@@ -21,6 +21,13 @@
 # of must not change underneath it.
 set -euo pipefail
 
+# ROOT'S HOME, WHATEVER THE CALLER'S WAS. chroot keeps the environment, so every
+# installer run inside the image writes its first-run state under this HOME: a
+# build started on a CI runner with HOME=/home/runner left the image's
+# /home/runner/.config to root (the toolcache's dotnet wrote NuGet's config there),
+# and every job whose tool creates ~/.config/<tool> failed with EACCES.
+export HOME=/root
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 # ONE PIN FOR EVERY IMAGE BILLET BUILDS, read from the file the Go code embeds.
