@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,13 +138,50 @@ func TestTheBuildSetsRootsHomeBeforeAnythingElse(t *testing.T) {
 		}
 
 		commands = append(commands, line)
-		if len(commands) == 2 {
+		if len(commands) == 3 {
 			break
 		}
 	}
 
-	if len(commands) < 2 || commands[0] != "set -euo pipefail" || commands[1] != "export HOME=/root" {
-		t.Errorf("build-guest-image.sh's first commands are %q, want the shell options and then export HOME=/root", commands)
+	want := []string{"set -euo pipefail", "export HOME=/root",
+		"unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR"}
+	if !slices.Equal(commands, want) {
+		t.Errorf("build-guest-image.sh's first commands are %q, want %q", commands, want)
+	}
+}
+
+// AND THE OWNERSHIP PASS IS THE LAST THING DONE TO THE HOME. HOME=/root was not
+// enough: an image built with it still carried /home/runner/.config/NuGet owned
+// by root (2026-09-21, guest build from v0.12.3, refused by the gate), written
+// during the toolcache step by a writer that was not measured. Whatever writes
+// there, a chown after every install step leaves the home the runner's, and the
+// gate proves it did.
+func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("build-guest-image.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source := string(raw)
+
+	// A LINE OF ITS OWN, so a commented-out pass does not count.
+	const pass = "\n\tchroot \"$rootfs\" chown -R runner:runner /home/runner\n"
+
+	last := strings.LastIndex(source, pass)
+	toolcache := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")
+	boot := strings.Index(source, `echo "=== 5/6 boot configuration ==="`)
+	filesystem := strings.Index(source, `echo "=== 6/6 filesystem ==="`)
+
+	if last < 0 || toolcache < 0 || boot < 0 || filesystem < 0 {
+		t.Fatalf("build-guest-image.sh lost a landmark: pass %d, toolcache %d, step 5 %d, step 6 %d",
+			last, toolcache, boot, filesystem)
+	}
+
+	if last < toolcache || last < boot || last > filesystem {
+		t.Errorf("the last ownership pass over /home/runner (offset %d) must come after the toolcache "+
+			"(%d) and step 5 (%d), and before step 6 (%d)", last, toolcache, boot, filesystem)
 	}
 }
 
