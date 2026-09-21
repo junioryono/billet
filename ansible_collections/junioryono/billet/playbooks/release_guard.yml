@@ -1,0 +1,25 @@
+---
+# Release the converge guard a converge left on every host it held.
+#
+# THE OTHER HALF OF fleet.yml. Every play there holds its host under the
+# converge's name before anything changes it, and nothing in the role ever
+# releases, because the role cannot know when the converge driving it has
+# ended. This playbook is how the driver says so: the published action runs it
+# however its job finished, and an operator runs it when they are done.
+#
+# THE SAME INVENTORY AND THE SAME --limit as the converge, or a host this
+# converge never held is asked about a guard that is not its to release. The
+# task reports that and changes nothing, but a release run over the wrong hosts
+# says nothing useful about the right ones.
+#
+# NO FACTS ARE GATHERED. This runs one command per host and is the last thing a
+# failed converge does; a fact gather against a host that has just been
+# restarted is a slow way to fail at the end of a job that already failed.
+- name: Release the converge guard
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Release it on this host
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: release-guard

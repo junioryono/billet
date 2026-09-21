@@ -1,0 +1,87 @@
+---
+# Release the converge guard this converge holds, and only that one.
+#
+# THE PREPARATION HOLDS AND NEVER RELEASES, deliberately: the hold is what stops
+# a converge racing a rollout's `billet host-upgrade` for the same binaries, and
+# the role cannot know when the converge driving it has ended. The driver can,
+# and this is what it calls at its end: the published action runs it however the
+# job finished, and an operator runs it when they are done with the fleet.
+#
+# ONLY THIS HOLDER'S. The guard is read before it is released, and a guard
+# another name holds is left exactly as it is and reported: a converge that
+# tore down somebody else's hold would be the fleet-wide race the guard exists
+# to prevent, made automatic.
+#
+# A HOST WITH NO GUARD IS NOT A FAILURE. A run that never reached this host, a
+# guard an operator already cleared, a second release of the same run: each
+# leaves nothing to do, and a release that failed on them could not be run on
+# every path, which is the one property that makes it useful.
+- name: Resolve the platform and the binary that answers for the guard
+  ansible.builtin.set_fact:
+    billet_release_platform: "{{ ansible_facts['system'] | default('Linux') }}"
+
+- name: Resolve the guard's executable and escalation
+  ansible.builtin.set_fact:
+    billet_release_binary: >-
+      {{ billet_managed_binary if billet_managed_binary | length > 0
+         else ('/usr/local/bin/billet' if billet_release_platform == 'Darwin' else '/usr/bin/billet') }}
+    billet_release_become: "{{ billet_release_platform != 'Darwin' }}"
+    billet_release_holder: "{{ billet_converge_guard_holder | default('', true) }}"
+
+- name: Refuse a release with no name
+  ansible.builtin.assert:
+    that:
+      - billet_release_holder | length > 0
+    fail_msg: >-
+      A release is addressed to the name the converge held under, and none was
+      given. Export BILLET_CONVERGE_GUARD_HOLDER on the controller, or pass
+      -e billet_converge_guard_holder=<name>. `billet converge-guard status` on
+      the host says which name holds it.
+    success_msg: "Releasing the converge guard held as {{ billet_release_holder }}."
+
+# WHO HOLDS IT, BEFORE ANYTHING IS REMOVED. `converge-guard holder` prints the
+# name and exits non-zero when no guard is held, so this one read separates all
+# three outcomes without matching on a message.
+- name: Read who holds the converge guard
+  ansible.builtin.command:
+    argv: >-
+      {{ ([] if billet_release_platform == 'Darwin' else ['timeout', '-k', '10', billet_guard_timeout | string])
+         + [billet_release_binary, 'converge-guard', 'holder'] }}
+    expand_argument_vars: false
+  register: billet_release_held
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: "{{ billet_release_become }}"
+
+- name: Release the guard this converge holds
+  ansible.builtin.command:
+    argv: >-
+      {{ ([] if billet_release_platform == 'Darwin' else ['timeout', '-k', '10', billet_guard_timeout | string])
+         + [billet_release_binary, 'converge-guard', 'release', '--holder', billet_release_holder] }}
+    expand_argument_vars: false
+  register: billet_release_result
+  changed_when: billet_release_result.rc == 0
+  check_mode: false
+  become: "{{ billet_release_become }}"
+  when:
+    - billet_release_held.rc | default(1) == 0
+    - (billet_release_held.stdout | default('') | trim) == billet_release_holder
+
+- name: Say that another name holds this host
+  ansible.builtin.debug:
+    msg: >-
+      The converge guard on this host is held as
+      {{ billet_release_held.stdout | default('') | trim }}, not as
+      {{ billet_release_holder }}, so this release left it alone. That is
+      another converge or an operator; `billet converge-guard status` says what
+      it is doing, and only that holder may release it.
+  when:
+    - billet_release_held.rc | default(1) == 0
+    - (billet_release_held.stdout | default('') | trim) != billet_release_holder
+
+- name: Say that nothing was held here
+  ansible.builtin.debug:
+    msg: >-
+      No converge guard is held on this host, so there was nothing to release.
+  when: billet_release_held.rc | default(1) != 0
