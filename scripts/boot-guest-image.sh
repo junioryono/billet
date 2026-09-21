@@ -185,23 +185,35 @@ api PUT /actions '{"action_type":"InstanceStart"}'
 #
 # Firecracker exits 0 on some guest-side failures, so none of this waits on the
 # process.
-saw_multiuser=0
-docker_started=0
-saw_agent=0
+#
+# BOTH SIGNALS ARE WAITED FOR, in either order. The agent is ordered after the
+# network, not after multi-user.target, so it can answer while other wanted units
+# are still starting: measured 2026-09-21, the agent refused at 8.56 s and a watch
+# that stopped at its line reported that systemd never reached its target, for an
+# image that was still booting normally.
+watch_console() {
+	saw_multiuser=0
+	docker_started=0
+	saw_agent=0
 
-for _ in $(seq 1 "$BOOT_TIMEOUT"); do
-	grep -q "Reached target.*[Mm]ulti-[Uu]ser" "$CONSOLE" 2>/dev/null && saw_multiuser=1
-	grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && docker_started=1
-	grep -q "metadata contract $REFUSED_CONTRACT" "$CONSOLE" 2>/dev/null && saw_agent=1
+	for _ in $(seq 1 "$BOOT_TIMEOUT"); do
+		grep -q "Reached target.*[Mm]ulti-[Uu]ser" "$CONSOLE" 2>/dev/null && saw_multiuser=1
+		grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && docker_started=1
+		grep -q "metadata contract $REFUSED_CONTRACT" "$CONSOLE" 2>/dev/null && saw_agent=1
 
-	[ "$saw_agent" -eq 1 ] && break
+		if [ "$saw_agent" -eq 1 ] && [ "$saw_multiuser" -eq 1 ]; then
+			break
+		fi
 
-	if ! kill -0 "$FCPID" 2>/dev/null; then
-		break
-	fi
+		if ! kill -0 "$FCPID" 2>/dev/null; then
+			break
+		fi
 
-	sleep 1
-done
+		sleep 1
+	done
+}
+
+watch_console
 
 echo
 echo "=== console ==="
