@@ -305,3 +305,90 @@ func TestTheReleasePlaybookTheScriptNamesExists(t *testing.T) {
 		t.Fatalf("the collection ships no %s for %s: %v", playbook, named, err)
 	}
 }
+
+// A CHECK HOLDS NOTHING, SO IT RELEASES NOTHING.
+//
+// The role takes no guard in check mode — its holder is not even required
+// there — so a dry run has nothing to release, and a release play run anyway
+// reaches every host to ask a question whose answer is always "nothing held".
+// MEASURED: the first dry run of a consumer's fleet failed on exactly that. One
+// host was unreachable, the release could not ask it, and the run went red at
+// the very end over a guard that was never taken. A check that cannot fail for
+// what it did not do is the whole point of having one.
+func TestACheckRunLeavesNoGuardMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+
+	out, err := f.run(t, convergeRun{mode: "check", holder: "gha-acme-platform-17-2"})
+	if err != nil {
+		t.Fatalf("converge.sh in check mode: %v\n%s", err, out)
+	}
+
+	marker := filepath.Join(f.runnerTm, "billet-guard-held")
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a check run left the guard marker, so the release step will walk the fleet " +
+			"to release a guard no host was ever held under")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat the marker: %v", err)
+	}
+}
+
+// AND A CONVERGE LEAVES ONE, which is the other half: the marker is what the
+// release step reads, so a converge that wrote none would hold every host and
+// release nothing.
+func TestAConvergeRunLeavesTheGuardMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+
+	out, err := f.run(t, convergeRun{mode: "converge", holder: "gha-acme-platform-17-2"})
+	if err != nil {
+		t.Fatalf("converge.sh: %v\n%s", err, out)
+	}
+
+	body, err := os.ReadFile(filepath.Join(f.runnerTm, "billet-guard-held"))
+	if err != nil {
+		t.Fatalf("a converge left no guard marker, so nothing releases what it held: %v", err)
+	}
+
+	if got := strings.TrimSpace(string(body)); got != "gha-acme-platform-17-2" {
+		t.Errorf("the marker names %q, want the holder this run converged under", got)
+	}
+}
+
+// THE RELEASE CONNECTS WITH THE KEY THE CONVERGE CONNECTED WITH.
+//
+// converge.sh writes the SSH key to RUNNER_TEMP and exports its path, but an
+// export ends with the step that made it, and the release is a step of its
+// own. MEASURED on a consumer's fleet: the release ran ansible-playbook with no
+// key, sshd logged "Connection closed by authenticating user ... [preauth]",
+// and the step reported "Permission denied (publickey)" for a host whose
+// authorized_keys held the CI key all along — which reads exactly like a host
+// that does not trust the converge, and sent the diagnosis the wrong way.
+func TestTheReleaseUsesTheKeyTheConvergeWrote(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+	for _, name := range []string{"recap1", "recap2", "list-hosts"} {
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte(cleanRecap("cp-1")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	key := filepath.Join(f.runnerTm, "billet-ssh-key")
+	if err := os.WriteFile(key, []byte("not a real key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := f.release(t, releaseRun{held: true})
+	if err != nil {
+		t.Fatalf("release-guard.sh: %v\n%s", err, out)
+	}
+
+	if got := recordedEnv(t, f.pbEnv)["ANSIBLE_PRIVATE_KEY_FILE"]; got != key {
+		t.Errorf("the release ran ansible-playbook with ANSIBLE_PRIVATE_KEY_FILE=%q, want %q: "+
+			"with no key every host refuses it, and the refusal reads as a host that does not "+
+			"trust the converge", got, key)
+	}
+}
