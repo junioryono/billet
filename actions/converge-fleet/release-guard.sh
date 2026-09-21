@@ -53,11 +53,8 @@ export ANSIBLE_COLLECTIONS_PATH="$checkout:$billet_release_runner_temp/billet-co
 if [[ -f $billet_release_runner_temp/billet-ssh-key ]]; then
   export ANSIBLE_PRIVATE_KEY_FILE="$billet_release_runner_temp/billet-ssh-key"
 fi
-export ANSIBLE_HOST_KEY_CHECKING=True
-export ANSIBLE_STDOUT_CALLBACK=default
-export ANSIBLE_RESULT_FORMAT=yaml
-export ANSIBLE_FORCE_COLOR=0
-export ANSIBLE_NOCOLOR=1
+# shellcheck source=actions/converge-fleet/ansible-environment.sh
+source "$here/ansible-environment.sh"
 
 args=(-i "${BILLET_INVENTORY:?}")
 if [[ -n ${BILLET_LIMIT:-} ]]; then
