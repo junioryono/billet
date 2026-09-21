@@ -244,6 +244,29 @@ EOF
 
 pass() { echo "  ok    $*"; }
 
+# files_not_owned_by prints every path under a directory whose owner is not the
+# given uid or whose group is not the given gid.
+#
+# EXIT 0 with nothing when every path belongs to them, 1 with the paths, 2 when
+# find could not look: a home that could not be read is not one that passed.
+files_not_owned_by() {
+	local found status=0
+
+	found=$(find "$1" \( ! -uid "$2" -o ! -gid "$3" \) -print) || status=$?
+
+	if [ "$status" -ne 0 ]; then
+		echo "could not list $1 (find exited $status)" >&2
+
+		return 2
+	fi
+
+	if [ -n "$found" ]; then
+		printf '%s\n' "$found"
+
+		return 1
+	fi
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -297,6 +320,24 @@ if [ -n "$runner_ids" ] && [ "$work_ids" = "$runner_ids" ]; then
 else
 	fail "the runner work directory belongs to ${work_ids:-no account}, not
         ${runner_ids:-the missing runner account}; the runner cannot initialize a job"
+fi
+
+# THE WHOLE HOME IS THE RUNNER'S. A tool that creates ~/.config/<tool> or
+# ~/.cache/<tool> on first use fails with EACCES under a directory the build left
+# to root, which is how an installer run with the builder's HOME broke jobs
+# (measured 2026-09-21: /home/runner/.config/NuGet, from the build's own dotnet).
+if [ -n "$runner_ids" ]; then
+	runner_uid=${runner_ids%%:*}
+	runner_gid=${runner_ids#*:}
+	foreign_status=0
+	foreign=$(files_not_owned_by "$MNT/home/runner" "$runner_uid" "$runner_gid") || foreign_status=$?
+
+	case "$foreign_status" in
+		0) pass "everything under /home/runner belongs to the runner account" ;;
+		1) fail "paths under /home/runner do not belong to the runner account, so a job
+        cannot write there: $(awk -v m="$MNT" 'NR <= 20 { if (index($0, m) == 1) $0 = substr($0, length(m) + 1); printf "%s ", $0 }' <<<"$foreign")" ;;
+		*) fail "could not check who owns /home/runner" ;;
+	esac
 fi
 
 AGENT="$MNT/usr/local/bin/billet-agent"
