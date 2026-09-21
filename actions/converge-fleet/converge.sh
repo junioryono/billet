@@ -65,11 +65,8 @@ readonly billet_action_runner_temp=${RUNNER_TEMP:?}
 [[ -f $billet_action_inventory ]] || { echo "::error::inventory $billet_action_inventory does not exist"; exit 1; }
 
 export ANSIBLE_COLLECTIONS_PATH="$checkout:$billet_action_runner_temp/billet-collections"
-export ANSIBLE_HOST_KEY_CHECKING=True
-export ANSIBLE_STDOUT_CALLBACK=default
-export ANSIBLE_RESULT_FORMAT=yaml
-export ANSIBLE_FORCE_COLOR=0
-export ANSIBLE_NOCOLOR=1
+# shellcheck source=actions/converge-fleet/ansible-environment.sh
+source "$here/ansible-environment.sh"
 
 # --- the environment input: NAME=value lines for the child, and only the child ---
 child_env_file="$billet_action_runner_temp/billet-child-env"
