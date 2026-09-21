@@ -490,9 +490,10 @@ jobs:
       - name: Prove every documented Terraform module source is pinnable
         run: make module-sources
 
+  # One Python script over the shards' reports: nothing here compiles.
   retirement-selection:
     needs: host-lifecycle
-    runs-on: billet-8vcpu-ubuntu-2404
+    runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
@@ -504,7 +505,10 @@ jobs:
         run: python3 scripts/check-retirement-shards.py --completed-roles retirement-selection
 
   host-lifecycle:
-    runs-on: billet-8vcpu-ubuntu-2404
+    # Every group compiles billet at least once except retirement-node-shape,
+    # which runs the shard checker and four plays, so it alone takes the small
+    # runner; the others hold the 8 vCPU one until a measured run says otherwise.
+    runs-on: ${{ matrix.group == 'retirement-node-shape' && 'billet-2vcpu-ubuntu-2404' || 'billet-8vcpu-ubuntu-2404' }}
     # The former retirement group reached 36 minutes before request coverage
     # on 46fcafa (2026-09-14). Partition its parser, routes, compatibility,
     # retained continuation, recovery and 3c settled callers. The 64 request

@@ -1,6 +1,6 @@
 # Retirement caller coverage
 
-CI keeps the `host-lifecycle` runner at `billet-8vcpu-ubuntu-2404` and its timeout at 45 minutes. The existing `policy`, `roles`, `guard`, `shape` and `endpoint` groups remain. The former `retirement-request` group has five selectors, each with `BILLET_GATE_ONLY=retirement-request` and `BILLET_GATE_REQUIRE_ROOT=1`. The former `retirement` workload now has ten selectors, all with `BILLET_GATE_ONLY=retirement`, `BILLET_GATE_SKIP=retirement-request` and `BILLET_GATE_REQUIRE_ROOT=1`. `retirement-node-shape` owns the four retained guard/drift/input/operand plays formerly imported by `host-upgrade-order.yml`; `shape` retains the original ordering and reader controls.
+CI keeps the `host-lifecycle` runner at `billet-8vcpu-ubuntu-2404` for every group but `retirement-node-shape`, which compiles nothing and runs on `billet-2vcpu-ubuntu-2404`, and its timeout at 45 minutes. The existing `policy`, `roles`, `guard`, `shape` and `endpoint` groups remain. The former `retirement-request` group has five selectors, each with `BILLET_GATE_ONLY=retirement-request` and `BILLET_GATE_REQUIRE_ROOT=1`. The former `retirement` workload now has ten selectors, all with `BILLET_GATE_ONLY=retirement`, `BILLET_GATE_SKIP=retirement-request` and `BILLET_GATE_REQUIRE_ROOT=1`. `retirement-node-shape` owns the four retained guard/drift/input/operand plays formerly imported by `host-upgrade-order.yml`; `shape` retains the original ordering and reader controls.
 
 | CI group | `BILLET_RETIREMENT_SHARD` | Case executions | Source |
 |---|---|---:|---|
