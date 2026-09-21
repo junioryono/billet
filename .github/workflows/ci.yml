@@ -504,7 +504,34 @@ jobs:
       - name: Prove all retirement role cases ran exactly once
         run: python3 scripts/check-retirement-shards.py --completed-roles retirement-selection
 
+  # BILLET BUILT ONCE FOR EVERY host-lifecycle GROUP. Seventeen groups each built
+  # the guard gate's four stamped binaries and three built the ordinary CLI
+  # several times (74 builds a run); this builds them once and the groups verify
+  # and use these files (gate-binaries.sh, and the gates' BILLET_*_BINARY
+  # overrides). The artifact lives for this run only.
+  gate-binaries:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build the gate's binaries and the CLI
+        run: |
+          ansible_collections/junioryono/billet/tests/gate-binaries.sh build "$RUNNER_TEMP/gate-binaries"
+          ansible_collections/junioryono/billet/tests/gate-binaries.sh verify "$RUNNER_TEMP/gate-binaries"
+          go build -o "$RUNNER_TEMP/gate-binaries/billet" ./cmd/billet
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gate-binaries
+          path: ${{ runner.temp }}/gate-binaries
+          if-no-files-found: error
+          retention-days: 1
+
   host-lifecycle:
+    needs: gate-binaries
     # Every group compiles billet at least once except retirement-node-shape,
     # which runs the shard checker and four plays, so it alone takes the small
     # runner; the others hold the 8 vCPU one until a measured run says otherwise.
@@ -603,6 +630,23 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: gate-binaries
+          path: ${{ runner.temp }}/gate-binaries
+
+      # An artifact does not keep the executable bit. The guard gate verifies its
+      # four binaries before it uses them; the CLI is the same build every
+      # other gate would have made.
+      - name: Use the binaries built once for this run
+        run: |
+          chmod 0755 "$RUNNER_TEMP"/gate-binaries/*
+          {
+            echo "BILLET_GATE_PREBUILT=$RUNNER_TEMP/gate-binaries"
+            echo "BILLET_EMITTED_BLOCK_BINARY=$RUNNER_TEMP/gate-binaries/billet"
+            echo "BILLET_HYBRID_CHECK_BINARY=$RUNNER_TEMP/gate-binaries/billet"
+          } >>"$GITHUB_ENV"
 
       - name: Exercise alert ownership migration and teardown
         if: matrix.group == 'shape'
@@ -1064,6 +1108,7 @@ jobs:
         test-postgres-retirement,
         lint,
         release-config,
+        gate-binaries,
         host-lifecycle, # Includes every route and request matrix group.
         retirement-selection,
         package-lifecycle,
