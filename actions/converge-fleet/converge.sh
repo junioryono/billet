@@ -285,12 +285,19 @@ status=0
 # THE MARKER IS WRITTEN BEFORE THE PLAYBOOK, NOT AFTER IT. The role's first task
 # on every host is the hold, so a run that is killed, cancelled or fails part-way
 # is exactly the run whose guards need releasing; a marker written afterwards
-# would be missing in precisely that case. Written in check mode too, because a
-# check holds the host as a converge does.
+# would be missing in precisely that case. It carries the holder, so the release
+# step releases what this run held even if something later changed the
+# environment.
 #
-# It carries the holder so the release step releases what this run held, even if
-# something later in the job changed the environment.
-printf '%s\n' "${BILLET_CONVERGE_GUARD_HOLDER:-}" >"$billet_action_runner_temp/billet-guard-held"
+# CONVERGE ONLY, BECAUSE A CHECK HOLDS NOTHING. The role does not take a guard in
+# check mode and does not even require a holder there, so a marker written by a
+# dry run sends the release step around the fleet to ask every host about a guard
+# that was never taken. Measured on a consumer's first dry run: one host was
+# unreachable, the release could not ask it, and the run failed at the very end
+# over a guard nothing had held.
+if [[ $billet_action_mode == converge ]]; then
+  printf '%s\n' "${BILLET_CONVERGE_GUARD_HOLDER:-}" >"$billet_action_runner_temp/billet-guard-held"
+fi
 
 if [[ $billet_action_mode == check ]]; then
   run_ansible ansible-playbook "${args[@]}" --check --diff "$billet_action_playbook" 2>&1 | tee "$log" || status=$?
