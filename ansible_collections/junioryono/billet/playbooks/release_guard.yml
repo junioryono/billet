@@ -12,12 +12,16 @@
 # task reports that and changes nothing, but a release run over the wrong hosts
 # says nothing useful about the right ones.
 #
-# NO FACTS ARE GATHERED. This runs one command per host and is the last thing a
-# failed converge does; a fact gather against a host that has just been
-# restarted is a slow way to fail at the end of a job that already failed.
+# ONLY THE MINIMAL FACTS. The task picks the guard's binary and escalation by
+# platform, and without a gather `ansible_facts['system']` is undefined and falls
+# back to Linux: on a Mac that is the wrong binary and root it must not use.
+# The `min` subset is what names the platform and nothing more, so a host that
+# has just been restarted is not put through a full gather at the end of a job
+# that may already have failed.
 - name: Release the converge guard
   hosts: all
-  gather_facts: false
+  gather_facts: true
+  gather_subset: ['!all', 'min']
   tasks:
     - name: Release it on this host
       ansible.builtin.include_role:
