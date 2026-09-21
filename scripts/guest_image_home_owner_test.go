@@ -75,16 +75,21 @@ func TestTheImageGateFailsOnWhatTheCheckFinds(t *testing.T) {
 
 	for _, tc := range []struct {
 		name       string
-		root       func(t *testing.T) string
+		noHome     bool
 		uid        int
 		wantFailed string
 	}{
-		{"owned", func(t *testing.T) string { return filepath.Dir(filepath.Dir(homeFixture(t))) }, os.Getuid(), "0"},
-		{"foreign", func(t *testing.T) string { return filepath.Dir(filepath.Dir(homeFixture(t))) }, os.Getuid() + 1, "1"},
-		{"unreadable", func(t *testing.T) string { return t.TempDir() }, os.Getuid(), "1"},
+		{"owned", false, os.Getuid(), "0"},
+		{"foreign", false, os.Getuid() + 1, "1"},
+		{"unreadable", true, os.Getuid(), "1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+
+			root := t.TempDir()
+			if !tc.noHome {
+				root = filepath.Dir(filepath.Dir(homeFixture(t)))
+			}
 
 			script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\n" +
 				"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
@@ -97,7 +102,7 @@ func TestTheImageGateFailsOnWhatTheCheckFinds(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			out, err := exec.CommandContext(t.Context(), "bash", path, tc.root(t), strconv.Itoa(tc.uid),
+			out, err := exec.CommandContext(t.Context(), "bash", path, root, strconv.Itoa(tc.uid),
 				strconv.Itoa(os.Getgid())).CombinedOutput()
 			if err != nil {
 				t.Fatalf("the gate's check did not run to its verdict: %v\n%s", err, out)
