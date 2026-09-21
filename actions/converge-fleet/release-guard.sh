@@ -43,6 +43,16 @@ fi
 
 export BILLET_CONVERGE_GUARD_HOLDER="$holder"
 export ANSIBLE_COLLECTIONS_PATH="$checkout:$billet_release_runner_temp/billet-collections"
+
+# THE KEY THE CONVERGE CONNECTED WITH. converge.sh writes it here and exports its
+# path, but an export ends with the step that made it and this is a step of its
+# own. Without it ansible offers no key, every host refuses, and the refusal reads
+# as a host that does not trust the converge — measured on a real fleet, where
+# the host's authorized_keys held the CI key all along. known_hosts needs nothing:
+# converge.sh wrote the pins into the runner user's own file, which persists.
+if [[ -f $billet_release_runner_temp/billet-ssh-key ]]; then
+  export ANSIBLE_PRIVATE_KEY_FILE="$billet_release_runner_temp/billet-ssh-key"
+fi
 export ANSIBLE_HOST_KEY_CHECKING=True
 export ANSIBLE_STDOUT_CALLBACK=default
 export ANSIBLE_RESULT_FORMAT=yaml
