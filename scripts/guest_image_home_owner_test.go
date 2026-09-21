@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,22 +138,24 @@ func TestTheBuildSetsRootsHomeBeforeAnythingElse(t *testing.T) {
 		}
 
 		commands = append(commands, line)
-		if len(commands) == 2 {
+		if len(commands) == 3 {
 			break
 		}
 	}
 
-	if len(commands) < 2 || commands[0] != "set -euo pipefail" || commands[1] != "export HOME=/root" {
-		t.Errorf("build-guest-image.sh's first commands are %q, want the shell options and then export HOME=/root", commands)
+	want := []string{"set -euo pipefail", "export HOME=/root",
+		"unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR"}
+	if !slices.Equal(commands, want) {
+		t.Errorf("build-guest-image.sh's first commands are %q, want %q", commands, want)
 	}
 }
 
 // AND THE OWNERSHIP PASS IS THE LAST THING DONE TO THE HOME. HOME=/root was not
 // enough: an image built with it still carried /home/runner/.config/NuGet owned
-// by root (2026-09-21, guest build from v0.12.3, refused by the gate), written by
-// something in the toolcache step that finds the runner's home without asking
-// HOME. Whatever writes there, a chown after every install step leaves the home
-// the runner's, and the gate proves it did.
+// by root (2026-09-21, guest build from v0.12.3, refused by the gate), written
+// during the toolcache step by a writer that was not measured. Whatever writes
+// there, a chown after every install step leaves the home the runner's, and the
+// gate proves it did.
 func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
 	t.Parallel()
 
@@ -163,7 +166,8 @@ func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
 
 	source := string(raw)
 
-	const pass = `chroot "$rootfs" chown -R runner:runner /home/runner`
+	// A LINE OF ITS OWN, so a commented-out pass does not count.
+	const pass = "\n\tchroot \"$rootfs\" chown -R runner:runner /home/runner\n"
 
 	last := strings.LastIndex(source, pass)
 	toolcache := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")

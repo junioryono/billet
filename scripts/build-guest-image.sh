@@ -21,12 +21,16 @@
 # of must not change underneath it.
 set -euo pipefail
 
-# ROOT'S HOME, WHATEVER THE CALLER'S WAS. chroot keeps the environment, so every
-# installer run inside the image writes its first-run state under this HOME: a
-# build started on a CI runner with HOME=/home/runner left the image's
-# /home/runner/.config to root (the toolcache's dotnet wrote NuGet's config there),
-# and every job whose tool creates ~/.config/<tool> failed with EACCES.
+# ROOT'S HOME AND NO CALLER'S XDG DIRECTORIES. chroot keeps the environment, so
+# every installer run inside the image writes its first-run state wherever these
+# point, and a CI runner's point at /home/runner: an image built there shipped
+# /home/runner/.config/NuGet owned by root, and every job whose tool creates
+# ~/.config/<tool> failed with EACCES. HOME alone did not stop it; PowerShell's
+# NuGet provider, which the toolcache's module installs reach, prefers
+# XDG_CONFIG_HOME to HOME, which fits but was not measured. The ownership pass
+# before step 6 is what holds whichever it was.
 export HOME=/root
+unset XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_RUNTIME_DIR
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
@@ -1739,11 +1743,10 @@ NET
 	'
 
 	# THE RUNNER'S HOME IS HANDED TO IT LAST, after every step that installs into
-	# the image. HOME=/root above was not enough: a build with it still left
+	# the image. HOME=/root alone was not enough: a build with it still left
 	# /home/runner/.config/NuGet to root (2026-09-21, from v0.12.3; the gate
-	# refused it), written during the toolcache step by something that finds the
-	# runner's home without asking HOME. Whatever writes there, nothing after this
-	# does, and check-guest-image.sh proves it.
+	# refused it), written during the toolcache step. Whatever writes there,
+	# nothing after this does, and check-guest-image.sh proves it.
 	chroot "$rootfs" chown -R runner:runner /home/runner
 
 	echo "=== 6/6 filesystem ==="
