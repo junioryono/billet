@@ -147,6 +147,40 @@ func TestTheBuildSetsRootsHomeBeforeAnythingElse(t *testing.T) {
 	}
 }
 
+// AND THE OWNERSHIP PASS IS THE LAST THING DONE TO THE HOME. HOME=/root was not
+// enough: an image built with it still carried /home/runner/.config/NuGet owned
+// by root (2026-09-21, guest build from v0.12.3, refused by the gate), written by
+// something in the toolcache step that finds the runner's home without asking
+// HOME. Whatever writes there, a chown after every install step leaves the home
+// the runner's, and the gate proves it did.
+func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("build-guest-image.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source := string(raw)
+
+	const pass = `chroot "$rootfs" chown -R runner:runner /home/runner`
+
+	last := strings.LastIndex(source, pass)
+	toolcache := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")
+	boot := strings.Index(source, `echo "=== 5/6 boot configuration ==="`)
+	filesystem := strings.Index(source, `echo "=== 6/6 filesystem ==="`)
+
+	if last < 0 || toolcache < 0 || boot < 0 || filesystem < 0 {
+		t.Fatalf("build-guest-image.sh lost a landmark: pass %d, toolcache %d, step 5 %d, step 6 %d",
+			last, toolcache, boot, filesystem)
+	}
+
+	if last < toolcache || last < boot || last > filesystem {
+		t.Errorf("the last ownership pass over /home/runner (offset %d) must come after the toolcache "+
+			"(%d) and step 5 (%d), and before step 6 (%d)", last, toolcache, boot, filesystem)
+	}
+}
+
 func homeFixture(t *testing.T) string {
 	t.Helper()
 

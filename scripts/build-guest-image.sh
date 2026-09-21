@@ -1738,6 +1738,14 @@ NET
 		passwd -l root
 	'
 
+	# THE RUNNER'S HOME IS HANDED TO IT LAST, after every step that installs into
+	# the image. HOME=/root above was not enough: a build with it still left
+	# /home/runner/.config/NuGet to root (2026-09-21, from v0.12.3; the gate
+	# refused it), written during the toolcache step by something that finds the
+	# runner's home without asking HOME. Whatever writes there, nothing after this
+	# does, and check-guest-image.sh proves it.
+	chroot "$rootfs" chown -R runner:runner /home/runner
+
 	echo "=== 6/6 filesystem ==="
 
 	# MEASURED WHILE IT IS STILL MOUNTED, because that is the only moment the used
