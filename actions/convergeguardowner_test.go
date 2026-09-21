@@ -305,3 +305,54 @@ func TestTheReleasePlaybookTheScriptNamesExists(t *testing.T) {
 		t.Fatalf("the collection ships no %s for %s: %v", playbook, named, err)
 	}
 }
+
+// A CHECK HOLDS NOTHING, SO IT RELEASES NOTHING.
+//
+// The role takes no guard in check mode — its holder is not even required
+// there — so a dry run has nothing to release, and a release play run anyway
+// reaches every host to ask a question whose answer is always "nothing held".
+// MEASURED: the first dry run of a consumer's fleet failed on exactly that. One
+// host was unreachable, the release could not ask it, and the run went red at
+// the very end over a guard that was never taken. A check that cannot fail for
+// what it did not do is the whole point of having one.
+func TestACheckRunLeavesNoGuardMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+
+	out, err := f.run(t, convergeRun{mode: "check", holder: "gha-acme-platform-17-2"})
+	if err != nil {
+		t.Fatalf("converge.sh in check mode: %v\n%s", err, out)
+	}
+
+	marker := filepath.Join(f.runnerTm, "billet-guard-held")
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a check run left the guard marker, so the release step will walk the fleet " +
+			"to release a guard no host was ever held under")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat the marker: %v", err)
+	}
+}
+
+// AND A CONVERGE LEAVES ONE, which is the other half: the marker is what the
+// release step reads, so a converge that wrote none would hold every host and
+// release nothing.
+func TestAConvergeRunLeavesTheGuardMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+
+	out, err := f.run(t, convergeRun{mode: "converge", holder: "gha-acme-platform-17-2"})
+	if err != nil {
+		t.Fatalf("converge.sh: %v\n%s", err, out)
+	}
+
+	body, err := os.ReadFile(filepath.Join(f.runnerTm, "billet-guard-held"))
+	if err != nil {
+		t.Fatalf("a converge left no guard marker, so nothing releases what it held: %v", err)
+	}
+
+	if got := strings.TrimSpace(string(body)); got != "gha-acme-platform-17-2" {
+		t.Errorf("the marker names %q, want the holder this run converged under", got)
+	}
+}
