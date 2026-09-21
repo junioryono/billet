@@ -55,25 +55,67 @@ func TestAHomeTheGateCannotReadIsNotAPass(t *testing.T) {
 	}
 }
 
-// THE GATE CALLS IT on the image's runner home with the runner's own ids, and a
-// finding fails the gate.
-func TestTheImageGateChecksTheRunnerHome(t *testing.T) {
+// A GROUP THE RUNNER IS NOT IN is a finding as much as an owner it is not.
+func TestTheGateNamesAPathInAnotherGroup(t *testing.T) {
 	t.Parallel()
 
-	raw, err := os.ReadFile("check-guest-image.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
+	home := homeFixture(t)
 
-	if !strings.Contains(string(raw), `files_not_owned_by "$MNT/home/runner" "$runner_uid" "$runner_gid"`) {
-		t.Error("check-guest-image.sh does not check the runner's home with the runner's ids")
+	out, code := runHomeOwnerCheck(t, home, os.Getuid(), os.Getgid()+1)
+	if code != 1 || !strings.Contains(out, "nuget.config") {
+		t.Fatalf("the check exited %d for a home in another group, want 1 naming the file:\n%s", code, out)
 	}
 }
 
-// THE BUILD RUNS AS ROOT UNDER ROOT'S HOME. chroot keeps the caller's
-// environment, so a HOME inherited from the machine running the build is where
-// every installer's first-run state lands inside the image.
-func TestTheBuildSetsRootsHomeBeforeItsFirstChroot(t *testing.T) {
+// THE GATE ITSELF FAILS on a finding and on a home it could not read, and passes
+// a home the runner owns: check_runner_home is executed as the gate runs it,
+// under the gate's own shell options, with its pass and fail.
+func TestTheImageGateFailsOnWhatTheCheckFinds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		root       func(t *testing.T) string
+		uid        int
+		wantFailed string
+	}{
+		{"owned", func(t *testing.T) string { return filepath.Dir(filepath.Dir(homeFixture(t))) }, os.Getuid(), "0"},
+		{"foreign", func(t *testing.T) string { return filepath.Dir(filepath.Dir(homeFixture(t))) }, os.Getuid() + 1, "1"},
+		{"unreadable", func(t *testing.T) string { return t.TempDir() }, os.Getuid(), "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\n" +
+				"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
+				checkImageFunction(t, "files_not_owned_by") + "\n" +
+				checkImageFunction(t, "check_runner_home") + "\n" +
+				"check_runner_home \"$1\" \"$2\" \"$3\"\necho \"FAILED=$FAILED\"\n"
+
+			path := filepath.Join(t.TempDir(), "gate.sh")
+			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			out, err := exec.CommandContext(t.Context(), "bash", path, tc.root(t), strconv.Itoa(tc.uid),
+				strconv.Itoa(os.Getgid())).CombinedOutput()
+			if err != nil {
+				t.Fatalf("the gate's check did not run to its verdict: %v\n%s", err, out)
+			}
+
+			if !strings.Contains(string(out), "FAILED="+tc.wantFailed+"\n") {
+				t.Errorf("want FAILED=%s:\n%s", tc.wantFailed, out)
+			}
+		})
+	}
+}
+
+// THE BUILD RUNS AS ROOT UNDER ROOT'S HOME, before it does anything else. chroot
+// and debootstrap keep the caller's environment, so a HOME inherited from the
+// machine running the build is where every installer's first-run state lands
+// inside the image; the export is the first command after the shell options, so
+// no spelling of either can precede it.
+func TestTheBuildSetsRootsHomeBeforeAnythingElse(t *testing.T) {
 	t.Parallel()
 
 	raw, err := os.ReadFile("build-guest-image.sh")
@@ -81,23 +123,29 @@ func TestTheBuildSetsRootsHomeBeforeItsFirstChroot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	source := string(raw)
+	var commands []string
 
-	home := strings.Index(source, "\nexport HOME=/root\n")
-	if home < 0 {
-		t.Fatal("build-guest-image.sh does not export HOME=/root")
+	for line := range strings.Lines(string(raw)) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		commands = append(commands, line)
+		if len(commands) == 2 {
+			break
+		}
 	}
 
-	first := strings.Index(source, "\tchroot ")
-	if first >= 0 && first < home {
-		t.Errorf("build-guest-image.sh runs chroot (offset %d) before it sets HOME (offset %d)", first, home)
+	if len(commands) < 2 || commands[0] != "set -euo pipefail" || commands[1] != "export HOME=/root" {
+		t.Errorf("build-guest-image.sh's first commands are %q, want the shell options and then export HOME=/root", commands)
 	}
 }
 
 func homeFixture(t *testing.T) string {
 	t.Helper()
 
-	home := filepath.Join(t.TempDir(), "runner")
+	home := filepath.Join(t.TempDir(), "home", "runner")
 	if err := os.MkdirAll(filepath.Join(home, ".config", "NuGet"), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -267,6 +267,21 @@ files_not_owned_by() {
 	fi
 }
 
+# check_runner_home passes or fails the gate on who owns the runner's home inside
+# the image mounted at $1, given the runner account's uid and gid.
+check_runner_home() {
+	local root=$1 foreign status=0
+
+	foreign=$(files_not_owned_by "$root/home/runner" "$2" "$3") || status=$?
+
+	case "$status" in
+		0) pass "everything under /home/runner belongs to the runner account" ;;
+		1) fail "paths under /home/runner do not belong to the runner account, so a job
+        may not be able to write there: $(awk -v m="$root" 'NR <= 20 { if (index($0, m) == 1) $0 = substr($0, length(m) + 1); printf "%s ", $0 }' <<<"$foreign")" ;;
+		*) fail "could not check who owns /home/runner" ;;
+	esac
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -327,17 +342,7 @@ fi
 # to root, which is how an installer run with the builder's HOME broke jobs
 # (measured 2026-09-21: /home/runner/.config/NuGet, from the build's own dotnet).
 if [ -n "$runner_ids" ]; then
-	runner_uid=${runner_ids%%:*}
-	runner_gid=${runner_ids#*:}
-	foreign_status=0
-	foreign=$(files_not_owned_by "$MNT/home/runner" "$runner_uid" "$runner_gid") || foreign_status=$?
-
-	case "$foreign_status" in
-		0) pass "everything under /home/runner belongs to the runner account" ;;
-		1) fail "paths under /home/runner do not belong to the runner account, so a job
-        cannot write there: $(awk -v m="$MNT" 'NR <= 20 { if (index($0, m) == 1) $0 = substr($0, length(m) + 1); printf "%s ", $0 }' <<<"$foreign")" ;;
-		*) fail "could not check who owns /home/runner" ;;
-	esac
+	check_runner_home "$MNT" "${runner_ids%%:*}" "${runner_ids#*:}"
 fi
 
 AGENT="$MNT/usr/local/bin/billet-agent"
