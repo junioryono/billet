@@ -356,3 +356,39 @@ func TestAConvergeRunLeavesTheGuardMarker(t *testing.T) {
 		t.Errorf("the marker names %q, want the holder this run converged under", got)
 	}
 }
+
+// THE RELEASE CONNECTS WITH THE KEY THE CONVERGE CONNECTED WITH.
+//
+// converge.sh writes the SSH key to RUNNER_TEMP and exports its path, but an
+// export ends with the step that made it, and the release is a step of its
+// own. MEASURED on a consumer's fleet: the release ran ansible-playbook with no
+// key, sshd logged "Connection closed by authenticating user ... [preauth]",
+// and the step reported "Permission denied (publickey)" for a host whose
+// authorized_keys held the CI key all along — which reads exactly like a host
+// that does not trust the converge, and sent the diagnosis the wrong way.
+func TestTheReleaseUsesTheKeyTheConvergeWrote(t *testing.T) {
+	t.Parallel()
+
+	f := newConvergeFixture(t)
+	for _, name := range []string{"recap1", "recap2", "list-hosts"} {
+		if err := os.WriteFile(filepath.Join(f.dir, name), []byte(cleanRecap("cp-1")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	key := filepath.Join(f.runnerTm, "billet-ssh-key")
+	if err := os.WriteFile(key, []byte("not a real key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := f.release(t, releaseRun{held: true})
+	if err != nil {
+		t.Fatalf("release-guard.sh: %v\n%s", err, out)
+	}
+
+	if got := recordedEnv(t, f.pbEnv)["ANSIBLE_PRIVATE_KEY_FILE"]; got != key {
+		t.Errorf("the release ran ansible-playbook with ANSIBLE_PRIVATE_KEY_FILE=%q, want %q: "+
+			"with no key every host refuses it, and the refusal reads as a host that does not "+
+			"trust the converge", got, key)
+	}
+}
