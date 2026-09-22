@@ -66,7 +66,7 @@ provider "aws" {
 }
 
 module "billet" {
-  source            = "github.com/junioryono/billet//terraform/modules/billet?ref=v0.12.4"
+  source            = "github.com/junioryono/billet//terraform/modules/billet?ref=v0.12.5"
   name              = "billet"
   enable_cache      = true
   ssh_ingress_cidrs = ["203.0.113.0/24"] # your admin range, for the Ansible role
