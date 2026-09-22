@@ -59,6 +59,7 @@ description: "The local service lifecycle on a host: `billet local up|status|dow
 - A launchd-managed node ran a real Actions job to green and destroyed its guest.
 - The restore rehearsal found the ownership gap `StateDirectory=` cannot repair.
 - `make systemd-lifecycle` is the only test of the lifecycle against a real service manager and the real package; it skips without a working App credential.
+- A unit with `PrivateTmp=true` cannot require a path under `/tmp` or `/var/tmp` in `ReadWritePaths`: systemd resolves it inside the fresh private directory and refuses the start with `226/NAMESPACE`, even when the host has the directory (systemd 255.4, ubuntu-24.04, 2026-09-22; a leading `-` or no entry starts, and the private `/var/tmp` is writable under `ProtectSystem=strict`). `billet-images-refresh.service` carried `/var/tmp/billet-images` and never started once on a systemd host, so nodes kept their first guest image while the timer failed daily; `TestNoPrivateTmpUnitRequiresAWritablePathUnderTmp` covers every packaged unit.
 
 ## Retirement operation admission and stopped boundaries
 

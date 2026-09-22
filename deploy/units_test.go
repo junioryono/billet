@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -453,6 +454,104 @@ func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
 	} {
 		if !strings.Contains(deploy.ImagesRefreshTimer, want) {
 			t.Errorf("%s does not carry %q", deploy.ImagesRefreshTimerName, want)
+		}
+	}
+}
+
+// A PRIVATE /tmp IS NOT THE HOST'S, so a unit with PrivateTmp=true may name no
+// path under /tmp or /var/tmp as required in ReadWritePaths: systemd resolves
+// the entry inside the service's fresh private directory, finds nothing and
+// refuses to start the unit with 226/NAMESPACE. Measured 2026-09-22 under
+// systemd 255.4 on ubuntu-24.04, with PrivateTmp=true and ProtectSystem=strict:
+// ReadWritePaths=/var/tmp/billet-images exited 226 while the directory existed on
+// the host; without the entry, or with a leading '-', the service started and
+// wrote into its private /var/tmp. billet-images-refresh.service carried the
+// entry and so never started once on a systemd host; the fleet it served kept a
+// three-week-old guest image while the daily timer failed in the journal.
+func TestNoPrivateTmpUnitRequiresAWritablePathUnderTmp(t *testing.T) {
+	for name, unit := range map[string]string{
+		deploy.ServerUnitName:        deploy.ServerUnit,
+		deploy.NodeUnitName:          deploy.NodeUnit,
+		deploy.BackupUnitName:        deploy.BackupUnit,
+		deploy.UpgradeUnitName:       deploy.UpgradeUnit,
+		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
+	} {
+		for _, path := range requiredPathsUnderPrivateTmp(unit) {
+			t.Errorf("%s has PrivateTmp and requires %s in ReadWritePaths; systemd refuses to start it (226/NAMESPACE)", name, path)
+		}
+	}
+}
+
+// requiredPathsUnderPrivateTmp reads a unit as systemd assigns it (whitespace
+// around the '=', comment lines skipped, the last PrivateTmp winning, systemd's
+// boolean spellings) and returns the ReadWritePaths entries a private /tmp
+// cannot satisfy: a required path strictly below /tmp or /var/tmp. The roots
+// themselves exist in the private namespace, and a '-' entry may be missing.
+func requiredPathsUnderPrivateTmp(unit string) []string {
+	private := false
+
+	var required []string
+
+	for line := range strings.Lines(unit) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+
+		switch key {
+		case "PrivateTmp":
+			switch strings.ToLower(value) {
+			case "1", "yes", "y", "true", "t", "on":
+				private = true
+			default:
+				private = false
+			}
+		case "ReadWritePaths":
+			for path := range strings.FieldsSeq(value) {
+				path = strings.Trim(path, `"`)
+				if strings.HasPrefix(path, "-") {
+					continue
+				}
+
+				path = strings.TrimPrefix(path, "+")
+				if strings.HasPrefix(path, "/tmp/") || strings.HasPrefix(path, "/var/tmp/") {
+					required = append(required, path)
+				}
+			}
+		}
+	}
+
+	if !private {
+		return nil
+	}
+
+	return required
+}
+
+// THE READER HOLDS ACROSS THE SPELLINGS systemd accepts, so the rule cannot be
+// passed by writing the same unit another way.
+func TestRequiredPathsUnderPrivateTmpReadsTheUnitAsSystemdDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name, unit string
+		want       []string
+	}{
+		{"canonical", "[Service]\nPrivateTmp=true\nReadWritePaths=/var/lib/billet /var/tmp/billet-images\n", []string{"/var/tmp/billet-images"}},
+		{"yes and spaces", "[Service]\nPrivateTmp = yes\nReadWritePaths = /var/lib /tmp/x\n", []string{"/tmp/x"}},
+		{"optional", "[Service]\nPrivateTmp=true\nReadWritePaths=-/var/tmp/billet-images\n", nil},
+		{"the roots exist", "[Service]\nPrivateTmp=true\nReadWritePaths=/tmp /var/tmp\n", nil},
+		{"not private", "[Service]\nPrivateTmp=false\nReadWritePaths=/var/tmp/billet-images\n", nil},
+		{"last one wins", "[Service]\nPrivateTmp=false\nPrivateTmp=on\nReadWritePaths=/var/tmp/x\n", []string{"/var/tmp/x"}},
+		{"comment", "[Service]\nPrivateTmp=true\n# ReadWritePaths=/var/tmp/x\n", nil},
+	} {
+		if got := requiredPathsUnderPrivateTmp(tc.unit); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
