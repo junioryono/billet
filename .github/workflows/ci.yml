@@ -614,14 +614,26 @@ jobs:
             attempt=$((attempt + 1))
           done
 
+      # THE ROLE'S apt TASKS NEED PACKAGE LISTS, AND THE FLEET'S RUNNER SHIPS NONE:
+      # the guest image build empties /var/lib/apt/lists. This update used to run
+      # only inside the python3-apt install below, which is skipped now that the
+      # image carries python3-apt, so the lists stayed empty and every group whose
+      # converge installs a package failed with `No package matching 'ceph-common'`
+      # (measured on a fleet guest 2026-09-22: 0 lists before, 57 after one
+      # update). The InRelease check fails when the update left no lists at all;
+      # on a runner that starts with none, present means fetched.
+      - name: Refresh apt's package lists
+        run: |
+          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          ls /var/lib/apt/lists/*InRelease >/dev/null
+
       # The check-mode scenario pins /usr/bin/python3, and the apt module in
-      # check mode needs python3-apt there (a real run installs it itself).
-      # The hosted image carries it; the fleet's guest image does not yet.
+      # check mode needs python3-apt there (a real run installs it itself). The
+      # hosted image and the fleet's guest image both carry it.
       - name: Install python3-apt for the apt module's check mode
         run: |
           [ "$(dpkg-query -W -f '${db:Status-Status}' python3-apt 2>/dev/null)" = installed ] && { echo "python3-apt already installed"; exit 0; }
-          sudo sed -i -e 's,^URIs: http://archive[.]ubuntu[.]com/ubuntu/$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' -e 's,^URIs: http://ports[.]ubuntu[.]com/ubuntu-ports/$,URIs: https://ports.ubuntu.com/ubuntu-ports/,' /etc/apt/sources.list.d/ubuntu.sources
-          sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-apt
 
       # The emitted-block and hybrid-emission gates build billet to render what
