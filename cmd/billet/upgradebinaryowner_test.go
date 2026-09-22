@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,8 @@ func TestTheInstalledBinaryIsRootsWhateverTheStagedFileSays(t *testing.T) {
 	if err := os.WriteFile(staged, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+
+	ownedByTheBuilder(t, staged)
 
 	previous := installedBinary
 	installedBinary = installed
@@ -75,6 +78,8 @@ func TestARestoredBinaryIsRootsAndARestoredConfigKeepsItsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	ownedByTheBuilder(t, filepath.Join(preserved, "billet"))
+
 	host := &systemdHost{}
 	if err := host.RestorePreserved(t.Context(), recovery); err != nil {
 		t.Fatalf("RestorePreserved: %v", err)
@@ -102,6 +107,47 @@ func TestARestoredBinaryIsRootsAndARestoredConfigKeepsItsOwner(t *testing.T) {
 	uid, gid := ownerOf(t, from)
 	if len(*calls) != 1 || (*calls)[0].uid != uid || (*calls)[0].gid != gid {
 		t.Fatalf("a configuration copy handed out %+v; want its source's owner %d:%d", *calls, uid, gid)
+	}
+}
+
+// ownedByTheBuilder makes a fixture read as the release builder's (uid 1001)
+// when the test runs as root, where an inherited owner of 0 would let a copy
+// that kept its source's owner pass; unprivileged, the test's own uid is already
+// not root's and the assertion is meaningful as it is.
+func ownedByTheBuilder(t *testing.T, path string) {
+	t.Helper()
+
+	if os.Getuid() != 0 {
+		return
+	}
+
+	if err := os.Chown(path, 1001, 1001); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// AND stageCandidate UNPACKS ONLY THROUGH candidateUnpack: no other tar is run
+// in the transaction's file, so the flag cannot be bypassed by an inline command.
+func TestTheTransactionUnpacksOnlyThroughCandidateUnpack(t *testing.T) {
+	raw, err := os.ReadFile("hostupgrade.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source := string(raw)
+
+	if strings.Count(source, `"tar"`) != 1 {
+		t.Errorf("hostupgrade.go names tar %d times; want once, in candidateUnpack", strings.Count(source, `"tar"`))
+	}
+
+	start := strings.Index(source, "func stageCandidate(")
+	if start < 0 {
+		t.Fatal("hostupgrade.go has no stageCandidate")
+	}
+
+	end := strings.Index(source[start:], "\n}\n")
+	if end < 0 || !strings.Contains(source[start:start+end], "candidateUnpack(ctx, archive, dir)") {
+		t.Error("stageCandidate does not unpack through candidateUnpack")
 	}
 }
 
