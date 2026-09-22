@@ -43,12 +43,16 @@ TimeoutStartSec=7200
 Nice=10
 IOSchedulingClass=idle
 
-# The kernel lock, the staging directory and the jailer are the writable paths a
-# pull needs; the config is read-only.
+# The kernel lock and the jailer are the writable paths a pull needs besides its
+# staging directory, /var/tmp/billet-images, which lives in this unit's private
+# /var/tmp: PrivateTmp makes that writable, and naming it in ReadWritePaths is
+# what kept this unit from ever starting (systemd resolves the entry inside the
+# fresh private directory and fails with 226/NAMESPACE; measured 2026-09-22
+# under systemd 255). The config is read-only.
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/billet /var/tmp/billet-images -/srv/jailer
+ReadWritePaths=/var/lib/billet -/srv/jailer
 ReadOnlyPaths=/etc/billet
 # The pull maps RBD devices and the probe boots under the jailer, which creates
 # cgroups through sysfs; ProtectKernelTunables would remount those read-only.
