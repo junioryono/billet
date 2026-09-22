@@ -155,7 +155,7 @@ billet ships `deploy/sh.billet.node.plist` and `deploy/sh.billet.server.plist`. 
 
 **Virtualization.framework needs an unlocked `login.keychain`.** Since macOS 15 this is an undocumented requirement, recorded in [tart's own FAQ](https://tart.run/faq/): a VM will not run without one, and it fails with `SecKeyCreateRandomKey_ios failed`, `Failed to generate keypair`, or `Interaction is not allowed with the Security Server` — none of which mention a keychain. **A headless SSH session leaves that keychain locked**, so this is exactly the state a remotely-administered Mac is in. A daemon has no login session and therefore no unlocked keychain at all.
 
-That is why a dedicated Mac node wants **automatic login**: a real GUI session at every boot keeps the keychain unlocked. It is a genuine security decision — the disk is unlocked and a session is live whenever the machine is on — and it is the price of running macOS guests with nobody present. The alternative is `security unlock-keychain login.keychain`, which means the password lives wherever that command is driven from. First login must happen through Screen Sharing at least once, because that is what creates the keychain.
+That is why a dedicated Mac node wants **automatic login**: a real GUI session at every boot keeps the keychain unlocked. It is a genuine security decision — the disk is unlocked and a session is live whenever the machine is on — and it is the price of running macOS guests with nobody present. The alternative is `security unlock-keychain login.keychain`, which means the password lives wherever that command is driven from. The first GUI login is what creates the keychain; on the mini it was the console login Setup Assistant ends in, with no Screen Sharing session ever opened (below).
 
 The other two are smaller and still fatal: tart's VM store is **per-user** (`TART_HOME`, default `~/.tart`), so a root daemon looks at root's store and finds none of the images you pulled; and the Linux node unit runs as root only because Docker's socket and the Firecracker jailer demand it, neither of which applies to a CLI the operator's own account drives.
 
@@ -212,7 +212,14 @@ There is a third that shapes `uninstall`: launchd's **disabled-override database
 
 ### Headless operation
 
-Verified against macOS 26 (Tahoe) sources rather than on the mini, which has not arrived. Two of these are recent behaviour changes, so re-verify on the real host before relying on them:
+Written against macOS 26 (Tahoe) sources before the mini arrived. What has since been measured on the mini itself (18-core, 64 GB, 1 TB, macOS 27.0, 2026-09-22), with FileVault off, automatic login set, and Remote Login and Screen Sharing turned on in System Settings:
+
+- **The unattended boot holds.** After `sudo reboot`, with nobody at the keyboard, the account was on `console` and `launchctl print gui/501` reported `type = login` 34 seconds after boot; SSH answered with the key and Screen Sharing answered on port 5900.
+- **The Setup Assistant login created the keychain.** `~/Library/Keychains/login.keychain-db` existed after the console login alone, before any Screen Sharing session, so a Screen Sharing login is not what creates it.
+- **SSH cannot see that keychain.** `security show-keychain-info` from an SSH session answers *User interaction is not allowed* while the GUI session is logged in, so it cannot serve as the check that the keychain is unlocked.
+- **`pmset -a sleep 0 disksleep 0` is accepted**, and `pmset -g` reports `sleep 0 (sleep prevented by powerd)`.
+
+Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), the sshd drop-in below, power-on after a deliberate shutdown, and tart itself on macOS 27. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
 
 **SSH first, then anything else.** `sudo systemsetup -setremotelogin on`, then confirm with `sudo systemsetup -getremotelogin`. On Tahoe, Screen Sharing after a reboot needs SSH to already be reachable, so enabling SSH is not one option among several — it is the one that makes the others recoverable.
 
