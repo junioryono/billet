@@ -3197,7 +3197,10 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// ONLY REAL ESCROW CAN BACK AN ACQUISITION, and it is bought here, for
 		// exactly the offers in hand: the allocator's atomic purchase decides
 		// whether there is room, and what it refuses is not acquired.
-		if len(msg.Available) > 0 {
+		// AND THE OFFER PATH ASKS THE ORDER, for the reason backAssignment does:
+		// escrow bought here is room a waiting tier was accumulating (#157).
+		// What is not bought is not acquired, and GitHub offers it again.
+		if len(msg.Available) > 0 && l.order.mayBuy(l.tier, l.admission(ctx)) {
 			if err := l.refillEscrowTo(ctx, l.targetCapacityFor(len(msg.Available))); err != nil {
 				return err
 			}
@@ -3387,12 +3390,17 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if err != nil {
 		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
 	}
+
+	// READ ONCE, so every purchase in this loop and the record below judge the
+	// tier as it stood at one instant.
+	admission := l.admission(ctx)
+
 	for active < desired {
 		// WHOSE TURN IT IS, asked before the purchase and not after: under fair
 		// the room a finished job leaves belongs to the longest-waiting tier
 		// until its shape fits, and a tier that bought first would have taken it
 		// (admissionQueue).
-		if !l.order.mayBuy(l.tier) {
+		if !l.order.mayBuy(l.tier, admission) {
 			break
 		}
 
@@ -3418,8 +3426,22 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	l.waitingFor = max(desired-active, 0)
 	l.mu.Unlock()
 
+	// A TIER THAT COULD NOT GROW WHATEVER ANYONE FREED DOES NOT HOLD THE LINE.
+	// Its refusal is its own cap, a pin on a host that is gone, or a shape no
+	// live host fits, and none of those is cured by another tier's job ending;
+	// recorded as the longest waiter it would stop the whole fleet buying room
+	// that is free (#157).
+	//
+	// READ AGAIN, AFTER THE PURCHASES: what this tier could grow to is judged as
+	// it stands now, not as it stood before it bought. The tier that reached its
+	// own cap in the loop above could still grow when the loop began, and
+	// recording that answer is exactly the outage this fixes.
 	if active < desired {
-		l.order.waits(l.tier)
+		admission = l.admission(ctx)
+	}
+
+	if active < desired && admission.CanGrow {
+		l.order.waits(l.tier, admission)
 	} else {
 		l.order.served(l.tier)
 	}
@@ -3499,7 +3521,41 @@ func (l *Listener) backAssignment(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
+	// THIS PATH ASKS THE ORDER TOO. On GitHub.com a job arrives as an assignment
+	// rather than an offer, so a stream of small direct assignments took every
+	// fragment of room the longest-waiting tier was accumulating and fairness
+	// protected only the pool path (#157). The assignment is not acquired here:
+	// billet declines it and GitHub reassigns it after its pickup deadline.
+	if !l.order.mayBuy(l.tier, l.admission(ctx)) {
+		return nil
+	}
+
 	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
+}
+
+// admission is what the order needs to know about this tier: whether room could
+// ever reach it, and the hosts it competes for.
+//
+// A READ THAT FAILED IS NOT A WAY PAST THE ORDER, and it is not a refusal
+// either. The tier is kept eligible, because a ledger that could not be read is
+// no evidence that room can never reach it, and the queue decides who buys first
+// rather than whether a purchase is safe (the allocator's atomic escrow does
+// that). Its host set is unknown, which competes with every waiter, so such a
+// purchase is still refused whenever another tier is ahead of it.
+func (l *Listener) admission(ctx context.Context) alloc.TierAdmission {
+	if l.alloc == nil || !l.order.gates() {
+		return alloc.TierAdmission{CanGrow: true}
+	}
+
+	view, err := l.alloc.AdmissionView(ctx)
+	if err != nil {
+		l.log.Warn("could not read which tiers room could reach; admitting this purchase",
+			"tier", l.tier, "error", err)
+
+		return alloc.TierAdmission{CanGrow: true}
+	}
+
+	return view[l.tier]
 }
 
 func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
