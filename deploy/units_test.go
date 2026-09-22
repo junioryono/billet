@@ -457,6 +457,48 @@ func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
 	}
 }
 
+// A PRIVATE /tmp IS NOT THE HOST'S, so a unit with PrivateTmp=true may name no
+// path under /tmp or /var/tmp as required in ReadWritePaths: systemd resolves
+// the entry inside the service's fresh private directory, finds nothing and
+// refuses to start the unit with 226/NAMESPACE. Measured 2026-09-22 under
+// systemd 255.4 on ubuntu-24.04, with PrivateTmp=true and ProtectSystem=strict:
+// ReadWritePaths=/var/tmp/billet-images exited 226 while the directory existed on
+// the host; without the entry, or with a leading '-', the service started and
+// wrote into its private /var/tmp. billet-images-refresh.service carried the
+// entry and so never started once on a systemd host; the fleet it served kept a
+// three-week-old guest image while the daily timer failed in the journal.
+func TestNoPrivateTmpUnitRequiresAWritablePathUnderTmp(t *testing.T) {
+	for name, unit := range map[string]string{
+		deploy.ServerUnitName:        deploy.ServerUnit,
+		deploy.NodeUnitName:          deploy.NodeUnit,
+		deploy.BackupUnitName:        deploy.BackupUnit,
+		deploy.UpgradeUnitName:       deploy.UpgradeUnit,
+		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
+	} {
+		if !strings.Contains(unit, "\nPrivateTmp=true\n") {
+			continue
+		}
+
+		for line := range strings.Lines(unit) {
+			value, ok := strings.CutPrefix(strings.TrimSpace(line), "ReadWritePaths=")
+			if !ok {
+				continue
+			}
+
+			for _, path := range strings.Fields(value) {
+				path = strings.Trim(path, `"`)
+				if strings.HasPrefix(path, "-") {
+					continue
+				}
+
+				if path == "/tmp" || path == "/var/tmp" || strings.HasPrefix(path, "/tmp/") || strings.HasPrefix(path, "/var/tmp/") {
+					t.Errorf("%s has PrivateTmp=true and requires %s in ReadWritePaths; systemd refuses to start it (226/NAMESPACE)", name, path)
+				}
+			}
+		}
+	}
+}
+
 // THE NODE DECLARES ITS TWO RUNTIME DIRECTORIES ONCE, IN [Service], AND THE
 // SERVER DECLARES NONE. The registration record lives under
 // billet/registration; a second assignment or a later empty one would reset
