@@ -596,6 +596,100 @@ func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *tes
 	}
 }
 
+// A UNIT THAT TAKES THE HOST LOCK DECLARES THE DIRECTORY IT LIVES IN, AND ONLY
+// ITS OWNER MAY REMOVE IT.
+//
+// /run/billet/locks is the host-wide collision domain, and ProtectSystem=strict
+// leaves nothing under /run writable except a directory the unit itself
+// declares. The image refresh takes that lock to boot-verify a generation before
+// promoting it, so without the declaration a pull downloaded fifteen gigabytes,
+// imported the generation and then failed on the lock, leaving the image
+// unpromoted and @verified on the old one (measured on a node 2026-09-22).
+//
+// The preserve is the other half. A unit removes the runtime directories it
+// declares when it stops, and a oneshot stops after every run, so a refresh
+// without RuntimeDirectoryPreserve=yes would take the running node's lock
+// directory with it. billet-node.service is the owner and must NOT preserve,
+// which the test above pins; every other unit that declares the directory must.
+func TestAUnitThatTakesTheHostLockDeclaresItWithoutTakingItAway(t *testing.T) {
+	for name, unit := range map[string]string{
+		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
+	} {
+		if got := serviceAssignments(unit, "RuntimeDirectory"); !slices.Equal(got, []string{"billet/locks"}) {
+			t.Errorf("%s assigns RuntimeDirectory=%q; it takes the host lock, and under "+
+				"ProtectSystem=strict a directory it does not declare cannot be opened, so the "+
+				"pull it follows is wasted", name, got)
+		}
+
+		if got := serviceAssignments(unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, []string{"yes"}) {
+			t.Errorf("%s assigns RuntimeDirectoryPreserve=%q; a unit removes the runtime "+
+				"directories it declares when it stops, and this one stops after every run, so "+
+				"anything but yes takes %s's lock directory with it", name, got, deploy.NodeUnitName)
+		}
+
+		if got := serviceAssignments(unit, "RuntimeDirectoryMode"); !slices.Equal(got, []string{"0750"}) {
+			t.Errorf("%s assigns RuntimeDirectoryMode=%q; %s creates that directory 0750, and a "+
+				"different mode re-owns what the two units share", name, got, deploy.NodeUnitName)
+		}
+	}
+}
+
+// serviceAssignments reads a unit as systemd assigns it — comment lines skipped,
+// whitespace around the '=' ignored, sections tracked — and returns every value
+// assigned to one key inside [Service], in order.
+//
+// PARSED RATHER THAN SEARCHED, because a directive named in a COMMENT satisfies
+// a substring search: the first version of the rule above passed against a unit
+// with the preserve deleted, on the strength of the comment that explains why it
+// has to be there.
+func serviceAssignments(unit, key string) []string {
+	var out []string
+
+	section := ""
+
+	for line := range strings.Lines(unit) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "[") {
+			section = line
+
+			continue
+		}
+
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || section != "[Service]" || strings.TrimSpace(k) != key {
+			continue
+		}
+
+		out = append(out, strings.TrimSpace(v))
+	}
+
+	return out
+}
+
+// THE READER IS TESTED ON WHAT FOOLED ITS PREDECESSOR.
+func TestServiceAssignmentsReadsAssignmentsAndNotProse(t *testing.T) {
+	for _, tc := range []struct {
+		name, unit string
+		want       []string
+	}{
+		{"canonical", "[Service]\nRuntimeDirectoryPreserve=yes\n", []string{"yes"}},
+		{"spaces", "[Service]\nRuntimeDirectoryPreserve = yes \n", []string{"yes"}},
+		{"a comment is not an assignment", "[Service]\n# RuntimeDirectoryPreserve=yes keeps it\n", nil},
+		{"another section is not [Service]", "[Unit]\nRuntimeDirectoryPreserve=yes\n", nil},
+		{"back in [Service]", "[Unit]\nX=1\n[Service]\nRuntimeDirectoryPreserve=no\n", []string{"no"}},
+		{"every assignment, in order", "[Service]\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryPreserve=no\n", []string{"yes", "no"}},
+		{"a longer key is not this one", "[Service]\nRuntimeDirectoryPreserveMore=yes\n", nil},
+	} {
+		if got := serviceAssignments(tc.unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // THE CONSTANTS ARE THE UNITS' OWN BOUNDS: a caller that starts or stops a
 // unit under deploy.UnitStartTimeout or deploy.UnitStopTimeout waits exactly
 // as long as systemd would, plus its own margin, and a unit edited without

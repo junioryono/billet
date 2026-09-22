@@ -54,6 +54,27 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/billet -/srv/jailer
 ReadOnlyPaths=/etc/billet
+
+# THE HOST LOCK IS THE REST OF THE PULL. Promotion boot-verifies the generation,
+# and `images verify` takes /run/billet/locks/billet-imageverify-<node>.lock:
+# ProtectSystem=strict leaves nothing under /run writable except a directory the
+# unit declares, so without this the pull downloaded fifteen gigabytes, imported
+# the generation and then failed to verify it — leaving the image unpromoted and
+# @verified still on the old one (measured on a node 2026-09-22).
+#
+# PRESERVED, BECAUSE THIS DIRECTORY IS THE NODE'S. A unit removes the runtime
+# directories it declares when it stops, and this oneshot stops after every pull;
+# without the preserve it would take the running node's lock directory with it.
+# Measured under systemd 255.4 on 2026-09-22: a strict oneshot cannot write there
+# without declaring it; declaring it with RuntimeDirectoryPreserve=yes writes,
+# leaves the owner's files untouched and leaves the directory in place when the
+# oneshot finishes; the owning unit's own stop still removes it; and on a host
+# where no owner has run, this unit creates it itself. Same root:root 0750 as
+# billet-node.service, so the declaration re-owns nothing.
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
 # The pull maps RBD devices and the probe boots under the jailer, which creates
 # cgroups through sysfs; ProtectKernelTunables would remount those read-only.
 ProtectKernelModules=true
