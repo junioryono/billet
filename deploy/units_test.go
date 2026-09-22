@@ -602,9 +602,10 @@ func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *tes
 // /run/billet/locks is the host-wide collision domain, and ProtectSystem=strict
 // leaves nothing under /run writable except a directory the unit itself
 // declares. The image refresh takes that lock to boot-verify a generation before
-// promoting it, so without the declaration a pull downloaded fifteen gigabytes,
-// imported the generation and then failed on the lock, leaving the image
-// unpromoted and @verified on the old one (measured on a node 2026-09-22).
+// promoting it, so without the declaration a pull downloaded the image (about
+// 5.1 GiB of parts, 23.6 GB decompressed), imported the generation and then
+// failed on the lock, leaving the image unpromoted and @verified on the old one
+// (measured on a node 2026-09-22).
 //
 // The preserve is the other half. A unit removes the runtime directories it
 // declares when it stops, and a oneshot stops after every run, so a refresh

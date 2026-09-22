@@ -58,9 +58,10 @@ ReadOnlyPaths=/etc/billet
 # THE HOST LOCK IS THE REST OF THE PULL. Promotion boot-verifies the generation,
 # and `images verify` takes /run/billet/locks/billet-imageverify-<node>.lock:
 # ProtectSystem=strict leaves nothing under /run writable except a directory the
-# unit declares, so without this the pull downloaded fifteen gigabytes, imported
-# the generation and then failed to verify it — leaving the image unpromoted and
-# @verified still on the old one (measured on a node 2026-09-22).
+# unit declares, so without this the pull downloaded the image (about 5.1 GiB of
+# parts, 23.6 GB decompressed), imported the generation and then failed to
+# verify it — leaving the image unpromoted and @verified still on the old one
+# (measured on a node 2026-09-22).
 #
 # PRESERVED, BECAUSE THIS DIRECTORY IS THE NODE'S. A unit removes the runtime
 # directories it declares when it stops, and this oneshot stops after every pull;
@@ -74,6 +75,7 @@ ReadOnlyPaths=/etc/billet
 RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
+
 # The pull maps RBD devices and the probe boots under the jailer, which creates
 # cgroups through sysfs; ProtectKernelTunables would remount those read-only.
 ProtectKernelModules=true
