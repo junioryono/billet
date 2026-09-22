@@ -1735,7 +1735,7 @@ func stageCandidate(ctx context.Context, client *releasesource.Client,
 	// UNPACKED WITH tar, WHICH IS ON EVERY HOST BILLET RUNS ON. The archive's
 	// digest has already been proved against the signed manifest, so what comes
 	// out of it is what was published.
-	cmd := exec.CommandContext(ctx, "tar", "-xzf", archive, "-C", dir, "billet")
+	cmd := candidateUnpack(ctx, archive, dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("unpack %s: %w: %s", filepath.Base(archive), err, out)
 	}
@@ -1746,6 +1746,29 @@ func stageCandidate(ctx context.Context, client *releasesource.Client,
 	}
 
 	return staged, nil
+}
+
+// candidateUnpack is the tar that unpacks the candidate from its archive.
+//
+// --no-same-owner BECAUSE tar RUN AS ROOT RESTORES RECORDED OWNERS by default,
+// and a release archive records its builder's account (uid 1001 on the hosted
+// runner): the staged candidate, and the /usr/bin/billet copied from it, came out
+// 1001's (measured on a fleet 2026-09-22). GNU tar and bsdtar both spell it so.
+func candidateUnpack(ctx context.Context, archive, dir string) *exec.Cmd {
+	return exec.CommandContext(ctx, "tar", "--no-same-owner", "-xzf", archive, "-C", dir, "billet")
+}
+
+// rootOwner is the owner the installed binary is given by a privileged updater,
+// whatever the file it is copied from says: a root-executed binary another
+// account owns is one that account can replace.
+type rootOwner struct{ os.FileInfo }
+
+func (rootOwner) Sys() any { return &syscall.Stat_t{Uid: 0, Gid: 0} }
+
+// installBinaryFrom copies a binary to installedBinary as root's under a
+// privileged updater (an unprivileged one keeps its own, see fchownLike).
+func installBinaryFrom(from string) error {
+	return copyFileOwnedBy(from, installedBinary, rootOwner{})
 }
 
 // systemdHost is the real machine.
@@ -2095,7 +2118,7 @@ var identityOwner = os.Stat
 
 // InstallCandidate puts the staged binary in place.
 func (h *systemdHost) InstallCandidate(_ context.Context) error {
-	return copyFile(h.staged, installedBinary)
+	return installBinaryFrom(h.staged)
 }
 
 // RecordInstalled writes which manifest produced the binary now in place.
@@ -2847,7 +2870,15 @@ func (h *systemdHost) RestorePreserved(_ context.Context, dir string) error {
 			return fmt.Errorf("read the preserved %s: %w", filepath.Base(target), err)
 		}
 
-		if err := copyFile(source, target); err != nil {
+		// THE BINARY IS ROOT'S HOWEVER IT WAS PRESERVED: a host an earlier upgrade
+		// left with a 1001-owned binary preserved exactly that. Everything else
+		// keeps the owner it had.
+		copyBack := copyFile
+		if target == installedBinary {
+			copyBack = func(from, _ string) error { return installBinaryFrom(from) }
+		}
+
+		if err := copyBack(source, target); err != nil {
 			return err
 		}
 	}
