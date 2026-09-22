@@ -12,7 +12,7 @@ One job, one ephemeral VM on an Apple Silicon Mac you own, through [tart](https:
 - **Disk.** The Xcode image is about 87 GB on disk (140 GB virtual) before clones; the arm64 Linux `ubuntu-runner-arm64` image is 11.3 GB compressed on a 40 GB virtual disk. billet refuses to pull inside a launch because a node executes one command at a time; pull before the first job.
 - **Not 10GbE.** A Mac never joins a Ceph site (`node.ceph` is refused on a tart node), so its traffic is GitHub polling, image pulls and artifact uploads.
 
-The [reference Mac](../reference/reference-hardware.md) is a Mac mini with 64 GB and 1 TB, sized for two comfortable macOS guests plus a Linux tier; a 24 GB mini running one macOS guest is a real deployment. Every fact below was measured on an M2 Max running macOS 26, tart 2.36.0 and softnet 0.23.0.
+The [reference Mac](../reference/reference-hardware.md) is a Mac mini with 64 GB and 1 TB, sized for two comfortable macOS guests plus a Linux tier; a 24 GB mini running one macOS guest is a real deployment. Every fact about tart, its guests and softnet below was measured on an M2 Max running macOS 26, tart 2.36.0 and softnet 0.23.0; what the first-boot steps rest on was measured on the reference mini under macOS 27.0 on 2026-09-22 and is recorded in [Headless operation](../reference/reference-hardware.md#headless-operation).
 
 ## Before billet: Setup Assistant and the first boot
 
@@ -31,10 +31,10 @@ Done once, at the Mac, in this order; nothing here can be done remotely before i
    ```
 
    `LocalHostName` is also the Bonjour name, so the Mac answers as `mac-mini-1.local` on the LAN whatever address DHCP gives it; a DHCP reservation is still worth making, because whatever routes to the Mac from outside names an address.
-4. **Install Homebrew and tart** (`brew install cirruslabs/cli/tart`), and install billet itself (see [Installation](../getting-started/installation.md)). Rosetta is not needed.
+4. **Install Homebrew and tart** (`brew install cirruslabs/cli/tart`). Rosetta is not needed. billet itself is installed in the next section, once `/usr/local/bin` exists: Homebrew on Apple Silicon lives under `/opt/homebrew`, and the install script refuses a directory that is not there.
 5. **Prove the unattended boot before the Mac goes headless**, while a keyboard is still attached: `sudo reboot`, then from another machine over SSH, `who` lists the account on `console` and `launchctl print gui/$(id -u)` reports `type = login`. Only then disconnect the display. From SSH, `security show-keychain-info ~/Library/Keychains/login.keychain-db` answers *User interaction is not allowed* even while the GUI session holds the keychain unlocked, because an SSH session is a different security session; that answer is not a failure, and the proof that the keychain serves Virtualization.framework is the first guest billet starts.
 
-A macOS update is then `billet drain --wait`, the update and its restart, and `billet resume`; automatic login brings the agents back. Treat a major macOS version as a change to test rather than an update to take, because Virtualization.framework and tart move with it.
+A macOS update is then `billet local down` (it drains this host, waiting for as long as its jobs run, then stops and disables its agents), the update and its restart, and `billet local up`. `billet drain` is the wrong tool for one host: it seals the whole deployment through the ledger. Treat a major macOS version as a change to test rather than an update to take, because Virtualization.framework and tart move with it.
 
 ## Set it up, on the Mac
 
@@ -45,6 +45,7 @@ sudo mkdir -p /usr/local/bin /usr/local/etc/billet /usr/local/var/log/billet \
               /usr/local/var/lib/billet /usr/local/var/run/billet/locks
 sudo chown "$(id -un)" /usr/local/bin /usr/local/etc/billet /usr/local/var/log/billet \
               /usr/local/var/lib/billet /usr/local/var/run/billet/locks
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 
 billet init --profile local-service --provider tart --node-name mac-mini-1
 billet github-app create --org <your-org> --config "$CFG"

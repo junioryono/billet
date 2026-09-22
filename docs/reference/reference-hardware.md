@@ -217,7 +217,7 @@ Written against macOS 26 (Tahoe) sources before the mini arrived. What has since
 - **The unattended boot holds.** After `sudo reboot`, with nobody at the keyboard, the account was on `console` and `launchctl print gui/501` reported `type = login` 34 seconds after boot; SSH answered with the key and Screen Sharing answered on port 5900.
 - **The Setup Assistant login created the keychain.** `~/Library/Keychains/login.keychain-db` existed after the console login alone, before any Screen Sharing session, so a Screen Sharing login is not what creates it.
 - **SSH cannot see that keychain.** `security show-keychain-info` from an SSH session answers *User interaction is not allowed* while the GUI session is logged in, so it cannot serve as the check that the keychain is unlocked.
-- **`pmset -a sleep 0 disksleep 0` is accepted**, and `pmset -g` reports `sleep 0 (sleep prevented by powerd)`.
+- **After `pmset -a sleep 0 disksleep 0 womp 1`**, `pmset -g` read back `sleep 0 (sleep prevented by powerd)`, `disksleep 0` and `womp 1`.
 
 Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), the sshd drop-in below, power-on after a deliberate shutdown, and tart itself on macOS 27. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
 
