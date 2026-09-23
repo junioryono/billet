@@ -253,6 +253,9 @@ github:
 #     app_id: 0
 #     installation_id: 0
 #     private_key_path: /etc/billet/app-private-key-personal.pem
+#     # This target's share: the most its tiers hold at once between them, so
+#     # a burst of its CI leaves the other targets the rest of the ceiling.
+#     max_vcpu: 80
 
 # Where `billet local backup` puts a copy that is NOT on the disk it protects.
 #

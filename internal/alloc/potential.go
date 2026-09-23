@@ -66,6 +66,13 @@ type TierAdmission struct {
 	// two of them together could not, so a stream of the small one starved the
 	// large one on a fleet where they shared no host.
 	CeilingShared bool
+	// Target is the target this tier's share is keyed by.
+	Target string
+	// ShareBound reports that this tier's own target share, not the fleet, is
+	// what stops it buying one more now. Room another target's jobs free can
+	// never reach it until its own target's work ends, so it must not hold that
+	// target's tiers back: that is the starvation a share exists to prevent.
+	ShareBound bool
 }
 
 // AdmissionView reads every tier's TierAdmission in one ledger snapshot, so one
@@ -139,7 +146,15 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 				grow = room > 0
 			}
 
-			out[label] = TierAdmission{CanGrow: grow, Nodes: p.nodes, CeilingShared: shared}
+			bound, err := a.shareBound(ctx, tx, t)
+			if err != nil {
+				return err
+			}
+
+			out[label] = TierAdmission{
+				CanGrow: grow, Nodes: p.nodes, CeilingShared: shared,
+				Target: config.ShareTarget(t), ShareBound: bound,
+			}
 		}
 
 		return nil
@@ -263,6 +278,18 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 	vcpu, memory := a.limits.MaxVCPU-owedVCPU, a.limits.MaxMemory-owedMemory
 
 	t := a.tiers[label]
+
+	// ONCE CURRENT WORK ENDS the whole share is free again, so the model is
+	// bounded by the share itself rather than by what is left of it.
+	if share, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
+		if share.VCPU > 0 {
+			vcpu = min(vcpu, share.VCPU)
+		}
+
+		if share.Memory > 0 {
+			memory = min(memory, share.Memory)
+		}
+	}
 
 	p, err := free.forTier(ctx, tx, a, t)
 	if err != nil {

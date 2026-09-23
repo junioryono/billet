@@ -515,3 +515,34 @@ func TestCheckTargetNameIsTheLabelGrammar(t *testing.T) {
 		}
 	}
 }
+
+// A TARGET'S SHARE LOADS FROM ITS OWN BLOCK and is keyed by the target's name,
+// which is what every tier's share is looked up by (#192).
+func TestATargetShareLoadsKeyedByTarget(t *testing.T) {
+	body := twoTargetConfig(t, "personal")
+	body = strings.Replace(body, "  - label: billet-8vcpu-ubuntu-2404\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    target: default\n", 1)
+	body = strings.Replace(body, "    private_key_path: /etc/billet/app-personal.pem\n",
+		"    private_key_path: /etc/billet/app-personal.pem\n    max_vcpu: 8\n", 1)
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	shares := cfg.TargetShares()
+	if len(shares) != 1 || shares["personal"] != (TargetShare{VCPU: 8}) {
+		t.Fatalf("shares = %+v, want personal's 8 vCPU alone", shares)
+	}
+
+	if got := ShareTarget(cfg.Tiers[0]); got != "personal" {
+		t.Errorf("the first tier's share is keyed %q, want personal", got)
+	}
+
+	// A share smaller than one of its tiers is a tier that never runs.
+	small := strings.Replace(body, "    max_vcpu: 8\n", "    max_vcpu: 2\n", 1)
+	if _, err := Load(writeConfig(t, small)); err == nil ||
+		!strings.Contains(err.Error(), `target "personal"`) {
+		t.Errorf("a share below its tier's shape loaded: %v", err)
+	}
+}

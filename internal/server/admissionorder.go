@@ -97,8 +97,16 @@ func (q *admissionQueue) gates() bool {
 // host starve a large tier waiting on the other.
 //
 // A tier whose hosts are unknown competes with every tier, so a failed read
-// never lets a purchase skip the order.
+// never lets a purchase skip the order. The one exception is a share, below.
 func competes(a, b alloc.TierAdmission) bool {
+	// A TIER HELD BY ITS OWN TARGET'S SHARE takes nothing another target frees,
+	// so it neither holds that target back nor is held back by it (#192). The
+	// flag is the view at the waiter's last refusal; a stale one lets another
+	// target buy for up to one poll, which is the direction the share favours.
+	if a.Target != b.Target && (a.ShareBound || b.ShareBound) {
+		return false
+	}
+
 	if a.CeilingShared && b.CeilingShared {
 		return true
 	}

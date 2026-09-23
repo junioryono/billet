@@ -401,3 +401,44 @@ func TestADirectAssignmentWaitsItsTurn(t *testing.T) {
 			"is holding", got)
 	}
 }
+
+// A WAITER HELD BY ITS OWN TARGET'S SHARE DOES NOT HOLD ANOTHER TARGET (#192).
+//
+// Room the other target frees can never reach it, so letting it hold the line
+// would reproduce, through the order, the starvation the share exists to
+// prevent. It still holds its own target's tiers, which do compete for the
+// share.
+func TestAShareBoundWaiterHoldsOnlyItsOwnTarget(t *testing.T) {
+	t.Parallel()
+
+	bound := on("host")
+	bound.Target, bound.ShareBound = "repo", true
+
+	org := on("host")
+	org.Target = "default"
+
+	sibling := on("host")
+	sibling.Target = "repo"
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-16", bound)
+
+	if !q.mayBuy("org-2", org) {
+		t.Error("a waiter held by its own target's share held another target's tier back")
+	}
+
+	if q.mayBuy("repo-8", sibling) {
+		t.Error("a sibling tier of the same target bought ahead of the waiter sharing its share")
+	}
+
+	// And a waiter the FLEET holds, not its share, still holds every target.
+	unbound := on("host")
+	unbound.Target = "repo"
+
+	q = newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-16", unbound)
+
+	if q.mayBuy("org-2", org) {
+		t.Error("a waiter held by the fleet let another target's tier buy ahead of it")
+	}
+}

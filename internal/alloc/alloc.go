@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -204,6 +205,11 @@ type Limits struct {
 	// config.DefaultMacOSVMLimit — the licence rather than "unlimited", so a mistyped
 	// node name costs a scheduling constraint rather than a licence violation.
 	Nodes map[string]config.NodePolicy
+
+	// Shares is each target's share by target name, from
+	// config.Config.TargetShares: a ceiling inside MaxVCPU/MaxMemory that the
+	// tiers of one target buy from together. A target absent from it has none.
+	Shares map[string]config.TargetShare
 }
 
 // Lease is a capacity reservation. The Epoch is the fencing token: every write
@@ -412,6 +418,12 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	}
 
 	limits.Nodes = perNode
+
+	if errs := config.TargetShareErrors(limits.Shares, tiers, limits.MaxVCPU, limits.MaxMemory); len(errs) > 0 {
+		return nil, fmt.Errorf("alloc: %w", errors.Join(errs...))
+	}
+
+	limits.Shares = maps.Clone(limits.Shares)
 
 	a := &Allocator{
 		db:       db,
@@ -987,6 +999,17 @@ func (a *Allocator) headroomWithPlacer(
 	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-owedVCPU, 0)
 	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-owedMemory, 0)
 
+	// A TARGET'S SHARE IS A NARROWER DEPLOYMENT CEILING, spent by the placer at
+	// the same charged cost, so a remote shape counts against it as it counts
+	// against the deployment.
+	shareVCPU, shareMemory, err := a.shareRoom(ctx, tx, t, 0, 0)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	place.deploymentVCPU = min(place.deploymentVCPU, max(shareVCPU, 0))
+	place.deploymentMemory = min(place.deploymentMemory, max(shareMemory, 0))
+
 	n := place.total(t)
 
 	if t.MaxConcurrent > 0 {
@@ -1360,11 +1383,24 @@ func (a *Allocator) Resize(
 
 		deploymentVCPU := a.limits.MaxVCPU - (fleetUsed.VCPU - lease.VCPU) - owedVCPU
 		deploymentMemory := a.limits.MaxMemory - (fleetUsed.Memory - lease.Memory) - owedMemory
+
+		// The share is authorised the same way: as if this lease's current shape
+		// had been returned to its target first.
+		shareVCPU, shareMemory := unboundedVCPU, unboundedMemory
+		if t, ok := a.tiers[lease.Tier]; ok {
+			shareVCPU, shareMemory, err = a.shareRoom(ctx, tx, t, lease.VCPU, lease.Memory)
+			if err != nil {
+				return err
+			}
+		}
+
 		if vcpu > free.vcpu[lease.Node] || memory > free.memory[lease.Node] ||
 			vcpu > deploymentVCPU || memory > deploymentMemory ||
+			vcpu > shareVCPU || memory > shareMemory ||
 			vcpu > nodeVCPU || memory > config.ByteSize(nodeMemory) {
 			return fmt.Errorf("%w: EC2 fallback %q needs %d vCPU and %s, which would exceed "+
-				"the node or deployment budget or consume another tier's reserved capacity",
+				"the node or deployment budget or its target's share, or consume another "+
+				"tier's reserved capacity",
 				ErrNoCapacity, instanceType, vcpu, memory)
 		}
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -158,6 +159,114 @@ func (c *Config) GitHubTargets() []GitHubTarget {
 	}
 
 	return out
+}
+
+// TargetShare is the most one target's tiers may hold at once, between them.
+// A zero dimension is unbounded by the share.
+type TargetShare struct {
+	VCPU   int
+	Memory ByteSize
+}
+
+// TargetShares is every target's share by target name; a target that bounds
+// neither dimension is absent.
+func (c *Config) TargetShares() map[string]TargetShare {
+	blocks := map[string]*GitHubConfig{}
+	if c.GitHub != nil {
+		blocks[DefaultTargetName] = c.GitHub
+	}
+
+	for i := range c.Targets {
+		blocks[c.Targets[i].Name] = &c.Targets[i]
+	}
+
+	out := map[string]TargetShare{}
+	for name, g := range blocks {
+		if g.MaxVCPU != 0 || g.MaxMemory != 0 {
+			out[name] = TargetShare{VCPU: g.MaxVCPU, Memory: g.MaxMemory}
+		}
+	}
+
+	return out
+}
+
+// ShareTarget is the target a tier's share is keyed by: its own, or the
+// default target's when it names none, which is what applyDefaults writes.
+func ShareTarget(t Tier) string {
+	if t.Target == "" {
+		return DefaultTargetName
+	}
+
+	return t.Target
+}
+
+// TargetShareErrors reports a share billet could not honour.
+//
+// Exported because alloc.New re-applies it on a catalogue that never went
+// through Parse. A share below one of its tiers' shapes, or below what its
+// tiers' floors hold between them, is a tier that can never run or a floor that
+// can never be kept; one above the deployment ceiling bounds nothing and is
+// more likely a typo than an intent.
+func TargetShareErrors(shares map[string]TargetShare, tiers []Tier, maxVCPU int,
+	maxMemory ByteSize,
+) []error {
+	var errs []error
+
+	names := make([]string, 0, len(shares))
+	for name := range shares {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		share := shares[name]
+
+		if share.VCPU < 0 || share.Memory < 0 {
+			errs = append(errs, fmt.Errorf("target %q: max_vcpu and max_memory must not be "+
+				"negative", name))
+
+			continue
+		}
+
+		if maxVCPU > 0 && share.VCPU > maxVCPU {
+			errs = append(errs, fmt.Errorf("target %q: max_vcpu %d is above server.max_vcpu %d, "+
+				"so it bounds nothing", name, share.VCPU, maxVCPU))
+		}
+
+		if maxMemory > 0 && share.Memory > maxMemory {
+			errs = append(errs, fmt.Errorf("target %q: max_memory %s is above server.max_memory "+
+				"%s, so it bounds nothing", name, share.Memory, maxMemory))
+		}
+
+		var floorVCPU int
+
+		var floorMemory ByteSize
+
+		for _, t := range tiers {
+			if ShareTarget(t) != name {
+				continue
+			}
+
+			if (share.VCPU > 0 && t.VCPU > share.VCPU) || (share.Memory > 0 && t.Memory > share.Memory) {
+				errs = append(errs, fmt.Errorf("tier %q requests %d vCPU and %s, more than its "+
+					"target %q's share of %d vCPU and %s; its jobs would never be schedulable",
+					t.Label, t.VCPU, t.Memory, name, share.VCPU, share.Memory))
+			}
+
+			floorVCPU += t.Reserved * t.VCPU
+			floorMemory += ByteSize(t.Reserved) * t.Memory
+		}
+
+		if (share.VCPU > 0 && floorVCPU > share.VCPU) ||
+			(share.Memory > 0 && floorMemory > share.Memory) {
+			errs = append(errs, fmt.Errorf("target %q: its tiers' reserved floors hold %d vCPU "+
+				"and %s, more than its share of %d vCPU and %s, so a floor could never be kept",
+				name, floorVCPU, floorMemory, share.VCPU, share.Memory))
+		}
+	}
+
+	return errs
 }
 
 // GitHubTarget resolves a target by name.
