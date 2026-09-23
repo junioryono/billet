@@ -291,3 +291,85 @@ func TestShareBoundIsMeasuredAtTheChargedShape(t *testing.T) {
 		t.Errorf("4 vCPU left of the share against an 8 vCPU charge reported %+v, want share-bound", got)
 	}
 }
+
+// SHARE-BOUND TESTS EACH SHAPE WHOLE. The least vCPU of one host's shape and the
+// least memory of another's describe a shape nobody sells, and a tier judged by
+// it would hold other targets back for room it can never use.
+func TestShareBoundTestsEachChargedShapeWhole(t *testing.T) {
+	cloud := config.Tier{
+		Label: "cloud", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 4 * config.GiB, Image: "ami-test",
+	}
+	a := newBareAllocator(t, Limits{
+		MaxVCPU: 64, MaxMemory: 256 * config.GiB,
+		Shares: map[string]config.TargetShare{
+			config.DefaultTargetName: {VCPU: 4, Memory: 16 * config.GiB},
+		},
+	}, []config.Tier{cloud})
+
+	for name, shape := range map[string]config.EC2InstanceType{
+		"cloud-wide": {Type: "wide", VCPU: 4, Memory: 32 * config.GiB},
+		"cloud-tall": {Type: "tall", VCPU: 8, Memory: 16 * config.GiB},
+	} {
+		if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+			Name: name, Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+			EC2Shapes: []config.EC2InstanceType{shape},
+		}); err != nil {
+			t.Fatalf("RegisterNode %s: %v", name, err)
+		}
+	}
+
+	if got := admissionOf(t, a, "cloud"); !got.ShareBound {
+		t.Errorf("no charged shape fits a 4 vCPU, 16GiB share, yet the tier was not share-bound: %+v", got)
+	}
+}
+
+// A RESIZE CREDITS THE RETURNED SHAPE BEFORE THE FLOORS ARE HELD. Credited only
+// afterwards, a sibling's floor measured against the share without it held
+// nothing, and the fallback then took the room that floor was owed.
+func TestAResizeKeepsASiblingFloorItsShare(t *testing.T) {
+	cloud := config.Tier{
+		Label: "cloud", Target: "repo", Provider: config.ProviderEC2,
+		GuestOS: config.GuestLinux, VCPU: 2, Memory: 4 * config.GiB, Image: "ami-test",
+	}
+	floored := targetTier("floored", "repo", 12, 16*config.GiB)
+	floored.Reserved = 1
+
+	a := newBareAllocator(t, Limits{
+		MaxVCPU: 64, MaxMemory: 256 * config.GiB,
+		Shares: map[string]config.TargetShare{"repo": {VCPU: 16}},
+	}, []config.Tier{cloud, floored})
+
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{
+			{Type: "eight", VCPU: 8, Memory: 16 * config.GiB},
+			{Type: "sixteen", VCPU: 16, Memory: 32 * config.GiB},
+		},
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// The floored tier has no host yet, so its floor holds nothing and the
+	// cloud tier buys inside the whole share.
+	lease := reserve(t, a, "cloud")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "cloud-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	// A host arrives that can keep the floor: 12 of the share are now owed to it.
+	if _, err := a.RegisterNode(t.Context(), testRegistration("fc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode fc: %v", err)
+	}
+
+	err := a.Resize(t.Context(), lease.ID, lease.Epoch, "sixteen", 16, 32*config.GiB)
+	if !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("a fallback into the sibling floor's share returned %v, want ErrNoCapacity", err)
+	}
+}

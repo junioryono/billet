@@ -277,7 +277,7 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 	// host the model then re-packed that floor onto was reported unable to grow
 	// and never joined the waiting order at all — the starvation this view exists
 	// to prevent. reserveFloors holds only what is outstanding.
-	floors, err := a.reserveFloors(ctx, tx, label, free)
+	floors, err := a.reserveFloors(ctx, tx, label, free, placementCost{})
 	if err != nil {
 		return potential{}, err
 	}

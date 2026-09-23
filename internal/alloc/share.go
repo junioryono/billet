@@ -135,11 +135,13 @@ func (a *Allocator) shareTargets() []string {
 	return out
 }
 
-// cheapestCharge is the least one lease of this tier is charged on any host it
-// could be placed on: the tier request on a host backend, the smallest fitting
-// shape on a remote one. With no eligible host it is the tier request.
-func cheapestCharge(p *placer, t config.Tier) placementCost {
-	out := placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
+// anyChargeFits reports whether one lease of this tier, charged as it would be
+// on some host it could be placed on, fits room whole. Each candidate's shape is
+// tested as a vector: the least vCPU of one shape and the least memory of
+// another describe a shape nobody sells. With no candidate host, the tier
+// request is what is tested.
+func anyChargeFits(p *placer, t config.Tier, room placementCost) bool {
+	tested := false
 
 	for _, n := range p.order {
 		c, ok := p.cost[n.name]
@@ -147,20 +149,20 @@ func cheapestCharge(p *placer, t config.Tier) placementCost {
 			continue
 		}
 
-		out.vcpu, out.memory = min(out.vcpu, c.vcpu), min(out.memory, c.memory)
+		tested = true
+
+		if c.vcpu <= room.vcpu && c.memory <= room.memory {
+			return true
+		}
 	}
 
-	if out.vcpu == unboundedVCPU {
-		return placementCost{vcpu: t.VCPU, memory: t.Memory}
-	}
-
-	return out
+	return !tested && t.VCPU <= room.vcpu && t.Memory <= room.memory
 }
 
 // shareBound reports whether a tier's own target share, rather than the fleet,
-// is what stops it buying one more now, measured at the least a lease of it is
-// charged on any host it could use: a remote tier is charged the shape it buys,
-// not its request.
+// is what stops it buying one more now, measured at the shape a lease of it is
+// charged on the hosts it could use: a remote tier is charged the shape it
+// buys, not its request.
 func (a *Allocator) shareBound(ctx context.Context, tx querier, t config.Tier) (bool, error) {
 	if _, ok := a.limits.Shares[config.ShareTarget(t)]; !ok {
 		return false, nil
@@ -176,7 +178,5 @@ func (a *Allocator) shareBound(ctx context.Context, tx querier, t config.Tier) (
 		return false, err
 	}
 
-	charge := cheapestCharge(p, t)
-
-	return room.vcpu < charge.vcpu || room.memory < charge.memory, nil
+	return !anyChargeFits(p, t, room), nil
 }

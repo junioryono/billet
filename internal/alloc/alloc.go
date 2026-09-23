@@ -1376,7 +1376,8 @@ func (a *Allocator) Resize(
 		}
 		free.vcpu[lease.Node] += lease.VCPU
 		free.memory[lease.Node] += lease.Memory
-		floors, err := a.reserveFloors(ctx, tx, lease.Tier, free)
+		floors, err := a.reserveFloors(ctx, tx, lease.Tier, free,
+			placementCost{vcpu: lease.VCPU, memory: lease.Memory})
 		if err != nil {
 			return err
 		}

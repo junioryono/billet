@@ -32,9 +32,12 @@ import (
 // A TARGET'S FLOORS ARE HELD INSIDE ITS SHARE, at the shape each is charged:
 // more than the share can hold can never be kept, and holding it anyway would
 // take room from every other target. What each target's floors held is handed
-// back so a purchase for a sibling tier leaves it inside the share.
+// back so a purchase for a sibling tier leaves it inside the share. returned is
+// a lease of forTier handed back first, as a resize is authorised; it is
+// credited to forTier's share, or to every share when forTier left the
+// catalogue, because that is where its charge sits.
 func (a *Allocator) reserveFloors(
-	ctx context.Context, tx querier, forTier string, free *fleet,
+	ctx context.Context, tx querier, forTier string, free *fleet, returned placementCost,
 ) (floorCharge, error) {
 	open, err := a.countOpenPerTier(ctx, tx)
 	if err != nil {
@@ -49,8 +52,18 @@ func (a *Allocator) reserveFloors(
 	held := floorCharge{byTarget: map[string]placementCost{}}
 	budget := map[string]placementCost{}
 
+	returnedTo := ""
+	if t, ok := a.tiers[forTier]; ok {
+		returnedTo = config.ShareTarget(t)
+	}
+
 	for _, target := range a.shareTargets() {
-		budget[target] = a.room(usage, target, placementCost{})
+		credit := placementCost{}
+		if returnedTo == "" || returnedTo == target {
+			credit = returned
+		}
+
+		budget[target] = a.room(usage, target, credit)
 	}
 
 	// IN A FIXED ORDER, because these floors compete with each other for the same

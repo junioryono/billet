@@ -227,7 +227,7 @@ func (a *Allocator) placerWithFloors(
 		return nil, floorCharge{}, err
 	}
 
-	floors, err := a.reserveFloors(ctx, tx, t.Label, free)
+	floors, err := a.reserveFloors(ctx, tx, t.Label, free, placementCost{})
 	if err != nil {
 		return nil, floorCharge{}, err
 	}
