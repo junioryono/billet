@@ -1056,7 +1056,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		// A joined node has no App to create; the rest of its guidance is the
 		// same once the merged file is in place.
 		if joining {
-			printJoinNext(*cfgPath, params.Profile, joined)
+			printJoinNext(*cfgPath, params.Profile, joined, true)
 
 			return nil
 		}
@@ -1102,7 +1102,7 @@ func cmdInit(ctx context.Context, args []string) error {
 
 	report()
 	if joining {
-		printJoinNext(*cfgPath, params.Profile, joined)
+		printJoinNext(*cfgPath, params.Profile, joined, false)
 
 		return nil
 	}
@@ -1114,7 +1114,10 @@ func cmdInit(ctx context.Context, args []string) error {
 
 // printJoinNext says what a joined node still needs once its config is
 // written: the control plane's half, its certificate bundle, and a start.
-func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult) {
+// replaced is a config merged over one the services may already be running.
+func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult,
+	replaced bool,
+) {
 	printJoinControlPlane(joined)
 
 	pathArg := shellArg(cfgPath)
@@ -1157,6 +1160,10 @@ func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig
 				account, shellArg(service), shellArg(service))
 		}
 		step = 4
+	}
+	if replaced {
+		fmt.Printf("  %d. billet local down --reason 'joined a control plane'\n", step)
+		step++
 	}
 	fmt.Printf("  %d. billet local up\n", step)
 }
