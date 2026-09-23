@@ -24,6 +24,10 @@ type resolvedJob struct {
 	cleanup    Job
 	binding    *alloc.PoolRunner
 	held       []actualJobIdentity
+	// detached is a runner-less completion whose request is the launch identity
+	// of a pool runner GitHub gave another job, or a job not yet known: the
+	// completion is not that runner's, and settling it would end the other job.
+	detached bool
 }
 
 type jobResolution int
@@ -164,6 +168,8 @@ func actualJobCandidates(actual actualJobIdentity, requestID int64, known []actu
 // ID from JobID. 114/860 runners (13%) completed another job than their launch;
 // no JobID started twice, no runner started two jobs, and every completion named
 // its runner. Cross-run JobID ambiguity and request-only assignments were unseen.
+// Not every completion does: a job cancelled before any runner took it completes
+// with none (a controller's journal, 2026-09-22), which is what detached is for.
 func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolution,
 	known []actualJobIdentity,
 ) (resolvedJob, error) {
@@ -293,6 +299,23 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 		if out.cleanup.RequestID == 0 {
 			return out, fmt.Errorf("%w: %s completed runner %q without a request id or resolvable job or billet lease identity",
 				errQuarantinableCompletion, l.tier, job.RunnerName)
+		}
+		if job.RunnerName == "" && l.alloc != nil {
+			launched, err := l.alloc.PoolRunnerLaunchedFor(ctx, l.tier, out.cleanup.RequestID)
+			switch {
+			case err == nil:
+				// A busy runner whose job is not yet known (recovered, awaiting its
+				// JobStarted) is held too: only a binding to this very job settles it.
+				bound := actualJobIdentity{job: launched.JobID, run: launched.RunID}
+				if launched.ActualRequestID != 0 {
+					bound.requests = []int64{launched.ActualRequestID}
+				}
+				out.detached = (launched.ActualRequestID != 0 || launched.Status == alloc.PoolRunnerBusy) &&
+					!sameActualJob(out.actual, bound)
+			case !errors.Is(err, alloc.ErrLeaseNotFound):
+				return out, fmt.Errorf("%w: cannot resolve the runner launched for %s request %d: %w",
+					ErrUntrustworthySession, l.tier, out.cleanup.RequestID, err)
+			}
 		}
 	} else if mode == resolveAcquisition && out.job.RequestID == 0 {
 		return out, fmt.Errorf("%w: %s cannot identify directly assigned job %q",

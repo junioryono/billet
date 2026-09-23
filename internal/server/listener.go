@@ -3100,6 +3100,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if containsActual(resolved.held, entry.actual) {
 			continue
 		}
+		if entry.detached {
+			// Still finished, so a redelivered offer for it is not acquired.
+			finished = append(finished, entry.actual)
+			l.log.Info("a job completed before any runner took it; the runner launched for it is running another job and is left to finish it",
+				"tier", l.tier, "request", entry.cleanup.RequestID, "job", entry.job.JobID,
+				"result", entry.job.Result)
+			continue
+		}
 		if entry.binding != nil {
 			if err := l.restorePoolLease(ctx, *entry.binding); err != nil {
 				return err
