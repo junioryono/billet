@@ -2586,7 +2586,7 @@
         "server": "typed:IPv4 or IPv6 literal validated in validate-interpreted-inputs.yml"
       },
       "writes": "The DHCP lease database is daemon-owned runtime state under /var/lib/billet-dnsmasq/<typed-interface>/dnsmasq.leases, not shell redirection. systemd StateDirectory owns the directory. Daemon internals are R7.7 scope; inventory cannot add a leasefile/logfile directive because every interpolated field is typed.",
-      "text": "interface={{ item.name }}\nexcept-interface=lo\nbind-dynamic\ndhcp-authoritative\ndhcp-range={{ item.dhcp_start }},{{ item.dhcp_end }},{{ item.netmask }},1h\ndhcp-leasefile=/var/lib/billet-dnsmasq/{{ item.name }}/dnsmasq.leases\ndhcp-option=option:router,{{ item.address }}\ndhcp-option=option:dns-server,{{ item.address }}\ndomain-needed\nbogus-priv\nno-resolv\ncache-size={{ billet_guest_dns_cache_size | int }}\ndns-forward-max={{ billet_guest_dns_forward_max | int }}\n{% for server in billet_guest_dns_servers %}\nserver={{ server }}\n{% endfor %}\n"
+      "text": "interface={{ item.name }}\nexcept-interface=lo\nbind-dynamic\ndhcp-authoritative\ndhcp-range={{ item.dhcp_start }},{{ item.dhcp_end }},{{ item.netmask }},1h\ndhcp-leasefile=/var/lib/billet-dnsmasq/{{ item.name }}/dnsmasq.leases\ndhcp-option=option:router,{{ item.address }}\ndhcp-option=option:dns-server,{{ item.address }}\ndomain-needed\nbogus-priv\nstop-dns-rebind\nmax-cache-ttl=300\nno-resolv\ncache-size={{ billet_guest_dns_cache_size | int }}\ndns-forward-max={{ billet_guest_dns_forward_max | int }}\n{% for server in billet_guest_dns_servers %}\nserver={{ server }}\n{% endfor %}\n"
     },
     "msmtprc.j2": {
       "variables": {
