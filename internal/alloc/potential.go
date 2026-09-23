@@ -68,6 +68,11 @@ type TierAdmission struct {
 	CeilingShared bool
 	// Target is the target this tier's share is keyed by.
 	Target string
+	// TargetShared reports that the target has a share, which makes it one pot
+	// its tiers buy from wherever their hosts are, as CeilingShared does for the
+	// deployment: two tiers of it pinned to different hosts still take room from
+	// each other.
+	TargetShared bool
 	// ShareBound reports that this tier's own target share, not the fleet, is
 	// what stops it buying one more now. Room another target's jobs free can
 	// never reach it until its own target's work ends, so it must not hold that
@@ -151,9 +156,11 @@ func (a *Allocator) AdmissionView(ctx context.Context) (map[string]TierAdmission
 				return err
 			}
 
+			_, hasShare := a.limits.Shares[config.ShareTarget(t)]
+
 			out[label] = TierAdmission{
 				CanGrow: grow, Nodes: p.nodes, CeilingShared: shared,
-				Target: config.ShareTarget(t), ShareBound: bound,
+				Target: config.ShareTarget(t), TargetShared: hasShare, ShareBound: bound,
 			}
 		}
 
@@ -270,24 +277,30 @@ func (a *Allocator) potentialIn(ctx context.Context, tx querier, label string,
 	// host the model then re-packed that floor onto was reported unable to grow
 	// and never joined the waiting order at all — the starvation this view exists
 	// to prevent. reserveFloors holds only what is outstanding.
-	owedVCPU, owedMemory, err := a.reserveFloors(ctx, tx, label, free)
+	floors, err := a.reserveFloors(ctx, tx, label, free)
 	if err != nil {
 		return potential{}, err
 	}
 
-	vcpu, memory := a.limits.MaxVCPU-owedVCPU, a.limits.MaxMemory-owedMemory
+	vcpu, memory := a.limits.MaxVCPU-floors.vcpu, a.limits.MaxMemory-floors.memory
 
 	t := a.tiers[label]
 
-	// ONCE CURRENT WORK ENDS the whole share is free again, so the model is
-	// bounded by the share itself rather than by what is left of it.
-	if share, ok := a.limits.Shares[config.ShareTarget(t)]; ok {
+	// ONCE CURRENT WORK ENDS the whole share is free again, less what its other
+	// tiers' floors keep, so the model is bounded by the share itself rather
+	// than by what is left of it. Those floors were held against the share's
+	// room now, which is never more than the whole share, so this errs towards
+	// growth, the direction the view is meant to err in.
+	target := config.ShareTarget(t)
+	if share, ok := a.limits.Shares[target]; ok {
+		held := floors.byTarget[target]
+
 		if share.VCPU > 0 {
-			vcpu = min(vcpu, share.VCPU)
+			vcpu = min(vcpu, share.VCPU-held.vcpu)
 		}
 
 		if share.Memory > 0 {
-			memory = min(memory, share.Memory)
+			memory = min(memory, share.Memory-held.memory)
 		}
 	}
 

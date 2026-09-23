@@ -28,18 +28,30 @@ import (
 // the machines could ever hold is a configuration mistake, and reading it literally
 // would refuse every other tier forever. Billet holds back what it can and lets the
 // rest compete.
+//
+// A TARGET'S FLOORS ARE HELD INSIDE ITS SHARE, at the shape each is charged:
+// more than the share can hold can never be kept, and holding it anyway would
+// take room from every other target. What each target's floors held is handed
+// back so a purchase for a sibling tier leaves it inside the share.
 func (a *Allocator) reserveFloors(
 	ctx context.Context, tx querier, forTier string, free *fleet,
-) (int, config.ByteSize, error) {
+) (floorCharge, error) {
 	open, err := a.countOpenPerTier(ctx, tx)
 	if err != nil {
-		return 0, 0, err
+		return floorCharge{}, err
 	}
 
-	var (
-		heldVCPU   int
-		heldMemory config.ByteSize
-	)
+	usage, err := a.readShareUsage(ctx, tx)
+	if err != nil {
+		return floorCharge{}, err
+	}
+
+	held := floorCharge{byTarget: map[string]placementCost{}}
+	budget := map[string]placementCost{}
+
+	for _, target := range a.shareTargets() {
+		budget[target] = a.room(usage, target, placementCost{})
+	}
 
 	// IN A FIXED ORDER, because these floors compete with each other for the same
 	// hosts and Go map iteration is randomised. Without it one fleet answers
@@ -65,10 +77,28 @@ func (a *Allocator) reserveFloors(
 			continue
 		}
 
-		cost, err := a.holdFloor(ctx, tx, t, missing, free)
-		if err != nil {
-			return 0, 0, err
+		target := config.ShareTarget(t)
+
+		limit, shared := budget[target]
+		if !shared {
+			limit = placementCost{vcpu: unboundedVCPU, memory: unboundedMemory}
 		}
+
+		cost, err := a.holdFloor(ctx, tx, t, missing, free, limit)
+		if err != nil {
+			return floorCharge{}, err
+		}
+
+		if shared {
+			budget[target] = placementCost{
+				vcpu: limit.vcpu - cost.vcpu, memory: limit.memory - cost.memory,
+			}
+		}
+
+		sum := held.byTarget[target]
+		sum.vcpu += cost.vcpu
+		sum.memory += cost.memory
+		held.byTarget[target] = sum
 
 		// ONLY WHAT WAS ACTUALLY KEPT counts against the deployment ceiling. The
 		// old arithmetic deducted every configured floor from that ceiling without
@@ -76,11 +106,19 @@ func (a *Allocator) reserveFloors(
 		// no suitable host anywhere took the ceiling away from tiers that were
 		// perfectly placeable — a Tart floor on a fleet of Docker boxes left an
 		// entirely healthy deployment advertising nothing.
-		heldVCPU += cost.vcpu
-		heldMemory += cost.memory
+		held.vcpu += cost.vcpu
+		held.memory += cost.memory
 	}
 
-	return heldVCPU, heldMemory, nil
+	return held, nil
+}
+
+// floorCharge is what other tiers' outstanding floors hold: in all, against the
+// deployment ceiling, and per target, against that target's share.
+type floorCharge struct {
+	vcpu     int
+	memory   config.ByteSize
+	byTarget map[string]placementCost
 }
 
 // holdFloor takes one tier's outstanding reservation off the machines it could
@@ -92,6 +130,7 @@ func (a *Allocator) reserveFloors(
 // exactly the contention a floor is meant to survive.
 func (a *Allocator) holdFloor(
 	ctx context.Context, tx querier, t config.Tier, missing int, free *fleet,
+	limit placementCost,
 ) (placementCost, error) {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier
@@ -102,6 +141,10 @@ func (a *Allocator) holdFloor(
 	if err != nil {
 		return placementCost{}, err
 	}
+
+	// The placer bounds every placement by its deployment room, so the share is
+	// that room here and a remote floor is spent at the shape it buys.
+	held.deploymentVCPU, held.deploymentMemory = max(limit.vcpu, 0), max(limit.memory, 0)
 
 	var cost placementCost
 

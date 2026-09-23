@@ -991,24 +991,24 @@ func (a *Allocator) headroomWithPlacer(
 	// any MACHINE could keep the floor, so a reservation on a tier with no
 	// suitable host anywhere — a Tart tier on a fleet of Docker boxes — would take
 	// the ceiling from tiers that are perfectly placeable.
-	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
+	place, floors, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-owedVCPU, 0)
-	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-owedMemory, 0)
+	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-floors.vcpu, 0)
+	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-floors.memory, 0)
 
 	// A TARGET'S SHARE IS A NARROWER DEPLOYMENT CEILING, spent by the placer at
 	// the same charged cost, so a remote shape counts against it as it counts
-	// against the deployment.
-	shareVCPU, shareMemory, err := a.shareRoom(ctx, tx, t, 0, 0)
+	// against the deployment, and a sibling tier's floor is kept inside it.
+	share, err := a.shareRoomFor(ctx, tx, t.Label, placementCost{}, floors)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	place.deploymentVCPU = min(place.deploymentVCPU, max(shareVCPU, 0))
-	place.deploymentMemory = min(place.deploymentMemory, max(shareMemory, 0))
+	place.deploymentVCPU = min(place.deploymentVCPU, max(share.vcpu, 0))
+	place.deploymentMemory = min(place.deploymentMemory, max(share.memory, 0))
 
 	n := place.total(t)
 
@@ -1376,27 +1376,25 @@ func (a *Allocator) Resize(
 		}
 		free.vcpu[lease.Node] += lease.VCPU
 		free.memory[lease.Node] += lease.Memory
-		owedVCPU, owedMemory, err := a.reserveFloors(ctx, tx, lease.Tier, free)
+		floors, err := a.reserveFloors(ctx, tx, lease.Tier, free)
 		if err != nil {
 			return err
 		}
 
-		deploymentVCPU := a.limits.MaxVCPU - (fleetUsed.VCPU - lease.VCPU) - owedVCPU
-		deploymentMemory := a.limits.MaxMemory - (fleetUsed.Memory - lease.Memory) - owedMemory
+		deploymentVCPU := a.limits.MaxVCPU - (fleetUsed.VCPU - lease.VCPU) - floors.vcpu
+		deploymentMemory := a.limits.MaxMemory - (fleetUsed.Memory - lease.Memory) - floors.memory
 
 		// The share is authorised the same way: as if this lease's current shape
-		// had been returned to its target first.
-		shareVCPU, shareMemory := unboundedVCPU, unboundedMemory
-		if t, ok := a.tiers[lease.Tier]; ok {
-			shareVCPU, shareMemory, err = a.shareRoom(ctx, tx, t, lease.VCPU, lease.Memory)
-			if err != nil {
-				return err
-			}
+		// had been returned to its target first, with its siblings' floors kept.
+		share, err := a.shareRoomFor(ctx, tx, lease.Tier,
+			placementCost{vcpu: lease.VCPU, memory: lease.Memory}, floors)
+		if err != nil {
+			return err
 		}
 
 		if vcpu > free.vcpu[lease.Node] || memory > free.memory[lease.Node] ||
 			vcpu > deploymentVCPU || memory > deploymentMemory ||
-			vcpu > shareVCPU || memory > shareMemory ||
+			vcpu > share.vcpu || memory > share.memory ||
 			vcpu > nodeVCPU || memory > config.ByteSize(nodeMemory) {
 			return fmt.Errorf("%w: EC2 fallback %q needs %d vCPU and %s, which would exceed "+
 				"the node or deployment budget or its target's share, or consume another "+
