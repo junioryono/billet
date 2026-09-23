@@ -69,9 +69,15 @@ func TestInitJoinWritesANodeWithoutTheAppIdentity(t *testing.T) {
 		t.Errorf("the joined config still carries a control plane: server %v, github %v",
 			cfg.Server != nil, cfg.GitHub != nil)
 	}
-	if want := filepath.Join(dir, "tls", "node.crt"); cfg.Node == nil || cfg.Node.TLS == nil ||
-		!sameDir(filepath.Dir(cfg.Node.TLS.CertPath), filepath.Dir(want)) {
-		t.Errorf("node.tls does not name the bundle under %s: %+v", filepath.Dir(want), cfg.Node)
+	// The working directory filepath.Abs resolves against, which on macOS is
+	// the /private spelling of the temporary directory.
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if want := filepath.Join(wd, "tls", "node.crt"); cfg.Node == nil || cfg.Node.TLS == nil ||
+		cfg.Node.TLS.CertPath != want {
+		t.Errorf("node.tls does not name %s: %+v", want, cfg.Node)
 	}
 	for _, want := range []string{"On the control plane", "Raise server.max_vcpu", "billet node --config"} {
 		if !strings.Contains(out, want) {
