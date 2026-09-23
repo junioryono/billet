@@ -243,8 +243,9 @@ func TargetShareErrors(shares map[string]TargetShare, tiers []Tier, maxVCPU int,
 
 		var floorMemory ByteSize
 
-		for _, t := range tiers {
-			if ShareTarget(t) != name {
+		for i := range tiers {
+			t := &tiers[i]
+			if ShareTarget(*t) != name {
 				continue
 			}
 
