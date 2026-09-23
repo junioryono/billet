@@ -221,7 +221,7 @@ Written against macOS 26 (Tahoe) sources before the mini arrived. What has since
 
 - **Virtualization.framework starts a VM on macOS 27.0 under tart 2.37.0.** An empty Linux VM (`tart create --linux`, then `tart run --no-graphics`) started from an SSH session with no keychain error, and its guest stopped for want of an OS. That does not reach the keychain requirement above, which is recorded for macOS guests.
 
-- **A deliberate shutdown is not a power cut.** After Shut Down, the reference mini stayed off when it was unplugged, moved and plugged back in, unreachable on the LAN until someone pressed its power button; it was up and logged in 23 seconds after. The power-on-when-mains-returns behaviour below is for power that was lost, not for a Mac that was shut down.
+- **A deliberate shutdown is not a power cut.** With `autorestartatconnect` at its default of 0, after Shut Down the reference mini stayed off when it was unplugged, moved and plugged back in, unreachable on the LAN until someone pressed its power button; it was up and logged in 23 seconds after. The power-on-when-mains-returns behaviour below is for power that was lost, not for a Mac that was shut down.
 
 Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), power-on after a real power cut, and a macOS guest on macOS 27. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
 
@@ -233,14 +233,14 @@ Harden with a drop-in rather than by editing the main config, because macOS owns
 printf '%s\n' 'PermitRootLogin no' 'PasswordAuthentication no' \
     'KbdInteractiveAuthentication no' 'AllowUsers <account>' |
   sudo tee /etc/ssh/sshd_config.d/000-headless.conf >/dev/null &&
-  { sudo sshd -t || sudo rm /etc/ssh/sshd_config.d/000-headless.conf; }
+  { sudo sshd -t || { sudo rm -f /etc/ssh/sshd_config.d/000-headless.conf; false; }; }
 ```
 
-Replace `<account>` with the node account's short name first: the quotes keep it literal, and `AllowUsers <account>` admits nobody. A failed `sshd -t` removes the file again. Run it from a session that stays open, and prove a key login from a second terminal before closing it, because `sshd -t` checks syntax, not that the account can still get in.
+Replace `<account>` with the node account's short name first: the quotes keep it literal, and `AllowUsers <account>` admits nobody. A failed `sshd -t` removes the file again and the command still exits non-zero, so a failure never reads as success. Run it from a session that stays open, and prove a key login from a second terminal before closing it, because `sshd -t` checks syntax, not that the account can still get in.
 
 **Turn off keyboard-interactive as well as password authentication.** Apple's `100-macos.conf` sets `UsePAM yes`, and keyboard-interactive is a second method that can take a password through PAM; the password prompt macOS's sshd gave before hardening had the keyboard-interactive shape (`(user@host) Password:`). Whether `PasswordAuthentication no` alone leaves password logins open was not tested. Measured on the mini with all four lines: a client with public-key authentication turned off is answered `Permission denied (publickey)`. The `printf` form is deliberate: a heredoc pasted with indentation never finds its closing `EOF` and leaves the shell waiting.
 
-**Do not reach for `pmset autorestart`.** It is a silent no-op on Apple Silicon — it accepts the setting and changes nothing — and it is also unnecessary, because an Apple Silicon mini is documented to power on by itself when mains power returns after a loss. That is power that was lost, not a Mac that was shut down, which stays off (above), and recovery from a real power cut is not yet measured on the mini. A guide that tells an operator to set it leaves them believing they have configured automatic recovery when they have configured nothing.
+**Do not reach for `pmset autorestart`.** It is a silent no-op on Apple Silicon — it accepts the setting and changes nothing — and it is also unnecessary, because an Apple Silicon mini is documented to power on by itself when mains power returns after a loss. That is power that was lost. For a Mac that was shut down, Apple documents *Start up when power is connected* (System Settings → Energy) on 2024-and-later minis under macOS 26.5 and later; the mini lists it in `pmset -g cap` as `autorestartatconnect`, and `sudo pmset -a autorestartatconnect 1` sets it. Neither the setting's effect nor recovery from a real power cut is measured on the mini yet. A guide that tells an operator to set it leaves them believing they have configured automatic recovery when they have configured nothing.
 
 ## An inherited machine can arrive with the worst case already set up
 
