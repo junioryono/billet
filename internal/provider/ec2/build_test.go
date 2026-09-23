@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -74,6 +75,8 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"docker-buildx", "so does Buildx"},
 		{"docker buildx version", "the image build must execute the packaged Buildx plugin"},
 		{"docker compose version", "the image build must execute the Compose plugin"},
+		{"gh --version", "GitHub's image carries the GitHub CLI and its declaration does not name it, " +
+			"so nothing else puts it on this one"},
 		{`"containerd-snapshotter": false`, "pulled images must stay inside the cache-backed Docker data root"},
 		{`"storage-driver": "overlay2"`, "the Docker cache snapshots the classic image store atomically"},
 		{"e2fsprogs", "the transparent Docker cache formats and verifies ext4"},
@@ -414,6 +417,52 @@ func TestTheJobStartHookReportsColdStartPhasesWithoutFailingTheJob(t *testing.T)
 }
 
 // mustScript builds the ordinary script or fails the test.
+// THE GITHUB CLI IS INSTALLED, AND A BUILD WHOSE gh DOES NOT RUN STOPS.
+//
+// The package is a whole name in the one apt transaction (a substring test would
+// be vacuous: "gh" is inside "github"), and `gh --version` is a line of its own
+// after it and before the success signal, in a script under `set -e`, so a
+// missing or broken gh ends the build rather than a workflow. As an exact line,
+// because `# gh --version` and `gh --version || true` both contain the text and
+// neither stops anything.
+func TestTheBuilderInstallsTheGitHubCLI(t *testing.T) {
+	t.Parallel()
+
+	lines := strings.Split(mustScript(t), "\n")
+
+	if len(lines) < 2 || lines[0] != "#!/bin/sh" || !strings.HasPrefix(lines[1], "set -e") {
+		t.Fatalf("the script does not begin under `set -e` (%q), so no check in it stops a build", lines[:min(2, len(lines))])
+	}
+
+	install, check, power := -1, -1, -1
+
+	for i, line := range lines {
+		switch {
+		case line == "apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \\" && i+1 < len(lines):
+			install = i
+
+			if !slices.Contains(strings.Fields(lines[i+1]), "gh") {
+				t.Errorf("the apt transaction installs %q, without gh; GitHub's image carries the GitHub "+
+					"CLI and its declaration does not name it, so nothing else puts it on this one", lines[i+1])
+			}
+		case line == "gh --version":
+			check = i
+		case line == "poweroff":
+			power = i
+		}
+	}
+
+	if install < 0 {
+		t.Fatal("the script has no apt install command, so this test is reading the wrong script")
+	}
+
+	if check < 0 || check < install || check > power {
+		t.Errorf("`gh --version` is line %d, the install line %d and poweroff line %d; it has to run on its "+
+			"own after the install and before the success signal, or a build without a working gh succeeds",
+			check, install, power)
+	}
+}
+
 func mustScript(t *testing.T) string {
 	t.Helper()
 

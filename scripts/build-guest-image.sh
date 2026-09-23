@@ -635,11 +635,17 @@ EOF
 	# present dockerd confines every container under docker-default, as a hosted
 	# runner does; a job that mounts with added capabilities can now meet a denial
 	# it did not meet on the parser-less guest, and meets the same one hosted.
+	# gh IS ON THE HOSTED IMAGE AND IN NO DECLARATION: GitHub installs it with a
+	# script of its own, the latest release's .deb, so the toolset never names it
+	# and nothing here installed it until a workflow's first `gh` call failed with
+	# 127 on the fleet (2026-09-22). This is Ubuntu's package, signed by the archive
+	# key and installed in this one transaction, which is older than the release
+	# GitHub installs; ADR-005 records that difference and what would close it.
 	local billet_packages=(
 		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
 		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
 		systemd-resolved netplan.io libicu74 zstd rsync build-essential
-		python3-pip python3-venv python3-dev apparmor python3-apt
+		python3-pip python3-venv python3-dev apparmor python3-apt gh
 	)
 
 	local github_packages=()
