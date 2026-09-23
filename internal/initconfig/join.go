@@ -106,6 +106,10 @@ func Join(generated, serverAddr, tlsDir string) (JoinResult, error) {
 	return JoinResult{Node: out.String(), ControlPlane: cp}, nil
 }
 
+// joinKeyOf names what identifies an entry in each list the control plane
+// merges.
+var joinKeyOf = map[string]string{"tiers": "label", "nodes": "name"}
+
 // controlPlaneHalf is the text an operator adds to the control plane's config.
 func controlPlaneHalf(root *yaml.Node, maxVCPU, maxMemory string) (string, error) {
 	var b strings.Builder
@@ -127,7 +131,10 @@ func controlPlaneHalf(root *yaml.Node, maxVCPU, maxMemory string) (string, error
 		if err := enc.Close(); err != nil {
 			return "", fmt.Errorf("render the control plane's %s: %w", key, err)
 		}
-		fmt.Fprintf(&b, "\nAdd to the control plane's %s (a restart reads it):\n%s", key, out.String())
+		fmt.Fprintf(&b, "\nMerge into the control plane's %s by %s (a restart reads it). An entry "+
+			"already there needs nothing; one label or name is refused twice, so a tier this node "+
+			"pins beside one of that label gets a new label rather than a second entry:\n%s",
+			key, joinKeyOf[key], out.String())
 	}
 
 	return b.String(), nil
