@@ -312,7 +312,8 @@ func (q *admissionQueue) launchEnds(tier string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.launching[tier]--; q.launching[tier] <= 0 {
+	q.launching[tier]--
+	if q.launching[tier] <= 0 {
 		delete(q.launching, tier)
 	}
 
