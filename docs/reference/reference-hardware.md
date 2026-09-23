@@ -212,25 +212,30 @@ There is a third that shapes `uninstall`: launchd's **disabled-override database
 
 ### Headless operation
 
-Written against macOS 26 (Tahoe) sources before the mini arrived. What has since been measured on the mini itself (18-core, 64 GB, 1 TB, macOS 27.0, 2026-09-22), with FileVault off, automatic login set, and Remote Login and Screen Sharing turned on in System Settings:
+Written against macOS 26 (Tahoe) sources before the mini arrived. What has since been measured on the mini itself (18-core, 64 GB, 1 TB, macOS 27.0), with FileVault off, automatic login set, and Remote Login and Screen Sharing turned on in System Settings:
 
 - **The unattended boot holds.** After `sudo reboot`, with nobody at the keyboard, the account was on `console` and `launchctl print gui/501` reported `type = login` 34 seconds after boot; SSH answered with the key and Screen Sharing answered on port 5900.
 - **The Setup Assistant login created the keychain.** `~/Library/Keychains/login.keychain-db` existed after the console login alone, before any Screen Sharing session, so a Screen Sharing login is not what creates it.
 - **SSH cannot see that keychain.** `security show-keychain-info` from an SSH session answers *User interaction is not allowed* while the GUI session is logged in, so it cannot serve as the check that the keychain is unlocked.
 - **After `pmset -a sleep 0 disksleep 0 womp 1`**, `pmset -g` read back `sleep 0 (sleep prevented by powerd)`, `disksleep 0` and `womp 1`.
 
-Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), the sshd drop-in below, power-on after a deliberate shutdown, and tart itself on macOS 27. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
+- **Virtualization.framework starts a VM on macOS 27.0 under tart 2.37.0.** An empty Linux VM (`tart create --linux`, then `tart run --no-graphics`) started from an SSH session with no keychain error, and its guest stopped for want of an OS. That does not reach the keychain requirement above, which is recorded for macOS guests.
+
+- **A deliberate shutdown is not a power cut.** After Shut Down, the mini stayed off when it was unplugged, moved and plugged back in, unreachable on the LAN until someone pressed its power button; it was up and logged in 23 seconds after. The power-on-when-mains-returns behaviour below is for power that was lost, not for a Mac that was shut down.
+
+Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), power-on after a real power cut, and a macOS guest on macOS 27. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
 
 **SSH first, then anything else.** `sudo systemsetup -setremotelogin on`, then confirm with `sudo systemsetup -getremotelogin`. On Tahoe, Screen Sharing after a reboot needs SSH to already be reachable, so enabling SSH is not one option among several — it is the one that makes the others recoverable.
 
 Harden with a drop-in rather than by editing the main config, because macOS owns `/etc/ssh/sshd_config.d/100-macos.conf` and the first value wins on a conflict — so the drop-in has to sort *ahead* of it:
 
 ```
-sudo tee /etc/ssh/sshd_config.d/000-headless.conf <<'EOF'
-PermitRootLogin no
-PasswordAuthentication no
-EOF
+printf '%s\n' 'PermitRootLogin no' 'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' 'AllowUsers <account>' |
+  sudo tee /etc/ssh/sshd_config.d/000-headless.conf >/dev/null && sudo sshd -t
 ```
+
+**`PasswordAuthentication no` alone does not end password logins on a Mac.** Apple's `100-macos.conf` sets `UsePAM yes`, and the password prompt macOS's sshd gives is the keyboard-interactive one through PAM (`(user@host) Password:`), not the `user@host's password:` that `PasswordAuthentication` governs; `KbdInteractiveAuthentication no` closes that path. Measured on the mini with all four lines: a client offering no key is answered `Permission denied (publickey)`, so publickey is the only method left. The two-line form was not tested on its own. The `printf` form is deliberate: a heredoc pasted with indentation never finds its closing `EOF` and leaves the shell waiting.
 
 **Do not reach for `pmset autorestart`.** It is a silent no-op on Apple Silicon — it accepts the setting and changes nothing — and it is also unnecessary, because Apple Silicon minis power on by themselves when mains power returns. A guide that tells an operator to set it leaves them believing they have configured automatic recovery when they have configured nothing.
 
