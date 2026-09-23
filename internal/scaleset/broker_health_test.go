@@ -22,8 +22,10 @@ type silenceProxy struct {
 	backend string
 	dialed  atomic.Int32
 
-	mu    sync.Mutex
-	conns []*silenceable
+	mu      sync.Mutex
+	conns   []*silenceable
+	sockets []net.Conn
+	wg      sync.WaitGroup
 }
 
 type silenceable struct{ silent atomic.Bool }
@@ -31,27 +33,31 @@ type silenceable struct{ silent atomic.Bool }
 func newSilenceProxy(t *testing.T, backend string) *silenceProxy {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
 	p := &silenceProxy{ln: ln, backend: backend}
-	t.Cleanup(func() { _ = ln.Close() })
-
-	go p.serve(t)
+	p.wg.Add(1)
+	go p.serve()
+	t.Cleanup(p.close)
 
 	return p
 }
 
-func (p *silenceProxy) serve(t *testing.T) {
+func (p *silenceProxy) serve() {
+	defer p.wg.Done()
+
+	var d net.Dialer
 	for {
 		client, err := p.ln.Accept()
 		if err != nil {
 			return
 		}
 
-		server, err := net.Dial("tcp", p.backend)
+		server, err := d.DialContext(context.Background(), "tcp", p.backend)
 		if err != nil {
 			_ = client.Close()
 			continue
@@ -61,12 +67,26 @@ func (p *silenceProxy) serve(t *testing.T) {
 		c := &silenceable{}
 		p.mu.Lock()
 		p.conns = append(p.conns, c)
+		p.sockets = append(p.sockets, client, server)
 		p.mu.Unlock()
-		t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 
-		go c.pipe(server, client)
-		go c.pipe(client, server)
+		p.wg.Add(2)
+		go func() { defer p.wg.Done(); c.pipe(server, client) }()
+		go func() { defer p.wg.Done(); c.pipe(client, server) }()
 	}
+}
+
+// close stops accepting, closes every socket and waits for every goroutine.
+func (p *silenceProxy) close() {
+	_ = p.ln.Close()
+
+	p.mu.Lock()
+	for _, s := range p.sockets {
+		_ = s.Close()
+	}
+	p.mu.Unlock()
+
+	p.wg.Wait()
 }
 
 // pipe copies until the connection is silenced, then reads and discards.
@@ -94,25 +114,30 @@ func (p *silenceProxy) silenceAll() {
 	}
 }
 
-// A SILENT CONNECTION TO THE BROKER IS REPLACED, NOT REUSED UNTIL THE KERNEL GIVES
-// UP. Every listener of a target multiplexes its long poll over one HTTP/2
+// A SILENT CONNECTION TO THE BROKER IS REPLACED, NOT REUSED UNTIL THE SOCKET
+// FAILS. Every listener of a target multiplexes its long poll over one HTTP/2
 // connection; on 2026-09-23 that connection went half-open and every retry of
 // every listener's poll was sent down it again for 18 minutes. With the health
-// check, a request on the silenced connection fails within the ping allowance,
-// far inside the request timeout, and the next request dials a new connection.
+// check, a request in flight on the silenced connection fails within the ping
+// allowance, far inside the request timeout, and the next request dials a new
+// connection.
 func TestASilentBrokerConnectionIsClosedAndReplaced(t *testing.T) {
 	t.Parallel()
 
-	release := make(chan struct{})
+	entered := make(chan string, 4)
+	release := map[string]chan struct{}{"/long-poll": make(chan struct{}), "/stuck": make(chan struct{})}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/long-poll" {
+		if held, ok := release[r.URL.Path]; ok {
+			entered <- r.URL.Path
 			select {
-			case <-release:
+			case <-held:
 			case <-r.Context().Done():
 				return
 			}
 		}
-		_, _ = io.WriteString(w, r.Proto)
+		if _, err := io.WriteString(w, r.Proto); err != nil {
+			return
+		}
 	}))
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
@@ -120,18 +145,31 @@ func TestASilentBrokerConnectionIsClosedAndReplaced(t *testing.T) {
 
 	proxy := newSilenceProxy(t, srv.Listener.Addr().String())
 
-	const pingAfter, pingTimeout = 200 * time.Millisecond, 200 * time.Millisecond
-	const requestTimeout = 30 * time.Second
+	// Generous enough that a healthy peer on a loaded runner always answers in
+	// time, and still an order of magnitude inside the request timeout.
+	const pingAfter, pingTimeout = 500 * time.Millisecond, 2 * time.Second
+	const requestTimeout = 60 * time.Second
 
 	client := newRetryableHTTPClient(pingAfter, pingTimeout)
 	client.RetryMax = 0
 	client.HTTPClient.Timeout = requestTimeout
-	transport := client.HTTPClient.Transport.(*http.Transport)
-	transport.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
-	url := "https://" + proxy.ln.Addr().String()
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("the client's transport is not an *http.Transport")
+	}
+	serverTransport, ok := srv.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("the test server's client transport is not an *http.Transport")
+	}
+	transport.TLSClientConfig = serverTransport.TLSClientConfig.Clone()
+	base := "https://" + proxy.ln.Addr().String()
 
 	get := func(path string) (string, error) {
-		resp, err := client.StandardClient().Get(url + path)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+path, nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := client.StandardClient().Do(req)
 		if err != nil {
 			return "", err
 		}
@@ -153,25 +191,49 @@ func TestASilentBrokerConnectionIsClosedAndReplaced(t *testing.T) {
 		t.Fatalf("dialed %d connections for two requests; the test needs one reused connection", n)
 	}
 
-	// A long poll outlives several ping intervals on a healthy connection: the
-	// health check answers silence, not a slow response.
-	go func() { time.Sleep(10 * pingAfter); close(release) }()
-	if proto, err := get("/long-poll"); err != nil || proto != "HTTP/2.0" {
-		t.Fatalf("a long poll on a healthy connection = %q, %v; pings must not end it", proto, err)
+	// A long poll held at the server for several ping intervals survives on a
+	// healthy connection: the health check answers silence, not a slow response.
+	type result struct {
+		proto string
+		err   error
+	}
+	held := make(chan result, 1)
+	go func() {
+		proto, err := get("/long-poll")
+		held <- result{proto, err}
+	}()
+	if path := <-entered; path != "/long-poll" {
+		t.Fatalf("the server entered %q, want the long poll", path)
+	}
+	time.Sleep(5 * pingAfter)
+	close(release["/long-poll"])
+	if r := <-held; r.err != nil || r.proto != "HTTP/2.0" {
+		t.Fatalf("a long poll on a healthy connection = %q, %v; pings must not end it", r.proto, r.err)
 	}
 
+	// Silence the connection UNDER a request already in flight, so the request
+	// cannot have been sent on a replacement the health check dialled first.
+	stuck := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		proto, err := get("/stuck")
+		stuck <- result{proto, err}
+	}()
+	if path := <-entered; path != "/stuck" {
+		t.Fatalf("the server entered %q, want the request that will be stranded", path)
+	}
 	proxy.silenceAll()
 
-	started := time.Now()
-	_, err := get("/")
+	r := <-stuck
 	elapsed := time.Since(started)
-	if err == nil {
+	if r.err == nil {
 		t.Fatal("a request on a silenced connection succeeded; the proxy did not silence it")
 	}
-	if errors.Is(err, context.DeadlineExceeded) || elapsed >= requestTimeout/2 {
+	if errors.Is(r.err, context.DeadlineExceeded) || elapsed >= requestTimeout/2 {
 		t.Fatalf("the silenced connection was noticed after %v (%v): the request timeout ended it, "+
-			"not the health check", elapsed, err)
+			"not the health check", elapsed, r.err)
 	}
+	close(release["/stuck"])
 
 	proto, err := get("/")
 	if err != nil || proto != "HTTP/2.0" {
