@@ -1052,6 +1052,14 @@ func cmdInit(ctx context.Context, args []string) error {
 			"(edited values, sites, extra tiers, or a different billet version's shape). "+
 			"Compare and merge deliberately:\n\n  diff -u %s %s\n\nThen move the merged "+
 			"result into place yourself.\n", shellArg(*cfgPath), shellArg(writePath))
+
+		// A joined node has no App to create; the rest of its guidance is the
+		// same once the merged file is in place.
+		if joining {
+			printJoinNext(*cfgPath, params.Profile, joined)
+
+			return nil
+		}
 		// SAME RULE AS THE NEXT STEPS: there is nothing to hand a file to on a
 		// Mac. Worse than useless there — an operator who runs it under sudo to
 		// make it work leaves a root-owned config that the agents, which run as
@@ -1070,14 +1078,6 @@ func cmdInit(ctx context.Context, args []string) error {
 			fmt.Printf("Then have the services read it:\n" +
 				"  billet local down --reason 'merged a regenerated config'\n" +
 				"  billet local up\n")
-		}
-
-		// A joined node has no App to create; what it still needs is the
-		// control plane's half and a certificate bundle.
-		if joining {
-			printJoinControlPlane(joined)
-
-			return nil
 		}
 
 		// THE OTHER RULE, SAID WHERE THIS ONE IS LEARNED. An operator meets both
@@ -1133,6 +1133,23 @@ func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig
 	// The agents read exactly one path, so a config written anywhere else
 	// is installed there first or `local up` starts whatever that path holds.
 	if service := initconfig.ServiceConfigPathFor(hostOS); cfgPath != service {
+		// THE SAME GUARD AS WRITING IT HERE: the copy below replaces the
+		// service path's config, which may be this machine's control plane.
+		raw, err := os.ReadFile(service)
+		switch {
+		case err != nil && !os.IsNotExist(err):
+			fmt.Printf("  3. Do NOT install it at %s yet: billet cannot read that file to rule "+
+				"out a live control plane (%v).\n", service, err)
+
+			return
+		case err == nil:
+			if refuse := refuseServerRemoval(service, raw); refuse != nil {
+				fmt.Printf("  3. Do NOT install it at %s yet: %v\n", service, refuse)
+
+				return
+			}
+		}
+
 		fmt.Printf("  3. Install the file where the services billet ships read it:\n")
 		fmt.Printf("       cp %s %s\n", pathArg, shellArg(service))
 		if account := initconfig.ServiceAccountFor(hostOS); account != "" {

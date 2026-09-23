@@ -22,14 +22,17 @@ func joinArgs(path string, extra ...string) []string {
 // variable otherwise generated a control plane on the machine meant to join one.
 func TestInitRefusesAnEmptyJoin(t *testing.T) {
 	ownHome(t)
-	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	err := cmdInit(t.Context(), joinArgs(path, "--join", "  "))
-	if err == nil || !strings.Contains(err.Error(), "--join") {
-		t.Fatalf("an empty --join was not refused by name: %v", err)
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Errorf("a refused join wrote %s (stat: %v)", path, statErr)
+	for _, addr := range []string{"", "  "} {
+		path := filepath.Join(t.TempDir(), "billet.yaml")
+
+		err := cmdInit(t.Context(), joinArgs(path, "--join", addr))
+		if err == nil || !strings.Contains(err.Error(), "--join") {
+			t.Errorf("--join %q was not refused by name: %v", addr, err)
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Errorf("a refused --join %q wrote %s (stat: %v)", addr, path, statErr)
+		}
 	}
 }
 
