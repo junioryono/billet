@@ -338,7 +338,25 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
         printf 'Installed %s billet to %s\n' "${platform}" "${destination}"
     fi
     echo
-    if [ "${native}" = true ]; then
+    # A MAC IS NOT A LINUX TRIAL. There is no package, the backend is tart with a
+    # VM per job rather than a container, the config the launch agents read is
+    # the local-service path, and the service is billet local up, so the Linux
+    # text below would send a Mac operator the wrong way at the step they just
+    # finished (#184).
+    if [ "${native}" = true ] && [ "${platform%%_*}" = darwin ]; then
+        echo "Next, on this Mac, as the account that will run the node (never under sudo):
+  billet init --profile local-service --provider tart --node-name NAME --org YOUR-ORG
+  billet github-app create --org YOUR-ORG --config /usr/local/etc/billet/billet.yaml
+  billet images pull --config /usr/local/etc/billet/billet.yaml
+  billet check --config /usr/local/etc/billet/billet.yaml
+  billet local up
+
+NAME is this Mac's node name (letters, digits, dot, dash, underscore). The
+/usr/local directories the launch agents use, the Setup Assistant choices a
+node needs (automatic login, FileVault off) and the softnet grant untrusted
+work needs are all in the Mac guide:
+  https://github.com/junioryono/billet/blob/main/docs/deploying/mac-tart.md"
+    elif [ "${native}" = true ]; then
         echo "Next:
   billet init --org YOUR-ORG --runner-group YOUR-GROUP \\
     --workflow YOUR-ORG/REPO/.github/workflows/ci.yml@refs/heads/main \\
