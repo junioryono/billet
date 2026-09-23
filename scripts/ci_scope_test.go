@@ -100,9 +100,9 @@ func TestCIScopeRunsOnlyDocsJobsForAChangeThatIsAllDocumentation(t *testing.T) {
 				t.Helper()
 
 				mustWrite(t, dir, "docs/deploying/mac-tart.md", "# Mac\n")
-				mustWrite(t, dir, "README.md", "# readme\n")
+				mustWrite(t, dir, "docs/conf.py", "project = 'billet'\n")
 				mustWrite(t, dir, ".claude/skills/x/SKILL.md", "---\nname: x\n---\n")
-				mustWrite(t, dir, "LICENSE", "Apache\n")
+				mustWrite(t, dir, "CLAUDE.md", "# billet\n")
 			},
 			event: "pull_request", want: "docs", reason: "all 4 paths",
 		},
@@ -133,6 +133,91 @@ func TestCIScopeRunsOnlyDocsJobsForAChangeThatIsAllDocumentation(t *testing.T) {
 				mustWrite(t, dir, "docs/a.md", "a\n")
 			},
 			event: "push", want: "full", reason: "is not a pull request",
+		},
+		{
+			name: "LICENSE is a package input",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "LICENSE", "Apache\n")
+			},
+			event: "pull_request", want: "full", reason: "touches LICENSE",
+		},
+		{
+			name: "the root README is a package input",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "README.md", "# billet\n")
+			},
+			event: "pull_request", want: "full", reason: "touches README.md",
+		},
+		{
+			name: "Go source under docs is source",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "docs/helper.go", "package docs\n")
+			},
+			event: "pull_request", want: "full", reason: "touches docs/helper.go",
+		},
+		{
+			name: "a script under .claude is not documentation",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, ".claude/skills/x/run.sh", "#!/bin/sh\n")
+			},
+			event: "pull_request", want: "full", reason: "touches .claude/skills/x/run.sh",
+		},
+		{
+			name: "a skills symlink under .agents is not documentation",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				if err := os.MkdirAll(filepath.Join(dir, ".agents", "skills"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("../../.claude/skills/x", filepath.Join(dir, ".agents", "skills", "x")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			event: "pull_request", want: "full", reason: "touches .agents/skills/x",
+		},
+		{
+			name: "a documentation path made executable",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				if err := os.Chmod(filepath.Join(dir, "docs", "index.md"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			event: "pull_request", want: "full", reason: "100644 -> 100755",
+		},
+		{
+			name: "a documentation path replaced by a symlink",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				p := filepath.Join(dir, "docs", "index.md")
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("../cmd/billet/main.go", p); err != nil {
+					t.Fatal(err)
+				}
+			},
+			event: "pull_request", want: "full", reason: "100644 -> 120000",
+		},
+		{
+			name: "a documentation file deleted",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				gitIn(t, dir, "rm", "-q", "docs/index.md")
+			},
+			event: "pull_request", want: "docs", reason: "all 1 paths",
 		},
 		{
 			name:   "a change that lists no paths",
@@ -277,6 +362,10 @@ func TestCIScopeGatesOnlyJobsVerifyMaySeeSkipped(t *testing.T) {
 	wf := readCIWorkflow(t)
 	_, kept := verifyStep(t, wf)
 	verified := jobNeeds(t, wf.Jobs["verify-all-checks"].Needs)
+
+	if wf.Jobs["verify-all-checks"].If != "always()" {
+		t.Errorf("verify-all-checks runs if %q; it must be always(), or a failed or skipped job leaves the one required check unreported", wf.Jobs["verify-all-checks"].If)
+	}
 
 	gated := 0
 	for name, job := range wf.Jobs {
