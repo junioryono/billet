@@ -3422,10 +3422,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if lease == nil {
 			break
 		}
-		l.order.launchBegins(l.tier)
-		err = l.launch(ctx, lease, job)
-		l.order.launchEnds(l.tier)
-		if err != nil {
+		if err := l.launch(ctx, lease, job); err != nil {
 			return err
 		}
 		active++
@@ -4253,7 +4250,12 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 // holding it withholds capacity from every other tier for no reason. GitHub
 // reassigns the job when its pickup deadline passes.
 func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) error {
+	// EVERY LAUNCH, on the pool path and the direct-assignment path alike: a
+	// waiter launching for the node's whole command timeout is progressing, and
+	// the finished launch dates its progress.
+	l.order.launchBegins(l.tier)
 	err := l.runner.Launch(ctx, lease, job)
+	l.order.launchEnds(l.tier)
 
 	if err == nil {
 		// STILL OURS? The mutex was released for the duration of the launch, and

@@ -113,7 +113,7 @@ var statusNow = time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 // the reader compares the last progress it did publish with its own clock. On
 // 2026-09-23 the report said only "waiting 1 job(s) for room" for eighteen
 // minutes while that waiter's listener sat on a dead connection.
-func TestStatusSaysAStalledWaiterIsNotHoldingTheLine(t *testing.T) {
+func TestStatusSaysAWaiterHasPublishedNoProgress(t *testing.T) {
 	report := func(progress string) string {
 		var b strings.Builder
 
@@ -129,13 +129,13 @@ func TestStatusSaysAStalledWaiterIsNotHoldingTheLine(t *testing.T) {
 	}
 
 	stalled := statusNow.Add(-server.WaiterAllowance - time.Minute).Format(time.RFC3339Nano)
-	if out := report(stalled); !strings.Contains(out, "NOT HOLDING THE LINE") {
+	if out := report(stalled); !strings.Contains(out, "NO ADMISSION PROGRESS PUBLISHED") {
 		t.Errorf("a waiter stalled past the allowance is reported as holding the line:\n%s", out)
 	}
 
 	live := statusNow.Add(-server.WaiterAllowance + time.Minute).Format(time.RFC3339Nano)
 	for _, progress := range []string{live, "", "not a time"} {
-		if out := report(progress); strings.Contains(out, "NOT HOLDING THE LINE") {
+		if out := report(progress); strings.Contains(out, "NO ADMISSION PROGRESS PUBLISHED") {
 			t.Errorf("progress %q is reported as a stall:\n%s", progress, out)
 		}
 	}

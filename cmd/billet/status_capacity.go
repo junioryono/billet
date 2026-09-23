@@ -43,9 +43,12 @@ func printTierCapacity(w io.Writer, label string, r alloc.TierCapacity, now time
 	if r.Listener.Waiting > 0 && r.Listener.WaitingSince != "" {
 		fmt.Fprintf(w, "          waiting %d job(s) for room, oldest since %s\n",
 			r.Listener.Waiting, r.Listener.WaitingSince)
+		// AN OBSERVATION, NOT THE QUEUE'S DECISION. The listener publishes its
+		// progress once a poll; one launching for longer still holds the line, and
+		// one that stalled cannot publish that it has.
 		if stalled := stalledFor(r.Listener.WaitingProgress, now); stalled > server.WaiterAllowance {
-			fmt.Fprintf(w, "          NOT HOLDING THE LINE: no admission progress for %s (last %s); "+
-				"other tiers may buy ahead of it until it progresses\n",
+			fmt.Fprintf(w, "          NO ADMISSION PROGRESS PUBLISHED for %s (last %s): unless its listener "+
+				"is in a launch, other tiers may buy ahead of it until it progresses\n",
 				stalled.Round(time.Second), r.Listener.WaitingProgress)
 		}
 	}

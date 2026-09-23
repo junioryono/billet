@@ -196,6 +196,8 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 	first, since := "", time.Time{}
 	now := q.now()
 
+	var stalled []string
+
 	for label, waiter := range q.waiting {
 		if label != tier && !competes(where, waiter.where) {
 			continue
@@ -204,14 +206,7 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 		// A STALLED WAITER STEPS ASIDE BUT KEEPS ITS PLACE. Its own record is never
 		// skipped, so a tier is not let past itself.
 		if label != tier && !q.holdsTheLine(label, waiter, now) {
-			if !waiter.passed {
-				waiter.passed = true
-				q.waiting[label] = waiter
-				q.log.Warn("letting a tier past a waiter whose listener has made no admission progress; "+
-					"it keeps its place and holds the line again when it progresses",
-					"tier", tier, "waiter", label, "waiting_since", waiter.since,
-					"last_progress", waiter.progress, "allowance", WaiterAllowance)
-			}
+			stalled = append(stalled, label)
 
 			continue
 		}
@@ -224,7 +219,32 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 		}
 	}
 
-	return first == "" || first == tier
+	allowed := first == "" || first == tier
+	if allowed {
+		q.letPast(tier, stalled)
+	}
+
+	return allowed
+}
+
+// letPast requires q.mu. It logs, once per stall, each stalled waiter this
+// buyer really did get ahead of: one that would otherwise have come first.
+func (q *admissionQueue) letPast(tier string, stalled []string) {
+	own, waiting := q.waiting[tier]
+
+	for _, label := range stalled {
+		waiter := q.waiting[label]
+		if waiter.passed || waiting && !waiter.since.Before(own.since) {
+			continue
+		}
+
+		waiter.passed = true
+		q.waiting[label] = waiter
+		q.log.Warn("letting a tier past a waiter whose listener has made no admission progress; "+
+			"it keeps its place and holds the line again when it progresses",
+			"tier", tier, "waiter", label, "waiting_since", waiter.since,
+			"last_progress", waiter.progress, "allowance", WaiterAllowance)
+	}
 }
 
 // waits records that this tier has demand it could not buy for.
@@ -315,7 +335,7 @@ func (q *admissionQueue) served(tier string) {
 
 // waitingSince reports when a tier began waiting and when its listener last made
 // admission progress, for the status report.
-func (q *admissionQueue) waitingSince(tier string) (since, progress time.Time, ok bool) {
+func (q *admissionQueue) waitingSince(tier string) (time.Time, time.Time, bool) {
 	if q == nil {
 		return time.Time{}, time.Time{}, false
 	}
