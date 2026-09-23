@@ -8,7 +8,7 @@ The fail-closed **mount** of the ledger volume is the configuration layer's job:
 
 ```hcl
 module "control_plane" {
-  source = "github.com/junioryono/billet//terraform/modules/billet/modules/control-plane-ec2-sqlite?ref=v0.12.6"
+  source = "github.com/junioryono/billet//terraform/modules/billet/modules/control-plane-ec2-sqlite?ref=v0.12.7"
 
   name              = "billet"
   vpc_id            = aws_vpc.mine.id
