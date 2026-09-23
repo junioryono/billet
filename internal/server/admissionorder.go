@@ -34,9 +34,10 @@ import (
 // fallback resizes a lease that already exists (`alloc.Resize`) to the shape the
 // cloud actually sold, which is re-authorised against the deployment ceiling and
 // every floor but not against this queue. The order admitted that lease; the
-// node plane, where the resize happens, is below the scheduler and cannot reach
-// the queue. A fallback to a larger shape can therefore take pot a waiter was
-// accumulating, which is #172 and is exempt until that says otherwise.
+// resize is asked for by the node, through the node plane's resize route or the
+// in-process runtime, and the queue is handed only to listeners, so nothing on
+// that path holds it. A fallback to a larger shape can therefore take pot a
+// waiter was accumulating, which is #172 and is exempt until that says otherwise.
 //
 // A TIER HOLDS THE LINE ONLY WHERE ROOM COULD REACH IT, which is #157. A tier
 // waiting on its own max_concurrent, pinned to a host that is gone, or with a
