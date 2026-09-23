@@ -2,6 +2,10 @@
 
 A control plane bound to a network address requires client certificates and is its own certificate authority. There is no CA to run and nothing to install. A machine joins by asking and having its fingerprint approved, or by being handed a certificate you issued.
 
+## The new machine's config
+
+`billet init --join <control plane>:7717` generates a config the way a single-machine `init` does, from the same flags, and then turns it into a node that joins the control plane at that address: no `server:` and no `github:`, `node.server_addr` set, `node.tls` naming the bundle under the config directory's `tls/`, and the ceiling it measured moved onto `node.max_vcpu` and `node.max_memory`. Left unset there, a node contributes its whole machine rather than what it was measured to spare. It then prints the control plane's half: raise `server.max_vcpu` and `server.max_memory` by this node's contribution, because the deployment ceiling caps every node and room it does not count is room nothing hands out, and add the printed `tiers:` and `nodes:` entries. The control plane reads both at startup, so restart it afterwards. The certificate bundle comes from either way of joining below.
+
 ## Enroll: the machine asks, you approve a fingerprint
 
 Two ends display the same number and you check they match. That comparison is the trust decision; everything else is transport.

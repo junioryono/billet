@@ -134,6 +134,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	emit := fs.String("emit", string(emitFile),
 		"where the generation goes: file (write --config) or ansible (print the "+
 			"billet_config block for an inventory, writing nothing)")
+	join := fs.String("join", "",
+		"write a node-only config for this machine that joins the control plane at this "+
+			"node-wire address (host:port), and print what that control plane's config needs")
 
 	// WHERE THE LEDGER LIVES, and it is a property of the CONTROL PLANE rather
 	// than of a backend — so unlike every flag below, these apply to any provider.
@@ -372,6 +375,10 @@ func cmdInit(ctx context.Context, args []string) error {
 		return errors.New("--emit ansible describes a host the junioryono.billet.host role " +
 			"converges, which installs the service shape; --profile local is the two-terminal " +
 			"user-session shape and its paths are unreadable to the role's units")
+	}
+	if *join != "" && emitValue == emitAnsible {
+		return errors.New("--join writes this machine's node config and prints the control " +
+			"plane's half; it has no inventory form, so it cannot be combined with --emit ansible")
 	}
 	if err := initconfig.CheckListen(*listen); err != nil {
 		return err
@@ -682,6 +689,18 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// A JOIN IS A TRANSFORM OF THE GENERATION, so the measured ceiling and the
+	// tiers that fit it have one author; the half that belongs in the control
+	// plane's file is printed once this machine's file is written.
+	var joined initconfig.JoinResult
+	if *join != "" {
+		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(*cfgPath), "tls"))
+		if err != nil {
+			return err
+		}
+		body = joined.Node
+	}
+
 	// The three re-run outcomes. BESIDE moves no pointer and touches no
 	// existing file, so the identity refusal applies only to the two paths
 	// that REPLACE the file: converge and --force.
@@ -755,7 +774,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	final := []byte(body)
 	carried := false
 	var keyMovedFrom, keyMovedTo string
-	if len(existingRaw) > 0 {
+	// A joined node has no github block, and carrying one back in would make
+	// this machine a second control plane for the same App.
+	if len(existingRaw) > 0 && *join == "" {
 		gb, oldKeyPath, ok := existingGitHubBlock(existingRaw)
 		switch {
 		case ok && !gb.usable():
@@ -1056,10 +1077,30 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 
 	report()
+	if *join != "" {
+		printJoinNext(*cfgPath, params.Profile, joined)
+
+		return nil
+	}
 	warnIfListenBusy(ctx, params.Listen)
 	printInitNextFor(*cfgPath, params, trusted, carried)
 
 	return nil
+}
+
+// printJoinNext says what a joined node still needs: its certificate bundle,
+// and the control plane's half of the join.
+func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult) {
+	fmt.Printf("\nOn the control plane:\n\n%s\n", joined.ControlPlane)
+	fmt.Printf("Then on this machine:\n\n")
+	fmt.Printf("  1. Install the certificate bundle the config's node.tls names — from " +
+		"`billet ca issue <name>` on the control plane, or the enrollment ceremony.\n")
+	fmt.Printf("  2. billet check --config %s\n", shellArg(cfgPath))
+	if profile == initconfig.ProfileLocalService {
+		fmt.Printf("  3. billet local up\n")
+	} else {
+		fmt.Printf("  3. billet node --config %s\n", shellArg(cfgPath))
+	}
 }
 
 // existingGitHubBlock reads the App identity out of the file being replaced —
