@@ -282,6 +282,24 @@ check_runner_home() {
 	esac
 }
 
+# check_github_cli passes or fails the gate on the GitHub CLI in the image mounted
+# at $1.
+#
+# CHECKED BY NAME BECAUSE THE PARITY CHECK CANNOT SEE IT. GitHub's image carries
+# `gh`, and its toolset declaration does not name it: GitHub installs it with a
+# script of its own. So an image without it passes every declared package, and a
+# workflow step that calls `gh` fails with 127 at its first call. The steps that
+# do are mostly the ones that run only after a merge, which is how a fleet image
+# without it went unnoticed until a push to main (measured 2026-09-22).
+check_github_cli() {
+	if [ -x "$1/usr/bin/gh" ]; then
+		pass "the GitHub CLI is installed"
+	else
+		fail "no GitHub CLI at /usr/bin/gh; GitHub's image carries it, and a workflow step
+        that calls gh fails with 127"
+	fi
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -535,6 +553,8 @@ for tool in zstd unzip zip tar wget rsync gcc make; do
         @actions/tool-cache"
 	fi
 done
+
+check_github_cli "$MNT"
 
 # --- parity with github's declaration ---------------------------------------
 

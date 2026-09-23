@@ -1134,6 +1134,12 @@ func provisionScript(spec BuildSpec) (string, error) {
 		// thing that killed a guest-image build on `netcat`. So the provider is
 		// named, and mawk is the one Ubuntu ships by default.
 		"mawk",
+		// gh IS ON GITHUB'S IMAGE AND IN NO DECLARATION: GitHub installs it with a
+		// script of its own, so the toolset never names it and a workflow's first
+		// `gh` call failed with 127 on the fleet (2026-09-22). Ubuntu's package,
+		// for the reason compose and buildx come from the archive below, and older
+		// than the release GitHub installs; ADR-005 records that difference.
+		"gh",
 	}
 
 	declared := ts.AptPackages()
@@ -1332,6 +1338,9 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// true, for a plugin the distribution already maintains.
 	b.WriteString("docker buildx version\n")
 	b.WriteString("docker compose version\n")
+	// EXECUTED, like the plugins above, so an image whose apt transaction dropped
+	// it stops here under `set -e` rather than at a workflow's first `gh` call.
+	b.WriteString("gh --version\n")
 	b.WriteString("systemctl enable docker\n")
 
 	// THE RUNNER'S OWN DEPENDENCY IS STILL NAMED RATHER THAN SCRIPTED, and the
