@@ -3422,7 +3422,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		if lease == nil {
 			break
 		}
-		if err := l.launch(ctx, lease, job); err != nil {
+		l.order.launchBegins(l.tier)
+		err = l.launch(ctx, lease, job)
+		l.order.launchEnds(l.tier)
+		if err != nil {
 			return err
 		}
 		active++

@@ -40,8 +40,9 @@ func (l *Listener) reportCapacity(ctx context.Context, sent *int, exchange strin
 	// timestamp: the point of the field is how long the oldest work has been
 	// waiting, and a value stamped at each observation would always read as
 	// "just now".
-	if since, ok := l.order.waitingSince(l.tier); ok {
+	if since, progress, ok := l.order.waitingSince(l.tier); ok {
 		report.WaitingSince = since.UTC().Format(time.RFC3339Nano)
+		report.WaitingProgress = progress.UTC().Format(time.RFC3339Nano)
 	}
 
 	// A COUNT WITHOUT A DATE IS NOT A WAIT. The two are written by different

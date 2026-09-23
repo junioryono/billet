@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -20,9 +21,22 @@ import (
 // ONE WINNER, CHOSEN BY A WAIT IT CANNOT EXTEND. Under fair the longest-waiting
 // tier holds the freed room until its shape fits, which is head-of-line blocking
 // on purpose: a large shape only ever fits when several small jobs end together,
-// so first-come starves it outright on a fleet that is never idle. The block is
-// bounded by the longest job already running, and it cannot deadlock, because
-// the winner is a single tier and waiting never moves it later in the order.
+// so first-come starves it outright on a fleet that is never idle. It cannot
+// deadlock, because the winner is a single tier and waiting never moves it later
+// in the order.
+//
+// A WAITER HOLDS THE LINE ONLY WHILE ITS LISTENER IS MAKING PROGRESS. The block
+// was said to be bounded by the longest job already running, and that assumed
+// the winner was always there to buy. On 2026-09-23 it was not: the longest
+// waiter's listener sat on a dead connection to GitHub for 18 minutes, could
+// neither buy nor give up its place, and every tier sharing its host declined
+// every assignment with 78 of 136 vCPU free. So a waiter is dated by its last
+// admission progress (a refused reconciliation, or a launch finishing) and, once
+// that is older than WaiterAllowance with no launch of its own in flight, it
+// stops holding back other tiers. It keeps its place: the moment its listener
+// progresses again it is the longest waiter once more. Silence suspends the right
+// to block others and proves nothing else; the queue releases, destroys and
+// promises nothing, and every purchase is still the allocator's atomic escrow.
 //
 // A WAIT IS RELEASED BY DEMAND GOING AWAY AS WELL AS BY BEING SERVED. GitHub's
 // count is the only thing that says a queued job was cancelled, so a record that
@@ -49,10 +63,23 @@ import (
 type admissionQueue struct {
 	policy config.AdmissionOrder
 	now    func() time.Time
+	log    *slog.Logger
 
 	mu      sync.Mutex
 	waiting map[string]waitingTier
+	// launching counts each tier's launches in flight. A launch can take the
+	// node's whole command timeout, and a tier whose listener is launching is
+	// progressing, so it never goes stale mid-launch.
+	launching map[string]int
 }
+
+// WaiterAllowance is how long a waiter keeps holding back other tiers without
+// admission progress. A healthy listener reconciles before every poll and after
+// every empty one, and the longest long poll measured was about 88 seconds; this
+// is two of those, a policy choice rather than a proof that a quieter listener
+// is dead. Too short costs a large tier its accumulated room; too long is the
+// 2026-09-23 stall.
+const WaiterAllowance = 3 * time.Minute
 
 // waitingTier is one tier's place in the order and where its room could come
 // from.
@@ -69,15 +96,31 @@ type waitingTier struct {
 	// would block tiers it no longer competes with and let past ones it now
 	// does. Its PLACE in the order is what must not move.
 	where alloc.TierAdmission
+	// progress is the last time this tier's listener did admission work: a
+	// refused reconciliation or a launch finishing. Not a successful exchange
+	// with GitHub, because a held message is redelivered on every poll while the
+	// reconciliation that would re-judge the demand is skipped.
+	progress time.Time
+	// passed records that another tier has been let past this stalled waiter,
+	// so the log says so once per stall rather than on every purchase.
+	passed bool
 }
 
 // newAdmissionQueue builds the queue every listener of one control plane shares.
 func newAdmissionQueue(policy config.AdmissionOrder) *admissionQueue {
 	return &admissionQueue{
-		policy:  policy.Or(),
-		now:     time.Now,
-		waiting: map[string]waitingTier{},
+		policy:    policy.Or(),
+		now:       time.Now,
+		log:       slog.Default(),
+		waiting:   map[string]waitingTier{},
+		launching: map[string]int{},
 	}
+}
+
+// holdsTheLine requires q.mu. A waiter that is launching, or progressed within
+// WaiterAllowance, holds back the tiers it competes with.
+func (q *admissionQueue) holdsTheLine(label string, waiter waitingTier, now time.Time) bool {
+	return q.launching[label] > 0 || now.Sub(waiter.progress) <= WaiterAllowance
 }
 
 // gates reports whether this queue decides anything: under fill, and for the
@@ -151,9 +194,25 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 	defer q.mu.Unlock()
 
 	first, since := "", time.Time{}
+	now := q.now()
 
 	for label, waiter := range q.waiting {
 		if label != tier && !competes(where, waiter.where) {
+			continue
+		}
+
+		// A STALLED WAITER STEPS ASIDE BUT KEEPS ITS PLACE. Its own record is never
+		// skipped, so a tier is not let past itself.
+		if label != tier && !q.holdsTheLine(label, waiter, now) {
+			if !waiter.passed {
+				waiter.passed = true
+				q.waiting[label] = waiter
+				q.log.Warn("letting a tier past a waiter whose listener has made no admission progress; "+
+					"it keeps its place and holds the line again when it progresses",
+					"tier", tier, "waiter", label, "waiting_since", waiter.since,
+					"last_progress", waiter.progress, "allowance", WaiterAllowance)
+			}
+
 			continue
 		}
 
@@ -189,12 +248,57 @@ func (q *admissionQueue) waits(tier string, where alloc.TierAdmission) {
 	// refusal.
 	if previous, ok := q.waiting[tier]; ok {
 		previous.where = where
-		q.waiting[tier] = previous
+		q.progressed(tier, previous)
 
 		return
 	}
 
-	q.waiting[tier] = waitingTier{since: q.now(), where: where}
+	now := q.now()
+	q.waiting[tier] = waitingTier{since: now, where: where, progress: now}
+}
+
+// progressed requires q.mu. It dates a waiter's admission progress and says so
+// when that ends a stall other tiers were let past.
+func (q *admissionQueue) progressed(tier string, waiter waitingTier) {
+	if waiter.passed {
+		q.log.Info("a waiter's listener is making admission progress again; it holds the line from its original place",
+			"waiter", tier, "waiting_since", waiter.since)
+	}
+
+	waiter.progress = q.now()
+	waiter.passed = false
+	q.waiting[tier] = waiter
+}
+
+// launchBegins marks a launch in flight for this tier, which progresses however
+// long the node takes.
+func (q *admissionQueue) launchBegins(tier string) {
+	if q == nil {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.launching[tier]++
+}
+
+// launchEnds is launchBegins' partner, and a finished launch is progress.
+func (q *admissionQueue) launchEnds(tier string) {
+	if q == nil {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.launching[tier]--; q.launching[tier] <= 0 {
+		delete(q.launching, tier)
+	}
+
+	if waiter, ok := q.waiting[tier]; ok {
+		q.progressed(tier, waiter)
+	}
 }
 
 // served records that this tier's demand is met, or gone.
@@ -209,10 +313,11 @@ func (q *admissionQueue) served(tier string) {
 	delete(q.waiting, tier)
 }
 
-// waitingSince reports when a tier began waiting, for the status report.
-func (q *admissionQueue) waitingSince(tier string) (time.Time, bool) {
+// waitingSince reports when a tier began waiting and when its listener last made
+// admission progress, for the status report.
+func (q *admissionQueue) waitingSince(tier string) (since, progress time.Time, ok bool) {
 	if q == nil {
-		return time.Time{}, false
+		return time.Time{}, time.Time{}, false
 	}
 
 	q.mu.Lock()
@@ -220,5 +325,5 @@ func (q *admissionQueue) waitingSince(tier string) (time.Time, bool) {
 
 	waiter, ok := q.waiting[tier]
 
-	return waiter.since, ok
+	return waiter.since, waiter.progress, ok
 }

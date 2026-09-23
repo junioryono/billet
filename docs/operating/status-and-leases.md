@@ -32,7 +32,14 @@ A tier with work it could not buy room for says so, on a line of its own:
 
 **That line is the only place a queue is visible.** Nothing is reserved for an idle tier, so in the ledger a tier with three queued jobs and a tier nobody has asked for are the same shape: both hold nothing and both advertise their ceiling. The count is what GitHub has assigned beyond what this tier could start, and the timestamp is when it first could not start it — not when the observation was written, so it reads as the age of the oldest wait. It is absent when nothing is waiting, and a control plane older than this field reports nothing rather than a queue of zero.
 
-Which waiting tier takes that room is `server.admission_order`. Under `fair`, the default, it goes to the tier that has waited longest, and no other tier buys until that tier's shape fits: a large shape only ever fits when several small jobs end together, so first-come starves it on a fleet that is never idle. The freed room therefore sits idle while it accumulates, for at most as long as the longest job already running. Under `fill` anything that fits starts instead, and the largest shape may wait indefinitely. A tier stops holding the line as soon as its demand is served or GitHub's count says the work was cancelled.
+Which waiting tier takes that room is `server.admission_order`. Under `fair`, the default, it goes to the tier that has waited longest, and no other tier buys until that tier's shape fits: a large shape only ever fits when several small jobs end together, so first-come starves it on a fleet that is never idle. The freed room therefore sits idle while it accumulates, for as long as the longest job already running, provided the waiting tier's listener is there to buy it. A tier stops holding the line as soon as its demand is served or GitHub's count says the work was cancelled, and also while its listener has made no admission progress for three minutes (a refused reconciliation or a finished launch counts; a launch in flight never goes stale). That is the 2026-09-23 stall: the longest waiter's listener sat on a dead connection to GitHub for 18 minutes, and every tier sharing its host declined every assignment with most of the fleet free. Such a waiter keeps its place and holds the line again as soon as it progresses, and the report says so beneath its waiting line:
+
+```text
+          waiting 1 job(s) for room, oldest since 2026-09-23T15:48:42Z
+          NOT HOLDING THE LINE: no admission progress for 18m2s (last 2026-09-23T15:58:38Z); other tiers may buy ahead of it until it progresses
+```
+
+A stalled listener cannot publish that it has stalled, so `billet status` compares the last progress it did publish with its own clock. Under `fill` anything that fits starts instead, and the largest shape may wait indefinitely.
 
 ## `billet leases`
 

@@ -2942,7 +2942,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(os.Stdout, t.Label, report)
+			printTierCapacity(os.Stdout, t.Label, report, time.Now())
 		}
 	}
 
