@@ -504,10 +504,8 @@ func fakeDiffGit(t *testing.T, raw string) string {
 	if err := os.WriteFile(out, []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/bin/sh\nif [ \"$1\" = diff ]; then cat " + out + "; exit 0; fi\nexec " + realGit + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	script := "#!/bin/sh\nif [ \"$1\" = diff ]; then exec cat '" + out + "'; fi\nexec '" + realGit + "' \"$@\"\n"
+	writeExecutable(t, filepath.Join(bin, "git"), script)
 
 	return bin
 }
