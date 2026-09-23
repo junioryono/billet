@@ -307,6 +307,21 @@ func (a *Allocator) PoolRunners(ctx context.Context, tier string) ([]PoolRunner,
 	return out, err
 }
 
+// PoolRunnerLaunchedFor resolves the member launched for a request, whatever job
+// GitHub later gave it.
+func (a *Allocator) PoolRunnerLaunchedFor(ctx context.Context, tier string, requestID int64) (PoolRunner, error) {
+	runners, err := a.PoolRunners(ctx, tier)
+	if err != nil {
+		return PoolRunner{}, err
+	}
+	for i := range runners {
+		if runners[i].LaunchRequestID == requestID {
+			return runners[i], nil
+		}
+	}
+	return PoolRunner{}, ErrLeaseNotFound
+}
+
 // IdlePoolRunners reports pool members that can be considered for scale-down.
 func (a *Allocator) IdlePoolRunners(ctx context.Context, tier string) ([]PoolRunner, error) {
 	runners, err := a.PoolRunners(ctx, tier)
