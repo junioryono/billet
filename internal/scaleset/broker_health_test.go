@@ -165,7 +165,7 @@ func TestASilentBrokerConnectionIsClosedAndReplaced(t *testing.T) {
 	base := "https://" + proxy.ln.Addr().String()
 
 	get := func(path string) (string, error) {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+path, nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+path, http.NoBody)
 		if err != nil {
 			return "", err
 		}
