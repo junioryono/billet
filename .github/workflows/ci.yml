@@ -16,6 +16,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # HOW MUCH OF THIS RUN A CHANGE NEEDS. A pull request that touches only
+  # documentation runs test (the Go suite reads docs: the compatibility page, the
+  # documented module sources), release-config and docs, and skips the jobs
+  # listed in verify-all-checks' KEPT complement: the PostgreSQL shards, the host
+  # lifecycle matrix, the package, Terraform and replay jobs, lint and the gate
+  # binaries. Everything else, and anything scripts/ci-scope.sh cannot establish,
+  # is "full". A job gated on this must be one verify-all-checks may see skipped.
+  changes:
+    runs-on: billet-2vcpu-ubuntu-2404
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The merge commit and its first parent: HEAD^1..HEAD is the change.
+          fetch-depth: 2
+      - id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+        run: |
+          scope=$(scripts/ci-scope.sh)
+          echo "scope=$scope" >>"$GITHUB_OUTPUT"
   test:
     runs-on: billet-16vcpu-ubuntu-2404
     # THIS JOB RUNS THE SUITE TWICE AND TALKS TO TWO REAL SERVICES, so it is the
@@ -182,6 +204,8 @@ jobs:
   # (BILLET_TEST_LEDGER=postgres), which is the conformance run the single job
   # made. internal/state's SQLite suite is NOT re-run here.
   test-postgres:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     # 30: the command suite moved to test-postgres-command, so this job is the
     # ledger backend (283.4s on main at d4d4e2e) and the capacity suite (204.2s)
@@ -242,6 +266,8 @@ jobs:
   # TestA* 546s and the rest 684s. The patterns partition the top-level names;
   # ^TestRetirement belongs to test-postgres-retirement and is skipped here.
   test-postgres-command:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 45
     strategy:
@@ -321,6 +347,8 @@ jobs:
   # run here in seven disjoint source-owned shards. The partition check refuses
   # missing or duplicate selection; test-postgres skips all TestRetirement names.
   test-postgres-retirement:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 75
     strategy:
@@ -394,6 +422,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
@@ -510,6 +540,8 @@ jobs:
   # and use these files (gate-binaries.sh, and the gates' BILLET_*_BINARY
   # overrides). The artifact lives for this run only.
   gate-binaries:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -873,6 +905,8 @@ jobs:
   # phony and runs again for the second target, but the Go build cache is warm
   # by then and it costs about a minute.
   package-lifecycle:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -916,6 +950,8 @@ jobs:
   # thing standing between a typo and an operator's plan. The tests run against
   # a mocked provider: no credentials, nothing created, real provider schemas.
   terraform:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     # Named by the leg's ROLE, not its version: a required-status-check
     # configured against a name that embeds the pin would silently stop being
     # satisfied on the next version bump.
@@ -997,6 +1033,8 @@ jobs:
   # consumer floor would be an untested claim that rots. It validates exactly
   # what a consumer resolves: the module sources without tests.
   terraform-consumer-floor:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -1030,6 +1068,8 @@ jobs:
   # Versions are read from the Makefile, the way goreleaser's is, so the
   # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
   terraform-lint:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -1071,6 +1111,8 @@ jobs:
   # test job's cap on a runner (measured 2026-09-05), and the race detector's
   # value is already spent on the same code by the three-hundred-job run there.
   replay:
+    needs: changes
+    if: needs.changes.outputs.scope == 'full'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -1114,6 +1156,7 @@ jobs:
     runs-on: billet-2vcpu-ubuntu-2404
     needs:
       [
+        changes,
         test,
         test-postgres,
         test-postgres-command,
@@ -1135,12 +1178,24 @@ jobs:
       - name: Verify all checks passed
         env:
           NEEDS: ${{ toJSON(needs) }}
+          # The jobs a docs-scoped run still runs. Every other job this needs may be
+          # skipped on such a run, and only on such a run: a docs change cannot
+          # reach them, and changes decided it, not a guess.
+          KEPT: '["changes", "test", "release-config", "docs"]'
         run: |
           # Every needed job must have SUCCEEDED: a skipped or cancelled job is
           # not a passed one, and reading it as one is a green check over an
-          # unverified tree.
-          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null; then
-            echo "not every check passed:"
+          # unverified tree. The one exception is a job changes scoped out, and
+          # changes itself must have succeeded for its decision to count.
+          scope=$(jq -r '.changes.outputs.scope // ""' <<<"$NEEDS")
+          if ! jq -e --arg scope "$scope" --argjson kept "$KEPT" '
+              .changes.result == "success" and
+              ($scope == "full" or $scope == "docs") and
+              (to_entries | all(
+                .value.result == "success" or
+                ($scope == "docs" and .value.result == "skipped" and (.key as $k | $kept | index($k) | not))
+              ))' <<<"$NEEDS" >/dev/null; then
+            echo "not every check passed (scope: ${scope:-none}):"
             jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
             exit 1
           fi
