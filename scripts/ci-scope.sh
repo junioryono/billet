@@ -61,10 +61,30 @@ if ! git diff --no-renames --raw -z HEAD^1 HEAD >"$list"; then
 	decide full "git diff HEAD^1 HEAD failed"
 fi
 
+# EVERY RECORD MUST BE WHOLE. A header without its path, a path without its
+# terminator or a header of any other shape is output this script cannot read,
+# and what it cannot read is "full": a loop that simply stopped there would have
+# judged only the records before it.
+record='^:([0-7]{6}) ([0-7]{6}) [0-9a-f]+ [0-9a-f]+ [ADMTUX]$'
 count=0
-while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+while :; do
+	meta=
+	if ! IFS= read -r -d '' meta; then
+		if [ -z "$meta" ]; then
+			break
+		fi
+		decide full "git diff's output ends inside a record header"
+	fi
+	path=
+	if ! IFS= read -r -d '' path; then
+		decide full "a git diff record has no terminated path"
+	fi
+	if ! [[ $meta =~ $record ]]; then
+		decide full "git diff printed a record this script cannot read: $meta"
+	fi
+	old_mode=${BASH_REMATCH[1]}
+	new_mode=${BASH_REMATCH[2]}
 	count=$((count + 1))
-	read -r old_mode new_mode _ _ _ <<<"${meta#:}"
 	if ! is_documentation "$path"; then
 		decide full "touches $path"
 	fi

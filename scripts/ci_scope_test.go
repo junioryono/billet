@@ -47,6 +47,13 @@ func scopeRepo(t *testing.T, change func(t *testing.T, dir string)) string {
 	git("init", "-q", "-b", "main")
 	write("cmd/billet/main.go", "package main\n")
 	write("docs/index.md", "# billet\n")
+	write("docs/run.md", "#!/bin/sh\n")
+	if err := os.Chmod(filepath.Join(dir, "docs", "run.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("index.md", filepath.Join(dir, "docs", "link.md")); err != nil {
+		t.Fatal(err)
+	}
 	git("add", "-A")
 	git("commit", "-q", "-m", "base")
 	git("checkout", "-q", "-b", "change")
@@ -57,14 +64,16 @@ func scopeRepo(t *testing.T, change func(t *testing.T, dir string)) string {
 	// The base moves on after the branch was cut, as it does on a busy repository,
 	// so HEAD^1 is not the branch point.
 	write("internal/other.go", "package other\n")
-	git("add", "-A")
+	// Only its own file: anything the change left on disk (an embedded repository
+	// survives a checkout) must reach the merge through the change, not the base.
+	git("add", "internal/other.go")
 	git("commit", "-q", "-m", "base moves on")
 	git("merge", "-q", "--no-ff", "-m", "merge", "change")
 
 	return dir
 }
 
-func runScope(t *testing.T, dir, event string) (string, string) {
+func runScope(t *testing.T, dir, event string, env ...string) (string, string) {
 	t.Helper()
 
 	script, err := filepath.Abs(ciScopeScript)
@@ -73,7 +82,7 @@ func runScope(t *testing.T, dir, event string) (string, string) {
 	}
 	cmd := exec.CommandContext(t.Context(), "bash", script)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "CI_EVENT="+event)
+	cmd.Env = append(append(os.Environ(), "CI_EVENT="+event), env...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -209,6 +218,43 @@ func TestCIScopeRunsOnlyDocsJobsForAChangeThatIsAllDocumentation(t *testing.T) {
 				}
 			},
 			event: "pull_request", want: "full", reason: "100644 -> 120000",
+		},
+		{
+			name: "an executable made a regular documentation file",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				// The base's docs/run.md is executable (see scopeRepo); this change only
+				// clears the bit, so only the old side is not a regular file.
+				if err := os.Chmod(filepath.Join(dir, "docs", "run.md"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			event: "pull_request", want: "full", reason: "100755 -> 100644",
+		},
+		{
+			name: "a documentation-shaped symlink deleted",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				gitIn(t, dir, "rm", "-q", "docs/link.md")
+			},
+			event: "pull_request", want: "full", reason: "120000 -> 000000",
+		},
+		{
+			name: "a submodule at a documentation-shaped path",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				// An embedded repository, which `git add` records as a gitlink (160000).
+				sub := filepath.Join(dir, "docs", "sub.md")
+				if err := os.MkdirAll(sub, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				gitIn(t, sub, "init", "-q")
+				gitIn(t, sub, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "sub")
+			},
+			event: "pull_request", want: "full", reason: "000000 -> 160000",
 		},
 		{
 			name: "a documentation file deleted",
@@ -440,5 +486,69 @@ func TestCIVerifyAcceptsASkipOnlyWhereTheScopeDecidedIt(t *testing.T) {
 				t.Fatalf("verify err=%v, want failure=%v\n%s", err, tc.wantErr, out)
 			}
 		})
+	}
+}
+
+// A git whose diff prints raw, a truncated or malformed record after a valid
+// one, and which hands every other command to the real git, so the merge-commit
+// check still reads a real repository.
+func fakeDiffGit(t *testing.T, raw string) string {
+	t.Helper()
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	out := filepath.Join(bin, "diff-output")
+	if err := os.WriteFile(out, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nif [ \"$1\" = diff ]; then cat " + out + "; exit 0; fi\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	return bin
+}
+
+func TestCIScopeIsFullWhenGitDiffOutputIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	const valid = ":100644 100644 aaaaaaa bbbbbbb M\x00docs/index.md\x00"
+	for _, tc := range []struct {
+		name, raw, reason string
+	}{
+		{"a header cut short", valid + ":100644 1006", "ends inside a record header"},
+		{"a header with no path", valid + ":100644 100644 aaaaaaa bbbbbbb M\x00", "no terminated path"},
+		{"a path with no terminator", valid + ":100644 100644 aaaaaaa bbbbbbb M\x00docs/a.md", "no terminated path"},
+		{"a header of another shape", valid + "garbage\x00docs/a.md\x00", "cannot read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := scopeRepo(t, func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "docs/a.md", "a\n")
+			})
+			bin := fakeDiffGit(t, tc.raw)
+			got, stderr := runScope(t, dir, "pull_request", "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if got != "full" || !strings.Contains(stderr, tc.reason) {
+				t.Fatalf("scope %q (%q), want full naming %q", got, stderr, tc.reason)
+			}
+		})
+	}
+
+	// The same fake with only the valid record answers docs, so the cases above
+	// fail on the truncation and not on the fake.
+	dir := scopeRepo(t, func(t *testing.T, dir string) {
+		t.Helper()
+
+		mustWrite(t, dir, "docs/a.md", "a\n")
+	})
+	bin := fakeDiffGit(t, valid)
+	if got, stderr := runScope(t, dir, "pull_request", "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH")); got != "docs" {
+		t.Fatalf("the fake's one valid record gave %q (%q), want docs", got, stderr)
 	}
 }
