@@ -122,7 +122,7 @@ The same framing as above: a known-good starting point, not a minimum. A single 
 
 ### What was measured, and on what
 
-The mini is the machine this is *sized* for. Everything asserted about tart, macOS guests and softnet below was measured on an **Apple M2 Max (12-core, 32 GB) running macOS 26.0 (25A354), tart 2.36.0 and softnet 0.23.0** — including a real GitHub Actions Xcode job that built an iOS target inside a billet-launched guest and was torn down afterwards. Where a fact came from running something, this says so; where it did not, it says that too.
+The mini is the machine this is *sized* for. Unless a passage below attributes it to the mini, everything asserted about tart, macOS guests and softnet was measured on an **Apple M2 Max (12-core, 32 GB) running macOS 26.0 (25A354), tart 2.36.0 and softnet 0.23.0** — including a real GitHub Actions Xcode job that built an iOS target inside a billet-launched guest and was torn down afterwards. Where a fact came from running something, this says so; where it did not, it says that too.
 
 Three host limits are encoded in billet rather than assumed, and each is a sentence Virtualization.framework or tart actually produced:
 
