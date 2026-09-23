@@ -122,7 +122,7 @@ The same framing as above: a known-good starting point, not a minimum. A single 
 
 ### What was measured, and on what
 
-The mini is the machine this is *sized* for. Everything asserted about tart, macOS guests and softnet below was measured on an **Apple M2 Max (12-core, 32 GB) running macOS 26.0 (25A354), tart 2.36.0 and softnet 0.23.0** — including a real GitHub Actions Xcode job that built an iOS target inside a billet-launched guest and was torn down afterwards. Where a fact came from running something, this says so; where it did not, it says that too.
+The mini is the machine this is *sized* for. Unless a passage below attributes it to the mini, everything asserted about tart, macOS guests and softnet was measured on an **Apple M2 Max (12-core, 32 GB) running macOS 26.0 (25A354), tart 2.36.0 and softnet 0.23.0** — including a real GitHub Actions Xcode job that built an iOS target inside a billet-launched guest and was torn down afterwards. Where a fact came from running something, this says so; where it did not, it says that too.
 
 Three host limits are encoded in billet rather than assumed, and each is a sentence Virtualization.framework or tart actually produced:
 
@@ -155,7 +155,7 @@ billet ships `deploy/sh.billet.node.plist` and `deploy/sh.billet.server.plist`. 
 
 **Virtualization.framework needs an unlocked `login.keychain`.** Since macOS 15 this is an undocumented requirement, recorded in [tart's own FAQ](https://tart.run/faq/): a VM will not run without one, and it fails with `SecKeyCreateRandomKey_ios failed`, `Failed to generate keypair`, or `Interaction is not allowed with the Security Server` — none of which mention a keychain. **A headless SSH session leaves that keychain locked**, so this is exactly the state a remotely-administered Mac is in. A daemon has no login session and therefore no unlocked keychain at all.
 
-That is why a dedicated Mac node wants **automatic login**: a real GUI session at every boot keeps the keychain unlocked. It is a genuine security decision — the disk is unlocked and a session is live whenever the machine is on — and it is the price of running macOS guests with nobody present. The alternative is `security unlock-keychain login.keychain`, which means the password lives wherever that command is driven from. First login must happen through Screen Sharing at least once, because that is what creates the keychain.
+That is why a dedicated Mac node wants **automatic login**: a real GUI session at every boot keeps the keychain unlocked. It is a genuine security decision — the disk is unlocked and a session is live whenever the machine is on — and it is the price of running macOS guests with nobody present. The alternative is `security unlock-keychain login.keychain`, which means the password lives wherever that command is driven from. The first GUI login is what creates the keychain; on the mini it was the console login Setup Assistant ends in, with no Screen Sharing session ever opened (below).
 
 The other two are smaller and still fatal: tart's VM store is **per-user** (`TART_HOME`, default `~/.tart`), so a root daemon looks at root's store and finds none of the images you pulled; and the Linux node unit runs as root only because Docker's socket and the Firecracker jailer demand it, neither of which applies to a CLI the operator's own account drives.
 
@@ -212,20 +212,35 @@ There is a third that shapes `uninstall`: launchd's **disabled-override database
 
 ### Headless operation
 
-Verified against macOS 26 (Tahoe) sources rather than on the mini, which has not arrived. Two of these are recent behaviour changes, so re-verify on the real host before relying on them:
+Written against macOS 26 (Tahoe) sources before the mini arrived. What has since been measured on the mini itself (18-core, 64 GB, 1 TB, macOS 27.0), with FileVault off, automatic login set, and Remote Login and Screen Sharing turned on in System Settings:
+
+- **The unattended boot holds.** After `sudo reboot`, with nobody at the keyboard, the account was on `console` and `launchctl print gui/501` reported `type = login` 34 seconds after boot; SSH answered with the key and Screen Sharing answered on port 5900.
+- **The Setup Assistant login created the keychain.** `~/Library/Keychains/login.keychain-db` existed after the console login alone, before any Screen Sharing session, so a Screen Sharing login is not what creates it.
+- **SSH cannot see that keychain.** `security show-keychain-info` from an SSH session answers *User interaction is not allowed* while the GUI session is logged in, so it cannot serve as the check that the keychain is unlocked.
+- **After `pmset -a sleep 0 disksleep 0 womp 1`**, `pmset -g` read back `sleep 0 (sleep prevented by powerd)`, `disksleep 0` and `womp 1`.
+
+- **Virtualization.framework starts a VM on macOS 27.0 under tart 2.37.0.** An empty Linux VM (`tart create --linux`, then `tart run --no-graphics`) started from an SSH session with no keychain error, and its guest stopped for want of an OS. That does not reach the keychain requirement above, which is recorded for macOS guests. **A macOS guest has since run a real job** under the launch agent on the same host: macOS 26.6.2 in the guest with Xcode 27.0, at 6 vCPU / 24 GiB, as did an arm64 Linux guest (Docker 29.7.2, a container run), both untrusted under softnet. From both, every private LAN and Zero Trust address tested timed out, and the vmnet gateway, which is the host, accepted connections on 22 and 5900 (#190). `sudo launchctl disable system/com.apple.screensharing && sudo launchctl bootout system/com.apple.screensharing`, run over SSH, then closed 5900 (a connect from the LAN is refused, and `launchctl print-disabled system` lists it as disabled). While a guest runs, `pgrep -fl 'tart run'` lists it as `tart run <lease name> --no-graphics --net-softnet`, which is the check the guide uses before opening Screen Sharing. Not measured: whether that override holds across a reboot, and whether `launchctl enable` plus `kickstart` brings Screen Sharing back.
+
+- **A deliberate shutdown is not a power cut.** With `autorestartatconnect` at its default of 0, after Shut Down the reference mini stayed off when it was unplugged, moved and plugged back in, unreachable on the LAN until someone pressed its power button; it was up and logged in 23 seconds after. The setting that changes this is below.
+
+Not yet measured on the mini: `systemsetup -setremotelogin` (Remote Login was turned on in System Settings instead), and power-on after a real power cut. Two of the claims below are recent behaviour changes, so re-verify them on the real host before relying on them:
 
 **SSH first, then anything else.** `sudo systemsetup -setremotelogin on`, then confirm with `sudo systemsetup -getremotelogin`. On Tahoe, Screen Sharing after a reboot needs SSH to already be reachable, so enabling SSH is not one option among several — it is the one that makes the others recoverable.
 
 Harden with a drop-in rather than by editing the main config, because macOS owns `/etc/ssh/sshd_config.d/100-macos.conf` and the first value wins on a conflict — so the drop-in has to sort *ahead* of it:
 
 ```
-sudo tee /etc/ssh/sshd_config.d/000-headless.conf <<'EOF'
-PermitRootLogin no
-PasswordAuthentication no
-EOF
+printf '%s\n' 'PermitRootLogin no' 'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' 'AllowUsers <account>' |
+  sudo tee /etc/ssh/sshd_config.d/000-headless.conf >/dev/null &&
+  { sudo sshd -t || { sudo rm -f /etc/ssh/sshd_config.d/000-headless.conf; false; }; }
 ```
 
-**Do not reach for `pmset autorestart`.** It is a silent no-op on Apple Silicon — it accepts the setting and changes nothing — and it is also unnecessary, because Apple Silicon minis power on by themselves when mains power returns. A guide that tells an operator to set it leaves them believing they have configured automatic recovery when they have configured nothing.
+Replace `<account>` with the node account's short name first: the quotes keep it literal, and `AllowUsers <account>` admits nobody. A failed `sshd -t` removes the file again and the command still exits non-zero, so a failure never reads as success. Run it from a session that stays open, and prove a key login from a second terminal before closing it, because `sshd -t` checks syntax, not that the account can still get in.
+
+**Turn off keyboard-interactive as well as password authentication.** Apple's `100-macos.conf` sets `UsePAM yes`, and keyboard-interactive is a second method that can take a password through PAM; the password prompt macOS's sshd gave before hardening had the keyboard-interactive shape (`(user@host) Password:`). Whether `PasswordAuthentication no` alone leaves password logins open was not tested. Measured on the mini with all four lines: a client with public-key authentication turned off is answered `Permission denied (publickey)`. The `printf` form is deliberate: a heredoc pasted with indentation never finds its closing `EOF` and leaves the shell waiting.
+
+**Do not reach for `pmset autorestart`.** It is a silent no-op on Apple Silicon — it accepts the setting and changes nothing — and a guide that tells an operator to set `autorestart` leaves them believing they have configured automatic recovery when they have configured nothing. Recovery is a different setting: *Start up when power is connected* in System Settings → Energy, which Apple documents for 2024-and-later minis under macOS 26.5 and later with three choices, *Never*, *After power failure* and *Always*. Choose **Always** for an unattended host: it is the one that also starts a Mac that was shut down, as well as one that lost power. After a shutdown, Apple advises leaving the power disconnected for about 30 seconds before reconnecting it. The mini lists the setting in `pmset -g cap` as `autorestartatconnect`, and `sudo pmset -a autorestartatconnect 1` is what was set on it. Neither its effect nor recovery from a real power cut is measured on the mini yet.
 
 ## An inherited machine can arrive with the worst case already set up
 
