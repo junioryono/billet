@@ -296,6 +296,11 @@
         - { unit: billet-images-refresh.service, directive: ExecStart }
         - { unit: billet-images-refresh.service, directive: TimeoutStartSec }
         - { unit: billet-images-refresh.service, directive: ReadWritePaths }
+        # The lock directory the boot-verification needs, and the preserve that
+        # keeps this oneshot from removing the node's when it finishes.
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectory }
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryMode }
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryPreserve }
         - { unit: billet-images-refresh.timer, directive: OnCalendar }
         - { unit: billet-images-refresh.timer, directive: RandomizedDelaySec }
         - { unit: billet-images-refresh.timer, directive: Persistent }
@@ -405,6 +410,40 @@
           The ordinary-converge readiness rule no longer requires an installed unit to already
           report notify. An absent unit does not prove the installed binary can send READY=1,
           and this path runs with a binary of unknown vintage.
+
+    # A DIRECTIVE IN THE WRONG SECTION IS NOT A DIRECTIVE, and the comparison
+    # above is section-blind: it matches a line anywhere in the file, so moving
+    # the refresh's RuntimeDirectoryPreserve into [Unit] keeps both copies equal
+    # while systemd ignores the setting entirely — and an ignored preserve means
+    # the refresh removes the running node's lock directory every time it
+    # finishes. These three are checked where they must be because the lock
+    # directory is shared with billet-node.service; the packaged copy is pinned
+    # the same way in deploy/units_test.go.
+    - name: The refresh's runtime directory directives are in [Service] in both copies
+      ansible.builtin.assert:
+        that: >-
+          {{ [packaged_scheduled['billet-images-refresh.service'],
+              role_scheduled['billet-images-refresh.service']]
+             | map('split', '[Service]')
+             | map('last')
+             | select('search', '(?m)^' ~ item ~ '=')
+             | list | length == 2
+             and [packaged_scheduled['billet-images-refresh.service'],
+                  role_scheduled['billet-images-refresh.service']]
+             | map('split', '[Service]')
+             | map('first')
+             | select('search', '(?m)^' ~ item ~ '=')
+             | list | length == 0 }}
+        fail_msg: >-
+          {{ item }} must be assigned inside [Service] in both
+          deploy/billet-images-refresh.service and the role's template. systemd
+          reads it nowhere else, and an ignored RuntimeDirectoryPreserve lets
+          this oneshot delete billet-node.service's /run/billet/locks when it
+          finishes.
+      loop:
+        - RuntimeDirectory
+        - RuntimeDirectoryMode
+        - RuntimeDirectoryPreserve
 
     # THE DIFFERENCES ARE ASSERTED TOO, not merely tolerated. Each is deliberate
     # and each is the kind of thing that would otherwise drift into an accident;

@@ -1746,8 +1746,14 @@ func fileSHA256(t *testing.T, path string) [sha256.Size]byte {
 	return sha256.Sum256(body)
 }
 
+// writeExecutable writes a file some test will exec, under syscall.ForkLock:
+// every os/exec start holds that lock while it creates a child, so no child of a
+// parallel test can inherit this write descriptor and make the exec fail with
+// "text file busy" (golang/go#22315; internal/guestassets does the same).
 func writeExecutable(t *testing.T, path, body string) {
 	t.Helper()
+	syscall.ForkLock.Lock()
+	defer syscall.ForkLock.Unlock()
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
