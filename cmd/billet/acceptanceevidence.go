@@ -283,6 +283,7 @@ func acceptanceAllocator(db *state.DB, cfg *config.Config) (*alloc.Allocator, er
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return nil, fmt.Errorf("capacity allocator: %w", err)

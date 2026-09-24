@@ -87,28 +87,48 @@ func (q *admissionQueue) gates() bool {
 	return q != nil && q.policy != config.AdmissionFill
 }
 
-// competes reports whether two tiers contend for the same room.
+// competes reports whether a buyer contends with a waiter for the same room.
 //
-// TWO WAYS TO COMPETE, and the second is easy to miss: they share a host either
-// could be placed on, OR the deployment's own ceiling is smaller than the hosts
-// it caps, which makes it one pot every tier buys from. Under such a ceiling a
-// tier pinned to one host and a tier pinned to another still take room from each
-// other, and a rule that looked only at hosts let a stream of small jobs on one
-// host starve a large tier waiting on the other.
+// THREE WAYS TO COMPETE, and the last two are easy to miss: they share a host
+// either could be placed on; the deployment's own ceiling is smaller than the
+// hosts it caps, which makes it one pot every tier buys from; or they belong to
+// one target with a share, which is a pot its tiers buy from wherever their
+// hosts are. Under such a pot a tier pinned to one host and a tier pinned to
+// another still take room from each other, and a rule that looked only at hosts
+// let a stream of small jobs on one host starve a large tier waiting on the
+// other.
 //
 // A tier whose hosts are unknown competes with every tier, so a failed read
 // never lets a purchase skip the order.
-func competes(a, b alloc.TierAdmission) bool {
-	if a.CeilingShared && b.CeilingShared {
+//
+// ONE WAY NOT TO, AND IT IS DIRECTIONAL (#192). A waiter held by its own
+// target's share takes nothing another target frees, so it does not hold that
+// target's buyers back. Only the WAITER's flag decides it: a buyer's own share
+// being full says nothing about whether the waiter it would pass could use the
+// room. Both targets must be known, because an unknown one may be the waiter's
+// own. The flag is the waiter's view at its last refusal, so it can be one poll
+// stale in the direction that favours the other target.
+func competes(buyer, waiter alloc.TierAdmission) bool {
+	known := buyer.Target != "" && waiter.Target != ""
+
+	if known && buyer.Target != waiter.Target && waiter.ShareBound {
+		return false
+	}
+
+	if known && buyer.Target == waiter.Target && buyer.TargetShared && waiter.TargetShared {
 		return true
 	}
 
-	if len(a.Nodes) == 0 || len(b.Nodes) == 0 {
+	if buyer.CeilingShared && waiter.CeilingShared {
 		return true
 	}
 
-	for _, x := range a.Nodes {
-		if slices.Contains(b.Nodes, x) {
+	if len(buyer.Nodes) == 0 || len(waiter.Nodes) == 0 {
+		return true
+	}
+
+	for _, x := range buyer.Nodes {
+		if slices.Contains(waiter.Nodes, x) {
 			return true
 		}
 	}

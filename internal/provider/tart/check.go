@@ -66,6 +66,16 @@ type SoftnetReport struct {
 	Trusted bool
 	// Why explains the state, with the command that fixes it when there is one.
 	Why string
+	// HostBlockSupported reports that this softnet accepts `@host`, which every
+	// untrusted launch passes (--net-softnet-block=@host) to keep the guest off
+	// the Mac itself. softnet 0.18 parses block targets as IPv4 CIDRs only and
+	// refuses the alias, so a host with an older softnet passes the grant check
+	// and then fails every untrusted launch; this is established by asking the
+	// installed binary, not by a version number. False when it could not be
+	// established, with HostBlockWhy saying which.
+	HostBlockSupported bool
+	// HostBlockWhy explains a false HostBlockSupported.
+	HostBlockWhy string
 }
 
 // statOwner reports a file's mode and owning uid.
@@ -284,6 +294,35 @@ func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 		report.StoreLockProved = true
 	}
 	report.Softnet = p.checkSoftnet()
+	if report.Softnet.Path != "" {
+		report.Softnet.HostBlockSupported, report.Softnet.HostBlockWhy =
+			p.softnetBlocksHost(ctx, report.Softnet.Path)
+	}
 
 	return report, nil
+}
+
+// softnetBlocksHost asks the installed softnet whether it knows `@host`, from
+// its own --help, which lists the targets its --block accepts. An answer that
+// cannot be read is not a yes: the launch would pass the alias regardless.
+func (p *Provider) softnetBlocksHost(ctx context.Context, path string) (bool, string) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, path, "--help")
+	cmd.WaitDelay = time.Second
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, "could not ask softnet which block targets it accepts (" + err.Error() +
+			"), so whether it can keep untrusted guests off this Mac is unknown"
+	}
+
+	if !strings.Contains(string(out), "@host") {
+		return false, "does not accept the @host block target, which untrusted launches need " +
+			"to keep the guest off this Mac; upgrade it (`brew upgrade openai/tools/softnet`) " +
+			"and grant the new binary again"
+	}
+
+	return true, ""
 }
