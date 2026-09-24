@@ -127,35 +127,35 @@ func hostedImage(t *testing.T, skip string) string {
 	}
 
 	if skip == "link through a missing dir" {
-		writeFile(t, filepath.Join(root, "usr/bin/real-aws"), "#!/bin/sh\n", 0o755)
+		writeFile(t, filepath.Join(root, "usr", "bin", "real-aws"), "#!/bin/sh\n", 0o755)
 
-		if err := os.Symlink("/missing/../usr/bin/real-aws", filepath.Join(root, "usr/local/bin/aws")); err != nil {
+		if err := os.Symlink("/missing/../usr/bin/real-aws", filepath.Join(root, "usr", "local", "bin", "aws")); err != nil {
 			t.Fatal(err)
 		}
 	} else if skip != "/usr/local/bin/aws" {
-		writeFile(t, filepath.Join(root, "usr/local/aws-cli/v2/2.99.0/bin/aws"), "#!/bin/sh\n", 0o755)
+		writeFile(t, filepath.Join(root, "usr", "local", "aws-cli", "v2", "2.99.0", "bin", "aws"), "#!/bin/sh\n", 0o755)
 
-		if err := os.Symlink("/usr/local/aws-cli/v2/2.99.0", filepath.Join(root, "usr/local/aws-cli/v2/current")); err != nil {
+		if err := os.Symlink("/usr/local/aws-cli/v2/2.99.0", filepath.Join(root, "usr", "local", "aws-cli", "v2", "current")); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := os.Symlink("/usr/local/aws-cli/v2/current/bin/aws", filepath.Join(root, "usr/local/bin/aws")); err != nil {
+		if err := os.Symlink("/usr/local/aws-cli/v2/current/bin/aws", filepath.Join(root, "usr", "local", "bin", "aws")); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	if skip != "postgres" {
-		writeFile(t, filepath.Join(root, "usr/lib/postgresql/16/bin/postgres"), "#!/bin/sh\n", 0o755)
+		writeFile(t, filepath.Join(root, "usr", "lib", "postgresql", "16", "bin", "postgres"), "#!/bin/sh\n", 0o755)
 	}
 
 	switch skip {
 	case "action archive cache":
 	case "empty archive directory":
-		if err := os.MkdirAll(filepath.Join(root, "opt/actionarchivecache/actions_checkout"), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, "opt", "actionarchivecache", "actions_checkout"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	default:
-		writeFile(t, filepath.Join(root, "opt/actionarchivecache/actions_checkout/v4.tar.gz"), "x", 0o644)
+		writeFile(t, filepath.Join(root, "opt", "actionarchivecache", "actions_checkout", "v4.tar.gz"), "x", 0o644)
 	}
 
 	env := "JAVA_HOME=/usr/lib/jvm/x\n"
@@ -167,6 +167,7 @@ func hostedImage(t *testing.T, skip string) string {
 		env += "USE_BAZEL_FALLBACK_VERSION=silent:9.1.1\n"
 	}
 
+<<<<<<< HEAD
 	for name, line := range languageEnv {
 		if skip != name {
 			env += line + "\n"
@@ -200,28 +201,33 @@ func hostedImage(t *testing.T, skip string) string {
 	}
 
 	awf := filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0")
+=======
+	writeFile(t, filepath.Join(root, "etc", "billet-image-env"), env, 0o644)
+
+	awf := filepath.Join(root, "opt", "hostedtoolcache", "agentic-workflow-firewall-js", "0.1.0")
+>>>>>>> junior-sep24-hosted-tools
 	switch skip {
 	case "firewall bundle":
 	case "empty firewall bundle":
-		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "", 0o644)
+		writeFile(t, filepath.Join(awf, "x64", "awf-bundle.js"), "", 0o644)
 		writeFile(t, filepath.Join(awf, "x64.complete"), "", 0o644)
 	case "firewall without .complete":
-		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "x", 0o644)
+		writeFile(t, filepath.Join(awf, "x64", "awf-bundle.js"), "x", 0o644)
 	default:
-		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "x", 0o644)
+		writeFile(t, filepath.Join(awf, "x64", "awf-bundle.js"), "x", 0o644)
 		writeFile(t, filepath.Join(awf, "x64.complete"), "", 0o644)
 	}
 
-	copilot := filepath.Join(root, "opt/hostedtoolcache/copilot-cli/1.0.0")
+	copilot := filepath.Join(root, "opt", "hostedtoolcache", "copilot-cli", "1.0.0")
 	switch skip {
 	case "Copilot CLI":
 	case "copilot without .complete":
-		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o755)
+		writeFile(t, filepath.Join(copilot, "x64", "bin", "copilot"), "x", 0o755)
 	case "copilot not executable":
-		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o644)
+		writeFile(t, filepath.Join(copilot, "x64", "bin", "copilot"), "x", 0o644)
 		writeFile(t, filepath.Join(copilot, "x64.complete"), "", 0o644)
 	default:
-		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o755)
+		writeFile(t, filepath.Join(copilot, "x64", "bin", "copilot"), "x", 0o755)
 		writeFile(t, filepath.Join(copilot, "x64.complete"), "", 0o644)
 	}
 
@@ -265,7 +271,7 @@ func TestTheGateDoesNotFollowALinkOutOfTheImage(t *testing.T) {
 	t.Parallel()
 
 	root := hostedImage(t, "/usr/local/bin/aws")
-	if err := os.Symlink("/bin/sh", filepath.Join(root, "usr/local/bin/aws")); err != nil {
+	if err := os.Symlink("/bin/sh", filepath.Join(root, "usr", "local", "bin", "aws")); err != nil {
 		t.Fatal(err)
 	}
 
