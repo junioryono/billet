@@ -35,6 +35,11 @@ type ListenerCapacity struct {
 	// neither, which reads as not waiting, so this needs no migration.
 	Waiting      int    `json:"waiting,omitempty"`
 	WaitingSince string `json:"waiting_since,omitempty"`
+	// WaitingProgress is when this tier's listener last made admission
+	// progress. A waiter holds other tiers back only while that is recent, and a
+	// stalled listener cannot say it has stalled, so the reader compares this
+	// with its own clock.
+	WaitingProgress string `json:"waiting_progress,omitempty"`
 }
 
 // RecordListenerCapacity publishes the listener's ownership for another process.

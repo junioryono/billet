@@ -231,7 +231,7 @@ func TestAWaitersHostsAreRefreshedAndItsPlaceIsKept(t *testing.T) {
 	q := newAdmissionQueue(config.AdmissionFair)
 	q.waits("a-waiting", on("host-a"))
 
-	first, ok := q.waitingSince("a-waiting")
+	first, _, ok := q.waitingSince("a-waiting")
 	if !ok {
 		t.Fatal("the tier was not recorded as waiting")
 	}
@@ -240,7 +240,7 @@ func TestAWaitersHostsAreRefreshedAndItsPlaceIsKept(t *testing.T) {
 	q.now = func() time.Time { return first.Add(time.Hour) }
 	q.waits("a-waiting", on("host-b"))
 
-	if again, _ := q.waitingSince("a-waiting"); !again.Equal(first) {
+	if again, _, _ := q.waitingSince("a-waiting"); !again.Equal(first) {
 		t.Errorf("the wait was re-dated to %s from %s; a tier refused on every poll would never reach the front", again, first)
 	}
 
