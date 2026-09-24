@@ -2584,10 +2584,16 @@ billet_tc_reap_target() {
 	sleep 5
 
 	# RE-ASKED BEFORE EACH SIGKILL, because a process that exited on SIGTERM frees
-	# its pid for anything on the host; a reused pid is rooted at /, not here.
+	# its pid; a reused pid is rooted at /, not here. Between the check and the
+	# signal no reuse is possible in practice: Linux hands out pids cyclically and
+	# does not return a freed one until the counter wraps pid_max (4194304 on
+	# 64-bit), and bash has no pidfd to close even that. A process that exits in
+	# between is simply gone, which is what was wanted.
 	local pid
 	for pid in "${pids[@]}"; do
-		[ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$root" ] && kill -9 "$pid" 2>/dev/null
+		if [ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$root" ]; then
+			kill -9 "$pid" 2>/dev/null || true
+		fi
 	done
 
 	return 0

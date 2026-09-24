@@ -421,7 +421,6 @@ check_hosted_tools() {
 
 	found=0
 	for entry in "$tc"/copilot-cli/*/*/bin/copilot; do
-		[ -e "$entry" ] || continue
 		local arch_dir="${entry%/bin/copilot}"
 		image_executable "$1" "${entry#"$1"}" && [ -f "$arch_dir.complete" ] && found=1
 	done
