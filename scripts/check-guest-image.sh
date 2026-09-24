@@ -326,6 +326,40 @@ check_android_sdk() {
 	pass "the Android SDK is installed, with ANDROID_HOME set"
 }
 
+# HOSTED_TOOLS are the commands GitHub's image installs with scripts of its own,
+# outside the declaration the parity check below reads, so only a list of paths
+# can notice one missing.
+HOSTED_TOOLS=(
+	/usr/local/bin/yq /usr/local/bin/kubectl /usr/local/bin/kind /usr/local/bin/minikube
+	/usr/local/bin/helm /usr/local/bin/kustomize /usr/local/bin/git-lfs /usr/local/bin/ninja
+	/usr/local/bin/aws /usr/local/bin/sam /usr/local/bin/session-manager-plugin
+	/usr/bin/docker-credential-ecr-login /usr/bin/composer /usr/local/bin/phpunit
+	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
+	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
+	/usr/sbin/nginx
+)
+
+# check_hosted_tools passes or fails the gate on every command in HOSTED_TOOLS, on
+# the PostgreSQL server and on the action archive cache, in the image at $1.
+check_hosted_tools() {
+	local missing=() tool
+
+	for tool in "${HOSTED_TOOLS[@]}"; do
+		[ -x "$1$tool" ] || missing+=("$tool")
+	done
+
+	compgen -G "$1/usr/lib/postgresql/*/bin/postgres" >/dev/null ||
+		missing+=("/usr/lib/postgresql/<version>/bin/postgres")
+	[ -d "$1/opt/actionarchivecache" ] || missing+=("/opt/actionarchivecache")
+
+	if [ "${#missing[@]}" -gt 0 ]; then
+		fail "GitHub's image carries these and this one does not: ${missing[*]}"
+		return
+	fi
+
+	pass "every tool GitHub installs outside its declaration is here (${#HOSTED_TOOLS[@]} commands)"
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -582,6 +616,7 @@ done
 
 check_github_cli "$MNT"
 check_android_sdk "$MNT"
+check_hosted_tools "$MNT"
 
 # --- parity with github's declaration ---------------------------------------
 
