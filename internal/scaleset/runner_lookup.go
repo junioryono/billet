@@ -7,14 +7,33 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
 )
 
 const maxRunnerLookupResponse = 1 << 20
 
+// A silent HTTP/2 connection is closed after brokerPingAfter without a frame plus
+// brokerPingTimeout without the answer to a PING. Every listener of a target
+// multiplexes its long poll over one connection, and with no health check a
+// half-open one was reused by every retry until the socket itself failed: 18
+// minutes on 2026-09-23, during which no listener of that target heard anything.
+const (
+	brokerPingAfter   = 30 * time.Second
+	brokerPingTimeout = 15 * time.Second
+)
+
 func newValidatedRetryableHTTPClient() *retryablehttp.Client {
+	return newRetryableHTTPClient(brokerPingAfter, brokerPingTimeout)
+}
+
+// newRetryableHTTPClient keeps the *http.Transport the upstream client asserts.
+func newRetryableHTTPClient(pingAfter, pingTimeout time.Duration) *retryablehttp.Client {
 	client := retryablehttp.NewClient()
+	if transport, ok := client.HTTPClient.Transport.(*http.Transport); ok {
+		transport.HTTP2 = &http.HTTP2Config{SendPingTimeout: pingAfter, PingTimeout: pingTimeout}
+	}
 	// The hook runs after the retry decision and before the response reaches the
 	// upstream decoder. Turning an invalid 200 into a non-retryable 422 therefore
 	// makes GetRunnerByName return an error instead of accepting false absence or

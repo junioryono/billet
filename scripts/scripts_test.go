@@ -958,6 +958,42 @@ func TestInstallerExecutesANativeBinaryForItsVersion(t *testing.T) {
 	}
 }
 
+// A Mac install is told the Mac's path, not the Linux trial's: no package, no
+// systemd, tart rather than a container, and billet local up as the service.
+func TestInstallerPointsAMacAtTheMacPath(t *testing.T) {
+	t.Parallel()
+
+	run := runInstaller(t, installerFixture{
+		hostOS:   "Darwin",
+		hostArch: "arm64",
+		binary:   "#!/bin/sh\nprintf 'billet fixture 0.0.0\\n'\n",
+	})
+	for _, want := range []string{"--provider tart", "billet local up", "docs/deploying/mac-tart.md"} {
+		if !strings.Contains(run.output, want) {
+			t.Errorf("a Mac install's next steps do not mention %q:\n%s", want, run.output)
+		}
+	}
+	for _, unwanted := range []string{"systemd", "a container shares the host kernel"} {
+		if strings.Contains(run.output, unwanted) {
+			t.Errorf("a Mac install's next steps still say %q:\n%s", unwanted, run.output)
+		}
+	}
+}
+
+// And a Linux install keeps the Linux text.
+func TestInstallerKeepsTheLinuxPathForLinux(t *testing.T) {
+	t.Parallel()
+
+	run := runInstaller(t, installerFixture{
+		hostOS:   "Linux",
+		hostArch: "x86_64",
+		binary:   "#!/bin/sh\nprintf 'billet fixture 0.0.0\\n'\n",
+	})
+	if !strings.Contains(run.output, "systemd units") || strings.Contains(run.output, "--provider tart") {
+		t.Fatalf("a Linux install lost its next steps or got the Mac's:\n%s", run.output)
+	}
+}
+
 func TestInstallerValidatesAnExplicitNativeTarget(t *testing.T) {
 	t.Parallel()
 

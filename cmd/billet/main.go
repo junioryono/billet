@@ -590,6 +590,7 @@ func runServer(
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
@@ -2448,6 +2449,7 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
@@ -2493,6 +2495,7 @@ func cmdCARevocations(ctx context.Context, args []string) error {
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
@@ -2919,6 +2922,22 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Printf("capacity  %d of %d vCPU, %s of %s, %d open leases\n",
 		usage.VCPU, cfg.Server.MaxVCPU, usage.Memory, cfg.Server.MaxMemory, usage.Leases)
 
+	// A CEILING BELOW THE HOSTS IS SILENT OTHERWISE. The deployment ceiling caps
+	// every node, so a host added without raising it registers and advertises and
+	// never gets its own room; said here because nothing else ever says it.
+	hostVCPU, hostMemory, hosts, err := a.PlaceableContribution(ctx)
+	if err != nil {
+		return err
+	}
+
+	if hostVCPU > cfg.Server.MaxVCPU || hostMemory > cfg.Server.MaxMemory {
+		fmt.Printf("ceiling   BELOW THE HOSTS: the %d live hosts contribute %d vCPU and %s, "+
+			"and server.max_vcpu / max_memory allow %d and %s, so the ceiling, not the hosts, "+
+			"decides what runs; raise the ceiling to the hosts' sum, or cap a host with "+
+			"node.max_vcpu / max_memory\n",
+			hosts, hostVCPU, hostMemory, cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	}
+
 	// GROUPED BY TARGET WHEN THERE ARE SEVERAL, because a tier's scale set lives
 	// on exactly one owner and an operator reading capacity per label needs to
 	// know which owner's jobs it serves.
@@ -2939,7 +2958,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(os.Stdout, t.Label, report)
+			printTierCapacity(os.Stdout, t.Label, report, time.Now())
 		}
 	}
 
@@ -3765,6 +3784,10 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("         softnet  %s\n", report.Softnet.Why)
 	}
 
+	if report.Softnet.Path != "" && !report.Softnet.HostBlockSupported {
+		fmt.Printf("         softnet  %s\n", report.Softnet.HostBlockWhy)
+	}
+
 	// WHAT THIS NODE WILL DO WITH A FORK'S PULL REQUEST, in one line, because the
 	// answer is a decision the operator made in config and not a property of the
 	// host — and a node that silently ran untrusted work on the default NAT
@@ -3783,6 +3806,13 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 			"untrusted work, but softnet %s — every untrusted launch would fail, and the "+
 			"promise in the config is one this host cannot keep",
 			tartCfg.UntrustedIsolation, report.Softnet.Why)
+
+	case !report.Softnet.HostBlockSupported:
+		// FATAL FOR THE SAME REASON: every untrusted launch passes
+		// --net-softnet-block=@host, so a softnet that refuses the alias fails
+		// each one, and a check that passed would be a promise the host breaks.
+		return fmt.Errorf("node.tart.untrusted_isolation is %q, but softnet %s",
+			tartCfg.UntrustedIsolation, report.Softnet.HostBlockWhy)
 
 	default:
 		fmt.Printf("         untrusted work runs under %s, resolving through %s\n",

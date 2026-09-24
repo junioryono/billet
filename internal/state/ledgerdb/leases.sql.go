@@ -863,3 +863,42 @@ func (q *Queries) TotalUsage(ctx context.Context) (TotalUsageRow, error) {
 	err := row.Scan(&i.Vcpu, &i.Memory, &i.Leases)
 	return i, err
 }
+
+const usageByTier = `-- name: UsageByTier :many
+SELECT tier,
+       CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
+       CAST(COALESCE(SUM(memory), 0) AS BIGINT) AS memory
+  FROM leases WHERE phase NOT IN ('done','failed')
+ GROUP BY tier
+`
+
+type UsageByTierRow struct {
+	Tier   string
+	Vcpu   int64
+	Memory int64
+}
+
+// What each tier has committed, for a target's share: the allocator sums the
+// tiers a target owns, because which target a tier belongs to is configuration.
+func (q *Queries) UsageByTier(ctx context.Context) ([]UsageByTierRow, error) {
+	rows, err := q.db.QueryContext(ctx, usageByTier)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UsageByTierRow
+	for rows.Next() {
+		var i UsageByTierRow
+		if err := rows.Scan(&i.Tier, &i.Vcpu, &i.Memory); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

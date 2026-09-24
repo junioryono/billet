@@ -271,6 +271,21 @@ func TestEmitAnsibleRefusesTheUserSessionShape(t *testing.T) {
 	}
 }
 
+// A JOIN HAS NO INVENTORY FORM: it writes this machine's node config and prints
+// the control plane's half, so an emission beside it is refused by name.
+func TestEmitAnsibleRefusesAJoin(t *testing.T) {
+	asLinux(t)
+
+	err := cmdInit(t.Context(), append(emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
+		"--join", "controller.example:7717"))
+	if err == nil {
+		t.Fatal("--emit ansible --join was not refused")
+	}
+	if !strings.Contains(err.Error(), "--join") {
+		t.Errorf("the refusal does not name --join: %v", err)
+	}
+}
+
 // THE CEILING IS MEASURED HERE, so an emission for another machine is refused.
 //
 // A host-run backend's ceiling comes from DetectHostCapacity on the machine
