@@ -1580,6 +1580,9 @@ runner_env=(
 	"HOME=/home/runner"
 	"USER=runner"
 	"LOGNAME=runner"
+	# A UTF-8 LOCALE, as GitHub's Ubuntu runners export: without one the job runs in
+	# C, and tools that normalise or print Unicode fail or mangle it.
+	"LANG=C.UTF-8"
 	"RUNNER_TOOL_CACHE=/opt/hostedtoolcache"
 	"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"
 )
