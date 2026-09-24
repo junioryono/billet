@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,7 +128,7 @@ func TestInitJoinRefusesReplacingALiveControlPlane(t *testing.T) {
 		t.Errorf("the refusal does not name the retirement: %v", joinErr)
 	}
 	after, err := os.ReadFile(path)
-	if err != nil || string(after) != string(before) {
+	if err != nil || !bytes.Equal(after, before) {
 		t.Errorf("the refused join changed %s (err %v)", path, err)
 	}
 }
