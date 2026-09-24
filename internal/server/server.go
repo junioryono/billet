@@ -328,6 +328,9 @@ func New(
 	if s.order == nil {
 		s.order = newAdmissionQueue(config.AdmissionFair)
 	}
+	if s.log != nil {
+		s.order.log = s.log
+	}
 
 	return s
 }
