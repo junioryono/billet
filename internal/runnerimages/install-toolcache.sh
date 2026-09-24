@@ -1676,11 +1676,9 @@ install_dotnet() {
 # THE LICENCE IS ACCEPTED BY THE OPERATOR, NOT BY BILLET. sdkmanager installs
 # nothing until Google's terms are accepted, and accepting them is an act with
 # legal content -- so this does nothing unless BILLET_TC_ANDROID_ACCEPT_LICENSES is
-# `yes`. The EC2 build sets it: that image is built in the operator's own account,
-# from their own instruction, and never leaves it. The guest build does NOT, because
-# the image it produces is published as a release asset -- running the SDK is use,
-# and shipping it to third parties is redistribution, which Google's terms treat
-# differently. That distinction is the one policy decision in this file.
+# `yes`. The EC2 build and the guest build both set it, by the maintainer's decision
+# recorded in ADR-005; it stays a switch so that decision is made at the call, where
+# a reader sees it, and nowhere else.
 #
 # NO PUBLISHED CHECKSUM. Google serves the command-line tools zip over HTTPS and
 # publishes no digest beside it; everything sdkmanager fetches afterwards it

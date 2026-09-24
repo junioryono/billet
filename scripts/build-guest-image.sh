@@ -142,9 +142,8 @@ SUITE="${SUITE:-noble}"
 # that happened to work.
 #
 # THE ANDROID SDK IS IN THIS IMAGE, by the maintainer's decision of 2026-09-24
-# (ADR-005). It was left out while that was open, because publishing this image as a
-# release asset redistributes what it carries; an Android build moved onto the fleet
-# then failed with "SDK location not found" (#209).
+# (ADR-005). It was left out while its licensing question was open, and an Android
+# build moved onto the fleet then failed with "SDK location not found" (#209).
 #
 # OVER-SIZING IS CHEAP AND UNDER-SIZING IS NOT, which is why this is rounded up
 # rather than fitted to the nearest block. The file is sparse, ext4 allocates only
