@@ -1208,6 +1208,7 @@ jobs:
           # that was selected and then skipped (because what it needs failed) is
           # a failure, never a permitted skip. A push selects every family.
           if ! jq -e --argjson kept "$KEPT" --argjson family "$FAMILY" --arg event "$EVENT" '
+              . as $needs |
               .changes as $c |
               ($c.outputs // {}) as $o |
               ($family | [.[]] | unique) as $families |
@@ -1217,10 +1218,11 @@ jobs:
               ($event != "push" or ($families | all(. as $f | $o[$f] == "true"))) and
               ($family | keys | all(. as $j | $kept | index($j) | not)) and
               (keys | all(. as $j | ($kept | index($j)) or ($family | has($j)))) and
-              ($kept + ($family | keys) | all(. as $j | has($j))) and
+              ($kept + ($family | keys) | all(. as $j | $needs | has($j))) and
               (to_entries | all(
+                .key as $j |
                 .value.result == "success" or
-                (.value.result == "skipped" and ($family | has(.key)) and $o[$family[.key]] == "false")
+                (.value.result == "skipped" and ($family | has($j)) and $o[$family[$j]] == "false")
               ))' <<<"$NEEDS" >/dev/null; then
             echo "not every check passed:"
             jq -r '"  selected: \(.changes.outputs // {} | to_entries | map(select(.value == "true") | .key) | join(", "))"' <<<"$NEEDS"

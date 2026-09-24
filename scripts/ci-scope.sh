@@ -74,15 +74,17 @@ is_documentation() {
 }
 
 # The packages the replay harness builds and runs (go list -deps of
-# internal/replay's tests), with their embedded assets and testdata. provider
-# and store mean their own directories, not their backends' subtrees.
+# internal/replay's tests), with their embedded assets and testdata;
+# TestCIScopeReplayRuleCoversTheReplayClosure holds this list to that closure.
+# provider and store include everything but their backend packages, which
+# replay does not import, so a new asset or testdata directory under either is
+# included rather than silently left out.
 is_replay_input() {
 	case "$1" in
-	internal/provider/simulated/*) return 0 ;;
-	internal/provider/*/*) return 1 ;;
-	internal/provider/*) return 0 ;;
-	internal/store/*/*) return 1 ;;
-	internal/store/*) return 0 ;;
+	internal/provider/codebuild/* | internal/provider/docker/* | internal/provider/ec2/* | \
+		internal/provider/firecracker/* | internal/provider/tart/* | \
+		internal/store/ceph/* | internal/store/ebss3/*) return 1 ;;
+	internal/provider/* | internal/store/*) return 0 ;;
 	internal/alloc/* | internal/config/* | internal/deploymentid/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/importcheck/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
@@ -100,8 +102,8 @@ classify() {
 
 	# Global: what drives the jobs themselves, and the module graph.
 	case "$p" in
-	.github/* | Makefile | sqlc.yaml | go.work | go.work.sum | */go.mod | */go.sum | go.mod | go.sum | \
-		scripts/ci-scope.sh)
+	.github/* | Makefile | sqlc.yaml | go.mod | go.sum | go.work | go.work.sum | \
+		*/go.mod | */go.sum | */go.work | */go.work.sum | scripts/ci-scope.sh)
 		select_families "${families[@]}"
 		return 0
 		;;
@@ -180,6 +182,16 @@ classify() {
 
 	return "$known"
 }
+
+# CI_SCOPE_PATH classifies one path and nothing else, for the tests that hold a
+# rule to what it must cover. The workflow never sets it.
+if [ -n "${CI_SCOPE_PATH:-}" ]; then
+	if ! classify "$CI_SCOPE_PATH"; then
+		everything "no rule names $CI_SCOPE_PATH"
+	fi
+	emit
+	exit 0
+fi
 
 if [ "${CI_EVENT:-}" != pull_request ]; then
 	everything "event '${CI_EVENT:-}' is not a pull request"

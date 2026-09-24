@@ -126,11 +126,61 @@ func runScope(t *testing.T, dir, event string, env ...string) (string, string) {
 	return strings.Join(selected, ","), stderr.String()
 }
 
-// families names a selection the way runScope reports one.
+// families names a selection the way runScope reports one. It sorts a copy: the
+// callers pass the shared application slice from parallel tests.
 func families(f ...string) string {
+	f = slices.Clone(f)
 	slices.Sort(f)
 
 	return strings.Join(f, ",")
+}
+
+// scopeOfPath classifies one path through the classifier's CI_SCOPE_PATH mode.
+func scopeOfPath(t *testing.T, path string) string {
+	t.Helper()
+
+	got, _ := runScope(t, t.TempDir(), "pull_request", "CI_SCOPE_PATH="+path)
+
+	return got
+}
+
+// THE REPLAY RULE COVERS EVERY PACKAGE THE REPLAY HARNESS BUILDS. The rule is a
+// list, and a list drifts: a package replay starts importing would otherwise be
+// scoped out of replay on every change to it. This asks go itself for the
+// closure of internal/replay's tests and requires a Go file in each of billet's
+// packages in it to select replay.
+func TestCIScopeReplayRuleCoversTheReplayClosure(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", "-test",
+		"-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./internal/replay/...")
+	cmd.Dir = ".."
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list the replay closure: %v", err)
+	}
+
+	const module = "github.com/junioryono/billet/"
+	seen := 0
+	for _, pkg := range strings.Fields(string(out)) {
+		if !strings.HasPrefix(pkg, module+"internal/") {
+			continue
+		}
+		// A test binary appears as "pkg.test" and its package as "pkg [pkg.test]".
+		dir := strings.TrimPrefix(strings.SplitN(pkg, " ", 2)[0], module)
+		if strings.HasSuffix(dir, ".test") {
+			continue
+		}
+		// An external test package (foo_test) lives in foo's directory.
+		dir = strings.TrimSuffix(dir, "_test")
+		seen++
+		if got := scopeOfPath(t, dir+"/any.go"); got != "all" && !slices.Contains(strings.Split(got, ","), "replay") {
+			t.Errorf("replay builds %s, but a change to it selects %q, not replay", dir, got)
+		}
+	}
+	if seen == 0 {
+		t.Fatalf("go list found no billet package in the replay closure:\n%s", out)
+	}
 }
 
 // application is what any path under cmd/, internal/ or deploy/ selects.
@@ -346,6 +396,9 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/provider/provider.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/simulated/sim.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/store/ceph/ceph.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/provider/testdata/shape.json", families(append([]string{"replay"}, application...)...)},
+		{"internal/store/embedded/schema.json", families(append([]string{"replay"}, application...)...)},
+		{"tools/lint/go.work", "all"},
 		{"internal/state/migrations/0099_x.sql", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/lifeops/unit.go", families(append([]string{"postgres"}, application...)...)},
 		{"deploy/billet-server.service", families(application...)},
@@ -690,6 +743,11 @@ func TestCIVerifyAcceptsASkipOnlyWhereTheFamilyWasNotSelected(t *testing.T) {
 			cmd.Env = append(os.Environ(), "NEEDS="+tc.needs, "EVENT="+tc.event,
 				"KEPT=["+`"`+strings.Join(kept, `","`)+`"`+"]", "FAMILY="+string(fam))
 			out, err := cmd.CombinedOutput()
+			// A jq program that errors fails every run, so a rejection that is
+			// really a jq error proves nothing about the rule it names.
+			if strings.Contains(string(out), "jq: error") {
+				t.Fatalf("the verifier's jq program errored instead of deciding:\n%s", out)
+			}
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("verify err=%v, want failure=%v\n%s", err, tc.wantErr, out)
 			}
@@ -717,7 +775,11 @@ func TestCIVerifyAcceptsASkipOnlyWhereTheFamilyWasNotSelected(t *testing.T) {
 		cmd := exec.CommandContext(t.Context(), "bash", "-e", "-o", "pipefail", "-c", script)
 		cmd.Env = append(os.Environ(), "NEEDS="+string(trimmed), "EVENT=pull_request",
 			"KEPT=["+`"`+strings.Join(kept, `","`)+`"`+"]", "FAMILY="+string(fam))
-		if out, err := cmd.CombinedOutput(); err == nil {
+		out, err := cmd.CombinedOutput()
+		if strings.Contains(string(out), "jq: error") {
+			t.Fatalf("the verifier's jq program errored instead of deciding:\n%s", out)
+		}
+		if err == nil {
 			t.Fatalf("verify passed with replay missing from needs\n%s", out)
 		}
 	})
