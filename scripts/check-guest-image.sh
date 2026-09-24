@@ -368,6 +368,12 @@ image_resolve() {
 			rest="${target#/}${rest:+/$rest}"
 		else
 			out="$out/$part"
+
+			# A COMPONENT WITH MORE AFTER IT MUST BE A DIRECTORY THAT EXISTS, or
+			# `/missing/../usr/bin/x` would resolve here and fail when executed.
+			if [ -n "$rest" ] && [ ! -d "$root$out" ]; then
+				return 1
+			fi
 		fi
 	done
 
@@ -397,16 +403,29 @@ check_hosted_tools() {
 		missing+=("the PostgreSQL server (postgres)")
 	fi
 
-	compgen -G "$1/opt/actionarchivecache/*" >/dev/null ||
-		missing+=("the action archive cache (/opt/actionarchivecache is empty)")
+	local archive
+	archive=$(find "$1/opt/actionarchivecache" -type f -size +0 -print -quit 2>/dev/null || true)
+	[ -n "$archive" ] || missing+=("the action archive cache (no archive under /opt/actionarchivecache)")
 	grep -qx 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache' "$env" 2>/dev/null ||
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
-	compgen -G "$1/opt/hostedtoolcache/agentic-workflow-firewall-js/*/x64/awf-bundle.js" >/dev/null ||
-		missing+=("the gh-aw firewall bundle in the toolcache")
-	compgen -G "$1/opt/hostedtoolcache/copilot-cli/*/*/bin/copilot" >/dev/null ||
-		missing+=("the Copilot CLI in the toolcache")
+
+	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
+	# @actions/tool-cache looks for; a payload without one is invisible to it.
+	local tc="$1/opt/hostedtoolcache" found=0 entry
+	for entry in "$tc"/agentic-workflow-firewall-js/*/x64/awf-bundle.js; do
+		[ -f "$entry" ] && [ -s "$entry" ] && [ -f "${entry%/x64/awf-bundle.js}/x64.complete" ] && found=1
+	done
+	[ "$found" -eq 1 ] || missing+=("the gh-aw firewall bundle in the toolcache")
+
+	found=0
+	for entry in "$tc"/copilot-cli/*/*/bin/copilot; do
+		[ -e "$entry" ] || continue
+		local arch_dir="${entry%/bin/copilot}"
+		image_executable "$1" "${entry#"$1"}" && [ -f "$arch_dir.complete" ] && found=1
+	done
+	[ "$found" -eq 1 ] || missing+=("the Copilot CLI in the toolcache")
 
 	if [ "${#missing[@]}" -gt 0 ]; then
 		fail "GitHub's image carries these and this one does not: ${missing[*]}"

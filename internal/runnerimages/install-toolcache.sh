@@ -2582,7 +2582,15 @@ billet_tc_reap_target() {
 	echo "stopping ${#pids[@]} process(es) left running in the target: ${pids[*]}" >&2
 	kill "${pids[@]}" 2>/dev/null || true
 	sleep 5
-	kill -9 "${pids[@]}" 2>/dev/null || true
+
+	# RE-ASKED BEFORE EACH SIGKILL, because a process that exited on SIGTERM frees
+	# its pid for anything on the host; a reused pid is rooted at /, not here.
+	local pid
+	for pid in "${pids[@]}"; do
+		[ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$root" ] && kill -9 "$pid" 2>/dev/null
+	done
+
+	return 0
 }
 
 # install_hosted_packages installs the packages GitHub's scripts add from apt.

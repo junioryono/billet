@@ -38,7 +38,8 @@ func runHostedGate(t *testing.T, root string) string {
 	declaration, _ := hostedToolsArray(t)
 	script := "#!/usr/bin/env bash\nset -euo pipefail\nFAILED=0\n" +
 		"pass() { echo \"ok $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
-		declaration + "\n" + checkImageFunction(t, "check_hosted_tools") + "\n" +
+		declaration + "\n" + checkImageFunction(t, "image_resolve") + "\n" +
+		checkImageFunction(t, "image_executable") + "\n" + checkImageFunction(t, "check_hosted_tools") + "\n" +
 		"check_hosted_tools \"$1\"\necho \"FAILED=$FAILED\"\n"
 
 	path := filepath.Join(t.TempDir(), "gate.sh")
@@ -51,6 +52,12 @@ func runHostedGate(t *testing.T, root string) string {
 		t.Fatalf("the check did not run to its verdict: %v\n%s", err, out)
 	}
 
+	// A HELPER THE HARNESS FORGOT reads as every tool missing, which would satisfy
+	// every refusal below for the wrong reason.
+	if strings.Contains(string(out), "command not found") {
+		t.Fatalf("the gate called something the harness does not define:\n%s", out)
+	}
+
 	return string(out)
 }
 
@@ -59,6 +66,17 @@ func runHostedGate(t *testing.T, root string) string {
 var hostedExtras = []string{
 	"postgres", "action archive cache", "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE",
 	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI",
+}
+
+// hostedDamage are ways an entry can be present and still unusable, each with
+// the name the gate reports it under.
+var hostedDamage = map[string]string{
+	"empty archive directory":    "action archive cache",
+	"firewall without .complete": "firewall bundle",
+	"empty firewall bundle":      "firewall bundle",
+	"copilot without .complete":  "Copilot CLI",
+	"copilot not executable":     "Copilot CLI",
+	"link through a missing dir": "/usr/local/bin/aws",
 }
 
 func writeFile(t *testing.T, path, body string, mode os.FileMode) {
@@ -90,7 +108,13 @@ func hostedImage(t *testing.T, skip string) string {
 		writeFile(t, filepath.Join(root, tool), "#!/bin/sh\n", 0o755)
 	}
 
-	if skip != "/usr/local/bin/aws" {
+	if skip == "link through a missing dir" {
+		writeFile(t, filepath.Join(root, "usr/bin/real-aws"), "#!/bin/sh\n", 0o755)
+
+		if err := os.Symlink("/missing/../usr/bin/real-aws", filepath.Join(root, "usr/local/bin/aws")); err != nil {
+			t.Fatal(err)
+		}
+	} else if skip != "/usr/local/bin/aws" {
 		writeFile(t, filepath.Join(root, "usr/local/aws-cli/v2/2.99.0/bin/aws"), "#!/bin/sh\n", 0o755)
 
 		if err := os.Symlink("/usr/local/aws-cli/v2/2.99.0", filepath.Join(root, "usr/local/aws-cli/v2/current")); err != nil {
@@ -106,7 +130,13 @@ func hostedImage(t *testing.T, skip string) string {
 		writeFile(t, filepath.Join(root, "usr/lib/postgresql/16/bin/postgres"), "#!/bin/sh\n", 0o755)
 	}
 
-	if skip != "action archive cache" {
+	switch skip {
+	case "action archive cache":
+	case "empty archive directory":
+		if err := os.MkdirAll(filepath.Join(root, "opt/actionarchivecache/actions_checkout"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	default:
 		writeFile(t, filepath.Join(root, "opt/actionarchivecache/actions_checkout/v4.tar.gz"), "x", 0o644)
 	}
 
@@ -121,13 +151,30 @@ func hostedImage(t *testing.T, skip string) string {
 
 	writeFile(t, filepath.Join(root, "etc/billet-image-env"), env, 0o644)
 
-	if skip != "firewall bundle" {
-		writeFile(t, filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0/x64/awf-bundle.js"),
-			"x", 0o644)
+	awf := filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0")
+	switch skip {
+	case "firewall bundle":
+	case "empty firewall bundle":
+		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "", 0o644)
+		writeFile(t, filepath.Join(awf, "x64.complete"), "", 0o644)
+	case "firewall without .complete":
+		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "x", 0o644)
+	default:
+		writeFile(t, filepath.Join(awf, "x64/awf-bundle.js"), "x", 0o644)
+		writeFile(t, filepath.Join(awf, "x64.complete"), "", 0o644)
 	}
 
-	if skip != "Copilot CLI" {
-		writeFile(t, filepath.Join(root, "opt/hostedtoolcache/copilot-cli/1.0.0/x64/bin/copilot"), "x", 0o755)
+	copilot := filepath.Join(root, "opt/hostedtoolcache/copilot-cli/1.0.0")
+	switch skip {
+	case "Copilot CLI":
+	case "copilot without .complete":
+		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o755)
+	case "copilot not executable":
+		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o644)
+		writeFile(t, filepath.Join(copilot, "x64.complete"), "", 0o644)
+	default:
+		writeFile(t, filepath.Join(copilot, "x64/bin/copilot"), "x", 0o755)
+		writeFile(t, filepath.Join(copilot, "x64.complete"), "", 0o644)
 	}
 
 	return root
@@ -152,6 +199,14 @@ func TestTheGateRefusesAnImageMissingAHostedTool(t *testing.T) {
 
 		if !strings.Contains(out, "FAILED=1\n") || !strings.Contains(out, missing) {
 			t.Errorf("an image without %s was not refused by name:\n%s", missing, out)
+		}
+	}
+
+	for damage, name := range hostedDamage {
+		out := runHostedGate(t, hostedImage(t, damage))
+
+		if !strings.Contains(out, "FAILED=1\n") || !strings.Contains(out, name) {
+			t.Errorf("an image with %s was not refused as %s:\n%s", damage, name, out)
 		}
 	}
 }
