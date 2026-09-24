@@ -54,38 +54,87 @@ func runHostedGate(t *testing.T, root string) string {
 	return string(out)
 }
 
-// hostedImage is an image root carrying every hosted tool except skip.
+// extras are the non-command parts check_hosted_tools asks for, by the name a
+// missing one is reported under.
+var hostedExtras = []string{
+	"postgres", "action archive cache", "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE",
+	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI",
+}
+
+func writeFile(t *testing.T, path, body string, mode os.FileMode) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hostedImage is an image root carrying everything check_hosted_tools asks for
+// except skip, a HOSTED_TOOLS path or one of hostedExtras. /usr/local/bin/aws is
+// an absolute symlink through a directory symlink, as the AWS CLI installs it.
 func hostedImage(t *testing.T, skip string) string {
 	t.Helper()
 
 	_, tools := hostedToolsArray(t)
 	root := t.TempDir()
 
-	for _, tool := range append(tools, "/usr/lib/postgresql/16/bin/postgres") {
-		if tool == skip {
+	for _, tool := range tools {
+		if tool == skip || tool == "/usr/local/bin/aws" {
 			continue
 		}
 
-		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(tool)), 0o755); err != nil {
+		writeFile(t, filepath.Join(root, tool), "#!/bin/sh\n", 0o755)
+	}
+
+	if skip != "/usr/local/bin/aws" {
+		writeFile(t, filepath.Join(root, "usr/local/aws-cli/v2/2.99.0/bin/aws"), "#!/bin/sh\n", 0o755)
+
+		if err := os.Symlink("/usr/local/aws-cli/v2/2.99.0", filepath.Join(root, "usr/local/aws-cli/v2/current")); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := os.WriteFile(filepath.Join(root, tool), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		if err := os.Symlink("/usr/local/aws-cli/v2/current/bin/aws", filepath.Join(root, "usr/local/bin/aws")); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if skip != "/opt/actionarchivecache" {
-		if err := os.MkdirAll(filepath.Join(root, "opt", "actionarchivecache"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if skip != "postgres" {
+		writeFile(t, filepath.Join(root, "usr/lib/postgresql/16/bin/postgres"), "#!/bin/sh\n", 0o755)
+	}
+
+	if skip != "action archive cache" {
+		writeFile(t, filepath.Join(root, "opt/actionarchivecache/actions_checkout/v4.tar.gz"), "x", 0o644)
+	}
+
+	env := "JAVA_HOME=/usr/lib/jvm/x\n"
+	if skip != "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE" {
+		env += "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache\n"
+	}
+
+	if skip != "USE_BAZEL_FALLBACK_VERSION" {
+		env += "USE_BAZEL_FALLBACK_VERSION=silent:9.1.1\n"
+	}
+
+	writeFile(t, filepath.Join(root, "etc/billet-image-env"), env, 0o644)
+
+	if skip != "firewall bundle" {
+		writeFile(t, filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0/x64/awf-bundle.js"),
+			"x", 0o644)
+	}
+
+	if skip != "Copilot CLI" {
+		writeFile(t, filepath.Join(root, "opt/hostedtoolcache/copilot-cli/1.0.0/x64/bin/copilot"), "x", 0o755)
 	}
 
 	return root
 }
 
-// THE GATE REFUSES AN IMAGE MISSING ANY ONE TOOL GITHUB'S CARRIES, and names it:
-// each is removed in turn, so a tool the list names and the check ignores fails.
+// THE GATE REFUSES AN IMAGE MISSING ANY ONE THING GITHUB'S CARRIES, and names it:
+// each is removed in turn, so an entry the gate lists and never checks fails here.
 func TestTheGateRefusesAnImageMissingAHostedTool(t *testing.T) {
 	t.Parallel()
 
@@ -98,17 +147,28 @@ func TestTheGateRefusesAnImageMissingAHostedTool(t *testing.T) {
 		t.Fatalf("HOSTED_TOOLS parsed to %d entries, which is not the list the gate declares", len(tools))
 	}
 
-	for _, missing := range append(tools, "/usr/lib/postgresql/16/bin/postgres", "/opt/actionarchivecache") {
+	for _, missing := range append(tools, hostedExtras...) {
 		out := runHostedGate(t, hostedImage(t, missing))
 
-		name := missing
-		if strings.HasPrefix(missing, "/usr/lib/postgresql/") {
-			name = "postgres"
-		}
-
-		if !strings.Contains(out, "FAILED=1\n") || !strings.Contains(out, name) {
+		if !strings.Contains(out, "FAILED=1\n") || !strings.Contains(out, missing) {
 			t.Errorf("an image without %s was not refused by name:\n%s", missing, out)
 		}
+	}
+}
+
+// A SYMLINK IS RESOLVED INSIDE THE IMAGE. An absolute link to a path the image
+// lacks must fail even when the machine running the gate has that path.
+func TestTheGateDoesNotFollowALinkOutOfTheImage(t *testing.T) {
+	t.Parallel()
+
+	root := hostedImage(t, "/usr/local/bin/aws")
+	if err := os.Symlink("/bin/sh", filepath.Join(root, "usr/local/bin/aws")); err != nil {
+		t.Fatal(err)
+	}
+
+	out := runHostedGate(t, root)
+	if !strings.Contains(out, "FAILED=1\n") || !strings.Contains(out, "/usr/local/bin/aws") {
+		t.Errorf("an aws linked to the host's /bin/sh passed:\n%s", out)
 	}
 }
 
@@ -127,7 +187,7 @@ func TestTheHostedToolsAreInstalledAndGated(t *testing.T) {
 	}
 
 	hosted := guestImageFunction(t, "install_hosted_tools")
-	for _, step := range []string{"install_hosted_packages", "install_hosted_binaries", "install_aws_tools",
+	for _, step := range []string{"install_hosted_packages", "install_github_cli", "install_hosted_binaries", "install_aws_tools",
 		"install_hosted_php_tools", "install_bazelisk", "install_action_cache", "install_agentic_tools",
 		"install_hosted_environment"} {
 		if !hasExactLine(hosted, "\t"+step) {

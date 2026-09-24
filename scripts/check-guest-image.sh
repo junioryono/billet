@@ -339,25 +339,81 @@ HOSTED_TOOLS=(
 	/usr/sbin/nginx
 )
 
-# check_hosted_tools passes or fails the gate on every command in HOSTED_TOOLS, on
-# the PostgreSQL server and on the action archive cache, in the image at $1.
-check_hosted_tools() {
-	local missing=() tool
+# image_resolve prints path as the image at $1 resolves it, following every
+# symlink along the way inside the image. The AWS CLI's links are absolute, and
+# resolved against the machine running this gate they would find the host's
+# tools, or miss the image's.
+image_resolve() {
+	local root="$1" rest="${2#/}" out="" part target hops=0
 
-	for tool in "${HOSTED_TOOLS[@]}"; do
-		[ -x "$1$tool" ] || missing+=("$tool")
+	while [ -n "$rest" ]; do
+		part="${rest%%/*}"
+
+		if [ "$part" = "$rest" ]; then
+			rest=""
+		else
+			rest="${rest#*/}"
+		fi
+
+		case "$part" in
+			"" | .) continue ;;
+			..) out="${out%/*}"; continue ;;
+		esac
+
+		if [ -L "$root$out/$part" ]; then
+			hops=$((hops + 1))
+			[ "$hops" -le 40 ] || return 1
+			target=$(readlink "$root$out/$part")
+			case "$target" in /*) out="" ;; esac
+			rest="${target#/}${rest:+/$rest}"
+		else
+			out="$out/$part"
+		fi
 	done
 
-	compgen -G "$1/usr/lib/postgresql/*/bin/postgres" >/dev/null ||
-		missing+=("/usr/lib/postgresql/<version>/bin/postgres")
-	[ -d "$1/opt/actionarchivecache" ] || missing+=("/opt/actionarchivecache")
+	printf '%s' "${out:-/}"
+}
+
+# image_executable reports whether path is an executable file inside the image.
+image_executable() {
+	local resolved
+	resolved=$(image_resolve "$1" "$2") || return 1
+	[ -f "$1$resolved" ] && [ -x "$1$resolved" ]
+}
+
+# check_hosted_tools passes or fails the gate on everything GitHub's image
+# installs outside its declaration: each command in HOSTED_TOOLS, the PostgreSQL
+# server, the action archive cache and the variable that points the runner at
+# it, Bazel's fallback pin, and the gh-aw entries in the toolcache.
+check_hosted_tools() {
+	local missing=() tool match env="$1/etc/billet-image-env"
+
+	for tool in "${HOSTED_TOOLS[@]}"; do
+		image_executable "$1" "$tool" || missing+=("$tool")
+	done
+
+	match=$(compgen -G "$1/usr/lib/postgresql/*/bin/postgres" | head -n 1 || true)
+	if [ -z "$match" ] || ! image_executable "$1" "${match#"$1"}"; then
+		missing+=("the PostgreSQL server (postgres)")
+	fi
+
+	compgen -G "$1/opt/actionarchivecache/*" >/dev/null ||
+		missing+=("the action archive cache (/opt/actionarchivecache is empty)")
+	grep -qx 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache' "$env" 2>/dev/null ||
+		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
+	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
+		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+	compgen -G "$1/opt/hostedtoolcache/agentic-workflow-firewall-js/*/x64/awf-bundle.js" >/dev/null ||
+		missing+=("the gh-aw firewall bundle in the toolcache")
+	compgen -G "$1/opt/hostedtoolcache/copilot-cli/*/*/bin/copilot" >/dev/null ||
+		missing+=("the Copilot CLI in the toolcache")
 
 	if [ "${#missing[@]}" -gt 0 ]; then
 		fail "GitHub's image carries these and this one does not: ${missing[*]}"
 		return
 	fi
 
-	pass "every tool GitHub installs outside its declaration is here (${#HOSTED_TOOLS[@]} commands)"
+	pass "everything GitHub installs outside its declaration is here (${#HOSTED_TOOLS[@]} commands and more)"
 }
 
 # toolset_query reads one expectation set out of the pinned declaration, and
