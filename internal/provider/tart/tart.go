@@ -556,7 +556,14 @@ func isolationOf(netFlags []string) string {
 func (p *Provider) isolationFlags() ([]string, error) {
 	switch p.cfg.UntrustedIsolation {
 	case config.IsolationSoftnet:
-		return []string{"--net-softnet"}, nil
+		// @HOST IS BLOCKED TOO. softnet's default lets a guest reach its vmnet
+		// gateway, and that gateway is the Mac: an untrusted guest on macOS 27
+		// (tart 2.37.0, softnet 0.23.0) connected to the host's SSH and Screen
+		// Sharing, which takes the node account's password. `@host` is softnet's
+		// name for that gateway, so no address has to be known before the bridge
+		// exists; with it blocked the same guest timed out on both ports, still
+		// reached the internet, and still renewed its DHCP lease (#190).
+		return []string{"--net-softnet", "--net-softnet-block=@host"}, nil
 
 	case "":
 		return nil, errors.New("tart: refusing to run untrusted work until it has isolation of " +
