@@ -2922,6 +2922,22 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Printf("capacity  %d of %d vCPU, %s of %s, %d open leases\n",
 		usage.VCPU, cfg.Server.MaxVCPU, usage.Memory, cfg.Server.MaxMemory, usage.Leases)
 
+	// A CEILING BELOW THE HOSTS IS SILENT OTHERWISE. The deployment ceiling caps
+	// every node, so a host added without raising it registers and advertises and
+	// never gets its own room; said here because nothing else ever says it.
+	hostVCPU, hostMemory, hosts, err := a.PlaceableContribution(ctx)
+	if err != nil {
+		return err
+	}
+
+	if hostVCPU > cfg.Server.MaxVCPU || hostMemory > cfg.Server.MaxMemory {
+		fmt.Printf("ceiling   BELOW THE HOSTS: the %d live hosts contribute %d vCPU and %s, "+
+			"and server.max_vcpu / max_memory allow %d and %s, so the ceiling, not the hosts, "+
+			"decides what runs; raise the ceiling to the hosts' sum, or cap a host with "+
+			"node.max_vcpu / max_memory\n",
+			hosts, hostVCPU, hostMemory, cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	}
+
 	// GROUPED BY TARGET WHEN THERE ARE SEVERAL, because a tier's scale set lives
 	// on exactly one owner and an operator reading capacity per label needs to
 	// know which owner's jobs it serves.
