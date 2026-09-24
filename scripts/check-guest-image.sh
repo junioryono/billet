@@ -436,10 +436,13 @@ check_hosted_tools() {
 	done
 
 	# rustup's proxies without a toolchain run nothing.
-	local component
+	local component candidate ok
 	for component in rustc cargo rustfmt cargo-clippy; do
-		compgen -G "$1/home/runner/.rustup/toolchains/stable-*/bin/$component" >/dev/null ||
-			missing+=("the Rust stable toolchain's $component")
+		ok=0
+		for candidate in "$1"/home/runner/.rustup/toolchains/stable-*/bin/"$component"; do
+			image_executable "$1" "${candidate#"$1"}" && ok=1
+		done
+		[ "$ok" -eq 1 ] || missing+=("the Rust stable toolchain's $component")
 	done
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what

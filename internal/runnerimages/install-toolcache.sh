@@ -3083,7 +3083,7 @@ install_rust() {
 	local said cmd
 	for cmd in "cargo --version" "rustc --version" "rustfmt --version" "cargo clippy --version"; do
 		# shellcheck disable=SC2086 # the command and its argument are two words
-		said=$(billet_tc_run runuser -u runner -- env HOME="$home" \
+		said=$(billet_tc_run runuser -u runner -- env -i HOME="$home" USER=runner LOGNAME=runner \
 			PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" $cmd)
 	done
 

@@ -92,6 +92,9 @@ var hostedDamage = map[string]string{
 	"copilot without .complete":  "Copilot CLI",
 	"copilot not executable":     "Copilot CLI",
 	"link through a missing dir": "/usr/local/bin/aws",
+	"overridden PATH":            "a PATH with cargo",
+	"lookalike PATH":             "a PATH with cargo",
+	"rustc not executable":       "Rust stable toolchain",
 }
 
 func writeFile(t *testing.T, path, body string, mode os.FileMode) {
@@ -182,8 +185,13 @@ func hostedImage(t *testing.T, skip string) string {
 
 	if skip != "Rust stable toolchain" {
 		for _, c := range []string{"rustc", "cargo", "rustfmt", "cargo-clippy"} {
+			mode := os.FileMode(0o755)
+			if c == "rustc" && skip == "rustc not executable" {
+				mode = 0o644
+			}
+
 			writeFile(t, filepath.Join(root, "home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin", c),
-				"#!/bin/sh\n", 0o755)
+				"#!/bin/sh\n", mode)
 		}
 	}
 
