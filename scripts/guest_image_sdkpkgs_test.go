@@ -139,6 +139,7 @@ func TestEveryAndroidPackageArrivesAsOneArgument(t *testing.T) {
 		"BILLET_TC_DPKG=amd64\n" +
 		"BILLET_TC_ANDROID_ACCEPT_LICENSES=yes\n" +
 		"curl() { : ; }\n" +
+		"unzip() { : ; }\n" +
 		"billet_tc_run() {\n" +
 		"  case \"$1\" in\n" +
 		"    test) return 0 ;;\n" +

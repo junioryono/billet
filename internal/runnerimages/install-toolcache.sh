@@ -1763,8 +1763,11 @@ install_android() {
 	# location rather than about the layout. `unzip` is in the declaration's apt set.
 	billet_tc_run rm -rf "$root/cmdline-tools/latest" "$root/cmdline-tools/.staging"
 	billet_tc_run mkdir -p "$root/cmdline-tools/.staging"
-	billet_tc_run unzip -q "$BILLET_TC_WORK/android-tools.zip" \
-		-d "$root/cmdline-tools/.staging"
+	# ON THE CALLER'S SIDE, into the target's directory as the caller sees it: the
+	# zip is in the caller's work directory, which a chroot cannot see. Natively
+	# (the EC2 build) BILLET_TC_ROOT is empty and this is the same command.
+	unzip -q "$BILLET_TC_WORK/android-tools.zip" \
+		-d "${BILLET_TC_ROOT:-}$root/cmdline-tools/.staging"
 
 	if ! billet_tc_run test -d "$root/cmdline-tools/.staging/cmdline-tools"; then
 		echo "the android tools zip does not contain a cmdline-tools directory" >&2
