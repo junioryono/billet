@@ -95,7 +95,7 @@ func TestTheGuestBuildInstallsAndTheGateAsksForTheAndroidSDK(t *testing.T) {
 	}
 
 	start := strings.LastIndex(source[:call], "\tBILLET_TC_ROOT=")
-	if start < 0 || !strings.Contains(source[start:call], "BILLET_TC_ANDROID_ACCEPT_LICENSES=yes \\\n") {
+	if start < 0 || !strings.Contains(source[start:call], "\t\tBILLET_TC_ANDROID_ACCEPT_LICENSES=yes \\") {
 		t.Error("the toolcache call in build-guest-image.sh does not set BILLET_TC_ANDROID_ACCEPT_LICENSES=yes, " +
 			"so install_android installs nothing")
 	}
