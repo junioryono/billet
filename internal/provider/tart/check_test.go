@@ -429,3 +429,48 @@ func TestRealSoftnetGrant(t *testing.T) {
 		t.Error("softnet is on PATH but the check could not resolve it")
 	}
 }
+
+// softnetAnswering is a softnet whose --help prints help, so the @host probe
+// reads what a real one would.
+func softnetAnswering(t *testing.T, help string) string {
+	t.Helper()
+
+	bin := filepath.Join(t.TempDir(), "softnet")
+	script := "#!/bin/sh\ncat <<'HELP'\n" + help + "\nHELP\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake softnet: %v", err)
+	}
+
+	return bin
+}
+
+func TestSoftnetThatListsTheHostTargetCanBlockTheHost(t *testing.T) {
+	p := newProvider(t, newStub(t))
+	bin := softnetAnswering(t, "Targets are:\n  * IPv4 CIDRs\n  * @host, which matches the vmnet bridge gateway IP")
+
+	ok, why := p.softnetBlocksHost(t.Context(), bin)
+	if !ok || why != "" {
+		t.Fatalf("a softnet documenting @host was reported unable to block the host: %q", why)
+	}
+}
+
+// softnet 0.18's help lists IPv4 CIDRs only, and it refuses the alias every
+// untrusted launch passes, so such a host must fail the check, not the launch.
+func TestSoftnetWithoutTheHostTargetCannotBlockTheHost(t *testing.T) {
+	p := newProvider(t, newStub(t))
+	bin := softnetAnswering(t, "Targets are:\n  * IPv4 CIDRs")
+
+	ok, why := p.softnetBlocksHost(t.Context(), bin)
+	if ok || !strings.Contains(why, "@host") || !strings.Contains(why, "brew upgrade") {
+		t.Fatalf("a softnet without @host was accepted or not told how to fix it: ok=%v why=%q", ok, why)
+	}
+}
+
+func TestSoftnetThatCannotBeAskedIsNotAssumedToBlockTheHost(t *testing.T) {
+	p := newProvider(t, newStub(t))
+
+	ok, why := p.softnetBlocksHost(t.Context(), filepath.Join(t.TempDir(), "absent"))
+	if ok || !strings.Contains(why, "could not ask") {
+		t.Fatalf("an unaskable softnet was assumed to block the host: ok=%v why=%q", ok, why)
+	}
+}
