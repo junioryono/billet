@@ -11,7 +11,7 @@ A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the 
 
 ## Rules
 
-**Parity with GitHub's image is a rebuild, not a copy.** GitHub does not publish the image its runners boot (`actions/runner-images` is Packer source targeting Azure; each release's only asset is a ~50KB JSON). It publishes the recipe, so billet vendors `toolset-2404.json` pinned by upstream commit plus its own sha256 (`PinnedCommit`, `PinnedSHA256`, `VerifyToolset`), and both the shell build and the Go side read it, verifying the digest on both paths. Costs measured: the guest image is 15.0GiB used (2.6GB before), the EC2 image 26.8GiB on x64 and 24.9GiB on arm64 (the Android SDK the guest omits). Retention is per guest contract, so `--keep 3` at `size=2` is about 90GiB per contract, and two contracts are live during a migration.
+**Parity with GitHub's image is a rebuild, not a copy.** GitHub does not publish the image its runners boot (`actions/runner-images` is Packer source targeting Azure; each release's only asset is a ~50KB JSON). It publishes the recipe, so billet vendors `toolset-2404.json` pinned by upstream commit plus its own sha256 (`PinnedCommit`, `PinnedSHA256`, `VerifyToolset`), and both the shell build and the Go side read it, verifying the digest on both paths. Costs measured: the guest image was 15.0GiB used (2.6GB before) without the Android SDK, the EC2 image 26.8GiB on x64 and 24.9GiB on arm64; the guest carries the SDK since 2026-09-24 (#209, the maintainer's decision in ADR-005 to redistribute it in the published image), `SIZE_MB` 36864 for an estimated 27200M, and `check_android_sdk` in the gate refuses an image without sdkmanager, a platform and `ANDROID_HOME`. Retention is per guest contract, so `--keep 3` at `size=2` was about 90GiB per contract and is about 160GiB with the SDK, and two contracts are live during a migration.
 
 **Some of GitHub's image is not in its declaration.** Tools GitHub installs with a script of their own never appear in `toolset-2404.json`, so building from it cannot bring them and the parity gate cannot notice them missing: each is named in billet's own package list and checked by name. `gh` is in both backends (Ubuntu's package, 2.45.0, against GitHub's current release; ADR-005 records the gap and the pinned-release fix); `apparmor` and `python3-apt` are named in the guest list only (the AMI gets both from Canonical's cloud image) and gated by nothing. When a workflow finds a command missing on the fleet that it had on a hosted runner, look here first.
 
@@ -41,7 +41,7 @@ A Firecracker job boots a golden image: an Ubuntu 24.04 rootfs with Docker, the 
 
 ## Measured facts
 
-- Guest image 15.0GiB; EC2 image 26.8GiB x64, 24.9GiB arm64.
+- Guest image 15.0GiB without the Android SDK (about 27GiB estimated with it, to be replaced by the next build's `contents:` line); EC2 image 26.8GiB x64, 24.9GiB arm64.
 - A guest boots, takes its registration and runs a container in about ten seconds.
 - `actions/runner` history: v2.285.3 published 2023-01-30, after v2.301.1 on 2023-01-19; one releases page is ~5MB and reaches back five years, so the walk bound is two pages.
 - The macOS Xcode image is about 87GB to pull; `ubuntu-runner-arm64` 11.3GB compressed.
