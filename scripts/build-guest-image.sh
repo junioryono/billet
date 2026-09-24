@@ -93,6 +93,12 @@ fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
+# 49152MB, PROVISIONAL, FOR THE LANGUAGES AND PACKAGE MANAGERS GITHUB'S IMAGE
+# CARRIES (Rust, Swift, GHC, Kotlin, Julia, Miniconda, vcpkg, Homebrew, nvm):
+# about 10GB more on top of the figure below and the hosted tools' 2-3GB, which
+# puts the content near 40GB. The first build with them replaces this with its
+# own `contents:` line.
+#
 # 36864MB, FOR ABOUT 27200MB OF CONTENT ONCE THE ANDROID SDK IS IN.
 #
 # The last build without the SDK measured `contents: 15073M used, 5788M free of
@@ -154,7 +160,7 @@ SUITE="${SUITE:-noble}"
 #
 # It is still not free forever: every generation already published keeps its own
 # size, so this should track the measurement rather than drift upward by habit.
-SIZE_MB="${SIZE_MB:-36864}"
+SIZE_MB="${SIZE_MB:-49152}"
 
 # MIN_FREE_MB is the build's own margin, checked against a MEASUREMENT.
 #
@@ -1750,7 +1756,7 @@ NET
 		systemctl mask systemd-resolved-monitor.service 2>/dev/null || true
 		printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
 		echo billet-guest >/etc/hostname
-		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n" >/etc/hosts
+		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n::1     localhost ip6-localhost ip6-loopback\n" >/etc/hosts
 		# ROOT CANNOT LOG IN. Nothing should be logging into a guest that exists for
 		# one job, and an account with no password is not the same as a locked one.
 		passwd -l root

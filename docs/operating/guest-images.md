@@ -4,7 +4,7 @@ A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Dock
 
 ## What is in it
 
-GitHub does not publish the image its hosted runners boot; it publishes the recipe. billet vendors GitHub's own `toolset-2404.json`, pinned by digest, and builds from it, so a workflow that assumes something a hosted runner has (`openssh-client`, a particular Python minor, five JDKs, the node/go/Python/PyPy/Ruby/CodeQL toolcache) finds it here, on x64 and arm64 alike. The image carries the Android SDK at `/usr/local/lib/android/sdk` with `ANDROID_HOME` set, as a hosted runner does, and is about 27 GiB used; [ADR-005](../reference/decisions/adr-005-runner-image-parity.md) records what parity costs and what is still missing (browsers among it).
+GitHub does not publish the image its hosted runners boot; it publishes the recipe. billet vendors GitHub's own `toolset-2404.json`, pinned by digest, and builds from it, so a workflow that assumes something a hosted runner has (`openssh-client`, a particular Python minor, five JDKs, the node/go/Python/PyPy/Ruby/CodeQL toolcache) finds it here, on x64 and arm64 alike. The image carries the Android SDK at `/usr/local/lib/android/sdk` with `ANDROID_HOME` set, and what GitHub installs outside its declaration (Git LFS, yq, the AWS and Kubernetes tools, Podman, MySQL, PostgreSQL, Composer, Rust, Swift, GHC, Kotlin, Julia, Miniconda, vcpkg, Homebrew, nvm and the rest ADR-005 lists), as a hosted runner does, and is about 27 GiB used; [ADR-005](../reference/decisions/adr-005-runner-image-parity.md) records what parity costs and what is still missing (browsers among it).
 
 ## Pull, verify, promote
 

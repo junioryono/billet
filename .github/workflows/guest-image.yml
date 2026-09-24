@@ -171,9 +171,16 @@ jobs:
 
           before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
 
+          # THE HOSTED RUNNER'S OWN SOFTWARE, none of which the build reads: the
+          # image it builds carries the same set, so it grew by what this frees.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/lib/node_modules \
-            "$AGENT_TOOLSDIRECTORY" || true
+            "$AGENT_TOOLSDIRECTORY" /usr/local/.ghcup /usr/share/swift \
+            /usr/local/julia* /usr/share/miniconda /usr/local/share/vcpkg \
+            /home/linuxbrew /opt/az /opt/microsoft /opt/google /usr/lib/google-cloud-sdk \
+            /usr/local/share/powershell /usr/share/kotlinc /usr/local/aws-cli \
+            /usr/local/aws-sam-cli /usr/local/share/chromium /opt/pipx || true
+          sudo docker system prune --all --force >/dev/null 2>&1 || true
 
           sudo apt-get clean
 
