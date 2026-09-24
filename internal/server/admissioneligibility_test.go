@@ -401,3 +401,80 @@ func TestADirectAssignmentWaitsItsTurn(t *testing.T) {
 			"is holding", got)
 	}
 }
+
+// A WAITER HELD BY ITS OWN TARGET'S SHARE DOES NOT HOLD ANOTHER TARGET (#192).
+//
+// Room the other target frees can never reach it, so letting it hold the line
+// would reproduce, through the order, the starvation the share exists to
+// prevent. It still holds its own target's tiers, which do compete for the
+// share.
+func TestAShareBoundWaiterHoldsOnlyItsOwnTarget(t *testing.T) {
+	t.Parallel()
+
+	admission := func(target string, shared, bound bool) alloc.TierAdmission {
+		a := on("host")
+		a.Target, a.TargetShared, a.ShareBound = target, shared, bound
+
+		return a
+	}
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-16", admission("repo", true, true))
+
+	if !q.mayBuy("org-2", admission("default", false, false)) {
+		t.Error("a waiter held by its own target's share held another target's tier back")
+	}
+
+	if q.mayBuy("repo-8", admission("repo", true, false)) {
+		t.Error("a sibling tier of the same target bought ahead of the waiter sharing its share")
+	}
+
+	// AN UNKNOWN TARGET MAY BE THE WAITER'S OWN, so it is not a way past it.
+	if q.mayBuy("unknown", on("host")) {
+		t.Error("a buyer whose target could not be read passed a share-bound waiter")
+	}
+
+	// A waiter the FLEET holds, not its share, still holds every target, and
+	// the BUYER's full share is no exemption: the waiter could use the room.
+	q = newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-16", admission("repo", true, false))
+
+	if q.mayBuy("org-2", admission("default", false, false)) {
+		t.Error("a waiter held by the fleet let another target's tier buy ahead of it")
+	}
+
+	q = newAdmissionQueue(config.AdmissionFair)
+	q.waits("org-16", admission("default", false, false))
+
+	if q.mayBuy("repo-2", admission("repo", true, true)) {
+		t.Error("a buyer's own full share let it pass an older waiter of another target")
+	}
+}
+
+// ONE TARGET'S SHARE IS ONE POT, whichever hosts its tiers are pinned to: a
+// stream of a small tier on one host must not starve a large sibling waiting
+// on another while the share is what both buy from.
+func TestTiersOfOneSharedTargetCompeteAcrossHosts(t *testing.T) {
+	t.Parallel()
+
+	large, small := on("host-a"), on("host-b")
+	large.Target, large.TargetShared = "repo", true
+	small.Target, small.TargetShared = "repo", true
+
+	q := newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-large", large)
+
+	if q.mayBuy("repo-small", small) {
+		t.Error("a sibling on another host bought ahead of the waiter sharing its target's share")
+	}
+
+	// Without a share the hosts decide, as before.
+	large.TargetShared, small.TargetShared = false, false
+
+	q = newAdmissionQueue(config.AdmissionFair)
+	q.waits("repo-large", large)
+
+	if !q.mayBuy("repo-small", small) {
+		t.Error("tiers of an unshared target on disjoint hosts were held behind each other")
+	}
+}

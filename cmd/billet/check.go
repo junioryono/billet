@@ -301,6 +301,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			MaxVCPU:   cfg.Server.MaxVCPU,
 			MaxMemory: cfg.Server.MaxMemory,
 			Nodes:     cfg.NodePolicies(),
+			Shares:    cfg.TargetShares(),
 		}, cfg.Tiers)
 		if err != nil {
 			return report, fmt.Errorf("capacity allocator: %w", err)

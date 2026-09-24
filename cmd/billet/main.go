@@ -590,6 +590,7 @@ func runServer(
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
@@ -2448,6 +2449,7 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
@@ -2493,6 +2495,7 @@ func cmdCARevocations(ctx context.Context, args []string) error {
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
