@@ -1976,6 +1976,12 @@ type GitHubConfig struct {
 	// most sensitive thing in a billet deployment: it lives only on the control
 	// plane, and nodes never hold long-lived GitHub credentials.
 	PrivateKeyPath string `yaml:"private_key_path"`
+	// MaxVCPU and MaxMemory are this target's share: the most its tiers may hold
+	// at once between them, inside the deployment ceiling. Zero leaves that
+	// dimension to the deployment ceiling alone. A share is what keeps one
+	// target's burst from taking every host another target's jobs need.
+	MaxVCPU   int      `yaml:"max_vcpu,omitempty"`
+	MaxMemory ByteSize `yaml:"max_memory,omitempty"`
 }
 
 // BackupConfig is where this deployment's archives go when they leave the disk
@@ -3400,6 +3406,10 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateTargets()...)
 	errs = append(errs, c.validateTargetKeyPaths()...)
 	errs = append(errs, c.validateTierTargets()...)
+	if c.Server != nil {
+		errs = append(errs, TargetShareErrors(c.TargetShares(), c.Tiers,
+			c.Server.MaxVCPU, c.Server.MaxMemory)...)
+	}
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)
 	errs = append(errs, c.validateNodes()...)

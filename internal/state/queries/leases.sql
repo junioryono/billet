@@ -236,6 +236,15 @@ SELECT CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
        CAST(COUNT(*) AS BIGINT) AS leases
   FROM leases WHERE phase NOT IN ('done','failed');
 
+-- name: UsageByTier :many
+-- What each tier has committed, for a target's share: the allocator sums the
+-- tiers a target owns, because which target a tier belongs to is configuration.
+SELECT tier,
+       CAST(COALESCE(SUM(vcpu), 0) AS BIGINT) AS vcpu,
+       CAST(COALESCE(SUM(memory), 0) AS BIGINT) AS memory
+  FROM leases WHERE phase NOT IN ('done','failed')
+ GROUP BY tier;
+
 -- name: CountActiveRunnerLeases :one
 -- How many runners GitHub could still route a job to, in one tier.
 --
