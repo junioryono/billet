@@ -3048,6 +3048,302 @@ install_hosted_tools() {
 	install_action_cache
 	install_agentic_tools
 	install_hosted_environment
+	install_hosted_languages
+}
+
+# --- languages and package managers GitHub installs by script --------------
+#
+# THE RUNNER ACCOUNT'S OWN TOOLS GO INTO ITS HOME. GitHub installs rustup and nvm
+# into /etc/skel, which reaches a user created afterwards; billet's runner account
+# exists before this runs (the guest build and the EC2 provisioning both create
+# it first), so they go to /home/runner directly and are handed to it.
+BILLET_TC_RUNNER_HOME=/home/runner
+
+# install_rust installs rustup and the stable toolchain for the runner, with the
+# components GitHub adds (rustfmt, clippy) on the minimal profile.
+install_rust() {
+	local triple="$BILLET_TC_UNAME-unknown-linux-gnu"
+	local url="https://static.rust-lang.org/rustup/dist/$triple/rustup-init"
+	local sums want home="$BILLET_TC_RUNNER_HOME"
+
+	sums=$(billet_tc_get "$url.sha256")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	fetch_verified "$url" "${BILLET_TC_ROOT:-}/tmp/rustup-init" "$(billet_tc_hex "$want" 64 rustup-init)"
+	chmod 0755 "${BILLET_TC_ROOT:-}/tmp/rustup-init"
+
+	billet_tc_run env RUSTUP_HOME="$home/.rustup" CARGO_HOME="$home/.cargo" \
+		/tmp/rustup-init -y --no-modify-path --default-toolchain stable --profile minimal \
+		--component rustfmt --component clippy >/dev/null
+	rm -f "${BILLET_TC_ROOT:-}/tmp/rustup-init"
+	billet_tc_run rm -rf "$home/.cargo/registry"
+	billet_tc_run chown -R runner:runner "$home/.rustup" "$home/.cargo"
+
+	local said
+	said=$(billet_tc_run env RUSTUP_HOME="$home/.rustup" CARGO_HOME="$home/.cargo" \
+		"$home/.cargo/bin/cargo" --version)
+
+	echo "languages: $said"
+}
+
+# install_swift installs the Swift toolchain, verified against Swift's signing
+# keys as GitHub's script verifies it, into /usr/share/swift.
+install_swift() {
+	local version dist file url home
+	version=$(jq -r '.tag_name | match("[0-9.]+").string' <<<"$(billet_tc_release apple/swift)")
+	[[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "apple/swift's latest release is \"$version\"" >&2; exit 1; }
+
+	dist=ubuntu2404
+	file="swift-$version-RELEASE-ubuntu24.04"
+	if [ "$BILLET_TC_ARCH" = arm64 ]; then
+		dist=ubuntu2404-aarch64
+		file="$file-aarch64"
+	fi
+
+	url="https://download.swift.org/swift-$version-release/$dist/swift-$version-RELEASE/$file.tar.gz"
+	billet_tc_tls "$url" "$BILLET_TC_WORK/swift.tgz"
+	billet_tc_tls "$url.sig" "$BILLET_TC_WORK/swift.tgz.sig"
+
+	# THE NINE KEYS GITHUB'S SCRIPT TRUSTS, each fetched and pinned on its own.
+	local keyrings=() fpr n=0
+	for fpr in 7463A81A4B2EEA1B551FFBCFD441C977412B37AD 1BE1E29A084CB305F397D62A9F597F4D21A56D5F \
+		A3BAFD3556A59079C06894BD63BC1CFE91D306C6 5E4DF843FB065D7F7E24FBA2EF5430F071E1B235 \
+		8513444E2DA36B7C1659AF4D7638F1FB2B2B08C4 A62AE125BBBFBB96A6E042EC925CC1CCED3D1561 \
+		8A7495662C3CD4AE18D95637FAF6989E1BC16FEA E813C892820A6FA13755B268F167DF1ACF9CE069 \
+		52BB7E3DE28A71BE22EC05FFEF80A866B47A981F; do
+		n=$((n + 1))
+		billet_tc_key "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x$fpr" \
+			"$fpr" "$BILLET_TC_WORK/swift-$n.gpg"
+		keyrings+=(--keyring "$BILLET_TC_WORK/swift-$n.gpg")
+	done
+
+	home=$(mktemp -d)
+	if ! GNUPGHOME="$home" gpgv "${keyrings[@]}" "$BILLET_TC_WORK/swift.tgz.sig" "$BILLET_TC_WORK/swift.tgz"; then
+		echo "swift $version does not verify against Swift's signing keys" >&2
+		rm -rf "$home" "$BILLET_TC_WORK"/swift*
+		exit 1
+	fi
+	rm -rf "$home" "$BILLET_TC_WORK"/swift-*.gpg "$BILLET_TC_WORK/swift.tgz.sig"
+
+	local root="${BILLET_TC_ROOT:-}"
+	mkdir -p "$root/usr/share/swift"
+	tar -xzf "$BILLET_TC_WORK/swift.tgz" -C "$root/usr/share/swift" --strip-components=1
+	rm -f "$BILLET_TC_WORK/swift.tgz"
+	billet_tc_run ln -sfnT /usr/share/swift/usr/bin/swift /usr/local/bin/swift
+	billet_tc_run ln -sfnT /usr/share/swift/usr/bin/swiftc /usr/local/bin/swiftc
+	billet_tc_run ln -sfnT /usr/share/swift/usr/lib/libsourcekitdInProc.so /usr/local/lib/libsourcekitdInProc.so
+	printf 'SWIFT_PATH=/usr/share/swift/usr/bin\n' >>"$BILLET_TC_ENV_FILE"
+
+	echo "languages: swift $version"
+}
+
+# install_haskell installs GHCup under /usr/local/.ghcup and, through it, the
+# latest GHC, Cabal and Stack, as GitHub's image carries them.
+install_haskell() {
+	local listing version sums want file base
+
+	listing=$(billet_tc_get https://downloads.haskell.org/~ghcup/)
+	version=$(grep -oE 'href="[0-9]+(\.[0-9]+)+/"' <<<"$listing" | grep -oE '[0-9]+(\.[0-9]+)+' |
+		sort -V | tail -n 1)
+	[ -n "$version" ] || { echo "downloads.haskell.org lists no ghcup release" >&2; exit 1; }
+
+	base="https://downloads.haskell.org/~ghcup/$version"
+	file="$BILLET_TC_UNAME-linux-ghcup-$version"
+	sums=$(billet_tc_get "$base/SHA256SUMS")
+	want=$(awk -v f="./$file" '$2 == f { print $1; exit }' <<<"$sums")
+
+	# WHAT GHCUP'S BOOTSTRAP INSTALLS FIRST: a GHC links against these, and one
+	# installed without them builds nothing.
+	billet_tc_run env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 update -qq
+	billet_tc_run env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y \
+		--no-install-recommends libffi-dev libgmp-dev libgmp10 libncurses-dev libnuma-dev >/dev/null
+	billet_tc_run rm -rf /var/lib/apt/lists
+
+	local ghcup=/usr/local/.ghcup/bin/ghcup
+	mkdir -p "${BILLET_TC_ROOT:-}/usr/local/.ghcup/bin"
+	fetch_verified "$base/$file" "${BILLET_TC_ROOT:-}$ghcup" "$(billet_tc_hex "$want" 64 "ghcup $version")"
+	chmod 0755 "${BILLET_TC_ROOT:-}$ghcup"
+
+	# ghcup checks every GHC, Cabal and Stack it fetches against its own metadata.
+	local tool
+	for tool in ghc cabal stack; do
+		billet_tc_run env GHCUP_INSTALL_BASE_PREFIX=/usr/local HOME=/root \
+			"$ghcup" --no-verbose install "$tool" latest --set >/dev/null
+	done
+
+	billet_tc_run ln -sfnT /usr/local/.ghcup/bin/stack /usr/local/bin/stack
+	billet_tc_run rm -rf /usr/local/.ghcup/cache /usr/local/.ghcup/tmp /root/.stack
+
+	# WRITABLE BY JOBS, as GitHub's is, so `ghcup install ghc <other>` works in one.
+	billet_tc_run chmod -R a+rwX /usr/local/.ghcup
+
+	printf '%s\n' BOOTSTRAP_HASKELL_NONINTERACTIVE=1 GHCUP_INSTALL_BASE_PREFIX=/usr/local \
+		>>"$BILLET_TC_ENV_FILE"
+
+	local said
+	said=$(billet_tc_run /usr/local/.ghcup/bin/ghc --numeric-version)
+
+	echo "languages: ghcup $version, ghc $said, cabal, stack"
+}
+
+# install_kotlin installs the Kotlin compiler into /usr/share/kotlinc and links
+# its commands into /usr/bin, as GitHub's image does.
+install_kotlin() {
+	local rel url sums want
+	rel=$(billet_tc_release JetBrains/kotlin)
+	url=$(jq -r '[.assets[] | select(.name | test("^kotlin-compiler-.*\\.zip$")) | .browser_download_url] | first // empty' <<<"$rel")
+	[[ "$url" == https://* ]] || { echo "JetBrains/kotlin's latest release has no compiler zip" >&2; exit 1; }
+
+	sums=$(billet_tc_get "$url.sha256")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	fetch_verified "$url" "$BILLET_TC_WORK/kotlin.zip" "$(billet_tc_hex "$want" 64 kotlin)"
+
+	local root="${BILLET_TC_ROOT:-}"
+	rm -rf "$root/usr/share/kotlinc"
+	unzip -q "$BILLET_TC_WORK/kotlin.zip" -d "$root/usr/share"
+	rm -f "$BILLET_TC_WORK/kotlin.zip" "$root"/usr/share/kotlinc/bin/*.bat
+
+	local cmd
+	for cmd in "$root"/usr/share/kotlinc/bin/*; do
+		billet_tc_run ln -sfnT "/usr/share/kotlinc/bin/$(basename "$cmd")" "/usr/bin/$(basename "$cmd")"
+	done
+
+	echo "languages: kotlin $(jq -r .tag_name <<<"$rel")"
+}
+
+# install_julia installs the newest stable Julia, checked against the digest
+# Julia's own versions.json publishes (GitHub's script checks none).
+install_julia() {
+	local versions triplet version url want
+	triplet="$BILLET_TC_UNAME-linux-gnu"
+	versions=$(billet_tc_get https://julialang-s3.julialang.org/bin/versions.json)
+	version=$(jq -r 'to_entries | map(select(.value.stable)) | map(.key)[]' <<<"$versions" | sort -V | tail -n 1)
+	url=$(jq -r --arg v "$version" --arg t "$triplet" \
+		'first(.[$v].files[] | select(.triplet == $t and .kind == "archive" and (.url | endswith(".tar.gz"))) | .url) // empty' \
+		<<<"$versions")
+	want=$(jq -r --arg v "$version" --arg u "$url" '.[$v].files[] | select(.url == $u) | .sha256' <<<"$versions")
+	[[ "$url" == https://* ]] || { echo "julia $version publishes no $triplet archive" >&2; exit 1; }
+
+	local dest="/usr/local/julia$version"
+	billet_tc_install "$url" "$(billet_tc_hex "$want" 64 "julia $version")" "$dest" 1 "$dest/bin/julia --version"
+	billet_tc_run ln -sfnT "$dest/bin/julia" /usr/bin/julia
+
+	echo "languages: julia $version"
+}
+
+# install_miniconda installs Miniconda into /usr/share/miniconda and links conda,
+# checked against the digest Anaconda lists beside the installer.
+install_miniconda() {
+	local file="Miniconda3-latest-Linux-$BILLET_TC_UNAME.sh" index want
+
+	index=$(billet_tc_get https://repo.anaconda.com/miniconda/)
+	# THE ROW AFTER THE FILENAME'S CELL carries the digest; mawk has no interval
+	# expressions, so the hex is taken by grep from the lines awk hands it.
+	local row
+	row=$(awk -v f=">$file<" 'index($0, f) { n = 4; next } n > 0 { print; n-- }' <<<"$index")
+	want=$(grep -m 1 -oE '[0-9a-f]{64}' <<<"$row" || true)
+	fetch_verified "https://repo.anaconda.com/miniconda/$file" "${BILLET_TC_ROOT:-}/tmp/$file" \
+		"$(billet_tc_hex "$want" 64 "$file")"
+
+	billet_tc_run rm -rf /usr/share/miniconda
+	billet_tc_run bash "/tmp/$file" -b -p /usr/share/miniconda >/dev/null
+	rm -f "${BILLET_TC_ROOT:-}/tmp/$file"
+	billet_tc_run ln -sfnT /usr/share/miniconda/bin/conda /usr/bin/conda
+
+	# WRITABLE BY JOBS, as GitHub's is, so `conda install` into base works.
+	billet_tc_run chmod -R a+rwX /usr/share/miniconda
+	printf 'CONDA=/usr/share/miniconda\n' >>"$BILLET_TC_ENV_FILE"
+
+	local said
+	said=$(billet_tc_run /usr/share/miniconda/bin/conda --version)
+
+	echo "languages: $said"
+}
+
+# install_vcpkg clones vcpkg and bootstraps its tool, which checks the download
+# against the SHA-512 the checkout pins.
+install_vcpkg() {
+	local root=/usr/local/share/vcpkg
+
+	billet_tc_run rm -rf "$root"
+	billet_tc_run git clone --quiet https://github.com/microsoft/vcpkg "$root"
+	billet_tc_run env HOME=/root "$root/bootstrap-vcpkg.sh" -disableMetrics >/dev/null
+	billet_tc_run ln -sfnT "$root/vcpkg" /usr/local/bin/vcpkg
+	billet_tc_run chmod -R a+rwX "$root"
+	billet_tc_run rm -rf /root/.vcpkg
+
+	printf 'VCPKG_INSTALLATION_ROOT=%s\n' "$root" >>"$BILLET_TC_ENV_FILE"
+	if [ "$BILLET_TC_ARCH" = arm64 ]; then
+		printf 'VCPKG_FORCE_SYSTEM_BINARIES=1\n' >>"$BILLET_TC_ENV_FILE"
+	fi
+
+	echo "languages: vcpkg $(billet_tc_run git -C "$root" rev-parse --short HEAD)"
+}
+
+# install_homebrew installs Homebrew at /home/linuxbrew/.linuxbrew, owned by the
+# runner so a job's `brew install` works, and off PATH, as GitHub leaves it.
+#
+# BUILT THE WAY Homebrew's installer builds it (a clone of Homebrew/brew at its
+# latest tag and the bin link), because that installer refuses to run as root
+# and asks for a terminal; brew then fetches its portable Ruby as the runner.
+install_homebrew() {
+	local prefix=/home/linuxbrew/.linuxbrew tag
+
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release Homebrew/brew)")
+	billet_tc_run rm -rf /home/linuxbrew
+	billet_tc_run mkdir -p "$prefix/bin"
+	billet_tc_run git clone --quiet --branch "$tag" https://github.com/Homebrew/brew "$prefix/Homebrew"
+	billet_tc_run ln -sfnT ../Homebrew/bin/brew "$prefix/bin/brew"
+	billet_tc_run chown -R runner:runner /home/linuxbrew
+
+	billet_tc_run runuser -u runner -- env HOME="$BILLET_TC_RUNNER_HOME" HOMEBREW_NO_AUTO_UPDATE=1 \
+		HOMEBREW_NO_ANALYTICS=1 "$prefix/bin/brew" --version >/dev/null
+
+	printf '%s\n' HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_CLEANUP_PERIODIC_FULL_DAYS=3650 >>"$BILLET_TC_ENV_FILE"
+
+	echo "languages: homebrew $tag"
+}
+
+# install_nvm installs nvm for the runner at its latest tag, with `system` as the
+# default so the image's node stays the one on PATH.
+install_nvm() {
+	local tag home="$BILLET_TC_RUNNER_HOME"
+
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release nvm-sh/nvm)")
+	billet_tc_run rm -rf "$home/.nvm"
+	billet_tc_run git clone --quiet --depth 1 --branch "$tag" https://github.com/nvm-sh/nvm "$home/.nvm"
+	billet_tc_run mkdir -p "$home/.nvm/alias"
+	printf 'system\n' >"${BILLET_TC_ROOT:-}$home/.nvm/alias/default"
+	printf '%s\n' '[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm' \
+		>>"${BILLET_TC_ROOT:-}$home/.bash_profile"
+	billet_tc_run chown -R runner:runner "$home/.nvm" "$home/.bash_profile"
+	printf 'NVM_DIR=%s/.nvm\n' "$home" >>"$BILLET_TC_ENV_FILE"
+
+	echo "languages: nvm $tag"
+}
+
+# install_hosted_path writes the runner's PATH with the directories GitHub's puts
+# in front of the system ones: the runner's own bins, cargo, Composer's global
+# bin, GHCup and dotnet tools. The image environment's PATH replaces the default
+# both backends start the runner with.
+install_hosted_path() {
+	local home="$BILLET_TC_RUNNER_HOME"
+
+	printf 'PATH=%s\n' "$home/.local/bin:$home/.cargo/bin:$home/.config/composer/vendor/bin:/usr/local/.ghcup/bin:$home/.dotnet/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+		>>"$BILLET_TC_ENV_FILE"
+}
+
+# install_hosted_languages installs every language and package manager above.
+install_hosted_languages() {
+	install_rust
+	install_swift
+	install_haskell
+	install_kotlin
+	install_julia
+	install_miniconda
+	install_vcpkg
+	install_homebrew
+	install_nvm
+	install_hosted_path
 }
 
 # billet_install_toolcache is the one entry point a caller invokes.

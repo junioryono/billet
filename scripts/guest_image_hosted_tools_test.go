@@ -65,7 +65,22 @@ func runHostedGate(t *testing.T, root string) string {
 // missing one is reported under.
 var hostedExtras = []string{
 	"postgres", "action archive cache", "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE",
-	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI",
+	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI", "nvm",
+	"SWIFT_PATH", "CONDA", "VCPKG_INSTALLATION_ROOT", "NVM_DIR", "HOMEBREW_NO_AUTO_UPDATE",
+	"GHCUP_INSTALL_BASE_PREFIX", "a PATH with cargo",
+}
+
+// languageEnv are the image environment lines the language tools need, keyed by
+// the name the gate reports a missing one under.
+var languageEnv = map[string]string{
+	"SWIFT_PATH":                "SWIFT_PATH=/usr/share/swift/usr/bin",
+	"CONDA":                     "CONDA=/usr/share/miniconda",
+	"VCPKG_INSTALLATION_ROOT":   "VCPKG_INSTALLATION_ROOT=/usr/local/share/vcpkg",
+	"NVM_DIR":                   "NVM_DIR=/home/runner/.nvm",
+	"HOMEBREW_NO_AUTO_UPDATE":   "HOMEBREW_NO_AUTO_UPDATE=1",
+	"GHCUP_INSTALL_BASE_PREFIX": "GHCUP_INSTALL_BASE_PREFIX=/usr/local",
+	"a PATH with cargo": "PATH=/home/runner/.local/bin:/home/runner/.cargo/bin:" +
+		"/home/runner/.config/composer/vendor/bin:/usr/local/.ghcup/bin:/usr/local/bin:/usr/bin:/bin",
 }
 
 // hostedDamage are ways an entry can be present and still unusable, each with
@@ -149,7 +164,17 @@ func hostedImage(t *testing.T, skip string) string {
 		env += "USE_BAZEL_FALLBACK_VERSION=silent:9.1.1\n"
 	}
 
+	for name, line := range languageEnv {
+		if skip != name {
+			env += line + "\n"
+		}
+	}
+
 	writeFile(t, filepath.Join(root, "etc/billet-image-env"), env, 0o644)
+
+	if skip != "nvm" {
+		writeFile(t, filepath.Join(root, "home/runner/.nvm/nvm.sh"), "nvm() { :; }\n", 0o644)
+	}
 
 	awf := filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0")
 	switch skip {

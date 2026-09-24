@@ -337,6 +337,10 @@ HOSTED_TOOLS=(
 	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
 	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
 	/usr/sbin/nginx
+	/home/runner/.cargo/bin/cargo /home/runner/.cargo/bin/rustc /home/runner/.cargo/bin/rustup
+	/usr/local/bin/swift /usr/local/bin/swiftc /usr/local/.ghcup/bin/ghcup /usr/local/.ghcup/bin/ghc
+	/usr/local/.ghcup/bin/cabal /usr/local/bin/stack /usr/bin/kotlin /usr/bin/kotlinc /usr/bin/julia
+	/usr/bin/conda /usr/local/bin/vcpkg /home/linuxbrew/.linuxbrew/bin/brew
 )
 
 # image_resolve prints path as the image at $1 resolves it, following every
@@ -410,6 +414,18 @@ check_hosted_tools() {
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+
+	[ -f "$1/home/runner/.nvm/nvm.sh" ] || missing+=("nvm (/home/runner/.nvm/nvm.sh)")
+
+	# THE ENVIRONMENT THE LANGUAGES NEED, which the runner gets from this file alone.
+	local line
+	for line in 'SWIFT_PATH=/usr/share/swift/usr/bin' 'CONDA=/usr/share/miniconda' \
+		'VCPKG_INSTALLATION_ROOT=/usr/local/share/vcpkg' 'NVM_DIR=/home/runner/.nvm' \
+		'HOMEBREW_NO_AUTO_UPDATE=1' 'GHCUP_INSTALL_BASE_PREFIX=/usr/local'; do
+		grep -qxF "$line" "$env" 2>/dev/null || missing+=("$line in /etc/billet-image-env")
+	done
+	grep -q '^PATH=.*/home/runner/\.cargo/bin:.*/usr/local/\.ghcup/bin' "$env" 2>/dev/null ||
+		missing+=("a PATH with cargo and GHCup in /etc/billet-image-env")
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
 	# @actions/tool-cache looks for; a payload without one is invisible to it.
