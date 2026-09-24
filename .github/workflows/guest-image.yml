@@ -192,8 +192,9 @@ jobs:
           # it from the build script means one edit rather than two, and the two
           # cannot drift into a check that passes for an image it cannot hold.
           #
-          # THE IMAGE, ITS COMPRESSED FORM AND THE KERNEL ALL EXIST AT ONCE at the
-          # pack step, so the floor is the image plus roughly half again, plus a
+          # THE IMAGE, ITS BOOT CHECK'S COPY (`cp --reflink=auto` makes a full one
+          # where the filesystem has no reflinks), ITS COMPRESSED FORM AND ITS PARTS
+          # can all exist at once, so the floor is two images and half again, plus a
           # few GB for the kernel build tree and the debootstrap cache.
           size_mb=$(sed -n 's/^SIZE_MB="\${SIZE_MB:-\([0-9]*\)}"$/\1/p' \
             scripts/build-guest-image.sh)
@@ -203,7 +204,7 @@ jobs:
             exit 1
           fi
 
-          needed=$(( size_mb * 3 / 2 / 1024 + 6 ))
+          needed=$(( size_mb * 5 / 2 / 1024 + 6 ))
 
           if [ "$after" -lt "$needed" ]; then
             echo "only ${after}GB free; a ${size_mb}M image needs about ${needed}GB here" >&2
