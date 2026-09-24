@@ -167,7 +167,6 @@ func hostedImage(t *testing.T, skip string) string {
 		env += "USE_BAZEL_FALLBACK_VERSION=silent:9.1.1\n"
 	}
 
-<<<<<<< HEAD
 	for name, line := range languageEnv {
 		if skip != name {
 			env += line + "\n"
@@ -182,7 +181,7 @@ func hostedImage(t *testing.T, skip string) string {
 		env = strings.ReplaceAll(env, "/usr/local/.ghcup/bin:", "/usr/local/.ghcup/bin-broken:")
 	}
 
-	writeFile(t, filepath.Join(root, "etc/billet-image-env"), env, 0o644)
+	writeFile(t, filepath.Join(root, "etc", "billet-image-env"), env, 0o644)
 
 	if skip != "Rust stable toolchain" {
 		for _, c := range []string{"rustc", "cargo", "rustfmt", "cargo-clippy"} {
@@ -191,21 +190,16 @@ func hostedImage(t *testing.T, skip string) string {
 				mode = 0o644
 			}
 
-			writeFile(t, filepath.Join(root, "home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin", c),
+			writeFile(t, filepath.Join(root, "home", "runner", ".rustup", "toolchains", "stable-x86_64-unknown-linux-gnu", "bin", c),
 				"#!/bin/sh\n", mode)
 		}
 	}
 
 	if skip != "nvm" {
-		writeFile(t, filepath.Join(root, "home/runner/.nvm/nvm.sh"), "nvm() { :; }\n", 0o644)
+		writeFile(t, filepath.Join(root, "home", "runner", ".nvm", "nvm.sh"), "nvm() { :; }\n", 0o644)
 	}
 
-	awf := filepath.Join(root, "opt/hostedtoolcache/agentic-workflow-firewall-js/0.1.0")
-=======
-	writeFile(t, filepath.Join(root, "etc", "billet-image-env"), env, 0o644)
-
 	awf := filepath.Join(root, "opt", "hostedtoolcache", "agentic-workflow-firewall-js", "0.1.0")
->>>>>>> junior-sep24-hosted-tools
 	switch skip {
 	case "firewall bundle":
 	case "empty firewall bundle":
