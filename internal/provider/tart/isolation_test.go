@@ -109,6 +109,12 @@ func TestAnUntrustedGuestBootsUnderSoftnet(t *testing.T) {
 			"shared NAT, which reaches the host and lets a guest spoof the bridge.\nargv:\n%s",
 			s.argv(t))
 	}
+
+	// softnet alone still admits the vmnet gateway, which is the host itself.
+	if !strings.Contains(s.argv(t), "--net-softnet-block=@host") {
+		t.Errorf("an untrusted guest was booted without --net-softnet-block=@host, so it "+
+			"reaches every service the host listens on at its gateway.\nargv:\n%s", s.argv(t))
+	}
 }
 
 // AND A TRUSTED GUEST IS NOT CONFINED, which is not a nicety: softnet blocks the

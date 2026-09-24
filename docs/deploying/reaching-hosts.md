@@ -89,6 +89,41 @@ The workflow installs the WARP client from a fingerprint-verified signing key, w
 
 Three trade-offs are worth stating. `non_identity@` is a **shared principal**, so the Gateway rule is the entire scope: one rule per fleet, not per token. Gateway **normalises `/32` off** a single address, so a rule written with `/32`s never converges; the module refuses a prefix. And the device profile's **split tunnel must include the destinations**, or the traffic never reaches Gateway and the rule never matters.
 
+## The other direction: a node reaching a private control plane
+
+Everything above is how CI reaches a host to converge it. A node needs the opposite: it dials the control plane's `node.server_addr`, and nothing dials the node. When the control plane sits on a private network (an address in a VPC, reached over Cloudflare Zero Trust) and the node sits somewhere else (a house, an office), the node needs a way *out* to that address, and no route in at all unless a converge also has to reach it.
+
+The choice is a security decision, not plumbing, because each way in carries a different identity, and Gateway grants reach by identity:
+
+| How the node joins | Identity it carries | What it can reach |
+|---|---|---|
+| a WARP Connector (a Mesh node) | `warp_connector@<team>`, one identity shared by every connector | every grant that identity already holds, typically whole VPCs |
+| the WARP client signed in as a person | that person's email | everything that person can reach |
+| a headless WARP client enrolled by a service token | `non_identity@<team>`, shared by every service-token device | nothing until a Gateway rule grants it |
+
+The last is the narrow one: enrol the node's machine with its own service token, and it carries `non_identity@` into the rule you already wrote for Route D, which names exactly the control plane's address and the hosts CI converges. Its own token, rather than CI's, is what lets you revoke the node without touching CI. The `converge-cloudflare-warp` module mints one token and one rule; a node's token is a service token and a Service Auth (`non_identity`) enrolment policy beside it, attached to the enrolment application the same way:
+
+```hcl
+resource "cloudflare_zero_trust_access_service_token" "node" {
+  account_id = var.account_id
+  name       = "mac-mini-1 node (WARP client)"
+  duration   = "8760h"
+}
+
+resource "cloudflare_zero_trust_access_policy" "node_enrol" {
+  account_id = var.account_id
+  name       = "mac-mini-1 node: service-token device enrolment"
+  decision   = "non_identity"
+  include    = [{ service_token = { token_id = cloudflare_zero_trust_access_service_token.node.id } }]
+}
+```
+
+Said plainly, `non_identity@` is shared: the node can reach whatever the Route D rule admits, on any port, including a converged host's SSH, and it holds no key those hosts accept. Do not write a second Gateway rule for the node at a new precedence; the one rule is the whole of that principal's reach.
+
+On the node, the client enrols headless from an MDM file holding the token: `/var/lib/cloudflare-warp/mdm.xml` on Linux, `/Library/Managed Preferences/com.cloudflare.warp.plist` on macOS, with `organization`, `auth_client_id`, `auth_client_secret`, `service_mode` `warp`, `auto_connect` `1` and `onboarding` `false`, written `0600` and root-owned, and never passed on a command line. Prove the path before starting the node: `nc -z <control plane address> 7717` from the node.
+
+**The guests do not inherit the node's reach.** A Firecracker guest's forwarding to every private range, which includes the Mesh range, is dropped by the host's `billet_guard`; a tart guest under softnet may send only to globally routable addresses, and billet also blocks its gateway, which is the Mac (`--net-softnet-block=@host`). Measured on a Mac enrolled this way: from untrusted macOS and Linux guests, the control plane, a Mesh address and the LAN all timed out.
+
 ## What is deliberately not here
 
 A self-hosted mesh (Headscale, WireGuard) is a reasonable choice for a fleet across several sites and is not documented as a getting-started route: it means running another control plane, and for one or two hosts a deploy runner on Route A achieves the same thing with nothing new to operate. None of these is a requirement; billet runs jobs without them.

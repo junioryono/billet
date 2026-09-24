@@ -347,3 +347,35 @@ func (a *Allocator) Decommission(ctx context.Context, req DecommissionRequest) (
 
 	return proven, nil
 }
+
+// PlaceableContribution is what the live, undrained hosts contribute between
+// them, and how many hosts that is.
+//
+// It exists for the comparison an operator cannot see: the deployment ceiling
+// caps every node, so a ceiling below this sum is room the hosts have and the
+// allocator will never hand out, and a node added without raising the ceiling
+// registers, advertises, and quietly gets none of its own capacity.
+func (a *Allocator) PlaceableContribution(ctx context.Context) (int, config.ByteSize, int, error) {
+	var (
+		vcpu   int
+		memory config.ByteSize
+		hosts  int
+	)
+
+	err := a.db.View(ctx, func(q querier) error {
+		rows, err := state.ReadQueries(q).ListPlaceableNodes(ctx)
+		if err != nil {
+			return fmt.Errorf("alloc: list placeable nodes: %w", err)
+		}
+
+		for _, row := range rows {
+			vcpu += int(row.TotalVcpu)
+			memory += config.ByteSize(row.TotalMemory)
+			hosts++
+		}
+
+		return nil
+	})
+
+	return vcpu, memory, hosts, err
+}

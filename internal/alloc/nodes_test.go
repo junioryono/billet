@@ -390,3 +390,34 @@ func TestRegisteredNodesRefuseCorruptPlacementIdentity(t *testing.T) {
 		})
 	}
 }
+
+// THE SUM A CEILING IS COMPARED WITH counts every live host's contribution and
+// nothing else: a drained host is not placeable, so its capacity is not room the
+// ceiling withholds.
+func TestPlaceableContributionSumsTheLiveUndrainedHosts(t *testing.T) {
+	t.Parallel()
+
+	a, err := New(openState(t), Limits{MaxVCPU: 136, MaxMemory: 540 * config.GiB}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, n := range []NodeRegistration{
+		{Name: "linux-1", Provider: config.ProviderDocker, VCPU: 120, Memory: 480 * config.GiB},
+		{Name: "mac-1", Provider: config.ProviderDocker, VCPU: 18, Memory: 64 * config.GiB},
+	} {
+		if _, err := a.RegisterNode(t.Context(), n); err != nil {
+			t.Fatalf("RegisterNode %s: %v", n.Name, err)
+		}
+	}
+
+	vcpu, memory, hosts, err := a.PlaceableContribution(t.Context())
+	if err != nil {
+		t.Fatalf("PlaceableContribution: %v", err)
+	}
+
+	if vcpu != 138 || memory != 544*config.GiB || hosts != 2 {
+		t.Fatalf("contribution = %d vCPU, %s over %d hosts; want 138 vCPU, 544GiB over 2",
+			vcpu, memory, hosts)
+	}
+}

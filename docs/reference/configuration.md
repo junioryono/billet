@@ -35,6 +35,7 @@ The first GitHub **target**: the owner whose runners this deployment serves, and
 | `client_id` | no | when set, the scale-set client signs with it; `billet check` reports which issuer it tested |
 | `installation_id` | yes | creating an App does not install it |
 | `private_key_path` | yes | the key GitHub issued once |
+| `max_vcpu`, `max_memory` | no | this target's share: the most its tiers may hold at once between them, inside `server.max_vcpu`/`max_memory`; see [A target's share](#a-targets-share) |
 
 A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group`, `workflows` and `intercept` are refused on a tier under one. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
 
@@ -45,9 +46,13 @@ Further targets, each an organization or a repository with its own App, served b
 | Key | Required | Meaning |
 |---|---|---|
 | `name` | yes | the target's name, in the tier-label grammar, unique; what `tiers[].target`, `github-app create --target`, the archive and the host role refer to it by |
-| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
+| `org` or `repository`, `app_id`, `client_id`, `installation_id`, `private_key_path`, `max_vcpu`, `max_memory` | as for `github` | the target and its credential; with a file-backed identity every target needs its own `private_key_path`, with a store-backed one none may set it |
 
 The target's GitHub path (`owner` or `owner/name`) is its identity on the wire and in the ledger; the name is a label for the operator.
+
+### A target's share
+
+Every target's tiers buy from the one deployment ceiling, so a burst of one target's CI can take every host another target's jobs need. `max_vcpu` and `max_memory` on a target's block cap what that target's tiers hold at once between them, charged the way the deployment ceiling is (a remote backend at the shape it buys). A zero or absent dimension is bounded by the deployment ceiling alone. Capping one target leaves the rest for the others: with `server.max_vcpu: 120` and `max_vcpu: 80` on a repository target, that repository's jobs never hold more than 80, so the other target always has at least 40. A tier held back by its own target's share also stops holding its place in `server.admission_order` against other targets' tiers, because room they free could never reach it. A share is refused when it is above the deployment ceiling, below one of its tiers' shapes, or below what its tiers' `reserved` floors hold between them.
 
 ## `node`
 

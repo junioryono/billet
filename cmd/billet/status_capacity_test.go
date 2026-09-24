@@ -3,9 +3,11 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -76,11 +78,12 @@ func TestStatusSaysWhatATierIsWaitingFor(t *testing.T) {
 	printTierCapacity(&waiting, "billet-64vcpu", alloc.TierCapacity{
 		ObservedAt: "2026-09-20T12:00:00Z",
 		Listener: alloc.ListenerCapacity{
-			Exchange:     "confirmed",
-			Waiting:      3,
-			WaitingSince: "2026-09-20T11:40:00Z",
+			Exchange:        "confirmed",
+			Waiting:         3,
+			WaitingSince:    "2026-09-20T11:40:00Z",
+			WaitingProgress: "2026-09-20T11:59:30Z",
 		},
-	})
+	}, statusNow)
 
 	for _, want := range []string{"waiting 3", "2026-09-20T11:40:00Z"} {
 		if !strings.Contains(waiting.String(), want) {
@@ -95,9 +98,45 @@ func TestStatusSaysWhatATierIsWaitingFor(t *testing.T) {
 	printTierCapacity(&quiet, "billet-2vcpu", alloc.TierCapacity{
 		ObservedAt: "2026-09-20T12:00:00Z",
 		Listener:   alloc.ListenerCapacity{Exchange: "confirmed"},
-	})
+	}, statusNow)
 
 	if strings.Contains(quiet.String(), "waiting") {
 		t.Errorf("a tier with nothing waiting reported a queue:\n%s", quiet.String())
+	}
+}
+
+// statusNow is the clock the status tests read the reports against.
+var statusNow = time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+
+// A WAITER WHOSE LISTENER HAS STALLED IS SAID TO HAVE STOPPED HOLDING THE LINE.
+// Its own report cannot say so, because a stalled listener publishes nothing;
+// the reader compares the last progress it did publish with its own clock. On
+// 2026-09-23 the report said only "waiting 1 job(s) for room" for eighteen
+// minutes while that waiter's listener sat on a dead connection.
+func TestStatusSaysAWaiterHasPublishedNoProgress(t *testing.T) {
+	report := func(progress string) string {
+		var b strings.Builder
+
+		printTierCapacity(&b, "platform-8vcpu", alloc.TierCapacity{
+			ObservedAt: "2026-09-20T11:40:00Z",
+			Listener: alloc.ListenerCapacity{
+				Exchange: "in flight", Waiting: 1,
+				WaitingSince: "2026-09-20T11:30:00Z", WaitingProgress: progress,
+			},
+		}, statusNow)
+
+		return b.String()
+	}
+
+	stalled := statusNow.Add(-server.WaiterAllowance - time.Minute).Format(time.RFC3339Nano)
+	if out := report(stalled); !strings.Contains(out, "NO ADMISSION PROGRESS PUBLISHED") {
+		t.Errorf("a waiter stalled past the allowance is reported as holding the line:\n%s", out)
+	}
+
+	live := statusNow.Add(-server.WaiterAllowance + time.Minute).Format(time.RFC3339Nano)
+	for _, progress := range []string{live, "", "not a time"} {
+		if out := report(progress); strings.Contains(out, "NO ADMISSION PROGRESS PUBLISHED") {
+			t.Errorf("progress %q is reported as a stall:\n%s", progress, out)
+		}
 	}
 }

@@ -134,6 +134,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	emit := fs.String("emit", string(emitFile),
 		"where the generation goes: file (write --config) or ansible (print the "+
 			"billet_config block for an inventory, writing nothing)")
+	join := fs.String("join", "",
+		"write a node-only config for this machine that joins the control plane at this "+
+			"node-wire address (host:port), and print what that control plane's config needs")
 
 	// WHERE THE LEDGER LIVES, and it is a property of the CONTROL PLANE rather
 	// than of a backend — so unlike every flag below, these apply to any provider.
@@ -372,6 +375,16 @@ func cmdInit(ctx context.Context, args []string) error {
 		return errors.New("--emit ansible describes a host the junioryono.billet.host role " +
 			"converges, which installs the service shape; --profile local is the two-terminal " +
 			"user-session shape and its paths are unreadable to the role's units")
+	}
+	// BY PRESENCE, so `--join "$ADDR"` with an empty variable is refused rather
+	// than quietly generating a control plane.
+	joining := setFlags["join"]
+	if joining && strings.TrimSpace(*join) == "" {
+		return errors.New("--join: the control plane's node-wire address is empty")
+	}
+	if joining && emitValue == emitAnsible {
+		return errors.New("--join writes this machine's node config and prints the control " +
+			"plane's half; it has no inventory form, so it cannot be combined with --emit ansible")
 	}
 	if err := initconfig.CheckListen(*listen); err != nil {
 		return err
@@ -682,6 +695,24 @@ func cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// A JOIN IS A TRANSFORM OF THE GENERATION, so the measured ceiling and the
+	// tiers that fit it have one author; the half that belongs in the control
+	// plane's file is printed once this machine's file is written.
+	var joined initconfig.JoinResult
+	if joining {
+		// Absolute, because node.tls refuses a relative path and a relative
+		// --config would otherwise fail every join at validation.
+		abs, err := filepath.Abs(*cfgPath)
+		if err != nil {
+			return fmt.Errorf("resolve --config %s: %w", *cfgPath, err)
+		}
+		joined, err = initconfig.Join(body, *join, filepath.Join(filepath.Dir(abs), "tls"))
+		if err != nil {
+			return err
+		}
+		body = joined.Node
+	}
+
 	// The three re-run outcomes. BESIDE moves no pointer and touches no
 	// existing file, so the identity refusal applies only to the two paths
 	// that REPLACE the file: converge and --force.
@@ -704,8 +735,12 @@ func cmdInit(ctx context.Context, args []string) error {
 		}
 
 		if len(existingRaw) > 0 && (converged || *force) {
-			if err := refuseIdentityMove(*cfgPath, existingRaw, params.ServerStateDir()); err != nil {
-				return err
+			refuse := refuseIdentityMove(*cfgPath, existingRaw, params.ServerStateDir())
+			if joining {
+				refuse = refuseServerRemoval(*cfgPath, existingRaw)
+			}
+			if refuse != nil {
+				return refuse
 			}
 		}
 
@@ -755,7 +790,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	final := []byte(body)
 	carried := false
 	var keyMovedFrom, keyMovedTo string
-	if len(existingRaw) > 0 {
+	// A joined node has no github block, and carrying one back in would make
+	// this machine a second control plane for the same App.
+	if len(existingRaw) > 0 && !joining {
 		gb, oldKeyPath, ok := existingGitHubBlock(existingRaw)
 		switch {
 		case ok && !gb.usable():
@@ -1015,6 +1052,14 @@ func cmdInit(ctx context.Context, args []string) error {
 			"(edited values, sites, extra tiers, or a different billet version's shape). "+
 			"Compare and merge deliberately:\n\n  diff -u %s %s\n\nThen move the merged "+
 			"result into place yourself.\n", shellArg(*cfgPath), shellArg(writePath))
+
+		// A joined node has no App to create; the rest of its guidance is the
+		// same once the merged file is in place.
+		if joining {
+			printJoinNext(*cfgPath, params.Profile, joined, true)
+
+			return nil
+		}
 		// SAME RULE AS THE NEXT STEPS: there is nothing to hand a file to on a
 		// Mac. Worse than useless there — an operator who runs it under sudo to
 		// make it work leaves a root-owned config that the agents, which run as
@@ -1056,10 +1101,77 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 
 	report()
+	if joining {
+		printJoinNext(*cfgPath, params.Profile, joined, false)
+
+		return nil
+	}
 	warnIfListenBusy(ctx, params.Listen)
 	printInitNextFor(*cfgPath, params, trusted, carried)
 
 	return nil
+}
+
+// printJoinNext says what a joined node still needs once its config is
+// written: the control plane's half, its certificate bundle, and a start.
+// replaced is a config merged over one the services may already be running.
+func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult,
+	replaced bool,
+) {
+	printJoinControlPlane(joined)
+
+	pathArg := shellArg(cfgPath)
+	step := 3
+
+	fmt.Printf("Then on this machine:\n\n")
+	fmt.Printf("  1. Install the certificate bundle the config's node.tls names — from " +
+		"`billet ca issue <name>` on the control plane, or the enrollment ceremony.\n")
+	fmt.Printf("  2. billet check --config %s\n", pathArg)
+	if profile != initconfig.ProfileLocalService {
+		fmt.Printf("  3. billet node --config %s\n", pathArg)
+
+		return
+	}
+
+	// The agents read exactly one path, so a config written anywhere else
+	// is installed there first or `local up` starts whatever that path holds.
+	if service := initconfig.ServiceConfigPathFor(hostOS); cfgPath != service {
+		// THE SAME GUARD AS WRITING IT HERE: the copy below replaces the
+		// service path's config, which may be this machine's control plane.
+		raw, err := os.ReadFile(service)
+		switch {
+		case err != nil && !os.IsNotExist(err):
+			fmt.Printf("  3. Do NOT install it at %s yet: billet cannot read that file to rule "+
+				"out a live control plane (%v).\n", service, err)
+
+			return
+		case err == nil:
+			if refuse := refuseServerRemoval(service, raw); refuse != nil {
+				fmt.Printf("  3. Do NOT install it at %s yet: %v\n", service, refuse)
+
+				return
+			}
+		}
+
+		fmt.Printf("  3. Install the file where the services billet ships read it:\n")
+		fmt.Printf("       cp %s %s\n", pathArg, shellArg(service))
+		if account := initconfig.ServiceAccountFor(hostOS); account != "" {
+			fmt.Printf("       chown root:%s %s && chmod 0640 %s\n",
+				account, shellArg(service), shellArg(service))
+		}
+		step = 4
+	}
+	if replaced {
+		fmt.Printf("  %d. billet local down --reason 'joined a control plane'\n", step)
+		step++
+	}
+	fmt.Printf("  %d. billet local up\n", step)
+}
+
+// printJoinControlPlane prints the half of a join that belongs in the control
+// plane's config.
+func printJoinControlPlane(joined initconfig.JoinResult) {
+	fmt.Printf("\nOn the control plane:\n\n%s\n", joined.ControlPlane)
 }
 
 // existingGitHubBlock reads the App identity out of the file being replaced —
@@ -1691,6 +1803,37 @@ func refuseIdentityAdoption(cfgPath, newState string) error {
 	}
 
 	return nil
+}
+
+// refuseServerRemoval refuses a join that would replace a config whose control
+// plane holds a deployment: the node-only file has no server, so every
+// container and lease under that identity would be orphaned.
+func refuseServerRemoval(cfgPath string, existingRaw []byte) error {
+	oldState, ok := initconfig.ExistingServerStateDir(existingRaw)
+	if !ok {
+		return fmt.Errorf("%s exists but its YAML cannot be read, so billet cannot tell "+
+			"whether it runs a live control plane — refusing to replace it with a joined "+
+			"node. If it is garbage, delete it yourself and re-run", cfgPath)
+	}
+	if oldState == "" {
+		return nil
+	}
+
+	switch state.ProbeDeploymentID(oldState) {
+	case state.IdentityAbsent:
+		return nil
+	case state.IdentityPresent:
+		return fmt.Errorf("%s runs a control plane whose state at %s holds a live "+
+			"deployment identity, and --join would replace it with a node-only config — "+
+			"orphaning every container and lease under that identity. Retire the deployment "+
+			"first (`billet decommission`, then `billet teardown`), or write the joined config "+
+			"to another path with --config", cfgPath, oldState)
+	default:
+		return fmt.Errorf("%s runs a control plane whose state is at %s, and billet cannot "+
+			"read that directory to rule out a live deployment identity — refusing to replace "+
+			"it with a joined node. Fix the directory's permissions, or retire the deployment "+
+			"(`billet decommission`, then `billet teardown`)", cfgPath, oldState)
+	}
 }
 
 // sameDir reports whether two paths name the same directory, resolving
