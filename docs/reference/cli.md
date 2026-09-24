@@ -42,6 +42,7 @@ Generate a `billet.yaml` that runs. It measures the host, writes a ceiling below
 | `--listen` | the loopback address the server binds and the node dials (default `127.0.0.1:7717`) |
 | `--image` | the tier image (default: a runner container for docker, a golden generation for firecracker) |
 | `--emit file\|ansible` | write the file, or print the `billet_config` block for an inventory and write nothing |
+| `--join ADDR` | write a node-only config for this machine that dials the control plane at `ADDR` (its node-wire `host:port`), carrying the measured ceiling as `node.max_vcpu`/`max_memory` and naming the certificate bundle under the config's `tls/` directory, and print what the control plane's config needs: how far to raise `server.max_vcpu`/`max_memory`, and the `tiers:` and `nodes:` to add. Not with `--emit ansible` |
 | `--state-backend sqlite\|postgres`, `--state-dsn-env` | where the ledger lives; the DSN's environment variable is required for postgres |
 | `--node-name` | this host's name; required for a macOS tier on tart or codebuild |
 | `--guest-os macos\|linux` (repeatable), `--macos-image`, `--linux-image` | tart guest kinds and their images (defaults `ghcr.io/cirruslabs/macos-tahoe-xcode:latest` and `ghcr.io/cirruslabs/ubuntu-runner-arm64:latest`) |

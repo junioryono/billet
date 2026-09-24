@@ -260,7 +260,8 @@ func TestASoftnetGuestCanResolveAndReachGitHub(t *testing.T) {
 
 	const name = "billet-dnsguest"
 
-	bootedGuestWith(t, p, name, "--net-softnet")
+	// The flags billet's own untrusted launch passes, so this measures that policy.
+	bootedGuestWith(t, p, name, "--net-softnet", "--net-softnet-block=@host")
 
 	// FIRST, PROVE SOFTNET IS ACTUALLY ON. Configuring a public resolver and
 	// then watching DNS work would pass identically under default NAT, an

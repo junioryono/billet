@@ -354,6 +354,7 @@ func waitForQuiet(ctx context.Context, db *state.DB, cfg *config.Config, generat
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
+		Shares:    cfg.TargetShares(),
 	}, cfg.Tiers)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
