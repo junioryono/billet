@@ -424,8 +424,23 @@ check_hosted_tools() {
 		'HOMEBREW_NO_AUTO_UPDATE=1' 'GHCUP_INSTALL_BASE_PREFIX=/usr/local'; do
 		grep -qxF "$line" "$env" 2>/dev/null || missing+=("$line in /etc/billet-image-env")
 	done
-	grep -q '^PATH=.*/home/runner/\.cargo/bin:.*/usr/local/\.ghcup/bin' "$env" 2>/dev/null ||
-		missing+=("a PATH with cargo and GHCup in /etc/billet-image-env")
+	# THE LAST PATH LINE IS THE ONE THE RUNNER GETS, and its entries are compared
+	# whole, so neither a later override nor a lookalike directory passes.
+	local path dir
+	path=$(grep '^PATH=' "$env" 2>/dev/null | tail -n 1 || true)
+	for dir in /home/runner/.cargo/bin /usr/local/.ghcup/bin /usr/local/bin /usr/bin; do
+		if [[ ":${path#PATH=}:" != *":$dir:"* ]]; then
+			missing+=("a PATH with cargo and GHCup in /etc/billet-image-env (no $dir)")
+			break
+		fi
+	done
+
+	# rustup's proxies without a toolchain run nothing.
+	local component
+	for component in rustc cargo rustfmt cargo-clippy; do
+		compgen -G "$1/home/runner/.rustup/toolchains/stable-*/bin/$component" >/dev/null ||
+			missing+=("the Rust stable toolchain's $component")
+	done
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
 	# @actions/tool-cache looks for; a payload without one is invisible to it.

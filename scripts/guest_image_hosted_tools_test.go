@@ -67,7 +67,7 @@ var hostedExtras = []string{
 	"postgres", "action archive cache", "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE",
 	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI", "nvm",
 	"SWIFT_PATH", "CONDA", "VCPKG_INSTALLATION_ROOT", "NVM_DIR", "HOMEBREW_NO_AUTO_UPDATE",
-	"GHCUP_INSTALL_BASE_PREFIX", "a PATH with cargo",
+	"GHCUP_INSTALL_BASE_PREFIX", "a PATH with cargo", "Rust stable toolchain",
 }
 
 // languageEnv are the image environment lines the language tools need, keyed by
@@ -170,7 +170,22 @@ func hostedImage(t *testing.T, skip string) string {
 		}
 	}
 
+	if skip == "overridden PATH" {
+		env += "PATH=/usr/bin:/bin\n"
+	}
+
+	if skip == "lookalike PATH" {
+		env = strings.ReplaceAll(env, "/usr/local/.ghcup/bin:", "/usr/local/.ghcup/bin-broken:")
+	}
+
 	writeFile(t, filepath.Join(root, "etc/billet-image-env"), env, 0o644)
+
+	if skip != "Rust stable toolchain" {
+		for _, c := range []string{"rustc", "cargo", "rustfmt", "cargo-clippy"} {
+			writeFile(t, filepath.Join(root, "home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin", c),
+				"#!/bin/sh\n", 0o755)
+		}
+	}
 
 	if skip != "nvm" {
 		writeFile(t, filepath.Join(root, "home/runner/.nvm/nvm.sh"), "nvm() { :; }\n", 0o644)
@@ -269,9 +284,23 @@ func TestTheHostedToolsAreInstalledAndGated(t *testing.T) {
 	hosted := guestImageFunction(t, "install_hosted_tools")
 	for _, step := range []string{"install_hosted_packages", "install_github_cli", "install_hosted_binaries", "install_aws_tools",
 		"install_hosted_php_tools", "install_bazelisk", "install_action_cache", "install_agentic_tools",
-		"install_hosted_environment"} {
+		"install_hosted_environment", "install_hosted_languages"} {
 		if !hasExactLine(hosted, "\t"+step) {
 			t.Errorf("install_hosted_tools does not call %s", step)
+		}
+	}
+}
+
+// AND EVERY LANGUAGE INSTALLER IS CALLED, with the PATH line after them.
+func TestTheHostedLanguagesAreInstalled(t *testing.T) {
+	t.Parallel()
+
+	languages := guestImageFunction(t, "install_hosted_languages")
+	for _, step := range []string{"install_rust", "install_swift", "install_haskell", "install_kotlin",
+		"install_julia", "install_miniconda", "install_vcpkg", "install_homebrew", "install_nvm",
+		"install_hosted_path", "billet_tc_reap_target"} {
+		if !hasExactLine(languages, "\t"+step) {
+			t.Errorf("install_hosted_languages does not call %s", step)
 		}
 	}
 }

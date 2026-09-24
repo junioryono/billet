@@ -3078,11 +3078,16 @@ install_rust() {
 	billet_tc_run rm -rf "$home/.cargo/registry"
 	billet_tc_run chown -R runner:runner "$home/.rustup" "$home/.cargo"
 
-	local said
-	said=$(billet_tc_run env RUSTUP_HOME="$home/.rustup" CARGO_HOME="$home/.cargo" \
-		"$home/.cargo/bin/cargo" --version)
+	# PROVED AS THE RUNNER, with the environment a job has, because a toolchain
+	# only root can use is the failure this would otherwise hide.
+	local said cmd
+	for cmd in "cargo --version" "rustc --version" "rustfmt --version" "cargo clippy --version"; do
+		# shellcheck disable=SC2086 # the command and its argument are two words
+		said=$(billet_tc_run runuser -u runner -- env HOME="$home" \
+			PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" $cmd)
+	done
 
-	echo "languages: $said"
+	echo "languages: rust, $said"
 }
 
 # install_swift installs the Swift toolchain, verified against Swift's signing
@@ -3344,6 +3349,7 @@ install_hosted_languages() {
 	install_homebrew
 	install_nvm
 	install_hosted_path
+	billet_tc_reap_target
 }
 
 # billet_install_toolcache is the one entry point a caller invokes.
