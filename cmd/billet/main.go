@@ -148,6 +148,7 @@ func commands(lc *lifecycle) []command {
 		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
+		{"jobs", "show which GitHub job a lease ran and what it did to the host", cmdJobs},
 		{"cache", "manage transparent Actions caching and install its conformance gate", cmdCache},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},

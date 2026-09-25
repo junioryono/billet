@@ -157,6 +157,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet leases held` | every lease whose compute is not confirmed gone |
 | `billet leases quarantined` | capacity held for compute nobody has accounted for |
 | `billet leases failures [--since 24h] [--limit 50]` | jobs GitHub did not report as succeeded on leases billet's infrastructure disrupted; billet re-runs nothing |
+| `billet jobs show <lease>` | which GitHub job the lease ran (repository, workflow ref, job name, event, GitHub's job id) and, with `node.monitoring`, what the host measured it do: CPU with the guest and VMM split, peak memory, disk and network bytes, pressure stalls and package energy. A group the host could not read says `not measured` |
 | `billet leases release <lease> --force` | hand capacity back on your assertion that its compute is gone (`--force` required) |
 | `billet drain [--reason] [--wait] [--timeout] [--without-compute-proof]` | seal admission and, with `--wait`, wait for the ledger and then every host to prove nothing is running. Exit 2: still draining or interrupted; the seal remains |
 | `billet resume` | open admission again |
