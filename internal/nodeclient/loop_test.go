@@ -478,6 +478,7 @@ func TestLaunchPreservesTheAuthenticatedRepositoryScope(t *testing.T) {
 		Owner:       "acme",
 		Repository:  "api",
 		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		JobID:       "51001",
 	}
 	if err := p.NewRunner().Launch(t.Context(), lease, want); err != nil {
 		t.Fatalf("Launch: %v", err)

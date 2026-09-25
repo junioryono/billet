@@ -244,6 +244,15 @@ type Job struct {
 	Owner       string
 	Repository  string
 	WorkflowRef string
+	// JobName is the job's display name, kept for people to read and never
+	// consulted for a decision.
+	JobName string
+}
+
+// historyJob is what a message said about its job, as job_history keeps it.
+func (j Job) historyJob() alloc.HistoryJob {
+	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
+		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -3864,6 +3873,7 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 		}
 		return Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
+	l.recordJobIdentity(ctx, leaseID, job)
 	return identified, nil
 }
 
@@ -4344,6 +4354,7 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
 		return nil, false, fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
+	l.recordJobIdentity(ctx, lease.ID, job)
 
 	// Moved into running only AFTER the assignment is durable. Consuming it first
 	// meant a failed Assign left the lease open in the database and absent from
@@ -4796,6 +4807,20 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 			"infrastructure was disrupted while its lease could still have been "+
 			"running it",
 			"tier", l.tier, "request", job.RequestID, "lease", leaseID, "error", err)
+	}
+	l.recordJobIdentity(ctx, leaseID, job)
+}
+
+// recordJobIdentity writes which job a lease ran onto its history row. It is a
+// diagnostic: a failure is logged and never changes what the caller does.
+func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job Job) {
+	if l.alloc == nil {
+		return
+	}
+	if err := l.alloc.RecordJobIdentity(ctx, leaseID, job.historyJob()); err != nil {
+		l.log.Warn("could not record which github job a lease ran; its history row "+
+			"will not name the repository, workflow or job",
+			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)
 	}
 }
 

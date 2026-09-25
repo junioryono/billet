@@ -337,6 +337,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			Owner:       j.OwnerName,
 			Repository:  j.RepositoryName,
 			WorkflowRef: j.JobWorkflowRef,
+			JobName:     j.JobDisplayName,
 		})
 	}
 
@@ -353,6 +354,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			Owner:       j.OwnerName,
 			Repository:  j.RepositoryName,
 			WorkflowRef: j.JobWorkflowRef,
+			JobName:     j.JobDisplayName,
 		})
 	}
 
@@ -371,6 +373,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			Owner:       j.OwnerName,
 			Repository:  j.RepositoryName,
 			WorkflowRef: j.JobWorkflowRef,
+			JobName:     j.JobDisplayName,
 		})
 	}
 
@@ -387,6 +390,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			Owner:       j.OwnerName,
 			Repository:  j.RepositoryName,
 			WorkflowRef: j.JobWorkflowRef,
+			JobName:     j.JobDisplayName,
 			Result:      j.Result,
 			RunnerID:    int64(j.RunnerID),
 			RunnerName:  j.RunnerName,

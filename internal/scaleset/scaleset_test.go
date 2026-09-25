@@ -69,6 +69,7 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 				RunnerRequestID: 111,
 				WorkflowRunID:   222,
 				JobID:           "assigned-guid",
+				JobDisplayName:  "build",
 				OwnerName:       "acme",
 				RepositoryName:  "api",
 				JobWorkflowRef:  "acme/api/.github/workflows/ci.yml@refs/heads/main",
@@ -80,6 +81,7 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 				RunnerRequestID: 555,
 				WorkflowRunID:   556,
 				JobID:           "started-guid",
+				JobDisplayName:  "test (ubuntu)",
 				OwnerName:       "acme",
 				RepositoryName:  "api",
 				JobWorkflowRef:  "acme/api/.github/workflows/ci.yml@refs/heads/main",
@@ -90,6 +92,7 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 				RunnerRequestID: 333,
 				WorkflowRunID:   444,
 				JobID:           "completed-guid",
+				JobDisplayName:  "lint",
 			}},
 		},
 	}
@@ -114,9 +117,15 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 		got.Assigned[0].WorkflowRef != "acme/api/.github/workflows/ci.yml@refs/heads/main" {
 		t.Errorf("assigned cache identity was lost: %+v", got.Assigned[0])
 	}
+	if got.Assigned[0].JobName != "build" {
+		t.Errorf("assigned JobName = %q, want build", got.Assigned[0].JobName)
+	}
 	if len(got.Started) != 1 || got.Started[0].RunnerID != 55 ||
 		got.Started[0].RunnerName != "billet-lease-55" || got.Started[0].RequestID != 555 {
 		t.Fatalf("started runner/job binding was lost: %+v", got.Started)
+	}
+	if got.Started[0].JobName != "test (ubuntu)" {
+		t.Errorf("started JobName = %q, want the message's display name", got.Started[0].JobName)
 	}
 
 	if len(got.Completed) != 1 {
@@ -134,6 +143,9 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 	}
 	if got.Completed[0].JobID != "completed-guid" {
 		t.Errorf("completed JobID = %q, want completed-guid", got.Completed[0].JobID)
+	}
+	if got.Completed[0].JobName != "lint" {
+		t.Errorf("completed JobName = %q, want lint", got.Completed[0].JobName)
 	}
 }
 

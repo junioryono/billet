@@ -143,6 +143,7 @@ type ReadOps interface {
 	ListCacheOutcomes(ctx context.Context, arg ledgerdb.ListCacheOutcomesParams) ([]ledgerdb.ListCacheOutcomesRow, error)
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
 	ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error)
+	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
 	ReadJobResult(ctx context.Context, leaseID string) (string, error)
 	ReadJobStarted(ctx context.Context, leaseID string) (bool, error)
 	ReadLease(ctx context.Context, id string) (ledgerdb.ReadLeaseRow, error)
@@ -248,6 +249,7 @@ type WriteOps interface {
 	RecordIssuedCert(ctx context.Context, arg ledgerdb.RecordIssuedCertParams) error
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
+	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
 	RecordJobRun(ctx context.Context, arg ledgerdb.RecordJobRunParams) error
 	RecordJobStart(ctx context.Context, arg ledgerdb.RecordJobStartParams) error
 	BackfillFailureReason(ctx context.Context, arg ledgerdb.BackfillFailureReasonParams) error
