@@ -2685,6 +2685,14 @@ install_hosted_packages() {
 		done
 	done
 
+	# UBUNTU'S CLOUD IMAGE IS WHAT GITHUB'S IMAGE STARTS FROM, and the guest starts
+	# from debootstrap's minbase, so the utilities a CI job reaches for without a
+	# thought (envsubst, add-apt-repository, lsb_release, uuidgen, gawk, column)
+	# are in GitHub's image and in nobody's declaration. The second group in the
+	# install below is the noble cloud image manifest (2026-09-25) minus the
+	# guest's installed set, cut to what a job would call: no kernel, boot,
+	# firmware or hardware packages.
+	#
 	# NOTHING STARTS IN A CHROOT. A package script that starts its daemon there
 	# leaves a process holding the filesystem the build must unmount, so service
 	# starts are refused for the transaction and anything left running inside the
@@ -2710,7 +2718,11 @@ apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
 	git git-ftp podman buildah skopeo \
 	mysql-client mysql-server libmysqlclient-dev \
 	apache2 nginx "postgresql-$pg" libpq-dev \
-	"$@" php-pear snmp bc
+	"$@" php-pear snmp \
+	bc gettext-base software-properties-common lsb-release uuid-runtime gawk \
+	bsdextrautils less lsof strace fdisk gdisk parted fuse3 cpio ed htop tcpdump \
+	apt-utils bash-completion vim nano mtr-tiny iputils-tracepath numactl kmod \
+	nftables distro-info eatmydata
 
 # PCOV IS INSTALLED AND OFF, XDEBUG ON, as GitHub documents.
 for v in /etc/php/*/; do

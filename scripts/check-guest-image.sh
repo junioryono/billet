@@ -337,6 +337,8 @@ HOSTED_TOOLS=(
 	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
 	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
 	/usr/sbin/nginx /usr/bin/az /usr/bin/gcloud /usr/bin/bc /usr/bin/go /usr/bin/gofmt
+	/usr/bin/envsubst /usr/bin/add-apt-repository /usr/bin/lsb_release /usr/bin/uuidgen
+	/usr/bin/gawk /usr/bin/column /usr/bin/lsof /usr/bin/strace
 )
 
 # image_resolve prints path as the image at $1 resolves it, following every
