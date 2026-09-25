@@ -218,7 +218,7 @@ func fakeSoftnet(t *testing.T, p *Provider, mode os.FileMode, uid uint32) {
 	t.Helper()
 
 	bin := filepath.Join(t.TempDir(), "softnet")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake softnet: %v", err)
 	}
 
@@ -333,7 +333,7 @@ func TestSoftnetRemediationQuotesThePath(t *testing.T) {
 	}
 
 	bin := filepath.Join(dir, "softnet")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -386,7 +386,7 @@ func TestSoftnetIsInspectedThroughItsSymlink(t *testing.T) {
 	target := filepath.Join(dir, "softnet-0.23.0")
 	link := filepath.Join(dir, "softnet")
 
-	if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake softnet: %v", err)
 	}
 
@@ -437,7 +437,7 @@ func softnetAnswering(t *testing.T, help string) string {
 
 	bin := filepath.Join(t.TempDir(), "softnet")
 	script := "#!/bin/sh\ncat <<'HELP'\n" + help + "\nHELP\n"
-	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake softnet: %v", err)
 	}
 

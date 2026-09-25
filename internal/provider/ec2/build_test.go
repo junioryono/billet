@@ -383,7 +383,7 @@ func TestTheJobStartHookReportsColdStartPhasesWithoutFailingTheJob(t *testing.T)
 
 	dir := t.TempDir()
 	date := filepath.Join(dir, "date")
-	if err := os.WriteFile(date, []byte("#!/bin/sh\nprintf '%s\\n' 3000000000\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(date, []byte("#!/bin/sh\nprintf '%s\\n' 3000000000\n"), 0o755); err != nil {
 		t.Fatalf("write fake date: %v", err)
 	}
 
@@ -1118,7 +1118,7 @@ func TestTheImageStoreAssertionsActuallyRefuse(t *testing.T) {
 			}
 			write := func(name, body string) {
 				t.Helper()
-				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+				if err := forkSafeWriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 					t.Fatalf("write %s: %v", name, err)
 				}
 			}

@@ -65,7 +65,7 @@ func psmoduleHarness(t *testing.T, dir, fake, decl string, timeoutS, tries int) 
 		"install_powershell_modules\n"
 
 	script := filepath.Join(dir, "run.sh")
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestAPowerShellModuleThatHangsIsStoppedAndNamed(t *testing.T) {
 		"trap '' TERM\n" +
 		"exec sleep 3600\n"
 
-	if err := os.WriteFile(fake, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(fake, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the fake pwsh: %v", err)
 	}
 
@@ -206,7 +206,7 @@ func TestAStalledModuleInstallIsRetried(t *testing.T) {
 		"if [ \"$n\" -le 2 ]; then trap '' TERM; exec sleep 3600; fi\n" +
 		"exit 0\n"
 
-	if err := os.WriteFile(fake, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(fake, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the fake pwsh: %v", err)
 	}
 
@@ -279,7 +279,7 @@ func TestAPowerShellModuleOverrideThatBreaksTheBoundIsRefused(t *testing.T) {
 				"install_powershell_modules\n"
 
 			script := filepath.Join(dir, "run.sh")
-			if err := os.WriteFile(script, []byte(harness), 0o700); err != nil {
+			if err := forkSafeWriteFile(script, []byte(harness), 0o700); err != nil {
 				t.Fatalf("write the harness: %v", err)
 			}
 

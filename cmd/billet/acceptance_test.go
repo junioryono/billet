@@ -755,7 +755,7 @@ func TestAServiceThatExitsImmediatelyIsCaughtAndOneThatDoesNotIsNot(t *testing.T
 	self := filepath.Join(dir, "fake-billet")
 
 	script := "#!/bin/sh\ncase \"$1\" in\n  server) exec sleep 30 ;;\n  node) exit 1 ;;\nesac\n"
-	if err := os.WriteFile(self, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(self, []byte(script), 0o755); err != nil {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 
@@ -799,7 +799,7 @@ func TestStoppingAServiceIsSafeHoweverManyTimesItHappens(t *testing.T) {
 	dir := t.TempDir()
 	self := filepath.Join(dir, "fake-billet")
 
-	if err := os.WriteFile(self, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(self, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 

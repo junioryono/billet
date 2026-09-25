@@ -213,7 +213,7 @@ func TestAConfigItCouldNotSearchIsNotAConfigWithoutModules(t *testing.T) {
 		"  case $a in *'=m$') echo 'grep: cannot read' >&2; exit 2 ;; esac\n" +
 		"done\nexec " + tool + " \"$@\"\n"
 
-	if err := os.WriteFile(filepath.Join(shims, "grep"), []byte(shim), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(shims, "grep"), []byte(shim), 0o700); err != nil {
 		t.Fatalf("write the grep shim: %v", err)
 	}
 
@@ -613,7 +613,7 @@ func stubChecker(t *testing.T, body string) []string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "check-config.sh")
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the stand-in checker: %v", err)
 	}
 
@@ -734,7 +734,7 @@ func TestTheCheckerThatRunsIsTheFileThatWasHashed(t *testing.T) {
 	// script it was handed, which needs no cooperation from anything else.
 	body := "#!/bin/sh\nprintf '%s' \"$0\" > " + shellQuote(ranFromAt) + "\nexit 0\n"
 
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the stand-in checker: %v", err)
 	}
 
@@ -763,7 +763,7 @@ func TestTheCheckerThatRunsIsTheFileThatWasHashed(t *testing.T) {
 			"printf '%s' \"$last\" > " + shellQuote(hashedAt) +
 			"\nexec " + shellQuote(tool) + " \"$@\"\n"
 
-		if err := os.WriteFile(filepath.Join(shims, name), []byte(shim), 0o700); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(shims, name), []byte(shim), 0o700); err != nil {
 			t.Fatalf("write the %s shim: %v", name, err)
 		}
 	}

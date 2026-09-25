@@ -75,7 +75,7 @@ func TestTheImageEnvironmentReachesTheJob(t *testing.T) {
 				"printf '%s\\n' \"${runner_env[@]}\"\n"
 
 			path := filepath.Join(dir, "run.sh")
-			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 				t.Fatalf("write the harness: %v", err)
 			}
 

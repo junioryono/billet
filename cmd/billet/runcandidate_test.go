@@ -49,7 +49,7 @@ func candidateScript(t *testing.T, listsHold bool, body string) {
 	path := filepath.Join(t.TempDir(), "billet")
 	script := "#!/bin/sh\n" + usageHandler(listsHold) + body + "\n"
 
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -420,7 +420,7 @@ func TestRunCandidateRefusesAProbeWhoseChildHoldsItsOutput(t *testing.T) {
 // the refusal names the question it could not answer.
 func TestRunCandidateRefusesACandidateWhoseUsageFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\necho 'no such command' >&2\nexit 2\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte("#!/bin/sh\necho 'no such command' >&2\nexit 2\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -466,7 +466,7 @@ func TestRunCandidateRefusesACandidateWhoseUsageLeavesAProcessOnItsOutput(t *tes
 	script := "#!/bin/sh\n" + usageHandlerThatAlso(true,
 		"  sleep 60 &\n  echo $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n") + "exit 0\n"
 
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -510,7 +510,7 @@ func TestRunCandidateCordonsWhenAFailedUsageLeavesAProcessOnItsOutput(t *testing
 	script := "#!/bin/sh\nif [ \"$2\" = -h ]; then\n  sleep 60 &\n" +
 		"  echo $! > \"$BILLET_TEST_GRANDCHILD_PIDFILE\"\n  echo 'no such command' >&2\n  exit 2\nfi\nexit 0\n"
 
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

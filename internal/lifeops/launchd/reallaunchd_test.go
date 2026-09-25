@@ -158,7 +158,7 @@ func writeAgent(t *testing.T, label, dir string, exitTimeout, drain int) string 
 		"trap term TERM\n" +
 		"while :; do sleep 1 & wait $!; done\n"
 
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the agent script: %v", err)
 	}
 

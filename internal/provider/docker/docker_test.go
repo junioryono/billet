@@ -247,7 +247,7 @@ func stubDocker(t *testing.T) (script, argvFile string) {
 	body := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + argvFile +
 		"\necho 0123456789abcdef0123456789abcdef\n"
 
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
 
@@ -276,7 +276,7 @@ func stubPrinting(t *testing.T, out string) string {
 	// A quoted heredoc, so nothing in the payload is expanded by the shell.
 	body := "#!/bin/sh\ncat <<'BILLET_EOF'\n" + out + "\nBILLET_EOF\n"
 
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
 

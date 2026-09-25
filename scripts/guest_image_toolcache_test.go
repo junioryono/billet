@@ -233,7 +233,7 @@ esac
 				guestImageFunction(t, "fetch_python_toolcache") + "\n" +
 				"manifest=$(<\"$MANIFEST\")\n" +
 				"fetch_python_toolcache \"$manifest\" \"$VERSION\" \"$OUT\"\n"
-			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 				t.Fatalf("write shell exercise: %v", err)
 			}
 

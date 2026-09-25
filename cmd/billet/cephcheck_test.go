@@ -179,7 +179,7 @@ func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
 	// and this test passes for the wrong reason.
 	script := "#!/bin/sh\necho 'rbd: listing images failed: (1) Operation not permitted' >&2\nexit 1\n"
 	for _, name := range []string{"rbd", "ceph"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
 			t.Fatalf("write the %s stub: %v", name, err)
 		}
 	}
@@ -231,7 +231,7 @@ func stubCluster(t *testing.T, minCompat string) {
 	}
 
 	for name, body := range scripts {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
 			t.Fatalf("write the %s stub: %v", name, err)
 		}
 	}

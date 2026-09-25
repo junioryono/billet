@@ -99,7 +99,7 @@ func TestTheImageGateFailsOnWhatTheCheckFinds(t *testing.T) {
 				"check_runner_home \"$1\" \"$2\" \"$3\"\necho \"FAILED=$FAILED\"\n"
 
 			path := filepath.Join(t.TempDir(), "gate.sh")
-			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
 
@@ -208,7 +208,7 @@ func runHomeOwnerCheck(t *testing.T, home string, uid, gid int) (string, int) {
 		"files_not_owned_by \"$1\" \"$2\" \"$3\"\nexit $?\n"
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

@@ -40,7 +40,7 @@ func buildRecordFixture(t *testing.T) recordFixture {
 	dir := t.TempDir()
 
 	binary := filepath.Join(dir, "billet")
-	if err := os.WriteFile(binary, []byte(archiveBody), 0o755); err != nil {
+	if err := forkSafeWriteFile(binary, []byte(archiveBody), 0o755); err != nil {
 		t.Fatalf("write the binary: %v", err)
 	}
 
@@ -283,7 +283,7 @@ func TestReleaseRecordRefusesABinaryTheArchiveDoesNotCarry(t *testing.T) {
 	f := buildRecordFixture(t)
 
 	// The archive and the manifest still agree; the binary is somebody else's.
-	if err := os.WriteFile(f.binary, []byte("a different build entirely"), 0o755); err != nil {
+	if err := forkSafeWriteFile(f.binary, []byte("a different build entirely"), 0o755); err != nil {
 		t.Fatalf("substitute the binary: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestReleaseRecordRefusesAnEmptyBinary(t *testing.T) {
 
 	repointManifest(t, f)
 
-	if err := os.WriteFile(f.binary, []byte{}, 0o755); err != nil {
+	if err := forkSafeWriteFile(f.binary, []byte{}, 0o755); err != nil {
 		t.Fatalf("empty the binary: %v", err)
 	}
 

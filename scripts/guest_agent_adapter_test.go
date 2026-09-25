@@ -228,7 +228,7 @@ func writeFakeServiceManagers(t *testing.T) string {
 			`if [ "$1" = start ]; then exit "${BILLET_FAKE_START_STATUS:-0}"; fi` + "\n" +
 			"exit 0\n",
 	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
 			t.Fatalf("write the fake %s: %v", name, err)
 		}
 	}

@@ -179,7 +179,7 @@ func runShell(t *testing.T, body string, args ...string) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

@@ -319,7 +319,7 @@ func buildSharedRunner() (string, error) {
 			return dir, err
 		}
 
-		if err := os.WriteFile(path, []byte(standInRunner), 0o700); err != nil {
+		if err := forkSafeWriteFile(path, []byte(standInRunner), 0o700); err != nil {
 			return dir, err
 		}
 	}
@@ -462,7 +462,7 @@ func TestAnUnverifiedRunnerTarballIsNeverInstalled(t *testing.T) {
 		t.Fatalf("create the payload dir: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(payload, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(payload, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write the payload runner: %v", err)
 	}
 
@@ -479,7 +479,7 @@ func TestAnUnverifiedRunnerTarballIsNeverInstalled(t *testing.T) {
 		"while [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then out=$2; shift; fi; shift; done\n" +
 		"cp " + shellSingleQuote(tarball) + " \"$out\"\n"
 
-	if err := os.WriteFile(filepath.Join(fakeBin, "curl"), []byte(curl), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fakeBin, "curl"), []byte(curl), 0o700); err != nil {
 		t.Fatalf("write the stand-in curl: %v", err)
 	}
 
@@ -723,7 +723,7 @@ func standInBin(t *testing.T, dir, name, body string) {
 		t.Fatalf("create the stand-in bin: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o700); err != nil {
 		t.Fatalf("write the stand-in %s: %v", name, err)
 	}
 }
@@ -1235,7 +1235,7 @@ func TestASuccessfulFetchLeavesOnlyWhatItVerified(t *testing.T) {
 		t.Fatalf("create the payload dir: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(payload, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(payload, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write the payload runner: %v", err)
 	}
 
@@ -1261,7 +1261,7 @@ func TestASuccessfulFetchLeavesOnlyWhatItVerified(t *testing.T) {
 	}
 
 	leftover := filepath.Join(stale, "bin", "left-by-the-previous-build")
-	if err := os.WriteFile(leftover, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(leftover, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write the leftover: %v", err)
 	}
 
@@ -1474,7 +1474,7 @@ func TestAFailedCleanupIsNotAnsweredForByTheStaleRunner(t *testing.T) {
 		t.Fatalf("stage the stale runner: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(stale, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(stale, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write the stale runner: %v", err)
 	}
 
@@ -1528,7 +1528,7 @@ func TestAFailedDownloadFailsEvenWithAStaleRunnerPresent(t *testing.T) {
 		t.Fatalf("stage the stale runner: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(stale, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(stale, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write the stale runner: %v", err)
 	}
 
