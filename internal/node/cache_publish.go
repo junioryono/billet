@@ -230,10 +230,7 @@ func pendingPublication(attachment *cacheAttachment) bool {
 func (s *CacheService) sessionKindAllowed(ctx context.Context, session *cacheSession,
 	kind config.CacheKind,
 ) bool {
-	owner, repository := session.owner, session.repository
-	if session.cache != nil && session.cache.Owner != "" {
-		owner, repository = session.cache.Owner, session.cache.Repository
-	}
+	owner, repository := session.cacheOwner(), session.cacheRepository()
 	if owner == "" {
 		return true
 	}
@@ -337,22 +334,30 @@ func (s *CacheService) SettleCompleted(
 		return nil
 	}
 
-	switch sessionPolicy(session) {
-	case config.CachePublishTrustedOnly:
-		return s.SettleDocker(ctx, instance, succeeded)
-	case config.CachePublishOff:
+	if !publicationAllowed(session, succeeded, authority) {
 		return nil
 	}
-
-	if !succeeded || !authorisesPublication(session, authority) {
-		return nil
-	}
-
 	intent := &publishIntent{LeaseID: authority.LeaseID, JobID: authority.JobID,
 		RunID: authority.RunID, At: s.now()}
 
 	if err := lockCacheSession(ctx, session); err != nil {
 		return err
+	}
+	// THE CONTENT-ADDRESSED CACHES PUBLISH UNDER EITHER POLICY, always from the
+	// cache loop after the compute is gone.
+	for _, hv := range session.hosts {
+		if hv.Dirty {
+			hv.Intent = intent
+		}
+	}
+	if sessionPolicy(session) == config.CachePublishTrustedOnly {
+		err := s.persistSession(session)
+		session.mu.Unlock()
+		if err != nil {
+			return err
+		}
+
+		return s.SettleDocker(ctx, instance, succeeded)
 	}
 	for _, attachment := range session.slots {
 		if attachment != nil && !attachment.Docker && attachment.Deferred && attachment.Ready {

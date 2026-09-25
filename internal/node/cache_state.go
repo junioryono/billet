@@ -64,6 +64,7 @@ type durableCacheSession struct {
 	Closed      bool                                  `json:"closed"`
 	Slots       [provider.MaxVolumes]*cacheAttachment `json:"slots"`
 	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
+	Hosts       map[config.CacheKind]*hostVolume      `json:"hosts,omitempty"`
 	Receipts    map[string]*actionsReceipt            `json:"actions_receipts,omitempty"`
 }
 
@@ -109,6 +110,11 @@ func (s *CacheService) loadSessions() error {
 			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 			actions:  record.Actions,
 			receipts: record.Receipts,
+			hosts:    record.Hosts,
+			casAdmit: make(chan struct{}, casConcurrency),
+		}
+		if session.hosts == nil {
+			session.hosts = make(map[config.CacheKind]*hostVolume)
 		}
 		session.closing.Store(record.Closed)
 		if session.actions == nil {
@@ -184,7 +190,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 		LeaseID: session.leaseID, Epoch: session.epoch,
 		Observed: session.observed,
 		Closed:   session.closed, Slots: session.slots, Actions: session.actions,
-		Receipts: session.receipts,
+		Receipts: session.receipts, Hosts: session.hosts,
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {

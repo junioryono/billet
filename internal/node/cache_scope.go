@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 )
 
@@ -50,7 +51,8 @@ func sessionSetting(session *cacheSession, kind config.CacheKind) config.CacheSe
 func (s *CacheService) cacheKeyFor(session *cacheSession, kind config.CacheKind, arch,
 	rest string,
 ) string {
-	if sessionPolicy(session) != config.CachePublishDefaultBranch {
+	legacyKind := kind == config.CacheDocker || kind == config.CacheSticky
+	if legacyKind && sessionPolicy(session) != config.CachePublishDefaultBranch {
 		if kind == config.CacheDocker {
 			return s.qualifiedKey(dockerStoreKey + arch)
 		}
@@ -58,12 +60,18 @@ func (s *CacheService) cacheKeyFor(session *cacheSession, kind config.CacheKind,
 		return s.qualifiedKey(rest)
 	}
 
+	// THE CACHES THAT HAD NO KEYS BEFORE tiers[].cache ALWAYS LIVE UNDER THE
+	// SCOPED ROOT, whatever the policy, so none of them can be named by a guest.
+	// A trusted-only tier has no repository scope, and is keyed by its trust.
 	if arch == "" {
 		arch = "any"
 	}
+	owner, repository := "-", "-"
+	if session.cache != nil && session.cache.Owner != "" {
+		owner, repository = strings.ToLower(session.cache.Owner), strings.ToLower(session.cache.Repository)
+	}
 	key := s.namespace + scopedNamespaceSuffix + "/" + session.trust.String() + "/" +
-		strings.ToLower(session.cache.Owner) + "/" + strings.ToLower(session.cache.Repository) +
-		"/" + arch + "/" + string(kind)
+		owner + "/" + repository + "/" + arch + "/" + string(kind)
 	if rest != "" {
 		key += "/" + rest
 	}
@@ -75,6 +83,39 @@ func (s *CacheService) cacheKeyFor(session *cacheSession, kind config.CacheKind,
 // the job's proven ref rather than a static workflow.
 func defaultBranchScope(spec *config.CacheSpec) bool {
 	return spec != nil && spec.Publish.Effective() == config.CachePublishDefaultBranch
+}
+
+// cacheOwner and cacheRepository are the scope a session's kill switch is
+// asked about: the tier's cache scope, or the static interception scope.
+func (session *cacheSession) cacheOwner() string {
+	if session.cache != nil && session.cache.Owner != "" {
+		return session.cache.Owner
+	}
+
+	return session.owner
+}
+
+func (session *cacheSession) cacheRepository() string {
+	if session.cache != nil && session.cache.Repository != "" {
+		return session.cache.Repository
+	}
+
+	return session.repository
+}
+
+// publicationAllowed says whether a completed job's writes may be published
+// under its session's policy: a trusted pool's successful job under
+// trusted-only, a proven default-branch job under default-branch, never under
+// off.
+func publicationAllowed(session *cacheSession, succeeded bool, authority server.CacheAuthority) bool {
+	switch sessionPolicy(session) {
+	case config.CachePublishTrustedOnly:
+		return succeeded && session.trust == provider.TrustTrusted
+	case config.CachePublishDefaultBranch:
+		return succeeded && authorisesPublication(session, authority)
+	default:
+		return false
+	}
 }
 
 // validateSessionCache refuses a cache configuration a session cannot be

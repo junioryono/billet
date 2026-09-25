@@ -98,6 +98,10 @@ type cacheSession struct {
 	// never by mu, because it is asked for inside handlers that take mu.
 	authorityMu      sync.Mutex
 	actionsAuthority *server.CacheAuthority
+	// hosts are the content-addressed cache volumes the node mounted for this
+	// session, and casAdmit bounds their concurrent transfers.
+	hosts    map[config.CacheKind]*hostVolume
+	casAdmit chan struct{}
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -549,6 +553,8 @@ func (s *CacheService) PrepareScoped(
 			admit:    make(chan struct{}, 1),
 			actions:  make(map[string]*actionsArchive),
 			receipts: make(map[string]*actionsReceipt),
+			hosts:    make(map[config.CacheKind]*hostVolume),
+			casAdmit: make(chan struct{}, casConcurrency),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {
@@ -734,6 +740,14 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 				failures = append(failures, fmt.Errorf("%s slot %d: %w", session.instance, slot, err))
 			}
 		}
+		for kind, hv := range session.hosts {
+			if hv.Volume.Lease.ID == "" || (session.closed && hv.Intent == nil) {
+				continue
+			}
+			if err := s.store.RenewActive(ctx, hv.Volume, until); err != nil {
+				failures = append(failures, fmt.Errorf("%s %s cache: %w", session.instance, kind, err))
+			}
+		}
 		if !session.closed {
 			for id, archive := range session.actions {
 				if archive.Volume.Lease.ID == "" {
@@ -831,6 +845,19 @@ func (s *CacheService) cleanupSession(
 				session.instance, slot, err)
 		}
 	}
+	for kind, hv := range session.hosts {
+		done, err := s.releaseCASVolume(ctx, session, hv)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s cache: %w", kind, err))
+		}
+		if !done {
+			continue
+		}
+		delete(session.hosts, kind)
+		if err := s.persistSession(session); err != nil {
+			return fmt.Errorf("node: record released %s cache of %s: %w", kind, session.instance, err)
+		}
+	}
 	for id, archive := range session.actions {
 		if err := lockCacheMutex(ctx, &archive.mu); err != nil {
 			failures = append(failures, fmt.Errorf("actions cache %s wait for archive: %w", id, err))
@@ -885,6 +912,14 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	session, ok := s.authenticate(r)
 	if !ok {
 		http.Error(w, "unauthorised cache session", http.StatusUnauthorized)
+
+		return
+	}
+	// CONTENT-ADDRESSED TRANSFERS ARE MANY AND CONCURRENT, a build's worth at
+	// once, so they have their own bound rather than the one-at-a-time
+	// admission the volume API takes.
+	if strings.HasPrefix(r.URL.Path, casPathPrefix) {
+		s.serveCAS(w, r, session)
 
 		return
 	}

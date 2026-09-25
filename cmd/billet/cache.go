@@ -19,6 +19,14 @@ func cmdCache(ctx context.Context, args []string) error {
 		return cmdCacheStatus(ctx, args[1:])
 	}
 
+	// Run inside a guest by the go command and by bazel, never by a person.
+	if len(args) > 0 && args[0] == "gocacheprog" {
+		return cmdCacheGoCacheProg(ctx, args[1:])
+	}
+	if len(args) > 0 && args[0] == "credential-helper" {
+		return cmdCacheCredentialHelper(ctx, args[1:])
+	}
+
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
 		return errors.New("usage: billet cache <disable|enable|status|conformance> [flags]")
 	}
