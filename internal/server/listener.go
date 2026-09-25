@@ -1144,6 +1144,11 @@ func (l *Listener) Run(ctx context.Context) error {
 		endDrain        context.CancelFunc
 		poisonMessageID int64
 		poisonRefusals  int
+		// Polls that returned, the idle slots last judged, and the poll count
+		// when that set was first seen.
+		polled    int
+		idleSeen  map[int64]bool
+		idleSince int
 	)
 
 	defer func() {
@@ -1167,6 +1172,25 @@ func (l *Listener) Run(ctx context.Context) error {
 		if draining {
 			if l.drained() {
 				l.log.Info("everything running here has finished; stopping", "tier", l.tier)
+
+				return ctx.Err()
+			}
+
+			// A WHOLE POLL AFTER EVERY SLOT IN THE SET WAS FIRST SEEN IDLE, because a
+			// Started for one can be in the next message. A slot joining the set
+			// restarts the window; one leaving it does not.
+			idle := l.idleMembersOnly(pollCtx)
+
+			switch {
+			case idle == nil:
+				idleSeen = nil
+			case idleSeen == nil || !subsetOf(idle, idleSeen):
+				idleSeen, idleSince = idle, polled
+			case polled > idleSince:
+				l.log.Info("only pool runners that never started a job remain; stopping and "+
+					"leaving them registered, with their capacity charged, for the next "+
+					"control plane to adopt",
+					"tier", l.tier, "idle", len(idle))
 
 				return ctx.Err()
 			}
@@ -1298,6 +1322,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		l.reportCapacity(pollCtx, &advertised, "in flight")
 		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, advertised)
 		if err == nil || errors.Is(err, ErrNoMessage) {
+			polled++
 			l.reportCapacity(pollCtx, &advertised, "confirmed")
 		} else {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
@@ -1810,6 +1835,72 @@ func (l *Listener) drained() bool {
 	defer l.mu.Unlock()
 
 	return len(l.running) == 0
+}
+
+// idleMembersOnly is the launch ids of what this listener still runs when every
+// entry is an anonymous pool slot the ledger records as never having started a job,
+// and nil otherwise.
+//
+// Such a slot is not work the drain owes anyone, and leaving it registered and
+// charged is what a second signal does. A runner launched for an assigned job (one
+// with a runningJobs identity) is waited for until it completes. A read that fails
+// is "could not tell", which keeps the drain waiting.
+func (l *Listener) idleMembersOnly(ctx context.Context) map[int64]bool {
+	if l.alloc == nil {
+		return nil
+	}
+
+	l.mu.Lock()
+	remaining := make(map[int64]bool, len(l.running))
+	for id := range l.running {
+		if _, forJob := l.runningJobs[id]; forJob {
+			l.mu.Unlock()
+
+			return nil
+		}
+		remaining[id] = true
+	}
+	l.mu.Unlock()
+
+	if len(remaining) == 0 {
+		return nil
+	}
+
+	members, err := l.alloc.PoolRunners(ctx, l.tier)
+	if err != nil {
+		l.log.Warn("could not read the runner pool to judge the drain; still waiting",
+			"tier", l.tier, "error", err)
+
+		return nil
+	}
+
+	idle := make(map[int64]bool, len(remaining))
+	for _, member := range members {
+		if !remaining[member.LaunchRequestID] {
+			continue
+		}
+		if member.Status != alloc.PoolRunnerIdle || member.ActualRequestID != 0 {
+			return nil
+		}
+		idle[member.LaunchRequestID] = true
+	}
+
+	if len(idle) != len(remaining) {
+		return nil
+	}
+
+	return idle
+}
+
+// subsetOf reports whether every key of a is in b.
+func subsetOf(a, b map[int64]bool) bool {
+	for id := range a {
+		if !b[id] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // drainStartedAt is when this listener began draining, or the zero time.
