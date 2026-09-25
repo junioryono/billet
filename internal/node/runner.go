@@ -829,13 +829,16 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	return nil
 }
 
+// cleanupCache closes a stopped instance's cache session. Its volumes are
+// discarded by the cache service's own retry loop, never on this path.
 func (r *Runner) cleanupCache(ctx context.Context, instance string) {
 	if r.cache == nil {
 		return
 	}
 
-	if err := r.cache.Cleanup(ctx, instance); err != nil {
-		r.log.Warn("compute stopped but its cache clones could not all be discarded; cleanup will retry",
+	if err := r.cache.Close(ctx, instance); err != nil {
+		r.log.Warn("compute stopped but its cache session could not be closed; its volumes "+
+			"are discarded when the node next recovers",
 			"instance", instance, "error", err)
 	}
 }
@@ -1055,15 +1058,19 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (strayCleanup, e
 // destroyed here rather than left for the first sweep, because until they are
 // gone the host is over-committed by exactly their size.
 func (r *Runner) Recover(ctx context.Context) error {
-	r.retryClosedCache(ctx)
-
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list what is already running: %w", err)
 	}
+
+	// NOT A REASON TO REFUSE WORK. What this closes is storage whose compute the
+	// list just proved absent, and the compute accounting below does not depend
+	// on it; a node that refused work over it stopped the host for as long as its
+	// storage cluster refused `rbd rm`.
 	if r.cache != nil {
 		if err := r.cache.ReconcileInventory(ctx, instances); err != nil {
-			return fmt.Errorf("node: reconcile cache custody with provider inventory: %w", err)
+			r.log.Warn("could not close the cache sessions of compute that is gone; their "+
+				"volumes are discarded once they close", "error", err)
 		}
 	}
 
@@ -1310,8 +1317,6 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 // has not yet been written. It cannot race a starting job either — the list is
 // taken first, so anything in it predates the query that judges it.
 func (r *Runner) Sweep(ctx context.Context) error {
-	r.retryClosedCache(ctx)
-
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list running instances: %w", err)
@@ -1435,15 +1440,6 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-func (r *Runner) retryClosedCache(ctx context.Context) {
-	if r.cache == nil {
-		return
-	}
-	if err := r.cache.RetryClosed(ctx); err != nil {
-		r.log.Warn("cache cleanup from an earlier run is still incomplete", "error", err)
-	}
 }
 
 // reportInventory tells the control plane which leases this host is running.
