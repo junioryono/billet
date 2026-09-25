@@ -1877,13 +1877,20 @@ func (c *limitedConn) Close() error {
 	return err
 }
 
+// nodeCacheControl is what the node's cache service asks the control plane:
+// the kill switch, and what a job may publish. The node client is both.
+type nodeCacheControl interface {
+	node.ActionsPolicy
+	node.CacheAuthorityReader
+}
+
 // startNodeCache exposes the site's clone store to its managed guests.
 func startNodeCache(
 	ctx context.Context,
 	cfg *config.Config,
 	p provider.Provider,
 	deployment string,
-	cachePolicy node.ActionsPolicy,
+	cachePolicy nodeCacheControl,
 ) (*node.CacheService, func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, nil
@@ -1925,6 +1932,7 @@ func startNodeCache(
 		return nil, nil, err
 	}
 	service.SetActionsPolicy(cachePolicy)
+	service.SetAuthorityReader(cachePolicy)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)

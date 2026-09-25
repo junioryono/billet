@@ -298,7 +298,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
-	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
+	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnOrEndedLease(h.cacheAuthority))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
 	mux.HandleFunc("POST /v1/nodes/{node}/trusted-runner-group", h.forNewWork(h.validateTrustedRunnerGroup))
@@ -1940,25 +1940,35 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// cacheAuthority answers what a lease's job may do with a cache while it runs.
+// cacheAuthority answers what a lease's job may do with a cache.
 //
 // DECIDED HERE, BY THE ONE FUNCTION, from the binding the ledger holds and
 // GitHub's record read fresh, and narrowed to the tier's namespace. A lease with
 // no binding yet (JobStarted not processed) or evidence that cannot be read
 // answers the unproven authority, which writes nothing: the node splices to
 // GitHub and asks again on the next call.
+//
+// AN ENDED LEASE IS ANSWERED TOO, from its durable binding, because a deferred
+// publication re-checks its authority after the compute is gone, which is after
+// the lease ended.
 func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	leaseID := r.PathValue("lease")
-	lease, err := h.store.Lease(r.Context(), leaseID)
-	if err != nil {
-		writeStoreErr(w, err)
+	unproven := server.CacheAuthority{LeaseID: leaseID}
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		writeJSON(w, http.StatusOK, nodeapi.CacheAuthorityResponse{Authority: *nodeapiAuthority(unproven)})
 		return
 	}
-	if lease == nil {
-		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused, "the lease no longer exists")
+	binding, bindingErr := pool.PoolRunnerByLease(r.Context(), leaseID)
+	if bindingErr != nil && !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
+		writeStoreErr(w, bindingErr)
 		return
 	}
-	tier, ok := h.plane.tierFor(lease.Tier)
+	label := binding.Tier
+	if lease, err := h.store.Lease(r.Context(), leaseID); err == nil && lease != nil {
+		label = lease.Tier
+	}
+	tier, ok := h.plane.tierFor(label)
 	if !ok {
 		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, "the lease's tier is not in the catalogue")
 		return
@@ -1969,14 +1979,7 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 			Authority: *nodeapiAuthority(server.ScopedCacheAuthority(spec, a)),
 		})
 	}
-	unproven := server.CacheAuthority{LeaseID: leaseID}
-	pool, ok := h.store.(poolRunnerStore)
-	if spec.Publish != config.CachePublishDefaultBranch || !ok {
-		answer(unproven)
-		return
-	}
-	binding, err := pool.PoolRunnerByLease(r.Context(), leaseID)
-	if err != nil {
+	if spec.Publish != config.CachePublishDefaultBranch || bindingErr != nil {
 		answer(unproven)
 		return
 	}

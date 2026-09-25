@@ -449,7 +449,7 @@ func (r *Runner) Launch(
 		var credentials CacheCredentials
 		scope := CacheSessionScope{
 			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted,
-			LeaseID: lease.ID, Epoch: lease.Epoch,
+			LeaseID: lease.ID, Epoch: lease.Epoch, Cache: tier.Cache,
 		}
 		if tier.CacheScope != nil {
 			scope.Owner = tier.CacheScope.Owner
@@ -664,7 +664,7 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 			r.log.Info("settling a Docker image store from a completed job",
 				"request", requestID, "instance", instance, "result", result,
 				"succeeded", succeeded)
-			if err := r.cache.SettleDocker(ctx, instance, succeeded); err != nil {
+			if err := r.cache.SettleCompleted(ctx, instance, succeeded, authority); err != nil {
 				r.log.Warn("Docker image store was not published; compute teardown will discard it",
 					"request", requestID, "instance", instance, "result", result, "error", err)
 			}
