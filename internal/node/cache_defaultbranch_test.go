@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -45,20 +44,33 @@ func defaultBranchCache() *config.CacheSpec {
 }
 
 // scopedService is a cache service with one session scoped by spec, under a
-// lease its instance is named after, re-checking against authority.
+// lease its instance is named after, asking authority about its job.
 func scopedService(
 	t *testing.T, trust provider.TrustClass, spec *config.CacheSpec, authority *fakeAuthority,
 	storage storecontract.Store,
 ) (*CacheService, string, string) {
 	t.Helper()
 
-	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+	service, token, instance := scopedServiceIn(t, t.TempDir(), trust, spec, storage)
+	if authority != nil {
+		service.SetAuthorityReader(authority)
+	}
+
+	return service, token, instance
+}
+
+// scopedServiceIn is scopedService with its state in dir, so a test can start
+// another process on the same state.
+func scopedServiceIn(
+	t *testing.T, dir string, trust provider.TrustClass, spec *config.CacheSpec,
+	storage storecontract.Store,
+) (*CacheService, string, string) {
+	t.Helper()
+
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", dir,
 		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
-	}
-	if authority != nil {
-		service.SetAuthorityReader(authority)
 	}
 	instance := provider.InstanceName(scopedLease)
 	credentials, err := service.PrepareScoped(instance, CacheSessionScope{
@@ -131,15 +143,14 @@ func TestADefaultBranchSessionUsesItsOwnNamespace(t *testing.T) {
 }
 
 // A DEFAULT-BRANCH COMMIT WAITS FOR ITS JOB'S COMPLETION, and an authorised
-// completion publishes it after the compute is gone, once the re-check agrees.
-// The clone is consumed by the snapshot, so nothing is discarded.
+// completion publishes it after the compute is gone. The clone is consumed by
+// the snapshot, so nothing is discarded.
 func TestAnAuthorisedDefaultBranchWritePublishesAfterTheComputeIsGone(t *testing.T) {
 	t.Parallel()
 
 	storage := &fakeCacheStore{}
-	recheck := &fakeAuthority{authority: publishingAuthority()}
 	service, token, instance := scopedService(t, provider.TrustUntrusted, defaultBranchCache(),
-		recheck, storage)
+		nil, storage)
 
 	body := attachAndCommit(t, service, token)
 	if body["pending"] != true || body["published"] != false {
@@ -152,14 +163,23 @@ func TestAnAuthorisedDefaultBranchWritePublishesAfterTheComputeIsGone(t *testing
 
 	endSession(t, service, instance, publishingAuthority())
 
-	if storage.published != 1 || storage.discarded != 0 || recheck.asked == 0 {
-		t.Fatalf("publish/discard/re-checks = %d/%d/%d, want 1/0/>0", storage.published,
-			storage.discarded, recheck.asked)
+	if storage.published != 1 || storage.discarded != 0 {
+		t.Fatalf("publish/discard = %d/%d, want 1/0", storage.published, storage.discarded)
 	}
 }
 
+// killSwitch blocks every cache it is asked about, and counts.
+type killSwitch struct{ asked int }
+
+func (k *killSwitch) CacheAllowed(context.Context, config.CacheKind, string, string) (bool, error) {
+	k.asked++
+
+	return false, nil
+}
+
 // EVERY WAY A COMPLETION CAN FAIL TO AUTHORISE LEAVES THE WRITE UNPUBLISHED,
-// and the clone discarded with the session.
+// and the clone discarded with the session; so does a kill switch set after
+// the completion authorised it.
 func TestAnUnauthorisedDefaultBranchWriteIsDiscarded(t *testing.T) {
 	t.Parallel()
 
@@ -169,48 +189,52 @@ func TestAnUnauthorisedDefaultBranchWriteIsDiscarded(t *testing.T) {
 	otherRepository.Repository = "web"
 	pullRequest := publishingAuthority()
 	pullRequest.PublishDefault = false
-	withdrawn := &fakeAuthority{authority: server.CacheAuthority{LeaseID: scopedLease}}
-	unreadable := &fakeAuthority{err: errors.New("the plane is unreachable")}
 
 	for name, tc := range map[string]struct {
 		completion server.CacheAuthority
-		recheck    *fakeAuthority
+		blocked    bool
 	}{
 		"a pull request":                          {completion: pullRequest},
 		"an authority for another lease":          {completion: another},
 		"an authority for another repository":     {completion: otherRepository},
 		"the zero authority an older plane sends": {},
-		"a re-check that withdraws it":            {completion: publishingAuthority(), recheck: withdrawn},
-		"no control plane to re-check with":       {completion: publishingAuthority()},
-		"a re-check that cannot be read":          {completion: publishingAuthority(), recheck: unreadable},
+		"a kill switch set after the completion":  {completion: publishingAuthority(), blocked: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			storage := &fakeCacheStore{}
-			recheck := tc.recheck
-			if recheck == nil && name != "no control plane to re-check with" {
-				recheck = &fakeAuthority{authority: publishingAuthority()}
-			}
 			service, token, instance := scopedService(t, provider.TrustUntrusted,
-				defaultBranchCache(), recheck, storage)
+				defaultBranchCache(), nil, storage)
 			attachAndCommit(t, service, token)
-			endSession(t, service, instance, tc.completion)
-
-			if storage.published != 0 || storage.snapshots != 0 {
-				t.Fatalf("published %d, snapshotted %d", storage.published, storage.snapshots)
+			if err := service.SettleCompleted(t.Context(), instance, true, tc.completion); err != nil {
+				t.Fatalf("SettleCompleted: %v", err)
 			}
-			if name != "a re-check that cannot be read" && storage.discarded != 1 {
-				t.Errorf("discarded %d, want the clone discarded", storage.discarded)
+			blocker := &killSwitch{}
+			if tc.blocked {
+				service.SetCachePolicy(blocker)
+			}
+			if err := service.Close(t.Context(), instance); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			_ = service.RetryClosed(t.Context())
+
+			if storage.published != 0 || storage.snapshots != 0 || storage.discarded != 1 {
+				t.Fatalf("published %d, snapshotted %d, discarded %d; want only the discard",
+					storage.published, storage.snapshots, storage.discarded)
+			}
+			if tc.blocked && blocker.asked == 0 {
+				t.Error("the kill switch was never asked")
 			}
 		})
 	}
 }
 
-// A PUBLICATION A CRASH INTERRUPTED IS NEVER SNAPSHOTTED TWICE. A journal that
-// says the snapshot may have run is abandoned, because which candidate exists
-// cannot be told; one that says the pointer may have moved checks the pointer
-// before publishing again.
+// A PUBLICATION A CRASH INTERRUPTED IS NEVER SNAPSHOTTED TWICE, reconciled by
+// a fresh process from the journal on disk: a journal that says the snapshot
+// may have run is abandoned, because which candidate exists cannot be told;
+// one that says the pointer may have moved checks the pointer before
+// publishing again.
 func TestAnInterruptedPublicationIsReconciledFromItsJournal(t *testing.T) {
 	t.Parallel()
 
@@ -218,10 +242,11 @@ func TestAnInterruptedPublicationIsReconciledFromItsJournal(t *testing.T) {
 		journal       publishJournal
 		current       string
 		wantPublished int
-		wantSnapshots int
+		wantDiscarded int
 	}{
 		"interrupted inside the snapshot": {
-			journal: publishJournal{Phase: phaseSnapshotting},
+			journal:       publishJournal{Phase: phaseSnapshotting},
+			wantDiscarded: 1,
 		},
 		"interrupted after the pointer moved": {
 			journal: publishJournal{Phase: phasePublishing, Consumed: true,
@@ -238,15 +263,20 @@ func TestAnInterruptedPublicationIsReconciledFromItsJournal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			storage := &fakeCacheStore{current: tc.current}
-			recheck := &fakeAuthority{authority: publishingAuthority()}
-			service, token, instance := scopedService(t, provider.TrustUntrusted,
-				defaultBranchCache(), recheck, storage)
+			dir := t.TempDir()
+			first := &fakeCacheStore{current: tc.current}
+			service, token, instance := scopedServiceIn(t, dir, provider.TrustUntrusted,
+				defaultBranchCache(), first)
 			attachAndCommit(t, service, token)
 			if err := service.SettleCompleted(t.Context(), instance, true, publishingAuthority()); err != nil {
 				t.Fatalf("SettleCompleted: %v", err)
 			}
+			if err := service.Close(t.Context(), instance); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
 
+			// THE CRASH: the journal the dead process left, written as it would
+			// have been, and a new process reading it from disk.
 			session := service.sessionOf(instance)
 			session.mu.Lock()
 			session.slots[0].Journal = &tc.journal
@@ -256,16 +286,21 @@ func TestAnInterruptedPublicationIsReconciledFromItsJournal(t *testing.T) {
 			}
 			session.mu.Unlock()
 
-			if err := service.Close(t.Context(), instance); err != nil {
-				t.Fatalf("Close: %v", err)
+			after := &fakeCacheStore{current: tc.current}
+			restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", dir,
+				after, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("restart: %v", err)
 			}
-			_ = service.RetryClosed(t.Context())
+			_ = restarted.RetryClosed(t.Context())
 
-			if storage.snapshots != tc.wantSnapshots || storage.published != tc.wantPublished {
-				t.Fatalf("snapshots/publications = %d/%d, want %d/%d", storage.snapshots,
-					storage.published, tc.wantSnapshots, tc.wantPublished)
+			if after.snapshots != 0 || after.published != tc.wantPublished ||
+				after.discarded != tc.wantDiscarded {
+				t.Fatalf("snapshots/publications/discards = %d/%d/%d, want 0/%d/%d",
+					after.snapshots, after.published, after.discarded, tc.wantPublished,
+					tc.wantDiscarded)
 			}
-			if service.sessionOf(instance) != nil {
+			if restarted.sessionOf(instance) != nil {
 				t.Error("the session outlived a publication that had nothing left to do")
 			}
 		})

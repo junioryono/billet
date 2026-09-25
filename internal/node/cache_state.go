@@ -141,7 +141,7 @@ func (r durableCacheSession) valid(filename string) error {
 	if err := validateSessionCache(r.Cache); err != nil {
 		return fmt.Errorf("node: cache custody file %s: %w", filename, err)
 	}
-	if r.Intercept {
+	if r.Intercept && !defaultBranchScope(r.Cache) {
 		if err := validateActionsScope(CacheSessionScope{
 			Trust: r.Trust, Intercept: true, Owner: r.Owner, Repository: r.Repository,
 			WorkflowRef: r.WorkflowRef,

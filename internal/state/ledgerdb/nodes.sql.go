@@ -355,7 +355,7 @@ func (q *Queries) ListOutstandingRemoteShapes(ctx context.Context) ([]ListOutsta
 }
 
 const listPlaceableNodes = `-- name: ListPlaceableNodes :many
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name
@@ -368,6 +368,7 @@ type ListPlaceableNodesRow struct {
 	TotalVcpu   int64
 	TotalMemory int64
 	Ec2Shapes   string
+	WireVersion int64
 }
 
 // The hosts a lease may be placed on at all.
@@ -407,6 +408,7 @@ func (q *Queries) ListPlaceableNodes(ctx context.Context) ([]ListPlaceableNodesR
 			&i.TotalVcpu,
 			&i.TotalMemory,
 			&i.Ec2Shapes,
+			&i.WireVersion,
 		); err != nil {
 			return nil, err
 		}

@@ -32,8 +32,12 @@ func TestActionsLookupRefusesAnArchiveLinkOutsideTheVolume(t *testing.T) {
 	}
 	storage.current = "published"
 	service.actionIO = &linkedActionsVolume{fakeActionsVolumeManager: volumes, target: canary}
+	keys, disposition := service.actionsKeysFor(t.Context(), session)
+	if disposition != "" {
+		t.Fatalf("the trusted session was not served locally: %s", disposition)
+	}
 	response, err := service.findActionsCache(t.Context(),
-		strings.NewReader(`{"key":"key","version":"v1"}`), session, "")
+		strings.NewReader(`{"key":"key","version":"v1"}`), session, "", keys)
 	if response != nil {
 		response.Body.Close()
 	}

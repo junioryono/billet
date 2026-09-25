@@ -448,7 +448,7 @@ func (r *Runner) Launch(
 	if r.cache != nil {
 		var credentials CacheCredentials
 		scope := CacheSessionScope{
-			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted,
+			Trust: trust, Intercept: interceptsFor(tier, trust),
 			LeaseID: lease.ID, Epoch: lease.Epoch, Cache: tier.Cache,
 		}
 		if tier.CacheScope != nil {
@@ -1586,3 +1586,19 @@ func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, e
 // Job re-exports the listener's job identity so this package's signature matches
 // server.Runner without importing anything else from it at call sites.
 type Job = server.Job
+
+// interceptsFor says whether a launch's guest gets the Actions cache
+// interception: a trusted pool's legacy cache, or a default-branch tier's of
+// either trust, whose writes the job's proven ref decides.
+func interceptsFor(tier *nodeapi.TierSpec, trust provider.TrustClass) bool {
+	// EITHER SPELLING ENABLES IT: intercept is the deprecated name of
+	// cache.actions.enabled, and a spec carrying both says the same thing.
+	if !tier.Intercept && (tier.Cache == nil || !tier.Cache.Actions.Enabled) {
+		return false
+	}
+	if tier.Cache != nil && tier.Cache.Publish.Effective() == config.CachePublishDefaultBranch {
+		return true
+	}
+
+	return trust == provider.TrustTrusted
+}

@@ -3,6 +3,7 @@ package nodeplane
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,20 @@ import (
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
 )
+
+// waitForQueued waits for one command to be queued for a node, so a test that
+// changes the node's registration does so after dispatch.
+func waitForQueued(t *testing.T, p *Plane, name string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest(name) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("nothing was queued for %s", name)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
 
 func cacheConfiguredTier() config.Tier {
 	tier := testTier()
@@ -25,7 +40,7 @@ func cacheConfiguredTier() config.Tier {
 func TestACacheConfiguredTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	t.Parallel()
 
-	p := New(nil, deployment, time.Minute, WithTierCatalog([]config.Tier{cacheConfiguredTier()}),
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithTierCatalog([]config.Tier{cacheConfiguredTier()}),
 		WithRegistrar(&recordingRegistrar{}))
 	if _, err := p.Register(t.Context(), releasedNode()); err != nil {
 		t.Fatalf("register: %v", err)
@@ -42,12 +57,47 @@ func TestACacheConfiguredTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	}
 }
 
+// A PROCESS THAT RE-REGISTERS ON AN OLDER WIRE AFTER DISPATCH DOES NOT TAKE
+// THE LAUNCH: the check that chose the node is repeated when the command is
+// delivered, because a queued command outlives the registration it was
+// checked against.
+func TestAnOlderProcessCannotTakeACacheConfiguredLaunchQueuedForANewerOne(t *testing.T) {
+	t.Parallel()
+
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithTierCatalog([]config.Tier{cacheConfiguredTier()}),
+		WithRegistrar(&recordingRegistrar{}), WithCommandTimeout(5*time.Second))
+	current := releasedNode()
+	current.Version, current.MinVersion = nodeapi.Version, nodeapi.MinVersion
+	current.Incarnation = "new"
+	if _, err := p.Register(t.Context(), current); err != nil {
+		t.Fatalf("register the current process: %v", err)
+	}
+
+	launched := make(chan error, 1)
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+	waitForQueued(t, p, "n1")
+
+	older := releasedNode()
+	older.Incarnation = "old"
+	if _, err := p.Register(t.Context(), older); err != nil {
+		t.Fatalf("register the older process: %v", err)
+	}
+	if cmd, took, err := p.Poll(t.Context(), "n1", "old"); err == nil && took {
+		t.Fatalf("the older process took %s", cmd.Kind)
+	}
+	if err := <-launched; err == nil {
+		t.Fatal("the launch reported success though nothing took it")
+	}
+}
+
 // AND A NODE THAT CAN IS GIVEN THE TIER'S EFFECTIVE CACHE CONFIGURATION with the
 // launch, every default applied, so it needs no copy of the rules.
 func TestACurrentNodeReceivesTheTiersCacheConfiguration(t *testing.T) {
 	t.Parallel()
 
-	p := New(nil, deployment, time.Minute, WithTierCatalog([]config.Tier{cacheConfiguredTier()}),
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithTierCatalog([]config.Tier{cacheConfiguredTier()}),
 		WithCommandTimeout(5*time.Second))
 	register(t, p, "n1", config.ProviderDocker)
 

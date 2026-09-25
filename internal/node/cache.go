@@ -21,6 +21,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -92,6 +93,11 @@ type cacheSession struct {
 	leaseID  string
 	epoch    int64
 	observed cacheObserved
+	// actionsAuthority is the proven authority of a default-branch session's
+	// job, kept once the control plane has proved it. Guarded by authorityMu,
+	// never by mu, because it is asked for inside handlers that take mu.
+	authorityMu      sync.Mutex
+	actionsAuthority *server.CacheAuthority
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -502,7 +508,7 @@ func (s *CacheService) PrepareScoped(
 	if scope.Trust != provider.TrustTrusted && scope.Trust != provider.TrustUntrusted {
 		return CacheCredentials{}, errors.New("node: cannot give cache access to work with unknown trust")
 	}
-	if scope.Intercept {
+	if scope.Intercept && !defaultBranchScope(scope.Cache) {
 		if err := validateActionsScope(scope); err != nil {
 			return CacheCredentials{}, err
 		}

@@ -21,7 +21,14 @@ type nodeRow struct {
 	vcpu     int
 	memory   config.ByteSize
 	shapes   []config.EC2InstanceType
+	// wire is the protocol the host's registration settled on.
+	wire int
 }
+
+// CacheAuthorityWireVersion is the oldest wire a node can honour a tier's cache
+// block on, mirrored from nodeapi.VersionCacheAuthority (a test holds them
+// equal), because nodeapi imports this package.
+const CacheAuthorityWireVersion = 22
 
 // eligibleNodes lists the live hosts a tier could actually be placed on.
 //
@@ -74,6 +81,13 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 			continue
 		}
 
+		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK IS NOT A CANDIDATE, or
+		// placement would choose it again and again for a launch the plane then
+		// refuses to send, and newer hosts beside it would sit unused.
+		if n.wire < CacheAuthorityWireVersion && !t.EffectiveCache().IsLegacy() {
+			continue
+		}
+
 		out = append(out, n)
 	}
 
@@ -91,6 +105,7 @@ func nodeRowFrom(row *ledgerdb.ListPlaceableNodesRow) (nodeRow, error) {
 		site:     row.Site,
 		vcpu:     int(row.TotalVcpu),
 		memory:   config.ByteSize(row.TotalMemory),
+		wire:     int(row.WireVersion),
 	}
 
 	shapes, err := decodeRemoteShapes(n.provider, row.Ec2Shapes)

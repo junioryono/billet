@@ -23,9 +23,9 @@ type CacheAuthorityReader interface {
 	CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error)
 }
 
-// SetAuthorityReader installs where a deferred publication re-checks its
-// authority before it writes anything. Without one, nothing deferred publishes:
-// a permission that cannot be re-checked is one that cannot be told.
+// SetAuthorityReader installs where a default-branch session asks what its job
+// may do with the Actions cache while the job runs. Without one, every such
+// call goes to GitHub.
 func (s *CacheService) SetAuthorityReader(reader CacheAuthorityReader) { s.authority = reader }
 
 // publishIntent is a completion's authority for one attachment, recorded
@@ -102,9 +102,15 @@ func (s *CacheService) publishDeferred(
 	if !attachment.Ready || attachment.Intent == nil {
 		return abandon("the attachment was never proved ready to publish")
 	}
-	if time.Since(attachment.Intent.At) > publishWindow {
+	deadline := attachment.Intent.At.Add(publishWindow)
+	if !s.now().Before(deadline) {
 		return abandon("the publication did not complete within its window")
 	}
+	// EVERY STORAGE STEP BELOW IS BOUNDED BY THE WINDOW, a writer's wait
+	// included, so one contended key cannot hold the cache loop, and with it
+	// every other session's cleanup, past the point this publication is owed.
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 
 	// THE AUTHORITY IS ASKED AGAIN, NOW. The completion's grant was decided
 	// before the compute was destroyed; a default branch renamed, a permission
@@ -150,6 +156,15 @@ func (s *CacheService) publishDeferred(
 
 		return false, errors.Join(fmt.Errorf("acquire writer: %w", err), s.persistSession(session))
 	}
+	// ASKED AGAIN AFTER THE WAIT, which may have been long: a kill switch set
+	// while this pass waited for the writer stops it before the pointer moves.
+	if allowed, reason, _ := s.stillAuthorised(ctx, session, attachment); !allowed {
+		if err := s.releaseWriter(ctx, lease, fence); err != nil {
+			s.log.Warn("could not release a cache writer", "key", key, "error", err)
+		}
+
+		return abandon(reason)
+	}
 	journal.Phase = phasePublishing
 	if err := s.persistSession(session); err != nil {
 		return false, errors.Join(err, s.releaseWriter(ctx, lease, fence))
@@ -178,22 +193,19 @@ func (s *CacheService) publishDeferred(
 	return true, s.persistSession(session)
 }
 
-// stillAuthorised asks the control plane again whether the session's job may
-// publish, and checks the answer names the same job the completion did.
+// stillAuthorised asks the kill switch again before anything is written.
+//
+// THE AUTHORITY ITSELF IS NOT RE-DECIDED. The control plane decided it at the
+// job's completion, from GitHub's record of the run and the repository's
+// default branch read fresh, and the binding it was decided from is settled
+// and gone soon after. What can change between the completion and this pass
+// (seconds, at most publishWindow) and must stop a publication is an
+// operator's kill switch, which is asked here. A default branch renamed inside
+// that window is the accepted residual: the writes are those of a run GitHub
+// proved was on the then-default branch.
 func (s *CacheService) stillAuthorised(
 	ctx context.Context, session *cacheSession, attachment *cacheAttachment,
 ) (bool, string, error) {
-	if s.authority == nil {
-		return false, "no control plane to re-check the authority with", nil
-	}
-	authority, err := s.authority.CacheAuthority(ctx, session.leaseID)
-	if err != nil {
-		return false, "", fmt.Errorf("re-check the cache authority: %w", err)
-	}
-	if !authorisesPublication(session, authority) || authority.JobID != attachment.Intent.JobID ||
-		authority.RunID != attachment.Intent.RunID {
-		return false, "the control plane no longer authorises this publication", nil
-	}
 	if !s.kindAllowed(ctx, attachmentKind(attachment), session.cache.Owner, session.cache.Repository) {
 		return false, "the cache is disabled for this repository", nil
 	}
@@ -262,11 +274,18 @@ func (s *CacheService) cloneWithin(
 	if err != nil || size <= ceiling {
 		return volume, false, nil
 	}
+	// A CLONE THAT CANNOT BE DISCARDED IS KEPT AND USED, oversized, rather than
+	// dropped: nothing has recorded it yet, so returning without it would lose
+	// the only handle anything has on it.
+	if err := s.store.Discard(ctx, volume); err != nil {
+		s.log.Warn("could not discard a cache generation larger than its tier allows; using it",
+			"key", key, "generation", volume.Generation, "size", size, "ceiling", ceiling,
+			"error", err)
+
+		return volume, false, nil
+	}
 	s.log.Info("a cache generation is larger than its tier allows; starting cold",
 		"key", key, "generation", volume.Generation, "size", size, "ceiling", ceiling)
-	if err := s.store.Discard(ctx, volume); err != nil {
-		return storecontract.Volume{}, false, fmt.Errorf("discard an oversized clone: %w", err)
-	}
 
 	return storecontract.Volume{}, true, nil
 }

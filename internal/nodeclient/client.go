@@ -568,6 +568,9 @@ func (c *Client) CacheAllowed(
 ) (bool, error) {
 	query := url.Values{"owner": {owner}, "repository": {repository}}
 	if kind != config.CacheActions {
+		if c.WireVersion() == 0 {
+			return false, errUnregistered
+		}
 		if c.WireVersion() < nodeapi.VersionCacheAuthority {
 			return true, nil
 		}
@@ -647,11 +650,18 @@ func (c *Client) RecordCacheObservation(
 		}, nil)
 }
 
+// errUnregistered says the client has not negotiated a wire with the control
+// plane yet, so a version-dependent question cannot be answered, only retried.
+var errUnregistered = errors.New("nodeclient: not registered with the control plane yet")
+
 // CacheAuthority asks what a lease's running job may do with a cache.
 //
 // Below the version that serves it, the answer is the zero authority, which
 // writes nothing, without asking: an older control plane cannot decide one.
 func (c *Client) CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error) {
+	if c.WireVersion() == 0 {
+		return server.CacheAuthority{}, errUnregistered
+	}
 	if c.WireVersion() < nodeapi.VersionCacheAuthority {
 		return server.CacheAuthority{}, nil
 	}

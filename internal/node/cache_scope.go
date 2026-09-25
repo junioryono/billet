@@ -71,6 +71,12 @@ func (s *CacheService) cacheKeyFor(session *cacheSession, kind config.CacheKind,
 	return key
 }
 
+// defaultBranchScope reports whether a cache configuration scopes its caches by
+// the job's proven ref rather than a static workflow.
+func defaultBranchScope(spec *config.CacheSpec) bool {
+	return spec != nil && spec.Publish.Effective() == config.CachePublishDefaultBranch
+}
+
 // validateSessionCache refuses a cache configuration a session cannot be
 // scoped by: a default-branch namespace needs the repository it belongs to.
 func validateSessionCache(spec *config.CacheSpec) error {

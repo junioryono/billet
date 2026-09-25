@@ -103,6 +103,9 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 		done:             make(chan nodeapi.CommandResult, 1),
 		expectedProvider: selectedProvider,
 	}
+	if !tier.EffectiveCache().IsLegacy() {
+		pend.minWire = nodeapi.VersionCacheAuthority
+	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)
 	if err != nil {

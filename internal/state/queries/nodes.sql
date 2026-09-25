@@ -97,7 +97,7 @@ UPDATE nodes
 -- different questions (can this host be reached, and does anybody still expect
 -- it to serve), and the next path that sets liveness without going through
 -- registration must not silently start placing work on an excluded host.
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name;
