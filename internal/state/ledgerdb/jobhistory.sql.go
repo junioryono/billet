@@ -15,11 +15,12 @@ INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      queued_at, finished_at)
+      sticky_cache, git_cache, bazel_cache, go_cache, queued_at, finished_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7,
         $8, $9, $10, $11, $12, $13,
         $14, $15, $16, $17,
-        $18, $19, $20)
+        $18, $19, $20, $21, $22,
+        $23, $24)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -42,7 +43,15 @@ ON CONFLICT (lease_id) DO UPDATE SET
   cache_generation = CASE WHEN excluded.image_cache != ''
                           THEN excluded.cache_generation ELSE job_history.cache_generation END,
   actions_cache    = CASE WHEN excluded.actions_cache != ''
-                          THEN excluded.actions_cache ELSE job_history.actions_cache END
+                          THEN excluded.actions_cache ELSE job_history.actions_cache END,
+  sticky_cache     = CASE WHEN job_history.sticky_cache = ''
+                          THEN excluded.sticky_cache ELSE job_history.sticky_cache END,
+  git_cache        = CASE WHEN job_history.git_cache = ''
+                          THEN excluded.git_cache ELSE job_history.git_cache END,
+  bazel_cache      = CASE WHEN job_history.bazel_cache = ''
+                          THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
+  go_cache         = CASE WHEN job_history.go_cache = ''
+                          THEN excluded.go_cache ELSE job_history.go_cache END
 `
 
 type ArchiveJobHistoryParams struct {
@@ -64,6 +73,10 @@ type ArchiveJobHistoryParams struct {
 	ImageCache         string
 	CacheGeneration    string
 	ActionsCache       string
+	StickyCache        string
+	GitCache           string
+	BazelCache         string
+	GoCache            string
 	QueuedAt           string
 	FinishedAt         sql.NullString
 }
@@ -110,6 +123,10 @@ func (q *Queries) ArchiveJobHistory(ctx context.Context, arg ArchiveJobHistoryPa
 		arg.ImageCache,
 		arg.CacheGeneration,
 		arg.ActionsCache,
+		arg.StickyCache,
+		arg.GitCache,
+		arg.BazelCache,
+		arg.GoCache,
 		arg.QueuedAt,
 		arg.FinishedAt,
 	)
@@ -202,6 +219,66 @@ func (q *Queries) ListAttributedFailures(ctx context.Context, arg ListAttributed
 			&i.Disruption,
 			&i.DisruptedAt,
 			&i.ResultAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCacheOutcomes = `-- name: ListCacheOutcomes :many
+SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache
+  FROM job_history
+ WHERE assigned_at >= $1
+ ORDER BY assigned_at DESC
+ LIMIT CAST($2 AS BIGINT)
+`
+
+type ListCacheOutcomesParams struct {
+	Since   sql.NullString
+	MaxRows int64
+}
+
+type ListCacheOutcomesRow struct {
+	Tier         string
+	ImageCache   string
+	ActionsCache string
+	StickyCache  string
+	GitCache     string
+	BazelCache   string
+	GoCache      string
+}
+
+// What each cache did for the jobs assigned since a moment, one row per job.
+//
+// WINDOWED ON assigned_at, when the history row opens: the node reports the
+// build caches when a job's session ends, and a job whose lease is still being
+// torn down has already been served by its caches. Empty tokens are jobs whose
+// cache outcome was not observed, which a report counts as such.
+func (q *Queries) ListCacheOutcomes(ctx context.Context, arg ListCacheOutcomesParams) ([]ListCacheOutcomesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listCacheOutcomes, arg.Since, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCacheOutcomesRow
+	for rows.Next() {
+		var i ListCacheOutcomesRow
+		if err := rows.Scan(
+			&i.Tier,
+			&i.ImageCache,
+			&i.ActionsCache,
+			&i.StickyCache,
+			&i.GitCache,
+			&i.BazelCache,
+			&i.GoCache,
 		); err != nil {
 			return nil, err
 		}
@@ -375,7 +452,8 @@ func (q *Queries) ReadJobNode(ctx context.Context, leaseID string) (sql.NullStri
 
 const readJobPlacement = `-- name: ReadJobPlacement :one
 SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
-       image_cache, cache_generation, actions_cache
+       image_cache, cache_generation, actions_cache, sticky_cache, git_cache,
+       bazel_cache, go_cache
   FROM job_history WHERE lease_id = $1
 `
 
@@ -389,6 +467,10 @@ type ReadJobPlacementRow struct {
 	ImageCache         string
 	CacheGeneration    string
 	ActionsCache       string
+	StickyCache        string
+	GitCache           string
+	BazelCache         string
+	GoCache            string
 }
 
 // What one lease was charged for and what the cache did, from the row that
@@ -413,6 +495,10 @@ func (q *Queries) ReadJobPlacement(ctx context.Context, leaseID string) (ReadJob
 		&i.ImageCache,
 		&i.CacheGeneration,
 		&i.ActionsCache,
+		&i.StickyCache,
+		&i.GitCache,
+		&i.BazelCache,
+		&i.GoCache,
 	)
 	return i, err
 }

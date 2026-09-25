@@ -1498,6 +1498,10 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 		ImageCache:      alloc.ImageCache(req.ImageCache),
 		CacheGeneration: req.CacheGeneration,
 		ActionsCache:    alloc.ActionsCache(req.ActionsCache),
+		BuildCaches: alloc.BuildCaches{
+			Sticky: alloc.BuildCache(req.StickyCache), Git: alloc.BuildCache(req.GitCache),
+			Bazel: alloc.BuildCache(req.BazelCache), Go: alloc.BuildCache(req.GoCache),
+		},
 	}
 	if err := obs.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -175,6 +176,42 @@ func TestAGitCloneIsServedFromTheMirror(t *testing.T) {
 	}
 	if got, _ := git("-C", "second", "rev-parse", "HEAD"); strings.TrimSpace(got) != want {
 		t.Fatalf("the second clone is at %q, want %q", got, want)
+	}
+}
+
+// THE JOB THAT MADE A MIRROR REPORTS THE GIT CACHE COLD, and the next job it
+// serves reports it warm.
+func TestTheGitCacheIsReportedColdThenWarm(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, first := gitNode(t, upstream)
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+	second, err := service.PrepareScoped(provider.InstanceName("second-lease"), CacheSessionScope{
+		Trust: provider.TrustUntrusted, LeaseID: "second-lease", Epoch: 1, Cache: gitCache(),
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+
+	for i, token := range []string{first, second.Token} {
+		if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+			"https://github.com/acme/api.git", "c"); err != nil {
+			t.Fatalf("clone %d: %v\n%s", i, err, output)
+		}
+	}
+	for instance, want := range map[string]alloc.BuildCache{
+		provider.InstanceName(scopedLease):    alloc.BuildCacheCold,
+		provider.InstanceName("second-lease"): alloc.BuildCacheWarm,
+	} {
+		if err := service.Close(t.Context(), instance); err != nil {
+			t.Fatalf("Close %s: %v", instance, err)
+		}
+		calls := observer.recorded()
+		if got := calls[len(calls)-1].obs.Git; got != want {
+			t.Errorf("%s reported the git cache %q, want %q", instance, got, want)
+		}
 	}
 }
 

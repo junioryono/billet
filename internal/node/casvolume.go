@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node/reapi"
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -76,6 +77,10 @@ type hostVolume struct {
 	// allowedAt is when the kill switch last allowed this cache, under
 	// session.mu; a transfer asks again once it is older than casPolicyAge.
 	allowedAt time.Time
+	// used and hit say a transfer was admitted and an object was found, for
+	// what the session reports the cache did; atomics, for the lock order.
+	used atomic.Bool
+	hit  atomic.Bool
 }
 
 func (s *CacheService) casMountPath(session *cacheSession, kind config.CacheKind) string {
@@ -258,6 +263,7 @@ func (s *CacheService) openCASHandle(
 		return nil, reapi.ErrEnded
 	}
 	hv, err := s.casVolume(ctx, session, kind)
+	enabled := sessionSetting(session, kind).Enabled
 	if err == nil && s.now().Sub(hv.allowedAt) >= casPolicyAge {
 		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
 		// when it is attached, so disabling a cache stops a running job's use of
@@ -267,6 +273,12 @@ func (s *CacheService) openCASHandle(
 		} else {
 			hv.allowedAt = s.now()
 		}
+	}
+	switch {
+	case errors.Is(err, errCacheOff) && enabled:
+		noteBuildCache(session, kind, alloc.BuildCacheDisabled)
+	case err != nil && !errors.Is(err, errCacheOff):
+		noteBuildCache(session, kind, alloc.BuildCacheUnavailable)
 	}
 	session.mu.Unlock()
 	if errors.Is(err, errCacheOff) {
@@ -289,6 +301,7 @@ func (s *CacheService) openCASHandle(
 
 		return nil, reapi.ErrEnded
 	}
+	hv.used.Store(true)
 
 	return &casHandle{
 		s: s, session: session, hv: hv, root: s.casMountPath(session, kind),
@@ -326,6 +339,7 @@ func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
 
 		return nil, fs.ErrNotExist
 	}
+	h.hv.hit.Store(true)
 
 	return file, nil
 }

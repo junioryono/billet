@@ -113,6 +113,9 @@ type cacheSession struct {
 	pathID string
 	// gitAllowedAt is when the kill switch last allowed the git cache, under mu.
 	gitAllowedAt time.Time
+	// building is what each build cache did so far, under mu; reported when the
+	// session ends.
+	building map[config.CacheKind]alloc.BuildCache
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -195,6 +198,10 @@ type cacheObserved struct {
 	ImageCache      string `json:"image_cache,omitempty"`
 	CacheGeneration string `json:"cache_generation,omitempty"`
 	ActionsCache    string `json:"actions_cache,omitempty"`
+	StickyCache     string `json:"sticky_cache,omitempty"`
+	GitCache        string `json:"git_cache,omitempty"`
+	BazelCache      string `json:"bazel_cache,omitempty"`
+	GoCache         string `json:"go_cache,omitempty"`
 	// Reported says everything above has reached the control plane.
 	Reported bool `json:"reported,omitempty"`
 	// ActionsPending says the first CacheService call was dispatched and its
@@ -209,6 +216,10 @@ func (o cacheObserved) observation() alloc.CacheObservation {
 		ImageCache:      alloc.ImageCache(o.ImageCache),
 		CacheGeneration: o.CacheGeneration,
 		ActionsCache:    alloc.ActionsCache(o.ActionsCache),
+		BuildCaches: alloc.BuildCaches{
+			Sticky: alloc.BuildCache(o.StickyCache), Git: alloc.BuildCache(o.GitCache),
+			Bazel: alloc.BuildCache(o.BazelCache), Go: alloc.BuildCache(o.GoCache),
+		},
 	}
 }
 
@@ -324,6 +335,19 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		changed = true
 	}
 
+	for _, field := range []struct {
+		observed *string
+		outcome  alloc.BuildCache
+	}{
+		{&session.observed.StickyCache, obs.Sticky}, {&session.observed.GitCache, obs.Git},
+		{&session.observed.BazelCache, obs.Bazel}, {&session.observed.GoCache, obs.Go},
+	} {
+		if field.outcome != "" && *field.observed == "" {
+			*field.observed = string(field.outcome)
+			changed = true
+		}
+	}
+
 	if !changed {
 		return
 	}
@@ -430,6 +454,8 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 		}
 	}
 
+	obs.BuildCaches = settledBuildCaches(session)
+
 	if obs != (alloc.CacheObservation{}) {
 		s.observe(ctx, session, obs)
 
@@ -437,6 +463,55 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 	}
 
 	s.report(ctx, session)
+}
+
+// buildCacheRank orders what a build cache did by how much it says: a cache
+// that served one request warm was warm for the job, whatever else it did.
+var buildCacheRank = map[alloc.BuildCache]int{
+	alloc.BuildCacheWarm: 4, alloc.BuildCacheCold: 3, alloc.BuildCacheDisabled: 2,
+	alloc.BuildCacheUnavailable: 1,
+}
+
+// noteBuildCache records what a build cache did for the session, keeping the
+// most telling outcome so far. Called with session.mu held.
+func noteBuildCache(session *cacheSession, kind config.CacheKind, outcome alloc.BuildCache) {
+	if session.building == nil {
+		session.building = make(map[config.CacheKind]alloc.BuildCache)
+	}
+	if buildCacheRank[outcome] > buildCacheRank[session.building[kind]] {
+		session.building[kind] = outcome
+	}
+}
+
+// settledBuildCaches is what each build cache did over the session, reported
+// once, when it ends. Called with session.mu held.
+//
+// A CACHE THE TIER ENABLES AND NOTHING NOTED IS "unused" only for the process
+// that saw the whole session; one that recovered it from disk says nothing.
+func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
+	for kind, hv := range session.hosts {
+		switch {
+		case hv.hit.Load():
+			noteBuildCache(session, kind, alloc.BuildCacheWarm)
+		case hv.used.Load():
+			noteBuildCache(session, kind, alloc.BuildCacheCold)
+		}
+	}
+	outcome := func(kind config.CacheKind) alloc.BuildCache {
+		if noted := session.building[kind]; noted != "" {
+			return noted
+		}
+		if !session.recovered && sessionSetting(session, kind).Enabled {
+			return alloc.BuildCacheUnused
+		}
+
+		return ""
+	}
+
+	return alloc.BuildCaches{
+		Sticky: outcome(config.CacheSticky), Git: outcome(config.CacheGit),
+		Bazel: outcome(config.CacheBazel), Go: outcome(config.CacheGo),
+	}
 }
 
 // beginActionsCall marks a CacheService call as in flight, and endActionsCall
@@ -1362,7 +1437,13 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 	setting := sessionSetting(session, config.CacheSticky)
-	if !setting.Enabled || !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+	if !setting.Enabled {
+		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
+
+		return
+	}
+	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheDisabled)
 		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
 
 		return
@@ -1378,6 +1459,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	if err != nil {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheUnavailable)
 		s.log.Warn("cache volume is unavailable; the job can continue cold",
 			"instance", session.instance, "error", err)
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
@@ -1432,6 +1514,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	guestDevice := guestVolumeDevice(slot)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
 		guestDevice = locator.GuestVolumeDevice(slot, volume.Device)
+	}
+	if cold {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheCold)
+	} else {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheWarm)
 	}
 	writeCacheJSON(w, http.StatusCreated, map[string]any{
 		"slot": slot, "device": guestDevice, "generation": volume.Generation, "cold": cold,

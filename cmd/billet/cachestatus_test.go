@@ -4,10 +4,35 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
+
+// WHAT THE CACHES DID IS RENDERED PER TIER AND CACHE, a cache nothing observed
+// is left out, and a job whose outcome was not observed is counted as that.
+func TestCacheStatusRendersWhatTheCachesDid(t *testing.T) {
+	t.Parallel()
+
+	var out strings.Builder
+	printCacheOutcomes(&out, map[string]map[string]map[string]int{
+		"linux-8": {
+			"git":   {"warm": 3, "cold": 1, "": 1},
+			"bazel": {"": 5},
+		},
+	}, 5, 24*time.Hour)
+	text := out.String()
+	for _, want := range []string{"5 job(s) assigned in the last", "linux-8", "git",
+		"not observed 1, cold 1, warm 3"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the report lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "bazel") {
+		t.Errorf("a cache nothing observed was reported:\n%s", text)
+	}
+}
 
 // THE KILL SWITCH'S KINDS ARE THE CACHES CONFIG KNOWS, plus all, and nothing
 // else reaches the ledger.

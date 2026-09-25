@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
@@ -326,6 +327,76 @@ func TestAGRPCCallReachesTheBazelVolumeOfItsOwnSession(t *testing.T) {
 				t.Errorf("opening the volume = %v, want off=%v", opened, tc.off)
 			}
 		})
+	}
+}
+
+// WHAT EACH BUILD CACHE DID IS REPORTED WHEN THE SESSION ENDS: warm for one
+// that served something it already held, cold for one used and found empty,
+// unused for one the tier enabled and the guest never asked for, and nothing
+// for one the tier does not enable.
+func TestTheBuildCachesOutcomesAreReportedWhenTheSessionEnds(t *testing.T) {
+	t.Parallel()
+
+	enabled, disabled := true, false
+	spec := config.Tier{Cache: &config.TierCache{
+		Go:          &config.GoCache{Enabled: &enabled},
+		Bazel:       &config.CacheToggle{Enabled: &enabled},
+		Git:         &config.CacheToggle{Enabled: &enabled},
+		StickyDisks: &config.CacheToggle{Enabled: &disabled},
+	}}.EffectiveCache()
+	service, _, token, instance := casService(t, provider.TrustTrusted, &spec, &fakeCacheStore{})
+	observer := &recordingObserver{}
+	service.SetCacheObserver(observer)
+
+	if code := putObject(t, service, token, "go object"); code != http.StatusOK {
+		t.Fatalf("PUT go = %d", code)
+	}
+	if code := casRequest(t, service, token, http.MethodGet, "/v1/cas/go/cas/"+digestOf("go object"), "").Code; code != http.StatusOK {
+		t.Fatalf("GET go = %d", code)
+	}
+	if code := casRequest(t, service, token, http.MethodGet, "/v1/cas/bazel/cas/"+digestOf("absent"), "").Code; code != http.StatusNotFound {
+		t.Fatalf("GET bazel = %d", code)
+	}
+	if err := service.Close(t.Context(), instance); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	calls := observer.recorded()
+	if len(calls) == 0 {
+		t.Fatal("nothing was reported")
+	}
+	got := calls[len(calls)-1].obs.BuildCaches
+	want := alloc.BuildCaches{Go: alloc.BuildCacheWarm, Bazel: alloc.BuildCacheCold,
+		Git: alloc.BuildCacheUnused}
+	if got != want {
+		t.Fatalf("build caches reported %+v, want %+v", got, want)
+	}
+}
+
+// A STICKY DISK IS REPORTED COLD when its first attach found no generation, and
+// WARM when it cloned one.
+func TestAStickyDiskIsReportedColdOrWarm(t *testing.T) {
+	t.Parallel()
+
+	for want, current := range map[alloc.BuildCache]string{
+		alloc.BuildCacheCold: "", alloc.BuildCacheWarm: "baseline",
+	} {
+		legacy := config.Tier{}.EffectiveCache()
+		service, _, token, instance := casService(t, provider.TrustTrusted, &legacy,
+			&fakeCacheStore{current: current})
+		observer := &recordingObserver{}
+		service.SetCacheObserver(observer)
+		if got := cacheRequest(t, service, token, "/v1/volumes",
+			map[string]any{"key": "npm", "size_bytes": int64(1 << 30)}); got.Code != http.StatusCreated {
+			t.Fatalf("attach = %d %s", got.Code, got.Body.String())
+		}
+		if err := service.Close(t.Context(), instance); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		calls := observer.recorded()
+		if got := calls[len(calls)-1].obs.Sticky; got != want {
+			t.Errorf("a sticky disk over generation %q was reported %q, want %q", current, got, want)
+		}
 	}
 }
 

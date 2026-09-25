@@ -4,20 +4,28 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
 
-// cmdCacheStatus prints every tier's caches and every kill-switch block.
+// cmdCacheStatus prints every tier's caches, every kill-switch block, and what
+// each cache did for the jobs assigned recently.
 func cmdCacheStatus(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet cache status")
 	cfgPath := addConfigFlag(fs)
+	since := fs.Duration("since", 24*time.Hour, "how far back to count what the caches did")
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *since <= 0 {
+		return fmt.Errorf("--since must be positive, got %s", *since)
 	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -41,8 +49,62 @@ func cmdCacheStatus(ctx context.Context, args []string) error {
 		return err
 	}
 	printCacheBlocks(os.Stdout, blocks)
+	if err := db.Close(); err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+	counts, jobs, err := a.CacheOutcomes(ctx, time.Now().Add(-*since), cacheOutcomeRows)
+	if err != nil {
+		return err
+	}
+	printCacheOutcomes(os.Stdout, counts, jobs, *since)
 
 	return nil
+}
+
+// cacheOutcomeRows bounds the jobs one report reads.
+const cacheOutcomeRows = 100_000
+
+// cacheReportOrder is the order caches are reported in.
+var cacheReportOrder = []string{"image", "sticky", "actions", "git", "bazel", "go"}
+
+// printCacheOutcomes renders what each cache did per tier. A cache with no
+// observation for any of a tier's jobs is left out; within one that has some,
+// the jobs it was not observed for are counted as such, never as a miss.
+func printCacheOutcomes(w io.Writer, counts map[string]map[string]map[string]int, jobs int,
+	since time.Duration,
+) {
+	fmt.Fprintf(w, "\nwhat the caches did for the %d job(s) assigned in the last %s:\n", jobs,
+		shortDuration(since))
+	if jobs == 0 {
+		return
+	}
+	tiers := slices.Sorted(maps.Keys(counts))
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "TIER\tCACHE\tOUTCOMES")
+	for _, tier := range tiers {
+		for _, cache := range cacheReportOrder {
+			outcomes := counts[tier][cache]
+			if len(outcomes) == 0 || len(outcomes) == 1 && outcomes[""] > 0 {
+				continue
+			}
+			var parts []string
+			for _, outcome := range slices.Sorted(maps.Keys(outcomes)) {
+				name := outcome
+				if name == "" {
+					name = "not observed"
+				}
+				parts = append(parts, fmt.Sprintf("%s %d", name, outcomes[outcome]))
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", tier, cache, strings.Join(parts, ", "))
+		}
+	}
+	_ = tw.Flush()
 }
 
 // printTierCaches renders each tier's effective cache configuration, every

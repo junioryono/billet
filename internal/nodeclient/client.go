@@ -640,14 +640,23 @@ func (c *Client) RecordCacheObservation(
 	if c.WireVersion() < nodeapi.VersionCacheObservation {
 		return nil
 	}
+	request := nodeapi.CacheObservationRequest{
+		Epoch:           epoch,
+		ImageCache:      string(obs.ImageCache),
+		CacheGeneration: obs.CacheGeneration,
+		ActionsCache:    string(obs.ActionsCache),
+	}
+	// THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM, whose decoder would
+	// otherwise refuse the image and Actions halves along with them.
+	if c.WireVersion() >= nodeapi.VersionCacheAuthority {
+		request.StickyCache, request.GitCache = string(obs.Sticky), string(obs.Git)
+		request.BazelCache, request.GoCache = string(obs.Bazel), string(obs.Go)
+	}
+	if request == (nodeapi.CacheObservationRequest{Epoch: epoch}) {
+		return nil
+	}
 
-	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"),
-		nodeapi.CacheObservationRequest{
-			Epoch:           epoch,
-			ImageCache:      string(obs.ImageCache),
-			CacheGeneration: obs.CacheGeneration,
-			ActionsCache:    string(obs.ActionsCache),
-		}, nil)
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"), request, nil)
 }
 
 // errUnregistered says the client has not negotiated a wire with the control

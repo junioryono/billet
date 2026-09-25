@@ -135,11 +135,12 @@ INSERT INTO job_history
      (lease_id, tier, node, run_id, request_id, conclusion, failure_reason,
       disruption, disrupted_at, chosen_provider, instance_type, vcpu, memory, site,
       price_micros_per_hour, image_cache, cache_generation, actions_cache,
-      queued_at, finished_at)
+      sticky_cache, git_cache, bazel_cache, go_cache, queued_at, finished_at)
 VALUES (@lease_id, @tier, @node, @run_id, @request_id, @conclusion, @failure_reason,
         @disruption, @disrupted_at, @chosen_provider, @instance_type, @vcpu, @memory,
         @site, @price_micros_per_hour, @image_cache, @cache_generation,
-        @actions_cache, @queued_at, @finished_at)
+        @actions_cache, @sticky_cache, @git_cache, @bazel_cache, @go_cache,
+        @queued_at, @finished_at)
 ON CONFLICT (lease_id) DO UPDATE SET
   conclusion     = excluded.conclusion,
   failure_reason = excluded.failure_reason,
@@ -162,7 +163,15 @@ ON CONFLICT (lease_id) DO UPDATE SET
   cache_generation = CASE WHEN excluded.image_cache != ''
                           THEN excluded.cache_generation ELSE job_history.cache_generation END,
   actions_cache    = CASE WHEN excluded.actions_cache != ''
-                          THEN excluded.actions_cache ELSE job_history.actions_cache END;
+                          THEN excluded.actions_cache ELSE job_history.actions_cache END,
+  sticky_cache     = CASE WHEN job_history.sticky_cache = ''
+                          THEN excluded.sticky_cache ELSE job_history.sticky_cache END,
+  git_cache        = CASE WHEN job_history.git_cache = ''
+                          THEN excluded.git_cache ELSE job_history.git_cache END,
+  bazel_cache      = CASE WHEN job_history.bazel_cache = ''
+                          THEN excluded.bazel_cache ELSE job_history.bazel_cache END,
+  go_cache         = CASE WHEN job_history.go_cache = ''
+                          THEN excluded.go_cache ELSE job_history.go_cache END;
 
 -- name: ReadJobPlacement :one
 -- What one lease was charged for and what the cache did, from the row that
@@ -175,7 +184,8 @@ ON CONFLICT (lease_id) DO UPDATE SET
 -- does not recognise is a NEWER binary's observation, rendered verbatim rather
 -- than dropped.
 SELECT chosen_provider, instance_type, vcpu, memory, site, price_micros_per_hour,
-       image_cache, cache_generation, actions_cache
+       image_cache, cache_generation, actions_cache, sticky_cache, git_cache,
+       bazel_cache, go_cache
   FROM job_history WHERE lease_id = @lease_id;
 
 -- name: ListJobConclusionsForRequest :many
@@ -233,4 +243,17 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(finished_at, '') AS finished_at
   FROM job_history
  ORDER BY queued_at, lease_id
+ LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ListCacheOutcomes :many
+-- What each cache did for the jobs assigned since a moment, one row per job.
+--
+-- WINDOWED ON assigned_at, when the history row opens: the node reports the
+-- build caches when a job's session ends, and a job whose lease is still being
+-- torn down has already been served by its caches. Empty tokens are jobs whose
+-- cache outcome was not observed, which a report counts as such.
+SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, go_cache
+  FROM job_history
+ WHERE assigned_at >= @since
+ ORDER BY assigned_at DESC
  LIMIT CAST(@max_rows AS BIGINT);

@@ -479,7 +479,10 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	}
 
 	calls := observer.recorded()
-	if len(calls) != 1 || calls[0].obs != (alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused}) {
+	// Sticky disks are on for a session with no cache block, and were not asked for.
+	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused,
+		BuildCaches: alloc.BuildCaches{Sticky: alloc.BuildCacheUnused}}
+	if len(calls) != 1 || calls[0].obs != want {
 		t.Fatalf("settlement with a call in flight told the observer %+v, want the image half "+
 			"only", calls)
 	}
@@ -495,7 +498,8 @@ func TestSettlementLeavesAnInFlightActionsCallAlone(t *testing.T) {
 	}
 
 	calls = observer.recorded()
-	want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheSpliced}
+	want = alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheSpliced,
+		BuildCaches: alloc.BuildCaches{Sticky: alloc.BuildCacheUnused}}
 	if len(calls) != 2 || calls[1].obs != want {
 		t.Fatalf("the late outcome was reported as %+v, want %+v", calls, want)
 	}
@@ -711,7 +715,8 @@ func TestAnUntouchedSessionSettlesAsUnused(t *testing.T) {
 		}
 
 		calls := observer.recorded()
-		want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheOff}
+		want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheOff,
+			BuildCaches: alloc.BuildCaches{Sticky: alloc.BuildCacheUnused}}
 		if len(calls) != 1 || calls[0].obs != want {
 			t.Fatalf("observer was told %+v, want %+v", calls, want)
 		}
@@ -729,7 +734,8 @@ func TestAnUntouchedSessionSettlesAsUnused(t *testing.T) {
 		}
 
 		calls := observer.recorded()
-		want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheUnused}
+		want := alloc.CacheObservation{ImageCache: alloc.ImageCacheUnused, ActionsCache: alloc.ActionsCacheUnused,
+			BuildCaches: alloc.BuildCaches{Sticky: alloc.BuildCacheUnused}}
 		if len(calls) != 1 || calls[0].obs != want {
 			t.Fatalf("observer was told %+v, want %+v", calls, want)
 		}

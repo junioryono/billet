@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -112,7 +113,7 @@ func newGitProxy(root string) *gitProxy {
 		},
 		fullFraction: gitFullFraction,
 		mirrors:      make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
-		tooLarge:     make(map[string]time.Time),
+		tooLarge: make(map[string]time.Time),
 	}
 }
 
@@ -227,6 +228,8 @@ func (s *CacheService) gitAllowed(ctx context.Context, session *cacheSession) bo
 		return true
 	}
 	if !s.sessionKindAllowed(ctx, session, config.CacheGit) {
+		noteBuildCache(session, config.CacheGit, alloc.BuildCacheDisabled)
+
 		return false
 	}
 	session.gitAllowedAt = s.now()
@@ -352,8 +355,9 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	advertisement, err := s.refreshMirror(ctx, request, body)
+	advertisement, existed, err := s.refreshMirror(ctx, request, body)
 	s.git.remember(request, s.now(), err == nil)
+	s.noteGit(ctx, request.session, err, existed)
 	if err != nil {
 		s.log.Info("the git cache could not serve a repository; github.com serves it",
 			"repository", request.owner+"/"+request.repo, "error", err)
@@ -425,22 +429,42 @@ func advertisedRefs(body []byte) (map[string]string, string, error) {
 	return refs, head, nil
 }
 
+// noteGit records what the git cache did for one advertisement: served from a
+// mirror that already existed, served from one made for it, or not served.
+func (s *CacheService) noteGit(ctx context.Context, session *cacheSession, err error, existed bool) {
+	outcome := alloc.BuildCacheCold
+	switch {
+	case err != nil:
+		outcome = alloc.BuildCacheUnavailable
+	case existed:
+		outcome = alloc.BuildCacheWarm
+	}
+	if lockCacheSession(ctx, session) != nil {
+		return
+	}
+	noteBuildCache(session, config.CacheGit, outcome)
+	session.mu.Unlock()
+}
+
 // refreshMirror brings the repository's mirror to the refs upstream advertised,
-// fetching only when they differ, and returns the mirror's advertisement.
-func (s *CacheService) refreshMirror(ctx context.Context, request gitRequest, upstream []byte) ([]byte, error) {
+// fetching only when they differ, and returns the mirror's advertisement and
+// whether the mirror existed before this request.
+func (s *CacheService) refreshMirror(
+	ctx context.Context, request gitRequest, upstream []byte,
+) ([]byte, bool, error) {
 	key := request.key()
 	s.git.mu.Lock()
 	until := s.git.tooLarge[key]
 	s.git.mu.Unlock()
 	if s.now().Before(until) {
-		return nil, errors.New("the repository is larger than the tier's git cache")
+		return nil, false, errors.New("the repository is larger than the tier's git cache")
 	}
 	refs, head, err := advertisedRefs(upstream)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(refs) == 0 {
-		return nil, errors.New("upstream advertised no refs")
+		return nil, false, errors.New("upstream advertised no refs")
 	}
 
 	mirror := s.git.mirror(key)
@@ -450,11 +474,12 @@ func (s *CacheService) refreshMirror(ctx context.Context, request gitRequest, up
 
 	mirror.fetch.Lock()
 	current, err := s.mirrorRefs(ctx, path)
+	existed := err == nil && len(current) > 0
 	if err != nil || !sameRefs(current, refs) {
 		if full, statErr := filledAbove(s.git.root, s.git.fullFraction); statErr == nil && full {
 			mirror.fetch.Unlock()
 
-			return nil, errors.New("the git cache's filesystem is full")
+			return nil, false, errors.New("the git cache's filesystem is full")
 		}
 		err = s.fetchMirror(ctx, path, request)
 		if err == nil {
@@ -466,13 +491,15 @@ func (s *CacheService) refreshMirror(ctx context.Context, request gitRequest, up
 	}
 	mirror.fetch.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	now := s.now()
 	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
 
-	return s.runGit(ctx, path, nil, append(slices.Clone(uploadPackConfig),
+	advertisement, err := s.runGit(ctx, path, nil, append(slices.Clone(uploadPackConfig),
 		"upload-pack", "--stateless-rpc", "--advertise-refs", ".")...)
+
+	return advertisement, existed, err
 }
 
 func sameRefs(a, b map[string]string) bool {
