@@ -947,19 +947,27 @@ func (g *scriptedGitHub) answer(repo string, answer scriptedAnswer) {
 func advertise(t *testing.T, node *httptest.Server, token, repo string) {
 	t.Helper()
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+	if err := advertiseErr(t.Context(), node, token, repo); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// advertiseErr is advertise for a goroutine other than the test's.
+func advertiseErr(ctx context.Context, node *httptest.Server, token, repo string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		node.URL+"/v1/git/github.com/acme/"+repo+".git/info/refs?service=git-upload-pack", nil)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	req.SetBasicAuth(token, githubBasic)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+
+	return resp.Body.Close()
 }
 
 func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Server, string) {
@@ -1004,11 +1012,18 @@ func TestAFollowUpRefusalOutranksAnEarlierGrant(t *testing.T) {
 	service, github, node, token := scriptedNode(t)
 	arrived, gate := make(chan struct{}), make(chan struct{})
 	github.answer("a", scriptedAnswer{redirect: "b", arrived: arrived, gate: gate})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		advertise(t, node, token, "a")
-	}()
+	done := make(chan error, 1)
+	// RELEASED AND JOINED HOWEVER THE TEST ENDS, before either server closes: a
+	// held answer would otherwise block the upstream's Close forever.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	t.Cleanup(func() {
+		release()
+		if err := <-done; err != nil {
+			t.Errorf("the advertisement of a: %v", err)
+		}
+	})
+	go func() { done <- advertiseErr(t.Context(), node, token, "a") }()
 	<-arrived
 	advertise(t, node, token, "b")
 	b := gitRequest{session: service.byToken[token], owner: "acme", repo: "b", auth: gitAuth(githubBasic)}
@@ -1020,8 +1035,11 @@ func TestAFollowUpRefusalOutranksAnEarlierGrant(t *testing.T) {
 	}
 
 	github.answer("b", scriptedAnswer{status: http.StatusNotFound})
-	close(gate)
-	<-done
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("the advertisement of a: %v", err)
+	}
+	done <- nil
 	service.git.mu.Lock()
 	held := service.git.authorised[service.git.authorisationKey(b)]
 	service.git.mu.Unlock()

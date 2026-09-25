@@ -70,7 +70,9 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 		firstDone, secondDone := make(chan server.CacheAuthority, 1), make(chan server.CacheAuthority, 1)
 		defer func() {
 			close(release)
-			<-firstDone
+			if got := <-firstDone; got != first {
+				t.Errorf("the first job was answered %+v, want its own %+v", got, first)
+			}
 		}()
 		go func() {
 			firstDone <- memory.resolve("l1", alloc.PoolRunner{JobID: "job-1", RunID: 31}, now,
