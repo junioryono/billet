@@ -2168,14 +2168,14 @@ func codeBuildRegion(cfg *config.Config) string {
 func cmdTeardown(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet teardown")
 	cfgPath := addConfigFlag(fs)
-	tier := fs.String("tier", "", "delete this tier's scale set")
+	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
 	force := fs.Bool("force", false,
 		"delete even if the scale set's labels are not this tier's (requires --tier)")
 	group := fs.String("runner-group", "",
 		"the runner group to look in, for a --tier the config no longer declares")
 	targetName := fs.String("target", "",
-		"the target a --tier the config no longer declares belongs to (default: the only one)")
+		"the one target to act on for --tier (default: every target declaring it, or the only one)")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 
 	if err := parse(fs, args); err != nil {
@@ -2209,7 +2209,21 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			"scale set")
 	}
 
-	wanted, undeclared, err := teardownTargets(cfg.Tiers, *tier, *group, *force)
+	if *all && *targetName != "" {
+		return errors.New("--target scopes one --tier; --all walks every target")
+	}
+
+	// --target SCOPES THE NAME TO ONE TARGET. Several targets may declare one
+	// scale-set name, and one may have stopped declaring it while another still
+	// does; unscoped, the name matches the live set and the leftover stays.
+	candidates := cfg.Tiers
+	if *targetName != "" {
+		if candidates, err = tiersOnTarget(cfg, *targetName); err != nil {
+			return err
+		}
+	}
+
+	wanted, undeclared, err := teardownTargets(candidates, *tier, *group, *force)
 	if err != nil {
 		return err
 	}
@@ -2220,9 +2234,6 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	if undeclared {
 		fmt.Printf("%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
 			*tier, *cfgPath, groupOrDefault(*group))
-	} else if *targetName != "" {
-		return errors.New("--target names where to look for a --tier the config no longer " +
-			"declares; a declared tier's target comes from the config")
 	}
 
 	// EVERY TARGET IN CONFIG ORDER, each with its own client and its own
@@ -2290,17 +2301,17 @@ func teardownOnTarget(
 	for i := range wanted {
 		t := &wanted[i]
 
-		set, labels, err := client.Describe(ctx, t.Label, t.RunnerGroup)
+		set, labels, err := client.Describe(ctx, t.ScaleSetName(), t.RunnerGroup)
 		if err != nil {
 			return err
 		}
 
 		if set == nil {
-			fmt.Printf("  %-32s not present\n", t.Label)
+			fmt.Printf("  %-32s not present\n", t.ScaleSetName())
 
-			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
 				fmt.Printf("  %-32s billet could not forget it (%v); the control plane "+
-					"will keep reporting it\n", t.Label, err)
+					"will keep reporting it\n", t.ScaleSetName(), err)
 			}
 
 			continue
@@ -2308,7 +2319,7 @@ func teardownOnTarget(
 
 		present = append(present, *t)
 
-		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.Label, set.ID, set.Group, labels)
+		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.ScaleSetName(), set.ID, set.Group, labels)
 	}
 
 	if len(present) == 0 {
@@ -2328,7 +2339,7 @@ func teardownOnTarget(
 	for i := range present {
 		t := &present[i]
 
-		deleted, err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}, force)
+		deleted, err := client.DeleteScaleSet(ctx, t.ScaleSetName(), t.RunnerGroup, []string{t.ScaleSetName()}, force)
 		if err != nil {
 			return err
 		}
@@ -2339,14 +2350,14 @@ func teardownOnTarget(
 		// "deleted" walks away from an object that is still there.
 		if !deleted {
 			fmt.Printf("%s: nothing in runner group %q; if it was created under a different "+
-				"group it is still there\n", t.Label, groupOrDefault(t.RunnerGroup))
+				"group it is still there\n", t.ScaleSetName(), groupOrDefault(t.RunnerGroup))
 
 			continue
 		}
 
-		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
 			fmt.Printf("%s: deleted, but billet could not forget it had created it (%v); "+
-				"the control plane will keep reporting it until this is cleared\n", t.Label, err)
+				"the control plane will keep reporting it until this is cleared\n", t.ScaleSetName(), err)
 		}
 	}
 
@@ -2960,7 +2971,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(os.Stdout, t.Label, report, time.Now())
+			printTierCapacity(os.Stdout, tierDisplay(t), report, time.Now())
 		}
 	}
 
