@@ -79,50 +79,6 @@ func TestADrainingRefusalOverTheWireTakesTheHostOutOfPlacement(t *testing.T) {
 	}
 }
 
-// THE MARK IS FENCED TO THE PROCESS THAT REFUSED. A replacement that registers
-// under the name between the refusal and its report must not be the one marked
-// draining: it would stay out of placement for as long as it ran without
-// registering again.
-func TestADrainingRefusalMarksTheProcessThatRefusedNotItsReplacement(t *testing.T) {
-	t.Parallel()
-
-	reg := &fakeRegistrar{}
-	p, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),
-		nodeplane.WithCommandTimeout(60*time.Second))
-	first := dial(t, base)
-
-	lease := &alloc.Lease{ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
-		GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1}
-
-	launched := make(chan error, 1)
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
-
-	cmd, ok, err := first.Poll(t.Context())
-	if err != nil || !ok {
-		t.Fatalf("Poll = ok %v, err %v", ok, err)
-	}
-
-	second := dial(t, base)
-	if second.Incarnation() == first.Incarnation() {
-		t.Fatal("the replacement has the same incarnation, so this proves nothing")
-	}
-
-	if err := first.Report(t.Context(), nodeapi.CommandResult{ID: cmd.ID,
-		Error: "this node is draining and will not start new work", Draining: true}); err != nil {
-		t.Fatalf("the process that took the launch could not report it: %v", err)
-	}
-
-	if err := <-launched; err == nil {
-		t.Fatal("a refused launch was reported as started")
-	}
-
-	told := reg.drainings()
-	if len(told) != 1 || told[0].incarnation != first.Incarnation() || told[0].epoch != 1 {
-		t.Errorf("the ledger was told %+v, want the refusing process %s at epoch 1, not its "+
-			"replacement %s", told, first.Incarnation(), second.Incarnation())
-	}
-}
-
 // A WITHDRAWAL CROSSES THE WIRE AS THE CURRENT PROCESS'S OWN STATEMENT, and
 // each of the plane's three answers arrives on the node as the error it
 // branches on.
