@@ -349,9 +349,6 @@ func (s *CacheService) SettleCompleted(
 	// THE CONTENT-ADDRESSED CACHES PUBLISH UNDER EITHER POLICY, always from the
 	// cache loop after the compute is gone.
 	for _, hv := range session.hosts {
-		if hv.written.Load() {
-			hv.Dirty = true
-		}
 		if hv.Dirty {
 			hv.Intent = intent
 		}

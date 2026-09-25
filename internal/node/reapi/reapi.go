@@ -60,8 +60,9 @@ type Volume interface {
 	Close()
 }
 
-// Opener admits one call and gives it its session's volume.
-type Opener func(ctx context.Context) (Volume, error)
+// Opener admits one call and gives it its session's volume. write says the call
+// may store something, which the node records before the first byte lands.
+type Opener func(ctx context.Context, write bool) (Volume, error)
 
 const (
 	// maxBatch bounds a batch call's payload: gRPC's default message ceiling
@@ -233,7 +234,7 @@ func (s *service) FindMissingBlobs(
 			return nil, err
 		}
 	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, false)
 	if err != nil {
 		return nil, code(err)
 	}
@@ -270,7 +271,7 @@ func (s *service) BatchUpdateBlobs(
 		return nil, status.Errorf(codes.InvalidArgument, "a batch of %d bytes is larger than %d",
 			total, maxBatch)
 	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, true)
 	if err != nil {
 		return nil, code(err)
 	}
@@ -302,18 +303,19 @@ func (s *service) BatchReadBlobs(
 	if err := checkFunction(req.GetDigestFunction()); err != nil {
 		return nil, err
 	}
+	// CHECKED ONE DIGEST AT A TIME, so sizes a client chose cannot overflow the
+	// total past the bound it exists to hold.
 	var total int64
 	for _, d := range req.GetDigests() {
 		if err := checkDigest(d); err != nil {
 			return nil, err
 		}
+		if d.GetSizeBytes() > maxBatch-total {
+			return nil, status.Errorf(codes.InvalidArgument, "a batch larger than %d bytes", maxBatch)
+		}
 		total += d.GetSizeBytes()
 	}
-	if total > maxBatch {
-		return nil, status.Errorf(codes.InvalidArgument, "a batch of %d bytes is larger than %d",
-			total, maxBatch)
-	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, false)
 	if err != nil {
 		return nil, code(err)
 	}
@@ -344,7 +346,7 @@ func (s *service) GetActionResult(
 	if err := checkDigest(req.GetActionDigest()); err != nil {
 		return nil, err
 	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, false)
 	if err != nil {
 		return nil, code(err)
 	}
@@ -364,6 +366,13 @@ func (s *service) GetActionResult(
 	}
 	for _, dir := range result.GetOutputDirectories() {
 		referenced = append(referenced, dir.GetTreeDigest())
+		// AND EVERY FILE THE TREE NAMES: a tree that is present says nothing
+		// about the outputs inside it.
+		files, err := treeFiles(v, dir.GetTreeDigest())
+		if err != nil {
+			return nil, status.Error(codes.NotFound, "not found")
+		}
+		referenced = append(referenced, files...)
 	}
 	for _, d := range referenced {
 		if d == nil {
@@ -401,7 +410,7 @@ func (s *service) UpdateActionResult(
 		return nil, status.Errorf(codes.InvalidArgument, "an action result of %d bytes is larger than %d",
 			len(body), resultLimit)
 	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, true)
 	if err != nil {
 		return nil, code(err)
 	}
@@ -411,6 +420,36 @@ func (s *service) UpdateActionResult(
 	}
 
 	return req.GetActionResult(), nil
+}
+
+// treeLimit bounds one output directory's Tree, which names every file under
+// it.
+const treeLimit = 64 << 20
+
+// treeFiles is every file digest a stored Tree names.
+func treeFiles(v Volume, d *repb.Digest) ([]*repb.Digest, error) {
+	if err := checkDigest(d); err != nil {
+		return nil, err
+	}
+	if d.GetSizeBytes() > treeLimit {
+		return nil, fmt.Errorf("a tree of %d bytes is larger than %d", d.GetSizeBytes(), treeLimit)
+	}
+	body, err := read(v, TableCAS, d.GetHash(), d.GetSizeBytes())
+	if err != nil {
+		return nil, err
+	}
+	tree := &repb.Tree{}
+	if err := proto.Unmarshal(body, tree); err != nil {
+		return nil, err
+	}
+	var files []*repb.Digest
+	for _, dir := range append([]*repb.Directory{tree.GetRoot()}, tree.GetChildren()...) {
+		for _, file := range dir.GetFiles() {
+			files = append(files, file.GetDigest())
+		}
+	}
+
+	return files, nil
 }
 
 // blobName reads `[{instance}/]blobs/{hash}/{size}` out of a ByteStream
@@ -456,7 +495,7 @@ func (s *service) Read(req *bspb.ReadRequest, stream bspb.ByteStream_ReadServer)
 
 		return nil
 	}
-	v, err := s.open(stream.Context())
+	v, err := s.open(stream.Context(), false)
 	if err != nil {
 		return code(err)
 	}
@@ -504,7 +543,7 @@ func (s *service) Write(stream bspb.ByteStream_WriteServer) error {
 	if err != nil {
 		return err
 	}
-	v, err := s.open(stream.Context())
+	v, err := s.open(stream.Context(), true)
 	if err != nil {
 		return code(err)
 	}
@@ -554,9 +593,16 @@ func (s *service) Write(stream bspb.ByteStream_WriteServer) error {
 			return err
 		}
 	}
+	// A DIGEST IS ITS HASH AND ITS SIZE: an upload of the right bytes under a
+	// wrong size is refused, not stored and reported committed. Checked before
+	// the stream is closed, which is what lets the store finish.
+	if offset != d.GetSizeBytes() {
+		_ = writer.CloseWithError(ErrMismatch)
+		<-stored
+
+		return status.Error(codes.InvalidArgument, "the upload is not the blob's size")
+	}
 	_ = writer.Close()
-	// FEWER BYTES THAN THE DIGEST'S SIZE CANNOT HASH TO IT, so the volume's own
-	// verification refuses a short upload.
 	if err := <-stored; err != nil {
 		return code(err)
 	}
@@ -573,7 +619,7 @@ func (s *service) QueryWriteStatus(
 	if err != nil {
 		return nil, err
 	}
-	v, err := s.open(ctx)
+	v, err := s.open(ctx, false)
 	if err != nil {
 		return nil, code(err)
 	}

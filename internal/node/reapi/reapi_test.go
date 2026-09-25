@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/junioryono/billet/internal/node/reapi"
 )
@@ -97,7 +98,7 @@ func volumeIn(t *testing.T) (dirVolume, reapi.Opener) {
 
 	v := dirVolume{root: t.TempDir(), stored: new(atomic.Int64)}
 
-	return v, func(context.Context) (reapi.Volume, error) { return v, nil }
+	return v, func(context.Context, bool) (reapi.Volume, error) { return v, nil }
 }
 
 func upload(t *testing.T, conn *grpc.ClientConn, resource string, parts ...[]byte) (*bspb.WriteResponse, error) {
@@ -294,7 +295,7 @@ func TestTheNodesRefusalsBecomeGRPCCodes(t *testing.T) {
 		errors.New("unmounted"): codes.Unavailable,
 		fs.ErrNotExist:          codes.NotFound,
 	} {
-		conn := serve(t, func(context.Context) (reapi.Volume, error) { return nil, refusal })
+		conn := serve(t, func(context.Context, bool) (reapi.Volume, error) { return nil, refusal })
 		_, err := repb.NewContentAddressableStorageClient(conn).FindMissingBlobs(t.Context(),
 			&repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{digestOf([]byte("x"))}})
 		if status.Code(err) != want {
@@ -318,5 +319,153 @@ func TestTheCapabilitiesAreACacheOnly(t *testing.T) {
 	if len(cache.GetDigestFunctions()) != 1 || cache.GetDigestFunctions()[0] != repb.DigestFunction_SHA256 ||
 		!cache.GetActionCacheUpdateCapabilities().GetUpdateEnabled() || capabilities.GetExecutionCapabilities() != nil {
 		t.Fatalf("capabilities = %v", capabilities)
+	}
+}
+
+// EVERY CALL THAT STORES SAYS SO WHEN IT OPENS THE VOLUME, and no call that
+// only reads does, so the node records a write before its first byte lands.
+func TestTheOpenerIsToldWhichCallsWrite(t *testing.T) {
+	t.Parallel()
+
+	volume, _ := volumeIn(t)
+	var writes, reads atomic.Int64
+	conn := serve(t, func(_ context.Context, write bool) (reapi.Volume, error) {
+		if write {
+			writes.Add(1)
+		} else {
+			reads.Add(1)
+		}
+
+		return volume, nil
+	})
+	body := []byte("told")
+	d := digestOf(body)
+	cas := repb.NewContentAddressableStorageClient(conn)
+	ac := repb.NewActionCacheClient(conn)
+
+	for name, call := range map[string]struct {
+		write bool
+		do    func() error
+	}{
+		"BatchUpdateBlobs": {true, func() error {
+			_, err := cas.BatchUpdateBlobs(t.Context(), &repb.BatchUpdateBlobsRequest{
+				Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: d, Data: body}}})
+			return err
+		}},
+		"Write": {true, func() error {
+			_, err := upload(t, conn, "uploads/2/blobs/"+digestOf([]byte("w")).GetHash()+"/1", []byte("w"))
+			return err
+		}},
+		"UpdateActionResult": {true, func() error {
+			_, err := ac.UpdateActionResult(t.Context(), &repb.UpdateActionResultRequest{
+				ActionDigest: d, ActionResult: &repb.ActionResult{}})
+			return err
+		}},
+		"FindMissingBlobs": {false, func() error {
+			_, err := cas.FindMissingBlobs(t.Context(), &repb.FindMissingBlobsRequest{BlobDigests: []*repb.Digest{d}})
+			return err
+		}},
+		"BatchReadBlobs": {false, func() error {
+			_, err := cas.BatchReadBlobs(t.Context(), &repb.BatchReadBlobsRequest{Digests: []*repb.Digest{d}})
+			return err
+		}},
+		"GetActionResult": {false, func() error {
+			_, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: d})
+			if status.Code(err) == codes.NotFound {
+				return nil
+			}
+			return err
+		}},
+	} {
+		beforeWrites, beforeReads := writes.Load(), reads.Load()
+		if err := call.do(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if wrote := writes.Load() > beforeWrites; wrote != call.write || reads.Load() > beforeReads == call.write {
+			t.Errorf("%s opened the volume as a write = %v, want %v", name, wrote, call.write)
+		}
+	}
+}
+
+// A BATCH READ IS BOUNDED BY WHAT IT ASKS FOR, and sizes a client chose cannot
+// overflow that bound: two enormous digests, or one blob asked for many times.
+func TestABatchReadCannotAskForMoreThanItsBound(t *testing.T) {
+	t.Parallel()
+
+	_, open := volumeIn(t)
+	conn := serve(t, open)
+	cas := repb.NewContentAddressableStorageClient(conn)
+	huge := &repb.Digest{Hash: digestOf([]byte("x")).GetHash(), SizeBytes: 1 << 62}
+	blob := bytes.Repeat([]byte("b"), 1<<20)
+	if _, err := cas.BatchUpdateBlobs(t.Context(), &repb.BatchUpdateBlobsRequest{
+		Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: digestOf(blob), Data: blob}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, digests := range map[string][]*repb.Digest{
+		"sizes that overflow": {huge, huge},
+		"one blob many times": {digestOf(blob), digestOf(blob), digestOf(blob), digestOf(blob), digestOf(blob)},
+	} {
+		if _, err := cas.BatchReadBlobs(t.Context(), &repb.BatchReadBlobsRequest{Digests: digests}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("%s: answered %v, want InvalidArgument", name, err)
+		}
+	}
+}
+
+// AN UPLOAD OF THE RIGHT BYTES UNDER A WRONG SIZE IS REFUSED, not stored and
+// reported committed.
+func TestAnUploadUnderAWrongSizeIsRefused(t *testing.T) {
+	t.Parallel()
+
+	volume, open := volumeIn(t)
+	conn := serve(t, open)
+	d := digestOf([]byte("x"))
+	if _, err := upload(t, conn, "uploads/1/blobs/"+d.GetHash()+"/2", []byte("x")); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("an upload under a wrong size answered %v, want InvalidArgument", err)
+	}
+	if volume.stored.Load() != 0 {
+		t.Fatal("the upload was stored")
+	}
+}
+
+// AN ACTION RESULT WHOSE OUTPUT DIRECTORY LACKS A FILE IS A MISS, though the
+// directory's Tree itself is present.
+func TestAnActionResultIsAMissWhenATreesFileIsMissing(t *testing.T) {
+	t.Parallel()
+
+	_, open := volumeIn(t)
+	conn := serve(t, open)
+	file := []byte("inside the directory")
+	tree, err := proto.Marshal(&repb.Tree{Root: &repb.Directory{
+		Files: []*repb.FileNode{{Name: "f", Digest: digestOf(file)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cas := repb.NewContentAddressableStorageClient(conn)
+	put := func(body []byte) {
+		t.Helper()
+		if _, err := cas.BatchUpdateBlobs(t.Context(), &repb.BatchUpdateBlobsRequest{
+			Requests: []*repb.BatchUpdateBlobsRequest_Request{{Digest: digestOf(body), Data: body}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(tree)
+	ac := repb.NewActionCacheClient(conn)
+	action := digestOf([]byte("a directory action"))
+	if _, err := ac.UpdateActionResult(t.Context(), &repb.UpdateActionResultRequest{
+		ActionDigest: action, ActionResult: &repb.ActionResult{
+			OutputDirectories: []*repb.OutputDirectory{{Path: "out", TreeDigest: digestOf(tree)}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: action}); status.Code(err) != codes.NotFound {
+		t.Fatalf("a result whose tree names a missing file answered %v, want NotFound", err)
+	}
+	put(file)
+	if _, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
+		t.Fatalf("a complete result: %v", err)
 	}
 }

@@ -281,7 +281,7 @@ func TestAGRPCCallReachesTheBazelVolumeOfItsOwnSession(t *testing.T) {
 			var opened error
 			service.remoteAPI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				reached = true
-				volume, err := service.openRemoteAPIVolume(r.Context())
+				volume, err := service.openRemoteAPIVolume(r.Context(), true)
 				opened = err
 				if err != nil {
 					return
@@ -511,7 +511,7 @@ func TestAWriteDuringReleaseDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("PUT = %d", code)
 	}
 	session := service.sessionOf(instance)
-	handle, err := service.openCASHandle(t.Context(), session, config.CacheGo)
+	handle, err := service.openCASHandle(t.Context(), session, config.CacheGo, true)
 	if err != nil {
 		t.Fatalf("openCASHandle: %v", err)
 	}
@@ -572,6 +572,33 @@ func TestTheKillSwitchStopsACacheAlreadyInUse(t *testing.T) {
 	now = now.Add(casPolicyAge)
 	if code := putObject(t, service, token, "after the block"); code != http.StatusForbidden {
 		t.Fatalf("PUT after the block = %d, want 403", code)
+	}
+}
+
+// A WRITE SURVIVES A RESTART BEFORE THE JOB COMPLETES: the node that reloads
+// the session still knows the volume holds something, and publishes it when
+// the completion authorises it.
+func TestAWriteBeforeARestartIsStillPublished(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	if code := putObject(t, service, token, "written before the restart"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+
+	reloaded, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", service.rootState,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	reloaded.actionIO = volumes
+	finish(t, reloaded, instance, server.CacheAuthority{})
+	if err := reloaded.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.current != "next" {
+		t.Fatalf("current = %q, want the write made before the restart published", storage.current)
 	}
 }
 

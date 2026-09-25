@@ -3,6 +3,8 @@ package node
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +33,9 @@ type gitUpstream struct {
 	*httptest.Server
 	repo    string
 	fetches atomic.Int64
+	// refuse makes it answer every request as it would a header it no longer
+	// accepts.
+	refuse atomic.Bool
 }
 
 func runIn(t *testing.T, dir string, args ...string) string {
@@ -71,7 +76,13 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 		Env:  []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1"},
 	}
 	upstream.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != githubBasic {
+		// A RENAMED REPOSITORY IS A REDIRECT, as github.com answers one.
+		if old, ok := strings.CutPrefix(r.URL.Path, "/acme/old.git/"); ok {
+			http.Redirect(w, r, upstream.URL+"/acme/api.git/"+old+"?"+r.URL.RawQuery, http.StatusMovedPermanently)
+
+			return
+		}
+		if r.Header.Get("Authorization") != githubBasic || upstream.refuse.Load() {
 			w.Header().Set("WWW-Authenticate", `Basic realm="GitHub"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 
@@ -254,9 +265,20 @@ func TestAnObjectOnlyADeletedBranchReachedIsNotServed(t *testing.T) {
 	work := t.TempDir()
 	runIn(t, work, "clone", "-q", upstream.repo, "w")
 	runIn(t, filepath.Join(work, "w"), "checkout", "-q", "-b", "secret")
-	runIn(t, filepath.Join(work, "w"), "commit", "-q", "--allow-empty", "-m", "secret")
+	if err := os.WriteFile(filepath.Join(work, "w", "credential"), []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, filepath.Join(work, "w"), "add", "credential")
+	runIn(t, filepath.Join(work, "w"), "commit", "-q", "-m", "secret")
 	runIn(t, filepath.Join(work, "w"), "push", "-q", "origin", "secret")
 	secret := runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD")
+	// THE COMMIT, ITS TREE AND ITS FILE: a reachability check that walks
+	// commits alone passes a want for a tree or a blob.
+	secretObjects := map[string]string{
+		"commit": secret,
+		"tree":   runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD^{tree}"),
+		"blob":   runIn(t, filepath.Join(work, "w"), "rev-parse", "HEAD:credential"),
+	}
 
 	git := gitClient(t, node, token, githubBasic)
 	// THE MIRROR TAKES EVERY REF, the secret branch's object included; the
@@ -283,8 +305,19 @@ func TestAnObjectOnlyADeletedBranchReachedIsNotServed(t *testing.T) {
 	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err != nil {
 		t.Fatalf("ls-remote: %v\n%s", err, output)
 	}
-	if body := negotiate(t, node, token, githubBasic, secret); bytes.Contains(body, []byte("PACK")) {
-		t.Fatalf("an object only a deleted branch reached was served: %q", body[:min(len(body), 80)])
+	// THE MIRROR ANSWERS NONE OF THEM. The commit it refuses itself, as
+	// upload-pack judges a commit; a tree or a blob it sends to GitHub, whose
+	// answer is GitHub's own business (the stand-in here is git's http-backend,
+	// which serves one as upload-pack does).
+	if body := negotiate(t, node, token, githubBasic, secretObjects["commit"]); bytes.Contains(body, []byte("PACK")) {
+		t.Errorf("a commit only a deleted branch reached was served: %q", body[:min(len(body), 80)])
+	}
+	for _, kind := range []string{"tree", "blob"} {
+		before := upstream.fetches.Load()
+		negotiate(t, node, token, githubBasic, secretObjects[kind])
+		if upstream.fetches.Load() == before {
+			t.Errorf("a %s only a deleted branch reached was answered from the mirror", kind)
+		}
 	}
 	if body := negotiate(t, node, token, githubBasic, runIn(t, upstream.repo, "rev-parse", "main")); !bytes.Contains(body, []byte("PACK")) {
 		t.Fatalf("an advertised object was not served by the same negotiation: %q", body)
@@ -462,4 +495,148 @@ func negotiate(t *testing.T, node *httptest.Server, token, header, want string) 
 	}
 
 	return body
+}
+
+// GITHUB'S LATEST ANSWER STANDS: a header refused after it was granted is
+// served nothing more from the mirror, even a negotiation sent within the
+// minute the grant would have lasted.
+func TestARefusalEndsAnEarlierGrant(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	git := gitClient(t, node, token, githubBasic)
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	main := runIn(t, upstream.repo, "rev-parse", "main")
+	if body := negotiate(t, node, token, githubBasic, main); !bytes.Contains(body, []byte("PACK")) {
+		t.Fatalf("a granted negotiation was not served: %q", body)
+	}
+
+	upstream.refuse.Store(true)
+	if output, err := git("ls-remote", "https://github.com/acme/api.git"); err == nil {
+		t.Fatalf("a refused header listed the refs:\n%s", output)
+	}
+	if body := negotiate(t, node, token, githubBasic, main); bytes.Contains(body, []byte("PACK")) {
+		t.Fatal("the mirror served a header GitHub had since refused")
+	}
+}
+
+// AN ANSWER TO AN OLDER QUESTION NEVER REPLACES A NEWER ONE: a grant asked for
+// before a refusal, and landing after it, leaves the refusal standing.
+func TestAnOlderGrantDoesNotOvertakeANewerRefusal(t *testing.T) {
+	t.Parallel()
+
+	g := newGitProxy(t.TempDir())
+	request := gitRequest{session: &cacheSession{trust: provider.TrustUntrusted}, owner: "acme",
+		repo: "api", auth: "basic eA=="}
+	now := time.Now()
+	earlier, later := g.ask(), g.ask()
+	g.remember(request, now, later, false, false)
+	g.remember(request, now, earlier, true, true)
+	if g.servesFromMirror(request, now) {
+		t.Fatal("a grant asked for before a refusal overtook it")
+	}
+	g.remember(request, now, g.ask(), true, true)
+	if !g.servesFromMirror(request, now) {
+		t.Fatal("a grant asked for after the refusal did not stand")
+	}
+}
+
+// A FETCH IS STOPPED WHILE IT RUNS once its mirror passes the tier's ceiling,
+// not only measured after it finishes: a slow upstream here holds the fetch
+// open far longer than the watchdog takes.
+func TestAFetchIsStoppedWhileItRunsAtTheCeiling(t *testing.T) {
+	t.Parallel()
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(20 * time.Second):
+		}
+		http.Error(w, "slow", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(slow.Close)
+	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
+	service.git.upstream, service.git.fullFraction = slow.URL, 1
+	request := gitRequest{session: service.sessionOf(provider.InstanceName(scopedLease)),
+		owner: "acme", repo: "api"}
+
+	start := time.Now()
+	err := service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 1)
+	if !errors.Is(err, errMirrorTooLarge) {
+		t.Fatalf("fetchMirror = %v, want errMirrorTooLarge", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("the fetch ran %s past its ceiling", took)
+	}
+}
+
+// A REPOSITORY GITHUB REDIRECTS IS FOLLOWED THROUGH THE PROXY, so the client's
+// next request still carries the credentials the rewrite depends on.
+func TestARedirectIsFollowedThroughTheProxy(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/acme/old.git", "c"); err != nil {
+		t.Fatalf("a clone of a renamed repository failed: %v\n%s", err, output)
+	}
+}
+
+// THE REAPER PASSES OVER A MIRROR IN USE, rather than hold the cache loop until
+// the transfer ends.
+func TestTheReaperPassesOverAMirrorInUse(t *testing.T) {
+	t.Parallel()
+
+	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
+	service.git.fullFraction = 0
+	path := service.git.mirrorPath("untrusted/acme/busy")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, gitUsedStamp), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	held := service.git.mirror("untrusted/acme/busy")
+	held.use.RLock()
+	defer held.use.RUnlock()
+
+	start := time.Now()
+	if err := service.ReapGitMirrors(t.Context()); err != nil {
+		t.Fatalf("ReapGitMirrors: %v", err)
+	}
+	if waited := time.Since(start); waited > 3*time.Second {
+		t.Fatalf("the reaper waited %s on a mirror in use", waited)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a mirror in use was removed: %v", err)
+	}
+}
+
+// ADMISSION WAITS ONLY AS LONG AS THE REQUEST MAY, and gives back what it took
+// when it cannot take everything.
+func TestGitAdmissionIsBoundedAndGivesBack(t *testing.T) {
+	t.Parallel()
+
+	free, full := make(chan struct{}, 1), make(chan struct{}, 1)
+	full <- struct{}{}
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := admitGit(ctx, free, full); err == nil {
+		t.Fatal("admission past a full bound succeeded")
+	}
+	if len(free) != 0 {
+		t.Fatal("a failed admission kept the slot it had taken")
+	}
+	release, err := admitGit(t.Context(), free)
+	if err != nil || len(free) != 1 {
+		t.Fatalf("admission = %v with %d held", err, len(free))
+	}
+	release()
+	if len(free) != 0 {
+		t.Fatal("release gave nothing back")
+	}
 }

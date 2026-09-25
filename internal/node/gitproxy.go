@@ -61,7 +61,19 @@ const (
 	// ceiling is forwarded rather than mirrored again.
 	gitTooLargeFor = time.Hour
 	gitUsedStamp   = "billet-used"
+	// gitFetches bounds the mirror fetches the node runs at once, so what they
+	// write together is bounded by that many tiers' ceilings; gitWork bounds
+	// every git request the node is serving, each a subprocess or an upstream
+	// connection.
+	gitFetches = 2
+	gitWork    = 32
+	// gitWatchEvery is how often a fetch in progress is measured against its
+	// ceiling and the filesystem's fill.
+	gitWatchEvery = 500 * time.Millisecond
 )
+
+// errMirrorTooLarge says a mirror passed its tier's ceiling and is removed.
+var errMirrorTooLarge = errors.New("the repository is larger than the tier's git cache")
 
 var gitSegment = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 
@@ -81,11 +93,29 @@ type gitProxy struct {
 	// fill of the disk it runs on.
 	fullFraction float64
 
+	fetches chan struct{}
+	work    chan struct{}
+
 	mu         sync.Mutex
 	mirrors    map[string]*gitMirror
 	authorised map[string]gitAuthorisation
 	tooLarge   map[string]time.Time
+	// renamed maps a repository GitHub redirected to where it now lives.
+	renamed map[string]gitRename
+	// sequence orders GitHub's answers, so a later one always wins over an
+	// earlier one that finished after it.
+	sequence uint64
 }
+
+// gitRename is where GitHub said a repository moved, and until when that is
+// believed without asking again.
+type gitRename struct {
+	owner, repo string
+	until       time.Time
+}
+
+// gitRenameAge is how long a redirect GitHub gave is followed without asking.
+const gitRenameAge = time.Hour
 
 // gitAuthorisation is GitHub's yes to one header for one repository, and
 // whether the mirror answered the advertisement it came with: a fetch is served
@@ -93,6 +123,7 @@ type gitProxy struct {
 type gitAuthorisation struct {
 	until    time.Time
 	mirrored bool
+	sequence uint64
 }
 
 type gitMirror struct {
@@ -112,8 +143,11 @@ func newGitProxy(root string) *gitProxy {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		fullFraction: gitFullFraction,
+		fetches:      make(chan struct{}, gitFetches),
+		work:         make(chan struct{}, gitWork),
 		mirrors:      make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
 		tooLarge: make(map[string]time.Time),
+		renamed:  make(map[string]gitRename),
 	}
 }
 
@@ -200,6 +234,24 @@ func (s *CacheService) serveGit(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := extendTransfer(w, r)
 	defer cancel()
+	// THE TRANSFER'S DEADLINE GOES WITH EVERY BRANCH, a forward included.
+	r = r.WithContext(ctx)
+
+	// ADMITTED LIKE ANY OTHER TRANSFER, per session and per node, because each
+	// request is a subprocess or an upstream connection a guest could multiply.
+	release, err := admitGit(ctx, request.session.casAdmit, s.git.work)
+	if err != nil {
+		http.Error(w, "the git cache is busy", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer release()
+
+	// A REPOSITORY GITHUB SAID HAS MOVED IS ASKED FOR WHERE IT NOW LIVES. git
+	// keeps its old base URL when it follows a redirect on the retry after a 401
+	// (measured, git 2.51.0, 2026-09-25), and every fetch through here takes that
+	// retry, so the node follows the redirect for it, fetch and all.
+	request = s.git.follow(request, s.now())
 
 	switch {
 	case !s.gitAllowed(ctx, request.session):
@@ -212,6 +264,28 @@ func (s *CacheService) serveGit(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.forwardGit(w, r, request)
 	}
+}
+
+// admitGit takes a slot of each bound in turn, waiting as long as ctx lets it.
+func admitGit(ctx context.Context, bounds ...chan struct{}) (func(), error) {
+	var held []chan struct{}
+	release := func() {
+		for _, bound := range held {
+			<-bound
+		}
+	}
+	for _, bound := range bounds {
+		select {
+		case bound <- struct{}{}:
+			held = append(held, bound)
+		case <-ctx.Done():
+			release()
+
+			return nil, ctx.Err()
+		}
+	}
+
+	return release, nil
 }
 
 // gitAllowed reports whether the session's tier enables the git cache and no
@@ -299,17 +373,78 @@ func (g *gitProxy) authorisationKey(request gitRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (g *gitProxy) remember(request gitRequest, now time.Time, mirrored bool) {
+// follow is request aimed where GitHub last said its repository moved.
+func (g *gitProxy) follow(request gitRequest, now time.Time) gitRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	moved, ok := g.renamed[strings.ToLower(request.owner+"/"+request.repo)]
+	if ok && now.Before(moved.until) {
+		request.owner, request.repo = moved.owner, moved.repo
+	}
+
+	return request
+}
+
+// learnRename records a redirect GitHub gave for an advertisement when it
+// points at another repository on github.com, and reports where to.
+func (g *gitProxy) learnRename(request gitRequest, resp *http.Response, now time.Time) (gitRequest, bool) {
+	if resp.StatusCode < 300 || resp.StatusCode > 399 {
+		return request, false
+	}
+	rest, ok := strings.CutPrefix(resp.Header.Get("Location"), g.upstream+"/")
+	if !ok {
+		return request, false
+	}
+	path, _, _ := strings.Cut(rest, "?")
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) != 3 || parts[2] != "info/refs" || !gitSegment.MatchString(parts[0]) {
+		return request, false
+	}
+	repo := strings.TrimSuffix(parts[1], ".git")
+	if !gitSegment.MatchString(repo) || strings.HasPrefix(repo, ".") || strings.HasPrefix(parts[0], ".") ||
+		strings.EqualFold(parts[0]+"/"+repo, request.owner+"/"+request.repo) {
+		return request, false
+	}
+	g.mu.Lock()
+	g.renamed[strings.ToLower(request.owner+"/"+request.repo)] = gitRename{
+		owner: parts[0], repo: repo, until: now.Add(gitRenameAge),
+	}
+	g.mu.Unlock()
+	request.owner, request.repo = parts[0], repo
+
+	return request, true
+}
+
+// ask numbers one question to GitHub about a header and a repository.
+func (g *gitProxy) ask() uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.sequence++
+
+	return g.sequence
+}
+
+// remember records GitHub's answer to question sequence: a grant for
+// gitAuthorisationAge, or, with granted false, the end of any earlier grant. An
+// answer to an older question than the one recorded changes nothing, so a
+// refusal is never overtaken by a grant asked for before it.
+func (g *gitProxy) remember(request gitRequest, now time.Time, sequence uint64, granted, mirrored bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for key, held := range g.authorised {
-		if !now.Before(held.until) {
+		if !now.Before(held.until) && held.sequence < sequence {
 			delete(g.authorised, key)
 		}
 	}
-	g.authorised[g.authorisationKey(request)] = gitAuthorisation{
-		until: now.Add(gitAuthorisationAge), mirrored: mirrored,
+	key := g.authorisationKey(request)
+	if g.authorised[key].sequence > sequence {
+		return
 	}
+	held := gitAuthorisation{sequence: sequence}
+	if granted {
+		held.until, held.mirrored = now.Add(gitAuthorisationAge), mirrored
+	}
+	g.authorised[key] = held
 }
 
 // servesFromMirror reports whether GitHub authorised this header for this
@@ -341,8 +476,18 @@ func (g *gitProxy) mirrorPath(key string) string { return filepath.Join(g.root, 
 // the mirror cannot do sends GitHub's answer instead, and the fetch after it to
 // GitHub too.
 func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, r *http.Request, request gitRequest) {
+	sequence := s.git.ask()
 	resp, body, err := s.upstreamRefs(ctx, request)
+	if err == nil {
+		// ONE HOP, followed here for the reason serveGit follows a known one.
+		if moved, ok := s.git.learnRename(request, resp, s.now()); ok {
+			request = moved
+			resp, body, err = s.upstreamRefs(ctx, request)
+		}
+	}
 	if err != nil {
+		// COULD NOT TELL ENDS WHATEVER WAS GRANTED BEFORE, as a refusal does.
+		s.git.remember(request, s.now(), sequence, false, false)
 		s.log.Warn("could not ask github.com about a repository; forwarding",
 			"repository", request.owner+"/"+request.repo, "error", err)
 		s.forwardGit(w, r, request)
@@ -350,18 +495,19 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		relayGit(w, resp, body)
+		s.git.remember(request, s.now(), sequence, false, false)
+		s.relayGit(w, r, resp, body)
 
 		return
 	}
 
 	advertisement, existed, err := s.refreshMirror(ctx, request, body)
-	s.git.remember(request, s.now(), err == nil)
+	s.git.remember(request, s.now(), sequence, true, err == nil)
 	s.noteGit(ctx, request.session, err, existed)
 	if err != nil {
 		s.log.Info("the git cache could not serve a repository; github.com serves it",
 			"repository", request.owner+"/"+request.repo, "error", err)
-		relayGit(w, resp, body)
+		s.relayGit(w, r, resp, body)
 
 		return
 	}
@@ -372,11 +518,21 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 	_, _ = w.Write(advertisement)
 }
 
-func relayGit(w http.ResponseWriter, resp *http.Response, body []byte) {
+// relayGit answers with what GitHub answered. A redirect keeps its
+// destination, and one within github.com is sent back through the proxy, so the
+// client's next request carries its credentials here rather than going to
+// GitHub without the header the rewrite dropped.
+func (s *CacheService) relayGit(w http.ResponseWriter, r *http.Request, resp *http.Response, body []byte) {
 	for _, name := range []string{"Content-Type", "WWW-Authenticate", "Cache-Control"} {
 		if value := resp.Header.Get(name); value != "" {
 			w.Header().Set(name, value)
 		}
+	}
+	if location := resp.Header.Get("Location"); location != "" {
+		if rest, ok := strings.CutPrefix(location, s.git.upstream+"/"); ok {
+			location = "http://" + r.Host + gitPathPrefix + rest
+		}
+		w.Header().Set("Location", location)
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
@@ -469,7 +625,30 @@ func (s *CacheService) refreshMirror(
 
 	mirror := s.git.mirror(key)
 	mirror.use.RLock()
-	defer mirror.use.RUnlock()
+	advertisement, existed, err := s.refreshHeld(ctx, request, mirror, refs, head)
+	mirror.use.RUnlock()
+	// REMOVED UNDER THE EXCLUSIVE LOCK, once this request's own hold is gone,
+	// so no fetch being served loses its repository mid-pack.
+	if errors.Is(err, errMirrorTooLarge) {
+		s.git.mu.Lock()
+		s.git.tooLarge[key] = s.now().Add(gitTooLargeFor)
+		s.git.mu.Unlock()
+		if lockWithin(ctx, &mirror.use, casReleaseWait) {
+			if removeErr := os.RemoveAll(s.git.mirrorPath(key)); removeErr != nil {
+				err = errors.Join(err, removeErr)
+			}
+			mirror.use.Unlock()
+		}
+	}
+
+	return advertisement, existed, err
+}
+
+// refreshHeld is refreshMirror's work, with the mirror held for reading.
+func (s *CacheService) refreshHeld(
+	ctx context.Context, request gitRequest, mirror *gitMirror, refs map[string]string, head string,
+) ([]byte, bool, error) {
+	key := request.key()
 	path := s.git.mirrorPath(key)
 
 	mirror.fetch.Lock()
@@ -481,10 +660,8 @@ func (s *CacheService) refreshMirror(
 
 			return nil, false, errors.New("the git cache's filesystem is full")
 		}
-		err = s.fetchMirror(ctx, path, request)
-		if err == nil {
-			err = s.boundMirror(key, path, sessionSetting(request.session, config.CacheGit))
-		}
+		err = s.fetchMirror(ctx, path, request,
+			volumeCeiling(sessionSetting(request.session, config.CacheGit)))
 	}
 	if err == nil && head != "" && strings.HasPrefix(head, "refs/") {
 		_, err = s.runGit(ctx, path, nil, "symbolic-ref", "HEAD", head)
@@ -537,7 +714,16 @@ func (s *CacheService) mirrorRefs(ctx context.Context, path string) (map[string]
 
 // fetchMirror makes or refreshes a mirror with the job's header, which reaches
 // git through its environment and never its argv, a file or a log.
-func (s *CacheService) fetchMirror(ctx context.Context, path string, request gitRequest) error {
+//
+// BOUNDED WHILE IT RUNS, not only after: a node-wide slot caps the fetches in
+// flight, and a watchdog stops one whose mirror passes the tier's ceiling or
+// whose filesystem passes its fill, before either can exhaust the node's disk.
+func (s *CacheService) fetchMirror(ctx context.Context, path string, request gitRequest, ceiling int64) error {
+	release, err := admitGit(ctx, s.git.fetches)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
@@ -554,15 +740,45 @@ func (s *CacheService) fetchMirror(ctx context.Context, path string, request git
 		secret = []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraheader",
 			"GIT_CONFIG_VALUE_0=Authorization: " + string(request.auth)}
 	}
-	_, err := s.runGit(ctx, path, secret, "fetch", "--prune", "--quiet", "--no-write-fetch-head",
+	watched, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(gitWatchEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
+			if directorySize(path) > ceiling {
+				stop(errMirrorTooLarge)
+
+				return
+			}
+			if full, err := filledAbove(s.git.root, s.git.fullFraction); err == nil && full {
+				stop(errors.New("the git cache's filesystem is full"))
+
+				return
+			}
+		}
+	}()
+	_, err = s.runGit(watched, path, secret, "fetch", "--prune", "--quiet", "--no-write-fetch-head",
 		s.git.upstream+"/"+request.owner+"/"+request.repo+".git", "+refs/*:refs/*")
+	if cause := context.Cause(watched); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	if err == nil && directorySize(path) > ceiling {
+		return errMirrorTooLarge
+	}
 
 	return err
 }
 
-// boundMirror removes a mirror larger than its tier's git ceiling, and forwards
-// that repository for a while rather than fetch it again at once.
-func (s *CacheService) boundMirror(key, path string, setting config.CacheSetting) error {
+// directorySize is the bytes of the regular files under path.
+func directorySize(path string) int64 {
 	var size int64
 	_ = filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
 		if err == nil && entry.Type().IsRegular() {
@@ -573,15 +789,8 @@ func (s *CacheService) boundMirror(key, path string, setting config.CacheSetting
 
 		return nil
 	})
-	if size <= volumeCeiling(setting) {
-		return nil
-	}
-	s.git.mu.Lock()
-	s.git.tooLarge[key] = s.now().Add(gitTooLargeFor)
-	s.git.mu.Unlock()
 
-	return errors.Join(fmt.Errorf("the mirror is %d bytes, above the tier's git cache", size),
-		os.RemoveAll(path))
+	return size
 }
 
 // runGit runs git in dir with a closed environment: no system or global
@@ -626,16 +835,36 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	var body io.Reader = io.LimitReader(r.Body, gitRequestLimit)
+	raw, err := io.ReadAll(io.LimitReader(r.Body, gitRequestLimit+1))
+	if err != nil || len(raw) > gitRequestLimit {
+		http.Error(w, "an unreadable or oversized request", http.StatusBadRequest)
+
+		return
+	}
+	negotiation := raw
 	if r.Header.Get("Content-Encoding") == "gzip" {
-		decompressed, err := gzip.NewReader(body)
-		if err != nil {
-			http.Error(w, "an unreadable request", http.StatusBadRequest)
+		decompressed, err := gzip.NewReader(bytes.NewReader(raw))
+		if err == nil {
+			negotiation, err = io.ReadAll(io.LimitReader(decompressed, gitRequestLimit+1))
+		}
+		if err != nil || len(negotiation) > gitRequestLimit {
+			http.Error(w, "an unreadable or oversized request", http.StatusBadRequest)
 
 			return
 		}
-		defer decompressed.Close()
-		body = io.LimitReader(decompressed, gitRequestLimit)
+	}
+
+	// A WANT THE MIRROR MAY NOT ANSWER GOES TO GITHUB, WHOLE. upload-pack's own
+	// check under v0 walks commits alone, so a want for a tree or a blob no ref
+	// reaches passes it (measured, git 2.51.0, 2026-09-25); the mirror answers
+	// only wants that are commits, which the check does judge, or a current
+	// ref's own object. Anything else, a partial clone's blob fetch included, is
+	// GitHub's to answer, and GitHub authorised this header for this repository.
+	if !s.mirrorServesWants(ctx, path, negotiatedWants(negotiation)) {
+		r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(raw)), int64(len(raw))
+		s.forwardGit(w, r, request)
+
+		return
 	}
 
 	cmd := exec.CommandContext(ctx, s.git.binary, append(slices.Clone(uploadPackConfig),
@@ -643,7 +872,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 	cmd.Dir = path
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + s.git.root, "GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null"}
-	cmd.Stdin = body
+	cmd.Stdin = bytes.NewReader(negotiation)
 	cmd.WaitDelay = 5 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -656,6 +885,78 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 	}
 	now := s.now()
 	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
+}
+
+// negotiatedWants reads the objects a v0 fetch negotiation wants: every
+// `want <oid>` pkt-line before the first flush.
+func negotiatedWants(negotiation []byte) []string {
+	var wants []string
+	for len(negotiation) >= 4 {
+		var size int
+		if _, err := fmt.Sscanf(string(negotiation[:4]), "%04x", &size); err != nil {
+			return append(wants, "")
+		}
+		if size == 0 {
+			break
+		}
+		if size < 4 || size > len(negotiation) {
+			return append(wants, "")
+		}
+		line := strings.TrimSuffix(string(negotiation[4:size]), "\n")
+		negotiation = negotiation[size:]
+		if rest, ok := strings.CutPrefix(line, "want "); ok {
+			object, _, _ := strings.Cut(rest, " ")
+			wants = append(wants, object)
+		}
+	}
+
+	return wants
+}
+
+// mirrorServesWants reports whether every want is a commit in the mirror or a
+// current ref's own object. A want it cannot read, or cannot type, is not.
+func (s *CacheService) mirrorServesWants(ctx context.Context, path string, wants []string) bool {
+	if len(wants) == 0 {
+		return true
+	}
+	refs, err := s.mirrorRefs(ctx, path)
+	if err != nil {
+		return false
+	}
+	tips := make(map[string]bool, len(refs))
+	for _, object := range refs {
+		tips[object] = true
+	}
+	var input strings.Builder
+	for _, want := range wants {
+		if len(want) != 40 && len(want) != 64 || strings.ContainsAny(want, " \n") {
+			return false
+		}
+		input.WriteString(want + "\n")
+	}
+	cmd := exec.CommandContext(ctx, s.git.binary, "cat-file",
+		"--batch-check=%(objectname) %(objecttype)")
+	cmd.Dir = path
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + s.git.root, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null"}
+	cmd.Stdin = strings.NewReader(input.String())
+	cmd.WaitDelay = 5 * time.Second
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) != len(wants) {
+		return false
+	}
+	for i, line := range lines {
+		object, kind, _ := strings.Cut(line, " ")
+		if object != wants[i] || kind != "commit" && !tips[object] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ReapGitMirrors removes the mirrors no job has used within gitMirrorRetention,
@@ -706,8 +1007,13 @@ func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
 		if !full && s.now().Sub(m.used) < gitMirrorRetention {
 			break
 		}
+		// A MIRROR IN USE IS PASSED OVER, not waited for: this loop also renews
+		// and cleans up every session, and a slow transfer holds a mirror for
+		// minutes. It is reaped on a later pass.
 		held := s.git.mirror(m.key)
-		held.use.Lock()
+		if !lockWithin(ctx, &held.use, time.Second) {
+			continue
+		}
 		err = os.RemoveAll(s.git.mirrorPath(m.key))
 		held.use.Unlock()
 		if err != nil {

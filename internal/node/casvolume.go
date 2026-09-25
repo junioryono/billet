@@ -69,11 +69,8 @@ type hostVolume struct {
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
 	// THE ORDER IS session.mu, THEN io: a transfer holding io never waits for
-	// session.mu, which is why a write is recorded in written, not Dirty.
+	// session.mu, which is why a write is marked Dirty when it is admitted.
 	io sync.RWMutex
-	// written says a transfer stored something since the session began; the
-	// holder of session.mu folds it into Dirty.
-	written atomic.Bool
 	// allowedAt is when the kill switch last allowed this cache, under
 	// session.mu; a transfer asks again once it is older than casPolicyAge.
 	allowedAt time.Time
@@ -166,7 +163,7 @@ func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session 
 	ctx, cancel := extendTransfer(w, r)
 	defer cancel()
 
-	handle, err := s.openCASHandle(ctx, session, kind)
+	handle, err := s.openCASHandle(ctx, session, kind, r.Method == http.MethodPut)
 	switch {
 	case errors.Is(err, reapi.ErrBusy):
 		http.Error(w, err.Error(), http.StatusTooManyRequests)
@@ -241,8 +238,13 @@ var _ reapi.Volume = (*casHandle)(nil)
 
 // openCASHandle admits a transfer and attaches the session's volume of kind on
 // first use. The refusals are reapi's, so each protocol can say them its way.
+//
+// A WRITE IS RECORDED BEFORE IT IS ADMITTED, durably and under the session's
+// lock, so a restart between the write and the job's completion still knows
+// the volume holds something to publish; a transfer never takes that lock once
+// it holds the volume.
 func (s *CacheService) openCASHandle(
-	ctx context.Context, session *cacheSession, kind config.CacheKind,
+	ctx context.Context, session *cacheSession, kind config.CacheKind, write bool,
 ) (*casHandle, error) {
 	select {
 	case session.casAdmit <- struct{}{}:
@@ -272,6 +274,13 @@ func (s *CacheService) openCASHandle(
 			err = errCacheOff
 		} else {
 			hv.allowedAt = s.now()
+		}
+	}
+	if err == nil && write && !hv.Dirty {
+		hv.Dirty = true
+		if persistErr := s.persistSession(session); persistErr != nil {
+			hv.Dirty = false
+			err = persistErr
 		}
 	}
 	switch {
@@ -354,12 +363,7 @@ func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, b
 	if table == reapi.TableCAS {
 		limit = h.limit
 	}
-	if err := h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root); err != nil {
-		return err
-	}
-	h.hv.written.Store(true)
-
-	return nil
+	return h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root)
 }
 
 func (h *casHandle) Close() { h.release() }
@@ -468,9 +472,6 @@ func (s *CacheService) releaseCASVolume(
 		return false, errors.New("a transfer is still using the volume")
 	}
 	defer hv.io.Unlock()
-	if hv.written.Load() {
-		hv.Dirty = true
-	}
 
 	if hv.Mounted {
 		if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
@@ -741,12 +742,12 @@ func (s *CacheService) serveRemoteAPI(w http.ResponseWriter, r *http.Request, se
 
 // openRemoteAPIVolume is the Bazel volume of the call's session: the Remote
 // Execution API serves the bazel cache only, whichever client speaks it.
-func (s *CacheService) openRemoteAPIVolume(ctx context.Context) (reapi.Volume, error) {
+func (s *CacheService) openRemoteAPIVolume(ctx context.Context, write bool) (reapi.Volume, error) {
 	session, ok := ctx.Value(remoteAPISession{}).(*cacheSession)
 	if !ok || session == nil {
 		return nil, reapi.ErrEnded
 	}
-	handle, err := s.openCASHandle(ctx, session, config.CacheBazel)
+	handle, err := s.openCASHandle(ctx, session, config.CacheBazel, write)
 	if err != nil {
 		return nil, err
 	}
