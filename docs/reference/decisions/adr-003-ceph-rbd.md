@@ -20,7 +20,7 @@ Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, on the reference host in `docs/refere
 |---|---|
 | Ceph | 20.2.3 Tentacle (`quay.io/ceph/ceph:v20`), deployed by `cephadm` 20.2.0 from the Ubuntu archive |
 | Container engine | Docker 29.1.3 — the host already runs it for the `docker` provider |
-| Daemons | 1 mon, 2 mgr, 1 crash, 2 OSD, all on `ubuntu-01` |
+| Daemons | 1 mon, 2 mgr, 1 crash, 2 OSD, all on `linux-01` |
 | OSDs | the two bare Samsung 990 PRO 4TB (`nvme0n1`, `nvme3n1`), 7.3 TiB raw |
 | Pools | `billet-images` and `billet-cache`, `size=2 min_size=1`, autoscaled PGs |
 | Identity | `client.billet`, `mon 'profile rbd'`, `osd 'profile rbd pool=billet-images, profile rbd pool=billet-cache'` |
@@ -28,10 +28,10 @@ Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, on the reference host in `docs/refere
 The mdraid RAID1 root on `nvme1n1`/`nvme2n1` is untouched and still holds `/`, `/var/lib/billet` and the control-plane database.
 
 ```bash
-cephadm bootstrap --mon-ip 192.168.1.126 --single-host-defaults \
+cephadm bootstrap --mon-ip 192.168.1.10 --single-host-defaults \
   --skip-dashboard --skip-monitoring-stack --ssh-user <account-with-passwordless-sudo>
-ceph orch daemon add osd ubuntu-01:/dev/nvme0n1
-ceph orch daemon add osd ubuntu-01:/dev/nvme3n1
+ceph orch daemon add osd linux-01:/dev/nvme0n1
+ceph orch daemon add osd linux-01:/dev/nvme3n1
 ceph osd pool create billet-images && rbd pool init billet-images
 ceph osd pool create billet-cache  && rbd pool init billet-cache
 ceph osd set-require-min-compat-client mimic     # see "clone v2", below
@@ -198,17 +198,17 @@ Three workloads on a mounted RBD volume against the same tree on the mdraid NVMe
 A clone made on one machine, mapped and read on another. `rbd-second` is a VM with its own kernel (7.0.0-28 against the host's 7.0.0-29) and its own RBD client, reaching the cluster over the network:
 
 ```
-ubuntu-01   $ rbd clone billet-images/ubuntu-2404-x64@golden billet-cache/from-host
-ubuntu-01   $ ... mount, write host-note, unmount, unmap
+linux-01   $ rbd clone billet-images/ubuntu-2404-x64@golden billet-cache/from-host
+linux-01   $ ... mount, write host-note, unmount, unmap
 
 rbd-second  $ rbd --id billet device map billet-cache/from-host   -> /dev/rbd0
 rbd-second  $ cat /mnt/x/host-note
-            written on ubuntu-01 at 2026-08-13T16:22:08Z
+            written on linux-01 at 2026-08-13T16:22:08Z
 rbd-second  $ sha256sum /mnt/x/payload
-            3097e2ff...f002d003        # byte-identical to what ubuntu-01 wrote
+            3097e2ff...f002d003        # byte-identical to what linux-01 wrote
 rbd-second  $ echo 'written on the second machine' > /mnt/x/vm-note
 
-ubuntu-01   $ cat /mnt/fromhost/vm-note
+linux-01   $ cat /mnt/fromhost/vm-note
             written on the second machine
 ```
 

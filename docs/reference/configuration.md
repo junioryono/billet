@@ -100,8 +100,9 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 
 | Key | Meaning |
 |---|---|
-| `label` | the `runs-on` value and the scale set's name |
+| `label` | the tier's identity inside the deployment (its leases, escrow and history), unique across the file; also the `runs-on` value and the scale set's name unless `runs_on` names another |
 | `target` | which target's scale set this is; defaults to the only target and is required when there are several |
+| `runs_on` | the scale set's name on its target and the `runs-on` value workflows use; defaults to `label`. Unique within a target, so tiers on different targets can each answer to the same name (`billet-2vcpu-ubuntu-2404` on every organization) while their labels stay distinct. With `sizes` it expands as the label does. Changing it moves the tier to a new scale set; the old one is reported as undeclared and removed with `billet teardown --tier <old> --runner-group <group> --target <target>`. Runners already registered in the old set are not moved: an idle one can take a job still aimed at the old name until it is retired, so change it when that name is no longer in use, as with a `runner_group` change |
 | `trust` | `untrusted` (default) or `trusted`; trusted requires `runner_group` and `workflows`, and is refused under a repository target |
 | `runner_group` | a non-default group GitHub restricts; empty means GitHub's default group; `&`, `#`, `;`, `%` and `+` are refused because the client does not escape them |
 | `workflows` | the exact allowlist the group must carry, with refs |
