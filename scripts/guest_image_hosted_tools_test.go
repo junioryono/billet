@@ -306,7 +306,7 @@ func TestEveryHostedToolReadsItsSumsThroughTheOneReader(t *testing.T) {
 			"\nbillet_tc_sum \"$1\" git-lfs-linux-amd64-v3.8.0.tar.gz\n"
 
 		path := filepath.Join(t.TempDir(), "sum.sh")
-		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 			t.Fatal(err)
 		}
 
