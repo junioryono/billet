@@ -478,7 +478,7 @@ func TestTheNodeReadsTheGuardsRefusalFromTheUpdaterItLaunched(t *testing.T) {
 		guardHelperModeEnv + "=host-upgrade " + guardHelperRootEnv + "=" + upgradeRoot + " " + guardHelperBinEnv + "=" + installedBinary +
 		" exec " + os.Args[0] + " -test.run='^TestGuardHelperProcess$' -- \"$@\"\n"
 
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

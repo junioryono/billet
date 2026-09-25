@@ -78,7 +78,7 @@ func TestNothingIsUnpackedWithoutItsVendorsChecksum(t *testing.T) {
 				"  if [ \"$1\" = -o ]; then printf '%s' " +
 				shellQuote(body) + " >\"$2\"; exit 0; fi\n  shift\ndone\nexit 1\n"
 
-			if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(fake), 0o700); err != nil {
+			if err := forkSafeWriteFile(filepath.Join(bin, "curl"), []byte(fake), 0o700); err != nil {
 				t.Fatalf("write the fake curl: %v", err)
 			}
 
@@ -92,7 +92,7 @@ func TestNothingIsUnpackedWithoutItsVendorsChecksum(t *testing.T) {
 				"fetch_verified " + args + "\n"
 
 			script := filepath.Join(dir, "run.sh")
-			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 				t.Fatalf("write the harness: %v", err)
 			}
 

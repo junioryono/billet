@@ -691,7 +691,7 @@ func TestTheGuardStatusFixturesAreTheCommandsOwn(t *testing.T) {
 
 			candidate := stageGuardCandidate(t, f, "recovery-20260909T120000-0badcafe", []byte("#!/bin/sh\nexit 0\n"))
 			mustOK(t, guardRun(t, "hold", "--holder", "ci-1", "--candidate", candidate))
-			mustOK(t, os.WriteFile(candidate, []byte("#!/bin/sh\nexit 1\n"), 0o755))
+			mustOK(t, forkSafeWriteFile(candidate, []byte("#!/bin/sh\nexit 1\n"), 0o755))
 		},
 		"malformed-record": func(t *testing.T, f *guardFixture) {
 			t.Helper()

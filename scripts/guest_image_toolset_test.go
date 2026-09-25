@@ -223,7 +223,7 @@ func dpkgArchFor(t *testing.T, arch string) string {
 		"billet_tc_set_arch\nprintf '%s' \"$BILLET_TC_DPKG\"\n"
 
 	script := filepath.Join(t.TempDir(), "arch.sh")
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 
@@ -274,7 +274,7 @@ func runHarness(t *testing.T, script string) (string, error) {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

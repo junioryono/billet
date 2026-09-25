@@ -105,7 +105,7 @@ func runGlobals(t *testing.T) []string {
 		"install_global_packages\n"
 
 	script := filepath.Join(dir, "run.sh")
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

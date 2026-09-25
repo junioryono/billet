@@ -1534,7 +1534,7 @@ func TestAPoolTheClusterDidNotDescribeIsNotInvented(t *testing.T) {
 // green. This puts a real rbd on PATH and no ceph.
 func TestAMissingCephIsRefusedEvenWhenRBDIsPresent(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "rbd"), []byte("#!/bin/sh\necho '[]'\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, "rbd"), []byte("#!/bin/sh\necho '[]'\n"), 0o700); err != nil {
 		t.Fatalf("write the rbd stub: %v", err)
 	}
 

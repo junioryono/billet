@@ -106,7 +106,7 @@ func TestEveryAndroidPackageArrivesAsOneArgument(t *testing.T) {
 		t.Fatalf("write the fake catalogue: %v", err)
 	}
 
-	if err := os.WriteFile(mgr, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(mgr, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the fake sdkmanager: %v", err)
 	}
 
