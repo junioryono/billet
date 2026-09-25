@@ -774,8 +774,24 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 	if err := runner.Destroy(t.Context(), 11); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
+
+	// CLOSED WHEN THE COMPUTE STOPPED: the token attaches nothing more, and the
+	// volume waits for the retry loop rather than holding up the teardown.
+	closed := cacheRequest(t, service, spec.CacheToken, "/v1/volumes",
+		map[string]any{"key": "acme/api/npm", "size_bytes": int64(1 << 30)})
+	if closed.Code == http.StatusCreated {
+		t.Fatal("a stopped compute's token still attached a volume")
+	}
+	if storage.discarded != 0 {
+		t.Errorf("discarded %d volumes on the teardown path, want the discard left to RetryClosed",
+			storage.discarded)
+	}
+
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 	if storage.discarded != 1 {
-		t.Errorf("discarded %d attached volumes when compute stopped, want 1", storage.discarded)
+		t.Errorf("discarded %d attached volumes after the compute stopped, want 1", storage.discarded)
 	}
 
 	after := cacheRequest(t, service, spec.CacheToken, "/v1/volumes",
@@ -1197,6 +1213,19 @@ func TestSuccessfulEmptyInventoryClosesPersistedCacheSessions(t *testing.T) {
 
 	if err := service.ReconcileInventory(t.Context(), nil); err != nil {
 		t.Fatalf("ReconcileInventory: %v", err)
+	}
+	// CLOSED, NOT DISCARDED: the discard belongs to the retry loop, off the path
+	// that proved the compute gone.
+	if storage.discarded != 0 {
+		t.Fatalf("discarded = %d while reconciling, want the discard left to RetryClosed", storage.discarded)
+	}
+	select {
+	case <-service.ClosedSessions():
+	default:
+		t.Fatal("closing a session with volumes left to discard did not wake the retry loop")
+	}
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
 	}
 	if storage.discarded != 1 {
 		t.Fatalf("discarded = %d, want 1", storage.discarded)
