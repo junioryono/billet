@@ -109,6 +109,13 @@ github:
 #   # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which
 #   # is correct: the lock is meaningful per boot.
 #   lock_dir: /run/billet/locks
+#
+#   # Measure each job from the host and report it to the control plane
+#   # (firecracker and docker nodes only). Absent means off. See
+#   # billet.example.yaml for what each key does.
+#   # monitoring:
+#   #   interval: 1s
+#   #   rapl: true
 
 # Tiers are yours to define. The label is what users put in `runs-on`.
 tiers:

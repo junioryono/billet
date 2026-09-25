@@ -407,6 +407,26 @@ node:
   #
   # drain_timeout: 6h
 
+  # Measure each job from the host: its cgroup's CPU, memory, io and pressure,
+  # its tap, the VMM's vCPU and emulation threads, and (with rapl) its share of
+  # the package energy counter. The summary and a compressed series reach the
+  # control plane before the compute is destroyed; `billet jobs show <lease>`
+  # prints them. Absent means off, and off launches exactly as before.
+  #
+  # On firecracker this also asks the jailer to enable the memory and io
+  # controllers for each microVM, where `billet check` shows the host can.
+  # Only firecracker and docker nodes accept this block.
+  #
+  # idle_package_watts is the package power this host draws with no jobs,
+  # measured by you (turbostat's PkgWatt over a quiet minute). With it, energy
+  # above the baseline is shared by CPU time and the baseline by reserved vCPUs;
+  # without it the whole package is shared by CPU time and marked unsplit.
+  #
+  # monitoring:
+  #   interval: 1s
+  #   rapl: true
+  #   idle_package_watts: 73.5
+
   firecracker:
     # The guest kernel must include everything Docker needs, or service
     # containers fail in ways that are hard to read. Validate with moby's

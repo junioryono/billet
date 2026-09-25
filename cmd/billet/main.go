@@ -1449,8 +1449,7 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			return nil, err
 		}
 
-		return firecracker.New(deployment, *cfg.Node.Firecracker, store,
-			firecracker.WithLogger(slog.Default()))
+		return firecracker.New(deployment, *cfg.Node.Firecracker, store, firecrackerOptions(cfg)...)
 
 	case config.ProviderTart:
 		// Labelled with the DEPLOYMENT id for the docker backend's reason: two
@@ -1714,6 +1713,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// than one attempting a transaction against a machine that is not shaped for
 	// it.
 	runnerOpts = append(runnerOpts, node.WithUpgrader(upgrader))
+
+	monitorOpts, err := nodeMonitorOptions(ctx, cfg, p)
+	if err != nil {
+		return err
+	}
+	runnerOpts = append(runnerOpts, monitorOpts...)
 
 	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)
 

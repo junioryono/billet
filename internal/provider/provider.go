@@ -438,3 +438,30 @@ type QuotaReporter interface {
 	// for its advisory probes.
 	Quotas(ctx context.Context) ([]Quota, error)
 }
+
+// UsageTarget is where the host can read one instance's counters.
+type UsageTarget struct {
+	// CgroupDir is the instance's own cgroup-v2 directory, absolute.
+	CgroupDir string
+	// PID is the VMM process whose threads split guest time from its own, zero
+	// for an instance with no VMM.
+	PID int
+	// VCPUThreadPrefix names the threads that run guest code.
+	VCPUThreadPrefix string
+	// NetDevice is the host's end of the instance's network device, empty when
+	// its traffic cannot be told apart from anything else's.
+	NetDevice string
+	// NetHostView says NetDevice counts from the host's side (a tap), so its
+	// received bytes are what the guest sent.
+	NetHostView bool
+}
+
+// UsageSource is a backend whose instances can be measured from the host.
+//
+// AN OPTIONAL CAPABILITY that carries no safety invariant: a backend without it
+// has nothing measured, and a failure to answer loses a measurement, never a
+// job.
+type UsageSource interface {
+	// UsageTarget says where a running instance's counters are.
+	UsageTarget(ctx context.Context, instanceID string) (UsageTarget, error)
+}

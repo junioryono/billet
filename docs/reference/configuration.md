@@ -71,6 +71,11 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `drain_timeout` | no | when the node starts reporting a drain as long |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |
+| `monitoring` | no | measure each job from the host; absent means off; firecracker and docker only (see below) |
+
+### `node.monitoring` (optional; firecracker and docker only)
+
+`interval` (a Go duration, default `1s`, from `250ms` to `30s`; the upper bound keeps the package energy counter from wrapping unseen between readings), `rapl` (read `/sys/class/powercap/intel-rapl:0/energy_uj`, the package zone only, and share it among jobs by CPU time), `idle_package_watts` (the host's measured idle package power; requires `rapl`; with it the energy above the baseline is shared by CPU time and the baseline by reserved vCPUs, and without it the whole package is shared by CPU time and recorded as `rapl-unsplit`). On firecracker it also asks the jailer to enable the memory and io controllers for each microVM, but only for a controller `billet check` reports present, because the jailer refuses a launch whose key names a file the kernel does not provide. A group the host could not read is recorded as unmeasured, never as zero. A job adopted by a restarted node, or held in custody, is not measured.
 
 ### `node.firecracker` (required for firecracker, refused otherwise)
 

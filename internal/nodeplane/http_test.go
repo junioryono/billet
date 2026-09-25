@@ -264,9 +264,9 @@ type fakeStore struct {
 	observations []observed
 	observeErr   error
 	// usages are the usage reports recorded, with the epoch each arrived under.
-	usages []reportedUsage
-	pool         map[string]alloc.PoolRunner
-	retired      []string
+	usages  []reportedUsage
+	pool    map[string]alloc.PoolRunner
+	retired []string
 }
 
 type cachePolicyFunc func(ctx context.Context, kind, owner, repository string) (bool, error)
