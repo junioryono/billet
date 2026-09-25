@@ -31,7 +31,7 @@ Nothing is reserved for an idle tier. An explicit `reserved` floor is the one ex
 
 ### The waiting order is a policy, and it gates purchases only
 
-When several tiers want the room a finished job leaves, `server.admission_order` decides. `fair`, the default, gives it to the tier that has waited longest and holds it until that tier's shape fits; `fill` gives it to anything that fits. A tier's place is dated by its first refusal and released when its demand is served or when GitHub's count says the work is gone.
+When several tiers want the room a finished job leaves, `server.admission_order` decides. `fair`, the default, gives it to the tier that has waited longest and holds it until that tier's shape fits; `fill` gives it to anything that fits. A tier's place is dated by its first refusal and released when its demand is served or when GitHub's count says the work is gone. A waiting tier that buys goes to the back of the order and keeps waiting, so waiting tiers take turns one purchase each; before that, a tier whose demand kept arriving was never served and held the line for as long as its backlog lasted (#248).
 
 The order never lowers an advertisement. That distinction is the whole lesson of v0.11.0: admission control that works by withholding advertisement cannot be corrected later, because the work it would have scheduled is never assigned in the first place.
 
