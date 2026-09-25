@@ -231,7 +231,7 @@ The upgrade root's trust boundary is proved before any of these takes the lock, 
 
 | Command | Meaning |
 |---|---|
-| `billet teardown --tier <label>\|--all [--target NAME] [--runner-group] [--force] [--yes]` | delete the scale sets billet created on GitHub; `--all` walks every target with that target's credential, a declared tier's target comes from the config, and `--target` names it for a tier the config no longer declares |
+| `billet teardown --tier <name>\|--all [--target NAME] [--runner-group] [--force] [--yes]` | delete the scale sets billet created on GitHub; `--all` walks every target with that target's credential, a declared tier's target comes from the config, and `--target` names it for a tier the config no longer declares; `--tier` is the scale set's name (a tier's `runs_on`, else its label), and matches that tier on every target that declares it |
 | `billet decommission [--yes] [--terminate-instances]` | delete the EC2 instances and EBS+S3 cache billet made outside Terraform; without `--yes` it reports |
 
 ## Acceptance

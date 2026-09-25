@@ -31,7 +31,7 @@ GitHub's Runner Scale Set API is a long-poll: billet asks, GitHub answers when i
 
 ## What a job looks like from the inside
 
-1. A workflow says `runs-on: <tier label>`. GitHub queues the job against the scale set with that name.
+1. A workflow says `runs-on: <tier label>` (or the tier's `runs_on`, when it names one). GitHub queues the job against the scale set with that name.
 2. The server's listener for that tier has already escrowed capacity in the ledger, so it advertises a slot. GitHub offers the job; the server acquires it and records the assignment.
 3. Placement picks the host: the tier's providers in preference order, then packing (or spreading), then name. The lease is bound to that host and charged against both the host's budget and the deployment ceiling.
 4. The node launches: a container, a microVM under the jailer with a copy-on-write root disk, a tart VM, an EC2 instance, or a CodeBuild build. The runner inside registers with GitHub using the single-use JIT configuration and picks up the job.

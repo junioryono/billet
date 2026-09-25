@@ -321,16 +321,55 @@ func TestGitHubAppCreateRefusesTwoScopesAndNone(t *testing.T) {
 	}
 }
 
-// --target names where an UNDECLARED tier lives; a declared tier's target is
-// the config's to say.
-func TestTeardownTargetFlagAppliesOnlyToAnUndeclaredTier(t *testing.T) {
-	cfgPath := writeTargetConfig(t, "  org: acme", "")
+// twoTargetTeardownExtra puts the fixture's tier on default and a second tier,
+// answering to another name, on a repository target.
+const twoTargetTeardownExtra = `    target: default
+  - label: personal-4vcpu
+    runs_on: widgets-4vcpu
+    provider: docker
+    vcpu: 4
+    memory: 16GiB
+    image: ghcr.io/actions/actions-runner:latest
+    trust: untrusted
+    target: personal
+targets:
+  - name: personal
+    repository: someone/widgets
+    app_id: 8
+    installation_id: 9
+    private_key_path: EXTRA_KEY
+`
 
-	err := cmdTeardown(t.Context(), []string{
-		"--config", cfgPath, "--tier", "billet-4vcpu", "--target", "default", "--yes",
+// --target SCOPES A NAME TO ONE TARGET. A name another target still declares
+// is undeclared on this one, so a set left there needs its group, and is never
+// resolved to the other target's live set.
+func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
+	cfgPath := writeTargetConfig(t, "  org: acme", twoTargetTeardownExtra)
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	onPersonal, err := tiersOnTarget(cfg, "personal")
+	if err != nil {
+		t.Fatalf("tiersOnTarget: %v", err)
+	}
+
+	if len(onPersonal) != 1 || onPersonal[0].Label != "personal-4vcpu" {
+		t.Fatalf("tiers on personal = %v, want only personal-4vcpu", onPersonal)
+	}
+
+	err = cmdTeardown(t.Context(), []string{
+		"--config", cfgPath, "--tier", "billet-4vcpu", "--target", "personal", "--yes",
 	})
-	if err == nil || !strings.Contains(err.Error(), "--target names where to look") {
-		t.Fatalf("a declared tier with --target: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "is not a tier in the config") {
+		t.Fatalf("a name only default declares, scoped to personal: %v", err)
+	}
+
+	err = cmdTeardown(t.Context(), []string{"--config", cfgPath, "--all", "--target", "personal", "--yes"})
+	if err == nil || !strings.Contains(err.Error(), "--all walks every target") {
+		t.Fatalf("--all with --target: %v", err)
 	}
 }
 
