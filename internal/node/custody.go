@@ -231,6 +231,7 @@ func (r *Runner) adoptWithObservation(
 	// instance gone, which is the ordinary way an adoption ends.
 	entry.unconfirmed.Store(true)
 
+	r.forgetRunningLocked(inst.Name)
 	r.custody[lease.ID] = entry
 }
 
@@ -274,6 +275,7 @@ func (r *Runner) holdWithRegistration(
 	}
 	entry.epoch.Store(lease.Epoch)
 	entry.unconfirmed.Store(true)
+	r.forgetRunningLocked(name)
 	r.custody[lease.ID] = entry
 }
 
@@ -327,6 +329,7 @@ func (r *Runner) holdWithOutcomeAndEvidence(
 	// otherwise, a Destroy for this request must not report success.
 	entry.unconfirmed.Store(true)
 
+	r.forgetRunningLocked(name)
 	r.custody[lease.ID] = entry
 }
 
