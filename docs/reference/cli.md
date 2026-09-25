@@ -236,7 +236,7 @@ The upgrade root's trust boundary is proved before any of these takes the lock, 
 
 ## Acceptance
 
-`billet acceptance up|run|evidence|down|sweep` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. `up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]`; `run --workspace [--jobs 1] [--wait 30m] [--no-teardown]`; `evidence --workspace [--out]`; `down --workspace [--wait 20m] [--keep-workspace]`; `sweep --workspace` asks whether anything billable is left without destroying anything. A weekly workflow runs it; it is never run on a pull request.
+`billet acceptance up|run|evidence|down|sweep` stands an isolated deployment up beside this one against a real account, runs a real job, and destroys exactly what it made. `up --config <derive-from> --workspace <dir> [--account] [--label-prefix accept] [--region]`; `run --workspace [--jobs 1] [--wait 30m] [--no-teardown]`; `evidence --workspace [--out]`; `down --workspace [--wait 20m] [--keep-workspace]`; `sweep --workspace` asks whether anything billable is left without destroying anything. Nothing runs it on a schedule; it is run by hand, never on a pull request.
 
 ## `billet version`
 
