@@ -277,7 +277,9 @@ func TestAScaleSetIsDescribedByTheTiersRunsOn(t *testing.T) {
 		RequestID: 7, VCPU: 2, Memory: 8 * config.GiB, GuestOS: config.GuestLinux,
 		Providers: []config.ProviderKind{config.ProviderDocker}}
 
-	go func() { _ = p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	launched := make(chan error, 1)
+
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for p.QueuedForTest("n1") == 0 {

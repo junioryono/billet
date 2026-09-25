@@ -2235,7 +2235,7 @@ func (t WorkloadTrust) Effective() WorkloadTrust {
 
 // ScaleSetName is the name of this tier's scale set on its target: RunsOn, or
 // Label when the tier names none.
-func (t *Tier) ScaleSetName() string {
+func (t Tier) ScaleSetName() string {
 	if t.RunsOn != "" {
 		return t.RunsOn
 	}
