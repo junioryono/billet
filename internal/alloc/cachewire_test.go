@@ -60,3 +60,27 @@ func TestACacheConfiguredTierIsPlacedOnlyWhereItCanBeHonoured(t *testing.T) {
 		t.Fatalf("configured lease placed on %q, want new-host", leases[0].TargetNode)
 	}
 }
+
+// A HOST TOO SMALL FOR ONE RUNNER DOES NOT END THE WAIT: a tier whose only
+// host on the version cannot hold it is still waiting for one that can.
+func TestAnUndersizedCurrentHostDoesNotEndTheWait(t *testing.T) {
+	t.Parallel()
+
+	configured := tier("configured", 32, 64*config.GiB)
+	off := false
+	configured.Cache = &config.TierCache{StickyDisks: &config.CacheToggle{Enabled: &off}}
+	a := newBareAllocator(t, Limits{MaxVCPU: 1024, MaxMemory: 2048 * config.GiB}, []config.Tier{configured})
+
+	old := testRegistration("old-host", config.ProviderFirecracker)
+	old.WireMin, old.WireVersion, old.WireMax = 12, CacheAuthorityWireVersion-1, CacheAuthorityWireVersion-1
+	small := testRegistration("small-host", config.ProviderFirecracker)
+	small.VCPU, small.Memory = 4, 8*config.GiB
+	for _, reg := range []NodeRegistration{old, small} {
+		if _, err := a.RegisterNode(t.Context(), reg); err != nil {
+			t.Fatalf("RegisterNode(%s): %v", reg.Name, err)
+		}
+	}
+	if waits, err := a.WaitsForCacheAwareHost(t.Context(), configured); err != nil || !waits {
+		t.Fatalf("with only an undersized host on the version, waits = %v, %v; want true", waits, err)
+	}
+}

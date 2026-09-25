@@ -78,11 +78,15 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 		Env:  []string{"GIT_PROJECT_ROOT=" + root, "GIT_HTTP_EXPORT_ALL=1"},
 	}
 	upstream.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A RENAMED REPOSITORY IS A REDIRECT, as github.com answers one.
-		if old, ok := strings.CutPrefix(r.URL.Path, "/acme/old.git/"); ok {
-			http.Redirect(w, r, upstream.URL+"/acme/api.git/"+old+"?"+r.URL.RawQuery, http.StatusMovedPermanently)
+		// A RENAMED REPOSITORY IS A REDIRECT, as github.com answers one; a
+		// transferred one names another owner.
+		for _, from := range []string{"/acme/old.git/", "/other/moved.git/"} {
+			if old, ok := strings.CutPrefix(r.URL.Path, from); ok {
+				http.Redirect(w, r, upstream.URL+"/acme/api.git/"+old+"?"+r.URL.RawQuery,
+					http.StatusMovedPermanently)
 
-			return
+				return
+			}
 		}
 		if r.Header.Get("Authorization") != githubBasic || upstream.refuse.Load() {
 			w.Header().Set("WWW-Authenticate", `Basic realm="GitHub"`)
@@ -720,6 +724,16 @@ func TestOnlyTheScopeOwnersRepositoriesAreMirrored(t *testing.T) {
 	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
 		t.Fatal("a repository outside the session's owner was mirrored")
 	}
+
+	// NOR ONE THAT ONLY REDIRECTS FROM THE OWNER: a repository transferred out
+	// of the scope is judged where it now lives.
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/other/moved.git", "d"); err != nil {
+		t.Fatalf("clone of a transferred repository: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
+		t.Fatal("a repository transferred out of the session's owner was mirrored")
+	}
 }
 
 // AN ADVERTISEMENT ALWAYS ASKS ABOUT THE NAME IT WAS GIVEN, so a rename is
@@ -734,7 +748,7 @@ func TestARenameIsFollowedOnlyForTheFetchItWasGivenTo(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
 		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
 	now := time.Now()
-	if _, ok := g.learnRename(old, resp, now); !ok {
+	if _, ok := g.learnRename(old, resp, now, g.ask()); !ok {
 		t.Fatal("the redirect was not learned")
 	}
 	if moved := g.follow(old, now); moved.repo != "api" {
@@ -807,4 +821,68 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 	}
 	_ = syscall.Kill(child, syscall.SIGKILL)
 	t.Fatal("the child outlived its cancelled parent")
+}
+
+// A RENAME ENDS WITH THE NEXT ANSWER THAT IS NOT ONE: a refusal, or could not
+// tell, about the old name must not leave its fetch following the rename to a
+// repository whose grant is still held.
+func TestARenameIsWithdrawnByALaterAnswer(t *testing.T) {
+	t.Parallel()
+
+	g := newGitProxy(t.TempDir())
+	session := &cacheSession{trust: provider.TrustUntrusted}
+	old := gitRequest{session: session, owner: "acme", repo: "old", auth: "basic YQ=="}
+	redirect := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
+	refusal := &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}}
+	now := time.Now()
+
+	older, learned, refused := g.ask(), g.ask(), g.ask()
+	g.learnRename(old, redirect, now, learned)
+	if moved, _ := g.learnRename(old, refusal, now, refused); moved.repo != "old" {
+		t.Fatalf("a refusal answered with %q", moved.repo)
+	}
+	if moved := g.follow(old, now); moved.repo != "old" {
+		t.Fatal("a fetch followed a rename GitHub had since stopped giving")
+	}
+	if _, ok := g.learnRename(old, redirect, now, older); ok {
+		t.Fatal("an older redirect overtook the withdrawal")
+	}
+	if moved := g.follow(old, now); moved.repo != "old" {
+		t.Fatal("an older redirect was followed after the withdrawal")
+	}
+	unknown := g.ask()
+	g.learnRename(old, redirect, now, g.ask())
+	g.learnRename(old, nil, now, unknown)
+	if moved := g.follow(old, now); moved.repo != "api" {
+		t.Fatal("an older could-not-tell withdrew a newer rename")
+	}
+	g.learnRename(old, nil, now, g.ask())
+	if moved := g.follow(old, now); moved.repo != "old" {
+		t.Fatal("could not tell left the rename standing")
+	}
+}
+
+// RENAMES ARE FORGOTTEN once no question they could order is still in flight,
+// so headers that come and go do not grow the node's memory.
+func TestRenamesAreForgotten(t *testing.T) {
+	t.Parallel()
+
+	g := newGitProxy(t.TempDir())
+	session := &cacheSession{trust: provider.TrustUntrusted}
+	redirect := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
+	now := time.Now()
+	for i := range 50 {
+		request := gitRequest{session: session, owner: "acme", repo: "old", auth: gitAuth(fmt.Sprint("basic ", i))}
+		g.learnRename(request, redirect, now, g.ask())
+	}
+	last := gitRequest{session: session, owner: "acme", repo: "old", auth: "basic last"}
+	g.learnRename(last, redirect, now.Add(gitGrantMemory+time.Second), g.ask())
+	g.mu.Lock()
+	held := len(g.renamed)
+	g.mu.Unlock()
+	if held != 1 {
+		t.Fatalf("%d renames held after their memory, want only the newest", held)
+	}
 }

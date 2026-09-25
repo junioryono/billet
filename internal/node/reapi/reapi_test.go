@@ -372,8 +372,96 @@ func TestATreeNamedManyTimesIsExpandedOnce(t *testing.T) {
 	if _, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
 		t.Fatalf("GetActionResult: %v", err)
 	}
-	if got := volume.opened[digestOf(tree).GetHash()]; got != 1 {
-		t.Fatalf("the tree was opened %d times, want once", got)
+	if got := volume.opened[digestOf(tree).GetHash()]; got != 2 {
+		t.Fatalf("the tree was opened %d times, want once to check it and once to read it", got)
+	}
+}
+
+// storeResult stores bodies in the CAS and result under a fresh action, and
+// returns GetActionResult's answer to it.
+func storeResult(t *testing.T, bodies [][]byte, result *repb.ActionResult) error {
+	t.Helper()
+
+	volume, open := volumeIn(t)
+	conn := serve(t, open)
+	for _, body := range bodies {
+		if err := volume.Put(t.Context(), reapi.TableCAS, digestOf(body).GetHash(), bytes.NewReader(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ac := repb.NewActionCacheClient(conn)
+	action := digestOf([]byte(t.Name()))
+	if _, err := ac.UpdateActionResult(t.Context(), &repb.UpdateActionResultRequest{
+		ActionDigest: action, ActionResult: result,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: action})
+
+	return err
+}
+
+func treeNaming(t *testing.T, name string, files ...[]byte) []byte {
+	t.Helper()
+
+	root := &repb.Directory{}
+	for _, file := range files {
+		root.Files = append(root.Files, &repb.FileNode{Name: name, Digest: digestOf(file)})
+	}
+	tree, err := proto.Marshal(&repb.Tree{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return tree
+}
+
+// A TREE IS EXPANDED EVEN WHEN THE SAME DIGEST WAS CHECKED AS A BLOB: present
+// bytes say nothing about the files inside them.
+func TestATreeAlsoNamedAsABlobIsStillExpanded(t *testing.T) {
+	t.Parallel()
+
+	tree := treeNaming(t, "f", []byte("never stored"))
+	err := storeResult(t, [][]byte{tree}, &repb.ActionResult{
+		StdoutDigest:      digestOf(tree),
+		OutputDirectories: []*repb.OutputDirectory{{Path: "out", TreeDigest: digestOf(tree)}},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("GetActionResult = %v, want NotFound for the file the tree names", err)
+	}
+}
+
+// A TREE NAMED LARGER THAN IT IS IS NOT A HIT, because ByteStream refuses to
+// serve it under that digest.
+func TestATreeNamedLargerThanItIsIsNotAHit(t *testing.T) {
+	t.Parallel()
+
+	file := []byte("stored")
+	tree := treeNaming(t, "f", file)
+	wrong := digestOf(tree)
+	wrong.SizeBytes++
+	err := storeResult(t, [][]byte{tree, file}, &repb.ActionResult{
+		OutputDirectories: []*repb.OutputDirectory{{Path: "out", TreeDigest: wrong}},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("GetActionResult = %v, want NotFound", err)
+	}
+}
+
+// A LARGE TREE NAMED TWICE COSTS ITS SIZE ONCE: the budget is for reading, and
+// the second reference reads nothing.
+func TestALargeTreeNamedTwiceFitsTheBudgetOnce(t *testing.T) {
+	t.Parallel()
+
+	file := []byte("stored")
+	tree := treeNaming(t, strings.Repeat("n", 40<<20), file)
+	err := storeResult(t, [][]byte{tree, file}, &repb.ActionResult{
+		OutputDirectories: []*repb.OutputDirectory{
+			{Path: "a", TreeDigest: digestOf(tree)}, {Path: "b", TreeDigest: digestOf(tree)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("GetActionResult = %v, want the result served", err)
 	}
 }
 

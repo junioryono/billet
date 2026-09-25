@@ -711,9 +711,9 @@ func TestAFullGenerationStartsOver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("casVolume: %v", err)
 	}
-	if !hv.Fresh || storage.discarded != 1 {
-		t.Fatalf("fresh %v, discarded %d; want the full clone discarded and a fresh start", hv.Fresh,
-			storage.discarded)
+	if hv.Supersedes != "full" || storage.discarded != 1 {
+		t.Fatalf("supersedes %q, discarded %d; want the full clone discarded and a fresh start",
+			hv.Supersedes, storage.discarded)
 	}
 	service.casFill = 1
 	if code := putObject(t, service, token, "after the reset"); code != http.StatusOK {
@@ -726,6 +726,41 @@ func TestAFullGenerationStartsOver(t *testing.T) {
 	if storage.current != "next" || storage.cloned != 1 {
 		t.Fatalf("current %q after %d clones; want the fresh volume published without a merge",
 			storage.current, storage.cloned)
+	}
+}
+
+// A FRESH START REPLACES ONLY THE GENERATION IT FOUND FULL: when another job
+// published after it (another fresh start, say), its objects are merged into
+// that publication, or the other job's work would vanish from the cache.
+func TestAFreshStartMergesIntoANewerPublication(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{current: "full"}
+	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	session := service.sessionOf(instance)
+	service.casFill = 0
+	session.mu.Lock()
+	hv, err := service.casVolume(t.Context(), session, config.CacheGo)
+	session.mu.Unlock()
+	if err != nil || hv.Supersedes != "full" {
+		t.Fatalf("casVolume: %v, supersedes %q; want a fresh start in place of full", err, hv.Supersedes)
+	}
+	service.casFill = 1
+	if code := putObject(t, service, token, "after the reset"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	storage.current = "another fresh start"
+	cloned := storage.cloned
+	finish(t, service, instance, server.CacheAuthority{})
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.cloned != cloned+1 || storage.published != 1 {
+		t.Fatalf("%d clones and %d publications after the newer one; want it cloned and merged into",
+			storage.cloned-cloned, storage.published)
+	}
+	if got := storage.publishExpected[0]; got != "another fresh start" {
+		t.Fatalf("published over %q, want over the newer publication", got)
 	}
 }
 

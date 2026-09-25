@@ -363,7 +363,7 @@ func (s *service) GetActionResult(
 	// EVERY BLOB IS CHECKED ONCE, and a Tree expanded once, within one budget
 	// for the whole result: a result naming one Tree a thousand times must not
 	// cost a thousand expansions of it.
-	check := resultCheck{ctx: ctx, v: v, seen: make(map[string]bool)}
+	check := resultCheck{ctx: ctx, v: v, seen: make(map[string]bool), expanded: make(map[string]bool)}
 	for _, d := range []*repb.Digest{result.GetStdoutDigest(), result.GetStderrDigest()} {
 		check.blob(d)
 	}
@@ -390,11 +390,13 @@ const (
 )
 
 // resultCheck is one GetActionResult's walk over what the result names. The
-// first failure stops it; a missing blob is NotFound.
+// first failure stops it; a missing blob is NotFound. A digest checked as a
+// blob is still expanded as a Tree: the two are different questions about it.
 type resultCheck struct {
 	ctx       context.Context
 	v         Volume
 	seen      map[string]bool
+	expanded  map[string]bool
 	treeBytes int64
 	err       error
 }
@@ -415,7 +417,7 @@ func (c *resultCheck) first(d *repb.Digest) bool {
 
 		return false
 	}
-	key := d.GetHash() + "/" + strconv.FormatInt(d.GetSizeBytes(), 10)
+	key := digestKey(d)
 	if c.seen[key] {
 		return false
 	}
@@ -442,8 +444,15 @@ func (c *resultCheck) blob(d *repb.Digest) {
 	}
 }
 
+func digestKey(d *repb.Digest) string {
+	return d.GetHash() + "/" + strconv.FormatInt(d.GetSizeBytes(), 10)
+}
+
 func (c *resultCheck) tree(d *repb.Digest) {
-	if d == nil || c.err != nil {
+	// PRESENT AT EXACTLY ITS SIZE, as ByteStream will serve it, before anything
+	// is read of it.
+	c.blob(d)
+	if d == nil || c.err != nil || c.expanded[digestKey(d)] {
 		return
 	}
 	if d.GetSizeBytes() > resultTreeBudget-c.treeBytes {
@@ -451,9 +460,7 @@ func (c *resultCheck) tree(d *repb.Digest) {
 
 		return
 	}
-	if !c.first(d) {
-		return
-	}
+	c.expanded[digestKey(d)] = true
 	c.treeBytes += d.GetSizeBytes()
 	files, err := treeFiles(c.v, d)
 	if err != nil {

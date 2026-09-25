@@ -65,9 +65,10 @@ type hostVolume struct {
 	// Merge is the clone of the newest generation a merge publication is
 	// filling, recorded before it is mounted so a crash cannot lose it.
 	Merge *storecontract.Volume `json:"merge,omitempty"`
-	// Fresh says the newest generation was full, so this job started empty and
-	// its volume replaces that generation rather than merging into it.
-	Fresh bool `json:"fresh,omitempty"`
+	// Supersedes is the full generation this job found and started empty in
+	// place of. Its volume replaces that generation and no other: anything
+	// published since, another fresh start's included, is merged into.
+	Supersedes string `json:"supersedes,omitempty"`
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
@@ -177,7 +178,7 @@ func (s *CacheService) startFresh(
 	if err != nil {
 		return err
 	}
-	hv.Volume, hv.Fresh = fresh, true
+	hv.Supersedes, hv.Volume = hv.Volume.Generation, fresh
 	if err := s.persistSession(session); err != nil {
 		return errors.Join(err, s.store.Discard(ctx, fresh))
 	}
@@ -667,7 +668,7 @@ func (s *CacheService) mergeCASVolume(
 	if currentErr != nil && !errors.Is(currentErr, storecontract.ErrMiss) {
 		return "", false, release(currentErr)
 	}
-	if current == hv.Volume.Generation || hv.Fresh {
+	if current == hv.Volume.Generation || (hv.Supersedes != "" && current == hv.Supersedes) {
 		candidate, err := s.store.Snapshot(ctx, hv.Volume)
 		if err != nil {
 			return "", false, release(fmt.Errorf("snapshot: %w", err))

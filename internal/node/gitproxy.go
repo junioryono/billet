@@ -122,10 +122,14 @@ type gitProxy struct {
 }
 
 // gitRename is where GitHub said a repository moved, and until when that is
-// believed without asking again.
+// believed without asking again. It is ordered by the question it answered like
+// a grant, and a later answer that is not a redirect leaves a withdrawal with
+// no destination, kept as a refusal is.
 type gitRename struct {
 	owner, repo string
 	until       time.Time
+	sequence    uint64
+	at          time.Time
 }
 
 // gitRenameAge is how long a redirect GitHub gave to one header's advertisement
@@ -415,10 +419,38 @@ func (s *CacheService) mirrorsOwner(request gitRequest) bool {
 	return owner == "" || strings.EqualFold(owner, request.owner)
 }
 
-// learnRename records a redirect GitHub gave for an advertisement when it
-// points at another repository on github.com, and reports where to.
-func (g *gitProxy) learnRename(request gitRequest, resp *http.Response, now time.Time) (gitRequest, bool) {
-	if resp.StatusCode < 300 || resp.StatusCode > 399 {
+// learnRename records GitHub's answer to question sequence about request's
+// name: a redirect to another repository on github.com is followed by this
+// header's fetch, and reported; anything else withdraws an earlier redirect,
+// so a fetch never follows a rename GitHub has since stopped giving.
+func (g *gitProxy) learnRename(
+	request gitRequest, resp *http.Response, now time.Time, sequence uint64,
+) (gitRequest, bool) {
+	moved, ok := g.renameTarget(request, resp)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for key, held := range g.renamed {
+		if now.Sub(held.at) > gitGrantMemory {
+			delete(g.renamed, key)
+		}
+	}
+	key := g.authorisationKey(request)
+	if g.renamed[key].sequence > sequence {
+		return request, false
+	}
+	held := gitRename{sequence: sequence, at: now}
+	if ok {
+		held.owner, held.repo, held.until = moved.owner, moved.repo, now.Add(gitRenameAge)
+	}
+	g.renamed[key] = held
+
+	return moved, ok
+}
+
+// renameTarget is where resp redirects request's advertisement, when that is
+// another repository on github.com.
+func (g *gitProxy) renameTarget(request gitRequest, resp *http.Response) (gitRequest, bool) {
+	if resp == nil || resp.StatusCode < 300 || resp.StatusCode > 399 {
 		return request, false
 	}
 	rest, ok := strings.CutPrefix(resp.Header.Get("Location"), g.upstream+"/")
@@ -435,11 +467,6 @@ func (g *gitProxy) learnRename(request gitRequest, resp *http.Response, now time
 		strings.EqualFold(parts[0]+"/"+repo, request.owner+"/"+request.repo) {
 		return request, false
 	}
-	g.mu.Lock()
-	g.renamed[g.authorisationKey(request)] = gitRename{
-		owner: parts[0], repo: repo, until: now.Add(gitRenameAge),
-	}
-	g.mu.Unlock()
 	request.owner, request.repo = parts[0], repo
 
 	return request, true
@@ -511,12 +538,20 @@ func (g *gitProxy) mirrorPath(key string) string { return filepath.Join(g.root, 
 func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, r *http.Request, request gitRequest) {
 	sequence := s.git.ask()
 	resp, body, err := s.upstreamRefs(ctx, request)
-	if err == nil {
-		// ONE HOP, followed here for the reason serveGit follows a known one.
-		if moved, ok := s.git.learnRename(request, resp, s.now()); ok {
-			request = moved
-			resp, body, err = s.upstreamRefs(ctx, request)
+	// ONE HOP, followed here for the reason serveGit follows a known one. Could
+	// not tell withdraws an earlier rename as any other answer does.
+	if moved, ok := s.git.learnRename(request, resp, s.now(), sequence); ok && err == nil {
+		// A RENAME OUT OF THE SCOPE'S OWNER IS NOT MIRRORED, as a request for
+		// that repository by its own name would not be: GitHub's redirect goes
+		// back to the client, whose fetch then follows it to GitHub.
+		if !s.mirrorsOwner(moved) {
+			s.git.remember(moved, s.now(), sequence, false, false)
+			s.relayGit(w, r, resp, body)
+
+			return
 		}
+		request = moved
+		resp, body, err = s.upstreamRefs(ctx, request)
 	}
 	if err != nil {
 		// COULD NOT TELL ENDS WHATEVER WAS GRANTED BEFORE, as a refusal does.

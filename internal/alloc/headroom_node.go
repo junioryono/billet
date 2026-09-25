@@ -46,7 +46,9 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 // WaitsForCacheAwareHost reports whether a tier is placed nowhere only because
 // every host it could otherwise use is too old to read its cache block, which
 // is what a rollout looks like to such a tier until its first host upgrades.
-// Asked on the read-only pool, with placement's own rule.
+// Asked on the read-only pool, with placement's own rule, of the hosts large
+// enough for one of the tier's runners: a host too small to hold one is no
+// answer to the wait whatever its version.
 func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (bool, error) {
 	if !t.NeedsCacheAwareNode() {
 		return false, nil
@@ -54,16 +56,24 @@ func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (
 	var waits bool
 	err := a.db.View(ctx, func(tx querier) error {
 		honouring, err := a.eligibleNodesFor(ctx, tx, t, true)
-		if err != nil || len(honouring) > 0 {
+		if err != nil || slices.ContainsFunc(honouring, func(n nodeRow) bool { return n.holdsOne(t) }) {
 			return err
 		}
 		any, err := a.eligibleNodesFor(ctx, tx, t, false)
-		waits = len(any) > 0
+		waits = slices.ContainsFunc(any, func(n nodeRow) bool { return n.holdsOne(t) })
 
 		return err
 	})
 
 	return waits, err
+}
+
+// holdsOne reports whether the host, empty, is large enough for one of the
+// tier's runners. A remote backend's shape already is.
+func (n nodeRow) holdsOne(t config.Tier) bool {
+	cost, ok := n.cost(t)
+
+	return ok && (!n.provider.RunsOnHost() || (n.vcpu >= cost.vcpu && n.memory >= cost.memory))
 }
 
 // eligibleNodesFor is eligibleNodes with the cache-block rule as a parameter,
