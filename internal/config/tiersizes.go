@@ -119,6 +119,9 @@ func expandOne(t Tier) ([]Tier, error) {
 		sized.Sizes = nil
 		sized.MemoryPerVCPU = 0
 		sized.Label = fmt.Sprintf("%s-%dvcpu", t.Label, size)
+		if t.RunsOn != "" {
+			sized.RunsOn = fmt.Sprintf("%s-%dvcpu", t.RunsOn, size)
+		}
 		sized.VCPU = size
 		sized.Memory = ByteSize(size) * perVCPU
 

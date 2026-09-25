@@ -20,7 +20,7 @@ tiers:
         command: [/usr/local/bin/billet-runner]
 ```
 
-Each tier becomes one GitHub runner scale set whose name is the label, so `runs-on: billet-8vcpu-ubuntu-2404` is the whole contract between a workflow and billet. A tier names one provider or an ordered list of them; with a list, the control plane fills the first provider's machines before the second's, which is how `[firecracker, ec2]` means "the box at home before the cloud". Each backend gets its own `launch` entry because a Firecracker generation, an EC2 AMI and their runner commands are backend-specific.
+Each tier becomes one GitHub runner scale set whose name is the label, so `runs-on: billet-8vcpu-ubuntu-2404` is the whole contract between a workflow and billet. A tier can instead name its scale set with `runs_on`, which is how tiers on several organizations answer to one `runs-on` value while their labels, billet's own identity for each, stay distinct. A tier names one provider or an ordered list of them; with a list, the control plane fills the first provider's machines before the second's, which is how `[firecracker, ec2]` means "the box at home before the cloud". Each backend gets its own `launch` entry because a Firecracker generation, an EC2 AMI and their runner commands are backend-specific.
 
 `sizes` with `memory_per_vcpu` expands one template into several real tiers. `disk` is real root-volume capacity on Firecracker and EC2 (the guest's copy-on-write clone is grown before boot; the golden image stays small and shared) and is ignored by Docker. `max_concurrent` is a ceiling and `reserved` is a floor held against machines that could keep it. Tiers are read at startup, so adding or changing one restarts the control plane.
 

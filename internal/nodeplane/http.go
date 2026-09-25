@@ -408,14 +408,14 @@ func (h *handler) scaleSetFor(ctx context.Context, tier config.Tier) (int, error
 		return 0, err
 	}
 
-	set, _, err := src.Describe(ctx, tier.Label, tier.RunnerGroup)
+	set, _, err := src.Describe(ctx, tier.ScaleSetName(), tier.RunnerGroup)
 	if err != nil {
 		return 0, err
 	}
 
 	if set == nil {
-		return 0, fmt.Errorf("nodeplane: tier %q has no scale set in runner group %q",
-			tier.Label, tier.RunnerGroup)
+		return 0, fmt.Errorf("nodeplane: tier %q has no scale set named %q in runner group %q",
+			tier.Label, tier.ScaleSetName(), tier.RunnerGroup)
 	}
 
 	h.setsMu.Lock()
@@ -1635,14 +1635,21 @@ func (h *handler) describe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src, err := h.jitForLabel(req.Name)
+	// A node names the tier by its label; the scale set on GitHub answers to the
+	// tier's runs_on, which only the catalogue here knows.
+	tier, ok := h.plane.tierFor(req.Name)
+	if !ok {
+		tier = config.Tier{Label: req.Name}
+	}
+
+	src, err := h.jitFor(tier)
 	if err != nil {
 		writeStoreErr(w, err)
 
 		return
 	}
 
-	set, names, err := src.Describe(r.Context(), req.Name, req.Group)
+	set, names, err := src.Describe(r.Context(), tier.ScaleSetName(), req.Group)
 	if err != nil {
 		writeStoreErr(w, err)
 

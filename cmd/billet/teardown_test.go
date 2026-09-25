@@ -201,3 +201,39 @@ func TestARunnerGroupWithoutATierIsRefused(t *testing.T) {
 		t.Errorf("the refusal does not mention --all: %v", err)
 	}
 }
+
+// --tier NAMES A SCALE SET. A tier answering to a shared runs_on is found by
+// that name on every target that declares one, and not by its label, which
+// names nothing on GitHub.
+func TestTeardownFindsATierByItsScaleSetName(t *testing.T) {
+	tiers := []config.Tier{
+		{Label: "platform-2vcpu", RunsOn: "billet-2vcpu", Target: "default"},
+		{Label: "taksa-2vcpu", RunsOn: "billet-2vcpu", Target: "taksa"},
+		{Label: "billet-4vcpu"},
+	}
+
+	got, undeclared, err := teardownTargets(tiers, "billet-2vcpu", "", false)
+	if err != nil {
+		t.Fatalf("teardownTargets: %v", err)
+	}
+
+	if undeclared || len(got) != 2 || got[0].Label != "platform-2vcpu" || got[1].Label != "taksa-2vcpu" {
+		t.Fatalf("wanted both tiers answering to billet-2vcpu, got %v (undeclared %v)", got, undeclared)
+	}
+
+	// The label is not a scale set: alone it is refused naming the set the tier
+	// answers to, and with a group it deletes a set left under that name.
+	_, _, err = teardownTargets(tiers, "platform-2vcpu", "", false)
+	if err == nil || !strings.Contains(err.Error(), `answers to "billet-2vcpu"`) {
+		t.Fatalf("a label whose tier answers to another name: %v", err)
+	}
+
+	left, undeclared, err := teardownTargets(tiers, "platform-2vcpu", "default", false)
+	if err != nil {
+		t.Fatalf("teardownTargets with a group: %v", err)
+	}
+
+	if !undeclared || len(left) != 1 || left[0].ScaleSetName() != "platform-2vcpu" {
+		t.Fatalf("wanted the set left under platform-2vcpu, got %v (undeclared %v)", left, undeclared)
+	}
+}
