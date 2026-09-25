@@ -550,8 +550,13 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 
 			return
 		}
-		request = moved
+		// THE FOLLOWED NAME'S ANSWER IS A QUESTION OF ITS OWN, numbered when it
+		// is asked and recorded against that name's rename as well as its grant,
+		// so a refusal of it outranks whatever was said about it before. A second
+		// redirect is recorded and relayed, never followed.
+		request, sequence = moved, s.git.ask()
 		resp, body, err = s.upstreamRefs(ctx, request)
+		s.git.learnRename(request, resp, s.now(), sequence)
 	}
 	if err != nil {
 		// COULD NOT TELL ENDS WHATEVER WAS GRANTED BEFORE, as a refusal does.

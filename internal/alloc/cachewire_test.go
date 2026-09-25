@@ -84,3 +84,29 @@ func TestAnUndersizedCurrentHostDoesNotEndTheWait(t *testing.T) {
 		t.Fatalf("with only an undersized host on the version, waits = %v, %v; want true", waits, err)
 	}
 }
+
+// NOR DOES A REMOTE NODE WHOSE SHAPE FITS BUT WHOSE BUDGET DOES NOT: placement
+// charges a remote node's contributed budget as it charges a host's.
+func TestAnUndersizedRemoteNodeDoesNotEndTheWait(t *testing.T) {
+	t.Parallel()
+
+	configured := tier("configured", 32, 64*config.GiB)
+	configured.Provider, configured.Providers = "", []config.ProviderKind{config.ProviderFirecracker,
+		config.ProviderEC2}
+	off := false
+	configured.Cache = &config.TierCache{StickyDisks: &config.CacheToggle{Enabled: &off}}
+	a := newBareAllocator(t, Limits{MaxVCPU: 1024, MaxMemory: 2048 * config.GiB}, []config.Tier{configured})
+
+	old := testRegistration("old-host", config.ProviderFirecracker)
+	old.WireMin, old.WireVersion, old.WireMax = 12, CacheAuthorityWireVersion-1, CacheAuthorityWireVersion-1
+	remote := testRegistration("small-ec2", config.ProviderEC2)
+	remote.VCPU, remote.Memory = 4, 8*config.GiB
+	for _, reg := range []NodeRegistration{old, remote} {
+		if _, err := a.RegisterNode(t.Context(), reg); err != nil {
+			t.Fatalf("RegisterNode(%s): %v", reg.Name, err)
+		}
+	}
+	if waits, err := a.WaitsForCacheAwareHost(t.Context(), configured); err != nil || !waits {
+		t.Fatalf("with only an undersized remote node on the version, waits = %v, %v; want true", waits, err)
+	}
+}

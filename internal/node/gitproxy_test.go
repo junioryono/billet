@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -884,5 +885,147 @@ func TestRenamesAreForgotten(t *testing.T) {
 	g.mu.Unlock()
 	if held != 1 {
 		t.Fatalf("%d renames held after their memory, want only the newest", held)
+	}
+}
+
+// scriptedGitHub answers info/refs per repository from a table a test changes
+// as it goes: a redirect to another repository, a status, or a gate that holds
+// the answer until the test releases it.
+type scriptedGitHub struct {
+	*httptest.Server
+	mu      sync.Mutex
+	answers map[string]scriptedAnswer
+}
+
+type scriptedAnswer struct {
+	redirect string
+	status   int
+	arrived  chan struct{}
+	gate     chan struct{}
+}
+
+func newScriptedGitHub(t *testing.T) *scriptedGitHub {
+	t.Helper()
+
+	github := &scriptedGitHub{answers: map[string]scriptedAnswer{}}
+	github.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		repo, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/acme/"), ".git/")
+		github.mu.Lock()
+		answer := github.answers[repo]
+		github.mu.Unlock()
+		if answer.arrived != nil {
+			close(answer.arrived)
+		}
+		if answer.gate != nil {
+			<-answer.gate
+			github.mu.Lock()
+			answer = github.answers[repo]
+			github.mu.Unlock()
+		}
+		switch {
+		case answer.redirect != "":
+			http.Redirect(w, r, github.URL+"/acme/"+answer.redirect+".git/info/refs?"+r.URL.RawQuery,
+				http.StatusMovedPermanently)
+		case answer.status != 0:
+			http.Error(w, "scripted", answer.status)
+		default:
+			_, _ = w.Write([]byte("001e# service=git-upload-pack\n0000"))
+		}
+	}))
+	t.Cleanup(github.Close)
+
+	return github
+}
+
+func (g *scriptedGitHub) answer(repo string, answer scriptedAnswer) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.answers[repo] = answer
+}
+
+// advertise asks the node for repo's advertisement as the job would.
+func advertise(t *testing.T, node *httptest.Server, token, repo string) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet,
+		node.URL+"/v1/git/github.com/acme/"+repo+".git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth(token, githubBasic)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Server, string) {
+	t.Helper()
+
+	github := newScriptedGitHub(t)
+	service, _, token, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
+	service.git.upstream, service.git.fullFraction = github.URL, 1
+	node := httptest.NewServer(service)
+	t.Cleanup(node.Close)
+
+	return service, github, node, token
+}
+
+// A FOLLOWED NAME'S REFUSAL WITHDRAWS WHAT WAS SAID ABOUT IT BEFORE: once b
+// redirected to c, an advertisement of a that GitHub sends on to b, which b
+// now refuses, must leave b's fetch no rename to follow into c's mirror.
+func TestARefusalReachedThroughARedirectWithdrawsTheFollowedNamesRename(t *testing.T) {
+	t.Parallel()
+
+	service, github, node, token := scriptedNode(t)
+	github.answer("b", scriptedAnswer{redirect: "c"})
+	advertise(t, node, token, "b")
+	b := gitRequest{session: service.byToken[token], owner: "acme", repo: "b", auth: gitAuth(githubBasic)}
+	if moved := service.git.follow(b, service.now()); moved.repo != "c" {
+		t.Fatalf("the first redirect was not learned: b goes to %q", moved.repo)
+	}
+
+	github.answer("a", scriptedAnswer{redirect: "b"})
+	github.answer("b", scriptedAnswer{status: http.StatusNotFound})
+	advertise(t, node, token, "a")
+	if moved := service.git.follow(b, service.now()); moved.repo != "b" {
+		t.Fatalf("after GitHub refused b, b's fetch still follows the rename to %q", moved.repo)
+	}
+}
+
+// A FOLLOWED NAME'S ANSWER IS ORDERED WHEN IT IS ASKED: a redirect asked about
+// before a grant of b, whose follow-up b refuses after that grant, ends it.
+func TestAFollowUpRefusalOutranksAnEarlierGrant(t *testing.T) {
+	t.Parallel()
+
+	service, github, node, token := scriptedNode(t)
+	arrived, gate := make(chan struct{}), make(chan struct{})
+	github.answer("a", scriptedAnswer{redirect: "b", arrived: arrived, gate: gate})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		advertise(t, node, token, "a")
+	}()
+	<-arrived
+	advertise(t, node, token, "b")
+	b := gitRequest{session: service.byToken[token], owner: "acme", repo: "b", auth: gitAuth(githubBasic)}
+	service.git.mu.Lock()
+	granted := service.git.authorised[service.git.authorisationKey(b)].until
+	service.git.mu.Unlock()
+	if !service.now().Before(granted) {
+		t.Fatal("the direct advertisement of b was not granted")
+	}
+
+	github.answer("b", scriptedAnswer{status: http.StatusNotFound})
+	close(gate)
+	<-done
+	service.git.mu.Lock()
+	held := service.git.authorised[service.git.authorisationKey(b)]
+	service.git.mu.Unlock()
+	if service.now().Before(held.until) {
+		t.Fatal("b's grant survived GitHub's later refusal of b")
 	}
 }

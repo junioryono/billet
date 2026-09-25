@@ -69,11 +69,12 @@ func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (
 }
 
 // holdsOne reports whether the host, empty, is large enough for one of the
-// tier's runners. A remote backend's shape already is.
+// tier's runners at what placement charges it: a remote backend's shape
+// against the budget the node contributes, as roomFor weighs it.
 func (n nodeRow) holdsOne(t config.Tier) bool {
 	cost, ok := n.cost(t)
 
-	return ok && (!n.provider.RunsOnHost() || (n.vcpu >= cost.vcpu && n.memory >= cost.memory))
+	return ok && n.vcpu >= cost.vcpu && n.memory >= cost.memory
 }
 
 // eligibleNodesFor is eligibleNodes with the cache-block rule as a parameter,

@@ -736,7 +736,7 @@ func TestAFreshStartMergesIntoANewerPublication(t *testing.T) {
 	t.Parallel()
 
 	storage := &fakeCacheStore{current: "full"}
-	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
 	session := service.sessionOf(instance)
 	service.casFill = 0
 	session.mu.Lock()
@@ -749,7 +749,20 @@ func TestAFreshStartMergesIntoANewerPublication(t *testing.T) {
 	if code := putObject(t, service, token, "after the reset"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
+	// THE NEWER PUBLICATION HOLDS AN OBJECT OF ITS OWN, on the device a clone of
+	// it is given.
 	storage.current = "another fresh start"
+	theirs := volumes.dir("/dev/rbd8")
+	if err := os.RemoveAll(theirs); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(theirs, "cas", digestOf("their object")[:2])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, digestOf("their object")), []byte("their object"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cloned := storage.cloned
 	finish(t, service, instance, server.CacheAuthority{})
 	if err := service.RetryClosed(t.Context()); err != nil {
@@ -761,6 +774,16 @@ func TestAFreshStartMergesIntoANewerPublication(t *testing.T) {
 	}
 	if got := storage.publishExpected[0]; got != "another fresh start" {
 		t.Fatalf("published over %q, want over the newer publication", got)
+	}
+	published := storage.snapshotVolumes[len(storage.snapshotVolumes)-1]
+	if published.Device != "/dev/rbd8" {
+		t.Fatalf("snapshotted %s, want the merge clone of the newer publication", published.Device)
+	}
+	for _, body := range []string{"after the reset", "their object"} {
+		got, err := os.ReadFile(filepath.Join(volumes.dir(published.Device), "cas", digestOf(body)[:2], digestOf(body)))
+		if err != nil || !bytes.Equal(got, []byte(body)) {
+			t.Errorf("the published generation lacks %q: %v", body, err)
+		}
 	}
 }
 

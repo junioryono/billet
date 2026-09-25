@@ -2043,9 +2043,11 @@ type authorityMemory struct {
 }
 
 type rememberedAuthority struct {
-	asking    sync.Mutex
 	authority server.CacheAuthority
 	until     time.Time
+	// asking is closed when the question in flight is answered; nil when none
+	// is.
+	asking chan struct{}
 }
 
 func (m *authorityMemory) resolve(
@@ -2057,11 +2059,8 @@ func (m *authorityMemory) resolve(
 		m.entries = make(map[string]*rememberedAuthority)
 	}
 	for k, entry := range m.entries {
-		if entry.asking.TryLock() {
-			if !entry.until.IsZero() && now.After(entry.until.Add(authorityDecidedFor)) {
-				delete(m.entries, k)
-			}
-			entry.asking.Unlock()
+		if entry.asking == nil && now.After(entry.until.Add(authorityDecidedFor)) {
+			delete(m.entries, k)
 		}
 	}
 	entry := m.entries[key]
@@ -2069,20 +2068,37 @@ func (m *authorityMemory) resolve(
 		entry = &rememberedAuthority{}
 		m.entries[key] = entry
 	}
-	m.mu.Unlock()
-
-	entry.asking.Lock()
-	defer entry.asking.Unlock()
+	for entry.asking != nil {
+		answered := entry.asking
+		m.mu.Unlock()
+		<-answered
+		m.mu.Lock()
+	}
 	if now.Before(entry.until) {
+		defer m.mu.Unlock()
+
 		return entry.authority
 	}
-	authority, decided := ask()
-	entry.authority, entry.until = authority, now.Add(authorityUndecidedFor)
-	if decided {
-		entry.until = now.Add(authorityDecidedFor)
-	}
+	answered := make(chan struct{})
+	entry.asking = answered
+	m.mu.Unlock()
 
-	return entry.authority
+	// ANSWERED WHATEVER ask DOES, a panic included, or every waiter on this key
+	// would wait forever.
+	authority, decided := server.CacheAuthority{}, false
+	defer func() {
+		m.mu.Lock()
+		entry.authority, entry.until = authority, now.Add(authorityUndecidedFor)
+		if decided {
+			entry.until = now.Add(authorityDecidedFor)
+		}
+		entry.asking = nil
+		close(answered)
+		m.mu.Unlock()
+	}()
+	authority, decided = ask()
+
+	return authority
 }
 
 // nodeapiAuthority is WireCacheAuthority that never answers nil, for a
