@@ -254,7 +254,7 @@ func TestTheHostedToolsAreInstalledAndGated(t *testing.T) {
 	for _, step := range []string{"install_hosted_packages", "install_github_cli", "install_hosted_binaries", "install_aws_tools",
 		"install_cloud_clis",
 		"install_hosted_php_tools", "install_bazelisk", "install_action_cache", "install_agentic_tools",
-		"install_hosted_environment"} {
+		"install_hosted_environment", "open_hosted_permissions"} {
 		if !hasExactLine(hosted, "\t"+step) {
 			t.Errorf("install_hosted_tools does not call %s", step)
 		}

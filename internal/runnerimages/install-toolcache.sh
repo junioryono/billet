@@ -3145,6 +3145,30 @@ install_hosted_tools() {
 	install_action_cache
 	install_agentic_tools
 	install_hosted_environment
+	open_hosted_permissions
+}
+
+# open_hosted_permissions opens the directories GitHub's image leaves writable
+# to every account, as its configure-system.sh and install-android-sdk.sh do.
+#
+# A JOB ADDS TO THEM. Gradle installs the NDK a React Native project asks for
+# into the Android SDK, and setup-* actions add toolcache versions under /opt;
+# read-only here, the first failed with "The SDK directory is not writable"
+# (2026-09-25). The Ruby toolcache keeps the sticky bit GitHub sets for Ruby 4.
+# The guest is one job's VM and is discarded afterwards, so opening its tree
+# costs what it costs on GitHub's image and nothing more.
+open_hosted_permissions() {
+	local root="${BILLET_TC_ROOT:-}"
+
+	chmod -R 777 "$root/usr/share" "$root/opt"
+	if [ -d "$root/opt/hostedtoolcache/Ruby" ]; then
+		find "$root/opt/hostedtoolcache/Ruby" -type d -exec chmod +t {} +
+	fi
+	if [ -d "$root/usr/local/lib/android/sdk" ]; then
+		chmod -R a+rwx "$root/usr/local/lib/android/sdk"
+	fi
+
+	echo "hosted: /opt, /usr/share and the Android SDK are writable to every account"
 }
 
 # billet_install_toolcache is the one entry point a caller invokes.

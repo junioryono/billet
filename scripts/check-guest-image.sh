@@ -412,6 +412,9 @@ check_hosted_tools() {
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+	if [ -d "$1/usr/local/lib/android/sdk" ] && [ -z "$(find "$1/usr/local/lib/android/sdk" -maxdepth 0 -perm -o+w)" ]; then
+		missing+=("a writable Android SDK (Gradle installs the NDK a project asks for into it)")
+	fi
 	grep -qx 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions' "$env" 2>/dev/null ||
 		missing+=("AZURE_EXTENSION_DIR in /etc/billet-image-env")
 	grep -q '^GOROOT_[0-9]*_[0-9]*_X64=/opt/hostedtoolcache/go/' "$env" 2>/dev/null ||
