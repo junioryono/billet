@@ -65,7 +65,8 @@ type Compute interface {
 }
 
 type completionAwareCompute interface {
-	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+	DestroyCompleted(ctx context.Context, requestID int64, result string,
+		authority server.CacheAuthority) error
 }
 
 // upgradableCompute can replace this node's own billet.
@@ -1157,7 +1158,8 @@ func execute(
 	case nodeapi.CommandDestroy:
 		var err error
 		if completed, ok := compute.(completionAwareCompute); ok && cmd.JobResult != "" {
-			err = completed.DestroyCompleted(ctx, cmd.RequestID, cmd.JobResult)
+			err = completed.DestroyCompleted(ctx, cmd.RequestID, cmd.JobResult,
+				ServerCacheAuthority(cmd.CacheAuthority))
 		} else {
 			err = compute.Destroy(ctx, cmd.RequestID)
 		}
@@ -1292,5 +1294,20 @@ func sleep(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+// ServerCacheAuthority is an authority received on the wire, or the zero
+// value, which authorises nothing, when none was sent.
+func ServerCacheAuthority(a *nodeapi.CacheAuthority) server.CacheAuthority {
+	if a == nil {
+		return server.CacheAuthority{}
+	}
+
+	return server.CacheAuthority{
+		LeaseID: a.LeaseID, JobID: a.JobID, RunID: a.RunID, Owner: a.Owner,
+		Repository: a.Repository, Event: a.Event, Ref: a.Ref, BaseRef: a.BaseRef,
+		DefaultRef: a.DefaultRef, Proven: a.Proven, WriteOwnRef: a.WriteOwnRef,
+		PublishDefault: a.PublishDefault,
 	}
 }

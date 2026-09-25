@@ -3752,6 +3752,8 @@ type fakeRunner struct {
 	onLaunch           func(requestID int64) error
 	onDestroy          func(requestID int64) error
 	onDestroyCompleted func(requestID int64, result string) error
+	// authorities are the cache authorities every completion carried, in order.
+	authorities []CacheAuthority
 }
 
 type journaledFailureRunner struct {
@@ -3795,6 +3797,7 @@ type boundFakeRunner struct {
 	node       string
 	leaseEpoch int64
 	outcome    alloc.Phase
+	authority  CacheAuthority
 	err        error
 }
 
@@ -3824,9 +3827,11 @@ func (f *boundFakeRunner) DestroyCompletedBound(
 	result, leaseID, node string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
+	authority CacheAuthority,
 ) error {
 	f.requestID, f.result, f.leaseID, f.node, f.leaseEpoch, f.outcome =
 		requestID, result, leaseID, node, leaseEpoch, outcome
+	f.authority = authority
 
 	return f.err
 }
@@ -3841,6 +3846,7 @@ func (r *absenceResolvingRunner) DestroyCompletedBound(
 	_, leaseID, node string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
+	_ CacheAuthority,
 ) error {
 	r.calls.Add(1)
 	settled, err := r.allocator.SettleCompletionOnTerminalLease(ctx, leaseID, leaseEpoch, outcome)
@@ -3868,7 +3874,9 @@ func (r *cancelAfterDestroyRunner) Destroy(context.Context, int64) error {
 	return nil
 }
 
-func (r *cancelAfterDestroyRunner) DestroyCompleted(context.Context, int64, string) error {
+func (r *cancelAfterDestroyRunner) DestroyCompleted(context.Context, int64, string,
+	CacheAuthority,
+) error {
 	r.cancel()
 
 	return nil
@@ -3890,7 +3898,10 @@ func (f *fakeRunner) Destroy(_ context.Context, requestID int64) error {
 	return nil
 }
 
-func (f *fakeRunner) DestroyCompleted(_ context.Context, requestID int64, result string) error {
+func (f *fakeRunner) DestroyCompleted(_ context.Context, requestID int64, result string,
+	authority CacheAuthority,
+) error {
+	f.authorities = append(f.authorities, authority)
 	if f.onDestroyCompleted != nil {
 		return f.onDestroyCompleted(requestID, result)
 	}

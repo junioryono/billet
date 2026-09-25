@@ -646,8 +646,15 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	return r.destroy(ctx, requestID)
 }
 
+// A COMPILE-TIME PROMISE: the node loop finds this by type assertion, and a
+// signature that drifted would compile and quietly lose every completion's
+// result and cache authority.
+var _ server.CompletionAwareRunner = (*Runner)(nil)
+
 // DestroyCompleted settles result-dependent cache state before removing compute.
-func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string,
+	authority server.CacheAuthority,
+) error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 

@@ -628,6 +628,24 @@ func (c *Client) RecordCacheObservation(
 		}, nil)
 }
 
+// CacheAuthority asks what a lease's running job may do with a cache.
+//
+// Below the version that serves it, the answer is the zero authority, which
+// writes nothing, without asking: an older control plane cannot decide one.
+func (c *Client) CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error) {
+	if c.WireVersion() < nodeapi.VersionCacheAuthority {
+		return server.CacheAuthority{}, nil
+	}
+
+	var response nodeapi.CacheAuthorityResponse
+	if err := c.do(ctx, http.MethodGet, c.leasePath(leaseID, "/cache-authority"), nil,
+		&response); err != nil {
+		return server.CacheAuthority{}, err
+	}
+
+	return ServerCacheAuthority(&response.Authority), nil
+}
+
 // Resize changes an EC2 lease's charged shape before the provider attempts it.
 func (c *Client) Resize(
 	ctx context.Context, leaseID string, epoch int64, instanceType string,

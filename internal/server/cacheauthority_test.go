@@ -120,6 +120,15 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 				return run
 			}(), dflt: "main",
 		},
+		"a workflow calling itself pinned to main from a tag named main writes nothing": {
+			binding: authorityBinding("push", "refs/heads/main"),
+			run: func() WorkflowRun {
+				run := authorityRun("push", "main")
+				run.ReferencedWorkflows = []ReferencedWorkflow{
+					{Path: ciRef + "@refs/heads/main", SHA: "main-sha"}}
+				return run
+			}(), dflt: "main",
+		},
 		"a local reusable workflow at the run's own commit is the run's own ref": {
 			binding: func() alloc.PoolRunner {
 				b := authorityBinding("push", "refs/heads/main")
@@ -200,6 +209,37 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 		want.Event = tc.binding.Identity.Event
 		if got != want {
 			t.Errorf("%s:\n got %+v\nwant %+v", name, got, want)
+		}
+	}
+}
+
+// A COMPLETION MUST AGREE WITH ITS BINDING ON EVERY FIELD, each one checked on
+// its own: a completion that matches the job id and differs in anything else
+// is another description of the job, and proves nothing.
+func TestACompletionThatDisagreesInAnyFieldIsNotProven(t *testing.T) {
+	t.Parallel()
+
+	agreeing := Job{JobID: "job-1", RunID: 31, Owner: "acme", Repository: "api",
+		Event: "push", WorkflowRef: ciRef + "@refs/heads/main"}
+	binding := authorityBinding("push", "refs/heads/main")
+	run := authorityRun("push", "main")
+	if got := DecideCacheAuthority("lease-1", binding, &agreeing, run, "main"); !got.PublishDefault {
+		t.Fatalf("an agreeing completion did not publish: %+v", got)
+	}
+
+	for field, change := range map[string]func(*Job){
+		"run":          func(j *Job) { j.RunID = 32 },
+		"owner":        func(j *Job) { j.Owner = "other" },
+		"repository":   func(j *Job) { j.Repository = "web" },
+		"event":        func(j *Job) { j.Event = "workflow_dispatch" },
+		"workflow ref": func(j *Job) { j.WorkflowRef = ciRef + "@refs/heads/other" },
+		"empty owner":  func(j *Job) { j.Owner = "" },
+	} {
+		completion := agreeing
+		change(&completion)
+		got := DecideCacheAuthority("lease-1", binding, &completion, run, "main")
+		if got.Proven || got.WriteOwnRef || got.PublishDefault {
+			t.Errorf("a completion disagreeing on its %s was proven: %+v", field, got)
 		}
 	}
 }

@@ -194,3 +194,53 @@ func TestAPendingCompletionKeepsItsJobIdentity(t *testing.T) {
 		t.Fatalf("pending completions = %+v, want %+v", got, completion)
 	}
 }
+
+// A REDELIVERY OF THE SAME MESSAGE CANNOT ERASE OR REPLACE THE IDENTITY IT
+// RECORDED, whether it carries none or another, because that identity is the
+// completion's own evidence after a restart. A later message is a new
+// obligation and replaces it with the rest of the row.
+func TestARedeliveredCompletionKeepsTheIdentityItFirstRecorded(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+	first := PendingCompletion{
+		Tier: "linux", RequestID: 19, RunID: 34, Result: "succeeded", MessageID: 5,
+		LeaseID: "lease-19", LeaseEpoch: 2, Outcome: "done", ReleaseOnly: true,
+		JobID: "job-19", JobOwner: "acme", JobRepository: "api",
+		JobWorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", JobEvent: "push",
+	}
+	if _, err := db.PutPendingCompletion(ctx, first); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+
+	empty := first
+	empty.JobID, empty.JobOwner, empty.JobRepository, empty.JobWorkflowRef, empty.JobEvent =
+		"", "", "", "", ""
+	other := first
+	other.JobID, other.JobEvent = "job-20", "workflow_dispatch"
+	for _, redelivery := range []PendingCompletion{empty, other} {
+		if _, err := db.PutPendingCompletion(ctx, redelivery); err != nil {
+			t.Fatalf("redelivered PutPendingCompletion: %v", err)
+		}
+		got, err := db.PendingCompletions(ctx, "linux")
+		if err != nil {
+			t.Fatalf("PendingCompletions: %v", err)
+		}
+		if len(got) != 1 || got[0].JobID != first.JobID || got[0].JobEvent != first.JobEvent ||
+			got[0].JobWorkflowRef != first.JobWorkflowRef {
+			t.Fatalf("after a redelivery carrying %q, identity = %+v, want the first", redelivery.JobID, got)
+		}
+	}
+
+	later := other
+	later.MessageID = 6
+	if _, err := db.PutPendingCompletion(ctx, later); err != nil {
+		t.Fatalf("later PutPendingCompletion: %v", err)
+	}
+	got, err := db.PendingCompletions(ctx, "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(got) != 1 || got[0].JobID != "job-20" || got[0].JobEvent != "workflow_dispatch" {
+		t.Fatalf("a later message did not replace the identity: %+v", got)
+	}
+}

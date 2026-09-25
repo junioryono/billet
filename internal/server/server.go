@@ -579,7 +579,10 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
 	// went back while the advertisement was still live.
 
-	return NewListener(s.alloc, t.Label, session, s.listenerOpts(prov)...).Run(ctx)
+	evidence, _ := prov.(RunEvidence)
+	opts := append(s.listenerOpts(prov), WithCachePublication(t.EffectiveCache(), evidence))
+
+	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
 }
 
 // openSession takes this tier's message session, waiting out one an abandoned

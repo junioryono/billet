@@ -104,7 +104,7 @@ func (r *blockingInventoryRegistrar) ResolveQuarantineFor(
 func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	p := testPlane(t)
 	runner := p.NewRunner()
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{}); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("absent holder destroy = %v, want only holder unavailable", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -113,7 +113,7 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unrelated node: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{}); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("unrelated live fleet destroy = %v, want only holder unavailable", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -122,7 +122,7 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unreconciled holder: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{}); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("unreconciled holder destroy = %v, want only holder unavailable", err)
 	}
 }
@@ -140,7 +140,7 @@ func TestBoundCompletionUsesTheHolderAfterItAdoptsTheLease(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone)
+			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{})
 	}()
 	cmd, took, err := p.Poll(t.Context(), "holder", "holder-2")
 	if err != nil || !took {
@@ -169,7 +169,7 @@ func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone)
+			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{})
 	}()
 	waitFor(t, "bound destroy to queue", func() bool { return p.QueuedForTest("holder") == 1 })
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -201,7 +201,7 @@ func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
 	}
 	p.AdoptOwnershipWithInventory("holder", "holder-2", nil, true)
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); err != nil {
+		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{}); err != nil {
 		t.Fatalf("durably absent holder destroy: %v", err)
 	}
 }
@@ -217,7 +217,7 @@ func TestKnownEmptyInventoryDoesNotReleaseALiveDurableLease(t *testing.T) {
 		t.Fatalf("register empty holder: %v", err)
 	}
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{}); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("live durable lease destroy = %v, want only holder unavailable", err)
 	}
 }
@@ -246,7 +246,7 @@ func TestPeriodicReconciliationInstallsOwnershipBeforeCompletionCanUseAbsence(t 
 	destroyed := make(chan error, 1)
 	go func() {
 		destroyed <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone)
+			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{})
 	}()
 	select {
 	case err := <-destroyed:
@@ -335,7 +335,7 @@ func TestReplacementRegistrationInvalidatesAbsenceBeforeItsEpochWrite(t *testing
 	<-reg.entered
 
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone,
+		t.Context(), 7, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone, server.CacheAuthority{},
 	); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("completion during replacement registration = %v, want only holder unavailable", err)
 	}
@@ -459,7 +459,7 @@ func TestPeriodicInventoryAdoptsItsLiveBoundLease(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone)
+			t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone, server.CacheAuthority{})
 	}()
 	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !took {
@@ -739,7 +739,7 @@ func TestABoundCompletionSettlesFromTheReplacementsInventoryOnceQuarantined(t *t
 
 	settle := func() error {
 		return p.NewRunner().DestroyCompletedBound(
-			t.Context(), requestID, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone)
+			t.Context(), requestID, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone, server.CacheAuthority{})
 	}
 	unavailable := func(what string) {
 		t.Helper()
@@ -901,7 +901,7 @@ func TestABoundCompletionFinishesOnAForcedReleaseWhenItsHostNeverReturns(t *test
 
 	settle := func() error {
 		return p.NewRunner().DestroyCompletedBound(
-			t.Context(), requestID, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone)
+			t.Context(), requestID, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone, server.CacheAuthority{})
 	}
 	if err := settle(); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("a dead, unreplaced holder: bound destroy = %v, want only holder unavailable", err)

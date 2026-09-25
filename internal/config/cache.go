@@ -233,11 +233,26 @@ func toggle(t *CacheToggle, enabled bool, size ByteSize) CacheSetting {
 	return setting
 }
 
-// NeedsRunEvidence reports whether any tier publishes from a default branch,
-// which is what asks the GitHub App for `actions: read`.
+// NeedsRunEvidence reports whether any tier publishes from a default branch.
 func (c *Config) NeedsRunEvidence() bool {
 	for i := range c.Tiers {
 		if c.Tiers[i].EffectiveCache().Publish == CachePublishDefaultBranch {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TargetNeedsRunEvidence reports whether a tier of the named target publishes
+// from a default branch, which is what asks that target's GitHub App for
+// `actions: read`. PER TARGET, because each target has its own App, and one
+// target's cache policy must not make another's minimal App look deficient.
+func (c *Config) TargetNeedsRunEvidence(name string) bool {
+	for i := range c.Tiers {
+		target, ok := c.TierTarget(&c.Tiers[i])
+		if ok && target.Name == name &&
+			c.Tiers[i].EffectiveCache().Publish == CachePublishDefaultBranch {
 			return true
 		}
 	}

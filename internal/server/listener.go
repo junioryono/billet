@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -65,8 +66,12 @@ type RunnerRegistry interface {
 // CompletionAwareRunner receives GitHub's authoritative completed-job result.
 // It is optional so runners that have no result-dependent teardown keep the
 // smaller Runner contract.
+//
+// The authority is what the completed job's caches may publish; its zero value
+// authorises nothing.
 type CompletionAwareRunner interface {
-	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+	DestroyCompleted(ctx context.Context, requestID int64, result string,
+		authority CacheAuthority) error
 }
 
 // BoundCompletionAwareRunner reconciles teardown with the node and lease that
@@ -78,6 +83,7 @@ type BoundCompletionAwareRunner interface {
 		result, leaseID, nodeName string,
 		leaseEpoch int64,
 		outcome alloc.Phase,
+		authority CacheAuthority,
 	) error
 }
 
@@ -398,6 +404,10 @@ type Listener struct {
 	// Never nil; see noRunner.
 	runner   Runner
 	registry RunnerRegistry
+	// cacheSpec and runEvidence decide what a completed job's caches may
+	// publish. See WithCachePublication.
+	cacheSpec   config.CacheSpec
+	runEvidence RunEvidence
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
 	completionStore completionStore
@@ -491,6 +501,17 @@ func WithRunner(r Runner) Option {
 }
 
 // WithRunnerRegistry installs the GitHub side of safe runner retirement.
+// WithCachePublication gives the listener its tier's effective cache
+// configuration and the target's run evidence, which a completion's cache
+// authority is decided from. Without it, or without evidence, every completion
+// carries the zero authority and publishes nothing beyond the legacy rules.
+func WithCachePublication(spec config.CacheSpec, evidence RunEvidence) Option {
+	return func(l *Listener) {
+		l.cacheSpec = spec
+		l.runEvidence = evidence
+	}
+}
+
 func WithRunnerRegistry(registry RunnerRegistry) Option {
 	return func(l *Listener) { l.registry = registry }
 }
@@ -5421,13 +5442,17 @@ func (l *Listener) destroyCompleted(
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}
+	var authority CacheAuthority
+	if job.Result != "" && lease != nil {
+		authority = l.completionCacheAuthority(ctx, job, lease.ID)
+	}
 	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
 		lease != nil && lease.ID != "" && lease.Node != "" {
 		return runner.DestroyCompletedBound(
-			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome)
+			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome, authority)
 	}
 	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
-		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
+		return runner.DestroyCompleted(ctx, job.RequestID, job.Result, authority)
 	}
 
 	return l.runner.Destroy(ctx, job.RequestID)

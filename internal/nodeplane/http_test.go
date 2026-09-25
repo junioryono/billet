@@ -1934,7 +1934,7 @@ func TestRegistrationIntentInvalidatesAbsenceBeforeTheOwnershipRead(t *testing.T
 	<-entered
 
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone,
+		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone, server.CacheAuthority{},
 	); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("completion during ownership read = %v, want only holder unavailable", err)
 	}

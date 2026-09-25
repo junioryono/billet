@@ -24,6 +24,14 @@ type Runner struct {
 	plane *Plane
 }
 
+// A COMPILE-TIME PROMISE, because the listener finds these by type assertion:
+// a signature that drifted would compile and quietly stop delivering GitHub's
+// result and the cache authority with a completion's destroy.
+var (
+	_ server.CompletionAwareRunner      = (*Runner)(nil)
+	_ server.BoundCompletionAwareRunner = (*Runner)(nil)
+)
+
 // NewRunner returns the plane's server.Runner.
 func (p *Plane) NewRunner() *Runner { return &Runner{plane: p} }
 
@@ -56,6 +64,20 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 	if !ok {
 		return fmt.Errorf("%w: lease %s names tier %q, which is not in this deployment's catalogue",
 			ErrNoNode, lease.ID, lease.Tier)
+	}
+
+	// A CACHE BLOCK AN OLDER NODE CANNOT HONOUR IS NOT SENT TO ONE. It would
+	// ignore the block and keep its own rule, publishing a trusted pool's writes
+	// under `publish: off` and nothing at all under `default-branch`; refused
+	// before anything is sent, the lease is released and the job waits for a
+	// node that understands it.
+	r.plane.mu.Lock()
+	wire := n.wireVersion
+	r.plane.mu.Unlock()
+	if !tier.EffectiveCache().IsLegacy() && wire < nodeapi.VersionCacheAuthority {
+		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
+			"speaks wire %d and a cache block needs %d, so upgrade the node",
+			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionCacheAuthority)
 	}
 
 	id, err := commandID()
@@ -114,12 +136,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	return r.destroy(ctx, requestID, "")
+	return r.destroy(ctx, requestID, "", nil)
 }
 
-// DestroyCompleted sends GitHub's authoritative result with a completion-triggered destroy.
-func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
-	return r.destroy(ctx, requestID, result)
+// DestroyCompleted sends GitHub's authoritative result, and what the job's
+// caches may publish, with a completion-triggered destroy.
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string,
+	authority server.CacheAuthority,
+) error {
+	return r.destroy(ctx, requestID, result, WireCacheAuthority(authority))
 }
 
 // DestroyCompletedBound reconciles a restored completion with its durable host
@@ -130,6 +155,7 @@ func (r *Runner) DestroyCompletedBound(
 	result, leaseID, nodeName string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
+	authority server.CacheAuthority,
 ) error {
 	id, err := commandID()
 	if err != nil {
@@ -138,6 +164,7 @@ func (r *Runner) DestroyCompletedBound(
 	pend := &pending{
 		cmd: nodeapi.Command{
 			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+			CacheAuthority: WireCacheAuthority(authority),
 		},
 		done: make(chan nodeapi.CommandResult, 1),
 	}
@@ -168,7 +195,9 @@ func (r *Runner) DestroyCompletedBound(
 	return nil
 }
 
-func (r *Runner) destroy(ctx context.Context, requestID int64, result string) error {
+func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
+	authority *nodeapi.CacheAuthority,
+) error {
 	// WHO HOLDS THIS? The node name is not enough: a superseded process and its
 	// replacement share it, and only one of them has the container.
 	owner, known := r.plane.OwnerOfRequest(requestID)
@@ -233,7 +262,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string) er
 		go func() {
 			defer wg.Done()
 
-			incarnation, err := r.destroyOn(ctx, n, requestID, result)
+			incarnation, err := r.destroyOn(ctx, n, requestID, result, authority)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -454,6 +483,7 @@ func (r *Runner) destroyOn(
 	n *node,
 	requestID int64,
 	result string,
+	authority *nodeapi.CacheAuthority,
 ) (string, error) {
 	id, err := commandID()
 	if err != nil {
@@ -463,6 +493,7 @@ func (r *Runner) destroyOn(
 	pend := &pending{
 		cmd: nodeapi.Command{
 			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+			CacheAuthority: authority,
 		},
 		done: make(chan nodeapi.CommandResult, 1),
 	}
@@ -833,3 +864,18 @@ func commandID() (string, error) {
 var _ server.Runner = (*Runner)(nil)
 
 var _ = errors.Is
+
+// WireCacheAuthority is the wire's shape of an authority, or nil for the zero
+// value, which authorises nothing and need not travel.
+func WireCacheAuthority(a server.CacheAuthority) *nodeapi.CacheAuthority {
+	if a == (server.CacheAuthority{}) {
+		return nil
+	}
+
+	return &nodeapi.CacheAuthority{
+		LeaseID: a.LeaseID, JobID: a.JobID, RunID: a.RunID, Owner: a.Owner,
+		Repository: a.Repository, Event: a.Event, Ref: a.Ref, BaseRef: a.BaseRef,
+		DefaultRef: a.DefaultRef, Proven: a.Proven, WriteOwnRef: a.WriteOwnRef,
+		PublishDefault: a.PublishDefault,
+	}
+}

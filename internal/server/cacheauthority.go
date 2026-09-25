@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 )
 
 // RunEvidence reads what GitHub records about a workflow run and a repository.
@@ -176,7 +179,12 @@ func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 		return "", false
 	}
 
-	if path != run.Path && !calledAtTheRunsCommit(identity.WorkflowRef, run) {
+	// A FILE NAMED LIKE THE TOP-LEVEL WORKFLOW IS THE TOP-LEVEL WORKFLOW ONLY IF
+	// THE RUN DID NOT CALL IT: a workflow can call itself pinned to another ref,
+	// and the job then carries the callee's ref under the run's own file name.
+	called := calledByTheRun(identity.WorkflowRef, run)
+	topLevel := path == run.Path && !called
+	if !topLevel && !calledAtTheRunsCommit(identity.WorkflowRef, run) {
 		return "", false
 	}
 
@@ -208,6 +216,98 @@ func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 	}
 }
 
+// cacheAuthorityLimit bounds reading GitHub's evidence for one authority. A
+// completion waits on it, so a slow GitHub costs the job's cache and never its
+// teardown.
+const cacheAuthorityLimit = 10 * time.Second
+
+// ResolveCacheAuthority reads GitHub's record of the binding's run and the
+// repository's default branch, fresh, and decides. A binding that names no run
+// is not asked about; a failed read is returned beside an unproven authority,
+// which writes nothing.
+func ResolveCacheAuthority(
+	ctx context.Context, evidence RunEvidence, leaseID string, binding alloc.PoolRunner,
+	completion *Job,
+) (CacheAuthority, error) {
+	unproven := DecideCacheAuthority(leaseID, binding, completion, WorkflowRun{}, "")
+	identity := binding.Identity
+	if evidence == nil || binding.RunID <= 0 || identity.Owner == "" || identity.Repository == "" {
+		return unproven, nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, cacheAuthorityLimit)
+	defer cancel()
+
+	run, err := evidence.WorkflowRun(ctx, identity.Owner, identity.Repository, binding.RunID)
+	if err != nil {
+		return unproven, fmt.Errorf("server: read workflow run %d of %s/%s: %w",
+			binding.RunID, identity.Owner, identity.Repository, err)
+	}
+	defaultBranch, err := evidence.DefaultBranch(ctx, identity.Owner, identity.Repository)
+	if err != nil {
+		return unproven, fmt.Errorf("server: read the default branch of %s/%s: %w",
+			identity.Owner, identity.Repository, err)
+	}
+
+	return DecideCacheAuthority(leaseID, binding, completion, run, defaultBranch), nil
+}
+
+// ScopedCacheAuthority is the authority a tier with the given cache
+// configuration may act on: a job of another repository than the tier's
+// namespace is not proven for it, whatever GitHub says about the job.
+func ScopedCacheAuthority(spec config.CacheSpec, authority CacheAuthority) CacheAuthority {
+	if spec.Publish != config.CachePublishDefaultBranch ||
+		!strings.EqualFold(authority.Owner, spec.Owner) ||
+		!strings.EqualFold(authority.Repository, spec.Repository) {
+		authority.Proven, authority.WriteOwnRef, authority.PublishDefault = false, false, false
+	}
+
+	return authority
+}
+
+// completionCacheAuthority is the authority a completed job's destroy carries.
+func (l *Listener) completionCacheAuthority(ctx context.Context, job Job, leaseID string) CacheAuthority {
+	if l.cacheSpec.Publish != config.CachePublishDefaultBranch || l.runEvidence == nil ||
+		l.alloc == nil || leaseID == "" {
+		return CacheAuthority{}
+	}
+
+	binding, err := l.alloc.PoolRunnerByLease(ctx, leaseID)
+	if err != nil {
+		l.log.Warn("could not read the job a completed runner ran; its caches will not publish",
+			"tier", l.tier, "lease", leaseID, "error", err)
+
+		return CacheAuthority{}
+	}
+	authority, err := ResolveCacheAuthority(ctx, l.runEvidence, leaseID, binding, &job)
+	if err != nil {
+		l.log.Warn("could not read GitHub's record of a completed job; its caches will not publish",
+			"tier", l.tier, "lease", leaseID, "error", err)
+	}
+	authority = ScopedCacheAuthority(l.cacheSpec, authority)
+	l.log.Info("decided what a completed job's caches may publish", "tier", l.tier,
+		"lease", leaseID, "job", authority.JobID, "event", authority.Event, "ref", authority.Ref,
+		"proven", authority.Proven, "publish_default", authority.PublishDefault)
+
+	return authority
+}
+
+// calledByTheRun reports whether GitHub records the workflow as one the run
+// called, at any commit.
+func calledByTheRun(workflowRef string, run WorkflowRun) bool {
+	for _, called := range run.ReferencedWorkflows {
+		if called.Path == workflowRef {
+			return true
+		}
+	}
+
+	return false
+}
+
+// calledAtTheRunsCommit reports whether the run called the workflow at the
+// run's own head commit, as a local `./` call does. A reusable workflow GitHub
+// resolved to that commit ran exactly the code of the commit the run is for, so
+// its ref may stand for the run's; a pinned one resolved elsewhere may not.
 func calledAtTheRunsCommit(workflowRef string, run WorkflowRun) bool {
 	if run.HeadSHA == "" {
 		return false

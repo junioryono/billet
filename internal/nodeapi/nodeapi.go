@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 21
+	Version = 22
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -301,6 +301,16 @@ const (
 	// naming this version, because a wrong guess would validate one owner's
 	// policy with another owner's App.
 	VersionTargetedRunnerGroup = 21
+
+	// VersionCacheAuthority is the version from which a node understands a
+	// tier's cache block and the cache authority a completion carries (#226).
+	//
+	// REFUSED WHERE THE LAUNCH IS SENT for a tier whose cache block is not the
+	// legacy shape, because an older node ignores a restrictive policy: it would
+	// go on publishing a trusted pool's writes under `publish: off`, and treat a
+	// default-branch tier as trusted-only. A legacy tier still launches on an
+	// older node, which does exactly what it always did.
+	VersionCacheAuthority = 22
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -625,6 +635,10 @@ type Command struct {
 	// JobResult is GitHub's authoritative conclusion for a completion-triggered
 	// destroy. It is empty for shutdown, sweep and other teardown paths.
 	JobResult string `json:"job_result,omitempty"`
+	// CacheAuthority is what the completed job's caches may publish, decided by
+	// the control plane from GitHub's evidence. Absent means nothing may, which
+	// is also what an older control plane sends.
+	CacheAuthority *CacheAuthority `json:"cache_authority,omitempty"`
 
 	// Upgrade is the release an upgrade command names, and the rollout that asked
 	// for it.
@@ -695,6 +709,10 @@ type TierSpec struct {
 	// Intercept enables the authenticated Actions results proxy for this tier.
 	Intercept  bool               `json:"intercept,omitempty"`
 	CacheScope *config.CacheScope `json:"cache_scope,omitempty"`
+	// Cache is the tier's effective cache configuration, every default applied,
+	// so a node needs no copy of the rules. An older control plane sends none,
+	// and the node then keeps the legacy behaviour.
+	Cache *config.CacheSpec `json:"cache,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -712,6 +730,7 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 		Workflows:   slices.Clone(t.Workflows),
 		Intercept:   t.Intercept,
 		CacheScope:  t.CacheScope,
+		Cache:       new(t.EffectiveCache()),
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit
@@ -795,6 +814,31 @@ type RenewRequest struct {
 type RenewResponse struct {
 	CertPEM string `json:"cert_pem"`
 	CAPEM   string `json:"ca_pem"`
+}
+
+// CacheAuthority is the wire's shape of what a job's caches may do.
+//
+// Its own type rather than the server's, so the wire keeps a stable shape
+// whatever the server's struct grows. The zero value authorises nothing.
+type CacheAuthority struct {
+	LeaseID        string `json:"lease_id"`
+	JobID          string `json:"job_id"`
+	RunID          int64  `json:"run_id"`
+	Owner          string `json:"owner"`
+	Repository     string `json:"repository"`
+	Event          string `json:"event"`
+	Ref            string `json:"ref,omitempty"`
+	BaseRef        string `json:"base_ref,omitempty"`
+	DefaultRef     string `json:"default_ref,omitempty"`
+	Proven         bool   `json:"proven"`
+	WriteOwnRef    bool   `json:"write_own_ref"`
+	PublishDefault bool   `json:"publish_default"`
+}
+
+// CacheAuthorityResponse answers a node asking what one of its leases' job may
+// do with a cache, while the job runs.
+type CacheAuthorityResponse struct {
+	Authority CacheAuthority `json:"authority"`
 }
 
 // CachePolicyResponse is the control plane's current interception decision.

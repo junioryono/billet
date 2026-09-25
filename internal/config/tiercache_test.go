@@ -154,6 +154,29 @@ func TestARepositoryTargetScopesItsDefaultBranchTier(t *testing.T) {
 	}
 }
 
+// ACTIONS: READ IS ONE TARGET'S NEED, never the deployment's: each target has
+// its own App, and one target publishing from a default branch must not make
+// another's minimal App fail its permission check.
+func TestRunEvidenceIsRequiredPerTarget(t *testing.T) {
+	t.Parallel()
+
+	const tier = "  - label: billet-4vcpu-ubuntu-2404\n"
+	body := strings.Replace(twoTargetConfig(t, "personal"), tier, tier+
+		"    cache:\n      publish: default-branch\n", 1)
+	const other = "  - label: billet-8vcpu-ubuntu-2404\n"
+	body = strings.Replace(body, other, other+"    target: default\n", 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.TargetNeedsRunEvidence("personal") {
+		t.Error("the target with a default-branch tier was not asked for run evidence")
+	}
+	if cfg.TargetNeedsRunEvidence(DefaultTargetName) {
+		t.Error("a target with no default-branch tier was asked for run evidence")
+	}
+}
+
 // THE DEPRECATED SPELLING READS AS THE NEW ONE, so a trusted interception tier
 // written before the cache block existed is unchanged.
 func TestInterceptReadsAsTheActionsCache(t *testing.T) {
