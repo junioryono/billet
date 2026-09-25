@@ -1194,10 +1194,19 @@ func (p *Provider) deliverRegistration(ctx context.Context, spec provider.Spec) 
 	// so it enters the spawned runner's environment and never the delivering
 	// shell's — a losing attempt waits fifteen seconds, and it must not hold a
 	// live registration in its environment while it does.
-	prefix := jitEnvVar + "=\"$jit\" "
+	//
+	// THE LOCALE RIDES THE SAME WAY, and only where the guest set none. `tart exec`
+	// starts a session with no LANG, so the runner and every job inherited the C
+	// locale where GitHub's runners export a UTF-8 one (en_US.UTF-8 on macOS,
+	// C.UTF-8 on Ubuntu), and CocoaPods aborts in it ("Unicode Normalization not
+	// appropriate for ASCII-8BIT", measured on the macOS tier 2026-09-24).
+	prefix := "LANG=\"$billet_lang\" " + jitEnvVar + "=\"$jit\" "
 
 	script := "set -eu\n" +
 		"cd \"$HOME\"\n" +
+		"billet_lang=C.UTF-8\n" +
+		"[ \"$(uname -s)\" = Darwin ] && billet_lang=en_US.UTF-8\n" +
+		"billet_lang=${LANG:-$billet_lang}\n" +
 		"IFS= read -r jit\n" +
 		// THE ATOMIC CLAIM. `set -C` makes this O_EXCL, so exactly one attempt in
 		// the VM's life may spawn and a retry can never start a rival runner.
