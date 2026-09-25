@@ -23,7 +23,7 @@ import (
 // on purpose: a large shape only ever fits when several small jobs end together,
 // so first-come starves it outright on a fleet that is never idle. It cannot
 // deadlock, because the winner is a single tier and waiting never moves it later
-// in the order.
+// in the order; only buying does (bought), so waiting tiers take turns.
 //
 // A WAITER HOLDS THE LINE ONLY WHILE ITS LISTENER IS MAKING PROGRESS. The block
 // was said to be bounded by the longest job already running, and that assumed
@@ -306,6 +306,33 @@ func (q *admissionQueue) launchMark(tier string) {
 	if waiter, ok := q.waiting[tier]; ok {
 		q.progressed(tier, waiter)
 	}
+}
+
+// bought moves a waiting tier that has just bought capacity to the back of the
+// order, keeping it waiting.
+//
+// A PLACE IS WON FOR ONE PURCHASE, NOT FOR A BACKLOG. A waiter used to keep its
+// place until its whole demand was met, and a tier whose demand keeps arriving
+// is never met: on 2026-09-25 a repository's CI backlog held the line for half
+// an hour and an organization's tier on the same host started nothing, its
+// assignments declined and reassigned every five minutes. Re-dated here, the
+// waiting tiers take turns one purchase each, and a large shape at the head
+// still holds the freed room until it fits.
+func (q *admissionQueue) bought(tier string) {
+	if q == nil {
+		return
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	waiter, ok := q.waiting[tier]
+	if !ok {
+		return
+	}
+
+	waiter.since = q.now()
+	q.progressed(tier, waiter)
 }
 
 // served records that this tier's demand is met, or gone.

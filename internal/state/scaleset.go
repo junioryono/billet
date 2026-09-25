@@ -17,6 +17,9 @@ import (
 // which predates repository targets and keeps its name: every row written
 // before them is an organization's and still reads as one, and a repository's
 // path is simply a value that column had never carried.
+//
+// Label is the scale set's NAME, a tier's runs_on, which is its label unless
+// the tier names another; the column predates runs_on and keeps its name.
 type ScaleSetRecord struct {
 	Target      string
 	RunnerGroup string

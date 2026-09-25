@@ -1592,8 +1592,9 @@ func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, e
 	if set == nil {
 		// Reconciliation creates these before any listener starts, so an absent
 		// one means somebody removed it underneath a running control plane.
-		return 0, fmt.Errorf("node: tier %s has no scale set on github; it was created at "+
-			"startup, so something removed it since", tier.Label)
+		return 0, fmt.Errorf("node: tier %s has no scale set on github; the control plane "+
+			"creates it at startup (under the tier's runs_on, which only it knows), so "+
+			"something removed it since", tier.Label)
 	}
 
 	r.mu.Lock()
