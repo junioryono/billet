@@ -1676,11 +1676,9 @@ install_dotnet() {
 # THE LICENCE IS ACCEPTED BY THE OPERATOR, NOT BY BILLET. sdkmanager installs
 # nothing until Google's terms are accepted, and accepting them is an act with
 # legal content -- so this does nothing unless BILLET_TC_ANDROID_ACCEPT_LICENSES is
-# `yes`. The EC2 build sets it: that image is built in the operator's own account,
-# from their own instruction, and never leaves it. The guest build does NOT, because
-# the image it produces is published as a release asset -- running the SDK is use,
-# and shipping it to third parties is redistribution, which Google's terms treat
-# differently. That distinction is the one policy decision in this file.
+# `yes`. The EC2 build and the guest build both set it, by the maintainer's decision
+# recorded in ADR-005; it stays a switch so that decision is made at the call, where
+# a reader sees it, and nowhere else.
 #
 # NO PUBLISHED CHECKSUM. Google serves the command-line tools zip over HTTPS and
 # publishes no digest beside it; everything sdkmanager fetches afterwards it
@@ -1763,8 +1761,11 @@ install_android() {
 	# location rather than about the layout. `unzip` is in the declaration's apt set.
 	billet_tc_run rm -rf "$root/cmdline-tools/latest" "$root/cmdline-tools/.staging"
 	billet_tc_run mkdir -p "$root/cmdline-tools/.staging"
-	billet_tc_run unzip -q "$BILLET_TC_WORK/android-tools.zip" \
-		-d "$root/cmdline-tools/.staging"
+	# ON THE CALLER'S SIDE, into the target's directory as the caller sees it: the
+	# zip is in the caller's work directory, which a chroot cannot see. Natively
+	# (the EC2 build) BILLET_TC_ROOT is empty and this is the same command.
+	unzip -q "$BILLET_TC_WORK/android-tools.zip" \
+		-d "${BILLET_TC_ROOT:-}$root/cmdline-tools/.staging"
 
 	if ! billet_tc_run test -d "$root/cmdline-tools/.staging/cmdline-tools"; then
 		echo "the android tools zip does not contain a cmdline-tools directory" >&2

@@ -300,6 +300,32 @@ check_github_cli() {
 	fi
 }
 
+# check_android_sdk passes or fails the gate on the Android SDK in the image
+# mounted at $1: sdkmanager where the installer puts it, at least one platform, and
+# ANDROID_HOME in the environment the runner reads. GitHub's image carries the SDK,
+# and a build that relies on it fails with "SDK location not found" without it.
+check_android_sdk() {
+	local sdk="$1/usr/local/lib/android/sdk"
+
+	if [ ! -x "$sdk/cmdline-tools/latest/bin/sdkmanager" ]; then
+		fail "no sdkmanager at /usr/local/lib/android/sdk/cmdline-tools/latest/bin; the
+        Android SDK is not installed"
+		return
+	fi
+
+	if ! compgen -G "$sdk/platforms/android-*" >/dev/null; then
+		fail "the Android SDK has no platform under /usr/local/lib/android/sdk/platforms"
+		return
+	fi
+
+	if ! grep -qx 'ANDROID_HOME=/usr/local/lib/android/sdk' "$1/etc/billet-image-env" 2>/dev/null; then
+		fail "ANDROID_HOME is not in /etc/billet-image-env, so a job cannot find the SDK"
+		return
+	fi
+
+	pass "the Android SDK is installed, with ANDROID_HOME set"
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -555,6 +581,7 @@ for tool in zstd unzip zip tar wget rsync gcc make; do
 done
 
 check_github_cli "$MNT"
+check_android_sdk "$MNT"
 
 # --- parity with github's declaration ---------------------------------------
 

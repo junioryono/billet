@@ -93,7 +93,16 @@ fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
-# 22528MB AGAINST 15392MB MEASURED, leaving about 5481MB free.
+# 36864MB, FOR ABOUT 27200MB OF CONTENT ONCE THE ANDROID SDK IS IN.
+#
+# The last build without the SDK measured `contents: 15073M used, 5788M free of
+# 22528M`. The SDK with its platforms, build-tools and three NDKs is what separates
+# the EC2 image (26.8GiB) from this one (15.0GiB), about 12100M, so the estimate is
+# 27200M used. Usable space is about 0.927 of the declaration (below), so 36864
+# leaves about 7000M, a little more than the margin the 22528 image had. The next
+# build's own `contents:` line replaces this estimate with a measurement.
+#
+# THE MEASUREMENT BEFORE THE SDK: 22528MB against 15392MB, leaving about 5481MB free.
 #
 # MEASURED BY THE BUILD ITSELF, off the mounted filesystem after the apt set, the
 # toolcache, the JDKs and the toolchains: `contents: 15392M used, 22559M free of
@@ -132,11 +141,9 @@ SUITE="${SUITE:-noble}"
 # argument for reading the build's own report rather than for trusting a prediction
 # that happened to work.
 #
-# WHY THE GUEST IS SMALLER THAN THE AMI. The EC2 image measures 26.8GiB on x64. The
-# difference is the Android SDK and its three NDKs, which this image deliberately
-# does not carry: BILLET_TC_ANDROID_ACCEPT_LICENSES is set by the AMI build and not
-# by this one, because building in the operator's own account is use and publishing
-# this image as a release asset is redistribution.
+# THE ANDROID SDK IS IN THIS IMAGE, by the maintainer's decision of 2026-09-24
+# (ADR-005). It was left out while its licensing question was open, and an Android
+# build moved onto the fleet then failed with "SDK location not found" (#209).
 #
 # OVER-SIZING IS CHEAP AND UNDER-SIZING IS NOT, which is why this is rounded up
 # rather than fitted to the nearest block. The file is sparse, ext4 allocates only
@@ -147,7 +154,7 @@ SUITE="${SUITE:-noble}"
 #
 # It is still not free forever: every generation already published keeps its own
 # size, so this should track the measurement rather than drift upward by habit.
-SIZE_MB="${SIZE_MB:-22528}"
+SIZE_MB="${SIZE_MB:-36864}"
 
 # MIN_FREE_MB is the build's own margin, checked against a MEASUREMENT.
 #
@@ -886,6 +893,7 @@ IMAGEENV
 		BILLET_TC_WORK="$WORK" \
 		BILLET_TC_TOOLSET="$TOOLSET_FILE" \
 		BILLET_TC_ENV_FILE="$rootfs/etc/billet-image-env" \
+		BILLET_TC_ANDROID_ACCEPT_LICENSES=yes \
 		billet_install_toolcache
 
 	# CLOSED AS SOON AS THE STEP THAT NEEDS IT IS DONE. The trap would drop it
