@@ -215,6 +215,45 @@ func (a *Allocator) NodeWithdrawn(
 	})
 }
 
+// NodeDraining takes a host out of placement because its process said it is
+// draining, while it stays live for the work it still has.
+//
+// A DRAINING PROCESS REFUSES EVERY LAUNCH, and without this the plane went on
+// buying leases for the host and dispatching them to it: each refused, each
+// handed back, each bumping the dispatch generation the compute-absence proof is
+// fenced on. The host's next registration clears the mark, and a refused launch
+// after that sets it again, so a process that re-registers mid-drain costs the
+// launches already queued for it and no more.
+//
+// FENCED LIKE NodeWithdrawn, on the epoch and the incarnation, so a superseded
+// process cannot take its replacement out of placement. ErrWithdrawalStale
+// answers a fence that moved; nothing was changed.
+func (a *Allocator) NodeDraining(
+	ctx context.Context, name string, epoch int64, incarnation string,
+) error {
+	if name == "" {
+		return errors.New("alloc: a draining host must be named")
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		matched, err := state.WriteQueries(tx).MarkNodeDraining(ctx, ledgerdb.MarkNodeDrainingParams{
+			Name:        name,
+			Epoch:       epoch,
+			Incarnation: strings.TrimSpace(incarnation),
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: mark node %s draining: %w", name, err)
+		}
+
+		if matched == 0 {
+			return fmt.Errorf("%w: node %s at epoch %d from process %q",
+				ErrWithdrawalStale, name, epoch, incarnation)
+		}
+
+		return nil
+	})
+}
+
 // ErrNotDecommissionable means a host may not be removed from the fleet's
 // expected set yet, and the message says what would make it removable.
 var ErrNotDecommissionable = errors.New("alloc: this host cannot be decommissioned yet")

@@ -18,7 +18,7 @@ A host that is off, or negotiated a protocol too old to be asked, never answers 
 
 A SIGTERM to either process is a drain:
 
-- `billet node` stops taking new work, waits for the compute already running here, destroys it when each job completes, tells the control plane it is leaving, and exits.
+- `billet node` stops taking new work, waits for the compute already running here, destroys it when each job completes, tells the control plane it is leaving, and exits. The first launch it refuses while draining takes the host out of placement until it registers again, so the control plane stops sending it work it will only refuse.
 - `billet server` stops admitting work and waits for the jobs it is tracking, finishing the teardown it owes (destroys a completion already asked for, the session close, the idle escrow). A pool runner started from GitHub's assigned count is not waited for while it has no job. If the ledger records no job started on any runner still held, and still records none after one more poll, the server stops and logs `only pool runners that never started a job remain`. The runners stay registered and their capacity stays charged. Nothing is destroyed, and the next control plane adopts them. Without this rule the drain could wait indefinitely: one was observed idle for a whole sixteen-minute drain with jobs queued for its tier.
 
 Neither has a deadline. `drain_timeout` decides only when billet starts saying the drain is running long, and it repeats every fifteen minutes. The packaged units and plists give the service manager 88200 seconds before it kills a drain, so a reboot mid-drain loses billet's bookkeeping and not the jobs: the guests keep running, their leases stay charged, and the next process re-adopts them.
