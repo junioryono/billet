@@ -31,9 +31,12 @@ import (
 // waiter's listener sat on a dead connection to GitHub for 18 minutes, could
 // neither buy nor give up its place, and every tier sharing its host declined
 // every assignment with 78 of 136 vCPU free. So a waiter is dated by its last
-// admission progress (a refused reconciliation, or a launch finishing) and, once
-// that is older than WaiterAllowance with no launch of its own in flight, it
-// stops holding back other tiers. It keeps its place: the moment its listener
+// admission progress (a refused reconciliation, or a launch starting or
+// finishing) and, once that is older than WaiterAllowance, it stops holding back
+// other tiers. A launch still in flight is not progress: on 2026-09-25 a waiter
+// launching eight slots one at a time into a node whose command queue took four
+// to five minutes a launch held every tier on the fleet for twenty minutes. It
+// keeps its place: the moment its listener
 // progresses again it is the longest waiter once more. Silence suspends the right
 // to block others and proves nothing else; the queue releases, destroys and
 // promises nothing, and every purchase is still the allocator's atomic escrow.
@@ -67,10 +70,6 @@ type admissionQueue struct {
 
 	mu      sync.Mutex
 	waiting map[string]waitingTier
-	// launching counts each tier's launches in flight. A launch can take the
-	// node's whole command timeout, and a tier whose listener is launching is
-	// progressing, so it never goes stale mid-launch.
-	launching map[string]int
 }
 
 // WaiterAllowance is how long a waiter keeps holding back other tiers without
@@ -97,7 +96,7 @@ type waitingTier struct {
 	// does. Its PLACE in the order is what must not move.
 	where alloc.TierAdmission
 	// progress is the last time this tier's listener did admission work: a
-	// refused reconciliation or a launch finishing. Not a successful exchange
+	// refused reconciliation or a launch starting or finishing. Not a successful exchange
 	// with GitHub, because a held message is redelivered on every poll while the
 	// reconciliation that would re-judge the demand is skipped.
 	progress time.Time
@@ -109,18 +108,17 @@ type waitingTier struct {
 // newAdmissionQueue builds the queue every listener of one control plane shares.
 func newAdmissionQueue(policy config.AdmissionOrder) *admissionQueue {
 	return &admissionQueue{
-		policy:    policy.Or(),
-		now:       time.Now,
-		log:       slog.Default(),
-		waiting:   map[string]waitingTier{},
-		launching: map[string]int{},
+		policy:  policy.Or(),
+		now:     time.Now,
+		log:     slog.Default(),
+		waiting: map[string]waitingTier{},
 	}
 }
 
-// holdsTheLine requires q.mu. A waiter that is launching, or progressed within
-// WaiterAllowance, holds back the tiers it competes with.
-func (q *admissionQueue) holdsTheLine(label string, waiter waitingTier, now time.Time) bool {
-	return q.launching[label] > 0 || now.Sub(waiter.progress) <= WaiterAllowance
+// holdsTheLine requires q.mu. A waiter that progressed within WaiterAllowance
+// holds back the tiers it competes with.
+func holdsTheLine(waiter waitingTier, now time.Time) bool {
+	return now.Sub(waiter.progress) <= WaiterAllowance
 }
 
 // gates reports whether this queue decides anything: under fill, and for the
@@ -205,7 +203,7 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 
 		// A STALLED WAITER STEPS ASIDE BUT KEEPS ITS PLACE. Its own record is never
 		// skipped, so a tier is not let past itself.
-		if label != tier && !q.holdsTheLine(label, waiter, now) {
+		if label != tier && !holdsTheLine(waiter, now) {
 			stalled = append(stalled, label)
 
 			continue
@@ -290,32 +288,20 @@ func (q *admissionQueue) progressed(tier string, waiter waitingTier) {
 	q.waiting[tier] = waiter
 }
 
-// launchBegins marks a launch in flight for this tier, which progresses however
-// long the node takes.
-func (q *admissionQueue) launchBegins(tier string) {
+// launchBegins and launchEnds date a waiter's progress at each end of a launch.
+// The launch between them is not progress, so one that outlasts
+// WaiterAllowance lets other tiers past.
+func (q *admissionQueue) launchBegins(tier string) { q.launchMark(tier) }
+
+func (q *admissionQueue) launchEnds(tier string) { q.launchMark(tier) }
+
+func (q *admissionQueue) launchMark(tier string) {
 	if q == nil {
 		return
 	}
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
-	q.launching[tier]++
-}
-
-// launchEnds is launchBegins' partner, and a finished launch is progress.
-func (q *admissionQueue) launchEnds(tier string) {
-	if q == nil {
-		return
-	}
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.launching[tier]--
-	if q.launching[tier] <= 0 {
-		delete(q.launching, tier)
-	}
 
 	if waiter, ok := q.waiting[tier]; ok {
 		q.progressed(tier, waiter)
