@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -356,5 +357,77 @@ func TestEveryListenerSharesOneQueueBuiltBeforeTheyStart(t *testing.T) {
 			t.Errorf("%s got a different admission queue from %s, so each is fair about part "+
 				"of the fleet", tiers[i].Label, tiers[0].Label)
 		}
+	}
+}
+
+// WAITING TIERS TAKE TURNS: A PLACE IS WON FOR ONE PURCHASE, NOT FOR A BACKLOG.
+//
+// Two tiers of one shape share a fleet and both have demand that never runs
+// out, as a busy repository's CI does. The first to wait buys the first freed
+// slot; the second freed slot is the other tier's even though the first still
+// has demand and asks first. Before a purchase re-dated the buyer, the first
+// waiter held the line for as long as its backlog lasted (2026-09-25: half an
+// hour, with the other target's tier starting nothing).
+func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
+	t.Parallel()
+
+	a, log, listeners := orderedListeners(t,
+		[]config.Tier{tierOf("a-small", 4), tierOf("b-small", 4)}, 8, config.AdmissionFair)
+	first, second := listeners[0], listeners[1]
+
+	var mu sync.Mutex
+
+	clock := time.Date(2026, 9, 25, 17, 21, 0, 0, time.UTC)
+	first.order.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		clock = clock.Add(time.Second)
+
+		return clock
+	}
+
+	// The first tier fills the fleet and still wants more, so it waits first.
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile: %v", err)
+	}
+
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile: %v", err)
+	}
+
+	if got := log.tiers(); len(got) != 2 {
+		t.Fatalf("started %v, want the first tier's two runners and nothing else", got)
+	}
+
+	// A slot frees. The first tier has waited longest and takes it.
+	freeOneLease(t, a)
+
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile after a slot freed: %v", err)
+	}
+
+	if got := log.tiers(); len(got) != 3 || got[2] != "a-small" {
+		t.Fatalf("started %v, want the longest waiter to take the first freed slot", got)
+	}
+
+	// Another frees, and the first tier asks first again. Its turn is spent.
+	freeOneLease(t, a)
+
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile after its turn: %v", err)
+	}
+
+	if got := log.tiers(); len(got) != 3 {
+		t.Fatalf("started %v: the first tier bought again while the other tier waited, "+
+			"so a backlog that never runs out holds the line forever", got)
+	}
+
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile on its turn: %v", err)
+	}
+
+	if got := log.tiers(); len(got) != 4 || got[3] != "b-small" {
+		t.Fatalf("started %v, want the other waiting tier to take the second freed slot", got)
 	}
 }
