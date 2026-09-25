@@ -1670,10 +1670,12 @@ fi
 # seams are defaulted variables so a test executes this block against fixtures.
 GUEST_BILLET="${GUEST_BILLET:-/opt/billet/bin/billet}"
 BAZELRC_FILE="${BAZELRC_FILE:-/etc/bazel.bazelrc}"
+GITCONFIG_FILE="${GITCONFIG_FILE:-/etc/gitconfig}"
 # BILLET_GUEST_CACHES_BEGIN
 guest_go=""
 guest_go_tests=""
 guest_bazel=""
+guest_git=""
 if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -x "$GUEST_BILLET" ]; then
 	IFS=, read -r -a requested_caches <<<"$guest_caches"
 	for cache in ${requested_caches[@]+"${requested_caches[@]}"}; do
@@ -1681,6 +1683,7 @@ if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -x "$GUEST_BILLET" ]; 
 			go) guest_go=1 ;;
 			go-test-results) guest_go_tests=1 ;;
 			bazel) guest_bazel=1 ;;
+			git) guest_git=1 ;;
 			*) log "this image does not know the guest cache \"$cache\"; ignoring it" ;;
 		esac
 	done
@@ -1706,6 +1709,22 @@ if [ -n "$guest_bazel" ]; then
 		printf '%s\n' "build --remote_cache=${cache_endpoint%/}/v1/cas/bazel"
 		printf '%s\n' "build --credential_helper=$bazel_host=${GUEST_BILLET%/*}/bazel-credential-helper"
 	} >>"$BAZELRC_FILE"
+fi
+if [ -n "$guest_git" ]; then
+	# FETCHES FROM github.com GO THROUGH THE NODE; PUSHES DO NOT. The rewrite
+	# drops the header actions/checkout scopes to github.com, so the credential
+	# helper hands it back to the node, which asks GitHub before serving a byte.
+	# Only https://github.com/ is rewritten: SSH and every other host are
+	# untouched.
+	git_origin=${cache_endpoint%/}
+	{
+		printf '%s\n' "[url \"$git_origin/v1/git/github.com/\"]"
+		printf '\t%s\n' "insteadOf = https://github.com/"
+		printf '%s\n' '[url "https://github.com/"]'
+		printf '\t%s\n' "pushInsteadOf = https://github.com/"
+		printf '%s\n' "[credential \"$git_origin\"]"
+		printf '\t%s\n' "helper = $GUEST_BILLET cache git-credential"
+	} >>"$GITCONFIG_FILE"
 fi
 # BILLET_GUEST_CACHES_END
 if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then

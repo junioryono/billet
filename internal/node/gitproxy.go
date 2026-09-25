@@ -1,0 +1,692 @@
+package node
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+)
+
+// The Git proxy serves `git fetch` of github.com repositories from a mirror on
+// the node. A guest's git reaches it through url.insteadOf, which drops the
+// header actions/checkout scopes to https://github.com/ (measured, git 2.51.0,
+// 2026-09-25), so the guest's credential helper hands that header back as the
+// Basic password, beside the session bearer as the user name.
+//
+// EVERY FETCH IS AUTHORISED BY GITHUB, with the job's own header, before a byte
+// of the mirror is served: the mirror holds what GitHub gave some job that could
+// read the repository, and this job is served it only when GitHub says this job
+// can read it too. Nothing a job sends is written into a mirror.
+//
+// PROTOCOL v0 ONLY. Under v2 upload-pack serves any object in the repository,
+// advertised or not, even with uploadpack.allowAnySHA1InWant=false; under v0 it
+// refuses an object no ref reaches (measured, git 2.51.0, 2026-09-25). A mirror
+// is pruned to upstream's refs, so an object only a deleted branch reached is
+// never served from it.
+const (
+	gitPathPrefix = "/v1/git/github.com/"
+	// gitAuthorisationAge is how long GitHub's yes for one header and one
+	// repository stands, so a fetch's POST is not authorised twice.
+	gitAuthorisationAge = time.Minute
+	// gitAdvertisementLimit bounds upstream's ref advertisement.
+	gitAdvertisementLimit = 256 << 20
+	// gitRequestLimit bounds a fetch negotiation a client sends.
+	gitRequestLimit = 64 << 20
+	// gitMirrorRetention is how long a mirror no job has used is kept.
+	gitMirrorRetention = 7 * 24 * time.Hour
+	// gitFullFraction is how full the mirrors' filesystem may get before the
+	// least recently used are removed and new ones are not made.
+	gitFullFraction = 0.8
+	// gitTooLargeFor is how long a repository whose mirror exceeded its tier's
+	// ceiling is forwarded rather than mirrored again.
+	gitTooLargeFor = time.Hour
+	gitUsedStamp   = "billet-used"
+)
+
+var gitSegment = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+
+// uploadPackConfig is how the mirror is served, advertised and fetched alike: a
+// want any ref reaches is allowed, as GitHub allows it, so checkout's fetch of a
+// commit that is no longer a tip works; one no ref reaches is not.
+var uploadPackConfig = []string{"-c", "uploadpack.allowReachableSHA1InWant=true",
+	"-c", "uploadpack.allowFilter=true"}
+
+// gitProxy is the node's mirrors and what it remembers about them.
+type gitProxy struct {
+	upstream string
+	root     string
+	binary   string
+	client   *http.Client
+	// fullFraction is gitFullFraction, a field so a test is not decided by the
+	// fill of the disk it runs on.
+	fullFraction float64
+
+	mu         sync.Mutex
+	mirrors    map[string]*gitMirror
+	authorised map[string]gitAuthorisation
+	tooLarge   map[string]time.Time
+}
+
+// gitAuthorisation is GitHub's yes to one header for one repository, and
+// whether the mirror answered the advertisement it came with: a fetch is served
+// from the mirror only then, because a mirror whose refresh failed is stale.
+type gitAuthorisation struct {
+	until    time.Time
+	mirrored bool
+}
+
+type gitMirror struct {
+	// fetch serialises refreshes; use is held for reading while a mirror is
+	// served or refreshed and for writing while it is removed.
+	fetch sync.Mutex
+	use   sync.RWMutex
+}
+
+func newGitProxy(root string) *gitProxy {
+	return &gitProxy{
+		upstream: "https://github.com", root: root, binary: "git",
+		client: &http.Client{
+			Timeout: 2 * time.Minute,
+			// A redirect is the client's to follow, never the node's: following
+			// it would carry the job's header wherever upstream pointed.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		fullFraction: gitFullFraction,
+		mirrors:      make(map[string]*gitMirror), authorised: make(map[string]gitAuthorisation),
+		tooLarge:     make(map[string]time.Time),
+	}
+}
+
+// gitAuth is the job's upstream Authorization header value. It prints as
+// redacted, so no log or error can carry it.
+type gitAuth string
+
+func (gitAuth) String() string   { return "[redacted]" }
+func (gitAuth) GoString() string { return "[redacted]" }
+
+// gitRequest is one parsed proxy request.
+type gitRequest struct {
+	session *cacheSession
+	owner   string
+	repo    string
+	// suffix is the repository path as the client spelled it (".git" or not),
+	// rest what follows it.
+	suffix string
+	rest   string
+	auth   gitAuth
+}
+
+func (g gitRequest) key() string {
+	return filepath.Join(g.session.trust.String(), strings.ToLower(g.owner), strings.ToLower(g.repo))
+}
+
+func (g gitRequest) upstreamPath() string {
+	return "/" + g.owner + "/" + g.repo + g.suffix + "/" + g.rest
+}
+
+// parseGitRequest reads `/v1/git/github.com/{owner}/{repo}[.git]/{rest}` and
+// the Basic credentials: the session bearer, and the job's header or "-".
+func (s *CacheService) parseGitRequest(r *http.Request) (gitRequest, bool, bool) {
+	path, ok := strings.CutPrefix(r.URL.Path, gitPathPrefix)
+	if !ok {
+		return gitRequest{}, false, false
+	}
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) != 3 || !gitSegment.MatchString(parts[0]) || parts[2] == "" {
+		return gitRequest{}, false, false
+	}
+	repo, suffix := strings.CutSuffix(parts[1], ".git")
+	request := gitRequest{owner: parts[0], repo: repo, rest: parts[2]}
+	if suffix {
+		request.suffix = ".git"
+	}
+	if !gitSegment.MatchString(repo) || strings.HasPrefix(repo, ".") || strings.HasPrefix(parts[0], ".") {
+		return gitRequest{}, false, false
+	}
+
+	user, password, ok := r.BasicAuth()
+	if !ok {
+		return request, true, false
+	}
+	s.mu.Lock()
+	session := s.byToken[user]
+	s.mu.Unlock()
+	if session == nil || len(password) > 8<<10 || strings.ContainsAny(password, "\r\n") {
+		return request, true, false
+	}
+	request.session = session
+	if password != "-" {
+		request.auth = gitAuth(password)
+	}
+
+	return request, true, true
+}
+
+// serveGit answers one request under gitPathPrefix.
+func (s *CacheService) serveGit(w http.ResponseWriter, r *http.Request) {
+	request, ok, authenticated := s.parseGitRequest(r)
+	if !ok {
+		http.NotFound(w, r)
+
+		return
+	}
+	// ASKED FOR CREDENTIALS, which makes git run the guest's helper: the first
+	// request of every fetch carries none, because the rewrite dropped them.
+	if !authenticated {
+		w.Header().Set("WWW-Authenticate", `Basic realm="billet"`)
+		http.Error(w, "credentials required", http.StatusUnauthorized)
+
+		return
+	}
+	ctx, cancel := extendTransfer(w, r)
+	defer cancel()
+
+	switch {
+	case !s.gitAllowed(ctx, request.session):
+		s.forwardGit(w, r, request)
+	case r.Method == http.MethodGet && request.rest == "info/refs" &&
+		r.URL.Query().Get("service") == "git-upload-pack":
+		s.gitAdvertise(ctx, w, r, request)
+	case r.Method == http.MethodPost && request.rest == "git-upload-pack":
+		s.gitUploadPack(ctx, w, r, request)
+	default:
+		s.forwardGit(w, r, request)
+	}
+}
+
+// gitAllowed reports whether the session's tier enables the git cache and no
+// kill switch blocks it; could-not-tell forwards, which is never wrong.
+func (s *CacheService) gitAllowed(ctx context.Context, session *cacheSession) bool {
+	if err := lockCacheSession(ctx, session); err != nil {
+		return false
+	}
+	defer session.mu.Unlock()
+	if session.closed || !sessionSetting(session, config.CacheGit).Enabled {
+		return false
+	}
+	if s.now().Sub(session.gitAllowedAt) < casPolicyAge {
+		return true
+	}
+	if !s.sessionKindAllowed(ctx, session, config.CacheGit) {
+		return false
+	}
+	session.gitAllowedAt = s.now()
+
+	return true
+}
+
+// forwardGit sends the request to GitHub as the job would have, with the job's
+// own header and nothing of billet's.
+func (s *CacheService) forwardGit(w http.ResponseWriter, r *http.Request, request gitRequest) {
+	target, err := url.Parse(s.git.upstream)
+	if err != nil {
+		http.Error(w, "the git upstream is misconfigured", http.StatusBadGateway)
+
+		return
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(out *httputil.ProxyRequest) {
+			out.Out.URL.Scheme, out.Out.URL.Host = target.Scheme, target.Host
+			out.Out.URL.Path, out.Out.URL.RawPath = request.upstreamPath(), ""
+			out.Out.URL.RawQuery = r.URL.RawQuery
+			out.Out.Host = target.Host
+			out.Out.Header.Del("Authorization")
+			if request.auth != "" {
+				out.Out.Header.Set("Authorization", string(request.auth))
+			}
+		},
+		Transport: s.git.client.Transport,
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, "github.com is unreachable", http.StatusBadGateway)
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+// upstreamRefs asks GitHub for the repository's v0 advertisement with the job's
+// header. A status other than 200 is GitHub's answer to this job, relayed.
+func (s *CacheService) upstreamRefs(ctx context.Context, request gitRequest) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		s.git.upstream+"/"+request.owner+"/"+request.repo+".git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if request.auth != "" {
+		req.Header.Set("Authorization", string(request.auth))
+	}
+	req.Header.Set("User-Agent", "git/2 billet")
+	resp, err := s.git.client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, gitAdvertisementLimit+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(body) > gitAdvertisementLimit {
+		return nil, nil, errors.New("the advertisement is larger than the proxy reads")
+	}
+
+	return resp, body, nil
+}
+
+func (g *gitProxy) authorisationKey(request gitRequest) string {
+	sum := sha256.Sum256([]byte(string(request.auth) + "\x00" + request.key()))
+
+	return hex.EncodeToString(sum[:])
+}
+
+func (g *gitProxy) remember(request gitRequest, now time.Time, mirrored bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for key, held := range g.authorised {
+		if !now.Before(held.until) {
+			delete(g.authorised, key)
+		}
+	}
+	g.authorised[g.authorisationKey(request)] = gitAuthorisation{
+		until: now.Add(gitAuthorisationAge), mirrored: mirrored,
+	}
+}
+
+// servesFromMirror reports whether GitHub authorised this header for this
+// repository within gitAuthorisationAge and the mirror answered it then.
+func (g *gitProxy) servesFromMirror(request gitRequest, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	held := g.authorised[g.authorisationKey(request)]
+
+	return held.mirrored && now.Before(held.until)
+}
+
+func (g *gitProxy) mirror(key string) *gitMirror {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	m := g.mirrors[key]
+	if m == nil {
+		m = &gitMirror{}
+		g.mirrors[key] = m
+	}
+
+	return m
+}
+
+func (g *gitProxy) mirrorPath(key string) string { return filepath.Join(g.root, key+".git") }
+
+// gitAdvertise authorises the job with GitHub, brings the mirror to the refs
+// GitHub advertised, and answers with the mirror's own advertisement. Anything
+// the mirror cannot do sends GitHub's answer instead, and the fetch after it to
+// GitHub too.
+func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, r *http.Request, request gitRequest) {
+	resp, body, err := s.upstreamRefs(ctx, request)
+	if err != nil {
+		s.log.Warn("could not ask github.com about a repository; forwarding",
+			"repository", request.owner+"/"+request.repo, "error", err)
+		s.forwardGit(w, r, request)
+
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		relayGit(w, resp, body)
+
+		return
+	}
+
+	advertisement, err := s.refreshMirror(ctx, request, body)
+	s.git.remember(request, s.now(), err == nil)
+	if err != nil {
+		s.log.Info("the git cache could not serve a repository; github.com serves it",
+			"repository", request.owner+"/"+request.repo, "error", err)
+		relayGit(w, resp, body)
+
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(pktLine("# service=git-upload-pack\n"))
+	_, _ = w.Write([]byte("0000"))
+	_, _ = w.Write(advertisement)
+}
+
+func relayGit(w http.ResponseWriter, resp *http.Response, body []byte) {
+	for _, name := range []string{"Content-Type", "WWW-Authenticate", "Cache-Control"} {
+		if value := resp.Header.Get(name); value != "" {
+			w.Header().Set(name, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func pktLine(payload string) []byte { return fmt.Appendf(nil, "%04x%s", len(payload)+4, payload) }
+
+// advertisedRefs reads a v0 upload-pack advertisement: every ref and its object,
+// peeled entries and HEAD aside, and what HEAD points to.
+func advertisedRefs(body []byte) (map[string]string, string, error) {
+	refs := make(map[string]string)
+	head := ""
+	for len(body) > 0 {
+		if len(body) < 4 {
+			return nil, "", errors.New("a truncated pkt-line")
+		}
+		var size int
+		if _, err := fmt.Sscanf(string(body[:4]), "%04x", &size); err != nil {
+			return nil, "", fmt.Errorf("a malformed pkt-line: %w", err)
+		}
+		if size == 0 {
+			body = body[4:]
+
+			continue
+		}
+		if size < 4 || size > len(body) {
+			return nil, "", errors.New("a pkt-line longer than the advertisement")
+		}
+		line := strings.TrimSuffix(string(body[4:size]), "\n")
+		body = body[size:]
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		line, capabilities, _ := strings.Cut(line, "\x00")
+		for _, capability := range strings.Fields(capabilities) {
+			if target, ok := strings.CutPrefix(capability, "symref=HEAD:"); ok {
+				head = target
+			}
+		}
+		object, name, ok := strings.Cut(line, " ")
+		if !ok || len(object) != 40 && len(object) != 64 {
+			return nil, "", fmt.Errorf("a malformed ref line %q", line)
+		}
+		if name == "HEAD" || strings.HasSuffix(name, "^{}") || name == "capabilities^{}" {
+			continue
+		}
+		refs[name] = object
+	}
+
+	return refs, head, nil
+}
+
+// refreshMirror brings the repository's mirror to the refs upstream advertised,
+// fetching only when they differ, and returns the mirror's advertisement.
+func (s *CacheService) refreshMirror(ctx context.Context, request gitRequest, upstream []byte) ([]byte, error) {
+	key := request.key()
+	s.git.mu.Lock()
+	until := s.git.tooLarge[key]
+	s.git.mu.Unlock()
+	if s.now().Before(until) {
+		return nil, errors.New("the repository is larger than the tier's git cache")
+	}
+	refs, head, err := advertisedRefs(upstream)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, errors.New("upstream advertised no refs")
+	}
+
+	mirror := s.git.mirror(key)
+	mirror.use.RLock()
+	defer mirror.use.RUnlock()
+	path := s.git.mirrorPath(key)
+
+	mirror.fetch.Lock()
+	current, err := s.mirrorRefs(ctx, path)
+	if err != nil || !sameRefs(current, refs) {
+		if full, statErr := filledAbove(s.git.root, s.git.fullFraction); statErr == nil && full {
+			mirror.fetch.Unlock()
+
+			return nil, errors.New("the git cache's filesystem is full")
+		}
+		err = s.fetchMirror(ctx, path, request)
+		if err == nil {
+			err = s.boundMirror(key, path, sessionSetting(request.session, config.CacheGit))
+		}
+	}
+	if err == nil && head != "" && strings.HasPrefix(head, "refs/") {
+		_, err = s.runGit(ctx, path, nil, "symbolic-ref", "HEAD", head)
+	}
+	mirror.fetch.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	now := s.now()
+	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
+
+	return s.runGit(ctx, path, nil, append(slices.Clone(uploadPackConfig),
+		"upload-pack", "--stateless-rpc", "--advertise-refs", ".")...)
+}
+
+func sameRefs(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, object := range a {
+		if b[name] != object {
+			return false
+		}
+	}
+
+	return true
+}
+
+// mirrorRefs lists a mirror's refs; a mirror that does not exist has none.
+func (s *CacheService) mirrorRefs(ctx context.Context, path string) (map[string]string, error) {
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return map[string]string{}, nil
+	}
+	output, err := s.runGit(ctx, path, nil, "for-each-ref", "--format=%(objectname) %(refname)")
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[string]string)
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	for scanner.Scan() {
+		if object, name, ok := strings.Cut(scanner.Text(), " "); ok {
+			refs[name] = object
+		}
+	}
+
+	return refs, scanner.Err()
+}
+
+// fetchMirror makes or refreshes a mirror with the job's header, which reaches
+// git through its environment and never its argv, a file or a log.
+func (s *CacheService) fetchMirror(ctx context.Context, path string, request gitRequest) error {
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		if _, err := s.runGit(ctx, filepath.Dir(path), nil, "init", "--bare", "--quiet", path); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(path, gitUsedStamp), nil, 0o600); err != nil {
+			return err
+		}
+	}
+	var secret []string
+	if request.auth != "" {
+		secret = []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.extraheader",
+			"GIT_CONFIG_VALUE_0=Authorization: " + string(request.auth)}
+	}
+	_, err := s.runGit(ctx, path, secret, "fetch", "--prune", "--quiet", "--no-write-fetch-head",
+		s.git.upstream+"/"+request.owner+"/"+request.repo+".git", "+refs/*:refs/*")
+
+	return err
+}
+
+// boundMirror removes a mirror larger than its tier's git ceiling, and forwards
+// that repository for a while rather than fetch it again at once.
+func (s *CacheService) boundMirror(key, path string, setting config.CacheSetting) error {
+	var size int64
+	_ = filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
+		if err == nil && entry.Type().IsRegular() {
+			if info, err := entry.Info(); err == nil {
+				size += info.Size()
+			}
+		}
+
+		return nil
+	})
+	if size <= volumeCeiling(setting) {
+		return nil
+	}
+	s.git.mu.Lock()
+	s.git.tooLarge[key] = s.now().Add(gitTooLargeFor)
+	s.git.mu.Unlock()
+
+	return errors.Join(fmt.Errorf("the mirror is %d bytes, above the tier's git cache", size),
+		os.RemoveAll(path))
+}
+
+// runGit runs git in dir with a closed environment: no system or global
+// configuration, no prompt, protocol v0, and only what extra adds.
+func (s *CacheService) runGit(ctx context.Context, dir string, extra []string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, s.git.binary, args...)
+	cmd.Dir = dir
+	cmd.Env = append([]string{
+		"PATH=" + os.Getenv("PATH"), "HOME=" + s.git.root, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/false",
+	}, extra...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = 5 * time.Second
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git %s: %w: %s", args[len(args)-1], err, boundedOutput(stderr.Bytes()))
+	}
+
+	return output, nil
+}
+
+// gitUploadPack serves a fetch from the mirror, to a job GitHub authorised for
+// the repository within gitAuthorisationAge; anything else goes to GitHub.
+func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter, r *http.Request, request gitRequest) {
+	// NOTHING IS SERVED FROM THE MIRROR BUT A FETCH WHOSE ADVERTISEMENT IT
+	// ANSWERED: GitHub authorised the header then, and the mirror was brought to
+	// GitHub's refs then. Every other fetch is GitHub's to answer.
+	if !s.git.servesFromMirror(request, s.now()) {
+		s.forwardGit(w, r, request)
+
+		return
+	}
+	key := request.key()
+	mirror := s.git.mirror(key)
+	mirror.use.RLock()
+	defer mirror.use.RUnlock()
+	path := s.git.mirrorPath(key)
+	if _, err := os.Stat(filepath.Join(path, "HEAD")); err != nil {
+		s.forwardGit(w, r, request)
+
+		return
+	}
+
+	var body io.Reader = io.LimitReader(r.Body, gitRequestLimit)
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		decompressed, err := gzip.NewReader(body)
+		if err != nil {
+			http.Error(w, "an unreadable request", http.StatusBadRequest)
+
+			return
+		}
+		defer decompressed.Close()
+		body = io.LimitReader(decompressed, gitRequestLimit)
+	}
+
+	cmd := exec.CommandContext(ctx, s.git.binary, append(slices.Clone(uploadPackConfig),
+		"upload-pack", "--stateless-rpc", ".")...)
+	cmd.Dir = path
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + s.git.root, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null"}
+	cmd.Stdin = body
+	cmd.WaitDelay = 5 * time.Second
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	w.Header().Set("Cache-Control", "no-cache")
+	cmd.Stdout = w
+	if err := cmd.Run(); err != nil {
+		s.log.Warn("a fetch from the git cache failed", "repository", request.owner+"/"+request.repo,
+			"error", err, "stderr", boundedOutput(stderr.Bytes()))
+	}
+	now := s.now()
+	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
+}
+
+// ReapGitMirrors removes the mirrors no job has used within gitMirrorRetention,
+// then the least recently used while their filesystem is above gitFullFraction.
+func (s *CacheService) ReapGitMirrors(ctx context.Context) error {
+	type mirror struct {
+		key  string
+		used time.Time
+	}
+	var mirrors []mirror
+	err := filepath.WalkDir(s.git.root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && path == s.git.root {
+				return fs.SkipAll
+			}
+
+			return err
+		}
+		if !entry.IsDir() || !strings.HasSuffix(path, ".git") {
+			return nil
+		}
+		info, err := os.Stat(filepath.Join(path, gitUsedStamp))
+		if err != nil {
+			return fs.SkipDir
+		}
+		relative, err := filepath.Rel(s.git.root, strings.TrimSuffix(path, ".git"))
+		if err != nil {
+			return err
+		}
+		mirrors = append(mirrors, mirror{key: relative, used: info.ModTime()})
+
+		return fs.SkipDir
+	})
+	if err != nil {
+		return err
+	}
+	slices.SortFunc(mirrors, func(a, b mirror) int { return a.used.Compare(b.used) })
+
+	var failures []error
+	for _, m := range mirrors {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		full, err := filledAbove(s.git.root, s.git.fullFraction)
+		if err != nil {
+			return err
+		}
+		if !full && s.now().Sub(m.used) < gitMirrorRetention {
+			break
+		}
+		held := s.git.mirror(m.key)
+		held.use.Lock()
+		err = os.RemoveAll(s.git.mirrorPath(m.key))
+		held.use.Unlock()
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	return errors.Join(failures...)
+}

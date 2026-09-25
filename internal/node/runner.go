@@ -1622,6 +1622,9 @@ func guestCachesFor(spec *config.CacheSpec) []provider.GuestCache {
 	if spec.Bazel.Enabled {
 		caches = append(caches, provider.GuestCacheBazel)
 	}
+	if spec.Git.Enabled {
+		caches = append(caches, provider.GuestCacheGit)
+	}
 
 	return caches
 }

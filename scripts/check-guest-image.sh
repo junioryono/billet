@@ -628,12 +628,13 @@ if [ -x "$GUEST_BILLET" ] && [ -s "$GUEST_BILLET" ] &&
 	grep -Fq 'exec /opt/billet/bin/billet cache credential-helper "$@"' \
 		"$MNT/opt/billet/bin/bazel-credential-helper" &&
 	grep -Fq 'runner_env+=("GOCACHEPROG=$GUEST_BILLET cache gocacheprog")' "$AGENT" &&
-	grep -Fq 'build --credential_helper=' "$AGENT"; then
-	pass "billet is in the guest for the go and bazel build caches"
+	grep -Fq 'build --credential_helper=' "$AGENT" &&
+	grep -Fq 'helper = $GUEST_BILLET cache git-credential' "$AGENT"; then
+	pass "billet is in the guest for the go, bazel and git caches"
 else
 	fail "no billet at /opt/billet/bin/billet, no bazel credential helper beside it, or an
-        agent that does not configure them; a tier with the go or bazel cache would build
-        cold"
+        agent that does not configure them; a tier with the go, bazel or git cache would
+        build cold"
 fi
 
 buildx_plugin=""

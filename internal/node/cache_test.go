@@ -751,10 +751,11 @@ func TestRunnerTellsTheGuestWhichBuildCachesItsTierEnables(t *testing.T) {
 			cache: &config.TierCache{
 				Go:    &config.GoCache{Enabled: &enabled, TestResults: true},
 				Bazel: &config.CacheToggle{Enabled: &enabled},
+				Git:   &config.CacheToggle{Enabled: &enabled},
 			},
 			service: true,
 			want: []provider.GuestCache{provider.GuestCacheGo, provider.GuestCacheGoTestResults,
-				provider.GuestCacheBazel},
+				provider.GuestCacheBazel, provider.GuestCacheGit},
 		},
 		"no cache block": {service: true},
 		"no cache service": {

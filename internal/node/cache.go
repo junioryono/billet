@@ -75,6 +75,8 @@ type CacheService struct {
 	observer   CacheObserver
 	// remoteAPI serves Bazel's and Buck2's gRPC remote caches.
 	remoteAPI http.Handler
+	// git serves github.com fetches from mirrors on the node.
+	git *gitProxy
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -109,6 +111,8 @@ type cacheSession struct {
 	// must never reach a mount table or a mount's argv; a session recorded by an
 	// older binary keeps its token here, so what it mounted is still found.
 	pathID string
+	// gitAllowedAt is when the kill switch last allowed the git cache, under mu.
+	gitAllowedAt time.Time
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -264,6 +268,7 @@ func NewCacheService(
 		closed:     make(chan struct{}, 1),
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
+	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -915,6 +920,13 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		proxy.serveConnect(w, r)
+
+		return
+	}
+	// A GIT FETCH AUTHENTICATES BY BASIC CREDENTIALS, which is all git sends to
+	// an origin it was rewritten to.
+	if strings.HasPrefix(r.URL.Path, gitPathPrefix) {
+		s.serveGit(w, r)
 
 		return
 	}

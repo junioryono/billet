@@ -2005,6 +2005,9 @@ func startNodeCache(
 				slog.Default().Warn("could not evict expired cache generations; will retry",
 					"error", err)
 			}
+			if err := service.ReapGitMirrors(ctx); err != nil && ctx.Err() == nil {
+				slog.Default().Warn("could not reap unused git mirrors; will retry", "error", err)
+			}
 		}
 
 		retryClosed()

@@ -31,6 +31,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 		wantEnv     []string
 		wantNoEnv   []string
 		wantBazelrc []string
+		wantGit     []string
 	}{
 		{
 			name: "go without test results runs every test", caches: "go", token: "token",
@@ -49,7 +50,19 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 			},
 		},
 		{
-			name: "an image without billet builds cold", caches: "go,bazel", token: "token",
+			name: "git rewrites github.com fetches to the node, and nothing else", caches: "git",
+			token: "token", binary: billet, wantNoEnv: []string{"GOCACHEPROG="},
+			wantGit: []string{
+				`[url "` + endpoint + `/v1/git/github.com/"]`,
+				"\tinsteadOf = https://github.com/",
+				`[url "https://github.com/"]`,
+				"\tpushInsteadOf = https://github.com/",
+				`[credential "` + endpoint + `"]`,
+				"\thelper = " + billet + " cache git-credential",
+			},
+		},
+		{
+			name: "an image without billet builds cold", caches: "go,bazel,git", token: "token",
 			binary: filepath.Join(t.TempDir(), "absent"), wantNoEnv: []string{"GOCACHEPROG=", "GOFLAGS="},
 		},
 		{
@@ -69,6 +82,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 			t.Parallel()
 
 			bazelrc := filepath.Join(t.TempDir(), "bazel.bazelrc")
+			gitconfig := filepath.Join(t.TempDir(), "gitconfig")
 			script := strings.Join([]string{
 				"set -euo pipefail",
 				`log() { printf 'billet-agent: %s\n' "$*" >&2; }`,
@@ -77,6 +91,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 				"guest_caches=" + shellQuote(tc.caches),
 				"GUEST_BILLET=" + shellQuote(tc.binary),
 				"BAZELRC_FILE=" + shellQuote(bazelrc),
+				"GITCONFIG_FILE=" + shellQuote(gitconfig),
 				"runner_env=()",
 				block,
 				`for entry in ${runner_env[@]+"${runner_env[@]}"}; do printf 'env=%s\n' "$entry"; done`,
@@ -117,6 +132,21 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 			}
 			if strings.Contains(string(rc), "token") {
 				t.Errorf("the bazelrc carries the bearer: %q", rc)
+			}
+
+			gc, err := os.ReadFile(gitconfig)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if len(tc.wantGit) == 0 && len(gc) != 0 {
+				t.Errorf("a tier without the git cache got a gitconfig: %q", gc)
+			}
+			if got := strings.Split(strings.TrimSpace(string(gc)), "\n"); len(tc.wantGit) > 0 &&
+				!slices.Equal(got, tc.wantGit) {
+				t.Errorf("gitconfig = %q, want %q", got, tc.wantGit)
+			}
+			if strings.Contains(string(gc), "token") {
+				t.Errorf("the gitconfig carries the bearer: %q", gc)
 			}
 		})
 	}

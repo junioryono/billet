@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,7 +9,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/junioryono/billet/internal/gocacheprog"
 )
@@ -67,6 +70,69 @@ func cmdCacheCredentialHelper(_ context.Context, args []string) error {
 	}
 
 	return json.NewEncoder(os.Stdout).Encode(answer)
+}
+
+// cmdCacheGitCredential is the git credential helper the guest's gitconfig
+// names for the node, which a github.com fetch reaches through url.insteadOf.
+// The rewrite drops the header actions/checkout scopes to github.com, so this
+// hands it to the node as the password, beside the session bearer.
+func cmdCacheGitCredential(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: billet cache git-credential get (run by git)")
+	}
+	if args[0] != "get" {
+		return nil
+	}
+	// RUN IN THE REPOSITORY GIT IS FETCHING INTO (measured: git runs a helper
+	// with the worktree as its directory), where checkout wrote its header.
+	output, _ := exec.CommandContext(ctx, "git", "config", "--get-all",
+		"http.https://github.com/.extraheader").Output()
+	answer, err := gitCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken),
+		strings.Split(strings.TrimSpace(string(output)), "\n"))
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(os.Stdout, answer)
+
+	return err
+}
+
+// gitCredential answers git's request for the node's host: the session bearer
+// as the user name, and the last Authorization header checkout configured for
+// github.com as the password, or "-" when there is none. A request for any
+// other host is answered with nothing.
+func gitCredential(in io.Reader, endpoint, token string, headers []string) (string, error) {
+	node, err := url.Parse(endpoint)
+	if err != nil || node.Host == "" || token == "" {
+		return "", nil
+	}
+	asked := map[string]string{}
+	scanner := bufio.NewScanner(io.LimitReader(in, 64<<10))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			break
+		}
+		if key, value, ok := strings.Cut(line, "="); ok {
+			asked[key] = value
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read the credential request: %w", err)
+	}
+	if asked["protocol"] != node.Scheme || asked["host"] != node.Host {
+		return "", nil
+	}
+	password := "-"
+	for _, header := range headers {
+		name, value, ok := strings.Cut(header, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "authorization") &&
+			strings.TrimSpace(value) != "" && !strings.ContainsAny(value, "\r\n") {
+			password = strings.TrimSpace(value)
+		}
+	}
+
+	return "username=" + token + "\npassword=" + password + "\n", nil
 }
 
 // cacheCredential answers the bearer only for a URI on the node's own endpoint:

@@ -41,12 +41,14 @@ const (
 	GuestCacheGoTestResults GuestCache = "go-test-results"
 	// GuestCacheBazel points Bazel's remote cache at the node.
 	GuestCacheBazel GuestCache = "bazel"
+	// GuestCacheGit sends the guest's github.com fetches through the node.
+	GuestCacheGit GuestCache = "git"
 )
 
 // Valid reports whether g is one the guest image knows.
 func (g GuestCache) Valid() bool {
 	switch g {
-	case GuestCacheGo, GuestCacheGoTestResults, GuestCacheBazel:
+	case GuestCacheGo, GuestCacheGoTestResults, GuestCacheBazel, GuestCacheGit:
 		return true
 	default:
 		return false

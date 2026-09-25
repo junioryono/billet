@@ -410,7 +410,10 @@ func (s *CacheService) storeCASObject(
 }
 
 // casFull reports whether a volume has passed the fraction it may fill.
-func casFull(root string) (bool, error) {
+func casFull(root string) (bool, error) { return filledAbove(root, casFullFraction) }
+
+// filledAbove reports whether root's filesystem is more than fraction full.
+func filledAbove(root string, fraction float64) (bool, error) {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(root, &stat); err != nil {
 		return false, err
@@ -420,7 +423,7 @@ func casFull(root string) (bool, error) {
 		return false, nil
 	}
 
-	return (total-float64(stat.Bavail))/total > casFullFraction, nil
+	return (total-float64(stat.Bavail))/total > fraction, nil
 }
 
 // contextReader stops a copy when its context ends.
