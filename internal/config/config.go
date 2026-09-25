@@ -2473,15 +2473,14 @@ func (t Tier) ReservationErrors(where string) []error {
 // site-store volume on the host, which only a firecracker node has.
 func (t Tier) InterceptionErrors(where string) []error {
 	cache := t.EffectiveCache()
-	if !cache.needsGuestCacheServices() {
+	explicit := t.explicitGuestCaches()
+	if !cache.needsGuestCacheServices() || len(explicit) == 0 {
 		return nil
 	}
 
 	var enabled []string
-	for _, kind := range []CacheKind{CacheActions, CacheGit, CacheBazel, CacheGo} {
-		if cache.Setting(kind).Enabled {
-			enabled = append(enabled, string(kind))
-		}
+	for _, kind := range explicit {
+		enabled = append(enabled, string(kind))
 	}
 	what := "the " + strings.Join(enabled, ", ") + " cache"
 
@@ -4003,7 +4002,7 @@ func (c *Config) validateNode() []error {
 	errs = append(errs, c.validateCacheNode()...)
 	if c.Node.Cache == nil {
 		for i := range c.Tiers {
-			if c.Tiers[i].EffectiveCache().needsGuestCacheServices() &&
+			if len(c.Tiers[i].explicitGuestCaches()) > 0 &&
 				c.Tiers[i].AcceptsProvider(c.Node.Provider) {
 				errs = append(errs, fmt.Errorf("tier %q enables a cache the node serves, but "+
 					"node.cache is not configured on this %s node", c.Tiers[i].Label, c.Node.Provider))

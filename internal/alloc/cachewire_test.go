@@ -14,7 +14,8 @@ func TestACacheConfiguredTierIsPlacedOnlyWhereItCanBeHonoured(t *testing.T) {
 
 	legacy := tier("legacy", 2, 4*config.GiB)
 	configured := tier("configured", 2, 4*config.GiB)
-	configured.Cache = &config.TierCache{Publish: config.CachePublishOff}
+	off := false
+	configured.Cache = &config.TierCache{StickyDisks: &config.CacheToggle{Enabled: &off}}
 
 	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
 		[]config.Tier{legacy, configured})

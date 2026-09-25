@@ -15,9 +15,11 @@ func untrustedCacheTier(block string) string {
 		"    image: ubuntu-2404-x64\n"+block, 1)
 }
 
-// A TIER THAT SAYS NOTHING GETS WHAT IT HAD. The zero value is today's
-// behaviour exactly, so an upgrade changes no deployment that did not ask.
-func TestATierWithNoCacheBlockKeepsTodaysCaches(t *testing.T) {
+// A TIER THAT SAYS NOTHING GETS EVERY CACHE IT CAN HAVE: a Linux Firecracker
+// tier the Git, Bazel and Go caches beside the Docker store and sticky disks,
+// with Go test results left off, and a node without a cache listener refuses
+// none of it, because a default that cannot run is simply off.
+func TestATierWithNoCacheBlockGetsEveryCacheItCanHave(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := Load(writeConfig(t, validConfig))
@@ -25,11 +27,51 @@ func TestATierWithNoCacheBlockKeepsTodaysCaches(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	spec := cfg.Tiers[0].EffectiveCache()
-	if !spec.IsLegacy() || spec.Actions.Enabled {
-		t.Fatalf("effective cache of an unconfigured tier = %+v, want the legacy shape", spec)
+	if !spec.Docker.Enabled || !spec.StickyDisks.Enabled || !spec.Git.Enabled ||
+		!spec.Bazel.Enabled || !spec.Go.Enabled || spec.GoTestResults {
+		t.Fatalf("effective cache of an unconfigured firecracker tier = %+v", spec)
 	}
-	if cfg.NeedsRunEvidence() {
-		t.Error("a deployment that publishes from no default branch asked for run evidence")
+	// NO REPOSITORY, SO NO DEFAULT-BRANCH NAMESPACE AND NO ACTIONS CACHE: nothing
+	// could prove whose default branch a job ran on, or scope its archives.
+	if spec.Publish != CachePublishTrustedOnly || spec.Actions.Enabled || cfg.NeedsRunEvidence() {
+		t.Fatalf("an unscoped tier = %+v, run evidence %v", spec, cfg.NeedsRunEvidence())
+	}
+
+	enabled := true
+	goOnly := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux,
+		Cache: &TierCache{Go: &GoCache{Enabled: &enabled}}}.EffectiveCache()
+	if !goOnly.Go.Enabled || goOnly.GoTestResults {
+		t.Fatalf("a go cache that says nothing of test results = %+v, want them off", goOnly)
+	}
+
+	docker := Tier{Provider: ProviderDocker, GuestOS: GuestLinux}.EffectiveCache()
+	if docker.Git.Enabled || docker.Go.Enabled || docker.Actions.Enabled {
+		t.Fatalf("a docker tier's default = %+v, want the Docker store and sticky disks only", docker)
+	}
+}
+
+// AN UNTRUSTED TIER WITH A REPOSITORY PUBLISHES FROM ITS DEFAULT BRANCH BY
+// DEFAULT, with the Actions cache on; a trusted one publishes what it writes, as
+// it always has.
+func TestTheDefaultPublicationFollowsTrust(t *testing.T) {
+	t.Parallel()
+
+	scope := &CacheScope{Owner: "acme", Repository: "api"}
+	untrusted := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadUntrusted,
+		CacheScope: scope}.EffectiveCache()
+	if untrusted.Publish != CachePublishDefaultBranch || !untrusted.Actions.Enabled ||
+		untrusted.Owner != "acme" || untrusted.Repository != "api" {
+		t.Fatalf("an untrusted tier with a repository = %+v", untrusted)
+	}
+	trusted := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadTrusted,
+		CacheScope: scope}.EffectiveCache()
+	if trusted.Publish != CachePublishTrustedOnly || trusted.Actions.Enabled {
+		t.Fatalf("a trusted tier with no workflow scope = %+v", trusted)
+	}
+	explicit := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadUntrusted,
+		CacheScope: scope, Cache: &TierCache{Publish: CachePublishOff}}.EffectiveCache()
+	if explicit.Publish != CachePublishOff {
+		t.Fatalf("a tier's own publication rule was replaced: %+v", explicit)
 	}
 }
 
@@ -49,7 +91,7 @@ func TestAnUntrustedDefaultBranchTierIsAccepted(t *testing.T) {
 	spec := cfg.Tiers[0].EffectiveCache()
 	if spec.Publish != CachePublishDefaultBranch || spec.Owner != "acme" || spec.Repository != "api" ||
 		!spec.Actions.Enabled || !spec.Git.Enabled || spec.Bazel.MaxSize != 20*GiB ||
-		!spec.Go.Enabled || !spec.GoTestResults || spec.IsLegacy() {
+		!spec.Go.Enabled || !spec.GoTestResults {
 		t.Fatalf("effective cache = %+v", spec)
 	}
 	if !cfg.NeedsRunEvidence() {
@@ -71,7 +113,7 @@ func TestTheCacheBlockRefusesWhatItCannotHonour(t *testing.T) {
 			block: "    cache:\n      publish: default-branch\n", want: "needs a static repository",
 		},
 		"an untrusted trusted-only Actions cache": {
-			block: scope + "    cache:\n      actions: {enabled: true}\n",
+			block: scope + "    cache:\n      publish: trusted-only\n      actions: {enabled: true}\n",
 			want:  "only with cache.publish: default-branch",
 		},
 		"both spellings of the Actions cache": {
@@ -183,7 +225,42 @@ func TestInterceptReadsAsTheActionsCache(t *testing.T) {
 	t.Parallel()
 
 	tier := Tier{Intercept: true}
-	if spec := tier.EffectiveCache(); !spec.Actions.Enabled || !spec.IsLegacy() {
+	if spec := tier.EffectiveCache(); !spec.Actions.Enabled || tier.NeedsCacheAwareNode() {
 		t.Fatalf("intercept: true = %+v, want the Actions cache on and nothing else changed", spec)
+	}
+}
+
+// A TIER IS KEPT FROM AN OLDER NODE ONLY WHERE THAT NODE WOULD DO MORE THAN
+// THE TIER ALLOWS. Every default does less or the same on one, so none of them
+// needs a node that reads the cache block.
+func TestOnlyATierAnOlderNodeWouldExceedNeedsACacheAwareNode(t *testing.T) {
+	t.Parallel()
+
+	off, small := false, 10*GiB
+	scope := &CacheScope{Owner: "acme", Repository: "api"}
+	firecracker := func(trust WorkloadTrust, cache *TierCache) Tier {
+		return Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: trust,
+			CacheScope: scope, Cache: cache}
+	}
+	for name, tc := range map[string]struct {
+		tier Tier
+		want bool
+	}{
+		"an untrusted tier's defaults":     {firecracker(WorkloadUntrusted, nil), false},
+		"a trusted tier's defaults":        {firecracker(WorkloadTrusted, nil), false},
+		"an untrusted tier publishing off": {firecracker(WorkloadUntrusted, &TierCache{Publish: CachePublishOff}), false},
+		"a trusted tier publishing off":    {firecracker(WorkloadTrusted, &TierCache{Publish: CachePublishOff}), true},
+		"a trusted default-branch tier": {firecracker(WorkloadTrusted,
+			&TierCache{Publish: CachePublishDefaultBranch}), true},
+		"sticky disks turned off": {firecracker(WorkloadUntrusted,
+			&TierCache{StickyDisks: &CacheToggle{Enabled: &off}}), true},
+		"a smaller docker store": {firecracker(WorkloadUntrusted,
+			&TierCache{Docker: &CacheToggle{MaxSize: small}}), true},
+		"a smaller actions archive": {firecracker(WorkloadUntrusted,
+			&TierCache{Actions: &ActionsCache{MaxArchive: 5 * GiB}}), true},
+	} {
+		if got := tc.tier.NeedsCacheAwareNode(); got != tc.want {
+			t.Errorf("%s: NeedsCacheAwareNode = %v, want %v", name, got, tc.want)
+		}
 	}
 }

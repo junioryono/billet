@@ -108,10 +108,10 @@ func TestTheDefaultBranchIsNeverCached(t *testing.T) {
 	}
 }
 
-// ACTIONS: READ IS ASKED FOR ONLY WHEN IT IS NEEDED, and then it is required.
-// Both directions of the exact comparison hold: a deployment that did not ask
-// for it is told an installation holding it has more than billet claims, and
-// one that did is told an installation without it cannot prove a branch.
+// ACTIONS: READ IS REQUIRED WHERE IT IS NEEDED and accepted everywhere else,
+// because billet requests it by default: a deployment that needs it is told an
+// installation without it cannot prove a branch, and one that does not is not
+// told an installation holding it has more than billet claims.
 func TestRunEvidenceAddsActionsReadAndNothingElse(t *testing.T) {
 	t.Parallel()
 
@@ -128,9 +128,8 @@ func TestRunEvidenceAddsActionsReadAndNothingElse(t *testing.T) {
 		if problems := granted.PermissionMismatches(scope, true); len(problems) != 0 {
 			t.Errorf("%s: the requested set was refused: %v", scope, problems)
 		}
-		if problems := granted.PermissionMismatches(scope, false); len(problems) != 1 ||
-			!strings.Contains(problems[0], "actions") {
-			t.Errorf("%s: actions: read held unasked = %v, want it named as unrequested", scope, problems)
+		if problems := granted.PermissionMismatches(scope, false); len(problems) != 0 {
+			t.Errorf("%s: actions: read held where no tier needs it = %v, want it accepted", scope, problems)
 		}
 		plain := &Installation{Permissions: without}
 		if problems := plain.PermissionMismatches(scope, true); len(problems) != 1 ||

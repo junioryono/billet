@@ -84,7 +84,7 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK IS NOT A CANDIDATE, or
 		// placement would choose it again and again for a launch the plane then
 		// refuses to send, and newer hosts beside it would sit unused.
-		if n.wire < CacheAuthorityWireVersion && !t.EffectiveCache().IsLegacy() {
+		if n.wire < CacheAuthorityWireVersion && t.NeedsCacheAwareNode() {
 			continue
 		}
 

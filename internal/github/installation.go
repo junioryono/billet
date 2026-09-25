@@ -190,10 +190,17 @@ func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []str
 	}
 
 	for name, got := range i.Permissions {
-		if _, expected := permissions[name]; !expected {
-			problems = append(problems,
-				fmt.Sprintf("%s: granted %s, but billet never requested it", name, got))
+		if _, expected := permissions[name]; expected {
+			continue
 		}
+		// `actions: read` IS WHAT billet REQUESTS BY DEFAULT, so an App that
+		// holds it is one billet made, not one edited behind its back; it is
+		// required only where a tier publishes from a default branch.
+		if runEvidencePermission[name] == got {
+			continue
+		}
+		problems = append(problems,
+			fmt.Sprintf("%s: granted %s, but billet never requested it", name, got))
 	}
 
 	sort.Strings(problems)

@@ -29,7 +29,8 @@ func waitForQueued(t *testing.T, p *Plane, name string) {
 
 func cacheConfiguredTier() config.Tier {
 	tier := testTier()
-	tier.Cache = &config.TierCache{Publish: config.CachePublishOff}
+	off := false
+	tier.Cache = &config.TierCache{StickyDisks: &config.CacheToggle{Enabled: &off}}
 
 	return tier
 }
@@ -110,9 +111,9 @@ func TestACurrentNodeReceivesTheTiersCacheConfiguration(t *testing.T) {
 	if err != nil || !took || cmd.Kind != nodeapi.CommandLaunch {
 		t.Fatalf("poll = %+v, %v, %v", cmd, took, err)
 	}
-	if cmd.Tier == nil || cmd.Tier.Cache == nil || cmd.Tier.Cache.Publish != config.CachePublishOff ||
+	if cmd.Tier == nil || cmd.Tier.Cache == nil || cmd.Tier.Cache.StickyDisks.Enabled ||
 		!cmd.Tier.Cache.Docker.Enabled {
-		t.Fatalf("launched tier cache = %+v, want publish off with its defaults", cmd.Tier)
+		t.Fatalf("launched tier cache = %+v, want sticky disks off beside its other defaults", cmd.Tier)
 	}
 	if err := p.Result("n1", "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 		t.Fatalf("result: %v", err)

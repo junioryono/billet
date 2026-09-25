@@ -50,11 +50,18 @@ func TestPermissionMismatches(t *testing.T) {
 			},
 			want: []string{"contents: granted read, but billet never requested it"},
 		},
-		"actions was added": {
+		// ACTIONS: READ IS WHAT billet REQUESTS BY DEFAULT, so holding it is not
+		// an edit; write is more than billet ever asks for.
+		"actions: read, billet's default": {
 			granted: map[string]string{
 				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read",
 			},
-			want: []string{"actions: granted read, but billet never requested it"},
+		},
+		"actions: write was added": {
+			granted: map[string]string{
+				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "write",
+			},
+			want: []string{"actions: granted write, but billet never requested it"},
 		},
 	}
 

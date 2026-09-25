@@ -74,7 +74,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 	r.plane.mu.Lock()
 	wire := n.wireVersion
 	r.plane.mu.Unlock()
-	if !tier.EffectiveCache().IsLegacy() && wire < nodeapi.VersionCacheAuthority {
+	if tier.NeedsCacheAwareNode() && wire < nodeapi.VersionCacheAuthority {
 		return fmt.Errorf("%w: tier %s configures its caches, which node %s cannot honour: it "+
 			"speaks wire %d and a cache block needs %d, so upgrade the node",
 			ErrNoNode, tier.Label, n.name, wire, nodeapi.VersionCacheAuthority)
@@ -103,7 +103,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 		done:             make(chan nodeapi.CommandResult, 1),
 		expectedProvider: selectedProvider,
 	}
-	if !tier.EffectiveCache().IsLegacy() {
+	if tier.NeedsCacheAwareNode() {
 		pend.minWire = nodeapi.VersionCacheAuthority
 	}
 

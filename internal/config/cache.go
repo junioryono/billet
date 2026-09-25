@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -167,35 +168,64 @@ func (s CacheSpec) Setting(kind CacheKind) CacheSetting {
 	}
 }
 
-// IsLegacy reports whether s is what a tier had before tiers[].cache existed:
-// trusted-only publication, the Docker store and sticky disks at their default
-// sizes, nothing else. Anything else needs a node that understands it.
-func (s CacheSpec) IsLegacy() bool {
-	return s.Publish == CachePublishTrustedOnly && s.Owner == "" && s.Repository == "" &&
-		s.Docker == (CacheSetting{Enabled: true, MaxSize: DefaultDockerCacheSize}) &&
-		s.StickyDisks == (CacheSetting{Enabled: true, MaxSize: DefaultStickyDiskSize}) &&
-		!s.Git.Enabled && !s.Bazel.Enabled && !s.Go.Enabled && !s.GoTestResults &&
-		s.Actions.MaxSize == ActionsArchiveLimit
+// NeedsCacheAwareNode reports whether a node too old to read the tier's cache
+// block would do MORE with its caches than the tier allows. Such a node ignores
+// the block and applies the rule every tier had before it: a trusted pool
+// publishes what it writes and an untrusted one publishes nothing, with the
+// Docker store and sticky disks at their default sizes, interception as
+// `intercept` says, and no Git, Bazel or Go cache.
+//
+// DOING LESS IS SAFE AND DOING MORE IS NOT. A cache the older node does not
+// serve leaves the job cold, and an untrusted pool whose writes it discards
+// publishes less than default-branch would; neither needs refusing. A trusted
+// pool told to publish nothing or only from its default branch, a Docker store
+// or sticky disk turned off or held smaller, and an Actions archive held below
+// GitHub's limit would all be exceeded, so those tiers are placed only on a
+// node that reads the block.
+func (t Tier) NeedsCacheAwareNode() bool {
+	s := t.EffectiveCache()
+
+	return t.Trust.Effective() == WorkloadTrusted && s.Publish != CachePublishTrustedOnly ||
+		s.Docker != (CacheSetting{Enabled: true, MaxSize: DefaultDockerCacheSize}) ||
+		s.StickyDisks != (CacheSetting{Enabled: true, MaxSize: DefaultStickyDiskSize}) ||
+		s.Actions.MaxSize != ActionsArchiveLimit
 }
 
 // EffectiveCache is the tier's cache configuration with every default applied.
 //
 // `intercept: true` is the deprecated spelling of `cache.actions.enabled`, and
 // reads as it.
+//
+// EVERY CACHE IS ON BY DEFAULT WHERE THE TIER CAN HAVE IT. The Docker store and
+// sticky disks are on for every tier; the Git, Bazel and Go caches for a tier
+// whose guest the node controls (servesGuestCaches); the Actions cache where
+// its scope rules already hold (actionsByDefault). Go test results stay off by
+// default, because caching them lets `go test` skip a test whose inputs did not
+// change, which is a change to what a job runs, not only to how fast. A cache
+// off by default is off, never refused: only a cache a tier turns on explicitly
+// is held to where it can run.
+//
+// THE PUBLICATION RULE DEFAULTS BY TRUST. A trusted pool publishes what it
+// writes, as it always has. An untrusted pool with a static repository
+// publishes from its default branch, which is the most an untrusted pool can
+// safely publish; one without a repository cannot prove whose default branch
+// it ran on and publishes nothing.
 func (t Tier) EffectiveCache() CacheSpec {
 	c := t.Cache
 	if c == nil {
 		c = &TierCache{}
 	}
 
+	guest := t.servesGuestCaches()
 	spec := CacheSpec{
-		Publish:     c.Publish.Effective(),
+		Publish:     t.defaultPublish(c.Publish),
 		Docker:      toggle(c.Docker, true, DefaultDockerCacheSize),
 		StickyDisks: toggle(c.StickyDisks, true, DefaultStickyDiskSize),
-		Git:         toggle(c.Git, false, DefaultGitCacheSize),
-		Bazel:       toggle(c.Bazel, false, DefaultBazelCacheSize),
-		Actions:     CacheSetting{Enabled: t.Intercept, MaxSize: ActionsArchiveLimit},
+		Git:         toggle(c.Git, guest, DefaultGitCacheSize),
+		Bazel:       toggle(c.Bazel, guest, DefaultBazelCacheSize),
 	}
+	spec.Actions = CacheSetting{Enabled: t.Intercept || guest && t.actionsByDefault(spec.Publish),
+		MaxSize: ActionsArchiveLimit}
 	if c.Actions != nil {
 		if c.Actions.Enabled != nil {
 			spec.Actions.Enabled = *c.Actions.Enabled
@@ -205,17 +235,87 @@ func (t Tier) EffectiveCache() CacheSpec {
 		}
 	}
 	if c.Go != nil {
-		spec.Go = toggle(&CacheToggle{Enabled: c.Go.Enabled, MaxSize: c.Go.MaxSize}, false,
+		spec.Go = toggle(&CacheToggle{Enabled: c.Go.Enabled, MaxSize: c.Go.MaxSize}, guest,
 			DefaultGoCacheSize)
 		spec.GoTestResults = spec.Go.Enabled && c.Go.TestResults
 	} else {
-		spec.Go = CacheSetting{MaxSize: DefaultGoCacheSize}
+		spec.Go = CacheSetting{Enabled: guest, MaxSize: DefaultGoCacheSize}
 	}
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
 	}
 
 	return spec
+}
+
+// servesGuestCaches reports whether the node controls this tier's guest the way
+// the Git, Bazel, Go and Actions caches need: a Linux Firecracker guest and no
+// other backend.
+func (t Tier) servesGuestCaches() bool {
+	providers := t.AcceptableProviders()
+
+	return len(providers) == 1 && providers[0] == ProviderFirecracker && t.GuestOS == GuestLinux
+}
+
+// defaultPublish is the tier's publication rule, its own or the default by
+// trust.
+func (t Tier) defaultPublish(publish CachePublish) CachePublish {
+	if publish != "" {
+		return publish.Effective()
+	}
+	if t.Trust.Effective() == WorkloadUntrusted && t.hasRepositoryScope() {
+		return CachePublishDefaultBranch
+	}
+
+	return CachePublishTrustedOnly
+}
+
+func (t Tier) hasRepositoryScope() bool {
+	return t.CacheScope != nil && t.CacheScope.Owner != "" && t.CacheScope.Repository != ""
+}
+
+// actionsByDefault reports whether the Actions cache's scope rules already
+// hold, so that turning it on by default refuses nothing: a default-branch
+// namespace needs the repository, a trusted-only one the workflow the runner
+// group admits.
+func (t Tier) actionsByDefault(publish CachePublish) bool {
+	if !t.hasRepositoryScope() {
+		return false
+	}
+	switch {
+	case publish == CachePublishDefaultBranch:
+		return true
+	case publish == CachePublishTrustedOnly && t.Trust.Effective() == WorkloadTrusted:
+		return t.CacheScope.WorkflowRef != "" && slices.Contains(t.Workflows, t.CacheScope.WorkflowRef)
+	default:
+		return false
+	}
+}
+
+// explicitGuestCaches names the node-served caches a tier turns on itself,
+// which are the ones held to where they can run: a default that cannot run is
+// simply off.
+func (t Tier) explicitGuestCaches() []CacheKind {
+	var kinds []CacheKind
+	c := t.Cache
+	on := func(toggle *CacheToggle) bool { return toggle != nil && toggle.Enabled != nil && *toggle.Enabled }
+	if t.Intercept || c != nil && c.Actions != nil && c.Actions.Enabled != nil && *c.Actions.Enabled {
+		kinds = append(kinds, CacheActions)
+	}
+	if c == nil {
+		return kinds
+	}
+	if on(c.Git) {
+		kinds = append(kinds, CacheGit)
+	}
+	if on(c.Bazel) {
+		kinds = append(kinds, CacheBazel)
+	}
+	if c.Go != nil && c.Go.Enabled != nil && *c.Go.Enabled {
+		kinds = append(kinds, CacheGo)
+	}
+
+	return kinds
 }
 
 func toggle(t *CacheToggle, enabled bool, size ByteSize) CacheSetting {
@@ -268,13 +368,20 @@ func (s CacheSpec) needsGuestCacheServices() bool {
 }
 
 // materializeCacheScope writes a repository target's identity as the cache
-// scope of a default-branch tier that names none, so the scope travels with
-// the tier to every node that launches it.
+// scope of a tier that names none and publishes from its default branch, or
+// would by default: an untrusted tier that sets no publication rule.
 func (c *Config) materializeCacheScope() {
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
-		if t.Cache == nil || t.Cache.Publish.Effective() != CachePublishDefaultBranch ||
-			t.CacheScope != nil {
+		if t.CacheScope != nil {
+			continue
+		}
+		publish := CachePublish("")
+		if t.Cache != nil {
+			publish = t.Cache.Publish
+		}
+		if publish.Effective() != CachePublishDefaultBranch &&
+			(publish != "" || t.Trust.Effective() != WorkloadUntrusted) {
 			continue
 		}
 		target, ok := c.TierTarget(t)
