@@ -336,7 +336,7 @@ HOSTED_TOOLS=(
 	/usr/bin/docker-credential-ecr-login /usr/bin/composer /usr/local/bin/phpunit
 	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
 	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
-	/usr/sbin/nginx
+	/usr/sbin/nginx /usr/bin/az /usr/bin/gcloud /usr/bin/bc /usr/bin/go /usr/bin/gofmt
 )
 
 # image_resolve prints path as the image at $1 resolves it, following every
@@ -410,6 +410,10 @@ check_hosted_tools() {
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+	grep -qx 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions' "$env" 2>/dev/null ||
+		missing+=("AZURE_EXTENSION_DIR in /etc/billet-image-env")
+	grep -q '^GOROOT_[0-9]*_[0-9]*_X64=/opt/hostedtoolcache/go/' "$env" 2>/dev/null ||
+		missing+=("GOROOT_<major>_<minor>_X64 in /etc/billet-image-env")
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
 	# @actions/tool-cache looks for; a payload without one is invisible to it.
