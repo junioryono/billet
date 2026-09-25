@@ -7,11 +7,12 @@ name: Cancel superseded CI
 # stale run had to be force-cancelled by hand. This force-cancels every unfinished
 # CI run on the same branch whose head is not the commit just pushed.
 #
+# PULL REQUESTS ONLY. A main run is the check on what merged, and cancelling it
+# for the next merge left main with no completed run all day (see ci.yml).
+#
 # ON A GITHUB-HOSTED RUNNER, because a job queued behind the very fleet it is
 # trying to free would start after the runs it should have cancelled.
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -21,7 +22,7 @@ permissions:
 jobs:
   cancel:
     # A fork's pull_request token is read-only and cannot cancel anything.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -29,8 +30,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event_name == 'push' && github.ref_name || github.head_ref }}
-          HEAD_SHA: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
