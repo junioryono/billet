@@ -6,9 +6,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/state"
 )
+
+// A TIER NO REACHABLE HOST CAN HONOUR IS SAID TO WAIT, by name, until one host
+// this deployment can reach speaks the version that reads its cache block; a
+// tier any host can run is never named.
+func TestStatusNamesATierWaitingForACacheAwareHost(t *testing.T) {
+	t.Parallel()
+
+	off := false
+	restrictive := config.Tier{Label: "strict", Provider: config.ProviderFirecracker, GuestOS: config.GuestLinux,
+		Cache: &config.TierCache{StickyDisks: &config.CacheToggle{Enabled: &off}}}
+	plain := config.Tier{Label: "plain", Provider: config.ProviderFirecracker, GuestOS: config.GuestLinux}
+	tiers := []config.Tier{restrictive, plain}
+	old := alloc.NodeWire{Name: "old", Live: true, Negotiated: nodeapi.VersionCacheAuthority - 1}
+	gone := alloc.NodeWire{Name: "gone", Negotiated: nodeapi.VersionCacheAuthority}
+	current := alloc.NodeWire{Name: "new", Live: true, Negotiated: nodeapi.VersionCacheAuthority}
+
+	lines := cacheAwareWaits(tiers, []alloc.NodeWire{old, gone})
+	if len(lines) != 1 || !strings.Contains(lines[0], "tier strict WAITS") {
+		t.Fatalf("with no reachable host on the version = %q, want the strict tier named", lines)
+	}
+	if lines := cacheAwareWaits(tiers, []alloc.NodeWire{old, current}); len(lines) != 0 {
+		t.Fatalf("with a reachable host on the version = %q, want nothing", lines)
+	}
+}
 
 // WHAT THE CACHES DID IS RENDERED PER TIER AND CACHE, a cache nothing observed
 // is left out, and a job whose outcome was not observed is counted as that.

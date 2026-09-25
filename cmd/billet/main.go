@@ -2998,6 +2998,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	printReportedInventory(ctx, a)
 	printComputeBarrier(ctx, a)
 	printWireWindow(ctx, a)
+	printCacheAwareWaits(ctx, a, cfg.Tiers)
 
 	held, err := a.Held(ctx)
 	if err != nil {
@@ -4176,6 +4177,46 @@ func printComputeBarrier(ctx context.Context, a *alloc.Allocator) {
 
 		fmt.Println()
 	}
+}
+
+// printCacheAwareWaits names every tier that waits for a host new enough to
+// read its cache block, so a rollout's wait reads as a wait and not a stall.
+func printCacheAwareWaits(ctx context.Context, a *alloc.Allocator, tiers []config.Tier) {
+	fleet, err := a.NodeWireVersions(ctx)
+	if err != nil {
+		return
+	}
+	for _, line := range cacheAwareWaits(tiers, fleet) {
+		fmt.Println(line)
+	}
+}
+
+// cacheAwareWaits is a line for each tier an older host would exceed while no
+// host this deployment can reach speaks the version that reads its cache
+// block: such a tier is placed nowhere until one does, which in a rollout is
+// the first upgraded host.
+func cacheAwareWaits(tiers []config.Tier, fleet []alloc.NodeWire) []string {
+	for _, n := range fleet {
+		if n.Live && n.Negotiated >= nodeapi.VersionCacheAuthority {
+			return nil
+		}
+	}
+	var lines []string
+	for i := range tiers {
+		if !tiers[i].NeedsCacheAwareNode() {
+			continue
+		}
+		label := "cache"
+		if len(lines) > 0 {
+			label = ""
+		}
+		lines = append(lines, fmt.Sprintf("%-9s tier %s WAITS FOR A HOST ON PROTOCOL %d: an older host "+
+			"would ignore its cache block and publish or keep more than it allows, and no host "+
+			"this deployment can reach speaks %d yet", label, tiers[i].Label,
+			nodeapi.VersionCacheAuthority, nodeapi.VersionCacheAuthority))
+	}
+
+	return lines
 }
 
 // printWireWindow reports which hosts are still on an older node wire.
