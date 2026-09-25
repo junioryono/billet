@@ -198,6 +198,25 @@ linters:
             - pkg: "github.com/actions/scaleset"
               desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
 
+        # One gRPC server, for the Bazel and Buck2 remote caches, in one place.
+        # The Remote Execution API's generated code and gRPC's server are large
+        # and serve one listener route; internal/node/reapi adapts them to a
+        # Volume the node hands it, and nothing else in billet speaks gRPC.
+        remoteapis:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/node/reapi/**"
+          deny:
+            - pkg: "github.com/bazelbuild/remote-apis"
+              desc: "Serve the Remote Execution API through internal/node/reapi."
+            - pkg: "google.golang.org/grpc"
+              desc: "gRPC is served only by internal/node/reapi."
+            - pkg: "google.golang.org/genproto"
+              desc: "The API's generated types stay inside internal/node/reapi."
+            - pkg: "google.golang.org/protobuf"
+              desc: "The API's generated types stay inside internal/node/reapi."
+
         # Layering: a compute backend is a leaf. It must not reach up into the
         # scheduler, or the provider abstraction stops being substitutable.
         provider:

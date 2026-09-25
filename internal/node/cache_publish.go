@@ -230,8 +230,11 @@ func pendingPublication(attachment *cacheAttachment) bool {
 func (s *CacheService) sessionKindAllowed(ctx context.Context, session *cacheSession,
 	kind config.CacheKind,
 ) bool {
+	// A SESSION WITH NO REPOSITORY IS NOTHING A KILL SWITCH CAN NAME: blocks are
+	// by repository or by its owner, and the ledger answers only for a
+	// repository. A trusted-only tier without a cache scope is one.
 	owner, repository := session.cacheOwner(), session.cacheRepository()
-	if owner == "" {
+	if owner == "" || repository == "" {
 		return true
 	}
 
@@ -346,6 +349,9 @@ func (s *CacheService) SettleCompleted(
 	// THE CONTENT-ADDRESSED CACHES PUBLISH UNDER EITHER POLICY, always from the
 	// cache loop after the compute is gone.
 	for _, hv := range session.hosts {
+		if hv.written.Load() {
+			hv.Dirty = true
+		}
 		if hv.Dirty {
 			hv.Intent = intent
 		}

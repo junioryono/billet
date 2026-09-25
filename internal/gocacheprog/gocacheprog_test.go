@@ -252,6 +252,22 @@ func TestADamagedLocalObjectIsAMiss(t *testing.T) {
 	if !answers[0].Miss {
 		t.Fatalf("a truncated local object was answered %+v", answers[0])
 	}
+
+	// AND A REMOTE HIT FOR THE SAME ACTION REPLACES IT rather than naming the
+	// damaged file again.
+	fake := &fakeNode{objects: map[string][]byte{
+		"ac/" + hex.EncodeToString(action): entry{output: hex.EncodeToString(sum[:]), size: int64(len(body)),
+			at: time.Unix(1, 0)}.encode(),
+		"cas/" + hex.EncodeToString(sum[:]): body,
+	}}
+	node := httptest.NewServer(fake)
+	t.Cleanup(node.Close)
+	answers = exchange(t, Config{Dir: dir, Endpoint: node.URL, Token: "token"},
+		request{ID: 1, Command: "get", ActionID: action}, request{ID: 2, Command: "close"})
+	got, err := os.ReadFile(answers[0].DiskPath)
+	if answers[0].Miss || err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("a remote hit over a damaged local object answered %+v with %q (%v)", answers[0], got, err)
+	}
 }
 
 // A PUT IS ANSWERED WITH AN ABSOLUTE PATH HOLDING THE BODY, and a later get in

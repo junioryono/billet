@@ -51,6 +51,7 @@ func validateSessionLease(instance, leaseID string, epoch int64) error {
 
 type durableCacheSession struct {
 	Token       string                                `json:"token"`
+	PathID      string                                `json:"path_id,omitempty"`
 	Instance    string                                `json:"instance"`
 	Trust       provider.TrustClass                   `json:"trust"`
 	Owner       string                                `json:"owner,omitempty"`
@@ -112,6 +113,10 @@ func (s *CacheService) loadSessions() error {
 			receipts: record.Receipts,
 			hosts:    record.Hosts,
 			casAdmit: make(chan struct{}, casConcurrency),
+			pathID:   record.PathID,
+		}
+		if session.pathID == "" {
+			session.pathID = record.Token
 		}
 		if session.hosts == nil {
 			session.hosts = make(map[config.CacheKind]*hostVolume)
@@ -184,7 +189,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 	}
 
 	record := durableCacheSession{
-		Token: session.token, Instance: session.instance, Trust: session.trust,
+		Token: session.token, PathID: session.pathID, Instance: session.instance, Trust: session.trust,
 		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,
 		Intercept: session.intercept, Cache: session.cache,
 		LeaseID: session.leaseID, Epoch: session.epoch,

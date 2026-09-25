@@ -20,6 +20,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -72,6 +73,8 @@ type CacheService struct {
 	policy     CachePolicy
 	authority  CacheAuthorityReader
 	observer   CacheObserver
+	// remoteAPI serves Bazel's and Buck2's gRPC remote caches.
+	remoteAPI http.Handler
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -102,6 +105,10 @@ type cacheSession struct {
 	// session, and casAdmit bounds their concurrent transfers.
 	hosts    map[config.CacheKind]*hostVolume
 	casAdmit chan struct{}
+	// pathID names the session's host mount points. It is not the bearer, which
+	// must never reach a mount table or a mount's argv; a session recorded by an
+	// older binary keeps its token here, so what it mounted is still found.
+	pathID string
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -256,6 +263,7 @@ func NewCacheService(
 		now:        time.Now,
 		closed:     make(chan struct{}, 1),
 	}
+	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -555,6 +563,7 @@ func (s *CacheService) PrepareScoped(
 			receipts: make(map[string]*actionsReceipt),
 			hosts:    make(map[config.CacheKind]*hostVolume),
 			casAdmit: make(chan struct{}, casConcurrency),
+			pathID:   sessionPathID(token),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {
@@ -917,7 +926,13 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// CONTENT-ADDRESSED TRANSFERS ARE MANY AND CONCURRENT, a build's worth at
 	// once, so they have their own bound rather than the one-at-a-time
-	// admission the volume API takes.
+	// admission the volume API takes. A gRPC call is the Remote Execution API
+	// over the same volume.
+	if reapi.IsGRPC(r) {
+		s.serveRemoteAPI(w, r, session)
+
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, casPathPrefix) {
 		s.serveCAS(w, r, session)
 

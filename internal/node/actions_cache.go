@@ -132,7 +132,7 @@ func (a *actionsArchive) valid() error {
 }
 
 func (s *CacheService) actionsMountPath(session *cacheSession, archive *actionsArchive) string {
-	return filepath.Join(s.rootState, "actions-cache-volumes", session.token, archive.ID)
+	return filepath.Join(s.rootState, "actions-cache-volumes", session.pathID, archive.ID)
 }
 
 func (s *CacheService) actionsArchivePath(session *cacheSession, archive *actionsArchive) string {

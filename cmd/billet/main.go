@@ -1951,6 +1951,15 @@ func startNodeCache(
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    16 << 10,
 	}
+	// BAZEL'S AND BUCK2'S REMOTE CACHES SPEAK gRPC, which is HTTP/2, and a guest
+	// reaches this listener in the clear on its own bridge, so it takes HTTP/2
+	// with prior knowledge beside HTTP/1. The read timeout applies per stream,
+	// and a cache transfer extends its own.
+	if cfg.Node.Provider != config.ProviderEC2 {
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		srv.Protocols.SetUnencryptedHTTP2(true)
+	}
 	serveListener := ln
 	if cfg.Node.Provider == config.ProviderEC2 {
 		certificate, err := tls.LoadX509KeyPair(cfg.Node.Cache.TLSCert, cfg.Node.Cache.TLSKey)

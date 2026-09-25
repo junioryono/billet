@@ -228,7 +228,9 @@ func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
 	if !ok {
 		return entry{}, false
 	}
-	if _, err := os.Stat(h.outputPath(found.output)); err != nil {
+	// AN OUTPUT ALREADY ON DISK IS REUSED ONLY WHEN IT IS THE ENTRY'S: a damaged
+	// one, which local() refused, is fetched again rather than named.
+	if !h.holds(found) {
 		body, ok := h.call(ctx, http.MethodGet, "cas/"+found.output, nil)
 		if !ok || int64(len(body)) != found.size || digest(body) != found.output {
 			return entry{}, false
@@ -242,6 +244,13 @@ func (h *helper) fetch(ctx context.Context, action string) (entry, bool) {
 	}
 
 	return found, true
+}
+
+// holds reports whether the local output is exactly the one found names.
+func (h *helper) holds(found entry) bool {
+	body, err := os.ReadFile(h.outputPath(found.output))
+
+	return err == nil && int64(len(body)) == found.size && digest(body) == found.output
 }
 
 func (h *helper) put(ctx context.Context, req request, body []byte, resp *response) {

@@ -13,11 +13,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node/reapi"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -38,6 +40,12 @@ const (
 	// casConcurrency bounds one session's concurrent cache transfers, which a
 	// build issues many of at once.
 	casConcurrency = 16
+	// casPolicyAge is how long a kill switch's answer stands for a session's
+	// transfers, which are too many to ask the control plane about each.
+	casPolicyAge = 30 * time.Second
+	// casReleaseWait bounds how long the cache loop waits for a closed
+	// session's transfers to end before it tries again on a later pass.
+	casReleaseWait = 5 * time.Second
 )
 
 // casKinds are the caches served from a content-addressed volume.
@@ -53,14 +61,33 @@ type hostVolume struct {
 	Dirty   bool            `json:"dirty,omitempty"`
 	Intent  *publishIntent  `json:"intent,omitempty"`
 	Journal *publishJournal `json:"journal,omitempty"`
+	// Merge is the clone of the newest generation a merge publication is
+	// filling, recorded before it is mounted so a crash cannot lose it.
+	Merge *storecontract.Volume `json:"merge,omitempty"`
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
+	// THE ORDER IS session.mu, THEN io: a transfer holding io never waits for
+	// session.mu, which is why a write is recorded in written, not Dirty.
 	io sync.RWMutex
+	// written says a transfer stored something since the session began; the
+	// holder of session.mu folds it into Dirty.
+	written atomic.Bool
+	// allowedAt is when the kill switch last allowed this cache, under
+	// session.mu; a transfer asks again once it is older than casPolicyAge.
+	allowedAt time.Time
 }
 
 func (s *CacheService) casMountPath(session *cacheSession, kind config.CacheKind) string {
-	return filepath.Join(s.rootState, "cas-volumes", session.token, string(kind))
+	return filepath.Join(s.rootState, "cas-volumes", session.pathID, string(kind))
+}
+
+// sessionPathID is a name for a session's mount points that reveals nothing of
+// its bearer.
+func sessionPathID(token string) string {
+	sum := sha256.Sum256([]byte("billet cache session path\x00" + token))
+
+	return hex.EncodeToString(sum[:16])
 }
 
 // casVolume is the session's mounted volume of one kind, attaching it on first
@@ -92,7 +119,7 @@ func (s *CacheService) casVolume(
 
 	// DURABLE BEFORE IT IS MOUNTED, so a crash between the two leaves a record
 	// restart cleanup can find.
-	hv := &hostVolume{Kind: kind, Volume: volume}
+	hv := &hostVolume{Kind: kind, Volume: volume, allowedAt: s.now()}
 	session.hosts[kind] = hv
 	if err := s.persistSession(session); err != nil {
 		delete(session.hosts, kind)
@@ -131,83 +158,197 @@ func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session 
 
 		return
 	}
-
-	select {
-	case session.casAdmit <- struct{}{}:
-		defer func() { <-session.casAdmit }()
-	default:
-		http.Error(w, "too many concurrent cache transfers", http.StatusTooManyRequests)
-
-		return
-	}
-
-	// A TRANSFER MAY OUTLIVE THE LISTENER'S READ TIMEOUT, which is sized for
-	// the small requests the rest of the API makes.
-	controller := http.NewResponseController(w)
-	_ = controller.SetReadDeadline(time.Now().Add(casRequestLife))
-	_ = controller.SetWriteDeadline(time.Now().Add(casRequestLife))
-	ctx, cancel := context.WithTimeout(r.Context(), casRequestLife)
+	ctx, cancel := extendTransfer(w, r)
 	defer cancel()
 
-	if err := lockCacheSession(ctx, session); err != nil {
-		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+	handle, err := s.openCASHandle(ctx, session, kind)
+	switch {
+	case errors.Is(err, reapi.ErrBusy):
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
 
 		return
-	}
-	if session.closed {
-		session.mu.Unlock()
-		http.Error(w, "cache session has ended", http.StatusGone)
+	case errors.Is(err, reapi.ErrEnded):
+		http.Error(w, err.Error(), http.StatusGone)
 
 		return
-	}
-	hv, err := s.casVolume(ctx, session, kind)
-	session.mu.Unlock()
-	if errors.Is(err, errCacheOff) {
+	case errors.Is(err, reapi.ErrOff):
 		http.Error(w, err.Error(), http.StatusForbidden)
 
 		return
-	}
-	if err != nil {
-		s.log.Warn("a content-addressed cache is unavailable; the build continues uncached",
-			"instance", session.instance, "kind", kind, "error", err)
+	case err != nil:
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
 
 		return
 	}
-
-	hv.io.RLock()
-	defer hv.io.RUnlock()
-	if !hv.Mounted {
-		http.Error(w, "cache session has ended", http.StatusGone)
-
-		return
-	}
-	path := filepath.Join(s.casMountPath(session, kind), table, digest[:2], digest)
+	defer handle.Close()
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		serveCASObject(w, r, path)
-	case http.MethodPut:
-		limit := int64(casResultLimit)
-		if table == "cas" {
-			limit = volumeCeiling(sessionSetting(session, kind))
+		file, err := handle.Open(reapi.Table(table), digest)
+		if err != nil {
+			http.NotFound(w, r)
+
+			return
 		}
-		if err := s.storeCASObject(ctx, r.Body, path, table, digest, limit,
-			s.casMountPath(session, kind)); err != nil {
+		defer file.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeContent(w, r, "", time.Time{}, file)
+	case http.MethodPut:
+		if err := handle.Put(ctx, reapi.Table(table), digest, r.Body); err != nil {
 			status := http.StatusBadRequest
-			if errors.Is(err, errCASFull) {
+			if errors.Is(err, reapi.ErrFull) {
 				status = http.StatusInsufficientStorage
 			}
 			http.Error(w, err.Error(), status)
 
 			return
 		}
-		s.markCASDirty(session, hv)
 		w.WriteHeader(http.StatusOK)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
+
+// extendTransfer lets one cache transfer outlive the listener's read timeout,
+// which is sized for the small requests the rest of the API makes.
+func extendTransfer(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(casRequestLife))
+	_ = controller.SetWriteDeadline(time.Now().Add(casRequestLife))
+
+	return context.WithTimeout(r.Context(), casRequestLife)
+}
+
+// casHandle is one admitted transfer's hold on a session's mounted volume: a
+// slot of the session's transfer bound, and the volume's io lock for reading,
+// so the volume is not unmounted under it. It is what both the HTTP routes and
+// the Remote Execution API read and write through.
+type casHandle struct {
+	s       *CacheService
+	session *cacheSession
+	hv      *hostVolume
+	root    string
+	limit   int64
+	release func()
+}
+
+var _ reapi.Volume = (*casHandle)(nil)
+
+// openCASHandle admits a transfer and attaches the session's volume of kind on
+// first use. The refusals are reapi's, so each protocol can say them its way.
+func (s *CacheService) openCASHandle(
+	ctx context.Context, session *cacheSession, kind config.CacheKind,
+) (*casHandle, error) {
+	select {
+	case session.casAdmit <- struct{}{}:
+	default:
+		return nil, reapi.ErrBusy
+	}
+	admitted := func() { <-session.casAdmit }
+
+	if err := lockCacheSession(ctx, session); err != nil {
+		admitted()
+
+		return nil, err
+	}
+	if session.closed {
+		session.mu.Unlock()
+		admitted()
+
+		return nil, reapi.ErrEnded
+	}
+	hv, err := s.casVolume(ctx, session, kind)
+	if err == nil && s.now().Sub(hv.allowedAt) >= casPolicyAge {
+		// THE KILL SWITCH IS ASKED AGAIN WHILE THE VOLUME IS IN USE, not only
+		// when it is attached, so disabling a cache stops a running job's use of
+		// it within casPolicyAge.
+		if !s.sessionKindAllowed(ctx, session, kind) {
+			err = errCacheOff
+		} else {
+			hv.allowedAt = s.now()
+		}
+	}
+	session.mu.Unlock()
+	if errors.Is(err, errCacheOff) {
+		admitted()
+
+		return nil, reapi.ErrOff
+	}
+	if err != nil {
+		admitted()
+		s.log.Warn("a content-addressed cache is unavailable; the build continues uncached",
+			"instance", session.instance, "kind", kind, "error", err)
+
+		return nil, err
+	}
+
+	hv.io.RLock()
+	if !hv.Mounted {
+		hv.io.RUnlock()
+		admitted()
+
+		return nil, reapi.ErrEnded
+	}
+
+	return &casHandle{
+		s: s, session: session, hv: hv, root: s.casMountPath(session, kind),
+		limit: volumeCeiling(sessionSetting(session, kind)),
+		release: func() {
+			hv.io.RUnlock()
+			admitted()
+		},
+	}, nil
+}
+
+func (h *casHandle) path(table reapi.Table, digest string) (string, error) {
+	if (table != reapi.TableAC && table != reapi.TableCAS) || !validDigest(digest) {
+		return "", fs.ErrNotExist
+	}
+
+	return filepath.Join(h.root, string(table), digest[:2], digest), nil
+}
+
+// Open returns a stored object, opened without following a link and only if it
+// is a regular file, though nothing but the node writes the volume.
+func (h *casHandle) Open(table reapi.Table, digest string) (*os.File, error) {
+	path, err := h.path(table, digest)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fs.ErrNotExist
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = file.Close()
+
+		return nil, fs.ErrNotExist
+	}
+
+	return file, nil
+}
+
+// Put stores an object and marks the volume written.
+func (h *casHandle) Put(ctx context.Context, table reapi.Table, digest string, body io.Reader) error {
+	path, err := h.path(table, digest)
+	if err != nil {
+		return reapi.ErrMismatch
+	}
+	limit := int64(casResultLimit)
+	if table == reapi.TableCAS {
+		limit = h.limit
+	}
+	if err := h.s.storeCASObject(ctx, body, path, string(table), digest, limit, h.root); err != nil {
+		return err
+	}
+	h.hv.written.Store(true)
+
+	return nil
+}
+
+func (h *casHandle) Close() { h.release() }
 
 func parseCASPath(path string) (config.CacheKind, string, string, bool) {
 	rest, ok := strings.CutPrefix(path, casPathPrefix)
@@ -232,29 +373,6 @@ func validDigest(value string) bool {
 	return err == nil && strings.ToLower(value) == value
 }
 
-// serveCASObject writes a stored object, opened without following a link,
-// though nothing but the node writes the volume.
-func serveCASObject(w http.ResponseWriter, r *http.Request, path string) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		http.NotFound(w, r)
-
-		return
-	}
-	file := os.NewFile(uintptr(fd), path)
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		http.NotFound(w, r)
-
-		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, "", time.Time{}, file)
-}
-
-var errCASFull = errors.New("the cache volume is full; this object is not cached")
-
 // storeCASObject writes one object through a temporary file and a rename, so a
 // reader sees a whole object or none, and refuses content that does not hash
 // to its name.
@@ -262,7 +380,7 @@ func (s *CacheService) storeCASObject(
 	ctx context.Context, body io.Reader, path, table, digest string, limit int64, root string,
 ) error {
 	if full, err := casFull(root); err != nil || full {
-		return errCASFull
+		return reapi.ErrFull
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("prepare the cache directory: %w", err)
@@ -285,7 +403,7 @@ func (s *CacheService) storeCASObject(
 	case written > limit:
 		return fmt.Errorf("the object is larger than %d bytes", limit)
 	case table == "cas" && hex.EncodeToString(hash.Sum(nil)) != digest:
-		return errors.New("the object's content does not hash to its name")
+		return reapi.ErrMismatch
 	}
 
 	return os.Rename(temporary.Name(), path)
@@ -303,19 +421,6 @@ func casFull(root string) (bool, error) {
 	}
 
 	return (total-float64(stat.Bavail))/total > casFullFraction, nil
-}
-
-func (s *CacheService) markCASDirty(session *cacheSession, hv *hostVolume) {
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if hv.Dirty || session.finished {
-		return
-	}
-	hv.Dirty = true
-	if err := s.persistSession(session); err != nil {
-		s.log.Warn("could not record that a cache volume was written", "instance",
-			session.instance, "kind", hv.Kind, "error", err)
-	}
 }
 
 // contextReader stops a copy when its context ends.
@@ -339,8 +444,16 @@ func (c contextReader) Read(p []byte) (int, error) {
 func (s *CacheService) releaseCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
 ) (done bool, err error) {
-	hv.io.Lock()
+	// A TRANSFER STILL RUNNING HOLDS io, and the cache loop serves every
+	// session, so it waits a little and comes back rather than wait out a
+	// transfer's whole deadline.
+	if !lockWithin(ctx, &hv.io, casReleaseWait) {
+		return false, errors.New("a transfer is still using the volume")
+	}
 	defer hv.io.Unlock()
+	if hv.written.Load() {
+		hv.Dirty = true
+	}
 
 	if hv.Mounted {
 		if err := s.actionIO.Unmount(ctx, s.casMountPath(session, hv.Kind)); err != nil {
@@ -353,7 +466,7 @@ func (s *CacheService) releaseCASVolume(
 	}
 
 	if hv.Intent == nil || !hv.Dirty {
-		return true, s.store.Discard(ctx, hv.Volume)
+		return s.discardCASVolumes(ctx, session, hv, true)
 	}
 
 	journal := hv.Journal
@@ -365,14 +478,22 @@ func (s *CacheService) releaseCASVolume(
 		journal.Phase, journal.Reason = phaseAbandoned, reason
 		s.log.Info("a cache publication was abandoned; the writes are discarded",
 			"instance", session.instance, "kind", hv.Kind, "reason", reason)
+		if err := s.persistSession(session); err != nil {
+			return false, err
+		}
 
-		return true, errors.Join(s.persistSession(session), s.store.Discard(ctx, hv.Volume))
+		return s.discardCASVolumes(ctx, session, hv, true)
 	}
 	switch journal.Phase {
 	case phasePublished:
-		return true, nil
+		// A SNAPSHOT TOOK THE SESSION'S OWN CLONE, or a merge left it to discard.
+		if journal.Consumed {
+			return s.discardCASVolumes(ctx, session, hv, false)
+		}
+
+		return s.discardCASVolumes(ctx, session, hv, true)
 	case phaseAbandoned:
-		return true, s.store.Discard(ctx, hv.Volume)
+		return s.discardCASVolumes(ctx, session, hv, true)
 	case "":
 	default:
 		return abandon("a crash interrupted the merge, so its state cannot be told")
@@ -384,7 +505,7 @@ func (s *CacheService) releaseCASVolume(
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if !s.kindAllowed(ctx, hv.Kind, session.cacheOwner(), session.cacheRepository()) {
+	if !s.sessionKindAllowed(ctx, session, hv.Kind) {
 		return abandon("the cache is disabled for this repository")
 	}
 
@@ -392,15 +513,54 @@ func (s *CacheService) releaseCASVolume(
 	if err := s.persistSession(session); err != nil {
 		return false, err
 	}
-	merged, err := s.mergeCASVolume(ctx, session, hv)
+	merged, consumed, err := s.mergeCASVolume(ctx, session, hv)
 	if err != nil {
 		return abandon("the merge failed: " + err.Error())
 	}
-	journal.Phase = phasePublished
+	journal.Phase, journal.Consumed = phasePublished, consumed
 	s.log.Info("published a content-addressed cache a job wrote", "instance", session.instance,
 		"kind", hv.Kind, "generation", merged)
+	if err := s.persistSession(session); err != nil {
+		return false, err
+	}
+	if consumed {
+		return true, nil
+	}
 
-	return true, s.persistSession(session)
+	return s.discardCASVolumes(ctx, session, hv, true)
+}
+
+// discardCASVolumes lets go of everything a host volume holds: the merge's
+// mount points, the merge clone, and the session's own clone unless a snapshot
+// took it (own false). Done only when every step succeeded, so a failed one
+// keeps the record for the next pass.
+func (s *CacheService) discardCASVolumes(
+	ctx context.Context, session *cacheSession, hv *hostVolume, own bool,
+) (bool, error) {
+	base := s.casMountPath(session, hv.Kind)
+	err := errors.Join(s.actionIO.Unmount(ctx, base+".source"), s.actionIO.Unmount(ctx, base+".merge"))
+	if err == nil && hv.Merge != nil {
+		err = s.store.Discard(ctx, *hv.Merge)
+	}
+	if err == nil && own {
+		err = s.store.Discard(ctx, hv.Volume)
+	}
+
+	return err == nil, err
+}
+
+// lockWithin takes l for writing, giving up after wait or when ctx ends.
+func lockWithin(ctx context.Context, l *sync.RWMutex, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		if l.TryLock() {
+			return true
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // mergeCASVolume publishes a session's objects into the newest generation of
@@ -413,64 +573,83 @@ func (s *CacheService) releaseCASVolume(
 // action result already there is kept, because either is a valid answer), and
 // that clone is published. Disjoint writes of concurrent jobs therefore both
 // survive, which a whole-volume last-write-wins would lose.
+//
+// consumed says the session's own clone became the published generation, so
+// there is nothing of it left to discard. Every failure leaves what it made to
+// the caller's discard: the merge clone is recorded before it is mounted.
 func (s *CacheService) mergeCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
-) (string, error) {
+) (generation string, consumed bool, err error) {
 	key := hv.Volume.Key
 	lease, fence, err := s.store.AcquireWriter(ctx, key, session.instance+"/"+string(hv.Kind),
 		cacheWriterTTL)
 	if err != nil {
-		return "", fmt.Errorf("acquire writer: %w", err)
+		return "", false, fmt.Errorf("acquire writer: %w", err)
 	}
 	release := func(err error) error { return errors.Join(err, s.releaseWriter(ctx, lease, fence)) }
+	// THE KILL SWITCH IS ASKED AGAIN IMMEDIATELY BEFORE THE POINTER MOVES, after
+	// the writer's wait and the copy, which can both be long.
+	publish := func(current string, candidate storecontract.Candidate) error {
+		if !s.sessionKindAllowed(ctx, session, hv.Kind) {
+			return release(errors.New("the cache was disabled before its publication"))
+		}
+		if err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence); err != nil {
+			return release(fmt.Errorf("publish: %w", err))
+		}
+
+		return nil
+	}
 
 	current, currentErr := s.store.Current(ctx, key)
 	if currentErr != nil && !errors.Is(currentErr, storecontract.ErrMiss) {
-		return "", release(currentErr)
+		return "", false, release(currentErr)
 	}
 	if current == hv.Volume.Generation {
 		candidate, err := s.store.Snapshot(ctx, hv.Volume)
 		if err != nil {
-			return "", release(fmt.Errorf("snapshot: %w", err))
+			return "", false, release(fmt.Errorf("snapshot: %w", err))
 		}
-		if err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence); err != nil {
-			return "", release(fmt.Errorf("publish: %w", err))
+		if err := publish(current, candidate); err != nil {
+			return "", false, err
 		}
 
-		return candidate.Generation, nil
+		return candidate.Generation, true, nil
 	}
 
 	latest, err := s.store.Clone(ctx, key, current)
 	if err != nil {
-		return "", release(fmt.Errorf("clone the newest generation: %w", err))
+		return "", false, release(fmt.Errorf("clone the newest generation: %w", err))
+	}
+	hv.Merge = &latest
+	if err := s.persistSession(session); err != nil {
+		return "", false, release(errors.Join(err, s.store.Discard(ctx, latest)))
 	}
 	source := s.casMountPath(session, hv.Kind) + ".source"
 	target := s.casMountPath(session, hv.Kind) + ".merge"
-	cleanup := func(err error) error {
-		return errors.Join(err, s.actionIO.Unmount(ctx, source), s.actionIO.Unmount(ctx, target),
-			s.store.Discard(ctx, latest))
-	}
 	if err := s.actionIO.MountReadOnly(ctx, hv.Volume.Device, source); err != nil {
-		return "", release(cleanup(err))
+		return "", false, release(err)
 	}
 	if err := s.actionIO.MountWritable(ctx, latest.Device, target); err != nil {
-		return "", release(cleanup(err))
+		return "", false, release(err)
 	}
 	if err := copyMissingObjects(ctx, source, target); err != nil {
-		return "", release(cleanup(err))
+		return "", false, release(err)
 	}
 	if err := errors.Join(s.actionIO.Unmount(ctx, source), s.actionIO.Unmount(ctx, target)); err != nil {
-		return "", release(cleanup(err))
+		return "", false, release(err)
 	}
 	candidate, err := s.store.Snapshot(ctx, latest)
 	if err != nil {
-		return "", release(cleanup(fmt.Errorf("snapshot: %w", err)))
+		return "", false, release(fmt.Errorf("snapshot: %w", err))
 	}
-	if err := s.store.PublishCAS(ctx, key, current, candidate, lease, fence); err != nil {
-		return "", release(fmt.Errorf("publish: %w", err))
+	if err := publish(current, candidate); err != nil {
+		return "", false, err
 	}
+	// THE MERGE CLONE BECAME THE GENERATION; the session's own clone is what is
+	// left to discard.
+	hv.Merge = nil
 
-	return candidate.Generation, s.store.Discard(ctx, hv.Volume)
+	return candidate.Generation, false, nil
 }
 
 // copyMissingObjects copies every object and action result in source that
@@ -531,4 +710,29 @@ func copyFile(from, to string) error {
 	}
 
 	return os.Rename(temporary.Name(), to)
+}
+
+// remoteAPISession carries an authenticated session from the listener to the
+// Remote Execution API's handlers, which gRPC runs on the request's context.
+type remoteAPISession struct{}
+
+func (s *CacheService) serveRemoteAPI(w http.ResponseWriter, r *http.Request, session *cacheSession) {
+	ctx, cancel := extendTransfer(w, r)
+	defer cancel()
+	s.remoteAPI.ServeHTTP(w, r.WithContext(context.WithValue(ctx, remoteAPISession{}, session)))
+}
+
+// openRemoteAPIVolume is the Bazel volume of the call's session: the Remote
+// Execution API serves the bazel cache only, whichever client speaks it.
+func (s *CacheService) openRemoteAPIVolume(ctx context.Context) (reapi.Volume, error) {
+	session, ok := ctx.Value(remoteAPISession{}).(*cacheSession)
+	if !ok || session == nil {
+		return nil, reapi.ErrEnded
+	}
+	handle, err := s.openCASHandle(ctx, session, config.CacheBazel)
+	if err != nil {
+		return nil, err
+	}
+
+	return handle, nil
 }
