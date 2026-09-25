@@ -245,3 +245,81 @@ func TestATierWithNoCredentialIsRefusedNotBorrowed(t *testing.T) {
 		t.Errorf("target A's source described %v for a tier that is not its own", described)
 	}
 }
+
+// A node names a tier by its label and the plane describes the scale set by
+// the tier's runs_on, on the tier's own target, both for the node's describe
+// and for the set a registration is minted in. Two targets may share the name.
+func TestAScaleSetIsDescribedByTheTiersRunsOn(t *testing.T) {
+	t.Parallel()
+
+	catalogue := twoTargetCatalogue()
+	for i := range catalogue {
+		catalogue[i].RunsOn = "shared"
+	}
+
+	jitA, jitB := &targetJIT{}, &targetJIT{}
+
+	store := &fakeStore{lease: &alloc.Lease{
+		ID: "l1", Tier: "tier-b", Node: "n1", Epoch: 1, RequestID: 7,
+	}}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithTierCatalog(catalogue), nodeplane.WithCommandTimeout(time.Minute))
+
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil,
+		nodeplane.WithTargetJIT(map[string]nodeplane.JITSource{"default": jitA, "personal": jitB})))
+	t.Cleanup(srv.Close)
+
+	c := dial(t, srv.URL)
+
+	lease := &alloc.Lease{ID: "l1", Tier: "tier-b", Node: "n1", Epoch: 1,
+		RequestID: 7, VCPU: 2, Memory: 8 * config.GiB, GuestOS: config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderDocker}}
+
+	launched := make(chan error, 1)
+
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("launch was never queued")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, ok, err := c.Poll(t.Context()); err != nil || !ok {
+		t.Fatalf("Poll = ok %v, err %v", ok, err)
+	}
+
+	set, _, err := c.Describe(t.Context(), "tier-b", "billet")
+	if err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+
+	if set == nil || set.Name != "shared" {
+		t.Fatalf("Describe answered %+v, want the set named by runs_on", set)
+	}
+
+	if _, err := c.JITConfig(t.Context(), set.ID, "billet-l1", "_work"); err != nil {
+		t.Fatalf("JITConfig: %v", err)
+	}
+
+	describedB, mintedB, _ := jitB.snapshot()
+	if len(describedB) < 2 || len(mintedB) != 1 {
+		t.Fatalf("target B's source described %v and minted %v; want the node's describe, "+
+			"the plane's own and one mint", describedB, mintedB)
+	}
+
+	for _, name := range describedB {
+		if name != "shared" {
+			t.Errorf("target B's source described %q, not the tier's runs_on", name)
+		}
+	}
+
+	if describedA, mintedA, _ := jitA.snapshot(); len(describedA)+len(mintedA) != 0 {
+		t.Errorf("target A's source was asked about target B's tier: %v %v", describedA, mintedA)
+	}
+}

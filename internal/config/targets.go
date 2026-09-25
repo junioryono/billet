@@ -511,6 +511,14 @@ func (c *Config) validateTierTargets() []error {
 		names = append(names, t.Name)
 	}
 
+	// A scale set's name is unique within the GitHub owner it lives on, keyed by
+	// the target's path rather than its config name, so two targets on one
+	// organization cannot both carry it either. Folded, because GitHub compares
+	// owners, repositories and these names without case.
+	type scaleSet struct{ path, name string }
+
+	claimed := make(map[scaleSet]string, len(c.Tiers))
+
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
 
@@ -520,6 +528,15 @@ func (c *Config) validateTierTargets() []error {
 		}
 
 		target, ok := c.TierTarget(t)
+		if ok {
+			key := scaleSet{path: strings.ToLower(target.Path()), name: strings.ToLower(t.ScaleSetName())}
+			if other, dup := claimed[key]; !dup {
+				claimed[key] = t.Label
+			} else if other != t.Label {
+				errs = append(errs, fmt.Errorf("%s: tier %q already answers to %q on %s; "+
+					"a scale set's name is unique within its target", where, other, key.name, key.path))
+			}
+		}
 		if !ok {
 			if t.Target == "" {
 				errs = append(errs, fmt.Errorf("%s: target is required, because this deployment "+
@@ -534,6 +551,25 @@ func (c *Config) validateTierTargets() []error {
 		}
 
 		errs = append(errs, TierTargetPolicyErrors(where, *t, target)...)
+	}
+
+	// AN ORGANIZATION'S SET ALSO TAKES ITS REPOSITORIES' JOBS, so a repository
+	// target inside an organization target cannot answer to a name the
+	// organization's tiers do: either set could run the repository's job.
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		target, ok := c.TierTarget(t)
+		if !ok || !target.IsRepository() {
+			continue
+		}
+
+		owner := scaleSet{path: strings.ToLower(target.Owner()), name: strings.ToLower(t.ScaleSetName())}
+		if other, dup := claimed[owner]; dup {
+			errs = append(errs, fmt.Errorf("tier %q answers to %q on %s, and tier %q answers to it "+
+				"on the organization %s, whose scale set would take the same jobs", t.Label,
+				t.ScaleSetName(), target.Path(), other, target.Owner()))
+		}
 	}
 
 	return errs

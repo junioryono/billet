@@ -55,7 +55,7 @@ The one operation that fails somebody's build on purpose. It refuses unless admi
 
 ## Removing GitHub and AWS resources
 
-`billet teardown --tier <label>` or `--all` deletes the scale sets billet created on GitHub; there is no delete control for them in GitHub's UI. `billet decommission --yes` deletes the EC2 instances and the EBS+S3 cache billet made outside Terraform, scoped by the deployment identity; run it before `terraform destroy`, and pass `--terminate-instances` only if failing any job still running is acceptable. The CodeBuild Terraform module refuses a destroy while a build is running; drain first.
+`billet teardown --tier <name>` (a tier's `runs_on`, or its label; `--target` scopes it to one target) or `--all` deletes the scale sets billet created on GitHub; there is no delete control for them in GitHub's UI. `billet decommission --yes` deletes the EC2 instances and the EBS+S3 cache billet made outside Terraform, scoped by the deployment identity; run it before `terraform destroy`, and pass `--terminate-instances` only if failing any job still running is acceptable. The CodeBuild Terraform module refuses a destroy while a build is running; drain first.
 
 ## What stays charged
 

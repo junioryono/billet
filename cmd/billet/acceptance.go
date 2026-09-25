@@ -35,8 +35,8 @@ import (
 // already holds a DIFFERENT identity, a workspace inside the base config's own
 // state directory, and an AWS credential in an account they did not name.
 //
-// THE TIER LABELS ARE PREFIXED, which is the other half. A tier's label is its
-// GitHub scale set, so an unprefixed acceptance tier would share a scale set with
+// THE TIER LABELS ARE PREFIXED, which is the other half. A derived tier's label is
+// its GitHub scale set (the derivation drops runs_on), so an unprefixed acceptance tier would share a scale set with
 // production's — and `billet teardown --all` would then delete the one that
 // matters. Prefixing makes the scale sets disjoint, which makes the teardown
 // disjoint.
