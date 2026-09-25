@@ -3248,6 +3248,28 @@ func (a *Allocator) countOpenPerTier(ctx context.Context, tx querier) (map[strin
 	return held, nil
 }
 
+// countFloorLeasesPerTier reports what each tier holds toward its reserved floor:
+// every non-terminal lease on a host still in contact, draining or not.
+//
+// WIDER THAN countOpenPerTier BY THE DRAINING HOSTS, and only that. A draining
+// host takes no new work, so it is out of the placement fleet, but the leases on
+// it are running jobs occupying the slots their floor promised; counting them
+// unmet would hold a second slot elsewhere for a tier that cannot use it.
+func (a *Allocator) countFloorLeasesPerTier(ctx context.Context, tx querier) (map[string]int, error) {
+	rows, err := state.ReadQueries(tx).CountOpenPerTierOnLiveHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: count floor leases per tier: %w", err)
+	}
+
+	held := make(map[string]int, len(a.tiers))
+
+	for _, row := range rows {
+		held[row.Tier] = int(row.OpenLeases)
+	}
+
+	return held, nil
+}
+
 func (a *Allocator) countOpenByTier(ctx context.Context, tx querier, tier string) (int, error) {
 	n, err := state.ReadQueries(tx).CountOpenInTier(ctx, tier)
 	if err != nil {

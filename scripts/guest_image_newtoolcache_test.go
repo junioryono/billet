@@ -219,7 +219,7 @@ if [ -n "$out" ]; then cat "$src" >"$out"; else cat "$src"; fi
 		guestImageFunction(t, fn) + "\n" +
 		call + "\n"
 
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatalf("write exercise: %v", err)
 	}
 

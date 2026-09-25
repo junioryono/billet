@@ -35,7 +35,7 @@ func fakeBinary(t *testing.T, dir, contents string) string {
 	t.Helper()
 
 	path := filepath.Join(dir, "billet")
-	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte(contents), 0o755); err != nil {
 		t.Fatalf("write the fake binary: %v", err)
 	}
 

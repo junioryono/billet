@@ -129,7 +129,7 @@ func TestTheCoverageCheckIteratesTheDeclarationAndNotTheDirectory(t *testing.T) 
 				gateFunction(t, "check_toolcache_coverage") + "\n" +
 				"check_toolcache_coverage\n"
 
-			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			if err := forkSafeWriteFile(script, []byte(body), 0o700); err != nil {
 				t.Fatalf("write exercise: %v", err)
 			}
 

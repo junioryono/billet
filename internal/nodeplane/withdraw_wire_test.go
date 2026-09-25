@@ -4,10 +4,80 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/server"
 )
+
+// A LAUNCH REFUSED BECAUSE THE NODE IS DRAINING TAKES THE HOST OUT OF
+// PLACEMENT, with the fence of the registration the plane was talking to, so the
+// plane stops dispatching launches the node will only refuse. A plain failure
+// marks nothing.
+func TestADrainingRefusalOverTheWireTakesTheHostOutOfPlacement(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		draining bool
+	}{
+		{"a draining refusal", true},
+		{"an ordinary failure", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := &fakeRegistrar{}
+			p, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),
+				nodeplane.WithCommandTimeout(60*time.Second))
+			c := dial(t, base)
+
+			reported := make(chan error, 1)
+
+			go func() {
+				cmd, ok, err := c.Poll(t.Context())
+				if err != nil || !ok {
+					reported <- err
+
+					return
+				}
+
+				reported <- c.Report(t.Context(), nodeapi.CommandResult{ID: cmd.ID,
+					Error: "this node is draining and will not start new work", Draining: tc.draining})
+			}()
+
+			lease := &alloc.Lease{ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
+				GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1}
+
+			if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err == nil {
+				t.Fatal("a refused launch was reported as started")
+			}
+
+			if err := <-reported; err != nil {
+				t.Fatalf("the node could not report: %v", err)
+			}
+
+			told := reg.drainings()
+
+			if !tc.draining {
+				if len(told) != 0 {
+					t.Errorf("an ordinary launch failure took the host out of placement: %+v", told)
+				}
+
+				return
+			}
+
+			if len(told) != 1 || told[0].name != "n1" || told[0].epoch != 1 ||
+				told[0].incarnation != c.Incarnation() {
+				t.Errorf("the ledger was told %+v, want n1 at epoch 1 from %s", told, c.Incarnation())
+			}
+		})
+	}
+}
 
 // A WITHDRAWAL CROSSES THE WIRE AS THE CURRENT PROCESS'S OWN STATEMENT, and
 // each of the plane's three answers arrives on the node as the error it

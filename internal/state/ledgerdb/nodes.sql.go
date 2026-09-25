@@ -382,15 +382,11 @@ type ListPlaceableNodesRow struct {
 // asking tier may not share them -- so the two differ in what they do with the
 // rows, never in which rows exist.
 //
-// `drained = 0` IS REDUNDANT WITH `live = 1` IN EVERY STATE REACHABLE TODAY, and
-// that is said here rather than left for somebody to discover: a decommission
-// writes drained = 1 and live = 0 together, and a re-registration clears both
-// together, so no API path produces a live host that is drained. Measured --
-// deleting either half of this predicate fails no test in internal/alloc, while
-// deleting `live = 1` alone does. It stays because the two columns answer
-// different questions (can this host be reached, and does anybody still expect
-// it to serve), and the next path that sets liveness without going through
-// registration must not silently start placing work on an excluded host.
+// `drained = 0` IS WHAT KEEPS A DRAINING HOST OUT. A decommission writes
+// drained = 1 and live = 0 together, and MarkNodeDraining writes drained = 1 on
+// a host that stays live, because its process still has running work to answer
+// for; a re-registration clears both. The two columns answer different questions:
+// can this host be reached, and does it take new work.
 func (q *Queries) ListPlaceableNodes(ctx context.Context) ([]ListPlaceableNodesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listPlaceableNodes)
 	if err != nil {
@@ -527,6 +523,34 @@ func (q *Queries) ListRemoteCostNodes(ctx context.Context) ([]ListRemoteCostNode
 		return nil, err
 	}
 	return items, nil
+}
+
+const markNodeDraining = `-- name: MarkNodeDraining :execrows
+UPDATE nodes SET drained = 1
+ WHERE name = $1 AND epoch = $2 AND incarnation = $3
+`
+
+type MarkNodeDrainingParams struct {
+	Name        string
+	Epoch       int64
+	Incarnation string
+}
+
+// Record that one host's process refused new work because it is draining, and
+// take it out of placement while it drains.
+//
+// `drained`, NOT `live`: the process is still polling, still answering the
+// destroys and completions its running work needs, and must stay live for them.
+// ListPlaceableNodes reads both columns, and the next registration (the host's
+// process after its restart) clears `drained` as it always has. Fenced on the
+// epoch and the incarnation exactly as WithdrawNode is, so a superseded process
+// cannot take its replacement out of placement. Zero rows is the fence moving.
+func (q *Queries) MarkNodeDraining(ctx context.Context, arg MarkNodeDrainingParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markNodeDraining, arg.Name, arg.Epoch, arg.Incarnation)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const markNodeNotLive = `-- name: MarkNodeNotLive :exec

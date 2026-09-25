@@ -43,7 +43,7 @@ func runHostedGate(t *testing.T, root string) string {
 		"check_hosted_tools \"$1\"\necho \"FAILED=$FAILED\"\n"
 
 	path := filepath.Join(t.TempDir(), "gate.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,7 +272,7 @@ func TestADigestOfTheWrongShapeIsRefused(t *testing.T) {
 		script := "#!/usr/bin/env bash\nset -euo pipefail\n" + fn + "\nbillet_tc_hex \"$1\" 64 fixture\n"
 
 		path := filepath.Join(t.TempDir(), "hex.sh")
-		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 			t.Fatal(err)
 		}
 

@@ -52,7 +52,7 @@ func fakeBillet(t *testing.T, dir, failOn string) (string, string) {
 		"esac\n" +
 		"exit 0\n"
 
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write the stand-in billet: %v", err)
 	}
 

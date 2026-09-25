@@ -26,7 +26,7 @@ func stagedImagesFake(t *testing.T, compatibleStatus int, names []string) (strin
 		"fi\n" +
 		"exit 0\n"
 	staged := filepath.Join(dir, "billet.candidate")
-	if err := os.WriteFile(staged, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(staged, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

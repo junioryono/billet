@@ -2026,7 +2026,7 @@ func TestReleaseInspectRefusesAnImageModifiedDuringTheHash(t *testing.T) {
 			return
 		}
 		// An in-place write: the same inode, new bytes, a new size.
-		if err := os.WriteFile(f.binPath, []byte("IMAGE-A-touched\n"), 0o755); err != nil {
+		if err := forkSafeWriteFile(f.binPath, []byte("IMAGE-A-touched\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}

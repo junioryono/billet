@@ -268,7 +268,7 @@ func runParityCheck(t *testing.T, toolset, installed string) (string, int) {
 		"declared_packages_missing_from \"$1\" \"$2\"\nexit $?\n"
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

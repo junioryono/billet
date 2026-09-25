@@ -40,7 +40,7 @@ func newGuardFixture(t *testing.T) *guardFixture {
 	f := &guardFixture{parent: parent, root: filepath.Join(parent, "upgrades")}
 
 	f.binary = filepath.Join(t.TempDir(), "billet")
-	if err := os.WriteFile(f.binary, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(f.binary, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -980,7 +980,7 @@ func stageGuardCandidate(t *testing.T, f *guardFixture, dir string, body []byte)
 	}
 
 	path := filepath.Join(recovery, "billet.candidate")
-	if err := os.WriteFile(path, body, 0o755); err != nil {
+	if err := forkSafeWriteFile(path, body, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1641,15 +1641,15 @@ func TestACandidateIsValidatedAndDigestedThroughDescriptors(t *testing.T) {
 	}
 
 	outside := filepath.Join(t.TempDir(), "billet.candidate")
-	mustOK(t, os.WriteFile(outside, []byte("x"), 0o755))
+	mustOK(t, forkSafeWriteFile(outside, []byte("x"), 0o755))
 
 	directChild := filepath.Join(f.root, "billet.candidate")
-	mustOK(t, os.WriteFile(directChild, []byte("x"), 0o755))
+	mustOK(t, forkSafeWriteFile(directChild, []byte("x"), 0o755))
 
 	notRecovery := stageGuardCandidate(t, f, "staging-x", []byte("x"))
 	nested := filepath.Join(f.root, "recovery-x", "deeper", "billet.candidate")
 	mustOK(t, os.MkdirAll(filepath.Dir(nested), 0o700))
-	mustOK(t, os.WriteFile(nested, []byte("x"), 0o755))
+	mustOK(t, forkSafeWriteFile(nested, []byte("x"), 0o755))
 
 	linkToCandidate := filepath.Join(f.root, "recovery-x", "link")
 	mustOK(t, os.Symlink(candidate, linkToCandidate))
@@ -1895,7 +1895,7 @@ func TestATakeoverRelabelsAndKeepsEverythingElse(t *testing.T) {
 	// under its other name. Both are refused before the truncation, and the
 	// other name keeps its bytes.
 	preserved := filepath.Join(recovery, "billet.previous")
-	mustOK(t, os.WriteFile(preserved, []byte("the previous binary"), 0o700))
+	mustOK(t, forkSafeWriteFile(preserved, []byte("the previous binary"), 0o700))
 
 	for name, target := range map[string]string{
 		"the record":         filepath.Join(f.active(), guardRecordName),
