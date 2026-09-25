@@ -13,7 +13,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A PULL REQUEST'S OLDER RUN IS CANCELLED; main's is let finish. Cancelling on
+  # main meant a run completed only when nothing merged for as long as CI takes,
+  # and on 2026-09-25 no main run completed across nine merges. The group still
+  # replaces a PENDING main run with the newer one, so main queues at most one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # WHICH JOB FAMILIES A CHANGE NEEDS. test, release-config and docs always run
