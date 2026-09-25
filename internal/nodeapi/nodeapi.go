@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 21
+	Version = 22
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -301,6 +301,16 @@ const (
 	// naming this version, because a wrong guess would validate one owner's
 	// policy with another owner's App.
 	VersionTargetedRunnerGroup = 21
+
+	// VersionNodeDraining is the version from which a launch a draining node
+	// refuses says so in CommandResult.Draining, and the plane takes the host out
+	// of placement until it registers again.
+	//
+	// CHECKED WHERE IT IS EMITTED, because the plane decodes a result strictly
+	// and an older one would refuse the field. What an older pairing loses is the
+	// refusal being remembered: the plane goes on dispatching launches the node
+	// refuses, which is how it behaved before, and nothing is lost but the churn.
+	VersionNodeDraining = 22
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -843,6 +853,11 @@ type CommandResult struct {
 	// assume something is running, keep the lease, and let the node's recovery
 	// adopt it. The opposite default releases capacity that is genuinely in use.
 	Custody bool `json:"custody,omitempty"`
+
+	// Draining says a launch was refused because the node is draining: nothing
+	// started, and no launch will until the process registers again. Sent only
+	// on a wire at or above VersionNodeDraining.
+	Draining bool `json:"draining,omitempty"`
 
 	// BarrierID echoes the inventory command's barrier, and Instances is what the
 	// host's provider actually holds.

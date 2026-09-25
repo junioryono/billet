@@ -1120,6 +1120,8 @@ func execute(
 		// GitHub reassigns — and no custody is claimed, because nothing started.
 		if draining {
 			res.Error = "this node is draining and will not start new work"
+			// Only where the wire has the field: the plane decodes a result strictly.
+			res.Draining = negotiated >= nodeapi.VersionNodeDraining
 
 			return res
 		}
