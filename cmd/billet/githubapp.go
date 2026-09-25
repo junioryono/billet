@@ -77,6 +77,9 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	cfgPath := fs.String("config", "", "billet.yaml to write the github block into")
 	noBrowser := fs.Bool("no-browser", false, "print URLs instead of opening a browser")
 	port := fs.Int("port", 0, "fixed loopback callback port (needed for `ssh -L` when onboarding a remote host)")
+	actionsRead := fs.Bool("actions-read", false,
+		"also request `actions: read`, which a deployment with cache.publish: default-branch needs "+
+			"to prove a job's branch from GitHub's record of its run")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -183,7 +186,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	fmt.Printf("billet requests exactly these permissions for a %s:\n", target.Scope())
 
-	perms := github.Permissions(target.Scope())
+	perms := github.Permissions(target.Scope(), *actionsRead)
 
 	names := make([]string, 0, len(perms))
 	for name := range perms {
@@ -212,6 +215,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	result, err := onboard(ctx, github.OnboardOptions{
 		Target:      target,
+		RunEvidence: *actionsRead,
 		Name:        *name,
 		Port:        *port,
 		OpenBrowser: open,

@@ -108,6 +108,38 @@ func TestTheDefaultBranchIsNeverCached(t *testing.T) {
 	}
 }
 
+// ACTIONS: READ IS ASKED FOR ONLY WHEN IT IS NEEDED, and then it is required.
+// Both directions of the exact comparison hold: a deployment that did not ask
+// for it is told an installation holding it has more than billet claims, and
+// one that did is told an installation without it cannot prove a branch.
+func TestRunEvidenceAddsActionsReadAndNothingElse(t *testing.T) {
+	t.Parallel()
+
+	for _, scope := range []Scope{ScopeOrganization, ScopeRepository} {
+		without, with := Permissions(scope, false), Permissions(scope, true)
+		if _, ok := without["actions"]; ok {
+			t.Errorf("%s: actions requested without run evidence", scope)
+		}
+		if with["actions"] != "read" || len(with) != len(without)+1 {
+			t.Errorf("%s: run evidence set = %v, want %v plus actions: read", scope, with, without)
+		}
+
+		granted := &Installation{Permissions: with}
+		if problems := granted.PermissionMismatches(scope, true); len(problems) != 0 {
+			t.Errorf("%s: the requested set was refused: %v", scope, problems)
+		}
+		if problems := granted.PermissionMismatches(scope, false); len(problems) != 1 ||
+			!strings.Contains(problems[0], "actions") {
+			t.Errorf("%s: actions: read held unasked = %v, want it named as unrequested", scope, problems)
+		}
+		plain := &Installation{Permissions: without}
+		if problems := plain.PermissionMismatches(scope, true); len(problems) != 1 ||
+			!strings.Contains(problems[0], "actions: want read, not granted") {
+			t.Errorf("%s: missing actions: read = %v", scope, problems)
+		}
+	}
+}
+
 // A PATH SEGMENT FROM A MESSAGE CANNOT STEER THE REQUEST ELSEWHERE.
 func TestARepositorySegmentThatIsNotOneIsRefused(t *testing.T) {
 	t.Parallel()

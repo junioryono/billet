@@ -203,7 +203,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			fmt.Printf("github   (verification skipped during maintenance)\n")
 		default:
 			inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, target.AppID, key,
-				githubTarget(target), target.InstallationID)
+				githubTarget(target), target.InstallationID, cfg.NeedsRunEvidence())
 			switch {
 			case errors.Is(err, github.ErrAppUnverifiable):
 				verdict = githubUnverifiable

@@ -990,6 +990,25 @@ tiers:
     #   owner: acme
     #   repository: api
     #   workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
+    #
+    # Every cache a tier's jobs get, and whose writes publish. Omitted, a tier
+    # keeps the Docker image store and sticky disks on and publishes only what a
+    # trusted pool writes. `publish: default-branch` publishes what a job GitHub
+    # proves ran on the repository's default branch (push, schedule, dispatch)
+    # writes, into a namespace scoped by this pool's trust and repository, so it
+    # works on an untrusted pool; every other ref reads and discards. It needs a
+    # static repository (cache_scope.owner and .repository, or a repository
+    # target) and the App's `actions: read` (github-app create --actions-read).
+    # The Actions, Git, Bazel and Go caches are served by the node and need a
+    # Linux Firecracker tier with node.cache. Go test results are opt-in.
+    # cache:
+    #   publish: default-branch        # trusted-only (default) | default-branch | off
+    #   docker:       { enabled: true, max_size: 100GiB }
+    #   sticky_disks: { enabled: true, max_size: 100GiB }
+    #   actions:      { enabled: true, max_archive: 10GiB }
+    #   git:          { enabled: true, max_size: 50GiB }
+    #   bazel:        { enabled: true, max_size: 50GiB }
+    #   go:           { enabled: true, max_size: 20GiB, test_results: false }
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

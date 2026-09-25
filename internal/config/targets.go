@@ -577,8 +577,10 @@ func TierTargetPolicyErrors(where string, t Tier, target GitHubTarget) []error {
 				where, target.Name))
 		}
 
-		if t.Intercept {
-			errs = append(errs, fmt.Errorf("%s: intercept under repository target %q: interception "+
+		if cache := t.EffectiveCache(); cache.Actions.Enabled &&
+			cache.Publish != CachePublishDefaultBranch {
+			errs = append(errs, fmt.Errorf("%s: the Actions cache under repository target %q "+
+				"needs cache.publish: default-branch, because a trusted-only Actions cache "+
 				"requires a trusted pool, and a repository-scoped tier cannot be one",
 				where, target.Name))
 		}

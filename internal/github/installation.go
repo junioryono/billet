@@ -168,10 +168,10 @@ func waitForInstallationAt(ctx context.Context, client *http.Client, base string
 //
 // Results are sorted so the diagnostic is stable across runs — Go randomizes map
 // iteration, and an error message that reorders itself is one nobody can diff.
-func (i *Installation) PermissionMismatches(scope Scope) []string {
+func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []string {
 	var problems []string
 
-	permissions := permissionsFor(scope)
+	permissions := permissionsFor(scope, runEvidence)
 
 	for name, want := range permissions {
 		got, ok := i.Permissions[name]
@@ -219,18 +219,18 @@ var ErrAppUnverifiable = errors.New(
 // a test fake or a GitHub Enterprise Server deployment passes its own.
 func VerifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
 ) (*Installation, error) {
 	if base == "" {
 		base = apiBase
 	}
 
-	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID)
+	return verifyAppAt(ctx, client, base, appID, privateKeyPEM, target, installationID, runEvidence)
 }
 
 func verifyAppAt(
 	ctx context.Context, client *http.Client, base string,
-	appID int64, privateKeyPEM []byte, target Target, installationID int64,
+	appID int64, privateKeyPEM []byte, target Target, installationID int64, runEvidence bool,
 ) (*Installation, error) {
 	inst, err := getInstallationAt(ctx, client, base, appID, privateKeyPEM, target)
 	if err != nil {
@@ -300,7 +300,7 @@ func verifyAppAt(
 			"`billet github-app create`, which fills it in)", target, inst.ID, installationID, inst.ID)
 	}
 
-	if problems := inst.PermissionMismatches(target.Scope()); len(problems) > 0 {
+	if problems := inst.PermissionMismatches(target.Scope(), runEvidence); len(problems) > 0 {
 		// THE OWNER'S KIND COMES FROM THE ANSWER. The installation names the
 		// account it is on, so the review page is the right one for a user's
 		// repository as well as an organization's.

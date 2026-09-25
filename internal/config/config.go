@@ -2182,6 +2182,9 @@ type Tier struct {
 	// Intercept routes the Actions results origin through the node-local cache proxy.
 	// False is the safe default because the same origin carries artifact metadata.
 	Intercept bool `yaml:"intercept,omitempty"`
+	// Cache configures every cache the tier's jobs get: whose writes publish,
+	// which caches are on, and how large each may grow. See TierCache.
+	Cache *TierCache `yaml:"cache,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
@@ -2253,36 +2256,44 @@ func (t Tier) PoolPolicyErrors(where string) []error {
 		}
 		seenWorkflows[workflow] = struct{}{}
 	}
-	if trust == WorkloadUntrusted && t.Intercept {
-		errs = append(errs, fmt.Errorf("%s: an untrusted pool cannot enable Actions cache interception", where))
+	cache := t.EffectiveCache()
+	// A TRUSTED-ONLY ACTIONS CACHE IS SCOPED BY A STATIC WORKFLOW, the one the
+	// runner group admits; a default-branch one is scoped by the ref GitHub
+	// proves for each job, so an untrusted pool may have it too.
+	legacyActions := cache.Actions.Enabled && cache.Publish != CachePublishDefaultBranch
+	if trust == WorkloadUntrusted && legacyActions {
+		errs = append(errs, fmt.Errorf("%s: an untrusted pool can enable the Actions cache "+
+			"only with cache.publish: default-branch", where))
 	}
-	if t.Intercept && t.CacheScope == nil {
-		errs = append(errs, fmt.Errorf("%s: intercept requires a static cache_scope because JobStarted arrives after launch", where))
+	if cache.Actions.Enabled && t.CacheScope == nil {
+		errs = append(errs, fmt.Errorf("%s: the Actions cache requires a static cache_scope because JobStarted arrives after launch", where))
 	}
 	if scope := t.CacheScope; scope != nil {
-		if strings.TrimSpace(scope.Owner) == "" || strings.TrimSpace(scope.Owner) != scope.Owner ||
-			strings.Contains(scope.Owner, "/") || len(scope.Owner) > 100 {
-			errs = append(errs, fmt.Errorf("%s: cache_scope.owner must be one trimmed path component no longer than 100 bytes", where))
+		if err := CheckCacheScopeSegment(scope.Owner); err != nil {
+			errs = append(errs, fmt.Errorf("%s: cache_scope.owner: %w", where, err))
 		}
-		if strings.TrimSpace(scope.Repository) == "" ||
-			strings.TrimSpace(scope.Repository) != scope.Repository ||
-			strings.Contains(scope.Repository, "/") || len(scope.Repository) > 100 {
-			errs = append(errs, fmt.Errorf("%s: cache_scope.repository must be one trimmed path component no longer than 100 bytes", where))
+		if err := CheckCacheScopeSegment(scope.Repository); err != nil {
+			errs = append(errs, fmt.Errorf("%s: cache_scope.repository: %w", where, err))
 		}
-		if err := checkWorkflowRef(scope.WorkflowRef); err != nil {
-			errs = append(errs, fmt.Errorf("%s: cache_scope.workflow_ref %q %w", where, scope.WorkflowRef, err))
-		} else {
-			workflow := strings.SplitN(strings.SplitN(scope.WorkflowRef, "@", 2)[0], "/", 3)
-			if len(workflow) < 2 || workflow[0] != scope.Owner || workflow[1] != scope.Repository {
-				errs = append(errs, fmt.Errorf("%s: cache_scope owner/repository must match workflow_ref", where))
+		// THE WORKFLOW REF IS OPTIONAL WHERE NOTHING READS IT: a default-branch
+		// namespace is the repository, and the job's own ref is proved per job.
+		if scope.WorkflowRef != "" || legacyActions {
+			if err := checkWorkflowRef(scope.WorkflowRef); err != nil {
+				errs = append(errs, fmt.Errorf("%s: cache_scope.workflow_ref %q %w", where, scope.WorkflowRef, err))
+			} else {
+				workflow := strings.SplitN(strings.SplitN(scope.WorkflowRef, "@", 2)[0], "/", 3)
+				if len(workflow) < 2 || workflow[0] != scope.Owner || workflow[1] != scope.Repository {
+					errs = append(errs, fmt.Errorf("%s: cache_scope owner/repository must match workflow_ref", where))
+				}
 			}
 		}
-		if t.Intercept {
+		if legacyActions {
 			if _, allowed := seenWorkflows[scope.WorkflowRef]; !allowed {
 				errs = append(errs, fmt.Errorf("%s: cache_scope.workflow_ref must be one of the trusted workflows", where))
 			}
 		}
 	}
+	errs = append(errs, t.cachePolicyErrors(where)...)
 
 	return errs
 }
@@ -2456,18 +2467,31 @@ func (t Tier) ReservationErrors(where string) []error {
 // storage and guest control the transparent Actions cache requires.
 //
 // Exported because alloc.New cannot assume its catalogue came through Load.
+//
+// THE SAME RULE HOLDS FOR EVERY CACHE THE NODE SERVES TO A GUEST IT CONTROLS:
+// the Actions cache, the Git proxy and the Bazel and Go caches each mount a
+// site-store volume on the host, which only a firecracker node has.
 func (t Tier) InterceptionErrors(where string) []error {
-	if !t.Intercept {
+	cache := t.EffectiveCache()
+	if !cache.needsGuestCacheServices() {
 		return nil
 	}
 
+	var enabled []string
+	for _, kind := range []CacheKind{CacheActions, CacheGit, CacheBazel, CacheGo} {
+		if cache.Setting(kind).Enabled {
+			enabled = append(enabled, string(kind))
+		}
+	}
+	what := "the " + strings.Join(enabled, ", ") + " cache"
+
 	providers := t.AcceptableProviders()
 	if len(providers) != 1 || providers[0] != ProviderFirecracker {
-		return []error{fmt.Errorf("%s: intercept requires only the firecracker provider; "+
-			"remote and fallback providers cannot reach this node's site-local archive store", where)}
+		return []error{fmt.Errorf("%s: %s requires only the firecracker provider; "+
+			"remote and fallback providers cannot reach this node's site-local store", where, what)}
 	}
 	if t.GuestOS != GuestLinux {
-		return []error{fmt.Errorf("%s: intercept currently requires a Linux guest", where)}
+		return []error{fmt.Errorf("%s: %s currently requires a Linux guest", where, what)}
 	}
 
 	return nil
@@ -3114,6 +3138,7 @@ func (c *Config) applyDefaults() {
 	}
 
 	c.defaultTierTargets()
+	c.materializeCacheScope()
 
 	if c.Backup != nil {
 		c.Backup.S3.normalize()
@@ -3978,9 +4003,10 @@ func (c *Config) validateNode() []error {
 	errs = append(errs, c.validateCacheNode()...)
 	if c.Node.Cache == nil {
 		for i := range c.Tiers {
-			if c.Tiers[i].Intercept && c.Tiers[i].AcceptsProvider(c.Node.Provider) {
-				errs = append(errs, fmt.Errorf("tier %q enables intercept, but node.cache is not "+
-					"configured on this %s node", c.Tiers[i].Label, c.Node.Provider))
+			if c.Tiers[i].EffectiveCache().needsGuestCacheServices() &&
+				c.Tiers[i].AcceptsProvider(c.Node.Provider) {
+				errs = append(errs, fmt.Errorf("tier %q enables a cache the node serves, but "+
+					"node.cache is not configured on this %s node", c.Tiers[i].Label, c.Node.Provider))
 
 				break
 			}
