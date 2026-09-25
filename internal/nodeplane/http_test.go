@@ -414,9 +414,9 @@ func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.Pool
 func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.PoolRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, runner := range f.pool {
-		if runner.LeaseID == leaseID {
-			return runner, nil
+	for name := range f.pool {
+		if f.pool[name].LeaseID == leaseID {
+			return f.pool[name], nil
 		}
 	}
 	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
@@ -425,7 +425,8 @@ func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.
 func (f *fakeStore) RetirePoolRunner(_ context.Context, leaseID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for name, runner := range f.pool {
+	for name := range f.pool {
+		runner := f.pool[name]
 		if runner.LeaseID != leaseID {
 			continue
 		}
@@ -445,7 +446,8 @@ func (f *fakeStore) PreserveRecoveredBusyPoolRunner(
 	if f.pool == nil {
 		f.pool = make(map[string]alloc.PoolRunner)
 	}
-	for name, runner := range f.pool {
+	for name := range f.pool {
+		runner := f.pool[name]
 		if runner.LeaseID != recovered.LeaseID {
 			continue
 		}
@@ -466,7 +468,8 @@ func (f *fakeStore) RetireRecoveredPoolRunner(
 ) (alloc.PoolRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for name, runner := range f.pool {
+	for name := range f.pool {
+		runner := f.pool[name]
 		if runner.LeaseID != recovered.LeaseID {
 			continue
 		}

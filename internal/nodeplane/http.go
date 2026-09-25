@@ -2060,8 +2060,9 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 		answer(unproven)
 		return
 	}
+	ctx := r.Context()
 	authority := h.authorities.resolve(leaseID, binding, time.Now(), func() (server.CacheAuthority, bool) {
-		authority, err := server.ResolveCacheAuthority(r.Context(), evidence, leaseID, binding, nil)
+		authority, err := server.ResolveCacheAuthority(ctx, evidence, leaseID, binding, nil)
 		if err != nil {
 			h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
 				"lease", leaseID, "error", err)

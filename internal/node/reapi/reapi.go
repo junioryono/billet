@@ -393,7 +393,7 @@ const (
 // first failure stops it; a missing blob is NotFound. A digest checked as a
 // blob is still expanded as a Tree: the two are different questions about it.
 type resultCheck struct {
-	ctx       context.Context
+	ctx       context.Context //nolint:containedctx // one walk's state, made and dropped inside the call that owns ctx
 	v         Volume
 	seen      map[string]bool
 	expanded  map[string]bool

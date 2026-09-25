@@ -85,14 +85,19 @@ func cmdCacheGitCredential(ctx context.Context, args []string) error {
 	}
 	// RUN IN THE REPOSITORY GIT IS FETCHING INTO (measured: git runs a helper
 	// with the worktree as its directory), where checkout wrote its header.
-	output, _ := exec.CommandContext(ctx, "git", "config", "--get-all",
+	// git exits 1 when the key is unset, which is "no header" rather than a
+	// failure: the answer is then "-" as the password.
+	output, err := exec.CommandContext(ctx, "git", "config", "--get-all",
 		"http.https://github.com/.extraheader").Output()
+	if err != nil {
+		output = nil
+	}
 	answer, err := gitCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken),
 		strings.Split(strings.TrimSpace(string(output)), "\n"))
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(os.Stdout, answer)
+	_, err = os.Stdout.WriteString(answer)
 
 	return err
 }
@@ -102,8 +107,8 @@ func cmdCacheGitCredential(ctx context.Context, args []string) error {
 // github.com as the password, or "-" when there is none. A request for any
 // other host is answered with nothing.
 func gitCredential(in io.Reader, endpoint, token string, headers []string) (string, error) {
-	node, err := url.Parse(endpoint)
-	if err != nil || node.Host == "" || token == "" {
+	node, ok := parsedHost(endpoint)
+	if !ok || token == "" {
 		return "", nil
 	}
 	asked := map[string]string{}
@@ -147,15 +152,26 @@ func cacheCredential(in io.Reader, endpoint, token string) (credentialResponse, 
 	if endpoint == "" || token == "" {
 		return answer, nil
 	}
-	node, err := url.Parse(endpoint)
-	if err != nil {
+	node, ok := parsedHost(endpoint)
+	if !ok {
 		return answer, nil
 	}
-	asked, err := url.Parse(request.URI)
-	if err != nil || asked.Host != node.Host || asked.Host == "" {
+	if asked, ok := parsedHost(request.URI); !ok || asked.Host != node.Host {
 		return answer, nil
 	}
 	answer.Headers["Authorization"] = []string{"Bearer " + token}
 
 	return answer, nil
+}
+
+// parsedHost parses a URL that must name a host. An unparseable one, or one
+// with no host, is not the node's endpoint, which every caller answers with
+// nothing rather than an error.
+func parsedHost(raw string) (*url.URL, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+
+	return u, true
 }

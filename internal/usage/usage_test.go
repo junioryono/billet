@@ -52,7 +52,11 @@ type tree struct {
 	root string
 }
 
-func newTree(t *testing.T) tree { return tree{t: t, root: t.TempDir()} }
+func newTree(t *testing.T) tree {
+	t.Helper()
+
+	return tree{t: t, root: t.TempDir()}
+}
 
 func (tr tree) write(path, body string) {
 	tr.t.Helper()

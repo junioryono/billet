@@ -79,17 +79,23 @@ type observationPlane struct {
 func (p *observationPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v1/register" {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(nodeapi.RegisterResponse{
+		if err := json.NewEncoder(w).Encode(nodeapi.RegisterResponse{
 			Version: p.version, LeaseTTLSeconds: 60, PollSeconds: 30,
-		})
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 
 		return
 	}
 	var body map[string]any
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
 	p.bodies <- body
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte("{}"))
+	_, _ = w.Write([]byte("{}")) //nolint:errcheck // the fake has no test to report to, and its client reports a short body
 }
 
 // THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM. An older plane decodes

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -199,14 +200,16 @@ var errCacheOff = errors.New("this cache is off for this job")
 // guest sends can sit under a digest it does not have. An ac record is the
 // guest's claim about an action, trusted exactly as far as the job is: it lands
 // in the job's own clone and is published only where the job's writes are.
-func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session *cacheSession) {
+func (s *CacheService) serveCAS(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, session *cacheSession,
+) {
 	kind, table, digest, ok := parseCASPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 
 		return
 	}
-	ctx, cancel := extendTransfer(w, r)
+	ctx, cancel := extendTransfer(ctx, w)
 	defer cancel()
 
 	handle, err := s.openCASHandle(ctx, session, kind, r.Method == http.MethodPut)
@@ -259,12 +262,20 @@ func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session 
 
 // extendTransfer lets one cache transfer outlive the listener's read timeout,
 // which is sized for the small requests the rest of the API makes.
-func extendTransfer(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc) {
+//
+// A WRITER THAT CANNOT MOVE ITS DEADLINES keeps the listener's, which bounds
+// the transfer sooner and is not a reason to refuse it; the context bound
+// below holds either way.
+func extendTransfer(ctx context.Context, w http.ResponseWriter) (context.Context, context.CancelFunc) {
 	controller := http.NewResponseController(w)
-	_ = controller.SetReadDeadline(time.Now().Add(casRequestLife))
-	_ = controller.SetWriteDeadline(time.Now().Add(casRequestLife))
+	if err := controller.SetReadDeadline(time.Now().Add(casRequestLife)); err != nil {
+		slog.Debug("a cache transfer keeps the listener's read deadline", "error", err)
+	}
+	if err := controller.SetWriteDeadline(time.Now().Add(casRequestLife)); err != nil {
+		slog.Debug("a cache transfer keeps the listener's write deadline", "error", err)
+	}
 
-	return context.WithTimeout(r.Context(), casRequestLife)
+	return context.WithTimeout(ctx, casRequestLife)
 }
 
 // casHandle is one admitted transfer's hold on a session's mounted volume: a
@@ -446,6 +457,8 @@ func (s *CacheService) storeCASObject(
 	if full, err := s.casFull(root); err != nil || full {
 		return reapi.ErrFull
 	}
+	// #nosec G703 -- path is the volume root joined with a table from a closed
+	// set and a digest validDigest proved is 64 lowercase hex characters.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("prepare the cache directory: %w", err)
 	}
@@ -470,7 +483,7 @@ func (s *CacheService) storeCASObject(
 		return reapi.ErrMismatch
 	}
 
-	return os.Rename(temporary.Name(), path)
+	return os.Rename(temporary.Name(), path) // #nosec G703 -- the path proved above
 }
 
 // casFull reports whether a volume has passed the fraction it may fill.
@@ -492,7 +505,7 @@ func filledAbove(root string, fraction float64) (bool, error) {
 
 // contextReader stops a copy when its context ends.
 type contextReader struct {
-	ctx context.Context
+	ctx context.Context //nolint:containedctx // an io.Reader's Read takes no context, so the copy's is carried to it
 	r   io.Reader
 }
 
@@ -510,7 +523,7 @@ func (c contextReader) Read(p []byte) (int, error) {
 // cleanupSession; done means the volume needs nothing more.
 func (s *CacheService) releaseCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
-) (done bool, err error) {
+) (bool, error) {
 	// A TRANSFER STILL RUNNING HOLDS io, and the cache loop serves every
 	// session, so it waits a little and comes back rather than wait out a
 	// transfer's whole deadline.
@@ -643,7 +656,7 @@ func lockWithin(ctx context.Context, l *sync.RWMutex, wait time.Duration) bool {
 // the caller's discard: the merge clone is recorded before it is mounted.
 func (s *CacheService) mergeCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
-) (generation string, consumed bool, err error) {
+) (string, bool, error) {
 	key := hv.Volume.Key
 	lease, fence, err := s.store.AcquireWriter(ctx, key, session.instance+"/"+string(hv.Kind),
 		cacheWriterTTL)
@@ -780,8 +793,10 @@ func copyFile(from, to string) error {
 // Remote Execution API's handlers, which gRPC runs on the request's context.
 type remoteAPISession struct{}
 
-func (s *CacheService) serveRemoteAPI(w http.ResponseWriter, r *http.Request, session *cacheSession) {
-	ctx, cancel := extendTransfer(w, r)
+func (s *CacheService) serveRemoteAPI(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, session *cacheSession,
+) {
+	ctx, cancel := extendTransfer(ctx, w)
 	defer cancel()
 	s.remoteAPI.ServeHTTP(w, r.WithContext(context.WithValue(ctx, remoteAPISession{}, session)))
 }

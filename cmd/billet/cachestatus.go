@@ -112,7 +112,8 @@ func printCacheOutcomes(w io.Writer, counts map[string]map[string]map[string]int
 func printTierCaches(w io.Writer, tiers []config.Tier) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "TIER\tPUBLISH\tSCOPE\tCACHES")
-	for _, tier := range tiers {
+	for i := range tiers {
+		tier := &tiers[i]
 		spec := tier.EffectiveCache()
 		scope := "-"
 		if spec.Owner != "" {

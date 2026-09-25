@@ -30,8 +30,8 @@ func TestTheGitCredentialHelperHandsTheNodeCheckoutsHeader(t *testing.T) {
 			t.Errorf("%s: answered %q, %v; want %q", name, got, err, tc.want)
 		}
 	}
-	if got, _ := gitCredential(strings.NewReader(node), endpoint, "", nil); got != "" {
-		t.Errorf("with no session the helper answered %q", got)
+	if got, err := gitCredential(strings.NewReader(node), endpoint, "", nil); err != nil || got != "" {
+		t.Errorf("with no session the helper answered %q, %v", got, err)
 	}
 }
 
@@ -60,7 +60,8 @@ func TestTheCredentialHelperAnswersOnlyTheNode(t *testing.T) {
 		}
 	}
 
-	if answer, _ := cacheCredential(strings.NewReader(`{"uri":"http://172.31.0.1:7718/x"}`), endpoint, ""); len(answer.Headers) != 0 {
-		t.Errorf("with no token the helper answered %v", answer.Headers)
+	answer, err := cacheCredential(strings.NewReader(`{"uri":"http://172.31.0.1:7718/x"}`), endpoint, "")
+	if err != nil || len(answer.Headers) != 0 {
+		t.Errorf("with no token the helper answered %v, %v", answer.Headers, err)
 	}
 }

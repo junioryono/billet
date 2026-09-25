@@ -42,9 +42,10 @@ func (m *presentMatcher) Match(
 	return "", "", storecontract.ErrMiss
 }
 
-func refPrefix(ref, version string) string {
+// refPrefix is where a ref's entries live under the Actions cache's version v1.
+func refPrefix(ref string) string {
 	refDigest := sha256.Sum256([]byte(ref))
-	versionDigest := sha256.Sum256([]byte(version))
+	versionDigest := sha256.Sum256([]byte("v1"))
 
 	return "test-deployment.scoped/untrusted/acme/api/any/actions/" +
 		hex.EncodeToString(refDigest[:]) + "/" + hex.EncodeToString(versionDigest[:]) + "/"
@@ -129,7 +130,7 @@ func TestAPullRequestSavesUnderItsOwnRef(t *testing.T) {
 		t.Fatalf("create handled=%t err=%v, want it served locally", handled, err)
 	}
 	response.Body.Close()
-	want := refPrefix("refs/pull/7/merge", "v1") + "npm"
+	want := refPrefix("refs/pull/7/merge") + "npm"
 	if len(storage.keys) == 0 || storage.keys[len(storage.keys)-1] != want {
 		t.Fatalf("reserved %v, want %q", storage.keys, want)
 	}
@@ -141,7 +142,7 @@ func TestALookupRestoresInGitHubsOrder(t *testing.T) {
 	t.Parallel()
 
 	matcher := &presentMatcher{fakeCacheStore: &fakeCacheStore{current: "g"},
-		present: map[string]string{refPrefix("refs/heads/main", "v1") + "npm": "g"}}
+		present: map[string]string{refPrefix("refs/heads/main") + "npm": "g"}}
 	service, session := defaultBranchActions(t,
 		&fakeAuthority{authority: pullRequestAuthority()}, matcher)
 
@@ -155,9 +156,9 @@ func TestALookupRestoresInGitHubsOrder(t *testing.T) {
 		t.Fatalf("lookup = %v, want the default branch's entry", found)
 	}
 	want := []string{
-		refPrefix("refs/pull/7/merge", "v1") + "npm",
-		refPrefix("refs/heads/release", "v1") + "npm",
-		refPrefix("refs/heads/main", "v1") + "npm",
+		refPrefix("refs/pull/7/merge") + "npm",
+		refPrefix("refs/heads/release") + "npm",
+		refPrefix("refs/heads/main") + "npm",
 	}
 	if strings.Join(matcher.asked, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("asked\n%s\nwant\n%s", strings.Join(matcher.asked, "\n"), strings.Join(want, "\n"))

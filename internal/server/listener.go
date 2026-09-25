@@ -1912,7 +1912,8 @@ func (l *Listener) idleMembersOnly(ctx context.Context) map[int64]bool {
 	}
 
 	idle := make(map[int64]bool, len(remaining))
-	for _, member := range members {
+	for i := range members {
+		member := &members[i]
 		if !remaining[member.LaunchRequestID] {
 			continue
 		}

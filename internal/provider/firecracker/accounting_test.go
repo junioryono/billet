@@ -61,6 +61,8 @@ func TestAccountingIsProvedPerController(t *testing.T) {
 		{
 			name: "a kernel without iocost has io and no io.weight",
 			root: func(t *testing.T) string {
+				t.Helper()
+
 				return cgroupTree(t, "cpu io memory", "cpu io memory",
 					map[string][]string{"system.slice": {"io.stat"}})
 			},
@@ -69,6 +71,8 @@ func TestAccountingIsProvedPerController(t *testing.T) {
 		{
 			name: "a root without the controllers proves them missing",
 			root: func(t *testing.T) string {
+				t.Helper()
+
 				return cgroupTree(t, "cpu pids", "cpu", map[string][]string{"system.slice": nil})
 			},
 			memory: ControllerMissing, io: ControllerMissing, reason: "memory controller is not in",
@@ -76,14 +80,20 @@ func TestAccountingIsProvedPerController(t *testing.T) {
 		{
 			name: "io enabled nowhere below the root cannot be read",
 			root: func(t *testing.T) string {
+				t.Helper()
+
 				return cgroupTree(t, "cpu io memory", "cpu memory",
 					map[string][]string{"system.slice": nil})
 			},
 			memory: ControllerPresent, io: ControllerUnknown, reason: "cannot be read",
 		},
 		{
-			name:   "an unreadable root is could not tell for both",
-			root:   func(t *testing.T) string { return filepath.Join(t.TempDir(), "absent") },
+			name: "an unreadable root is could not tell for both",
+			root: func(t *testing.T) string {
+				t.Helper()
+
+				return filepath.Join(t.TempDir(), "absent")
+			},
 			memory: ControllerUnknown, io: ControllerUnknown, reason: "cgroup.controllers",
 		},
 	} {

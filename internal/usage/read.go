@@ -158,7 +158,7 @@ func (s *Sample) readNet(r Reader, t Target) {
 	}
 	var v [4]int64
 	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
-		raw, err := r.read(filepath.Join("/sys/class/net", t.NetDevice, "statistics", name))
+		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
 		if err != nil {
 			return
 		}
@@ -187,12 +187,13 @@ func (s *Sample) readThreads(r Reader, t Target) {
 	s.GuestCPU, s.VMMCPU, s.ThreadsOK = guest, vmm, true
 }
 
-func (r Reader) threadTimes(pid int, vcpuPrefix string) (guest, vmm int64, err error) {
-	dir := filepath.Join("/proc", fmt.Sprint(pid), "task")
+func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
+	dir := fmt.Sprintf("/proc/%d/task", pid)
 	entries, err := os.ReadDir(r.path(dir))
 	if err != nil {
 		return 0, 0, err
 	}
+	var guest, vmm int64
 	sawVCPU := false
 	for _, entry := range entries {
 		raw, err := r.read(filepath.Join(dir, entry.Name(), "stat"))

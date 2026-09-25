@@ -1046,12 +1046,12 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// admission the volume API takes. A gRPC call is the Remote Execution API
 	// over the same volume.
 	if reapi.IsGRPC(r) {
-		s.serveRemoteAPI(w, r, session)
+		s.serveRemoteAPI(r.Context(), w, r, session)
 
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, casPathPrefix) {
-		s.serveCAS(w, r, session)
+		s.serveCAS(r.Context(), w, r, session)
 
 		return
 	}
@@ -1269,8 +1269,8 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 		sessionPolicy(session) != config.CachePublishTrustedOnly {
 		return nil
 	}
-	attachment, err := s.awaitDockerReady(ctx, session)
-	if err != nil || attachment == nil {
+	attachment, docker, err := s.awaitDockerReady(ctx, session)
+	if err != nil || !docker {
 		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -1285,19 +1285,19 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 }
 
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
-// to prove it quiesced, returning the ready attachment, or nil when the session
-// has no Docker store.
+// to prove it quiesced, returning the ready attachment. false says the session
+// has no Docker store, which is not an error.
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
-) (*cacheAttachment, error) {
+) (*cacheAttachment, bool, error) {
 	if err := lockCacheSession(ctx, session); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	attachment := session.slots[0]
 	if attachment == nil || !attachment.Docker {
 		session.mu.Unlock()
 
-		return nil, nil
+		return nil, false, nil
 	}
 	if !attachment.Settling {
 		attachment.Settling = true
@@ -1306,7 +1306,7 @@ func (s *CacheService) awaitDockerReady(
 		if err := s.persistSession(session); err != nil {
 			session.mu.Unlock()
 
-			return nil, fmt.Errorf("open Docker image-store settlement: %w", err)
+			return nil, false, fmt.Errorf("open Docker image-store settlement: %w", err)
 		}
 	}
 	session.mu.Unlock()
@@ -1316,18 +1316,18 @@ func (s *CacheService) awaitDockerReady(
 
 	for {
 		if err := lockCacheSession(ctx, session); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		attachment := session.slots[0]
 		if attachment == nil || !attachment.Docker {
 			session.mu.Unlock()
 
-			return nil, nil
+			return nil, false, nil
 		}
 		ready := attachment.Ready
 		session.mu.Unlock()
 		if ready {
-			return attachment, nil
+			return attachment, true, nil
 		}
 
 		timer := time.NewTimer(100 * time.Millisecond)
@@ -1335,11 +1335,11 @@ func (s *CacheService) awaitDockerReady(
 		case <-ctx.Done():
 			timer.Stop()
 
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		case <-deadline.C:
 			timer.Stop()
 
-			return nil, errors.New("docker image store did not become ready before teardown")
+			return nil, false, errors.New("docker image store did not become ready before teardown")
 		case <-timer.C:
 		}
 	}

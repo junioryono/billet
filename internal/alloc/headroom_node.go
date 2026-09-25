@@ -59,8 +59,8 @@ func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (
 		if err != nil || slices.ContainsFunc(honouring, func(n nodeRow) bool { return n.holdsOne(t) }) {
 			return err
 		}
-		any, err := a.eligibleNodesFor(ctx, tx, t, false)
-		waits = slices.ContainsFunc(any, func(n nodeRow) bool { return n.holdsOne(t) })
+		all, err := a.eligibleNodesFor(ctx, tx, t, false)
+		waits = slices.ContainsFunc(all, func(n nodeRow) bool { return n.holdsOne(t) })
 
 		return err
 	})

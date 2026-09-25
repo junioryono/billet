@@ -57,7 +57,8 @@ func parseSingle(data string) (int64, error) {
 
 // parseIOStat sums rbytes and wbytes over every device in a cgroup's io.stat
 // ("MAJ:MIN rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N" per line).
-func parseIOStat(data string) (readBytes, writeBytes int64, err error) {
+func parseIOStat(data string) (int64, int64, error) {
+	var readBytes, writeBytes int64
 	for line := range strings.SplitSeq(data, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
@@ -89,7 +90,8 @@ func parseIOStat(data string) (readBytes, writeBytes int64, err error) {
 // parsePressure reads the total stall time, in microseconds, from a PSI file
 // ("some avg10=0.00 avg60=0.00 avg300=0.00 total=N", and a "full" line). A
 // file with no full line (cpu.pressure on older kernels) reports full as zero.
-func parsePressure(data string) (some, full int64, err error) {
+func parsePressure(data string) (int64, int64, error) {
+	var some, full int64
 	sawSome := false
 	for line := range strings.SplitSeq(data, "\n") {
 		fields := strings.Fields(line)
@@ -99,6 +101,7 @@ func parsePressure(data string) (some, full int64, err error) {
 		var total int64 = -1
 		for _, field := range fields[1:] {
 			if value, ok := strings.CutPrefix(field, "total="); ok {
+				var err error
 				if total, err = strconv.ParseInt(value, 10, 64); err != nil {
 					return 0, 0, fmt.Errorf("usage: pressure total: %w", err)
 				}
@@ -127,23 +130,25 @@ func parsePressure(data string) (some, full int64, err error) {
 // THE NAME IS BETWEEN THE FIRST "(" AND THE LAST ")", because a thread name
 // may itself contain spaces and parentheses ("fc_vcpu 0"); splitting the whole
 // line on spaces would shift every field after it.
-func parseTaskStat(data string) (comm string, utime, stime int64, err error) {
+func parseTaskStat(data string) (string, int64, int64, error) {
 	open := strings.IndexByte(data, '(')
 	closing := strings.LastIndexByte(data, ')')
 	if open < 0 || closing < open {
 		return "", 0, 0, errors.New("usage: task stat has no (comm)")
 	}
-	comm = data[open+1 : closing]
+	comm := data[open+1 : closing]
 	// After ")" the fields resume at field 3 (state); utime and stime are
 	// fields 14 and 15, so indexes 11 and 12 here.
 	rest := strings.Fields(data[closing+1:])
 	if len(rest) < 13 {
 		return "", 0, 0, fmt.Errorf("usage: task stat has %d fields after comm, want at least 13", len(rest))
 	}
-	if utime, err = strconv.ParseInt(rest[11], 10, 64); err != nil {
+	utime, err := strconv.ParseInt(rest[11], 10, 64)
+	if err != nil {
 		return "", 0, 0, fmt.Errorf("usage: task utime: %w", err)
 	}
-	if stime, err = strconv.ParseInt(rest[12], 10, 64); err != nil {
+	stime, err := strconv.ParseInt(rest[12], 10, 64)
+	if err != nil {
 		return "", 0, 0, fmt.Errorf("usage: task stime: %w", err)
 	}
 
@@ -155,7 +160,9 @@ func parseTaskStat(data string) (comm string, utime, stime int64, err error) {
 //
 // BUSY EXCLUDES idle AND iowait. guest and guest_nice are already inside user
 // and nice, so they are not added again.
-func parseHostCPU(data string) (busy, total int64, cpus int, err error) {
+func parseHostCPU(data string) (int64, int64, int, error) {
+	var busy, total int64
+	cpus := 0
 	sawAggregate := false
 	for line := range strings.SplitSeq(data, "\n") {
 		fields := strings.Fields(line)

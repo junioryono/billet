@@ -32,7 +32,7 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 	if err != nil || pid <= 0 {
 		return provider.UsageTarget{}, fmt.Errorf("docker: container %s has no running process to measure", instanceID)
 	}
-	raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
 		return provider.UsageTarget{}, fmt.Errorf("docker: read the cgroup of container %s: %w", instanceID, err)
 	}

@@ -17,8 +17,7 @@ func cmdJobs(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease>")
 	}
-	switch args[0] {
-	case "show":
+	if args[0] == "show" {
 		return cmdJobsShow(ctx, args[1:])
 	}
 

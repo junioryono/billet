@@ -222,8 +222,16 @@ func TestABlobThatDoesNotMatchItsDigestIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = stream.Send(&bspb.WriteRequest{ResourceName: resource, Data: []byte("the real ")})
-	_ = stream.Send(&bspb.WriteRequest{WriteOffset: 10, Data: []byte("object"), FinishWrite: true})
+	// A SEND AFTER THE SERVER HAS REFUSED IS io.EOF, and the refusal itself is
+	// what CloseAndRecv reports below.
+	for _, req := range []*bspb.WriteRequest{
+		{ResourceName: resource, Data: []byte("the real ")},
+		{WriteOffset: 10, Data: []byte("object"), FinishWrite: true},
+	} {
+		if err := stream.Send(req); err != nil && !errors.Is(err, io.EOF) {
+			t.Fatalf("send: %v", err)
+		}
+	}
 	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("an upload with a gap answered %v, want InvalidArgument", err)
 	}
