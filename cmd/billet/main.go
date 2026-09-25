@@ -2166,7 +2166,7 @@ func codeBuildRegion(cfg *config.Config) string {
 func cmdTeardown(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet teardown")
 	cfgPath := addConfigFlag(fs)
-	tier := fs.String("tier", "", "delete this tier's scale set")
+	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, or its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
 	force := fs.Bool("force", false,
 		"delete even if the scale set's labels are not this tier's (requires --tier)")
@@ -2288,17 +2288,17 @@ func teardownOnTarget(
 	for i := range wanted {
 		t := &wanted[i]
 
-		set, labels, err := client.Describe(ctx, t.Label, t.RunnerGroup)
+		set, labels, err := client.Describe(ctx, t.ScaleSetName(), t.RunnerGroup)
 		if err != nil {
 			return err
 		}
 
 		if set == nil {
-			fmt.Printf("  %-32s not present\n", t.Label)
+			fmt.Printf("  %-32s not present\n", t.ScaleSetName())
 
-			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
 				fmt.Printf("  %-32s billet could not forget it (%v); the control plane "+
-					"will keep reporting it\n", t.Label, err)
+					"will keep reporting it\n", t.ScaleSetName(), err)
 			}
 
 			continue
@@ -2306,7 +2306,7 @@ func teardownOnTarget(
 
 		present = append(present, *t)
 
-		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.Label, set.ID, set.Group, labels)
+		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.ScaleSetName(), set.ID, set.Group, labels)
 	}
 
 	if len(present) == 0 {
@@ -2326,7 +2326,7 @@ func teardownOnTarget(
 	for i := range present {
 		t := &present[i]
 
-		deleted, err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}, force)
+		deleted, err := client.DeleteScaleSet(ctx, t.ScaleSetName(), t.RunnerGroup, []string{t.ScaleSetName()}, force)
 		if err != nil {
 			return err
 		}
@@ -2337,14 +2337,14 @@ func teardownOnTarget(
 		// "deleted" walks away from an object that is still there.
 		if !deleted {
 			fmt.Printf("%s: nothing in runner group %q; if it was created under a different "+
-				"group it is still there\n", t.Label, groupOrDefault(t.RunnerGroup))
+				"group it is still there\n", t.ScaleSetName(), groupOrDefault(t.RunnerGroup))
 
 			continue
 		}
 
-		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.Label); err != nil {
+		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
 			fmt.Printf("%s: deleted, but billet could not forget it had created it (%v); "+
-				"the control plane will keep reporting it until this is cleared\n", t.Label, err)
+				"the control plane will keep reporting it until this is cleared\n", t.ScaleSetName(), err)
 		}
 	}
 

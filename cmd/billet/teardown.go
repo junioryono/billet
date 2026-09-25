@@ -19,7 +19,8 @@ import (
 // failing — billet's characteristic failure, reached by an ordinary config edit.
 //
 // The expected labels are NOT lost with the tier definition. billet names a
-// scale set after its tier and labels it with the same string, so the name is
+// scale set after its tier's runs_on (its label unless it names one) and labels
+// it with the same string, so the name is
 // enough to check against and no --force is needed to delete one this way. The
 // runner group is the part the config was carrying, so an undeclared tier takes
 // it from the operator instead.
@@ -41,8 +42,12 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 		return tiers, false, nil
 	}
 
+	// --tier names a scale set, which is a tier's runs_on: one per target, so
+	// several targets may each declare one by that name.
+	var matched []config.Tier
+
 	for i := range tiers {
-		if tiers[i].Label == tier {
+		if tiers[i].ScaleSetName() == tier {
 			// Its own runner group, not the flag's: the config still describes
 			// this one, and letting a flag override it would delete from a group
 			// the tier was never in while reporting success.
@@ -50,11 +55,15 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 				return nil, false, fmt.Errorf(
 					"tier %q is declared with runner group %q, so --runner-group %q would "+
 						"look in the wrong place; drop the flag to use the declared group",
-					tier, groupOrDefault(tiers[i].RunnerGroup), group)
+					tiers[i].Label, groupOrDefault(tiers[i].RunnerGroup), group)
 			}
 
-			return []config.Tier{tiers[i]}, false, nil
+			matched = append(matched, tiers[i])
 		}
+	}
+
+	if len(matched) > 0 {
+		return matched, false, nil
 	}
 
 	if group == "" {

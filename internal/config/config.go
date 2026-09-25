@@ -2058,6 +2058,14 @@ type Tier struct {
 	// the credential that creates it is that target's.
 	Target string `yaml:"target,omitempty"`
 
+	// RunsOn is the name of this tier's scale set on its target, the value a
+	// workflow puts in `runs-on`. It defaults to Label. It exists so tiers on
+	// different targets can answer to one name: Label identifies the tier inside
+	// the deployment (its escrow, its leases, its history) and must be unique,
+	// while a scale set is unique only within its target, so two targets may each
+	// carry a tier with the same RunsOn.
+	RunsOn string `yaml:"runs_on,omitempty"`
+
 	// Trust is the authority every member of this runner pool receives before
 	// GitHub assigns it a job. It is explicit because scale-set JIT runners are
 	// pool members, not registrations bound to the assignment that caused Billet
@@ -2221,6 +2229,16 @@ func (t WorkloadTrust) Effective() WorkloadTrust {
 		return WorkloadUntrusted
 	}
 	return t
+}
+
+// ScaleSetName is the name of this tier's scale set on its target: RunsOn, or
+// Label when the tier names none.
+func (t *Tier) ScaleSetName() string {
+	if t.RunsOn != "" {
+		return t.RunsOn
+	}
+
+	return t.Label
 }
 
 // PoolPolicyErrors reports unsafe or contradictory authority for a pooled
@@ -5598,6 +5616,9 @@ func (c *Config) validateTiers() []error {
 		}
 		if _, dup := seen[t.Label]; dup {
 			errs = append(errs, fmt.Errorf("%s: duplicate label", where))
+		}
+		if t.RunsOn != "" && !labelRe.MatchString(t.RunsOn) {
+			errs = append(errs, fmt.Errorf("%s: runs_on must match %s", where, labelRe))
 		}
 
 		// Rejected HERE rather than left for GitHub to answer confusingly: an unescaped

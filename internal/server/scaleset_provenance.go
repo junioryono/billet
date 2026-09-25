@@ -6,7 +6,8 @@ import (
 )
 
 // scaleSetKey identifies one scale set within a target: its runner group plus
-// the label, since the same label in two groups is two objects.
+// its name (a tier's ScaleSetName), since the same name in two groups is two
+// objects.
 //
 // A struct rather than a joined string, because a delimiter is a decision about
 // characters the two halves may contain and neither the state store nor GitHub

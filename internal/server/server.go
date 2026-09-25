@@ -430,10 +430,13 @@ func (s *Server) Run(ctx context.Context) error {
 			declared[path] = make(map[scaleSetKey]struct{})
 		}
 
-		declared[path][scaleSetKey{
-			group: groupOrDefault(t.RunnerGroup),
-			label: t.Label,
-		}] = struct{}{}
+		key := scaleSetKey{group: groupOrDefault(t.RunnerGroup), label: t.ScaleSetName()}
+		if _, dup := declared[path][key]; dup {
+			return fmt.Errorf("server: tier %s answers to %q on %s, which another tier already "+
+				"does; two tiers on one scale set would each take the other's jobs", t.Label, key.label, path)
+		}
+
+		declared[path][key] = struct{}{}
 	}
 
 	if err := s.reportUndeclaredScaleSets(ctx, declared); err != nil {
@@ -454,7 +457,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 
-		set, err := prov.EnsureScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label})
+		set, err := prov.EnsureScaleSet(ctx, t.ScaleSetName(), t.RunnerGroup, []string{t.ScaleSetName()})
 		if err != nil {
 			return fmt.Errorf("server: reconcile scale set for tier %s: %w", t.Label, err)
 		}
@@ -467,14 +470,15 @@ func (s *Server) Run(ctx context.Context) error {
 
 		if s.completionStore != nil && len(s.targets) > 0 {
 			rec := state.ScaleSetRecord{
-				Target: targets[t.Label].Config.Path(), RunnerGroup: set.Group, Label: t.Label, ID: set.ID,
+				Target: targets[t.Label].Config.Path(), RunnerGroup: set.Group, Label: t.ScaleSetName(), ID: set.ID,
 			}
 			if err := s.completionStore.RecordScaleSet(ctx, rec); err != nil {
 				return fmt.Errorf("server: record scale set for tier %s: %w", t.Label, err)
 			}
 		}
 
-		s.log.Info("scale set ready", "tier", t.Label, "scale_set", set.ID, "group", set.Group,
+		s.log.Info("scale set ready", "tier", t.Label, "runs_on", t.ScaleSetName(),
+			"scale_set", set.ID, "group", set.Group,
 			"target", targets[t.Label].Config.Path())
 	}
 

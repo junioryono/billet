@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -270,5 +272,72 @@ func TestRemovingTheLastTierStillReportsWhatItLeftBehind(t *testing.T) {
 	if got := handler.warningsAbout("billet", "billet-8vcpu"); len(got) == 0 {
 		t.Error("removing the last tier reported nothing, so the scale set it stranded " +
 			"is invisible in exactly the case that guarantees one")
+	}
+}
+
+// A TIER WITH runs_on IS ITS SCALE SET BY THAT NAME. The set is created,
+// recorded and declared under runs_on, and one left behind under the tier's own
+// label, as a tier moved onto a shared name leaves it, is reported like any
+// other set no tier declares.
+func TestATierIsReconciledUnderItsRunsOn(t *testing.T) {
+	moved := tier("platform-4vcpu")
+	moved.RunsOn = "billet-4vcpu"
+	tiers := []config.Tier{moved}
+
+	db := openState(t)
+
+	const group = "default"
+
+	left := state.ScaleSetRecord{Target: testOrg, RunnerGroup: group, Label: moved.Label, ID: 40}
+	if err := db.RecordScaleSet(t.Context(), left); err != nil {
+		t.Fatalf("RecordScaleSet: %v", err)
+	}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	prov := &fakeProvisioner{
+		newSession: func(string) Session {
+			return &fakeSession{onPoll: func(int) { cancel() }}
+		},
+	}
+
+	handler := newCapturingHandler()
+
+	if err := New(a, prov, tiers, "test-owner", slog.New(handler),
+		WithCompletionLedger(db), WithTargets(Target{Config: testTarget, Provisioner: prov})).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	prov.mu.Lock()
+	created := slices.Collect(maps.Values(prov.labels))
+	prov.mu.Unlock()
+
+	if !slices.Equal(created, []string{"billet-4vcpu"}) {
+		t.Errorf("created scale sets %v, want only the tier's runs_on", created)
+	}
+
+	recorded, err := db.ScaleSets(t.Context(), testOrg)
+	if err != nil {
+		t.Fatalf("ScaleSets: %v", err)
+	}
+
+	names := make([]string, 0, len(recorded))
+	for _, rec := range recorded {
+		names = append(names, rec.Label)
+	}
+
+	if !slices.Contains(names, "billet-4vcpu") {
+		t.Errorf("recorded %v, missing the set reconciled under runs_on", names)
+	}
+
+	if len(handler.warningsAbout(group, "platform-4vcpu")) == 0 {
+		t.Error("the set left under the tier's old name was not reported as undeclared")
+	}
+
+	if warned := handler.warningsAbout(group, "billet-4vcpu"); len(warned) != 0 {
+		t.Errorf("the set the tier answers to was reported as an orphan: %v", warned)
 	}
 }

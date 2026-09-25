@@ -511,6 +511,12 @@ func (c *Config) validateTierTargets() []error {
 		names = append(names, t.Name)
 	}
 
+	// A scale set's name is unique within its target, so two tiers on one target
+	// may not share one, and tiers on different targets may.
+	type scaleSet struct{ target, name string }
+
+	claimed := make(map[scaleSet]string, len(c.Tiers))
+
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
 
@@ -520,6 +526,15 @@ func (c *Config) validateTierTargets() []error {
 		}
 
 		target, ok := c.TierTarget(t)
+		if ok {
+			key := scaleSet{target: target.Name, name: t.ScaleSetName()}
+			if other, dup := claimed[key]; !dup {
+				claimed[key] = t.Label
+			} else if other != t.Label {
+				errs = append(errs, fmt.Errorf("%s: tier %q already answers to %q on target %s; "+
+					"a scale set's name is unique within its target", where, other, key.name, target.Name))
+			}
+		}
 		if !ok {
 			if t.Target == "" {
 				errs = append(errs, fmt.Errorf("%s: target is required, because this deployment "+

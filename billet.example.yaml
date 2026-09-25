@@ -247,6 +247,12 @@ github:
 # Names are label-shaped and `default` is the github block above. Each tier
 # names its target with `target:` once there are several.
 #
+# One `runs-on` name on every target: a tier's `runs_on:` is its scale set's
+# name (default: its label), unique within a target, while labels stay unique
+# across the file. So `label: personal-2vcpu`, `target: personal`,
+# `runs_on: billet-2vcpu-ubuntu-2404` answers to the same name as the default
+# target's `billet-2vcpu-ubuntu-2404` tier.
+#
 # targets:
 #   - name: personal
 #     repository: your-account/your-repo
