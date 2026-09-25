@@ -1796,6 +1796,114 @@ func TestRecoverIgnoresInstancesBilletDidNotName(t *testing.T) {
 	}
 }
 
+// RECOVERY RUNS AT EVERY REGISTRATION, NOT ONLY AT START, and this process's own
+// jobs are what it finds there. An instance it destroys as an orphan is one this
+// process may still list as running; left there, Holding() stays true and the
+// next drain waits forever on compute that is gone.
+func TestRecoverForgetsTheRunningEntryOfAnInstanceItDestroys(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	inst := &provider.Instance{ID: "finished", Name: provider.InstanceName("deadbeef"), Running: true}
+	p.add(inst)
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	r.mu.Lock()
+	r.running[41] = inst
+	r.mu.Unlock()
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if !slices.Contains(p.destroyed, "finished") {
+		t.Fatalf("destroyed %v; the orphan was not destroyed, so this proves nothing", p.destroyed)
+	}
+	if r.Holding() {
+		t.Fatal("still holding an instance recovery destroyed; a drain would wait on it forever")
+	}
+}
+
+// THE SWEEP IS THE SAME: an orphan it proves destroyed leaves this process's
+// running set too, or no later inventory can repair it.
+func TestSweepForgetsTheRunningEntryOfAnOrphanItDestroys(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	inst := &provider.Instance{ID: "orphan", Name: provider.InstanceName("0ddba11"), Running: true}
+	p.add(inst)
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	r.mu.Lock()
+	r.running[43] = inst
+	r.mu.Unlock()
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if !slices.Contains(p.destroyed, "orphan") {
+		t.Fatalf("destroyed %v; the sweep did not destroy the orphan, so this proves nothing", p.destroyed)
+	}
+	if r.Holding() {
+		t.Fatal("still holding an orphan the sweep destroyed; a drain would wait on it forever")
+	}
+}
+
+// AN UNCONFIRMED TEARDOWN IS STILL COMPUTE. Only a confirmed stop removes the
+// running entry, because the instance may yet be there.
+func TestRecoverKeepsTheRunningEntryOfATeardownNotConfirmed(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	inst := &provider.Instance{ID: "stopping", Name: provider.InstanceName("cafef00d"), Running: true}
+	p.add(inst)
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	r.mu.Lock()
+	r.running[42] = inst
+	r.mu.Unlock()
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if !r.Holding() {
+		t.Fatal("forgot an instance whose teardown was not confirmed")
+	}
+}
+
+// AN INSTANCE RECOVERY ADOPTS IS CUSTODY'S, and custody is what ends it; an
+// entry left in running as well would outlive custody settling.
+func TestRecoverMovesAnAdoptedInstanceOutOfRunning(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	r.mu.Lock()
+	_, stillRunning := r.running[lease.RequestID]
+	_, inCustody := r.custody[lease.ID]
+	r.mu.Unlock()
+
+	if !inCustody {
+		t.Fatal("recovery did not adopt the surviving instance into custody, so this proves nothing")
+	}
+	if stillRunning {
+		t.Error("an adopted instance is also still listed as running; it would hold a drain after custody settles")
+	}
+}
+
 func TestRecoverReportsInstancesItCouldNotDestroy(t *testing.T) {
 	t.Parallel()
 

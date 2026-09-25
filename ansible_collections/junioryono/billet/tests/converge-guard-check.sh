@@ -1568,6 +1568,7 @@ mkdir -p "$case_dir/tmp"
 # work directory may live under it, so it cannot be overlaid), and what the
 # case is answerable for is what appeared during its play.
 ls /tmp 2>/dev/null | grep '^billet-endpoint-' | sort >"$case_dir/tmp-before" || true
+date +%s.%N >"$case_dir/time-play-start"
 if [ -s "$case_dir/role-driver" ]; then
   env "${envs[@]}" HOME="$HOME_DIR" /bin/bash "$(cat "$case_dir/role-driver")" "$case_dir" "$play" >"$case_dir/out" 2>&1
 elif [ "$mode" = escalated ]; then
@@ -1589,6 +1590,7 @@ else
   setpriv --reuid="$INVOKER_UID" --regid="$INVOKER_GID" --init-groups env "${envs[@]}" HOME="$HOME_DIR" USER="$INVOKER_NAME" LOGNAME="$INVOKER_NAME" "$ANSIBLE_PLAYBOOK" -i "$INVENTORY" "$play" -e ansible_become=false -e "billet_gate_expect_uid=$INVOKER_UID" "${args[@]+"${args[@]}"}" >"$case_dir/out" 2>&1
 fi
 echo "$?" >"$case_dir/status"
+date +%s.%N >"$case_dir/time-play-end"
 if [ -s "$case_dir/second-play" ]; then
   cp "$case_dir/calls/index.jsonl" "$case_dir/calls-first.jsonl" || exit 96
   second_play=$(cat "$case_dir/second-play")
@@ -1680,6 +1682,19 @@ p() { printf '%s\n' "$2" >>"$work/cases/$1/plant.sh"; }
 e() { printf '%s\n' "$2" >>"$work/cases/$1/env"; }
 a() { local name=$1; shift; for x in "$@"; do printf '%s\n' "$x" >>"$work/cases/$name/args"; done; }
 post() { printf '%s\n' "$2" >>"$work/cases/$1/post.sh"; }
+# case_timing CASE STARTED records how long a namespace case took and how much
+# of that was its playbook, one line per case in $work/timings, so the report
+# at the end can say where the gate's time goes. It measures and decides
+# nothing: a missing timestamp records -1.
+case_timing() {
+  local name=$1 started=$2 ended play_start play_end
+  ended=$(date +%s.%N)
+  play_start=$(cat "$work/cases/$name/time-play-start" 2>/dev/null || echo -1)
+  play_end=$(cat "$work/cases/$name/time-play-end" 2>/dev/null || echo -1)
+  awk -v n="$name" -v s="$started" -v e="$ended" -v ps="$play_start" -v pe="$play_end" \
+    'BEGIN { play = (ps < 0 || pe < 0) ? -1 : pe - ps; printf "%s %.2f %.2f\n", n, e - s, play }' >>"$work/timings"
+}
+
 # ns_case CASE MODE [PLAY]: MODE escalated (the play runs as root, so every
 # task's own escalation is a no-op and the case is about the protocol),
 # unescalated (as the invoker, with escalation refused, so the role's refusals
@@ -1691,12 +1706,15 @@ ns_case() {
   retirement_case_seen "$1"
   local name=$1 mode=$2 play=${3:-play}
   local case_dir=$work/cases/$name
+  local started
+  started=$(date +%s.%N)
   sudo -n env BINS="$bins" FAKES="$fakes" PYTHON="$python" NSLIB="$work/ns-lib.sh" HOME_DIR="$HOME" MNT="$mnt" \
     COLLECTIONS="$collections_path" RUNNER="$RUNNER" HOLDER="$HOLDER" INVOKER_UID="$invoker_uid" INVOKER_GID="$invoker_gid" INVOKER_NAME="$invoker_name" \
     ANSIBLE_PLAYBOOK="$ansible_playbook" INVENTORY="$work/inventory.ini" \
     RECORDER="$work/record-call.py" RETIRE_FIXTURES="$work/retire-fixtures" \
     unshare -m --propagation private /bin/bash "$work/ns-run.sh" "$case_dir" "$mode" "$work/$play.yml"
   local rc=$?
+  case_timing "$name" "$started"
   [ "$rc" -eq 0 ] || fail "$name: the namespace runner failed ($rc): $(cat "$case_dir/state" 2>/dev/null)"
   status=$(cat "$case_dir/status")
   check_sentinel "$name"
@@ -3476,6 +3494,14 @@ fi
 if [ -n "${BILLET_RETIREMENT_REPORT:-}" ]; then
   [ -n "${BILLET_RETIREMENT_SHARD:-}" ] || fail 'a retirement report requires one explicit subshard'
   "$python" "$repo_root/scripts/check-retirement-shards.py" --section "$BILLET_RETIREMENT_SHARD" --selection "$work/retirement-selection.tsv" --report "$BILLET_RETIREMENT_REPORT"
+fi
+
+# WHERE THE TIME WENT: per namespace case, wall time and the playbook's share,
+# so batching can be judged on a measurement rather than a guess.
+if [ -s "$work/timings" ]; then
+  awk '{ n++; total += $2; if ($3 >= 0) { play += $3; plays++ } }
+    END { printf "converge guard: timing: %d namespace cases, %.1f s in all, %.1f s inside their playbooks (%d measured), %.1f s around them\n", n, total, play, plays, total - play }' "$work/timings"
+  sort -k2 -rn "$work/timings" | head -5 | awk '{ printf "converge guard: timing: slowest %s %.1f s (playbook %.1f s)\n", $1, $2, $3 }'
 fi
 
 echo "converge guard: every case passed (sections run: $sections_ran)"

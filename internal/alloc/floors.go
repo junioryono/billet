@@ -39,7 +39,7 @@ import (
 func (a *Allocator) reserveFloors(
 	ctx context.Context, tx querier, forTier string, free *fleet, returned placementCost,
 ) (floorCharge, error) {
-	open, err := a.countOpenPerTier(ctx, tx)
+	open, err := a.countFloorLeasesPerTier(ctx, tx)
 	if err != nil {
 		return floorCharge{}, err
 	}

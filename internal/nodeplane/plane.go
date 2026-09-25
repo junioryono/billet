@@ -374,6 +374,11 @@ type pending struct {
 	// process the other's work — and the JIT route, which must stay open so a
 	// launch already under way can finish, is exactly where that matters.
 	incarnation string
+	// takenLedgerEpoch is the ledger epoch of that process's registration, read
+	// with incarnation in one hold of the mutex, so what the command's result
+	// says about its process is fenced to that process and not to one that has
+	// registered under the name since.
+	takenLedgerEpoch int64
 	// delivered records that a node took this command. After that point a
 	// timeout is AMBIGUOUS rather than a failure, because the node may be acting
 	// on it right now.
@@ -2074,6 +2079,7 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 
 		pend.delivered = true
 		pend.incarnation = incarnation
+		pend.takenLedgerEpoch = n.ledgerEpoch
 		n.inflight[pend.cmd.ID] = pend
 
 		// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
@@ -2171,6 +2177,45 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 	p.answerLocked(pend, res)
 
 	return nil
+}
+
+// drainingRecorder is the ledger's half of a node saying it is draining.
+// Optional, like the provider capabilities: the allocator implements it, and a
+// registrar that does not leaves the plane dispatching to the refusal, as before.
+type drainingRecorder interface {
+	NodeDraining(ctx context.Context, name string, epoch int64, incarnation string) error
+}
+
+// markDraining takes a host out of placement after its process refused a launch
+// because it is draining. The process stays registered and polled, so the
+// destroys and completions its running work needs still reach it; the ledger
+// mark is cleared by its next registration.
+//
+// FENCED TO THE PROCESS THAT REFUSED, captured when it took the command. The
+// node entry's current fence would be wrong: a replacement registering between
+// the refusal and this call would be marked draining in its place, and it may
+// poll for weeks without registering again to clear the mark.
+//
+// BEST EFFORT. A mark that does not land leaves the host placeable, which is how
+// it behaved before: the next launch is refused again and tries again.
+func (p *Plane) markDraining(ctx context.Context, name string, pend *pending) {
+	recorder, ok := p.registrar.(drainingRecorder)
+	if !ok || pend.incarnation == "" || pend.takenLedgerEpoch == 0 {
+		return
+	}
+
+	if err := recorder.NodeDraining(ctx, name, pend.takenLedgerEpoch, pend.incarnation); err != nil {
+		if !errors.Is(err, alloc.ErrWithdrawalStale) {
+			p.log.Warn("a node refused a launch because it is draining, and taking it out "+
+				"of placement did not land; the next launch will be refused too",
+				"node", name, "error", err)
+		}
+
+		return
+	}
+
+	p.log.Info("a node is draining; no new work is placed on it until it registers again",
+		"node", name)
 }
 
 // Withdraw takes a node out of placement because its current process said it

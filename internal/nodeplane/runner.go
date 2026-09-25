@@ -125,6 +125,10 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 		return fmt.Errorf("%w: node %s: %s", server.ErrCustody, n.name, res.Error)
 	}
 
+	if res.Draining {
+		r.plane.markDraining(ctx, n.name, pend)
+	}
+
 	return fmt.Errorf("node %s could not launch lease %s: %s", n.name, lease.ID, res.Error)
 }
 

@@ -71,6 +71,7 @@ type ReadOps interface {
 	CountLiveWorkOnNode(ctx context.Context, arg ledgerdb.CountLiveWorkOnNodeParams) (int64, error)
 	CountOpenInTier(ctx context.Context, tier string) (int64, error)
 	CountOpenPerTier(ctx context.Context) ([]ledgerdb.CountOpenPerTierRow, error)
+	CountOpenPerTierOnLiveHosts(ctx context.Context) ([]ledgerdb.CountOpenPerTierOnLiveHostsRow, error)
 	CountOutstandingLeasesOnNode(ctx context.Context, node string) (int64, error)
 	DisruptableLease(ctx context.Context, id string) ([]string, error)
 	DisruptableLeasesOnNode(ctx context.Context, node string) ([]string, error)
@@ -232,6 +233,7 @@ type WriteOps interface {
 	InsertRolloutNode(ctx context.Context, arg ledgerdb.InsertRolloutNodeParams) error
 	MarkLeaseDeregistered(ctx context.Context, id string) error
 	MarkLeaseFailure(ctx context.Context, arg ledgerdb.MarkLeaseFailureParams) error
+	MarkNodeDraining(ctx context.Context, arg ledgerdb.MarkNodeDrainingParams) (int64, error)
 	MarkNodeNotLive(ctx context.Context, arg ledgerdb.MarkNodeNotLiveParams) error
 	MarkPoolRunnerBusy(ctx context.Context, arg ledgerdb.MarkPoolRunnerBusyParams) error
 	MarkPoolRunnerRetired(ctx context.Context, arg ledgerdb.MarkPoolRunnerRetiredParams) error

@@ -175,6 +175,50 @@ func (q *Queries) CountOpenPerTier(ctx context.Context) ([]CountOpenPerTierRow, 
 	return items, nil
 }
 
+const countOpenPerTierOnLiveHosts = `-- name: CountOpenPerTierOnLiveHosts :many
+SELECT l.tier, CAST(COUNT(*) AS BIGINT) AS open_leases
+  FROM leases l
+  LEFT JOIN nodes n ON n.name = COALESCE(l.node, l.target_node)
+ WHERE l.phase NOT IN ('done','failed')
+   AND (COALESCE(l.node, l.target_node, '') = '' OR n.live = 1)
+ GROUP BY l.tier
+`
+
+type CountOpenPerTierOnLiveHostsRow struct {
+	Tier       string
+	OpenLeases int64
+}
+
+// What each tier holds on a host still in contact, draining or not: the count a
+// reserved floor is met by.
+//
+// A DRAINING HOST'S LEASES ARE RUNNING JOBS, and each is occupying the slot its
+// tier's floor promised; counting it unmet would hold a second slot elsewhere
+// for a tier that cannot use it. A host that is not live is what CountOpenPerTier
+// excludes for the floors' own reason, and so does this.
+func (q *Queries) CountOpenPerTierOnLiveHosts(ctx context.Context) ([]CountOpenPerTierOnLiveHostsRow, error) {
+	rows, err := q.db.QueryContext(ctx, countOpenPerTierOnLiveHosts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CountOpenPerTierOnLiveHostsRow
+	for rows.Next() {
+		var i CountOpenPerTierOnLiveHostsRow
+		if err := rows.Scan(&i.Tier, &i.OpenLeases); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const heartbeatLease = `-- name: HeartbeatLease :exec
 UPDATE leases SET heartbeat_at = $1, expires_at = $2
  WHERE id = $3 AND epoch = $4

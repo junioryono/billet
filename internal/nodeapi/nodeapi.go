@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 22
+	Version = 23
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -302,15 +302,25 @@ const (
 	// policy with another owner's App.
 	VersionTargetedRunnerGroup = 21
 
+	// VersionNodeDraining is the version from which a launch a draining node
+	// refuses says so in CommandResult.Draining, and the plane takes the host out
+	// of placement until it registers again.
+	//
+	// CHECKED WHERE IT IS EMITTED, because the plane decodes a result strictly
+	// and an older one would refuse the field. What an older pairing loses is the
+	// refusal being remembered: the plane goes on dispatching launches the node
+	// refuses, which is how it behaved before, and nothing is lost but the churn.
+	VersionNodeDraining = 22
+
 	// VersionCacheAuthority is the version from which a node understands a
 	// tier's cache block and the cache authority a completion carries (#226).
 	//
-	// REFUSED WHERE THE LAUNCH IS SENT for a tier whose cache block is not the
-	// legacy shape, because an older node ignores a restrictive policy: it would
-	// go on publishing a trusted pool's writes under `publish: off`, and treat a
-	// default-branch tier as trusted-only. A legacy tier still launches on an
-	// older node, which does exactly what it always did.
-	VersionCacheAuthority = 22
+	// REFUSED WHERE THE LAUNCH IS SENT only for a tier an older node would
+	// exceed (config.Tier.NeedsCacheAwareNode): such a node ignores the block and
+	// applies the rule every tier had before it, which for every default does the
+	// same or less, and for a trusted pool told to publish nothing, or a cache
+	// turned off or held smaller, does more.
+	VersionCacheAuthority = 23
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -887,6 +897,11 @@ type CommandResult struct {
 	// assume something is running, keep the lease, and let the node's recovery
 	// adopt it. The opposite default releases capacity that is genuinely in use.
 	Custody bool `json:"custody,omitempty"`
+
+	// Draining says a launch was refused because the node is draining: nothing
+	// started, and no launch will until the process registers again. Sent only
+	// on a wire at or above VersionNodeDraining.
+	Draining bool `json:"draining,omitempty"`
 
 	// BarrierID echoes the inventory command's barrier, and Instances is what the
 	// host's provider actually holds.

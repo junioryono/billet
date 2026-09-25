@@ -300,6 +300,21 @@ SELECT l.tier, CAST(COUNT(*) AS BIGINT) AS open_leases
         OR (n.live = 1 AND n.drained = 0))
  GROUP BY l.tier;
 
+-- name: CountOpenPerTierOnLiveHosts :many
+-- What each tier holds on a host still in contact, draining or not: the count a
+-- reserved floor is met by.
+--
+-- A DRAINING HOST'S LEASES ARE RUNNING JOBS, and each is occupying the slot its
+-- tier's floor promised; counting it unmet would hold a second slot elsewhere
+-- for a tier that cannot use it. A host that is not live is what CountOpenPerTier
+-- excludes for the floors' own reason, and so does this.
+SELECT l.tier, CAST(COUNT(*) AS BIGINT) AS open_leases
+  FROM leases l
+  LEFT JOIN nodes n ON n.name = COALESCE(l.node, l.target_node)
+ WHERE l.phase NOT IN ('done','failed')
+   AND (COALESCE(l.node, l.target_node, '') = '' OR n.live = 1)
+ GROUP BY l.tier;
+
 -- name: CountOpenInTier :one
 -- Everything one tier holds, live host or not.
 SELECT CAST(COUNT(*) AS BIGINT) FROM leases

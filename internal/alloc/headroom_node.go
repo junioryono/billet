@@ -28,7 +28,7 @@ type nodeRow struct {
 // CacheAuthorityWireVersion is the oldest wire a node can honour a tier's cache
 // block on, mirrored from nodeapi.VersionCacheAuthority (a test holds them
 // equal), because nodeapi imports this package.
-const CacheAuthorityWireVersion = 22
+const CacheAuthorityWireVersion = 23
 
 // eligibleNodes lists the live hosts a tier could actually be placed on.
 //
