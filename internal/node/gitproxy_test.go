@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -639,4 +641,170 @@ func TestGitAdmissionIsBoundedAndGivesBack(t *testing.T) {
 	if len(free) != 0 {
 		t.Fatal("release gave nothing back")
 	}
+}
+
+// A SHALLOW NEGOTIATION IS GITHUB'S TO ANSWER: a client's `shallow` line makes
+// upload-pack send that commit's parents without judging them.
+func TestAShallowNegotiationGoesToGitHub(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	_, node, token := gitNode(t, upstream)
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	main := runIn(t, upstream.repo, "rev-parse", "main")
+	shallow := "shallow " + main + "\n"
+	want := "want " + main + "\n"
+	deepen := "deepen 2147483647\n"
+	negotiation := fmt.Sprintf("%04x%s%04x%s%04x%s00000009done\n", len(want)+4, want,
+		len(shallow)+4, shallow, len(deepen)+4, deepen)
+	before := upstream.fetches.Load()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		node.URL+"/v1/git/github.com/acme/api.git/git-upload-pack", strings.NewReader(negotiation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth(token, githubBasic)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if upstream.fetches.Load() == before {
+		t.Fatal("a shallow negotiation was answered from the mirror")
+	}
+	if wants, shallow := negotiatedWants([]byte(negotiation)); !shallow || len(wants) != 1 {
+		t.Fatalf("negotiatedWants = %v, %v", wants, shallow)
+	}
+}
+
+// A REFUSAL OUTLIVES ANSWERS ABOUT OTHER HEADERS: an unrelated question
+// recorded after it must not clear it, or an older grant for the refused
+// header would land as though nothing newer had been said.
+func TestARefusalOutlivesUnrelatedAnswers(t *testing.T) {
+	t.Parallel()
+
+	g := newGitProxy(t.TempDir())
+	session := &cacheSession{trust: provider.TrustUntrusted}
+	a := gitRequest{session: session, owner: "acme", repo: "api", auth: "basic YQ=="}
+	b := gitRequest{session: session, owner: "acme", repo: "api", auth: "basic Yg=="}
+	now := time.Now()
+	older, refusal, unrelated := g.ask(), g.ask(), g.ask()
+	g.remember(a, now, refusal, false, false)
+	g.remember(b, now.Add(gitAuthorisationAge), unrelated, true, true)
+	g.remember(a, now.Add(gitAuthorisationAge), older, true, true)
+	if g.servesFromMirror(a, now.Add(gitAuthorisationAge)) {
+		t.Fatal("an unrelated answer cleared a refusal and let an older grant stand")
+	}
+}
+
+// ONLY THE SCOPE OWNER'S REPOSITORIES ARE MIRRORED for a scoped session; any
+// other repository is GitHub's to serve, so a job cannot fill the node with
+// mirrors of whatever it names.
+func TestOnlyTheScopeOwnersRepositoriesAreMirrored(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	spec := gitCache()
+	spec.Publish, spec.Owner, spec.Repository = config.CachePublishDefaultBranch, "other", "repo"
+	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
+	service.git.upstream, service.git.fullFraction = upstream.URL, 1
+	node := httptest.NewServer(service)
+	t.Cleanup(node.Close)
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
+		t.Fatal("a repository outside the session's owner was mirrored")
+	}
+}
+
+// AN ADVERTISEMENT ALWAYS ASKS ABOUT THE NAME IT WAS GIVEN, so a rename is
+// believed only while GitHub is giving it, and only to the header it was given
+// to.
+func TestARenameIsFollowedOnlyForTheFetchItWasGivenTo(t *testing.T) {
+	t.Parallel()
+
+	g := newGitProxy(t.TempDir())
+	session := &cacheSession{trust: provider.TrustUntrusted}
+	old := gitRequest{session: session, owner: "acme", repo: "old", auth: "basic YQ=="}
+	resp := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
+	now := time.Now()
+	if _, ok := g.learnRename(old, resp, now); !ok {
+		t.Fatal("the redirect was not learned")
+	}
+	if moved := g.follow(old, now); moved.repo != "api" {
+		t.Fatalf("the same header's fetch went to %q", moved.repo)
+	}
+	other := old
+	other.auth = "basic Yg=="
+	if moved := g.follow(other, now); moved.repo != "old" {
+		t.Fatal("another header followed a rename it was never given")
+	}
+	if moved := g.follow(old, now.Add(gitRenameAge)); moved.repo != "old" {
+		t.Fatal("a rename was followed after its grant expired")
+	}
+}
+
+// A BUSY FETCH SLOT SENDS THE JOB TO GITHUB PROMPTLY, rather than holding its
+// checkout behind another job's fetch.
+func TestABusyFetchSlotFallsBackPromptly(t *testing.T) {
+	t.Parallel()
+
+	upstream := newGitUpstream(t)
+	service, node, token := gitNode(t, upstream)
+	for range gitFetches {
+		service.git.fetches <- struct{}{}
+	}
+	start := time.Now()
+	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
+		"https://github.com/acme/api.git", "c"); err != nil {
+		t.Fatalf("clone while every slot is busy: %v\n%s", err, output)
+	}
+	if took := time.Since(start); took > 3*gitFetchWait+5*time.Second {
+		t.Fatalf("the clone waited %s behind busy fetch slots", took)
+	}
+	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
+		t.Fatal("a mirror was fetched while every slot was held")
+	}
+}
+
+// A CANCELLED GIT TAKES ITS CHILDREN WITH IT: fetch runs index-pack, which
+// would go on writing after the slot that bounded it was released.
+func TestACancelledCommandEndsItsChildren(t *testing.T) {
+	t.Parallel()
+
+	pidFile := filepath.Join(t.TempDir(), "child")
+	ctx, cancel := context.WithCancel(t.Context())
+	cmd := exec.CommandContext(ctx, "sh", "-c", "sleep 60 & echo $! >"+pidFile+"; wait")
+	killGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var child int
+	for range 100 {
+		if raw, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+			child, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if child == 0 {
+		t.Fatal("the child never started")
+	}
+	cancel()
+	_ = cmd.Wait()
+	for range 100 {
+		if syscall.Kill(child, 0) != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(child, syscall.SIGKILL)
+	t.Fatal("the child outlived its cancelled parent")
 }

@@ -311,7 +311,11 @@ func (h *helper) call(ctx context.Context, method, path string, body []byte) ([]
 		return nil, false
 	case resp.StatusCode == http.StatusOK:
 		return raw, true
-	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusInsufficientStorage:
+	// A MISS, A FULL VOLUME, OR A NODE BUSY WITH THE JOB'S OTHER TRANSFERS is
+	// this request's answer, not the node's verdict on the job: the next one
+	// may well be served.
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusInsufficientStorage ||
+		resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable:
 		return nil, false
 	default:
 		h.disable(fmt.Sprintf("the node cache answered %d", resp.StatusCode))

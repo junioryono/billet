@@ -270,6 +270,38 @@ func TestADamagedLocalObjectIsAMiss(t *testing.T) {
 	}
 }
 
+// A BUSY NODE IS A MISS, NOT A REASON TO STOP ASKING: the next request is
+// served once the node has room.
+func TestABusyNodeIsAMissAndIsAskedAgain(t *testing.T) {
+	t.Parallel()
+
+	action := bytes.Repeat([]byte{3}, 32)
+	body := []byte("served later")
+	var busy atomic.Int64
+	busy.Store(1)
+	objects := map[string][]byte{
+		"ac/" + hex.EncodeToString(action): entry{output: digest(body), size: int64(len(body)), at: time.Unix(1, 0)}.encode(),
+		"cas/" + digest(body):              body,
+	}
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if busy.Add(-1) >= 0 {
+			http.Error(w, "busy", http.StatusTooManyRequests)
+
+			return
+		}
+		key, _ := strings.CutPrefix(r.URL.Path, "/v1/cas/go/")
+		_, _ = w.Write(objects[key])
+	}))
+	t.Cleanup(node.Close)
+	answers := exchange(t, Config{Dir: t.TempDir(), Endpoint: node.URL, Token: "token"},
+		request{ID: 1, Command: "get", ActionID: action},
+		request{ID: 2, Command: "get", ActionID: action},
+		request{ID: 3, Command: "close"})
+	if !answers[0].Miss || answers[1].Miss {
+		t.Fatalf("answers = %+v, want a miss while busy and a hit after", answers[:2])
+	}
+}
+
 // A PUT IS ANSWERED WITH AN ABSOLUTE PATH HOLDING THE BODY, and a later get in
 // the same process finds it without the node.
 func TestAPutIsServedLocallyByPath(t *testing.T) {

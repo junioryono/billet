@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -319,6 +320,60 @@ func TestTheCapabilitiesAreACacheOnly(t *testing.T) {
 	if len(cache.GetDigestFunctions()) != 1 || cache.GetDigestFunctions()[0] != repb.DigestFunction_SHA256 ||
 		!cache.GetActionCacheUpdateCapabilities().GetUpdateEnabled() || capabilities.GetExecutionCapabilities() != nil {
 		t.Fatalf("capabilities = %v", capabilities)
+	}
+}
+
+// countingVolume counts how often each object is opened.
+type countingVolume struct {
+	dirVolume
+	mu     sync.Mutex
+	opened map[string]int
+}
+
+func (c *countingVolume) Open(table reapi.Table, hash string) (*os.File, error) {
+	c.mu.Lock()
+	c.opened[hash]++
+	c.mu.Unlock()
+
+	return c.dirVolume.Open(table, hash)
+}
+
+// A RESULT THAT NAMES ONE TREE MANY TIMES EXPANDS IT ONCE, so a job cannot make
+// the node unpack the same Tree over and over within one request.
+func TestATreeNamedManyTimesIsExpandedOnce(t *testing.T) {
+	t.Parallel()
+
+	inner, _ := volumeIn(t)
+	volume := &countingVolume{dirVolume: inner, opened: map[string]int{}}
+	conn := serve(t, func(context.Context, bool) (reapi.Volume, error) { return volume, nil })
+	file := []byte("one file")
+	tree, err := proto.Marshal(&repb.Tree{Root: &repb.Directory{
+		Files: []*repb.FileNode{{Name: "f", Digest: digestOf(file)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range [][]byte{tree, file} {
+		if err := volume.Put(t.Context(), reapi.TableCAS, digestOf(body).GetHash(), bytes.NewReader(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var dirs []*repb.OutputDirectory
+	for i := range 1000 {
+		dirs = append(dirs, &repb.OutputDirectory{Path: "out" + strconv.Itoa(i), TreeDigest: digestOf(tree)})
+	}
+	ac := repb.NewActionCacheClient(conn)
+	action := digestOf([]byte("many directories"))
+	if _, err := ac.UpdateActionResult(t.Context(), &repb.UpdateActionResultRequest{
+		ActionDigest: action, ActionResult: &repb.ActionResult{OutputDirectories: dirs},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ac.GetActionResult(t.Context(), &repb.GetActionResultRequest{ActionDigest: action}); err != nil {
+		t.Fatalf("GetActionResult: %v", err)
+	}
+	if got := volume.opened[digestOf(tree).GetHash()]; got != 1 {
+		t.Fatalf("the tree was opened %d times, want once", got)
 	}
 }
 

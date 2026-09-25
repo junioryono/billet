@@ -694,3 +694,64 @@ func TestAFailedMergeDiscardsItsClone(t *testing.T) {
 		t.Fatalf("discards = %d, want the merge clone and the job's own", storage.discarded)
 	}
 }
+
+// A FULL GENERATION IS NOT MERGED INTO FOREVER: a job that finds its clone
+// past the fill line starts empty, and what it publishes replaces the full
+// generation rather than being refused alongside it.
+func TestAFullGenerationStartsOver(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{current: "full"}
+	service, _, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	session := service.sessionOf(instance)
+	service.casFill = 0
+	session.mu.Lock()
+	hv, err := service.casVolume(t.Context(), session, config.CacheGo)
+	session.mu.Unlock()
+	if err != nil {
+		t.Fatalf("casVolume: %v", err)
+	}
+	if !hv.Fresh || storage.discarded != 1 {
+		t.Fatalf("fresh %v, discarded %d; want the full clone discarded and a fresh start", hv.Fresh,
+			storage.discarded)
+	}
+	service.casFill = 1
+	if code := putObject(t, service, token, "after the reset"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	finish(t, service, instance, server.CacheAuthority{})
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.current != "next" || storage.cloned != 1 {
+		t.Fatalf("current %q after %d clones; want the fresh volume published without a merge",
+			storage.current, storage.cloned)
+	}
+}
+
+// A SESSION A RESTART RECOVERED REPORTS ONLY WHAT IT CAN VOUCH FOR: a warm
+// cache stays warm whatever the rest of the job did, and nothing lower does,
+// because the part of the job before the restart may have outranked it.
+func TestARecoveredSessionReportsOnlyWhatItCanVouchFor(t *testing.T) {
+	t.Parallel()
+
+	session := &cacheSession{recovered: true, cache: goBazelCache()}
+	noteBuildCache(session, config.CacheGo, alloc.BuildCacheWarm)
+	noteBuildCache(session, config.CacheBazel, alloc.BuildCacheCold)
+	got := settledBuildCaches(session)
+	if got.Go != alloc.BuildCacheWarm || got.Bazel != "" || got.Git != "" {
+		t.Fatalf("a recovered session reported %+v, want only the warm cache", got)
+	}
+
+	live := &cacheSession{cache: gitCacheSpecForTest(), gitPending: 1}
+	if got := settledBuildCaches(live); got.Git != "" {
+		t.Fatalf("a git refresh in flight was reported %q, want nothing yet", got.Git)
+	}
+}
+
+func gitCacheSpecForTest() *config.CacheSpec {
+	enabled := true
+	spec := config.Tier{Cache: &config.TierCache{Git: &config.CacheToggle{Enabled: &enabled}}}.EffectiveCache()
+
+	return &spec
+}

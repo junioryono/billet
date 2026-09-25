@@ -135,7 +135,7 @@ Everything here is optional; [Build caches](../operating/build-caches.md) explai
 | `go.enabled`, `go.max_size` | `true` on Linux Firecracker, `20GiB` | the Go build cache through `GOCACHEPROG` |
 | `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
 
-A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed (a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, an Actions archive held below `10GiB`) is placed only on a node at protocol 23 or later.
+A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
 
 ## `nodes`
 

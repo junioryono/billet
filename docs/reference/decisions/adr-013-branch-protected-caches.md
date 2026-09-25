@@ -31,7 +31,7 @@ Everything else, including a pull request, a tag, `pull_request_target`, a reusa
 
 **Publication is off the command path and journaled.** A completion records an intent. The node's cache loop publishes after the compute is gone, within 30 minutes, asking the kill switch again before the pointer moves. A crash is reconciled from the journal and never snapshots twice. Content-addressed caches (Bazel, Go) merge into the newest generation, so concurrent jobs' writes both survive.
 
-**An older node is refused only a tier it would exceed.** A node below wire 23 ignores the cache block and applies the old rule. That is the same or less for every default, and more for a trusted pool told to publish `off` or `default-branch`, or for a cache turned off or held smaller; those tiers wait for an upgraded node, and `billet status` says so.
+**An older node is refused only a tier it would exceed, reads included.** A node below wire 23 ignores the cache block and applies the old rule, with the pool's pre-#226 keys. That is more than a `default-branch` tier allows, because it would read keys other repositories' jobs wrote. It is also more for a trusted pool told to publish `off` or `default-branch`, and for a cache turned off or held smaller. Those tiers wait for an upgraded host of their own, and `billet status` names them.
 
 ## Measured
 
@@ -47,4 +47,4 @@ Everything else, including a pull request, a tag, `pull_request_target`, a reusa
 - **Trust `jobWorkflowRef`.** A push to `feature` can call `owner/repo/.github/workflows/x.yml@main`, which reads as a default-branch job running feature code. The branch comes from GitHub's record of the run.
 - **A Git proxy by remapping `github.com` in the guest.** It would terminate TLS for every github.com request, pushes and downloads included, and needs SSH forwarded besides. `insteadOf` rewrites HTTPS fetches alone.
 - **Whole-volume last-write-wins for content-addressed caches.** It loses one of two concurrent jobs' writes; the merge keeps both.
-- **Refuse every non-default cache block on an older node.** Once every cache is on by default, that pins every Firecracker tier to upgraded nodes through a whole rollout, for defaults an older node only does less with.
+- **Refuse every non-default cache block on an older node.** Once every cache is on by default, that pins every Firecracker tier to upgraded nodes through a whole rollout, for defaults an older node only does less with. Only `default-branch` tiers are pinned, because there the older node's reads are wider.

@@ -40,6 +40,37 @@ const CacheAuthorityWireVersion = 23
 // placement. An unordered candidate set makes the same fleet produce different
 // answers on different runs, which is untestable and unexplainable in a log.
 func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
+	return a.eligibleNodesFor(ctx, tx, t, t.NeedsCacheAwareNode())
+}
+
+// WaitsForCacheAwareHost reports whether a tier is placed nowhere only because
+// every host it could otherwise use is too old to read its cache block, which
+// is what a rollout looks like to such a tier until its first host upgrades.
+// Asked on the read-only pool, with placement's own rule.
+func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (bool, error) {
+	if !t.NeedsCacheAwareNode() {
+		return false, nil
+	}
+	var waits bool
+	err := a.db.View(ctx, func(tx querier) error {
+		honouring, err := a.eligibleNodesFor(ctx, tx, t, true)
+		if err != nil || len(honouring) > 0 {
+			return err
+		}
+		any, err := a.eligibleNodesFor(ctx, tx, t, false)
+		waits = len(any) > 0
+
+		return err
+	})
+
+	return waits, err
+}
+
+// eligibleNodesFor is eligibleNodes with the cache-block rule as a parameter,
+// so a report can ask what the tier would have without it.
+func (a *Allocator) eligibleNodesFor(
+	ctx context.Context, tx querier, t config.Tier, needsCacheAware bool,
+) ([]nodeRow, error) {
 	rows, err := state.ReadQueries(tx).ListPlaceableNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: list nodes for tier %s: %w", t.Label, err)
@@ -84,7 +115,7 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK IS NOT A CANDIDATE, or
 		// placement would choose it again and again for a launch the plane then
 		// refuses to send, and newer hosts beside it would sit unused.
-		if n.wire < CacheAuthorityWireVersion && t.NeedsCacheAwareNode() {
+		if n.wire < CacheAuthorityWireVersion && needsCacheAware {
 			continue
 		}
 

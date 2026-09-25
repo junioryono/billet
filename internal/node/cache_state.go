@@ -113,6 +113,8 @@ func (s *CacheService) loadSessions() error {
 			receipts: record.Receipts,
 			hosts:    record.Hosts,
 			casAdmit: make(chan struct{}, casConcurrency),
+			gitAdmit: make(chan struct{}, gitSessionWork),
+			gitFetch: make(chan struct{}, 1),
 			pathID:   record.PathID,
 		}
 		if session.pathID == "" {

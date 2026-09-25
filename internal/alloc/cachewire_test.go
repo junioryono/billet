@@ -32,12 +32,25 @@ func TestACacheConfiguredTierIsPlacedOnlyWhereItCanBeHonoured(t *testing.T) {
 	if got := headroom(t, a, "legacy"); got == 0 {
 		t.Fatal("a legacy tier could not use an old host")
 	}
+	// THE WAIT IS REPORTED BY THE TIER'S OWN HOSTS: the configured tier waits
+	// on the old host; the legacy tier, which the old host serves, does not.
+	for _, tc := range []struct {
+		tier config.Tier
+		want bool
+	}{{configured, true}, {legacy, false}} {
+		if waits, err := a.WaitsForCacheAwareHost(t.Context(), tc.tier); err != nil || waits != tc.want {
+			t.Fatalf("tier %s waits = %v, %v; want %v", tc.tier.Label, waits, err, tc.want)
+		}
+	}
 
 	current := testRegistration("new-host", config.ProviderFirecracker)
 	current.WireMin, current.WireVersion, current.WireMax = 12, CacheAuthorityWireVersion,
 		CacheAuthorityWireVersion
 	if _, err := a.RegisterNode(t.Context(), current); err != nil {
 		t.Fatalf("RegisterNode(new): %v", err)
+	}
+	if waits, err := a.WaitsForCacheAwareHost(t.Context(), configured); err != nil || waits {
+		t.Fatalf("with a host on the version, the configured tier waits = %v, %v", waits, err)
 	}
 	leases, err := a.Escrow(t.Context(), "configured", 1)
 	if err != nil || len(leases) != 1 {

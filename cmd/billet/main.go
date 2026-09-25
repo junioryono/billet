@@ -4182,28 +4182,28 @@ func printComputeBarrier(ctx context.Context, a *alloc.Allocator) {
 // printCacheAwareWaits names every tier that waits for a host new enough to
 // read its cache block, so a rollout's wait reads as a wait and not a stall.
 func printCacheAwareWaits(ctx context.Context, a *alloc.Allocator, tiers []config.Tier) {
-	fleet, err := a.NodeWireVersions(ctx)
+	lines, err := cacheAwareWaits(tiers, func(t config.Tier) (bool, error) {
+		return a.WaitsForCacheAwareHost(ctx, t)
+	})
 	if err != nil {
-		return
+		fmt.Printf("cache     unavailable: %v\n", err)
 	}
-	for _, line := range cacheAwareWaits(tiers, fleet) {
+	for _, line := range lines {
 		fmt.Println(line)
 	}
 }
 
-// cacheAwareWaits is a line for each tier an older host would exceed while no
-// host this deployment can reach speaks the version that reads its cache
-// block: such a tier is placed nowhere until one does, which in a rollout is
-// the first upgraded host.
-func cacheAwareWaits(tiers []config.Tier, fleet []alloc.NodeWire) []string {
-	for _, n := range fleet {
-		if n.Live && n.Negotiated >= nodeapi.VersionCacheAuthority {
-			return nil
-		}
-	}
+// cacheAwareWaits is a line for each tier placed nowhere only because every
+// host it could otherwise use is too old to read its cache block: in a rollout,
+// until the first of ITS hosts upgrades, whatever other hosts have.
+func cacheAwareWaits(tiers []config.Tier, waits func(config.Tier) (bool, error)) ([]string, error) {
 	var lines []string
 	for i := range tiers {
-		if !tiers[i].NeedsCacheAwareNode() {
+		waiting, err := waits(tiers[i])
+		if err != nil {
+			return lines, err
+		}
+		if !waiting {
 			continue
 		}
 		label := "cache"
@@ -4211,12 +4211,12 @@ func cacheAwareWaits(tiers []config.Tier, fleet []alloc.NodeWire) []string {
 			label = ""
 		}
 		lines = append(lines, fmt.Sprintf("%-9s tier %s WAITS FOR A HOST ON PROTOCOL %d: an older host "+
-			"would ignore its cache block and publish or keep more than it allows, and no host "+
-			"this deployment can reach speaks %d yet", label, tiers[i].Label,
+			"would ignore its cache block and read, publish or keep more than it allows, and "+
+			"none of the hosts it could run on speaks %d yet", label, tiers[i].Label,
 			nodeapi.VersionCacheAuthority, nodeapi.VersionCacheAuthority))
 	}
 
-	return lines
+	return lines, nil
 }
 
 // printWireWindow reports which hosts are still on an older node wire.

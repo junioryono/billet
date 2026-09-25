@@ -61,9 +61,8 @@ const (
 
 // TierCache is one tier's cache configuration, `tiers[].cache`.
 //
-// Every field is optional and a tier that says nothing gets exactly what it
-// had before this block existed: the Docker image store and sticky disks on,
-// publication from trusted pools only, everything else off.
+// Every field is optional, and a tier that says nothing gets every cache it can
+// have, publishing by its trust; Tier.EffectiveCache says what that is.
 type TierCache struct {
 	Publish     CachePublish  `yaml:"publish,omitempty"`
 	Docker      *CacheToggle  `yaml:"docker,omitempty"`
@@ -175,17 +174,19 @@ func (s CacheSpec) Setting(kind CacheKind) CacheSetting {
 // Docker store and sticky disks at their default sizes, interception as
 // `intercept` says, and no Git, Bazel or Go cache.
 //
-// DOING LESS IS SAFE AND DOING MORE IS NOT. A cache the older node does not
-// serve leaves the job cold, and an untrusted pool whose writes it discards
-// publishes less than default-branch would; neither needs refusing. A trusted
-// pool told to publish nothing or only from its default branch, a Docker store
-// or sticky disk turned off or held smaller, and an Actions archive held below
-// GitHub's limit would all be exceeded, so those tiers are placed only on a
-// node that reads the block.
+// DOING LESS IS SAFE AND DOING MORE IS NOT, for reads as for writes. A cache
+// the older node does not serve leaves the job cold, which needs no refusing.
+// But a default-branch tier's namespace is its repository's, and the older
+// node would attach the pool's pre-#226 keys instead, which other repositories'
+// jobs wrote: more to read than the tier allows. So every default-branch tier
+// needs a node that reads the block, as do a trusted pool told to publish
+// nothing, a Docker store or sticky disk turned off or held smaller, and an
+// Actions archive held below GitHub's limit.
 func (t Tier) NeedsCacheAwareNode() bool {
 	s := t.EffectiveCache()
 
-	return t.Trust.Effective() == WorkloadTrusted && s.Publish != CachePublishTrustedOnly ||
+	return s.Publish == CachePublishDefaultBranch ||
+		t.Trust.Effective() == WorkloadTrusted && s.Publish != CachePublishTrustedOnly ||
 		s.Docker != (CacheSetting{Enabled: true, MaxSize: DefaultDockerCacheSize}) ||
 		s.StickyDisks != (CacheSetting{Enabled: true, MaxSize: DefaultStickyDiskSize}) ||
 		s.Actions.MaxSize != ActionsArchiveLimit

@@ -77,6 +77,9 @@ type CacheService struct {
 	remoteAPI http.Handler
 	// git serves github.com fetches from mirrors on the node.
 	git *gitProxy
+	// casFill is casFullFraction, a field so a test is not decided by the fill
+	// of the disk it runs on.
+	casFill float64
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -103,6 +106,9 @@ type cacheSession struct {
 	// never by mu, because it is asked for inside handlers that take mu.
 	authorityMu      sync.Mutex
 	actionsAuthority *server.CacheAuthority
+	// unprovenUntil is when an unproven answer stops standing, under
+	// authorityMu, so a job that cannot be proved asks at most that often.
+	unprovenUntil time.Time
 	// hosts are the content-addressed cache volumes the node mounted for this
 	// session, and casAdmit bounds their concurrent transfers.
 	hosts    map[config.CacheKind]*hostVolume
@@ -113,6 +119,12 @@ type cacheSession struct {
 	pathID string
 	// gitAllowedAt is when the kill switch last allowed the git cache, under mu.
 	gitAllowedAt time.Time
+	// gitAdmit bounds the session's git requests and gitFetch its mirror
+	// fetches, one at a time; gitPending counts refreshes whose outcome is not
+	// yet noted, under mu.
+	gitAdmit   chan struct{}
+	gitFetch   chan struct{}
+	gitPending int
 	// building is what each build cache did so far, under mu; reported when the
 	// session ends.
 	building map[config.CacheKind]alloc.BuildCache
@@ -280,6 +292,7 @@ func NewCacheService(
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
+	service.casFill = casFullFraction
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -498,10 +511,25 @@ func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
 		}
 	}
 	outcome := func(kind config.CacheKind) alloc.BuildCache {
-		if noted := session.building[kind]; noted != "" {
+		noted := session.building[kind]
+		// A RECOVERED SESSION SAW ONLY PART OF THE JOB, so what it noted stands
+		// only when nothing the part it missed did could outrank it.
+		if session.recovered {
+			if noted == alloc.BuildCacheWarm {
+				return noted
+			}
+
+			return ""
+		}
+		if noted != "" {
 			return noted
 		}
-		if !session.recovered && sessionSetting(session, kind).Enabled {
+		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when
+		// it returns, after this report.
+		if kind == config.CacheGit && session.gitPending > 0 {
+			return ""
+		}
+		if sessionSetting(session, kind).Enabled {
 			return alloc.BuildCacheUnused
 		}
 
@@ -643,6 +671,8 @@ func (s *CacheService) PrepareScoped(
 			receipts: make(map[string]*actionsReceipt),
 			hosts:    make(map[config.CacheKind]*hostVolume),
 			casAdmit: make(chan struct{}, casConcurrency),
+			gitAdmit: make(chan struct{}, gitSessionWork),
+			gitFetch: make(chan struct{}, 1),
 			pathID:   sessionPathID(token),
 		}
 		credentials := CacheCredentials{Token: token}

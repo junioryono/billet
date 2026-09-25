@@ -79,10 +79,17 @@ billet cache disable --org acme                   # every cache (--kind all is t
 billet cache enable  --repository acme/api --kind git
 ```
 
-A block covers one cache or all of them, for an organisation or a repository. The node asks it before attaching a cache, again every 30 seconds while a content-addressed cache is in use, and again before a publication moves the pointer. A block an older binary wrote covers the Actions cache, which is all it ever meant.
+A block covers one cache or all of them, for an organisation or a repository, and so reaches the tiers whose caches belong to a repository: a repository target's, or one with `cache_scope`. The node asks it before attaching a cache, again every 30 seconds while a content-addressed cache is in use, and again before a deferred publication moves the pointer. A tier with no repository scope is nothing a block can name, so turn its caches off in its own `cache` block. A block an older binary wrote covers the Actions cache, which is all it ever meant.
 
 Each job's history records what every cache did: `warm` (it already held something the job used), `cold` (the job used it and it held nothing the job used), `disabled`, `unavailable` (the store failed and the job went on without it) or `unused`. A job whose outcome was not observed is counted as such, never as a miss.
 
 ## Older nodes
 
-A node too old to read a tier's cache block (wire below 23) applies the rule every tier had before: a trusted pool publishes, an untrusted one discards, and only the image store and sticky disks run. For every default that is the same or less, so such a node still runs those tiers, cold. A tier it would exceed (a trusted pool publishing `off` or `default-branch`, a Docker store or sticky disk turned off or held smaller, an Actions archive held below 10 GiB) is placed only on a node at 23 or later; during a rollout such a tier waits for the first upgraded node.
+A node too old to read a tier's cache block (wire below 23) applies the rule every tier had before: a trusted pool publishes, an untrusted one discards, only the image store and sticky disks run, and both use the pool's pre-#226 keys. Where that is the same or less than the tier allows, such a node still runs the tier: an unscoped tier's new caches simply build cold there. Where it would be more, the tier is placed only on a node at 23 or later:
+
+- **Every `default-branch` tier**, which is an untrusted tier with a repository by default. Its namespace is its repository's, and the older node would read the pool's wider keys instead.
+- **A trusted pool** publishing `off` or `default-branch`.
+- **A Docker store or sticky disk** turned off or held smaller.
+- **An Actions archive** held below 10 GiB.
+
+During a rollout such a tier waits for the first of its own hosts to upgrade, and `billet status` names it as waiting.

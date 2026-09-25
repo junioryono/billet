@@ -231,8 +231,8 @@ func TestInterceptReadsAsTheActionsCache(t *testing.T) {
 }
 
 // A TIER IS KEPT FROM AN OLDER NODE ONLY WHERE THAT NODE WOULD DO MORE THAN
-// THE TIER ALLOWS. Every default does less or the same on one, so none of them
-// needs a node that reads the cache block.
+// THE TIER ALLOWS, reads included: a default-branch tier's namespace is its
+// repository's, which an older node would replace with the pool's wider keys.
 func TestOnlyATierAnOlderNodeWouldExceedNeedsACacheAwareNode(t *testing.T) {
 	t.Parallel()
 
@@ -246,7 +246,9 @@ func TestOnlyATierAnOlderNodeWouldExceedNeedsACacheAwareNode(t *testing.T) {
 		tier Tier
 		want bool
 	}{
-		"an untrusted tier's defaults":     {firecracker(WorkloadUntrusted, nil), false},
+		"an untrusted tier's defaults": {firecracker(WorkloadUntrusted, nil), true},
+		"an unscoped untrusted tier": {Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux,
+			Trust: WorkloadUntrusted}, false},
 		"a trusted tier's defaults":        {firecracker(WorkloadTrusted, nil), false},
 		"an untrusted tier publishing off": {firecracker(WorkloadUntrusted, &TierCache{Publish: CachePublishOff}), false},
 		"a trusted tier publishing off":    {firecracker(WorkloadTrusted, &TierCache{Publish: CachePublishOff}), true},

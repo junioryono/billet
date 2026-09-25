@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -371,6 +372,9 @@ type handler struct {
 	trust       []byte
 	enrollments Enrollments
 	cachePolicy CachePolicy
+	// authorities remembers what GitHub's record said about a running job, so a
+	// job whose cache calls cannot be proved does not ask GitHub on every call.
+	authorities authorityMemory
 
 	// enrollSlots bounds concurrent enrollments. Non-nil only on a bootstrap
 	// handler; a nil channel means the route is not served at all.
@@ -2010,12 +2014,75 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 		answer(unproven)
 		return
 	}
-	authority, err := server.ResolveCacheAuthority(r.Context(), evidence, leaseID, binding, nil)
-	if err != nil {
-		h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
-			"lease", leaseID, "error", err)
-	}
+	authority := h.authorities.resolve(leaseID, binding, time.Now(), func() (server.CacheAuthority, bool) {
+		authority, err := server.ResolveCacheAuthority(r.Context(), evidence, leaseID, binding, nil)
+		if err != nil {
+			h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
+				"lease", leaseID, "error", err)
+		}
+
+		return authority, err == nil
+	})
 	answer(authority)
+}
+
+// How long an answer about a running job stands. A decided one describes a
+// run whose branch, event and workflow do not change; could-not-tell is kept
+// only briefly, so a GitHub blip does not hold a job read-only for long.
+const (
+	authorityDecidedFor   = 10 * time.Minute
+	authorityUndecidedFor = 30 * time.Second
+)
+
+// authorityMemory keeps one answer per lease and job, and lets one question
+// at a time reach GitHub for each, so a job's burst of cache calls costs one
+// pair of GitHub requests rather than one per call. The zero value is ready.
+type authorityMemory struct {
+	mu      sync.Mutex
+	entries map[string]*rememberedAuthority
+}
+
+type rememberedAuthority struct {
+	asking    sync.Mutex
+	authority server.CacheAuthority
+	until     time.Time
+}
+
+func (m *authorityMemory) resolve(
+	leaseID string, binding alloc.PoolRunner, now time.Time, ask func() (server.CacheAuthority, bool),
+) server.CacheAuthority {
+	key := leaseID + "\x00" + binding.JobID + "\x00" + strconv.FormatInt(binding.RunID, 10)
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = make(map[string]*rememberedAuthority)
+	}
+	for k, entry := range m.entries {
+		if entry.asking.TryLock() {
+			if !entry.until.IsZero() && now.After(entry.until.Add(authorityDecidedFor)) {
+				delete(m.entries, k)
+			}
+			entry.asking.Unlock()
+		}
+	}
+	entry := m.entries[key]
+	if entry == nil {
+		entry = &rememberedAuthority{}
+		m.entries[key] = entry
+	}
+	m.mu.Unlock()
+
+	entry.asking.Lock()
+	defer entry.asking.Unlock()
+	if now.Before(entry.until) {
+		return entry.authority
+	}
+	authority, decided := ask()
+	entry.authority, entry.until = authority, now.Add(authorityUndecidedFor)
+	if decided {
+		entry.until = now.Add(authorityDecidedFor)
+	}
+
+	return entry.authority
 }
 
 // nodeapiAuthority is WireCacheAuthority that never answers nil, for a

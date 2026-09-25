@@ -492,7 +492,7 @@ func (s *CacheService) sessionActionsAuthority(
 	if session.actionsAuthority != nil {
 		return *session.actionsAuthority, true
 	}
-	if s.authority == nil || session.leaseID == "" {
+	if s.authority == nil || session.leaseID == "" || s.now().Before(session.unprovenUntil) {
 		return server.CacheAuthority{}, false
 	}
 	askCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
@@ -507,12 +507,21 @@ func (s *CacheService) sessionActionsAuthority(
 	if !authority.Proven || authority.LeaseID != session.leaseID ||
 		!strings.EqualFold(authority.Owner, session.cache.Owner) ||
 		!strings.EqualFold(authority.Repository, session.cache.Repository) {
+		// AN UNPROVEN ANSWER STANDS A LITTLE WHILE: a job that cannot be proved
+		// (a fork, a pull request) makes many cache calls, and each ask costs the
+		// control plane GitHub requests.
+		session.unprovenUntil = s.now().Add(actionsUnprovenFor)
+
 		return server.CacheAuthority{}, false
 	}
 	session.actionsAuthority = &authority
 
 	return authority, true
 }
+
+// actionsUnprovenFor is how long an unproven authority stands before a job's
+// next cache call asks again.
+const actionsUnprovenFor = 30 * time.Second
 
 // actionsLimit is the largest archive a session's tier accepts.
 func actionsLimit(session *cacheSession) int64 {

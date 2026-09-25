@@ -65,6 +65,9 @@ type hostVolume struct {
 	// Merge is the clone of the newest generation a merge publication is
 	// filling, recorded before it is mounted so a crash cannot lose it.
 	Merge *storecontract.Volume `json:"merge,omitempty"`
+	// Fresh says the newest generation was full, so this job started empty and
+	// its volume replaces that generation rather than merging into it.
+	Fresh bool `json:"fresh,omitempty"`
 
 	// io is held for reading by every transfer and for writing by whatever
 	// unmounts the volume, so no transfer runs on a volume being taken away.
@@ -141,7 +144,49 @@ func (s *CacheService) casVolume(
 		return nil, err
 	}
 
+	// A FULL CACHE STARTS OVER. Merge publication only ever adds, so a
+	// generation past its fill line would refuse every write and every merge
+	// from then on; a job that finds one starts empty, and publishes an empty
+	// start with what it wrote in place of the full generation.
+	if full, err := s.casFull(s.casMountPath(session, kind)); err == nil && full && !cold {
+		if err := s.startFresh(ctx, session, hv, key, ceiling); err != nil {
+			return nil, err
+		}
+	}
+
 	return hv, nil
+}
+
+// startFresh replaces a mounted clone of a full generation with a new empty
+// volume, recorded before each step so a crash leaves nothing unaccounted for.
+func (s *CacheService) startFresh(
+	ctx context.Context, session *cacheSession, hv *hostVolume, key string, ceiling int64,
+) error {
+	path := s.casMountPath(session, hv.Kind)
+	if err := s.actionIO.Unmount(ctx, path); err != nil {
+		return fmt.Errorf("unmount the full %s cache: %w", hv.Kind, err)
+	}
+	hv.Mounted = false
+	if err := s.persistSession(session); err != nil {
+		return err
+	}
+	if err := s.store.Discard(ctx, hv.Volume); err != nil {
+		return fmt.Errorf("discard the full %s cache: %w", hv.Kind, err)
+	}
+	fresh, err := s.store.Create(ctx, key, ceiling)
+	if err != nil {
+		return err
+	}
+	hv.Volume, hv.Fresh = fresh, true
+	if err := s.persistSession(session); err != nil {
+		return errors.Join(err, s.store.Discard(ctx, fresh))
+	}
+	if err := s.actionIO.MountNew(ctx, fresh.Device, path); err != nil {
+		return fmt.Errorf("mount the fresh %s cache: %w", hv.Kind, err)
+	}
+	hv.Mounted = true
+
+	return s.persistSession(session)
 }
 
 var errCacheOff = errors.New("this cache is off for this job")
@@ -397,7 +442,7 @@ func validDigest(value string) bool {
 func (s *CacheService) storeCASObject(
 	ctx context.Context, body io.Reader, path, table, digest string, limit int64, root string,
 ) error {
-	if full, err := casFull(root); err != nil || full {
+	if full, err := s.casFull(root); err != nil || full {
 		return reapi.ErrFull
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -428,7 +473,7 @@ func (s *CacheService) storeCASObject(
 }
 
 // casFull reports whether a volume has passed the fraction it may fill.
-func casFull(root string) (bool, error) { return filledAbove(root, casFullFraction) }
+func (s *CacheService) casFull(root string) (bool, error) { return filledAbove(root, s.casFill) }
 
 // filledAbove reports whether root's filesystem is more than fraction full.
 func filledAbove(root string, fraction float64) (bool, error) {
@@ -622,7 +667,7 @@ func (s *CacheService) mergeCASVolume(
 	if currentErr != nil && !errors.Is(currentErr, storecontract.ErrMiss) {
 		return "", false, release(currentErr)
 	}
-	if current == hv.Volume.Generation {
+	if current == hv.Volume.Generation || hv.Fresh {
 		candidate, err := s.store.Snapshot(ctx, hv.Volume)
 		if err != nil {
 			return "", false, release(fmt.Errorf("snapshot: %w", err))

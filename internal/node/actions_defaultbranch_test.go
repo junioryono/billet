@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
@@ -87,6 +88,32 @@ func twirp(t *testing.T, path, body string) *http.Request {
 	return actionsRequestForTest(t, http.MethodPost, "https://"+actionsResultsHost+path, body)
 }
 
+// A JOB THAT CANNOT BE PROVED IS NOT ASKED ABOUT ON EVERY CALL: its answer
+// stands for actionsUnprovenFor, because each ask costs the control plane
+// GitHub requests and such a job (a fork's pull request) makes many calls.
+func TestAnUnprovenJobIsAskedAboutAtMostEveryInterval(t *testing.T) {
+	t.Parallel()
+
+	authority := &fakeAuthority{authority: server.CacheAuthority{LeaseID: scopedLease}}
+	service, session := defaultBranchActions(t, authority, &fakeCacheStore{})
+	now := time.Now()
+	service.now = func() time.Time { return now }
+
+	for range 5 {
+		if _, ok := service.sessionActionsAuthority(t.Context(), session); ok {
+			t.Fatal("an unproven job was given an authority")
+		}
+	}
+	if authority.asked != 1 {
+		t.Fatalf("asked %d times within the interval, want once", authority.asked)
+	}
+	now = now.Add(actionsUnprovenFor)
+	authority.authority = pullRequestAuthority()
+	if _, ok := service.sessionActionsAuthority(t.Context(), session); !ok || authority.asked != 2 {
+		t.Fatalf("after the interval: proven %v, asked %d, want a fresh ask proving it", ok, authority.asked)
+	}
+}
+
 // A PULL REQUEST SAVES UNDER ITS OWN MERGE REF AND NOWHERE ELSE, on an
 // untrusted pool, served locally because GitHub proved which ref it runs for.
 func TestAPullRequestSavesUnderItsOwnRef(t *testing.T) {
@@ -158,15 +185,21 @@ func TestAReadOnlyJobsSaveGoesToGitHub(t *testing.T) {
 	}
 }
 
-// AN UNPROVEN JOB GOES WHOLLY TO GITHUB, and is asked about again on its next
-// call, because its binding may simply not have arrived yet.
+// AN UNPROVEN JOB GOES WHOLLY TO GITHUB. An unproven answer stands for
+// actionsUnprovenFor (TestAnUnprovenJobIsAskedAboutAtMostEveryInterval); a plane
+// that could not be reached is asked again on the next call, because nothing
+// was decided.
 func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 	t.Parallel()
 
-	for name, authority := range map[string]*fakeAuthority{
-		"unproven":   {authority: server.CacheAuthority{LeaseID: scopedLease}},
-		"unreadable": {err: errors.New("the plane is unreachable")},
+	for name, tc := range map[string]struct {
+		authority *fakeAuthority
+		asks      int
+	}{
+		"unproven":   {&fakeAuthority{authority: server.CacheAuthority{LeaseID: scopedLease}}, 1},
+		"unreadable": {&fakeAuthority{err: errors.New("the plane is unreachable")}, 2},
 	} {
+		authority := tc.authority
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -183,9 +216,9 @@ func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 					t.Fatalf("lookup handled=%t err=%v, want it spliced", handled, err)
 				}
 			}
-			if authority.asked != 2 || len(storage.keys) != 0 {
-				t.Fatalf("asked %d times, keys %v; want two asks and no storage", authority.asked,
-					storage.keys)
+			if authority.asked != tc.asks || len(storage.keys) != 0 {
+				t.Fatalf("asked %d times, keys %v; want %d asks and no storage", authority.asked,
+					storage.keys, tc.asks)
 			}
 		})
 	}

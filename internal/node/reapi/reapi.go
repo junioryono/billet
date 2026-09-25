@@ -360,37 +360,110 @@ func (s *service) GetActionResult(
 	if err := proto.Unmarshal(body, result); err != nil {
 		return nil, status.Error(codes.NotFound, "not found")
 	}
-	referenced := []*repb.Digest{result.GetStdoutDigest(), result.GetStderrDigest()}
+	// EVERY BLOB IS CHECKED ONCE, and a Tree expanded once, within one budget
+	// for the whole result: a result naming one Tree a thousand times must not
+	// cost a thousand expansions of it.
+	check := resultCheck{ctx: ctx, v: v, seen: make(map[string]bool)}
+	for _, d := range []*repb.Digest{result.GetStdoutDigest(), result.GetStderrDigest()} {
+		check.blob(d)
+	}
 	for _, file := range result.GetOutputFiles() {
-		referenced = append(referenced, file.GetDigest())
+		check.blob(file.GetDigest())
 	}
 	for _, dir := range result.GetOutputDirectories() {
-		referenced = append(referenced, dir.GetTreeDigest())
 		// AND EVERY FILE THE TREE NAMES: a tree that is present says nothing
 		// about the outputs inside it.
-		files, err := treeFiles(v, dir.GetTreeDigest())
-		if err != nil {
-			return nil, status.Error(codes.NotFound, "not found")
-		}
-		referenced = append(referenced, files...)
+		check.tree(dir.GetTreeDigest())
 	}
-	for _, d := range referenced {
-		if d == nil {
-			continue
-		}
-		if checkDigest(d) != nil {
-			return nil, status.Error(codes.NotFound, "not found")
-		}
-		present, err := has(v, d)
-		if err != nil {
-			return nil, code(err)
-		}
-		if !present {
-			return nil, status.Error(codes.NotFound, "not found")
-		}
+	if check.err != nil {
+		return nil, check.err
 	}
 
 	return result, nil
+}
+
+const (
+	// resultTreeBudget bounds the Tree bytes one result's check reads, and
+	// resultBlobBudget the blobs it checks.
+	resultTreeBudget = treeLimit
+	resultBlobBudget = 1 << 20
+)
+
+// resultCheck is one GetActionResult's walk over what the result names. The
+// first failure stops it; a missing blob is NotFound.
+type resultCheck struct {
+	ctx       context.Context
+	v         Volume
+	seen      map[string]bool
+	treeBytes int64
+	err       error
+}
+
+func (c *resultCheck) fail(err error) { c.err = err }
+
+func (c *resultCheck) first(d *repb.Digest) bool {
+	if c.err != nil || d == nil {
+		return false
+	}
+	if err := c.ctx.Err(); err != nil {
+		c.fail(code(err))
+
+		return false
+	}
+	if checkDigest(d) != nil {
+		c.fail(status.Error(codes.NotFound, "not found"))
+
+		return false
+	}
+	key := d.GetHash() + "/" + strconv.FormatInt(d.GetSizeBytes(), 10)
+	if c.seen[key] {
+		return false
+	}
+	if len(c.seen) >= resultBlobBudget {
+		c.fail(status.Error(codes.NotFound, "the result names more blobs than are checked"))
+
+		return false
+	}
+	c.seen[key] = true
+
+	return true
+}
+
+func (c *resultCheck) blob(d *repb.Digest) {
+	if !c.first(d) {
+		return
+	}
+	present, err := has(c.v, d)
+	switch {
+	case err != nil:
+		c.fail(code(err))
+	case !present:
+		c.fail(status.Error(codes.NotFound, "not found"))
+	}
+}
+
+func (c *resultCheck) tree(d *repb.Digest) {
+	if d == nil || c.err != nil {
+		return
+	}
+	if d.GetSizeBytes() > resultTreeBudget-c.treeBytes {
+		c.fail(status.Error(codes.NotFound, "the result's trees are larger than are checked"))
+
+		return
+	}
+	if !c.first(d) {
+		return
+	}
+	c.treeBytes += d.GetSizeBytes()
+	files, err := treeFiles(c.v, d)
+	if err != nil {
+		c.fail(status.Error(codes.NotFound, "not found"))
+
+		return
+	}
+	for _, file := range files {
+		c.blob(file)
+	}
 }
 
 func (s *service) UpdateActionResult(
