@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -325,6 +326,7 @@ func TestACacheObservationIsFencedAndValidated(t *testing.T) {
 		"nothing observed":        {},
 		"unknown image token":     {ImageCache: "tepid"},
 		"unknown actions token":   {ActionsCache: "maybe"},
+		"unknown build token":     {BuildCaches: BuildCaches{Git: "lukewarm"}},
 		"generation without warm": {ImageCache: ImageCacheCold, CacheGeneration: "gen-7"},
 		"warm without generation": {ImageCache: ImageCacheWarm},
 	} {
@@ -356,6 +358,42 @@ func TestACacheObservationIsFencedAndValidated(t *testing.T) {
 	}
 }
 
+// WHAT THE CACHES DID IS COUNTED PER TIER from the history, with a job whose
+// cache was not observed counted as such rather than left out.
+func TestCacheOutcomesAreCountedPerTier(t *testing.T) {
+	t.Parallel()
+
+	a := pricedCloudAllocator(t, 340_000)
+	before := time.Now().Add(-time.Minute)
+	for _, git := range []BuildCache{BuildCacheWarm, BuildCacheWarm, ""} {
+		lease, err := a.Reserve(t.Context(), "cloud")
+		if err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+		launched(t, a, lease, "cloud-1")
+		if git != "" {
+			if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch,
+				CacheObservation{BuildCaches: BuildCaches{Git: git}}); err != nil {
+				t.Fatalf("RecordCacheObservation: %v", err)
+			}
+		}
+		if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+	}
+
+	counts, jobs, err := a.CacheOutcomes(t.Context(), before, 100)
+	if err != nil {
+		t.Fatalf("CacheOutcomes: %v", err)
+	}
+	if jobs != 3 || counts["cloud"]["git"][string(BuildCacheWarm)] != 2 || counts["cloud"]["git"][""] != 1 {
+		t.Fatalf("counted %d jobs: %v", jobs, counts)
+	}
+	if _, jobs, _ := a.CacheOutcomes(t.Context(), time.Now().Add(time.Minute), 100); jobs != 0 {
+		t.Fatalf("a window after every job counted %d", jobs)
+	}
+}
+
 // THE FIRST OBSERVATION IS KEPT, on both rows, and nothing later erases it: not
 // a different observation, not an archive from a caller that did not load the
 // columns, not the reaper.
@@ -371,7 +409,10 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 
 	launched(t, a, lease, "cloud-1")
 
-	first := CacheObservation{ImageCache: ImageCacheCold, ActionsCache: ActionsCacheDisabled}
+	builds := BuildCaches{Sticky: BuildCacheWarm, Git: BuildCacheCold, Bazel: BuildCacheUnused,
+		Go: BuildCacheDisabled}
+	first := CacheObservation{ImageCache: ImageCacheCold, ActionsCache: ActionsCacheDisabled,
+		BuildCaches: builds}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, first); err != nil {
 		t.Fatalf("RecordCacheObservation: %v", err)
 	}
@@ -381,6 +422,8 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 	// response must not be told its report was refused.
 	later := CacheObservation{
 		ImageCache: ImageCacheWarm, CacheGeneration: "gen-9", ActionsCache: ActionsCacheServed,
+		BuildCaches: BuildCaches{Sticky: BuildCacheCold, Git: BuildCacheWarm, Bazel: BuildCacheWarm,
+			Go: BuildCacheWarm},
 	}
 	if err := a.RecordCacheObservation(t.Context(), lease.ID, lease.Epoch, later); err != nil {
 		t.Fatalf("a second observation was refused: %v", err)
@@ -391,7 +434,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 		t.Fatalf("Lease: %v", err)
 	}
 	if live.ImageCache != ImageCacheCold || live.CacheGeneration != "" ||
-		live.ActionsCache != ActionsCacheDisabled {
+		live.ActionsCache != ActionsCacheDisabled || live.BuildCaches != builds {
 		t.Fatalf("the lease row moved to the later observation: %+v", live)
 	}
 
@@ -403,7 +446,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 		t.Fatalf("HistoryPlacement while open: %v", err)
 	}
 	if early.ImageCache != ImageCacheCold || early.CacheGeneration != "" ||
-		early.ActionsCache != ActionsCacheDisabled {
+		early.ActionsCache != ActionsCacheDisabled || early.BuildCaches != builds {
 		t.Fatalf("the history row moved to the later observation: %+v", early)
 	}
 
@@ -424,7 +467,7 @@ func TestTheFirstCacheObservationSurvivesEverythingAfterIt(t *testing.T) {
 		t.Fatalf("HistoryPlacement: %v", err)
 	}
 	if got.ImageCache != ImageCacheCold || got.CacheGeneration != "" ||
-		got.ActionsCache != ActionsCacheDisabled {
+		got.ActionsCache != ActionsCacheDisabled || got.BuildCaches != builds {
 		t.Fatalf("history after the reap = %+v, want the first observation kept", got)
 	}
 }

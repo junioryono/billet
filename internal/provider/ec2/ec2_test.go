@@ -1266,6 +1266,19 @@ func TestAValueNoShellCanCarryIsRefusedRatherThanTruncated(t *testing.T) {
 	}
 }
 
+// GUEST BUILD CACHES ARE A FIRECRACKER GUEST'S, and an EC2 instance asked for
+// them is refused rather than launched to build cold.
+func TestGuestBuildCachesAreRefused(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := validSpec()
+	spec.GuestCaches = []provider.GuestCache{provider.GuestCacheGo}
+	if _, err := p.userData(spec); err == nil {
+		t.Fatal("an EC2 boot script was written for a guest asking for build caches")
+	}
+}
+
 // The command reaches the guest as the argument vector billet was given, so an
 // image needing arguments does not have to smuggle them through a shell.
 func TestACommandWithAwkwardArgumentsSurvivesTheBootScript(t *testing.T) {

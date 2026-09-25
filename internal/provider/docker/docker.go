@@ -126,6 +126,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	if err := p.Accepts(spec.Trust); err != nil {
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
+	if len(spec.GuestCaches) > 0 {
+		return nil, fmt.Errorf("docker: %s asks for guest build caches, which only "+
+			"firecracker guests configure", spec.Name)
+	}
 
 	// REFUSED, not defaulted. Every stock runner image's default command is a
 	// shell, so a spec with no command produces a container that starts, exits at

@@ -44,8 +44,10 @@ type fakeCompute struct {
 	launchJobs []server.Job
 	destroyed  []int64
 	results    []string
-	recovered  int
-	swept      int
+	// authorities are the cache authorities every completion carried.
+	authorities []server.CacheAuthority
+	recovered   int
+	swept       int
 
 	// order records the sequence of calls, which is what proves Recover ran
 	// before any work was taken.
@@ -242,9 +244,12 @@ func (f *fakeCompute) Destroy(ctx context.Context, requestID int64) error {
 	return f.destroyErr
 }
 
-func (f *fakeCompute) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+func (f *fakeCompute) DestroyCompleted(ctx context.Context, requestID int64, result string,
+	authority server.CacheAuthority,
+) error {
 	f.mu.Lock()
 	f.results = append(f.results, result)
+	f.authorities = append(f.authorities, authority)
 	f.mu.Unlock()
 
 	return f.Destroy(ctx, requestID)
@@ -520,6 +525,41 @@ func TestACompletedDestroyCarriesGitHubsResultToTheCompute(t *testing.T) {
 	defer compute.mu.Unlock()
 	if len(compute.results) != 1 || compute.results[0] != "succeeded" {
 		t.Fatalf("completed destroy results = %v, want [succeeded]", compute.results)
+	}
+}
+
+// AND THE CACHE AUTHORITY, field for field, so what the control plane decided is
+// what the node publishes on; a destroy that carried none reaches the compute as
+// the zero authority, which publishes nothing.
+func TestACompletedDestroyCarriesItsCacheAuthorityToTheCompute(t *testing.T) {
+	t.Parallel()
+
+	wire := &nodeapi.CacheAuthority{LeaseID: "l1", JobID: "job-42", RunID: 9, Owner: "acme",
+		Repository: "api", Event: "push", Ref: "refs/heads/main", BaseRef: "refs/heads/dev",
+		DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true, PublishDefault: true}
+	want := server.CacheAuthority{LeaseID: "l1", JobID: "job-42", RunID: 9, Owner: "acme",
+		Repository: "api", Event: "push", Ref: "refs/heads/main", BaseRef: "refs/heads/dev",
+		DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true, PublishDefault: true}
+
+	for _, carried := range []*nodeapi.CacheAuthority{wire, nil} {
+		compute := &fakeCompute{}
+		result := nodeclient.ExecuteForTest(t.Context(), compute, nodeapi.Command{
+			ID: "destroy", Kind: nodeapi.CommandDestroy, RequestID: 42, JobResult: "succeeded",
+			CacheAuthority: carried,
+		})
+		if !result.OK {
+			t.Fatalf("completed destroy = %+v", result)
+		}
+		compute.mu.Lock()
+		got := compute.authorities
+		compute.mu.Unlock()
+		expected := want
+		if carried == nil {
+			expected = server.CacheAuthority{}
+		}
+		if len(got) != 1 || got[0] != expected {
+			t.Errorf("carrying %+v, the compute was handed %+v, want %+v", carried, got, expected)
+		}
 	}
 }
 

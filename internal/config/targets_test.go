@@ -259,7 +259,6 @@ func TestARepositoryTargetIsUntrustedOnly(t *testing.T) {
 			"    workflows: [acme/widgets/.github/workflows/ci.yml@refs/heads/main]\n",
 		"a runner group": "    runner_group: billet\n",
 		"workflows":      "    workflows: [acme/widgets/.github/workflows/ci.yml@refs/heads/main]\n",
-		"interception":   "    intercept: true\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			body := strings.Replace(repositoryConfig(t), tier, tier+extra, 1)
@@ -276,8 +275,17 @@ func TestARepositoryTargetIsUntrustedOnly(t *testing.T) {
 	}
 
 	untrusted := strings.Replace(repositoryConfig(t), tier, tier+"    trust: untrusted\n", 1)
-	if _, err := Load(writeConfig(t, untrusted)); err != nil {
+	cfg, err := Load(writeConfig(t, untrusted))
+	if err != nil {
 		t.Fatalf("Load refused an untrusted tier under a repository target: %v", err)
+	}
+	// THE TARGET IS THE TIER'S REPOSITORY, so by default it publishes from that
+	// repository's default branch, and the target asks for run evidence.
+	spec := cfg.Tiers[0].EffectiveCache()
+	if spec.Publish != CachePublishDefaultBranch || spec.Owner == "" || spec.Repository == "" ||
+		!cfg.NeedsRunEvidence() {
+		t.Fatalf("an untrusted tier under a repository target = %+v, run evidence %v", spec,
+			cfg.NeedsRunEvidence())
 	}
 }
 

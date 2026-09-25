@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -65,5 +66,79 @@ func TestACacheObservationIsNotSentToAPlaneTooOldForIt(t *testing.T) {
 
 	if n := plane.others.Load(); n != 0 {
 		t.Fatalf("the node sent %d request(s) to a plane that cannot answer them", n)
+	}
+}
+
+// observationPlane registers at a chosen version and records every observation
+// body it is sent.
+type observationPlane struct {
+	version int
+	bodies  chan map[string]any
+}
+
+func (p *observationPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/register" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(nodeapi.RegisterResponse{
+			Version: p.version, LeaseTTLSeconds: 60, PollSeconds: 30,
+		})
+
+		return
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	p.bodies <- body
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte("{}"))
+}
+
+// THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM. An older plane decodes
+// strictly, so a body carrying them would lose the image and Actions halves
+// too; one carrying nothing else is not sent at all.
+func TestBuildCacheOutcomesAreNotSentToAPlaneTooOldForThem(t *testing.T) {
+	t.Parallel()
+
+	builds := alloc.BuildCaches{Git: alloc.BuildCacheWarm}
+	for version, want := range map[int][]string{
+		nodeapi.VersionCacheAuthority - 1: {"image_cache"},
+		nodeapi.VersionCacheAuthority:     {"image_cache", "git_cache"},
+	} {
+		plane := &observationPlane{version: version, bodies: make(chan map[string]any, 4)}
+		srv := httptest.NewServer(plane)
+		t.Cleanup(srv.Close)
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		if err := c.Register(t.Context(), testRegistration()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.RecordCacheObservation(t.Context(), "l1", 1,
+			alloc.CacheObservation{ImageCache: alloc.ImageCacheCold, BuildCaches: builds}); err != nil {
+			t.Fatalf("v%d: RecordCacheObservation: %v", version, err)
+		}
+		body := <-plane.bodies
+		for _, field := range []string{"image_cache", "git_cache"} {
+			if _, sent := body[field]; sent != slices.Contains(want, field) {
+				t.Errorf("v%d: %s sent = %v, want %v (%v)", version, field, sent, !sent, body)
+			}
+		}
+
+		if err := c.RecordCacheObservation(t.Context(), "l1", 1,
+			alloc.CacheObservation{BuildCaches: builds}); err != nil {
+			t.Fatalf("v%d: RecordCacheObservation: %v", version, err)
+		}
+		select {
+		case body := <-plane.bodies:
+			if version < nodeapi.VersionCacheAuthority {
+				t.Errorf("v%d: an observation with nothing an older plane records was sent: %v",
+					version, body)
+			}
+		default:
+			if version >= nodeapi.VersionCacheAuthority {
+				t.Errorf("v%d: a build-cache observation was not sent", version)
+			}
+		}
 	}
 }

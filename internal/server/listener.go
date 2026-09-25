@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -65,8 +66,12 @@ type RunnerRegistry interface {
 // CompletionAwareRunner receives GitHub's authoritative completed-job result.
 // It is optional so runners that have no result-dependent teardown keep the
 // smaller Runner contract.
+//
+// The authority is what the completed job's caches may publish; its zero value
+// authorises nothing.
 type CompletionAwareRunner interface {
-	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+	DestroyCompleted(ctx context.Context, requestID int64, result string,
+		authority CacheAuthority) error
 }
 
 // BoundCompletionAwareRunner reconciles teardown with the node and lease that
@@ -78,6 +83,7 @@ type BoundCompletionAwareRunner interface {
 		result, leaseID, nodeName string,
 		leaseEpoch int64,
 		outcome alloc.Phase,
+		authority CacheAuthority,
 	) error
 }
 
@@ -398,6 +404,10 @@ type Listener struct {
 	// Never nil; see noRunner.
 	runner   Runner
 	registry RunnerRegistry
+	// cacheSpec and runEvidence decide what a completed job's caches may
+	// publish. See WithCachePublication.
+	cacheSpec   config.CacheSpec
+	runEvidence RunEvidence
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
 	completionStore completionStore
@@ -491,6 +501,17 @@ func WithRunner(r Runner) Option {
 }
 
 // WithRunnerRegistry installs the GitHub side of safe runner retirement.
+// WithCachePublication gives the listener its tier's effective cache
+// configuration and the target's run evidence, which a completion's cache
+// authority is decided from. Without it, or without evidence, every completion
+// carries the zero authority and publishes nothing beyond the legacy rules.
+func WithCachePublication(spec config.CacheSpec, evidence RunEvidence) Option {
+	return func(l *Listener) {
+		l.cacheSpec = spec
+		l.runEvidence = evidence
+	}
+}
+
 func WithRunnerRegistry(registry RunnerRegistry) Option {
 	return func(l *Listener) { l.registry = registry }
 }
@@ -3176,8 +3197,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 			return err
 		}
+		// The identity is the message's own, which is the evidence a cache
+		// authority will be decided from; what each field holds per event is
+		// measured on the fleet from this line (#226).
 		l.log.Info("a pooled runner started a job", "tier", l.tier,
-			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
+			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID,
+			"run", msg.Started[i].RunID, "event", msg.Started[i].Event,
+			"owner", msg.Started[i].Owner, "repository", msg.Started[i].Repository,
+			"workflow_ref", msg.Started[i].WorkflowRef)
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
@@ -3828,7 +3855,9 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	}
 
 	if _, err := l.alloc.StartPoolRunner(ctx, leaseID, l.tier, job.RunnerID,
-		job.RunnerName, identified.RequestID, identified.RunID, identified.JobID); err != nil {
+		job.RunnerName, identified.RequestID, identified.RunID, identified.JobID,
+		alloc.JobIdentity{Owner: job.Owner, Repository: job.Repository,
+			WorkflowRef: job.WorkflowRef, Event: job.Event}); err != nil {
 		if errors.Is(err, alloc.ErrConflict) || errors.Is(err, alloc.ErrLeaseNotFound) {
 			return Job{}, fmt.Errorf("%w: cannot bind started runner %q: %w",
 				errQuarantinableStarted, job.RunnerName, err)
@@ -4669,6 +4698,7 @@ func (l *Listener) recordCompletion(
 		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 		MessageID: job.CompletionID,
 	}
+	withCompletionIdentity(&completion, job)
 	if lease != nil {
 		completion.LeaseID = lease.ID
 		completion.LeaseEpoch = lease.Epoch
@@ -4773,6 +4803,17 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 // lease release is attempted. It deliberately outlives cancellation for one
 // bounded local-write budget: otherwise shutdown would preserve a row that asks
 // restart recovery to contact a node for compute already proved absent.
+// withCompletionIdentity keeps what the completion itself said about its job on
+// the durable row, so a completion restored after a restart is still evidence
+// of its own rather than a copy of the binding it is compared with.
+func withCompletionIdentity(completion *state.PendingCompletion, job Job) {
+	completion.JobID = job.JobID
+	completion.JobOwner = job.Owner
+	completion.JobRepository = job.Repository
+	completion.JobWorkflowRef = job.WorkflowRef
+	completion.JobEvent = job.Event
+}
+
 func (l *Listener) recordReleaseOnly(
 	ctx context.Context,
 	job Job,
@@ -4792,6 +4833,7 @@ func (l *Listener) recordReleaseOnly(
 		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: lease.Node,
 		Outcome: string(outcome), ReleaseOnly: true, MessageID: job.CompletionID,
 	}
+	withCompletionIdentity(&completion, job)
 	disposition, err := l.completionStore.PutPendingCompletion(persistCtx, completion)
 	if err != nil {
 		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
@@ -5017,7 +5059,9 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 	for i := range completions {
 		completion := &completions[i]
 		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result,
-			CompletionID: completion.MessageID}
+			CompletionID: completion.MessageID, JobID: completion.JobID,
+			Owner: completion.JobOwner, Repository: completion.JobRepository,
+			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}
 		if completion.Retired {
 			continue
 		}
@@ -5500,13 +5544,17 @@ func (l *Listener) destroyCompleted(
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}
+	var authority CacheAuthority
+	if job.Result != "" && lease != nil {
+		authority = l.completionCacheAuthority(ctx, job, lease.ID)
+	}
 	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
 		lease != nil && lease.ID != "" && lease.Node != "" {
 		return runner.DestroyCompletedBound(
-			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome)
+			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome, authority)
 	}
 	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
-		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
+		return runner.DestroyCompleted(ctx, job.RequestID, job.Result, authority)
 	}
 
 	return l.runner.Destroy(ctx, job.RequestID)

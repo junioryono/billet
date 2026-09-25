@@ -22,7 +22,7 @@ func TestPoolRunnerBindsTheActualJobWithoutChangingItsComputeLease(t *testing.T)
 	}
 
 	started, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 77, runner.RunnerName,
-		22, 202, "actual-job")
+		22, 202, "actual-job", JobIdentity{})
 	if err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestPoolRunnerBindsTheActualJobWithoutChangingItsComputeLease(t *testing.T)
 	}
 
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 77, runner.RunnerName,
-		33, 303, "different-job"); !errors.Is(err, ErrConflict) {
+		33, 303, "different-job", JobIdentity{}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a busy runner accepted a second job: %v", err)
 	}
 }
@@ -60,7 +60,7 @@ func TestOnlyIdlePoolMembersAreScaleDownCandidates(t *testing.T) {
 		}
 		if request == 11 {
 			if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-				request, 111, "busy-job"); err != nil {
+				request, 111, "busy-job", JobIdentity{}); err != nil {
 				t.Fatalf("StartPoolRunner: %v", err)
 			}
 		}
@@ -90,7 +90,7 @@ func TestRecoveredBusyPoolRunnerYieldsToAuthoritativeJobStarted(t *testing.T) {
 		t.Fatalf("PreserveRecoveredBusyPoolRunner: %v", err)
 	}
 	started, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-		22, 202, "actual-job")
+		22, 202, "actual-job", JobIdentity{})
 	if err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestRecoveredRetirementFencesALateLegacyJobStarted(t *testing.T) {
 		t.Fatalf("late legacy registration: %v", err)
 	}
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-		22, 202, "late-job"); !errors.Is(err, ErrConflict) {
+		22, 202, "late-job", JobIdentity{}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("late JobStarted crossed recovery fence: %v", err)
 	}
 	got, err := a.PoolRunnerByLease(t.Context(), lease.ID)
@@ -181,7 +181,7 @@ func TestSettledPoolIdentitySurvivesUntilSourceAcknowledgement(t *testing.T) {
 		t.Fatalf("RegisterPoolRunner: %v", err)
 	}
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-		22, 202, "actual-job"); err != nil {
+		22, 202, "actual-job", JobIdentity{}); err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
 	if err := a.SettlePoolRunner(t.Context(), "linux", 11); err != nil {
@@ -227,7 +227,7 @@ func TestRetiringAnAlreadyRetiredPoolMemberMovesNothingBackwards(t *testing.T) {
 	}
 
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-		22, 202, "actual-job"); err != nil {
+		22, 202, "actual-job", JobIdentity{}); err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
 
@@ -275,7 +275,7 @@ func TestAnAcknowledgementBeforeSettlementRemovesTheIdentity(t *testing.T) {
 	}
 
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
-		22, 202, "actual-job"); err != nil {
+		22, 202, "actual-job", JobIdentity{}); err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
 

@@ -37,7 +37,7 @@ The first GitHub **target**: the owner whose runners this deployment serves, and
 | `private_key_path` | yes | the key GitHub issued once |
 | `max_vcpu`, `max_memory` | no | this target's share: the most its tiers may hold at once between them, inside `server.max_vcpu`/`max_memory`; see [A target's share](#a-targets-share) |
 
-A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group`, `workflows` and `intercept` are refused on a tier under one. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
+A repository target is **untrusted-only**: a repository has no runner groups, so nothing on GitHub's side can restrict a pool there, and `trust: trusted`, `runner_group` and `workflows` are refused on a tier under one. Its repository becomes the cache scope of each of its tiers, which therefore publish from its default branch by default. Its App holds `administration: write` on that repository, the only permission GitHub offers for registering a repository's runners ([ADR-011](decisions/adr-011-targets-and-repository-scope.md)).
 
 ## `targets`
 
@@ -115,9 +115,28 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
 | `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
-| `intercept`, `cache_scope` | transparent Actions caching, Linux Firecracker only, with a static scope inside the tier's target (its owner, and for a repository target that repository); refused under a repository target |
+| `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
+| `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
+| `intercept` | the deprecated spelling of `cache.actions.enabled`; refused beside `cache.actions` |
 | `max_concurrent`, `reserved` | a ceiling and a floor; a macOS tier's ceiling defaults to what its hosts permit between them |
 | `warm_pool` | refused when non-zero; no backend implements it |
+
+### `tiers[].cache`
+
+Everything here is optional; [Build caches](../operating/build-caches.md) explains each cache. A cache on by default that the tier cannot have (the Actions, Git, Bazel and Go caches need a Linux Firecracker tier) is off; one a tier turns on explicitly is refused where it cannot run.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `publish` | `default-branch` for an untrusted tier with a repository scope, otherwise `trusted-only` | `trusted-only`: a trusted pool publishes what it writes and an untrusted one nothing. `default-branch`: only a job GitHub proves ran on the default branch under a writing event publishes; needs a repository scope and the App's `actions: read`. `off`: nothing publishes |
+| `docker.enabled`, `docker.max_size` | `true`, `100GiB` | the guest's Docker image store and its ceiling |
+| `sticky_disks.enabled`, `sticky_disks.max_size` | `true`, `100GiB` | `actions/stickydisk` volumes; a larger request is clamped |
+| `actions.enabled`, `actions.max_archive` | on where the scope already holds, `10GiB` | the transparent Actions cache; an untrusted tier needs `default-branch`, a trusted `trusted-only` one a `cache_scope.workflow_ref` in its `workflows` |
+| `git.enabled`, `git.max_size` | `true` on Linux Firecracker, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
+| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker, `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
+| `go.enabled`, `go.max_size` | `true` on Linux Firecracker, `20GiB` | the Go build cache through `GOCACHEPROG` |
+| `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
+
+A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.
 
 ## `nodes`
 

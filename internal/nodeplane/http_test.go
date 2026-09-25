@@ -267,13 +267,13 @@ type fakeStore struct {
 	retired      []string
 }
 
-type cachePolicyFunc func(context.Context, string, string) (bool, error)
+type cachePolicyFunc func(ctx context.Context, kind, owner, repository string) (bool, error)
 
-func (f cachePolicyFunc) ActionsCacheAllowed(
+func (f cachePolicyFunc) CacheAllowed(
 	ctx context.Context,
-	owner, repository string,
+	kind, owner, repository string,
 ) (bool, error) {
-	return f(ctx, owner, repository)
+	return f(ctx, kind, owner, repository)
 }
 
 func (f *fakeStore) Bind(_ context.Context, leaseID string, _ int64, node string) error {
@@ -593,9 +593,9 @@ func TestTheActionsCacheKillSwitchCrossesTheAuthenticatedNodeWire(t *testing.T) 
 		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
 		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
 	}}))
-	var gotOwner, gotRepository string
-	policy := cachePolicyFunc(func(_ context.Context, owner, repository string) (bool, error) {
-		gotOwner, gotRepository = owner, repository
+	var gotKind, gotOwner, gotRepository string
+	policy := cachePolicyFunc(func(_ context.Context, kind, owner, repository string) (bool, error) {
+		gotKind, gotOwner, gotRepository = kind, owner, repository
 		return false, nil
 	})
 	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil,
@@ -610,8 +610,16 @@ func TestTheActionsCacheKillSwitchCrossesTheAuthenticatedNodeWire(t *testing.T) 
 	if allowed {
 		t.Fatal("a centrally blocked repository was allowed")
 	}
-	if gotOwner != "Acme" || gotRepository != "API" {
-		t.Fatalf("policy scope = %q/%q, want Acme/API", gotOwner, gotRepository)
+	if gotKind != "actions" || gotOwner != "Acme" || gotRepository != "API" {
+		t.Fatalf("policy scope = %q %q/%q, want actions Acme/API", gotKind, gotOwner, gotRepository)
+	}
+
+	// ANOTHER CACHE IS ASKED ABOUT BY NAME, once both ends speak kinds.
+	if _, err := c.CacheAllowed(t.Context(), config.CacheDocker, "Acme", "API"); err != nil {
+		t.Fatalf("CacheAllowed: %v", err)
+	}
+	if gotKind != "docker" {
+		t.Fatalf("policy kind = %q, want docker", gotKind)
 	}
 }
 
@@ -1956,7 +1964,7 @@ func TestRegistrationIntentInvalidatesAbsenceBeforeTheOwnershipRead(t *testing.T
 	<-entered
 
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone,
+		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone, server.CacheAuthority{},
 	); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Fatalf("completion during ownership read = %v, want only holder unavailable", err)
 	}

@@ -83,6 +83,10 @@ func (f *fakeActionsVolumeManager) MountNew(_ context.Context, _, target string)
 	return os.MkdirAll(target, 0o700)
 }
 
+func (f *fakeActionsVolumeManager) MountWritable(_ context.Context, _, target string) error {
+	return os.MkdirAll(target, 0o700)
+}
+
 func (f *fakeActionsVolumeManager) MountReadOnly(_ context.Context, _, target string) error {
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		return err

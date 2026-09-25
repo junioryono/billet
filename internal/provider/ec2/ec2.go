@@ -1299,6 +1299,10 @@ func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, 
 	if cacheFields != 0 && cacheFields != 2 {
 		return "", fmt.Errorf("ec2: the cache endpoint and per-guest token for %s must be supplied together", spec.Name)
 	}
+	if len(spec.GuestCaches) > 0 {
+		return "", fmt.Errorf("ec2: %s asks for guest build caches, which only firecracker "+
+			"guests configure", spec.Name)
+	}
 	// A PLAIN SINGLE-QUOTED ASSIGNMENT, which is the one construct with no
 	// parsing left in it. Inside single quotes a POSIX shell expands nothing at
 	// all, and the only character that needs handling is the quote itself.

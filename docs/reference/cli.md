@@ -98,6 +98,7 @@ Create the GitHub App in a browser, install it on the organization or the reposi
 | `--key-path` | where to write the key (default: beside the config, `app-private-key.pem` for the default target and `app-private-key-<name>.pem` otherwise) |
 | `--name` | a suggested App name |
 | `--no-browser` | print URLs instead of opening a browser |
+| `--actions-read` | request `actions: read` (default `true`), which default-branch cache publication needs to prove a job's branch from GitHub's record of its run; `--actions-read=false` leaves it out |
 | `--port` | a fixed loopback callback port, for `ssh -L` |
 
 ### `billet github-app store-key --from <path> [--target NAME]`
@@ -199,7 +200,8 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet cache enable\|disable --org <org>` or `--repository <owner/repo>` | the central kill switch for transparent Actions caching |
+| `billet cache enable\|disable --org <org>` or `--repository <owner/repo>` `[--kind docker\|sticky\|actions\|git\|bazel\|go\|all]` | the central kill switch; `--kind` defaults to `all`, and enabling one kind leaves a block on every cache standing |
+| `billet cache status [--since 24h]` | every tier's effective caches, every kill-switch block, and what each cache did per tier for the jobs assigned since `--since` |
 | `billet cache conformance install --repository <owner/repo> --runner-label <label> [--billet-ref] [--billet-repository] [--expected-runner-version] [--expected-guest-contract] [--workflow-ref] [--output] [--force]` | write the consumer-owned conformance workflow, pinning the resolved billet commit, runner version, guest contract and one label |
 
 ## Upgrades

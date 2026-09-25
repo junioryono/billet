@@ -1039,6 +1039,27 @@ func (c *Client) RenewActive(
 }
 
 // Discard unmaps and removes a writable cache clone.
+// SizeOf reports a cache clone's provisioned size, as rbd describes it.
+func (c *Client) SizeOf(ctx context.Context, volume storecontract.Volume) (int64, error) {
+	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
+	if name == volume.Handle || !strings.HasPrefix(name, "cache-v-") {
+		return 0, errors.New("ceph: refusing to inspect a cache volume outside the configured pool")
+	}
+
+	out, err := c.rbdCmd(ctx, true, "info", volume.Handle)
+	if err != nil {
+		return 0, fmt.Errorf("ceph: inspect cache clone %s: %w", volume.Handle, err)
+	}
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil || info.Size <= 0 {
+		return 0, fmt.Errorf("ceph: %s did not describe %s with a positive size", c.bin, volume.Handle)
+	}
+
+	return info.Size, nil
+}
+
 func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error {
 	if volume.Handle == "" {
 		return nil

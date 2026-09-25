@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -50,18 +51,21 @@ func validateSessionLease(instance, leaseID string, epoch int64) error {
 
 type durableCacheSession struct {
 	Token       string                                `json:"token"`
+	PathID      string                                `json:"path_id,omitempty"`
 	Instance    string                                `json:"instance"`
 	Trust       provider.TrustClass                   `json:"trust"`
 	Owner       string                                `json:"owner,omitempty"`
 	Repository  string                                `json:"repository,omitempty"`
 	WorkflowRef string                                `json:"workflow_ref,omitempty"`
 	Intercept   bool                                  `json:"intercept,omitempty"`
+	Cache       *config.CacheSpec                     `json:"cache,omitempty"`
 	LeaseID     string                                `json:"lease_id,omitempty"`
 	Epoch       int64                                 `json:"epoch,omitempty"`
 	Observed    cacheObserved                         `json:"observed"`
 	Closed      bool                                  `json:"closed"`
 	Slots       [provider.MaxVolumes]*cacheAttachment `json:"slots"`
 	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
+	Hosts       map[config.CacheKind]*hostVolume      `json:"hosts,omitempty"`
 	Receipts    map[string]*actionsReceipt            `json:"actions_receipts,omitempty"`
 }
 
@@ -100,13 +104,24 @@ func (s *CacheService) loadSessions() error {
 		session := &cacheSession{
 			token: record.Token, instance: record.Instance, trust: record.Trust,
 			owner: record.Owner, repository: record.Repository, workflowRef: record.WorkflowRef,
-			intercept: record.Intercept,
-			leaseID:   record.LeaseID, epoch: record.Epoch,
+			intercept: record.Intercept, cache: record.Cache,
+			leaseID: record.LeaseID, epoch: record.Epoch,
 			observed:  record.Observed,
 			recovered: true,
 			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 			actions:  record.Actions,
 			receipts: record.Receipts,
+			hosts:    record.Hosts,
+			casAdmit: make(chan struct{}, casConcurrency),
+			gitAdmit: make(chan struct{}, gitSessionWork),
+			gitFetch: make(chan struct{}, 1),
+			pathID:   record.PathID,
+		}
+		if session.pathID == "" {
+			session.pathID = record.Token
+		}
+		if session.hosts == nil {
+			session.hosts = make(map[config.CacheKind]*hostVolume)
 		}
 		session.closing.Store(record.Closed)
 		if session.actions == nil {
@@ -136,7 +151,10 @@ func (r durableCacheSession) valid(filename string) error {
 	if err := validateSessionLease(r.Instance, r.LeaseID, r.Epoch); err != nil {
 		return fmt.Errorf("node: cache custody file %s: %w", filename, err)
 	}
-	if r.Intercept {
+	if err := validateSessionCache(r.Cache); err != nil {
+		return fmt.Errorf("node: cache custody file %s: %w", filename, err)
+	}
+	if r.Intercept && !defaultBranchScope(r.Cache) {
 		if err := validateActionsScope(CacheSessionScope{
 			Trust: r.Trust, Intercept: true, Owner: r.Owner, Repository: r.Repository,
 			WorkflowRef: r.WorkflowRef,
@@ -173,13 +191,13 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 	}
 
 	record := durableCacheSession{
-		Token: session.token, Instance: session.instance, Trust: session.trust,
+		Token: session.token, PathID: session.pathID, Instance: session.instance, Trust: session.trust,
 		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,
-		Intercept: session.intercept,
-		LeaseID:   session.leaseID, Epoch: session.epoch,
+		Intercept: session.intercept, Cache: session.cache,
+		LeaseID: session.leaseID, Epoch: session.epoch,
 		Observed: session.observed,
 		Closed:   session.closed, Slots: session.slots, Actions: session.actions,
-		Receipts: session.receipts,
+		Receipts: session.receipts, Hosts: session.hosts,
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {

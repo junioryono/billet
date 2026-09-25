@@ -53,7 +53,7 @@ func jsString(s string) string {
 	return string(b)
 }
 
-func runHook(t *testing.T, node, index string, request map[string]any, shim string) (int, []byte) {
+func runHook(t *testing.T, node, index string, request map[string]any, env ...string) (int, []byte) {
 	t.Helper()
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -61,7 +61,7 @@ func runHook(t *testing.T, node, index string, request map[string]any, shim stri
 	}
 	cmd := exec.CommandContext(t.Context(), node, index)
 	cmd.Stdin = strings.NewReader(string(body))
-	cmd.Env = append(os.Environ(), "BILLET_TEST_SHIM="+shim)
+	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	var exit *exec.ExitError
@@ -100,7 +100,7 @@ func TestTheContainerHookMountsTheShimIntoTheJobContainer(t *testing.T) {
 			"services": []any{},
 		},
 	}
-	code, out := runHook(t, node, index, request, shim)
+	code, out := runHook(t, node, index, request, "BILLET_CONTAINER_SHIM=1")
 	if code != 0 {
 		t.Fatalf("hook exited %d\n%s", code, out)
 	}
@@ -164,7 +164,7 @@ func TestTheContainerHookLeavesOtherRequestsAlone(t *testing.T) {
 				}
 			}
 			patchShimPath(t, index, shim)
-			if code, out := runHook(t, node, index, tc.request, shim); code != 0 {
+			if code, out := runHook(t, node, index, tc.request, "BILLET_CONTAINER_SHIM=1"); code != 0 {
 				t.Fatalf("hook exited %d\n%s", code, out)
 			}
 			forwarded := readForwarded(t, record)
@@ -189,24 +189,116 @@ func TestTheContainerHookPropagatesTheReferenceHooksExitStatus(t *testing.T) {
 	node := nodeOrSkip(t)
 	index, _ := hookHarness(t, "3")
 	patchShimPath(t, index, filepath.Join(t.TempDir(), "absent"))
-	if code, _ := runHook(t, node, index, map[string]any{"command": "cleanup_job", "args": map[string]any{}}, ""); code != 3 {
+	if code, _ := runHook(t, node, index, map[string]any{"command": "cleanup_job", "args": map[string]any{}}); code != 3 {
 		t.Fatalf("hook exited %d, want the reference hook's 3", code)
 	}
 }
 
 func patchShimPath(t *testing.T, index, shim string) {
 	t.Helper()
+	patchConstant(t, index, "SHIM", "/opt/billet/bin/docker", shim)
+}
+
+// patchConstant points one of the wrapper's fixed production paths at a file
+// the test made, in the test's private copy.
+func patchConstant(t *testing.T, index, name, production, replacement string) {
+	t.Helper()
 	body, err := os.ReadFile(index)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const production = "const SHIM = '/opt/billet/bin/docker';"
-	if !strings.Contains(string(body), production) {
-		t.Fatalf("the wrapper no longer declares %s; update this test with it", production)
+	declared := "const " + name + " = '" + production + "';"
+	if !strings.Contains(string(body), declared) {
+		t.Fatalf("the wrapper no longer declares %s; update this test with it", declared)
 	}
-	patched := strings.Replace(string(body), production, "const SHIM = "+jsString(shim)+";", 1)
+	patched := strings.Replace(string(body), declared, "const "+name+" = "+jsString(replacement)+";", 1)
 	if err := os.WriteFile(index, []byte(patched), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A TIER WITHOUT THE GO CACHE GETS NEITHER THE HELPER NOR ITS ENVIRONMENT, even
+// on an image that carries billet.
+func TestTheContainerHookAddsNothingForATierWithoutTheGoCache(t *testing.T) {
+	t.Parallel()
+	node := nodeOrSkip(t)
+	index, record := hookHarness(t, "0")
+	billet := filepath.Join(t.TempDir(), "billet")
+	if err := forkSafeWriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	patchShimPath(t, index, filepath.Join(t.TempDir(), "absent"))
+	patchConstant(t, index, "BILLET", "/opt/billet/bin/billet", billet)
+	request := map[string]any{
+		"command": "prepare_job",
+		"args":    map[string]any{"container": map[string]any{"image": "golang:1.26"}},
+	}
+	if code, out := runHook(t, node, index, request, "GOCACHEPROG=", "BILLET_CACHE_TOKEN=token"); code != 0 {
+		t.Fatalf("hook exited %d\n%s", code, out)
+	}
+	container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
+	if len(container) != 1 {
+		t.Fatalf("a tier without the go cache had its container changed: %v", container)
+	}
+}
+
+// A GO CACHE TIER'S JOB CONTAINER GETS THE HELPER AND ITS ENVIRONMENT, and a
+// job that set GOCACHEPROG itself keeps its own value, which is how a workflow
+// turns the cache off. Without interception the docker shim is not mounted.
+func TestTheContainerHookGivesAJobContainerTheGoCacheHelper(t *testing.T) {
+	t.Parallel()
+	node := nodeOrSkip(t)
+
+	for name, own := range map[string]map[string]any{
+		"the job sets nothing":         {},
+		"the job turned the cache off": {"GOCACHEPROG": ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			index, record := hookHarness(t, "0")
+			dir := t.TempDir()
+			shim, billet := filepath.Join(dir, "docker"), filepath.Join(dir, "billet")
+			for _, file := range []string{shim, billet} {
+				if err := forkSafeWriteFile(file, []byte("#!/bin/sh\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			patchShimPath(t, index, shim)
+			patchConstant(t, index, "BILLET", "/opt/billet/bin/billet", billet)
+
+			request := map[string]any{
+				"command": "prepare_job",
+				"args": map[string]any{"container": map[string]any{
+					"image": "golang:1.26", "environmentVariables": own,
+				}},
+			}
+			code, out := runHook(t, node, index, request,
+				"GOCACHEPROG="+billet+" cache gocacheprog", "GOFLAGS=-count=1",
+				"BILLET_CACHE_ENDPOINT=http://172.31.0.1:7718", "BILLET_CACHE_TOKEN=token",
+				"BILLET_CONTAINER_SHIM=")
+			if code != 0 {
+				t.Fatalf("hook exited %d\n%s", code, out)
+			}
+			container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
+			mounts, _ := container["systemMountVolumes"].([]any)
+			if len(mounts) != 1 || mounts[0].(map[string]any)["sourceVolumePath"] != billet ||
+				mounts[0].(map[string]any)["readOnly"] != true {
+				t.Fatalf("mounts = %v, want only the helper, read-only", mounts)
+			}
+			variables := container["environmentVariables"].(map[string]any)
+			wantHelper := billet + " cache gocacheprog"
+			if _, turnedOff := own["GOCACHEPROG"]; turnedOff {
+				wantHelper = ""
+			}
+			for key, want := range map[string]string{
+				"GOCACHEPROG": wantHelper, "GOFLAGS": "-count=1",
+				"BILLET_CACHE_ENDPOINT": "http://172.31.0.1:7718", "BILLET_CACHE_TOKEN": "token",
+			} {
+				if variables[key] != want {
+					t.Errorf("%s = %v, want %q", key, variables[key], want)
+				}
+			}
+		})
 	}
 }
 

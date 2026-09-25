@@ -11,6 +11,9 @@ import (
 type actionsVolumeManager interface {
 	MountNew(ctx context.Context, device, target string) error
 	MountReadOnly(ctx context.Context, device, target string) error
+	// MountWritable mounts an existing filesystem for the node to write, as a
+	// content-addressed cache volume is.
+	MountWritable(ctx context.Context, device, target string) error
 	Trim(ctx context.Context, target string) error
 	Unmount(ctx context.Context, target string) error
 }
@@ -26,6 +29,10 @@ func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target str
 		return fmt.Errorf("node: format Actions cache volume: %w: %s", err, boundedOutput(output))
 	}
 
+	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
+}
+
+func (hostActionsVolumeManager) MountWritable(ctx context.Context, device, target string) error {
 	return mountActionsVolume(ctx, device, target, "noatime,nodev,nosuid,noexec")
 }
 

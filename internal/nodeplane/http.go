@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -95,9 +97,9 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
-// CachePolicy answers the kill switch for transparent Actions caching.
+// CachePolicy answers the kill switch for one cache of one repository.
 type CachePolicy interface {
-	ActionsCacheAllowed(ctx context.Context, owner, repository string) (bool, error)
+	CacheAllowed(ctx context.Context, kind, owner, repository string) (bool, error)
 }
 
 // maxBody bounds a request body.
@@ -297,6 +299,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
+	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
 	mux.HandleFunc("POST /v1/nodes/{node}/trusted-runner-group", h.forNewWork(h.validateTrustedRunnerGroup))
@@ -369,6 +372,9 @@ type handler struct {
 	trust       []byte
 	enrollments Enrollments
 	cachePolicy CachePolicy
+	// authorities remembers what GitHub's record said about a running job, so a
+	// job whose cache calls cannot be proved does not ask GitHub on every call.
+	authorities authorityMemory
 
 	// enrollSlots bounds concurrent enrollments. Non-nil only on a bootstrap
 	// handler; a nil channel means the route is not served at all.
@@ -1321,7 +1327,18 @@ func (h *handler) actionsCachePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	owner := r.URL.Query().Get("owner")
 	repository := r.URL.Query().Get("repository")
-	allowed, err := h.cachePolicy.ActionsCacheAllowed(r.Context(), owner, repository)
+	// A NODE BELOW VersionCacheAuthority NAMES NO KIND, and it asks only about
+	// the Actions cache, which is all the switch covered then.
+	kind := config.CacheKind(r.URL.Query().Get("kind"))
+	if kind == "" {
+		kind = config.CacheActions
+	}
+	if !kind.Valid() {
+		writeErr(w, http.StatusBadRequest, "", "unknown cache kind")
+
+		return
+	}
+	allowed, err := h.cachePolicy.CacheAllowed(r.Context(), string(kind), owner, repository)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
 
@@ -1485,6 +1502,10 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 		ImageCache:      alloc.ImageCache(req.ImageCache),
 		CacheGeneration: req.CacheGeneration,
 		ActionsCache:    alloc.ActionsCache(req.ActionsCache),
+		BuildCaches: alloc.BuildCaches{
+			Sticky: alloc.BuildCache(req.StickyCache), Git: alloc.BuildCache(req.GitCache),
+			Bazel: alloc.BuildCache(req.BazelCache), Go: alloc.BuildCache(req.GoCache),
+		},
 	}
 	if err := obs.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
@@ -1943,6 +1964,158 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 			"lease", binding.LeaseID, "error", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// cacheAuthority answers what a running lease's job may do with a cache.
+//
+// DECIDED HERE, BY THE ONE FUNCTION, from the binding the ledger holds and
+// GitHub's record read fresh, and narrowed to the tier's namespace. A lease with
+// no binding yet (JobStarted not processed) or evidence that cannot be read
+// answers the unproven authority, which writes nothing: the node splices to
+// GitHub and asks again on the next call. Only a lease this node holds now is
+// answered.
+func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
+	leaseID := r.PathValue("lease")
+	unproven := server.CacheAuthority{LeaseID: leaseID}
+	lease, err := h.store.Lease(r.Context(), leaseID)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if lease == nil {
+		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused, "the lease no longer exists")
+		return
+	}
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		writeJSON(w, http.StatusOK, nodeapi.CacheAuthorityResponse{Authority: *nodeapiAuthority(unproven)})
+		return
+	}
+	binding, bindingErr := pool.PoolRunnerByLease(r.Context(), leaseID)
+	if bindingErr != nil && !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
+		writeStoreErr(w, bindingErr)
+		return
+	}
+	tier, ok := h.plane.tierFor(lease.Tier)
+	if !ok {
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, "the lease's tier is not in the catalogue")
+		return
+	}
+	spec := tier.EffectiveCache()
+	answer := func(a server.CacheAuthority) {
+		writeJSON(w, http.StatusOK, nodeapi.CacheAuthorityResponse{
+			Authority: *nodeapiAuthority(server.ScopedCacheAuthority(spec, a)),
+		})
+	}
+	if spec.Publish != config.CachePublishDefaultBranch || bindingErr != nil {
+		answer(unproven)
+		return
+	}
+	src, err := h.jitFor(tier)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	evidence, ok := src.(server.RunEvidence)
+	if !ok {
+		answer(unproven)
+		return
+	}
+	authority := h.authorities.resolve(leaseID, binding, time.Now(), func() (server.CacheAuthority, bool) {
+		authority, err := server.ResolveCacheAuthority(r.Context(), evidence, leaseID, binding, nil)
+		if err != nil {
+			h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
+				"lease", leaseID, "error", err)
+		}
+
+		return authority, err == nil
+	})
+	answer(authority)
+}
+
+// How long an answer about a running job stands. A decided one describes a
+// run whose branch, event and workflow do not change; could-not-tell is kept
+// only briefly, so a GitHub blip does not hold a job read-only for long.
+const (
+	authorityDecidedFor   = 10 * time.Minute
+	authorityUndecidedFor = 30 * time.Second
+)
+
+// authorityMemory keeps one answer per lease and job, and lets one question
+// at a time reach GitHub for each, so a job's burst of cache calls costs one
+// pair of GitHub requests rather than one per call. The zero value is ready.
+type authorityMemory struct {
+	mu      sync.Mutex
+	entries map[string]*rememberedAuthority
+}
+
+type rememberedAuthority struct {
+	authority server.CacheAuthority
+	until     time.Time
+	// asking is closed when the question in flight is answered; nil when none
+	// is.
+	asking chan struct{}
+}
+
+func (m *authorityMemory) resolve(
+	leaseID string, binding alloc.PoolRunner, now time.Time, ask func() (server.CacheAuthority, bool),
+) server.CacheAuthority {
+	key := leaseID + "\x00" + binding.JobID + "\x00" + strconv.FormatInt(binding.RunID, 10)
+	m.mu.Lock()
+	if m.entries == nil {
+		m.entries = make(map[string]*rememberedAuthority)
+	}
+	for k, entry := range m.entries {
+		if entry.asking == nil && now.After(entry.until.Add(authorityDecidedFor)) {
+			delete(m.entries, k)
+		}
+	}
+	entry := m.entries[key]
+	if entry == nil {
+		entry = &rememberedAuthority{}
+		m.entries[key] = entry
+	}
+	for entry.asking != nil {
+		answered := entry.asking
+		m.mu.Unlock()
+		<-answered
+		m.mu.Lock()
+	}
+	if now.Before(entry.until) {
+		defer m.mu.Unlock()
+
+		return entry.authority
+	}
+	answered := make(chan struct{})
+	entry.asking = answered
+	m.mu.Unlock()
+
+	// ANSWERED WHATEVER ask DOES, a panic included, or every waiter on this key
+	// would wait forever.
+	authority, decided := server.CacheAuthority{}, false
+	defer func() {
+		m.mu.Lock()
+		entry.authority, entry.until = authority, now.Add(authorityUndecidedFor)
+		if decided {
+			entry.until = now.Add(authorityDecidedFor)
+		}
+		entry.asking = nil
+		close(answered)
+		m.mu.Unlock()
+	}()
+	authority, decided = ask()
+
+	return authority
+}
+
+// nodeapiAuthority is WireCacheAuthority that never answers nil, for a
+// response that always carries one.
+func nodeapiAuthority(a server.CacheAuthority) *nodeapi.CacheAuthority {
+	if wire := WireCacheAuthority(a); wire != nil {
+		return wire
+	}
+
+	return &nodeapi.CacheAuthority{}
 }
 
 func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {

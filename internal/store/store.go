@@ -166,6 +166,13 @@ type Store interface {
 	Evict(ctx context.Context, olderThan time.Duration) error
 }
 
+// VolumeSizer reports how large a mapped volume is, so a caller can refuse a
+// generation larger than it allows. Optional: a store that cannot tell leaves
+// the ceiling to apply at creation only.
+type VolumeSizer interface {
+	SizeOf(ctx context.Context, volume Volume) (int64, error)
+}
+
 // KeyMatcher finds the exact cache key or the newest current key under the first
 // restore prefix that has a match. Stores used by transparent Actions caching
 // implement it; ordinary sticky disks need only Store.

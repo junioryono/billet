@@ -19,7 +19,10 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -67,7 +70,16 @@ type CacheService struct {
 	actions    *actionsProxy
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
+	policy     CachePolicy
+	authority  CacheAuthorityReader
 	observer   CacheObserver
+	// remoteAPI serves Bazel's and Buck2's gRPC remote caches.
+	remoteAPI http.Handler
+	// git serves github.com fetches from mirrors on the node.
+	git *gitProxy
+	// casFill is casFullFraction, a field so a test is not decided by the fill
+	// of the disk it runs on.
+	casFill float64
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
@@ -83,9 +95,39 @@ type cacheSession struct {
 	repository  string
 	workflowRef string
 	intercept   bool
-	leaseID     string
-	epoch       int64
-	observed    cacheObserved
+	// cache is the tier's cache configuration the session was scoped with, or
+	// nil for the legacy behaviour.
+	cache    *config.CacheSpec
+	leaseID  string
+	epoch    int64
+	observed cacheObserved
+	// actionsAuthority is the proven authority of a default-branch session's
+	// job, kept once the control plane has proved it. Guarded by authorityMu,
+	// never by mu, because it is asked for inside handlers that take mu.
+	authorityMu      sync.Mutex
+	actionsAuthority *server.CacheAuthority
+	// unprovenUntil is when an unproven answer stops standing, under
+	// authorityMu, so a job that cannot be proved asks at most that often.
+	unprovenUntil time.Time
+	// hosts are the content-addressed cache volumes the node mounted for this
+	// session, and casAdmit bounds their concurrent transfers.
+	hosts    map[config.CacheKind]*hostVolume
+	casAdmit chan struct{}
+	// pathID names the session's host mount points. It is not the bearer, which
+	// must never reach a mount table or a mount's argv; a session recorded by an
+	// older binary keeps its token here, so what it mounted is still found.
+	pathID string
+	// gitAllowedAt is when the kill switch last allowed the git cache, under mu.
+	gitAllowedAt time.Time
+	// gitAdmit bounds the session's git requests and gitFetch its mirror
+	// fetches, one at a time; gitPending counts refreshes whose outcome is not
+	// yet noted, under mu.
+	gitAdmit   chan struct{}
+	gitFetch   chan struct{}
+	gitPending int
+	// building is what each build cache did so far, under mu; reported when the
+	// session ends.
+	building map[config.CacheKind]alloc.BuildCache
 	// inflight counts CacheService calls between dispatch and their recorded
 	// outcome, so settlement does not write `unused` over a call still being
 	// answered.
@@ -129,6 +171,14 @@ type CacheSessionScope struct {
 	// epoch.
 	LeaseID string
 	Epoch   int64
+	// Cache is the tier's effective cache configuration from the control plane,
+	// or nil for the legacy behaviour an older control plane implies.
+	Cache *config.CacheSpec
+}
+
+// CachePolicy reads the control plane's kill switch for one cache.
+type CachePolicy interface {
+	CacheAllowed(ctx context.Context, kind config.CacheKind, owner, repository string) (bool, error)
 }
 
 // ActionsPolicy reads the control plane's current interception kill switch.
@@ -160,6 +210,10 @@ type cacheObserved struct {
 	ImageCache      string `json:"image_cache,omitempty"`
 	CacheGeneration string `json:"cache_generation,omitempty"`
 	ActionsCache    string `json:"actions_cache,omitempty"`
+	StickyCache     string `json:"sticky_cache,omitempty"`
+	GitCache        string `json:"git_cache,omitempty"`
+	BazelCache      string `json:"bazel_cache,omitempty"`
+	GoCache         string `json:"go_cache,omitempty"`
 	// Reported says everything above has reached the control plane.
 	Reported bool `json:"reported,omitempty"`
 	// ActionsPending says the first CacheService call was dispatched and its
@@ -174,6 +228,10 @@ func (o cacheObserved) observation() alloc.CacheObservation {
 		ImageCache:      alloc.ImageCache(o.ImageCache),
 		CacheGeneration: o.CacheGeneration,
 		ActionsCache:    alloc.ActionsCache(o.ActionsCache),
+		BuildCaches: alloc.BuildCaches{
+			Sticky: alloc.BuildCache(o.StickyCache), Git: alloc.BuildCache(o.GitCache),
+			Bazel: alloc.BuildCache(o.BazelCache), Go: alloc.BuildCache(o.GoCache),
+		},
 	}
 }
 
@@ -183,6 +241,13 @@ type cacheAttachment struct {
 	Docker      bool                 `json:"docker,omitempty"`
 	Settling    bool                 `json:"settling,omitempty"`
 	Ready       bool                 `json:"ready,omitempty"`
+	// Deferred says the guest committed a default-branch sticky disk, which
+	// publishes only once the job's completion authorises it.
+	Deferred bool `json:"deferred,omitempty"`
+	// Intent is the completion's authority to publish, and Journal how far the
+	// publication the cache loop runs has got.
+	Intent  *publishIntent  `json:"intent,omitempty"`
+	Journal *publishJournal `json:"journal,omitempty"`
 }
 
 // NewCacheService constructs a node-local cache endpoint.
@@ -225,6 +290,9 @@ func NewCacheService(
 		now:        time.Now,
 		closed:     make(chan struct{}, 1),
 	}
+	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
+	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
+	service.casFill = casFullFraction
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
@@ -248,6 +316,10 @@ func (s *CacheService) Endpoint() string { return s.endpoint }
 
 // SetActionsPolicy installs the control-plane policy reader before the listener starts.
 func (s *CacheService) SetActionsPolicy(policy ActionsPolicy) { s.actionRule = policy }
+
+// SetCachePolicy installs the kill switch every cache kind is asked before a
+// local operation and again before a deferred publication.
+func (s *CacheService) SetCachePolicy(policy CachePolicy) { s.policy = policy }
 
 // SetCacheObserver installs where observations are reported, before the
 // listener starts. Without one they are kept on the session and reported to
@@ -274,6 +346,19 @@ func (s *CacheService) observe(ctx context.Context, session *cacheSession, obs a
 		session.observed.ActionsCache = string(obs.ActionsCache)
 		session.observed.ActionsPending = false
 		changed = true
+	}
+
+	for _, field := range []struct {
+		observed *string
+		outcome  alloc.BuildCache
+	}{
+		{&session.observed.StickyCache, obs.Sticky}, {&session.observed.GitCache, obs.Git},
+		{&session.observed.BazelCache, obs.Bazel}, {&session.observed.GoCache, obs.Go},
+	} {
+		if field.outcome != "" && *field.observed == "" {
+			*field.observed = string(field.outcome)
+			changed = true
+		}
 	}
 
 	if !changed {
@@ -382,6 +467,8 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 		}
 	}
 
+	obs.BuildCaches = settledBuildCaches(session)
+
 	if obs != (alloc.CacheObservation{}) {
 		s.observe(ctx, session, obs)
 
@@ -389,6 +476,70 @@ func (s *CacheService) settleObservation(ctx context.Context, session *cacheSess
 	}
 
 	s.report(ctx, session)
+}
+
+// buildCacheRank orders what a build cache did by how much it says: a cache
+// that served one request warm was warm for the job, whatever else it did.
+var buildCacheRank = map[alloc.BuildCache]int{
+	alloc.BuildCacheWarm: 4, alloc.BuildCacheCold: 3, alloc.BuildCacheDisabled: 2,
+	alloc.BuildCacheUnavailable: 1,
+}
+
+// noteBuildCache records what a build cache did for the session, keeping the
+// most telling outcome so far. Called with session.mu held.
+func noteBuildCache(session *cacheSession, kind config.CacheKind, outcome alloc.BuildCache) {
+	if session.building == nil {
+		session.building = make(map[config.CacheKind]alloc.BuildCache)
+	}
+	if buildCacheRank[outcome] > buildCacheRank[session.building[kind]] {
+		session.building[kind] = outcome
+	}
+}
+
+// settledBuildCaches is what each build cache did over the session, reported
+// once, when it ends. Called with session.mu held.
+//
+// A CACHE THE TIER ENABLES AND NOTHING NOTED IS "unused" only for the process
+// that saw the whole session; one that recovered it from disk says nothing.
+func settledBuildCaches(session *cacheSession) alloc.BuildCaches {
+	for kind, hv := range session.hosts {
+		switch {
+		case hv.hit.Load():
+			noteBuildCache(session, kind, alloc.BuildCacheWarm)
+		case hv.used.Load():
+			noteBuildCache(session, kind, alloc.BuildCacheCold)
+		}
+	}
+	outcome := func(kind config.CacheKind) alloc.BuildCache {
+		noted := session.building[kind]
+		// A RECOVERED SESSION SAW ONLY PART OF THE JOB, so what it noted stands
+		// only when nothing the part it missed did could outrank it.
+		if session.recovered {
+			if noted == alloc.BuildCacheWarm {
+				return noted
+			}
+
+			return ""
+		}
+		if noted != "" {
+			return noted
+		}
+		// A REFRESH STILL IN FLIGHT IS NOT "UNUSED": its outcome is noted when
+		// it returns, after this report.
+		if kind == config.CacheGit && session.gitPending > 0 {
+			return ""
+		}
+		if sessionSetting(session, kind).Enabled {
+			return alloc.BuildCacheUnused
+		}
+
+		return ""
+	}
+
+	return alloc.BuildCaches{
+		Sticky: outcome(config.CacheSticky), Git: outcome(config.CacheGit),
+		Bazel: outcome(config.CacheBazel), Go: outcome(config.CacheGo),
+	}
 }
 
 // beginActionsCall marks a CacheService call as in flight, and endActionsCall
@@ -477,13 +628,21 @@ func (s *CacheService) PrepareScoped(
 	if scope.Trust != provider.TrustTrusted && scope.Trust != provider.TrustUntrusted {
 		return CacheCredentials{}, errors.New("node: cannot give cache access to work with unknown trust")
 	}
-	if scope.Intercept {
+	if scope.Intercept && !defaultBranchScope(scope.Cache) {
 		if err := validateActionsScope(scope); err != nil {
 			return CacheCredentials{}, err
 		}
 	}
 	if err := validateSessionLease(instance, scope.LeaseID, scope.Epoch); err != nil {
 		return CacheCredentials{}, err
+	}
+	if err := validateSessionCache(scope.Cache); err != nil {
+		return CacheCredentials{}, err
+	}
+	var spec *config.CacheSpec
+	if scope.Cache != nil {
+		clone := *scope.Cache
+		spec = &clone
 	}
 
 	s.mu.Lock()
@@ -505,11 +664,16 @@ func (s *CacheService) PrepareScoped(
 		session := &cacheSession{
 			token: token, instance: instance, trust: scope.Trust,
 			owner: scope.Owner, repository: scope.Repository, workflowRef: scope.WorkflowRef,
-			intercept: scope.Intercept,
-			leaseID:   scope.LeaseID, epoch: scope.Epoch,
+			intercept: scope.Intercept, cache: spec,
+			leaseID: scope.LeaseID, epoch: scope.Epoch,
 			admit:    make(chan struct{}, 1),
 			actions:  make(map[string]*actionsArchive),
 			receipts: make(map[string]*actionsReceipt),
+			hosts:    make(map[config.CacheKind]*hostVolume),
+			casAdmit: make(chan struct{}, casConcurrency),
+			gitAdmit: make(chan struct{}, gitSessionWork),
+			gitFetch: make(chan struct{}, 1),
+			pathID:   sessionPathID(token),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {
@@ -684,15 +848,26 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 
 			continue
 		}
-		if !session.closed {
-			for slot, attachment := range session.slots {
-				if attachment == nil || attachment.Volume.Lease.ID == "" {
-					continue
-				}
-				if err := s.store.RenewActive(ctx, attachment.Volume, until); err != nil {
-					failures = append(failures, fmt.Errorf("%s slot %d: %w", session.instance, slot, err))
-				}
+		// A CLOSED SESSION'S PENDING PUBLICATIONS ARE RENEWED TOO, so the parent
+		// generation of a clone waiting to be published cannot be evicted under it.
+		for slot, attachment := range session.slots {
+			if attachment == nil || attachment.Volume.Lease.ID == "" ||
+				(session.closed && !pendingPublication(attachment)) {
+				continue
 			}
+			if err := s.store.RenewActive(ctx, attachment.Volume, until); err != nil {
+				failures = append(failures, fmt.Errorf("%s slot %d: %w", session.instance, slot, err))
+			}
+		}
+		for kind, hv := range session.hosts {
+			if hv.Volume.Lease.ID == "" || (session.closed && hv.Intent == nil) {
+				continue
+			}
+			if err := s.store.RenewActive(ctx, hv.Volume, until); err != nil {
+				failures = append(failures, fmt.Errorf("%s %s cache: %w", session.instance, kind, err))
+			}
+		}
+		if !session.closed {
 			for id, archive := range session.actions {
 				if archive.Volume.Lease.ID == "" {
 					continue
@@ -750,6 +925,33 @@ func (s *CacheService) cleanupSession(
 			continue
 		}
 
+		// PUBLISHED BEFORE IT IS DISCARDED, when the job's completion authorised
+		// it: the compute is gone by now, so nothing can still be writing the
+		// clone. A publication that is not finished keeps its slot for the next
+		// pass; one that is finished leaves nothing to discard if Snapshot took
+		// the clone.
+		if attachment.Intent != nil {
+			done, err := s.publishDeferred(ctx, session, slot, attachment)
+			if err != nil {
+				s.log.Warn("could not yet publish a cache a completed job wrote; will retry",
+					"instance", session.instance, "slot", slot, "error", err)
+			}
+			if !done {
+				failures = append(failures, fmt.Errorf("slot %d: publication pending", slot))
+
+				continue
+			}
+			if attachment.Journal != nil && attachment.Journal.Consumed {
+				session.slots[slot] = nil
+				if err := s.persistSession(session); err != nil {
+					return fmt.Errorf("node: record published cache volume of %s slot %d: %w",
+						session.instance, slot, err)
+				}
+
+				continue
+			}
+		}
+
 		if err := s.store.Discard(ctx, attachment.Volume); err != nil {
 			failures = append(failures, fmt.Errorf("slot %d: %w", slot, err))
 
@@ -760,6 +962,19 @@ func (s *CacheService) cleanupSession(
 		if err := s.persistSession(session); err != nil {
 			return fmt.Errorf("node: record discarded cache volume of %s slot %d: %w",
 				session.instance, slot, err)
+		}
+	}
+	for kind, hv := range session.hosts {
+		done, err := s.releaseCASVolume(ctx, session, hv)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s cache: %w", kind, err))
+		}
+		if !done {
+			continue
+		}
+		delete(session.hosts, kind)
+		if err := s.persistSession(session); err != nil {
+			return fmt.Errorf("node: record released %s cache of %s: %w", kind, session.instance, err)
 		}
 	}
 	for id, archive := range session.actions {
@@ -813,9 +1028,30 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	// A GIT FETCH AUTHENTICATES BY BASIC CREDENTIALS, which is all git sends to
+	// an origin it was rewritten to.
+	if strings.HasPrefix(r.URL.Path, gitPathPrefix) {
+		s.serveGit(w, r)
+
+		return
+	}
 	session, ok := s.authenticate(r)
 	if !ok {
 		http.Error(w, "unauthorised cache session", http.StatusUnauthorized)
+
+		return
+	}
+	// CONTENT-ADDRESSED TRANSFERS ARE MANY AND CONCURRENT, a build's worth at
+	// once, so they have their own bound rather than the one-at-a-time
+	// admission the volume API takes. A gRPC call is the Remote Execution API
+	// over the same volume.
+	if reapi.IsGRPC(r) {
+		s.serveRemoteAPI(w, r, session)
+
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, casPathPrefix) {
+		s.serveCAS(w, r, session)
 
 		return
 	}
@@ -883,12 +1119,18 @@ func (s *CacheService) attachDockerStore(
 
 		return
 	}
+	setting := sessionSetting(session, config.CacheDocker)
+	if !setting.Enabled || !s.sessionKindAllowed(ctx, session, config.CacheDocker) {
+		s.observe(ctx, session, alloc.CacheObservation{ImageCache: alloc.ImageCacheUnavailable})
+		http.Error(w, "the Docker image store is off for this job", http.StatusForbidden)
 
-	key := s.qualifiedKey(dockerStoreKey + request.Architecture)
-	volume, err := s.store.Clone(ctx, key, "")
-	cold := errors.Is(err, storecontract.ErrMiss)
+		return
+	}
+
+	key := s.cacheKeyFor(session, config.CacheDocker, request.Architecture, "")
+	volume, cold, err := s.cloneWithin(ctx, key, volumeCeiling(setting))
 	if cold {
-		volume, err = s.store.Create(ctx, key, cacheVolumeLimit)
+		volume, err = s.store.Create(ctx, key, volumeCeiling(setting))
 	}
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",
@@ -1023,17 +1265,39 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	session := s.byToken[token]
 	s.mu.Unlock()
 
-	if !succeeded || session.trust != provider.TrustTrusted {
+	if !succeeded || session.trust != provider.TrustTrusted ||
+		sessionPolicy(session) != config.CachePublishTrustedOnly {
 		return nil
+	}
+	attachment, err := s.awaitDockerReady(ctx, session)
+	if err != nil || attachment == nil {
+		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
 		return err
+	}
+	defer session.mu.Unlock()
+	if session.slots[0] != attachment || !attachment.Ready {
+		return nil
+	}
+
+	return s.publishDocker(ctx, session, attachment)
+}
+
+// awaitDockerReady opens the Docker store's settlement and waits for the guest
+// to prove it quiesced, returning the ready attachment, or nil when the session
+// has no Docker store.
+func (s *CacheService) awaitDockerReady(
+	ctx context.Context, session *cacheSession,
+) (*cacheAttachment, error) {
+	if err := lockCacheSession(ctx, session); err != nil {
+		return nil, err
 	}
 	attachment := session.slots[0]
 	if attachment == nil || !attachment.Docker {
 		session.mu.Unlock()
 
-		return nil
+		return nil, nil
 	}
 	if !attachment.Settling {
 		attachment.Settling = true
@@ -1042,7 +1306,7 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 		if err := s.persistSession(session); err != nil {
 			session.mu.Unlock()
 
-			return fmt.Errorf("open Docker image-store settlement: %w", err)
+			return nil, fmt.Errorf("open Docker image-store settlement: %w", err)
 		}
 	}
 	session.mu.Unlock()
@@ -1052,32 +1316,30 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 
 	for {
 		if err := lockCacheSession(ctx, session); err != nil {
-			return err
+			return nil, err
 		}
 		attachment := session.slots[0]
 		if attachment == nil || !attachment.Docker {
 			session.mu.Unlock()
 
-			return nil
+			return nil, nil
 		}
-		if attachment.Ready {
-			err := s.publishDocker(ctx, session, attachment)
-			session.mu.Unlock()
-
-			return err
-		}
+		ready := attachment.Ready
 		session.mu.Unlock()
+		if ready {
+			return attachment, nil
+		}
 
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-deadline.C:
 			timer.Stop()
 
-			return errors.New("docker image store did not become ready before teardown")
+			return nil, errors.New("docker image store did not become ready before teardown")
 		case <-timer.C:
 		}
 	}
@@ -1139,6 +1401,9 @@ type attachCacheRequest struct {
 	Key         string `json:"key"`
 	SizeBytes   int64  `json:"size_bytes"`
 	Publication string `json:"publication,omitempty"`
+	// Architecture scopes a default-branch sticky disk by the guest's
+	// architecture; an older action sends none.
+	Architecture string `json:"architecture,omitempty"`
 }
 
 func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *cacheSession) {
@@ -1169,6 +1434,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
+	if request.Architecture != "" && !validCacheArchitecture(request.Architecture) {
+		http.Error(w, "invalid sticky-disk architecture", http.StatusBadRequest)
+
+		return
+	}
 
 	if err := lockCacheSession(ctx, session); err != nil {
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
@@ -1196,15 +1466,30 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 		return
 	}
+	setting := sessionSetting(session, config.CacheSticky)
+	if !setting.Enabled {
+		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
 
-	key := s.qualifiedKey(request.Key)
-	volume, err := s.store.Clone(ctx, key, "")
-	cold := errors.Is(err, storecontract.ErrMiss)
+		return
+	}
+	if !s.sessionKindAllowed(ctx, session, config.CacheSticky) {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheDisabled)
+		http.Error(w, "sticky disks are off for this job", http.StatusForbidden)
+
+		return
+	}
+	if ceiling := volumeCeiling(setting); request.SizeBytes > ceiling {
+		request.SizeBytes = ceiling
+	}
+
+	key := s.cacheKeyFor(session, config.CacheSticky, request.Architecture, request.Key)
+	volume, cold, err := s.cloneWithin(ctx, key, volumeCeiling(setting))
 	if cold {
 		volume, err = s.store.Create(ctx, key, request.SizeBytes)
 	}
 
 	if err != nil {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheUnavailable)
 		s.log.Warn("cache volume is unavailable; the job can continue cold",
 			"instance", session.instance, "error", err)
 		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
@@ -1259,6 +1544,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	guestDevice := guestVolumeDevice(slot)
 	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
 		guestDevice = locator.GuestVolumeDevice(slot, volume.Device)
+	}
+	if cold {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheCold)
+	} else {
+		noteBuildCache(session, config.CacheSticky, alloc.BuildCacheWarm)
 	}
 	writeCacheJSON(w, http.StatusCreated, map[string]any{
 		"slot": slot, "device": guestDevice, "generation": volume.Generation, "cold": cold,
@@ -1320,20 +1610,43 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
-	if session.trust != provider.TrustTrusted {
+	// A DEFAULT-BRANCH DISK WAITS FOR ITS JOB'S COMPLETION, whoever the pool
+	// trusts: the node cannot yet tell which ref this job runs for, and the
+	// completion's authority is what says. The guest's filesystem proof is kept
+	// and the clone stays unpublished until then; unauthorised, it is discarded
+	// when the session ends.
+	if sessionPolicy(session) == config.CachePublishDefaultBranch {
+		attachment.Deferred, attachment.Ready = true, attachment.Volume.Filesystem.Valid() == nil
+		if err := s.persistSession(session); err != nil {
+			s.nonFatalCommit(w, session, "record deferred write", err)
+
+			return
+		}
+		writeCacheJSON(w, http.StatusOK, map[string]any{
+			"published": false, "pending": attachment.Ready, "reason": "awaiting the job's result",
+		})
+
+		return
+	}
+
+	if session.trust != provider.TrustTrusted || sessionPolicy(session) == config.CachePublishOff {
+		reason := "untrusted"
+		if session.trust == provider.TrustTrusted {
+			reason = "publication is off"
+		}
 		if err := s.store.Discard(ctx, attachment.Volume); err != nil {
-			s.nonFatalCommit(w, session, "discard untrusted write", err)
+			s.nonFatalCommit(w, session, "discard unpublished write", err)
 
 			return
 		}
 
 		session.slots[slot] = nil
 		if err := s.persistSession(session); err != nil {
-			s.nonFatalCommit(w, session, "record discarded untrusted write", err)
+			s.nonFatalCommit(w, session, "record discarded write", err)
 
 			return
 		}
-		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": "untrusted"})
+		writeCacheJSON(w, http.StatusOK, map[string]any{"published": false, "reason": reason})
 
 		return
 	}
