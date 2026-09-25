@@ -1502,10 +1502,17 @@ func (l *Listener) Run(ctx context.Context) error {
 // intermittently for the most ordinary reason there is.
 //
 // So: once stopping, an error IS the shutdown unless it is one billet must stop for
-// regardless. A scale-set response it cannot act on is the only one.
+// regardless. A scale-set response it cannot act on is the only one, and a
+// response is not what failed when the error also carries the cancellation: a
+// runner lookup cut short by it is wrapped as untrustworthy, and answering that
+// with a stop skipped the drain and left the tier's running jobs unwaited-for.
 func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
 	if draining || ctx.Err() == nil {
 		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 
 	return !errors.Is(err, ErrUntrustworthySession)
@@ -3093,6 +3100,10 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 
 	if err != nil {
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
+	}
+
+	if len(leases) > 0 {
+		l.order.bought(l.tier)
 	}
 
 	l.mu.Lock()

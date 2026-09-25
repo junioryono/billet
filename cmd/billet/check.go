@@ -524,7 +524,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		}
 
 		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
-			t.Label, t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
+			tierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
 
 		// THE SERVER REFUSES ON THIS AND CHECK USED TO PASS OVER IT.

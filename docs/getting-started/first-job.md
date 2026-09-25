@@ -40,7 +40,7 @@ Commit it on the branch your runner group allows, and dispatch. Within a minute 
 The failure mode of this system is a job that queues rather than an error, so this is the section you will actually use.
 
 - **Check `billet status` first.** If your tier shows `0 available`, billet is advertising nothing and GitHub has nothing to assign. Usually another tier's reservation is holding the memory: reduce a tier, or raise the ceiling if the machine has room.
-- **Check the label matches a tier exactly.** `runs-on` matches the tier's label, which is the scale set's name.
+- **Check the label matches a tier exactly.** `runs-on` matches the tier's label, which is the scale set's name (or its `runs_on`, when the tier sets one; `billet check` shows it).
 - **Check the runner group grants the repository.** A group with selected visibility and no repositories looks exactly like a healthy deployment from every other angle.
 - **Check the workflow is on the group's allowlist, including the ref.** `…/ci.yml@refs/heads/main` does not match a run on another branch.
 - **Cancel old queued runs before retrying.** A backlog of runs that were never assignable can keep new dispatches queued.

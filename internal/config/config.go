@@ -44,8 +44,9 @@ type Config struct {
 	// Targets are the further organizations and repositories this deployment
 	// serves, each with its own App credential. See GitHubTargets.
 	Targets []GitHubConfig `yaml:"targets,omitempty"`
-	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
-	// its Label is what users put in `runs-on`.
+	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, named by
+	// its runs_on (its label unless it names one), which is what users put in
+	// `runs-on`.
 	Tiers []Tier `yaml:"tiers,omitempty"`
 	// Backup is where archives go when they leave this disk. Optional: absent
 	// means `billet local backup --out <dir>` is the whole story and an
@@ -2048,7 +2049,8 @@ func (b *BackupS3Config) normalize() {
 	}
 }
 
-// Tier is one runner shape. Its Label is what appears in `runs-on`.
+// Tier is one runner shape. Its Label identifies it in the deployment and its
+// ScaleSetName is what appears in `runs-on`.
 type Tier struct {
 	Label string `yaml:"label"`
 
@@ -2057,6 +2059,14 @@ type Tier struct {
 	// because a scale set exists on exactly one organization or repository and
 	// the credential that creates it is that target's.
 	Target string `yaml:"target,omitempty"`
+
+	// RunsOn is the name of this tier's scale set on its target, the value a
+	// workflow puts in `runs-on`. It defaults to Label. It exists so tiers on
+	// different targets can answer to one name: Label identifies the tier inside
+	// the deployment (its escrow, its leases, its history) and must be unique,
+	// while a scale set is unique only within its target, so two targets may each
+	// carry a tier with the same RunsOn.
+	RunsOn string `yaml:"runs_on,omitempty"`
 
 	// Trust is the authority every member of this runner pool receives before
 	// GitHub assigns it a job. It is explicit because scale-set JIT runners are
@@ -2221,6 +2231,16 @@ func (t WorkloadTrust) Effective() WorkloadTrust {
 		return WorkloadUntrusted
 	}
 	return t
+}
+
+// ScaleSetName is the name of this tier's scale set on its target: RunsOn, or
+// Label when the tier names none.
+func (t Tier) ScaleSetName() string {
+	if t.RunsOn != "" {
+		return t.RunsOn
+	}
+
+	return t.Label
 }
 
 // PoolPolicyErrors reports unsafe or contradictory authority for a pooled
@@ -5599,6 +5619,9 @@ func (c *Config) validateTiers() []error {
 		if _, dup := seen[t.Label]; dup {
 			errs = append(errs, fmt.Errorf("%s: duplicate label", where))
 		}
+		if t.RunsOn != "" && !labelRe.MatchString(t.RunsOn) {
+			errs = append(errs, fmt.Errorf("%s: runs_on must match %s", where, labelRe))
+		}
 
 		// Rejected HERE rather than left for GitHub to answer confusingly: an unescaped
 		// "Platform & Security" comes back as "group not found", which reads as a
@@ -6486,7 +6509,8 @@ func validateHostPort(field, addr string) error {
 	return nil
 }
 
-// TierByLabel returns the tier a `runs-on` label refers to.
+// TierByLabel returns the tier with this label, billet's identity for it; that
+// is its `runs-on` value only when it names no runs_on.
 func (c *Config) TierByLabel(label string) (*Tier, bool) {
 	for i := range c.Tiers {
 		if c.Tiers[i].Label == label {
