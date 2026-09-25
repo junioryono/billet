@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -91,6 +92,33 @@ func defaultHTTP() *http.Client {
 			ForceAttemptHTTP2:     true,
 		},
 	}
+}
+
+// WithoutSignedQuery removes the query string, fragment and userinfo from the URL
+// a failed request names, keeping its scheme, host and path.
+//
+// A RELEASE ASSET REDIRECTS TO A PRE-SIGNED URL, and http.Client reports the URL
+// it was fetching when it failed, not the one it was asked for. On 2026-09-25 a
+// TLS timeout on that hop put a SAS signature and a JWT into a rollout refusal,
+// which `billet rollout status` printed and the journal kept (#253).
+func WithoutSignedQuery(err error) error {
+	var failed *neturl.Error
+	if !errors.As(err, &failed) {
+		return err
+	}
+
+	u, parseErr := neturl.Parse(failed.URL)
+	if parseErr != nil {
+		return &neturl.Error{Op: failed.Op, URL: "(unparsable URL withheld)", Err: failed.Err}
+	}
+
+	if u.RawQuery == "" && u.Fragment == "" && u.User == nil {
+		return err
+	}
+
+	u.RawQuery, u.Fragment, u.User = "", "", nil
+
+	return &neturl.Error{Op: failed.Op, URL: u.String(), Err: failed.Err}
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -244,7 +272,7 @@ func (c *Client) get(ctx context.Context, url string, limit int64) ([]byte, erro
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("imagesource: could not reach %s: %w", url, err)
+		return nil, fmt.Errorf("imagesource: could not reach %s: %w", url, WithoutSignedQuery(err))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -307,7 +335,7 @@ func (c *Client) Download(ctx context.Context, asset Asset, dir string) (string,
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("imagesource: could not reach %s: %w", url, err)
+		return "", fmt.Errorf("imagesource: could not reach %s: %w", url, WithoutSignedQuery(err))
 	}
 
 	defer func() { _ = resp.Body.Close() }()
