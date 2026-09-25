@@ -254,6 +254,6 @@ The security model says guests are blocked from the host LAN, RFC1918, BMC/IPMI,
 
 **The overlay network, not just the LAN.** This host joins a Cloudflare Mesh and takes an address in `100.96.0.0/12`. That range is not RFC1918 and is not the host LAN, so a blocklist derived from the usual list does not cover it — and it is the most valuable thing on the machine to reach. A compromised job that can route into the mesh is inside a Zero Trust network that reaches beta and production databases. **`100.96.0.0/12` belongs in the guest deny list**, and it belongs there before the first untrusted job runs, not after.
 
-**The BMC is on the LAN with full power and console control** (192.168.1.125 on the reference machine). Blocking RFC1918 covers it only if RFC1918 is genuinely blocked rather than assumed; it is worth an explicit rule, because the consequence of missing it is an attacker with the machine's reset button and its serial console.
+**The BMC is on the LAN with full power and console control** (a LAN address on the reference machine). Blocking RFC1918 covers it only if RFC1918 is genuinely blocked rather than assumed; it is worth an explicit rule, because the consequence of missing it is an attacker with the machine's reset button and its serial console.
 
 Neither of these is billet enforcing something clever. They are host firewall rules that have to exist before billet is trusted with anything but its own jobs, and they are recorded here because the machine is what makes them specific.
