@@ -1999,6 +1999,8 @@ func startNodeCache(
 			case <-cleanupTicker.C:
 				retryClosed()
 				renewActive()
+			case <-service.ClosedSessions():
+				retryClosed()
 			case <-evictionTicker.C:
 				evict()
 			}

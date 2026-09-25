@@ -4250,9 +4250,9 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 // holding it withholds capacity from every other tier for no reason. GitHub
 // reassigns the job when its pickup deadline passes.
 func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) error {
-	// EVERY LAUNCH, on the pool path and the direct-assignment path alike: a
-	// waiter launching for the node's whole command timeout is progressing, and
-	// the finished launch dates its progress.
+	// EVERY LAUNCH, on the pool path and the direct-assignment path alike: each
+	// end of a launch dates a waiter's progress, so a waiter launching slot after
+	// slot keeps its line, and one launch longer than WaiterAllowance does not.
 	l.order.launchBegins(l.tier)
 	err := l.runner.Launch(ctx, lease, job)
 	l.order.launchEnds(l.tier)

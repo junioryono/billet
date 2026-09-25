@@ -454,7 +454,7 @@ func TestActionsCleanupStopsAfterItsContextIsCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
-	if err := service.cleanupSession(ctx, session, true); !errors.Is(err, context.DeadlineExceeded) {
+	if err := service.cleanupSession(ctx, session, true, true); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cleanup error = %v; want context deadline while the archive is busy", err)
 	}
 }
@@ -499,6 +499,13 @@ func TestPendingActionsArchiveCustodySurvivesANodeRestart(t *testing.T) {
 	restarted.actionIO = &fakeActionsVolumeManager{}
 	if err := restarted.ReconcileInventory(t.Context(), nil); err != nil {
 		t.Fatalf("reconcile after restart: %v", err)
+	}
+	if storage.discarded != 0 {
+		t.Fatalf("discarded archive volumes = %d while reconciling, want the discard left to RetryClosed",
+			storage.discarded)
+	}
+	if err := restarted.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("retry closed after restart: %v", err)
 	}
 	if storage.discarded != 1 {
 		t.Fatalf("discarded archive volumes = %d, want 1", storage.discarded)

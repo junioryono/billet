@@ -16,17 +16,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # HOW MUCH OF THIS RUN A CHANGE NEEDS. A pull request that touches only
-  # documentation runs test (the Go suite reads docs: the compatibility page, the
-  # documented module sources), release-config and docs, and skips the jobs
-  # listed in verify-all-checks' KEPT complement: the PostgreSQL shards, the host
-  # lifecycle matrix, the package, Terraform and replay jobs, lint and the gate
-  # binaries. Everything else, and anything scripts/ci-scope.sh cannot establish,
-  # is "full". A job gated on this must be one verify-all-checks may see skipped.
+  # WHICH JOB FAMILIES A CHANGE NEEDS. test, release-config and docs always run
+  # (test reads scripts, actions, workflows, docs, Ansible, Terraform and source
+  # text). Every other job belongs to exactly one family in verify-all-checks'
+  # FAMILY map, and runs only when scripts/ci-scope.sh selects that family: a
+  # pull request whose paths cannot reach a family skips its jobs. A push, and
+  # anything the script cannot establish, selects every family.
   changes:
     runs-on: billet-2vcpu-ubuntu-2404
     outputs:
-      scope: ${{ steps.scope.outputs.scope }}
+      schema: ${{ steps.scope.outputs.schema }}
+      host_lifecycle: ${{ steps.scope.outputs.host_lifecycle }}
+      postgres: ${{ steps.scope.outputs.postgres }}
+      postgres_command: ${{ steps.scope.outputs.postgres_command }}
+      postgres_retirement: ${{ steps.scope.outputs.postgres_retirement }}
+      package_lifecycle: ${{ steps.scope.outputs.package_lifecycle }}
+      terraform: ${{ steps.scope.outputs.terraform }}
+      terraform_consumer_floor: ${{ steps.scope.outputs.terraform_consumer_floor }}
+      terraform_lint: ${{ steps.scope.outputs.terraform_lint }}
+      replay: ${{ steps.scope.outputs.replay }}
+      lint: ${{ steps.scope.outputs.lint }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,9 +44,7 @@ jobs:
       - id: scope
         env:
           CI_EVENT: ${{ github.event_name }}
-        run: |
-          scope=$(scripts/ci-scope.sh)
-          echo "scope=$scope" >>"$GITHUB_OUTPUT"
+        run: scripts/ci-scope.sh >>"$GITHUB_OUTPUT"
   test:
     runs-on: billet-16vcpu-ubuntu-2404
     # THIS JOB RUNS THE SUITE TWICE AND TALKS TO TWO REAL SERVICES, so it is the
@@ -205,7 +212,7 @@ jobs:
   # made. internal/state's SQLite suite is NOT re-run here.
   test-postgres:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.postgres == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     # 30: the command suite moved to test-postgres-command, so this job is the
     # ledger backend (283.4s on main at d4d4e2e) and the capacity suite (204.2s)
@@ -267,7 +274,7 @@ jobs:
   # ^TestRetirement belongs to test-postgres-retirement and is skipped here.
   test-postgres-command:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.postgres_command == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 45
     strategy:
@@ -348,7 +355,7 @@ jobs:
   # missing or duplicate selection; test-postgres skips all TestRetirement names.
   test-postgres-retirement:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.postgres_retirement == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 75
     strategy:
@@ -423,7 +430,7 @@ jobs:
 
   lint:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.lint == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
@@ -522,7 +529,8 @@ jobs:
 
   # One Python script over the shards' reports: nothing here compiles.
   retirement-selection:
-    needs: host-lifecycle
+    needs: [changes, host-lifecycle]
+    if: needs.changes.outputs.host_lifecycle == 'true'
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 5
     steps:
@@ -541,7 +549,7 @@ jobs:
   # overrides). The artifact lives for this run only.
   gate-binaries:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.host_lifecycle == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -563,7 +571,8 @@ jobs:
           retention-days: 1
 
   host-lifecycle:
-    needs: gate-binaries
+    needs: [changes, gate-binaries]
+    if: needs.changes.outputs.host_lifecycle == 'true'
     # Every group compiles billet at least once except retirement-node-shape,
     # which runs the shard checker and four plays, so it alone takes the small
     # runner; the others hold the 8 vCPU one until a measured run says otherwise.
@@ -906,7 +915,7 @@ jobs:
   # by then and it costs about a minute.
   package-lifecycle:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.package_lifecycle == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -951,7 +960,7 @@ jobs:
   # a mocked provider: no credentials, nothing created, real provider schemas.
   terraform:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.terraform == 'true'
     # Named by the leg's ROLE, not its version: a required-status-check
     # configured against a name that embeds the pin would silently stop being
     # satisfied on the next version bump.
@@ -1034,7 +1043,7 @@ jobs:
   # what a consumer resolves: the module sources without tests.
   terraform-consumer-floor:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.terraform_consumer_floor == 'true'
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -1069,7 +1078,7 @@ jobs:
   # workflow and `make tf-lint`/`make tf-scan` cannot drift apart.
   terraform-lint:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.terraform_lint == 'true'
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -1112,7 +1121,7 @@ jobs:
   # value is already spent on the same code by the three-hundred-job run there.
   replay:
     needs: changes
-    if: needs.changes.outputs.scope == 'full'
+    if: needs.changes.outputs.replay == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -1178,24 +1187,45 @@ jobs:
       - name: Verify all checks passed
         env:
           NEEDS: ${{ toJSON(needs) }}
-          # The jobs a docs-scoped run still runs. Every other job this needs may be
-          # skipped on such a run, and only on such a run: a docs change cannot
-          # reach them, and changes decided it, not a guess.
+          EVENT: ${{ github.event_name }}
+          # The jobs every run runs, whatever the change.
           KEPT: '["changes", "test", "release-config", "docs"]'
+          # Every other job, and the one family whose selection is the only
+          # permission to skip it.
+          FAMILY: >-
+            {"test-postgres": "postgres", "test-postgres-command": "postgres_command",
+             "test-postgres-retirement": "postgres_retirement", "lint": "lint",
+             "gate-binaries": "host_lifecycle", "host-lifecycle": "host_lifecycle",
+             "retirement-selection": "host_lifecycle", "package-lifecycle": "package_lifecycle",
+             "terraform": "terraform", "terraform-consumer-floor": "terraform_consumer_floor",
+             "terraform-lint": "terraform_lint", "replay": "replay"}
         run: |
           # Every needed job must have SUCCEEDED: a skipped or cancelled job is
           # not a passed one, and reading it as one is a green check over an
-          # unverified tree. The one exception is a job changes scoped out, and
-          # changes itself must have succeeded for its decision to count.
-          scope=$(jq -r '.changes.outputs.scope // ""' <<<"$NEEDS")
-          if ! jq -e --arg scope "$scope" --argjson kept "$KEPT" '
-              .changes.result == "success" and
-              ($scope == "full" or $scope == "docs") and
+          # unverified tree. The one exception is a job whose own family changes
+          # did not select, and only when changes itself succeeded with a
+          # readable decision. Each job is judged by its own family, so a job
+          # that was selected and then skipped (because what it needs failed) is
+          # a failure, never a permitted skip. A push selects every family.
+          if ! jq -e --argjson kept "$KEPT" --argjson family "$FAMILY" --arg event "$EVENT" '
+              . as $needs |
+              .changes as $c |
+              ($c.outputs // {}) as $o |
+              ($family | [.[]] | unique) as $families |
+              $c.result == "success" and
+              $o.schema == "2" and
+              ($families | all(. as $f | $o[$f] == "true" or $o[$f] == "false")) and
+              ($event != "push" or ($families | all(. as $f | $o[$f] == "true"))) and
+              ($family | keys | all(. as $j | $kept | index($j) | not)) and
+              (keys | all(. as $j | ($kept | index($j)) or ($family | has($j)))) and
+              ($kept + ($family | keys) | all(. as $j | $needs | has($j))) and
               (to_entries | all(
+                .key as $j |
                 .value.result == "success" or
-                ($scope == "docs" and .value.result == "skipped" and (.key as $k | $kept | index($k) | not))
+                (.value.result == "skipped" and ($family | has($j)) and $o[$family[$j]] == "false")
               ))' <<<"$NEEDS" >/dev/null; then
-            echo "not every check passed (scope: ${scope:-none}):"
+            echo "not every check passed:"
+            jq -r '"  selected: \(.changes.outputs // {} | to_entries | map(select(.value == "true") | .key) | join(", "))"' <<<"$NEEDS"
             jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
             exit 1
           fi

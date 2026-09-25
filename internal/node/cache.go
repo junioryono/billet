@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -67,6 +68,9 @@ type CacheService struct {
 	actionIO   actionsVolumeManager
 	actionRule ActionsPolicy
 	observer   CacheObserver
+	// closed wakes whatever runs RetryClosed when a session is closed with its
+	// volumes still to discard.
+	closed chan struct{}
 }
 
 type cacheSession struct {
@@ -87,6 +91,10 @@ type cacheSession struct {
 	// answered.
 	inflight int
 	closed   bool
+	// closing mirrors closed without the session lock, which RetryClosed holds
+	// for the whole of a discard. Closing an already closed session must not
+	// wait on storage.
+	closing atomic.Bool
 	// finished says the session has left the service's indexes and its record
 	// is gone; an outcome recorded after that is reported but no longer written,
 	// or the record would come back as an orphan.
@@ -215,6 +223,7 @@ func NewCacheService(
 		actionIO:   hostActionsVolumeManager{},
 		wait:       sleepFor,
 		now:        time.Now,
+		closed:     make(chan struct{}, 1),
 	}
 	if err := service.loadSessions(); err != nil {
 		return nil, err
@@ -561,18 +570,52 @@ func (s *CacheService) finishSession(session *cacheSession) error {
 
 // Cleanup discards every volume after its compute is proved gone.
 func (s *CacheService) Cleanup(ctx context.Context, instance string) error {
-	s.mu.Lock()
-	token, ok := s.byInstance[instance]
-	if !ok {
-		s.mu.Unlock()
-
+	session := s.sessionOf(instance)
+	if session == nil {
 		return nil
 	}
 
-	session := s.byToken[token]
-	s.mu.Unlock()
+	return s.cleanupSession(ctx, session, true, true)
+}
 
-	return s.cleanupSession(ctx, session, true)
+// Close ends an instance's session after its compute is proved gone and leaves
+// its volumes to RetryClosed.
+//
+// A DISCARD IS STORAGE, NOT COMPUTE, and does not belong on the path that proved
+// the compute gone: a storage cluster that refuses or ignores `rbd rm` must cost
+// nothing but the discard itself. The closed record is durable before this
+// returns, so nothing is lost by discarding later, and a session already closed
+// is not waited for, because RetryClosed may hold it for as long as storage takes.
+func (s *CacheService) Close(ctx context.Context, instance string) error {
+	session := s.sessionOf(instance)
+	if session == nil || session.closing.Load() {
+		return nil
+	}
+
+	return s.cleanupSession(ctx, session, true, false)
+}
+
+// ClosedSessions is signalled whenever a session is closed with volumes still to
+// discard; whatever runs RetryClosed wakes on it.
+func (s *CacheService) ClosedSessions() <-chan struct{} { return s.closed }
+
+func (s *CacheService) sessionOf(instance string) *cacheSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	token, ok := s.byInstance[instance]
+	if !ok {
+		return nil
+	}
+
+	return s.byToken[token]
+}
+
+func (s *CacheService) signalClosed() {
+	select {
+	case s.closed <- struct{}{}:
+	default:
+	}
 }
 
 // RetryClosed releases cache volumes whose earlier cleanup was interrupted.
@@ -586,7 +629,7 @@ func (s *CacheService) RetryClosed(ctx context.Context) error {
 
 	var failures []error
 	for _, session := range sessions {
-		if err := s.cleanupSession(ctx, session, false); err != nil {
+		if err := s.cleanupSession(ctx, session, false, true); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -595,8 +638,9 @@ func (s *CacheService) RetryClosed(ctx context.Context) error {
 }
 
 // ReconcileInventory closes cache sessions whose compute is absent from a
-// successful provider inventory. Only a successful list is evidence: an empty
-// inventory is meaningful, while a list error must leave every session fenced.
+// successful provider inventory, leaving their volumes to RetryClosed. Only a
+// successful list is evidence: an empty inventory is meaningful, while a list
+// error must leave every session fenced.
 func (s *CacheService) ReconcileInventory(ctx context.Context, instances []*provider.Instance) error {
 	present := make(map[string]bool, len(instances))
 	for _, instance := range instances {
@@ -606,7 +650,7 @@ func (s *CacheService) ReconcileInventory(ctx context.Context, instances []*prov
 	s.mu.Lock()
 	missing := make([]*cacheSession, 0)
 	for _, session := range s.byToken {
-		if !present[session.instance] {
+		if !present[session.instance] && !session.closing.Load() {
 			missing = append(missing, session)
 		}
 	}
@@ -614,7 +658,7 @@ func (s *CacheService) ReconcileInventory(ctx context.Context, instances []*prov
 
 	var failures []error
 	for _, session := range missing {
-		if err := s.cleanupSession(ctx, session, true); err != nil {
+		if err := s.cleanupSession(ctx, session, true, false); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -665,10 +709,12 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 	return errors.Join(failures...)
 }
 
+// cleanupSession closes a session when closeSession is set (otherwise it acts
+// only on one already closed), then discards its volumes when discard is set.
 func (s *CacheService) cleanupSession(
 	ctx context.Context,
 	session *cacheSession,
-	closeSession bool,
+	closeSession, discard bool,
 ) error {
 	if err := lockCacheSession(ctx, session); err != nil {
 		return err
@@ -683,6 +729,7 @@ func (s *CacheService) cleanupSession(
 	}
 
 	session.closed = true
+	session.closing.Store(true)
 	if err := s.persistSession(session); err != nil {
 		return fmt.Errorf("node: record closed cache session for %s: %w", session.instance, err)
 	}
@@ -690,6 +737,12 @@ func (s *CacheService) cleanupSession(
 	// THE SESSION IS OVER, so what it never observed is now known, and a report
 	// the plane never answered gets its last chance from this process.
 	s.settleObservation(ctx, session)
+
+	if !discard {
+		s.signalClosed()
+
+		return nil
+	}
 
 	var failures []error
 	for slot, attachment := range session.slots {

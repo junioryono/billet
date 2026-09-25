@@ -108,6 +108,7 @@ func (s *CacheService) loadSessions() error {
 			actions:  record.Actions,
 			receipts: record.Receipts,
 		}
+		session.closing.Store(record.Closed)
 		if session.actions == nil {
 			session.actions = make(map[string]*actionsArchive)
 		}
