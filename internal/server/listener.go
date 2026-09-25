@@ -3102,6 +3102,10 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
 	}
 
+	if len(leases) > 0 {
+		l.order.bought(l.tier)
+	}
+
 	l.mu.Lock()
 
 	l.trackHeld(leases)
