@@ -49,6 +49,8 @@ type fakeRegistrar struct {
 	mu       sync.Mutex
 	err      error
 	accepted []string
+	// drained is every draining mark the plane asked the ledger for.
+	drained []withdrawal
 	// last is the whole registration, so a wire test can prove the fields
 	// actually arrived rather than only that a name did.
 	last alloc.NodeRegistration
@@ -77,6 +79,26 @@ type withdrawal struct {
 	name        string
 	epoch       int64
 	incarnation string
+}
+
+// NodeDraining records the fence a draining refusal presented, as NodeWithdrawn
+// does for a withdrawal.
+func (f *fakeRegistrar) NodeDraining(
+	_ context.Context, name string, epoch int64, incarnation string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.drained = append(f.drained, withdrawal{name: name, epoch: epoch, incarnation: incarnation})
+
+	return nil
+}
+
+func (f *fakeRegistrar) drainings() []withdrawal {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.drained)
 }
 
 // NodeWithdrawn records the fence a withdrawal presented, so a wire test can
