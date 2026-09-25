@@ -28,7 +28,7 @@ Ubuntu 26.04 LTS, kernel 7.0.0-29-generic, on the reference host in `docs/refere
 The mdraid RAID1 root on `nvme1n1`/`nvme2n1` is untouched and still holds `/`, `/var/lib/billet` and the control-plane database.
 
 ```bash
-cephadm bootstrap --mon-ip 192.168.1.126 --single-host-defaults \
+cephadm bootstrap --mon-ip 192.168.1.10 --single-host-defaults \
   --skip-dashboard --skip-monitoring-stack --ssh-user <account-with-passwordless-sudo>
 ceph orch daemon add osd linux-01:/dev/nvme0n1
 ceph orch daemon add osd linux-01:/dev/nvme3n1
