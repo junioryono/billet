@@ -2166,14 +2166,14 @@ func codeBuildRegion(cfg *config.Config) string {
 func cmdTeardown(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet teardown")
 	cfgPath := addConfigFlag(fs)
-	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, or its label)")
+	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
 	force := fs.Bool("force", false,
 		"delete even if the scale set's labels are not this tier's (requires --tier)")
 	group := fs.String("runner-group", "",
 		"the runner group to look in, for a --tier the config no longer declares")
 	targetName := fs.String("target", "",
-		"the target a --tier the config no longer declares belongs to (default: the only one)")
+		"the one target to act on for --tier (default: every target declaring it, or the only one)")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 
 	if err := parse(fs, args); err != nil {
@@ -2207,7 +2207,21 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			"scale set")
 	}
 
-	wanted, undeclared, err := teardownTargets(cfg.Tiers, *tier, *group, *force)
+	if *all && *targetName != "" {
+		return errors.New("--target scopes one --tier; --all walks every target")
+	}
+
+	// --target SCOPES THE NAME TO ONE TARGET. Several targets may declare one
+	// scale-set name, and one may have stopped declaring it while another still
+	// does; unscoped, the name matches the live set and the leftover stays.
+	candidates := cfg.Tiers
+	if *targetName != "" {
+		if candidates, err = tiersOnTarget(cfg, *targetName); err != nil {
+			return err
+		}
+	}
+
+	wanted, undeclared, err := teardownTargets(candidates, *tier, *group, *force)
 	if err != nil {
 		return err
 	}
@@ -2218,9 +2232,6 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	if undeclared {
 		fmt.Printf("%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
 			*tier, *cfgPath, groupOrDefault(*group))
-	} else if *targetName != "" {
-		return errors.New("--target names where to look for a --tier the config no longer " +
-			"declares; a declared tier's target comes from the config")
 	}
 
 	// EVERY TARGET IN CONFIG ORDER, each with its own client and its own
@@ -2958,7 +2969,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(os.Stdout, t.Label, report, time.Now())
+			printTierCapacity(os.Stdout, tierDisplay(t), report, time.Now())
 		}
 	}
 

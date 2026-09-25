@@ -221,10 +221,19 @@ func TestTeardownFindsATierByItsScaleSetName(t *testing.T) {
 		t.Fatalf("wanted both tiers answering to billet-2vcpu, got %v (undeclared %v)", got, undeclared)
 	}
 
-	// The label is not a scale set, so an object left behind under it is
-	// undeclared and needs its group from the operator.
+	// The label is not a scale set: alone it is refused naming the set the tier
+	// answers to, and with a group it deletes a set left under that name.
 	_, _, err = teardownTargets(tiers, "platform-2vcpu", "", false)
-	if err == nil || !strings.Contains(err.Error(), "is not a tier in the config") {
-		t.Fatalf("a label whose tier answers to another name was matched: %v", err)
+	if err == nil || !strings.Contains(err.Error(), `answers to "billet-2vcpu"`) {
+		t.Fatalf("a label whose tier answers to another name: %v", err)
+	}
+
+	left, undeclared, err := teardownTargets(tiers, "platform-2vcpu", "default", false)
+	if err != nil {
+		t.Fatalf("teardownTargets with a group: %v", err)
+	}
+
+	if !undeclared || len(left) != 1 || left[0].ScaleSetName() != "platform-2vcpu" {
+		t.Fatalf("wanted the set left under platform-2vcpu, got %v (undeclared %v)", left, undeclared)
 	}
 }

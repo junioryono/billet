@@ -67,6 +67,18 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 	}
 
 	if group == "" {
+		// A tier's own label names nothing on GitHub once it has a runs_on, so the
+		// operator is asking either for the tier's set, by its other name, or for
+		// a set left under the old one, which needs its group like any other.
+		for i := range tiers {
+			if tiers[i].Label == tier {
+				return nil, false, fmt.Errorf(
+					"tier %q answers to %q on GitHub; pass --tier %q to delete its scale set, "+
+						"or name a runner group with --runner-group to delete a set left under %q",
+					tier, tiers[i].ScaleSetName(), tiers[i].ScaleSetName(), tier)
+			}
+		}
+
 		return nil, false, fmt.Errorf(
 			"%q is not a tier in the config, so nothing says which runner group it is in; "+
 				"name it with --runner-group (billet's default group is %q)",
@@ -82,4 +94,34 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 	}
 
 	return []config.Tier{{Label: tier, RunnerGroup: group}}, true, nil
+}
+
+// tiersOnTarget narrows the config's tiers to one target's, so a scale-set name
+// several targets declare can be torn down on one of them, and a set one target
+// no longer declares is undeclared there whatever the others say.
+func tiersOnTarget(cfg *config.Config, name string) ([]config.Tier, error) {
+	target, err := targetByName(cfg, name)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []config.Tier
+
+	for i := range cfg.Tiers {
+		if resolved, ok := cfg.TierTarget(&cfg.Tiers[i]); ok && resolved.Name == target.Name {
+			out = append(out, cfg.Tiers[i])
+		}
+	}
+
+	return out, nil
+}
+
+// tierDisplay names a tier for an operator, with the runs-on name workflows use
+// when it is not the label.
+func tierDisplay(t *config.Tier) string {
+	if t.ScaleSetName() == t.Label {
+		return t.Label
+	}
+
+	return t.Label + " (runs-on " + t.ScaleSetName() + ")"
 }

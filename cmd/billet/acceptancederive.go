@@ -187,8 +187,8 @@ func setStateDir(server *yaml.Node, dir string) error {
 
 // prefixTierLabels prefixes every tier's label and returns the results.
 //
-// THE LABEL IS THE SCALE SET, which is why this is the single most load-bearing
-// edit in the file. `billet acceptance down` runs `teardown --all`, which deletes
+// THE LABEL IS THE SCALE SET once runs_on is dropped, as it is here, which is why
+// this is the single most load-bearing edit in the file. `billet acceptance down` runs `teardown --all`, which deletes
 // the scale set of every tier in the config it is given — so if a derived label
 // equalled a real one, the teardown would delete the production deployment's
 // scale set and every runner registration in it.

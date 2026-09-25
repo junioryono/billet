@@ -82,9 +82,9 @@ func (s *Server) reportUndeclaredScaleSets(
 			}
 
 			s.log.Warn("a scale set billet created is no longer declared by any tier; "+
-				"it advertises nothing, so a job using that label queues rather than failing. "+
-				"Remove it with `billet teardown --tier <label> --runner-group <group> --target <name>`",
-				"tier", rec.Label, "group", rec.RunnerGroup, "scale_set", rec.ID,
+				"it advertises nothing, so a job using that name in runs-on queues rather than failing. "+
+				"Remove it with `billet teardown --tier <name> --runner-group <group> --target <target>`",
+				"name", rec.Label, "group", rec.RunnerGroup, "scale_set", rec.ID,
 				"target", target.Config.Name, "path", path)
 		}
 	}

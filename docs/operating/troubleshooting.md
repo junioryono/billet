@@ -7,7 +7,7 @@ The failure mode of this system is a job that queues rather than an error. Start
 | Symptom | Cause | Fix |
 |---|---|---|
 | `billet status` shows the tier at `0 available` | billet advertises nothing for it; another tier's reservation holds the capacity, or no live node can serve it | reduce a tier, raise the ceiling, or check the node is registered and live |
-| the label matches nothing | `runs-on` must equal a tier's label exactly; the label is the scale set's name | fix the label or the tier |
+| the label matches nothing | `runs-on` must equal a tier's scale-set name exactly: its `runs_on`, or its label when it has none (`billet check` lists both) | fix the label or the tier |
 | the runner group grants no repository | a group with selected visibility and an empty repository list routes nothing and reports nothing; `billet check` refuses it, and a REST `PATCH` that sets visibility without re-sending repository ids clears the list | grant the repository in the group |
 | the workflow is not on the group's allowlist | the allowlist includes the ref, so `…/ci.yml@refs/heads/main` does not match a run on another branch | add the exact workflow identity |
 | old queued runs pile up | a backlog of runs that were never assignable keeps new dispatches queued | cancel them and dispatch fresh |

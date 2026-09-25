@@ -414,8 +414,8 @@ func (h *handler) scaleSetFor(ctx context.Context, tier config.Tier) (int, error
 	}
 
 	if set == nil {
-		return 0, fmt.Errorf("nodeplane: tier %q has no scale set in runner group %q",
-			tier.Label, tier.RunnerGroup)
+		return 0, fmt.Errorf("nodeplane: tier %q has no scale set named %q in runner group %q",
+			tier.Label, tier.ScaleSetName(), tier.RunnerGroup)
 	}
 
 	h.setsMu.Lock()

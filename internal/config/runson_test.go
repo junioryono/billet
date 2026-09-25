@@ -108,3 +108,31 @@ func TestSizesExpandRunsOnAsTheyExpandTheLabel(t *testing.T) {
 		t.Errorf("a ladder without runs_on answers to %q", plain[0].ScaleSetName())
 	}
 }
+
+// Uniqueness is per GitHub owner, not per config name: a second target on the
+// same organization, or a repository inside it, cannot answer to a name the
+// organization's tiers already do.
+func TestAScaleSetNameIsUniquePerOwnerNotPerTargetName(t *testing.T) {
+	for name, entry := range map[string]string{
+		"the same organization":        "    org: acme\n",
+		"a repository inside that org": "    repository: acme/widgets\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Replace(twoTargets(t), "    repository: someone/widgets\n", entry, 1)
+			if !strings.Contains(body, entry) {
+				t.Fatal("the fixture's second target has changed, so this case patches nothing")
+			}
+
+			body = withRunsOn(t, body, "personal", "billet-8vcpu-ubuntu-2404")
+
+			_, err := Load(writeConfig(t, body))
+			if err == nil {
+				t.Fatal("Load accepted one scale-set name twice on one owner")
+			}
+
+			if !strings.Contains(err.Error(), "billet-8vcpu-ubuntu-2404") {
+				t.Errorf("the refusal does not name the scale set: %v", err)
+			}
+		})
+	}
+}

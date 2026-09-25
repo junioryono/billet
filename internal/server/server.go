@@ -624,7 +624,7 @@ func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet,
 		s.log.Warn("this scale set still has the message session an earlier control "+
 			"plane left behind, so this one cannot open its own yet; waiting for GitHub "+
 			"to expire it. Queued jobs are not lost while this waits",
-			"tier", t.Label, "attempt", attempt, "retry-in", sessionRetryFor)
+			"tier", t.Label, "runs_on", t.ScaleSetName(), "attempt", attempt, "retry-in", sessionRetryFor)
 
 		// A TIMER RATHER THAN time.After, WHICH THIS REPOSITORY BANS. `time.After`
 		// holds its timer until it fires whatever else the select does, so a control

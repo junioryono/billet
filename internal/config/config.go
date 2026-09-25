@@ -44,8 +44,9 @@ type Config struct {
 	// Targets are the further organizations and repositories this deployment
 	// serves, each with its own App credential. See GitHubTargets.
 	Targets []GitHubConfig `yaml:"targets,omitempty"`
-	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
-	// its Label is what users put in `runs-on`.
+	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, named by
+	// its runs_on (its label unless it names one), which is what users put in
+	// `runs-on`.
 	Tiers []Tier `yaml:"tiers,omitempty"`
 	// Backup is where archives go when they leave this disk. Optional: absent
 	// means `billet local backup --out <dir>` is the whole story and an
@@ -2048,7 +2049,8 @@ func (b *BackupS3Config) normalize() {
 	}
 }
 
-// Tier is one runner shape. Its Label is what appears in `runs-on`.
+// Tier is one runner shape. Its Label identifies it in the deployment and its
+// ScaleSetName is what appears in `runs-on`.
 type Tier struct {
 	Label string `yaml:"label"`
 
@@ -6507,7 +6509,8 @@ func validateHostPort(field, addr string) error {
 	return nil
 }
 
-// TierByLabel returns the tier a `runs-on` label refers to.
+// TierByLabel returns the tier with this label, billet's identity for it; that
+// is its `runs-on` value only when it names no runs_on.
 func (c *Config) TierByLabel(label string) (*Tier, bool) {
 	for i := range c.Tiers {
 		if c.Tiers[i].Label == label {

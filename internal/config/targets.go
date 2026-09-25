@@ -511,9 +511,10 @@ func (c *Config) validateTierTargets() []error {
 		names = append(names, t.Name)
 	}
 
-	// A scale set's name is unique within its target, so two tiers on one target
-	// may not share one, and tiers on different targets may.
-	type scaleSet struct{ target, name string }
+	// A scale set's name is unique within the GitHub owner it lives on, keyed by
+	// the target's path rather than its config name, so two targets on one
+	// organization cannot both carry it either.
+	type scaleSet struct{ path, name string }
 
 	claimed := make(map[scaleSet]string, len(c.Tiers))
 
@@ -527,12 +528,12 @@ func (c *Config) validateTierTargets() []error {
 
 		target, ok := c.TierTarget(t)
 		if ok {
-			key := scaleSet{target: target.Name, name: t.ScaleSetName()}
+			key := scaleSet{path: target.Path(), name: t.ScaleSetName()}
 			if other, dup := claimed[key]; !dup {
 				claimed[key] = t.Label
 			} else if other != t.Label {
-				errs = append(errs, fmt.Errorf("%s: tier %q already answers to %q on target %s; "+
-					"a scale set's name is unique within its target", where, other, key.name, target.Name))
+				errs = append(errs, fmt.Errorf("%s: tier %q already answers to %q on %s; "+
+					"a scale set's name is unique within its target", where, other, key.name, key.path))
 			}
 		}
 		if !ok {
@@ -549,6 +550,24 @@ func (c *Config) validateTierTargets() []error {
 		}
 
 		errs = append(errs, TierTargetPolicyErrors(where, *t, target)...)
+	}
+
+	// AN ORGANIZATION'S SET ALSO TAKES ITS REPOSITORIES' JOBS, so a repository
+	// target inside an organization target cannot answer to a name the
+	// organization's tiers do: either set could run the repository's job.
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		target, ok := c.TierTarget(t)
+		if !ok || !target.IsRepository() {
+			continue
+		}
+
+		if other, dup := claimed[scaleSet{path: target.Owner(), name: t.ScaleSetName()}]; dup {
+			errs = append(errs, fmt.Errorf("tier %q answers to %q on %s, and tier %q answers to it "+
+				"on the organization %s, whose scale set would take the same jobs", t.Label,
+				t.ScaleSetName(), target.Path(), other, target.Owner()))
+		}
 	}
 
 	return errs

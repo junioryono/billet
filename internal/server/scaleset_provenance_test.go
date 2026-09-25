@@ -78,7 +78,7 @@ func (h *capturingHandler) warningsAbout(group, label string) []slog.Record {
 
 		r.Attrs(func(a slog.Attr) bool {
 			switch a.Key {
-			case "tier":
+			case "name":
 				gotLabel = a.Value.String()
 			case "group":
 				gotGroup = a.Value.String()
