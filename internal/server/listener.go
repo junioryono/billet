@@ -3074,8 +3074,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 			return err
 		}
+		// The identity is the message's own, which is the evidence a cache
+		// authority will be decided from; what each field holds per event is
+		// measured on the fleet from this line (#226).
 		l.log.Info("a pooled runner started a job", "tier", l.tier,
-			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
+			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID,
+			"run", msg.Started[i].RunID, "event", msg.Started[i].Event,
+			"owner", msg.Started[i].Owner, "repository", msg.Started[i].Repository,
+			"workflow_ref", msg.Started[i].WorkflowRef)
 	}
 
 	resolved, err := l.resolveMessage(ctx, msg)
