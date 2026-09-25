@@ -1,6 +1,6 @@
 # The shared uplink
 
-What a morning of failing fetches from the reference deployment's guests turned out to be, measured on 2026-09-11, and what billet changed because of it. The deployment is one EC2 control plane (`billet-control-01`) and one bare-metal Firecracker node (`ubuntu-01`) at a residential site, with billet's own CI running on that node's guests since PR #111.
+What a morning of failing fetches from the reference deployment's guests turned out to be, measured on 2026-09-11, and what billet changed because of it. The deployment is one EC2 control plane (`control-01`) and one bare-metal Firecracker node (`linux-01`) at a residential site, with billet's own CI running on that node's guests since PR #111.
 
 ## What failed
 

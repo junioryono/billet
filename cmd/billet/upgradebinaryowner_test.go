@@ -29,7 +29,7 @@ func TestTheInstalledBinaryIsRootsWhateverTheStagedFileSays(t *testing.T) {
 		}
 	}
 
-	if err := os.WriteFile(staged, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(staged, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +74,7 @@ func TestARestoredBinaryIsRootsAndARestoredConfigKeepsItsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(preserved, "billet"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(preserved, "billet"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

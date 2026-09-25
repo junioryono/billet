@@ -117,7 +117,7 @@ func TestStatusSaysAWaiterHasPublishedNoProgress(t *testing.T) {
 	report := func(progress string) string {
 		var b strings.Builder
 
-		printTierCapacity(&b, "platform-8vcpu", alloc.TierCapacity{
+		printTierCapacity(&b, "org-8vcpu", alloc.TierCapacity{
 			ObservedAt: "2026-09-20T11:40:00Z",
 			Listener: alloc.ListenerCapacity{
 				Exchange: "in flight", Waiting: 1,

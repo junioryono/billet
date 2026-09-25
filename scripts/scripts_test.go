@@ -47,7 +47,7 @@ func TestRepositoryKeyVerifierRequiresTheExactPrimaryKeySet(t *testing.T) {
 				output.WriteString(fingerprint)
 				output.WriteString(":'\n")
 			}
-			if err := os.WriteFile(filepath.Join(tools, "gpg"), []byte(output.String()), 0o755); err != nil {
+			if err := forkSafeWriteFile(filepath.Join(tools, "gpg"), []byte(output.String()), 0o755); err != nil {
 				t.Fatalf("write fake gpg: %v", err)
 			}
 			cmd := exec.CommandContext(t.Context(), verifier, filepath.Join(tools, "bundle.asc"), pinned)
@@ -1473,7 +1473,7 @@ func executeInstaller(t *testing.T, fixture installerFixture) (installerRun, err
 		t.Fatalf("write checksums: %v", err)
 	}
 	if fixture.oldBinary != "" {
-		if err := os.WriteFile(filepath.Join(installDir, "billet"), []byte(fixture.oldBinary), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(installDir, "billet"), []byte(fixture.oldBinary), 0o755); err != nil {
 			t.Fatalf("write existing binary: %v", err)
 		}
 	}
@@ -1671,7 +1671,7 @@ func writeInstallerArchive(t *testing.T, root, name, binary string) string {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		t.Fatalf("create %s archive directory: %v", name, err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "billet"), []byte(binary), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(directory, "billet"), []byte(binary), 0o755); err != nil {
 		t.Fatalf("write %s archive binary: %v", name, err)
 	}
 	archive := filepath.Join(root, name+".tar.gz")

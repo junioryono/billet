@@ -189,7 +189,7 @@ func provide(t *testing.T, prebuilt string) provided {
 	calls := filepath.Join(t.TempDir(), "go-calls")
 
 	shim := "#!/bin/sh\nprintf '%s\\n' \"$*\" >>" + calls + "\nexec " + realGo + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(fakes, "go"), []byte(shim), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(fakes, "go"), []byte(shim), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

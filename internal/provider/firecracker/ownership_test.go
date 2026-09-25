@@ -357,7 +357,7 @@ func TestProviderRejectsAResolvedBinaryNameThatCannotRoundTrip(t *testing.T) {
 	h := newHarness(t)
 	badName := "firecracker" + string([]byte{'\n'}) + "other"
 	badBinary := filepath.Join(filepath.Dir(h.p.execPath), badName)
-	if err := os.WriteFile(badBinary, []byte("#!/bin/true\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(badBinary, []byte("#!/bin/true\n"), 0o700); err != nil {
 		t.Fatalf("write the invalidly named binary: %v", err)
 	}
 	cfg := h.p.cfg

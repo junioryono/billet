@@ -596,6 +596,31 @@ func (r *Runner) Launch(
 	return nil
 }
 
+// forgetRunning drops this process's running entry for an instance a recovery or
+// a sweep has proved destroyed.
+//
+// BOTH RUN WHILE THIS PROCESS STILL HOLDS ITS OWN JOBS: recovery at every
+// registration, the sweep on its tick. An entry left behind keeps Holding() true
+// for compute that is gone, and a drain waits on it forever.
+func (r *Runner) forgetRunning(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.forgetRunningLocked(name)
+}
+
+// forgetRunningLocked requires r.mu. An instance is running or in custody, never
+// both: custody's finish removes only the custody entry, so a running entry beside
+// it would outlive the compute.
+func (r *Runner) forgetRunningLocked(name string) {
+	for requestID, inst := range r.running {
+		if inst != nil && inst.Name == name {
+			delete(r.running, requestID)
+			delete(r.runningLease, requestID)
+		}
+	}
+}
+
 func (r *Runner) removeRegistration(
 	ctx context.Context, leaseID string, runnerID int64, runnerName string,
 ) error {
@@ -1194,6 +1219,7 @@ func (r *Runner) Recover(ctx context.Context) error {
 			continue
 		}
 
+		r.forgetRunning(inst.Name)
 		r.cleanupCache(ctx, inst.Name)
 
 		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
@@ -1420,6 +1446,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 			continue
 		}
 
+		r.forgetRunning(inst.Name)
 		r.cleanupCache(ctx, inst.Name)
 
 		// Its lease is already terminal — that is what made this an orphan — so
@@ -1565,8 +1592,9 @@ func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, e
 	if set == nil {
 		// Reconciliation creates these before any listener starts, so an absent
 		// one means somebody removed it underneath a running control plane.
-		return 0, fmt.Errorf("node: tier %s has no scale set on github; it was created at "+
-			"startup, so something removed it since", tier.Label)
+		return 0, fmt.Errorf("node: tier %s has no scale set on github; the control plane "+
+			"creates it at startup (under the tier's runs_on, which only it knows), so "+
+			"something removed it since", tier.Label)
 	}
 
 	r.mu.Lock()

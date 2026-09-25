@@ -143,7 +143,7 @@ func newExportHarness(t *testing.T) exportHarness {
 		}
 	}
 
-	if err := os.WriteFile(filepath.Join(h.bin, "gh"), []byte(fakeGH), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(h.bin, "gh"), []byte(fakeGH), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
 	}
 

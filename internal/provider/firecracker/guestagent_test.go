@@ -245,7 +245,7 @@ while [ "$#" -gt 0 ]; do
 done
 exit 97
 `
-	if err := os.WriteFile(filepath.Join(shadow, "setpriv"), []byte(stub), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(shadow, "setpriv"), []byte(stub), 0o755); err != nil {
 		t.Fatalf("write the validating setpriv stub: %v", err)
 	}
 
@@ -746,7 +746,7 @@ func TestTheGuestAgentStopsWhenTheDecoderFails(t *testing.T) {
 	shadow := t.TempDir()
 
 	stub := "#!/bin/sh\nprintf 'partial'\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(shadow, "base64"), []byte(stub), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(shadow, "base64"), []byte(stub), 0o755); err != nil {
 		t.Fatalf("stage a failing base64: %v", err)
 	}
 

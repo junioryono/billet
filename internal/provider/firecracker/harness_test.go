@@ -407,7 +407,11 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 			},
 			func(string, int, int) error { return nil },
 		),
-		WithBootWait(2 * time.Second),
+		// GENEROUS, because no test here waits for it to expire: every fake VMM
+		// answers, and a failed start is asserted at the start action. At 2 seconds a
+		// race-instrumented run on a loaded CI runner missed the fake's first answer
+		// and failed a test that had nothing wrong with it.
+		WithBootWait(30 * time.Second),
 	}
 
 	p, err := New(testDeployment, cfg, h.disk, append(fixed, opts...)...)

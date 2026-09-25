@@ -88,15 +88,11 @@ UPDATE nodes
 -- asking tier may not share them -- so the two differ in what they do with the
 -- rows, never in which rows exist.
 --
--- `drained = 0` IS REDUNDANT WITH `live = 1` IN EVERY STATE REACHABLE TODAY, and
--- that is said here rather than left for somebody to discover: a decommission
--- writes drained = 1 and live = 0 together, and a re-registration clears both
--- together, so no API path produces a live host that is drained. Measured --
--- deleting either half of this predicate fails no test in internal/alloc, while
--- deleting `live = 1` alone does. It stays because the two columns answer
--- different questions (can this host be reached, and does anybody still expect
--- it to serve), and the next path that sets liveness without going through
--- registration must not silently start placing work on an excluded host.
+-- `drained = 0` IS WHAT KEEPS A DRAINING HOST OUT. A decommission writes
+-- drained = 1 and live = 0 together, and MarkNodeDraining writes drained = 1 on
+-- a host that stays live, because its process still has running work to answer
+-- for; a re-registration clears both. The two columns answer different questions:
+-- can this host be reached, and does it take new work.
 SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
   FROM nodes
  WHERE live = 1 AND drained = 0
@@ -317,6 +313,19 @@ UPDATE nodes SET live = 0 WHERE name = @name AND epoch = @epoch;
 -- those, exactly as it does after silence. What changes is that ListPlaceableNodes
 -- stops offering the host at once instead of after the silence window.
 UPDATE nodes SET live = 0
+ WHERE name = @name AND epoch = @epoch AND incarnation = @incarnation;
+
+-- name: MarkNodeDraining :execrows
+-- Record that one host's process refused new work because it is draining, and
+-- take it out of placement while it drains.
+--
+-- `drained`, NOT `live`: the process is still polling, still answering the
+-- destroys and completions its running work needs, and must stay live for them.
+-- ListPlaceableNodes reads both columns, and the next registration (the host's
+-- process after its restart) clears `drained` as it always has. Fenced on the
+-- epoch and the incarnation exactly as WithdrawNode is, so a superseded process
+-- cannot take its replacement out of placement. Zero rows is the fence moving.
+UPDATE nodes SET drained = 1
  WHERE name = @name AND epoch = @epoch AND incarnation = @incarnation;
 
 -- name: ForgetEveryNode :exec

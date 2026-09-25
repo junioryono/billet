@@ -755,7 +755,7 @@ func TestAServiceThatExitsImmediatelyIsCaughtAndOneThatDoesNotIsNot(t *testing.T
 	self := filepath.Join(dir, "fake-billet")
 
 	script := "#!/bin/sh\ncase \"$1\" in\n  server) exec sleep 30 ;;\n  node) exit 1 ;;\nesac\n"
-	if err := os.WriteFile(self, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(self, []byte(script), 0o755); err != nil {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 
@@ -799,7 +799,7 @@ func TestStoppingAServiceIsSafeHoweverManyTimesItHappens(t *testing.T) {
 	dir := t.TempDir()
 	self := filepath.Join(dir, "fake-billet")
 
-	if err := os.WriteFile(self, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(self, []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 
@@ -984,6 +984,42 @@ func TestADerivedLabelThatIsAlreadyARealTierIsRefused(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "accept-linux-2vcpu") {
 		t.Errorf("the refusal does not name the colliding label: %v", err)
+	}
+}
+
+// A runs_on names a production scale set as surely as a label does, so a
+// derived label equal to one is refused, and a derived tier keeps no runs_on:
+// kept, it would put the run on that production set and `down` would delete it.
+func TestADerivedTierAnswersToItsDerivedLabelNotTheBaseRunsOn(t *testing.T) {
+	t.Parallel()
+
+	const tier = "  - label: linux-2vcpu\n"
+	if !strings.Contains(acceptanceBaseConfig, tier) {
+		t.Fatal("the fixture's tier has changed, so this case patches nothing")
+	}
+
+	colliding := strings.Replace(acceptanceBaseConfig, tier,
+		tier+"    runs_on: accept-linux-2vcpu\n", 1)
+
+	_, err := deriveAcceptance(t.Context(), acceptanceInputs{
+		base:      writeAcceptanceBase(t, colliding),
+		workspace: t.TempDir(),
+		prefix:    defaultLabelPrefix,
+	})
+	if err == nil || !strings.Contains(err.Error(), "accept-linux-2vcpu") {
+		t.Fatalf("a derived label equal to a base runs_on was not refused by name: %v", err)
+	}
+
+	shared := strings.Replace(acceptanceBaseConfig, tier, tier+"    runs_on: shared-2vcpu\n", 1)
+	ws := deriveForTest(t, writeAcceptanceBase(t, shared), t.TempDir())
+
+	derived, err := os.ReadFile(ws.ConfigPath)
+	if err != nil {
+		t.Fatalf("read the derived config: %v", err)
+	}
+
+	if strings.Contains(string(derived), "runs_on") || strings.Contains(string(derived), "shared-2vcpu") {
+		t.Errorf("the derived config still answers to the base runs_on:\n%s", derived)
 	}
 }
 
