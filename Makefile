@@ -395,26 +395,6 @@ hybrid-emission-check: ## Prove the inventory and playbook `billet init hybrid` 
 hybrid-root-check: ## Prove the Terraform root `billet init hybrid` writes validates against this checkout's module
 	scripts/hybrid-root-check.sh
 
-.PHONY: acceptance
-acceptance: ## Run an ISOLATED acceptance deployment against a real account, and destroy exactly what it makes
-	@# NOT IN `check`, and not in CI's ordinary jobs: it launches billable compute
-	@# in a real AWS account and needs a real GitHub App. .github/workflows/
-	@# acceptance.yml is what runs it on a schedule, against the dedicated account
-	@# docs/reference/records/aws-acceptance.md names.
-	@#
-	@# BILLET_ACCEPTANCE_CONFIG is the config to DERIVE FROM; the run never writes
-	@# to it, and every path, port, tier label and deployment identity it uses is
-	@# its own.
-	@test -n "$(BILLET_ACCEPTANCE_CONFIG)" || { \
-		echo "set BILLET_ACCEPTANCE_CONFIG to the billet.yaml to derive an isolated run from" >&2; \
-		echo "  make acceptance BILLET_ACCEPTANCE_CONFIG=/etc/billet/billet.yaml BILLET_ACCEPTANCE_ACCOUNT=..." >&2; \
-		exit 2; \
-	}
-	scripts/acceptance.sh --config $(BILLET_ACCEPTANCE_CONFIG) \
-		$(if $(BILLET_ACCEPTANCE_ACCOUNT),--account $(BILLET_ACCEPTANCE_ACCOUNT),) \
-		$(if $(BILLET_ACCEPTANCE_REGION),--region $(BILLET_ACCEPTANCE_REGION),) \
-		$(if $(BILLET_ACCEPTANCE_JOBS),--jobs $(BILLET_ACCEPTANCE_JOBS),)
-
 .PHONY: host-fresh-check
 host-fresh-check: ## Check-mode converge of the host role against a FRESH machine (the collection README's documented first step)
 	ansible_collections/junioryono/billet/tests/host-fresh-check.sh
@@ -450,8 +430,8 @@ postgres-restore-rehearsal: dist ## Rehearse a restore of a deployment whose led
 # need a config with a working GitHub App (BILLET_REHEARSAL_APP_CONFIG) and the
 # key it names (BILLET_REHEARSAL_APP_KEY), because a control plane will not start
 # without one; they SKIP rather than fail without it. Outside `check` for that
-# reason and because each runs for ten to twenty minutes; rehearsals.yml runs
-# them weekly and on dispatch, and records go to docs/reference/records/.
+# reason and because each runs for ten to twenty minutes; they are run by hand
+# against an App the operator provides, and records go to docs/reference/records/.
 .PHONY: rollout-rehearsal
 rollout-rehearsal: ## Move two packaged hosts from one PUBLISHED release to the next by rollout, then roll a bad candidate back
 	@# THE ONE REHEARSAL THAT USES PUBLISHED RELEASES rather than dist: what it
