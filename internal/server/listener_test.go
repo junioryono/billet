@@ -1796,7 +1796,7 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 		t.Fatalf("late legacy registration: %v", err)
 	}
 	if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 71, name,
-		22, 202, "late-job"); !errors.Is(err, alloc.ErrConflict) {
+		22, 202, "late-job", alloc.JobIdentity{}); !errors.Is(err, alloc.ErrConflict) {
 		t.Fatalf("late JobStarted crossed custody recovery fence: %v", err)
 	}
 }

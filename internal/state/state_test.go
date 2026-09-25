@@ -1455,6 +1455,13 @@ func TestAPendingCompletionWrittenAtVersion25SurvivesVersion26(t *testing.T) {
 			) STRICT`,
 			`DROP TABLE job_identities`,
 			`DELETE FROM schema_migrations WHERE version = 26`,
+			// Migration 53 adds columns to the table rebuilt above, so the
+			// rewind takes it back too and the upgrade applies both.
+			`ALTER TABLE pool_runners DROP COLUMN job_owner`,
+			`ALTER TABLE pool_runners DROP COLUMN job_repository`,
+			`ALTER TABLE pool_runners DROP COLUMN job_workflow_ref`,
+			`ALTER TABLE pool_runners DROP COLUMN job_event`,
+			`DELETE FROM schema_migrations WHERE version = 53`,
 			`INSERT INTO pending_completions
 			 (tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
 			  release_only, lease_node, message_id, retired, acknowledged)

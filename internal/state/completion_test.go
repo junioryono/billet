@@ -169,3 +169,28 @@ func TestPendingCompletionDeletionWaitsForSettlementAndAcknowledgement(t *testin
 		t.Fatalf("settled and acknowledged completion remained: %+v", got)
 	}
 }
+
+// WHAT THE COMPLETION SAID ABOUT ITS JOB SURVIVES WITH IT, every field read
+// back, because a restored completion is compared against the binding and a
+// field that did not round-trip would make every restored completion either
+// unprovable or, worse, equal to an empty binding.
+func TestAPendingCompletionKeepsItsJobIdentity(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+	completion := PendingCompletion{
+		Tier: "linux", RequestID: 18, RunID: 33, Result: "succeeded", MessageID: 4,
+		JobID: "job-18", JobOwner: "acme", JobRepository: "api",
+		JobWorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main", JobEvent: "push",
+	}
+	if _, err := db.PutPendingCompletion(ctx, completion); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+
+	got, err := db.PendingCompletions(ctx, "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if !slices.Equal(got, []PendingCompletion{completion}) {
+		t.Fatalf("pending completions = %+v, want %+v", got, completion)
+	}
+}

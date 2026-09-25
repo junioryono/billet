@@ -3732,7 +3732,9 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 	}
 
 	if _, err := l.alloc.StartPoolRunner(ctx, leaseID, l.tier, job.RunnerID,
-		job.RunnerName, identified.RequestID, identified.RunID, identified.JobID); err != nil {
+		job.RunnerName, identified.RequestID, identified.RunID, identified.JobID,
+		alloc.JobIdentity{Owner: job.Owner, Repository: job.Repository,
+			WorkflowRef: job.WorkflowRef, Event: job.Event}); err != nil {
 		if errors.Is(err, alloc.ErrConflict) || errors.Is(err, alloc.ErrLeaseNotFound) {
 			return Job{}, fmt.Errorf("%w: cannot bind started runner %q: %w",
 				errQuarantinableStarted, job.RunnerName, err)
@@ -4573,6 +4575,7 @@ func (l *Listener) recordCompletion(
 		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 		MessageID: job.CompletionID,
 	}
+	withCompletionIdentity(&completion, job)
 	if lease != nil {
 		completion.LeaseID = lease.ID
 		completion.LeaseEpoch = lease.Epoch
@@ -4677,6 +4680,17 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 // lease release is attempted. It deliberately outlives cancellation for one
 // bounded local-write budget: otherwise shutdown would preserve a row that asks
 // restart recovery to contact a node for compute already proved absent.
+// withCompletionIdentity keeps what the completion itself said about its job on
+// the durable row, so a completion restored after a restart is still evidence
+// of its own rather than a copy of the binding it is compared with.
+func withCompletionIdentity(completion *state.PendingCompletion, job Job) {
+	completion.JobID = job.JobID
+	completion.JobOwner = job.Owner
+	completion.JobRepository = job.Repository
+	completion.JobWorkflowRef = job.WorkflowRef
+	completion.JobEvent = job.Event
+}
+
 func (l *Listener) recordReleaseOnly(
 	ctx context.Context,
 	job Job,
@@ -4696,6 +4710,7 @@ func (l *Listener) recordReleaseOnly(
 		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: lease.Node,
 		Outcome: string(outcome), ReleaseOnly: true, MessageID: job.CompletionID,
 	}
+	withCompletionIdentity(&completion, job)
 	disposition, err := l.completionStore.PutPendingCompletion(persistCtx, completion)
 	if err != nil {
 		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
@@ -4921,7 +4936,9 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 	for i := range completions {
 		completion := &completions[i]
 		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result,
-			CompletionID: completion.MessageID}
+			CompletionID: completion.MessageID, JobID: completion.JobID,
+			Owner: completion.JobOwner, Repository: completion.JobRepository,
+			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}
 		if completion.Retired {
 			continue
 		}

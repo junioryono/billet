@@ -86,6 +86,10 @@ type PoolRunner struct {
 	JobID              string
 	SourceAcknowledged int64
 	UpdatedAt          string
+	JobOwner           string
+	JobRepository      string
+	JobWorkflowRef     string
+	JobEvent           string
 }
 
 type RevokedCert struct {

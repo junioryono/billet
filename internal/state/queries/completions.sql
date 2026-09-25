@@ -21,12 +21,19 @@ SELECT message_id, retired FROM pending_completions
 -- redelivery can only ever move them forward.
 INSERT INTO pending_completions
 	(tier, request_id, run_id, result, lease_id, lease_epoch, lease_node, outcome,
-	 release_only, message_id, retired, acknowledged)
+	 release_only, message_id, retired, acknowledged, job_id, job_owner, job_repository,
+	 job_workflow_ref, job_event)
 	VALUES (@tier, @request_id, @run_id, @result, @lease_id, @lease_epoch, @lease_node,
-	        @outcome, @release_only, @message_id, @retired, @acknowledged)
+	        @outcome, @release_only, @message_id, @retired, @acknowledged, @job_id,
+	        @job_owner, @job_repository, @job_workflow_ref, @job_event)
 	ON CONFLICT(tier, request_id) DO UPDATE SET
 		run_id=excluded.run_id,
 		result=excluded.result,
+		job_id=excluded.job_id,
+		job_owner=excluded.job_owner,
+		job_repository=excluded.job_repository,
+		job_workflow_ref=excluded.job_workflow_ref,
+		job_event=excluded.job_event,
 		lease_id=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND (pending_completions.retired = 1 OR
 			     pending_completions.release_only > excluded.release_only)
@@ -93,5 +100,6 @@ DELETE FROM pending_completions
 -- name: ListPendingCompletions :many
 -- One tier's outstanding obligations.
 SELECT tier, request_id, run_id, result, lease_id, lease_epoch, lease_node,
-       outcome, release_only, message_id, retired, acknowledged
+       outcome, release_only, message_id, retired, acknowledged, job_id, job_owner,
+       job_repository, job_workflow_ref, job_event
   FROM pending_completions WHERE tier = @tier ORDER BY request_id;
