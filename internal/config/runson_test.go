@@ -116,6 +116,7 @@ func TestAScaleSetNameIsUniquePerOwnerNotPerTargetName(t *testing.T) {
 	for name, entry := range map[string]string{
 		"the same organization":        "    org: acme\n",
 		"a repository inside that org": "    repository: acme/widgets\n",
+		"that org spelled otherwise":   "    repository: ACME/widgets\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			body := strings.Replace(twoTargets(t), "    repository: someone/widgets\n", entry, 1)

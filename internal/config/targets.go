@@ -513,7 +513,8 @@ func (c *Config) validateTierTargets() []error {
 
 	// A scale set's name is unique within the GitHub owner it lives on, keyed by
 	// the target's path rather than its config name, so two targets on one
-	// organization cannot both carry it either.
+	// organization cannot both carry it either. Folded, because GitHub compares
+	// owners, repositories and these names without case.
 	type scaleSet struct{ path, name string }
 
 	claimed := make(map[scaleSet]string, len(c.Tiers))
@@ -528,7 +529,7 @@ func (c *Config) validateTierTargets() []error {
 
 		target, ok := c.TierTarget(t)
 		if ok {
-			key := scaleSet{path: target.Path(), name: t.ScaleSetName()}
+			key := scaleSet{path: strings.ToLower(target.Path()), name: strings.ToLower(t.ScaleSetName())}
 			if other, dup := claimed[key]; !dup {
 				claimed[key] = t.Label
 			} else if other != t.Label {
@@ -563,7 +564,8 @@ func (c *Config) validateTierTargets() []error {
 			continue
 		}
 
-		if other, dup := claimed[scaleSet{path: target.Owner(), name: t.ScaleSetName()}]; dup {
+		owner := scaleSet{path: strings.ToLower(target.Owner()), name: strings.ToLower(t.ScaleSetName())}
+		if other, dup := claimed[owner]; dup {
 			errs = append(errs, fmt.Errorf("tier %q answers to %q on %s, and tier %q answers to it "+
 				"on the organization %s, whose scale set would take the same jobs", t.Label,
 				t.ScaleSetName(), target.Path(), other, target.Owner()))
