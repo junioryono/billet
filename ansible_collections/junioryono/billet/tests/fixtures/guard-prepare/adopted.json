@@ -4,7 +4,7 @@
   "adopted": true,
   "holder": "ci-1",
   "claimed_at": "2026-09-09T11:00:00Z",
-  "hostname": "billet-control-01",
+  "hostname": "control-01",
   "preparing": false,
   "record": {
     "release_executable": "/usr/bin/billet",
