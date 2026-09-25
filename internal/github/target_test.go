@@ -72,7 +72,7 @@ func TestThePermissionSetIsChosenByScopeAndOnlyThere(t *testing.T) {
 		}
 	}
 
-	org, repo := Permissions(ScopeOrganization), Permissions(ScopeRepository)
+	org, repo := Permissions(ScopeOrganization, false), Permissions(ScopeRepository, false)
 
 	var shared []string
 
@@ -126,8 +126,8 @@ func TestRepositoryPermissionsAreValidatedAgainstTheRepositorySet(t *testing.T) 
 
 			inst := &Installation{Permissions: tc.granted}
 
-			if got := inst.PermissionMismatches(ScopeRepository); !slices.Equal(got, tc.want) {
-				t.Errorf("PermissionMismatches(repository) = %v, want %v", got, tc.want)
+			if got := inst.PermissionMismatches(ScopeRepository, false); !slices.Equal(got, tc.want) {
+				t.Errorf("PermissionMismatches(repository, false) = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -136,7 +136,7 @@ func TestRepositoryPermissionsAreValidatedAgainstTheRepositorySet(t *testing.T) 
 	// falsifies "billet cannot change your repositories".
 	inst := &Installation{Permissions: map[string]string{"metadata": "read",
 		"organization_self_hosted_runners": "write", "administration": "write"}}
-	if got := inst.PermissionMismatches(ScopeOrganization); len(got) != 1 ||
+	if got := inst.PermissionMismatches(ScopeOrganization, false); len(got) != 1 ||
 		!strings.Contains(got[0], "administration: granted write, but billet never requested it") {
 		t.Errorf("an organization installation holding administration was not refused: %v", got)
 	}
@@ -172,7 +172,7 @@ func TestVerifyAsksTheTargetsOwnInstallationEndpoint(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			if _, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), tc.target, 42); err != nil {
+			if _, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(), tc.target, 42, false); err != nil {
 				t.Fatalf("verifyAppAt: %v", err)
 			}
 
@@ -190,7 +190,7 @@ func TestARepositoryInstallationIsHeldToTheRepositorySet(t *testing.T) {
 		"permissions": {"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 
 	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(),
-		RepositoryTarget("someone", "widgets"), 42)
+		RepositoryTarget("someone", "widgets"), 42, false)
 	if err == nil {
 		t.Fatal("a repository installation holding the organization set was accepted")
 	}
@@ -209,7 +209,7 @@ func TestANotInstalledRepositoryNamesTheRepository(t *testing.T) {
 	srv, _ := verifyFake(t, http.StatusNotFound, `{"message":"Not Found"}`)
 
 	_, err := verifyAppAt(t.Context(), srv.Client(), srv.URL, 7, testAppKey(),
-		RepositoryTarget("someone", "widgets"), 42)
+		RepositoryTarget("someone", "widgets"), 42, false)
 	if err == nil || !strings.Contains(err.Error(), `not installed on repository "someone/widgets"`) {
 		t.Errorf("unexpected error: %v", err)
 	}

@@ -51,6 +51,8 @@ description: "What `make check` runs and why each piece is inside or outside it;
 
 **Go comments wrap at 88 columns; Markdown never wraps.** Go source follows the surrounding file. Every `.md` and `.txt` file is one paragraph per line.
 
+**One gRPC server, in one package.** The depguard rule `remoteapis` confines `github.com/bazelbuild/remote-apis`, `google.golang.org/grpc`, `google.golang.org/genproto` and `google.golang.org/protobuf` to `internal/node/reapi`, which serves the cache half of the Remote Execution API over a `Volume` the node hands it and knows nothing of sessions or publication. A test that needs a real gRPC client lives in `reapi_test`; a node test replaces `CacheService.remoteAPI` with a recording handler instead of importing gRPC. Adding the API cost 462,848 bytes (1.2%) of a stripped linux/amd64 binary, because gRPC was already linked through an existing dependency (2026-09-25).
+
 ## Measured facts
 
 - `make lint` on darwin alone missed a linux-only conversion error that CI caught; hence the second pass.

@@ -26,7 +26,9 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -130,7 +132,7 @@ func (a *actionsArchive) valid() error {
 }
 
 func (s *CacheService) actionsMountPath(session *cacheSession, archive *actionsArchive) string {
-	return filepath.Join(s.rootState, "actions-cache-volumes", session.token, archive.ID)
+	return filepath.Join(s.rootState, "actions-cache-volumes", session.pathID, archive.ID)
 }
 
 func (s *CacheService) actionsArchivePath(session *cacheSession, archive *actionsArchive) string {
@@ -179,34 +181,18 @@ func (s *CacheService) actionsResponse(
 		return nil, false, nil
 	}
 
-	// Untrusted work never writes a generation that trusted work can read. GitHub
-	// remains authoritative for untrusted-pool cache traffic; Billet does not
-	// derive storage authority from the assignment that caused scale-up.
-	if session.trust != provider.TrustTrusted || s.actionRule == nil {
+	keys, disposition := s.actionsKeysFor(req.Context(), session)
+	if disposition != "" {
 		if cacheCall {
-			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
+			s.observeActions(req.Context(), session, disposition)
 		}
 
 		return nil, false, nil
 	}
-	policyCtx, cancel := context.WithTimeout(req.Context(), actionsPolicyLimit)
-	allowed, policyErr := s.actionRule.ActionsCacheAllowed(policyCtx,
-		session.owner, session.repository)
-	cancel()
-	if policyErr != nil {
-		s.log.Warn("Actions cache policy is unavailable",
-			"instance", session.instance, "owner", session.owner,
-			"repository", session.repository, "error", policyErr)
-		if cacheCall {
-			s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
-		}
-
-		return nil, false, nil
-	}
-	if !allowed {
-		if cacheCall {
-			s.observeActions(req.Context(), session, alloc.ActionsCacheDisabled)
-		}
+	// A JOB THAT MAY NOT WRITE ITS OWN REF RESERVES NOTHING HERE: its save goes to
+	// GitHub, which applies its own rule to the same job.
+	if req.URL.Path == actionsCreatePath && keys.write == nil {
+		s.observeActions(req.Context(), session, alloc.ActionsCacheSpliced)
 
 		return nil, false, nil
 	}
@@ -221,13 +207,13 @@ func (s *CacheService) actionsResponse(
 
 	switch req.URL.Path {
 	case actionsCreatePath:
-		response, err := s.createActionsCache(req.Context(), req.Body, session, origin)
+		response, err := s.createActionsCache(req.Context(), req.Body, session, origin, keys)
 		return response, true, err
 	case actionsFinalizePath:
 		response, err := s.finalizeActionsCache(req.Context(), req.Body, session)
 		return response, true, err
 	case actionsDownloadPath:
-		response, err := s.findActionsCache(req.Context(), req.Body, session, origin)
+		response, err := s.findActionsCache(req.Context(), req.Body, session, origin, keys)
 		return response, true, err
 	default:
 		response, err := s.serveActionsBlob(req, session)
@@ -407,8 +393,144 @@ func actionsVersionPrefix(session *cacheSession, version string) string {
 	return actionsStorePrefix + actionsScopeDigest(session) + "/" + hex.EncodeToString(digest[:]) + "/"
 }
 
+// actionsStoreKey is the store key of one entry of a trusted-only session.
 func (s *CacheService) actionsStoreKey(session *cacheSession, key, version string) string {
 	return s.qualifiedKey(actionsVersionPrefix(session, version) + key)
+}
+
+// actionsKeys are where one session's Actions cache calls read and write.
+type actionsKeys struct {
+	// write is the prefix a save is reserved under, or nil when the job may not
+	// write anywhere billet serves.
+	write func(version string) string
+	// read are the prefixes a lookup tries, in GitHub's restore order.
+	read func(version string) []string
+}
+
+// actionsKeysFor decides where a session's Actions cache calls go, or the
+// disposition that sends them to GitHub instead.
+//
+// A TRUSTED-ONLY SESSION is scoped by its static workflow, as it always was,
+// and served only for a trusted pool. A DEFAULT-BRANCH SESSION is scoped by the
+// ref GitHub proves for its job, asked of the control plane: a job restores from
+// its own ref, then its pull request's base branch, then the default branch,
+// and saves only under its own ref, and only where GitHub would let it. An
+// authority that is not proven sends every call to GitHub.
+func (s *CacheService) actionsKeysFor(
+	ctx context.Context, session *cacheSession,
+) (actionsKeys, alloc.ActionsCache) {
+	if sessionPolicy(session) != config.CachePublishDefaultBranch {
+		// Untrusted work never writes a generation that trusted work can read.
+		if session.trust != provider.TrustTrusted || s.actionRule == nil {
+			return actionsKeys{}, alloc.ActionsCacheSpliced
+		}
+		policyCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
+		allowed, policyErr := s.actionRule.ActionsCacheAllowed(policyCtx,
+			session.owner, session.repository)
+		cancel()
+		if policyErr != nil {
+			s.log.Warn("Actions cache policy is unavailable",
+				"instance", session.instance, "owner", session.owner,
+				"repository", session.repository, "error", policyErr)
+
+			return actionsKeys{}, alloc.ActionsCacheSpliced
+		}
+		if !allowed {
+			return actionsKeys{}, alloc.ActionsCacheDisabled
+		}
+		prefix := func(version string) string {
+			return s.qualifiedKey(actionsVersionPrefix(session, version))
+		}
+
+		return actionsKeys{write: prefix, read: func(version string) []string {
+			return []string{prefix(version)}
+		}}, ""
+	}
+
+	authority, ok := s.sessionActionsAuthority(ctx, session)
+	if !ok {
+		return actionsKeys{}, alloc.ActionsCacheSpliced
+	}
+	if !s.kindAllowed(ctx, config.CacheActions, session.cache.Owner, session.cache.Repository) {
+		return actionsKeys{}, alloc.ActionsCacheDisabled
+	}
+	prefix := func(ref, version string) string {
+		refDigest := sha256.Sum256([]byte(ref))
+		versionDigest := sha256.Sum256([]byte(version))
+
+		return s.cacheKeyFor(session, config.CacheActions, "",
+			hex.EncodeToString(refDigest[:])+"/"+hex.EncodeToString(versionDigest[:])) + "/"
+	}
+	keys := actionsKeys{read: func(version string) []string {
+		var prefixes []string
+		seen := map[string]bool{}
+		for _, ref := range []string{authority.Ref, authority.BaseRef, authority.DefaultRef} {
+			if ref != "" && !seen[ref] {
+				seen[ref] = true
+				prefixes = append(prefixes, prefix(ref, version))
+			}
+		}
+
+		return prefixes
+	}}
+	if authority.WriteOwnRef {
+		keys.write = func(version string) string { return prefix(authority.Ref, version) }
+	}
+
+	return keys, ""
+}
+
+// sessionActionsAuthority is the proven authority of a default-branch
+// session's job, asked of the control plane once and kept once proven. An
+// unproven answer is not kept: the job may not have been bound yet, and the
+// next call asks again.
+func (s *CacheService) sessionActionsAuthority(
+	ctx context.Context, session *cacheSession,
+) (server.CacheAuthority, bool) {
+	session.authorityMu.Lock()
+	defer session.authorityMu.Unlock()
+	if session.actionsAuthority != nil {
+		return *session.actionsAuthority, true
+	}
+	if s.authority == nil || session.leaseID == "" || s.now().Before(session.unprovenUntil) {
+		return server.CacheAuthority{}, false
+	}
+	askCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
+	defer cancel()
+	authority, err := s.authority.CacheAuthority(askCtx, session.leaseID)
+	if err != nil {
+		s.log.Warn("could not ask what this job may do with the Actions cache; it goes to GitHub",
+			"instance", session.instance, "error", err)
+
+		return server.CacheAuthority{}, false
+	}
+	if !authority.Proven || authority.LeaseID != session.leaseID ||
+		!strings.EqualFold(authority.Owner, session.cache.Owner) ||
+		!strings.EqualFold(authority.Repository, session.cache.Repository) {
+		// AN UNPROVEN ANSWER STANDS A LITTLE WHILE: a job that cannot be proved
+		// (a fork, a pull request) makes many cache calls, and each ask costs the
+		// control plane GitHub requests.
+		session.unprovenUntil = s.now().Add(actionsUnprovenFor)
+
+		return server.CacheAuthority{}, false
+	}
+	session.actionsAuthority = &authority
+
+	return authority, true
+}
+
+// actionsUnprovenFor is how long an unproven authority stands before a job's
+// next cache call asks again.
+const actionsUnprovenFor = 30 * time.Second
+
+// actionsLimit is the largest archive a session's tier accepts.
+func actionsLimit(session *cacheSession) int64 {
+	if limit := int64(sessionSetting(session, config.CacheActions).MaxSize); limit > 0 &&
+		limit < actionsArchiveLimit {
+		return limit
+	}
+
+	return actionsArchiveLimit
 }
 
 func (s *CacheService) actionsSignedURL(archive *actionsArchive, origin string) string {
@@ -436,6 +558,7 @@ func (s *CacheService) createActionsCache(
 	body io.Reader,
 	session *cacheSession,
 	origin string,
+	keys actionsKeys,
 ) (*http.Response, error) {
 	var request struct {
 		Key     string `json:"key"`
@@ -445,7 +568,7 @@ func (s *CacheService) createActionsCache(
 		!validActionsCacheField(request.Key) || !validActionsCacheField(request.Version) {
 		return nil, errors.New("invalid Actions cache reservation")
 	}
-	storeKey := s.actionsStoreKey(session, request.Key, request.Version)
+	storeKey := keys.write(request.Version) + request.Key
 	if err := lockCacheSession(ctx, session); err != nil {
 		return nil, err
 	}
@@ -639,6 +762,9 @@ func (s *CacheService) finalizeActionsCache(
 	size, err := parseActionsSize(request.SizeBytes)
 	if err != nil {
 		return nil, err
+	}
+	if size > actionsLimit(session) {
+		return nil, fmt.Errorf("the archive is larger than this tier's %d-byte limit", actionsLimit(session))
 	}
 
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -855,6 +981,7 @@ func (s *CacheService) findActionsCache(
 	body io.Reader,
 	session *cacheSession,
 	origin string,
+	keys actionsKeys,
 ) (*http.Response, error) {
 	var request struct {
 		Key         string   `json:"key"`
@@ -885,17 +1012,27 @@ func (s *CacheService) findActionsCache(
 	if !ok {
 		return nil, errors.New("site cache store cannot match restore keys")
 	}
-	prefix := s.qualifiedKey(actionsVersionPrefix(session, request.Version))
-	restore := make([]string, len(request.RestoreKeys))
-	for index, key := range request.RestoreKeys {
-		restore[index] = prefix + key
+	// THE FIRST SCOPE THAT HAS A MATCH WINS, exact key before restore keys within
+	// it, which is GitHub's own order: a job's own ref, its base, the default.
+	var prefix, matched, generation string
+	for _, candidate := range keys.read(request.Version) {
+		restore := make([]string, len(request.RestoreKeys))
+		for index, key := range request.RestoreKeys {
+			restore[index] = candidate + key
+		}
+		found, foundGeneration, err := matcher.Match(ctx, candidate+request.Key, restore)
+		if errors.Is(err, storecontract.ErrMiss) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		prefix, matched, generation = candidate, found, foundGeneration
+
+		break
 	}
-	matched, generation, err := matcher.Match(ctx, prefix+request.Key, restore)
-	if errors.Is(err, storecontract.ErrMiss) {
+	if matched == "" {
 		return actionsJSONResponse(map[string]any{"ok": false})
-	}
-	if err != nil {
-		return nil, err
 	}
 	matchedKey, ok := strings.CutPrefix(matched, prefix)
 	if !ok || !validActionsCacheField(matchedKey) {

@@ -210,6 +210,22 @@ func TestLaunchRefusesASpecWithNoCommand(t *testing.T) {
 	}
 }
 
+// GUEST BUILD CACHES ARE A FIRECRACKER GUEST'S; a container asked for them is
+// refused rather than started to build cold.
+func TestLaunchRefusesGuestBuildCaches(t *testing.T) {
+	stub, _ := stubDocker(t)
+	p := New("billet-test", WithBinary(stub))
+
+	_, err := p.Launch(t.Context(), provider.Spec{
+		Name: "billet-runner-1", Image: "ghcr.io/actions/actions-runner:latest",
+		Trust: provider.TrustTrusted, JITConfig: "jit", Command: []string{"./run.sh"},
+		GuestCaches: []provider.GuestCache{provider.GuestCacheGo},
+	})
+	if err == nil || !strings.Contains(err.Error(), "guest build caches") {
+		t.Fatalf("Launch = %v, want a refusal naming the guest build caches", err)
+	}
+}
+
 // A spec with no registration is refused rather than launched.
 //
 // A container that starts without one registers nothing, takes no job, and sits

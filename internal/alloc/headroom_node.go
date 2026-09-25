@@ -21,7 +21,14 @@ type nodeRow struct {
 	vcpu     int
 	memory   config.ByteSize
 	shapes   []config.EC2InstanceType
+	// wire is the protocol the host's registration settled on.
+	wire int
 }
+
+// CacheAuthorityWireVersion is the oldest wire a node can honour a tier's cache
+// block on, mirrored from nodeapi.VersionCacheAuthority (a test holds them
+// equal), because nodeapi imports this package.
+const CacheAuthorityWireVersion = 23
 
 // eligibleNodes lists the live hosts a tier could actually be placed on.
 //
@@ -33,6 +40,48 @@ type nodeRow struct {
 // placement. An unordered candidate set makes the same fleet produce different
 // answers on different runs, which is untestable and unexplainable in a log.
 func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
+	return a.eligibleNodesFor(ctx, tx, t, t.NeedsCacheAwareNode())
+}
+
+// WaitsForCacheAwareHost reports whether a tier is placed nowhere only because
+// every host it could otherwise use is too old to read its cache block, which
+// is what a rollout looks like to such a tier until its first host upgrades.
+// Asked on the read-only pool, with placement's own rule, of the hosts large
+// enough for one of the tier's runners: a host too small to hold one is no
+// answer to the wait whatever its version.
+func (a *Allocator) WaitsForCacheAwareHost(ctx context.Context, t config.Tier) (bool, error) {
+	if !t.NeedsCacheAwareNode() {
+		return false, nil
+	}
+	var waits bool
+	err := a.db.View(ctx, func(tx querier) error {
+		honouring, err := a.eligibleNodesFor(ctx, tx, t, true)
+		if err != nil || slices.ContainsFunc(honouring, func(n nodeRow) bool { return n.holdsOne(t) }) {
+			return err
+		}
+		any, err := a.eligibleNodesFor(ctx, tx, t, false)
+		waits = slices.ContainsFunc(any, func(n nodeRow) bool { return n.holdsOne(t) })
+
+		return err
+	})
+
+	return waits, err
+}
+
+// holdsOne reports whether the host, empty, is large enough for one of the
+// tier's runners at what placement charges it: a remote backend's shape
+// against the budget the node contributes, as roomFor weighs it.
+func (n nodeRow) holdsOne(t config.Tier) bool {
+	cost, ok := n.cost(t)
+
+	return ok && n.vcpu >= cost.vcpu && n.memory >= cost.memory
+}
+
+// eligibleNodesFor is eligibleNodes with the cache-block rule as a parameter,
+// so a report can ask what the tier would have without it.
+func (a *Allocator) eligibleNodesFor(
+	ctx context.Context, tx querier, t config.Tier, needsCacheAware bool,
+) ([]nodeRow, error) {
 	rows, err := state.ReadQueries(tx).ListPlaceableNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: list nodes for tier %s: %w", t.Label, err)
@@ -74,6 +123,13 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 			continue
 		}
 
+		// A HOST THAT CANNOT HONOUR THE TIER'S CACHE BLOCK IS NOT A CANDIDATE, or
+		// placement would choose it again and again for a launch the plane then
+		// refuses to send, and newer hosts beside it would sit unused.
+		if n.wire < CacheAuthorityWireVersion && needsCacheAware {
+			continue
+		}
+
 		out = append(out, n)
 	}
 
@@ -91,6 +147,7 @@ func nodeRowFrom(row *ledgerdb.ListPlaceableNodesRow) (nodeRow, error) {
 		site:     row.Site,
 		vcpu:     int(row.TotalVcpu),
 		memory:   config.ByteSize(row.TotalMemory),
+		wire:     int(row.WireVersion),
 	}
 
 	shapes, err := decodeRemoteShapes(n.provider, row.Ec2Shapes)

@@ -16,14 +16,26 @@ UPDATE job_history
        cache_generation = CASE WHEN image_cache = '' THEN CAST($2 AS TEXT)
                                ELSE cache_generation END,
        actions_cache    = CASE WHEN actions_cache = '' THEN CAST($3 AS TEXT)
-                               ELSE actions_cache END
- WHERE lease_id = $4
+                               ELSE actions_cache END,
+       sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST($4 AS TEXT)
+                               ELSE sticky_cache END,
+       git_cache        = CASE WHEN git_cache = '' THEN CAST($5 AS TEXT)
+                               ELSE git_cache END,
+       bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST($6 AS TEXT)
+                               ELSE bazel_cache END,
+       go_cache         = CASE WHEN go_cache = '' THEN CAST($7 AS TEXT)
+                               ELSE go_cache END
+ WHERE lease_id = $8
 `
 
 type RecordHistoryCacheObservationParams struct {
 	ImageCache      string
 	CacheGeneration string
 	ActionsCache    string
+	StickyCache     string
+	GitCache        string
+	BazelCache      string
+	GoCache         string
 	LeaseID         string
 }
 
@@ -40,6 +52,10 @@ func (q *Queries) RecordHistoryCacheObservation(ctx context.Context, arg RecordH
 		arg.ImageCache,
 		arg.CacheGeneration,
 		arg.ActionsCache,
+		arg.StickyCache,
+		arg.GitCache,
+		arg.BazelCache,
+		arg.GoCache,
 		arg.LeaseID,
 	)
 	return err
@@ -53,14 +69,26 @@ UPDATE leases
        cache_generation = CASE WHEN image_cache = '' THEN CAST($2 AS TEXT)
                                ELSE cache_generation END,
        actions_cache    = CASE WHEN actions_cache = '' THEN CAST($3 AS TEXT)
-                               ELSE actions_cache END
- WHERE id = $4 AND epoch = $5
+                               ELSE actions_cache END,
+       sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST($4 AS TEXT)
+                               ELSE sticky_cache END,
+       git_cache        = CASE WHEN git_cache = '' THEN CAST($5 AS TEXT)
+                               ELSE git_cache END,
+       bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST($6 AS TEXT)
+                               ELSE bazel_cache END,
+       go_cache         = CASE WHEN go_cache = '' THEN CAST($7 AS TEXT)
+                               ELSE go_cache END
+ WHERE id = $8 AND epoch = $9
 `
 
 type RecordLeaseCacheObservationParams struct {
 	ImageCache      string
 	CacheGeneration string
 	ActionsCache    string
+	StickyCache     string
+	GitCache        string
+	BazelCache      string
+	GoCache         string
 	ID              string
 	Epoch           int64
 }
@@ -68,9 +96,9 @@ type RecordLeaseCacheObservationParams struct {
 // Cache observations: what the cache did for one job, as the node saw it.
 //
 // AN OBSERVATION, NEVER A VERDICT, and from a CLOSED vocabulary the node writes
-// from what it saw rather than what the tier intended -- alloc.ImageCache and
-// alloc.ActionsCache hold the sets, and every new observation goes through their
-// Valid() before it reaches a statement here. The empty string is the zero value
+// from what it saw rather than what the tier intended -- alloc.ImageCache,
+// alloc.ActionsCache and alloc.BuildCache hold the sets, and every new
+// observation goes through their Valid() before it reaches a statement here. The empty string is the zero value
 // and means nothing was observed.
 //
 // THE FIRST OBSERVATION IS KEPT, and the guard is in the statement rather than in
@@ -86,6 +114,10 @@ func (q *Queries) RecordLeaseCacheObservation(ctx context.Context, arg RecordLea
 		arg.ImageCache,
 		arg.CacheGeneration,
 		arg.ActionsCache,
+		arg.StickyCache,
+		arg.GitCache,
+		arg.BazelCache,
+		arg.GoCache,
 		arg.ID,
 		arg.Epoch,
 	)

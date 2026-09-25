@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,43 @@ import (
 // correct deployment is one an operator learns to scroll past: the listener case
 // must say the cache is served, and the case with neither a store nor a listener
 // must say nothing about caches at all.
+// A NODE WITH NO GIT IS REPORTED, NOT REFUSED, when a tier enables the git
+// cache: its jobs fetch from github.com, which works and saves nothing.
+func TestJudgeNodeCacheReportsANodeWithNoGit(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{
+		Node: &config.NodeConfig{
+			Name: "epyc-1", Provider: config.ProviderFirecracker, Site: "home",
+			Ceph:  &config.CephConfig{ImagePool: "billet-images", CachePool: "billet-cache"},
+			Cache: &config.NodeCacheConfig{Listen: "172.31.0.1:7718", GuestEndpoint: "http://172.31.0.1:7718"},
+		},
+		Tiers: []config.Tier{
+			{Label: "plain"},
+			{Label: "fetches", Cache: &config.TierCache{Git: &config.CacheToggle{Enabled: &enabled}}},
+		},
+	}
+	original := lookGit
+	t.Cleanup(func() { lookGit = original })
+
+	for present, want := range map[bool]bool{true: false, false: true} {
+		lookGit = func(string) (string, error) {
+			if present {
+				return "/usr/bin/git", nil
+			}
+
+			return "", errors.New("not found")
+		}
+		lines, err := judgeNodeCache(cfg)
+		if err != nil {
+			t.Fatalf("git present=%v: a missing git was refused: %v", present, err)
+		}
+		reported := strings.Contains(strings.Join(lines, "\n"), "NO GIT: tier fetches")
+		if reported != want {
+			t.Errorf("git present=%v: reported %v, want %v: %q", present, reported, want, lines)
+		}
+	}
+}
+
 func TestJudgeNodeCache(t *testing.T) {
 	ebsNode := func() *config.NodeConfig {
 		return &config.NodeConfig{

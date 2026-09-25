@@ -94,7 +94,7 @@ func TestLiveRepositoryScope(t *testing.T) {
 	// check` confirms it, so a finding below is about the Actions service and not
 	// about a key that never verified.
 	inst, err := github.VerifyAppAt(probeCtx(t), nil, "https://api.github.com", appID, key,
-		github.RepositoryTarget(owner, name), installationID)
+		github.RepositoryTarget(owner, name), installationID, false)
 	if err != nil {
 		t.Fatalf("verify the App against the repository: %v", err)
 	}

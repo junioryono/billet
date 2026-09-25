@@ -1,9 +1,9 @@
 -- Cache observations: what the cache did for one job, as the node saw it.
 --
 -- AN OBSERVATION, NEVER A VERDICT, and from a CLOSED vocabulary the node writes
--- from what it saw rather than what the tier intended -- alloc.ImageCache and
--- alloc.ActionsCache hold the sets, and every new observation goes through their
--- Valid() before it reaches a statement here. The empty string is the zero value
+-- from what it saw rather than what the tier intended -- alloc.ImageCache,
+-- alloc.ActionsCache and alloc.BuildCache hold the sets, and every new
+-- observation goes through their Valid() before it reaches a statement here. The empty string is the zero value
 -- and means nothing was observed.
 --
 -- THE FIRST OBSERVATION IS KEPT, and the guard is in the statement rather than in
@@ -22,7 +22,15 @@ UPDATE leases
        cache_generation = CASE WHEN image_cache = '' THEN CAST(@cache_generation AS TEXT)
                                ELSE cache_generation END,
        actions_cache    = CASE WHEN actions_cache = '' THEN CAST(@actions_cache AS TEXT)
-                               ELSE actions_cache END
+                               ELSE actions_cache END,
+       sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST(@sticky_cache AS TEXT)
+                               ELSE sticky_cache END,
+       git_cache        = CASE WHEN git_cache = '' THEN CAST(@git_cache AS TEXT)
+                               ELSE git_cache END,
+       bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST(@bazel_cache AS TEXT)
+                               ELSE bazel_cache END,
+       go_cache         = CASE WHEN go_cache = '' THEN CAST(@go_cache AS TEXT)
+                               ELSE go_cache END
  WHERE id = @id AND epoch = @epoch;
 
 -- name: RecordHistoryCacheObservation :exec
@@ -40,5 +48,13 @@ UPDATE job_history
        cache_generation = CASE WHEN image_cache = '' THEN CAST(@cache_generation AS TEXT)
                                ELSE cache_generation END,
        actions_cache    = CASE WHEN actions_cache = '' THEN CAST(@actions_cache AS TEXT)
-                               ELSE actions_cache END
+                               ELSE actions_cache END,
+       sticky_cache     = CASE WHEN sticky_cache = '' THEN CAST(@sticky_cache AS TEXT)
+                               ELSE sticky_cache END,
+       git_cache        = CASE WHEN git_cache = '' THEN CAST(@git_cache AS TEXT)
+                               ELSE git_cache END,
+       bazel_cache      = CASE WHEN bazel_cache = '' THEN CAST(@bazel_cache AS TEXT)
+                               ELSE bazel_cache END,
+       go_cache         = CASE WHEN go_cache = '' THEN CAST(@go_cache AS TEXT)
+                               ELSE go_cache END
  WHERE lease_id = @lease_id;

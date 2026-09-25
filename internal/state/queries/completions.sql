@@ -19,14 +19,36 @@ SELECT message_id, retired FROM pending_completions
 --
 -- release_only, retired and acknowledged are max()'d for the same message so a
 -- redelivery can only ever move them forward.
+--
+-- THE JOB'S IDENTITY IS KEPT WHOLE FOR THE SAME MESSAGE once one was recorded,
+-- because it is the completion's own evidence, compared with the binding after a
+-- restart: a redelivery carrying less, or something else, must not erase or
+-- replace it. A later message replaces it with the rest of the row.
 INSERT INTO pending_completions
 	(tier, request_id, run_id, result, lease_id, lease_epoch, lease_node, outcome,
-	 release_only, message_id, retired, acknowledged)
+	 release_only, message_id, retired, acknowledged, job_id, job_owner, job_repository,
+	 job_workflow_ref, job_event)
 	VALUES (@tier, @request_id, @run_id, @result, @lease_id, @lease_epoch, @lease_node,
-	        @outcome, @release_only, @message_id, @retired, @acknowledged)
+	        @outcome, @release_only, @message_id, @retired, @acknowledged, @job_id,
+	        @job_owner, @job_repository, @job_workflow_ref, @job_event)
 	ON CONFLICT(tier, request_id) DO UPDATE SET
 		run_id=excluded.run_id,
 		result=excluded.result,
+		job_id=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_id ELSE excluded.job_id END,
+		job_owner=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_owner ELSE excluded.job_owner END,
+		job_repository=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_repository ELSE excluded.job_repository END,
+		job_workflow_ref=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_workflow_ref ELSE excluded.job_workflow_ref END,
+		job_event=CASE WHEN excluded.message_id = pending_completions.message_id
+			AND pending_completions.job_id != ''
+			THEN pending_completions.job_event ELSE excluded.job_event END,
 		lease_id=CASE WHEN excluded.message_id = pending_completions.message_id
 			AND (pending_completions.retired = 1 OR
 			     pending_completions.release_only > excluded.release_only)
@@ -93,5 +115,6 @@ DELETE FROM pending_completions
 -- name: ListPendingCompletions :many
 -- One tier's outstanding obligations.
 SELECT tier, request_id, run_id, result, lease_id, lease_epoch, lease_node,
-       outcome, release_only, message_id, retired, acknowledged
+       outcome, release_only, message_id, retired, acknowledged, job_id, job_owner,
+       job_repository, job_workflow_ref, job_event
   FROM pending_completions WHERE tier = @tier ORDER BY request_id;
