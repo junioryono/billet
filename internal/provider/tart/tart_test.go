@@ -149,7 +149,7 @@ func newStub(t *testing.T) *stub {
 		"printf '%s %s\\n' \"$$\" \"$(ps -p $$ -o lstart=)\" >> \"$HOME/" + spawnedPIDs + "\"\n" +
 		"exec sleep 30\n"
 
-	if err := os.WriteFile(runner, []byte(body), 0o755); err != nil {
+	if err := forkSafeWriteFile(runner, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake runner: %v", err)
 	}
 
@@ -424,7 +424,7 @@ exec)
 esac
 `
 
-	if err := os.WriteFile(s.bin, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(s.bin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
 
@@ -573,7 +573,7 @@ exit 127
 `,
 	}
 	for name, body := range shims {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			t.Fatalf("write the %s shim: %v", name, err)
 		}
 	}
@@ -1153,7 +1153,7 @@ func TestResolveImageRefusesAnUnpinnedRemoteAnswer(t *testing.T) {
 	echo := filepath.Join(t.TempDir(), "tart-echo")
 	script := "#!/bin/sh\nif [ \"$1\" = fqn ]; then printf '%s\\n' \"$2\"; exit 0; fi\nexit 64\n"
 
-	if err := os.WriteFile(echo, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(echo, []byte(script), 0o755); err != nil {
 		t.Fatalf("write echo stub: %v", err)
 	}
 
@@ -1175,7 +1175,7 @@ func TestAnUnrelatedErrorIsNotMisreadAsUnpulled(t *testing.T) {
 	fail := filepath.Join(t.TempDir(), "tart-fail")
 	script := "#!/bin/sh\necho \"registry timeout while checking whether \\\"x doesn't point to a digest\\\" applies\" >&2\nexit 1\n"
 
-	if err := os.WriteFile(fail, []byte(script), 0o755); err != nil {
+	if err := forkSafeWriteFile(fail, []byte(script), 0o755); err != nil {
 		t.Fatalf("write failing stub: %v", err)
 	}
 

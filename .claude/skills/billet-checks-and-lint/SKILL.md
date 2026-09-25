@@ -73,3 +73,5 @@ description: "What `make check` runs and why each piece is inside or outside it;
 ## Related skills
 
 `billet-testing` (the mutation discipline the guards protect), `billet-state` (why the ledger rules exist), `billet-shell-gates` (the same "a gate must be able to fail" rule applied to shell), `billet-git-flow` (when the gate runs).
+
+**Superseded CI runs are force-cancelled.** `ci.yml`'s concurrency group asks GitHub to cancel an older run of the same ref, but a run whose jobs are queued for self-hosted runners ignores an ordinary cancel and keeps its place in the fleet's queue. `.github/workflows/cancel-superseded.yml` runs on a GitHub-hosted runner on every push to `main` and every same-repository PR push, and force-cancels each unfinished CI run on that branch whose head is not the pushed commit.

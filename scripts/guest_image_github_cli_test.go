@@ -47,7 +47,7 @@ func TestTheGateRefusesAnImageWithoutTheGitHubCLI(t *testing.T) {
 				"check_github_cli \"$1\"\necho \"FAILED=$FAILED\"\n"
 
 			path := filepath.Join(t.TempDir(), "gate.sh")
-			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
 

@@ -90,7 +90,7 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 		"echo \"multiuser=$saw_multiuser agent=$saw_agent docker=$docker_started\"\n"
 
 	path := filepath.Join(dir, "watch.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 

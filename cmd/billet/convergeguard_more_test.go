@@ -629,7 +629,7 @@ func TestTheRecordedExecutableIsNeverRun(t *testing.T) {
 
 			marker := filepath.Join(t.TempDir(), "ran")
 			script := "#!/bin/sh\ntouch " + marker + "\n"
-			if err := os.WriteFile(f.binary, []byte(script), 0o755); err != nil {
+			if err := forkSafeWriteFile(f.binary, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 
