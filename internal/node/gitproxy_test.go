@@ -3,8 +3,8 @@ package node
 import (
 	"bytes"
 	"compress/gzip"
-	"errors"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
