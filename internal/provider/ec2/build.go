@@ -833,9 +833,12 @@ const (
 // The environment belongs to the same contract: setpriv does not reset it, so
 // without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
 // then fails every job step that writes to $HOME.
+//
+// LANG is GitHub's Ubuntu runners' C.UTF-8: without it every job runs in the C
+// locale, where tools that normalise or print Unicode fail or mangle it.
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
 	"  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
-	"HOME=/home/runner USER=runner LOGNAME=runner"
+	"HOME=/home/runner USER=runner LOGNAME=runner LANG=C.UTF-8"
 
 // jobTimingHookPath ends in the extension GitHub uses to select the hook's
 // interpreter. A shebang and executable mode are not sufficient.
