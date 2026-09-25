@@ -87,36 +87,39 @@ func TestAStalledWaiterStopsHoldingTheLineAndKeepsItsPlace(t *testing.T) {
 	}
 }
 
-// A LAUNCH IN FLIGHT IS PROGRESS, HOWEVER LONG THE NODE TAKES. A launch can run
-// for the node's whole command timeout, far past the allowance, and a waiter
-// doing one is not stalled.
-func TestALaunchInFlightKeepsAWaiterHoldingTheLine(t *testing.T) {
+// A LAUNCH STARTING OR FINISHING IS PROGRESS; ONE STILL IN FLIGHT IS NOT. A
+// waiter launching slot after slot keeps the line while each launch comes back
+// within the allowance, and one whose launch outlasts it lets other tiers past
+// until the launch returns.
+func TestALaunchLongerThanTheAllowanceLetsOtherTiersPast(t *testing.T) {
 	t.Parallel()
 
-	clock := time.Date(2026, 9, 23, 15, 48, 0, 0, time.UTC)
+	clock := time.Date(2026, 9, 25, 3, 33, 0, 0, time.UTC)
 	q := newAdmissionQueue(config.AdmissionFair)
 	q.now = func() time.Time { return clock }
 
 	shared := alloc.TierAdmission{CanGrow: true, Nodes: []string{"ubuntu-01"}}
 
 	q.waits("b-large", shared)
+	clock = clock.Add(WaiterAllowance - time.Second)
+
+	// The launch starting is progress: the allowance starts again from it.
 	q.launchBegins("b-large")
-
-	clock = clock.Add(10 * WaiterAllowance)
-	if q.mayBuy("a-small", shared) {
-		t.Fatal("a waiter with a launch in flight was treated as stalled")
-	}
-
-	// The launch finishing is progress: the allowance starts again from it.
-	q.launchEnds("b-large")
 	clock = clock.Add(WaiterAllowance - time.Second)
 	if q.mayBuy("a-small", shared) {
-		t.Fatal("the allowance did not restart when the waiter's launch finished")
+		t.Fatal("the allowance did not restart when the waiter's launch began")
 	}
 
 	clock = clock.Add(2 * time.Second)
 	if !q.mayBuy("a-small", shared) {
-		t.Fatal("a waiter with nothing in flight and no progress for the allowance still held the line")
+		t.Fatal("a waiter whose launch outlasted the allowance still held the line")
+	}
+
+	// The launch finishing is progress too, and the waiter holds from its place.
+	q.launchEnds("b-large")
+	clock = clock.Add(WaiterAllowance - time.Second)
+	if q.mayBuy("a-small", shared) {
+		t.Fatal("the allowance did not restart when the waiter's launch finished")
 	}
 }
 
@@ -166,11 +169,11 @@ func (s *slowLauncher) Launch(ctx context.Context, lease *alloc.Lease, job Job) 
 	return s.launchLog.Launch(ctx, lease, job)
 }
 
-// A WAITER IN THE MIDDLE OF A LAUNCH HOLDS THE LINE, THROUGH THE LISTENER. A
-// launch can take the node's whole command timeout; the listener's own launch
-// path is what marks it in flight, so a waiter doing one is not treated as
-// stalled however long it takes.
-func TestAWaiterMidLaunchHoldsTheLineThroughTheListener(t *testing.T) {
+// A LAUNCH STARTING DATES A WAITER'S PROGRESS, THROUGH THE LISTENER, AND ONE
+// THAT OUTLASTS THE ALLOWANCE LETS A COMPETING TIER PAST. The listener's own
+// launch path is what marks the start: without it the waiter below would read as
+// stalled from its last refusal, two allowances back.
+func TestAWaiterMidLaunchHoldsTheLineOnlyWithinTheAllowance(t *testing.T) {
 	t.Parallel()
 
 	tiers := contenders()
@@ -200,17 +203,23 @@ func TestAWaiterMidLaunchHoldsTheLineThroughTheListener(t *testing.T) {
 		t.Fatal("the large tier found no room and is not recorded as waiting")
 	}
 
-	// A small job ends; the large tier buys the 8 vCPU and starts a launch that
-	// takes ten allowances.
+	// Nearly an allowance later a small job ends; the large tier buys the 8 vCPU
+	// and starts a launch that does not return.
+	clock.Add(int64(WaiterAllowance - time.Second))
 	freeOneLease(t, a)
 	done := make(chan error, 1)
 	go func() { done <- large.reconcilePool(t.Context(), 1) }()
 	<-runner.began
 
-	clock.Add(int64(10 * WaiterAllowance))
+	clock.Add(int64(WaiterAllowance - time.Second))
 	freeOneLease(t, a)
 	if small.order.mayBuy("a-small", small.admission(t.Context())) {
-		t.Error("a waiter in the middle of a launch was treated as stalled and let a competing tier past it")
+		t.Error("a waiter whose launch began within the allowance was treated as stalled")
+	}
+
+	clock.Add(int64(2 * time.Second))
+	if !small.order.mayBuy("a-small", small.admission(t.Context())) {
+		t.Error("a waiter whose launch outlasted the allowance still held the line")
 	}
 
 	close(runner.release)
