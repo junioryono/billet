@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 )
 
 // THE GUEST AGENT'S DECODE IS RUN HERE, not described here.
@@ -781,5 +782,54 @@ func TestBothSidesOfTheGuestContractAgree(t *testing.T) {
 	if got := string(match[1]); got != GuestContract {
 		t.Errorf("the guest image understands contract %s and billet speaks %s, so every "+
 			"guest built from this script would refuse every launch", got, GuestContract)
+	}
+}
+
+// THE GUEST'S BUILD CACHES TRAVEL AS ONE STRING LEAF, in the order the node gave
+// them, and only beside a cache session: a guest configuring GOCACHEPROG with no
+// node to serve it would send every build to a refused connection.
+func TestGuestCachesTravelBesideACacheSession(t *testing.T) {
+	t.Parallel()
+
+	spec := aSpec()
+	spec.CacheEndpoint, spec.CacheToken = "http://172.31.0.1:7718", "token"
+	spec.BuildKitCacheMountLimit = config.GiB
+	spec.GuestCaches = []provider.GuestCache{provider.GuestCacheGo, provider.GuestCacheBazel}
+	if err := checkSpec(spec); err != nil {
+		t.Fatalf("checkSpec: %v", err)
+	}
+	md, err := metadata(spec)
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	billet := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)
+	if got := billet["guest-caches"]; got != "go,bazel" {
+		t.Errorf("guest-caches = %v, want \"go,bazel\"", got)
+	}
+
+	for name, mutate := range map[string]func(*provider.Spec){
+		"no cache session": func(s *provider.Spec) {
+			s.CacheEndpoint, s.CacheToken, s.BuildKitCacheMountLimit = "", "", 0
+		},
+		"an unknown cache": func(s *provider.Spec) { s.GuestCaches = []provider.GuestCache{"rust"} },
+		"a repeated cache": func(s *provider.Spec) {
+			s.GuestCaches = []provider.GuestCache{provider.GuestCacheGo, provider.GuestCacheGo}
+		},
+	} {
+		refused := spec
+		refused.GuestCaches = slices.Clone(spec.GuestCaches)
+		mutate(&refused)
+		if err := checkSpec(refused); err == nil {
+			t.Errorf("%s: checkSpec accepted guest caches it cannot serve", name)
+		}
+	}
+
+	spec.GuestCaches = nil
+	md, err = metadata(spec)
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	if _, ok := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)["guest-caches"]; ok {
+		t.Error("a guest with no build caches was told about some")
 	}
 }

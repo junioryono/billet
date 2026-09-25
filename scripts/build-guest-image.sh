@@ -235,6 +235,39 @@ install_container_hook() {
 	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
 }
 
+# install_guest_billet builds billet from this tree into the image, with the newest
+# go the image's toolcache carries, and installs Bazel's credential helper beside
+# it. The go command's own GOTOOLCHAIN rule fetches (and verifies) a newer
+# toolchain when go.mod asks for one the toolcache lacks.
+install_guest_billet() {
+	local rootfs=$1
+	local candidate go="" newest=""
+	for candidate in "$rootfs$TOOLCACHE_DIR"/go/*/x64/bin/go; do
+		[ -x "$candidate" ] || continue
+		local version=${candidate#"$rootfs$TOOLCACHE_DIR"/go/}
+		version=${version%%/*}
+		if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$version" | sort -V | tail -n 1)" = "$version" ]; then
+			newest=$version
+			go=$candidate
+		fi
+	done
+	if [ -z "$go" ]; then
+		echo "the image's toolcache carries no go to build billet with; the go and bazel" >&2
+		echo "  build caches need billet inside the guest" >&2
+		exit 1
+	fi
+	install -d -m 0755 "$rootfs/opt/billet/bin"
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=readonly \
+		GOPATH="$WORK/go" GOCACHE="$WORK/go-build" \
+		"$go" -C "$SCRIPT_DIR/.." build -trimpath -o "$rootfs/opt/billet/bin/billet" ./cmd/billet
+	chmod 0755 "$rootfs/opt/billet/bin/billet"
+	install -m 0755 /dev/stdin "$rootfs/opt/billet/bin/bazel-credential-helper" <<'HELPER'
+#!/bin/sh
+exec /opt/billet/bin/billet cache credential-helper "$@"
+HELPER
+	echo "guest billet: built with go $newest"
+}
+
 read_guest_contract() {
 	local rootfs="$1"
 	local agent="$rootfs/usr/local/bin/billet-agent"
@@ -941,6 +974,13 @@ IMAGEINFO
 	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
 		"$rootfs/opt/billet/bin/docker"
 
+	# BILLET ITSELF, for the build caches: it is the go command's GOCACHEPROG and
+	# Bazel's credential helper on a tier that enables them, and nothing starts it
+	# otherwise. Built here from this very tree, with the newest go the toolcache
+	# step just installed, because a hosted build runner has had its own go
+	# removed to make room; the go command verifies every module against go.sum.
+	install_guest_billet "$rootfs"
+
 	# THE CONTAINER HOOK: GitHub's reference docker hook, pinned by version and
 	# sha256 the way the runner is, behind a wrapper that adds one mount. The
 	# runner runs it with its own node, so the guest needs no node of its own.
@@ -1084,6 +1124,14 @@ else
 	cache_endpoint=""
 	cache_token=""
 	buildkit_cache_mount_limit_bytes=""
+fi
+
+# THE BUILD CACHES THE TIER ENABLES, a comma-separated list the node derives from
+# the tier's cache block. Absent on an older node, and meaningless without a cache
+# session, so either leaves every build tool as the image ships it.
+guest_caches=""
+if [ -n "$cache_endpoint" ]; then
+	guest_caches=$(fetch guest-caches 2>/dev/null) || guest_caches=""
 fi
 
 # TRANSPARENT ACTIONS CACHE REQUESTS USE A NODE-LOCAL TLS TERMINATOR. The proxy
@@ -1616,6 +1664,50 @@ if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
 fi
+# THE BUILD CACHES, each configured only when the node offered it AND this image
+# carries billet to serve it; an image without the binary builds cold rather than
+# naming a GOCACHEPROG the go command cannot start, which fails every build. The
+# seams are defaulted variables so a test executes this block against fixtures.
+GUEST_BILLET="${GUEST_BILLET:-/opt/billet/bin/billet}"
+BAZELRC_FILE="${BAZELRC_FILE:-/etc/bazel.bazelrc}"
+# BILLET_GUEST_CACHES_BEGIN
+guest_go=""
+guest_go_tests=""
+guest_bazel=""
+if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -x "$GUEST_BILLET" ]; then
+	IFS=, read -r -a requested_caches <<<"$guest_caches"
+	for cache in ${requested_caches[@]+"${requested_caches[@]}"}; do
+		case "$cache" in
+			go) guest_go=1 ;;
+			go-test-results) guest_go_tests=1 ;;
+			bazel) guest_bazel=1 ;;
+			*) log "this image does not know the guest cache \"$cache\"; ignoring it" ;;
+		esac
+	done
+fi
+if [ -n "$guest_go" ]; then
+	# THE ONLY WAY OUT IS GOCACHEPROG= (EMPTY) IN A WORKFLOW: the go command
+	# prefers GOCACHEPROG to GOCACHE, so setting GOCACHE alone changes nothing.
+	runner_env+=("GOCACHEPROG=$GUEST_BILLET cache gocacheprog")
+	# TEST RESULTS ARE SHARED ONLY WHEN THE TIER SAYS SO. Without it every go
+	# test runs; GOFLAGS applies -count=1 to the commands that know it and no
+	# other.
+	if [ -z "$guest_go_tests" ]; then
+		runner_env+=("GOFLAGS=-count=1")
+	fi
+fi
+if [ -n "$guest_bazel" ]; then
+	# THE BEARER IS NOT IN THIS FILE. Bazel asks the credential helper, which
+	# answers from the runner's environment and only for the node's own host.
+	bazel_host=${cache_endpoint#*://}
+	bazel_host=${bazel_host%%/*}
+	bazel_host=${bazel_host%%:*}
+	{
+		printf '%s\n' "build --remote_cache=${cache_endpoint%/}/v1/cas/bazel"
+		printf '%s\n' "build --credential_helper=$bazel_host=${GUEST_BILLET%/*}/bazel-credential-helper"
+	} >>"$BAZELRC_FILE"
+fi
+# BILLET_GUEST_CACHES_END
 if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
 	# NO HTTPS_PROXY. Interception reaches the runner by a DNS remap of the one
 	# results origin, so only that host's traffic is redirected and every other
@@ -1625,11 +1717,9 @@ if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions
 	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
 		"BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path")
-	# THE CONTAINER HOOK, ONLY WHERE INTERCEPTION IS: it exists to put the docker
-	# shim inside a job container, and a tier without interception has nothing
-	# for the shim to point at, so those tiers keep the runner's built-in docker
-	# path and this one runs GitHub's reference of it plus one mount.
-	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
+	# THE DOCKER SHIM GOES INTO JOB CONTAINERS ONLY WHERE INTERCEPTION IS: a tier
+	# without it has nothing for the shim to point at.
+	runner_env+=("BILLET_CONTAINER_SHIM=1")
 	# ONLY WHEN THE ADAPTER IS ACTUALLY SERVING. The docker shim, and a workflow
 	# that writes `url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }}`, point BuildKit
 	# wherever this says, so publishing it for a listener that never started
@@ -1647,6 +1737,14 @@ if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions
 fi
 if [ -n "$registry_mirrors_json" ]; then
 	runner_env+=("BILLET_REGISTRY_MIRRORS_JSON=$registry_mirrors_json")
+fi
+# THE CONTAINER HOOK, ONLY WHERE IT HAS SOMETHING TO ADD: the docker shim under
+# interception, the Go cache helper under the go cache. Every other tier keeps
+# the runner's built-in docker path; this one runs GitHub's reference of it plus
+# those mounts.
+if { [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; } ||
+	[ -n "$guest_go" ]; then
+	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
 fi
 
 set +e

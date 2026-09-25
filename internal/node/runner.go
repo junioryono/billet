@@ -445,6 +445,7 @@ func (r *Runner) Launch(
 	cacheEndpoint, cacheToken := "", ""
 	actionsProxy, actionsCAPEM := "", ""
 	var buildKitCacheMountLimit config.ByteSize
+	var guestCaches []provider.GuestCache
 	if r.cache != nil {
 		var credentials CacheCredentials
 		scope := CacheSessionScope{
@@ -466,6 +467,7 @@ func (r *Runner) Launch(
 			actionsProxy = credentials.ActionsProxy
 			actionsCAPEM = credentials.ActionsCAPEM
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
+			guestCaches = guestCachesFor(tier.Cache)
 		}
 	}
 
@@ -518,6 +520,7 @@ func (r *Runner) Launch(
 		JITConfig:               reg.Config(),
 		CacheEndpoint:           cacheEndpoint,
 		CacheToken:              cacheToken,
+		GuestCaches:             guestCaches,
 		ActionsProxy:            actionsProxy,
 		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
@@ -1601,4 +1604,24 @@ func interceptsFor(tier *nodeapi.TierSpec, trust provider.TrustClass) bool {
 	}
 
 	return trust == provider.TrustTrusted
+}
+
+// guestCachesFor is what the guest configures for a tier's cache block. A
+// tier without one (an older plane) configures nothing new.
+func guestCachesFor(spec *config.CacheSpec) []provider.GuestCache {
+	if spec == nil {
+		return nil
+	}
+	var caches []provider.GuestCache
+	if spec.Go.Enabled {
+		caches = append(caches, provider.GuestCacheGo)
+		if spec.GoTestResults {
+			caches = append(caches, provider.GuestCacheGoTestResults)
+		}
+	}
+	if spec.Bazel.Enabled {
+		caches = append(caches, provider.GuestCacheBazel)
+	}
+
+	return caches
 }

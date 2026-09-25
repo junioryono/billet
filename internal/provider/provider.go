@@ -30,6 +30,29 @@ import (
 // MaxVolumes is the maximum number of cache disks one job can attach.
 const MaxVolumes = 5
 
+// GuestCache is one build cache a guest configures for its jobs.
+type GuestCache string
+
+const (
+	// GuestCacheGo names billet as the go command's GOCACHEPROG.
+	GuestCacheGo GuestCache = "go"
+	// GuestCacheGoTestResults keeps the go command's test results cached too;
+	// without it the guest runs every test (GOFLAGS=-count=1).
+	GuestCacheGoTestResults GuestCache = "go-test-results"
+	// GuestCacheBazel points Bazel's remote cache at the node.
+	GuestCacheBazel GuestCache = "bazel"
+)
+
+// Valid reports whether g is one the guest image knows.
+func (g GuestCache) Valid() bool {
+	switch g {
+	case GuestCacheGo, GuestCacheGoTestResults, GuestCacheBazel:
+		return true
+	default:
+		return false
+	}
+}
+
 // VolumeSlotID is the stable Firecracker drive id and in-jail path for one slot.
 func VolumeSlotID(slot int) string { return "cache" + strconv.Itoa(slot) }
 
@@ -122,6 +145,10 @@ type Spec struct {
 	// guest: workflow code has passwordless sudo and Docker-root equivalence.
 	CacheEndpoint string
 	CacheToken    string
+	// GuestCaches are the build caches the guest configures for its jobs against
+	// CacheEndpoint. Meaningful only with it; a backend that cannot carry them
+	// refuses them rather than launching a guest that silently builds cold.
+	GuestCaches []GuestCache
 	// ActionsProxy and ActionsCAPEM opt this guest into the authenticated results
 	// proxy. Both must be present or absent together.
 	ActionsProxy string

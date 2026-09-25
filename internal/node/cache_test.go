@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -734,6 +735,55 @@ func TestMountedGenerationsStayProtectedFromEviction(t *testing.T) {
 	if storage.renewed != 1 || !storage.renewedUntil.Equal(until) {
 		t.Fatalf("renewals = %d until %s, want one until %s",
 			storage.renewed, storage.renewedUntil, until)
+	}
+}
+
+// THE GUEST IS TOLD WHICH BUILD CACHES ITS TIER ENABLES, and only with a cache
+// session to serve them.
+func TestRunnerTellsTheGuestWhichBuildCachesItsTierEnables(t *testing.T) {
+	enabled := true
+	for name, tc := range map[string]struct {
+		cache   *config.TierCache
+		service bool
+		want    []provider.GuestCache
+	}{
+		"go and bazel": {
+			cache: &config.TierCache{
+				Go:    &config.GoCache{Enabled: &enabled, TestResults: true},
+				Bazel: &config.CacheToggle{Enabled: &enabled},
+			},
+			service: true,
+			want: []provider.GuestCache{provider.GuestCacheGo, provider.GuestCacheGoTestResults,
+				provider.GuestCacheBazel},
+		},
+		"no cache block": {service: true},
+		"no cache service": {
+			cache: &config.TierCache{Go: &config.GoCache{Enabled: &enabled}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &fakeProvider{kind: config.ProviderDocker}
+			var options []Option
+			if tc.service {
+				service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+					&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+				if err != nil {
+					t.Fatalf("NewCacheService: %v", err)
+				}
+				options = append(options, WithCacheService(service))
+			}
+			tier := dockerTier()
+			tier.Cache = tc.cache
+			a, host := newAllocatorWithHost(t)
+			runner := New(a, host, &fakeJIT{setID: 7}, p, nil, options...)
+			if err := runner.Launch(t.Context(), assignedLease(t, a),
+				nodeapi.TierSpecOf(tier, config.ProviderDocker), Job{RequestID: 11, Event: "push"}); err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+			if got := p.launched[0].GuestCaches; !slices.Equal(got, tc.want) {
+				t.Errorf("guest caches = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
