@@ -210,7 +210,7 @@ func placeRunnerWherePublishedImagesPutIt(t *testing.T, s *stub) {
 		t.Fatalf("make the guest runner directory: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "run.sh"), body, 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, "run.sh"), body, 0o755); err != nil {
 		t.Fatalf("place the guest runner: %v", err)
 	}
 

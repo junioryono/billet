@@ -54,7 +54,7 @@ func TestAnUnprivilegedUpdaterLeavesItsCopyAsItsOwn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(from, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(from, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

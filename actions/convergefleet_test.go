@@ -186,7 +186,7 @@ fi
 `,
 	}
 	for name, body := range fakes {
-		if err := os.WriteFile(filepath.Join(f.bin, name), []byte(body), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(f.bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}

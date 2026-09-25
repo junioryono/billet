@@ -1,7 +1,6 @@
 package scripts_test
 
 import (
-	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -103,7 +102,7 @@ func shellPackages(t *testing.T, script, fn string) []string {
 		scriptFunction(t, script, fn) + "\n" + fn + " \"$TOOLSET_FILE\"\n"
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

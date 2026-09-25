@@ -1,0 +1,47 @@
+name: Cancel superseded CI
+
+# CI's concurrency group asks GitHub to cancel an older run of the same ref, and
+# for a run whose jobs are queued for self-hosted runners that ordinary cancel
+# does not land: the run stays "queued" and holds its place in the fleet's queue.
+# Measured 2026-09-25, when a branch carried two queued CI runs at once and every
+# stale run had to be force-cancelled by hand. This force-cancels every unfinished
+# CI run on the same branch whose head is not the commit just pushed.
+#
+# ON A GITHUB-HOSTED RUNNER, because a job queued behind the very fleet it is
+# trying to free would start after the runs it should have cancelled.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    # A fork's pull_request token is read-only and cannot cancel anything.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Force-cancel older unfinished CI runs of this branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event_name == 'push' && github.ref_name || github.head_ref }}
+          HEAD_SHA: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api --paginate "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=$EVENT&per_page=100" \
+            --jq ".workflow_runs[] | select(.status != \"completed\" and .head_sha != \"$HEAD_SHA\") | .id")
+          if [ -z "$ids" ]; then
+            echo "no superseded CI runs on $BRANCH"
+            exit 0
+          fi
+          for id in $ids; do
+            echo "force-cancelling superseded CI run $id on $BRANCH"
+            # A run that finished in the meantime answers 409; that is not a failure.
+            gh api -X POST "repos/$REPO/actions/runs/$id/force-cancel" >/dev/null || echo "run $id could not be cancelled (probably finished)"
+          done

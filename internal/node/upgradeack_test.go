@@ -184,7 +184,7 @@ func fakeUpdaterMode(t *testing.T, mode, answer string) string {
 		" BILLET_FAKE_UPDATER_ANSWER=" + shellQuoteUpgrade(answer) + " exec " +
 		shellQuoteUpgrade(self) + " -test.run '^TestFakeUpdaterProcess$' -- \"$@\"\n"
 
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
 

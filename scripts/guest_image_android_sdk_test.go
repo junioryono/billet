@@ -41,7 +41,7 @@ func TestTheGateRefusesAnImageWithoutTheAndroidSDK(t *testing.T) {
 			}
 
 			if tc.sdkmanager {
-				if err := os.WriteFile(filepath.Join(bin, "sdkmanager"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+				if err := forkSafeWriteFile(filepath.Join(bin, "sdkmanager"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -62,7 +62,7 @@ func TestTheGateRefusesAnImageWithoutTheAndroidSDK(t *testing.T) {
 				"check_android_sdk \"$1\"\necho \"FAILED=$FAILED\"\n"
 
 			path := filepath.Join(t.TempDir(), "gate.sh")
-			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
 

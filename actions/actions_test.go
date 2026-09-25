@@ -321,7 +321,7 @@ func TestBuilderResetClearsOnlyTheMountedBuildKitState(t *testing.T) {
 
 	tools := t.TempDir()
 	fakeDocker := "#!/bin/sh\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
 		t.Fatalf("write fake docker: %v", err)
 	}
 	output := filepath.Join(temporary, "outputs")
@@ -357,7 +357,7 @@ func TestBuilderRefusesAGuestWithoutBuildxBeforeStartingCompute(t *testing.T) {
 	tools := t.TempDir()
 	calls := filepath.Join(temporary, "docker-calls")
 	fakeDocker := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BILLET_TEST_DOCKER_CALLS\"\nif [ \"$*\" = \"buildx version\" ]; then exit 1; fi\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
 		t.Fatalf("write fake docker: %v", err)
 	}
 
@@ -394,7 +394,7 @@ func TestTheBuilderConfiguresEachUpstreamToItsOwnMirror(t *testing.T) {
 		t.Fatalf("create builder state: %v", err)
 	}
 	tools := t.TempDir()
-	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake docker: %v", err)
 	}
 	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "start.sh"))
@@ -528,11 +528,11 @@ case " $* " in
     ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
 		t.Fatalf("write fake docker: %v", err)
 	}
 	fakeDU := "#!/bin/sh\nprintf '1.0K\\t%s\\n' \"$2\"\n"
-	if err := os.WriteFile(filepath.Join(tools, "du"), []byte(fakeDU), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(tools, "du"), []byte(fakeDU), 0o755); err != nil {
 		t.Fatalf("write fake du: %v", err)
 	}
 

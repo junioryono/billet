@@ -178,7 +178,7 @@ func runWithStandInAWS(t *testing.T, command string) []string {
 	stand := filepath.Join(dir, "aws")
 
 	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n"
-	if err := os.WriteFile(stand, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(stand, []byte(script), 0o700); err != nil {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 

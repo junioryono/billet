@@ -634,7 +634,7 @@ func androidFixture(t *testing.T, root string) string {
 	}
 
 	mgr := filepath.Join(sdk, "cmdline-tools", "latest", "bin", "sdkmanager")
-	if err := os.WriteFile(mgr, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(mgr, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write the sdkmanager stub: %v", err)
 	}
 

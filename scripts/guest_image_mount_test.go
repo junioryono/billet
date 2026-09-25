@@ -67,7 +67,7 @@ func TestTheWorkspaceIsNeverDeletedThroughALiveMount(t *testing.T) {
 				"echo REACHED_THE_DELETE\n"
 
 			path := filepath.Join(t.TempDir(), "run.sh")
-			if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 				t.Fatalf("write the harness: %v", err)
 			}
 
@@ -117,7 +117,7 @@ func TestTheUnmountTrapIsANoOpWhenNothingIsMounted(t *testing.T) {
 		"unmount_rootfs\necho CLEAN\n"
 
 	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatalf("write the harness: %v", err)
 	}
 

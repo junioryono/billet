@@ -97,7 +97,7 @@ func newGuardHarness(t *testing.T, withAWS bool) guardHarness {
 	}
 
 	if withAWS {
-		if err := os.WriteFile(filepath.Join(h.bin, "aws"), []byte(fakeAWS), 0o755); err != nil {
+		if err := forkSafeWriteFile(filepath.Join(h.bin, "aws"), []byte(fakeAWS), 0o755); err != nil {
 			t.Fatalf("write fake aws: %v", err)
 		}
 	}
@@ -186,7 +186,7 @@ func (h guardHarness) pinClock(t *testing.T) {
 		t.Fatalf("unlink date: %v", err)
 	}
 
-	if err := os.WriteFile(link, []byte(fakeDate), 0o755); err != nil {
+	if err := forkSafeWriteFile(link, []byte(fakeDate), 0o755); err != nil {
 		t.Fatalf("write fake date: %v", err)
 	}
 }

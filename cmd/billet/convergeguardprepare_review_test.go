@@ -67,7 +67,7 @@ func TestTheCandidateJudgedIsTheCandidateRecorded(t *testing.T) {
 			// The probes ran between the judgement's hash and the recording
 			// hash; the bytes change as the recording hash is about to read.
 			if hashes == 2 {
-				mustOK(t, os.WriteFile(cand, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+				mustOK(t, forkSafeWriteFile(cand, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 			}
 		}
 
@@ -507,7 +507,7 @@ func TestAVersionLineThatNamesNoBuildIsNotNoRelease(t *testing.T) {
 	// reaches the managed binary's version.
 	cand := guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--candidate", cand, "--allow-downgrade"), prepareRebound)
-	mustOK(t, os.WriteFile(f.binary, script("billet v0.10.0-0.20260909120000-83de6dda9f5b\\n"), 0o755))
+	mustOK(t, forkSafeWriteFile(f.binary, script("billet v0.10.0-0.20260909120000-83de6dda9f5b\\n"), 0o755))
 
 	recordBefore, err := os.ReadFile(filepath.Join(f.active(), guardRecordName))
 	mustOK(t, err)
@@ -581,7 +581,7 @@ func TestADirtyBuildAtAReleaseTagIsADevelopmentBuild(t *testing.T) {
 	// keeps one intent): an older release candidate is re-bound with nothing
 	// compared, and no --allow-downgrade is needed.
 	f = newGuardFixture(t)
-	mustOK(t, os.WriteFile(f.binary, []byte(dirty), 0o755))
+	mustOK(t, forkSafeWriteFile(f.binary, []byte(dirty), 0o755))
 	mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
 
 	cand = guardCandidateScript(t, f, "recovery-20260909T120000-1badcafe", "v0.9.0", "capable")

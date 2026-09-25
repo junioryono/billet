@@ -312,7 +312,7 @@ func resolverInjectionCases(t *testing.T, fakes func(t *testing.T, dir, ran stri
 func fakeCommand(t *testing.T, dir, name, body string) {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+	if err := forkSafeWriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake %s: %v", name, err)
 	}
 }

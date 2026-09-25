@@ -161,7 +161,7 @@ func managedScript(t *testing.T, f *guardFixture, version string) {
 	body := "#!/bin/sh\ncase \"$1\" in\n  version) echo \"billet " + version + " linux/amd64\";;\n" +
 		"  converge-guard) printf '{\"active\": \"none\"}\\n';;\nesac\nexit 0\n"
 
-	mustOK(t, os.WriteFile(f.binary, []byte(body), 0o755))
+	mustOK(t, forkSafeWriteFile(f.binary, []byte(body), 0o755))
 
 	sum, _, err := hashRegular(f.binary, maxExecutableBytes)
 	mustOK(t, err)
@@ -627,7 +627,7 @@ func TestPrepareVerifiesTheRecordedExecutable(t *testing.T) {
 	first := runPrepare(t, "--holder", "ci-1", "--validate")
 	mustOutcome(t, first, prepareAcquired)
 
-	mustOK(t, os.WriteFile(f.binary, []byte("#!/bin/sh\nexit 1\n"), 0o755))
+	mustOK(t, forkSafeWriteFile(f.binary, []byte("#!/bin/sh\nexit 1\n"), 0o755))
 
 	for _, args := range [][]string{
 		{"--holder", "ci-1", "--validate"},
@@ -763,7 +763,7 @@ func TestPrepareJudgesTheSecondCall(t *testing.T) {
 
 		body, err := os.ReadFile(cand)
 		mustOK(t, err)
-		mustOK(t, os.WriteFile(f.binary, body, 0o755))
+		mustOK(t, forkSafeWriteFile(f.binary, body, 0o755))
 
 		o = runPrepare(t, "--holder", "ci-1", "--no-change")
 		mustOutcome(t, o, prepareValidated)
@@ -852,7 +852,7 @@ func TestPrepareJudgesTheSecondCall(t *testing.T) {
 		f := newGuardFixture(t)
 		mustOutcome(t, runPrepare(t, "--holder", "ci-1", "--validate"), prepareAcquired)
 		outside := filepath.Join(f.parent, "billet.candidate")
-		mustOK(t, os.WriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		mustOK(t, forkSafeWriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 
 		o := runPrepare(t, "--holder", "ci-1", "--candidate", outside)
 		mustRefusal(t, o, reasonCandidate)
