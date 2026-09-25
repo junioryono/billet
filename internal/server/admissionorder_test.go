@@ -368,12 +368,17 @@ func TestEveryListenerSharesOneQueueBuiltBeforeTheyStart(t *testing.T) {
 // has demand and asks first. Before a purchase re-dated the buyer, the first
 // waiter held the line for as long as its backlog lasted (2026-09-25: half an
 // hour, with the other target's tier starting nothing).
+//
+// A third tier holds one slot throughout. Without it the first tier would hold
+// the whole fleet, and a tier whose only way to grow is its own jobs ending is
+// never recorded as waiting (#157), which is a different rule from this one.
 func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 	t.Parallel()
 
 	a, log, listeners := orderedListeners(t,
-		[]config.Tier{tierOf("a-small", 4), tierOf("b-small", 4)}, 8, config.AdmissionFair)
-	first, second := listeners[0], listeners[1]
+		[]config.Tier{tierOf("a-small", 4), tierOf("b-small", 4), tierOf("c-small", 4)},
+		12, config.AdmissionFair)
+	first, second, other := listeners[0], listeners[1], listeners[2]
 
 	var mu sync.Mutex
 
@@ -387,7 +392,11 @@ func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 		return clock
 	}
 
-	// The first tier fills the fleet and still wants more, so it waits first.
+	if err := other.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("other tier reconcile: %v", err)
+	}
+
+	// The first tier fills the rest and still wants more, so it waits first.
 	if err := first.reconcilePool(t.Context(), 10); err != nil {
 		t.Fatalf("first tier reconcile: %v", err)
 	}
@@ -396,8 +405,16 @@ func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 		t.Fatalf("second tier reconcile: %v", err)
 	}
 
-	if got := log.tiers(); len(got) != 2 {
-		t.Fatalf("started %v, want the first tier's two runners and nothing else", got)
+	if _, _, waiting := first.order.waitingSince("a-small"); !waiting {
+		t.Fatal("the first tier found no room for its demand and is not recorded as waiting")
+	}
+
+	if _, _, waiting := second.order.waitingSince("b-small"); !waiting {
+		t.Fatal("the second tier found no room for its demand and is not recorded as waiting")
+	}
+
+	if got := log.tiers(); len(got) != 3 {
+		t.Fatalf("started %v, want the other tier's runner and the first tier's two", got)
 	}
 
 	// A slot frees. The first tier has waited longest and takes it.
@@ -407,7 +424,7 @@ func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 		t.Fatalf("first tier reconcile after a slot freed: %v", err)
 	}
 
-	if got := log.tiers(); len(got) != 3 || got[2] != "a-small" {
+	if got := log.tiers(); len(got) != 4 || got[3] != "a-small" {
 		t.Fatalf("started %v, want the longest waiter to take the first freed slot", got)
 	}
 
@@ -418,7 +435,7 @@ func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 		t.Fatalf("first tier reconcile after its turn: %v", err)
 	}
 
-	if got := log.tiers(); len(got) != 3 {
+	if got := log.tiers(); len(got) != 4 {
 		t.Fatalf("started %v: the first tier bought again while the other tier waited, "+
 			"so a backlog that never runs out holds the line forever", got)
 	}
@@ -427,7 +444,7 @@ func TestWaitingTiersTakeTurnsWhenBothHaveStandingDemand(t *testing.T) {
 		t.Fatalf("second tier reconcile on its turn: %v", err)
 	}
 
-	if got := log.tiers(); len(got) != 4 || got[3] != "b-small" {
+	if got := log.tiers(); len(got) != 5 || got[4] != "b-small" {
 		t.Fatalf("started %v, want the other waiting tier to take the second freed slot", got)
 	}
 }
