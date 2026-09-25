@@ -98,7 +98,7 @@ func TestALaunchLongerThanTheAllowanceLetsOtherTiersPast(t *testing.T) {
 	q := newAdmissionQueue(config.AdmissionFair)
 	q.now = func() time.Time { return clock }
 
-	shared := alloc.TierAdmission{CanGrow: true, Nodes: []string{"ubuntu-01"}}
+	shared := alloc.TierAdmission{CanGrow: true, Nodes: []string{"linux-01"}}
 
 	q.waits("b-large", shared)
 	clock = clock.Add(WaiterAllowance - time.Second)
@@ -133,7 +133,7 @@ func TestAStalledOldestWaiterStillBuysAheadOfAYoungerOne(t *testing.T) {
 	q := newAdmissionQueue(config.AdmissionFair)
 	q.now = func() time.Time { return clock }
 
-	shared := alloc.TierAdmission{CanGrow: true, Nodes: []string{"ubuntu-01"}}
+	shared := alloc.TierAdmission{CanGrow: true, Nodes: []string{"linux-01"}}
 
 	q.waits("b-oldest", shared)
 	clock = clock.Add(time.Minute)

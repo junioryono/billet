@@ -8,15 +8,15 @@ One deployment (identity `86565b95…`), three nodes at two sites. The home node
 
 | node | where | provider | site | store |
 |---|---|---|---|---|
-| `home-a` | the reference host (`ubuntu-01`, EPYC 7763), a second `billet node` process beside the production one | firecracker | `home` | Ceph, pools `accept-images` / `accept-cache` |
-| `home-b` | a KVM virtual machine on `ubuntu-01` (Ubuntu 24.04, kernel 6.8, 16 vCPU, nested KVM), mapping the same pools over the network as a second kernel client | firecracker | `home` | the same pools |
+| `home-a` | the reference host (`linux-01`, EPYC 7763), a second `billet node` process beside the production one | firecracker | `home` | Ceph, pools `accept-images` / `accept-cache` |
+| `home-b` | a KVM virtual machine on `linux-01` (Ubuntu 24.04, kernel 6.8, 16 vCPU, nested KVM), mapping the same pools over the network as a second kernel client | firecracker | `home` | the same pools |
 | `aws-1` | `t3.small` in the CI account (`810711872940`, us-west-2a), which also runs the control plane | ec2 | `aws` | EBS snapshots and an S3 prefix (`billet-20-cache-810711872940/accept20`) |
 
 **`home-b` is a virtual machine on the same chassis as `home-a`, not a second physical server**, because the office has one Linux host and a Mac cannot map RBD or run Firecracker. What the VM shares with a second physical node is everything the site boundary is about — its own kernel, its own RBD client identity, its own jailer, its own bridges and its own node identity and certificate, reaching the mons and OSDs over the network rather than through a local socket. What it does not share is a second power supply and a second NIC; nothing here measures those.
 
 The control plane listens on `0.0.0.0:7717` under the node-wire CA with `node_tls_hosts: [52.42.222.206, 10.3.2.50]`; the home nodes dial the Elastic IP and `aws-1` dials the private address. Bundles were issued with `billet ca issue` on the control plane and copied to each host.
 
-The isolation from the production deployment on the same office host is by pools and identity: `client.billet-accept` holds `profile rbd` on `accept-images` and `accept-cache` only, the golden image was copied into `accept-images` with `rbd export --export-format 2 | rbd import` plus its 41 `image-meta` keys (the `@verified` resolution lives in those keys, and `rbd deep cp` does not carry them), and the acceptance node on `ubuntu-01` listens on `172.31.0.1:7728` with `image_verify_port: 7729`, two ports opened on the production `billet_guard` chain for the duration.
+The isolation from the production deployment on the same office host is by pools and identity: `client.billet-accept` holds `profile rbd` on `accept-images` and `accept-cache` only, the golden image was copied into `accept-images` with `rbd export --export-format 2 | rbd import` plus its 41 `image-meta` keys (the `@verified` resolution lives in those keys, and `rbd deep cp` does not carry them), and the acceptance node on `linux-01` listens on `172.31.0.1:7728` with `image_verify_port: 7729`, two ports opened on the production `billet_guard` chain for the duration.
 
 The probe is one workflow, `site-cache.yml` in the private consumer repository: `seed` pulls `alpine` and tags it `billet-site-cache:<tag>`; `reuse` asks whether that tag is in the runner's Docker image store and fails the run when the answer differs from `expect`. The image store is the per-site Docker image-store generation the guest requests from its node's cache API before the runner starts, keyed `<deployment>/<site>/docker-images/<arch>`.
 
