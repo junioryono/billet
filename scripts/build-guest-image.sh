@@ -1750,7 +1750,7 @@ NET
 		systemctl mask systemd-resolved-monitor.service 2>/dev/null || true
 		printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
 		echo billet-guest >/etc/hostname
-		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n" >/etc/hosts
+		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n::1     localhost ip6-localhost ip6-loopback\n" >/etc/hosts
 		# ROOT CANNOT LOG IN. Nothing should be logging into a guest that exists for
 		# one job, and an account with no password is not the same as a locked one.
 		passwd -l root

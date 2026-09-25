@@ -561,6 +561,8 @@ var installerKeys = []string{
 	"powershellModules", // installed through PSGallery, two of the four pinned
 	"azureModules",      // the same mechanism, a second list upstream maintains apart
 	"android",           // the SDK, its platforms, build-tools and NDKs
+	"php",               // the versions whose extension set the hosted tools install
+	"postgresql",        // the server major the hosted tools install from PGDG
 }
 
 // InstallerToolset is the declaration the installers read, and nothing else.
