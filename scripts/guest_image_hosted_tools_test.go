@@ -320,7 +320,7 @@ func TestTheDefaultGoIsLinkedOntoPathInsideTheImage(t *testing.T) {
 		"\nlink_go_default \"$1\" \"$2\"\n"
 
 	path := filepath.Join(t.TempDir(), "link.sh")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 
