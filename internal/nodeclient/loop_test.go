@@ -325,6 +325,10 @@ func (stubStore) Resize(context.Context, string, int64, string, int, config.Byte
 	return nil
 }
 func (stubStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
+func (stubStore) RecordLeaseUsage(context.Context, string, int64, alloc.JobUsage, *alloc.UsageSeries) error {
+	return nil
+}
+
 func (stubStore) RecordCacheObservation(context.Context, string, int64, alloc.CacheObservation) error {
 	return nil
 }

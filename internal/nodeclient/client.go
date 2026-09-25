@@ -619,6 +619,23 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 		nodeapi.HeartbeatRequest{Epoch: epoch}, nil)
 }
 
+// RecordLeaseUsage tells the control plane what the host measured a lease's
+// job do.
+//
+// CHECKED WHERE IT IS EMITTED, for RecordCacheObservation's reason: an older
+// plane answers the route with a bare 404, and what the pairing loses is the
+// measurement, never a job, so the report is dropped as success.
+func (c *Client) RecordLeaseUsage(
+	ctx context.Context, leaseID string, epoch int64, usage alloc.JobUsage, series *alloc.UsageSeries,
+) error {
+	if c.WireVersion() < nodeapi.VersionJobUsage {
+		return nil
+	}
+
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
+		nodeapi.UsageRequest{Epoch: epoch, Usage: usage, Series: series}, nil)
+}
+
 // MarkFailure records why a running lease is destined to fail before teardown.
 func (c *Client) MarkFailure(ctx context.Context, leaseID string, epoch int64, reason string) error {
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/failure"),

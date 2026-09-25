@@ -82,6 +82,15 @@ type CacheObservationRequest struct {
 	GoCache     string `json:"go_cache,omitempty"`
 }
 
+// UsageRequest reports what the host measured a lease's job do, once, before
+// the compute is destroyed (VersionJobUsage). Series is optional: a node that
+// could not encode one still reports the summary.
+type UsageRequest struct {
+	Epoch  int64              `json:"epoch"`
+	Usage  alloc.JobUsage     `json:"usage"`
+	Series *alloc.UsageSeries `json:"series,omitempty"`
+}
+
 // ReleaseRequest ends a lease with a terminal outcome.
 type ReleaseRequest struct {
 	Epoch   int64  `json:"epoch"`
