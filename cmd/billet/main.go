@@ -3730,6 +3730,7 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 	}
 
 	fmt.Printf("         guests on %s; %s\n", report.Bridge, untrusted)
+	fmt.Printf("         %s\n", report.Accounting.Summary())
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Opening /dev/kvm says
 	// nothing about the jailer's ability to chroot, mknod or place a cgroup, all of
