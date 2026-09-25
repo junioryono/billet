@@ -17,7 +17,7 @@ func TestTheAgentConfiguresOnlyTheBuildCachesTheNodeOffers(t *testing.T) {
 
 	block := agentBlock(t, "BILLET_GUEST_CACHES")
 	billet := filepath.Join(t.TempDir(), "billet")
-	if err := os.WriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	const endpoint = "http://172.31.0.1:7718"

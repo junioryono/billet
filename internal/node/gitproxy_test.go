@@ -130,7 +130,7 @@ func gitClient(t *testing.T, node *httptest.Server, token, header string) func(a
 
 	home := t.TempDir()
 	helper := filepath.Join(home, "helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n[ \"$1\" = get ] || exit 0\n"+
+	if err := forkSafeWriteFile(helper, []byte("#!/bin/sh\n[ \"$1\" = get ] || exit 0\n"+
 		"echo username="+token+"\necho password="+header+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestTheJobsHeaderIsNeverAnArgument(t *testing.T) {
 	service, node, token := gitNode(t, upstream)
 	record := filepath.Join(t.TempDir(), "argv")
 	wrapper := filepath.Join(t.TempDir(), "git")
-	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" >>"+record+"\nexec git \"$@\"\n"), 0o700); err != nil {
+	if err := forkSafeWriteFile(wrapper, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" >>"+record+"\nexec git \"$@\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	service.git.binary = wrapper

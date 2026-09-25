@@ -224,7 +224,7 @@ func TestTheContainerHookAddsNothingForATierWithoutTheGoCache(t *testing.T) {
 	node := nodeOrSkip(t)
 	index, record := hookHarness(t, "0")
 	billet := filepath.Join(t.TempDir(), "billet")
-	if err := os.WriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	patchShimPath(t, index, filepath.Join(t.TempDir(), "absent"))
@@ -259,7 +259,7 @@ func TestTheContainerHookGivesAJobContainerTheGoCacheHelper(t *testing.T) {
 			dir := t.TempDir()
 			shim, billet := filepath.Join(dir, "docker"), filepath.Join(dir, "billet")
 			for _, file := range []string{shim, billet} {
-				if err := os.WriteFile(file, []byte("#!/bin/sh\n"), 0o755); err != nil {
+				if err := forkSafeWriteFile(file, []byte("#!/bin/sh\n"), 0o755); err != nil {
 					t.Fatal(err)
 				}
 			}
