@@ -46,6 +46,7 @@ install_powershell_modules() { printf 'psmod %s\n' "$*" >>"` + log + `"; }
 install_android()          { printf 'android %s\n' "$*" >>"` + log + `"; }
 install_default_runtimes() { printf 'defaults %s\n' "$*" >>"` + log + `"; }
 install_global_packages()  { printf 'globals %s\n'  "$*" >>"` + log + `"; }
+install_hosted_tools()     { printf 'hosted %s\n'   "$*" >>"` + log + `"; }
 billet_tc_run()            { printf 'run %s\n'    "$*" >>"` + log + `"; }
 find()                     { :; }
 `
@@ -103,6 +104,8 @@ BILLET_TC_ARCH=x64 \
 		// bare `node` resolves to nothing, and the globals install through them.
 		{"defaults", "or a bare node resolves against an apt set that has none"},
 		{"globals", "and every declared pipx, npm and gem package"},
+		// AND WHAT GITHUB INSTALLS OUTSIDE ITS DECLARATION, which nothing else brings.
+		{"hosted", "and every tool GitHub's image carries that its declaration never names"},
 	} {
 		if !strings.Contains(got, want.tool+" ") {
 			t.Errorf("install_%s_toolcache was never called — %s\nrecorded:\n%s",
@@ -115,7 +118,7 @@ BILLET_TC_ARCH=x64 \
 	// completed.
 	for _, tool := range []string{
 		"node", "go", "python", "java", "pypy", "ruby", "codeql",
-		"cmake", "pwsh", "dotnet", "defaults", "globals",
+		"cmake", "pwsh", "dotnet", "defaults", "globals", "hosted",
 	} {
 		if n := strings.Count(got, "\n"+tool+" ") + boolToInt(strings.HasPrefix(got, tool+" ")); n != 1 {
 			t.Errorf("install_%s_toolcache was called %d times, want once\nrecorded:\n%s",

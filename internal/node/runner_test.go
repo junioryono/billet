@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -283,6 +284,15 @@ func TestGitHubNonSuccessResultsDoNotPublishTheDockerStore(t *testing.T) {
 			}
 			if err := runner.DestroyCompleted(t.Context(), 11, result); err != nil {
 				t.Fatalf("DestroyCompleted: %v", err)
+			}
+			// THE DISCARD IS NOT ON THE TEARDOWN PATH: the teardown only closes the
+			// session, and the retry loop discards it.
+			if storage.published != 0 || storage.discarded != 0 {
+				t.Errorf("result %q published/discarded %d/%d Docker stores during the teardown, want 0/0",
+					result, storage.published, storage.discarded)
+			}
+			if err := cache.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
 			}
 			if storage.published != 0 || storage.discarded != 1 {
 				t.Errorf("result %q published/discarded %d/%d Docker stores, want 0/1",
@@ -1800,6 +1810,124 @@ func TestRecoverReportsInstancesItCouldNotDestroy(t *testing.T) {
 
 	if err := r.Recover(t.Context()); err == nil {
 		t.Fatal("reported success while an instance was still holding capacity")
+	}
+}
+
+// A CACHE VOLUME THAT WILL NOT GO IS NOT A REASON TO REFUSE WORK. Recovery closes
+// the cache sessions of compute that is gone and leaves their discard to the
+// retry loop, so a storage cluster refusing `rbd rm` cannot keep the node from
+// registering, as it did for thirty-five minutes on 2026-09-25.
+func TestRecoverDoesNotWaitOnADiscardTheStoreRefuses(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{discardFailures: 100}
+	cache, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := cache.Prepare("billet-gone", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if response := cacheRequest(t, cache, credentials.Token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	}); response.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d: %s", response.Code, response.Body.String())
+	}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(cache))
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover refused work over a cache volume: %v", err)
+	}
+	if storage.discarded != 0 {
+		t.Errorf("Recover discarded %d volumes in line; the discard belongs to the retry loop",
+			storage.discarded)
+	}
+	if err := cache.RetryClosed(t.Context()); err == nil {
+		t.Error("RetryClosed reported success while the store refused the discard")
+	}
+}
+
+// stuckDiscardStore blocks every discard until released and says when one has
+// begun, the shape of a storage cluster that does not answer `rbd rm`.
+type stuckDiscardStore struct {
+	*fakeCacheStore
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stuckDiscardStore) Discard(ctx context.Context, volume storecontract.Volume) error {
+	s.entered <- struct{}{}
+	<-s.release
+
+	return s.fakeCacheStore.Discard(ctx, volume)
+}
+
+// NOR ON A DISCARD STILL IN PROGRESS. RetryClosed holds a closed session for as
+// long as storage takes; recovery and a second close of that session must not
+// queue behind it.
+func TestRecoverDoesNotWaitBehindADiscardInProgress(t *testing.T) {
+	t.Parallel()
+
+	storage := &stuckDiscardStore{fakeCacheStore: &fakeCacheStore{},
+		entered: make(chan struct{}, 1), release: make(chan struct{})}
+	cache, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := cache.Prepare("billet-gone", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if response := cacheRequest(t, cache, credentials.Token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	}); response.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d: %s", response.Code, response.Body.String())
+	}
+	if err := cache.Close(t.Context(), "billet-gone"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	retried := make(chan error, 1)
+	go func() { retried <- cache.RetryClosed(t.Context()) }()
+	<-storage.entered
+	t.Cleanup(func() {
+		close(storage.release)
+		<-retried
+	})
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(cache))
+
+	recovered := make(chan error, 1)
+	go func() { recovered <- r.Recover(t.Context()) }()
+
+	select {
+	case err := <-recovered:
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Recover waited behind a discard the store has not answered")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- cache.Close(t.Context(), "billet-gone") }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing an already closed session waited behind its discard")
 	}
 }
 

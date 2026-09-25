@@ -326,6 +326,114 @@ check_android_sdk() {
 	pass "the Android SDK is installed, with ANDROID_HOME set"
 }
 
+# HOSTED_TOOLS are the commands GitHub's image installs with scripts of its own,
+# outside the declaration the parity check below reads, so only a list of paths
+# can notice one missing.
+HOSTED_TOOLS=(
+	/usr/local/bin/yq /usr/local/bin/kubectl /usr/local/bin/kind /usr/local/bin/minikube
+	/usr/local/bin/helm /usr/local/bin/kustomize /usr/local/bin/git-lfs /usr/local/bin/ninja
+	/usr/local/bin/aws /usr/local/bin/sam /usr/local/bin/session-manager-plugin
+	/usr/bin/docker-credential-ecr-login /usr/bin/composer /usr/local/bin/phpunit
+	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
+	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
+	/usr/sbin/nginx
+)
+
+# image_resolve prints path as the image at $1 resolves it, following every
+# symlink along the way inside the image. The AWS CLI's links are absolute, and
+# resolved against the machine running this gate they would find the host's
+# tools, or miss the image's.
+image_resolve() {
+	local root="$1" rest="${2#/}" out="" part target hops=0
+
+	while [ -n "$rest" ]; do
+		part="${rest%%/*}"
+
+		if [ "$part" = "$rest" ]; then
+			rest=""
+		else
+			rest="${rest#*/}"
+		fi
+
+		case "$part" in
+			"" | .) continue ;;
+			..) out="${out%/*}"; continue ;;
+		esac
+
+		if [ -L "$root$out/$part" ]; then
+			hops=$((hops + 1))
+			[ "$hops" -le 40 ] || return 1
+			target=$(readlink "$root$out/$part")
+			case "$target" in /*) out="" ;; esac
+			rest="${target#/}${rest:+/$rest}"
+		else
+			out="$out/$part"
+
+			# A COMPONENT WITH MORE AFTER IT MUST BE A DIRECTORY THAT EXISTS, or
+			# `/missing/../usr/bin/x` would resolve here and fail when executed.
+			if [ -n "$rest" ] && [ ! -d "$root$out" ]; then
+				return 1
+			fi
+		fi
+	done
+
+	printf '%s' "${out:-/}"
+}
+
+# image_executable reports whether path is an executable file inside the image.
+image_executable() {
+	local resolved
+	resolved=$(image_resolve "$1" "$2") || return 1
+	[ -f "$1$resolved" ] && [ -x "$1$resolved" ]
+}
+
+# check_hosted_tools passes or fails the gate on everything GitHub's image
+# installs outside its declaration: each command in HOSTED_TOOLS, the PostgreSQL
+# server, the action archive cache and the variable that points the runner at
+# it, Bazel's fallback pin, and the gh-aw entries in the toolcache.
+check_hosted_tools() {
+	local missing=() tool match env="$1/etc/billet-image-env"
+
+	for tool in "${HOSTED_TOOLS[@]}"; do
+		image_executable "$1" "$tool" || missing+=("$tool")
+	done
+
+	match=$(compgen -G "$1/usr/lib/postgresql/*/bin/postgres" | head -n 1 || true)
+	if [ -z "$match" ] || ! image_executable "$1" "${match#"$1"}"; then
+		missing+=("the PostgreSQL server (postgres)")
+	fi
+
+	local archive
+	archive=$(find "$1/opt/actionarchivecache" -type f -size +0 -print -quit 2>/dev/null || true)
+	[ -n "$archive" ] || missing+=("the action archive cache (no archive under /opt/actionarchivecache)")
+	grep -qx 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache' "$env" 2>/dev/null ||
+		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
+	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
+		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+
+	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
+	# @actions/tool-cache looks for; a payload without one is invisible to it.
+	local tc="$1/opt/hostedtoolcache" found=0 entry
+	for entry in "$tc"/agentic-workflow-firewall-js/*/x64/awf-bundle.js; do
+		[ -f "$entry" ] && [ -s "$entry" ] && [ -f "${entry%/x64/awf-bundle.js}/x64.complete" ] && found=1
+	done
+	[ "$found" -eq 1 ] || missing+=("the gh-aw firewall bundle in the toolcache")
+
+	found=0
+	for entry in "$tc"/copilot-cli/*/*/bin/copilot; do
+		local arch_dir="${entry%/bin/copilot}"
+		image_executable "$1" "${entry#"$1"}" && [ -f "$arch_dir.complete" ] && found=1
+	done
+	[ "$found" -eq 1 ] || missing+=("the Copilot CLI in the toolcache")
+
+	if [ "${#missing[@]}" -gt 0 ]; then
+		fail "GitHub's image carries these and this one does not: ${missing[*]}"
+		return
+	fi
+
+	pass "everything GitHub installs outside its declaration is here (${#HOSTED_TOOLS[@]} commands and more)"
+}
+
 # toolset_query reads one expectation set out of the pinned declaration, and
 # treats a parser failure as a failure rather than as an empty expectation.
 #
@@ -582,6 +690,7 @@ done
 
 check_github_cli "$MNT"
 check_android_sdk "$MNT"
+check_hosted_tools "$MNT"
 
 # --- parity with github's declaration ---------------------------------------
 

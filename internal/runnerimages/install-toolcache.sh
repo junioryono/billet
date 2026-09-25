@@ -166,6 +166,9 @@ install_toolcache() {
 	install_default_runtimes "$tc"
 	install_global_packages
 
+	# AFTER THE GLOBALS, because Bazelisk comes through the npm they installed.
+	install_hosted_tools
+
 	# READ AND WRITTEN BY EVERY JOB, which runs as the unprivileged runner account.
 	#
 	# -h SO SYMLINKS ARE NOT FOLLOWED. Java's toolcache entries are symlinks into
@@ -2439,6 +2442,612 @@ install_global_packages() {
 	[ "$failed" -eq 0 ] || exit 1
 
 	echo "globals: pipx, npm and gem sets installed"
+}
+
+# --- the rest of GitHub's image ---------------------------------------------
+#
+# WHAT GITHUB'S ubuntu-24.04 INSTALLS WITH SCRIPTS OF ITS OWN, outside the toolset
+# declaration, so nothing above could bring it and the declared-package gate
+# cannot see it missing. The list and each tool's source are read from
+# actions/runner-images at the commit pinned.txt names
+# (images/ubuntu/scripts/build/install-*.sh). The rule is that a workflow moved
+# onto billet changes its runs-on and nothing else, so every tool a hosted job can
+# call without installing it is here.
+#
+# SOURCES FOLLOW GITHUB'S, VERIFICATION IS BILLET'S. Where GitHub pipes a vendor's
+# script to bash, billet downloads what that script would and checks it; where the
+# vendor publishes a digest or a signature it is checked, and the few that publish
+# neither are named at the call, as the Android tools zip is.
+
+# billet_tc_release prints the JSON of a repository's latest release.
+billet_tc_release() {
+	curl -fsSL --retry 5 --retry-all-errors "https://api.github.com/repos/$1/releases/latest"
+}
+
+# billet_tc_release_tag prints the newest non-prerelease tag of a repository that
+# starts with a prefix, for repositories whose `latest` is another line or product.
+billet_tc_release_tag() {
+	curl -fsSL --retry 5 --retry-all-errors \
+		"https://api.github.com/repos/$1/releases?per_page=100" |
+		jq -r --arg p "$2" '[.[] | select(.prerelease == false and .draft == false)
+			| .tag_name | select(startswith($p))] | first // empty'
+}
+
+# billet_tc_get prints a small text resource, fetched whole.
+#
+# CAPTURED, NEVER PIPED INTO A PARSER THAT CAN STOP EARLY. An awk that exits on its
+# match closes the pipe while curl may still be writing, and under pipefail the
+# writer's SIGPIPE fails an assignment whose value was right. Every digest below
+# is parsed from a variable, through a here-string, which has no writer.
+billet_tc_get() {
+	curl -fsSL --retry 5 --retry-all-errors "$1"
+}
+
+# billet_tc_hex refuses anything but one digest of the expected length.
+billet_tc_hex() {
+	local value="$1" length="$2" what="$3"
+
+	if ! [[ "$value" =~ ^[0-9a-f]{$length}$ ]]; then
+		echo "the published digest for $what is \"$value\", not $length hex characters" >&2
+		exit 1
+	fi
+
+	printf '%s' "$value"
+}
+
+# billet_tc_bin installs one verified file as an executable in the target.
+billet_tc_bin() {
+	local url="$1" dest="$2" want="$3"
+
+	fetch_verified "$url" "$BILLET_TC_WORK/bin" "$want"
+	install -D -m 0755 "$BILLET_TC_WORK/bin" "${BILLET_TC_ROOT:-}$dest"
+	rm -f "$BILLET_TC_WORK/bin"
+}
+
+# billet_tc_tls fetches a file its vendor publishes no digest or signature for.
+#
+# THE TRUST BOUNDARY IS TLS TO THE VENDOR, stated at every call so the exceptions
+# stay countable: GitHub's own scripts check none of these either.
+billet_tc_tls() {
+	curl -fL -sS --connect-timeout 20 --max-time 900 --retry 5 --retry-delay 5 \
+		--retry-all-errors -o "$2" "$1"
+}
+
+# billet_tc_key fetches a signing key and refuses it unless every primary key in
+# it is one of the pinned fingerprints (space-separated; a vendor that signs with
+# two keys ships both in one keyring, as the GitHub CLI's does).
+#
+# A KEY FROM A URL IS ONLY AS GOOD AS THE URL, so each is pinned to the full
+# fingerprint read on 2026-09-24 and compared before anything trusts it, and a
+# primary key nobody pinned is a refusal, not an extra.
+billet_tc_key() {
+	local url="$1" fingerprints="$2" out="$3"
+	local home colons primaries fpr
+
+	home=$(mktemp -d)
+	curl -fsSL --retry 5 --retry-all-errors "$url" -o "$out.key"
+	colons=$(GNUPGHOME="$home" gpg --show-keys --with-colons "$out.key")
+	primaries=$(awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }' \
+		<<<"$colons")
+
+	if [ -z "$primaries" ]; then
+		echo "the key at $url holds no primary key" >&2
+		rm -rf "$home" "$out.key"
+		exit 1
+	fi
+
+	while IFS= read -r fpr; do
+		if [[ " $fingerprints " != *" $fpr "* ]]; then
+			echo "the key at $url holds $fpr, which is not among the pinned $fingerprints" >&2
+			rm -rf "$home" "$out.key"
+			exit 1
+		fi
+	done <<<"$primaries"
+
+	# ARMORED OR ALREADY A KEYRING: some vendors publish one, some the other.
+	if grep -q -- '-----BEGIN PGP PUBLIC KEY BLOCK-----' "$out.key"; then
+		GNUPGHOME="$home" gpg --batch --yes --dearmor -o "$out" "$out.key"
+	else
+		cp "$out.key" "$out"
+	fi
+
+	rm -rf "$home" "$out.key"
+}
+
+# billet_tc_apt_source adds a vendor repository bound to its own pinned key.
+billet_tc_apt_source() {
+	local name="$1" key_url="$2" fingerprint="$3" line="$4"
+	local keyring="/usr/share/keyrings/billet-$name.gpg"
+
+	billet_tc_key "$key_url" "$fingerprint" "${BILLET_TC_ROOT:-}$keyring"
+	printf '%s\n' "${line//@KEYRING@/$keyring}" \
+		>"${BILLET_TC_ROOT:-}/etc/apt/sources.list.d/billet-$name.list"
+}
+
+# billet_tc_reap_target stops every process whose root is the target, so none is
+# left holding the filesystem the guest build unmounts. A native target is this
+# machine, and nothing is stopped.
+billet_tc_reap_target() {
+	[ -n "${BILLET_TC_ROOT:-}" ] || return 0
+
+	local root proc pids=()
+	root=$(readlink -f "$BILLET_TC_ROOT")
+
+	for proc in /proc/[0-9]*; do
+		[ "$(readlink "$proc/root" 2>/dev/null)" = "$root" ] && pids+=("${proc#/proc/}")
+	done
+
+	[ "${#pids[@]}" -gt 0 ] || return 0
+
+	echo "stopping ${#pids[@]} process(es) left running in the target: ${pids[*]}" >&2
+	kill "${pids[@]}" 2>/dev/null || true
+	sleep 5
+
+	# RE-ASKED BEFORE EACH SIGKILL, because a process that exited on SIGTERM frees
+	# its pid; a reused pid is rooted at /, not here. Between the check and the
+	# signal no reuse is possible in practice: Linux hands out pids cyclically and
+	# does not return a freed one until the counter wraps pid_max (4194304 on
+	# 64-bit), and bash has no pidfd to close even that. A process that exits in
+	# between is simply gone, which is what was wanted.
+	local pid
+	for pid in "${pids[@]}"; do
+		if [ "$(readlink "/proc/$pid/root" 2>/dev/null)" = "$root" ]; then
+			kill -9 "$pid" 2>/dev/null || true
+		fi
+	done
+
+	return 0
+}
+
+# install_hosted_packages installs the packages GitHub's scripts add from apt.
+#
+# git FROM THE git-core PPA AND PostgreSQL FROM PGDG, as GitHub's are: noble's git
+# is 2.43 against the PPA's current release, and GitHub's server and client both
+# come from PGDG. The rest is Ubuntu's own archive. The vendor sources are removed
+# afterwards, as GitHub removes them, so a job's apt sees the archive it expects.
+#
+# MySQL IS root/root AND EVERY SERVER IS STOPPED AND DISABLED, which is GitHub's
+# documented contract: a job starts the service it wants with systemctl. In the
+# guest's chroot nothing starts (systemd is not running there); on the EC2 builder
+# the packages start them, so they are stopped as well as disabled.
+install_hosted_packages() {
+	billet_tc_apt_source git-core \
+		'https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0xE1DD270288B4E6030699E45FA1715D88E1DF1F24' \
+		E1DD270288B4E6030699E45FA1715D88E1DF1F24 \
+		'deb [signed-by=@KEYRING@] https://ppa.launchpadcontent.net/git-core/ppa/ubuntu noble main'
+	billet_tc_apt_source pgdg \
+		https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+		B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8 \
+		'deb [signed-by=@KEYRING@] https://apt.postgresql.org/pub/repos/apt noble-pgdg main'
+
+	local pg
+	pg=$(jq -r '.postgresql.version // empty' "$BILLET_TC_TOOLSET")
+	[[ "$pg" =~ ^[0-9]+$ ]] || { echo "the toolset's postgresql version is \"$pg\"" >&2; exit 1; }
+
+	local php=()
+	local v ext
+	for v in $(jq -r '.php.versions[]? // empty' "$BILLET_TC_TOOLSET"); do
+		for ext in "" -amqp -apcu -bcmath -bz2 -cgi -cli -common -curl -dba -dev -enchant \
+			-fpm -gd -gmp -igbinary -imagick -interbase -intl -ldap -mbstring -memcache \
+			-memcached -mongodb -mysql -odbc -pgsql -phpdbg -pspell -readline -redis -snmp \
+			-soap -sqlite3 -sybase -tidy -xdebug -xml -xsl -yaml -zip -zmq -imap -opcache \
+			-pcov; do
+			php+=("php$v$ext")
+		done
+	done
+
+	# NOTHING STARTS IN A CHROOT. A package script that starts its daemon there
+	# leaves a process holding the filesystem the build must unmount, so service
+	# starts are refused for the transaction and anything left running inside the
+	# target is stopped after it. Natively (the EC2 builder) services start as they
+	# would on GitHub's, and are stopped and disabled below.
+	local policy="${BILLET_TC_ROOT:-}/usr/sbin/policy-rc.d" own_policy=0
+	if [ -n "${BILLET_TC_ROOT:-}" ] && [ ! -e "$policy" ]; then
+		printf '#!/bin/sh\nexit 101\n' >"$policy"
+		chmod 0755 "$policy"
+		own_policy=1
+	fi
+
+	billet_tc_run /bin/bash -euxo pipefail -s -- "$pg" "${php[@]}" <<'PACKAGES'
+export DEBIAN_FRONTEND=noninteractive
+pg="$1"
+shift
+
+debconf-set-selections <<<'mysql-server mysql-server/root_password password root'
+debconf-set-selections <<<'mysql-server mysql-server/root_password_again password root'
+
+apt-get -o DPkg::Lock::Timeout=600 update -qq
+apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
+	git git-ftp podman buildah skopeo \
+	mysql-client mysql-server libmysqlclient-dev \
+	apache2 nginx "postgresql-$pg" libpq-dev \
+	"$@" php-pear snmp
+
+# PCOV IS INSTALLED AND OFF, XDEBUG ON, as GitHub documents.
+for v in /etc/php/*/; do
+	phpdismod -v "$(basename "$v")" pcov
+done
+
+for s in mysql apache2 nginx postgresql /lib/systemd/system/php*-fpm.service; do
+	s=$(basename "$s" .service)
+	systemctl stop "$s.service" 2>/dev/null || true
+	systemctl disable "$s.service"
+done
+
+rm -f /etc/apt/sources.list.d/billet-git-core.list /etc/apt/sources.list.d/billet-pgdg.list
+apt-get -o DPkg::Lock::Timeout=600 update -qq
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+# GitHub's registry search list, which `podman pull name` without a registry reads.
+printf '[registries.search]\nregistries = [%s]\n' "'docker.io', 'quay.io'" \
+	>/etc/containers/registries.conf
+
+# `safe.directory = *` IS WHAT LETS actions/checkout WORK across the uids a job's
+# containers run as; GitHub writes it system-wide.
+git config --system --add safe.directory '*'
+PACKAGES
+
+	if [ "$own_policy" -eq 1 ]; then
+		rm -f "$policy"
+	fi
+
+	billet_tc_reap_target
+	echo "hosted: git, git-ftp, podman, buildah, skopeo, mysql, apache2, nginx, postgresql $pg, php"
+}
+
+# install_github_cli replaces Ubuntu's gh with the current release, as GitHub's
+# install-github-cli.sh installs it: the release .deb, checked against that
+# release's checksums file. Noble's package is 2.45, and a workflow using a newer
+# subcommand (`gh attestation` arrived in 2.49) fails on it (#179).
+install_github_cli() {
+	local tag version file url sums want
+
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release cli/cli)")
+	version="${tag#v}"
+	file="gh_${version}_linux_$BILLET_TC_DPKG.deb"
+	url="https://github.com/cli/cli/releases/download/$tag"
+	sums=$(billet_tc_get "$url/gh_${version}_checksums.txt")
+	want=$(awk -v f="$file" '$2 == f { print $1; exit }' <<<"$sums")
+
+	fetch_verified "$url/$file" "${BILLET_TC_ROOT:-}/tmp/$file" "$(billet_tc_hex "$want" 64 "gh $version")"
+	billet_tc_run env DEBIAN_FRONTEND=noninteractive dpkg -i "/tmp/$file" >/dev/null
+	rm -f "${BILLET_TC_ROOT:-}/tmp/$file"
+
+	local said
+	said=$(billet_tc_run /usr/bin/gh --version)
+
+	if ! grep -qF "gh version $version" <<<"$said"; then
+		echo "installed gh $version and /usr/bin/gh does not report it" >&2
+		exit 1
+	fi
+
+	echo "hosted: gh $version"
+}
+
+# install_hosted_binaries installs the single-binary tools, each from its vendor.
+install_hosted_binaries() {
+	local arch="$BILLET_TC_DPKG" rel tag url want sums
+
+	# yq: the checksums file lists every algorithm per line, in the order its
+	# checksums_hashes_order names, so the SHA-256 column is looked up, not assumed.
+	rel=$(billet_tc_release mikefarah/yq)
+	tag=$(jq -r .tag_name <<<"$rel")
+	url="https://github.com/mikefarah/yq/releases/download/$tag"
+	local order column
+	order=$(billet_tc_get "$url/checksums_hashes_order")
+	column=$(awk '$0 == "SHA-256" { print NR + 1; exit }' <<<"$order")
+	[ -n "$column" ] || { echo "yq $tag lists no SHA-256 column" >&2; exit 1; }
+	sums=$(billet_tc_get "$url/checksums")
+	want=$(awk -v f="yq_linux_$arch" -v c="$column" '$1 == f { print $c; exit }' <<<"$sums")
+	billet_tc_bin "$url/yq_linux_$arch" /usr/local/bin/yq "$(billet_tc_hex "$want" 64 "yq $tag")"
+
+	# kubectl, the current stable release, from dl.k8s.io with its digest.
+	tag=$(billet_tc_get https://dl.k8s.io/release/stable.txt)
+	url="https://dl.k8s.io/release/$tag/bin/linux/$arch/kubectl"
+	want=$(billet_tc_get "$url.sha256")
+	billet_tc_bin "$url" /usr/local/bin/kubectl "$(billet_tc_hex "$want" 64 "kubectl $tag")"
+
+	# kind
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release kubernetes-sigs/kind)")
+	url="https://github.com/kubernetes-sigs/kind/releases/download/$tag/kind-linux-$arch"
+	sums=$(billet_tc_get "$url.sha256sum")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	billet_tc_bin "$url" /usr/local/bin/kind "$(billet_tc_hex "$want" 64 "kind $tag")"
+
+	# minikube
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release kubernetes/minikube)")
+	url="https://github.com/kubernetes/minikube/releases/download/$tag/minikube-linux-$arch"
+	sums=$(billet_tc_get "$url.sha256")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	billet_tc_bin "$url" /usr/local/bin/minikube "$(billet_tc_hex "$want" 64 "minikube $tag")"
+
+	# helm, the 3.x line GitHub's get-helm-3 installs.
+	tag=$(billet_tc_release_tag helm/helm v3.)
+	[ -n "$tag" ] || { echo "helm publishes no 3.x release" >&2; exit 1; }
+	url="https://get.helm.sh/helm-$tag-linux-$arch.tar.gz"
+	sums=$(billet_tc_get "$url.sha256sum")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	fetch_verified "$url" "$BILLET_TC_WORK/helm.tgz" "$(billet_tc_hex "$want" 64 "helm $tag")"
+	tar -xzf "$BILLET_TC_WORK/helm.tgz" -C "$BILLET_TC_WORK" "linux-$arch/helm"
+	install -D -m 0755 "$BILLET_TC_WORK/linux-$arch/helm" "${BILLET_TC_ROOT:-}/usr/local/bin/helm"
+	rm -rf "$BILLET_TC_WORK/helm.tgz" "$BILLET_TC_WORK/linux-$arch"
+
+	# kustomize, whose repository also releases api/ and kyaml/ under `latest`.
+	tag=$(billet_tc_release_tag kubernetes-sigs/kustomize kustomize/v)
+	[ -n "$tag" ] || { echo "kustomize publishes no kustomize/ release" >&2; exit 1; }
+	local kver="${tag#kustomize/}"
+	url="https://github.com/kubernetes-sigs/kustomize/releases/download/$tag"
+	sums=$(billet_tc_get "$url/checksums.txt")
+	want=$(awk -v f="kustomize_${kver}_linux_$arch.tar.gz" '$2 == f { print $1; exit }' <<<"$sums")
+	fetch_verified "$url/kustomize_${kver}_linux_$arch.tar.gz" "$BILLET_TC_WORK/kustomize.tgz" \
+		"$(billet_tc_hex "$want" 64 "kustomize $kver")"
+	tar -xzf "$BILLET_TC_WORK/kustomize.tgz" -C "$BILLET_TC_WORK" kustomize
+	install -D -m 0755 "$BILLET_TC_WORK/kustomize" "${BILLET_TC_ROOT:-}/usr/local/bin/kustomize"
+	rm -f "$BILLET_TC_WORK/kustomize.tgz" "$BILLET_TC_WORK/kustomize"
+
+	# The ECR credential helper, from the URL its release notes name.
+	rel=$(billet_tc_release awslabs/amazon-ecr-credential-helper)
+	sums=$(jq -r .body <<<"$rel")
+	url=$(awk -F'[()]' -v a="linux-$arch" '$0 ~ a { print $2; exit }' <<<"$sums")
+	[[ "$url" == https://* ]] || { echo "the ECR helper's release names no linux-$arch binary" >&2; exit 1; }
+	sums=$(billet_tc_get "$url.sha256")
+	want=$(awk '{ print $1; exit }' <<<"$sums")
+	billet_tc_bin "$url" /usr/bin/docker-credential-ecr-login "$(billet_tc_hex "$want" 64 "the ECR helper")"
+
+	# Git LFS, from its release rather than packagecloud's piped installer; the
+	# sums file is a clearsigned list of `<sha256>  <file>` lines.
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release git-lfs/git-lfs)")
+	url="https://github.com/git-lfs/git-lfs/releases/download/$tag"
+	local lfs="git-lfs-linux-$arch-$tag.tar.gz"
+	sums=$(billet_tc_get "$url/sha256sums.asc")
+	want=$(awk -v f="$lfs" '$2 == f { print $1; exit }' <<<"$sums")
+	fetch_verified "$url/$lfs" "$BILLET_TC_WORK/lfs.tgz" "$(billet_tc_hex "$want" 64 "git-lfs $tag")"
+	mkdir -p "$BILLET_TC_WORK/lfs"
+	tar -xzf "$BILLET_TC_WORK/lfs.tgz" -C "$BILLET_TC_WORK/lfs" --strip-components=1
+	install -D -m 0755 "$BILLET_TC_WORK/lfs/git-lfs" "${BILLET_TC_ROOT:-}/usr/local/bin/git-lfs"
+	rm -rf "$BILLET_TC_WORK/lfs.tgz" "$BILLET_TC_WORK/lfs"
+
+	# Ninja: its releases carry no digest, and GitHub checks none (TLS only).
+	local ninja=ninja-linux.zip
+	[ "$arch" = arm64 ] && ninja=ninja-linux-aarch64.zip
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release ninja-build/ninja)")
+	billet_tc_tls "https://github.com/ninja-build/ninja/releases/download/$tag/$ninja" \
+		"$BILLET_TC_WORK/ninja.zip"
+	unzip -q -o "$BILLET_TC_WORK/ninja.zip" -d "$BILLET_TC_WORK"
+	install -D -m 0755 "$BILLET_TC_WORK/ninja" "${BILLET_TC_ROOT:-}/usr/local/bin/ninja"
+	rm -f "$BILLET_TC_WORK/ninja.zip" "$BILLET_TC_WORK/ninja"
+
+	echo "hosted: yq, kubectl, kind, minikube, helm, kustomize, the ECR helper, git-lfs, ninja"
+}
+
+# install_aws_tools installs the AWS CLI, its Session Manager plugin and SAM.
+install_aws_tools() {
+	local uname="$BILLET_TC_UNAME" sam=x86_64 ssm=ubuntu_64bit
+
+	if [ "$BILLET_TC_ARCH" = arm64 ]; then
+		sam=arm64
+		ssm=ubuntu_arm64
+	fi
+
+	# THE CLI IS SIGNED, AND GITHUB DOES NOT CHECK IT; billet does, against the key
+	# AWS documents (FB5DB77F...4672475C), fetched and pinned like the others.
+	local zip="$BILLET_TC_WORK/awscli.zip" home
+	billet_tc_tls "https://awscli.amazonaws.com/awscli-exe-linux-$uname.zip" "$zip"
+	billet_tc_tls "https://awscli.amazonaws.com/awscli-exe-linux-$uname.zip.sig" "$zip.sig"
+	billet_tc_key \
+		'https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0xFB5DB77FD5C118B80511ADA8A6310ACC4672475C' \
+		FB5DB77FD5C118B80511ADA8A6310ACC4672475C "$BILLET_TC_WORK/aws.gpg"
+	home=$(mktemp -d)
+	if ! GNUPGHOME="$home" gpgv --keyring "$BILLET_TC_WORK/aws.gpg" "$zip.sig" "$zip"; then
+		echo "the AWS CLI zip does not verify against AWS's key" >&2
+		rm -rf "$home" "$zip"
+		exit 1
+	fi
+	rm -rf "$home" "$zip.sig" "$BILLET_TC_WORK/aws.gpg"
+
+	# INSTALLED FROM INSIDE THE TARGET, because its installer writes absolute
+	# symlinks; the unpacked tree is staged where the target can see it.
+	local stage=/tmp/billet-aws
+	rm -rf "${BILLET_TC_ROOT:-}$stage"
+	mkdir -p "${BILLET_TC_ROOT:-}$stage"
+	unzip -q "$zip" -d "${BILLET_TC_ROOT:-}$stage"
+	rm -f "$zip"
+	billet_tc_run "$stage/aws/install" -i /usr/local/aws-cli -b /usr/local/bin --update
+
+	# SAM, whose digest GitHub reads out of the release notes.
+	local rel tag want body
+	rel=$(billet_tc_release aws/aws-sam-cli)
+	tag=$(jq -r .tag_name <<<"$rel")
+	body=$(jq -r .body <<<"$rel")
+	want=$(awk -v f="aws-sam-cli-linux-$sam.zip" 'index($0, f) {
+			for (i = 1; i <= NF; i++) if ($i ~ /^[0-9a-f]+$/ && length($i) == 64) { print $i; exit }
+		}' <<<"$body")
+	fetch_verified "https://github.com/aws/aws-sam-cli/releases/download/$tag/aws-sam-cli-linux-$sam.zip" \
+		"$BILLET_TC_WORK/sam.zip" "$(billet_tc_hex "$want" 64 "aws-sam-cli $tag")"
+	rm -rf "${BILLET_TC_ROOT:-}$stage/sam"
+	unzip -q "$BILLET_TC_WORK/sam.zip" -d "${BILLET_TC_ROOT:-}$stage/sam"
+	rm -f "$BILLET_TC_WORK/sam.zip"
+	billet_tc_run "$stage/sam/install" --update
+
+	# The Session Manager plugin publishes no digest; GitHub checks none (TLS only).
+	billet_tc_tls \
+		"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/$ssm/session-manager-plugin.deb" \
+		"${BILLET_TC_ROOT:-}$stage/ssm.deb"
+	billet_tc_run env DEBIAN_FRONTEND=noninteractive dpkg -i "$stage/ssm.deb" >/dev/null
+
+	rm -rf "${BILLET_TC_ROOT:-}$stage"
+
+	local cmd
+	for cmd in aws sam session-manager-plugin; do
+		if ! billet_tc_run "/usr/local/bin/$cmd" --version >/dev/null 2>&1; then
+			echo "installed $cmd and it does not run" >&2
+			exit 1
+		fi
+	done
+
+	echo "hosted: aws cli, sam, session-manager-plugin"
+}
+
+# install_hosted_php_tools installs Composer and PHPUnit on the PHP above.
+install_hosted_php_tools() {
+	# Composer's installer is checked against the SHA-384 Composer publishes for it.
+	local want got
+	want=$(curl -fsSL --retry 5 --retry-all-errors https://composer.github.io/installer.sig)
+	want=$(billet_tc_hex "$want" 96 "the Composer installer")
+	billet_tc_tls https://getcomposer.org/installer "${BILLET_TC_ROOT:-}/tmp/composer-setup.php"
+	got=$(sha384sum "${BILLET_TC_ROOT:-}/tmp/composer-setup.php" | awk '{ print $1 }')
+
+	if [ "$got" != "$want" ]; then
+		echo "the Composer installer is $got, not the published $want" >&2
+		rm -f "${BILLET_TC_ROOT:-}/tmp/composer-setup.php"
+		exit 1
+	fi
+
+	billet_tc_run php /tmp/composer-setup.php --quiet --install-dir=/usr/bin --filename=composer
+	rm -f "${BILLET_TC_ROOT:-}/tmp/composer-setup.php"
+
+	# PHPUnit 8, the line GitHub pins; phar.phpunit.de publishes no digest (TLS only).
+	billet_tc_tls https://phar.phpunit.de/phpunit-8.phar "$BILLET_TC_WORK/phpunit"
+	install -D -m 0755 "$BILLET_TC_WORK/phpunit" "${BILLET_TC_ROOT:-}/usr/local/bin/phpunit"
+	rm -f "$BILLET_TC_WORK/phpunit"
+
+	echo "hosted: composer, phpunit"
+}
+
+# install_bazelisk installs Bazelisk through npm and pins the Bazel it resolved.
+#
+# THE PIN IS WHAT GITHUB'S IMAGE REALLY OFFERS: Bazelisk downloads Bazel on first
+# use, and USE_BAZEL_FALLBACK_VERSION names the version it found at build time.
+install_bazelisk() {
+	billet_tc_run /usr/local/bin/npm install -g --prefix /usr/local --no-fund --no-audit \
+		@bazel/bazelisk >/dev/null
+
+	local version
+	# --version, A STARTUP OPTION, answers without starting a Bazel server, which
+	# in a build chroot would hold the mount open.
+	local said
+	said=$(billet_tc_run env HOME=/root /usr/local/bin/bazelisk --version 2>/dev/null || true)
+	version=$(awk '$1 == "bazel" { print $2; exit }' <<<"$said")
+	billet_tc_run rm -rf /root/.cache/bazelisk
+	billet_tc_reap_target
+
+	if [ -z "$version" ]; then
+		echo "bazelisk installed and could not resolve a bazel version" >&2
+		exit 1
+	fi
+
+	printf 'USE_BAZEL_FALLBACK_VERSION=silent:%s\n' "$version" >>"$BILLET_TC_ENV_FILE"
+
+	echo "hosted: bazelisk, bazel $version on first use"
+}
+
+# install_action_cache installs the runner's archive of popular actions.
+#
+# NOT A TOOL A JOB CALLS: the runner reads ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE and
+# takes actions/checkout and the rest from disk instead of downloading them. Its
+# release carries no digest, and GitHub checks none (TLS only).
+install_action_cache() {
+	local tag
+	tag=$(jq -r .tag_name <<<"$(billet_tc_release actions/action-versions)")
+	billet_tc_tls \
+		"https://github.com/actions/action-versions/releases/download/$tag/action-versions.tar.gz" \
+		"$BILLET_TC_WORK/action-versions.tgz"
+	mkdir -p "${BILLET_TC_ROOT:-}/opt/actionarchivecache"
+	tar -xzf "$BILLET_TC_WORK/action-versions.tgz" -C "${BILLET_TC_ROOT:-}/opt/actionarchivecache"
+	rm -f "$BILLET_TC_WORK/action-versions.tgz"
+	chmod -R a+rX "${BILLET_TC_ROOT:-}/opt/actionarchivecache"
+
+	printf 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache\n' >>"$BILLET_TC_ENV_FILE"
+
+	echo "hosted: action archive cache $tag"
+}
+
+# install_agentic_tools installs what GitHub Agentic Workflows look up in the
+# toolcache: the firewall bundle's three newest releases and the Copilot CLI the
+# gh-aw compatibility matrix names.
+install_agentic_tools() {
+	local tc="$BILLET_TC_DIR" tags tag want
+
+	tags=$(curl -fsSL --retry 5 --retry-all-errors \
+		'https://api.github.com/repos/github/gh-aw-firewall/releases?per_page=10' |
+		jq -r '[.[] | select(.prerelease == false and .draft == false and (.assets | length) > 0)
+			| .tag_name | select(test("-[a-z]|beta") | not)] | .[:3][]')
+	[ -n "$tags" ] || { echo "gh-aw-firewall publishes no stable release" >&2; exit 1; }
+
+	while IFS= read -r tag; do
+		local url="https://github.com/github/gh-aw-firewall/releases/download/$tag"
+		local dir="$tc/agentic-workflow-firewall-js/${tag#v}"
+		local sums
+		sums=$(billet_tc_get "$url/checksums.txt")
+		want=$(awk '$2 == "awf-bundle.js" { print $1; exit }' <<<"$sums")
+		mkdir -p "$dir/x64"
+		fetch_verified "$url/awf-bundle.js" "$dir/x64/awf-bundle.js" \
+			"$(billet_tc_hex "$want" 64 "awf-bundle.js $tag")"
+		touch "$dir/x64.complete"
+	done <<<"$tags"
+
+	local version
+	version=$(curl -fsSL --retry 5 --retry-all-errors \
+		https://raw.githubusercontent.com/github/gh-aw-actions/main/.github/aw/compat.json |
+		jq -r '[.["agent-compat-v1"].copilot[] | select(.["max-gh-aw"] == "*") | .["max-agent"]]
+			| if length == 1 then .[0] else empty end')
+	[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+		{ echo "the gh-aw compatibility matrix names no single copilot version: \"$version\"" >&2; exit 1; }
+
+	local url="https://github.com/github/copilot-cli/releases/download/v$version"
+	local file="copilot-linux-$BILLET_TC_ARCH.tar.gz"
+	local sums
+	sums=$(billet_tc_get "$url/SHA256SUMS.txt")
+	want=$(awk -v f="$file" '$2 == f { print $1; exit }' <<<"$sums")
+	fetch_verified "$url/$file" "$BILLET_TC_WORK/copilot.tgz" "$(billet_tc_hex "$want" 64 "copilot $version")"
+	mkdir -p "$tc/copilot-cli/$version/$BILLET_TC_ARCH/bin"
+	tar -xzf "$BILLET_TC_WORK/copilot.tgz" -C "$tc/copilot-cli/$version/$BILLET_TC_ARCH/bin"
+	rm -f "$BILLET_TC_WORK/copilot.tgz"
+	touch "$tc/copilot-cli/$version/$BILLET_TC_ARCH.complete"
+
+	echo "hosted: gh-aw firewall $(tr '\n' ' ' <<<"$tags"), copilot cli $version"
+}
+
+# install_hosted_environment writes what GitHub's configure-environment.sh sets
+# for every tool: kernel limits kind and Elasticsearch need, conntrack's liberal
+# TCP window for container networking, GitHub's SSH host keys, and ::1 as
+# localhost.
+install_hosted_environment() {
+	local root="${BILLET_TC_ROOT:-}"
+
+	mkdir -p "$root/etc/sysctl.d" "$root/etc/udev/rules.d" "$root/etc/ssh"
+	printf '%s\n' vm.max_map_count=262144 fs.inotify.max_user_watches=655360 \
+		fs.inotify.max_user_instances=1280 vm.mmap_rnd_bits=28 \
+		>"$root/etc/sysctl.d/60-hosted-runner.conf"
+	printf '%s\n' 'ACTION=="add", SUBSYSTEM=="module", KERNEL=="nf_conntrack", RUN+="/usr/sbin/sysctl net.netfilter.nf_conntrack_tcp_be_liberal=1"' \
+		>"$root/etc/udev/rules.d/50-netfilter.rules"
+
+	# FROM GITHUB'S OWN API, which publishes its SSH host keys, rather than an
+	# ssh-keyscan that trusts whatever answers on port 22 during the build.
+	curl -fsSL --retry 5 --retry-all-errors https://api.github.com/meta |
+		jq -r '.ssh_keys[] | "github.com " + .' >>"$root/etc/ssh/ssh_known_hosts"
+
+	if [ -f "$root/etc/hosts" ]; then
+		sed -i 's/^::1[[:space:]]\+ip6-localhost ip6-loopback$/::1     localhost ip6-localhost ip6-loopback/' \
+			"$root/etc/hosts"
+	fi
+
+	echo "hosted: sysctl limits, conntrack rule, github.com host keys"
+}
+
+# install_hosted_tools installs everything above, in GitHub's order where it
+# matters: PHP before Composer, npm before Bazelisk.
+install_hosted_tools() {
+	install_hosted_packages
+	install_github_cli
+	install_hosted_binaries
+	install_aws_tools
+	install_hosted_php_tools
+	install_bazelisk
+	install_action_cache
+	install_agentic_tools
+	install_hosted_environment
 }
 
 # billet_install_toolcache is the one entry point a caller invokes.
