@@ -176,13 +176,13 @@ func TestAnUnauthorisedDefaultBranchWriteIsDiscarded(t *testing.T) {
 		completion server.CacheAuthority
 		recheck    *fakeAuthority
 	}{
-		"a pull request":                         {completion: pullRequest},
-		"an authority for another lease":         {completion: another},
-		"an authority for another repository":    {completion: otherRepository},
+		"a pull request":                          {completion: pullRequest},
+		"an authority for another lease":          {completion: another},
+		"an authority for another repository":     {completion: otherRepository},
 		"the zero authority an older plane sends": {},
-		"a re-check that withdraws it":           {completion: publishingAuthority(), recheck: withdrawn},
-		"no control plane to re-check with":      {completion: publishingAuthority()},
-		"a re-check that cannot be read":         {completion: publishingAuthority(), recheck: unreadable},
+		"a re-check that withdraws it":            {completion: publishingAuthority(), recheck: withdrawn},
+		"no control plane to re-check with":       {completion: publishingAuthority()},
+		"a re-check that cannot be read":          {completion: publishingAuthority(), recheck: unreadable},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

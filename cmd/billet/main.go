@@ -1881,6 +1881,7 @@ func (c *limitedConn) Close() error {
 // the kill switch, and what a job may publish. The node client is both.
 type nodeCacheControl interface {
 	node.ActionsPolicy
+	node.CachePolicy
 	node.CacheAuthorityReader
 }
 
@@ -1932,6 +1933,7 @@ func startNodeCache(
 		return nil, nil, err
 	}
 	service.SetActionsPolicy(cachePolicy)
+	service.SetCachePolicy(cachePolicy)
 	service.SetAuthorityReader(cachePolicy)
 
 	var lc net.ListenConfig

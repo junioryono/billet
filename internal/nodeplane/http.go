@@ -96,9 +96,9 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
-// CachePolicy answers the kill switch for transparent Actions caching.
+// CachePolicy answers the kill switch for one cache of one repository.
 type CachePolicy interface {
-	ActionsCacheAllowed(ctx context.Context, owner, repository string) (bool, error)
+	CacheAllowed(ctx context.Context, kind, owner, repository string) (bool, error)
 }
 
 // maxBody bounds a request body.
@@ -1323,7 +1323,18 @@ func (h *handler) actionsCachePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	owner := r.URL.Query().Get("owner")
 	repository := r.URL.Query().Get("repository")
-	allowed, err := h.cachePolicy.ActionsCacheAllowed(r.Context(), owner, repository)
+	// A NODE BELOW VersionCacheAuthority NAMES NO KIND, and it asks only about
+	// the Actions cache, which is all the switch covered then.
+	kind := config.CacheKind(r.URL.Query().Get("kind"))
+	if kind == "" {
+		kind = config.CacheActions
+	}
+	if !kind.Valid() {
+		writeErr(w, http.StatusBadRequest, "", "unknown cache kind")
+
+		return
+	}
+	allowed, err := h.cachePolicy.CacheAllowed(r.Context(), string(kind), owner, repository)
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
 

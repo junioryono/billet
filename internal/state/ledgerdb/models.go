@@ -14,6 +14,14 @@ type Admission struct {
 	ChangedAt  string
 }
 
+type CacheBlock struct {
+	Kind       string
+	ScopeType  string
+	Owner      string
+	Repository string
+	DisabledAt string
+}
+
 type ControllerRetirement struct {
 	Deployment   string
 	Retiring     string

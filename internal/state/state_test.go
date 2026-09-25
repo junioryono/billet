@@ -1153,7 +1153,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 			`DROP TABLE node_revocations`,
 			`DROP TABLE pending_completions`,
 			`DROP TABLE job_identities`,
-			`DROP TABLE cache_interception_blocks`,
+			`DROP TABLE cache_blocks`,
 			`DROP TABLE pool_runners`,
 			`DROP TABLE pool_slot_identities`,
 			`DROP TABLE deployment_binding`,

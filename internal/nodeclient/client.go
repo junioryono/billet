@@ -553,7 +553,26 @@ func (c *Client) ActionsCacheAllowed(
 	ctx context.Context,
 	owner, repository string,
 ) (bool, error) {
+	return c.CacheAllowed(ctx, config.CacheActions, owner, repository)
+}
+
+// CacheAllowed reads the control plane's kill switch for one cache.
+//
+// Below the version that knows kinds, only the Actions cache has a switch to
+// ask about, and every other cache is answered allowed without asking: that is
+// exactly what the older control plane would enforce.
+func (c *Client) CacheAllowed(
+	ctx context.Context,
+	kind config.CacheKind,
+	owner, repository string,
+) (bool, error) {
 	query := url.Values{"owner": {owner}, "repository": {repository}}
+	if kind != config.CacheActions {
+		if c.WireVersion() < nodeapi.VersionCacheAuthority {
+			return true, nil
+		}
+		query.Set("kind", string(kind))
+	}
 	var response nodeapi.CachePolicyResponse
 	if err := c.do(ctx, http.MethodGet, c.nodePath("/cache-policy")+"?"+query.Encode(),
 		nil, &response); err != nil {
