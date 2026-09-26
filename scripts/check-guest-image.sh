@@ -300,6 +300,36 @@ check_github_cli() {
 	fi
 }
 
+# check_filesystem_ready passes or fails the gate on whether the image's ext4 can
+# be grown at launch without a check first.
+#
+# A NODE GROWS EVERY CLONE WITH resize2fs BEFORE BOOT, and resize2fs refuses a
+# filesystem that is not clean or whose last check is older than its last mount
+# ("Please run 'e2fsck -f' first"). The build mounted the image one second after
+# mkfs had stamped the check time, and that generation failed every launch on the
+# fleet for 90 minutes (2026-09-26) while `images verify`, which does not grow the
+# disk, passed it. Every earlier image had mounted within the same second.
+check_filesystem_ready() {
+	local sb state mounted checked
+
+	if ! sb=$(dumpe2fs -h "$1" 2>/dev/null); then
+		fail "could not read the image's ext4 superblock, so nothing says a node can grow it"
+		return
+	fi
+
+	state=$(sed -n 's/^Filesystem state: *//p' <<<"$sb")
+	mounted=$(date -d "$(sed -n 's/^Last mount time: *//p' <<<"$sb")" +%s 2>/dev/null || echo 0)
+	checked=$(date -d "$(sed -n 's/^Last checked: *//p' <<<"$sb")" +%s 2>/dev/null || echo 0)
+
+	if [ "$state" != clean ]; then
+		fail "the image's filesystem state is '$state', not clean; resize2fs will refuse to grow it at launch"
+	elif [ "$checked" -lt "$mounted" ]; then
+		fail "the image's filesystem was last checked before it was last mounted; resize2fs will demand e2fsck -f at every launch (run e2fsck -f on the image after the build unmounts it)"
+	else
+		pass "filesystem clean and checked after its last mount, so a node can grow it"
+	fi
+}
+
 # check_android_sdk passes or fails the gate on the Android SDK in the image
 # mounted at $1: sdkmanager where the installer puts it, at least one platform, and
 # ANDROID_HOME in the environment the runner reads. GitHub's image carries the SDK,
@@ -697,6 +727,7 @@ for tool in zstd unzip zip tar wget rsync gcc make; do
 	fi
 done
 
+check_filesystem_ready "$IMAGE"
 check_github_cli "$MNT"
 check_android_sdk "$MNT"
 check_hosted_tools "$MNT"

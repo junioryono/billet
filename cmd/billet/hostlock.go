@@ -93,12 +93,15 @@ func takeHostLock() (*hostLock, error) {
 	return &hostLock{file: file}, nil
 }
 
-// release drops the lock. Closing the descriptor releases it, so this cannot
-// leave one held by a process that has exited.
+// release drops the lock, unlocking before it closes for probeLock.release's
+// reason: a child forked meanwhile shares the open file description until it
+// execs, and closing only this descriptor would leave the lock held.
 func (l *hostLock) release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
 
-	return l.file.Close()
+	unlockErr := unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
+
+	return errors.Join(unlockErr, l.file.Close())
 }

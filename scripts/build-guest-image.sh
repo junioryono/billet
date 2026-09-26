@@ -451,7 +451,7 @@ need_tools() {
 	# mountpoint likewise: the stale-mount guard is what stops that delete from
 	# running through a live filesystem, and a guard whose tool is missing is not
 	# a guard.
-	for t in debootstrap mkfs.ext4 chroot jq flock mountpoint; do
+	for t in debootstrap mkfs.ext4 e2fsck chroot jq flock mountpoint; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
 
@@ -1812,6 +1812,21 @@ NET
 	contract=$(read_guest_contract "$rootfs")
 
 	unmount_rootfs
+
+	# CHECKED AFTER THE LAST UNMOUNT, which is what makes the image growable. A node
+	# grows every clone with resize2fs before boot, and resize2fs refuses a
+	# filesystem whose last check is older than its last mount: mkfs stamps the
+	# check time, the build mounts it a moment later, and when that moment crossed
+	# a second boundary every launch failed with "Please run 'e2fsck -f' first"
+	# (2026-09-26). A forced check stamps a newer time and proves the filesystem.
+	# e2fsck exits 0 when clean and 1 when it corrected something; 4 and above
+	# mean it could not, and that image must not be published.
+	local fsck_status=0
+	e2fsck -f -y "$img" >&2 || fsck_status=$?
+	if [ "$fsck_status" -ge 4 ]; then
+		echo "e2fsck could not make $img consistent (exit $fsck_status); refusing to publish it" >&2
+		exit 1
+	fi
 
 	echo "built $img ($(du -h "$img" | cut -f1))"
 
