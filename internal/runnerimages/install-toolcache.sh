@@ -2916,13 +2916,23 @@ install_aws_tools() {
 	rm -f "$zip"
 	billet_tc_run "$stage/aws/install" -i /usr/local/aws-cli -b /usr/local/bin --update
 
-	# SAM, whose digest GitHub reads out of the release notes.
+	# SAM, whose digest GitHub reads out of the release notes. The notes are a
+	# Markdown table (**file** | `sum`), so the emphasis, pipes and backticks are
+	# blanked before a field is judged; a bare-hex test on the raw fields found
+	# nothing and failed the image build (2026-09-26). The row must name the zip
+	# itself, not its .sig, which shares the prefix.
 	local rel tag want body
 	rel=$(billet_tc_release aws/aws-sam-cli)
 	tag=$(jq -r .tag_name <<<"$rel")
 	body=$(jq -r .body <<<"$rel")
-	want=$(awk -v f="aws-sam-cli-linux-$sam.zip" 'index($0, f) {
-			for (i = 1; i <= NF; i++) if ($i ~ /^[0-9a-f]+$/ && length($i) == 64) { print $i; exit }
+	want=$(awk -v f="aws-sam-cli-linux-$sam.zip" '{
+			line = $0
+			gsub(/[`*|]/, " ", line)
+			n = split(line, field, /[ \t\r]+/)
+			named = 0
+			for (i = 1; i <= n; i++) if (field[i] == f) named = 1
+			if (!named) next
+			for (i = 1; i <= n; i++) if (field[i] ~ /^[0-9a-f]+$/ && length(field[i]) == 64) { print field[i]; exit }
 		}' <<<"$body")
 	fetch_verified "https://github.com/aws/aws-sam-cli/releases/download/$tag/aws-sam-cli-linux-$sam.zip" \
 		"$BILLET_TC_WORK/sam.zip" "$(billet_tc_hex "$want" 64 "aws-sam-cli $tag")"
