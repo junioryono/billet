@@ -102,8 +102,8 @@ func defaultHTTP() *http.Client {
 // TLS timeout on that hop put a SAS signature and a JWT into a rollout refusal,
 // which `billet rollout status` printed and the journal kept (#253).
 func WithoutSignedQuery(err error) error {
-	var failed *neturl.Error
-	if !errors.As(err, &failed) {
+	failed, ok := errors.AsType[*neturl.Error](err)
+	if !ok {
 		return err
 	}
 
