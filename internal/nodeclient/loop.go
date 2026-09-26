@@ -852,22 +852,33 @@ func waitForHolding(
 	// one somebody kills, which is the outcome the whole change exists to avoid.
 	started := time.Now()
 
-	var warnedAt time.Time
+	// HOLDING IS ASKED OFTEN AND TEND ONLY ON THE SWEEP CADENCE. Holding is an
+	// in-memory read; Tend asks the provider and writes the ledger. Asking Holding
+	// only once per sweep kept every drained host out of service for up to a whole
+	// sweep interval (five minutes in production) after its last job's compute was
+	// destroyed, and a rollout paid that once per host.
+	check := min(every, holdingCheckEvery)
+
+	var warnedAt, tendAt time.Time
 
 	for compute.Holding() {
-		err := compute.Tend(ctx)
+		if !time.Now().Before(tendAt) {
+			err := compute.Tend(ctx)
 
-		// CANCELLATION FIRST, BECAUSE BOTH LINES BELOW WOULD BE WRONG. A Tend that
-		// was still running when the wait ended returns context.Canceled, which is
-		// not a custody failure — and the overrun warning would tell an operator to
-		// send a signal they have already sent. Neither is a lie worth logging at
-		// the moment somebody is watching a shutdown.
-		if ctx.Err() != nil {
-			return false
-		}
+			// CANCELLATION FIRST, BECAUSE BOTH LINES BELOW WOULD BE WRONG. A Tend
+			// that was still running when the wait ended returns context.Canceled,
+			// which is not a custody failure — and the overrun warning would tell an
+			// operator to send a signal they have already sent. Neither is a lie
+			// worth logging at the moment somebody is watching a shutdown.
+			if ctx.Err() != nil {
+				return false
+			}
 
-		if err != nil {
-			log.Error("could not advance custody while draining", "error", err)
+			if err != nil {
+				log.Error("could not advance custody while draining", "error", err)
+			}
+
+			tendAt = time.Now().Add(every)
 		}
 
 		if waited := time.Since(started); waited >= reportAfter &&
@@ -881,13 +892,17 @@ func waitForHolding(
 				"stop_waiting", stopHint)
 		}
 
-		if !sleep(ctx, every) {
+		if !sleep(ctx, check) {
 			return false
 		}
 	}
 
 	return true
 }
+
+// holdingCheckEvery bounds how long a draining node goes on waiting after the
+// last compute it held is gone.
+const holdingCheckEvery = 2 * time.Second
 
 // drainWarnEvery bounds how often an overrunning node drain repeats itself.
 //
