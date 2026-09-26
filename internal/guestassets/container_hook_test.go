@@ -236,7 +236,7 @@ func TestTheContainerHookAddsNothingForATierWithoutTheGoCache(t *testing.T) {
 	if code, out := runHook(t, node, index, request, "GOCACHEPROG=", "BILLET_CACHE_TOKEN=token"); code != 0 {
 		t.Fatalf("hook exited %d\n%s", code, out)
 	}
-	container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
+	container := field[map[string]any](t, field[map[string]any](t, readForwarded(t, record), "args"), "container")
 	if len(container) != 1 {
 		t.Fatalf("a tier without the go cache had its container changed: %v", container)
 	}
@@ -279,13 +279,17 @@ func TestTheContainerHookGivesAJobContainerTheGoCacheHelper(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("hook exited %d\n%s", code, out)
 			}
-			container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
-			mounts, _ := container["systemMountVolumes"].([]any)
-			if len(mounts) != 1 || mounts[0].(map[string]any)["sourceVolumePath"] != billet ||
-				mounts[0].(map[string]any)["readOnly"] != true {
+			container := field[map[string]any](t,
+				field[map[string]any](t, readForwarded(t, record), "args"), "container")
+			mounts := field[[]any](t, container, "systemMountVolumes")
+			if len(mounts) != 1 {
 				t.Fatalf("mounts = %v, want only the helper, read-only", mounts)
 			}
-			variables := container["environmentVariables"].(map[string]any)
+			mount, ok := mounts[0].(map[string]any)
+			if !ok || mount["sourceVolumePath"] != billet || mount["readOnly"] != true {
+				t.Fatalf("mounts = %v, want only the helper, read-only", mounts)
+			}
+			variables := field[map[string]any](t, container, "environmentVariables")
 			wantHelper := billet + " cache gocacheprog"
 			if _, turnedOff := own["GOCACHEPROG"]; turnedOff {
 				wantHelper = ""
@@ -300,6 +304,18 @@ func TestTheContainerHookGivesAJobContainerTheGoCacheHelper(t *testing.T) {
 			}
 		})
 	}
+}
+
+// field is object[key] as a T, failing the test when it is absent or not one.
+func field[T any](t *testing.T, object map[string]any, key string) T {
+	t.Helper()
+
+	value, ok := object[key].(T)
+	if !ok {
+		t.Fatalf("%s is %T, not the %T the hook forwards: %v", key, object[key], value, object)
+	}
+
+	return value
 }
 
 func readForwarded(t *testing.T, record string) map[string]any {

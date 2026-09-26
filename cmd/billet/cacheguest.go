@@ -83,18 +83,45 @@ func cmdCacheGitCredential(ctx context.Context, args []string) error {
 	if args[0] != "get" {
 		return nil
 	}
-	// RUN IN THE REPOSITORY GIT IS FETCHING INTO (measured: git runs a helper
-	// with the worktree as its directory), where checkout wrote its header.
-	output, _ := exec.CommandContext(ctx, "git", "config", "--get-all",
-		"http.https://github.com/.extraheader").Output()
-	answer, err := gitCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken),
-		strings.Split(strings.TrimSpace(string(output)), "\n"))
+	headers, err := checkoutHeaders(ctx)
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(os.Stdout, answer)
+	answer, err := gitCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken), headers)
+	if err != nil {
+		return err
+	}
+	_, err = os.Stdout.WriteString(answer)
 
 	return err
+}
+
+// checkoutHeaders is every header actions/checkout configured for github.com in
+// the repository git is fetching into (measured: git runs a helper with the
+// worktree as its directory). git config exits 1 for a key that is not set,
+// which is none; any other failure is the helper's, not an absent header.
+func checkoutHeaders(ctx context.Context) ([]string, error) {
+	output, err := exec.CommandContext(ctx, "git", "config", "--get-all",
+		"http.https://github.com/.extraheader").Output()
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok && exit.ExitCode() == 1 {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read checkout's github.com header: %w", err)
+	}
+
+	return strings.Split(strings.TrimSpace(string(output)), "\n"), nil
+}
+
+// hostOf is the scheme and host a URL names, or two empty strings for one that
+// does not parse, which names no host at all.
+func hostOf(raw string) (string, string) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", ""
+	}
+
+	return parsed.Scheme, parsed.Host
 }
 
 // gitCredential answers git's request for the node's host: the session bearer
@@ -102,8 +129,8 @@ func cmdCacheGitCredential(ctx context.Context, args []string) error {
 // github.com as the password, or "-" when there is none. A request for any
 // other host is answered with nothing.
 func gitCredential(in io.Reader, endpoint, token string, headers []string) (string, error) {
-	node, err := url.Parse(endpoint)
-	if err != nil || node.Host == "" || token == "" {
+	scheme, host := hostOf(endpoint)
+	if host == "" || token == "" {
 		return "", nil
 	}
 	asked := map[string]string{}
@@ -120,7 +147,7 @@ func gitCredential(in io.Reader, endpoint, token string, headers []string) (stri
 	if err := scanner.Err(); err != nil {
 		return "", fmt.Errorf("read the credential request: %w", err)
 	}
-	if asked["protocol"] != node.Scheme || asked["host"] != node.Host {
+	if asked["protocol"] != scheme || asked["host"] != host {
 		return "", nil
 	}
 	password := "-"
@@ -147,12 +174,8 @@ func cacheCredential(in io.Reader, endpoint, token string) (credentialResponse, 
 	if endpoint == "" || token == "" {
 		return answer, nil
 	}
-	node, err := url.Parse(endpoint)
-	if err != nil {
-		return answer, nil
-	}
-	asked, err := url.Parse(request.URI)
-	if err != nil || asked.Host != node.Host || asked.Host == "" {
+	_, node := hostOf(endpoint)
+	if _, asked := hostOf(request.URI); asked == "" || asked != node {
 		return answer, nil
 	}
 	answer.Headers["Authorization"] = []string{"Bearer " + token}

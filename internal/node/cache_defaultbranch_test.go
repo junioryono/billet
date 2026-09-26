@@ -118,7 +118,9 @@ func endSession(t *testing.T, service *CacheService, instance string, authority 
 	if err := service.Close(t.Context(), instance); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	_ = service.RetryClosed(t.Context())
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 }
 
 // A DEFAULT-BRANCH NAMESPACE IS NOT ONE A GUEST CAN NAME. Every key it uses
@@ -217,7 +219,9 @@ func TestAnUnauthorisedDefaultBranchWriteIsDiscarded(t *testing.T) {
 			if err := service.Close(t.Context(), instance); err != nil {
 				t.Fatalf("Close: %v", err)
 			}
-			_ = service.RetryClosed(t.Context())
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
+			}
 
 			if storage.published != 0 || storage.snapshots != 0 || storage.discarded != 1 {
 				t.Fatalf("published %d, snapshotted %d, discarded %d; want only the discard",
@@ -292,7 +296,9 @@ func TestAnInterruptedPublicationIsReconciledFromItsJournal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("restart: %v", err)
 			}
-			_ = restarted.RetryClosed(t.Context())
+			if err := restarted.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
+			}
 
 			if after.snapshots != 0 || after.published != tc.wantPublished ||
 				after.discarded != tc.wantDiscarded {
@@ -363,7 +369,9 @@ func TestTheRunnerSettlesACompletionWithItsAuthority(t *testing.T) {
 			if err := runner.DestroyCompleted(t.Context(), 11, "succeeded", authority); err != nil {
 				t.Fatalf("DestroyCompleted: %v", err)
 			}
-			_ = service.RetryClosed(t.Context())
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
+			}
 
 			if got := storage.published == 1; got != publishes {
 				t.Fatalf("published %d, want publication %t", storage.published, publishes)
