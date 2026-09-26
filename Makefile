@@ -49,14 +49,15 @@ test: ## Race-enabled test run, instrumented exactly as CI runs it
 	# reliable under coverage. A local gate that is weaker than CI trains you to
 	# trust it and then be surprised.
 	#
-	# -timeout 20m IS PER PACKAGE, and matches CI: internal/alloc alone took
+	# -timeout 35m IS PER PACKAGE, and matches CI: internal/alloc alone took
 	# 530s under -race and atomic coverage before migration 49 added fourteen
-	# statements to every test ledger's open, against go test's default of 600s.
-	go test -race -count=1 -timeout 20m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
+	# statements to every test ledger's open, against go test's default of 600s,
+	# and cmd/billet crossed 20m on a loaded fleet runner on 2026-09-26.
+	go test -race -count=1 -timeout 35m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
-	go test -race -count=1 -timeout 20m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
+	go test -race -count=1 -timeout 35m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
