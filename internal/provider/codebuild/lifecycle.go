@@ -135,6 +135,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	if err := p.Accepts(spec.Trust); err != nil {
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
+	if len(spec.GuestCaches) > 0 {
+		return nil, fmt.Errorf("codebuild: %s asks for guest build caches, which only "+
+			"firecracker guests configure", spec.Name)
+	}
 
 	// THE NETWORK IS VERIFIED AGAINST THE PROJECT BEFORE ANYTHING IS STAGED, because
 	// CodeBuild has no StartBuild VPC override: a fork's build runs on whatever

@@ -62,9 +62,12 @@ tiers:
     memory: 32GiB
     disk: 160GiB
     image: ubuntu-2404-x64@verified
-    intercept: true           # transparent Actions cache, Linux Firecracker only
-    cache_scope: repository
+    cache_scope:              # the repository this pool's caches belong to
+      owner: acme
+      repository: api
 ```
+
+With a repository scope, an untrusted tier gets every cache a Firecracker node serves (the Docker store, sticky disks, the Actions cache, the Git mirror, Bazel and Buck2, and Go) and publishes only what a job GitHub proves ran on `acme/api`'s default branch wrote, which needs the App's `actions: read`. [Build caches](../operating/build-caches.md) has each cache and how to turn it off.
 
 `node.ceph` is a sibling of `node.firecracker` rather than a field inside it, because two hosts in one place map the same pools. `node.ceph.user` defaults to `billet` and `admin` is refused, since an admin key can delete a pool. `image: …@verified` resolves to the newest generation proved to boot, so a fleet takes up a new image with no config edit; `disk` grows the job's clone before boot and the golden image stays small.
 

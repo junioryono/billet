@@ -122,7 +122,7 @@ func TestCheckAtRepositoryScopeSkipsTheRunnerGroupProbeAndSaysSo(t *testing.T) {
 
 	asked := installationAt(t, map[string]string{
 		"/repos/acme/widgets/installation": `{"id": 42, "account": {"login": "acme", "type": "User"},
-			"permissions": {"metadata": "read", "administration": "write"}}`,
+			"permissions": {"metadata": "read", "administration": "write", "actions": "read"}}`,
 	})
 
 	var checkErr error

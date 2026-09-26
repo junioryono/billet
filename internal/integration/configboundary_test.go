@@ -258,7 +258,7 @@ func TestTheConfiguredOrgIsTheOneGitHubIsAskedAbout(t *testing.T) {
 
 	if _, err := github.VerifyAppAt(t.Context(), srv.Client(), srv.URL,
 		cfg.GitHub.AppID, boundaryAppKey(), github.OrganizationTarget(cfg.GitHub.Org),
-		cfg.GitHub.InstallationID); err != nil {
+		cfg.GitHub.InstallationID, false); err != nil {
 		t.Fatalf("VerifyAppAt: %v", err)
 	}
 
@@ -332,7 +332,7 @@ func TestTheConfiguredRepositoryIsTheOneGitHubIsAskedAbout(t *testing.T) {
 
 	if _, err := github.VerifyAppAt(t.Context(), srv.Client(), srv.URL,
 		cfg.GitHub.AppID, boundaryAppKey(), github.RepositoryTarget(target.Owner(), target.RepositoryName()),
-		cfg.GitHub.InstallationID); err != nil {
+		cfg.GitHub.InstallationID, false); err != nil {
 		t.Fatalf("VerifyAppAt: %v", err)
 	}
 

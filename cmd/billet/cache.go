@@ -15,18 +15,39 @@ func cmdCache(ctx context.Context, args []string) error {
 		return cmdCacheConformance(ctx, args[1:])
 	}
 
+	if len(args) > 0 && args[0] == "status" {
+		return cmdCacheStatus(ctx, args[1:])
+	}
+
+	// Run inside a guest by the go command, bazel and git, never by a person.
+	if len(args) > 0 && args[0] == "gocacheprog" {
+		return cmdCacheGoCacheProg(ctx, args[1:])
+	}
+	if len(args) > 0 && args[0] == "credential-helper" {
+		return cmdCacheCredentialHelper(ctx, args[1:])
+	}
+	if len(args) > 0 && args[0] == "git-credential" {
+		return cmdCacheGitCredential(ctx, args[1:])
+	}
+
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
-		return errors.New("usage: billet cache <disable|enable|conformance> [flags]")
+		return errors.New("usage: billet cache <disable|enable|status|conformance> [flags]")
 	}
 	action := args[0]
 	fs := newFlagSet("billet cache " + action)
 	cfgPath := addConfigFlag(fs)
 	organisation := fs.String("org", "", "GitHub organisation whose repositories this policy covers")
 	repository := fs.String("repository", "", "GitHub owner/repository this policy covers")
+	kindFlag := fs.String("kind", "all", "the cache this policy covers: "+
+		"docker, sticky, actions, git, bazel, go, or all")
 	if err := parse(fs, args[1:]); err != nil {
 		return err
 	}
 	scope, label, err := cachePolicyScope(*organisation, *repository)
+	if err != nil {
+		return err
+	}
+	kind, what, err := cachePolicyKind(*kindFlag)
 	if err != nil {
 		return err
 	}
@@ -43,16 +64,32 @@ func cmdCache(ctx context.Context, args []string) error {
 	}
 	defer db.Close()
 	enabled := action == "enable"
-	if err := db.SetActionsCacheEnabled(ctx, scope, enabled); err != nil {
+	if err := db.SetCacheEnabled(ctx, kind, scope, enabled); err != nil {
 		return err
 	}
 	status := "disabled"
 	if enabled {
 		status = "enabled"
 	}
-	fmt.Printf("transparent Actions caching is %s for %s\n", status, label)
+	fmt.Printf("%s %s for %s\n", what, status, label)
+	if enabled && kind != state.AllCaches {
+		fmt.Printf("(a block for every cache on the same scope, if there is one, still stands; " +
+			"remove it with --kind all)\n")
+	}
 
 	return nil
+}
+
+// cachePolicyKind is the ledger's kind for a --kind flag, and how to say it.
+func cachePolicyKind(flag string) (string, string, error) {
+	if flag == "all" {
+		return state.AllCaches, "every cache is", nil
+	}
+	if kind := config.CacheKind(flag); kind.Valid() {
+		return flag, "the " + flag + " cache is", nil
+	}
+
+	return "", "", fmt.Errorf("--kind %q is not one of docker, sticky, actions, git, bazel, go, all", flag)
 }
 
 func cachePolicyScope(organisation, repository string) (state.ActionsCacheScope, string, error) {

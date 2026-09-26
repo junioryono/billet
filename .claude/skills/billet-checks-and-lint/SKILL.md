@@ -51,6 +51,8 @@ description: "What `make check` runs and why each piece is inside or outside it;
 
 **Go comments wrap at 88 columns; Markdown never wraps.** Go source follows the surrounding file. Every `.md` and `.txt` file is one paragraph per line.
 
+**One gRPC server, in one package.** The depguard rule `remoteapis` confines `github.com/bazelbuild/remote-apis`, `google.golang.org/grpc`, `google.golang.org/genproto` and `google.golang.org/protobuf` to `internal/node/reapi`, which serves the cache half of the Remote Execution API over a `Volume` the node hands it and knows nothing of sessions or publication. A test that needs a real gRPC client lives in `reapi_test`; a node test replaces `CacheService.remoteAPI` with a recording handler instead of importing gRPC. Adding the API cost 462,848 bytes (1.2%) of a stripped linux/amd64 binary, because gRPC was already linked through an existing dependency (2026-09-25).
+
 ## Measured facts
 
 - `make lint` on darwin alone missed a linux-only conversion error that CI caught; hence the second pass.
@@ -72,4 +74,4 @@ description: "What `make check` runs and why each piece is inside or outside it;
 
 `billet-testing` (the mutation discipline the guards protect), `billet-state` (why the ledger rules exist), `billet-shell-gates` (the same "a gate must be able to fail" rule applied to shell), `billet-git-flow` (when the gate runs).
 
-**Superseded CI runs are force-cancelled.** `ci.yml`'s concurrency group asks GitHub to cancel an older run of the same ref, but a run whose jobs are queued for self-hosted runners ignores an ordinary cancel and keeps its place in the fleet's queue. `.github/workflows/cancel-superseded.yml` runs on a GitHub-hosted runner on every push to `main` and every same-repository PR push, and force-cancels each unfinished CI run on that branch whose head is not the pushed commit.
+**Superseded CI runs are force-cancelled.** `ci.yml`'s concurrency group asks GitHub to cancel an older run of the same ref, but a run whose jobs are queued for self-hosted runners ignores an ordinary cancel and keeps its place in the fleet's queue. `.github/workflows/cancel-superseded.yml` runs on a GitHub-hosted runner on every same-repository PR push, and force-cancels each unfinished CI run on that branch whose head is not the pushed commit. NEVER ON `main`: a `main` run is the check on what merged, and cancelling it for the next merge left `main` with no completed run across nine merges on 2026-09-25. So `ci.yml` sets `cancel-in-progress` only for `pull_request`; on `main` the concurrency group lets the running run finish and keeps only the newest pending one.

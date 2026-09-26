@@ -620,6 +620,23 @@ else
         reach billet's cache adapter for a type=gha export"
 fi
 
+# THE BUILD CACHES NEED BILLET INSIDE THE GUEST: the go command runs it as
+# GOCACHEPROG and Bazel as its credential helper. The agent configures neither
+# without the binary, so a missing one is a tier that silently builds cold.
+GUEST_BILLET="$MNT/opt/billet/bin/billet"
+if [ -x "$GUEST_BILLET" ] && [ -s "$GUEST_BILLET" ] &&
+	grep -Fq 'exec /opt/billet/bin/billet cache credential-helper "$@"' \
+		"$MNT/opt/billet/bin/bazel-credential-helper" &&
+	grep -Fq 'runner_env+=("GOCACHEPROG=$GUEST_BILLET cache gocacheprog")' "$AGENT" &&
+	grep -Fq 'build --credential_helper=' "$AGENT" &&
+	grep -Fq 'helper = $GUEST_BILLET cache git-credential' "$AGENT"; then
+	pass "billet is in the guest for the go, bazel and git caches"
+else
+	fail "no billet at /opt/billet/bin/billet, no bazel credential helper beside it, or an
+        agent that does not configure them; a tier with the go, bazel or git cache would
+        build cold"
+fi
+
 buildx_plugin=""
 for candidate in \
 	usr/local/lib/docker/cli-plugins/docker-buildx \

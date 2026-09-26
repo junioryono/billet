@@ -14,6 +14,14 @@ type Admission struct {
 	ChangedAt  string
 }
 
+type CacheBlock struct {
+	Kind       string
+	ScopeType  string
+	Owner      string
+	Repository string
+	DisabledAt string
+}
+
 type ControllerRetirement struct {
 	Deployment   string
 	Retiring     string
@@ -86,6 +94,10 @@ type PoolRunner struct {
 	JobID              string
 	SourceAcknowledged int64
 	UpdatedAt          string
+	JobOwner           string
+	JobRepository      string
+	JobWorkflowRef     string
+	JobEvent           string
 }
 
 type RevokedCert struct {

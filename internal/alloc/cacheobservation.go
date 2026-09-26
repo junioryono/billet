@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -96,6 +97,54 @@ func (c ActionsCache) Valid() bool {
 	return false
 }
 
+// BuildCache is what one build cache (sticky disks, the Git mirror, the Bazel
+// and Go content-addressed caches) did for a job, as the node saw it over the
+// job's whole session and reported when the session ended.
+//
+// AN OBSERVATION, like ImageCache: it decides nothing. The empty string means
+// nothing was observed, which is also what a session a restarted node recovered
+// says about a cache it did not see the whole of.
+type BuildCache string
+
+const (
+	// BuildCacheWarm means the cache already held something the job used.
+	BuildCacheWarm BuildCache = "warm"
+	// BuildCacheCold means the job used the cache and it held nothing the job
+	// used.
+	BuildCacheCold BuildCache = "cold"
+	// BuildCacheDisabled means the kill switch refused the cache.
+	BuildCacheDisabled BuildCache = "disabled"
+	// BuildCacheUnavailable means the store failed and the job went on without
+	// the cache.
+	BuildCacheUnavailable BuildCache = "unavailable"
+	// BuildCacheUnused means the tier enabled the cache and the session ended
+	// without the guest asking for it.
+	BuildCacheUnused BuildCache = "unused"
+)
+
+// Valid reports whether this is a token billet may write.
+func (c BuildCache) Valid() bool {
+	switch c {
+	case BuildCacheWarm, BuildCacheCold, BuildCacheDisabled, BuildCacheUnavailable, BuildCacheUnused:
+		return true
+	}
+
+	return false
+}
+
+// BuildCaches is what each build cache did for one job.
+type BuildCaches struct {
+	Sticky BuildCache `json:"sticky_cache,omitempty"`
+	Git    BuildCache `json:"git_cache,omitempty"`
+	Bazel  BuildCache `json:"bazel_cache,omitempty"`
+	Go     BuildCache `json:"go_cache,omitempty"`
+}
+
+// each names every observation, for the loops that treat them alike.
+func (b BuildCaches) each() map[string]BuildCache {
+	return map[string]BuildCache{"sticky": b.Sticky, "git": b.Git, "bazel": b.Bazel, "go": b.Go}
+}
+
 // CacheObservation is what a node saw the cache do for one job. Either half
 // may be empty, meaning that half has not been observed yet; a generation
 // travels only with a warm image store.
@@ -103,13 +152,19 @@ type CacheObservation struct {
 	ImageCache      ImageCache   `json:"image_cache,omitempty"`
 	CacheGeneration string       `json:"cache_generation,omitempty"`
 	ActionsCache    ActionsCache `json:"actions_cache,omitempty"`
+	BuildCaches
 }
 
 // Validate refuses an observation billet must not write: an unknown token, a
 // generation with no warm store to attribute it to, or nothing at all.
 func (o CacheObservation) Validate() error {
-	if o.ImageCache == "" && o.ActionsCache == "" {
+	if o.ImageCache == "" && o.ActionsCache == "" && o.BuildCaches == (BuildCaches{}) {
 		return errors.New("alloc: a cache observation must observe something")
+	}
+	for name, outcome := range o.each() {
+		if outcome != "" && !outcome.Valid() {
+			return fmt.Errorf("alloc: %q is not a %s cache outcome billet records", outcome, name)
+		}
 	}
 	if o.ImageCache != "" && !o.ImageCache.Valid() {
 		return fmt.Errorf("alloc: %q is not an image-cache outcome billet records", o.ImageCache)
@@ -161,6 +216,10 @@ func (a *Allocator) RecordCacheObservation(
 			ImageCache:      string(obs.ImageCache),
 			CacheGeneration: obs.CacheGeneration,
 			ActionsCache:    string(obs.ActionsCache),
+			StickyCache:     string(obs.Sticky),
+			GitCache:        string(obs.Git),
+			BazelCache:      string(obs.Bazel),
+			GoCache:         string(obs.Go),
 			ID:              lease.ID,
 			Epoch:           lease.Epoch,
 		}); err != nil {
@@ -171,6 +230,10 @@ func (a *Allocator) RecordCacheObservation(
 			ImageCache:      string(obs.ImageCache),
 			CacheGeneration: obs.CacheGeneration,
 			ActionsCache:    string(obs.ActionsCache),
+			StickyCache:     string(obs.Sticky),
+			GitCache:        string(obs.Git),
+			BazelCache:      string(obs.Bazel),
+			GoCache:         string(obs.Go),
 			LeaseID:         lease.ID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the cache observation in the history of lease %s: %w",
@@ -179,6 +242,51 @@ func (a *Allocator) RecordCacheObservation(
 
 		return nil
 	})
+}
+
+// CacheOutcomes counts, per tier and per cache, what each cache did for the
+// jobs assigned since a moment: tier, then cache ("image", "actions",
+// "sticky", "git", "bazel", "go"), then outcome, with "" for a job whose
+// outcome was not observed. Jobs is how many rows were read, at most limit.
+//
+// ON THE READ-ONLY POOL, like every report.
+func (a *Allocator) CacheOutcomes(
+	ctx context.Context, since time.Time, limit int,
+) (counts map[string]map[string]map[string]int, jobs int, err error) {
+	if limit <= 0 {
+		return nil, 0, fmt.Errorf("alloc: a cache report needs a positive limit, got %d", limit)
+	}
+	err = a.db.View(ctx, func(tx querier) error {
+		counts, jobs = map[string]map[string]map[string]int{}, 0
+		rows, err := state.ReadQueries(tx).ListCacheOutcomes(ctx, ledgerdb.ListCacheOutcomesParams{
+			Since:   sql.NullString{String: ts(since.UTC()), Valid: true},
+			MaxRows: int64(limit),
+		})
+		if err != nil {
+			return fmt.Errorf("alloc: list what the caches did: %w", err)
+		}
+		for _, row := range rows {
+			tier := counts[row.Tier]
+			if tier == nil {
+				tier = map[string]map[string]int{}
+				counts[row.Tier] = tier
+			}
+			for cache, outcome := range map[string]string{
+				"image": row.ImageCache, "actions": row.ActionsCache, "sticky": row.StickyCache,
+				"git": row.GitCache, "bazel": row.BazelCache, "go": row.GoCache,
+			} {
+				if tier[cache] == nil {
+					tier[cache] = map[string]int{}
+				}
+				tier[cache][outcome]++
+			}
+		}
+		jobs = len(rows)
+
+		return nil
+	})
+
+	return counts, jobs, err
 }
 
 // JobPlacement is what one lease was charged for and what the cache did,
@@ -205,6 +313,7 @@ type JobPlacement struct {
 	ImageCache      ImageCache
 	CacheGeneration string
 	ActionsCache    ActionsCache
+	BuildCaches
 }
 
 // HistoryPlacement reads what a lease was charged for from its history row.
@@ -235,6 +344,8 @@ func (a *Allocator) HistoryPlacement(ctx context.Context, leaseID string) (JobPl
 			ImageCache:      ImageCache(row.ImageCache),
 			CacheGeneration: row.CacheGeneration,
 			ActionsCache:    ActionsCache(row.ActionsCache),
+			BuildCaches: BuildCaches{Sticky: BuildCache(row.StickyCache), Git: BuildCache(row.GitCache),
+				Bazel: BuildCache(row.BazelCache), Go: BuildCache(row.GoCache)},
 		}
 
 		return nil
