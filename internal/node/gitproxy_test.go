@@ -473,7 +473,10 @@ func TestATierWithoutTheGitCacheIsForwarded(t *testing.T) {
 		"https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
-	if entries, err := os.ReadDir(service.git.root); err != nil || len(entries) != 0 {
+	// NO DIRECTORY IS NO MIRROR, the answer this wants; any other read error is
+	// could not tell.
+	if entries, err := os.ReadDir(service.git.root); (err != nil && !errors.Is(err, os.ErrNotExist)) ||
+		len(entries) != 0 {
 		t.Fatalf("a tier without the git cache made a mirror: %v (%v)", entries, err)
 	}
 	if upstream.fetches.Load() != 1 {
