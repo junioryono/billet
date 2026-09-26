@@ -30,19 +30,22 @@ VALUES (@lease_id, @tier, @launch_request_id, @runner_id, @runner_name, @status,
 -- THE COMPUTE AUTHORITY WHEN NO MESSAGE CARRIES A RUNNER NAME. Read inside the
 -- write transaction by every mutation below, against the row that write acts on.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE lease_id = @lease_id;
 
 -- name: ReadPoolRunnerByName :one
 -- GitHub's runner identity resolved to billet's compute lease.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE runner_name = @runner_name;
 
 -- name: ListPoolRunnersInTier :many
 -- Every durable member of one tier's GitHub runner pool.
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE tier = @tier ORDER BY updated_at, lease_id;
 
 -- name: ReadPoolRunnerSettlementByRequest :one
@@ -66,6 +69,8 @@ SELECT lease_id, status, source_acknowledged FROM pool_runners
 -- `status = 'busy'` here changes no observable behaviour today.
 UPDATE pool_runners
    SET actual_request_id = @actual_request_id, run_id = @run_id, job_id = @job_id,
+       job_owner = @job_owner, job_repository = @job_repository,
+       job_workflow_ref = @job_workflow_ref, job_event = @job_event,
        updated_at = @updated_at
  WHERE lease_id = @lease_id;
 
@@ -73,7 +78,9 @@ UPDATE pool_runners
 -- Bind an idle member to the job GitHub gave it.
 UPDATE pool_runners
    SET runner_id = @runner_id, status = 'busy', actual_request_id = @actual_request_id,
-       run_id = @run_id, job_id = @job_id, updated_at = @updated_at
+       run_id = @run_id, job_id = @job_id, job_owner = @job_owner,
+       job_repository = @job_repository, job_workflow_ref = @job_workflow_ref,
+       job_event = @job_event, updated_at = @updated_at
  WHERE lease_id = @lease_id;
 
 -- name: MarkPoolRunnerBusy :exec

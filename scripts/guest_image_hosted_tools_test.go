@@ -351,3 +351,39 @@ func TestTheDefaultGoIsLinkedOntoPathInsideTheImage(t *testing.T) {
 		t.Errorf("link_go_default linked a line with no binaries and succeeded:\n%s", out)
 	}
 }
+
+// A SUMS FILE IN BINARY MODE IS STILL A SUMS FILE. git-lfs writes
+// `<sum> *<file>`, and a raw `$2 == f` lookup read that as "no published
+// checksum" and failed the whole image build (guest-image.yml, 2026-09-25). The
+// installer reads every sums file through billet_tc_sum, which takes both
+// spellings.
+func TestEveryHostedToolReadsItsSumsThroughTheOneReader(t *testing.T) {
+	t.Parallel()
+
+	sum := guestImageFunction(t, "billet_tc_sum")
+	digest := strings.Repeat("e", 64)
+
+	for name, sums := range map[string]string{
+		"text mode":   digest + "  git-lfs-linux-amd64-v3.8.0.tar.gz\n",
+		"binary mode": "-----BEGIN PGP SIGNED MESSAGE-----\n\n" + digest + " *git-lfs-linux-amd64-v3.8.0.tar.gz\n",
+	} {
+		script := "#!/usr/bin/env bash\nset -euo pipefail\n" + sum +
+			"\nbillet_tc_sum \"$1\" git-lfs-linux-amd64-v3.8.0.tar.gz\n"
+
+		path := filepath.Join(t.TempDir(), "sum.sh")
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		out, err := exec.CommandContext(t.Context(), "bash", path, sums).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != digest {
+			t.Errorf("%s: billet_tc_sum answered %q (%v), want the digest", name, out, err)
+		}
+	}
+
+	// billet_tc_sum's own comparison is the only one the installer may hold.
+	if n := strings.Count(readScriptFile(t, toolcacheAssetPath), "$2 == f"); n != 1 {
+		t.Errorf("install-toolcache.sh compares a sums file's second field %d times; "+
+			"read every sums file through billet_tc_sum, which accepts binary-mode lines", n)
+	}
+}

@@ -15,6 +15,20 @@ import (
 //
 // The happy path first, because a suite of refusals passes when the fixture is
 // broken for an unrelated reason and proves nothing about any of the rules.
+// GUEST BUILD CACHES ARE A FIRECRACKER GUEST'S; a build asked for them is
+// refused before anything starts.
+func TestALaunchAskingForGuestBuildCachesIsRefused(t *testing.T) {
+	f := newFakeAWS(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := launchSpec(provider.InstanceName("abc123"))
+	spec.GuestCaches = []provider.GuestCache{provider.GuestCacheBazel}
+	if _, err := p.Launch(t.Context(), spec); err == nil ||
+		!strings.Contains(err.Error(), "guest build caches") {
+		t.Fatalf("Launch = %v, want a refusal naming the guest build caches", err)
+	}
+}
+
 func TestALaunchStartsOneBuildCarryingItsOwnerAndLeaseMarkers(t *testing.T) {
 	f := newFakeAWS(t)
 	p := newTestProvider(t, f, nil)

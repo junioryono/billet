@@ -24,6 +24,17 @@ type PoolRunner struct {
 	RunID              int64
 	JobID              string
 	SourceAcknowledged bool
+	// Identity is what JobStarted said about the job, the evidence a cache
+	// authority is decided from. Zero means not recorded, never a match.
+	Identity JobIdentity
+}
+
+// JobIdentity is what one of GitHub's own scale-set messages said about a job.
+type JobIdentity struct {
+	Owner       string
+	Repository  string
+	WorkflowRef string
+	Event       string
 }
 
 const (
@@ -67,8 +78,13 @@ func (a *Allocator) RegisterPoolRunner(ctx context.Context, runner PoolRunner) e
 }
 
 // StartPoolRunner durably binds a pool member to the job GitHub actually gave it.
+//
+// The identity is written with the binding it belongs to. A member bound
+// before identities were recorded, or recovered without one, has it filled by
+// the first JobStarted for the same job; an identity already recorded is never
+// replaced, because the first report is the one the ledger has vouched for.
 func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, runnerID int64,
-	runnerName string, requestID, runID int64, jobID string,
+	runnerName string, requestID, runID int64, jobID string, identity JobIdentity,
 ) (PoolRunner, error) {
 	if strings.TrimSpace(leaseID) == "" || strings.TrimSpace(tier) == "" || runnerID <= 0 ||
 		strings.TrimSpace(runnerName) == "" || requestID == 0 || runID < 0 || strings.TrimSpace(jobID) == "" {
@@ -102,13 +118,8 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			// delayed JobStarted arrives. That empty job identity is a reservation
 			// for this exact physical runner, not a competing job binding.
 			if prior.ActualRequestID == 0 && prior.RunID == 0 && prior.JobID == "" {
-				if err := q.BindPoolRunnerJob(ctx, ledgerdb.BindPoolRunnerJobParams{
-					ActualRequestID: requestID,
-					RunID:           runID,
-					JobID:           jobID,
-					UpdatedAt:       nowStamp(),
-					LeaseID:         leaseID,
-				}); err != nil {
+				if err := bindPoolRunnerJob(ctx, q, leaseID, requestID, runID, jobID,
+					identity); err != nil {
 					return fmt.Errorf("alloc: bind recovered pool runner %q to job %q: %w",
 						runnerName, jobID, err)
 				}
@@ -116,11 +127,20 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 					return err
 				}
 				prior.ActualRequestID, prior.RunID, prior.JobID = requestID, runID, jobID
+				prior.Identity = identity
 				out = prior
 				return nil
 			}
 			if prior.ActualRequestID != requestID || prior.RunID != runID || prior.JobID != jobID {
 				return fmt.Errorf("alloc: %w: runner %q is already busy with another job", ErrConflict, runnerName)
+			}
+			if prior.Identity == (JobIdentity{}) && identity != (JobIdentity{}) {
+				if err := bindPoolRunnerJob(ctx, q, leaseID, requestID, runID, jobID,
+					identity); err != nil {
+					return fmt.Errorf("alloc: record the identity of pool runner %q's job %q: %w",
+						runnerName, jobID, err)
+				}
+				prior.Identity = identity
 			}
 			// The same job reported started again: the start is already recorded,
 			// and a reason that landed in between is repaired now.
@@ -136,6 +156,10 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			ActualRequestID: requestID,
 			RunID:           runID,
 			JobID:           jobID,
+			JobOwner:        identity.Owner,
+			JobRepository:   identity.Repository,
+			JobWorkflowRef:  identity.WorkflowRef,
+			JobEvent:        identity.Event,
 			UpdatedAt:       nowStamp(),
 			LeaseID:         leaseID,
 		}); err != nil {
@@ -150,11 +174,29 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		}
 		prior.RunnerID, prior.Status = runnerID, PoolRunnerBusy
 		prior.ActualRequestID, prior.RunID, prior.JobID = requestID, runID, jobID
+		prior.Identity = identity
 		out = prior
 		return nil
 	})
 
 	return out, err
+}
+
+// bindPoolRunnerJob fills in a busy member's job and that job's identity.
+func bindPoolRunnerJob(ctx context.Context, q state.WriteOps, leaseID string,
+	requestID, runID int64, jobID string, identity JobIdentity,
+) error {
+	return q.BindPoolRunnerJob(ctx, ledgerdb.BindPoolRunnerJobParams{
+		ActualRequestID: requestID,
+		RunID:           runID,
+		JobID:           jobID,
+		JobOwner:        identity.Owner,
+		JobRepository:   identity.Repository,
+		JobWorkflowRef:  identity.WorkflowRef,
+		JobEvent:        identity.Event,
+		UpdatedAt:       nowStamp(),
+		LeaseID:         leaseID,
+	})
 }
 
 // PreserveRecoveredBusyPoolRunner journals the exact identity of a legacy
@@ -457,6 +499,10 @@ func poolRunnerFrom(row *ledgerdb.PoolRunner) PoolRunner {
 		RunID:              row.RunID,
 		JobID:              row.JobID,
 		SourceAcknowledged: row.SourceAcknowledged == 1,
+		Identity: JobIdentity{
+			Owner: row.JobOwner, Repository: row.JobRepository,
+			WorkflowRef: row.JobWorkflowRef, Event: row.JobEvent,
+		},
 	}
 }
 

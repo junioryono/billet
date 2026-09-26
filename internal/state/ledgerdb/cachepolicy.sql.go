@@ -10,61 +10,108 @@ import (
 )
 
 const countCacheBlocks = `-- name: CountCacheBlocks :one
-SELECT COUNT(*) FROM cache_interception_blocks
- WHERE owner = $1 AND ((scope_type = 'org' AND repository = '') OR
-                           (scope_type = 'repository' AND repository = $2))
+SELECT COUNT(*) FROM cache_blocks
+ WHERE (kind = $1 OR kind = '*') AND owner = $2 AND
+       ((scope_type = 'org' AND repository = '') OR
+        (scope_type = 'repository' AND repository = $3))
 `
 
 type CountCacheBlocksParams struct {
+	Kind       string
 	Owner      string
 	Repository string
 }
 
-// Blocks covering one repository: its organisation's, or its own.
+// Blocks covering one cache of one repository: its organisation's or its own,
+// for that cache or for every cache.
 //
-// ONE QUERY FOR BOTH SCOPES, because the answer is "is either blocked" and two
-// reads could straddle a write that added the org block after the repository
-// read said no.
+// ONE QUERY FOR BOTH SCOPES AND BOTH KINDS, because the answer is "is any of
+// them blocked" and separate reads could straddle a write that added one after
+// another read said no.
 func (q *Queries) CountCacheBlocks(ctx context.Context, arg CountCacheBlocksParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countCacheBlocks, arg.Owner, arg.Repository)
+	row := q.db.QueryRowContext(ctx, countCacheBlocks, arg.Kind, arg.Owner, arg.Repository)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
 }
 
 const deleteCacheBlock = `-- name: DeleteCacheBlock :exec
-DELETE FROM cache_interception_blocks
- WHERE scope_type = $1 AND owner = $2 AND repository = $3
+DELETE FROM cache_blocks
+ WHERE kind = $1 AND scope_type = $2 AND owner = $3
+   AND repository = $4
 `
 
 type DeleteCacheBlockParams struct {
+	Kind       string
 	ScopeType  string
 	Owner      string
 	Repository string
 }
 
-// Re-enable interception for one explicit scope by removing its block.
+// Re-enable one cache kind for one explicit scope by removing its block.
 func (q *Queries) DeleteCacheBlock(ctx context.Context, arg DeleteCacheBlockParams) error {
-	_, err := q.db.ExecContext(ctx, deleteCacheBlock, arg.ScopeType, arg.Owner, arg.Repository)
+	_, err := q.db.ExecContext(ctx, deleteCacheBlock,
+		arg.Kind,
+		arg.ScopeType,
+		arg.Owner,
+		arg.Repository,
+	)
 	return err
 }
 
+const listCacheBlocks = `-- name: ListCacheBlocks :many
+SELECT kind, scope_type, owner, repository, disabled_at FROM cache_blocks
+ ORDER BY owner, repository, kind
+`
+
+// Every block, for `billet cache status`.
+func (q *Queries) ListCacheBlocks(ctx context.Context) ([]CacheBlock, error) {
+	rows, err := q.db.QueryContext(ctx, listCacheBlocks)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CacheBlock
+	for rows.Next() {
+		var i CacheBlock
+		if err := rows.Scan(
+			&i.Kind,
+			&i.ScopeType,
+			&i.Owner,
+			&i.Repository,
+			&i.DisabledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertCacheBlock = `-- name: UpsertCacheBlock :exec
-INSERT INTO cache_interception_blocks (scope_type, owner, repository, disabled_at)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT(scope_type, owner, repository) DO UPDATE SET disabled_at = excluded.disabled_at
+INSERT INTO cache_blocks (kind, scope_type, owner, repository, disabled_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT(kind, scope_type, owner, repository) DO UPDATE SET disabled_at = excluded.disabled_at
 `
 
 type UpsertCacheBlockParams struct {
+	Kind       string
 	ScopeType  string
 	Owner      string
 	Repository string
 	DisabledAt string
 }
 
-// Disable interception for one explicit scope, refreshing when it was decided.
+// Disable one cache kind for one explicit scope, refreshing when it was decided.
 func (q *Queries) UpsertCacheBlock(ctx context.Context, arg UpsertCacheBlockParams) error {
 	_, err := q.db.ExecContext(ctx, upsertCacheBlock,
+		arg.Kind,
 		arg.ScopeType,
 		arg.Owner,
 		arg.Repository,

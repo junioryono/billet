@@ -553,7 +553,29 @@ func (c *Client) ActionsCacheAllowed(
 	ctx context.Context,
 	owner, repository string,
 ) (bool, error) {
+	return c.CacheAllowed(ctx, config.CacheActions, owner, repository)
+}
+
+// CacheAllowed reads the control plane's kill switch for one cache.
+//
+// Below the version that knows kinds, only the Actions cache has a switch to
+// ask about, and every other cache is answered allowed without asking: that is
+// exactly what the older control plane would enforce.
+func (c *Client) CacheAllowed(
+	ctx context.Context,
+	kind config.CacheKind,
+	owner, repository string,
+) (bool, error) {
 	query := url.Values{"owner": {owner}, "repository": {repository}}
+	if kind != config.CacheActions {
+		if c.WireVersion() == 0 {
+			return false, errUnregistered
+		}
+		if c.WireVersion() < nodeapi.VersionCacheAuthority {
+			return true, nil
+		}
+		query.Set("kind", string(kind))
+	}
 	var response nodeapi.CachePolicyResponse
 	if err := c.do(ctx, http.MethodGet, c.nodePath("/cache-policy")+"?"+query.Encode(),
 		nil, &response); err != nil {
@@ -618,14 +640,48 @@ func (c *Client) RecordCacheObservation(
 	if c.WireVersion() < nodeapi.VersionCacheObservation {
 		return nil
 	}
+	request := nodeapi.CacheObservationRequest{
+		Epoch:           epoch,
+		ImageCache:      string(obs.ImageCache),
+		CacheGeneration: obs.CacheGeneration,
+		ActionsCache:    string(obs.ActionsCache),
+	}
+	// THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM, whose decoder would
+	// otherwise refuse the image and Actions halves along with them.
+	if c.WireVersion() >= nodeapi.VersionCacheAuthority {
+		request.StickyCache, request.GitCache = string(obs.Sticky), string(obs.Git)
+		request.BazelCache, request.GoCache = string(obs.Bazel), string(obs.Go)
+	}
+	if request == (nodeapi.CacheObservationRequest{Epoch: epoch}) {
+		return nil
+	}
 
-	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"),
-		nodeapi.CacheObservationRequest{
-			Epoch:           epoch,
-			ImageCache:      string(obs.ImageCache),
-			CacheGeneration: obs.CacheGeneration,
-			ActionsCache:    string(obs.ActionsCache),
-		}, nil)
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/cache"), request, nil)
+}
+
+// errUnregistered says the client has not negotiated a wire with the control
+// plane yet, so a version-dependent question cannot be answered, only retried.
+var errUnregistered = errors.New("nodeclient: not registered with the control plane yet")
+
+// CacheAuthority asks what a lease's running job may do with a cache.
+//
+// Below the version that serves it, the answer is the zero authority, which
+// writes nothing, without asking: an older control plane cannot decide one.
+func (c *Client) CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error) {
+	if c.WireVersion() == 0 {
+		return server.CacheAuthority{}, errUnregistered
+	}
+	if c.WireVersion() < nodeapi.VersionCacheAuthority {
+		return server.CacheAuthority{}, nil
+	}
+
+	var response nodeapi.CacheAuthorityResponse
+	if err := c.do(ctx, http.MethodGet, c.leasePath(leaseID, "/cache-authority"), nil,
+		&response); err != nil {
+		return server.CacheAuthority{}, err
+	}
+
+	return ServerCacheAuthority(&response.Authority), nil
 }
 
 // Resize changes an EC2 lease's charged shape before the provider attempts it.

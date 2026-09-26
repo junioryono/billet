@@ -4,17 +4,23 @@ go 1.26.6
 
 require (
 	github.com/actions/scaleset v0.4.0
+	github.com/bazelbuild/remote-apis v0.0.0-20260922155111-adbf4a27c86f
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/sigstore/sigstore-go v1.3.0
 	golang.org/x/mod v0.40.0
 	golang.org/x/sys v0.47.0
+	google.golang.org/genproto/googleapis/bytestream v0.0.0-20260921155816-b14227669459
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa
+	google.golang.org/grpc v1.83.1
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.56.0
 )
 
 require (
+	cloud.google.com/go/longrunning v1.0.0 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -87,9 +93,6 @@ require (
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.1 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

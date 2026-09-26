@@ -1,10 +1,10 @@
 # Transparent Actions cache
 
-Billet can serve `actions/cache` from the same site's block store as a Firecracker runner without requiring workflow changes. The feature is deliberately opt-in per tier because GitHub carries cache and artifact metadata on the same results origin.
+Billet can serve `actions/cache` from the same site's block store as a Firecracker runner without requiring workflow changes. It is one of the [build caches](build-caches.md), on by default where its scope rules already hold: an untrusted tier with a repository scope, which publishes from its default branch, or a trusted tier whose `cache_scope.workflow_ref` is one of its `workflows`. Anywhere else it is off until a tier turns it on, because GitHub carries cache and artifact metadata on the same results origin and the scope is what keeps one repository's archives from another's.
 
 ## Enable it
 
-Interception currently requires one Linux Firecracker provider, a configured `node.cache` listener, and the site's Ceph store. Validation refuses Docker, EC2, macOS, mixed-provider fallback tiers, and a Firecracker node without its cache endpoint rather than accepting a tier that can route work somewhere the local archive does not exist.
+The Actions cache requires one Linux Firecracker provider, a configured `node.cache` listener, and the site's Ceph store. A tier that turns it on explicitly anywhere else (Docker, EC2, macOS, a mixed-provider fallback tier, a Firecracker node without its cache endpoint) is refused rather than accepted with work that can land where the local archive does not exist.
 
 ```yaml
 tiers:
@@ -19,14 +19,15 @@ tiers:
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@verified
-    intercept: true
+    cache:
+      actions: {enabled: true}
     cache_scope:
       owner: acme
       repository: api
       workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
 ```
 
-`intercept` defaults to `false`. A trusted pool must use a non-default GitHub runner group restricted to exactly the listed `workflows`; Billet validates that policy at server startup and again before every registration is minted. `cache_scope` is static because GitHub chooses a job only after the JIT runner has joined the pool, so launch-time cache authority cannot safely come from the assignment that happened to cause scale-up. Keep interception absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed the consumer-owned workflow installed by `billet cache conformance install` in the deployment that will use them.
+`intercept: true` is the deprecated spelling of `cache.actions.enabled` and still works; the two together are refused. A trusted pool must use a non-default GitHub runner group restricted to exactly the listed `workflows`; Billet validates that policy at server startup and again before every registration is minted. `cache_scope` is static because GitHub chooses a job only after the JIT runner has joined the pool, so launch-time cache authority cannot safely come from the assignment that happened to cause scale-up. Keep interception absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed the consumer-owned workflow installed by `billet cache conformance install` in the deployment that will use them.
 
 The guest image must speak the contract required by the running Billet binary. `billet images compatible` and the host-upgrade transaction enforce that before a tier can launch. The interception contract includes the guest-side DNS-remap passthrough, runner hook, CA propagation, container resolver, and the loopback cache adapter; an older image is refused rather than launched without one of those pieces.
 
@@ -36,7 +37,16 @@ The node proxy accepts CONNECT only for `results-receiver.actions.githubusercont
 
 The guest authenticates its CONNECT request with the unguessable cache-session capability Billet created for that VM. The node does not decode `ACTIONS_RUNTIME_TOKEN`. The tier's `cache_scope` supplies the owner, repository, and workflow ref before a pooled runner launches; a durable cache key is scoped by deployment and site, a digest of that identity, a digest of the cache version, and the workflow's cache key. Validation requires the scope's workflow ref to be one of the trusted runner group's declared workflows. Restore-prefix matching never crosses any of those boundaries.
 
-Untrusted jobs receive no interception and no CA and stay entirely on GitHub's cache service. Billet does not reproduce GitHub's fork and default-branch cache policy from incomplete local evidence, and an untrusted job never publishes a local generation that trusted work could restore.
+## Untrusted pools
+
+An untrusted pool is served under `cache.publish: default-branch`, which it gets by default with a repository scope, and never otherwise. Billet does not reproduce GitHub's fork and default-branch policy from incomplete evidence. On a job's first cache call the node asks the control plane for that job's authority, which the plane decides from the JobStarted binding and GitHub's record of the run. An unproven answer sends the call to GitHub and is asked again next time. A job whose repository is not the pool's scope is sent to GitHub too.
+
+A proven job's archives are keyed under a namespace of their own (`<namespace>.scoped/untrusted/<owner>/<repo>/<arch>/actions/<ref digest>/<version digest>/<key>`), which no trusted pool reads:
+
+- **Restore.** From the job's own ref, then its pull request's base branch, then the default branch, which is GitHub's order.
+- **Save.** Only under its own ref, and only where GitHub would let it: a pull request under its merge ref, and `pull_request_target`, `issue_comment` and `workflow_run` nowhere, whose saves go to GitHub, which applies the same rule.
+
+Proving the branch needs the App's `actions: read`, and without it every call goes to GitHub.
 
 Archives are limited to 10 GiB. A thin-provisioned upload volume reserves 22 GiB so a boundary staged-block upload can hold the 10 GiB block set and its 10 GiB assembled archive simultaneously with ext4 metadata and journal headroom. Billet deletes the staged files and trims their freed extents before snapshotting, so the published generation retains only the assembled archive rather than both copies. One job may hold at most 32 pending uploads and active downloads before additional requests fall back to GitHub. Uploads accept the Azure Block Blob single-request and staged-block shapes used by the official toolkit, assemble declared block order on a fresh host-mounted ext4 volume, unmount and verify that filesystem, snapshot it, and publish through the site's fenced generation CAS. Downloads clone the exact immutable generation, mount it read-only with journal replay disabled, and support the byte ranges used by the official client. Active clones remain under the existing cache lease and eviction rules.
 
@@ -83,12 +93,12 @@ One limit is worth knowing. BuildKit writes one cache entry per layer blob while
 
 ## Kill switch
 
-The control plane owns a deny list in its state database, and the node asks it before every locally handled cache operation. Before any local reservation exists, policy lookup failure or denial is passthrough, never local permission. A blob upload or finalization already bound to a Billet reservation fails locally instead of being misrouted to GitHub, which never received that reservation. Organisation and repository names are case-insensitive.
+The control plane owns a deny list in its state database, one entry per cache or for every cache (`--kind`, default `all`), and the node asks it before every locally handled cache operation. Before any local reservation exists, policy lookup failure or denial is passthrough, never local permission. A blob upload or finalization already bound to a Billet reservation fails locally instead of being misrouted to GitHub, which never received that reservation. Organisation and repository names are case-insensitive.
 
 ```bash
-billet cache disable --org acme
-billet cache disable --repository acme/payments
-billet cache enable --repository acme/payments
+billet cache disable --org acme                           # every cache
+billet cache disable --repository acme/payments --kind actions
+billet cache enable --repository acme/payments --kind actions
 billet cache enable --org acme
 ```
 

@@ -74,6 +74,12 @@ type CacheObservationRequest struct {
 	ImageCache      string `json:"image_cache,omitempty"`
 	CacheGeneration string `json:"cache_generation,omitempty"`
 	ActionsCache    string `json:"actions_cache,omitempty"`
+	// The build caches' outcomes, sent from VersionCacheAuthority: a plane
+	// below it decodes strictly and would refuse the whole observation.
+	StickyCache string `json:"sticky_cache,omitempty"`
+	GitCache    string `json:"git_cache,omitempty"`
+	BazelCache  string `json:"bazel_cache,omitempty"`
+	GoCache     string `json:"go_cache,omitempty"`
 }
 
 // ReleaseRequest ends a lease with a terminal outcome.
