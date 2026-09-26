@@ -639,6 +639,14 @@ install_go_toolcache() {
 	local globs
 	read_toolset_versions globs go
 
+	# GITHUB'S IMAGE PUTS ITS DEFAULT go ON PATH (Configure-Toolset.ps1 links the
+	# default line's bin/* into /usr/bin) and exports GOROOT_<major>_<minor>_<ARCH>
+	# for every line, so a workflow that runs `go` with no setup-go step works
+	# there. Without both, the same job exits 127 here (measured 2026-09-25).
+	local default default_bare="" suffix=X64
+	default=$(jq -r '.toolcache[] | select(.name == "go") | .default // empty' "$BILLET_TC_TOOLSET")
+	[ "$BILLET_TC_ARCH" = arm64 ] && suffix=AARCH64
+
 	local glob
 	for glob in "${globs[@]}"; do
 		# THE NEWEST PATCH ON THAT LINE. go.dev lists newest first, but sorting
@@ -694,8 +702,49 @@ install_go_toolcache() {
 		rm -f "$BILLET_TC_WORK/go.tgz"
 		touch "$tc/go/$bare/$BILLET_TC_ARCH.complete"
 
+		local major="${bare%%.*}" minor="${bare#*.}"
+		minor="${minor%%.*}"
+		printf 'GOROOT_%s_%s_%s=%s\n' "$major" "$minor" "$suffix" \
+			"$BILLET_TC_IN_TARGET/go/$bare/$BILLET_TC_ARCH" >>"$BILLET_TC_ENV_FILE"
+		[ "$glob" = "$default" ] && default_bare="$bare"
+
 		echo "toolcache: go $bare"
 	done
+
+	# A DECLARED DEFAULT THAT NAMES NO INSTALLED LINE IS REFUSED, because the image
+	# would otherwise ship with no `go` on PATH and nothing would say why.
+	if [ -n "$default" ]; then
+		if [ -z "$default_bare" ]; then
+			echo "github's image declares go default $default, which names none of the lines installed" >&2
+			exit 1
+		fi
+
+		link_go_default "$tc" "$default_bare" || exit 1
+	fi
+}
+
+# link_go_default links one installed go line's binaries into /usr/bin.
+#
+# TO THE TARGET'S PATH, not the build host's, so the links resolve inside the
+# image and dangle nowhere else. A line with no binaries is refused rather than
+# linking nothing.
+link_go_default() {
+	local tc="$1" bare="$2" bin name linked=0
+
+	for bin in "$tc/go/$bare/$BILLET_TC_ARCH/bin/"*; do
+		[ -e "$bin" ] || continue
+		name="${bin##*/}"
+		ln -sfn "$BILLET_TC_IN_TARGET/go/$bare/$BILLET_TC_ARCH/bin/$name" \
+			"${BILLET_TC_ROOT:-}/usr/bin/$name"
+		linked=1
+	done
+
+	if [ "$linked" -eq 0 ]; then
+		echo "go $bare has no binaries under $tc/go/$bare/$BILLET_TC_ARCH/bin to put on PATH" >&2
+		return 1
+	fi
+
+	echo "toolcache: go $bare is the default on PATH"
 }
 
 # install_python_toolcache bakes in every minor github's image declares.
@@ -2636,6 +2685,14 @@ install_hosted_packages() {
 		done
 	done
 
+	# UBUNTU'S CLOUD IMAGE IS WHAT GITHUB'S IMAGE STARTS FROM, and the guest starts
+	# from debootstrap's minbase, so the utilities a CI job reaches for without a
+	# thought (envsubst, add-apt-repository, lsb_release, uuidgen, gawk, column)
+	# are in GitHub's image and in nobody's declaration. The second group in the
+	# install below is the noble cloud image manifest (2026-09-25) minus the
+	# guest's installed set, cut to what a job would call: no kernel, boot,
+	# firmware or hardware packages.
+	#
 	# NOTHING STARTS IN A CHROOT. A package script that starts its daemon there
 	# leaves a process holding the filesystem the build must unmount, so service
 	# starts are refused for the transaction and anything left running inside the
@@ -2661,7 +2718,11 @@ apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends \
 	git git-ftp podman buildah skopeo \
 	mysql-client mysql-server libmysqlclient-dev \
 	apache2 nginx "postgresql-$pg" libpq-dev \
-	"$@" php-pear snmp
+	"$@" php-pear snmp \
+	bc gettext-base software-properties-common lsb-release uuid-runtime gawk \
+	bsdextrautils less lsof strace fdisk gdisk parted fuse3 cpio ed htop tcpdump \
+	apt-utils bash-completion vim nano mtr-tiny iputils-tracepath numactl kmod \
+	nftables distro-info eatmydata
 
 # PCOV IS INSTALLED AND OFF, XDEBUG ON, as GitHub documents.
 for v in /etc/php/*/; do
@@ -2855,13 +2916,23 @@ install_aws_tools() {
 	rm -f "$zip"
 	billet_tc_run "$stage/aws/install" -i /usr/local/aws-cli -b /usr/local/bin --update
 
-	# SAM, whose digest GitHub reads out of the release notes.
+	# SAM, whose digest GitHub reads out of the release notes. The notes are a
+	# Markdown table (**file** | `sum`), so the emphasis, pipes and backticks are
+	# blanked before a field is judged; a bare-hex test on the raw fields found
+	# nothing and failed the image build (2026-09-26). The row must name the zip
+	# itself, not its .sig, which shares the prefix.
 	local rel tag want body
 	rel=$(billet_tc_release aws/aws-sam-cli)
 	tag=$(jq -r .tag_name <<<"$rel")
 	body=$(jq -r .body <<<"$rel")
-	want=$(awk -v f="aws-sam-cli-linux-$sam.zip" 'index($0, f) {
-			for (i = 1; i <= NF; i++) if ($i ~ /^[0-9a-f]+$/ && length($i) == 64) { print $i; exit }
+	want=$(awk -v f="aws-sam-cli-linux-$sam.zip" '{
+			line = $0
+			gsub(/[`*|]/, " ", line)
+			n = split(line, field, /[ \t\r]+/)
+			named = 0
+			for (i = 1; i <= n; i++) if (field[i] == f) named = 1
+			if (!named) next
+			for (i = 1; i <= n; i++) if (field[i] ~ /^[0-9a-f]+$/ && length(field[i]) == 64) { print field[i]; exit }
 		}' <<<"$body")
 	fetch_verified "https://github.com/aws/aws-sam-cli/releases/download/$tag/aws-sam-cli-linux-$sam.zip" \
 		"$BILLET_TC_WORK/sam.zip" "$(billet_tc_hex "$want" 64 "aws-sam-cli $tag")"
@@ -2887,6 +2958,41 @@ install_aws_tools() {
 	done
 
 	echo "hosted: aws cli, sam, session-manager-plugin"
+}
+
+# install_cloud_clis installs the Azure CLI, its azure-devops extension and the
+# Google Cloud CLI, which GitHub's image carries outside its declaration, from
+# each vendor's signed apt repository, the way GitHub's own scripts do.
+#
+# THE KEYS ARE PINNED BY FINGERPRINT and both repositories' InRelease files were
+# checked to be signed by them (2026-09-25). The sources are removed after the
+# install, as GitHub's are, so a job's apt update does not depend on either host.
+# AZURE_EXTENSION_DIR is exported because `az extension add` otherwise writes to
+# the building user's home, where the runner account never looks.
+install_cloud_clis() {
+	billet_tc_apt_source azure-cli https://packages.microsoft.com/keys/microsoft.asc \
+		BC528686B50D79E339D3721CEB3E94ADBE1229CF \
+		"deb [arch=$BILLET_TC_DPKG signed-by=@KEYRING@] https://packages.microsoft.com/repos/azure-cli/ noble main"
+	billet_tc_apt_source google-cloud-cli https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+		35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3 \
+		'deb [signed-by=@KEYRING@] https://packages.cloud.google.com/apt cloud-sdk main'
+
+	billet_tc_run /bin/bash -euxo pipefail -s <<'CLIS'
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o DPkg::Lock::Timeout=600 update -qq
+apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends azure-cli google-cloud-cli
+AZURE_EXTENSION_DIR=/opt/az/azcliextensions az extension add --name azure-devops --yes
+chmod -R a+rX /opt/az/azcliextensions
+rm -f /etc/apt/sources.list.d/billet-azure-cli.list /etc/apt/sources.list.d/billet-google-cloud-cli.list \
+	/usr/share/keyrings/billet-azure-cli.gpg /usr/share/keyrings/billet-google-cloud-cli.gpg
+apt-get -o DPkg::Lock::Timeout=600 update -qq
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+CLIS
+
+	printf 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions\n' >>"$BILLET_TC_ENV_FILE"
+	billet_tc_reap_target
+	echo "hosted: azure-cli with azure-devops, google-cloud-cli"
 }
 
 # install_hosted_php_tools installs Composer and PHPUnit on the PHP above.
@@ -3043,11 +3149,36 @@ install_hosted_tools() {
 	install_github_cli
 	install_hosted_binaries
 	install_aws_tools
+	install_cloud_clis
 	install_hosted_php_tools
 	install_bazelisk
 	install_action_cache
 	install_agentic_tools
 	install_hosted_environment
+	open_hosted_permissions
+}
+
+# open_hosted_permissions opens the directories GitHub's image leaves writable
+# to every account, as its configure-system.sh and install-android-sdk.sh do.
+#
+# A JOB ADDS TO THEM. Gradle installs the NDK a React Native project asks for
+# into the Android SDK, and setup-* actions add toolcache versions under /opt;
+# read-only here, the first failed with "The SDK directory is not writable"
+# (2026-09-25). The Ruby toolcache keeps the sticky bit GitHub sets for Ruby 4.
+# The guest is one job's VM and is discarded afterwards, so opening its tree
+# costs what it costs on GitHub's image and nothing more.
+open_hosted_permissions() {
+	local root="${BILLET_TC_ROOT:-}"
+
+	chmod -R 777 "$root/usr/share" "$root/opt"
+	if [ -d "$root/opt/hostedtoolcache/Ruby" ]; then
+		find "$root/opt/hostedtoolcache/Ruby" -type d -exec chmod +t {} +
+	fi
+	if [ -d "$root/usr/local/lib/android/sdk" ]; then
+		chmod -R a+rwx "$root/usr/local/lib/android/sdk"
+	fi
+
+	echo "hosted: /opt, /usr/share and the Android SDK are writable to every account"
 }
 
 # billet_install_toolcache is the one entry point a caller invokes.
