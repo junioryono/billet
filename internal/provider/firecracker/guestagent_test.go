@@ -802,8 +802,7 @@ func TestGuestCachesTravelBesideACacheSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metadata: %v", err)
 	}
-	billet := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)
-	if got := billet["guest-caches"]; got != "go,bazel" {
+	if got := billetMetadata(t, md)["guest-caches"]; got != "go,bazel" {
 		t.Errorf("guest-caches = %v, want \"go,bazel\"", got)
 	}
 
@@ -829,7 +828,27 @@ func TestGuestCachesTravelBesideACacheSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("metadata: %v", err)
 	}
-	if _, ok := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)["guest-caches"]; ok {
+	if _, ok := billetMetadata(t, md)["guest-caches"]; ok {
 		t.Error("a guest with no build caches was told about some")
 	}
+}
+
+// billetMetadata is the billet block of a guest's metadata document.
+func billetMetadata(t *testing.T, md map[string]any) map[string]any {
+	t.Helper()
+
+	node := any(md)
+	for _, key := range []string{"latest", "meta-data", "billet"} {
+		object, ok := node.(map[string]any)
+		if !ok {
+			t.Fatalf("the metadata has no %s object: %v", key, md)
+		}
+		node = object[key]
+	}
+	block, ok := node.(map[string]any)
+	if !ok {
+		t.Fatalf("the metadata's billet block is %T: %v", node, md)
+	}
+
+	return block
 }

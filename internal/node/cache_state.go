@@ -217,6 +217,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 	}
 
 	target := filepath.Join(s.stateDir, session.token+".json")
+	//nolint:gosec // G703: the name is the session's bearer, which billet generated as hex
 	if err := os.Rename(temporaryPath, target); err != nil {
 		return fmt.Errorf("node: install cache custody for %s: %w", session.instance, err)
 	}

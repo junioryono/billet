@@ -2021,8 +2021,10 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 		answer(unproven)
 		return
 	}
-	authority := h.authorities.resolve(leaseID, binding, time.Now(), func() (server.CacheAuthority, bool) {
-		authority, err := server.ResolveCacheAuthority(r.Context(), evidence, leaseID, binding, nil)
+	authority := h.authorities.resolve(r.Context(), leaseID, binding, time.Now(), func(
+		ctx context.Context,
+	) (server.CacheAuthority, bool) {
+		authority, err := server.ResolveCacheAuthority(ctx, evidence, leaseID, binding, nil)
 		if err != nil {
 			h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
 				"lease", leaseID, "error", err)
@@ -2058,7 +2060,8 @@ type rememberedAuthority struct {
 }
 
 func (m *authorityMemory) resolve(
-	leaseID string, binding alloc.PoolRunner, now time.Time, ask func() (server.CacheAuthority, bool),
+	ctx context.Context, leaseID string, binding alloc.PoolRunner, now time.Time,
+	ask func(context.Context) (server.CacheAuthority, bool),
 ) server.CacheAuthority {
 	key := leaseID + "\x00" + binding.JobID + "\x00" + strconv.FormatInt(binding.RunID, 10)
 	m.mu.Lock()
@@ -2103,7 +2106,7 @@ func (m *authorityMemory) resolve(
 		close(answered)
 		m.mu.Unlock()
 	}()
-	authority, decided = ask()
+	authority, decided = ask(ctx)
 
 	return authority
 }
