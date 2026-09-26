@@ -460,7 +460,6 @@ func (s *CacheService) storeCASObject(
 	if full, err := s.casFull(root); err != nil || full {
 		return reapi.ErrFull
 	}
-	//nolint:gosec // G703: path is root joined with a table and a digest parseCASPath or checkDigest admitted as hex
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("prepare the cache directory: %w", err)
 	}
@@ -485,7 +484,6 @@ func (s *CacheService) storeCASObject(
 		return reapi.ErrMismatch
 	}
 
-	//nolint:gosec // G703: the same admitted path the object was staged beside
 	return os.Rename(temporary.Name(), path)
 }
 
