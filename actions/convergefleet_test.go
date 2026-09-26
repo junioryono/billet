@@ -655,14 +655,14 @@ func TestATemplatedAnsibleHostIsRenderedAndProbed(t *testing.T) {
 	t.Parallel()
 	f := newConvergeFixture(t)
 
-	debug := debugLine("cp-1", "10.3.1.117", 2222, "") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
+	debug := debugLine("cp-1", "10.0.0.1", 2222, "") + "\n" + debugLine("node-a", "10.0.0.2", 22, "") + "\n"
 	out, err := f.run(t, convergeRun{debug: debug})
 	if err != nil {
 		t.Fatalf("converge failed: %v\n%s", err, out)
 	}
 	found := false
 	for _, c := range f.callsOf(t, "nc") {
-		if strings.Contains(c, "10.3.1.117 2222") {
+		if strings.Contains(c, "10.0.0.1 2222") {
 			found = true
 		}
 	}

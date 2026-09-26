@@ -18,7 +18,7 @@ func TestJoinMovesTheMeasuredCeilingOntoTheNode(t *testing.T) {
 		t.Fatalf("Generate: %v", err)
 	}
 
-	got, err := Join(body, "10.3.1.117:7717", "/etc/billet/tls")
+	got, err := Join(body, "10.0.0.1:7717", "/etc/billet/tls")
 	if err != nil {
 		t.Fatalf("Join: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestJoinMovesTheMeasuredCeilingOntoTheNode(t *testing.T) {
 	if cfg.Node == nil {
 		t.Fatalf("a joined config has no node block:\n%s", got.Node)
 	}
-	if cfg.Node.ServerAddr != "10.3.1.117:7717" {
+	if cfg.Node.ServerAddr != "10.0.0.1:7717" {
 		t.Errorf("node.server_addr = %q, want the control plane's address", cfg.Node.ServerAddr)
 	}
 

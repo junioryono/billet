@@ -88,7 +88,7 @@ class Tree:
         return {
             "holder": "ci-1",
             "claimed_at": "2026-09-09T12:00:00Z",
-            "hostname": "billet-control-01",
+            "hostname": "control-01",
             "release_executable": str(self.candidate),
             "release_executable_sha256": hashlib.sha256(CANDIDATE_BODY).hexdigest(),
         }
