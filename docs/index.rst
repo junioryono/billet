@@ -45,6 +45,7 @@
    operating/status-and-leases
    operating/nodes
    operating/guest-images
+   operating/build-caches
    operating/actions-cache
    operating/compatibility
    operating/upgrades

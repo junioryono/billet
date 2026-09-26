@@ -445,11 +445,12 @@ func (r *Runner) Launch(
 	cacheEndpoint, cacheToken := "", ""
 	actionsProxy, actionsCAPEM := "", ""
 	var buildKitCacheMountLimit config.ByteSize
+	var guestCaches []provider.GuestCache
 	if r.cache != nil {
 		var credentials CacheCredentials
 		scope := CacheSessionScope{
-			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted,
-			LeaseID: lease.ID, Epoch: lease.Epoch,
+			Trust: trust, Intercept: interceptsFor(tier, trust),
+			LeaseID: lease.ID, Epoch: lease.Epoch, Cache: tier.Cache,
 		}
 		if tier.CacheScope != nil {
 			scope.Owner = tier.CacheScope.Owner
@@ -466,6 +467,7 @@ func (r *Runner) Launch(
 			actionsProxy = credentials.ActionsProxy
 			actionsCAPEM = credentials.ActionsCAPEM
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
+			guestCaches = guestCachesFor(tier.Cache)
 		}
 	}
 
@@ -518,6 +520,7 @@ func (r *Runner) Launch(
 		JITConfig:               reg.Config(),
 		CacheEndpoint:           cacheEndpoint,
 		CacheToken:              cacheToken,
+		GuestCaches:             guestCaches,
 		ActionsProxy:            actionsProxy,
 		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
@@ -671,8 +674,15 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	return r.destroy(ctx, requestID)
 }
 
+// A COMPILE-TIME PROMISE: the node loop finds this by type assertion, and a
+// signature that drifted would compile and quietly lose every completion's
+// result and cache authority.
+var _ server.CompletionAwareRunner = (*Runner)(nil)
+
 // DestroyCompleted settles result-dependent cache state before removing compute.
-func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string,
+	authority server.CacheAuthority,
+) error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 
@@ -682,7 +692,7 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 			r.log.Info("settling a Docker image store from a completed job",
 				"request", requestID, "instance", instance, "result", result,
 				"succeeded", succeeded)
-			if err := r.cache.SettleDocker(ctx, instance, succeeded); err != nil {
+			if err := r.cache.SettleCompleted(ctx, instance, succeeded, authority); err != nil {
 				r.log.Warn("Docker image store was not published; compute teardown will discard it",
 					"request", requestID, "instance", instance, "result", result, "error", err)
 			}
@@ -1607,3 +1617,42 @@ func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, e
 // Job re-exports the listener's job identity so this package's signature matches
 // server.Runner without importing anything else from it at call sites.
 type Job = server.Job
+
+// interceptsFor says whether a launch's guest gets the Actions cache
+// interception: a trusted pool's legacy cache, or a default-branch tier's of
+// either trust, whose writes the job's proven ref decides.
+func interceptsFor(tier *nodeapi.TierSpec, trust provider.TrustClass) bool {
+	// EITHER SPELLING ENABLES IT: intercept is the deprecated name of
+	// cache.actions.enabled, and a spec carrying both says the same thing.
+	if !tier.Intercept && (tier.Cache == nil || !tier.Cache.Actions.Enabled) {
+		return false
+	}
+	if tier.Cache != nil && tier.Cache.Publish.Effective() == config.CachePublishDefaultBranch {
+		return true
+	}
+
+	return trust == provider.TrustTrusted
+}
+
+// guestCachesFor is what the guest configures for a tier's cache block. A
+// tier without one (an older plane) configures nothing new.
+func guestCachesFor(spec *config.CacheSpec) []provider.GuestCache {
+	if spec == nil {
+		return nil
+	}
+	var caches []provider.GuestCache
+	if spec.Go.Enabled {
+		caches = append(caches, provider.GuestCacheGo)
+		if spec.GoTestResults {
+			caches = append(caches, provider.GuestCacheGoTestResults)
+		}
+	}
+	if spec.Bazel.Enabled {
+		caches = append(caches, provider.GuestCacheBazel)
+	}
+	if spec.Git.Enabled {
+		caches = append(caches, provider.GuestCacheGit)
+	}
+
+	return caches
+}

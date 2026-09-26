@@ -40,6 +40,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -706,6 +707,15 @@ func checkSpec(spec provider.Spec) error {
 	if spec.ActionsProxy != "" && spec.CacheEndpoint == "" {
 		return fmt.Errorf("firecracker: %s has an Actions proxy but no cache session", spec.Name)
 	}
+	if len(spec.GuestCaches) > 0 && spec.CacheEndpoint == "" {
+		return fmt.Errorf("firecracker: %s has guest build caches but no cache session", spec.Name)
+	}
+	for i, cache := range spec.GuestCaches {
+		if !cache.Valid() || slices.Contains(spec.GuestCaches[:i], cache) {
+			return fmt.Errorf("firecracker: %s names guest build cache %q, which is unknown or "+
+				"repeated", spec.Name, cache)
+		}
+	}
 	for _, value := range []string{spec.ActionsProxy, spec.ActionsCAPEM} {
 		if strings.ContainsRune(value, 0) {
 			return fmt.Errorf("firecracker: %s has Actions interception metadata containing a NUL",
@@ -884,6 +894,13 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 		billet["cache-token"] = spec.CacheToken
 		billet["buildkit-cache-mount-limit-bytes"] =
 			strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10)
+	}
+	if len(spec.GuestCaches) > 0 {
+		names := make([]string, len(spec.GuestCaches))
+		for i, cache := range spec.GuestCaches {
+			names[i] = string(cache)
+		}
+		billet["guest-caches"] = strings.Join(names, ",")
 	}
 	if spec.ActionsProxy != "" {
 		billet["actions-proxy"] = spec.ActionsProxy

@@ -81,6 +81,9 @@ type Onboarding struct {
 
 // OnboardOptions configures the manifest flow.
 type OnboardOptions struct {
+	// RunEvidence asks for `actions: read` too, which a deployment that
+	// publishes caches from a default branch needs.
+	RunEvidence bool
 	// Target is the organization or repository the App will manage runners
 	// for. Required.
 	Target Target
@@ -635,7 +638,7 @@ func (f *onboardFlow) install(ctx context.Context, app *App) (*Installation, err
 // The app key has already been written by this point, so failing here is
 // recoverable: fix the permissions on GitHub and re-run `billet check`.
 func (f *onboardFlow) verify(inst *Installation) (*Installation, error) {
-	problems := inst.PermissionMismatches(f.opts.Target.Scope())
+	problems := inst.PermissionMismatches(f.opts.Target.Scope(), f.opts.RunEvidence)
 	if len(problems) == 0 {
 		return inst, nil
 	}
@@ -698,7 +701,8 @@ func (f *onboardFlow) openOrPrint(ctx context.Context, target string) {
 // handleStart serves the self-submitting form. A plain redirect cannot work:
 // GitHub requires the manifest in a POST body.
 func (f *onboardFlow) handleStart(w http.ResponseWriter, _ *http.Request) {
-	manifest := NewManifest(f.opts.Name, f.base+"/callback", f.base+"/installed", f.opts.Target.Scope())
+	manifest := NewManifest(f.opts.Name, f.base+"/callback", f.base+"/installed",
+		f.opts.Target.Scope(), f.opts.RunEvidence)
 
 	encoded, err := json.Marshal(manifest)
 	if err != nil {

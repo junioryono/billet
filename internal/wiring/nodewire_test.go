@@ -489,7 +489,7 @@ func TestALoopbackWireHasNoCertificatesAndAsksForNoAuthority(t *testing.T) {
 // cachePolicy records that it was asked, and decides nothing.
 type cachePolicy struct{ asked int }
 
-func (c *cachePolicy) ActionsCacheAllowed(context.Context, string, string) (bool, error) {
+func (c *cachePolicy) CacheAllowed(context.Context, string, string, string) (bool, error) {
 	c.asked++
 
 	return true, nil

@@ -336,7 +336,9 @@ HOSTED_TOOLS=(
 	/usr/bin/docker-credential-ecr-login /usr/bin/composer /usr/local/bin/phpunit
 	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
 	/usr/bin/skopeo /usr/bin/git-ftp /usr/bin/mysql /usr/sbin/mysqld /usr/sbin/apache2
-	/usr/sbin/nginx
+	/usr/sbin/nginx /usr/bin/az /usr/bin/gcloud /usr/bin/bc /usr/bin/go /usr/bin/gofmt
+	/usr/bin/envsubst /usr/bin/add-apt-repository /usr/bin/lsb_release /usr/bin/uuidgen
+	/usr/bin/gawk /usr/bin/column /usr/bin/lsof /usr/bin/strace
 )
 
 # image_resolve prints path as the image at $1 resolves it, following every
@@ -410,6 +412,13 @@ check_hosted_tools() {
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
 	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
+	if [ -d "$1/usr/local/lib/android/sdk" ] && [ -z "$(find "$1/usr/local/lib/android/sdk" -maxdepth 0 -perm -o+w)" ]; then
+		missing+=("a writable Android SDK (Gradle installs the NDK a project asks for into it)")
+	fi
+	grep -qx 'AZURE_EXTENSION_DIR=/opt/az/azcliextensions' "$env" 2>/dev/null ||
+		missing+=("AZURE_EXTENSION_DIR in /etc/billet-image-env")
+	grep -q '^GOROOT_[0-9]*_[0-9]*_X64=/opt/hostedtoolcache/go/' "$env" 2>/dev/null ||
+		missing+=("GOROOT_<major>_<minor>_X64 in /etc/billet-image-env")
 
 	# A TOOLCACHE ENTRY COUNTS ONLY WITH ITS .complete MARKER, which is what
 	# @actions/tool-cache looks for; a payload without one is invisible to it.
@@ -618,6 +627,23 @@ else
 	fail "the container hook, its vendored reference, the runner's pointer to it or the
         GITHUB_PATH entry is missing; a docker client inside a container: job cannot
         reach billet's cache adapter for a type=gha export"
+fi
+
+# THE BUILD CACHES NEED BILLET INSIDE THE GUEST: the go command runs it as
+# GOCACHEPROG and Bazel as its credential helper. The agent configures neither
+# without the binary, so a missing one is a tier that silently builds cold.
+GUEST_BILLET="$MNT/opt/billet/bin/billet"
+if [ -x "$GUEST_BILLET" ] && [ -s "$GUEST_BILLET" ] &&
+	grep -Fq 'exec /opt/billet/bin/billet cache credential-helper "$@"' \
+		"$MNT/opt/billet/bin/bazel-credential-helper" &&
+	grep -Fq 'runner_env+=("GOCACHEPROG=$GUEST_BILLET cache gocacheprog")' "$AGENT" &&
+	grep -Fq 'build --credential_helper=' "$AGENT" &&
+	grep -Fq 'helper = $GUEST_BILLET cache git-credential' "$AGENT"; then
+	pass "billet is in the guest for the go, bazel and git caches"
+else
+	fail "no billet at /opt/billet/bin/billet, no bazel credential helper beside it, or an
+        agent that does not configure them; a tier with the go, bazel or git cache would
+        build cold"
 fi
 
 buildx_plugin=""

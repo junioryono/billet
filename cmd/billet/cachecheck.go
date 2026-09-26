@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -29,6 +30,9 @@ import (
 // every microVM boots a clone of; it is REQUIRED for firecracker; and it is what
 // `billet init --provider firecracker` writes when no cache endpoint was given.
 // So there the unreachable cache_pool is reported and the deployment runs.
+// lookGit finds the node's git; a test stands in for it.
+var lookGit = exec.LookPath
+
 func judgeNodeCache(cfg *config.Config) ([]string, error) {
 	if cfg.Node == nil {
 		return nil, nil
@@ -46,8 +50,26 @@ func judgeNodeCache(cfg *config.Config) ([]string, error) {
 	// distinction this command is careful about everywhere else. It says what
 	// billet will hand each guest, and says that is all it says.
 	if n.Cache != nil {
-		return []string{"guests are handed " + n.Cache.GuestEndpoint + servedFrom(n) +
-			" (configured, not probed)"}, nil
+		lines := []string{"guests are handed " + n.Cache.GuestEndpoint + servedFrom(n) +
+			" (configured, not probed)"}
+		// THE GIT CACHE RUNS git ON THE NODE, and one without it forwards every
+		// fetch to github.com, which works and saves nothing. Reported, not
+		// refused, and not claimed of any tier: whether a git-cache tier lands on
+		// this node is placement's question.
+		for _, tier := range cfg.Tiers {
+			if !tier.EffectiveCache().Git.Enabled {
+				continue
+			}
+			if _, err := lookGit("git"); err != nil {
+				lines = append(lines, "NO GIT: tier "+tier.Label+" enables the git cache, and a "+
+					"job of it placed here fetches from github.com, because this node has no git "+
+					"on its PATH to keep mirrors with")
+			}
+
+			break
+		}
+
+		return lines, nil
 	}
 
 	switch {

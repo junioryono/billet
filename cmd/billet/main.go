@@ -1877,13 +1877,21 @@ func (c *limitedConn) Close() error {
 	return err
 }
 
+// nodeCacheControl is what the node's cache service asks the control plane:
+// the kill switch, and what a job may publish. The node client is both.
+type nodeCacheControl interface {
+	node.ActionsPolicy
+	node.CachePolicy
+	node.CacheAuthorityReader
+}
+
 // startNodeCache exposes the site's clone store to its managed guests.
 func startNodeCache(
 	ctx context.Context,
 	cfg *config.Config,
 	p provider.Provider,
 	deployment string,
-	cachePolicy node.ActionsPolicy,
+	cachePolicy nodeCacheControl,
 ) (*node.CacheService, func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, nil
@@ -1925,6 +1933,8 @@ func startNodeCache(
 		return nil, nil, err
 	}
 	service.SetActionsPolicy(cachePolicy)
+	service.SetCachePolicy(cachePolicy)
+	service.SetAuthorityReader(cachePolicy)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)
@@ -1940,6 +1950,15 @@ func startNodeCache(
 		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    16 << 10,
+	}
+	// BAZEL'S AND BUCK2'S REMOTE CACHES SPEAK gRPC, which is HTTP/2, and a guest
+	// reaches this listener in the clear on its own bridge, so it takes HTTP/2
+	// with prior knowledge beside HTTP/1. The read timeout applies per stream,
+	// and a cache transfer extends its own.
+	if cfg.Node.Provider != config.ProviderEC2 {
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		srv.Protocols.SetUnencryptedHTTP2(true)
 	}
 	serveListener := ln
 	if cfg.Node.Provider == config.ProviderEC2 {
@@ -1985,6 +2004,9 @@ func startNodeCache(
 			if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {
 				slog.Default().Warn("could not evict expired cache generations; will retry",
 					"error", err)
+			}
+			if err := service.ReapGitMirrors(ctx); err != nil && ctx.Err() == nil {
+				slog.Default().Warn("could not reap unused git mirrors; will retry", "error", err)
 			}
 		}
 
@@ -2987,6 +3009,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	printReportedInventory(ctx, a)
 	printComputeBarrier(ctx, a)
 	printWireWindow(ctx, a)
+	printCacheAwareWaits(ctx, a, cfg.Tiers)
 
 	held, err := a.Held(ctx)
 	if err != nil {
@@ -4165,6 +4188,46 @@ func printComputeBarrier(ctx context.Context, a *alloc.Allocator) {
 
 		fmt.Println()
 	}
+}
+
+// printCacheAwareWaits names every tier that waits for a host new enough to
+// read its cache block, so a rollout's wait reads as a wait and not a stall.
+func printCacheAwareWaits(ctx context.Context, a *alloc.Allocator, tiers []config.Tier) {
+	lines, err := cacheAwareWaits(tiers, func(t config.Tier) (bool, error) {
+		return a.WaitsForCacheAwareHost(ctx, t)
+	})
+	if err != nil {
+		fmt.Printf("cache     unavailable: %v\n", err)
+	}
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+}
+
+// cacheAwareWaits is a line for each tier placed nowhere only because every
+// host it could otherwise use is too old to read its cache block: in a rollout,
+// until the first of ITS hosts upgrades, whatever other hosts have.
+func cacheAwareWaits(tiers []config.Tier, waits func(config.Tier) (bool, error)) ([]string, error) {
+	var lines []string
+	for i := range tiers {
+		waiting, err := waits(tiers[i])
+		if err != nil {
+			return lines, err
+		}
+		if !waiting {
+			continue
+		}
+		label := "cache"
+		if len(lines) > 0 {
+			label = ""
+		}
+		lines = append(lines, fmt.Sprintf("%-9s tier %s WAITS FOR A HOST ON PROTOCOL %d: an older host "+
+			"would ignore its cache block and read, publish or keep more than it allows, and "+
+			"none of the hosts it could run on speaks %d yet", label, tiers[i].Label,
+			nodeapi.VersionCacheAuthority, nodeapi.VersionCacheAuthority))
+	}
+
+	return lines, nil
 }
 
 // printWireWindow reports which hosts are still on an older node wire.

@@ -49,7 +49,9 @@ func (stubCompute) Tend(context.Context) error                               { r
 func (stubCompute) AssumeCustody(context.Context, *alloc.Lease, int64) error { return nil }
 func (stubCompute) Holding() bool                                            { return false }
 func (stubCompute) Superseded()                                              {}
-func (stubCompute) DestroyCompleted(context.Context, int64, string) error    { return nil }
+func (stubCompute) DestroyCompleted(context.Context, int64, string, server.CacheAuthority) error {
+	return nil
+}
 
 type stubJIT struct{}
 
