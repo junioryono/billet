@@ -345,7 +345,7 @@ func (c *Client) open(ctx context.Context, url string) (io.ReadCloser, error) {
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("releasesource: fetch %s: %w", url, err)
+		return nil, fmt.Errorf("releasesource: fetch %s: %w", url, imagesource.WithoutSignedQuery(err))
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
