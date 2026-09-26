@@ -595,8 +595,8 @@ install_node_toolcache() {
 		local want
 
 		# THE CHECKSUM COMES FROM THE RELEASE ITSELF, published beside the tarball.
-		want=$(curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/$v/SHASUMS256.txt" |
-			awk -v f="$file" '$2 == f {print $1}')
+		want=$(billet_tc_sum "$(curl -fsSL --retry 3 --retry-all-errors \
+			"https://nodejs.org/dist/$v/SHASUMS256.txt")" "$file")
 
 		if [ -z "$want" ]; then
 			echo "no published checksum for node $v; refusing to bake an unverified runtime" >&2
@@ -967,7 +967,7 @@ install_pypy_toolcache() {
 		# The here-string removes the pipeline, so there is no upstream to signal
 		# and the early `exit` costs nothing. Reproducing this needed the ERR trap
 		# added beside it; the build had printed nothing at all.
-		want=$(awk -v f="$file" '$2 == f { print $1; exit }' <<<"$checksums")
+		want=$(billet_tc_sum "$checksums" "$file")
 
 		# PUBLISHED WITHOUT A CHECKSUM IS A THIRD THING, and pypy does it on arm64.
 		#
@@ -2708,7 +2708,7 @@ install_github_cli() {
 	file="gh_${version}_linux_$BILLET_TC_DPKG.deb"
 	url="https://github.com/cli/cli/releases/download/$tag"
 	sums=$(billet_tc_get "$url/gh_${version}_checksums.txt")
-	want=$(awk -v f="$file" '$2 == f { print $1; exit }' <<<"$sums")
+	want=$(billet_tc_sum "$sums" "$file")
 
 	fetch_verified "$url/$file" "${BILLET_TC_ROOT:-}/tmp/$file" "$(billet_tc_hex "$want" 64 "gh $version")"
 	billet_tc_run env DEBIAN_FRONTEND=noninteractive dpkg -i "/tmp/$file" >/dev/null
@@ -2779,7 +2779,7 @@ install_hosted_binaries() {
 	local kver="${tag#kustomize/}"
 	url="https://github.com/kubernetes-sigs/kustomize/releases/download/$tag"
 	sums=$(billet_tc_get "$url/checksums.txt")
-	want=$(awk -v f="kustomize_${kver}_linux_$arch.tar.gz" '$2 == f { print $1; exit }' <<<"$sums")
+	want=$(billet_tc_sum "$sums" "kustomize_${kver}_linux_$arch.tar.gz")
 	fetch_verified "$url/kustomize_${kver}_linux_$arch.tar.gz" "$BILLET_TC_WORK/kustomize.tgz" \
 		"$(billet_tc_hex "$want" 64 "kustomize $kver")"
 	tar -xzf "$BILLET_TC_WORK/kustomize.tgz" -C "$BILLET_TC_WORK" kustomize
@@ -2796,12 +2796,12 @@ install_hosted_binaries() {
 	billet_tc_bin "$url" /usr/bin/docker-credential-ecr-login "$(billet_tc_hex "$want" 64 "the ECR helper")"
 
 	# Git LFS, from its release rather than packagecloud's piped installer; the
-	# sums file is a clearsigned list of `<sha256>  <file>` lines.
+	# sums file is a clearsigned list of `<sha256> *<file>` lines (binary mode).
 	tag=$(jq -r .tag_name <<<"$(billet_tc_release git-lfs/git-lfs)")
 	url="https://github.com/git-lfs/git-lfs/releases/download/$tag"
 	local lfs="git-lfs-linux-$arch-$tag.tar.gz"
 	sums=$(billet_tc_get "$url/sha256sums.asc")
-	want=$(awk -v f="$lfs" '$2 == f { print $1; exit }' <<<"$sums")
+	want=$(billet_tc_sum "$sums" "$lfs")
 	fetch_verified "$url/$lfs" "$BILLET_TC_WORK/lfs.tgz" "$(billet_tc_hex "$want" 64 "git-lfs $tag")"
 	mkdir -p "$BILLET_TC_WORK/lfs"
 	tar -xzf "$BILLET_TC_WORK/lfs.tgz" -C "$BILLET_TC_WORK/lfs" --strip-components=1
@@ -2980,7 +2980,7 @@ install_agentic_tools() {
 		local dir="$tc/agentic-workflow-firewall-js/${tag#v}"
 		local sums
 		sums=$(billet_tc_get "$url/checksums.txt")
-		want=$(awk '$2 == "awf-bundle.js" { print $1; exit }' <<<"$sums")
+		want=$(billet_tc_sum "$sums" awf-bundle.js)
 		mkdir -p "$dir/x64"
 		fetch_verified "$url/awf-bundle.js" "$dir/x64/awf-bundle.js" \
 			"$(billet_tc_hex "$want" 64 "awf-bundle.js $tag")"
@@ -2999,7 +2999,7 @@ install_agentic_tools() {
 	local file="copilot-linux-$BILLET_TC_ARCH.tar.gz"
 	local sums
 	sums=$(billet_tc_get "$url/SHA256SUMS.txt")
-	want=$(awk -v f="$file" '$2 == f { print $1; exit }' <<<"$sums")
+	want=$(billet_tc_sum "$sums" "$file")
 	fetch_verified "$url/$file" "$BILLET_TC_WORK/copilot.tgz" "$(billet_tc_hex "$want" 64 "copilot $version")"
 	mkdir -p "$tc/copilot-cli/$version/$BILLET_TC_ARCH/bin"
 	tar -xzf "$BILLET_TC_WORK/copilot.tgz" -C "$tc/copilot-cli/$version/$BILLET_TC_ARCH/bin"
