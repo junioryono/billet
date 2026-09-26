@@ -211,7 +211,7 @@ func TestRolloutStatusJSONPinsTheReport(t *testing.T) {
 	)
 
 	statusPlane(t, stateDir, func(db *state.DB) {
-		if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+		if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 			t.Fatalf("ClaimController: %v", err)
 		}
 
@@ -454,12 +454,12 @@ func TestRolloutStatusReportsTheRetirementRow(t *testing.T) {
 	}
 
 	statusPlane(t, stateDir, func(db *state.DB) {
-		if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+		if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 			t.Fatalf("ClaimController: %v", err)
 		}
 
 		if _, _, err := db.ReserveRetirement(t.Context(), state.RetirementReservation{
-			Deployment: deployment, Retiring: "billet-control-01", Survivor: "billet-control-02",
+			Deployment: deployment, Retiring: "control-01", Survivor: "control-02",
 			Run: "ci-42", TransitionID: transitionForStatus,
 			At: time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC),
 		}); err != nil {
@@ -470,7 +470,7 @@ func TestRolloutStatusReportsTheRetirementRow(t *testing.T) {
 	report, _, out := statusJSON(t, cfgPath)
 
 	want := &rolloutStatusRetirement{
-		Retiring: "billet-control-01", Survivor: "billet-control-02", Run: "ci-42",
+		Retiring: "control-01", Survivor: "control-02", Run: "ci-42",
 		State: state.RetirementReserved, TransitionID: transitionForStatus,
 		ReservedAt: "2026-09-11T08:00:00Z", UpdatedAt: "2026-09-11T08:00:00Z",
 	}
@@ -487,7 +487,7 @@ func TestRolloutStatusReportsTheRetirementRow(t *testing.T) {
 		t.Fatalf("rollout status: %v\n%s", runErr, text)
 	}
 
-	if !strings.Contains(text, "retirement billet-control-01 -> billet-control-02 is reserved") ||
+	if !strings.Contains(text, "retirement control-01 -> control-02 is reserved") ||
 		!strings.Contains(text, transitionForStatus) {
 		t.Errorf("the text does not name the retirement row:\n%s", text)
 	}
@@ -536,7 +536,7 @@ func TestRolloutStatusReportsTheLedgersBindingAndNeverMintsOne(t *testing.T) {
 		}
 
 		statusPlane(t, stateDir, func(db *state.DB) {
-			if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+			if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -562,7 +562,7 @@ func TestRolloutStatusReportsTheLedgersBindingAndNeverMintsOne(t *testing.T) {
 		cfgPath := writeCAConfig(t, stateDir)
 
 		statusPlane(t, stateDir, func(db *state.DB) {
-			if _, err := db.ClaimController(t.Context(), "billet-control-01",
+			if _, err := db.ClaimController(t.Context(), "control-01",
 				"0123456789abcdef0123456789abcdef"); err != nil {
 				t.Fatal(err)
 			}
