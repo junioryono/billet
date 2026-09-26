@@ -904,3 +904,58 @@ func TestAStoppedNodeExitsCleanlyWhetherOrNotItWasHoldingWork(t *testing.T) {
 		})
 	}
 }
+
+// A DRAIN ENDS SECONDS AFTER THE LAST COMPUTE GOES, NOT A SWEEP LATER, and it
+// still tends custody only on the sweep cadence.
+//
+// The sweep interval here is an hour. Before Holding was asked on its own short
+// tick, the wait slept a whole sweep between checks, so a host whose last job
+// finished stayed out of service for up to five minutes in production.
+func TestADrainEndsSoonAfterTheLastComputeGoesWhateverTheSweepInterval(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
+			Provider:     config.ProviderDocker,
+			Deployment:   deployment,
+			Log:          slog.New(slog.DiscardHandler),
+			Backoff:      20 * time.Millisecond,
+			SweepEvery:   time.Hour,
+			DrainTimeout: 20 * time.Second,
+		})
+	}()
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	cancel()
+
+	waitFor(t, func() bool { return compute.tended() > 0 })
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("a drained node reported a failure: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a node holding nothing went on draining; it checked only on the hour-long sweep")
+	}
+
+	if n := compute.tended(); n != 1 {
+		t.Errorf("tended custody %d times within one sweep interval; want 1", n)
+	}
+}
