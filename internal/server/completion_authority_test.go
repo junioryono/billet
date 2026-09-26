@@ -27,12 +27,12 @@ func (f *fakeRunEvidence) DefaultBranch(context.Context, string, string) (string
 
 // completedPool starts job 11 on the runner launched for it with the given
 // identity and completes it, and returns what the runner was handed.
-func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence, event, ref string,
+func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence,
 ) []CacheAuthority {
 	t.Helper()
 
 	started := Job{RequestID: 11, RunID: 101, JobID: "job-11", Owner: "acme", Repository: "api",
-		Event: event, WorkflowRef: "acme/api/.github/workflows/ci.yml@" + ref}
+		Event: "push", WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main"}
 	assigned := started
 	assigned.Owner, assigned.Repository, assigned.Event, assigned.WorkflowRef = "", "", "", ""
 
@@ -71,7 +71,7 @@ func TestACompletedDefaultBranchJobCarriesItsPublication(t *testing.T) {
 	evidence := &fakeRunEvidence{branch: "main", run: WorkflowRun{ID: 101, Event: "push",
 		HeadBranch: "main", HeadRepository: "acme/api", Repository: "acme/api",
 		Path: ".github/workflows/ci.yml", HeadSHA: "abc"}}
-	got := completedPool(t, defaultBranchSpec(), evidence, "push", "refs/heads/main")
+	got := completedPool(t, defaultBranchSpec(), evidence)
 
 	if len(got) != 1 || !got[0].PublishDefault || got[0].JobID != "job-11" || got[0].LeaseID == "" {
 		t.Fatalf("authorities = %+v, want one that publishes the default branch for job-11", got)
@@ -84,7 +84,7 @@ func TestAnUnreadableRunPublishesNothing(t *testing.T) {
 	t.Parallel()
 
 	evidence := &fakeRunEvidence{err: errors.New("github is down")}
-	got := completedPool(t, defaultBranchSpec(), evidence, "push", "refs/heads/main")
+	got := completedPool(t, defaultBranchSpec(), evidence)
 
 	if len(got) != 1 || got[0].Proven || got[0].PublishDefault || got[0].WriteOwnRef {
 		t.Fatalf("authorities = %+v, want one unproven completion", got)
@@ -102,7 +102,7 @@ func TestAJobOfAnotherRepositoryDoesNotPublishIntoTheNamespace(t *testing.T) {
 		Path: ".github/workflows/ci.yml", HeadSHA: "abc"}}
 	spec := defaultBranchSpec()
 	spec.Repository = "web"
-	got := completedPool(t, spec, evidence, "push", "refs/heads/main")
+	got := completedPool(t, spec, evidence)
 
 	if len(got) != 1 || got[0].Proven || got[0].PublishDefault {
 		t.Fatalf("authorities = %+v, want an unproven authority for another repository", got)
@@ -115,8 +115,7 @@ func TestATrustedOnlyTierNeverAsksForRunEvidence(t *testing.T) {
 	t.Parallel()
 
 	evidence := &fakeRunEvidence{branch: "main"}
-	got := completedPool(t, config.CacheSpec{Publish: config.CachePublishTrustedOnly}, evidence,
-		"push", "refs/heads/main")
+	got := completedPool(t, config.CacheSpec{Publish: config.CachePublishTrustedOnly}, evidence)
 
 	if evidence.asked != 0 {
 		t.Errorf("GitHub was asked %d times for a trusted-only tier", evidence.asked)

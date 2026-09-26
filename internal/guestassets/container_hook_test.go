@@ -236,7 +236,7 @@ func TestTheContainerHookAddsNothingForATierWithoutTheGoCache(t *testing.T) {
 	if code, out := runHook(t, node, index, request, "GOCACHEPROG=", "BILLET_CACHE_TOKEN=token"); code != 0 {
 		t.Fatalf("hook exited %d\n%s", code, out)
 	}
-	container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
+	container := as[map[string]any](t, as[map[string]any](t, readForwarded(t, record)["args"])["container"])
 	if len(container) != 1 {
 		t.Fatalf("a tier without the go cache had its container changed: %v", container)
 	}
@@ -279,13 +279,13 @@ func TestTheContainerHookGivesAJobContainerTheGoCacheHelper(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("hook exited %d\n%s", code, out)
 			}
-			container := readForwarded(t, record)["args"].(map[string]any)["container"].(map[string]any)
-			mounts, _ := container["systemMountVolumes"].([]any)
-			if len(mounts) != 1 || mounts[0].(map[string]any)["sourceVolumePath"] != billet ||
-				mounts[0].(map[string]any)["readOnly"] != true {
+			container := as[map[string]any](t, as[map[string]any](t, readForwarded(t, record)["args"])["container"])
+			mounts := as[[]any](t, container["systemMountVolumes"])
+			if len(mounts) != 1 || as[map[string]any](t, mounts[0])["sourceVolumePath"] != billet ||
+				as[map[string]any](t, mounts[0])["readOnly"] != true {
 				t.Fatalf("mounts = %v, want only the helper, read-only", mounts)
 			}
-			variables := container["environmentVariables"].(map[string]any)
+			variables := as[map[string]any](t, container["environmentVariables"])
 			wantHelper := billet + " cache gocacheprog"
 			if _, turnedOff := own["GOCACHEPROG"]; turnedOff {
 				wantHelper = ""
@@ -313,4 +313,17 @@ func readForwarded(t *testing.T, record string) map[string]any {
 		t.Fatalf("the reference hook was handed something that is not JSON: %v\n%s", err, body)
 	}
 	return forwarded
+}
+
+// as is a checked type assertion on decoded JSON: a shape the hook did not
+// forward fails the test by name instead of panicking inside it.
+func as[T any](t *testing.T, v any) T {
+	t.Helper()
+
+	out, ok := v.(T)
+	if !ok {
+		t.Fatalf("forwarded %T (%v), want %T", v, v, out)
+	}
+
+	return out
 }

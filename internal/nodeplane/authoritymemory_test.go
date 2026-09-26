@@ -137,7 +137,13 @@ func TestAPanickingQuestionReleasesItsWaiters(t *testing.T) {
 		binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
 		release := make(chan struct{})
 		go func() {
-			defer func() { _ = recover() }()
+			// THE PANIC IS THE CASE UNDER TEST; recovering it keeps the test
+			// binary alive to assert what the waiter was told.
+			defer func() {
+				if recovered := recover(); recovered == nil {
+					t.Error("the question did not panic")
+				}
+			}()
 			memory.resolve("l1", binding, now, func() (server.CacheAuthority, bool) {
 				<-release
 				panic("github client")

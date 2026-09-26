@@ -107,7 +107,11 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 			plain := body
 			if r.Header.Get("Content-Encoding") == "gzip" {
 				if reader, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
-					plain, _ = io.ReadAll(reader)
+					decoded, err := io.ReadAll(reader)
+					if err != nil {
+						t.Errorf("the fake github could not inflate a negotiation: %v", err)
+					}
+					plain = decoded
 				}
 			}
 			if bytes.Contains(plain, []byte("command=fetch")) || bytes.Contains(plain, []byte("want ")) {
@@ -141,9 +145,9 @@ func gitClient(t *testing.T, node *httptest.Server, token, header string) func(a
 		"echo username="+token+"\necho password="+header+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	config := "[url \"" + node.URL + "/v1/git/github.com/\"]\n\tinsteadOf = https://github.com/\n" +
+	gitconfig := "[url \"" + node.URL + "/v1/git/github.com/\"]\n\tinsteadOf = https://github.com/\n" +
 		"[credential \"" + node.URL + "\"]\n\thelper = " + helper + "\n"
-	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(gitconfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -192,8 +196,8 @@ func TestAGitCloneIsServedFromTheMirror(t *testing.T) {
 	if upstream.fetches.Load() != mirrored {
 		t.Fatalf("the second clone fetched from github.com (%d fetches)", upstream.fetches.Load())
 	}
-	if got, _ := git("-C", "second", "rev-parse", "HEAD"); strings.TrimSpace(got) != want {
-		t.Fatalf("the second clone is at %q, want %q", got, want)
+	if got, err := git("-C", "second", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(got) != want {
+		t.Fatalf("the second clone is at %q (%v), want %q", got, err, want)
 	}
 }
 
@@ -469,8 +473,11 @@ func TestATierWithoutTheGitCacheIsForwarded(t *testing.T) {
 		"https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
-	if entries, _ := os.ReadDir(service.git.root); len(entries) != 0 {
-		t.Fatalf("a tier without the git cache made a mirror: %v", entries)
+	// NO DIRECTORY IS NO MIRROR, the answer this wants; any other read error is
+	// could not tell.
+	if entries, err := os.ReadDir(service.git.root); (err != nil && !errors.Is(err, os.ErrNotExist)) ||
+		len(entries) != 0 {
+		t.Fatalf("a tier without the git cache made a mirror: %v (%v)", entries, err)
 	}
 	if upstream.fetches.Load() != 1 {
 		t.Fatalf("github.com served %d fetches, want the client's own", upstream.fetches.Load())
@@ -802,8 +809,10 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 	}
 	var child int
 	for range 100 {
-		if raw, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
-			child, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+		if raw, err := os.ReadFile(pidFile); err == nil && strings.TrimSpace(string(raw)) != "" {
+			if child, err = strconv.Atoi(strings.TrimSpace(string(raw))); err != nil {
+				t.Fatalf("the child wrote %q as its pid: %v", raw, err)
+			}
 
 			break
 		}
@@ -813,14 +822,20 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 		t.Fatal("the child never started")
 	}
 	cancel()
-	_ = cmd.Wait()
+	// A cancelled command reports the signal that ended it; what this asserts
+	// is the child, below.
+	if err := cmd.Wait(); err == nil {
+		t.Log("the cancelled parent exited cleanly")
+	}
 	for range 100 {
 		if syscall.Kill(child, 0) != nil {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	_ = syscall.Kill(child, syscall.SIGKILL)
+	if err := syscall.Kill(child, syscall.SIGKILL); err != nil {
+		t.Logf("could not kill the surviving child %d: %v", child, err)
+	}
 	t.Fatal("the child outlived its cancelled parent")
 }
 
@@ -929,7 +944,9 @@ func newScriptedGitHub(t *testing.T) *scriptedGitHub {
 		case answer.status != 0:
 			http.Error(w, "scripted", answer.status)
 		default:
-			_, _ = w.Write([]byte("001e# service=git-upload-pack\n0000"))
+			if _, err := w.Write([]byte("001e# service=git-upload-pack\n0000")); err != nil {
+				t.Errorf("the scripted github could not answer: %v", err)
+			}
 		}
 	}))
 	t.Cleanup(github.Close)
@@ -955,7 +972,7 @@ func advertise(t *testing.T, node *httptest.Server, token, repo string) {
 // advertiseErr is advertise for a goroutine other than the test's.
 func advertiseErr(ctx context.Context, node *httptest.Server, token, repo string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		node.URL+"/v1/git/github.com/acme/"+repo+".git/info/refs?service=git-upload-pack", nil)
+		node.URL+"/v1/git/github.com/acme/"+repo+".git/info/refs?service=git-upload-pack", http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -965,9 +982,9 @@ func advertiseErr(ctx context.Context, node *httptest.Server, token, repo string
 	if err != nil {
 		return err
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, copyErr := io.Copy(io.Discard, resp.Body)
 
-	return resp.Body.Close()
+	return errors.Join(copyErr, resp.Body.Close())
 }
 
 func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Server, string) {

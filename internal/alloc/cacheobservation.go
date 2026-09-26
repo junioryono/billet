@@ -252,11 +252,13 @@ func (a *Allocator) RecordCacheObservation(
 // ON THE READ-ONLY POOL, like every report.
 func (a *Allocator) CacheOutcomes(
 	ctx context.Context, since time.Time, limit int,
-) (counts map[string]map[string]map[string]int, jobs int, err error) {
+) (map[string]map[string]map[string]int, int, error) {
 	if limit <= 0 {
 		return nil, 0, fmt.Errorf("alloc: a cache report needs a positive limit, got %d", limit)
 	}
-	err = a.db.View(ctx, func(tx querier) error {
+	var counts map[string]map[string]map[string]int
+	var jobs int
+	err := a.db.View(ctx, func(tx querier) error {
 		counts, jobs = map[string]map[string]map[string]int{}, 0
 		rows, err := state.ReadQueries(tx).ListCacheOutcomes(ctx, ledgerdb.ListCacheOutcomesParams{
 			Since:   sql.NullString{String: ts(since.UTC()), Valid: true},

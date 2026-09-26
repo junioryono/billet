@@ -76,7 +76,7 @@ type publishJournal struct {
 // the next pass.
 func (s *CacheService) publishDeferred(
 	ctx context.Context, session *cacheSession, slot int, attachment *cacheAttachment,
-) (done bool, err error) {
+) (bool, error) {
 	journal := attachment.Journal
 	if journal == nil {
 		journal = &publishJournal{}
@@ -115,11 +115,7 @@ func (s *CacheService) publishDeferred(
 	// THE AUTHORITY IS ASKED AGAIN, NOW. The completion's grant was decided
 	// before the compute was destroyed; a default branch renamed, a permission
 	// withdrawn or a kill switch set since then stops the publication here.
-	if allowed, reason, err := s.stillAuthorised(ctx, session, attachment); err != nil {
-		journal.Attempts++
-
-		return false, errors.Join(err, s.persistSession(session))
-	} else if !allowed {
+	if allowed, reason := s.stillAuthorised(ctx, session, attachment); !allowed {
 		return abandon(reason)
 	}
 
@@ -158,7 +154,7 @@ func (s *CacheService) publishDeferred(
 	}
 	// ASKED AGAIN AFTER THE WAIT, which may have been long: a kill switch set
 	// while this pass waited for the writer stops it before the pointer moves.
-	if allowed, reason, _ := s.stillAuthorised(ctx, session, attachment); !allowed {
+	if allowed, reason := s.stillAuthorised(ctx, session, attachment); !allowed {
 		if err := s.releaseWriter(ctx, lease, fence); err != nil {
 			s.log.Warn("could not release a cache writer", "key", key, "error", err)
 		}
@@ -205,12 +201,12 @@ func (s *CacheService) publishDeferred(
 // proved was on the then-default branch.
 func (s *CacheService) stillAuthorised(
 	ctx context.Context, session *cacheSession, attachment *cacheAttachment,
-) (bool, string, error) {
+) (bool, string) {
 	if !s.kindAllowed(ctx, attachmentKind(attachment), session.cache.Owner, session.cache.Repository) {
-		return false, "the cache is disabled for this repository", nil
+		return false, "the cache is disabled for this repository"
 	}
 
-	return true, "", nil
+	return true, ""
 }
 
 // pendingPublication reports whether an attachment still has a clone a
@@ -270,8 +266,8 @@ func (s *CacheService) cloneWithin(
 	if !ok {
 		return volume, false, nil
 	}
-	size, err := sizer.SizeOf(ctx, volume)
-	if err != nil || size <= ceiling {
+	size, known := sizeIfKnown(ctx, sizer, volume)
+	if !known || size <= ceiling {
 		return volume, false, nil
 	}
 	// A CLONE THAT CANNOT BE DISCARDED IS KEPT AND USED, oversized, rather than
@@ -374,8 +370,8 @@ func (s *CacheService) SettleCompleted(
 		return err
 	}
 
-	attachment, err := s.awaitDockerReady(ctx, session)
-	if err != nil || attachment == nil {
+	attachment, stillDocker, err := s.awaitDockerReady(ctx, session)
+	if err != nil || !stillDocker {
 		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -387,4 +383,12 @@ func (s *CacheService) SettleCompleted(
 	}
 
 	return s.persistSession(session)
+}
+
+// sizeIfKnown is a clone's size, or false when the store could not say, which
+// cloneWithin reads as "keep it" rather than as a failure.
+func sizeIfKnown(ctx context.Context, sizer storecontract.VolumeSizer, volume storecontract.Volume) (int64, bool) {
+	size, err := sizer.SizeOf(ctx, volume)
+
+	return size, err == nil
 }

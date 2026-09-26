@@ -82,9 +82,14 @@ func (f *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(key, "cas/") {
 			f.casHits.Add(1)
 		}
-		_, _ = w.Write(body)
+		_, _ = w.Write(body) //nolint:errcheck // the fake has no test to report to, and its client reports a short body
 	case http.MethodPut:
-		body, _ := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
 		if _, held := f.objects[key]; held && strings.HasPrefix(key, "ac/") &&
 			!bytes.Contains(body, []byte(digest(nil))) {
 			f.redone.Add(1)
@@ -290,7 +295,9 @@ func TestABusyNodeIsAMissAndIsAskedAgain(t *testing.T) {
 			return
 		}
 		key, _ := strings.CutPrefix(r.URL.Path, "/v1/cas/go/")
-		_, _ = w.Write(objects[key])
+		if _, err := w.Write(objects[key]); err != nil {
+			t.Errorf("serve %s: %v", key, err)
+		}
 	}))
 	t.Cleanup(node.Close)
 	answers := exchange(t, Config{Dir: t.TempDir(), Endpoint: node.URL, Token: "token"},

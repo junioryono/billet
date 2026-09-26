@@ -86,6 +86,7 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 			Owner:       "acme",
 			Repository:  "api",
 			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			JobID:       "51001",
 		},
 	}
 
@@ -126,6 +127,9 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 	if got.Job.Owner != "acme" || got.Job.Repository != "api" ||
 		got.Job.WorkflowRef != "acme/api/.github/workflows/ci.yml@refs/heads/main" {
 		t.Errorf("the authenticated cache scope was lost on the node wire: %+v", got.Job)
+	}
+	if got.Job.JobID != "51001" {
+		t.Errorf("GitHub's job id was lost on the node wire: %+v", got.Job)
 	}
 	if got.Tier == nil || got.Tier.BuildKitCacheMountLimit != 7*config.GiB {
 		t.Errorf("the tier's BuildKit cache-mount ceiling was lost: %+v", got.Tier)

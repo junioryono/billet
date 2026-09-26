@@ -413,19 +413,19 @@ func (t Tier) cachePolicyErrors(where string) []error {
 		} {
 			if size < 0 || size > CacheVolumeLimit {
 				errs = append(errs, fmt.Errorf("%s: cache.%s.max_size %s is outside (0, %s]",
-					where, name, size, ByteSize(CacheVolumeLimit)))
+					where, name, size, CacheVolumeLimit))
 			}
 		}
 		if c.Go != nil && (c.Go.MaxSize < 0 || c.Go.MaxSize > CacheVolumeLimit) {
 			errs = append(errs, fmt.Errorf("%s: cache.go.max_size %s is outside (0, %s]",
-				where, c.Go.MaxSize, ByteSize(CacheVolumeLimit)))
+				where, c.Go.MaxSize, CacheVolumeLimit))
 		}
 		if c.Go != nil && c.Go.TestResults && (c.Go.Enabled == nil || !*c.Go.Enabled) {
 			errs = append(errs, fmt.Errorf("%s: cache.go.test_results needs cache.go.enabled", where))
 		}
 		if c.Actions != nil && (c.Actions.MaxArchive < 0 || c.Actions.MaxArchive > ActionsArchiveLimit) {
 			errs = append(errs, fmt.Errorf("%s: cache.actions.max_archive %s is outside (0, %s]",
-				where, c.Actions.MaxArchive, ByteSize(ActionsArchiveLimit)))
+				where, c.Actions.MaxArchive, ActionsArchiveLimit))
 		}
 	}
 

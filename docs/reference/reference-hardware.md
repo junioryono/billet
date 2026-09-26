@@ -75,7 +75,7 @@ Golden images and control-plane state should be **replicated**. The control-plan
 
 ## The reference host as actually built (verified, not assumed)
 
-Ubuntu 26.04 LTS, kernel 7.0.0-29-generic. `/dev/kvm` present, `kvm_amd` loaded, cgroup v2 — which is the jailer's requirement, not a nice-to-have.
+Ubuntu 26.04 LTS, kernel 7.0.0-29-generic when this was first written, 7.0.0-30-generic on 2026-09-25. `/dev/kvm` present, `kvm_amd` loaded, cgroup v2 — which is the jailer's requirement, not a nice-to-have.
 
 **Firecracker and jailer pinned at v1.16.1** (released 2026-07-02), installed as versioned filenames behind stable symlinks so `firecracker --version` always matches what is on disk and a bump is reversible. Billet pins to what the host has rather than the other way round: the provider is written against a version known to be installed, not against a version someone hopes is.
 
@@ -99,6 +99,21 @@ Redundancy is not lost in the move, which was the open question when it was plan
 - **`jailer --daemonize` exits 0 for a VM that died during startup**, leaving a pid file and an API socket behind. Its exit code proves nothing; the VMM's own API is what billet believes.
 - **The jailer creates a per-VM cgroup only when given at least one `--cgroup`**, and the two forms cannot coexist: once any VM on the host has been started with one, a VM started without one fails with `CgroupMove … Resource busy`.
 - **There is no API action that kills a microVM.** `SendCtrlAltDel` is a keyboard event the guest decides what to do with, and a real guest here ignored it for twenty seconds. billet signals the VMM process, after proving the pid is still that microVM's by the `--id` in `/proc/<pid>/cmdline`.
+
+### Power, frequency and what a job's counters look like (read 2026-09-25, read only)
+
+These are the facts `node.monitoring` rests on, read on the running host rather than taken from AMD's or the kernel's documentation.
+
+- **Topology.** One socket, SMT on, one NUMA node (NPS1). The eight L3 groups are `0-7,64-71`, `8-15,72-79`, and so on through `56-63,120-127`, so a core's SMT sibling is the core number plus 64.
+- **Frequency.** `acpi-cpufreq` with the `schedutil` governor, boost on, 1.5 to 3.53 GHz. There is no `cppc` flag in `/proc/cpuinfo`, so no MSR CPPC; ACPI CPPC is present (highest 255, nominal 177, lowest 29), so `amd-pstate` would take the shared-memory path and only when given `amd_pstate=` on the kernel command line. C-states are `acpi_idle` POLL, C1 (1 µs) and C2 (30 µs), none disabled.
+- **RAPL.** Two powercap zones, `intel-rapl:0` (`package-0`) and `intel-rapl:0:0` (`core`), both root-only. `max_energy_range_uj` is 65,532,610,987, so the counter wraps after about 65.5 kJ: four minutes at 280 W, about eight at the 140 W measured below. **The `core` zone is not usable**: it read 0.6 W while turbostat's CorWatt read 4.2 W for all cores, which fits AMD's per-core energy register covering one core. billet reads the package zone only.
+- **Idle power.** 73.5 W package over 10 s at 1.7% busy, which turbostat agreed with (PkgWatt 73.1, CorWatt 4.2): almost all idle power is the uncore and IO die, not the cores. That is the value `node.monitoring.idle_package_watts` is for.
+- **Under CI.** With about twenty microVMs running, a 10 s read of the package counter advanced 1,406,605,023 µJ, about 140.7 W, while `/proc/stat` showed 17,655 of 127,469 ticks busy (13.9% across 128 CPUs).
+- **perf.** `perf_event_paranoid` is 4. The `power` (`energy-pkg`) and `power_core` PMUs are present, and `nmi_watchdog` is 1, which likely holds one of the six core counters. `nf_conntrack_acct` is 0. `turbostat`, `cpupower` and `perf` are installed; `ipmitool` and `stress-ng` are not.
+- **A microVM's cgroup, before billet asked for accounting.** `firecracker-v1.16.1/cgroup.subtree_control` read `cpu` while the root's offered `cpuset cpu io memory hugetlb pids rdma misc dmem`, because the jailer enables only the controllers its `--cgroup` keys name. A job's cgroup therefore had `cpu.stat` and the three pressure files and no memory or io accounting. `io.weight` exists in io-enabled cgroups here (`default 100`; the kernel has blk-iocost), which is what lets billet ask for io at all.
+- **The thread split agrees with the cgroup.** For one 8-vCPU microVM the cgroup's `usage_usec` read 62,338,613 µs while the VMM's threads summed to 62.35 s: 60.37 s on `fc_vcpu 0` through `fc_vcpu 7` and 1.98 s on the event loop (`firecracker-v1.`, the name cut to 15 bytes) and `fc_api`. Its tap, `bt-16`, had transmitted 202,408,832 bytes into the guest and received 941,790 from it: a tap counts from the host's side.
+
+Still to record: the BIOS determinism slider, cTDP and PPL, which need the BMC or a reboot into setup, and whether `ipmitool dcmi power reading` over the BMC is usable as whole-server ground truth next to RAPL.
 
 The `junioryono.billet.host` Ansible role owns the guest network rather than an application repository: `billet0` is the trusted DHCP/NAT bridge and `billet1` is the separate untrusted bridge. Its nftables table permits DHCP, DNS and the node cache endpoint on the host, blocks every other guest-to-host connection, and blocks forwarded traffic to private, link-local and CGNAT destinations. The live provider tests originally ran against `lxdbr0`; deployment uses the two billet-owned bridges so removing LXD cannot take CI networking with it.
 

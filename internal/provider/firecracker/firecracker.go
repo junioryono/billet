@@ -147,6 +147,11 @@ type Provider struct {
 
 	// bootWait bounds how long Launch waits for a VMM to answer its own API.
 	bootWait time.Duration
+
+	// wantAccounting is WithJobAccounting; accounting is what the host proved at
+	// construction, and only a present controller is ever asked of the jailer.
+	wantAccounting bool
+	accounting     Accounting
 }
 
 // runner executes one command. A seam, so a test can assert the ARGUMENTS billet
@@ -298,6 +303,18 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	// has already been cloned, in an error that names no field.
 	if err := checkSocketPath(cfg.ChrootBase, p.execName); err != nil {
 		return nil, err
+	}
+
+	// READ ONCE, AT CONSTRUCTION, and only when asked: a key naming a file the
+	// kernel does not provide fails every launch, so a controller the host did
+	// not prove is left off rather than attempted.
+	if p.wantAccounting {
+		root, err := cgroup2Mount(p.procMountsPath)
+		if err != nil {
+			p.accounting = Accounting{Reason: err.Error()}
+		} else {
+			p.accounting = probeAccounting(root)
+		}
 	}
 
 	return p, nil
@@ -1029,8 +1046,11 @@ func (p *Provider) startVMM(ctx context.Context, j jail, res resources) error {
 // The value is cpu.weight at its default of 100, which changes nothing. The vCPU
 // and memory a guest gets are set on the VMM itself, where the ledger's numbers
 // belong; this is about the cgroup EXISTING.
+//
+// WithJobAccounting adds the memory and io keys the host proved it can honour;
+// see Accounting.jailerAccountingArgs.
 func (p *Provider) jailerArgs(j jail, res resources) []string {
-	return []string{
+	args := []string{
 		"--id", j.id,
 		"--exec-file", p.execPath,
 		"--uid", strconv.Itoa(res.UID),
@@ -1038,6 +1058,10 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		"--chroot-base-dir", p.cfg.ChrootBase,
 		"--cgroup-version", "2",
 		"--cgroup", "cpu.weight=100",
+	}
+	args = append(args, p.accounting.jailerAccountingArgs()...)
+
+	return append(args,
 		// A PID NAMESPACE OF ITS OWN, and the reason is a pid FILE rather than the
 		// isolation — though the isolation is worth having, since a VMM that cannot
 		// see a host process cannot signal one.
@@ -1056,10 +1080,10 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		// time billet was upgraded.
 		"--daemonize",
 		"--",
-		"--api-sock", "/" + filepath.Join("run", "firecracker.socket"),
-		"--log-path", "/" + vmmLog,
+		"--api-sock", "/"+filepath.Join("run", "firecracker.socket"),
+		"--log-path", "/"+vmmLog,
 		"--level", "Info",
-	}
+	)
 }
 
 // vmmLog is the VMM's own log inside the chroot. It carries VMM-level lines only —
