@@ -165,6 +165,10 @@ func TestTheFloorDoesNotReachAVersionThatIsUnsafe(t *testing.T) {
 func TestBarrierVersionsAgree(t *testing.T) {
 	t.Parallel()
 
+	if VersionCacheAuthority != alloc.CacheAuthorityWireVersion {
+		t.Errorf("nodeapi.VersionCacheAuthority = %d, alloc.CacheAuthorityWireVersion = %d",
+			VersionCacheAuthority, alloc.CacheAuthorityWireVersion)
+	}
 	if VersionComputeBarrier != alloc.BarrierWireVersion {
 		t.Errorf("nodeapi says a host can answer a barrier from wire %d and alloc says %d; "+
 			"a host between the two is neither asked nor reported",

@@ -198,6 +198,25 @@ linters:
             - pkg: "github.com/actions/scaleset"
               desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
 
+        # One gRPC server, for the Bazel and Buck2 remote caches, in one place.
+        # The Remote Execution API's generated code and gRPC's server are large
+        # and serve one listener route; internal/node/reapi adapts them to a
+        # Volume the node hands it, and nothing else in billet speaks gRPC.
+        remoteapis:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/node/reapi/**"
+          deny:
+            - pkg: "github.com/bazelbuild/remote-apis"
+              desc: "Serve the Remote Execution API through internal/node/reapi."
+            - pkg: "google.golang.org/grpc"
+              desc: "gRPC is served only by internal/node/reapi."
+            - pkg: "google.golang.org/genproto"
+              desc: "The API's generated types stay inside internal/node/reapi."
+            - pkg: "google.golang.org/protobuf"
+              desc: "The API's generated types stay inside internal/node/reapi."
+
         # Layering: a compute backend is a leaf. It must not reach up into the
         # scheduler, or the provider abstraction stops being substitutable.
         provider:
@@ -517,6 +536,18 @@ linters:
       # the kernel's openat2 instead), so a nolint directive is used on one
       # GOOS and reported unused on the other. Excluded here, by file and rule.
       - path: (^|/)cmd/billet/releaseinspect_resolve\.go$
+        linters:
+          - gosec
+        text: G703
+
+      # THE NODE'S CACHE FILES ARE NAMED BY BILLET. A session's custody record is
+      # named by its bearer, which billet generated as hex, and a content-addressed
+      # object by a digest parseCASPath or checkDigest admitted as hex under the
+      # volume's root. G703 reports those paths on one run and not the next: the
+      # same tree passed lint in CI and then failed it on an unused nolint
+      # directive for the finding (2026-09-26), so a directive cannot hold it.
+      # Excluded here, by file and rule.
+      - path: (^|/)internal/node/(cache_state|casvolume)\.go$
         linters:
           - gosec
         text: G703

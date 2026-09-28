@@ -43,6 +43,9 @@ async function main() {
       key,
       size_bytes: sizeGB * 1024 * 1024 * 1024,
       publication: process.env.INPUT_PUBLICATION || "cas",
+      // Scopes a default-branch sticky disk by the guest's architecture, in the
+      // spelling the Docker image store uses.
+      architecture: { x64: "amd64", arm64: "arm64" }[process.arch] || "",
     }, 13 * 60 * 1000);
     slot = attached.slot;
 

@@ -45,9 +45,11 @@ const ManifestTTL = time.Hour
 // Read ONLY through permissionsFor, so no code path can request both sets: a
 // test parses this package and holds that to be so.
 //
-// Deliberately absent from both: `actions: read`. It would expose workflow runs,
-// logs and artifacts, and billet needs none of them. Its absence is what makes
-// "billet cannot read your code" true rather than reassuring.
+// Absent from both: `actions: read`. It exposes workflow runs, logs and
+// artifacts, and only a deployment that publishes caches from a default branch
+// needs it, to read a run's own head branch and event from GitHub (see
+// runEvidencePermission). No `contents` either way, which is what makes "billet
+// cannot read your code" true rather than reassuring.
 //
 // THE REPOSITORY SET IS WIDER, AND THAT IS A STATED TRADE. Registering a
 // repository's runners needs the repository permission `administration: write`
@@ -69,19 +71,40 @@ var (
 	}
 )
 
+// runEvidencePermission is what a deployment publishing caches from a default
+// branch adds: `actions: read`, to read a workflow run's head branch, head
+// repository and event, the evidence a cache authority is decided from.
+// Requested only when asked for, so every other deployment's set is unchanged.
+var runEvidencePermission = map[string]string{"actions": "read"}
+
 // permissionsFor is the ONE reader of the two sets.
-func permissionsFor(scope Scope) map[string]string {
+func permissionsFor(scope Scope, runEvidence bool) map[string]string {
+	base := organizationPermissions
 	if scope == ScopeRepository {
-		return repositoryPermissions
+		base = repositoryPermissions
+	}
+	if !runEvidence {
+		return base
 	}
 
-	return organizationPermissions
+	out := make(map[string]string, len(base)+len(runEvidencePermission))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range runEvidencePermission {
+		out[k] = v
+	}
+
+	return out
 }
 
 // Permissions returns a copy of the permission set billet requests for a
 // target of the given scope.
-func Permissions(scope Scope) map[string]string {
-	set := permissionsFor(scope)
+//
+// runEvidence adds `actions: read`, which a deployment that publishes caches
+// from a default branch needs.
+func Permissions(scope Scope, runEvidence bool) map[string]string {
+	set := permissionsFor(scope, runEvidence)
 
 	out := make(map[string]string, len(set))
 	for k, v := range set {
@@ -119,7 +142,7 @@ type HookAttributes struct {
 // NewManifest builds billet's manifest for a target of the given scope.
 // redirectURL and setupURL point at the loopback server the CLI runs for the
 // duration of onboarding.
-func NewManifest(name, redirectURL, setupURL string, scope Scope) Manifest {
+func NewManifest(name, redirectURL, setupURL string, scope Scope, runEvidence bool) Manifest {
 	return Manifest{
 		Name:        name,
 		URL:         "https://github.com/junioryono/billet",
@@ -141,7 +164,7 @@ func NewManifest(name, redirectURL, setupURL string, scope Scope) Manifest {
 			URL:    webhookPlaceholderURL,
 			Active: false,
 		},
-		Permissions: Permissions(scope),
+		Permissions: Permissions(scope, runEvidence),
 		// Deliberately NOT setting SetupOnUpdate. It would redirect a future
 		// repository-access change back to setup_url — a loopback port that
 		// stopped existing the moment onboarding finished, so the operator would

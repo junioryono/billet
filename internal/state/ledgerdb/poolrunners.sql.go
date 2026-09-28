@@ -29,14 +29,20 @@ func (q *Queries) AcknowledgePoolRunnerSource(ctx context.Context, arg Acknowled
 const bindPoolRunnerJob = `-- name: BindPoolRunnerJob :exec
 UPDATE pool_runners
    SET actual_request_id = $1, run_id = $2, job_id = $3,
-       updated_at = $4
- WHERE lease_id = $5
+       job_owner = $4, job_repository = $5,
+       job_workflow_ref = $6, job_event = $7,
+       updated_at = $8
+ WHERE lease_id = $9
 `
 
 type BindPoolRunnerJobParams struct {
 	ActualRequestID int64
 	RunID           int64
 	JobID           string
+	JobOwner        string
+	JobRepository   string
+	JobWorkflowRef  string
+	JobEvent        string
 	UpdatedAt       string
 	LeaseID         string
 }
@@ -54,6 +60,10 @@ func (q *Queries) BindPoolRunnerJob(ctx context.Context, arg BindPoolRunnerJobPa
 		arg.ActualRequestID,
 		arg.RunID,
 		arg.JobID,
+		arg.JobOwner,
+		arg.JobRepository,
+		arg.JobWorkflowRef,
+		arg.JobEvent,
 		arg.UpdatedAt,
 		arg.LeaseID,
 	)
@@ -141,7 +151,8 @@ func (q *Queries) InsertPoolRunner(ctx context.Context, arg InsertPoolRunnerPara
 
 const listPoolRunnersInTier = `-- name: ListPoolRunnersInTier :many
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE tier = $1 ORDER BY updated_at, lease_id
 `
 
@@ -167,6 +178,10 @@ func (q *Queries) ListPoolRunnersInTier(ctx context.Context, tier string) ([]Poo
 			&i.JobID,
 			&i.SourceAcknowledged,
 			&i.UpdatedAt,
+			&i.JobOwner,
+			&i.JobRepository,
+			&i.JobWorkflowRef,
+			&i.JobEvent,
 		); err != nil {
 			return nil, err
 		}
@@ -240,7 +255,8 @@ func (q *Queries) MarkPoolRunnerRetiring(ctx context.Context, arg MarkPoolRunner
 
 const readPoolRunnerByLease = `-- name: ReadPoolRunnerByLease :one
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE lease_id = $1
 `
 
@@ -263,13 +279,18 @@ func (q *Queries) ReadPoolRunnerByLease(ctx context.Context, leaseID string) (Po
 		&i.JobID,
 		&i.SourceAcknowledged,
 		&i.UpdatedAt,
+		&i.JobOwner,
+		&i.JobRepository,
+		&i.JobWorkflowRef,
+		&i.JobEvent,
 	)
 	return i, err
 }
 
 const readPoolRunnerByName = `-- name: ReadPoolRunnerByName :one
 SELECT lease_id, tier, launch_request_id, runner_id, runner_name, status,
-       actual_request_id, run_id, job_id, source_acknowledged, updated_at
+       actual_request_id, run_id, job_id, source_acknowledged, updated_at,
+       job_owner, job_repository, job_workflow_ref, job_event
   FROM pool_runners WHERE runner_name = $1
 `
 
@@ -289,6 +310,10 @@ func (q *Queries) ReadPoolRunnerByName(ctx context.Context, runnerName string) (
 		&i.JobID,
 		&i.SourceAcknowledged,
 		&i.UpdatedAt,
+		&i.JobOwner,
+		&i.JobRepository,
+		&i.JobWorkflowRef,
+		&i.JobEvent,
 	)
 	return i, err
 }
@@ -325,8 +350,10 @@ func (q *Queries) ReadPoolRunnerSettlementByRequest(ctx context.Context, arg Rea
 const startPoolRunner = `-- name: StartPoolRunner :exec
 UPDATE pool_runners
    SET runner_id = $1, status = 'busy', actual_request_id = $2,
-       run_id = $3, job_id = $4, updated_at = $5
- WHERE lease_id = $6
+       run_id = $3, job_id = $4, job_owner = $5,
+       job_repository = $6, job_workflow_ref = $7,
+       job_event = $8, updated_at = $9
+ WHERE lease_id = $10
 `
 
 type StartPoolRunnerParams struct {
@@ -334,6 +361,10 @@ type StartPoolRunnerParams struct {
 	ActualRequestID int64
 	RunID           int64
 	JobID           string
+	JobOwner        string
+	JobRepository   string
+	JobWorkflowRef  string
+	JobEvent        string
 	UpdatedAt       string
 	LeaseID         string
 }
@@ -345,6 +376,10 @@ func (q *Queries) StartPoolRunner(ctx context.Context, arg StartPoolRunnerParams
 		arg.ActualRequestID,
 		arg.RunID,
 		arg.JobID,
+		arg.JobOwner,
+		arg.JobRepository,
+		arg.JobWorkflowRef,
+		arg.JobEvent,
 		arg.UpdatedAt,
 		arg.LeaseID,
 	)

@@ -349,6 +349,10 @@ type pending struct {
 	// may update the node object before this command is queued; dispatch refuses
 	// that stale choice rather than sending one backend's launch shape to another.
 	expectedProvider config.ProviderKind
+	// minWire is the oldest wire the taking process may speak, checked again
+	// at delivery: a process that re-registered under the same name after
+	// dispatch on an older wire must not take a command it cannot honour.
+	minWire int
 	// expectedIncarnation fences a bound destroy to the process that adopted its
 	// lease. A replacement sharing the node name must never take that command.
 	expectedIncarnation string
@@ -2048,6 +2052,16 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 				ID: pend.cmd.ID,
 				Error: fmt.Sprintf("node %q process %s replaced the bound holder %s before taking this command",
 					n.name, incarnation, pend.expectedIncarnation),
+			})
+
+			continue
+		}
+
+		if pend.minWire > 0 && n.wireVersion < pend.minWire {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q now speaks wire %d, and this command needs %d; "+
+					"it was not delivered", n.name, n.wireVersion, pend.minWire),
 			})
 
 			continue

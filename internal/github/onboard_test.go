@@ -557,7 +557,7 @@ func (b *browser) validateManifest(raw, base string) {
 	// THE SET FOLLOWS THE TARGET'S SCOPE: a repository has no
 	// organization_self_hosted_runners permission to ask for, and an
 	// organization must not be asked for administration.
-	expected := permissionsFor(b.fake.target.Scope())
+	expected := permissionsFor(b.fake.target.Scope(), false)
 
 	if len(perms) != len(expected) {
 		b.t.Errorf("manifest requests %d permissions, want %d: %v", len(perms), len(expected), perms)

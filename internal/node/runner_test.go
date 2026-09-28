@@ -227,7 +227,7 @@ func TestGitHubSuccessResultPublishesTheDockerStore(t *testing.T) {
 		runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
 	}
 	destroyed := make(chan error, 1)
-	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "succeeded") }()
+	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "succeeded", server.CacheAuthority{}) }()
 
 	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
@@ -282,7 +282,7 @@ func TestGitHubNonSuccessResultsDoNotPublishTheDockerStore(t *testing.T) {
 				},
 				runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
 			}
-			if err := runner.DestroyCompleted(t.Context(), 11, result); err != nil {
+			if err := runner.DestroyCompleted(t.Context(), 11, result, server.CacheAuthority{}); err != nil {
 				t.Fatalf("DestroyCompleted: %v", err)
 			}
 			// THE DISCARD IS NOT ON THE TEARDOWN PATH: the teardown only closes the

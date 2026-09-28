@@ -188,7 +188,7 @@ func TestAReasonSentBeforeTheJobStartIsRepairedByTheStart(t *testing.T) {
 		if err := a.MarkFailure(t.Context(), lease.ID, lease.Epoch, LaunchFailedReason); err != nil {
 			t.Fatalf("MarkFailure: %v", err)
 		}
-		if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 91, runnerName, -1, 5, "job-5"); err != nil {
+		if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 91, runnerName, -1, 5, "job-5", JobIdentity{}); err != nil {
 			t.Fatalf("StartPoolRunner: %v", err)
 		}
 		if marked, err := a.Lease(t.Context(), lease.ID); err != nil || marked.Disruption != DisruptionReclaimed {
@@ -368,7 +368,7 @@ func TestAPooledRunnersJobStartIsRecorded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RegisterPoolRunner: %v", err)
 	}
-	if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 91, runnerName, -1, 5, "job-5"); err != nil {
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 91, runnerName, -1, 5, "job-5", JobIdentity{}); err != nil {
 		t.Fatalf("StartPoolRunner: %v", err)
 	}
 

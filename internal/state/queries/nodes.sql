@@ -93,7 +93,7 @@ UPDATE nodes
 -- a host that stays live, because its process still has running work to answer
 -- for; a re-registration clears both. The two columns answer different questions:
 -- can this host be reached, and does it take new work.
-SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
+SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes, wire_version
   FROM nodes
  WHERE live = 1 AND drained = 0
  ORDER BY name;

@@ -1594,7 +1594,7 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 	answerOneCommand(t, p, "second")
 	waitFor(t, "the replacement to park on a second poll",
 		func() bool { return p.WaitersForTest("n1") == 1 })
-	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded")
+	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded", server.CacheAuthority{})
 	if !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
 		t.Errorf("a completion answered by the process that replaced the holder reported %v; "+
 			"want only holder unavailable", err)

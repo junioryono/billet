@@ -358,9 +358,9 @@ func (q *Queries) InsertLease(ctx context.Context, arg InsertLeaseParams) error 
 const listExpiredLeases = `-- name: ListExpiredLeases :many
 SELECT id, tier, node, target_node, macos_slot, chosen_provider, phase, vcpu, memory,
        requested_vcpu, requested_memory, instance_type, site, price_micros_per_hour,
-       image_cache, cache_generation, actions_cache, held_at, force_release,
-       holder_incarnation, failure_reason, disruption, disrupted_at, epoch, run_id,
-       request_id
+       image_cache, cache_generation, actions_cache, sticky_cache, git_cache,
+       bazel_cache, go_cache, held_at, force_release, holder_incarnation,
+       failure_reason, disruption, disrupted_at, epoch, run_id, request_id
   FROM leases
  WHERE phase NOT IN ('done','failed','quarantine') AND expires_at <= $1
  ORDER BY expires_at
@@ -390,6 +390,10 @@ type ListExpiredLeasesRow struct {
 	ImageCache         string
 	CacheGeneration    string
 	ActionsCache       string
+	StickyCache        string
+	GitCache           string
+	BazelCache         string
+	GoCache            string
 	HeldAt             string
 	ForceRelease       int64
 	HolderIncarnation  string
@@ -438,6 +442,10 @@ func (q *Queries) ListExpiredLeases(ctx context.Context, arg ListExpiredLeasesPa
 			&i.ImageCache,
 			&i.CacheGeneration,
 			&i.ActionsCache,
+			&i.StickyCache,
+			&i.GitCache,
+			&i.BazelCache,
+			&i.GoCache,
 			&i.HeldAt,
 			&i.ForceRelease,
 			&i.HolderIncarnation,
@@ -586,8 +594,9 @@ const readLease = `-- name: ReadLease :one
 SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
        phase, vcpu, memory, requested_vcpu, requested_memory, instance_type, site,
        price_micros_per_hour, image_cache, cache_generation, actions_cache,
-       held_at, force_release, holder_incarnation, failure_reason, disruption,
-       disrupted_at, epoch, run_id, request_id
+       sticky_cache, git_cache, bazel_cache, go_cache, held_at, force_release,
+       holder_incarnation, failure_reason, disruption, disrupted_at, epoch, run_id,
+       request_id
   FROM leases WHERE id = $1
 `
 
@@ -611,6 +620,10 @@ type ReadLeaseRow struct {
 	ImageCache         string
 	CacheGeneration    string
 	ActionsCache       string
+	StickyCache        string
+	GitCache           string
+	BazelCache         string
+	GoCache            string
 	HeldAt             string
 	ForceRelease       int64
 	HolderIncarnation  string
@@ -646,6 +659,10 @@ func (q *Queries) ReadLease(ctx context.Context, id string) (ReadLeaseRow, error
 		&i.ImageCache,
 		&i.CacheGeneration,
 		&i.ActionsCache,
+		&i.StickyCache,
+		&i.GitCache,
+		&i.BazelCache,
+		&i.GoCache,
 		&i.HeldAt,
 		&i.ForceRelease,
 		&i.HolderIncarnation,

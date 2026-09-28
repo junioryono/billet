@@ -35,6 +35,10 @@ async function cleanup() {
       warning("billet discarded this sticky-disk update because its cache policy could not be enforced; the job result is unchanged");
       return;
     }
+    if (result.pending) {
+      process.stdout.write("billet will publish this sticky-disk update once the job's result proves it ran on the default branch\n");
+      return;
+    }
     if (!result.published) warning(`billet discarded this sticky-disk update (${result.reason || "cache unavailable"}); the job result is unchanged`);
   } catch (error) {
     warning(`billet could not commit the sticky disk; the job result is unchanged: ${error.message}`);

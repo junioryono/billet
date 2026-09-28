@@ -17,11 +17,16 @@ import (
 // capacity keeps measuring exactly what it measured before. A test that wants
 // per-node capacity to bite says so by registering a specific size.
 func testRegistration(name string, kind config.ProviderKind) NodeRegistration {
+	// A CURRENT NODE, as the plane records one it negotiated with; a test of an
+	// older wire says so by setting its own.
 	reg := NodeRegistration{
-		Name:     name,
-		Provider: kind,
-		VCPU:     1 << 20,
-		Memory:   1 << 20 * config.GiB,
+		Name:        name,
+		Provider:    kind,
+		VCPU:        1 << 20,
+		Memory:      1 << 20 * config.GiB,
+		WireMin:     12,
+		WireMax:     CacheAuthorityWireVersion,
+		WireVersion: CacheAuthorityWireVersion,
 	}
 
 	if kind == config.ProviderEC2 {

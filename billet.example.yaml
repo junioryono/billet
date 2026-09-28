@@ -986,16 +986,30 @@ tiers:
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@g1
-    # Transparent actions/cache interception is off unless explicitly enabled.
-    # Use it only on a Linux Firecracker tier backed by node.cache and a site
-    # store, after this image and runner passed cache-conformance.yml. The official
-    # toolkit CacheService client is local; BuildKit type=gha, ArtifactService,
-    # unknown clients and unknown methods remain on GitHub.
-    # intercept: true
+    # EVERY CACHE THIS TIER CAN HAVE IS ON WITHOUT A LINE HERE: on a Linux
+    # Firecracker tier backed by node.cache, the Docker image store, sticky
+    # disks, the Git mirror, Bazel and Buck2, and Go; the Actions cache too once
+    # the scope below holds. Go test results stay off.
+    #
+    # Whose writes publish follows trust unless `publish` says otherwise: a
+    # trusted pool publishes what it writes, and an untrusted pool with a
+    # repository (the scope below, or a repository target) publishes only what a
+    # job GitHub proves ran on that repository's default branch wrote (push,
+    # schedule, dispatch), into a namespace of its own; every other ref reads
+    # and discards. That needs the App's `actions: read`, which
+    # `billet github-app create` requests by default.
     # cache_scope:
     #   owner: acme
     #   repository: api
-    #   workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
+    #   workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main   # a trusted Actions cache
+    # cache:
+    #   publish: default-branch        # trusted-only | default-branch | off
+    #   docker:       { enabled: true, max_size: 100GiB }
+    #   sticky_disks: { enabled: true, max_size: 100GiB }
+    #   actions:      { enabled: true, max_archive: 10GiB }
+    #   git:          { enabled: true, max_size: 50GiB }
+    #   bazel:        { enabled: true, max_size: 50GiB }
+    #   go:           { enabled: true, max_size: 20GiB, test_results: false }
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker
@@ -1009,13 +1023,21 @@ tiers:
     # for them. No accepted key is allowed to be an inert cost setting.
     # warm_pool: 2
 
-  # A tier that produces release artifacts. Interception is deliberately absent.
+  # A tier that produces release artifacts reads no cache, because a release
+  # should be built from nothing a cache could have carried in.
   - label: billet-4vcpu-ubuntu-2404-release
     provider: firecracker
     vcpu: 4
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@g1
+    cache:
+      publish: off
+      docker: { enabled: false }
+      sticky_disks: { enabled: false }
+      git: { enabled: false }
+      bazel: { enabled: false }
+      go: { enabled: false }
 
 # Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
 # macOS guests and native Linux arm64 guests, but whether it does is your

@@ -21,6 +21,8 @@ func TestACacheObservationCrossesTheNodeWire(t *testing.T) {
 
 	want := alloc.CacheObservation{
 		ImageCache: alloc.ImageCacheWarm, CacheGeneration: "gen-7", ActionsCache: alloc.ActionsCacheServed,
+		BuildCaches: alloc.BuildCaches{Sticky: alloc.BuildCacheCold, Git: alloc.BuildCacheWarm,
+			Bazel: alloc.BuildCacheUnavailable, Go: alloc.BuildCacheUnused},
 	}
 	if err := c.RecordCacheObservation(t.Context(), "l1", 7, want); err != nil {
 		t.Fatalf("RecordCacheObservation: %v", err)
