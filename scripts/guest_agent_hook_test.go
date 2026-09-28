@@ -47,8 +47,20 @@ func TestTheJobStartedHookPublishesTheAdapterURLForWorkflowExpressions(t *testin
 				}
 			}
 
+			// THE HOOK'S OWN INPUTS ARE NOT INHERITED. This suite runs in billet's
+			// own guests, whose jobs carry a real BILLET_ACTIONS_CACHE_URL, and an
+			// inherited one made "the adapter never started" see a serving adapter.
+			var inherited []string
+
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "BILLET_ACTIONS_") && !strings.HasPrefix(kv, "GITHUB_ENV=") &&
+					!strings.HasPrefix(kv, "RUNNER_TEMP=") {
+					inherited = append(inherited, kv)
+				}
+			}
+
 			run := exec.CommandContext(t.Context(), "sh", "-c", hook)
-			run.Env = append(os.Environ(),
+			run.Env = append(inherited,
 				"RUNNER_TEMP="+dir,
 				"GITHUB_ENV="+environment,
 				"BILLET_ACTIONS_CA_SOURCE="+source,
