@@ -232,7 +232,12 @@ start)
 	# terminals are let through. systemd-nspawn@.service also allows loop and
 	# device-mapper block devices, for --image= and encrypted images; a directory
 	# boot needs neither, and those classes include the builder's own disks.
+	#
+	# /tmp ON THE IMAGE'S DISK, as on GitHub's VM: nspawn otherwise mounts a tmpfs
+	# there capped at a tenth of the builder's memory, which the toolset's
+	# downloads fill. The template's cleanup empties it before the image ships.
 	systemd-run --quiet --unit="$unit" --property=Delegate=yes \
+		--setenv=SYSTEMD_NSPAWN_TMPFS_TMP=0 \
 		--property=Restart=on-failure --property=RestartForceExitStatus=133 \
 		--property=SuccessExitStatus=133 \
 		--property=DevicePolicy=closed \
@@ -241,6 +246,11 @@ start)
 		--keep-unit --capability=all --system-call-filter='@keyring bpf' --private-users=no \
 		--network-veth --resolv-conf=replace-uplink --timezone=off
 	ready
+	# PROVED, not assumed from the variable: a /tmp that cannot be shown to be on
+	# disk fails the build here rather than eighty steps later.
+	if ! answers sh -c 'fs=$(stat -f -c %T /tmp) && [ "$fs" != tmpfs ]'; then
+		fail "$machine's /tmp is not shown to be on the image's disk"
+	fi
 	;;
 stop)
 	stop

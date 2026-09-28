@@ -34,6 +34,7 @@ for last; do :; done
 case " $* " in
 *" -- test -d "*) grep -qxF -- "$last" "$FAKE/dirs" ; exit $? ;;
 *" -- /bin/true "* | *" -- getent hosts "*) exit 0 ;;
+*"stat -f -c %T /tmp"*) [ ! -f "$FAKE/tmpfs-tmp" ] ; exit $? ;;
 *" -- systemd-nspawn "*) echo active >"$FAKE/state"; echo 100 >"$FAKE/leader"; exit 0 ;;
 esac
 [ -f "$FAKE/status" ] && exit "$(cat "$FAKE/status")"
@@ -218,7 +219,7 @@ func TestTheNspawnDriverStartsItsOwnMachine(t *testing.T) {
 	calls := driverCalls(t, fake)
 	for _, want := range []string{"--unit=probe-nspawn.service", "--network-veth", "--resolv-conf=replace-uplink",
 		"--machine=probe", "--directory=/mnt/rootfs", "-- getent hosts archive.ubuntu.com",
-		"--keep-unit", "--property=DevicePolicy=closed",
+		"--keep-unit", "--property=DevicePolicy=closed", "--setenv=SYSTEMD_NSPAWN_TMPFS_TMP=0",
 		"iptables -w -I FORWARD -i ve-probe -m comment --comment billet-runner-images:probe -j ACCEPT"} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("start did not pass %q:\n%s", want, calls)
@@ -234,6 +235,14 @@ func TestTheNspawnDriverStartsItsOwnMachine(t *testing.T) {
 	}
 	if output, err := runDriver(t, fake, "start"); err == nil || !strings.Contains(output, "already running") {
 		t.Fatalf("a second start of a running machine answered %v:\n%s", err, output)
+	}
+
+	// A /tmp THAT IS A tmpfs IN THE MACHINE fails the start: the toolset's
+	// downloads outgrow it.
+	tmpfs := t.TempDir()
+	writeFake(t, tmpfs, "tmpfs-tmp", "")
+	if output, err := runDriver(t, tmpfs, "start"); err == nil || !strings.Contains(output, "/tmp is not shown") {
+		t.Fatalf("a machine whose /tmp is a tmpfs answered %v:\n%s", err, output)
 	}
 }
 
