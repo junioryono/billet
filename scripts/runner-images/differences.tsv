@@ -1,0 +1,12 @@
+# Everything billet's guest build does differently from GitHub's template, in one
+# place. One entry per line, tab-separated: action, step id (from plan.json), reason.
+#
+#   skip           the step does not run; the runner says so when it reaches it
+#   prepare:<name> the runner's prepare_<name> runs in the target just before the step
+#
+# A step id that is not in the plan, or a prepare the runner does not implement,
+# stops the build before anything runs: an entry that no longer names anything is
+# a pin bump to review, not a line to ignore.
+skip	inline:5943fe1a3eb3	Azure's agent deprovisions the VM for capture; a billet guest is not an Azure VM and carries no waagent
+prepare:waagent-conf	configure-environment.sh	Ubuntu's generic cloud image has no /etc/waagent.conf, and the script edits it unconditionally under bash -e; an empty file lets the rest of the script run, and the Azure resource-disk settings it writes are read by nothing
+prepare:build-user	install-homebrew.sh	GitHub runs this step as Packer's unprivileged SSH user, because Homebrew refuses to install as root; billet runs it as runner, created here with GitHub's uid and passwordless sudo

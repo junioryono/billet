@@ -422,6 +422,9 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		// Read only by the jobs that always run.
 		{"actions/stickydisk/action.yml", "none"},
 		{"scripts/install.sh", "none"},
+		{"scripts/run-runner-images.sh", "none"},
+		{"scripts/runner-images/differences.tsv", "none"},
+		{"scripts/runner-images/upstream/images/ubuntu/scripts/build/install-git.sh", "none"},
 		{"scripts/ci_scope_test.go", "lint"},
 		// What drives the jobs, and the module graph: everything.
 		{".github/workflows/ci.yml", "all"},
