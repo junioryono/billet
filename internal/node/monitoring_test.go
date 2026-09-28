@@ -62,7 +62,7 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	root := t.TempDir()
 	p := &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, root: root}
 	a, host := newAllocatorWithHost(t)
-	monitor := usage.NewMonitor(root, usage.Options{Interval: time.Second})
+	monitor := runningMonitor(t, root)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithMonitor(monitor))
 
 	lease := assignedLease(t, a)
@@ -105,7 +105,7 @@ func TestAJobThatCannotBeMeasuredStillRunsAndStops(t *testing.T) {
 		targetErr: errors.New("no cgroup")}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil,
-		WithMonitor(usage.NewMonitor(root, usage.Options{Interval: time.Second})))
+		WithMonitor(runningMonitor(t, root)))
 
 	lease := assignedLease(t, a)
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
@@ -124,4 +124,24 @@ func TestTheSeriesCodecsAgree(t *testing.T) {
 	if usage.SeriesCodec != alloc.UsageSeriesCodec {
 		t.Fatalf("usage writes codec %d and the ledger accepts %d", usage.SeriesCodec, alloc.UsageSeriesCodec)
 	}
+}
+
+// runningMonitor is a sampler serving requests, as cmd/billet runs one, stopped
+// when the test ends.
+func runningMonitor(t *testing.T, root string) *usage.Monitor {
+	t.Helper()
+
+	m := usage.NewMonitor(root, usage.Options{Interval: time.Hour})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	return m
 }

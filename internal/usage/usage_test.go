@@ -261,7 +261,7 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	tr.write(raplZone+"/energy_uj", "38419855704\n")
 
 	now := time.Date(2026, 9, 25, 22, 50, 0, 0, time.UTC)
-	m := NewMonitor(tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: 73.5,
+	m := runMonitor(t, tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: 73.5,
 		Now: func() time.Time { return now }})
 	m.Tick()
 	m.Start("vm", target, 8)
@@ -304,7 +304,7 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 func TestALostReadKeepsTheLastMeasurement(t *testing.T) {
 	tr, target := referenceVM(t)
 	now := time.Now()
-	m := NewMonitor(tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
 	m.Start("vm", target, 8)
 	tr.remove(refCgroup + "/cpu.stat")
 	now = now.Add(time.Second)

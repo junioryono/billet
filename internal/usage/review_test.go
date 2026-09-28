@@ -32,7 +32,7 @@ func newEnergyHost(t *testing.T, idleWatts float64) energyHost {
 	tr.write(raplZone+"/energy_uj", "38419855704\n")
 	now := time.Date(2026, 9, 25, 22, 50, 0, 0, time.UTC)
 	h := energyHost{tr: tr, target: target, now: &now}
-	h.m = NewMonitor(tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: idleWatts,
+	h.m = runMonitor(t, tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: idleWatts,
 		Now: func() time.Time { return *h.now }})
 	h.m.Tick()
 
@@ -147,7 +147,7 @@ func TestASecondPackageRefusesEnergy(t *testing.T) {
 // a replacement VMM with the same vCPU thread names.
 func TestAReusedPidIsNotReadAsTheJobsThreads(t *testing.T) {
 	tr, target := referenceVM(t)
-	h := NewMonitor(tr.root, Options{Interval: time.Second})
+	h := runMonitor(t, tr.root, Options{Interval: time.Second})
 	h.Start("vm", target, 8)
 
 	reborn := strings.Replace(refThreads["315359"], " 298947558 ", " 398947558 ", 1)
@@ -195,7 +195,7 @@ func stuckTarget(t *testing.T, tr tree, target Target) (Target, string) {
 
 // waitForReader waits until something has the FIFO open for reading, which is
 // when a non-blocking open for writing stops failing, and returns that writer
-// held open so the reader stays blocked in read.
+// held open so the reader stays blocked in read. The caller must close it.
 func waitForReader(t *testing.T, fifo string) *os.File {
 	t.Helper()
 
@@ -211,97 +211,78 @@ func waitForReader(t *testing.T, fifo string) *os.File {
 	return nil
 }
 
-// release lets the blocked reader finish and waits, bounded, for done.
-func release(t *testing.T, w *os.File, done <-chan struct{}) {
+// finalWithin asks for key's final summary and fails unless it comes within
+// about the limit.
+func finalWithin(t *testing.T, m *Monitor, key string) Summary {
 	t.Helper()
 
-	if _, err := w.WriteString("usage_usec 1\nuser_usec 1\nsystem_usec 0\n"); err != nil {
+	type answer struct {
+		s    Summary
+		ok   bool
+		took time.Duration
+	}
+	finished := make(chan answer, 1)
+	go func() {
+		begun := time.Now()
+		s, ok := m.Final(key)
+		finished <- answer{s, ok, time.Since(begun)}
+	}()
+	select {
+	case a := <-finished:
+		if !a.ok || a.took > testLimit+time.Second {
+			t.Errorf("Final(%s) answered %v after %s, want an answer within about %s", key, a.ok,
+				a.took, testLimit)
+		}
+		return a.s
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Final(%s) waited on a stuck sampler", key)
+	}
+
+	return Summary{}
+}
+
+// A SAMPLER STUCK ON A READ HOLDS UP NO TEARDOWN FOR LONGER THAN THE LIMIT.
+// First the sampler takes the stuck job's own Final and blocks reading it,
+// proved blocked in the FIFO before anything is asserted; then another job's
+// Final cannot reach the sampler at all. Both answer from what was already
+// known, and the sampler is released and proved to finish.
+func TestAStuckSamplerHoldsUpNoTeardownPastTheLimit(t *testing.T) {
+	tr, target := referenceVM(t)
+	m := runMonitor(t, tr.root, Options{Interval: time.Second})
+	m.Start("vm", target, 8)
+	fifo := stuckJob(t, tr, target, m)
+
+	stuckFinal := make(chan Summary, 1)
+	go func() { stuckFinal <- finalWithin(t, m, "stuck") }()
+	writer := waitForReader(t, fifo)
+	select {
+	case <-stuckFinal:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stuck job's own Final never answered")
+	}
+
+	if s := finalWithin(t, m, "vm"); s.Latest.CPUUsage != 62_338_613 {
+		t.Errorf("Final(vm) answered cpu %d, want the reading Start took", s.Latest.CPUUsage)
+	}
+
+	// Released, the sampler finishes the read it was stuck in and serves again.
+	if _, err := writer.WriteString("usage_usec 1\nuser_usec 1\nsystem_usec 0\n"); err != nil {
 		t.Errorf("write the fifo: %v", err)
 	}
-	if err := w.Close(); err != nil {
+	if err := writer.Close(); err != nil {
 		t.Errorf("close the fifo: %v", err)
 	}
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Error("the blocked reader never finished")
-	}
-}
-
-// A SLOW READ OF ONE JOB DOES NOT HOLD UP ANOTHER JOB'S FINAL SAMPLE, which
-// sits on the teardown path. The tick is proved blocked in the FIFO's read
-// before Final is called.
-func TestAStuckReadDoesNotHoldUpAnotherJobsFinalSample(t *testing.T) {
-	tr, target := referenceVM(t)
-	stuck, fifo := stuckTarget(t, tr, target)
-
-	m := NewMonitor(tr.root, Options{Interval: time.Second})
-	m.Start("vm", target, 8)
-	m.mu.Lock()
-	m.jobs["stuck"] = &job{target: stuck, first: time.Now()}
-	m.mu.Unlock()
-
-	ticked := make(chan struct{})
+	m.Forget("stuck")
+	served := make(chan struct{})
 	go func() {
-		defer close(ticked)
+		defer close(served)
 		m.Tick()
 	}()
-	writer := waitForReader(t, fifo)
-	defer release(t, writer, ticked)
-
-	finished := make(chan Summary, 1)
-	go func() {
-		s, _ := m.Final("vm")
-		finished <- s
-	}()
 	select {
-	case s := <-finished:
-		if !s.Measured.CPU || s.Latest.CPUUsage != 62_338_613 {
-			t.Errorf("Final answered %+v, want the vm's own reading", s.Latest)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Final waited on another job's stuck read")
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the released sampler never served again")
 	}
-}
-
-// AND A STUCK READ OF THE JOB'S OWN COUNTERS HOLDS UP ITS TEARDOWN FOR AT MOST
-// lifecycleReadLimit: Final answers with what it already had.
-func TestAJobsOwnStuckReadDoesNotHoldUpItsFinalSample(t *testing.T) {
-	tr, target := referenceVM(t)
-	m := NewMonitor(tr.root, Options{Interval: time.Second})
-	m.Start("vm", target, 8)
-	stuck, fifo := stuckTarget(t, tr, target)
-	m.mu.Lock()
-	m.jobs["vm"].target = stuck
-	m.mu.Unlock()
-
-	finished := make(chan Summary, 1)
-	begun := time.Now()
-	go func() {
-		s, _ := m.Final("vm")
-		finished <- s
-	}()
-	writer := waitForReader(t, fifo)
-	select {
-	case s := <-finished:
-		if took := time.Since(begun); took > lifecycleReadLimit+2*time.Second {
-			t.Errorf("Final took %s", took)
-		}
-		if s.Latest.CPUUsage != 62_338_613 {
-			t.Errorf("cpu = %d, want the reading Start took", s.Latest.CPUUsage)
-		}
-	case <-time.After(lifecycleReadLimit + 5*time.Second):
-		t.Fatal("Final waited on its own job's stuck read")
-	}
-	// The abandoned read finishes once released; nothing waits for it.
-	release(t, writer, closedChannel())
-}
-
-func closedChannel() <-chan struct{} {
-	c := make(chan struct{})
-	close(c)
-
-	return c
 }
 
 func encodedRaw(t *testing.T, raw []byte) []byte {
@@ -363,17 +344,29 @@ func TestAHostileSeriesIsRefused(t *testing.T) {
 	// is refused by the byte bound. Measured after compressing, so the budget is
 	// the decoder's own: allocating per point here would be ~50 MiB.
 	many := uint64(4 * maxDecodedPoints)
-	overCount := encodedRaw(t, append(header(many), make([]byte, many*uint64(len(SeriesColumns)))...))
-	shortBytes := encodedRaw(t, append(header(1000), make([]byte, 100)...))
-	for name, data := range map[string][]byte{"too many points": overCount, "too few bytes": shortBytes} {
+	for _, tc := range []struct {
+		name   string
+		data   []byte
+		budget uint64
+	}{
+		// Every byte the count needs is there, so only the point bound refuses it.
+		{"too many points", encodedRaw(t, append(header(many),
+			make([]byte, many*uint64(len(SeriesColumns)))...)), 32 << 20},
+		// Within the point bound, far short of its bytes, so only the byte bound
+		// refuses it before allocating ~10 MiB of points.
+		{"too few bytes", encodedRaw(t, append(header(maxDecodedPoints-1), make([]byte, 100)...)),
+			2 << 20},
+	} {
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
-		if _, err := DecodeSeries(data); err == nil {
-			t.Errorf("%s: decoded", name)
-		}
+		_, err := DecodeSeries(tc.data)
 		runtime.ReadMemStats(&after)
-		if grew := after.TotalAlloc - before.TotalAlloc; grew > 32<<20 {
-			t.Errorf("%s: refusing it allocated %d MiB", name, grew>>20)
+		if err == nil {
+			t.Errorf("%s: decoded", tc.name)
+		}
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > tc.budget {
+			t.Errorf("%s: refusing it allocated %d KiB, over its %d KiB budget", tc.name, grew>>10,
+				tc.budget>>10)
 		}
 	}
 
