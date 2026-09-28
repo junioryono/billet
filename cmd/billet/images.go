@@ -1138,15 +1138,25 @@ func checkRootFilesystem(body string, disk config.ByteSize) string {
 	if disk <= 0 {
 		return ""
 	}
-	_, after, found := strings.Cut(body, "rootfs=")
-	if !found {
-		return "the guest did not report its root filesystem's size"
+	// THE LINE ITSELF, and only one: a substring would take the value from any
+	// field whose name ends in rootfs.
+	var values []string
+	for _, line := range strings.Split(body, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "rootfs="); ok {
+			values = append(values, strings.TrimSpace(value))
+		}
 	}
-	value, _, _ := strings.Cut(after, "\n")
-	size, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	switch len(values) {
+	case 0:
+		return "the guest did not report its root filesystem's size"
+	case 1:
+	default:
+		return fmt.Sprintf("the guest reported its root filesystem's size %d times", len(values))
+	}
+	value := values[0]
+	size, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return fmt.Sprintf("the guest's root filesystem size %q is not a number of bytes",
-			strings.TrimSpace(value))
+		return fmt.Sprintf("the guest's root filesystem size %q is not a number of bytes", value)
 	}
 	if want := int64(disk) / 100 * (100 - rootfsSlack); size < want {
 		return fmt.Sprintf("the root filesystem the guest booted is %s, not the %s the launch "+

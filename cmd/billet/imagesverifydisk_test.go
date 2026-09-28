@@ -43,8 +43,10 @@ func TestTheProbeDiskIsWhatTheFleetGrowsTo(t *testing.T) {
 				config.ProviderFirecracker}, Disk: 120 * config.GiB}},
 			want: 120 * config.GiB,
 		},
-		"no tier names a disk":    {tiers: []config.Tier{firecracker(0)}, want: verifyDiskFallback},
-		"a node config, no tiers": {want: verifyDiskFallback},
+		// STATED, NOT READ FROM THE CONSTANT, so a fallback of zero (no grow at all
+		// on a node config) fails here.
+		"no tier names a disk":    {tiers: []config.Tier{firecracker(0)}, want: 80 * config.GiB},
+		"a node config, no tiers": {want: 80 * config.GiB},
 		"--disk wins": {
 			tiers:    []config.Tier{firecracker(160 * config.GiB)},
 			override: 50 * config.GiB,
@@ -100,6 +102,10 @@ func TestTheReportedRootFilesystemMustBeTheGrownOne(t *testing.T) {
 		"not grown":    {ungrown, "did not reach it"},
 		"not reported": {"", "did not report its root filesystem"},
 		"not a number": {"df: /: No such file", "is not a number of bytes"},
+		// ANOTHER FIELD ENDING IN rootfs IS NOT THE ROOT FILESYSTEM: only the
+		// line's own value counts.
+		"another field": {ungrown + "\nother_rootfs=" + grown, "did not reach it"},
+		"twice":         {grown + "\nrootfs=" + grown, "2 times"},
 	} {
 		err := checkGuestReport(report(tc.rootfs), "probe-secret", disk)
 		if err == nil || !strings.Contains(err.Error(), tc.clause) {
@@ -133,32 +139,42 @@ func TestTheReportIsJudgedAgainstTheGrownDisk(t *testing.T) {
 
 // THE COMMAND HANDS THE VERIFICATION THE FLEET'S SIZE. A structural test,
 // because cmdImagesVerify needs a real node to run: what it checks is that the
-// disk verifyGuestImage launches on is the one verifyDisk chose, so a later edit
-// cannot quietly verify on an ungrown disk again.
+// disk verifyGuestImage launches on is the one verifyDisk chose from the config
+// and --disk, assigned once and never replaced, so a later edit cannot quietly
+// verify on an ungrown disk again.
 func TestTheVerifyCommandLaunchesOnTheDiskItChose(t *testing.T) {
 	t.Parallel()
 
 	fn := findFunc(t, "cmdImagesVerify")
-	chosen, passed := false, false
+	assignments, chosen, passed := 0, false, false
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		switch n := node.(type) {
 		case *ast.AssignStmt:
-			if len(n.Lhs) == 1 && len(n.Rhs) == 1 && isIdent(n.Lhs[0], "disk") && isCallTo(n.Rhs[0], "verifyDisk") {
-				chosen = true
+			for i, lhs := range n.Lhs {
+				if !isIdent(lhs, "disk") {
+					continue
+				}
+				assignments++
+				if len(n.Rhs) != len(n.Lhs) {
+					continue
+				}
+				if call, ok := n.Rhs[i].(*ast.CallExpr); ok && isIdent(call.Fun, "verifyDisk") {
+					chosen = len(call.Args) == 2 && isIdent(call.Args[0], "cfg") &&
+						isIdent(call.Args[1], "override")
+				}
 			}
 		case *ast.CallExpr:
-			if isCallTo(n, "verifyGuestImage") {
-				for _, arg := range n.Args {
-					passed = passed || isIdent(arg, "disk")
-				}
+			if isCallTo(n, "verifyGuestImage") && len(n.Args) == 8 {
+				passed = isIdent(n.Args[6], "disk")
 			}
 		}
 
 		return true
 	})
-	if !chosen || !passed {
-		t.Fatalf("cmdImagesVerify chose its disk with verifyDisk: %v; passed it to "+
-			"verifyGuestImage: %v", chosen, passed)
+	if assignments != 1 || !chosen || !passed {
+		t.Fatalf("cmdImagesVerify assigned disk %d times, chose it as verifyDisk(cfg, override): %v, "+
+			"and passed it as verifyGuestImage's disk: %v; want once, true, true",
+			assignments, chosen, passed)
 	}
 }
 
@@ -174,18 +190,42 @@ func isCallTo(expr ast.Expr, name string) bool {
 	return ok && isIdent(call.Fun, name)
 }
 
-// launchRecorder records what a verification asks the backend to launch and
-// refuses it, so the verification ends at once; its Destroy finds nothing.
+// launchRecorder records what a verification asks the backend to launch. With
+// no report it refuses the launch, so the verification ends at once; with one,
+// it starts the probe and the guest posts that report. Its Destroy finds
+// nothing.
 type launchRecorder struct {
 	provider.Provider
 
 	launched []provider.Spec
+	report   string
+	reports  chan<- string
 }
 
 func (l *launchRecorder) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
 	l.launched = append(l.launched, spec)
+	if l.report == "" {
+		return nil, errors.New("refused by the test")
+	}
+	l.reports <- strings.ReplaceAll(l.report, "SECRET", spec.JITConfig)
 
-	return nil, errors.New("refused by the test")
+	return &provider.Instance{ID: spec.Name, Name: spec.Name, Running: true}, nil
+}
+
+// fakeGuestListener stands in for the bridge listener, handing the guest's
+// report channel to the backend that will post to it. Serial callers only: it
+// replaces listenGuestReport.
+func fakeGuestListener(t *testing.T, backend *launchRecorder) {
+	t.Helper()
+
+	listen := listenGuestReport
+	t.Cleanup(func() { listenGuestReport = listen })
+	listenGuestReport = func(_ context.Context, _ string, _ int, _ string, report chan<- string,
+	) (*http.Server, string, <-chan error, error) {
+		backend.reports = report
+
+		return &http.Server{ReadHeaderTimeout: time.Second}, "127.0.0.1:7719", nil, nil
+	}
 }
 
 func (l *launchRecorder) Destroy(context.Context, string) (provider.Teardown, error) {
@@ -196,14 +236,8 @@ func (l *launchRecorder) Destroy(context.Context, string) (provider.Teardown, er
 // takes, rather than only building a spec that says so. Serial: it replaces
 // listenGuestReport.
 func TestAVerificationLaunchesOnTheGrownDisk(t *testing.T) {
-	listen := listenGuestReport
-	t.Cleanup(func() { listenGuestReport = listen })
-	listenGuestReport = func(context.Context, string, int, string, chan<- string,
-	) (*http.Server, string, <-chan error, error) {
-		return &http.Server{ReadHeaderTimeout: time.Second}, "127.0.0.1:7719", nil, nil
-	}
-
 	backend := &launchRecorder{}
+	fakeGuestListener(t, backend)
 	err := verifyGuestImage(t.Context(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
 		120*config.GiB, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "did not launch") {
@@ -211,5 +245,25 @@ func TestAVerificationLaunchesOnTheGrownDisk(t *testing.T) {
 	}
 	if len(backend.launched) != 1 || backend.launched[0].Disk != 120*config.GiB {
 		t.Fatalf("launched %+v, want one probe on a 120GiB disk", backend.launched)
+	}
+}
+
+// A GUEST THAT BOOTED ON AN UNGROWN FILESYSTEM FAILS THE VERIFICATION, judged
+// against the disk the verification grew, through the whole of verifyGuestImage.
+// Serial: it replaces listenGuestReport.
+func TestAnUngrownGuestFailsTheVerification(t *testing.T) {
+	backend := &launchRecorder{report: strings.Join([]string{
+		"jit=SECRET", "whoami=runner", "runner=2.336.0",
+		"docker=29.1.3 storage=overlay2 cgroups=2",
+		"buildx=github.com/docker/buildx v0.33.0 7f91f038ac14",
+		"compose=2.40.3", "container=1",
+		"rootfs=" + strconv.FormatInt(int64(36*config.GiB), 10),
+	}, "\n")}
+	fakeGuestListener(t, backend)
+
+	err := verifyGuestImage(t.Context(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
+		120*config.GiB, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "did not reach it") {
+		t.Fatalf("verifyGuestImage = %v, want the ungrown filesystem refused", err)
 	}
 }
