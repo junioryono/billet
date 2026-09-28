@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,37 +74,48 @@ func TestTheGateAsksForTheGitHubCLI(t *testing.T) {
 	}
 }
 
-// AND THE BUILD INSTALLS IT, in its own package list, as a whole word: a
-// substring test would be satisfied by "github".
+// AND THE BUILD INSTALLS IT: GitHub's own install-github-cli.sh is a step of the
+// plan the guest build runs, and nothing billet carries skips it.
 func TestTheGuestBuildInstallsTheGitHubCLI(t *testing.T) {
 	t.Parallel()
 
-	source := readScriptFile(t, "build-guest-image.sh")
+	planInstalls(t, "install-github-cli.sh")
+}
 
-	start := strings.Index(source, "local billet_packages=(")
-	if start < 0 {
-		t.Fatal("build-guest-image.sh has no billet_packages list, so this test is reading the wrong script")
+// planInstalls holds that GitHub's plan runs the named installer and that no
+// entry in differences.tsv skips it, so the guest image carries what it installs.
+func planInstalls(t *testing.T, installer string) {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(runnerImagesDir, "plan.json"))
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	end := strings.Index(source[start:], "\n\t\t)")
-	if end < 0 {
-		t.Fatal("the billet_packages list is not closed where this test expects")
+	var plan []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		t.Fatal(err)
 	}
 
-	var packages []string
+	if !slices.ContainsFunc(plan, func(step struct {
+		ID string `json:"id"`
+	}) bool {
+		return step.ID == installer
+	}) {
+		t.Fatalf("GitHub's plan has no %s step, so the guest image does not install what it does", installer)
+	}
 
-	// A `#` STARTS A COMMENT WHEREVER IT IS, and bash hands nothing after it to
-	// apt: `python3-apt # gh` installs no gh. No package name contains one.
-	for line := range strings.SplitSeq(source[start+len("local billet_packages=("):start+end], "\n") {
-		if i := strings.Index(line, "#"); i >= 0 {
-			line = line[:i]
+	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for line := range strings.Lines(string(differences)) {
+		if fields := strings.Split(strings.TrimSuffix(line, "\n"), "\t"); len(fields) == 3 &&
+			fields[0] == "skip" && fields[1] == installer {
+			t.Errorf("differences.tsv skips %s, so the guest image lacks what it installs", installer)
 		}
-
-		packages = append(packages, strings.Fields(line)...)
-	}
-
-	if !slices.Contains(packages, "gh") {
-		t.Errorf("the guest build installs %v, without gh; GitHub's image carries the GitHub CLI and its "+
-			"declaration does not name it, so nothing else puts it on this one", packages)
 	}
 }

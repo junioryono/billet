@@ -4,80 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/runnerimages"
 )
-
-// TestTheBuildInstallsGitHubsDeclaredPackages drives the shell's own extraction
-// and compares it against the Go reader's.
-//
-// TWO LANGUAGES READ ONE FILE, and the entire point of vendoring it was that they
-// cannot disagree. A jq expression that sorted, dropped a group, or silently
-// produced nothing would leave the guest image and the AMI carrying different
-// package sets while both claimed to follow GitHub's declaration.
-func TestTheBuildInstallsGitHubsDeclaredPackages(t *testing.T) {
-	t.Parallel()
-
-	got := runToolsetPackages(t)
-
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	want := ts.AptPackages()
-
-	if len(got) != len(want) {
-		t.Fatalf("the shell extracts %d packages and the Go reader %d; they read the same "+
-			"file and must agree", len(got), len(want))
-	}
-
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("package %d is %q in the shell and %q in Go; ORDER matters, because it "+
-				"decides which package resolves a shared dependency first", i, got[i], want[i])
-		}
-	}
-}
-
-// TestTheExtractionKeepsUpstreamOrder is the property `jq unique` would break.
-//
-// jq's `unique` SORTS, so the obvious way to deduplicate turns three ordered
-// groups into one alphabetical list. That still installs every package, which is
-// why it would survive a test that only compared sets.
-func TestTheExtractionKeepsUpstreamOrder(t *testing.T) {
-	t.Parallel()
-
-	got := runToolsetPackages(t)
-
-	ts, err := runnerimages.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	vitalAt := slices.Index(got, ts.Apt.VitalPackages[0])
-	commonAt := slices.Index(got, ts.Apt.CommonPackages[0])
-	cmdAt := slices.Index(got, ts.Apt.CmdPackages[0])
-
-	if vitalAt < 0 || commonAt < 0 || cmdAt < 0 {
-		t.Fatalf("a group's first package is missing entirely: vital=%d common=%d cmd=%d",
-			vitalAt, commonAt, cmdAt)
-	}
-
-	if vitalAt >= commonAt || commonAt >= cmdAt {
-		t.Errorf("groups are emitted out of order: vital at %d, common at %d, cmd at %d. "+
-			"If this was `jq unique`, the list is alphabetical and every group boundary "+
-			"is gone", vitalAt, commonAt, cmdAt)
-	}
-
-	if slices.IsSorted(got) {
-		t.Error("the extracted list is fully sorted, which upstream's is not; something " +
-			"reordered it")
-	}
-}
 
 // TestTheDeclarationMustMatchItsPinBeforeAnythingIsBuilt covers the shell's own
 // digest check.
@@ -233,41 +164,6 @@ func dpkgArchFor(t *testing.T, arch string) string {
 	}
 
 	return string(out)
-}
-
-func runToolsetPackages(t *testing.T) []string {
-	t.Helper()
-
-	toolset, err := filepath.Abs(filepath.Join("..", "internal", "runnerimages",
-		"toolset-2404.json"))
-	if err != nil {
-		t.Fatalf("resolve the toolset: %v", err)
-	}
-
-	aliases, err := filepath.Abs(filepath.Join("..", "internal", "runnerimages",
-		"apt-aliases.json"))
-	if err != nil {
-		t.Fatalf("resolve the aliases: %v", err)
-	}
-
-	script := "#!/usr/bin/env bash\nset -euo pipefail\nTOOLSET_FILE=" + toolset + "\n" +
-		"APT_ALIASES=" + aliases + "\n" +
-		guestImageFunction(t, "toolset_packages") + "\ntoolset_packages\n"
-
-	out, err := runHarness(t, script)
-	if err != nil {
-		t.Fatalf("toolset_packages: %v\n%s", err, out)
-	}
-
-	var packages []string
-
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		if line != "" {
-			packages = append(packages, line)
-		}
-	}
-
-	return packages
 }
 
 func runHarness(t *testing.T, script string) (string, error) {

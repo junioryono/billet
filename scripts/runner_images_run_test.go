@@ -379,7 +379,7 @@ func TestTheImageEnvironmentIsGitHubsMadePlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := "SCRIPT_DIR=" + here + "\n" + scriptFunction(t, "build-guest-image.sh", "write_image_env") +
+	script := "SCRIPT_DIR=" + here + "\n" + guestImageFunction(t, "write_image_env") +
 		"\nset -euo pipefail\nwrite_image_env \"$1\"\n"
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", script, "bash", rootfs)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -465,8 +465,8 @@ func runRecovery(t *testing.T, fake string) (string, error) {
 		}
 	}
 	script := "SCRIPT_DIR=" + fake + "\nWORK=/var/tmp/billet-guest\n" +
-		scriptFunction(t, "build-guest-image.sh", "runner_images_machine") + "\n" +
-		scriptFunction(t, "build-guest-image.sh", "recover_runner_images") + "\n" +
+		guestImageFunction(t, "runner_images_machine") + "\n" +
+		guestImageFunction(t, "recover_runner_images") + "\n" +
 		// CALLED AS THE BUILD CALLS IT, as an if condition, where errexit does not
 		// reach inside the function and every failure must be returned.
 		"set -euo pipefail\nif ! recover_runner_images /var/tmp/billet-guest/rootfs; then exit 1; fi\n"
@@ -563,7 +563,7 @@ func TestRecoveryWithoutMachinectl(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		script := "SCRIPT_DIR=" + bin + "\n" + scriptFunction(t, "build-guest-image.sh", "recover_runner_images") + "\n" +
+		script := "SCRIPT_DIR=" + bin + "\n" + guestImageFunction(t, "recover_runner_images") + "\n" +
 			"set -euo pipefail\nrecover_runner_images /var/tmp/billet-guest/rootfs\n"
 		cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
 		cmd.Env = append(os.Environ(), "PATH="+bin)

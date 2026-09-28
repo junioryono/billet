@@ -117,7 +117,7 @@ func TestTheImageGateFailsOnWhatTheCheckFinds(t *testing.T) {
 }
 
 // THE BUILD RUNS AS ROOT UNDER ROOT'S HOME, before it does anything else. chroot
-// and debootstrap keep the caller's environment, so a HOME inherited from the
+// keeps the caller's environment, so a HOME inherited from the
 // machine running the build is where every installer's first-run state lands
 // inside the image; the export is the first command after the shell options, so
 // no spelling of either can precede it.
@@ -153,7 +153,7 @@ func TestTheBuildSetsRootsHomeBeforeAnythingElse(t *testing.T) {
 // AND THE OWNERSHIP PASS IS THE LAST THING DONE TO THE HOME. HOME=/root was not
 // enough: an image built with it still carried /home/runner/.config/NuGet owned
 // by root (2026-09-21, guest build from v0.12.3, refused by the gate), written
-// during the toolcache step by a writer that was not measured. Whatever writes
+// during an install step by a writer that was not measured. Whatever writes
 // there, a chown after every install step leaves the home the runner's, and the
 // gate proves it did.
 func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
@@ -170,18 +170,18 @@ func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
 	const pass = "\n\tchroot \"$rootfs\" chown -R runner:runner /home/runner\n"
 
 	last := strings.LastIndex(source, pass)
-	toolcache := strings.LastIndex(source, "\n\t\t\tbillet_install_toolcache\n")
+	build := strings.LastIndex(source, "\n\trun_runner_images_build \"$rootfs\"\n")
 	boot := strings.Index(source, `echo "=== 5/6 boot configuration ==="`)
 	filesystem := strings.Index(source, `echo "=== 6/6 filesystem ==="`)
 
-	if last < 0 || toolcache < 0 || boot < 0 || filesystem < 0 {
-		t.Fatalf("build-guest-image.sh lost a landmark: pass %d, toolcache %d, step 5 %d, step 6 %d",
-			last, toolcache, boot, filesystem)
+	if last < 0 || build < 0 || boot < 0 || filesystem < 0 {
+		t.Fatalf("build-guest-image.sh lost a landmark: pass %d, GitHub's build %d, step 5 %d, step 6 %d",
+			last, build, boot, filesystem)
 	}
 
-	if last < toolcache || last < boot || last > filesystem {
-		t.Errorf("the last ownership pass over /home/runner (offset %d) must come after the toolcache "+
-			"(%d) and step 5 (%d), and before step 6 (%d)", last, toolcache, boot, filesystem)
+	if last < build || last < boot || last > filesystem {
+		t.Errorf("the last ownership pass over /home/runner (offset %d) must come after GitHub's "+
+			"build (%d) and step 5 (%d), and before step 6 (%d)", last, build, boot, filesystem)
 	}
 }
 

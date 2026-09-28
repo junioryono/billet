@@ -3,7 +3,7 @@
 # WHY THIS EXISTS AT ALL. Every billet deployment needs the same microVM guest:
 # Ubuntu, Docker, the Actions runner, billet's agent. Nothing in it is specific to
 # an organisation. Having each operator build it means each of them needs root,
-# debootstrap and an hour, and each of them independently discovers that GitHub
+# a large machine and hours, and each of them independently discovers that GitHub
 # stops handing jobs to a runner more than thirty days past a release. Building it
 # once here makes that expiry one project's problem instead of everyone's.
 #
@@ -167,11 +167,10 @@ jobs:
           ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
 
-      # A HOSTED RUNNER HAS ABOUT 14 GB FREE and this build wants most of it: a
-      # debootstrapped tree, a 4 GB ext4 image on top of it, a kernel source tree
-      # and the compressed outputs. Removing toolchains this build will never use
-      # buys back more than twenty, and doing it FIRST means a disk-full failure
-      # cannot happen halfway through an hour-long build.
+      # THE BUILD WANTS MOST OF THE BUILDER'S DISK: an 80 GiB image file, a kernel
+      # source tree and the compressed outputs. Removing toolchains this build will
+      # never use buys back space, and doing it FIRST means a disk-full failure
+      # cannot happen halfway through a build that takes hours.
       - name: Reclaim runner disk
         run: |
           set -euo pipefail
@@ -229,7 +228,7 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            systemd-container xz-utils debootstrap e2fsprogs jq zstd unzip \
+            systemd-container xz-utils e2fsprogs jq zstd unzip \
             build-essential flex bison libelf-dev libssl-dev bc \
             dnsmasq
 

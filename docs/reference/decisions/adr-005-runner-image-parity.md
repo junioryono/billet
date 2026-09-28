@@ -1,5 +1,7 @@
 # ADR-005 — Parity with GitHub's runner image is a rebuild, not a copy
 
+For the Firecracker guest image this is superseded by [ADR-014](adr-014-guest-image-from-githubs-template.md): the guest is now GitHub's own build, run under systemd-nspawn. This record still governs the EC2 AMI, and its findings about the declaration, the toolcache and the architecture spellings still hold there.
+
 Status: accepted, and being implemented in stages. On the Firecracker guest: the apt set, every declared toolcache line, the five JDKs and the image environment have landed and are validated by a real build that boots. The EC2 AMI now builds from the same declaration and runs the same installers — one file, sourced by the guest build and carried to the builder — with the apt set validated by a real build and the toolcache not yet. The remaining heavyweight software has landed on neither.
 
 ## The question that started it

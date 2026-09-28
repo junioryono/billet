@@ -6,11 +6,12 @@ import (
 	"testing"
 )
 
-// THE SHARED INSTALLERS DEFINE EVERYTHING THE BUILD CALLS, and this sources the
-// file rather than reading it.
+// THE SHARED INSTALLERS DEFINE EVERYTHING THE EC2 BUILD CALLS, and this sources
+// the file rather than reading it.
 //
 // The four toolcache installers moved out of build-guest-image.sh so the EC2
-// backend runs the same code instead of a second hand-written copy. `bash -n`
+// backend ran the same code instead of a second hand-written copy; the guest
+// image now gets its toolcache from GitHub's own build, and EC2 still runs these. `bash -n`
 // proves each file parses; it says nothing about a function that moved and left
 // its caller behind, which is the failure mode of a move like this.
 func TestTheSharedToolcacheInstallersDefineWhatTheBuildCalls(t *testing.T) {
@@ -55,10 +56,9 @@ func TestTheSharedToolcacheInstallersDefineWhatTheBuildCalls(t *testing.T) {
 // NO FUNCTION IS DEFINED IN BOTH FILES, which is the property the move exists to
 // create.
 //
-// build-guest-image.sh sources the asset, so a name defined in both would be
-// silently shadowed by whichever came last — two copies that drift, which is
-// exactly what a second hand-written EC2 implementation would have been. The
-// failure would be invisible: the build keeps working, on one of the two copies.
+// A name defined in both is two copies that drift, which is exactly what a
+// second hand-written EC2 implementation would have been, and the failure is
+// invisible: each caller keeps working, on its own copy.
 func TestNoToolcacheFunctionIsDefinedTwice(t *testing.T) {
 	t.Parallel()
 
@@ -74,31 +74,6 @@ func TestNoToolcacheFunctionIsDefinedTwice(t *testing.T) {
 
 	if len(asset) == 0 {
 		t.Fatalf("%s defines no functions, so the check above cannot fail", toolcacheAssetPath)
-	}
-}
-
-// THE BUILD SOURCES THE ASSET, so the pair is one program.
-//
-// Without the dot, every installer is undefined at the call and the build dies
-// after debootstrap — late, expensive, and only on a real run.
-func TestTheBuildSourcesTheSharedInstallers(t *testing.T) {
-	t.Parallel()
-
-	source := readScriptFile(t, "build-guest-image.sh")
-
-	if !strings.Contains(source, `. "$SCRIPT_DIR/../internal/runnerimages/install-toolcache.sh"`) {
-		t.Fatal("build-guest-image.sh does not source the shared installers, so every " +
-			"toolcache function is undefined at its call site")
-	}
-
-	// AND BEFORE main, since main is where they are called from. A dot inside a
-	// function, or after main runs, defines them too late.
-	dot := strings.Index(source, `. "$SCRIPT_DIR/../internal/runnerimages/install-toolcache.sh"`)
-	mainAt := strings.Index(source, "\nmain() {")
-
-	if mainAt >= 0 && dot > mainAt {
-		t.Error("the shared installers are sourced after main is defined; they must be in " +
-			"scope before it runs")
 	}
 }
 
