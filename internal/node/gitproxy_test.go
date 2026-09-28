@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -107,11 +108,11 @@ func newGitUpstream(t *testing.T) *gitUpstream {
 			plain := body
 			if r.Header.Get("Content-Encoding") == "gzip" {
 				if reader, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
-					decoded, err := io.ReadAll(reader)
-					if err != nil {
-						t.Errorf("the fake github could not inflate a negotiation: %v", err)
+					if plain, err = io.ReadAll(reader); err != nil {
+						http.Error(w, "unreadable", http.StatusBadRequest)
+
+						return
 					}
-					plain = decoded
 				}
 			}
 			if bytes.Contains(plain, []byte("command=fetch")) || bytes.Contains(plain, []byte("want ")) {
@@ -473,11 +474,12 @@ func TestATierWithoutTheGitCacheIsForwarded(t *testing.T) {
 		"https://github.com/acme/api.git", "c"); err != nil {
 		t.Fatalf("clone: %v\n%s", err, output)
 	}
-	// NO DIRECTORY IS NO MIRROR, the answer this wants; any other read error is
-	// could not tell.
-	if entries, err := os.ReadDir(service.git.root); (err != nil && !errors.Is(err, os.ErrNotExist)) ||
-		len(entries) != 0 {
-		t.Fatalf("a tier without the git cache made a mirror: %v (%v)", entries, err)
+	entries, err := os.ReadDir(service.git.root)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read the mirror root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a tier without the git cache made a mirror: %v", entries)
 	}
 	if upstream.fetches.Load() != 1 {
 		t.Fatalf("github.com served %d fetches, want the client's own", upstream.fetches.Load())
@@ -753,7 +755,7 @@ func TestARenameIsFollowedOnlyForTheFetchItWasGivenTo(t *testing.T) {
 	g := newGitProxy(t.TempDir())
 	session := &cacheSession{trust: provider.TrustUntrusted}
 	old := gitRequest{session: session, owner: "acme", repo: "old", auth: "basic YQ=="}
-	resp := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+	resp := &gitAnswer{StatusCode: http.StatusMovedPermanently, Header: http.Header{
 		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
 	now := time.Now()
 	if _, ok := g.learnRename(old, resp, now, g.ask()); !ok {
@@ -811,7 +813,7 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 	for range 100 {
 		if raw, err := os.ReadFile(pidFile); err == nil && strings.TrimSpace(string(raw)) != "" {
 			if child, err = strconv.Atoi(strings.TrimSpace(string(raw))); err != nil {
-				t.Fatalf("the child wrote %q as its pid: %v", raw, err)
+				t.Fatalf("the child's pid %q: %v", raw, err)
 			}
 
 			break
@@ -822,10 +824,8 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 		t.Fatal("the child never started")
 	}
 	cancel()
-	// A cancelled command reports the signal that ended it; what this asserts
-	// is the child, below.
 	if err := cmd.Wait(); err == nil {
-		t.Log("the cancelled parent exited cleanly")
+		t.Fatal("a cancelled command exited cleanly")
 	}
 	for range 100 {
 		if syscall.Kill(child, 0) != nil {
@@ -834,7 +834,7 @@ func TestACancelledCommandEndsItsChildren(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if err := syscall.Kill(child, syscall.SIGKILL); err != nil {
-		t.Logf("could not kill the surviving child %d: %v", child, err)
+		t.Errorf("kill the surviving child: %v", err)
 	}
 	t.Fatal("the child outlived its cancelled parent")
 }
@@ -848,9 +848,9 @@ func TestARenameIsWithdrawnByALaterAnswer(t *testing.T) {
 	g := newGitProxy(t.TempDir())
 	session := &cacheSession{trust: provider.TrustUntrusted}
 	old := gitRequest{session: session, owner: "acme", repo: "old", auth: "basic YQ=="}
-	redirect := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+	redirect := &gitAnswer{StatusCode: http.StatusMovedPermanently, Header: http.Header{
 		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
-	refusal := &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}}
+	refusal := &gitAnswer{StatusCode: http.StatusNotFound, Header: http.Header{}}
 	now := time.Now()
 
 	older, learned, refused := g.ask(), g.ask(), g.ask()
@@ -886,7 +886,7 @@ func TestRenamesAreForgotten(t *testing.T) {
 
 	g := newGitProxy(t.TempDir())
 	session := &cacheSession{trust: provider.TrustUntrusted}
-	redirect := &http.Response{StatusCode: http.StatusMovedPermanently, Header: http.Header{
+	redirect := &gitAnswer{StatusCode: http.StatusMovedPermanently, Header: http.Header{
 		"Location": {g.upstream + "/acme/api.git/info/refs?service=git-upload-pack"}}}
 	now := time.Now()
 	for i := range 50 {
@@ -945,7 +945,7 @@ func newScriptedGitHub(t *testing.T) *scriptedGitHub {
 			http.Error(w, "scripted", answer.status)
 		default:
 			if _, err := w.Write([]byte("001e# service=git-upload-pack\n0000")); err != nil {
-				t.Errorf("the scripted github could not answer: %v", err)
+				return
 			}
 		}
 	}))
@@ -982,9 +982,9 @@ func advertiseErr(ctx context.Context, node *httptest.Server, token, repo string
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(io.Discard, resp.Body)
+	_, err = io.Copy(io.Discard, resp.Body)
 
-	return errors.Join(copyErr, resp.Body.Close())
+	return errors.Join(err, resp.Body.Close())
 }
 
 func scriptedNode(t *testing.T) (*CacheService, *scriptedGitHub, *httptest.Server, string) {

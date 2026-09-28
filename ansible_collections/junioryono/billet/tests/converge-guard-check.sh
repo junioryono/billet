@@ -1484,7 +1484,7 @@ plant_guard() {
 import hashlib, json, os, sys
 holder, exe, mode, ident, root = sys.argv[1:6]
 digest = hashlib.sha256(open(exe, "rb").read()).hexdigest()
-rec = {"holder": holder, "claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01",
+rec = {"holder": holder, "claimed_at": "2026-09-09T12:00:00Z", "hostname": "control-01",
        "release_executable": exe, "release_executable_sha256": digest}
 if mode != "legacy":
     rec["id"] = ident or "0123456789abcdef0123456789abcdef"

@@ -583,9 +583,11 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
 	// went back while the advertisement was still live.
 
+	// A PROVIDER THAT CANNOT READ GITHUB'S RECORD OF A RUN hands the listener no
+	// evidence, and every default-branch completion is could-not-tell.
 	var evidence RunEvidence
-	if e, ok := prov.(RunEvidence); ok {
-		evidence = e
+	if reader, ok := prov.(RunEvidence); ok {
+		evidence = reader
 	}
 	opts := append(s.listenerOpts(prov), WithCachePublication(t.EffectiveCache(), evidence))
 

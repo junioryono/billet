@@ -66,6 +66,7 @@ func runHostedGate(t *testing.T, root string) string {
 var hostedExtras = []string{
 	"postgres", "action archive cache", "ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE",
 	"USE_BAZEL_FALLBACK_VERSION", "firewall bundle", "Copilot CLI",
+	"AZURE_EXTENSION_DIR", "GOROOT_",
 }
 
 // hostedDamage are ways an entry can be present and still unusable, each with
@@ -147,6 +148,14 @@ func hostedImage(t *testing.T, skip string) string {
 
 	if skip != "USE_BAZEL_FALLBACK_VERSION" {
 		env += "USE_BAZEL_FALLBACK_VERSION=silent:9.1.1\n"
+	}
+
+	if skip != "AZURE_EXTENSION_DIR" {
+		env += "AZURE_EXTENSION_DIR=/opt/az/azcliextensions\n"
+	}
+
+	if skip != "GOROOT_" {
+		env += "GOROOT_1_24_X64=/opt/hostedtoolcache/go/1.24.13/x64\n"
 	}
 
 	writeFile(t, filepath.Join(root, "etc", "billet-image-env"), env, 0o644)
@@ -243,8 +252,9 @@ func TestTheHostedToolsAreInstalledAndGated(t *testing.T) {
 
 	hosted := guestImageFunction(t, "install_hosted_tools")
 	for _, step := range []string{"install_hosted_packages", "install_github_cli", "install_hosted_binaries", "install_aws_tools",
+		"install_cloud_clis",
 		"install_hosted_php_tools", "install_bazelisk", "install_action_cache", "install_agentic_tools",
-		"install_hosted_environment"} {
+		"install_hosted_environment", "open_hosted_permissions"} {
 		if !hasExactLine(hosted, "\t"+step) {
 			t.Errorf("install_hosted_tools does not call %s", step)
 		}
@@ -284,5 +294,96 @@ func TestADigestOfTheWrongShapeIsRefused(t *testing.T) {
 		if !tc.ok && err == nil {
 			t.Errorf("billet_tc_hex accepted %q", tc.value)
 		}
+	}
+}
+
+// GITHUB'S IMAGE HAS `go` ON PATH with no setup-go step, linked from the
+// declared default line; a job that ran `go build` here exited 127
+// (2026-09-25). The links point at the TARGET's toolcache path, so they resolve
+// inside the image, and a line with nothing to link is refused.
+func TestTheDefaultGoIsLinkedOntoPathInsideTheImage(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	tc := filepath.Join(root, "opt", "hostedtoolcache")
+	bin := filepath.Join(tc, "go", "1.24.13", "x64", "bin")
+
+	for _, name := range []string{"go", "gofmt"} {
+		writeFile(t, filepath.Join(bin, name), "#!/bin/sh\n", 0o755)
+	}
+
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	script := "#!/usr/bin/env bash\nset -euo pipefail\n" + guestImageFunction(t, "link_go_default") +
+		"\nlink_go_default \"$1\" \"$2\"\n"
+
+	path := filepath.Join(t.TempDir(), "link.sh")
+	if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(bare string) ([]byte, error) {
+		cmd := exec.CommandContext(t.Context(), "bash", path, tc, bare)
+		cmd.Env = append(os.Environ(), "BILLET_TC_ROOT="+root, "BILLET_TC_ARCH=x64",
+			"BILLET_TC_IN_TARGET=/opt/hostedtoolcache")
+
+		return cmd.CombinedOutput()
+	}
+
+	if out, err := run("1.24.13"); err != nil {
+		t.Fatalf("link_go_default: %v\n%s", err, out)
+	}
+
+	for _, name := range []string{"go", "gofmt"} {
+		target, err := os.Readlink(filepath.Join(root, "usr", "bin", name))
+		if err != nil {
+			t.Fatalf("/usr/bin/%s is not a link: %v", name, err)
+		}
+
+		if want := "/opt/hostedtoolcache/go/1.24.13/x64/bin/" + name; target != want {
+			t.Errorf("/usr/bin/%s -> %s, want %s (the target's path, not the build host's)", name, target, want)
+		}
+	}
+
+	if out, err := run("1.99.0"); err == nil {
+		t.Errorf("link_go_default linked a line with no binaries and succeeded:\n%s", out)
+	}
+}
+
+// A SUMS FILE IN BINARY MODE IS STILL A SUMS FILE. git-lfs writes
+// `<sum> *<file>`, and a raw `$2 == f` lookup read that as "no published
+// checksum" and failed the whole image build (guest-image.yml, 2026-09-25). The
+// installer reads every sums file through billet_tc_sum, which takes both
+// spellings.
+func TestEveryHostedToolReadsItsSumsThroughTheOneReader(t *testing.T) {
+	t.Parallel()
+
+	sum := guestImageFunction(t, "billet_tc_sum")
+	digest := strings.Repeat("e", 64)
+
+	for name, sums := range map[string]string{
+		"text mode":   digest + "  git-lfs-linux-amd64-v3.8.0.tar.gz\n",
+		"binary mode": "-----BEGIN PGP SIGNED MESSAGE-----\n\n" + digest + " *git-lfs-linux-amd64-v3.8.0.tar.gz\n",
+	} {
+		script := "#!/usr/bin/env bash\nset -euo pipefail\n" + sum +
+			"\nbillet_tc_sum \"$1\" git-lfs-linux-amd64-v3.8.0.tar.gz\n"
+
+		path := filepath.Join(t.TempDir(), "sum.sh")
+		if err := forkSafeWriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		out, err := exec.CommandContext(t.Context(), "bash", path, sums).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(out)) != digest {
+			t.Errorf("%s: billet_tc_sum answered %q (%v), want the digest", name, out, err)
+		}
+	}
+
+	// billet_tc_sum's own comparison is the only one the installer may hold.
+	if n := strings.Count(readScriptFile(t, toolcacheAssetPath), "$2 == f"); n != 1 {
+		t.Errorf("install-toolcache.sh compares a sums file's second field %d times; "+
+			"read every sums file through billet_tc_sum, which accepts binary-mode lines", n)
 	}
 }

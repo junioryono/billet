@@ -35,7 +35,6 @@ make check     # the pre-commit gate
 | `make host-upgrade-order unit-parity …` | the Ansible scenario tests (`make help` lists them) | no; CI runs them |
 | `make dist` | build the release artifacts exactly as a tag would | no |
 | `make package-lifecycle`, `make restore-rehearsal`, `make postgres-restore-rehearsal`, `make systemd-lifecycle` | the real-package rehearsals | no; CI runs the first three |
-| `make acceptance` | an isolated deployment against a real AWS account and a real GitHub App; billable | no; a weekly workflow runs it |
 
 A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Do not push work that has not passed `make check`, and expect CI to catch the rest.
 

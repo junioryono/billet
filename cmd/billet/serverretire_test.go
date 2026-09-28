@@ -43,7 +43,7 @@ func newRetireFixture(t *testing.T) *retireFixture {
 	// Bound, as a pair's ledger is once a controller has claimed it: the
 	// dry run associates a row with this host through the binding.
 	statusPlane(t, f.stateDir, func(db *state.DB) {
-		_, err := db.ClaimController(t.Context(), "billet-control-01", id)
+		_, err := db.ClaimController(t.Context(), "control-01", id)
 		mustOK(t, err)
 	})
 

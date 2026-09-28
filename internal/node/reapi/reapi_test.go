@@ -222,14 +222,14 @@ func TestABlobThatDoesNotMatchItsDigestIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A SEND AFTER THE SERVER HAS REFUSED IS io.EOF, and the refusal itself is
-	// what CloseAndRecv reports below.
-	for _, req := range []*bspb.WriteRequest{
+	// A SEND'S OWN ERROR IS THE SERVER'S REFUSAL ARRIVING EARLY; CloseAndRecv
+	// reports it either way.
+	for _, part := range []*bspb.WriteRequest{
 		{ResourceName: resource, Data: []byte("the real ")},
 		{WriteOffset: 10, Data: []byte("object"), FinishWrite: true},
 	} {
-		if err := stream.Send(req); err != nil && !errors.Is(err, io.EOF) {
-			t.Fatalf("send: %v", err)
+		if err := stream.Send(part); err != nil {
+			break
 		}
 	}
 	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.InvalidArgument {

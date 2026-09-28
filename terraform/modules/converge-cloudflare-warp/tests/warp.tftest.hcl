@@ -13,7 +13,7 @@ mock_provider "cloudflare" {}
 variables {
   account_id     = "0123456789abcdef0123456789abcdef"
   team_name      = "example"
-  host_addresses = ["100.96.0.14", "10.60.0.10"]
+  host_addresses = ["100.96.0.20", "10.60.0.10"]
   precedence     = 3
 }
 
@@ -117,7 +117,7 @@ run "the_gateway_rule_admits_exactly_the_fleet" {
   # permanent diff; asserted as the whole string so an appended range or a
   # dropped host fails.
   assert {
-    condition     = cloudflare_zero_trust_gateway_policy.allow.traffic == "net.dst.ip in {100.96.0.14 10.60.0.10}"
+    condition     = cloudflare_zero_trust_gateway_policy.allow.traffic == "net.dst.ip in {100.96.0.20 10.60.0.10}"
     error_message = "the Gateway rule must name exactly the given hosts as bare addresses"
   }
 
@@ -151,7 +151,7 @@ run "refuses_a_prefixed_address" {
   command = plan
 
   variables {
-    host_addresses = ["100.96.0.14/32"]
+    host_addresses = ["100.96.0.20/32"]
   }
 
   expect_failures = [var.host_addresses]

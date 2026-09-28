@@ -266,7 +266,7 @@ func (s *CacheService) cloneWithin(
 	if !ok {
 		return volume, false, nil
 	}
-	size, known := sizeIfKnown(ctx, sizer, volume)
+	size, known := s.volumeSize(ctx, sizer, key, volume)
 	if !known || size <= ceiling {
 		return volume, false, nil
 	}
@@ -284,6 +284,22 @@ func (s *CacheService) cloneWithin(
 		"key", key, "generation", volume.Generation, "size", size, "ceiling", ceiling)
 
 	return storecontract.Volume{}, true, nil
+}
+
+// volumeSize is how large a clone is, when the store can say. One it cannot
+// size is used as it is, as a store with no sizer's always is.
+func (s *CacheService) volumeSize(
+	ctx context.Context, sizer storecontract.VolumeSizer, key string, volume storecontract.Volume,
+) (int64, bool) {
+	size, err := sizer.SizeOf(ctx, volume)
+	if err != nil {
+		s.log.Warn("could not read a cache generation's size; using it",
+			"key", key, "generation", volume.Generation, "error", err)
+
+		return 0, false
+	}
+
+	return size, true
 }
 
 // kindAllowed asks the kill switch about one cache for a repository. Could not
@@ -370,8 +386,11 @@ func (s *CacheService) SettleCompleted(
 		return err
 	}
 
-	attachment, stillDocker, err := s.awaitDockerReady(ctx, session)
-	if err != nil || !stillDocker {
+	attachment, err := s.awaitDockerReady(ctx, session)
+	if errors.Is(err, errNoDockerStore) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -383,12 +402,4 @@ func (s *CacheService) SettleCompleted(
 	}
 
 	return s.persistSession(session)
-}
-
-// sizeIfKnown is a clone's size, or false when the store could not say, which
-// cloneWithin reads as "keep it" rather than as a failure.
-func sizeIfKnown(ctx context.Context, sizer storecontract.VolumeSizer, volume storecontract.Volume) (int64, bool) {
-	size, err := sizer.SizeOf(ctx, volume)
-
-	return size, err == nil
 }

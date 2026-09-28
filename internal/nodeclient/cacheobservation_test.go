@@ -82,20 +82,22 @@ func (p *observationPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewEncoder(w).Encode(nodeapi.RegisterResponse{
 			Version: p.version, LeaseTTLSeconds: 60, PollSeconds: 30,
 		}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		return
 	}
 	var body map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "unreadable", http.StatusBadRequest)
 
 		return
 	}
 	p.bodies <- body
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte("{}")) //nolint:errcheck // the fake has no test to report to, and its client reports a short body
+	if _, err := w.Write([]byte("{}")); err != nil {
+		return
+	}
 }
 
 // THE BUILD CACHES GO ONLY TO A PLANE THAT KNOWS THEM. An older plane decodes

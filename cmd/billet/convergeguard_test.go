@@ -60,7 +60,7 @@ func newGuardFixture(t *testing.T) *guardFixture {
 	savedRandom := guardRandom
 	guardRandom = deterministicGuardRandom()
 	t.Cleanup(func() { guardRandom = savedRandom })
-	guardHostname = func() (string, error) { return "billet-control-01", nil }
+	guardHostname = func() (string, error) { return "control-01", nil }
 
 	t.Cleanup(func() {
 		upgradeRoot, installedBinary, guardNow, guardHostname = savedRoot, savedBinary, savedNow, savedHost
@@ -219,7 +219,7 @@ func TestAHoldPublishesTheRecordAndReleasesTheLock(t *testing.T) {
 
 	rec := f.record(t)
 
-	if rec.Holder != "ci-1" || rec.Hostname != "billet-control-01" || rec.ReleaseExecutable != f.binary ||
+	if rec.Holder != "ci-1" || rec.Hostname != "control-01" || rec.ReleaseExecutable != f.binary ||
 		rec.ReleaseExecutableSHA256 != f.binarySHA {
 		t.Errorf("the record is %+v", rec)
 	}
@@ -437,7 +437,7 @@ func TestGuardHelperProcess(t *testing.T) {
 
 	upgradeRoot = root
 	installedBinary = os.Getenv(guardHelperBinEnv)
-	guardHostname = func() (string, error) { return "billet-control-01", nil }
+	guardHostname = func() (string, error) { return "control-01", nil }
 
 	announce := func(line string) {
 		if _, err := fmt.Fprintln(os.Stdout, line); err != nil {
@@ -1326,7 +1326,7 @@ func TestStatusNamesEveryShapeWithoutLockingOrCreating(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"holder": "ci-1", "claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01",
+		"holder": "ci-1", "claimed_at": "2026-09-09T12:00:00Z", "hostname": "control-01",
 		"id": f.record(t).ID, "preparing": false, "stray_temporary": false,
 		"recovery_pointer": false, "release_executable": f.binary, "release_executable_sha256": f.binarySHA,
 		"release_executable_verified": true,

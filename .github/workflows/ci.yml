@@ -156,12 +156,14 @@ jobs:
       # allocator with concurrent scale-set listeners, and a data race in that
       # code double-admits jobs onto a machine that cannot hold them.
       - name: Test
-        # -timeout 20m IS PER PACKAGE, and internal/alloc needs it: under -race
+        # -timeout 35m IS PER PACKAGE, and internal/alloc needs it: under -race
         # and atomic coverage that package alone took 530s on main before
         # migration 49 added fourteen statements to every test ledger's open,
-        # against go test's default of 600s. The job's own timeout-minutes still
-        # bounds the whole run; this only stops one package that is legitimately
-        # slow from being reported as hung.
+        # against go test's default of 600s. It was 20m until cmd/billet crossed
+        # that on a loaded fleet runner twice on 2026-09-26 with no test hung
+        # (the ones running had run for seconds). The job's own timeout-minutes
+        # still bounds the whole run and stays above this, so a real hang is
+        # reported by go test with its goroutine dump rather than by a cancel.
         #
         # -json through jq so the log reads as it always did and the events
         # are kept for the ranking below: the run's floor is one package's
@@ -169,7 +171,7 @@ jobs:
         # than guessed at. `fromjson?` lets a build error's plain line through.
         run: |
           set -o pipefail
-          go test -race -count=1 -timeout 20m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
+          go test -race -count=1 -timeout 35m -vet=off -coverprofile=coverage.out -covermode=atomic -json ./... \
             | tee test-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 

@@ -415,8 +415,9 @@ func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for name := range f.pool {
-		if f.pool[name].LeaseID == leaseID {
-			return f.pool[name], nil
+		runner := f.pool[name]
+		if runner.LeaseID == leaseID {
+			return runner, nil
 		}
 	}
 	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +27,7 @@ import (
 // deviceVolumes is a mount manager that gives every device a directory of its
 // own and mounts it as a link, so two volumes really are two filesystems.
 type deviceVolumes struct {
+	t     *testing.T
 	mu    sync.Mutex
 	root  string
 	dirs  map[string]string
@@ -41,7 +41,7 @@ type deviceVolumes struct {
 func newDeviceVolumes(t *testing.T) *deviceVolumes {
 	t.Helper()
 
-	return &deviceVolumes{root: t.TempDir(), dirs: map[string]string{}, fresh: map[string]bool{}}
+	return &deviceVolumes{t: t, root: t.TempDir(), dirs: map[string]string{}, fresh: map[string]bool{}}
 }
 
 func (d *deviceVolumes) dir(device string) string {
@@ -52,7 +52,7 @@ func (d *deviceVolumes) dir(device string) string {
 	}
 	dir := filepath.Join(d.root, strings.ReplaceAll(device, "/", "_"))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		panic(fmt.Sprintf("the fixture could not make %s: %v", dir, err))
+		d.t.Errorf("make the directory standing in for %s: %v", device, err)
 	}
 	d.dirs[device] = dir
 
@@ -425,7 +425,9 @@ func TestAnUnauthorisedJobsCASWritesAreDiscarded(t *testing.T) {
 	if err := service.Close(t.Context(), instance); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	retryOnce(t, service)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 
 	if storage.published != 0 || storage.discarded != 1 {
 		t.Fatalf("published %d, discarded %d; want the clone discarded", storage.published,
@@ -451,7 +453,8 @@ func putObject(t *testing.T, service *CacheService, token, body string) int {
 	return casRequest(t, service, token, http.MethodPut, "/v1/cas/go/cas/"+digestOf(body), body).Code
 }
 
-// finish settles a job that succeeded with no cache authority.
+// finish completes the session's job with no authority, as a trusted pool's
+// completion is, and closes it.
 func finish(t *testing.T, service *CacheService, instance string) {
 	t.Helper()
 
@@ -623,7 +626,9 @@ func TestABlockDuringPublicationStopsIt(t *testing.T) {
 		t.Fatalf("PUT = %d", code)
 	}
 	finish(t, service, instance)
-	retryOnce(t, service)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 
 	if storage.snapshots != 1 || storage.published != 0 {
 		t.Fatalf("snapshots/publications = %d/%d, want the snapshot taken and nothing published",
@@ -664,7 +669,9 @@ func TestAFailedDiscardIsRetried(t *testing.T) {
 	if err := service.Close(t.Context(), instance); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	retryOnce(t, service)
+	if err := service.RetryClosed(t.Context()); err == nil {
+		t.Fatal("RetryClosed reported nothing of a discard that failed")
+	}
 	session := service.sessionOf(instance)
 	if session == nil || len(session.hosts) != 1 {
 		t.Fatal("a failed discard dropped the volume's record")
@@ -818,14 +825,4 @@ func gitCacheSpecForTest() *config.CacheSpec {
 	spec := config.Tier{Cache: &config.TierCache{Git: &config.CacheToggle{Enabled: &enabled}}}.EffectiveCache()
 
 	return &spec
-}
-
-// retryOnce runs one cleanup pass whose error the test does not judge: what it
-// asserts next is what the pass left, whichever way the pass went.
-func retryOnce(t *testing.T, service *CacheService) {
-	t.Helper()
-
-	if err := service.RetryClosed(t.Context()); err != nil {
-		t.Logf("the cleanup pass reported: %v", err)
-	}
 }

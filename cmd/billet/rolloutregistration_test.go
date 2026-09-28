@@ -43,7 +43,7 @@ func newRegLedger(t *testing.T, claim bool) *regLedger {
 
 	statusPlane(t, stateDir, func(db *state.DB) {
 		if claim {
-			if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+			if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 				t.Fatal(err)
 			}
 		}

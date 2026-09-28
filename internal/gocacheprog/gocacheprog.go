@@ -191,8 +191,8 @@ func (h *helper) get(ctx context.Context, req request, resp *response) {
 	resp.Miss = true
 }
 
-// answer reports a hit. An entry whose output id is not hex was validated
-// before it got here, so failing the decode is a corrupt entry and a miss.
+// answer fills resp from found, whose output every reader checked is a digest;
+// one that does not decode is a miss rather than a hit naming nothing.
 func answer(resp *response, found entry, path string) {
 	output, err := hex.DecodeString(found.output)
 	if err != nil {

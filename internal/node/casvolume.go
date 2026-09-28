@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -209,7 +208,12 @@ func (s *CacheService) serveCAS(
 
 		return
 	}
-	ctx, cancel := extendTransfer(ctx, w)
+	ctx, cancel, err := extendTransfer(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
 	defer cancel()
 
 	handle, err := s.openCASHandle(ctx, session, kind, r.Method == http.MethodPut)
@@ -261,21 +265,20 @@ func (s *CacheService) serveCAS(
 }
 
 // extendTransfer lets one cache transfer outlive the listener's read timeout,
-// which is sized for the small requests the rest of the API makes.
-//
-// A WRITER THAT CANNOT MOVE ITS DEADLINES keeps the listener's, which bounds
-// the transfer sooner and is not a reason to refuse it; the context bound
-// below holds either way.
-func extendTransfer(ctx context.Context, w http.ResponseWriter) (context.Context, context.CancelFunc) {
+// which is sized for the small requests the rest of the API makes. A writer
+// that cannot move its deadlines (a test's recorder) keeps them, bounded by the
+// context all the same; any other refusal is a connection already gone.
+func extendTransfer(ctx context.Context, w http.ResponseWriter) (context.Context, context.CancelFunc, error) {
 	controller := http.NewResponseController(w)
-	if err := controller.SetReadDeadline(time.Now().Add(casRequestLife)); err != nil {
-		slog.Debug("a cache transfer keeps the listener's read deadline", "error", err)
+	deadline := time.Now().Add(casRequestLife)
+	for _, extend := range []func(time.Time) error{controller.SetReadDeadline, controller.SetWriteDeadline} {
+		if err := extend(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return nil, nil, fmt.Errorf("extend the transfer's deadline: %w", err)
+		}
 	}
-	if err := controller.SetWriteDeadline(time.Now().Add(casRequestLife)); err != nil {
-		slog.Debug("a cache transfer keeps the listener's write deadline", "error", err)
-	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 
-	return context.WithTimeout(ctx, casRequestLife)
+	return ctx, cancel, nil
 }
 
 // casHandle is one admitted transfer's hold on a session's mounted volume: a
@@ -457,8 +460,6 @@ func (s *CacheService) storeCASObject(
 	if full, err := s.casFull(root); err != nil || full {
 		return reapi.ErrFull
 	}
-	// #nosec G703 -- path is the volume root joined with a table from a closed
-	// set and a digest validDigest proved is 64 lowercase hex characters.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("prepare the cache directory: %w", err)
 	}
@@ -470,7 +471,7 @@ func (s *CacheService) storeCASObject(
 
 	hash := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(temporary, hash),
-		io.LimitReader(contextReader{ctx: ctx, r: body}, limit+1))
+		io.LimitReader(stopWith(ctx, body), limit+1))
 	closeErr := temporary.Close()
 	switch {
 	case copyErr != nil:
@@ -483,7 +484,7 @@ func (s *CacheService) storeCASObject(
 		return reapi.ErrMismatch
 	}
 
-	return os.Rename(temporary.Name(), path) // #nosec G703 -- the path proved above
+	return os.Rename(temporary.Name(), path)
 }
 
 // casFull reports whether a volume has passed the fraction it may fill.
@@ -503,18 +504,20 @@ func filledAbove(root string, fraction float64) (bool, error) {
 	return (total-float64(stat.Bavail))/total > fraction, nil
 }
 
-// contextReader stops a copy when its context ends.
-type contextReader struct {
-	ctx context.Context //nolint:containedctx // an io.Reader's Read takes no context, so the copy's is carried to it
-	r   io.Reader
-}
+// readerFunc is a Read method.
+type readerFunc func([]byte) (int, error)
 
-func (c contextReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
-	return c.r.Read(p)
+// stopWith is r, stopping a copy when ctx ends.
+func stopWith(ctx context.Context, r io.Reader) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		return r.Read(p)
+	})
 }
 
 // releaseCASVolume unmounts a closed session's volume and publishes it when
@@ -796,7 +799,12 @@ type remoteAPISession struct{}
 func (s *CacheService) serveRemoteAPI(
 	ctx context.Context, w http.ResponseWriter, r *http.Request, session *cacheSession,
 ) {
-	ctx, cancel := extendTransfer(ctx, w)
+	ctx, cancel, err := extendTransfer(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
 	defer cancel()
 	s.remoteAPI.ServeHTTP(w, r.WithContext(context.WithValue(ctx, remoteAPISession{}, session)))
 }

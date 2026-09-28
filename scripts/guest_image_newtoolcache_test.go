@@ -215,6 +215,7 @@ if [ -n "$out" ]; then cat "$src" >"$out"; else cat "$src"; fi
 		guestImageFunction(t, "read_toolset_versions") + "\n" +
 		guestImageFunction(t, "fetch_verified") + "\n" +
 		guestImageFunction(t, "billet_tc_unpublished") + "\n" +
+		guestImageFunction(t, "billet_tc_sum") + "\n" +
 		guestImageFunction(t, fn) + "\n" +
 		call + "\n"
 

@@ -107,7 +107,7 @@ func TestTheRolloutStatusFixturesAreTheCommandsOwn(t *testing.T) {
 		"no-rollout": func(t *testing.T, stateDir, deployment string) {
 			t.Helper()
 			statusPlane(t, stateDir, func(db *state.DB) {
-				if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+				if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 					t.Fatal(err)
 				}
 
@@ -117,7 +117,7 @@ func TestTheRolloutStatusFixturesAreTheCommandsOwn(t *testing.T) {
 		"open-rollout": func(t *testing.T, stateDir, deployment string) {
 			t.Helper()
 			statusPlane(t, stateDir, func(db *state.DB) {
-				if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+				if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 					t.Fatal(err)
 				}
 
@@ -136,7 +136,7 @@ func TestTheRolloutStatusFixturesAreTheCommandsOwn(t *testing.T) {
 		"finished-rollout": func(t *testing.T, stateDir, deployment string) {
 			t.Helper()
 			statusPlane(t, stateDir, func(db *state.DB) {
-				if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+				if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 					t.Fatal(err)
 				}
 
@@ -163,14 +163,14 @@ func TestTheRolloutStatusFixturesAreTheCommandsOwn(t *testing.T) {
 		"retirement-reserved": func(t *testing.T, stateDir, deployment string) {
 			t.Helper()
 			statusPlane(t, stateDir, func(db *state.DB) {
-				if _, err := db.ClaimController(t.Context(), "billet-control-01", deployment); err != nil {
+				if _, err := db.ClaimController(t.Context(), "control-01", deployment); err != nil {
 					t.Fatal(err)
 				}
 
 				registerStatusNode(t, db, "node-a", "v0.9.4", statusDigestB, regIncarnationNew)
 
 				if _, _, err := db.ReserveRetirement(t.Context(), state.RetirementReservation{
-					Deployment: deployment, Retiring: "billet-control-01", Survivor: "billet-control-02",
+					Deployment: deployment, Retiring: "control-01", Survivor: "control-02",
 					Run: "ci-42", TransitionID: strings.Repeat("ab", 16),
 					At: time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
 				}); err != nil {

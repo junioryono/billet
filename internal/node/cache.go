@@ -1031,7 +1031,7 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A GIT FETCH AUTHENTICATES BY BASIC CREDENTIALS, which is all git sends to
 	// an origin it was rewritten to.
 	if strings.HasPrefix(r.URL.Path, gitPathPrefix) {
-		s.serveGit(w, r)
+		s.serveGit(r.Context(), w, r)
 
 		return
 	}
@@ -1269,8 +1269,11 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 		sessionPolicy(session) != config.CachePublishTrustedOnly {
 		return nil
 	}
-	attachment, docker, err := s.awaitDockerReady(ctx, session)
-	if err != nil || !docker {
+	attachment, err := s.awaitDockerReady(ctx, session)
+	if errors.Is(err, errNoDockerStore) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -1284,20 +1287,24 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	return s.publishDocker(ctx, session, attachment)
 }
 
+// errNoDockerStore is awaitDockerReady's answer for a session with no Docker
+// image store: there is nothing to settle.
+var errNoDockerStore = errors.New("this session has no Docker image store")
+
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
-// to prove it quiesced, returning the ready attachment. false says the session
-// has no Docker store, which is not an error.
+// to prove it quiesced, returning the ready attachment, or errNoDockerStore
+// when the session has none.
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
-) (*cacheAttachment, bool, error) {
+) (*cacheAttachment, error) {
 	if err := lockCacheSession(ctx, session); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	attachment := session.slots[0]
 	if attachment == nil || !attachment.Docker {
 		session.mu.Unlock()
 
-		return nil, false, nil
+		return nil, errNoDockerStore
 	}
 	if !attachment.Settling {
 		attachment.Settling = true
@@ -1306,7 +1313,7 @@ func (s *CacheService) awaitDockerReady(
 		if err := s.persistSession(session); err != nil {
 			session.mu.Unlock()
 
-			return nil, false, fmt.Errorf("open Docker image-store settlement: %w", err)
+			return nil, fmt.Errorf("open Docker image-store settlement: %w", err)
 		}
 	}
 	session.mu.Unlock()
@@ -1316,18 +1323,18 @@ func (s *CacheService) awaitDockerReady(
 
 	for {
 		if err := lockCacheSession(ctx, session); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		attachment := session.slots[0]
 		if attachment == nil || !attachment.Docker {
 			session.mu.Unlock()
 
-			return nil, false, nil
+			return nil, errNoDockerStore
 		}
 		ready := attachment.Ready
 		session.mu.Unlock()
 		if ready {
-			return attachment, true, nil
+			return attachment, nil
 		}
 
 		timer := time.NewTimer(100 * time.Millisecond)
@@ -1335,11 +1342,11 @@ func (s *CacheService) awaitDockerReady(
 		case <-ctx.Done():
 			timer.Stop()
 
-			return nil, false, ctx.Err()
+			return nil, ctx.Err()
 		case <-deadline.C:
 			timer.Stop()
 
-			return nil, false, errors.New("docker image store did not become ready before teardown")
+			return nil, errors.New("docker image store did not become ready before teardown")
 		case <-timer.C:
 		}
 	}

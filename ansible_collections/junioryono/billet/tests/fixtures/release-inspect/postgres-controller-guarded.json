@@ -174,7 +174,7 @@
     "converge_guard": {
       "claimed_at": "2026-09-10T12:00:00Z",
       "holder": "ci-1",
-      "hostname": "billet-control-01",
+      "hostname": "control-01",
       "recovery_pointer": false,
       "release_executable": "/usr/bin/billet",
       "release_executable_sha256": "abababababababababababababababababababababababababababababababab",

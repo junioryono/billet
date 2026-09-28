@@ -217,8 +217,6 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 	}
 
 	target := filepath.Join(s.stateDir, session.token+".json")
-	// #nosec G703 -- the token is randomCacheToken's hex, minted here, never a
-	// guest's string, so it names a file directly under stateDir.
 	if err := os.Rename(temporaryPath, target); err != nil {
 		return fmt.Errorf("node: install cache custody for %s: %w", session.instance, err)
 	}

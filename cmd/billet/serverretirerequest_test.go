@@ -80,7 +80,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 	db, err := state.OpenPostgres(t.Context(), identityDir, dsn)
 	mustOK(t, err)
 
-	_, err = db.ClaimController(t.Context(), "billet-control-01", id)
+	_, err = db.ClaimController(t.Context(), "control-01", id)
 	mustOK(t, err)
 	mustOK(t, db.Close())
 

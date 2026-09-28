@@ -81,12 +81,20 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 	return &probeLock{file: file}, nil
 }
 
-// release drops the lock. Closing the descriptor releases it, so this cannot leave
-// one held by a process that has exited.
+// release drops the lock.
+//
+// UNLOCKED BEFORE IT IS CLOSED. A flock belongs to the open file description, and
+// a child forked by any goroutine holds a copy of that description until its exec
+// closes it; closing only this descriptor inside that window leaves the lock held.
+// Measured 2026-09-26: TestASecondVerificationOnThisMachineIsRefused failed on CI
+// with "the lock stayed held after it was released" while parallel tests forked.
+// LOCK_UN releases the description's lock whoever else refers to it.
 func (l *probeLock) release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
 
-	return l.file.Close()
+	unlockErr := unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
+
+	return errors.Join(unlockErr, l.file.Close())
 }

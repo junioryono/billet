@@ -25,10 +25,9 @@ func (f *fakeRunEvidence) DefaultBranch(context.Context, string, string) (string
 	return f.branch, f.err
 }
 
-// completedPool starts job 11 on the runner launched for it with the given
-// identity and completes it, and returns what the runner was handed.
-func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence,
-) []CacheAuthority {
+// completedPool starts job 11 on the runner launched for it as a push to main
+// and completes it, and returns what the runner was handed.
+func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence) []CacheAuthority {
 	t.Helper()
 
 	started := Job{RequestID: 11, RunID: 101, JobID: "job-11", Owner: "acme", Repository: "api",

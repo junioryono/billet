@@ -37,7 +37,7 @@ module "converge" {
 
   account_id     = var.cloudflare_account_id
   team_name      = "example"               # the <team> in <team>.cloudflareaccess.com
-  host_addresses = ["100.96.0.14", "10.60.0.10"]
+  host_addresses = ["100.96.0.20", "10.60.0.10"]
   precedence     = 3                       # before your block rule for the private ranges
 }
 ```

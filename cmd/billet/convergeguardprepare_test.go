@@ -120,7 +120,7 @@ func capableAnswer() string {
 	return `id=$(sed -n 's/.*"id": *"\([0-9a-f]*\)".*/\1/p' "$(dirname "$(dirname "$0")")/active/` + guardRecordName +
 		`" 2>/dev/null | head -1); ` +
 		`printf '{"outcome": "reported", "shape": "converge-guard", "guard": {"id": "%s", "holder": "ci-1", ` +
-		`"claimed_at": "2026-09-09T12:00:00Z", "hostname": "billet-control-01", "preparing": true, ` +
+		`"claimed_at": "2026-09-09T12:00:00Z", "hostname": "control-01", "preparing": true, ` +
 		`"record": {"release_executable": "/usr/bin/billet", "release_executable_sha256": "` + strings.Repeat("ab", 32) +
 		`", "verified": true}, "pointer": false, "stray_temporary": false}, ` +
 		`"managed": {"path": "/usr/bin/billet", "present": true}}\n' "$id"`
@@ -202,7 +202,7 @@ func TestPrepareValidateAcquiresAndAnswers(t *testing.T) {
 		t.Errorf("pointer %v adopted %v on a fresh acquisition", o.boolean("pointer"), o.boolean("adopted"))
 	case o.record()["release_executable"] != f.binary || o.record()["release_executable_sha256"] != f.binarySHA:
 		t.Errorf("record %v", o.record())
-	case o.str("holder") != "ci-1" || o.str("claimed_at") != "2026-09-09T12:00:00Z" || o.str("hostname") != "billet-control-01":
+	case o.str("holder") != "ci-1" || o.str("claimed_at") != "2026-09-09T12:00:00Z" || o.str("hostname") != "control-01":
 		t.Errorf("answer %v", o.doc)
 	}
 
@@ -558,7 +558,7 @@ func TestPrepareContinuityAndAdoption(t *testing.T) {
 
 		// A record from before the protocol: the five members only.
 		body, err := json.MarshalIndent(map[string]any{
-			"holder": "ci-1", "claimed_at": "2026-09-09T11:00:00Z", "hostname": "billet-control-01",
+			"holder": "ci-1", "claimed_at": "2026-09-09T11:00:00Z", "hostname": "control-01",
 			"release_executable": f.binary, "release_executable_sha256": f.binarySHA,
 		}, "", "  ")
 		mustOK(t, err)
@@ -1675,7 +1675,7 @@ func TestTheGuardPrepareFixturesAreTheCommandsOwn(t *testing.T) {
 			managedScript(t, f, "v0.10.0")
 			mustHold(t, "ci-1")
 			body, err := json.MarshalIndent(map[string]any{
-				"holder": "ci-1", "claimed_at": "2026-09-09T11:00:00Z", "hostname": "billet-control-01",
+				"holder": "ci-1", "claimed_at": "2026-09-09T11:00:00Z", "hostname": "control-01",
 				"release_executable": f.binary, "release_executable_sha256": f.binarySHA,
 			}, "", "  ")
 			mustOK(t, err)

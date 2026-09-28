@@ -42,7 +42,7 @@ func (m *presentMatcher) Match(
 	return "", "", storecontract.ErrMiss
 }
 
-// refPrefix is where a ref's entries live under the Actions cache's version v1.
+// refPrefix is the key prefix of a v1 archive under ref.
 func refPrefix(ref string) string {
 	refDigest := sha256.Sum256([]byte(ref))
 	versionDigest := sha256.Sum256([]byte("v1"))

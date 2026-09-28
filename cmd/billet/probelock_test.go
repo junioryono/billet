@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // THE LOCK'S NAME IS BUILT OUT OF THE IDENTITY, SO THE IDENTITY IS CHECKED HERE.
@@ -156,6 +158,47 @@ func TestASecondVerificationOnThisMachineIsRefused(t *testing.T) {
 	after, err := takeProbeLock(dir, nodeDeployment)
 	if err != nil {
 		t.Fatalf("the lock stayed held after it was released: %v", err)
+	}
+
+	if err := after.release(); err != nil {
+		t.Errorf("release: %v", err)
+	}
+}
+
+// RELEASING THE LOCK RELEASES IT EVEN WHILE ANOTHER DESCRIPTOR SHARES IT.
+//
+// A child forked by a parallel goroutine holds a copy of the lock's open file
+// description until its exec closes it. The duplicate here stands in for that
+// child, deterministically: closing only the original left the flock held, which
+// is how the test above failed on CI (2026-09-26).
+func TestReleasingTheProbeLockReleasesItWhileADuplicateIsOpen(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	held, err := takeProbeLock(dir, nodeDeployment)
+	if err != nil {
+		t.Fatalf("take the lock: %v", err)
+	}
+
+	child, err := unix.Dup(int(held.file.Fd()))
+	if err != nil {
+		t.Fatalf("duplicate the lock's descriptor: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := unix.Close(child); err != nil {
+			t.Errorf("close the duplicate: %v", err)
+		}
+	})
+
+	if err := held.release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	after, err := takeProbeLock(dir, nodeDeployment)
+	if err != nil {
+		t.Fatalf("the lock stayed held by a descriptor that shares it: %v", err)
 	}
 
 	if err := after.release(); err != nil {
