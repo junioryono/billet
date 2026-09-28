@@ -533,29 +533,39 @@ runner_images_machine() {
 }
 
 # recover_runner_images stops every machine that may still hold this workspace's
-# filesystem: the name this workspace derives, the name recorded beside its lock
-# when a build last started one (so a change to the naming cannot hide a
-# survivor), and any registered machine whose root is this rootfs, whatever it
-# is called. It fails when any of them cannot be proved stopped.
+# filesystem: each registered machine whose root is this rootfs, through the unit
+# systemd says holds it, and this workspace's own machine, whose forwarding rules
+# only its own name removes. It fails when the machines cannot be listed, a
+# property cannot be read, or any of them cannot be proved stopped, because the
+# caller clears the workspace next. There is no record to trust: a machine is
+# found by what it holds, not by what a file says its name was.
 recover_runner_images() {
-	local rootfs="$1" names name root listed
-	names=$(runner_images_machine)
-	if [ -r "$WORK.machine" ]; then
-		names="$names $(cat "$WORK.machine")"
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed name root unit
+	# NO machinectl, NO MACHINE: it ships in the package with systemd-nspawn, so a
+	# host without it has never booted one.
+	command -v machinectl >/dev/null 2>&1 || return 0
+	if ! listed=$(machinectl list --no-legend --no-pager 2>&1); then
+		echo "could not list this host's machines: $listed" >&2
+		return 1
 	fi
-	if command -v machinectl >/dev/null 2>&1 &&
-		listed=$(machinectl list --no-legend --no-pager 2>/dev/null); then
-		for name in $(awk '{ print $1 }' <<<"$listed"); do
-			root=$(machinectl show --property=RootDirectory --value "$name" 2>/dev/null) || continue
-			[ "$root" = "$rootfs" ] && names="$names $name"
-		done
-	fi
-	for name in $names; do
-		if ! BILLET_RI_MACHINE="$name" BILLET_RI_ROOTFS="$rootfs" \
-			"$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+	for name in $(awk '{ print $1 }' <<<"$listed"); do
+		if ! root=$(machinectl show --property=RootDirectory --value "$name" 2>&1); then
+			# GONE SINCE THE LISTING is the one failure that means absence.
+			case "$root" in
+			*"No machine"*) continue ;;
+			esac
+			echo "could not read machine $name's root: $root" >&2
 			return 1
 		fi
+		[ "$root" = "$rootfs" ] || continue
+		if ! unit=$(machinectl show --property=Unit --value "$name" 2>&1); then
+			echo "could not read the unit holding machine $name: $unit" >&2
+			return 1
+		fi
+		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
+			return 1
 	done
+	BILLET_RI_MACHINE=$(runner_images_machine) BILLET_RI_ROOTFS="$rootfs" "$driver" stop
 }
 
 # install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
@@ -626,9 +636,6 @@ run_runner_images_build() {
 	# shipping that file would resolve through the builder's DNS wherever it runs.
 	cp -a "$rootfs/etc/resolv.conf" "$WORK/resolv.conf.image"
 
-	# RECORDED BEFORE IT STARTS, beside the lock and outside the workspace, so a
-	# later run finds this machine whatever it would call its own.
-	printf '%s\n' "$BILLET_RI_MACHINE" >"$WORK.machine"
 	RUNNER_IMAGES_BOOTED="$rootfs"
 	BILLET_RI_ROOTFS="$rootfs" "$driver" start
 

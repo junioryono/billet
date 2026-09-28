@@ -428,3 +428,106 @@ func TestAnUnreadableEnvironmentFailsTheStep(t *testing.T) {
 		t.Fatalf("the step ran without its environment:\n%s", steps)
 	}
 }
+
+// recoveryFakes stand in for machinectl and the driver for recover_runner_images:
+// machinectl lists $FAKE/list and answers each machine's properties from
+// $FAKE/<name>.root and $FAKE/<name>.unit (a missing root reads as gone), or
+// fails outright while $FAKE/broken names the verb; the driver records who it
+// was asked to stop and fails for a name listed in $FAKE/refuse.
+var recoveryFakes = map[string]string{
+	"machinectl": `#!/bin/sh
+if grep -qx "$1" "$FAKE/broken" 2>/dev/null; then echo "Failed to connect to bus" >&2; exit 1; fi
+case "$1" in
+list) cat "$FAKE/list" 2>/dev/null ;;
+show)
+	for last; do :; done
+	case "$*" in
+	*RootDirectory*) [ -f "$FAKE/$last.root" ] || { echo "No machine '$last' known" >&2; exit 1; }
+		cat "$FAKE/$last.root" ;;
+	*Unit*) cat "$FAKE/$last.unit" ;;
+	esac ;;
+esac
+`,
+	"runner-images-nspawn.sh": `#!/bin/sh
+echo "stop $BILLET_RI_MACHINE unit=${BILLET_RI_UNIT:-} root=$BILLET_RI_ROOTFS" >>"$FAKE/stops"
+! grep -qx "$BILLET_RI_MACHINE" "$FAKE/refuse" 2>/dev/null
+`,
+}
+
+func runRecovery(t *testing.T, fake string) (string, error) {
+	t.Helper()
+
+	for name, body := range recoveryFakes {
+		if err := forkSafeWriteFile(filepath.Join(fake, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := "SCRIPT_DIR=" + fake + "\nWORK=/var/tmp/billet-guest\n" +
+		scriptFunction(t, "build-guest-image.sh", "runner_images_machine") + "\n" +
+		scriptFunction(t, "build-guest-image.sh", "recover_runner_images") + "\n" +
+		"set -euo pipefail\nrecover_runner_images /var/tmp/billet-guest/rootfs\n"
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
+	cmd.Env = append(os.Environ(), "PATH="+fake+":"+os.Getenv("PATH"), "FAKE="+fake)
+	output, err := cmd.CombinedOutput()
+
+	return string(output), err
+}
+
+// RECOVERY STOPS WHAT HOLDS THIS WORKSPACE, by what it holds: a machine on this
+// rootfs is stopped through the unit systemd says holds it, one on another root
+// is left alone, one gone since the listing is skipped, and this workspace's own
+// machine is always asked.
+func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
+	t.Parallel()
+
+	fake := t.TempDir()
+	for name, body := range map[string]string{
+		"list": "old-survivor container systemd-nspawn ubuntu 24.04 -\n" +
+			"elsewhere container systemd-nspawn - - -\nvanished container - - - -\n",
+		"old-survivor.root": "/var/tmp/billet-guest/rootfs\n",
+		"old-survivor.unit": "machine-old-survivor.scope\n",
+		"elsewhere.root":    "/srv/other/rootfs\n",
+		"elsewhere.unit":    "elsewhere.service\n",
+	} {
+		writeFake(t, fake, name, body)
+	}
+	if output, err := runRecovery(t, fake); err != nil {
+		t.Fatalf("recovery: %v\n%s", err, output)
+	}
+	stops, err := os.ReadFile(filepath.Join(fake, "stops"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(stops)
+	if !strings.Contains(got, "stop old-survivor unit=machine-old-survivor.scope root=/var/tmp/billet-guest/rootfs\n") {
+		t.Errorf("the machine on this workspace was not stopped through its own unit:\n%s", got)
+	}
+	if strings.Contains(got, "elsewhere") || strings.Contains(got, "vanished") {
+		t.Errorf("recovery stopped a machine that does not hold this workspace:\n%s", got)
+	}
+	if !strings.Contains(got, "stop bri-") {
+		t.Errorf("this workspace's own machine was not asked:\n%s", got)
+	}
+}
+
+// RECOVERY THAT CANNOT SEE EVERYTHING REFUSES: a listing that fails, a property
+// that cannot be read, or a stop that cannot be proved each fail it, and the
+// caller then leaves the workspace alone.
+func TestRecoveryRefusesWhatItCannotSee(t *testing.T) {
+	t.Parallel()
+
+	for name, files := range map[string]map[string]string{
+		"the listing fails":     {"broken": "list\n"},
+		"a root cannot be read": {"list": "m container - - - -\n", "broken": "show\n"},
+		"a stop cannot be proved": {"list": "m container - - - -\n", "m.root": "/var/tmp/billet-guest/rootfs\n",
+			"m.unit": "m-nspawn.service\n", "refuse": "m\n"},
+	} {
+		fake := t.TempDir()
+		for file, body := range files {
+			writeFake(t, fake, file, body)
+		}
+		if output, err := runRecovery(t, fake); err == nil {
+			t.Errorf("%s: recovery succeeded:\n%s", name, output)
+		}
+	}
+}

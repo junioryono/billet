@@ -25,10 +25,13 @@
 #                       names its own, so two builds on one host never share one
 #   BILLET_RI_STOP_WAIT seconds a poweroff is given before the unit is stopped
 #                       (default: 120)
+#   BILLET_RI_UNIT      for stop: the unit systemd says holds the machine, when a
+#                       caller found it by asking rather than by this driver's
+#                       own naming (default: <machine>-nspawn.service)
 set -euo pipefail
 
 machine=${BILLET_RI_MACHINE:-billet-ri}
-unit=$machine-nspawn.service
+unit=${BILLET_RI_UNIT:-$machine-nspawn.service}
 # THE HOST SIDE OF THE MACHINE'S LINK, named by nspawn as ve-<machine> when that
 # fits an interface name (fifteen characters), which is why the name is bounded.
 link=ve-$machine
@@ -142,7 +145,8 @@ tagged() {
 
 # remove_forwarding deletes this machine's rules by the argument vectors it
 # inserted them with, as often as the listed ruleset still shows them, and proves
-# none is left: a ruleset it cannot read is not a ruleset without them.
+# none is left: a ruleset it cannot read is not a ruleset without them. (Only this
+# shape of rule was ever installed: no build ran before it.)
 remove_forwarding() {
 	command -v iptables >/dev/null 2>&1 || return 0
 	local rules attempt
@@ -153,6 +157,9 @@ remove_forwarding() {
 		iptables -w -D FORWARD -o "$link" -m conntrack --ctstate RELATED,ESTABLISHED \
 			-m comment --comment "$rule_tag" -j ACCEPT 2>/dev/null || true
 	done
+	# THE LAST REMOVAL IS READ BACK TOO, so success on the last attempt is success.
+	rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain after removing $machine's rules"
+	tagged "$rules" || return 0
 	fail "$machine's forwarding rules are still installed after $attempt removals"
 }
 
@@ -208,17 +215,17 @@ start)
 	# unit restarts it on exactly that status, as systemd-nspawn@.service does, and
 	# a poweroff (status 0) stays down.
 	#
-	# THE DEVICE POLICY systemd-nspawn@.service sets, which --keep-unit leaves to
-	# the unit: every capability and no user namespace would otherwise let the
-	# build make a block device node for the builder's own disk and open it.
+	# A CLOSED DEVICE POLICY, which --keep-unit leaves to the unit: with every
+	# capability and no user namespace, the build could otherwise make or mount a
+	# node for the builder's own disk and open it. Only the tun device and
+	# terminals are let through. systemd-nspawn@.service also allows loop and
+	# device-mapper block devices, for --image= and encrypted images; a directory
+	# boot needs neither, and those classes include the builder's own disks.
 	systemd-run --quiet --unit="$unit" --property=Delegate=yes \
 		--property=Restart=on-failure --property=RestartForceExitStatus=133 \
 		--property=SuccessExitStatus=133 \
 		--property=DevicePolicy=closed \
-		--property="DeviceAllow=/dev/net/tun rwm" --property="DeviceAllow=char-pts rw" \
-		--property="DeviceAllow=/dev/loop-control rw" --property="DeviceAllow=block-loop rw" \
-		--property="DeviceAllow=block-blkext rw" --property="DeviceAllow=/dev/mapper/control rw" \
-		--property="DeviceAllow=block-device-mapper rw" -- \
+		--property="DeviceAllow=/dev/net/tun rwm" --property="DeviceAllow=char-pts rw" -- \
 		systemd-nspawn --boot --quiet --machine="$machine" --directory="$BILLET_RI_ROOTFS" \
 		--keep-unit --capability=all --system-call-filter='@keyring bpf' --private-users=no \
 		--network-veth --resolv-conf=replace-uplink --timezone=off

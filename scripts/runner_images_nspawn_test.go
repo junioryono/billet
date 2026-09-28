@@ -23,7 +23,8 @@ import (
 //     cgroup.events the test writes under $FAKE/cgroup; a stop ends the unit and
 //     the machine unless $FAKE/stuck names stop.
 //   - iptables keeps its FORWARD rules in $FAKE/rules and lists a comment the way
-//     Ubuntu's iptables does, quoted when it holds a colon; -S fails while
+//     Ubuntu's iptables does, quoted when it holds a colon; -D removes the first
+//     matching rule only, as the real one does; -S fails while
 //     $FAKE/iptables-broken exists.
 //   - timeout drops its bounds and runs the command.
 var nspawnFakes = map[string]string{
@@ -67,7 +68,7 @@ case "$1" in
 	echo "-P FORWARD DROP"; cat "$FAKE/rules" 2>/dev/null ;;
 -I) shift; echo "-A $*" | sed 's/--comment \([^ ]*:[^ ]*\)/--comment "\1"/' >>"$FAKE/rules" ;;
 -D) shift; want=$(echo "-A $*" | sed 's/--comment \([^ ]*:[^ ]*\)/--comment "\1"/')
-	grep -vxF -- "$want" "$FAKE/rules" >"$FAKE/rules.new" || true
+	awk -v want="$want" '!done && $0 == want { done = 1; next } { print }' "$FAKE/rules" >"$FAKE/rules.new"
 	mv "$FAKE/rules.new" "$FAKE/rules" ;;
 esac
 exit 0
@@ -79,6 +80,12 @@ exec "$@"
 }
 
 func runDriver(t *testing.T, fake string, args ...string) (string, error) {
+	t.Helper()
+
+	return runDriverWith(t, fake, nil, args...)
+}
+
+func runDriverWith(t *testing.T, fake string, env []string, args ...string) (string, error) {
 	t.Helper()
 
 	bin := filepath.Join(fake, "bin")
@@ -94,6 +101,7 @@ func runDriver(t *testing.T, fake string, args ...string) (string, error) {
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE="+fake,
 		"BILLET_RI_ROOTFS=/mnt/rootfs", "BILLET_RI_MACHINE=probe", "BILLET_RI_STOP_WAIT=1",
 		"BILLET_RI_CGROUP_ROOT="+filepath.Join(fake, "cgroup"))
+	cmd.Env = append(cmd.Env, env...)
 	output, err := cmd.CombinedOutput()
 
 	return string(output), err
@@ -209,6 +217,11 @@ func TestTheNspawnDriverStartsItsOwnMachine(t *testing.T) {
 	if strings.Contains(calls, "/dev/fuse") {
 		t.Error("start binds /dev/fuse, which the guest kernel does not provide")
 	}
+	// NO BLOCK DEVICE CLASS IS ALLOWED: with every capability, a class is every
+	// disk of that kind on the builder.
+	if strings.Contains(calls, "DeviceAllow=block-") || strings.Contains(calls, "mapper") {
+		t.Errorf("start lets the machine open a block device class:\n%s", calls)
+	}
 	if output, err := runDriver(t, fake, "start"); err == nil || !strings.Contains(output, "already running") {
 		t.Fatalf("a second start of a running machine answered %v:\n%s", err, output)
 	}
@@ -263,6 +276,36 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 		if output, err := runDriver(t, populated, "stop"); err == nil || !strings.Contains(output, clause) {
 			t.Errorf("a failed launcher with cgroup.events %q answered %v:\n%s", events, err, output)
 		}
+	}
+
+	// EIGHT COPIES OF THE RULES take all eight removals, and the stop still
+	// succeeds because the chain is read back after the last one; nine do not.
+	for copies, clean := range map[int]bool{8: true, 9: false} {
+		duplicated := t.TempDir()
+		pair := "-A FORWARD -i ve-probe -m comment --comment \"billet-runner-images:probe\" -j ACCEPT\n" +
+			"-A FORWARD -o ve-probe -m conntrack --ctstate RELATED,ESTABLISHED -m comment " +
+			"--comment \"billet-runner-images:probe\" -j ACCEPT\n"
+		writeFake(t, duplicated, "rules", strings.Repeat(pair, copies))
+		output, err := runDriver(t, duplicated, "stop")
+		if clean && err != nil {
+			t.Errorf("%d copies of the rules: %v\n%s", copies, err, output)
+		}
+		if !clean && (err == nil || !strings.Contains(output, "still installed")) {
+			t.Errorf("%d copies of the rules answered %v:\n%s", copies, err, output)
+		}
+	}
+
+	// A UNIT NAMED BY THE CALLER is the one stopped: recovery finds a machine by
+	// what it holds and asks systemd which unit holds it.
+	named := t.TempDir()
+	writeFake(t, named, "state", "active\n")
+	writeFake(t, named, "leader", "100\n")
+	writeFake(t, named, "stuck", "poweroff\n")
+	if output, err := runDriverWith(t, named, []string{"BILLET_RI_UNIT=machine-probe.scope"}, "stop"); err != nil {
+		t.Fatalf("stop: %v\n%s", err, output)
+	}
+	if calls := driverCalls(t, named); !strings.Contains(calls, "systemctl stop machine-probe.scope\n") {
+		t.Errorf("stop did not stop the unit it was told holds the machine:\n%s", calls)
 	}
 
 	unknown := t.TempDir()
