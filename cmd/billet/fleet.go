@@ -153,7 +153,7 @@ func fetchFleetSource(ctx context.Context, root, ref string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("billet fleet converge: stage %s: %w", ref, err)
 	}
-	defer os.RemoveAll(staging) //nolint:errcheck // the staging copy is disposable; the rename below is what matters
+	defer os.RemoveAll(staging)
 
 	// `--` BEFORE THE URL: the ref is a checked vX.Y.Z and the URL a constant,
 	// but a leading dash in either must never reach git as an option.
@@ -251,7 +251,7 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(temp) //nolint:errcheck // cleanup.sh removed the secrets; this is the directory around them
+	defer os.RemoveAll(temp)
 
 	env := fleetBaseEnv(os.Environ())
 	basePath := env["PATH"]
@@ -301,7 +301,8 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 	// other step has a use for them.
 	step := func(name string, extra ...map[string]string) error {
 		stepEnv := mergeEnv(env, extra...)
-		cmd := exec.CommandContext(ctx, "bash", filepath.Join(actionPath, name))
+		// The script is one of fleetSteps, inside a checkout checkFleetSource proved.
+		cmd := exec.CommandContext(ctx, "bash", filepath.Join(actionPath, name)) //nolint:gosec // G204: a fixed step name in a verified checkout
 		cmd.Env = envList(stepEnv)
 		cmd.Stdin = nil
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -339,7 +340,7 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 		// a context of its own: the guard names this run, and a held guard stops
 		// the next converge and every rollout on those hosts.
 		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-		cmd := exec.CommandContext(finalCtx, "bash", filepath.Join(actionPath, name))
+		cmd := exec.CommandContext(finalCtx, "bash", filepath.Join(actionPath, name)) //nolint:gosec // G204: a fixed step name in a verified checkout
 		cmd.Env = envList(mergeEnv(env, inputs))
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 
