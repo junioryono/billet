@@ -114,9 +114,10 @@ func (p *Provider) checkResize2fs(required bool) error {
 func checkKVM() error {
 	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("%w: %w (a bare-metal host needs the kvm module loaded, and a virtual "+
-			"one needs nested virtualisation enabled; if the device is there, this process's "+
-			"account is probably not in the group that owns it)", ErrNoKVM, err)
+		return fmt.Errorf("%w: %w (a bare-metal host needs the CPU's virtualisation extension "+
+			"enabled in its firmware, Intel VT-x or AMD SVM, and the kvm_intel or kvm_amd module "+
+			"loaded; a virtual one needs nested virtualisation enabled; if the device is there, "+
+			"this process's account is probably not in the group that owns it)", ErrNoKVM, err)
 	}
 
 	return f.Close()
