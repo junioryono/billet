@@ -123,10 +123,25 @@ run() {
     BILLET_TEST_STAGED=
 }
 
+# ANSIBLE'S OWN INTERPRETER, which has PyYAML (fleet-playbook-check.sh makes
+# the same choice for the same reason).
+python=""
+if command -v ansible >/dev/null 2>&1; then
+    python=$(ansible --version 2>/dev/null | sed -n 's/.*python version.*(\(.*\)).*/\1/p' | head -n1)
+fi
+if [ -z "$python" ] || [ ! -x "$python" ]; then
+    python=$(command -v python3) || { echo "macos-node-check: no python3" >&2; exit 1; }
+fi
+
+# A SET-UP MAC: billet installed, a configuration the setup wrote, and a
+# running node, which is what docs/deploying/mac-tart.md leaves behind.
 fresh() {
     rm -rf "$work/root" "$work/state"
     mkdir -p "$work/root/etc/billet" "$work/state"
     chmod 0755 "$work/root/etc/billet"
+    printf 'node:\n  name: mac-1\n  provider: tart\n' >"$conf"
+    chmod 0600 "$conf"
+    : >"$work/state/running"
 }
 
 calls_are() {
@@ -135,76 +150,99 @@ calls_are() {
 }
 
 no_candidate() {
-    [ ! -e "$work/root/etc/billet/.billet.yaml.candidate" ] || { echo "FAIL: $1: the candidate was left behind" >&2; exit 1; }
+    for f in "$work/root/etc/billet"/.billet.yaml.candidate*; do
+        if [ -e "$f" ]; then echo "FAIL: $1: the candidate $f was left behind" >&2; exit 1; fi
+    done
+}
+
+# is_config <file> <max_vcpu or none>: the file is config-a (or config-b with
+# its max_vcpu) as a document, nested by two spaces, which is what the host
+# role's billet.yaml.j2 renders.
+is_config() {
+    if ! "$python" - "$1" "$2" <<'PY'
+import sys, yaml
+want = {"node": {"name": "mac-1", "server_addr": "10.0.0.1:7717", "provider": "tart"}}
+if sys.argv[2] != "none":
+    want["node"]["max_vcpu"] = int(sys.argv[2])
+text = open(sys.argv[1]).read()
+assert yaml.safe_load(text) == want, yaml.safe_load(text)
+assert "\n  name: mac-1\n" in text, text
+PY
+    then
+        echo "FAIL: $1 is not the rendered billet_config: $(cat "$1")" >&2; exit 1
+    fi
 }
 
 # 1. No billet_config: nothing asked of billet, nothing changed.
 fresh
+cp "$conf" "$work/before.yaml"
 run "no billet_config does nothing" pass --
 [ ! -s "$work/calls" ] || { echo "FAIL: a Mac with no billet_config called billet: $(cat "$work/calls")" >&2; exit 1; }
 [ "$(recap_changed_of "$work/out.log")" = 0 ] || { echo "FAIL: a Mac with no billet_config changed something" >&2; exit 1; }
-[ ! -e "$conf" ] || { echo "FAIL: a Mac with no billet_config was given one" >&2; exit 1; }
+cmp -s "$conf" "$work/before.yaml" || { echo "FAIL: a Mac with no billet_config had its configuration changed" >&2; exit 1; }
 
-# 2. A first configuration: checked as a candidate, installed 0600, brought up;
-#    nothing to drain, because no configuration was running.
+# 2. A Mac whose configuration is missing: nothing can tell whether a node is
+#    running from a file that was removed, so nothing is asked or written.
+rm -f "$conf"
+run "a missing configuration is refused" "cannot be told apart from a running node" -- -e "@$work/config-a.yml"
+[ ! -s "$work/calls" ] || { echo "FAIL: a missing configuration reached billet: $(cat "$work/calls")" >&2; exit 1; }
+[ ! -e "$conf" ] || { echo "FAIL: a missing configuration was written" >&2; exit 1; }
+
+# 3. The inventory's configuration over the setup's: checked as a candidate,
+#    drained against the setup's, installed 0600, brought up.
 fresh
-run "a first configuration is checked, installed and brought up" pass -- -e "@$work/config-a.yml"
-calls_are "billet check;billet local up;" "a first configuration"
-grep -q 'max_vcpu' "$conf" && { echo "FAIL: the first configuration is the wrong one" >&2; exit 1; }
-grep -q '^    name: mac-1$' "$conf" || { echo "FAIL: the configuration is not the rendered billet_config: $(cat "$conf")" >&2; exit 1; }
-cmp -s "$work/state/checked" "$conf" || { echo "FAIL: the check was not given the configuration that was installed" >&2; exit 1; }
-[ "$(stat -c %a "$conf" 2>/dev/null || stat -f %Lp "$conf")" = 600 ] || { echo "FAIL: the configuration is not 0600" >&2; exit 1; }
-no_candidate "a first configuration"
-
-# 3. The same configuration again: `local up` alone, and the run is changed=0.
-run "an unchanged configuration only brings the node up" pass -- -e "@$work/config-a.yml"
-calls_are "billet local up;" "an unchanged configuration"
-[ "$(recap_changed_of "$work/out.log")" = 0 ] || { echo "FAIL: an unchanged configuration was not changed=0" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
-
-# 4. A changed configuration: checked, then drained AGAINST THE OLD ONE, then
-#    replaced (the old one kept as a backup), then brought up on the new one.
 cp "$conf" "$work/old.yaml"
-run "a changed configuration drains, replaces and brings up" pass -- -e "@$work/config-b.yml"
+run "a changed configuration drains, replaces and brings up" pass -- -e "@$work/config-a.yml"
 calls_are "billet check;billet local down;billet local up;" "a changed configuration"
+is_config "$conf" none
+cmp -s "$work/state/checked" "$conf" || { echo "FAIL: the check was not given the configuration that was installed" >&2; exit 1; }
 cmp -s "$work/state/at-down" "$work/old.yaml" || { echo "FAIL: the drain did not run against the configuration the node was running" >&2; exit 1; }
-grep -q 'max_vcpu: 16' "$work/state/checked" || { echo "FAIL: the check did not see the new configuration" >&2; exit 1; }
-grep -q 'max_vcpu: 16' "$work/state/at-up" || { echo "FAIL: the node was brought up on the old configuration" >&2; exit 1; }
+cmp -s "$work/state/at-up" "$conf" || { echo "FAIL: the node was brought up on another configuration" >&2; exit 1; }
+[ "$(stat -c %a "$conf" 2>/dev/null || stat -f %Lp "$conf")" = 600 ] || { echo "FAIL: the configuration is not 0600" >&2; exit 1; }
 kept=false
 for f in "$work/root/etc/billet"/billet.yaml.*~; do
-    [ -f "$f" ] && cmp -s "$f" "$work/old.yaml" && kept=true
+    if [ -f "$f" ] && cmp -s "$f" "$work/old.yaml"; then kept=true; fi
 done
 [ "$kept" = true ] || { echo "FAIL: the previous configuration was not kept" >&2; ls -la "$work/root/etc/billet" >&2; exit 1; }
 no_candidate "a changed configuration"
 
+# 4. The same configuration again: `local up` alone, and the run is changed=0.
+run "an unchanged configuration only brings the node up" pass -- -e "@$work/config-a.yml"
+calls_are "billet local up;" "an unchanged configuration"
+[ "$(recap_changed_of "$work/out.log")" = 0 ] || { echo "FAIL: an unchanged configuration was not changed=0" >&2; sed -n '/PLAY RECAP/,$p' "$work/out.log" >&2; exit 1; }
+
 # 5. A candidate billet refuses: no drain, the configuration untouched.
 cp "$conf" "$work/before.yaml"
-run "a refused candidate drains nothing" "The node was not stopped" BILLET_FAKE_CHECK_RC=1 -- -e "@$work/config-a.yml"
+run "a refused candidate drains nothing" "The node was not stopped" BILLET_FAKE_CHECK_RC=1 -- -e "@$work/config-b.yml"
 calls_are "billet check;" "a refused candidate"
 cmp -s "$conf" "$work/before.yaml" || { echo "FAIL: a refused candidate changed the configuration" >&2; exit 1; }
 grep -q 'tart binary is not installed' "$work/out.log" || { echo "FAIL: the refusal did not quote the check" >&2; exit 1; }
 no_candidate "a refused candidate"
 
 # 6. A drain that fails: nothing replaced and nothing brought up.
-run "a failed drain replaces nothing" "is unchanged" BILLET_FAKE_DOWN_RC=1 -- -e "@$work/config-a.yml"
+run "a failed drain replaces nothing" "is unchanged" BILLET_FAKE_DOWN_RC=1 -- -e "@$work/config-b.yml"
 calls_are "billet check;billet local down;" "a failed drain"
 cmp -s "$conf" "$work/before.yaml" || { echo "FAIL: a failed drain was followed by a replacement" >&2; exit 1; }
+no_candidate "a failed drain"
 
-# 7. `local up` refusing after the replacement: the run fails and says where
-#    the previous configuration is.
-BILLET_TEST_STAGED=staged run "a node that does not come up is reported with the backup" "the previous configuration is at" \
-    BILLET_FAKE_UP_RC=1 -- -e "@$work/config-a.yml"
-calls_are "billet check;billet local down;billet local up;" "a node that did not come up"
-grep -q 'differs from its plist' "$work/out.log" || { echo "FAIL: the refusal did not quote local up" >&2; exit 1; }
-
-# 8. A dry run of a change: the diff, and billet is never asked anything.
-cp "$conf" "$work/before.yaml"
+# 7. A dry run of a change: the diff, and billet is never asked anything.
 run "a dry run diffs and runs nothing" pass -- --check -e "@$work/config-b.yml"
 [ ! -s "$work/calls" ] || { echo "FAIL: a dry run called billet: $(cat "$work/calls")" >&2; exit 1; }
 cmp -s "$conf" "$work/before.yaml" || { echo "FAIL: a dry run changed the configuration" >&2; exit 1; }
-grep -q '+    max_vcpu: 16' "$work/out.log" || { echo "FAIL: a dry run printed no diff" >&2; exit 1; }
+grep -q '^+  max_vcpu: 16$' "$work/out.log" || { echo "FAIL: a dry run printed no diff" >&2; exit 1; }
 grep -q 'runs `billet local down`' "$work/out.log" || { echo "FAIL: a dry run did not say a converge would drain" >&2; exit 1; }
 
+# 8. `local up` refusing after the replacement: the run fails, says where the
+#    previous configuration is, and does not claim the node is stopped.
+BILLET_TEST_STAGED=staged run "a node that does not come up is reported with the backup" "The previous configuration is at" \
+    BILLET_FAKE_UP_RC=1 -- -e "@$work/config-b.yml"
+calls_are "billet check;billet local down;billet local up;" "a node that did not come up"
+grep -q 'differs from its plist' "$work/out.log" || { echo "FAIL: the refusal did not quote local up" >&2; exit 1; }
+grep -q 'billet local status' "$work/out.log" || { echo "FAIL: the refusal did not name local status" >&2; exit 1; }
+is_config "$conf" 16
+
 # 9. Refusals before anything is asked of billet.
+fresh
 run "a host that is not a Mac is refused" "reports Linux" BILLET_TEST_PLATFORM=Linux -- -e "@$work/config-b.yml"
 [ ! -s "$work/calls" ] || { echo "FAIL: a Linux host reached billet" >&2; exit 1; }
 
@@ -215,5 +253,10 @@ chmod 0775 "$work/root/etc/billet"
 run "a configuration directory others can write is refused" "writable by its group or by others" -- -e "@$work/config-b.yml"
 [ ! -s "$work/calls" ] || { echo "FAIL: a writable directory reached billet" >&2; exit 1; }
 chmod 0755 "$work/root/etc/billet"
+
+chmod 0620 "$conf"
+run "a configuration others can write is refused" "writable by nobody else" -- -e "@$work/config-b.yml"
+[ ! -s "$work/calls" ] || { echo "FAIL: a writable configuration reached billet" >&2; exit 1; }
+chmod 0600 "$conf"
 
 echo "macos-node-check: every case behaved as the role requires"

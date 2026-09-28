@@ -98,23 +98,42 @@
          else 'writable by its group or by others'))) }}.
       Create it as docs/deploying/mac-tart.md does; nothing was changed.
 
+# A MISSING CONFIGURATION PROVES NOTHING ABOUT THE NODE: a running agent
+# survives the removal of the file it was started from, and replacing it
+# without a drain would leave that process running on a configuration no file
+# holds. The first configuration is the setup's (docs/deploying/mac-tart.md),
+# and every later one is this role's.
+- name: Refuse a Mac whose billet was never set up
+  ansible.builtin.assert:
+    that:
+      - billet_macos_node_config_stat.exists
+    fail_msg: >-
+      {{ billet_macos_node_config_path }} is absent on {{ inventory_hostname }}
+      beside an installed billet, which cannot be told apart from a running node
+      whose file was removed, so nothing here can decide whether a drain is due.
+      Set the Mac up as docs/deploying/mac-tart.md does (a configuration and one
+      `billet local up`), then converge again; nothing was changed.
+
+# WRITABLE BY NOBODY ELSE, or another account could change it between the
+# comparison and the install and the role would replace it without a drain.
 - name: Refuse a configuration that is not a plain file of the node account's
   ansible.builtin.assert:
     that:
       - billet_macos_node_config_stat.isreg | default(false)
       - billet_macos_node_config_stat.uid | default(-1) == (billet_macos_node_uid.stdout | trim | int)
+      - not billet_macos_node_config_stat.wgrp | default(false)
+      - not billet_macos_node_config_stat.woth | default(false)
     fail_msg: >-
-      {{ billet_macos_node_config_path }} exists and is not a regular file owned by
-      uid {{ billet_macos_node_uid.stdout | trim }}; the role replaces only a file
-      it could have written. Inspect it by hand; nothing was changed.
-  when: billet_macos_node_config_stat.exists
+      {{ billet_macos_node_config_path }} is not a regular file owned by uid
+      {{ billet_macos_node_uid.stdout | trim }} and writable by nobody else; the
+      role replaces only a file it could have written. Inspect it by hand;
+      nothing was changed.
 
 - name: Read the installed configuration
   ansible.builtin.slurp:
     src: "{{ billet_macos_node_config_path }}"
   register: billet_macos_node_installed
   check_mode: false
-  when: billet_macos_node_config_stat.exists
 
 # THE HOST ROLE'S RENDERING, byte for byte: templates/billet.yaml.j2 in the
 # host role is this one expression, and a template drops the newline after it.
@@ -122,21 +141,29 @@
   ansible.builtin.set_fact:
     billet_macos_node_rendered: "{{ billet_config | to_nice_yaml(indent=2, sort_keys=false) }}"
     billet_macos_node_changes: >-
-      {{ not billet_macos_node_config_stat.exists
-         or (billet_macos_node_installed.content | b64decode) != (billet_config | to_nice_yaml(indent=2, sort_keys=false)) }}
+      {{ (billet_macos_node_installed.content | b64decode) != (billet_config | to_nice_yaml(indent=2, sort_keys=false)) }}
 
 # THE CANDIDATE IS CHECKED BEFORE ANYTHING STOPS: a configuration billet
 # refuses must not cost a drain. Written beside the configuration as the node
-# account, removed whatever the check answered.
+# account under a name allocated for this run, and removed whatever the check
+# answered, never by a name the role did not create.
 - name: Check the candidate configuration
   when:
     - billet_macos_node_changes | bool
     - not ansible_check_mode
   block:
+    - name: Allocate the candidate configuration
+      ansible.builtin.tempfile:
+        path: "{{ billet_macos_node_config_path | dirname }}"
+        prefix: .billet.yaml.candidate.
+        state: file
+      register: billet_macos_node_candidate
+      changed_when: false
+
     - name: Write the candidate configuration
       ansible.builtin.copy:
         content: "{{ billet_macos_node_rendered }}"
-        dest: "{{ billet_macos_node_config_path | dirname }}/.billet.yaml.candidate"
+        dest: "{{ billet_macos_node_candidate.path }}"
         mode: "0600"
       changed_when: false
 
@@ -146,7 +173,7 @@
           - "{{ billet_macos_node_binary }}"
           - check
           - --config
-          - "{{ billet_macos_node_config_path | dirname }}/.billet.yaml.candidate"
+          - "{{ billet_macos_node_candidate.path }}"
       environment:
         PATH: "{{ billet_macos_node_path }}"
       async: "{{ billet_macos_node_check_timeout | int }}"
@@ -170,9 +197,10 @@
   always:
     - name: Remove the candidate configuration
       ansible.builtin.file:
-        path: "{{ billet_macos_node_config_path | dirname }}/.billet.yaml.candidate"
+        path: "{{ billet_macos_node_candidate.path }}"
         state: absent
       changed_when: false
+      when: billet_macos_node_candidate.path | default('') | length > 0
 
 - name: Report what a real converge would do
   ansible.builtin.debug:
@@ -202,7 +230,6 @@
   failed_when: false
   when:
     - billet_macos_node_changes | bool
-    - billet_macos_node_config_stat.exists
     - not ansible_check_mode
 
 - name: Refuse to replace the configuration of a node that did not stop
@@ -227,6 +254,7 @@
     mode: "0600"
     backup: true
   register: billet_macos_node_install
+  when: billet_macos_node_changes | bool
 
 - name: Start and prove the node
   ansible.builtin.command:
@@ -259,9 +287,9 @@
       ({{ 'exit ' ~ billet_macos_node_up.rc if billet_macos_node_up.rc is defined else billet_macos_node_up.msg | default('no answer') }}):
       {{ billet_macos_node_up.stdout | default('') | trim }}
       {{ billet_macos_node_up.stderr | default('') | trim }}
-      {{ ('The new configuration is installed and the node is stopped; '
-          ~ (('the previous configuration is at ' ~ billet_macos_node_install.backup_file ~ '. ') if billet_macos_node_install.backup_file | default('') | length > 0 else '')
-          ~ 'fix what is named above and run `billet local up` on the Mac, or converge again.')
+      {{ ('The new configuration is installed and the node was drained, and its start failed or was not confirmed: `billet local status` on the Mac says what is running. '
+          ~ (('The previous configuration is at ' ~ billet_macos_node_install.backup_file ~ '. ') if billet_macos_node_install.backup_file | default('') | length > 0 else '')
+          ~ 'Fix what is named above and run `billet local up` on the Mac, or converge again.')
          if billet_macos_node_install is changed
          else 'The configuration was not changed; fix what is named above and converge again.' }}
   when: not ansible_check_mode
