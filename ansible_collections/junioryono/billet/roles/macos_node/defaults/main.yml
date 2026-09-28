@@ -1,0 +1,29 @@
+---
+# THE MAC'S OWN PATHS, the ones `billet local up` reads on darwin
+# (initconfig.ServiceConfigPathFor and hostPathsFor in cmd/billet): the config
+# the launch agents pass as --config, and the binary the updater renames into.
+# Overridable for the role's own gate, which runs on Linux against fakes.
+billet_macos_node_config_path: /usr/local/etc/billet/billet.yaml
+billet_macos_node_binary: /usr/local/bin/billet
+
+# THE PATH THE LAUNCH AGENTS RUN WITH (deploy/sh.billet.node.plist), which
+# every command here runs with too: a non-login SSH session has no Homebrew
+# prefix, so a check run with the session's PATH would report tart missing on
+# a Mac whose node finds it, and one run with a richer PATH would pass a node
+# that cannot.
+billet_macos_node_path: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# The platform the role converges, from the gathered facts; the gate sets it
+# because it runs where the facts say Linux.
+billet_macos_node_platform: "{{ ansible_facts['system'] | default('') }}"
+
+# How long each command may take before the role stops waiting for it. The
+# check reads certificates and asks tart; `local up` proves each agent held its
+# process through a settle window. `local down` drains, and a drain waits for
+# every running job: 88200 seconds is the agents' own ExitTimeOut, so the bound
+# is that plus a margin, and a job that outlives it is still running when the
+# role gives up (the role then says so and changes nothing further).
+billet_macos_node_check_timeout: 300
+billet_macos_node_up_timeout: 900
+billet_macos_node_down_timeout: 90000
+billet_macos_node_poll: 10

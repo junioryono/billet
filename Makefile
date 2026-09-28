@@ -367,6 +367,10 @@ cloudflared-connector-check: ## Prove the cloudflared_connector role's refusals,
 warp-connector-check: ## Prove the warp_connector role enrols exactly on a missing registration and never over its own transport
 	ansible_collections/junioryono/billet/tests/warp-connector-check.sh
 
+.PHONY: macos-node-check
+macos-node-check: ## Prove the macos_node role checks a changed config, drains before replacing it, and calls nothing in a dry run
+	ansible_collections/junioryono/billet/tests/macos-node-check.sh
+
 .PHONY: fleet-playbook-check
 fleet-playbook-check: ## Prove the shipped fleet playbook's shape and that its converge guard fires before ssh_access
 	ansible_collections/junioryono/billet/tests/fleet-playbook-check.sh

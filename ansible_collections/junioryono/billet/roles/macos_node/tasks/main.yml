@@ -1,0 +1,37 @@
+---
+# Converge a Mac node's billet.yaml from the inventory, the way the host role
+# converges a Linux node's, and leave everything else about the Mac to
+# `billet local up`, which is the one thing that installs and proves its
+# launch agents.
+#
+# AS THE NODE'S OWN ACCOUNT, NEVER ROOT. The agents live in that account's GUI
+# domain, where the unlocked login keychain and tart's images are; nothing in
+# this role escalates, and a converge connecting as root is refused.
+#
+# THE BINARY IS NOT THIS ROLE'S. Rollouts move /usr/local/bin/billet through
+# sh.billet.upgrade, and the converge guard the fleet playbook holds for this
+# play is what keeps the two apart; a Mac with no billet installed is refused
+# with the install command, because a first install is an operator's act.
+#
+# A CHANGE IS A DRAIN. A changed configuration is checked as a candidate
+# first, then `billet local down` stops the node (which waits for every
+# running job), the file is replaced, and `billet local up` starts and proves
+# the agents again. An unchanged one runs `local up` alone, which starts
+# nothing already running and refuses, naming the fix, a loaded agent that
+# has drifted from its plist.
+#
+# WITHOUT billet_config THE ROLE DOES NOTHING, so the playbook's macOS play
+# converges an inventory that says nothing about the Mac exactly as before.
+
+- name: Note that no billet_config was given for this Mac
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} has no billet_config, so its billet.yaml is not
+      converged; the Mac keeps whatever {{ billet_macos_node_config_path }} holds.
+  when: billet_config is not defined or billet_config | length == 0
+
+- name: Converge the Mac node's configuration
+  ansible.builtin.include_tasks: converge.yml
+  when:
+    - billet_config is defined
+    - billet_config | length > 0
