@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -576,6 +577,9 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		"on success, mark this generation verified so `@verified` resolves to it")
 	allowUnpaired := fs.Bool("allow-unpaired", false,
 		"mark verified even when the kernel that proved it is not one billet manages")
+	diskFlag := fs.String("disk", "",
+		"grow the probe's root disk to this size before boot (default: the largest disk a "+
+			"firecracker tier asks for, else "+verifyDiskFallback.String()+")")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -614,6 +618,14 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return fmt.Errorf("billet images verify: this node's provider is %s, and only firecracker "+
 			"boots a guest image; run this on a machine that runs microVMs", cfg.Node.Provider)
 	}
+
+	var override config.ByteSize
+	if *diskFlag != "" {
+		if override, err = config.ParseByteSize(*diskFlag); err != nil || override <= 0 {
+			return fmt.Errorf("billet images verify: --disk %q is not a positive size", *diskFlag)
+		}
+	}
+	disk := verifyDisk(cfg, override)
 
 	// THE SAME DERIVATION `billet node` USES, rather than a second one that agrees
 	// with it by luck. The identity decides which jails this command can see, so a
@@ -687,7 +699,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	}
 
 	if err := verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge,
-		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, *wait); err != nil {
+		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait); err != nil {
 		return err
 	}
 
@@ -764,10 +776,42 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	return nil
 }
 
+// verifyDiskFallback is the probe's root disk when neither --disk nor a tier
+// names one: comfortably above the guest image's own filesystem, so the grow a
+// launch performs is a real one.
+const verifyDiskFallback = 80 * config.GiB
+
+// verifyDisk is the size the probe's root disk is grown to before boot.
+//
+// GROWN AS A LAUNCH GROWS IT, because verifying the image without the grow proved
+// nothing about the step every job takes first: generation g20260926055218 booted
+// and reported here, and then every launch on the fleet failed for about ninety
+// minutes, because resize2fs refused its superblock (#261). The size is the
+// largest any firecracker tier in this config asks for, since that is what the
+// fleet grows it to; a node config that carries no tiers, or tiers that name no
+// disk, gets the fallback, which is still a grow.
+func verifyDisk(cfg *config.Config, override config.ByteSize) config.ByteSize {
+	if override > 0 {
+		return override
+	}
+	var largest config.ByteSize
+	for i := range cfg.Tiers {
+		tier := &cfg.Tiers[i]
+		if tier.AcceptsProvider(config.ProviderFirecracker) && tier.Disk > largest {
+			largest = tier.Disk
+		}
+	}
+	if largest > 0 {
+		return largest
+	}
+
+	return verifyDiskFallback
+}
+
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
 func verifyGuestImage(
 	ctx context.Context, prov provider.Provider, bridge string, port int,
-	image, lease string, wait time.Duration,
+	image, lease string, disk config.ByteSize, wait time.Duration,
 ) error {
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
 	// Anything the host can check on its own was already green for an image that ran
@@ -781,7 +825,7 @@ func verifyGuestImage(
 		return err
 	}
 
-	srv, addr, serveErr, err := listenForGuestReport(ctx, bridge, port, secret, report)
+	srv, addr, serveErr, err := listenGuestReport(ctx, bridge, port, secret, report)
 	if err != nil {
 		return err
 	}
@@ -793,7 +837,34 @@ func verifyGuestImage(
 	}()
 
 	name := provider.InstanceName(lease)
+	spec := probeSpec(name, image, addr, secret, disk)
 
+	fmt.Printf("verifying %s on a root disk grown to %s\n", image, disk)
+
+	if _, err := prov.Launch(ctx, spec); err != nil {
+		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
+		// in as many words: a cancelled context can kill this process after the work
+		// was accepted, and the backend's own unwind can itself fail. So the probe is
+		// reconciled rather than assumed away — otherwise a failed verification is
+		// also a leaked uid, device name and cloned disk.
+		return errors.Join(
+			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
+			destroyProbe(ctx, prov, name),
+		)
+	}
+
+	verdict := awaitGuestReport(ctx, report, serveErr, image, secret, disk, wait)
+
+	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
+	// printed a line and returned success, so the weekly job would announce a
+	// verified image while probes accumulated — each holding a uid, a device name
+	// and a cloned disk, and each invisible to the node's sweep by design.
+	return errors.Join(verdict, destroyProbe(ctx, prov, name))
+}
+
+// probeSpec is the launch a verification makes: a trusted microVM whose command
+// reports on the guest to addr, on a root disk the launch grows to disk.
+func probeSpec(name, image, addr, secret string, disk config.ByteSize) provider.Spec {
 	// WHAT THE GUEST IS ASKED TO SAY, and each part answers a way the image can be
 	// broken while looking fine:
 	//
@@ -808,6 +879,8 @@ func verifyGuestImage(
 	//               predict, and a container actually ran
 	//   buildx      the CLI plugin required by billet's persistent builder exists
 	//   compose     the CLI plugin common multi-container workflows invoke exists
+	//   rootfs      the filesystem the guest booted is the one the launch grew,
+	//               which is the step every job takes before its first instruction
 	probe := strings.Join([]string{
 		`echo "whoami=$(whoami)"`,
 		`echo "jit=$ACTIONS_RUNNER_INPUT_JITCONFIG"`,
@@ -817,13 +890,15 @@ func verifyGuestImage(
 		`echo "buildx=$(docker buildx version 2>&1 | head -1)"`,
 		`echo "compose=$(docker compose version --short 2>&1 | head -1)"`,
 		`echo "container=$(docker run --rm hello-world 2>&1 | grep -ci 'working correctly' || echo 0)"`,
+		`echo "rootfs=$(df -B1 --output=size / 2>&1 | tail -1 | tr -d ' ')"`,
 	}, "; ")
 
-	spec := provider.Spec{
+	return provider.Spec{
 		Name:   name,
 		Image:  image,
 		VCPU:   2,
 		Memory: 2 * config.GiB,
+		Disk:   disk,
 		// RUN ONCE AND POSTED, rather than run for a console that does not exist and
 		// then run again to be sent: billet passes no console= to a guest, so the
 		// first copy's output went nowhere while doubling the time to report and
@@ -834,41 +909,19 @@ func verifyGuestImage(
 		Trust:     provider.TrustTrusted,
 		JITConfig: secret,
 	}
-
-	fmt.Printf("verifying %s\n", image)
-
-	if _, err := prov.Launch(ctx, spec); err != nil {
-		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
-		// in as many words: a cancelled context can kill this process after the work
-		// was accepted, and the backend's own unwind can itself fail. So the probe is
-		// reconciled rather than assumed away — otherwise a failed verification is
-		// also a leaked uid, device name and cloned disk.
-		return errors.Join(
-			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
-			destroyProbe(ctx, prov, name),
-		)
-	}
-
-	verdict := awaitGuestReport(ctx, report, serveErr, image, secret, wait)
-
-	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
-	// printed a line and returned success, so the weekly job would announce a
-	// verified image while probes accumulated — each holding a uid, a device name
-	// and a cloned disk, and each invisible to the node's sweep by design.
-	return errors.Join(verdict, destroyProbe(ctx, prov, name))
 }
 
 // awaitGuestReport waits for the guest to say something, or for a reason it cannot.
 func awaitGuestReport(
 	ctx context.Context, report <-chan string, serveErr <-chan error,
-	image, secret string, wait time.Duration,
+	image, secret string, disk config.ByteSize, wait time.Duration,
 ) error {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 
 	select {
 	case body := <-report:
-		return checkGuestReport(body, secret)
+		return checkGuestReport(body, secret, disk)
 
 	case err := <-serveErr:
 		// THE LISTENER DIED, WHICH IS NOT THE IMAGE'S FAULT. Without this the wait
@@ -919,6 +972,10 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 
 	return nil
 }
+
+// listenGuestReport is listenForGuestReport, a variable so a test can verify
+// without a bridge on the machine it runs on.
+var listenGuestReport = listenForGuestReport
 
 // listenForGuestReport serves the address the guest posts its report to.
 func listenForGuestReport(
@@ -1003,7 +1060,7 @@ func listenForGuestReport(
 }
 
 // checkGuestReport turns what the guest said into a verdict.
-func checkGuestReport(body, secret string) error {
+func checkGuestReport(body, secret string, disk config.ByteSize) error {
 	fmt.Println()
 
 	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
@@ -1053,6 +1110,10 @@ func checkGuestReport(body, secret string) error {
 			"registry, so it can also mean the bridge has none)")
 	}
 
+	if failure := checkRootFilesystem(body, disk); failure != "" {
+		failures = append(failures, failure)
+	}
+
 	if len(failures) > 0 {
 		return fmt.Errorf("billet images verify: this image cannot run a job:\n  - %s",
 			strings.Join(failures, "\n  - "))
@@ -1062,6 +1123,38 @@ func checkGuestReport(body, secret string) error {
 	fmt.Println("actions runner and runs a container.")
 
 	return nil
+}
+
+// rootfsSlack is how far below the grown disk the guest's root filesystem may
+// read: df reports the filesystem's size, which ext4's own metadata and reserved
+// blocks keep a few percent under its device.
+const rootfsSlack = 10
+
+// checkRootFilesystem says why the guest's root filesystem is not the one the
+// launch grew to disk, or "" when it is. A launch whose grow failed never reaches
+// the guest at all; this catches a grow that ran and did not reach the
+// filesystem the guest booted.
+func checkRootFilesystem(body string, disk config.ByteSize) string {
+	if disk <= 0 {
+		return ""
+	}
+	_, after, found := strings.Cut(body, "rootfs=")
+	if !found {
+		return "the guest did not report its root filesystem's size"
+	}
+	value, _, _ := strings.Cut(after, "\n")
+	size, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return fmt.Sprintf("the guest's root filesystem size %q is not a number of bytes",
+			strings.TrimSpace(value))
+	}
+	if want := int64(disk) / 100 * (100 - rootfsSlack); size < want {
+		return fmt.Sprintf("the root filesystem the guest booted is %s, not the %s the launch "+
+			"grew its disk to, so the grow every job takes did not reach it",
+			config.ByteSize(size), disk)
+	}
+
+	return ""
 }
 
 // hasVersion reports whether a field of the guest's report starts with a digit.
