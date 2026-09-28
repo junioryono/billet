@@ -154,6 +154,7 @@ func commands(lc *lifecycle) []command {
 		{"ami", "build and verify the machine image the ec2 backend launches", cmdAMI},
 		{"runner", "report how close the pinned actions/runner is to being refused", cmdRunner},
 		{"images", "verify the golden image a microVM guest boots from", cmdImages},
+		{"fleet", "converge a fleet from this machine with the collection of this billet's release", cmdFleet},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
 		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
 		{"decommission", "remove the ec2 instances and cache billet made outside Terraform",
