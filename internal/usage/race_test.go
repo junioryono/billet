@@ -244,3 +244,70 @@ func releaseAnyReader(t *testing.T, fifo string) {
 		t.Errorf("close the fifo: %v", err)
 	}
 }
+
+// A START THE SAMPLER TOOK BUT DID NOT FINISH IN TIME LEAVES ITS JOB PENDING,
+// and a Forget in the meantime wins: when the read finally completes, the job
+// is not brought back.
+func TestAStartThatOutlivesItsLimitDoesNotBringAForgottenJobBack(t *testing.T) {
+	tr, target := referenceVM(t)
+	// A FRESH TICK AND A WIDE STALE WINDOW, so only pending can make the job's
+	// energy could-not-tell.
+	m := runMonitor(t, tr.root, Options{Interval: time.Minute, RAPL: true})
+	m.Tick()
+	stuck, fifo := stuckTarget(t, tr, target)
+	t.Cleanup(func() { releaseAnyReader(t, fifo) })
+
+	begun := time.Now()
+	started := make(chan struct{})
+	go func() {
+		defer close(started)
+		m.Start("vm", stuck, 8)
+	}()
+	writer := waitForReader(t, fifo)
+	select {
+	case <-started:
+		if took := time.Since(begun); took > testLimit+time.Second {
+			t.Errorf("Start took %s", took)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start waited on its own stuck read")
+	}
+
+	s, ok := m.Final("vm")
+	if !ok || s.Measured.Energy {
+		t.Errorf("a pending job answered found %v, energy measured %v; want found and unmeasured", ok,
+			s.Measured.Energy)
+	}
+	m.Forget("vm")
+
+	if _, err := writer.WriteString("usage_usec 1\nuser_usec 1\nsystem_usec 0\n"); err != nil {
+		t.Errorf("write the fifo: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Errorf("close the fifo: %v", err)
+	}
+	m.Tick() // served after the stuck Start, so the Start has finished by now
+
+	m.mu.Lock()
+	_, back := m.jobs["vm"]
+	m.mu.Unlock()
+	if back {
+		t.Error("a job forgotten while its Start was reading was brought back when the read finished")
+	}
+}
+
+// A JOB STARTED JUST AFTER A TICK THAT THEN GOES UNSAMPLED FOR THREE INTERVALS
+// has missed them as surely as one that was there before the tick.
+func TestAJobStartedJustAfterATickStillMissesTheGap(t *testing.T) {
+	h := newEnergyHost(t, 0)
+	*h.now = h.now.Add(time.Second)
+	h.m.Start("vm", h.target, 8)
+	h.step(39*time.Second, 1)
+	h.m.Tick()
+	h.step(10*time.Second, 2)
+	h.m.Tick()
+
+	if finalOf(t, h.m).Measured.Energy {
+		t.Error("a job unsampled for 39 of its first seconds reported its energy as measured")
+	}
+}

@@ -87,11 +87,10 @@ const (
 )
 
 type request struct {
-	kind   requestKind
-	key    string
-	target Target
-	vcpus  int
-	reply  chan reply
+	kind  requestKind
+	key   string
+	job   *job
+	reply chan reply
 }
 
 type reply struct {
@@ -104,6 +103,11 @@ type job struct {
 	vcpus   int
 	first   time.Time
 	samples int64
+	// pending is a job Start published whose baseline Run has not yet taken.
+	// Ticks leave it alone, so a job still pending when it ends has only its
+	// placeholder point, and summaryOf's two-point rule makes its energy
+	// could-not-tell.
+	pending bool
 	// latest holds each group's most recent successful reading, and seen which
 	// groups were ever read, so one failed read does not erase a measurement.
 	latest     Sample
@@ -157,7 +161,7 @@ func (m *Monitor) Run(ctx context.Context) {
 func (m *Monitor) serve(r request) {
 	switch r.kind {
 	case requestStart:
-		m.start(r.key, r.target, r.vcpus)
+		m.start(r.key, r.job)
 		r.reply <- reply{}
 	case requestFinal:
 		s, ok := m.final(r.key)
@@ -193,33 +197,34 @@ func (m *Monitor) ask(r request, limit time.Duration) (bool, reply, bool) {
 // the baseline is read after the host's last tick, so the job's CPU in its first
 // interval is within the host's.
 //
-// A SAMPLER THAT DOES NOT TAKE THE REQUEST IN TIME is stuck: the job is known
-// without a baseline, so its first interval is not attributed.
+// THE JOB IS PUBLISHED FIRST, pending, and Run fills in the baseline only if
+// that same job is still the one under the key: a Forget, or a successor, while
+// Run was reading wins. A sampler that does not finish in time leaves the job
+// pending, which is known and never attributed.
 func (m *Monitor) Start(key string, target Target, vcpus int) {
-	if taken, _, _ := m.ask(request{kind: requestStart, key: key, target: target, vcpus: vcpus},
-		m.limit); taken {
-		return
-	}
-
 	now := m.opts.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	j := &job{target: target, vcpus: vcpus, first: now}
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true}
 	j.points = append(j.points, j.point(now))
+	m.mu.Lock()
 	m.jobs[key] = j
+	m.mu.Unlock()
+
+	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
 }
 
-func (m *Monitor) start(key string, target Target, vcpus int) {
+func (m *Monitor) start(key string, j *job) {
 	now := m.opts.Now()
-	s := m.reader.Read(target)
+	s := m.reader.Read(j.target)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	j := &job{target: target, vcpus: vcpus, first: now}
+	if m.jobs[key] != j {
+		return
+	}
+	j.first, j.pending, j.points = now, false, nil
 	j.absorb(s)
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
-	m.jobs[key] = j
 }
 
 // Forget stops measuring a job without reporting it.
@@ -248,7 +253,9 @@ func (m *Monitor) tick() {
 	m.mu.Lock()
 	snapshot := make(map[string]*job, len(m.jobs))
 	for key, j := range m.jobs {
-		snapshot[key] = j
+		if !j.pending {
+			snapshot[key] = j
+		}
 	}
 	m.mu.Unlock()
 
@@ -278,7 +285,6 @@ func (m *Monitor) tick() {
 	}
 	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
 	dt := now.Sub(m.lastTick)
-	gapped := !m.lastTick.IsZero() && dt >= staleAfter*m.opts.Interval
 
 	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
 	// interval's actual draw would otherwise hand out energy that never existed.
@@ -326,8 +332,10 @@ func (m *Monitor) tick() {
 		j.absorb(*s)
 		if m.opts.RAPL {
 			d, measured := deltas[key]
-			// A GAP BREAKS THE JOBS THAT LIVED THROUGH IT, not one started since.
-			missed := gapped && !j.first.After(m.lastTick)
+			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
+			// of the last tick and the job's own baseline.
+			missed := !m.lastTick.IsZero() &&
+				now.Sub(maxTime(m.lastTick, j.first)) >= staleAfter*m.opts.Interval
 			if !consistent || !measured || missed {
 				j.energyBroken = true
 			} else {

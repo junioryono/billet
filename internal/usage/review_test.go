@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -195,13 +196,20 @@ func stuckTarget(t *testing.T, tr tree, target Target) (Target, string) {
 
 // waitForReader waits until something has the FIFO open for reading, which is
 // when a non-blocking open for writing stops failing, and returns that writer
-// held open so the reader stays blocked in read. The caller must close it.
+// held open so the reader stays blocked in read. It is closed at cleanup on
+// every path, before the sampler is joined, since a reader cannot reach EOF
+// while it is open.
 func waitForReader(t *testing.T, fifo string) *os.File {
 	t.Helper()
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			t.Cleanup(func() {
+				if err := w.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("close the fifo's writer: %v", err)
+				}
+			})
 			return w
 		}
 		time.Sleep(5 * time.Millisecond)

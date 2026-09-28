@@ -261,7 +261,9 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	tr.write(raplZone+"/energy_uj", "38419855704\n")
 
 	now := time.Date(2026, 9, 25, 22, 50, 0, 0, time.UTC)
-	m := runMonitor(t, tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: 73.5,
+	// THIRTY-SECOND INTERVALS, so the gap below (70 s) is past the counter's
+	// wrap bound (65.5 s) and short of three intervals: only the wrap can refuse it.
+	m := runMonitor(t, tr.root, Options{Interval: 30 * time.Second, RAPL: true, IdleWatts: 73.5,
 		Now: func() time.Time { return now }})
 	m.Tick()
 	m.Start("vm", target, 8)
@@ -288,9 +290,10 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	// A gap long enough for the counter to wrap unseen (65.5 s at 1 kW) makes
 	// the job's energy could-not-tell, never a small number. Everything else
 	// about the interval is ordinary, so the gap is the only reason.
-	now = now.Add(2 * time.Minute)
+	now = now.Add(70 * time.Second)
+	// 128 CPUs, as before, so the CPU-count rule is not what refuses it.
 	tr.write("/proc/stat", "cpu  728314069 39636 158013305 37269744359 62999128 0 4781732 0 688798719 927\n"+
-		strings.Repeat("cpu1 0 0 0 0 0 0 0 0 0 0\n", 127))
+		strings.Repeat("cpu1 0 0 0 0 0 0 0 0 0 0\n", 128))
 	tr.write(raplZone+"/energy_uj", "40826460727\n")
 	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 79571715", 1))
 	m.Tick()
