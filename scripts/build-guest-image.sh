@@ -532,6 +532,32 @@ runner_images_machine() {
 	printf 'bri-%s\n' "$(printf '%s' "$WORK" | sha256sum | cut -c1-8)"
 }
 
+# recover_runner_images stops every machine that may still hold this workspace's
+# filesystem: the name this workspace derives, the name recorded beside its lock
+# when a build last started one (so a change to the naming cannot hide a
+# survivor), and any registered machine whose root is this rootfs, whatever it
+# is called. It fails when any of them cannot be proved stopped.
+recover_runner_images() {
+	local rootfs="$1" names name root listed
+	names=$(runner_images_machine)
+	if [ -r "$WORK.machine" ]; then
+		names="$names $(cat "$WORK.machine")"
+	fi
+	if command -v machinectl >/dev/null 2>&1 &&
+		listed=$(machinectl list --no-legend --no-pager 2>/dev/null); then
+		for name in $(awk '{ print $1 }' <<<"$listed"); do
+			root=$(machinectl show --property=RootDirectory --value "$name" 2>/dev/null) || continue
+			[ "$root" = "$rootfs" ] && names="$names $name"
+		done
+	fi
+	for name in $names; do
+		if ! BILLET_RI_MACHINE="$name" BILLET_RI_ROOTFS="$rootfs" \
+			"$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+			return 1
+		fi
+	done
+}
+
 # install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
 # scripts/runner-images/base.pin, into the mounted image and makes it a billet
 # guest's base: the filesystem GitHub's template starts from on Azure, without
@@ -600,6 +626,9 @@ run_runner_images_build() {
 	# shipping that file would resolve through the builder's DNS wherever it runs.
 	cp -a "$rootfs/etc/resolv.conf" "$WORK/resolv.conf.image"
 
+	# RECORDED BEFORE IT STARTS, beside the lock and outside the workspace, so a
+	# later run finds this machine whatever it would call its own.
+	printf '%s\n' "$BILLET_RI_MACHINE" >"$WORK.machine"
 	RUNNER_IMAGES_BOOTED="$rootfs"
 	BILLET_RI_ROOTFS="$rootfs" "$driver" start
 
@@ -753,7 +782,10 @@ main() {
 	# it would mean every first run after this check was added fails on a workspace
 	# an earlier run left behind. The check is about an OVERRIDE, which is where a
 	# typo can name something that matters.
-	if [ "$WORK" != "$(realpath -m -- "$WORK_DEFAULT")" ] &&
+	# THE DEFAULT AS SPELLED, NOT AS RESOLVED: a symlink planted at the default
+	# path resolves somewhere else, and that somewhere must prove it is a workspace
+	# like any other override before it is deleted.
+	if [ "$WORK" != "$WORK_DEFAULT" ] &&
 		[ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
 		echo "WORK=$WORK exists and was not created by this script; refusing to delete it." >&2
 		echo "Remove it yourself, or point WORK at a path this script may own." >&2
@@ -794,7 +826,7 @@ main() {
 	# workspace's.
 	BILLET_RI_MACHINE=$(runner_images_machine)
 	export BILLET_RI_MACHINE
-	if ! BILLET_RI_ROOTFS="$rootfs" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+	if ! recover_runner_images "$rootfs"; then
 		echo "an earlier build's machine on $rootfs could not be stopped; refusing to clear" >&2
 		echo "the workspace under it" >&2
 		exit 1

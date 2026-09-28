@@ -43,7 +43,9 @@ fail() {
 case "$machine" in
 *[!a-z0-9-]* | '') fail "the machine name $machine is not lower-case letters, digits and hyphens" ;;
 esac
-[ "${#machine}" -le 12 ] || fail "the machine name $machine is longer than twelve characters"
+
+# THE CGROUP HIERARCHY, a variable so a test can stand one up.
+cgroup_root=${BILLET_RI_CGROUP_ROOT:-/sys/fs/cgroup}
 
 [ -n "${BILLET_RI_ROOTFS:-}" ] || fail "BILLET_RI_ROOTFS names no root filesystem"
 
@@ -53,8 +55,13 @@ esac
 # can reach "failed" with processes its kill left behind, and a registered
 # machine is one systemd still counts as running.
 running() {
-	local state registered cgroup
-	command -v systemctl >/dev/null 2>&1 || return 1
+	local state registered cgroup events
+	# A HOST NOT RUN BY SYSTEMD HAS NO UNIT TO BE RUNNING, which is evidence; a
+	# systemd host whose systemctl is missing is not.
+	if ! command -v systemctl >/dev/null 2>&1; then
+		[ -d /run/systemd/system ] && return 2
+		return 1
+	fi
 	state=$(systemctl is-active "$unit" 2>/dev/null) || true
 	case "$state" in
 	active | activating | reloading | deactivating) return 0 ;;
@@ -69,13 +76,16 @@ running() {
 	*) return 2 ;;
 	esac
 	cgroup=$(systemctl show --property=ControlGroup --value "$unit" 2>/dev/null) || return 2
-	if [ -n "$cgroup" ] && [ -d "/sys/fs/cgroup$cgroup" ]; then
-		if find "/sys/fs/cgroup$cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null | grep -q .; then
-			return 0
-		fi
-	fi
-
-	return 1
+	# cgroup.events SAYS WHETHER ANY PROCESS IS LEFT ANYWHERE BELOW IT (cgroup v2's
+	# "populated"), read once; a cgroup that is gone holds nothing, and one that
+	# cannot be read tells nothing.
+	[ -n "$cgroup" ] && [ -e "$cgroup_root$cgroup" ] || return 1
+	events=$(cat "$cgroup_root$cgroup/cgroup.events" 2>/dev/null) || return 2
+	case "$events" in
+	*"populated 1"*) return 0 ;;
+	*"populated 0"*) return 1 ;;
+	*) return 2 ;;
+	esac
 }
 
 # leader is the PID of the machine's init, which a reboot replaces.
@@ -117,27 +127,33 @@ forwarding() {
 			-m comment --comment "$rule_tag" -j ACCEPT
 }
 
-# remove_forwarding deletes every rule carrying this machine's tag, read from the
-# ruleset rather than probed for, and proves none is left: a ruleset it cannot
-# read is not a ruleset without them.
+# tagged reports whether the listed ruleset still carries this machine's tag, as
+# the whole comment: iptables -S quotes a comment holding a colon, and a
+# substring would also match a machine whose name extends this one.
+tagged() {
+	local status=0
+	grep -Eq -- "--comment \"?$rule_tag\"?( |\$)" <<<"$1" || status=$?
+	case "$status" in
+	0) return 0 ;;
+	1) return 1 ;;
+	*) fail "could not search the FORWARD chain for $machine's rules" ;;
+	esac
+}
+
+# remove_forwarding deletes this machine's rules by the argument vectors it
+# inserted them with, as often as the listed ruleset still shows them, and proves
+# none is left: a ruleset it cannot read is not a ruleset without them.
 remove_forwarding() {
 	command -v iptables >/dev/null 2>&1 || return 0
-	local rules rule
-	rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain to remove $machine's rules"
-	while IFS= read -r rule; do
-		case "$rule" in
-		"-A FORWARD "*"$rule_tag"*) ;;
-		*) continue ;;
-		esac
-		local words
-		read -r -a words <<<"$rule"
-		words[0]=-D
-		iptables -w "${words[@]}" || fail "could not remove the rule: $rule"
-	done <<<"$rules"
-	rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain after removing $machine's rules"
-	case "$rules" in
-	*"$rule_tag"*) fail "$machine's forwarding rules are still installed" ;;
-	esac
+	local rules attempt
+	for attempt in 1 2 3 4 5 6 7 8; do
+		rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain to remove $machine's rules"
+		tagged "$rules" || return 0
+		iptables -w -D FORWARD -i "$link" -m comment --comment "$rule_tag" -j ACCEPT 2>/dev/null || true
+		iptables -w -D FORWARD -o "$link" -m conntrack --ctstate RELATED,ESTABLISHED \
+			-m comment --comment "$rule_tag" -j ACCEPT 2>/dev/null || true
+	done
+	fail "$machine's forwarding rules are still installed after $attempt removals"
 }
 
 stop() {
@@ -170,6 +186,9 @@ stop() {
 
 case "${1:-}" in
 start)
+	# BOUNDED ONLY WHERE A LINK IS NAMED FROM IT: a machine an earlier naming left
+	# behind can still be stopped by its own name.
+	[ "${#machine}" -le 12 ] || fail "the machine name $machine is longer than twelve characters"
 	status=0
 	running || status=$?
 	[ "$status" -eq 1 ] || fail "$unit is already running or cannot be read; stop it first"
@@ -188,9 +207,18 @@ start)
 	# A REBOOT IS NSPAWN EXITING 133, which it does when the container reboots; the
 	# unit restarts it on exactly that status, as systemd-nspawn@.service does, and
 	# a poweroff (status 0) stays down.
+	#
+	# THE DEVICE POLICY systemd-nspawn@.service sets, which --keep-unit leaves to
+	# the unit: every capability and no user namespace would otherwise let the
+	# build make a block device node for the builder's own disk and open it.
 	systemd-run --quiet --unit="$unit" --property=Delegate=yes \
 		--property=Restart=on-failure --property=RestartForceExitStatus=133 \
-		--property=SuccessExitStatus=133 -- \
+		--property=SuccessExitStatus=133 \
+		--property=DevicePolicy=closed \
+		--property="DeviceAllow=/dev/net/tun rwm" --property="DeviceAllow=char-pts rw" \
+		--property="DeviceAllow=/dev/loop-control rw" --property="DeviceAllow=block-loop rw" \
+		--property="DeviceAllow=block-blkext rw" --property="DeviceAllow=/dev/mapper/control rw" \
+		--property="DeviceAllow=block-device-mapper rw" -- \
 		systemd-nspawn --boot --quiet --machine="$machine" --directory="$BILLET_RI_ROOTFS" \
 		--keep-unit --capability=all --system-call-filter='@keyring bpf' --private-users=no \
 		--network-veth --resolv-conf=replace-uplink --timezone=off

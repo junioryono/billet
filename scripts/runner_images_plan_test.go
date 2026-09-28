@@ -279,13 +279,20 @@ func unquote(s string) string { return strings.ReplaceAll(s, `\"`, `"`) }
 // holding anything else (a number, an expression), which the plan could not
 // carry.
 func listItems(value string) ([]string, bool) {
+	if !stringList.MatchString(strings.TrimSpace(value)) {
+		return nil, false
+	}
 	var items []string
 	for _, item := range quoted.FindAllStringSubmatch(value, -1) {
 		items = append(items, unquote(item[1]))
 	}
 
-	return items, strings.Trim(quoted.ReplaceAllString(value, ""), "[], \t") == ""
+	return items, true
 }
+
+// stringList is exactly one list of string literals, a trailing comma allowed.
+var stringList = regexp.MustCompile(
+	`^\[\s*(?:"(?:[^"\\]|\\.)*"\s*(?:,\s*"(?:[^"\\]|\\.)*"\s*)*,?\s*)?\]$`)
 
 var templateRef = regexp.MustCompile(`\$\{(var\.[a-z_]+|path\.root)\}`)
 
@@ -561,10 +568,16 @@ func TestTheTemplateReaderRefusesListsItCannotCarry(t *testing.T) {
 		`[1]`:            false,
 		`[var.scripts]`:  false,
 		`["a", local.b]`: false,
+		`[["a"]]`:        false,
+		`[[]]`:           false,
+		`["a"]]`:         false,
 	} {
 		if _, ok := listItems(value); ok != want {
 			t.Errorf("listItems(%s) readable = %v, want %v", value, ok, want)
 		}
+	}
+	if items, ok := listItems(`[ "a, b", "c\"d" ]`); !ok || strings.Join(items, "|") != `a, b|c"d` {
+		t.Errorf("listItems read %q, %v; want the two strings as written", items, ok)
 	}
 	if attrs := blockAttributes(t, "valid_exit_codes = []\n"); attrs["valid_exit_codes"] == nil {
 		t.Error("an empty list was not recorded, so the allowlist would never see it")

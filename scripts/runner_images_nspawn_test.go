@@ -18,9 +18,12 @@ import (
 //     answers its Leader or Name, or "No machine" when it is not; a reboot moves
 //     the leader to $FAKE/next-leader; a poweroff or terminate ends it unless
 //     $FAKE/stuck names that verb.
-//   - systemctl answers is-active from $FAKE/state (inactive when absent); a
-//     stop ends the unit and the machine unless $FAKE/stuck names stop.
-//   - iptables keeps its FORWARD rules in $FAKE/rules; -S fails while
+//   - systemctl answers is-active from $FAKE/state (inactive when absent), and
+//     the unit's ControlGroup as /system.slice/probe-nspawn.service, whose
+//     cgroup.events the test writes under $FAKE/cgroup; a stop ends the unit and
+//     the machine unless $FAKE/stuck names stop.
+//   - iptables keeps its FORWARD rules in $FAKE/rules and lists a comment the way
+//     Ubuntu's iptables does, quoted when it holds a colon; -S fails while
 //     $FAKE/iptables-broken exists.
 //   - timeout drops its bounds and runs the command.
 var nspawnFakes = map[string]string{
@@ -53,7 +56,7 @@ case "$1" in
 is-active) state=$(cat "$FAKE/state" 2>/dev/null || echo inactive); echo "$state"
 	[ "$state" = active ] ;;
 stop) grep -qx stop "$FAKE/stuck" 2>/dev/null || { echo inactive >"$FAKE/state"; rm -f "$FAKE/leader"; } ;;
-show) echo "" ;;
+show) echo /system.slice/probe-nspawn.service ;;
 esac
 `,
 	"iptables": `#!/bin/sh
@@ -62,8 +65,9 @@ shift
 case "$1" in
 -S) [ -f "$FAKE/iptables-broken" ] && exit 1
 	echo "-P FORWARD DROP"; cat "$FAKE/rules" 2>/dev/null ;;
--I) shift; echo "-A $*" >>"$FAKE/rules" ;;
--D) shift; want="-A $*"; grep -vxF -- "$want" "$FAKE/rules" >"$FAKE/rules.new" || true
+-I) shift; echo "-A $*" | sed 's/--comment \([^ ]*:[^ ]*\)/--comment "\1"/' >>"$FAKE/rules" ;;
+-D) shift; want=$(echo "-A $*" | sed 's/--comment \([^ ]*:[^ ]*\)/--comment "\1"/')
+	grep -vxF -- "$want" "$FAKE/rules" >"$FAKE/rules.new" || true
 	mv "$FAKE/rules.new" "$FAKE/rules" ;;
 esac
 exit 0
@@ -88,7 +92,8 @@ func runDriver(t *testing.T, fake string, args ...string) (string, error) {
 	}
 	cmd := exec.CommandContext(t.Context(), "./runner-images-nspawn.sh", args...)
 	cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE="+fake,
-		"BILLET_RI_ROOTFS=/mnt/rootfs", "BILLET_RI_MACHINE=probe", "BILLET_RI_STOP_WAIT=1")
+		"BILLET_RI_ROOTFS=/mnt/rootfs", "BILLET_RI_MACHINE=probe", "BILLET_RI_STOP_WAIT=1",
+		"BILLET_RI_CGROUP_ROOT="+filepath.Join(fake, "cgroup"))
 	output, err := cmd.CombinedOutput()
 
 	return string(output), err
@@ -195,7 +200,7 @@ func TestTheNspawnDriverStartsItsOwnMachine(t *testing.T) {
 	calls := driverCalls(t, fake)
 	for _, want := range []string{"--unit=probe-nspawn.service", "--network-veth", "--resolv-conf=replace-uplink",
 		"--machine=probe", "--directory=/mnt/rootfs", "-- getent hosts archive.ubuntu.com",
-		"--keep-unit",
+		"--keep-unit", "--property=DevicePolicy=closed",
 		"iptables -w -I FORWARD -i ve-probe -m comment --comment billet-runner-images:probe -j ACCEPT"} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("start did not pass %q:\n%s", want, calls)
@@ -240,6 +245,26 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 		t.Fatalf("a failed launcher whose machine is still registered answered %v:\n%s", err, output)
 	}
 
+	// A FAILED LAUNCHER WHOSE CGROUP STILL HOLDS A PROCESS is not stopped, and one
+	// whose cgroup cannot be read is not known to be.
+	for events, clause := range map[string]string{"populated 1\nfrozen 0\n": "still running", "": "cannot tell"} {
+		populated := t.TempDir()
+		writeFake(t, populated, "state", "failed\n")
+		writeFake(t, populated, "stuck", "poweroff\nstop\nterminate\n")
+		cgroup := filepath.Join(populated, "cgroup", "system.slice", "probe-nspawn.service")
+		if err := os.MkdirAll(cgroup, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if events != "" {
+			if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte(events), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if output, err := runDriver(t, populated, "stop"); err == nil || !strings.Contains(output, clause) {
+			t.Errorf("a failed launcher with cgroup.events %q answered %v:\n%s", events, err, output)
+		}
+	}
+
 	unknown := t.TempDir()
 	writeFake(t, unknown, "state", "unknown\n")
 	if output, err := runDriver(t, unknown, "stop"); err == nil || !strings.Contains(output, "cannot tell") {
@@ -256,12 +281,13 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 	}
 }
 
-// A MACHINE NAME TOO LONG FOR ITS LINK NAME IS REFUSED, since the forwarding rules
-// match the link by that exact name.
+// A MACHINE NAME TOO LONG FOR ITS LINK NAME IS NEVER STARTED, since the
+// forwarding rules match the link by that exact name. (Stopping one by such a
+// name stays possible, for a machine an earlier naming left behind.)
 func TestTheNspawnDriverRefusesALongMachineName(t *testing.T) {
 	t.Parallel()
 
-	cmd := exec.CommandContext(t.Context(), "./runner-images-nspawn.sh", "stop")
+	cmd := exec.CommandContext(t.Context(), "./runner-images-nspawn.sh", "start")
 	cmd.Env = append(os.Environ(), "BILLET_RI_ROOTFS=/mnt/rootfs", "BILLET_RI_MACHINE=billet-runner-images")
 	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "longer than twelve") {
 		t.Fatalf("a long machine name answered %v:\n%s", err, output)
