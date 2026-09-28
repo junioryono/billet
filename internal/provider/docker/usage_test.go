@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+// A CGROUP IS THE CONTAINER'S ONLY WHEN IT NAMES THE CONTAINER, so a pid reused
+// between docker inspect and the /proc read is not measured as the container.
+func TestACgroupMustNameItsContainer(t *testing.T) {
+	const id = "4f1c0ffee"
+	for rel, want := range map[string]bool{
+		"/system.slice/docker-4f1c0ffee.scope": true,
+		"/docker/4f1c0ffee":                    true,
+		"/system.slice/docker-beef.scope":      false,
+		"/user.slice/session-3.scope":          false,
+		"/docker/4f1c0ffee/child":              false,
+	} {
+		if got := cgroupNames(rel, id); got != want {
+			t.Errorf("cgroupNames(%q) = %v, want %v", rel, got, want)
+		}
+	}
+	if cgroupNames("/docker/", "") {
+		t.Error("an empty container id matched a cgroup")
+	}
+}
+
 func TestAContainersCgroupIsReadUnderEitherDriver(t *testing.T) {
 	for _, tc := range []struct {
 		name, proc, want, err string

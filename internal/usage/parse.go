@@ -155,6 +155,27 @@ func parseTaskStat(data string) (string, int64, int64, error) {
 	return comm, utime, stime, nil
 }
 
+// parseStartTime reads a process's start time, in clock ticks since boot, from
+// /proc/<pid>/stat (field 22). A pid the kernel reuses gets a new start time,
+// which is what makes a pid plus its start time one process.
+func parseStartTime(data string) (uint64, error) {
+	closing := strings.LastIndexByte(data, ')')
+	if closing < 0 {
+		return 0, errors.New("usage: stat has no (comm)")
+	}
+	// After ")" the fields resume at field 3, so field 22 is index 19.
+	rest := strings.Fields(data[closing+1:])
+	if len(rest) < 20 {
+		return 0, fmt.Errorf("usage: stat has %d fields after comm, want at least 20", len(rest))
+	}
+	start, err := strconv.ParseUint(rest[19], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("usage: start time: %w", err)
+	}
+
+	return start, nil
+}
+
 // parseHostCPU reads the aggregate "cpu" line of /proc/stat into busy and
 // total USER_HZ ticks, and counts the per-CPU lines.
 //

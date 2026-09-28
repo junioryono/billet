@@ -16,6 +16,11 @@ type Target struct {
 	// PID is the VMM's process, whose threads split guest time from the VMM's
 	// own. Zero means there is no such split to make (a container).
 	PID int
+	// PIDStart is the start time PID had when the target was made
+	// (ProcessStart). Every read checks it, so a pid the kernel has since given
+	// to another process, a replacement VMM included, is never read as this
+	// job's. Zero is unknown, and the threads are then not read at all.
+	PIDStart uint64
 	// VCPUThreadPrefix names the threads that run guest code ("fc_vcpu" for
 	// Firecracker, whose vCPU threads are "fc_vcpu 0" through "fc_vcpu N").
 	VCPUThreadPrefix string
@@ -177,14 +182,30 @@ func (s *Sample) readNet(r Reader, t Target) {
 // readThreads splits a VMM's CPU time into its vCPU threads (guest code) and
 // everything else (the event loop, the API thread: emulation and IO).
 func (s *Sample) readThreads(r Reader, t Target) {
-	if t.PID <= 0 || t.VCPUThreadPrefix == "" {
+	if t.PID <= 0 || t.VCPUThreadPrefix == "" || t.PIDStart == 0 {
 		return
 	}
 	guest, vmm, err := r.threadTimes(t.PID, t.VCPUThreadPrefix)
 	if err != nil {
 		return
 	}
+	// CHECKED AFTER THE READ, which covers a pid reused before it and during it:
+	// either way the process holding the pid now is not the one recorded, and
+	// what was read is discarded.
+	if start, err := r.ProcessStart(t.PID); err != nil || start != t.PIDStart {
+		return
+	}
 	s.GuestCPU, s.VMMCPU, s.ThreadsOK = guest, vmm, true
+}
+
+// ProcessStart is the start time of pid, which with the pid names one process.
+func (r Reader) ProcessStart(pid int) (uint64, error) {
+	raw, err := r.read(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+
+	return parseStartTime(raw)
 }
 
 func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
@@ -249,6 +270,12 @@ func (r Reader) ReadHostCPU() (HostCPU, error) {
 // energy register reporting a single core.
 const raplZone = "/sys/class/powercap/intel-rapl:0"
 
+// secondPackage is the zone a second socket's package would have. Energy from
+// package 0 shared by CPU time counted on every socket would charge one
+// socket's energy to jobs running on another, so a host with a second package
+// reports energy as could-not-tell instead.
+const secondPackage = "/sys/class/powercap/intel-rapl:1"
+
 // Energy is one reading of the package energy counter.
 type Energy struct {
 	Microjoules, MaxRange int64
@@ -256,6 +283,13 @@ type Energy struct {
 
 // ReadEnergy reads the package energy counter and its wrap point.
 func (r Reader) ReadEnergy() (Energy, error) {
+	switch _, err := os.Stat(r.path(secondPackage)); {
+	case err == nil:
+		return Energy{}, errors.New("usage: this host has more than one package, and energy " +
+			"is attributed from package 0 alone")
+	case !errors.Is(err, os.ErrNotExist):
+		return Energy{}, fmt.Errorf("usage: could not tell how many packages this host has: %w", err)
+	}
 	rawMax, err := r.read(filepath.Join(raplZone, "max_energy_range_uj"))
 	if err != nil {
 		return Energy{}, err

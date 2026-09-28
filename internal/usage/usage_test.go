@@ -47,6 +47,9 @@ var refThreads = map[string]string{
 
 const refCgroup = "/sys/fs/cgroup/firecracker-v1.16.1/billet-b9eb5fb98c62f06fcc85357ded87995b"
 
+// refVMMStart is the captured VMM's start time, field 22 of its stat.
+const refVMMStart = 298947558
+
 type tree struct {
 	t    *testing.T
 	root string
@@ -95,14 +98,16 @@ func referenceVM(t *testing.T) (tree, Target) {
 	for tid, stat := range refThreads {
 		tr.write("/proc/315359/task/"+tid+"/stat", stat+"\n")
 	}
+	// The process's own stat is its main thread's; field 22 is 298947558.
+	tr.write("/proc/315359/stat", refThreads["315359"]+"\n")
 	// bt-16, the VM's tap: rx=941790 tx=202408832 rxp=9276 txp=12866.
 	for name, v := range map[string]string{"rx_bytes": "941790", "tx_bytes": "202408832",
 		"rx_packets": "9276", "tx_packets": "12866"} {
 		tr.write("/sys/class/net/bt-16/statistics/"+name, v+"\n")
 	}
 
-	return tr, Target{CgroupDir: refCgroup, PID: 315359, VCPUThreadPrefix: "fc_vcpu",
-		NetDevice: "bt-16", NetHostView: true}
+	return tr, Target{CgroupDir: refCgroup, PID: 315359, PIDStart: refVMMStart,
+		VCPUThreadPrefix: "fc_vcpu", NetDevice: "bt-16", NetHostView: true}
 }
 
 // The VMM's threads account for the cgroup's CPU time to within a tick, and
@@ -289,7 +294,7 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	tr.write(raplZone+"/energy_uj", "40826460727\n")
 	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 79571715", 1))
 	m.Tick()
-	if s, _ := m.Final("vm"); s.Measured.Energy {
+	if s := finalOf(t, m); s.Measured.Energy {
 		t.Error("energy across a gap the counter could have wrapped in was reported as measured")
 	}
 }
