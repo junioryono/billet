@@ -253,9 +253,12 @@ func blockAttributes(t *testing.T, body string) attributes {
 				}
 				value += " " + strings.TrimSpace(lines[i])
 			}
-			for _, item := range quoted.FindAllStringSubmatch(value, -1) {
-				attrs[name] = append(attrs[name], unquote(item[1]))
+			items, ok := listItems(value)
+			if !ok {
+				t.Fatalf("attribute %s is a list the runner cannot read: %s", name, value)
 			}
+			// RECORDED EVEN WHEN EMPTY, so the attribute allowlist sees it.
+			attrs[name] = append([]string{}, items...)
 
 			continue
 		}
@@ -271,6 +274,18 @@ func blockAttributes(t *testing.T, body string) attributes {
 }
 
 func unquote(s string) string { return strings.ReplaceAll(s, `\"`, `"`) }
+
+// listItems reads `[ "a", "b" ]` into its strings, and reports false for a list
+// holding anything else (a number, an expression), which the plan could not
+// carry.
+func listItems(value string) ([]string, bool) {
+	var items []string
+	for _, item := range quoted.FindAllStringSubmatch(value, -1) {
+		items = append(items, unquote(item[1]))
+	}
+
+	return items, strings.Trim(quoted.ReplaceAllString(value, ""), "[], \t") == ""
+}
 
 var templateRef = regexp.MustCompile(`\$\{(var\.[a-z_]+|path\.root)\}`)
 
@@ -530,5 +545,28 @@ func TestEveryVendoredDirectoryIsThePinnedCommitsWhole(t *testing.T) {
 		if got := gitTreeID(t, filepath.Join(runnerImagesDir, "upstream", dir)); got != want {
 			t.Errorf("%s is tree %s, not the pinned commit's %s", dir, got, want)
 		}
+	}
+}
+
+// A LIST THE READER CANNOT CARRY IS REFUSED, NOT DROPPED: a number or an
+// expression in a list, and an empty list is still an attribute the allowlist
+// judges.
+func TestTheTemplateReaderRefusesListsItCannotCarry(t *testing.T) {
+	t.Parallel()
+
+	for value, want := range map[string]bool{
+		`["a", "b"]`:     true,
+		`[ "a" , ]`:      true,
+		`[]`:             true,
+		`[1]`:            false,
+		`[var.scripts]`:  false,
+		`["a", local.b]`: false,
+	} {
+		if _, ok := listItems(value); ok != want {
+			t.Errorf("listItems(%s) readable = %v, want %v", value, ok, want)
+		}
+	}
+	if attrs := blockAttributes(t, "valid_exit_codes = []\n"); attrs["valid_exit_codes"] == nil {
+		t.Error("an empty list was not recorded, so the allowlist would never see it")
 	}
 }

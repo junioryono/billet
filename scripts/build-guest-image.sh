@@ -526,9 +526,10 @@ stop_runner_images() {
 }
 
 # runner_images_machine names this workspace's machine, so builds in two
-# workspaces on one host never share (or stop) one.
+# workspaces on one host never share (or stop) one. Twelve characters, so the
+# machine's link is exactly ve-<name> (see runner-images-nspawn.sh).
 runner_images_machine() {
-	printf 'billet-ri-%s\n' "$(printf '%s' "$WORK" | sha256sum | cut -c1-12)"
+	printf 'bri-%s\n' "$(printf '%s' "$WORK" | sha256sum | cut -c1-8)"
 }
 
 # install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
@@ -638,15 +639,14 @@ run_runner_images_build() {
 # cache and GitHub's PATH, as a hosted runner exports them.
 #
 # THE AGENT PASSES EACH LINE AS IT IS, through env -i, so each line is made a
-# plain NAME=VALUE here, as pam_env would read it: one pair of surrounding quotes
-# removed, and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for the
-# login shell to expand, is the runner's home, which nothing downstream expands.
+# plain NAME=VALUE here by pam-environment.awk, the reader the build's own steps
+# use; and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for a login
+# shell to expand, is the runner's home, which nothing downstream expands.
 write_image_env() {
 	local rootfs="$1"
-	grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$rootfs/etc/environment" |
-		sed -E -e 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' \
-			-e 's#\$HOME#/home/runner#g' -e 's#\$\{HOME\}#/home/runner#g' \
-		>"$rootfs/etc/billet-image-env.tmp" || true
+	awk -f "$SCRIPT_DIR/runner-images/pam-environment.awk" "$rootfs/etc/environment" |
+		sed -e 's#\$HOME#/home/runner#g' -e 's#\${HOME}#/home/runner#g' \
+		>"$rootfs/etc/billet-image-env.tmp"
 	if ! grep -q '^ImageOS=' "$rootfs/etc/billet-image-env.tmp"; then
 		echo "GitHub's build wrote no ImageOS to /etc/environment; refusing an image whose jobs" >&2
 		echo "would not see the variables a hosted runner exports" >&2
@@ -724,6 +724,11 @@ main() {
 	# BEFORE ANYTHING IS BUILT, because this file decides what goes in.
 	verify_toolset
 
+	# ONE SPELLING PER DIRECTORY, before anything is derived from it: a trailing
+	# slash or a `..` would otherwise give one workspace two locks and two machine
+	# names, and a second build would clear the first one's workspace under it.
+	WORK=$(realpath -m -- "$WORK")
+
 	local rootfs="$WORK/rootfs" img="$WORK/$IMAGE_NAME.ext4"
 
 	# THE WORKSPACE IS PROVED TO BE A WORKSPACE BEFORE IT IS DELETED. This runs as
@@ -748,7 +753,7 @@ main() {
 	# it would mean every first run after this check was added fails on a workspace
 	# an earlier run left behind. The check is about an OVERRIDE, which is where a
 	# typo can name something that matters.
-	if [ "$WORK" != "$WORK_DEFAULT" ] &&
+	if [ "$WORK" != "$(realpath -m -- "$WORK_DEFAULT")" ] &&
 		[ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
 		echo "WORK=$WORK exists and was not created by this script; refusing to delete it." >&2
 		echo "Remove it yourself, or point WORK at a path this script may own." >&2
@@ -783,13 +788,13 @@ main() {
 		exit 1
 	fi
 
-	# A MACHINE AN EARLIER RUN LEFT BOOTED ON THIS WORKSPACE GOES FIRST: its
-	# filesystem is about to be unmounted and deleted, which must not happen under
-	# a machine still writing to it. Its name is this workspace's.
+	# A MACHINE AN EARLIER RUN LEFT BOOTED ON THIS WORKSPACE GOES FIRST, WHATEVER
+	# THIS RUN BUILDS: its filesystem is about to be unmounted and deleted, which
+	# must not happen under a machine still writing to it. Its name is this
+	# workspace's.
 	BILLET_RI_MACHINE=$(runner_images_machine)
 	export BILLET_RI_MACHINE
-	if [ "$BUILD_FROM" = runner-images ] &&
-		! BILLET_RI_ROOTFS="$rootfs" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+	if ! BILLET_RI_ROOTFS="$rootfs" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
 		echo "an earlier build's machine on $rootfs could not be stopped; refusing to clear" >&2
 		echo "the workspace under it" >&2
 		exit 1

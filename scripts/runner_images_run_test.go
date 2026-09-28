@@ -27,7 +27,8 @@ exec)
 	if [ "$1" = runuser ]; then shift 4; fi
 	[ "$1" = /var/tmp/billet-ri/with-environment ] || exit 0
 	set -- $(printf '%s\n' "$@" | sed "s#^/var/tmp/billet-ri/#$BILLET_TEST_ROOT/var/tmp/billet-ri/#")
-	BILLET_RI_ENVIRONMENT=$BILLET_TEST_ROOT/etc/environment "$@"
+	BILLET_RI_ENVIRONMENT=$BILLET_TEST_ROOT/etc/environment \
+		BILLET_RI_ENVIRONMENT_READER=$BILLET_TEST_ROOT/var/tmp/billet-ri/pam-environment.awk "$@"
 	;;
 copy-in)
 	mkdir -p "$(dirname "$BILLET_TEST_ROOT$3")"
@@ -63,7 +64,7 @@ func runRunner(t *testing.T, fx runnerFixture) (string, []string, error) {
 	if err := forkSafeWriteFile(driver, []byte(fakeTargetDriver), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(t.Context(), "bash", "run-runner-images.sh")
+	cmd := exec.CommandContext(t.Context(), "./run-runner-images.sh")
 	cmd.Env = append(os.Environ(),
 		"BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=20260927.1", "BILLET_RI_OUT="+fx.out,
 		"BILLET_RI_DIR="+fx.dir, "BILLET_RI_NO_PAUSE=1", "BILLET_TEST_ROOT="+fx.root,
@@ -87,6 +88,14 @@ func newRunnerFixture(t *testing.T) runnerFixture {
 	t.Helper()
 
 	fx := runnerFixture{dir: t.TempDir(), root: t.TempDir(), out: t.TempDir()}
+	// THE REAL READER, so the fixture runs the one the build ships.
+	reader, err := os.ReadFile(filepath.Join(runnerImagesDir, "pam-environment.awk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.dir, "pam-environment.awk"), reader, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	build := filepath.Join(fx.dir, "upstream", "images", "ubuntu", "scripts", "build")
 	if err := os.MkdirAll(build, 0o700); err != nil {
 		t.Fatal(err)
@@ -264,7 +273,7 @@ func TestTheRealDifferenceListIsAccepted(t *testing.T) {
 	if err := forkSafeWriteFile(driver, []byte("#!/bin/sh\necho \"$*\" >>\""+root+"/calls\"\nexit 9\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(t.Context(), "bash", "run-runner-images.sh")
+	cmd := exec.CommandContext(t.Context(), "./run-runner-images.sh")
 	cmd.Env = append(os.Environ(), "BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=1",
 		"BILLET_RI_OUT="+t.TempDir())
 	output, err := cmd.CombinedOutput()
@@ -360,11 +369,16 @@ func TestTheImageEnvironmentIsGitHubsMadePlain(t *testing.T) {
 	}
 	environment := "PATH=\"$HOME/.local/bin:/opt/pipx_bin:$HOME/.cargo/bin:/usr/bin\"\n" +
 		"ImageOS=ubuntu24\nXDG_CONFIG_HOME=$HOME/.config\nJAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n" +
-		"# a comment\nnot an assignment\n"
+		"# a comment\nnot an assignment\n  export SINGLE='/opt/jdk'\n"
 	if err := os.WriteFile(filepath.Join(rootfs, "etc", "environment"), []byte(environment), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	script := scriptFunction(t, "build-guest-image.sh", "write_image_env") + "\nset -euo pipefail\nwrite_image_env \"$1\"\n"
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "SCRIPT_DIR=" + here + "\n" + scriptFunction(t, "build-guest-image.sh", "write_image_env") +
+		"\nset -euo pipefail\nwrite_image_env \"$1\"\n"
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", script, "bash", rootfs)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("write_image_env: %v\n%s", err, output)
@@ -374,7 +388,8 @@ func TestTheImageEnvironmentIsGitHubsMadePlain(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "PATH=/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/usr/bin\n" +
-		"ImageOS=ubuntu24\nXDG_CONFIG_HOME=/home/runner/.config\nJAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n"
+		"ImageOS=ubuntu24\nXDG_CONFIG_HOME=/home/runner/.config\nJAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n" +
+		"SINGLE=/opt/jdk\n"
 	if string(got) != want {
 		t.Fatalf("the image environment is\n%s\nwant\n%s", got, want)
 	}
@@ -385,5 +400,31 @@ func TestTheImageEnvironmentIsGitHubsMadePlain(t *testing.T) {
 	cmd = exec.CommandContext(t.Context(), "bash", "-c", script, "bash", rootfs)
 	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "no ImageOS") {
 		t.Fatalf("an environment without ImageOS answered %v:\n%s", err, output)
+	}
+}
+
+// A STEP WHOSE ENVIRONMENT CANNOT BE READ DOES NOT RUN WITHOUT IT: the reader
+// failing fails the step, rather than running it with none of what earlier steps
+// wrote.
+func TestAnUnreadableEnvironmentFailsTheStep(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	if err := os.WriteFile(filepath.Join(fx.dir, "pam-environment.awk"), []byte("{ this is not awk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(fx.root, "etc"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.root, "etc", "environment"), []byte("A=b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.plan = fx.plan[1:2]
+	output, _, err := runRunner(t, fx)
+	if err == nil || !strings.Contains(output, "could not read") {
+		t.Fatalf("a step with an unreadable environment answered %v:\n%s", err, output)
+	}
+	if steps := readSteps(t, fx); steps != "" {
+		t.Fatalf("the step ran without its environment:\n%s", steps)
 	}
 }

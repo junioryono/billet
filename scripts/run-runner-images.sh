@@ -183,34 +183,32 @@ target exec mkdir -p /var/tmp/billet-ri
 # EVERY STEP STARTS IN THE ENVIRONMENT THE STEPS BEFORE IT BUILT. Packer runs a
 # step over ssh and sudo, and PAM's pam_env loads /etc/environment into both: a
 # step reads what configure-environment.sh wrote there (AGENT_TOOLSDIRECTORY,
-# say). A service started for a step loads nothing, so this wrapper does what
-# pam_env does -- NAME=VALUE lines, one pair of surrounding quotes removed,
-# nothing expanded -- and then the step's own variables apply on top.
+# say). A service started for a step loads nothing, so this wrapper reads the
+# file through pam-environment.awk, the one reader of it the build has, and then
+# the step's own variables apply on top. A file it cannot read fails the step.
 with_environment=/var/tmp/billet-ri/with-environment
 cat >"$staging/with-environment" <<'WRAPPER'
 #!/bin/sh
 file=${BILLET_RI_ENVIRONMENT:-/etc/environment}
-if [ -r "$file" ]; then
-	while IFS= read -r line || [ -n "$line" ]; do
-		case "$line" in
-		[A-Za-z_]*=*) ;;
-		*) continue ;;
-		esac
-		key=${line%%=*}
-		case "$key" in
-		*[!A-Za-z0-9_]*) continue ;;
-		esac
-		value=${line#*=}
-		case "$value" in
-		\"*\") value=${value#\"} value=${value%\"} ;;
-		esac
-		export "$key=$value"
-	done <"$file"
+reader=${BILLET_RI_ENVIRONMENT_READER:-/var/tmp/billet-ri/pam-environment.awk}
+if [ -e "$file" ]; then
+	normalized=$(mktemp) || exit 1
+	if ! awk -f "$reader" "$file" >"$normalized"; then
+		echo "with-environment: could not read $file" >&2
+		rm -f "$normalized"
+		exit 1
+	fi
+	while IFS= read -r line; do
+		export "$line"
+	done <"$normalized"
+	rm -f "$normalized"
 fi
 exec "$@"
 WRAPPER
 chmod 0755 "$staging/with-environment"
 target copy-in "$staging/with-environment" "$with_environment" || fail "could not stage the environment wrapper"
+target copy-in "$dir/pam-environment.awk" /var/tmp/billet-ri/pam-environment.awk ||
+	fail "could not stage the environment reader"
 
 total=$(jq 'length' "$plan")
 n=0

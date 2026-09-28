@@ -20,14 +20,18 @@
 #
 # Environment:
 #   BILLET_RI_ROOTFS    the mounted root filesystem (required)
-#   BILLET_RI_MACHINE   the machine name (default: billet-ri); a build names its
-#                       own, so two builds on one host never share one
+#   BILLET_RI_MACHINE   the machine name (default: billet-ri), at most twelve
+#                       characters so its host link is exactly ve-<name>; a build
+#                       names its own, so two builds on one host never share one
 #   BILLET_RI_STOP_WAIT seconds a poweroff is given before the unit is stopped
 #                       (default: 120)
 set -euo pipefail
 
 machine=${BILLET_RI_MACHINE:-billet-ri}
 unit=$machine-nspawn.service
+# THE HOST SIDE OF THE MACHINE'S LINK, named by nspawn as ve-<machine> when that
+# fits an interface name (fifteen characters), which is why the name is bounded.
+link=ve-$machine
 # THE FORWARDING RULES ARE OWNED, found again by this comment and by nothing else.
 rule_tag="billet-runner-images:$machine"
 
@@ -36,19 +40,42 @@ fail() {
 	exit 1
 }
 
+case "$machine" in
+*[!a-z0-9-]* | '') fail "the machine name $machine is not lower-case letters, digits and hyphens" ;;
+esac
+[ "${#machine}" -le 12 ] || fail "the machine name $machine is longer than twelve characters"
+
 [ -n "${BILLET_RI_ROOTFS:-}" ] || fail "BILLET_RI_ROOTFS names no root filesystem"
 
-# running answers yes (0), no (1), or could not tell (2), from the unit, which is
-# what holds the machine: systemctl is-active says "inactive" or "failed" for a
-# unit that is not running, and anything else it cannot vouch for.
+# running answers yes (0), no (1), or could not tell (2). NO NEEDS ALL THREE: the
+# unit is inactive or failed, the machine is no longer registered, and the unit's
+# cgroup, which --keep-unit makes the container's own, holds no process. A unit
+# can reach "failed" with processes its kill left behind, and a registered
+# machine is one systemd still counts as running.
 running() {
-	local state
+	local state registered cgroup
+	command -v systemctl >/dev/null 2>&1 || return 1
 	state=$(systemctl is-active "$unit" 2>/dev/null) || true
 	case "$state" in
 	active | activating | reloading | deactivating) return 0 ;;
-	inactive | failed) return 1 ;;
+	inactive | failed) ;;
 	*) return 2 ;;
 	esac
+	if registered=$(machinectl show --property=Name --value "$machine" 2>&1); then
+		return 0
+	fi
+	case "$registered" in
+	*"No machine"*) ;;
+	*) return 2 ;;
+	esac
+	cgroup=$(systemctl show --property=ControlGroup --value "$unit" 2>/dev/null) || return 2
+	if [ -n "$cgroup" ] && [ -d "/sys/fs/cgroup$cgroup" ]; then
+		if find "/sys/fs/cgroup$cgroup" -name cgroup.procs -exec cat {} + 2>/dev/null | grep -q .; then
+			return 0
+		fi
+	fi
+
+	return 1
 }
 
 # leader is the PID of the machine's init, which a reboot replaces.
@@ -56,17 +83,20 @@ leader() {
 	machinectl show --property=Leader --value "$machine" 2>/dev/null || true
 }
 
+# answers runs a probe in the machine, each bounded, so no one probe can outlast
+# the wait it belongs to.
 answers() {
-	systemd-run --machine="$machine" --quiet --wait --pipe -- "$@" </dev/null >/dev/null 2>&1
+	timeout -k 5 15 systemd-run --machine="$machine" --quiet --wait --pipe -- "$@" \
+		</dev/null >/dev/null 2>&1
 }
 
-# ready waits until the machine runs commands and resolves a name, and refuses
-# after a bound rather than hanging a build on a guest that never came up. A
+# ready waits until the machine runs commands and resolves a name, and refuses at
+# a deadline rather than hanging a build on a guest that never came up. A
 # machine that runs /bin/true and cannot reach the network would fail an hour of
 # apt later instead of here.
 ready() {
-	local i
-	for i in $(seq 1 180); do
+	local deadline=$((SECONDS + 180))
+	while [ "$SECONDS" -lt "$deadline" ]; do
 		if answers /bin/true && answers getent hosts archive.ubuntu.com; then
 			return 0
 		fi
@@ -78,23 +108,36 @@ ready() {
 # forwarding adds (-I) or removes (-D) the rules that let the machine's veth link
 # through a FORWARD policy of DROP, which the builder's own docker sets. networkd
 # masquerades the link and adds no filter exception of its own.
+# THE MACHINE'S OWN LINK ONLY, by its exact name: a pattern would let every
+# other container's link through too.
 forwarding() {
 	command -v iptables >/dev/null 2>&1 || return 0
-	iptables -w "$1" FORWARD -i "ve-+" -m comment --comment "$rule_tag" -j ACCEPT &&
-		iptables -w "$1" FORWARD -o "ve-+" -m conntrack --ctstate RELATED,ESTABLISHED \
+	iptables -w "$1" FORWARD -i "$link" -m comment --comment "$rule_tag" -j ACCEPT &&
+		iptables -w "$1" FORWARD -o "$link" -m conntrack --ctstate RELATED,ESTABLISHED \
 			-m comment --comment "$rule_tag" -j ACCEPT
 }
 
+# remove_forwarding deletes every rule carrying this machine's tag, read from the
+# ruleset rather than probed for, and proves none is left: a ruleset it cannot
+# read is not a ruleset without them.
 remove_forwarding() {
 	command -v iptables >/dev/null 2>&1 || return 0
-	while iptables -w -C FORWARD -i "ve-+" -m comment --comment "$rule_tag" -j ACCEPT 2>/dev/null; do
-		iptables -w -D FORWARD -i "ve-+" -m comment --comment "$rule_tag" -j ACCEPT
-	done
-	while iptables -w -C FORWARD -o "ve-+" -m conntrack --ctstate RELATED,ESTABLISHED \
-		-m comment --comment "$rule_tag" -j ACCEPT 2>/dev/null; do
-		iptables -w -D FORWARD -o "ve-+" -m conntrack --ctstate RELATED,ESTABLISHED \
-			-m comment --comment "$rule_tag" -j ACCEPT
-	done
+	local rules rule
+	rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain to remove $machine's rules"
+	while IFS= read -r rule; do
+		case "$rule" in
+		"-A FORWARD "*"$rule_tag"*) ;;
+		*) continue ;;
+		esac
+		local words
+		read -r -a words <<<"$rule"
+		words[0]=-D
+		iptables -w "${words[@]}" || fail "could not remove the rule: $rule"
+	done <<<"$rules"
+	rules=$(iptables -w -S FORWARD) || fail "cannot read the FORWARD chain after removing $machine's rules"
+	case "$rules" in
+	*"$rule_tag"*) fail "$machine's forwarding rules are still installed" ;;
+	esac
 }
 
 stop() {
@@ -113,7 +156,10 @@ stop() {
 		# left; a stop that cannot be proved fails, because the caller unmounts and
 		# checks the filesystem next.
 		if running; then
+			# stop ALSO CANCELS A PENDING RESTART, which Restart= would otherwise
+			# queue after the container went down.
 			systemctl stop "$unit" || true
+			machinectl terminate "$machine" 2>/dev/null || true
 		fi
 		status=0
 		running || status=$?
@@ -146,7 +192,7 @@ start)
 		--property=Restart=on-failure --property=RestartForceExitStatus=133 \
 		--property=SuccessExitStatus=133 -- \
 		systemd-nspawn --boot --quiet --machine="$machine" --directory="$BILLET_RI_ROOTFS" \
-		--capability=all --system-call-filter='@keyring bpf' --private-users=no \
+		--keep-unit --capability=all --system-call-filter='@keyring bpf' --private-users=no \
 		--network-veth --resolv-conf=replace-uplink --timezone=off
 	ready
 	;;
