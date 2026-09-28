@@ -84,7 +84,7 @@ cleanup() {
 	# and leaves them behind -- holding the image file open for whatever wants to
 	# upload or delete it next.
 	local sub
-	for sub in proc dev; do
+	for sub in proc dev tmp; do
 		if mountpoint -q "$MNT/$sub" 2>/dev/null; then
 			umount "$MNT/$sub" || umount -l "$MNT/$sub" || true
 		fi
@@ -139,6 +139,13 @@ ln -s /proc/self/fd "$MNT/dev/fd"
 ln -s /proc/self/fd/0 "$MNT/dev/stdin"
 ln -s /proc/self/fd/1 "$MNT/dev/stdout"
 ln -s /proc/self/fd/2 "$MNT/dev/stderr"
+
+# A WRITABLE SCRATCH /tmp, holding the HOME the toolchains run with: pwsh creates
+# ~/.cache before it does anything else and dies on a read-only root's home. The
+# image itself stays read-only; this tmpfs only covers its /tmp while the gate
+# runs.
+mount -t tmpfs -o nosuid,nodev,mode=1777,size=256m billet-gate-tmp "$MNT/tmp"
+mkdir -m 0700 "$MNT/tmp/home"
 
 fail() {
 	echo "  FAIL  $*" >&2
@@ -1215,7 +1222,7 @@ check_toolcache_coverage() {
 
 		# ITS OWN ERROR IS KEPT, the first lines of it: "does not run" is a verdict,
 		# and the next person needs the reason.
-		if said=$(chroot "$MNT" "$bin" "$flag" 2>&1 >/dev/null); then
+		if said=$(chroot "$MNT" /usr/bin/env HOME=/tmp/home "$bin" "$flag" 2>&1 >/dev/null); then
 			pass "$name runs from $bin"
 		else
 			fail "$name does not run from $bin, so a workflow using it fails on an image
