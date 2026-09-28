@@ -153,7 +153,7 @@
   ansible.builtin.assert:
     that:
       - billet_macos_node_acl.rc == 0
-      - billet_macos_node_acl.stdout is not search('(?m)^ *[0-9]+: ')
+      - "billet_macos_node_acl.stdout is not search('(?m)^ *[0-9]+: ')"
     fail_msg: >-
       {{ ('The access control entries on ' ~ billet_macos_node_config_path ~ ' and its directory could not be listed: '
           ~ (billet_macos_node_acl.stderr | default('') | trim))
