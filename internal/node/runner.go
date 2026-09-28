@@ -122,6 +122,8 @@ type Runner struct {
 	log             *slog.Logger
 	cache           *CacheService
 	registryMirrors config.RegistryMirrors
+	// monitor measures each running job from the host; nil measures nothing.
+	monitor JobMonitor
 	// upgrader replaces this node's own billet. Nil means it cannot, which the
 	// upgrade command reports rather than silently ignoring.
 	upgrader Upgrader
@@ -592,6 +594,8 @@ func (r *Runner) Launch(
 	r.runningLease[job.RequestID] = lease
 	r.mu.Unlock()
 
+	r.startMonitoring(ctx, lease, inst)
+
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
 		"instance", inst.ID, "trust", trust)
@@ -622,6 +626,7 @@ func (r *Runner) forgetRunningLocked(name string) {
 			delete(r.runningLease, requestID)
 		}
 	}
+	r.forgetMonitoring(name)
 }
 
 func (r *Runner) removeRegistration(
@@ -782,6 +787,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
+	// THE LAST SAMPLE IS TAKEN BEFORE THE DESTROY, because the cgroup and the
+	// VMM's threads it reads go with the compute.
+	measured, hasUsage := r.finalUsage(inst.Name)
+
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
@@ -808,6 +817,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	if r.cache != nil {
 		r.cache.SettleObservation(ctx, inst.Name)
 	}
+	// AND SO IS WHAT THE JOB DID TO THE HOST, for the same reason: the report is
+	// fenced on the lease, which the plane releases only after this returns.
+	if hasUsage && holdable {
+		r.reportUsage(ctx, lease, inst.Name, measured)
+	}
 
 	if state != provider.TeardownStopped && !holdable {
 		// KEPT IN THE MAPS, so the retry re-enters here rather than through the
@@ -826,6 +840,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	delete(r.running, requestID)
 	delete(r.runningLease, requestID)
 	r.mu.Unlock()
+	r.forgetMonitoring(inst.Name)
 
 	// THE BACKEND DID NOT CONFIRM THE GUEST HAD STOPPED.
 	//

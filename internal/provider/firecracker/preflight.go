@@ -27,6 +27,9 @@ type HostReport struct {
 	// entry means fork pull-request work is refused.
 	Bridge          string
 	UntrustedBridge string
+	// Accounting is whether each microVM's cgroup could account for its memory
+	// and io, read from the cgroup-v2 hierarchy whether or not this node asks.
+	Accounting Accounting
 }
 
 // ErrNoKVM is returned when this machine cannot run a hardware-accelerated guest.
@@ -83,6 +86,14 @@ func (p *Provider) CheckHost(ctx context.Context, needsRootResize bool) (HostRep
 
 	if err := p.checkBridges(ctx); err != nil {
 		return report, err
+	}
+
+	// REPORTED, NEVER FATAL: accounting is monitoring's, and a host without it
+	// launches exactly as it always has.
+	if root, err := cgroup2Mount(p.procMountsPath); err != nil {
+		report.Accounting = Accounting{Reason: err.Error()}
+	} else {
+		report.Accounting = probeAccounting(root)
 	}
 
 	return report, nil

@@ -36,6 +36,27 @@ UPDATE job_history SET result = @result, result_at = @result_at WHERE lease_id =
 UPDATE job_history SET run_id = @run_id
  WHERE lease_id = @lease_id AND COALESCE(run_id, 0) = 0;
 
+-- name: RecordJobIdentity :exec
+-- Record which of GitHub's jobs this lease ran, filling only what is empty.
+--
+-- EACH COLUMN IS WRITE-ONCE, and only for the job already named. A pooled
+-- runner learns its job on JobStarted and a direct assignment at assignment;
+-- a completion then fills only what neither recorded. The job-id filter is in
+-- the statement so a message about a different job can never splice its name
+-- or repository onto the one this row recorded, which is also why the job id
+-- itself needs no CASE: the filter admits only an empty one or the same.
+UPDATE job_history
+   SET github_job_id = CAST(@github_job_id AS TEXT),
+       repo          = CASE WHEN COALESCE(repo, '') = '' THEN CAST(@repo AS TEXT)
+                            ELSE repo END,
+       workflow_ref  = CASE WHEN workflow_ref = '' THEN CAST(@workflow_ref AS TEXT)
+                            ELSE workflow_ref END,
+       job_name      = CASE WHEN job_name = '' THEN CAST(@job_name AS TEXT)
+                            ELSE job_name END,
+       event         = CASE WHEN event = '' THEN CAST(@event AS TEXT) ELSE event END
+ WHERE lease_id = @lease_id
+   AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
+
 -- name: ListAttributedFailures :many
 -- Jobs that did not succeed while billet's own infrastructure was disrupted.
 --
@@ -240,7 +261,8 @@ SELECT failure_reason FROM job_history WHERE lease_id = @lease_id;
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, conclusion, failure_reason,
        result, disruption, queued_at, COALESCE(started_at, '') AS started_at,
-       COALESCE(finished_at, '') AS finished_at
+       COALESCE(finished_at, '') AS finished_at, github_job_id,
+       COALESCE(repo, '') AS repo, workflow_ref, job_name, event
   FROM job_history
  ORDER BY queued_at, lease_id
  LIMIT CAST(@max_rows AS BIGINT);
@@ -257,3 +279,18 @@ SELECT tier, image_cache, actions_cache, sticky_cache, git_cache, bazel_cache, g
  WHERE assigned_at >= @since
  ORDER BY assigned_at DESC
  LIMIT CAST(@max_rows AS BIGINT);
+
+-- name: ReadJob :one
+-- One job's whole history row, for `billet jobs show`.
+--
+-- sql.ErrNoRows means the lease was never assigned a job. Every empty string
+-- here is "not recorded", which a reader renders as such rather than as a
+-- value.
+SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
+       COALESCE(request_id, 0) AS request_id, github_job_id,
+       COALESCE(repo, '') AS repo, workflow_ref, job_name, event,
+       COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
+       queued_at, COALESCE(assigned_at, '') AS assigned_at,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
+       chosen_provider, instance_type, vcpu, memory, site
+  FROM job_history WHERE lease_id = @lease_id;

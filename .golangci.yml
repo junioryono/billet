@@ -337,6 +337,17 @@ linters:
             - pkg: "github.com/junioryono/billet/internal"
               desc: "config is a leaf package — it must not import other billet packages."
 
+        # usage reads counters under a root it is given and imports nothing of
+        # ours, so every parser runs against captured bytes and the node, not
+        # the sampler, decides what a measurement becomes on the wire.
+        usage:
+          list-mode: lax
+          files:
+            - "**/internal/usage/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal"
+              desc: "usage is a leaf package — it must not import other billet packages."
+
         # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
         #
         # The writer pool is ONE connection and DB.Tx begins IMMEDIATE, so a

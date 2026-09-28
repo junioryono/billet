@@ -1155,6 +1155,7 @@ func execute(
 			Owner:       cmd.Job.Owner,
 			Repository:  cmd.Job.Repository,
 			WorkflowRef: cmd.Job.WorkflowRef,
+			JobID:       cmd.Job.JobID,
 		})
 		if err == nil {
 			res.OK = true

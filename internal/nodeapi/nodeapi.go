@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 23
+	Version = 24
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -321,6 +321,19 @@ const (
 	// same or less, and for a trusted pool told to publish nothing, or a cache
 	// turned off or held smaller, does more.
 	VersionCacheAuthority = 23
+
+	// VersionJobUsage is the version from which a launch names GitHub's job id
+	// and a node can report what a job used on the host
+	// (POST /v1/nodes/{node}/leases/{lease}/usage).
+	//
+	// BOTH ARE DIAGNOSTICS, reported rather than refused: they decide nothing
+	// about capacity, fencing, identity, custody or destruction. The job id
+	// needs no check where it is sent, because it travels to the node's lenient
+	// decoder and an older node ignores it. The usage report is CHECKED WHERE IT
+	// IS SENT, like VersionCacheObservation and for the same reason: an older
+	// plane answers the route with a bare 404, and what the pairing loses is the
+	// measurement, never a job.
+	VersionJobUsage = 24
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.
@@ -869,6 +882,9 @@ type Job struct {
 	Owner       string `json:"owner"`
 	Repository  string `json:"repository"`
 	WorkflowRef string `json:"workflow_ref"`
+	// JobID is GitHub's workflow-job id, empty for a pooled runner launched
+	// before GitHub chose its job. See VersionJobUsage.
+	JobID string `json:"job_id,omitempty"`
 }
 
 // CommandResult reports what happened.
