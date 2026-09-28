@@ -191,8 +191,15 @@ func (h *helper) get(ctx context.Context, req request, resp *response) {
 	resp.Miss = true
 }
 
+// answer fills resp from found, whose output every reader checked is a digest;
+// one that does not decode is a miss rather than a hit naming nothing.
 func answer(resp *response, found entry, path string) {
-	output, _ := hex.DecodeString(found.output)
+	output, err := hex.DecodeString(found.output)
+	if err != nil {
+		resp.Miss = true
+
+		return
+	}
 	at := found.at
 	resp.OutputID, resp.Size, resp.Time, resp.DiskPath = output, found.size, &at, path
 }

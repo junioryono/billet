@@ -1031,7 +1031,7 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A GIT FETCH AUTHENTICATES BY BASIC CREDENTIALS, which is all git sends to
 	// an origin it was rewritten to.
 	if strings.HasPrefix(r.URL.Path, gitPathPrefix) {
-		s.serveGit(w, r)
+		s.serveGit(r.Context(), w, r)
 
 		return
 	}
@@ -1046,12 +1046,12 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// admission the volume API takes. A gRPC call is the Remote Execution API
 	// over the same volume.
 	if reapi.IsGRPC(r) {
-		s.serveRemoteAPI(w, r, session)
+		s.serveRemoteAPI(r.Context(), w, r, session)
 
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, casPathPrefix) {
-		s.serveCAS(w, r, session)
+		s.serveCAS(r.Context(), w, r, session)
 
 		return
 	}
@@ -1270,7 +1270,10 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 		return nil
 	}
 	attachment, err := s.awaitDockerReady(ctx, session)
-	if err != nil || attachment == nil {
+	if errors.Is(err, errNoDockerStore) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if err := lockCacheSession(ctx, session); err != nil {
@@ -1284,9 +1287,13 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	return s.publishDocker(ctx, session, attachment)
 }
 
+// errNoDockerStore is awaitDockerReady's answer for a session with no Docker
+// image store: there is nothing to settle.
+var errNoDockerStore = errors.New("this session has no Docker image store")
+
 // awaitDockerReady opens the Docker store's settlement and waits for the guest
-// to prove it quiesced, returning the ready attachment, or nil when the session
-// has no Docker store.
+// to prove it quiesced, returning the ready attachment, or errNoDockerStore
+// when the session has none.
 func (s *CacheService) awaitDockerReady(
 	ctx context.Context, session *cacheSession,
 ) (*cacheAttachment, error) {
@@ -1297,7 +1304,7 @@ func (s *CacheService) awaitDockerReady(
 	if attachment == nil || !attachment.Docker {
 		session.mu.Unlock()
 
-		return nil, nil
+		return nil, errNoDockerStore
 	}
 	if !attachment.Settling {
 		attachment.Settling = true
@@ -1322,7 +1329,7 @@ func (s *CacheService) awaitDockerReady(
 		if attachment == nil || !attachment.Docker {
 			session.mu.Unlock()
 
-			return nil, nil
+			return nil, errNoDockerStore
 		}
 		ready := attachment.Ready
 		session.mu.Unlock()

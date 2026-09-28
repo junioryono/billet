@@ -363,17 +363,17 @@ func (s *service) GetActionResult(
 	// EVERY BLOB IS CHECKED ONCE, and a Tree expanded once, within one budget
 	// for the whole result: a result naming one Tree a thousand times must not
 	// cost a thousand expansions of it.
-	check := resultCheck{ctx: ctx, v: v, seen: make(map[string]bool), expanded: make(map[string]bool)}
+	check := resultCheck{v: v, seen: make(map[string]bool), expanded: make(map[string]bool)}
 	for _, d := range []*repb.Digest{result.GetStdoutDigest(), result.GetStderrDigest()} {
-		check.blob(d)
+		check.blob(ctx, d)
 	}
 	for _, file := range result.GetOutputFiles() {
-		check.blob(file.GetDigest())
+		check.blob(ctx, file.GetDigest())
 	}
 	for _, dir := range result.GetOutputDirectories() {
 		// AND EVERY FILE THE TREE NAMES: a tree that is present says nothing
 		// about the outputs inside it.
-		check.tree(dir.GetTreeDigest())
+		check.tree(ctx, dir.GetTreeDigest())
 	}
 	if check.err != nil {
 		return nil, check.err
@@ -393,7 +393,6 @@ const (
 // first failure stops it; a missing blob is NotFound. A digest checked as a
 // blob is still expanded as a Tree: the two are different questions about it.
 type resultCheck struct {
-	ctx       context.Context
 	v         Volume
 	seen      map[string]bool
 	expanded  map[string]bool
@@ -403,11 +402,11 @@ type resultCheck struct {
 
 func (c *resultCheck) fail(err error) { c.err = err }
 
-func (c *resultCheck) first(d *repb.Digest) bool {
+func (c *resultCheck) first(ctx context.Context, d *repb.Digest) bool {
 	if c.err != nil || d == nil {
 		return false
 	}
-	if err := c.ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		c.fail(code(err))
 
 		return false
@@ -431,8 +430,8 @@ func (c *resultCheck) first(d *repb.Digest) bool {
 	return true
 }
 
-func (c *resultCheck) blob(d *repb.Digest) {
-	if !c.first(d) {
+func (c *resultCheck) blob(ctx context.Context, d *repb.Digest) {
+	if !c.first(ctx, d) {
 		return
 	}
 	present, err := has(c.v, d)
@@ -448,10 +447,10 @@ func digestKey(d *repb.Digest) string {
 	return d.GetHash() + "/" + strconv.FormatInt(d.GetSizeBytes(), 10)
 }
 
-func (c *resultCheck) tree(d *repb.Digest) {
+func (c *resultCheck) tree(ctx context.Context, d *repb.Digest) {
 	// PRESENT AT EXACTLY ITS SIZE, as ByteStream will serve it, before anything
 	// is read of it.
-	c.blob(d)
+	c.blob(ctx, d)
 	if d == nil || c.err != nil || c.expanded[digestKey(d)] {
 		return
 	}
@@ -469,7 +468,7 @@ func (c *resultCheck) tree(d *repb.Digest) {
 		return
 	}
 	for _, file := range files {
-		c.blob(file)
+		c.blob(ctx, file)
 	}
 }
 

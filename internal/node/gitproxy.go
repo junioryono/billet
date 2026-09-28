@@ -237,7 +237,7 @@ func (s *CacheService) parseGitRequest(r *http.Request) (gitRequest, bool, bool)
 }
 
 // serveGit answers one request under gitPathPrefix.
-func (s *CacheService) serveGit(w http.ResponseWriter, r *http.Request) {
+func (s *CacheService) serveGit(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	request, ok, authenticated := s.parseGitRequest(r)
 	if !ok {
 		http.NotFound(w, r)
@@ -252,7 +252,12 @@ func (s *CacheService) serveGit(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
-	ctx, cancel := extendTransfer(w, r)
+	ctx, cancel, err := extendTransfer(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
 	defer cancel()
 	// THE TRANSFER'S DEADLINE GOES WITH EVERY BRANCH, a forward included.
 	r = r.WithContext(ctx)
@@ -363,13 +368,21 @@ func (s *CacheService) forwardGit(w http.ResponseWriter, r *http.Request, reques
 	proxy.ServeHTTP(w, r)
 }
 
+// gitAnswer is what GitHub answered an advertisement, read whole, so nothing of
+// the response outlives the request that fetched it.
+type gitAnswer struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
 // upstreamRefs asks GitHub for the repository's v0 advertisement with the job's
 // header. A status other than 200 is GitHub's answer to this job, relayed.
-func (s *CacheService) upstreamRefs(ctx context.Context, request gitRequest) (*http.Response, []byte, error) {
+func (s *CacheService) upstreamRefs(ctx context.Context, request gitRequest) (*gitAnswer, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		s.git.upstream+"/"+request.owner+"/"+request.repo+".git/info/refs?service=git-upload-pack", nil)
+		s.git.upstream+"/"+request.owner+"/"+request.repo+".git/info/refs?service=git-upload-pack", http.NoBody)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if request.auth != "" {
 		req.Header.Set("Authorization", string(request.auth))
@@ -377,18 +390,18 @@ func (s *CacheService) upstreamRefs(ctx context.Context, request gitRequest) (*h
 	req.Header.Set("User-Agent", "git/2 billet")
 	resp, err := s.git.client.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, gitAdvertisementLimit+1))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(body) > gitAdvertisementLimit {
-		return nil, nil, errors.New("the advertisement is larger than the proxy reads")
+		return nil, errors.New("the advertisement is larger than the proxy reads")
 	}
 
-	return resp, body, nil
+	return &gitAnswer{StatusCode: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }
 
 func (g *gitProxy) authorisationKey(request gitRequest) string {
@@ -424,7 +437,7 @@ func (s *CacheService) mirrorsOwner(request gitRequest) bool {
 // header's fetch, and reported; anything else withdraws an earlier redirect,
 // so a fetch never follows a rename GitHub has since stopped giving.
 func (g *gitProxy) learnRename(
-	request gitRequest, resp *http.Response, now time.Time, sequence uint64,
+	request gitRequest, resp *gitAnswer, now time.Time, sequence uint64,
 ) (gitRequest, bool) {
 	moved, ok := g.renameTarget(request, resp)
 	g.mu.Lock()
@@ -449,7 +462,7 @@ func (g *gitProxy) learnRename(
 
 // renameTarget is where resp redirects request's advertisement, when that is
 // another repository on github.com.
-func (g *gitProxy) renameTarget(request gitRequest, resp *http.Response) (gitRequest, bool) {
+func (g *gitProxy) renameTarget(request gitRequest, resp *gitAnswer) (gitRequest, bool) {
 	if resp == nil || resp.StatusCode < 300 || resp.StatusCode > 399 {
 		return request, false
 	}
@@ -537,7 +550,7 @@ func (g *gitProxy) mirrorPath(key string) string { return filepath.Join(g.root, 
 // GitHub too.
 func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, r *http.Request, request gitRequest) {
 	sequence := s.git.ask()
-	resp, body, err := s.upstreamRefs(ctx, request)
+	resp, err := s.upstreamRefs(ctx, request)
 	// ONE HOP, followed here for the reason serveGit follows a known one. Could
 	// not tell withdraws an earlier rename as any other answer does.
 	if moved, ok := s.git.learnRename(request, resp, s.now(), sequence); ok && err == nil {
@@ -546,7 +559,7 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 		// back to the client, whose fetch then follows it to GitHub.
 		if !s.mirrorsOwner(moved) {
 			s.git.remember(moved, s.now(), sequence, false, false)
-			s.relayGit(w, r, resp, body)
+			s.relayGit(w, r, resp)
 
 			return
 		}
@@ -555,7 +568,7 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 		// so a refusal of it outranks whatever was said about it before. A second
 		// redirect is recorded and relayed, never followed.
 		request, sequence = moved, s.git.ask()
-		resp, body, err = s.upstreamRefs(ctx, request)
+		resp, err = s.upstreamRefs(ctx, request)
 		s.git.learnRename(request, resp, s.now(), sequence)
 	}
 	if err != nil {
@@ -569,34 +582,40 @@ func (s *CacheService) gitAdvertise(ctx context.Context, w http.ResponseWriter, 
 	}
 	if resp.StatusCode != http.StatusOK {
 		s.git.remember(request, s.now(), sequence, false, false)
-		s.relayGit(w, r, resp, body)
+		s.relayGit(w, r, resp)
 
 		return
 	}
 
 	s.gitBegin(request.session)
-	advertisement, existed, err := s.refreshMirror(ctx, request, body)
+	advertisement, existed, err := s.refreshMirror(ctx, request, resp.Body)
 	s.git.remember(request, s.now(), sequence, true, err == nil)
-	s.noteGit(ctx, request.session, err, existed)
+	s.noteGit(request.session, err, existed)
 	if err != nil {
 		s.log.Info("the git cache could not serve a repository; github.com serves it",
 			"repository", request.owner+"/"+request.repo, "error", err)
-		s.relayGit(w, r, resp, body)
+		s.relayGit(w, r, resp)
 
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(pktLine("# service=git-upload-pack\n"))
-	_, _ = w.Write([]byte("0000"))
-	_, _ = w.Write(advertisement)
+	s.writeGit(w, slices.Concat(pktLine("# service=git-upload-pack\n"), []byte("0000"), advertisement))
+}
+
+// writeGit sends an answer's body. One that cannot be written is a client that
+// went away, with nothing left to tell it.
+func (s *CacheService) writeGit(w http.ResponseWriter, body []byte) {
+	if _, err := w.Write(body); err != nil {
+		s.log.Debug("a git client went away before its answer was written", "error", err)
+	}
 }
 
 // relayGit answers with what GitHub answered. A redirect keeps its
 // destination, and one within github.com is sent back through the proxy, so the
 // client's next request carries its credentials here rather than going to
 // GitHub without the header the rewrite dropped.
-func (s *CacheService) relayGit(w http.ResponseWriter, r *http.Request, resp *http.Response, body []byte) {
+func (s *CacheService) relayGit(w http.ResponseWriter, r *http.Request, resp *gitAnswer) {
 	for _, name := range []string{"Content-Type", "WWW-Authenticate", "Cache-Control"} {
 		if value := resp.Header.Get(name); value != "" {
 			w.Header().Set(name, value)
@@ -609,7 +628,7 @@ func (s *CacheService) relayGit(w http.ResponseWriter, r *http.Request, resp *ht
 		w.Header().Set("Location", location)
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(body)
+	s.writeGit(w, resp.Body)
 }
 
 func pktLine(payload string) []byte { return fmt.Appendf(nil, "%04x%s", len(payload)+4, payload) }
@@ -661,7 +680,7 @@ func advertisedRefs(body []byte) (map[string]string, string, error) {
 
 // noteGit records what the git cache did for one advertisement: served from a
 // mirror that already existed, served from one made for it, or not served.
-func (s *CacheService) noteGit(ctx context.Context, session *cacheSession, err error, existed bool) {
+func (s *CacheService) noteGit(session *cacheSession, err error, existed bool) {
 	outcome := alloc.BuildCacheCold
 	switch {
 	case err != nil:
@@ -740,7 +759,7 @@ func (s *CacheService) refreshHeld(
 	if err != nil || !sameRefs(current, refs) {
 		if full, statErr := filledAbove(s.git.root, s.git.fullFraction); statErr == nil && full {
 			mirror.fetch.Unlock()
-			s.wakeGitReaper()
+			s.wakeGitReaper(ctx)
 
 			return nil, false, errors.New("the git cache's filesystem is full")
 		}
@@ -754,8 +773,7 @@ func (s *CacheService) refreshHeld(
 	if err != nil {
 		return nil, false, err
 	}
-	now := s.now()
-	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
+	s.markMirrorUsed(path)
 
 	advertisement, err := s.runGit(ctx, path, nil, append(slices.Clone(uploadPackConfig),
 		"upload-pack", "--stateless-rpc", "--advertise-refs", ".")...)
@@ -839,8 +857,10 @@ func (s *CacheService) fetchMirror(ctx context.Context, path string, request git
 				return
 			case <-ticker.C:
 			}
-			if directorySize(path) > ceiling {
-				stop(errMirrorTooLarge)
+			// A MIRROR WHOSE SIZE CANNOT BE READ IS STOPPED as one past its
+			// ceiling is: the watchdog cannot vouch for it.
+			if size, err := directorySize(path); err != nil || size > ceiling {
+				stop(errors.Join(errMirrorTooLarge, err))
 
 				return
 			}
@@ -856,22 +876,26 @@ func (s *CacheService) fetchMirror(ctx context.Context, path string, request git
 	if cause := context.Cause(watched); cause != nil && !errors.Is(cause, context.Canceled) {
 		return cause
 	}
-	if err == nil && directorySize(path) > ceiling {
-		return errMirrorTooLarge
+	if err != nil {
+		return err
+	}
+	if size, err := directorySize(path); err != nil || size > ceiling {
+		return errors.Join(errMirrorTooLarge, err)
 	}
 
-	return err
+	return nil
 }
 
 // wakeGitReaper reaps unused mirrors now rather than at the next maintenance
-// pass, once, when the filesystem is found full.
-func (s *CacheService) wakeGitReaper() {
+// pass, once, when the filesystem is found full. The pass outlives the request
+// that found it full, so it keeps the request's values and not its end.
+func (s *CacheService) wakeGitReaper(ctx context.Context) {
 	if !s.git.reaping.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer s.git.reaping.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), casRequestLife)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), casRequestLife)
 		defer cancel()
 		if err := s.ReapGitMirrors(ctx); err != nil {
 			s.log.Warn("could not reap git mirrors on a full filesystem", "error", err)
@@ -879,20 +903,44 @@ func (s *CacheService) wakeGitReaper() {
 	}()
 }
 
-// directorySize is the bytes of the regular files under path.
-func directorySize(path string) int64 {
+// directorySize is the bytes of the regular files under path. A file that
+// vanishes mid-walk is one git removed and no longer counts; anything else
+// unreadable leaves the size unknown.
+func directorySize(path string) (int64, error) {
 	var size int64
-	_ = filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
-		if err == nil && entry.Type().IsRegular() {
-			if info, err := entry.Info(); err == nil {
-				size += info.Size()
-			}
+	err := filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
 		}
+		if err != nil {
+			return err
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		size += info.Size()
 
 		return nil
 	})
 
-	return size
+	return size, err
+}
+
+// markMirrorUsed stamps a mirror as served now, which is what the reaper reads.
+// A stamp that cannot be written costs only an earlier reap and a refetch.
+func (s *CacheService) markMirrorUsed(path string) {
+	now := s.now()
+	if err := os.Chtimes(filepath.Join(path, gitUsedStamp), now, now); err != nil {
+		s.log.Warn("could not mark a git mirror used; the reaper may take it sooner",
+			"mirror", filepath.Base(path), "error", err)
+	}
 }
 
 // killGroup makes cancelling cmd end every process it started, not only git:
@@ -906,6 +954,7 @@ func killGroup(cmd *exec.Cmd) {
 // runGit runs git in dir with a closed environment: no system or global
 // configuration, no prompt, protocol v0, and only what extra adds.
 func (s *CacheService) runGit(ctx context.Context, dir string, extra []string, args ...string) ([]byte, error) {
+	//nolint:gosec // G204: the node's configured git, with billet's own arguments and owner/repo segments gitSegment admitted
 	cmd := exec.CommandContext(ctx, s.git.binary, args...)
 	killGroup(cmd)
 	cmd.Dir = dir
@@ -979,6 +1028,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	//nolint:gosec // G204: the node's configured git, with billet's own arguments
 	cmd := exec.CommandContext(ctx, s.git.binary, append(slices.Clone(uploadPackConfig),
 		"upload-pack", "--stateless-rpc", ".")...)
 	killGroup(cmd)
@@ -996,8 +1046,7 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 		s.log.Warn("a fetch from the git cache failed", "repository", request.owner+"/"+request.repo,
 			"error", err, "stderr", boundedOutput(stderr.Bytes()))
 	}
-	now := s.now()
-	_ = os.Chtimes(filepath.Join(path, gitUsedStamp), now, now)
+	s.markMirrorUsed(path)
 }
 
 // negotiatedWants reads the objects a v0 fetch negotiation wants, every
@@ -1006,7 +1055,9 @@ func (s *CacheService) gitUploadPack(ctx context.Context, w http.ResponseWriter,
 // parents without judging them (git 2.51.0's send_unshallow), so a negotiation
 // that names one is GitHub's to answer; `deepen` alone walks from the wants,
 // which are judged.
-func negotiatedWants(negotiation []byte) (wants []string, shallow bool) {
+func negotiatedWants(negotiation []byte) ([]string, bool) {
+	var wants []string
+	shallow := false
 	for len(negotiation) >= 4 {
 		var size int
 		if _, err := fmt.Sscanf(string(negotiation[:4]), "%04x", &size); err != nil {
@@ -1053,6 +1104,7 @@ func (s *CacheService) mirrorServesWants(ctx context.Context, path string, wants
 		}
 		input.WriteString(want + "\n")
 	}
+	//nolint:gosec // G204: the node's configured git; literal arguments, and the wants go on stdin
 	cmd := exec.CommandContext(ctx, s.git.binary, "cat-file",
 		"--batch-check=%(objectname) %(objecttype)")
 	cmd.Dir = path
