@@ -286,7 +286,12 @@ func TestAStartThatOutlivesItsLimitDoesNotBringAForgottenJobBack(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Errorf("close the fifo: %v", err)
 	}
-	m.Tick() // served after the stuck Start, so the Start has finished by now
+	// A REQUEST THAT READS NOTHING, served after the stuck Start: once Run
+	// answers it, the Start has finished. A Tick here would hang on the very
+	// regression this test is for, reading the resurrected job's FIFO again.
+	if _, answered := m.ask(request{kind: requestFinal, key: "absent"}, 10*time.Second); !answered {
+		t.Fatal("the sampler never finished the stuck Start")
+	}
 
 	m.mu.Lock()
 	_, back := m.jobs["vm"]
@@ -309,5 +314,23 @@ func TestAJobStartedJustAfterATickStillMissesTheGap(t *testing.T) {
 
 	if finalOf(t, h.m).Measured.Energy {
 		t.Error("a job unsampled for 39 of its first seconds reported its energy as measured")
+	}
+}
+
+// A JOB STILL PENDING HOLDS ITS RESERVATION: its compute is live whether or not
+// the sampler has taken its baseline, so another job is not charged its idle.
+func TestAPendingJobHoldsItsReservation(t *testing.T) {
+	h := newEnergyHost(t, 73.5)
+	h.m.Start("vm", h.target, 128)
+	h.m.mu.Lock()
+	h.m.jobs["pending"] = &job{target: h.target, vcpus: 128, first: *h.now, pending: true}
+	h.m.mu.Unlock()
+	h.advance(10*time.Second, "69571715")
+	h.m.Tick()
+
+	s := finalOf(t, h.m)
+	if !s.Measured.Energy || s.EnergyIdle != 735_000_000/2 {
+		t.Errorf("idle = %d µJ (measured %v), want half of 735000000: the pending job holds the other half",
+			s.EnergyIdle, s.Measured.Energy)
 	}
 }

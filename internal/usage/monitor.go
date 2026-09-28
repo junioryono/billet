@@ -294,21 +294,25 @@ func (m *Monitor) tick() {
 	}
 	activePool := float64(pkgDelta) - idlePool
 
+	// THE RESERVATION COUNTS EVERY LIVE JOB, pending or unreadable included:
+	// failing to take a job's baseline or read its CPU does not free the CPUs
+	// its compute holds.
+	reserved := 0
+	for _, j := range m.jobs {
+		reserved += j.vcpus
+	}
+
 	// EVERY JOB'S CPU DELTA IS CHECKED BEFORE ANY IS USED, alone and together:
 	// a negative delta, or jobs that together ran longer than the host was busy,
-	// makes the interval could-not-tell for all of them. The reservation counts
-	// every live job, measured or not: failing to read a job's CPU does not free
-	// the CPUs it holds.
+	// makes the interval could-not-tell for all of them.
 	deltas := make(map[string]int64, len(samples))
 	var total int64
-	reserved := 0
 	consistent := energyOK && hostOK && busyDelta > 0 && dt > 0
 	for key, s := range samples {
 		j := m.jobs[key]
 		if j != snapshot[key] {
 			continue
 		}
-		reserved += j.vcpus
 		if !s.CPUOK || !j.lastCPUOK {
 			continue
 		}
