@@ -972,7 +972,9 @@ all:
 
     # The fleet playbook targets three groups. An empty one is declared so a
     # strict host-pattern setting cannot fail a play that has nothing to do;
-    # a Mac added here gets development_host when billet_development_enabled.
+    # a Mac added here, reached as its node account, gets its billet.yaml from
+    # billet_config (macos_node) and development_host when
+    # billet_development_enabled.
     macos:
       hosts: {}
 `,
