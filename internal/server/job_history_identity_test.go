@@ -53,27 +53,43 @@ func TestAPooledJobsHistoryNamesTheJobItRan(t *testing.T) {
 	}
 }
 
-// AN ASSIGNMENT THAT NAMES ITS JOB RECORDS IT when the lease is assigned, so a
-// job that never reaches JobStarted (a launch that fails) still says whose it
-// was.
-func TestAnAssignedJobsHistoryNamesTheJob(t *testing.T) {
+// A SWAPPED POOL RUNNER'S HISTORY NAMES THE JOB IT RAN, not the one it was
+// launched for. GitHub gives a pooled runner any waiting job, so the assignment
+// that caused the launch says nothing about what ran; recorded at assignment,
+// the launch's job would win the write-once column and the job that ran could
+// never be written.
+func TestASwappedPoolRunnersHistoryNamesTheJobItRan(t *testing.T) {
 	t.Parallel()
 
-	assigned := job11
-	assigned.Event = "pull_request"
-	assigned.Owner, assigned.Repository = "acme", "web"
-	assigned.WorkflowRef = "acme/web/.github/workflows/test.yml@refs/pull/9/merge"
-	assigned.JobName = "unit"
+	assigned11, assigned12 := job11, job12
+	assigned11.Owner, assigned11.Repository, assigned11.JobName = "acme", "web", "launched-for"
+	assigned12.Owner, assigned12.Repository = "acme", "api"
+	p := newRunnerlessPool(t, assigned11, assigned12)
+	swapped := p.launchedFor11(t)
 
-	p := newRunnerlessPool(t, assigned)
+	started := assigned12
+	started.RunnerID, started.RunnerName = 77, swapped.RunnerName
+	started.Event = "push"
+	started.WorkflowRef = "acme/api/.github/workflows/ci.yml@refs/heads/main"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("start job 12 on the runner launched for 11: %v", err)
+	}
 
-	got, err := p.a.Job(t.Context(), p.launchedFor11(t).LeaseID)
+	completed := started
+	completed.Result, completed.JobName = "Succeeded", "ran"
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("complete job 12: %v", err)
+	}
+
+	got, err := p.a.Job(t.Context(), swapped.LeaseID)
 	if err != nil {
 		t.Fatalf("Job: %v", err)
 	}
-	want := alloc.HistoryJob{JobID: "job-11", WorkflowRef: assigned.WorkflowRef,
-		Name: "unit", Event: "pull_request"}
-	if got.Job != want || got.Repo != "acme/web" {
-		t.Errorf("after assignment the row says %+v in %q, want %+v in acme/web", got.Job, got.Repo, want)
+	want := alloc.HistoryJob{JobID: "job-12", WorkflowRef: started.WorkflowRef, Name: "ran", Event: "push"}
+	if got.Job != want || got.Repo != "acme/api" {
+		t.Errorf("the swapped runner's row says %+v in %q, want the job it ran, %+v in acme/api",
+			got.Job, got.Repo, want)
 	}
 }

@@ -146,16 +146,45 @@ func (u JobUsage) Validate() error {
 			return fmt.Errorf("alloc: usage %s is negative (%d)", name, v)
 		}
 	}
+	for group, fields := range u.groupFields() {
+		if u.Measured(group) {
+			continue
+		}
+		for _, v := range fields {
+			if v != 0 {
+				return fmt.Errorf("alloc: a usage report names %s unmeasured and reports some", group)
+			}
+		}
+	}
 	switch {
 	case !u.Measured(UsageEnergy):
-		if u.EnergySource != "" || u.EnergyActiveMicrojoules != 0 || u.EnergyIdleMicrojoules != 0 {
-			return errors.New("alloc: a usage report names energy unmeasured and reports some")
+		if u.EnergySource != "" {
+			return errors.New("alloc: a usage report names energy unmeasured and gives it a source")
 		}
-	case u.EnergySource != EnergyRAPL && u.EnergySource != EnergyRAPLUnsplit:
+	case u.EnergySource == EnergyRAPLUnsplit:
+		if u.EnergyIdleMicrojoules != 0 {
+			return errors.New("alloc: unsplit energy has no idle share, so it cannot report one")
+		}
+	case u.EnergySource != EnergyRAPL:
 		return fmt.Errorf("alloc: energy source %q is not one this control plane records", u.EnergySource)
 	}
 
 	return nil
+}
+
+// groupFields maps each measurement group to the quantities it owns, which are
+// zero whenever the group is unmeasured.
+func (u JobUsage) groupFields() map[string][]int64 {
+	return map[string][]int64{
+		UsageCPU:     {u.CPUUserMicros, u.CPUSystemMicros},
+		UsageThreads: {u.GuestCPUMicros, u.VMMCPUMicros},
+		UsageMemory:  {u.MemoryPeakBytes, u.OOMKills},
+		UsageIO:      {u.DiskReadBytes, u.DiskWriteBytes},
+		UsageNet:     {u.NetRxBytes, u.NetTxBytes, u.NetRxPackets, u.NetTxPackets},
+		UsagePressure: {u.CPUSomeMicros, u.CPUFullMicros, u.MemorySomeMicros, u.MemoryFullMicros,
+			u.IOSomeMicros, u.IOFullMicros},
+		UsageEnergy: {u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules},
+	}
 }
 
 // Validate refuses a series this build cannot read back or the wire could not
@@ -197,7 +226,7 @@ func (a *Allocator) RecordLeaseUsage(
 		}
 
 		q := state.WriteQueries(tx)
-		if err := q.RecordJobUsage(ctx, ledgerdb.RecordJobUsageParams{
+		won, err := q.RecordJobUsage(ctx, ledgerdb.RecordJobUsageParams{
 			LeaseID: lease.ID, Node: lease.Node, RecordedAt: nowStamp(),
 			Source: usage.Source, Unmeasured: strings.Join(usage.Unmeasured, ","),
 			Samples: usage.Samples, IntervalMs: usage.IntervalMillis, WindowMs: usage.WindowMillis,
@@ -212,11 +241,14 @@ func (a *Allocator) RecordLeaseUsage(
 			IoSomeUs: usage.IOSomeMicros, IoFullUs: usage.IOFullMicros,
 			EnergyActiveUj: usage.EnergyActiveMicrojoules, EnergyIdleUj: usage.EnergyIdleMicrojoules,
 			EnergySource: usage.EnergySource,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("alloc: record the usage of lease %s: %w", leaseID, err)
 		}
 
-		if series == nil {
+		// ONLY THE REPORT THAT WON WRITES A SERIES, so the stored pair is always
+		// one request's.
+		if series == nil || won == 0 {
 			return nil
 		}
 		if err := q.RecordJobSeries(ctx, ledgerdb.RecordJobSeriesParams{

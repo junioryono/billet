@@ -54,16 +54,28 @@ func TestAUsageReportCrossesTheNodeWire(t *testing.T) {
 
 // A REPORT THIS CONTROL PLANE CANNOT KEEP FAITHFULLY IS REFUSED AT THE
 // BOUNDARY and never reaches the ledger, as a permanent refusal.
+//
+// EVERY CASE IS THE ONE VALID REPORT WITH ONE THING BROKEN, and says which
+// refusal it expects, so a case cannot pass on a failure it was not written
+// for.
 func TestAnUnkeepableUsageReportIsRefusedAtTheWire(t *testing.T) {
 	t.Parallel()
 
-	for name, body := range map[string]string{
-		"an unknown source":       `{"epoch":7,"usage":{"source":"guest","samples":1,"interval_ms":1000,"window_ms":0}}`,
-		"a negative quantity":     `{"epoch":7,"usage":{"source":"host","samples":1,"interval_ms":1000,"window_ms":0,"cpu_user_us":-1}}`,
-		"an unknown codec":        `{"epoch":7,"usage":{"source":"host","samples":1,"interval_ms":1000,"window_ms":0},"series":{"codec":9,"data":"AQ=="}}`,
-		"an unknown usage group":  `{"epoch":7,"usage":{"source":"host","samples":1,"interval_ms":1000,"window_ms":0,"unmeasured":["gpu"]}}`,
-		"energy claimed and none": `{"epoch":7,"usage":{"source":"host","samples":1,"interval_ms":1000,"window_ms":0,"unmeasured":["energy"],"energy_active_uj":5}}`,
+	const valid = `"source":"host","samples":1,"interval_ms":1000,"window_ms":0,"unmeasured":["energy"]`
+	accepted := `{"epoch":7,"usage":{` + valid + `},"series":{"codec":1,"data":"AQ=="}}`
+	for name, tc := range map[string]struct{ body, want string }{
+		"an unknown source": {strings.Replace(accepted, `"source":"host"`, `"source":"guest"`, 1),
+			"not one this control plane records"},
+		"a negative quantity": {strings.Replace(accepted, `"window_ms":0`, `"window_ms":0,"cpu_user_us":-1`, 1),
+			"cpu_user_us is negative"},
+		"an unknown codec": {strings.Replace(accepted, `"codec":1`, `"codec":9`, 1),
+			"codec 9"},
+		"an unknown usage group": {strings.Replace(accepted, `["energy"]`, `["energy","gpu"]`, 1),
+			`"gpu" is not a usage group`},
+		"energy claimed and none": {strings.Replace(accepted, `"window_ms":0`, `"window_ms":0,"energy_active_uj":5`, 1),
+			"names energy unmeasured"},
 	} {
+		body := tc.body
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -88,9 +100,10 @@ func TestAnUnkeepableUsageReportIsRefusedAtTheWire(t *testing.T) {
 			if err := json.NewDecoder(resp.Body).Decode(&refusal); err != nil {
 				t.Fatalf("decode the refusal: %v", err)
 			}
-			if resp.StatusCode != http.StatusBadRequest || refusal.Code != nodeapi.CodeRefused {
-				t.Fatalf("answered %d %q (%s), want 400 %q", resp.StatusCode, refusal.Code,
-					refusal.Message, nodeapi.CodeRefused)
+			if resp.StatusCode != http.StatusBadRequest || refusal.Code != nodeapi.CodeRefused ||
+				!strings.Contains(refusal.Message, tc.want) {
+				t.Fatalf("answered %d %q (%s), want 400 %q saying %q", resp.StatusCode, refusal.Code,
+					refusal.Message, nodeapi.CodeRefused, tc.want)
 			}
 
 			store.mu.Lock()
@@ -99,5 +112,21 @@ func TestAnUnkeepableUsageReportIsRefusedAtTheWire(t *testing.T) {
 				t.Fatalf("the ledger was asked to record %+v from a refused request", store.usages)
 			}
 		})
+	}
+}
+
+// The valid report every refusal case starts from is itself accepted, or the
+// cases above could all be refusing it for the same unrelated reason.
+func TestTheBaseUsageReportIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{}
+	_, base := serve(t, store)
+	c := dial(t, base)
+	usage := alloc.JobUsage{Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000,
+		Unmeasured: []string{alloc.UsageEnergy}}
+	if err := c.RecordLeaseUsage(t.Context(), "l1", 7, usage,
+		&alloc.UsageSeries{Codec: alloc.UsageSeriesCodec, Data: []byte{1}}); err != nil {
+		t.Fatalf("the base report was refused: %v", err)
 	}
 }

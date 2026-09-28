@@ -252,7 +252,7 @@ type WriteOps interface {
 	RecordJobAssignment(ctx context.Context, arg ledgerdb.RecordJobAssignmentParams) error
 	RecordJobResult(ctx context.Context, arg ledgerdb.RecordJobResultParams) error
 	RecordJobIdentity(ctx context.Context, arg ledgerdb.RecordJobIdentityParams) error
-	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) error
+	RecordJobUsage(ctx context.Context, arg ledgerdb.RecordJobUsageParams) (int64, error)
 	RecordJobSeries(ctx context.Context, arg ledgerdb.RecordJobSeriesParams) error
 	RecordJobRun(ctx context.Context, arg ledgerdb.RecordJobRunParams) error
 	RecordJobStart(ctx context.Context, arg ledgerdb.RecordJobStartParams) error

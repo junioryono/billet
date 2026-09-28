@@ -100,6 +100,15 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 		{"a group named twice", func(u *JobUsage) { u.Unmeasured = []string{UsageIO, UsageIO} }, "twice"},
 		{"energy unmeasured and reported", func(u *JobUsage) { u.EnergyIdleMicrojoules = 1 }, "names energy unmeasured"},
 		{"energy measured with no source", func(u *JobUsage) { u.Unmeasured = nil }, `energy source ""`},
+		{"cpu unmeasured and reported", func(u *JobUsage) { u.Unmeasured = append(u.Unmeasured, UsageCPU) },
+			"names cpu unmeasured"},
+		{"threads unmeasured and reported", func(u *JobUsage) {
+			u.Unmeasured = append(u.Unmeasured, UsageThreads)
+		}, "names threads unmeasured"},
+		{"unsplit energy with an idle share", func(u *JobUsage) {
+			u.Unmeasured = []string{UsageIO}
+			u.EnergySource, u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules = EnergyRAPLUnsplit, 5, 1
+		}, "no idle share"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u := measuredUsage()
@@ -121,5 +130,28 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 		if err := s.Validate(); err == nil {
 			t.Errorf("series codec %d of %d bytes was accepted", s.Codec, len(s.Data))
 		}
+	}
+}
+
+// ONLY THE REPORT THAT WON THE SUMMARY WRITES A SERIES. A first report with no
+// series and a retry carrying one would otherwise be stored as a pair neither
+// request sent.
+func TestASeriesIsKeptOnlyWithTheSummaryItCameWith(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+	lease := busyLease(t, a)
+
+	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, measuredUsage(), nil); err != nil {
+		t.Fatalf("RecordLeaseUsage without a series: %v", err)
+	}
+	later := measuredUsage()
+	later.CPUUserMicros++
+	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, later,
+		&UsageSeries{Codec: UsageSeriesCodec, Data: []byte{1}}); err != nil {
+		t.Fatalf("RecordLeaseUsage with a series: %v", err)
+	}
+
+	if _, err := a.LeaseUsageSeries(t.Context(), lease.ID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("LeaseUsageSeries = %v, want none: the series came with a report that lost", err)
 	}
 }
