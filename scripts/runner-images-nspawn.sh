@@ -90,7 +90,13 @@ running() {
 	# cgroup.events SAYS WHETHER ANY PROCESS IS LEFT ANYWHERE BELOW IT (cgroup v2's
 	# "populated"), read once; a cgroup that is gone holds nothing, and one that
 	# cannot be read tells nothing.
-	[ -n "$cgroup" ] && [ -e "$cgroup_root$cgroup" ] || return 1
+	[ -n "$cgroup" ] || return 1
+	if [ ! -e "$cgroup_root$cgroup" ]; then
+		# GONE ONLY WHERE ITS PARENT CAN BE SEARCHED: a lookup below a parent this
+		# cannot see fails the same way as a cgroup that is not there.
+		[ -d "$cgroup_root${cgroup%/*}" ] && [ -x "$cgroup_root${cgroup%/*}" ] || return 2
+		return 1
+	fi
 	events=$(cat "$cgroup_root$cgroup/cgroup.events" 2>/dev/null) || return 2
 	case "$events" in
 	*"populated 1"*) return 0 ;;
@@ -142,13 +148,10 @@ forwarding() {
 # the whole comment: iptables -S quotes a comment holding a colon, and a
 # substring would also match a machine whose name extends this one.
 tagged() {
-	local status=0
-	grep -Eq -- "--comment \"?$rule_tag\"?( |\$)" <<<"$1" || status=$?
-	case "$status" in
-	0) return 0 ;;
-	1) return 1 ;;
-	*) fail "could not search the FORWARD chain for $machine's rules" ;;
-	esac
+	# MATCHED IN THE SHELL, with no here-string whose setup could fail into "no
+	# match"; the tag's dots are escaped, the only regex character a name holds.
+	local re="--comment \"?${rule_tag//./\\.}\"?( |"$'\n'")"
+	[[ "$1"$'\n' =~ $re ]]
 }
 
 # remove_forwarding deletes this machine's rules by the argument vectors it

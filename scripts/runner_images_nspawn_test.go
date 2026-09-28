@@ -108,6 +108,9 @@ func runDriverWith(t *testing.T, fake string, env []string, args ...string) (str
 			t.Fatal(err)
 		}
 		writeFake(t, filepath.Join(fake, "cgroup"), "cgroup.controllers", "cpu memory pids\n")
+		if err := os.MkdirAll(filepath.Join(fake, "cgroup", "system.slice"), 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	output, err := cmd.CombinedOutput()
 
@@ -354,6 +357,29 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 	writeFake(t, hidden, "no-cgroup-root", "")
 	if output, err := runDriver(t, hidden, "stop"); err == nil || !strings.Contains(output, "cannot tell") {
 		t.Errorf("a stop with no cgroup hierarchy to read answered %v:\n%s", err, output)
+	}
+
+	// ANOTHER MACHINE'S RULES ARE NOT THIS ONE'S, though its name extends this
+	// one: the stop leaves them and succeeds.
+	neighbour := t.TempDir()
+	other := "-A FORWARD -i ve-probe2 -m comment --comment \"billet-runner-images:probe2\" -j ACCEPT\n"
+	writeFake(t, neighbour, "rules", other)
+	if output, err := runDriver(t, neighbour, "stop"); err != nil {
+		t.Errorf("a stop beside another machine's rules: %v\n%s", err, output)
+	}
+	if rules, err := os.ReadFile(filepath.Join(neighbour, "rules")); err != nil || string(rules) != other {
+		t.Errorf("the stop touched another machine's rules (%v): %q", err, rules)
+	}
+
+	// A CGROUP WHOSE PARENT CANNOT BE SEEN is not known to be gone, although the
+	// hierarchy's root can be read.
+	masked := t.TempDir()
+	writeFake(t, masked, "state", "failed\n")
+	writeFake(t, masked, "stuck", "poweroff\nstop\nterminate\n")
+	writeFake(t, masked, "machine-probe.scope.cgroup", "/machine.slice/machine-probe.scope\n")
+	output, err = runDriverWith(t, masked, []string{"BILLET_RI_UNIT=machine-probe.scope"}, "stop")
+	if err == nil || !strings.Contains(output, "cannot tell") {
+		t.Errorf("a cgroup below a parent that cannot be seen answered %v:\n%s", err, output)
 	}
 
 	unknown := t.TempDir()

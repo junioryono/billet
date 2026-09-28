@@ -582,7 +582,7 @@ recover_runner_images() {
 		fi
 		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
 			return 1
-	done 3<<<"$listed"
+	done 3<<<"$listed" || return 1
 	own=$(runner_images_machine) || return 1
 	BILLET_RI_MACHINE="$own" BILLET_RI_ROOTFS="$rootfs" "$driver" stop
 }

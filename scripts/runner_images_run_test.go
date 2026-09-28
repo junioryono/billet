@@ -467,7 +467,9 @@ func runRecovery(t *testing.T, fake string) (string, error) {
 	script := "SCRIPT_DIR=" + fake + "\nWORK=/var/tmp/billet-guest\n" +
 		scriptFunction(t, "build-guest-image.sh", "runner_images_machine") + "\n" +
 		scriptFunction(t, "build-guest-image.sh", "recover_runner_images") + "\n" +
-		"set -euo pipefail\nrecover_runner_images /var/tmp/billet-guest/rootfs\n"
+		// CALLED AS THE BUILD CALLS IT, as an if condition, where errexit does not
+		// reach inside the function and every failure must be returned.
+		"set -euo pipefail\nif ! recover_runner_images /var/tmp/billet-guest/rootfs; then exit 1; fi\n"
 	cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
 	cmd.Env = append(os.Environ(), "PATH="+fake+":"+os.Getenv("PATH"), "FAKE="+fake)
 	output, err := cmd.CombinedOutput()
