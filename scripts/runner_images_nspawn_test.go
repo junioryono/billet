@@ -371,6 +371,32 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 		t.Errorf("the stop touched another machine's rules (%v): %q", err, rules)
 	}
 
+	// A CGROUP THAT SAYS IT IS EMPTY IS STOPPED, for the default service and for
+	// a scope systemd places under machine.slice.
+	for unit, path := range map[string]string{
+		"":                    "system.slice/probe-nspawn.service",
+		"machine-probe.scope": "machine.slice/machine-probe.scope",
+	} {
+		empty := t.TempDir()
+		writeFake(t, empty, "state", "failed\n")
+		writeFake(t, empty, "stuck", "poweroff\nstop\nterminate\n")
+		env := []string{}
+		if unit != "" {
+			writeFake(t, empty, unit+".cgroup", "/"+path+"\n")
+			env = append(env, "BILLET_RI_UNIT="+unit)
+		}
+		cgroup := filepath.Join(empty, "cgroup", filepath.FromSlash(path))
+		if err := os.MkdirAll(cgroup, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := runDriverWith(t, empty, env, "stop"); err != nil {
+			t.Errorf("an empty cgroup at %s: %v\n%s", path, err, output)
+		}
+	}
+
 	// A CGROUP WHOSE PARENT CANNOT BE SEEN is not known to be gone, although the
 	// hierarchy's root can be read.
 	masked := t.TempDir()

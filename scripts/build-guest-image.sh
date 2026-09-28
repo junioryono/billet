@@ -549,7 +549,7 @@ runner_images_machine() {
 # caller clears the workspace next. There is no record to trust: a machine is
 # found by what it holds, not by what a file says its name was.
 recover_runner_images() {
-	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed name root unit own
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed rest line name root unit own
 	# NO machinectl, NO MACHINE, but only while systemd-nspawn is absent too: they
 	# ship in one package, and nspawn without machinectl cannot be asked.
 	if ! command -v machinectl >/dev/null 2>&1; then
@@ -563,9 +563,14 @@ recover_runner_images() {
 		echo "could not list this host's machines: $listed" >&2
 		return 1
 	fi
-	# READ WITH THE SHELL'S OWN read, on its own descriptor, so no parser can fail
-	# into an empty list and nothing the loop runs can drain it.
-	while read -r -u 3 name _; do
+	# SPLIT IN THE SHELL, line by line from the captured listing, with no parser
+	# or read that could fail into a shorter list.
+	rest=$listed$'\n'
+	while [ -n "$rest" ]; do
+		line=${rest%%$'\n'*}
+		rest=${rest#*$'\n'}
+		line=${line#"${line%%[![:space:]]*}"}
+		name=${line%%[[:space:]]*}
 		[ -n "$name" ] || continue
 		# A MACHINE GONE BEFORE ITS ROOT IS READ may have left its processes in a
 		# unit this never learned, so it is not known to be stopped; and an empty
@@ -582,7 +587,7 @@ recover_runner_images() {
 		fi
 		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
 			return 1
-	done 3<<<"$listed" || return 1
+	done
 	own=$(runner_images_machine) || return 1
 	BILLET_RI_MACHINE="$own" BILLET_RI_ROOTFS="$rootfs" "$driver" stop
 }

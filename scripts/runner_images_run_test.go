@@ -485,8 +485,8 @@ func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
 
 	fake := t.TempDir()
 	for name, body := range map[string]string{
-		"list": "old-survivor container systemd-nspawn ubuntu 24.04 -\n" +
-			"elsewhere container systemd-nspawn - - -\n",
+		"list": "elsewhere container systemd-nspawn - - -\n" +
+			"  old-survivor  container systemd-nspawn ubuntu 24.04 -\n",
 		"old-survivor.root": "/var/tmp/billet-guest/rootfs\n",
 		"old-survivor.unit": "machine-old-survivor.scope\n",
 		"elsewhere.root":    "/srv/other/rootfs\n",
