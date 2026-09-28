@@ -88,7 +88,16 @@ prepare_system_tests_virtio() {
 		grep -q "It \"All sd\* devices have read_ahead_kb set to 128\" -Skip {" "$test_file"'
 }
 
-prepares=" waagent-conf docker-daemon build-user system-tests-virtio "
+# PIPX AS GITHUB PINNED IT for 24.04 after this template's commit (be22fc2981aa):
+# the script's unpinned install takes a pipx that needs a newer packaging than
+# Debian's, which pip cannot replace. Installed first, the script finds it there.
+prepare_pipx_pin() {
+	target exec env DEBIAN_FRONTEND=noninteractive sh -c '
+		apt-get install -y --no-install-recommends python3-pip &&
+			python3 -m pip install --break-system-packages "pipx==1.16.7"'
+}
+
+prepares=" waagent-conf docker-daemon build-user system-tests-virtio pipx-pin "
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
