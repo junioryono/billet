@@ -79,10 +79,12 @@ func TestTheDeclarationMustMatchItsPinBeforeAnythingIsBuilt(t *testing.T) {
 	}
 }
 
-// TestTheJavaPathsMatchOnBothSides. The build writes JAVA_HOME_<v>_X64 into the
-// image and `runnerimages.JavaHomeVars` computes the same names and paths for the
-// EC2 side; if they disagree, one backend exports a path the other does not have
-// and a workflow reading the variable breaks on exactly one of them.
+// TestTheJavaPathsMatchOnBothSides. The EC2 build's shared installer writes
+// JAVA_HOME_<v>_X64 into the AMI and `runnerimages.JavaHomeVars` computes the same
+// names and paths on the Go side; if they disagree, the AMI exports a path it does
+// not have and a workflow reading the variable breaks there. (The guest image's
+// JAVA_HOME lines are GitHub's own, written by its Java step, and the gate runs
+// every JDK they name.)
 //
 // THE PATH SHAPE IS ADOPTIUM'S PACKAGE LAYOUT, not a choice: temurin-<v>-jdk
 // installs to /usr/lib/jvm/temurin-<v>-jdk-<arch>. A mismatch here is a variable
@@ -97,7 +99,7 @@ func TestTheJavaPathsMatchOnBothSides(t *testing.T) {
 	}
 
 	vars := ts.JavaHomeVars("/usr/lib/jvm")
-	build := readBuildScript(t)
+	build := readScriptFile(t, toolcacheAssetPath)
 
 	for _, v := range ts.Java.Versions {
 		name := "JAVA_HOME_" + v + "_X64"

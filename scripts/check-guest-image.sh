@@ -139,6 +139,10 @@ ln -s /proc/self/fd "$MNT/dev/fd"
 ln -s /proc/self/fd/0 "$MNT/dev/stdin"
 ln -s /proc/self/fd/1 "$MNT/dev/stdout"
 ln -s /proc/self/fd/2 "$MNT/dev/stderr"
+# READ-ONLY ONCE POPULATED, so nothing the gate runs is handed a directory to make
+# a block device node in. What the gate executes is GitHub's build, run as root in
+# the chroot as it always has been; this narrows what the gate adds, not that.
+mount -o remount,ro "$MNT/dev"
 
 # A WRITABLE SCRATCH /tmp, holding the HOME the toolchains run with: pwsh creates
 # ~/.cache before it does anything else and dies on a read-only root's home. The
@@ -1238,7 +1242,9 @@ check_toolcache_coverage() {
 	# AS A JOB RUNS THEM: GitHub installs dotnet tools under /etc/skel, so they are
 	# the runner's, found through $HOME/.dotnet/tools on the PATH the image hands
 	# every job. root's login shell in a chroot has neither.
-	job_path=$(grep -m 1 '^PATH=' "$MNT/etc/billet-image-env" 2>/dev/null || true)
+	# THE LAST PATH LINE, because the agent passes every line to env -i and the
+	# last assignment is the one a job gets.
+	job_path=$(grep '^PATH=' "$MNT/etc/billet-image-env" 2>/dev/null | tail -n 1 || true)
 
 	while IFS= read -r probe; do
 		[ -n "$probe" ] || continue

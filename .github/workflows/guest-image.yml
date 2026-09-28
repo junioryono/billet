@@ -226,9 +226,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # debootstrap STAYS WHILE A BUILDABLE RELEASE STILL USES IT: this job
+          # checks out the stable release's tree, whose build script may be the
+          # debootstrap one until a release carries the runner-images build.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            systemd-container xz-utils e2fsprogs jq zstd unzip \
+            systemd-container xz-utils debootstrap e2fsprogs jq zstd unzip \
             build-essential flex bison libelf-dev libssl-dev bc \
             dnsmasq
 
