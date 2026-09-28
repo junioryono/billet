@@ -752,6 +752,12 @@ jobs:
         if: matrix.group == 'roles'
         run: make warp-connector-check
 
+      # No other suite gives a Mac a billet_config, so the macos_node role's
+      # order (check, drain, replace, up) and its refusals are proved here only.
+      - name: Prove the macos_node role
+        if: matrix.group == 'roles'
+        run: make macos-node-check
+
       # The fleet playbook runs ssh_access before the host role, so the role's
       # own converge guard would fire after a key was installed; the playbook
       # repeats the guard first in every play, and only this proves it.
