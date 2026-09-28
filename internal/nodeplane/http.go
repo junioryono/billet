@@ -82,6 +82,10 @@ type LeaseStore interface {
 	// job, from alloc's closed vocabularies, fenced on the epoch.
 	RecordCacheObservation(ctx context.Context, leaseID string, epoch int64,
 		obs alloc.CacheObservation) error
+	// RecordLeaseUsage keeps what the host measured a lease's job do, fenced on
+	// the epoch; the ledger keeps the first report.
+	RecordLeaseUsage(ctx context.Context, leaseID string, epoch int64,
+		usage alloc.JobUsage, series *alloc.UsageSeries) error
 	// MarkDeregistered records that a lease's GitHub runner registration has been
 	// removed, so ActiveRunnerLeases stops counting it as a live runner. It is
 	// monotonic and unfenced; deregistration is a fact about GitHub, not about who
@@ -297,6 +301,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/failure", h.forOwnLease(h.markFailure))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/resize", h.forOwnLease(h.resize))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/usage", h.forOwnLease(h.leaseUsage))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
@@ -1514,6 +1519,40 @@ func (h *handler) cacheObservation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.RecordCacheObservation(r.Context(), r.PathValue("lease"), req.Epoch, obs); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// leaseUsage keeps what the host measured a lease's job do.
+//
+// VALIDATED AT THE BOUNDARY, like a cache observation, so a report this
+// control plane cannot keep faithfully is refused as such rather than
+// surfacing from the ledger as an error the node would read as transient.
+func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.UsageRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := req.Usage.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+	if req.Series != nil {
+		if err := req.Series.Validate(); err != nil {
+			writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+			return
+		}
+	}
+
+	if err := h.store.RecordLeaseUsage(r.Context(), r.PathValue("lease"), req.Epoch,
+		req.Usage, req.Series); err != nil {
 		writeStoreErr(w, err)
 
 		return

@@ -325,6 +325,10 @@ func (stubStore) Resize(context.Context, string, int64, string, int, config.Byte
 	return nil
 }
 func (stubStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
+func (stubStore) RecordLeaseUsage(context.Context, string, int64, alloc.JobUsage, *alloc.UsageSeries) error {
+	return nil
+}
+
 func (stubStore) RecordCacheObservation(context.Context, string, int64, alloc.CacheObservation) error {
 	return nil
 }
@@ -478,6 +482,7 @@ func TestLaunchPreservesTheAuthenticatedRepositoryScope(t *testing.T) {
 		Owner:       "acme",
 		Repository:  "api",
 		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		JobID:       "51001",
 	}
 	if err := p.NewRunner().Launch(t.Context(), lease, want); err != nil {
 		t.Fatalf("Launch: %v", err)

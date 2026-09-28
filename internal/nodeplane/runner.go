@@ -98,6 +98,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 				Owner:       job.Owner,
 				Repository:  job.Repository,
 				WorkflowRef: job.WorkflowRef,
+				JobID:       job.JobID,
 			},
 		},
 		done:             make(chan nodeapi.CommandResult, 1),

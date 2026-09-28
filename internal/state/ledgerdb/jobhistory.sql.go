@@ -334,7 +334,8 @@ const listJobHistory = `-- name: ListJobHistory :many
 SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
        COALESCE(request_id, 0) AS request_id, conclusion, failure_reason,
        result, disruption, queued_at, COALESCE(started_at, '') AS started_at,
-       COALESCE(finished_at, '') AS finished_at
+       COALESCE(finished_at, '') AS finished_at, github_job_id,
+       COALESCE(repo, '') AS repo, workflow_ref, job_name, event
   FROM job_history
  ORDER BY queued_at, lease_id
  LIMIT CAST($1 AS BIGINT)
@@ -353,6 +354,11 @@ type ListJobHistoryRow struct {
 	QueuedAt      string
 	StartedAt     string
 	FinishedAt    string
+	GithubJobID   string
+	Repo          string
+	WorkflowRef   string
+	JobName       string
+	Event         string
 }
 
 // Every job this deployment recorded, oldest first, bounded.
@@ -395,6 +401,11 @@ func (q *Queries) ListJobHistory(ctx context.Context, maxRows int64) ([]ListJobH
 			&i.QueuedAt,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.GithubJobID,
+			&i.Repo,
+			&i.WorkflowRef,
+			&i.JobName,
+			&i.Event,
 		); err != nil {
 			return nil, err
 		}
@@ -407,6 +418,79 @@ func (q *Queries) ListJobHistory(ctx context.Context, maxRows int64) ([]ListJobH
 		return nil, err
 	}
 	return items, nil
+}
+
+const readJob = `-- name: ReadJob :one
+SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id,
+       COALESCE(request_id, 0) AS request_id, github_job_id,
+       COALESCE(repo, '') AS repo, workflow_ref, job_name, event,
+       COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
+       queued_at, COALESCE(assigned_at, '') AS assigned_at,
+       COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
+       chosen_provider, instance_type, vcpu, memory, site
+  FROM job_history WHERE lease_id = $1
+`
+
+type ReadJobRow struct {
+	LeaseID        string
+	Tier           string
+	Node           string
+	RunID          int64
+	RequestID      int64
+	GithubJobID    string
+	Repo           string
+	WorkflowRef    string
+	JobName        string
+	Event          string
+	Conclusion     string
+	FailureReason  string
+	Result         string
+	Disruption     string
+	QueuedAt       string
+	AssignedAt     string
+	StartedAt      string
+	FinishedAt     string
+	ChosenProvider string
+	InstanceType   string
+	Vcpu           int64
+	Memory         int64
+	Site           string
+}
+
+// One job's whole history row, for `billet jobs show`.
+//
+// sql.ErrNoRows means the lease was never assigned a job. Every empty string
+// here is "not recorded", which a reader renders as such rather than as a
+// value.
+func (q *Queries) ReadJob(ctx context.Context, leaseID string) (ReadJobRow, error) {
+	row := q.db.QueryRowContext(ctx, readJob, leaseID)
+	var i ReadJobRow
+	err := row.Scan(
+		&i.LeaseID,
+		&i.Tier,
+		&i.Node,
+		&i.RunID,
+		&i.RequestID,
+		&i.GithubJobID,
+		&i.Repo,
+		&i.WorkflowRef,
+		&i.JobName,
+		&i.Event,
+		&i.Conclusion,
+		&i.FailureReason,
+		&i.Result,
+		&i.Disruption,
+		&i.QueuedAt,
+		&i.AssignedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.ChosenProvider,
+		&i.InstanceType,
+		&i.Vcpu,
+		&i.Memory,
+		&i.Site,
+	)
+	return i, err
 }
 
 const readJobConclusion = `-- name: ReadJobConclusion :one
@@ -580,6 +664,49 @@ func (q *Queries) RecordJobAssignment(ctx context.Context, arg RecordJobAssignme
 		arg.RequestID,
 		arg.QueuedAt,
 		arg.AssignedAt,
+	)
+	return err
+}
+
+const recordJobIdentity = `-- name: RecordJobIdentity :exec
+UPDATE job_history
+   SET github_job_id = CAST($1 AS TEXT),
+       repo          = CASE WHEN COALESCE(repo, '') = '' THEN CAST($2 AS TEXT)
+                            ELSE repo END,
+       workflow_ref  = CASE WHEN workflow_ref = '' THEN CAST($3 AS TEXT)
+                            ELSE workflow_ref END,
+       job_name      = CASE WHEN job_name = '' THEN CAST($4 AS TEXT)
+                            ELSE job_name END,
+       event         = CASE WHEN event = '' THEN CAST($5 AS TEXT) ELSE event END
+ WHERE lease_id = $6
+   AND (github_job_id = '' OR github_job_id = CAST($1 AS TEXT))
+`
+
+type RecordJobIdentityParams struct {
+	GithubJobID string
+	Repo        string
+	WorkflowRef string
+	JobName     string
+	Event       string
+	LeaseID     string
+}
+
+// Record which of GitHub's jobs this lease ran, filling only what is empty.
+//
+// EACH COLUMN IS WRITE-ONCE, and only for the job already named. A pooled
+// runner learns its job on JobStarted and a direct assignment at assignment;
+// a completion then fills only what neither recorded. The job-id filter is in
+// the statement so a message about a different job can never splice its name
+// or repository onto the one this row recorded, which is also why the job id
+// itself needs no CASE: the filter admits only an empty one or the same.
+func (q *Queries) RecordJobIdentity(ctx context.Context, arg RecordJobIdentityParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobIdentity,
+		arg.GithubJobID,
+		arg.Repo,
+		arg.WorkflowRef,
+		arg.JobName,
+		arg.Event,
+		arg.LeaseID,
 	)
 	return err
 }
