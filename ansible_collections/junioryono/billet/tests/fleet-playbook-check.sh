@@ -40,7 +40,7 @@ want = {
     "control_plane": ["junioryono.billet.ssh_access", "junioryono.billet.host", "junioryono.billet.cloudflared_connector"],
     "linux": ["junioryono.billet.ssh_access", "junioryono.billet.host", "junioryono.billet.warp_connector",
               "junioryono.billet.cloudflared_connector", "junioryono.billet.development_host"],
-    "macos": ["junioryono.billet.development_host"],
+    "macos": ["junioryono.billet.macos_node", "junioryono.billet.development_host"],
 }
 if [p["hosts"] for p in plays] != list(want):
     sys.exit(f"fleet-playbook-check: plays target {[p['hosts'] for p in plays]}, want {list(want)} in that order (the control plane first)")
