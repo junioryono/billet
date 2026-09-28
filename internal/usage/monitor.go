@@ -28,6 +28,11 @@ const maxPackageWatts = 1000
 // keeping every total, so a job of any length costs bounded memory.
 const maxPoints = 1 << 16
 
+// lifecycleReadLimit bounds the one read Start and Final make, which sit on a
+// job's launch and teardown. A read that has not answered by then is given up
+// on: the job starts or ends without that sample.
+const lifecycleReadLimit = 2 * time.Second
+
 // Monitor samples every job it is told about on one clock, and attributes the
 // host's package energy among them.
 type Monitor struct {
@@ -37,11 +42,17 @@ type Monitor struct {
 	// ticking serialises Tick, so the reads it makes outside mu apply in order.
 	ticking sync.Mutex
 
+	// The hooks run between a read and its apply, in tests only, to place
+	// another operation exactly where a race would.
+	afterTickRead, afterStartRead, afterFinalRead func()
+
 	// mu guards everything below. No file is read while it is held: a slow read
 	// of one job's counters must not hold up Start, Final or Forget, which sit on
 	// the launch and teardown paths.
-	mu           sync.Mutex
-	jobs         map[string]*job
+	mu   sync.Mutex
+	jobs map[string]*job
+	// tickSeq counts applied ticks, so a read that a tick overtook can tell.
+	tickSeq      uint64
 	lastTick     time.Time
 	host         HostCPU
 	hostOK       bool
@@ -57,7 +68,9 @@ type job struct {
 	samples int64
 	// latest holds each group's most recent successful reading, and seen which
 	// groups were ever read, so one failed read does not erase a measurement.
+	// latestAt is when latest was read; an older read is never applied over it.
 	latest     Sample
+	latestAt   time.Time
 	seen       seen
 	peakMemory int64
 	lastCPU    int64
@@ -81,20 +94,59 @@ func NewMonitor(root string, opts Options) *Monitor {
 	return &Monitor{reader: Reader{Root: root}, opts: opts, jobs: map[string]*job{}}
 }
 
+// boundedRead reads a target within lifecycleReadLimit. A read that has not
+// answered is left to finish on its own and reported as not taken.
+func (m *Monitor) boundedRead(target Target) (Sample, bool) {
+	done := make(chan Sample, 1)
+	go func() { done <- m.reader.Read(target) }()
+	timer := time.NewTimer(lifecycleReadLimit)
+	defer timer.Stop()
+	select {
+	case s := <-done:
+		return s, true
+	case <-timer.C:
+		return Sample{}, false
+	}
+}
+
 // Start begins measuring a job, taking its first sample now so the CPU it used
 // before this moment (the boot) is never charged to one interval's energy.
+//
+// THE BASELINE MUST PAIR WITH THE HOST'S. A tick that applies while this read
+// runs moves the host and package baselines past it, and the next interval
+// would compare this job's CPU from before the tick with the host's from after
+// it; so the read is taken again, and a baseline that still cannot be paired
+// leaves the job's first interval unattributed.
 func (m *Monitor) Start(key string, target Target, vcpus int) {
-	now := m.opts.Now()
-	s := m.reader.Read(target)
+	const attempts = 3
+	for attempt := 1; ; attempt++ {
+		m.mu.Lock()
+		seq := m.tickSeq
+		m.mu.Unlock()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+		now := m.opts.Now()
+		s, read := m.boundedRead(target)
+		if m.afterStartRead != nil {
+			m.afterStartRead()
+		}
 
-	j := &job{target: target, vcpus: vcpus, first: now}
-	j.absorb(s)
-	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-	j.points = append(j.points, j.point(now))
-	m.jobs[key] = j
+		m.mu.Lock()
+		overtaken := m.tickSeq != seq
+		if overtaken && attempt < attempts {
+			m.mu.Unlock()
+			continue
+		}
+		j := &job{target: target, vcpus: vcpus, first: now, latestAt: now}
+		if read {
+			j.absorb(s)
+			j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK && !overtaken
+		}
+		j.points = append(j.points, j.point(now))
+		m.jobs[key] = j
+		m.mu.Unlock()
+
+		return
+	}
 }
 
 // Forget stops measuring a job without reporting it.
@@ -126,18 +178,24 @@ func (m *Monitor) Run(ctx context.Context) {
 // share past it is could-not-tell, never clipped into a plausible number.
 const skewSlack = 0.05
 
+// staleAfter is how many intervals without a tick make energy could-not-tell:
+// a sampler that stalled or stopped (a node shutting down while its jobs drain)
+// has missed intervals, and their energy is in no job's total.
+const staleAfter = 3
+
 // Tick samples every job once and attributes the energy since the last tick.
 //
-// SNAPSHOT UNDER THE LOCK, READ OUTSIDE IT, APPLY UNDER IT. A job started while
-// the reads ran is sampled next tick; one forgotten meanwhile is skipped.
+// SNAPSHOT UNDER THE LOCK, READ OUTSIDE IT, APPLY UNDER IT. What is applied is
+// checked against the job it was read for, not the key: a job forgotten and a
+// new one started under the same key while the reads ran is a different job.
 func (m *Monitor) Tick() {
 	m.ticking.Lock()
 	defer m.ticking.Unlock()
 
 	m.mu.Lock()
-	targets := make(map[string]Target, len(m.jobs))
+	snapshot := make(map[string]*job, len(m.jobs))
 	for key, j := range m.jobs {
-		targets[key] = j.target
+		snapshot[key] = j
 	}
 	m.mu.Unlock()
 
@@ -148,22 +206,26 @@ func (m *Monitor) Tick() {
 	if m.opts.RAPL {
 		energy, energyErr = m.reader.ReadEnergy()
 	}
-	samples := make(map[string]*Sample, len(targets))
-	for key, target := range targets {
-		s := m.reader.Read(target)
+	samples := make(map[string]*Sample, len(snapshot))
+	for key, j := range snapshot {
+		s := m.reader.Read(j.target)
 		samples[key] = &s
+	}
+	if m.afterTickRead != nil {
+		m.afterTickRead()
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	hostOK := hostErr == nil && m.hostOK && host.CPUs > 0
+	hostOK := hostErr == nil && m.hostOK && host.CPUs > 0 && host.CPUs == m.host.CPUs
 	busyDelta := int64(0)
 	if hostOK {
 		busyDelta = host.Busy - m.host.Busy
 	}
 	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
 	dt := now.Sub(m.lastTick)
+	gapped := !m.lastTick.IsZero() && dt >= staleAfter*m.opts.Interval
 
 	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
 	// interval's actual draw would otherwise hand out energy that never existed.
@@ -178,10 +240,11 @@ func (m *Monitor) Tick() {
 	// makes the interval could-not-tell for all of them.
 	deltas := make(map[string]int64, len(samples))
 	var total int64
-	consistent := energyOK && hostOK && busyDelta > 0 && dt > 0
+	reserved := 0
+	consistent := energyOK && hostOK && busyDelta > 0 && dt > 0 && !gapped
 	for key, s := range samples {
 		j := m.jobs[key]
-		if j == nil || !s.CPUOK || !j.lastCPUOK {
+		if j != snapshot[key] || !s.CPUOK || !j.lastCPUOK || now.Before(j.latestAt) {
 			continue
 		}
 		d := s.CPUUsage - j.lastCPU
@@ -190,17 +253,25 @@ func (m *Monitor) Tick() {
 		}
 		deltas[key] = d
 		total += d
+		reserved += j.vcpus
 	}
 	if float64(total) > float64(busyDelta)*(1+skewSlack) {
 		consistent = false
 	}
+	// RESERVED CPUS BEYOND THE HOST'S share the idle pool, never multiply it.
+	idleDenominator := float64(max(host.CPUs, reserved))
 
 	for key, s := range samples {
 		j := m.jobs[key]
-		if j == nil {
+		if j != snapshot[key] {
+			continue
+		}
+		// A FINAL THAT READ AFTER THIS TICK'S CLOCK has the newer sample.
+		if now.Before(j.latestAt) {
 			continue
 		}
 		j.absorb(*s)
+		j.latestAt = now
 		if m.opts.RAPL {
 			d, measured := deltas[key]
 			if !consistent || !measured {
@@ -211,7 +282,7 @@ func (m *Monitor) Tick() {
 				overlap := now.Sub(maxTime(m.lastTick, j.first))
 				if overlap > 0 {
 					j.energyIdle += idlePool * (overlap.Seconds() / dt.Seconds()) *
-						float64(j.vcpus) / float64(host.CPUs)
+						float64(j.vcpus) / idleDenominator
 				}
 			}
 		}
@@ -224,6 +295,7 @@ func (m *Monitor) Tick() {
 
 	m.host, m.hostOK = host, hostErr == nil
 	m.lastTick = now
+	m.tickSeq++
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -323,13 +395,11 @@ type Summary struct {
 // attributed for the job's whole life.
 type Measured struct{ CPU, Memory, IO, Net, Threads, Pressure, Energy bool }
 
-// staleAfter is how many intervals without a tick make a job's energy
-// could-not-tell: a sampler that stopped (the node shutting down while jobs
-// drain) has missed intervals, and those intervals' energy is not in the total.
-const staleAfter = 3
-
 // Final takes one last sample of a job and summarises it. The job stays known,
 // so a destroy that fails and is retried can ask again; Forget ends it.
+//
+// THE SERIES NEVER GOES BACK IN TIME: a tick that read after this call's clock
+// wins over this read, and the final point is at the later of the two.
 func (m *Monitor) Final(key string) (Summary, bool) {
 	m.mu.Lock()
 	j, ok := m.jobs[key]
@@ -343,20 +413,27 @@ func (m *Monitor) Final(key string) (Summary, bool) {
 	}
 
 	now := m.opts.Now()
-	s := m.reader.Read(target)
+	s, read := m.boundedRead(target)
+	if m.afterFinalRead != nil {
+		m.afterFinalRead()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if j, ok = m.jobs[key]; !ok {
+	if current, ok := m.jobs[key]; !ok || current != j {
 		return Summary{}, false
 	}
-	j.absorb(s)
-	points := append(append([]Point(nil), j.points...), j.point(now))
-	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) > staleAfter*m.opts.Interval
+	if read && !now.Before(j.latestAt) {
+		j.absorb(s)
+		j.latestAt = now
+	}
+	at := maxTime(now, j.latestAt)
+	points := append(append([]Point(nil), j.points...), j.point(at))
+	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
 
 	return Summary{
-		Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),
+		Samples: j.samples, Interval: m.opts.Interval, Window: at.Sub(j.first),
 		Latest: j.latest, MemoryPeak: j.peakMemory,
 		Measured: Measured{CPU: j.seen.cpu, Memory: j.seen.memory, IO: j.seen.io, Net: j.seen.net,
 			Threads: j.seen.threads, Pressure: j.seen.pressure,

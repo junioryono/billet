@@ -81,7 +81,8 @@ func TestIdleIsChargedOnlyForTheTimeAJobExisted(t *testing.T) {
 }
 
 // A BASELINE ABOVE THE MEASURED DRAW NEVER HANDS OUT ENERGY THAT WAS NOT
-// MEASURED: the idle pool is capped at what the package counter advanced.
+// MEASURED: the idle pool is capped at what the package counter advanced, and a
+// job holding every CPU is given exactly that, still measured.
 func TestTheIdlePoolIsNeverMoreThanWasMeasured(t *testing.T) {
 	h := newEnergyHost(t, 500) // 5,000 J over ten seconds; the counter moved 1,406.6 J
 	h.m.Start("vm", h.target, 128)
@@ -89,9 +90,9 @@ func TestTheIdlePoolIsNeverMoreThanWasMeasured(t *testing.T) {
 	h.m.Tick()
 
 	s := finalOf(t, h.m)
-	if s.EnergyIdle > 1_406_605_023 || s.EnergyActive != 0 {
-		t.Errorf("a job holding every CPU got %d µJ idle and %d active; the package moved 1406605023",
-			s.EnergyIdle, s.EnergyActive)
+	if !s.Measured.Energy || s.EnergyIdle != 1_406_605_023 || s.EnergyActive != 0 {
+		t.Errorf("a job holding every CPU got %d µJ idle and %d active (measured %v); want exactly "+
+			"the 1406605023 the package moved, as idle", s.EnergyIdle, s.EnergyActive, s.Measured.Energy)
 	}
 }
 
@@ -174,10 +175,11 @@ func TestAReusedPidIsNotReadAsTheJobsThreads(t *testing.T) {
 	}
 }
 
-// A SLOW READ OF ONE JOB DOES NOT HOLD UP ANOTHER JOB'S FINAL SAMPLE, which
-// sits on the teardown path. The tick is stuck opening a FIFO nobody writes.
-func TestAStuckReadDoesNotHoldUpAnotherJobsFinalSample(t *testing.T) {
-	tr, target := referenceVM(t)
+// stuckTarget is a copy of target whose cpu.stat is a FIFO: a read of it blocks
+// until something opens the FIFO for writing.
+func stuckTarget(t *testing.T, tr tree, target Target) (Target, string) {
+	t.Helper()
+
 	stuck := target
 	stuck.CgroupDir = "/sys/fs/cgroup/stuck"
 	if err := os.MkdirAll(filepath.Join(tr.root, stuck.CgroupDir), 0o700); err != nil {
@@ -187,6 +189,51 @@ func TestAStuckReadDoesNotHoldUpAnotherJobsFinalSample(t *testing.T) {
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
+
+	return stuck, fifo
+}
+
+// waitForReader waits until something has the FIFO open for reading, which is
+// when a non-blocking open for writing stops failing, and returns that writer
+// held open so the reader stays blocked in read.
+func waitForReader(t *testing.T, fifo string) *os.File {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			return w
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("nothing ever opened the fifo for reading")
+
+	return nil
+}
+
+// release lets the blocked reader finish and waits, bounded, for done.
+func release(t *testing.T, w *os.File, done <-chan struct{}) {
+	t.Helper()
+
+	if _, err := w.WriteString("usage_usec 1\nuser_usec 1\nsystem_usec 0\n"); err != nil {
+		t.Errorf("write the fifo: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("close the fifo: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Error("the blocked reader never finished")
+	}
+}
+
+// A SLOW READ OF ONE JOB DOES NOT HOLD UP ANOTHER JOB'S FINAL SAMPLE, which
+// sits on the teardown path. The tick is proved blocked in the FIFO's read
+// before Final is called.
+func TestAStuckReadDoesNotHoldUpAnotherJobsFinalSample(t *testing.T) {
+	tr, target := referenceVM(t)
+	stuck, fifo := stuckTarget(t, tr, target)
 
 	m := NewMonitor(tr.root, Options{Interval: time.Second})
 	m.Start("vm", target, 8)
@@ -199,35 +246,62 @@ func TestAStuckReadDoesNotHoldUpAnotherJobsFinalSample(t *testing.T) {
 		defer close(ticked)
 		m.Tick()
 	}()
-	t.Cleanup(func() {
-		// Release the tick: opening the FIFO for writing lets its reader in.
-		writer, err := os.OpenFile(fifo, os.O_WRONLY, 0)
-		if err != nil {
-			t.Errorf("open the fifo to release the tick: %v", err)
-			return
-		}
-		if _, err := writer.WriteString("usage_usec 1\nuser_usec 1\nsystem_usec 0\n"); err != nil {
-			t.Errorf("write the fifo: %v", err)
-		}
-		if err := writer.Close(); err != nil {
-			t.Errorf("close the fifo: %v", err)
-		}
-		<-ticked
-	})
+	writer := waitForReader(t, fifo)
+	defer release(t, writer, ticked)
 
-	finished := make(chan bool, 1)
+	finished := make(chan Summary, 1)
 	go func() {
-		_, ok := m.Final("vm")
-		finished <- ok
+		s, _ := m.Final("vm")
+		finished <- s
 	}()
 	select {
-	case ok := <-finished:
-		if !ok {
-			t.Error("Final found no job")
+	case s := <-finished:
+		if !s.Measured.CPU || s.Latest.CPUUsage != 62_338_613 {
+			t.Errorf("Final answered %+v, want the vm's own reading", s.Latest)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Final waited on another job's stuck read")
 	}
+}
+
+// AND A STUCK READ OF THE JOB'S OWN COUNTERS HOLDS UP ITS TEARDOWN FOR AT MOST
+// lifecycleReadLimit: Final answers with what it already had.
+func TestAJobsOwnStuckReadDoesNotHoldUpItsFinalSample(t *testing.T) {
+	tr, target := referenceVM(t)
+	m := NewMonitor(tr.root, Options{Interval: time.Second})
+	m.Start("vm", target, 8)
+	stuck, fifo := stuckTarget(t, tr, target)
+	m.mu.Lock()
+	m.jobs["vm"].target = stuck
+	m.mu.Unlock()
+
+	finished := make(chan Summary, 1)
+	begun := time.Now()
+	go func() {
+		s, _ := m.Final("vm")
+		finished <- s
+	}()
+	writer := waitForReader(t, fifo)
+	select {
+	case s := <-finished:
+		if took := time.Since(begun); took > lifecycleReadLimit+2*time.Second {
+			t.Errorf("Final took %s", took)
+		}
+		if s.Latest.CPUUsage != 62_338_613 {
+			t.Errorf("cpu = %d, want the reading Start took", s.Latest.CPUUsage)
+		}
+	case <-time.After(lifecycleReadLimit + 5*time.Second):
+		t.Fatal("Final waited on its own job's stuck read")
+	}
+	// The abandoned read finishes once released; nothing waits for it.
+	release(t, writer, closedChannel())
+}
+
+func closedChannel() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+
+	return c
 }
 
 func encodedRaw(t *testing.T, raw []byte) []byte {
@@ -275,31 +349,32 @@ func TestAHostileSeriesIsRefused(t *testing.T) {
 	}
 
 	for name, raw := range map[string][]byte{
-		// Sixty-seven million points claimed in a few bytes of zeros.
-		"a point count the bytes cannot hold": append(header(67_000_000), make([]byte, 64)...),
-		"more points than a monitor keeps":    append(header(maxDecodedPoints+1), make([]byte, 64)...),
-		"a column that overflows":             twoPoints(map[int][]int64{1: {math.MaxInt64, 1}}),
-		"a count that goes negative":          twoPoints(map[int][]int64{1: {5, -6}}),
-		"time that goes backwards":            twoPoints(map[int][]int64{0: {1000, -1}}),
+		"a column that overflows":    twoPoints(map[int][]int64{1: {math.MaxInt64, 1}}),
+		"a count that goes negative": twoPoints(map[int][]int64{1: {5, -6}}),
+		"time that goes backwards":   twoPoints(map[int][]int64{0: {1000, -1}}),
 	} {
 		if _, err := DecodeSeries(encodedRaw(t, raw)); err == nil {
 			t.Errorf("%s: decoded", name)
 		}
 	}
 
-	// A COUNT THE BYTES COULD HOLD BUT A MONITOR NEVER WRITES is refused before
-	// the per-point allocation: 8 MiB of zeros compresses to a few KiB and holds
-	// a million points' worth of zero deltas, which would be ~100 MB of slices.
-	big := append(header(1<<20), make([]byte, 8<<20)...)
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	if _, err := DecodeSeries(encodedRaw(t, big)); err == nil {
-		t.Error("a million-point series decoded")
-	}
-	runtime.ReadMemStats(&after)
-	if grew := after.TotalAlloc - before.TotalAlloc; grew > 48<<20 {
-		t.Errorf("refusing a million-point series allocated %d MiB", grew>>20)
+	// EACH BOUND ALONE. A count above what a monitor keeps, with every byte the
+	// count needs, is refused by the point bound; a count the bytes cannot hold
+	// is refused by the byte bound. Measured after compressing, so the budget is
+	// the decoder's own: allocating per point here would be ~50 MiB.
+	many := uint64(4 * maxDecodedPoints)
+	overCount := encodedRaw(t, append(header(many), make([]byte, many*uint64(len(SeriesColumns)))...))
+	shortBytes := encodedRaw(t, append(header(1000), make([]byte, 100)...))
+	for name, data := range map[string][]byte{"too many points": overCount, "too few bytes": shortBytes} {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if _, err := DecodeSeries(data); err == nil {
+			t.Errorf("%s: decoded", name)
+		}
+		runtime.ReadMemStats(&after)
+		if grew := after.TotalAlloc - before.TotalAlloc; grew > 32<<20 {
+			t.Errorf("%s: refusing it allocated %d MiB", name, grew>>20)
+		}
 	}
 
 	// A level that falls (memory freed) is ordinary and decodes.
