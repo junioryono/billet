@@ -205,6 +205,12 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet cache status [--since 24h]` | every tier's effective caches, every kill-switch block, and what each cache did per tier for the jobs assigned since `--since` |
 | `billet cache conformance install --repository <owner/repo> --runner-label <label> [--billet-ref] [--billet-repository] [--expected-runner-version] [--expected-guest-contract] [--workflow-ref] [--output] [--force]` | write the consumer-owned conformance workflow, pinning the resolved billet commit, runner version, guest contract and one label |
 
+## Fleet
+
+| Command | Meaning |
+|---|---|
+| `billet fleet converge -inventory FILE [-check] [-limit PATTERN] [-playbook P] [-known-hosts FILE] [-ssh-key FILE] [-github-app-key FILE] [-environment-file FILE] [-extra-vars JSON] [-holder NAME] [-no-prove-idempotent] [-ref vX.Y.Z \| -source DIR]` | converge a fleet from an operator's machine with exactly what `actions/converge-fleet` runs in CI: the action's own scripts and the collection from the same checkout, at this binary's release (or `-ref`), fetched once into the user cache directory. So a laptop needs only billet installed, and a consumer keeps no collection pin, `requirements.yml` or wrapper script. It runs the action's steps in order (the host checks, the pinned ansible-core, the converge and, unless `-check` or `-no-prove-idempotent`, the second pass that must report `changed=0`), always releases the converge guard it took and removes its temporary files, and reaches hosts over this machine's own network (the action's `reach: none`). A development build must name `-ref` or `-source`; `-ref` accepts only a release. Secrets are read from files and passed to the converge step through its environment, never on a command line; `-environment-file` carries `NAME=value` lines such as `BILLET_CLOUDFLARED_TOKEN_<HOST>` into the playbook's environment. Host-key pins from `-known-hosts` are appended to `~/.ssh/known_hosts`, never replacing it |
+
 ## Upgrades
 
 | Command | Meaning |

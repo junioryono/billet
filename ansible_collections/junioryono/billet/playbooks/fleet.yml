@@ -35,6 +35,11 @@
 # play targets and the inventory never declares is a warning by default and a
 # failure under ANSIBLE_HOST_PATTERN_MISMATCH=error, after the earlier plays
 # have already converged. A macOS host gets no connector from this playbook.
+#
+# A MAC IS CONVERGED AS ITS NODE ACCOUNT. macos_node renders billet_config to
+# the Mac's billet.yaml and brings the launch agents up with `billet local up`,
+# draining the node first when the configuration changes; it never escalates
+# and never moves the binary, and without billet_config it does nothing.
 
 - name: billet control plane
   hosts: control_plane
@@ -83,5 +88,6 @@
           tags: [always]
       tags: [always]
   roles:
+    - role: junioryono.billet.macos_node
     - role: junioryono.billet.development_host
       when: billet_development_enabled | default(false) | bool

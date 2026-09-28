@@ -43,6 +43,7 @@
         - localhost
         - 127.0.0.1
         - "::1"
+    - role: junioryono.billet.macos_node
 
 - name: Validate the host role syntax for an ec2 node
   hosts: all
