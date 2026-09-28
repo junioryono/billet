@@ -36,6 +36,7 @@
    deploying/hybrid-owned-hardware
    deploying/postgres-and-active-passive
    deploying/reaching-hosts
+   deploying/converging-from-ci
 
 .. toctree::
    :maxdepth: 2
