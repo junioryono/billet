@@ -172,23 +172,23 @@ func (m *Monitor) serve(r request) {
 	}
 }
 
-// ask hands Run a request and waits for its answer within limit. It reports
-// whether Run took the request, the answer, and whether the answer came in
-// time.
-func (m *Monitor) ask(r request, limit time.Duration) (bool, reply, bool) {
+// ask hands Run a request and waits for its answer, the whole exchange within
+// limit, and reports whether the answer came in time. Run replies into a
+// buffered channel, so an answer nobody waits for any more never blocks it.
+func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
 	r.reply = make(chan reply, 1)
 	deadline := time.NewTimer(limit)
 	defer deadline.Stop()
 	select {
 	case m.requests <- r:
 	case <-deadline.C:
-		return false, reply{}, false
+		return reply{}, false
 	}
 	select {
 	case a := <-r.reply:
-		return true, a, true
+		return a, true
 	case <-deadline.C:
-		return true, reply{}, false
+		return reply{}, false
 	}
 }
 
@@ -462,7 +462,7 @@ type Measured struct{ CPU, Memory, IO, Net, Threads, Pressure, Energy bool }
 // A SAMPLER THAT DOES NOT ANSWER IN TIME is stuck on a read: the summary is
 // what was already known, and the silence makes its energy stale.
 func (m *Monitor) Final(key string) (Summary, bool) {
-	if _, answer, answered := m.ask(request{kind: requestFinal, key: key}, m.limit); answered {
+	if answer, answered := m.ask(request{kind: requestFinal, key: key}, m.limit); answered {
 		return answer.summary, answer.ok
 	}
 
