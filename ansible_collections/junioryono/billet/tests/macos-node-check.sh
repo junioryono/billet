@@ -49,7 +49,7 @@ case "$1 ${2:-}" in
     "local up")
         cp "$config" "$BILLET_FAKE_STATE/at-up" 2>/dev/null || :
         [ "${BILLET_FAKE_UP_RC:-0}" = 0 ] || { echo "refuse   the loaded sh.billet.node differs from its plist" >&2; exit "$BILLET_FAKE_UP_RC"; }
-        if [ -f "$BILLET_FAKE_STATE/running" ]; then
+        if [ -f "$BILLET_FAKE_STATE/running" ] || [ -n "${BILLET_FAKE_RESTARTED:-}" ]; then
             echo "start    sh.billet.node is already running; left alone (a restart is a drain)"
             echo "enable   sh.billet.node is already enabled"
         else
@@ -64,6 +64,20 @@ esac
 exit 0
 EOF
 chmod +x "$work/bin/billet"
+
+# THE FAKE ls answers only the role's `ls -lde`: a listing, with an access
+# control entry under the macOS format when the case asks for one.
+cat >"$work/bin/ls" <<'EOF'
+#!/bin/sh
+[ "${BILLET_FAKE_LS_RC:-0}" = 0 ] || { echo "ls: cannot read" >&2; exit "$BILLET_FAKE_LS_RC"; }
+shift
+for p in "$@"; do
+    echo "-rw-------  1 node  staff  64 Sep 28 04:21 $p"
+    [ -n "${BILLET_FAKE_ACL:-}" ] && echo " 0: group:everyone allow write"
+done
+exit 0
+EOF
+chmod +x "$work/bin/ls"
 
 cat >"$work/play.yml" <<'EOF'
 - name: macos node
@@ -123,16 +137,6 @@ run() {
     BILLET_TEST_STAGED=
 }
 
-# ANSIBLE'S OWN INTERPRETER, which has PyYAML (fleet-playbook-check.sh makes
-# the same choice for the same reason).
-python=""
-if command -v ansible >/dev/null 2>&1; then
-    python=$(ansible --version 2>/dev/null | sed -n 's/.*python version.*(\(.*\)).*/\1/p' | head -n1)
-fi
-if [ -z "$python" ] || [ ! -x "$python" ]; then
-    python=$(command -v python3) || { echo "macos-node-check: no python3" >&2; exit 1; }
-fi
-
 # A SET-UP MAC: billet installed, a configuration the setup wrote, and a
 # running node, which is what docs/deploying/mac-tart.md leaves behind.
 fresh() {
@@ -155,22 +159,14 @@ no_candidate() {
     done
 }
 
-# is_config <file> <max_vcpu or none>: the file is config-a (or config-b with
-# its max_vcpu) as a document, nested by two spaces, which is what the host
-# role's billet.yaml.j2 renders.
+# is_config <file> <max_vcpu or none>: the file is, byte for byte, what
+# to_nice_yaml(indent=2, sort_keys=false) renders for config-a (or config-b):
+# the host role's billet.yaml.j2, key order and trailing newline included
+# (measured with ansible-core's filter, 2026-09-28).
 is_config() {
-    if ! "$python" - "$1" "$2" <<'PY'
-import sys, yaml
-want = {"node": {"name": "mac-1", "server_addr": "10.0.0.1:7717", "provider": "tart"}}
-if sys.argv[2] != "none":
-    want["node"]["max_vcpu"] = int(sys.argv[2])
-text = open(sys.argv[1]).read()
-assert yaml.safe_load(text) == want, yaml.safe_load(text)
-assert "\n  name: mac-1\n" in text, text
-PY
-    then
-        echo "FAIL: $1 is not the rendered billet_config: $(cat "$1")" >&2; exit 1
-    fi
+    printf 'node:\n  name: mac-1\n  server_addr: 10.0.0.1:7717\n  provider: tart\n' >"$work/want.yaml"
+    [ "$2" = none ] || printf '  max_vcpu: %s\n' "$2" >>"$work/want.yaml"
+    cmp -s "$1" "$work/want.yaml" || { echo "FAIL: $1 is not the rendered billet_config: $(cat "$1")" >&2; exit 1; }
 }
 
 # 1. No billet_config: nothing asked of billet, nothing changed.
@@ -258,5 +254,19 @@ chmod 0620 "$conf"
 run "a configuration others can write is refused" "writable by nobody else" -- -e "@$work/config-b.yml"
 [ ! -s "$work/calls" ] || { echo "FAIL: a writable configuration reached billet" >&2; exit 1; }
 chmod 0600 "$conf"
+
+run "an access control entry is refused" "carries an access control entry" BILLET_FAKE_ACL=1 -- -e "@$work/config-b.yml"
+[ ! -s "$work/calls" ] || { echo "FAIL: a configuration with an ACL reached billet" >&2; exit 1; }
+grep -q 'group:everyone allow write' "$work/out.log" || { echo "FAIL: the ACL refusal did not quote the entry" >&2; exit 1; }
+
+run "an unreadable ACL listing is refused" "could not be listed" BILLET_FAKE_LS_RC=1 -- -e "@$work/config-b.yml"
+[ ! -s "$work/calls" ] || { echo "FAIL: an unreadable ACL listing reached billet" >&2; exit 1; }
+
+# 10. Something starting the node between the drain and the install: the
+#     final `up` finds it running on the replaced configuration, and the run
+#     must fail rather than report a converged node.
+BILLET_TEST_STAGED=staged run "a node restarted during the converge is refused" "something started it between the drain and the install" \
+    BILLET_FAKE_RESTARTED=1 -- -e "@$work/config-b.yml"
+calls_are "billet check;billet local down;billet local up;" "a node restarted during the converge"
 
 echo "macos-node-check: every case behaved as the role requires"

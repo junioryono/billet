@@ -129,6 +129,40 @@
       role replaces only a file it could have written. Inspect it by hand;
       nothing was changed.
 
+# MODE BITS ARE NOT THE WHOLE ANSWER ON A MAC: an access control entry can
+# grant another account write on a 0600 file or entry rights on a 0755
+# directory, and `stat` reports neither. Any entry is refused rather than
+# interpreted; `ls -le` prints each as ` N: <who> allow|deny <rights>`
+# (measured on macOS 26, 2026-09-28), and an answer that could not be read
+# refuses too.
+- name: List the access control entries on the configuration and its directory
+  ansible.builtin.command:
+    argv:
+      - ls
+      - -lde
+      - "{{ billet_macos_node_config_path | dirname }}"
+      - "{{ billet_macos_node_config_path }}"
+  environment:
+    PATH: "{{ billet_macos_node_path }}"
+  register: billet_macos_node_acl
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Refuse a configuration an access control entry lets another account change
+  ansible.builtin.assert:
+    that:
+      - billet_macos_node_acl.rc == 0
+      - billet_macos_node_acl.stdout is not search('(?m)^ *[0-9]+: ')
+    fail_msg: >-
+      {{ ('The access control entries on ' ~ billet_macos_node_config_path ~ ' and its directory could not be listed: '
+          ~ (billet_macos_node_acl.stderr | default('') | trim))
+         if billet_macos_node_acl.rc != 0
+         else (billet_macos_node_config_path ~ ' or its directory carries an access control entry: '
+               ~ (billet_macos_node_acl.stdout_lines | select('search', '^ *[0-9]+: ') | join('; '))
+               ~ '. The role does not interpret ACLs; remove them with `chmod -N`.') }}
+      Nothing was changed.
+
 - name: Read the installed configuration
   ansible.builtin.slurp:
     src: "{{ billet_macos_node_config_path }}"
@@ -276,6 +310,26 @@
     or billet_macos_node_up.stdout | default('') is search('(?m)^enable {3}\S+ (?!is already enabled)')
   failed_when: false
   when: not ansible_check_mode
+
+# ON A CHANGE THE NODE MUST HAVE BEEN STARTED BY THIS `up`. The drain's
+# lifecycle lock ends when `local down` returns, so an operator's `local up`
+# between the drain and the install would start the node on the configuration
+# just replaced, and this `up` would leave it running. A start is the positive
+# proof it runs the new file; "already running" on this path is the race.
+- name: Refuse a node something else started on the replaced configuration
+  ansible.builtin.assert:
+    that:
+      - billet_macos_node_up.stdout | default('') is not search('(?m)^start {4}\S+ is already running')
+    fail_msg: >-
+      `billet local up` on {{ inventory_hostname }} found the node already running
+      after this converge drained it: something started it between the drain and
+      the install, on the configuration now replaced, and it is running that one.
+      Run `billet local down` and then `billet local up` on the Mac, or converge
+      again once nothing else is managing the node.
+  when:
+    - billet_macos_node_changes | bool
+    - not ansible_check_mode
+    - billet_macos_node_up.rc | default(1) == 0
 
 - name: Refuse a node that did not come up
   ansible.builtin.assert:
