@@ -59,12 +59,14 @@ func TestTheJobStartedHookPublishesTheAdapterURLForWorkflowExpressions(t *testin
 				}
 			}
 
-			run := exec.CommandContext(t.Context(), "sh", "-c", hook)
-			run.Env = append(inherited,
+			inherited = append(inherited,
 				"RUNNER_TEMP="+dir,
 				"GITHUB_ENV="+environment,
 				"BILLET_ACTIONS_CA_SOURCE="+source,
 			)
+
+			run := exec.CommandContext(t.Context(), "sh", "-c", hook)
+			run.Env = inherited
 			if tc.url != "" {
 				run.Env = append(run.Env, "BILLET_ACTIONS_CACHE_URL="+tc.url)
 			}
