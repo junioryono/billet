@@ -170,7 +170,7 @@ func TestTheBuildHandsTheHomeToTheRunnerAfterEveryInstallStep(t *testing.T) {
 	const pass = "\n\tchroot \"$rootfs\" chown -R runner:runner /home/runner\n"
 
 	last := strings.LastIndex(source, pass)
-	toolcache := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")
+	toolcache := strings.LastIndex(source, "\n\t\t\tbillet_install_toolcache\n")
 	boot := strings.Index(source, `echo "=== 5/6 boot configuration ==="`)
 	filesystem := strings.Index(source, `echo "=== 6/6 filesystem ==="`)
 

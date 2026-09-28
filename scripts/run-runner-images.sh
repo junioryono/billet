@@ -59,13 +59,21 @@ prepare_waagent_conf() {
 	target exec sh -c 'test -e /etc/waagent.conf || : >/etc/waagent.conf'
 }
 
+# THE daemon.json THE GUEST SHIPS, the one file build-guest-image.sh installs too,
+# and it must be the first one dockerd reads, because what it pulls lands in
+# whichever store it started with.
+prepare_docker_daemon() {
+	target exec mkdir -p /etc/docker &&
+		target copy-in "$here/../internal/guestassets/docker-daemon.json" /etc/docker/daemon.json
+}
+
 prepare_build_user() {
 	target exec sh -c 'id runner >/dev/null 2>&1 || useradd --create-home --uid 1001 --shell /bin/bash runner
 		printf "runner ALL=(ALL) NOPASSWD:ALL\n" >/etc/sudoers.d/runner
 		chmod 0440 /etc/sudoers.d/runner'
 }
 
-prepares=" waagent-conf build-user "
+prepares=" waagent-conf docker-daemon build-user "
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT

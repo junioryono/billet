@@ -9,4 +9,6 @@
 # a pin bump to review, not a line to ignore.
 skip	inline:5943fe1a3eb3	Azure's agent deprovisions the VM for capture; a billet guest is not an Azure VM and carries no waagent
 prepare:waagent-conf	configure-environment.sh	Ubuntu's generic cloud image has no /etc/waagent.conf, and the script edits it unconditionally under bash -e; an empty file lets the rest of the script run, and the Azure resource-disk settings it writes are read by nothing
+prepare:docker-daemon	install-docker.sh	billet's /var/lib/docker is one independently fenced cache filesystem, so docker must keep images in its classic overlay2 store rather than Docker 29's containerd store, which keeps content outside it; written before the script first starts dockerd and pulls into it
+skip	configure-snap.sh	the script restarts snapd, which needs AppArmor profiles and squashfs mounts a container build does not give it, and a billet guest runs no snaps; /snap/bin on PATH and the refresh hold describe a snapd that is not running
 prepare:build-user	install-homebrew.sh	GitHub runs this step as Packer's unprivileged SSH user, because Homebrew refuses to install as root; billet runs it as runner, created here with GitHub's uid and passwordless sudo

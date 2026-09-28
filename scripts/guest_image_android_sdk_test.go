@@ -89,13 +89,13 @@ func TestTheGuestBuildInstallsAndTheGateAsksForTheAndroidSDK(t *testing.T) {
 
 	source := readScriptFile(t, "build-guest-image.sh")
 
-	call := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")
+	call := strings.LastIndex(source, "\n\t\t\tbillet_install_toolcache\n")
 	if call < 0 {
 		t.Fatal("build-guest-image.sh has no billet_install_toolcache call, so this test is reading the wrong script")
 	}
 
-	start := strings.LastIndex(source[:call], "\tBILLET_TC_ROOT=")
-	if start < 0 || !strings.Contains(source[start:call], "\t\tBILLET_TC_ANDROID_ACCEPT_LICENSES=yes \\") {
+	start := strings.LastIndex(source[:call], "\t\tBILLET_TC_ROOT=")
+	if start < 0 || !strings.Contains(source[start:call], "\t\t\tBILLET_TC_ANDROID_ACCEPT_LICENSES=yes \\") {
 		t.Error("the toolcache call in build-guest-image.sh does not set BILLET_TC_ANDROID_ACCEPT_LICENSES=yes, " +
 			"so install_android installs nothing")
 	}

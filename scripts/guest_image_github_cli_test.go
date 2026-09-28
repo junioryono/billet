@@ -85,7 +85,7 @@ func TestTheGuestBuildInstallsTheGitHubCLI(t *testing.T) {
 		t.Fatal("build-guest-image.sh has no billet_packages list, so this test is reading the wrong script")
 	}
 
-	end := strings.Index(source[start:], "\n\t)")
+	end := strings.Index(source[start:], "\n\t\t)")
 	if end < 0 {
 		t.Fatal("the billet_packages list is not closed where this test expects")
 	}

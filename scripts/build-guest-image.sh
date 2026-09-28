@@ -93,7 +93,16 @@ fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
-# 36864MB, FOR ABOUT 27200MB OF CONTENT ONCE THE ANDROID SDK IS IN.
+# 81920MB FOR THE RUNNER-IMAGES BUILD, AN ESTIMATE UNTIL ITS FIRST BUILD REPORTS.
+# GitHub's own image is built on a 75GB disk and a hosted runner shows about 16GB
+# of it free, so about 59GB used; billet's layer adds under a gigabyte. 81920
+# declares about 75900M usable (0.927 of it, below), about 16000M of margin. The
+# debootstrap build below measured about 27200M and was sized 36864MB; the file
+# is sparse and zstd compresses what is unused, so the larger declaration costs
+# that build nothing but the declared size of its clones.
+#
+# THE DEBOOTSTRAP BUILD'S HISTORY: 36864MB, FOR ABOUT 27200MB OF CONTENT ONCE THE
+# ANDROID SDK IS IN.
 #
 # The last build without the SDK measured `contents: 15073M used, 5788M free of
 # 22528M`. The SDK with its platforms, build-tools and three NDKs is what separates
@@ -154,7 +163,7 @@ SUITE="${SUITE:-noble}"
 #
 # It is still not free forever: every generation already published keeps its own
 # size, so this should track the measurement rather than drift upward by habit.
-SIZE_MB="${SIZE_MB:-36864}"
+SIZE_MB="${SIZE_MB:-81920}"
 
 # MIN_FREE_MB is the build's own margin, checked against a MEASUREMENT.
 #
@@ -171,6 +180,22 @@ CEPH_USER="${CEPH_USER:-billet}"
 WORK_DEFAULT=/var/tmp/billet-guest
 WORK="${WORK:-$WORK_DEFAULT}"
 PUBLISH="${PUBLISH:-yes}"
+
+# HOW THE IMAGE IS BUILT (#250). runner-images, the default, starts from Ubuntu's
+# own cloud root filesystem and runs GitHub's runner-images template in it under
+# systemd-nspawn, so parity with a hosted runner holds by construction and the
+# difference is one reviewed file (scripts/runner-images/differences.tsv).
+# debootstrap is the build this replaced, which assembled parity from GitHub's
+# declaration with billet's own installers; it stays selectable until the
+# runner-images build has published, and is then removed.
+BUILD_FROM="${BUILD_FROM:-runner-images}"
+case "$BUILD_FROM" in
+	runner-images | debootstrap) ;;
+	*)
+		echo "BUILD_FROM must be runner-images or debootstrap, not '$BUILD_FROM'" >&2
+		exit 1
+		;;
+esac
 
 # PINNED, NOT "LATEST", for the reason cmd/billet/ami.go gives about the AMI: an
 # image is a thing you reproduce, and a build that silently tracked the newest
@@ -433,6 +458,7 @@ unmount_rootfs() {
 on_signal() {
 	local signal="$1"
 
+	stop_runner_images
 	unmount_guest_proc
 	unmount_rootfs
 
@@ -445,7 +471,7 @@ on_signal() {
 # as a call from unmount_rootfs made the two inseparable, which broke the test
 # that exercises the rootfs unmount on its own. Each function drops one mount;
 # the sequence they must run in is stated once, here, where both are in view.
-trap 'unmount_guest_proc; unmount_rootfs' EXIT
+trap 'stop_runner_images; unmount_guest_proc; unmount_rootfs' EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
 
@@ -470,6 +496,129 @@ clear_stale_mount() {
 	fi
 }
 
+# RUNNER_IMAGES_BOOTED is the root filesystem booted under systemd-nspawn, or
+# empty. POWERED OFF BEFORE ANY UNMOUNT, because a booted machine holds the
+# filesystem and every mount inside it.
+RUNNER_IMAGES_BOOTED=""
+
+# stop_runner_images powers off the booted image, if there is one.
+stop_runner_images() {
+	[ -n "$RUNNER_IMAGES_BOOTED" ] || return 0
+
+	BILLET_RI_ROOTFS="$RUNNER_IMAGES_BOOTED" "$SCRIPT_DIR/runner-images-nspawn.sh" stop || true
+	RUNNER_IMAGES_BOOTED=""
+}
+
+# install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
+# scripts/runner-images/base.pin, into the mounted image and makes it a billet
+# guest's base: the filesystem GitHub's template starts from on Azure, without
+# Azure.
+install_cloud_base() {
+	local rootfs="$1" release file sum
+	read -r release file sum <"$SCRIPT_DIR/runner-images/base.pin"
+	if [ -z "$sum" ]; then
+		echo "scripts/runner-images/base.pin names no release, file and sha256" >&2
+		exit 1
+	fi
+
+	local tarball="$WORK/$file"
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 900 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$tarball" \
+		"https://cloud-images.ubuntu.com/releases/noble/$release/$file"
+
+	# VERIFIED BEFORE IT IS UNPACKED, against the sum pinned from a SHA256SUMS
+	# whose signature was checked when the pin was written.
+	echo "$sum  $tarball" | sha256sum -c -
+
+	tar --numeric-owner --xattrs --xattrs-include='*' -xJpf "$tarball" -C "$rootfs"
+	rm -f "$tarball"
+
+	# THE CLOUD IMAGE MOUNTS / BY LABEL, and this filesystem has none: the kernel
+	# mounts the root from its command line, as the debootstrapped image did.
+	printf '# the root filesystem is mounted by the kernel from its command line\n' \
+		>"$rootfs/etc/fstab"
+
+	# NO CLOUD-INIT: a guest takes its registration from billet's metadata agent,
+	# and cloud-init would wait at every boot for a datasource that is not there.
+	touch "$rootfs/etc/cloud/cloud-init.disabled"
+
+	write_apt_sources "$rootfs" \
+		"https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
+	rm -f "$rootfs/etc/apt/sources.list"
+	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APTCONF
+}
+
+# write_apt_sources writes the image's one deb822 source for $SUITE from URIS.
+write_apt_sources() {
+	local rootfs="$1" uris="$2"
+	cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
+Types: deb
+URIs: $uris
+Suites: $SUITE $SUITE-updates $SUITE-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+}
+
+# run_runner_images_build boots the base under systemd-nspawn, runs GitHub's
+# template in it through scripts/run-runner-images.sh, and powers it off; then
+# adds what the guest mechanism needs that GitHub's image has no reason to carry.
+run_runner_images_build() {
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh"
+
+	RUNNER_IMAGES_BOOTED="$rootfs"
+	BILLET_RI_ROOTFS="$rootfs" "$driver" start
+
+	BILLET_RI_ROOTFS="$rootfs" \
+		BILLET_RI_TARGET="$driver" \
+		BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
+		BILLET_RI_OUT="$WORK/runner-images" \
+		"$SCRIPT_DIR/run-runner-images.sh"
+
+	stop_runner_images
+
+	# ONE MACHINE ID PER GUEST: the boot above wrote one, and a clone that carried
+	# it would share it with every other guest of this generation.
+	: >"$rootfs/etc/machine-id"
+
+	# WHAT THE GUEST MECHANISM NEEDS THAT GITHUB'S IMAGE DOES NOT CARRY: dnsmasq-base
+	# for the cache's DNS remap, networkd, resolved and netplan for the network the
+	# agent reaches the metadata service over, libicu74 for the .NET runner,
+	# e2fsprogs because the host grows this filesystem, and the two a hosted runner
+	# has that CI jobs here installed every run. apt skips any GitHub already put in.
+	chroot "$rootfs" /bin/bash -eux -s -- \
+		dnsmasq-base systemd-resolved netplan.io libicu74 e2fsprogs apparmor python3-apt <<'APT'
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends "$@"
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+APT
+}
+
+# write_image_env writes /etc/billet-image-env, the environment the agent hands
+# the job, from the NAME=VALUE lines GitHub's scripts wrote to /etc/environment:
+# ImageOS, ImageVersion, the JAVA_HOME and GOROOT lines, ANDROID_HOME, the tool
+# cache and GitHub's PATH, as a hosted runner exports them.
+write_image_env() {
+	local rootfs="$1"
+	grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$rootfs/etc/environment" \
+		>"$rootfs/etc/billet-image-env.tmp" || true
+	if ! grep -q '^ImageOS=' "$rootfs/etc/billet-image-env.tmp"; then
+		echo "GitHub's build wrote no ImageOS to /etc/environment; refusing an image whose jobs" >&2
+		echo "would not see the variables a hosted runner exports" >&2
+		exit 1
+	fi
+	chmod 0644 "$rootfs/etc/billet-image-env.tmp"
+	mv "$rootfs/etc/billet-image-env.tmp" "$rootfs/etc/billet-image-env"
+}
+
 need_root() {
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "this builds a filesystem and maps a block device; run it as root" >&2
@@ -484,7 +633,15 @@ need_tools() {
 	# mountpoint likewise: the stale-mount guard is what stops that delete from
 	# running through a live filesystem, and a guard whose tool is missing is not
 	# a guard.
-	for t in debootstrap mkfs.ext4 e2fsck chroot jq flock mountpoint; do
+	local tools=(mkfs.ext4 e2fsck chroot jq flock mountpoint)
+	if [ "$BUILD_FROM" = runner-images ]; then
+		# systemd-nspawn, machinectl and systemd-run BOOT THE IMAGE the scripts run
+		# in; curl, sha256sum and xz fetch and verify its base.
+		tools+=(systemd-nspawn machinectl systemd-run curl sha256sum xz)
+	else
+		tools+=(debootstrap)
+	fi
+	for t in "${tools[@]}"; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
 
@@ -501,7 +658,7 @@ need_tools() {
 	fi
 
 	if [ ${#missing[@]} -ne 0 ]; then
-		echo "missing: ${missing[*]} (apt-get install debootstrap e2fsprogs ceph-common)" >&2
+		echo "missing: ${missing[*]} (apt-get install systemd-container xz-utils debootstrap e2fsprogs ceph-common)" >&2
 		exit 1
 	fi
 
@@ -615,113 +772,120 @@ main() {
 	MOUNTED_ROOTFS="$rootfs"
 	mount -o loop "$img" "$rootfs"
 
-	echo "=== 1/6 base system ($SUITE) ==="
-	# --variant=minbase, then systemd on top: the guest needs an init that can run
-	# Docker's unit, and the alternative is hand-writing service supervision.
-	#
-	# GNU Wget does not race address families. On the reference host it selected an
-	# established but black-holed IPv6 connection to archive.ubuntu.com and waited
-	# for its 900-second default timeout, while the same object answered immediately
-	# over IPv4. Keep IPv6 as a fallback, but prefer IPv4 and bound each attempt so a
-	# weekly rebuild cannot spend most of its service timeout on one package.
-	local download_bin="$WORK/download-bin"
-	mkdir -p "$download_bin"
-	cat >"$download_bin/wget" <<'EOF'
+	if [ "$BUILD_FROM" = runner-images ]; then
+		echo "=== 1/6 base system (Ubuntu's cloud root filesystem) ==="
+		install_cloud_base "$rootfs"
+
+		echo "=== 2/6 GitHub's runner-images build ==="
+		run_runner_images_build "$rootfs"
+	else
+		echo "=== 1/6 base system ($SUITE) ==="
+		# --variant=minbase, then systemd on top: the guest needs an init that can run
+		# Docker's unit, and the alternative is hand-writing service supervision.
+		#
+		# GNU Wget does not race address families. On the reference host it selected an
+		# established but black-holed IPv6 connection to archive.ubuntu.com and waited
+		# for its 900-second default timeout, while the same object answered immediately
+		# over IPv4. Keep IPv6 as a fallback, but prefer IPv4 and bound each attempt so a
+		# weekly rebuild cannot spend most of its service timeout on one package.
+		local download_bin="$WORK/download-bin"
+		mkdir -p "$download_bin"
+		cat >"$download_bin/wget" <<'EOF'
 #!/bin/sh
 exec /usr/bin/wget --prefer-family=IPv4 --timeout=30 --tries=5 "$@"
 EOF
-	chmod 0755 "$download_bin/wget"
-	PATH="$download_bin:$PATH" debootstrap \
-		--variant=minbase --include=systemd,systemd-sysv,dbus \
-		"$SUITE" "$rootfs" http://archive.ubuntu.com/ubuntu/
+		chmod 0755 "$download_bin/wget"
+		PATH="$download_bin:$PATH" debootstrap \
+			--variant=minbase --include=systemd,systemd-sysv,dbus \
+			"$SUITE" "$rootfs" http://archive.ubuntu.com/ubuntu/
 
-	echo "=== 2/6 packages ==="
-	# debootstrap writes a one-line legacy source for the base suite. Replace it
-	# rather than layering the deb822 source beside it, which asks apt for the same
-	# index twice and hides useful warnings in duplicate-target noise.
-	rm -f "$rootfs/etc/apt/sources.list"
-	cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
+		echo "=== 2/6 packages ==="
+		# debootstrap writes a one-line legacy source for the base suite. Replace it
+		# rather than layering the deb822 source beside it, which asks apt for the same
+		# index twice and hides useful warnings in duplicate-target noise.
+		rm -f "$rootfs/etc/apt/sources.list"
+		cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
 Types: deb
 URIs: http://archive.ubuntu.com/ubuntu/
 Suites: $SUITE $SUITE-updates $SUITE-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
-	# MULTIVERSE AND RESTRICTED ARE NOT OPTIONAL ONCE THE TOOLSET DRIVES THIS.
-	# GitHub's own package list includes p7zip-rar, which is in multiverse -- so
-	# with main+universe alone the install fails on one package out of seventy-four
-	# and takes the whole build with it. Enabling the components is what lets the
-	# declaration be installed as written rather than edited down to what happens
-	# to be reachable.
+		# MULTIVERSE AND RESTRICTED ARE NOT OPTIONAL ONCE THE TOOLSET DRIVES THIS.
+		# GitHub's own package list includes p7zip-rar, which is in multiverse -- so
+		# with main+universe alone the install fails on one package out of seventy-four
+		# and takes the whole build with it. Enabling the components is what lets the
+		# declaration be installed as written rather than edited down to what happens
+		# to be reachable.
 
-	# TWO LISTS, AND THE DISTINCTION IS THE WHOLE POINT OF SPLITTING THEM.
-	#
-	# BILLET_PACKAGES is what the GUEST MECHANISM needs: Docker for the jobs,
-	# iproute2 and netplan for the network the agent reaches the metadata service
-	# over, dnsmasq-base for the cache's DNS remap, libicu74 for the .NET runner,
-	# e2fsprogs because the host grows this filesystem before boot. None of it is
-	# on GitHub's list, because GitHub's image is not a microVM guest -- and none of
-	# it may be dropped when the toolset changes.
-	#
-	# TOOLSET_PACKAGES is what a WORKFLOW expects, taken from GitHub's own
-	# declaration and never edited here. Editing it is how the two images diverge
-	# silently, which is exactly the gap this work exists to close.
-	# apparmor and python3-apt are on the hosted image and were installed by every
-	# CI job on this fleet that needed them, which reached the archive from every
-	# guest: one more dependency on a mirror that was unreachable for hours on
-	# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
-	# everything else at its site. apparmor is a BEHAVIOUR CHANGE, not only a
-	# file: the guest kernel boots with AppArmor as its LSM, and with the parser
-	# present dockerd confines every container under docker-default, as a hosted
-	# runner does; a job that mounts with added capabilities can now meet a denial
-	# it did not meet on the parser-less guest, and meets the same one hosted.
-	# gh IS ON THE HOSTED IMAGE AND IN NO DECLARATION: GitHub installs it with a
-	# script of its own, the latest release's .deb, so the toolset never names it
-	# and nothing here installed it until a workflow's first `gh` call failed with
-	# 127 on the fleet (2026-09-22). This is Ubuntu's package, signed by the archive
-	# key and installed in this one transaction, which is older than the release
-	# GitHub installs; ADR-005 records that difference and what would close it.
-	local billet_packages=(
-		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
-		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
-		systemd-resolved netplan.io libicu74 zstd rsync build-essential
-		python3-pip python3-venv python3-dev apparmor python3-apt gh
-	)
+		# TWO LISTS, AND THE DISTINCTION IS THE WHOLE POINT OF SPLITTING THEM.
+		#
+		# BILLET_PACKAGES is what the GUEST MECHANISM needs: Docker for the jobs,
+		# iproute2 and netplan for the network the agent reaches the metadata service
+		# over, dnsmasq-base for the cache's DNS remap, libicu74 for the .NET runner,
+		# e2fsprogs because the host grows this filesystem before boot. None of it is
+		# on GitHub's list, because GitHub's image is not a microVM guest -- and none of
+		# it may be dropped when the toolset changes.
+		#
+		# TOOLSET_PACKAGES is what a WORKFLOW expects, taken from GitHub's own
+		# declaration and never edited here. Editing it is how the two images diverge
+		# silently, which is exactly the gap this work exists to close.
+		# apparmor and python3-apt are on the hosted image and were installed by every
+		# CI job on this fleet that needed them, which reached the archive from every
+		# guest: one more dependency on a mirror that was unreachable for hours on
+		# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
+		# everything else at its site. apparmor is a BEHAVIOUR CHANGE, not only a
+		# file: the guest kernel boots with AppArmor as its LSM, and with the parser
+		# present dockerd confines every container under docker-default, as a hosted
+		# runner does; a job that mounts with added capabilities can now meet a denial
+		# it did not meet on the parser-less guest, and meets the same one hosted.
+		# gh IS ON THE HOSTED IMAGE AND IN NO DECLARATION: GitHub installs it with a
+		# script of its own, the latest release's .deb, so the toolset never names it
+		# and nothing here installed it until a workflow's first `gh` call failed with
+		# 127 on the fleet (2026-09-22). This is Ubuntu's package, signed by the archive
+		# key and installed in this one transaction, which is older than the release
+		# GitHub installs; ADR-005 records that difference and what would close it.
+		local billet_packages=(
+			ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
+			docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
+			systemd-resolved netplan.io libicu74 zstd rsync build-essential
+			python3-pip python3-venv python3-dev apparmor python3-apt gh
+		)
 
-	local github_packages=()
-	while IFS= read -r pkg; do
-		[ -n "$pkg" ] && github_packages+=("$pkg")
-	done < <(toolset_packages)
+		local github_packages=()
+		while IFS= read -r pkg; do
+			[ -n "$pkg" ] && github_packages+=("$pkg")
+		done < <(toolset_packages)
 
-	if [ "${#github_packages[@]}" -eq 0 ]; then
-		echo "the toolset declared no apt packages; refusing to build an image that would" >&2
-		echo "silently carry only billet's own dependencies" >&2
-		exit 1
-	fi
+		if [ "${#github_packages[@]}" -eq 0 ]; then
+			echo "the toolset declared no apt packages; refusing to build an image that would" >&2
+			echo "silently carry only billet's own dependencies" >&2
+			exit 1
+		fi
 
-	echo "installing ${#billet_packages[@]} billet packages and ${#github_packages[@]} from github's toolset"
+		echo "installing ${#billet_packages[@]} billet packages and ${#github_packages[@]} from github's toolset"
 
-	# INSTALLED IN ONE TRANSACTION so apt resolves the whole set together; two
-	# passes can have the second uninstall something the first pulled in.
-	#
-	# --no-install-recommends, WHICH IS WHERE THIS DIFFERS FROM UPSTREAM ON PURPOSE.
-	# runner-images installs each package with recommends on a full cloud image;
-	# here every recommended package is permanent size in a file every node
-	# downloads and every job clones. The toolset names what a workflow is entitled
-	# to find, and that is what gets installed.
-	# PASSED AS ARGUMENTS, NOT INTERPOLATED INTO THE PROGRAM TEXT.
-	#
-	# `${array[*]}` inside a double-quoted `bash -c` string flattens the names into
-	# the SOURCE of the inner shell, which then word-splits, glob-expands and
-	# interprets them. Today's names are all shell-safe, and nothing enforces that:
-	# the digest proves the declaration is the file upstream published, which is a
-	# statement about provenance and not about whether its strings are safe shell
-	# syntax. A future entry containing a space, a `*`, or a `;` would be split,
-	# expanded against the chroot's filesystem, or executed.
-	#
-	# `bash -s -- "$@"` passes them as argv, where none of that happens.
-	chroot "$rootfs" /bin/bash -eux -s -- \
-		"${billet_packages[@]}" "${github_packages[@]}" <<'APT'
+		# INSTALLED IN ONE TRANSACTION so apt resolves the whole set together; two
+		# passes can have the second uninstall something the first pulled in.
+		#
+		# --no-install-recommends, WHICH IS WHERE THIS DIFFERS FROM UPSTREAM ON PURPOSE.
+		# runner-images installs each package with recommends on a full cloud image;
+		# here every recommended package is permanent size in a file every node
+		# downloads and every job clones. The toolset names what a workflow is entitled
+		# to find, and that is what gets installed.
+		# PASSED AS ARGUMENTS, NOT INTERPOLATED INTO THE PROGRAM TEXT.
+		#
+		# `${array[*]}` inside a double-quoted `bash -c` string flattens the names into
+		# the SOURCE of the inner shell, which then word-splits, glob-expands and
+		# interprets them. Today's names are all shell-safe, and nothing enforces that:
+		# the digest proves the declaration is the file upstream published, which is a
+		# statement about provenance and not about whether its strings are safe shell
+		# syntax. A future entry containing a space, a `*`, or a `;` would be split,
+		# expanded against the chroot's filesystem, or executed.
+		#
+		# `bash -s -- "$@"` passes them as argv, where none of that happens.
+		chroot "$rootfs" /bin/bash -eux -s -- \
+			"${billet_packages[@]}" "${github_packages[@]}" <<'APT'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends "$@"
@@ -729,32 +893,34 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 APT
 
-	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
-	# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
-	# apt: it fetches both index sets (twice the index traffic) and takes a package
-	# from whichever lists the version, so an install can succeed from the
-	# surviving repository when it indexes and serves the selected version, while
-	# `apt-get update` under Error-Mode=any still fails naming the dead one.
-	# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
-	# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
-	# passed in 13 s, and a package installed from the second mirror in 4 s. The
-	# `mirror+file:` method, which fetches one index set and offers alternate URLs
-	# per file, did NOT finish a strict update in nine minutes under the same
-	# black hole, so it is not the shape here. Acquire::Retries retries the failing
-	# URI; the timeout is per read, not per download. The build bootstraps over
-	# plain HTTP because minbase carries no CA bundle until the transaction above
-	# installs ca-certificates. Why two sources: the same day every
-	# archive.ubuntu.com address refused port 80 from the site and from AWS for
-	# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
-	# on one of those. A rewrite the grep does not confirm is a build that would
-	# ship the old source under a new comment.
-	sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
-	grep -Fxq 'URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
-	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
+		# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
+		# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
+		# apt: it fetches both index sets (twice the index traffic) and takes a package
+		# from whichever lists the version, so an install can succeed from the
+		# surviving repository when it indexes and serves the selected version, while
+		# `apt-get update` under Error-Mode=any still fails naming the dead one.
+		# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
+		# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
+		# passed in 13 s, and a package installed from the second mirror in 4 s. The
+		# `mirror+file:` method, which fetches one index set and offers alternate URLs
+		# per file, did NOT finish a strict update in nine minutes under the same
+		# black hole, so it is not the shape here. Acquire::Retries retries the failing
+		# URI; the timeout is per read, not per download. The build bootstraps over
+		# plain HTTP because minbase carries no CA bundle until the transaction above
+		# installs ca-certificates. Why two sources: the same day every
+		# archive.ubuntu.com address refused port 80 from the site and from AWS for
+		# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
+		# on one of those. A rewrite the grep does not confirm is a build that would
+		# ship the old source under a new comment.
+		sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+		grep -Fxq 'URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
+		install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
 Acquire::Retries "3";
 Acquire::http::Timeout "30";
 Acquire::https::Timeout "30";
 APTCONF
+
+	fi
 
 	# break-system-packages, exactly as runner-images writes it on 24.04, so a
 	# workflow that `pip install`s against the system python succeeds here as it does
@@ -772,16 +938,11 @@ PIPCONF
 	# package default would publish a healthy but empty volume while pulled images
 	# stayed on the disposable root disk. Pin the supported classic backend rather
 	# than splitting one cache generation across two independently mounted trees.
+	# ONE FILE, which the runner-images build installs too, before dockerd first
+	# starts there.
 	install -d -m 0755 "$rootfs/etc/docker"
-	install -m 0644 /dev/stdin "$rootfs/etc/docker/daemon.json" <<'DOCKER'
-{
-  "features": {
-    "containerd-snapshotter": false
-  },
-  "storage-driver": "overlay2",
-  "bip": "172.17.0.1/16"
-}
-DOCKER
+	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/docker-daemon.json" \
+		"$rootfs/etc/docker/daemon.json"
 
 	# WHY THESE SIX, AND WHY THEY ARE NOT OPTIONAL.
 	#
@@ -832,7 +993,9 @@ DOCKER
 	# and a job that could write outside its own tree is a job that can rewrite the
 	# agent that started it.
 	chroot "$rootfs" /bin/bash -euxc "
-		useradd --create-home --shell /bin/bash runner
+		# THE ACCOUNT MAY EXIST ALREADY: the runner-images build creates it with
+		# GitHub's uid for the step GitHub runs unprivileged.
+		id runner >/dev/null 2>&1 || useradd --create-home --shell /bin/bash runner
 		usermod -aG docker runner
 		echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 	"
@@ -898,42 +1061,49 @@ DOCKER
 	# every JAVA_HOME the JDKs had just written, leaving five JDKs installed and
 	# unfindable. That is the exact failure the toolcache section warns about one
 	# directory over, and nothing about a running image would have said so.
-	install -m 0644 /dev/stdin "$rootfs/etc/billet-image-env" <<'IMAGEENV'
+	# GITHUB'S SCRIPTS WROTE THE HOSTED ENVIRONMENT TO /etc/environment in the
+	# runner-images build, and installed the toolcache; the agent passes the job
+	# exactly what /etc/billet-image-env names, so it is that file's lines.
+	if [ "$BUILD_FROM" = runner-images ]; then
+		write_image_env "$rootfs"
+	else
+		install -m 0644 /dev/stdin "$rootfs/etc/billet-image-env" <<'IMAGEENV'
 ImageOS=ubuntu24
 ImageVersion=billet
 IMAGEENV
 
-	# /proc FOR THE DURATION, because the runtimes this installs need it. See
-	# MOUNTED_PROC: two of them locate their own libraries through an $ORIGIN
-	# rpath, which glibc resolves by reading /proc/self/exe. The window is kept to
-	# the step that needs it rather than the whole build.
-	MOUNTED_PROC="$rootfs/proc"
-	mount -t proc proc "$rootfs/proc"
+		# /proc FOR THE DURATION, because the runtimes this installs need it. See
+		# MOUNTED_PROC: two of them locate their own libraries through an $ORIGIN
+		# rpath, which glibc resolves by reading /proc/self/exe. The window is kept to
+		# the step that needs it rather than the whole build.
+		MOUNTED_PROC="$rootfs/proc"
+		mount -t proc proc "$rootfs/proc"
 
-	# THE CONTRACT, STATED AT THE CALL. The guest build assembles a filesystem it
-	# is not running, so the target root is $rootfs and everything that must see
-	# the target's own apt or interpreter goes through chroot. The EC2 build sets
-	# BILLET_TC_ROOT to "" and the same functions run directly.
-	# x64 BECAUSE THIS SCRIPT REFUSES TO RUN ANYWHERE ELSE. check_host_arch stops a
-	# build on a non-x86_64 host, since the pinned runner is linux-x64 -- so the
-	# guest's architecture is not a variable here the way it is for an AMI. Stating
-	# it at the call rather than defaulting it keeps the installers' refusal of an
-	# unset value meaningful.
-	BILLET_TC_ROOT="$rootfs" \
-		BILLET_TC_ARCH=x64 \
-		BILLET_TC_DIR="$rootfs$TOOLCACHE_DIR" \
-		BILLET_TC_IN_TARGET="$TOOLCACHE_DIR" \
-		BILLET_TC_WORK="$WORK" \
-		BILLET_TC_TOOLSET="$TOOLSET_FILE" \
-		BILLET_TC_ENV_FILE="$rootfs/etc/billet-image-env" \
-		BILLET_TC_ANDROID_ACCEPT_LICENSES=yes \
-		billet_install_toolcache
+		# THE CONTRACT, STATED AT THE CALL. The guest build assembles a filesystem it
+		# is not running, so the target root is $rootfs and everything that must see
+		# the target's own apt or interpreter goes through chroot. The EC2 build sets
+		# BILLET_TC_ROOT to "" and the same functions run directly.
+		# x64 BECAUSE THIS SCRIPT REFUSES TO RUN ANYWHERE ELSE. check_host_arch stops a
+		# build on a non-x86_64 host, since the pinned runner is linux-x64 -- so the
+		# guest's architecture is not a variable here the way it is for an AMI. Stating
+		# it at the call rather than defaulting it keeps the installers' refusal of an
+		# unset value meaningful.
+		BILLET_TC_ROOT="$rootfs" \
+			BILLET_TC_ARCH=x64 \
+			BILLET_TC_DIR="$rootfs$TOOLCACHE_DIR" \
+			BILLET_TC_IN_TARGET="$TOOLCACHE_DIR" \
+			BILLET_TC_WORK="$WORK" \
+			BILLET_TC_TOOLSET="$TOOLSET_FILE" \
+			BILLET_TC_ENV_FILE="$rootfs/etc/billet-image-env" \
+			BILLET_TC_ANDROID_ACCEPT_LICENSES=yes \
+			billet_install_toolcache
 
-	# CLOSED AS SOON AS THE STEP THAT NEEDS IT IS DONE. The trap would drop it
-	# anyway, but a mount left open across the rest of the build is one more thing
-	# every later step has to be correct about -- and the pack step in particular
-	# must not be looking at a rootfs with a kernel filesystem inside it.
-	unmount_guest_proc
+		# CLOSED AS SOON AS THE STEP THAT NEEDS IT IS DONE. The trap would drop it
+		# anyway, but a mount left open across the rest of the build is one more thing
+		# every later step has to be correct about -- and the pack step in particular
+		# must not be looking at a rootfs with a kernel filesystem inside it.
+		unmount_guest_proc
+	fi
 
 	# WHAT THIS IMAGE ACTUALLY CONTAINS, WRITTEN INTO THE IMAGE.
 	#
@@ -1868,7 +2038,8 @@ NET
 		# the guest, so a getty on ttyS0 would spin against a device nothing reads.
 		systemctl mask getty@tty1.service serial-getty@ttyS0.service
 		systemctl mask systemd-resolved-monitor.service 2>/dev/null || true
-		printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
+		grep -q "^RUNNER_TOOL_CACHE=" /etc/environment ||
+			printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
 		echo billet-guest >/etc/hostname
 		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n::1     localhost ip6-localhost ip6-loopback\n" >/etc/hosts
 		# ROOT CANNOT LOG IN. Nothing should be logging into a guest that exists for

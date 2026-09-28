@@ -52,9 +52,14 @@ ready() {
 case "${1:-}" in
 start)
 	[ -z "$(leader)" ] || fail "$machine is already running"
-	# EVERY CAPABILITY AND THE HOST'S NETWORK, because the scripts install and run
-	# docker, mount filesystems and start network services: the container is a
-	# build environment for an image, not a boundary around it.
+	# EVERY CAPABILITY, because the scripts install and run docker, mount
+	# filesystems and start services: the container is a build environment for an
+	# image, not a boundary around it.
+	#
+	# ITS OWN NETWORK, NATted by the host's networkd (--network-veth): the builder
+	# is itself a guest that may run docker, and two dockerds in one network
+	# namespace both claim docker0. The uplink's DNS servers, because the host's
+	# stub resolver on 127.0.0.53 is not reachable from another namespace.
 	#
 	# A REBOOT IS NSPAWN EXITING 133, which it does when the container reboots; the
 	# unit restarts it on exactly that status, as systemd-nspawn@.service does, and
@@ -64,7 +69,7 @@ start)
 		--property=SuccessExitStatus=133 -- \
 		systemd-nspawn --boot --quiet --machine="$machine" --directory="$BILLET_RI_ROOTFS" \
 		--capability=all --system-call-filter='@keyring bpf' --private-users=no \
-		--resolv-conf=replace-host --timezone=off --bind=/dev/fuse
+		--network-veth --resolv-conf=replace-uplink --timezone=off --bind=/dev/fuse
 	ready
 	;;
 stop)
