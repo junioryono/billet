@@ -57,7 +57,8 @@ case "$1" in
 is-active) state=$(cat "$FAKE/state" 2>/dev/null || echo inactive); echo "$state"
 	[ "$state" = active ] ;;
 stop) grep -qx stop "$FAKE/stuck" 2>/dev/null || { echo inactive >"$FAKE/state"; rm -f "$FAKE/leader"; } ;;
-show) for last; do :; done; echo "/system.slice/$last" ;;
+show) for last; do :; done
+	cat "$FAKE/$last.cgroup" 2>/dev/null || echo "/system.slice/$last" ;;
 esac
 `,
 	"iptables": `#!/bin/sh
@@ -102,6 +103,12 @@ func runDriverWith(t *testing.T, fake string, env []string, args ...string) (str
 		"BILLET_RI_ROOTFS=/mnt/rootfs", "BILLET_RI_MACHINE=probe", "BILLET_RI_STOP_WAIT=1",
 		"BILLET_RI_CGROUP_ROOT="+filepath.Join(fake, "cgroup"))
 	cmd.Env = append(cmd.Env, env...)
+	if _, err := os.Stat(filepath.Join(fake, "no-cgroup-root")); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Join(fake, "cgroup"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFake(t, filepath.Join(fake, "cgroup"), "cgroup.controllers", "cpu memory pids\n")
+	}
 	output, err := cmd.CombinedOutput()
 
 	return string(output), err
@@ -314,8 +321,15 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 	scope := t.TempDir()
 	writeFake(t, scope, "state", "failed\n")
 	writeFake(t, scope, "stuck", "poweroff\nstop\nterminate\n")
-	for dir, events := range map[string]string{"machine-probe.scope": "populated 1\n", "probe-nspawn.service": "populated 0\n"} {
-		cgroup := filepath.Join(scope, "cgroup", "system.slice", dir)
+	// THE SCOPE'S CGROUP IS WHERE systemd SAYS, under machine.slice; the paths a
+	// guess would build from the unit's name hold nothing.
+	writeFake(t, scope, "machine-probe.scope.cgroup", "/machine.slice/machine-probe.scope\n")
+	for dir, events := range map[string]string{
+		"machine.slice/machine-probe.scope": "populated 1\n",
+		"system.slice/machine-probe.scope":  "populated 0\n",
+		"system.slice/probe-nspawn.service": "populated 0\n",
+	} {
+		cgroup := filepath.Join(scope, "cgroup", filepath.FromSlash(dir))
 		if err := os.MkdirAll(cgroup, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -330,6 +344,16 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 	output, err = runDriverWith(t, t.TempDir(), []string{"BILLET_RI_UNIT="}, "stop")
 	if err == nil || !strings.Contains(output, "no unit named") {
 		t.Errorf("an empty unit answered %v:\n%s", err, output)
+	}
+
+	// A CGROUP HIERARCHY THAT CANNOT BE SEEN proves nothing about the unit's
+	// cgroup being gone.
+	hidden := t.TempDir()
+	writeFake(t, hidden, "state", "failed\n")
+	writeFake(t, hidden, "stuck", "poweroff\nstop\nterminate\n")
+	writeFake(t, hidden, "no-cgroup-root", "")
+	if output, err := runDriver(t, hidden, "stop"); err == nil || !strings.Contains(output, "cannot tell") {
+		t.Errorf("a stop with no cgroup hierarchy to read answered %v:\n%s", err, output)
 	}
 
 	unknown := t.TempDir()

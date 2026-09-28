@@ -1,6 +1,8 @@
 package scripts_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -504,7 +506,8 @@ func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
 	if strings.Contains(got, "elsewhere") {
 		t.Errorf("recovery stopped a machine that does not hold this workspace:\n%s", got)
 	}
-	if !strings.Contains(got, "stop bri-") {
+	digest := sha256.Sum256([]byte("/var/tmp/billet-guest"))
+	if own := "bri-" + hex.EncodeToString(digest[:])[:8]; !strings.Contains(got, "stop "+own+" unit= ") {
 		t.Errorf("this workspace's own machine was not asked:\n%s", got)
 	}
 }
@@ -521,6 +524,9 @@ func TestRecoveryRefusesWhatItCannotSee(t *testing.T) {
 		"the listing fails":                           {"broken": "list\n"},
 		"a root cannot be read":                       {"list": "m container - - - -\n", "broken": "show\n"},
 		"a machine vanished before its root was read": {"list": "m container - - - -\n"},
+		"a machine's root reads empty":                {"list": "m container - - - -\n", "m.root": "\n"},
+		"the workspace's hash fails":                  {"list": "", "sha256sum": "#!/bin/sh\necho 'abcdef12  -'\nexit 3\n"},
+		"the workspace's hash is not a digest":        {"list": "", "sha256sum": "#!/bin/sh\necho 'not-a-digest  -'\n"},
 		"the unit holding it reads empty": {"list": "m container - - - -\n", "m.root": "/var/tmp/billet-guest/rootfs\n",
 			"m.unit": "\n"},
 		"a stop cannot be proved": {"list": "m container - - - -\n", "m.root": "/var/tmp/billet-guest/rootfs\n",
@@ -528,6 +534,12 @@ func TestRecoveryRefusesWhatItCannotSee(t *testing.T) {
 	} {
 		fake := t.TempDir()
 		for file, body := range files {
+			if strings.HasPrefix(body, "#!") {
+				if err := forkSafeWriteFile(filepath.Join(fake, file), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
 			writeFake(t, fake, file, body)
 		}
 		if output, err := runRecovery(t, fake); err == nil {

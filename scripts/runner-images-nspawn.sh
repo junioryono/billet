@@ -84,6 +84,9 @@ running() {
 	*) return 2 ;;
 	esac
 	cgroup=$(systemctl show --property=ControlGroup --value "$unit" 2>/dev/null) || return 2
+	# A HIERARCHY THAT CANNOT BE READ says nothing about the cgroup below it, so
+	# its absence is evidence only under a cgroup v2 root this can see.
+	[ -r "$cgroup_root/cgroup.controllers" ] || return 2
 	# cgroup.events SAYS WHETHER ANY PROCESS IS LEFT ANYWHERE BELOW IT (cgroup v2's
 	# "populated"), read once; a cgroup that is gone holds nothing, and one that
 	# cannot be read tells nothing.

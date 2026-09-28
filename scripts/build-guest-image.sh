@@ -529,7 +529,16 @@ stop_runner_images() {
 # workspaces on one host never share (or stop) one. Twelve characters, so the
 # machine's link is exactly ve-<name> (see runner-images-nspawn.sh).
 runner_images_machine() {
-	printf 'bri-%s\n' "$(printf '%s' "$WORK" | sha256sum | cut -c1-8)"
+	local digest
+	# CHECKED ON ITS OWN, not inside printf's argument, whose status would hide a
+	# failed hash and name the machine "bri-".
+	digest=$(printf '%s' "$WORK" | sha256sum) || return 1
+	digest=${digest:0:8}
+	if ! [[ $digest =~ ^[0-9a-f]{8}$ ]]; then
+		echo "could not derive this workspace's machine name from its digest" >&2
+		return 1
+	fi
+	printf 'bri-%s\n' "$digest"
 }
 
 # recover_runner_images stops every machine that may still hold this workspace's
@@ -540,7 +549,7 @@ runner_images_machine() {
 # caller clears the workspace next. There is no record to trust: a machine is
 # found by what it holds, not by what a file says its name was.
 recover_runner_images() {
-	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed name root unit
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed name root unit own
 	# NO machinectl, NO MACHINE, but only while systemd-nspawn is absent too: they
 	# ship in one package, and nspawn without machinectl cannot be asked.
 	if ! command -v machinectl >/dev/null 2>&1; then
@@ -559,9 +568,11 @@ recover_runner_images() {
 	while read -r -u 3 name _; do
 		[ -n "$name" ] || continue
 		# A MACHINE GONE BEFORE ITS ROOT IS READ may have left its processes in a
-		# unit this never learned, so it is not known to be stopped.
-		if ! root=$(machinectl show --property=RootDirectory --value "$name" 2>&1); then
-			echo "could not read machine $name's root: $root" >&2
+		# unit this never learned, so it is not known to be stopped; and an empty
+		# root is no evidence that it is elsewhere. machinectl's own diagnostic
+		# goes to stderr, never into the value compared.
+		if ! root=$(machinectl show --property=RootDirectory --value "$name") || [ -z "$root" ]; then
+			echo "could not read machine $name's root" >&2
 			return 1
 		fi
 		[ "$root" = "$rootfs" ] || continue
@@ -572,7 +583,8 @@ recover_runner_images() {
 		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
 			return 1
 	done 3<<<"$listed"
-	BILLET_RI_MACHINE=$(runner_images_machine) BILLET_RI_ROOTFS="$rootfs" "$driver" stop
+	own=$(runner_images_machine) || return 1
+	BILLET_RI_MACHINE="$own" BILLET_RI_ROOTFS="$rootfs" "$driver" stop
 }
 
 # install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
