@@ -1213,11 +1213,13 @@ check_toolcache_coverage() {
 		bin="${rest%% *}"
 		flag="${rest#* }"
 
-		if chroot "$MNT" "$bin" "$flag" >/dev/null 2>&1; then
+		# ITS OWN ERROR IS KEPT, the first lines of it: "does not run" is a verdict,
+		# and the next person needs the reason.
+		if said=$(chroot "$MNT" "$bin" "$flag" 2>&1 >/dev/null); then
 			pass "$name runs from $bin"
 		else
 			fail "$name does not run from $bin, so a workflow using it fails on an image
-        that advertises having it"
+        that advertises having it: $(head -n 5 <<<"$said")"
 		fi
 	done
 
@@ -1226,14 +1228,22 @@ check_toolcache_coverage() {
 	# whole point of having one.
 	declared_dotnet_tools=$(toolset_query '.dotnet.tools[]?.test // empty' "the dotnet tools")
 
+	# AS A JOB RUNS THEM: GitHub installs dotnet tools under /etc/skel, so they are
+	# the runner's, found through $HOME/.dotnet/tools on the PATH the image hands
+	# every job. root's login shell in a chroot has neither.
+	job_path=$(grep -m 1 '^PATH=' "$MNT/etc/billet-image-env" 2>/dev/null || true)
+
 	while IFS= read -r probe; do
 		[ -n "$probe" ] || continue
 
-		if chroot "$MNT" sh -lc "$probe" >/dev/null 2>&1; then
+		if [ -z "$job_path" ]; then
+			fail "the image has no PATH in /etc/billet-image-env, so the dotnet tool probe
+        \"$probe\" cannot be run as a job would run it"
+		elif said=$(chroot "$MNT" env -i HOME=/home/runner "$job_path" sh -c "$probe" 2>&1 >/dev/null); then
 			pass "the dotnet tool probe \"$probe\" runs"
 		else
 			fail "the declaration names the dotnet tool probe \"$probe\" and it does not run
-        on this image"
+        on this image: $(head -n 5 <<<"$said")"
 		fi
 	done <<<"$declared_dotnet_tools"
 
