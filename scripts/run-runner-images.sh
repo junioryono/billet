@@ -50,7 +50,10 @@ fail() {
 [ -f "$differences" ] || fail "no difference list at $differences"
 command -v jq >/dev/null || fail "jq is required to read the plan"
 
-target() { "$BILLET_RI_TARGET" "$@"; }
+# EVERY TARGET CALL READS NOTHING: a step that reads stdin would otherwise read the
+# plan this script is iterating, and a plan read to its end is a build that
+# reports success over steps it never ran.
+target() { "$BILLET_RI_TARGET" "$@" </dev/null; }
 
 # THE PREPARES billet runs before a step that assumes something about the host
 # GitHub builds on. Each runs in the target as root. Named in differences.tsv,
@@ -73,7 +76,19 @@ prepare_build_user() {
 		chmod 0440 /etc/sudoers.d/runner'
 }
 
-prepares=" waagent-conf docker-daemon build-user "
+# GITHUB'S SYSTEM TESTS ASSERT AZURE'S DISKS: one requires an sd* block device
+# with the read-ahead its udev rule sets, and a Firecracker guest's disks are
+# virtio (vd*). That one assertion is marked skipped, in the tests the final step
+# runs, and every other test in the suite still runs; the edit is proved, so a
+# changed test file stops the build rather than failing it an hour later.
+prepare_system_tests_virtio() {
+	target exec sh -c '
+		test_file=/imagegeneration/tests/System.Tests.ps1
+		sed -i "s/^\( *It \"All sd\* devices have read_ahead_kb set to 128\"\) {/\1 -Skip {/" "$test_file"
+		grep -q "It \"All sd\* devices have read_ahead_kb set to 128\" -Skip {" "$test_file"'
+}
+
+prepares=" waagent-conf docker-daemon build-user system-tests-virtio "
 
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
@@ -87,6 +102,30 @@ prepare_steps=$staging/prepares
 : >"$skips"
 : >"$prepare_steps"
 ids=$(jq -r '.[].id' "$plan")
+
+# EXACTLY THREE FIELDS, EACH SAID ONCE. A read that collapses tabs would take a
+# missing field from the next one; a step named twice, or skipped and prepared,
+# would have one of its entries silently ignored.
+problems=$(awk -F'\t' '
+	/\r/ { printf "line %d carries a carriage return\n", NR; next }
+	/^#/ || /^$/ { next }
+	NF != 3 || $1 == "" || $2 == "" || $3 == "" {
+		printf "line %d: want three tab-separated fields, an action, a step and a reason\n", NR
+		next
+	}
+	seen[$1 FS $2]++ { printf "line %d: %s for %s is listed twice\n", NR, $1, $2 }
+	$1 == "skip" { skipped[$2] = 1 }
+	{ entries[$2]++ }
+	END {
+		for (id in skipped) {
+			if (entries[id] > 1) {
+				printf "%s is skipped and given another difference, so one of them would be ignored\n", id
+			}
+		}
+	}
+' "$differences")
+[ -z "$problems" ] || fail "differences.tsv: $problems"
+
 while IFS=$'\t' read -r action id reason || [ -n "$action" ]; do
 	case "$action" in
 	'' | '#'*) continue ;;
@@ -141,9 +180,43 @@ pause() {
 mkdir -p "$BILLET_RI_OUT"
 target exec mkdir -p /var/tmp/billet-ri
 
+# EVERY STEP STARTS IN THE ENVIRONMENT THE STEPS BEFORE IT BUILT. Packer runs a
+# step over ssh and sudo, and PAM's pam_env loads /etc/environment into both: a
+# step reads what configure-environment.sh wrote there (AGENT_TOOLSDIRECTORY,
+# say). A service started for a step loads nothing, so this wrapper does what
+# pam_env does -- NAME=VALUE lines, one pair of surrounding quotes removed,
+# nothing expanded -- and then the step's own variables apply on top.
+with_environment=/var/tmp/billet-ri/with-environment
+cat >"$staging/with-environment" <<'WRAPPER'
+#!/bin/sh
+file=${BILLET_RI_ENVIRONMENT:-/etc/environment}
+if [ -r "$file" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+		[A-Za-z_]*=*) ;;
+		*) continue ;;
+		esac
+		key=${line%%=*}
+		case "$key" in
+		*[!A-Za-z0-9_]*) continue ;;
+		esac
+		value=${line#*=}
+		case "$value" in
+		\"*\") value=${value#\"} value=${value%\"} ;;
+		esac
+		export "$key=$value"
+	done <"$file"
+fi
+exec "$@"
+WRAPPER
+chmod 0755 "$staging/with-environment"
+target copy-in "$staging/with-environment" "$with_environment" || fail "could not stage the environment wrapper"
+
 total=$(jq 'length' "$plan")
 n=0
-while IFS= read -r step; do
+# THE PLAN IS READ ON ITS OWN DESCRIPTOR, never on stdin, which the steps must not
+# be able to reach.
+while IFS= read -r step <&3; do
 	n=$((n + 1))
 	id=$(jq -r .id <<<"$step")
 	kind=$(jq -r .kind <<<"$step")
@@ -207,9 +280,9 @@ while IFS= read -r step; do
 
 		execute=$(jq -r .execute <<<"$step")
 		case "$execute" in
-		root) command=("${env[@]}" "$remote") ;;
-		root-pwsh) command=("${env[@]}" pwsh -f "$remote") ;;
-		user) command=(runuser -u runner -- "${env[@]}" "$remote") ;;
+		root) command=("$with_environment" "${env[@]}" "$remote") ;;
+		root-pwsh) command=("$with_environment" "${env[@]}" pwsh -f "$remote") ;;
+		user) command=(runuser -u runner -- "$with_environment" "${env[@]}" "$remote") ;;
 		*) fail "step $n $id: an execute kind the runner does not know: $execute" ;;
 		esac
 		status=0
@@ -220,6 +293,8 @@ while IFS= read -r step; do
 		;;
 	*) fail "step $n $id: a kind the runner does not know: $kind" ;;
 	esac
-done < <(jq -c '.[]' "$plan")
+done 3< <(jq -c '.[]' "$plan")
 
+# EVERY STEP WAS REACHED, which is what "the template ran" means.
+[ "$n" -eq "$total" ] || fail "reached $n of the plan's $total steps"
 echo "ran $total steps of GitHub's template"

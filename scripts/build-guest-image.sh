@@ -435,6 +435,15 @@ unmount_guest_proc() {
 unmount_rootfs() {
 	[ -n "$MOUNTED_ROOTFS" ] || return 0
 
+	# NOT WHILE A MACHINE MAY STILL HOLD IT. A booted image that could not be proved
+	# stopped keeps its mount: unmounting would detach the filesystem under it and
+	# leave it writing to an image the next run deletes through. The next run
+	# stops the machine before it clears the workspace.
+	if [ -n "$RUNNER_IMAGES_STUCK" ]; then
+		echo "leaving $MOUNTED_ROOTFS mounted: the machine booted on it could not be proved stopped" >&2
+		return 0
+	fi
+
 	# SYNCED FIRST. The image file is what gets packed and published, and an
 	# unmount that reports success after a lazy detach can leave data unwritten.
 	sync
@@ -498,15 +507,28 @@ clear_stale_mount() {
 
 # RUNNER_IMAGES_BOOTED is the root filesystem booted under systemd-nspawn, or
 # empty. POWERED OFF BEFORE ANY UNMOUNT, because a booted machine holds the
-# filesystem and every mount inside it.
+# filesystem and every mount inside it. RUNNER_IMAGES_STUCK is set when a stop
+# could not be proved, and keeps the filesystem mounted from then on.
 RUNNER_IMAGES_BOOTED=""
+RUNNER_IMAGES_STUCK=""
 
-# stop_runner_images powers off the booted image, if there is one.
+# stop_runner_images powers off the booted image, if there is one, and says
+# whether it could prove it did.
 stop_runner_images() {
 	[ -n "$RUNNER_IMAGES_BOOTED" ] || return 0
 
-	BILLET_RI_ROOTFS="$RUNNER_IMAGES_BOOTED" "$SCRIPT_DIR/runner-images-nspawn.sh" stop || true
+	if ! BILLET_RI_ROOTFS="$RUNNER_IMAGES_BOOTED" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+		RUNNER_IMAGES_STUCK=1
+		echo "the machine booted on $RUNNER_IMAGES_BOOTED could not be proved stopped" >&2
+		return 1
+	fi
 	RUNNER_IMAGES_BOOTED=""
+}
+
+# runner_images_machine names this workspace's machine, so builds in two
+# workspaces on one host never share (or stop) one.
+runner_images_machine() {
+	printf 'billet-ri-%s\n' "$(printf '%s' "$WORK" | sha256sum | cut -c1-12)"
 }
 
 # install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
@@ -572,6 +594,11 @@ EOF
 run_runner_images_build() {
 	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh"
 
+	# THE IMAGE'S OWN RESOLVER COMES BACK AFTER THE BOOT. nspawn replaces
+	# /etc/resolv.conf with the builder's uplink servers for the build, and an image
+	# shipping that file would resolve through the builder's DNS wherever it runs.
+	cp -a "$rootfs/etc/resolv.conf" "$WORK/resolv.conf.image"
+
 	RUNNER_IMAGES_BOOTED="$rootfs"
 	BILLET_RI_ROOTFS="$rootfs" "$driver" start
 
@@ -581,34 +608,44 @@ run_runner_images_build() {
 		BILLET_RI_OUT="$WORK/runner-images" \
 		"$SCRIPT_DIR/run-runner-images.sh"
 
-	stop_runner_images
-
-	# ONE MACHINE ID PER GUEST: the boot above wrote one, and a clone that carried
-	# it would share it with every other guest of this generation.
-	: >"$rootfs/etc/machine-id"
-
 	# WHAT THE GUEST MECHANISM NEEDS THAT GITHUB'S IMAGE DOES NOT CARRY: dnsmasq-base
 	# for the cache's DNS remap, networkd, resolved and netplan for the network the
 	# agent reaches the metadata service over, libicu74 for the .NET runner,
 	# e2fsprogs because the host grows this filesystem, and the two a hosted runner
 	# has that CI jobs here installed every run. apt skips any GitHub already put in.
-	chroot "$rootfs" /bin/bash -eux -s -- \
-		dnsmasq-base systemd-resolved netplan.io libicu74 e2fsprogs apparmor python3-apt <<'APT'
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y --no-install-recommends "$@"
-apt-get clean
-rm -rf /var/lib/apt/lists/*
-APT
+	# IN THE BOOTED MACHINE, where the network is: a chroot has no resolver once
+	# the image's own is back.
+	BILLET_RI_ROOTFS="$rootfs" "$driver" exec /bin/bash -euxc '
+		apt-get update -qq
+		apt-get install -y --no-install-recommends "$@"
+		apt-get clean
+		rm -rf /var/lib/apt/lists/*' bash \
+		dnsmasq-base systemd-resolved netplan.io libicu74 e2fsprogs apparmor python3-apt
+
+	stop_runner_images
+
+	rm -f "$rootfs/etc/resolv.conf"
+	cp -a "$WORK/resolv.conf.image" "$rootfs/etc/resolv.conf"
+
+	# ONE MACHINE ID PER GUEST: the boot above wrote one, and a clone that carried
+	# it would share it with every other guest of this generation.
+	: >"$rootfs/etc/machine-id"
 }
 
 # write_image_env writes /etc/billet-image-env, the environment the agent hands
 # the job, from the NAME=VALUE lines GitHub's scripts wrote to /etc/environment:
 # ImageOS, ImageVersion, the JAVA_HOME and GOROOT lines, ANDROID_HOME, the tool
 # cache and GitHub's PATH, as a hosted runner exports them.
+#
+# THE AGENT PASSES EACH LINE AS IT IS, through env -i, so each line is made a
+# plain NAME=VALUE here, as pam_env would read it: one pair of surrounding quotes
+# removed, and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for the
+# login shell to expand, is the runner's home, which nothing downstream expands.
 write_image_env() {
 	local rootfs="$1"
-	grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$rootfs/etc/environment" \
+	grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$rootfs/etc/environment" |
+		sed -E -e 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\1=\2/' \
+			-e 's#\$HOME#/home/runner#g' -e 's#\$\{HOME\}#/home/runner#g' \
 		>"$rootfs/etc/billet-image-env.tmp" || true
 	if ! grep -q '^ImageOS=' "$rootfs/etc/billet-image-env.tmp"; then
 		echo "GitHub's build wrote no ImageOS to /etc/environment; refusing an image whose jobs" >&2
@@ -743,6 +780,18 @@ main() {
 		echo "Two builds cannot share a workspace: this one would unmount the filesystem" >&2
 		echo "the other is writing through and delete its tree. Wait for it, or run with" >&2
 		echo "WORK pointing somewhere else." >&2
+		exit 1
+	fi
+
+	# A MACHINE AN EARLIER RUN LEFT BOOTED ON THIS WORKSPACE GOES FIRST: its
+	# filesystem is about to be unmounted and deleted, which must not happen under
+	# a machine still writing to it. Its name is this workspace's.
+	BILLET_RI_MACHINE=$(runner_images_machine)
+	export BILLET_RI_MACHINE
+	if [ "$BUILD_FROM" = runner-images ] &&
+		! BILLET_RI_ROOTFS="$rootfs" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+		echo "an earlier build's machine on $rootfs could not be stopped; refusing to clear" >&2
+		echo "the workspace under it" >&2
 		exit 1
 	fi
 

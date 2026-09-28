@@ -12,10 +12,11 @@ import (
 
 // fakeTargetDriver stands in for a booted target. It logs every call, one line
 // per call with the argv joined by `|`, and does the file work inside $ROOT.
-// It EXECUTES only what the runner runs as a step (argv starting with env, or
-// runuser and then env), with target paths moved under $ROOT; anything else,
-// the prepares included, is logged and never run on the machine running the
-// test.
+// It EXECUTES only what the runner runs as a step (argv starting with the
+// environment wrapper, or runuser and then it), with target paths moved under
+// $ROOT and the target's /etc/environment at $ROOT/etc/environment; anything
+// else, the prepares included, is logged and never run on the machine running
+// the test.
 const fakeTargetDriver = `#!/bin/sh
 set -eu
 log=$BILLET_TEST_ROOT/driver.log
@@ -24,9 +25,9 @@ case "$1" in
 exec)
 	shift
 	if [ "$1" = runuser ]; then shift 4; fi
-	[ "$1" = env ] || exit 0
+	[ "$1" = /var/tmp/billet-ri/with-environment ] || exit 0
 	set -- $(printf '%s\n' "$@" | sed "s#^/var/tmp/billet-ri/#$BILLET_TEST_ROOT/var/tmp/billet-ri/#")
-	"$@"
+	BILLET_RI_ENVIRONMENT=$BILLET_TEST_ROOT/etc/environment "$@"
 	;;
 copy-in)
 	mkdir -p "$(dirname "$BILLET_TEST_ROOT$3")"
@@ -154,8 +155,8 @@ func TestTheRunnerRunsThePlanInOrder(t *testing.T) {
 		"copy-in|" + filepath.Join(fx.dir, "upstream", "images", "ubuntu", "scripts", "build", "asset.txt") +
 			"|/imagegeneration/asset.txt",
 		"reboot",
-		"exec|runuser|-u|runner|--|env|HELPER_SCRIPTS=/imagegeneration/helpers|IMAGE_VERSION=20260927.1|" +
-			"/var/tmp/billet-ri/4",
+		"exec|runuser|-u|runner|--|/var/tmp/billet-ri/with-environment|env|" +
+			"HELPER_SCRIPTS=/imagegeneration/helpers|IMAGE_VERSION=20260927.1|/var/tmp/billet-ri/4",
 		"copy-out|/report.md|" + fx.out,
 	} {
 		if !strings.Contains(joined, expected) {
@@ -231,7 +232,13 @@ func TestADifferenceThatNamesNothingStopsTheBuild(t *testing.T) {
 		"a step gone":        {"skip\tgone.sh\twas removed upstream\n", "which the plan does not have"},
 		"an unknown prepare": {"prepare:nothing\tfirst.sh\tno such prepare\n", "does not implement"},
 		"an unknown action":  {"rewrite\tfirst.sh\tno such action\n", "an action nobody implements"},
-		"no reason":          {"skip\tfirst.sh\n", "without a step or a reason"},
+		"no reason":          {"skip\tfirst.sh\n", "want three tab-separated fields"},
+		"a fourth field":     {"skip\tfirst.sh\ta reason\tmore\n", "want three tab-separated fields"},
+		"an empty field":     {"skip\t\tfirst.sh\n", "want three tab-separated fields"},
+		"a carriage return":  {"skip\tfirst.sh\ta reason\r\n", "carriage return"},
+		"said twice":         {"skip\tfirst.sh\tone\nskip\tfirst.sh\ttwo\n", "listed twice"},
+		"skipped and prepared": {"skip\tthird.sh\tnot run\nprepare:waagent-conf\tthird.sh\tprepared\n",
+			"so one of them would be ignored"},
 	} {
 		fx := newRunnerFixture(t)
 		fx.differences = tc.differences
@@ -285,5 +292,98 @@ func TestTheRealDifferenceListIsAccepted(t *testing.T) {
 		if deprovision.MatchString(strings.Join(step.Inline, "\n")) && !skipped[step.ID] {
 			t.Errorf("step %s deprovisions the VM for Azure and is not skipped", step.ID)
 		}
+	}
+}
+
+// A STEP STARTS IN THE ENVIRONMENT THE STEPS BEFORE IT WROTE, as a Packer step
+// does through pam_env: a value written to /etc/environment by one step is set for
+// the next, with its quotes removed and nothing expanded, and the step's own
+// variables still win.
+func TestAStepSeesTheEnvironmentEarlierStepsWrote(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	build := filepath.Join(fx.dir, "upstream", "images", "ubuntu", "scripts", "build")
+	writes := "#!/bin/sh\nmkdir -p \"$BILLET_TEST_ROOT/etc\"\n" +
+		"printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nXDG_CONFIG_HOME=\"$HOME/.config\"\\n" +
+		"HELPER_SCRIPTS=/from/environment\\n' >\"$BILLET_TEST_ROOT/etc/environment\"\n"
+	reads := "#!/bin/sh\necho \"$AGENT_TOOLSDIRECTORY $XDG_CONFIG_HOME $HELPER_SCRIPTS\" >>\"$BILLET_TEST_LOG\"\n"
+	for name, body := range map[string]string{"writes.sh": writes, "reads.sh": reads} {
+		if err := forkSafeWriteFile(filepath.Join(build, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fx.plan = []planStep{
+		{ID: "writes.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/writes.sh"},
+		{ID: "reads.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/reads.sh",
+			Env: map[string]string{"HELPER_SCRIPTS": "/from/the/step"}},
+	}
+	output, _, err := runRunner(t, fx)
+	if err != nil {
+		t.Fatalf("run-runner-images.sh: %v\n%s", err, output)
+	}
+	if got, want := readSteps(t, fx), "/opt/hostedtoolcache $HOME/.config /from/the/step\n"; got != want {
+		t.Fatalf("the second step saw %q, want %q", got, want)
+	}
+}
+
+// A STEP THAT READS STDIN CANNOT EAT THE PLAN: the steps after it still run, a
+// failing one still fails the build, and the count of steps reached is checked.
+func TestAStepReadingStdinCannotSkipTheRest(t *testing.T) {
+	t.Parallel()
+
+	fx := newRunnerFixture(t)
+	build := filepath.Join(fx.dir, "upstream", "images", "ubuntu", "scripts", "build")
+	if err := forkSafeWriteFile(filepath.Join(build, "drains.sh"), []byte("#!/bin/sh\ncat >/dev/null\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fx.plan = []planStep{
+		{ID: "drains.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/drains.sh"},
+		{ID: "fails.sh", Kind: "shell", Execute: "root", Script: "images/ubuntu/scripts/build/fails.sh"},
+	}
+	output, _, err := runRunner(t, fx)
+	if err == nil || !strings.Contains(output, "step 2 fails.sh failed with status 3") {
+		t.Fatalf("a step after one reading stdin did not run and fail: %v\n%s", err, output)
+	}
+}
+
+// THE JOB'S ENVIRONMENT IS GITHUB'S, MADE PLAIN: the agent passes each line of
+// /etc/billet-image-env through env -i as it is, so write_image_env removes the
+// quotes pam_env would and gives $HOME the runner's home, which GitHub writes
+// into PATH for a login shell to expand and nothing here would.
+func TestTheImageEnvironmentIsGitHubsMadePlain(t *testing.T) {
+	t.Parallel()
+
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	environment := "PATH=\"$HOME/.local/bin:/opt/pipx_bin:$HOME/.cargo/bin:/usr/bin\"\n" +
+		"ImageOS=ubuntu24\nXDG_CONFIG_HOME=$HOME/.config\nJAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n" +
+		"# a comment\nnot an assignment\n"
+	if err := os.WriteFile(filepath.Join(rootfs, "etc", "environment"), []byte(environment), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := scriptFunction(t, "build-guest-image.sh", "write_image_env") + "\nset -euo pipefail\nwrite_image_env \"$1\"\n"
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", script, "bash", rootfs)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("write_image_env: %v\n%s", err, output)
+	}
+	got, err := os.ReadFile(filepath.Join(rootfs, "etc", "billet-image-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "PATH=/home/runner/.local/bin:/opt/pipx_bin:/home/runner/.cargo/bin:/usr/bin\n" +
+		"ImageOS=ubuntu24\nXDG_CONFIG_HOME=/home/runner/.config\nJAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n"
+	if string(got) != want {
+		t.Fatalf("the image environment is\n%s\nwant\n%s", got, want)
+	}
+
+	if err := os.WriteFile(filepath.Join(rootfs, "etc", "environment"), []byte("PATH=/usr/bin\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.CommandContext(t.Context(), "bash", "-c", script, "bash", rootfs)
+	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "no ImageOS") {
+		t.Fatalf("an environment without ImageOS answered %v:\n%s", err, output)
 	}
 }

@@ -806,12 +806,13 @@
     "kind": "shell",
     "execute": "root",
     "script": "images/ubuntu/scripts/build/cleanup.sh",
-    "pause_before": "5m0s"
+    "pause_before": "5m0s",
+    "start_retry_timeout": "10m"
   },
   {
     "id": "inline:508b7308e973",
     "kind": "shell",
-    "execute": "root",
+    "execute": "user",
     "env": {
       "IMAGE_VERSION": "@image_version@",
       "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"

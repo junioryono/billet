@@ -38,6 +38,9 @@ type planStep struct {
 	Download    bool              `json:"download,omitempty"`
 	Reboots     bool              `json:"reboots,omitempty"`
 	PauseBefore string            `json:"pause_before,omitempty"`
+	// StartRetryTimeout is how long Packer keeps reconnecting before the step,
+	// which the runner's reboot wait already covers; kept so the plan says so.
+	StartRetryTimeout string `json:"start_retry_timeout,omitempty"`
 }
 
 // templateVars are the template's variables as a billet build sets them: the
@@ -50,6 +53,15 @@ var templateVars = map[string]string{
 	"imagedata_file":          "/imagegeneration/imagedata.json",
 	"image_os":                "ubuntu24",
 	"image_version":           "@image_version@",
+}
+
+// provisionerAttributes is every attribute the reader understands, per
+// provisioner kind. Anything else is refused: an attribute the plan does not
+// carry is a semantic the runner would silently not have.
+var provisionerAttributes = map[string]map[string]bool{
+	"file": {"destination": true, "source": true, "sources": true, "direction": true},
+	"shell": {"execute_command": true, "environment_vars": true, "script": true, "scripts": true,
+		"inline": true, "expect_disconnect": true, "pause_before": true, "start_retry_timeout": true},
 }
 
 // executeKinds names the three ways the template runs a shell provisioner.
@@ -69,6 +81,15 @@ func readTemplatePlan(t *testing.T, template string) []planStep {
 	var plan []planStep
 	for _, block := range blocks {
 		attrs := blockAttributes(t, block.body)
+		allowed, known := provisionerAttributes[block.kind]
+		if !known {
+			t.Fatalf("the template uses a %q provisioner, which the runner does not know", block.kind)
+		}
+		for name := range attrs {
+			if !allowed[name] {
+				t.Fatalf("a %s provisioner sets %s, which the runner does not implement", block.kind, name)
+			}
+		}
 		switch block.kind {
 		case "file":
 			step := planStep{Kind: "file", Destination: expand(t, attrs.one("destination"))}
@@ -82,7 +103,9 @@ func readTemplatePlan(t *testing.T, template string) []planStep {
 			}
 			plan = append(plan, step)
 		case "shell":
-			execute := "root"
+			// PACKER'S DEFAULT RUNS AS THE CONNECTING USER, unprivileged: only an
+			// execute_command with sudo elevates.
+			execute := "user"
 			if raw := attrs.optionalOne("execute_command"); raw != "" {
 				kind, ok := executeKinds[raw]
 				if !ok {
@@ -103,8 +126,9 @@ func readTemplatePlan(t *testing.T, template string) []planStep {
 				env = nil
 			}
 			base := planStep{Kind: "shell", Execute: execute, Env: env,
-				Reboots:     attrs.optionalOne("expect_disconnect") == "true",
-				PauseBefore: attrs.optionalOne("pause_before")}
+				Reboots:           attrs.optionalOne("expect_disconnect") == "true",
+				PauseBefore:       attrs.optionalOne("pause_before"),
+				StartRetryTimeout: attrs.optionalOne("start_retry_timeout")}
 			scripts := append(attrs.list("scripts"), attrs.optional("script")...)
 			for _, script := range scripts {
 				step := base
@@ -433,5 +457,78 @@ func TestTheVendoredRunnerImagesAreThePinnedCommits(t *testing.T) {
 	sort.Strings(extra)
 	if len(extra) > 0 {
 		t.Fatalf("vendored files the pinned commit does not list: %v", extra)
+	}
+}
+
+// gitTreeID is the id git gives the directory at dir: a tree object of its
+// entries, sorted as git sorts them, over each file's blob id and mode.
+func gitTreeID(t *testing.T, dir string) string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type entry struct {
+		mode, name, sortKey string
+		id                  []byte
+	}
+	var list []entry
+	for _, e := range entries {
+		full := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			id, err := hex.DecodeString(gitTreeID(t, full))
+			if err != nil {
+				t.Fatal(err)
+			}
+			list = append(list, entry{"40000", e.Name(), e.Name() + "/", id})
+
+			continue
+		}
+		body, err := os.ReadFile(full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mode := "100644"
+		if info.Mode()&0o111 != 0 {
+			mode = "100755"
+		}
+		sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(body))), body...))
+		list = append(list, entry{mode, e.Name(), e.Name(), sum[:]})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].sortKey < list[j].sortKey })
+	var content bytes.Buffer
+	for _, e := range list {
+		content.WriteString(e.mode + " " + e.name + "\x00")
+		content.Write(e.id)
+	}
+	sum := sha1.Sum(append([]byte(fmt.Sprintf("tree %d\x00", content.Len())), content.Bytes()...))
+
+	return hex.EncodeToString(sum[:])
+}
+
+// EVERY VENDORED DIRECTORY IS THE PINNED COMMIT'S WHOLE DIRECTORY: its git tree
+// id, computed here from what is on disk, is the one GitHub's tree at COMMIT
+// gives it, which anyone can check against the commit. A file removed from a
+// directory, with or without its BLOBS line, changes the id.
+func TestEveryVendoredDirectoryIsThePinnedCommitsWhole(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join(runnerImagesDir, "TREES"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		want, dir, ok := strings.Cut(line, " ")
+		if !ok {
+			t.Fatalf("a TREES line that is not `id path`: %q", line)
+		}
+		if got := gitTreeID(t, filepath.Join(runnerImagesDir, "upstream", dir)); got != want {
+			t.Errorf("%s is tree %s, not the pinned commit's %s", dir, got, want)
+		}
 	}
 }
