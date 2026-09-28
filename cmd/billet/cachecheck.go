@@ -56,7 +56,8 @@ func judgeNodeCache(cfg *config.Config) ([]string, error) {
 		// fetch to github.com, which works and saves nothing. Reported, not
 		// refused, and not claimed of any tier: whether a git-cache tier lands on
 		// this node is placement's question.
-		for _, tier := range cfg.Tiers {
+		for i := range cfg.Tiers {
+			tier := &cfg.Tiers[i]
 			if !tier.EffectiveCache().Git.Enabled {
 				continue
 			}

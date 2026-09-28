@@ -27,6 +27,7 @@ import (
 // deviceVolumes is a mount manager that gives every device a directory of its
 // own and mounts it as a link, so two volumes really are two filesystems.
 type deviceVolumes struct {
+	t     *testing.T
 	mu    sync.Mutex
 	root  string
 	dirs  map[string]string
@@ -38,7 +39,9 @@ type deviceVolumes struct {
 }
 
 func newDeviceVolumes(t *testing.T) *deviceVolumes {
-	return &deviceVolumes{root: t.TempDir(), dirs: map[string]string{}, fresh: map[string]bool{}}
+	t.Helper()
+
+	return &deviceVolumes{t: t, root: t.TempDir(), dirs: map[string]string{}, fresh: map[string]bool{}}
 }
 
 func (d *deviceVolumes) dir(device string) string {
@@ -48,7 +51,9 @@ func (d *deviceVolumes) dir(device string) string {
 		return dir
 	}
 	dir := filepath.Join(d.root, strings.ReplaceAll(device, "/", "_"))
-	_ = os.MkdirAll(dir, 0o700)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		d.t.Errorf("make the directory standing in for %s: %v", device, err)
+	}
 	d.dirs[device] = dir
 
 	return dir
@@ -420,7 +425,9 @@ func TestAnUnauthorisedJobsCASWritesAreDiscarded(t *testing.T) {
 	if err := service.Close(t.Context(), instance); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	_ = service.RetryClosed(t.Context())
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 
 	if storage.published != 0 || storage.discarded != 1 {
 		t.Fatalf("published %d, discarded %d; want the clone discarded", storage.published,
@@ -446,10 +453,12 @@ func putObject(t *testing.T, service *CacheService, token, body string) int {
 	return casRequest(t, service, token, http.MethodPut, "/v1/cas/go/cas/"+digestOf(body), body).Code
 }
 
-func finish(t *testing.T, service *CacheService, instance string, authority server.CacheAuthority) {
+// finish completes the session's job with no authority, as a trusted pool's
+// completion is, and closes it.
+func finish(t *testing.T, service *CacheService, instance string) {
 	t.Helper()
 
-	if err := service.SettleCompleted(t.Context(), instance, true, authority); err != nil {
+	if err := service.SettleCompleted(t.Context(), instance, true, server.CacheAuthority{}); err != nil {
 		t.Fatalf("SettleCompleted: %v", err)
 	}
 	if err := service.Close(t.Context(), instance); err != nil {
@@ -515,7 +524,7 @@ func TestAWriteDuringReleaseDoesNotDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openCASHandle: %v", err)
 	}
-	finish(t, service, instance, server.CacheAuthority{})
+	finish(t, service, instance)
 
 	// THE LOOP HOLDS THE SESSION LOCK WHILE IT WAITS FOR THE VOLUME, so a
 	// transfer holding the volume must finish without it.
@@ -593,7 +602,7 @@ func TestAWriteBeforeARestartIsStillPublished(t *testing.T) {
 		t.Fatalf("NewCacheService: %v", err)
 	}
 	reloaded.actionIO = volumes
-	finish(t, reloaded, instance, server.CacheAuthority{})
+	finish(t, reloaded, instance)
 	if err := reloaded.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}
@@ -616,8 +625,10 @@ func TestABlockDuringPublicationStopsIt(t *testing.T) {
 	if code := putObject(t, service, token, "an object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
-	finish(t, service, instance, server.CacheAuthority{})
-	_ = service.RetryClosed(t.Context())
+	finish(t, service, instance)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
 
 	if storage.snapshots != 1 || storage.published != 0 {
 		t.Fatalf("snapshots/publications = %d/%d, want the snapshot taken and nothing published",
@@ -636,7 +647,7 @@ func TestAnUnscopedTrustedCachePublishesUnderTheLedgersPolicy(t *testing.T) {
 	if code := putObject(t, service, token, "an object"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
-	finish(t, service, instance, server.CacheAuthority{})
+	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}
@@ -658,7 +669,9 @@ func TestAFailedDiscardIsRetried(t *testing.T) {
 	if err := service.Close(t.Context(), instance); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	_ = service.RetryClosed(t.Context())
+	if err := service.RetryClosed(t.Context()); err == nil {
+		t.Fatal("RetryClosed reported nothing of a discard that failed")
+	}
 	session := service.sessionOf(instance)
 	if session == nil || len(session.hosts) != 1 {
 		t.Fatal("a failed discard dropped the volume's record")
@@ -683,7 +696,7 @@ func TestAFailedMergeDiscardsItsClone(t *testing.T) {
 	}
 	storage.current = "theirs"
 	volumes.failSuffix = ".merge"
-	finish(t, service, instance, server.CacheAuthority{})
+	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}
@@ -719,7 +732,7 @@ func TestAFullGenerationStartsOver(t *testing.T) {
 	if code := putObject(t, service, token, "after the reset"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
-	finish(t, service, instance, server.CacheAuthority{})
+	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}
@@ -764,7 +777,7 @@ func TestAFreshStartMergesIntoANewerPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	cloned := storage.cloned
-	finish(t, service, instance, server.CacheAuthority{})
+	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
 	}

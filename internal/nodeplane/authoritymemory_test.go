@@ -1,6 +1,7 @@
 package nodeplane
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -24,7 +25,7 @@ func TestAJobsAuthorityIsAskedOnceAndRemembered(t *testing.T) {
 		binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
 		want := server.CacheAuthority{LeaseID: "l1", JobID: "job-1", RunID: 31, Proven: true, WriteOwnRef: true}
 		release := make(chan struct{})
-		decided := func() (server.CacheAuthority, bool) {
+		decided := func(context.Context) (server.CacheAuthority, bool) {
 			asked.Add(1)
 			<-release
 
@@ -34,7 +35,7 @@ func TestAJobsAuthorityIsAskedOnceAndRemembered(t *testing.T) {
 		const callers = 8
 		answers := make(chan server.CacheAuthority, callers)
 		for range callers {
-			go func() { answers <- memory.resolve("l1", binding, now, decided) }()
+			go func() { answers <- memory.resolve(t.Context(), "l1", binding, now, decided) }()
 		}
 		synctest.Wait()
 		if got := asked.Load(); got != 1 || len(answers) != 0 {
@@ -47,7 +48,7 @@ func TestAJobsAuthorityIsAskedOnceAndRemembered(t *testing.T) {
 				t.Errorf("a caller was answered %+v, want %+v", got, want)
 			}
 		}
-		if got := memory.resolve("l1", binding, now.Add(authorityDecidedFor-time.Second), decided); got != want {
+		if got := memory.resolve(t.Context(), "l1", binding, now.Add(authorityDecidedFor-time.Second), decided); got != want {
 			t.Errorf("the remembered answer was %+v, want %+v", got, want)
 		}
 		if asked.Load() != 1 {
@@ -75,8 +76,8 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 			}
 		}()
 		go func() {
-			firstDone <- memory.resolve("l1", alloc.PoolRunner{JobID: "job-1", RunID: 31}, now,
-				func() (server.CacheAuthority, bool) {
+			firstDone <- memory.resolve(t.Context(), "l1", alloc.PoolRunner{JobID: "job-1", RunID: 31}, now,
+				func(context.Context) (server.CacheAuthority, bool) {
 					<-release
 
 					return first, true
@@ -84,8 +85,8 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 		}()
 		synctest.Wait()
 		go func() {
-			secondDone <- memory.resolve("l1", alloc.PoolRunner{JobID: "job-2", RunID: 32}, now,
-				func() (server.CacheAuthority, bool) { return second, true })
+			secondDone <- memory.resolve(t.Context(), "l1", alloc.PoolRunner{JobID: "job-2", RunID: 32}, now,
+				func(context.Context) (server.CacheAuthority, bool) { return second, true })
 		}()
 		synctest.Wait()
 		select {
@@ -112,13 +113,13 @@ func TestACouldNotTellAnswerIsAskedAgainSoon(t *testing.T) {
 	binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
 	var asked atomic.Int64
 	unproven := server.CacheAuthority{LeaseID: "l2", JobID: "job-1", RunID: 31}
-	couldNotTell := func() (server.CacheAuthority, bool) {
+	couldNotTell := func(context.Context) (server.CacheAuthority, bool) {
 		asked.Add(1)
 
 		return unproven, false
 	}
 	for _, at := range []time.Duration{0, authorityUndecidedFor - time.Second, authorityUndecidedFor} {
-		if got := memory.resolve("l2", binding, now.Add(at), couldNotTell); got != unproven {
+		if got := memory.resolve(t.Context(), "l2", binding, now.Add(at), couldNotTell); got != unproven {
 			t.Fatalf("at %s the answer was %+v, want %+v", at, got, unproven)
 		}
 	}
@@ -137,8 +138,12 @@ func TestAPanickingQuestionReleasesItsWaiters(t *testing.T) {
 		binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
 		release := make(chan struct{})
 		go func() {
-			defer func() { _ = recover() }()
-			memory.resolve("l1", binding, now, func() (server.CacheAuthority, bool) {
+			defer func() {
+				if recover() == nil {
+					t.Error("the question did not panic")
+				}
+			}()
+			memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (server.CacheAuthority, bool) {
 				<-release
 				panic("github client")
 			})
@@ -146,7 +151,7 @@ func TestAPanickingQuestionReleasesItsWaiters(t *testing.T) {
 		synctest.Wait()
 		waiter := make(chan server.CacheAuthority, 1)
 		go func() {
-			waiter <- memory.resolve("l1", binding, now, func() (server.CacheAuthority, bool) {
+			waiter <- memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (server.CacheAuthority, bool) {
 				return server.CacheAuthority{Proven: true}, true
 			})
 		}()

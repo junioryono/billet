@@ -389,8 +389,8 @@ func TestCacheOutcomesAreCountedPerTier(t *testing.T) {
 	if jobs != 3 || counts["cloud"]["git"][string(BuildCacheWarm)] != 2 || counts["cloud"]["git"][""] != 1 {
 		t.Fatalf("counted %d jobs: %v", jobs, counts)
 	}
-	if _, jobs, _ := a.CacheOutcomes(t.Context(), time.Now().Add(time.Minute), 100); jobs != 0 {
-		t.Fatalf("a window after every job counted %d", jobs)
+	if _, jobs, err := a.CacheOutcomes(t.Context(), time.Now().Add(time.Minute), 100); err != nil || jobs != 0 {
+		t.Fatalf("a window after every job counted %d, %v", jobs, err)
 	}
 }
 

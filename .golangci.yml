@@ -540,6 +540,18 @@ linters:
           - gosec
         text: G703
 
+      # THE NODE'S CACHE FILES ARE NAMED BY BILLET. A session's custody record is
+      # named by its bearer, which billet generated as hex, and a content-addressed
+      # object by a digest parseCASPath or checkDigest admitted as hex under the
+      # volume's root. G703 reports those paths on one run and not the next: the
+      # same tree passed lint in CI and then failed it on an unused nolint
+      # directive for the finding (2026-09-26), so a directive cannot hold it.
+      # Excluded here, by file and rule.
+      - path: (^|/)internal/node/(cache_state|casvolume)\.go$
+        linters:
+          - gosec
+        text: G703
+
       # `configuredKeyPath` reads the file `--config` names, which is the
       # operator's own pathname handed to the command they ran, and the same
       # read every command makes through config.Load. gosec's taint analysis

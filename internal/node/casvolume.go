@@ -199,14 +199,21 @@ var errCacheOff = errors.New("this cache is off for this job")
 // guest sends can sit under a digest it does not have. An ac record is the
 // guest's claim about an action, trusted exactly as far as the job is: it lands
 // in the job's own clone and is published only where the job's writes are.
-func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session *cacheSession) {
+func (s *CacheService) serveCAS(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, session *cacheSession,
+) {
 	kind, table, digest, ok := parseCASPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 
 		return
 	}
-	ctx, cancel := extendTransfer(w, r)
+	ctx, cancel, err := extendTransfer(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
 	defer cancel()
 
 	handle, err := s.openCASHandle(ctx, session, kind, r.Method == http.MethodPut)
@@ -258,13 +265,20 @@ func (s *CacheService) serveCAS(w http.ResponseWriter, r *http.Request, session 
 }
 
 // extendTransfer lets one cache transfer outlive the listener's read timeout,
-// which is sized for the small requests the rest of the API makes.
-func extendTransfer(w http.ResponseWriter, r *http.Request) (context.Context, context.CancelFunc) {
+// which is sized for the small requests the rest of the API makes. A writer
+// that cannot move its deadlines (a test's recorder) keeps them, bounded by the
+// context all the same; any other refusal is a connection already gone.
+func extendTransfer(ctx context.Context, w http.ResponseWriter) (context.Context, context.CancelFunc, error) {
 	controller := http.NewResponseController(w)
-	_ = controller.SetReadDeadline(time.Now().Add(casRequestLife))
-	_ = controller.SetWriteDeadline(time.Now().Add(casRequestLife))
+	deadline := time.Now().Add(casRequestLife)
+	for _, extend := range []func(time.Time) error{controller.SetReadDeadline, controller.SetWriteDeadline} {
+		if err := extend(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return nil, nil, fmt.Errorf("extend the transfer's deadline: %w", err)
+		}
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 
-	return context.WithTimeout(r.Context(), casRequestLife)
+	return ctx, cancel, nil
 }
 
 // casHandle is one admitted transfer's hold on a session's mounted volume: a
@@ -457,7 +471,7 @@ func (s *CacheService) storeCASObject(
 
 	hash := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(temporary, hash),
-		io.LimitReader(contextReader{ctx: ctx, r: body}, limit+1))
+		io.LimitReader(stopWith(ctx, body), limit+1))
 	closeErr := temporary.Close()
 	switch {
 	case copyErr != nil:
@@ -490,18 +504,20 @@ func filledAbove(root string, fraction float64) (bool, error) {
 	return (total-float64(stat.Bavail))/total > fraction, nil
 }
 
-// contextReader stops a copy when its context ends.
-type contextReader struct {
-	ctx context.Context
-	r   io.Reader
-}
+// readerFunc is a Read method.
+type readerFunc func([]byte) (int, error)
 
-func (c contextReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
-		return 0, err
-	}
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
-	return c.r.Read(p)
+// stopWith is r, stopping a copy when ctx ends.
+func stopWith(ctx context.Context, r io.Reader) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		return r.Read(p)
+	})
 }
 
 // releaseCASVolume unmounts a closed session's volume and publishes it when
@@ -510,7 +526,7 @@ func (c contextReader) Read(p []byte) (int, error) {
 // cleanupSession; done means the volume needs nothing more.
 func (s *CacheService) releaseCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
-) (done bool, err error) {
+) (bool, error) {
 	// A TRANSFER STILL RUNNING HOLDS io, and the cache loop serves every
 	// session, so it waits a little and comes back rather than wait out a
 	// transfer's whole deadline.
@@ -643,7 +659,7 @@ func lockWithin(ctx context.Context, l *sync.RWMutex, wait time.Duration) bool {
 // the caller's discard: the merge clone is recorded before it is mounted.
 func (s *CacheService) mergeCASVolume(
 	ctx context.Context, session *cacheSession, hv *hostVolume,
-) (generation string, consumed bool, err error) {
+) (string, bool, error) {
 	key := hv.Volume.Key
 	lease, fence, err := s.store.AcquireWriter(ctx, key, session.instance+"/"+string(hv.Kind),
 		cacheWriterTTL)
@@ -780,8 +796,15 @@ func copyFile(from, to string) error {
 // Remote Execution API's handlers, which gRPC runs on the request's context.
 type remoteAPISession struct{}
 
-func (s *CacheService) serveRemoteAPI(w http.ResponseWriter, r *http.Request, session *cacheSession) {
-	ctx, cancel := extendTransfer(w, r)
+func (s *CacheService) serveRemoteAPI(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, session *cacheSession,
+) {
+	ctx, cancel, err := extendTransfer(ctx, w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+
+		return
+	}
 	defer cancel()
 	s.remoteAPI.ServeHTTP(w, r.WithContext(context.WithValue(ctx, remoteAPISession{}, session)))
 }
