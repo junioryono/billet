@@ -27,11 +27,16 @@
 #                       (default: 120)
 #   BILLET_RI_UNIT      for stop: the unit systemd says holds the machine, when a
 #                       caller found it by asking rather than by this driver's
-#                       own naming (default: <machine>-nspawn.service)
+#                       own naming (default when unset: <machine>-nspawn.service;
+#                       set and empty is refused, never taken for the default)
 set -euo pipefail
 
 machine=${BILLET_RI_MACHINE:-billet-ri}
-unit=${BILLET_RI_UNIT:-$machine-nspawn.service}
+unit=${BILLET_RI_UNIT-$machine-nspawn.service}
+if [ -z "$unit" ]; then
+	echo "no unit named for machine $machine: an empty holder is not the default one" >&2
+	exit 1
+fi
 # THE HOST SIDE OF THE MACHINE'S LINK, named by nspawn as ve-<machine> when that
 # fits an interface name (fifteen characters), which is why the name is bounded.
 link=ve-$machine

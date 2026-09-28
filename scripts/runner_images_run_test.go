@@ -475,15 +475,14 @@ func runRecovery(t *testing.T, fake string) (string, error) {
 
 // RECOVERY STOPS WHAT HOLDS THIS WORKSPACE, by what it holds: a machine on this
 // rootfs is stopped through the unit systemd says holds it, one on another root
-// is left alone, one gone since the listing is skipped, and this workspace's own
-// machine is always asked.
+// is left alone, and this workspace's own machine is always asked.
 func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
 	t.Parallel()
 
 	fake := t.TempDir()
 	for name, body := range map[string]string{
 		"list": "old-survivor container systemd-nspawn ubuntu 24.04 -\n" +
-			"elsewhere container systemd-nspawn - - -\nvanished container - - - -\n",
+			"elsewhere container systemd-nspawn - - -\n",
 		"old-survivor.root": "/var/tmp/billet-guest/rootfs\n",
 		"old-survivor.unit": "machine-old-survivor.scope\n",
 		"elsewhere.root":    "/srv/other/rootfs\n",
@@ -502,7 +501,7 @@ func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
 	if !strings.Contains(got, "stop old-survivor unit=machine-old-survivor.scope root=/var/tmp/billet-guest/rootfs\n") {
 		t.Errorf("the machine on this workspace was not stopped through its own unit:\n%s", got)
 	}
-	if strings.Contains(got, "elsewhere") || strings.Contains(got, "vanished") {
+	if strings.Contains(got, "elsewhere") {
 		t.Errorf("recovery stopped a machine that does not hold this workspace:\n%s", got)
 	}
 	if !strings.Contains(got, "stop bri-") {
@@ -511,14 +510,19 @@ func TestRecoveryStopsTheMachinesOnThisWorkspace(t *testing.T) {
 }
 
 // RECOVERY THAT CANNOT SEE EVERYTHING REFUSES: a listing that fails, a property
-// that cannot be read, or a stop that cannot be proved each fail it, and the
-// caller then leaves the workspace alone.
+// that cannot be read, a machine gone before its root was read (its processes may
+// outlive its registration in a unit never learned), an empty holding unit, or a
+// stop that cannot be proved each fail it, and the caller then leaves the
+// workspace alone.
 func TestRecoveryRefusesWhatItCannotSee(t *testing.T) {
 	t.Parallel()
 
 	for name, files := range map[string]map[string]string{
-		"the listing fails":     {"broken": "list\n"},
-		"a root cannot be read": {"list": "m container - - - -\n", "broken": "show\n"},
+		"the listing fails":                           {"broken": "list\n"},
+		"a root cannot be read":                       {"list": "m container - - - -\n", "broken": "show\n"},
+		"a machine vanished before its root was read": {"list": "m container - - - -\n"},
+		"the unit holding it reads empty": {"list": "m container - - - -\n", "m.root": "/var/tmp/billet-guest/rootfs\n",
+			"m.unit": "\n"},
 		"a stop cannot be proved": {"list": "m container - - - -\n", "m.root": "/var/tmp/billet-guest/rootfs\n",
 			"m.unit": "m-nspawn.service\n", "refuse": "m\n"},
 	} {
@@ -528,6 +532,33 @@ func TestRecoveryRefusesWhatItCannotSee(t *testing.T) {
 		}
 		if output, err := runRecovery(t, fake); err == nil {
 			t.Errorf("%s: recovery succeeded:\n%s", name, output)
+		}
+	}
+}
+
+// A HOST WITH systemd-nspawn AND NO machinectl CANNOT BE ASKED, so recovery
+// refuses there; with neither, no machine was ever booted and there is nothing to
+// stop.
+func TestRecoveryWithoutMachinectl(t *testing.T) {
+	t.Parallel()
+
+	for nspawn, refused := range map[bool]bool{true: true, false: false} {
+		bin := t.TempDir()
+		if nspawn {
+			if err := forkSafeWriteFile(filepath.Join(bin, "systemd-nspawn"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		script := "SCRIPT_DIR=" + bin + "\n" + scriptFunction(t, "build-guest-image.sh", "recover_runner_images") + "\n" +
+			"set -euo pipefail\nrecover_runner_images /var/tmp/billet-guest/rootfs\n"
+		cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
+		cmd.Env = append(os.Environ(), "PATH="+bin)
+		output, err := cmd.CombinedOutput()
+		if refused && (err == nil || !strings.Contains(string(output), "machinectl is not")) {
+			t.Errorf("nspawn without machinectl answered %v:\n%s", err, output)
+		}
+		if !refused && err != nil {
+			t.Errorf("a host with neither answered %v:\n%s", err, output)
 		}
 	}
 }

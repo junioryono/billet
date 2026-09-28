@@ -541,30 +541,37 @@ runner_images_machine() {
 # found by what it holds, not by what a file says its name was.
 recover_runner_images() {
 	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed name root unit
-	# NO machinectl, NO MACHINE: it ships in the package with systemd-nspawn, so a
-	# host without it has never booted one.
-	command -v machinectl >/dev/null 2>&1 || return 0
+	# NO machinectl, NO MACHINE, but only while systemd-nspawn is absent too: they
+	# ship in one package, and nspawn without machinectl cannot be asked.
+	if ! command -v machinectl >/dev/null 2>&1; then
+		if command -v systemd-nspawn >/dev/null 2>&1; then
+			echo "systemd-nspawn is installed and machinectl is not, so this host's machines cannot be listed" >&2
+			return 1
+		fi
+		return 0
+	fi
 	if ! listed=$(machinectl list --no-legend --no-pager 2>&1); then
 		echo "could not list this host's machines: $listed" >&2
 		return 1
 	fi
-	for name in $(awk '{ print $1 }' <<<"$listed"); do
+	# READ WITH THE SHELL'S OWN read, on its own descriptor, so no parser can fail
+	# into an empty list and nothing the loop runs can drain it.
+	while read -r -u 3 name _; do
+		[ -n "$name" ] || continue
+		# A MACHINE GONE BEFORE ITS ROOT IS READ may have left its processes in a
+		# unit this never learned, so it is not known to be stopped.
 		if ! root=$(machinectl show --property=RootDirectory --value "$name" 2>&1); then
-			# GONE SINCE THE LISTING is the one failure that means absence.
-			case "$root" in
-			*"No machine"*) continue ;;
-			esac
 			echo "could not read machine $name's root: $root" >&2
 			return 1
 		fi
 		[ "$root" = "$rootfs" ] || continue
-		if ! unit=$(machinectl show --property=Unit --value "$name" 2>&1); then
+		if ! unit=$(machinectl show --property=Unit --value "$name" 2>&1) || [ -z "$unit" ]; then
 			echo "could not read the unit holding machine $name: $unit" >&2
 			return 1
 		fi
 		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
 			return 1
-	done
+	done 3<<<"$listed"
 	BILLET_RI_MACHINE=$(runner_images_machine) BILLET_RI_ROOTFS="$rootfs" "$driver" stop
 }
 

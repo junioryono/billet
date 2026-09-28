@@ -57,7 +57,7 @@ case "$1" in
 is-active) state=$(cat "$FAKE/state" 2>/dev/null || echo inactive); echo "$state"
 	[ "$state" = active ] ;;
 stop) grep -qx stop "$FAKE/stuck" 2>/dev/null || { echo inactive >"$FAKE/state"; rm -f "$FAKE/leader"; } ;;
-show) echo /system.slice/probe-nspawn.service ;;
+show) for last; do :; done; echo "/system.slice/$last" ;;
 esac
 `,
 	"iptables": `#!/bin/sh
@@ -306,6 +306,30 @@ func TestTheNspawnDriverProvesTheMachineStopped(t *testing.T) {
 	}
 	if calls := driverCalls(t, named); !strings.Contains(calls, "systemctl stop machine-probe.scope\n") {
 		t.Errorf("stop did not stop the unit it was told holds the machine:\n%s", calls)
+	}
+
+	// THE PROOF IS READ FROM THAT UNIT'S OWN CGROUP: a process left in the scope
+	// is found although the driver's default unit's cgroup is empty, and an
+	// explicitly empty unit is refused rather than taken for the default.
+	scope := t.TempDir()
+	writeFake(t, scope, "state", "failed\n")
+	writeFake(t, scope, "stuck", "poweroff\nstop\nterminate\n")
+	for dir, events := range map[string]string{"machine-probe.scope": "populated 1\n", "probe-nspawn.service": "populated 0\n"} {
+		cgroup := filepath.Join(scope, "cgroup", "system.slice", dir)
+		if err := os.MkdirAll(cgroup, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte(events), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := runDriverWith(t, scope, []string{"BILLET_RI_UNIT=machine-probe.scope"}, "stop")
+	if err == nil || !strings.Contains(output, "still running") {
+		t.Errorf("a scope still holding a process answered %v:\n%s", err, output)
+	}
+	output, err = runDriverWith(t, t.TempDir(), []string{"BILLET_RI_UNIT="}, "stop")
+	if err == nil || !strings.Contains(output, "no unit named") {
+		t.Errorf("an empty unit answered %v:\n%s", err, output)
 	}
 
 	unknown := t.TempDir()
