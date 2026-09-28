@@ -18,7 +18,7 @@ Converge a billet fleet from GitHub Actions with one `uses:` line. The action re
       BILLET_WARP_CONNECTOR_TOKEN_NODE_1=${{ secrets.BILLET_WARP_CONNECTOR_TOKEN_NODE_1 }}
 ```
 
-`billet init hybrid --workflow` writes the two-job workflow around this, and [Converging from CI](https://billet.readthedocs.io/en/latest/deploying/converging-from-ci.html) is the page that explains it.
+[Converging from CI](https://billet.readthedocs.io/en/latest/deploying/converging-from-ci.html) has the two-job workflow around this, the secrets, the trust boundary and the first converge.
 
 ## The one pin
 
@@ -68,16 +68,7 @@ Outputs: `recap` (the recap rows of the last pass) and `billet-ref` (the ref thi
 
 ## Running the same thing from a laptop
 
-The scripts take their inputs from the environment the action's steps set, so a laptop run is a clone of billet at the release you pin and the same variables:
-
-```bash
-git clone --branch v0.10.0 --depth 1 https://github.com/junioryono/billet
-export GITHUB_ACTION_PATH=$PWD/billet/actions/converge-fleet RUNNER_TEMP=$(mktemp -d) GITHUB_OUTPUT=/dev/null GITHUB_PATH=/dev/null
-"$GITHUB_ACTION_PATH/install-ansible.sh" && export PATH="$RUNNER_TEMP/billet-ansible/bin:$PATH"
-BILLET_MODE=check BILLET_INVENTORY=fleet/inventory.yml BILLET_KNOWN_HOSTS=fleet/known_hosts BILLET_REACH=none \
-  BILLET_ENVIRONMENT="BILLET_CLOUDFLARED_TOKEN_CONTROL_1=$(terraform output -raw tunnel_token)" \
-  "$GITHUB_ACTION_PATH/converge.sh"
-```
+`billet fleet converge -inventory fleet/inventory.yml -known-hosts fleet/known_hosts [-check]` runs these same scripts, from the checkout of the installed billet's release, with the collection from that checkout. It carries the steps' environment between them as a runner does, reaches the hosts over the laptop's own network (`reach: none`), and always releases the guard it took. See `billet fleet converge -h` and [Converging from CI](https://billet.readthedocs.io/en/latest/deploying/converging-from-ci.html).
 
 ## What is not covered
 
