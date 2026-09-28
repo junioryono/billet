@@ -79,13 +79,16 @@ FAILED=0
 # UNMOUNTED ON EVERY PATH. A loop mount left behind holds the image file open, and
 # the next step in a build is usually the one that wants to upload or delete it.
 cleanup() {
-	# /proc FIRST. It is mounted INSIDE the image's mountpoint, so unmounting the
-	# image while it is still there fails with "target is busy" and leaves both
-	# behind -- holding the image file open for whatever wants to upload or delete
-	# it next.
-	if mountpoint -q "$MNT/proc" 2>/dev/null; then
-		umount "$MNT/proc" || umount -l "$MNT/proc" || true
-	fi
+	# /proc AND /dev FIRST. They are mounted INSIDE the image's mountpoint, so
+	# unmounting the image while they are still there fails with "target is busy"
+	# and leaves them behind -- holding the image file open for whatever wants to
+	# upload or delete it next.
+	local sub
+	for sub in proc dev; do
+		if mountpoint -q "$MNT/$sub" 2>/dev/null; then
+			umount "$MNT/$sub" || umount -l "$MNT/$sub" || true
+		fi
+	done
 
 	if mountpoint -q "$MNT" 2>/dev/null; then
 		umount "$MNT" || umount -l "$MNT" || true
@@ -115,6 +118,27 @@ mount -o ro,loop "$IMAGE" "$MNT"
 # READ-ONLY AND NOSUID/NODEV/NOEXEC: this is the host's /proc, exposed only so a
 # binary can read its own path. Nothing here should be able to write through it.
 mount -o bind,ro,nosuid,nodev,noexec /proc "$MNT/proc"
+
+# A MINIMAL /dev, the character devices a booted guest's devtmpfs gives every
+# process: the .NET runtime aborts at startup without them, so pwsh and every
+# dotnet tool read as broken in a chroot whose image left /dev empty (Ubuntu's
+# cloud root filesystem does; debootstrap's used to carry these nodes). Its own
+# tmpfs, never the builder's /dev, so nothing run here can reach a real disk.
+mount -t tmpfs -o nosuid,noexec,mode=0755,size=64k billet-gate-dev "$MNT/dev"
+while read -r node major minor; do
+	mknod -m 0666 "$MNT/dev/$node" c "$major" "$minor"
+done <<'NODES'
+null 1 3
+zero 1 5
+full 1 7
+random 1 8
+urandom 1 9
+tty 5 0
+NODES
+ln -s /proc/self/fd "$MNT/dev/fd"
+ln -s /proc/self/fd/0 "$MNT/dev/stdin"
+ln -s /proc/self/fd/1 "$MNT/dev/stdout"
+ln -s /proc/self/fd/2 "$MNT/dev/stderr"
 
 fail() {
 	echo "  FAIL  $*" >&2
@@ -209,8 +233,7 @@ $(jq -r --argjson alias "$alias_json" '
 		(.clang.versions[]? | select(. != null and . != "") | "clang-" + .),
 			(.gcc.versions[]?), (.gfortran.versions[]?),
 			(.php.versions[]? | select(. != null and . != "") | "php" + . + "-cli"),
-			(.postgresql.version | select(. != null and . != "") | "postgresql-client-" + .),
-			(if (.pipx | length) > 0 then "pipx" else empty end)]
+			(.postgresql.version | select(. != null and . != "") | "postgresql-client-" + .)]
 	| map(select(. != null and . != ""))
 	| map(
 		$alias[.] as $entry
@@ -360,8 +383,8 @@ check_android_sdk() {
 # outside the declaration the parity check below reads, so only a list of paths
 # can notice one missing.
 HOSTED_TOOLS=(
-	/usr/local/bin/yq /usr/local/bin/kubectl /usr/local/bin/kind /usr/local/bin/minikube
-	/usr/local/bin/helm /usr/local/bin/kustomize /usr/local/bin/git-lfs /usr/local/bin/ninja
+	/usr/bin/yq /usr/bin/kubectl /usr/local/bin/kind /usr/local/bin/minikube
+	/usr/local/bin/helm /usr/local/bin/kustomize /usr/bin/git-lfs /usr/local/bin/ninja
 	/usr/local/bin/aws /usr/local/bin/sam /usr/local/bin/session-manager-plugin
 	/usr/bin/docker-credential-ecr-login /usr/bin/composer /usr/local/bin/phpunit
 	/usr/local/bin/bazel /usr/local/bin/bazelisk /usr/bin/podman /usr/bin/buildah
@@ -440,7 +463,10 @@ check_hosted_tools() {
 	[ -n "$archive" ] || missing+=("the action archive cache (no archive under /opt/actionarchivecache)")
 	grep -qx 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=/opt/actionarchivecache' "$env" 2>/dev/null ||
 		missing+=("ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE in /etc/billet-image-env")
-	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:[0-9]' "$env" 2>/dev/null ||
+	# silent: WITH NO VERSION IS WHAT GitHub's install-bazel.sh WRITES: it reads the
+	# version from a `bazel --version` line Bazel 9 no longer prints. The gate
+	# holds the variable GitHub sets, not a value GitHub's image does not carry.
+	grep -q '^USE_BAZEL_FALLBACK_VERSION=silent:' "$env" 2>/dev/null ||
 		missing+=("USE_BAZEL_FALLBACK_VERSION in /etc/billet-image-env")
 	if [ -d "$1/usr/local/lib/android/sdk" ] && [ -z "$(find "$1/usr/local/lib/android/sdk" -maxdepth 0 -perm -o+w)" ]; then
 		missing+=("a writable Android SDK (Gradle installs the NDK a project asks for into it)")
@@ -1253,8 +1279,10 @@ check_toolcache_coverage() {
 	# needed them. A toolcache entry is found by an ACTION; a workflow step that
 	# runs a bare `node` or `gem` resolves against the system, and this image's apt
 	# set carries neither.
+	# RESOLVED THROUGH THE IMAGE'S OWN PATH, as a step resolves it: GitHub's node
+	# is under /usr/local/bin and its ruby is apt's, under /usr/bin.
 	for cmd in node npm ruby gem; do
-		if chroot "$MNT" "/usr/local/bin/$cmd" --version >/dev/null 2>&1; then
+		if chroot "$MNT" sh -lc "$cmd --version" >/dev/null 2>&1; then
 			pass "$cmd resolves on PATH"
 		else
 			fail "$cmd is not on PATH; a step calling it without setup-node or setup-ruby
@@ -1284,6 +1312,16 @@ check_toolcache_coverage() {
 	declared_globals=$(toolset_query \
 		'(.pipx[]?.cmd // empty), (.node_modules[]?.command // empty)' \
 		"the global commands")
+
+	# pipx ITSELF, WHICH THE DECLARATION NEVER NAMES: GitHub's install-python.sh
+	# installs it with pip, so it is a command on PATH and no dpkg package.
+	if [ -n "$(toolset_query '.pipx[]?.package // empty' "the pipx packages")" ]; then
+		if chroot "$MNT" sh -lc "pipx --version" >/dev/null 2>&1; then
+			pass "pipx runs, for the pipx packages the declaration names"
+		else
+			fail "the declaration names pipx packages and the image has no working pipx"
+		fi
+	fi
 
 	while IFS= read -r cmd; do
 		[ -n "$cmd" ] || continue

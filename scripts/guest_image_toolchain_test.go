@@ -74,6 +74,15 @@ func TestTheToolchainSectionsReachEveryReader(t *testing.T) {
 	missing := gateDeclared(t)
 
 	for _, pkg := range want {
+		if pkg == pipxPackage {
+			if slices.Contains(missing, pkg) {
+				t.Errorf("the guest gate requires the %s package, which GitHub's image installs "+
+					"with pip rather than apt", pkg)
+			}
+
+			continue
+		}
+
 		if !slices.Contains(missing, pkg) {
 			t.Errorf("%q is not in the set the guest gate requires; an image without it "+
 				"would pass", pkg)
@@ -155,4 +164,17 @@ func scriptFunction(t *testing.T, script, name string) string {
 	}
 
 	return source[start : start+end+2]
+}
+
+// pipxPackage is the one name the EC2 build installs from apt and the guest gate
+// does not require as a package: GitHub's install-python.sh installs pipx with
+// pip, so the gate checks that the command runs instead.
+const pipxPackage = "pipx"
+
+// gateRequiredPackages is the declaration's package list as the guest gate
+// requires it: everything the EC2 build installs, less pipx.
+func gateRequiredPackages(ts runnerimages.Toolset) []string {
+	return slices.DeleteFunc(ts.AptPackages(), func(pkg string) bool {
+		return pkg == pipxPackage
+	})
 }
