@@ -293,17 +293,21 @@ func (c *Converger) job(ctx context.Context, label string) (Job, bool, error) {
 // on an agent that exits non-zero makes launchd START IT AGAIN — the service
 // billet was asked to stop, restarted by the stop. bootout removes it from the
 // domain, so KeepAlive has nothing left to act on.
-func (c *Converger) StopAndProve(ctx context.Context, label string) (result lifeops.StopResult, err error) {
+func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.StopResult, error) {
 	// A DRAIN THIS STOP REQUESTED IS SAID ON EVERY ANSWER, including a bootout
 	// that fails after it, or a caller would report a host it touched as untouched.
 	asked := false
 
-	defer func() {
-		if asked {
-			result.Asked = true
-		}
-	}()
+	result, err := c.stopAndProve(ctx, label, &asked)
+	if asked {
+		result.Asked = true
+	}
 
+	return result, err
+}
+
+// stopAndProve is StopAndProve's body; asked is set once a drain was requested.
+func (c *Converger) stopAndProve(ctx context.Context, label string, asked *bool) (lifeops.StopResult, error) {
 	before, loaded, err := c.job(ctx, label)
 	if err != nil {
 		return lifeops.StopResult{Gone: lifeops.Unknown, How: "could not be asked about"}, err
@@ -347,7 +351,7 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (result life
 	// then has no process to kill.
 	if before.PIDKnown && before.PID > 0 {
 		drained, err := c.drainFirst(ctx, label, before.PID, watch, watched)
-		asked = drained.Asked
+		*asked = drained.Asked
 
 		if err != nil {
 			return drained, err
@@ -477,7 +481,7 @@ func (c *Converger) drainFirst(
 
 		if next == 0 {
 			// The processes this record names are gone, so it answers nothing now.
-			_ = os.Remove(record) //nolint:errcheck // a leftover names a pid and start time no process has.
+			_ = os.Remove(record)
 
 			return lifeops.StopResult{Asked: asked}, nil
 		}
@@ -552,7 +556,7 @@ func (c *Converger) askOnce(
 
 	case code != 0 && c.alive(pid):
 		// A PROVED REFUSAL: launchctl answered, and the process is still there.
-		_ = os.Remove(record) //nolint:errcheck // an undelivered request's record; a leftover only suppresses a re-ask of this one process.
+		_ = os.Remove(record)
 
 		return lifeops.StopResult{
 				Gone: lifeops.Unknown,
@@ -658,7 +662,7 @@ const stopRecordLimit = 4 << 10
 // unrecorded. So the open follows nothing and does not block, and anything but
 // a regular file is refused.
 func readStopRecord(path string) (string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // the path is billet's own log directory and a fixed name.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
 	}
@@ -667,7 +671,7 @@ func readStopRecord(path string) (string, error) {
 		return "", fmt.Errorf("launchd: open the stop record %s: %w", path, err)
 	}
 
-	defer f.Close() //nolint:errcheck // read-only; nothing to flush.
+	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -699,20 +703,20 @@ func writeStopRecord(path, incarnation string) error {
 	name := tmp.Name()
 
 	if _, err := tmp.WriteString(incarnation + "\n"); err != nil {
-		_ = tmp.Close()     //nolint:errcheck // abandoning it.
-		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+		_ = tmp.Close()
+		_ = os.Remove(name)
 
 		return fmt.Errorf("write the stop record %s: %w", name, err)
 	}
 
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+		_ = os.Remove(name)
 
 		return fmt.Errorf("close the stop record %s: %w", name, err)
 	}
 
 	if err := os.Rename(name, path); err != nil {
-		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+		_ = os.Remove(name)
 
 		return fmt.Errorf("install the stop record %s: %w", path, err)
 	}
