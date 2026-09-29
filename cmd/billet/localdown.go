@@ -440,7 +440,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 
 		if stopErr == nil {
 			stoppedUnits = append(stoppedUnits, unit)
-		} else if len(disturbed) > 0 || stopped.Gone != lifeops.Unknown {
+		} else if len(disturbed) > 0 || stopped.Gone != lifeops.Unknown || stopped.Asked {
 			// It failed, and something moved anyway — or the manager told billet
 			// something about the service despite failing. Say the unit was
 			// touched rather than leaving the report claiming it was not.

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/user"
@@ -64,6 +66,12 @@ type Converger struct {
 	// reason: the stop proof's whole job is to keep asking this after launchd
 	// has stopped answering.
 	alive func(pid int) bool
+	// started reads when a process started. A seam so a stop's once-per-process
+	// record is exercised without a process.
+	started func(ctx context.Context, pid int) (string, error)
+	// productVersion reads this Mac's macOS release, which decides whether its
+	// launchd clamps ExitTimeOut. A seam so both answers are exercised.
+	productVersion func() (string, error)
 
 	// agentsDir is where a launch agent's plist has to be for launchd to load
 	// it at login. A field so a test has one it can write to.
@@ -153,6 +161,8 @@ func New(opts ...Option) *Converger {
 	}
 
 	c.run = c.exec
+	c.started = c.processStarted
+	c.productVersion = swVersProductVersion
 
 	for _, opt := range opts {
 		opt(c)
@@ -284,6 +294,20 @@ func (c *Converger) job(ctx context.Context, label string) (Job, bool, error) {
 // billet was asked to stop, restarted by the stop. bootout removes it from the
 // domain, so KeepAlive has nothing left to act on.
 func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.StopResult, error) {
+	// A DRAIN THIS STOP REQUESTED IS SAID ON EVERY ANSWER, including a bootout
+	// that fails after it, or a caller would report a host it touched as untouched.
+	asked := false
+
+	result, err := c.stopAndProve(ctx, label, &asked)
+	if asked {
+		result.Asked = true
+	}
+
+	return result, err
+}
+
+// stopAndProve is StopAndProve's body; asked is set once a drain was requested.
+func (c *Converger) stopAndProve(ctx context.Context, label string, asked *bool) (lifeops.StopResult, error) {
 	before, loaded, err := c.job(ctx, label)
 	if err != nil {
 		return lifeops.StopResult{Gone: lifeops.Unknown, How: "could not be asked about"}, err
@@ -314,6 +338,25 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 	}
 
 	watch(before)
+
+	// THE DRAIN IS THE PROCESS'S OWN, AND LAUNCHD IS NOT ASKED UNTIL IT IS OVER.
+	// launchd SIGKILLs a job ExitTimeOut seconds after IT sends the SIGTERM, and
+	// macOS 27 clamps a launch agent's ExitTimeOut to 60 (measured 2026-09-29:
+	// declared 61, 600 and 88200 all loaded as 60), so a bootout of a node
+	// still draining killed it a minute in. billet asks first, through
+	// `launchctl kill`, which starts no such timer, once per process (a second
+	// SIGTERM escalates the drain), and the wait for the process to leave is
+	// bounded only by the caller. A node that drained exits 0, which
+	// KeepAlive{SuccessfulExit: false} does not restart, and the bootout below
+	// then has no process to kill.
+	if before.PIDKnown && before.PID > 0 {
+		drained, err := c.drainFirst(ctx, label, before.PID, watch, watched)
+		*asked = drained.Asked
+
+		if err != nil {
+			return drained, err
+		}
+	}
 
 	// A BOOTOUT THAT DID NOT SUCCEED IS NOT A STOP. `run` reports a non-zero
 	// exit separately from an error precisely so it can be acted on, and
@@ -394,6 +437,321 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 				"proved gone; it %s", label, result.How)
 		}
 	}
+}
+
+// drainFirst asks the loaded process to stop, once per process, and waits until
+// it has exited. A process launchd starts in its place (a restart after a
+// non-zero exit) is asked in its turn, so the bootout that follows has no
+// process to kill.
+//
+// THROUGH `launchctl kill TERM <service>`, NOT kill(2) ON A PID. launchd
+// addresses the service's current process, so a pid another process reused
+// since it was read is never signalled; and, measured on macOS 27.0
+// (2026-09-29), a SIGTERM delivered this way starts no ExitTimeOut timer: an
+// agent drained its full 90s, exited 0 and was not restarted.
+//
+// ONCE PER PROCESS, ACROSS CALLS. The node's second SIGTERM escalates its drain,
+// so a stop retried after a caller's deadline must resume waiting rather than
+// ask again. The request is recorded against the process's incarnation (its pid
+// and start time) BEFORE it is sent; a record billet cannot write means nothing
+// is sent, and a request that was proved not delivered clears its record.
+func (c *Converger) drainFirst(
+	ctx context.Context, label string, pid int, watch func(Job), watched map[int]bool,
+) (lifeops.StopResult, error) {
+	record := filepath.Join(c.logDir, ".stop-"+label)
+	asked := false
+	seen := []int{pid}
+
+	for {
+		result, err := c.askOnce(ctx, label, pid, record, watch)
+		asked = asked || result.Asked
+
+		if err != nil {
+			result.Asked = asked
+
+			return result, err
+		}
+
+		next, result, err := c.awaitExit(ctx, label, pid, record, watch, watched)
+		if err != nil {
+			result.Asked = asked
+
+			return result, err
+		}
+
+		if next == 0 {
+			// The processes this record names are gone, so it answers nothing now.
+			_ = os.Remove(record)
+
+			return lifeops.StopResult{Asked: asked}, nil
+		}
+
+		// A SERVICE THAT KEEPS RESTARTING is crashing, not draining, and chasing
+		// it would never end under a caller with no deadline.
+		seen = append(seen, next)
+		if len(seen) > maxDrainRestarts {
+			return lifeops.StopResult{
+					Gone:  lifeops.Unknown,
+					How:   fmt.Sprintf("kept being restarted while it was stopped (pids %v)", seen),
+					Asked: asked,
+				}, fmt.Errorf("launchd: %s was restarted %d times while it was being stopped "+
+					"(pids %v); it is crashing rather than draining, and billet stops asking. Read "+
+					"%s for why", label, len(seen)-1, seen, filepath.Join(c.logDir, "node.log"))
+		}
+
+		pid = next
+	}
+}
+
+// askOnce sends pid's process its one SIGTERM, unless the record says it was
+// already asked.
+func (c *Converger) askOnce(
+	ctx context.Context, label string, pid int, record string, watch func(Job),
+) (lifeops.StopResult, error) {
+	incarnation, err := c.incarnation(ctx, label, pid)
+	if err != nil {
+		if !c.alive(pid) {
+			return lifeops.StopResult{}, nil
+		}
+
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  fmt.Sprintf("could not be identified to ask it to stop (pid %d)", pid),
+		}, err
+	}
+
+	prior, err := readStopRecord(record)
+	if err != nil {
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "could not read whether it was already asked to stop",
+		}, err
+	}
+
+	if prior == incarnation {
+		return lifeops.StopResult{Asked: true}, nil
+	}
+
+	if err := writeStopRecord(record, incarnation); err != nil {
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "was not asked to stop, because the request could not be recorded",
+		}, fmt.Errorf("launchd: record the stop of %s before asking: %w", label, err)
+	}
+
+	out, code, err := c.run(ctx, []string{"kill", "TERM", c.target(label)})
+
+	switch {
+	case err != nil || code < 0:
+		// NOT A PROVED REFUSAL: launchctl was cut short, killed, or could not
+		// be waited on, and it may have delivered the signal first. The record
+		// stays, because a second SIGTERM would escalate a drain that did begin.
+		return lifeops.StopResult{
+				Gone:  lifeops.Unknown,
+				How:   "may have been asked to stop; the request did not finish",
+				Asked: true,
+			}, fmt.Errorf("launchd: `launchctl kill TERM %s` did not finish (exit %d), so whether it "+
+				"was delivered is unknown; a retry waits and asks nothing again (if nothing was "+
+				"asked, remove %s): %v", c.target(label), code, record, err)
+
+	case code != 0 && c.alive(pid):
+		// A PROVED REFUSAL: launchctl answered, and the process is still there.
+		_ = os.Remove(record)
+
+		return lifeops.StopResult{
+				Gone: lifeops.Unknown,
+				How:  fmt.Sprintf("could not be asked to stop (launchctl kill exited %d)", code),
+			}, fmt.Errorf("launchd: `launchctl kill TERM %s` exited %d: %s", c.target(label), code,
+				firstLine(out))
+	}
+
+	// THE RECIPIENT IS WHATEVER launchd RAN WHEN IT DELIVERED. If the process
+	// named now is not the one sampled a moment ago, the service was restarted
+	// around the request, and which of the two received it cannot be told:
+	// asking the new one could be its second SIGTERM, and assuming it was asked
+	// could leave it running unasked. So the stop ends here, saying so, and asks
+	// nothing more; so does one that cannot find out.
+	now, loaded, err := c.job(ctx, label)
+	if err != nil {
+		return lifeops.StopResult{
+			Gone:  lifeops.Unknown,
+			How:   "was asked to stop, and could not be asked about afterwards",
+			Asked: true,
+		}, fmt.Errorf("launchd: read %s after asking it to stop: %w", label, err)
+	}
+
+	watch(now)
+
+	if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+		return lifeops.StopResult{
+				Gone:  lifeops.Unknown,
+				How:   fmt.Sprintf("was restarted around the request (pid %d, then %d)", pid, now.PID),
+				Asked: true,
+			}, fmt.Errorf("launchd: %s was restarted while it was being asked to stop, so whether pid "+
+				"%d or pid %d received the SIGTERM cannot be told; billet asks nothing more. `billet "+
+				"local status` says what runs; a node that is draining exits by itself, and one "+
+				"that is not can be asked with `launchctl kill TERM %s` once %s is removed",
+				label, pid, now.PID, c.target(label), record)
+	}
+
+	return lifeops.StopResult{Asked: true}, nil
+}
+
+// awaitExit waits for pid's process to exit and reports the process launchd
+// runs for the label afterwards, zero when it runs none.
+func (c *Converger) awaitExit(
+	ctx context.Context, label string, pid int, record string, watch func(Job), watched map[int]bool,
+) (int, lifeops.StopResult, error) {
+	for c.alive(pid) {
+		if !c.sleep(ctx, stopPoll) {
+			result := lifeops.StopResult{
+				Gone: lifeops.Unknown,
+				How:  "was asked to drain and " + c.stillThere(label, watched, c.anyAlive(watched)),
+			}
+
+			if err := ctx.Err(); err != nil {
+				return 0, result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain "+
+					"(a retry resumes the wait and asks nothing again; if no drain was ever "+
+					"requested, remove %s): %w", label, record, err)
+			}
+
+			return 0, result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain; it %s",
+				label, result.How)
+		}
+	}
+
+	now, loaded, err := c.job(ctx, label)
+	if err != nil {
+		return 0, lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "could not be asked about after its process exited",
+		}, err
+	}
+
+	watch(now)
+
+	if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+		return now.PID, lifeops.StopResult{}, nil
+	}
+
+	return 0, lifeops.StopResult{}, nil
+}
+
+// incarnation names one process for its whole life: its label, pid and start.
+func (c *Converger) incarnation(ctx context.Context, label string, pid int) (string, error) {
+	started, err := c.started(ctx, pid)
+	if err != nil {
+		return "", fmt.Errorf("launchd: read when %s (pid %d) started: %w", label, pid, err)
+	}
+
+	return fmt.Sprintf("%s pid=%d started=%s", label, pid, started), nil
+}
+
+// maxDrainRestarts is how many processes one stop asks in turn before it
+// decides the service is crashing rather than draining.
+const maxDrainRestarts = 3
+
+// stopRecordLimit bounds what a stop record may hold; one line is under 200 bytes.
+const stopRecordLimit = 4 << 10
+
+// readStopRecord reads a stop record, "" when there is none.
+//
+// NEVER THROUGH A LINK, AND NEVER BLOCKING. The record lives in the account's
+// own log directory, and a symlink planted there would redirect it, a FIFO
+// would hang the read, and a link to /dev/null would make every request look
+// unrecorded. So the open follows nothing and does not block, and anything but
+// a regular file is refused.
+func readStopRecord(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("launchd: open the stop record %s: %w", path, err)
+	}
+
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("launchd: examine the stop record %s: %w", path, err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("launchd: the stop record %s is not a regular file (%s); remove it",
+			path, info.Mode().Type())
+	}
+
+	body, err := io.ReadAll(io.LimitReader(f, stopRecordLimit))
+	if err != nil {
+		return "", fmt.Errorf("launchd: read the stop record %s: %w", path, err)
+	}
+
+	return strings.TrimSpace(string(body)), nil
+}
+
+// writeStopRecord replaces a stop record atomically: a temporary file in the
+// same directory renamed over it, which replaces a link rather than writing
+// through it.
+func writeStopRecord(path, incarnation string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".stop-record-*")
+	if err != nil {
+		return fmt.Errorf("create a stop record beside %s: %w", path, err)
+	}
+
+	name := tmp.Name()
+
+	if _, err := tmp.WriteString(incarnation + "\n"); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+
+		return fmt.Errorf("write the stop record %s: %w", name, err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+
+		return fmt.Errorf("close the stop record %s: %w", name, err)
+	}
+
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
+
+		return fmt.Errorf("install the stop record %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// swVersProductVersion reads the macOS release, such as "27.0".
+func swVersProductVersion() (string, error) {
+	out, err := exec.Command("sw_vers", "-productVersion").Output() //nolint:noctx // a local read that returns at once; the plan it serves takes no context.
+	if err != nil {
+		return "", fmt.Errorf("sw_vers -productVersion: %w", err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// processStarted reads when a process started, which with its pid names one
+// process for its whole life.
+func (c *Converger) processStarted(ctx context.Context, pid int) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	// #nosec G204 -- ps is resolved from PATH and the only argument is a pid.
+	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return "", fmt.Errorf("ps -p %d: %w", pid, err)
+	}
+
+	started := strings.Join(strings.Fields(string(out)), " ")
+	if started == "" {
+		return "", fmt.Errorf("ps -p %d named no process", pid)
+	}
+
+	return started, nil
 }
 
 // anyAlive counts how many of the watched pids are still live processes.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,18 @@ type fake struct {
 	// was the first version, and which of the two arrived first decided the
 	// result -- so the test could fail for a reason it did not name.
 	onTick func(remaining int)
+
+	// terms counts the `launchctl kill TERM` requests, the stop's one SIGTERM.
+	terms int
+	// exitsOnTerm are the pids with nothing to drain: each is gone the moment
+	// its SIGTERM arrives. Any other process keeps running.
+	exitsOnTerm []int
+	// onKill runs after the fake delivers a SIGTERM, so a test can model what
+	// launchd did at that moment (a restart under a new pid).
+	onKill func()
+	// startedAt is what the fake ps answers for a pid's start, so a test can
+	// model a different process under the same pid.
+	startedAt map[int]string
 }
 
 func (f *fake) run(_ context.Context, args []string) (string, int, error) {
@@ -61,6 +74,28 @@ func (f *fake) run(_ context.Context, args []string) (string, int, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
 
 	verb := args[0]
+
+	// THE STOP'S OWN SIGTERM needs no staging: it succeeds, and a node with
+	// nothing to drain leaves at once. It must be exactly a TERM to the service,
+	// or a stop that sent KILL, or addressed something else, would pass.
+	if verb == "kill" && len(f.replies["kill"]) == 0 {
+		if strings.Join(args, " ") != "kill TERM "+nodeTarget {
+			f.t.Fatalf("the stop asked `launchctl %s`, want `launchctl kill TERM %s`",
+				strings.Join(args, " "), nodeTarget)
+		}
+
+		f.terms++
+
+		for _, pid := range f.exitsOnTerm {
+			f.alive[pid] = false
+		}
+
+		if f.onKill != nil {
+			f.onKill()
+		}
+
+		return "", 0, nil
+	}
 
 	queue := f.replies[verb]
 	if len(queue) == 0 {
@@ -83,6 +118,16 @@ func (f *fake) converger(t *testing.T) *Converger {
 	c.uid = 501
 	c.run = f.run
 	c.alive = func(pid int) bool { return f.alive[pid] }
+	c.logDir = t.TempDir()
+	// NEVER THE REAL ps: these pids are invented, and on the machine running the
+	// test they may name somebody's process.
+	c.started = func(_ context.Context, pid int) (string, error) {
+		if s, ok := f.startedAt[pid]; ok {
+			return s, nil
+		}
+
+		return fmt.Sprintf("started-%d", pid), nil
+	}
 	c.sleep = func(ctx context.Context, _ time.Duration) bool {
 		if err := ctx.Err(); err != nil {
 			return false
@@ -169,6 +214,162 @@ func TestStopAndProveWaitsForTheProcessAndNotJustTheRecord(t *testing.T) {
 	}
 }
 
+// THE DRAIN FINISHES BEFORE launchd IS ASKED ANYTHING.
+//
+// launchd SIGKILLs a job ExitTimeOut seconds after its own SIGTERM, and macOS 27
+// clamps that to 60 (measured 2026-09-29), so a bootout of a node still draining
+// killed its jobs a minute in. The stop asks through `launchctl kill` first,
+// waits however long the drain takes, and only then boots out a job with no
+// process left.
+//
+// THE DRAIN ONLY ADVANCES ONCE IT WAS ASKED FOR, and the job stays loaded until
+// the bootout, so a stop that sent its SIGTERM late, or never, waits here for a
+// process that never leaves and fails the test rather than passing it.
+func TestStopAndProveLetsTheProcessDrainBeforeTheBootout(t *testing.T) {
+	t.Parallel()
+
+	running := reply{out: printOut("state = running", "pid = 4242")}
+	f := &fake{
+		t:     t,
+		ticks: 100,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"bootout": {{}},
+			"print":   {running},
+		},
+	}
+
+	askedAt := -1
+
+	f.onTick = func(remaining int) {
+		if f.terms > 0 && askedAt < 0 {
+			askedAt = remaining
+		}
+
+		// A DRAIN LONGER THAN ANY GRACE launchd WOULD GIVE, counted from the ask.
+		if askedAt >= 0 && askedAt-remaining >= 40 {
+			f.alive[4242] = false
+		}
+	}
+
+	var aliveAtBootout []bool
+
+	f.before = func(args []string) {
+		if args[0] == "bootout" {
+			aliveAtBootout = append(aliveAtBootout, f.alive[4242])
+			f.replies["print"] = []reply{{out: "", code: notLoaded}}
+		}
+	}
+
+	got, err := f.converger(t).StopAndProve(t.Context(), "sh.billet.node")
+	if err != nil {
+		t.Fatalf("StopAndProve: %v", err)
+	}
+
+	if got.Gone != lifeops.Yes {
+		t.Errorf("Gone = %v, want yes", got.Gone)
+	}
+
+	if f.terms != 1 {
+		t.Errorf("SIGTERMs asked for = %d, want exactly one: a second one escalates the drain", f.terms)
+	}
+
+	if len(aliveAtBootout) != 1 || aliveAtBootout[0] {
+		t.Errorf("bootout ran with the process alive (%v): launchd's grace, not the drain, "+
+			"would decide when the node dies", aliveAtBootout)
+	}
+}
+
+// A STOP RETRIED AFTER ITS CALLER GAVE UP ASKS NOTHING AGAIN.
+//
+// The node's second SIGTERM escalates its drain, so a retry against the same
+// process resumes the wait. A different process under the same pid is a
+// different incarnation and is asked once, itself.
+func TestStopAndProveAsksEachProcessOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"bootout": {{}},
+			"print":   {{out: printOut("state = running", "pid = 4242")}},
+		},
+	}
+
+	c := f.converger(t)
+
+	// The first attempt runs out of patience with the drain still going.
+	if _, err := c.StopAndProve(t.Context(), "sh.billet.node"); err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if f.terms != 1 {
+		t.Fatalf("the first attempt asked %d times, want once", f.terms)
+	}
+
+	// The retry: same process, so nothing is sent again.
+	f.ticks = 3
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if f.terms != 1 {
+		t.Errorf("the retry asked the same process again (%d SIGTERMs): that escalates its drain",
+			f.terms)
+	}
+
+	if !got.Asked {
+		t.Error("a stop that had asked the process to drain reported it was not asked")
+	}
+
+	// A NEW PROCESS UNDER THE SAME PID is asked, once.
+	f.startedAt = map[int]string{4242: "a later start"}
+	f.ticks = 3
+
+	if _, err := c.StopAndProve(t.Context(), "sh.billet.node"); err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if f.terms != 2 {
+		t.Errorf("a different process under the same pid was asked %d times in all, want 2", f.terms)
+	}
+}
+
+// A REQUEST billet CANNOT RECORD IS NOT SENT, because an unrecorded ask is one a
+// retry would repeat.
+func TestStopAndProveSendsNothingItCannotRecord(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+		},
+	}
+
+	c := f.converger(t)
+	c.logDir = filepath.Join(t.TempDir(), "absent")
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a stop that could not record its request was reported done")
+	}
+
+	if f.terms != 0 {
+		t.Errorf("a request that could not be recorded was sent anyway (%d)", f.terms)
+	}
+
+	if got.Gone != lifeops.Unknown || got.Asked {
+		t.Errorf("result = %+v, want unknown and not asked", got)
+	}
+}
+
 // AND IT NEVER REPORTS A STOP WHILE A WATCHED PROCESS IS ALIVE.
 func TestStopAndProveRefusesWhileTheProcessLives(t *testing.T) {
 	t.Parallel()
@@ -213,9 +414,10 @@ func TestStopAndProveRefusesABootoutThatFailed(t *testing.T) {
 	t.Parallel()
 
 	f := &fake{
-		t:     t,
-		ticks: 4,
-		alive: map[int]bool{4242: true},
+		t:           t,
+		ticks:       4,
+		alive:       map[int]bool{4242: true},
+		exitsOnTerm: []int{4242},
 		replies: map[string][]reply{
 			"print":   {{out: printOut("state = running", "pid = 4242")}},
 			"bootout": {{out: "Boot-out failed: 1: Operation not permitted", code: 1}},
@@ -232,8 +434,20 @@ func TestStopAndProveRefusesABootoutThatFailed(t *testing.T) {
 	}
 
 	// AND IT DID NOT GO ON TO POLL, because there is nothing to wait for.
-	if n := strings.Count(strings.Join(f.calls, "|"), "print"); n != 1 {
-		t.Errorf("it polled after a failed bootout: %v", f.calls)
+	bootout := slices.IndexFunc(f.calls, func(c string) bool { return strings.HasPrefix(c, "bootout") })
+	if bootout < 0 {
+		t.Fatalf("no bootout was run: %v", f.calls)
+	}
+
+	for _, call := range f.calls[bootout+1:] {
+		if strings.HasPrefix(call, "print") {
+			t.Errorf("it polled after a failed bootout: %v", f.calls)
+		}
+	}
+
+	// AND IT SAYS THE DRAIN IT ASKED FOR, though the bootout failed after it.
+	if !got.Asked {
+		t.Error("a stop that asked the process to drain reported it untouched because the bootout failed")
 	}
 }
 
@@ -442,5 +656,209 @@ func TestEnabledNowSurfacesAFailureToAsk(t *testing.T) {
 
 	if _, err := f.converger(t).EnabledNow(t.Context(), "sh.billet.node"); err == nil {
 		t.Error("a launchctl that could not be run was read as a database with nothing in it")
+	}
+}
+
+// A PROCESS launchd STARTS DURING THE DRAIN IS ASKED IN ITS TURN, once, so the
+// bootout that follows has no process to kill under launchd's grace.
+func TestStopAndProveAsksAProcessLaunchdRestartedDuringTheDrain(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:           t,
+		ticks:       20,
+		alive:       map[int]bool{4242: true},
+		exitsOnTerm: []int{},
+		replies: map[string][]reply{
+			"bootout": {{}},
+			"print":   {{out: printOut("state = running", "pid = 4242")}},
+		},
+	}
+
+	// The first process exits non-zero after its drain and launchd starts 5353.
+	f.onTick = func(int) {
+		if f.terms == 1 && f.alive[4242] {
+			f.alive[4242] = false
+			f.alive[5353] = true
+			f.replies["print"] = []reply{{out: printOut("state = running", "pid = 5353")}}
+			f.exitsOnTerm = []int{5353}
+		}
+	}
+
+	f.before = func(args []string) {
+		if args[0] == "bootout" {
+			if f.alive[5353] {
+				t.Error("bootout ran with the restarted process alive")
+			}
+
+			f.replies["print"] = []reply{{out: "", code: notLoaded}}
+		}
+	}
+
+	got, err := f.converger(t).StopAndProve(t.Context(), "sh.billet.node")
+	if err != nil {
+		t.Fatalf("StopAndProve: %v", err)
+	}
+
+	if f.terms != 2 {
+		t.Errorf("SIGTERMs = %d, want one to each process", f.terms)
+	}
+
+	if got.Gone != lifeops.Yes || !got.Asked {
+		t.Errorf("result = %+v, want gone and asked", got)
+	}
+}
+
+// A PROCESS NAMED RIGHT AFTER THE ASK MAY BE THE ONE THAT RECEIVED IT: launchd
+// delivers to whatever it runs, and one that crashed and was restarted in
+// between had its replacement signalled. Asking that one again would be its
+// second SIGTERM.
+func TestStopAndProveNeverAsksTheProcessThatMayHaveReceivedTheAskAgain(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 6,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+		},
+	}
+
+	f.onKill = func() {
+		f.alive[4242] = false
+		f.alive[5353] = true
+		f.replies["print"] = []reply{{out: printOut("state = running", "pid = 5353")}}
+	}
+
+	// 5353 drains past the wait, so the stop ends unfinished; what matters is
+	// how many SIGTERMs it sent.
+	if _, err := f.converger(t).StopAndProve(t.Context(), "sh.billet.node"); err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if f.terms != 1 {
+		t.Errorf("SIGTERMs = %d, want 1: the process named after the ask was asked again", f.terms)
+	}
+}
+
+// A REQUEST launchctl REFUSED WAS NOT DELIVERED, so it leaves no record and a
+// retry asks again.
+func TestStopAndProveForgetsARequestThatWasNotDelivered(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+			"kill":  {{out: "Could not kill service: 1: Operation not permitted", code: 1}},
+		},
+	}
+
+	c := f.converger(t)
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a refused kill was treated as a request")
+	}
+
+	if got.Asked {
+		t.Error("a request launchctl refused was reported as asked")
+	}
+
+	if _, err := os.Lstat(filepath.Join(c.logDir, ".stop-sh.billet.node")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an undelivered request left its record (%v), so a retry would never ask", err)
+	}
+}
+
+// A RECORD THAT IS NOT A REGULAR FILE IS REFUSED, never followed.
+func TestStopAndProveRefusesARecordThatIsALink(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+		},
+	}
+
+	c := f.converger(t)
+
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, []byte("sh.billet.node pid=4242 started=started-4242\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(target, filepath.Join(c.logDir, ".stop-sh.billet.node")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a stop read its record through a link")
+	}
+
+	if f.terms != 0 || got.Gone != lifeops.Unknown {
+		t.Errorf("terms = %d, result = %+v; want nothing sent and unknown", f.terms, got)
+	}
+}
+
+// A kill THAT DID NOT FINISH MAY HAVE BEEN DELIVERED. launchctl killed by its own
+// bound answers -1 with no error, and the signal may already be on its way: the
+// record stays, the stop says it may have asked, and a retry asks nothing again.
+func TestStopAndProveKeepsTheRecordOfARequestThatDidNotFinish(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+			"kill":  {{code: -1}},
+		},
+	}
+
+	c := f.converger(t)
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a kill that did not finish was treated as delivered and proved")
+	}
+
+	if !got.Asked || got.Gone != lifeops.Unknown {
+		t.Errorf("result = %+v, want unknown and possibly asked", got)
+	}
+
+	if _, err := os.Lstat(filepath.Join(c.logDir, ".stop-sh.billet.node")); err != nil {
+		t.Fatalf("the record of a possibly delivered request was removed (%v), so a retry "+
+			"would send a second SIGTERM", err)
+	}
+
+	kills := func() int {
+		n := 0
+
+		for _, call := range f.calls {
+			if strings.HasPrefix(call, "kill") {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	before := kills()
+	f.ticks = 3
+
+	if _, err := c.StopAndProve(t.Context(), "sh.billet.node"); err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if kills() != before {
+		t.Errorf("a retry asked again after a request that may have been delivered: %v", f.calls)
 	}
 }
