@@ -497,6 +497,10 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	// prints the same failure four times.
 	reach := map[string]error{}
 
+	// Set once a group lookup could not be answered, so every later tier says
+	// its group was not probed rather than printing nothing about it.
+	groupsUndecided := false
+
 	for i := range cfg.Tiers {
 		t := &cfg.Tiers[i]
 
@@ -548,6 +552,18 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			skipped, err := checkTierRunnerGroup(ctx, cfg, t, reach)
 
 			switch {
+			// GITHUB COULD NOT ANSWER, which is not a verdict about the group:
+			// measured 2026-09-28 as `list runner groups: HTTP 503: github-launch
+			// service unavailable` failing a converge whose App had just verified.
+			// Advisory like the App probe's own UNVERIFIED, and it stops the later
+			// tiers' lookups the same way, since report.github is no longer
+			// verified.
+			case err != nil && ctx.Err() == nil && github.Undecided(err):
+				groupsUndecided = true
+				report.github = worseGitHubVerdict(report.github, githubUnverifiable)
+				fmt.Printf("           runner group UNVERIFIED: %v\n", err)
+				fmt.Printf("           (GitHub could not answer; this says nothing about the " +
+					"group, and nothing may treat it as a verdict)\n")
 			case err != nil:
 				report.github = githubFailed
 				fmt.Printf("           runner group FAILED: %v\n", err)
@@ -564,6 +580,9 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			default:
 				fmt.Printf("           runner group %q verified\n", t.RunnerGroup)
 			}
+		} else if groupsUndecided {
+			fmt.Printf("           runner group not probed: GitHub could not answer an earlier " +
+				"lookup, so nothing was asked about this tier's group\n")
 		}
 	}
 
