@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -292,7 +293,17 @@ func (c *Converger) job(ctx context.Context, label string) (Job, bool, error) {
 // on an agent that exits non-zero makes launchd START IT AGAIN — the service
 // billet was asked to stop, restarted by the stop. bootout removes it from the
 // domain, so KeepAlive has nothing left to act on.
-func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.StopResult, error) {
+func (c *Converger) StopAndProve(ctx context.Context, label string) (result lifeops.StopResult, err error) {
+	// A DRAIN THIS STOP REQUESTED IS SAID ON EVERY ANSWER, including a bootout
+	// that fails after it, or a caller would report a host it touched as untouched.
+	asked := false
+
+	defer func() {
+		if asked {
+			result.Asked = true
+		}
+	}()
+
 	before, loaded, err := c.job(ctx, label)
 	if err != nil {
 		return lifeops.StopResult{Gone: lifeops.Unknown, How: "could not be asked about"}, err
@@ -335,8 +346,11 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 	// KeepAlive{SuccessfulExit: false} does not restart, and the bootout below
 	// then has no process to kill.
 	if before.PIDKnown && before.PID > 0 {
-		if result, err := c.drainFirst(ctx, label, before.PID, watch, watched); err != nil {
-			return result, err
+		drained, err := c.drainFirst(ctx, label, before.PID, watch, watched)
+		asked = drained.Asked
+
+		if err != nil {
+			return drained, err
 		}
 	}
 
@@ -422,9 +436,9 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 }
 
 // drainFirst asks the loaded process to stop, once per process, and waits until
-// it has exited, or until launchd names a different pid for the label, which is
-// a restart after a non-zero exit: the bootout that follows stops that process
-// under launchd's own grace, the one case this order cannot cover.
+// it has exited. A process launchd starts in its place (a restart after a
+// non-zero exit) is asked in its turn, so the bootout that follows has no
+// process to kill.
 //
 // THROUGH `launchctl kill TERM <service>`, NOT kill(2) ON A PID. launchd
 // addresses the service's current process, so a pid another process reused
@@ -435,12 +449,48 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 // ONCE PER PROCESS, ACROSS CALLS. The node's second SIGTERM escalates its drain,
 // so a stop retried after a caller's deadline must resume waiting rather than
 // ask again. The request is recorded against the process's incarnation (its pid
-// and start time) BEFORE it is sent, and a record billet cannot write means
-// nothing is sent.
+// and start time) BEFORE it is sent; a record billet cannot write means nothing
+// is sent, and a request that was proved not delivered clears its record.
 func (c *Converger) drainFirst(
 	ctx context.Context, label string, pid int, watch func(Job), watched map[int]bool,
 ) (lifeops.StopResult, error) {
-	started, err := c.started(ctx, pid)
+	record := filepath.Join(c.logDir, ".stop-"+label)
+	asked := false
+
+	for {
+		result, err := c.askOnce(ctx, label, pid, record, watch)
+		asked = asked || result.Asked
+
+		if err != nil {
+			result.Asked = asked
+
+			return result, err
+		}
+
+		next, result, err := c.awaitExit(ctx, label, pid, record, watch, watched)
+		if err != nil {
+			result.Asked = asked
+
+			return result, err
+		}
+
+		if next == 0 {
+			// The processes this record names are gone, so it answers nothing now.
+			_ = os.Remove(record) //nolint:errcheck // a leftover names a pid and start time no process has.
+
+			return lifeops.StopResult{Asked: asked}, nil
+		}
+
+		pid = next
+	}
+}
+
+// askOnce sends pid's process its one SIGTERM, unless the record says it was
+// already asked.
+func (c *Converger) askOnce(
+	ctx context.Context, label string, pid int, record string, watch func(Job),
+) (lifeops.StopResult, error) {
+	incarnation, err := c.incarnation(ctx, label, pid)
 	if err != nil {
 		if !c.alive(pid) {
 			return lifeops.StopResult{}, nil
@@ -449,76 +499,202 @@ func (c *Converger) drainFirst(
 		return lifeops.StopResult{
 			Gone: lifeops.Unknown,
 			How:  fmt.Sprintf("could not be identified to ask it to stop (pid %d)", pid),
-		}, fmt.Errorf("launchd: read when %s (pid %d) started: %w", label, pid, err)
+		}, err
 	}
 
-	incarnation := fmt.Sprintf("%s pid=%d started=%s", label, pid, started)
-	record := filepath.Join(c.logDir, ".stop-"+label)
-
-	prior, err := os.ReadFile(record) //nolint:gosec // the path is billet's own log directory and a fixed name.
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	prior, err := readStopRecord(record)
+	if err != nil {
 		return lifeops.StopResult{
 			Gone: lifeops.Unknown,
 			How:  "could not read whether it was already asked to stop",
-		}, fmt.Errorf("launchd: read %s: %w", record, err)
+		}, err
 	}
 
-	if strings.TrimSpace(string(prior)) != incarnation {
-		if err := os.WriteFile(record, []byte(incarnation+"\n"), 0o600); err != nil {
-			return lifeops.StopResult{
-				Gone: lifeops.Unknown,
-				How:  "was not asked to stop, because the request could not be recorded",
-			}, fmt.Errorf("launchd: record the stop of %s before asking: %w", label, err)
-		}
-
-		out, code, err := c.run(ctx, []string{"kill", "TERM", c.target(label)})
-		if err != nil || (code != 0 && c.alive(pid)) {
-			return lifeops.StopResult{
-					Gone:  lifeops.Unknown,
-					How:   fmt.Sprintf("could not be asked to stop (launchctl kill exited %d)", code),
-					Asked: true,
-				}, fmt.Errorf("launchd: `launchctl kill TERM %s` exited %d: %s %w",
-					c.target(label), code, firstLine(out), err)
-		}
+	if prior == incarnation {
+		return lifeops.StopResult{Asked: true}, nil
 	}
 
-	for c.alive(pid) {
-		now, loaded, err := c.job(ctx, label)
-		if err != nil {
-			return lifeops.StopResult{
+	if err := writeStopRecord(record, incarnation); err != nil {
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "was not asked to stop, because the request could not be recorded",
+		}, fmt.Errorf("launchd: record the stop of %s before asking: %w", label, err)
+	}
+
+	out, code, err := c.run(ctx, []string{"kill", "TERM", c.target(label)})
+
+	switch {
+	case err != nil && ctx.Err() == nil:
+		// launchctl could not be run at all: nothing was delivered.
+		_ = os.Remove(record) //nolint:errcheck // an unsent request's record; a leftover only suppresses a re-ask of this one process.
+
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "could not be asked to stop (launchctl could not be run)",
+		}, fmt.Errorf("launchd: `launchctl kill TERM %s`: %w", c.target(label), err)
+
+	case err != nil:
+		// CUT SHORT BY THE CALLER: it may or may not have been delivered, and the
+		// record stays, because a second SIGTERM would escalate a drain that did
+		// begin.
+		return lifeops.StopResult{
 				Gone:  lifeops.Unknown,
-				How:   "could not be asked about while it drained",
+				How:   "may have been asked to stop; the request was cut short",
 				Asked: true,
-			}, err
-		}
+			}, fmt.Errorf("launchd: `launchctl kill TERM %s` was cut short, so whether it was "+
+				"delivered is unknown; a retry waits and asks nothing again (if nothing was "+
+				"asked, remove %s): %w", c.target(label), record, err)
 
+	case code != 0 && c.alive(pid):
+		_ = os.Remove(record) //nolint:errcheck // an undelivered request's record; a leftover only suppresses a re-ask of this one process.
+
+		return lifeops.StopResult{
+				Gone: lifeops.Unknown,
+				How:  fmt.Sprintf("could not be asked to stop (launchctl kill exited %d)", code),
+			}, fmt.Errorf("launchd: `launchctl kill TERM %s` exited %d: %s", c.target(label), code,
+				firstLine(out))
+	}
+
+	// THE RECIPIENT IS WHATEVER launchd RAN WHEN IT DELIVERED, which is not
+	// necessarily the process sampled a moment ago: one that crashed and was
+	// restarted in between had its replacement signalled. So a different process
+	// named now is recorded as asked, because asking it again would be its
+	// second SIGTERM.
+	now, loaded, err := c.job(ctx, label)
+	if err == nil {
 		watch(now)
+	}
 
-		if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
-			return lifeops.StopResult{Asked: true}, nil
+	if err == nil && loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+		if next, err := c.incarnation(ctx, label, now.PID); err == nil {
+			_ = writeStopRecord(record, next) //nolint:errcheck // a record not rewritten re-asks this process once more, the lesser harm.
 		}
+	}
 
+	return lifeops.StopResult{Asked: true}, nil
+}
+
+// awaitExit waits for pid's process to exit and reports the process launchd
+// runs for the label afterwards, zero when it runs none.
+func (c *Converger) awaitExit(
+	ctx context.Context, label string, pid int, record string, watch func(Job), watched map[int]bool,
+) (int, lifeops.StopResult, error) {
+	for c.alive(pid) {
 		if !c.sleep(ctx, stopPoll) {
 			result := lifeops.StopResult{
-				Gone:  lifeops.Unknown,
-				How:   "was asked to drain and " + c.stillThere(label, watched, c.anyAlive(watched)),
-				Asked: true,
+				Gone: lifeops.Unknown,
+				How:  "was asked to drain and " + c.stillThere(label, watched, c.anyAlive(watched)),
 			}
 
 			if err := ctx.Err(); err != nil {
-				return result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain "+
-					"(a retry resumes the wait and asks nothing again): %w", label, err)
+				return 0, result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain "+
+					"(a retry resumes the wait and asks nothing again; if no drain was ever "+
+					"requested, remove %s): %w", label, record, err)
 			}
 
-			return result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain; it %s",
+			return 0, result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain; it %s",
 				label, result.How)
 		}
 	}
 
-	// The process this record names is gone, so the record answers nothing now.
-	_ = os.Remove(record) //nolint:errcheck // a leftover names a pid and start time no process has.
+	now, loaded, err := c.job(ctx, label)
+	if err != nil {
+		return 0, lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  "could not be asked about after its process exited",
+		}, err
+	}
 
-	return lifeops.StopResult{Asked: true}, nil
+	watch(now)
+
+	if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+		return now.PID, lifeops.StopResult{}, nil
+	}
+
+	return 0, lifeops.StopResult{}, nil
+}
+
+// incarnation names one process for its whole life: its label, pid and start.
+func (c *Converger) incarnation(ctx context.Context, label string, pid int) (string, error) {
+	started, err := c.started(ctx, pid)
+	if err != nil {
+		return "", fmt.Errorf("launchd: read when %s (pid %d) started: %w", label, pid, err)
+	}
+
+	return fmt.Sprintf("%s pid=%d started=%s", label, pid, started), nil
+}
+
+// stopRecordLimit bounds what a stop record may hold; one line is under 200 bytes.
+const stopRecordLimit = 4 << 10
+
+// readStopRecord reads a stop record, "" when there is none.
+//
+// NEVER THROUGH A LINK, AND NEVER BLOCKING. The record lives in the account's
+// own log directory, and a symlink planted there would redirect it, a FIFO
+// would hang the read, and a link to /dev/null would make every request look
+// unrecorded. So the open follows nothing and does not block, and anything but
+// a regular file is refused.
+func readStopRecord(path string) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) //nolint:gosec // the path is billet's own log directory and a fixed name.
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("launchd: open the stop record %s: %w", path, err)
+	}
+
+	defer f.Close() //nolint:errcheck // read-only; nothing to flush.
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("launchd: examine the stop record %s: %w", path, err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("launchd: the stop record %s is not a regular file (%s); remove it",
+			path, info.Mode().Type())
+	}
+
+	body, err := io.ReadAll(io.LimitReader(f, stopRecordLimit))
+	if err != nil {
+		return "", fmt.Errorf("launchd: read the stop record %s: %w", path, err)
+	}
+
+	return strings.TrimSpace(string(body)), nil
+}
+
+// writeStopRecord replaces a stop record atomically: a temporary file in the
+// same directory renamed over it, which replaces a link rather than writing
+// through it.
+func writeStopRecord(path, incarnation string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".stop-record-*")
+	if err != nil {
+		return fmt.Errorf("create a stop record beside %s: %w", path, err)
+	}
+
+	name := tmp.Name()
+
+	if _, err := tmp.WriteString(incarnation + "\n"); err != nil {
+		_ = tmp.Close()     //nolint:errcheck // abandoning it.
+		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+
+		return fmt.Errorf("write the stop record %s: %w", name, err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+
+		return fmt.Errorf("close the stop record %s: %w", name, err)
+	}
+
+	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name) //nolint:errcheck // abandoning it.
+
+		return fmt.Errorf("install the stop record %s: %w", path, err)
+	}
+
+	return nil
 }
 
 // swVersProductVersion reads the macOS release, such as "27.0".
