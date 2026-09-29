@@ -456,6 +456,7 @@ func (c *Converger) drainFirst(
 ) (lifeops.StopResult, error) {
 	record := filepath.Join(c.logDir, ".stop-"+label)
 	asked := false
+	seen := []int{pid}
 
 	for {
 		result, err := c.askOnce(ctx, label, pid, record, watch)
@@ -479,6 +480,19 @@ func (c *Converger) drainFirst(
 			_ = os.Remove(record) //nolint:errcheck // a leftover names a pid and start time no process has.
 
 			return lifeops.StopResult{Asked: asked}, nil
+		}
+
+		// A SERVICE THAT KEEPS RESTARTING is crashing, not draining, and chasing
+		// it would never end under a caller with no deadline.
+		seen = append(seen, next)
+		if len(seen) > maxDrainRestarts {
+			return lifeops.StopResult{
+					Gone:  lifeops.Unknown,
+					How:   fmt.Sprintf("kept being restarted while it was stopped (pids %v)", seen),
+					Asked: asked,
+				}, fmt.Errorf("launchd: %s was restarted %d times while it was being stopped "+
+					"(pids %v); it is crashing rather than draining, and billet stops asking. Read "+
+					"%s for why", label, len(seen)-1, seen, filepath.Join(c.logDir, "node.log"))
 		}
 
 		pid = next
@@ -524,28 +538,20 @@ func (c *Converger) askOnce(
 	out, code, err := c.run(ctx, []string{"kill", "TERM", c.target(label)})
 
 	switch {
-	case err != nil && ctx.Err() == nil:
-		// launchctl could not be run at all: nothing was delivered.
-		_ = os.Remove(record) //nolint:errcheck // an unsent request's record; a leftover only suppresses a re-ask of this one process.
-
-		return lifeops.StopResult{
-			Gone: lifeops.Unknown,
-			How:  "could not be asked to stop (launchctl could not be run)",
-		}, fmt.Errorf("launchd: `launchctl kill TERM %s`: %w", c.target(label), err)
-
-	case err != nil:
-		// CUT SHORT BY THE CALLER: it may or may not have been delivered, and the
-		// record stays, because a second SIGTERM would escalate a drain that did
-		// begin.
+	case err != nil || code < 0:
+		// NOT A PROVED REFUSAL: launchctl was cut short, killed, or could not
+		// be waited on, and it may have delivered the signal first. The record
+		// stays, because a second SIGTERM would escalate a drain that did begin.
 		return lifeops.StopResult{
 				Gone:  lifeops.Unknown,
-				How:   "may have been asked to stop; the request was cut short",
+				How:   "may have been asked to stop; the request did not finish",
 				Asked: true,
-			}, fmt.Errorf("launchd: `launchctl kill TERM %s` was cut short, so whether it was "+
-				"delivered is unknown; a retry waits and asks nothing again (if nothing was "+
-				"asked, remove %s): %w", c.target(label), record, err)
+			}, fmt.Errorf("launchd: `launchctl kill TERM %s` did not finish (exit %d), so whether it "+
+				"was delivered is unknown; a retry waits and asks nothing again (if nothing was "+
+				"asked, remove %s): %v", c.target(label), code, record, err)
 
 	case code != 0 && c.alive(pid):
+		// A PROVED REFUSAL: launchctl answered, and the process is still there.
 		_ = os.Remove(record) //nolint:errcheck // an undelivered request's record; a leftover only suppresses a re-ask of this one process.
 
 		return lifeops.StopResult{
@@ -555,20 +561,33 @@ func (c *Converger) askOnce(
 				firstLine(out))
 	}
 
-	// THE RECIPIENT IS WHATEVER launchd RAN WHEN IT DELIVERED, which is not
-	// necessarily the process sampled a moment ago: one that crashed and was
-	// restarted in between had its replacement signalled. So a different process
-	// named now is recorded as asked, because asking it again would be its
-	// second SIGTERM.
+	// THE RECIPIENT IS WHATEVER launchd RAN WHEN IT DELIVERED. If the process
+	// named now is not the one sampled a moment ago, the service was restarted
+	// around the request, and which of the two received it cannot be told:
+	// asking the new one could be its second SIGTERM, and assuming it was asked
+	// could leave it running unasked. So the stop ends here, saying so, and asks
+	// nothing more; so does one that cannot find out.
 	now, loaded, err := c.job(ctx, label)
-	if err == nil {
-		watch(now)
+	if err != nil {
+		return lifeops.StopResult{
+			Gone:  lifeops.Unknown,
+			How:   "was asked to stop, and could not be asked about afterwards",
+			Asked: true,
+		}, fmt.Errorf("launchd: read %s after asking it to stop: %w", label, err)
 	}
 
-	if err == nil && loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
-		if next, err := c.incarnation(ctx, label, now.PID); err == nil {
-			_ = writeStopRecord(record, next) //nolint:errcheck // a record not rewritten re-asks this process once more, the lesser harm.
-		}
+	watch(now)
+
+	if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+		return lifeops.StopResult{
+				Gone:  lifeops.Unknown,
+				How:   fmt.Sprintf("was restarted around the request (pid %d, then %d)", pid, now.PID),
+				Asked: true,
+			}, fmt.Errorf("launchd: %s was restarted while it was being asked to stop, so whether pid "+
+				"%d or pid %d received the SIGTERM cannot be told; billet asks nothing more. `billet "+
+				"local status` says what runs; a node that is draining exits by itself, and one "+
+				"that is not can be asked with `launchctl kill TERM %s` once %s is removed",
+				label, pid, now.PID, c.target(label), record)
 	}
 
 	return lifeops.StopResult{Asked: true}, nil
@@ -623,6 +642,10 @@ func (c *Converger) incarnation(ctx context.Context, label string, pid int) (str
 
 	return fmt.Sprintf("%s pid=%d started=%s", label, pid, started), nil
 }
+
+// maxDrainRestarts is how many processes one stop asks in turn before it
+// decides the service is crashing rather than draining.
+const maxDrainRestarts = 3
 
 // stopRecordLimit bounds what a stop record may hold; one line is under 200 bytes.
 const stopRecordLimit = 4 << 10

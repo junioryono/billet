@@ -806,3 +806,59 @@ func TestStopAndProveRefusesARecordThatIsALink(t *testing.T) {
 		t.Errorf("terms = %d, result = %+v; want nothing sent and unknown", f.terms, got)
 	}
 }
+
+// A kill THAT DID NOT FINISH MAY HAVE BEEN DELIVERED. launchctl killed by its own
+// bound answers -1 with no error, and the signal may already be on its way: the
+// record stays, the stop says it may have asked, and a retry asks nothing again.
+func TestStopAndProveKeepsTheRecordOfARequestThatDidNotFinish(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 3,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"print": {{out: printOut("state = running", "pid = 4242")}},
+			"kill":  {{code: -1}},
+		},
+	}
+
+	c := f.converger(t)
+
+	got, err := c.StopAndProve(t.Context(), "sh.billet.node")
+	if err == nil {
+		t.Fatal("a kill that did not finish was treated as delivered and proved")
+	}
+
+	if !got.Asked || got.Gone != lifeops.Unknown {
+		t.Errorf("result = %+v, want unknown and possibly asked", got)
+	}
+
+	if _, err := os.Lstat(filepath.Join(c.logDir, ".stop-sh.billet.node")); err != nil {
+		t.Fatalf("the record of a possibly delivered request was removed (%v), so a retry "+
+			"would send a second SIGTERM", err)
+	}
+
+	kills := func() int {
+		n := 0
+
+		for _, call := range f.calls {
+			if strings.HasPrefix(call, "kill") {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	before := kills()
+	f.ticks = 3
+
+	if _, err := c.StopAndProve(t.Context(), "sh.billet.node"); err == nil {
+		t.Fatal("a stop whose drain never ended was reported done")
+	}
+
+	if kills() != before {
+		t.Errorf("a retry asked again after a request that may have been delivered: %v", f.calls)
+	}
+}
