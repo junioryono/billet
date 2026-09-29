@@ -262,6 +262,73 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		}
 	})
 
+	// THE APP VERIFIED AND ONLY THE GROUP LOOKUP COULD NOT BE ANSWERED: GitHub
+	// failed `list runner groups` with a 503 while the installation probe
+	// before it succeeded (measured 2026-09-28, a converge's `billet check`).
+	// That is could-not-tell, so it is UNVERIFIED and the check passes; a
+	// refusing 403 on the same call is GitHub's answer and still fails.
+	for _, c := range []struct {
+		name   string
+		status int
+		body   string
+		fails  bool
+	}{
+		{"a 503 on the group lookup stays advisory", http.StatusServiceUnavailable, `github-launch service unavailable`, false},
+		{"a refusing 403 on the group lookup fails", http.StatusForbidden, `{"message":"Resource not accessible by integration"}`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfgPath := writeCheckConfig(t)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+					w.WriteHeader(http.StatusCreated)
+					_, _ = fmt.Fprintf(w, `{"token":"stub","expires_at":%q}`,
+						time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+				case strings.HasSuffix(r.URL.Path, "/actions/runner-groups"):
+					w.WriteHeader(c.status)
+					_, _ = fmt.Fprint(w, c.body)
+				default:
+					_, _ = fmt.Fprint(w, `{"id": 42, "permissions": {
+						"metadata": "read", "organization_self_hosted_runners": "write"}}`)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			prev := githubAPIBase
+			githubAPIBase = srv.URL
+			t.Cleanup(func() { githubAPIBase = prev })
+
+			var checkErr error
+			out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+
+			if !strings.Contains(out, "github   verified") {
+				t.Fatalf("the App probe did not verify, so this case proves nothing:\n%s", out)
+			}
+
+			if c.fails {
+				if checkErr == nil {
+					t.Fatalf("GitHub refusing the group lookup passed the check:\n%s", out)
+				}
+				if !strings.Contains(out, "runner group FAILED") {
+					t.Errorf("the refusal is not reported as a failed group:\n%s", out)
+				}
+
+				return
+			}
+
+			if checkErr != nil {
+				t.Fatalf("GitHub failing to answer the group lookup failed the check: %v\n%s", checkErr, out)
+			}
+			if strings.Contains(out, "runner group FAILED") {
+				t.Errorf("a group verdict was reported when GitHub could not answer:\n%s", out)
+			}
+			if !strings.Contains(out, "runner group UNVERIFIED") {
+				t.Errorf("the undecided lookup is not reported as UNVERIFIED:\n%s", out)
+			}
+		})
+	}
+
 	t.Run("an unreachable GitHub stays advisory", func(t *testing.T) {
 		cfgPath := writeCheckConfig(t)
 		stubGitHubUnverifiable(t)
