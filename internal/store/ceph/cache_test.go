@@ -2165,14 +2165,16 @@ func TestCloningRefreshesTheCurrentPointersLastUse(t *testing.T) {
 	}
 }
 
-// THE PURGE DELETES WHAT DISCARDS MOVED TO THE TRASH, AND NOTHING ELSE.
+// THE PURGE DELETES THE ROOT DISKS DISCARDS MOVED TO THE TRASH, AND NOTHING ELSE.
 //
-// A root clone and a discarded cache volume are billet's; another name in the
-// trash is somebody else's and is left alone. A parent a copy-on-write child
-// still reads answers ENOTEMPTY and waits for a later purge. Each deletion runs
-// under the purge's own bound, because a large image takes minutes and the
-// command bound is what left removals half-done.
-func TestPurgeTrashDeletesBilletsDiscardsUnderItsOwnBound(t *testing.T) {
+// A per-job root clone is billet-<lease>. The cache's own retired volumes and
+// generations are eviction's to purge under the cache lock, and a name that is
+// not billet's is somebody else's. A parent a copy-on-write child still reads
+// answers ENOTEMPTY and waits; one image that fails for another reason is
+// reported without stopping the rest. Each deletion runs under a bound of about
+// thirty minutes rather than the fifteen-second command bound that left
+// removals half-done.
+func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 	t.Parallel()
 
 	f := newCacheFake()
@@ -2187,6 +2189,10 @@ func TestPurgeTrashDeletesBilletsDiscardsUnderItsOwnBound(t *testing.T) {
 			} else {
 				bounds = append(bounds, time.Until(deadline))
 			}
+
+			if slices.Contains(args, "billet-cache/id-0refused") {
+				return nil, errors.New("exit status 1: rbd: error: (5) Input/output error")
+			}
 		}
 
 		return f.run(ctx, bin, args)
@@ -2197,33 +2203,37 @@ func TestPurgeTrashDeletesBilletsDiscardsUnderItsOwnBound(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	f.trash["id-root"] = "billet-624131f5"
-	f.trash["id-cache"] = "cache-v-1790048184-abc"
-	f.trash["id-parent"] = "cache-v-parent"
-	f.trash["id-other"] = "somebody-elses-image"
-	f.parents["billet-cache/child"] = "billet-cache/cache-v-parent@g1"
+	// The fake lists the trash sorted by id, so the refused image comes first and
+	// the ones after it are what a pass that stopped at it would never reach.
+	f.trash["id-0refused"] = "billet-0refused"
+	f.trash["id-b-root"] = "billet-624131f5"
+	f.trash["id-c-parent"] = "billet-parent"
+	f.trash["id-d-cache"] = "cache-v-1790048184-abc"
+	f.trash["id-e-other"] = "somebody-elses-image"
+	f.parents["billet-cache/child"] = "billet-cache/billet-parent@g1"
 
 	n, err := c.PurgeTrash(t.Context())
-	if err != nil {
-		t.Fatalf("PurgeTrash: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "billet-0refused") {
+		t.Errorf("the refused image was not reported: %v", err)
 	}
 
-	if n != 2 {
-		t.Errorf("purged %d, want the root clone and the cache volume", n)
+	if n != 1 {
+		t.Errorf("purged %d, want the one root disk that could be deleted", n)
 	}
 
-	for _, gone := range []string{"id-root", "id-cache"} {
-		if _, ok := f.trash[gone]; ok {
-			t.Errorf("%s is still in the trash", gone)
+	if _, ok := f.trash["id-b-root"]; ok {
+		t.Error("a root disk behind a refused one was never reached")
+	}
+
+	for id, why := range map[string]string{
+		"id-c-parent": "a parent a child still reads",
+		"id-d-cache":  "a cache volume, which is eviction's to purge",
+		"id-e-other":  "an image that is not billet's",
+		"id-0refused": "the refused image",
+	} {
+		if _, ok := f.trash[id]; !ok {
+			t.Errorf("%s was deleted from the trash", why)
 		}
-	}
-
-	if _, ok := f.trash["id-parent"]; !ok {
-		t.Error("a parent a child still reads was deleted")
-	}
-
-	if _, ok := f.trash["id-other"]; !ok {
-		t.Error("an image that is not billet's was deleted from the trash")
 	}
 
 	if len(bounds) == 0 {
@@ -2231,8 +2241,8 @@ func TestPurgeTrashDeletesBilletsDiscardsUnderItsOwnBound(t *testing.T) {
 	}
 
 	for _, b := range bounds {
-		if b < PurgeTimeout-time.Minute {
-			t.Errorf("a trash removal ran under %s, not the purge's %s", b, PurgeTimeout)
+		if b < 29*time.Minute || b > 31*time.Minute {
+			t.Errorf("a trash removal ran under %s, want about thirty minutes", b)
 		}
 	}
 }

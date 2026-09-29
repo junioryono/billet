@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -3137,68 +3136,63 @@ func TestARegistrationRemovalTheLedgerRefusesIsRetriedBeforeCompute(t *testing.T
 	}
 }
 
-// purgingProvider defers deletions to a purge, which it holds open until released.
+// purgingProvider defers deletions to a purge and counts the purges it ran.
 type purgingProvider struct {
 	*fakeProvider
 
-	started chan struct{}
-	release chan struct{}
-	calls   atomic.Int32
+	calls atomic.Int32
 }
 
 func (p *purgingProvider) PurgeDiscarded(context.Context) (int, error) {
 	p.calls.Add(1)
-	p.started <- struct{}{}
-	<-p.release
 
 	return 1, nil
 }
 
-// A SWEEP STARTS THE PURGE AND DOES NOT WAIT FOR IT, AND NEVER STARTS TWO.
+// A SWEEP HANDS THE PURGE TO THE BACKGROUND AND NEVER STARTS TWO.
 //
 // Deleting a large root disk takes minutes and the sweep holds the node's one
-// command slot, so the purge runs beside it; a sweep that finds one still
-// running starts no second.
-func TestSweepStartsOnePurgeOfDiscardedStorageAndDoesNotWaitForIt(t *testing.T) {
+// command slot, so the purge is handed off rather than run; a sweep that finds
+// one still pending hands off no second. The hand-off is captured here, so
+// whether a second one was started is a fact rather than a race with a goroutine.
+func TestSweepHandsOffOnePurgeOfDiscardedStorage(t *testing.T) {
 	t.Parallel()
 
-	p := &purgingProvider{
-		fakeProvider: &fakeProvider{kind: config.ProviderFirecracker},
-		started:      make(chan struct{}, 4),
-		release:      make(chan struct{}),
-	}
+	p := &purgingProvider{fakeProvider: &fakeProvider{kind: config.ProviderFirecracker}}
 
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	// The first sweep returns while its purge is still held open.
+	var pending []func()
+
+	r.spawn = func(f func()) { pending = append(pending, f) }
+
+	for range 2 {
+		if err := r.Sweep(t.Context()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+	}
+
+	if len(pending) != 1 {
+		t.Fatalf("two sweeps handed off %d purges while the first was pending, want 1", len(pending))
+	}
+
+	if p.calls.Load() != 0 {
+		t.Fatal("the sweep ran the purge itself instead of handing it off")
+	}
+
+	pending[0]()
+
+	if p.calls.Load() != 1 {
+		t.Fatalf("the handed-off purge did not run: %d", p.calls.Load())
+	}
+
+	// Finished, so the next sweep hands off another.
 	if err := r.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 
-	<-p.started
-
-	if err := r.Sweep(t.Context()); err != nil {
-		t.Fatalf("second Sweep: %v", err)
-	}
-
-	if got := p.calls.Load(); got != 1 {
-		t.Fatalf("a sweep started a second purge while one ran: %d", got)
-	}
-
-	close(p.release)
-
-	for r.purging.Load() {
-		runtime.Gosched()
-	}
-
-	if err := r.Sweep(t.Context()); err != nil {
-		t.Fatalf("third Sweep: %v", err)
-	}
-
-	<-p.started
-
-	if got := p.calls.Load(); got != 2 {
-		t.Errorf("a sweep after the purge finished did not start another: %d", got)
+	if len(pending) != 2 {
+		t.Errorf("a sweep after the purge finished handed off %d in all, want 2", len(pending))
 	}
 }

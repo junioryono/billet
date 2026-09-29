@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -454,9 +455,11 @@ func TestADiscardMovesTheCloneToTheTrashAndNeverRemovesIt(t *testing.T) {
 
 	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 
+	// NEITHER DELETION: `rbd rm`, nor `rbd trash rm`, which deletes the same data.
 	for _, call := range f.calls {
-		if subcommandOf(call) == "rm" {
-			t.Errorf("a discard ran `rbd rm`, which deletes the data on the command path: %v", call)
+		sub := subcommandOf(call)
+		if sub == "rm" || (sub == "trash" && slices.Contains(call, "rm")) {
+			t.Errorf("a discard deleted the data on the command path: %v", call)
 		}
 	}
 }

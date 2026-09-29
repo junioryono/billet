@@ -120,6 +120,9 @@ type Runner struct {
 	// purging is set while a background purge of discarded storage runs, so a
 	// sweep starts at most one.
 	purging atomic.Bool
+	// spawn runs the purge in the background; a seam so a test controls when it
+	// runs instead of racing a goroutine. Nil is `go`.
+	spawn func(func())
 
 	jit             JITSource
 	provider        provider.Provider
@@ -1372,7 +1375,12 @@ func (r *Runner) purgeDiscarded(ctx context.Context) {
 		return
 	}
 
-	go func() {
+	spawn := r.spawn
+	if spawn == nil {
+		spawn = func(f func()) { go f() }
+	}
+
+	spawn(func() {
 		defer r.purging.Store(false)
 
 		n, err := purger.PurgeDiscarded(context.WithoutCancel(ctx))
@@ -1386,7 +1394,7 @@ func (r *Runner) purgeDiscarded(ctx context.Context) {
 		if n > 0 {
 			r.log.Info("deleted storage discarded by earlier destroys", "deleted", n)
 		}
-	}()
+	})
 }
 
 // Sweep destroys instances whose lease is no longer open on this node.

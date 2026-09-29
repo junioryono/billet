@@ -1094,12 +1094,9 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	return nil
 }
 
-// removeCacheImage takes a discarded cache volume out of use through the trash,
-// for removeClone's reason: a remove killed by the command's bound leaves the
-// volume half-deleted and the discard failing on every retry.
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
-		return fmt.Errorf("ceph: move cache volume %s to the trash: %w", handle, err)
+	if _, err := c.rbdCmd(ctx, false, "rm", handle); err != nil && !isNoSuchFile(err) {
+		return fmt.Errorf("ceph: remove cache volume %s: %w", handle, err)
 	}
 
 	return nil
@@ -1110,12 +1107,16 @@ func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 // this is a bound on how long one call holds, not on how large an image can be.
 const PurgeTimeout = 30 * time.Minute
 
-// PurgeTrash deletes the per-job root disks and discarded cache volumes this
-// client moved to the cache pool's trash, and reports how many it deleted.
+// PurgeTrash deletes the per-job root disks DiscardRoot moved to the cache
+// pool's trash, and reports how many it deleted.
 //
 // OFF THE COMMAND PATH and under its own bound, because deleting a large image's
-// objects takes minutes. An image a copy-on-write child still reads (ENOTEMPTY)
-// is left for a later purge; one already gone counts as done.
+// objects takes minutes. ROOT DISKS ONLY: the cache's own retired volumes and
+// generations are purged by eviction under the cache lock, and a name that is
+// not billet's is never touched. An image a copy-on-write child still reads
+// (ENOTEMPTY) is left for a later purge, one already gone counts as done, and
+// one that fails for any other reason does not stop the rest: each failure is
+// reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
 	if err != nil {
@@ -1129,31 +1130,41 @@ func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 
 	purged := 0
 
+	var failures []error
+
 	for _, image := range images {
-		if !strings.HasPrefix(image.Name, "billet-") && !strings.HasPrefix(image.Name, "cache-v-") {
+		if !strings.HasPrefix(image.Name, "billet-") {
 			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return purged, errors.Join(append(failures, err)...)
 		}
 
 		if image.ID == "" || strings.ContainsAny(image.ID, "/@") ||
 			strings.HasPrefix(image.ID, "-") || strings.TrimSpace(image.ID) != image.ID {
-			return purged, errors.New("ceph: the cache trash contains an unusable image identity")
+			failures = append(failures, fmt.Errorf("ceph: the trash holds %s under an unusable "+
+				"identity %q", image.Name, image.ID))
+
+			continue
 		}
 
 		handle := c.cfg.CachePool + "/" + image.ID
 
 		if _, err := c.rbdCmdWithin(ctx, PurgeTimeout, false, "trash", "rm", handle); err != nil &&
 			!isNoSuchFile(err) {
-			if isImageNotEmpty(err) {
-				continue
+			if !isImageNotEmpty(err) {
+				failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
+					image.Name, handle, err))
 			}
 
-			return purged, fmt.Errorf("ceph: delete %s (%s) from the trash: %w", image.Name, handle, err)
+			continue
 		}
 
 		purged++
 	}
 
-	return purged, nil
+	return purged, errors.Join(failures...)
 }
 
 func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
