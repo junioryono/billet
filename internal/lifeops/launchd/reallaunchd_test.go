@@ -50,7 +50,9 @@ func realLaunchd(t *testing.T) (*Converger, string) {
 		t.Skip("launchctl is not the macOS service manager")
 	}
 
-	c := New(WithAgentsDir(t.TempDir()))
+	// Its own log directory: a stop records its request there, and billet's real
+	// one belongs to the agents running on this Mac.
+	c := New(WithAgentsDir(t.TempDir()), WithLogDir(t.TempDir()))
 
 	// LEFTOVERS ARE REPORTED, not discarded. These run against a real launchd on
 	// somebody's own Mac, and a cleanup that quietly failed would leave an agent
