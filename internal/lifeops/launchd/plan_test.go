@@ -135,8 +135,29 @@ func TestLoadedRefusalsCatchesADefinitionThatDrifted(t *testing.T) {
 			"proves nothing", want.ExitTimeout)
 	}
 
-	if got := c.loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) != 0 {
-		t.Fatalf("a job launchd loaded at its %ds ceiling was refused: %v", exitTimeoutCeiling, got)
+	onRelease := func(v string, err error) *Converger {
+		return &Converger{productVersion: func() (string, error) { return v, err }}
+	}
+
+	if got := onRelease("27.0", nil).loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) != 0 {
+		t.Fatalf("a job macOS 27 loaded at its %ds ceiling was refused: %v", exitTimeoutCeiling, got)
+	}
+
+	// BUT ONLY WHERE launchd CLAMPS. On an earlier release, and on one whose
+	// version could not be read, a loaded 60 is a stale bootstrap: launchd would
+	// SIGKILL a drain it started a minute in, and nothing forced the value.
+	for _, r := range []struct {
+		name string
+		v    string
+		err  error
+	}{
+		{"macOS 26", "26.3", nil},
+		{"an unreadable release", "", errors.New("sw_vers: no such file")},
+	} {
+		if got := onRelease(r.v, r.err).loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) == 0 {
+			t.Errorf("on %s a job loaded at %ds was accepted, though nothing clamps it there",
+				r.name, exitTimeoutCeiling)
+		}
 	}
 
 	drift := func(f func(*Job)) Job {
