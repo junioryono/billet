@@ -3135,3 +3135,80 @@ func TestARegistrationRemovalTheLedgerRefusesIsRetriedBeforeCompute(t *testing.T
 		t.Fatalf("recovered order: removals %v destroys %v", restartedJIT.ensureCalls, p.destroyed)
 	}
 }
+
+// purgingProvider defers deletions to a purge and counts the purges it ran.
+type purgingProvider struct {
+	*fakeProvider
+
+	calls atomic.Int32
+	// inherited records whether a purge ran under a context that was cancelled
+	// or carried a deadline, which would be the sweep's.
+	inherited atomic.Bool
+}
+
+func (p *purgingProvider) PurgeDiscarded(ctx context.Context) (int, error) {
+	p.calls.Add(1)
+
+	if _, has := ctx.Deadline(); has || ctx.Err() != nil {
+		p.inherited.Store(true)
+	}
+
+	return 1, nil
+}
+
+// A SWEEP HANDS THE PURGE TO THE BACKGROUND AND NEVER STARTS TWO.
+//
+// Deleting a large root disk takes minutes and the sweep holds the node's one
+// command slot, so the purge is handed off rather than run; a sweep that finds
+// one still pending hands off no second. The hand-off is captured here, so
+// whether a second one was started is a fact rather than a race with a goroutine.
+func TestSweepHandsOffOnePurgeOfDiscardedStorage(t *testing.T) {
+	t.Parallel()
+
+	p := &purgingProvider{fakeProvider: &fakeProvider{kind: config.ProviderFirecracker}}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	var pending []func()
+
+	r.spawn = func(f func()) { pending = append(pending, f) }
+
+	// A SWEEP'S CONTEXT ENDS WITH THE SWEEP, long before a purge does.
+	sweepCtx, endSweep := context.WithTimeout(t.Context(), time.Hour)
+
+	for range 2 {
+		if err := r.Sweep(sweepCtx); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+	}
+
+	endSweep()
+
+	if len(pending) != 1 {
+		t.Fatalf("two sweeps handed off %d purges while the first was pending, want 1", len(pending))
+	}
+
+	if p.calls.Load() != 0 {
+		t.Fatal("the sweep ran the purge itself instead of handing it off")
+	}
+
+	pending[0]()
+
+	if p.calls.Load() != 1 {
+		t.Fatalf("the handed-off purge did not run: %d", p.calls.Load())
+	}
+
+	if p.inherited.Load() {
+		t.Error("the purge ran under the sweep's cancellation or deadline, so it would end with the sweep")
+	}
+
+	// Finished, so the next sweep hands off another.
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if len(pending) != 2 {
+		t.Errorf("a sweep after the purge finished handed off %d in all, want 2", len(pending))
+	}
+}

@@ -80,6 +80,9 @@ type RootDisk interface {
 	CloneRoot(ctx context.Context, image, name string, capacity config.ByteSize) (string, error)
 	// DiscardRoot unmaps and removes a clone. It must be idempotent: teardown runs
 	// on paths that have already failed once.
+	//
+	// A discard may only move the clone out of use, leaving its data for
+	// PurgeDiscarded to delete when the disk also implements trashPurging.
 	DiscardRoot(ctx context.Context, name string) error
 	// KernelFor reports which kernel file a generation was paired with, if any.
 	//
@@ -326,6 +329,26 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 
 // Kind reports the backend this is.
 func (p *Provider) Kind() config.ProviderKind { return config.ProviderFirecracker }
+
+// trashPurging is a RootDisk whose discard defers the deletion to a purge.
+type trashPurging interface {
+	PurgeTrash(ctx context.Context) (int, error)
+}
+
+// PurgeDiscarded deletes the root disks earlier destroys moved out of use.
+func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
+	purger, ok := p.disk.(trashPurging)
+	if !ok {
+		return 0, nil
+	}
+
+	n, err := purger.PurgeTrash(ctx)
+	if err != nil {
+		return n, fmt.Errorf("firecracker: purge discarded root disks: %w", err)
+	}
+
+	return n, nil
+}
 
 // Accepts reports whether this backend may run work of that trust class.
 //
