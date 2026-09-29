@@ -262,6 +262,135 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		}
 	})
 
+	// THE APP VERIFIED AND ONLY A LATER CALL COULD NOT BE ANSWERED: GitHub
+	// failed `list runner groups` with a 503 while the installation probe
+	// before it succeeded (measured 2026-09-28, a converge's `billet check`).
+	// That is could-not-tell: the check passes and its verdict is unverifiable,
+	// never verified, which `local up` would read as permission to start. The
+	// installation token the lookup needs first is held to the same rule. A
+	// refusing 403 on either call is GitHub's answer and still fails.
+	for _, c := range []struct {
+		name   string
+		path   string
+		status int
+		body   string
+		fails  bool
+	}{
+		{"a 503 on the group lookup stays advisory", "/actions/runner-groups", http.StatusServiceUnavailable, `github-launch service unavailable`, false},
+		{"a 503 on the installation token stays advisory", "/access_tokens", http.StatusServiceUnavailable, `unavailable`, false},
+		{"a 429 on the installation token stays advisory", "/access_tokens", http.StatusTooManyRequests, `{"message":"slow down"}`, false},
+		// A 403 is a refusal unless its message says throttle, so this one proves
+		// the token's body reaches the classification, not only its status.
+		{"a rate-limited 403 on the installation token stays advisory", "/access_tokens", http.StatusForbidden, `{"message":"API rate limit exceeded for installation ID 42."}`, false},
+		{"a refusing 403 on the group lookup fails", "/actions/runner-groups", http.StatusForbidden, `{"message":"Resource not accessible by integration"}`, true},
+		{"a refusing 401 on the installation token fails", "/access_tokens", http.StatusUnauthorized, `{"message":"A JSON web token could not be decoded"}`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfgPath := writeCheckConfig(t)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, c.path):
+					w.WriteHeader(c.status)
+					_, _ = fmt.Fprint(w, c.body)
+				case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+					w.WriteHeader(http.StatusCreated)
+					_, _ = fmt.Fprintf(w, `{"token":"stub","expires_at":%q}`,
+						time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+				case strings.HasSuffix(r.URL.Path, "/actions/runner-groups"):
+					_, _ = fmt.Fprint(w, `{"runner_groups":[{"id":9,"name":"billet-trial","default":false}]}`)
+				default:
+					_, _ = fmt.Fprint(w, `{"id": 42, "permissions": {
+						"metadata": "read", "organization_self_hosted_runners": "write"}}`)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			prev := githubAPIBase
+			githubAPIBase = srv.URL
+			t.Cleanup(func() { githubAPIBase = prev })
+
+			var (
+				report   checkReport
+				checkErr error
+			)
+			out := capture(t, func() {
+				report, checkErr = runCheck(t.Context(), checkOptions{configPath: cfgPath})
+			})
+
+			if !strings.Contains(out, "github   verified") {
+				t.Fatalf("the App probe did not verify, so this case proves nothing:\n%s", out)
+			}
+
+			if c.fails {
+				if checkErr == nil {
+					t.Fatalf("GitHub refusing the call passed the check:\n%s", out)
+				}
+				if report.github != githubFailed {
+					t.Errorf("verdict %s, want failed:\n%s", report.github, out)
+				}
+				if !strings.Contains(out, "runner group FAILED") {
+					t.Errorf("the refusal is not reported as a failed group:\n%s", out)
+				}
+
+				return
+			}
+
+			if checkErr != nil {
+				t.Fatalf("GitHub failing to answer failed the check: %v\n%s", checkErr, out)
+			}
+			if report.github != githubUnverifiable {
+				t.Errorf("verdict %s, want unverifiable: an unanswered lookup must never read as verified:\n%s",
+					report.github, out)
+			}
+			if strings.Contains(out, "runner group FAILED") {
+				t.Errorf("a group verdict was reported when GitHub could not answer:\n%s", out)
+			}
+			if !strings.Contains(out, "runner group UNVERIFIED") {
+				t.Errorf("the undecided lookup is not reported as UNVERIFIED:\n%s", out)
+			}
+		})
+	}
+
+	// A LATER TIER SAYS IT WAS NOT PROBED. The first undecided lookup stops the
+	// rest, as an unreachable App probe does, and each later tier must say so
+	// rather than print nothing about its group.
+	t.Run("a tier after an undecided lookup says it was not probed", func(t *testing.T) {
+		cfgPath := writeUntrustedCheckConfig(t, "billet-first", "billet-second")
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprintf(w, `{"token":"stub","expires_at":%q}`,
+					time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+			case strings.HasSuffix(r.URL.Path, "/actions/runner-groups"):
+				w.WriteHeader(http.StatusServiceUnavailable)
+			default:
+				_, _ = fmt.Fprint(w, `{"id": 42, "permissions": {
+					"metadata": "read", "organization_self_hosted_runners": "write"}}`)
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		prev := githubAPIBase
+		githubAPIBase = srv.URL
+		t.Cleanup(func() { githubAPIBase = prev })
+
+		var checkErr error
+		out := capture(t, func() { _, checkErr = runCheck(t.Context(), checkOptions{configPath: cfgPath}) })
+
+		if checkErr != nil {
+			t.Fatalf("GitHub failing to answer failed the check: %v\n%s", checkErr, out)
+		}
+		if strings.Count(out, "runner group UNVERIFIED") != 1 {
+			t.Errorf("want exactly one UNVERIFIED lookup, the first tier's:\n%s", out)
+		}
+		if strings.Count(out, "runner group not probed: GitHub could not answer") != 1 {
+			t.Errorf("the second tier does not say its group was not probed:\n%s", out)
+		}
+	})
+
 	t.Run("an unreachable GitHub stays advisory", func(t *testing.T) {
 		cfgPath := writeCheckConfig(t)
 		stubGitHubUnverifiable(t)
