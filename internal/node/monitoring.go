@@ -55,8 +55,9 @@ func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *
 		return
 	}
 	r.monitor.Start(inst.Name, usage.Target{
-		CgroupDir: target.CgroupDir, PID: target.PID, VCPUThreadPrefix: target.VCPUThreadPrefix,
-		NetDevice: target.NetDevice, NetHostView: target.NetHostView,
+		CgroupDir: target.CgroupDir, PID: target.PID, PIDStart: target.PIDStart,
+		VCPUThreadPrefix: target.VCPUThreadPrefix,
+		NetDevice:        target.NetDevice, NetHostView: target.NetHostView,
 	}, lease.VCPU)
 }
 

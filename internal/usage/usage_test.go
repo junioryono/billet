@@ -47,6 +47,9 @@ var refThreads = map[string]string{
 
 const refCgroup = "/sys/fs/cgroup/firecracker-v1.16.1/billet-b9eb5fb98c62f06fcc85357ded87995b"
 
+// refVMMStart is the captured VMM's start time, field 22 of its stat.
+const refVMMStart = 298947558
+
 type tree struct {
 	t    *testing.T
 	root string
@@ -95,14 +98,16 @@ func referenceVM(t *testing.T) (tree, Target) {
 	for tid, stat := range refThreads {
 		tr.write("/proc/315359/task/"+tid+"/stat", stat+"\n")
 	}
+	// The process's own stat is its main thread's; field 22 is 298947558.
+	tr.write("/proc/315359/stat", refThreads["315359"]+"\n")
 	// bt-16, the VM's tap: rx=941790 tx=202408832 rxp=9276 txp=12866.
 	for name, v := range map[string]string{"rx_bytes": "941790", "tx_bytes": "202408832",
 		"rx_packets": "9276", "tx_packets": "12866"} {
 		tr.write("/sys/class/net/bt-16/statistics/"+name, v+"\n")
 	}
 
-	return tr, Target{CgroupDir: refCgroup, PID: 315359, VCPUThreadPrefix: "fc_vcpu",
-		NetDevice: "bt-16", NetHostView: true}
+	return tr, Target{CgroupDir: refCgroup, PID: 315359, PIDStart: refVMMStart,
+		VCPUThreadPrefix: "fc_vcpu", NetDevice: "bt-16", NetHostView: true}
 }
 
 // The VMM's threads account for the cgroup's CPU time to within a tick, and
@@ -256,7 +261,9 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	tr.write(raplZone+"/energy_uj", "38419855704\n")
 
 	now := time.Date(2026, 9, 25, 22, 50, 0, 0, time.UTC)
-	m := NewMonitor(tr.root, Options{Interval: 10 * time.Second, RAPL: true, IdleWatts: 73.5,
+	// THIRTY-SECOND INTERVALS, so the gap below (70 s) is past the counter's
+	// wrap bound (65.5 s) and short of three intervals: only the wrap can refuse it.
+	m := runMonitor(t, tr.root, Options{Interval: 30 * time.Second, RAPL: true, IdleWatts: 73.5,
 		Now: func() time.Time { return now }})
 	m.Tick()
 	m.Start("vm", target, 8)
@@ -283,13 +290,14 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 	// A gap long enough for the counter to wrap unseen (65.5 s at 1 kW) makes
 	// the job's energy could-not-tell, never a small number. Everything else
 	// about the interval is ordinary, so the gap is the only reason.
-	now = now.Add(2 * time.Minute)
+	now = now.Add(70 * time.Second)
+	// 128 CPUs, as before, so the CPU-count rule is not what refuses it.
 	tr.write("/proc/stat", "cpu  728314069 39636 158013305 37269744359 62999128 0 4781732 0 688798719 927\n"+
-		strings.Repeat("cpu1 0 0 0 0 0 0 0 0 0 0\n", 127))
+		strings.Repeat("cpu1 0 0 0 0 0 0 0 0 0 0\n", 128))
 	tr.write(raplZone+"/energy_uj", "40826460727\n")
 	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 79571715", 1))
 	m.Tick()
-	if s, _ := m.Final("vm"); s.Measured.Energy {
+	if s := finalOf(t, m); s.Measured.Energy {
 		t.Error("energy across a gap the counter could have wrapped in was reported as measured")
 	}
 }
@@ -299,7 +307,7 @@ func TestAJobsEnergyIsItsShareOfTheHostsBusyTime(t *testing.T) {
 func TestALostReadKeepsTheLastMeasurement(t *testing.T) {
 	tr, target := referenceVM(t)
 	now := time.Now()
-	m := NewMonitor(tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
 	m.Start("vm", target, 8)
 	tr.remove(refCgroup + "/cpu.stat")
 	now = now.Add(time.Second)

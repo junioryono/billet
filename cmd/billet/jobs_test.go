@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"strings"
 	"testing"
@@ -49,7 +50,8 @@ func seedMeasuredJob(t *testing.T, stateDir string, requestID int64, usage *allo
 		t.Fatalf("Bind: %v", err)
 	}
 	if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{
-		JobID: "51001", Owner: "acme", Repository: "api", Event: "push",
+		// GITHUB'S JOB ID IS A STRING GITHUB CHOSE, quoted like the rest.
+		JobID: "51001\rjob        forged", Owner: "acme", Repository: "api", Event: "push",
 		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
 		// A WORKFLOW CHOOSES ITS JOB'S NAME, newlines included.
 		Name: "test\nlease      forged",
@@ -85,7 +87,7 @@ func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		lease, `"test\nlease      forged"`, "github job 51001", "run 4242", "request 77",
+		lease, `"test\nlease      forged"`, `github job "51001\rjob        forged"`, "run 4242", "request 77",
 		`"acme/api"`, `"acme/api/.github/workflows/ci.yml@refs/heads/main"`, `"push"`,
 		"measured by the host epyc-1, 1200 samples every 1s over 20m0s",
 		"user 3600.0s, system 400.0s", "guest vCPUs 3900.0s, VMM 100.0s",
@@ -116,7 +118,7 @@ func TestJobsShowSaysWhenNothingWasMeasured(t *testing.T) {
 			t.Errorf("billet jobs show: %v", err)
 		}
 	})
-	if !strings.Contains(out, "usage      not measured") {
+	if !strings.Contains(out, "usage      no report recorded") {
 		t.Errorf("an unmeasured job did not say so:\n%s", out)
 	}
 	if strings.Contains(out, "request -3") {
@@ -127,4 +129,50 @@ func TestJobsShowSaysWhenNothingWasMeasured(t *testing.T) {
 	if !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Errorf("an unknown lease = %v, want ErrLeaseNotFound", err)
 	}
+}
+
+// EACH GROUP SAYS "not measured" EXACTLY WHEN IT IS NAMED UNMEASURED, and no
+// other group does, so the report never shows a zero it did not measure or
+// hides one it did.
+func TestEveryUsageGroupRendersItsOwnMeasurement(t *testing.T) {
+	labels := map[string]string{
+		alloc.UsageCPU: "cpu", alloc.UsageThreads: "vmm split", alloc.UsageMemory: "memory",
+		alloc.UsageIO: "disk", alloc.UsageNet: "network", alloc.UsagePressure: "stalled",
+		alloc.UsageEnergy: "energy",
+	}
+	for group := range labels {
+		t.Run(group, func(t *testing.T) {
+			usage := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: alloc.JobUsage{
+				Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000,
+				Unmeasured: []string{group}, EnergySource: alloc.EnergyRAPL,
+			}}
+			if group == alloc.UsageEnergy {
+				usage.EnergySource = ""
+			}
+			var out bytes.Buffer
+			renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+
+			for other, label := range labels {
+				line := lineStarting(t, out.String(), label)
+				unmeasured := strings.Contains(line, "not measured")
+				if unmeasured != (other == group) {
+					t.Errorf("with %s unmeasured, the %s line reads %q", group, label, line)
+				}
+			}
+		})
+	}
+}
+
+// lineStarting is the report line whose label is label.
+func lineStarting(t *testing.T, report, label string) string {
+	t.Helper()
+
+	for line := range strings.SplitSeq(report, "\n") {
+		if strings.HasPrefix(line, label+strings.Repeat(" ", 11-len(label))) {
+			return line
+		}
+	}
+	t.Fatalf("no %q line in:\n%s", label, report)
+
+	return ""
 }

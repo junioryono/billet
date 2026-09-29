@@ -249,6 +249,10 @@ type Job struct {
 	JobName string
 }
 
+// identityWriteLimit bounds one job-identity write, which is a diagnostic on
+// the poll path.
+const identityWriteLimit = 2 * time.Second
+
 // historyJob is what a message said about its job, as job_history keeps it.
 func (j Job) historyJob() alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
@@ -4355,7 +4359,6 @@ func (l *Listener) assignResolved(ctx context.Context, entry resolvedJob) (*allo
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
 		return nil, false, fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
-	l.recordJobIdentity(ctx, lease.ID, job)
 
 	// Moved into running only AFTER the assignment is durable. Consuming it first
 	// meant a failed Assign left the lease open in the database and absent from
@@ -4814,10 +4817,20 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 
 // recordJobIdentity writes which job a lease ran onto its history row. It is a
 // diagnostic: a failure is logged and never changes what the caller does.
+//
+// ONLY FROM A MESSAGE THAT SAYS WHAT THE RUNNER RAN: JobStarted's binding and the
+// completion. An assignment names the job a pooled runner was LAUNCHED for, and
+// GitHub may give that runner another; recorded there, the first write would win
+// and the job that actually ran could never be written.
+//
+// BOUNDED ON ITS OWN, because the writer retries contention until its context
+// ends and the caller's context is the poll's.
 func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job Job) {
 	if l.alloc == nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
+	defer cancel()
 	if err := l.alloc.RecordJobIdentity(ctx, leaseID, job.historyJob()); err != nil {
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
@@ -5148,7 +5161,9 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		}
 
 		l.recordJobResult(ctx, Job{RequestID: completion.RequestID, RunID: completion.RunID,
-			Result: completion.Result, CompletionID: completion.MessageID}, completion.LeaseID)
+			Result: completion.Result, CompletionID: completion.MessageID,
+			JobID: completion.JobID, Owner: completion.JobOwner, Repository: completion.JobRepository,
+			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}, completion.LeaseID)
 	}
 
 	return nil

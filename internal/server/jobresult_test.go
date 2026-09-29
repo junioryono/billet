@@ -307,6 +307,9 @@ func TestARestoredCompletionRecordsTheResultItsCrashLost(t *testing.T) {
 		Tier: tiers[0].Label, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, Outcome: string(alloc.PhaseDone),
 		MessageID: job.CompletionID,
+		// AND WHICH JOB IT WAS, which the same crash kept off the history row.
+		JobID: "job-91", JobOwner: "acme", JobRepository: "api", JobEvent: "push",
+		JobWorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
 	}); err != nil {
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
@@ -327,6 +330,15 @@ func TestARestoredCompletionRecordsTheResultItsCrashLost(t *testing.T) {
 		t.Fatalf("RecordedJobResult after recovery: %v", err)
 	} else if got != "failed" {
 		t.Errorf("recovery recorded %q, want the result the crash lost", got)
+	}
+
+	history, err := a.Job(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if history.Job.JobID != "job-91" || history.Repo != "acme/api" || history.Job.Event != "push" {
+		t.Errorf("recovery recorded job %+v in %q, want the identity the completion persisted",
+			history.Job, history.Repo)
 	}
 }
 

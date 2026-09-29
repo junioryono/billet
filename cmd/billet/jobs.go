@@ -88,7 +88,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		request = fmt.Sprintf(", request %d", rec.RequestID)
 	}
 	line("job", "%s (github job %s, run %s%s)", quoted(rec.Job.Name),
-		orUnknown(rec.Job.JobID), identifier(rec.RunID), request)
+		quoted(rec.Job.JobID), identifier(rec.RunID), request)
 	line("repository", "%s", quoted(rec.Repo))
 	line("workflow", "%s", quoted(rec.Job.WorkflowRef))
 	line("event", "%s", quoted(rec.Job.Event))
@@ -98,7 +98,10 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 
 	fmt.Fprintln(w)
 	if u == nil {
-		fmt.Fprintln(w, "usage      not measured (node.monitoring was off, or the job ended before a report)")
+		// NOT A REASON: a job still running has no report either, since the node
+		// sends one as its compute is destroyed.
+		fmt.Fprintln(w, "usage      no report recorded (one arrives as the job's compute is destroyed, "+
+			"from a node with node.monitoring)")
 		return
 	}
 	line("usage", "measured by the host %s, %d samples every %s over %s",

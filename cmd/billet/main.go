@@ -1716,7 +1716,11 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// it.
 	runnerOpts = append(runnerOpts, node.WithUpgrader(upgrader))
 
-	monitorOpts, err := nodeMonitorOptions(ctx, cfg, p)
+	// THE SAMPLER OUTLIVES THE SHUTDOWN SIGNAL, as the drain does: jobs keep
+	// running and being measured until this command returns.
+	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopMonitor()
+	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
 	if err != nil {
 		return err
 	}

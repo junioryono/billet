@@ -1,11 +1,15 @@
 -- Job usage: what a job did to the host, measured by the host (migration 57).
 
--- name: RecordJobUsage :exec
+-- name: RecordJobUsage :execrows
 -- Keep the first usage report for a lease.
 --
 -- DO NOTHING ON CONFLICT, because a node reports once and a retry after a lost
 -- answer carries the same summary; a second report is not allowed to replace
 -- the first. The epoch fence is the caller's, in the same transaction.
+--
+-- THE ROW COUNT SAYS WHETHER THIS REPORT WON, and only the report that won may
+-- write the series: otherwise a first report without a series and a second
+-- with one would be stored as a pair neither request sent.
 INSERT INTO job_usage
      (lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
       window_ms, cpu_user_us, cpu_system_us, guest_cpu_us, vmm_cpu_us,

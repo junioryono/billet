@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -27,12 +28,46 @@ const maxPackageWatts = 1000
 // keeping every total, so a job of any length costs bounded memory.
 const maxPoints = 1 << 16
 
+// lifecycleLimit bounds how long Start and Final wait for the sampler, since
+// they sit on a job's launch and teardown. A sampler that has not answered by
+// then is stuck on a read, and the caller goes on without it.
+const lifecycleLimit = 2 * time.Second
+
+// skewSlack is how far the jobs' CPU time may exceed the host's busy time over
+// one interval before the interval is read as inconsistent. The job counters
+// and /proc/stat are read one after another, so a little skew is ordinary; a
+// share past it is could-not-tell, never clipped into a plausible number.
+const skewSlack = 0.05
+
+// staleAfter is how many intervals without a tick make energy could-not-tell:
+// a sampler that stalled or stopped has missed intervals, and their energy is
+// in no job's total.
+const staleAfter = 3
+
 // Monitor samples every job it is told about on one clock, and attributes the
 // host's package energy among them.
+//
+// ONE GOROUTINE READS. Run is the only place any counter file is read and the
+// only place a reading is applied, so a job's baseline, its samples and its
+// final reading are ordered by construction, and a file that never answers
+// blocks that one goroutine rather than one per caller. Start and Final ask Run
+// and wait at most lifecycleLimit; past it they go on with what is already
+// known, and the silence reads as staleness.
 type Monitor struct {
 	reader Reader
 	opts   Options
 
+	requests chan request
+	// ticker is false in tests that drive every tick themselves; limit is
+	// lifecycleLimit, shortened by those tests.
+	ticker bool
+	limit  time.Duration
+	// afterTickRead runs in Run between a tick's reads and its apply, in tests
+	// only, to place a Forget exactly where it would race.
+	afterTickRead func()
+
+	// mu guards what Forget and a Final that could not reach Run touch from
+	// another goroutine. Run holds it only while applying, never while reading.
 	mu           sync.Mutex
 	jobs         map[string]*job
 	lastTick     time.Time
@@ -43,11 +78,36 @@ type Monitor struct {
 	energyReadAt time.Time
 }
 
+type requestKind int
+
+const (
+	requestStart requestKind = iota
+	requestFinal
+	requestTick
+)
+
+type request struct {
+	kind  requestKind
+	key   string
+	job   *job
+	reply chan reply
+}
+
+type reply struct {
+	summary Summary
+	ok      bool
+}
+
 type job struct {
 	target  Target
 	vcpus   int
 	first   time.Time
 	samples int64
+	// pending is a job Start published whose baseline Run has not yet taken.
+	// Ticks leave it alone, so a job still pending when it ends has only its
+	// placeholder point, and summaryOf's two-point rule makes its energy
+	// could-not-tell.
+	pending bool
 	// latest holds each group's most recent successful reading, and seen which
 	// groups were ever read, so one failed read does not erase a measurement.
 	latest     Sample
@@ -65,28 +125,106 @@ type job struct {
 
 type seen struct{ cpu, memory, io, net, threads, pressure bool }
 
-// NewMonitor builds a monitor reading under root ("/" on a real host).
+// NewMonitor builds a monitor reading under root ("/" on a real host). It
+// samples nothing until Run.
 func NewMonitor(root string, opts Options) *Monitor {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
 
-	return &Monitor{reader: Reader{Root: root}, opts: opts, jobs: map[string]*job{}}
+	return &Monitor{reader: Reader{Root: root}, opts: opts, jobs: map[string]*job{},
+		requests: make(chan request), ticker: true, limit: lifecycleLimit}
 }
 
-// Start begins measuring a job, taking its first sample now so the CPU it used
-// before this moment (the boot) is never charged to one interval's energy.
+// Run samples every job each interval, and serves Start and Final, until ctx
+// ends.
+func (m *Monitor) Run(ctx context.Context) {
+	var tick <-chan time.Time
+	if m.ticker {
+		m.tick()
+		t := time.NewTicker(m.opts.Interval)
+		defer t.Stop()
+		tick = t.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+			m.tick()
+		case r := <-m.requests:
+			m.serve(r)
+		}
+	}
+}
+
+func (m *Monitor) serve(r request) {
+	switch r.kind {
+	case requestStart:
+		m.start(r.key, r.job)
+		r.reply <- reply{}
+	case requestFinal:
+		s, ok := m.final(r.key)
+		r.reply <- reply{summary: s, ok: ok}
+	case requestTick:
+		m.tick()
+		r.reply <- reply{}
+	}
+}
+
+// ask hands Run a request and waits for its answer, the whole exchange within
+// limit, and reports whether the answer came in time. Run replies into a
+// buffered channel, so an answer nobody waits for any more never blocks it.
+func (m *Monitor) ask(r request, limit time.Duration) (reply, bool) {
+	r.reply = make(chan reply, 1)
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	select {
+	case m.requests <- r:
+	case <-deadline.C:
+		return reply{}, false
+	}
+	select {
+	case a := <-r.reply:
+		return a, true
+	case <-deadline.C:
+		return reply{}, false
+	}
+}
+
+// Start begins measuring a job. Run takes its first sample, so the CPU it used
+// before this moment (the boot) is never charged to one interval's energy, and
+// the baseline is read after the host's last tick, so the job's CPU in its first
+// interval is within the host's.
+//
+// THE JOB IS PUBLISHED FIRST, pending, and Run fills in the baseline only if
+// that same job is still the one under the key: a Forget, or a successor, while
+// Run was reading wins. A sampler that does not finish in time leaves the job
+// pending, which is known and never attributed.
 func (m *Monitor) Start(key string, target Target, vcpus int) {
+	now := m.opts.Now()
+	j := &job{target: target, vcpus: vcpus, first: now, pending: true}
+	j.points = append(j.points, j.point(now))
+	m.mu.Lock()
+	m.jobs[key] = j
+	m.mu.Unlock()
+
+	m.ask(request{kind: requestStart, key: key, job: j}, m.limit)
+}
+
+func (m *Monitor) start(key string, j *job) {
+	now := m.opts.Now()
+	s := m.reader.Read(j.target)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	now := m.opts.Now()
-	j := &job{target: target, vcpus: vcpus, first: now}
-	s := m.reader.Read(target)
+	if m.jobs[key] != j {
+		return
+	}
+	j.first, j.pending, j.points = now, false, nil
 	j.absorb(s)
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
-	m.jobs[key] = j
 }
 
 // Forget stops measuring a job without reporting it.
@@ -97,56 +235,121 @@ func (m *Monitor) Forget(key string) {
 	delete(m.jobs, key)
 }
 
-// Run samples every job each interval until ctx ends.
-func (m *Monitor) Run(ctx context.Context) {
-	m.Tick()
-	t := time.NewTicker(m.opts.Interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			m.Tick()
-		}
-	}
+// Tick asks Run for one tick and waits for it. Run ticks on its own clock;
+// this is for tests that drive time themselves.
+func (m *Monitor) Tick() {
+	r := request{kind: requestTick, reply: make(chan reply, 1)}
+	m.requests <- r
+	<-r.reply
 }
 
-// Tick samples every job once and attributes the energy since the last tick.
-func (m *Monitor) Tick() {
+// tick samples every job once and attributes the energy since the last tick.
+// Only Run calls it.
+//
+// SNAPSHOT UNDER THE LOCK, READ OUTSIDE IT, APPLY UNDER IT. What is applied is
+// checked against the job it was read for, because Forget does not wait for
+// Run.
+func (m *Monitor) tick() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	snapshot := make(map[string]*job, len(m.jobs))
+	for key, j := range m.jobs {
+		if !j.pending {
+			snapshot[key] = j
+		}
+	}
+	m.mu.Unlock()
 
 	now := m.opts.Now()
 	host, hostErr := m.reader.ReadHostCPU()
+	var energy Energy
+	energyErr := errNoRAPL
+	if m.opts.RAPL {
+		energy, energyErr = m.reader.ReadEnergy()
+	}
+	samples := make(map[string]*Sample, len(snapshot))
+	for key, j := range snapshot {
+		s := m.reader.Read(j.target)
+		samples[key] = &s
+	}
+	if m.afterTickRead != nil {
+		m.afterTickRead()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	hostOK := hostErr == nil && m.hostOK && host.CPUs > 0 && host.CPUs == m.host.CPUs
 	busyDelta := int64(0)
-	hostOK := hostErr == nil && m.hostOK
 	if hostOK {
 		busyDelta = host.Busy - m.host.Busy
 	}
-
-	pkgDelta, energyOK := m.readEnergy(now)
+	pkgDelta, energyOK := m.energySince(now, energy, energyErr)
 	dt := now.Sub(m.lastTick)
-	var idle float64
+
+	// THE IDLE POOL IS NEVER MORE THAN WAS MEASURED: a baseline above an
+	// interval's actual draw would otherwise hand out energy that never existed.
+	var idlePool float64
 	if m.opts.IdleWatts > 0 && !m.lastTick.IsZero() {
-		idle = m.opts.IdleWatts * dt.Seconds() * 1e6
+		idlePool = min(m.opts.IdleWatts*dt.Seconds()*1e6, float64(pkgDelta))
 	}
-	active := float64(pkgDelta)
-	if m.opts.IdleWatts > 0 {
-		active = max(active-idle, 0)
+	activePool := float64(pkgDelta) - idlePool
+
+	// THE RESERVATION COUNTS EVERY LIVE JOB, pending or unreadable included:
+	// failing to take a job's baseline or read its CPU does not free the CPUs
+	// its compute holds.
+	reserved := 0
+	for _, j := range m.jobs {
+		reserved += j.vcpus
 	}
 
-	for _, j := range m.jobs {
-		s := m.reader.Read(j.target)
-		j.absorb(s)
+	// EVERY JOB'S CPU DELTA IS CHECKED BEFORE ANY IS USED, alone and together:
+	// a negative delta, or jobs that together ran longer than the host was busy,
+	// makes the interval could-not-tell for all of them.
+	deltas := make(map[string]int64, len(samples))
+	var total int64
+	consistent := energyOK && hostOK && busyDelta > 0 && dt > 0
+	for key, s := range samples {
+		j := m.jobs[key]
+		if j != snapshot[key] {
+			continue
+		}
+		if !s.CPUOK || !j.lastCPUOK {
+			continue
+		}
+		d := s.CPUUsage - j.lastCPU
+		if d < 0 {
+			consistent = false
+		}
+		deltas[key] = d
+		total += d
+	}
+	if float64(total) > float64(busyDelta)*(1+skewSlack) {
+		consistent = false
+	}
+	idleDenominator := float64(max(host.CPUs, reserved))
+
+	for key, s := range samples {
+		j := m.jobs[key]
+		if j != snapshot[key] {
+			continue
+		}
+		j.absorb(*s)
 		if m.opts.RAPL {
-			switch {
-			case !energyOK || !hostOK || busyDelta <= 0 || !s.CPUOK || !j.lastCPUOK || host.CPUs <= 0:
+			d, measured := deltas[key]
+			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
+			// of the last tick and the job's own baseline.
+			missed := !m.lastTick.IsZero() &&
+				now.Sub(maxTime(m.lastTick, j.first)) >= staleAfter*m.opts.Interval
+			if !consistent || !measured || missed {
 				j.energyBroken = true
-			default:
-				share := min(float64(s.CPUUsage-j.lastCPU)/float64(busyDelta), 1)
-				j.energyActive += active * max(share, 0)
-				j.energyIdle += idle * float64(j.vcpus) / float64(host.CPUs)
+			} else {
+				j.energyActive += activePool * min(float64(d)/float64(busyDelta), 1)
+				// IDLE ONLY FOR THE PART OF THE INTERVAL THE JOB EXISTED.
+				overlap := now.Sub(maxTime(m.lastTick, j.first))
+				if overlap > 0 {
+					j.energyIdle += idlePool * (overlap.Seconds() / dt.Seconds()) *
+						float64(j.vcpus) / idleDenominator
+				}
 			}
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
@@ -160,14 +363,21 @@ func (m *Monitor) Tick() {
 	m.lastTick = now
 }
 
-// readEnergy reads the package counter and returns the energy since the last
-// reading. A gap long enough for the counter to have wrapped unseen is could
-// not tell, never a small number.
-func (m *Monitor) readEnergy(now time.Time) (int64, bool) {
-	if !m.opts.RAPL {
-		return 0, false
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
 	}
-	e, err := m.reader.ReadEnergy()
+
+	return b
+}
+
+// errNoRAPL stands in for a reading a monitor without RAPL never takes.
+var errNoRAPL = errors.New("usage: rapl is not configured")
+
+// energySince records a package reading and returns the energy since the last
+// one. A gap long enough for the counter to have wrapped unseen is could not
+// tell, never a small number. Called with mu held.
+func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) {
 	if err != nil {
 		m.energyOK = false
 		return 0, false
@@ -252,26 +462,58 @@ type Measured struct{ CPU, Memory, IO, Net, Threads, Pressure, Energy bool }
 
 // Final takes one last sample of a job and summarises it. The job stays known,
 // so a destroy that fails and is retried can ask again; Forget ends it.
+//
+// A SAMPLER THAT DOES NOT ANSWER IN TIME is stuck on a read: the summary is
+// what was already known, and the silence makes its energy stale.
 func (m *Monitor) Final(key string) (Summary, bool) {
+	if answer, answered := m.ask(request{kind: requestFinal, key: key}, m.limit); answered {
+		return answer.summary, answer.ok
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
 	j, ok := m.jobs[key]
 	if !ok {
 		return Summary{}, false
 	}
+
+	return m.summaryOf(j, m.opts.Now()), true
+}
+
+func (m *Monitor) final(key string) (Summary, bool) {
+	m.mu.Lock()
+	j, ok := m.jobs[key]
+	m.mu.Unlock()
+	if !ok {
+		return Summary{}, false
+	}
+
 	now := m.opts.Now()
-	j.absorb(m.reader.Read(j.target))
+	s := m.reader.Read(j.target)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.jobs[key]; !ok || current != j {
+		return Summary{}, false
+	}
+	j.absorb(s)
+
+	return m.summaryOf(j, now), true
+}
+
+// summaryOf summarises a job at now. Called with mu held.
+func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	points := append(append([]Point(nil), j.points...), j.point(now))
+	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
 
 	return Summary{
 		Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),
 		Latest: j.latest, MemoryPeak: j.peakMemory,
 		Measured: Measured{CPU: j.seen.cpu, Memory: j.seen.memory, IO: j.seen.io, Net: j.seen.net,
 			Threads: j.seen.threads, Pressure: j.seen.pressure,
-			Energy: m.opts.RAPL && !j.energyBroken && len(j.points) > 1},
+			Energy: m.opts.RAPL && !j.energyBroken && len(j.points) > 1 && !stale},
 		EnergySplit:  m.opts.IdleWatts > 0,
 		EnergyActive: int64(j.energyActive), EnergyIdle: int64(j.energyIdle),
 		Points: points,
-	}, true
+	}
 }
