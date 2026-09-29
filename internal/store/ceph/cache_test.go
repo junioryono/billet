@@ -2190,7 +2190,7 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 				bounds = append(bounds, time.Until(deadline))
 			}
 
-			if slices.Contains(args, "billet-cache/id-0refused") {
+			if slices.Contains(args, "billet-cache/id-0refused") || slices.Contains(args, "billet-cache/id-1refused") {
 				return nil, errors.New("exit status 1: rbd: error: (5) Input/output error")
 			}
 		}
@@ -2206,6 +2206,7 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 	// The fake lists the trash sorted by id, so the refused image comes first and
 	// the ones after it are what a pass that stopped at it would never reach.
 	f.trash["id-0refused"] = "billet-0refused"
+	f.trash["id-1refused"] = "billet-1refused"
 	f.trash["id-b-root"] = "billet-624131f5"
 	f.trash["id-c-parent"] = "billet-parent"
 	f.trash["id-d-cache"] = "cache-v-1790048184-abc"
@@ -2213,8 +2214,10 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 	f.parents["billet-cache/child"] = "billet-cache/billet-parent@g1"
 
 	n, err := c.PurgeTrash(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "billet-0refused") {
-		t.Errorf("the refused image was not reported: %v", err)
+	for _, refused := range []string{"billet-0refused", "billet-1refused"} {
+		if err == nil || !strings.Contains(err.Error(), refused) {
+			t.Errorf("%s was not reported, and every failure must be: %v", refused, err)
+		}
 	}
 
 	if n != 1 {
@@ -2229,7 +2232,8 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 		"id-c-parent": "a parent a child still reads",
 		"id-d-cache":  "a cache volume, which is eviction's to purge",
 		"id-e-other":  "an image that is not billet's",
-		"id-0refused": "the refused image",
+		"id-0refused": "the first refused image",
+		"id-1refused": "the second refused image",
 	} {
 		if _, ok := f.trash[id]; !ok {
 			t.Errorf("%s was deleted from the trash", why)
@@ -2244,5 +2248,30 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 		if b < 29*time.Minute || b > 31*time.Minute {
 			t.Errorf("a trash removal ran under %s, want about thirty minutes", b)
 		}
+	}
+}
+
+// A PARENT A CHILD STILL READS IS NOT A FAILURE: it waits for a later purge, and
+// a pass that met nothing else answers no error at all.
+func TestPurgeTrashLeavesAReferencedParentWithoutAnError(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+
+	f.trash["id-parent"] = "billet-parent"
+	f.parents["billet-cache/child"] = "billet-cache/billet-parent@g1"
+
+	n, err := c.PurgeTrash(t.Context())
+	if err != nil {
+		t.Fatalf("a parent still read by a child was reported as a failure: %v", err)
+	}
+
+	if n != 0 {
+		t.Errorf("purged %d, want 0", n)
+	}
+
+	if _, ok := f.trash["id-parent"]; !ok {
+		t.Error("a parent a child still reads was deleted")
 	}
 }

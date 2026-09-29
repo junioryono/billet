@@ -3141,10 +3141,17 @@ type purgingProvider struct {
 	*fakeProvider
 
 	calls atomic.Int32
+	// inherited records whether a purge ran under a context that was cancelled
+	// or carried a deadline, which would be the sweep's.
+	inherited atomic.Bool
 }
 
-func (p *purgingProvider) PurgeDiscarded(context.Context) (int, error) {
+func (p *purgingProvider) PurgeDiscarded(ctx context.Context) (int, error) {
 	p.calls.Add(1)
+
+	if _, has := ctx.Deadline(); has || ctx.Err() != nil {
+		p.inherited.Store(true)
+	}
 
 	return 1, nil
 }
@@ -3167,11 +3174,16 @@ func TestSweepHandsOffOnePurgeOfDiscardedStorage(t *testing.T) {
 
 	r.spawn = func(f func()) { pending = append(pending, f) }
 
+	// A SWEEP'S CONTEXT ENDS WITH THE SWEEP, long before a purge does.
+	sweepCtx, endSweep := context.WithTimeout(t.Context(), time.Hour)
+
 	for range 2 {
-		if err := r.Sweep(t.Context()); err != nil {
+		if err := r.Sweep(sweepCtx); err != nil {
 			t.Fatalf("Sweep: %v", err)
 		}
 	}
+
+	endSweep()
 
 	if len(pending) != 1 {
 		t.Fatalf("two sweeps handed off %d purges while the first was pending, want 1", len(pending))
@@ -3185,6 +3197,10 @@ func TestSweepHandsOffOnePurgeOfDiscardedStorage(t *testing.T) {
 
 	if p.calls.Load() != 1 {
 		t.Fatalf("the handed-off purge did not run: %d", p.calls.Load())
+	}
+
+	if p.inherited.Load() {
+		t.Error("the purge ran under the sweep's cancellation or deadline, so it would end with the sweep")
 	}
 
 	// Finished, so the next sweep hands off another.
