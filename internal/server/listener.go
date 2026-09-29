@@ -244,6 +244,19 @@ type Job struct {
 	Owner       string
 	Repository  string
 	WorkflowRef string
+	// JobName is the job's display name, kept for people to read and never
+	// consulted for a decision.
+	JobName string
+}
+
+// identityWriteLimit bounds one job-identity write, which is a diagnostic on
+// the poll path.
+const identityWriteLimit = 2 * time.Second
+
+// historyJob is what a message said about its job, as job_history keeps it.
+func (j Job) historyJob() alloc.HistoryJob {
+	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
+		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -3865,6 +3878,7 @@ func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
 		}
 		return Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
 	}
+	l.recordJobIdentity(ctx, leaseID, job)
 	return identified, nil
 }
 
@@ -4798,6 +4812,30 @@ func (l *Listener) recordJobResult(ctx context.Context, job Job, leaseID string)
 			"running it",
 			"tier", l.tier, "request", job.RequestID, "lease", leaseID, "error", err)
 	}
+	l.recordJobIdentity(ctx, leaseID, job)
+}
+
+// recordJobIdentity writes which job a lease ran onto its history row. It is a
+// diagnostic: a failure is logged and never changes what the caller does.
+//
+// ONLY FROM A MESSAGE THAT SAYS WHAT THE RUNNER RAN: JobStarted's binding and the
+// completion. An assignment names the job a pooled runner was LAUNCHED for, and
+// GitHub may give that runner another; recorded there, the first write would win
+// and the job that actually ran could never be written.
+//
+// BOUNDED ON ITS OWN, because the writer retries contention until its context
+// ends and the caller's context is the poll's.
+func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job Job) {
+	if l.alloc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
+	defer cancel()
+	if err := l.alloc.RecordJobIdentity(ctx, leaseID, job.historyJob()); err != nil {
+		l.log.Warn("could not record which github job a lease ran; its history row "+
+			"will not name the repository, workflow or job",
+			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)
+	}
 }
 
 // recordReleaseOnly makes successful node teardown durable before the local
@@ -5123,7 +5161,9 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		}
 
 		l.recordJobResult(ctx, Job{RequestID: completion.RequestID, RunID: completion.RunID,
-			Result: completion.Result, CompletionID: completion.MessageID}, completion.LeaseID)
+			Result: completion.Result, CompletionID: completion.MessageID,
+			JobID: completion.JobID, Owner: completion.JobOwner, Repository: completion.JobRepository,
+			WorkflowRef: completion.JobWorkflowRef, Event: completion.JobEvent}, completion.LeaseID)
 	}
 
 	return nil

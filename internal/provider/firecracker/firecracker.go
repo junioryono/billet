@@ -80,6 +80,9 @@ type RootDisk interface {
 	CloneRoot(ctx context.Context, image, name string, capacity config.ByteSize) (string, error)
 	// DiscardRoot unmaps and removes a clone. It must be idempotent: teardown runs
 	// on paths that have already failed once.
+	//
+	// A discard may only move the clone out of use, leaving its data for
+	// PurgeDiscarded to delete when the disk also implements trashPurging.
 	DiscardRoot(ctx context.Context, name string) error
 	// KernelFor reports which kernel file a generation was paired with, if any.
 	//
@@ -147,6 +150,14 @@ type Provider struct {
 
 	// bootWait bounds how long Launch waits for a VMM to answer its own API.
 	bootWait time.Duration
+
+	// wantAccounting is WithJobAccounting; accounting is what the host proved at
+	// construction, and only a present controller is ever asked of the jailer.
+	wantAccounting bool
+	accounting     Accounting
+	// processStart reads a pid's start time; a seam for the tests, whose VMM
+	// pid is a process that has exited.
+	processStart func(pid int) (uint64, error)
 }
 
 // runner executes one command. A seam, so a test can assert the ARGUMENTS billet
@@ -271,6 +282,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		bootWait: DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
+	p.processStart = hostProcessStart
 	p.removeCgroupAtFn = p.removeCgroupAt
 	p.procMountsPath = defaultProcMountsPath
 
@@ -300,11 +312,43 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		return nil, err
 	}
 
+	// READ ONCE, AT CONSTRUCTION, and only when asked: a key naming a file the
+	// kernel does not provide fails every launch, so a controller the host did
+	// not prove is left off rather than attempted.
+	if p.wantAccounting {
+		root, err := cgroup2Mount(p.procMountsPath)
+		if err != nil {
+			p.accounting = Accounting{Reason: err.Error()}
+		} else {
+			p.accounting = probeAccounting(root)
+		}
+	}
+
 	return p, nil
 }
 
 // Kind reports the backend this is.
 func (p *Provider) Kind() config.ProviderKind { return config.ProviderFirecracker }
+
+// trashPurging is a RootDisk whose discard defers the deletion to a purge.
+type trashPurging interface {
+	PurgeTrash(ctx context.Context) (int, error)
+}
+
+// PurgeDiscarded deletes the root disks earlier destroys moved out of use.
+func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
+	purger, ok := p.disk.(trashPurging)
+	if !ok {
+		return 0, nil
+	}
+
+	n, err := purger.PurgeTrash(ctx)
+	if err != nil {
+		return n, fmt.Errorf("firecracker: purge discarded root disks: %w", err)
+	}
+
+	return n, nil
+}
 
 // Accepts reports whether this backend may run work of that trust class.
 //
@@ -1029,8 +1073,11 @@ func (p *Provider) startVMM(ctx context.Context, j jail, res resources) error {
 // The value is cpu.weight at its default of 100, which changes nothing. The vCPU
 // and memory a guest gets are set on the VMM itself, where the ledger's numbers
 // belong; this is about the cgroup EXISTING.
+//
+// WithJobAccounting adds the memory and io keys the host proved it can honour;
+// see Accounting.jailerAccountingArgs.
 func (p *Provider) jailerArgs(j jail, res resources) []string {
-	return []string{
+	args := []string{
 		"--id", j.id,
 		"--exec-file", p.execPath,
 		"--uid", strconv.Itoa(res.UID),
@@ -1038,6 +1085,10 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		"--chroot-base-dir", p.cfg.ChrootBase,
 		"--cgroup-version", "2",
 		"--cgroup", "cpu.weight=100",
+	}
+	args = append(args, p.accounting.jailerAccountingArgs()...)
+
+	return append(args,
 		// A PID NAMESPACE OF ITS OWN, and the reason is a pid FILE rather than the
 		// isolation — though the isolation is worth having, since a VMM that cannot
 		// see a host process cannot signal one.
@@ -1056,10 +1107,10 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		// time billet was upgraded.
 		"--daemonize",
 		"--",
-		"--api-sock", "/" + filepath.Join("run", "firecracker.socket"),
-		"--log-path", "/" + vmmLog,
+		"--api-sock", "/"+filepath.Join("run", "firecracker.socket"),
+		"--log-path", "/"+vmmLog,
 		"--level", "Info",
-	}
+	)
 }
 
 // vmmLog is the VMM's own log inside the chroot. It carries VMM-level lines only —

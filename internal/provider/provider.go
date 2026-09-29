@@ -267,6 +267,17 @@ type StagedCredentialReaper interface {
 	ReapStagedCredential(ctx context.Context, instanceName string) error
 }
 
+// TrashPurger is a provider whose destroy only moves what it discarded out of
+// use, and which deletes it when asked. The node asks from its sweep, in the
+// background, because a large disk takes minutes to delete and the node serves
+// one command at a time. It returns how many it deleted.
+//
+// NOT PART OF A DESTROY'S PROOF. The compute is gone when Destroy says so; what
+// is purged here is storage no job can reach.
+type TrashPurger interface {
+	PurgeDiscarded(ctx context.Context) (int, error)
+}
+
 // InstanceName is billet's handle for the compute backing a lease.
 //
 // Derived rather than stored, and that is the whole trick: it means a running
@@ -437,4 +448,34 @@ type QuotaReporter interface {
 	// the ones that answered. That is the same shape `billet check` already uses
 	// for its advisory probes.
 	Quotas(ctx context.Context) ([]Quota, error)
+}
+
+// UsageTarget is where the host can read one instance's counters.
+type UsageTarget struct {
+	// CgroupDir is the instance's own cgroup-v2 directory, absolute.
+	CgroupDir string
+	// PID is the VMM process whose threads split guest time from its own, zero
+	// for an instance with no VMM.
+	PID int
+	// PIDStart is PID's start time when the target was made, checked on every
+	// read so a reused pid is never charged to this instance.
+	PIDStart uint64
+	// VCPUThreadPrefix names the threads that run guest code.
+	VCPUThreadPrefix string
+	// NetDevice is the host's end of the instance's network device, empty when
+	// its traffic cannot be told apart from anything else's.
+	NetDevice string
+	// NetHostView says NetDevice counts from the host's side (a tap), so its
+	// received bytes are what the guest sent.
+	NetHostView bool
+}
+
+// UsageSource is a backend whose instances can be measured from the host.
+//
+// AN OPTIONAL CAPABILITY that carries no safety invariant: a backend without it
+// has nothing measured, and a failure to answer loses a measurement, never a
+// job.
+type UsageSource interface {
+	// UsageTarget says where a running instance's counters are.
+	UsageTarget(ctx context.Context, instanceID string) (UsageTarget, error)
 }

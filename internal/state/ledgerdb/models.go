@@ -65,6 +65,38 @@ type IssuedCert struct {
 	IssuedAt string
 }
 
+type JobUsage struct {
+	LeaseID         string
+	Node            string
+	RecordedAt      string
+	Source          string
+	Unmeasured      string
+	Samples         int64
+	IntervalMs      int64
+	WindowMs        int64
+	CpuUserUs       int64
+	CpuSystemUs     int64
+	GuestCpuUs      int64
+	VmmCpuUs        int64
+	MemoryPeakBytes int64
+	OomKills        int64
+	DiskReadBytes   int64
+	DiskWriteBytes  int64
+	NetRxBytes      int64
+	NetTxBytes      int64
+	NetRxPackets    int64
+	NetTxPackets    int64
+	CpuSomeUs       int64
+	CpuFullUs       int64
+	MemorySomeUs    int64
+	MemoryFullUs    int64
+	IoSomeUs        int64
+	IoFullUs        int64
+	EnergyActiveUj  int64
+	EnergyIdleUj    int64
+	EnergySource    string
+}
+
 type ListenerCapacity struct {
 	Tier       string
 	ObservedAt string

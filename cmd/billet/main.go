@@ -148,6 +148,7 @@ func commands(lc *lifecycle) []command {
 		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
+		{"jobs", "show which GitHub job a lease ran and what it did to the host", cmdJobs},
 		{"cache", "manage transparent Actions caching and install its conformance gate", cmdCache},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
@@ -1450,8 +1451,7 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			return nil, err
 		}
 
-		return firecracker.New(deployment, *cfg.Node.Firecracker, store,
-			firecracker.WithLogger(slog.Default()))
+		return firecracker.New(deployment, *cfg.Node.Firecracker, store, firecrackerOptions(cfg)...)
 
 	case config.ProviderTart:
 		// Labelled with the DEPLOYMENT id for the docker backend's reason: two
@@ -1715,6 +1715,16 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// than one attempting a transaction against a machine that is not shaped for
 	// it.
 	runnerOpts = append(runnerOpts, node.WithUpgrader(upgrader))
+
+	// THE SAMPLER OUTLIVES THE SHUTDOWN SIGNAL, as the drain does: jobs keep
+	// running and being measured until this command returns.
+	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopMonitor()
+	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
+	if err != nil {
+		return err
+	}
+	runnerOpts = append(runnerOpts, monitorOpts...)
 
 	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)
 
@@ -3731,6 +3741,7 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 	}
 
 	fmt.Printf("         guests on %s; %s\n", report.Bridge, untrusted)
+	fmt.Printf("         %s\n", report.Accounting.Summary())
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Opening /dev/kvm says
 	// nothing about the jailer's ability to chroot, mknod or place a cgroup, all of

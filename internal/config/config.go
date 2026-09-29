@@ -618,6 +618,9 @@ type NodeConfig struct {
 	// `billet decommission` and `billet init iam` both read a store block on a
 	// config that has already lost its listener.
 	Cache *NodeCacheConfig `yaml:"cache,omitempty"`
+	// Monitoring measures each job from the host. Absent means off; see
+	// NodeMonitoringConfig.
+	Monitoring *NodeMonitoringConfig `yaml:"monitoring,omitempty"`
 	// RegistryMirrors are three site-local Distribution pull-through caches. One
 	// instance per upstream is required because proxy mode has one remote URL.
 	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
@@ -4020,6 +4023,7 @@ func (c *Config) validateNode() []error {
 	errs = append(errs, c.validateCephNode()...)
 	errs = append(errs, c.validateEBSS3Node()...)
 	errs = append(errs, c.validateCacheNode()...)
+	errs = append(errs, c.validateMonitoringNode()...)
 	if c.Node.Cache == nil {
 		for i := range c.Tiers {
 			if len(c.Tiers[i].explicitGuestCaches()) > 0 &&

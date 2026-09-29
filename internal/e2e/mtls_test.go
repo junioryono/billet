@@ -83,6 +83,10 @@ func (mtlsStore) RetirePoolRunner(context.Context, string) error { return nil }
 
 func (m mtlsStore) MarkDeregistered(context.Context, string) error { return nil }
 
+func (mtlsStore) RecordLeaseUsage(context.Context, string, int64, alloc.JobUsage, *alloc.UsageSeries) error {
+	return nil
+}
+
 func (mtlsStore) RecordCacheObservation(context.Context, string, int64, alloc.CacheObservation) error {
 	return nil
 }

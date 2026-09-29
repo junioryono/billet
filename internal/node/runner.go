@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -116,12 +117,21 @@ type LeaseStore interface {
 
 // Runner starts and stops the compute for assigned leases.
 type Runner struct {
+	// purging is set while a background purge of discarded storage runs, so a
+	// sweep starts at most one.
+	purging atomic.Bool
+	// spawn runs the purge in the background; a seam so a test controls when it
+	// runs instead of racing a goroutine. Nil is `go`.
+	spawn func(func())
+
 	jit             JITSource
 	provider        provider.Provider
 	alloc           LeaseStore
 	log             *slog.Logger
 	cache           *CacheService
 	registryMirrors config.RegistryMirrors
+	// monitor measures each running job from the host; nil measures nothing.
+	monitor JobMonitor
 	// upgrader replaces this node's own billet. Nil means it cannot, which the
 	// upgrade command reports rather than silently ignoring.
 	upgrader Upgrader
@@ -592,6 +602,8 @@ func (r *Runner) Launch(
 	r.runningLease[job.RequestID] = lease
 	r.mu.Unlock()
 
+	r.startMonitoring(ctx, lease, inst)
+
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
 		"instance", inst.ID, "trust", trust)
@@ -622,6 +634,7 @@ func (r *Runner) forgetRunningLocked(name string) {
 			delete(r.runningLease, requestID)
 		}
 	}
+	r.forgetMonitoring(name)
 }
 
 func (r *Runner) removeRegistration(
@@ -782,6 +795,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
+	// THE LAST SAMPLE IS TAKEN BEFORE THE DESTROY, because the cgroup and the
+	// VMM's threads it reads go with the compute.
+	measured, hasUsage := r.finalUsage(inst.Name)
+
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
@@ -808,6 +825,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	if r.cache != nil {
 		r.cache.SettleObservation(ctx, inst.Name)
 	}
+	// AND SO IS WHAT THE JOB DID TO THE HOST, for the same reason: the report is
+	// fenced on the lease, which the plane releases only after this returns.
+	if hasUsage && holdable {
+		r.reportUsage(ctx, lease, inst.Name, measured)
+	}
 
 	if state != provider.TeardownStopped && !holdable {
 		// KEPT IN THE MAPS, so the retry re-enters here rather than through the
@@ -826,6 +848,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	delete(r.running, requestID)
 	delete(r.runningLease, requestID)
 	r.mu.Unlock()
+	r.forgetMonitoring(inst.Name)
 
 	// THE BACKEND DID NOT CONFIRM THE GUEST HAD STOPPED.
 	//
@@ -1338,6 +1361,42 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 	return r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
 }
 
+// purgeDiscarded starts, in the background, the deletion of storage earlier
+// destroys moved out of use, when the provider defers it and no purge is
+// already running.
+//
+// NOT ON THE COMMAND PATH. The sweep holds the node's one command slot, and a
+// large root disk takes minutes to delete; the destroy that discarded it has
+// already been answered. Detached from the sweep's context, because the sweep
+// ends long before the purge, and bounded per image by the provider.
+func (r *Runner) purgeDiscarded(ctx context.Context) {
+	purger, ok := r.provider.(provider.TrashPurger)
+	if !ok || !r.purging.CompareAndSwap(false, true) {
+		return
+	}
+
+	spawn := r.spawn
+	if spawn == nil {
+		spawn = func(f func()) { go f() }
+	}
+
+	spawn(func() {
+		defer r.purging.Store(false)
+
+		n, err := purger.PurgeDiscarded(context.WithoutCancel(ctx))
+		if err != nil {
+			r.log.Warn("could not delete storage discarded by earlier destroys; the next sweep "+
+				"retries", "deleted", n, "error", err)
+
+			return
+		}
+
+		if n > 0 {
+			r.log.Info("deleted storage discarded by earlier destroys", "deleted", n)
+		}
+	})
+}
+
 // Sweep destroys instances whose lease is no longer open on this node.
 //
 // The steady-state counterpart to Recover, and the reason a failed cleanup is
@@ -1376,6 +1435,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		r.log.Warn("could not tell the control plane what this host is running; capacity for "+
 			"compute it cannot account for stays held until this succeeds", "error", err)
 	}
+
+	r.purgeDiscarded(ctx)
 
 	if len(instances) == 0 {
 		return nil

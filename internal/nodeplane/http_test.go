@@ -263,8 +263,10 @@ type fakeStore struct {
 	// arrived under.
 	observations []observed
 	observeErr   error
-	pool         map[string]alloc.PoolRunner
-	retired      []string
+	// usages are the usage reports recorded, with the epoch each arrived under.
+	usages  []reportedUsage
+	pool    map[string]alloc.PoolRunner
+	retired []string
 }
 
 type cachePolicyFunc func(ctx context.Context, kind, owner, repository string) (bool, error)
@@ -326,6 +328,25 @@ func (f *fakeStore) RecordCacheObservation(
 	f.observations = append(f.observations, observed{lease: leaseID, epoch: epoch, obs: obs})
 
 	return f.observeErr
+}
+
+// reportedUsage is one usage report the fake was asked to record.
+type reportedUsage struct {
+	lease  string
+	epoch  int64
+	usage  alloc.JobUsage
+	series *alloc.UsageSeries
+}
+
+func (f *fakeStore) RecordLeaseUsage(
+	_ context.Context, leaseID string, epoch int64, usage alloc.JobUsage, series *alloc.UsageSeries,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.usages = append(f.usages, reportedUsage{lease: leaseID, epoch: epoch, usage: usage, series: series})
+
+	return nil
 }
 
 func (f *fakeStore) Resize(context.Context, string, int64, string, int, config.ByteSize) error {
