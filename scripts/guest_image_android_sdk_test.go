@@ -78,8 +78,9 @@ func TestTheGateRefusesAnImageWithoutTheAndroidSDK(t *testing.T) {
 	}
 }
 
-// AND THE GATE ASKS IT, and the build accepts the licences at the one call that
-// installs the toolcache: a switch set anywhere else installs nothing.
+// AND THE GATE ASKS IT, and the build installs it: GitHub's own
+// install-android-sdk.sh is a step of the plan, and nothing billet carries skips
+// it.
 func TestTheGuestBuildInstallsAndTheGateAsksForTheAndroidSDK(t *testing.T) {
 	t.Parallel()
 
@@ -87,16 +88,5 @@ func TestTheGuestBuildInstallsAndTheGateAsksForTheAndroidSDK(t *testing.T) {
 		t.Error(`check-guest-image.sh never runs check_android_sdk "$MNT", so an image without the SDK passes`)
 	}
 
-	source := readScriptFile(t, "build-guest-image.sh")
-
-	call := strings.LastIndex(source, "\n\t\tbillet_install_toolcache\n")
-	if call < 0 {
-		t.Fatal("build-guest-image.sh has no billet_install_toolcache call, so this test is reading the wrong script")
-	}
-
-	start := strings.LastIndex(source[:call], "\tBILLET_TC_ROOT=")
-	if start < 0 || !strings.Contains(source[start:call], "\t\tBILLET_TC_ANDROID_ACCEPT_LICENSES=yes \\") {
-		t.Error("the toolcache call in build-guest-image.sh does not set BILLET_TC_ANDROID_ACCEPT_LICENSES=yes, " +
-			"so install_android installs nothing")
-	}
+	planInstalls(t, "install-android-sdk.sh")
 }

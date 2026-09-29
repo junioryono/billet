@@ -161,8 +161,19 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	if !strings.Contains(build, "systemctl disable docker.service docker.socket") {
 		t.Fatal("the image still permits Docker to autostart before its cache is mounted")
 	}
-	if !strings.Contains(build, `"containerd-snapshotter": false`) ||
-		!strings.Contains(build, `"storage-driver": "overlay2"`) {
+	// THE DAEMON CONFIG IS ONE FILE, installed by the runner-images build's
+	// docker-daemon prepare before GitHub's install-docker.sh first starts dockerd.
+	daemon, err := os.ReadFile(filepath.Join("..", "..", "guestassets", "docker-daemon.json"))
+	if err != nil {
+		t.Fatalf("read the guest's daemon.json: %v", err)
+	}
+	runner, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "run-runner-images.sh"))
+	if err != nil {
+		t.Fatalf("read the runner-images runner: %v", err)
+	}
+	if !strings.Contains(string(daemon), `"containerd-snapshotter": false`) ||
+		!strings.Contains(string(daemon), `"storage-driver": "overlay2"`) ||
+		!strings.Contains(string(runner), `internal/guestassets/docker-daemon.json" /etc/docker/daemon.json`) {
 		t.Fatal("the image can put pulled images outside the cache-backed Docker data root")
 	}
 	if !strings.Contains(build, "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true") ||
@@ -465,7 +476,21 @@ func TestTheGuestImageIncludesDockerCLIPluginsWorkflowsUse(t *testing.T) {
 		t.Fatalf("read guest image builder: %v", err)
 	}
 
-	if !strings.Contains(string(source), "docker.io docker-buildx docker-compose-v2") {
+	// GITHUB'S install-docker.sh INSTALLS BOTH PLUGINS, and the guest build runs
+	// it: the plan names the step and no difference skips it.
+	if !strings.Contains(string(source), "run_runner_images_build") {
+		t.Fatal("the guest build no longer runs GitHub's build, which is what installs Docker")
+	}
+	plan, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "runner-images", "plan.json"))
+	if err != nil {
+		t.Fatalf("read the runner-images plan: %v", err)
+	}
+	differences, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "runner-images", "differences.tsv"))
+	if err != nil {
+		t.Fatalf("read the runner-images differences: %v", err)
+	}
+	if !strings.Contains(string(plan), `"id": "install-docker.sh"`) ||
+		strings.Contains(string(differences), "skip\tinstall-docker.sh\t") {
 		t.Fatal("the guest installs Docker without the Buildx and Compose CLI plugins workflows use")
 	}
 

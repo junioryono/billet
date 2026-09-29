@@ -1,7 +1,6 @@
 package scripts_test
 
 import (
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -10,14 +9,14 @@ import (
 	"github.com/junioryono/billet/internal/runnerimages"
 )
 
-// THE COMPILER SECTIONS REACH APT, AND ALL THREE READERS AGREE ON WHAT THEY ARE.
+// THE COMPILER SECTIONS REACH APT, AND BOTH READERS AGREE ON WHAT THEY ARE.
 //
 // `clang`, `gcc`, `gfortran`, `php` and `postgresql` are declared outside the
-// three apt lists, so nothing installed them and nothing checked for them. Three
-// separate readers now expand them — Go's AptPackages for the EC2 script,
-// build-guest-image.sh's jq for the guest install, and check-guest-image.sh's jq
-// for the guest gate — and a section added to fewer than three is either shipped
-// unchecked or checked and never shipped.
+// three apt lists, so nothing installed them and nothing checked for them. Two
+// readers expand them — Go's AptPackages for the EC2 script, and
+// check-guest-image.sh's jq for the guest gate — and a section added to only one
+// is either shipped unchecked or checked and never shipped. The guest image
+// itself is GitHub's build, which installs them from the same declaration.
 func TestTheToolchainSectionsReachEveryReader(t *testing.T) {
 	t.Parallel()
 
@@ -53,19 +52,14 @@ func TestTheToolchainSectionsReachEveryReader(t *testing.T) {
 		}
 	}
 
-	// EVERY READER, RUN. Go's list is the one EC2 interpolates; the other two are
-	// jq programs in shell, and asking Go about them would only prove Go agrees
-	// with itself.
+	// EVERY READER, RUN. Go's list is the one EC2 interpolates; the gate's is a jq
+	// program in shell, and asking Go about it would only prove Go agrees with
+	// itself.
 	inGo := ts.AptPackages()
-	inBuild := shellPackages(t, "build-guest-image.sh", "toolset_packages")
 
 	for _, pkg := range want {
 		if !slices.Contains(inGo, pkg) {
 			t.Errorf("%q is not in the list the EC2 build installs", pkg)
-		}
-
-		if !slices.Contains(inBuild, pkg) {
-			t.Errorf("%q is not in the list the guest build installs", pkg)
 		}
 	}
 
@@ -74,44 +68,20 @@ func TestTheToolchainSectionsReachEveryReader(t *testing.T) {
 	missing := gateDeclared(t)
 
 	for _, pkg := range want {
+		if pkg == pipxPackage {
+			if slices.Contains(missing, pkg) {
+				t.Errorf("the guest gate requires the %s package, which GitHub's image installs "+
+					"with pip rather than apt", pkg)
+			}
+
+			continue
+		}
+
 		if !slices.Contains(missing, pkg) {
 			t.Errorf("%q is not in the set the guest gate requires; an image without it "+
 				"would pass", pkg)
 		}
 	}
-}
-
-// shellPackages runs one of the build's package-list functions and returns what it
-// printed.
-func shellPackages(t *testing.T, script, fn string) []string {
-	t.Helper()
-
-	aliases, err := filepath.Abs(filepath.Join("..", "internal", "runnerimages",
-		"apt-aliases.json"))
-	if err != nil {
-		t.Fatalf("resolve the aliases: %v", err)
-	}
-
-	toolset, err := filepath.Abs(toolsetPathForTest)
-	if err != nil {
-		t.Fatalf("resolve the toolset: %v", err)
-	}
-
-	body := "#!/usr/bin/env bash\nset -uo pipefail\nAPT_ALIASES=" + aliases + "\n" +
-		"TOOLSET_FILE=" + toolset + "\n" +
-		scriptFunction(t, script, fn) + "\n" + fn + " \"$TOOLSET_FILE\"\n"
-
-	path := filepath.Join(t.TempDir(), "run.sh")
-	if err := forkSafeWriteFile(path, []byte(body), 0o700); err != nil {
-		t.Fatalf("write the harness: %v", err)
-	}
-
-	out, err := exec.CommandContext(t.Context(), "bash", path).CombinedOutput()
-	if err != nil {
-		t.Fatalf("running %s: %v\n%s", fn, err, out)
-	}
-
-	return strings.Fields(string(out))
 }
 
 // gateDeclared is the set the guest gate requires, read by asking it about an
@@ -138,21 +108,15 @@ func gateDeclared(t *testing.T) []string {
 	return strings.Fields(out)
 }
 
-// scriptFunction extracts one shell function from a named script.
-func scriptFunction(t *testing.T, script, name string) string {
-	t.Helper()
+// pipxPackage is the one name the EC2 build installs from apt and the guest gate
+// does not require as a package: GitHub's install-python.sh installs pipx with
+// pip, so the gate checks that the command runs instead.
+const pipxPackage = "pipx"
 
-	source := readScriptFile(t, script)
-
-	start := strings.Index(source, name+"() {")
-	if start < 0 {
-		t.Fatalf("%s has no %s function", script, name)
-	}
-
-	end := strings.Index(source[start:], "\n}\n")
-	if end < 0 {
-		t.Fatalf("could not find the end of %s in %s", name, script)
-	}
-
-	return source[start : start+end+2]
+// gateRequiredPackages is the declaration's package list as the guest gate
+// requires it: everything the EC2 build installs, less pipx.
+func gateRequiredPackages(ts runnerimages.Toolset) []string {
+	return slices.DeleteFunc(ts.AptPackages(), func(pkg string) bool {
+		return pkg == pipxPackage
+	})
 }
