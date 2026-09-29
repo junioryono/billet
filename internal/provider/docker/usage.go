@@ -40,6 +40,13 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 	if err != nil {
 		return provider.UsageTarget{}, fmt.Errorf("docker: container %s: %w", instanceID, err)
 	}
+	// THE CGROUP MUST NAME THE CONTAINER, under either driver: the pid inspect
+	// returned can have exited and been reused between the two reads, and a
+	// reused pid's cgroup is some other process's.
+	if !cgroupNames(rel, instanceID) {
+		return provider.UsageTarget{}, fmt.Errorf("docker: pid %d is in %s, which is not container %s's",
+			pid, rel, instanceID)
+	}
 
 	return provider.UsageTarget{CgroupDir: filepath.Join(cgroupMount, rel)}, nil
 }
@@ -62,4 +69,15 @@ func unifiedCgroup(data string) (string, error) {
 	}
 
 	return "", errors.New("no cgroup-v2 entry, so this host's containers cannot be measured")
+}
+
+// cgroupNames reports whether a cgroup path is a container's own: the last
+// element is docker-<id>.scope (systemd driver) or <id> (cgroupfs driver).
+func cgroupNames(rel, containerID string) bool {
+	if containerID == "" {
+		return false
+	}
+	last := path.Base(rel)
+
+	return last == containerID || last == "docker-"+containerID+".scope"
 }

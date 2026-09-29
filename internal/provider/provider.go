@@ -446,6 +446,9 @@ type UsageTarget struct {
 	// PID is the VMM process whose threads split guest time from its own, zero
 	// for an instance with no VMM.
 	PID int
+	// PIDStart is PID's start time when the target was made, checked on every
+	// read so a reused pid is never charged to this instance.
+	PIDStart uint64
 	// VCPUThreadPrefix names the threads that run guest code.
 	VCPUThreadPrefix string
 	// NetDevice is the host's end of the instance's network device, empty when

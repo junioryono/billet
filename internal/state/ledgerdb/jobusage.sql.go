@@ -94,7 +94,7 @@ func (q *Queries) RecordJobSeries(ctx context.Context, arg RecordJobSeriesParams
 	return err
 }
 
-const recordJobUsage = `-- name: RecordJobUsage :exec
+const recordJobUsage = `-- name: RecordJobUsage :execrows
 
 INSERT INTO job_usage
      (lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
@@ -151,8 +151,12 @@ type RecordJobUsageParams struct {
 // DO NOTHING ON CONFLICT, because a node reports once and a retry after a lost
 // answer carries the same summary; a second report is not allowed to replace
 // the first. The epoch fence is the caller's, in the same transaction.
-func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) error {
-	_, err := q.db.ExecContext(ctx, recordJobUsage,
+//
+// THE ROW COUNT SAYS WHETHER THIS REPORT WON, and only the report that won may
+// write the series: otherwise a first report without a series and a second
+// with one would be stored as a pair neither request sent.
+func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recordJobUsage,
 		arg.LeaseID,
 		arg.Node,
 		arg.RecordedAt,
@@ -183,5 +187,8 @@ func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) 
 		arg.EnergyIdleUj,
 		arg.EnergySource,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

@@ -112,9 +112,14 @@ func encode(points []Point) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// maxDecodedSeries bounds what DecodeSeries will inflate, so a ledger row
-// cannot make a reader allocate without limit.
-const maxDecodedSeries = 64 << 20
+// maxDecodedSeries bounds what DecodeSeries will inflate, and maxDecodedPoints
+// how many points it will allocate for, so a ledger row cannot make a reader
+// allocate without limit. A monitor never keeps more than maxPoints plus the
+// final one.
+const (
+	maxDecodedSeries = 64 << 20
+	maxDecodedPoints = 2 * maxPoints
+)
 
 // DecodeSeries reverses EncodeSeries.
 func DecodeSeries(data []byte) ([]Point, error) {
@@ -131,7 +136,9 @@ func DecodeSeries(data []byte) ([]Point, error) {
 		return nil, fmt.Errorf("usage: the series has %d columns, want %d", columns, len(SeriesColumns))
 	}
 	n, err := binary.ReadUvarint(r)
-	if err != nil || n > uint64(len(raw)) {
+	// EVERY VALUE IS AT LEAST ONE BYTE, so a count the remaining bytes cannot
+	// hold is refused before anything is allocated for it.
+	if err != nil || n > maxDecodedPoints || n*uint64(len(SeriesColumns)) > uint64(r.Len()) {
 		return nil, errors.New("usage: the series has no valid point count")
 	}
 	values := make([][]int64, n)
@@ -146,6 +153,13 @@ func DecodeSeries(data []byte) ([]Point, error) {
 				return nil, fmt.Errorf("usage: the series ends inside column %s", SeriesColumns[col])
 			}
 			prev += d
+			// EVERY COLUMN IS A COUNT, A LEVEL OR AN OFFSET, none of them negative,
+			// which also catches overflow: prev is never negative before this add,
+			// so a positive d that overflows wraps negative, and a negative d
+			// cannot overflow.
+			if prev < 0 {
+				return nil, fmt.Errorf("usage: column %s goes negative", SeriesColumns[col])
+			}
 			values[i][col] = prev
 		}
 	}
@@ -155,6 +169,9 @@ func DecodeSeries(data []byte) ([]Point, error) {
 	points := make([]Point, n)
 	for i, v := range values {
 		points[i] = pointFrom(v)
+		if i > 0 && points[i].OffsetMillis < points[i-1].OffsetMillis {
+			return nil, errors.New("usage: the series goes back in time")
+		}
 	}
 
 	return points, nil

@@ -34,6 +34,12 @@ func TestAMicroVMsCountersAreWhereTheJailerPutThem(t *testing.T) {
 	}
 
 	h.p.pidOwner = func(got int, id string) (bool, error) { return got == pid && id == inst.ID, nil }
+	h.p.processStart = func(got int) (uint64, error) {
+		if got != pid {
+			t.Errorf("asked the start time of pid %d, want the vmm's %d", got, pid)
+		}
+		return 298947558, nil
+	}
 	target, err := h.p.UsageTarget(t.Context(), inst.ID)
 	if err != nil {
 		t.Fatalf("UsageTarget: %v", err)
@@ -41,7 +47,7 @@ func TestAMicroVMsCountersAreWhereTheJailerPutThem(t *testing.T) {
 	if want := filepath.Join(root, "firecracker-v1.16.1", inst.ID); target.CgroupDir != want {
 		t.Errorf("cgroup = %s, want %s", target.CgroupDir, want)
 	}
-	if target.PID != pid || target.NetDevice != res.Tap || !target.NetHostView ||
+	if target.PID != pid || target.PIDStart != 298947558 || target.NetDevice != res.Tap || !target.NetHostView ||
 		target.VCPUThreadPrefix != "fc_vcpu" {
 		t.Errorf("target = %+v, want pid %d on tap %s seen from the host", target, pid, res.Tap)
 	}
@@ -51,5 +57,16 @@ func TestAMicroVMsCountersAreWhereTheJailerPutThem(t *testing.T) {
 	h.p.pidOwner = func(int, string) (bool, error) { return false, nil }
 	if _, err := h.p.UsageTarget(t.Context(), inst.ID); err == nil {
 		t.Error("a reused pid was measured as the microVM's")
+	}
+
+	// AND A PID THAT CHANGES HANDS BETWEEN THE PROOF AND THE START TIME: the
+	// start time read would be the newcomer's.
+	proofs := 0
+	h.p.pidOwner = func(int, string) (bool, error) {
+		proofs++
+		return proofs == 1, nil
+	}
+	if _, err := h.p.UsageTarget(t.Context(), inst.ID); err == nil {
+		t.Error("a start time read after the pid changed hands was kept")
 	}
 }

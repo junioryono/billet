@@ -152,6 +152,9 @@ type Provider struct {
 	// construction, and only a present controller is ever asked of the jailer.
 	wantAccounting bool
 	accounting     Accounting
+	// processStart reads a pid's start time; a seam for the tests, whose VMM
+	// pid is a process that has exited.
+	processStart func(pid int) (uint64, error)
 }
 
 // runner executes one command. A seam, so a test can assert the ARGUMENTS billet
@@ -276,6 +279,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		bootWait: DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
+	p.processStart = hostProcessStart
 	p.removeCgroupAtFn = p.removeCgroupAt
 	p.procMountsPath = defaultProcMountsPath
 
