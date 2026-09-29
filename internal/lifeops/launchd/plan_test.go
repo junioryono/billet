@@ -124,6 +124,21 @@ func TestLoadedRefusalsCatchesADefinitionThatDrifted(t *testing.T) {
 		t.Fatalf("a job loaded from the shipped agent was refused: %v", got)
 	}
 
+	// NOR IS A HEALTHY macOS 27 HOST, whose launchd loads the declared 88200 as
+	// 60 (measured 2026-09-29). Refusing it refused every `local up` after the
+	// first, for the one value launchd would ever load.
+	clamped := matching
+	clamped.ExitTimeout = exitTimeoutCeiling
+
+	if want.ExitTimeout <= exitTimeoutCeiling {
+		t.Fatalf("the shipped agent declares ExitTimeOut %d, not above the ceiling, so this case "+
+			"proves nothing", want.ExitTimeout)
+	}
+
+	if got := c.loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) != 0 {
+		t.Fatalf("a job launchd loaded at its %ds ceiling was refused: %v", exitTimeoutCeiling, got)
+	}
+
 	drift := func(f func(*Job)) Job {
 		j := matching
 		j.Environment = map[string]string{}

@@ -413,6 +413,49 @@ func TestStopAndProveWaitsOutARealDrain(t *testing.T) {
 	}
 }
 
+// A DRAIN OUTLASTS launchd's CLAMPED GRACE, because launchd is not the one who
+// asked.
+//
+// macOS 27 loads a declared ExitTimeOut above 60 as 60, and a bootout of an agent
+// still draining is SIGKILLed then (measured 2026-09-29: killed at 61s, the drain
+// never finished). StopAndProve sends the SIGTERM itself and waits, so a drain
+// of 70s completes and the agent is not restarted. Opt-in, because it takes over
+// a minute: BILLET_LAUNCHD_LONG_DRAIN=1.
+func TestStopAndProveOutlastsTheClampedExitTimeout(t *testing.T) {
+	if os.Getenv("BILLET_LAUNCHD_LONG_DRAIN") != "1" {
+		t.Skip("set BILLET_LAUNCHD_LONG_DRAIN=1 to run the 70s drain against a real launchd")
+	}
+
+	c, label := realLaunchd(t)
+
+	dir := t.TempDir()
+	job := bootstrap(t, c, label, writeAgent(t, label, dir, 88200, 70))
+
+	start := time.Now()
+
+	got, err := c.StopAndProve(t.Context(), label)
+	if err != nil {
+		t.Fatalf("StopAndProve: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if got.Gone != lifeops.Yes {
+		t.Errorf("Gone = %v, want yes", got.Gone)
+	}
+
+	// THE DRAIN RAN TO ITS END: the agent writes `exit` only after its full sleep,
+	// so a SIGKILL at launchd's grace leaves it out.
+	if log := agentLog(t, dir); !strings.Contains(log, "exit") {
+		t.Fatalf("the agent never finished its drain after %s (loaded exit timeout %d): %q",
+			elapsed, job.ExitTimeout, log)
+	}
+
+	if elapsed < 65*time.Second {
+		t.Errorf("StopAndProve returned after %s against a 70s drain", elapsed)
+	}
+}
+
 // ExitTimeOut IS REAL, AND launchd's DEFAULT IS FIVE SECONDS.
 //
 // The second half is the one that was wrong in billet's own shipped comments,

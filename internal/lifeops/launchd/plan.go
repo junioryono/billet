@@ -289,6 +289,19 @@ func (c *Converger) planOne(ctx context.Context, label string) (lifeops.UnitPlan
 	return unit, refusals, nil
 }
 
+// exitTimeoutCeiling is the most launchd loads for a launch agent's
+// ExitTimeOut: measured on macOS 27.0 (2026-09-29), a declared 61, 600, 3600 or
+// 88200 all loaded as 60, and 30 loaded as 30. A stop no longer depends on it,
+// because StopAndProve lets the process drain before launchd is asked, so the
+// loaded value is judged against what launchd can load rather than refused for
+// being what it always will be.
+const exitTimeoutCeiling = 60
+
+// loadableExitTimeout is what launchd loads for a declared ExitTimeOut.
+func loadableExitTimeout(declared int) int {
+	return min(declared, exitTimeoutCeiling)
+}
+
 // loadedRefusals compares the job launchd LOADED against the agent billet ships.
 //
 // THE LOADED JOB IS NOT ITS PLIST, and this is the measurement the whole backend
@@ -325,10 +338,16 @@ func (c *Converger) loadedRefusals(label string, job Job, shipped string) []life
 			job.Arguments, want.Arguments))
 	}
 
-	if job.ExitTimeoutKnown && want.ExitTimeoutKnown && job.ExitTimeout != want.ExitTimeout {
+	// THE DECLARED VALUE OR THE CLAMPED ONE, because the clamp is measured on
+	// macOS 27 and an earlier release that loads the value as written must not
+	// be refused for it. Anything else is a stale bootstrap, such as launchd's
+	// own five-second default.
+	if job.ExitTimeoutKnown && want.ExitTimeoutKnown && job.ExitTimeout != want.ExitTimeout &&
+		job.ExitTimeout != loadableExitTimeout(want.ExitTimeout) {
 		differ = append(differ, fmt.Sprintf("launchd will SIGKILL it %ds after asking it to "+
-			"stop, rather than the %ds this build's agent declares — a node draining a job "+
-			"would be killed through the middle of it", job.ExitTimeout, want.ExitTimeout))
+			"stop, rather than the %ds this build's agent declares (%ds as launchd loads it) — "+
+			"a node draining a job would be killed through the middle of it",
+			job.ExitTimeout, want.ExitTimeout, loadableExitTimeout(want.ExitTimeout)))
 	}
 
 	if diff := environmentDiff(job.Environment, want.Environment); diff != "" {

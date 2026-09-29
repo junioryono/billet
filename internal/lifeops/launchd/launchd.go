@@ -64,6 +64,9 @@ type Converger struct {
 	// reason: the stop proof's whole job is to keep asking this after launchd
 	// has stopped answering.
 	alive func(pid int) bool
+	// terminate delivers the one SIGTERM a stop sends to the agent's own
+	// process. A seam so the drain-first order is exercised without a process.
+	terminate func(pid int) error
 
 	// agentsDir is where a launch agent's plist has to be for launchd to load
 	// it at login. A field so a test has one it can write to.
@@ -147,6 +150,7 @@ func New(opts ...Option) *Converger {
 		stabilityWait: DefaultStabilityWait,
 		startWindow:   DefaultStartWindow,
 		alive:         processAlive,
+		terminate:     terminateProcess,
 		sleep:         sleep,
 		agentsDir:     filepath.Join(homeOf(os.Getuid()), "Library", "LaunchAgents"),
 		logDir:        defaultLogDir,
@@ -315,6 +319,21 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 
 	watch(before)
 
+	// THE DRAIN IS THE PROCESS'S OWN, AND LAUNCHD IS NOT ASKED UNTIL IT IS OVER.
+	// launchd SIGKILLs a job ExitTimeOut seconds after IT sends the SIGTERM, and
+	// macOS 27 clamps a launch agent's ExitTimeOut to 60 (measured 2026-09-29:
+	// declared 61, 600 and 88200 all loaded as 60), so a bootout of a node
+	// still draining killed it a minute in. The SIGTERM is billet's instead,
+	// sent once (a second one escalates the drain), and the wait for the
+	// process to leave is bounded only by the caller. A node that drained exits
+	// 0, which KeepAlive{SuccessfulExit: false} does not restart, and the bootout
+	// below then has no process to kill.
+	if before.PIDKnown && before.PID > 0 {
+		if result, err := c.drainFirst(ctx, label, before.PID, watch, watched); err != nil {
+			return result, err
+		}
+	}
+
 	// A BOOTOUT THAT DID NOT SUCCEED IS NOT A STOP. `run` reports a non-zero
 	// exit separately from an error precisely so it can be acted on, and
 	// ignoring it here meant a refused bootout — a permission problem, a domain
@@ -394,6 +413,62 @@ func (c *Converger) StopAndProve(ctx context.Context, label string) (lifeops.Sto
 				"proved gone; it %s", label, result.How)
 		}
 	}
+}
+
+// drainFirst sends the loaded process its one SIGTERM and waits until it has
+// exited, or until launchd names a different pid for the label, which is a
+// restart after a non-zero exit: the bootout that follows stops that process
+// under launchd's own grace, the one case this order cannot cover.
+//
+// THE PID IS THE ONE launchd NAMED FOR THIS LABEL a moment ago. A process that
+// has already gone answers ESRCH, which is the stop having happened.
+func (c *Converger) drainFirst(
+	ctx context.Context, label string, pid int, watch func(Job), watched map[int]bool,
+) (lifeops.StopResult, error) {
+	if err := c.terminate(pid); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return lifeops.StopResult{
+			Gone: lifeops.Unknown,
+			How:  fmt.Sprintf("could not be asked to stop (pid %d)", pid),
+		}, fmt.Errorf("launchd: send SIGTERM to %s (pid %d): %w", label, pid, err)
+	}
+
+	for c.alive(pid) {
+		now, loaded, err := c.job(ctx, label)
+		if err != nil {
+			return lifeops.StopResult{
+				Gone: lifeops.Unknown,
+				How:  "could not be asked about while it drained",
+			}, err
+		}
+
+		watch(now)
+
+		if loaded && now.PIDKnown && now.PID > 0 && now.PID != pid {
+			return lifeops.StopResult{}, nil
+		}
+
+		if !c.sleep(ctx, stopPoll) {
+			result := lifeops.StopResult{
+				Gone: lifeops.Unknown,
+				How:  c.stillThere(label, watched, c.anyAlive(watched)),
+			}
+
+			if err := ctx.Err(); err != nil {
+				return result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain: %w",
+					label, err)
+			}
+
+			return result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain; it %s",
+				label, result.How)
+		}
+	}
+
+	return lifeops.StopResult{}, nil
+}
+
+// terminateProcess sends a process SIGTERM.
+func terminateProcess(pid int) error {
+	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
 // anyAlive counts how many of the watched pids are still live processes.

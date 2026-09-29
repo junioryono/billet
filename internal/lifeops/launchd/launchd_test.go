@@ -51,6 +51,12 @@ type fake struct {
 	// was the first version, and which of the two arrived first decided the
 	// result -- so the test could fail for a reason it did not name.
 	onTick func(remaining int)
+
+	// terms records every SIGTERM the stop sent, by pid; nothing is delivered.
+	terms []int
+	// exitOnTerm models a node with nothing to drain: its process is gone the
+	// moment its SIGTERM arrives.
+	exitOnTerm bool
 }
 
 func (f *fake) run(_ context.Context, args []string) (string, int, error) {
@@ -83,6 +89,17 @@ func (f *fake) converger(t *testing.T) *Converger {
 	c.uid = 501
 	c.run = f.run
 	c.alive = func(pid int) bool { return f.alive[pid] }
+	// NEVER A REAL SIGNAL: these pids are invented, and on the machine running
+	// the test they may name somebody's process.
+	c.terminate = func(pid int) error {
+		f.terms = append(f.terms, pid)
+
+		if f.exitOnTerm {
+			f.alive[pid] = false
+		}
+
+		return nil
+	}
 	c.sleep = func(ctx context.Context, _ time.Duration) bool {
 		if err := ctx.Err(); err != nil {
 			return false
@@ -169,6 +186,70 @@ func TestStopAndProveWaitsForTheProcessAndNotJustTheRecord(t *testing.T) {
 	}
 }
 
+// THE DRAIN FINISHES BEFORE launchd IS ASKED ANYTHING.
+//
+// launchd SIGKILLs a job ExitTimeOut seconds after its own SIGTERM, and macOS 27
+// clamps that to 60 (measured 2026-09-29), so a bootout of a node still draining
+// killed its jobs a minute in. The stop sends the process one SIGTERM itself,
+// waits however long the drain takes, and only then boots out a job with no
+// process left.
+func TestStopAndProveLetsTheProcessDrainBeforeTheBootout(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{
+		t:     t,
+		ticks: 100,
+		alive: map[int]bool{4242: true},
+		replies: map[string][]reply{
+			"bootout": {{}},
+			"print": {
+				{out: printOut("state = running", "pid = 4242")},
+				// Draining: still loaded, same pid, for as long as the drain runs.
+				{out: printOut("state = running", "pid = 4242")},
+			},
+		},
+	}
+
+	// A DRAIN LONGER THAN ANY GRACE launchd WOULD GIVE, in poll ticks.
+	f.onTick = func(remaining int) {
+		if remaining == 30 {
+			f.alive[4242] = false
+			f.replies["print"] = []reply{{out: "", code: notLoaded}}
+		}
+	}
+
+	var aliveAtBootout []bool
+
+	f.before = func(args []string) {
+		if args[0] == "bootout" {
+			aliveAtBootout = append(aliveAtBootout, f.alive[4242])
+		}
+	}
+
+	got, err := f.converger(t).StopAndProve(t.Context(), "sh.billet.node")
+	if err != nil {
+		t.Fatalf("StopAndProve: %v", err)
+	}
+
+	if got.Gone != lifeops.Yes {
+		t.Errorf("Gone = %v, want yes", got.Gone)
+	}
+
+	if len(f.terms) != 1 || f.terms[0] != 4242 {
+		t.Errorf("SIGTERMs sent = %v, want exactly one to 4242: a second one escalates the drain",
+			f.terms)
+	}
+
+	if len(aliveAtBootout) != 1 || aliveAtBootout[0] {
+		t.Errorf("bootout ran with the process alive (%v): launchd's grace, not the drain, "+
+			"would decide when the node dies", aliveAtBootout)
+	}
+
+	if f.ticks > 30 {
+		t.Errorf("the stop returned after %d ticks, before the drain ended at tick 70", 100-f.ticks)
+	}
+}
+
 // AND IT NEVER REPORTS A STOP WHILE A WATCHED PROCESS IS ALIVE.
 func TestStopAndProveRefusesWhileTheProcessLives(t *testing.T) {
 	t.Parallel()
@@ -213,9 +294,10 @@ func TestStopAndProveRefusesABootoutThatFailed(t *testing.T) {
 	t.Parallel()
 
 	f := &fake{
-		t:     t,
-		ticks: 4,
-		alive: map[int]bool{4242: true},
+		t:          t,
+		ticks:      4,
+		alive:      map[int]bool{4242: true},
+		exitOnTerm: true,
 		replies: map[string][]reply{
 			"print":   {{out: printOut("state = running", "pid = 4242")}},
 			"bootout": {{out: "Boot-out failed: 1: Operation not permitted", code: 1}},
