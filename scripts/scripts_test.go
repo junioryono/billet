@@ -230,16 +230,24 @@ func readCalls(t *testing.T, path string) string {
 
 // publishDir builds the output directory a publish runs against: the manifest,
 // its signature, the release notes, and each named asset.
-// publishDir writes a publication directory: the manifest, with each "DIGEST" in
-// it replaced by the sha256 of the bytes every named asset holds, and the assets.
+// publishDir writes a publication directory: the assets, each holding its own
+// name as its bytes, and the manifest with each "DIGEST:<name>" in it replaced by
+// the sha256 of that asset's bytes, so every asset has a digest of its own.
 func publishDir(t *testing.T, manifest string, assets ...string) string {
 	t.Helper()
 
 	dir := t.TempDir()
-	digest := sha256.Sum256([]byte("bytes"))
+
+	// LONGEST FIRST: "DIGEST:rootfs.img.zst" is a prefix of each part's placeholder.
+	for _, name := range []string{
+		"rootfs.img.zst.part000", "rootfs.img.zst.part001", "rootfs.img.zst", "vmlinux-billet",
+	} {
+		digest := sha256.Sum256([]byte(name))
+		manifest = strings.ReplaceAll(manifest, "DIGEST:"+name, hex.EncodeToString(digest[:]))
+	}
 
 	for name, body := range map[string]string{
-		"manifest.json":          strings.ReplaceAll(manifest, "DIGEST", hex.EncodeToString(digest[:])),
+		"manifest.json":          manifest,
 		"manifest.sigstore.json": "{}",
 		"release-notes.md":       "notes",
 	} {
@@ -249,7 +257,7 @@ func publishDir(t *testing.T, manifest string, assets ...string) string {
 	}
 
 	for _, name := range assets {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("bytes"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
@@ -275,11 +283,11 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
   "rootfs_multipart": {
     "name": "rootfs.img.zst", "sha256": "x", "size": 2,
     "parts": [
-      {"name": "rootfs.img.zst.part000", "sha256": "DIGEST", "size": 1},
-      {"name": "rootfs.img.zst.part001", "sha256": "DIGEST", "size": 1}
+      {"name": "rootfs.img.zst.part000", "sha256": "DIGEST:rootfs.img.zst.part000", "size": 1},
+      {"name": "rootfs.img.zst.part001", "sha256": "DIGEST:rootfs.img.zst.part001", "size": 1}
     ]
   },
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
 }`
 
 	for _, tc := range []struct {
@@ -306,6 +314,32 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			name: "a part that is not the file the manifest describes stops the publish",
 			dir: truncated(t, publishDir(t, multipart,
 				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "rootfs.img.zst.part001"),
+			wantSuccess: false,
+		},
+		{
+			name: "two parts swapped stop the publish",
+			dir: swapped(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001"),
+			wantSuccess: false,
+		},
+		{
+			name: "no release notes stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "release-notes.md"),
+			wantSuccess: false,
+		},
+		{
+			name: "no signature bundle stops the publish before the tag",
+			dir: without(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "manifest.sigstore.json"),
+			wantSuccess: false,
+		},
+		{
+			name: "a name carrying a digest is refused rather than split",
+			dir: publishDir(t, strings.Replace(multipart, `"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet"`,
+				`"name": "vmlinux-billet DIGEST:vmlinux-billet", "sha256": ""`, 1),
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"),
 			wantSuccess: false,
 		},
 	} {
@@ -369,6 +403,30 @@ exit 0
 	}
 }
 
+// swapped exchanges two assets of a publication directory, each still complete.
+func swapped(t *testing.T, dir, a, b string) string {
+	t.Helper()
+
+	for _, move := range [][2]string{{a, "swap"}, {b, a}, {"swap", b}} {
+		if err := os.Rename(filepath.Join(dir, move[0]), filepath.Join(dir, move[1])); err != nil {
+			t.Fatalf("swap %s and %s: %v", a, b, err)
+		}
+	}
+
+	return dir
+}
+
+// without removes one file from a publication directory.
+func without(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		t.Fatalf("remove %s: %v", name, err)
+	}
+
+	return dir
+}
+
 // truncated cuts one asset of a publication directory short, as a download that
 // ran out of disk leaves it.
 func truncated(t *testing.T, dir, name string) string {
@@ -420,8 +478,8 @@ exit 97
 
 			cmd := exec.CommandContext(t.Context(), publisher, publishDir(t, `{
   "schema": 1,
-  "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST", "size": 1},
-  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST", "size": 1}
+  "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST:rootfs.img.zst", "size": 1},
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST:vmlinux-billet", "size": 1}
 }`, "rootfs.img.zst", "vmlinux-billet"))
 			cmd.Env = append(os.Environ(),
 				"PATH="+tools+":"+os.Getenv("PATH"),

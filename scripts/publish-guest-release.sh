@@ -39,16 +39,35 @@ esac
 # AND EACH IS THE FILE THE MANIFEST DESCRIBES, by its digest. An artifact download
 # that ran out of disk reported success with files missing (2026-09-29), so a file
 # that is present can still be a truncated one, and nothing but its digest says so.
+#
+# EACH FIELD IS PROVED IN THE JSON, before anything splits it on whitespace: a name
+# the reader would accept (its own pattern) and a sha256 of 64 lowercase hex
+# digits. Split first, a name carrying a space and a digest would be checked as a
+# different file from the one the manifest promises.
 assets=$(jq -r '
     [.kernel]
     + (if .rootfs_multipart then .rootfs_multipart.parts else [.rootfs] end)
-    | .[] | "\(.name) \(.sha256)"
+    | .[]
+    | if ((.name | type) == "string" and (.name | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+          and (.sha256 | type) == "string" and (.sha256 | test("^[0-9a-f]{64}$")))
+      then "\(.name) \(.sha256)"
+      else error("the manifest names an asset with an unusable name or digest: \(.name | tojson)")
+      end
 ' "$out/manifest.json")
 
 if [ -z "$assets" ]; then
     printf 'the manifest names no assets to publish\n' >&2
     exit 2
 fi
+
+# THE SIGNATURE AND THE NOTES TOO, before any ref is written: gh reads the notes
+# only once the tag exists, so a missing file there would leave the tag behind.
+for file in manifest.sigstore.json release-notes.md; do
+    if [ ! -r "$out/$file" ]; then
+        printf 'the publication has no %s, so nothing is tagged or released\n' "$file" >&2
+        exit 2
+    fi
+done
 
 set -- "$out/manifest.json" "$out/manifest.sigstore.json"
 
