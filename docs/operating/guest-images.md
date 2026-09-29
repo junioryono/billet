@@ -25,6 +25,8 @@ billet images promote|unpromote <image>@<gen>
 
 **A source that is not billet's must say what makes it trustworthy.** Pointing at your own mirror and configuring nothing is refused rather than silently unverified: set `images.signing_identity` and `images.signing_issuer`, or pass `--skip-signature-verification` deliberately. Sideloading with `--from <dir>` applies the same policy; a directory is not more trustworthy than a download.
 
+**Verification grows the disk the way a launch does.** A launch grows each job's clone to the tier's `disk` with resize2fs before boot, so a filesystem resize2fs refuses boots nowhere on the fleet. `billet images verify` therefore launches its probe through the same grow: to the largest `disk` any firecracker tier in the config asks for, to 80GiB when none does (a node config with no tiers), or to what `--disk` names. The guest reports the size of the root filesystem it booted, and a verification whose filesystem is not the grown one fails. A generation that booted and reported on an ungrown disk, and then failed every launch for about ninety minutes, is why (2026-09-26).
+
 **`@verified` is what lets a fleet take up a new image with no config edit.** A tier names one of two things:
 
 ```yaml
