@@ -280,7 +280,7 @@ func TestRemovingTheLastTierStillReportsWhatItLeftBehind(t *testing.T) {
 // label, as a tier moved onto a shared name leaves it, is reported like any
 // other set no tier declares.
 func TestATierIsReconciledUnderItsRunsOn(t *testing.T) {
-	moved := tier("platform-4vcpu")
+	moved := tier("team-a-4vcpu")
 	moved.RunsOn = "billet-4vcpu"
 	tiers := []config.Tier{moved}
 
@@ -333,7 +333,7 @@ func TestATierIsReconciledUnderItsRunsOn(t *testing.T) {
 		t.Errorf("recorded %v, missing the set reconciled under runs_on", names)
 	}
 
-	if len(handler.warningsAbout(group, "platform-4vcpu")) == 0 {
+	if len(handler.warningsAbout(group, "team-a-4vcpu")) == 0 {
 		t.Error("the set left under the tier's old name was not reported as undeclared")
 	}
 
