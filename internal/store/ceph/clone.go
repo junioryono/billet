@@ -311,16 +311,25 @@ func isDeviceBusy(err error) bool {
 		strings.Contains(strings.ToLower(err.Error()), "device or resource busy")
 }
 
-// removeClone deletes a cache-pool image, treating an absent one as success.
+// removeClone takes a cache-pool image out of use, treating an absent one as
+// success.
+//
+// INTO THE TRASH, NOT `rbd rm`. A remove deletes every data object before it
+// returns, which for a heavily written 320GiB root clone outlasted the command's
+// bound: killed partway, it left the name in the pool directory with its header
+// gone and its objects still there, and every retry deleted another slice and
+// was killed again while the destroy, and the capacity behind it, stayed
+// refused (measured 2026-09-29). `rbd trash mv` moves the image's metadata and
+// returns at once; PurgeTrash deletes the data off the command path.
 func (c *Client) removeClone(ctx context.Context, name string) error {
 	spec := c.cfg.CachePool + "/" + name
 
-	if _, err := c.rbdCmd(ctx, false, "rm", spec); err != nil {
+	if _, err := c.rbdCmd(ctx, false, "trash", "mv", spec); err != nil {
 		if isNoSuchFile(err) {
 			return nil
 		}
 
-		return fmt.Errorf("ceph: remove %s as client.%s: %w", spec, c.cfg.User, err)
+		return fmt.Errorf("ceph: move %s to the trash as client.%s: %w", spec, c.cfg.User, err)
 	}
 
 	return nil

@@ -267,6 +267,17 @@ type StagedCredentialReaper interface {
 	ReapStagedCredential(ctx context.Context, instanceName string) error
 }
 
+// TrashPurger is a provider whose destroy only moves what it discarded out of
+// use, and which deletes it when asked. The node asks from its sweep, in the
+// background, because a large disk takes minutes to delete and the node serves
+// one command at a time. It returns how many it deleted.
+//
+// NOT PART OF A DESTROY'S PROOF. The compute is gone when Destroy says so; what
+// is purged here is storage no job can reach.
+type TrashPurger interface {
+	PurgeDiscarded(ctx context.Context) (int, error)
+}
+
 // InstanceName is billet's handle for the compute backing a lease.
 //
 // Derived rather than stored, and that is the whole trick: it means a running
