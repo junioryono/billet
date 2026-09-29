@@ -789,6 +789,22 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 	return c.run(ctx, c.bin, append(args, command...))
 }
 
+// rbdCmdWithin is rbdCmd under a bound of its own, for the one deletion that
+// takes minutes by nature and is only ever run off the command path.
+func (c *Client) rbdCmdWithin(ctx context.Context, bound time.Duration, asJSON bool,
+	command ...string,
+) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+
+	args := c.identity()
+	if asJSON {
+		args = append(args, "--format", "json")
+	}
+
+	return c.run(ctx, c.bin, append(args, command...))
+}
+
 // list counts the images in one pool.
 func (c *Client) list(ctx context.Context, pool string) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.wait)

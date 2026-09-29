@@ -2164,3 +2164,75 @@ func TestCloningRefreshesTheCurrentPointersLastUse(t *testing.T) {
 		t.Errorf("pointer use stayed at %s", refreshed.UsedAt)
 	}
 }
+
+// THE PURGE DELETES WHAT DISCARDS MOVED TO THE TRASH, AND NOTHING ELSE.
+//
+// A root clone and a discarded cache volume are billet's; another name in the
+// trash is somebody else's and is left alone. A parent a copy-on-write child
+// still reads answers ENOTEMPTY and waits for a later purge. Each deletion runs
+// under the purge's own bound, because a large image takes minutes and the
+// command bound is what left removals half-done.
+func TestPurgeTrashDeletesBilletsDiscardsUnderItsOwnBound(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+
+	var bounds []time.Duration
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "trash") && slices.Contains(args, "rm") {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Error("a trash removal ran with no deadline at all")
+			} else {
+				bounds = append(bounds, time.Until(deadline))
+			}
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	f.trash["id-root"] = "billet-624131f5"
+	f.trash["id-cache"] = "cache-v-1790048184-abc"
+	f.trash["id-parent"] = "cache-v-parent"
+	f.trash["id-other"] = "somebody-elses-image"
+	f.parents["billet-cache/child"] = "billet-cache/cache-v-parent@g1"
+
+	n, err := c.PurgeTrash(t.Context())
+	if err != nil {
+		t.Fatalf("PurgeTrash: %v", err)
+	}
+
+	if n != 2 {
+		t.Errorf("purged %d, want the root clone and the cache volume", n)
+	}
+
+	for _, gone := range []string{"id-root", "id-cache"} {
+		if _, ok := f.trash[gone]; ok {
+			t.Errorf("%s is still in the trash", gone)
+		}
+	}
+
+	if _, ok := f.trash["id-parent"]; !ok {
+		t.Error("a parent a child still reads was deleted")
+	}
+
+	if _, ok := f.trash["id-other"]; !ok {
+		t.Error("an image that is not billet's was deleted from the trash")
+	}
+
+	if len(bounds) == 0 {
+		t.Fatal("no trash removal was run")
+	}
+
+	for _, b := range bounds {
+		if b < PurgeTimeout-time.Minute {
+			t.Errorf("a trash removal ran under %s, not the purge's %s", b, PurgeTimeout)
+		}
+	}
+}

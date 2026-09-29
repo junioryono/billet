@@ -237,7 +237,7 @@ func TestACloneThatCannotBeGrownIsRemoved(t *testing.T) {
 		t.Fatal("CloneRoot reported success although sizing failed")
 	}
 
-	f.ran(t, "rm", "billet-cache/billet-abc")
+	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 	for _, call := range f.calls {
 		if subcommandOf(call) == "device map" {
 			t.Errorf("billet mapped a clone whose promised capacity was not established: %v", call)
@@ -376,7 +376,7 @@ func TestACloneThatCannotBeMappedIsRemoved(t *testing.T) {
 		t.Fatal("CloneRoot reported success although the map failed")
 	}
 
-	f.ran(t, "rm", "billet-cache/billet-abc")
+	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 }
 
 // A DEVICE PATH THAT IS NOT ONE IS REFUSED. The caller stats this value for a major
@@ -433,7 +433,32 @@ func TestDiscardUnmapsEveryMappingOfAClone(t *testing.T) {
 		}
 	}
 
-	f.ran(t, "rm", "billet-cache/billet-abc")
+	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
+}
+
+// A DISCARD NEVER DELETES THE DATA ITSELF.
+//
+// `rbd rm` deletes every object before it returns, and under the command's bound a
+// heavily written 320GiB root clone could not finish: killed partway, the name was
+// left in the pool with its objects, every retry was killed again, and the destroy,
+// with the capacity behind it, stayed refused (measured 2026-09-29). The discard
+// moves the clone to the trash, which is metadata only; PurgeTrash deletes it.
+func TestADiscardMovesTheCloneToTheTrashAndNeverRemovesIt(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+
+	if err := cloneClient(t, f).DiscardRoot(t.Context(), "billet-abc"); err != nil {
+		t.Fatalf("DiscardRoot: %v", err)
+	}
+
+	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
+
+	for _, call := range f.calls {
+		if subcommandOf(call) == "rm" {
+			t.Errorf("a discard ran `rbd rm`, which deletes the data on the command path: %v", call)
+		}
+	}
 }
 
 // AND IT IS IDEMPOTENT, because teardown runs on paths that have already failed
@@ -443,8 +468,8 @@ func TestDiscardingAnAbsentCloneIsSuccess(t *testing.T) {
 	t.Parallel()
 
 	f := newCloneFake()
-	f.failOn = "rm"
-	f.failErr = errors.New("exit status 2: rbd: delete error: (2) No such file or directory")
+	f.failOn = "trash"
+	f.failErr = errors.New("exit status 2: rbd: error: (2) No such file or directory")
 
 	if err := cloneClient(t, f).DiscardRoot(t.Context(), "billet-abc"); err != nil {
 		t.Errorf("discarding a clone that was already gone reported an error: %v", err)
@@ -457,8 +482,8 @@ func TestARemovalThatFailedForAnotherReasonIsReported(t *testing.T) {
 	t.Parallel()
 
 	f := newCloneFake()
-	f.failOn = "rm"
-	f.failErr = errors.New("exit status 39: rbd: error: image still has watchers")
+	f.failOn = "trash"
+	f.failErr = errors.New("exit status 16: rbd: error: image still has watchers")
 
 	if err := cloneClient(t, f).DiscardRoot(t.Context(), "billet-abc"); err == nil {
 		t.Error("a removal that failed for a real reason was reported as success")

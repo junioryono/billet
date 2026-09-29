@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -3133,5 +3134,71 @@ func TestARegistrationRemovalTheLedgerRefusesIsRetriedBeforeCompute(t *testing.T
 	}
 	if !slices.Equal(restartedJIT.ensureCalls, []string{lease.ID, lease.ID}) || len(p.destroyed) != 1 {
 		t.Fatalf("recovered order: removals %v destroys %v", restartedJIT.ensureCalls, p.destroyed)
+	}
+}
+
+// purgingProvider defers deletions to a purge, which it holds open until released.
+type purgingProvider struct {
+	*fakeProvider
+
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (p *purgingProvider) PurgeDiscarded(context.Context) (int, error) {
+	p.calls.Add(1)
+	p.started <- struct{}{}
+	<-p.release
+
+	return 1, nil
+}
+
+// A SWEEP STARTS THE PURGE AND DOES NOT WAIT FOR IT, AND NEVER STARTS TWO.
+//
+// Deleting a large root disk takes minutes and the sweep holds the node's one
+// command slot, so the purge runs beside it; a sweep that finds one still
+// running starts no second.
+func TestSweepStartsOnePurgeOfDiscardedStorageAndDoesNotWaitForIt(t *testing.T) {
+	t.Parallel()
+
+	p := &purgingProvider{
+		fakeProvider: &fakeProvider{kind: config.ProviderFirecracker},
+		started:      make(chan struct{}, 4),
+		release:      make(chan struct{}),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	// The first sweep returns while its purge is still held open.
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	<-p.started
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("second Sweep: %v", err)
+	}
+
+	if got := p.calls.Load(); got != 1 {
+		t.Fatalf("a sweep started a second purge while one ran: %d", got)
+	}
+
+	close(p.release)
+
+	for r.purging.Load() {
+		runtime.Gosched()
+	}
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("third Sweep: %v", err)
+	}
+
+	<-p.started
+
+	if got := p.calls.Load(); got != 2 {
+		t.Errorf("a sweep after the purge finished did not start another: %d", got)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -116,6 +117,10 @@ type LeaseStore interface {
 
 // Runner starts and stops the compute for assigned leases.
 type Runner struct {
+	// purging is set while a background purge of discarded storage runs, so a
+	// sweep starts at most one.
+	purging atomic.Bool
+
 	jit             JITSource
 	provider        provider.Provider
 	alloc           LeaseStore
@@ -1353,6 +1358,37 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 	return r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
 }
 
+// purgeDiscarded starts, in the background, the deletion of storage earlier
+// destroys moved out of use, when the provider defers it and no purge is
+// already running.
+//
+// NOT ON THE COMMAND PATH. The sweep holds the node's one command slot, and a
+// large root disk takes minutes to delete; the destroy that discarded it has
+// already been answered. Detached from the sweep's context, because the sweep
+// ends long before the purge, and bounded per image by the provider.
+func (r *Runner) purgeDiscarded(ctx context.Context) {
+	purger, ok := r.provider.(provider.TrashPurger)
+	if !ok || !r.purging.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer r.purging.Store(false)
+
+		n, err := purger.PurgeDiscarded(context.WithoutCancel(ctx))
+		if err != nil {
+			r.log.Warn("could not delete storage discarded by earlier destroys; the next sweep "+
+				"retries", "deleted", n, "error", err)
+
+			return
+		}
+
+		if n > 0 {
+			r.log.Info("deleted storage discarded by earlier destroys", "deleted", n)
+		}
+	}()
+}
+
 // Sweep destroys instances whose lease is no longer open on this node.
 //
 // The steady-state counterpart to Recover, and the reason a failed cleanup is
@@ -1391,6 +1427,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		r.log.Warn("could not tell the control plane what this host is running; capacity for "+
 			"compute it cannot account for stays held until this succeeds", "error", err)
 	}
+
+	r.purgeDiscarded(ctx)
 
 	if len(instances) == 0 {
 		return nil
