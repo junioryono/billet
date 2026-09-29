@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -229,13 +230,16 @@ func readCalls(t *testing.T, path string) string {
 
 // publishDir builds the output directory a publish runs against: the manifest,
 // its signature, the release notes, and each named asset.
+// publishDir writes a publication directory: the manifest, with each "DIGEST" in
+// it replaced by the sha256 of the bytes every named asset holds, and the assets.
 func publishDir(t *testing.T, manifest string, assets ...string) string {
 	t.Helper()
 
 	dir := t.TempDir()
+	digest := sha256.Sum256([]byte("bytes"))
 
 	for name, body := range map[string]string{
-		"manifest.json":          manifest,
+		"manifest.json":          strings.ReplaceAll(manifest, "DIGEST", hex.EncodeToString(digest[:])),
 		"manifest.sigstore.json": "{}",
 		"release-notes.md":       "notes",
 	} {
@@ -271,11 +275,11 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
   "rootfs_multipart": {
     "name": "rootfs.img.zst", "sha256": "x", "size": 2,
     "parts": [
-      {"name": "rootfs.img.zst.part000", "sha256": "a", "size": 1},
-      {"name": "rootfs.img.zst.part001", "sha256": "b", "size": 1}
+      {"name": "rootfs.img.zst.part000", "sha256": "DIGEST", "size": 1},
+      {"name": "rootfs.img.zst.part001", "sha256": "DIGEST", "size": 1}
     ]
   },
-  "kernel": {"name": "vmlinux-billet", "sha256": "y", "size": 1}
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST", "size": 1}
 }`
 
 	for _, tc := range []struct {
@@ -298,12 +302,19 @@ func TestGuestReleasePublisherUploadsWhatTheManifestNames(t *testing.T) {
 			dir:         publishDir(t, multipart, "rootfs.img.zst.part000", "vmlinux-billet"),
 			wantSuccess: false,
 		},
+		{
+			name: "a part that is not the file the manifest describes stops the publish",
+			dir: truncated(t, publishDir(t, multipart,
+				"rootfs.img.zst.part000", "rootfs.img.zst.part001", "vmlinux-billet"), "rootfs.img.zst.part001"),
+			wantSuccess: false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tools := t.TempDir()
 			calls := filepath.Join(tools, "calls.log")
 
-			writeExecutable(t, filepath.Join(tools, "git"), "#!/bin/sh\nexit 0\n")
+			writeExecutable(t, filepath.Join(tools, "git"),
+				"#!/bin/sh\nprintf 'git %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\nexit 0\n")
 			writeExecutable(t, filepath.Join(tools, "gh"), `#!/bin/sh
 printf 'gh %s\n' "$*" >> "$BILLET_TEST_CALLS"
 if [ "$1 $2" = "release view" ]; then printf 'true\n'; exit 0; fi
@@ -331,6 +342,11 @@ exit 0
 					t.Error("the release was created despite a missing asset; it is immutable, " +
 						"so the incomplete one is what every node now sees")
 				}
+				// NOR A TAG: a dated tag with no release behind it is what a
+				// refusal after the push left on the repository.
+				if strings.Contains(readCalls(t, calls), "git push") {
+					t.Error("the tag was pushed for a publication that was then refused")
+				}
 
 				return
 			}
@@ -351,6 +367,18 @@ exit 0
 			}
 		})
 	}
+}
+
+// truncated cuts one asset of a publication directory short, as a download that
+// ran out of disk leaves it.
+func truncated(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("byt"), 0o600); err != nil {
+		t.Fatalf("truncate %s: %v", name, err)
+	}
+
+	return dir
 }
 
 func TestGuestReleasePublisherRefusesAConflictingTag(t *testing.T) {
@@ -392,8 +420,8 @@ exit 97
 
 			cmd := exec.CommandContext(t.Context(), publisher, publishDir(t, `{
   "schema": 1,
-  "rootfs": {"name": "rootfs.img.zst", "sha256": "x", "size": 1},
-  "kernel": {"name": "vmlinux-billet", "sha256": "y", "size": 1}
+  "rootfs": {"name": "rootfs.img.zst", "sha256": "DIGEST", "size": 1},
+  "kernel": {"name": "vmlinux-billet", "sha256": "DIGEST", "size": 1}
 }`, "rootfs.img.zst", "vmlinux-billet"))
 			cmd.Env = append(os.Environ(),
 				"PATH="+tools+":"+os.Getenv("PATH"),

@@ -457,6 +457,8 @@ jobs:
     runs-on: ubuntu-24.04
 
     permissions:
+      # actions: read ONLY TO ASK THE ARTIFACT'S SIZE before downloading it.
+      actions: read
       contents: write
       id-token: write
 
@@ -468,6 +470,38 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      # ROOM FOR THE ARTIFACT, PROVED BEFORE IT IS FETCHED. The runner-images
+      # image packs to about 22GB, more than a hosted runner has free, and the
+      # download that ran out of disk reported success with files missing
+      # (2026-09-29). So the toolchains this job never uses are removed first, and
+      # the job refuses unless what is free holds the artifact with room to spare.
+      - name: Make room for the image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+
+          size=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '[.artifacts[] | select(.name == "guest-image") | .size_in_bytes] | first')
+          if ! [[ "$size" =~ ^[1-9][0-9]*$ ]]; then
+            echo "could not read the guest-image artifact's size (got '$size')" >&2
+            exit 1
+          fi
+
+          free=$(df --output=avail -B1 "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
+          needed=$(( size + 4 * 1024 * 1024 * 1024 ))
+          echo "the artifact is $(( size >> 30 ))GiB; $(( free >> 30 ))GiB free"
+          if [ "$free" -lt "$needed" ]; then
+            echo "only $(( free >> 30 ))GiB free for a $(( size >> 30 ))GiB artifact and its" >&2
+            echo "signature; this job cannot hold the image it would publish" >&2
+            exit 1
+          fi
 
       - name: Download the checked image
         uses: actions/download-artifact@v5
