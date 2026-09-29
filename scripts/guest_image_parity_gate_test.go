@@ -62,7 +62,7 @@ func TestTheParityGateNamesWhatIsMissing(t *testing.T) {
 			toolset:   realToolset,
 			installed: everything,
 			wantExit:  0,
-			wantOut:   []string{strconv.Itoa(len(ts.AptPackages()))},
+			wantOut:   []string{strconv.Itoa(len(gateRequiredPackages(ts)))},
 		},
 		{
 			name:      "a missing package is named",
@@ -110,7 +110,7 @@ func TestTheParityGateNamesWhatIsMissing(t *testing.T) {
 			toolset:   realToolset,
 			installed: everything,
 			wantExit:  0,
-			wantOut:   []string{strconv.Itoa(len(ts.AptPackages()))},
+			wantOut:   []string{strconv.Itoa(len(gateRequiredPackages(ts)))},
 		},
 		{
 			name:      "nothing installed reports everything",

@@ -3,7 +3,7 @@
 # WHY THIS EXISTS AT ALL. Every billet deployment needs the same microVM guest:
 # Ubuntu, Docker, the Actions runner, billet's agent. Nothing in it is specific to
 # an organisation. Having each operator build it means each of them needs root,
-# debootstrap and an hour, and each of them independently discovers that GitHub
+# a large machine and hours, and each of them independently discovers that GitHub
 # stops handing jobs to a runner more than thirty days past a release. Building it
 # once here makes that expiry one project's problem instead of everyone's.
 #
@@ -65,7 +65,14 @@ concurrency:
 jobs:
   build:
     name: Build and check
-    runs-on: ubuntu-24.04
+    # ON THE FLEET, because the runner-images build (#250) outgrew a hosted runner:
+    # GitHub's image is about 59GB used, and the build holds it beside its
+    # compressed copy and parts. A 16-vCPU guest with a large root disk holds that;
+    # a hosted runner's 14GB free plus what reclaiming buys does not. The tier is
+    # its own (320GiB disk) so everyday CI jobs do not grow a root that large. It is a
+    # Firecracker guest, so the build boots the image under systemd-nspawn, which
+    # needs no KVM.
+    runs-on: billet-image-builder-ubuntu-2404
 
     outputs:
       tag: ${{ steps.pack.outputs.tag }}
@@ -160,11 +167,10 @@ jobs:
           ref: ${{ steps.source.outputs.sha }}
           persist-credentials: false
 
-      # A HOSTED RUNNER HAS ABOUT 14 GB FREE and this build wants most of it: a
-      # debootstrapped tree, a 4 GB ext4 image on top of it, a kernel source tree
-      # and the compressed outputs. Removing toolchains this build will never use
-      # buys back more than twenty, and doing it FIRST means a disk-full failure
-      # cannot happen halfway through an hour-long build.
+      # THE BUILD WANTS MOST OF THE BUILDER'S DISK: an 80 GiB image file, a kernel
+      # source tree and the compressed outputs. Removing toolchains this build will
+      # never use buys back space, and doing it FIRST means a disk-full failure
+      # cannot happen halfway through a build that takes hours.
       - name: Reclaim runner disk
         run: |
           set -euo pipefail
@@ -192,10 +198,10 @@ jobs:
           # it from the build script means one edit rather than two, and the two
           # cannot drift into a check that passes for an image it cannot hold.
           #
-          # THE IMAGE, ITS BOOT CHECK'S COPY (`cp --reflink=auto` makes a full one
-          # where the filesystem has no reflinks), ITS COMPRESSED FORM AND ITS PARTS
-          # can all exist at once, so the floor is two images and half again, plus a
-          # few GB for the kernel build tree and the debootstrap cache.
+          # THE IMAGE, ITS COMPRESSED FORM AND ITS PARTS can all exist at once, so
+          # the floor is the image and half again, plus a few GB for the kernel build
+          # tree and the base tarball. There is no boot check's copy here any more:
+          # a Firecracker guest has no KVM to boot one in (see below).
           size_mb=$(sed -n 's/^SIZE_MB="\${SIZE_MB:-\([0-9]*\)}"$/\1/p' \
             scripts/build-guest-image.sh)
 
@@ -204,13 +210,13 @@ jobs:
             exit 1
           fi
 
-          needed=$(( size_mb * 5 / 2 / 1024 + 6 ))
+          needed=$(( size_mb * 3 / 2 / 1024 + 6 ))
 
           if [ "$after" -lt "$needed" ]; then
             echo "only ${after}GB free; a ${size_mb}M image needs about ${needed}GB here" >&2
             echo "" >&2
             echo "This job builds an image, compresses it, and holds a kernel tree beside" >&2
-            echo "both. A larger runner is what provides that; see the ADR." >&2
+            echo "both. The builder tier's disk is what provides that; see the ADR." >&2
             exit 1
           fi
 
@@ -220,9 +226,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # debootstrap STAYS WHILE A BUILDABLE RELEASE STILL USES IT: this job
+          # checks out the stable release's tree, whose build script may be the
+          # debootstrap one until a release carries the runner-images build.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            debootstrap e2fsprogs jq zstd unzip \
+            systemd-container xz-utils debootstrap e2fsprogs jq zstd unzip \
             build-essential flex bison libelf-dev libssl-dev bc \
             dnsmasq
 
@@ -391,51 +400,16 @@ jobs:
             "$WORK/$IMAGE_NAME.ext4" \
             "${{ github.workspace }}/out/manifest.json"
 
-      # THE SECOND HALF OF THE GATE: it has to BOOT.
+      # THE BOOT IS PROVED ON THE FLEET, NOT HERE. This job runs in a Firecracker
+      # guest, which has no KVM to boot another in, so the Firecracker boot this job
+      # used to make on a hosted runner cannot happen here. What proves a generation
+      # boots is what always decided whether the fleet uses it: `billet images pull
+      # --verify` on a node boots it, on a disk grown the way a launch grows one,
+      # and only a generation that passes becomes @verified. One that does not is
+      # published and never promoted, and the next reap removes it.
       #
-      # The check above reads the filesystem and can prove the agent is installed
-      # and the units enabled. It cannot prove the kernel boots this userspace,
-      # that systemd reaches its target, that the network comes up, or that the
-      # guest can reach the metadata service -- and those are precisely the
-      # failures that produce a microVM which starts and then does nothing.
-      #
-      # THIS IS POSSIBLE AT ALL BECAUSE HOSTED RUNNERS HAVE KVM. GitHub extended it
-      # to 2-vCPU runners in April 2024, and a Firecracker microVM manager runs its
-      # end-to-end suite on stock ubuntu-latest today. GitHub documents it only as
-      # an Android-emulator feature and never as a general guarantee, so the script
-      # asserts /dev/kvm itself and says plainly that its absence is not the
-      # image's fault.
-      #
-      # firecracker is fetched pinned rather than built: it is a released binary
-      # with a published checksum, and building it would add a rust toolchain to a
-      # job that has no other use for one.
-      - name: Install firecracker
-        run: |
-          set -euo pipefail
-
-          curl -fL -sS --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
-            --connect-timeout 20 --max-time 300 \
-            -o /tmp/fc.tgz \
-            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-x86_64.tgz"
-
-          tar xf /tmp/fc.tgz -C /tmp
-
-          sudo install -m 0755 \
-            "/tmp/release-v${FC_VERSION}-x86_64/firecracker-v${FC_VERSION}-x86_64" \
-            /usr/local/bin/firecracker
-
-          firecracker --version
-        env:
-          FC_VERSION: "1.13.1"
-
-      - name: Boot the image and prove it came up
-        run: |
-          set -euo pipefail
-
-          sudo --preserve-env=KERNEL,ROOTFS scripts/boot-guest-image.sh
-        env:
-          KERNEL: ${{ github.workspace }}/out/vmlinux-billet
-          ROOTFS: /var/tmp/billet-guest/ubuntu-2404-x64.ext4
+      # The gate above still runs on the image's contents here, before anything is
+      # uploaded.
 
       # THE BUILD JOB CANNOT PUBLISH. Its one handoff is an ordinary workflow
       # artifact; the privileged job below consumes it only when this exact run is

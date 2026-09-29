@@ -61,8 +61,10 @@ func TestEverythingThatReadsTheImageRunsBeforeTheUnmount(t *testing.T) {
 	for _, tc := range []struct{ call, why string }{
 		{"read_guest_contract", "the guest contract is read out of the agent INSIDE the " +
 			"image; after the unmount there is no agent to read"},
-		{"install_toolcache", "the toolcache is written into the image; after the unmount " +
-			"it would land on the build host"},
+		{"run_runner_images_build", "GitHub's build is run in the image; after the unmount " +
+			"there is no image to boot"},
+		{"write_image_env", "the job environment is read out of the image's " +
+			"/etc/environment; after the unmount there is none to read"},
 	} {
 		at := strings.Index(main, tc.call)
 
@@ -75,51 +77,39 @@ func TestEverythingThatReadsTheImageRunsBeforeTheUnmount(t *testing.T) {
 	}
 }
 
-// TestTheImageEnvironmentFileIsCreatedOnceAndBeforeItIsAppendedTo guards an
-// ordering that silently discarded everything the JDK step wrote.
+// TestTheImageEnvironmentIsWrittenOnceAfterGitHubsBuild guards where the job's
+// environment comes from.
 //
-// THE JDK STEP APPENDS A JAVA_HOME PER VERSION. When the file was created after
-// the toolcache ran, with `>`, that create silently discarded every one of them —
-// five JDKs installed and unfindable, which is precisely the failure the toolcache
-// section warns about one directory over. Nothing about a running image would
-// have said so: setup-java would simply install its own JDK and the job would
-// pass, slowly.
-func TestTheImageEnvironmentFileIsCreatedOnceAndBeforeItIsAppendedTo(t *testing.T) {
+// GitHub's scripts write the hosted environment to /etc/environment as they
+// install, and the agent hands a job exactly what /etc/billet-image-env names. So
+// that file is written once, by write_image_env, and only after the build that
+// wrote /etc/environment: before it, every JAVA_HOME and GOROOT a later step
+// sets would be missing, and a second writer would decide the result by order.
+func TestTheImageEnvironmentIsWrittenOnceAfterGitHubsBuild(t *testing.T) {
 	t.Parallel()
 
 	source := readBuildScript(t)
 
-	// EXACTLY ONE TRUNCATING WRITE. A second one anywhere discards whatever the
-	// first and every appender had put there, and which of them wins depends on
-	// an order nothing states.
-	//
-	// `>>` CONTAINS `>`, so counting the truncating form has to subtract the
-	// appending one or every append reads as a create. The first version of this
-	// check did not, reported four creates against one, and would have sent a
-	// reader looking for three writes that do not exist.
-	creates := strings.Count(source, `/etc/billet-image-env" <<`) +
-		strings.Count(source, `>"$rootfs/etc/billet-image-env"`) -
-		strings.Count(source, `>>"$rootfs/etc/billet-image-env"`)
-	if creates != 1 {
-		t.Errorf("the image environment file is created %d times; every create truncates, so "+
-			"a second one silently discards the variables written before it", creates)
+	// ONE WRITER, to a temporary file renamed into place, so no reader sees half.
+	if writes := strings.Count(source, `>"$rootfs/etc/billet-image-env`); writes != 1 {
+		t.Errorf("the image environment file is written %d times; it must be written once, "+
+			"by write_image_env", writes)
 	}
 
 	main := mainBody(t, source)
 
-	createAt := strings.Index(main, `/etc/billet-image-env" <<`)
-	toolcacheAt := strings.Index(main, "install_toolcache")
+	buildAt := strings.Index(main, "run_runner_images_build")
+	envAt := strings.Index(main, "write_image_env")
 
 	switch {
-	case createAt < 0:
-		t.Fatal("main never creates /etc/billet-image-env, so a job sees none of the " +
+	case buildAt < 0:
+		t.Fatal("main never runs GitHub's build")
+	case envAt < 0:
+		t.Fatal("main never writes /etc/billet-image-env, so a job sees none of the " +
 			"variables a hosted runner exports")
-	case toolcacheAt < 0:
-		t.Fatal("main never installs the toolcache")
-	case createAt > toolcacheAt:
-		t.Error("the image environment file is created AFTER install_toolcache, which " +
-			"appends to it — so every JAVA_HOME the JDKs wrote is discarded and the JDKs " +
-			"are installed and unfindable")
+	case envAt < buildAt:
+		t.Error("the image environment is written BEFORE GitHub's build, which is what " +
+			"writes the /etc/environment it is read from")
 	}
 }
 

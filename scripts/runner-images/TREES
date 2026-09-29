@@ -1,0 +1,6 @@
+8fb30d782db71b9bd473f81b5788fa4860b71375 helpers/software-report-base
+18914ba2ead44db0c69c1145692835992be66dfa images/ubuntu/assets/post-gen
+d6206eff41cf2a4bf9c96d75a8a894249885f6c2 images/ubuntu/scripts/build
+ed1fe6866c18fe85b698c598d674c7e89c0de43c images/ubuntu/scripts/docs-gen
+6a833584a1c5cff7dd9f3a3becb6a85fab482fa3 images/ubuntu/scripts/helpers
+1a482409a0b0e69120733adda3df2b36cdf52caa images/ubuntu/scripts/tests

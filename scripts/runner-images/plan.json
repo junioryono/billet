@@ -1,0 +1,872 @@
+[
+  {
+    "id": "inline:e6b834ecb7c8",
+    "kind": "shell",
+    "execute": "root",
+    "inline": [
+      "mkdir /imagegeneration",
+      "chmod 777 /imagegeneration"
+    ]
+  },
+  {
+    "id": "file:/imagegeneration/helpers",
+    "kind": "file",
+    "sources": [
+      "images/ubuntu/scripts/helpers"
+    ],
+    "destination": "/imagegeneration/helpers"
+  },
+  {
+    "id": "configure-apt-mock.sh",
+    "kind": "shell",
+    "execute": "root",
+    "script": "images/ubuntu/scripts/build/configure-apt-mock.sh"
+  },
+  {
+    "id": "install-ms-repos.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers"
+    },
+    "script": "images/ubuntu/scripts/build/install-ms-repos.sh"
+  },
+  {
+    "id": "configure-apt-sources.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers"
+    },
+    "script": "images/ubuntu/scripts/build/configure-apt-sources.sh"
+  },
+  {
+    "id": "configure-apt.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers"
+    },
+    "script": "images/ubuntu/scripts/build/configure-apt.sh"
+  },
+  {
+    "id": "configure-limits.sh",
+    "kind": "shell",
+    "execute": "root",
+    "script": "images/ubuntu/scripts/build/configure-limits.sh"
+  },
+  {
+    "id": "file:/imagegeneration/installers",
+    "kind": "file",
+    "sources": [
+      "images/ubuntu/scripts/build"
+    ],
+    "destination": "/imagegeneration/installers"
+  },
+  {
+    "id": "file:/imagegeneration",
+    "kind": "file",
+    "sources": [
+      "images/ubuntu/assets/post-gen",
+      "images/ubuntu/scripts/tests",
+      "images/ubuntu/scripts/docs-gen"
+    ],
+    "destination": "/imagegeneration"
+  },
+  {
+    "id": "file:/imagegeneration/docs-gen/",
+    "kind": "file",
+    "sources": [
+      "helpers/software-report-base"
+    ],
+    "destination": "/imagegeneration/docs-gen/"
+  },
+  {
+    "id": "file:/imagegeneration/installers/toolset.json",
+    "kind": "file",
+    "sources": [
+      "images/ubuntu/toolsets/toolset-2404.json"
+    ],
+    "destination": "/imagegeneration/installers/toolset.json"
+  },
+  {
+    "id": "inline:dfd6027a0db4",
+    "kind": "shell",
+    "execute": "root",
+    "inline": [
+      "mv /imagegeneration/docs-gen /imagegeneration/SoftwareReport",
+      "mv /imagegeneration/post-gen /imagegeneration/post-generation"
+    ]
+  },
+  {
+    "id": "configure-image-data.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "IMAGEDATA_FILE": "/imagegeneration/imagedata.json",
+      "IMAGE_VERSION": "@image_version@"
+    },
+    "script": "images/ubuntu/scripts/build/configure-image-data.sh"
+  },
+  {
+    "id": "configure-environment.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "IMAGE_OS": "ubuntu24",
+      "IMAGE_VERSION": "@image_version@"
+    },
+    "script": "images/ubuntu/scripts/build/configure-environment.sh"
+  },
+  {
+    "id": "install-apt-vital.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-apt-vital.sh"
+  },
+  {
+    "id": "install-powershell.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-powershell.sh"
+  },
+  {
+    "id": "Install-PowerShellModules.ps1",
+    "kind": "shell",
+    "execute": "root-pwsh",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/Install-PowerShellModules.ps1"
+  },
+  {
+    "id": "Install-PowerShellAzModules.ps1",
+    "kind": "shell",
+    "execute": "root-pwsh",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/Install-PowerShellAzModules.ps1"
+  },
+  {
+    "id": "install-actions-cache.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-actions-cache.sh"
+  },
+  {
+    "id": "install-apt-common.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-apt-common.sh"
+  },
+  {
+    "id": "install-azcopy.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-azcopy.sh"
+  },
+  {
+    "id": "install-azure-cli.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-azure-cli.sh"
+  },
+  {
+    "id": "install-azure-devops-cli.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-azure-devops-cli.sh"
+  },
+  {
+    "id": "install-bicep.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-bicep.sh"
+  },
+  {
+    "id": "install-apache.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-apache.sh"
+  },
+  {
+    "id": "install-aws-tools.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-aws-tools.sh"
+  },
+  {
+    "id": "install-clang.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-clang.sh"
+  },
+  {
+    "id": "install-swift.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-swift.sh"
+  },
+  {
+    "id": "install-cmake.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-cmake.sh"
+  },
+  {
+    "id": "install-codeql-bundle.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-codeql-bundle.sh"
+  },
+  {
+    "id": "install-awf.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-awf.sh"
+  },
+  {
+    "id": "install-container-tools.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-container-tools.sh"
+  },
+  {
+    "id": "install-dotnetcore-sdk.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-dotnetcore-sdk.sh"
+  },
+  {
+    "id": "install-microsoft-edge.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-microsoft-edge.sh"
+  },
+  {
+    "id": "install-gcc-compilers.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-gcc-compilers.sh"
+  },
+  {
+    "id": "install-firefox.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-firefox.sh"
+  },
+  {
+    "id": "install-gfortran.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-gfortran.sh"
+  },
+  {
+    "id": "install-git.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-git.sh"
+  },
+  {
+    "id": "install-git-lfs.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-git-lfs.sh"
+  },
+  {
+    "id": "install-github-cli.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-github-cli.sh"
+  },
+  {
+    "id": "install-google-chrome.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-google-chrome.sh"
+  },
+  {
+    "id": "install-google-cloud-cli.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-google-cloud-cli.sh"
+  },
+  {
+    "id": "install-haskell.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-haskell.sh"
+  },
+  {
+    "id": "install-java-tools.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-java-tools.sh"
+  },
+  {
+    "id": "install-kubernetes-tools.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-kubernetes-tools.sh"
+  },
+  {
+    "id": "install-miniconda.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-miniconda.sh"
+  },
+  {
+    "id": "install-kotlin.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-kotlin.sh"
+  },
+  {
+    "id": "install-mysql.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-mysql.sh"
+  },
+  {
+    "id": "install-nginx.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-nginx.sh"
+  },
+  {
+    "id": "install-nvm.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-nvm.sh"
+  },
+  {
+    "id": "install-nodejs.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-nodejs.sh"
+  },
+  {
+    "id": "install-copilot-cli.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-copilot-cli.sh"
+  },
+  {
+    "id": "install-bazel.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-bazel.sh"
+  },
+  {
+    "id": "install-php.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-php.sh"
+  },
+  {
+    "id": "install-postgresql.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-postgresql.sh"
+  },
+  {
+    "id": "install-pulumi.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-pulumi.sh"
+  },
+  {
+    "id": "install-ruby.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-ruby.sh"
+  },
+  {
+    "id": "install-rust.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-rust.sh"
+  },
+  {
+    "id": "install-julia.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-julia.sh"
+  },
+  {
+    "id": "install-selenium.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-selenium.sh"
+  },
+  {
+    "id": "install-packer.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-packer.sh"
+  },
+  {
+    "id": "install-vcpkg.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-vcpkg.sh"
+  },
+  {
+    "id": "configure-dpkg.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/configure-dpkg.sh"
+  },
+  {
+    "id": "install-yq.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-yq.sh"
+  },
+  {
+    "id": "install-android-sdk.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-android-sdk.sh"
+  },
+  {
+    "id": "install-pypy.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-pypy.sh"
+  },
+  {
+    "id": "install-python.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-python.sh"
+  },
+  {
+    "id": "install-zstd.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-zstd.sh"
+  },
+  {
+    "id": "install-ninja.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-ninja.sh"
+  },
+  {
+    "id": "install-docker.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-docker.sh"
+  },
+  {
+    "id": "Install-Toolset.ps1",
+    "kind": "shell",
+    "execute": "root-pwsh",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/Install-Toolset.ps1"
+  },
+  {
+    "id": "Configure-Toolset.ps1",
+    "kind": "shell",
+    "execute": "root-pwsh",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/Configure-Toolset.ps1"
+  },
+  {
+    "id": "install-pipx-packages.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-pipx-packages.sh"
+  },
+  {
+    "id": "install-homebrew.sh",
+    "kind": "shell",
+    "execute": "user",
+    "env": {
+      "DEBIAN_FRONTEND": "noninteractive",
+      "HELPER_SCRIPTS": "/imagegeneration/helpers",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/install-homebrew.sh"
+  },
+  {
+    "id": "configure-snap.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers"
+    },
+    "script": "images/ubuntu/scripts/build/configure-snap.sh"
+  },
+  {
+    "id": "list-dpkg.sh",
+    "kind": "shell",
+    "execute": "root",
+    "script": "images/ubuntu/scripts/build/list-dpkg.sh"
+  },
+  {
+    "id": "inline:e722856701f1",
+    "kind": "shell",
+    "execute": "root",
+    "inline": [
+      "echo 'Reboot VM'",
+      "sudo reboot"
+    ],
+    "reboots": true
+  },
+  {
+    "id": "cleanup.sh",
+    "kind": "shell",
+    "execute": "root",
+    "script": "images/ubuntu/scripts/build/cleanup.sh",
+    "pause_before": "5m0s",
+    "start_retry_timeout": "10m"
+  },
+  {
+    "id": "inline:508b7308e973",
+    "kind": "shell",
+    "execute": "user",
+    "env": {
+      "IMAGE_VERSION": "@image_version@",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "inline": [
+      "pwsh -File /imagegeneration/SoftwareReport/Generate-SoftwareReport.ps1 -OutputDirectory /imagegeneration",
+      "pwsh -File /imagegeneration/tests/RunAll-Tests.ps1 -OutputDirectory /imagegeneration"
+    ]
+  },
+  {
+    "id": "download:/imagegeneration/software-report.md",
+    "kind": "file",
+    "sources": [
+      "/imagegeneration/software-report.md"
+    ],
+    "destination": "@root@/../Ubuntu2404-Readme.md",
+    "download": true
+  },
+  {
+    "id": "download:/imagegeneration/software-report.json",
+    "kind": "file",
+    "sources": [
+      "/imagegeneration/software-report.json"
+    ],
+    "destination": "@root@/../software-report.json",
+    "download": true
+  },
+  {
+    "id": "configure-system.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPT_FOLDER": "/imagegeneration/helpers",
+      "IMAGE_FOLDER": "/imagegeneration",
+      "INSTALLER_SCRIPT_FOLDER": "/imagegeneration/installers"
+    },
+    "script": "images/ubuntu/scripts/build/configure-system.sh"
+  },
+  {
+    "id": "post-build-validation.sh",
+    "kind": "shell",
+    "execute": "root",
+    "env": {
+      "HELPER_SCRIPTS": "/imagegeneration/helpers"
+    },
+    "script": "images/ubuntu/scripts/build/post-build-validation.sh"
+  },
+  {
+    "id": "inline:5943fe1a3eb3",
+    "kind": "shell",
+    "execute": "root",
+    "inline": [
+      "sleep 30",
+      "/usr/sbin/waagent -force -deprovision+user \u0026\u0026 export HISTSIZE=0 \u0026\u0026 sync"
+    ]
+  }
+]

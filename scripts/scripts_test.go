@@ -2283,7 +2283,6 @@ func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
 		"scripts/build-guest-kernel.sh":        true,
 		"scripts/check-guest-image.sh":         true,
 		"scripts/check-guest-kernel-config.sh": true,
-		"scripts/boot-guest-image.sh":          true,
 		"scripts/split-image.sh":               true,
 		"scripts/write-image-manifest.sh":      true,
 		"scripts/guest-kernel.config":          true,

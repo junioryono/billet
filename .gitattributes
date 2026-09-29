@@ -20,3 +20,9 @@ internal/state/migrations/*.sql text eol=lf
 # byte of it, so the gate would report an unreviewed edit against a file nobody
 # touched -- and the remedy it names, restoring the file with git, would not help.
 scripts/kernel/check-config.sh text eol=lf
+
+# GITHUB'S RUNNER-IMAGES TREE, VENDORED BYTE FOR BYTE. Each file must hash to the
+# blob id the pinned commit gives it (scripts/runner-images/BLOBS), so no
+# line-ending conversion may touch any of it: `-text` leaves every byte as the
+# commit had it.
+scripts/runner-images/upstream/** -text
