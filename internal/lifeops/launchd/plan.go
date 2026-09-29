@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/junioryono/billet/internal/lifeops"
@@ -289,6 +290,43 @@ func (c *Converger) planOne(ctx context.Context, label string) (lifeops.UnitPlan
 	return unit, refusals, nil
 }
 
+// exitTimeoutCeiling is the most launchd loads for a launch agent's
+// ExitTimeOut: measured on macOS 27.0 (2026-09-29), a declared 61, 600, 3600 or
+// 88200 all loaded as 60, and 30 loaded as 30. A stop no longer depends on it,
+// because StopAndProve lets the process drain before launchd is asked, so the
+// loaded value is judged against what launchd can load rather than refused for
+// being what it always will be.
+const exitTimeoutCeiling = 60
+
+// loadableExitTimeout is what a clamping launchd loads for a declared
+// ExitTimeOut.
+func loadableExitTimeout(declared int) int {
+	return min(declared, exitTimeoutCeiling)
+}
+
+// clampsFrom is the first macOS release measured to clamp ExitTimeOut.
+const clampsFrom = 27
+
+// clampsExitTimeout reports whether this Mac's launchd clamps ExitTimeOut: a
+// release at or after the one it was measured on. A version that cannot be read
+// is taken as unclamped, which only ever refuses more.
+func (c *Converger) clampsExitTimeout() bool {
+	if c.productVersion == nil {
+		return false
+	}
+
+	v, err := c.productVersion()
+	if err != nil {
+		return false
+	}
+
+	major, _, _ := strings.Cut(strings.TrimSpace(v), ".")
+
+	n, err := strconv.Atoi(major)
+
+	return err == nil && n >= clampsFrom
+}
+
 // loadedRefusals compares the job launchd LOADED against the agent billet ships.
 //
 // THE LOADED JOB IS NOT ITS PLIST, and this is the measurement the whole backend
@@ -325,10 +363,15 @@ func (c *Converger) loadedRefusals(label string, job Job, shipped string) []life
 			job.Arguments, want.Arguments))
 	}
 
-	if job.ExitTimeoutKnown && want.ExitTimeoutKnown && job.ExitTimeout != want.ExitTimeout {
+	// THE DECLARED VALUE, OR ON A RELEASE THAT CLAMPS, THE CLAMPED ONE. On an
+	// unclamped release a loaded 60 is a stale bootstrap like any other, and is
+	// refused; so is launchd's own five-second default everywhere.
+	if job.ExitTimeoutKnown && want.ExitTimeoutKnown && job.ExitTimeout != want.ExitTimeout &&
+		(!c.clampsExitTimeout() || job.ExitTimeout != loadableExitTimeout(want.ExitTimeout)) {
 		differ = append(differ, fmt.Sprintf("launchd will SIGKILL it %ds after asking it to "+
-			"stop, rather than the %ds this build's agent declares — a node draining a job "+
-			"would be killed through the middle of it", job.ExitTimeout, want.ExitTimeout))
+			"stop, rather than the %ds this build's agent declares (%ds as launchd loads it) — "+
+			"a node draining a job would be killed through the middle of it",
+			job.ExitTimeout, want.ExitTimeout, loadableExitTimeout(want.ExitTimeout)))
 	}
 
 	if diff := environmentDiff(job.Environment, want.Environment); diff != "" {

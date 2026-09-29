@@ -401,6 +401,10 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.base, c.installationID)
+	// BOUNDED, request and body alike: this holds c.mu, which every other caller
+	// of the client waits on, and the client it was given may carry no timeout.
+	ctx, cancel := context.WithTimeout(ctx, requestTimout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
 		return "", fmt.Errorf("github: build installation-token request: %w", err)
@@ -413,7 +417,11 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("github: create installation token: status %d", resp.StatusCode)
+		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
+		// GitHub being unable to answer (5xx, a throttle) through Undecided.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16)) //nolint:errcheck // a body that cannot be read leaves only the status, which still decides.
+
+		return "", fmt.Errorf("github: create installation token: %w", apiError(resp.StatusCode, body))
 	}
 	var out struct {
 		Token     string    `json:"token"`

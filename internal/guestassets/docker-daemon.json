@@ -1,0 +1,7 @@
+{
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "storage-driver": "overlay2",
+  "bip": "172.17.0.1/16"
+}

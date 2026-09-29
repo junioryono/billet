@@ -216,6 +216,30 @@ func (i *Installation) PermissionMismatches(scope Scope, runEvidence bool) []str
 var ErrAppUnverifiable = errors.New(
 	"github: could not verify the App (network or GitHub unavailable)")
 
+// Undecided reports whether err is GitHub being unable to answer rather than an
+// answer: its own 5xx, a throttle, or a request that got no response. Such an
+// error says nothing about the App, its installation or its runner groups, so a
+// caller reports it as could-not-tell and never as a failure. A caller that
+// cancelled its own context must check that first; this does not.
+func Undecided(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, ErrAppUnverifiable) {
+		return true
+	}
+
+	if api, ok := errors.AsType[*APIError](err); ok {
+		return api.Status >= 500 || api.Status == http.StatusTooManyRequests || api.RateLimited
+	}
+
+	//nolint:errcheck // the discarded value is the typed error itself, not a failure; the bool is the answer. errcheck cannot exclude a generic function.
+	_, transport := errors.AsType[*url.Error](err)
+
+	return transport
+}
+
 // VerifyAppAt proves the configured App LIVE: the key signs a JWT GitHub
 // accepts, the App is installed on the target's owner (and not suspended), the
 // installation id matches the config, and the granted permissions are exactly

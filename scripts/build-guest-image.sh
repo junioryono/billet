@@ -4,7 +4,8 @@
 #
 # A SCRIPT RATHER THAN A `billet` SUBCOMMAND, unlike `billet ami`. That one has to
 # drive an API — launch a builder instance, wait, snapshot it — which is a program.
-# This one runs debootstrap, chroot and apt on the machine it is already on, and a Go
+# This one boots a filesystem under systemd-nspawn on the machine it is already on
+# and runs GitHub's own build scripts in it, and a Go
 # program wrapping those is a worse version of a shell script. `billet check` proves
 # the result; nothing about building it needs to be in the binary.
 #
@@ -56,12 +57,6 @@ PINNED_RUNNER_FILE="$SCRIPT_DIR/../internal/runnerrelease/pinned.txt"
 TOOLSET_FILE="$SCRIPT_DIR/../internal/runnerimages/toolset-2404.json"
 TOOLSET_PIN="$SCRIPT_DIR/../internal/runnerimages/pinned.txt"
 
-# THE NARROW MAPPING FROM A DECLARED NAME TO ONE APT CAN INSTALL.
-#
-# Read here and by check-guest-image.sh from the same file, so a mapped package is
-# still verified as present rather than quietly excused from the check.
-APT_ALIASES="${APT_ALIASES:-$SCRIPT_DIR/../internal/runnerimages/apt-aliases.json}"
-
 # TOOLCACHE_DIR IS NOT A CHOICE.
 #
 # The python builds from actions/python-versions are configured with
@@ -76,15 +71,6 @@ APT_ALIASES="${APT_ALIASES:-$SCRIPT_DIR/../internal/runnerimages/apt-aliases.jso
 # assumes it.
 TOOLCACHE_DIR=/opt/hostedtoolcache
 
-# THE TOOLCACHE INSTALLERS LIVE BESIDE THE DECLARATION THEY READ, and the EC2
-# backend runs the same file. Sourced rather than executed: they are bash
-# functions, and a function definition does not cross a process boundary.
-#
-# SOURCED HERE, BEFORE main, because toolset_versions and read_toolset_versions
-# moved with them and this script's own callers expect them defined.
-# shellcheck source=../internal/runnerimages/install-toolcache.sh
-. "$SCRIPT_DIR/../internal/runnerimages/install-toolcache.sh"
-
 if [ -z "${RUNNER_VERSION:-}" ] && [ ! -r "$PINNED_RUNNER_FILE" ]; then
 	echo "cannot read the pinned runner version at $PINNED_RUNNER_FILE, and RUNNER_VERSION" >&2
 	echo "was not set; run this from a checkout, or say which release to install" >&2
@@ -93,57 +79,20 @@ fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
-# 36864MB, FOR ABOUT 27200MB OF CONTENT ONCE THE ANDROID SDK IS IN.
+# 81920MB, MEASURED: the runner-images build reported `contents: 53779M used,
+# 22176M free of 81920M` on the image builder on 2026-09-28, the same within a few
+# megabytes on three consecutive builds. That is GitHub's whole image, the Android
+# SDK included (ADR-005, #209), plus billet's layer.
 #
-# The last build without the SDK measured `contents: 15073M used, 5788M free of
-# 22528M`. The SDK with its platforms, build-tools and three NDKs is what separates
-# the EC2 image (26.8GiB) from this one (15.0GiB), about 12100M, so the estimate is
-# 27200M used. Usable space is about 0.927 of the declaration (below), so 36864
-# leaves about 7000M, a little more than the margin the 22528 image had. The next
-# build's own `contents:` line replaces this estimate with a measurement.
+# THE DECLARED SIZE IS NOT THE USABLE SIZE: 53779 + 22176 is 75955, not 81920,
+# because ext4's journal, inode tables and the 5% reserved-blocks default take
+# about 7.3% off the top. A margin computed by subtracting content from the
+# declaration overstates itself by about six gigabytes here.
 #
-# THE MEASUREMENT BEFORE THE SDK: 22528MB against 15392MB, leaving about 5481MB free.
-#
-# MEASURED BY THE BUILD ITSELF, off the mounted filesystem after the apt set, the
-# toolcache, the JDKs and the toolchains: `contents: 15392M used, 22559M free of
-# 40960M`, read out of a build log rather than derived. That run was given a
-# deliberately oversized filesystem precisely so it would COMPLETE and print this
-# line; the size here is fitted to what it reported.
-#
-# THE DECLARED SIZE IS NOT THE USABLE SIZE, and that is the trap in reading that
-# line. 15392 + 22559 is 37951, not 40960: ext4's journal, inode tables and the 5%
-# reserved-blocks default take 7.3% off the top. So usable space is about 0.927 of
-# whatever is declared here, and a margin computed by subtracting content from the
-# declaration overstates itself by about two gigabytes. The first draft of this
-# revision did exactly that -- claimed 5088M of headroom for a 20480M image that
-# actually leaves 3584M. At 22528 the usable space is about 20873M, so the real
-# margin is 5481M against a MIN_FREE_MB of 512.
-#
-# THE HISTORY IS 4096 -> 8192 -> 12288 -> 22528, AND EVERY STEP WAS MEASURED AND
-# THEN OUTGROWN. 4096 held 2.6GB. 8192 held 6521MB with a 2.7G toolcache of node,
-# go, Python and Java, and was right until PyPy, Ruby and CodeQL took the toolcache
-# to 5.2G -- a build then died extracting the codeql bundle with 880M free. 12288
-# held 9009MB and was right until the toolchains landed: .NET, PowerShell and its
-# modules, and the compilers. A build died again, unpacking .NET:
-#
-#	tar: ./packs/Microsoft.NETCore.App.Host.linux-x64/10.0.11: Cannot mkdir: No space left on device
-#
-# THE GUARD BELOW CANNOT CATCH THAT, WHICH IS WORTH KNOWING BEFORE TRUSTING IT. It
-# compares free space AFTER the installs, so a build that overflows DURING one never
-# reaches it and fails with a tar error naming a package instead -- which is exactly
-# what the MIN_FREE_MB comment predicts will happen. It still earns its place for
-# the case it does catch, a build that finishes with no margin left, and it is what
-# produced the measurement above. It is not a substitute for this number being right.
-#
-# AN ESTIMATE THAT LANDS IS STILL AN ESTIMATE. The arithmetic before the 12288
-# measurement said 9.1GB and was right; the one before that said 5.3GB and was wrong
-# by a gigabyte, about 20%, in this same file for the same reason. That is the
-# argument for reading the build's own report rather than for trusting a prediction
-# that happened to work.
-#
-# THE ANDROID SDK IS IN THIS IMAGE, by the maintainer's decision of 2026-09-24
-# (ADR-005). It was left out while its licensing question was open, and an Android
-# build moved onto the fleet then failed with "SDK location not found" (#209).
+# THE GUARD BELOW CANNOT CATCH AN OVERFLOW DURING AN INSTALL. It compares free
+# space after the build, so a build that fills the filesystem part way fails in
+# the step that overflowed, naming what it was writing. It still catches a build
+# that finishes with no margin left, and it is what reports the measurement.
 #
 # OVER-SIZING IS CHEAP AND UNDER-SIZING IS NOT, which is why this is rounded up
 # rather than fitted to the nearest block. The file is sparse, ext4 allocates only
@@ -154,7 +103,7 @@ SUITE="${SUITE:-noble}"
 #
 # It is still not free forever: every generation already published keeps its own
 # size, so this should track the measurement rather than drift upward by habit.
-SIZE_MB="${SIZE_MB:-36864}"
+SIZE_MB="${SIZE_MB:-81920}"
 
 # MIN_FREE_MB is the build's own margin, checked against a MEASUREMENT.
 #
@@ -171,6 +120,11 @@ CEPH_USER="${CEPH_USER:-billet}"
 WORK_DEFAULT=/var/tmp/billet-guest
 WORK="${WORK:-$WORK_DEFAULT}"
 PUBLISH="${PUBLISH:-yes}"
+
+# HOW THE IMAGE IS BUILT (#250): from Ubuntu's own cloud root filesystem, running
+# GitHub's runner-images template in it under systemd-nspawn, so parity with a
+# hosted runner holds by construction and the difference is one reviewed file
+# (scripts/runner-images/differences.tsv).
 
 # PINNED, NOT "LATEST", for the reason cmd/billet/ami.go gives about the AMI: an
 # image is a thing you reproduce, and a build that silently tracked the newest
@@ -322,82 +276,10 @@ verify_toolset() {
 	fi
 }
 
-# toolset_packages prints every apt package GitHub's image installs, in its order.
-#
-# VITAL, THEN COMMON, THEN CMD, deduplicated. That is the order upstream installs
-# them in, and it decides which package resolves a shared dependency first.
-
-# NOT `unique`, WHICH SORTS. jq's unique returns a sorted array, which would
-# reorder the three groups into one alphabetical list and lose exactly the
-# property this function documents. The reduce below drops repeats while keeping
-# first-seen order.
-#
-# THE ALIAS MAP IS APPLIED HERE, so every consumer of this function installs a
-# name apt can resolve. `netcat` is a pure virtual package on noble with two
-# providers, which apt refuses to choose between -- it took down the first real
-# end-to-end build at stage 2, after debootstrap and before anything else ran.
-toolset_packages() {
-	jq -er --slurpfile aliases "$APT_ALIASES" '
-		($aliases[0] // {}) as $alias
-		| [.apt.vital_packages[], .apt.common_packages[], .apt.cmd_packages[],
-			(.clang.versions[]? | select(. != null and . != "") | "clang-" + .),
-			(.gcc.versions[]?), (.gfortran.versions[]?),
-			(.php.versions[]? | select(. != null and . != "") | "php" + . + "-cli"),
-			(.postgresql.version | select(. != null and . != "") | "postgresql-client-" + .),
-			(if (.pipx | length) > 0 then "pipx" else empty end)]
-		| map(select(. != null and . != ""))
-		| map(
-			$alias[.] as $entry
-			| if $entry == null then .
-			  # AN ALIAS THAT MAPS TO NOTHING IS AN ERROR, NOT A PASSTHROUGH.
-			  # An empty install used to read as "no alias" and produce a BLANK
-			  # line, which the caller then filtered out -- silently dropping a
-			  # DECLARED package from the install list and from the expected set
-			  # the gate checks, so nothing anywhere reported it missing.
-			  #
-			  # NOTE: no apostrophes in this block. The jq program is a
-			  # single-quoted shell string, and one would end it -- which is
-			  # exactly how the first version of this comment broke the script.
-			  elif ($entry | type) != "object" or ($entry.install // "") == "" then
-				error("apt-aliases.json maps \(.) to nothing usable; an entry needs a non-empty install")
-			  else $entry.install
-			  end)
-		| reduce .[] as $p ([]; if index($p) then . else . + [$p] end)
-		| .[]
-	' "$TOOLSET_FILE"
-}
-
 # MOUNTED_ROOTFS is the mountpoint this build is currently writing through, or
 # empty. The trap reads it, so it must be set BEFORE the mount and cleared AFTER
 # the unmount rather than around them.
 MOUNTED_ROOTFS=""
-
-# MOUNTED_PROC is the /proc mounted INSIDE the rootfs, or empty.
-#
-# A CHROOT WITHOUT /proc CANNOT RUN EVERY RUNTIME THE TOOLCACHE INSTALLS, and two
-# of them proved it in the same build. pypy's `pypy3` is a launcher whose library
-# sits beside it, found through a DT_RPATH of `$ORIGIN/`; the codeql bundle ships
-# its own JVM whose `java` finds libjli.so through `$ORIGIN/../lib`. Both failed
-# with "cannot open shared object file" for files present at full size in exactly
-# those directories, and pypy said why in passing -- it warned that it could not
-# read /proc/cpuinfo. glibc resolves $ORIGIN for a main executable by reading
-# /proc/self/exe, which is not there to read.
-#
-# NESTED, SO IT UNMOUNTS FIRST. A mount inside the rootfs blocks the rootfs
-# unmount, and the rootfs unmount is what stops the next run recursively deleting
-# a live filesystem -- so this is torn down ahead of it rather than beside it.
-MOUNTED_PROC=""
-
-# unmount_guest_proc drops the /proc mounted inside the rootfs.
-unmount_guest_proc() {
-	[ -n "$MOUNTED_PROC" ] || return 0
-
-	if mountpoint -q "$MOUNTED_PROC" 2>/dev/null; then
-		umount "$MOUNTED_PROC" || umount -l "$MOUNTED_PROC" || true
-	fi
-
-	MOUNTED_PROC=""
-}
 
 # unmount_rootfs is the trap, and it is installed before anything is mounted.
 #
@@ -409,6 +291,15 @@ unmount_guest_proc() {
 # cannot protect against.
 unmount_rootfs() {
 	[ -n "$MOUNTED_ROOTFS" ] || return 0
+
+	# NOT WHILE A MACHINE MAY STILL HOLD IT. A booted image that could not be proved
+	# stopped keeps its mount: unmounting would detach the filesystem under it and
+	# leave it writing to an image the next run deletes through. The next run
+	# stops the machine before it clears the workspace.
+	if [ -n "$RUNNER_IMAGES_STUCK" ]; then
+		echo "leaving $MOUNTED_ROOTFS mounted: the machine booted on it could not be proved stopped" >&2
+		return 0
+	fi
 
 	# SYNCED FIRST. The image file is what gets packed and published, and an
 	# unmount that reports success after a lazy detach can leave data unwritten.
@@ -433,19 +324,17 @@ unmount_rootfs() {
 on_signal() {
 	local signal="$1"
 
-	unmount_guest_proc
+	stop_runner_images
 	unmount_rootfs
 
 	trap - "$signal"
 	kill -s "$signal" $$
 }
 
-# THE ORDER IS IN THE TRAP, NOT INSIDE EITHER FUNCTION. A mount nested in the
-# rootfs blocks the rootfs unmount, so /proc has to go first -- and writing that
-# as a call from unmount_rootfs made the two inseparable, which broke the test
-# that exercises the rootfs unmount on its own. Each function drops one mount;
-# the sequence they must run in is stated once, here, where both are in view.
-trap 'unmount_guest_proc; unmount_rootfs' EXIT
+# THE ORDER IS IN THE TRAP, NOT INSIDE EITHER FUNCTION. The machine booted on the
+# rootfs is stopped before the rootfs is unmounted, and unmount_rootfs refuses when
+# that stop could not be proved; the sequence is stated once, here.
+trap 'stop_runner_images; unmount_rootfs' EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
 
@@ -470,6 +359,217 @@ clear_stale_mount() {
 	fi
 }
 
+# RUNNER_IMAGES_BOOTED is the root filesystem booted under systemd-nspawn, or
+# empty. POWERED OFF BEFORE ANY UNMOUNT, because a booted machine holds the
+# filesystem and every mount inside it. RUNNER_IMAGES_STUCK is set when a stop
+# could not be proved, and keeps the filesystem mounted from then on.
+RUNNER_IMAGES_BOOTED=""
+RUNNER_IMAGES_STUCK=""
+
+# stop_runner_images powers off the booted image, if there is one, and says
+# whether it could prove it did.
+stop_runner_images() {
+	[ -n "$RUNNER_IMAGES_BOOTED" ] || return 0
+
+	if ! BILLET_RI_ROOTFS="$RUNNER_IMAGES_BOOTED" "$SCRIPT_DIR/runner-images-nspawn.sh" stop; then
+		RUNNER_IMAGES_STUCK=1
+		echo "the machine booted on $RUNNER_IMAGES_BOOTED could not be proved stopped" >&2
+		return 1
+	fi
+	RUNNER_IMAGES_BOOTED=""
+}
+
+# runner_images_machine names this workspace's machine, so builds in two
+# workspaces on one host never share (or stop) one. Twelve characters, so the
+# machine's link is exactly ve-<name> (see runner-images-nspawn.sh).
+runner_images_machine() {
+	local digest
+	# CHECKED ON ITS OWN, not inside printf's argument, whose status would hide a
+	# failed hash and name the machine "bri-".
+	digest=$(printf '%s' "$WORK" | sha256sum) || return 1
+	digest=${digest:0:8}
+	if ! [[ $digest =~ ^[0-9a-f]{8}$ ]]; then
+		echo "could not derive this workspace's machine name from its digest" >&2
+		return 1
+	fi
+	printf 'bri-%s\n' "$digest"
+}
+
+# recover_runner_images stops every machine that may still hold this workspace's
+# filesystem: each registered machine whose root is this rootfs, through the unit
+# systemd says holds it, and this workspace's own machine, whose forwarding rules
+# only its own name removes. It fails when the machines cannot be listed, a
+# property cannot be read, or any of them cannot be proved stopped, because the
+# caller clears the workspace next. There is no record to trust: a machine is
+# found by what it holds, not by what a file says its name was.
+recover_runner_images() {
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh" listed rest line name root unit own
+	# NO machinectl, NO MACHINE, but only while systemd-nspawn is absent too: they
+	# ship in one package, and nspawn without machinectl cannot be asked.
+	if ! command -v machinectl >/dev/null 2>&1; then
+		if command -v systemd-nspawn >/dev/null 2>&1; then
+			echo "systemd-nspawn is installed and machinectl is not, so this host's machines cannot be listed" >&2
+			return 1
+		fi
+		return 0
+	fi
+	if ! listed=$(machinectl list --no-legend --no-pager 2>&1); then
+		echo "could not list this host's machines: $listed" >&2
+		return 1
+	fi
+	# SPLIT IN THE SHELL, line by line from the captured listing, with no parser
+	# or read that could fail into a shorter list.
+	rest=$listed$'\n'
+	while [ -n "$rest" ]; do
+		line=${rest%%$'\n'*}
+		rest=${rest#*$'\n'}
+		line=${line#"${line%%[![:space:]]*}"}
+		name=${line%%[[:space:]]*}
+		[ -n "$name" ] || continue
+		# A MACHINE GONE BEFORE ITS ROOT IS READ may have left its processes in a
+		# unit this never learned, so it is not known to be stopped; and an empty
+		# root is no evidence that it is elsewhere. machinectl's own diagnostic
+		# goes to stderr, never into the value compared.
+		if ! root=$(machinectl show --property=RootDirectory --value "$name") || [ -z "$root" ]; then
+			echo "could not read machine $name's root" >&2
+			return 1
+		fi
+		[ "$root" = "$rootfs" ] || continue
+		if ! unit=$(machinectl show --property=Unit --value "$name" 2>&1) || [ -z "$unit" ]; then
+			echo "could not read the unit holding machine $name: $unit" >&2
+			return 1
+		fi
+		BILLET_RI_MACHINE="$name" BILLET_RI_UNIT="$unit" BILLET_RI_ROOTFS="$rootfs" "$driver" stop ||
+			return 1
+	done
+	own=$(runner_images_machine) || return 1
+	BILLET_RI_MACHINE="$own" BILLET_RI_ROOTFS="$rootfs" "$driver" stop
+}
+
+# install_cloud_base unpacks Ubuntu's 24.04 cloud root filesystem, pinned in
+# scripts/runner-images/base.pin, into the mounted image and makes it a billet
+# guest's base: the filesystem GitHub's template starts from on Azure, without
+# Azure.
+install_cloud_base() {
+	local rootfs="$1" release file sum
+	read -r release file sum <"$SCRIPT_DIR/runner-images/base.pin"
+	if [ -z "$sum" ]; then
+		echo "scripts/runner-images/base.pin names no release, file and sha256" >&2
+		exit 1
+	fi
+
+	local tarball="$WORK/$file"
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 900 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$tarball" \
+		"https://cloud-images.ubuntu.com/releases/noble/$release/$file"
+
+	# VERIFIED BEFORE IT IS UNPACKED, against the sum pinned from a SHA256SUMS
+	# whose signature was checked when the pin was written.
+	echo "$sum  $tarball" | sha256sum -c -
+
+	tar --numeric-owner --xattrs --xattrs-include='*' -xJpf "$tarball" -C "$rootfs"
+	rm -f "$tarball"
+
+	# THE CLOUD IMAGE MOUNTS / BY LABEL, and this filesystem has none: the kernel
+	# mounts the root from its command line.
+	printf '# the root filesystem is mounted by the kernel from its command line\n' \
+		>"$rootfs/etc/fstab"
+
+	# NO CLOUD-INIT: a guest takes its registration from billet's metadata agent,
+	# and cloud-init would wait at every boot for a datasource that is not there.
+	touch "$rootfs/etc/cloud/cloud-init.disabled"
+
+	write_apt_sources "$rootfs" \
+		"https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/"
+	rm -f "$rootfs/etc/apt/sources.list"
+	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APTCONF
+}
+
+# write_apt_sources writes the image's one deb822 source for $SUITE from URIS.
+write_apt_sources() {
+	local rootfs="$1" uris="$2"
+	cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
+Types: deb
+URIs: $uris
+Suites: $SUITE $SUITE-updates $SUITE-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+}
+
+# run_runner_images_build boots the base under systemd-nspawn, runs GitHub's
+# template in it through scripts/run-runner-images.sh, and powers it off; then
+# adds what the guest mechanism needs that GitHub's image has no reason to carry.
+run_runner_images_build() {
+	local rootfs="$1" driver="$SCRIPT_DIR/runner-images-nspawn.sh"
+
+	# THE IMAGE'S OWN RESOLVER COMES BACK AFTER THE BOOT. nspawn replaces
+	# /etc/resolv.conf with the builder's uplink servers for the build, and an image
+	# shipping that file would resolve through the builder's DNS wherever it runs.
+	cp -a "$rootfs/etc/resolv.conf" "$WORK/resolv.conf.image"
+
+	RUNNER_IMAGES_BOOTED="$rootfs"
+	BILLET_RI_ROOTFS="$rootfs" "$driver" start
+
+	BILLET_RI_ROOTFS="$rootfs" \
+		BILLET_RI_TARGET="$driver" \
+		BILLET_RI_IMAGE_VERSION="$(date -u +%Y%m%d).billet" \
+		BILLET_RI_OUT="$WORK/runner-images" \
+		"$SCRIPT_DIR/run-runner-images.sh"
+
+	# WHAT THE GUEST MECHANISM NEEDS THAT GITHUB'S IMAGE DOES NOT CARRY: dnsmasq-base
+	# for the cache's DNS remap, networkd, resolved and netplan for the network the
+	# agent reaches the metadata service over, libicu74 for the .NET runner,
+	# e2fsprogs because the host grows this filesystem, and the two a hosted runner
+	# has that CI jobs here installed every run. apt skips any GitHub already put in.
+	# IN THE BOOTED MACHINE, where the network is: a chroot has no resolver once
+	# the image's own is back.
+	BILLET_RI_ROOTFS="$rootfs" "$driver" exec /bin/bash -euxc '
+		apt-get update -qq
+		apt-get install -y --no-install-recommends "$@"
+		apt-get clean
+		rm -rf /var/lib/apt/lists/*' bash \
+		dnsmasq-base systemd-resolved netplan.io libicu74 e2fsprogs apparmor python3-apt
+
+	stop_runner_images
+
+	rm -f "$rootfs/etc/resolv.conf"
+	cp -a "$WORK/resolv.conf.image" "$rootfs/etc/resolv.conf"
+
+	# ONE MACHINE ID PER GUEST: the boot above wrote one, and a clone that carried
+	# it would share it with every other guest of this generation.
+	: >"$rootfs/etc/machine-id"
+}
+
+# write_image_env writes /etc/billet-image-env, the environment the agent hands
+# the job, from the NAME=VALUE lines GitHub's scripts wrote to /etc/environment:
+# ImageOS, ImageVersion, the JAVA_HOME and GOROOT lines, ANDROID_HOME, the tool
+# cache and GitHub's PATH, as a hosted runner exports them.
+#
+# THE AGENT PASSES EACH LINE AS IT IS, through env -i, so each line is made a
+# plain NAME=VALUE here by pam-environment.awk, the reader the build's own steps
+# use; and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for a login
+# shell to expand, is the runner's home, which nothing downstream expands.
+write_image_env() {
+	local rootfs="$1"
+	awk -f "$SCRIPT_DIR/runner-images/pam-environment.awk" "$rootfs/etc/environment" |
+		sed -e 's#\$HOME#/home/runner#g' -e 's#\${HOME}#/home/runner#g' \
+		>"$rootfs/etc/billet-image-env.tmp"
+	if ! grep -q '^ImageOS=' "$rootfs/etc/billet-image-env.tmp"; then
+		echo "GitHub's build wrote no ImageOS to /etc/environment; refusing an image whose jobs" >&2
+		echo "would not see the variables a hosted runner exports" >&2
+		exit 1
+	fi
+	chmod 0644 "$rootfs/etc/billet-image-env.tmp"
+	mv "$rootfs/etc/billet-image-env.tmp" "$rootfs/etc/billet-image-env"
+}
+
 need_root() {
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "this builds a filesystem and maps a block device; run it as root" >&2
@@ -484,7 +584,11 @@ need_tools() {
 	# mountpoint likewise: the stale-mount guard is what stops that delete from
 	# running through a live filesystem, and a guard whose tool is missing is not
 	# a guard.
-	for t in debootstrap mkfs.ext4 e2fsck chroot jq flock mountpoint; do
+	# systemd-nspawn, machinectl and systemd-run BOOT THE IMAGE the scripts run in;
+	# curl, sha256sum and xz fetch and verify its base.
+	local tools=(mkfs.ext4 e2fsck chroot jq flock mountpoint
+		systemd-nspawn machinectl systemd-run curl sha256sum xz)
+	for t in "${tools[@]}"; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
 
@@ -501,13 +605,14 @@ need_tools() {
 	fi
 
 	if [ ${#missing[@]} -ne 0 ]; then
-		echo "missing: ${missing[*]} (apt-get install debootstrap e2fsprogs ceph-common)" >&2
+		echo "missing: ${missing[*]} (apt-get install systemd-container xz-utils e2fsprogs ceph-common)" >&2
 		exit 1
 	fi
 
 	# THE GUEST'S ARCHITECTURE IS THE HOST'S, AND THE RUNNER IS PINNED TO x64.
-	# debootstrap takes the host architecture unless told otherwise, so on an arm64
-	# machine this would build an arm64 userspace and drop an x86-64 runner into it.
+	# The base filesystem and the machine that runs GitHub's scripts are the host's
+	# architecture, so on an arm64 machine this would build an arm64 userspace and
+	# drop an x86-64 runner into it.
 	# That combination boots perfectly and fails at the moment the agent execs the
 	# runner, with an executable-format error inside a guest nobody has a console for
 	# -- the exact shape of failure this whole image is built to make impossible.
@@ -517,7 +622,7 @@ need_tools() {
 	if [ "$arch" != "x86_64" ]; then
 		echo "this builds an x86-64 guest (the pinned runner is linux-x64) and this host is" >&2
 		echo "$arch; build it on an x86-64 machine, or teach this script to select the" >&2
-		echo "runner and debootstrap architecture together" >&2
+		echo "runner and base filesystem architecture together" >&2
 		exit 1
 	fi
 }
@@ -529,6 +634,11 @@ main() {
 
 	# BEFORE ANYTHING IS BUILT, because this file decides what goes in.
 	verify_toolset
+
+	# ONE SPELLING PER DIRECTORY, before anything is derived from it: a trailing
+	# slash or a `..` would otherwise give one workspace two locks and two machine
+	# names, and a second build would clear the first one's workspace under it.
+	WORK=$(realpath -m -- "$WORK")
 
 	local rootfs="$WORK/rootfs" img="$WORK/$IMAGE_NAME.ext4"
 
@@ -554,6 +664,9 @@ main() {
 	# it would mean every first run after this check was added fails on a workspace
 	# an earlier run left behind. The check is about an OVERRIDE, which is where a
 	# typo can name something that matters.
+	# THE DEFAULT AS SPELLED, NOT AS RESOLVED: a symlink planted at the default
+	# path resolves somewhere else, and that somewhere must prove it is a workspace
+	# like any other override before it is deleted.
 	if [ "$WORK" != "$WORK_DEFAULT" ] &&
 		[ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
 		echo "WORK=$WORK exists and was not created by this script; refusing to delete it." >&2
@@ -589,6 +702,18 @@ main() {
 		exit 1
 	fi
 
+	# A MACHINE AN EARLIER RUN LEFT BOOTED ON THIS WORKSPACE GOES FIRST, WHATEVER
+	# THIS RUN BUILDS: its filesystem is about to be unmounted and deleted, which
+	# must not happen under a machine still writing to it. Its name is this
+	# workspace's.
+	BILLET_RI_MACHINE=$(runner_images_machine)
+	export BILLET_RI_MACHINE
+	if ! recover_runner_images "$rootfs"; then
+		echo "an earlier build's machine on $rootfs could not be stopped; refusing to clear" >&2
+		echo "the workspace under it" >&2
+		exit 1
+	fi
+
 	clear_stale_mount "$rootfs"
 
 	rm -rf "$WORK"
@@ -615,224 +740,21 @@ main() {
 	MOUNTED_ROOTFS="$rootfs"
 	mount -o loop "$img" "$rootfs"
 
-	echo "=== 1/6 base system ($SUITE) ==="
-	# --variant=minbase, then systemd on top: the guest needs an init that can run
-	# Docker's unit, and the alternative is hand-writing service supervision.
-	#
-	# GNU Wget does not race address families. On the reference host it selected an
-	# established but black-holed IPv6 connection to archive.ubuntu.com and waited
-	# for its 900-second default timeout, while the same object answered immediately
-	# over IPv4. Keep IPv6 as a fallback, but prefer IPv4 and bound each attempt so a
-	# weekly rebuild cannot spend most of its service timeout on one package.
-	local download_bin="$WORK/download-bin"
-	mkdir -p "$download_bin"
-	cat >"$download_bin/wget" <<'EOF'
-#!/bin/sh
-exec /usr/bin/wget --prefer-family=IPv4 --timeout=30 --tries=5 "$@"
-EOF
-	chmod 0755 "$download_bin/wget"
-	PATH="$download_bin:$PATH" debootstrap \
-		--variant=minbase --include=systemd,systemd-sysv,dbus \
-		"$SUITE" "$rootfs" http://archive.ubuntu.com/ubuntu/
+	echo "=== 1/6 base system (Ubuntu's cloud root filesystem) ==="
+	install_cloud_base "$rootfs"
 
-	echo "=== 2/6 packages ==="
-	# debootstrap writes a one-line legacy source for the base suite. Replace it
-	# rather than layering the deb822 source beside it, which asks apt for the same
-	# index twice and hides useful warnings in duplicate-target noise.
-	rm -f "$rootfs/etc/apt/sources.list"
-	cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
-Types: deb
-URIs: http://archive.ubuntu.com/ubuntu/
-Suites: $SUITE $SUITE-updates $SUITE-security
-Components: main universe restricted multiverse
-Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-EOF
-	# MULTIVERSE AND RESTRICTED ARE NOT OPTIONAL ONCE THE TOOLSET DRIVES THIS.
-	# GitHub's own package list includes p7zip-rar, which is in multiverse -- so
-	# with main+universe alone the install fails on one package out of seventy-four
-	# and takes the whole build with it. Enabling the components is what lets the
-	# declaration be installed as written rather than edited down to what happens
-	# to be reachable.
+	echo "=== 2/6 GitHub's runner-images build ==="
+	run_runner_images_build "$rootfs"
 
-	# TWO LISTS, AND THE DISTINCTION IS THE WHOLE POINT OF SPLITTING THEM.
-	#
-	# BILLET_PACKAGES is what the GUEST MECHANISM needs: Docker for the jobs,
-	# iproute2 and netplan for the network the agent reaches the metadata service
-	# over, dnsmasq-base for the cache's DNS remap, libicu74 for the .NET runner,
-	# e2fsprogs because the host grows this filesystem before boot. None of it is
-	# on GitHub's list, because GitHub's image is not a microVM guest -- and none of
-	# it may be dropped when the toolset changes.
-	#
-	# TOOLSET_PACKAGES is what a WORKFLOW expects, taken from GitHub's own
-	# declaration and never edited here. Editing it is how the two images diverge
-	# silently, which is exactly the gap this work exists to close.
-	# apparmor and python3-apt are on the hosted image and were installed by every
-	# CI job on this fleet that needed them, which reached the archive from every
-	# guest: one more dependency on a mirror that was unreachable for hours on
-	# 2026-09-11, and one more set of sessions on an uplink the fleet shares with
-	# everything else at its site. apparmor is a BEHAVIOUR CHANGE, not only a
-	# file: the guest kernel boots with AppArmor as its LSM, and with the parser
-	# present dockerd confines every container under docker-default, as a hosted
-	# runner does; a job that mounts with added capabilities can now meet a denial
-	# it did not meet on the parser-less guest, and meets the same one hosted.
-	# gh IS ON THE HOSTED IMAGE AND IN NO DECLARATION: GitHub installs it with a
-	# script of its own, the latest release's .deb, so the toolset never names it
-	# and nothing here installed it until a workflow's first `gh` call failed with
-	# 127 on the fleet (2026-09-22). This is Ubuntu's package, signed by the archive
-	# key and installed in this one transaction, which is older than the release
-	# GitHub installs; ADR-005 records that difference and what would close it.
-	local billet_packages=(
-		ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base
-		docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux
-		systemd-resolved netplan.io libicu74 zstd rsync build-essential
-		python3-pip python3-venv python3-dev apparmor python3-apt gh
-	)
-
-	local github_packages=()
-	while IFS= read -r pkg; do
-		[ -n "$pkg" ] && github_packages+=("$pkg")
-	done < <(toolset_packages)
-
-	if [ "${#github_packages[@]}" -eq 0 ]; then
-		echo "the toolset declared no apt packages; refusing to build an image that would" >&2
-		echo "silently carry only billet's own dependencies" >&2
-		exit 1
-	fi
-
-	echo "installing ${#billet_packages[@]} billet packages and ${#github_packages[@]} from github's toolset"
-
-	# INSTALLED IN ONE TRANSACTION so apt resolves the whole set together; two
-	# passes can have the second uninstall something the first pulled in.
-	#
-	# --no-install-recommends, WHICH IS WHERE THIS DIFFERS FROM UPSTREAM ON PURPOSE.
-	# runner-images installs each package with recommends on a full cloud image;
-	# here every recommended package is permanent size in a file every node
-	# downloads and every job clones. The toolset names what a workflow is entitled
-	# to find, and that is what gets installed.
-	# PASSED AS ARGUMENTS, NOT INTERPOLATED INTO THE PROGRAM TEXT.
-	#
-	# `${array[*]}` inside a double-quoted `bash -c` string flattens the names into
-	# the SOURCE of the inner shell, which then word-splits, glob-expands and
-	# interprets them. Today's names are all shell-safe, and nothing enforces that:
-	# the digest proves the declaration is the file upstream published, which is a
-	# statement about provenance and not about whether its strings are safe shell
-	# syntax. A future entry containing a space, a `*`, or a `;` would be split,
-	# expanded against the chroot's filesystem, or executed.
-	#
-	# `bash -s -- "$@"` passes them as argv, where none of that happens.
-	chroot "$rootfs" /bin/bash -eux -s -- \
-		"${billet_packages[@]}" "${github_packages[@]}" <<'APT'
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y --no-install-recommends "$@"
-apt-get clean
-rm -rf /var/lib/apt/lists/*
-APT
-
-	# THE SHIPPED IMAGE FETCHES OVER HTTPS FROM TWO SOURCES, EVERY FETCH BOUNDED BY
-	# AN INACTIVITY TIMEOUT. Two URIs in one deb822 stanza are TWO REPOSITORIES to
-	# apt: it fetches both index sets (twice the index traffic) and takes a package
-	# from whichever lists the version, so an install can succeed from the
-	# surviving repository when it indexes and serves the selected version, while
-	# `apt-get update` under Error-Mode=any still fails naming the dead one.
-	# Measured on a fleet guest 2026-09-11 with the first URI black-holed and a 5 s
-	# timeout: a strict update failed in 13 s naming the dead mirror, a lenient one
-	# passed in 13 s, and a package installed from the second mirror in 4 s. The
-	# `mirror+file:` method, which fetches one index set and offers alternate URLs
-	# per file, did NOT finish a strict update in nine minutes under the same
-	# black hole, so it is not the shape here. Acquire::Retries retries the failing
-	# URI; the timeout is per read, not per download. The build bootstraps over
-	# plain HTTP because minbase carries no CA bundle until the transaction above
-	# installs ca-certificates. Why two sources: the same day every
-	# archive.ubuntu.com address refused port 80 from the site and from AWS for
-	# hours, two answered nothing on 443 either, and a job's apt sat 30 s per attempt
-	# on one of those. A rewrite the grep does not confirm is a build that would
-	# ship the old source under a new comment.
-	sed -i 's,^URIs: .*$,URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/,' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
-	grep -Fxq 'URIs: https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/' "$rootfs/etc/apt/sources.list.d/ubuntu.sources"
-	install -m 0644 /dev/stdin "$rootfs/etc/apt/apt.conf.d/90billet-fetch" <<'APTCONF'
-Acquire::Retries "3";
-Acquire::http::Timeout "30";
-Acquire::https::Timeout "30";
-APTCONF
-
-	# break-system-packages, exactly as runner-images writes it on 24.04, so a
-	# workflow that `pip install`s against the system python succeeds here as it does
-	# on a hosted runner instead of failing PEP 668's externally-managed guard. It is
-	# a no-op for setup-python's self-contained toolcache pip, which is not an
-	# externally-managed environment.
-	install -m 0644 /dev/stdin "$rootfs/etc/pip.conf" <<'PIPCONF'
-[global]
-break-system-packages = true
-PIPCONF
-
-	# Docker 29 made the containerd image store the default for fresh installs, and
-	# that store keeps image content outside Docker's data root. The slot-zero cache
-	# mounts /var/lib/docker as one independently fenced filesystem, so accepting the
-	# package default would publish a healthy but empty volume while pulled images
-	# stayed on the disposable root disk. Pin the supported classic backend rather
-	# than splitting one cache generation across two independently mounted trees.
-	install -d -m 0755 "$rootfs/etc/docker"
-	install -m 0644 /dev/stdin "$rootfs/etc/docker/daemon.json" <<'DOCKER'
-{
-  "features": {
-    "containerd-snapshotter": false
-  },
-  "storage-driver": "overlay2",
-  "bip": "172.17.0.1/16"
-}
-DOCKER
-
-	# WHY THESE SIX, AND WHY THEY ARE NOT OPTIONAL.
-	#
-	# zstd IS THE ONE THAT LOOKS LIKE IT WORKS. actions/cache chooses its
-	# compression by shelling out to `zstd --version`, falls back to gzip when it is
-	# absent, AND FOLDS THE CHOSEN TOOL INTO THE CACHE VERSION HASH. Without it,
-	# every cache this fleet saves has a different version from one saved on a
-	# github-hosted runner: same key, permanent miss, no error and no log line. A
-	# cache that silently never hits is worse than no cache, because the workflow
-	# still pays to save it.
-	#
-	# unzip and tar ARE HARD REQUIREMENTS OF THE setup-* FAMILY.
-	# @actions/tool-cache's extractZip calls io.which('unzip', true), which THROWS
-	# when it is missing -- so any action that downloads a tool fails outright, which
-	# is most of them.
-	#
-	# build-essential IS FOR THE SOURCE BUILD THAT HAS NO WHEEL. node-gyp, a native
-	# ruby gem, a pip install with no matching wheel: all fail without a compiler,
-	# and the error arrives from inside the package manager rather than from
-	# anything that mentions the image.
-	#
-	# NOT build-essential FOR setup-python, which is folklore. That action needs the
-	# distro to match its published manifest -- which is why this image is ubuntu
-	# 24.04 and not something smaller -- and a compiler only when it falls back to
-	# building from source.
-	#
-	# THE SYSTEM PYTHON GETS THE SAME PROVISIONING THE HOSTED IMAGE GIVES IT, which a
-	# debootstrap of the release does not. runner-images installs
-	# `python3 python3-dev python3-pip python3-venv` and, on non-22.04, writes
-	# /etc/pip.conf with break-system-packages so pip still installs past PEP 668;
-	# python-is-python3 supplies the `python` name. The concrete failure this fixes:
-	# setup-python's `cache: pip` runs `pip cache dir` through io.which('pip', true),
-	# which THROWS the moment no `pip` -- not `pip3` -- resolves, and this guest's only
-	# pip was setup-python's own toolcache entry, on PATH just for the window its
-	# addition holds; the hosted image never hit that because a system pip always
-	# answered. Match it fully rather than in part, or the system pip resolves for
-	# `which` but a workflow that runs `pip install` or `python -m venv` without
-	# setup-python fails where a hosted runner succeeds -- a later, more confusing gap
-	# than the one it replaces. The toolcache pip stays primary once setup-python
-	# prepends its bin, so an install still lands on that interpreter's own newer pip.
-	# The /etc/pip.conf write is above, right after the chroot install.
-	#
-	# wget and rsync are cheap and assumed by enough workflows to be worth the few
-	# megabytes.
 
 	echo "=== 3/6 the actions runner ==="
 	# A DEDICATED, UNPRIVILEGED ACCOUNT. The runner refuses to run as root outright,
 	# and a job that could write outside its own tree is a job that can rewrite the
 	# agent that started it.
 	chroot "$rootfs" /bin/bash -euxc "
-		useradd --create-home --shell /bin/bash runner
+		# THE ACCOUNT MAY EXIST ALREADY: the runner-images build creates it with
+		# GitHub's uid for the step GitHub runs unprivileged.
+		id runner >/dev/null 2>&1 || useradd --create-home --shell /bin/bash runner
 		usermod -aG docker runner
 		echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 	"
@@ -898,42 +820,10 @@ DOCKER
 	# every JAVA_HOME the JDKs had just written, leaving five JDKs installed and
 	# unfindable. That is the exact failure the toolcache section warns about one
 	# directory over, and nothing about a running image would have said so.
-	install -m 0644 /dev/stdin "$rootfs/etc/billet-image-env" <<'IMAGEENV'
-ImageOS=ubuntu24
-ImageVersion=billet
-IMAGEENV
-
-	# /proc FOR THE DURATION, because the runtimes this installs need it. See
-	# MOUNTED_PROC: two of them locate their own libraries through an $ORIGIN
-	# rpath, which glibc resolves by reading /proc/self/exe. The window is kept to
-	# the step that needs it rather than the whole build.
-	MOUNTED_PROC="$rootfs/proc"
-	mount -t proc proc "$rootfs/proc"
-
-	# THE CONTRACT, STATED AT THE CALL. The guest build assembles a filesystem it
-	# is not running, so the target root is $rootfs and everything that must see
-	# the target's own apt or interpreter goes through chroot. The EC2 build sets
-	# BILLET_TC_ROOT to "" and the same functions run directly.
-	# x64 BECAUSE THIS SCRIPT REFUSES TO RUN ANYWHERE ELSE. check_host_arch stops a
-	# build on a non-x86_64 host, since the pinned runner is linux-x64 -- so the
-	# guest's architecture is not a variable here the way it is for an AMI. Stating
-	# it at the call rather than defaulting it keeps the installers' refusal of an
-	# unset value meaningful.
-	BILLET_TC_ROOT="$rootfs" \
-		BILLET_TC_ARCH=x64 \
-		BILLET_TC_DIR="$rootfs$TOOLCACHE_DIR" \
-		BILLET_TC_IN_TARGET="$TOOLCACHE_DIR" \
-		BILLET_TC_WORK="$WORK" \
-		BILLET_TC_TOOLSET="$TOOLSET_FILE" \
-		BILLET_TC_ENV_FILE="$rootfs/etc/billet-image-env" \
-		BILLET_TC_ANDROID_ACCEPT_LICENSES=yes \
-		billet_install_toolcache
-
-	# CLOSED AS SOON AS THE STEP THAT NEEDS IT IS DONE. The trap would drop it
-	# anyway, but a mount left open across the rest of the build is one more thing
-	# every later step has to be correct about -- and the pack step in particular
-	# must not be looking at a rootfs with a kernel filesystem inside it.
-	unmount_guest_proc
+	# GITHUB'S SCRIPTS WROTE THE HOSTED ENVIRONMENT TO /etc/environment in the
+	# runner-images build, and installed the toolcache; the agent passes the job
+	# exactly what /etc/billet-image-env names, so it is that file's lines.
+	write_image_env "$rootfs"
 
 	# WHAT THIS IMAGE ACTUALLY CONTAINS, WRITTEN INTO THE IMAGE.
 	#
@@ -1842,8 +1732,8 @@ DHCP=yes
 
 [DHCPv4]
 # KEY THE LEASE ON THE MAC, NOT A DUID. networkd's default client identifier is a
-# DUID derived from /etc/machine-id, and the debootstrapped image bakes ONE
-# machine-id into every clone -- so with a DUID two guests present the same client
+# DUID derived from /etc/machine-id, and every clone of one image starts from the
+# same filesystem -- so with a DUID two guests can present the same client
 # id and dnsmasq hands them the same address, which is the collision that stalled
 # large downloads. The firecracker backend now gives each guest a stable MAC
 # derived from its tap (unique among live guests, reused only after one exits), so
@@ -1868,7 +1758,8 @@ NET
 		# the guest, so a getty on ttyS0 would spin against a device nothing reads.
 		systemctl mask getty@tty1.service serial-getty@ttyS0.service
 		systemctl mask systemd-resolved-monitor.service 2>/dev/null || true
-		printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
+		grep -q "^RUNNER_TOOL_CACHE=" /etc/environment ||
+			printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
 		echo billet-guest >/etc/hostname
 		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n::1     localhost ip6-localhost ip6-loopback\n" >/etc/hosts
 		# ROOT CANNOT LOG IN. Nothing should be logging into a guest that exists for

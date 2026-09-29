@@ -142,11 +142,11 @@ func resolveGoLine(t *testing.T, feed, glob string) string {
 }
 
 // goResolutionExpression extracts the version-selection statement out of
-// install_go_toolcache.
+// install_go_toolcache, which the EC2 build runs.
 func goResolutionExpression(t *testing.T) string {
 	t.Helper()
 
-	source := readBuildScript(t)
+	source := readScriptFile(t, toolcacheAssetPath)
 
 	const begin = "\t\tversion=$(printf '%s' \"$meta\" |"
 
@@ -164,11 +164,11 @@ func goResolutionExpression(t *testing.T) string {
 }
 
 // goDirectoryNormalization extracts the case statement that turns a go release
-// name into a toolcache directory name.
+// name into a toolcache directory name, in the EC2 build's installer.
 func goDirectoryNormalization(t *testing.T) string {
 	t.Helper()
 
-	source := readBuildScript(t)
+	source := readScriptFile(t, toolcacheAssetPath)
 
 	const begin = "\t\tlocal bare=\"${version#go}\"\n"
 
@@ -185,17 +185,13 @@ func goDirectoryNormalization(t *testing.T) string {
 	return strings.ReplaceAll(source[start:start+end+7], "local ", "")
 }
 
-// readBuildScript returns the build script AND the shared toolcache installers.
-//
-// THEY ARE ONE PROGRAM AT RUNTIME. build-guest-image.sh dots
-// internal/runnerimages/install-toolcache.sh in near the top, so a test asking
-// "does the build do X" has to look in both — and when the installers moved out,
-// six tests went red for exactly that reason rather than because anything broke.
+// readBuildScript returns the guest build script, and only it: the shared
+// toolcache installers are the EC2 build's, and a test that reads them is asking
+// about the AMI, so it reads toolcacheAssetPath by name.
 func readBuildScript(t *testing.T) string {
 	t.Helper()
 
-	return readScriptFile(t, "build-guest-image.sh") + "\n" +
-		readScriptFile(t, toolcacheAssetPath)
+	return readScriptFile(t, "build-guest-image.sh")
 }
 
 // toolcacheAssetPath is the shared installer, relative to scripts/.

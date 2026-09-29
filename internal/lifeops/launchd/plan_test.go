@@ -124,6 +124,42 @@ func TestLoadedRefusalsCatchesADefinitionThatDrifted(t *testing.T) {
 		t.Fatalf("a job loaded from the shipped agent was refused: %v", got)
 	}
 
+	// NOR IS A HEALTHY macOS 27 HOST, whose launchd loads the declared 88200 as
+	// 60 (measured 2026-09-29). Refusing it refused every `local up` after the
+	// first, for the one value launchd would ever load.
+	clamped := matching
+	clamped.ExitTimeout = exitTimeoutCeiling
+
+	if want.ExitTimeout <= exitTimeoutCeiling {
+		t.Fatalf("the shipped agent declares ExitTimeOut %d, not above the ceiling, so this case "+
+			"proves nothing", want.ExitTimeout)
+	}
+
+	onRelease := func(v string, err error) *Converger {
+		return &Converger{productVersion: func() (string, error) { return v, err }}
+	}
+
+	if got := onRelease("27.0", nil).loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) != 0 {
+		t.Fatalf("a job macOS 27 loaded at its %ds ceiling was refused: %v", exitTimeoutCeiling, got)
+	}
+
+	// BUT ONLY WHERE launchd CLAMPS. On an earlier release, and on one whose
+	// version could not be read, a loaded 60 is a stale bootstrap: launchd would
+	// SIGKILL a drain it started a minute in, and nothing forced the value.
+	for _, r := range []struct {
+		name string
+		v    string
+		err  error
+	}{
+		{"macOS 26", "26.3", nil},
+		{"an unreadable release", "", errors.New("sw_vers: no such file")},
+	} {
+		if got := onRelease(r.v, r.err).loadedRefusals(deploy.NodeAgentLabel, clamped, deploy.NodeAgent); len(got) == 0 {
+			t.Errorf("on %s a job loaded at %ds was accepted, though nothing clamps it there",
+				r.name, exitTimeoutCeiling)
+		}
+	}
+
 	drift := func(f func(*Job)) Job {
 		j := matching
 		j.Environment = map[string]string{}

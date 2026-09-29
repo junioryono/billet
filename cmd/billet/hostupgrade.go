@@ -1947,7 +1947,7 @@ func (h *systemdHost) stop(ctx context.Context, unit string) error {
 		return fmt.Errorf("stopping %s: %w", unit, err)
 	}
 
-	fmt.Printf("  stopped %s (%s)\n", unit, how)
+	fmt.Printf("  stopped %s (%s: %s)\n", unit, how.Gone, how.How)
 
 	return nil
 }
