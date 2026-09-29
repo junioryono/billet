@@ -278,7 +278,10 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 	}{
 		{"a 503 on the group lookup stays advisory", "/actions/runner-groups", http.StatusServiceUnavailable, `github-launch service unavailable`, false},
 		{"a 503 on the installation token stays advisory", "/access_tokens", http.StatusServiceUnavailable, `unavailable`, false},
-		{"a throttle on the installation token stays advisory", "/access_tokens", http.StatusTooManyRequests, `{"message":"You have exceeded a secondary rate limit"}`, false},
+		{"a 429 on the installation token stays advisory", "/access_tokens", http.StatusTooManyRequests, `{"message":"slow down"}`, false},
+		// A 403 is a refusal unless its message says throttle, so this one proves
+		// the token's body reaches the classification, not only its status.
+		{"a rate-limited 403 on the installation token stays advisory", "/access_tokens", http.StatusForbidden, `{"message":"API rate limit exceeded for installation ID 42."}`, false},
 		{"a refusing 403 on the group lookup fails", "/actions/runner-groups", http.StatusForbidden, `{"message":"Resource not accessible by integration"}`, true},
 		{"a refusing 401 on the installation token fails", "/access_tokens", http.StatusUnauthorized, `{"message":"A JSON web token could not be decoded"}`, true},
 	} {

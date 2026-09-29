@@ -401,6 +401,10 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.base, c.installationID)
+	// BOUNDED, request and body alike: this holds c.mu, which every other caller
+	// of the client waits on, and the client it was given may carry no timeout.
+	ctx, cancel := context.WithTimeout(ctx, requestTimout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
 		return "", fmt.Errorf("github: build installation-token request: %w", err)
