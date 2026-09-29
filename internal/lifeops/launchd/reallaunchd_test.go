@@ -50,7 +50,9 @@ func realLaunchd(t *testing.T) (*Converger, string) {
 		t.Skip("launchctl is not the macOS service manager")
 	}
 
-	c := New(WithAgentsDir(t.TempDir()))
+	// Its own log directory: a stop records its request there, and billet's real
+	// one belongs to the agents running on this Mac.
+	c := New(WithAgentsDir(t.TempDir()), WithLogDir(t.TempDir()))
 
 	// LEFTOVERS ARE REPORTED, not discarded. These run against a real launchd on
 	// somebody's own Mac, and a cleanup that quietly failed would leave an agent
@@ -410,6 +412,49 @@ func TestStopAndProveWaitsOutARealDrain(t *testing.T) {
 
 	if processAlive(job.PID) {
 		t.Errorf("pid %d is still alive after a stop reported gone", job.PID)
+	}
+}
+
+// A DRAIN OUTLASTS launchd's CLAMPED GRACE, because launchd is not the one who
+// asked.
+//
+// macOS 27 loads a declared ExitTimeOut above 60 as 60, and a bootout of an agent
+// still draining is SIGKILLed then (measured 2026-09-29: killed at 61s, the drain
+// never finished). StopAndProve sends the SIGTERM itself and waits, so a drain
+// of 70s completes and the agent is not restarted. Opt-in, because it takes over
+// a minute: BILLET_LAUNCHD_LONG_DRAIN=1.
+func TestStopAndProveOutlastsTheClampedExitTimeout(t *testing.T) {
+	if os.Getenv("BILLET_LAUNCHD_LONG_DRAIN") != "1" {
+		t.Skip("set BILLET_LAUNCHD_LONG_DRAIN=1 to run the 70s drain against a real launchd")
+	}
+
+	c, label := realLaunchd(t)
+
+	dir := t.TempDir()
+	job := bootstrap(t, c, label, writeAgent(t, label, dir, 88200, 70))
+
+	start := time.Now()
+
+	got, err := c.StopAndProve(t.Context(), label)
+	if err != nil {
+		t.Fatalf("StopAndProve: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if got.Gone != lifeops.Yes {
+		t.Errorf("Gone = %v, want yes", got.Gone)
+	}
+
+	// THE DRAIN RAN TO ITS END: the agent writes `exit` only after its full sleep,
+	// so a SIGKILL at launchd's grace leaves it out.
+	if log := agentLog(t, dir); !strings.Contains(log, "exit") {
+		t.Fatalf("the agent never finished its drain after %s (loaded exit timeout %d): %q",
+			elapsed, job.ExitTimeout, log)
+	}
+
+	if elapsed < 65*time.Second {
+		t.Errorf("StopAndProve returned after %s against a 70s drain", elapsed)
 	}
 }
 

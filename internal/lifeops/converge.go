@@ -1624,6 +1624,10 @@ type StopResult struct {
 	// caller. systemd fills it from ActiveState and Result; launchd from whether
 	// the service is still in its domain and whether the pid it named is alive.
 	How string
+	// Asked is whether the stop was requested of the process, whatever became
+	// of it: a drain billet started and could not prove finished is a host that
+	// was touched, and a report saying nothing was stopped would be wrong.
+	Asked bool
 }
 
 // StopAndProve stops a unit and establishes that it is actually gone.
