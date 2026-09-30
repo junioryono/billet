@@ -121,12 +121,17 @@ func TestCapacityReportReadsPooledRunnersFromTheirRecords(t *testing.T) {
 	}
 }
 
-// A RUNNER STATUS THE REPORT DOES NOT KNOW IS UNKNOWN, never launching: a
+// A RUNNER RECORD THE REPORT CANNOT RECONCILE IS UNKNOWN, never launching: a
 // launching count is a claim that the launch has not returned.
-func TestCapacityReportCountsAnUnknownRunnerStatusAsUnknown(t *testing.T) {
-	var report TierCapacity
-	report.countLaunched(PhaseLaunching, map[string]string{"l1": "adopted"}, "l1")
-	if report.Unknown != 1 || report.Launching != 0 {
-		t.Fatalf("an unknown runner status was reported as %+v", report)
+func TestCapacityReportCountsAnUnreconciledRunnerAsUnknown(t *testing.T) {
+	for name, member := range map[string]PoolRunner{
+		"an unknown status": {Tier: "pooled", Status: "adopted"},
+		"another tier":      {Tier: "elsewhere", Status: PoolRunnerBusy},
+	} {
+		var report TierCapacity
+		report.countLaunched(PhaseLaunching, member, true, "pooled")
+		if report.Unknown != 1 || report.Launching != 0 || report.Running != 0 {
+			t.Errorf("%s was reported as %+v", name, report)
+		}
 	}
 }
