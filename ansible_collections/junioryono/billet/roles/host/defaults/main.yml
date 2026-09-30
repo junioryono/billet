@@ -349,6 +349,18 @@ billet_registration_wait: 300
 # An explicit confirmation controller is verified or refused. Empty requests
 # automatic selection from observed controllers when migration needs one.
 billet_migration_controller: ""
+
+# THE ORDINARY NODE RESTART, after a converge changed the node's configuration,
+# units or Firecracker binary. The restart is handed to systemd without waiting
+# and polled every billet_node_restart_poll_interval seconds, each poll a short
+# command of its own, until the node runs a new main process. The node drains
+# before it stops and the drain has no bound, so billet_node_restart_wait bounds
+# only how long this converge watches: past it the converge fails saying the
+# restart is still draining, and systemd finishes the restart regardless. Set
+# it from what the fleet's longest jobs take. Seconds, positive whole numbers.
+billet_node_restart_wait: 3600
+billet_node_restart_poll_interval: 15
+
 # The platform the exclusion is prepared for: Linux, or Darwin for the fleet
 # playbook's macOS play. From the gathered facts, because the preparation runs
 # before the role's own platform assertion and on a Mac holds without

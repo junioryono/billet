@@ -328,7 +328,7 @@ def require_control(trace, scenario, pass_name):
     # task conditions. A shared regression cannot pass by changing both legs.
     expected = {
         'active': [], 'inactive': [['start', NODE]], 'failed': [['start', NODE]],
-        'input': [['restart', NODE]], 'migration': [['stop', NODE], ['start', NODE]],
+        'input': [['restart', '--no-block', NODE]], 'migration': [['stop', NODE], ['start', NODE]],
         'stable': [],
     }
     network = [['stop', NODE], ['restart', 'billet-dnsmasq@billet0.service'],

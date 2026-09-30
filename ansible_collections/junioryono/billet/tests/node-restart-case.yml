@@ -1,0 +1,57 @@
+---
+- name: Seed the scripted node for {{ billet_gate_restart_case.name }}
+  ansible.builtin.copy:
+    dest: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
+    mode: "0600"
+    content: >-
+      {{ {'before': billet_gate_restart_case.before, 'before_rc': billet_gate_restart_case.before_rc | default(0),
+          'after': billet_gate_restart_case.after, 'restarted': false, 'polls': 0, 'calls': []} | to_json }}
+
+- name: Forget the preceding case's outcome
+  ansible.builtin.set_fact:
+    billet_gate_restart_failure: ""
+    billet_gate_restart_failed: false
+
+- name: Restart the node through the production task file
+  environment:
+    PATH: "{{ billet_gate_restart_root.path }}:{{ lookup('ansible.builtin.env', 'PATH') }}"
+    BILLET_GATE_RESTART_CASE: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
+  block:
+    - name: Include the node restart
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: node-restart
+      vars:
+        billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
+        billet_node_restart_poll_interval: 1
+  rescue:
+    - name: Record the refusal
+      ansible.builtin.set_fact:
+        billet_gate_restart_failed: true
+        billet_gate_restart_failure: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: Read what the scripted systemctl was asked
+  ansible.builtin.slurp:
+    src: "{{ billet_gate_restart_root.path }}/{{ billet_gate_restart_case.name }}.json"
+  register: billet_gate_restart_state_raw
+
+- name: Judge {{ billet_gate_restart_case.name }}
+  vars:
+    billet_gate_restart_state: "{{ billet_gate_restart_state_raw.content | b64decode | from_json }}"
+    billet_gate_restart_requests: "{{ billet_gate_restart_state.calls | select('contains', 'restart') | list }}"
+  ansible.builtin.assert:
+    that:
+      - billet_gate_restart_failed == (not billet_gate_restart_case.succeeds)
+      # EXACTLY ONE RESTART, AND ONLY THE ONE THAT DOES NOT WAIT.
+      - >-
+        billet_gate_restart_requests ==
+        ([['restart', '--no-block', 'billet-node.service']] * (billet_gate_restart_case.restarts | default(1)))
+      - billet_gate_restart_case.calls is not defined or billet_gate_restart_state.calls | length == billet_gate_restart_case.calls
+      # THE BOUND IS THE WAIT OVER THE INTERVAL, PLUS THE FIRST LOOK.
+      - billet_gate_restart_case.polls is not defined or billet_gate_restart_state.polls == billet_gate_restart_case.polls
+      - billet_gate_restart_case.message | default([]) | reject('in', billet_gate_restart_failure) | list | length == 0
+      - "'unreachable' not in billet_gate_restart_failure | lower"
+    fail_msg: >-
+      {{ billet_gate_restart_case.name }}: failed={{ billet_gate_restart_failed }}
+      message={{ billet_gate_restart_failure }} calls={{ billet_gate_restart_state.calls }}
+      polls={{ billet_gate_restart_state.polls }}
