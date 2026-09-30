@@ -105,7 +105,8 @@ func TestTheGuestArtifactIsFetchedWhole(t *testing.T) {
 	digest := artifactZip(t, filepath.Join(fake, "artifact.zip"), "manifest.json", "vmlinux-billet")
 	writeFake(t, fake, "listing", fmt.Sprintf(`{"artifacts":[{"id":42,"name":"guest-image","expired":false,`+
 		`"size_in_bytes":1000,"digest":"sha256:%s"}]}`, digest))
-	writeFake(t, fake, "free", "10737418240\n")
+	// EXACTLY ROOM FOR BOTH COPIES AND THE MARGIN is enough.
+	writeFake(t, fake, "free", fmt.Sprintf("%d\n", 2*1000+4<<30))
 
 	out, output, err := runFetch(t, fake)
 	if err != nil {
@@ -121,7 +122,7 @@ func TestTheGuestArtifactIsFetchedWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"repos/junioryono/billet/actions/runs/77/artifacts?name=guest-image",
-		"Authorization: Bearer token-for-test",
+		"Authorization: Bearer token-for-test", "--speed-limit 1048576 --speed-time 120",
 		"https://api.github.com/repos/junioryono/billet/actions/artifacts/42/zip"} {
 		if !strings.Contains(string(calls), want) {
 			t.Errorf("the fetch did not ask for %q:\n%s", want, calls)
@@ -148,13 +149,19 @@ func TestTheGuestArtifactFetchRefusesWhatItCannotProve(t *testing.T) {
 			`{"id":42,"name":"guest-image","expired":false,"size_in_bytes":1000,"digest":"sha256:x"},` +
 			`{"id":43,"name":"guest-image","expired":false,"size_in_bytes":1000,"digest":"sha256:x"}]}`,
 			"10737418240", "exactly one", false},
-		{"too little room", `{"artifacts":[{"id":42,"name":"guest-image","expired":false,` +
-			`"size_in_bytes":10737418240,"digest":"sha256:` + strings.Repeat("0", 64) + `"}]}`,
-			"10737418240", "free to hold", false},
+		// ROOM FOR THE ZIP AND ITS CONTENTS: a 10GiB artifact needs 24GiB, so 20GiB
+		// (room for one copy and the margin) is refused. The digest is the zip's
+		// own, so only the room check can refuse it.
+		{"room for one copy only", `{"artifacts":[{"id":42,"name":"guest-image","expired":false,` +
+			`"size_in_bytes":10737418240,"digest":"sha256:ZIPDIGEST"}]}`,
+			"21474836480", "free to hold", false},
+		{"one byte short of both copies", `{"artifacts":[{"id":42,"name":"guest-image","expired":false,` +
+			`"size_in_bytes":10737418240,"digest":"sha256:ZIPDIGEST"}]}`,
+			"25769803775", "free to hold", false},
 	} {
 		fake := t.TempDir()
-		artifactZip(t, filepath.Join(fake, "artifact.zip"), "manifest.json", "vmlinux-billet")
-		writeFake(t, fake, "listing", tc.listing)
+		digest := artifactZip(t, filepath.Join(fake, "artifact.zip"), "manifest.json", "vmlinux-billet")
+		writeFake(t, fake, "listing", strings.ReplaceAll(tc.listing, "ZIPDIGEST", digest))
 		writeFake(t, fake, "free", tc.free+"\n")
 
 		out, output, err := runFetch(t, fake)

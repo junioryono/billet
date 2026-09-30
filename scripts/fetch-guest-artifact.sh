@@ -54,8 +54,10 @@ echo "the artifact is $((size >> 30))GiB; $((free >> 30))GiB free"
 
 # THE TOKEN GOES TO THE API ONLY: curl does not carry an Authorization header across
 # the redirect to the blob host.
+# A STALL IS AN ERROR, so it is retried: slower than 1MiB/s for two minutes ends the
+# attempt, where a connection that stops sending would otherwise hold the job.
 curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
-	--connect-timeout 30 \
+	--connect-timeout 30 --speed-limit 1048576 --speed-time 120 \
 	-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
 	-o "$zip" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" ||
 	fail "could not download artifact $id"
