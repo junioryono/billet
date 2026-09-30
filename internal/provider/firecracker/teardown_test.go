@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -251,11 +254,10 @@ func TestDestroyRefusesAnotherDeploymentsMicroVM(t *testing.T) {
 	}
 }
 
-// A VMM THAT IGNORES SIGTERM IS KILLED.
-//
-// The escalation had no coverage at all: the stand-in used elsewhere is `sleep`,
-// which dies on SIGTERM, so the SIGKILL path was never reached. A guest that will
-// not go is holding a mapped block device open while its capacity stays charged.
+// A VMM THAT IGNORES SIGTERM IS KILLED, which is every jailed one: it is the init of
+// its own pid namespace and has no SIGTERM handler, so the kernel drops the signal.
+// A guest that will not go is holding a mapped block device open while its capacity
+// stays charged.
 func TestAVMMThatIgnoresSIGTERMIsKilled(t *testing.T) {
 	requireProc(t)
 
@@ -298,14 +300,9 @@ func TestAVMMThatIgnoresSIGTERMIsKilled(t *testing.T) {
 	}
 }
 
-// A PID BILLET CANNOT VERIFY IS NEVER SIGNALLED, not even when the VMM has already
-// failed to stop.
-//
-// The escalation runs on "SIGTERM did not work", and that failure arrives for two
-// unlike reasons: the VMM outlived its grace, or billet could not TELL whether the
-// pid is still the VMM. Killing on the second is the act process.go refuses by name
-// — sending a signal, as root, to a number nothing ties to this jail, on a machine
-// where the kernel has long since reused it.
+// A PID BILLET CANNOT VERIFY IS NEVER SIGNALLED. Killing on "could not tell" is the
+// act process.go refuses by name: sending a signal, as root, to a number nothing ties
+// to this jail, on a machine where the kernel has long since reused it.
 func TestAPidBilletCannotVerifyIsNeverKilled(t *testing.T) {
 	requireProc(t)
 
@@ -378,7 +375,7 @@ func TestStopVMMRechecksCancellationBeforeItsFirstSignal(t *testing.T) {
 	}
 }
 
-func TestStopVMMRechecksCancellationBeforeEscalatingToSIGKILL(t *testing.T) {
+func TestStopVMMRechecksCancellationBeforeSIGKILL(t *testing.T) {
 	requireProc(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -388,9 +385,6 @@ func TestStopVMMRechecksCancellationBeforeEscalatingToSIGKILL(t *testing.T) {
 		checks++
 		owns, err := pidIsVMM(pid, jailID)
 		if checks == 2 {
-			return false, errors.New("transient ownership check failure")
-		}
-		if checks == 3 {
 			cancel()
 		}
 
@@ -412,11 +406,12 @@ func TestStopVMMRechecksCancellationBeforeEscalatingToSIGKILL(t *testing.T) {
 	if err := h.p.stopVMM(ctx, j); !errors.Is(err, context.Canceled) {
 		t.Fatalf("stopVMM error = %v, want cancellation before SIGKILL", err)
 	}
-	if checks != 3 {
-		t.Fatalf("pid ownership checks = %d, want the initial, wait, and escalation checks", checks)
+	if checks != 2 {
+		t.Fatalf("pid ownership checks = %d, want the pid file's and the one with the handle held",
+			checks)
 	}
 	if owns, err := pidIsVMM(pid, theInstance); err != nil || !owns {
-		t.Fatalf("canceled SIGKILL escalation killed the live process: owns=%v err=%v", owns, err)
+		t.Fatalf("canceled stopVMM killed the live process: owns=%v err=%v", owns, err)
 	}
 }
 
@@ -598,5 +593,128 @@ func TestOnlyOneLaunchCanClaimALease(t *testing.T) {
 
 	if !strings.Contains(err.Error(), j.dir()) {
 		t.Errorf("the error does not name what is in the way: %v", err)
+	}
+}
+
+// recordingHandle stands in for a pidfd on a jailed VMM: it records every signal and,
+// like a pid-namespace init with no handler, dies only on SIGKILL.
+type recordingHandle struct {
+	mu     sync.Mutex
+	sent   []syscall.Signal
+	dead   bool
+	closed bool
+}
+
+func (h *recordingHandle) signal(sig syscall.Signal) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.sent = append(h.sent, sig)
+	if sig == syscall.SIGKILL {
+		h.dead = true
+	}
+
+	return nil
+}
+
+func (h *recordingHandle) close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.closed = true
+}
+
+func (h *recordingHandle) state() ([]syscall.Signal, bool, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]syscall.Signal(nil), h.sent...), h.dead, h.closed
+}
+
+// withRecordedVMM replaces the process seams with one VMM that is alive until it is
+// sent SIGKILL.
+func withRecordedVMM(h *harness, owner func(check int, dead bool) (bool, error)) *recordingHandle {
+	vmm := &recordingHandle{}
+	var checks atomic.Int32
+
+	h.p.openHandle = func(int) (signaller, bool, error) { return vmm, true, nil }
+	h.p.pidOwner = func(_ int, jailID string) (bool, error) {
+		if jailID != theInstance {
+			return false, nil
+		}
+		_, dead, _ := vmm.state()
+
+		return owner(int(checks.Add(1)), dead)
+	}
+
+	return vmm
+}
+
+// A JAILED VMM IS SENT SIGKILL AND NOTHING ELSE, and Destroy still waits for proof it
+// is gone. The jailer runs every VMM as the init of its own pid namespace, where a
+// SIGTERM from the host is dropped (measured 2026-09-30, Firecracker v1.16.1), so a
+// SIGTERM first only spends the whole exit wait on every destroy.
+func TestDestroySendsAJailedVMMSIGKILLAlone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	var checksAfterKill int
+	vmm := withRecordedVMM(h, func(_ int, dead bool) (bool, error) {
+		if dead {
+			checksAfterKill++
+		}
+
+		return !dead, nil
+	})
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	sent, _, closed := vmm.state()
+	if len(sent) != 1 || sent[0] != syscall.SIGKILL {
+		t.Errorf("signals sent to the jailed vmm = %v, want exactly [SIGKILL]", sent)
+	}
+	if checksAfterKill == 0 {
+		t.Error("Destroy went on without proving the killed vmm was gone")
+	}
+	if !closed {
+		t.Error("the process handle was never closed")
+	}
+	if _, err := os.Stat(h.p.jailFor(theInstance).dir()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the jail survived the destroy: %v", err)
+	}
+}
+
+// THE SECOND PROOF, TAKEN WITH THE HANDLE HELD, GATES THE KILL. A check that cannot
+// answer there stops teardown with nothing signalled and nothing removed.
+func TestAnUnanswerableCheckWithTheHandleHeldKillsNothing(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	vmm := withRecordedVMM(h, func(check int, dead bool) (bool, error) {
+		if check == 2 {
+			return false, errors.New("cannot tell whether this pid is still the microVM")
+		}
+
+		return !dead, nil
+	})
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
+		t.Fatal("Destroy reported success although it could not verify the vmm's pid")
+	}
+
+	if sent, _, _ := vmm.state(); len(sent) != 0 {
+		t.Errorf("a pid billet could not verify was signalled: %v", sent)
+	}
+	if _, err := os.Stat(h.p.jailFor(theInstance).dir()); err != nil {
+		t.Errorf("the jail was removed although the vmm was not stopped: %v", err)
+	}
+	if got := h.disk.discards(); len(got) != 0 {
+		t.Errorf("the root disk was discarded out from under a possibly-live guest: %v", got)
 	}
 }
