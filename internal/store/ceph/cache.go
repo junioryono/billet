@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -383,7 +384,7 @@ func (c *Client) Create(
 
 	device, err := c.mapCache(ctx, handle)
 	if err != nil {
-		return storecontract.Volume{}, errors.Join(err, c.removeCacheImage(ctx, handle))
+		return storecontract.Volume{}, errors.Join(err, c.discardCacheVolume(ctx, handle))
 	}
 
 	return storecontract.Volume{Key: key, Handle: handle, Device: device}, nil
@@ -734,7 +735,7 @@ func (c *Client) cleanupSnapshotFailure(
 			failures = append(failures, err)
 		}
 	}
-	if err := c.removeCacheImage(cleanupCtx, volume.Handle); err != nil {
+	if err := c.discardCacheVolume(cleanupCtx, volume.Handle); err != nil {
 		failures = append(failures, err)
 	}
 	if volume.Lease.ID != "" {
@@ -1038,7 +1039,6 @@ func (c *Client) RenewActive(
 	})
 }
 
-// Discard unmaps and removes a writable cache clone.
 // SizeOf reports a cache clone's provisioned size, as rbd describes it.
 func (c *Client) SizeOf(ctx context.Context, volume storecontract.Volume) (int64, error) {
 	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
@@ -1060,6 +1060,8 @@ func (c *Client) SizeOf(ctx context.Context, volume storecontract.Volume) (int64
 	return info.Size, nil
 }
 
+// Discard unmaps a writable cache clone and moves it to the cache pool's trash,
+// where PurgeTrash deletes it.
 func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error {
 	if volume.Handle == "" {
 		return nil
@@ -1081,7 +1083,7 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 		}
 	}
 
-	if err := c.removeCacheImage(ctx, volume.Handle); err != nil {
+	if err := c.discardCacheVolume(ctx, volume.Handle); err != nil {
 		return err
 	}
 
@@ -1094,12 +1096,58 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	return nil
 }
 
+// removeCacheImage deletes a cache generation with `rbd rm`, which refuses a
+// parent a copy-on-write child still reads before it deletes anything. A
+// generation never goes to the trash, where nothing would refuse it.
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 	if _, err := c.rbdCmd(ctx, false, "rm", handle); err != nil && !isNoSuchFile(err) {
-		return fmt.Errorf("ceph: remove cache volume %s: %w", handle, err)
+		return fmt.Errorf("ceph: remove cache image %s: %w", handle, err)
 	}
 
 	return nil
+}
+
+// discardCacheVolume moves a writable cache volume to the cache pool's trash,
+// treating an absent one as success. It refuses every other image.
+//
+// INTO THE TRASH, NOT `rbd rm`, for the reason removeClone gives: a remove
+// deletes every data object before it returns, and under the command's bound it
+// was killed partway for most jobs, leaving about 1,260 half-removed volumes in
+// the reference deployment's cache pool (#292). PurgeTrash deletes the data off
+// the command path.
+func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
+	name, ok := strings.CutPrefix(handle, c.cfg.CachePool+"/")
+	if !ok || !strings.HasPrefix(name, "cache-v-") {
+		return fmt.Errorf("ceph: refusing to move %s to the trash: only a writable cache volume "+
+			"goes there", handle)
+	}
+
+	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
+		return fmt.Errorf("ceph: move cache volume %s to the trash: %w", handle, err)
+	}
+
+	return nil
+}
+
+// billetCacheImage matches exactly the names cacheName gives the images billet
+// creates in the cache pool: a writable volume (v) or a generation (g), the Unix
+// second it was named and a 96-bit nonce.
+var billetCacheImage = regexp.MustCompile(`^cache-([vg])-([0-9]+)-[0-9a-f]{24}$`)
+
+// cacheImageName reports whether billet named an image, which kind it is and when
+// it was named.
+func cacheImageName(name string) (kind string, named time.Time, ok bool) {
+	match := billetCacheImage.FindStringSubmatch(name)
+	if match == nil {
+		return "", time.Time{}, false
+	}
+
+	seconds, err := strconv.ParseInt(match[2], 10, 64)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	return match[1], time.Unix(seconds, 0), true
 }
 
 // PurgeTimeout bounds one image's deletion from the trash. A trash removal that
@@ -1107,25 +1155,40 @@ func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 // this is a bound on how long one call holds, not on how large an image can be.
 const PurgeTimeout = 30 * time.Minute
 
-// PurgeTrash deletes the per-job root disks DiscardRoot moved to the cache
-// pool's trash, and reports how many it deleted.
+// halfRemovedAfter is how long ago an image must have been named before one
+// that cannot be opened is taken for a removal cut short. Creating an image lists
+// its name a moment before it writes its header.
+const halfRemovedAfter = time.Hour
+
+// PurgeTrash deletes the per-job root disks and writable cache volumes discards
+// moved to the cache pool's trash, finishes the cache images an `rbd rm` left
+// half-removed, and reports how many it deleted.
 //
 // OFF THE COMMAND PATH and under its own bound, because deleting a large image's
-// objects takes minutes. ROOT DISKS ONLY: the cache's own retired volumes and
-// generations are purged by eviction under the cache lock, and a name that is
-// not billet's is never touched. An image a copy-on-write child still reads
-// (ENOTEMPTY) is left for a later purge, one already gone counts as done, and
-// one that fails for any other reason does not stop the rest: each failure is
-// reported together at the end.
+// objects takes minutes. ONLY WHAT BILLET NAMED: a root disk (billet-*) or a
+// writable cache volume (cacheImageName); a generation never reaches the trash
+// (removeCacheImage) and a name that is not billet's is never touched. An image
+// a copy-on-write child still reads (ENOTEMPTY), which is every retired writer
+// whose generation is live, is left for a later purge, one already gone counts
+// as done, and one that fails for any other reason does not stop the rest: each
+// failure is reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
+	purged, failures := c.purgeTrashEntries(ctx)
+
+	finished, unfinished := c.finishHalfRemoved(ctx, time.Now())
+
+	return purged + finished, errors.Join(append(failures, unfinished...)...)
+}
+
+func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
 	if err != nil {
-		return 0, fmt.Errorf("ceph: list the cache pool's trash: %w", err)
+		return 0, []error{fmt.Errorf("ceph: list the cache pool's trash: %w", err)}
 	}
 
 	var images []cacheTrashImage
 	if err := json.Unmarshal(out, &images); err != nil || images == nil {
-		return 0, fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)
+		return 0, []error{fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)}
 	}
 
 	purged := 0
@@ -1133,12 +1196,13 @@ func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 	var failures []error
 
 	for _, image := range images {
-		if !strings.HasPrefix(image.Name, "billet-") {
+		if kind, _, ok := cacheImageName(image.Name); !strings.HasPrefix(image.Name, "billet-") &&
+			(!ok || kind != "v") {
 			continue
 		}
 
 		if err := ctx.Err(); err != nil {
-			return purged, errors.Join(append(failures, err)...)
+			return purged, append(failures, err)
 		}
 
 		if image.ID == "" || strings.ContainsAny(image.ID, "/@") ||
@@ -1164,7 +1228,67 @@ func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 		purged++
 	}
 
-	return purged, errors.Join(failures...)
+	return purged, failures
+}
+
+// finishHalfRemoved completes the removals of cache images an `rbd rm` left half
+// done, and reports how many it finished.
+//
+// A REMOVAL CUT SHORT leaves the name listed by `rbd ls` while `rbd info` answers
+// ENOENT and the data objects remain, and running `rbd rm` again finishes it
+// (measured on root clones, 2026-09-29, #280). THE PROOF IS THAT NOTHING CAN OPEN
+// IT: an image without a header cannot be mapped, cloned or read, so no job,
+// generation or index record can be using it; and rbd refuses to remove a parent
+// with a clone child before it deletes anything, so one left half-removed had no
+// child and can acquire none. Only names billet gave its cache images, and only
+// past halfRemovedAfter, so an image another node is creating is never taken for
+// one. An `rbd info` that fails for another reason is could-not-tell: the image
+// is kept and the failure reported.
+func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []error) {
+	names, err := c.cacheImages(ctx)
+	if err != nil {
+		return 0, []error{err}
+	}
+
+	finished := 0
+
+	var failures []error
+
+	for _, name := range names {
+		_, named, ok := cacheImageName(name)
+		if !ok || now.Sub(named) < halfRemovedAfter {
+			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return finished, append(failures, err)
+		}
+
+		handle := c.cfg.CachePool + "/" + name
+
+		if _, err := c.rbdCmd(ctx, true, "info", handle); err == nil {
+			continue
+		} else if !isNoSuchFile(err) {
+			failures = append(failures, fmt.Errorf("ceph: could not tell whether %s is half-removed: %w",
+				handle, err))
+
+			continue
+		}
+
+		if _, err := c.rbdCmdWithin(ctx, PurgeTimeout, false, "rm", handle); err != nil &&
+			!isNoSuchFile(err) {
+			if !isImageNotEmpty(err) {
+				failures = append(failures, fmt.Errorf("ceph: finish removing half-removed %s: %w",
+					handle, err))
+			}
+
+			continue
+		}
+
+		finished++
+	}
+
+	return finished, failures
 }
 
 func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
@@ -1175,7 +1299,13 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 	return nil
 }
 
-// Evict removes old, unreferenced cache images under the same lock as publication.
+// Evict removes old, unreferenced cache images under the same lock as publication:
+// a generation with `rbd rm`, a writable volume into the trash.
+//
+// IT NEVER DELETES FROM THE TRASH. Under this lock every writer waits on it, and a
+// discarded volume takes minutes to delete, so PurgeTrash does that off the lock.
+// A generation parented through a retired writer is therefore reclaimed over
+// passes: a pass removes the child, the purge the writer, a later pass the parent.
 func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 	if olderThan <= 0 {
 		return errors.New("ceph: cache eviction needs a positive inactivity age")
@@ -1249,80 +1379,73 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 			}
 		}
 
-		removed := map[string]bool{}
-		for {
-			progress := false
-			for _, name := range images {
-				if removed[name] {
-					continue
-				}
-				if !strings.HasPrefix(name, "cache-g-") && !strings.HasPrefix(name, "cache-v-") {
-					continue
-				}
+		for _, name := range images {
+			if !strings.HasPrefix(name, "cache-g-") && !strings.HasPrefix(name, "cache-v-") {
+				continue
+			}
 
-				handle := c.cfg.CachePool + "/" + name
-				if protected[handle] {
-					continue
-				}
+			handle := c.cfg.CachePool + "/" + name
+			if protected[handle] {
+				continue
+			}
 
-				usedAt, ok := cacheTimeFromName(name)
-				if value, found, readErr := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); readErr != nil {
-					return readErr
-				} else if found {
-					if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
-						usedAt, ok = parsed, true
-					}
-				}
-
-				age := olderThan
-				if specific := retention[handle]; specific > age {
-					age = specific
-				}
-				if !ok || now.Sub(usedAt) < age {
-					continue
-				}
-
-				mapped, err := c.mappedDevices(ctx, name)
-				if err != nil {
-					return err
-				}
-
-				if len(mapped) != 0 {
-					continue
-				}
-
-				if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
-					!isNoSuchFile(err) {
-					return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
-				}
-
-				if err := c.removeCacheImage(ctx, handle); err != nil {
-					// A newer generation may still be a copy-on-write descendant. Keep
-					// this generation's metadata so a later dependency pass can retry it
-					// after the descendants and their retired writers are gone.
-					if isImageNotEmpty(err) {
-						continue
-					}
-
-					return err
-				}
-				removed[name] = true
-				progress = true
-				for _, key := range generationMetadata[handle] {
-					if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-						return err
-					}
+			usedAt, ok := cacheTimeFromName(name)
+			if value, found, readErr := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); readErr != nil {
+				return readErr
+			} else if found {
+				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+					usedAt, ok = parsed, true
 				}
 			}
 
-			retiredProgress, err := c.purgeRetiredCacheImages(ctx)
+			age := olderThan
+			if specific := retention[handle]; specific > age {
+				age = specific
+			}
+			if !ok || now.Sub(usedAt) < age {
+				continue
+			}
+
+			mapped, err := c.mappedDevices(ctx, name)
 			if err != nil {
 				return err
 			}
-			if !progress && !retiredProgress {
-				return nil
+
+			if len(mapped) != 0 {
+				continue
+			}
+
+			if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
+				!isNoSuchFile(err) {
+				return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
+			}
+
+			if strings.HasPrefix(name, "cache-v-") {
+				if err := c.discardCacheVolume(ctx, handle); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			if err := c.removeCacheImage(ctx, handle); err != nil {
+				// A newer generation may still be a copy-on-write descendant. Keep
+				// this generation's metadata so a later pass can retry it once
+				// PurgeTrash has deleted the retired writer between them.
+				if isImageNotEmpty(err) {
+					continue
+				}
+
+				return err
+			}
+			for _, key := range generationMetadata[handle] {
+				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+					return err
+				}
 			}
 		}
+
+		return nil
 	})
 }
 
@@ -1331,47 +1454,11 @@ type cacheTrashImage struct {
 	Name string `json:"name"`
 }
 
+// isImageNotEmpty reports ENOTEMPTY (39): a copy-on-write child still reads the
+// image. `rbd trash rm` prints different prose than `rbd rm`, so the errno is the
+// stable part measured against both commands.
 func isImageNotEmpty(err error) bool {
 	return exitedWith(err, 39)
-}
-
-func (c *Client) purgeRetiredCacheImages(ctx context.Context) (bool, error) {
-	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
-	if err != nil {
-		return false, fmt.Errorf("ceph: list retired cache volumes: %w", err)
-	}
-
-	var images []cacheTrashImage
-	if err := json.Unmarshal(out, &images); err != nil || images == nil {
-		return false, fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)
-	}
-
-	removed := false
-	for _, image := range images {
-		if !strings.HasPrefix(image.Name, "cache-v-") {
-			continue
-		}
-		if image.ID == "" || strings.ContainsAny(image.ID, "/@") ||
-			strings.HasPrefix(image.ID, "-") || strings.TrimSpace(image.ID) != image.ID {
-			return false, errors.New("ceph: the cache trash contains an unusable image identity")
-		}
-
-		handle := c.cfg.CachePool + "/" + image.ID
-		if _, err := c.rbdCmd(ctx, false, "trash", "rm", handle); err != nil &&
-			!isNoSuchFile(err) {
-			// ENOTEMPTY (39) means a copy-on-write child still reads the retired
-			// parent. `rbd trash rm` prints different prose than `rbd rm`, so the
-			// errno is the stable part measured against both commands.
-			if isImageNotEmpty(err) {
-				continue
-			}
-
-			return false, fmt.Errorf("ceph: remove retired cache volume %s: %w", handle, err)
-		}
-		removed = true
-	}
-
-	return removed, nil
 }
 
 func retentionHours(key string) int {

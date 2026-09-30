@@ -50,6 +50,9 @@ type cacheFake struct {
 	// removeLocked records, per metadata key, whether the cache index lock was
 	// held at the instant `image-meta remove` ran for it.
 	removeLocked map[string]bool
+	// halfRemoved holds images an interrupted `rbd rm` left behind: `rbd ls`
+	// still lists them, nothing can open them, and `rbd rm` finishes them.
+	halfRemoved map[string]bool
 }
 
 type cacheExitError struct {
@@ -72,6 +75,7 @@ func newCacheFake() *cacheFake {
 		locker:    "client.1234",
 
 		removeLocked: map[string]bool{},
+		halfRemoved:  map[string]bool{},
 	}
 }
 
@@ -114,6 +118,10 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 	switch args[0] {
 	case "mv":
+		if f.failRemove {
+			return nil, errors.New("injected remove failure")
+		}
+
 		image := args[1]
 		if !f.images[image] {
 			return nil, errors.New("rbd: (2) No such file or directory")
@@ -413,6 +421,11 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 		if f.failRemove {
 			return nil, errors.New("injected remove failure")
 		}
+		if f.halfRemoved[tail[0]] {
+			delete(f.halfRemoved, tail[0])
+
+			return nil, nil
+		}
 		for _, parent := range f.parents {
 			if strings.HasPrefix(parent, tail[0]+"@") {
 				return nil, fmt.Errorf("exit status 39: %w", cacheExitError{
@@ -432,10 +445,12 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 		// rbd ls --format json answers an empty pool with [], not null; billet
 		// rejects a null list, so the fake must return a non-nil empty slice.
 		names := []string{}
-		for image := range f.images {
-			imagePool, name, _ := strings.Cut(image, "/")
-			if imagePool == pool {
-				names = append(names, name)
+		for _, listed := range []map[string]bool{f.images, f.halfRemoved} {
+			for image := range listed {
+				imagePool, name, _ := strings.Cut(image, "/")
+				if imagePool == pool {
+					names = append(names, name)
+				}
 			}
 		}
 
@@ -1730,6 +1745,12 @@ func TestEvictionReclaimsTheRetiredWriterAfterItsGeneration(t *testing.T) {
 	if !f.images[candidate.Handle] || len(f.trash) != 1 {
 		t.Fatal("eviction removed a current generation or its retired copy-on-write parent")
 	}
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("PurgeTrash with a live candidate: %v", err)
+	}
+	if len(f.trash) != 1 {
+		t.Fatal("the purge deleted a retired writer its live generation still reads")
+	}
 
 	old := now.Add(-8 * 24 * time.Hour)
 	var pointer cachePointer
@@ -1751,9 +1772,40 @@ func TestEvictionReclaimsTheRetiredWriterAfterItsGeneration(t *testing.T) {
 	if f.images[candidate.Handle] {
 		t.Fatal("eviction kept the expired generation")
 	}
-	if len(f.trash) != 0 {
-		t.Fatalf("eviction left %d retired writers after their children were removed", len(f.trash))
+	// EVICTION NEVER DELETES FROM THE TRASH: it holds the lock every writer waits
+	// on, and a discarded volume takes minutes to delete. The purge does it.
+	if len(f.trash) != 1 {
+		t.Fatalf("eviction deleted from the trash under the cache lock: %d left", len(f.trash))
 	}
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("PurgeTrash: %v", err)
+	}
+	if len(f.trash) != 0 {
+		t.Fatalf("the purge left %d retired writers after their children were removed", len(f.trash))
+	}
+}
+
+// reclaim alternates eviction and the purge until a round changes nothing, as
+// the node's eviction and sweep loops do, and fails the test on either's error.
+func reclaim(t *testing.T, c *Client, f *cacheFake) {
+	t.Helper()
+
+	for range 16 {
+		before := len(f.images) + len(f.trash)
+
+		if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+		if _, err := c.PurgeTrash(t.Context()); err != nil {
+			t.Fatalf("PurgeTrash: %v", err)
+		}
+
+		if len(f.images)+len(f.trash) == before {
+			return
+		}
+	}
+
+	t.Fatal("eviction and the purge were still making progress after 16 rounds")
 }
 
 func TestEvictionEventuallyReclaimsAMultiGenerationCloneChain(t *testing.T) {
@@ -1827,9 +1879,7 @@ func TestEvictionEventuallyReclaimsAMultiGenerationCloneChain(t *testing.T) {
 		f.metadata[c.cacheIndex()][metadataKey] = string(encoded)
 	}
 
-	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
-		t.Fatalf("Evict: %v", err)
-	}
+	reclaim(t, c, f)
 	for image := range f.images {
 		if strings.Contains(image, "/cache-g-") || strings.Contains(image, "/cache-v-") {
 			t.Fatalf("eviction left a cache image after the clone chain expired: %s", image)
@@ -1926,9 +1976,7 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 		f.metadata[c.cacheIndex()][metadataKey] = string(encoded)
 	}
 
-	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
-		t.Fatalf("Evict: %v", err)
-	}
+	reclaim(t, c, f)
 	if !f.images[current.Handle] {
 		t.Fatal("eviction removed the active current generation")
 	}
@@ -2165,16 +2213,17 @@ func TestCloningRefreshesTheCurrentPointersLastUse(t *testing.T) {
 	}
 }
 
-// THE PURGE DELETES THE ROOT DISKS DISCARDS MOVED TO THE TRASH, AND NOTHING ELSE.
+// THE PURGE DELETES THE ROOT DISKS AND CACHE VOLUMES DISCARDS MOVED TO THE TRASH,
+// AND NOTHING ELSE.
 //
-// A per-job root clone is billet-<lease>. The cache's own retired volumes and
-// generations are eviction's to purge under the cache lock, and a name that is
-// not billet's is somebody else's. A parent a copy-on-write child still reads
-// answers ENOTEMPTY and waits; one image that fails for another reason is
-// reported without stopping the rest. Each deletion runs under a bound of about
-// thirty minutes rather than the fifteen-second command bound that left
-// removals half-done.
-func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
+// A per-job root clone is billet-<lease>, a writable cache volume
+// cache-v-<second>-<nonce>. A generation never belongs in the trash, and a name
+// billet did not give, even one that looks like a cache volume, is somebody
+// else's. A parent a copy-on-write child still reads answers ENOTEMPTY and
+// waits; one image that fails for another reason is reported without stopping
+// the rest. Each deletion runs under a bound of about thirty minutes rather than
+// the fifteen-second command bound that left removals half-done.
+func TestPurgeTrashDeletesDiscardedRootDisksAndCacheVolumesUnderItsOwnBound(t *testing.T) {
 	t.Parallel()
 
 	f := newCacheFake()
@@ -2209,8 +2258,10 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 	f.trash["id-1refused"] = "billet-1refused"
 	f.trash["id-b-root"] = "billet-624131f5"
 	f.trash["id-c-parent"] = "billet-parent"
-	f.trash["id-d-cache"] = "cache-v-1790048184-abc"
+	f.trash["id-d-cache"] = "cache-v-1790048184-0123456789abcdef01234567"
 	f.trash["id-e-other"] = "somebody-elses-image"
+	f.trash["id-f-generation"] = "cache-g-1790048184-0123456789abcdef01234567"
+	f.trash["id-g-lookalike"] = "cache-v-1790048184-by-hand"
 	f.parents["billet-cache/child"] = "billet-cache/billet-parent@g1"
 
 	n, err := c.PurgeTrash(t.Context())
@@ -2220,20 +2271,25 @@ func TestPurgeTrashDeletesDiscardedRootDisksUnderItsOwnBound(t *testing.T) {
 		}
 	}
 
-	if n != 1 {
-		t.Errorf("purged %d, want the one root disk that could be deleted", n)
+	if n != 2 {
+		t.Errorf("purged %d, want the root disk and the cache volume that could be deleted", n)
 	}
 
 	if _, ok := f.trash["id-b-root"]; ok {
 		t.Error("a root disk behind a refused one was never reached")
 	}
 
+	if _, ok := f.trash["id-d-cache"]; ok {
+		t.Error("a discarded cache volume was left in the trash")
+	}
+
 	for id, why := range map[string]string{
-		"id-c-parent": "a parent a child still reads",
-		"id-d-cache":  "a cache volume, which is eviction's to purge",
-		"id-e-other":  "an image that is not billet's",
-		"id-0refused": "the first refused image",
-		"id-1refused": "the second refused image",
+		"id-c-parent":     "a parent a child still reads",
+		"id-e-other":      "an image that is not billet's",
+		"id-f-generation": "a cache generation, which the purge never deletes",
+		"id-g-lookalike":  "a name shaped like a cache volume that billet did not give",
+		"id-0refused":     "the first refused image",
+		"id-1refused":     "the second refused image",
 	} {
 		if _, ok := f.trash[id]; !ok {
 			t.Errorf("%s was deleted from the trash", why)
@@ -2273,5 +2329,235 @@ func TestPurgeTrashLeavesAReferencedParentWithoutAnError(t *testing.T) {
 
 	if _, ok := f.trash["id-parent"]; !ok {
 		t.Error("a parent a child still reads was deleted")
+	}
+}
+
+// isRemoval reports whether an rbd call deletes an image's data: `rbd rm` or
+// `rbd trash rm`, never the cache index lock's `lock rm` or a snapshot's.
+func isRemoval(call []string) bool {
+	return slices.Contains(call, "rm") && !slices.Contains(call, "lock") &&
+		!slices.Contains(call, "snap")
+}
+
+// A DISCARDED CACHE VOLUME GOES TO THE TRASH AND IS NEVER DELETED IN LINE.
+//
+// `rbd rm` deletes every data object before it returns, and under the command's
+// bound it was killed partway for most jobs, leaving about 1,260 half-removed
+// volumes in the reference deployment's cache pool (#292). The discard moves the
+// volume to the trash, which is metadata only; PurgeTrash deletes it.
+func TestADiscardedCacheVolumeGoesToTheTrashAndIsNeverRemovedInLine(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+
+	volume, err := c.Create(t.Context(), "acme/api/pr", 1<<30)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	f.calls = nil
+
+	if err := c.Discard(t.Context(), volume); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+
+	if !f.ranWith("trash", "mv", volume.Handle) {
+		t.Fatal("the discard did not move the volume to the trash")
+	}
+
+	for _, call := range f.calls {
+		if isRemoval(call) {
+			t.Errorf("a discard deleted the data on the command path: %v", call)
+		}
+	}
+
+	if n, err := c.PurgeTrash(t.Context()); err != nil || n != 1 || len(f.trash) != 0 {
+		t.Fatalf("PurgeTrash = %d, %v, trash %v; want the discarded volume deleted", n, err, f.trash)
+	}
+}
+
+// NOTHING MOVES A GENERATION TO THE TRASH. `rbd rm` refuses a parent a clone still
+// reads before it deletes anything; the trash would take it and nothing would
+// refuse it there.
+func TestTheTrashRefusesAGeneration(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	handle := "billet-cache/cache-g-1790048184-0123456789abcdef01234567"
+	f.images[handle] = true
+
+	if err := c.discardCacheVolume(t.Context(), handle); err == nil {
+		t.Fatal("a generation was accepted for the trash")
+	}
+
+	if len(f.calls) != 0 || !f.images[handle] {
+		t.Fatalf("refusing a generation still ran %v", f.calls)
+	}
+}
+
+// EVICTION MOVES AN EXPIRED VOLUME TO THE TRASH, REMOVES AN EXPIRED GENERATION WITH
+// `rbd rm`, AND NEVER DELETES FROM THE TRASH, because it holds the lock every
+// cache writer waits on and a discarded volume takes minutes to delete.
+func TestEvictionTrashesVolumesRemovesGenerationsAndNeverPurges(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	old := time.Now().Add(-8 * 24 * time.Hour).Unix()
+	volume := fmt.Sprintf("billet-cache/cache-v-%d-0123456789abcdef01234567", old)
+	generation := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", old)
+	f.images[volume] = true
+	f.images[generation] = true
+	f.trash["id-discarded"] = fmt.Sprintf("cache-v-%d-fedcba9876543210fedcba98", old)
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if f.images[volume] || f.images[generation] {
+		t.Fatalf("eviction kept an expired image: %v", f.images)
+	}
+
+	if !f.ranWith("trash", "mv", volume) || f.ranWith("rm", volume) {
+		t.Error("eviction did not move the expired volume to the trash")
+	}
+
+	if f.ranWith("trash", "mv", generation) || !f.ranWith("rm", generation) {
+		t.Error("eviction did not remove the expired generation with rbd rm")
+	}
+
+	if _, ok := f.trash["id-discarded"]; !ok || f.ranWith("trash", "rm") {
+		t.Error("eviction deleted from the trash under the cache lock")
+	}
+}
+
+// THE PURGE FINISHES WHAT AN INTERRUPTED `rbd rm` LEFT, AND ONLY THAT.
+//
+// A removal cut short leaves the name listed while nothing can open it, and `rbd
+// rm` again finishes it (measured 2026-09-29). An image nobody can open is one no
+// job or generation can use, and rbd refused to start removing a parent with a
+// child. It must be a name billet gave a cache image, named long enough ago that
+// it is not an image another node is creating, and it is deleted under the
+// purge's own bound rather than the fifteen-second one that cut it short.
+func TestThePurgeFinishesHalfRemovedCacheImages(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+
+	var bounds []time.Duration
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if isRemoval(args) && !slices.Contains(args, "trash") {
+			if deadline, ok := ctx.Deadline(); ok {
+				bounds = append(bounds, time.Until(deadline))
+			} else {
+				t.Error("a removal ran with no deadline at all")
+			}
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	fresh := time.Now().Unix()
+	halfVolume := fmt.Sprintf("billet-cache/cache-v-%d-0123456789abcdef01234567", old)
+	halfGeneration := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", old)
+	creating := fmt.Sprintf("billet-cache/cache-v-%d-fedcba9876543210fedcba98", fresh)
+	lookalike := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old)
+	root := "billet-cache/billet-624131f5"
+	whole := fmt.Sprintf("billet-cache/cache-v-%d-fedcba9876543210fedcba98", old)
+
+	for _, image := range []string{halfVolume, halfGeneration, creating, lookalike, root} {
+		f.halfRemoved[image] = true
+	}
+	f.images[whole] = true
+
+	n, err := c.PurgeTrash(t.Context())
+	if err != nil {
+		t.Fatalf("PurgeTrash: %v", err)
+	}
+
+	if n != 2 || f.halfRemoved[halfVolume] || f.halfRemoved[halfGeneration] {
+		t.Errorf("finished %d, left %v; want both half-removed cache images finished", n, f.halfRemoved)
+	}
+
+	for image, why := range map[string]string{
+		creating:  "an image named moments ago, which may be one being created",
+		lookalike: "a name billet did not give",
+		root:      "a name that is not a cache image's",
+	} {
+		if !f.halfRemoved[image] {
+			t.Errorf("the purge removed %s", why)
+		}
+	}
+
+	if !f.images[whole] || f.ranWith("rm", whole) {
+		t.Error("the purge removed a whole image that can still be opened")
+	}
+
+	if len(bounds) != 2 {
+		t.Fatalf("ran %d removals, want 2", len(bounds))
+	}
+
+	for _, b := range bounds {
+		if b < 29*time.Minute || b > 31*time.Minute {
+			t.Errorf("a half-removed image was finished under %s, want about thirty minutes", b)
+		}
+	}
+}
+
+// COULD NOT TELL IS NOT HALF-REMOVED. An `rbd info` that fails for any reason but
+// ENOENT keeps the image and reports it, and one image that cannot be finished
+// does not stop the rest.
+func TestAHalfRemovedCheckThatCannotTellKeepsTheImage(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	unreadable := fmt.Sprintf("billet-cache/cache-v-%d-000000000000000000000000", old)
+	refused := fmt.Sprintf("billet-cache/cache-v-%d-111111111111111111111111", old)
+	finishable := fmt.Sprintf("billet-cache/cache-v-%d-222222222222222222222222", old)
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "info") && slices.Contains(args, unreadable) {
+			return nil, errors.New("exit status 108: rbd: error: (108) Cannot send after transport endpoint shutdown")
+		}
+
+		if isRemoval(args) && slices.Contains(args, refused) {
+			return nil, errors.New("exit status 5: rbd: error: (5) Input/output error")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, image := range []string{unreadable, refused, finishable} {
+		f.halfRemoved[image] = true
+	}
+
+	n, err := c.PurgeTrash(t.Context())
+	for _, image := range []string{unreadable, refused} {
+		if err == nil || !strings.Contains(err.Error(), image) {
+			t.Errorf("%s was not reported: %v", image, err)
+		}
+	}
+
+	if n != 1 || f.halfRemoved[finishable] {
+		t.Errorf("finished %d; an image after the failures was never reached", n)
+	}
+
+	if !f.halfRemoved[unreadable] || f.ranWith("rm", unreadable) {
+		t.Error("an image whose state could not be read was removed")
 	}
 }
