@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -262,6 +263,11 @@ func TestStopAndProveNeverSendsTheRequestToAProcessNotProvedToHandleIt(t *testin
 		"a member this build does not know": `{"schema":1,"label":"sh.billet.node","pid":4242,"started":"started-4242","request":"SIGUSR1","release":"v","hurry":true}`,
 		"two reports":                       reportBody(1, "sh.billet.node", 4242, "started-4242", "SIGUSR1") + reportBody(1, "sh.billet.node", 4242, "started-4242", "SIGUSR1"),
 		"a report cut short":                `{"schema":1,"label":"sh.billet.node","pid":4242`,
+		"a member in another case":          `{"schema":1,"label":"sh.billet.node","pid":4242,"started":"started-4242","REQUEST":"SIGUSR1","release":"v"}`,
+		"a member twice":                    `{"schema":1,"label":"sh.billet.node","pid":4242,"started":"started-4242","request":"SIGUSR2","request":"SIGUSR1","release":"v"}`,
+		"a member missing":                  `{"schema":1,"label":"sh.billet.node","pid":4242,"started":"started-4242","request":"SIGUSR1"}`,
+		"a stray brace after it":            reportBody(1, "sh.billet.node", 4242, "started-4242", "SIGUSR1") + "}",
+		"more than a report can hold":       reportBody(1, "sh.billet.node", 4242, "started-4242", "SIGUSR1") + strings.Repeat(" ", 5000) + "x",
 		"an empty start that matches none":  reportBody(1, "sh.billet.node", 4242, "", "SIGUSR1"),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -276,6 +282,20 @@ func TestStopAndProveNeverSendsTheRequestToAProcessNotProvedToHandleIt(t *testin
 
 			assertOldPath(t, f, c)
 		})
+	}
+}
+
+// THE CONTROL FOR THE TABLE ABOVE: the report every case there breaks one thing
+// of is proved as written.
+func TestTheUnbrokenReportIsProved(t *testing.T) {
+	t.Parallel()
+
+	f := &fake{t: t, alive: map[int]bool{4242: true}}
+	c := f.converger(t)
+	writeReport(t, c, reportBody(1, "sh.billet.node", 4242, "started-4242", "SIGUSR1")+"\n")
+
+	if err := c.provesDrainRequest("sh.billet.node", 4242); err != nil {
+		t.Errorf("a well-formed report for this process was not proved: %v", err)
 	}
 }
 

@@ -27,8 +27,8 @@ func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
 	close(requests)
 	lc.drainOn(requests)
 
-	if cancels.Load() == 0 {
-		t.Fatal("a drain request did not start the drain")
+	if cancels.Load() != 5 {
+		t.Fatalf("five drain requests started the drain %d times, want every one", cancels.Load())
 	}
 
 	select {
@@ -47,15 +47,18 @@ func TestTheDrainSignalReachesTheDrain(t *testing.T) {
 	lc := newLifecycle(func() { cancels.Add(1) })
 
 	stop := lc.handleDrainRequests()
-	defer stop()
 
-	for range 3 {
+	// ONE AT A TIME, each acknowledged before the next, so no two coalesce and
+	// every repeat is one the handler actually received.
+	for i := int32(1); i <= 3; i++ {
 		if err := syscall.Kill(os.Getpid(), launchd.DrainSignal); err != nil {
 			t.Fatalf("send the drain request: %v", err)
 		}
+
+		waitFor(t, "the drain request to be received", func() bool { return cancels.Load() == i })
 	}
 
-	waitFor(t, "the drain request to cancel", func() bool { return cancels.Load() > 0 })
+	stop()
 
 	select {
 	case <-lc.hurry:
@@ -96,40 +99,58 @@ func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
 // handler is installed tells a stop to send a signal the Go runtime then drops,
 // and the stop waits on a drain that never began. The upgrade probe returns
 // before either, because it is not the node a stop asks.
+//
+// EACH IS A STATEMENT OF cmdNode's OWN BODY, IN ITS SHAPE, not a call found
+// anywhere in it: the handler is installed by `defer lc.handleDrainRequests()()`,
+// whose inner call runs where the defer stands (a call wrapped in a deferred
+// closure would run at return), the report is a plain statement after it, the
+// probe is the `if *upgradeProbe` block that returns, and serving is the final
+// `return nodeclient.Run(...)`.
 func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 	fn := findFunc(t, "cmdNode")
 
-	first := map[string]int{}
-	last := map[string]int{}
+	probe, handler, report, serve := -1, -1, -1, -1
 
-	ast.Inspect(fn, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+	for i, stmt := range fn.Body.List {
+		switch s := stmt.(type) {
+		case *ast.IfStmt:
+			if star, ok := s.Cond.(*ast.StarExpr); ok {
+				if id, ok := star.X.(*ast.Ident); ok && id.Name == "upgradeProbe" {
+					probe = i
+				}
+			}
+
+		case *ast.DeferStmt:
+			if inner, ok := s.Call.Fun.(*ast.CallExpr); ok && calleeName(inner) == "handleDrainRequests" {
+				handler = i
+			}
+
+		case *ast.ExprStmt:
+			if call, ok := s.X.(*ast.CallExpr); ok && calleeName(call) == "publishNodeDrainReport" {
+				report = i
+			}
+
+		case *ast.ReturnStmt:
+			if len(s.Results) != 1 {
+				continue
+			}
+
+			call, ok := s.Results[0].(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
+				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "nodeclient" {
+					serve = i
+				}
+			}
 		}
+	}
 
-		name := calleeName(call)
-		if name == "" {
-			return true
-		}
-
-		if _, seen := first[name]; !seen {
-			first[name] = int(call.Pos())
-		}
-
-		last[name] = int(call.Pos())
-
-		return true
-	})
-
-	handler, okHandler := first["handleDrainRequests"]
-	report, okReport := first["publishNodeDrainReport"]
-	probe, okProbe := last["holdProbe"]
-	serve, okServe := last["Run"]
-
-	if !okHandler || !okReport || !okProbe || !okServe {
-		t.Fatalf("cmdNode lost a call this test orders: handler %v, report %v, probe %v, run %v",
-			okHandler, okReport, okProbe, okServe)
+	if probe < 0 || handler < 0 || report < 0 || serve < 0 {
+		t.Fatalf("cmdNode lost a statement this test orders (index -1): probe %d, handler %d, "+
+			"report %d, serve %d", probe, handler, report, serve)
 	}
 
 	if handler < probe || report < probe {

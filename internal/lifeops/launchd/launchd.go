@@ -576,7 +576,7 @@ func (c *Converger) askOnce(
 				How:   "may have been asked to stop; the request did not finish",
 				Asked: true,
 			}, fmt.Errorf("launchd: `launchctl kill TERM %s` did not finish (exit %d), so whether it "+
-				"was delivered is unknown; a retry waits and asks nothing again (if nothing was "+
+				"was delivered is unknown; a retry sends it no second SIGTERM (if nothing was "+
 				"asked, remove %s): %v", c.target(label), code, record, err)
 
 	case code != 0 && c.alive(pid):
@@ -636,7 +636,7 @@ func (c *Converger) awaitExit(
 
 			if err := ctx.Err(); err != nil {
 				return 0, result, fmt.Errorf("launchd: stopped waiting for %s to finish its drain "+
-					"(a retry resumes the wait and asks nothing again; if no drain was ever "+
+					"(a retry resumes the wait and sends no second SIGTERM; if no drain was ever "+
 					"requested, remove %s): %w", label, record, err)
 			}
 
@@ -681,22 +681,26 @@ const maxDrainRestarts = 3
 const ownFileLimit = 4 << 10
 
 // readStopRecord reads a stop record, "" when there is none.
-func readStopRecord(path string) (string, error) { return readOwnFile(path, "stop record") }
+func readStopRecord(path string) (string, error) {
+	body, err := readOwnFile(path, "stop record", ownFileLimit)
+
+	return strings.TrimSpace(body), err
+}
 
 // writeStopRecord replaces a stop record atomically.
 func writeStopRecord(path, incarnation string) error {
 	return writeOwnFile(path, ".stop-record-*", incarnation)
 }
 
-// readOwnFile reads one of the small files this package keeps in the log
-// directory, "" when there is none.
+// readOwnFile reads at most limit bytes of one of the small files this package
+// keeps in the log directory, "" when there is none.
 //
 // NEVER THROUGH A LINK, AND NEVER BLOCKING. The file lives in the account's own
 // log directory, and a symlink planted there would redirect it, a FIFO would
 // hang the read, and a link to /dev/null would make every request look
 // unrecorded. So the open follows nothing and does not block, and anything but
 // a regular file is refused.
-func readOwnFile(path, what string) (string, error) {
+func readOwnFile(path, what string, limit int64) (string, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
@@ -718,12 +722,12 @@ func readOwnFile(path, what string) (string, error) {
 			what, path, info.Mode().Type())
 	}
 
-	body, err := io.ReadAll(io.LimitReader(f, ownFileLimit))
+	body, err := io.ReadAll(io.LimitReader(f, limit))
 	if err != nil {
 		return "", fmt.Errorf("launchd: read the %s %s: %w", what, path, err)
 	}
 
-	return strings.TrimSpace(string(body)), nil
+	return string(body), nil
 }
 
 // writeOwnFile replaces one of those files atomically: a temporary file in the

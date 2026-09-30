@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 
 	"github.com/junioryono/billet/internal/lifeops"
@@ -85,25 +88,22 @@ func publishDrainReport(
 func (c *Converger) provesDrainRequest(label string, pid int) error {
 	path := drainReportPath(c.logDir, label)
 
-	body, err := readOwnFile(path, "drain report")
+	body, err := readOwnFile(path, "drain report", ownFileLimit+1)
 	if err != nil {
 		return err
 	}
 
-	if body == "" {
+	if len(body) > ownFileLimit {
+		return fmt.Errorf("launchd: the drain report %s is larger than a report can be", path)
+	}
+
+	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("launchd: %s publishes no drain report at %s", label, path)
 	}
 
-	dec := json.NewDecoder(bytes.NewReader([]byte(body)))
-	dec.DisallowUnknownFields()
-
-	var report drainReport
-	if err := dec.Decode(&report); err != nil {
+	report, err := decodeDrainReport([]byte(body))
+	if err != nil {
 		return fmt.Errorf("launchd: read the drain report %s: %w", path, err)
-	}
-
-	if dec.More() {
-		return fmt.Errorf("launchd: the drain report %s holds more than one report", path)
 	}
 
 	switch {
@@ -130,6 +130,60 @@ func (c *Converger) provesDrainRequest(label string, pid int) error {
 	return nil
 }
 
+// drainReportMembers is the exact member set of a drain report.
+var drainReportMembers = []string{"schema", "label", "pid", "started", "request", "release"}
+
+// decodeDrainReport reads exactly one report holding exactly its members,
+// each once and spelled exactly, and nothing after it. encoding/json alone
+// would accept a member twice, a member in another case and trailing bytes.
+func decodeDrainReport(body []byte) (drainReport, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return drainReport{}, fmt.Errorf("not a JSON object (%v)", err)
+	}
+
+	seen := map[string]bool{}
+
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return drainReport{}, err
+		}
+
+		name, _ := tok.(string)
+		if !slices.Contains(drainReportMembers, name) || seen[name] {
+			return drainReport{}, fmt.Errorf("unexpected or repeated member %q", name)
+		}
+
+		seen[name] = true
+
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return drainReport{}, err
+		}
+	}
+
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return drainReport{}, fmt.Errorf("the object is not closed (%v)", err)
+	}
+
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return drainReport{}, errors.New("something follows the report")
+	}
+
+	if len(seen) != len(drainReportMembers) {
+		return drainReport{}, fmt.Errorf("%d of its %d members", len(seen), len(drainReportMembers))
+	}
+
+	var report drainReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return drainReport{}, err
+	}
+
+	return report, nil
+}
+
 // requestDrain sends pid DrainSignal on every poll until the process exits,
 // and reports the process launchd runs for the label afterwards, zero when it
 // runs none. requested is false, with nothing sent, when the process is not
@@ -139,7 +193,11 @@ func (c *Converger) provesDrainRequest(label string, pid int) error {
 // process, and launchd delivers to whatever it runs at that moment, which a
 // restart in between makes a process that never said it handles the request.
 // So the proof is re-read immediately before every signal, and a process that
-// stops proving it after being asked is waited for and not asked again.
+// stops proving it after being asked is waited for and not asked again. What
+// remains is the instant between that read and the kill, in which the process
+// would have to exit and its pid be handed out again; macOS has no pidfd to
+// close it, and allocates pids in sequence, so that needs the whole pid space
+// to wrap in between.
 func (c *Converger) requestDrain(
 	ctx context.Context, label string, pid int, watch func(Job), watched map[int]bool,
 ) (int, bool, lifeops.StopResult, error) {
