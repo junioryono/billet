@@ -50,7 +50,8 @@
 # ONE SHORT READ PER STEP, each a fresh module run over its own connection. The
 # retries' exhaustion is judged below with this role's words, not Ansible's, and
 # a step the connection lost ends the poll as could-not-tell rather than
-# removing the host from the play.
+# removing the host from the play. The retries are the wait over the interval,
+# rounded down, so the sleeps between reads never add up to more than the wait.
 - name: Poll the billet node until a new main process runs
   ansible.builtin.command:
     argv:
@@ -71,7 +72,7 @@
     'SubState=running' in billet_node_restart_poll.stdout_lines | default([]) and
     billet_node_restart_poll.stdout_lines | default([]) | select('match', '^MainPID=[1-9][0-9]*\Z') | list | length == 1 and
     ('MainPID=' ~ (billet_node_restart_before.stdout | trim)) not in billet_node_restart_poll.stdout_lines | default([])
-  retries: "{{ ((billet_node_restart_wait | int) / (billet_node_restart_poll_interval | int)) | round(0, 'ceil') | int }}"
+  retries: "{{ (billet_node_restart_wait | int) // (billet_node_restart_poll_interval | int) }}"
   delay: "{{ billet_node_restart_poll_interval | int }}"
 
 - name: Refuse a node restart this converge lost sight of
@@ -86,23 +87,63 @@
       converge again.
   when: billet_node_restart_poll is unreachable
 
+# THE LAST READ DECIDES WHAT IS REPORTED when the poll ends without the proof:
+# nothing readable is could-not-tell; the process from before still in charge
+# (deactivating, or active under the recorded MainPID) is a restart still
+# draining, which systemd will finish; anything else (failed, inactive, a new
+# process that never became ready) is a node that did not come back.
+- name: Refuse a node restart whose last poll could not be read
+  ansible.builtin.fail:
+    msg: >-
+      The billet node's restart was requested, and the last poll this converge
+      made over {{ billet_node_restart_wait }} seconds (billet_node_restart_wait)
+      read nothing usable from systemd (systemctl show exited
+      {{ billet_node_restart_poll.rc | default('unknown') }}), so whether
+      billet-node.service came back could not be told. On the host,
+      `systemctl show billet-node -p ActiveState,SubState,MainPID` answers it:
+      active, running and a MainPID other than
+      {{ billet_node_restart_before.stdout | trim }} means it restarted; then
+      converge again.
+  when:
+    - billet_node_restart_poll is not unreachable
+    - >-
+      billet_node_restart_poll.rc | default(1) != 0 or
+      billet_node_restart_poll.stdout_lines | default([]) | select('match', '^ActiveState=') | list | length != 1 or
+      billet_node_restart_poll.stdout_lines | default([]) | select('match', '^MainPID=[0-9]+\Z') | list | length != 1
+
 - name: Report a node restart still draining past its bound
-  ansible.builtin.assert:
-    that:
-      - billet_node_restart_poll.rc | default(1) == 0
-      - "'ActiveState=active' in billet_node_restart_poll.stdout_lines | default([])"
-      - "'SubState=running' in billet_node_restart_poll.stdout_lines | default([])"
-      - billet_node_restart_poll.stdout_lines | default([]) | select('match', '^MainPID=[1-9][0-9]*\Z') | list | length == 1
-      - ('MainPID=' ~ (billet_node_restart_before.stdout | trim)) not in billet_node_restart_poll.stdout_lines | default([])
-    fail_msg: >-
-      The billet node restart is still draining {{ billet_node_restart_wait }}
-      seconds after it was requested (billet_node_restart_wait): the host
-      answered every poll, and billet-node.service last reported
-      {{ billet_node_restart_poll.stdout_lines | default([]) | join(' ') if billet_node_restart_poll.rc | default(1) == 0
-         else 'nothing readable (systemctl show exited ' ~ (billet_node_restart_poll.rc | default('unknown')) ~ ')' }}
-      against MainPID={{ billet_node_restart_before.stdout | trim }} before the restart. systemd still holds
-      the restart and will finish it when the drain does; nothing was lost by
-      this converge ending. Follow it on the host with
+  ansible.builtin.fail:
+    msg: >-
+      The billet node restart is still draining after this converge polled it
+      for {{ billet_node_restart_wait }} seconds (billet_node_restart_wait):
+      billet-node.service last reported
+      {{ billet_node_restart_poll.stdout_lines | join(' ') }}, the process from
+      before the restart (MainPID={{ billet_node_restart_before.stdout | trim }})
+      still in charge. systemd holds the restart and finishes it when the drain
+      does; ending this converge lost nothing. Follow it on the host with
       `systemctl show billet-node -p ActiveState,SubState,MainPID`, and converge
       again once it reports active, running and a new MainPID.
+  when:
+    - billet_node_restart_poll is not unreachable
+    - >-
+      'ActiveState=deactivating' in billet_node_restart_poll.stdout_lines or
+      ('ActiveState=active' in billet_node_restart_poll.stdout_lines and
+       ('MainPID=' ~ (billet_node_restart_before.stdout | trim)) in billet_node_restart_poll.stdout_lines)
+
+- name: Prove the billet node restarted into a new main process
+  ansible.builtin.assert:
+    that:
+      - "'ActiveState=active' in billet_node_restart_poll.stdout_lines"
+      - "'SubState=running' in billet_node_restart_poll.stdout_lines"
+      - billet_node_restart_poll.stdout_lines | select('match', '^MainPID=[1-9][0-9]*\Z') | list | length == 1
+      - ('MainPID=' ~ (billet_node_restart_before.stdout | trim)) not in billet_node_restart_poll.stdout_lines
+    fail_msg: >-
+      The billet node did not come back from its restart within
+      {{ billet_node_restart_wait }} seconds (billet_node_restart_wait): the
+      process from before it (MainPID={{ billet_node_restart_before.stdout | trim }})
+      is gone, and billet-node.service last reported
+      {{ billet_node_restart_poll.stdout_lines | join(' ') }}, not a new main
+      process active and running. Read why on the host with
+      `systemctl show billet-node -p ActiveState,SubState,MainPID` and
+      `journalctl -u billet-node`.
   when: billet_node_restart_poll is not unreachable

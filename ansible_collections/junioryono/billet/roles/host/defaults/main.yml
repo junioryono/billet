@@ -356,8 +356,11 @@ billet_migration_controller: ""
 # command of its own, until the node runs a new main process. The node drains
 # before it stops and the drain has no bound, so billet_node_restart_wait bounds
 # only how long this converge watches: past it the converge fails saying the
-# restart is still draining, and systemd finishes the restart regardless. Set
-# it from what the fleet's longest jobs take. Seconds, positive whole numbers.
+# restart is still draining (the process from before still in charge), that the
+# node did not come back, or that its last read was unusable, and systemd
+# carries the restart on regardless. Set it from what the fleet's longest jobs
+# take. Seconds, positive whole numbers; the sleeps between polls never add up
+# to more than the wait.
 billet_node_restart_wait: 3600
 billet_node_restart_poll_interval: 15
 

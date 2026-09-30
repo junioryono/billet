@@ -36,13 +36,15 @@ elif args == ['restart', '--no-block', 'billet-node.service']:
     state['restarted'] = True
     save()
 elif args == ['show', '--property=ActiveState', '--property=SubState', '--property=MainPID', 'billet-node.service']:
+    unit = state['before']
     if state['restarted']:
         after = state['after']
-        show(after[min(state['polls'], len(after) - 1)])
+        unit = after[min(state['polls'], len(after) - 1)]
         state['polls'] += 1
-    else:
-        show(state['before'])
     save()
+    if unit.get('rc'):
+        sys.exit(unit['rc'])
+    show(unit)
 else:
     save()
     sys.exit('the node-restart systemctl fake does not answer ' + repr(args))

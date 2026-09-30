@@ -1,10 +1,12 @@
 ---
 # THE ORDINARY NODE RESTART AGAINST A SCRIPTED systemctl. The restart must be
 # requested with --no-block and proved by polling for an active, running node
-# with a MainPID other than the one recorded before it; a poll that never sees
-# that must end at billet_node_restart_wait with the role's own "still
-# draining" words. Each case drives the production task file through
-# include_role; the fake answers only the requests that file makes.
+# with a MainPID other than the one recorded before it. A poll that never sees
+# that ends at billet_node_restart_wait and says which of three things it last
+# read: nothing usable (could not tell), the old process still in charge (still
+# draining), or anything else (did not come back). Each case drives the
+# production task file through include_role; the fake answers only the
+# requests that file makes. `absent` fragments must not appear in the message.
 - name: Prove the node restart is requested without waiting and polled to a new main process
   hosts: localhost
   connection: local
@@ -19,6 +21,16 @@
           - {ActiveState: active, SubState: running, MainPID: "200"}
         succeeds: true
         polls: 3
+      # A NOTIFY SERVICE HAS ITS NEW MAIN PROCESS BEFORE IT IS READY: a new
+      # MainPID alone is not the proof, active and running are too.
+      - name: new-process-before-ready
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100"}
+          - {ActiveState: activating, SubState: start, MainPID: "200"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: true
+        polls: 3
       # A NODE THAT WAS NOT RUNNING HAS NO OLD MAIN PROCESS: MainPID=0 before.
       - name: first-start
         before: {ActiveState: inactive, SubState: dead, MainPID: "0"}
@@ -27,6 +39,8 @@
           - {ActiveState: active, SubState: running, MainPID: "300"}
         succeeds: true
         polls: 2
+      # THE BOUND IS THE WAIT OVER THE INTERVAL, ROUNDED DOWN, PLUS THE FIRST
+      # LOOK: three one-second sleeps, four reads.
       - name: still-draining
         before: {ActiveState: active, SubState: running, MainPID: "100"}
         after:
@@ -34,6 +48,17 @@
         succeeds: false
         polls: 4
         message: [still draining, "`systemctl show billet-node -p ActiveState,SubState,MainPID`", MainPID=100, billet_node_restart_wait]
+        absent: [did not come back, could not be told]
+      # Three seconds at a two-second interval is one sleep, never two.
+      - name: bound-rounds-down
+        wait: 3
+        interval: 2
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100"}
+        succeeds: false
+        polls: 2
+        message: [still draining]
       # BACK WHERE IT WAS IS NOT A RESTART: the job left the queue, and the
       # same main process still runs the old inputs.
       - name: same-main-process
@@ -43,6 +68,32 @@
         succeeds: false
         polls: 4
         message: [still draining, "ActiveState=active SubState=running"]
+      - name: never-ready
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: activating, SubState: start, MainPID: "200"}
+        succeeds: false
+        polls: 4
+        message: [did not come back, ActiveState=activating, "`journalctl -u billet-node`"]
+        absent: [still draining, could not be told]
+      - name: failed
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100"}
+          - {ActiveState: failed, SubState: failed, MainPID: "0"}
+        succeeds: false
+        polls: 4
+        message: [did not come back, ActiveState=failed]
+        absent: [still draining, could not be told]
+      # A READ THAT FAILED IS NOT A DRAIN: could not tell, never "still draining".
+      - name: unreadable-after
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {rc: 1}
+        succeeds: false
+        polls: 4
+        message: [could not be told, systemctl show exited 1]
+        absent: [still draining, did not come back]
       - name: unreadable-before
         before: {ActiveState: active, SubState: running, MainPID: "100"}
         before_rc: 1

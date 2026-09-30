@@ -23,7 +23,7 @@
         tasks_from: node-restart
       vars:
         billet_node_restart_wait: "{{ billet_gate_restart_case.wait | default(3) }}"
-        billet_node_restart_poll_interval: 1
+        billet_node_restart_poll_interval: "{{ billet_gate_restart_case.interval | default(1) }}"
   rescue:
     - name: Record the refusal
       ansible.builtin.set_fact:
@@ -50,6 +50,7 @@
       # THE BOUND IS THE WAIT OVER THE INTERVAL, PLUS THE FIRST LOOK.
       - billet_gate_restart_case.polls is not defined or billet_gate_restart_state.polls == billet_gate_restart_case.polls
       - billet_gate_restart_case.message | default([]) | reject('in', billet_gate_restart_failure) | list | length == 0
+      - billet_gate_restart_case.absent | default([]) | select('in', billet_gate_restart_failure) | list | length == 0
       - "'unreachable' not in billet_gate_restart_failure | lower"
     fail_msg: >-
       {{ billet_gate_restart_case.name }}: failed={{ billet_gate_restart_failed }}
