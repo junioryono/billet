@@ -2269,6 +2269,7 @@ func TestPurgeTrashDeletesDiscardedRootDisksAndCacheVolumesUnderItsOwnBound(t *t
 	f.trash["id-e-other"] = "somebody-elses-image"
 	f.trash["id-f-generation"] = "cache-g-1790048184-0123456789abcdef01234567"
 	f.trash["id-g-lookalike"] = "cache-v-1790048184-by-hand"
+	f.trash["id-h-padded"] = "cache-v-01790048184-0123456789abcdef01234567"
 	f.parents["billet-cache/child"] = "billet-cache/billet-parent@g1"
 
 	n, err := c.PurgeTrash(t.Context())
@@ -2295,6 +2296,7 @@ func TestPurgeTrashDeletesDiscardedRootDisksAndCacheVolumesUnderItsOwnBound(t *t
 		"id-e-other":      "an image that is not billet's",
 		"id-f-generation": "a cache generation, which the purge never deletes",
 		"id-g-lookalike":  "a name shaped like a cache volume that billet did not give",
+		"id-h-padded":     "a zero-padded second, which billet never prints",
 		"id-0refused":     "the first refused image",
 		"id-1refused":     "the second refused image",
 	} {
@@ -2395,6 +2397,7 @@ func TestTheTrashTakesOnlyAWritableVolumeBilletNamed(t *testing.T) {
 	for _, handle := range []string{
 		"billet-cache/cache-g-1790048184-0123456789abcdef01234567",
 		"billet-cache/cache-v-1790048184-by-hand",
+		"billet-cache/cache-v-01790048184-0123456789abcdef01234567",
 		"billet-cache/cache-v-ns/cache-g-1790048184-0123456789abcdef01234567",
 		"billet-cache/cache-v-1790048184-0123456789abcdef01234567@g1",
 		"other-pool/cache-v-1790048184-0123456789abcdef01234567",
@@ -2791,7 +2794,23 @@ func TestAHalfRemovedCheckThatCannotTellKeepsTheImage(t *testing.T) {
 	}
 }
 
-// THE MINUTE IS BETWEEN SIGHTINGS, NOT BETWEEN PASSES. A pass can spend half an
+// THE RECHECK OUTLASTS EVERY COMMAND THAT CREATES A CACHE IMAGE. An image is
+// listed before its header exists for as long as the command creating it runs,
+// and the slowest, a lineage copy, may run for cacheCompactionLimit.
+func TestTheHalfRemovedRecheckOutlastsEveryCreation(t *testing.T) {
+	t.Parallel()
+
+	for name, bound := range map[string]time.Duration{
+		"a lineage copy": cacheCompactionLimit,
+		"an rbd command": DefaultTimeout,
+	} {
+		if halfRemovedRecheck <= bound {
+			t.Errorf("the recheck, %s, does not outlast %s, bounded at %s", halfRemovedRecheck, name, bound)
+		}
+	}
+}
+
+// THE RECHECK IS BETWEEN SIGHTINGS, NOT BETWEEN PASSES. A pass can spend half an
 // hour on the removals before it reaches an image; timed from the pass's start,
 // that image's first sighting would be backdated and a sweep seconds later would
 // take it for confirmed.

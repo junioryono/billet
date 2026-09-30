@@ -1160,8 +1160,10 @@ func cacheImageName(name string) (kind string, named time.Time, ok bool) {
 		return "", time.Time{}, false
 	}
 
+	// cacheName prints the second with %d, so a spelling it cannot produce, such
+	// as a leading zero, is somebody else's.
 	seconds, err := strconv.ParseInt(match[2], 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatInt(seconds, 10) != match[2] {
 		return "", time.Time{}, false
 	}
 
@@ -1175,11 +1177,12 @@ const PurgeTimeout = 30 * time.Minute
 
 // halfRemovedAfter is how long ago an image must have been named, and
 // halfRemovedRecheck how long it must have stayed unopenable, before it is taken
-// for a removal cut short. Creating an image lists its name a moment before it
-// writes its header.
+// for a removal cut short. Creating an image lists its name before it writes its
+// header, and the longest command that creates one is a lineage copy under
+// cacheCompactionLimit, so the recheck outlasts that with a margin.
 const (
 	halfRemovedAfter   = time.Hour
-	halfRemovedRecheck = time.Minute
+	halfRemovedRecheck = cacheCompactionLimit + 5*time.Minute
 )
 
 // PurgeTrash deletes the per-job root disks and writable cache volumes discards
