@@ -1130,7 +1130,19 @@ func (r *Runner) Holding() bool {
 	// the moment it was superseded, exited, and left a container whose completion
 	// is now routed to a replacement that cannot see it. That Destroy finds
 	// nothing, reports success, and the lease is released under a running job.
-	return len(r.custody) > 0 || len(r.launching) > 0 || len(r.running) > 0
+	if len(r.custody) > 0 || len(r.launching) > 0 {
+		return true
+	}
+
+	// EXCEPT A GUEST TWO SWEEPS HAVE SEEN STOPPED: its compute is gone, and the
+	// Destroy that would remove the entry may never come (see noteStopped).
+	for _, inst := range r.running {
+		if inst == nil || !r.stoppedProved[inst.Name] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // renewSnapshot is everything whose lease this node must keep alive.

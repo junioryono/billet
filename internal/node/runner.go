@@ -185,6 +185,11 @@ type Runner struct {
 	// running maps a request to what was started for it, which is the only way
 	// Destroy knows what to remove.
 	running map[int64]*provider.Instance
+	// stoppedSince dates the first sweep that listed a running entry's instance as
+	// not running, and stoppedProved marks one a later sweep still saw stopped
+	// strayGrace on. Both guarded by mu; see noteStopped.
+	stoppedSince  map[string]time.Time
+	stoppedProved map[string]bool
 	// sets caches tier to scale-set id. Looked up once per tier rather than per
 	// launch, because it does not change while the process runs and a lookup on
 	// the launch path is a round trip in front of every job.
@@ -1437,6 +1442,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	r.purgeDiscarded(ctx)
+
+	r.noteStopped(instances)
 
 	if len(instances) == 0 {
 		return nil
