@@ -175,10 +175,16 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	// routed to the runner afterwards and nothing was running on it. A refusal,
 	// an absent runner or any error leaves the member idle and unjournaled, so a
 	// JobStarted for it still binds.
+	//
+	// A DELETE GITHUB CARRIED OUT WHOSE ANSWER WAS LOST is kept the same way, and
+	// stays kept: later inspections find the runner absent, and absence is not the
+	// acknowledgement this path requires. That member is left for an operator, the
+	// safe direction, as it was before this path existed.
 	if err := inspector.WithdrawRunner(ctx, candidate.RunnerID); err != nil {
 		delete(w.offlineSince, candidate.LeaseID)
-		l.log.Warn("GitHub reported an idle pool member's runner offline but did not delete it; "+
-			"keeping it", "tier", l.tier, "runner", candidate.RunnerName, "error", err)
+		l.log.Warn("GitHub reported an idle pool member's runner offline but its deletion was "+
+			"refused or not confirmed; keeping it", "tier", l.tier, "runner", candidate.RunnerName,
+			"runner_id", candidate.RunnerID, "error", err)
 
 		return
 	}

@@ -23,6 +23,8 @@ type inspectingRegistry struct {
 	askedFor []string
 	// during runs inside an inspection, as a slow lookup would.
 	during func()
+	// byName, when set, answers each runner from its own queue instead of answers.
+	byName map[string][]RunnerState
 
 	withdrawn   []int64
 	withdrawErr error
@@ -35,6 +37,17 @@ func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int
 
 	if r.during != nil {
 		r.during()
+	}
+
+	if r.byName != nil {
+		queue := r.byName[name]
+		if len(queue) == 0 {
+			return RunnerState{}, errors.New("unscripted inspection")
+		}
+
+		r.byName[name] = queue[1:]
+
+		return queue[0], nil
 	}
 
 	if i < len(r.errs) && r.errs[i] != nil {
@@ -66,6 +79,8 @@ type offlineFixture struct {
 	desired   int
 	now       time.Time
 	destroyed int
+	// requests is every launch request the runner was told to destroy.
+	requests []int64
 }
 
 // newOfflineFixture registers one idle pool member with a GitHub id, the shape
@@ -108,7 +123,12 @@ func newOfflineFixtureOf(t *testing.T, reg *inspectingRegistry, n int) *offlineF
 	}
 
 	f.l = NewListener(f.a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
-		onDestroy: func(int64) error { f.destroyed++; return nil },
+		onDestroy: func(request int64) error {
+			f.destroyed++
+			f.requests = append(f.requests, request)
+
+			return nil
+		},
 	}), WithRunnerRegistry(reg))
 	f.l.now = func() time.Time { return f.now }
 
@@ -142,20 +162,31 @@ func (f *offlineFixture) status(t *testing.T) string {
 
 func TestAMemberGitHubReportsOfflineTwiceIsWithdrawnThenRetired(t *testing.T) {
 	offline := RunnerState{Present: true}
-	f := newOfflineFixture(t, &inspectingRegistry{answers: []RunnerState{offline, offline}})
+	online := RunnerState{Present: true, Online: true}
+	// Two members; the second is online throughout and must be untouched.
+	reg := &inspectingRegistry{}
+	f := newOfflineFixtureOf(t, reg, 2)
+	reg.byName = map[string][]RunnerState{
+		f.names[0]: {offline, offline},
+		f.names[1]: {online, online},
+	}
 
+	// The members take turns, whichever goes first, so each has two answers by
+	// +22m and the offline one's are at least offlineGrace apart.
 	f.reconcileAt(t, 0)
 	f.reconcileAt(t, offlineIdleAfter)
-	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery)
+	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery+offlineGrace)
+	f.reconcileAt(t, offlineIdleAfter+2*offlineInspectEvery+offlineGrace)
 
-	if f.reg.asked != 2 {
-		t.Fatalf("GitHub was asked %d times, want 2", f.reg.asked)
+	if f.reg.asked != 4 {
+		t.Fatalf("GitHub was asked %d times, want 4", f.reg.asked)
 	}
 	if !slices.Equal(f.reg.withdrawn, []int64{10899}) {
 		t.Fatalf("withdrawn ids = %v, want exactly the inspected 10899", f.reg.withdrawn)
 	}
-	if f.destroyed != 1 {
-		t.Fatalf("compute destroyed %d times, want 1", f.destroyed)
+	if !slices.Equal(f.requests, []int64{-53128}) {
+		t.Fatalf("destroyed launch requests = %v, want only the withdrawn member's -53128", f.requests)
 	}
 	if got := f.status(t); got == alloc.PoolRunnerIdle {
 		t.Fatalf("member still idle after GitHub deleted its runner")
