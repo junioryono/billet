@@ -11,6 +11,7 @@ import (
 	gh "github.com/actions/scaleset"
 
 	billetgithub "github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/server"
 )
 
 // DefaultRunnerGroup is where a scale set lands when a tier names no group.
@@ -106,6 +107,29 @@ func (c *Client) RecoverRunner(
 			runnerName, recovery.RunnerID, runner.ID)
 	}
 	return recovery, nil
+}
+
+// The listener reaches InspectRunner by asserting its registry, which is this
+// client; without the method the offline retirement is silently off.
+var _ server.RunnerInspector = (*Client)(nil)
+
+// InspectRunner answers the listener's question about one pool registration.
+// Anything RecoverRunner cannot establish is an error, never an absent runner:
+// the listener retires only on a positive answer.
+func (c *Client) InspectRunner(ctx context.Context, runnerName string, runnerID int64) (server.RunnerState, error) {
+	recovery, err := c.RecoverRunner(ctx, runnerName)
+	if err != nil {
+		return server.RunnerState{}, err
+	}
+	if !recovery.Present {
+		return server.RunnerState{}, nil
+	}
+	if runnerID > 0 && recovery.RunnerID != runnerID {
+		return server.RunnerState{}, fmt.Errorf("scaleset: runner %q now has id %d, not the pool's %d",
+			runnerName, recovery.RunnerID, runnerID)
+	}
+
+	return server.RunnerState{Present: true, Online: recovery.Online, Busy: recovery.Busy}, nil
 }
 
 // ScaleSet is billet's view of one provisioned scale set.
