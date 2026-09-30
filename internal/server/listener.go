@@ -421,6 +421,9 @@ type Listener struct {
 	// and now its clock; nil is the wall clock. See retireOfflineMembers.
 	offline offlineWatch
 	now     func() time.Time
+	// claimRetirement stands in for alloc.RetirePoolRunner on the offline path,
+	// so a test can fail the ledger write after GitHub accepted the withdrawal.
+	claimRetirement func(context.Context, string) error
 	// cacheSpec and runEvidence decide what a completed job's caches may
 	// publish. See WithCachePublication.
 	cacheSpec   config.CacheSpec

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -11,7 +12,8 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 )
 
-// inspectingRegistry is a registry that also answers InspectRunner from a script.
+// inspectingRegistry is a registry that also answers InspectRunner from a script
+// and records every id WithdrawRunner is asked to delete.
 type inspectingRegistry struct {
 	fakeRunnerRegistry
 
@@ -21,6 +23,9 @@ type inspectingRegistry struct {
 	askedFor []string
 	// during runs inside an inspection, as a slow lookup would.
 	during func()
+
+	withdrawn   []int64
+	withdrawErr error
 }
 
 func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int64) (RunnerState, error) {
@@ -43,12 +48,22 @@ func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int
 	return RunnerState{}, errors.New("unscripted inspection")
 }
 
+func (r *inspectingRegistry) WithdrawRunner(_ context.Context, id int64) error {
+	r.withdrawn = append(r.withdrawn, id)
+
+	return r.withdrawErr
+}
+
+var offlineEpoch = time.Date(2026, 9, 30, 8, 52, 0, 0, time.UTC)
+
 type offlineFixture struct {
 	a         *alloc.Allocator
 	l         *Listener
 	reg       *inspectingRegistry
 	lease     *alloc.Lease
 	name      string
+	names     []string
+	desired   int
 	now       time.Time
 	destroyed int
 }
@@ -58,19 +73,38 @@ type offlineFixture struct {
 func newOfflineFixture(t *testing.T, reg *inspectingRegistry) *offlineFixture {
 	t.Helper()
 
+	return newOfflineFixtureOf(t, reg, 1)
+}
+
+// newOfflineFixtureOf registers n such members, and sets the frozen assigned
+// count to n so none of them is surplus.
+func newOfflineFixtureOf(t *testing.T, reg *inspectingRegistry, n int) *offlineFixture {
+	t.Helper()
+
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	f := &offlineFixture{reg: reg, now: time.Date(2026, 9, 30, 8, 52, 0, 0, time.UTC)}
-	f.a = newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
-	f.lease = poolLeaseForTier(t, f.a, tiers[0].Label)
+	f := &offlineFixture{reg: reg, now: offlineEpoch, desired: n}
+	f.a = newAllocator(t, alloc.Limits{MaxVCPU: 64, MaxMemory: 512 * config.GiB}, tiers)
 
-	if err := f.a.Assign(t.Context(), f.lease.ID, f.lease.Epoch, 0, -53128); err != nil {
-		t.Fatalf("Assign: %v", err)
-	}
+	for i := range n {
+		lease := poolLeaseForTier(t, f.a, tiers[0].Label)
+		request := int64(-53128 - i)
 
-	f.name = provider.InstanceName(f.lease.ID)
-	if err := f.a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: f.lease.ID,
-		Tier: tiers[0].Label, LaunchRequestID: -53128, RunnerID: 10899, RunnerName: f.name}); err != nil {
-		t.Fatalf("RegisterPoolRunner: %v", err)
+		if err := f.a.Assign(t.Context(), lease.ID, lease.Epoch, 0, request); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+
+		name := provider.InstanceName(lease.ID)
+		if err := f.a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID,
+			Tier: tiers[0].Label, LaunchRequestID: request, RunnerID: int64(10899 + i),
+			RunnerName: name}); err != nil {
+			t.Fatalf("RegisterPoolRunner: %v", err)
+		}
+
+		if i == 0 {
+			f.lease, f.name = lease, name
+		}
+
+		f.names = append(f.names, name)
 	}
 
 	f.l = NewListener(f.a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
@@ -81,13 +115,13 @@ func newOfflineFixture(t *testing.T, reg *inspectingRegistry) *offlineFixture {
 	return f
 }
 
-// reconcileAt runs the pool reconciliation GitHub's last statistics would ask
-// for (one assigned job, the frozen count) at the given offset.
+// reconcileAt runs the pool reconciliation GitHub's frozen statistics would ask
+// for at the given offset.
 func (f *offlineFixture) reconcileAt(t *testing.T, after time.Duration) {
 	t.Helper()
 
-	f.now = time.Date(2026, 9, 30, 8, 52, 0, 0, time.UTC).Add(after)
-	if err := f.l.reconcilePool(t.Context(), 1); err != nil {
+	f.now = offlineEpoch.Add(after)
+	if err := f.l.reconcilePool(t.Context(), f.desired); err != nil {
 		t.Fatalf("reconcilePool at +%s: %v", after, err)
 	}
 }
@@ -106,7 +140,7 @@ func (f *offlineFixture) status(t *testing.T) string {
 	return member.Status
 }
 
-func TestAMemberGitHubReportsOfflineTwiceIsRetired(t *testing.T) {
+func TestAMemberGitHubReportsOfflineTwiceIsWithdrawnThenRetired(t *testing.T) {
 	offline := RunnerState{Present: true}
 	f := newOfflineFixture(t, &inspectingRegistry{answers: []RunnerState{offline, offline}})
 
@@ -117,14 +151,14 @@ func TestAMemberGitHubReportsOfflineTwiceIsRetired(t *testing.T) {
 	if f.reg.asked != 2 {
 		t.Fatalf("GitHub was asked %d times, want 2", f.reg.asked)
 	}
-	if !removedOnly(f.reg.names, f.name) {
-		t.Fatalf("registration removed = %v, want %q", f.reg.names, f.name)
+	if !slices.Equal(f.reg.withdrawn, []int64{10899}) {
+		t.Fatalf("withdrawn ids = %v, want exactly the inspected 10899", f.reg.withdrawn)
 	}
 	if f.destroyed != 1 {
 		t.Fatalf("compute destroyed %d times, want 1", f.destroyed)
 	}
 	if got := f.status(t); got == alloc.PoolRunnerIdle {
-		t.Fatalf("member still idle after two offline answers %s apart", offlineGrace)
+		t.Fatalf("member still idle after GitHub deleted its runner")
 	}
 }
 
@@ -151,8 +185,9 @@ func TestAMemberIsKeptUnlessEveryAnswerSaysOfflineAndIdle(t *testing.T) {
 			if reg.asked != 2 {
 				t.Fatalf("GitHub was asked %d times, want 2", reg.asked)
 			}
-			if len(reg.names) != 0 || f.destroyed != 0 {
-				t.Fatalf("retired on %s: removed %v, destroyed %d", tc.name, reg.names, f.destroyed)
+			if len(reg.withdrawn) != 0 || len(reg.names) != 0 || f.destroyed != 0 {
+				t.Fatalf("acted on %s: withdrawn %v, removed %v, destroyed %d",
+					tc.name, reg.withdrawn, reg.names, f.destroyed)
 			}
 			if got := f.status(t); got != alloc.PoolRunnerIdle {
 				t.Fatalf("member status = %q, want idle", got)
@@ -162,47 +197,31 @@ func TestAMemberIsKeptUnlessEveryAnswerSaysOfflineAndIdle(t *testing.T) {
 }
 
 // An answer that is not "offline" between two that are restarts the grace: the
-// retirement needs two consecutive offline observations, not any two.
+// withdrawal needs two consecutive offline observations, not any two.
 func TestAnInterruptedOfflineRunStartsTheGraceAgain(t *testing.T) {
 	offline := RunnerState{Present: true}
 	online := RunnerState{Present: true, Online: true}
-	reg := &inspectingRegistry{answers: []RunnerState{offline, online, offline, offline}}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, online, offline, offline, offline}}
 	f := newOfflineFixture(t, reg)
 
 	f.reconcileAt(t, 0)
 	f.reconcileAt(t, offlineIdleAfter)
 	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
 	f.reconcileAt(t, offlineIdleAfter+2*offlineGrace)
+	f.reconcileAt(t, offlineIdleAfter+2*offlineGrace+offlineInspectEvery)
 
-	if len(reg.names) != 0 {
-		t.Fatalf("retired after an online answer interrupted the offline run: %v", reg.names)
+	if len(reg.withdrawn) != 0 {
+		t.Fatalf("withdrawn inside the grace restarted by an online answer: %v", reg.withdrawn)
 	}
 
 	f.reconcileAt(t, offlineIdleAfter+3*offlineGrace)
 
-	if !removedOnly(reg.names, f.name) {
-		t.Fatalf("not retired after two fresh offline answers %s apart: %v", offlineGrace, reg.names)
+	if !slices.Equal(reg.withdrawn, []int64{10899}) {
+		t.Fatalf("not withdrawn after two fresh offline answers %s apart: %v", offlineGrace, reg.withdrawn)
 	}
 }
 
-// removedOnly reports whether the registration was removed, and nothing else was.
-// The retirement removes it once as its proof and destroyCompleted asks again by
-// name, which GitHub answers as already gone.
-func removedOnly(names []string, want string) bool {
-	if len(names) == 0 {
-		return false
-	}
-
-	for _, name := range names {
-		if name != want {
-			return false
-		}
-	}
-
-	return true
-}
-
-func TestTwoOfflineAnswersInsideTheGraceDoNotRetire(t *testing.T) {
+func TestTwoOfflineAnswersInsideTheGraceDoNotWithdraw(t *testing.T) {
 	offline := RunnerState{Present: true}
 	reg := &inspectingRegistry{answers: []RunnerState{offline, offline, offline}}
 	f := newOfflineFixture(t, reg)
@@ -211,15 +230,15 @@ func TestTwoOfflineAnswersInsideTheGraceDoNotRetire(t *testing.T) {
 	f.reconcileAt(t, offlineIdleAfter)
 	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery)
 
-	if reg.asked != 2 || len(reg.names) != 0 || f.destroyed != 0 {
-		t.Fatalf("after two offline answers %s apart: asked %d, removed %v, destroyed %d",
-			offlineInspectEvery, reg.asked, reg.names, f.destroyed)
+	if reg.asked != 2 || len(reg.withdrawn) != 0 || f.destroyed != 0 {
+		t.Fatalf("after two offline answers %s apart: asked %d, withdrawn %v, destroyed %d",
+			offlineInspectEvery, reg.asked, reg.withdrawn, f.destroyed)
 	}
 
 	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
 
-	if !removedOnly(reg.names, f.name) || f.destroyed != 1 {
-		t.Fatalf("not retired once the grace had passed: removed %v, destroyed %d", reg.names, f.destroyed)
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || f.destroyed != 1 {
+		t.Fatalf("not retired once the grace had passed: withdrawn %v, destroyed %d", reg.withdrawn, f.destroyed)
 	}
 }
 
@@ -241,37 +260,76 @@ func TestTheGraceRunsFromWhenTheFirstAnswerArrived(t *testing.T) {
 	if reg.asked != 2 {
 		t.Fatalf("GitHub was asked %d times, want 2", reg.asked)
 	}
-	if len(reg.names) != 0 || f.destroyed != 0 {
-		t.Fatalf("retired one second after the first answer arrived: removed %v, destroyed %d",
-			reg.names, f.destroyed)
+	if len(reg.withdrawn) != 0 || f.destroyed != 0 {
+		t.Fatalf("withdrawn one second after the first answer arrived: %v, destroyed %d",
+			reg.withdrawn, f.destroyed)
 	}
 }
 
-// GitHub refusing the removal (a job still running on it) keeps the member idle
-// and unjournaled, so the JobStarted that explains the refusal still binds.
-func TestARefusedRemovalKeepsTheMemberForItsJob(t *testing.T) {
+// GitHub refusing the delete (a job still running on it, or no such runner)
+// keeps the member idle and unjournaled, so the JobStarted that explains the
+// refusal still binds.
+func TestARefusedWithdrawalKeepsTheMemberForItsJob(t *testing.T) {
 	offline := RunnerState{Present: true}
 	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
-	reg.err = errors.New("job still running")
+	reg.withdrawErr = errors.New("job still running")
 	f := newOfflineFixture(t, reg)
 
 	f.reconcileAt(t, 0)
 	f.reconcileAt(t, offlineIdleAfter)
 	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
 
-	if len(reg.names) != 1 {
-		t.Fatalf("removal attempted %d times, want 1", len(reg.names))
+	if len(reg.withdrawn) != 1 {
+		t.Fatalf("withdrawal attempted %d times, want 1", len(reg.withdrawn))
 	}
-	if f.destroyed != 0 {
-		t.Fatalf("compute destroyed after GitHub refused the removal")
+	if len(reg.names) != 0 || f.destroyed != 0 {
+		t.Fatalf("acted after GitHub refused the delete: removed %v, destroyed %d", reg.names, f.destroyed)
 	}
 	if got := f.status(t); got != alloc.PoolRunnerIdle {
-		t.Fatalf("member status = %q after a refused removal, want idle", got)
+		t.Fatalf("member status = %q after a refused delete, want idle", got)
 	}
 
 	if _, err := f.a.StartPoolRunner(t.Context(), f.lease.ID, "billet-4vcpu-a", 10899, f.name,
 		-53200, 777, "job-777", alloc.JobIdentity{}); err != nil {
 		t.Fatalf("the job GitHub said was running could not bind: %v", err)
+	}
+}
+
+// A ledger that fails after GitHub accepted the delete is retried on the next
+// reconcile without asking GitHub again, whose answer now could only be absent.
+func TestALedgerFailureAfterTheWithdrawalIsRetriedWithoutAskingAgain(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	failures := 1
+	f.l.claimRetirement = func(ctx context.Context, leaseID string) error {
+		if failures > 0 {
+			failures--
+			return errors.New("database is locked")
+		}
+
+		return f.a.RetirePoolRunner(ctx, leaseID)
+	}
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if f.destroyed != 0 || f.status(t) != alloc.PoolRunnerIdle {
+		t.Fatalf("destroyed %d with the claim failed; status %q", f.destroyed, f.status(t))
+	}
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace+time.Second)
+
+	if reg.asked != 2 {
+		t.Fatalf("GitHub was asked %d times, want no inspection after the withdrawal", reg.asked)
+	}
+	if len(reg.withdrawn) != 1 {
+		t.Fatalf("withdrawn %d times, want 1", len(reg.withdrawn))
+	}
+	if f.destroyed != 1 {
+		t.Fatalf("compute destroyed %d times after the ledger recovered, want 1", f.destroyed)
 	}
 }
 
@@ -287,16 +345,33 @@ func TestAMemberIdleForLessThanTheBoundIsNotAskedAbout(t *testing.T) {
 	}
 }
 
-func TestAListenerAsksAboutAtMostOneMemberPerInterval(t *testing.T) {
-	offline := RunnerState{Present: true}
-	reg := &inspectingRegistry{answers: []RunnerState{offline, offline, offline}}
-	f := newOfflineFixture(t, reg)
+// One lookup per interval for the whole tier, not per member, and the members
+// take turns.
+func TestAListenerAsksAboutOneMemberPerIntervalInTurn(t *testing.T) {
+	online := RunnerState{Present: true, Online: true}
+	reg := &inspectingRegistry{answers: []RunnerState{online, online, online, online}}
+	f := newOfflineFixtureOf(t, reg, 3)
 
 	f.reconcileAt(t, 0)
 	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+time.Second)
 	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery-time.Second)
 
 	if reg.asked != 1 {
-		t.Fatalf("GitHub was asked %d times inside one %s interval, want 1", reg.asked, offlineInspectEvery)
+		t.Fatalf("GitHub was asked %d times inside one %s interval across 3 members, want 1",
+			reg.asked, offlineInspectEvery)
+	}
+
+	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery)
+	f.reconcileAt(t, offlineIdleAfter+2*offlineInspectEvery)
+
+	asked := slices.Clone(reg.askedFor)
+	slices.Sort(asked)
+
+	want := slices.Clone(f.names)
+	slices.Sort(want)
+
+	if !slices.Equal(asked, want) {
+		t.Fatalf("three intervals asked about %v, want each of %v once", reg.askedFor, f.names)
 	}
 }

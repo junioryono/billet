@@ -132,6 +132,24 @@ func (c *Client) InspectRunner(ctx context.Context, runnerName string, runnerID 
 	return server.RunnerState{Present: true, Online: recovery.Online, Busy: recovery.Busy}, nil
 }
 
+// WithdrawRunner deletes exactly this runner id and nothing else.
+//
+// NO NAME LOOKUP, unlike RemoveRunner, whose lookup answering "absent" returns
+// success without a DELETE ever being sent. The listener treats a nil here as
+// GitHub's own refusal having been consulted, so only an acknowledged DELETE of
+// the inspected id may produce it.
+func (c *Client) WithdrawRunner(ctx context.Context, runnerID int64) error {
+	if runnerID <= 0 {
+		return errors.New("scaleset: withdrawing a runner needs its id")
+	}
+
+	if err := c.gh.RemoveRunner(ctx, runnerID); err != nil {
+		return fmt.Errorf("scaleset: withdraw runner %d: %w", runnerID, err)
+	}
+
+	return nil
+}
+
 // ScaleSet is billet's view of one provisioned scale set.
 type ScaleSet struct {
 	ID    int
