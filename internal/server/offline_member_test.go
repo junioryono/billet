@@ -19,12 +19,18 @@ type inspectingRegistry struct {
 	errs     []error
 	asked    int
 	askedFor []string
+	// during runs inside an inspection, as a slow lookup would.
+	during func()
 }
 
 func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int64) (RunnerState, error) {
 	i := r.asked
 	r.asked++
 	r.askedFor = append(r.askedFor, name)
+
+	if r.during != nil {
+		r.during()
+	}
 
 	if i < len(r.errs) && r.errs[i] != nil {
 		return RunnerState{}, r.errs[i]
@@ -111,8 +117,8 @@ func TestAMemberGitHubReportsOfflineTwiceIsRetired(t *testing.T) {
 	if f.reg.asked != 2 {
 		t.Fatalf("GitHub was asked %d times, want 2", f.reg.asked)
 	}
-	if len(f.reg.names) != 1 || f.reg.names[0] != f.name {
-		t.Fatalf("registration removed = %v, want exactly %q", f.reg.names, f.name)
+	if !removedOnly(f.reg.names, f.name) {
+		t.Fatalf("registration removed = %v, want %q", f.reg.names, f.name)
 	}
 	if f.destroyed != 1 {
 		t.Fatalf("compute destroyed %d times, want 1", f.destroyed)
@@ -174,8 +180,98 @@ func TestAnInterruptedOfflineRunStartsTheGraceAgain(t *testing.T) {
 
 	f.reconcileAt(t, offlineIdleAfter+3*offlineGrace)
 
+	if !removedOnly(reg.names, f.name) {
+		t.Fatalf("not retired after two fresh offline answers %s apart: %v", offlineGrace, reg.names)
+	}
+}
+
+// removedOnly reports whether the registration was removed, and nothing else was.
+// The retirement removes it once as its proof and destroyCompleted asks again by
+// name, which GitHub answers as already gone.
+func removedOnly(names []string, want string) bool {
+	if len(names) == 0 {
+		return false
+	}
+
+	for _, name := range names {
+		if name != want {
+			return false
+		}
+	}
+
+	return true
+}
+
+func TestTwoOfflineAnswersInsideTheGraceDoNotRetire(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineInspectEvery)
+
+	if reg.asked != 2 || len(reg.names) != 0 || f.destroyed != 0 {
+		t.Fatalf("after two offline answers %s apart: asked %d, removed %v, destroyed %d",
+			offlineInspectEvery, reg.asked, reg.names, f.destroyed)
+	}
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !removedOnly(reg.names, f.name) || f.destroyed != 1 {
+		t.Fatalf("not retired once the grace had passed: removed %v, destroyed %d", reg.names, f.destroyed)
+	}
+}
+
+// The grace runs from when GitHub's first answer ARRIVED: a lookup that took
+// most of the grace to return leaves the next one well inside it.
+func TestTheGraceRunsFromWhenTheFirstAnswerArrived(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+
+	reg.during = func() { f.now = f.now.Add(offlineGrace - time.Second) }
+	f.reconcileAt(t, offlineIdleAfter)
+	reg.during = nil
+
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if reg.asked != 2 {
+		t.Fatalf("GitHub was asked %d times, want 2", reg.asked)
+	}
+	if len(reg.names) != 0 || f.destroyed != 0 {
+		t.Fatalf("retired one second after the first answer arrived: removed %v, destroyed %d",
+			reg.names, f.destroyed)
+	}
+}
+
+// GitHub refusing the removal (a job still running on it) keeps the member idle
+// and unjournaled, so the JobStarted that explains the refusal still binds.
+func TestARefusedRemovalKeepsTheMemberForItsJob(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	reg.err = errors.New("job still running")
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
 	if len(reg.names) != 1 {
-		t.Fatalf("not retired after two fresh offline answers %s apart", offlineGrace)
+		t.Fatalf("removal attempted %d times, want 1", len(reg.names))
+	}
+	if f.destroyed != 0 {
+		t.Fatalf("compute destroyed after GitHub refused the removal")
+	}
+	if got := f.status(t); got != alloc.PoolRunnerIdle {
+		t.Fatalf("member status = %q after a refused removal, want idle", got)
+	}
+
+	if _, err := f.a.StartPoolRunner(t.Context(), f.lease.ID, "billet-4vcpu-a", 10899, f.name,
+		-53200, 777, "job-777", alloc.JobIdentity{}); err != nil {
+		t.Fatalf("the job GitHub said was running could not bind: %v", err)
 	}
 }
 

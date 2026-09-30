@@ -56,9 +56,9 @@ type offlineWatch struct {
 // message carrying statistics refreshes, so a tier that goes quiet freezes it
 // and a member whose runner never takes a job is never surplus. On 2026-09-30
 // such a member held its lease, and a draining node's restart, for ten hours
-// (#288). An offline runner cannot be given a job, and retirement removes the
-// registration before the compute, so a runner that reconnects in between is
-// removed from GitHub before its guest is destroyed.
+// (#288). The offline answers only choose the candidate; what licenses the
+// teardown is GitHub accepting the registration's removal, which it refuses
+// while a job runs.
 //
 // An online idle member is left alone even here: GitHub may hand it a job at any
 // moment, and its only cost is capacity the aggregate will reclaim once it moves.
@@ -133,13 +133,33 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 		return
 	}
 
+	// DATED WHEN THE ANSWER ARRIVED, not when the question was asked: the lookup
+	// can wait on the client's mutex and two network calls, and a first answer
+	// dated at its start would let the second follow it by seconds.
+	answered := l.clock()
+
 	first, seen := w.offlineSince[candidate.LeaseID]
 	if !seen {
-		w.offlineSince[candidate.LeaseID] = now
+		w.offlineSince[candidate.LeaseID] = answered
 		return
 	}
 
 	if now.Sub(first) < offlineGrace {
+		return
+	}
+
+	// THE REMOVAL IS THE PROOF, AND IT COMES FIRST. No REST answer, however many,
+	// stops GitHub delivering a job the instant after it was read. The Actions
+	// service refuses to delete a runner with a job still running
+	// (JobStillRunningException, the refusal ARC's runner controller relies on),
+	// so a removal that succeeds is the fence: nothing can be routed to this
+	// runner afterwards and nothing was running on it. A refusal or any error
+	// leaves the member idle and unjournaled, so a JobStarted for it still binds.
+	if err := l.registry.RemoveRunner(ctx, candidate.RunnerID, candidate.RunnerName); err != nil {
+		delete(w.offlineSince, candidate.LeaseID)
+		l.log.Warn("GitHub reported an idle pool member's runner offline but would not remove it; "+
+			"keeping it", "tier", l.tier, "runner", candidate.RunnerName, "error", err)
+
 		return
 	}
 
@@ -150,8 +170,8 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 		return
 	}
 
-	l.log.Warn("retiring a pool member whose runner GitHub reports offline and not busy; "+
-		"it was never given a job", "tier", l.tier, "runner", candidate.RunnerName,
+	l.log.Warn("retiring a pool member whose runner GitHub reported offline and not busy and "+
+		"then removed; it was never given a job", "tier", l.tier, "runner", candidate.RunnerName,
 		"idle_since", w.idleSince[candidate.LeaseID], "offline_since", first)
 
 	delete(w.idleSince, candidate.LeaseID)
