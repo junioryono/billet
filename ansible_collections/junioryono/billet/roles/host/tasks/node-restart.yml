@@ -40,10 +40,12 @@
     billet_node_restart_before.rc != 0 or
     billet_node_restart_before.stdout | trim is not match('^[0-9]+\Z')
 
-# THE CONTROLLER'S CLOCK, which is the one every `until` below is evaluated on.
+# THE CONTROLLER'S CLOCK, which is the one every `until` below is evaluated on,
+# as epoch seconds: `now(utc=true)` is a naive datetime that `.timestamp()`
+# reads as local time, which moves by an hour across a daylight-saving change.
 - name: Set the node restart's deadline
   ansible.builtin.set_fact:
-    billet_node_restart_deadline: "{{ now(utc=true).timestamp() + (billet_node_restart_wait | int) }}"
+    billet_node_restart_deadline: "{{ ('%s' | strftime | int) + (billet_node_restart_wait | int) }}"
 
 - name: Request the billet node's restart without waiting for its drain
   ansible.builtin.command:
@@ -81,7 +83,7 @@
      'Job=' in billet_node_restart_poll.stdout_lines | default([]) and
      billet_node_restart_poll.stdout_lines | default([]) | select('match', '^MainPID=[1-9][0-9]*\Z') | list | length == 1 and
      ('MainPID=' ~ (billet_node_restart_before.stdout | trim)) not in billet_node_restart_poll.stdout_lines | default([]))
-    or now(utc=true).timestamp() >= billet_node_restart_deadline | float
+    or ('%s' | strftime | int) >= billet_node_restart_deadline | int
   retries: "{{ ((billet_node_restart_wait | int) + (billet_node_restart_poll_interval | int) - 1) // (billet_node_restart_poll_interval | int) + 1 }}"
   delay: "{{ billet_node_restart_poll_interval | int }}"
 
@@ -92,9 +94,9 @@
       while this converge polled it, so whether billet-node.service came back
       could not be told. systemd carries the restart on without this converge.
       On the host, `systemctl show billet-node -p ActiveState,SubState,MainPID`
-      answers it: active, running and a MainPID other than
-      {{ billet_node_restart_before.stdout | trim }} means it restarted; then
-      converge again.
+      answers it, with `-p Job` beside it: active, running, a MainPID other than
+      {{ billet_node_restart_before.stdout | trim }} and an empty Job means it
+      restarted; then converge again.
   when: billet_node_restart_poll is unreachable
 
 # THE LAST READ DECIDES WHAT IS REPORTED when the poll ends without the proof:
@@ -112,10 +114,10 @@
       (systemctl show exited {{ billet_node_restart_poll.rc | default('unknown') }}
       and printed {{ billet_node_restart_poll.stdout_lines | default([]) | join(' ') }}),
       so whether billet-node.service came back could not be told. On the host,
-      `systemctl show billet-node -p ActiveState,SubState,MainPID` answers it:
-      active, running and a MainPID other than
-      {{ billet_node_restart_before.stdout | trim }} means it restarted; then
-      converge again.
+      `systemctl show billet-node -p ActiveState,SubState,MainPID` answers it,
+      with `-p Job` beside it: active, running, a MainPID other than
+      {{ billet_node_restart_before.stdout | trim }} and an empty Job means it
+      restarted; then converge again.
   when:
     - billet_node_restart_poll is not unreachable
     - >-
@@ -137,7 +139,8 @@
       systemd holds the restart and finishes it when the drain does; ending this
       converge lost nothing. Follow it on the host with
       `systemctl show billet-node -p ActiveState,SubState,MainPID`, and converge
-      again once it reports active, running and a new MainPID.
+      again once it reports active, running and a new MainPID, and
+      `systemctl show billet-node -p Job` an empty Job.
   when:
     - billet_node_restart_poll is not unreachable
     - >-
