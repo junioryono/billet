@@ -729,22 +729,14 @@ func (c *Client) cleanupSnapshotFailure(
 			failures = append(failures, err)
 		}
 	}
-	stageKept := false
 	if stage != "" {
 		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "rm", stage); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
-			stageKept = true
 		}
 	}
-	// A VOLUME STILL CARRYING ITS STAGING SNAPSHOT STAYS LISTED. In the trash its
-	// snapshot would make every `trash rm` answer ENOTEMPTY, which the purge takes
-	// for a live child and waits on forever; listed, eviction purges the snapshot
-	// and removes it.
-	if !stageKept {
-		if err := c.discardCacheVolume(cleanupCtx, volume.Handle); err != nil {
-			failures = append(failures, err)
-		}
+	if err := c.discardCacheVolume(cleanupCtx, volume.Handle); err != nil {
+		failures = append(failures, err)
 	}
 	if volume.Lease.ID != "" {
 		if err := c.withCacheLock(cleanupCtx, time.Now(), func(time.Time) error {
@@ -1130,6 +1122,15 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 			"billet named goes there", bounded(handle))
 	}
 
+	// SNAPSHOTS FIRST, AND A VOLUME THAT KEEPS ONE STAYS LISTED. A failed Snapshot
+	// can leave its staging snapshot behind, and in the trash that snapshot makes
+	// every `trash rm` answer ENOTEMPTY, which the purge takes for a live child and
+	// waits on forever; listed, the next discard or eviction purges it.
+	if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil && !isNoSuchFile(err) {
+		return fmt.Errorf("ceph: purge the snapshots of cache volume %s before the trash: %w",
+			handle, err)
+	}
+
 	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: move cache volume %s to the trash: %w", handle, err)
 	}
@@ -1196,7 +1197,7 @@ const (
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 	purged, failures := c.purgeTrashEntries(ctx)
 
-	finished, unfinished := c.finishHalfRemoved(ctx, time.Now())
+	finished, unfinished := c.finishHalfRemoved(ctx)
 
 	return purged + finished, errors.Join(append(failures, unfinished...)...)
 }
@@ -1265,11 +1266,11 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 //
 // NOT AN IMAGE BEING CREATED, which is listed a moment before its header exists.
 // Its name must be older than halfRemovedAfter, and it must have been found
-// unopenable by an earlier pass at least halfRemovedRecheck ago on this node's
-// own clock, because the name's time is the creating node's clock. An `rbd info`
+// unopenable by an earlier sighting at least halfRemovedRecheck before this one
+// on this node's own clock, because the name's time is the creating node's clock. An `rbd info`
 // that fails for another reason is could-not-tell: the image is kept, forgotten
 // and reported.
-func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []error) {
+func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 	names, err := c.cacheImages(ctx)
 	if err != nil {
 		return 0, []error{err}
@@ -1287,7 +1288,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []e
 
 	for _, name := range names {
 		_, named, ok := cacheImageName(name)
-		if !ok || now.Sub(named) < halfRemovedAfter {
+		if !ok || c.now().Sub(named) < halfRemovedAfter {
 			continue
 		}
 
@@ -1306,14 +1307,18 @@ func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []e
 			continue
 		}
 
+		// THE SIGHTING'S OWN TIME, taken once rbd has answered, never the pass's:
+		// a pass can spend half an hour on the removals before this one.
+		sighted := c.now()
+
 		first, ok := seen[name]
-		if !ok || now.Before(first) {
-			c.halfRemoved[name] = now
+		if !ok || sighted.Before(first) {
+			c.halfRemoved[name] = sighted
 
 			continue
 		}
 
-		if now.Sub(first) < halfRemovedRecheck {
+		if sighted.Sub(first) < halfRemovedRecheck {
 			c.halfRemoved[name] = first
 
 			continue

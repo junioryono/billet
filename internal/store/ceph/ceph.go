@@ -62,9 +62,19 @@ type Client struct {
 	verify      filesystemVerifier
 
 	// halfRemoved remembers when each cache image finishHalfRemoved found
-	// unopenable was first seen so, which a second pass requires.
+	// unopenable was first seen so, which a second sighting requires.
 	halfRemovedMu sync.Mutex
 	halfRemoved   map[string]time.Time
+	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
+	clock func() time.Time
+}
+
+func (c *Client) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+
+	return time.Now()
 }
 
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS
