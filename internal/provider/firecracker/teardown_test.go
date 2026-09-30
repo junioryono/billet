@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -596,53 +597,60 @@ func TestOnlyOneLaunchCanClaimALease(t *testing.T) {
 	}
 }
 
-// recordingHandle stands in for a pidfd on a jailed VMM: it records every signal and,
-// like a pid-namespace init with no handler, dies only on SIGKILL.
-type recordingHandle struct {
+// recordedVMM stands in for a jailed VMM and the pidfd on it: it logs every ownership
+// check, handle open, signal and close in the order they happened and, like a
+// pid-namespace init with no handler, dies only on SIGKILL.
+type recordedVMM struct {
 	mu     sync.Mutex
-	sent   []syscall.Signal
+	events []string
 	dead   bool
-	closed bool
 }
 
-func (h *recordingHandle) signal(sig syscall.Signal) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (v *recordedVMM) record(event string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
-	h.sent = append(h.sent, sig)
+	v.events = append(v.events, event)
+}
+
+func (v *recordedVMM) signal(sig syscall.Signal) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.events = append(v.events, "signal "+sig.String())
 	if sig == syscall.SIGKILL {
-		h.dead = true
+		v.dead = true
 	}
 
 	return nil
 }
 
-func (h *recordingHandle) close() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (v *recordedVMM) close() { v.record("close") }
 
-	h.closed = true
-}
+func (v *recordedVMM) state() ([]string, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
-func (h *recordingHandle) state() ([]syscall.Signal, bool, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	return append([]syscall.Signal(nil), h.sent...), h.dead, h.closed
+	return append([]string(nil), v.events...), v.dead
 }
 
 // withRecordedVMM replaces the process seams with one VMM that is alive until it is
-// sent SIGKILL.
-func withRecordedVMM(h *harness, owner func(check int, dead bool) (bool, error)) *recordingHandle {
-	vmm := &recordingHandle{}
+// sent SIGKILL; owner answers each ownership check, numbered from one.
+func withRecordedVMM(h *harness, owner func(check int, dead bool) (bool, error)) *recordedVMM {
+	vmm := &recordedVMM{}
 	var checks atomic.Int32
 
-	h.p.openHandle = func(int) (signaller, bool, error) { return vmm, true, nil }
+	h.p.openHandle = func(int) (signaller, bool, error) {
+		vmm.record("open")
+
+		return vmm, true, nil
+	}
 	h.p.pidOwner = func(_ int, jailID string) (bool, error) {
 		if jailID != theInstance {
 			return false, nil
 		}
-		_, dead, _ := vmm.state()
+		vmm.record("owner")
+		_, dead := vmm.state()
 
 		return owner(int(checks.Add(1)), dead)
 	}
@@ -653,35 +661,26 @@ func withRecordedVMM(h *harness, owner func(check int, dead bool) (bool, error))
 // A JAILED VMM IS SENT SIGKILL AND NOTHING ELSE, and Destroy still waits for proof it
 // is gone. The jailer runs every VMM as the init of its own pid namespace, where a
 // SIGTERM from the host is dropped (measured 2026-09-30, Firecracker v1.16.1), so a
-// SIGTERM first only spends the whole exit wait on every destroy.
+// SIGTERM first only spends the whole exit wait on every destroy. The ownership check
+// that gates the kill must come after the handle is open: before it, the VMM could
+// exit and the handle be taken on whatever process inherited its number.
 func TestDestroySendsAJailedVMMSIGKILLAlone(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 	h.launch(t)
 
-	var checksAfterKill int
-	vmm := withRecordedVMM(h, func(_ int, dead bool) (bool, error) {
-		if dead {
-			checksAfterKill++
-		}
-
-		return !dead, nil
-	})
+	vmm := withRecordedVMM(h, func(_ int, dead bool) (bool, error) { return !dead, nil })
 
 	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	sent, _, closed := vmm.state()
-	if len(sent) != 1 || sent[0] != syscall.SIGKILL {
-		t.Errorf("signals sent to the jailed vmm = %v, want exactly [SIGKILL]", sent)
-	}
-	if checksAfterKill == 0 {
-		t.Error("Destroy went on without proving the killed vmm was gone")
-	}
-	if !closed {
-		t.Error("the process handle was never closed")
+	events, _ := vmm.state()
+	want := []string{"owner", "open", "owner", "signal killed", "owner", "close"}
+	if !slices.Equal(events, want) {
+		t.Errorf("stopping the jailed vmm did %q, want %q: one proof, the handle, a proof "+
+			"with it held, SIGKILL alone, and a proof it is gone", events, want)
 	}
 	if _, err := os.Stat(h.p.jailFor(theInstance).dir()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the jail survived the destroy: %v", err)
@@ -708,8 +707,9 @@ func TestAnUnanswerableCheckWithTheHandleHeldKillsNothing(t *testing.T) {
 		t.Fatal("Destroy reported success although it could not verify the vmm's pid")
 	}
 
-	if sent, _, _ := vmm.state(); len(sent) != 0 {
-		t.Errorf("a pid billet could not verify was signalled: %v", sent)
+	events, _ := vmm.state()
+	if want := []string{"owner", "open", "owner", "close"}; !slices.Equal(events, want) {
+		t.Errorf("stopping a vmm billet could not verify did %q, want %q", events, want)
 	}
 	if _, err := os.Stat(h.p.jailFor(theInstance).dir()); err != nil {
 		t.Errorf("the jail was removed although the vmm was not stopped: %v", err)
