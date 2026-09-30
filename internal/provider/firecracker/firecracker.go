@@ -1482,9 +1482,17 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 			// Not reachable on the measured version, which writes the file either
 			// way; reachable if a future one honours its own documentation, where
 			// the file appears only with --new-pid-ns.
-			if _, statErr := os.Stat(j.socket()); statErr == nil {
+			//
+			// Only a socket that is provably absent is absence; a stat that failed
+			// any other way is could-not-tell.
+			_, statErr := os.Stat(j.socket())
+			if statErr == nil {
 				return 0, fmt.Errorf("firecracker: %s has an api socket and no pid file, so "+
 					"billet cannot tell whether its vmm is running", j.dir())
+			}
+			if !errors.Is(statErr, os.ErrNotExist) {
+				return 0, fmt.Errorf("firecracker: %s has no pid file and billet cannot tell "+
+					"whether it has an api socket: %w", j.dir(), statErr)
 			}
 
 			return 0, nil

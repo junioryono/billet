@@ -228,6 +228,45 @@ func TestASocketWithNoPidFileIsNotReadAsStopped(t *testing.T) {
 	}
 }
 
+// AND ONE WHOSE SOCKET CANNOT BE EXAMINED IS INDETERMINATE TOO. A stat that fails
+// for any reason but absence proves nothing about the VMM behind it.
+func TestAnUnexaminableSocketWithNoPidFileIsNotReadAsStopped(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	j := h.p.jailFor(theInstance)
+
+	if err := os.Remove(j.pidFile()); err != nil {
+		t.Fatalf("remove the pid file: %v", err)
+	}
+	if err := os.Remove(j.socket()); err != nil {
+		t.Fatalf("remove the socket: %v", err)
+	}
+	// A link to itself: stat fails with ELOOP, which is not absence.
+	if err := os.Symlink(filepath.Base(j.socket()), j.socket()); err != nil {
+		t.Fatalf("stage an unexaminable socket: %v", err)
+	}
+
+	_, err := h.p.Destroy(t.Context(), theInstance)
+	if err == nil {
+		t.Fatal("Destroy read a socket it could not examine as no socket at all")
+	}
+
+	if !strings.Contains(err.Error(), "cannot tell whether it has an api socket") {
+		t.Errorf("the error does not say that billet could not tell: %v", err)
+	}
+
+	if _, err := os.Stat(j.dir()); err != nil {
+		t.Errorf("the jail was removed although the vmm's state was unknown: %v", err)
+	}
+
+	if got := h.disk.discards(); len(got) != 0 {
+		t.Errorf("the root disk was discarded although the vmm's state was unknown: %v", got)
+	}
+}
+
 // THE PID FILE IS NAMED AFTER THE RESOLVED BINARY, like the chroot directory and
 // for the same measured reason. Looking for `firecracker.pid` beside a jailer that
 // wrote `firecracker-v1.16.1.pid` finds nothing, which reads as "already stopped"
