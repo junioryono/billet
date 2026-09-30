@@ -115,8 +115,11 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 		switch s := stmt.(type) {
 		case *ast.IfStmt:
 			if star, ok := s.Cond.(*ast.StarExpr); ok {
-				if id, ok := star.X.(*ast.Ident); ok && id.Name == "upgradeProbe" {
-					probe = i
+				body := s.Body.List
+				if id, ok := star.X.(*ast.Ident); ok && id.Name == "upgradeProbe" && len(body) > 0 {
+					if _, returns := body[len(body)-1].(*ast.ReturnStmt); returns {
+						probe = i
+					}
 				}
 			}
 
