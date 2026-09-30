@@ -409,9 +409,12 @@ if operation == "show":
         if arg.startswith("--property="):
             properties.extend(arg.split("=", 1)[1].split(","))
     for key in properties or list(unit):
-        if key not in unit:
+        # This fake runs every job to completion before it answers, so a
+        # requested Job is always the empty one systemd shows for no job.
+        value = unit.get(key, "" if key == "Job" and properties else None)
+        if value is None:
             sys.exit("the recovery systemctl fake does not know property " + key)
-        print(unit[key] if "--value" in args else key + "=" + unit[key])
+        print(value if "--value" in args else key + "=" + value)
     sys.exit(0)
 if operation == "is-active":
     print(unit["ActiveState"])

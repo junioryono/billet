@@ -21,10 +21,15 @@ def save():
 
 
 def show(unit):
-    # systemd prints properties in its own order, never the requested one.
+    # systemd prints properties in its own order, never the requested one. A
+    # raw answer stands in for one systemd should not give.
+    if 'raw' in unit:
+        sys.stdout.write(unit['raw'])
+        return
     print('MainPID=' + unit['MainPID'])
     print('ActiveState=' + unit['ActiveState'])
     print('SubState=' + unit['SubState'])
+    print('Job=' + unit.get('Job', ''))
 
 
 if args == ['show', '--property=MainPID', '--value', 'billet-node.service']:
@@ -35,7 +40,8 @@ if args == ['show', '--property=MainPID', '--value', 'billet-node.service']:
 elif args == ['restart', '--no-block', 'billet-node.service']:
     state['restarted'] = True
     save()
-elif args == ['show', '--property=ActiveState', '--property=SubState', '--property=MainPID', 'billet-node.service']:
+elif args == ['show', '--property=ActiveState', '--property=SubState', '--property=MainPID', '--property=Job',
+              'billet-node.service']:
     unit = state['before']
     if state['restarted']:
         after = state['after']

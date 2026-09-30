@@ -47,8 +47,9 @@
         billet_gate_restart_requests ==
         ([['restart', '--no-block', 'billet-node.service']] * (billet_gate_restart_case.restarts | default(1)))
       - billet_gate_restart_case.calls is not defined or billet_gate_restart_state.calls | length == billet_gate_restart_case.calls
-      # THE BOUND IS THE WAIT OVER THE INTERVAL, PLUS THE FIRST LOOK.
-      - billet_gate_restart_case.polls is not defined or billet_gate_restart_state.polls == billet_gate_restart_case.polls
+      - >-
+        billet_gate_restart_case.polls is not defined or
+        (billet_gate_restart_case.polls[0] <= billet_gate_restart_state.polls <= billet_gate_restart_case.polls[1])
       - billet_gate_restart_case.message | default([]) | reject('in', billet_gate_restart_failure) | list | length == 0
       - billet_gate_restart_case.absent | default([]) | select('in', billet_gate_restart_failure) | list | length == 0
       - "'unreachable' not in billet_gate_restart_failure | lower"

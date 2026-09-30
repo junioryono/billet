@@ -353,14 +353,15 @@ billet_migration_controller: ""
 # THE ORDINARY NODE RESTART, after a converge changed the node's configuration,
 # units or Firecracker binary. The restart is handed to systemd without waiting
 # and polled every billet_node_restart_poll_interval seconds, each poll a short
-# command of its own, until the node runs a new main process. The node drains
+# command of its own, until the node runs a new main process with no job queued
+# for it. The node drains
 # before it stops and the drain has no bound, so billet_node_restart_wait bounds
 # only how long this converge watches: past it the converge fails saying the
 # restart is still draining (the process from before still in charge), that the
 # node did not come back, or that its last read was unusable, and systemd
 # carries the restart on regardless. Set it from what the fleet's longest jobs
-# take. Seconds, positive whole numbers; the sleeps between polls never add up
-# to more than the wait.
+# take. Seconds, positive whole numbers; the wait is a deadline on the
+# controller's clock from the request, and the last poll is the first after it.
 billet_node_restart_wait: 3600
 billet_node_restart_poll_interval: 15
 
