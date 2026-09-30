@@ -1473,7 +1473,7 @@ func TestDiscardResolvesTheCurrentMappingInsteadOfTrustingAStoredDevice(t *testi
 	f := newCacheFake()
 	c := cacheClient(t, f)
 	const (
-		handle        = "billet-cache/cache-v-lease-17"
+		handle        = "billet-cache/cache-v-1790048184-0123456789abcdef01234567"
 		currentDevice = "/dev/rbd8"
 		reusedDevice  = "/dev/rbd7"
 	)
@@ -2039,7 +2039,7 @@ func TestCanceledCloneCleanupRemovesThePartialImage(t *testing.T) {
 
 	f := newCacheFake()
 	c := cacheClient(t, f)
-	handle := "billet-cache/cache-v-1-partial"
+	handle := "billet-cache/cache-v-1790048184-0123456789abcdef01234567"
 	leaseID := "cache-a-1-active"
 	f.images[handle] = true
 	f.mappings["/dev/rbd9"] = handle
@@ -2377,30 +2377,139 @@ func TestADiscardedCacheVolumeGoesToTheTrashAndIsNeverRemovedInLine(t *testing.T
 	}
 }
 
-// NOTHING MOVES A GENERATION TO THE TRASH. `rbd rm` refuses a parent a clone still
-// reads before it deletes anything; the trash would take it and nothing would
-// refuse it there.
-func TestTheTrashRefusesAGeneration(t *testing.T) {
+// ONLY A WRITABLE VOLUME BILLET NAMED GOES TO THE TRASH. A generation must go
+// through `rbd rm`, which refuses a parent a clone still reads before it deletes
+// anything; the trash would take it and refuse nothing. A name billet did not
+// give, or a spec that addresses something else behind a volume-shaped prefix,
+// is not billet's to move.
+func TestTheTrashTakesOnlyAWritableVolumeBilletNamed(t *testing.T) {
 	t.Parallel()
 
-	f := newCacheFake()
-	c := cacheClient(t, f)
-	handle := "billet-cache/cache-g-1790048184-0123456789abcdef01234567"
-	f.images[handle] = true
+	for _, handle := range []string{
+		"billet-cache/cache-g-1790048184-0123456789abcdef01234567",
+		"billet-cache/cache-v-1790048184-by-hand",
+		"billet-cache/cache-v-ns/cache-g-1790048184-0123456789abcdef01234567",
+		"billet-cache/cache-v-1790048184-0123456789abcdef01234567@g1",
+		"other-pool/cache-v-1790048184-0123456789abcdef01234567",
+	} {
+		f := newCacheFake()
+		c := cacheClient(t, f)
+		f.images[handle] = true
 
-	if err := c.discardCacheVolume(t.Context(), handle); err == nil {
-		t.Fatal("a generation was accepted for the trash")
-	}
+		if err := c.discardCacheVolume(t.Context(), handle); err == nil {
+			t.Errorf("%s was accepted for the trash", handle)
+		}
 
-	if len(f.calls) != 0 || !f.images[handle] {
-		t.Fatalf("refusing a generation still ran %v", f.calls)
+		if err := c.Discard(t.Context(), storecontract.Volume{Handle: handle}); err == nil {
+			t.Errorf("Discard accepted %s", handle)
+		}
+
+		if len(f.calls) != 0 || !f.images[handle] {
+			t.Errorf("refusing %s still ran %v", handle, f.calls)
+		}
 	}
 }
 
-// EVICTION MOVES AN EXPIRED VOLUME TO THE TRASH, REMOVES AN EXPIRED GENERATION WITH
-// `rbd rm`, AND NEVER DELETES FROM THE TRASH, because it holds the lock every
-// cache writer waits on and a discarded volume takes minutes to delete.
-func TestEvictionTrashesVolumesRemovesGenerationsAndNeverPurges(t *testing.T) {
+// A VOLUME GIVEN UP BY A FAILED CREATE OR SNAPSHOT GOES TO THE TRASH TOO, and the
+// snapshot's unpublished candidate generation still goes through `rbd rm`.
+func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("create", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "device") && slices.Contains(args, "map") {
+				return nil, errors.New("exit status 5: rbd: map failed: (5) Input/output error")
+			}
+
+			return f.run(ctx, bin, args)
+		}
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		if _, err := c.Create(t.Context(), "acme/api/npm", 1<<30); err == nil {
+			t.Fatal("Create succeeded although the map failed")
+		}
+
+		if len(f.trash) != 1 || len(f.images) != 0 {
+			t.Fatalf("the failed volume was not moved to the trash: images %v, trash %v", f.images, f.trash)
+		}
+
+		for _, call := range f.calls {
+			if isRemoval(call) {
+				t.Errorf("a failed create deleted its volume in line: %v", call)
+			}
+		}
+	})
+
+	t.Run("snapshot", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "snap") && slices.Contains(args, "create") &&
+				slices.ContainsFunc(args, func(arg string) bool { return strings.Contains(arg, "/cache-g-") }) {
+				return nil, errors.New("exit status 5: rbd: failed to create snapshot: (5) Input/output error")
+			}
+
+			return f.run(ctx, bin, args)
+		}
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run),
+			withFilesystemVerifier(func(context.Context, string) (storecontract.Filesystem, error) {
+				return storecontract.Filesystem{
+					Type: "ext4", UUID: "dcab7af5-4ae7-4cc1-8ddb-1db18956c389", Clean: true,
+				}, nil
+			}))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		volume, err := c.Create(t.Context(), "acme/api/npm", 1<<30)
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		if _, err := c.Snapshot(t.Context(), volume); err == nil {
+			t.Fatal("Snapshot succeeded although freezing the candidate failed")
+		}
+
+		if !f.ranWith("trash", "mv", volume.Handle) || f.ranWith("rm", volume.Handle) {
+			t.Error("the snapshot's cleanup did not move its volume to the trash")
+		}
+
+		candidates := 0
+		for _, call := range f.calls {
+			for _, arg := range call {
+				if !strings.HasPrefix(arg, "billet-cache/cache-g-") || strings.Contains(arg, "@") {
+					continue
+				}
+
+				if slices.Contains(call, "trash") {
+					t.Errorf("the candidate generation went to the trash: %v", call)
+				}
+
+				if slices.Contains(call, "rm") {
+					candidates++
+				}
+			}
+		}
+
+		if candidates != 1 {
+			t.Errorf("the candidate generation was removed with rbd rm %d times, want 1", candidates)
+		}
+	})
+}
+
+// EVICTION REMOVES WITH `rbd rm` AND NEVER DELETES FROM THE TRASH. It checks only
+// its own host's mappings and no index record names a writable volume, so rbd's
+// refusal to remove an image still open elsewhere is what protects another
+// node's job; and it holds the lock every cache writer waits on, while a
+// discarded volume in the trash takes minutes to delete.
+func TestEvictionRemovesWithRmAndNeverPurges(t *testing.T) {
 	t.Parallel()
 
 	f := newCacheFake()
@@ -2420,12 +2529,10 @@ func TestEvictionTrashesVolumesRemovesGenerationsAndNeverPurges(t *testing.T) {
 		t.Fatalf("eviction kept an expired image: %v", f.images)
 	}
 
-	if !f.ranWith("trash", "mv", volume) || f.ranWith("rm", volume) {
-		t.Error("eviction did not move the expired volume to the trash")
-	}
-
-	if f.ranWith("trash", "mv", generation) || !f.ranWith("rm", generation) {
-		t.Error("eviction did not remove the expired generation with rbd rm")
+	for _, image := range []string{volume, generation} {
+		if f.ranWith("trash", "mv", image) || !f.ranWith("rm", image) {
+			t.Errorf("eviction did not remove %s with rbd rm", image)
+		}
 	}
 
 	if _, ok := f.trash["id-discarded"]; !ok || f.ranWith("trash", "rm") {

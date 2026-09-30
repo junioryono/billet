@@ -1068,8 +1068,9 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	}
 
 	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
-	if name == volume.Handle || !strings.HasPrefix(name, "cache-v-") {
-		return errors.New("ceph: refusing to discard a cache volume outside the configured pool")
+	if kind, _, ok := cacheImageName(name); name == volume.Handle || !ok || kind != "v" {
+		return fmt.Errorf("ceph: refusing to discard %s: it is not a writable cache volume billet "+
+			"named in the configured pool", bounded(volume.Handle))
 	}
 
 	devices, err := c.mappedDevices(ctx, name)
@@ -1096,9 +1097,9 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	return nil
 }
 
-// removeCacheImage deletes a cache generation with `rbd rm`, which refuses a
-// parent a copy-on-write child still reads before it deletes anything. A
-// generation never goes to the trash, where nothing would refuse it.
+// removeCacheImage deletes a cache image with `rbd rm`, which refuses a parent a
+// copy-on-write child still reads, or an image still open, before it deletes
+// anything. A generation never goes to the trash, where neither is refused.
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 	if _, err := c.rbdCmd(ctx, false, "rm", handle); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache image %s: %w", handle, err)
@@ -1117,9 +1118,9 @@ func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 // the command path.
 func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	name, ok := strings.CutPrefix(handle, c.cfg.CachePool+"/")
-	if !ok || !strings.HasPrefix(name, "cache-v-") {
+	if kind, _, named := cacheImageName(name); !ok || !named || kind != "v" {
 		return fmt.Errorf("ceph: refusing to move %s to the trash: only a writable cache volume "+
-			"goes there", handle)
+			"billet named goes there", handle)
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
@@ -1299,8 +1300,13 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 	return nil
 }
 
-// Evict removes old, unreferenced cache images under the same lock as publication:
-// a generation with `rbd rm`, a writable volume into the trash.
+// Evict removes old, unreferenced cache images under the same lock as publication.
+//
+// WITH `rbd rm`, NOT THE TRASH, even for a writable volume. Only the evicting
+// host's mappings are checked, and no index record names a writable volume, so
+// what refuses a volume another node's job still has open is rbd's own refusal
+// to remove an image with watchers. One removal cut short is finished by
+// PurgeTrash (finishHalfRemoved).
 //
 // IT NEVER DELETES FROM THE TRASH. Under this lock every writer waits on it, and a
 // discarded volume takes minutes to delete, so PurgeTrash does that off the lock.
@@ -1418,14 +1424,6 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 			if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
 				!isNoSuchFile(err) {
 				return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
-			}
-
-			if strings.HasPrefix(name, "cache-v-") {
-				if err := c.discardCacheVolume(ctx, handle); err != nil {
-					return err
-				}
-
-				continue
 			}
 
 			if err := c.removeCacheImage(ctx, handle); err != nil {
