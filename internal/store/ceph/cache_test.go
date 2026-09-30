@@ -154,6 +154,13 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 		}
 
 		image := "billet-cache/" + name
+		for snapshot := range f.snapshots {
+			if strings.HasPrefix(snapshot, image+"@") {
+				return nil, fmt.Errorf("exit status 39: %w", cacheExitError{
+					code: 39, message: "rbd: image has snapshots - not removing",
+				})
+			}
+		}
 		for _, parent := range f.parents {
 			if strings.HasPrefix(parent, image+"@") {
 				return nil, fmt.Errorf("exit status 39: %w", cacheExitError{
@@ -1230,7 +1237,7 @@ func TestCacheEvictFailsClosedWhenItCannotReadTheIndex(t *testing.T) {
 	// If the metadata error were softened to an empty view, Evict would compute
 	// an empty protected set and delete this — so seeding it gives the no-removal
 	// assertion something real to protect.
-	f.images[c.cfg.CachePool+"/cache-g-1000000000-deadbeef"] = true
+	f.images[c.cfg.CachePool+"/cache-g-1000000000-0123456789abcdef01234567"] = true
 
 	err := c.Evict(t.Context(), 7*24*time.Hour)
 	if err == nil {
@@ -1607,7 +1614,7 @@ func TestEvictionPreservesAnOldGenerationWhileACloneLeaseIsLive(t *testing.T) {
 	f := newCacheFake()
 	c := cacheClient(t, f)
 	now := time.Now().UTC()
-	handle := fmt.Sprintf("billet-cache/cache-g-%d-abcdef", now.Add(-8*24*time.Hour).Unix())
+	handle := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", now.Add(-8*24*time.Hour).Unix())
 	f.images[handle] = true
 	f.metadata[handle] = map[string]string{
 		cacheMetaPrefix + "used_at": now.Add(-8 * 24 * time.Hour).Format(time.RFC3339Nano),
@@ -2070,7 +2077,7 @@ func TestSnapshotRefreshesALongLivedWritableCloneBeforeUnmapping(t *testing.T) {
 	c := cacheClient(t, f)
 	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
 	now := time.Now().UTC()
-	handle := fmt.Sprintf("billet-cache/cache-v-%d-long-job", old.Unix())
+	handle := fmt.Sprintf("billet-cache/cache-v-%d-0123456789abcdef01234567", old.Unix())
 	f.images[handle] = true
 	f.depths[handle] = 0
 	f.mappings["/dev/rbd7"] = handle
@@ -2146,7 +2153,7 @@ func TestEvictionExpiresAnInactiveCurrentPointer(t *testing.T) {
 	f := newCacheFake()
 	c := cacheClient(t, f)
 	now := time.Now().UTC()
-	handle := fmt.Sprintf("billet-cache/cache-g-%d-abcdef", now.Add(-8*24*time.Hour).Unix())
+	handle := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", now.Add(-8*24*time.Hour).Unix())
 	f.images[handle] = true
 	pointer := cachePointer{
 		Generation: "g1", Handle: handle, UsedAt: now.Add(-8 * 24 * time.Hour),
@@ -2184,7 +2191,7 @@ func TestCloningRefreshesTheCurrentPointersLastUse(t *testing.T) {
 	f := newCacheFake()
 	c := cacheClient(t, f)
 	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
-	handle := fmt.Sprintf("billet-cache/cache-g-%d-abcdef", old.Unix())
+	handle := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", old.Unix())
 	f.images[handle] = true
 	f.snapshots[handle+"@g1"] = true
 	pointer := cachePointer{Generation: "g1", Handle: handle, UsedAt: old, RetentionHours: 7 * 24}
@@ -2501,6 +2508,61 @@ func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *te
 		if candidates != 1 {
 			t.Errorf("the candidate generation was removed with rbd rm %d times, want 1", candidates)
 		}
+
+		for snapshot := range f.snapshots {
+			if strings.HasPrefix(snapshot, volume.Handle+"@") {
+				t.Errorf("the volume went to the trash still carrying %s", snapshot)
+			}
+		}
+
+		if n, err := c.PurgeTrash(t.Context()); err != nil || n != 1 || len(f.trash) != 0 {
+			t.Errorf("PurgeTrash = %d, %v, trash %v; want the volume deleted", n, err, f.trash)
+		}
+	})
+
+	// A VOLUME WHOSE STAGING SNAPSHOT COULD NOT BE REMOVED STAYS LISTED. In the
+	// trash the snapshot would make every `trash rm` answer ENOTEMPTY, which the
+	// purge waits on forever; listed, eviction purges the snapshot and removes it.
+	t.Run("staging snapshot kept", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "snap") && slices.ContainsFunc(args, func(arg string) bool {
+				return strings.Contains(arg, "/cache-g-")
+			}) && slices.Contains(args, "create") {
+				return nil, errors.New("exit status 5: rbd: failed to create snapshot: (5) Input/output error")
+			}
+
+			if slices.Contains(args, "snap") && slices.Contains(args, "rm") {
+				return nil, errors.New("exit status 5: rbd: failed to remove snapshot: (5) Input/output error")
+			}
+
+			return f.run(ctx, bin, args)
+		}
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run),
+			withFilesystemVerifier(func(context.Context, string) (storecontract.Filesystem, error) {
+				return storecontract.Filesystem{
+					Type: "ext4", UUID: "dcab7af5-4ae7-4cc1-8ddb-1db18956c389", Clean: true,
+				}, nil
+			}))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		volume, err := c.Create(t.Context(), "acme/api/npm", 1<<30)
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		if _, err := c.Snapshot(t.Context(), volume); err == nil ||
+			!strings.Contains(err.Error(), "failed to remove snapshot") {
+			t.Fatalf("Snapshot = %v, want the staging snapshot's failure reported", err)
+		}
+
+		if !f.images[volume.Handle] || f.ranWith("trash", "mv", volume.Handle) {
+			t.Error("a volume still carrying its staging snapshot went to the trash")
+		}
 	})
 }
 
@@ -2545,8 +2607,9 @@ func TestEvictionRemovesWithRmAndNeverPurges(t *testing.T) {
 // A removal cut short leaves the name listed while nothing can open it, and `rbd
 // rm` again finishes it (measured 2026-09-29). An image nobody can open is one no
 // job or generation can use, and rbd refused to start removing a parent with a
-// child. It must be a name billet gave a cache image, named long enough ago that
-// it is not an image another node is creating, and it is deleted under the
+// child. It must be a name billet gave a cache image, named long enough ago and
+// found unopenable by an earlier pass long enough ago on this node's own clock
+// that it is not an image another node is creating, and it is deleted under the
 // purge's own bound rather than the fifteen-second one that cut it short.
 func TestThePurgeFinishesHalfRemovedCacheImages(t *testing.T) {
 	t.Parallel()
@@ -2580,15 +2643,38 @@ func TestThePurgeFinishesHalfRemovedCacheImages(t *testing.T) {
 	lookalike := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old)
 	root := "billet-cache/billet-624131f5"
 	whole := fmt.Sprintf("billet-cache/cache-v-%d-fedcba9876543210fedcba98", old)
+	// Unopenable on the first pass and whole by the second: an old name on a node
+	// whose clock is behind, caught between its directory entry and its header.
+	appearing := fmt.Sprintf("billet-cache/cache-g-%d-fedcba9876543210fedcba98", old)
 
-	for _, image := range []string{halfVolume, halfGeneration, creating, lookalike, root} {
+	for _, image := range []string{halfVolume, halfGeneration, creating, lookalike, root, appearing} {
 		f.halfRemoved[image] = true
 	}
 	f.images[whole] = true
 
+	// THE FIRST SIGHTING ONLY RECORDS, and so does one too soon after it.
+	first := time.Now()
+
 	n, err := c.PurgeTrash(t.Context())
-	if err != nil {
-		t.Fatalf("PurgeTrash: %v", err)
+	if err != nil || n != 0 || len(bounds) != 0 {
+		t.Fatalf("a first sighting removed something: PurgeTrash = %d, %v, %d removals", n, err, len(bounds))
+	}
+
+	if n, unfinished := c.finishHalfRemoved(t.Context(), first.Add(halfRemovedRecheck/2)); n != 0 ||
+		len(unfinished) != 0 || len(bounds) != 0 {
+		t.Fatalf("a second sighting too soon removed something: %d, %v", n, unfinished)
+	}
+
+	delete(f.halfRemoved, appearing)
+	f.images[appearing] = true
+
+	n, unfinished := c.finishHalfRemoved(t.Context(), first.Add(2*halfRemovedRecheck))
+	if len(unfinished) != 0 {
+		t.Fatalf("finishHalfRemoved: %v", unfinished)
+	}
+
+	if !f.images[appearing] || f.ranWith("rm", appearing) {
+		t.Error("an image that became whole between sightings was removed")
 	}
 
 	if n != 2 || f.halfRemoved[halfVolume] || f.halfRemoved[halfGeneration] {
@@ -2653,7 +2739,14 @@ func TestAHalfRemovedCheckThatCannotTellKeepsTheImage(t *testing.T) {
 		f.halfRemoved[image] = true
 	}
 
-	n, err := c.PurgeTrash(t.Context())
+	first := time.Now()
+
+	if _, err := c.PurgeTrash(t.Context()); err == nil || !strings.Contains(err.Error(), unreadable) {
+		t.Errorf("%s was not reported on the first sighting: %v", unreadable, err)
+	}
+
+	n, unfinished := c.finishHalfRemoved(t.Context(), first.Add(2*halfRemovedRecheck))
+	err = errors.Join(unfinished...)
 	for _, image := range []string{unreadable, refused} {
 		if err == nil || !strings.Contains(err.Error(), image) {
 			t.Errorf("%s was not reported: %v", image, err)

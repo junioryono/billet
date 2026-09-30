@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -59,6 +60,11 @@ type Client struct {
 	// one; only a test sets it, for the reason withRunner exists.
 	observation time.Duration
 	verify      filesystemVerifier
+
+	// halfRemoved remembers when each cache image finishHalfRemoved found
+	// unopenable was first seen so, which a second pass requires.
+	halfRemovedMu sync.Mutex
+	halfRemoved   map[string]time.Time
 }
 
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS

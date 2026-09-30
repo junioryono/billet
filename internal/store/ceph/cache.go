@@ -536,7 +536,7 @@ func (c *Client) snapshotAt(
 		return storecontract.Candidate{}, err
 	}
 
-	if !strings.HasPrefix(volume.Handle, c.cfg.CachePool+"/cache-v-") || volume.Device == "" {
+	if !c.isCacheVolume(volume.Handle) || volume.Device == "" {
 		return storecontract.Candidate{}, errors.New("ceph: a candidate must come from a mapped cache volume")
 	}
 
@@ -729,14 +729,22 @@ func (c *Client) cleanupSnapshotFailure(
 			failures = append(failures, err)
 		}
 	}
+	stageKept := false
 	if stage != "" {
 		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "rm", stage); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
+			stageKept = true
 		}
 	}
-	if err := c.discardCacheVolume(cleanupCtx, volume.Handle); err != nil {
-		failures = append(failures, err)
+	// A VOLUME STILL CARRYING ITS STAGING SNAPSHOT STAYS LISTED. In the trash its
+	// snapshot would make every `trash rm` answer ENOTEMPTY, which the purge takes
+	// for a live child and waits on forever; listed, eviction purges the snapshot
+	// and removes it.
+	if !stageKept {
+		if err := c.discardCacheVolume(cleanupCtx, volume.Handle); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	if volume.Lease.ID != "" {
 		if err := c.withCacheLock(cleanupCtx, time.Now(), func(time.Time) error {
@@ -1068,7 +1076,7 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	}
 
 	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
-	if kind, _, ok := cacheImageName(name); name == volume.Handle || !ok || kind != "v" {
+	if !c.isCacheVolume(volume.Handle) {
 		return fmt.Errorf("ceph: refusing to discard %s: it is not a writable cache volume billet "+
 			"named in the configured pool", bounded(volume.Handle))
 	}
@@ -1117,10 +1125,9 @@ func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 // the reference deployment's cache pool (#292). PurgeTrash deletes the data off
 // the command path.
 func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
-	name, ok := strings.CutPrefix(handle, c.cfg.CachePool+"/")
-	if kind, _, named := cacheImageName(name); !ok || !named || kind != "v" {
+	if !c.isCacheVolume(handle) {
 		return fmt.Errorf("ceph: refusing to move %s to the trash: only a writable cache volume "+
-			"billet named goes there", handle)
+			"billet named goes there", bounded(handle))
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
@@ -1134,6 +1141,15 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 // creates in the cache pool: a writable volume (v) or a generation (g), the Unix
 // second it was named and a 96-bit nonce.
 var billetCacheImage = regexp.MustCompile(`^cache-([vg])-([0-9]+)-[0-9a-f]{24}$`)
+
+// isCacheVolume reports whether a handle names, in the cache pool, a writable
+// cache volume billet created.
+func (c *Client) isCacheVolume(handle string) bool {
+	name, ok := strings.CutPrefix(handle, c.cfg.CachePool+"/")
+	kind, _, named := cacheImageName(name)
+
+	return ok && named && kind == "v"
+}
 
 // cacheImageName reports whether billet named an image, which kind it is and when
 // it was named.
@@ -1156,10 +1172,14 @@ func cacheImageName(name string) (kind string, named time.Time, ok bool) {
 // this is a bound on how long one call holds, not on how large an image can be.
 const PurgeTimeout = 30 * time.Minute
 
-// halfRemovedAfter is how long ago an image must have been named before one
-// that cannot be opened is taken for a removal cut short. Creating an image lists
-// its name a moment before it writes its header.
-const halfRemovedAfter = time.Hour
+// halfRemovedAfter is how long ago an image must have been named, and
+// halfRemovedRecheck how long it must have stayed unopenable, before it is taken
+// for a removal cut short. Creating an image lists its name a moment before it
+// writes its header.
+const (
+	halfRemovedAfter   = time.Hour
+	halfRemovedRecheck = time.Minute
+)
 
 // PurgeTrash deletes the per-job root disks and writable cache volumes discards
 // moved to the cache pool's trash, finishes the cache images an `rbd rm` left
@@ -1241,15 +1261,25 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 // IT: an image without a header cannot be mapped, cloned or read, so no job,
 // generation or index record can be using it; and rbd refuses to remove a parent
 // with a clone child before it deletes anything, so one left half-removed had no
-// child and can acquire none. Only names billet gave its cache images, and only
-// past halfRemovedAfter, so an image another node is creating is never taken for
-// one. An `rbd info` that fails for another reason is could-not-tell: the image
-// is kept and the failure reported.
+// child and can acquire none. Only names billet gave its cache images.
+//
+// NOT AN IMAGE BEING CREATED, which is listed a moment before its header exists.
+// Its name must be older than halfRemovedAfter, and it must have been found
+// unopenable by an earlier pass at least halfRemovedRecheck ago on this node's
+// own clock, because the name's time is the creating node's clock. An `rbd info`
+// that fails for another reason is could-not-tell: the image is kept, forgotten
+// and reported.
 func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []error) {
 	names, err := c.cacheImages(ctx)
 	if err != nil {
 		return 0, []error{err}
 	}
+
+	c.halfRemovedMu.Lock()
+	defer c.halfRemovedMu.Unlock()
+
+	seen := c.halfRemoved
+	c.halfRemoved = map[string]time.Time{}
 
 	finished := 0
 
@@ -1276,8 +1306,23 @@ func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []e
 			continue
 		}
 
+		first, ok := seen[name]
+		if !ok || now.Before(first) {
+			c.halfRemoved[name] = now
+
+			continue
+		}
+
+		if now.Sub(first) < halfRemovedRecheck {
+			c.halfRemoved[name] = first
+
+			continue
+		}
+
 		if _, err := c.rbdCmdWithin(ctx, PurgeTimeout, false, "rm", handle); err != nil &&
 			!isNoSuchFile(err) {
+			c.halfRemoved[name] = first
+
 			if !isImageNotEmpty(err) {
 				failures = append(failures, fmt.Errorf("ceph: finish removing half-removed %s: %w",
 					handle, err))
@@ -1293,6 +1338,11 @@ func (c *Client) finishHalfRemoved(ctx context.Context, now time.Time) (int, []e
 }
 
 func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
+	if !c.isCacheVolume(handle) {
+		return fmt.Errorf("ceph: refusing to retire %s: only a writable cache volume billet "+
+			"named is retired", bounded(handle))
+	}
+
 	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil {
 		return fmt.Errorf("ceph: retire cache volume %s: %w", handle, err)
 	}
@@ -1386,7 +1436,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		}
 
 		for _, name := range images {
-			if !strings.HasPrefix(name, "cache-g-") && !strings.HasPrefix(name, "cache-v-") {
+			if _, _, ok := cacheImageName(name); !ok {
 				continue
 			}
 
