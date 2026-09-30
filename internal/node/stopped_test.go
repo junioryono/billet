@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 )
 
 type stoppedFixture struct {
@@ -40,6 +41,22 @@ func newStoppedFixture(t *testing.T) *stoppedFixture {
 	return f
 }
 
+// end, pause and resume replace the backend's record with a FRESH one, as a
+// real provider's List returns a new Instance every time: the handle Launch
+// returned, which r.running holds, is never touched, so only an implementation
+// that reads the sweep's inventory can see the change.
+func (f *stoppedFixture) end() { f.replace(provider.Instance{Ended: true}) }
+
+func (f *stoppedFixture) pause() { f.replace(provider.Instance{}) }
+
+func (f *stoppedFixture) resume() { f.replace(provider.Instance{Running: true}) }
+
+func (f *stoppedFixture) replace(state provider.Instance) {
+	old := f.p.live[f.name]
+	state.ID, state.Name = old.ID, old.Name
+	f.p.live[f.name] = &state
+}
+
 func (f *stoppedFixture) sweepAt(t *testing.T, after time.Duration) {
 	t.Helper()
 
@@ -53,7 +70,7 @@ func TestADrainStopsWaitingOnAGuestTwoSweepsSawStopped(t *testing.T) {
 	t.Parallel()
 
 	f := newStoppedFixture(t)
-	f.p.stop(f.name)
+	f.end()
 
 	f.sweepAt(t, 0)
 
@@ -90,7 +107,7 @@ func TestOneObservationIsNotAProofHoweverLongAgo(t *testing.T) {
 	t.Parallel()
 
 	f := newStoppedFixture(t)
-	f.p.stop(f.name)
+	f.end()
 
 	f.sweepAt(t, 0)
 	f.now = f.now.Add(10 * strayGrace)
@@ -104,7 +121,7 @@ func TestTwoStoppedObservationsInsideTheGraceAreNotAProof(t *testing.T) {
 	t.Parallel()
 
 	f := newStoppedFixture(t)
-	f.p.stop(f.name)
+	f.end()
 
 	f.sweepAt(t, 0)
 	f.sweepAt(t, strayGrace-time.Second)
@@ -119,13 +136,13 @@ func TestAGuestSeenRunningAgainStartsTheGraceAgain(t *testing.T) {
 	t.Parallel()
 
 	f := newStoppedFixture(t)
-	f.p.stop(f.name)
+	f.end()
 	f.sweepAt(t, 0)
 
-	f.p.live[f.name].Running = true
+	f.resume()
 	f.sweepAt(t, time.Minute)
 
-	f.p.stop(f.name)
+	f.end()
 	f.sweepAt(t, strayGrace)
 
 	if !f.r.Holding() {
@@ -136,6 +153,45 @@ func TestAGuestSeenRunningAgainStartsTheGraceAgain(t *testing.T) {
 
 	if f.r.Holding() {
 		t.Fatal("still holding after two fresh stopped observations a grace apart")
+	}
+}
+
+// A paused guest is not running and has not ended: it is still mid-job, and a
+// drain that let go of it would leave it for the next Recover to destroy.
+func TestAPausedGuestIsHeldWhateverTheSweeps(t *testing.T) {
+	t.Parallel()
+
+	f := newStoppedFixture(t)
+	f.pause()
+
+	f.sweepAt(t, 0)
+	f.sweepAt(t, 10*strayGrace)
+
+	if !f.r.Holding() {
+		t.Fatal("stopped holding a paused guest; not running is not ended")
+	}
+}
+
+// The verdict comes from the sweep's inventory: the launch handle the runner
+// keeps still says running throughout.
+func TestTheVerdictComesFromTheSweepsInventory(t *testing.T) {
+	t.Parallel()
+
+	f := newStoppedFixture(t)
+	f.end()
+
+	f.sweepAt(t, 0)
+	f.sweepAt(t, strayGrace)
+
+	f.r.mu.Lock()
+	handle := f.r.running[11]
+	f.r.mu.Unlock()
+
+	if handle == nil || !handle.Running || handle.Ended {
+		t.Fatalf("the launch handle changed (%+v); this test no longer separates the handle from the inventory", handle)
+	}
+	if f.r.Holding() {
+		t.Fatal("the inventory said ended twice a grace apart and the drain still waits")
 	}
 }
 

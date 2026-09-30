@@ -21,14 +21,17 @@ import (
 // so failing its lease would misattribute a successful job; the entry is kept for
 // the Destroy that normally follows, and only Holding stops counting it once
 // stoppedProved says so. What is left is the next process's Recover to destroy,
-// as it destroys anything nothing is waiting for. `Running: false` is the provider's proof, not its silence:
-// firecracker answers false only on a refused connection or an absent socket and
-// TRUE whenever it cannot tell.
+// as it destroys anything nothing is waiting for. `Ended` is the provider's
+// proof, not its silence: firecracker sets it only on a refused connection or an
+// absent socket, docker only for exited and dead.
 func (r *Runner) noteStopped(instances []*provider.Instance) {
 	stopped := make(map[string]bool, len(instances))
 
+	// ENDED, NOT MERELY NOT RUNNING: a paused guest is not running and is still
+	// mid-job, and a drain that let go of it would leave it for the next
+	// process's Recover to destroy.
 	for _, inst := range instances {
-		if inst != nil && !inst.Running {
+		if inst != nil && inst.Ended {
 			stopped[inst.Name] = true
 		}
 	}

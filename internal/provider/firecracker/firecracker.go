@@ -1766,13 +1766,13 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 				continue
 			}
 
-			running, err := p.running(ctx, j)
+			running, ended, err := p.runState(ctx, j)
 			if err != nil {
 				return nil, err
 			}
 
 			instances = append(instances, &Instance{
-				ID: name, Name: name, Running: running,
+				ID: name, Name: name, Running: running, Ended: ended,
 			})
 		}
 	}
@@ -1797,9 +1797,21 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 // anything, because whatever would have started it is gone. It is this backend's
 // `created` container.
 func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
+	running, _, err := p.runState(ctx, j)
+
+	return running, err
+}
+
+// runState is running's answer plus whether the VMM is proved gone, which is
+// the only state firecracker has that says execution ENDED: a paused VMM, one
+// never started and one in a state billet does not know are all not running and
+// not ended.
+func (p *Provider) runState(ctx context.Context, j jail) (running, ended bool, err error) {
 	info, err := p.apiFor(j.socket()).info(ctx)
 	if err != nil {
-		return !gone(err), nil
+		vmmGone := gone(err)
+
+		return !vmmGone, vmmGone, nil
 	}
 
 	// A DIFFERENT VMM ON THIS SOCKET IS AN ERROR, NOT A "NO".
@@ -1810,11 +1822,11 @@ func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 	// cannot say the guest is running either. Neither answer is available, which is
 	// what an error is for.
 	if info.ID != j.id {
-		return false, fmt.Errorf("firecracker: the vmm answering for %s calls itself %s, so "+
+		return false, false, fmt.Errorf("firecracker: the vmm answering for %s calls itself %s, so "+
 			"billet cannot say whether %s is running", j.id, bounded(info.ID), j.id)
 	}
 
-	return info.State == stateRunning, nil
+	return info.State == stateRunning, false, nil
 }
 
 // execRunner runs the jailer or ip, and returns standard output.
