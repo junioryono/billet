@@ -1077,6 +1077,8 @@ func (r *Runner) Superseded() {
 		// left to do and can never stop.
 		delete(r.running, requestID)
 		delete(r.runningLease, requestID)
+		delete(r.stoppedSince, inst.Name)
+		delete(r.stoppedProved, inst.Name)
 		r.forgetMonitoring(inst.Name)
 
 		if _, held := r.custody[lease.ID]; held {

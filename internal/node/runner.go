@@ -857,6 +857,8 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	r.mu.Lock()
 	delete(r.running, requestID)
 	delete(r.runningLease, requestID)
+	delete(r.stoppedSince, inst.Name)
+	delete(r.stoppedProved, inst.Name)
 	r.mu.Unlock()
 	r.forgetMonitoring(inst.Name)
 

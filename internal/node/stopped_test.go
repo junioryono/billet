@@ -99,6 +99,15 @@ func TestADrainStopsWaitingOnAGuestTwoSweepsSawStopped(t *testing.T) {
 	if !slices.Contains(f.p.destroyed, "instance-"+f.name) {
 		t.Fatalf("the later destroy did not reach the guest; destroyed %v", f.p.destroyed)
 	}
+
+	f.r.mu.Lock()
+	_, since := f.r.stoppedSince[f.name]
+	_, proved := f.r.stoppedProved[f.name]
+	f.r.mu.Unlock()
+
+	if since || proved {
+		t.Fatalf("the destroy left its entry's proof behind (since %v, proved %v)", since, proved)
+	}
 }
 
 // Asked long after one sweep, with no second observation, Holding still holds:

@@ -49,3 +49,75 @@ func TestAVMMIsEndedOnlyWhenItsProcessIsProvedGone(t *testing.T) {
 		})
 	}
 }
+
+// THROUGH List, which is what a node's sweep reads: Ended appears only for a VMM
+// whose API is gone AND whose process is proved gone.
+func TestListReportsEndedOnlyForAnExitedVMM(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		act     func(t *testing.T, j jail, vmm *fakeVMM)
+		owns    bool
+		ownsErr error
+		want    bool
+	}{
+		{
+			name: "vmm exited",
+			act:  func(_ *testing.T, _ jail, vmm *fakeVMM) { vmm.stop() },
+			want: true,
+		},
+		{
+			name: "socket unlinked under a live vmm",
+			act: func(t *testing.T, j jail, _ *fakeVMM) {
+				if err := os.Remove(j.socket()); err != nil {
+					t.Fatalf("unlink the api socket: %v", err)
+				}
+			},
+			owns: true,
+			want: false,
+		},
+		{
+			name:    "api gone, process unreadable",
+			act:     func(_ *testing.T, _ jail, vmm *fakeVMM) { vmm.stop() },
+			ownsErr: errors.New("permission denied"),
+			want:    false,
+		},
+		{
+			name: "paused",
+			act: func(_ *testing.T, _ jail, vmm *fakeVMM) {
+				vmm.mu.Lock()
+				vmm.state = "Paused"
+				vmm.mu.Unlock()
+			},
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, withPidOwner(func(int, string) (bool, error) {
+				return tc.owns, tc.ownsErr
+			}))
+
+			_, vmm := h.launch(t)
+			j := h.p.jailFor(theInstance)
+
+			if err := os.MkdirAll(filepath.Dir(j.pidFile()), 0o700); err != nil {
+				t.Fatalf("make the pid directory: %v", err)
+			}
+			if err := os.WriteFile(j.pidFile(), []byte("4321\n"), 0o600); err != nil {
+				t.Fatalf("write the pid file: %v", err)
+			}
+
+			tc.act(t, j, vmm)
+
+			instances, err := h.p.List(t.Context())
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(instances) != 1 {
+				t.Fatalf("List returned %d instances, want 1", len(instances))
+			}
+			if got := instances[0]; got.Ended != tc.want || got.Running {
+				t.Fatalf("listed %+v, want Ended %v and not Running", got, tc.want)
+			}
+		})
+	}
+}
