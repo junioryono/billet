@@ -156,6 +156,47 @@ func TestAGuestSeenRunningAgainStartsTheGraceAgain(t *testing.T) {
 	}
 }
 
+// A proof already granted is revoked by a sweep that sees the guest running.
+func TestAGrantedProofIsRevokedWhenTheGuestIsSeenRunning(t *testing.T) {
+	t.Parallel()
+
+	f := newStoppedFixture(t)
+	f.end()
+	f.sweepAt(t, 0)
+	f.sweepAt(t, strayGrace)
+
+	if f.r.Holding() {
+		t.Fatal("precondition: the proof was never granted, so this proves nothing")
+	}
+
+	f.resume()
+	f.sweepAt(t, strayGrace+time.Minute)
+
+	if !f.r.Holding() {
+		t.Fatal("a guest seen running again is still ignored by the drain")
+	}
+}
+
+// A proof about one instance does not carry to the next launched under its name.
+func TestAProofIsClearedWhenItsEntryIsForgotten(t *testing.T) {
+	t.Parallel()
+
+	f := newStoppedFixture(t)
+	f.end()
+	f.sweepAt(t, 0)
+	f.sweepAt(t, strayGrace)
+
+	f.r.mu.Lock()
+	f.r.forgetRunningLocked(f.name)
+	_, since := f.r.stoppedSince[f.name]
+	_, proved := f.r.stoppedProved[f.name]
+	f.r.mu.Unlock()
+
+	if since || proved {
+		t.Fatalf("forgetting the entry left its proof behind (since %v, proved %v)", since, proved)
+	}
+}
+
 // A paused guest is not running and has not ended: it is still mid-job, and a
 // drain that let go of it would leave it for the next Recover to destroy.
 func TestAPausedGuestIsHeldWhateverTheSweeps(t *testing.T) {

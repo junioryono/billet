@@ -600,6 +600,9 @@ func (r *Runner) Launch(
 
 	r.mu.Lock()
 	r.running[job.RequestID] = inst
+	// A proof about an earlier instance of this name is not one about this one.
+	delete(r.stoppedSince, inst.Name)
+	delete(r.stoppedProved, inst.Name)
 	// THE LEASE IS KEPT WITH THE INSTANCE, because renewing or releasing it needs
 	// the epoch and the instance name carries only the id. It is needed exactly
 	// once — when this process is superseded and everything it is running becomes
@@ -639,6 +642,8 @@ func (r *Runner) forgetRunningLocked(name string) {
 			delete(r.runningLease, requestID)
 		}
 	}
+	delete(r.stoppedSince, name)
+	delete(r.stoppedProved, name)
 	r.forgetMonitoring(name)
 }
 

@@ -1468,6 +1468,25 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 // ZERO IS "NOTHING IS RUNNING" AND AN ERROR IS "BILLET COULD NOT TELL", which the
 // caller must not confuse: the first permits teardown to continue and the second
 // must stop it, because the next steps unmap a block device the VMM may still hold.
+// vmmExited reports whether the pid file names a process that is definitely no
+// longer this jail's VMM. No pid file, an unreadable one and a process billet
+// cannot inspect are all "could not tell", which is false here.
+func (p *Provider) vmmExited(j jail) bool {
+	raw, err := os.ReadFile(j.pidFile())
+	if err != nil {
+		return false
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+
+	owns, err := p.pidOwner(pid, j.id)
+
+	return err == nil && !owns
+}
+
 func (p *Provider) vmmPID(j jail) (int, error) {
 	raw, err := os.ReadFile(j.pidFile())
 	if err != nil {
@@ -1802,16 +1821,20 @@ func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 	return running, err
 }
 
-// runState is running's answer plus whether the VMM is proved gone, which is
-// the only state firecracker has that says execution ENDED: a paused VMM, one
-// never started and one in a state billet does not know are all not running and
-// not ended.
+// runState is running's answer plus whether the VMM process is proved to have
+// exited, which is the only thing firecracker has that says execution ENDED: a
+// paused VMM, one never started and one in a state billet does not know are all
+// not running and not ended.
+//
+// A GONE SOCKET IS NOT AN EXITED PROCESS. Unlinking a Unix socket leaves its
+// listener and the guest running, so `ended` needs the pid file to name a
+// process that /proc proves is no longer this jail's VMM (vmmExited).
 func (p *Provider) runState(ctx context.Context, j jail) (running, ended bool, err error) {
 	info, err := p.apiFor(j.socket()).info(ctx)
 	if err != nil {
 		vmmGone := gone(err)
 
-		return !vmmGone, vmmGone, nil
+		return !vmmGone, vmmGone && p.vmmExited(j), nil
 	}
 
 	// A DIFFERENT VMM ON THIS SOCKET IS AN ERROR, NOT A "NO".
