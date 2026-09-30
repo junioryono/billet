@@ -69,6 +69,11 @@ type Converger struct {
 	// started reads when a process started. A seam so a stop's once-per-process
 	// record is exercised without a process.
 	started func(ctx context.Context, pid int) (string, error)
+	// processStart reads a process's kernel start time, which binds a drain
+	// report to the process that wrote it, and signal sends a pid the drain
+	// request. Seams so the request is exercised without a process.
+	processStart func(pid int) (string, error)
+	signal       func(pid int) error
 	// productVersion reads this Mac's macOS release, which decides whether its
 	// launchd clamps ExitTimeOut. A seam so both answers are exercised.
 	productVersion func() (string, error)
@@ -162,6 +167,8 @@ func New(opts ...Option) *Converger {
 
 	c.run = c.exec
 	c.started = c.processStarted
+	c.processStart = processStart
+	c.signal = signalDrain
 	c.productVersion = swVersProductVersion
 
 	for _, opt := range opts {
@@ -343,9 +350,8 @@ func (c *Converger) stopAndProve(ctx context.Context, label string, asked *bool)
 	// launchd SIGKILLs a job ExitTimeOut seconds after IT sends the SIGTERM, and
 	// macOS 27 clamps a launch agent's ExitTimeOut to 60 (measured 2026-09-29:
 	// declared 61, 600 and 88200 all loaded as 60), so a bootout of a node
-	// still draining killed it a minute in. billet asks first, through
-	// `launchctl kill`, which starts no such timer, once per process (a second
-	// SIGTERM escalates the drain), and the wait for the process to leave is
+	// still draining killed it a minute in. billet asks first, with a request
+	// that starts no such timer, and the wait for the process to leave is
 	// bounded only by the caller. A node that drained exits 0, which
 	// KeepAlive{SuccessfulExit: false} does not restart, and the bootout below
 	// then has no process to kill.
@@ -439,16 +445,24 @@ func (c *Converger) stopAndProve(ctx context.Context, label string, asked *bool)
 	}
 }
 
-// drainFirst asks the loaded process to stop, once per process, and waits until
-// it has exited. A process launchd starts in its place (a restart after a
-// non-zero exit) is asked in its turn, so the bootout that follows has no
-// process to kill.
+// drainFirst asks the loaded process to drain and waits until it has exited. A
+// process launchd starts in its place (a restart after a non-zero exit) is
+// asked in its turn, so the bootout that follows has no process to kill.
 //
-// THROUGH `launchctl kill TERM <service>`, NOT kill(2) ON A PID. launchd
-// addresses the service's current process, so a pid another process reused
-// since it was read is never signalled; and, measured on macOS 27.0
-// (2026-09-29), a SIGTERM delivered this way starts no ExitTimeOut timer: an
-// agent drained its full 90s, exited 0 and was not restarted.
+// TWO REQUESTS, CHOSEN PER PROCESS BY WHAT THAT PROCESS SAYS OF ITSELF. One
+// that publishes a drain report naming its own pid and start is sent
+// DrainSignal on every poll: a repeat changes nothing, so nothing is recorded
+// and a restart or a retry simply asks again. Any other process, an older
+// release, one not yet reporting, or one whose report cannot be read, gets
+// the recorded single SIGTERM (askOnce). The binary on disk is never
+// consulted, because a rollout may have replaced it under the process that
+// runs.
+//
+// THE SIGTERM GOES THROUGH `launchctl kill TERM <service>`, NOT kill(2) ON A
+// PID. launchd addresses the service's current process, so a pid another
+// process reused since it was read is never signalled; and, measured on macOS
+// 27.0 (2026-09-29), a SIGTERM delivered this way starts no ExitTimeOut timer:
+// an agent drained its full 90s, exited 0 and was not restarted.
 //
 // ONCE PER PROCESS, ACROSS CALLS. The node's second SIGTERM escalates its drain,
 // so a stop retried after a caller's deadline must resume waiting rather than
@@ -463,7 +477,7 @@ func (c *Converger) drainFirst(
 	seen := []int{pid}
 
 	for {
-		result, err := c.askOnce(ctx, label, pid, record, watch)
+		next, requested, result, err := c.requestDrain(ctx, label, pid, watch, watched)
 		asked = asked || result.Asked
 
 		if err != nil {
@@ -472,11 +486,22 @@ func (c *Converger) drainFirst(
 			return result, err
 		}
 
-		next, result, err := c.awaitExit(ctx, label, pid, record, watch, watched)
-		if err != nil {
-			result.Asked = asked
+		if !requested {
+			result, err = c.askOnce(ctx, label, pid, record, watch)
+			asked = asked || result.Asked
 
-			return result, err
+			if err != nil {
+				result.Asked = asked
+
+				return result, err
+			}
+
+			next, result, err = c.awaitExit(ctx, label, pid, record, watch, watched)
+			if err != nil {
+				result.Asked = asked
+
+				return result, err
+			}
 		}
 
 		if next == 0 {
@@ -651,74 +676,84 @@ func (c *Converger) incarnation(ctx context.Context, label string, pid int) (str
 // decides the service is crashing rather than draining.
 const maxDrainRestarts = 3
 
-// stopRecordLimit bounds what a stop record may hold; one line is under 200 bytes.
-const stopRecordLimit = 4 << 10
+// ownFileLimit bounds what a stop record or a drain report may hold; each is
+// one line of under 300 bytes.
+const ownFileLimit = 4 << 10
 
 // readStopRecord reads a stop record, "" when there is none.
+func readStopRecord(path string) (string, error) { return readOwnFile(path, "stop record") }
+
+// writeStopRecord replaces a stop record atomically.
+func writeStopRecord(path, incarnation string) error {
+	return writeOwnFile(path, ".stop-record-*", incarnation)
+}
+
+// readOwnFile reads one of the small files this package keeps in the log
+// directory, "" when there is none.
 //
-// NEVER THROUGH A LINK, AND NEVER BLOCKING. The record lives in the account's
-// own log directory, and a symlink planted there would redirect it, a FIFO
-// would hang the read, and a link to /dev/null would make every request look
+// NEVER THROUGH A LINK, AND NEVER BLOCKING. The file lives in the account's own
+// log directory, and a symlink planted there would redirect it, a FIFO would
+// hang the read, and a link to /dev/null would make every request look
 // unrecorded. So the open follows nothing and does not block, and anything but
 // a regular file is refused.
-func readStopRecord(path string) (string, error) {
+func readOwnFile(path, what string) (string, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", nil
 	}
 
 	if err != nil {
-		return "", fmt.Errorf("launchd: open the stop record %s: %w", path, err)
+		return "", fmt.Errorf("launchd: open the %s %s: %w", what, path, err)
 	}
 
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("launchd: examine the stop record %s: %w", path, err)
+		return "", fmt.Errorf("launchd: examine the %s %s: %w", what, path, err)
 	}
 
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("launchd: the stop record %s is not a regular file (%s); remove it",
-			path, info.Mode().Type())
+		return "", fmt.Errorf("launchd: the %s %s is not a regular file (%s); remove it",
+			what, path, info.Mode().Type())
 	}
 
-	body, err := io.ReadAll(io.LimitReader(f, stopRecordLimit))
+	body, err := io.ReadAll(io.LimitReader(f, ownFileLimit))
 	if err != nil {
-		return "", fmt.Errorf("launchd: read the stop record %s: %w", path, err)
+		return "", fmt.Errorf("launchd: read the %s %s: %w", what, path, err)
 	}
 
 	return strings.TrimSpace(string(body)), nil
 }
 
-// writeStopRecord replaces a stop record atomically: a temporary file in the
+// writeOwnFile replaces one of those files atomically: a temporary file in the
 // same directory renamed over it, which replaces a link rather than writing
 // through it.
-func writeStopRecord(path, incarnation string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".stop-record-*")
+func writeOwnFile(path, pattern, line string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), pattern)
 	if err != nil {
-		return fmt.Errorf("create a stop record beside %s: %w", path, err)
+		return fmt.Errorf("create a file beside %s: %w", path, err)
 	}
 
 	name := tmp.Name()
 
-	if _, err := tmp.WriteString(incarnation + "\n"); err != nil {
+	if _, err := tmp.WriteString(line + "\n"); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(name)
 
-		return fmt.Errorf("write the stop record %s: %w", name, err)
+		return fmt.Errorf("write %s: %w", name, err)
 	}
 
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(name)
 
-		return fmt.Errorf("close the stop record %s: %w", name, err)
+		return fmt.Errorf("close %s: %w", name, err)
 	}
 
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
 
-		return fmt.Errorf("install the stop record %s: %w", path, err)
+		return fmt.Errorf("install %s: %w", path, err)
 	}
 
 	return nil
