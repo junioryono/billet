@@ -101,15 +101,16 @@ func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
 // before either, because it is not the node a stop asks.
 //
 // EACH IS A STATEMENT OF cmdNode's OWN BODY, IN ITS SHAPE, not a call found
-// anywhere in it: the handler is installed by `defer lc.handleDrainRequests()()`,
-// whose inner call runs where the defer stands (a call wrapped in a deferred
-// closure would run at return), the report is a plain statement after it, the
+// anywhere in it: the handler is installed by `stop := lc.handleDrainRequests()`,
+// a call that runs where it stands, and `defer stop()` follows it (a call wrapped
+// in a deferred closure would run at return), the report is a plain statement after it, the
 // probe is the `if *upgradeProbe` block that returns, and serving is the final
 // `return nodeclient.Run(...)`.
 func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 	fn := findFunc(t, "cmdNode")
 
-	probe, handler, report, serve := -1, -1, -1, -1
+	probe, handler, stopped, report, serve := -1, -1, -1, -1, -1
+	stopName := ""
 
 	for i, stmt := range fn.Body.List {
 		switch s := stmt.(type) {
@@ -123,9 +124,21 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 				}
 			}
 
+		case *ast.AssignStmt:
+			if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
+				continue
+			}
+
+			call, isCall := s.Rhs[0].(*ast.CallExpr)
+			name, isName := s.Lhs[0].(*ast.Ident)
+
+			if isCall && isName && calleeName(call) == "handleDrainRequests" {
+				handler, stopName = i, name.Name
+			}
+
 		case *ast.DeferStmt:
-			if inner, ok := s.Call.Fun.(*ast.CallExpr); ok && calleeName(inner) == "handleDrainRequests" {
-				handler = i
+			if id, ok := s.Call.Fun.(*ast.Ident); ok && stopName != "" && id.Name == stopName {
+				stopped = i
 			}
 
 		case *ast.ExprStmt:
@@ -151,9 +164,13 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 		}
 	}
 
-	if probe < 0 || handler < 0 || report < 0 || serve < 0 {
+	if probe < 0 || handler < 0 || stopped < 0 || report < 0 || serve < 0 {
 		t.Fatalf("cmdNode lost a statement this test orders (index -1): probe %d, handler %d, "+
-			"report %d, serve %d", probe, handler, report, serve)
+			"deferred stop %d, report %d, serve %d", probe, handler, stopped, report, serve)
+	}
+
+	if stopped != handler+1 {
+		t.Error("the drain handler's stop is not deferred immediately after it is installed")
 	}
 
 	if handler < probe || report < probe {
