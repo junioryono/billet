@@ -174,7 +174,7 @@ func TestGuestImageReleasesCannotTakeOverTheBinaryLatestChannel(t *testing.T) {
 		"if: github.ref == 'refs/heads/main'",
 		"contents: write",
 		"id-token: write",
-		"uses: actions/download-artifact@v5",
+		"run: scripts/fetch-guest-artifact.sh out",
 		"name: Install cosign",
 		"name: Sign the manifest",
 		"run: scripts/publish-guest-release.sh out",
