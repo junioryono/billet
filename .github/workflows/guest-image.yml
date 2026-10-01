@@ -471,14 +471,10 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      # ROOM FOR THE ARTIFACT, PROVED BEFORE IT IS FETCHED. The runner-images
-      # image packs to about 22GB, more than a hosted runner has free, and the
-      # download that ran out of disk reported success with files missing
-      # (2026-09-29). So the toolchains this job never uses are removed first, and
-      # the job refuses unless what is free holds the artifact with room to spare.
+      # ROOM FOR THE ARTIFACT. The runner-images image packs to about 20GB, and
+      # the zip and its contents exist at once, so the toolchains this job never
+      # uses go first; fetch-guest-artifact.sh proves the room before it writes.
       - name: Make room for the image
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -486,28 +482,15 @@ jobs:
             /usr/local/share/boost /usr/local/lib/node_modules \
             "$AGENT_TOOLSDIRECTORY" || true
           sudo apt-get clean
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
 
-          size=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
-            --jq '[.artifacts[] | select(.name == "guest-image") | .size_in_bytes] | first')
-          if ! [[ "$size" =~ ^[1-9][0-9]*$ ]]; then
-            echo "could not read the guest-image artifact's size (got '$size')" >&2
-            exit 1
-          fi
-
-          free=$(df --output=avail -B1 "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
-          needed=$(( size + 4 * 1024 * 1024 * 1024 ))
-          echo "the artifact is $(( size >> 30 ))GiB; $(( free >> 30 ))GiB free"
-          if [ "$free" -lt "$needed" ]; then
-            echo "only $(( free >> 30 ))GiB free for a $(( size >> 30 ))GiB artifact and its" >&2
-            echo "signature; this job cannot hold the image it would publish" >&2
-            exit 1
-          fi
-
+      # FETCHED THROUGH THE API AND HELD TO GITHUB'S DIGEST, not with
+      # actions/download-artifact, which twice stopped extracting this artifact part
+      # way through and reported success (actions/download-artifact#454).
       - name: Download the checked image
-        uses: actions/download-artifact@v5
-        with:
-          name: guest-image
-          path: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fetch-guest-artifact.sh out
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
