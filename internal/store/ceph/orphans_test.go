@@ -50,26 +50,53 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	snapsFail := orphanVolume(old, '3')
 	noWatchers := orphanVolume(old, '4')
 	halfRemoved := orphanVolume(old, '5')
+	lineage := orphanVolume(old, '8')
+	used := orphanVolume(old, '9')
+	unreadableUse := orphanVolume(old, '0')
+	publishing := orphanVolume(old.Add(2*time.Second), 'b')
+	moveUnconfirmed := orphanVolume(old.Add(time.Second), 'a')
 	generation := fmt.Sprintf("billet-cache/cache-g-%d-%s", old.Unix(), strings.Repeat("6", 24))
 	unparseable := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old.Unix())
 	padded := fmt.Sprintf("billet-cache/cache-v-0%d-%s", old.Unix(), strings.Repeat("7", 24))
 
 	for _, image := range []string{
 		orphan, young, watched, mapped, inSession, indexed, snapshotted, statusFails, snapsFail,
-		noWatchers, generation, unparseable, padded,
+		noWatchers, generation, unparseable, padded, lineage, used, unreadableUse, publishing,
+		moveUnconfirmed,
 	} {
 		f.images[image] = true
 	}
 	f.halfRemoved[halfRemoved] = true
 	f.watchers[watched] = 1
+	f.watchers[publishing] = 1
 	f.mappings["/dev/rbd9"] = mapped
 	f.snapshots[snapshotted+"@staging"] = true
+	f.trashSnapshots[lineage+"@retired"] = true
+	f.metadata[used] = map[string]string{
+		"billet.cache.used_at": now.Add(-time.Hour).Format(time.RFC3339Nano),
+	}
+	f.metadata[unreadableUse] = map[string]string{"billet.cache.used_at": "yesterday"}
 	f.metadata["billet-cache/.cache-index"] = map[string]string{
 		"billet.cache.active.x": `{"key":"k","handle":"` + indexed + `"}`,
 	}
 
 	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 		switch {
+		// ANOTHER NODE PUBLISHES IT between the snapshot list and the watchers:
+		// Snapshot writes used_at, then unmaps, so the watcher is gone by the time
+		// rbd answers.
+		case slices.Contains(args, "status") && slices.Contains(args, publishing):
+			f.metadata[publishing] = map[string]string{
+				"billet.cache.used_at": now.Format(time.RFC3339Nano),
+			}
+			delete(f.watchers, publishing)
+		case slices.Contains(args, "trash") && slices.Contains(args, "mv") &&
+			slices.Contains(args, moveUnconfirmed):
+			if _, err := f.run(ctx, bin, args); err != nil {
+				t.Fatalf("the fake refused the move: %v", err)
+			}
+
+			return nil, context.DeadlineExceeded
 		case slices.Contains(args, "status") && slices.Contains(args, statusFails):
 			return nil, errors.New("exit status 110: rbd: error: (110) Connection timed out")
 		case slices.Contains(args, "snap") && slices.Contains(args, "ls") && slices.Contains(args, snapsFail):
@@ -99,25 +126,30 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 
 	got := verdicts(report)
 	for image, want := range map[string]OrphanVerdict{
-		orphan:      OrphanMoved,
-		young:       OrphanTooYoung,
-		watched:     OrphanWatched,
-		mapped:      OrphanWatched,
-		inSession:   OrphanInSession,
-		indexed:     OrphanInIndex,
-		snapshotted: OrphanSnapshotted,
-		statusFails: OrphanUnknown,
-		snapsFail:   OrphanUnknown,
-		noWatchers:  OrphanUnknown,
-		halfRemoved: OrphanHalfRemoved,
-		generation:  OrphanGeneration,
-		unparseable: OrphanForeign,
-		padded:      OrphanForeign,
+		orphan:          OrphanMoved,
+		young:           OrphanTooYoung,
+		watched:         OrphanWatched,
+		mapped:          OrphanWatched,
+		inSession:       OrphanInSession,
+		indexed:         OrphanInIndex,
+		snapshotted:     OrphanSnapshotted,
+		statusFails:     OrphanUnknown,
+		snapsFail:       OrphanUnknown,
+		noWatchers:      OrphanUnknown,
+		halfRemoved:     OrphanHalfRemoved,
+		generation:      OrphanGeneration,
+		unparseable:     OrphanForeign,
+		padded:          OrphanForeign,
+		lineage:         OrphanSnapshotted,
+		used:            OrphanUsed,
+		unreadableUse:   OrphanUnknown,
+		publishing:      OrphanUsed,
+		moveUnconfirmed: OrphanMoveUnknown,
 	} {
 		if got[image] != want {
 			t.Errorf("%s: verdict %q, want %q", image, got[image], want)
 		}
-		if image == orphan {
+		if image == orphan || image == moveUnconfirmed {
 			continue
 		}
 		if trashMoved(f, image) {
@@ -264,6 +296,93 @@ func TestAnOrphanPassThatCannotReadTheIndexMovesNothing(t *testing.T) {
 
 	if !f.images[orphan] || trashMoved(f, orphan) {
 		t.Error("a volume was moved with the cache index unread")
+	}
+}
+
+// AN INDEX ANSWER THAT IS NOT THE INDEX JUDGES NOTHING. rbd prints the metadata
+// as one json object, or nothing for an index without any; anything else is not
+// a list this pass can stand on.
+func TestAnOrphanPassThatCannotParseTheIndexMovesNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	now := time.Now()
+	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
+	f.images[orphan] = true
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "image-meta") && slices.Contains(args, "list") {
+			return []byte("There are 2 metadata on this image:\n"), nil
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.clock = func() time.Time { return now }
+
+	if _, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+		OlderThan: DefaultOrphanAge, Limit: 10, Reclaim: true, InSession: func(string) bool { return false },
+	}); err == nil {
+		t.Error("a pass went ahead on an index answer it could not read")
+	}
+
+	if !f.images[orphan] || trashMoved(f, orphan) {
+		t.Error("a volume was moved with the cache index unparsed")
+	}
+}
+
+// A MAPPING TABLE THAT NAMES THE VOLUME PROTECTS IT, however incomplete the
+// entry, and one this pass cannot read is could-not-tell rather than "not
+// mapped".
+func TestAnOrphanPassTakesNoProofFromAMappingItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
+	_, name, _ := strings.Cut(orphan, "/")
+
+	for answer, want := range map[string]OrphanVerdict{
+		`[{"pool":"billet-cache","name":"` + name + `"}]`:       OrphanWatched,
+		`[{"pool":"other","name":"` + name + `","device":"x"}]`: OrphanWatched,
+		`[{}]`:   OrphanUnknown,
+		`[null]`: OrphanUnknown,
+		`null`:   OrphanUnknown,
+	} {
+		f := newCacheFake()
+		f.images[orphan] = true
+
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "device") && slices.Contains(args, "list") {
+				return []byte(answer), nil
+			}
+
+			return f.run(ctx, bin, args)
+		}
+
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		c.clock = func() time.Time { return now }
+
+		report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+			OlderThan: DefaultOrphanAge, Limit: 10, Reclaim: true, InSession: func(string) bool { return false },
+		})
+		if err != nil {
+			t.Fatalf("%s: ReclaimOrphans: %v", answer, err)
+		}
+
+		if got := verdicts(report)[orphan]; got != want {
+			t.Errorf("device list %s: verdict %q, want %q", answer, got, want)
+		}
+
+		if trashMoved(f, orphan) {
+			t.Errorf("device list %s: the volume was moved", answer)
+		}
 	}
 }
 

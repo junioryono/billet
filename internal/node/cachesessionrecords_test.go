@@ -93,4 +93,35 @@ func TestCacheSessionRecordsRefuseWhatTheyCannotRead(t *testing.T) {
 	if _, err := ReadCacheSessionRecords(dir); err == nil || errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("a linked record read as %v, want a refusal", err)
 	}
+
+	for _, body := range []string{"", `{"slots":[{"volume":{"handle":"billet-cache/cache-v-17`} {
+		torn := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(torn, cacheSessionDirectory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		record := filepath.Join(torn, cacheSessionDirectory, "0a.json")
+		if err := os.WriteFile(record, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := ReadCacheSessionRecords(torn); err == nil {
+			t.Errorf("a torn record %q was read as one that names nothing", body)
+		}
+	}
+
+	// A STAGED RECORD MAY BE CAUGHT HALF WRITTEN, and still names what it names.
+	staged := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(staged, cacheSessionDirectory), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	partial := `{"slots":[{"volume":{"handle":"` + heldVolume
+	if err := os.WriteFile(filepath.Join(staged, cacheSessionDirectory, ".session-123"), []byte(partial),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := ReadCacheSessionRecords(staged)
+	if err != nil || !records.Mentions("cache-v-1790000000-0123456789abcdef01234567") {
+		t.Errorf("a staged record was refused or lost its name: %v", err)
+	}
 }

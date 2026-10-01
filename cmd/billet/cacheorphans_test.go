@@ -37,6 +37,8 @@ func TestCacheOrphansPrintsEachVerdictAndFailsOnCouldNotTell(t *testing.T) {
 			Err: errors.New("ceph: read the watchers: timed out")},
 		{Name: "cache-v-1790000002-cccccccccccccccccccccccc", Named: named, Verdict: ceph.OrphanWatched},
 		{Name: "cache-g-1790000003-dddddddddddddddddddddddd", Named: named, Verdict: ceph.OrphanGeneration},
+		{Name: "cache-v-1790000004-eeeeeeeeeeeeeeeeeeeeeeee", Named: named, Verdict: ceph.OrphanMoveUnknown,
+			Err: errors.New("ceph: move to the trash, which may have happened: deadline exceeded")},
 	}}}
 
 	var out bytes.Buffer
@@ -45,8 +47,11 @@ func TestCacheOrphansPrintsEachVerdictAndFailsOnCouldNotTell(t *testing.T) {
 	err := reclaimCacheOrphans(t.Context(), &out, store, opts)
 
 	var exit *exitError
-	if !errors.As(err, &exit) || exit.code != 1 {
-		t.Errorf("a could-not-tell volume returned %v, want exit status 1", err)
+	if !errors.As(err, &exit) || exit.code != 1 ||
+		!strings.Contains(exit.msg, "1 cache volume(s) could not be judged") ||
+		!strings.Contains(exit.msg, "1 move(s) to the trash were not confirmed") {
+		t.Errorf("a could-not-tell volume and an unconfirmed move returned %v, want exit status 1 "+
+			"naming both", err)
 	}
 
 	if store.opts.Reclaim || store.opts.Limit != 7 || store.opts.InSession == nil {

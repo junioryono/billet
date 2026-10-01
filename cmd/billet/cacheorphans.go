@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"slices"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -77,9 +78,9 @@ func cacheSessionRecords(cfg *config.Config) (node.CacheSessionRecords, error) {
 
 // orphanListed are the verdicts printed one line per image; the rest are counted.
 var orphanListed = []ceph.OrphanVerdict{
-	ceph.OrphanReclaimable, ceph.OrphanMoved, ceph.OrphanUnknown, ceph.OrphanWatched,
-	ceph.OrphanSnapshotted, ceph.OrphanInSession, ceph.OrphanInIndex, ceph.OrphanHalfRemoved,
-	ceph.OrphanGone,
+	ceph.OrphanReclaimable, ceph.OrphanMoved, ceph.OrphanMoveUnknown, ceph.OrphanUnknown,
+	ceph.OrphanWatched, ceph.OrphanSnapshotted, ceph.OrphanUsed, ceph.OrphanInSession,
+	ceph.OrphanInIndex, ceph.OrphanHalfRemoved, ceph.OrphanGone,
 }
 
 var orphanCounted = slices.Concat(orphanListed, []ceph.OrphanVerdict{
@@ -132,8 +133,16 @@ func reclaimCacheOrphans(
 			report.Count(ceph.OrphanMoved))
 	}
 
+	var failures []string
 	if n := report.Count(ceph.OrphanUnknown); n > 0 {
-		return &exitError{code: 1, msg: fmt.Sprintf("%d cache volume(s) could not be judged and were kept", n)}
+		failures = append(failures, fmt.Sprintf("%d cache volume(s) could not be judged and were kept", n))
+	}
+	if n := report.Count(ceph.OrphanMoveUnknown); n > 0 {
+		failures = append(failures, fmt.Sprintf("%d move(s) to the trash were not confirmed and may "+
+			"have happened", n))
+	}
+	if len(failures) > 0 {
+		return &exitError{code: 1, msg: strings.Join(failures, "; ")}
 	}
 
 	return nil

@@ -44,9 +44,12 @@ const (
 	OrphanDeferred    OrphanVerdict = "beyond this pass's limit"
 	OrphanWatched     OrphanVerdict = "held open by a client"
 	OrphanSnapshotted OrphanVerdict = "has snapshots"
+	OrphanUsed        OrphanVerdict = "snapshotted for publication too recently"
 	OrphanHalfRemoved OrphanVerdict = "half-removed, which the purge finishes"
 	OrphanGone        OrphanVerdict = "gone"
 	OrphanUnknown     OrphanVerdict = "could not tell"
+	// OrphanMoveUnknown is a move rbd did not confirm, which may have happened.
+	OrphanMoveUnknown OrphanVerdict = "move not confirmed"
 )
 
 // OrphanOptions shapes one ReclaimOrphans pass. Its zero value is refused.
@@ -98,17 +101,23 @@ func (r OrphanReport) Count(verdict OrphanVerdict) int {
 // name cacheName gives a writable volume (a generation is never a candidate);
 // named at least OlderThan ago; named by no cache session this node keeps and by
 // no record in the cache index; and then, asking rbd, no snapshot in any
-// namespace, so no generation's lineage reads it; no mapping on this host; and no
-// watcher, so no client anywhere has it open. Any answer rbd gives other than
-// those keeps the image as OrphanUnknown.
+// namespace, so no generation's lineage reads it; no mapping on this host; no
+// watcher, so no client anywhere has it open; and no `used_at` Snapshot wrote
+// within OlderThan. Any answer rbd gives other than those keeps the image as
+// OrphanUnknown.
 //
-// THE WATCHER CHECK IS THE ONLY GUARD AGAINST AN IMAGE IN USE. `rbd trash mv`
-// refuses only an image whose exclusive lock it cannot take, which a volume Create
-// makes does not have and a krbd mapping of a clone hands over on request, so it
-// moves a mapped image (librbd Trash::move, Ceph v19.2.2, read rather than
-// measured). Nothing maps a volume after the job that named it,
-// so the age bound is what keeps a volume from being mapped between the check
-// and the move. The purge's `trash rm` does refuse an image with watchers.
+// THE WATCHER CHECK IS THE GUARD AGAINST AN IMAGE IN USE. `rbd trash mv` refuses
+// only an image whose exclusive lock it cannot take, which a volume Create makes
+// does not have and a krbd mapping of a clone hands over on request, so it moves
+// a mapped image (librbd Trash::move, Ceph v19.2.2, read rather than measured).
+// Nothing maps a volume after the job that named it, so the age bound is what
+// keeps a volume from being mapped between the check and the move. The purge's
+// `trash rm` does refuse an image with watchers.
+//
+// `used_at` IS READ AFTER THE WATCHERS. Snapshot, on any node, writes it on the
+// volume before it unmaps it to take the publication's snapshot, so a volume
+// whose watcher is gone because its job is publishing shows a fresh `used_at` to
+// any read that follows the watcher check.
 //
 // INTO THE TRASH, NEVER `rbd rm`, for the reason discardCacheVolume gives.
 func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (OrphanReport, error) {
@@ -128,19 +137,10 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 		return OrphanReport{}, err
 	}
 
-	// A cold site has no index image, which is rbd saying no record exists; any
-	// other failure is could-not-tell for every image.
-	metadata, err := c.cacheIndexMetadata(ctx)
-	if err != nil && !isNoSuchFile(err) {
+	index, err := c.cacheIndexText(ctx)
+	if err != nil {
 		return OrphanReport{}, err
 	}
-
-	var records strings.Builder
-	for key, value := range metadata {
-		records.WriteString(key + " " + value + "\n")
-	}
-
-	index := records.String()
 
 	images := make([]OrphanImage, 0, len(names))
 	for _, name := range names {
@@ -180,16 +180,76 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 			}
 
 			asked++
-			image.Verdict, image.Err = c.judgeOrphan(ctx, c.cfg.CachePool+"/"+image.Name, opts.Reclaim)
+			image.Verdict, image.Err = c.judgeOrphan(ctx, image.Name, opts, now)
 		}
 	}
 
 	return OrphanReport{Images: images}, nil
 }
 
+// cacheIndexText is every key and value the cache index holds, as one string to
+// search. It asks for json, which rbd prints as one object, or nothing at all
+// for an index with no metadata; a cold site with no index image holds no record.
+func (c *Client) cacheIndexText(ctx context.Context) (string, error) {
+	out, err := c.rbdCmd(ctx, true, "image-meta", "list", c.cacheIndex())
+	if err != nil {
+		if isNoSuchFile(err) {
+			return "", nil
+		}
+
+		return "", fmt.Errorf("ceph: list the cache index: %w", err)
+	}
+
+	if len(trimSpace(out)) == 0 {
+		return "", nil
+	}
+
+	var metadata map[string]string
+	if err := json.Unmarshal(out, &metadata); err != nil || metadata == nil {
+		return "", fmt.Errorf("ceph: %s did not answer with the cache index as a json object", c.bin)
+	}
+
+	var text strings.Builder
+	for key, value := range metadata {
+		text.WriteString(key + " " + value + "\n")
+	}
+
+	return text.String(), nil
+}
+
+// mappedHere reports whether this host maps an image of that name from any pool.
+// An entry it cannot read is could-not-tell, never "not this one".
+func (c *Client) mappedHere(ctx context.Context, name string) (bool, error) {
+	out, err := c.rbdCmd(ctx, true, "device", "list")
+	if err != nil {
+		return false, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
+	}
+
+	var devices []*mappedDevice
+	if err := json.Unmarshal(trimSpace(out), &devices); err != nil || devices == nil {
+		return false, fmt.Errorf("ceph: %s did not answer with a json device list", c.bin)
+	}
+
+	for _, device := range devices {
+		if device == nil || device.Pool == "" || device.Name == "" {
+			return false, fmt.Errorf("ceph: %s listed a mapped device without its pool and image", c.bin)
+		}
+
+		if device.Name == name {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // judgeOrphan asks rbd about one old, unnamed writable volume and, when reclaim
 // is set and nothing holds it, moves it to the trash.
-func (c *Client) judgeOrphan(ctx context.Context, handle string, reclaim bool) (OrphanVerdict, error) {
+func (c *Client) judgeOrphan(
+	ctx context.Context, name string, opts OrphanOptions, now time.Time,
+) (OrphanVerdict, error) {
+	handle := c.cfg.CachePool + "/" + name
+
 	out, err := c.rbdCmd(ctx, true, "snap", "ls", "--all", handle)
 	if err != nil {
 		if isNoSuchFile(err) {
@@ -208,18 +268,14 @@ func (c *Client) judgeOrphan(ctx context.Context, handle string, reclaim bool) (
 		return OrphanSnapshotted, nil
 	}
 
-	_, name, _ := strings.Cut(handle, "/")
-
-	mapped, err := c.mappedDevices(ctx, name)
+	mapped, err := c.mappedHere(ctx, name)
 	if err != nil {
 		return OrphanUnknown, err
 	}
-	if len(mapped) > 0 {
+	if mapped {
 		return OrphanWatched, nil
 	}
 
-	// THE WATCHERS LAST, immediately before the move, so the window between the
-	// answer and the action is one command long.
 	out, err = c.rbdCmd(ctx, true, "status", handle)
 	if err != nil {
 		if isNoSuchFile(err) {
@@ -239,7 +295,24 @@ func (c *Client) judgeOrphan(ctx context.Context, handle string, reclaim bool) (
 		return OrphanWatched, nil
 	}
 
-	if !reclaim {
+	// AFTER THE WATCHERS, for the reason ReclaimOrphans gives.
+	value, found, err := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at")
+	if err != nil {
+		return OrphanUnknown, err
+	}
+	if found {
+		usedAt, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return OrphanUnknown, fmt.Errorf("ceph: %s records an unreadable use time %s", handle,
+				bounded(value))
+		}
+
+		if now.Sub(usedAt) < opts.OlderThan {
+			return OrphanUsed, nil
+		}
+	}
+
+	if !opts.Reclaim {
 		return OrphanReclaimable, nil
 	}
 
@@ -253,7 +326,8 @@ func (c *Client) judgeOrphan(ctx context.Context, handle string, reclaim bool) (
 			return OrphanGone, nil
 		}
 
-		return OrphanUnknown, fmt.Errorf("ceph: move %s to the trash: %w", handle, err)
+		return OrphanMoveUnknown, fmt.Errorf("ceph: move %s to the trash, which may have happened: %w",
+			handle, err)
 	}
 
 	return OrphanMoved, nil

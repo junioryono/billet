@@ -55,6 +55,9 @@ type cacheFake struct {
 	halfRemoved map[string]bool
 	// watchers counts the clients `rbd status` reports holding an image open.
 	watchers map[string]int
+	// trashSnapshots are snapshots in the trash namespace, which a generation's
+	// clone keeps; `rbd snap ls` shows them only with --all.
+	trashSnapshots map[string]bool
 }
 
 type cacheExitError struct {
@@ -79,6 +82,8 @@ func newCacheFake() *cacheFake {
 		removeLocked: map[string]bool{},
 		halfRemoved:  map[string]bool{},
 		watchers:     map[string]int{},
+
+		trashSnapshots: map[string]bool{},
 	}
 }
 
@@ -94,7 +99,7 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 	}
 
 	if i := slices.Index(args, "image-meta"); i >= 0 {
-		return f.imageMeta(args[i+1:])
+		return f.imageMeta(args[i+1:], slices.Contains(args[:i], "json"))
 	}
 
 	if i := slices.Index(args, "device"); i >= 0 {
@@ -257,7 +262,7 @@ func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 	}
 }
 
-func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
+func (f *cacheFake) imageMeta(args []string, asJSON bool) ([]byte, error) {
 	verb, image := args[0], args[1]
 	// A cold site has no cache-index image yet, so rbd answers ENOENT to any
 	// image-meta command against it. Model that when the test asks for it, so a
@@ -305,6 +310,15 @@ func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
 	case "list":
 		if f.metaListErr != nil {
 			return nil, f.metaListErr
+		}
+		// As json rbd prints one object, or nothing at all for an image with no
+		// metadata (do_metadata_list, Ceph v19.2.2).
+		if asJSON {
+			if len(f.metadata[image]) == 0 {
+				return nil, nil
+			}
+
+			return json.Marshal(f.metadata[image])
 		}
 		var lines []string
 		for key, value := range f.metadata[image] {
@@ -402,10 +416,17 @@ func (f *cacheFake) snap(args []string) ([]byte, error) {
 			Name string `json:"name"`
 		}
 
+		listed := []map[string]bool{f.snapshots}
+		if slices.Contains(args, "--all") {
+			listed = append(listed, f.trashSnapshots)
+		}
+
 		snapshots := []entry{}
-		for snapshot := range f.snapshots {
-			if name, ok := strings.CutPrefix(snapshot, image+"@"); ok {
-				snapshots = append(snapshots, entry{Name: name})
+		for _, set := range listed {
+			for snapshot := range set {
+				if name, ok := strings.CutPrefix(snapshot, image+"@"); ok {
+					snapshots = append(snapshots, entry{Name: name})
+				}
 			}
 		}
 

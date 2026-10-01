@@ -127,6 +127,12 @@ func ReadCacheSessionRecords(stateDir string) (CacheSessionRecords, error) {
 		if err != nil {
 			return CacheSessionRecords{}, fmt.Errorf("node: read cache custody %s: %w", entry.Name(), err)
 		}
+		// AN INSTALLED RECORD MUST BE WHOLE, because one that is not may have lost
+		// the name it held; the node installed it by rename, so a torn one is
+		// damage. A staged one may be partial and only adds names.
+		if strings.HasSuffix(entry.Name(), ".json") && !json.Valid(body) {
+			return CacheSessionRecords{}, fmt.Errorf("node: cache custody %s is not valid json", entry.Name())
+		}
 
 		records.bodies = append(records.bodies, body)
 	}
