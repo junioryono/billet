@@ -257,6 +257,108 @@ func TestAnOrphanPassIsBoundedAndWorksOldestFirst(t *testing.T) {
 	}
 }
 
+// A LISTED OR UNCONFIRMED VOLUME IS TAKEN TOO. A listing names no more than the
+// limit, and a move rbd did not confirm, which may have happened, counts as one.
+func TestAListingAndAnUnconfirmedMoveCountAgainstTheLimit(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	first := orphanVolume(now.Add(-20*24*time.Hour), 'a')
+	second := orphanVolume(now.Add(-10*24*time.Hour), 'b')
+
+	for _, reclaim := range []bool{false, true} {
+		f := newCacheFake()
+		f.images[first] = true
+		f.images[second] = true
+
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "trash") && slices.Contains(args, "mv") && slices.Contains(args, first) {
+				if _, err := f.run(ctx, bin, args); err != nil {
+					t.Fatalf("the fake refused the move: %v", err)
+				}
+
+				return nil, context.DeadlineExceeded
+			}
+
+			return f.run(ctx, bin, args)
+		}
+
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		c.clock = func() time.Time { return now }
+
+		report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+			OlderThan: DefaultOrphanAge, Limit: 1, Reclaim: reclaim, InSession: func(string) bool { return false },
+		})
+		if err != nil {
+			t.Fatalf("ReclaimOrphans: %v", err)
+		}
+
+		want := OrphanReclaimable
+		if reclaim {
+			want = OrphanMoveUnknown
+		}
+
+		got := verdicts(report)
+		if got[first] != want || got[second] != OrphanDeferred {
+			t.Errorf("reclaim %t: verdicts %v; want the first %q and the second deferred", reclaim, got, want)
+		}
+
+		if f.ranWith("status", second) || trashMoved(f, second) {
+			t.Errorf("reclaim %t: a volume past the limit was asked about or moved", reclaim)
+		}
+	}
+}
+
+// A VOLUME'S METADATA ANSWER THAT IS NOT A LIST KEEPS IT. The use time is read
+// from that list, so an answer it cannot read is no proof the volume is unused.
+func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	orphan := orphanVolume(now.Add(-10*24*time.Hour), 'a')
+
+	for name, answer := range map[string]func() ([]byte, error){
+		"null":     func() ([]byte, error) { return []byte("null"), nil },
+		"text":     func() ([]byte, error) { return []byte("There is 1 metadatum on this image:"), nil },
+		"an error": func() ([]byte, error) { return nil, errors.New("exit status 5: rbd: (5) Input/output error") },
+	} {
+		f := newCacheFake()
+		f.images[orphan] = true
+
+		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "image-meta") && slices.Contains(args, orphan) {
+				return answer()
+			}
+
+			return f.run(ctx, bin, args)
+		}
+
+		c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		c.clock = func() time.Time { return now }
+
+		report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+			OlderThan: DefaultOrphanAge, Limit: 10, Reclaim: true, InSession: func(string) bool { return false },
+		})
+		if err != nil {
+			t.Fatalf("%s: ReclaimOrphans: %v", name, err)
+		}
+
+		if len(report.Images) != 1 || report.Images[0].Verdict != OrphanUnknown || report.Images[0].Err == nil {
+			t.Errorf("%s: report %+v; want the volume could-not-tell, with a reason", name, report.Images)
+		}
+
+		if trashMoved(f, orphan) {
+			t.Errorf("%s: the volume was moved", name)
+		}
+	}
+}
+
 // WHAT A PASS KEEPS DOES NOT USE UP ITS LIMIT. Older volumes kept on every pass,
 // such as half-removed ones the purge is still finishing, would otherwise hold
 // the orphans behind them back forever.

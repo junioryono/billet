@@ -102,6 +102,9 @@ func (r CacheSessionRecords) Mentions(name string) bool {
 // directory, staged ones included, for a process other than the node. A
 // directory that does not exist wraps fs.ErrNotExist; an entry that cannot be
 // read as a regular file is an error, never an empty record.
+//
+// NO ERROR NAMES A RECORD'S FILE, because an installed record is named by its
+// session's bearer; a record is identified by its place in the listing.
 func ReadCacheSessionRecords(stateDir string) (CacheSessionRecords, error) {
 	directory := filepath.Join(stateDir, cacheSessionDirectory)
 
@@ -112,9 +115,10 @@ func ReadCacheSessionRecords(stateDir string) (CacheSessionRecords, error) {
 	}
 
 	var records CacheSessionRecords
-	for _, entry := range entries {
+	for i, entry := range entries {
 		if entry.IsDir() {
-			continue
+			return CacheSessionRecords{}, fmt.Errorf("node: cache custody entry %d of %d is a directory",
+				i+1, len(entries))
 		}
 
 		body, err := regularfile.ReadFile(filepath.Join(directory, entry.Name()), cacheSessionRecordLimit,
@@ -125,19 +129,30 @@ func ReadCacheSessionRecords(stateDir string) (CacheSessionRecords, error) {
 			continue
 		}
 		if err != nil {
-			return CacheSessionRecords{}, fmt.Errorf("node: read cache custody %s: %w", entry.Name(), err)
+			return CacheSessionRecords{}, fmt.Errorf("node: read cache custody entry %d of %d: %w",
+				i+1, len(entries), withoutPath(err))
 		}
 		// AN INSTALLED RECORD MUST BE WHOLE, because one that is not may have lost
 		// the name it held; the node installed it by rename, so a torn one is
 		// damage. A staged one may be partial and only adds names.
 		if strings.HasSuffix(entry.Name(), ".json") && !json.Valid(body) {
-			return CacheSessionRecords{}, fmt.Errorf("node: cache custody %s is not valid json", entry.Name())
+			return CacheSessionRecords{}, fmt.Errorf("node: cache custody entry %d of %d is not valid json",
+				i+1, len(entries))
 		}
 
 		records.bodies = append(records.bodies, body)
 	}
 
 	return records, nil
+}
+
+// withoutPath is a path error's cause without the path.
+func withoutPath(err error) error {
+	if pathErr, ok := errors.AsType[*fs.PathError](err); ok {
+		return fmt.Errorf("%s: %w", pathErr.Op, pathErr.Err)
+	}
+
+	return errors.New("the record could not be read")
 }
 
 func (s *CacheService) loadSessions() error {

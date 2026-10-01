@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/provider"
@@ -86,12 +87,26 @@ func TestCacheSessionRecordsRefuseWhatTheyCannotRead(t *testing.T) {
 	if err := os.WriteFile(target, []byte(`{"volume":"`+heldVolume+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(target, filepath.Join(sessions, "linked.json")); err != nil {
+	const recordID = "5f0c3a9e1d7b2468ace013579bdf2468ace013579bdf2468ace013579bdf2468"
+	if err := os.Symlink(target, filepath.Join(sessions, recordID+".json")); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := ReadCacheSessionRecords(dir); err == nil || errors.Is(err, fs.ErrNotExist) {
+	_, err := ReadCacheSessionRecords(dir)
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("a linked record read as %v, want a refusal", err)
+	}
+	if err != nil && strings.Contains(err.Error(), recordID) {
+		t.Errorf("the refusal names the record's bearer: %v", err)
+	}
+
+	// A DIRECTORY WHERE A RECORD SHOULD BE is not an absent record.
+	occupied := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(occupied, cacheSessionDirectory, recordID+".json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadCacheSessionRecords(occupied); err == nil {
+		t.Error("a directory at a record's name was read as no record")
 	}
 
 	for _, body := range []string{"", `{"slots":[{"volume":{"handle":"billet-cache/cache-v-17`} {
@@ -99,13 +114,16 @@ func TestCacheSessionRecordsRefuseWhatTheyCannotRead(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(torn, cacheSessionDirectory), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		record := filepath.Join(torn, cacheSessionDirectory, "0a.json")
+		record := filepath.Join(torn, cacheSessionDirectory, recordID+".json")
 		if err := os.WriteFile(record, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
-		if _, err := ReadCacheSessionRecords(torn); err == nil {
+		_, err := ReadCacheSessionRecords(torn)
+		if err == nil {
 			t.Errorf("a torn record %q was read as one that names nothing", body)
+		} else if strings.Contains(err.Error(), recordID) {
+			t.Errorf("the refusal of a torn record names its bearer: %v", err)
 		}
 	}
 
