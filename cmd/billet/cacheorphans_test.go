@@ -77,6 +77,33 @@ func TestCacheOrphansPrintsEachVerdictAndFailsOnCouldNotTell(t *testing.T) {
 	}
 }
 
+// A MOVE RBD DID NOT CONFIRM FAILS THE COMMAND ON ITS OWN, because it may have
+// happened and the operator has to look.
+func TestCacheOrphansFailsOnAnUnconfirmedMove(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeOrphanStore{report: ceph.OrphanReport{Images: []ceph.OrphanImage{
+		{Name: "cache-v-1790000000-aaaaaaaaaaaaaaaaaaaaaaaa", Verdict: ceph.OrphanMoved},
+		{Name: "cache-v-1790000004-eeeeeeeeeeeeeeeeeeeeeeee", Verdict: ceph.OrphanMoveUnknown,
+			Err: errors.New("deadline exceeded")},
+	}}}
+
+	var out bytes.Buffer
+
+	err := reclaimCacheOrphans(t.Context(), &out, store, ceph.OrphanOptions{
+		OlderThan: ceph.DefaultOrphanAge, Limit: 7, Reclaim: true, InSession: func(string) bool { return false },
+	})
+
+	var exit *exitError
+	if !errors.As(err, &exit) || exit.code != 1 || !strings.Contains(exit.msg, "not confirmed") {
+		t.Errorf("an unconfirmed move returned %v, want exit status 1 saying so", err)
+	}
+
+	if !strings.Contains(out.String(), "moved 1 volume(s) to the trash") {
+		t.Errorf("output does not count the confirmed move:\n%s", out.String())
+	}
+}
+
 // squeeze collapses tabwriter padding to two spaces, so an assertion names the
 // columns and not their widths.
 func squeeze(s string) string {

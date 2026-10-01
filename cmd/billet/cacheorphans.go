@@ -29,7 +29,7 @@ func cmdCacheOrphans(ctx context.Context, args []string) error {
 	cfgPath := addConfigFlag(fs)
 	olderThan := fs.Duration("older-than", ceph.DefaultOrphanAge,
 		fmt.Sprintf("how long ago a volume must have been named, at least %s", ceph.OrphanMinimumAge))
-	limit := fs.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass asks rbd about")
+	limit := fs.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass moves, or lists as reclaimable")
 	reclaim := fs.Bool("reclaim", false, "move what the listing calls reclaimable to the trash; "+
 		"without it nothing is changed")
 	if err := parse(fs, args); err != nil {
@@ -96,7 +96,7 @@ func reclaimCacheOrphans(
 	}
 
 	fmt.Fprintf(w, "%d cache image(s) listed; a writable volume is judged when it was named at "+
-		"least %s ago, at most %d per pass\n\n", len(report.Images), opts.OlderThan, opts.Limit)
+		"least %s ago, and at most %d are taken per pass\n\n", len(report.Images), opts.OlderThan, opts.Limit)
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, verdict := range orphanListed {

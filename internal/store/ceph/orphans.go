@@ -46,7 +46,7 @@ const (
 	OrphanSnapshotted OrphanVerdict = "has snapshots"
 	OrphanUsed        OrphanVerdict = "snapshotted for publication too recently"
 	OrphanHalfRemoved OrphanVerdict = "half-removed, which the purge finishes"
-	OrphanGone        OrphanVerdict = "gone"
+	OrphanGone        OrphanVerdict = "no longer listed under its name"
 	OrphanUnknown     OrphanVerdict = "could not tell"
 	// OrphanMoveUnknown is a move rbd did not confirm, which may have happened.
 	OrphanMoveUnknown OrphanVerdict = "move not confirmed"
@@ -57,8 +57,9 @@ type OrphanOptions struct {
 	// OlderThan is how long ago a volume must have been named, at least
 	// OrphanMinimumAge.
 	OlderThan time.Duration
-	// Limit bounds how many images one pass asks rbd about, and so how many it
-	// can move.
+	// Limit bounds how many volumes one pass moves, or lists as reclaimable,
+	// and so what it hands the purge; every older volume it keeps is asked
+	// about on the way.
 	Limit int
 	// Reclaim moves what qualifies to the trash; without it the pass only lists.
 	Reclaim bool
@@ -153,7 +154,7 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 	slices.SortStableFunc(images, func(a, b OrphanImage) int { return a.Named.Compare(b.Named) })
 
 	now := c.now()
-	asked := 0
+	taken := 0
 
 	for i := range images {
 		image := &images[i]
@@ -170,7 +171,7 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 			image.Verdict = OrphanInSession
 		case strings.Contains(index, image.Name):
 			image.Verdict = OrphanInIndex
-		case asked >= opts.Limit:
+		case taken >= opts.Limit:
 			image.Verdict = OrphanDeferred
 		default:
 			if err := ctx.Err(); err != nil {
@@ -179,8 +180,15 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 				continue
 			}
 
-			asked++
 			image.Verdict, image.Err = c.judgeOrphan(ctx, image.Name, opts, now)
+
+			// ONLY WHAT IS TAKEN COUNTS, so the volumes a pass keeps (half-removed
+			// ones the purge is still finishing, above all) never use up the
+			// limit of every later pass ahead of the orphans behind them.
+			switch image.Verdict {
+			case OrphanReclaimable, OrphanMoved, OrphanMoveUnknown:
+				taken++
+			}
 		}
 	}
 
@@ -295,12 +303,27 @@ func (c *Client) judgeOrphan(
 		return OrphanWatched, nil
 	}
 
-	// AFTER THE WATCHERS, for the reason ReclaimOrphans gives.
-	value, found, err := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at")
+	// AFTER THE WATCHERS, for the reason ReclaimOrphans gives, and as the whole
+	// metadata list: a get answers ENOENT alike for a missing key and a missing
+	// image, and only the first says the volume was never published from.
+	out, err = c.rbdCmd(ctx, true, "image-meta", "list", handle)
 	if err != nil {
-		return OrphanUnknown, err
+		if isNoSuchFile(err) {
+			return OrphanGone, nil
+		}
+
+		return OrphanUnknown, fmt.Errorf("ceph: read the metadata of %s: %w", handle, err)
 	}
-	if found {
+
+	metadata := map[string]string{}
+	if len(trimSpace(out)) > 0 {
+		if err := json.Unmarshal(out, &metadata); err != nil || metadata == nil {
+			return OrphanUnknown, fmt.Errorf("ceph: %s did not answer with the metadata of %s as a json "+
+				"object", c.bin, handle)
+		}
+	}
+
+	if value, found := metadata[cacheMetaPrefix+"used_at"]; found {
 		usedAt, err := time.Parse(time.RFC3339Nano, value)
 		if err != nil {
 			return OrphanUnknown, fmt.Errorf("ceph: %s records an unreadable use time %s", handle,

@@ -55,6 +55,7 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	unreadableUse := orphanVolume(old, '0')
 	publishing := orphanVolume(old.Add(2*time.Second), 'b')
 	moveUnconfirmed := orphanVolume(old.Add(time.Second), 'a')
+	vanishing := orphanVolume(old.Add(3*time.Second), 'a')
 	generation := fmt.Sprintf("billet-cache/cache-g-%d-%s", old.Unix(), strings.Repeat("6", 24))
 	unparseable := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old.Unix())
 	padded := fmt.Sprintf("billet-cache/cache-v-0%d-%s", old.Unix(), strings.Repeat("7", 24))
@@ -62,7 +63,7 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	for _, image := range []string{
 		orphan, young, watched, mapped, inSession, indexed, snapshotted, statusFails, snapsFail,
 		noWatchers, generation, unparseable, padded, lineage, used, unreadableUse, publishing,
-		moveUnconfirmed,
+		moveUnconfirmed, vanishing,
 	} {
 		f.images[image] = true
 	}
@@ -97,6 +98,12 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 			}
 
 			return nil, context.DeadlineExceeded
+		// REMOVED BY SOMEONE ELSE after its watchers were read: its metadata
+		// cannot be listed, which is not the same as having no use time.
+		case slices.Contains(args, "image-meta") && slices.Contains(args, vanishing):
+			delete(f.images, vanishing)
+
+			return nil, errors.New("exit status 2: rbd: error opening image: (2) No such file or directory")
 		case slices.Contains(args, "status") && slices.Contains(args, statusFails):
 			return nil, errors.New("exit status 110: rbd: error: (110) Connection timed out")
 		case slices.Contains(args, "snap") && slices.Contains(args, "ls") && slices.Contains(args, snapsFail):
@@ -145,6 +152,7 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 		unreadableUse:   OrphanUnknown,
 		publishing:      OrphanUsed,
 		moveUnconfirmed: OrphanMoveUnknown,
+		vanishing:       OrphanGone,
 	} {
 		if got[image] != want {
 			t.Errorf("%s: verdict %q, want %q", image, got[image], want)
@@ -246,6 +254,40 @@ func TestAnOrphanPassIsBoundedAndWorksOldestFirst(t *testing.T) {
 	if report.Count(OrphanMoved) != 2 || report.Count(OrphanDeferred) != 1 {
 		t.Errorf("counted %d moved and %d deferred, want 2 and 1",
 			report.Count(OrphanMoved), report.Count(OrphanDeferred))
+	}
+}
+
+// WHAT A PASS KEEPS DOES NOT USE UP ITS LIMIT. Older volumes kept on every pass,
+// such as half-removed ones the purge is still finishing, would otherwise hold
+// the orphans behind them back forever.
+func TestKeptVolumesDoNotUseUpAnOrphanPassLimit(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	now := time.Now()
+	halfRemoved := orphanVolume(now.Add(-30*24*time.Hour), 'c')
+	snapshotted := orphanVolume(now.Add(-20*24*time.Hour), 'b')
+	orphan := orphanVolume(now.Add(-10*24*time.Hour), 'a')
+
+	f.halfRemoved[halfRemoved] = true
+	f.images[snapshotted] = true
+	f.snapshots[snapshotted+"@staging"] = true
+	f.images[orphan] = true
+
+	c := cacheClient(t, f)
+	c.clock = func() time.Time { return now }
+
+	report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+		OlderThan: DefaultOrphanAge, Limit: 1, Reclaim: true, InSession: func(string) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("ReclaimOrphans: %v", err)
+	}
+
+	got := verdicts(report)
+	if got[halfRemoved] != OrphanHalfRemoved || got[snapshotted] != OrphanSnapshotted ||
+		got[orphan] != OrphanMoved {
+		t.Errorf("verdicts %v; want the two kept and the orphan behind them moved", got)
 	}
 }
 
