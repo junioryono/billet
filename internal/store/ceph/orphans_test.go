@@ -24,10 +24,25 @@ func verdicts(report OrphanReport) map[string]OrphanVerdict {
 	return out
 }
 
-// addVolume lists an image the cluster created long before any test's now.
+// addVolume lists an image the cluster created when its name says.
 func (f *cacheFake) addVolume(handle string) {
+	_, name, _ := strings.Cut(handle, "/")
+	_, named, ok := cacheImageName(name)
+	if !ok {
+		named = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+
 	f.images[handle] = true
-	f.created[handle] = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.created[handle] = named
+}
+
+// freshVolume lists a volume created at now, which every pass needs as its
+// reading of the cluster's clock.
+func (f *cacheFake) freshVolume(now time.Time) string {
+	handle := orphanVolume(now, 'f')
+	f.addVolume(handle)
+
+	return handle
 }
 
 func trashMoved(f *cacheFake, handle string) bool {
@@ -64,6 +79,7 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	vanishing := orphanVolume(old.Add(3*time.Second), 'a')
 	behindClock := orphanVolume(old.Add(4*time.Second), 'a')
 	noCreation := orphanVolume(old.Add(5*time.Second), 'a')
+	stale := orphanVolume(old.Add(6*time.Second), 'a')
 	generation := fmt.Sprintf("billet-cache/cache-g-%d-%s", old.Unix(), strings.Repeat("6", 24))
 	unparseable := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old.Unix())
 	padded := fmt.Sprintf("billet-cache/cache-v-0%d-%s", old.Unix(), strings.Repeat("7", 24))
@@ -71,13 +87,18 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	for _, image := range []string{
 		orphan, young, watched, mapped, inSession, indexed, snapshotted, statusFails, snapsFail,
 		noWatchers, generation, unparseable, padded, lineage, used, unreadableUse, publishing,
-		moveUnconfirmed, vanishing, behindClock, noCreation,
+		moveUnconfirmed, vanishing, behindClock, noCreation, stale,
 	} {
 		f.addVolume(image)
 	}
+	f.freshVolume(now)
 	// NAMED BY A NODE WHOSE CLOCK IS BEHIND: the name says it is old, and the
 	// cluster created it an hour ago.
 	f.created[behindClock] = now.Add(-time.Hour)
+	// PUBLISHED FROM LONG AGO, which is no reason to keep it.
+	f.metadata[stale] = map[string]string{
+		"billet.cache.used_at": now.Add(-DefaultOrphanAge - 24*time.Hour).Format(time.RFC3339Nano),
+	}
 	delete(f.created, noCreation)
 	f.halfRemoved[halfRemoved] = true
 	f.watchers[watched] = 1
@@ -165,13 +186,14 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 		publishing:      OrphanUsed,
 		moveUnconfirmed: OrphanMoveUnknown,
 		vanishing:       OrphanGone,
-		behindClock:     OrphanTooYoung,
+		behindClock:     OrphanCreatedRecently,
 		noCreation:      OrphanUnknown,
+		stale:           OrphanMoved,
 	} {
 		if got[image] != want {
 			t.Errorf("%s: verdict %q, want %q", image, got[image], want)
 		}
-		if image == orphan || image == moveUnconfirmed {
+		if image == orphan || image == moveUnconfirmed || image == stale {
 			continue
 		}
 		if trashMoved(f, image) {
@@ -211,6 +233,7 @@ func TestAnOrphanListingChangesNothing(t *testing.T) {
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
 	f.addVolume(orphan)
+	f.freshVolume(now)
 
 	c := cacheClient(t, f)
 	c.clock = func() time.Time { return now }
@@ -271,6 +294,44 @@ func TestAnOrphanPassIsBoundedAndWorksOldestFirst(t *testing.T) {
 	}
 }
 
+// A NODE WHOSE CLOCK IS AHEAD PROVES NO AGE. Its clock makes every name and
+// every creation look old; the cluster's newest creation does not, and a volume
+// the cluster created within the bound of it is kept.
+func TestAReclaimingClockThatIsAheadProvesNoAge(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	clusterNow := time.Now()
+	recent := orphanVolume(clusterNow.Add(-24*time.Hour), 'a')
+	f.addVolume(recent)
+	f.freshVolume(clusterNow)
+	publishing := orphanVolume(clusterNow.Add(-20*24*time.Hour), 'b')
+	f.addVolume(publishing)
+	f.metadata[publishing] = map[string]string{
+		"billet.cache.used_at": clusterNow.Add(-time.Hour).Format(time.RFC3339Nano),
+	}
+
+	c := cacheClient(t, f)
+	c.clock = func() time.Time { return clusterNow.Add(30 * 24 * time.Hour) }
+
+	report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+		OlderThan: DefaultOrphanAge, Limit: 10, Reclaim: true, InSession: func(string) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("ReclaimOrphans: %v", err)
+	}
+
+	if got := verdicts(report)[recent]; got != OrphanCreatedRecently || trashMoved(f, recent) {
+		t.Errorf("verdict %q (moved %t); want a volume the cluster created a day ago kept", got,
+			trashMoved(f, recent))
+	}
+
+	if got := verdicts(report)[publishing]; got != OrphanUsed || trashMoved(f, publishing) {
+		t.Errorf("verdict %q (moved %t); want a volume published from an hour ago kept", got,
+			trashMoved(f, publishing))
+	}
+}
+
 // A LISTED OR UNCONFIRMED VOLUME IS TAKEN TOO. A listing names no more than the
 // limit, and a move rbd did not confirm, which may have happened, counts as one.
 func TestAListingAndAnUnconfirmedMoveCountAgainstTheLimit(t *testing.T) {
@@ -283,6 +344,7 @@ func TestAListingAndAnUnconfirmedMoveCountAgainstTheLimit(t *testing.T) {
 	for _, reclaim := range []bool{false, true} {
 		f := newCacheFake()
 		f.addVolume(first)
+		f.freshVolume(now)
 		f.addVolume(second)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
@@ -341,6 +403,7 @@ func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
 	} {
 		f := newCacheFake()
 		f.addVolume(orphan)
+		f.freshVolume(now)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "image-meta") && slices.Contains(args, orphan) {
@@ -363,7 +426,10 @@ func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
 			t.Fatalf("%s: ReclaimOrphans: %v", name, err)
 		}
 
-		if len(report.Images) != 1 || report.Images[0].Verdict != OrphanUnknown || report.Images[0].Err == nil {
+		judged := slices.IndexFunc(report.Images, func(image OrphanImage) bool {
+			return "billet-cache/"+image.Name == orphan
+		})
+		if judged < 0 || report.Images[judged].Verdict != OrphanUnknown || report.Images[judged].Err == nil {
 			t.Errorf("%s: report %+v; want the volume could-not-tell, with a reason", name, report.Images)
 		}
 
@@ -389,6 +455,7 @@ func TestKeptVolumesDoNotUseUpAnOrphanPassLimit(t *testing.T) {
 	f.addVolume(snapshotted)
 	f.snapshots[snapshotted+"@staging"] = true
 	f.addVolume(orphan)
+	f.freshVolume(now)
 
 	c := cacheClient(t, f)
 	c.clock = func() time.Time { return now }
@@ -441,6 +508,7 @@ func TestAnOrphanPassThatCannotReadTheIndexMovesNothing(t *testing.T) {
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
 	f.addVolume(orphan)
+	f.freshVolume(now)
 	f.metaListErr = errors.New("exit status 108: rbd: error: (108) Cannot send after transport endpoint shutdown")
 
 	c := cacheClient(t, f)
@@ -467,6 +535,7 @@ func TestAnOrphanPassThatCannotParseTheIndexMovesNothing(t *testing.T) {
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
 	f.addVolume(orphan)
+	f.freshVolume(now)
 
 	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 		if slices.Contains(args, "image-meta") && slices.Contains(args, "list") {
@@ -512,6 +581,7 @@ func TestAnOrphanPassTakesNoProofFromAMappingItCannotRead(t *testing.T) {
 	} {
 		f := newCacheFake()
 		f.addVolume(orphan)
+		f.freshVolume(now)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "device") && slices.Contains(args, "list") {

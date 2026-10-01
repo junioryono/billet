@@ -79,7 +79,7 @@ func cacheSessionRecords(cfg *config.Config) (node.CacheSessionRecords, error) {
 // orphanListed are the verdicts printed one line per image; the rest are counted.
 var orphanListed = []ceph.OrphanVerdict{
 	ceph.OrphanReclaimable, ceph.OrphanMoved, ceph.OrphanMoveUnknown, ceph.OrphanUnknown,
-	ceph.OrphanWatched, ceph.OrphanSnapshotted, ceph.OrphanUsed, ceph.OrphanInSession,
+	ceph.OrphanWatched, ceph.OrphanSnapshotted, ceph.OrphanUsed, ceph.OrphanCreatedRecently, ceph.OrphanInSession,
 	ceph.OrphanInIndex, ceph.OrphanHalfRemoved, ceph.OrphanGone,
 }
 

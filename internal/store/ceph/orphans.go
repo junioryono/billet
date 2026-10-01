@@ -39,15 +39,18 @@ const (
 	OrphanForeign     OrphanVerdict = "not a name billet gives"
 	OrphanGeneration  OrphanVerdict = "a generation"
 	OrphanTooYoung    OrphanVerdict = "named too recently"
-	OrphanInSession   OrphanVerdict = "named by a cache session on this node"
-	OrphanInIndex     OrphanVerdict = "named by the cache index"
-	OrphanDeferred    OrphanVerdict = "beyond this pass's limit"
-	OrphanWatched     OrphanVerdict = "held open by a client"
-	OrphanSnapshotted OrphanVerdict = "has snapshots"
-	OrphanUsed        OrphanVerdict = "snapshotted for publication too recently"
-	OrphanHalfRemoved OrphanVerdict = "half-removed, which the purge finishes"
-	OrphanGone        OrphanVerdict = "no longer listed under its name"
-	OrphanUnknown     OrphanVerdict = "could not tell"
+	// OrphanCreatedRecently is a volume the cluster created within the bound,
+	// by this node's clock or against the newest image it created.
+	OrphanCreatedRecently OrphanVerdict = "created too recently"
+	OrphanInSession       OrphanVerdict = "named by a cache session on this node"
+	OrphanInIndex         OrphanVerdict = "named by the cache index"
+	OrphanDeferred        OrphanVerdict = "beyond this pass's limit"
+	OrphanWatched         OrphanVerdict = "held open by a client"
+	OrphanSnapshotted     OrphanVerdict = "has snapshots"
+	OrphanUsed            OrphanVerdict = "snapshotted for publication too recently"
+	OrphanHalfRemoved     OrphanVerdict = "half-removed, which the purge finishes"
+	OrphanGone            OrphanVerdict = "no longer listed under its name"
+	OrphanUnknown         OrphanVerdict = "could not tell"
 	// OrphanMoveUnknown is a move rbd did not confirm, which may have happened.
 	OrphanMoveUnknown OrphanVerdict = "move not confirmed"
 )
@@ -102,8 +105,9 @@ func (r OrphanReport) Count(verdict OrphanVerdict) int {
 // name cacheName gives a writable volume (a generation is never a candidate);
 // named at least OlderThan ago; named by no cache session this node keeps and by
 // no record in the cache index; and then, asking rbd, created by the cluster at
-// least OlderThan ago by this node's clock; no snapshot in any
-// namespace, so no generation's lineage reads it; no mapping on this host; no
+// least OlderThan ago, by this node's clock and before the newest creation the
+// cluster reports; no snapshot in any namespace, so no generation's lineage
+// reads it; no mapping on this host; no
 // watcher, so no client anywhere has it open; and no `used_at` Snapshot wrote
 // within OlderThan. Any answer rbd gives other than those keeps the image as
 // OrphanUnknown.
@@ -157,6 +161,11 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 	now := c.now()
 	taken := 0
 
+	var (
+		clusterNow time.Time
+		clusterErr error
+	)
+
 	for i := range images {
 		image := &images[i]
 		kind, _, ok := cacheImageName(image.Name)
@@ -181,7 +190,16 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 				continue
 			}
 
-			image.Verdict, image.Err = c.judgeOrphan(ctx, image.Name, opts, now)
+			if clusterNow.IsZero() && clusterErr == nil {
+				clusterNow, clusterErr = c.clusterNow(ctx, images)
+			}
+			if clusterErr != nil {
+				image.Verdict, image.Err = OrphanUnknown, clusterErr
+
+				continue
+			}
+
+			image.Verdict, image.Err = c.judgeOrphan(ctx, image.Name, opts, now, clusterNow)
 
 			// ONLY WHAT IS TAKEN COUNTS, so the volumes a pass keeps (half-removed
 			// ones the purge is still finishing, above all) never use up the
@@ -252,42 +270,82 @@ func (c *Client) mappedHere(ctx context.Context, name string) (bool, error) {
 	return false, nil
 }
 
-// judgeOrphan asks rbd about one old, unnamed writable volume and, when reclaim
-// is set and nothing holds it, moves it to the trash.
-func (c *Client) judgeOrphan(
-	ctx context.Context, name string, opts OrphanOptions, now time.Time,
-) (OrphanVerdict, error) {
-	handle := c.cfg.CachePool + "/" + name
-
-	// THE CLUSTER'S CLOCK AS WELL AS THE NAME'S. The name carries the creating
-	// node's clock, which may be behind; create_timestamp is set by the OSD that
-	// created the header (cls_rbd create), and rbd prints it with ctime in this
-	// process's zone (Ceph v19.2.2, read rather than measured).
+// createdAt is when the cluster created an image: create_timestamp, which the
+// OSD that created the header sets (cls_rbd create) and rbd prints with ctime in
+// this process's zone (Ceph v19.2.2, read rather than measured). An `rbd info`
+// error is returned as it came, so a caller can tell ENOENT.
+func (c *Client) createdAt(ctx context.Context, handle string) (time.Time, error) {
 	out, err := c.rbdCmd(ctx, true, "info", handle)
 	if err != nil {
-		if isNoSuchFile(err) {
-			return OrphanHalfRemoved, nil
-		}
-
-		return OrphanUnknown, fmt.Errorf("ceph: describe %s: %w", handle, err)
+		return time.Time{}, fmt.Errorf("ceph: describe %s: %w", handle, err)
 	}
 
 	var info struct {
 		CreateTimestamp string `json:"create_timestamp"`
 	}
 	if err := json.Unmarshal(out, &info); err != nil {
-		return OrphanUnknown, fmt.Errorf("ceph: %s did not describe %s as json", c.bin, handle)
+		return time.Time{}, fmt.Errorf("ceph: %s did not describe %s as json", c.bin, handle)
 	}
 
 	created, err := time.ParseInLocation(time.ANSIC, info.CreateTimestamp, time.Local)
 	if err != nil {
-		return OrphanUnknown, fmt.Errorf("ceph: %s did not say when the cluster created %s", c.bin, handle)
-	}
-	if now.Sub(created) < opts.OlderThan {
-		return OrphanTooYoung, nil
+		return time.Time{}, fmt.Errorf("ceph: %s did not say when the cluster created %s", c.bin, handle)
 	}
 
-	out, err = c.rbdCmd(ctx, true, "snap", "ls", "--all", handle)
+	return created, nil
+}
+
+// clusterNowProbes bounds how many of the newest images a pass asks for a
+// creation time before it gives up on the cluster's clock.
+const clusterNowProbes = 8
+
+// clusterNow is a lower bound on the cluster's clock: the creation time of the
+// newest-named image billet named that the cluster will describe.
+func (c *Client) clusterNow(ctx context.Context, images []OrphanImage) (time.Time, error) {
+	probed := 0
+
+	for i := len(images) - 1; i >= 0 && probed < clusterNowProbes; i-- {
+		if _, _, ok := cacheImageName(images[i].Name); !ok {
+			continue
+		}
+
+		probed++
+
+		created, err := c.createdAt(ctx, c.cfg.CachePool+"/"+images[i].Name)
+		if err == nil {
+			return created, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("ceph: none of the %d newest cache images said when the cluster "+
+		"created it, so no creation can be dated against the cluster's clock", probed)
+}
+
+// judgeOrphan asks rbd about one old, unnamed writable volume and, when reclaim
+// is set and nothing holds it, moves it to the trash.
+func (c *Client) judgeOrphan(
+	ctx context.Context, name string, opts OrphanOptions, now, clusterNow time.Time,
+) (OrphanVerdict, error) {
+	handle := c.cfg.CachePool + "/" + name
+
+	// THE CLUSTER'S CLOCK, NOT ONLY A NODE'S. The name carries the creating
+	// node's clock and now is this node's; either may be wrong by more than the
+	// bound. The volume must also have been created OlderThan before the newest
+	// creation the cluster reports for any listed image, which no node's clock
+	// enters.
+	created, err := c.createdAt(ctx, handle)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return OrphanHalfRemoved, nil
+		}
+
+		return OrphanUnknown, err
+	}
+	if now.Sub(created) < opts.OlderThan || clusterNow.Sub(created) < opts.OlderThan {
+		return OrphanCreatedRecently, nil
+	}
+
+	out, err := c.rbdCmd(ctx, true, "snap", "ls", "--all", handle)
 	if err != nil {
 		if isNoSuchFile(err) {
 			return OrphanHalfRemoved, nil
@@ -359,7 +417,7 @@ func (c *Client) judgeOrphan(
 				bounded(value))
 		}
 
-		if now.Sub(usedAt) < opts.OlderThan {
+		if now.Sub(usedAt) < opts.OlderThan || clusterNow.Sub(usedAt) < opts.OlderThan {
 			return OrphanUsed, nil
 		}
 	}
