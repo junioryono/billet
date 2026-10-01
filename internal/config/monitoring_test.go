@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -50,11 +51,38 @@ func TestAMonitoringBlockTheNodeCannotHonourIsRefused(t *testing.T) {
 		{"a baseline without rapl", withMonitoring(t, "  monitoring:\n    idle_package_watts: 73.5\n"), "rapl is not"},
 		{"a baseline in milliwatts", withMonitoring(t, "  monitoring:\n    rapl: true\n    idle_package_watts: 73500\n"), "not a package power"},
 		{"a negative baseline", withMonitoring(t, "  monitoring:\n    rapl: true\n    idle_package_watts: -1\n"), "not a package power"},
-		{"a cloud node", cloudConfig(t, "  max_memory: 256GiB\n", "  max_memory: 256GiB\n  monitoring: {}\n"), "only firecracker and docker"},
+		{"a cloud node", cloudConfig(t, "  max_memory: 256GiB\n", "  max_memory: 256GiB\n  monitoring: {}\n"), "only firecracker, docker and tart"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := loadErr(t, tc.body); !strings.Contains(got, tc.want) {
 				t.Fatalf("refused with %q, want it to say %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A TART NODE IS MEASURED BY EACH VM'S OWN PROCESS, so monitoring is admitted
+// there and the Linux package counter and its baseline are not.
+func TestATartNodeIsMonitoredWithoutRAPL(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    NodeMonitoringConfig
+		want string
+	}{
+		{"the defaults", NodeMonitoringConfig{}, ""},
+		{"an interval", NodeMonitoringConfig{Interval: "2s"}, ""},
+		{"rapl", NodeMonitoringConfig{RAPL: true}, "macOS's own estimate"},
+		{"a baseline", NodeMonitoringConfig{RAPL: true, IdlePackageWatts: 10}, "macOS's own estimate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Node: &NodeConfig{Provider: ProviderTart, Monitoring: &tc.m}}
+			errs := c.validateMonitoringNode()
+			got := errors.Join(errs...)
+			switch {
+			case tc.want == "" && got != nil:
+				t.Errorf("refused: %v", got)
+			case tc.want != "" && (got == nil || !strings.Contains(got.Error(), tc.want)):
+				t.Errorf("answered %v, want a refusal saying %q", got, tc.want)
 			}
 		})
 	}

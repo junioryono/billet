@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 24
+	Version = 25
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -334,6 +334,18 @@ const (
 	// plane answers the route with a bare 404, and what the pairing loses is the
 	// measurement, never a job.
 	VersionJobUsage = 24
+
+	// VersionProcessUsage is the version from which a usage report may name the
+	// oom group unmeasured and give energy the process source: what a job measured
+	// by its process's own accounting reports (a tart VM on macOS, whose kernel
+	// keeps no OOM count but estimates each process's energy).
+	//
+	// CHECKED WHERE IT IS SENT, because an older plane validates a report
+	// strictly and would refuse both. Below it the node says less rather than
+	// nothing: energy from the process is reported unmeasured, and memory with no
+	// OOM count is reported unmeasured whole, since an older plane reads a
+	// measured memory group as a measured count.
+	VersionProcessUsage = 25
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

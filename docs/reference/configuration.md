@@ -71,11 +71,13 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `drain_timeout` | no | when the node starts reporting a drain as long |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |
-| `monitoring` | no | measure each job from the host; absent means off; firecracker and docker only (see below) |
+| `monitoring` | no | measure each job from the host; absent means off; firecracker, docker and tart only (see below) |
 
-### `node.monitoring` (optional; firecracker and docker only)
+### `node.monitoring` (optional; firecracker, docker and tart only)
 
 `interval` (a Go duration, default `1s`, from `250ms` to `30s`; the upper bound keeps the package energy counter from wrapping unseen between readings), `rapl` (read `/sys/class/powercap/intel-rapl:0/energy_uj`, the package zone only, and share it among jobs by CPU time), `idle_package_watts` (the host's measured idle package power; requires `rapl`; with it the energy above the baseline is shared by CPU time and the baseline by reserved vCPUs, and without it the whole package is shared by CPU time and recorded as `rapl-unsplit`). On firecracker it also asks the jailer to enable the memory and io controllers for each microVM, but only for a controller `billet check` reports present, because the jailer refuses a launch whose key names a file the kernel does not provide. A group the host could not read is recorded as unmeasured, never as zero. Energy is also recorded as unmeasured on a host with more than one package (package 0 alone cannot be shared by CPU time counted on every socket), for an interval whose jobs ran longer than the host was busy, and for a job the sampler missed three intervals of. A job adopted by a restarted node, or held in custody, is not measured.
+
+On tart there is no cgroup: each VM runs in its own Virtualization.framework process, which billet finds as the one such process holding the VM's `disk.img` open, and measures by that process's own accounting (`proc_pid_rusage`). CPU is the process's user and system time, memory its physical footprint and lifetime peak, disk the bytes it moved to and from storage, and energy macOS's own estimate for the process, recorded with the source `process` and no idle share, since the machine's idle draw is not in it. The OOM count, network, pressure and the guest/VMM thread split are recorded as unmeasured, because macOS keeps none of them for one process. `rapl` and `idle_package_watts` are refused on tart. Reporting the `oom` group and `process` energy needs wire 25; against an older control plane the node reports energy unmeasured, and memory unmeasured whole.
 
 ### `node.firecracker` (required for firecracker, refused otherwise)
 
