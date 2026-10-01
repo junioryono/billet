@@ -101,7 +101,8 @@ func (r OrphanReport) Count(verdict OrphanVerdict) int {
 // ONLY ON POSITIVE PROOF that nothing needs the image, in this order: the exact
 // name cacheName gives a writable volume (a generation is never a candidate);
 // named at least OlderThan ago; named by no cache session this node keeps and by
-// no record in the cache index; and then, asking rbd, no snapshot in any
+// no record in the cache index; and then, asking rbd, created by the cluster at
+// least OlderThan ago by this node's clock; no snapshot in any
 // namespace, so no generation's lineage reads it; no mapping on this host; no
 // watcher, so no client anywhere has it open; and no `used_at` Snapshot wrote
 // within OlderThan. Any answer rbd gives other than those keeps the image as
@@ -258,7 +259,35 @@ func (c *Client) judgeOrphan(
 ) (OrphanVerdict, error) {
 	handle := c.cfg.CachePool + "/" + name
 
-	out, err := c.rbdCmd(ctx, true, "snap", "ls", "--all", handle)
+	// THE CLUSTER'S CLOCK AS WELL AS THE NAME'S. The name carries the creating
+	// node's clock, which may be behind; create_timestamp is set by the OSD that
+	// created the header (cls_rbd create), and rbd prints it with ctime in this
+	// process's zone (Ceph v19.2.2, read rather than measured).
+	out, err := c.rbdCmd(ctx, true, "info", handle)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return OrphanHalfRemoved, nil
+		}
+
+		return OrphanUnknown, fmt.Errorf("ceph: describe %s: %w", handle, err)
+	}
+
+	var info struct {
+		CreateTimestamp string `json:"create_timestamp"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return OrphanUnknown, fmt.Errorf("ceph: %s did not describe %s as json", c.bin, handle)
+	}
+
+	created, err := time.ParseInLocation(time.ANSIC, info.CreateTimestamp, time.Local)
+	if err != nil {
+		return OrphanUnknown, fmt.Errorf("ceph: %s did not say when the cluster created %s", c.bin, handle)
+	}
+	if now.Sub(created) < opts.OlderThan {
+		return OrphanTooYoung, nil
+	}
+
+	out, err = c.rbdCmd(ctx, true, "snap", "ls", "--all", handle)
 	if err != nil {
 		if isNoSuchFile(err) {
 			return OrphanHalfRemoved, nil

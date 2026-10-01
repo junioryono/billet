@@ -58,6 +58,9 @@ type cacheFake struct {
 	// trashSnapshots are snapshots in the trash namespace, which a generation's
 	// clone keeps; `rbd snap ls` shows them only with --all.
 	trashSnapshots map[string]bool
+	// created is when the cluster created an image, which `rbd info` reports
+	// only for an image listed here.
+	created map[string]time.Time
 }
 
 type cacheExitError struct {
@@ -84,6 +87,7 @@ func newCacheFake() *cacheFake {
 		watchers:     map[string]int{},
 
 		trashSnapshots: map[string]bool{},
+		created:        map[string]time.Time{},
 	}
 }
 
@@ -488,6 +492,13 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 	case "info":
 		if !f.images[tail[0]] && !f.snapshots[tail[0]] {
 			return nil, errors.New("rbd: (2) No such file or directory")
+		}
+
+		if created, ok := f.created[tail[0]]; ok {
+			// ctime in the rbd process's zone, as rbd info prints it.
+			return json.Marshal(map[string]any{
+				"size": 1073741824, "create_timestamp": created.In(time.Local).Format(time.ANSIC),
+			})
 		}
 
 		return []byte(`{"size":1073741824}`), nil

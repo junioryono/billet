@@ -24,6 +24,12 @@ func verdicts(report OrphanReport) map[string]OrphanVerdict {
 	return out
 }
 
+// addVolume lists an image the cluster created long before any test's now.
+func (f *cacheFake) addVolume(handle string) {
+	f.images[handle] = true
+	f.created[handle] = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+}
+
 func trashMoved(f *cacheFake, handle string) bool {
 	return f.ranWith("trash", "mv", handle)
 }
@@ -56,6 +62,8 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	publishing := orphanVolume(old.Add(2*time.Second), 'b')
 	moveUnconfirmed := orphanVolume(old.Add(time.Second), 'a')
 	vanishing := orphanVolume(old.Add(3*time.Second), 'a')
+	behindClock := orphanVolume(old.Add(4*time.Second), 'a')
+	noCreation := orphanVolume(old.Add(5*time.Second), 'a')
 	generation := fmt.Sprintf("billet-cache/cache-g-%d-%s", old.Unix(), strings.Repeat("6", 24))
 	unparseable := fmt.Sprintf("billet-cache/cache-v-%d-by-hand", old.Unix())
 	padded := fmt.Sprintf("billet-cache/cache-v-0%d-%s", old.Unix(), strings.Repeat("7", 24))
@@ -63,10 +71,14 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	for _, image := range []string{
 		orphan, young, watched, mapped, inSession, indexed, snapshotted, statusFails, snapsFail,
 		noWatchers, generation, unparseable, padded, lineage, used, unreadableUse, publishing,
-		moveUnconfirmed, vanishing,
+		moveUnconfirmed, vanishing, behindClock, noCreation,
 	} {
-		f.images[image] = true
+		f.addVolume(image)
 	}
+	// NAMED BY A NODE WHOSE CLOCK IS BEHIND: the name says it is old, and the
+	// cluster created it an hour ago.
+	f.created[behindClock] = now.Add(-time.Hour)
+	delete(f.created, noCreation)
 	f.halfRemoved[halfRemoved] = true
 	f.watchers[watched] = 1
 	f.watchers[publishing] = 1
@@ -153,6 +165,8 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 		publishing:      OrphanUsed,
 		moveUnconfirmed: OrphanMoveUnknown,
 		vanishing:       OrphanGone,
+		behindClock:     OrphanTooYoung,
+		noCreation:      OrphanUnknown,
 	} {
 		if got[image] != want {
 			t.Errorf("%s: verdict %q, want %q", image, got[image], want)
@@ -196,7 +210,7 @@ func TestAnOrphanListingChangesNothing(t *testing.T) {
 	f := newCacheFake()
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
-	f.images[orphan] = true
+	f.addVolume(orphan)
 
 	c := cacheClient(t, f)
 	c.clock = func() time.Time { return now }
@@ -229,7 +243,7 @@ func TestAnOrphanPassIsBoundedAndWorksOldestFirst(t *testing.T) {
 	newest := orphanVolume(now.Add(-10*24*time.Hour), 'a')
 
 	for _, image := range []string{oldest, older, newest} {
-		f.images[image] = true
+		f.addVolume(image)
 	}
 
 	c := cacheClient(t, f)
@@ -268,8 +282,8 @@ func TestAListingAndAnUnconfirmedMoveCountAgainstTheLimit(t *testing.T) {
 
 	for _, reclaim := range []bool{false, true} {
 		f := newCacheFake()
-		f.images[first] = true
-		f.images[second] = true
+		f.addVolume(first)
+		f.addVolume(second)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "trash") && slices.Contains(args, "mv") && slices.Contains(args, first) {
@@ -326,7 +340,7 @@ func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
 		"an error": func() ([]byte, error) { return nil, errors.New("exit status 5: rbd: (5) Input/output error") },
 	} {
 		f := newCacheFake()
-		f.images[orphan] = true
+		f.addVolume(orphan)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "image-meta") && slices.Contains(args, orphan) {
@@ -372,9 +386,9 @@ func TestKeptVolumesDoNotUseUpAnOrphanPassLimit(t *testing.T) {
 	orphan := orphanVolume(now.Add(-10*24*time.Hour), 'a')
 
 	f.halfRemoved[halfRemoved] = true
-	f.images[snapshotted] = true
+	f.addVolume(snapshotted)
 	f.snapshots[snapshotted+"@staging"] = true
-	f.images[orphan] = true
+	f.addVolume(orphan)
 
 	c := cacheClient(t, f)
 	c.clock = func() time.Time { return now }
@@ -426,7 +440,7 @@ func TestAnOrphanPassThatCannotReadTheIndexMovesNothing(t *testing.T) {
 	f := newCacheFake()
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
-	f.images[orphan] = true
+	f.addVolume(orphan)
 	f.metaListErr = errors.New("exit status 108: rbd: error: (108) Cannot send after transport endpoint shutdown")
 
 	c := cacheClient(t, f)
@@ -452,7 +466,7 @@ func TestAnOrphanPassThatCannotParseTheIndexMovesNothing(t *testing.T) {
 	f := newCacheFake()
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-8*24*time.Hour), 'a')
-	f.images[orphan] = true
+	f.addVolume(orphan)
 
 	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 		if slices.Contains(args, "image-meta") && slices.Contains(args, "list") {
@@ -497,7 +511,7 @@ func TestAnOrphanPassTakesNoProofFromAMappingItCannotRead(t *testing.T) {
 		`null`:   OrphanUnknown,
 	} {
 		f := newCacheFake()
-		f.images[orphan] = true
+		f.addVolume(orphan)
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "device") && slices.Contains(args, "list") {
