@@ -1,19 +1,26 @@
 package node
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
-const cacheSessionDirectory = "cache-sessions"
+const (
+	cacheSessionDirectory = "cache-sessions"
+	// cacheSessionRecordLimit bounds one custody record read outside the node.
+	cacheSessionRecordLimit = 16 << 20
+)
 
 // errSessionFinished is what a write to a session's record gets once cleanup
 // has removed it: the compute is gone, and a record written now would load on
@@ -67,6 +74,64 @@ type durableCacheSession struct {
 	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
 	Hosts       map[config.CacheKind]*hostVolume      `json:"hosts,omitempty"`
 	Receipts    map[string]*actionsReceipt            `json:"actions_receipts,omitempty"`
+}
+
+// CacheSessionRecords is the raw text of every cache custody record a node
+// keeps, read without loading a session.
+type CacheSessionRecords struct {
+	bodies [][]byte
+}
+
+// Mentions reports whether any record contains name anywhere, so a name a
+// record carries in a field this reader does not know about still counts.
+func (r CacheSessionRecords) Mentions(name string) bool {
+	if name == "" {
+		return true
+	}
+
+	for _, body := range r.bodies {
+		if bytes.Contains(body, []byte(name)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ReadCacheSessionRecords reads the custody records under a node's state
+// directory, staged ones included, for a process other than the node. A
+// directory that does not exist wraps fs.ErrNotExist; an entry that cannot be
+// read as a regular file is an error, never an empty record.
+func ReadCacheSessionRecords(stateDir string) (CacheSessionRecords, error) {
+	directory := filepath.Join(stateDir, cacheSessionDirectory)
+
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return CacheSessionRecords{}, fmt.Errorf("node: read cache custody directory %s: %w",
+			directory, err)
+	}
+
+	var records CacheSessionRecords
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		body, err := regularfile.ReadFile(filepath.Join(directory, entry.Name()), cacheSessionRecordLimit,
+			regularfile.Options{NoFollow: true})
+		// A record that went between the listing and the open was renamed over
+		// or removed with its finished session.
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return CacheSessionRecords{}, fmt.Errorf("node: read cache custody %s: %w", entry.Name(), err)
+		}
+
+		records.bodies = append(records.bodies, body)
+	}
+
+	return records, nil
 }
 
 func (s *CacheService) loadSessions() error {

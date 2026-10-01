@@ -19,6 +19,10 @@ func cmdCache(ctx context.Context, args []string) error {
 		return cmdCacheStatus(ctx, args[1:])
 	}
 
+	if len(args) > 0 && args[0] == "orphans" {
+		return cmdCacheOrphans(ctx, args[1:])
+	}
+
 	// Run inside a guest by the go command, bazel and git, never by a person.
 	if len(args) > 0 && args[0] == "gocacheprog" {
 		return cmdCacheGoCacheProg(ctx, args[1:])
@@ -31,7 +35,7 @@ func cmdCache(ctx context.Context, args []string) error {
 	}
 
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
-		return errors.New("usage: billet cache <disable|enable|status|conformance> [flags]")
+		return errors.New("usage: billet cache <disable|enable|status|orphans|conformance> [flags]")
 	}
 	action := args[0]
 	fs := newFlagSet("billet cache " + action)

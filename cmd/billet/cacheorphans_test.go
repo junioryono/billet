@@ -1,0 +1,101 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/store/ceph"
+)
+
+type fakeOrphanStore struct {
+	opts   ceph.OrphanOptions
+	report ceph.OrphanReport
+}
+
+func (f *fakeOrphanStore) ReclaimOrphans(_ context.Context, opts ceph.OrphanOptions) (ceph.OrphanReport, error) {
+	f.opts = opts
+
+	return f.report, nil
+}
+
+// THE COMMAND LISTS, AND SAYS WHY; ACTING IS ASKED FOR. Without --reclaim the
+// pass is a listing, each judged volume is printed with its verdict, and a
+// volume rbd could not answer for fails the command rather than reading as kept
+// for a reason.
+func TestCacheOrphansPrintsEachVerdictAndFailsOnCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	named := time.Date(2026, 9, 21, 8, 0, 0, 0, time.UTC)
+	store := &fakeOrphanStore{report: ceph.OrphanReport{Images: []ceph.OrphanImage{
+		{Name: "cache-v-1790000000-aaaaaaaaaaaaaaaaaaaaaaaa", Named: named, Verdict: ceph.OrphanReclaimable},
+		{Name: "cache-v-1790000001-bbbbbbbbbbbbbbbbbbbbbbbb", Named: named, Verdict: ceph.OrphanUnknown,
+			Err: errors.New("ceph: read the watchers: timed out")},
+		{Name: "cache-v-1790000002-cccccccccccccccccccccccc", Named: named, Verdict: ceph.OrphanWatched},
+		{Name: "cache-g-1790000003-dddddddddddddddddddddddd", Named: named, Verdict: ceph.OrphanGeneration},
+	}}}
+
+	var out bytes.Buffer
+
+	opts := ceph.OrphanOptions{OlderThan: ceph.DefaultOrphanAge, Limit: 7, InSession: func(string) bool { return false }}
+	err := reclaimCacheOrphans(t.Context(), &out, store, opts)
+
+	var exit *exitError
+	if !errors.As(err, &exit) || exit.code != 1 {
+		t.Errorf("a could-not-tell volume returned %v, want exit status 1", err)
+	}
+
+	if store.opts.Reclaim || store.opts.Limit != 7 || store.opts.InSession == nil {
+		t.Errorf("the pass was asked with %+v", store.opts)
+	}
+
+	text := out.String()
+	for _, want := range []string{
+		"reclaimable  cache-v-1790000000-aaaaaaaaaaaaaaaaaaaaaaaa",
+		"could not tell  cache-v-1790000001-bbbbbbbbbbbbbbbbbbbbbbbb",
+		"read the watchers: timed out",
+		"held open by a client",
+		"a generation",
+		"nothing was changed; run again with --reclaim to move the 1 reclaimable volume(s)",
+	} {
+		if !strings.Contains(squeeze(text), want) {
+			t.Errorf("output lacks %q:\n%s", want, text)
+		}
+	}
+
+	if strings.Contains(text, "cache-g-1790000003") {
+		t.Errorf("a generation was listed by name:\n%s", text)
+	}
+}
+
+// squeeze collapses tabwriter padding to two spaces, so an assertion names the
+// columns and not their widths.
+func squeeze(s string) string {
+	for strings.Contains(s, "   ") {
+		s = strings.ReplaceAll(s, "   ", "  ")
+	}
+
+	return s
+}
+
+// A NODE THAT KEEPS CACHE SESSIONS MUST HAVE THEM READ. Only a node with no cache
+// listener, which never kept a session, may stand on a missing directory.
+func TestCacheOrphansNeedTheSessionsOfANodeThatKeepsThem(t *testing.T) {
+	t.Parallel()
+
+	withoutListener := &config.Config{Node: &config.NodeConfig{StateDir: t.TempDir()}}
+	if _, err := cacheSessionRecords(withoutListener); err != nil {
+		t.Errorf("a node without a cache listener was refused: %v", err)
+	}
+
+	withListener := &config.Config{Node: &config.NodeConfig{
+		StateDir: t.TempDir(), Cache: &config.NodeCacheConfig{},
+	}}
+	if _, err := cacheSessionRecords(withListener); err == nil {
+		t.Error("a cache node whose sessions could not be read was judged anyway")
+	}
+}

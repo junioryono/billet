@@ -53,6 +53,8 @@ type cacheFake struct {
 	// halfRemoved holds images an interrupted `rbd rm` left behind: `rbd ls`
 	// still lists them, nothing can open them, and `rbd rm` finishes them.
 	halfRemoved map[string]bool
+	// watchers counts the clients `rbd status` reports holding an image open.
+	watchers map[string]int
 }
 
 type cacheExitError struct {
@@ -76,6 +78,7 @@ func newCacheFake() *cacheFake {
 
 		removeLocked: map[string]bool{},
 		halfRemoved:  map[string]bool{},
+		watchers:     map[string]int{},
 	}
 }
 
@@ -104,6 +107,10 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 
 	if i := slices.Index(args, "trash"); i >= 0 {
 		return f.trashCommand(args[i+1:])
+	}
+
+	if i := slices.Index(args, "status"); i >= 0 {
+		return f.status(args[i+1])
 	}
 
 	for _, verb := range []string{"create", "clone", "cp", "info", "rm", "ls"} {
@@ -362,8 +369,47 @@ func (f *cacheFake) device(args []string) ([]byte, error) {
 	}
 }
 
+// status answers `rbd status` the way rbd does: ENOENT for an image nothing can
+// open, otherwise the watchers array, empty when no client holds it.
+func (f *cacheFake) status(image string) ([]byte, error) {
+	if !f.images[image] {
+		return nil, errors.New("rbd: (2) No such file or directory")
+	}
+
+	type watcher struct {
+		Address string `json:"address"`
+		Client  int    `json:"client"`
+		Cookie  int    `json:"cookie"`
+	}
+
+	watchers := []watcher{}
+	for i := range f.watchers[image] {
+		watchers = append(watchers, watcher{Address: "watcher-" + strconv.Itoa(i), Client: 4100 + i, Cookie: i})
+	}
+
+	return json.Marshal(map[string]any{"watchers": watchers})
+}
+
 func (f *cacheFake) snap(args []string) ([]byte, error) {
 	switch args[0] {
+	case "ls":
+		image := args[len(args)-1]
+		if !f.images[image] {
+			return nil, errors.New("rbd: (2) No such file or directory")
+		}
+
+		type entry struct {
+			Name string `json:"name"`
+		}
+
+		snapshots := []entry{}
+		for snapshot := range f.snapshots {
+			if name, ok := strings.CutPrefix(snapshot, image+"@"); ok {
+				snapshots = append(snapshots, entry{Name: name})
+			}
+		}
+
+		return json.Marshal(snapshots)
 	case "create":
 		f.snapshots[args[1]] = true
 
