@@ -1141,7 +1141,7 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 // billetCacheImage matches exactly the names cacheName gives the images billet
 // creates in the cache pool: a writable volume (v) or a generation (g), the Unix
 // second it was named and a 96-bit nonce.
-var billetCacheImage = regexp.MustCompile(`^cache-([vg])-([0-9]+)-[0-9a-f]{24}$`)
+var billetCacheImage = regexp.MustCompile(`^cache-([vg])-(\d+)-[0-9a-f]{24}$`)
 
 // isCacheVolume reports whether a handle names, in the cache pool, a writable
 // cache volume billet created.
@@ -1152,9 +1152,9 @@ func (c *Client) isCacheVolume(handle string) bool {
 	return ok && named && kind == "v"
 }
 
-// cacheImageName reports whether billet named an image, which kind it is and when
-// it was named.
-func cacheImageName(name string) (kind string, named time.Time, ok bool) {
+// cacheImageName reports which kind of image billet named (v or g), when it named
+// it, and whether billet named it at all.
+func cacheImageName(name string) (string, time.Time, bool) {
 	match := billetCacheImage.FindStringSubmatch(name)
 	if match == nil {
 		return "", time.Time{}, false
@@ -1240,7 +1240,7 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 
 		handle := c.cfg.CachePool + "/" + image.ID
 
-		if _, err := c.rbdCmdWithin(ctx, PurgeTimeout, false, "trash", "rm", handle); err != nil &&
+		if err := c.rbdCmdWithin(ctx, PurgeTimeout, "trash", "rm", handle); err != nil &&
 			!isNoSuchFile(err) {
 			if !isImageNotEmpty(err) {
 				failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
@@ -1327,7 +1327,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 			continue
 		}
 
-		if _, err := c.rbdCmdWithin(ctx, PurgeTimeout, false, "rm", handle); err != nil &&
+		if err := c.rbdCmdWithin(ctx, PurgeTimeout, "rm", handle); err != nil &&
 			!isNoSuchFile(err) {
 			c.halfRemoved[name] = first
 
