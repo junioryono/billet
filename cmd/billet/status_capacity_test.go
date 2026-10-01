@@ -55,7 +55,7 @@ func TestStatusShowsDiscoverySeparatelyFromHeadroom(t *testing.T) {
 		}
 	})
 	for _, want := range []string{
-		"discovery 1, pending 0, launching 0, running 0, cleanup 0, unknown 0",
+		"discovery 1, pending 0, launching 0, idle 0, running 0, cleanup 0, unknown 0",
 		"reserved floor 0, additional headroom 0",
 		"advertisement last confirmed 1, sent 1, exchange confirmed",
 	} {
