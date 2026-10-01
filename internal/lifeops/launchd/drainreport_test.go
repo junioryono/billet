@@ -26,6 +26,8 @@ func (f *fake) reports(t *testing.T, c *Converger, pid int) {
 // stopsAfterTheDrain stages the bootout: it asserts no process of the label is
 // alive when launchd is asked, and makes the service leave the domain.
 func (f *fake) stopsAfterTheDrain(t *testing.T, pids ...int) {
+	t.Helper()
+
 	f.before = func(args []string) {
 		if args[0] != "bootout" {
 			return
@@ -306,6 +308,8 @@ func TestStopAndProveTakesTheRecordedPathWhenTheReportCannotBeRead(t *testing.T)
 
 	for name, plant := range map[string]func(t *testing.T, path string){
 		"a link to a valid report": func(t *testing.T, path string) {
+			t.Helper()
+
 			target := filepath.Join(t.TempDir(), "report")
 			if err := os.WriteFile(target, []byte(reportBody(1, "sh.billet.node", 4242, "started-4242",
 				"SIGUSR1")), 0o600); err != nil {
@@ -317,11 +321,15 @@ func TestStopAndProveTakesTheRecordedPathWhenTheReportCannotBeRead(t *testing.T)
 			}
 		},
 		"a directory": func(t *testing.T, path string) {
+			t.Helper()
+
 			if err := os.Mkdir(path, 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
 		"a FIFO": func(t *testing.T, path string) {
+			t.Helper()
+
 			if err := syscall.Mkfifo(path, 0o600); err != nil {
 				t.Fatal(err)
 			}

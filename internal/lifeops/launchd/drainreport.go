@@ -139,8 +139,13 @@ var drainReportMembers = []string{"schema", "label", "pid", "started", "request"
 func decodeDrainReport(body []byte) (drainReport, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return drainReport{}, fmt.Errorf("not a JSON object (%v)", err)
+	tok, err := dec.Token()
+	if err != nil {
+		return drainReport{}, fmt.Errorf("not a JSON object: %w", err)
+	}
+
+	if tok != json.Delim('{') {
+		return drainReport{}, errors.New("not a JSON object")
 	}
 
 	seen := map[string]bool{}
@@ -151,8 +156,8 @@ func decodeDrainReport(body []byte) (drainReport, error) {
 			return drainReport{}, err
 		}
 
-		name, _ := tok.(string)
-		if !slices.Contains(drainReportMembers, name) || seen[name] {
+		name, isName := tok.(string)
+		if !isName || !slices.Contains(drainReportMembers, name) || seen[name] {
 			return drainReport{}, fmt.Errorf("unexpected or repeated member %q", name)
 		}
 
@@ -164,8 +169,13 @@ func decodeDrainReport(body []byte) (drainReport, error) {
 		}
 	}
 
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
-		return drainReport{}, fmt.Errorf("the object is not closed (%v)", err)
+	tok, err = dec.Token()
+	if err != nil {
+		return drainReport{}, fmt.Errorf("the object is not closed: %w", err)
+	}
+
+	if tok != json.Delim('}') {
+		return drainReport{}, errors.New("the object is not closed")
 	}
 
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
