@@ -1,0 +1,45 @@
+---
+# NEEDRESTART MUST NOT RESTART BILLET'S SERVICES. On Ubuntu 24.04
+# unattended-upgrades runs `needrestart -m u` after every upgrade, and
+# needrestart.conf ships `$nrconf{restart}` commented out, so it restarts every
+# service still mapping an old copy of an upgraded library, as an ordinary
+# `systemctl restart`. A billet-node stop is a drain with no time limit: an OpenSSL
+# update restarted the reference deployment's Linux node on 2026-10-01 and again
+# on 2026-10-02, and its whole fleet ran nothing for hours. billet schedules its
+# own restarts (a rollout, a converge, `billet local down`), so the drop-in the
+# package seeds (deploy/needrestart.conf, the same bytes, which deploy's Go tests
+# and tests/needrestart-check.yml compare) is rendered here on every host where
+# needrestart is installed, and nothing is created where it is not.
+#
+# BEFORE account.yml, whose apt install is itself a package upgrade needrestart
+# would answer.
+
+- name: Inspect whether needrestart is installed
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "{{ billet_needrestart_binary }}"
+    - "{{ billet_needrestart_dir }}"
+  register: billet_needrestart_presence
+  become: true
+
+- name: Create needrestart's drop-in directory where needrestart is installed
+  ansible.builtin.file:
+    path: "{{ billet_needrestart_dir }}/conf.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when: billet_needrestart_presence.results | selectattr('stat.exists') | list | length > 0
+
+- name: Keep needrestart from restarting billet's services
+  ansible.builtin.template:
+    src: needrestart-billet.conf.j2
+    dest: "{{ billet_needrestart_dir }}/conf.d/90-billet.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  when: billet_needrestart_presence.results | selectattr('stat.exists') | list | length > 0

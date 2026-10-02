@@ -88,7 +88,7 @@
         billet_gate_ordinary_imports ==
         ['effective-config.yml', 'service-account.yml', 'upgrade-inspect.yml', 'ledger-mount-name.yml',
          'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'validate-interpreted-inputs.yml', 'network-disable.yml',
-         'retirement-node-preflight.yml', 'account.yml',
+         'retirement-node-preflight.yml', 'needrestart.yml', 'account.yml',
          'service-account.yml', 'ledger-mount.yml', 'cache-tls.yml', 'firecracker.yml', 'network.yml',
          'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml']
       - billet_gate_main_source[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
@@ -104,6 +104,7 @@
   loop:
     - {name: Record the service account and provision the authority locks on an existing installation, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: Refuse a guest network on a provider that has none, condition: 'not billet_firecracker_enabled'}
+    - {name: Exclude billet's services from needrestart, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: Configure billet account and files, condition: []}
     - {name: Record the service account and provision the authority locks on a fresh host, condition: 'not billet_retirement_node_ordinary | bool'}
     - {name: Mount the control-plane ledger volume fail closed, condition: ['billet_ledger_volume_id | length > 0', 'not billet_retirement_node_ordinary | bool']}
