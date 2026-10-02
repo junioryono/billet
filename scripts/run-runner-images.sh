@@ -80,8 +80,8 @@ prepare_build_user() {
 # ON, that a billet guest or the container it is built in does not have. Each is
 # one named test marked skipped, in the copy every step runs its tests from, by a
 # prepare on or before the first step that can select it (a script's
-# invoke_tests runs a file, or one Describe of it, mid-build); every other test
-# in the suite still runs.
+# invoke_tests runs a file mid-build, optionally filtered by Pester FullName);
+# every other test in the suite still runs.
 #
 # skip_upstream_test marks the test called NAME in FILE skipped: whatever follows
 # the name on its It line (a conditional -Skip, say) gives way to -Skip. EXACTLY

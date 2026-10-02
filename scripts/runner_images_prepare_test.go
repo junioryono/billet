@@ -233,7 +233,8 @@ func stepText(t *testing.T, step planStep) string {
 // one call and is gone; and each test skip on or before the first step that can
 // run its file, an invoke_tests mid-build (filtered or not) or the final suite.
 // Deleting an entry, or moving one past the step that needs it, fails here
-// rather than in a build.
+// rather than in a build. It reads each step's own text: a call made through a
+// helper the step sources is the reviewer's to find.
 func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 	t.Parallel()
 
@@ -262,7 +263,9 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 		}
 	}
 
-	grubCall := regexp.MustCompile(`(?m)^[^#\n]*\bupdate-grub\b`)
+	// A CALL, NOT A MENTION: the command word of a line or of a command after a
+	// separator, so text that only names update-grub cannot keep a stale prepare.
+	grubCall := regexp.MustCompile(`(?m)(^|[;&|])[ \t]*(sudo[ \t]+)?update-grub([ \t;&|]|$)`)
 	calls := 0
 	for i, step := range plan {
 		if !grubCall.MatchString(texts[i]) {
@@ -282,7 +285,7 @@ func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
 		"system-tests-virtio":    "System",
 		"system-tests-rootflags": "System",
 	} {
-		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests\s+"?` + file + `"?(\s|$)|RunAll-Tests\.ps1)`)
+		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests[ \t]+["']?` + file + `["']?([ \t;&|]|$)|RunAll-Tests\.ps1)`)
 		first := -1
 		for i := range plan {
 			if runs.MatchString(texts[i]) {
