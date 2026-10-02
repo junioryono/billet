@@ -75,6 +75,10 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 
 // ownDisk is the VM's disk, when the VM is this deployment's and neither its
 // directory nor its disk is a symlink.
+//
+// THESE CATCH ACCIDENTS, NOT AN ADVERSARY: a process running as the node's user
+// can write TART_HOME, and so can forge the marker as easily as swap a path or
+// hard-link a disk. That user is trusted; a guest never reaches these files.
 func (p *Provider) ownDisk(name string) (os.FileInfo, error) {
 	dir, err := os.Lstat(p.vmDir(name))
 	if err != nil {

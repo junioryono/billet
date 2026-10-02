@@ -163,7 +163,7 @@ func TestAVMProcessThatCannotBeProvedIsRefused(t *testing.T) {
 		},
 		{
 			name:    "the disk was replaced between the proofs",
-			answers: []string{"echo 1", `for a; do d=$a; done; rm -f "$d"; : > "$d"; echo 1`},
+			answers: []string{"echo 1", `for a; do d=$a; done; mv "$d" "$d.old"; : > "$d"; echo 1`},
 			paths:   map[int]string{1: vmService}, starts: map[int]uint64{1: 1}, want: "disk changed",
 		},
 	} {
