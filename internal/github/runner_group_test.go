@@ -115,13 +115,14 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 		runnerID    int64
 		wantPresent bool
 		wantBusy    bool
+		wantOnline  bool
 		wantID      int64
 		wantErr     bool
 		status      int
 	}{
 		{name: "absent", listed: `{"total_count":0,"runners":[]}`, runnerID: 71},
-		{name: "busy", listed: `{"total_count":1,"runners":[{"id":71,"name":"billet-l1","status":"online","busy":true,"ephemeral":true}]}`, runnerID: 71, wantPresent: true, wantBusy: true, wantID: 71},
-		{name: "idle without redundant ephemeral field", listed: `{"total_count":1,"runners":[{"id":72,"name":"billet-l1","status":"online","busy":false}]}`, runnerID: 72, wantPresent: true, wantID: 72},
+		{name: "busy", listed: `{"total_count":1,"runners":[{"id":71,"name":"billet-l1","status":"online","busy":true,"ephemeral":true}]}`, runnerID: 71, wantPresent: true, wantBusy: true, wantOnline: true, wantID: 71},
+		{name: "idle without redundant ephemeral field", listed: `{"total_count":1,"runners":[{"id":72,"name":"billet-l1","status":"online","busy":false}]}`, runnerID: 72, wantPresent: true, wantOnline: true, wantID: 72},
 		{name: "offline with null ephemeral field", listed: `{"total_count":1,"runners":[{"id":73,"name":"billet-l1","status":"offline","busy":false,"ephemeral":null}]}`, runnerID: 73, wantPresent: true, wantID: 73},
 		{name: "static", listed: `{"total_count":1,"runners":[{"id":74,"name":"billet-l1","status":"online","busy":false,"ephemeral":false}]}`, runnerID: 74, wantErr: true},
 		{name: "busy offline", listed: `{"total_count":1,"runners":[{"id":75,"name":"billet-l1","status":"offline","busy":true,"ephemeral":true}]}`, runnerID: 75, wantErr: true},
@@ -132,7 +133,7 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 		{name: "null runners", listed: `{"total_count":0,"runners":null}`, runnerID: 71, wantErr: true},
 		{name: "missing busy", listed: `{"total_count":1,"runners":[{"id":80,"name":"billet-l1","status":"online","ephemeral":true}]}`, runnerID: 80, wantErr: true},
 		{name: "replacement id", listed: `{"total_count":1,"runners":[{"id":81,"name":"billet-l1","status":"online","busy":false,"ephemeral":true}]}`, runnerID: 82, wantErr: true},
-		{name: "unrelated partial record", listed: `{"total_count":2,"runners":[{"name":"other"},{"id":83,"name":"billet-l1","status":"online","busy":false}]}`, runnerID: 83, wantPresent: true, wantID: 83},
+		{name: "unrelated partial record", listed: `{"total_count":2,"runners":[{"name":"other"},{"id":83,"name":"billet-l1","status":"online","busy":false}]}`, runnerID: 83, wantPresent: true, wantOnline: true, wantID: 83},
 		{name: "unnameable record", listed: `{"total_count":2,"runners":[{"id":84},{"id":83,"name":"billet-l1","status":"online","busy":false}]}`, runnerID: 83, wantErr: true},
 		{name: "invalid expected id", listed: `{"total_count":0,"runners":[]}`, wantErr: true},
 		{name: "api failure", listed: `{"message":"unavailable"}`, runnerID: 71, status: http.StatusServiceUnavailable, wantErr: true},
@@ -170,9 +171,10 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 			if err != nil {
 				t.Fatalf("InspectScaleSetRunner: %v", err)
 			}
-			if got.Present != tc.wantPresent || got.Busy != tc.wantBusy || got.RunnerID != tc.wantID {
-				t.Errorf("recovery = %+v, want present %v busy %v id %d",
-					got, tc.wantPresent, tc.wantBusy, tc.wantID)
+			if got.Present != tc.wantPresent || got.Busy != tc.wantBusy || got.Online != tc.wantOnline ||
+				got.RunnerID != tc.wantID {
+				t.Errorf("recovery = %+v, want present %v busy %v online %v id %d",
+					got, tc.wantPresent, tc.wantBusy, tc.wantOnline, tc.wantID)
 			}
 		})
 	}
