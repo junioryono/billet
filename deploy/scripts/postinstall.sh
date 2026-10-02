@@ -501,6 +501,69 @@ if [ "${deferred}" -ne 0 ]; then
     echo "        deb host, or reinstalling the package on an rpm one." >&2
 fi
 
+# NEEDRESTART MUST NOT RESTART BILLET'S SERVICES. On Ubuntu 24.04 unattended-
+# upgrades runs `needrestart -m u` after every upgrade, and needrestart.conf ships
+# `$nrconf{restart}` commented out, so it restarts every service still mapping an
+# old copy of an upgraded library; an OpenSSL update restarted billet-node, whose
+# stop is a drain with no time limit, and the node took no work for hours
+# (measured on the reference deployment, 2026-10-01 and 2026-10-02). billet
+# schedules its own restarts. SEEDED, NOT OWNED, like the configuration: copied
+# only where needrestart is installed and nothing is at the name yet, never over
+# an operator's file, and left behind on removal, where it matches no unit.
+NEEDRESTART_DIR=/etc/needrestart
+NEEDRESTART_DROPIN="${NEEDRESTART_DIR}/conf.d/90-billet.conf"
+NEEDRESTART_TEMPLATE=/usr/share/billet/needrestart.conf
+
+# EVERY STEP CHECKS ITSELF, because the caller is an `||` list and errexit is
+# suspended inside it: an install must not fail over a file that only keeps a
+# package hook away, but it must say when that file was not installed.
+install_needrestart_exclusion() {
+    if [ ! -d "${NEEDRESTART_DIR}" ]; then
+        return 0
+    fi
+
+    # A DANGLING SYMLINK IS SOMETHING AT THE NAME, and `-e` is false for one.
+    if [ -e "${NEEDRESTART_DROPIN}" ] || [ -L "${NEEDRESTART_DROPIN}" ]; then
+        return 0
+    fi
+
+    if [ ! -f "${NEEDRESTART_TEMPLATE}" ]; then
+        echo "billet: ${NEEDRESTART_TEMPLATE} is missing, so ${NEEDRESTART_DROPIN} was not created." >&2
+
+        return 1
+    fi
+
+    if ! mkdir -p "${NEEDRESTART_DIR}/conf.d"; then
+        return 1
+    fi
+
+    # PUBLISHED BY `ln -T`, which refuses an existing name, so a file that
+    # appeared since the test above is never overwritten. The temporary name
+    # does not end in .conf, so needrestart's conf.d glob never reads it.
+    needrestart_temp=$(mktemp "${NEEDRESTART_DROPIN}.XXXXXX" 2>/dev/null) || needrestart_temp=
+
+    if [ -z "${needrestart_temp}" ]; then
+        return 1
+    fi
+
+    if ! cp "${NEEDRESTART_TEMPLATE}" "${needrestart_temp}" || ! chown root:root "${needrestart_temp}" ||
+        ! chmod 0644 "${needrestart_temp}" || ! ln -T -- "${needrestart_temp}" "${NEEDRESTART_DROPIN}"; then
+        remove_or_name "${needrestart_temp}" || true
+
+        return 1
+    fi
+
+    # The drop-in is installed whatever this answers; a stray second link is
+    # named by remove_or_name itself.
+    remove_or_name "${needrestart_temp}" || true
+}
+
+if ! install_needrestart_exclusion; then
+    echo "billet: ${NEEDRESTART_DROPIN} could not be installed, so needrestart may restart" >&2
+    echo "        billet's services after a library upgrade. Copy ${NEEDRESTART_TEMPLATE}" >&2
+    echo "        there (root:root 0644), or reinstall the package once the cause is fixed." >&2
+fi
+
 # THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
 # that cannot be root-owned-and-group-readable.
 #

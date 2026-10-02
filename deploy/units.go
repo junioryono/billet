@@ -83,6 +83,20 @@ var ImagesRefreshUnit string
 //go:embed billet-images-refresh.timer
 var ImagesRefreshTimer string
 
+// NeedrestartDropIn is the needrestart configuration the package installs at
+// NeedrestartDropInPath (and the Ansible host role renders byte for byte), so
+// that an unattended library upgrade never restarts a billet service: a
+// billet-node stop is a drain with no time limit, and billet schedules its own
+// restarts. NeedrestartExclusion is its one effective line.
+//
+//go:embed needrestart.conf
+var NeedrestartDropIn string
+
+const (
+	NeedrestartDropInPath = "/etc/needrestart/conf.d/90-billet.conf"
+	NeedrestartExclusion  = "$nrconf{override_rc}{qr(^billet-)} = 0;"
+)
+
 // Launch agent labels, as launchd knows them. A macOS service is addressed by
 // its LABEL rather than its filename, so these are the strings `launchctl`
 // takes — and the filenames happen to match, which is convention rather than a
