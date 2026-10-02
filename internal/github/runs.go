@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -183,23 +181,9 @@ func (c *runnerGroupPolicyClient) getJSON(ctx context.Context, endpoint, operati
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, operation)
 	if err != nil {
-		return fmt.Errorf("github: build %s request: %w", operation, err)
-	}
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return fmt.Errorf("github: %s: %w", operation, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("github: %s: %w", operation, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("github: %s: %w", operation, apiError(resp.StatusCode, body))
+		return err
 	}
 	if err := json.Unmarshal(body, into); err != nil {
 		return fmt.Errorf("github: decode %s: %w", operation, err)

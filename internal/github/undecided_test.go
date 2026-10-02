@@ -27,6 +27,7 @@ func TestUndecidedSeparatesGitHubBeingDownFromGitHubAnswering(t *testing.T) {
 		{"a 429", wrap(apiError(http.StatusTooManyRequests, nil)), true},
 		{"a rate-limited 403", wrap(apiError(http.StatusForbidden, []byte(`{"message":"API rate limit exceeded"}`))), true},
 		{"no response", wrap(&url.Error{Op: "Get", URL: "https://api.github.com", Err: errors.New("connection reset")}), true},
+		{"no whole answer", wrap(fmt.Errorf("%w: the response broke off", errNoAnswer)), true},
 		{"already unverifiable", fmt.Errorf("%w: %w", ErrAppUnverifiable, errors.New("x")), true},
 		{"a refusing 403", wrap(apiError(http.StatusForbidden, []byte(`{"message":"Resource not accessible by integration"}`))), false},
 		{"a 404", wrap(apiError(http.StatusNotFound, nil)), false},
