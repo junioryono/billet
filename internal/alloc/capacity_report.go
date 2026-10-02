@@ -58,12 +58,15 @@ func (a *Allocator) RecordListenerCapacity(ctx context.Context, tier string, rep
 // TierCapacity separates charged leases from guarantees and additional headroom.
 // The observation's age is always shown: a stopped listener leaves a last report,
 // not a claim that another process can infer GitHub's present advertisement.
+//
+// Idle is a launched lease whose runner's record says it has no job, Running one
+// whose record says GitHub started a job on it.
 type TierCapacity struct {
-	Discovery, Pending, Launching, Running, Cleanup, Unknown int
-	Floor, Headroom                                          int
-	ObservedAt                                               string
-	ObservationError                                         string
-	Listener                                                 ListenerCapacity
+	Discovery, Pending, Launching, Idle, Running, Cleanup, Unknown int
+	Floor, Headroom                                                int
+	ObservedAt                                                     string
+	ObservationError                                               string
+	Listener                                                       ListenerCapacity
 }
 
 // CapacityReport reads ownership and charged phases in one ledger snapshot.
@@ -108,10 +111,12 @@ func (a *Allocator) CapacityReport(ctx context.Context, tier string) (TierCapaci
 				}
 			case PhaseAssigned:
 				out.Pending++
-			case PhaseLaunching:
-				out.Launching++
-			case PhaseOnline, PhaseBusy:
-				out.Running++
+			case PhaseLaunching, PhaseOnline, PhaseBusy:
+				member, found, err := poolRunnerByLease(ctx, state.ReadQueries(tx), lease.ID)
+				if err != nil {
+					return fmt.Errorf("alloc: read the pool runner of lease %s: %w", lease.ID, err)
+				}
+				out.countLaunched(Phase(lease.Phase), member, found, tier)
 			case PhaseCustody, PhaseTeardown, PhaseQuarantine:
 				out.Cleanup++
 			}
@@ -122,4 +127,33 @@ func (a *Allocator) CapacityReport(ctx context.Context, tier string) (TierCapaci
 	})
 
 	return out, err
+}
+
+// countLaunched classifies a lease of tier that has entered launch.
+//
+// A POOLED RUNNER'S PROGRESS IS ON ITS POOL RECORD, NOT ITS LEASE. Every launch
+// registers a pool member, idle, and JobStarted marks it busy; the lease stays
+// in `launching` throughout (StartPoolRunner), so the phase alone reported a
+// busy fleet as one still starting up. A lease with no record is a launch the
+// listener has not yet seen return. A record naming another tier, or a status
+// this does not know, is unknown.
+func (out *TierCapacity) countLaunched(phase Phase, member PoolRunner, found bool, tier string) {
+	switch {
+	case !found && phase == PhaseLaunching:
+		out.Launching++
+	case !found && phase == PhaseOnline:
+		out.Idle++
+	case !found:
+		out.Running++
+	case member.Tier != tier:
+		out.Unknown++
+	case member.Status == PoolRunnerIdle:
+		out.Idle++
+	case member.Status == PoolRunnerBusy:
+		out.Running++
+	case member.Status == PoolRunnerRetiring || member.Status == PoolRunnerRetired:
+		out.Cleanup++
+	default:
+		out.Unknown++
+	}
 }

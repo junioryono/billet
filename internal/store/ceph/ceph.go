@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -59,6 +60,21 @@ type Client struct {
 	// one; only a test sets it, for the reason withRunner exists.
 	observation time.Duration
 	verify      filesystemVerifier
+
+	// halfRemoved remembers when each cache image finishHalfRemoved found
+	// unopenable was first seen so, which a second sighting requires.
+	halfRemovedMu sync.Mutex
+	halfRemoved   map[string]time.Time
+	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
+	clock func() time.Time
+}
+
+func (c *Client) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+
+	return time.Now()
 }
 
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS
@@ -791,18 +807,13 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 
 // rbdCmdWithin is rbdCmd under a bound of its own, for the one deletion that
 // takes minutes by nature and is only ever run off the command path.
-func (c *Client) rbdCmdWithin(ctx context.Context, bound time.Duration, asJSON bool,
-	command ...string,
-) ([]byte, error) {
+func (c *Client) rbdCmdWithin(ctx context.Context, bound time.Duration, command ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 
-	args := c.identity()
-	if asJSON {
-		args = append(args, "--format", "json")
-	}
+	_, err := c.run(ctx, c.bin, append(c.identity(), command...))
 
-	return c.run(ctx, c.bin, append(args, command...))
+	return err
 }
 
 // list counts the images in one pool.
