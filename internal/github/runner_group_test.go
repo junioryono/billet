@@ -15,7 +15,7 @@ import (
 
 func TestRunnerGroupPolicyClientRedactsEveryRenderingPath(t *testing.T) {
 	key, _ := testKeyPKCS1(t)
-	c := newRunnerGroupPolicyClient(http.DefaultClient, "https://api.example.test", OrganizationTarget("acme"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, "https://api.example.test", OrganizationTarget("acme"), 11, 22, key)
 	c.token = "cached-installation-secret"
 	c.expiresAt = time.Now().Add(time.Hour)
 
@@ -69,7 +69,7 @@ func TestTrustedRunnerGroupRequiresTheExactWorkflowRestriction(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 	want := []string{"acme/api/.github/workflows/ci.yml@refs/heads/main",
 		"acme/api/.github/workflows/release.yml@refs/heads/main"}
 	if err := c.ValidateTrustedRunnerGroup(t.Context(), 7, want); err != nil {
@@ -97,7 +97,7 @@ func TestTrustedRunnerGroupRefusesPolicyDrift(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-	c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 	if err := c.ValidateTrustedRunnerGroup(t.Context(), 7, []string{"acme/api/.github/workflows/ci.yml@refs/heads/main"}); err == nil {
 		t.Fatal("accepted a runner group without workflow restriction")
 	}
@@ -158,7 +158,7 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 			})
 			srv := httptest.NewServer(mux)
 			defer srv.Close()
-			c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+			c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 			c.token = "cached-token"
 			c.expiresAt = time.Now().Add(time.Hour)
 			got, err := c.InspectScaleSetRunner(t.Context(), "billet-l1", tc.runnerID)
@@ -228,7 +228,7 @@ func TestTrustedRunnerGroupRequiresARepositoryGrant(t *testing.T) {
 	t.Run("selected with no repositories is refused", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, _ := newServer(t, "selected", 0)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		err := c.ValidateTrustedRunnerGroup(t.Context(), 7, want)
 		if err == nil {
@@ -242,7 +242,7 @@ func TestTrustedRunnerGroupRequiresARepositoryGrant(t *testing.T) {
 	t.Run("selected with a grant is accepted", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, _ := newServer(t, "selected", 1)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		if err := c.ValidateTrustedRunnerGroup(t.Context(), 7, want); err != nil {
 			t.Errorf("a group granting a repository was refused: %v", err)
@@ -252,7 +252,7 @@ func TestTrustedRunnerGroupRequiresARepositoryGrant(t *testing.T) {
 	t.Run("visibility all does not consult the repositories endpoint", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, repoCalls := newServer(t, "all", 0)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		if err := c.ValidateTrustedRunnerGroup(t.Context(), 7, want); err != nil {
 			t.Errorf("a group visible to all repositories was refused: %v", err)
@@ -362,7 +362,7 @@ func TestRunnerGroupReachRequiresARepositoryGrant(t *testing.T) {
 	t.Run("selected with no repositories is refused", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, _ := newServer(t, "selected", 0)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		err := c.ValidateRunnerGroupReach(t.Context(), 1)
 		if err == nil {
@@ -377,7 +377,7 @@ func TestRunnerGroupReachRequiresARepositoryGrant(t *testing.T) {
 	t.Run("selected with a grant is accepted", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, _ := newServer(t, "selected", 1)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		if err := c.ValidateRunnerGroupReach(t.Context(), 1); err != nil {
 			t.Errorf("a group granting a repository was refused: %v", err)
@@ -390,7 +390,7 @@ func TestRunnerGroupReachRequiresARepositoryGrant(t *testing.T) {
 	t.Run("an unrestricted group is accepted", func(t *testing.T) {
 		key, _ := testKeyPKCS1(t)
 		srv, calls := newServer(t, "all", 0)
-		c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
 		if err := c.ValidateRunnerGroupReach(t.Context(), 1); err != nil {
 			t.Errorf("a group visible to every repository was refused: %v", err)

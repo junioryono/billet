@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -46,30 +46,55 @@ type RunnerRecovery struct {
 
 type runnerGroupPolicyClient struct {
 	client         *http.Client
+	request        time.Duration
 	base           string
 	target         Target
 	appID          int64
 	installationID int64
 	privateKey     []byte
 
-	mu        sync.Mutex
+	// tokenSlot admits one installation-token exchange at a time. A channel
+	// rather than a mutex so a caller waiting behind a stalled exchange gives up
+	// when its own context does.
+	tokenSlot chan struct{}
 	token     string
 	expiresAt time.Time
 }
 
-// NewRunnerGroupPolicyClient builds a client for GitHub.com's REST API on one
-// target.
-//
-// A REPOSITORY TARGET GETS A CLIENT TOO, because runner recovery
-// (InspectScaleSetRunner) lists the target's runners, which a repository has;
-// every runner-group question on such a client answers ErrNoRunnerGroups.
-func NewRunnerGroupPolicyClient(target Target, appID, installationID int64,
-	privateKey []byte,
-) RunnerGroupPolicyClient {
-	return newRunnerGroupPolicyClient(http.DefaultClient, apiBase, target, appID, installationID, privateKey)
+// policyBounds limits every request the policy client makes. The policy is read
+// before every JIT mint, so a request nothing bounds holds its target's
+// registrations for as long as the connection stays silent.
+type policyBounds struct {
+	dial, tlsHandshake, responseHeader time.Duration
+	// request bounds one exchange end to end, body included.
+	request time.Duration
+	// pingAfter and pingTimeout close a silent HTTP/2 connection rather than
+	// reusing it, as the scale-set client does (#205).
+	pingAfter, pingTimeout time.Duration
 }
 
-// NewRunnerGroupPolicyClientAt builds a client for a GitHub Enterprise API base.
+var defaultPolicyBounds = policyBounds{
+	dial:           10 * time.Second,
+	tlsHandshake:   10 * time.Second,
+	responseHeader: 20 * time.Second,
+	request:        requestTimout,
+	pingAfter:      30 * time.Second,
+	pingTimeout:    15 * time.Second,
+}
+
+// maxPolicyResponse is the largest body the policy client reads. A longer one
+// is not read as an answer: a prefix of it can be a valid document that says
+// something the whole does not.
+const maxPolicyResponse = 1 << 20
+
+// errNoAnswer marks a policy request GitHub did not answer whole: a body that
+// stalled or broke mid-read, a body past maxPolicyResponse, or a wait for the
+// token exchange the caller abandoned. Undecided reads it as could-not-tell.
+var errNoAnswer = errors.New("github: GitHub did not answer in full")
+
+// NewRunnerGroupPolicyClientAt builds the policy client for one target on the
+// REST API at base, on an HTTP client of its own.
+//
 // AN EMPTY BASE MEANS THE REAL GITHUB, which is what every production caller
 // passes and what no test ever did.
 //
@@ -81,6 +106,10 @@ func NewRunnerGroupPolicyClient(target Target, appID, installationID int64,
 //
 // That check exists because a misconfigured runner group was the first failure
 // two operators hit on a fresh host, and it could not have caught one.
+//
+// A REPOSITORY TARGET GETS A CLIENT TOO, because runner recovery
+// (InspectScaleSetRunner) lists the target's runners, which a repository has;
+// every runner-group question on such a client answers ErrNoRunnerGroups.
 func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installationID int64,
 	privateKey []byte,
 ) RunnerGroupPolicyClient {
@@ -88,14 +117,85 @@ func NewRunnerGroupPolicyClientAt(base string, target Target, appID, installatio
 		base = apiBase
 	}
 
-	return newRunnerGroupPolicyClient(http.DefaultClient, base, target, appID, installationID, privateKey)
+	return newRunnerGroupPolicyClient(defaultPolicyBounds, base, target, appID, installationID, privateKey)
 }
 
-func newRunnerGroupPolicyClient(client *http.Client, base string, target Target, appID, installationID int64,
-	privateKey []byte,
+func newRunnerGroupPolicyClient(bounds policyBounds, base string, target Target, appID,
+	installationID int64, privateKey []byte,
 ) *runnerGroupPolicyClient {
-	return &runnerGroupPolicyClient{client: client, base: base, target: target, appID: appID,
-		installationID: installationID, privateKey: bytes.Clone(privateKey)}
+	return &runnerGroupPolicyClient{client: newPolicyHTTPClient(bounds), request: bounds.request,
+		base: base, target: target, appID: appID, installationID: installationID,
+		privateKey: bytes.Clone(privateKey), tokenSlot: make(chan struct{}, 1)}
+}
+
+// newPolicyHTTPClient builds a client and transport of the policy client's own,
+// so it shares neither the process-wide default transport nor another target's
+// connections.
+func newPolicyHTTPClient(b policyBounds) *http.Client {
+	return &http.Client{
+		Timeout: b.request,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: b.dial, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   b.tlsHandshake,
+			ResponseHeaderTimeout: b.responseHeader,
+			ExpectContinueTimeout: time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          10,
+			ForceAttemptHTTP2:     true,
+			HTTP2:                 &http.HTTP2Config{SendPingTimeout: b.pingAfter, PingTimeout: b.pingTimeout},
+		},
+	}
+}
+
+// exchange sends one request under the per-request bound and returns the
+// status and the whole body. A transport failure comes back as the client's
+// *url.Error and a body not read whole as errNoAnswer, both undecided.
+func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint, bearer string,
+) (int, []byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.request)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, http.NoBody)
+	if err != nil {
+		return 0, nil, fmt.Errorf("build request: %w", err)
+	}
+
+	setAPIHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, nil, err //nolint:wrapcheck // callers wrap with the operation name; *url.Error is what Undecided reads.
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponse+1))
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer, err)
+	}
+
+	if len(body) > maxPolicyResponse {
+		return 0, nil, fmt.Errorf("%w: the response exceeds %d bytes", errNoAnswer, maxPolicyResponse)
+	}
+
+	return resp.StatusCode, body, nil
+}
+
+// get reads one document with the installation token, refusing any status but
+// 200 with GitHub's own error.
+func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, operation string,
+) ([]byte, error) {
+	status, body, err := c.exchange(ctx, http.MethodGet, endpoint, token)
+	if err != nil {
+		return nil, fmt.Errorf("github: %s: %w", operation, err)
+	}
+
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("github: %s: %w", operation, apiError(status, body))
+	}
+
+	return body, nil
 }
 
 // configured reports whether this client can authenticate at all.
@@ -131,23 +231,9 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 		return err
 	}
 	endpoint := fmt.Sprintf("%s/%d", c.target.runnerGroupsEndpoint(c.base), groupID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, "get runner-group policy")
 	if err != nil {
-		return fmt.Errorf("github: build runner-group policy request: %w", err)
-	}
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return fmt.Errorf("github: get runner-group policy: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("github: read runner-group policy: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("github: get runner-group policy: %w", apiError(resp.StatusCode, body))
+		return err
 	}
 	var policy struct {
 		RestrictedToWorkflows bool     `json:"restricted_to_workflows"`
@@ -257,27 +343,9 @@ func (c *runnerGroupPolicyClient) runnerGroupVisibility(
 ) (string, error) {
 	endpoint := fmt.Sprintf("%s/%d", c.target.runnerGroupsEndpoint(c.base), groupID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, "get runner group")
 	if err != nil {
-		return "", fmt.Errorf("github: build runner-group request: %w", err)
-	}
-
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return "", fmt.Errorf("github: get runner group: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return "", fmt.Errorf("github: read runner group: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github: get runner group: %w", apiError(resp.StatusCode, body))
+		return "", err
 	}
 
 	var group struct {
@@ -311,24 +379,9 @@ func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 	}
 	query := url.Values{"name": {runnerName}, "per_page": {"100"}}
 	endpoint := c.target.runnersEndpoint(c.base) + "?" + query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, "list runners for recovery")
 	if err != nil {
-		return RunnerRecovery{}, fmt.Errorf("github: build runner recovery request: %w", err)
-	}
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return RunnerRecovery{}, fmt.Errorf("github: list runners for recovery: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return RunnerRecovery{}, fmt.Errorf("github: read runners for recovery: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return RunnerRecovery{}, fmt.Errorf("github: list runners for recovery: %w",
-			apiError(resp.StatusCode, body))
+		return RunnerRecovery{}, err
 	}
 	type runnerRecord struct {
 		ID        *int64  `json:"id"`
@@ -394,8 +447,14 @@ func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 }
 
 func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case c.tokenSlot <- struct{}{}:
+	case <-ctx.Done():
+		return "", fmt.Errorf("%w: waiting for another installation-token exchange: %w",
+			errNoAnswer, ctx.Err())
+	}
+	defer func() { <-c.tokenSlot }()
+
 	if c.token != "" && time.Until(c.expiresAt) > time.Minute {
 		return c.token, nil
 	}
@@ -404,33 +463,20 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return "", err
 	}
 	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.base, c.installationID)
-	// BOUNDED, request and body alike: this holds c.mu, which every other caller
-	// of the client waits on, and the client it was given may carry no timeout.
-	ctx, cancel := context.WithTimeout(ctx, requestTimout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
-	if err != nil {
-		return "", fmt.Errorf("github: build installation-token request: %w", err)
-	}
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+jwt)
-	resp, err := doWithTimeout(c.client, req)
+	status, body, err := c.exchange(ctx, http.MethodPost, endpoint, jwt)
 	if err != nil {
 		return "", fmt.Errorf("github: create installation token: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
+	if status != http.StatusCreated {
 		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
 		// GitHub being unable to answer (5xx, a throttle) through Undecided.
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16)) //nolint:errcheck // a body that cannot be read leaves only the status, which still decides.
-
-		return "", fmt.Errorf("github: create installation token: %w", apiError(resp.StatusCode, body))
+		return "", fmt.Errorf("github: create installation token: %w", apiError(status, body))
 	}
 	var out struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+	if err := json.Unmarshal(body, &out); err != nil {
 		return "", fmt.Errorf("github: decode installation token: %w", err)
 	}
 	if out.Token == "" || out.ExpiresAt.IsZero() {
@@ -488,28 +534,9 @@ func (c *runnerGroupPolicyClient) runnerGroupRepositories(
 ) (int, error) {
 	endpoint := fmt.Sprintf("%s/%d/repositories", c.target.runnerGroupsEndpoint(c.base), groupID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, "get runner-group repositories")
 	if err != nil {
-		return 0, fmt.Errorf("github: build runner-group repositories request: %w", err)
-	}
-
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return 0, fmt.Errorf("github: get runner-group repositories: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, fmt.Errorf("github: read runner-group repositories: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("github: get runner-group repositories: %w",
-			apiError(resp.StatusCode, body))
+		return 0, err
 	}
 
 	var listed struct {
@@ -549,27 +576,9 @@ func (c *runnerGroupPolicyClient) FindRunnerGroupID(ctx context.Context, name st
 
 	endpoint := c.target.runnerGroupsEndpoint(c.base) + "?per_page=100"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	body, err := c.get(ctx, token, endpoint, "list runner groups")
 	if err != nil {
-		return 0, false, fmt.Errorf("github: build runner-group list request: %w", err)
-	}
-
-	setAPIHeaders(req)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := doWithTimeout(c.client, req)
-	if err != nil {
-		return 0, false, fmt.Errorf("github: list runner groups: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, false, fmt.Errorf("github: read runner groups: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, false, fmt.Errorf("github: list runner groups: %w", apiError(resp.StatusCode, body))
+		return 0, false, err
 	}
 
 	var listed struct {
