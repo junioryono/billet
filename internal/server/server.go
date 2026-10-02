@@ -502,6 +502,13 @@ func (s *Server) Run(ctx context.Context) error {
 	// leaving a control plane that is advertising for some tiers and silent for
 	// others — a state whose only symptom is jobs queueing forever on the tiers
 	// nobody is listening to.
+	//
+	// SO ONLY WHAT THE DEPLOYMENT MUST STOP FOR REACHES HERE. A poll that fails
+	// past the client's retries is one target's broker, not the deployment, and
+	// the listener reopens its session with backoff and says so on every attempt
+	// (WithSessionReopen) rather than stopping every tier of every target (#207).
+	// A lost controller claim, a session response billet cannot act on, and a
+	// misconfigured listener still return, and still stop everything.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -589,7 +596,10 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 	if reader, ok := prov.(RunEvidence); ok {
 		evidence = reader
 	}
-	opts := append(s.listenerOpts(prov), WithCachePublication(t.EffectiveCache(), evidence))
+	opts := append(s.listenerOpts(prov), WithCachePublication(t.EffectiveCache(), evidence),
+		WithSessionReopen(func(ctx context.Context) (Session, error) {
+			return s.openSession(ctx, t, set, prov)
+		}))
 
 	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
 }
@@ -620,6 +630,12 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 // sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
 	for attempt := 1; ; attempt++ {
+		// BEFORE EVERY ATTEMPT, because a listener's recovery waits here too, and
+		// a process that is no longer the controller opens nothing.
+		if s.leadershipLost != nil && s.leadershipLost() {
+			return nil, fmt.Errorf("server: open session for tier %s: %w", t.Label, state.ErrLeadershipLost)
+		}
+
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
 			return session, nil
