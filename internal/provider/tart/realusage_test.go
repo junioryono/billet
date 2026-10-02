@@ -15,7 +15,17 @@ func TestARealVMIsFoundAndMeasured(t *testing.T) {
 	if name == "" {
 		t.Skip("BILLET_TART_USAGE_VM names no running VM")
 	}
-	p, err := New(testOwner)
+	// THE DEPLOYMENT IS THE VM'S OWN: this proves finding and reading a real VM,
+	// and the refusal of someone else's is proved above against fixtures.
+	probe, err := New(testOwner)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	owner, err := probe.ownerOf(name)
+	if err != nil {
+		t.Fatalf("read %s's ownership marker: %v", name, err)
+	}
+	p, err := New(owner)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

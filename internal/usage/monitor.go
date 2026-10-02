@@ -118,6 +118,9 @@ type job struct {
 	points     []Point
 
 	energyActive, energyIdle float64
+	// processEnergyAt is when the process's energy was last read: a lifetime
+	// total is the job's whole energy only if it is recent.
+	processEnergyAt time.Time
 	// energyBroken is set when any interval of the job's life could not be
 	// attributed, which makes its energy could-not-tell rather than too low.
 	energyBroken bool
@@ -222,7 +225,7 @@ func (m *Monitor) start(key string, j *job) {
 		return
 	}
 	j.first, j.pending, j.points = now, false, nil
-	j.absorb(s)
+	j.absorb(s, now)
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
 }
@@ -333,7 +336,7 @@ func (m *Monitor) tick() {
 		if j != snapshot[key] {
 			continue
 		}
-		j.absorb(*s)
+		j.absorb(*s, now)
 		if m.opts.RAPL {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
@@ -395,7 +398,7 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
 }
 
-func (j *job) absorb(s Sample) {
+func (j *job) absorb(s Sample, now time.Time) {
 	j.samples++
 	if s.CPUOK {
 		j.latest.CPUUsage, j.latest.CPUUser, j.latest.CPUSys = s.CPUUsage, s.CPUUser, s.CPUSys
@@ -431,7 +434,7 @@ func (j *job) absorb(s Sample) {
 	}
 	if s.ProcessEnergyOK {
 		j.latest.ProcessEnergy = s.ProcessEnergy
-		j.seen.processEnergy = true
+		j.seen.processEnergy, j.processEnergyAt = true, now
 	}
 }
 
@@ -512,7 +515,7 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if current, ok := m.jobs[key]; !ok || current != j {
 		return Summary{}, false
 	}
-	j.absorb(s)
+	j.absorb(s, now)
 
 	return m.summaryOf(j, now), true
 }
@@ -528,9 +531,12 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 		Points: points,
 	}
 	// A PROCESS'S ENERGY IS A LIFETIME TOTAL the kernel keeps, so no gap in
-	// sampling loses any of it: the last reading is the whole job's.
+	// sampling loses any of it, but only a recent reading is the whole job's: one
+	// from the final read, or from a tick the job did not outlive by
+	// staleAfter intervals. An older one is could-not-tell, never a smaller total.
 	if j.target.Process {
-		sum.Measured.Energy, sum.EnergyProcess = j.seen.processEnergy, true
+		fresh := now.Sub(j.processEnergyAt) < staleAfter*m.opts.Interval
+		sum.Measured.Energy, sum.EnergyProcess = j.seen.processEnergy && fresh, true
 		sum.EnergyActive = j.latest.ProcessEnergy
 
 		return sum

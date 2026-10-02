@@ -6,12 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/junioryono/billet/internal/provider"
 )
 
 const usageVM = "billet-c8b3dc17240b3ccb03e16d03efa9f22d"
+
+// goneHolder is a pid lsof listed whose process has since exited.
+const goneHolder = 4242
 
 // usageHost is a provider over a TART_HOME holding usageVM's disk, with a fake
 // lsof that answers each call with the next of answers (the last repeats) and
@@ -34,6 +38,10 @@ func newUsageHost(t *testing.T, answers ...string) usageHost {
 	}
 	if err := os.WriteFile(disk, nil, 0o600); err != nil {
 		t.Fatalf("write the disk: %v", err)
+	}
+	marker := filepath.Join(filepath.Dir(disk), ownerMarker)
+	if err := os.WriteFile(marker, []byte(testOwner+"\n"), 0o600); err != nil {
+		t.Fatalf("write the ownership marker: %v", err)
 	}
 	bin := t.TempDir()
 	argvLog := filepath.Join(bin, "argv")
@@ -64,8 +72,11 @@ func newUsageHost(t *testing.T, answers ...string) usageHost {
 		if path, ok := h.paths[pid]; ok {
 			return path, nil
 		}
+		if pid == goneHolder {
+			return "", fmt.Errorf("read the executable: %w", syscall.ESRCH)
+		}
 
-		return "", errors.New("no such process")
+		return "", errors.New("operation not permitted")
 	}
 	p.processStart = func(pid int) (uint64, error) {
 		if start, ok := h.starts[pid]; ok {
@@ -100,7 +111,7 @@ func TestAVMIsTheVirtualizationProcessHoldingItsDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read lsof's argv: %v", err)
 	}
-	if want := "-t -- " + h.disk + "\n"; string(argv) != want+want {
+	if want := "-t +w -- " + h.disk + "\n"; string(argv) != want+want {
 		t.Errorf("lsof was asked %q, want the disk twice: %q", argv, want+want)
 	}
 }
@@ -141,6 +152,20 @@ func TestAVMProcessThatCannotBeProvedIsRefused(t *testing.T) {
 			want: "cannot stat()",
 		},
 		{name: "lsof answered nonsense", answers: []string{"echo 12x"}, want: "not a pid"},
+		{
+			name:    "lsof warned and still succeeded",
+			answers: []string{"echo 1; echo 'lsof: WARNING: cannot stat()' >&2"},
+			paths:   map[int]string{1: vmService}, starts: map[int]uint64{1: 1}, want: "may be short",
+		},
+		{
+			name: "a holder could not be read", answers: []string{"echo 1; echo 2"},
+			paths: map[int]string{1: vmService}, starts: map[int]uint64{1: 1}, want: "could not tell what process 2",
+		},
+		{
+			name:    "the disk was replaced between the proofs",
+			answers: []string{"echo 1", `for a; do d=$a; done; rm -f "$d"; : > "$d"; echo 1`},
+			paths:   map[int]string{1: vmService}, starts: map[int]uint64{1: 1}, want: "disk changed",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -182,5 +207,82 @@ func TestUsageTargetLooksOnlyForALeasesVM(t *testing.T) {
 	}
 	if _, err := os.Stat(h.argvLog); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("lsof ran for a name that is not a lease's (stat: %v)", err)
+	}
+}
+
+// A HOLDER PROVED GONE IS SKIPPED: a process that exited between lsof's answer
+// and the read of its executable is not a VM, and not a reason to refuse.
+func TestAHolderThatExitedIsNotCounted(t *testing.T) {
+	t.Parallel()
+
+	h := newUsageHost(t, fmt.Sprintf("echo %d; echo 7", goneHolder))
+	h.paths[7], h.starts[7] = vmService, 70
+	target, err := h.p.UsageTarget(t.Context(), usageVM)
+	if err != nil || target.PID != 7 {
+		t.Errorf("UsageTarget = %+v, %v; want pid 7", target, err)
+	}
+}
+
+// ONLY THIS DEPLOYMENT'S OWN VM, BY ITS OWN FILES: a VM whose marker names
+// another deployment or none, or whose directory or disk is a symlink to
+// someone else's, is not looked for.
+func TestAVMThatIsNotProvedOursIsNotMeasured(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, h usageHost)
+	}{
+		{"a foreign marker", func(t *testing.T, h usageHost) {
+			t.Helper()
+			marker := filepath.Join(filepath.Dir(h.disk), ownerMarker)
+			if err := os.WriteFile(marker, []byte("fedcba9876543210fedcba9876543210\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"no marker", func(t *testing.T, h usageHost) {
+			t.Helper()
+			if err := os.Remove(filepath.Join(filepath.Dir(h.disk), ownerMarker)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a symlinked disk", func(t *testing.T, h usageHost) {
+			t.Helper()
+			theirs := filepath.Join(t.TempDir(), "disk.img")
+			if err := os.WriteFile(theirs, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(h.disk); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(theirs, h.disk); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"a symlinked VM directory", func(t *testing.T, h usageHost) {
+			t.Helper()
+			dir := filepath.Dir(h.disk)
+			theirs := filepath.Join(t.TempDir(), "theirs")
+			if err := os.Rename(dir, theirs); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(theirs, dir); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newUsageHost(t, "echo 1")
+			h.paths[1], h.starts[1] = vmService, 1
+			tc.damage(t, h)
+			if target, err := h.p.UsageTarget(t.Context(), usageVM); err == nil {
+				t.Errorf("UsageTarget measured %+v", target)
+			}
+			if _, err := os.Stat(h.argvLog); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("lsof ran for a VM that is not proved ours (stat: %v)", err)
+			}
+		})
 	}
 }

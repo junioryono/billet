@@ -80,6 +80,46 @@ func TestAProcessThatIsNotTheJobsIsNotRead(t *testing.T) {
 	}
 }
 
+// ONLY A RECENT LIFETIME TOTAL IS THE JOB'S: a process whose accounting stopped
+// answering long enough ago has an energy reading older than its job, which is
+// could-not-tell, never a smaller total. One that missed only its final read is
+// still the job's.
+func TestAProcessJobsEnergyMustBeRecent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		failing  int
+		measured bool
+	}{{"silent for one interval", 1, true}, {"silent for three", 3, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newProcessHost()
+			now := time.Date(2026, 9, 30, 19, 0, 0, 0, time.UTC)
+			m := runMonitor(t, t.TempDir(), Options{Interval: time.Second, Now: func() time.Time { return now }})
+			m.reader.Process = h.reader.Process
+			m.Start("vm", processTarget, 6)
+			now = now.Add(time.Second)
+			m.Tick()
+			*h.err = errors.New("the process stopped answering")
+			for range tc.failing - 1 {
+				now = now.Add(time.Second)
+				m.Tick()
+			}
+			now = now.Add(time.Second)
+			sum, ok := m.Final("vm")
+			if !ok || !sum.Measured.CPU {
+				t.Fatalf("Final = %+v, %v; want the earlier CPU kept", sum.Measured, ok)
+			}
+			if sum.Measured.Energy != tc.measured {
+				t.Errorf("energy measured %v after %d silent intervals, want %v", sum.Measured.Energy,
+					tc.failing, tc.measured)
+			}
+		})
+	}
+}
+
 // A PROCESS JOB'S ENERGY IS THE KERNEL'S LIFETIME TOTAL, read at the end and
 // never shared out of a package counter; a kernel that keeps none leaves it
 // unmeasured.
