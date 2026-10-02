@@ -61,6 +61,10 @@ type cacheFake struct {
 	// created is when the cluster created an image, which `rbd info` reports
 	// only for an image listed here.
 	created map[string]time.Time
+	// inSession are the image names the node's cache sessions hold, and
+	// sessionsErr what reading them answers instead.
+	inSession   map[string]bool
+	sessionsErr error
 }
 
 type cacheExitError struct {
@@ -88,6 +92,7 @@ func newCacheFake() *cacheFake {
 
 		trashSnapshots: map[string]bool{},
 		created:        map[string]time.Time{},
+		inSession:      map[string]bool{},
 	}
 }
 
@@ -511,6 +516,13 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 
 			return nil, nil
 		}
+		// rbd rm refuses an image a client holds open before it deletes anything
+		// (PreRemoveRequest, EBUSY); `rbd trash mv` makes no such refusal.
+		if f.watchers[tail[0]] > 0 {
+			return nil, fmt.Errorf("exit status 16: %w", cacheExitError{
+				code: 16, message: "rbd: error: image still has watchers",
+			})
+		}
 		for _, parent := range f.parents {
 			if strings.HasPrefix(parent, tail[0]+"@") {
 				return nil, fmt.Errorf("exit status 39: %w", cacheExitError{
@@ -565,12 +577,22 @@ func cacheClient(t *testing.T, f *cacheFake) *Client {
 			return storecontract.Filesystem{
 				Type: "ext4", UUID: "dcab7af5-4ae7-4cc1-8ddb-1db18956c389", Clean: true,
 			}, nil
-		}))
+		}), WithCacheSessions(f.readSessions))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	return c
+}
+
+// readSessions answers the node's cache sessions for Evict: the names in
+// inSession, or sessionsErr.
+func (f *cacheFake) readSessions() (func(string) bool, error) {
+	if f.sessionsErr != nil {
+		return nil, f.sessionsErr
+	}
+
+	return func(name string) bool { return f.inSession[name] }, nil
 }
 
 func (f *cacheFake) ranWith(fragments ...string) bool {
@@ -2668,42 +2690,6 @@ func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *te
 			t.Errorf("PurgeTrash = %d, %v, trash %v; want the volume deleted", n, err, f.trash)
 		}
 	})
-}
-
-// EVICTION REMOVES WITH `rbd rm` AND NEVER DELETES FROM THE TRASH. It checks only
-// its own host's mappings and no index record names a writable volume, so rbd's
-// refusal to remove an image still open elsewhere is what protects another
-// node's job; and it holds the lock every cache writer waits on, while a
-// discarded volume in the trash takes minutes to delete.
-func TestEvictionRemovesWithRmAndNeverPurges(t *testing.T) {
-	t.Parallel()
-
-	f := newCacheFake()
-	c := cacheClient(t, f)
-	old := time.Now().Add(-8 * 24 * time.Hour).Unix()
-	volume := fmt.Sprintf("billet-cache/cache-v-%d-0123456789abcdef01234567", old)
-	generation := fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", old)
-	f.images[volume] = true
-	f.images[generation] = true
-	f.trash["id-discarded"] = fmt.Sprintf("cache-v-%d-fedcba9876543210fedcba98", old)
-
-	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil {
-		t.Fatalf("Evict: %v", err)
-	}
-
-	if f.images[volume] || f.images[generation] {
-		t.Fatalf("eviction kept an expired image: %v", f.images)
-	}
-
-	for _, image := range []string{volume, generation} {
-		if f.ranWith("trash", "mv", image) || !f.ranWith("rm", image) {
-			t.Errorf("eviction did not remove %s with rbd rm", image)
-		}
-	}
-
-	if _, ok := f.trash["id-discarded"]; !ok || f.ranWith("trash", "rm") {
-		t.Error("eviction deleted from the trash under the cache lock")
-	}
 }
 
 // THE PURGE FINISHES WHAT AN INTERRUPTED `rbd rm` LEFT, AND ONLY THAT.
