@@ -1,0 +1,169 @@
+---
+# THE ORDINARY NODE RESTART AGAINST A SCRIPTED systemctl. The restart must be
+# requested with --no-block and proved by polling for an active, running node
+# under a MainPID other than the one recorded before it, with no job queued. A
+# poll that never sees that ends at its deadline and says which of three things
+# it last read: nothing usable (could not tell), the old process or a queued job
+# still in charge (still draining), or anything else (did not come back). Each
+# case drives the production task file through include_role; the fake answers
+# only the requests that file makes. A case that succeeds waits 30 seconds and
+# is ended by its script, never the deadline; one that fails waits 3 and reads
+# one state throughout, and its poll count is a range because the deadline, not
+# the count, ends it (one read on a controller slow enough to spend the three
+# seconds before the first).
+- name: Prove the node restart is requested without waiting and polled to a new main process
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_gate_restart_cases:
+      - name: restarts
+        wait: 30
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+          - {ActiveState: activating, SubState: start, MainPID: "0", Job: "41"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: true
+        polls: [3, 3]
+      # A NOTIFY SERVICE HAS ITS NEW MAIN PROCESS BEFORE IT IS READY: a new
+      # MainPID alone is not the proof, active and running are too.
+      - name: new-process-before-ready
+        wait: 30
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+          - {ActiveState: activating, SubState: start, MainPID: "200"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: true
+        polls: [3, 3]
+      # A NEW PROCESS BESIDE A QUEUED JOB started before this request, and the
+      # requested restart is still to come.
+      - name: new-process-before-the-job-ran
+        wait: 30
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "150", Job: "41"}
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: true
+        polls: [2, 2]
+      # A NODE THAT WAS NOT RUNNING HAS NO OLD MAIN PROCESS: MainPID=0 before.
+      - name: first-start
+        wait: 30
+        before: {ActiveState: inactive, SubState: dead, MainPID: "0"}
+        after:
+          - {ActiveState: activating, SubState: start, MainPID: "0", Job: "41"}
+          - {ActiveState: active, SubState: running, MainPID: "300"}
+        succeeds: true
+        polls: [2, 2]
+      - name: still-draining
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+        succeeds: false
+        polls: [1, 5]
+        message: [still draining, "`systemctl show billet-node -p ActiveState,SubState,MainPID`", MainPID=100, billet_node_restart_wait]
+        absent: [did not come back, could not be told]
+      # THE DEADLINE ENDS THE POLL, NOT THE COUNT: three seconds at a
+      # two-second interval caps the loop at four reads, and the third is
+      # already past the deadline.
+      - name: deadline-ends-the-poll
+        interval: 2
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: deactivating, SubState: stop-sigterm, MainPID: "100", Job: "41"}
+        succeeds: false
+        polls: [1, 3]
+        message: [still draining]
+      # BACK WHERE IT WAS IS NOT A RESTART: the job left the queue, and the
+      # same main process still runs the old inputs.
+      - name: same-main-process
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "100"}
+        succeeds: false
+        polls: [1, 5]
+        message: [still draining, "ActiveState=active SubState=running"]
+      - name: queued-behind-a-new-process
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "150", Job: "41"}
+        succeeds: false
+        polls: [1, 5]
+        message: [still draining, Job=41]
+      - name: never-ready
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: activating, SubState: start, MainPID: "200"}
+        succeeds: false
+        polls: [1, 5]
+        message: [did not come back, ActiveState=activating, "`journalctl -u billet-node`"]
+        absent: [still draining, could not be told]
+      - name: failed
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: failed, SubState: failed, MainPID: "0"}
+        succeeds: false
+        polls: [1, 5]
+        message: [did not come back, ActiveState=failed]
+        absent: [still draining, could not be told]
+      # A READ THAT FAILED IS NOT A DRAIN: could not tell, never "still draining".
+      - name: unreadable-after
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {rc: 1}
+        succeeds: false
+        polls: [1, 5]
+        message: [could not be told, systemctl show exited 1]
+        absent: [still draining, did not come back]
+      # A READ MISSING A PROPERTY IS NOT AN ANSWER, even one that looks ready.
+      - name: incomplete-after
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {raw: "ActiveState=active\nMainPID=200\nJob=\n"}
+        succeeds: false
+        polls: [1, 5]
+        message: [could not be told]
+        absent: [still draining, did not come back]
+      - name: unreadable-before
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        before_rc: 1
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        restarts: 0
+      - name: unusable-bound
+        wait: soon
+        before: {ActiveState: active, SubState: running, MainPID: "100"}
+        after:
+          - {ActiveState: active, SubState: running, MainPID: "200"}
+        succeeds: false
+        restarts: 0
+        calls: 0
+        message: [billet_node_restart_wait (soon), Nothing was restarted]
+  tasks:
+    - name: Create the case directory
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -node-restart
+      register: billet_gate_restart_root
+
+    - name: Install the scripted systemctl
+      ansible.builtin.copy:
+        dest: "{{ billet_gate_restart_root.path }}/systemctl"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          exec '{{ ansible_playbook_python }}' '{{ playbook_dir }}/node-restart-systemctl.py' "$BILLET_GATE_RESTART_CASE" "$@"
+
+    - name: Exercise each restart case
+      ansible.builtin.include_tasks: node-restart-case.yml
+      loop: "{{ billet_gate_restart_cases }}"
+      loop_control:
+        loop_var: billet_gate_restart_case
+        label: "{{ billet_gate_restart_case.name }}"
+
+    - name: Remove the case directory
+      ansible.builtin.file:
+        path: "{{ billet_gate_restart_root.path }}"
+        state: absent

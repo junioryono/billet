@@ -158,6 +158,19 @@ type Provider struct {
 	// processStart reads a pid's start time; a seam for the tests, whose VMM
 	// pid is a process that has exited.
 	processStart func(pid int) (uint64, error)
+	// openHandle takes the reference every signal goes through; a seam so a test
+	// can record which signals teardown sends, and in what order.
+	openHandle func(pid int) (signaller, bool, error)
+}
+
+// signaller is what stopVMM signals through: vmmHandle on linux.
+type signaller interface {
+	signal(sig syscall.Signal) error
+	close()
+}
+
+func openVMMHandle(pid int) (signaller, bool, error) {
+	return openVMM(pid)
 }
 
 // runner executes one command. A seam, so a test can assert the ARGUMENTS billet
@@ -283,6 +296,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	}
 	p.removeCgroupFn = p.removeCgroup
 	p.processStart = hostProcessStart
+	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
 	p.procMountsPath = defaultProcMountsPath
 
@@ -335,7 +349,8 @@ type trashPurging interface {
 	PurgeTrash(ctx context.Context) (int, error)
 }
 
-// PurgeDiscarded deletes the root disks earlier destroys moved out of use.
+// PurgeDiscarded deletes the root disks earlier destroys moved out of use, and
+// with them the discarded cache volumes that share the disk's pool.
 func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
 	purger, ok := p.disk.(trashPurging)
 	if !ok {
@@ -344,7 +359,7 @@ func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
 
 	n, err := purger.PurgeTrash(ctx)
 	if err != nil {
-		return n, fmt.Errorf("firecracker: purge discarded root disks: %w", err)
+		return n, fmt.Errorf("firecracker: purge discarded root disks and cache volumes: %w", err)
 	}
 
 	return n, nil
@@ -1100,6 +1115,9 @@ func (p *Provider) jailerArgs(j jail, res resources) []string {
 		// writing it and billet would read "no pid file" as "nothing is running",
 		// then unmap the block device of a guest in the middle of a job. Asking for
 		// the documented contract costs nothing and removes that.
+		//
+		// It also makes the VMM its namespace's init, which ignores SIGTERM from
+		// the host, so stopVMM sends SIGKILL alone.
 		"--new-pid-ns",
 		// DETACHED, so billet is not the VMM's parent. A node that restarts must
 		// leave running jobs running — that is what restart recovery adopts — and a
@@ -1190,8 +1208,8 @@ const vmmLogLines = 3
 //
 // FOUR THINGS OUTLIVE A GUEST and none of them is collected by anything else: the
 // VMM process, its jail, the tap device on the host bridge, and the root disk —
-// which is a mapped kernel block device AND an image holding pool space. Measured:
-// SIGTERM stops the VMM and leaves the other three exactly where they were.
+// which is a mapped kernel block device AND an image holding pool space. Stopping the
+// VMM leaves the other three exactly where they were.
 //
 // Idempotent, because teardown runs on paths that have already failed once. Every
 // step tolerates its subject being absent, and the errors are joined rather than
@@ -1393,7 +1411,7 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 		return nil
 	}
 
-	// A REFERENCE TO THE PROCESS, TAKEN BEFORE IT IS CHECKED AND USED FOR EVERY
+	// A REFERENCE TO THE PROCESS, TAKEN BEFORE IT IS CHECKED AGAIN AND USED FOR THE
 	// SIGNAL BELOW.
 	//
 	// vmmPID has already confirmed this pid is the VMM, but confirming and signalling
@@ -1401,7 +1419,7 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 	// number to something else, and this backend signals as root. The handle refers
 	// to the process rather than to the number, so a recycled pid gets ESRCH instead
 	// of a signal meant for a microVM.
-	handle, alive, err := openVMM(pid)
+	handle, alive, err := p.openHandle(pid)
 	if err != nil {
 		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
 	}
@@ -1412,52 +1430,34 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 
 	defer handle.close()
 
+	// PROVED AGAIN WITH THE HANDLE HELD, which is the order the handle's guarantee
+	// needs: a pid recycled after this check can only turn the signal into ESRCH. A
+	// check that cannot answer stops teardown rather than killing a number nothing
+	// ties to this jail.
+	owns, err := p.pidOwner(pid, j.id)
+	if err != nil {
+		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
+	}
+
+	if !owns {
+		return nil
+	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("firecracker: stop the microVM %s was canceled before signalling it: %w",
 			j.id, err)
 	}
 
-	// SIGTERM FIRST, because firecracker exits cleanly on it — measured — and a
-	// clean exit closes the guest's disk rather than leaving the mapped device to
-	// be torn out from under it.
-	if err := handle.signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
-	}
-
-	err = p.awaitExit(ctx, j, pid)
-	if err == nil {
-		return nil
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("firecracker: wait for the microVM %s to stop: %w", j.id, ctxErr)
-	}
-
-	// ESCALATION NEEDS A CONFIRMED PID, NOT MERELY A FAILED WAIT.
-	//
-	// awaitExit fails for two unlike reasons: the VMM outlived its grace, or billet
-	// could not TELL whether the pid is still the VMM. Killing on the second is the
-	// act process.go refuses by name — signalling, as root, a number nothing ties to
-	// this jail. So the pid is checked once more, and a check that cannot answer
-	// propagates rather than escalating.
-	owns, checkErr := p.pidOwner(pid, j.id)
-	if checkErr != nil {
-		return errors.Join(err, checkErr)
-	}
-
-	if !owns {
-		// It exited while billet was deciding, which is the outcome that was wanted.
-		return nil
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("firecracker: kill of the microVM %s was canceled before signalling it: %w",
-			j.id, ctxErr)
-	}
-
-	// AND SIGKILL IF IT WILL NOT GO, because the alternative is a microVM holding a
-	// mapped block device open forever while its capacity stays charged.
+	// SIGKILL, AND NOTHING GENTLER FIRST. The jailer is always run with --new-pid-ns
+	// (jailerArgs), so the VMM is the init of its own pid namespace, and the kernel
+	// drops a signal from an ancestor namespace to a namespace init that has no
+	// handler for it. Firecracker installs none for SIGTERM, so SIGTERM is discarded
+	// and only SIGKILL, which the kernel delivers regardless, ends it. Measured
+	// 2026-09-30 on the reference deployment's Linux node, Firecracker v1.16.1 under
+	// the jailer: SigCgt 0000000441801449 (no SIGTERM), `kill -TERM` did nothing for
+	// over two minutes, `kill -KILL` ended the VMM at once. A SIGTERM first would
+	// only spend the whole wait below on every destroy.
 	if err := handle.signal(syscall.SIGKILL); err != nil {
-		return fmt.Errorf("firecracker: kill the microVM %s, which did not stop when asked: %w",
-			j.id, err)
+		return fmt.Errorf("firecracker: kill the microVM %s: %w", j.id, err)
 	}
 
 	return p.awaitExit(ctx, j, pid)
@@ -1468,6 +1468,25 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 // ZERO IS "NOTHING IS RUNNING" AND AN ERROR IS "BILLET COULD NOT TELL", which the
 // caller must not confuse: the first permits teardown to continue and the second
 // must stop it, because the next steps unmap a block device the VMM may still hold.
+// vmmExited reports whether the pid file names a process that is definitely no
+// longer this jail's VMM. No pid file, an unreadable one and a process billet
+// cannot inspect are all "could not tell", which is false here.
+func (p *Provider) vmmExited(j jail) bool {
+	raw, err := os.ReadFile(j.pidFile())
+	if err != nil {
+		return false
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+
+	owns, err := p.pidOwner(pid, j.id)
+
+	return err == nil && !owns
+}
+
 func (p *Provider) vmmPID(j jail) (int, error) {
 	raw, err := os.ReadFile(j.pidFile())
 	if err != nil {
@@ -1483,9 +1502,17 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 			// Not reachable on the measured version, which writes the file either
 			// way; reachable if a future one honours its own documentation, where
 			// the file appears only with --new-pid-ns.
-			if _, statErr := os.Stat(j.socket()); statErr == nil {
+			//
+			// Only a socket that is provably absent is absence; a stat that failed
+			// any other way is could-not-tell.
+			_, statErr := os.Stat(j.socket())
+			if statErr == nil {
 				return 0, fmt.Errorf("firecracker: %s has an api socket and no pid file, so "+
 					"billet cannot tell whether its vmm is running", j.dir())
+			}
+			if !errors.Is(statErr, os.ErrNotExist) {
+				return 0, fmt.Errorf("firecracker: %s has no pid file and billet cannot tell "+
+					"whether it has an api socket: %w", j.dir(), statErr)
 			}
 
 			return 0, nil
@@ -1554,11 +1581,9 @@ func (p *Provider) awaitExit(ctx context.Context, j jail, pid int) error {
 	}
 }
 
-// exitWait bounds how long a signalled VMM is given to go.
-//
-// SHORT, because SIGTERM to a firecracker process is not a graceful guest shutdown
-// — the VMM exits, taking the guest with it, and measured that is immediate. What
-// this is really bounding is the window before billet escalates to SIGKILL.
+// exitWait bounds how long a killed VMM is given to be gone. SIGKILL ended a jailed
+// VMM at once when measured; a VMM still there after this is reported as could not
+// stop, and teardown goes no further.
 const exitWait = 5 * time.Second
 
 // unwindBeforeClone releases bookkeeping established before any host device,
@@ -1766,13 +1791,13 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 				continue
 			}
 
-			running, err := p.running(ctx, j)
+			running, ended, err := p.runState(ctx, j)
 			if err != nil {
 				return nil, err
 			}
 
 			instances = append(instances, &Instance{
-				ID: name, Name: name, Running: running,
+				ID: name, Name: name, Running: running, Ended: ended,
 			})
 		}
 	}
@@ -1797,9 +1822,26 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 // anything, because whatever would have started it is gone. It is this backend's
 // `created` container.
 func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
+	running, _, err := p.runState(ctx, j)
+
+	return running, err
+}
+
+// runState reports, in order, running's answer and whether the VMM process is
+// proved to have exited, which is the only thing firecracker has that says
+// execution ENDED: a
+// paused VMM, one never started and one in a state billet does not know are all
+// not running and not ended.
+//
+// A GONE SOCKET IS NOT AN EXITED PROCESS. Unlinking a Unix socket leaves its
+// listener and the guest running, so `ended` needs the pid file to name a
+// process that /proc proves is no longer this jail's VMM (vmmExited).
+func (p *Provider) runState(ctx context.Context, j jail) (bool, bool, error) {
 	info, err := p.apiFor(j.socket()).info(ctx)
 	if err != nil {
-		return !gone(err), nil
+		vmmGone := gone(err)
+
+		return !vmmGone, vmmGone && p.vmmExited(j), nil
 	}
 
 	// A DIFFERENT VMM ON THIS SOCKET IS AN ERROR, NOT A "NO".
@@ -1810,11 +1852,11 @@ func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 	// cannot say the guest is running either. Neither answer is available, which is
 	// what an error is for.
 	if info.ID != j.id {
-		return false, fmt.Errorf("firecracker: the vmm answering for %s calls itself %s, so "+
+		return false, false, fmt.Errorf("firecracker: the vmm answering for %s calls itself %s, so "+
 			"billet cannot say whether %s is running", j.id, bounded(info.ID), j.id)
 	}
 
-	return info.State == stateRunning, nil
+	return info.State == stateRunning, false, nil
 }
 
 // execRunner runs the jailer or ip, and returns standard output.

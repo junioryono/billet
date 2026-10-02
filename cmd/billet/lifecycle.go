@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"sync"
+
+	"github.com/junioryono/billet/internal/lifeops/launchd"
 )
 
 // lifecycle is the two ways an operator can hurry a shutdown along.
@@ -40,6 +43,38 @@ func newLifecycle(cancel context.CancelFunc) *lifecycle {
 // which is the one moment the process must not die.
 func (lc *lifecycle) rush() {
 	lc.once.Do(func() { close(lc.hurry) })
+}
+
+// drainOn answers every drain request with the first level and nothing more:
+// however often one arrives it never counts towards escalate's levels, which
+// is what lets a stop repeat it through a crash, a restart or its own retry.
+func (lc *lifecycle) drainOn(requests <-chan os.Signal) {
+	for range requests {
+		lc.cancel()
+	}
+}
+
+// handleDrainRequests routes launchd.DrainSignal to drainOn until the returned
+// function is called. Installed before the process says it handles the
+// request: an unhandled one is dropped by the Go runtime, and a stop that
+// believed otherwise would wait on a drain that never began.
+func (lc *lifecycle) handleDrainRequests() func() {
+	requests := make(chan os.Signal, 1)
+	signal.Notify(requests, launchd.DrainSignal)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		lc.drainOn(requests)
+	}()
+
+	return func() {
+		signal.Stop(requests)
+		close(requests)
+		<-done
+	}
 }
 
 // escalate applies the three levels to a stream of signals.

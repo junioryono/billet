@@ -457,6 +457,8 @@ jobs:
     runs-on: ubuntu-24.04
 
     permissions:
+      # actions: read ONLY TO ASK THE ARTIFACT'S SIZE before downloading it.
+      actions: read
       contents: write
       id-token: write
 
@@ -469,11 +471,26 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      # ROOM FOR THE ARTIFACT. The runner-images image packs to about 20GB, and
+      # the zip and its contents exist at once, so the toolchains this job never
+      # uses go first; fetch-guest-artifact.sh proves the room before it writes.
+      - name: Make room for the image
+        run: |
+          set -euo pipefail
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+
+      # FETCHED THROUGH THE API AND HELD TO GITHUB'S DIGEST, not with
+      # actions/download-artifact, which twice stopped extracting this artifact part
+      # way through and reported success (actions/download-artifact#454).
       - name: Download the checked image
-        uses: actions/download-artifact@v5
-        with:
-          name: guest-image
-          path: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fetch-guest-artifact.sh out
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3

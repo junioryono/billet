@@ -82,7 +82,7 @@ func TestRunsOnIsALabel(t *testing.T) {
 }
 
 func TestSizesExpandRunsOnAsTheyExpandTheLabel(t *testing.T) {
-	got, err := ExpandTierSizes([]Tier{{Label: "taksa", RunsOn: "shared", Sizes: []int{2, 4}}})
+	got, err := ExpandTierSizes([]Tier{{Label: "team-b", RunsOn: "shared", Sizes: []int{2, 4}}})
 	if err != nil {
 		t.Fatalf("ExpandTierSizes: %v", err)
 	}

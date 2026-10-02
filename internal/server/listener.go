@@ -417,6 +417,13 @@ type Listener struct {
 	// Never nil; see noRunner.
 	runner   Runner
 	registry RunnerRegistry
+	// offline is what reconcilePool remembers about idle members between polls,
+	// and now its clock; nil is the wall clock. See retireOfflineMembers.
+	offline offlineWatch
+	now     func() time.Time
+	// claimRetirement stands in for alloc.RetirePoolRunner on the offline path,
+	// so a test can fail the ledger write after GitHub accepted the withdrawal.
+	claimRetirement func(context.Context, string) error
 	// cacheSpec and runEvidence decide what a completed job's caches may
 	// publish. See WithCachePublication.
 	cacheSpec   config.CacheSpec
@@ -1319,8 +1326,9 @@ func (l *Listener) Run(ctx context.Context) error {
 			// member, which is the round-one defect wearing a different hat; the
 			// codebase's own rule is that a freshness check on your own record is
 			// not a causal fence on somebody else's snapshot. Closing it needs
-			// affirmative per-registration evidence, which is the durable
-			// deregistration signal rather than something this loop can infer.
+			// affirmative per-registration evidence, which retireOfflineMembers
+			// supplies for a runner GitHub reports offline; an online idle member
+			// still waits for the aggregate to move.
 			//
 			// The failure direction is the safe one. A registration that lingers
 			// keeps its lease non-terminal, so the quiescence barrier stays
@@ -3599,6 +3607,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 
 	surplus := active - desired
 	if surplus <= 0 {
+		l.retireOfflineMembers(ctx, runners)
+
 		return nil
 	}
 	for i := range runners {

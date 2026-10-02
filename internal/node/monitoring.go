@@ -58,6 +58,7 @@ func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *
 		CgroupDir: target.CgroupDir, PID: target.PID, PIDStart: target.PIDStart,
 		VCPUThreadPrefix: target.VCPUThreadPrefix,
 		NetDevice:        target.NetDevice, NetHostView: target.NetHostView,
+		Process: target.Process,
 	}, lease.VCPU)
 }
 
@@ -105,8 +106,8 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 		IntervalMillis: max(sum.Interval.Milliseconds(), 1), WindowMillis: sum.Window.Milliseconds(),
 		CPUUserMicros: s.CPUUser, CPUSystemMicros: s.CPUSys,
 		GuestCPUMicros: s.GuestCPU, VMMCPUMicros: s.VMMCPU,
-		MemoryPeakBytes: sum.MemoryPeak, OOMKills: s.OOMKills,
-		DiskReadBytes: s.DiskRead, DiskWriteBytes: s.DiskWrite,
+		MemoryPeakBytes: sum.MemoryPeak,
+		DiskReadBytes:   s.DiskRead, DiskWriteBytes: s.DiskWrite,
 		NetRxBytes: s.NetRx, NetTxBytes: s.NetTx, NetRxPackets: s.NetRxPackets, NetTxPackets: s.NetTxPackets,
 		CPUSomeMicros: s.CPUSome, CPUFullMicros: s.CPUFull,
 		MemorySomeMicros: s.MemorySome, MemoryFullMicros: s.MemoryFull,
@@ -114,7 +115,8 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 	}
 	for group, measured := range map[string]bool{
 		alloc.UsageCPU: sum.Measured.CPU, alloc.UsageMemory: sum.Measured.Memory,
-		alloc.UsageIO: sum.Measured.IO, alloc.UsageNet: sum.Measured.Net,
+		alloc.UsageOOM: sum.Measured.OOM,
+		alloc.UsageIO:  sum.Measured.IO, alloc.UsageNet: sum.Measured.Net,
 		alloc.UsageThreads: sum.Measured.Threads, alloc.UsagePressure: sum.Measured.Pressure,
 		alloc.UsageEnergy: sum.Measured.Energy,
 	} {
@@ -123,11 +125,18 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 		}
 	}
 	slices.Sort(u.Unmeasured)
+	if sum.Measured.Memory && sum.Measured.OOM {
+		u.OOMKills = s.OOMKills
+	}
 	if sum.Measured.Energy {
 		u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules = sum.EnergyActive, sum.EnergyIdle
-		u.EnergySource = alloc.EnergyRAPLUnsplit
-		if sum.EnergySplit {
+		switch {
+		case sum.EnergyProcess:
+			u.EnergySource = alloc.EnergyProcess
+		case sum.EnergySplit:
 			u.EnergySource = alloc.EnergyRAPL
+		default:
+			u.EnergySource = alloc.EnergyRAPLUnsplit
 		}
 	}
 	if len(sum.Points) == 0 {

@@ -21,6 +21,57 @@ func measuredUsage() JobUsage {
 	}
 }
 
+// processUsage is a tart VM measured by its process's own accounting: no OOM
+// count, no network, threads or pressure, and the kernel's own energy.
+func processUsage() JobUsage {
+	return JobUsage{
+		Source:     UsageSourceHost,
+		Unmeasured: []string{UsageNet, UsageOOM, UsagePressure, UsageThreads},
+		Samples:    600, IntervalMillis: 1000, WindowMillis: 600_000,
+		CPUUserMicros: 1_524_189_381, CPUSystemMicros: 67_371_613,
+		MemoryPeakBytes: 25_855_595_336, DiskReadBytes: 7_894_355_968, DiskWriteBytes: 18_492_821_504,
+		EnergyActiveMicrojoules: 7_400_903_879, EnergySource: EnergyProcess,
+	}
+}
+
+// AN OOM COUNT IS READ ONLY WITH ITS MEMORY: a report with memory unmeasured
+// has no count either, whether or not it names the group.
+func TestAnOOMCountIsMeasuredOnlyWithItsMemory(t *testing.T) {
+	t.Parallel()
+
+	u := processUsage()
+	if u.Measured(UsageOOM) || !u.Measured(UsageMemory) {
+		t.Errorf("named unmeasured: oom measured %v, memory measured %v", u.Measured(UsageOOM),
+			u.Measured(UsageMemory))
+	}
+	u = measuredUsage()
+	u.Unmeasured = append(u.Unmeasured, UsageMemory)
+	if u.Measured(UsageOOM) {
+		t.Error("an OOM count read as measured beside unmeasured memory")
+	}
+	if !measuredUsage().Measured(UsageOOM) {
+		t.Error("a measured memory group lost its OOM count")
+	}
+}
+
+// A VM MEASURED BY ITS PROCESS IS KEPT AS SENT, its energy source with it.
+func TestAProcessMeasuredReportIsKeptAsSent(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+	lease := busyLease(t, a)
+
+	if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, processUsage(), nil); err != nil {
+		t.Fatalf("RecordLeaseUsage: %v", err)
+	}
+	got, err := a.LeaseUsage(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("LeaseUsage: %v", err)
+	}
+	if !reflect.DeepEqual(got.JobUsage, processUsage()) {
+		t.Errorf("read back %+v, want %+v", got.JobUsage, processUsage())
+	}
+}
+
 // A REPORT IS KEPT AS SENT, ITS SERIES WITH IT, AND THE FIRST ONE WINS: a
 // retry after a lost answer must not replace what the ledger already kept.
 func TestALeasesUsageIsKeptOnceAndReadBackAsSent(t *testing.T) {
@@ -109,6 +160,13 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 			u.Unmeasured = []string{UsageIO}
 			u.EnergySource, u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules = EnergyRAPLUnsplit, 5, 1
 		}, "no idle share"},
+		{"process energy with an idle share", func(u *JobUsage) {
+			u.Unmeasured = []string{UsageIO}
+			u.EnergySource, u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules = EnergyProcess, 5, 1
+		}, "process energy has no idle share"},
+		{"an oom count unmeasured and reported", func(u *JobUsage) {
+			u.Unmeasured = append(u.Unmeasured, UsageOOM)
+		}, "names oom unmeasured"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u := measuredUsage()
@@ -121,6 +179,9 @@ func TestAUsageReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 
 	if err := measuredUsage().Validate(); err != nil {
 		t.Fatalf("a well-formed report was refused: %v", err)
+	}
+	if err := processUsage().Validate(); err != nil {
+		t.Fatalf("a VM measured by its process was refused: %v", err)
 	}
 	for _, s := range []UsageSeries{
 		{Codec: 2, Data: []byte{1}},
