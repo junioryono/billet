@@ -1701,7 +1701,7 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 		case <-ctx.Done():
 			timer.Stop()
 
-			return ctx.Err()
+			return l.interrupted(ctx)
 		case <-timer.C:
 		}
 
@@ -1713,7 +1713,7 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 
 		switch {
 		case err != nil && ctx.Err() != nil:
-			return ctx.Err()
+			return l.interrupted(ctx)
 		case err != nil:
 			l.log.Warn("could not close the failed message session; its replacement waits "+
 				"for GitHub to expire it, and idle escrow is kept until a poll lands",
@@ -1736,7 +1736,7 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 			}
 
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return l.interrupted(ctx)
 			}
 
 			if l.fenced() {
@@ -1749,22 +1749,53 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 			continue
 		}
 
-		l.session = session
-		l.sessionClosed = false
-		l.closing = nil
-		l.recoverCause = nil
-		l.lastMessageID = 0
-		l.observed = session.Statistics()
-
-		l.mu.Lock()
-		l.heldMessageID = nil
-		l.mu.Unlock()
-
-		l.log.Warn("opened a new message session for this tier after its last one failed",
-			"tier", l.tier, "failures", l.sessionFailures)
+		l.install(session)
 
 		return nil
 	}
+}
+
+// install makes session this listener's, as a restart would find it.
+func (l *Listener) install(session Session) {
+	l.session = session
+	l.sessionClosed = false
+	l.closing = nil
+	l.recoverCause = nil
+	l.lastMessageID = 0
+	l.observed = session.Statistics()
+
+	l.mu.Lock()
+	l.heldMessageID = nil
+	l.mu.Unlock()
+
+	l.log.Warn("opened a new message session for this tier after its last one failed",
+		"tier", l.tier, "failures", l.sessionFailures)
+}
+
+// interrupted is what recoverSession returns when ctx ends. An open that has
+// already answered is taken first, whichever wait the cancellation cut short: a
+// fatal answer is reported as itself, and a session it delivered is installed, so
+// neither is left on a channel nothing will read again.
+func (l *Listener) interrupted(ctx context.Context) error {
+	if l.opening != nil {
+		select {
+		case opened := <-l.opening:
+			l.opening = nil
+
+			if sessionFatal(opened.err) {
+				return fmt.Errorf("server: reopen session for %s: %w", l.tier, opened.err)
+			}
+
+			if opened.err == nil {
+				l.install(opened.session)
+
+				return nil
+			}
+		default:
+		}
+	}
+
+	return ctx.Err()
 }
 
 // fencedRecovery is the error a recovery stops with once this process is no
@@ -1854,17 +1885,9 @@ func (l *Listener) openReplacement(ctx context.Context) (Session, error) {
 
 		return opened.session, opened.err
 	case <-ctx.Done():
-		// A RESULT READY BESIDE THE CANCELLATION IS TAKEN, because select picks
-		// between them at random and a fatal answer left on the channel is never
-		// read if the listener stops here.
-		select {
-		case opened := <-l.opening:
-			l.opening = nil
-
-			return opened.session, opened.err
-		default:
-			return nil, ctx.Err()
-		}
+		// A RESULT READY BESIDE THE CANCELLATION IS LEFT FOR interrupted, which
+		// takes it before the recovery reports the cancellation.
+		return nil, ctx.Err()
 	}
 }
 

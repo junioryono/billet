@@ -572,9 +572,10 @@ func TestATeardownDuringARecoveryDoesNotWaitOnAStuckClose(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
 	var (
-		closeCalls atomic.Int64
-		closeGate  = make(chan struct{})
-		gateOnce   sync.Once
+		closeCalls    atomic.Int64
+		closeGate     = make(chan struct{})
+		closeReturned = make(chan struct{})
+		gateOnce      sync.Once
 	)
 
 	releaseClose := func() { gateOnce.Do(func() { close(closeGate) }) }
@@ -582,21 +583,36 @@ func TestATeardownDuringARecoveryDoesNotWaitOnAStuckClose(t *testing.T) {
 	first := &fakeSession{
 		onGet: func() (*Message, error) { return nil, errBrokerTimedOut },
 		onClose: func(context.Context) error {
-			if closeCalls.Add(1) == 1 {
+			n := closeCalls.Add(1)
+			if n == 1 {
 				return errors.New("scaleset: close session: 503 Service Unavailable")
 			}
 
 			<-closeGate
 
+			if n == 2 {
+				close(closeReturned)
+			}
+
 			return nil
 		},
 	}
+
+	// THE STUCK CLOSE IS JOINED TOO, after the listener's own cleanup below has
+	// released it and joined Run.
+	t.Cleanup(func() {
+		releaseClose()
+
+		if closeCalls.Load() >= 2 {
+			<-closeReturned
+		}
+	})
 
 	g := newGatedOpener(t, errors.New("unused"), nil)
 	l := NewListener(a, tiers[0].Label, first,
 		WithLogger(slog.New(slog.DiscardHandler)),
 		WithSessionReopen(g.open),
-		WithFinishGraces(100*time.Millisecond, 100*time.Millisecond),
+		WithFinishGraces(time.Second, time.Second),
 		stopsWithoutWaiting())
 
 	r := startListener(t, l, g.release, releaseClose)
