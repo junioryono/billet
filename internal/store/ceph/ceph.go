@@ -70,6 +70,11 @@ type Client struct {
 
 	// sessions reads which images the node's cache sessions name, for Evict.
 	sessions func() (func(name string) bool, error)
+
+	// evictResume is the last generation an eviction pass cut short by its lock
+	// budget reached, so the next pass begins after it.
+	evictMu     sync.Mutex
+	evictResume string
 }
 
 func (c *Client) now() time.Time {

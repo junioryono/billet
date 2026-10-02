@@ -1397,6 +1397,20 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 }
 
 func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, now time.Time) error {
+	// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
+	// removal that fails no longer ends the pass, so the pass bounds how long it
+	// holds the lock from the moment it has it and leaves the rest to the next.
+	started := c.now()
+	overBudget := func(what string) error {
+		held := c.now().Sub(started)
+		if held < evictionLockBudget {
+			return nil
+		}
+
+		return fmt.Errorf("ceph: the cache lock was held %s, so %s wait for the next eviction pass",
+			held.Round(time.Second), what)
+	}
+
 	metadata, err := c.cacheIndexMetadata(ctx)
 	if err != nil {
 		return err
@@ -1412,6 +1426,9 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 
 		var active cacheActive
 		if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
+			if err := overBudget("expired index records and every generation"); err != nil {
+				return err
+			}
 			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
 				return err
 			}
@@ -1430,6 +1447,8 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 				retention[pointer.Handle] = age
 				if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
 					protected[pointer.Handle] = true
+				} else if err := overBudget("expired index records and every generation"); err != nil {
+					return err
 				} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
 					return err
 				}
@@ -1456,40 +1475,55 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 			continue
 		}
 		for _, key := range keys {
+			if err := overBudget("expired index records and every generation"); err != nil {
+				return err
+			}
 			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
 				return err
 			}
 		}
 	}
 
+	generations := make([]string, 0, len(images))
+	for _, name := range images {
+		if kind, _, ok := cacheImageName(name); ok && kind == "g" {
+			generations = append(generations, name)
+		}
+	}
+
+	// A PASS CUT SHORT IS RESUMED WHERE IT STOPPED, so generations that fail
+	// slowly at the front of the order cannot spend every pass's budget ahead of
+	// the ones behind them.
+	c.evictMu.Lock()
+	resume := c.evictResume
+	c.evictMu.Unlock()
+
+	first := 0
+	if resume != "" {
+		if i := slices.IndexFunc(generations, func(name string) bool { return name > resume }); i > 0 {
+			first = i
+		}
+	}
+
+	order := slices.Concat(generations[first:], generations[:first])
+
 	var failures evictionFailures
 
-	started := c.now()
-
-	for i, name := range images {
-		if kind, _, ok := cacheImageName(name); !ok || kind != "g" {
-			continue
-		}
-
+	for i, name := range order {
 		if err := ctx.Err(); err != nil {
 			failures.add(err)
 
 			return failures.err()
 		}
 
-		// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
-		// removal that fails is no longer the end of the pass, so the pass bounds
-		// how long it holds the lock and leaves the rest to the next one.
-		if held := c.now().Sub(started); held >= evictionLockBudget {
-			waiting := 0
-			for _, later := range images[i:] {
-				if kind, _, ok := cacheImageName(later); ok && kind == "g" {
-					waiting++
-				}
+		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
+			if i > 0 {
+				c.evictMu.Lock()
+				c.evictResume = order[i-1]
+				c.evictMu.Unlock()
 			}
 
-			failures.add(fmt.Errorf("ceph: the cache lock was held %s, so %d generation(s) from %s "+
-				"on wait for the next eviction pass", held.Round(time.Second), waiting, name))
+			failures.add(err)
 
 			return failures.err()
 		}
@@ -1504,6 +1538,10 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 			failures.add(fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
 		}
 	}
+
+	c.evictMu.Lock()
+	c.evictResume = ""
+	c.evictMu.Unlock()
 
 	return failures.err()
 }

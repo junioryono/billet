@@ -280,6 +280,86 @@ func TestEvictionHoldsTheCacheLockForABoundedTime(t *testing.T) {
 	}
 }
 
+// A PASS CUT SHORT RESUMES WHERE IT STOPPED. Generations that fail slowly at the
+// front of the order would otherwise spend every pass's budget, and the
+// removable one behind them would never be reached.
+func TestEvictionResumesAfterTheGenerationsThatSpentItsBudget(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	stuck := []string{expiredGeneration(old, '1'), expiredGeneration(old, '2')}
+	behind := expiredGeneration(old, '3')
+
+	f := newCacheFake()
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && (slices.Contains(args, stuck[0]) || slices.Contains(args, stuck[1])) {
+			f.calls = append(f.calls, slices.Clone(args))
+			clock = clock.Add(evictionLockBudget / 2)
+
+			return nil, errors.New("signal: killed")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	for _, generation := range append(slices.Clone(stuck), behind) {
+		f.addVolume(generation)
+	}
+
+	for pass := range 2 {
+		if err := c.Evict(t.Context(), 7*24*time.Hour); err == nil {
+			t.Fatalf("pass %d reported no failure although two removals failed", pass+1)
+		}
+	}
+
+	if f.images[behind] {
+		t.Error("two passes never reached the generation behind the ones that spent the budget")
+	}
+
+	if !f.images[stuck[0]] || !f.images[stuck[1]] {
+		t.Error("a generation whose removal failed was not kept")
+	}
+}
+
+// THE BUDGET STARTS WHEN THE LOCK IS TAKEN, so the index records eviction
+// removes before the generations spend it too.
+func TestEvictionBudgetCoversTheIndexRecordsItRemoves(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	generation := expiredGeneration(old, 'a')
+
+	f := newCacheFake()
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "image-meta") && slices.Contains(args, "remove") {
+			clock = clock.Add(evictionLockBudget / 2)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	f.addVolume(generation)
+
+	f.metadata[c.cacheIndex()] = map[string]string{}
+	for i := range 3 {
+		f.metadata[c.cacheIndex()][activeKey(fmt.Sprintf("lease-%d", i))] = "not json"
+	}
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err == nil ||
+		!strings.Contains(err.Error(), "wait for the next eviction pass") {
+		t.Errorf("Evict = %v, want the work past the budget reported", err)
+	}
+
+	if len(f.metadata[c.cacheIndex()]) != 1 || !f.images[generation] || f.ranWith("rm", generation) {
+		t.Errorf("eviction went on past its budget: index %v, generation kept %v",
+			f.metadata[c.cacheIndex()], f.images[generation])
+	}
+}
+
 // ONE CAUSE CAN FAIL EVERY IMAGE ALIKE, so an eviction error names the first
 // evictionFailuresReported failures and counts the rest.
 func TestEvictionReportsABoundedNumberOfFailures(t *testing.T) {
