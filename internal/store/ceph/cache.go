@@ -1510,10 +1510,9 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 	var failures evictionFailures
 
 	for i, name := range order {
+		// WHY THE PASS STOPPED is never one of the failures the cap counts away.
 		if err := ctx.Err(); err != nil {
-			failures.add(err)
-
-			return failures.err()
+			return errors.Join(failures.err(), err)
 		}
 
 		if err := overBudget(fmt.Sprintf("%d generation(s) from %s on", len(order)-i, name)); err != nil {
@@ -1523,9 +1522,7 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 				c.evictMu.Unlock()
 			}
 
-			failures.add(err)
-
-			return failures.err()
+			return errors.Join(failures.err(), err)
 		}
 
 		handle := c.cfg.CachePool + "/" + name

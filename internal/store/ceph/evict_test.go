@@ -361,16 +361,27 @@ func TestEvictionBudgetCoversTheIndexRecordsItRemoves(t *testing.T) {
 }
 
 // ONE CAUSE CAN FAIL EVERY IMAGE ALIKE, so an eviction error names the first
-// evictionFailuresReported failures and counts the rest.
+// evictionFailuresReported failures and counts the rest; and why the pass
+// stopped is never one of the failures counted away.
 func TestEvictionReportsABoundedNumberOfFailures(t *testing.T) {
 	t.Parallel()
 
 	old := time.Now().Add(-8 * 24 * time.Hour)
+	attempted := evictionFailuresReported + 2
 
 	f := newCacheFake()
 	f.failRemove = true
-	c := evictingClient(t, f, f.run)
-	for i := range evictionFailuresReported + 2 {
+	clock := time.Now()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && !slices.Contains(args, "lock") {
+			clock = clock.Add(evictionLockBudget / time.Duration(attempted))
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	for i := range attempted + 1 {
 		f.addVolume(expiredGeneration(old.Add(time.Duration(i)*time.Second), 'a'))
 	}
 
@@ -383,5 +394,9 @@ func TestEvictionReportsABoundedNumberOfFailures(t *testing.T) {
 		!strings.Contains(err.Error(), "and 2 more eviction failure(s)") {
 		t.Errorf("Evict named %d failures in %v, want %d and the other 2 counted", named, err,
 			evictionFailuresReported)
+	}
+
+	if !strings.Contains(err.Error(), "1 generation(s) from cache-g-") {
+		t.Errorf("Evict = %v, want the generation left for the next pass named", err)
 	}
 }
