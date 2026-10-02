@@ -66,8 +66,11 @@ type runnerGroupPolicyClient struct {
 // registrations for as long as the connection stays silent.
 type policyBounds struct {
 	dial, tlsHandshake, responseHeader time.Duration
-	// request bounds one exchange end to end, body included.
-	request time.Duration
+	// request is the context bound on one exchange and overall the HTTP
+	// client's, each end to end with the body included. Either alone would do;
+	// both are set so a request reaching the client by some other path is
+	// bounded too.
+	request, overall time.Duration
 	// pingAfter and pingTimeout close a silent HTTP/2 connection rather than
 	// reusing it, as the scale-set client does (#205).
 	pingAfter, pingTimeout time.Duration
@@ -78,6 +81,7 @@ var defaultPolicyBounds = policyBounds{
 	tlsHandshake:   10 * time.Second,
 	responseHeader: 20 * time.Second,
 	request:        requestTimout,
+	overall:        requestTimout,
 	pingAfter:      30 * time.Second,
 	pingTimeout:    15 * time.Second,
 }
@@ -133,10 +137,10 @@ func newRunnerGroupPolicyClient(bounds policyBounds, base string, target Target,
 // connections.
 func newPolicyHTTPClient(b policyBounds) *http.Client {
 	return &http.Client{
-		Timeout: b.request,
+		Timeout: b.overall,
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: b.dial, KeepAlive: 30 * time.Second}).DialContext,
+			DialContext:           policyDialer(b).DialContext,
 			TLSHandshakeTimeout:   b.tlsHandshake,
 			ResponseHeaderTimeout: b.responseHeader,
 			ExpectContinueTimeout: time.Second,
@@ -146,6 +150,10 @@ func newPolicyHTTPClient(b policyBounds) *http.Client {
 			HTTP2:                 &http.HTTP2Config{SendPingTimeout: b.pingAfter, PingTimeout: b.pingTimeout},
 		},
 	}
+}
+
+func policyDialer(b policyBounds) *net.Dialer {
+	return &net.Dialer{Timeout: b.dial, KeepAlive: 30 * time.Second}
 }
 
 // exchange sends one request under the per-request bound and returns the

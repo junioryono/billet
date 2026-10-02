@@ -39,12 +39,13 @@ func returnsWithin(t *testing.T, call func() error) error {
 	}
 }
 
-// testBounds are the production bounds with the two timeouts a test exercises
-// replaced, so the one under test fires and the other cannot.
-func testBounds(responseHeader, request time.Duration) policyBounds {
+// testBounds are the production bounds with the three timeouts a test exercises
+// replaced, so the one under test fires and the others cannot.
+func testBounds(responseHeader, request, overall time.Duration) policyBounds {
 	b := defaultPolicyBounds
 	b.responseHeader = responseHeader
 	b.request = request
+	b.overall = overall
 
 	return b
 }
@@ -160,9 +161,13 @@ func TestThePolicyClientIsBuiltOnItsOwnBoundedTransport(t *testing.T) {
 		t.Fatalf("the policy client runs on %p, the process-wide default client is %p", c.client, http.DefaultClient)
 	}
 
-	if c.client.Timeout != defaultPolicyBounds.request || c.request != defaultPolicyBounds.request {
-		t.Errorf("overall bound %s and per-request bound %s, want both %s",
-			c.client.Timeout, c.request, defaultPolicyBounds.request)
+	if c.client.Timeout != defaultPolicyBounds.overall || c.request != defaultPolicyBounds.request {
+		t.Errorf("overall bound %s and per-request bound %s, want %s and %s",
+			c.client.Timeout, c.request, defaultPolicyBounds.overall, defaultPolicyBounds.request)
+	}
+
+	if d := policyDialer(defaultPolicyBounds).Timeout; d != defaultPolicyBounds.dial {
+		t.Errorf("the dialer's bound is %s, want %s", d, defaultPolicyBounds.dial)
 	}
 
 	transport, ok := c.client.Transport.(*http.Transport)
@@ -184,6 +189,7 @@ func TestThePolicyClientIsBuiltOnItsOwnBoundedTransport(t *testing.T) {
 	for name, d := range map[string]time.Duration{
 		"dial": defaultPolicyBounds.dial, "TLS handshake": defaultPolicyBounds.tlsHandshake,
 		"response header": defaultPolicyBounds.responseHeader, "request": defaultPolicyBounds.request,
+		"overall":    defaultPolicyBounds.overall,
 		"ping after": defaultPolicyBounds.pingAfter, "ping timeout": defaultPolicyBounds.pingTimeout,
 	} {
 		if d <= 0 {
@@ -204,7 +210,8 @@ func TestThePolicyClientIsBuiltOnItsOwnBoundedTransport(t *testing.T) {
 }
 
 // A SERVER THAT NEVER ANSWERS. The connection is accepted and nothing is ever
-// written back, so only the request's overall bound can end the exchange.
+// written back, so only an end-to-end bound can end the exchange, and each of
+// the two is proved with the other an hour away.
 func TestAPolicyServerThatNeverAnswersIsUndecided(t *testing.T) {
 	t.Parallel()
 
@@ -231,16 +238,28 @@ func TestAPolicyServerThatNeverAnswersIsUndecided(t *testing.T) {
 		}
 	}()
 
-	key, _ := testKeyPKCS1(t)
-	c := newRunnerGroupPolicyClient(testBounds(time.Hour, 200*time.Millisecond), "http://"+listener.Addr().String(),
-		OrganizationTarget("acme"), 11, 22, key)
+	for _, bound := range []struct {
+		name   string
+		bounds policyBounds
+	}{
+		{"the request context", testBounds(time.Hour, 200*time.Millisecond, time.Hour)},
+		{"the client", testBounds(time.Hour, time.Hour, 200*time.Millisecond)},
+	} {
+		t.Run(bound.name, func(t *testing.T) {
+			t.Parallel()
 
-	err = returnsWithin(t, func() error {
-		_, _, err := c.FindRunnerGroupID(t.Context(), "trusted")
+			key, _ := testKeyPKCS1(t)
+			c := newRunnerGroupPolicyClient(bound.bounds, "http://"+listener.Addr().String(),
+				OrganizationTarget("acme"), 11, 22, key)
 
-		return err
-	})
-	assertUndecided(t, err)
+			err := returnsWithin(t, func() error {
+				_, _, err := c.FindRunnerGroupID(t.Context(), "trusted")
+
+				return err
+			})
+			assertUndecided(t, err)
+		})
+	}
 }
 
 // A SLOW HEADER. The token is answered and every policy read is accepted and
@@ -261,7 +280,7 @@ func TestASlowPolicyHeaderIsUndecided(t *testing.T) {
 			})
 
 			key, _ := testKeyPKCS1(t)
-			c := newRunnerGroupPolicyClient(testBounds(200*time.Millisecond, time.Hour), base,
+			c := newRunnerGroupPolicyClient(testBounds(200*time.Millisecond, time.Hour, time.Hour), base,
 				OrganizationTarget("acme"), 11, 22, key)
 
 			err := returnsWithin(t, func() error { return op.call(t.Context(), c) })
@@ -296,7 +315,7 @@ func TestAStalledPolicyBodyIsUndecided(t *testing.T) {
 			})
 
 			key, _ := testKeyPKCS1(t)
-			c := newRunnerGroupPolicyClient(testBounds(time.Hour, 200*time.Millisecond), base,
+			c := newRunnerGroupPolicyClient(testBounds(time.Hour, 200*time.Millisecond, time.Hour), base,
 				OrganizationTarget("acme"), 11, 22, key)
 
 			err := returnsWithin(t, func() error { return op.call(t.Context(), c) })
@@ -349,7 +368,8 @@ func TestAWaitForTheTokenExchangeEndsWithTheCallersContext(t *testing.T) {
 	})
 
 	key, _ := testKeyPKCS1(t)
-	c := newRunnerGroupPolicyClient(testBounds(time.Hour, time.Hour), base, OrganizationTarget("acme"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(testBounds(time.Hour, time.Hour, time.Hour), base, OrganizationTarget("acme"),
+		11, 22, key)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	first := make(chan error, 1)
@@ -378,15 +398,84 @@ func TestAWaitForTheTokenExchangeEndsWithTheCallersContext(t *testing.T) {
 	})
 	assertUndecided(t, err)
 
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v; want the waiting caller's own deadline", err)
+	// errNoAnswer is what only the wait for the slot returns; a second exchange
+	// run beside the first would end in the client's own *url.Error.
+	if !errors.Is(err, errNoAnswer) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v; want the waiting caller's own deadline, met while waiting for the slot", err)
 	}
+
+	if extra := len(tokenSeen); extra != 0 {
+		t.Errorf("%d more token exchanges reached GitHub while the first was in flight", extra)
+	}
+}
+
+// policyClientViolations reports every shape in file that would send a request
+// outside the policy client's bounds: http.DefaultClient or DefaultTransport
+// anywhere, a package-level convenience call (http.Get and its siblings, which
+// use the default client), and in a method of runnerGroupPolicyClient a call to
+// doWithTimeout or any use of the HTTP client other than exchange's. It returns
+// the number of the client's methods it saw, so a rename cannot leave it
+// checking nothing.
+func policyClientViolations(fset *token.FileSet, file *ast.File) ([]string, int) {
+	var found []string
+	methods := 0
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || pkg.Name != "http" {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "DefaultClient", "DefaultTransport", "Get", "Head", "Post", "PostForm":
+			found = append(found, fmt.Sprintf("%s: http.%s", fset.Position(sel.Pos()), sel.Sel.Name))
+		}
+
+		return true
+	})
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
+		}
+		star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		if recv, ok := star.X.(*ast.Ident); !ok || recv.Name != "runnerGroupPolicyClient" {
+			continue
+		}
+		methods++
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.Ident:
+				if n.Name == "doWithTimeout" {
+					found = append(found, fmt.Sprintf("%s: %s reaches doWithTimeout",
+						fset.Position(n.Pos()), fn.Name.Name))
+				}
+			case *ast.SelectorExpr:
+				if n.Sel.Name == "client" && fn.Name.Name != "exchange" {
+					found = append(found, fmt.Sprintf("%s: %s uses the HTTP client itself rather than exchange",
+						fset.Position(n.Pos()), fn.Name.Name))
+				}
+			}
+
+			return true
+		})
+	}
+
+	return found, methods
 }
 
 // NO PRODUCTION CODE IN THIS PACKAGE REACHES THE PROCESS-WIDE DEFAULTS, and the
 // policy client sends every request through exchange, the one place its bounds
-// are applied. doWithTimeout is the shape that is refused: given a client it
-// adds nothing, and given none it builds one on the default transport.
+// are applied. doWithTimeout is refused in the client: given a client it adds
+// nothing, and given none it builds one on the default transport.
 func TestThePolicyClientReachesNoProcessWideDefault(t *testing.T) {
 	t.Parallel()
 
@@ -409,58 +498,60 @@ func TestThePolicyClientReachesNoProcessWideDefault(t *testing.T) {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 
-		ast.Inspect(file, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			pkg, ok := sel.X.(*ast.Ident)
-			if ok && pkg.Name == "http" && (sel.Sel.Name == "DefaultClient" || sel.Sel.Name == "DefaultTransport") {
-				t.Errorf("%s reaches http.%s", fset.Position(sel.Pos()), sel.Sel.Name)
-			}
-
-			return true
-		})
-
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || fn.Recv == nil || len(fn.Recv.List) != 1 {
-				continue
-			}
-			star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
-			if !ok {
-				continue
-			}
-			if recv, ok := star.X.(*ast.Ident); !ok || recv.Name != "runnerGroupPolicyClient" {
-				continue
-			}
-			methods++
-
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				switch f := call.Fun.(type) {
-				case *ast.Ident:
-					if f.Name == "doWithTimeout" {
-						t.Errorf("%s: %s sends through doWithTimeout, outside the policy client's bounds",
-							fset.Position(call.Pos()), fn.Name.Name)
-					}
-				case *ast.SelectorExpr:
-					if f.Sel.Name == "Do" && fn.Name.Name != "exchange" {
-						t.Errorf("%s: %s sends a request itself rather than through exchange",
-							fset.Position(call.Pos()), fn.Name.Name)
-					}
-				}
-
-				return true
-			})
+		found, seen := policyClientViolations(fset, file)
+		methods += seen
+		for _, violation := range found {
+			t.Error(violation)
 		}
 	}
 
-	// The walk found the client: a rename must not turn this into a test of nothing.
 	if methods < len(policyOperations) {
 		t.Fatalf("found %d methods on runnerGroupPolicyClient; the walk no longer sees the client", methods)
+	}
+}
+
+// The checker refuses each shape it names, so the test above is not passing
+// because it cannot see one.
+func TestThePolicyClientCheckerRefusesEachShape(t *testing.T) {
+	t.Parallel()
+
+	shapes := map[string]string{
+		"the default client":            `func f() { _ = http.DefaultClient }`,
+		"the default transport":         `func f() { _ = http.DefaultTransport }`,
+		"a convenience call":            `func f() { http.Get("x") }`,
+		"a convenience post":            `func f() { http.Post("x", "", nil) }`,
+		"doWithTimeout in a method":     `func (c *runnerGroupPolicyClient) m(r *http.Request) { doWithTimeout(c.client, r) }`,
+		"the client handed to a helper": `func (c *runnerGroupPolicyClient) m() { send(c.client) }`,
+		"the client used directly":      `func (c *runnerGroupPolicyClient) m(r *http.Request) { c.client.Do(r) }`,
+	}
+
+	for name, body := range shapes {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "fixture.go", "package github\n"+body, 0)
+			if err != nil {
+				t.Fatalf("parse the fixture: %v", err)
+			}
+
+			if found, _ := policyClientViolations(fset, file); len(found) == 0 {
+				t.Errorf("the checker accepted %s", body)
+			}
+		})
+	}
+
+	fset := token.NewFileSet()
+	allowed := `package github
+func (c *runnerGroupPolicyClient) exchange(r *http.Request) { c.client.Do(r) }
+func onboarding(r *http.Request) { doWithTimeout(nil, r) }`
+
+	file, err := parser.ParseFile(fset, "fixture.go", allowed, 0)
+	if err != nil {
+		t.Fatalf("parse the fixture: %v", err)
+	}
+
+	if found, methods := policyClientViolations(fset, file); len(found) != 0 || methods != 1 {
+		t.Errorf("the checker refused the allowed shapes (%v) or missed the method (%d)", found, methods)
 	}
 }
