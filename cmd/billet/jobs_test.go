@@ -180,7 +180,7 @@ func lineStarting(t *testing.T, report, label string) string {
 // A VM MEASURED BY ITS PROCESS RENDERS WHAT ITS HOST KEPT: memory without an
 // OOM count, and the kernel's energy estimate named as such.
 func TestAProcessMeasuredJobRendersWhatItsHostKept(t *testing.T) {
-	usage := &alloc.RecordedUsage{Node: "macos-01", JobUsage: alloc.JobUsage{
+	usage := &alloc.RecordedUsage{Node: "mac-1", JobUsage: alloc.JobUsage{
 		Source: alloc.UsageSourceHost, Samples: 600, IntervalMillis: 1000,
 		Unmeasured:      []string{alloc.UsageNet, alloc.UsageOOM, alloc.UsagePressure, alloc.UsageThreads},
 		MemoryPeakBytes: 25_855_595_336, EnergyActiveMicrojoules: 7_400_903_879, EnergySource: alloc.EnergyProcess,

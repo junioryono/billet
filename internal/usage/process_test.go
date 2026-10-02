@@ -7,7 +7,7 @@ import (
 )
 
 // refVMProcess is one tart VM's Virtualization.framework process on the
-// reference Mac (macos-01, macOS 27, a 6 vCPU / 24 GiB guest, 2026-09-30, read
+// reference deployment's Mac (macOS 27, a 6 vCPU / 24 GiB guest, 2026-09-30, read
 // only), converted from its rusage_info_v6 at hw.tbfrequency 24 MHz.
 var refVMProcess = ProcessCounters{
 	Start:      16664085551217,
