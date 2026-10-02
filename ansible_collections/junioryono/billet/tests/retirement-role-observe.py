@@ -333,7 +333,12 @@ def require_control(trace, scenario, pass_name):
     }
     network = [['stop', NODE], ['restart', 'billet-dnsmasq@billet0.service'],
                ['restart', 'billet-dnsmasq@billet1.service'], ['start', NODE]]
-    expected.update(network=network, combined=network,
+    # COMBINED ALSO CHANGES THE NODE'S INPUTS, so after the network drain's stop
+    # the node comes back through the input restart, which asks without waiting,
+    # rather than through the services step's start; a stopped unit restarted
+    # is a unit started.
+    combined = network[:-1] + [['restart', '--no-block', NODE]]
+    expected.update(network=network, combined=combined,
                     resume=network if pass_name == 'first' else [])
     require(trace == expected[scenario], f'independent node-only {scenario}/{pass_name}: {trace!r} != {expected[scenario]!r}')
 
