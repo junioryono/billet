@@ -185,6 +185,11 @@ type Runner struct {
 	// running maps a request to what was started for it, which is the only way
 	// Destroy knows what to remove.
 	running map[int64]*provider.Instance
+	// stoppedSince dates the first sweep that listed a running entry's instance as
+	// not running, and stoppedProved marks one a later sweep still saw stopped
+	// strayGrace on. Both guarded by mu; see noteStopped.
+	stoppedSince  map[string]time.Time
+	stoppedProved map[string]bool
 	// sets caches tier to scale-set id. Looked up once per tier rather than per
 	// launch, because it does not change while the process runs and a lookup on
 	// the launch path is a round trip in front of every job.
@@ -595,6 +600,9 @@ func (r *Runner) Launch(
 
 	r.mu.Lock()
 	r.running[job.RequestID] = inst
+	// A proof about an earlier instance of this name is not one about this one.
+	delete(r.stoppedSince, inst.Name)
+	delete(r.stoppedProved, inst.Name)
 	// THE LEASE IS KEPT WITH THE INSTANCE, because renewing or releasing it needs
 	// the epoch and the instance name carries only the id. It is needed exactly
 	// once — when this process is superseded and everything it is running becomes
@@ -634,6 +642,8 @@ func (r *Runner) forgetRunningLocked(name string) {
 			delete(r.runningLease, requestID)
 		}
 	}
+	delete(r.stoppedSince, name)
+	delete(r.stoppedProved, name)
 	r.forgetMonitoring(name)
 }
 
@@ -847,6 +857,8 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	r.mu.Lock()
 	delete(r.running, requestID)
 	delete(r.runningLease, requestID)
+	delete(r.stoppedSince, inst.Name)
+	delete(r.stoppedProved, inst.Name)
 	r.mu.Unlock()
 	r.forgetMonitoring(inst.Name)
 
@@ -1437,6 +1449,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	r.purgeDiscarded(ctx)
+
+	r.noteStopped(instances)
 
 	if len(instances) == 0 {
 		return nil
