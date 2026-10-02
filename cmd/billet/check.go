@@ -144,6 +144,10 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	// than a day is one somebody has forgotten.
 	checkGuard()
 
+	if runtime.GOOS == "linux" {
+		reportNeedrestart(os.Stdout, "/")
+	}
+
 	// The probe flag skips the network; so does the BILLET_MAINTENANCE
 	// environment variable — for the SKIPS ONLY, never the fence. The env form
 	// exists for binary-vintage compatibility: the Ansible upgrade transaction

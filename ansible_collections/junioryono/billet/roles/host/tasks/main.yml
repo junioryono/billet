@@ -488,6 +488,14 @@
       ansible.builtin.import_tasks: retirement-node-preflight.yml
       when: billet_retirement_node_ordinary | bool
 
+    # THE FIRST WRITE AFTER EVERY REFUSAL ABOVE AND BEFORE account.yml's apt
+    # install, so no package operation of this converge, nor any unattended one
+    # after it, restarts a billet service through needrestart. Not on the
+    # retained route, whose writes are admitted one destination at a time.
+    - name: Exclude billet's services from needrestart
+      ansible.builtin.import_tasks: needrestart.yml
+      when: not billet_retirement_node_ordinary | bool
+
     # THE CANDIDATE WAS RESOLVED, FETCHED AND STAGED BY THE PREPARATION
     # (stage-candidate.yml, before the hold), so by here billet_binary_upgrade and
     # the transaction's recovery directory are settled and nothing below reaches

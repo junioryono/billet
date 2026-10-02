@@ -737,6 +737,12 @@ jobs:
         if: matrix.group == 'shape'
         run: make unit-parity
 
+      # An unattended library upgrade restarted billet-node through needrestart,
+      # and a node's stop is a drain with no time limit. Escalated, as the role is.
+      - name: Prove the host role keeps needrestart from restarting billet's services
+        if: matrix.group == 'shape'
+        run: make needrestart-check
+
       # The PostgreSQL ledger shipped and the role read
       # server.state_dir, which such a config does not have — so every one of
       # them converged green against the DEFAULT directory, sandboxed and
