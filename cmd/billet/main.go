@@ -1683,6 +1683,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return nil
 	}
 
+	// THE HANDLER BEFORE THE REPORT that says this process has one, and neither
+	// for a probe, which is not the node a stop is asking.
+	stopDrainRequests := lc.handleDrainRequests()
+	defer stopDrainRequests()
+	publishNodeDrainReport(hostOS)
+
 	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client)
 	if err != nil {
 		return err
