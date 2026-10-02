@@ -67,6 +67,14 @@ type Client struct {
 	halfRemoved   map[string]time.Time
 	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
 	clock func() time.Time
+
+	// sessions reads which images the node's cache sessions name, for Evict.
+	sessions func() (func(name string) bool, error)
+
+	// evictResume is the last generation an eviction pass cut short by its lock
+	// budget reached, so the next pass begins after it.
+	evictMu     sync.Mutex
+	evictResume string
 }
 
 func (c *Client) now() time.Time {
@@ -114,6 +122,13 @@ func withRunner(r runner) Option {
 			c.run = r
 		}
 	}
+}
+
+// WithCacheSessions gives Evict a reader of the node's cache sessions, asked once
+// per pass before it moves an expired writable volume to the trash. Without one,
+// Evict keeps every writable volume and reports that it did.
+func WithCacheSessions(read func() (func(name string) bool, error)) Option {
+	return func(c *Client) { c.sessions = read }
 }
 
 // WithTimeout bounds one invocation.
