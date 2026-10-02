@@ -2332,7 +2332,9 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	// A hang guard only, longer than fifteen steps can take at their bounds'
+	// pace on a loaded host; the third poll is what ends the run.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 
 	// THE REAL LOOP, FED BY HAND. The ticks go to the goroutine Run starts, not
@@ -7514,15 +7516,16 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 			"the watchdog", err)
 	}
 
-	// THE WHOLE BUDGET, not a phase of it. Compared with the listener's own sum
-	// rather than restated, because a test that hardcoded "past the grace" broke
-	// when the cleanup-loop join got its own phase. The deadline was created
-	// before the destroy began, so it is already here.
+	// THE WHOLE BUDGET, not a phase of it: the cleanup join and the destroys get
+	// a grace each, the close and the release a finish grace each. Computed from
+	// the fixture rather than asked of teardownBudget, which would agree with
+	// itself if it dropped a phase. The deadline was created before the destroy
+	// began, so it is already here.
 	var end context.CancelFunc
 
 	select {
 	case budget := <-asked:
-		if want := l.teardownBudget(); budget != want {
+		if want := 2*grace + 2*(grace/3); budget != want {
 			t.Errorf("the teardown asked for a budget of %v, want the whole %v; renewal "+
 				"would stop while a phase still had time to run", budget, want)
 		}
