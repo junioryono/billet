@@ -336,6 +336,10 @@ postgres-profile: ## Prove the host role converges a deployment whose ledger is 
 unit-parity: ## Prove the packaged units and the role's templates agree on what matters
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/unit-parity.yml
 
+.PHONY: needrestart-check
+needrestart-check: ## Prove the host role installs the needrestart exclusion exactly where needrestart is
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/needrestart-check.yml
+
 .PHONY: emitted-block-check
 emitted-block-check: ## Converge the host role with a block `billet init --emit ansible` generated
 	ansible_collections/junioryono/billet/tests/emitted-block-check.sh

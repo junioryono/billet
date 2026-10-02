@@ -66,9 +66,11 @@ docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/bi
     APT="timeout -v -k 10 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::CAInfo=/usr/local/share/billet-host-ca.crt"
     ${APT} update
     ls /var/lib/apt/lists/*InRelease >/dev/null
+    mkdir /etc/needrestart
     ${APT} install --yes /tmp/billet.deb
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf
+    cmp /usr/share/billet/needrestart.conf /etc/needrestart/conf.d/90-billet.conf
     test -f /etc/billet/billet.yaml
     test -d /var/lib/billet
     test -d /srv/jailer
@@ -78,6 +80,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${deb_path}:/tmp/bi
     test ! -e /usr/bin/billet
     test ! -e /usr/lib/modules-load.d/billet-rbd.conf
     test -f /etc/billet/billet.yaml
+    test -f /etc/needrestart/conf.d/90-billet.conf
     test -f /var/lib/billet/package-lifecycle-state
     test -f /srv/jailer/package-lifecycle-guest
 '
@@ -86,6 +89,7 @@ docker run --rm --platform "linux/${package_arch}" --volume "${rpm_path}:/tmp/bi
     dnf install --assumeyes /tmp/billet.rpm
     test -x /usr/bin/billet
     test -f /usr/lib/modules-load.d/billet-rbd.conf
+    test ! -e /etc/needrestart
     test -f /etc/billet/billet.yaml
     test -d /var/lib/billet
     test -d /srv/jailer

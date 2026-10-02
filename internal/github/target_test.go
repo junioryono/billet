@@ -373,7 +373,7 @@ func TestRunnerGroupQuestionsAreRefusedForARepository(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
 	c.token = "cached-token"
 	c.expiresAt = time.Now().Add(time.Hour)
 
@@ -406,7 +406,7 @@ func TestRunnerRecoveryListsTheRepositorysRunners(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c := newRunnerGroupPolicyClient(srv.Client(), srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, RepositoryTarget("acme", "widgets"), 11, 22, key)
 	c.token = "cached-token"
 	c.expiresAt = time.Now().Add(time.Hour)
 

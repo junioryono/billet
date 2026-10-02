@@ -34,7 +34,7 @@ func runEvidenceServer(t *testing.T, run, repository string) (*runnerGroupPolicy
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	return newRunnerGroupPolicyClient(srv.Client(), srv.URL, OrganizationTarget("acme"), 11, 22, key),
+	return newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key),
 		&repositoryReads
 }
 

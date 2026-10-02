@@ -116,6 +116,8 @@ Validate the config and the state directory, prove every target's App key signs 
 
 The report names the host's converge guard when one is held: informational under a day, a `WARNING` naming `billet converge-guard recover --holder H --old-driver-stopped` past it, and a `WARNING` for a hold that never returned from its publication or a record whose time cannot be read. Nothing expires a guard; the warning is the reminder.
 
+On Linux it also says whether needrestart, which unattended upgrades run after every package upgrade, leaves billet's services alone: nothing when needrestart is not installed, the file carrying `$nrconf{override_rc}{qr(^billet-)} = 0;` when one does, a `WARNING` naming `/etc/needrestart/conf.d/90-billet.conf` when none does, and could-not-tell when a configuration file cannot be read. It recognises only that line, so a host kept safe another way still reads as the warning.
+
 ## Running the services
 
 ### `billet local status|up|down|uninstall`

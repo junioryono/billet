@@ -126,6 +126,8 @@ func (r OrphanReport) Count(verdict OrphanVerdict) int {
 // any read that follows the watcher check.
 //
 // INTO THE TRASH, NEVER `rbd rm`, for the reason discardCacheVolume gives.
+//
+// Evict takes the same proof, through judgeVolumes, for every expired volume.
 func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (OrphanReport, error) {
 	if opts.OlderThan < OrphanMinimumAge {
 		return OrphanReport{}, fmt.Errorf("ceph: an orphan must have been named at least %s ago, "+
@@ -138,6 +140,12 @@ func (c *Client) ReclaimOrphans(ctx context.Context, opts OrphanOptions) (Orphan
 		return OrphanReport{}, errors.New("ceph: an orphan pass needs this node's cache sessions")
 	}
 
+	return c.judgeVolumes(ctx, opts)
+}
+
+// judgeVolumes is the pass ReclaimOrphans and Evict share, on options their
+// callers have already judged.
+func (c *Client) judgeVolumes(ctx context.Context, opts OrphanOptions) (OrphanReport, error) {
 	names, err := c.cacheImages(ctx)
 	if err != nil {
 		return OrphanReport{}, err

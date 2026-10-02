@@ -140,6 +140,15 @@ nfpms:
       - src: deploy/billet.yaml
         dst: /usr/share/billet/billet.yaml
 
+      # SEEDED THE SAME WAY: postinstall copies this to
+      # /etc/needrestart/conf.d/90-billet.conf where needrestart is installed and
+      # nothing is there yet, so an unattended library upgrade never restarts a
+      # billet service (a node's stop is a drain with no time limit). Not a
+      # package-owned file under /etc/needrestart, because a removal would then
+      # delete an exclusion the host role or an operator also relies on.
+      - src: deploy/needrestart.conf
+        dst: /usr/share/billet/needrestart.conf
+
       - src: billet.example.yaml
         dst: /usr/share/doc/billet/billet.example.yaml
       - src: README.md
