@@ -314,6 +314,13 @@ type Listener struct {
 	heartbeatStopped func()
 	cleanupTicks     <-chan time.Time
 
+	// teardownDeadline replaces context.WithTimeout for the shutdown's overall
+	// budget when non-nil. TEST-ONLY and nil in every deployment: it is handed
+	// the budget the listener computed, so a test can check that number and
+	// then end the budget itself, instead of racing the watchdog's wall-clock
+	// timer to establish that renewal was running before it fired.
+	teardownDeadline func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
@@ -1032,8 +1039,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		// ONE DEADLINE THAT EVERY PHASE INHERITS, not a sum they can outlive: renewal has
 		// to outlast the whole teardown, and each phase is min(its own budget, what is
 		// left).
-		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx),
-			l.teardownBudget())
+		budgeted := context.WithTimeout
+		if l.teardownDeadline != nil {
+			budgeted = l.teardownDeadline
+		}
+
+		overall, endOverall := budgeted(context.WithoutCancel(ctx), l.teardownBudget())
 		defer endOverall()
 
 		renewCtx := overall

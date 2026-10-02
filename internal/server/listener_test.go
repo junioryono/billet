@@ -2340,9 +2340,11 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	// inside the poll would pass against a listener whose heartbeats stopped
 	// for the length of a poll, which is the regression this test exists for.
 	// Each send is followed by a wait for the pass it caused, bounded so that a
-	// loop that is not running fails the test instead of hanging it.
+	// loop that is not running fails the test instead of hanging it. The bounds
+	// exceed a pass's own deadline, and passed holds one acknowledgement, so a
+	// pass that outlives a bound cannot block the loop and with it the shutdown.
 	ticks := make(chan time.Time)
-	passed := make(chan struct{})
+	passed := make(chan struct{}, 1)
 
 	var (
 		polls    atomic.Int32
@@ -2377,7 +2379,7 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 				select {
 				case ticks <- clock.Now():
-				case <-time.After(5 * time.Second):
+				case <-time.After(30 * time.Second):
 					t.Error("the heartbeat loop took no tick while the poll was blocked; " +
 						"heartbeats are bounded by the poll again")
 
@@ -2386,7 +2388,7 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 				select {
 				case <-passed:
-				case <-time.After(5 * time.Second):
+				case <-time.After(30 * time.Second):
 					t.Error("the heartbeat loop took a tick and made no pass")
 
 					return
@@ -7324,6 +7326,13 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	closing0 := make(chan struct{})
 	checked := make(chan struct{})
 
+	// Released on every path out, including a failure before the check, or the
+	// close stays blocked and Run with it.
+	var releasing sync.Once
+
+	release := func() { releasing.Do(func() { close(checked) }) }
+	t.Cleanup(release)
+
 	var once sync.Once
 
 	session := &fakeSession{onClose: func(context.Context) error {
@@ -7372,13 +7381,6 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	// so the only thing that can have kept the lease alive is renewal.
 	time.Sleep(grace)
 
-	// close(checked) runs on every path out, or a failed step leaves the close
-	// blocked and Run with it.
-	var releasing sync.Once
-
-	release := func() { releasing.Do(func() { close(checked) }) }
-	t.Cleanup(release)
-
 	renewal.throughTwoTTLs(t, a, ttl, "renewal stopped while the shutdown was still "+
 		"closing its session; the old maxCapacity is still live at that moment")
 
@@ -7410,17 +7412,16 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	t.Parallel()
 
-	// The grace has to outlast the "still alive" check below, or the watchdog
-	// fires before the test has established that renewal was ever running. That
-	// check once slept two wall-clock TTLs against the real ticker and fired its
-	// own FIXTURE GUARD in CI -- "the lease was already gone before the shutdown
-	// grace expired" -- because a stall spent the margin (#188). It now drives
-	// the loop against the allocator's clock and takes milliseconds of the
-	// grace; the grace and the budget stay on the wall clock, since the watchdog
-	// is a wall-clock timer and is what this test is about.
+	// NOTHING HERE RACES THE WALL CLOCK. The "still alive" check once slept two
+	// TTLs against the real ticker and had to finish before the watchdog's real
+	// timer fired, and it fired its own FIXTURE GUARD in CI -- "the lease was
+	// already gone before the shutdown grace expired" -- because a stall spent
+	// the margin (#188). Renewal is now driven against the allocator's clock and
+	// the test ends the teardown budget itself, after checking the listener asked
+	// for the right one, so the grace only has to be longer than the test.
 	const (
 		ttl   = 30 * time.Second
-		grace = 5 * time.Second
+		grace = time.Minute
 	)
 
 	clock := newTestClock()
@@ -7449,9 +7450,7 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 		return nil
 	}}
 
-	// The finish phases are bounded too, and renewal has to outlast ALL of them —
-	// so they are small here for the same reason the grace is: the test is about
-	// what happens when the whole budget is spent, not about how long it is.
+	// The finish phases are bounded too, and renewal has to outlast ALL of them.
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
 		WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
@@ -7459,6 +7458,22 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 
 	stopped := make(chan struct{})
 	l.heartbeatStopped = sync.OnceFunc(func() { close(stopped) })
+
+	// THE OVERALL BUDGET, held by the test: the listener's number is recorded
+	// and the deadline is a cancellation only this test triggers.
+	var (
+		asked     = make(chan time.Duration, 1)
+		endBudget = make(chan context.CancelFunc, 1)
+	)
+
+	l.teardownDeadline = func(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		budgeted, end := context.WithCancel(parent)
+
+		asked <- budget
+		endBudget <- end
+
+		return budgeted, end
+	}
 
 	lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
@@ -7499,18 +7514,36 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 			"the watchdog", err)
 	}
 
-	// AND STOPPED ONCE THE WHOLE BUDGET IS SPENT, which is an event the loop
-	// reports rather than an interval this test sleeps through: with the ticks in
-	// the test's hands, a loop still running and one stopped look alike until
-	// something asks. The bound is the listener's own budget, taken from it
+	// THE WHOLE BUDGET, not a phase of it. Compared with the listener's own sum
 	// rather than restated, because a test that hardcoded "past the grace" broke
-	// when the cleanup-loop join got its own phase.
+	// when the cleanup-loop join got its own phase. The deadline was created
+	// before the destroy began, so it is already here.
+	var end context.CancelFunc
+
+	select {
+	case budget := <-asked:
+		if want := l.teardownBudget(); budget != want {
+			t.Errorf("the teardown asked for a budget of %v, want the whole %v; renewal "+
+				"would stop while a phase still had time to run", budget, want)
+		}
+
+		end = <-endBudget
+	default:
+		t.Fatal("the destroy began before the teardown set its overall budget")
+	}
+
+	// AND STOPPED ONCE IT IS SPENT, which is an event the loop reports rather
+	// than an interval this test sleeps through: with the ticks in the test's
+	// hands, a loop still running and one stopped look alike until something
+	// asks.
+	end()
+
 	select {
 	case <-stopped:
-	case <-time.After(l.teardownBudget() + 30*time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("a listener wedged in its teardown was still renewing after the shutdown " +
-			"grace; the reaper can never reclaim that capacity, so one stuck destroy " +
-			"costs the deployment those vCPUs until the process is killed")
+			"budget was spent; the reaper can never reclaim that capacity, so one stuck " +
+			"destroy costs the deployment those vCPUs until the process is killed")
 	}
 
 	unblock()
