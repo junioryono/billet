@@ -68,6 +68,8 @@ func TestListReportsEndedOnlyForAnExitedVMM(t *testing.T) {
 		{
 			name: "socket unlinked under a live vmm",
 			act: func(t *testing.T, j jail, _ *fakeVMM) {
+				t.Helper()
+
 				if err := os.Remove(j.socket()); err != nil {
 					t.Fatalf("unlink the api socket: %v", err)
 				}

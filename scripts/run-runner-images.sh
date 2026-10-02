@@ -371,8 +371,7 @@ done 3< <(jq -c '.[]' "$plan")
 # step it was placed for no longer calls update-grub and the image would ship it.
 # Asked of the image after the last step, whatever the placement test concluded.
 # The verdict is the exit status: 0 present, 1 absent, anything else a fault.
-if target exec sh -c '[ -e /usr/sbin/update-grub ] || [ -L /usr/sbin/update-grub ] || exit 1
-	grep -qF billet-update-grub-stand-in /usr/sbin/update-grub'; then
+if target exec sh -c '[ -e /usr/sbin/update-grub ] || [ -L /usr/sbin/update-grub ] || exit 1; grep -qF billet-update-grub-stand-in /usr/sbin/update-grub'; then
 	fail "the update-grub stand-in is still in the image: the step it was placed for never called it"
 else
 	status=$?

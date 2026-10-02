@@ -25,14 +25,14 @@ type orphanReclaimer interface {
 // cmdCacheOrphans lists the intact writable cache volumes nothing needs and,
 // with --reclaim, moves them to the cache pool's trash.
 func cmdCacheOrphans(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet cache orphans")
-	cfgPath := addConfigFlag(fs)
-	olderThan := fs.Duration("older-than", ceph.DefaultOrphanAge,
+	flags := newFlagSet("billet cache orphans")
+	cfgPath := addConfigFlag(flags)
+	olderThan := flags.Duration("older-than", ceph.DefaultOrphanAge,
 		fmt.Sprintf("how long ago a volume must have been named, at least %s", ceph.OrphanMinimumAge))
-	limit := fs.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass moves, or lists as reclaimable")
-	reclaim := fs.Bool("reclaim", false, "move what the listing calls reclaimable to the trash; "+
+	limit := flags.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass moves, or lists as reclaimable")
+	reclaim := flags.Bool("reclaim", false, "move what the listing calls reclaimable to the trash; "+
 		"without it nothing is changed")
-	if err := parse(fs, args); err != nil {
+	if err := parse(flags, args); err != nil {
 		return err
 	}
 

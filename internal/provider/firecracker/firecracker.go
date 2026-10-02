@@ -1827,15 +1827,16 @@ func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 	return running, err
 }
 
-// runState is running's answer plus whether the VMM process is proved to have
-// exited, which is the only thing firecracker has that says execution ENDED: a
+// runState reports, in order, running's answer and whether the VMM process is
+// proved to have exited, which is the only thing firecracker has that says
+// execution ENDED: a
 // paused VMM, one never started and one in a state billet does not know are all
 // not running and not ended.
 //
 // A GONE SOCKET IS NOT AN EXITED PROCESS. Unlinking a Unix socket leaves its
 // listener and the guest running, so `ended` needs the pid file to name a
 // process that /proc proves is no longer this jail's VMM (vmmExited).
-func (p *Provider) runState(ctx context.Context, j jail) (running, ended bool, err error) {
+func (p *Provider) runState(ctx context.Context, j jail) (bool, bool, error) {
 	info, err := p.apiFor(j.socket()).info(ctx)
 	if err != nil {
 		vmmGone := gone(err)

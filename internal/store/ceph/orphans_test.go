@@ -38,11 +38,8 @@ func (f *cacheFake) addVolume(handle string) {
 
 // freshVolume lists a volume created at now, which every pass needs as its
 // reading of the cluster's clock.
-func (f *cacheFake) freshVolume(now time.Time) string {
-	handle := orphanVolume(now, 'f')
-	f.addVolume(handle)
-
-	return handle
+func (f *cacheFake) freshVolume(now time.Time) {
+	f.addVolume(orphanVolume(now, 'f'))
 }
 
 func trashMoved(f *cacheFake, handle string) bool {
@@ -496,10 +493,13 @@ func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
 	now := time.Now()
 	orphan := orphanVolume(now.Add(-10*24*time.Hour), 'a')
 
-	for name, answer := range map[string]func() ([]byte, error){
-		"null":     func() ([]byte, error) { return []byte("null"), nil },
-		"text":     func() ([]byte, error) { return []byte("There is 1 metadatum on this image:"), nil },
-		"an error": func() ([]byte, error) { return nil, errors.New("exit status 5: rbd: (5) Input/output error") },
+	for name, answer := range map[string]struct {
+		out []byte
+		err error
+	}{
+		"null":     {out: []byte("null")},
+		"text":     {out: []byte("There is 1 metadatum on this image:")},
+		"an error": {err: errors.New("exit status 5: rbd: (5) Input/output error")},
 	} {
 		f := newCacheFake()
 		f.addVolume(orphan)
@@ -507,7 +507,7 @@ func TestAVolumeMetadataAnswerItCannotReadKeepsTheVolume(t *testing.T) {
 
 		run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 			if slices.Contains(args, "image-meta") && slices.Contains(args, orphan) {
-				return answer()
+				return answer.out, answer.err
 			}
 
 			return f.run(ctx, bin, args)

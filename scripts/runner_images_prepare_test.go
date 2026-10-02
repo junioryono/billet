@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,7 +212,7 @@ func TestTheGrubStandInAnswersOnceAndLeaves(t *testing.T) {
 	if err == nil || !strings.Contains(output, "has a GRUB the stand-in would hide") {
 		t.Fatalf("a present update-grub answered %v, want a refusal:\n%s", err, output)
 	}
-	if got, err := os.ReadFile(standIn); err != nil || string(got) != string(present) {
+	if got, err := os.ReadFile(standIn); err != nil || !bytes.Equal(got, present) {
 		t.Fatalf("the present update-grub was changed (%v):\n%s", err, got)
 	}
 }
