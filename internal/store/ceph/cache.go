@@ -1125,7 +1125,7 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	// SNAPSHOTS FIRST, AND A VOLUME THAT KEEPS ONE STAYS LISTED. A failed Snapshot
 	// can leave its staging snapshot behind, and in the trash that snapshot makes
 	// every `trash rm` answer ENOTEMPTY, which the purge takes for a live child and
-	// waits on forever; listed, the next discard or eviction purges it.
+	// waits on forever; listed, the next discard purges it.
 	if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: purge the snapshots of cache volume %s before the trash: %w",
 			handle, err)
@@ -1358,13 +1358,26 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 	return nil
 }
 
-// Evict removes old, unreferenced cache images under the same lock as publication.
+// Evict removes old, unreferenced generations under the same lock as
+// publication, and then moves expired writable volumes to the trash on the proof
+// ReclaimOrphans takes.
 //
-// WITH `rbd rm`, NOT THE TRASH, even for a writable volume. Only the evicting
-// host's mappings are checked, and no index record names a writable volume, so
-// what refuses a volume another node's job still has open is rbd's own refusal
-// to remove an image with watchers. One removal cut short is finished by
-// PurgeTrash (finishHalfRemoved).
+// A GENERATION IS REMOVED WITH `rbd rm`, NEVER THE TRASH. Only the evicting
+// host's mappings are checked, so what refuses a generation another node's job
+// still has open is rbd's own refusal to remove an image with watchers, which
+// `rbd trash mv` does not make. One removal cut short is finished by PurgeTrash
+// (finishHalfRemoved).
+//
+// A WRITABLE VOLUME GOES TO THE TRASH, AFTER THE LOCK. No index record names
+// one, and a large volume's `rbd rm` was routinely cut short by the command's
+// bound, so eviction takes the positive proof judgeVolumes takes (no session on
+// this node, no index record, old by the cluster's clock, no snapshot, no
+// mapping here, no watcher, no recent publication) and then `rbd trash mv`, which
+// is metadata only. PurgeTrash deletes the data under its own bound. Without a
+// session reader (WithCacheSessions) every volume is kept.
+//
+// A FAILURE ON ONE IMAGE IS REPORTED AND THE PASS GOES ON, so one image rbd
+// cannot remove or judge never holds every later one back to the next pass.
 //
 // IT NEVER DELETES FROM THE TRASH. Under this lock every writer waits on it, and a
 // discarded volume takes minutes to delete, so PurgeTrash does that off the lock.
@@ -1375,134 +1388,215 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ceph: cache eviction needs a positive inactivity age")
 	}
 
-	now := time.Now()
-
-	return c.withCacheLock(ctx, now, func(now time.Time) error {
-		metadata, err := c.cacheIndexMetadata(ctx)
-		if err != nil {
-			return err
-		}
-
-		protected := map[string]bool{}
-		retention := map[string]time.Duration{}
-		generationMetadata := map[string][]string{}
-		for key, value := range metadata {
-			if !strings.HasPrefix(key, cacheMetaPrefix+"active.") {
-				continue
-			}
-
-			var active cacheActive
-			if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
-				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return err
-				}
-
-				continue
-			}
-
-			protected[active.Handle] = true
-		}
-		for key, value := range metadata {
-			switch {
-			case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
-				var pointer cachePointer
-				if json.Unmarshal([]byte(value), &pointer) == nil && pointer.Handle != "" {
-					age := retentionDuration(pointer, olderThan)
-					retention[pointer.Handle] = age
-					if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
-						protected[pointer.Handle] = true
-					} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-						return err
-					}
-				}
-			case strings.HasPrefix(key, cacheMetaPrefix+"generation."):
-				var generation cachePointer
-				if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
-					retention[generation.Handle] = retentionDuration(generation, olderThan)
-					generationMetadata[generation.Handle] = append(generationMetadata[generation.Handle], key)
-				}
-			}
-		}
-
-		images, err := c.cacheImages(ctx)
-		if err != nil {
-			return err
-		}
-		present := make(map[string]bool, len(images))
-		for _, name := range images {
-			present[c.cfg.CachePool+"/"+name] = true
-		}
-		for handle, keys := range generationMetadata {
-			if present[handle] {
-				continue
-			}
-			for _, key := range keys {
-				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return err
-				}
-			}
-		}
-
-		for _, name := range images {
-			if _, _, ok := cacheImageName(name); !ok {
-				continue
-			}
-
-			handle := c.cfg.CachePool + "/" + name
-			if protected[handle] {
-				continue
-			}
-
-			usedAt, ok := cacheTimeFromName(name)
-			if value, found, readErr := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); readErr != nil {
-				return readErr
-			} else if found {
-				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
-					usedAt, ok = parsed, true
-				}
-			}
-
-			age := olderThan
-			if specific := retention[handle]; specific > age {
-				age = specific
-			}
-			if !ok || now.Sub(usedAt) < age {
-				continue
-			}
-
-			mapped, err := c.mappedDevices(ctx, name)
-			if err != nil {
-				return err
-			}
-
-			if len(mapped) != 0 {
-				continue
-			}
-
-			if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
-				!isNoSuchFile(err) {
-				return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
-			}
-
-			if err := c.removeCacheImage(ctx, handle); err != nil {
-				// A newer generation may still be a copy-on-write descendant. Keep
-				// this generation's metadata so a later pass can retry it once
-				// PurgeTrash has deleted the retired writer between them.
-				if isImageNotEmpty(err) {
-					continue
-				}
-
-				return err
-			}
-			for _, key := range generationMetadata[handle] {
-				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
+	generations := c.withCacheLock(ctx, time.Now(), func(now time.Time) error {
+		return c.evictGenerations(ctx, olderThan, now)
 	})
+
+	return errors.Join(generations, c.evictVolumes(ctx, olderThan))
+}
+
+func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, now time.Time) error {
+	metadata, err := c.cacheIndexMetadata(ctx)
+	if err != nil {
+		return err
+	}
+
+	protected := map[string]bool{}
+	retention := map[string]time.Duration{}
+	generationMetadata := map[string][]string{}
+	for key, value := range metadata {
+		if !strings.HasPrefix(key, cacheMetaPrefix+"active.") {
+			continue
+		}
+
+		var active cacheActive
+		if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
+			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		protected[active.Handle] = true
+	}
+	for key, value := range metadata {
+		switch {
+		case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
+			var pointer cachePointer
+			if json.Unmarshal([]byte(value), &pointer) == nil && pointer.Handle != "" {
+				age := retentionDuration(pointer, olderThan)
+				retention[pointer.Handle] = age
+				if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
+					protected[pointer.Handle] = true
+				} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+					return err
+				}
+			}
+		case strings.HasPrefix(key, cacheMetaPrefix+"generation."):
+			var generation cachePointer
+			if json.Unmarshal([]byte(value), &generation) == nil && generation.Handle != "" {
+				retention[generation.Handle] = retentionDuration(generation, olderThan)
+				generationMetadata[generation.Handle] = append(generationMetadata[generation.Handle], key)
+			}
+		}
+	}
+
+	images, err := c.cacheImages(ctx)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]bool, len(images))
+	for _, name := range images {
+		present[c.cfg.CachePool+"/"+name] = true
+	}
+	for handle, keys := range generationMetadata {
+		if present[handle] {
+			continue
+		}
+		for _, key := range keys {
+			if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+				return err
+			}
+		}
+	}
+
+	var failures []error
+
+	for _, name := range images {
+		if kind, _, ok := cacheImageName(name); !ok || kind != "g" {
+			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
+
+		handle := c.cfg.CachePool + "/" + name
+		if protected[handle] {
+			continue
+		}
+
+		if err := c.evictGeneration(ctx, name, handle, max(olderThan, retention[handle]), now,
+			generationMetadata[handle]); err != nil {
+			failures = append(failures, fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
+		}
+	}
+
+	return errors.Join(failures...)
+}
+
+// evictGeneration removes one unprotected generation unused for age, keeping it
+// on any answer it cannot read.
+func (c *Client) evictGeneration(
+	ctx context.Context, name, handle string, age time.Duration, now time.Time, metadataKeys []string,
+) error {
+	usedAt, ok := cacheTimeFromName(name)
+	if value, found, err := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); err != nil {
+		return err
+	} else if found {
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+			usedAt, ok = parsed, true
+		}
+	}
+
+	if !ok || now.Sub(usedAt) < age {
+		return nil
+	}
+
+	mapped, err := c.mappedDevices(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	if len(mapped) != 0 {
+		return nil
+	}
+
+	if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil && !isNoSuchFile(err) {
+		return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
+	}
+
+	if err := c.removeCacheImage(ctx, handle); err != nil {
+		// A newer generation may still be a copy-on-write descendant. Keep this
+		// generation's metadata so a later pass can retry it once PurgeTrash has
+		// deleted the retired writer between them.
+		if isImageNotEmpty(err) {
+			return nil
+		}
+
+		return err
+	}
+
+	for _, key := range metadataKeys {
+		if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// evictionVolumeLimit bounds how many expired volumes one eviction pass moves to
+// the trash. Eviction runs every six hours, so this clears a backlog of a few
+// thousand within a day or two while bounding one pass's rbd calls.
+const evictionVolumeLimit = 1000
+
+// evictionFailuresReported bounds how many kept volumes one eviction error names,
+// because one reason, such as an unreadable cluster clock, keeps every volume.
+const evictionFailuresReported = 10
+
+// evictVolumes moves expired writable volumes to the trash on judgeVolumes'
+// proof, outside the cache lock, and reports each volume it could not judge or
+// whose move rbd did not confirm.
+func (c *Client) evictVolumes(ctx context.Context, olderThan time.Duration) error {
+	if c.sessions == nil {
+		return errors.New("ceph: expired writable cache volumes are kept: this client was given no " +
+			"way to read the node's cache sessions")
+	}
+
+	inSession, err := c.sessions()
+	if err == nil && inSession == nil {
+		err = errors.New("the reader returned none")
+	}
+	if err != nil {
+		return fmt.Errorf("ceph: expired writable cache volumes are kept: could not tell which the "+
+			"node's cache sessions hold: %w", err)
+	}
+
+	report, err := c.judgeVolumes(ctx, OrphanOptions{
+		OlderThan: max(olderThan, OrphanMinimumAge), Limit: evictionVolumeLimit, Reclaim: true,
+		InSession: inSession,
+	})
+	if err != nil {
+		return fmt.Errorf("ceph: expired writable cache volumes are kept: %w", err)
+	}
+
+	var failures []error
+
+	unreported := 0
+
+	for _, image := range report.Images {
+		if image.Verdict != OrphanUnknown && image.Verdict != OrphanMoveUnknown {
+			continue
+		}
+
+		if len(failures) == evictionFailuresReported {
+			unreported++
+
+			continue
+		}
+
+		failures = append(failures, fmt.Errorf("ceph: expired cache volume %s/%s, %s: %w",
+			c.cfg.CachePool, image.Name, image.Verdict, image.Err))
+	}
+
+	if unreported > 0 {
+		failures = append(failures, fmt.Errorf("ceph: and %d more expired cache volume(s) kept or "+
+			"not confirmed moved", unreported))
+	}
+
+	return errors.Join(failures...)
 }
 
 type cacheTrashImage struct {

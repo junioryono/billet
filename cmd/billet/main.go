@@ -1926,7 +1926,7 @@ func startNodeCache(
 			return nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
 		var err error
-		storage, err = ceph.New(*cfg.Node.Ceph)
+		storage, err = ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(cacheSessionNames(cfg)))
 		if err != nil {
 			return nil, nil, err
 		}
