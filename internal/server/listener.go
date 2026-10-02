@@ -1493,6 +1493,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err != nil {
+			// AS ITSELF, AHEAD OF THE CANCELLATION, which stopping would report in
+			// its place during a drain.
+			if sessionFatal(err) {
+				return fmt.Errorf("server: poll %s: %w", l.tier, err)
+			}
+
 			if cancelledWhileServing(ctx, draining, err) {
 				continue
 			}
@@ -1501,8 +1507,16 @@ func (l *Listener) Run(ctx context.Context) error {
 				continue
 			}
 
-			if !l.sessionRecoverable(err) {
+			// A POLL FAILURE IS THIS TIER'S OWN TROUBLE WITH GITHUB, answered by
+			// replacing the session without stopping any other tier, unless there
+			// is nothing to reopen through or this process is no longer the
+			// controller, which must act on nothing.
+			if l.reopen == nil {
 				return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
+			}
+
+			if l.fenced() {
+				return l.fencedRecovery(err)
 			}
 
 			if stop, rerr := l.recoverOrStop(ctx, pollCtx, draining, err); stop {
@@ -1617,18 +1631,10 @@ var (
 	sessionReopenMax   = 5 * time.Minute
 )
 
-// sessionRecoverable reports whether a failed poll is this tier's own trouble
-// with GitHub, which recoverSession answers without stopping any other tier.
-//
-// THE REST STILL STOP THE CONTROL PLANE, and each for a reason that is not one
-// tier's: a response billet cannot act on leaves it unable to tell which of its
-// commitments are real, a process that is no longer the controller must act on
-// nothing, and a listener with nothing to reopen through has no way back.
-func (l *Listener) sessionRecoverable(err error) bool {
-	return l.reopen != nil && !l.fenced() && !sessionFatal(err)
-}
-
-// sessionFatal reports an error no session recovery may absorb.
+// sessionFatal reports an error no session recovery may absorb, and which stops
+// the control plane: a response billet cannot act on leaves it unable to tell
+// which of its commitments are real, and a process that is no longer the
+// controller must act on nothing.
 func sessionFatal(err error) bool {
 	return errors.Is(err, ErrUntrustworthySession) || errors.Is(err, state.ErrLeadershipLost)
 }
@@ -1848,7 +1854,17 @@ func (l *Listener) openReplacement(ctx context.Context) (Session, error) {
 
 		return opened.session, opened.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		// A RESULT READY BESIDE THE CANCELLATION IS TAKEN, because select picks
+		// between them at random and a fatal answer left on the channel is never
+		// read if the listener stops here.
+		select {
+		case opened := <-l.opening:
+			l.opening = nil
+
+			return opened.session, opened.err
+		default:
+			return nil, ctx.Err()
+		}
 	}
 }
 
