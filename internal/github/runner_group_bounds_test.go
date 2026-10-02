@@ -215,7 +215,7 @@ func TestThePolicyClientIsBuiltOnItsOwnBoundedTransport(t *testing.T) {
 func TestAPolicyServerThatNeverAnswersIsUndecided(t *testing.T) {
 	t.Parallel()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
