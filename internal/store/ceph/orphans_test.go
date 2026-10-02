@@ -339,7 +339,6 @@ func TestTheClusterClockIsTheLatestCreationItReports(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	ahead := now.Add(30 * 24 * time.Hour)
 
 	pass := func(t *testing.T, f *cacheFake, clock time.Time) OrphanReport {
 		t.Helper()
@@ -357,26 +356,34 @@ func TestTheClusterClockIsTheLatestCreationItReports(t *testing.T) {
 		return report
 	}
 
-	// Recent by the cluster, old by the clock that is ahead.
-	recent := orphanVolume(now.Add(-24*time.Hour), 'a')
-
 	t.Run("no reference can be read", func(t *testing.T) {
 		t.Parallel()
 
 		f := newCacheFake()
-		f.addVolume(recent)
+		orphan := orphanVolume(now.Add(-20*24*time.Hour), 'a')
+		f.addVolume(orphan)
 		for i := range clusterNowProbes {
 			unreadable := orphanVolume(now.Add(-time.Duration(i)*time.Minute), 'c')
 			f.images[unreadable] = true
 		}
+		// A readable reference past the probes' bound, which would date the
+		// orphan if the pass looked that far.
+		beyond := orphanVolume(now.Add(-time.Hour), 'b')
+		f.addVolume(beyond)
+		f.created[beyond] = now
 
-		report := pass(t, f, ahead)
+		report := pass(t, f, now)
 		judged := slices.IndexFunc(report.Images, func(image OrphanImage) bool {
-			return "billet-cache/"+image.Name == recent
+			return "billet-cache/"+image.Name == orphan
 		})
 		if judged < 0 || report.Images[judged].Verdict != OrphanUnknown || report.Images[judged].Err == nil ||
-			trashMoved(f, recent) {
-			t.Errorf("report %+v; want the volume could-not-tell, with a reason, and not moved", report.Images)
+			!strings.Contains(report.Images[judged].Err.Error(), "none of the 8 newest") || trashMoved(f, orphan) {
+			t.Errorf("report %+v; want the orphan could-not-tell for want of a reference, and not moved",
+				report.Images)
+		}
+
+		if f.ranWith("info", beyond) {
+			t.Error("the pass asked past its bound for the cluster's clock")
 		}
 	})
 
