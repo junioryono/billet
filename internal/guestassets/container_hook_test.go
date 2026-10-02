@@ -118,23 +118,41 @@ func TestTheHookHarnessRemovesEveryHookInput(t *testing.T) {
 
 	// EVERY VARIABLE THE HOOK NAMES is one this harness removes, so a new input
 	// added to the hook cannot leak back in unnoticed.
-	read := regexp.MustCompile(`env\.([A-Z_]+)`).FindAllStringSubmatch(string(body), -1)
+	source := string(body)
 
-	list := regexp.MustCompile(`GO_CACHE_ENV = \[([^\]]*)\]`).FindStringSubmatch(string(body))
+	// A COMPUTED READ cannot be checked by name. The one the hook has, env[name]
+	// inside `for (const name of GO_CACHE_ENV)`, reads exactly that list, which
+	// is parsed below; any other is refused.
+	for _, m := range regexp.MustCompile(`env\[([^'"\]][^\]]*)\]`).FindAllStringSubmatch(source, -1) {
+		if m[1] != "name" || !strings.Contains(source, "for (const name of GO_CACHE_ENV)") {
+			t.Fatalf("container-hook.js reads env[%s], a computed name this test cannot check", m[1])
+		}
+	}
+
+	var read []string
+
+	for _, m := range regexp.MustCompile(`env\.([A-Za-z_][A-Za-z0-9_]*)|env\[['"]([^'"]+)['"]\]`).
+		FindAllStringSubmatch(source, -1) {
+		read = append(read, m[1]+m[2])
+	}
+
+	list := regexp.MustCompile(`GO_CACHE_ENV = \[([^\]]*)\]`).FindStringSubmatch(source)
 	if list == nil {
 		t.Fatal("container-hook.js no longer declares GO_CACHE_ENV; update this test's reading of its inputs")
 	}
 
-	read = append(read, regexp.MustCompile(`'([A-Z_]+)'`).FindAllStringSubmatch(list[1], -1)...)
-
-	if len(read) < len(hookInputs) {
-		t.Fatalf("found %d inputs in container-hook.js, fewer than the %d the harness removes", len(read), len(hookInputs))
+	for _, m := range regexp.MustCompile(`['"]([^'"]+)['"]`).FindAllStringSubmatch(list[1], -1) {
+		read = append(read, m[1])
 	}
 
-	for _, name := range read {
-		if !slices.Contains(hookInputs, name[1]) {
-			t.Errorf("container-hook.js reads %s, which the harness does not remove", name[1])
-		}
+	slices.Sort(read)
+	read = slices.Compact(read)
+
+	want := slices.Clone(hookInputs)
+	slices.Sort(want)
+
+	if !slices.Equal(read, want) {
+		t.Fatalf("container-hook.js reads %v; the harness removes %v. They must be the same set", read, want)
 	}
 }
 
