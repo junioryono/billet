@@ -38,7 +38,7 @@ func runnerImagesFunction(t *testing.T, name string) string {
 		t.Fatalf("could not find the end of %s in run-runner-images.sh", name)
 	}
 
-	return source[start+1 : start+end+2]
+	return source[start+1 : start+end+3]
 }
 
 // runPrepare runs CALL in bash with the named functions from the runner and the

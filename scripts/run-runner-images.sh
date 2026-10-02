@@ -78,8 +78,9 @@ prepare_build_user() {
 
 # GITHUB'S TESTS ASSERT A FEW THINGS ABOUT AZURE, OR ABOUT THE MACHINE THEY RUN
 # ON, that a billet guest or the container it is built in does not have. Each is
-# one named test marked skipped, in the copy the final step runs, by a prepare
-# below; every other test in the suite still runs.
+# one named test marked skipped, in the copy every step runs its tests from, by a
+# prepare on the first step that runs that file (a script's invoke_tests runs a
+# whole file mid-build); every other test in the suite still runs.
 #
 # skip_upstream_test marks the test called NAME in FILE skipped: whatever follows
 # the name on its It line (a conditional -Skip, say) gives way to -Skip. EXACTLY
@@ -133,6 +134,7 @@ prepare_system_tests_rootflags() {
 
 # billet's apt source names two HTTPS mirrors as two repositories rather than
 # GitHub's mirror list; install_cloud_base in build-guest-image.sh writes it.
+# install-apt-common.sh is the first step that runs the apt tests.
 prepare_apt_tests_two_mirrors() {
 	skip_upstream_test /imagegeneration/tests/Apt.Tests.ps1 \
 		"Apt sources resolve through the mirror list"
