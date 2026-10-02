@@ -231,3 +231,77 @@ func TestEvictionNeverMovesAGenerationToTheTrash(t *testing.T) {
 		}
 	}
 }
+
+// THE GENERATIONS' PART HOLDS THE CACHE LOCK FOR A BOUNDED TIME. Every writer
+// waits on that lock, and a failed removal no longer ends the pass, so a pass of
+// slow removals stops at evictionLockBudget, says so, and the next pass goes on.
+func TestEvictionHoldsTheCacheLockForABoundedTime(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	generations := []string{
+		expiredGeneration(old, '1'), expiredGeneration(old, '2'), expiredGeneration(old, '3'),
+	}
+
+	f := newCacheFake()
+	clock := time.Now()
+	slow := true
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slow && slices.Contains(args, "rm") && !slices.Contains(args, "lock") {
+			clock = clock.Add(evictionLockBudget / 2)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c := evictingClient(t, f, run)
+	c.clock = func() time.Time { return clock }
+	for _, generation := range generations {
+		f.addVolume(generation)
+	}
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err == nil ||
+		!strings.Contains(err.Error(), "1 generation(s) from cache-g-") {
+		t.Errorf("Evict = %v, want the generation left for the next pass reported", err)
+	}
+
+	if f.images[generations[0]] || f.images[generations[1]] {
+		t.Error("eviction kept a generation inside its lock budget")
+	}
+
+	if !f.images[generations[2]] || f.ranWith("rm", generations[2]) {
+		t.Fatal("eviction went on removing generations past its lock budget")
+	}
+
+	slow = false
+
+	if err := c.Evict(t.Context(), 7*24*time.Hour); err != nil || f.images[generations[2]] {
+		t.Errorf("the next pass = %v and kept %v, want the waiting generation removed", err,
+			f.images[generations[2]])
+	}
+}
+
+// ONE CAUSE CAN FAIL EVERY IMAGE ALIKE, so an eviction error names the first
+// evictionFailuresReported failures and counts the rest.
+func TestEvictionReportsABoundedNumberOfFailures(t *testing.T) {
+	t.Parallel()
+
+	old := time.Now().Add(-8 * 24 * time.Hour)
+
+	f := newCacheFake()
+	f.failRemove = true
+	c := evictingClient(t, f, f.run)
+	for i := range evictionFailuresReported + 2 {
+		f.addVolume(expiredGeneration(old.Add(time.Duration(i)*time.Second), 'a'))
+	}
+
+	err := c.Evict(t.Context(), 7*24*time.Hour)
+	if err == nil {
+		t.Fatal("Evict reported no failure although every removal failed")
+	}
+
+	if named := strings.Count(err.Error(), "injected remove failure"); named != evictionFailuresReported ||
+		!strings.Contains(err.Error(), "and 2 more eviction failure(s)") {
+		t.Errorf("Evict named %d failures in %v, want %d and the other 2 counted", named, err,
+			evictionFailuresReported)
+	}
+}

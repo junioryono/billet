@@ -1377,7 +1377,8 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 // session reader (WithCacheSessions) every volume is kept.
 //
 // A FAILURE ON ONE IMAGE IS REPORTED AND THE PASS GOES ON, so one image rbd
-// cannot remove or judge never holds every later one back to the next pass.
+// cannot remove or judge never holds every later one back to the next pass; the
+// generations' part stops only at evictionLockBudget.
 //
 // IT NEVER DELETES FROM THE TRASH. Under this lock every writer waits on it, and a
 // discarded volume takes minutes to delete, so PurgeTrash does that off the lock.
@@ -1461,15 +1462,36 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 		}
 	}
 
-	var failures []error
+	var failures evictionFailures
 
-	for _, name := range images {
+	started := c.now()
+
+	for i, name := range images {
 		if kind, _, ok := cacheImageName(name); !ok || kind != "g" {
 			continue
 		}
 
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(failures, err)...)
+			failures.add(err)
+
+			return failures.err()
+		}
+
+		// EVERY WRITER WAITS ON THIS LOCK, for at most cacheLockWaitLimit, and a
+		// removal that fails is no longer the end of the pass, so the pass bounds
+		// how long it holds the lock and leaves the rest to the next one.
+		if held := c.now().Sub(started); held >= evictionLockBudget {
+			waiting := 0
+			for _, later := range images[i:] {
+				if kind, _, ok := cacheImageName(later); ok && kind == "g" {
+					waiting++
+				}
+			}
+
+			failures.add(fmt.Errorf("ceph: the cache lock was held %s, so %d generation(s) from %s "+
+				"on wait for the next eviction pass", held.Round(time.Second), waiting, name))
+
+			return failures.err()
 		}
 
 		handle := c.cfg.CachePool + "/" + name
@@ -1479,11 +1501,11 @@ func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, 
 
 		if err := c.evictGeneration(ctx, name, handle, max(olderThan, retention[handle]), now,
 			generationMetadata[handle]); err != nil {
-			failures = append(failures, fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
+			failures.add(fmt.Errorf("ceph: evict expired generation %s: %w", handle, err))
 		}
 	}
 
-	return errors.Join(failures...)
+	return failures.err()
 }
 
 // evictGeneration removes one unprotected generation unused for age, keeping it
@@ -1538,13 +1560,43 @@ func (c *Client) evictGeneration(
 }
 
 // evictionVolumeLimit bounds how many expired volumes one eviction pass moves to
-// the trash. Eviction runs every six hours, so this clears a backlog of a few
-// thousand within a day or two while bounding one pass's rbd calls.
+// the trash, and so what one pass hands the purge. Eviction runs every six hours,
+// so this clears a backlog of a few thousand within a day or two.
 const evictionVolumeLimit = 1000
 
-// evictionFailuresReported bounds how many kept volumes one eviction error names,
-// because one reason, such as an unreadable cluster clock, keeps every volume.
+// evictionLockBudget bounds how long one eviction pass holds the cache lock,
+// well inside cacheLockWaitLimit, the longest any writer waits for it.
+const evictionLockBudget = 5 * time.Minute
+
+// evictionFailuresReported bounds how many failures one eviction error names,
+// because one cause, such as an unreadable cluster clock, fails every image alike.
 const evictionFailuresReported = 10
+
+// evictionFailures joins the first evictionFailuresReported failures and counts
+// the rest.
+type evictionFailures struct {
+	named      []error
+	unreported int
+}
+
+func (f *evictionFailures) add(err error) {
+	if len(f.named) == evictionFailuresReported {
+		f.unreported++
+
+		return
+	}
+
+	f.named = append(f.named, err)
+}
+
+func (f *evictionFailures) err() error {
+	if f.unreported == 0 {
+		return errors.Join(f.named...)
+	}
+
+	return errors.Join(append(f.named, fmt.Errorf("ceph: and %d more eviction failure(s)",
+		f.unreported))...)
+}
 
 // evictVolumes moves expired writable volumes to the trash on judgeVolumes'
 // proof, outside the cache lock, and reports each volume it could not judge or
@@ -1572,31 +1624,16 @@ func (c *Client) evictVolumes(ctx context.Context, olderThan time.Duration) erro
 		return fmt.Errorf("ceph: expired writable cache volumes are kept: %w", err)
 	}
 
-	var failures []error
-
-	unreported := 0
+	var failures evictionFailures
 
 	for _, image := range report.Images {
-		if image.Verdict != OrphanUnknown && image.Verdict != OrphanMoveUnknown {
-			continue
+		if image.Verdict == OrphanUnknown || image.Verdict == OrphanMoveUnknown {
+			failures.add(fmt.Errorf("ceph: expired cache volume %s/%s, %s: %w",
+				c.cfg.CachePool, image.Name, image.Verdict, image.Err))
 		}
-
-		if len(failures) == evictionFailuresReported {
-			unreported++
-
-			continue
-		}
-
-		failures = append(failures, fmt.Errorf("ceph: expired cache volume %s/%s, %s: %w",
-			c.cfg.CachePool, image.Name, image.Verdict, image.Err))
 	}
 
-	if unreported > 0 {
-		failures = append(failures, fmt.Errorf("ceph: and %d more expired cache volume(s) kept or "+
-			"not confirmed moved", unreported))
-	}
-
-	return errors.Join(failures...)
+	return failures.err()
 }
 
 type cacheTrashImage struct {
