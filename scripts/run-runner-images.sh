@@ -153,7 +153,7 @@ prepare_grub_absent() {
 			echo "$stand_in exists, so this image has a GRUB the stand-in would hide" >&2
 			exit 1
 		fi
-		printf "%s\n" "#!/bin/sh" \
+		printf "%s\n" "#!/bin/sh" "# billet-update-grub-stand-in" \
 			"echo \"update-grub: a billet guest boots its kernel directly; no GRUB to update\" >&2" \
 			"rm -f -- \"\$0\"" >"$stand_in" &&
 			chmod 0755 "$stand_in"'
@@ -366,4 +366,17 @@ done 3< <(jq -c '.[]' "$plan")
 
 # EVERY STEP WAS REACHED, which is what "the template ran" means.
 [ "$n" -eq "$total" ] || fail "reached $n of the plan's $total steps"
+
+# THE GRUB STAND-IN REMOVES ITSELF WHEN CALLED, so one still present means the
+# step it was placed for no longer calls update-grub and the image would ship it.
+# Asked of the image after the last step, whatever the placement test concluded.
+# The verdict is the exit status: 0 present, 1 absent, anything else a fault.
+if target exec sh -c '[ -e /usr/sbin/update-grub ] || [ -L /usr/sbin/update-grub ] || exit 1
+	grep -qF billet-update-grub-stand-in /usr/sbin/update-grub'; then
+	fail "the update-grub stand-in is still in the image: the step it was placed for never called it"
+else
+	status=$?
+	[ "$status" -eq 1 ] || fail "could not check the image for the update-grub stand-in (status $status)"
+fi
+
 echo "ran $total steps of GitHub's template"
