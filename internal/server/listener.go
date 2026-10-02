@@ -305,6 +305,15 @@ type Listener struct {
 	heartbeatTicks  <-chan time.Time
 	heartbeatPassed func()
 
+	// heartbeatStopped runs when the heartbeat loop returns, and cleanupTicks
+	// replaces the cleanup loop's ticker when non-nil. TEST-ONLY and nil in every
+	// deployment. With the two above they let a test drive both loops against
+	// the allocator's clock instead of racing the machine's: when renewal ends is
+	// an event the test waits for rather than a wall-clock interval it sleeps
+	// through, and a slow pass on a loaded host costs time, not the lease.
+	heartbeatStopped func()
+	cleanupTicks     <-chan time.Time
+
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
@@ -2245,6 +2254,10 @@ func stopping(ctx context.Context, err error) error {
 // The interval is a fraction of the TTL so a single missed beat — a busy
 // database, a slow write — does not expire anything.
 func (l *Listener) heartbeatLoop(ctx context.Context) {
+	if l.heartbeatStopped != nil {
+		defer l.heartbeatStopped()
+	}
+
 	ticks := l.heartbeatTicks
 	if ticks == nil {
 		ticker := time.NewTicker(l.heartbeatInterval())
@@ -2319,14 +2332,19 @@ func (l *Listener) lockForHeartbeat() {
 
 // cleanupLoop retries cleanup obligations on its own clock.
 func (l *Listener) cleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(l.heartbeatInterval())
-	defer ticker.Stop()
+	ticks := l.cleanupTicks
+	if ticks == nil {
+		ticker := time.NewTicker(l.heartbeatInterval())
+		defer ticker.Stop()
+
+		ticks = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			l.retryCleanup(ctx)
 		}
 	}
