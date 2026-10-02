@@ -2,6 +2,10 @@ package main
 
 import (
 	"bytes"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,5 +105,78 @@ func TestCheckCannotTellThroughAnUnreadableConfiguration(t *testing.T) {
 	got := reportedNeedrestart(root)
 	if !strings.HasPrefix(got, "restarts could not tell whether needrestart excludes billet's services: ") {
 		t.Errorf("an unreadable drop-in reported %q", got)
+	}
+}
+
+// A dangling symlink where needrestart loads a file is one it fails to load,
+// not an absent file; a symlink to the exclusion is the exclusion.
+func TestCheckReadsADanglingConfigurationLinkAsCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	for name, path := range map[string]string{
+		"a drop-in":     "etc/needrestart/conf.d/90-billet.conf",
+		"the main file": "etc/needrestart/needrestart.conf",
+	} {
+		root := needrestartTree(t, map[string]string{"usr/sbin/needrestart": "#!/bin/sh\n"})
+		if err := os.MkdirAll(filepath.Join(root, "etc/needrestart/conf.d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(root, "nowhere"), filepath.Join(root, path)); err != nil {
+			t.Fatal(err)
+		}
+
+		got := reportedNeedrestart(root)
+		if !strings.HasPrefix(got, "restarts could not tell whether needrestart excludes billet's services: ") {
+			t.Errorf("%s: a dangling link reported %q", name, got)
+		}
+	}
+
+	root := needrestartTree(t, map[string]string{"elsewhere/billet.conf": deploy.NeedrestartDropIn})
+	link := filepath.Join(root, "etc/needrestart/conf.d/90-billet.conf")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "elsewhere/billet.conf"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := reportedNeedrestart(root); got != "restarts needrestart leaves billet's services alone ("+link+")\n" {
+		t.Errorf("a symlinked exclusion reported %q", got)
+	}
+}
+
+// TestCheckReportsNeedrestartOnLinux pins the call in runCheck: the report is
+// made on Linux, to stdout, about the host's own root.
+func TestCheckReportsNeedrestartOnLinux(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "check.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "runCheck" {
+			continue
+		}
+
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			stmt, ok := n.(*ast.IfStmt)
+			if !ok || types.ExprString(stmt.Cond) != `runtime.GOOS == "linux"` || len(stmt.Body.List) != 1 {
+				return true
+			}
+			expr, ok := stmt.Body.List[0].(*ast.ExprStmt)
+			if ok && types.ExprString(expr.X) == `reportNeedrestart(os.Stdout, "/")` {
+				found = true
+			}
+
+			return true
+		})
+	}
+
+	if !found {
+		t.Error(`runCheck does not call reportNeedrestart(os.Stdout, "/") under runtime.GOOS == "linux"`)
 	}
 }

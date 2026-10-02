@@ -67,9 +67,15 @@ func reportNeedrestart(w io.Writer, root string) {
 	var unreadable []error
 	for _, path := range files {
 		body, err := regularfile.ReadFile(path, needrestartConfigLimit, regularfile.Options{})
+		if errors.Is(err, fs.ErrNotExist) {
+			// ABSENT ONLY WHEN THE NAME IS: a dangling symlink is a file
+			// needrestart fails to load, not one it does without.
+			if _, lerr := os.Lstat(path); errors.Is(lerr, fs.ErrNotExist) {
+				continue
+			}
+		}
+
 		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			continue
 		case err != nil:
 			unreadable = append(unreadable, err)
 

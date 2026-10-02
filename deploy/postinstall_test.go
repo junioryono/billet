@@ -137,6 +137,44 @@ ln -s /nowhere /etc/needrestart/conf.d/90-billet.conf
 sh /postinstall.sh
 test "$(readlink /etc/needrestart/conf.d/90-billet.conf)" = '/nowhere'
 test ! -e /nowhere
+rm /etc/needrestart/conf.d/90-billet.conf
+
+# A FAILURE IS REPORTED AND NEVER ENDS THE INSTALL, and a file that appears at
+# the name between the check and the publication is never overwritten. The
+# mktemp shim acts only on the drop-in's temporary name: it fails, or it makes
+# the temporary file and then plants an operator's file at the destination.
+mkdir /shim
+cat >/shim/mktemp <<'SHIM'
+#!/bin/sh
+case "$1" in
+    /etc/needrestart/conf.d/90-billet.conf.*) ;;
+    *) exec /usr/bin/mktemp "$@" ;;
+esac
+if [ "${SHIM_MODE}" = fail ]; then
+    exit 1
+fi
+made=$(/usr/bin/mktemp "$@") || exit 1
+printf 'raced\n' >/etc/needrestart/conf.d/90-billet.conf
+printf '%s\n' "${made}"
+SHIM
+chmod 0755 /shim/mktemp
+
+SHIM_MODE=fail PATH="/shim:${PATH}" sh /postinstall.sh 2>/failed.err
+grep -F '/etc/needrestart/conf.d/90-billet.conf could not be installed' /failed.err
+test -z "$(ls -A /etc/needrestart/conf.d)"
+
+SHIM_MODE=race PATH="/shim:${PATH}" sh /postinstall.sh 2>/raced.err
+grep -F '/etc/needrestart/conf.d/90-billet.conf could not be installed' /raced.err
+test "$(cat /etc/needrestart/conf.d/90-billet.conf)" = 'raced'
+test "$(ls -A /etc/needrestart/conf.d)" = '90-billet.conf'
+rm /etc/needrestart/conf.d/90-billet.conf
+
+rmdir /etc/needrestart/conf.d
+touch /etc/needrestart/conf.d
+sh /postinstall.sh 2>/blocked.err
+grep -F '/etc/needrestart/conf.d/90-billet.conf could not be installed' /blocked.err
+test -f /etc/needrestart/conf.d
+test ! -s /etc/needrestart/conf.d
 `)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("package needrestart exclusion: %v\n%s", err, out)
