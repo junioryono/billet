@@ -630,6 +630,12 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 // sleep, and why nothing here assumes the redelivery.
 func (s *Server) openSession(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) (Session, error) {
 	for attempt := 1; ; attempt++ {
+		// BEFORE EVERY ATTEMPT, because a listener's recovery waits here too, and
+		// a process that is no longer the controller opens nothing.
+		if s.leadershipLost != nil && s.leadershipLost() {
+			return nil, fmt.Errorf("server: open session for tier %s: %w", t.Label, state.ErrLeadershipLost)
+		}
+
 		session, err := prov.Session(ctx, set.ID, s.owner)
 		if err == nil {
 			return session, nil

@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // fastSessionReopen makes recoverSession's backoff milliseconds for one test.
@@ -110,10 +111,20 @@ func TestOneTiersFailingPollLeavesTheOtherTiersServing(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
+	finished := make(chan struct{})
 
 	go func() {
+		defer close(finished)
+
 		done <- New(a, b.prov, b.tiers, "test-owner", slog.New(logged)).Run(ctx)
 	}()
+
+	// JOINED ON EVERY EXIT, a failed assertion included, so the control plane is
+	// gone before the ledger closes and the pacing is restored.
+	t.Cleanup(func() {
+		cancel()
+		<-finished
+	})
 
 	// THE HEALTHY TIER IS STILL POLLING AFTER THE BROKEN ONE HAS REOPENED ITS
 	// SESSION THREE TIMES. Counted from a baseline taken once the reopens have
@@ -328,5 +339,83 @@ func TestARecoveredSessionKeepsTheRunningJobAndItsLease(t *testing.T) {
 		t.Errorf("after the reopen: launched %v, running %d, leases charged %d; want the one "+
 			"pool runner kept, its lease charged and nothing launched twice",
 			launched, runningAfter, leasesAfter)
+	}
+}
+
+// A REPLACEMENT THAT FAILS FOR A REASON THE DEPLOYMENT MUST STOP FOR STOPS IT.
+//
+// The first poll's failure is ordinary transport trouble and enters the
+// recovery; what the open then answers is classified again, because a recovery
+// that retried these would keep a deposed controller or an untrustworthy session
+// alive behind an Error line per attempt.
+func TestAFatalReplacementStopsTheRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fatal error
+	}{
+		{"untrustworthy session", fmt.Errorf("%w: an id nobody offered for", ErrUntrustworthySession)},
+		{"lost controller claim", fmt.Errorf("server: open session for tier a: %w", state.ErrLeadershipLost)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fastSessionReopen(t)
+
+			tiers := []config.Tier{tier("billet-4vcpu-a")}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+			var opens atomic.Int64
+
+			session := &fakeSession{onGet: func() (*Message, error) { return nil, errBrokerTimedOut }}
+			l := NewListener(a, tiers[0].Label, session,
+				WithLogger(slog.New(slog.DiscardHandler)),
+				WithSessionReopen(func(context.Context) (Session, error) {
+					opens.Add(1)
+
+					return nil, tc.fatal
+				}))
+
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+
+			err := l.Run(ctx)
+			if ctx.Err() != nil {
+				t.Fatalf("the recovery went on retrying a fatal open until the test gave up: %v", err)
+			}
+
+			if !errors.Is(err, tc.fatal) {
+				t.Errorf("Run = %v, want the fatal open's error", err)
+			}
+
+			if got := opens.Load(); got != 1 {
+				t.Errorf("it tried %d opens, want exactly the one that answered fatally", got)
+			}
+		})
+	}
+}
+
+// AND THE WAIT FOR A HELD SESSION, WHICH A RECOVERY SITS IN TOO, ENDS WHEN THIS
+// PROCESS STOPS BEING THE CONTROLLER rather than opening one for a deployment
+// somebody else now runs.
+func TestTheWaitForAHeldSessionEndsWhenLeadershipIsLost(t *testing.T) {
+	original := sessionRetryFor
+	sessionRetryFor = time.Millisecond
+
+	t.Cleanup(func() { sessionRetryFor = original })
+
+	held := &heldSessions{refusals: 1_000_000}
+	s := &Server{
+		prov: held, log: slog.New(slog.DiscardHandler), owner: "billet",
+		leadershipLost: func() bool { return held.attempts.Load() >= 1 },
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	_, err := s.openSession(ctx, &config.Tier{Label: "linux"}, &ScaleSet{ID: 1}, s.prov)
+	if !errors.Is(err, state.ErrLeadershipLost) {
+		t.Fatalf("openSession = %v, want the lost claim", err)
+	}
+
+	if got := held.attempts.Load(); got != 1 {
+		t.Errorf("it asked GitHub %d times; after the claim was lost it must ask no more", got)
 	}
 }
