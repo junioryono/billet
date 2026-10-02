@@ -335,7 +335,8 @@ type trashPurging interface {
 	PurgeTrash(ctx context.Context) (int, error)
 }
 
-// PurgeDiscarded deletes the root disks earlier destroys moved out of use.
+// PurgeDiscarded deletes the root disks earlier destroys moved out of use, and
+// with them the discarded cache volumes that share the disk's pool.
 func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
 	purger, ok := p.disk.(trashPurging)
 	if !ok {
@@ -344,7 +345,7 @@ func (p *Provider) PurgeDiscarded(ctx context.Context) (int, error) {
 
 	n, err := purger.PurgeTrash(ctx)
 	if err != nil {
-		return n, fmt.Errorf("firecracker: purge discarded root disks: %w", err)
+		return n, fmt.Errorf("firecracker: purge discarded root disks and cache volumes: %w", err)
 	}
 
 	return n, nil
