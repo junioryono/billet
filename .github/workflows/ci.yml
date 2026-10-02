@@ -626,6 +626,13 @@ jobs:
         if: matrix.group == 'shape'
         run: make host-upgrade-order
 
+      # The node drains before it restarts and the drain has no bound, so the
+      # role hands the restart to systemd and polls for a new main process.
+      # This drives that task file against a scripted systemctl.
+      - name: Prove the node restart is polled rather than awaited
+        if: matrix.group == 'shape'
+        run: make node-restart-check
+
       - name: Pin the fail-closed ledger mount units
         if: matrix.group == 'shape'
         run: make ledger-mount-render

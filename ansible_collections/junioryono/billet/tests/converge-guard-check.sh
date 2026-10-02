@@ -409,9 +409,12 @@ if operation == "show":
         if arg.startswith("--property="):
             properties.extend(arg.split("=", 1)[1].split(","))
     for key in properties or list(unit):
-        if key not in unit:
+        # This fake runs every job to completion before it answers, so a
+        # requested Job is always the empty one systemd shows for no job.
+        value = unit.get(key, "" if key == "Job" and properties else None)
+        if value is None:
             sys.exit("the recovery systemctl fake does not know property " + key)
-        print(unit[key] if "--value" in args else key + "=" + unit[key])
+        print(value if "--value" in args else key + "=" + value)
     sys.exit(0)
 if operation == "is-active":
     print(unit["ActiveState"])
@@ -432,8 +435,14 @@ if operation in ["start", "restart", "stop"]:
             registration = pathlib.Path("/var/lib/billet/node/gate-registration.json")
             registration.parent.mkdir(parents=True, exist_ok=True)
             registration.write_text(json.dumps(dict(invocation=unit["InvocationID"], endpoint=unit["Endpoint"])))
+    # A RESTART RUNS A NEW MAIN PROCESS, as systemd's does: the role's restart
+    # is proved by a MainPID other than the one it recorded before, so the fake
+    # alternates between two live processes rather than answering the same one.
+    pid = os.environ["BILLET_GATE_SERVICE_PID"]
+    if operation == "restart" and unit["MainPID"] == pid:
+        pid = os.environ["BILLET_GATE_SERVICE_PID_NEXT"]
     unit.update(ActiveState="active" if active else "inactive", SubState="running" if active else "dead",
-                MainPID=os.environ["BILLET_GATE_SERVICE_PID"] if active else "0", ControlPID="0", Result="success")
+                MainPID=pid if active else "0", ControlPID="0", Result="success")
 elif operation in ["enable", "disable"]:
     if unit["LoadState"] == "not-found":
         sys.exit(1)
@@ -691,7 +700,7 @@ if [ "\${1:-}" = show ] && [ "\${3:-}" = --property=EnvironmentFiles ] && [ -n "
   exit 0
 fi
 if [ -n "\${BILLET_GATE_SERVICES:-}" ]; then
-  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID
+  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID BILLET_GATE_SERVICE_PID_NEXT
   exec '$python' '$work/service-state.py' systemctl "\$@"
 fi
 FAKE
@@ -710,7 +719,7 @@ for tool in pgrep systemd-cgls; do
 if [ -z "\${BILLET_GATE_LOG:-}" ] && [ -r /var/lib/billet-gate.env ]; then . /var/lib/billet-gate.env; fi
 if [ -n "\${BILLET_GATE_SERVICES:-}" ]; then
   printf 'role=$tool\nargv=%s\n---\n' "\$*" >>"\${BILLET_GATE_LOG:-/dev/null}"
-  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID
+  export BILLET_GATE_SERVICES BILLET_GATE_SERVICE_PID BILLET_GATE_SERVICE_PID_NEXT
   exec '$python' '$work/service-state.py' '$tool' "\$@"
 fi
 if [ -x '$mnt/bin/$tool' ]; then exec '$mnt/bin/$tool' "\$@"; fi
@@ -1173,7 +1182,7 @@ expect_no_ordinary() { # case
   # sources so a newly added ordinary task joins this assertion automatically.
   while IFS= read -r task; do
     expect_no_task "$1" "$task"
-  done < <(sed -n 's/^[[:space:]]*- name: //p' "$role_tasks/account.yml" "$role_tasks/services.yml" "$role_tasks/service-account.yml")
+  done < <(sed -n 's/^[[:space:]]*- name: //p' "$role_tasks/account.yml" "$role_tasks/services.yml" "$role_tasks/node-restart.yml" "$role_tasks/service-account.yml")
   expect_no_task "$1" "Configure billet account and files"
   expect_no_task "$1" "Configure billet services"
 }
@@ -1537,11 +1546,14 @@ fi
 mkdir -p "$case_dir/calls"
 : >"$case_dir/calls/index.jsonl"
 chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/calls" "$case_dir/calls/index.jsonl"
-# A live, harmless process gives the service fake a pid whose cmdline the
-# finalizer can inspect. It is reaped before this namespace exits.
+# Live, harmless processes give the service fake pids whose cmdline the
+# finalizer can inspect; a restart moves a unit from one to the other. Both are
+# reaped before this namespace exits.
 sleep 3600 &
 service_pid=$!
-trap 'kill "$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true' EXIT
+sleep 3600 &
+service_pid_next=$!
+trap 'kill "$service_pid" "$service_pid_next" 2>/dev/null || true; wait "$service_pid" "$service_pid_next" 2>/dev/null || true' EXIT
 chown "$INVOKER_UID:$INVOKER_GID" "$case_dir/log" "$case_dir/private" "$case_dir/out"
 envs=(PATH="$FAKES:$PATH" ANSIBLE_COLLECTIONS_PATH="$COLLECTIONS" \
   ANSIBLE_STDOUT_CALLBACK=default ANSIBLE_NOCOLOR=1 ANSIBLE_FORCE_COLOR=0 \
@@ -1549,7 +1561,8 @@ envs=(PATH="$FAKES:$PATH" ANSIBLE_COLLECTIONS_PATH="$COLLECTIONS" \
   RUNNER_NAME="$RUNNER" BILLET_CONVERGE_GUARD_HOLDER="$HOLDER" \
   BILLET_GATE_LOG="$case_dir/log" BILLET_GATE_PRIVATE="$case_dir/private" \
   BILLET_GATE_CALLS="$case_dir/calls" BILLET_GATE_RECORDER="$RECORDER" \
-  BILLET_GATE_SERVICE_PID="$service_pid" BILLET_GATE_RETIRE_FIXTURES="$RETIRE_FIXTURES")
+  BILLET_GATE_SERVICE_PID="$service_pid" BILLET_GATE_SERVICE_PID_NEXT="$service_pid_next" \
+  BILLET_GATE_RETIRE_FIXTURES="$RETIRE_FIXTURES")
 while IFS= read -r line; do [ -n "$line" ] && envs+=("$line"); done <"$case_dir/env"
 mapfile -t args <"$case_dir/args"
 if [ -d "$case_dir/services" ]; then mkdir -p /run/systemd/system || exit 96; fi

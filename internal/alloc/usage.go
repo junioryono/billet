@@ -14,8 +14,9 @@ import (
 )
 
 // UsageSourceHost is usage the node measured from outside the guest: the
-// cgroup, the tap, the VMM's threads and the package energy counter. It is the
-// only source today; a guest's own report would be another, and never a
+// cgroup, the tap, the VMM's threads and the package energy counter, or for a
+// VM that is one process with no cgroup, that process's own accounting. It is
+// the only source today; a guest's own report would be another, and never a
 // replacement for this one.
 const UsageSourceHost = "host"
 
@@ -23,8 +24,12 @@ const UsageSourceHost = "host"
 // node could not read reports zero AND is named, because zero is also a real
 // measurement.
 const (
-	UsageCPU      = "cpu"
-	UsageMemory   = "memory"
+	UsageCPU    = "cpu"
+	UsageMemory = "memory"
+	// UsageOOM is the OOM count alone, unmeasured where the host keeps no such
+	// count for the job (a process's own accounting on macOS). An unmeasured
+	// memory group takes the count with it.
+	UsageOOM      = "oom"
 	UsageIO       = "io"
 	UsageNet      = "net"
 	UsageThreads  = "threads"
@@ -32,7 +37,7 @@ const (
 	UsageEnergy   = "energy"
 )
 
-var usageGroups = []string{UsageCPU, UsageMemory, UsageIO, UsageNet, UsageThreads,
+var usageGroups = []string{UsageCPU, UsageMemory, UsageOOM, UsageIO, UsageNet, UsageThreads,
 	UsagePressure, UsageEnergy}
 
 // How a job's energy was attributed.
@@ -45,6 +50,10 @@ const (
 	// configured: the whole package is shared by CPU time and nothing is
 	// reported as idle, which overstates what a job's work cost.
 	EnergyRAPLUnsplit = "rapl-unsplit"
+	// EnergyProcess is the kernel's own estimate of the energy the job's process
+	// used over its life (macOS's per-process energy, for a tart VM): already
+	// attributed, with no idle share to report.
+	EnergyProcess = "process"
 )
 
 // UsageSeriesCodec is the one series encoding this build writes and reads.
@@ -108,8 +117,15 @@ type UsageSeries struct {
 	Data  []byte `json:"data"`
 }
 
-// Measured reports whether a group was read.
-func (u JobUsage) Measured(group string) bool { return !slices.Contains(u.Unmeasured, group) }
+// Measured reports whether a group was read. The OOM count is read only with
+// the memory it belongs to.
+func (u JobUsage) Measured(group string) bool {
+	if group == UsageOOM && !u.Measured(UsageMemory) {
+		return false
+	}
+
+	return !slices.Contains(u.Unmeasured, group)
+}
 
 // Validate refuses a report the ledger could not keep faithfully.
 func (u JobUsage) Validate() error {
@@ -161,9 +177,9 @@ func (u JobUsage) Validate() error {
 		if u.EnergySource != "" {
 			return errors.New("alloc: a usage report names energy unmeasured and gives it a source")
 		}
-	case u.EnergySource == EnergyRAPLUnsplit:
+	case u.EnergySource == EnergyRAPLUnsplit || u.EnergySource == EnergyProcess:
 		if u.EnergyIdleMicrojoules != 0 {
-			return errors.New("alloc: unsplit energy has no idle share, so it cannot report one")
+			return fmt.Errorf("alloc: %s energy has no idle share, so it cannot report one", u.EnergySource)
 		}
 	case u.EnergySource != EnergyRAPL:
 		return fmt.Errorf("alloc: energy source %q is not one this control plane records", u.EnergySource)
@@ -179,6 +195,7 @@ func (u JobUsage) groupFields() map[string][]int64 {
 		UsageCPU:     {u.CPUUserMicros, u.CPUSystemMicros},
 		UsageThreads: {u.GuestCPUMicros, u.VMMCPUMicros},
 		UsageMemory:  {u.MemoryPeakBytes, u.OOMKills},
+		UsageOOM:     {u.OOMKills},
 		UsageIO:      {u.DiskReadBytes, u.DiskWriteBytes},
 		UsageNet:     {u.NetRxBytes, u.NetTxBytes, u.NetRxPackets, u.NetTxPackets},
 		UsagePressure: {u.CPUSomeMicros, u.CPUFullMicros, u.MemorySomeMicros, u.MemoryFullMicros,

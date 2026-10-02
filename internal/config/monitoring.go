@@ -66,9 +66,10 @@ func (m *NodeMonitoringConfig) IntervalDuration() (time.Duration, error) {
 // validateMonitoringNode refuses a monitoring block this node could not honour.
 //
 // REFUSED RATHER THAN IGNORED on a backend with no host-side view of the job:
-// ec2 and codebuild run it on someone else's machine and tart's guest lives in
-// a process billet does not yet read, so the block would promise numbers that
-// never arrive.
+// ec2 and codebuild run it on someone else's machine, so the block would
+// promise numbers that never arrive. A tart VM is measured by its process's own
+// accounting, which carries its own energy estimate, so RAPL (a Linux counter)
+// and its idle baseline are refused there too.
 func (c *Config) validateMonitoringNode() []error {
 	m := c.Node.Monitoring
 	if m == nil {
@@ -76,9 +77,16 @@ func (c *Config) validateMonitoringNode() []error {
 	}
 
 	var errs []error
-	if c.Node.Provider != ProviderFirecracker && c.Node.Provider != ProviderDocker {
+	switch c.Node.Provider {
+	case ProviderFirecracker, ProviderDocker:
+	case ProviderTart:
+		if m.RAPL || m.IdlePackageWatts != 0 {
+			errs = append(errs, errors.New("node.monitoring.rapl and idle_package_watts are Linux "+
+				"package counters, and a tart VM's energy is macOS's own estimate for its process"))
+		}
+	default:
 		errs = append(errs, fmt.Errorf("node.monitoring is set but this node's provider is %s, "+
-			"and only firecracker and docker jobs can be measured from the host", c.Node.Provider))
+			"and only firecracker, docker and tart jobs can be measured from the host", c.Node.Provider))
 	}
 	if _, err := m.IntervalDuration(); err != nil {
 		errs = append(errs, err)

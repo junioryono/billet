@@ -69,6 +69,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // Instance is provider.Instance, aliased so this file does not repeat the
@@ -292,6 +293,13 @@ type Provider struct {
 	// Measured, not feared — that is how the first version of this behaved.
 	beforeStoreLock func()
 
+	// lsof lists who has a VM's disk open, processPath names a process's
+	// executable and processStart its start: how UsageTarget finds a VM's
+	// process. Seams because the real ones read the running kernel.
+	lsof         string
+	processPath  func(pid int) (string, error)
+	processStart func(pid int) (uint64, error)
+
 	// names serializes Launch and Destroy per VM name. Destroy's stop→prove→
 	// delete is not atomic, and a Launch admitted into that window could have
 	// its fresh VM deleted on the strength of the corpse's proof. The node runs
@@ -404,6 +412,10 @@ func New(owner string, opts ...Option) (*Provider, error) {
 
 		storeLockWindow: 2 * time.Minute,
 		storeLockRetry:  25 * time.Millisecond,
+
+		lsof:         "/usr/sbin/lsof",
+		processPath:  usage.ProcessPath,
+		processStart: hostProcessStart,
 	}
 
 	for _, opt := range opts {

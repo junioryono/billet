@@ -26,6 +26,11 @@ log=$BILLET_TEST_ROOT/driver.log
 case "$1" in
 exec)
 	shift
+	# The final check for a leftover update-grub stand-in: absent (1) unless a
+	# test stages another answer.
+	if [ "$1" = sh ] && [ "$2" = -c ]; then
+		case "$3" in *billet-update-grub-stand-in*) exit "${BILLET_TEST_STANDIN_STATUS:-1}" ;; esac
+	fi
 	if [ "$1" = runuser ]; then shift 4; fi
 	[ "$1" = /var/tmp/billet-ri/with-environment ] || exit 0
 	set -- $(printf '%s\n' "$@" | sed "s#^/var/tmp/billet-ri/#$BILLET_TEST_ROOT/var/tmp/billet-ri/#")
@@ -46,6 +51,8 @@ type runnerFixture struct {
 	dir, root, out string
 	plan           []planStep
 	differences    string
+	// env is added to the runner's environment, for what the fake target reads.
+	env []string
 }
 
 // runRunner runs run-runner-images.sh over the fixture and returns its combined
@@ -71,6 +78,7 @@ func runRunner(t *testing.T, fx runnerFixture) (string, []string, error) {
 		"BILLET_RI_TARGET="+driver, "BILLET_RI_IMAGE_VERSION=20260927.1", "BILLET_RI_OUT="+fx.out,
 		"BILLET_RI_DIR="+fx.dir, "BILLET_RI_NO_PAUSE=1", "BILLET_TEST_ROOT="+fx.root,
 		"BILLET_TEST_LOG="+filepath.Join(fx.root, "steps.log"))
+	cmd.Env = append(cmd.Env, fx.env...)
 	output, runErr := cmd.CombinedOutput()
 	raw, err := os.ReadFile(filepath.Join(fx.root, "driver.log"))
 	if err != nil && !os.IsNotExist(err) {
@@ -187,6 +195,43 @@ func TestTheRunnerRunsThePlanInOrder(t *testing.T) {
 
 // A STEP THAT FAILS STOPS THE BUILD, named with its status, and nothing after it
 // runs.
+// THE GRUB STAND-IN NEVER SHIPS: one still in the image after the last step (its
+// step no longer called update-grub) fails the build, and so does an image the
+// runner could not ask. An absent one is the ordinary build.
+func TestALeftoverUpdateGrubStandInFailsTheBuild(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		status, clause string
+	}{
+		"left in the image": {"0", "the update-grub stand-in is still in the image"},
+		"could not ask":     {"2", "could not check the image for the update-grub stand-in"},
+	} {
+		fx := newRunnerFixture(t)
+		fx.env = []string{"BILLET_TEST_STANDIN_STATUS=" + tc.status}
+
+		output, calls, err := runRunner(t, fx)
+		if err == nil || !strings.Contains(output, tc.clause) {
+			t.Errorf("%s: answered %v, want a failure saying %q:\n%s", name, err, tc.clause, output)
+		}
+
+		asked := false
+		for _, call := range calls {
+			if strings.HasPrefix(call, "exec|sh|-c|") && strings.Contains(call, "billet-update-grub-stand-in") {
+				asked = true
+			}
+		}
+		if !asked {
+			t.Errorf("%s: the runner never asked the image about the stand-in: %v", name, calls)
+		}
+	}
+
+	fx := newRunnerFixture(t)
+	if output, _, err := runRunner(t, fx); err != nil {
+		t.Fatalf("an image with no stand-in failed: %v\n%s", err, output)
+	}
+}
+
 func TestAFailingStepStopsTheBuildByName(t *testing.T) {
 	t.Parallel()
 

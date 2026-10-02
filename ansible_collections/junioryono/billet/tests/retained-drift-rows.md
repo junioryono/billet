@@ -204,7 +204,9 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/endpoint-migration.yml / Write the registration's confirmation | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
 | tasks/endpoint-migration.yml / Write the migration's receipt | parity:shared migration/receipt command owns its runtime footprint and is followed by strict closing (R7.2) |
 | tasks/endpoint-migration.yml / Remove the migration's temporary files | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
-| tasks/services.yml / Restart the billet node after non-binary inputs change | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
+| tasks/node-restart.yml / Record the billet node's main process before its restart | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/node-restart.yml / Request the billet node's restart without waiting for its drain | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
+| tasks/node-restart.yml / Poll the billet node until a new main process runs | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/services.yml / Enable and start the billet node | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
 | tasks/endpoint-receipt.yml / Refresh the endpoint receipt | parity:receipt command owns durable publication and revalidates running evidence (R7.2) |
 | tasks/services.yml / Stop and disable the billet node unless it may run here | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
