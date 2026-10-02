@@ -118,12 +118,15 @@ type job struct {
 	points     []Point
 
 	energyActive, energyIdle float64
+	// processEnergyAt is when the process's energy was last read: a lifetime
+	// total is the job's whole energy only if it is recent.
+	processEnergyAt time.Time
 	// energyBroken is set when any interval of the job's life could not be
 	// attributed, which makes its energy could-not-tell rather than too low.
 	energyBroken bool
 }
 
-type seen struct{ cpu, memory, io, net, threads, pressure bool }
+type seen struct{ cpu, memory, oom, io, net, threads, pressure, processEnergy bool }
 
 // NewMonitor builds a monitor reading under root ("/" on a real host). It
 // samples nothing until Run.
@@ -222,7 +225,7 @@ func (m *Monitor) start(key string, j *job) {
 		return
 	}
 	j.first, j.pending, j.points = now, false, nil
-	j.absorb(s)
+	j.absorb(s, now)
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
 }
@@ -333,7 +336,7 @@ func (m *Monitor) tick() {
 		if j != snapshot[key] {
 			continue
 		}
-		j.absorb(*s)
+		j.absorb(*s, now)
 		if m.opts.RAPL {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
@@ -395,16 +398,20 @@ func (m *Monitor) energySince(now time.Time, e Energy, err error) (int64, bool) 
 	return energyDelta(prev.Microjoules, e.Microjoules, e.MaxRange), true
 }
 
-func (j *job) absorb(s Sample) {
+func (j *job) absorb(s Sample, now time.Time) {
 	j.samples++
 	if s.CPUOK {
 		j.latest.CPUUsage, j.latest.CPUUser, j.latest.CPUSys = s.CPUUsage, s.CPUUser, s.CPUSys
 		j.seen.cpu = true
 	}
 	if s.MemoryOK {
-		j.latest.MemoryCurrent, j.latest.MemoryPeak, j.latest.OOMKills = s.MemoryCurrent, s.MemoryPeak, s.OOMKills
+		j.latest.MemoryCurrent, j.latest.MemoryPeak = s.MemoryCurrent, s.MemoryPeak
 		j.peakMemory = max(j.peakMemory, s.MemoryPeak, s.MemoryCurrent)
 		j.seen.memory = true
+	}
+	if s.OOMOK {
+		j.latest.OOMKills = s.OOMKills
+		j.seen.oom = true
 	}
 	if s.IOOK {
 		j.latest.DiskRead, j.latest.DiskWrite = s.DiskRead, s.DiskWrite
@@ -425,15 +432,24 @@ func (j *job) absorb(s Sample) {
 		j.latest.IOSome, j.latest.IOFull = s.IOSome, s.IOFull
 		j.seen.pressure = true
 	}
+	if s.ProcessEnergyOK {
+		j.latest.ProcessEnergy = s.ProcessEnergy
+		j.seen.processEnergy, j.processEnergyAt = true, now
+	}
 }
 
 func (j *job) point(now time.Time) Point {
+	energy := int64(j.energyActive)
+	if j.target.Process {
+		energy = j.latest.ProcessEnergy
+	}
+
 	return Point{
 		OffsetMillis: now.Sub(j.first).Milliseconds(), CPUUsage: j.latest.CPUUsage,
 		MemoryCurrent: j.latest.MemoryCurrent, DiskRead: j.latest.DiskRead,
 		DiskWrite: j.latest.DiskWrite, NetRx: j.latest.NetRx, NetTx: j.latest.NetTx,
 		GuestCPU: j.latest.GuestCPU, VMMCPU: j.latest.VMMCPU,
-		EnergyActive: int64(j.energyActive),
+		EnergyActive: energy,
 	}
 }
 
@@ -451,14 +467,17 @@ type Summary struct {
 	Measured   Measured
 	// EnergySplit says an idle baseline was configured, so EnergyIdle is the
 	// baseline's share and EnergyActive the energy above it.
-	EnergySplit              bool
+	EnergySplit bool
+	// EnergyProcess says EnergyActive is the kernel's own estimate for the job's
+	// process (Target.Process), not a share of the package counter.
+	EnergyProcess            bool
 	EnergyActive, EnergyIdle int64 // µJ
 	Points                   []Point
 }
 
 // Measured says which groups were read at least once, and whether energy was
 // attributed for the job's whole life.
-type Measured struct{ CPU, Memory, IO, Net, Threads, Pressure, Energy bool }
+type Measured struct{ CPU, Memory, OOM, IO, Net, Threads, Pressure, Energy bool }
 
 // Final takes one last sample of a job and summarises it. The job stays known,
 // so a destroy that fails and is retried can ask again; Forget ends it.
@@ -496,7 +515,7 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if current, ok := m.jobs[key]; !ok || current != j {
 		return Summary{}, false
 	}
-	j.absorb(s)
+	j.absorb(s, now)
 
 	return m.summaryOf(j, now), true
 }
@@ -504,16 +523,28 @@ func (m *Monitor) final(key string) (Summary, bool) {
 // summaryOf summarises a job at now. Called with mu held.
 func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	points := append(append([]Point(nil), j.points...), j.point(now))
-	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
-
-	return Summary{
+	sum := Summary{
 		Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),
 		Latest: j.latest, MemoryPeak: j.peakMemory,
-		Measured: Measured{CPU: j.seen.cpu, Memory: j.seen.memory, IO: j.seen.io, Net: j.seen.net,
-			Threads: j.seen.threads, Pressure: j.seen.pressure,
-			Energy: m.opts.RAPL && !j.energyBroken && len(j.points) > 1 && !stale},
-		EnergySplit:  m.opts.IdleWatts > 0,
-		EnergyActive: int64(j.energyActive), EnergyIdle: int64(j.energyIdle),
+		Measured: Measured{CPU: j.seen.cpu, Memory: j.seen.memory, OOM: j.seen.oom, IO: j.seen.io,
+			Net: j.seen.net, Threads: j.seen.threads, Pressure: j.seen.pressure},
 		Points: points,
 	}
+	// A PROCESS'S ENERGY IS A LIFETIME TOTAL the kernel keeps, so no gap in
+	// sampling loses any of it, but only a recent reading is the whole job's: one
+	// from the final read, or from a tick the job did not outlive by
+	// staleAfter intervals. An older one is could-not-tell, never a smaller total.
+	if j.target.Process {
+		fresh := now.Sub(j.processEnergyAt) < staleAfter*m.opts.Interval
+		sum.Measured.Energy, sum.EnergyProcess = j.seen.processEnergy && fresh, true
+		sum.EnergyActive = j.latest.ProcessEnergy
+
+		return sum
+	}
+	stale := m.lastTick.IsZero() || now.Sub(m.lastTick) >= staleAfter*m.opts.Interval
+	sum.Measured.Energy = m.opts.RAPL && !j.energyBroken && len(j.points) > 1 && !stale
+	sum.EnergySplit = m.opts.IdleWatts > 0
+	sum.EnergyActive, sum.EnergyIdle = int64(j.energyActive), int64(j.energyIdle)
+
+	return sum
 }

@@ -38,12 +38,16 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 
 	// SAID AT STARTUP, because a host that cannot account for memory or io
 	// reports those groups unmeasured on every job, and the reason is here.
-	if fc, ok := p.(*firecracker.Provider); ok {
+	switch fc, ok := p.(*firecracker.Provider); {
+	case ok:
 		acct := fc.Accounting()
 		slog.Info("measuring each job from the host", "interval", interval, "rapl", m.RAPL,
 			"idle_package_watts", m.IdlePackageWatts, "memory", acct.Memory.String(),
 			"io", acct.IO.String(), "reason", acct.Reason)
-	} else {
+	case p.Kind() == config.ProviderTart:
+		slog.Info("measuring each job from the host", "interval", interval,
+			"source", "each VM's own process accounting", "net", "not measured")
+	default:
 		slog.Info("measuring each job from the host", "interval", interval, "rapl", m.RAPL,
 			"idle_package_watts", m.IdlePackageWatts)
 	}

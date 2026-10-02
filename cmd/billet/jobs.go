@@ -122,6 +122,9 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		return fmt.Sprintf("guest vCPUs %s, VMM %s", seconds(u.GuestCPUMicros), seconds(u.VMMCPUMicros))
 	})
 	group(alloc.UsageMemory, "memory", func() string {
+		if !u.Measured(alloc.UsageOOM) {
+			return fmt.Sprintf("peak %s, oom kills not measured", humanBytes(u.MemoryPeakBytes))
+		}
 		return fmt.Sprintf("peak %s, oom kills %d", humanBytes(u.MemoryPeakBytes), u.OOMKills)
 	})
 	group(alloc.UsageIO, "disk", func() string {
@@ -138,9 +141,13 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 			seconds(u.IOFullMicros))
 	})
 	group(alloc.UsageEnergy, "energy", func() string {
-		if u.EnergySource == alloc.EnergyRAPL {
+		switch u.EnergySource {
+		case alloc.EnergyRAPL:
 			return fmt.Sprintf("%s active, %s idle (package RAPL, a model rather than a meter)",
 				joules(u.EnergyActiveMicrojoules), joules(u.EnergyIdleMicrojoules))
+		case alloc.EnergyProcess:
+			return fmt.Sprintf("%s (macOS's own estimate for the VM's process; the machine's idle draw is not in it)",
+				joules(u.EnergyActiveMicrojoules))
 		}
 		return fmt.Sprintf("%s (package RAPL with no idle baseline, so idle is inside it; source %s)",
 			joules(u.EnergyActiveMicrojoules), strconv.Quote(u.EnergySource))

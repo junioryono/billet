@@ -111,7 +111,7 @@ github:
 #   lock_dir: /run/billet/locks
 #
 #   # Measure each job from the host and report it to the control plane
-#   # (firecracker and docker nodes only). Absent means off. See
+#   # (firecracker, docker and tart nodes only). Absent means off. See
 #   # billet.example.yaml for what each key does.
 #   # monitoring:
 #   #   interval: 1s

@@ -475,6 +475,9 @@ type UsageTarget struct {
 	// NetHostView says NetDevice counts from the host's side (a tap), so its
 	// received bytes are what the guest sent.
 	NetHostView bool
+	// Process says the instance is PID alone, with no cgroup of its own, and is
+	// measured by that process's own accounting (a Virtualization.framework VM).
+	Process bool
 }
 
 // UsageSource is a backend whose instances can be measured from the host.
