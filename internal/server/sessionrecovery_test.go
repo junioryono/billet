@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -417,5 +418,243 @@ func TestTheWaitForAHeldSessionEndsWhenLeadershipIsLost(t *testing.T) {
 
 	if got := held.attempts.Load(); got != 1 {
 		t.Errorf("it asked GitHub %d times; after the claim was lost it must ask no more", got)
+	}
+}
+
+// gatedOpener is a WithSessionReopen whose first open ignores its context, the
+// way an open queued on the vendored client's per-target mutex does, until the
+// test releases it, and then answers first. Every later open answers later().
+type gatedOpener struct {
+	entered  chan struct{}
+	release  func()
+	released chan struct{}
+	returned chan struct{}
+	opens    atomic.Int64
+	first    error
+	later    func() (Session, error)
+}
+
+func newGatedOpener(t *testing.T, first error, later func() (Session, error)) *gatedOpener {
+	t.Helper()
+
+	g := &gatedOpener{
+		entered: make(chan struct{}), released: make(chan struct{}),
+		returned: make(chan struct{}), first: first, later: later,
+	}
+
+	var once sync.Once
+
+	g.release = func() { once.Do(func() { close(g.released) }) }
+
+	// THE STUCK OPEN IS JOINED, so it cannot outlive the test it belongs to.
+	t.Cleanup(func() {
+		g.release()
+
+		select {
+		case <-g.entered:
+			<-g.returned
+		default:
+		}
+	})
+
+	return g
+}
+
+func (g *gatedOpener) open(context.Context) (Session, error) {
+	if g.opens.Add(1) > 1 {
+		return g.later()
+	}
+
+	defer close(g.returned)
+
+	close(g.entered)
+	<-g.released
+
+	return nil, g.first
+}
+
+// waitFor fails the test unless ch closes within a bound far beyond what the
+// code under test needs.
+func waitFor(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	timer := time.NewTimer(20 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-ch:
+	case <-timer.C:
+		t.Fatalf("%s did not happen", what)
+	}
+}
+
+// A SECOND SIGNAL ENDS A LISTENER WHOSE REPLACEMENT OPEN IS STUCK.
+//
+// The open ignores its context, as one queued behind another call on the
+// vendored client's per-target mutex does, so a recovery that waited for it
+// inline would hold the listener, and the control plane's join, until that call
+// gave up. The old session was closed once, by the recovery, and the teardown
+// must not close it again.
+func TestASecondSignalEndsAListenerWhoseReopenIsStuck(t *testing.T) {
+	fastSessionReopen(t)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	g := newGatedOpener(t, errors.New("unused"), nil)
+	first := &fakeSession{onGet: func() (*Message, error) { return nil, errBrokerTimedOut }}
+	l := NewListener(a, tiers[0].Label, first,
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithSessionReopen(g.open), stopsWithoutWaiting())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	var runErr error
+
+	go func() {
+		defer close(runDone)
+
+		runErr = l.Run(ctx)
+	}()
+
+	waitFor(t, g.entered, "the replacement open")
+	cancel()
+	waitFor(t, runDone, "the listener stopping while its replacement open was stuck")
+
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		t.Errorf("Run = %v, want a clean stop", runErr)
+	}
+
+	if got := first.closes(); got != 1 {
+		t.Errorf("the failed session was closed %d times, want once", got)
+	}
+}
+
+// drainScenario is a listener holding one pool runner, so a drain does not end
+// at once, whose first session fails its every poll and whose first replacement
+// open is stuck in g. Closing hurry ends its drain.
+func drainScenario(t *testing.T, g *gatedOpener) (*Listener, *fakeSession, chan struct{}) {
+	t.Helper()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	first := &fakeSession{
+		stats: &Statistics{TotalAssignedJobs: 1},
+		onGet: func() (*Message, error) { return nil, errBrokerTimedOut },
+	}
+	hurry := make(chan struct{})
+
+	l := NewListener(a, tiers[0].Label, first,
+		WithLogger(slog.New(slog.DiscardHandler)),
+		WithRunner(&fakeRunner{}),
+		WithRunnerRegistry(&fakeRunnerRegistry{}),
+		WithSessionReopen(g.open),
+		WithHurrySignal(hurry))
+
+	return l, first, hurry
+}
+
+// A RECOVERY THE DRAIN'S START CUT SHORT RESUMES BEFORE THE NEXT POLL.
+//
+// The session in hand is the one the recovery closed, so polling it again would
+// spend another round of the client's retries against a session that no longer
+// exists before the drain could hear about its own jobs.
+func TestADrainResumesItsRecoveryBeforePollingTheClosedSession(t *testing.T) {
+	fastSessionReopen(t)
+
+	var (
+		hurry chan struct{}
+		once  sync.Once
+	)
+
+	second := &fakeSession{}
+	second.onPoll = func(int) { once.Do(func() { close(hurry) }) }
+
+	g := newGatedOpener(t, errors.New("scaleset: open session: cut short"),
+		func() (Session, error) { return second, nil })
+
+	l, first, hurry := drainScenario(t, g)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	var runErr error
+
+	go func() {
+		defer close(runDone)
+
+		runErr = l.Run(ctx)
+	}()
+
+	waitFor(t, g.entered, "the replacement open")
+	cancel()
+	g.release()
+	waitFor(t, runDone, "the drain ending")
+
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		t.Errorf("Run = %v, want a clean stop", runErr)
+	}
+
+	if got := first.polls(); got != 1 {
+		t.Errorf("the failed session was polled %d times; the drain must reopen before polling", got)
+	}
+
+	if second.polls() == 0 || g.opens.Load() != 2 {
+		t.Errorf("the drain opened %d sessions and polled the replacement %d times; want "+
+			"the recovery resumed and its session polled", g.opens.Load(), second.polls())
+	}
+}
+
+// AND A FATAL ANSWER TO THE REPLACEMENT OPEN IS REPORTED AS ITSELF, even when the
+// drain is what was waiting for it, rather than as the shutdown's cancellation.
+func TestAFatalReopenDuringADrainIsReportedAsItself(t *testing.T) {
+	fastSessionReopen(t)
+
+	fatal := fmt.Errorf("%w: an id nobody offered for", ErrUntrustworthySession)
+
+	var (
+		hurry chan struct{}
+		once  sync.Once
+	)
+
+	// REACHED ONLY IF THE FATAL ANSWER WAS LOST: a session that ends the drain,
+	// so the failure is a wrong error rather than a hang.
+	second := &fakeSession{}
+	second.onPoll = func(int) { once.Do(func() { close(hurry) }) }
+
+	g := newGatedOpener(t, fatal, func() (Session, error) { return second, nil })
+
+	l, _, hurry := drainScenario(t, g)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	var runErr error
+
+	go func() {
+		defer close(runDone)
+
+		runErr = l.Run(ctx)
+	}()
+
+	waitFor(t, g.entered, "the replacement open")
+	cancel()
+	g.release()
+	waitFor(t, runDone, "the listener stopping")
+
+	if !errors.Is(runErr, ErrUntrustworthySession) {
+		t.Errorf("Run = %v, want the untrustworthy session the open answered", runErr)
+	}
+
+	if got := g.opens.Load(); got != 1 {
+		t.Errorf("it opened %d sessions after a fatal answer, want none beyond it", got)
 	}
 }

@@ -1178,8 +1178,16 @@ func (l *Listener) Run(ctx context.Context) error {
 		// started is awaited rather than closed again.
 		if !l.sessionClosed {
 			closeSession := func() error { return l.session.Close(closeCtx) }
-			if l.closing != nil {
+
+			// ASIDE WHILE A RECOVERY IS UNDER WAY: an open it left behind can hold
+			// the vendored client's per-target mutex, which this Close would wait
+			// on and no context reaches. A close it already started is awaited.
+			if l.closing != nil || l.recoverCause != nil {
 				closeSession = func() error {
+					if l.closing == nil {
+						l.startClose(closeCtx, func() {})
+					}
+
 					_, err := l.awaitClose(closeCtx)
 
 					return err
@@ -1641,6 +1649,13 @@ func reopenDelay(n int) time.Duration {
 // on completions, and only a session can deliver them.
 func (l *Listener) recoverOrStop(ctx, pollCtx context.Context, draining bool, cause error) (bool, error) {
 	err := l.recoverSession(pollCtx, cause)
+
+	// AS ITSELF, even in a drain or a shutdown: stopping would report it as the
+	// cancellation, and the control plane as a clean stop.
+	if sessionFatal(err) {
+		return true, err
+	}
+
 	if err == nil || cancelledWhileServing(ctx, draining, err) || l.drainEnded(pollCtx, draining, err) {
 		return false, nil
 	}
@@ -1708,12 +1723,14 @@ func (l *Listener) recoverSession(ctx context.Context, cause error) error {
 
 		session, err := l.openReplacement(ctx)
 		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
+			// BEFORE THE CANCELLATION: the result has been taken off its channel,
+			// so a fatal answer dropped here would never be seen again.
 			if sessionFatal(err) {
 				return fmt.Errorf("server: reopen session for %s: %w", l.tier, err)
+			}
+
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 
 			if l.fenced() {
@@ -1764,20 +1781,25 @@ func (l *Listener) closeReplaced(ctx context.Context) (bool, error) {
 	}
 
 	if l.closing == nil {
-		done := make(chan error, 1)
-		session, grace := l.session, l.closeGrace
-
-		go func() {
-			closeCtx, endClose := context.WithTimeout(context.WithoutCancel(ctx), grace)
-			defer endClose()
-
-			done <- session.Close(closeCtx)
-		}()
-
-		l.closing = done
+		l.startClose(context.WithTimeout(context.WithoutCancel(ctx), l.closeGrace))
 	}
 
 	return l.awaitClose(ctx)
+}
+
+// startClose closes the current session aside on closeCtx, whose cancel the
+// close owns.
+func (l *Listener) startClose(closeCtx context.Context, endClose context.CancelFunc) {
+	done := make(chan error, 1)
+	session := l.session
+
+	go func() {
+		defer endClose()
+
+		done <- session.Close(closeCtx)
+	}()
+
+	l.closing = done
 }
 
 // awaitClose waits up to the close grace for the close in flight. One still
