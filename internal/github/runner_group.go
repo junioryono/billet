@@ -39,6 +39,9 @@ type RunnerRecovery struct {
 	RunnerID int64
 	Present  bool
 	Busy     bool
+	// Online is GitHub's `status`: whether the runner holds a connection it could
+	// be given a job over. Meaningful only when Present.
+	Online bool
 }
 
 type runnerGroupPolicyClient struct {
@@ -385,9 +388,9 @@ func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
 			return RunnerRecovery{}, fmt.Errorf("github: runner %q is busy but %s; refusing recovery",
 				runnerName, *runner.Status)
 		}
-		return RunnerRecovery{RunnerID: *runner.ID, Present: true, Busy: true}, nil
+		return RunnerRecovery{RunnerID: *runner.ID, Present: true, Busy: true, Online: true}, nil
 	}
-	return RunnerRecovery{RunnerID: *runner.ID, Present: true}, nil
+	return RunnerRecovery{RunnerID: *runner.ID, Present: true, Online: *runner.Status == "online"}, nil
 }
 
 func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
