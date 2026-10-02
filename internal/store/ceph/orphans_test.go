@@ -321,15 +321,108 @@ func TestAReclaimingClockThatIsAheadProvesNoAge(t *testing.T) {
 		t.Fatalf("ReclaimOrphans: %v", err)
 	}
 
-	if got := verdicts(report)[recent]; got != OrphanCreatedRecently || trashMoved(f, recent) {
-		t.Errorf("verdict %q (moved %t); want a volume the cluster created a day ago kept", got,
+	if got := verdicts(report)[recent]; got != OrphanUnknown || trashMoved(f, recent) {
+		t.Errorf("verdict %q (moved %t); want a volume the cluster created a day ago kept as could-not-tell", got,
 			trashMoved(f, recent))
 	}
 
-	if got := verdicts(report)[publishing]; got != OrphanUsed || trashMoved(f, publishing) {
-		t.Errorf("verdict %q (moved %t); want a volume published from an hour ago kept", got,
+	if got := verdicts(report)[publishing]; got != OrphanUnknown || trashMoved(f, publishing) {
+		t.Errorf("verdict %q (moved %t); want a volume published from an hour ago kept as could-not-tell", got,
 			trashMoved(f, publishing))
 	}
+}
+
+// THE CLUSTER'S CLOCK IS THE LATEST CREATION IT REPORTS, past an image it will
+// not describe and whatever the names' order says; and with none to read, or
+// only one too old to prove anything, nothing is dated and nothing moves.
+func TestTheClusterClockIsTheLatestCreationItReports(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	ahead := now.Add(30 * 24 * time.Hour)
+
+	pass := func(t *testing.T, f *cacheFake, clock time.Time) OrphanReport {
+		t.Helper()
+
+		c := cacheClient(t, f)
+		c.clock = func() time.Time { return clock }
+
+		report, err := c.ReclaimOrphans(t.Context(), OrphanOptions{
+			OlderThan: DefaultOrphanAge, Limit: 10, Reclaim: true, InSession: func(string) bool { return false },
+		})
+		if err != nil {
+			t.Fatalf("ReclaimOrphans: %v", err)
+		}
+
+		return report
+	}
+
+	// Recent by the cluster, old by the clock that is ahead.
+	recent := orphanVolume(now.Add(-24*time.Hour), 'a')
+
+	t.Run("no reference can be read", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		f.addVolume(recent)
+		for i := range clusterNowProbes {
+			unreadable := orphanVolume(now.Add(-time.Duration(i)*time.Minute), 'c')
+			f.images[unreadable] = true
+		}
+
+		report := pass(t, f, ahead)
+		judged := slices.IndexFunc(report.Images, func(image OrphanImage) bool {
+			return "billet-cache/"+image.Name == recent
+		})
+		if judged < 0 || report.Images[judged].Verdict != OrphanUnknown || report.Images[judged].Err == nil ||
+			trashMoved(f, recent) {
+			t.Errorf("report %+v; want the volume could-not-tell, with a reason, and not moved", report.Images)
+		}
+	})
+
+	t.Run("past an unreadable newest image", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		orphan := orphanVolume(now.Add(-20*24*time.Hour), 'a')
+		f.addVolume(orphan)
+		f.freshVolume(now)
+		f.images[orphanVolume(now.Add(time.Minute), 'c')] = true
+
+		if got := verdicts(pass(t, f, now))[orphan]; got != OrphanMoved {
+			t.Errorf("verdict %q; want the fresh reference behind the unreadable one to date the orphan", got)
+		}
+	})
+
+	t.Run("a newer creation behind an older one by name", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		orphan := orphanVolume(now.Add(-20*24*time.Hour), 'a')
+		f.addVolume(orphan)
+		// Named last, by a clock ahead of the cluster's, and created long ago.
+		misnamed := orphanVolume(now.Add(time.Hour), 'c')
+		f.addVolume(misnamed)
+		f.created[misnamed] = now.Add(-60 * 24 * time.Hour)
+		f.freshVolume(now)
+
+		if got := verdicts(pass(t, f, now))[orphan]; got != OrphanMoved {
+			t.Errorf("verdict %q; want the latest creation, not the newest name, to date the orphan", got)
+		}
+	})
+
+	t.Run("a pool of one old orphan", func(t *testing.T) {
+		t.Parallel()
+
+		f := newCacheFake()
+		lone := orphanVolume(now.Add(-30*24*time.Hour), 'a')
+		f.addVolume(lone)
+
+		report := pass(t, f, now)
+		if got := verdicts(report)[lone]; got != OrphanUnknown || trashMoved(f, lone) {
+			t.Errorf("verdict %q; want an orphan nothing newer dates kept as could-not-tell", got)
+		}
+	})
 }
 
 // A LISTED OR UNCONFIRMED VOLUME IS TAKEN TOO. A listing names no more than the

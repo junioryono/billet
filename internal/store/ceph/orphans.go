@@ -39,8 +39,8 @@ const (
 	OrphanForeign     OrphanVerdict = "not a name billet gives"
 	OrphanGeneration  OrphanVerdict = "a generation"
 	OrphanTooYoung    OrphanVerdict = "named too recently"
-	// OrphanCreatedRecently is a volume the cluster created within the bound,
-	// by this node's clock or against the newest image it created.
+	// OrphanCreatedRecently is a volume the cluster created within the bound by
+	// this node's clock.
 	OrphanCreatedRecently OrphanVerdict = "created too recently"
 	OrphanInSession       OrphanVerdict = "named by a cache session on this node"
 	OrphanInIndex         OrphanVerdict = "named by the cache index"
@@ -299,10 +299,13 @@ func (c *Client) createdAt(ctx context.Context, handle string) (time.Time, error
 // creation time before it gives up on the cluster's clock.
 const clusterNowProbes = 8
 
-// clusterNow is a lower bound on the cluster's clock: the creation time of the
-// newest-named image billet named that the cluster will describe.
+// clusterNow is a lower bound on the cluster's clock: the latest creation time
+// the cluster reports for the newest-named images billet named. The latest of
+// several, because a name's order is its creating node's clock.
 func (c *Client) clusterNow(ctx context.Context, images []OrphanImage) (time.Time, error) {
 	probed := 0
+
+	var latest time.Time
 
 	for i := len(images) - 1; i >= 0 && probed < clusterNowProbes; i-- {
 		if _, _, ok := cacheImageName(images[i].Name); !ok {
@@ -312,13 +315,35 @@ func (c *Client) clusterNow(ctx context.Context, images []OrphanImage) (time.Tim
 		probed++
 
 		created, err := c.createdAt(ctx, c.cfg.CachePool+"/"+images[i].Name)
-		if err == nil {
-			return created, nil
+		if err == nil && created.After(latest) {
+			latest = created
 		}
 	}
 
-	return time.Time{}, fmt.Errorf("ceph: none of the %d newest cache images said when the cluster "+
-		"created it, so no creation can be dated against the cluster's clock", probed)
+	if latest.IsZero() {
+		return time.Time{}, fmt.Errorf("ceph: none of the %d newest cache images said when the cluster "+
+			"created it, so no creation can be dated against the cluster's clock", probed)
+	}
+
+	return latest, nil
+}
+
+// youngerThan judges a time a node wrote against both clocks: recent by this
+// node's is a verdict, recent only against clusterNow is could-not-tell, because
+// a lower bound on the cluster's clock that is too old to prove age proves
+// nothing else either.
+func youngerThan(at, now, clusterNow time.Time, bound time.Duration, what string) (bool, error) {
+	if now.Sub(at) < bound {
+		return true, nil
+	}
+
+	if clusterNow.Sub(at) < bound {
+		return false, fmt.Errorf("ceph: %s %s is not %s before the newest creation the cluster reports "+
+			"(%s), so its age cannot be proved", what, at.UTC().Format(time.RFC3339), bound,
+			clusterNow.UTC().Format(time.RFC3339))
+	}
+
+	return false, nil
 }
 
 // judgeOrphan asks rbd about one old, unnamed writable volume and, when reclaim
@@ -341,7 +366,9 @@ func (c *Client) judgeOrphan(
 
 		return OrphanUnknown, err
 	}
-	if now.Sub(created) < opts.OlderThan || clusterNow.Sub(created) < opts.OlderThan {
+	if recent, err := youngerThan(created, now, clusterNow, opts.OlderThan, "its creation"); err != nil {
+		return OrphanUnknown, err
+	} else if recent {
 		return OrphanCreatedRecently, nil
 	}
 
@@ -417,7 +444,9 @@ func (c *Client) judgeOrphan(
 				bounded(value))
 		}
 
-		if now.Sub(usedAt) < opts.OlderThan || clusterNow.Sub(usedAt) < opts.OlderThan {
+		if recent, err := youngerThan(usedAt, now, clusterNow, opts.OlderThan, "its last publication"); err != nil {
+			return OrphanUnknown, err
+		} else if recent {
 			return OrphanUsed, nil
 		}
 	}
