@@ -217,7 +217,8 @@ var ErrAppUnverifiable = errors.New(
 	"github: could not verify the App (network or GitHub unavailable)")
 
 // Undecided reports whether err is GitHub being unable to answer rather than an
-// answer: its own 5xx, a throttle, or a request that got no response. Such an
+// answer: its own 5xx, a throttle, or a request that got no response or no
+// whole one (a timeout at any stage, a body cut off or past its bound). Such an
 // error says nothing about the App, its installation or its runner groups, so a
 // caller reports it as could-not-tell and never as a failure. A caller that
 // cancelled its own context must check that first; this does not.
@@ -226,7 +227,7 @@ func Undecided(err error) bool {
 		return false
 	}
 
-	if errors.Is(err, ErrAppUnverifiable) {
+	if errors.Is(err, ErrAppUnverifiable) || errors.Is(err, errNoAnswer) {
 		return true
 	}
 
