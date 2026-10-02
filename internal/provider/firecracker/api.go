@@ -198,7 +198,7 @@ func faultMessage(body []byte) string {
 // error and a half-read response are not, and reading them as absence force-kills
 // a live job.
 //
-// Measured: a VMM stopped with SIGTERM leaves its socket FILE in place, so the
+// Measured: a VMM that has exited leaves its socket FILE in place, so the
 // error is a refused connection rather than a missing file. Both are handled
 // because a removed jail produces the other.
 func gone(err error) bool {

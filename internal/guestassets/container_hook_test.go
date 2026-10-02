@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -61,7 +63,7 @@ func runHook(t *testing.T, node, index string, request map[string]any, env ...st
 	}
 	cmd := exec.CommandContext(t.Context(), node, index)
 	cmd.Stdin = strings.NewReader(string(body))
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(withoutHookInputs(os.Environ()), env...)
 	out, err := cmd.CombinedOutput()
 	code := 0
 	var exit *exec.ExitError
@@ -71,6 +73,87 @@ func runHook(t *testing.T, node, index string, request map[string]any, env ...st
 		t.Fatalf("run the hook: %v\n%s", err, out)
 	}
 	return code, out
+}
+
+// hookInputs are the variables container-hook.js reads. A test sets the ones it
+// means; the ambient value of any of them would be a second, unseen input.
+var hookInputs = []string{
+	"BILLET_CONTAINER_SHIM", "GOCACHEPROG", "GOFLAGS", "BILLET_CACHE_ENDPOINT", "BILLET_CACHE_TOKEN",
+}
+
+// withoutHookInputs is the environment with every hook input removed.
+//
+// REMOVED, NOT INHERITED, because these tests run inside billet's own guests:
+// since guest-20261001-030940 a CI guest carries the Go cache configuration, so
+// an inherited GOCACHEPROG made the hook add the cache helper's mount to every
+// request and the tests that count mounts failed (2026-10-02).
+func withoutHookInputs(environ []string) []string {
+	out := make([]string, 0, len(environ))
+
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.Contains(hookInputs, name) {
+			out = append(out, kv)
+		}
+	}
+
+	return out
+}
+
+// The ambient environment must not decide what the hook does.
+func TestTheHookHarnessRemovesEveryHookInput(t *testing.T) {
+	t.Parallel()
+
+	environ := []string{"PATH=/bin", "GOCACHEPROG=/x cache gocacheprog", "GOFLAGS=-count=1",
+		"BILLET_CACHE_ENDPOINT=http://h", "BILLET_CACHE_TOKEN=t", "BILLET_CONTAINER_SHIM=1"}
+
+	if got := withoutHookInputs(environ); !slices.Equal(got, []string{"PATH=/bin"}) {
+		t.Fatalf("withoutHookInputs left %v, want only PATH", got)
+	}
+
+	body, err := os.ReadFile("container-hook.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// EVERY VARIABLE THE HOOK NAMES is one this harness removes, so a new input
+	// added to the hook cannot leak back in unnoticed.
+	source := string(body)
+
+	// A COMPUTED READ cannot be checked by name. The one the hook has, env[name]
+	// inside `for (const name of GO_CACHE_ENV)`, reads exactly that list, which
+	// is parsed below; any other is refused.
+	for _, m := range regexp.MustCompile(`env\[([^'"\]][^\]]*)\]`).FindAllStringSubmatch(source, -1) {
+		if m[1] != "name" || !strings.Contains(source, "for (const name of GO_CACHE_ENV)") {
+			t.Fatalf("container-hook.js reads env[%s], a computed name this test cannot check", m[1])
+		}
+	}
+
+	var read []string
+
+	for _, m := range regexp.MustCompile(`env\.([A-Za-z_][A-Za-z0-9_]*)|env\[['"]([^'"]+)['"]\]`).
+		FindAllStringSubmatch(source, -1) {
+		read = append(read, m[1]+m[2])
+	}
+
+	list := regexp.MustCompile(`GO_CACHE_ENV = \[([^\]]*)\]`).FindStringSubmatch(source)
+	if list == nil {
+		t.Fatal("container-hook.js no longer declares GO_CACHE_ENV; update this test's reading of its inputs")
+	}
+
+	for _, m := range regexp.MustCompile(`['"]([^'"]+)['"]`).FindAllStringSubmatch(list[1], -1) {
+		read = append(read, m[1])
+	}
+
+	slices.Sort(read)
+	read = slices.Compact(read)
+
+	want := slices.Clone(hookInputs)
+	slices.Sort(want)
+
+	if !slices.Equal(read, want) {
+		t.Fatalf("container-hook.js reads %v; the harness removes %v. They must be the same set", read, want)
+	}
 }
 
 // The wrapper adds exactly one system mount, the shim read-only at its own path,

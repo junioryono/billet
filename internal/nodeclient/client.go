@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -628,12 +629,43 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 func (c *Client) RecordLeaseUsage(
 	ctx context.Context, leaseID string, epoch int64, usage alloc.JobUsage, series *alloc.UsageSeries,
 ) error {
-	if c.WireVersion() < nodeapi.VersionJobUsage {
+	wire := c.WireVersion()
+	if wire < nodeapi.VersionJobUsage {
 		return nil
+	}
+	if wire < nodeapi.VersionProcessUsage {
+		usage = beforeProcessUsage(usage)
 	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
 		nodeapi.UsageRequest{Epoch: epoch, Usage: usage, Series: series}, nil)
+}
+
+// beforeProcessUsage says what a report can say to a plane older than
+// VersionProcessUsage, whose strict validation knows neither the oom group nor
+// the process energy source. It says less, never something else: process energy
+// becomes unmeasured, and memory without an OOM count becomes unmeasured whole,
+// because that plane reads measured memory as a measured count.
+func beforeProcessUsage(u alloc.JobUsage) alloc.JobUsage {
+	unmeasured := slices.Clone(u.Unmeasured)
+	mark := func(group string) {
+		if !slices.Contains(unmeasured, group) {
+			unmeasured = append(unmeasured, group)
+		}
+	}
+	if u.EnergySource == alloc.EnergyProcess {
+		u.EnergyActiveMicrojoules, u.EnergyIdleMicrojoules, u.EnergySource = 0, 0, ""
+		mark(alloc.UsageEnergy)
+	}
+	if slices.Contains(unmeasured, alloc.UsageOOM) {
+		unmeasured = slices.DeleteFunc(unmeasured, func(g string) bool { return g == alloc.UsageOOM })
+		u.MemoryPeakBytes, u.OOMKills = 0, 0
+		mark(alloc.UsageMemory)
+	}
+	slices.Sort(unmeasured)
+	u.Unmeasured = unmeasured
+
+	return u
 }
 
 // MarkFailure records why a running lease is destined to fail before teardown.

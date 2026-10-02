@@ -30,16 +30,23 @@ type Target struct {
 	// NetHostView says the device's counters are the host's view, so received
 	// is what the guest sent. True for a tap, whose rx is the guest's tx.
 	NetHostView bool
+	// Process says the job is PID alone, with no cgroup: it is measured by the
+	// process's own accounting (ProcessCounters), checked against PIDStart on
+	// every read, and CgroupDir is not read.
+	Process bool
 }
 
 // Sample is one reading of a job's cumulative counters. A group whose OK flag
 // is false could not be read this time, and its fields are zero for that
 // reason rather than measured as zero.
 type Sample struct {
-	CPUOK                      bool
-	CPUUsage, CPUUser, CPUSys  int64 // µs
-	MemoryOK                   bool
-	MemoryCurrent, MemoryPeak  int64 // bytes
+	CPUOK                     bool
+	CPUUsage, CPUUser, CPUSys int64 // µs
+	MemoryOK                  bool
+	MemoryCurrent, MemoryPeak int64 // bytes
+	// OOMOK says OOMKills was read. A process's own accounting has no such
+	// count, so a job measured that way reports memory without it.
+	OOMOK                      bool
 	OOMKills                   int64
 	IOOK                       bool
 	DiskRead, DiskWrite        int64 // bytes
@@ -52,12 +59,19 @@ type Sample struct {
 	CPUSome, CPUFull           int64 // µs
 	MemorySome, MemoryFull     int64
 	IOSome, IOFull             int64
+	// ProcessEnergy is the kernel's own estimate of the energy a job's process
+	// has used over its whole life, in µJ.
+	ProcessEnergyOK bool
+	ProcessEnergy   int64
 }
 
 // Reader reads counters under a filesystem root, "/" on a real host and a
 // fixture tree in a test.
 type Reader struct {
 	Root string
+	// Process reads a process's own accounting; nil means the platform's. A
+	// test sets it, since the real one reads the running kernel.
+	Process func(pid int) (ProcessCounters, error)
 }
 
 func (r Reader) path(p string) string { return filepath.Join(r.Root, p) }
@@ -72,6 +86,10 @@ func (r Reader) read(p string) (string, error) {
 // still has CPU time worth reporting.
 func (r Reader) Read(t Target) Sample {
 	var s Sample
+	if t.Process {
+		s.readProcess(r, t)
+		return s
+	}
 	s.readCPU(r, t)
 	s.readMemory(r, t)
 	s.readIO(r, t)
@@ -125,7 +143,7 @@ func (s *Sample) readMemory(r Reader, t Target) {
 	if err != nil {
 		return
 	}
-	s.MemoryCurrent, s.MemoryPeak, s.OOMKills, s.MemoryOK = cur, peak, ev["oom_kill"], true
+	s.MemoryCurrent, s.MemoryPeak, s.OOMKills, s.MemoryOK, s.OOMOK = cur, peak, ev["oom_kill"], true, true
 }
 
 func (s *Sample) readIO(r Reader, t Target) {

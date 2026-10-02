@@ -414,8 +414,10 @@ node:
   # prints them. Absent means off, and off launches exactly as before.
   #
   # On firecracker this also asks the jailer to enable the memory and io
-  # controllers for each microVM, where `billet check` shows the host can.
-  # Only firecracker and docker nodes accept this block.
+  # controllers for each microVM, where `billet check` shows the host can. On
+  # tart each VM is measured by its own process's accounting (CPU, memory, disk
+  # and macOS's energy estimate), and rapl and idle_package_watts are refused.
+  # Only firecracker, docker and tart nodes accept this block.
   #
   # idle_package_watts is the package power this host draws with no jobs,
   # measured by you (turbostat's PkgWatt over a quiet minute). With it, energy
