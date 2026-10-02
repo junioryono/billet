@@ -361,6 +361,8 @@ func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, er
 			// that a job is over.
 			Running: state != "created" && state != "exited" &&
 				state != "dead" && state != "removing",
+			// Only the two states a started container's process ends in.
+			Ended: state == "exited" || state == "dead",
 		})
 	}
 

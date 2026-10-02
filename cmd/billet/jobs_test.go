@@ -176,3 +176,22 @@ func lineStarting(t *testing.T, report, label string) string {
 
 	return ""
 }
+
+// A VM MEASURED BY ITS PROCESS RENDERS WHAT ITS HOST KEPT: memory without an
+// OOM count, and the kernel's energy estimate named as such.
+func TestAProcessMeasuredJobRendersWhatItsHostKept(t *testing.T) {
+	usage := &alloc.RecordedUsage{Node: "mac-1", JobUsage: alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Samples: 600, IntervalMillis: 1000,
+		Unmeasured:      []string{alloc.UsageNet, alloc.UsageOOM, alloc.UsagePressure, alloc.UsageThreads},
+		MemoryPeakBytes: 25_855_595_336, EnergyActiveMicrojoules: 7_400_903_879, EnergySource: alloc.EnergyProcess,
+	}}
+	var out bytes.Buffer
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+
+	if line := lineStarting(t, out.String(), "memory"); !strings.Contains(line, "peak 24.1 GiB, oom kills not measured") {
+		t.Errorf("the memory line reads %q", line)
+	}
+	if line := lineStarting(t, out.String(), "energy"); !strings.Contains(line, "7.4 kJ (macOS's own estimate") {
+		t.Errorf("the energy line reads %q", line)
+	}
+}

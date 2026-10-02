@@ -215,6 +215,13 @@ type Instance struct {
 	// !Running: a stopped instance is not executing but still exists and may retain
 	// disks. The zero value is deliberately not proof.
 	Terminal bool
+
+	// Ended reports that the backend positively observed this instance's
+	// execution finish (its process exited), not merely that it is not executing
+	// now: paused, never started and unknown states leave it false. It lets a
+	// draining node stop waiting on the instance and authorises nothing else; the
+	// zero value is not proof.
+	Ended bool
 }
 
 // InterruptionNotice is an external warning that a provider will take compute
@@ -468,6 +475,9 @@ type UsageTarget struct {
 	// NetHostView says NetDevice counts from the host's side (a tap), so its
 	// received bytes are what the guest sent.
 	NetHostView bool
+	// Process says the instance is PID alone, with no cgroup of its own, and is
+	// measured by that process's own accounting (a Virtualization.framework VM).
+	Process bool
 }
 
 // UsageSource is a backend whose instances can be measured from the host.

@@ -806,10 +806,10 @@
 - name: Migrate the node's endpoint before the ordinary restart
   ansible.builtin.import_tasks: endpoint-migration.yml
 
+# REQUESTED WITHOUT WAITING AND POLLED IN BOUNDED STEPS (node-restart.yml),
+# because the drain in front of the restart has no bound.
 - name: Restart the billet node after non-binary inputs change
-  ansible.builtin.systemd_service:
-    name: billet-node.service
-    state: restarted
+  ansible.builtin.import_tasks: node-restart.yml
   when:
     - billet_node_should_run
     - not ansible_check_mode

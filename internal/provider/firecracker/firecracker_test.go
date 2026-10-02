@@ -638,7 +638,7 @@ func TestAnUntrustedGuestIsAttachedToTheUntrustedBridge(t *testing.T) {
 
 // DESTROY TAKES ALL FOUR THINGS AWAY. A guest leaves behind a VMM, a jail, a tap on
 // the host bridge and a root disk that is both a mapped kernel device and pool
-// space — measured, SIGTERM takes only the first.
+// space, and stopping the VMM takes only the first.
 func TestDestroyRemovesEverythingAGuestLeavesBehind(t *testing.T) {
 	t.Parallel()
 

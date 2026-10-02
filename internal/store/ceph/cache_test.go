@@ -53,6 +53,14 @@ type cacheFake struct {
 	// halfRemoved holds images an interrupted `rbd rm` left behind: `rbd ls`
 	// still lists them, nothing can open them, and `rbd rm` finishes them.
 	halfRemoved map[string]bool
+	// watchers counts the clients `rbd status` reports holding an image open.
+	watchers map[string]int
+	// trashSnapshots are snapshots in the trash namespace, which a generation's
+	// clone keeps; `rbd snap ls` shows them only with --all.
+	trashSnapshots map[string]bool
+	// created is when the cluster created an image, which `rbd info` reports
+	// only for an image listed here.
+	created map[string]time.Time
 }
 
 type cacheExitError struct {
@@ -76,6 +84,10 @@ func newCacheFake() *cacheFake {
 
 		removeLocked: map[string]bool{},
 		halfRemoved:  map[string]bool{},
+		watchers:     map[string]int{},
+
+		trashSnapshots: map[string]bool{},
+		created:        map[string]time.Time{},
 	}
 }
 
@@ -91,7 +103,7 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 	}
 
 	if i := slices.Index(args, "image-meta"); i >= 0 {
-		return f.imageMeta(args[i+1:])
+		return f.imageMeta(args[i+1:], slices.Contains(args[:i], "json"))
 	}
 
 	if i := slices.Index(args, "device"); i >= 0 {
@@ -104,6 +116,10 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 
 	if i := slices.Index(args, "trash"); i >= 0 {
 		return f.trashCommand(args[i+1:])
+	}
+
+	if i := slices.Index(args, "status"); i >= 0 {
+		return f.status(args[i+1])
 	}
 
 	for _, verb := range []string{"create", "clone", "cp", "info", "rm", "ls"} {
@@ -250,7 +266,7 @@ func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 	}
 }
 
-func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
+func (f *cacheFake) imageMeta(args []string, asJSON bool) ([]byte, error) {
 	verb, image := args[0], args[1]
 	// A cold site has no cache-index image yet, so rbd answers ENOENT to any
 	// image-meta command against it. Model that when the test asks for it, so a
@@ -298,6 +314,15 @@ func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
 	case "list":
 		if f.metaListErr != nil {
 			return nil, f.metaListErr
+		}
+		// As json rbd prints one object, or nothing at all for an image with no
+		// metadata (do_metadata_list, Ceph v19.2.2).
+		if asJSON {
+			if len(f.metadata[image]) == 0 {
+				return nil, nil
+			}
+
+			return json.Marshal(f.metadata[image])
 		}
 		var lines []string
 		for key, value := range f.metadata[image] {
@@ -362,8 +387,54 @@ func (f *cacheFake) device(args []string) ([]byte, error) {
 	}
 }
 
+// status answers `rbd status` the way rbd does: ENOENT for an image nothing can
+// open, otherwise the watchers array, empty when no client holds it.
+func (f *cacheFake) status(image string) ([]byte, error) {
+	if !f.images[image] {
+		return nil, errors.New("rbd: (2) No such file or directory")
+	}
+
+	type watcher struct {
+		Address string `json:"address"`
+		Client  int    `json:"client"`
+		Cookie  int    `json:"cookie"`
+	}
+
+	watchers := []watcher{}
+	for i := range f.watchers[image] {
+		watchers = append(watchers, watcher{Address: "watcher-" + strconv.Itoa(i), Client: 4100 + i, Cookie: i})
+	}
+
+	return json.Marshal(map[string]any{"watchers": watchers})
+}
+
 func (f *cacheFake) snap(args []string) ([]byte, error) {
 	switch args[0] {
+	case "ls":
+		image := args[len(args)-1]
+		if !f.images[image] {
+			return nil, errors.New("rbd: (2) No such file or directory")
+		}
+
+		type entry struct {
+			Name string `json:"name"`
+		}
+
+		listed := []map[string]bool{f.snapshots}
+		if slices.Contains(args, "--all") {
+			listed = append(listed, f.trashSnapshots)
+		}
+
+		snapshots := []entry{}
+		for _, set := range listed {
+			for snapshot := range set {
+				if name, ok := strings.CutPrefix(snapshot, image+"@"); ok {
+					snapshots = append(snapshots, entry{Name: name})
+				}
+			}
+		}
+
+		return json.Marshal(snapshots)
 	case "create":
 		f.snapshots[args[1]] = true
 
@@ -421,6 +492,13 @@ func (f *cacheFake) image(verb string, tail, all []string) ([]byte, error) {
 	case "info":
 		if !f.images[tail[0]] && !f.snapshots[tail[0]] {
 			return nil, errors.New("rbd: (2) No such file or directory")
+		}
+
+		if created, ok := f.created[tail[0]]; ok {
+			// ctime in the rbd process's zone, as rbd info prints it.
+			return json.Marshal(map[string]any{
+				"size": 1073741824, "create_timestamp": created.In(time.Local).Format(time.ANSIC),
+			})
 		}
 
 		return []byte(`{"size":1073741824}`), nil

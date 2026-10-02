@@ -320,6 +320,10 @@ development-check-mode: ## Exercise a first Linux development-host dry run befor
 host-upgrade-order: ## Guard the host role's drain, migration, image, restart, and rollback ordering
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/host-upgrade-order.yml
 
+.PHONY: node-restart-check
+node-restart-check: ## Prove the host role requests the node restart without waiting and polls it to a new main process
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/node-restart-check.yml
+
 .PHONY: ledger-mount-render
 ledger-mount-render: ## Pin the fail-closed ledger mount units the host role renders
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/ledger-mount-render.yml
