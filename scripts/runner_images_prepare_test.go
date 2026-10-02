@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -212,5 +213,96 @@ func TestTheGrubStandInAnswersOnceAndLeaves(t *testing.T) {
 	}
 	if got, err := os.ReadFile(standIn); err != nil || string(got) != string(present) {
 		t.Fatalf("the present update-grub was changed (%v):\n%s", err, got)
+	}
+}
+
+// stepText is what a planned shell step runs: its script's text, or its inline
+// commands.
+func stepText(t *testing.T, step planStep) string {
+	t.Helper()
+
+	if step.Script == "" {
+		return strings.Join(step.Inline, "\n")
+	}
+
+	return readScriptFile(t, filepath.Join(runnerImagesDir, "upstream", step.Script))
+}
+
+// THE REAL DIFFERENCE LIST PUTS EACH OF THESE PREPARES WHERE IT IS NEEDED: the
+// update-grub stand-in on every step that calls update-grub, since it answers
+// one call and is gone; and each test skip on or before the first step that can
+// run its file, an invoke_tests mid-build (filtered or not) or the final suite.
+// Deleting an entry, or moving one past the step that needs it, fails here
+// rather than in a build.
+func TestEachPrepareIsInPlaceBeforeTheStepThatNeedsIt(t *testing.T) {
+	t.Parallel()
+
+	differences, err := os.ReadFile(filepath.Join(runnerImagesDir, "differences.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preparedOn := map[string]map[string]bool{}
+	for _, line := range strings.Split(string(differences), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 || !strings.HasPrefix(fields[0], "prepare:") {
+			continue
+		}
+		name := strings.TrimPrefix(fields[0], "prepare:")
+		if preparedOn[name] == nil {
+			preparedOn[name] = map[string]bool{}
+		}
+		preparedOn[name][fields[1]] = true
+	}
+
+	plan := readTemplatePlan(t, vendoredTemplate(t))
+	texts := make([]string, len(plan))
+	for i, step := range plan {
+		if step.Kind == "shell" && !step.Reboots {
+			texts[i] = stepText(t, step)
+		}
+	}
+
+	grubCall := regexp.MustCompile(`(?m)^[^#\n]*\bupdate-grub\b`)
+	calls := 0
+	for i, step := range plan {
+		if !grubCall.MatchString(texts[i]) {
+			continue
+		}
+		calls++
+		if !preparedOn["grub-absent"][step.ID] {
+			t.Errorf("step %s calls update-grub and has no prepare:grub-absent", step.ID)
+		}
+	}
+	if calls == 0 {
+		t.Error("no step calls update-grub any more; retire prepare:grub-absent and this check")
+	}
+
+	for prepare, file := range map[string]string{
+		"apt-tests-two-mirrors":  "Apt",
+		"system-tests-virtio":    "System",
+		"system-tests-rootflags": "System",
+	} {
+		runs := regexp.MustCompile(`(?m)^[^#\n]*(invoke_tests\s+"?` + file + `"?(\s|$)|RunAll-Tests\.ps1)`)
+		first := -1
+		for i := range plan {
+			if runs.MatchString(texts[i]) {
+				first = i
+
+				break
+			}
+		}
+		if first < 0 {
+			t.Errorf("no step runs the %s tests, so prepare:%s skips nothing", file, prepare)
+
+			continue
+		}
+		placed := false
+		for i := 0; i <= first; i++ {
+			placed = placed || preparedOn[prepare][plan[i].ID]
+		}
+		if !placed {
+			t.Errorf("prepare:%s is not on or before %s, the first step that runs the %s tests",
+				prepare, plan[first].ID, file)
+		}
 	}
 }

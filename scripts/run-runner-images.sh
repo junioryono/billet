@@ -79,8 +79,9 @@ prepare_build_user() {
 # GITHUB'S TESTS ASSERT A FEW THINGS ABOUT AZURE, OR ABOUT THE MACHINE THEY RUN
 # ON, that a billet guest or the container it is built in does not have. Each is
 # one named test marked skipped, in the copy every step runs its tests from, by a
-# prepare on the first step that runs that file (a script's invoke_tests runs a
-# whole file mid-build); every other test in the suite still runs.
+# prepare on or before the first step that can select it (a script's
+# invoke_tests runs a file, or one Describe of it, mid-build); every other test
+# in the suite still runs.
 #
 # skip_upstream_test marks the test called NAME in FILE skipped: whatever follows
 # the name on its It line (a conditional -Skip, say) gives way to -Skip. EXACTLY
