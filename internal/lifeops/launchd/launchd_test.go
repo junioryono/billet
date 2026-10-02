@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,6 +65,42 @@ type fake struct {
 	// startedAt is what the fake ps answers for a pid's start, so a test can
 	// model a different process under the same pid.
 	startedAt map[int]string
+
+	// requests counts the drain requests each pid was sent.
+	requests map[int]int
+	// onRequest runs after the fake delivers a drain request to pid.
+	onRequest func(pid int)
+}
+
+// signal stands in for kill(2) with the drain request. It never reaches a real
+// process, and a request to a pid that is not alive is ESRCH, as the kernel
+// answers.
+func (f *fake) signal(pid int) error {
+	if !f.alive[pid] {
+		return syscall.ESRCH
+	}
+
+	if f.requests == nil {
+		f.requests = map[int]int{}
+	}
+
+	f.requests[pid]++
+
+	if f.onRequest != nil {
+		f.onRequest(pid)
+	}
+
+	return nil
+}
+
+// sent is how many drain requests were sent in all.
+func (f *fake) sent() int {
+	n := 0
+	for _, c := range f.requests {
+		n += c
+	}
+
+	return n
 }
 
 func (f *fake) run(_ context.Context, args []string) (string, int, error) {
@@ -128,6 +165,19 @@ func (f *fake) converger(t *testing.T) *Converger {
 
 		return fmt.Sprintf("started-%d", pid), nil
 	}
+	// NOR THE REAL KERNEL: a process that is not alive has no start to read.
+	c.processStart = func(pid int) (string, error) {
+		if !f.alive[pid] {
+			return "", fmt.Errorf("no process %d", pid)
+		}
+
+		if s, ok := f.startedAt[pid]; ok {
+			return s, nil
+		}
+
+		return fmt.Sprintf("started-%d", pid), nil
+	}
+	c.signal = f.signal
 	c.sleep = func(ctx context.Context, _ time.Duration) bool {
 		if err := ctx.Err(); err != nil {
 			return false
