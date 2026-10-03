@@ -37,6 +37,15 @@ import (
 // which pool it could not read.
 const DefaultTimeout = 15 * time.Second
 
+// MapTimeout bounds one `rbd device map`, which waits for the kernel client and
+// udev to create the device and so slows with the host's load, not the cluster's.
+// Measured on the reference deployment's Linux node on 2026-10-03, through a
+// restart's relaunch of 26 guests: 0.21s idle, commonly 4-13s at a load average
+// of 25-38, 17.83s at worst, past DefaultTimeout, while `rbd ls` and lock calls
+// stayed under 0.1s. A map cut short there failed the launch, and the kernel
+// finished it anyway, leaving a mapping nothing tracked.
+const MapTimeout = 60 * time.Second
+
 // Client runs the ceph client commands against one site's pools.
 //
 // TWO BINARIES, ONE PACKAGE. `rbd` addresses images and `ceph` answers for the
@@ -818,6 +827,15 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 	}
 
 	return c.run(ctx, c.bin, append(args, command...))
+}
+
+// rbdMap maps one image under MapTimeout rather than DefaultTimeout, and is the
+// only way billet runs `rbd device map`.
+func (c *Client) rbdMap(ctx context.Context, spec string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, MapTimeout)
+	defer cancel()
+
+	return c.run(ctx, c.bin, append(c.identity(), "device", "map", spec))
 }
 
 // rbdCmdWithin is rbdCmd under a bound of its own, for the one deletion that

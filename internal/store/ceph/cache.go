@@ -391,7 +391,7 @@ func (c *Client) Create(
 }
 
 func (c *Client) mapCache(ctx context.Context, handle string) (string, error) {
-	out, err := c.rbdCmd(ctx, false, "device", "map", handle)
+	out, err := c.rbdMap(ctx, handle)
 	if err != nil {
 		return "", fmt.Errorf("ceph: map cache volume %s: %w", handle, err)
 	}

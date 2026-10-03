@@ -191,7 +191,7 @@ func (c *Client) growRoot(ctx context.Context, spec string, capacity config.Byte
 func (c *Client) mapRoot(ctx context.Context, name string) (string, error) {
 	spec := c.cfg.CachePool + "/" + name
 
-	out, err := c.rbdCmd(ctx, false, "device", "map", spec)
+	out, err := c.rbdMap(ctx, spec)
 	if err != nil {
 		return "", fmt.Errorf("ceph: map %s as client.%s: %w", spec, c.cfg.User, err)
 	}

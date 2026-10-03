@@ -374,7 +374,7 @@ func (c *Client) ensureHead(ctx context.Context, image string, wantMB int64) err
 
 // mapImage maps the head image and returns the device it appeared at.
 func (c *Client) mapImage(ctx context.Context, image string) (string, error) {
-	out, err := c.rbdCmd(ctx, false, "device", "map", c.cfg.ImagePool+"/"+image)
+	out, err := c.rbdMap(ctx, c.cfg.ImagePool+"/"+image)
 	if err != nil {
 		return "", fmt.Errorf("ceph: could not map %s/%s: %w", c.cfg.ImagePool, image, err)
 	}
