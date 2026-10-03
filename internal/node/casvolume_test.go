@@ -841,10 +841,14 @@ func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
 	now := time.Date(2026, 10, 3, 5, 40, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
 
-	path := "/v1/cas/go/cas/" + digestOf("compiled object")
+	body := "compiled object"
+	path := "/v1/cas/go/cas/" + digestOf(body)
+
+	// 503 AND NOTHING ELSE: the Go helper reads it as a miss and keeps asking,
+	// while a 403 would turn the remote cache off for the rest of the build.
 	for i := range 10 {
-		if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code == http.StatusOK {
-			t.Fatalf("request %d was served from a cache that never attached", i)
+		if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d answered %d, want 503", i, got.Code)
 		}
 	}
 
@@ -853,11 +857,25 @@ func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
 			len(storage.keys))
 	}
 
-	now = now.Add(casAttachBackoff)
-	casRequest(t, service, token, http.MethodGet, path, "")
+	now = now.Add(casAttachBackoff - time.Second)
+	if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code != http.StatusServiceUnavailable ||
+		len(storage.keys) != 1 {
+		t.Fatalf("a second before the backoff passed: %d, %d attach(es); want 503 and still 1",
+			got.Code, len(storage.keys))
+	}
 
+	storage.createErr = nil
+	now = now.Add(time.Second)
+
+	if got := casRequest(t, service, token, http.MethodPut, path, body); got.Code != http.StatusOK {
+		t.Fatalf("once the backoff passed and storage recovered, PUT = %d %s", got.Code, got.Body.String())
+	}
+	if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code != http.StatusOK ||
+		got.Body.String() != body {
+		t.Fatalf("GET after recovery = %d %q", got.Code, got.Body.String())
+	}
 	if len(storage.keys) != 2 {
-		t.Fatalf("storage was asked %d time(s) once the backoff passed, want one more attempt (2)",
+		t.Fatalf("storage was asked %d time(s) in all, want one more attempt after the backoff (2)",
 			len(storage.keys))
 	}
 }
