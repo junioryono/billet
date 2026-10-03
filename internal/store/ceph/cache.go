@@ -1067,21 +1067,9 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 		return nil
 	}
 
-	name := strings.TrimPrefix(volume.Handle, c.cfg.CachePool+"/")
 	if !c.isCacheVolume(volume.Handle) {
 		return fmt.Errorf("ceph: refusing to discard %s: it is not a writable cache volume billet "+
 			"named in the configured pool", bounded(volume.Handle))
-	}
-
-	devices, err := c.mappedDevices(ctx, name)
-	if err != nil {
-		return err
-	}
-
-	for _, device := range devices {
-		if err := c.unmapDevice(ctx, device, name); err != nil {
-			return err
-		}
 	}
 
 	if err := c.discardCacheVolume(ctx, volume.Handle); err != nil {
@@ -1120,6 +1108,27 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	if !c.isCacheVolume(handle) {
 		return fmt.Errorf("ceph: refusing to move %s to the trash: only a writable cache volume "+
 			"billet named goes there", bounded(handle))
+	}
+
+	// UNMAPPED HERE, ON EVERY PATH THAT DISCARDS. `rbd trash mv` ignores watchers,
+	// and a volume this host still maps stays in the trash for good: every purge
+	// answers EBUSY. A map that timed out is the case that shipped it: on 2026-10-03
+	// `rbd device map` passed its bound, the kernel finished the mapping after the
+	// failed create had already trashed the volume, and the purge failed on it until
+	// the device was unmapped by hand. A device something still holds refuses the
+	// unmap, and the volume then stays listed for the next discard to retry.
+	name := strings.TrimPrefix(handle, c.cfg.CachePool+"/")
+
+	devices, err := c.mappedDevices(ctx, name)
+	if err != nil {
+		return fmt.Errorf("ceph: could not tell whether cache volume %s is mapped here, so it stays "+
+			"listed: %w", handle, err)
+	}
+
+	for _, device := range devices {
+		if err := c.unmapDevice(ctx, device, name); err != nil {
+			return err
+		}
 	}
 
 	// SNAPSHOTS FIRST, AND A VOLUME THAT KEEPS ONE STAYS LISTED. A failed Snapshot
