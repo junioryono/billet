@@ -201,6 +201,16 @@ func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 		return "", false, false
 	}
 
+	// AND A FILE THE RUN ALSO CALLED, UNDER ANY SPELLING OF ANY REF, IS NEVER THE
+	// RUN'S OWN. calledByTheRun compares whole strings, and GitHub can name the
+	// callee's ref differently there (`@main` beside `refs/heads/main`), which
+	// would read a self-call as the top-level workflow. Withholding writes from
+	// every file the run references costs only a self-calling workflow's
+	// publication.
+	if topLevel && callsTheFile(full, path, run) {
+		topLevel = false
+	}
+
 	switch {
 	case identity.Event == "pull_request":
 		if len(run.PullRequests) != 1 {
@@ -310,6 +320,25 @@ func (l *Listener) completionCacheAuthority(ctx context.Context, job Job, leaseI
 func calledByTheRun(workflowRef string, run WorkflowRun) bool {
 	for _, called := range run.ReferencedWorkflows {
 		if called.Path == workflowRef {
+			return true
+		}
+	}
+
+	return false
+}
+
+// callsTheFile reports whether the run called repository full's workflow file at
+// path at any ref, however GitHub spelled it. Repository names fold case; paths
+// do not.
+func callsTheFile(full, path string, run WorkflowRun) bool {
+	for _, called := range run.ReferencedWorkflows {
+		workflow, _, _ := strings.Cut(called.Path, "@")
+		owner, rest, ok := strings.Cut(workflow, "/")
+		if !ok {
+			continue
+		}
+		repository, file, ok := strings.Cut(rest, "/")
+		if ok && strings.EqualFold(owner+"/"+repository, full) && file == path {
 			return true
 		}
 	}

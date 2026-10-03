@@ -20,7 +20,7 @@ Under `default-branch`, a job's writes publish only when all of the following ho
   - a head repository equal to the job's repository, so never a fork;
   - a head branch equal to the repository's default branch, read uncached;
   - an event in GitHub's writing set: `push`, `schedule`, `workflow_dispatch`, `repository_dispatch`, `delete`, `registry_package`, `page_build` (GitHub changelog, 2026-06-26).
-- **The job's workflow is the run's.** It is the run's top-level workflow, or one it called at the run's own commit.
+- **The job's workflow is the run's own.** It is the run's top-level workflow, and the run calls no workflow file of the same name. A reusable workflow the run called at its own commit is proven for reading and never writes (#318).
 - **The repository is the pool's scope.** It equals the tier's static repository.
 
 Everything else, including a pull request, a tag, `pull_request_target`, any reusable workflow (#318: one called at the run's own commit cannot be told from a same-named tag at that commit), and any failure to ask, publishes nothing. One function, `server.DecideCacheAuthority`, holds the rule, and the node receives its verdict with the completion's destroy command (wire 23). The App needs `actions: read` to read the run; `billet github-app create` requests it by default.

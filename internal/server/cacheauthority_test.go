@@ -164,6 +164,19 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
+		// A self-call GitHub records under a short ref does not match the job's
+		// full ref as a string, and must still not read as the top-level workflow.
+		"a workflow that also calls itself under another spelling of the ref writes nothing": {
+			binding: authorityBinding("push", "refs/heads/main"),
+			run: func() WorkflowRun {
+				run := authorityRun("push", "main")
+				run.ReferencedWorkflows = []ReferencedWorkflow{
+					{Path: "ACME/api/.github/workflows/ci.yml@main", SHA: "abc"}}
+				return run
+			}(), dflt: "main",
+			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+				Proven: true},
+		},
 		"a reusable workflow on a feature branch at the run's commit writes nothing either": {
 			binding: func() alloc.PoolRunner {
 				b := authorityBinding("push", "refs/heads/feature")

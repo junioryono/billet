@@ -46,9 +46,19 @@ func TestTheAssembledProvisionerOffersTheOfflineMemberRetirement(t *testing.T) {
 func TestTheAssembledTargetsForwardTheRunEvidence(t *testing.T) {
 	t.Parallel()
 
+	// NO APP ID, so the client holds no GitHub policy and answers both questions
+	// with its own sentinel rather than reaching for an installation token.
+	client, err := scaleset.New(scaleset.Config{
+		Target: billetgithub.OrganizationTarget("acme"), ClientID: "1", InstallationID: 1,
+		PrivateKey: testPrivateKey(t),
+	}, nil)
+	if err != nil {
+		t.Fatalf("scaleset.New: %v", err)
+	}
+
 	servers, jit, err := BuildTargets([]Target{{
 		Config: config.GitHubTarget{Name: "default", Org: "acme"},
-		Client: clientFor(t, billetgithub.OrganizationTarget("acme")),
+		Client: client,
 	}})
 	if err != nil {
 		t.Fatalf("BuildTargets: %v", err)
@@ -82,25 +92,32 @@ func TestTheAssembledTargetsForwardTheRunEvidence(t *testing.T) {
 func clientFor(t *testing.T, target billetgithub.Target) *scaleset.Client {
 	t.Helper()
 
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate a key: %v", err)
-	}
-
 	c, err := scaleset.New(scaleset.Config{
 		Target:         target,
 		ClientID:       "1",
 		InstallationID: 1,
 		AppID:          1,
-		PrivateKey: string(pem.EncodeToMemory(&pem.Block{
-			Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key),
-		})),
+		PrivateKey:     testPrivateKey(t),
 	}, nil)
 	if err != nil {
 		t.Fatalf("scaleset.New: %v", err)
 	}
 
 	return c
+}
+
+// testPrivateKey is a freshly generated App key, PEM encoded.
+func testPrivateKey(t *testing.T) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate a key: %v", err)
+	}
+
+	return string(pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}))
 }
 
 // BuildTargets keys both views by the target's config name and gives each the
