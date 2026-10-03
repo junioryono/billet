@@ -122,6 +122,10 @@ Body covers:
 
 Link the issue with `Closes #N`.
 
+## A program tracked by an issue keeps its issue current
+
+Work that spans many PRs is tracked by one issue whose body is the plan and whose Progress table is the state (the architecture program is #356). Every PR that is part of it says `Part of #<issue>` in its body. In the same session the PR merges, update the issue's Progress row: the status, the PR link, and what the PR measured. A finding that changes the plan is edited into the issue body, with a dated line under Plan changes, before the PR that acts on it, so the issue never describes work the tree has stopped doing.
+
 ## Pre-1.0 may break a format, and never confusingly
 
 Tagged releases exist (`release/vX.Y` branches, a moving `v0` tag, signed manifests), so the ledger's schema is no longer free to change: migrations are append-only, their statement bytes are published and checksummed, and every deployment records them — see `billet-state`. What pre-1.0 still permits is breaking a non-ledger on-disk format (the recover journal, an archive schema, a channel statement), provided the refusal detects the old shape and says what to do about it. A raw `no such column`, or a silently accepted older schema whose meaning changed, gives an operator nothing to act on; a schema number that changes is better than one whose meaning changes.

@@ -57,7 +57,7 @@ make tools       # install the pinned golangci-lint, goreleaser, sqlc, tflint, t
 
 ## Skills
 
-Load the skill before starting, not after being stuck. Each holds rules that cost a debugging session to learn and are not visible in the code. If a change makes a skill wrong, fix the skill in the same PR. If you do repeatable multi-step work with no skill for it, say so and offer to write one.
+Load the skill before starting, not after being stuck. Each holds rules that cost a debugging session to learn and are not visible in the code. If a change makes a skill wrong, fix the skill in the same PR. If you do repeatable multi-step work with no skill for it, say so and offer to write one. `scripts/skills_test.go` holds what the skills said when they were frozen for the #356 rewrite: a sentence that no skill file says any more fails it unless `scripts/testdata/skills-dropped.txt` gives the reason, and it checks the frontmatter, the `.agents/skills` symlinks, one paragraph per line, and that every `references/` file is linked from its `SKILL.md` and every link names a file that exists.
 
 | Skill | Load it when |
 |---|---|
@@ -98,6 +98,8 @@ Types and functions get a doc comment cut to what the name does not already say.
 ## Working style
 
 Deliver what was asked, at the scope asked. Make routine judgment calls yourself and check in only when two readings of the request would produce materially different work. If the request looks mistaken, say so in a sentence and continue rather than quietly narrowing or widening it. Prefer reading a whole file over sampling it; most mistakes in this repository's history came from patching a region without seeing what surrounded it. Delegate to a subagent only for a genuinely independent, wide investigation, never for work a handful of tool calls finishes and never to double-check your own work. Report what happened, not what should have happened: if a test fails, say so and show the output; if you skipped part of a task, say which part.
+
+The architecture program is tracked in #356: one assembly, a use-case layer, a pinned wire, and skills that load fast. A PR that is part of it says `Part of #356` and, in the session it merges, updates that issue's Progress table with its status, its link and what it measured; a finding that changes the plan is written into the issue body, with a dated line under Plan changes, before the PR that acts on it.
 
 ## Codex compatibility
 
