@@ -25,12 +25,24 @@ type inspectingRegistry struct {
 	during func()
 	// byName, when set, answers each runner from its own queue instead of answers.
 	byName map[string][]RunnerState
+	// githubIDs is the id GitHub holds for each name, filled into a present
+	// answer that scripts none.
+	githubIDs map[string]int64
 
 	withdrawn   []int64
 	withdrawErr error
 }
 
 func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int64) (RunnerState, error) {
+	state, err := r.script(name)
+	if id, known := r.githubIDs[name]; err == nil && state.Present && state.ID == 0 && known {
+		state.ID = id
+	}
+
+	return state, err
+}
+
+func (r *inspectingRegistry) script(name string) (RunnerState, error) {
 	i := r.asked
 	r.asked++
 	r.askedFor = append(r.askedFor, name)
@@ -83,8 +95,9 @@ type offlineFixture struct {
 	requests []int64
 }
 
-// newOfflineFixture registers one idle pool member with a GitHub id, the shape
-// the member on 2026-09-30 had: registered, never given a job.
+// newOfflineFixture registers one idle pool member the way a launch journals it:
+// a name and no runner id, which the pool learns only from a JobStarted this
+// member never receives. GitHub holds id 10899 for the name.
 func newOfflineFixture(t *testing.T, reg *inspectingRegistry) *offlineFixture {
 	t.Helper()
 
@@ -96,9 +109,21 @@ func newOfflineFixture(t *testing.T, reg *inspectingRegistry) *offlineFixture {
 func newOfflineFixtureOf(t *testing.T, reg *inspectingRegistry, n int) *offlineFixture {
 	t.Helper()
 
+	return newOfflineFixtureWith(t, reg, n, 0)
+}
+
+// newOfflineFixtureWith is newOfflineFixtureOf with a runner id journaled for
+// each member, poolID+i, or none when poolID is zero.
+func newOfflineFixtureWith(t *testing.T, reg *inspectingRegistry, n int, poolID int64) *offlineFixture {
+	t.Helper()
+
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	f := &offlineFixture{reg: reg, now: offlineEpoch, desired: n}
 	f.a = newAllocator(t, alloc.Limits{MaxVCPU: 64, MaxMemory: 512 * config.GiB}, tiers)
+
+	if reg.githubIDs == nil {
+		reg.githubIDs = map[string]int64{}
+	}
 
 	for i := range n {
 		lease := poolLeaseForTier(t, f.a, tiers[0].Label)
@@ -108,11 +133,20 @@ func newOfflineFixtureOf(t *testing.T, reg *inspectingRegistry, n int) *offlineF
 			t.Fatalf("Assign: %v", err)
 		}
 
+		var journaled int64
+		if poolID != 0 {
+			journaled = poolID + int64(i)
+		}
+
 		name := provider.InstanceName(lease.ID)
 		if err := f.a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID,
-			Tier: tiers[0].Label, LaunchRequestID: request, RunnerID: int64(10899 + i),
+			Tier: tiers[0].Label, LaunchRequestID: request, RunnerID: journaled,
 			RunnerName: name}); err != nil {
 			t.Fatalf("RegisterPoolRunner: %v", err)
+		}
+
+		if _, set := reg.githubIDs[name]; !set {
+			reg.githubIDs[name] = int64(10899 + i)
 		}
 
 		if i == 0 {
@@ -362,6 +396,9 @@ func TestALedgerFailureAfterTheWithdrawalIsRetriedWithoutAskingAgain(t *testing.
 	if f.destroyed != 1 {
 		t.Fatalf("compute destroyed %d times after the ledger recovered, want 1", f.destroyed)
 	}
+	if !slices.Equal(reg.ids, []int64{10899}) {
+		t.Fatalf("the retried cleanup removed ids %v, want the withdrawn 10899, not the row's none", reg.ids)
+	}
 }
 
 func TestAMemberIdleForLessThanTheBoundIsNotAskedAbout(t *testing.T) {
@@ -404,5 +441,118 @@ func TestAListenerAsksAboutOneMemberPerIntervalInTurn(t *testing.T) {
 
 	if !slices.Equal(asked, want) {
 		t.Fatalf("three intervals asked about %v, want each of %v once", reg.askedFor, f.names)
+	}
+}
+
+// The shape that held a node's drain for nine hours (#317): a member journaled at
+// launch with no runner id is withdrawn by the id GitHub holds for its name, and
+// only that id.
+func TestAMemberJournaledWithoutAnIDIsWithdrawnByGitHubsID(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixture(t, reg)
+
+	member, err := f.a.PoolRunnerByLease(t.Context(), f.lease.ID)
+	if err != nil {
+		t.Fatalf("PoolRunnerByLease: %v", err)
+	}
+	if member.RunnerID != 0 {
+		t.Fatalf("fixture journaled runner id %d, want none, as a launch journals it", member.RunnerID)
+	}
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) {
+		t.Fatalf("withdrawn ids = %v, want GitHub's 10899 for %s", reg.withdrawn, f.name)
+	}
+	// The cleanup's removal expects the withdrawn id, so a registration that took
+	// the name since is refused rather than deleted by name alone.
+	if !slices.Equal(reg.ids, []int64{10899}) || !slices.Equal(reg.names, []string{f.name}) {
+		t.Fatalf("cleanup removed %v / %v, want the withdrawn 10899 under %s", reg.ids, reg.names, f.name)
+	}
+	if !slices.Equal(f.requests, []int64{-53128}) {
+		t.Fatalf("destroyed launch requests = %v, want -53128", f.requests)
+	}
+}
+
+// Two offline answers naming different ids are two registrations, not one seen
+// twice, so the grace starts again from the second.
+func TestOfflineAnswersNamingDifferentIDsStartTheGraceAgain(t *testing.T) {
+	reg := &inspectingRegistry{answers: []RunnerState{
+		{Present: true, ID: 10899},
+		{Present: true, ID: 20411},
+		{Present: true, ID: 20411},
+	}}
+	f := newOfflineFixture(t, reg)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if len(reg.withdrawn) != 0 || f.destroyed != 0 {
+		t.Fatalf("withdrew on two answers naming different ids: withdrawn %v, destroyed %d",
+			reg.withdrawn, f.destroyed)
+	}
+
+	f.reconcileAt(t, offlineIdleAfter+2*offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{20411}) {
+		t.Fatalf("withdrawn ids = %v, want the id both later answers named, 20411", reg.withdrawn)
+	}
+}
+
+func TestAnOfflineAnswerWithoutAnIDOrWithAnotherIsNotEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		poolID int64
+		answer RunnerState
+		noID   bool
+	}{
+		{name: "no id", answer: RunnerState{Present: true}, noID: true},
+		{name: "a negative id", answer: RunnerState{Present: true, ID: -1}},
+		{name: "another id than the pool journaled", poolID: 10899,
+			answer: RunnerState{Present: true, ID: 20411}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &inspectingRegistry{answers: []RunnerState{tc.answer, tc.answer, tc.answer}}
+			f := newOfflineFixtureWith(t, reg, 1, tc.poolID)
+			if tc.noID {
+				delete(reg.githubIDs, f.name)
+			}
+
+			f.reconcileAt(t, 0)
+			f.reconcileAt(t, offlineIdleAfter)
+			f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+			f.reconcileAt(t, offlineIdleAfter+2*offlineGrace)
+
+			if reg.asked != 3 {
+				t.Fatalf("GitHub was asked %d times, want 3", reg.asked)
+			}
+			if len(reg.withdrawn) != 0 || f.destroyed != 0 {
+				t.Fatalf("acted on %s: withdrawn %v, destroyed %d", tc.name, reg.withdrawn, f.destroyed)
+			}
+			if got := f.status(t); got != alloc.PoolRunnerIdle {
+				t.Fatalf("member status = %q, want idle", got)
+			}
+		})
+	}
+}
+
+// A remote node's JIT mint journals the registration's id before any job, and a
+// member journaled that way is retired by that same id.
+func TestAMemberJournaledWithItsIDIsWithdrawnByThatID(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixtureWith(t, reg, 1, 10899)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || f.destroyed != 1 {
+		t.Fatalf("withdrawn %v, destroyed %d; want 10899 withdrawn and its compute destroyed",
+			reg.withdrawn, f.destroyed)
 	}
 }

@@ -139,3 +139,28 @@ func TestRunnerRecoveryRequiresScaleSetAndOrganizationIdentityToAgree(t *testing
 		})
 	}
 }
+
+// An idle pool member is journaled with no runner id, so the id the listener
+// withdraws is the one this answer carries for the exact name (#317).
+func TestInspectRunnerCarriesGitHubsIDForAMemberJournaledWithoutOne(t *testing.T) {
+	fake := newFakeActions(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"count":1,"value":[{"id":72,"name":"billet-l1","runnerScaleSetId":9}]}`)
+	})
+	client, err := New(fake.config(t), slog.Default())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	client.policy = &recoveryPolicy{recovery: billetgithub.RunnerRecovery{RunnerID: 72, Present: true}}
+
+	got, err := client.InspectRunner(t.Context(), "billet-l1", 0)
+	if err != nil {
+		t.Fatalf("InspectRunner: %v", err)
+	}
+	if !got.Present || got.Online || got.Busy || got.ID != 72 {
+		t.Fatalf("state = %+v, want present, offline, idle, id 72", got)
+	}
+
+	if _, err := client.InspectRunner(t.Context(), "billet-l1", 71); err == nil {
+		t.Fatal("InspectRunner accepted a registration holding another id than the pool's")
+	}
+}

@@ -113,6 +113,28 @@ func (p Provisioner) RemoveRunner(ctx context.Context, runnerID int64, runnerNam
 	return p.Client.RemoveRunner(ctx, runnerID, runnerName)
 }
 
+// THE LISTENER FINDS THE OFFLINE-MEMBER RETIREMENT BY ASSERTING ITS REGISTRY,
+// which is this adapter rather than the client behind it. Without these two
+// methods the assertion failed in every deployment and the retirement never ran
+// (#317).
+//
+// server.RunEvidence is NOT forwarded, deliberately, though runTier asserts it
+// here too: forwarding it would let a default-branch cache publish be proved for
+// the first time, and the proof accepts a tag named like the default branch
+// whose reusable workflow resolves to the same commit (#318).
+var _ server.RunnerInspector = Provisioner{}
+
+// InspectRunner reads one pool registration's state at GitHub by its exact name.
+func (p Provisioner) InspectRunner(ctx context.Context, runnerName string, runnerID int64,
+) (server.RunnerState, error) {
+	return p.Client.InspectRunner(ctx, runnerName, runnerID)
+}
+
+// WithdrawRunner deletes exactly this runner id at GitHub.
+func (p Provisioner) WithdrawRunner(ctx context.Context, runnerID int64) error {
+	return p.Client.WithdrawRunner(ctx, runnerID)
+}
+
 // ValidateTrustedRunnerGroup verifies a trusted tier's workflow boundary.
 func (p Provisioner) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	workflows []string,

@@ -1,0 +1,177 @@
+---
+# Runs the host role's needrestart tasks (tasks_from: needrestart) against a
+# temporary tree, as the role runs them (escalated, so the drop-in is root's):
+# nothing is created on a host without needrestart, the drop-in is the package's
+# bytes wherever either needrestart path exists, a second converge changes
+# nothing, and an operator's edit is replaced by the role's file. The package's
+# own seeding is exercised by deploy/postinstall_test.go.
+- name: The host role keeps needrestart from restarting billet's services
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars:
+    billet_repo_root: "{{ playbook_dir }}/../../../.."
+
+  tasks:
+    - name: Make the tree the cases run in
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -needrestart
+      register: billet_gate_tree
+
+    - name: Run the cases and remove the tree
+      block:
+        - name: Read the drop-in the package seeds
+          ansible.builtin.slurp:
+            src: "{{ billet_repo_root }}/deploy/needrestart.conf"
+          register: billet_gate_packaged
+
+        # CASE 1: neither path exists. Nothing at all may be created.
+        - name: Converge a host without needrestart
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/absent/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/absent/usr/sbin/needrestart"
+
+        - name: Inspect the host without needrestart
+          ansible.builtin.find:
+            paths: "{{ billet_gate_tree.path }}"
+            file_type: any
+            recurse: true
+            hidden: true
+          register: billet_gate_absent
+
+        - name: Nothing is created where needrestart is not installed
+          ansible.builtin.assert:
+            that: billet_gate_absent.matched == 0
+            fail_msg: >-
+              The role created {{ billet_gate_absent.files | map(attribute='path') | list }}
+              on a host without needrestart.
+
+        # CASE 2: the configuration directory exists without conf.d, as a
+        # package that ships none would leave it.
+        - name: Plant needrestart's configuration directory
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}/dir/etc/needrestart"
+            state: directory
+            mode: "0755"
+
+        - name: Converge a host whose needrestart has a configuration directory
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/dir/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/dir/usr/sbin/needrestart"
+
+        - name: Inspect the drop-in after the first converge
+          ansible.builtin.stat:
+            path: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_first
+
+        - name: Read the drop-in after the first converge
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_first_bytes
+
+        - name: The drop-in is the package's bytes, root's, 0644
+          ansible.builtin.assert:
+            that:
+              - billet_gate_first.stat.isreg
+              - billet_gate_first.stat.pw_name == 'root'
+              - billet_gate_first.stat.gr_name == 'root'
+              - billet_gate_first.stat.mode == '0644'
+              - billet_gate_first_bytes.content == billet_gate_packaged.content
+            fail_msg: >-
+              {{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf is not the
+              packaged drop-in installed root:root 0644.
+
+        # CASE 3: a second converge changes nothing. The inode and mtime are the
+        # witness, because an include_role reports no per-task result.
+        - name: Converge the same host again
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/dir/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/dir/usr/sbin/needrestart"
+
+        - name: Inspect the drop-in after the second converge
+          ansible.builtin.stat:
+            path: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_second
+
+        - name: A second converge leaves the drop-in alone
+          ansible.builtin.assert:
+            that:
+              - billet_gate_second.stat.inode == billet_gate_first.stat.inode
+              - billet_gate_second.stat.mtime == billet_gate_first.stat.mtime
+            fail_msg: The second converge rewrote a drop-in that already said the right thing.
+
+        # CASE 4: an edited drop-in is the role's file, and the role puts it back.
+        - name: Edit the drop-in by hand
+          ansible.builtin.copy:
+            content: "$nrconf{override_rc}{qr(^billet-)} = 1;\n"
+            dest: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+            mode: "0644"
+          become: true
+
+        - name: Converge the edited host
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/dir/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/dir/usr/sbin/needrestart"
+
+        - name: Read the drop-in after the edited converge
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/dir/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_restored
+
+        - name: The role restores its own drop-in
+          ansible.builtin.assert:
+            that: billet_gate_restored.content == billet_gate_packaged.content
+            fail_msg: The role left a hand edit that lets needrestart restart billet's services.
+
+        # CASE 5: only the executable exists. needrestart reads conf.d whether or
+        # not its configuration directory was ever created, so the role makes it.
+        - name: Plant the needrestart executable alone
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}/binary/usr/sbin"
+            state: directory
+            mode: "0755"
+
+        - name: Plant the executable
+          ansible.builtin.copy:
+            content: "#!/bin/sh\n"
+            dest: "{{ billet_gate_tree.path }}/binary/usr/sbin/needrestart"
+            mode: "0755"
+
+        - name: Converge a host with only the needrestart executable
+          ansible.builtin.include_role:
+            name: junioryono.billet.host
+            tasks_from: needrestart
+          vars:
+            billet_needrestart_dir: "{{ billet_gate_tree.path }}/binary/etc/needrestart"
+            billet_needrestart_binary: "{{ billet_gate_tree.path }}/binary/usr/sbin/needrestart"
+
+        - name: Read the drop-in on the executable-only host
+          ansible.builtin.slurp:
+            src: "{{ billet_gate_tree.path }}/binary/etc/needrestart/conf.d/90-billet.conf"
+          register: billet_gate_binary_only
+
+        - name: The executable alone is enough to install the drop-in
+          ansible.builtin.assert:
+            that: billet_gate_binary_only.content == billet_gate_packaged.content
+            fail_msg: The role installed nothing on a host whose needrestart has no configuration directory yet.
+
+      always:
+        - name: Remove the tree
+          ansible.builtin.file:
+            path: "{{ billet_gate_tree.path }}"
+            state: absent
+          become: true

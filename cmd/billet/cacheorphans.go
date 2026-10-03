@@ -76,6 +76,19 @@ func cacheSessionRecords(cfg *config.Config) (node.CacheSessionRecords, error) {
 	return records, nil
 }
 
+// cacheSessionNames reads this node's cache custody records afresh each time
+// eviction asks, so a volume a session names is never moved to the trash.
+func cacheSessionNames(cfg *config.Config) func() (func(name string) bool, error) {
+	return func() (func(name string) bool, error) {
+		records, err := cacheSessionRecords(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		return records.Mentions, nil
+	}
+}
+
 // orphanListed are the verdicts printed one line per image; the rest are counted.
 var orphanListed = []ceph.OrphanVerdict{
 	ceph.OrphanReclaimable, ceph.OrphanMoved, ceph.OrphanMoveUnknown, ceph.OrphanUnknown,

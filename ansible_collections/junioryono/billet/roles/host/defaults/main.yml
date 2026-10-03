@@ -181,6 +181,13 @@ billet_automatic_updates: true
 # unit is refused, as on the two services: the mount fence is rendered into it.
 billet_backup_timer: true
 
+# Where needrestart is looked for. The role installs <dir>/conf.d/90-billet.conf
+# wherever either exists, so an unattended library upgrade never restarts a
+# billet service. Inputs only so tests/needrestart-check.yml can drive the tasks
+# against a temporary tree; a host has no reason to change them.
+billet_needrestart_dir: /etc/needrestart
+billet_needrestart_binary: /usr/sbin/needrestart
+
 # Whether a converge may move a host to a release OLDER than the one it runs.
 #
 # FALSE BY DEFAULT, AND THE REFUSAL IS BEFORE THE DRAIN. A stale billet_version

@@ -305,6 +305,22 @@ type Listener struct {
 	heartbeatTicks  <-chan time.Time
 	heartbeatPassed func()
 
+	// heartbeatStopped runs when the heartbeat loop returns, and cleanupTicks
+	// replaces the cleanup loop's ticker when non-nil. TEST-ONLY and nil in every
+	// deployment. With the two above they let a test drive both loops against
+	// the allocator's clock instead of racing the machine's: when renewal ends is
+	// an event the test waits for rather than a wall-clock interval it sleeps
+	// through, and a slow pass on a loaded host costs time, not the lease.
+	heartbeatStopped func()
+	cleanupTicks     <-chan time.Time
+
+	// teardownDeadline replaces context.WithTimeout for the shutdown's overall
+	// budget when non-nil. TEST-ONLY and nil in every deployment: it is handed
+	// the budget the listener computed, so a test can check that number and
+	// then end the budget itself, instead of racing the watchdog's wall-clock
+	// timer to establish that renewal was running before it fired.
+	teardownDeadline func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
@@ -470,6 +486,31 @@ type Listener struct {
 	// deployment's controller. Nil outside the control plane; see
 	// WithLeadershipLost.
 	leadershipLost func() bool
+
+	// reopen opens a replacement session after a poll failed past the client's
+	// own retries. Nil for a standalone listener, whose Run returns that failure
+	// instead; see WithSessionReopen.
+	reopen func(context.Context) (Session, error)
+	// Recovery state, all of it Run's goroutine's. recoverCause is set from a
+	// recoverable poll failure until a replacement session opens, and
+	// sessionFailures counts failed polls and attempts since the last poll that
+	// answered. sessionClosed means the current session is known closed, so
+	// nothing closes it again. closing and opening are a Close and an open
+	// recoverSession started and has not seen finish: the vendored client holds
+	// a per-target mutex no context reaches, so they run aside and a later
+	// attempt, or the teardown, waits for the same call rather than starting
+	// another.
+	recoverCause    error
+	sessionFailures int
+	sessionClosed   bool
+	closing         chan error
+	opening         chan openedSession
+}
+
+// openedSession is what an open recoverSession started came back with.
+type openedSession struct {
+	session Session
+	err     error
 }
 
 // NewListener builds a listener for one tier.
@@ -745,6 +786,15 @@ func WithHurrySignal(c <-chan struct{}) Option {
 // NIL EVERYWHERE BUT THE CONTROL PLANE. Nothing else has a claim to lose.
 func WithLeadershipLostCheck(fn func() bool) Option {
 	return func(l *Listener) { l.leadershipLost = fn }
+}
+
+// WithSessionReopen lets the listener replace a session whose poll failed after
+// the client's own retries rather than return, because a listener returning
+// stops every listener of the control plane, on every target (#207). open must
+// wait out ErrSessionHeld itself, since the session being replaced may not have
+// closed.
+func WithSessionReopen(open func(context.Context) (Session, error)) Option {
+	return func(l *Listener) { l.reopen = open }
 }
 
 // fenced reports that this listener must tear down without acting on anything.
@@ -1023,8 +1073,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		// ONE DEADLINE THAT EVERY PHASE INHERITS, not a sum they can outlive: renewal has
 		// to outlast the whole teardown, and each phase is min(its own budget, what is
 		// left).
-		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx),
-			l.teardownBudget())
+		budgeted := context.WithTimeout
+		if l.teardownDeadline != nil {
+			budgeted = l.teardownDeadline
+		}
+
+		overall, endOverall := budgeted(context.WithoutCancel(ctx), l.teardownBudget())
 		defer endOverall()
 
 		renewCtx := overall
@@ -1139,15 +1193,37 @@ func (l *Listener) Run(ctx context.Context) error {
 			return
 		}
 
-		if err := l.session.Close(closeCtx); err != nil {
-			l.log.Warn("could not close message session; capacity is held until it expires",
-				"tier", l.tier, "error", err)
+		// A session recoverSession already closed carries no advertisement, so the
+		// release below is licensed without closing it twice; one whose close it
+		// started is awaited rather than closed again.
+		if !l.sessionClosed {
+			closeSession := func() error { return l.session.Close(closeCtx) }
 
-			// NOT released. A session billet could not close may still be handing
-			// this scale set work, and handing the capacity back would let another
-			// tier escrow it while GitHub believes this one still has room. The
-			// reaper expiring the lease is the safe way out.
-			return
+			// ASIDE WHILE A RECOVERY IS UNDER WAY: an open it left behind can hold
+			// the vendored client's per-target mutex, which this Close would wait
+			// on and no context reaches. A close it already started is awaited.
+			if l.closing != nil || l.recoverCause != nil {
+				closeSession = func() error {
+					if l.closing == nil {
+						l.startClose(closeCtx, func() {})
+					}
+
+					_, err := l.awaitClose(closeCtx)
+
+					return err
+				}
+			}
+
+			if err := closeSession(); err != nil {
+				l.log.Warn("could not close message session; capacity is held until it expires",
+					"tier", l.tier, "error", err)
+
+				// NOT released. A session billet could not close may still be handing
+				// this scale set work, and handing the capacity back would let another
+				// tier escrow it while GitHub believes this one still has room. The
+				// reaper expiring the lease is the safe way out.
+				return
+			}
 		}
 		l.mu.Lock()
 		l.heldMessageID = nil
@@ -1361,10 +1437,21 @@ func (l *Listener) Run(ctx context.Context) error {
 			advertised = l.steadyAdvertisement()
 			withdrawnWhenSent = false
 		}
+		// A RECOVERY THE DRAIN'S START CUT SHORT RESUMES BEFORE ANY POLL, because
+		// the session in hand is the one it was replacing.
+		if l.recoverCause != nil {
+			if stop, rerr := l.recoverOrStop(ctx, pollCtx, draining, l.recoverCause); stop {
+				return rerr
+			}
+
+			continue
+		}
+
 		l.reportCapacity(pollCtx, &advertised, "in flight")
 		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, advertised)
 		if err == nil || errors.Is(err, ErrNoMessage) {
 			polled++
+			l.sessionFailures = 0
 			l.reportCapacity(pollCtx, &advertised, "confirmed")
 		} else {
 			l.reportCapacity(context.WithoutCancel(pollCtx), nil, "ambiguous")
@@ -1426,6 +1513,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err != nil {
+			// AS ITSELF, AHEAD OF THE CANCELLATION, which stopping would report in
+			// its place during a drain.
+			if sessionFatal(err) {
+				return fmt.Errorf("server: poll %s: %w", l.tier, err)
+			}
+
 			if cancelledWhileServing(ctx, draining, err) {
 				continue
 			}
@@ -1434,7 +1527,23 @@ func (l *Listener) Run(ctx context.Context) error {
 				continue
 			}
 
-			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
+			// A POLL FAILURE IS THIS TIER'S OWN TROUBLE WITH GITHUB, answered by
+			// replacing the session without stopping any other tier, unless there
+			// is nothing to reopen through or this process is no longer the
+			// controller, which must act on nothing.
+			if l.reopen == nil {
+				return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
+			}
+
+			if l.fenced() {
+				return l.fencedRecovery(err)
+			}
+
+			if stop, rerr := l.recoverOrStop(ctx, pollCtx, draining, err); stop {
+				return rerr
+			}
+
+			continue
 		}
 		// ASKED AGAIN, because the poll it just returned from can last most of a
 		// minute and a seal arrives from another process. Observed only before the
@@ -1532,6 +1641,273 @@ func (l *Listener) Run(ctx context.Context) error {
 			l.releaseIdleEscrowAbove(pollCtx, l.targetCapacity())
 		}
 		l.reportCapacity(pollCtx, nil, "")
+	}
+}
+
+// sessionReopenFirst and sessionReopenMax pace recoverSession. Vars so a test can
+// drive a recovery without waiting it out.
+var (
+	sessionReopenFirst = 5 * time.Second
+	sessionReopenMax   = 5 * time.Minute
+)
+
+// sessionFatal reports an error no session recovery may absorb, and which stops
+// the control plane: a response billet cannot act on leaves it unable to tell
+// which of its commitments are real, and a process that is no longer the
+// controller must act on nothing.
+func sessionFatal(err error) bool {
+	return errors.Is(err, ErrUntrustworthySession) || errors.Is(err, state.ErrLeadershipLost)
+}
+
+// reopenDelay is the wait before the nth consecutive attempt: doubling from
+// sessionReopenFirst, capped at sessionReopenMax.
+func reopenDelay(n int) time.Duration {
+	delay := sessionReopenFirst
+	for i := 1; i < n && delay < sessionReopenMax; i++ {
+		delay *= 2
+	}
+
+	return min(delay, sessionReopenMax)
+}
+
+// recoverOrStop runs recoverSession for Run's loop and reports whether Run must
+// return, and with what. DURING A DRAIN TOO, on the drain's context: a drain ends
+// on completions, and only a session can deliver them.
+func (l *Listener) recoverOrStop(ctx, pollCtx context.Context, draining bool, cause error) (bool, error) {
+	err := l.recoverSession(pollCtx, cause)
+
+	// AS ITSELF, even in a drain or a shutdown: stopping would report it as the
+	// cancellation, and the control plane as a clean stop.
+	if sessionFatal(err) {
+		return true, err
+	}
+
+	if err == nil || cancelledWhileServing(ctx, draining, err) || l.drainEnded(pollCtx, draining, err) {
+		return false, nil
+	}
+
+	return true, stopping(ctx, err)
+}
+
+// recoverSession replaces this listener's session after a poll failed past the
+// client's own retries, waiting with backoff before each attempt, until one opens,
+// a fatal error arrives, or ctx ends.
+//
+// EVERYTHING THE LISTENER HOLDS STAYS HELD. Running leases keep their heartbeat
+// and their compute, promises stay owed, and the cleanup loop keeps retrying, so
+// nothing about a broker outage can free capacity under a running job. Only idle
+// escrow goes back, and only once the old session is known closed, because until
+// then GitHub can assign against the advertisement it carries.
+//
+// A NEW SESSION IS A RESTART'S VIEW OF THE QUEUE: the cursor starts at zero, a
+// hold on a message the old session delivered is dropped because GitHub
+// redelivers whatever was not acknowledged (measured, 2026-09-04), and the
+// statistics are the new session's, including none.
+func (l *Listener) recoverSession(ctx context.Context, cause error) error {
+	l.recoverCause = cause
+
+	for {
+		l.sessionFailures++
+		delay := reopenDelay(l.sessionFailures)
+
+		l.log.Error("this tier's message session failed after the client's own retries, so "+
+			"GitHub is not assigning it work; reopening it. Every other tier keeps serving, "+
+			"and this one keeps its running jobs and their leases",
+			"tier", l.tier, "failures", l.sessionFailures, "retry_in", delay, "error", cause)
+
+		timer := time.NewTimer(delay)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return l.interrupted(ctx)
+		case <-timer.C:
+		}
+
+		if l.fenced() {
+			return l.fencedRecovery(cause)
+		}
+
+		closedNow, err := l.closeReplaced(ctx)
+
+		switch {
+		case err != nil && ctx.Err() != nil:
+			return l.interrupted(ctx)
+		case err != nil:
+			l.log.Warn("could not close the failed message session; its replacement waits "+
+				"for GitHub to expire it, and idle escrow is kept until a poll lands",
+				"tier", l.tier, "error", err)
+		case closedNow:
+			l.releaseIdleEscrow(ctx)
+		}
+
+		// AGAIN, IMMEDIATELY BEFORE THE OPEN: the close can take its whole grace.
+		if l.fenced() {
+			return l.fencedRecovery(cause)
+		}
+
+		session, err := l.openReplacement(ctx)
+		if err != nil {
+			// BEFORE THE CANCELLATION: the result has been taken off its channel,
+			// so a fatal answer dropped here would never be seen again.
+			if sessionFatal(err) {
+				return fmt.Errorf("server: reopen session for %s: %w", l.tier, err)
+			}
+
+			if ctx.Err() != nil {
+				return l.interrupted(ctx)
+			}
+
+			if l.fenced() {
+				return l.fencedRecovery(err)
+			}
+
+			cause = err
+			l.recoverCause = err
+
+			continue
+		}
+
+		l.install(session)
+
+		return nil
+	}
+}
+
+// install makes session this listener's, as a restart would find it.
+func (l *Listener) install(session Session) {
+	l.session = session
+	l.sessionClosed = false
+	l.closing = nil
+	l.recoverCause = nil
+	l.lastMessageID = 0
+	l.observed = session.Statistics()
+
+	l.mu.Lock()
+	l.heldMessageID = nil
+	l.mu.Unlock()
+
+	l.log.Warn("opened a new message session for this tier after its last one failed",
+		"tier", l.tier, "failures", l.sessionFailures)
+}
+
+// interrupted is what recoverSession returns when ctx ends. An open that has
+// already answered is taken first, whichever wait the cancellation cut short: a
+// fatal answer is reported as itself, and a session it delivered is installed, so
+// neither is left on a channel nothing will read again.
+func (l *Listener) interrupted(ctx context.Context) error {
+	if l.opening != nil {
+		select {
+		case opened := <-l.opening:
+			l.opening = nil
+
+			if sessionFatal(opened.err) {
+				return fmt.Errorf("server: reopen session for %s: %w", l.tier, opened.err)
+			}
+
+			if opened.err == nil {
+				l.install(opened.session)
+
+				return nil
+			}
+		default:
+		}
+	}
+
+	return ctx.Err()
+}
+
+// fencedRecovery is the error a recovery stops with once this process is no
+// longer the controller.
+func (l *Listener) fencedRecovery(cause error) error {
+	return fmt.Errorf("server: not reopening the session for %s: %w; the poll had failed with: %w",
+		l.tier, state.ErrLeadershipLost, cause)
+}
+
+// errCloseInFlight means a session close outlived its grace and its outcome is
+// not yet known.
+var errCloseInFlight = errors.New("server: the session close is still in flight past its grace")
+
+// closeReplaced closes the session recoverSession is replacing, reporting whether
+// this call is the one that saw it close. A close already in flight is awaited
+// rather than started again.
+func (l *Listener) closeReplaced(ctx context.Context) (bool, error) {
+	if l.sessionClosed {
+		return false, nil
+	}
+
+	if l.closing == nil {
+		l.startClose(context.WithTimeout(context.WithoutCancel(ctx), l.closeGrace))
+	}
+
+	return l.awaitClose(ctx)
+}
+
+// startClose closes the current session aside on closeCtx, whose cancel the
+// close owns.
+func (l *Listener) startClose(closeCtx context.Context, endClose context.CancelFunc) {
+	done := make(chan error, 1)
+	session := l.session
+
+	go func() {
+		defer endClose()
+
+		done <- session.Close(closeCtx)
+	}()
+
+	l.closing = done
+}
+
+// awaitClose waits up to the close grace for the close in flight. One still
+// running when the wait ends stays in flight, an unknown outcome that licenses no
+// release.
+func (l *Listener) awaitClose(ctx context.Context) (bool, error) {
+	wait := time.NewTimer(l.closeGrace)
+	defer wait.Stop()
+
+	select {
+	case err := <-l.closing:
+		l.closing = nil
+		if err != nil {
+			return false, err
+		}
+
+		l.sessionClosed = true
+
+		return true, nil
+	case <-wait.C:
+		return false, errCloseInFlight
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// openReplacement opens the replacement session, or waits for the open an
+// earlier attempt started. A session that open delivers after this listener has
+// stopped waiting for good is never closed, and GitHub expires it.
+func (l *Listener) openReplacement(ctx context.Context) (Session, error) {
+	if l.opening == nil {
+		done := make(chan openedSession, 1)
+		open := l.reopen
+
+		go func() {
+			session, err := open(ctx)
+			done <- openedSession{session: session, err: err}
+		}()
+
+		l.opening = done
+	}
+
+	select {
+	case opened := <-l.opening:
+		l.opening = nil
+
+		return opened.session, opened.err
+	case <-ctx.Done():
+		// A RESULT READY BESIDE THE CANCELLATION IS LEFT FOR interrupted, which
+		// takes it before the recovery reports the cancellation.
+		return nil, ctx.Err()
 	}
 }
 
@@ -1779,7 +2155,7 @@ func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 			// this listener's, and tried again by the teardown's own release pass
 			// on its own budget. Dropping it here would leak the capacity until the
 			// reaper; advertising it after losing it would be worse.
-			l.log.Warn("could not release idle escrow while draining; it stays this "+
+			l.log.Warn("could not release idle escrow; it stays this "+
 				"listener's and will be released at shutdown",
 				"tier", l.tier, "lease", lease.ID, "error", err)
 
@@ -2245,6 +2621,10 @@ func stopping(ctx context.Context, err error) error {
 // The interval is a fraction of the TTL so a single missed beat — a busy
 // database, a slow write — does not expire anything.
 func (l *Listener) heartbeatLoop(ctx context.Context) {
+	if l.heartbeatStopped != nil {
+		defer l.heartbeatStopped()
+	}
+
 	ticks := l.heartbeatTicks
 	if ticks == nil {
 		ticker := time.NewTicker(l.heartbeatInterval())
@@ -2319,14 +2699,19 @@ func (l *Listener) lockForHeartbeat() {
 
 // cleanupLoop retries cleanup obligations on its own clock.
 func (l *Listener) cleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(l.heartbeatInterval())
-	defer ticker.Stop()
+	ticks := l.cleanupTicks
+	if ticks == nil {
+		ticker := time.NewTicker(l.heartbeatInterval())
+		defer ticker.Stop()
+
+		ticks = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			l.retryCleanup(ctx)
 		}
 	}
@@ -3190,11 +3575,10 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 // work never happened; if it does not, advancing late costs one redelivery of a
 // message that is safe to re-handle. The asymmetry is the whole argument.
 //
-// Nothing exercises it yet, because every failure here is currently fatal — the
-// session ends and a fresh one starts the cursor at zero. That is the fragile
-// part: the cursor was only correct as a side effect of an unrelated decision
-// about error severity, so the first non-fatal error path anyone adds inherits
-// the question.
+// Every failure here is still fatal, and the one non-fatal session failure (a
+// poll that failed past the client's retries) replaces the session in
+// recoverSession, which starts the cursor at zero as a fresh listener does. A
+// non-fatal path that keeps the session would inherit the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	l.mu.Lock()
 	if l.heldMessageID != nil && *l.heldMessageID != msg.MessageID {
@@ -5573,6 +5957,13 @@ func (l *Listener) destroyCompleted(
 		removeID, removeName := binding.RunnerID, binding.RunnerName
 		if removeID == 0 && removeName == "" {
 			removeID, removeName = job.RunnerID, job.RunnerName
+		}
+		// AN ID THE JOB CARRIES FOR THE SAME NAME IS KEPT, so the removal refuses a
+		// registration that has since taken the name under another id. An offline
+		// member's row has a name and no id, and the id its retirement withdrew
+		// arrives here only on the job.
+		if removeID == 0 && job.RunnerID > 0 && removeName == job.RunnerName {
+			removeID = job.RunnerID
 		}
 		if err == nil && (removeID > 0 || removeName != "") {
 			if err := l.registry.RemoveRunner(ctx, removeID, removeName); err != nil {

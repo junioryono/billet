@@ -2318,7 +2318,12 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	// busy the machine was. Both sides of the property read the allocator's
 	// clock: the reaper expires against it and a renewal stamps with it, so
 	// moving it is what a long poll IS as far as the ledger is concerned.
-	const ttl = 600 * time.Millisecond
+	//
+	// AND LONG, because one thing here is still on the wall clock: each pass's
+	// budget is a third of the TTL. At 600ms that was 200ms for a SQLite write
+	// under -race on a loaded runner, and a pass that ran out renewed nothing
+	// while the test went on moving the clock (#188).
+	const ttl = 30 * time.Second
 
 	clock := newTestClock()
 
@@ -2327,7 +2332,9 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	// A hang guard only, longer than fifteen steps can take at their bounds'
+	// pace on a loaded host; the third poll is what ends the run.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 
 	// THE REAL LOOP, FED BY HAND. The ticks go to the goroutine Run starts, not
@@ -2335,9 +2342,11 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	// inside the poll would pass against a listener whose heartbeats stopped
 	// for the length of a poll, which is the regression this test exists for.
 	// Each send is followed by a wait for the pass it caused, bounded so that a
-	// loop that is not running fails the test instead of hanging it.
+	// loop that is not running fails the test instead of hanging it. The bounds
+	// exceed a pass's own deadline, and passed holds one acknowledgement, so a
+	// pass that outlives a bound cannot block the loop and with it the shutdown.
 	ticks := make(chan time.Time)
-	passed := make(chan struct{})
+	passed := make(chan struct{}, 1)
 
 	var (
 		polls    atomic.Int32
@@ -2372,7 +2381,7 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 				select {
 				case ticks <- clock.Now():
-				case <-time.After(5 * time.Second):
+				case <-time.After(30 * time.Second):
 					t.Error("the heartbeat loop took no tick while the poll was blocked; " +
 						"heartbeats are bounded by the poll again")
 
@@ -2381,7 +2390,7 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 				select {
 				case <-passed:
-				case <-time.After(5 * time.Second):
+				case <-time.After(30 * time.Second):
 					t.Error("the heartbeat loop took a tick and made no pass")
 
 					return
@@ -2462,6 +2471,70 @@ func (c *testClock) advance(d time.Duration) {
 	defer c.mu.Unlock()
 
 	c.now = c.now.Add(d)
+}
+
+// renewalDriver hands a listener's own heartbeat loop its ticks and moves the
+// allocator's clock between them. Whether a lease outlives a stall is then
+// arithmetic on that clock, not a race between a wall-clock sleep and a real
+// ticker whose passes a loaded machine can starve past the TTL (#188). Install
+// it before Run starts the loop.
+type renewalDriver struct {
+	clock  *testClock
+	ticks  chan time.Time
+	passed chan struct{}
+}
+
+func driveRenewal(l *Listener, clock *testClock) *renewalDriver {
+	d := &renewalDriver{clock: clock, ticks: make(chan time.Time), passed: make(chan struct{}, 1)}
+
+	l.heartbeatTicks = d.ticks
+	l.heartbeatPassed = func() { d.passed <- struct{}{} }
+
+	return d
+}
+
+// beat moves the allocator's clock by step, hands the loop one tick and waits
+// for the pass it caused. It reports false when the loop took no tick, which is
+// what a stopped renewal looks like; the bound is there so such a run fails
+// rather than hangs, and is far beyond any pass a live loop makes.
+func (d *renewalDriver) beat(t *testing.T, step time.Duration) bool {
+	t.Helper()
+
+	d.clock.advance(step)
+
+	select {
+	case d.ticks <- d.clock.Now():
+	case <-time.After(30 * time.Second):
+		return false
+	}
+
+	select {
+	case <-d.passed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the heartbeat loop took a tick and made no pass")
+	}
+
+	return true
+}
+
+// throughTwoTTLs moves the allocator's clock two TTLs forward one heartbeat
+// interval at a time, delivering each tick to the loop and reaping after every
+// pass, so expiry is enforced at each step rather than once at the end. stopped
+// is the failure when the loop refuses a tick.
+func (d *renewalDriver) throughTwoTTLs(t *testing.T, a *alloc.Allocator, ttl time.Duration,
+	stopped string,
+) {
+	t.Helper()
+
+	for range 6 {
+		if !d.beat(t, ttl/3) {
+			t.Fatal(stopped)
+		}
+
+		if _, err := a.Reap(t.Context()); err != nil {
+			t.Fatalf("reap: %v", err)
+		}
+	}
 }
 
 // A backlog GitHub already assigned has to be SAID, not merely stored.
@@ -4971,14 +5044,18 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// the separate clock was introduced. The loops therefore have to be the ones
 	// Run starts, and the detector has to be the consequence rather than the
 	// mechanism: a lease that stops being renewed is reaped.
-	// Long enough that renewal at ttl/3 gets three attempts before a lease would
-	// expire, so descheduling the process for a beat or two does not fail a
-	// correct implementation.
-	const ttl = 1500 * time.Millisecond
+	//
+	// BOTH LOOPS ARE DRIVEN BY HAND, against the allocator's clock. A wall-clock
+	// sleep past the TTL against the real tickers measures how busy the machine
+	// was: a pass starved past its budget renews nothing, and correct code is
+	// reported as starved renewal (#188).
+	const ttl = 30 * time.Second
+
+	clock := newTestClock()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
@@ -5002,11 +5079,15 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	renewal := driveRenewal(l, clock)
+
+	sweeps := make(chan time.Time)
+	l.cleanupTicks = sweeps
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
 	// A completion whose destroy already failed, so the loop has something to
-	// retry as soon as Run starts it.
+	// retry on its first tick.
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
 	l.mu.Unlock()
@@ -5021,6 +5102,16 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 		}
 	}()
 
+	// The cleanup loop's tick, taken only by a loop Run started: with the retry
+	// moved onto the heartbeat's tick there is no cleanup loop to take it.
+	select {
+	case sweeps <- clock.Now():
+	case <-runDone:
+		t.Fatal("the listener stopped before its cleanup loop took a tick")
+	case <-time.After(30 * time.Second):
+		t.Fatal("no cleanup loop took a tick, so nothing started it")
+	}
+
 	// Nothing below proves anything until the retry is genuinely stuck inside the
 	// provider, which is the state the whole test is about.
 	select {
@@ -5028,23 +5119,16 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	case <-runDone:
 		t.Fatal("the listener stopped before its cleanup loop reached the runner")
 	case <-time.After(30 * time.Second):
-		t.Fatal("the retry never reached the runner, so nothing started the cleanup loop")
+		t.Fatal("the retry never reached the runner")
 	}
 
-	// AND RENEWAL OUTLIVES THE STUCK DESTROY. Long enough that a lease nobody
-	// renewed has certainly expired, and then REAPED SYNCHRONOUSLY rather than by
-	// a background ticker.
-	//
-	// A background reaper made the result depend on its own scheduling: if it was
-	// delayed past this point, an expired-but-unreaped lease was still renewable,
-	// and the assertion's own Heartbeat then renewed it — so a listener whose
-	// renewal had stalled the whole time passed. Reaping here makes expiry
-	// enforced at exactly the moment it is checked.
-	time.Sleep(2 * ttl)
-
-	if _, err := a.Reap(ctx); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
+	// AND RENEWAL OUTLIVES THE STUCK DESTROY. Each step is REAPED SYNCHRONOUSLY
+	// rather than by a background reaper, whose own scheduling once let an
+	// expired-but-unreaped lease be renewed by the assertion's Heartbeat, so a
+	// listener whose renewal had stalled the whole time passed.
+	renewal.throughTwoTTLs(t, a, ttl, "the heartbeat loop took no tick while a cleanup "+
+		"retry was stuck in the provider; one unreachable host delays every renewal on "+
+		"this listener")
 
 	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
 		t.Fatalf("a running lease was lost while a cleanup retry was stuck in the provider "+
@@ -5205,11 +5289,19 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	t.Parallel()
 
-	const ttl = 900 * time.Millisecond
+	// THE ALLOCATOR'S CLOCK AND THE LOOP'S TICKS ARE THE TEST'S. The first
+	// version slept two 900ms TTLs against the real ticker and failed on a loaded
+	// CI runner (2026-10-02, the test taking 21s): a pass whose SQLite write
+	// outran its 300ms budget renewed nothing, and the reap took a lease the
+	// listener was still renewing correctly. The TTL is long so a pass's
+	// wall-clock budget, a third of it, is never what decides the outcome.
+	const ttl = 30 * time.Second
+
+	clock := newTestClock()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
 	blocked := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(blocked) })
@@ -5229,6 +5321,7 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+	renewal := driveRenewal(l, clock)
 
 	lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
@@ -5257,17 +5350,16 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 		t.Fatal("the shutdown release never reached the runner")
 	}
 
-	// The teardown is stuck in the provider. Long enough that a lease nobody
-	// renewed has expired, then reaped synchronously so expiry is enforced at the
-	// moment it is checked rather than by a background ticker.
+	// The teardown is stuck in the provider. Two TTLs pass on the allocator's
+	// clock, each step delivered to the listener's own loop and reaped. Stopping
+	// renewal before the release makes the loop refuse the first tick; dropping
+	// the running lease from the pass lets the third reap take it.
 	//
-	// t.Context() rather than ctx, which is cancelled — the allocator would refuse
-	// both calls and the test would fail without proving anything.
-	time.Sleep(2 * ttl)
-
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
+	// t.Context() rather than ctx, which is cancelled: the allocator would refuse
+	// every call and the test would fail without proving anything.
+	renewal.throughTwoTTLs(t, a, ttl, "renewal stopped while the shutdown release was "+
+		"still destroying compute; every lease the release has not reached yet expires "+
+		"under it and the reaper frees capacity for a container still on the host")
 
 	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
 		t.Fatalf("a lease was lost while the shutdown release was still destroying its "+
@@ -7206,19 +7298,14 @@ func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
 func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	t.Parallel()
 
-	// A TTL LARGE ENOUGH THAT A SCHEDULER STALL CANNOT SPEND IT.
-	//
-	// This test waits past a TTL and then requires the lease to still be
-	// renewable, which is only true if the janitor ran during the wait. At 300ms
-	// that margin was smaller than an ordinary stall on a loaded CI runner under
-	// -race and coverage: renewal was starved past the TTL, the reaper took the
-	// lease, and correct code was reported as a renewal failure. Measured, not
-	// guessed -- it is one of the failures seen on CI.
-	//
-	// The cadence is derived from the TTL, so raising it raises the absolute slack
-	// between a renewal and the deadline rather than just moving both.
+	// THE LEASE'S TIME IS THE ALLOCATOR'S CLOCK AND THE LOOP'S TICKS ARE THE
+	// TEST'S. At 300ms, and again at 2s, the TTL was a wall-clock race between
+	// the real ticker and a sleep: a loaded CI runner starved renewal past it, the
+	// reaper took the lease, and correct code was reported as a renewal failure
+	// (#188). The grace stays on the wall clock because it is the listener's own
+	// timer and the thing this test outlives.
 	const (
-		ttl   = 2 * time.Second
+		ttl   = 30 * time.Second
 		grace = 1 * time.Second
 		// LONGER THAN THE WAIT BELOW. The close blocks until the test has checked,
 		// so a finish grace shorter than that wait would abandon the close and the
@@ -7226,9 +7313,11 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 		closing = 60 * time.Second
 	)
 
+	clock := newTestClock()
+
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
 	// A close that BLOCKS UNTIL THE TEST SAYS SO, rather than sleeping for a
 	// guessed interval. Sleeping meant the assertion raced the close: if the test
@@ -7238,6 +7327,13 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	// that is not a remote possibility.
 	closing0 := make(chan struct{})
 	checked := make(chan struct{})
+
+	// Released on every path out, including a failure before the check, or the
+	// close stays blocked and Run with it.
+	var releasing sync.Once
+
+	release := func() { releasing.Do(func() { close(checked) }) }
+	t.Cleanup(release)
 
 	var once sync.Once
 
@@ -7252,6 +7348,7 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
 		WithShutdownGrace(grace), WithFinishGraces(closing, closing),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+	renewal := driveRenewal(l, clock)
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -7278,19 +7375,20 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 		t.Fatal("the shutdown never reached the session close")
 	}
 
-	// INSIDE THE CLOSE, and past both the destroy budget and a lease TTL. The
-	// close cannot finish until this is done, so the only thing that can have kept
-	// the lease alive is renewal.
-	time.Sleep(grace + 2*ttl)
+	// INSIDE THE CLOSE, and past the destroy budget: the grace is a wall-clock
+	// timer started before the close was entered, so after this sleep it has
+	// expired whatever the scheduler did, and renewal tied to it would have
+	// stopped. Then two TTLs on the allocator's clock, each tick delivered to the
+	// listener's own loop and reaped. The close cannot finish until this is done,
+	// so the only thing that can have kept the lease alive is renewal.
+	time.Sleep(grace)
 
-	_, reapErr := a.Reap(t.Context())
+	renewal.throughTwoTTLs(t, a, ttl, "renewal stopped while the shutdown was still "+
+		"closing its session; the old maxCapacity is still live at that moment")
+
 	beat := a.Heartbeat(t.Context(), lease.ID, lease.Epoch)
 
-	close(checked)
-
-	if reapErr != nil {
-		t.Fatalf("reap: %v", reapErr)
-	}
+	release()
 
 	if beat != nil {
 		t.Fatalf("a lease expired while the shutdown was still closing its session (%v); "+
@@ -7316,21 +7414,23 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	t.Parallel()
 
-	// The grace has to outlast the "still alive" check below, or the watchdog
-	// fires before the test has established that renewal was ever running.
-	// SAME REASON AS TestRenewalCoversTheWholeShutdownBudget, and this test is the
-	// one that showed it: the assertion that fired in CI was its own FIXTURE GUARD
-	// -- "the lease was already gone before the shutdown grace expired" -- which
-	// is the test correctly refusing to pass for the wrong reason rather than a
-	// watchdog defect. At 300ms a stall spent the whole margin.
+	// NOTHING HERE RACES THE WALL CLOCK. The "still alive" check once slept two
+	// TTLs against the real ticker and had to finish before the watchdog's real
+	// timer fired, and it fired its own FIXTURE GUARD in CI -- "the lease was
+	// already gone before the shutdown grace expired" -- because a stall spent
+	// the margin (#188). Renewal is now driven against the allocator's clock and
+	// the test ends the teardown budget itself, after checking the listener asked
+	// for the right one, so the grace only has to be longer than the test.
 	const (
-		ttl   = 2 * time.Second
-		grace = 5 * time.Second
+		ttl   = 30 * time.Second
+		grace = time.Minute
 	)
+
+	clock := newTestClock()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
 
 	// A destroy that ignores its context entirely. Registered for cleanup at the
 	// moment it is created, so a t.Fatal below cannot strand the goroutine.
@@ -7352,12 +7452,30 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 		return nil
 	}}
 
-	// The finish phases are bounded too, and renewal has to outlast ALL of them —
-	// so they are small here for the same reason the grace is: the test is about
-	// what happens when the whole budget is spent, not about how long it is.
+	// The finish phases are bounded too, and renewal has to outlast ALL of them.
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
 		WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+	renewal := driveRenewal(l, clock)
+
+	stopped := make(chan struct{})
+	l.heartbeatStopped = sync.OnceFunc(func() { close(stopped) })
+
+	// THE OVERALL BUDGET, held by the test: the listener's number is recorded
+	// and the deadline is a cancellation only this test triggers.
+	var (
+		asked     = make(chan time.Duration, 1)
+		endBudget = make(chan context.CancelFunc, 1)
+	)
+
+	l.teardownDeadline = func(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		budgeted, end := context.WithCancel(parent)
+
+		asked <- budget
+		endBudget <- end
+
+		return budgeted, end
+	}
 
 	lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
@@ -7389,11 +7507,8 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	// would be proving only that an unrenewed lease dies, which needs no
 	// watchdog. Past a TTL into the teardown, still renewable, is what says
 	// renewal was running when the grace began.
-	time.Sleep(2 * ttl)
-
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap before the grace: %v", err)
-	}
+	renewal.throughTwoTTLs(t, a, ttl, "the heartbeat loop took no tick early in the "+
+		"teardown; renewal was not running, so this proves nothing about the watchdog")
 
 	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
 		t.Fatalf("the lease was already gone before the shutdown grace expired (%v); "+
@@ -7401,20 +7516,37 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 			"the watchdog", err)
 	}
 
-	// AND DEAD AFTER THE WHOLE BUDGET. Taken from the listener rather than
-	// restated here: the teardown has four phases now, and a test that hardcodes
-	// "past the grace" starts failing the next time one is added — which is
-	// exactly how this one broke when the cleanup-loop join got its own.
-	time.Sleep(l.teardownBudget() + 2*ttl)
+	// THE WHOLE BUDGET, not a phase of it: the cleanup join and the destroys get
+	// a grace each, the close and the release a finish grace each. Computed from
+	// the fixture rather than asked of teardownBudget, which would agree with
+	// itself if it dropped a phase. The deadline was created before the destroy
+	// began, so it is already here.
+	var end context.CancelFunc
 
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap: %v", err)
+	select {
+	case budget := <-asked:
+		if want := 2*grace + 2*(grace/3); budget != want {
+			t.Errorf("the teardown asked for a budget of %v, want the whole %v; renewal "+
+				"would stop while a phase still had time to run", budget, want)
+		}
+
+		end = <-endBudget
+	default:
+		t.Fatal("the destroy began before the teardown set its overall budget")
 	}
 
-	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err == nil {
+	// AND STOPPED ONCE IT IS SPENT, which is an event the loop reports rather
+	// than an interval this test sleeps through: with the ticks in the test's
+	// hands, a loop still running and one stopped look alike until something
+	// asks.
+	end()
+
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
 		t.Fatal("a listener wedged in its teardown was still renewing after the shutdown " +
-			"grace; the reaper can never reclaim that capacity, so one stuck destroy " +
-			"costs the deployment those vCPUs until the process is killed")
+			"budget was spent; the reaper can never reclaim that capacity, so one stuck " +
+			"destroy costs the deployment those vCPUs until the process is killed")
 	}
 
 	unblock()

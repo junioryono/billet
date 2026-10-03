@@ -8,9 +8,14 @@ set -e
 # upgrade-by-reinstall silently invalidates every node in the fleet. The `billet`
 # user is left for the same reason: the files it owns are still there.
 #
+# So is /etc/needrestart/conf.d/90-billet.conf, which postinstall seeds rather
+# than the package owning: the host role may manage the same file, and once the
+# units are gone it matches nothing.
+#
 # To remove them, do it deliberately:
 #
 #   rm -rf /var/lib/billet /etc/billet
+#   rm -f /etc/needrestart/conf.d/90-billet.conf
 #   userdel billet
 
 if [ -d /run/systemd/system ]; then

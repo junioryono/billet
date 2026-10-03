@@ -1926,7 +1926,7 @@ func startNodeCache(
 			return nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
 		var err error
-		storage, err = ceph.New(*cfg.Node.Ceph)
+		storage, err = ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(cacheSessionNames(cfg)))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1999,11 +1999,15 @@ func startNodeCache(
 
 	// Eviction is intentionally best effort. A cache outage may slow a job, but it
 	// must never change that job's result or stop the node from serving compute.
+	//
+	// ITS OWN GOROUTINE, because a pass asks rbd several questions about every old
+	// volume and can run for many minutes, and the loop below finishes closed
+	// sessions, whose publications are abandoned after publishWindow. It starts
+	// after the first renewal, so a restarted node's live clones are renewed before
+	// any eviction pass reads their records.
 	go func() {
 		cleanupTicker := time.NewTicker(5 * time.Minute)
-		evictionTicker := time.NewTicker(6 * time.Hour)
 		defer cleanupTicker.Stop()
-		defer evictionTicker.Stop()
 
 		retryClosed := func() {
 			if err := service.RetryClosed(ctx); err != nil && ctx.Err() == nil {
@@ -2029,7 +2033,22 @@ func startNodeCache(
 
 		retryClosed()
 		renewActive()
-		evict()
+
+		go func() {
+			evictionTicker := time.NewTicker(6 * time.Hour)
+			defer evictionTicker.Stop()
+
+			evict()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-evictionTicker.C:
+					evict()
+				}
+			}
+		}()
 
 		for {
 			select {
@@ -2040,8 +2059,6 @@ func startNodeCache(
 				renewActive()
 			case <-service.ClosedSessions():
 				retryClosed()
-			case <-evictionTicker.C:
-				evict()
 			}
 		}
 	}()
