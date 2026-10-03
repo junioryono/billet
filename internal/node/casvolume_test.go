@@ -874,8 +874,12 @@ func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
 		got.Body.String() != body {
 		t.Fatalf("GET after recovery = %d %q", got.Code, got.Body.String())
 	}
-	if len(storage.keys) != 2 {
-		t.Fatalf("storage was asked %d time(s) in all, want one more attempt after the backoff (2)",
-			len(storage.keys))
+	// THE FAKE RECORDS A KEY FOR EVERY CLONE AND EVERY CREATE THAT SUCCEEDS: the
+	// failed attach inside the backoff is one clone miss, and the one after it a
+	// clone miss and the create it fell back to. Exactly one attempt after the
+	// backoff, then, is three keys and one volume created.
+	if len(storage.keys) != 3 || storage.created != 1 {
+		t.Fatalf("storage saw %d key(s) and created %d volume(s), want 3 and 1: one failed attach "+
+			"inside the backoff and one after it", len(storage.keys), storage.created)
 	}
 }
