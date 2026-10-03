@@ -2522,6 +2522,88 @@ func TestTheTrashTakesOnlyAWritableVolumeBilletNamed(t *testing.T) {
 
 // A VOLUME GIVEN UP BY A FAILED CREATE OR SNAPSHOT GOES TO THE TRASH TOO, and the
 // snapshot's unpublished candidate generation still goes through `rbd rm`.
+// A MAP THAT TIMED OUT CAN STILL HAVE MAPPED. On 2026-10-03 `rbd device map`
+// passed its bound, the kernel finished the mapping afterwards, and the failed
+// create trashed a volume the host still mapped, which no purge could delete. The
+// discard now unmaps whatever this host maps before the trash.
+func TestAFailedCreateUnmapsAMappingTheTimedOutMapLeftBeforeTheTrash(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "device") && slices.Contains(args, "map") {
+			if _, err := f.run(ctx, bin, args); err != nil {
+				return nil, err
+			}
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.Create(t.Context(), "acme/api/npm", 1<<30); err == nil {
+		t.Fatal("Create succeeded although the map did not answer")
+	}
+
+	if len(f.mappings) != 0 {
+		t.Fatalf("the mapping the timed-out map left is still there: %v", f.mappings)
+	}
+	if len(f.trash) != 1 || len(f.images) != 0 {
+		t.Fatalf("the failed volume was not moved to the trash: images %v, trash %v", f.images, f.trash)
+	}
+
+	unmapped, trashed := -1, -1
+	for i, call := range f.calls {
+		switch {
+		case slices.Contains(call, "unmap") && unmapped < 0:
+			unmapped = i
+		case slices.Contains(call, "trash") && slices.Contains(call, "mv") && trashed < 0:
+			trashed = i
+		}
+	}
+	if unmapped < 0 || trashed < 0 || unmapped > trashed {
+		t.Fatalf("unmap at call %d, trash at call %d; want the unmap first: %v", unmapped, trashed, f.calls)
+	}
+}
+
+// A DEVICE SOMETHING STILL HOLDS IS NOT TRASHED UNDER IT. The unmap refuses, and
+// the volume stays listed for the next discard rather than going where nothing
+// can delete it.
+func TestADiscardOfAVolumeStillHeldHereLeavesItListed(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "device") && slices.Contains(args, "unmap") {
+			return nil, errors.New("exit status 16: rbd: sysfs write failed\nrbd: unmap failed: (16) Device or resource busy")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	volume, err := c.Create(t.Context(), "acme/api/npm", 1<<30)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := c.Discard(t.Context(), volume); err == nil {
+		t.Fatal("Discard succeeded although the device would not unmap")
+	}
+
+	if len(f.trash) != 0 || !f.images[volume.Handle] {
+		t.Fatalf("a volume this host still maps went to the trash: images %v, trash %v", f.images, f.trash)
+	}
+}
+
 func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *testing.T) {
 	t.Parallel()
 
