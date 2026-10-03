@@ -29,10 +29,10 @@ func TestTheAgentAsksAgainOnlyWhenTheMetadataServiceDidNotAnswer(t *testing.T) {
 		answers []string
 		within  int
 		// gaveUp says an earlier read already spent the agent's budget.
-		gaveUp     bool
-		wantRead   int
-		wantValue  string
-		wantCalls  int
+		gaveUp    bool
+		wantRead  int
+		wantValue string
+		wantCalls int
 		// maxCalls bounds the attempts within the budget: one a second, so a
 		// read that ignored fetch_within would exceed it. Slow scheduling only
 		// lowers the count, so the bound cannot flake.
