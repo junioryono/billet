@@ -391,7 +391,7 @@ func (c *Client) Create(
 }
 
 func (c *Client) mapCache(ctx context.Context, handle string) (string, error) {
-	out, err := c.rbdCmd(ctx, false, "device", "map", handle)
+	out, err := c.rbdMap(ctx, handle)
 	if err != nil {
 		return "", fmt.Errorf("ceph: map cache volume %s: %w", handle, err)
 	}
@@ -1119,16 +1119,9 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	// unmap, and the volume then stays listed for the next discard to retry.
 	name := strings.TrimPrefix(handle, c.cfg.CachePool+"/")
 
-	devices, err := c.mappedDevices(ctx, name)
-	if err != nil {
-		return fmt.Errorf("ceph: could not tell whether cache volume %s is mapped here, so it stays "+
-			"listed: %w", handle, err)
-	}
-
-	for _, device := range devices {
-		if err := c.unmapDevice(ctx, device, name); err != nil {
-			return err
-		}
+	if err := c.unmapAll(ctx, name); err != nil {
+		return fmt.Errorf("ceph: cache volume %s may still be mapped here, so it stays listed: %w",
+			handle, err)
 	}
 
 	// SNAPSHOTS FIRST, AND A VOLUME THAT KEEPS ONE STAYS LISTED. A failed Snapshot
@@ -1193,6 +1186,14 @@ const (
 	halfRemovedAfter   = time.Hour
 	halfRemovedRecheck = cacheCompactionLimit + 5*time.Minute
 )
+
+// halfRemovedBudget bounds how long one purge pass spends finishing half-removed
+// images, after which the pass ends and the next resumes where it stopped. The
+// trash goes first in every pass, and each finish takes tens of seconds: on the
+// reference deployment on 2026-10-03 a backlog of 1,256 half-removed images held
+// one pass for hours while the trash, whose deletes take about a second each,
+// grew from 808 entries to 999 and the cache pool reached Ceph's nearfull ratio.
+const halfRemovedBudget = 10 * time.Minute
 
 // PurgeTrash deletes the per-job root disks and writable cache volumes discards
 // moved to the cache pool's trash, finishes the cache images an `rbd rm` left
@@ -1294,11 +1295,20 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 	seen := c.halfRemoved
 	c.halfRemoved = map[string]time.Time{}
 
+	// RESUMED AFTER WHERE THE LAST PASS STOPPED, in name order, so images that
+	// keep failing at the front cannot spend every pass's budget ahead of the rest.
+	slices.Sort(names)
+	if i := slices.IndexFunc(names, func(name string) bool { return name > c.halfRemovedResume }); i > 0 {
+		names = slices.Concat(names[i:], names[:i])
+	}
+	c.halfRemovedResume = ""
+
+	started := c.now()
 	finished := 0
 
 	var failures []error
 
-	for _, name := range names {
+	for i, name := range names {
 		_, named, ok := cacheImageName(name)
 		if !ok || c.now().Sub(named) < halfRemovedAfter {
 			continue
@@ -1306,6 +1316,22 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 
 		if err := ctx.Err(); err != nil {
 			return finished, append(failures, err)
+		}
+
+		// OUT OF BUDGET: the rest wait for the next pass, keeping the sightings
+		// they had, so a second sighting is not lost to the cut.
+		if c.now().Sub(started) >= halfRemovedBudget {
+			for _, rest := range names[i:] {
+				if first, ok := seen[rest]; ok {
+					c.halfRemoved[rest] = first
+				}
+			}
+
+			if i > 0 {
+				c.halfRemovedResume = names[i-1]
+			}
+
+			return finished, failures
 		}
 
 		handle := c.cfg.CachePool + "/" + name
