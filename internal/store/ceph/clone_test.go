@@ -473,6 +473,11 @@ func TestAnUnmapOutlivesItsCallerAndTheDiscardBlocklistsNothing(t *testing.T) {
 				}
 			}
 
+			// A REAL RUNNER STARTS NOTHING ON A DEAD CONTEXT, so neither does this one.
+			if err := runCtx.Err(); err != nil {
+				return nil, err
+			}
+
 			return f.run(runCtx, bin, args)
 		}))
 	if err != nil {
@@ -495,11 +500,11 @@ func TestAnUnmapOutlivesItsCallerAndTheDiscardBlocklistsNothing(t *testing.T) {
 			unmapBound, unmapBounded, MapTimeout)
 	}
 
-	if err != nil {
-		t.Fatalf("DiscardRoot: %v", err)
+	// THE MOVE TO THE TRASH IS THE CALLER'S, and its caller has gone: the discard
+	// stops there and is retried, with the device already released cleanly.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("DiscardRoot after its caller was cancelled answered %v, want context.Canceled", err)
 	}
-
-	f.ran(t, "--rbd_blocklist_on_break_lock false trash mv billet-cache/billet-abc")
 }
 
 // A DISCARD NEVER DELETES THE DATA ITSELF.
@@ -518,7 +523,9 @@ func TestADiscardMovesTheCloneToTheTrashAndNeverRemovesIt(t *testing.T) {
 		t.Fatalf("DiscardRoot: %v", err)
 	}
 
-	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
+	// AND THE MOVE BREAKS AN ORPHANED LOCK WITHOUT BLOCKLISTING THE HOST'S KERNEL
+	// CLIENT, which every device on the host shares (2026-10-03).
+	f.ran(t, "--rbd_blocklist_on_break_lock false trash mv billet-cache/billet-abc")
 
 	// NEITHER DELETION: `rbd rm`, nor `rbd trash rm`, which deletes the same data.
 	for _, call := range f.calls {

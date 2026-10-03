@@ -344,6 +344,11 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 				errors.Join(err, ctx.Err()))
 		case <-timer.C:
 		}
+
+		// AND AGAIN AFTER THE PAUSE, which is when the next attempt would start.
+		if time.Since(started) >= retryFor {
+			break
+		}
 	}
 
 	return fmt.Errorf("ceph: unmap %s, which maps %s: %w", device, name, err)
