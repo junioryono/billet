@@ -927,7 +927,44 @@ for attempt in $(seq 1 120); do
 	sleep 0.5
 done
 
-fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
+# A READ THAT GOT NO ANSWER IS ASKED AGAIN; AN ANSWER IS FINAL. On a loaded host the
+# service can miss a five-second window, and on 2026-10-03 one missed read of the
+# contract made a guest refuse as "older than this image": the agent exited, the
+# runner never connected, and GitHub showed it offline. A timeout or a refused
+# connection says nothing about the key, so the read is repeated for fetch_within
+# seconds; an HTTP answer is the service's word and is never retried. fetch returns 0
+# with the value, 3 when the service says the key does not exist, and 1 when it could
+# not be read, so a caller can tell "billet did not send it" from "could not ask".
+fetch_within=300
+
+# BILLET_AGENT_FETCH_BEGIN
+fetch() {
+	local answer code deadline
+	deadline=$((SECONDS + fetch_within))
+	while :; do
+		if answer=$(curl -s --connect-timeout 2 --max-time 5 -w '\n%{http_code}' \
+			-H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"); then
+			code=${answer##*$'\n'}
+			if [ "$code" = 200 ]; then
+				printf '%s' "${answer%$'\n'*}"
+				return 0
+			fi
+			if [ "$code" = 404 ]; then
+				return 3
+			fi
+			if [ "$code" != 000 ]; then
+				log "the metadata service answered $code for $1"
+				return 1
+			fi
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			log "could not read $1 from the metadata service in ${fetch_within}s"
+			return 1
+		fi
+		sleep 1
+	done
+}
+# BILLET_AGENT_FETCH_END
 
 # THE CONTRACT FIRST, BEFORE ANYTHING IS READ FROM IT.
 #
@@ -941,8 +978,16 @@ fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token
 # answer ("republish the image") is in the failure rather than in somebody's memory.
 WANT_CONTRACT=10
 
-if ! contract=$(fetch contract); then
+contract_read=0
+contract=$(fetch contract) || contract_read=$?
+
+if [ "$contract_read" -eq 3 ]; then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"
+	exit 1
+fi
+
+if [ "$contract_read" -ne 0 ]; then
+	log "could not read the metadata contract; the guest cannot start a runner without it"
 	exit 1
 fi
 
@@ -952,8 +997,16 @@ if [ "$contract" != "$WANT_CONTRACT" ]; then
 	exit 1
 fi
 
-if ! jit=$(fetch jit-config); then
+jit_read=0
+jit=$(fetch jit-config) || jit_read=$?
+
+if [ "$jit_read" -eq 3 ]; then
 	log "no registration in the metadata"
+	exit 1
+fi
+
+if [ "$jit_read" -ne 0 ]; then
+	log "could not read the registration from the metadata"
 	exit 1
 fi
 
