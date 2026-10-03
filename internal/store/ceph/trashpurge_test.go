@@ -10,10 +10,35 @@ import (
 	"time"
 )
 
-// THE TRASH IS PURGED SEVERAL AT A TIME. One at a time ran at about the rate a
-// busy node discards, and on 2026-10-03 a backlog of 950 did not shrink.
-func TestTheTrashIsPurgedByTrashPurgeWorkersAtOnce(t *testing.T) {
+// THE TRASH IS PURGED SEVERAL AT A TIME, and never more than purgeWorkers. One at
+// a time ran at about the rate a busy node discards, and on 2026-10-03 a backlog
+// of 950 did not shrink; one worker, which a fake runner gets, must never overlap.
+func TestTheTrashIsPurgedByPurgeWorkersAtOnce(t *testing.T) {
 	t.Parallel()
+
+	for _, workers := range []int{1, 2, trashPurgeWorkers} {
+		t.Run(fmt.Sprint(workers), func(t *testing.T) {
+			t.Parallel()
+
+			peak := purgeConcurrency(t, workers)
+
+			// MORE THAN ONE AND NEVER MORE THAN THE WORKERS: an exact peak would ask
+			// the scheduler to start all of them inside one hold.
+			if workers == 1 && peak != 1 {
+				t.Fatalf("one worker ran %d deletions at once", peak)
+			}
+			if workers > 1 && (peak < 2 || peak > workers) {
+				t.Fatalf("%d workers ran at most %d deletion(s) at once, want between 2 and %d",
+					workers, peak, workers)
+			}
+		})
+	}
+}
+
+// purgeConcurrency purges a trash of ten root disks with workers deletions at a
+// time, requires every one deleted, and reports the most that ran at once.
+func purgeConcurrency(t *testing.T, workers int) int {
+	t.Helper()
 
 	const entries = 10
 
@@ -67,7 +92,7 @@ func TestTheTrashIsPurgedByTrashPurgeWorkersAtOnce(t *testing.T) {
 	}
 
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
-		withRunner(run), withPurgeWorkers(trashPurgeWorkers))
+		withRunner(run), withPurgeWorkers(workers))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -80,11 +105,8 @@ func TestTheTrashIsPurgedByTrashPurgeWorkersAtOnce(t *testing.T) {
 	if n != entries || len(removed) != entries {
 		t.Fatalf("purged %d, removed %v; want all %d", n, removed, entries)
 	}
-	// MORE THAN ONE AND NEVER MORE THAN THE WORKERS: an exact peak would ask the
-	// scheduler to start all of them inside one hold.
-	if peak < 2 || peak > trashPurgeWorkers {
-		t.Fatalf("at most %d deletion(s) ran at once, want between 2 and %d", peak, trashPurgeWorkers)
-	}
+
+	return peak
 }
 
 // A FAKE RUNNER IS SERIAL, so the tests whose fakes are not safe for concurrent
