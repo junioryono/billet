@@ -676,12 +676,37 @@ func TestACloneWhoseMapTimedOutIsUnmappedBeforeTheTrash(t *testing.T) {
 	t.Parallel()
 
 	f := newCloneFake()
-	f.failOn = "device map"
-	f.failErr = fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
 	f.mapped = `[{"pool":"billet-cache","name":"billet-abc","device":"/dev/rbd5"}]`
 
-	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
-		20*config.GiB); err == nil {
+	// THE CALLER'S DEADLINE IS WHAT ENDED THE MAP, so it is cancelled there, and
+	// every later command run on a cancelled context fails as rbd would: the
+	// cleanup has to run on a context of its own.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	run := func(runCtx context.Context, bin string, args []string) ([]byte, error) {
+		if err := runCtx.Err(); err != nil {
+			f.calls = append(f.calls, args)
+
+			return nil, err
+		}
+
+		if subcommandOf(args) == "device map" {
+			f.calls = append(f.calls, args)
+			cancel()
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		}
+
+		return f.run(runCtx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.CloneRoot(ctx, "ubuntu-2404-x64@g1", "billet-abc", 20*config.GiB); err == nil {
 		t.Fatal("CloneRoot reported success although the map did not answer")
 	}
 
