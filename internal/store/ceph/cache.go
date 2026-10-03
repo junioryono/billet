@@ -385,7 +385,13 @@ func (c *Client) Create(
 
 	device, err := c.mapCache(ctx, handle)
 	if err != nil {
-		return storecontract.Volume{}, errors.Join(err, c.discardCacheVolume(ctx, handle))
+		// ON A CONTEXT OF ITS OWN: the map may have failed because the caller's
+		// deadline passed, and a discard on that context could not even ask whether
+		// the kernel finished the map, leaving the volume and its mapping behind.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), MapTimeout)
+		defer cancel()
+
+		return storecontract.Volume{}, errors.Join(err, c.discardCacheVolume(cleanupCtx, handle))
 	}
 
 	return storecontract.Volume{Key: key, Handle: handle, Device: device}, nil

@@ -47,8 +47,10 @@ type fakeCacheStore struct {
 	publishedFences    []storecontract.FencingToken
 	keys               []string
 	createdSizes       []int64
-	// createBudgets is the time each Create had left before its deadline.
+	// createBudgets and cloneBudgets are the time each Create and each Clone had
+	// left before its deadline.
 	createBudgets    []time.Duration
+	cloneBudgets     []time.Duration
 	snapshotVolumes  []storecontract.Volume
 	snapshotErr      error
 	snapshotHook     func()
@@ -134,7 +136,10 @@ func (f *fakeCacheStore) Create(ctx context.Context, key string, size int64) (st
 	return storecontract.Volume{Key: key, Handle: "working", Device: "/dev/rbd7"}, nil
 }
 
-func (f *fakeCacheStore) Clone(_ context.Context, key, generation string) (storecontract.Volume, error) {
+func (f *fakeCacheStore) Clone(ctx context.Context, key, generation string) (storecontract.Volume, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		f.cloneBudgets = append(f.cloneBudgets, time.Until(deadline))
+	}
 	f.keys = append(f.keys, key)
 	if f.current == "" {
 		return storecontract.Volume{}, storecontract.ErrMiss
@@ -592,11 +597,16 @@ func TestTheDockerStoreIsAcquiredWithinDockerStoreAttachLimit(t *testing.T) {
 		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
 	}
 
-	if len(storage.createBudgets) != 1 {
-		t.Fatalf("the store was created %d time(s) with a deadline, want 1", len(storage.createBudgets))
-	}
-	if got := storage.createBudgets[0]; got > dockerStoreAttachLimit || got < dockerStoreAttachLimit-5*time.Second {
-		t.Fatalf("the Docker store was acquired with %s left, want about %s", got, dockerStoreAttachLimit)
+	// THE CLONE TOO, which is where the store waited behind the cache index lock.
+	for name, budgets := range map[string][]time.Duration{
+		"cloned": storage.cloneBudgets, "created": storage.createBudgets,
+	} {
+		if len(budgets) != 1 {
+			t.Fatalf("the store was %s %d time(s) with a deadline, want 1", name, len(budgets))
+		}
+		if got := budgets[0]; got > dockerStoreAttachLimit || got < dockerStoreAttachLimit-5*time.Second {
+			t.Fatalf("the Docker store was %s with %s left, want about %s", name, got, dockerStoreAttachLimit)
+		}
 	}
 }
 
