@@ -248,17 +248,31 @@ func (c *Client) takeLock(
 	// `layering` ALONE, because Ceph documents the `exclusive-lock` feature as
 	// incompatible with these advisory lock commands — and the default feature set
 	// includes it.
-	if _, createErr := c.rbdCmd(ctx, false, "create", image, "--size", "1",
-		"--image-feature", "layering"); createErr != nil {
-		// DELIBERATELY NOT RETURNED. The ordinary case is that the image already
-		// exists, which rbd reports as a failure, and telling that apart from a real
-		// one means reading its prose. The `lock add` on the next line answers the
-		// same question definitively: if the image genuinely could not be created,
-		// locking it fails too, and that failure is the one worth reporting.
-		_ = createErr
+	//
+	// ONLY UNTIL A `lock add` HAS PROVED IT EXISTS. Every waiter on the cache index
+	// retries this every 250ms, and a create that can only fail is one of the three
+	// rbd processes each retry used to start; under a restart's burst of attaches
+	// those processes slowed the holder they were waiting on (2026-10-03).
+	if _, known := c.lockImages.Load(image); !known {
+		if _, createErr := c.rbdCmd(ctx, false, "create", image, "--size", "1",
+			"--image-feature", "layering"); createErr != nil {
+			// DELIBERATELY NOT RETURNED. The ordinary case is that the image already
+			// exists, which rbd reports as a failure, and telling that apart from a
+			// real one means reading its prose. The `lock add` on the next line answers
+			// the same question definitively: if the image genuinely could not be
+			// created, locking it fails too, and that failure is the one worth
+			// reporting.
+			_ = createErr
+		}
 	}
 
 	_, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie)
+	switch {
+	case addErr == nil, exitedWith(addErr, 16):
+		c.lockImages.Store(image, struct{}{})
+	case exitedWith(addErr, 2):
+		c.lockImages.Delete(image)
+	}
 	if addErr == nil {
 		lock := &PublishLock{client: c, cookie: cookie, image: image}
 		lock.beat(ctx)

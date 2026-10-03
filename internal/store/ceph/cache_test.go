@@ -750,6 +750,59 @@ func TestCacheIndexLockPreservesReleaseFailureAfterCanceledAmbiguousAdds(t *test
 	}
 }
 
+// A WAITER DOES NOT RE-CREATE AN INDEX IT HAS SEEN. Each retry used to start three
+// rbd processes, one of them a create that could only fail, and under a restart's
+// burst of attaches the waiters' processes slowed the holder they waited on.
+func TestACacheLockWaiterCreatesTheIndexOnlyUntilItHasSeenIt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	f := newCacheFake()
+	f.lockCookie = fmt.Sprintf("billet-import-otherhost-7-0123456789abcdef-%d", now.Unix())
+	f.releaseOn = 4
+	c := cacheClient(t, f)
+	c.cacheLockRetry = time.Millisecond
+
+	creates := func() int {
+		n := 0
+		for _, call := range f.calls {
+			if slices.Contains(call, "create") && slices.Contains(call, c.cacheIndex()) {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error { return nil }); err != nil {
+		t.Fatalf("withCacheLock: %v", err)
+	}
+
+	if f.lockAdds != 4 {
+		t.Fatalf("the lock was taken on attempt %d, want 4, so the waiting under test never happened",
+			f.lockAdds)
+	}
+	if got := creates(); got != 1 {
+		t.Errorf("a waiter ran `rbd create` on the index %d times over %d attempts, want once",
+			got, f.lockAdds)
+	}
+
+	// AN INDEX THAT DISAPPEARS IS CREATED AGAIN, so remembering it cannot strand a
+	// deployment whose index was removed.
+	f.lockAddErr = cacheExitError{code: 2, message: "exit status 2"}
+	f.lockAddErrOn = f.lockAdds + 1
+	_ = c.withCacheLock(t.Context(), now, func(time.Time) error { return nil })
+	f.lockAddErr = nil
+
+	before := creates()
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error { return nil }); err != nil {
+		t.Fatalf("withCacheLock after the index went: %v", err)
+	}
+	if creates() != before+1 {
+		t.Errorf("after `lock add` answered ENOENT the next attempt did not create the index again")
+	}
+}
+
 func TestCacheIndexLockReclaimsAHolderThatWasFreshWhenWaitingBegan(t *testing.T) {
 	t.Parallel()
 
