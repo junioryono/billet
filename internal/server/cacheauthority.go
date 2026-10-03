@@ -330,6 +330,11 @@ func calledByTheRun(workflowRef string, run WorkflowRun) bool {
 // callsTheFile reports whether the run called repository full's workflow file at
 // path at any ref, however GitHub spelled it. Repository names fold case; paths
 // do not.
+//
+// SPLIT AT THE FIRST `@`, deliberately: a workflow file whose own name holds an
+// `@` is then read as the file before it, which can only withhold a write from
+// a job that might have had one. Splitting at the last would misread a ref that
+// holds an `@` and could let a self-call through.
 func callsTheFile(full, path string, run WorkflowRun) bool {
 	for _, called := range run.ReferencedWorkflows {
 		workflow, _, _ := strings.Cut(called.Path, "@")

@@ -170,8 +170,9 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 			binding: authorityBinding("push", "refs/heads/main"),
 			run: func() WorkflowRun {
 				run := authorityRun("push", "main")
+				// At another commit, so the commit check cannot be what refuses it.
 				run.ReferencedWorkflows = []ReferencedWorkflow{
-					{Path: "ACME/api/.github/workflows/ci.yml@main", SHA: "abc"}}
+					{Path: "ACME/api/.github/workflows/ci.yml@main", SHA: "other-sha"}}
 				return run
 			}(), dflt: "main",
 			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
