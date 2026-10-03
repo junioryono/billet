@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -449,34 +450,53 @@ func TestAnUnmapOutlivesItsCallerAndTheDiscardBlocklistsNothing(t *testing.T) {
 	f := newCloneFake()
 	f.mapped = `[{"id":"1","pool":"billet-cache","namespace":"","name":"billet-abc","snap":"-","device":"/dev/rbd1"}]`
 
-	var unmapCtxErr error
-	unmapped := false
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		unmapped     bool
+		afterCancel  error
+		unmapBound   time.Duration
+		unmapBounded bool
+	)
 
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
-		withRunner(func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		withRunner(func(runCtx context.Context, bin string, args []string) ([]byte, error) {
 			if subcommandOf(args) == "device unmap" {
 				unmapped = true
-				unmapCtxErr = ctx.Err()
+				// THE DRAIN ARRIVES WHILE THE UNMAP IS IN FLIGHT, which is the incident:
+				// the command's own context must not end with its caller's.
+				cancel()
+				afterCancel = runCtx.Err()
+				if deadline, ok := runCtx.Deadline(); ok {
+					unmapBound, unmapBounded = time.Until(deadline), true
+				}
 			}
 
-			return f.run(ctx, bin, args)
+			return f.run(runCtx, bin, args)
 		}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	_ = c.DiscardRoot(ctx, "billet-abc")
+	err = c.DiscardRoot(ctx, "billet-abc")
 
 	if !unmapped {
 		t.Fatalf("the discard never unmapped the clone; billet ran %v", f.calls)
 	}
 
-	if unmapCtxErr != nil {
-		t.Errorf("the unmap ran on a context its caller had cancelled (%v), so a drain kills "+
-			"it partway and leaves the kernel client holding the root disk's lock", unmapCtxErr)
+	if afterCancel != nil {
+		t.Errorf("cancelling the caller ended the unmap in flight (%v), so a drain kills it "+
+			"partway and leaves the kernel client holding the root disk's lock", afterCancel)
+	}
+
+	if !unmapBounded || unmapBound < MapTimeout-5*time.Second || unmapBound > MapTimeout {
+		t.Errorf("the unmap ran under %s (bounded %t), want its own MapTimeout of %s",
+			unmapBound, unmapBounded, MapTimeout)
+	}
+
+	if err != nil {
+		t.Fatalf("DiscardRoot: %v", err)
 	}
 
 	f.ran(t, "--rbd_blocklist_on_break_lock false trash mv billet-cache/billet-abc")
