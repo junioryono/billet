@@ -5958,6 +5958,13 @@ func (l *Listener) destroyCompleted(
 		if removeID == 0 && removeName == "" {
 			removeID, removeName = job.RunnerID, job.RunnerName
 		}
+		// AN ID THE JOB CARRIES FOR THE SAME NAME IS KEPT, so the removal refuses a
+		// registration that has since taken the name under another id. An offline
+		// member's row has a name and no id, and the id its retirement withdrew
+		// arrives here only on the job.
+		if removeID == 0 && job.RunnerID > 0 && removeName == job.RunnerName {
+			removeID = job.RunnerID
+		}
 		if err == nil && (removeID > 0 || removeName != "") {
 			if err := l.registry.RemoveRunner(ctx, removeID, removeName); err != nil {
 				return fmt.Errorf("server: remove runner %q before teardown: %w", removeName, err)
