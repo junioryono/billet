@@ -2339,6 +2339,13 @@ func TestPurgeTrashDeletesDiscardedRootDisksAndCacheVolumesUnderItsOwnBound(t *t
 
 	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
 		if slices.Contains(args, "trash") && slices.Contains(args, "rm") {
+			// A root disk's lock left behind by an interrupted unmap is broken here,
+			// and breaking it must not blocklist the host's kernel client.
+			if i := slices.Index(args, "--rbd_blocklist_on_break_lock"); i < 0 || i+1 >= len(args) ||
+				args[i+1] != "false" {
+				t.Errorf("a trash removal could blocklist the host's kernel client: %v", args)
+			}
+
 			deadline, ok := ctx.Deadline()
 			if !ok {
 				t.Error("a trash removal ran with no deadline at all")

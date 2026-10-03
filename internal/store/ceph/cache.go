@@ -1278,7 +1278,7 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 	for range min(max(c.purgeWorkers, 1), len(deletions)) {
 		wg.Go(func() {
 			for d := range next {
-				err := c.rbdCmdWithin(ctx, PurgeTimeout, "trash", "rm", d.handle)
+				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 
 				mu.Lock()
 				switch {

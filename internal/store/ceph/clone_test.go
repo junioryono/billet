@@ -437,6 +437,51 @@ func TestDiscardUnmapsEveryMappingOfAClone(t *testing.T) {
 	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 }
 
+// AN UNMAP OUTLIVES ITS CALLER'S CANCELLATION, AND THE DISCARD BLOCKLISTS NOTHING.
+//
+// A node told to drain cancelled its context with an unmap in flight; the kernel
+// logged "failed to unlock header: -512", kept the root disk's exclusive lock, and
+// the discard's lock break blocklisted the host's one kernel client, so every
+// device on the node failed (measured 2026-10-03).
+func TestAnUnmapOutlivesItsCallerAndTheDiscardBlocklistsNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.mapped = `[{"id":"1","pool":"billet-cache","namespace":"","name":"billet-abc","snap":"-","device":"/dev/rbd1"}]`
+
+	var unmapCtxErr error
+	unmapped := false
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if subcommandOf(args) == "device unmap" {
+				unmapped = true
+				unmapCtxErr = ctx.Err()
+			}
+
+			return f.run(ctx, bin, args)
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_ = c.DiscardRoot(ctx, "billet-abc")
+
+	if !unmapped {
+		t.Fatalf("the discard never unmapped the clone; billet ran %v", f.calls)
+	}
+
+	if unmapCtxErr != nil {
+		t.Errorf("the unmap ran on a context its caller had cancelled (%v), so a drain kills "+
+			"it partway and leaves the kernel client holding the root disk's lock", unmapCtxErr)
+	}
+
+	f.ran(t, "--rbd_blocklist_on_break_lock false trash mv billet-cache/billet-abc")
+}
+
 // A DISCARD NEVER DELETES THE DATA ITSELF.
 //
 // `rbd rm` deletes every object before it returns, and under the command's bound a

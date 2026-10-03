@@ -301,8 +301,19 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 
 	var err error
 
+	// AN UNMAP IS NEVER KILLED BY ITS CALLER. A signal interrupts the kernel's
+	// release partway: the device goes, but the image's exclusive lock and watch
+	// stay with the host's one kernel client, and the next userspace command that
+	// needs the lock breaks it and, by Ceph's default, blocklists that client. Every
+	// device on the host then fails with -108 and every map after it refuses. Measured
+	// 2026-10-03: a node told to drain cancelled its context, the unmap in flight
+	// logged "failed to unlock header: -512", and the root disk's discard blocklisted
+	// the node's kernel client twenty-eight seconds later. Each attempt runs to its
+	// own bound, which is MapTimeout because unmap does the same kernel work.
+	detached := context.WithoutCancel(ctx)
+
 	for attempt := range attempts {
-		if _, err = c.rbdCmd(ctx, false, "device", "unmap", device); err == nil {
+		if err = c.rbdCmdWithin(detached, MapTimeout, "device", "unmap", device); err == nil {
 			return nil
 		}
 
@@ -355,7 +366,7 @@ func isDeviceBusy(err error) bool {
 func (c *Client) removeClone(ctx context.Context, name string) error {
 	spec := c.cfg.CachePool + "/" + name
 
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", spec); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", spec)...); err != nil {
 		if isNoSuchFile(err) {
 			return nil
 		}

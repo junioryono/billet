@@ -854,6 +854,20 @@ func (c *Client) rbdMap(ctx context.Context, spec string) ([]byte, error) {
 	return c.run(ctx, c.bin, append(c.identity(), "device", "map", spec))
 }
 
+// keepKernelClient prefixes a command that may take a root disk's exclusive lock
+// so that breaking a stale owner does not blocklist it.
+//
+// THE OWNER IS THE HOST'S ONE KERNEL CLIENT. Every device mapped on a host shares
+// it, so the blocklist Ceph adds by default when a lock is broken takes every disk
+// on the host with it, not the one image being removed (measured 2026-10-03, after
+// an interrupted unmap left a root disk's lock behind). These commands remove the
+// image, so a still-live owner writing on after the break writes to nothing anyone
+// reads. The advisory cache-index lock keeps its blocklist: there the broken holder
+// may be live and the blocklist is the fence.
+func keepKernelClient(command ...string) []string {
+	return append([]string{"--rbd_blocklist_on_break_lock", "false"}, command...)
+}
+
 // rbdCmdWithin is rbdCmd under a bound of its own, for the one deletion that
 // takes minutes by nature and is only ever run off the command path.
 func (c *Client) rbdCmdWithin(ctx context.Context, bound time.Duration, command ...string) error {
