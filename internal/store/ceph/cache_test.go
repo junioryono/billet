@@ -2530,23 +2530,31 @@ func TestAFailedCreateUnmapsAMappingTheTimedOutMapLeftBeforeTheTrash(t *testing.
 	t.Parallel()
 
 	f := newCacheFake()
-	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+
+	// THE CALLER'S DEADLINE IS WHAT ENDED THE MAP, so it is cancelled there, and
+	// the fake refuses every later command on it as rbd would: the discard has to
+	// run on a context of its own.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	run := func(runCtx context.Context, bin string, args []string) ([]byte, error) {
 		if slices.Contains(args, "device") && slices.Contains(args, "map") {
-			if _, err := f.run(ctx, bin, args); err != nil {
+			if _, err := f.run(runCtx, bin, args); err != nil {
 				return nil, err
 			}
+			cancel()
 
 			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
 		}
 
-		return f.run(ctx, bin, args)
+		return f.run(runCtx, bin, args)
 	}
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
-	if _, err := c.Create(t.Context(), "acme/api/npm", 1<<30); err == nil {
+	if _, err := c.Create(ctx, "acme/api/npm", 1<<30); err == nil {
 		t.Fatal("Create succeeded although the map did not answer")
 	}
 
