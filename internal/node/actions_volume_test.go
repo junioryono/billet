@@ -3,6 +3,7 @@ package node
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -32,13 +33,8 @@ func TestANewCacheVolumeIsFormattedWithoutADiscardPass(t *testing.T) {
 	}
 
 	args := strings.Split(strings.TrimSpace(string(recorded)), "\n")
-	nodiscard := false
-	for i := range len(args) - 1 {
-		if args[i] == "-E" && strings.Contains(args[i+1], "nodiscard") {
-			nodiscard = true
-		}
-	}
-	if !nodiscard || args[len(args)-1] != "/dev/rbd7" {
-		t.Fatalf("mkfs.ext4 ran with %q, want -E nodiscard and the device last", args)
+	want := []string{"-F", "-m", "0", "-E", "nodiscard", "/dev/rbd7"}
+	if !slices.Equal(args, want) {
+		t.Fatalf("mkfs.ext4 ran with %q, want exactly %q", args, want)
 	}
 }
