@@ -657,6 +657,30 @@ func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 // and the gap is where two listeners promise the same slots. Escrow makes the
 // promise and the reservation one act. Taking fewer than requested is ordinary.
 func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease, error) {
+	return a.EscrowLeaving(ctx, tier, want, nil)
+}
+
+// EscrowLeaving is Escrow for a tier buying ahead of its turn: it buys only while
+// every tier in protect could still be granted one lease of its own afterwards,
+// and buys nothing if one of them could not be granted one even now.
+//
+// THE FAIR ORDER HOLDS FREED ROOM FOR THE LONGEST WAITER, and a waiter that fits
+// loses nothing to a purchase that still leaves it room. Refusing that purchase
+// anyway made the fleet buy at the speed listeners woke rather than the speed
+// room freed: on 2026-10-03, with jobs finishing in seconds, a tier got four
+// runners every one to three minutes while room sat free (#346). A waiter that
+// does NOT fit is accumulating room, and nothing may take from it, which is the
+// guarantee the order exists to give (#157).
+//
+// JUDGED IN THE PURCHASE'S OWN TRANSACTION, so two tiers buying ahead at once
+// cannot each find the waiter room that the two purchases together take, and
+// MEASURED RATHER THAN MODELLED: the leases are inserted, each waiter's headroom
+// is read back from the ledger exactly as its own escrow would read it, and the
+// transaction is rolled back if any waiter is left without one. A model charging
+// the buyer against the waiter's fleet as first measured admitted a purchase that
+// moved another tier's floor onto the waiter's only host, leaving it nothing.
+// Fewer are then tried, one transaction each.
+func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, protect []string) ([]*Lease, error) {
 	if want < 0 {
 		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
 	}
@@ -666,6 +690,39 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
 	}
 
+	var guarded []config.Tier
+	for _, label := range protect {
+		if w, ok := a.tiers[label]; ok && label != tier {
+			guarded = append(guarded, w)
+		}
+	}
+
+	for take := want; take > 0; take-- {
+		leases, err := a.escrow(ctx, t, take, guarded)
+		if errors.Is(err, errWaiterLeftShort) {
+			continue
+		}
+		if errors.Is(err, errWaiterShortNow) {
+			return nil, nil
+		}
+
+		return leases, err
+	}
+
+	return nil, nil
+}
+
+// errWaiterShortNow and errWaiterLeftShort roll an escrow back: a waiter it must
+// protect cannot be granted a lease now, or could not be once the escrow commits.
+var (
+	errWaiterShortNow  = errors.New("alloc: a waiter ahead cannot be granted a lease now")
+	errWaiterLeftShort = errors.New("alloc: the purchase would leave a waiter ahead without a lease")
+)
+
+// escrow buys up to want leases of t in one transaction, rolling it back with
+// errWaiterShortNow or errWaiterLeftShort when it would leave a tier in guarded
+// unable to be granted one.
+func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded []config.Tier) ([]*Lease, error) {
 	if want == 0 {
 		return nil, nil
 	}
@@ -694,6 +751,12 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 			return err
 		}
 
+		// A WAITER THAT CANNOT BE GRANTED ONE NOW IS ACCUMULATING ROOM, and
+		// nothing is bought ahead of it.
+		if err := guardedHaveRoom(ctx, a, tx, guarded, errWaiterShortNow); err != nil {
+			return err
+		}
+
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
 
@@ -715,6 +778,11 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 			leases = append(leases, lease)
 		}
 
+		// READ BACK WITH THE LEASES IN THE LEDGER, floors re-placed and all.
+		if len(leases) > 0 {
+			return guardedHaveRoom(ctx, a, tx, guarded, errWaiterLeftShort)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -722,6 +790,23 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	}
 
 	return leases, nil
+}
+
+// guardedHaveRoom returns short unless every tier in guarded could be granted one
+// lease by an escrow in this transaction now.
+func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier, short error) error {
+	for _, w := range guarded {
+		room, err := a.headroom(ctx, tx, w)
+		if err != nil {
+			return err
+		}
+
+		if room < 1 {
+			return short
+		}
+	}
+
+	return nil
 }
 
 // encodeProviders renders a preference list for the ledger.
