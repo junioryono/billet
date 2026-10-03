@@ -106,7 +106,7 @@
               - billet_gate_health_canary.content | b64decode == "HEALTH_OK protected canary\n"
               - billet_gate_health_last.stat.isreg
               - not billet_gate_health_last.stat.islnk
-              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
+              - billet_gate_health_value.content | b64decode == "# billet ceph health checks seen since the last HEALTH_OK\n"
       always:
         - name: Remove the health script witness directory
           ansible.builtin.file:
@@ -189,7 +189,7 @@
               - billet_gate_health_canary.matched == 0
               - billet_gate_health_last.stat.isreg
               - not billet_gate_health_last.stat.islnk
-              - billet_gate_health_value.content | b64decode == "HEALTH_OK cluster is healthy\n"
+              - billet_gate_health_value.content | b64decode == "# billet ceph health checks seen since the last HEALTH_OK\n"
       always:
         - name: Remove the health script witness directory
           ansible.builtin.file:

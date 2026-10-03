@@ -1,25 +1,114 @@
 #!/bin/sh
 set -eu
 
+# ONE EMAIL PER PROBLEM, AND ONLY FOR A PROBLEM. An email is sent when a Ceph
+# health check appears that has not been seen since health was last OK, and for
+# nothing else: not when ceph's counts or percentages move, not when a check
+# clears or gives way to a milder one (backfillfull back to nearfull), and not on
+# recovery. Comparing the detail text sent three emails for one nearfull episode
+# on 2026-10-03. The checks seen since the last HEALTH_OK are the state; OK
+# clears it.
+
 state_dir=/var/lib/billet/health
 state_file=${state_dir}/ceph.last
 mkdir -p "${state_dir}"
 
-detail=$(ceph health detail 2>&1) || status=ERROR
-status=${status:-$(printf '%s\n' "${detail}" | sed -n '1s/ .*//p')}
-# A symlink is never read: its target may be an archived secret.
-previous=$(test -f "${state_file}" && ! test -L "${state_file}" && cat "${state_file}" || true)
+# The state's first line, so a state this version wrote is never read as the
+# detail text an earlier version wrote, or the other way round.
+marker='# billet ceph health checks seen since the last HEALTH_OK'
 
-if [ "${status}" != "HEALTH_OK" ] && [ "${detail}" != "${previous}" ]; then
-    printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}" {{ billet_alert_email | quote }}
-elif [ "${status}" = "HEALTH_OK" ] && [ -n "${previous}" ] && ! printf '%s' "${previous}" | grep -q '^HEALTH_OK'; then
-    printf '%s\n' "Ceph recovered on $(hostname): ${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph recovered on $(hostname)" {{ billet_alert_email | quote }}
+# first_word prints the first word of the first line, also when the line is
+# that word alone, as a healthy `ceph health detail` prints HEALTH_OK.
+first_word() {
+    printf '%s\n' "$1" | awk 'NR == 1 { print $1 }'
+}
+
+# BOUNDED: a client that cannot reach a monitor waits rather than refusing, and a
+# check that never returns reports nothing. ceph's own connect timeout bounds it;
+# a failure or the bound is an answer that is not a health report.
+status=""
+if ! detail=$(ceph --connect-timeout 60 health detail 2>&1); then
+    status=ERROR
+fi
+status=${status:-$(first_word "${detail}")}
+# An answer that is not a health status, an empty one included, is no answer.
+case "${status}" in
+HEALTH_OK | HEALTH_WARN | HEALTH_ERR) ;;
+*) status=ERROR ;;
+esac
+# A symlink is never read: its target may be an archived secret. A state that is
+# there and cannot be read stops the check rather than reading as nothing seen,
+# which would mail again what was already mailed.
+previous=""
+if test -f "${state_file}" && ! test -L "${state_file}"; then
+    previous=$(cat "${state_file}")
 fi
 
+# classify names the problems a `ceph health detail` reports, one per line: each
+# check it lists ("[WRN] OSD_NEARFULL: ..." gives OSD_NEARFULL), else its status
+# for a warning that names none, else CEPH_UNREADABLE for anything that is not a
+# health report; nothing for HEALTH_OK.
+classify() {
+    names=$(printf '%s\n' "$1" | sed -nE 's/^\[(WRN|ERR)\] ([A-Z0-9_]+):.*/\2/p')
+    if [ -n "${names}" ]; then
+        printf '%s\n' "${names}"
+
+        return 0
+    fi
+
+    word=$(first_word "$1")
+    case "${word}" in
+    HEALTH_OK | '') ;;
+    HEALTH_WARN | HEALTH_ERR) printf '%s\n' "${word}" ;;
+    *) printf 'CEPH_UNREADABLE\n' ;;
+    esac
+}
+
+# A state this version wrote is the marker and one name per line. Anything else
+# is what an earlier version wrote, the detail text, and is classified the same
+# way as an answer, so the converge that installs this never re-sends what was
+# already sent.
+if [ "$(printf '%s\n' "${previous}" | sed -n 1p)" = "${marker}" ]; then
+    seen=$(printf '%s\n' "${previous}" | sed 1d)
+else
+    seen=$(classify "${previous}")
+fi
+
+case "${status}" in
+HEALTH_OK) now="" ;;
+ERROR) now=CEPH_UNREADABLE ;;
+*) now=$(classify "${detail}") ;;
+esac
+
+new=""
+for check in ${now}; do
+    if ! printf '%s\n' "${seen}" | grep -qxF -- "${check}"; then
+        new="${new} ${check}"
+    fi
+done
+
+if [ "${status}" = "HEALTH_OK" ]; then
+    record=""
+else
+    record=$(printf '%s\n%s\n' "${seen}" "${now}" | grep -E '^[A-Z0-9_]+$' | sort -u || true)
+fi
+
+# THE NEW STATE IS WRITTEN BEFORE THE MAIL AND PUBLISHED AFTER IT, so a full or
+# read-only state directory stops the check before anything is sent rather than
+# after, when the stale state would send it again next hour.
 # Rename replaces a planted ceph.last symlink instead of opening its target;
 # -T keeps a symlink to a directory from receiving the file inside it.
 state_tmp=$(mktemp "${state_dir}/.ceph.last.XXXXXXXX")
 trap 'rm -f "${state_tmp}"' EXIT HUP INT TERM
-printf '%s\n' "${detail}" >"${state_tmp}"
+if [ -n "${record}" ]; then
+    printf '%s\n%s\n' "${marker}" "${record}" >"${state_tmp}"
+else
+    printf '%s\n' "${marker}" >"${state_tmp}"
+fi
+
+if [ -n "${new}" ]; then
+    printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}:${new}" {{ billet_alert_email | quote }}
+fi
+
 mv -fT -- "${state_tmp}" "${state_file}"
 trap - EXIT HUP INT TERM
