@@ -15,7 +15,7 @@ import (
 func TestAMapIsBoundedByMapTimeoutAndNothingElseIs(t *testing.T) {
 	t.Parallel()
 
-	budgets := map[string]time.Duration{}
+	budgets := map[string][]time.Duration{}
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		withRunner(func(ctx context.Context, _ string, args []string) ([]byte, error) {
 			deadline, ok := ctx.Deadline()
@@ -29,7 +29,7 @@ func TestAMapIsBoundedByMapTimeoutAndNothingElseIs(t *testing.T) {
 			if slices.Contains(args, "device") && slices.Contains(args, "map") {
 				verb = "map"
 			}
-			budgets[verb] = time.Until(deadline)
+			budgets[verb] = append(budgets[verb], time.Until(deadline))
 
 			return []byte("/dev/rbd3\n"), nil
 		}))
@@ -44,12 +44,13 @@ func TestAMapIsBoundedByMapTimeoutAndNothingElseIs(t *testing.T) {
 		t.Fatalf("rbdCmd: %v", err)
 	}
 
-	if got := budgets["map"]; got <= DefaultTimeout || got > MapTimeout {
-		t.Errorf("a map ran with %s left, want more than DefaultTimeout (%s) and at most MapTimeout (%s)",
-			got, DefaultTimeout, MapTimeout)
+	// EACH SEEN ONCE, AND EACH WITH ITS OWN BOUND less a second for scheduling, so
+	// a missing call and a shortened bound both fail.
+	if got := budgets["map"]; len(got) != 1 || got[0] < MapTimeout-time.Second || got[0] > MapTimeout {
+		t.Errorf("map budgets %v, want one of about MapTimeout (%s)", got, MapTimeout)
 	}
-	if got := budgets["other"]; got > DefaultTimeout {
-		t.Errorf("an ordinary rbd call ran with %s left, want at most DefaultTimeout (%s)", got, DefaultTimeout)
+	if got := budgets["other"]; len(got) != 1 || got[0] < DefaultTimeout-time.Second || got[0] > DefaultTimeout {
+		t.Errorf("ordinary rbd budgets %v, want one of about DefaultTimeout (%s)", got, DefaultTimeout)
 	}
 }
 
@@ -62,6 +63,8 @@ func TestNoMapBypassesRbdMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	maps := map[string]int{}
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -82,6 +85,16 @@ func TestNoMapBypassesRbdMap(t *testing.T) {
 		if count != want {
 			t.Errorf("%s spells out `device map` %d time(s), want %d: every map goes through rbdMap",
 				name, count, want)
+		}
+
+		maps[name] = strings.Count(string(body), "c.rbdMap(")
+	}
+
+	// AND THE THREE PLACES THAT MAP DO SO THROUGH IT, so a map moved out of
+	// sight of the string search above still fails here.
+	for _, name := range []string{"cache.go", "clone.go", "importer.go"} {
+		if maps[name] == 0 {
+			t.Errorf("%s no longer maps through rbdMap", name)
 		}
 	}
 }
