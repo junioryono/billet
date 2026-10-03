@@ -107,51 +107,42 @@ func TestAFencedControlPlaneNeverSweepsStagedCredentials(t *testing.T) {
 	sweeper := &countingSweeper{}
 
 	var (
-		ticks  atomic.Int32
-		fenced atomic.Bool
+		ticks    atomic.Int32
+		fenced   atomic.Bool
+		baseline atomic.Int32
 	)
 
 	stop, done := runPlaneWith(t,
 		WithStagedCredentialSweeper(sweeper),
 		WithLeadershipLost(fenced.Load),
 		ControlPlaneOption(func(s *Server) {
-			s.onReap = func(int) { ticks.Add(1) }
+			// ON THE REAPER'S OWN GOROUTINE, at the end of the first tick: the next
+			// tick cannot begin until this returns, so every tick after the first
+			// is wholly fenced and the baseline holds every sweep before the fence.
+			s.onReap = func(int) {
+				if ticks.Add(1) == 1 {
+					baseline.Store(sweeper.calls.Load())
+					fenced.Store(true)
+				}
+			}
 		}),
 	)
 
-	waitTicks := func(n int32) bool {
-		deadline := time.Now().Add(30 * time.Second)
-		for ticks.Load() < n && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-
-		return ticks.Load() >= n
+	// Three wholly fenced ticks, inside runPlaneWith's own lifetime.
+	deadline := time.Now().Add(8 * time.Second)
+	for ticks.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
-
-	if !waitTicks(1) {
-		stop()
-		<-done
-		t.Fatal("the reaper never ticked before the fence, so this proves nothing about what it skipped")
-	}
-
-	fenced.Store(true)
-
-	// A TICK ALREADY PAST ITS FENCE CHECK MAY STILL SWEEP, so the count is taken
-	// once a whole tick has begun after the fence: onReap ends a tick, and the
-	// tick after the next one to end started after the store.
-	fencedAt := ticks.Load()
-	settled := waitTicks(fencedAt + 2)
-	before := sweeper.calls.Load()
-	ticked := settled && waitTicks(fencedAt+5)
 
 	stop()
 	<-done
 
-	if !ticked {
-		t.Fatal("the reaper stopped ticking once fenced, so this proves nothing about what it skipped")
+	if ticks.Load() < 4 {
+		t.Fatalf("the reaper ticked %d time(s), fewer than three after the fence, so this proves "+
+			"nothing about what it skipped", ticks.Load())
 	}
 
-	if got := sweeper.calls.Load(); got != before {
-		t.Fatalf("a fenced control plane swept %d more time(s)", got-before)
+	if got := sweeper.calls.Load() - baseline.Load(); got != 0 {
+		t.Fatalf("a fenced control plane swept %d time(s)", got)
 	}
 }
