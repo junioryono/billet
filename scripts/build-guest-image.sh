@@ -927,7 +927,60 @@ for attempt in $(seq 1 120); do
 	sleep 0.5
 done
 
-fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
+# A READ THAT GOT NO ANSWER IS ASKED AGAIN; AN ANSWER IS FINAL. On a loaded host the
+# service can miss a five-second window, and on 2026-10-03 one missed read of the
+# contract made a guest refuse as "older than this image": the agent exited, the
+# runner never connected, and GitHub showed it offline. A timeout or a refused
+# connection says nothing about the key, so the read is repeated for fetch_within
+# seconds; an HTTP answer is the service's word and is never retried, except a 200
+# whose body did not arrive whole. fetch returns 0 with the value, 3 when the service
+# says the key does not exist, and 1 when it could not be read, so a caller can tell
+# "billet did not send it" from "could not ask".
+#
+# ONE BUDGET FOR THE AGENT, NOT ONE PER KEY. A read that spends it leaves
+# fetch_gave_up behind, and every later read is asked once until the service answers
+# again; otherwise each of the half-dozen keys read after it would wait its own five
+# minutes on a service that is gone. It is a file because fetch runs in a subshell,
+# and it is removed here because a restarted agent is owed a whole budget again.
+fetch_within=300
+fetch_gave_up=/run/billet-metadata-unanswered
+rm -f "$fetch_gave_up"
+
+# BILLET_AGENT_FETCH_BEGIN
+fetch() {
+	local answer code got deadline
+	deadline=$((SECONDS + fetch_within))
+	if [ -e "$fetch_gave_up" ]; then
+		deadline=$SECONDS
+	fi
+	while :; do
+		got=0
+		answer=$(curl -s --connect-timeout 2 --max-time 5 -w '\n%{http_code}' \
+			-H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1") || got=$?
+		code=${answer##*$'\n'}
+		if [ "$code" = 200 ] && [ "$got" -eq 0 ]; then
+			rm -f "$fetch_gave_up"
+			printf '%s' "${answer%$'\n'*}"
+			return 0
+		fi
+		if [ "$code" = 404 ]; then
+			rm -f "$fetch_gave_up"
+			return 3
+		fi
+		if [[ "$code" =~ ^[1-9][0-9][0-9]$ ]] && [ "$code" != 200 ]; then
+			rm -f "$fetch_gave_up"
+			log "the metadata service answered $code for $1"
+			return 1
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			: >"$fetch_gave_up"
+			log "could not read $1 from the metadata service in ${fetch_within}s"
+			return 1
+		fi
+		sleep 1
+	done
+}
+# BILLET_AGENT_FETCH_END
 
 # THE CONTRACT FIRST, BEFORE ANYTHING IS READ FROM IT.
 #
@@ -941,8 +994,16 @@ fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token
 # answer ("republish the image") is in the failure rather than in somebody's memory.
 WANT_CONTRACT=10
 
-if ! contract=$(fetch contract); then
+contract_read=0
+contract=$(fetch contract) || contract_read=$?
+
+if [ "$contract_read" -eq 3 ]; then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"
+	exit 1
+fi
+
+if [ "$contract_read" -ne 0 ]; then
+	log "could not read the metadata contract; the guest cannot start a runner without it"
 	exit 1
 fi
 
@@ -952,8 +1013,16 @@ if [ "$contract" != "$WANT_CONTRACT" ]; then
 	exit 1
 fi
 
-if ! jit=$(fetch jit-config); then
+jit_read=0
+jit=$(fetch jit-config) || jit_read=$?
+
+if [ "$jit_read" -eq 3 ]; then
 	log "no registration in the metadata"
+	exit 1
+fi
+
+if [ "$jit_read" -ne 0 ]; then
+	log "could not read the registration from the metadata"
 	exit 1
 fi
 
