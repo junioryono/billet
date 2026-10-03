@@ -391,7 +391,7 @@ func (c *Client) Create(
 }
 
 func (c *Client) mapCache(ctx context.Context, handle string) (string, error) {
-	out, err := c.rbdCmd(ctx, false, "device", "map", handle)
+	out, err := c.rbdMap(ctx, handle)
 	if err != nil {
 		return "", fmt.Errorf("ceph: map cache volume %s: %w", handle, err)
 	}
@@ -1119,16 +1119,9 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	// unmap, and the volume then stays listed for the next discard to retry.
 	name := strings.TrimPrefix(handle, c.cfg.CachePool+"/")
 
-	devices, err := c.mappedDevices(ctx, name)
-	if err != nil {
-		return fmt.Errorf("ceph: could not tell whether cache volume %s is mapped here, so it stays "+
-			"listed: %w", handle, err)
-	}
-
-	for _, device := range devices {
-		if err := c.unmapDevice(ctx, device, name); err != nil {
-			return err
-		}
+	if err := c.unmapAll(ctx, name); err != nil {
+		return fmt.Errorf("ceph: cache volume %s may still be mapped here, so it stays listed: %w",
+			handle, err)
 	}
 
 	// SNAPSHOTS FIRST, AND A VOLUME THAT KEEPS ONE STAYS LISTED. A failed Snapshot

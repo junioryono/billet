@@ -667,3 +667,106 @@ func TestTheMappingLookupIsScopedToTheConfiguredCachePool(t *testing.T) {
 		}
 	}
 }
+
+// A ROOT DISK MAP THAT TIMED OUT CAN STILL HAVE MAPPED, and the clone is unmapped
+// before it goes to the trash. Measured on 2026-10-03: a map passed its bound
+// under a relaunch burst, the kernel finished it, and a clone trashed while mapped
+// answers every purge with EBUSY for good.
+func TestACloneWhoseMapTimedOutIsUnmappedBeforeTheTrash(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.mapped = `[{"pool":"billet-cache","name":"billet-abc","device":"/dev/rbd5"}]`
+
+	// THE CALLER'S DEADLINE IS WHAT ENDED THE MAP, so it is cancelled there, and
+	// every later command run on a cancelled context fails as rbd would: the
+	// cleanup has to run on a context of its own.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	run := func(runCtx context.Context, bin string, args []string) ([]byte, error) {
+		if err := runCtx.Err(); err != nil {
+			f.calls = append(f.calls, args)
+
+			return nil, err
+		}
+
+		if subcommandOf(args) == "device map" {
+			f.calls = append(f.calls, args)
+			cancel()
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		}
+
+		return f.run(runCtx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.CloneRoot(ctx, "ubuntu-2404-x64@g1", "billet-abc", 20*config.GiB); err == nil {
+		t.Fatal("CloneRoot reported success although the map did not answer")
+	}
+
+	unmapped, trashed := -1, -1
+	for i, call := range f.calls {
+		switch subcommandOf(call) {
+		case "device unmap":
+			if unmapped < 0 && slices.Contains(call, "/dev/rbd5") {
+				unmapped = i
+			}
+		case "trash":
+			if trashed < 0 {
+				trashed = i
+			}
+		}
+	}
+	if unmapped < 0 || trashed < 0 || unmapped > trashed {
+		t.Fatalf("unmap of /dev/rbd5 at call %d, trash at call %d; want the unmap first: %v",
+			unmapped, trashed, f.calls)
+	}
+}
+
+// A CLONE STILL MAPPED HERE IS NOT TRASHED. The unmap refuses, and the clone stays
+// in the pool for the launch's own cleanup rather than going where nothing can
+// delete it.
+func TestACloneThatWillNotUnmapStaysOutOfTheTrash(t *testing.T) {
+	t.Parallel()
+
+	busy := errors.New("exit status 16: rbd: unmap failed: (16) Device or resource busy")
+
+	f := newCloneFake()
+	f.mapped = `[{"pool":"billet-cache","name":"billet-abc","device":"/dev/rbd5"}]`
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		switch subcommandOf(args) {
+		case "device map":
+			f.calls = append(f.calls, args)
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		case "device unmap":
+			f.calls = append(f.calls, args)
+
+			return nil, busy
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = c.CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc", 20*config.GiB)
+	if !errors.Is(err, busy) {
+		t.Fatalf("CloneRoot = %v, want the refused unmap reported", err)
+	}
+
+	for _, call := range f.calls {
+		if subcommandOf(call) == "trash" {
+			t.Fatalf("a clone still mapped here was trashed: %v", call)
+		}
+	}
+}
