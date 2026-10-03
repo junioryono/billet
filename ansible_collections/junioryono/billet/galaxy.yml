@@ -1,7 +1,7 @@
 ---
 namespace: junioryono
 name: billet
-version: 0.12.31
+version: 0.12.32
 readme: README.md
 authors:
   - junioryono
