@@ -23,15 +23,26 @@ first_word() {
     printf '%s\n' "$1" | awk 'NR == 1 { print $1 }'
 }
 
-detail=$(ceph health detail 2>&1) || status=ERROR
+# BOUNDED: a client that cannot reach a monitor waits rather than refusing, and a
+# check that never returns reports nothing. ceph's own connect timeout bounds it;
+# a failure or the bound is an answer that is not a health report.
+status=""
+if ! detail=$(ceph --connect-timeout 60 health detail 2>&1); then
+    status=ERROR
+fi
 status=${status:-$(first_word "${detail}")}
 # An answer that is not a health status, an empty one included, is no answer.
 case "${status}" in
 HEALTH_OK | HEALTH_WARN | HEALTH_ERR) ;;
 *) status=ERROR ;;
 esac
-# A symlink is never read: its target may be an archived secret.
-previous=$(test -f "${state_file}" && ! test -L "${state_file}" && cat "${state_file}" || true)
+# A symlink is never read: its target may be an archived secret. A state that is
+# there and cannot be read stops the check rather than reading as nothing seen,
+# which would mail again what was already mailed.
+previous=""
+if test -f "${state_file}" && ! test -L "${state_file}"; then
+    previous=$(cat "${state_file}")
+fi
 
 # classify names the problems a `ceph health detail` reports, one per line: each
 # check it lists ("[WRN] OSD_NEARFULL: ..." gives OSD_NEARFULL), else its status
@@ -76,16 +87,15 @@ for check in ${now}; do
     fi
 done
 
-if [ -n "${new}" ]; then
-    printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}:${new}" {{ billet_alert_email | quote }}
-fi
-
 if [ "${status}" = "HEALTH_OK" ]; then
     record=""
 else
     record=$(printf '%s\n%s\n' "${seen}" "${now}" | grep -E '^[A-Z0-9_]+$' | sort -u || true)
 fi
 
+# THE NEW STATE IS WRITTEN BEFORE THE MAIL AND PUBLISHED AFTER IT, so a full or
+# read-only state directory stops the check before anything is sent rather than
+# after, when the stale state would send it again next hour.
 # Rename replaces a planted ceph.last symlink instead of opening its target;
 # -T keeps a symlink to a directory from receiving the file inside it.
 state_tmp=$(mktemp "${state_dir}/.ceph.last.XXXXXXXX")
@@ -95,5 +105,10 @@ if [ -n "${record}" ]; then
 else
     printf '%s\n' "${marker}" >"${state_tmp}"
 fi
+
+if [ -n "${new}" ]; then
+    printf '%s\n' "${detail}" | mail -r {{ billet_alert_from | quote }} -s "billet Ceph health on $(hostname): ${status}:${new}" {{ billet_alert_email | quote }}
+fi
+
 mv -fT -- "${state_tmp}" "${state_file}"
 trap - EXIT HUP INT TERM
