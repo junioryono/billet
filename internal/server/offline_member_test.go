@@ -25,9 +25,9 @@ type inspectingRegistry struct {
 	during func()
 	// byName, when set, answers each runner from its own queue instead of answers.
 	byName map[string][]RunnerState
-	// ids is the id GitHub holds for each name, filled into a present answer
-	// that scripts none.
-	ids map[string]int64
+	// githubIDs is the id GitHub holds for each name, filled into a present
+	// answer that scripts none.
+	githubIDs map[string]int64
 
 	withdrawn   []int64
 	withdrawErr error
@@ -35,8 +35,8 @@ type inspectingRegistry struct {
 
 func (r *inspectingRegistry) InspectRunner(_ context.Context, name string, _ int64) (RunnerState, error) {
 	state, err := r.script(name)
-	if err == nil && state.Present && state.ID == 0 {
-		state.ID = r.ids[name]
+	if id, known := r.githubIDs[name]; err == nil && state.Present && state.ID == 0 && known {
+		state.ID = id
 	}
 
 	return state, err
@@ -121,8 +121,8 @@ func newOfflineFixtureWith(t *testing.T, reg *inspectingRegistry, n int, poolID 
 	f := &offlineFixture{reg: reg, now: offlineEpoch, desired: n}
 	f.a = newAllocator(t, alloc.Limits{MaxVCPU: 64, MaxMemory: 512 * config.GiB}, tiers)
 
-	if reg.ids == nil {
-		reg.ids = map[string]int64{}
+	if reg.githubIDs == nil {
+		reg.githubIDs = map[string]int64{}
 	}
 
 	for i := range n {
@@ -145,8 +145,8 @@ func newOfflineFixtureWith(t *testing.T, reg *inspectingRegistry, n int, poolID 
 			t.Fatalf("RegisterPoolRunner: %v", err)
 		}
 
-		if _, set := reg.ids[name]; !set {
-			reg.ids[name] = int64(10899 + i)
+		if _, set := reg.githubIDs[name]; !set {
+			reg.githubIDs[name] = int64(10899 + i)
 		}
 
 		if i == 0 {
@@ -396,6 +396,9 @@ func TestALedgerFailureAfterTheWithdrawalIsRetriedWithoutAskingAgain(t *testing.
 	if f.destroyed != 1 {
 		t.Fatalf("compute destroyed %d times after the ledger recovered, want 1", f.destroyed)
 	}
+	if !slices.Equal(reg.ids, []int64{10899}) {
+		t.Fatalf("the retried cleanup removed ids %v, want the withdrawn 10899, not the row's none", reg.ids)
+	}
 }
 
 func TestAMemberIdleForLessThanTheBoundIsNotAskedAbout(t *testing.T) {
@@ -464,6 +467,11 @@ func TestAMemberJournaledWithoutAnIDIsWithdrawnByGitHubsID(t *testing.T) {
 	if !slices.Equal(reg.withdrawn, []int64{10899}) {
 		t.Fatalf("withdrawn ids = %v, want GitHub's 10899 for %s", reg.withdrawn, f.name)
 	}
+	// The cleanup's removal expects the withdrawn id, so a registration that took
+	// the name since is refused rather than deleted by name alone.
+	if !slices.Equal(reg.ids, []int64{10899}) || !slices.Equal(reg.names, []string{f.name}) {
+		t.Fatalf("cleanup removed %v / %v, want the withdrawn 10899 under %s", reg.ids, reg.names, f.name)
+	}
 	if !slices.Equal(f.requests, []int64{-53128}) {
 		t.Fatalf("destroyed launch requests = %v, want -53128", f.requests)
 	}
@@ -500,14 +508,19 @@ func TestAnOfflineAnswerWithoutAnIDOrWithAnotherIsNotEvidence(t *testing.T) {
 		name   string
 		poolID int64
 		answer RunnerState
+		noID   bool
 	}{
-		{name: "no id", answer: RunnerState{Present: true, ID: -1}},
+		{name: "no id", answer: RunnerState{Present: true}, noID: true},
+		{name: "a negative id", answer: RunnerState{Present: true, ID: -1}},
 		{name: "another id than the pool journaled", poolID: 10899,
 			answer: RunnerState{Present: true, ID: 20411}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := &inspectingRegistry{answers: []RunnerState{tc.answer, tc.answer, tc.answer}}
 			f := newOfflineFixtureWith(t, reg, 1, tc.poolID)
+			if tc.noID {
+				delete(reg.githubIDs, f.name)
+			}
 
 			f.reconcileAt(t, 0)
 			f.reconcileAt(t, offlineIdleAfter)
@@ -524,5 +537,22 @@ func TestAnOfflineAnswerWithoutAnIDOrWithAnotherIsNotEvidence(t *testing.T) {
 				t.Fatalf("member status = %q, want idle", got)
 			}
 		})
+	}
+}
+
+// A remote node's JIT mint journals the registration's id before any job, and a
+// member journaled that way is retired by that same id.
+func TestAMemberJournaledWithItsIDIsWithdrawnByThatID(t *testing.T) {
+	offline := RunnerState{Present: true}
+	reg := &inspectingRegistry{answers: []RunnerState{offline, offline}}
+	f := newOfflineFixtureWith(t, reg, 1, 10899)
+
+	f.reconcileAt(t, 0)
+	f.reconcileAt(t, offlineIdleAfter)
+	f.reconcileAt(t, offlineIdleAfter+offlineGrace)
+
+	if !slices.Equal(reg.withdrawn, []int64{10899}) || f.destroyed != 1 {
+		t.Fatalf("withdrawn %v, destroyed %d; want 10899 withdrawn and its compute destroyed",
+			reg.withdrawn, f.destroyed)
 	}
 }

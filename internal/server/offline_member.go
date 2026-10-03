@@ -78,14 +78,16 @@ type offlineWatch struct {
 // An online idle member is left alone even here: GitHub may hand it a job at any
 // moment, and its only cost is capacity the aggregate will reclaim once it moves.
 //
-// THE ID IS GITHUB'S, READ BY THE MEMBER'S EXACT NAME. A member is journaled at
-// launch with no runner id, because the node mints the registration, and the pool
-// learns an id only from a JobStarted, which the members this exists for never
-// receive. Requiring the pool's own id retired nothing at all: on 2026-10-02 four
-// such members, adopted into a node's custody across a controller restart, held
-// that node's drain for nine hours (#317). The name is billet-<lease id>, unique
-// to the lease, and both offline answers must name the same id, which is the one
-// withdrawn.
+// THE ID IS GITHUB'S, READ BY THE MEMBER'S EXACT NAME. A remote node's JIT mint
+// journals the registration's id, but the listener's own launch path journals a
+// member with a name and no id, and the pool then learns one only from a
+// JobStarted, which the members this exists for never receive. The name is
+// billet-<lease id>, unique to the lease; both offline answers must name the same
+// id, which must equal one the pool journaled, and that id is the one withdrawn
+// and the one the cleanup's removal expects. (On 2026-10-02 four members adopted
+// into a node's custody across a controller restart held its drain for nine
+// hours, because the registry this asserts was an adapter that did not forward
+// the inspector at all, #317.)
 func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.PoolRunner) {
 	inspector, ok := l.registry.(RunnerInspector)
 	if !ok || l.alloc == nil {
@@ -114,8 +116,10 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 
 		idle[member.LeaseID] = true
 
-		if _, pending := w.withdrawn[member.LeaseID]; pending {
-			l.retireWithdrawn(ctx, *member)
+		// THE CACHED MEMBER, NOT THE ROW: only it carries the id GitHub deleted,
+		// which the cleanup's removal must expect.
+		if withdrawn, pending := w.withdrawn[member.LeaseID]; pending {
+			l.retireWithdrawn(ctx, withdrawn)
 			continue
 		}
 
