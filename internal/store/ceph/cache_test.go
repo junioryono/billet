@@ -2522,6 +2522,140 @@ func TestTheTrashTakesOnlyAWritableVolumeBilletNamed(t *testing.T) {
 
 // A VOLUME GIVEN UP BY A FAILED CREATE OR SNAPSHOT GOES TO THE TRASH TOO, and the
 // snapshot's unpublished candidate generation still goes through `rbd rm`.
+// A MAP THAT TIMED OUT CAN STILL HAVE MAPPED. On 2026-10-03 `rbd device map`
+// passed its bound, the kernel finished the mapping afterwards, and the failed
+// create trashed a volume the host still mapped, which no purge could delete. The
+// discard now unmaps whatever this host maps before the trash.
+func TestAFailedCreateUnmapsAMappingTheTimedOutMapLeftBeforeTheTrash(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "device") && slices.Contains(args, "map") {
+			if _, err := f.run(ctx, bin, args); err != nil {
+				return nil, err
+			}
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.Create(t.Context(), "acme/api/npm", 1<<30); err == nil {
+		t.Fatal("Create succeeded although the map did not answer")
+	}
+
+	if len(f.mappings) != 0 {
+		t.Fatalf("the mapping the timed-out map left is still there: %v", f.mappings)
+	}
+	if len(f.trash) != 1 || len(f.images) != 0 {
+		t.Fatalf("the failed volume was not moved to the trash: images %v, trash %v", f.images, f.trash)
+	}
+
+	unmapped, trashed := -1, -1
+	for i, call := range f.calls {
+		switch {
+		case slices.Contains(call, "unmap") && unmapped < 0:
+			unmapped = i
+		case slices.Contains(call, "trash") && slices.Contains(call, "mv") && trashed < 0:
+			trashed = i
+		}
+	}
+	if unmapped < 0 || trashed < 0 || unmapped > trashed {
+		t.Fatalf("unmap at call %d, trash at call %d; want the unmap first: %v", unmapped, trashed, f.calls)
+	}
+}
+
+// A DEVICE SOMETHING STILL HOLDS IS NOT TRASHED UNDER IT, on the failed create's
+// path, which discarded without unmapping before. The unmap refuses, and the
+// volume stays listed rather than going where nothing can delete it.
+func TestAFailedCreateLeavesListedAVolumeItCannotUnmap(t *testing.T) {
+	t.Parallel()
+
+	busy := errors.New("exit status 16: rbd: sysfs write failed\nrbd: unmap failed: (16) Device or resource busy")
+
+	f := newCacheFake()
+
+	var unmaps []string
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		switch {
+		case slices.Contains(args, "device") && slices.Contains(args, "map"):
+			if _, err := f.run(ctx, bin, args); err != nil {
+				return nil, err
+			}
+
+			return nil, fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+		case slices.Contains(args, "device") && slices.Contains(args, "unmap"):
+			unmaps = append(unmaps, args[len(args)-1])
+			f.calls = append(f.calls, slices.Clone(args))
+
+			return nil, busy
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = c.Create(t.Context(), "acme/api/npm", 1<<30)
+	if !errors.Is(err, busy) {
+		t.Fatalf("Create = %v, want the refused unmap reported", err)
+	}
+
+	if len(unmaps) == 0 || unmaps[0] != "/dev/rbd0" {
+		t.Fatalf("unmap attempts %v, want /dev/rbd0, the device the timed-out map left", unmaps)
+	}
+
+	for _, call := range f.calls {
+		if slices.Contains(call, "trash") || (slices.Contains(call, "snap") && slices.Contains(call, "purge")) {
+			t.Fatalf("a volume this host still maps was touched after the unmap refused: %v", call)
+		}
+	}
+
+	if len(f.trash) != 0 || len(f.images) != 1 {
+		t.Fatalf("a volume this host still maps went to the trash: images %v, trash %v", f.images, f.trash)
+	}
+}
+
+// A MAPPING TABLE THAT CANNOT BE READ IS COULD-NOT-TELL, and the volume stays
+// listed rather than being trashed on the assumption nothing maps it.
+func TestAFailedCreateLeavesListedAVolumeWhoseMappingsCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		switch {
+		case slices.Contains(args, "device") && slices.Contains(args, "map"):
+			return nil, errors.New("exit status 5: rbd: map failed: (5) Input/output error")
+		case slices.Contains(args, "device") && slices.Contains(args, "list"):
+			return []byte("null"), nil
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := c.Create(t.Context(), "acme/api/npm", 1<<30); err == nil {
+		t.Fatal("Create succeeded although the map failed")
+	}
+
+	if len(f.trash) != 0 || len(f.images) != 1 {
+		t.Fatalf("a volume whose mappings could not be read went to the trash: images %v, trash %v",
+			f.images, f.trash)
+	}
+}
+
 func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *testing.T) {
 	t.Parallel()
 

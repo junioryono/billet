@@ -292,13 +292,13 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 		case <-ctx.Done():
 			timer.Stop()
 
-			return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name,
+			return fmt.Errorf("ceph: unmap %s, which maps %s: %w", device, name,
 				errors.Join(err, ctx.Err()))
 		case <-timer.C:
 		}
 	}
 
-	return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name, err)
+	return fmt.Errorf("ceph: unmap %s, which maps %s: %w", device, name, err)
 }
 
 // isDeviceBusy reports whether the kernel client still holds a device.
