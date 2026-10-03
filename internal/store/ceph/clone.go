@@ -123,10 +123,24 @@ func (c *Client) CloneRoot(
 
 	device, err := c.mapRoot(ctx, name)
 	if err != nil {
+		// A MAP THAT FAILED CAN STILL HAVE MAPPED: one cut short by its bound is
+		// finished by the kernel, and a clone trashed while mapped answers every
+		// purge with EBUSY for good. So whatever this host maps of it is unmapped
+		// first, on a context of its own because the failure may be the caller's
+		// deadline; one that cannot be unmapped stays in the pool, where the
+		// launch's own unwind (DiscardRoot) tries again.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), MapTimeout)
+		defer cancel()
+
+		if unmapErr := c.unmapAll(cleanupCtx, name); unmapErr != nil {
+			return "", fmt.Errorf("%w (and the clone it made is still mapped here, so %s stays in the "+
+				"pool for the launch's cleanup: %w)", err, dst, unmapErr)
+		}
+
 		// BEST EFFORT, AND ITS FAILURE IS REPORTED RATHER THAN REPLACING THE CAUSE.
 		// The caller needs to know why the map failed; a second failure here is a
 		// clone left in the pool, which is worth saying and is not the headline.
-		if rmErr := c.removeClone(ctx, name); rmErr != nil {
+		if rmErr := c.removeClone(cleanupCtx, name); rmErr != nil {
 			return "", fmt.Errorf("%w (and the clone it made could not be removed, so %s is "+
 				"holding pool space: %w)", err, dst, rmErr)
 		}
@@ -181,6 +195,23 @@ func (c *Client) growRoot(ctx context.Context, spec string, capacity config.Byte
 	return nil
 }
 
+// unmapAll unmaps every device this host maps for a cache-pool image. A mapping
+// table it cannot read is an error, never "nothing mapped".
+func (c *Client) unmapAll(ctx context.Context, name string) error {
+	devices, err := c.mappedDevices(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	for _, device := range devices {
+		if err := c.unmapDevice(ctx, device, name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // mapRoot maps a cache-pool image and returns the device the kernel gave it.
 //
 // MAPPING IS NOT IDEMPOTENT — measured. A second `rbd device map` of the same
@@ -191,7 +222,7 @@ func (c *Client) growRoot(ctx context.Context, spec string, capacity config.Byte
 func (c *Client) mapRoot(ctx context.Context, name string) (string, error) {
 	spec := c.cfg.CachePool + "/" + name
 
-	out, err := c.rbdCmd(ctx, false, "device", "map", spec)
+	out, err := c.rbdMap(ctx, spec)
 	if err != nil {
 		return "", fmt.Errorf("ceph: map %s as client.%s: %w", spec, c.cfg.User, err)
 	}
