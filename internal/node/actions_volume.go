@@ -20,6 +20,10 @@ type actionsVolumeManager interface {
 
 type hostActionsVolumeManager struct{}
 
+// mountpointNotMounted is util-linux mountpoint's exit status for a directory that
+// is not a mount point.
+const mountpointNotMounted = 32
+
 func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target string) error {
 	mkfs, err := exec.LookPath("mkfs.ext4")
 	if err != nil {
@@ -91,10 +95,14 @@ func (hostActionsVolumeManager) Unmount(ctx context.Context, target string) erro
 	if err != nil {
 		return fmt.Errorf("node: mountpoint is required for Actions cache recovery: %w", err)
 	}
+	// util-linux's mountpoint exits 32 for "not a mount point" and 1 for a failure
+	// to look (2.41.3 on the reference deployment, measured 2026-10-03). Reading 1
+	// as unmounted refused every directory a failed mount left behind, and the
+	// session holding it never finished closing.
 	mounted := true
 	if err := exec.CommandContext(ctx, mountpoint, "-q", "--", target).Run(); err != nil {
 		exitErr, ok := errors.AsType[*exec.ExitError](err)
-		if !ok || exitErr.ExitCode() != 1 {
+		if !ok || exitErr.ExitCode() != mountpointNotMounted {
 			return fmt.Errorf("node: inspect Actions cache mount point: %w", err)
 		}
 		mounted = false
