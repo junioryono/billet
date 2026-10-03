@@ -284,6 +284,11 @@ type Listener struct {
 	// poolLaunchBatch is how many pool members a reconciliation starts at once;
 	// zero or one launches each before buying the next. See WithPoolLaunchBatch.
 	poolLaunchBatch int
+	// batchBuying is set, under mu, while a pool pass buys its batch, and
+	// batchBought records that it bought: the admission order re-dates the tier
+	// once for the pass rather than once per purchase.
+	batchBuying bool
+	batchBought bool
 
 	// heartbeatLock runs immediately before mu is taken at the top of a heartbeat
 	// pass. TEST-ONLY and nil in every deployment; it gates the acquisition
@@ -3540,11 +3545,21 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
 	}
 
-	if len(leases) > 0 {
-		l.order.bought(l.tier)
-	}
-
 	l.mu.Lock()
+
+	// A POOL PASS IS RE-DATED ONCE, after its batch, not after each purchase in
+	// it: re-dated per purchase, the tier lost its place after the first member
+	// and every batch shrank to one, so a tier bought one runner each time its
+	// listener woke however much room was free (2026-10-03).
+	if len(leases) > 0 {
+		if l.batchBuying {
+			l.batchBought = true
+		} else {
+			l.mu.Unlock()
+			l.order.bought(l.tier)
+			l.mu.Lock()
+		}
+	}
 
 	l.trackHeld(leases)
 	l.held = append(l.held, leases...)
@@ -3957,6 +3972,10 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 		// (2026-10-03, with 66 runners wanted on one tier).
 		var batch []poolLaunch
 
+		l.mu.Lock()
+		l.batchBuying, l.batchBought = true, false
+		l.mu.Unlock()
+
 		for active < desired && len(batch) < max(l.poolLaunchBatch, 1) {
 			// WHOSE TURN IT IS, asked before the purchase and not after: under
 			// fair the room a finished job leaves belongs to the longest-waiting
@@ -3967,10 +3986,14 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			}
 
 			if err := l.backPoolSlot(ctx); err != nil {
+				l.endBatchBuying()
+
 				return errors.Join(err, l.launchPool(ctx, batch))
 			}
 			lease, job, err := l.assignPoolSlot(ctx)
 			if err != nil {
+				l.endBatchBuying()
+
 				return errors.Join(err, l.launchPool(ctx, batch))
 			}
 			if lease == nil {
@@ -3979,6 +4002,8 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			batch = append(batch, poolLaunch{lease: lease, job: job})
 			active++
 		}
+
+		l.endBatchBuying()
 
 		if len(batch) == 0 {
 			break
@@ -4048,6 +4073,19 @@ const poolLaunchBatch = 4
 type poolLaunch struct {
 	lease *alloc.Lease
 	job   Job
+}
+
+// endBatchBuying closes a pool pass's purchases and, if it bought anything,
+// re-dates the tier in the admission order once for the whole pass.
+func (l *Listener) endBatchBuying() {
+	l.mu.Lock()
+	bought := l.batchBought
+	l.batchBuying, l.batchBought = false, false
+	l.mu.Unlock()
+
+	if bought {
+		l.order.bought(l.tier)
+	}
 }
 
 // launchPool starts every member of batch at once and waits for all of them.
