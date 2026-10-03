@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,7 +19,10 @@ import (
 )
 
 // skillCorpusPath is every unit of text the skills held when they were frozen
-// for the rewrite in #356, one per line.
+// for the rewrite in #356, one per line: skillUnits over every SKILL.md at
+// c0da9fb2. It is never regenerated, because regenerating it would bless
+// whatever the skills had lost since; a unit removed on purpose belongs in the
+// dropped list instead.
 const skillCorpusPath = "testdata/skills-corpus.txt"
 
 // skillDroppedPath lists corpus units removed on purpose: `<hash> <reason>`.
@@ -29,19 +35,16 @@ const maxSkillBytes = 12 * 1024
 // maxDescriptionRunes bounds a skill's description, which every session reads.
 const maxDescriptionRunes = 600
 
-// writeSkillCorpusEnv regenerates the corpus from the skills as they are now.
-// It exists for the one freeze, and running it again would bless whatever the
-// skills have lost since; a unit removed on purpose belongs in the dropped list.
-const writeSkillCorpusEnv = "BILLET_WRITE_SKILL_CORPUS"
-
 // NOTHING A SKILL SAID IS LOST WITHOUT A REASON.
 //
 // The skills are being reorganised into a short SKILL.md and references/ files
 // loaded on demand (#356), and a rewrite of 650 KB of measured rules is exactly
 // where a sentence nobody meant to drop goes missing with every gate green.
-// Every unit of the frozen corpus must still appear, verbatim after
-// normalisation, in some Markdown file under .claude/skills, or be listed in the
-// dropped file with a reason.
+// Every unit of the frozen corpus must still be a whole unit, verbatim after
+// normalisation, of some Markdown file under .claude/skills, or be listed in the
+// dropped file with a reason. A whole unit and not a substring, because "It is
+// no longer true that SQLite must be on local storage." contains the rule it
+// reverses.
 func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 	t.Parallel()
 
@@ -54,7 +57,7 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 
 	dropped := readDropped(t)
 
-	var haystack strings.Builder
+	said := map[string]bool{}
 
 	for _, path := range skillMarkdown(t, root) {
 		raw, err := os.ReadFile(path)
@@ -62,13 +65,11 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 			t.Fatalf("read %s: %v", path, err)
 		}
 
-		for line := range strings.SplitSeq(string(raw), "\n") {
-			haystack.WriteString(normaliseSkillText(line))
-			haystack.WriteByte('\n')
+		for _, unit := range skillUnits(string(raw)) {
+			said[unit] = true
 		}
 	}
 
-	text := haystack.String()
 	known := make(map[string]bool, len(corpus))
 
 	for _, unit := range corpus {
@@ -76,7 +77,7 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 		known[hash] = true
 
 		_, droppedOnPurpose := dropped[hash]
-		kept := strings.Contains(text, unit)
+		kept := said[unit]
 
 		switch {
 		case kept && droppedOnPurpose:
@@ -185,41 +186,41 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("units = %q, want %q", got, want)
 	}
-}
 
-// TestWriteSkillCorpus freezes the corpus. It writes only when asked.
-func TestWriteSkillCorpus(t *testing.T) {
-	if os.Getenv(writeSkillCorpusEnv) != "1" {
-		t.Skipf("set %s=1 to regenerate %s from the skills as they are now", writeSkillCorpusEnv, skillCorpusPath)
+	// A sentence that contains a rule while reversing it does not keep the rule.
+	reversed := skillUnits("It is no longer true that SQLite must be on local storage.\n")
+	if slices.Contains(reversed, "SQLite must be on local storage.") {
+		t.Error("a sentence reversing a rule was counted as saying it")
 	}
 
-	root := repositoryRoot(t)
-	seen := map[string]bool{}
-
-	var units []string
-
-	for _, path := range skillMarkdown(t, root) {
-		if filepath.Base(path) != "SKILL.md" {
-			continue
-		}
-
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
-		}
-
-		for _, unit := range skillUnits(string(raw)) {
-			if !seen[unit] {
-				seen[unit] = true
-				units = append(units, unit)
-			}
-		}
+	// One strict YAML document, and nothing hidden after it.
+	if _, err := parseFrontmatter("---\nname: x\ndescription: y\n...\n--- # second\nother: [\n---\nbody\n"); err == nil {
+		t.Error("a second YAML document after the frontmatter was accepted")
 	}
 
-	slices.Sort(units)
+	if _, err := parseFrontmatter("---\nname: x\ndescription: y\n---\nbody\n"); err != nil {
+		t.Errorf("one plain document was refused: %v", err)
+	}
 
-	if err := os.WriteFile(skillCorpusPath, []byte(strings.Join(units, "\n")+"\n"), 0o644); err != nil {
-		t.Fatalf("write %s: %v", skillCorpusPath, err)
+	// A link is judged by where it resolves, and a mention is not a link.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "references"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "references", "leases.md"), []byte("x.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for skill, want := range map[string]int{
+		"See [leases](references/leases.md).":                                                      0,
+		"See [leases](../other/references/leases.md).":                                             2, // missing, and the real file unlinked
+		"See references/leases.md, which nothing links.":                                           1,
+		"See [leases](references/leases.md#section) and [x](https://example.com/references/y.md).": 0,
+	} {
+		if got := referenceProblems(dir, skill); len(got) != want {
+			t.Errorf("%q: %d problems %q, want %d", skill, len(got), got, want)
+		}
 	}
 }
 
@@ -300,11 +301,11 @@ func skillUnits(text string) []string {
 }
 
 var (
-	listMarker    = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
-	referenceLink = regexp.MustCompile(`references/([A-Za-z0-9._-]+\.md)`)
-	notProse      = regexp.MustCompile(`^(?:[-*+]\s|\d+\.\s|#|\||>)`)
-	tableRule     = regexp.MustCompile(`^\|?\s*:?-{3,}`)
-	spaces        = regexp.MustCompile(`\s+`)
+	listMarker   = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
+	markdownLink = regexp.MustCompile(`\]\(([^)\s#]+)(?:#[^)]*)?\)`)
+	notProse     = regexp.MustCompile(`^(?:[-*+]\s|\d+\.\s|#|\||>)`)
+	tableRule    = regexp.MustCompile(`^\|?\s*:?-{3,}`)
+	spaces       = regexp.MustCompile(`\s+`)
 )
 
 // normaliseSkillText removes what a restructure changes without changing what a
@@ -421,29 +422,46 @@ type skillFrontmatter struct {
 	Description string `yaml:"description"`
 }
 
-func checkFrontmatter(t *testing.T, name string, raw []byte) {
-	t.Helper()
+// parseFrontmatter reads a SKILL.md's frontmatter as exactly one strict YAML
+// document: known fields only, and nothing after it, because a second document
+// is input the first decode never looked at.
+func parseFrontmatter(text string) (skillFrontmatter, error) {
+	var fm skillFrontmatter
 
-	text := string(raw)
 	if !strings.HasPrefix(text, "---\n") {
-		t.Errorf("skill %s: SKILL.md does not open with frontmatter", name)
-
-		return
+		return fm, errors.New("SKILL.md does not open with frontmatter")
 	}
 
 	frontmatter, _, closed := strings.Cut(text[len("---\n"):], "\n---\n")
 	if !closed {
-		t.Errorf("skill %s: the frontmatter is never closed", name)
-
-		return
+		return fm, errors.New("the frontmatter is never closed")
 	}
 
 	decoder := yaml.NewDecoder(strings.NewReader(frontmatter))
 	decoder.KnownFields(true)
 
-	var fm skillFrontmatter
 	if err := decoder.Decode(&fm); err != nil {
-		t.Errorf("skill %s: the frontmatter is not strict YAML, which Codex refuses: %v", name, err)
+		return fm, fmt.Errorf("the frontmatter is not strict YAML, which Codex refuses: %w", err)
+	}
+
+	var extra any
+
+	switch err := decoder.Decode(&extra); {
+	case err == nil:
+		return fm, errors.New("the frontmatter holds a second YAML document")
+	case !errors.Is(err, io.EOF):
+		return fm, fmt.Errorf("the frontmatter continues past its first YAML document: %w", err)
+	}
+
+	return fm, nil
+}
+
+func checkFrontmatter(t *testing.T, name string, raw []byte) {
+	t.Helper()
+
+	fm, err := parseFrontmatter(string(raw))
+	if err != nil {
+		t.Errorf("skill %s: %v", name, err)
 
 		return
 	}
@@ -482,29 +500,51 @@ func checkAgentsLink(t *testing.T, root, name string) {
 func checkReferencesAreLinked(t *testing.T, dir, name, skill string) {
 	t.Helper()
 
-	for _, m := range referenceLink.FindAllStringSubmatch(skill, -1) {
-		if _, err := os.Stat(filepath.Join(dir, "references", m[1])); err != nil {
-			t.Errorf("skill %s: SKILL.md links references/%s, which cannot be read: %v", name, m[1], err)
+	for _, problem := range referenceProblems(dir, skill) {
+		t.Errorf("skill %s: %s", name, problem)
+	}
+}
+
+// referenceProblems compares a SKILL.md's Markdown links, resolved against its
+// directory, with the files in its references/ directory: every relative link
+// must name a file that exists, and every reference file must be the
+// destination of a link, not merely a name the text mentions.
+func referenceProblems(dir, skill string) []string {
+	var problems []string
+
+	linked := map[string]bool{}
+
+	for _, m := range markdownLink.FindAllStringSubmatch(skill, -1) {
+		dest := m[1]
+		if strings.Contains(dest, "://") || strings.HasPrefix(dest, "mailto:") {
+			continue
+		}
+
+		resolved := filepath.Clean(filepath.Join(dir, dest))
+		linked[resolved] = true
+
+		if _, err := os.Stat(resolved); err != nil {
+			problems = append(problems, fmt.Sprintf("SKILL.md links %s, which cannot be read: %v", dest, err))
 		}
 	}
 
 	refs, err := os.ReadDir(filepath.Join(dir, "references"))
 	if os.IsNotExist(err) {
-		return
+		return problems
 	}
 
 	if err != nil {
-		t.Errorf("skill %s: read references: %v", name, err)
-
-		return
+		return append(problems, fmt.Sprintf("read references: %v", err))
 	}
 
 	for _, ref := range refs {
-		if !strings.Contains(skill, "references/"+ref.Name()) {
-			t.Errorf("skill %s: references/%s is linked from nowhere in SKILL.md, so no session loads it", name,
-				ref.Name())
+		if !linked[filepath.Join(dir, "references", ref.Name())] {
+			problems = append(problems, fmt.Sprintf("references/%s is the destination of no link in SKILL.md, "+
+				"so no session loads it", ref.Name()))
 		}
 	}
+
+	return problems
 }
 
 func readCorpus(t *testing.T) []string {
