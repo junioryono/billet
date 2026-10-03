@@ -78,6 +78,8 @@ type Client struct {
 	// halfRemovedBudget reached, so the next pass begins after it. Under
 	// halfRemovedMu.
 	halfRemovedResume string
+	// purgeWorkers is how many trash deletions PurgeTrash runs at once.
+	purgeWorkers int
 	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
 	clock func() time.Time
 
@@ -129,12 +131,21 @@ func withObservation(d time.Duration) Option {
 // withRunner replaces process execution. Unexported because its parameter is:
 // an exported option nothing outside this package can construct is a worse API
 // than one that is honestly package-private.
+// A fake runner is serial: it purges the trash with one worker, because the
+// fakes and the closures tests wrap them in are not safe for concurrent calls.
+// withPurgeWorkers, given after it, says otherwise for a runner that is.
 func withRunner(r runner) Option {
 	return func(c *Client) {
 		if r != nil {
 			c.run = r
+			c.purgeWorkers = 1
 		}
 	}
+}
+
+// withPurgeWorkers sets how many trash deletions run at once; only a test sets it.
+func withPurgeWorkers(n int) Option {
+	return func(c *Client) { c.purgeWorkers = n }
 }
 
 // WithCacheSessions gives Evict a reader of the node's cache sessions, asked once
@@ -188,7 +199,8 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
 	}
 
-	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem}
+	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
+		purgeWorkers: trashPurgeWorkers}
 	for _, opt := range opts {
 		opt(c)
 	}
