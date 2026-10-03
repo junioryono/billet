@@ -60,6 +60,45 @@ func TestEscrowLeavingKeepsRoomForTheWaitersAhead(t *testing.T) {
 	}
 }
 
+// A PURCHASE THAT MOVES ANOTHER TIER'S FLOOR ONTO THE WAITER'S HOST IS REFUSED.
+// Charged against the waiter's fleet as first measured, the buyer's lease looked
+// harmless; but the waiter's own escrow re-places the floor, and with host a at
+// 14 and host b at 12 both fit it once, so the tie-break by name puts it on a and
+// leaves the waiter, pinned to a, 6 vCPU for an 8 vCPU lease.
+func TestEscrowLeavingSeesAFloorItWouldMove(t *testing.T) {
+	t.Parallel()
+
+	floor := tier("floor", 8, 8*config.GiB)
+	floor.Reserved = 1
+	waiter := tier("waiter", 8, 8*config.GiB)
+	waiter.Node = "a"
+	buyer := tier("buyer", 2, 2*config.GiB)
+	buyer.Node = "a"
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 28, MaxMemory: 256 * config.GiB},
+		[]config.Tier{floor, waiter, buyer})
+
+	for name, vcpu := range map[string]int{"a": 16, "b": 12} {
+		reg := testRegistration(name, config.ProviderFirecracker)
+		reg.VCPU, reg.Memory = vcpu, 128*config.GiB
+		mustRegister(t, a, reg)
+	}
+
+	got, err := a.EscrowLeaving(t.Context(), "buyer", 1, []string{"waiter"})
+	if err != nil {
+		t.Fatalf("EscrowLeaving: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("bought %d ahead of the waiter, though doing so moves the floor onto its only host", len(got))
+	}
+
+	// THE WAITER'S OWN ESCROW STILL GETS ITS LEASE, which is what was protected.
+	leases, err := a.Escrow(t.Context(), "waiter", 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("the waiter bought %d (%v), want its one lease", len(leases), err)
+	}
+}
+
 // AND WITH NOTHING TO PROTECT IT IS ESCROW.
 func TestEscrowLeavingWithNoWaitersIsEscrow(t *testing.T) {
 	t.Parallel()
