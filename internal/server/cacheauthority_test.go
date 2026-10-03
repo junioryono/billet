@@ -129,7 +129,10 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 				return run
 			}(), dflt: "main",
 		},
-		"a local reusable workflow at the run's own commit is the run's own ref": {
+		// #318. A push to main calling a local workflow and a tag named main at the
+		// same commit calling the workflow pinned to refs/heads/main present the
+		// same evidence: the callee's ref and the run's commit. Neither may write.
+		"a reusable workflow at the run's own commit reads its ref and writes nothing": {
 			binding: func() alloc.PoolRunner {
 				b := authorityBinding("push", "refs/heads/main")
 				b.Identity.WorkflowRef = "acme/api/.github/workflows/build.yml@refs/heads/main"
@@ -142,7 +145,53 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 				return run
 			}(), dflt: "main",
 			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
-				Proven: true, WriteOwnRef: true, PublishDefault: true},
+				Proven: true},
+		},
+		"a tag named main calling a workflow pinned to main at the same commit writes nothing": {
+			binding: func() alloc.PoolRunner {
+				b := authorityBinding("push", "refs/heads/main")
+				b.Identity.WorkflowRef = "acme/api/.github/workflows/build.yml@refs/heads/main"
+				return b
+			}(),
+			// GitHub names a tag push's head branch by the tag's short name.
+			run: func() WorkflowRun {
+				run := authorityRun("push", "main")
+				run.Path = ".github/workflows/release.yml"
+				run.ReferencedWorkflows = []ReferencedWorkflow{
+					{Path: "acme/api/.github/workflows/build.yml@refs/heads/main", SHA: "abc"}}
+				return run
+			}(), dflt: "main",
+			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+				Proven: true},
+		},
+		// A self-call GitHub records under a short ref does not match the job's
+		// full ref as a string, and must still not read as the top-level workflow.
+		"a workflow that also calls itself under another spelling of the ref writes nothing": {
+			binding: authorityBinding("push", "refs/heads/main"),
+			run: func() WorkflowRun {
+				run := authorityRun("push", "main")
+				// At another commit, so the commit check cannot be what refuses it.
+				run.ReferencedWorkflows = []ReferencedWorkflow{
+					{Path: "ACME/api/.github/workflows/ci.yml@main", SHA: "other-sha"}}
+				return run
+			}(), dflt: "main",
+			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+				Proven: true},
+		},
+		"a reusable workflow on a feature branch at the run's commit writes nothing either": {
+			binding: func() alloc.PoolRunner {
+				b := authorityBinding("push", "refs/heads/feature")
+				b.Identity.WorkflowRef = "acme/api/.github/workflows/build.yml@refs/heads/feature"
+				return b
+			}(),
+			run: func() WorkflowRun {
+				run := authorityRun("push", "feature")
+				run.ReferencedWorkflows = []ReferencedWorkflow{
+					{Path: "acme/api/.github/workflows/build.yml@refs/heads/feature", SHA: "abc"}}
+				return run
+			}(), dflt: "main",
+			want: CacheAuthority{Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
+				Proven: true},
 		},
 		"a cross-repository workflow is never the job's ref": {
 			binding: func() alloc.PoolRunner {
