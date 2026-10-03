@@ -43,9 +43,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/sync/semaphore"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
@@ -112,6 +115,14 @@ type Provider struct {
 	owner string
 	cfg   config.FirecrackerConfig
 	disk  RootDisk
+
+	// lifecycleGate stands in front of the host-wide flock inside this process: a
+	// launch or teardown takes one unit and List takes all of them. Its waiters are
+	// served in order, so a waiting List stops new launches, which flock alone does
+	// not, and a stream of overlapping launches cannot keep List, and the inventory
+	// behind it, out. Built on first use; see gate.
+	lifecycleOnce sync.Once
+	lifecycleGate *semaphore.Weighted
 
 	// execPath and execName are the firecracker binary with its symlinks already
 	// followed, and the directory name the jailer derives from it.
@@ -441,11 +452,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// are what decide how many it can start a minute.
 	started := time.Now()
 
-	lifecycleLock, err := p.lockLifecycle(ctx)
+	unlockLease, err := p.lockLease(ctx, spec.Name)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = lifecycleLock.Close() }()
+	defer unlockLease()
 
 	lockWait := time.Since(started)
 
@@ -1255,11 +1266,11 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 			"started", bounded(id))
 	}
 
-	lifecycleLock, err := p.lockLifecycle(ctx)
+	unlockLease, err := p.lockLease(ctx, id)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lifecycleLock.Close() }()
+	defer unlockLease()
 
 	j, found, err := p.findJail(id)
 	if err != nil {
@@ -1751,11 +1762,11 @@ func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, erro
 // has never launched anything has no such directory, and refusing there would make
 // the first sweep on a fresh host a failure.
 func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
-	lifecycleLock, err := p.lockLifecycle(ctx)
+	unlockLifecycle, err := p.lockLifecycle(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = lifecycleLock.Close() }()
+	defer unlockLifecycle()
 
 	dirs, err := p.execDirs()
 	if err != nil {

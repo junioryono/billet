@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/provider"
 )
 
 func TestClaimMakesTheDeploymentMarkerDurableBeforeReturning(t *testing.T) {
@@ -409,21 +412,127 @@ func TestLifecycleLockWaitHonorsCancellation(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
-	first, err := h.p.lockLifecycle(t.Context())
+	unlock, err := h.p.lockLifecycle(t.Context())
 	if err != nil {
 		t.Fatalf("take the first lifecycle lock: %v", err)
 	}
-	defer func() { _ = first.Close() }()
+	defer unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
 	if second, err := h.p.lockLifecycle(ctx); err == nil {
-		_ = second.Close()
+		second()
 		t.Fatal("a lifecycle lock waiter ignored its canceled context")
 	} else if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("lifecycle lock wait error = %v, want context deadline", err)
 	}
+
+	if second, err := h.p.lockLease(ctx, theInstance); err == nil {
+		second()
+		t.Fatal("a lease lock waiter ignored its canceled context while List held the host")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lease lock wait error = %v, want context deadline", err)
+	}
+}
+
+// LEASES LAUNCH AT ONCE, ONE LEASE AT A TIME, AND A WAITING LIST STOPS NEW ONES.
+// A node that launched one microVM at a time started one runner every 30 to 65
+// seconds while 230 jobs waited (2026-10-03).
+func TestLeaseLocksAdmitOtherLeasesAndYieldToAWaitingList(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	short := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(t.Context(), 50*time.Millisecond)
+	}
+
+	first, err := h.p.lockLease(t.Context(), theInstance)
+	if err != nil {
+		t.Fatalf("lock the first lease: %v", err)
+	}
+
+	// ANOTHER LEASE PROCEEDS. Find two names on different stripes, so the
+	// assertion is about the host lock rather than a stripe collision.
+	other := otherLeaseOnAnotherStripe(t, theInstance)
+	ctx, cancel := short()
+	second, err := h.p.lockLease(ctx, other)
+	cancel()
+	if err != nil {
+		first()
+		t.Fatalf("a different lease waited for the first one's launch: %v", err)
+	}
+	second()
+
+	// THE SAME LEASE WAITS.
+	ctx, cancel = short()
+	if again, err := h.p.lockLease(ctx, theInstance); err == nil {
+		again()
+		first()
+		t.Fatal("two operations held one lease at once")
+	}
+	cancel()
+
+	// A LIST WAITS FOR THE LEASE, AND WHILE IT WAITS NO NEW LEASE STARTS.
+	listed := make(chan func(), 1)
+	go func() {
+		unlock, err := h.p.lockLifecycle(t.Context())
+		if err != nil {
+			listed <- nil
+
+			return
+		}
+		listed <- unlock
+	}()
+
+	select {
+	case unlock := <-listed:
+		if unlock != nil {
+			unlock()
+		}
+		first()
+		t.Fatal("List took the host while a lease was being launched")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ctx, cancel = short()
+	if late, err := h.p.lockLease(ctx, other); err == nil {
+		late()
+		first()
+		t.Fatal("a new lease started while List was waiting, so a stream of launches would starve it")
+	}
+	cancel()
+
+	first()
+
+	unlock := <-listed
+	if unlock == nil {
+		t.Fatal("List never took the host after the lease was released")
+	}
+	unlock()
+}
+
+// otherLeaseOnAnotherStripe is a lease name whose lock stripe differs from id's.
+func otherLeaseOnAnotherStripe(t *testing.T, id string) string {
+	t.Helper()
+
+	stripe := func(name string) uint32 {
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(name))
+
+		return hash.Sum32() % leaseLockStripes
+	}
+
+	for i := range 1000 {
+		candidate := provider.InstanceName(fmt.Sprintf("%032x", i+1))
+		if stripe(candidate) != stripe(id) {
+			return candidate
+		}
+	}
+
+	t.Fatal("no lease name on another stripe")
+
+	return ""
 }
 
 func TestLifecycleLockRefusesAnAlreadyCanceledContext(t *testing.T) {
@@ -435,7 +544,7 @@ func TestLifecycleLockRefusesAnAlreadyCanceledContext(t *testing.T) {
 
 	lock, err := h.p.lockLifecycle(ctx)
 	if err == nil {
-		_ = lock.Close()
+		lock()
 		t.Fatal("the lifecycle lock admitted an already-canceled operation")
 	}
 	if lock != nil {
