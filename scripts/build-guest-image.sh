@@ -940,9 +940,11 @@ done
 # ONE BUDGET FOR THE AGENT, NOT ONE PER KEY. A read that spends it leaves
 # fetch_gave_up behind, and every later read is asked once until the service answers
 # again; otherwise each of the half-dozen keys read after it would wait its own five
-# minutes on a service that is gone. It is a file because fetch runs in a subshell.
+# minutes on a service that is gone. It is a file because fetch runs in a subshell,
+# and it is removed here because a restarted agent is owed a whole budget again.
 fetch_within=300
 fetch_gave_up=/run/billet-metadata-unanswered
+rm -f "$fetch_gave_up"
 
 # BILLET_AGENT_FETCH_BEGIN
 fetch() {

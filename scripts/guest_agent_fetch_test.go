@@ -1,12 +1,14 @@
 package scripts_test
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // THE AGENT'S METADATA READ IS RUN HERE against a curl that answers from a script.
@@ -31,6 +33,10 @@ func TestTheAgentAsksAgainOnlyWhenTheMetadataServiceDidNotAnswer(t *testing.T) {
 		wantRead   int
 		wantValue  string
 		wantCalls  int
+		// maxCalls bounds the attempts within the budget: one a second, so a
+		// read that ignored fetch_within would exceed it. Slow scheduling only
+		// lowers the count, so the bound cannot flake.
+		maxCalls   int
 		wantGaveUp bool
 		wantLog    string
 	}{
@@ -62,7 +68,7 @@ func TestTheAgentAsksAgainOnlyWhenTheMetadataServiceDidNotAnswer(t *testing.T) {
 		{
 			name:    "a service that never answers is reported as unreadable, not absent",
 			answers: nil,
-			within:  1, wantRead: 1, wantGaveUp: true, wantLog: "could not read contract",
+			within:  2, wantRead: 1, wantGaveUp: true, maxCalls: 4, wantLog: "could not read contract",
 		},
 		{
 			name:    "after one read spent the budget the next is asked once",
@@ -99,23 +105,23 @@ func TestTheAgentAsksAgainOnlyWhenTheMetadataServiceDidNotAnswer(t *testing.T) {
 			if err := os.Mkdir(bin, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			// The fake refuses the arguments that would break the classification:
-			// -f hides the code of an HTTP error and the write-out is where the code
-			// is read from. Like curl, it writes the write-out whatever happened.
+			// The fake refuses the arguments the read depends on being absent or
+			// wrong: the write-out is where the code is read from, and without the
+			// two timeouts a stalled transfer would never reach the budget check.
+			// Like curl, it writes the write-out whatever happened.
 			curl := `#!/bin/bash
 printf '%s\n' "$*" >>"$CALLS"
-writeout=""
+writeout="" maxtime="" connect="" prev=""
 for arg in "$@"; do
-	case $arg in
-	-f | -sf | -fs | --fail) echo "fake curl: $arg would hide the HTTP code" >&2; exit 99 ;;
+	case $prev in
+	-w) writeout=$arg ;;
+	--max-time) maxtime=$arg ;;
+	--connect-timeout) connect=$arg ;;
 	esac
-	if [ "$prev" = -w ]; then
-		writeout=$arg
-	fi
 	prev=$arg
 done
-if [ "$writeout" != '\n%{http_code}' ]; then
-	echo "fake curl: write-out is [$writeout]" >&2
+if [ "$writeout" != '\n%{http_code}' ] || [ "$maxtime" != 5 ] || [ "$connect" != 2 ]; then
+	echo "fake curl: write-out [$writeout], max-time [$maxtime], connect-timeout [$connect]" >&2
 	exit 99
 fi
 n=$(($(wc -l <"$CALLS")))
@@ -148,7 +154,10 @@ exit "$status"
 				`printf 'read=%s\n' "$read"`,
 				`printf 'value=%s<end>\n' "$value"`,
 			}, "\n")
-			cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
+			// A read that ignored its budget would otherwise hang the suite.
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "bash", "-c", script)
 			cmd.Env = append(os.Environ(),
 				"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 				"CALLS="+calls, "ANSWERS="+answers)
@@ -182,6 +191,10 @@ exit "$status"
 			lines := strings.Split(strings.TrimSpace(string(recorded)), "\n")
 			if tc.wantCalls > 0 && len(lines) != tc.wantCalls {
 				t.Errorf("curl was called %d times, want %d:\n%s", len(lines), tc.wantCalls, recorded)
+			}
+			if tc.maxCalls > 0 && len(lines) > tc.maxCalls {
+				t.Errorf("curl was called %d times in a %d-second budget, more than %d; the read "+
+					"is not honouring fetch_within", len(lines), tc.within, tc.maxCalls)
 			}
 			for _, line := range lines {
 				if !strings.Contains(line, "X-metadata-token: session-token") ||
