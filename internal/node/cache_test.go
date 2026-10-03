@@ -785,6 +785,51 @@ func TestMountedGenerationsStayProtectedFromEviction(t *testing.T) {
 	}
 }
 
+// A LEASE IS RENEWED ONLY WHEN IT IS DUE. Each renewal takes the site's one cache
+// index lock, and renewing every volume seven hours ahead on every five-minute
+// pass was lock traffic a guest's Docker image store queued behind (#320).
+func TestAnActiveLeaseIsRenewedOnlyWhenItIsDue(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	storage.current = "baseline"
+
+	now := time.Now()
+	service.now = func() time.Time { return now }
+
+	if attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	}); attached.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+	}
+
+	// The clone's lease has an hour left, so the first pass renews it.
+	if err := service.RenewActive(t.Context(), now.Add(7*time.Hour)); err != nil {
+		t.Fatalf("RenewActive: %v", err)
+	}
+	if storage.renewed != 1 {
+		t.Fatalf("renewals after a due lease = %d, want 1", storage.renewed)
+	}
+
+	// Five minutes later it has nearly seven hours left and is not due.
+	now = now.Add(5 * time.Minute)
+	if err := service.RenewActive(t.Context(), now.Add(7*time.Hour)); err != nil {
+		t.Fatalf("RenewActive: %v", err)
+	}
+	if storage.renewed != 1 {
+		t.Fatalf("renewals five minutes later = %d, want still 1", storage.renewed)
+	}
+
+	// Once less than cacheRenewWithin is left, it is renewed again.
+	now = now.Add(7*time.Hour - cacheRenewWithin)
+	if err := service.RenewActive(t.Context(), now.Add(7*time.Hour)); err != nil {
+		t.Fatalf("RenewActive: %v", err)
+	}
+	if storage.renewed != 2 {
+		t.Fatalf("renewals once due again = %d, want 2", storage.renewed)
+	}
+}
+
 // THE GUEST IS TOLD WHICH BUILD CACHES ITS TIER ENABLES, and only with a cache
 // session to serve them.
 func TestRunnerTellsTheGuestWhichBuildCachesItsTierEnables(t *testing.T) {

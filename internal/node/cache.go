@@ -32,6 +32,11 @@ const (
 	cacheHandlerLimit  = 12*time.Minute + 45*time.Second
 	cacheCleanupMargin = 30 * time.Second
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
+	// cacheRenewWithin is how much life an active cache lease may have left before
+	// the node renews it. The node renews leases seven hours ahead every five
+	// minutes, so this renews each about once an hour and leaves six hours of
+	// margin against eviction.
+	cacheRenewWithin = 6 * time.Hour
 	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store, well
 	// inside the five-minute metadata token the guest agent fetched at boot.
 	dockerStoreAttachLimit = 3 * time.Minute
@@ -854,6 +859,27 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 
 			continue
 		}
+
+		renewed := false
+		// ONLY A LEASE THAT IS DUE. Each renewal takes the site's one cache index
+		// lock, and renewing every volume to seven hours ahead every five minutes
+		// was a lock acquisition per volume per pass that a guest's Docker image
+		// store queued behind (#320); a lease is renewed once it has less than
+		// cacheRenewWithin left, about once an hour. One whose expiry the node never
+		// recorded is due.
+		renew := func(volume *storecontract.Volume, what string) {
+			if !volume.Lease.Expires.IsZero() && volume.Lease.Expires.Sub(s.now()) > cacheRenewWithin {
+				return
+			}
+			if err := s.store.RenewActive(ctx, *volume, until); err != nil {
+				failures = append(failures, fmt.Errorf("%s %s: %w", session.instance, what, err))
+
+				return
+			}
+			volume.Lease.Expires = until
+			renewed = true
+		}
+
 		// A CLOSED SESSION'S PENDING PUBLICATIONS ARE RENEWED TOO, so the parent
 		// generation of a clone waiting to be published cannot be evicted under it.
 		for slot, attachment := range session.slots {
@@ -861,27 +887,30 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 				(session.closed && !pendingPublication(attachment)) {
 				continue
 			}
-			if err := s.store.RenewActive(ctx, attachment.Volume, until); err != nil {
-				failures = append(failures, fmt.Errorf("%s slot %d: %w", session.instance, slot, err))
-			}
+			renew(&attachment.Volume, fmt.Sprintf("slot %d", slot))
 		}
 		for kind, hv := range session.hosts {
 			if hv.Volume.Lease.ID == "" || (session.closed && hv.Intent == nil) {
 				continue
 			}
-			if err := s.store.RenewActive(ctx, hv.Volume, until); err != nil {
-				failures = append(failures, fmt.Errorf("%s %s cache: %w", session.instance, kind, err))
-			}
+			renew(&hv.Volume, fmt.Sprintf("%s cache", kind))
 		}
 		if !session.closed {
 			for id, archive := range session.actions {
 				if archive.Volume.Lease.ID == "" {
 					continue
 				}
-				if err := s.store.RenewActive(ctx, archive.Volume, until); err != nil {
-					failures = append(failures, fmt.Errorf("%s Actions cache %s: %w",
-						session.instance, id, err))
-				}
+				renew(&archive.Volume, "Actions cache "+id)
+			}
+		}
+
+		// THE NEW EXPIRY IS DURABLE, so a restart does not renew everything again
+		// at once; one that cannot be written leaves the old expiry, which only
+		// renews sooner.
+		if renewed {
+			if err := s.persistSession(session); err != nil {
+				failures = append(failures, fmt.Errorf("%s: record renewed cache leases: %w",
+					session.instance, err))
 			}
 		}
 		session.mu.Unlock()
