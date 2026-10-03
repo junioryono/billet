@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -1187,6 +1188,13 @@ const (
 	halfRemovedRecheck = cacheCompactionLimit + 5*time.Minute
 )
 
+// trashPurgeWorkers is how many trash deletions one purge pass runs at once. A
+// deletion of a disk a job wrote to removes every object it wrote and took up to
+// half a minute, and on the reference deployment on 2026-10-03, after #329 let
+// the trash be purged every pass, one-at-a-time deletion ran at about the rate
+// jobs discard, ten a minute, and a backlog of 950 did not shrink.
+const trashPurgeWorkers = 4
+
 // halfRemovedBudget bounds how long one purge pass spends finishing half-removed
 // images, after which the pass ends and the next resumes where it stopped. The
 // trash goes first in every pass, and each finish takes tens of seconds: on the
@@ -1226,18 +1234,17 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 		return 0, []error{fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)}
 	}
 
-	purged := 0
+	type deletion struct{ name, handle string }
 
-	var failures []error
+	var (
+		deletions []deletion
+		failures  []error
+	)
 
 	for _, image := range images {
 		if kind, _, ok := cacheImageName(image.Name); !strings.HasPrefix(image.Name, "billet-") &&
 			(!ok || kind != "v") {
 			continue
-		}
-
-		if err := ctx.Err(); err != nil {
-			return purged, append(failures, err)
 		}
 
 		if image.ID == "" || strings.ContainsAny(image.ID, "/@") ||
@@ -1248,19 +1255,51 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 			continue
 		}
 
-		handle := c.cfg.CachePool + "/" + image.ID
+		deletions = append(deletions, deletion{name: image.Name, handle: c.cfg.CachePool + "/" + image.ID})
+	}
 
-		if err := c.rbdCmdWithin(ctx, PurgeTimeout, "trash", "rm", handle); err != nil &&
-			!isNoSuchFile(err) {
-			if !isImageNotEmpty(err) {
-				failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
-					image.Name, handle, err))
+	// SEVERAL AT ONCE, each under its own PurgeTimeout: the deletions are of
+	// different images and independent, and one at a time could not keep up with
+	// a busy node's discards (trashPurgeWorkers).
+	var (
+		mu     sync.Mutex
+		purged int
+		wg     sync.WaitGroup
+	)
+
+	next := make(chan deletion)
+
+	for range min(max(c.purgeWorkers, 1), len(deletions)) {
+		wg.Go(func() {
+			for d := range next {
+				err := c.rbdCmdWithin(ctx, PurgeTimeout, "trash", "rm", d.handle)
+
+				mu.Lock()
+				switch {
+				case err == nil || isNoSuchFile(err):
+					purged++
+				case !isImageNotEmpty(err):
+					failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
+						d.name, d.handle, err))
+				}
+				mu.Unlock()
 			}
+		})
+	}
 
-			continue
+	for _, d := range deletions {
+		if ctx.Err() != nil {
+			break
 		}
 
-		purged++
+		next <- d
+	}
+
+	close(next)
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		failures = append(failures, err)
 	}
 
 	return purged, failures
