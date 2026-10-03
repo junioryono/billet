@@ -95,10 +95,10 @@ func TestCheckCannotTellThroughAnUnreadableConfiguration(t *testing.T) {
 	t.Parallel()
 
 	root := needrestartTree(t, map[string]string{"etc/needrestart/needrestart.conf": "\n"})
-	if err := os.Mkdir(filepath.Join(root, "etc/needrestart/conf.d"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "etc", "needrestart", "conf.d"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "etc/needrestart/conf.d/90-billet.conf"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "etc", "needrestart", "conf.d", "90-billet.conf"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,7 +118,7 @@ func TestCheckReadsADanglingConfigurationLinkAsCouldNotTell(t *testing.T) {
 		"the main file": "etc/needrestart/needrestart.conf",
 	} {
 		root := needrestartTree(t, map[string]string{"usr/sbin/needrestart": "#!/bin/sh\n"})
-		if err := os.MkdirAll(filepath.Join(root, "etc/needrestart/conf.d"), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, "etc", "needrestart", "conf.d"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(filepath.Join(root, "nowhere"), filepath.Join(root, path)); err != nil {
@@ -132,11 +132,11 @@ func TestCheckReadsADanglingConfigurationLinkAsCouldNotTell(t *testing.T) {
 	}
 
 	root := needrestartTree(t, map[string]string{"elsewhere/billet.conf": deploy.NeedrestartDropIn})
-	link := filepath.Join(root, "etc/needrestart/conf.d/90-billet.conf")
+	link := filepath.Join(root, "etc", "needrestart", "conf.d", "90-billet.conf")
 	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(root, "elsewhere/billet.conf"), link); err != nil {
+	if err := os.Symlink(filepath.Join(root, "elsewhere", "billet.conf"), link); err != nil {
 		t.Fatal(err)
 	}
 

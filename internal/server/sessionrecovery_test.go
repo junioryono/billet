@@ -33,7 +33,8 @@ func (h *capturingHandler) errorsFor(tier string) int {
 
 	n := 0
 
-	for _, r := range *h.records {
+	for i := range *h.records {
+		r := &(*h.records)[i]
 		if r.Level != slog.LevelError {
 			continue
 		}

@@ -44,8 +44,6 @@ func reportNeedrestart(w io.Writer, root string) {
 		return
 	}
 
-	files := []string{filepath.Join(confDir, "needrestart.conf")}
-
 	entries, err := os.ReadDir(filepath.Join(confDir, "conf.d"))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		_, _ = fmt.Fprintf(w, "restarts could not tell whether needrestart excludes billet's services: %v\n", err)
@@ -62,6 +60,9 @@ func reportNeedrestart(w io.Writer, root string) {
 		dropIns = append(dropIns, filepath.Join(confDir, "conf.d", entry.Name()))
 	}
 	sort.Strings(dropIns)
+
+	files := make([]string, 0, 1+len(dropIns))
+	files = append(files, filepath.Join(confDir, "needrestart.conf"))
 	files = append(files, dropIns...)
 
 	var unreadable []error
@@ -75,8 +76,7 @@ func reportNeedrestart(w io.Writer, root string) {
 			}
 		}
 
-		switch {
-		case err != nil:
+		if err != nil {
 			unreadable = append(unreadable, err)
 
 			continue
