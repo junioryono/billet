@@ -4125,8 +4125,8 @@ func (l *Listener) launchPool(ctx context.Context, batch []poolLaunch) error {
 	errs := make([]error, len(batch))
 
 	var wg sync.WaitGroup
-	for i, member := range batch {
-		wg.Go(func() { errs[i] = l.launch(ctx, member.lease, member.job) })
+	for i := range batch {
+		wg.Go(func() { errs[i] = l.launch(ctx, batch[i].lease, batch[i].job) })
 	}
 	wg.Wait()
 

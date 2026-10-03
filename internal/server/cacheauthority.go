@@ -178,7 +178,7 @@ func DecideCacheAuthority(
 // branch event the ref must also name the run's head branch.
 func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 	defaultBranch string,
-) (ref string, own, ok bool) {
+) (string, bool, bool) {
 	workflow, ref, ok := strings.Cut(identity.WorkflowRef, "@")
 	if !ok || ref == "" || strings.Contains(ref, "@") {
 		return "", false, false
