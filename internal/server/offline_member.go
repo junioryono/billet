@@ -16,12 +16,17 @@ type RunnerState struct {
 	Online bool
 	// Busy is whether GitHub says the runner is executing a job.
 	Busy bool
+	// ID is the id GitHub holds for the name, set whenever Present is.
+	ID int64
 }
 
 // RunnerInspector reads one pool registration's state at GitHub and withdraws
 // it by id. A registry that implements it lets the listener retire a member
 // GitHub can no longer route work to.
 type RunnerInspector interface {
+	// InspectRunner looks the registration up by its exact name. A non-zero
+	// runnerID is what the pool recorded, and a registration holding another id
+	// is an error.
 	InspectRunner(ctx context.Context, runnerName string, runnerID int64) (RunnerState, error)
 	// WithdrawRunner returns nil only when GitHub acknowledged deleting exactly
 	// this id; an absent runner is an error, never a success.
@@ -47,8 +52,11 @@ const (
 type offlineWatch struct {
 	idleSince    map[string]time.Time
 	offlineSince map[string]time.Time
-	inspectedAt  map[string]time.Time
-	lastInspect  time.Time
+	// offlineID is the runner id the first offline answer named; the second must
+	// name the same one.
+	offlineID   map[string]int64
+	inspectedAt map[string]time.Time
+	lastInspect time.Time
 	// withdrawn holds members GitHub has already deleted whose retirement the
 	// ledger has not yet recorded. They are journaled on the next reconcile
 	// without asking GitHub again, whose answer now is only "absent".
@@ -69,6 +77,17 @@ type offlineWatch struct {
 //
 // An online idle member is left alone even here: GitHub may hand it a job at any
 // moment, and its only cost is capacity the aggregate will reclaim once it moves.
+//
+// THE ID IS GITHUB'S, READ BY THE MEMBER'S EXACT NAME. A remote node's JIT mint
+// journals the registration's id, but the listener's own launch path journals a
+// member with a name and no id, and the pool then learns one only from a
+// JobStarted, which the members this exists for never receive. The name is
+// billet-<lease id>, unique to the lease; both offline answers must name the same
+// id, which must equal one the pool journaled, and that id is the one withdrawn
+// and the one the cleanup's removal expects. (On 2026-10-02 four members adopted
+// into a node's custody across a controller restart held its drain for nine
+// hours, because the registry this asserts was an adapter that did not forward
+// the inspector at all, #317.)
 func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.PoolRunner) {
 	inspector, ok := l.registry.(RunnerInspector)
 	if !ok || l.alloc == nil {
@@ -79,6 +98,7 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	if w.idleSince == nil {
 		w.idleSince = map[string]time.Time{}
 		w.offlineSince = map[string]time.Time{}
+		w.offlineID = map[string]int64{}
 		w.inspectedAt = map[string]time.Time{}
 		w.withdrawn = map[string]alloc.PoolRunner{}
 	}
@@ -90,15 +110,16 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 
 	for i := range runners {
 		member := &runners[i]
-		if member.Status != alloc.PoolRunnerIdle || member.ActualRequestID != 0 ||
-			member.RunnerID <= 0 || member.RunnerName == "" {
+		if member.Status != alloc.PoolRunnerIdle || member.ActualRequestID != 0 || member.RunnerName == "" {
 			continue
 		}
 
 		idle[member.LeaseID] = true
 
-		if _, pending := w.withdrawn[member.LeaseID]; pending {
-			l.retireWithdrawn(ctx, *member)
+		// THE CACHED MEMBER, NOT THE ROW: only it carries the id GitHub deleted,
+		// which the cleanup's removal must expect.
+		if withdrawn, pending := w.withdrawn[member.LeaseID]; pending {
+			l.retireWithdrawn(ctx, withdrawn)
 			continue
 		}
 
@@ -121,6 +142,7 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 		if !idle[id] {
 			delete(w.idleSince, id)
 			delete(w.offlineSince, id)
+			delete(w.offlineID, id)
 			delete(w.inspectedAt, id)
 		}
 	}
@@ -138,9 +160,14 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	w.lastInspect = now
 	w.inspectedAt[candidate.LeaseID] = now
 
+	restart := func() {
+		delete(w.offlineSince, candidate.LeaseID)
+		delete(w.offlineID, candidate.LeaseID)
+	}
+
 	state, err := inspector.InspectRunner(ctx, candidate.RunnerName, candidate.RunnerID)
 	if err != nil {
-		delete(w.offlineSince, candidate.LeaseID)
+		restart()
 		l.log.Debug("could not read an idle pool member's runner at GitHub; keeping it",
 			"tier", l.tier, "runner", candidate.RunnerName, "error", err)
 
@@ -148,7 +175,18 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	}
 
 	if !state.Present || state.Online || state.Busy {
-		delete(w.offlineSince, candidate.LeaseID)
+		restart()
+		return
+	}
+
+	// AN OFFLINE ANSWER THAT NAMES NO ID, OR ANOTHER ONE, IS NOT EVIDENCE about
+	// the registration this member launched.
+	if state.ID <= 0 || (candidate.RunnerID > 0 && state.ID != candidate.RunnerID) {
+		restart()
+		l.log.Warn("GitHub's answer for an idle pool member's runner named no id or another one; "+
+			"keeping it", "tier", l.tier, "runner", candidate.RunnerName,
+			"pool_id", candidate.RunnerID, "github_id", state.ID)
+
 		return
 	}
 
@@ -158,8 +196,10 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	answered := l.clock()
 
 	first, seen := w.offlineSince[candidate.LeaseID]
-	if !seen {
+	if !seen || w.offlineID[candidate.LeaseID] != state.ID {
 		w.offlineSince[candidate.LeaseID] = answered
+		w.offlineID[candidate.LeaseID] = state.ID
+
 		return
 	}
 
@@ -180,22 +220,25 @@ func (l *Listener) retireOfflineMembers(ctx context.Context, runners []alloc.Poo
 	// stays kept: later inspections find the runner absent, and absence is not the
 	// acknowledgement this path requires. That member is left for an operator, the
 	// safe direction, as it was before this path existed.
-	if err := inspector.WithdrawRunner(ctx, candidate.RunnerID); err != nil {
-		delete(w.offlineSince, candidate.LeaseID)
+	if err := inspector.WithdrawRunner(ctx, state.ID); err != nil {
+		restart()
 		l.log.Warn("GitHub reported an idle pool member's runner offline but its deletion was "+
 			"refused or not confirmed; keeping it", "tier", l.tier, "runner", candidate.RunnerName,
-			"runner_id", candidate.RunnerID, "error", err)
+			"runner_id", state.ID, "error", err)
 
 		return
 	}
 
 	l.log.Warn("GitHub deleted a pool member's runner after reporting it offline and not busy; "+
 		"it was never given a job, retiring it", "tier", l.tier, "runner", candidate.RunnerName,
-		"idle_since", w.idleSince[candidate.LeaseID], "offline_since", first)
+		"runner_id", state.ID, "idle_since", w.idleSince[candidate.LeaseID], "offline_since", first)
 
 	delete(w.idleSince, candidate.LeaseID)
 	delete(w.offlineSince, candidate.LeaseID)
+	delete(w.offlineID, candidate.LeaseID)
 	delete(w.inspectedAt, candidate.LeaseID)
+
+	candidate.RunnerID = state.ID
 	w.withdrawn[candidate.LeaseID] = *candidate
 
 	l.retireWithdrawn(ctx, *candidate)

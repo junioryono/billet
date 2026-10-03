@@ -11,7 +11,30 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/scaleset"
+	"github.com/junioryono/billet/internal/server"
 )
+
+// The listener finds the offline-member retirement by asserting the registry it
+// is handed, and the registry is the provisioner this assembly builds. Before
+// the adapter forwarded InspectRunner and WithdrawRunner, the assertion failed
+// in every deployment and the retirement never ran (#317).
+func TestTheAssembledProvisionerOffersTheOfflineMemberRetirement(t *testing.T) {
+	t.Parallel()
+
+	servers, _, err := BuildTargets([]Target{{
+		Config: config.GitHubTarget{Name: "default", Org: "acme"},
+		Client: clientFor(t, billetgithub.OrganizationTarget("acme")),
+	}})
+	if err != nil {
+		t.Fatalf("BuildTargets: %v", err)
+	}
+
+	var registry server.RunnerRegistry = servers[0].Provisioner
+	if _, ok := registry.(server.RunnerInspector); !ok {
+		t.Fatalf("the provisioner handed to every listener is %T, which is not a RunnerInspector",
+			servers[0].Provisioner)
+	}
+}
 
 // clientFor builds a real scale-set client for a target, so the assembly's
 // check that a client serves the target its config names is exercised against
