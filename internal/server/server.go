@@ -578,6 +578,19 @@ var sessionRetryFor = 30 * time.Second
 var ErrSessionHeld = errors.New("server: this scale set already has an active message " +
 	"session, held by a control plane that did not close it")
 
+// poolLaunchBatchFor is how many pool members a tier starts at once: as many as a
+// Firecracker node launches together when that is the tier's only backend, and
+// one otherwise, because the other nodes still take one command at a time and a
+// launch queued behind another runs out its command timeout waiting.
+func poolLaunchBatchFor(t *config.Tier) int {
+	providers := t.AcceptableProviders()
+	if len(providers) == 1 && providers[0] == config.ProviderFirecracker {
+		return poolLaunchBatch
+	}
+
+	return 1
+}
+
 // runTier opens a session on the tier's target and runs one listener on it.
 func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, prov Provisioner) error {
 	session, err := s.openSession(ctx, t, set, prov)
@@ -599,7 +612,8 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet, pro
 	opts := append(s.listenerOpts(prov), WithCachePublication(t.EffectiveCache(), evidence),
 		WithSessionReopen(func(ctx context.Context) (Session, error) {
 			return s.openSession(ctx, t, set, prov)
-		}))
+		}),
+		WithPoolLaunchBatch(poolLaunchBatchFor(t)))
 
 	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
 }
