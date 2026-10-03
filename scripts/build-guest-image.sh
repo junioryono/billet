@@ -908,9 +908,14 @@ ip route replace "$MMDS/32" dev eth0 2>/dev/null || true
 # the process was executed. Every branch here is a full if/then/fi for that reason.
 token=""
 
+# THE LONGEST TOKEN THE SERVICE ISSUES (21600 seconds). The agent reads the
+# runner's registration only after the Docker image store is attached, which can
+# take minutes, and a five-minute token expired in that wait on 2026-10-03: every
+# later read failed, the agent exited with "no command in the metadata", and the
+# runner never connected (#320).
 for attempt in $(seq 1 120); do
 	if token=$(curl -sf --connect-timeout 2 --max-time 5 -X PUT "http://$MMDS/latest/api/token" \
-		-H "X-metadata-token-ttl-seconds: 300" 2>/dev/null); then
+		-H "X-metadata-token-ttl-seconds: 21600" 2>/dev/null); then
 		break
 	fi
 

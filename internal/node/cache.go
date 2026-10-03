@@ -32,12 +32,15 @@ const (
 	cacheHandlerLimit  = 12*time.Minute + 45*time.Second
 	cacheCleanupMargin = 30 * time.Second
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
-	cacheWriterTTL     = 15 * time.Minute
-	cacheVolumeLimit   = int64(100 << 30)
-	dockerSettleWait   = 2 * time.Minute
-	dockerStoreKey     = "docker-images/"
-	publicationCAS     = "cas"
-	publicationLWW     = "last-write-wins"
+	// dockerStoreAttachLimit bounds acquiring a guest's Docker image store, well
+	// inside the five-minute metadata token the guest agent fetched at boot.
+	dockerStoreAttachLimit = 3 * time.Minute
+	cacheWriterTTL         = 15 * time.Minute
+	cacheVolumeLimit       = int64(100 << 30)
+	dockerSettleWait       = 2 * time.Minute
+	dockerStoreKey         = "docker-images/"
+	publicationCAS         = "cas"
+	publicationLWW         = "last-write-wins"
 
 	// A last-write-wins writer waiting on a live holder polls on this schedule,
 	// never past the holder's expiry. Measured before it existed: 100ms flat
@@ -1130,10 +1133,21 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
+	// THE ACQUISITION IS BOUNDED BY dockerStoreAttachLimit, not cacheWorkLimit,
+	// and the cleanup below keeps the longer bound. The guest asks for its store
+	// before it starts its runner, on a metadata token it fetched at boot that
+	// lives five minutes, so an answer later than that left it unable to read its
+	// own registration: on 2026-10-03 a store that took eight and a half minutes,
+	// queued behind the cache index lock, ended with "no command in the metadata"
+	// and a runner that never connected (#320). A store not ready in time is a
+	// cold job, which pulls its images; the store is offered again to the next.
+	acquireCtx, cancelAcquire := context.WithTimeout(ctx, dockerStoreAttachLimit)
+	defer cancelAcquire()
+
 	key := s.cacheKeyFor(session, config.CacheDocker, request.Architecture, "")
-	volume, cold, err := s.cloneWithin(ctx, key, volumeCeiling(setting))
+	volume, cold, err := s.cloneWithin(acquireCtx, key, volumeCeiling(setting))
 	if cold {
-		volume, err = s.store.Create(ctx, key, volumeCeiling(setting))
+		volume, err = s.store.Create(acquireCtx, key, volumeCeiling(setting))
 	}
 	if err != nil {
 		s.log.Warn("Docker image store is unavailable; the job can continue cold",

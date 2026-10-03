@@ -47,18 +47,20 @@ type fakeCacheStore struct {
 	publishedFences    []storecontract.FencingToken
 	keys               []string
 	createdSizes       []int64
-	snapshotVolumes    []storecontract.Volume
-	snapshotErr        error
-	snapshotHook       func()
-	heldRefusals       int
-	heldRefused        int
-	heldHolder         string
-	heldHolders        []string
-	heldExpires        time.Time
-	writerEvents       []string
-	released           []string
-	releaseCtxErrs     []error
-	releaseDeadlines   []bool
+	// createBudgets is the time each Create had left before its deadline.
+	createBudgets    []time.Duration
+	snapshotVolumes  []storecontract.Volume
+	snapshotErr      error
+	snapshotHook     func()
+	heldRefusals     int
+	heldRefused      int
+	heldHolder       string
+	heldHolders      []string
+	heldExpires      time.Time
+	writerEvents     []string
+	released         []string
+	releaseCtxErrs   []error
+	releaseDeadlines []bool
 	// createErr makes a fresh volume unobtainable, the way a read-only pool would.
 	createErr error
 }
@@ -118,7 +120,10 @@ func (f *fakeCacheStore) Match(
 	return exact, f.current, nil
 }
 
-func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
+func (f *fakeCacheStore) Create(ctx context.Context, key string, size int64) (storecontract.Volume, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		f.createBudgets = append(f.createBudgets, time.Until(deadline))
+	}
 	if f.createErr != nil {
 		return storecontract.Volume{}, f.createErr
 	}
@@ -560,6 +565,38 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	}
 	if len(attacher.detached) != 1 || attacher.detached[0] != 0 {
 		t.Errorf("Docker detached slots = %v, want [0]", attacher.detached)
+	}
+}
+
+// THE DOCKER STORE IS ACQUIRED INSIDE THE GUEST'S TOKEN. The guest asks for it
+// before starting its runner, on a metadata token that lives five minutes; a
+// store acquired under the twelve-minute cache bound outlived it on 2026-10-03
+// and the runner never started (#320).
+func TestTheDockerStoreIsAcquiredWithinDockerStoreAttachLimit(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	if response := cacheRequest(t, service, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+	}
+
+	if len(storage.createBudgets) != 1 {
+		t.Fatalf("the store was created %d time(s) with a deadline, want 1", len(storage.createBudgets))
+	}
+	if got := storage.createBudgets[0]; got > dockerStoreAttachLimit || got < dockerStoreAttachLimit-5*time.Second {
+		t.Fatalf("the Docker store was acquired with %s left, want about %s", got, dockerStoreAttachLimit)
 	}
 }
 
