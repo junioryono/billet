@@ -437,11 +437,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	// TIMED BY PHASE, because a node launches one guest at a time and the phases
+	// are what decide how many it can start a minute.
+	started := time.Now()
+
 	lifecycleLock, err := p.lockLifecycle(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = lifecycleLock.Close() }()
+
+	lockWait := time.Since(started)
 
 	if err := p.reserveLifecycle(ctx, spec.Name); err != nil {
 		return nil, err
@@ -511,6 +517,8 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, errors.Join(err, p.unwindBeforeClone(j, res))
 	}
 
+	cloneStarted := time.Now()
+
 	device, err := p.cloneResolved(ctx, requested, &spec)
 	if err != nil {
 		// A CLONE ERROR DOES NOT PROVE NO CLONE EXISTS. `rbd clone` can be killed by
@@ -530,11 +538,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// changes it. Doing that here, while the clone is mapped and unmounted, makes
 	// the tier's capacity real before the first guest instruction and works for
 	// every already-published image rather than requiring a new guest agent.
+	growStarted := time.Now()
+	clone := growStarted.Sub(cloneStarted)
+
 	if spec.Disk > 0 {
 		if err := p.growRootFilesystem(ctx, spec.Name, device); err != nil {
 			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 		}
 	}
+
+	bootStarted := time.Now()
+	grow := bootStarted.Sub(growStarted)
 
 	// FROM HERE EVERY FAILURE UNWINDS WHAT IT MADE, in reverse order, and says so if
 	// it cannot. The caller treats a launch error as "billet does not know whether
@@ -547,7 +561,10 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	}
 
 	p.log.Info("launched a microVM", "runner", spec.Name, "vcpu", spec.VCPU,
-		"memory", spec.Memory, "image", spec.Image, "trust", spec.Trust)
+		"memory", spec.Memory, "image", spec.Image, "trust", spec.Trust,
+		"took", time.Since(started).Round(time.Millisecond),
+		"lock_wait", lockWait.Round(time.Millisecond), "clone", clone.Round(time.Millisecond),
+		"grow", grow.Round(time.Millisecond), "boot", time.Since(bootStarted).Round(time.Millisecond))
 
 	return inst, nil
 }
