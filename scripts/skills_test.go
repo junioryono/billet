@@ -22,6 +22,13 @@ const skillCorpusPath = "testdata/skills-corpus.txt"
 // skillDroppedPath lists corpus units removed on purpose: `<hash> <reason>`.
 const skillDroppedPath = "testdata/skills-dropped.txt"
 
+// maxSkillBytes bounds a SKILL.md, which loads whole whenever its skill does; the
+// long form lives in references/ and loads only when a rule needs it.
+const maxSkillBytes = 12 * 1024
+
+// maxDescriptionRunes bounds a skill's description, which every session reads.
+const maxDescriptionRunes = 600
+
 // writeSkillCorpusEnv regenerates the corpus from the skills as they are now.
 // It exists for the one freeze, and running it again would bless whatever the
 // skills have lost since; a unit removed on purpose belongs in the dropped list.
@@ -122,6 +129,11 @@ func TestEverySkillFollowsTheRepositoryRules(t *testing.T) {
 			t.Errorf("skill %s: %v", name, err)
 
 			continue
+		}
+
+		if len(raw) > maxSkillBytes {
+			t.Errorf("skill %s: SKILL.md is %d bytes, over %d; move the long form into references/ and keep "+
+				"one line per rule here", name, len(raw), maxSkillBytes)
 		}
 
 		checkFrontmatter(t, name, raw)
@@ -438,6 +450,11 @@ func checkFrontmatter(t *testing.T, name string, raw []byte) {
 
 	if fm.Name != name {
 		t.Errorf("skill %s: frontmatter names %q", name, fm.Name)
+	}
+
+	if n := len([]rune(fm.Description)); n > maxDescriptionRunes {
+		t.Errorf("skill %s: the description is %d characters, over %d; it says when to load the skill, and "+
+			"every session reads every description", name, n, maxDescriptionRunes)
 	}
 
 	if strings.TrimSpace(fm.Description) == "" {
