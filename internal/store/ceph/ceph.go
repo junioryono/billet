@@ -74,6 +74,10 @@ type Client struct {
 	// unopenable was first seen so, which a second sighting requires.
 	halfRemovedMu sync.Mutex
 	halfRemoved   map[string]time.Time
+	// halfRemovedResume is the last image a finishHalfRemoved pass cut short by
+	// halfRemovedBudget reached, so the next pass begins after it. Under
+	// halfRemovedMu.
+	halfRemovedResume string
 	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
 	clock func() time.Time
 
