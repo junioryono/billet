@@ -1179,8 +1179,15 @@ func serveNodeWire(
 	// guaranteed is that anonymous traffic can never displace an admitted node;
 	// what is best effort is a handshake slot, which no server can reserve for a
 	// caller it has not yet identified.
+	//
+	// NOT CANCELLED BY THE SIGNAL. ctx is cancelled by SIGTERM, when a drain begins,
+	// and the wire must keep serving until stop runs after the drain: handshaking
+	// under it refused every node connection for the whole drain (measured
+	// 2026-10-03, over forty minutes), so running jobs lost their cache and the node
+	// could not renew a lease. Close ends the listener; the per-handshake deadline
+	// bounds each handshake.
 	if wire.TLS != nil {
-		ln = newHandshakingListener(ctx, ln, wire.TLS, limits.operational,
+		ln = newHandshakingListener(context.WithoutCancel(ctx), ln, wire.TLS, limits.operational,
 			handshakeBounds{handshakeFor: limits.handshake}, slog.Default())
 	} else {
 		// A LOOPBACK WIRE HAS NO HANDSHAKE TO WAIT FOR. There are no certificates
