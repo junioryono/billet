@@ -94,6 +94,9 @@ type Client struct {
 	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
 	// retry skips the `rbd create` that could only fail.
 	lockImages sync.Map
+	// abandoned holds the lock cookies this process gave up on without knowing
+	// whether Ceph holds them, keyed by abandonKey, valued by when.
+	abandoned sync.Map
 }
 
 func (c *Client) now() time.Time {

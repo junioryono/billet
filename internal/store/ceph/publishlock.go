@@ -234,11 +234,93 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 }
 
 // takeLock claims an advisory lock on one dedicated image.
+//
+// AN ADD WHOSE ANSWER WAS LOST MAY STILL LAND. A `lock add` killed at the rbd
+// bound can be committed by the cluster afterwards, when this attempt has already
+// read the locks, found none of its own and failed; nothing then owns the lock, it
+// writes no heartbeat, and every caller waits for the stale bound. On 2026-10-03 a
+// cache index held that way stopped every guest's Docker image store and cache
+// work on the site for over ten minutes. So a cookie given up with its fate
+// unknown is remembered, and a later attempt that finds it holding the lock
+// removes it at once: the cookie carries a nonce, so it is nobody else's.
 func (c *Client) takeLock(
 	ctx context.Context,
 	image, cookie string,
 	now time.Time,
 	staleAfter time.Duration,
+) (*PublishLock, error) {
+	uncertain := false
+	lock, err := c.takeLockAttempt(ctx, image, cookie, now, staleAfter, &uncertain)
+	if lock == nil && uncertain {
+		c.abandon(image, cookie)
+	}
+
+	return lock, err
+}
+
+// abandonedFor is how long an abandoned cookie is remembered, past which the
+// stale bound of either lock has long since recovered it.
+const abandonedFor = StaleLockAfter
+
+// abandonedLimit bounds the record. A cookie past it is not remembered and its
+// lock, if Ceph holds it, waits for the stale bound as every lock once did.
+const abandonedLimit = 64
+
+func abandonKey(image, cookie string) string { return image + "\x00" + cookie }
+
+// abandon records a cookie this process no longer claims and Ceph may hold.
+func (c *Client) abandon(image, cookie string) {
+	now := time.Now()
+	kept := 0
+	c.abandoned.Range(func(key, value any) bool {
+		if at, ok := value.(time.Time); !ok || now.Sub(at) > abandonedFor {
+			c.abandoned.Delete(key)
+		} else {
+			kept++
+		}
+
+		return true
+	})
+	if kept >= abandonedLimit {
+		return
+	}
+	c.abandoned.Store(abandonKey(image, cookie), now)
+}
+
+func (c *Client) wasAbandoned(image, cookie string) bool {
+	_, ok := c.abandoned.Load(abandonKey(image, cookie))
+
+	return ok
+}
+
+// removeAbandoned takes away a lock held under a cookie this process abandoned,
+// and always answers contention, so a waiter retries the add rather than failing.
+func (c *Client) removeAbandoned(ctx context.Context, image string, holder lockEntry) error {
+	_, err := c.rbdCmd(ctx, false, "lock", "rm", image, holder.ID, holder.Locker)
+	if err == nil || exitedWith(err, 2) {
+		c.abandoned.Delete(abandonKey(image, holder.ID))
+
+		return lockContendedf("ceph: %s was held by %s, which this process abandoned without "+
+			"knowing whether it was taken; it was removed and the lock is taken again", image, holder.ID)
+	}
+
+	return lockContendedf("ceph: %s is held by %s, which this process abandoned, and it could not "+
+		"be removed yet: %v", image, holder.ID, err)
+}
+
+// uncertainAdd says a `lock add` failed without proving the lock was not taken:
+// exit 16 is another holder and exit 2 an absent image, and anything else may
+// have committed.
+func uncertainAdd(err error) bool {
+	return err != nil && !exitedWith(err, 16) && !exitedWith(err, 2)
+}
+
+func (c *Client) takeLockAttempt(
+	ctx context.Context,
+	image, cookie string,
+	now time.Time,
+	staleAfter time.Duration,
+	uncertain *bool,
 ) (*PublishLock, error) {
 	// CREATED IF ABSENT, AND A FAILURE HERE IS NOT FATAL. The ordinary case is that
 	// it already exists, which `rbd create` reports as an error; distinguishing
@@ -267,6 +349,7 @@ func (c *Client) takeLock(
 	}
 
 	_, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie)
+	*uncertain = uncertainAdd(addErr)
 	switch {
 	case addErr == nil, exitedWith(addErr, 16):
 		c.lockImages.Store(image, struct{}{})
@@ -312,6 +395,9 @@ func (c *Client) takeLock(
 		// bounded race; golden-image publishers still report it and stand down.
 		return nil, lockContendedf("ceph: the publish lock on %s could not be taken and is not held; "+
 			"another publisher is contending for it right now", image)
+	}
+	if c.wasAbandoned(image, holder.ID) {
+		return nil, c.removeAbandoned(ctx, image, holder)
 	}
 	if !ageKnown {
 		return nil, fmt.Errorf("ceph: %s is held by %s and its age cannot be established; "+
@@ -400,6 +486,7 @@ func (c *Client) takeLock(
 	}
 
 	if _, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie); addErr != nil {
+		*uncertain = uncertainAdd(addErr)
 		replacement, replacementAge, replacementAgeKnown, replacementFound, readErr :=
 			c.heldLockAfterAdd(ctx, image, now, addErr)
 		if readErr != nil {
@@ -573,13 +660,21 @@ func (l *PublishLock) Release(ctx context.Context) error {
 	// THE LOCKER IS READ BACK RATHER THAN REMEMBERED. `rbd lock rm` takes both the
 	// cookie AND the locker's client id, and this process does not otherwise know
 	// its own client id — it is assigned by the cluster per connection.
+	//
+	// A RELEASE THAT CANNOT FINISH ABANDONS THE COOKIE, because the heartbeat has
+	// already stopped: left alone, the lock would sit unclaimed until the stale
+	// bound, and this process's next attempt removes it instead.
 	out, err := l.client.rbdCmd(ctx, true, "lock", "ls", l.image)
 	if err != nil {
+		l.client.abandon(l.image, l.cookie)
+
 		return fmt.Errorf("ceph: could not read %s to release it: %w", l.image, err)
 	}
 
 	var held []lockEntry
 	if err := json.Unmarshal(out, &held); err != nil {
+		l.client.abandon(l.image, l.cookie)
+
 		return fmt.Errorf("ceph: %s did not list the lockers of %s as json", l.client.bin, l.image)
 	}
 
@@ -590,6 +685,8 @@ func (l *PublishLock) Release(ctx context.Context) error {
 
 		if _, err := l.client.rbdCmd(ctx, false, "lock", "rm", l.image,
 			entry.ID, entry.Locker); err != nil {
+			l.client.abandon(l.image, l.cookie)
+
 			return fmt.Errorf("ceph: could not release %s: %w", l.image, err)
 		}
 
