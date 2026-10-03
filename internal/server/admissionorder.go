@@ -225,6 +225,41 @@ func (q *admissionQueue) mayBuy(tier string, where alloc.TierAdmission) bool {
 	return allowed
 }
 
+// ahead lists the waiters that hold the line ahead of tier, judged as mayBuy
+// judges them: competing, not stalled, and waiting longer (ties broken by label).
+// A tier refused by mayBuy may still buy if what it buys leaves each of these
+// room for one of its own, which the allocator decides atomically
+// (alloc.EscrowLeaving).
+func (q *admissionQueue) ahead(tier string, where alloc.TierAdmission) []string {
+	if q == nil || q.policy == config.AdmissionFill {
+		return nil
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := q.now()
+	own, waiting := q.waiting[tier]
+
+	var out []string
+	for label, waiter := range q.waiting {
+		if label == tier || !competes(where, waiter.where) || !holdsTheLine(waiter, now) {
+			continue
+		}
+
+		if waiting && (own.since.Before(waiter.since) ||
+			(own.since.Equal(waiter.since) && tier < label)) {
+			continue
+		}
+
+		out = append(out, label)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
 // letPast requires q.mu. It logs, once per stall, each stalled waiter this
 // buyer really did get ahead of: one that would otherwise have come first.
 func (q *admissionQueue) letPast(tier string, stalled []string) {

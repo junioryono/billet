@@ -159,6 +159,72 @@ func TestAWaitingTiersTurnBuysItsWholeBatch(t *testing.T) {
 	}
 }
 
+// A TIER BEHIND THE HEAD BUYS WHAT THE HEAD CAN SPARE (#346). Room the head
+// waiter still fits in after the purchase is room it loses nothing by; holding
+// every other tier back from it made the fleet buy at the speed listeners woke.
+func TestATierBehindTheHeadBuysWhatTheHeadCanSpare(t *testing.T) {
+	t.Parallel()
+
+	a, log, listeners := orderedListeners(t,
+		[]config.Tier{tierOf("a-small", 4), tierOf("b-small", 4), tierOf("c-small", 4)},
+		16, config.AdmissionFair)
+	first, second, other := listeners[0], listeners[1], listeners[2]
+
+	var mu sync.Mutex
+	clock := time.Date(2026, 10, 3, 21, 40, 0, 0, time.UTC)
+	first.order.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		clock = clock.Add(time.Second)
+
+		return clock
+	}
+
+	// Another tier holds one slot, the first fills the other three and waits,
+	// the second waits behind it.
+	if err := other.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("other tier reconcile: %v", err)
+	}
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile: %v", err)
+	}
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile: %v", err)
+	}
+	if _, _, waiting := first.order.waitingSince("a-small"); !waiting {
+		t.Fatal("the first tier is not recorded as waiting")
+	}
+	if _, _, waiting := second.order.waitingSince("b-small"); !waiting {
+		t.Fatal("the second tier is not recorded as waiting")
+	}
+	if got := log.tiers(); len(got) != 4 {
+		t.Fatalf("started %v, want the fleet's four slots filled", got)
+	}
+
+	// Two of the first tier's slots free. The second tier asks before the head
+	// does: it may take one, which leaves the head the other, and not two.
+	freeOneLease(t, a)
+	freeOneLease(t, a)
+
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile ahead of its turn: %v", err)
+	}
+
+	got := log.tiers()
+	if len(got) != 5 || got[4] != "b-small" {
+		t.Fatalf("started %v, want the second tier to buy the one slot the head can spare", got)
+	}
+
+	// AND THE HEAD STILL GETS ITS ROOM.
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile: %v", err)
+	}
+	if got := log.tiers(); len(got) != 6 || got[5] != "a-small" {
+		t.Fatalf("started %v, want the head tier to take the slot that was left for it", got)
+	}
+}
+
 // contenders is the fixture both policies are judged on: room for exactly two
 // small jobs OR one large one, with both tiers wanting work at once. A fleet
 // where everything fits cannot tell the policies apart.

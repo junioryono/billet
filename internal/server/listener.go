@@ -289,6 +289,10 @@ type Listener struct {
 	// once for the pass rather than once per purchase.
 	batchBuying bool
 	batchBought bool
+	// protect, under mu, names the waiters a purchase made ahead of this tier's
+	// turn must leave room for; empty for a purchase made in turn. See
+	// alloc.EscrowLeaving.
+	protect []string
 
 	// heartbeatLock runs immediately before mu is taken at the top of a heartbeat
 	// pass. TEST-ONLY and nil in every deployment; it gates the acquisition
@@ -3522,7 +3526,11 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 	// expiry, filed with the rest of the lifecycle work.
 	created := time.Now()
 
-	leases, err := l.alloc.Escrow(ctx, l.tier, room)
+	l.mu.Lock()
+	protect := l.protect
+	l.mu.Unlock()
+
+	leases, err := l.alloc.EscrowLeaving(ctx, l.tier, room, protect)
 
 	// A SEALED DEPLOYMENT IS NOT A BROKEN ONE, and the difference is the whole
 	// fleet. An escrow error returns from the listener, one listener returning
@@ -3981,11 +3989,29 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 			// fair the room a finished job leaves belongs to the longest-waiting
 			// tier until its shape fits, and a tier that bought first would have
 			// taken it (admissionQueue).
+			//
+			// AND OUT OF TURN WHEN THAT TAKES NOTHING FROM THE WAITERS AHEAD: the
+			// allocator buys only while each of them could still be granted one
+			// lease of its own, in the purchase's transaction (#346).
+			var protect []string
 			if !l.order.mayBuy(l.tier, admission) {
-				break
+				protect = l.order.ahead(l.tier, admission)
+				if len(protect) == 0 {
+					break
+				}
 			}
 
-			if err := l.backPoolSlot(ctx); err != nil {
+			l.mu.Lock()
+			l.protect = protect
+			l.mu.Unlock()
+
+			err := l.backPoolSlot(ctx)
+
+			l.mu.Lock()
+			l.protect = nil
+			l.mu.Unlock()
+
+			if err != nil {
 				l.endBatchBuying()
 
 				return errors.Join(err, l.launchPool(ctx, batch))
