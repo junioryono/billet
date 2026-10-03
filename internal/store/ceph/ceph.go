@@ -90,6 +90,10 @@ type Client struct {
 	// budget reached, so the next pass begins after it.
 	evictMu     sync.Mutex
 	evictResume string
+
+	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
+	// retry skips the `rbd create` that could only fail.
+	lockImages sync.Map
 }
 
 func (c *Client) now() time.Time {
