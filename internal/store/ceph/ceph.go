@@ -90,6 +90,10 @@ type Client struct {
 	// budget reached, so the next pass begins after it.
 	evictMu     sync.Mutex
 	evictResume string
+
+	// lockImages holds the advisory-lock images a `lock add` has proved exist, so a
+	// retry skips the `rbd create` that could only fail.
+	lockImages sync.Map
 }
 
 func (c *Client) now() time.Time {
@@ -852,6 +856,22 @@ func (c *Client) rbdMap(ctx context.Context, spec string) ([]byte, error) {
 	defer cancel()
 
 	return c.run(ctx, c.bin, append(c.identity(), "device", "map", spec))
+}
+
+// keepKernelClient prefixes a command that may take a root disk's exclusive lock
+// so that breaking a stale owner does not blocklist it.
+//
+// THE OWNER IS THE HOST'S ONE KERNEL CLIENT. Every device mapped on a host shares
+// it, so the blocklist Ceph adds by default when a lock is broken takes every disk
+// on the host with it, not the one image being removed (measured 2026-10-03, after
+// an interrupted unmap left a root disk's lock behind). These commands run only
+// once the image is billet's to dispose of and this host lists no mapping of it,
+// either because its unmaps succeeded or because none was listed, so the owner
+// whose lock they break is an orphan of an earlier unmap, not a guest. The
+// advisory cache-index lock keeps its blocklist: there the broken holder may be
+// live and the blocklist is the fence.
+func keepKernelClient(command ...string) []string {
+	return append([]string{"--rbd_blocklist_on_break_lock", "false"}, command...)
 }
 
 // rbdCmdWithin is rbdCmd under a bound of its own, for the one deletion that

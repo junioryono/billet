@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/provider"
@@ -19,15 +22,106 @@ const (
 	lifecycleExecDirName = ".billet-instance-executables"
 )
 
-// lockLifecycle serializes every launch and teardown that can act on a lease name.
-// The node runtime is already a serial command consumer; the host-wide lock extends
-// that property across deployments and Firecracker binary versions sharing a host.
-func (p *Provider) lockLifecycle(ctx context.Context) (*os.File, error) {
+// lockLifecycle takes the host-wide lifecycle lock EXCLUSIVELY, for a pass that
+// judges every lease at once: List reconciles lifecycle records that have no jail,
+// and a launch between its reservation and its jail looks exactly like that, so
+// no per-lease operation may run during the pass. It also excludes every
+// deployment and every older billet sharing the host, which take it exclusively
+// for each launch and teardown.
+func (p *Provider) lockLifecycle(ctx context.Context) (func(), error) {
+	if err := p.gate().Acquire(ctx, lifecycleGateSize); err != nil {
+		return nil, fmt.Errorf("firecracker: wait for the lifecycle lock: %w", err)
+	}
+
+	lock, err := p.flockLifecycle(ctx, filepath.Join(p.cfg.ChrootBase, ".billet-lifecycle.lock"), unix.LOCK_EX)
+	if err != nil {
+		p.gate().Release(lifecycleGateSize)
+
+		return nil, err
+	}
+
+	return func() {
+		_ = lock.Close()
+		p.gate().Release(lifecycleGateSize)
+	}, nil
+}
+
+// lifecycleGateSize is the whole of the in-process gate, which List takes and
+// each launch or teardown takes one unit of. Larger than any number of guests a
+// host could start at once.
+const lifecycleGateSize = 1 << 20
+
+// gate is the in-process lifecycle gate, made on first use so a Provider built
+// without New still has one.
+func (p *Provider) gate() *semaphore.Weighted {
+	p.lifecycleOnce.Do(func() { p.lifecycleGate = semaphore.NewWeighted(lifecycleGateSize) })
+
+	return p.lifecycleGate
+}
+
+// lockLease serializes the launch and teardown of one lease name while leases
+// with other names proceed at once: the host-wide lock SHARED, then the lease's
+// stripe exclusively, always in that order.
+//
+// CONCURRENT ACROSS LEASES because a node that launched one microVM at a time
+// started one runner every 30 to 65 seconds whatever its free capacity (measured
+// 2026-10-03, with 230 jobs queued). What a launch allocates on the host was
+// already safe to race: a uid or tap is claimed by an atomic link, a claim is
+// taken only after its jail exists, and a release compares before it deletes.
+//
+// STRIPED, NOT A FILE PER LEASE: removing a lock file another process may be
+// about to open hands two holders two inodes, and keeping one per lease grows
+// without bound. Two leases sharing a stripe merely wait for each other.
+func (p *Provider) lockLease(ctx context.Context, id string) (func(), error) {
+	if err := p.gate().Acquire(ctx, 1); err != nil {
+		return nil, fmt.Errorf("firecracker: wait for the lifecycle lock: %w", err)
+	}
+
+	host, err := p.flockLifecycle(ctx, filepath.Join(p.cfg.ChrootBase, ".billet-lifecycle.lock"),
+		unix.LOCK_SH)
+	if err != nil {
+		p.gate().Release(1)
+
+		return nil, err
+	}
+
+	release := func(files ...*os.File) {
+		for _, f := range files {
+			_ = f.Close()
+		}
+		p.gate().Release(1)
+	}
+
+	stripes := filepath.Join(p.cfg.ChrootBase, ".billet-lifecycle-leases")
+	if err := os.MkdirAll(stripes, 0o700); err != nil {
+		release(host)
+
+		return nil, fmt.Errorf("firecracker: create the lease lock directory: %w", err)
+	}
+
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(id))
+
+	lease, err := p.flockLifecycle(ctx,
+		filepath.Join(stripes, strconv.Itoa(int(hash.Sum32()%leaseLockStripes))+".lock"), unix.LOCK_EX)
+	if err != nil {
+		release(host)
+
+		return nil, err
+	}
+
+	return func() { release(lease, host) }, nil
+}
+
+// leaseLockStripes is how many lease locks a host keeps.
+const leaseLockStripes = 256
+
+// flockLifecycle waits for one flock on path, in the mode how names.
+func (p *Provider) flockLifecycle(ctx context.Context, path string, how int) (*os.File, error) {
 	if err := os.MkdirAll(p.cfg.ChrootBase, 0o700); err != nil {
 		return nil, fmt.Errorf("firecracker: create the lifecycle lock directory: %w", err)
 	}
 
-	path := filepath.Join(p.cfg.ChrootBase, ".billet-lifecycle.lock")
 	lock, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: open the lifecycle lock %s: %w", path, err)
@@ -37,7 +131,7 @@ func (p *Provider) lockLifecycle(ctx context.Context) (*os.File, error) {
 	defer ticker.Stop()
 
 	for {
-		err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		err := unix.Flock(int(lock.Fd()), how|unix.LOCK_NB)
 		if err == nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, errors.Join(
@@ -81,7 +175,7 @@ func (p *Provider) lifecycleExecFile(id string) string {
 }
 
 // reserveLifecycle publishes deployment authority before a launch creates anything
-// named after the lease. The caller holds lockLifecycle through the whole launch.
+// named after the lease. The caller holds lockLease through the whole launch.
 func (p *Provider) reserveLifecycle(ctx context.Context, id string) error {
 	if existing, found, err := p.findJail(id); err != nil {
 		return err
@@ -281,8 +375,8 @@ func (p *Provider) publishLifecycleFile(dir, path, prefix, contents, kind, id st
 }
 
 // releaseLifecycle removes deployment authority only after every owned resource is
-// gone. The caller still holds the host-wide lock, so no replacement can start in
-// the gap between removal and the directory sync.
+// gone. The caller holds lockLease for id, or lockLifecycle, so no replacement can
+// start in the gap between removal and the directory sync.
 func (p *Provider) releaseLifecycle(id string) error {
 	if err := os.Remove(p.lifecycleFile(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("firecracker: release lifecycle authority for %s: %w", id, err)
@@ -328,8 +422,8 @@ func (p *Provider) syncLifecycleDir() error {
 }
 
 // cleanupLifecycleOnly finishes an interrupted launch or teardown after the jail
-// is provably absent. The caller holds lockLifecycle, so a replacement cannot
-// appear between that proof and cleanup.
+// is provably absent. The caller holds lockLease for id, or lockLifecycle, so a
+// replacement cannot appear between that proof and cleanup.
 func (p *Provider) cleanupLifecycleOnly(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("firecracker: lifecycle cleanup of %s was canceled: %w", id, err)

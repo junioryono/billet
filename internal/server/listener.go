@@ -281,6 +281,10 @@ type Listener struct {
 	session Session
 	log     *slog.Logger
 
+	// poolLaunchBatch is how many pool members a reconciliation starts at once;
+	// zero or one launches each before buying the next. See WithPoolLaunchBatch.
+	poolLaunchBatch int
+
 	// heartbeatLock runs immediately before mu is taken at the top of a heartbeat
 	// pass. TEST-ONLY and nil in every deployment; it gates the acquisition
 	// rather than performing it, so it cannot get the mutex wrong.
@@ -557,6 +561,12 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 // path hands the capacity back, and GitHub reassigns. It does not hold capacity
 // and it does not quietly succeed — see noRunner's own documentation, which said
 // so correctly while this said the reverse.
+// WithPoolLaunchBatch sets how many pool members one reconciliation starts at
+// once. One, the default, launches each and waits for it before buying the next.
+func WithPoolLaunchBatch(n int) Option {
+	return func(l *Listener) { l.poolLaunchBatch = max(n, 1) }
+}
+
 func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }
@@ -3939,28 +3949,43 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	admission := l.admission(ctx)
 
 	for active < desired {
-		// WHOSE TURN IT IS, asked before the purchase and not after: under fair
-		// the room a finished job leaves belongs to the longest-waiting tier
-		// until its shape fits, and a tier that bought first would have taken it
-		// (admissionQueue).
-		if !l.order.mayBuy(l.tier, admission) {
-			break
+		// BOUGHT ONE AT A TIME, LAUNCHED TOGETHER. Each purchase still asks the
+		// order and the allocator on its own, exactly as before; what changes is
+		// that up to poolLaunchBatch members bought in a row start at once rather
+		// than each waiting for the last to boot. A tier launching one member at a
+		// time started one runner every 30 to 65 seconds however much room was free
+		// (2026-10-03, with 66 runners wanted on one tier).
+		var batch []poolLaunch
+
+		for active < desired && len(batch) < max(l.poolLaunchBatch, 1) {
+			// WHOSE TURN IT IS, asked before the purchase and not after: under
+			// fair the room a finished job leaves belongs to the longest-waiting
+			// tier until its shape fits, and a tier that bought first would have
+			// taken it (admissionQueue).
+			if !l.order.mayBuy(l.tier, admission) {
+				break
+			}
+
+			if err := l.backPoolSlot(ctx); err != nil {
+				return errors.Join(err, l.launchPool(ctx, batch))
+			}
+			lease, job, err := l.assignPoolSlot(ctx)
+			if err != nil {
+				return errors.Join(err, l.launchPool(ctx, batch))
+			}
+			if lease == nil {
+				break
+			}
+			batch = append(batch, poolLaunch{lease: lease, job: job})
+			active++
 		}
 
-		if err := l.backPoolSlot(ctx); err != nil {
-			return err
-		}
-		lease, job, err := l.assignPoolSlot(ctx)
-		if err != nil {
-			return err
-		}
-		if lease == nil {
+		if len(batch) == 0 {
 			break
 		}
-		if err := l.launch(ctx, lease, job); err != nil {
+		if err := l.launchPool(ctx, batch); err != nil {
 			return err
 		}
-		active++
 	}
 	// WHAT THIS TIER STILL WANTS, recorded for the order. Demand that is met, or
 	// that GitHub's count says has gone away, releases this tier's place rather
@@ -4013,6 +4038,35 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	}
 
 	return nil
+}
+
+// poolLaunchBatch is how many pool members one pass starts at once on a tier
+// served only by Firecracker, matching how many launches such a node runs at once.
+const poolLaunchBatch = 4
+
+// poolLaunch is one pool member bought and assigned, waiting to start.
+type poolLaunch struct {
+	lease *alloc.Lease
+	job   Job
+}
+
+// launchPool starts every member of batch at once and waits for all of them.
+// Every launch is waited for even when one fails, because each has already
+// been assigned its lease and has to settle it, success or not.
+func (l *Listener) launchPool(ctx context.Context, batch []poolLaunch) error {
+	if len(batch) == 1 {
+		return l.launch(ctx, batch[0].lease, batch[0].job)
+	}
+
+	errs := make([]error, len(batch))
+
+	var wg sync.WaitGroup
+	for i, member := range batch {
+		wg.Go(func() { errs[i] = l.launch(ctx, member.lease, member.job) })
+	}
+	wg.Wait()
+
+	return errors.Join(errs...)
 }
 
 // backPoolSlot buys the one lease the next pool member needs, at the moment it
