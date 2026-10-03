@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -437,6 +438,75 @@ func TestDiscardUnmapsEveryMappingOfAClone(t *testing.T) {
 	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 }
 
+// AN UNMAP OUTLIVES ITS CALLER'S CANCELLATION, AND THE DISCARD BLOCKLISTS NOTHING.
+//
+// A node told to drain cancelled its context with an unmap in flight; the kernel
+// logged "failed to unlock header: -512", kept the root disk's exclusive lock, and
+// the discard's lock break blocklisted the host's one kernel client, so every
+// device on the node failed (measured 2026-10-03).
+func TestAnUnmapOutlivesItsCallerAndTheDiscardBlocklistsNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.mapped = `[{"id":"1","pool":"billet-cache","namespace":"","name":"billet-abc","snap":"-","device":"/dev/rbd1"}]`
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		unmapped     bool
+		afterCancel  error
+		unmapBound   time.Duration
+		unmapBounded bool
+	)
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(func(runCtx context.Context, bin string, args []string) ([]byte, error) {
+			if subcommandOf(args) == "device unmap" {
+				unmapped = true
+				// THE DRAIN ARRIVES WHILE THE UNMAP IS IN FLIGHT, which is the incident:
+				// the command's own context must not end with its caller's.
+				cancel()
+				afterCancel = runCtx.Err()
+				if deadline, ok := runCtx.Deadline(); ok {
+					unmapBound, unmapBounded = time.Until(deadline), true
+				}
+			}
+
+			// A REAL RUNNER STARTS NOTHING ON A DEAD CONTEXT, so neither does this one.
+			if err := runCtx.Err(); err != nil {
+				return nil, err
+			}
+
+			return f.run(runCtx, bin, args)
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	err = c.DiscardRoot(ctx, "billet-abc")
+
+	if !unmapped {
+		t.Fatalf("the discard never unmapped the clone; billet ran %v", f.calls)
+	}
+
+	if afterCancel != nil {
+		t.Errorf("cancelling the caller ended the unmap in flight (%v), so a drain kills it "+
+			"partway and leaves the kernel client holding the root disk's lock", afterCancel)
+	}
+
+	if !unmapBounded || unmapBound < MapTimeout-5*time.Second || unmapBound > MapTimeout {
+		t.Errorf("the unmap ran under %s (bounded %t), want its own MapTimeout of %s",
+			unmapBound, unmapBounded, MapTimeout)
+	}
+
+	// THE MOVE TO THE TRASH IS THE CALLER'S, and its caller has gone: the discard
+	// stops there and is retried, with the device already released cleanly.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("DiscardRoot after its caller was cancelled answered %v, want context.Canceled", err)
+	}
+}
+
 // A DISCARD NEVER DELETES THE DATA ITSELF.
 //
 // `rbd rm` deletes every object before it returns, and under the command's bound a
@@ -453,7 +523,9 @@ func TestADiscardMovesTheCloneToTheTrashAndNeverRemovesIt(t *testing.T) {
 		t.Fatalf("DiscardRoot: %v", err)
 	}
 
-	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
+	// AND THE MOVE BREAKS AN ORPHANED LOCK WITHOUT BLOCKLISTING THE HOST'S KERNEL
+	// CLIENT, which every device on the host shares (2026-10-03).
+	f.ran(t, "--rbd_blocklist_on_break_lock false trash mv billet-cache/billet-abc")
 
 	// NEITHER DELETION: `rbd rm`, nor `rbd trash rm`, which deletes the same data.
 	for _, call := range f.calls {

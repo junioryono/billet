@@ -297,12 +297,29 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 	const (
 		attempts = 20
 		pause    = 250 * time.Millisecond
+		// retryFor bounds how long attempts keep being started, so a host answering
+		// busy slowly cannot hold a teardown for attempts × MapTimeout.
+		retryFor = 30 * time.Second
 	)
 
 	var err error
 
+	// AN UNMAP IS NOT KILLED BY ITS CALLER'S CANCELLATION. A signal interrupts the
+	// kernel's release partway: the device goes, but the image's exclusive lock and
+	// watch stay with the host's one kernel client, and the next userspace command
+	// that needs the lock breaks it and, by Ceph's default, blocklists that client.
+	// Every device on the host then fails with -108 and every map after it refuses.
+	// Measured 2026-10-03: a node told to drain cancelled its context, the unmap in
+	// flight logged "failed to unlock header: -512", and the root disk's discard
+	// blocklisted the node's kernel client twenty-eight seconds later. Each attempt
+	// still ends at its own bound, MapTimeout, because unmap does the same kernel
+	// work a map does; a kill there remains possible and is what keepKernelClient
+	// covers.
+	detached := context.WithoutCancel(ctx)
+	started := time.Now()
+
 	for attempt := range attempts {
-		if _, err = c.rbdCmd(ctx, false, "device", "unmap", device); err == nil {
+		if err = c.rbdCmdWithin(detached, MapTimeout, "device", "unmap", device); err == nil {
 			return nil
 		}
 
@@ -310,7 +327,7 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 			break
 		}
 
-		if attempt == attempts-1 {
+		if attempt == attempts-1 || time.Since(started) >= retryFor {
 			break
 		}
 
@@ -326,6 +343,11 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 			return fmt.Errorf("ceph: unmap %s, which maps %s: %w", device, name,
 				errors.Join(err, ctx.Err()))
 		case <-timer.C:
+		}
+
+		// AND AGAIN AFTER THE PAUSE, which is when the next attempt would start.
+		if time.Since(started) >= retryFor {
+			break
 		}
 	}
 
@@ -355,7 +377,7 @@ func isDeviceBusy(err error) bool {
 func (c *Client) removeClone(ctx context.Context, name string) error {
 	spec := c.cfg.CachePool + "/" + name
 
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", spec); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", spec)...); err != nil {
 		if isNoSuchFile(err) {
 			return nil
 		}
