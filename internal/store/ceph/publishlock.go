@@ -262,18 +262,28 @@ func (c *Client) takeLock(
 // stale bound of either lock has long since recovered it.
 const abandonedFor = StaleLockAfter
 
+// abandonedLimit bounds the record. A cookie past it is not remembered and its
+// lock, if Ceph holds it, waits for the stale bound as every lock once did.
+const abandonedLimit = 64
+
 func abandonKey(image, cookie string) string { return image + "\x00" + cookie }
 
 // abandon records a cookie this process no longer claims and Ceph may hold.
 func (c *Client) abandon(image, cookie string) {
 	now := time.Now()
+	kept := 0
 	c.abandoned.Range(func(key, value any) bool {
 		if at, ok := value.(time.Time); !ok || now.Sub(at) > abandonedFor {
 			c.abandoned.Delete(key)
+		} else {
+			kept++
 		}
 
 		return true
 	})
+	if kept >= abandonedLimit {
+		return
+	}
 	c.abandoned.Store(abandonKey(image, cookie), now)
 }
 

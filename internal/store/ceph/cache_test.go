@@ -857,18 +857,15 @@ func TestACacheIndexLockHeldUnderAnotherCookieIsNotRemoved(t *testing.T) {
 	f := newCacheFake()
 	f.lockCookie = holder
 	c := cacheClient(t, f)
-	c.cacheLockRetry = time.Millisecond
 	c.abandon(c.cacheIndex(), "billet-import-thishost-1-fedcba9876543210-1")
 
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	err := c.withCacheLock(ctx, now, func(time.Time) error {
-		t.Fatal("the work ran while another holder held the lock")
-
-		return nil
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waiting on another holder returned %v, want the caller's deadline", err)
+	lock, err := c.takeLock(t.Context(), c.cacheIndex(),
+		"billet-import-thishost-1-0011223344556677-1", now, CacheLockStaleAfter)
+	if lock != nil || !errors.Is(err, errLockContended) {
+		t.Fatalf("taking a lock another holder holds returned %v, %v; want contention", lock, err)
+	}
+	if f.lockLists == 0 {
+		t.Fatal("the holder was never listed, so the exclusion decision was not reached")
 	}
 	if f.ranWith("lock", "rm", holder) || f.lockCookie != holder {
 		t.Fatal("another holder's young lock was removed")
