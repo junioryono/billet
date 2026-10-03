@@ -99,33 +99,59 @@ func TestTheStagedCredentialSweepRunsOnTheReapersClock(t *testing.T) {
 // A FENCED CONTROL PLANE SWEEPS NOTHING. Deleting a parameter is an act in the
 // deployment's name, and once the ledger has refused this process as its
 // controller the successor performs it.
+//
+// FENCED AFTER THE PLANE IS RUNNING, as a claim is lost in production. A plane
+// fenced from the start opens no session at all (openSession refuses a process
+// that is no longer the controller, #207) and stops before its reaper ticks.
 func TestAFencedControlPlaneNeverSweepsStagedCredentials(t *testing.T) {
 	sweeper := &countingSweeper{}
 
-	var ticks atomic.Int32
+	var (
+		ticks  atomic.Int32
+		fenced atomic.Bool
+	)
 
 	stop, done := runPlaneWith(t,
 		WithStagedCredentialSweeper(sweeper),
-		WithLeadershipLost(func() bool { return true }),
+		WithLeadershipLost(fenced.Load),
 		ControlPlaneOption(func(s *Server) {
 			s.onReap = func(int) { ticks.Add(1) }
 		}),
 	)
 
-	// Several reaper ticks, so a sweep that ran would have had every chance to.
-	deadline := time.Now().Add(5 * time.Second)
-	for ticks.Load() < 3 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	waitTicks := func(n int32) bool {
+		deadline := time.Now().Add(30 * time.Second)
+		for ticks.Load() < n && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		return ticks.Load() >= n
 	}
+
+	if !waitTicks(1) {
+		stop()
+		<-done
+		t.Fatal("the reaper never ticked before the fence, so this proves nothing about what it skipped")
+	}
+
+	fenced.Store(true)
+
+	// A TICK ALREADY PAST ITS FENCE CHECK MAY STILL SWEEP, so the count is taken
+	// once a whole tick has begun after the fence: onReap ends a tick, and the
+	// tick after the next one to end started after the store.
+	fencedAt := ticks.Load()
+	settled := waitTicks(fencedAt + 2)
+	before := sweeper.calls.Load()
+	ticked := settled && waitTicks(fencedAt+5)
 
 	stop()
 	<-done
 
-	if ticks.Load() < 3 {
-		t.Fatal("the reaper never ticked, so this proves nothing about what it skipped")
+	if !ticked {
+		t.Fatal("the reaper stopped ticking once fenced, so this proves nothing about what it skipped")
 	}
 
-	if got := sweeper.calls.Load(); got != 0 {
-		t.Fatalf("a fenced control plane swept %d time(s)", got)
+	if got := sweeper.calls.Load(); got != before {
+		t.Fatalf("a fenced control plane swept %d more time(s)", got-before)
 	}
 }
