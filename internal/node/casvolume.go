@@ -59,6 +59,12 @@ const (
 // casAttachBackoff; the failure itself was logged when it happened.
 var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
 
+// errCASNotMounted is a transfer refused because the session's volume of its kind
+// is recorded and was never mounted, or was taken away. The failure that left it
+// so was logged when it happened; a build asks by the thousand, and logging each
+// refusal wrote 39,191 lines for one session in half an hour on 2026-10-03.
+var errCASNotMounted = errors.New("the cache volume is not mounted")
+
 // casKinds are the caches served from a content-addressed volume.
 var casKinds = map[config.CacheKind]bool{config.CacheGo: true, config.CacheBazel: true}
 
@@ -113,7 +119,7 @@ func (s *CacheService) casVolume(
 ) (*hostVolume, error) {
 	if hv := session.hosts[kind]; hv != nil {
 		if !hv.Mounted {
-			return nil, errors.New("the cache volume is not mounted")
+			return nil, errCASNotMounted
 		}
 
 		return hv, nil
@@ -382,7 +388,7 @@ func (s *CacheService) openCASHandle(
 	}
 	if err != nil {
 		admitted()
-		if !errors.Is(err, errCASBackoff) {
+		if !errors.Is(err, errCASBackoff) && !errors.Is(err, errCASNotMounted) {
 			s.log.Warn("a content-addressed cache is unavailable; the build continues uncached",
 				"instance", session.instance, "kind", kind, "error", err)
 		}
