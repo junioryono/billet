@@ -36,29 +36,6 @@ func TestTheAssembledProvisionerOffersTheOfflineMemberRetirement(t *testing.T) {
 	}
 }
 
-// A default-branch cache publish is proved with GitHub's record of the run, which
-// runTier finds by asserting the provisioner and the node plane by asserting its
-// JIT source. Both are the values this assembly builds, so the assertion is made
-// on them; before the adapters forwarded it, no such cache was ever proved (#317).
-func TestTheAssembledSourcesOfferRunEvidence(t *testing.T) {
-	t.Parallel()
-
-	servers, jit, err := BuildTargets([]Target{{
-		Config: config.GitHubTarget{Name: "default", Org: "acme"},
-		Client: clientFor(t, billetgithub.OrganizationTarget("acme")),
-	}})
-	if err != nil {
-		t.Fatalf("BuildTargets: %v", err)
-	}
-
-	if _, ok := servers[0].Provisioner.(server.RunEvidence); !ok {
-		t.Errorf("the provisioner runTier asserts is %T, which offers no RunEvidence", servers[0].Provisioner)
-	}
-	if _, ok := jit["default"].(server.RunEvidence); !ok {
-		t.Errorf("the node plane's JIT source is %T, which offers no RunEvidence", jit["default"])
-	}
-}
-
 // clientFor builds a real scale-set client for a target, so the assembly's
 // check that a client serves the target its config names is exercised against
 // what the constructor records rather than a zero value.

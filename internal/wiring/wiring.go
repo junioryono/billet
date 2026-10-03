@@ -113,26 +113,16 @@ func (p Provisioner) RemoveRunner(ctx context.Context, runnerID int64, runnerNam
 	return p.Client.RemoveRunner(ctx, runnerID, runnerName)
 }
 
-// THE SERVER FINDS CAPABILITIES BY ASSERTING THIS ADAPTER, not the client
-// behind it: the listener its registry for the offline-member retirement, and
-// runTier its provisioner for the run evidence a default-branch cache publish is
-// proved with. Without these methods both assertions failed in every deployment,
-// so the retirement never ran and no such cache was ever proved (#317).
-var (
-	_ server.RunnerInspector = Provisioner{}
-	_ server.RunEvidence     = Provisioner{}
-)
-
-// WorkflowRun reads GitHub's record of one run for a cache publication's proof.
-func (p Provisioner) WorkflowRun(ctx context.Context, owner, repository string, runID int64,
-) (server.WorkflowRun, error) {
-	return p.Client.WorkflowRun(ctx, owner, repository, runID)
-}
-
-// DefaultBranch reads a repository's current default branch.
-func (p Provisioner) DefaultBranch(ctx context.Context, owner, repository string) (string, error) {
-	return p.Client.DefaultBranch(ctx, owner, repository)
-}
+// THE LISTENER FINDS THE OFFLINE-MEMBER RETIREMENT BY ASSERTING ITS REGISTRY,
+// which is this adapter rather than the client behind it. Without these two
+// methods the assertion failed in every deployment and the retirement never ran
+// (#317).
+//
+// server.RunEvidence is NOT forwarded, deliberately, though runTier asserts it
+// here too: forwarding it would let a default-branch cache publish be proved for
+// the first time, and the proof accepts a tag named like the default branch
+// whose reusable workflow resolves to the same commit (#318).
+var _ server.RunnerInspector = Provisioner{}
 
 // InspectRunner reads one pool registration's state at GitHub by its exact name.
 func (p Provisioner) InspectRunner(ctx context.Context, runnerName string, runnerID int64,
@@ -348,21 +338,6 @@ func (n NodeJIT) RecoverRunner(
 	recovery, err := n.Client.RecoverRunner(ctx, runnerName)
 	return nodeplane.JITRunnerRecovery{RunnerID: recovery.RunnerID,
 		Present: recovery.Present, Busy: recovery.Busy}, err
-}
-
-// The node plane asserts its source for the run evidence a remote node's
-// default-branch cache publish is proved with, as runTier does the provisioner.
-var _ server.RunEvidence = NodeJIT{}
-
-// WorkflowRun reads GitHub's record of one run for a cache publication's proof.
-func (n NodeJIT) WorkflowRun(ctx context.Context, owner, repository string, runID int64,
-) (server.WorkflowRun, error) {
-	return n.Client.WorkflowRun(ctx, owner, repository, runID)
-}
-
-// DefaultBranch reads a repository's current default branch.
-func (n NodeJIT) DefaultBranch(ctx context.Context, owner, repository string) (string, error) {
-	return n.Client.DefaultBranch(ctx, owner, repository)
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before remote minting.
