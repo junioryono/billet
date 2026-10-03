@@ -584,14 +584,20 @@ func TestOrphanCleanupLeavesATapAnotherLeaseHasTaken(t *testing.T) {
 	deleted := map[string]bool{}
 	h.mu.Lock()
 	for _, run := range h.runs {
-		if len(run.args) == 4 && run.args[0] == "link" && run.args[1] == "del" {
-			deleted[run.args[3]] = true
+		if len(run.args) >= 2 && run.args[0] == "link" && run.args[1] == "del" {
+			deleted[run.args[len(run.args)-1]] = true
 		}
 	}
 	h.mu.Unlock()
 
 	if deleted["bt-0"] {
 		t.Error("an orphan's cleanup deleted bt-0, which another lease had claimed")
+	}
+	if deleted[""] || deleted["dev"] {
+		t.Error("an orphan's cleanup tried to delete a device with no name instead of skipping it")
+	}
+	if len(deleted) != 1 {
+		t.Errorf("an orphan's cleanup deleted %v, want only bt-1", deleted)
 	}
 	if !deleted["bt-1"] {
 		t.Error("an orphan's cleanup left the tap it still held")

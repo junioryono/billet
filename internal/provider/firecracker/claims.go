@@ -474,8 +474,10 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	// and every launch after it fails the same way until an operator deletes the
 	// device by hand. Keeping the claim is what lets a later teardown find the device
 	// and finish the job.
-	if err := p.deleteTap(ctx, res.Tap); err != nil {
-		return errors.Join(err, p.releaseUID(res.UID, jailID))
+	if res.Tap != "" {
+		if err := p.deleteTap(ctx, res.Tap); err != nil {
+			return errors.Join(err, p.releaseUID(res.UID, jailID))
+		}
 	}
 
 	return p.releaseResourcesLocked(res, jailID)

@@ -33,6 +33,28 @@ func newGatedCompute() *gatedCompute {
 	return &gatedCompute{fakeCompute: &fakeCompute{}, release: make(chan struct{})}
 }
 
+// open lets every held launch finish; safe to call more than once.
+func (g *gatedCompute) open() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	select {
+	case <-g.release:
+	default:
+		close(g.release)
+	}
+}
+
+// runGated starts the loop and, registered after it so it runs first, opens the
+// gate when the test ends: a failed assertion would otherwise leave a launch held
+// and the loop's join waiting on it until the package timeout.
+func runGated(t *testing.T, c *nodeclient.Client, compute *gatedCompute, concurrency int) {
+	t.Helper()
+
+	runLoopWith(t, c, compute, concurrency)
+	t.Cleanup(compute.open)
+}
+
 func (g *gatedCompute) Launch(
 	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job,
 ) error {
@@ -112,10 +134,13 @@ func TestLaunchesOverlapAndADestroyWaitsForThem(t *testing.T) {
 
 	p, c := harnessWithCommandTimeout(t, 30*time.Second)
 	compute := newGatedCompute()
-	runLoopWith(t, c, compute, 4)
+	runGated(t, c, compute, 4)
 	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
 
+	// CLEANUPS RUN LAST FIRST: open the gate, then join the launches, then the loop.
 	var launches sync.WaitGroup
+	t.Cleanup(launches.Wait)
+	t.Cleanup(compute.open)
 	for i := range 3 {
 		launches.Go(func() {
 			if err := p.NewRunner().Launch(t.Context(), testLease(i), server.Job{RequestID: int64(100 + i)}); err != nil {
@@ -133,17 +158,16 @@ func TestLaunchesOverlapAndADestroyWaitsForThem(t *testing.T) {
 	destroyed := make(chan error, 1)
 	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
 
-	// THE DESTROY IS HELD, which a short wait cannot prove by itself; the
-	// compute's own record below is what does.
+	// A DESTROY THAT RETURNS WHILE THE LAUNCHES ARE HELD has overtaken them. Not
+	// returning within the window proves less, which is why destroyedDuring below
+	// is the assertion that carries the test.
 	select {
 	case err := <-destroyed:
-		close(compute.release)
-		launches.Wait()
 		t.Fatalf("a destroy finished while launches were in flight: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	close(compute.release)
+	compute.open()
 	launches.Wait()
 
 	if err := <-destroyed; err != nil {
@@ -170,10 +194,12 @@ func TestLaunchesRunOneAtATimeByDefault(t *testing.T) {
 
 	p, c := harnessWithCommandTimeout(t, 30*time.Second)
 	compute := newGatedCompute()
-	runLoopWith(t, c, compute, 1)
+	runGated(t, c, compute, 1)
 	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
 
 	var launches sync.WaitGroup
+	t.Cleanup(launches.Wait)
+	t.Cleanup(compute.open)
 	for i := range 2 {
 		launches.Go(func() {
 			if err := p.NewRunner().Launch(t.Context(), testLease(i), server.Job{RequestID: int64(200 + i)}); err != nil {
@@ -191,7 +217,7 @@ func TestLaunchesRunOneAtATimeByDefault(t *testing.T) {
 	// Long enough for a second launch to have arrived had the loop taken it.
 	time.Sleep(100 * time.Millisecond)
 
-	close(compute.release)
+	compute.open()
 	launches.Wait()
 
 	if _, most := compute.peak(); most != 1 {

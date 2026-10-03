@@ -978,6 +978,18 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	launches := newLaunchSet(opts.LaunchConcurrency)
 	defer launches.wait()
 
+	// CUSTODY IS ADVANCED BY ONE CALLER AT A TIME. A launch whose report is lost
+	// takes custody from its own goroutine, and the custody it creates can settle
+	// at once; Tend and Sweep, on this loop, read and settle the same entries.
+	// Before launches overlapped all three ran on this goroutine.
+	var custody sync.Mutex
+	tend := func() error {
+		custody.Lock()
+		defer custody.Unlock()
+
+		return compute.Tend(ctx)
+	}
+
 	for {
 		if err := launches.failed(); err != nil {
 			return err
@@ -993,7 +1005,10 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		renewIfDue(ctx, c, log, opts)
 
 		if opts.SweepEvery > 0 && time.Now().After(sweepAt) {
-			if err := compute.Sweep(ctx); err != nil {
+			custody.Lock()
+			err := compute.Sweep(ctx)
+			custody.Unlock()
+			if err != nil {
 				// NOT FATAL. A sweep that fails leaves orphans for the next one; a
 				// node that stopped serving because of it would leave every job
 				// queued instead.
@@ -1004,7 +1019,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// lease once the compute behind it is confirmed gone; without this the
 			// janitor renews them forever and the capacity is never returned. The
 			// keepalive goroutine only holds them — this is what ends them.
-			if err := compute.Tend(ctx); err != nil {
+			if err := tend(); err != nil {
 				log.Error("could not advance custody; leases for compute that may already be "+
 					"gone will keep being renewed until this succeeds", "error", err)
 			}
@@ -1037,7 +1052,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// for the next five-minute sweep keeps a slot charged after its instance is
 			// already gone.
 			if compute.Holding() {
-				if err := compute.Tend(ctx); err != nil {
+				if err := tend(); err != nil {
 					log.Error("could not advance custody after the command poll; leases for "+
 						"compute that may already be gone will keep being renewed until this succeeds",
 						"error", err)
@@ -1053,7 +1068,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// Treat that boundary as part of the drain: refuse a launch, but let a
 		// destroy run under a fresh, bounded context so shutdown can still converge.
 		run := func() error {
-			return reportOutcome(ctx, c, compute, log, cmd,
+			return reportOutcome(ctx, c, compute, log, &custody, cmd,
 				executePolled(ctx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
@@ -1081,7 +1096,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 // reportOutcome reports what one command did, taking custody of a launch whose
 // report was lost. It returns an error only when the loop must stop serving.
 func reportOutcome(
-	ctx context.Context, c *Client, compute Compute, log *slog.Logger,
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, custody *sync.Mutex,
 	cmd nodeapi.Command, res nodeapi.CommandResult,
 ) error {
 	// REPORT AN OUTCOME EVEN IF SHUTDOWN LANDED WHILE THE COMMAND RAN. Using
@@ -1112,7 +1127,10 @@ func reportOutcome(
 		// runner records the lease before it tries to renew it, precisely
 		// because this call happens during the outage that lost the report
 		// — so the janitor already owns it and will keep retrying.
-		if custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf()); custodyErr != nil {
+		custody.Lock()
+		custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf())
+		custody.Unlock()
+		if custodyErr != nil {
 			log.Warn("took custody of a launch whose result was lost, but could not "+
 				"renew its lease yet; the janitor will keep trying",
 				"command", cmd.ID, "lease", cmd.Lease.ID, "error", custodyErr)
