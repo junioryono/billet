@@ -324,6 +324,8 @@ func New(
 func (r *Runner) Launch(
 	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job Job,
 ) error {
+	launchStarted := time.Now()
+
 	// SENT BY THE CONTROL PLANE, not read from a file here. A node with its own
 	// catalogue needed it to agree with the server's, and a drifted `image:` ran
 	// the wrong image with nothing reporting it.
@@ -444,7 +446,9 @@ func (r *Runner) Launch(
 		}
 	}
 
+	registrationStarted := time.Now()
 	reg, err := r.jit.JITConfig(ctx, setID, name, "_work")
+	registration := time.Since(registrationStarted)
 	if err != nil {
 		// The cached scale-set id is dropped, not reused. If the set was deleted
 		// and recreated — a teardown plus another control plane — every later
@@ -614,7 +618,9 @@ func (r *Runner) Launch(
 
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
-		"instance", inst.ID, "trust", trust)
+		"instance", inst.ID, "trust", trust,
+		"took", time.Since(launchStarted).Round(time.Millisecond),
+		"registration", registration.Round(time.Millisecond))
 
 	return nil
 }

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -37,6 +39,48 @@ import (
 // tell their jails apart afterwards.
 func (p *Provider) claimsDir(kind string) string {
 	return filepath.Join(p.cfg.ChrootBase, ".billet-"+kind)
+}
+
+// lockClaims serializes every reading-then-deleting of a claim on the host.
+//
+// THE LINK MAKES TAKING A NAME ATOMIC; IT DOES NOT MAKE FREEING ONE ATOMIC. A
+// reap reads a claim, finds its jail gone and unlinks it, and a release reads a
+// claim, finds it still its own and unlinks it. While one host-wide lifecycle
+// lock ran every launch and teardown in turn these never overlapped; with leases
+// launching at once, two launches could both read one orphan, the first reap and
+// re-take it, and the second unlink the first's live claim and take the same uid,
+// and an orphan's cleanup could delete a tap another lease had just claimed and
+// created. Every claim is therefore taken, reaped, released, and an orphan's tap
+// deleted, under this lock. It is held only for those file operations and one
+// `ip link del`, and is taken beneath the lifecycle and lease locks, never around
+// them.
+func (p *Provider) lockClaims() (func(), error) {
+	p.claimsMu.Lock()
+
+	if err := os.MkdirAll(p.cfg.ChrootBase, 0o700); err != nil {
+		p.claimsMu.Unlock()
+
+		return nil, fmt.Errorf("firecracker: create the claims lock directory: %w", err)
+	}
+
+	path := filepath.Join(p.cfg.ChrootBase, ".billet-claims.lock")
+	lock, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		p.claimsMu.Unlock()
+
+		return nil, fmt.Errorf("firecracker: open the claims lock %s: %w", path, err)
+	}
+
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		p.claimsMu.Unlock()
+
+		return nil, errors.Join(fmt.Errorf("firecracker: lock the claims: %w", err), lock.Close())
+	}
+
+	return func() {
+		_ = lock.Close()
+		p.claimsMu.Unlock()
+	}, nil
 }
 
 // claimUID takes a uid for one microVM out of the configured range.
@@ -287,6 +331,12 @@ type resources struct {
 // where billet holds an allocation nothing on disk names. A crash between two claims
 // leaves the first one recorded and reapable; a crash before any leaves nothing.
 func (p *Provider) claimResources(j jail) (resources, error) {
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return resources{}, err
+	}
+	defer unlock()
+
 	uid, err := p.claimUID(j)
 	if err != nil {
 		return resources{}, err
@@ -321,6 +371,17 @@ func (p *Provider) claimResources(j jail) (resources, error) {
 // BOTH, WHATEVER EITHER DOES. Stopping at the first failure would leak the other,
 // and these are the two things a host runs out of.
 func (p *Provider) releaseResources(res resources, jailID string) error {
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	return p.releaseResourcesLocked(res, jailID)
+}
+
+// releaseResourcesLocked is releaseResources for a caller holding lockClaims.
+func (p *Provider) releaseResourcesLocked(res resources, jailID string) error {
 	return errors.Join(p.releaseUID(res.UID, jailID), p.releaseTap(res.Tap, jailID))
 }
 
@@ -382,6 +443,26 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 		return nil
 	}
 
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// RE-READ UNDER THE LOCK. What claimedBy found is a snapshot taken without it,
+	// and the jail is gone, so a launch may have reaped this tap's claim and created
+	// its own device under the same name since. Only a claim that still names this
+	// jail authorizes deleting the device.
+	if res.Tap != "" {
+		raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("firecracker: read the claim on %s: %w", res.Tap, err)
+		}
+		if err != nil || strings.TrimSpace(string(raw)) != jailID {
+			res.Tap = ""
+		}
+	}
+
 	// THE DEVICE FIRST, because releasing the NAME while the device still exists
 	// would let another microVM claim a name the kernel already has — and `ip tuntap
 	// add` would then refuse a launch for a reason that names nothing billet did.
@@ -393,11 +474,13 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	// and every launch after it fails the same way until an operator deletes the
 	// device by hand. Keeping the claim is what lets a later teardown find the device
 	// and finish the job.
-	if err := p.deleteTap(ctx, res.Tap); err != nil {
-		return errors.Join(err, p.releaseUID(res.UID, jailID))
+	if res.Tap != "" {
+		if err := p.deleteTap(ctx, res.Tap); err != nil {
+			return errors.Join(err, p.releaseUID(res.UID, jailID))
+		}
 	}
 
-	return p.releaseResources(res, jailID)
+	return p.releaseResourcesLocked(res, jailID)
 }
 
 const defaultProcMountsPath = "/proc/mounts"

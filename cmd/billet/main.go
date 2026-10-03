@@ -1788,6 +1788,10 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		DrainTimeout:              drainTimeout,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
+		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
+		// locks each lease separately and allocates by atomic link. The others keep
+		// one command at a time until each is shown to be safe the same way.
+		LaunchConcurrency: nodeLaunchConcurrency(cfg.Node.Provider),
 		// Where the node publishes its registration record after every accepted
 		// registration, for the inspector to read: the one spelling, empty on a
 		// Mac.
@@ -2093,6 +2097,17 @@ func cacheNamespace(deployment, site string) string {
 // remoteShapes is the ordered shape catalogue this node registers, whichever
 // remote backend it runs.
 //
+// nodeLaunchConcurrency is how many launches a node of this provider runs at once.
+// Four keeps a host starting guests while no single burst outruns its disk and
+// network setup; one is a node as it always was.
+func nodeLaunchConcurrency(kind config.ProviderKind) int {
+	if kind == config.ProviderFirecracker {
+		return 4
+	}
+
+	return 1
+}
+
 // CLONED, because the registration is carried across every reconnect and the
 // caller keeps the config: a slice shared with cfg would let anything holding the
 // config widen what this host claims it may buy after the numbers were validated.

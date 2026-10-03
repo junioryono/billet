@@ -157,6 +157,11 @@ type LoopOptions struct {
 	// It governs BOTH registration and poll failures, so a caller lengthening it
 	// to calm a flapping link is not left hammering the poll endpoint.
 	Backoff time.Duration
+	// LaunchConcurrency is how many launches may run at once. One or less runs
+	// every command in order, as a node always did; more lets consecutive
+	// launches overlap, and is given only for a provider whose launches of
+	// different leases are safe to run together.
+	LaunchConcurrency int
 
 	// RegistrationRecordPath is where the node publishes its registration
 	// record after every successful registration (see record.go), or empty to
@@ -968,7 +973,28 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
 
+	// EVERY LAUNCH STARTED HERE IS REPORTED BEFORE serve RETURNS, so a
+	// re-registration never runs beside a launch begun under the last one.
+	launches := newLaunchSet(opts.LaunchConcurrency)
+	defer launches.wait()
+
+	// CUSTODY IS ADVANCED BY ONE CALLER AT A TIME. A launch whose report is lost
+	// takes custody from its own goroutine, and the custody it creates can settle
+	// at once; Tend and Sweep, on this loop, read and settle the same entries.
+	// Before launches overlapped all three ran on this goroutine.
+	var custody sync.Mutex
+	tend := func() error {
+		custody.Lock()
+		defer custody.Unlock()
+
+		return compute.Tend(ctx)
+	}
+
 	for {
+		if err := launches.failed(); err != nil {
+			return err
+		}
+
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -979,7 +1005,10 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		renewIfDue(ctx, c, log, opts)
 
 		if opts.SweepEvery > 0 && time.Now().After(sweepAt) {
-			if err := compute.Sweep(ctx); err != nil {
+			custody.Lock()
+			err := compute.Sweep(ctx)
+			custody.Unlock()
+			if err != nil {
 				// NOT FATAL. A sweep that fails leaves orphans for the next one; a
 				// node that stopped serving because of it would leave every job
 				// queued instead.
@@ -990,7 +1019,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// lease once the compute behind it is confirmed gone; without this the
 			// janitor renews them forever and the capacity is never returned. The
 			// keepalive goroutine only holds them — this is what ends them.
-			if err := compute.Tend(ctx); err != nil {
+			if err := tend(); err != nil {
 				log.Error("could not advance custody; leases for compute that may already be "+
 					"gone will keep being renewed until this succeeds", "error", err)
 			}
@@ -1023,7 +1052,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// for the next five-minute sweep keeps a slot charged after its instance is
 			// already gone.
 			if compute.Holding() {
-				if err := compute.Tend(ctx); err != nil {
+				if err := tend(); err != nil {
 					log.Error("could not advance custody after the command poll; leases for "+
 						"compute that may already be gone will keep being renewed until this succeeds",
 						"error", err)
@@ -1038,50 +1067,87 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// returns the command even though this context has just become cancelled.
 		// Treat that boundary as part of the drain: refuse a launch, but let a
 		// destroy run under a fresh, bounded context so shutdown can still converge.
-		res := executePolled(ctx, compute, cmd, draining, c.reqTimeout, c.WireVersion())
-
-		// REPORT AN OUTCOME EVEN IF SHUTDOWN LANDED WHILE THE COMMAND RAN. Using
-		// the cancelled polling context here made a successful destroy disappear;
-		// the plane waited its whole command timeout while the node had already done
-		// exactly what it asked. Report applies its own ordinary request deadline.
-		reportCtx := ctx
-		if ctx.Err() != nil {
-			reportCtx = context.WithoutCancel(ctx)
+		run := func() error {
+			return reportOutcome(ctx, c, compute, log, &custody, cmd,
+				executePolled(ctx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
-		if err := c.Report(reportCtx, res); err != nil {
-			// THE WORK IS DONE AND THE ANSWER DID NOT LAND. The report was lost and the
-			// plane timed the command out, or it arrived late and was answered with
-			// ErrCustody — either way the plane has stopped heartbeating the lease while
-			// the node holds the instance in its ordinary running set, which nothing
-			// renews. The lease is then reaped while the container runs and its capacity
-			// is sold twice, so the party that failed to report takes custody.
-			//
-			// Done before the ErrUnregistered check on purpose: being unknown to the
-			// control plane is when custody matters most, and returning first would skip it.
-			if res.OK && cmd.Kind == nodeapi.CommandLaunch && cmd.Lease != nil {
-				// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
-				// runner records the lease before it tries to renew it, precisely
-				// because this call happens during the outage that lost the report
-				// — so the janitor already owns it and will keep retrying.
-				if custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf()); custodyErr != nil {
-					log.Warn("took custody of a launch whose result was lost, but could not "+
-						"renew its lease yet; the janitor will keep trying",
-						"command", cmd.ID, "lease", cmd.Lease.ID, "error", custodyErr)
-				}
-			}
+		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
+		// that follows can hand over the next one at once. A draining node refuses
+		// launches, which is immediate, so that stays in line.
+		if cmd.Kind == nodeapi.CommandLaunch && opts.LaunchConcurrency > 1 && !draining &&
+			launches.start(ctx, run) {
+			continue
+		}
 
-			if errors.Is(err, ErrUnregistered) {
-				return err
-			}
+		// EVERYTHING ELSE WAITS FOR THE LAUNCHES IN FLIGHT, so it acts on the node
+		// as it would have when commands ran one at a time.
+		launches.wait()
+		if err := launches.failed(); err != nil {
+			return err
+		}
 
-			// Nothing is retried here: retrying a launch risks a second container
-			// for one job, and the destroy path is idempotent but has no queue yet.
-			log.Error("could not report a command's outcome; the control plane will treat "+
-				"it as unknown, and a launch as custody",
-				"command", cmd.ID, "kind", cmd.Kind, "error", err)
+		if err := run(); err != nil {
+			return err
 		}
 	}
+}
+
+// reportOutcome reports what one command did, taking custody of a launch whose
+// report was lost. It returns an error only when the loop must stop serving.
+func reportOutcome(
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, custody *sync.Mutex,
+	cmd nodeapi.Command, res nodeapi.CommandResult,
+) error {
+	// REPORT AN OUTCOME EVEN IF SHUTDOWN LANDED WHILE THE COMMAND RAN. Using
+	// the cancelled polling context here made a successful destroy disappear;
+	// the plane waited its whole command timeout while the node had already done
+	// exactly what it asked. Report applies its own ordinary request deadline.
+	reportCtx := ctx
+	if ctx.Err() != nil {
+		reportCtx = context.WithoutCancel(ctx)
+	}
+
+	err := c.Report(reportCtx, res)
+	if err == nil {
+		return nil
+	}
+
+	// THE WORK IS DONE AND THE ANSWER DID NOT LAND. The report was lost and the
+	// plane timed the command out, or it arrived late and was answered with
+	// ErrCustody — either way the plane has stopped heartbeating the lease while
+	// the node holds the instance in its ordinary running set, which nothing
+	// renews. The lease is then reaped while the container runs and its capacity
+	// is sold twice, so the party that failed to report takes custody.
+	//
+	// Done before the ErrUnregistered check on purpose: being unknown to the
+	// control plane is when custody matters most, and returning first would skip it.
+	if res.OK && cmd.Kind == nodeapi.CommandLaunch && cmd.Lease != nil {
+		// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
+		// runner records the lease before it tries to renew it, precisely
+		// because this call happens during the outage that lost the report
+		// — so the janitor already owns it and will keep retrying.
+		custody.Lock()
+		custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf())
+		custody.Unlock()
+		if custodyErr != nil {
+			log.Warn("took custody of a launch whose result was lost, but could not "+
+				"renew its lease yet; the janitor will keep trying",
+				"command", cmd.ID, "lease", cmd.Lease.ID, "error", custodyErr)
+		}
+	}
+
+	if errors.Is(err, ErrUnregistered) {
+		return err
+	}
+
+	// Nothing is retried here: retrying a launch risks a second container
+	// for one job, and the destroy path is idempotent but has no queue yet.
+	log.Error("could not report a command's outcome; the control plane will treat "+
+		"it as unknown, and a launch as custody",
+		"command", cmd.ID, "kind", cmd.Kind, "error", err)
+
+	return nil
 }
 
 // ExecuteForTest runs one command, for tests that need the command semantics
