@@ -2517,17 +2517,19 @@ func (d *renewalDriver) beat(t *testing.T, step time.Duration) bool {
 	return true
 }
 
-// throughTwoTTLs moves the allocator's clock two TTLs forward one heartbeat
-// interval at a time, delivering each tick to the loop and reaping after every
-// pass, so expiry is enforced at each step rather than once at the end. stopped
-// is the failure when the loop refuses a tick.
-func (d *renewalDriver) throughTwoTTLs(t *testing.T, a *alloc.Allocator, ttl time.Duration,
-	stopped string,
-) {
+// renewalTestTTL is the lease TTL of every test driven by a renewalDriver: long
+// enough that the TTL/3 wall-clock pass budget never decides the outcome.
+const renewalTestTTL = 30 * time.Second
+
+// throughTwoTTLs moves the allocator's clock two renewalTestTTLs forward one
+// heartbeat interval at a time, delivering each tick to the loop and reaping
+// after every pass, so expiry is enforced at each step rather than once at the
+// end. stopped is the failure when the loop refuses a tick.
+func (d *renewalDriver) throughTwoTTLs(t *testing.T, a *alloc.Allocator, stopped string) {
 	t.Helper()
 
 	for range 6 {
-		if !d.beat(t, ttl/3) {
+		if !d.beat(t, renewalTestTTL/3) {
 			t.Fatal(stopped)
 		}
 
@@ -5126,7 +5128,7 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// rather than by a background reaper, whose own scheduling once let an
 	// expired-but-unreaped lease be renewed by the assertion's Heartbeat, so a
 	// listener whose renewal had stalled the whole time passed.
-	renewal.throughTwoTTLs(t, a, ttl, "the heartbeat loop took no tick while a cleanup "+
+	renewal.throughTwoTTLs(t, a, "the heartbeat loop took no tick while a cleanup "+
 		"retry was stuck in the provider; one unreachable host delays every renewal on "+
 		"this listener")
 
@@ -5357,7 +5359,7 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	//
 	// t.Context() rather than ctx, which is cancelled: the allocator would refuse
 	// every call and the test would fail without proving anything.
-	renewal.throughTwoTTLs(t, a, ttl, "renewal stopped while the shutdown release was "+
+	renewal.throughTwoTTLs(t, a, "renewal stopped while the shutdown release was "+
 		"still destroying compute; every lease the release has not reached yet expires "+
 		"under it and the reaper frees capacity for a container still on the host")
 
@@ -7383,7 +7385,7 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	// so the only thing that can have kept the lease alive is renewal.
 	time.Sleep(grace)
 
-	renewal.throughTwoTTLs(t, a, ttl, "renewal stopped while the shutdown was still "+
+	renewal.throughTwoTTLs(t, a, "renewal stopped while the shutdown was still "+
 		"closing its session; the old maxCapacity is still live at that moment")
 
 	beat := a.Heartbeat(t.Context(), lease.ID, lease.Epoch)
@@ -7507,7 +7509,7 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	// would be proving only that an unrenewed lease dies, which needs no
 	// watchdog. Past a TTL into the teardown, still renewable, is what says
 	// renewal was running when the grace began.
-	renewal.throughTwoTTLs(t, a, ttl, "the heartbeat loop took no tick early in the "+
+	renewal.throughTwoTTLs(t, a, "the heartbeat loop took no tick early in the "+
 		"teardown; renewal was not running, so this proves nothing about the watchdog")
 
 	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
