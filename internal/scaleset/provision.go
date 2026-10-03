@@ -129,7 +129,8 @@ func (c *Client) InspectRunner(ctx context.Context, runnerName string, runnerID 
 			runnerName, recovery.RunnerID, runnerID)
 	}
 
-	return server.RunnerState{Present: true, Online: recovery.Online, Busy: recovery.Busy}, nil
+	return server.RunnerState{Present: true, Online: recovery.Online, Busy: recovery.Busy,
+		ID: recovery.RunnerID}, nil
 }
 
 // WithdrawRunner deletes exactly this runner id and nothing else.
