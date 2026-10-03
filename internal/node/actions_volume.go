@@ -25,7 +25,14 @@ func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target str
 	if err != nil {
 		return fmt.Errorf("node: mkfs.ext4 is required for Actions cache archives: %w", err)
 	}
-	if output, err := exec.CommandContext(ctx, mkfs, "-F", "-m", "0", device).CombinedOutput(); err != nil {
+	// NO DISCARD PASS. MountNew formats a volume Create has just made, a thin rbd
+	// image with nothing allocated, so mke2fs's default of discarding every block
+	// first gains nothing, and under load it was the whole cost: on 2026-10-03 the
+	// format of a 20GiB Go cache volume was killed at "Discarding device blocks:
+	// 0/5242880", and the session's cache answered "not mounted" to every request
+	// of the build after it.
+	if output, err := exec.CommandContext(ctx, mkfs, "-F", "-m", "0", "-E", "nodiscard",
+		device).CombinedOutput(); err != nil {
 		return fmt.Errorf("node: format Actions cache volume: %w: %s", err, boundedOutput(output))
 	}
 
