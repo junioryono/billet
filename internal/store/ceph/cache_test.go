@@ -3063,6 +3063,64 @@ func TestAHalfRemovedBacklogIsBudgetedSoTheTrashIsPurgedEveryPass(t *testing.T) 
 	}
 }
 
+// IMAGES THAT FAIL SLOWLY AT THE FRONT DO NOT STARVE THE REST. Without the resume
+// every pass would spend its budget on the same two failures and never reach the
+// images after them.
+func TestHalfRemovedFailuresAtTheFrontDoNotStarveTheRest(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	clock := time.Now()
+	old := clock.Add(-2 * time.Hour).Unix()
+
+	var half []string
+	for i := range 4 {
+		image := fmt.Sprintf("billet-cache/cache-v-%d-%024d", old, i)
+		half = append(half, image)
+		f.halfRemoved[image] = true
+	}
+	failing := half[:2]
+
+	// A failing finish takes six minutes and a successful one one.
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if isRemoval(args) && !slices.Contains(args, "trash") {
+			for _, image := range failing {
+				if slices.Contains(args, image) {
+					clock = clock.Add(6 * time.Minute)
+
+					return nil, errors.New("exit status 5: rbd: error: (5) Input/output error")
+				}
+			}
+			clock = clock.Add(time.Minute)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.clock = func() time.Time { return clock }
+
+	_, _ = c.PurgeTrash(t.Context())
+	clock = clock.Add(2 * halfRemovedRecheck)
+
+	// The two failures at the front spend the second pass's budget.
+	if n, _ := c.PurgeTrash(t.Context()); n != 0 {
+		t.Fatalf("the second pass finished %d, want 0: the two failures spend its budget", n)
+	}
+
+	if n, _ := c.PurgeTrash(t.Context()); n != 2 {
+		t.Fatalf("the third pass finished %d, want the 2 images after the failures", n)
+	}
+	for _, image := range half[2:] {
+		if f.halfRemoved[image] {
+			t.Errorf("%s was starved behind the failures at the front", image)
+		}
+	}
+}
+
 // THE RECHECK OUTLASTS EVERY COMMAND THAT CREATES A CACHE IMAGE. An image is
 // listed before its header exists for as long as the command creating it runs,
 // and the slowest, a lineage copy, may run for cacheCompactionLimit.
