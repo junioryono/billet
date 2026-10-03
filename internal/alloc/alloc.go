@@ -657,6 +657,24 @@ func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 // and the gap is where two listeners promise the same slots. Escrow makes the
 // promise and the reservation one act. Taking fewer than requested is ordinary.
 func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease, error) {
+	return a.EscrowLeaving(ctx, tier, want, nil)
+}
+
+// EscrowLeaving is Escrow for a tier buying ahead of its turn: it buys only while
+// every tier in protect could still be granted one lease of its own afterwards,
+// and buys nothing if one of them could not be granted one even now.
+//
+// THE FAIR ORDER HOLDS FREED ROOM FOR THE LONGEST WAITER, and a waiter that fits
+// loses nothing to a purchase that still leaves it room. Refusing that purchase
+// anyway made the fleet buy at the speed listeners woke rather than the speed
+// room freed: on 2026-10-03, with jobs finishing in seconds, a tier got four
+// runners every one to three minutes while room sat free (#346). A waiter that
+// does NOT fit is accumulating room, and nothing may take from it, which is the
+// guarantee the order exists to give (#157).
+//
+// JUDGED IN THE PURCHASE'S OWN TRANSACTION, so two tiers buying ahead at once
+// cannot each find the waiter room that the two purchases together take.
+func (a *Allocator) EscrowLeaving(ctx context.Context, tier string, want int, protect []string) ([]*Lease, error) {
 	if want < 0 {
 		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
 	}
@@ -694,6 +712,26 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 			return err
 		}
 
+		// THE WAITERS AHEAD, each measured as its own escrow would measure it.
+		guarded := make([]guardedWaiter, 0, len(protect))
+		for _, label := range protect {
+			w, ok := a.tiers[label]
+			if !ok || label == tier {
+				continue
+			}
+
+			wRoom, wPlace, err := a.headroomWithPlacer(ctx, tx, w)
+			if err != nil {
+				return err
+			}
+
+			if wRoom < 1 {
+				return nil
+			}
+
+			guarded = append(guarded, guardedWaiter{tier: w, place: wPlace})
+		}
+
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
 
@@ -703,6 +741,10 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 				// The fleet ran out before the ceiling did. Headroom is the smaller of the two, so
 				// this should not happen — but returning what was placed is the safe reading, and
 				// inserting an unplaced lease is the failure this design exists to prevent.
+				break
+			}
+
+			if !leavesRoom(guarded, target, cost, t) {
 				break
 			}
 
@@ -722,6 +764,53 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	}
 
 	return leases, nil
+}
+
+// guardedWaiter is one tier EscrowLeaving must leave room for, with the fleet as
+// that tier's own escrow would see it.
+type guardedWaiter struct {
+	tier  config.Tier
+	place *placer
+}
+
+// leavesRoom charges one placement of the buyer against every guarded waiter's
+// view and reports whether each could still be granted one lease. It charges
+// them only when the answer is yes, so a refused purchase leaves the views as
+// they were.
+//
+// CHARGED WHERE IT LANDS AND AGAINST THE DEPLOYMENT, and against the deployment
+// even when the waiter buys from another pot: that can only refuse a purchase
+// the waiter could have spared, never admit one it could not.
+func leavesRoom(guarded []guardedWaiter, target string, cost placementCost, buyer config.Tier) bool {
+	charged := make([]*placer, len(guarded))
+
+	for i, w := range guarded {
+		p := w.place.clone()
+
+		if _, ok := p.freeVCPU[target]; ok {
+			p.freeVCPU[target] -= cost.vcpu
+			p.freeMemory[target] -= cost.memory
+
+			if buyer.GuestOS == config.GuestMacOS {
+				p.freeMacOS[target]--
+			}
+		}
+
+		p.deploymentVCPU -= cost.vcpu
+		p.deploymentMemory -= cost.memory
+
+		if p.total(w.tier) < 1 {
+			return false
+		}
+
+		charged[i] = p
+	}
+
+	for i := range guarded {
+		guarded[i].place = charged[i]
+	}
+
+	return true
 }
 
 // encodeProviders renders a preference list for the ledger.
