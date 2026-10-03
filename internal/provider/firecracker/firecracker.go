@@ -124,6 +124,10 @@ type Provider struct {
 	lifecycleOnce sync.Once
 	lifecycleGate *semaphore.Weighted
 
+	// claimsMu stands in front of the claims flock inside this process; see
+	// lockClaims.
+	claimsMu sync.Mutex
+
 	// execPath and execName are the firecracker binary with its symlinks already
 	// followed, and the directory name the jailer derives from it.
 	//

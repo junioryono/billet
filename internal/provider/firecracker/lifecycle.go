@@ -375,8 +375,8 @@ func (p *Provider) publishLifecycleFile(dir, path, prefix, contents, kind, id st
 }
 
 // releaseLifecycle removes deployment authority only after every owned resource is
-// gone. The caller still holds the host-wide lock, so no replacement can start in
-// the gap between removal and the directory sync.
+// gone. The caller holds lockLease for id, or lockLifecycle, so no replacement can
+// start in the gap between removal and the directory sync.
 func (p *Provider) releaseLifecycle(id string) error {
 	if err := os.Remove(p.lifecycleFile(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("firecracker: release lifecycle authority for %s: %w", id, err)

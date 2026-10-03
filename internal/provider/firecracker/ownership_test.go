@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -443,6 +444,23 @@ func TestLeaseLocksAdmitOtherLeasesAndYieldToAWaitingList(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
+
+	// A REFUSAL IS ASSERTED AS A DEADLINE, and only a deadline: any other error
+	// would be a failure to look, not a lock that was held.
+	refused := func(what string, ctx context.Context, take func(context.Context) (func(), error)) {
+		t.Helper()
+
+		unlock, err := take(ctx)
+		if err == nil {
+			unlock()
+			t.Errorf("%s was taken", what)
+
+			return
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s answered %v, want it to wait out its deadline", what, err)
+		}
+	}
 	short := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(t.Context(), 50*time.Millisecond)
 	}
@@ -451,65 +469,154 @@ func TestLeaseLocksAdmitOtherLeasesAndYieldToAWaitingList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock the first lease: %v", err)
 	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			first()
+		}
+	}
+	defer release()
 
-	// ANOTHER LEASE PROCEEDS. Find two names on different stripes, so the
-	// assertion is about the host lock rather than a stripe collision.
+	// ANOTHER LEASE PROCEEDS, given all the time it could want: an expected
+	// success must not depend on the scheduler. The two names are on different
+	// stripes, so this is about the host lock rather than a stripe collision.
 	other := otherLeaseOnAnotherStripe(t, theInstance)
-	ctx, cancel := short()
-	second, err := h.p.lockLease(ctx, other)
-	cancel()
+	second, err := h.p.lockLease(t.Context(), other)
 	if err != nil {
-		first()
-		t.Fatalf("a different lease waited for the first one's launch: %v", err)
+		t.Fatalf("a different lease could not proceed beside the first: %v", err)
 	}
 	second()
 
 	// THE SAME LEASE WAITS.
-	ctx, cancel = short()
-	if again, err := h.p.lockLease(ctx, theInstance); err == nil {
-		again()
-		first()
-		t.Fatal("two operations held one lease at once")
-	}
+	ctx, cancel := short()
+	refused("a second lock on the same lease", ctx, func(ctx context.Context) (func(), error) {
+		return h.p.lockLease(ctx, theInstance)
+	})
 	cancel()
 
-	// A LIST WAITS FOR THE LEASE, AND WHILE IT WAITS NO NEW LEASE STARTS.
-	listed := make(chan func(), 1)
-	go func() {
-		unlock, err := h.p.lockLifecycle(t.Context())
-		if err != nil {
-			listed <- nil
-
-			return
-		}
-		listed <- unlock
-	}()
-
-	select {
-	case unlock := <-listed:
-		if unlock != nil {
+	// A LIST WAITS FOR THE LEASE, AND WHILE IT WAITS NO NEW LEASE STARTS. The
+	// worker owns its unlock and is joined on every way out of the test.
+	listCtx, stopList := context.WithCancel(t.Context())
+	listed := make(chan error, 1)
+	took := make(chan struct{})
+	var worker sync.WaitGroup
+	worker.Go(func() {
+		unlock, err := h.p.lockLifecycle(listCtx)
+		if err == nil {
+			close(took)
+			<-listCtx.Done()
 			unlock()
 		}
-		first()
+		listed <- err
+	})
+	defer func() {
+		stopList()
+		worker.Wait()
+	}()
+
+	// QUEUED, NOT MERELY STARTED: the gate refuses a non-blocking acquire exactly
+	// while a waiter is ahead of it, so this observes List in the queue rather
+	// than guessing at a sleep.
+	waitUntil(t, func() bool {
+		if h.p.gate().TryAcquire(1) {
+			h.p.gate().Release(1)
+
+			return false
+		}
+
+		return true
+	})
+
+	select {
+	case <-took:
 		t.Fatal("List took the host while a lease was being launched")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	ctx, cancel = short()
-	if late, err := h.p.lockLease(ctx, other); err == nil {
-		late()
-		first()
-		t.Fatal("a new lease started while List was waiting, so a stream of launches would starve it")
-	}
+	refused("a new lease while List was waiting", ctx, func(ctx context.Context) (func(), error) {
+		return h.p.lockLease(ctx, other)
+	})
 	cancel()
 
-	first()
+	release()
 
-	unlock := <-listed
-	if unlock == nil {
-		t.Fatal("List never took the host after the lease was released")
+	select {
+	case <-took:
+	case err := <-listed:
+		t.Fatalf("List did not take the host once the lease was released: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("List did not take the host within ten seconds of the lease being released")
 	}
-	unlock()
+}
+
+// AN ORPHAN'S CLEANUP DELETES ONLY A TAP IT STILL HOLDS. With leases launching at
+// once, a launch can reap an orphan's tap claim and create its own device under the
+// same name between claimedBy's snapshot and the deletion; deleting by the snapshot
+// would cut that guest's network.
+func TestOrphanCleanupLeavesATapAnotherLeaseHasTaken(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	dir := h.p.claimsDir("taps")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	other := otherLeaseOnAnotherStripe(t, theInstance)
+	if err := os.WriteFile(filepath.Join(dir, "bt-0"), []byte(other+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bt-1"), []byte(theInstance+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The snapshot said bt-0 was ours; another lease has since taken it.
+	if err := h.p.releaseOrphaned(t.Context(), resources{Tap: "bt-0"}, theInstance); err != nil {
+		t.Fatalf("releaseOrphaned: %v", err)
+	}
+	// And bt-1 is still ours, so it goes.
+	if err := h.p.releaseOrphaned(t.Context(), resources{Tap: "bt-1"}, theInstance); err != nil {
+		t.Fatalf("releaseOrphaned: %v", err)
+	}
+
+	deleted := map[string]bool{}
+	h.mu.Lock()
+	for _, run := range h.runs {
+		if len(run.args) == 4 && run.args[0] == "link" && run.args[1] == "del" {
+			deleted[run.args[3]] = true
+		}
+	}
+	h.mu.Unlock()
+
+	if deleted["bt-0"] {
+		t.Error("an orphan's cleanup deleted bt-0, which another lease had claimed")
+	}
+	if !deleted["bt-1"] {
+		t.Error("an orphan's cleanup left the tap it still held")
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "bt-0"))
+	if err != nil || strings.TrimSpace(string(raw)) != other {
+		t.Errorf("the other lease's claim on bt-0 = %q (%v), want it kept", raw, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bt-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the orphan's own claim on bt-1 was not released: %v", err)
+	}
+}
+
+// waitUntil polls cond for up to ten seconds.
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("the condition never held")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // otherLeaseOnAnotherStripe is a lease name whose lock stripe differs from id's.
