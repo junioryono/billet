@@ -113,16 +113,29 @@ func (p Provisioner) RemoveRunner(ctx context.Context, runnerID int64, runnerNam
 	return p.Client.RemoveRunner(ctx, runnerID, runnerName)
 }
 
-// THE LISTENER FINDS THE OFFLINE-MEMBER RETIREMENT BY ASSERTING ITS REGISTRY,
-// which is this adapter rather than the client behind it. Without these two
-// methods the assertion failed in every deployment and the retirement never ran
-// (#317).
-//
-// server.RunEvidence is NOT forwarded, deliberately, though runTier asserts it
-// here too: forwarding it would let a default-branch cache publish be proved for
-// the first time, and the proof accepts a tag named like the default branch
-// whose reusable workflow resolves to the same commit (#318).
-var _ server.RunnerInspector = Provisioner{}
+// THE LISTENER FINDS WHAT IT NEEDS BY ASSERTING THIS ADAPTER, not the client
+// behind it. Without the registry's two methods the assertion failed in every
+// deployment and the offline-member retirement never ran (#317); without the
+// run evidence every `publish: default-branch` cache answered "unproven" and
+// stayed read-only (#318). The evidence is forwarded now that a reusable
+// workflow, whose ref only a shared commit relates to the run's, may read and
+// never write.
+var (
+	_ server.RunnerInspector = Provisioner{}
+	_ server.RunEvidence     = Provisioner{}
+	_ server.RunEvidence     = NodeJIT{}
+)
+
+// WorkflowRun reads GitHub's record of one run, for a cache authority.
+func (p Provisioner) WorkflowRun(ctx context.Context, owner, repository string, runID int64,
+) (server.WorkflowRun, error) {
+	return p.Client.WorkflowRun(ctx, owner, repository, runID)
+}
+
+// DefaultBranch reads a repository's default branch, for a cache authority.
+func (p Provisioner) DefaultBranch(ctx context.Context, owner, repository string) (string, error) {
+	return p.Client.DefaultBranch(ctx, owner, repository)
+}
 
 // InspectRunner reads one pool registration's state at GitHub by its exact name.
 func (p Provisioner) InspectRunner(ctx context.Context, runnerName string, runnerID int64,
@@ -317,6 +330,19 @@ func (n NodeJIT) Describe(
 	}
 
 	return &nodeplane.JITSet{ID: set.ID, Name: set.Name}, labels, nil
+}
+
+// WorkflowRun reads GitHub's record of one run, for the node wire's cache
+// authority route.
+func (n NodeJIT) WorkflowRun(ctx context.Context, owner, repository string, runID int64,
+) (server.WorkflowRun, error) {
+	return n.Client.WorkflowRun(ctx, owner, repository, runID)
+}
+
+// DefaultBranch reads a repository's default branch, for the node wire's cache
+// authority route.
+func (n NodeJIT) DefaultBranch(ctx context.Context, owner, repository string) (string, error) {
+	return n.Client.DefaultBranch(ctx, owner, repository)
 }
 
 // JITConfig mints a registration for a remote node.

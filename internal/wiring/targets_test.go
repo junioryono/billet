@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"strings"
 	"testing"
 
@@ -36,10 +37,77 @@ func TestTheAssembledProvisionerOffersTheOfflineMemberRetirement(t *testing.T) {
 	}
 }
 
+// AND BOTH HALVES FIND THE RUN EVIDENCE a default-branch cache is proved with:
+// the listener asserts the provisioner, the node wire asserts its JIT source.
+// Neither adapter forwarded it, so every such cache answered "unproven" in every
+// deployment (#318). Asserting the interface is not enough on its own, so each
+// call is made and must come back from the client: with no GitHub policy behind
+// it, the client's own sentinel is the proof the adapter reached it.
+func TestTheAssembledTargetsForwardTheRunEvidence(t *testing.T) {
+	t.Parallel()
+
+	// NO APP ID, so the client holds no GitHub policy and answers both questions
+	// with its own sentinel rather than reaching for an installation token.
+	client, err := scaleset.New(scaleset.Config{
+		Target: billetgithub.OrganizationTarget("acme"), ClientID: "1", InstallationID: 1,
+		PrivateKey: testPrivateKey(t),
+	}, nil)
+	if err != nil {
+		t.Fatalf("scaleset.New: %v", err)
+	}
+
+	servers, jit, err := BuildTargets([]Target{{
+		Config: config.GitHubTarget{Name: "default", Org: "acme"},
+		Client: client,
+	}})
+	if err != nil {
+		t.Fatalf("BuildTargets: %v", err)
+	}
+
+	for name, value := range map[string]any{
+		"the listener's provisioner": servers[0].Provisioner,
+		"the node wire's JIT source": jit["default"],
+	} {
+		evidence, ok := value.(server.RunEvidence)
+		if !ok {
+			t.Errorf("%s is %T, which is not a server.RunEvidence", name, value)
+
+			continue
+		}
+
+		if _, err := evidence.WorkflowRun(t.Context(), "acme", "api", 31); !errors.Is(err,
+			billetgithub.ErrRunEvidenceUnavailable) {
+			t.Errorf("%s's WorkflowRun answered %v, not the client's own answer", name, err)
+		}
+		if _, err := evidence.DefaultBranch(t.Context(), "acme", "api"); !errors.Is(err,
+			billetgithub.ErrRunEvidenceUnavailable) {
+			t.Errorf("%s's DefaultBranch answered %v, not the client's own answer", name, err)
+		}
+	}
+}
+
 // clientFor builds a real scale-set client for a target, so the assembly's
 // check that a client serves the target its config names is exercised against
 // what the constructor records rather than a zero value.
 func clientFor(t *testing.T, target billetgithub.Target) *scaleset.Client {
+	t.Helper()
+
+	c, err := scaleset.New(scaleset.Config{
+		Target:         target,
+		ClientID:       "1",
+		InstallationID: 1,
+		AppID:          1,
+		PrivateKey:     testPrivateKey(t),
+	}, nil)
+	if err != nil {
+		t.Fatalf("scaleset.New: %v", err)
+	}
+
+	return c
+}
+
+// testPrivateKey is a freshly generated App key, PEM encoded.
+func testPrivateKey(t *testing.T) string {
 	t.Helper()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -47,20 +115,9 @@ func clientFor(t *testing.T, target billetgithub.Target) *scaleset.Client {
 		t.Fatalf("generate a key: %v", err)
 	}
 
-	c, err := scaleset.New(scaleset.Config{
-		Target:         target,
-		ClientID:       "1",
-		InstallationID: 1,
-		AppID:          1,
-		PrivateKey: string(pem.EncodeToMemory(&pem.Block{
-			Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key),
-		})),
-	}, nil)
-	if err != nil {
-		t.Fatalf("scaleset.New: %v", err)
-	}
-
-	return c
+	return string(pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}))
 }
 
 // BuildTargets keys both views by the target's config name and gives each the
