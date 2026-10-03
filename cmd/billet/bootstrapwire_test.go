@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -22,6 +23,79 @@ import (
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
+
+// THE NODE WIRE SERVES THROUGH A DRAIN. SIGTERM cancels the context the wire was
+// started with, and the wire stays up until its stop runs after the drain; a
+// handshake run under that context refused every node for the whole drain
+// (2026-10-03).
+func TestTheNodeWireServesAfterItsContextIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	deploymentID, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatalf("deployment id: %v", err)
+	}
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen: ":0", IdentityDir: stateDir, NodeTLSHosts: []string{"127.0.0.1"},
+	}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	served, err := serveNodeWire(ctx, cfg,
+		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
+		nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("serving the node wire: %v", err)
+	}
+
+	t.Cleanup(served.stop)
+
+	ca, err := wirecert.LoadOrCreateCA(stateDir, deploymentID)
+	if err != nil {
+		t.Fatalf("load the authority the wire minted: %v", err)
+	}
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue a node certificate: %v", err)
+	}
+
+	clientConf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	// What SIGTERM does when a drain begins.
+	cancel()
+
+	node := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: clientConf},
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		"https://127.0.0.1"+portOf(t, served.addr)+"/v1/register",
+		strings.NewReader(`{"node":"epyc-1"}`))
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	res, err := node.Do(req)
+	if err != nil {
+		t.Fatalf("an enrolled node could not reach the wire once its context was "+
+			"cancelled, which is every node for the whole of a drain: %v", err)
+	}
+
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusUnauthorized {
+		t.Errorf("the node wire told an enrolled node it had not authenticated: %s", res.Status)
+	}
+}
 
 // splitWire starts a control plane with both listeners and returns their
 // addresses and the authority they present.
