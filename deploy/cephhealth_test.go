@@ -35,7 +35,7 @@ func cephHealthScript(t *testing.T, stateDir string) string {
 		script = strings.ReplaceAll(script, from, to)
 	}
 
-	stubs := `ceph() { cat "$HEALTH"; }
+	stubs := `ceph() { cat "$HEALTH"; [ ! -e "$HEALTH.fail" ]; }
 mail() { while [ $# -gt 0 ]; do if [ "$1" = -s ]; then printf '%s\n' "$2" >>"$MAILED"; fi; shift; done; cat >/dev/null; }
 hostname() { printf 'node-1\n'; }
 `
@@ -71,6 +71,9 @@ const (
 [WRN] OSD_DOWN: 1 osds down
     osd.1 is down
 `
+	healthNameless = "HEALTH_WARN something ceph names no check for\n"
+	healthGarbage  = "monclient: hunting for new mon\n"
+	healthEmpty    = ""
 )
 
 // ONE EMAIL PER PROBLEM, AND ONLY FOR A PROBLEM. On 2026-10-03 one nearfull
@@ -105,23 +108,41 @@ func TestTheCephHealthAlertMailsEachNewProblemOnce(t *testing.T) {
 
 	steps := []struct {
 		health string
+		fail   bool
 		want   int
 		why    string
 	}{
-		{healthOK, 0, "healthy sends nothing"},
-		{healthNearfull, 1, "nearfull appears"},
-		{healthNearfull, 1, "the same nearfull an hour later"},
-		{healthNearfullMoved, 1, "nearfull with other numbers and other pools"},
-		{healthBackfillfull, 2, "backfillfull, a check not seen this episode"},
-		{healthNearfull, 2, "back down to nearfull, already seen"},
-		{healthDown, 3, "an OSD down, a new problem"},
-		{healthOK, 3, "recovery sends nothing"},
-		{healthNearfull, 4, "nearfull again after recovery is a new episode"},
+		{healthOK, false, 0, "healthy sends nothing"},
+		{healthNearfull, false, 1, "nearfull appears"},
+		{healthNearfull, false, 1, "the same nearfull an hour later"},
+		{healthNearfullMoved, false, 1, "nearfull with other numbers and other pools"},
+		{healthBackfillfull, false, 2, "backfillfull, a check not seen this episode"},
+		{healthNearfull, false, 2, "back down to nearfull, already seen"},
+		{healthDown, false, 3, "an OSD down, a new problem"},
+		{healthOK, false, 3, "recovery sends nothing"},
+		{healthNearfull, false, 4, "nearfull again after recovery is a new episode"},
+		{healthOK, false, 4, "recovered"},
+		{healthNameless, false, 5, "a warning that names no check is mailed under its status"},
+		{healthNameless, false, 5, "and only once"},
+		{healthOK, false, 5, "recovered"},
+		{healthGarbage, true, 6, "ceph failing is mailed as unreadable"},
+		{healthGarbage, true, 6, "and failing again is not mailed again"},
+		{healthEmpty, false, 6, "an empty answer is the same unreadable"},
+		{healthGarbage, false, 6, "and so is one that is not a health report"},
 	}
 
 	for i, step := range steps {
 		if err := os.WriteFile(healthFile, []byte(step.health), 0o600); err != nil {
 			t.Fatal(err)
+		}
+
+		if err := os.Remove(healthFile + ".fail"); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if step.fail {
+			if err := os.WriteFile(healthFile+".fail", nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
 		}
 
 		cmd := exec.CommandContext(t.Context(), "/bin/sh", script)
@@ -137,14 +158,15 @@ func TestTheCephHealthAlertMailsEachNewProblemOnce(t *testing.T) {
 
 	subjects := mails()
 	if !strings.Contains(subjects[0], "OSD_NEARFULL") || !strings.Contains(subjects[1], "OSD_BACKFILLFULL") ||
-		strings.Contains(subjects[1], "NEARFULL ") || !strings.Contains(subjects[2], "OSD_DOWN") {
+		strings.Contains(subjects[1], "NEARFULL ") || !strings.Contains(subjects[2], "OSD_DOWN") ||
+		!strings.Contains(subjects[4], "HEALTH_WARN") || !strings.Contains(subjects[5], "CEPH_UNREADABLE") {
 		t.Errorf("subjects %q do not name the checks that were new", subjects)
 	}
 }
 
-// A STATE WRITTEN BY THE OLD SCRIPT HOLDS THE DETAIL TEXT, and the checks in it
-// count as seen, so the converge that installs this version sends nothing for a
-// problem already mailed.
+// A STATE WRITTEN BY THE OLD SCRIPT HOLDS THE DETAIL TEXT, and what it reported
+// counts as seen, so the converge that installs this version sends nothing for a
+// problem already mailed, and the state is carried into the new form.
 func TestTheCephHealthAlertReadsTheOldStateAsSeen(t *testing.T) {
 	t.Parallel()
 
@@ -152,28 +174,58 @@ func TestTheCephHealthAlertReadsTheOldStateAsSeen(t *testing.T) {
 		t.Skip("the script uses GNU mv -T, as the hosts it is installed on do")
 	}
 
-	dir := t.TempDir()
-	stateDir := filepath.Join(dir, "state")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(stateDir, "ceph.last"), []byte(healthNearfull), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name, old, now, state string
+	}{
+		{"named checks", healthNearfull, healthNearfullMoved, "OSD_NEARFULL\nPOOL_NEARFULL\n"},
+		{"a nameless warning", healthNameless, healthNameless, "HEALTH_WARN\n"},
+		{"a failed ceph", "error connecting to the cluster\n", healthGarbage, "CEPH_UNREADABLE\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	healthFile := filepath.Join(dir, "health")
-	mailed := filepath.Join(dir, "mailed")
-	if err := os.WriteFile(healthFile, []byte(healthNearfullMoved), 0o600); err != nil {
-		t.Fatal(err)
-	}
+			dir := t.TempDir()
+			stateDir := filepath.Join(dir, "state")
+			stateFile := filepath.Join(stateDir, "ceph.last")
+			if err := os.MkdirAll(stateDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(stateFile, []byte(tc.old), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", cephHealthScript(t, stateDir))
-	cmd.Env = append(os.Environ(), "HEALTH="+healthFile, "MAILED="+mailed)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%v\n%s", err, out)
-	}
+			healthFile := filepath.Join(dir, "health")
+			mailed := filepath.Join(dir, "mailed")
+			script := cephHealthScript(t, stateDir)
+			run := func(health string) {
+				if err := os.WriteFile(healthFile, []byte(health), 0o600); err != nil {
+					t.Fatal(err)
+				}
 
-	if body, err := os.ReadFile(mailed); err == nil {
-		t.Fatalf("a nearfull already mailed by the old script was mailed again: %q", body)
+				cmd := exec.CommandContext(t.Context(), "/bin/sh", script)
+				cmd.Env = append(os.Environ(), "HEALTH="+healthFile, "MAILED="+mailed)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("%v\n%s", err, out)
+				}
+			}
+
+			run(tc.now)
+
+			if _, err := os.Stat(mailed); !os.IsNotExist(err) {
+				body, _ := os.ReadFile(mailed)
+				t.Fatalf("a problem the old script already mailed was mailed again (%v): %q", err, body)
+			}
+
+			if state, err := os.ReadFile(stateFile); err != nil || string(state) != tc.state {
+				t.Fatalf("the carried state is %q (%v), want %q", state, err, tc.state)
+			}
+
+			// AND A NEW PROBLEM STILL MAILS, so silence above was the state's doing.
+			run(healthDown)
+
+			if body, err := os.ReadFile(mailed); err != nil || !strings.Contains(string(body), "OSD_DOWN") {
+				t.Fatalf("a new problem after the carried state mailed %q (%v)", body, err)
+			}
+		})
 	}
 }

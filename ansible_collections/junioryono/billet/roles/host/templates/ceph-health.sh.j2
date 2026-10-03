@@ -15,32 +15,46 @@ mkdir -p "${state_dir}"
 
 detail=$(ceph health detail 2>&1) || status=ERROR
 status=${status:-$(printf '%s\n' "${detail}" | sed -n '1s/ .*//p')}
+# An answer that is not a health status, an empty one included, is no answer.
+case "${status}" in
+HEALTH_OK | HEALTH_WARN | HEALTH_ERR) ;;
+*) status=ERROR ;;
+esac
 # A symlink is never read: its target may be an archived secret.
 previous=$(test -f "${state_file}" && ! test -L "${state_file}" && cat "${state_file}" || true)
 
-# The check names a detail lists ("[WRN] OSD_NEARFULL: ..."), one per line. A
-# state written before this version holds the detail itself, so it is read the
-# same way and a converge never re-sends what was already sent.
-checks() {
-    printf '%s\n' "$1" | sed -nE 's/^\[(WRN|ERR)\] ([A-Z0-9_]+):.*/\2/p'
+# classify names the problems a `ceph health detail` reports, one per line: each
+# check it lists ("[WRN] OSD_NEARFULL: ..." gives OSD_NEARFULL), else its status
+# for a warning that names none, else CEPH_UNREADABLE for anything that is not a
+# health report; nothing for HEALTH_OK.
+classify() {
+    names=$(printf '%s\n' "$1" | sed -nE 's/^\[(WRN|ERR)\] ([A-Z0-9_]+):.*/\2/p')
+    if [ -n "${names}" ]; then
+        printf '%s\n' "${names}"
+
+        return 0
+    fi
+
+    case "$(printf '%s\n' "$1" | sed -n '1s/ .*//p')" in
+    HEALTH_OK | '') ;;
+    HEALTH_WARN | HEALTH_ERR) printf '%s\n' "$1" | sed -n '1s/ .*//p' ;;
+    *) printf 'CEPH_UNREADABLE\n' ;;
+    esac
 }
 
-seen=$(checks "${previous}"; printf '%s\n' "${previous}" | grep -E '^[A-Z0-9_]+$' || true)
+# The state is one name per line. A state written before this version holds the
+# detail text instead, and is classified the same way as an answer, so the
+# converge that installs this never re-sends what was already sent.
+if printf '%s\n' "${previous}" | grep -q '[^A-Z0-9_]'; then
+    seen=$(classify "${previous}")
+else
+    seen=${previous}
+fi
 
 case "${status}" in
-HEALTH_OK)
-    now=""
-    ;;
-ERROR)
-    now=CEPH_UNREADABLE
-    ;;
-*)
-    now=$(checks "${detail}")
-    # A status with no check named is still a problem, under its own name.
-    if [ -z "${now}" ]; then
-        now=${status}
-    fi
-    ;;
+HEALTH_OK) now="" ;;
+ERROR) now=CEPH_UNREADABLE ;;
+*) now=$(classify "${detail}") ;;
 esac
 
 new=""
