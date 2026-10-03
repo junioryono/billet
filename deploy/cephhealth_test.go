@@ -72,8 +72,10 @@ const (
     osd.1 is down
 `
 	healthNameless = "HEALTH_WARN something ceph names no check for\n"
-	healthGarbage  = "monclient: hunting for new mon\n"
-	healthEmpty    = ""
+	// stateMarker is the first line of a state this version writes.
+	stateMarker   = "# billet ceph health checks seen since the last HEALTH_OK\n"
+	healthGarbage = "monclient: hunting for new mon\n"
+	healthEmpty   = ""
 )
 
 // ONE EMAIL PER PROBLEM, AND ONLY FOR A PROBLEM. On 2026-10-03 one nearfull
@@ -177,9 +179,12 @@ func TestTheCephHealthAlertReadsTheOldStateAsSeen(t *testing.T) {
 	for _, tc := range []struct {
 		name, old, now, state string
 	}{
-		{"named checks", healthNearfull, healthNearfullMoved, "OSD_NEARFULL\nPOOL_NEARFULL\n"},
-		{"a nameless warning", healthNameless, healthNameless, "HEALTH_WARN\n"},
-		{"a failed ceph", "error connecting to the cluster\n", healthGarbage, "CEPH_UNREADABLE\n"},
+		{"named checks", healthNearfull, healthNearfullMoved, stateMarker + "OSD_NEARFULL\nPOOL_NEARFULL\n"},
+		{"a nameless warning", healthNameless, healthNameless, stateMarker + "HEALTH_WARN\n"},
+		{"a failed ceph", "error connecting to the cluster\n", healthGarbage, stateMarker + "CEPH_UNREADABLE\n"},
+		// AN UPPERCASE WORD ALONE was an earlier version's detail for a failure, and
+		// without the marker it would have read as a name this version wrote.
+		{"a lone uppercase diagnostic", "ERROR\n", healthGarbage, stateMarker + "CEPH_UNREADABLE\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

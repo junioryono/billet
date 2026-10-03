@@ -13,8 +13,18 @@ state_dir=/var/lib/billet/health
 state_file=${state_dir}/ceph.last
 mkdir -p "${state_dir}"
 
+# The state's first line, so a state this version wrote is never read as the
+# detail text an earlier version wrote, or the other way round.
+marker='# billet ceph health checks seen since the last HEALTH_OK'
+
+# first_word prints the first word of the first line, also when the line is
+# that word alone, as a healthy `ceph health detail` prints HEALTH_OK.
+first_word() {
+    printf '%s\n' "$1" | awk 'NR == 1 { print $1 }'
+}
+
 detail=$(ceph health detail 2>&1) || status=ERROR
-status=${status:-$(printf '%s\n' "${detail}" | sed -n '1s/ .*//p')}
+status=${status:-$(first_word "${detail}")}
 # An answer that is not a health status, an empty one included, is no answer.
 case "${status}" in
 HEALTH_OK | HEALTH_WARN | HEALTH_ERR) ;;
@@ -35,20 +45,22 @@ classify() {
         return 0
     fi
 
-    case "$(printf '%s\n' "$1" | sed -n '1s/ .*//p')" in
+    word=$(first_word "$1")
+    case "${word}" in
     HEALTH_OK | '') ;;
-    HEALTH_WARN | HEALTH_ERR) printf '%s\n' "$1" | sed -n '1s/ .*//p' ;;
+    HEALTH_WARN | HEALTH_ERR) printf '%s\n' "${word}" ;;
     *) printf 'CEPH_UNREADABLE\n' ;;
     esac
 }
 
-# The state is one name per line. A state written before this version holds the
-# detail text instead, and is classified the same way as an answer, so the
-# converge that installs this never re-sends what was already sent.
-if printf '%s\n' "${previous}" | grep -q '[^A-Z0-9_]'; then
-    seen=$(classify "${previous}")
+# A state this version wrote is the marker and one name per line. Anything else
+# is what an earlier version wrote, the detail text, and is classified the same
+# way as an answer, so the converge that installs this never re-sends what was
+# already sent.
+if [ "$(printf '%s\n' "${previous}" | sed -n 1p)" = "${marker}" ]; then
+    seen=$(printf '%s\n' "${previous}" | sed 1d)
 else
-    seen=${previous}
+    seen=$(classify "${previous}")
 fi
 
 case "${status}" in
@@ -78,6 +90,10 @@ fi
 # -T keeps a symlink to a directory from receiving the file inside it.
 state_tmp=$(mktemp "${state_dir}/.ceph.last.XXXXXXXX")
 trap 'rm -f "${state_tmp}"' EXIT HUP INT TERM
-printf '%s\n' "${record}" >"${state_tmp}"
+if [ -n "${record}" ]; then
+    printf '%s\n%s\n' "${marker}" "${record}" >"${state_tmp}"
+else
+    printf '%s\n' "${marker}" >"${state_tmp}"
+fi
 mv -fT -- "${state_tmp}" "${state_file}"
 trap - EXIT HUP INT TERM
