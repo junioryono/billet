@@ -15,24 +15,31 @@ import (
 )
 
 type cacheFake struct {
-	calls                [][]string
-	images               map[string]bool
-	snapshots            map[string]bool
-	parents              map[string]string
-	depths               map[string]int
-	trash                map[string]string
-	metadata             map[string]map[string]string
-	mappings             map[string]string
-	lockCookie           string
-	locker               string
-	heartbeat            func() string
-	heartbeatErr         error
-	lockAdds             int
-	lockAddErr           error
-	lockAddErrOn         int
-	cancelLockAddOn      int
-	cancelLockAdd        context.CancelFunc
-	committedLockAddErr  error
+	calls               [][]string
+	images              map[string]bool
+	snapshots           map[string]bool
+	parents             map[string]string
+	depths              map[string]int
+	trash               map[string]string
+	metadata            map[string]map[string]string
+	mappings            map[string]string
+	lockCookie          string
+	locker              string
+	heartbeat           func() string
+	heartbeatErr        error
+	lockAdds            int
+	lockAddErr          error
+	lockAddErrOn        int
+	cancelLockAddOn     int
+	cancelLockAdd       context.CancelFunc
+	committedLockAddErr error
+	// lateLockAddOn makes that add answer lateLockAddErr without taking the lock,
+	// and the cluster commit it at the first lock command after the attempt's
+	// own listing: an add whose answer was lost and which landed afterwards.
+	lateLockAddOn        int
+	lateLockAddErr       error
+	pendingCookie        string
+	pendingAfterLists    int
 	lockLists            int
 	lockListCanceledErr  error
 	releaseAfterLockList int
@@ -203,11 +210,21 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 }
 
 func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
+	if f.pendingCookie != "" && f.lockLists >= f.pendingAfterLists && f.lockCookie == "" {
+		f.lockCookie = f.pendingCookie
+		f.pendingCookie = ""
+	}
 	switch args[0] {
 	case "add":
 		f.lockAdds++
 		if f.lockAddErr != nil && (f.lockAddErrOn == 0 || f.lockAdds == f.lockAddErrOn) {
 			return nil, f.lockAddErr
+		}
+		if f.lockAdds == f.lateLockAddOn {
+			f.pendingCookie = args[2]
+			f.pendingAfterLists = f.lockLists + 1
+
+			return nil, f.lateLockAddErr
 		}
 		if f.lockAdds == f.releaseOn {
 			f.lockCookie = ""
@@ -747,6 +764,111 @@ func TestCacheIndexLockPreservesReleaseFailureAfterCanceledAmbiguousAdds(t *test
 				}
 			}
 		})
+	}
+}
+
+// AN ADD THAT LANDED AFTER ITS ATTEMPT GAVE UP IS TAKEN BACK BY THE NEXT ONE.
+// Measured 2026-10-03: a cache-index `lock add` killed at the rbd bound was
+// committed afterwards, nothing owned it, and every cache operation on the site
+// waited out the ten-minute stale bound. Each case bounds the second caller well
+// below that, so a regression fails here instead of waiting.
+func TestACacheIndexLockThisProcessAbandonedIsRemovedByItsNextAttempt(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		setup func(*cacheFake)
+		// firstFails says the first caller's own call fails; a lost release still
+		// runs the work.
+		firstFails bool
+	}{
+		{
+			name: "an add whose answer was lost and which landed afterwards",
+			setup: func(f *cacheFake) {
+				f.lateLockAddOn = 1
+				f.lateLockAddErr = fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+			},
+			firstFails: true,
+		},
+		{
+			name: "a release whose removal did not answer",
+			setup: func(f *cacheFake) {
+				f.lockRemoveErrOn = 1
+				f.lockRemoveErr = fmt.Errorf("rbd did not answer: %w", context.DeadlineExceeded)
+			},
+			firstFails: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			tc.setup(f)
+			c := cacheClient(t, f)
+			c.cacheLockRetry = time.Millisecond
+
+			err := c.withCacheLock(t.Context(), time.Now(), func(time.Time) error { return nil })
+			if tc.firstFails && err == nil {
+				t.Fatal("the first caller reported success although its lock was left behind")
+			}
+			var first string
+			for _, call := range f.calls {
+				if i := slices.Index(call, "add"); i >= 0 && slices.Contains(call, "lock") {
+					first = call[i+2]
+
+					break
+				}
+			}
+			if first == "" {
+				t.Fatal("the first caller never added a lock")
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			ran := false
+			if err := c.withCacheLock(ctx, time.Now(), func(time.Time) error {
+				ran = true
+
+				return nil
+			}); err != nil {
+				t.Fatalf("the next caller could not take the lock the first abandoned: %v", err)
+			}
+			if !ran {
+				t.Fatal("the next caller's work did not run")
+			}
+			if !f.ranWith("lock", "rm", first) {
+				t.Fatalf("the abandoned lock %q was never removed", first)
+			}
+			if f.lockCookie != "" || f.pendingCookie != "" {
+				t.Fatalf("a lock is still held after both callers finished: %q %q",
+					f.lockCookie, f.pendingCookie)
+			}
+		})
+	}
+}
+
+// A YOUNG LOCK THIS PROCESS NEVER ABANDONED IS ANOTHER HOLDER'S, and is waited
+// for rather than removed.
+func TestACacheIndexLockHeldUnderAnotherCookieIsNotRemoved(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	holder := fmt.Sprintf("billet-import-otherhost-9-0123456789abcdef-%d", now.Unix())
+	f := newCacheFake()
+	f.lockCookie = holder
+	c := cacheClient(t, f)
+	c.abandon(c.cacheIndex(), "billet-import-thishost-1-fedcba9876543210-1")
+
+	lock, err := c.takeLock(t.Context(), c.cacheIndex(),
+		"billet-import-thishost-1-0011223344556677-1", now, CacheLockStaleAfter)
+	if lock != nil || !errors.Is(err, errLockContended) {
+		t.Fatalf("taking a lock another holder holds returned %v, %v; want contention", lock, err)
+	}
+	if f.lockLists == 0 {
+		t.Fatal("the holder was never listed, so the exclusion decision was not reached")
+	}
+	if f.ranWith("lock", "rm", holder) || f.lockCookie != holder {
+		t.Fatal("another holder's young lock was removed")
 	}
 }
 
