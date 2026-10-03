@@ -826,3 +826,38 @@ func gitCacheSpecForTest() *config.CacheSpec {
 
 	return &spec
 }
+
+// A FAILED ATTACH IS NOT RETRIED BY EVERY REQUEST. A build asks for objects by
+// the thousand and an attach takes the site's one cache index lock; retried per
+// request, one failure starved every other session's cache work, the Docker
+// image store a guest's runner waits on among it (#320). The kind is refused
+// without touching storage until casAttachBackoff passes, then tried once more.
+func TestAFailedCASAttachIsNotRetriedUntilTheBackoffPasses(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{createErr: errors.New("ceph: wait for the cache index lock: context canceled")}
+	service, _, token, _ := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+
+	now := time.Date(2026, 10, 3, 5, 40, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+
+	path := "/v1/cas/go/cas/" + digestOf("compiled object")
+	for i := range 10 {
+		if got := casRequest(t, service, token, http.MethodGet, path, ""); got.Code == http.StatusOK {
+			t.Fatalf("request %d was served from a cache that never attached", i)
+		}
+	}
+
+	if len(storage.keys) != 1 {
+		t.Fatalf("storage was asked to attach %d time(s) for 10 requests inside the backoff, want 1",
+			len(storage.keys))
+	}
+
+	now = now.Add(casAttachBackoff)
+	casRequest(t, service, token, http.MethodGet, path, "")
+
+	if len(storage.keys) != 2 {
+		t.Fatalf("storage was asked %d time(s) once the backoff passed, want one more attempt (2)",
+			len(storage.keys))
+	}
+}
