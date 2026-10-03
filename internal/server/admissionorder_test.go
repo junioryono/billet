@@ -71,6 +71,94 @@ func orderedListeners(t *testing.T, tiers []config.Tier, vcpu int,
 	return a, log, listeners
 }
 
+// A TIER'S TURN BUYS A WHOLE BATCH. Re-dated after every purchase, the tier at the
+// head lost its place after one member, so every tier bought one runner per turn
+// while room sat free: on 2026-10-03 the fleet bought one runner every 45 seconds
+// to 3 minutes with 40 vCPU free. Re-dated once per pass, the head buys up to its
+// batch, and the turn still passes on afterwards.
+func TestAWaitingTiersTurnBuysItsWholeBatch(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tierOf("a-small", 4), tierOf("b-small", 4), tierOf("c-small", 4)}
+	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerHost(t, a)
+
+	log := &launchLog{}
+	s := New(a, nil, tiers, "order-test", nil, WithNodeRunner(log), WithAdmissionOrder(config.AdmissionFair))
+	batched := append(s.listenerOpts(nil), WithPoolLaunchBatch(4))
+	first := NewListener(a, tiers[0].Label, &fakeSession{}, batched...)
+	second := NewListener(a, tiers[1].Label, &fakeSession{}, batched...)
+	other := NewListener(a, tiers[2].Label, &fakeSession{}, batched...)
+
+	var mu sync.Mutex
+	clock := time.Date(2026, 10, 3, 20, 30, 0, 0, time.UTC)
+	first.order.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		clock = clock.Add(time.Second)
+
+		return clock
+	}
+
+	// ANOTHER TIER HOLDS ONE SLOT, so the first tier, filling the other two and
+	// still wanting more, could grow once that slot frees and is recorded as
+	// waiting; a tier that holds the whole fleet could not grow and would not be.
+	if err := other.reconcilePool(t.Context(), 1); err != nil {
+		t.Fatalf("other tier reconcile: %v", err)
+	}
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile: %v", err)
+	}
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile: %v", err)
+	}
+
+	if _, _, waiting := first.order.waitingSince("a-small"); !waiting {
+		t.Fatal("the first tier found no room for its demand and is not recorded as waiting")
+	}
+	if _, _, waiting := second.order.waitingSince("b-small"); !waiting {
+		t.Fatal("the second tier found no room for its demand and is not recorded as waiting")
+	}
+	if got := log.tiers(); len(got) != 3 {
+		t.Fatalf("started %v, want the other tier's runner and the first tier's two", got)
+	}
+
+	// Two of the first tier's slots free at once. It is at the head and takes both.
+	freeOneLease(t, a)
+	freeOneLease(t, a)
+
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile on its turn: %v", err)
+	}
+
+	got := log.tiers()
+	if len(got) != 5 || got[3] != "a-small" || got[4] != "a-small" {
+		t.Fatalf("started %v, want the head tier's turn to buy both freed slots", got)
+	}
+
+	// AND THE TURN PASSES: one more slot frees, and the first tier, having just
+	// had its turn, does not take it ahead of the second.
+	freeOneLease(t, a)
+
+	if err := first.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("first tier reconcile after its turn: %v", err)
+	}
+	if got := log.tiers(); len(got) != 5 {
+		t.Fatalf("started %v: the first tier bought again while the second waited", got)
+	}
+
+	if err := second.reconcilePool(t.Context(), 10); err != nil {
+		t.Fatalf("second tier reconcile on its turn: %v", err)
+	}
+	if got := log.tiers(); len(got) != 6 || got[5] != "b-small" {
+		t.Fatalf("started %v, want the second tier to take the next freed slot", got)
+	}
+}
+
 // contenders is the fixture both policies are judged on: room for exactly two
 // small jobs OR one large one, with both tiers wanting work at once. A fleet
 // where everything fits cannot tell the policies apart.
