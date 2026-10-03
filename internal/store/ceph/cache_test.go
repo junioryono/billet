@@ -2992,6 +2992,135 @@ func TestAHalfRemovedCheckThatCannotTellKeepsTheImage(t *testing.T) {
 	}
 }
 
+// A BACKLOG OF HALF-REMOVED IMAGES DOES NOT HOLD THE TRASH BACK. Each finish takes
+// tens of seconds, and on 2026-10-03 1,256 of them held one pass for hours while
+// the trash, deleted at the start of each pass, grew until the pool was nearfull.
+// A pass stops finishing at halfRemovedBudget, and the next deletes the trash
+// first and resumes the finishing where the last one stopped.
+func TestAHalfRemovedBacklogIsBudgetedSoTheTrashIsPurgedEveryPass(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	clock := time.Now()
+
+	// EVERY FINISH TAKES FOUR MINUTES of the purge's clock, so the budget is
+	// spent after three of them.
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if isRemoval(args) && !slices.Contains(args, "trash") {
+			clock = clock.Add(4 * time.Minute)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.clock = func() time.Time { return clock }
+
+	old := clock.Add(-2 * time.Hour).Unix()
+	var half []string
+	for i := range 5 {
+		image := fmt.Sprintf("billet-cache/cache-v-%d-%024d", old, i)
+		half = append(half, image)
+		f.halfRemoved[image] = true
+	}
+
+	// The first pass only sights them.
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	clock = clock.Add(2 * halfRemovedRecheck)
+
+	n, err := c.PurgeTrash(t.Context())
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("the second pass finished %d half-removed image(s), want 3 within %s at four minutes each",
+			n, halfRemovedBudget)
+	}
+
+	// A discard lands in the trash while the backlog remains.
+	f.trash["id-root"] = "billet-624131f5"
+
+	n, err = c.PurgeTrash(t.Context())
+	if err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+	if _, kept := f.trash["id-root"]; kept {
+		t.Fatal("the trash was not purged while half-removed images were still waiting")
+	}
+	if n != 3 {
+		t.Fatalf("the third pass deleted %d, want the trashed root disk and the last two half-removed images", n)
+	}
+	for _, image := range half {
+		if f.halfRemoved[image] {
+			t.Errorf("%s was never finished: the pass did not resume where the last stopped", image)
+		}
+	}
+}
+
+// IMAGES THAT FAIL SLOWLY AT THE FRONT DO NOT STARVE THE REST. Without the resume
+// every pass would spend its budget on the same two failures and never reach the
+// images after them.
+func TestHalfRemovedFailuresAtTheFrontDoNotStarveTheRest(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	clock := time.Now()
+	old := clock.Add(-2 * time.Hour).Unix()
+
+	var half []string
+	for i := range 4 {
+		image := fmt.Sprintf("billet-cache/cache-v-%d-%024d", old, i)
+		half = append(half, image)
+		f.halfRemoved[image] = true
+	}
+	failing := half[:2]
+
+	// A failing finish takes six minutes and a successful one one.
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if isRemoval(args) && !slices.Contains(args, "trash") {
+			for _, image := range failing {
+				if slices.Contains(args, image) {
+					clock = clock.Add(6 * time.Minute)
+
+					return nil, errors.New("exit status 5: rbd: error: (5) Input/output error")
+				}
+			}
+			clock = clock.Add(time.Minute)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	c.clock = func() time.Time { return clock }
+
+	_, _ = c.PurgeTrash(t.Context())
+	clock = clock.Add(2 * halfRemovedRecheck)
+
+	// The two failures at the front spend the second pass's budget.
+	if n, _ := c.PurgeTrash(t.Context()); n != 0 {
+		t.Fatalf("the second pass finished %d, want 0: the two failures spend its budget", n)
+	}
+
+	if n, _ := c.PurgeTrash(t.Context()); n != 2 {
+		t.Fatalf("the third pass finished %d, want the 2 images after the failures", n)
+	}
+	for _, image := range half[2:] {
+		if f.halfRemoved[image] {
+			t.Errorf("%s was starved behind the failures at the front", image)
+		}
+	}
+}
+
 // THE RECHECK OUTLASTS EVERY COMMAND THAT CREATES A CACHE IMAGE. An image is
 // listed before its header exists for as long as the command creating it runs,
 // and the slowest, a lineage copy, may run for cacheCompactionLimit.
