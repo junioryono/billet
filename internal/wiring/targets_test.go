@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"strings"
 	"testing"
 
@@ -33,6 +34,45 @@ func TestTheAssembledProvisionerOffersTheOfflineMemberRetirement(t *testing.T) {
 	if _, ok := registry.(server.RunnerInspector); !ok {
 		t.Fatalf("the provisioner handed to every listener is %T, which is not a RunnerInspector",
 			servers[0].Provisioner)
+	}
+}
+
+// AND BOTH HALVES FIND THE RUN EVIDENCE a default-branch cache is proved with:
+// the listener asserts the provisioner, the node wire asserts its JIT source.
+// Neither adapter forwarded it, so every such cache answered "unproven" in every
+// deployment (#318). Asserting the interface is not enough on its own, so each
+// call is made and must come back from the client: with no GitHub policy behind
+// it, the client's own sentinel is the proof the adapter reached it.
+func TestTheAssembledTargetsForwardTheRunEvidence(t *testing.T) {
+	t.Parallel()
+
+	servers, jit, err := BuildTargets([]Target{{
+		Config: config.GitHubTarget{Name: "default", Org: "acme"},
+		Client: clientFor(t, billetgithub.OrganizationTarget("acme")),
+	}})
+	if err != nil {
+		t.Fatalf("BuildTargets: %v", err)
+	}
+
+	for name, value := range map[string]any{
+		"the listener's provisioner": servers[0].Provisioner,
+		"the node wire's JIT source": jit["default"],
+	} {
+		evidence, ok := value.(server.RunEvidence)
+		if !ok {
+			t.Errorf("%s is %T, which is not a server.RunEvidence", name, value)
+
+			continue
+		}
+
+		if _, err := evidence.WorkflowRun(t.Context(), "acme", "api", 31); !errors.Is(err,
+			billetgithub.ErrRunEvidenceUnavailable) {
+			t.Errorf("%s's WorkflowRun answered %v, not the client's own answer", name, err)
+		}
+		if _, err := evidence.DefaultBranch(t.Context(), "acme", "api"); !errors.Is(err,
+			billetgithub.ErrRunEvidenceUnavailable) {
+			t.Errorf("%s's DefaultBranch answered %v, not the client's own answer", name, err)
+		}
 	}
 }
 

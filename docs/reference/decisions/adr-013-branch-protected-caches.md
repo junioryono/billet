@@ -23,7 +23,7 @@ Under `default-branch`, a job's writes publish only when all of the following ho
 - **The job's workflow is the run's.** It is the run's top-level workflow, or one it called at the run's own commit.
 - **The repository is the pool's scope.** It equals the tier's static repository.
 
-Everything else, including a pull request, a tag, `pull_request_target`, a reusable workflow pinned elsewhere, and any failure to ask, publishes nothing. One function, `server.DecideCacheAuthority`, holds the rule, and the node receives its verdict with the completion's destroy command (wire 23). The App needs `actions: read` to read the run; `billet github-app create` requests it by default.
+Everything else, including a pull request, a tag, `pull_request_target`, any reusable workflow (#318: one called at the run's own commit cannot be told from a same-named tag at that commit), and any failure to ask, publishes nothing. One function, `server.DecideCacheAuthority`, holds the rule, and the node receives its verdict with the completion's destroy command (wire 23). The App needs `actions: read` to read the run; `billet github-app create` requests it by default.
 
 **Reads are the pool's, in a namespace of their own.** Default-branch keys live under `<namespace>.scoped/<trust>/<owner>/<repo>/<arch>/<kind>/…`. No trusted-only key and no guest-chosen key can reach that prefix, so an untrusted pool never reads a trusted pool's generations. The namespace is the tier's static repository because caches are attached before the job is chosen. Any job of that pool reads what it published, which is GitHub's model.
 

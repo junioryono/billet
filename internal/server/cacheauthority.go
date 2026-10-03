@@ -132,7 +132,7 @@ func DecideCacheAuthority(
 		return authority
 	}
 
-	ref, ok := jobRef(full, identity, run, defaultBranch)
+	ref, own, ok := jobRef(full, identity, run, defaultBranch)
 	if !ok {
 		return authority
 	}
@@ -143,6 +143,17 @@ func DecideCacheAuthority(
 	if identity.Event == "pull_request" && len(run.PullRequests) == 1 {
 		authority.BaseRef = "refs/heads/" + run.PullRequests[0].Base
 	}
+
+	// A REUSABLE WORKFLOW READS AND NEVER WRITES. Its ref is the callee's, and the
+	// only thing relating it to the run's own ref is the commit both resolved to:
+	// a tag named main at commit S calling `@refs/heads/main` while the branch is
+	// also at S presents exactly what a push to main calling a local workflow does,
+	// and GitHub records nothing else that tells them apart (#318). A job defined in
+	// the run's top-level workflow carries the run's own triggering ref, which does.
+	if !own {
+		return authority
+	}
+
 	if ref == authority.DefaultRef {
 		authority.PublishDefault = defaultBranchWriters[identity.Event]
 		authority.WriteOwnRef = authority.PublishDefault
@@ -153,30 +164,32 @@ func DecideCacheAuthority(
 	return authority
 }
 
-// jobRef is the ref the job runs for, or false when the evidence cannot say.
+// jobRef is the ref the job runs for, and whether that ref is the run's own
+// triggering ref rather than a reusable workflow's; false when the evidence
+// cannot say.
 //
 // THE WORKFLOW REF IS TRUSTED ONLY WHERE IT IS THE RUN'S OWN. A job defined in
-// the run's top-level workflow carries that workflow's ref; so does a reusable
-// workflow of the same repository that GitHub records at the run's own commit,
-// since a local `./` call runs at that commit. A reusable workflow pinned to
-// another ref carries the callee's ref, and a push to a feature branch calling
-// `owner/repo/...@main` would otherwise read as a push to main. For a branch
-// event the ref must also name the run's head branch, which is what tells a
-// branch from a tag GitHub reports under the same head-branch name.
+// the run's top-level workflow carries that workflow's ref. A reusable workflow
+// of the same repository that GitHub records at the run's own commit ran that
+// commit's code, so its ref places the job for reading, but it is the callee's
+// ref and is never the run's own (#318). A reusable workflow pinned to another
+// commit carries a ref unrelated to the run, and a push to a feature branch
+// calling `owner/repo/...@main` would otherwise read as a push to main. For a
+// branch event the ref must also name the run's head branch.
 func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 	defaultBranch string,
-) (string, bool) {
+) (ref string, own, ok bool) {
 	workflow, ref, ok := strings.Cut(identity.WorkflowRef, "@")
 	if !ok || ref == "" || strings.Contains(ref, "@") {
-		return "", false
+		return "", false, false
 	}
 	owner, rest, ok := strings.Cut(workflow, "/")
 	if !ok {
-		return "", false
+		return "", false, false
 	}
 	repository, path, ok := strings.Cut(rest, "/")
 	if !ok || !strings.EqualFold(owner+"/"+repository, full) || path == "" {
-		return "", false
+		return "", false, false
 	}
 
 	// A FILE NAMED LIKE THE TOP-LEVEL WORKFLOW IS THE TOP-LEVEL WORKFLOW ONLY IF
@@ -185,34 +198,34 @@ func jobRef(full string, identity alloc.JobIdentity, run WorkflowRun,
 	called := calledByTheRun(identity.WorkflowRef, run)
 	topLevel := path == run.Path && !called
 	if !topLevel && !calledAtTheRunsCommit(identity.WorkflowRef, run) {
-		return "", false
+		return "", false, false
 	}
 
 	switch {
 	case identity.Event == "pull_request":
 		if len(run.PullRequests) != 1 {
-			return "", false
+			return "", false, false
 		}
 		want := "refs/pull/" + strconv.FormatInt(run.PullRequests[0].Number, 10) + "/merge"
 		if ref != want {
-			return "", false
+			return "", false, false
 		}
 
-		return ref, true
+		return ref, topLevel, true
 	case branchEvents[identity.Event]:
 		if run.HeadBranch == "" || ref != "refs/heads/"+run.HeadBranch {
-			return "", false
+			return "", false, false
 		}
 
-		return ref, true
+		return ref, topLevel, true
 	case defaultBranchReaders[identity.Event]:
 		if ref != "refs/heads/"+defaultBranch {
-			return "", false
+			return "", false, false
 		}
 
-		return ref, true
+		return ref, topLevel, true
 	default:
-		return "", false
+		return "", false, false
 	}
 }
 
