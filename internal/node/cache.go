@@ -113,6 +113,9 @@ type cacheSession struct {
 	// session, and casAdmit bounds their concurrent transfers.
 	hosts    map[config.CacheKind]*hostVolume
 	casAdmit chan struct{}
+	// casRetryAt is when a kind whose attach failed may be attached again, under
+	// mu; see casAttachBackoff.
+	casRetryAt map[config.CacheKind]time.Time
 	// pathID names the session's host mount points. It is not the bearer, which
 	// must never reach a mount table or a mount's argv; a session recorded by an
 	// older binary keeps its token here, so what it mounted is still found.

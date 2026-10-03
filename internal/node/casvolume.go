@@ -47,7 +47,17 @@ const (
 	// casReleaseWait bounds how long the cache loop waits for a closed
 	// session's transfers to end before it tries again on a later pass.
 	casReleaseWait = 5 * time.Second
+	// casAttachBackoff is how long a kind whose attach failed is refused without
+	// trying again. A build asks for objects by the thousand, and an attach takes
+	// the site's one cache index lock: retried per request, a single failure
+	// became a stream of lock attempts that starved every other session's cache
+	// work, the Docker image store a guest's runner waits on among it (#320).
+	casAttachBackoff = 5 * time.Minute
 )
+
+// errCASBackoff is a transfer refused because its kind's attach failed within
+// casAttachBackoff; the failure itself was logged when it happened.
+var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
 
 // casKinds are the caches served from a content-addressed volume.
 var casKinds = map[config.CacheKind]bool{config.CacheGo: true, config.CacheBazel: true}
@@ -113,6 +123,18 @@ func (s *CacheService) casVolume(
 		return nil, errCacheOff
 	}
 
+	if retryAt, failed := session.casRetryAt[kind]; failed && s.now().Before(retryAt) {
+		return nil, errCASBackoff
+	}
+
+	backOff := func() {
+		if session.casRetryAt == nil {
+			session.casRetryAt = make(map[config.CacheKind]time.Time)
+		}
+
+		session.casRetryAt[kind] = s.now().Add(casAttachBackoff)
+	}
+
 	ceiling := volumeCeiling(setting)
 	key := s.cacheKeyFor(session, kind, "", "")
 	volume, cold, err := s.cloneWithin(ctx, key, ceiling)
@@ -120,6 +142,8 @@ func (s *CacheService) casVolume(
 		volume, err = s.store.Create(ctx, key, ceiling)
 	}
 	if err != nil {
+		backOff()
+
 		return nil, err
 	}
 
@@ -129,6 +153,7 @@ func (s *CacheService) casVolume(
 	session.hosts[kind] = hv
 	if err := s.persistSession(session); err != nil {
 		delete(session.hosts, kind)
+		backOff()
 
 		return nil, errors.Join(err, s.store.Discard(ctx, volume))
 	}
@@ -357,8 +382,10 @@ func (s *CacheService) openCASHandle(
 	}
 	if err != nil {
 		admitted()
-		s.log.Warn("a content-addressed cache is unavailable; the build continues uncached",
-			"instance", session.instance, "kind", kind, "error", err)
+		if !errors.Is(err, errCASBackoff) {
+			s.log.Warn("a content-addressed cache is unavailable; the build continues uncached",
+				"instance", session.instance, "kind", kind, "error", err)
+		}
 
 		return nil, err
 	}
