@@ -8,3 +8,6 @@ a1e418a9618d A node-first upgrade is refused only when its registration carries 
 1ad0df649957 Firecracker nodes run four launches at once (nodeLaunchConcurrency); the rule now states the exception and that every other command waits for them.
 43d1333b82df The queue is not serial for launches on a provider that allows several; restated as a queue in which only launches run beside each other.
 14a01b270e4b There is a shared helper now (internal/state/ledgertest, #356 Phase 1); the convention says when to use it and what still runs for real.
+107711fec594 CacheAuthority moved to internal/dispatch (#356 Phase 2 item 3); the sentence now names dispatch.CacheAuthority.
+39f93bcbb585 CacheAuthority moved to internal/dispatch (#356 Phase 2 item 3); the sentence now names dispatch.CacheAuthority, decided still by server.DecideCacheAuthority.
+78939d8427eb Runner moved to internal/dispatch (#356 Phase 2 item 3); the plane's Runner now implements dispatch.Runner.

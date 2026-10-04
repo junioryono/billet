@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -77,8 +77,8 @@ func defaultBranchActions(
 	return service, service.byToken[credentials.Token]
 }
 
-func pullRequestAuthority() server.CacheAuthority {
-	return server.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
+func pullRequestAuthority() dispatch.CacheAuthority {
+	return dispatch.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
 		Repository: "api", Event: "pull_request", Ref: "refs/pull/7/merge",
 		BaseRef: "refs/heads/release", DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true}
 }
@@ -95,7 +95,7 @@ func twirp(t *testing.T, path, body string) *http.Request {
 func TestAnUnprovenJobIsAskedAboutAtMostEveryInterval(t *testing.T) {
 	t.Parallel()
 
-	authority := &fakeAuthority{authority: server.CacheAuthority{LeaseID: scopedLease}}
+	authority := &fakeAuthority{authority: dispatch.CacheAuthority{LeaseID: scopedLease}}
 	service, session := defaultBranchActions(t, authority, &fakeCacheStore{})
 	now := time.Now()
 	service.now = func() time.Time { return now }
@@ -197,7 +197,7 @@ func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 		authority *fakeAuthority
 		asks      int
 	}{
-		"unproven":   {&fakeAuthority{authority: server.CacheAuthority{LeaseID: scopedLease}}, 1},
+		"unproven":   {&fakeAuthority{authority: dispatch.CacheAuthority{LeaseID: scopedLease}}, 1},
 		"unreadable": {&fakeAuthority{err: errors.New("the plane is unreachable")}, 2},
 	} {
 		authority := tc.authority

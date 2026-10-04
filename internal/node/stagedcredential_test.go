@@ -7,8 +7,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // reapingProvider is a fakeProvider that also stages a credential outside its compute.
@@ -75,7 +75,7 @@ func TestSettlementReapsACredentialStagedOutsideTheCompute(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := r.Destroy(t.Context(), 21); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 21); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 
@@ -150,7 +150,7 @@ func TestAnAmbiguousLaunchWhoseComputeIsAlreadyOverReapsItsCredential(t *testing
 
 	// NOT CUSTODY. If this took the custody path the reap would happen at settlement
 	// and this test would be covering the case the previous one already covers.
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("the failed launch went into custody, so this test is not exercising the "+
 			"confirmed non-custody exit: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestAFailedReapStillSettlesTheLease(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := r.Destroy(t.Context(), 22); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 22); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 
@@ -224,7 +224,7 @@ func TestABackendThatStagesNothingIsNotAskedToReap(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := r.Destroy(t.Context(), 23); err != nil && !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 23); err != nil && !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy: %v", err)
 	}
 

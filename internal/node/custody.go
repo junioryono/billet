@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // custody is a lease whose capacity must keep being held because compute for it may
@@ -1214,10 +1214,10 @@ func (r *Runner) holdWhileLaunching(lease *alloc.Lease, name string) func() {
 // errCustody is returned by Launch when the runner has taken responsibility for
 // a lease's capacity, so the caller must not release it.
 //
-// It wraps server.ErrCustody rather than being it, so the listener can recognise
+// It wraps dispatch.ErrCustody rather than being it, so the listener can recognise
 // the situation without importing this package while the message still says
 // which instance is involved.
 func errCustody(name string, cause error) error {
 	return fmt.Errorf("%w: compute named %s may still exist; billet is holding its "+
-		"capacity until it is confirmed gone (%v)", server.ErrCustody, name, cause)
+		"capacity until it is confirmed gone (%v)", dispatch.ErrCustody, name, cause)
 }

@@ -28,11 +28,11 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provenance"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -726,18 +726,18 @@ var errUnregistered = errors.New("nodeclient: not registered with the control pl
 //
 // Below the version that serves it, the answer is the zero authority, which
 // writes nothing, without asking: an older control plane cannot decide one.
-func (c *Client) CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error) {
+func (c *Client) CacheAuthority(ctx context.Context, leaseID string) (dispatch.CacheAuthority, error) {
 	if c.WireVersion() == 0 {
-		return server.CacheAuthority{}, errUnregistered
+		return dispatch.CacheAuthority{}, errUnregistered
 	}
 	if c.WireVersion() < nodeapi.VersionCacheAuthority {
-		return server.CacheAuthority{}, nil
+		return dispatch.CacheAuthority{}, nil
 	}
 
 	var response nodeapi.CacheAuthorityResponse
 	if err := c.do(ctx, http.MethodGet, c.leasePath(leaseID, "/cache-authority"), nil,
 		&response); err != nil {
-		return server.CacheAuthority{}, err
+		return dispatch.CacheAuthority{}, err
 	}
 
 	return ServerCacheAuthority(&response.Authority), nil
@@ -1070,7 +1070,7 @@ func (c *Client) decodeErr(resp *http.Response, sentUnder int64) error {
 	case nodeapi.CodeUnauthenticated:
 		return fmt.Errorf("%w: %s", ErrUnauthenticated, body.Message)
 	case nodeapi.CodeCustody:
-		return fmt.Errorf("%w: %s", server.ErrCustody, body.Message)
+		return fmt.Errorf("%w: %s", dispatch.ErrCustody, body.Message)
 	case nodeapi.CodeFenced:
 		return fmt.Errorf("%w: %s", alloc.ErrFenced, body.Message)
 	case nodeapi.CodeNotFound:

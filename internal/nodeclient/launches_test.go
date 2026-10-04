@@ -11,9 +11,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // gatedCompute holds every launch open until release is closed, and records how
@@ -56,7 +56,7 @@ func runGated(t *testing.T, c *nodeclient.Client, compute *gatedCompute, concurr
 }
 
 func (g *gatedCompute) Launch(
-	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job,
+	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job dispatch.Job,
 ) error {
 	g.mu.Lock()
 	g.inflight++
@@ -143,7 +143,7 @@ func TestLaunchesOverlapAndADestroyWaitsForThem(t *testing.T) {
 	t.Cleanup(compute.open)
 	for i := range 3 {
 		launches.Go(func() {
-			if err := p.NewRunner().Launch(t.Context(), testLease(i), server.Job{RequestID: int64(100 + i)}); err != nil {
+			if err := p.NewRunner().Launch(t.Context(), testLease(i), dispatch.Job{RequestID: int64(100 + i)}); err != nil {
 				t.Errorf("Launch %d: %v", i, err)
 			}
 		})
@@ -202,7 +202,7 @@ func TestLaunchesRunOneAtATimeByDefault(t *testing.T) {
 	t.Cleanup(compute.open)
 	for i := range 2 {
 		launches.Go(func() {
-			if err := p.NewRunner().Launch(t.Context(), testLease(i), server.Job{RequestID: int64(200 + i)}); err != nil {
+			if err := p.NewRunner().Launch(t.Context(), testLease(i), dispatch.Job{RequestID: int64(200 + i)}); err != nil {
 				t.Errorf("Launch %d: %v", i, err)
 			}
 		})
