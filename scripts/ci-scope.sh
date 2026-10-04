@@ -174,7 +174,7 @@ classify() {
 		;;
 	# Read only by the jobs that always run: test executes and inspects these,
 	# and release-config reads the module sources.
-	actions/* | scripts/*_test.go | scripts/install.sh | scripts/build-guest-image.sh | \
+	actions/* | scripts/*_test.go | scripts/testdata/* | scripts/install.sh | scripts/build-guest-image.sh | \
 		.claude/settings.json | .claude/hooks/* | \
 		scripts/check-guest-image.sh | scripts/boot-guest-image.sh | scripts/check-module-sources.sh | \
 		scripts/run-runner-images.sh | scripts/runner-images/*)
