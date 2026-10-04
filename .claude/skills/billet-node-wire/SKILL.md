@@ -27,7 +27,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`/v1/register` authenticates before it reads a body.**
 - **A registration discards the host's barrier run before the request is judged.**
 - **Incarnation and epoch are different fences.**
-- **Commands are a serial queue with a ten-minute timeout that starts when queued.**
+- **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
 - **Placement reads do not hold the shared plane mutex.**
 
 ### Listeners, enrollment and renewal: [references/listeners-and-enrollment.md](references/listeners-and-enrollment.md)
@@ -42,7 +42,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 ## Checklists
 
-**A field or a route.** The plane decodes bodies strictly and a node decodes responses leniently, so decide whether an older peer is refused or reported, gate the new behaviour on its version, and record it in the version table ([references/versions.md](references/versions.md)). Upgrade the server first; the reverse is refused.
+**A field or a route.** The plane decodes bodies strictly and a node decodes responses leniently, so decide whether an older peer is refused or reported, gate the new behaviour on its version, and record it in the version table ([references/versions.md](references/versions.md)). Upgrade the server first. A node upgraded first is refused at registration only when its registration carries a field the older plane does not know or the ranges do not overlap; otherwise it registers at the highest version both speak, so the gate on the negotiated version is what protects everything after registration.
 
 ## Where the tests are
 

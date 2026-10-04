@@ -402,10 +402,12 @@ func DeclaredRange(minVersion, maxVersion int) (Range, bool) {
 // policy choice. The control plane decodes request bodies with
 // DisallowUnknownFields while a node decodes responses leniently, so an OLD
 // node's registration is a subset of a new server's struct and decodes cleanly,
-// and a new server's response decodes on an old node. The reverse does not: a
-// new node's body reaches an old server's strict decoder and is rejected before
-// any version check can run. So an upgrade is SERVER FIRST, a node-first attempt
-// is refused, and neither side may pretend otherwise.
+// and a new server's response decodes on an old node. The reverse need not: a
+// new node's body that carries a field an old server does not know reaches its
+// strict decoder and is rejected before any version check can run. So an upgrade
+// is SERVER FIRST. A node-first registration without such a field negotiates the
+// overlap like any other, so behaviour after registration is gated on the
+// negotiated version and never on registration having refused the node.
 func Negotiate(a, b Range) (int, bool) {
 	high := min(a.Max, b.Max)
 	low := max(a.Min, b.Min)
