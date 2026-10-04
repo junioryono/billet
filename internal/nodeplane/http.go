@@ -1246,6 +1246,21 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AND WHAT IT HOLDS IN QUARANTINE, which the launched set leaves out. It is
+	// never adopted here; it keeps a superseded process's adoption of such a lease
+	// from being pruned as ended.
+	quarantined, err := h.store.QuarantinedLeaseIDs(r.Context(), req.Node)
+	if err != nil {
+		h.log.Warn("could not read which leases this node holds in quarantine; refusing the "+
+			"registration rather than pruning ownership of compute that may still run",
+			"node", req.Node, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, "", fmt.Sprintf(
+			"could not read the leases quarantined on %s: %v", req.Node, err))
+
+		return
+	}
+
 	if req.InventoryKnown {
 		if err := checkInventoryPlacement(r.Context(), req.Node, req.Instances, h.store.Lease); err != nil {
 			writeStoreErr(w, err)
@@ -1295,7 +1310,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		open = append(open, id)
 	}
 
-	h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
+	h.plane.AdoptOwnershipKeeping(req.Node, req.Incarnation, open, quarantined)
 
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)
