@@ -14,7 +14,7 @@ import (
 
 // handedOver is the teardown's line for a handoff, written once it has done the
 // destroys it owed and left the session and the capacity alone.
-const handedOver = "handed over: left the message session open"
+const handedOver = "handed over: closed no message session"
 
 // handoffFixture is a listener with one running job that never completes and
 // one destroy it owes, over a ledger a test can seal.
@@ -27,6 +27,33 @@ type handoffFixture struct {
 
 	mu        sync.Mutex
 	destroyed []int64
+
+	hurry     chan struct{}
+	hurryOnce sync.Once
+}
+
+// hurryUp ends a drain's wait; safe to call more than once.
+func (f *handoffFixture) hurryUp() { f.hurryOnce.Do(func() { close(f.hurry) }) }
+
+// start runs the listener and registers a cleanup that ends any drain, cancels
+// and joins Run before the ledger is closed, so a regression into a drain cannot
+// leave the listener running against a closed database.
+func (f *handoffFixture) start(ctx context.Context, t *testing.T, cancel context.CancelFunc) *runResult {
+	t.Helper()
+
+	run := startRun(ctx, f.l)
+	t.Cleanup(func() {
+		f.hurryUp()
+		cancel()
+
+		select {
+		case <-run.done:
+		case <-time.After(30 * time.Second):
+			t.Error("Run did not return during cleanup")
+		}
+	})
+
+	return run
 }
 
 func (f *handoffFixture) tore(id int64) bool {
@@ -46,7 +73,8 @@ func newHandoffFixture(t *testing.T, opts ...Option) *handoffFixture {
 	t.Helper()
 
 	tiers := []config.Tier{tier("billet-4vcpu-handoff")}
-	f := &handoffFixture{db: openState(t), session: &fakeSession{}, log: &drainLog{}}
+	f := &handoffFixture{db: openState(t), session: &fakeSession{}, log: &drainLog{},
+		hurry: make(chan struct{})}
 
 	a, err := alloc.New(f.db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(outlivesTheDrain))
@@ -78,7 +106,8 @@ func newHandoffFixture(t *testing.T, opts ...Option) *handoffFixture {
 	}}
 
 	f.l = NewListener(a, tiers[0].Label, f.session,
-		append([]Option{WithRunner(runner), WithDrainGrace(time.Hour), f.log.option()}, opts...)...)
+		append([]Option{WithRunner(runner), WithDrainGrace(time.Hour), WithHurrySignal(f.hurry),
+			f.log.option()}, opts...)...)
 
 	return f
 }
@@ -111,10 +140,19 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
 	defer endDeadline()
 
-	run := startRun(ctx, f.l)
+	run := f.start(ctx, t, cancel)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
 	f.owe(22)
+
+	// HELD ESCROW, which releaseAll would hand back and a handoff must not.
+	if err := f.l.refillEscrowUngated(deadline, f.l.capacity()+1, 1); err != nil {
+		t.Fatalf("staging held escrow: %v", err)
+	}
+	held := f.l.Held()
+	if len(held) == 0 {
+		t.Fatal("the fixture staged no held escrow, so the release could not be observed")
+	}
 
 	cancel()
 	awaitRun(deadline, t, run)
@@ -144,6 +182,16 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 	if usage.Leases == 0 {
 		t.Error("the handoff handed back the running job's capacity")
 	}
+	for _, h := range held {
+		got, err := f.a.Lease(t.Context(), h.ID)
+		if err != nil {
+			t.Fatalf("Lease %s: %v", h.ID, err)
+		}
+		if got.Phase == alloc.PhaseDone || got.Phase == alloc.PhaseFailed {
+			t.Errorf("the handoff released held escrow %s (%s); it is reclaimed when its "+
+				"renewal stops, not handed back under a session left open", h.ID, got.Phase)
+		}
+	}
 }
 
 // A SEALED STOP IS THE DEPLOYMENT LEAVING, AND IT STILL DRAINS: an operator who
@@ -151,8 +199,7 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 func TestASealedStopStillDrains(t *testing.T) {
 	t.Parallel()
 
-	hurry := make(chan struct{})
-	f := newHandoffFixture(t, WithRestartHandoff(), WithHurrySignal(hurry))
+	f := newHandoffFixture(t, WithRestartHandoff())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -160,7 +207,7 @@ func TestASealedStopStillDrains(t *testing.T) {
 	deadline, endDeadline := context.WithTimeout(t.Context(), 30*time.Second)
 	defer endDeadline()
 
-	run := startRun(ctx, f.l)
+	run := f.start(ctx, t, cancel)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
 
@@ -174,7 +221,7 @@ func TestASealedStopStillDrains(t *testing.T) {
 	awaitDrainStart(deadline, t, f.log, run)
 
 	// The job never completes, so the second signal ends the wait.
-	close(hurry)
+	f.hurryUp()
 	awaitRun(deadline, t, run)
 
 	if f.log.saw(handedOver) {

@@ -1251,8 +1251,8 @@ func (l *Listener) Run(ctx context.Context) error {
 			held, promised := len(l.held), len(l.acquiring)
 			l.mu.Unlock()
 
-			l.log.Info("handed over: left the message session open and the capacity held for "+
-				"the next control plane", "tier", l.tier, "running", l.Running(),
+			l.log.Info("handed over: closed no message session and handed back no capacity, "+
+				"for the next control plane to take over", "tier", l.tier, "running", l.Running(),
 				"held", held, "promised", promised)
 
 			return

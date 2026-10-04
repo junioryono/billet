@@ -17,7 +17,14 @@ case "${1:-}" in
         ;;
 esac
 
-# A REAL REMOVAL. `systemctl stop` sends SIGTERM, which begins billet's drain, so
+# A REAL REMOVAL, AND THE DEPLOYMENT IS SEALED FIRST. An unsealed server stop is
+# a handoff to the next control plane, which leaves its jobs and its message
+# sessions for a successor to take over (#365). A removal has no successor, so
+# the control plane is sealed before it is stopped, and its stop is then the
+# drain it always was. A seal that cannot be taken refuses the removal rather
+# than turning it into a handoff to nobody.
+#
+# `systemctl stop` sends SIGTERM, which begins billet's drain, so
 # this waits for the jobs already running — up to the unit's TimeoutStopSec. That
 # is the intended behaviour and it can take a while; an operator in a hurry sends
 # a second SIGTERM with
@@ -35,6 +42,17 @@ if [ -d /run/systemd/system ]; then
     for timer in billet-upgrade.timer billet-images-refresh.timer; do
         systemctl disable --now "${timer}" >/dev/null 2>&1 || true
     done
+
+    if systemctl is-active --quiet billet-server 2>/dev/null; then
+        if ! "${BILLET_BIN:-/usr/bin/billet}" drain --config /etc/billet/billet.yaml \
+            --reason "the billet package is being removed from this host"; then
+            echo "billet: could not seal this deployment before removing the control" >&2
+            echo "        plane. Refusing to remove the package: stopping an unsealed" >&2
+            echo "        server hands its jobs to a control plane that will not come." >&2
+            echo "        Run \`billet drain\` and remove the package again." >&2
+            exit 1
+        fi
+    fi
 
     for unit in billet-node billet-server; do
         if systemctl is-active --quiet "${unit}" 2>/dev/null; then
