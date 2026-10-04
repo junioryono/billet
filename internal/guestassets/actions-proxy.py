@@ -36,6 +36,17 @@ including a websocket. The adapter cannot: it OWNS a TLS session, and an
 ssl.SSLSocket is not safe for a concurrent read and write, so it does one
 request and one answer in order -- which is all the paths it admits ever need.
 
+`--mode node-relay` puts the node's plain-HTTP cache endpoint one hop away
+(#374). The guest's Git, Bazel and Go caches, and the credential helpers that
+answer for them, name this listener instead of the node's address, and it splices
+each connection to the node unchanged. What it adds is patience: while the node is
+restarting (a node handing over leaves its guests running and its successor
+listens again a few seconds to minutes later), a connection is held and the node
+redialled for up to NODE_RELAY_WAIT instead of being refused, because a refused
+connection fails a `git fetch` and nothing in Git falls back. It understands no
+HTTP and terminates no TLS; an https endpoint never comes through it, since its
+certificate names the node's address.
+
 BOTH MODES ARE ONE FILE because they are one mechanism: the CONNECT tunnel, the
 header reader, the fail-open dial and the timeouts are shared, and a second copy
 of them is two things to keep in step.
@@ -86,6 +97,12 @@ DRAIN_IDLE = 30
 # and that connection was already wedged. It is generous enough that no
 # progressing transfer -- even a slow one -- ever trips it.
 RELAY_TIMEOUT = 300
+# How long node-relay keeps redialling a node that refuses or does not answer,
+# and how long it waits between attempts. Longer than a node's ordinary restart,
+# including an upgrade that pulls a guest generation, and short enough that a
+# node gone for good still ends a client's wait.
+NODE_RELAY_WAIT = 600
+NODE_RELAY_RETRY = 1
 # How long the adapter waits for an answer that has not started arriving. It
 # begins once the request body is written -- every read and write before that is
 # bounded per operation by RELAY_TIMEOUT -- and every byte received resets it, so
@@ -646,6 +663,54 @@ def handle(client, upstream, fallback):
             peer.close()
 
 
+def node_endpoint(upstream):
+    """The node's host and port from its plain-HTTP cache endpoint."""
+    parsed = urllib.parse.urlsplit(upstream)
+    if parsed.scheme != "http" or not parsed.hostname or parsed.port is None:
+        raise ValueError("the node relay needs an http endpoint with an explicit port")
+    return parsed.hostname, parsed.port
+
+
+def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep):
+    """Connect to the node, redialling while it is away, until the wait is spent.
+
+    A refused or unanswered dial is the node restarting as often as it is the node
+    gone, and the first is the case worth waiting for: the client is told nothing
+    until either a connection exists or the wait ends, and then it sees the same
+    failure it would have seen at once.
+    """
+    wait = NODE_RELAY_WAIT if wait is None else wait
+    retry = NODE_RELAY_RETRY if retry is None else retry
+    deadline = now() + wait
+    while True:
+        try:
+            return socket.create_connection(address, CONNECT_TIMEOUT)
+        except OSError:
+            if now() + retry >= deadline:
+                raise
+            sleep(retry)
+
+
+def handle_node_relay(client, address):
+    peer = None
+    try:
+        # The client's first byte first, as the passthrough does, so a bare
+        # connect spends no wait on the node.
+        ready, _, _ = select.select([client], [], [], CONNECT_TIMEOUT)
+        if not ready or not client.recv(1, socket.MSG_PEEK):
+            return
+        peer = dial_node(address)
+        client.settimeout(RELAY_TIMEOUT)
+        peer.settimeout(RELAY_TIMEOUT)
+        relay(client, peer, b"")
+    except (ConnectionError, OSError, ValueError):
+        pass
+    finally:
+        client.close()
+        if peer is not None:
+            peer.close()
+
+
 def systemd_listener():
     """Adopt the listening socket systemd bound for this activated service.
 
@@ -716,7 +781,7 @@ def listener_origin(server):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("passthrough", "cache-adapter"),
+    parser.add_argument("--mode", choices=("passthrough", "cache-adapter", "node-relay"),
                         default="passthrough")
     parser.add_argument("--listen")
     parser.add_argument("--systemd-socket", action="store_true")
@@ -726,6 +791,16 @@ def main():
     args = parser.parse_args()
 
     fallback = [addr for addr in args.fallback_addr.split(",") if addr]
+
+    node_address = None
+    if args.mode == "node-relay":
+        # Parsed once, so an endpoint the relay cannot serve fails the SERVICE and
+        # the agent keeps the node's own address, rather than a listener that
+        # starts and then drops every connection.
+        try:
+            node_address = node_endpoint(args.upstream)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
 
     if args.mode == "cache-adapter":
         if ssl is None:
@@ -780,6 +855,8 @@ def main():
             worker, arguments = handle_adapter, (
                 client, args.upstream, fallback, args.ca_file, origin,
             )
+        elif args.mode == "node-relay":
+            worker, arguments = handle_node_relay, (client, node_address)
         else:
             worker, arguments = handle, (client, args.upstream, fallback)
         threading.Thread(target=worker, args=arguments, daemon=True).start()
