@@ -1,8 +1,8 @@
 package nodeapi
 
 import (
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/lease"
 )
 
 // The lease half of the wire.
@@ -65,7 +65,7 @@ type ResizeRequest struct {
 // CacheObservationRequest records what the node saw the cache do for a lease's
 // job.
 //
-// The tokens are sent as strings from alloc's closed vocabularies, for the
+// The tokens are sent as strings from lease's closed vocabularies, for the
 // reason a phase is: an enum whose numbering is a wire contract is one insertion
 // away from silently remapping every observation in flight. Either half may be
 // empty, meaning that half has not been observed yet.
@@ -87,8 +87,8 @@ type CacheObservationRequest struct {
 // could not encode one still reports the summary.
 type UsageRequest struct {
 	Epoch  int64              `json:"epoch"`
-	Usage  alloc.JobUsage     `json:"usage"`
-	Series *alloc.UsageSeries `json:"series,omitempty"`
+	Usage  lease.JobUsage     `json:"usage"`
+	Series *lease.UsageSeries `json:"series,omitempty"`
 }
 
 // ReleaseRequest ends a lease with a terminal outcome.
@@ -99,7 +99,7 @@ type ReleaseRequest struct {
 
 // LeaseResponse carries a lease back to the node.
 type LeaseResponse struct {
-	Lease *alloc.Lease `json:"lease"`
+	Lease *lease.Lease `json:"lease"`
 }
 
 // LaunchedResponse lists the leases this node is believed to have launched.
@@ -200,9 +200,9 @@ const (
 	CodeUnregistered = "unregistered"
 )
 
-// ParsePhase turns a wire phase into an alloc.Phase, refusing anything else.
+// ParsePhase turns a wire phase into a lease.Phase, refusing anything else.
 //
-// alloc.Phase is a string type, so an unrecognised value would flow through
+// lease.Phase is a string type, so an unrecognised value would flow through
 // untouched and be caught later by validTransitions — which has no edge to it
 // and therefore fails closed. That is the right OUTCOME reached for the wrong
 // REASON: the operator gets "invalid transition to \"lauching\"" from deep in
@@ -212,18 +212,18 @@ const (
 //
 // The terminal phases are accepted because Release carries one, and refusing
 // them here would mean two spellings of the same enum.
-func ParsePhase(s string) (alloc.Phase, bool) {
-	switch alloc.Phase(s) {
-	case alloc.PhaseCapacity,
-		alloc.PhaseAssigned,
-		alloc.PhaseLaunching,
-		alloc.PhaseOnline,
-		alloc.PhaseBusy,
-		alloc.PhaseCustody,
-		alloc.PhaseTeardown,
-		alloc.PhaseDone,
-		alloc.PhaseFailed:
-		return alloc.Phase(s), true
+func ParsePhase(s string) (lease.Phase, bool) {
+	switch lease.Phase(s) {
+	case lease.PhaseCapacity,
+		lease.PhaseAssigned,
+		lease.PhaseLaunching,
+		lease.PhaseOnline,
+		lease.PhaseBusy,
+		lease.PhaseCustody,
+		lease.PhaseTeardown,
+		lease.PhaseDone,
+		lease.PhaseFailed:
+		return lease.Phase(s), true
 	default:
 		return "", false
 	}

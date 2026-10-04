@@ -24,8 +24,8 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/lease"
 )
 
 // Version is the newest wire this build speaks, and MinVersion the oldest.
@@ -647,7 +647,7 @@ type Command struct {
 	// fetching them separately would open a window where the lease changed
 	// between the command and the read. It also keeps a launch answerable from
 	// one message, which is what makes redelivery idempotent.
-	Lease *alloc.Lease `json:"lease,omitempty"`
+	Lease *lease.Lease `json:"lease,omitempty"`
 	Job   *Job         `json:"job,omitempty"`
 
 	// Tier is the shape of the machine to start, carried so a node needs no tier

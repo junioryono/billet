@@ -285,6 +285,34 @@ linters:
             # rendering a --dry-run.
             - golang.org/x/sys/unix$
 
+        # THE LEASE VOCABULARY IS WORDS, NOT A LAYER (#356 Phase 2). The node wire
+        # and the node runtime name a lease through internal/lease so that neither
+        # has to import the ledger writer; that is worth nothing if the vocabulary
+        # itself reaches the ledger, the scheduler or a provider. It may use the
+        # standard library and internal/config, and nothing else.
+        lease:
+          list-mode: strict
+          files:
+            - "**/internal/lease/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+
+        # THE NODE WIRE'S VOCABULARY IMPORTS NO LEDGER AND NO ROLE. Both roles
+        # import internal/nodeapi, so whatever it imports, a node imports: it names
+        # a lease through internal/lease and a tier through internal/config, and
+        # nothing else of billet's. Measured at zero violations when it went in
+        # (#356 Phase 2); its tests may still compare its constants with alloc's.
+        nodeapi:
+          list-mode: strict
+          files:
+            - "**/internal/nodeapi/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/config$
+            - github.com/junioryono/billet/internal/lease$
+
         # GENERATED QUERIES ARE REACHED BY THE THREE PACKAGES THAT OPEN A
         # TRANSACTION, AND BY NOBODY ELSE. sqlc emits a *Queries carrying every
         # statement and a DBTX that accepts any *sql.DB, so a caller holding it
