@@ -408,7 +408,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 	// the running process's, which may have loaded another; not on a Mac, where
 	// handoff is refused and the launch agent could not write the request.
 	if req.WantNode && hostOS == "linux" {
-		if err := requestNodeDrain(nodeDrainRequestPath); err != nil {
+		if err := requestNodeDrain(nodeDrainRequestFile); err != nil {
 			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}
 	}

@@ -16,6 +16,11 @@ import (
 // and on macOS.
 const nodeDrainRequestPath = "/var/run/billet-node-drain"
 
+// nodeDrainRequestFile is where `local down` and `local up` write and remove the
+// request: nodeDrainRequestPath, which TestMain points into a temporary
+// directory before any test runs, because a test host's /var/run is not ours.
+var nodeDrainRequestFile = nodeDrainRequestPath
+
 // nodeDrainRequested reports whether the stop now under way must drain even
 // though node.stop says handoff.
 //

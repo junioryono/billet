@@ -239,7 +239,7 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 	// THE NODE IS IN SERVICE AGAIN, so a drain a `down` asked of its stops no
 	// longer applies (#374).
 	if req.WantNode {
-		if err := releaseNodeDrain(nodeDrainRequestPath); err != nil {
+		if err := releaseNodeDrain(nodeDrainRequestFile); err != nil {
 			return err
 		}
 	}
