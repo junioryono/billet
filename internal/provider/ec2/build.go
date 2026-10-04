@@ -36,13 +36,16 @@ import (
 // 2: and the image carries the toolcache GitHub's declaration names, with the
 // variables that make it findable.
 //
+// 3: and the runner is launched through billet-exec-env, so its registration and
+// the cache bearer reach it in no process's argument list (#352).
+//
 // THE TAG IS A PROMOTION, NOT A CREATE-TIME CLAIM, and that is the whole content
 // of the number now. CreateImage stamps who owns the image and which billet made
 // it; the contract tag is added afterwards, by CreateTags, once billet has BOOTED
 // the image and proved the properties on the artifact. So an unstamped image is
 // one nothing has verified — which both readers already treat as "no answer,
 // rebuild" — rather than a claim nobody checked.
-const AMIContract = 2
+const AMIContract = 3
 
 // contractFor is the contract a build of this architecture actually meets.
 //
@@ -830,15 +833,70 @@ const (
 // supplementary-group option when it sets the primary GID, and without it the
 // runner never gets the docker group either.
 //
-// The environment belongs to the same contract: setpriv does not reset it, so
-// without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
-// then fails every job step that writes to $HOME.
-//
-// LANG is GitHub's Ubuntu runners' C.UTF-8: without it every job runs in the C
-// locale, where tools that normalise or print Unicode fail or mangle it.
+// THE ENVIRONMENT IS NOT ON THIS COMMAND LINE. `env -i` empties it and
+// billet-exec-env builds it from the lines on descriptor 3, so the registration
+// and the cache bearer appear in no argv (#352). Every use is followed by the
+// command and then runnerEnvStream.
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
-	"  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
-	"HOME=/home/runner USER=runner LOGNAME=runner LANG=C.UTF-8"
+	"  env -i " + execEnvPath
+
+// execEnvPath is where the image carries guestassets' exec-env.sh; the guest
+// image installs it at the same path.
+const execEnvPath = "/usr/local/bin/billet-exec-env"
+
+// entryPointPath is the entry point a tier names in its command.
+const entryPointPath = "/usr/local/bin/billet-runner"
+
+// runnerBaseEnv is what every runner-side command's environment starts from,
+// before the image's own variables. setpriv does not reset the environment, so
+// without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
+// then fails every job step that writes to $HOME. LANG is GitHub's Ubuntu
+// runners' C.UTF-8: without it every job runs in the C locale, where tools that
+// normalise or print Unicode fail or mangle it.
+var runnerBaseEnv = []string{
+	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	"HOME=/home/runner",
+	"USER=runner",
+	"LOGNAME=runner",
+	"LANG=C.UTF-8",
+}
+
+// runnerEnvStream hands billet_env, as writeRunnerEnv built it, to
+// billet-exec-env on descriptor 3. A here-document reaches it through a pipe or
+// an unlinked file, never through an argument list.
+const runnerEnvStream = " 3<<BILLETENVEOF\n${billet_env}end\nBILLETENVEOF\n"
+
+// writeRunnerEnv emits shell that sets billet_env to runnerBaseEnv followed by
+// the image's own variables from imageEnvFile, one NAME=VALUE line each, every
+// line ending in a newline. indent prefixes each emitted line.
+//
+// THE IMAGE'S OWN VARIABLES, READ AT JOB TIME. `env -i` means a variable not
+// listed does not exist for the job, whatever /etc/environment says, so the
+// toolcache would be on disk and invisible. Reading the FILE rather than baking
+// the values in is what lets the toolcache install append JAVA_HOME and the
+// JAVA_HOME_*_X64 set after the JDKs exist, which is the only point at which
+// those names are known.
+//
+// ONLY A VARIABLE'S NAME IS TAKEN, as the guest takes it, so a comment, a blank
+// line or a name billet-exec-env would refuse is skipped rather than ending the
+// launch: an image whose file is damaged should run jobs that download their own
+// toolchains, not refuse to run jobs at all.
+func writeRunnerEnv(b *strings.Builder, indent string) {
+	b.WriteString(indent + "billet_env='" + strings.Join(runnerBaseEnv, "\n") + "\n'\n")
+	b.WriteString(indent + "if [ -r " + imageEnvFile + " ]; then\n")
+	b.WriteString(indent + "  while IFS= read -r billet_line; do\n")
+	b.WriteString(indent + "    case \"$billet_line\" in\n")
+	b.WriteString(indent + "      OPTIND=*) continue ;;\n")
+	b.WriteString(indent + "      [A-Za-z_]*=*) ;;\n")
+	b.WriteString(indent + "      *) continue ;;\n")
+	b.WriteString(indent + "    esac\n")
+	b.WriteString(indent + "    case \"${billet_line%%=*}\" in\n")
+	b.WriteString(indent + "      *[!A-Za-z0-9_]*) continue ;;\n")
+	b.WriteString(indent + "    esac\n")
+	b.WriteString(indent + "    billet_env=\"$billet_env$billet_line\n\"\n")
+	b.WriteString(indent + "  done <" + imageEnvFile + "\n")
+	b.WriteString(indent + "fi\n")
+}
 
 // jobTimingHookPath ends in the extension GitHub uses to select the hook's
 // interpreter. A shebang and executable mode are not sufficient.
@@ -1440,91 +1498,21 @@ func provisionScript(spec BuildSpec) (string, error) {
 	}
 	b.WriteString("BILLETDOCKEREOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-docker-cache\n")
+	b.WriteString("cat > " + execEnvPath + " <<'BILLETEXECENVEOF'\n")
+	b.WriteString(guestassets.ExecEnvScript)
+	if !strings.HasSuffix(guestassets.ExecEnvScript, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("BILLETEXECENVEOF\n")
+	b.WriteString("chmod 0755 " + execEnvPath + "\n")
 
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
 	// losing that variable. setpriv does it in one process with no shell in between.
-	b.WriteString("cat > /usr/local/bin/billet-runner <<'BILLETEOF'\n")
-	b.WriteString("#!/bin/sh\nset -eu\n")
-
-	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
-	// cloud-init already started it, mounts the cache, and starts it again before
-	// service containers can be pulled. Every cache failure falls back to the root
-	// disk and a cold pull.
-	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
-
-	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
-	// invokes this the moment cloud-init reaches it and the daemon may not be up.
-	//
-	// A verification run of a finished image measured exactly that: at the instant
-	// the check ran, systemctl reported docker inactive, and a container ran fine
-	// SEVEN SECONDS LATER. Without this the first job on a fresh instance can pick
-	// up a workflow whose first step is `docker build` and fail it, on a machine
-	// that is about to be perfectly healthy — the worst kind of flake, because the
-	// next run works.
-	//
-	// Bounded, and it proceeds anyway on timeout: a runner that starts without
-	// Docker fails the jobs that need it, which is better than an instance that
-	// silently never registers and leaves the job queued until GitHub gives up.
-	b.WriteString("i=0\n")
-	b.WriteString("while [ $i -lt 60 ] && ! docker info >/dev/null 2>&1; do\n")
-	b.WriteString("  i=$((i+1)); sleep 1\n")
-	b.WriteString("done\n")
-	b.WriteString("runner_started=$(date +%s%N 2>/dev/null || true)\n")
-
-	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot
-	// leave the check passing while every job fails. See privilegeDrop.
-	//
-	// THE JIT VARIABLE IS THE CONSTANT, NOT A STRING. The boot script that exports
-	// it uses jitEnvVar; spelled out here, a rename would leave this file and its
-	// tests green while producing the failure this whole issue exists to prevent —
-	// a runner that starts, finds no registration, exits, and leaves a machine
-	// looking perfectly healthy.
-	// THE IMAGE'S OWN VARIABLES, READ AT JOB TIME, exactly as the guest's runner
-	// service reads them.
-	//
-	// `env -i` MEANS A VARIABLE NOT NAMED HERE DOES NOT EXIST FOR THE JOB, whatever
-	// /etc/environment says — so the toolcache would be on disk and invisible.
-	// Reading the FILE rather than baking the values in is what lets the toolcache
-	// install append JAVA_HOME and the JAVA_HOME_*_X64 set after the JDKs exist,
-	// which is the only point at which those names are known.
-	//
-	// THE POSITIONAL PARAMETERS ARE THE ARRAY THIS SHELL DOES NOT HAVE. The entry
-	// point is /bin/sh and takes no arguments of its own, so `set --` is free. The
-	// alternative — expanding the file unquoted into the command line — word-splits
-	// any value containing a space.
-	//
-	// THE SAME `[A-Za-z_]*=*` FILTER AS THE GUEST, so a comment or a blank line in
-	// that file is skipped rather than handed to env as a malformed assignment.
-	b.WriteString("set --\n")
-	b.WriteString("if [ -r " + imageEnvFile + " ]; then\n")
-	b.WriteString("  while IFS= read -r billet_line; do\n")
-	b.WriteString("    case \"$billet_line\" in\n")
-	b.WriteString("      [A-Za-z_]*=*) set -- \"$@\" \"$billet_line\" ;;\n")
-	b.WriteString("    esac\n")
-	b.WriteString("  done <" + imageEnvFile + "\n")
-	b.WriteString("fi\n")
-
-	b.WriteString("set +e\n")
-	b.WriteString(privilegeDrop + " \\\n")
-	b.WriteString("  \"$@\" \\\n")
-	b.WriteString("  BILLET_LAUNCH_EPOCH_NS=\"${BILLET_LAUNCH_EPOCH_NS:-}\" \\\n")
-	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
-	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
-	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
-	b.WriteString("  ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=\"${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}\" \\\n")
-	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
-	b.WriteString("  BILLET_CACHE_ENDPOINT=\"${BILLET_CACHE_ENDPOINT:-}\" \\\n")
-	b.WriteString("  BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\" \\\n")
-	b.WriteString("  BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=\"${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\" \\\n")
-	b.WriteString("  /opt/actions-runner/billet-runner-service\n")
-	b.WriteString("job_status=$?\n")
-	b.WriteString("set -e\n")
-	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")
-	b.WriteString("service_status=$(/usr/local/bin/billet-docker-cache service-status \"$job_status\") || service_status=$job_status\n")
-	b.WriteString("exit \"$service_status\"\n")
+	b.WriteString("cat > " + entryPointPath + " <<'BILLETEOF'\n")
+	b.WriteString(entryPointScript())
 	b.WriteString("BILLETEOF\n")
-	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
+	b.WriteString("chmod 0755 " + entryPointPath + "\n")
 
 	// THE RUNNER HAS TO RUN BEFORE THIS COUNTS AS SUCCESS.
 	//
@@ -1546,8 +1534,9 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// command that setpriv exists, that the user switch works, that the runner user
 	// can reach and execute the binary, and that .NET starts (a missing libicu dies
 	// here rather than at registration).
-	b.WriteString(privilegeDrop + " \\\n")
-	b.WriteString("  /opt/actions-runner/bin/Runner.Listener --version\n")
+	writeRunnerEnv(&b, "")
+	b.WriteString(privilegeDrop + " /opt/actions-runner/bin/Runner.Listener --version" +
+		runnerEnvStream)
 
 	// THE IMAGE STORE HAS TO BE THE CLASSIC ONE BEFORE THIS COUNTS AS SUCCESS.
 	//
@@ -1642,4 +1631,89 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("poweroff\n")
 
 	return b.String(), nil
+}
+
+// entryPointScript is the entry point a tier names, entryPointPath, written by
+// the build and compared byte for byte by the verifier, so the image is proved to
+// carry this launch and not merely a helper that could run one.
+func entryPointScript() string {
+	var b strings.Builder
+
+	b.WriteString("#!/bin/sh\nset -eu\n")
+
+	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
+	// cloud-init already started it, mounts the cache, and starts it again before
+	// service containers can be pulled. Every cache failure falls back to the root
+	// disk and a cold pull.
+	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
+
+	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
+	// invokes this the moment cloud-init reaches it and the daemon may not be up.
+	//
+	// A verification run of a finished image measured exactly that: at the instant
+	// the check ran, systemctl reported docker inactive, and a container ran fine
+	// SEVEN SECONDS LATER. Without this the first job on a fresh instance can pick
+	// up a workflow whose first step is `docker build` and fail it, on a machine
+	// that is about to be perfectly healthy — the worst kind of flake, because the
+	// next run works.
+	//
+	// Bounded, and it proceeds anyway on timeout: a runner that starts without
+	// Docker fails the jobs that need it, which is better than an instance that
+	// silently never registers and leaves the job queued until GitHub gives up.
+	b.WriteString("i=0\n")
+	b.WriteString("while [ $i -lt 60 ] && ! docker info >/dev/null 2>&1; do\n")
+	b.WriteString("  i=$((i+1)); sleep 1\n")
+	b.WriteString("done\n")
+	b.WriteString("runner_started=$(date +%s%N 2>/dev/null || true)\n")
+
+	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot
+	// leave the check passing while every job fails. See privilegeDrop.
+	//
+	// THE JIT VARIABLE IS THE CONSTANT, NOT A STRING. The boot script that exports
+	// it uses jitEnvVar; spelled out here, a rename would leave this file and its
+	// tests green while producing the failure this whole issue exists to prevent —
+	// a runner that starts, finds no registration, exits, and leaves a machine
+	// looking perfectly healthy.
+	writeRunnerEnv(&b, "")
+
+	// A VALUE HOLDING A NEWLINE CANNOT TRAVEL ONE LINE PER VARIABLE, so it refuses
+	// the launch, naming the variable and never the value, and the steps after the
+	// launch run as for a failed job. A shell function's arguments are no
+	// process's argv.
+	b.WriteString("billet_refused=\"\"\n")
+	b.WriteString("billet_env_add() {\n")
+	b.WriteString("  case \"$2\" in\n")
+	b.WriteString("    *'\n'*)\n")
+	b.WriteString("      echo \"billet-runner: $1 holds a newline, which cannot reach the runner; " +
+		"refusing the launch\" >&2\n")
+	b.WriteString("      billet_refused=1\n")
+	b.WriteString("      return ;;\n")
+	b.WriteString("  esac\n")
+	b.WriteString("  billet_env=\"$billet_env$1=$2\n\"\n")
+	b.WriteString("}\n")
+	b.WriteString("billet_env_add BILLET_LAUNCH_EPOCH_NS \"${BILLET_LAUNCH_EPOCH_NS:-}\"\n")
+	b.WriteString("billet_env_add BILLET_RUNNER_START_EPOCH_NS \"$runner_started\"\n")
+	b.WriteString("billet_env_add ACTIONS_RUNNER_HOOK_JOB_STARTED " + jobTimingHookPath + "\n")
+	b.WriteString("billet_env_add ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED true\n")
+	b.WriteString("billet_env_add ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE " +
+		"\"${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}\"\n")
+	b.WriteString("billet_env_add " + jitEnvVar + " \"$" + jitEnvVar + "\"\n")
+	b.WriteString("billet_env_add BILLET_CACHE_ENDPOINT \"${BILLET_CACHE_ENDPOINT:-}\"\n")
+	b.WriteString("billet_env_add BILLET_CACHE_TOKEN \"${BILLET_CACHE_TOKEN:-}\"\n")
+	b.WriteString("billet_env_add BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES " +
+		"\"${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\"\n")
+
+	b.WriteString("set +e\n")
+	b.WriteString("if [ -n \"$billet_refused\" ]; then\n")
+	b.WriteString("job_status=1\n")
+	b.WriteString("else\n")
+	b.WriteString(privilegeDrop + " /opt/actions-runner/billet-runner-service" + runnerEnvStream)
+	b.WriteString("job_status=$?\n")
+	b.WriteString("fi\n")
+	b.WriteString("set -e\n")
+	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")
+	b.WriteString("service_status=$(/usr/local/bin/billet-docker-cache service-status \"$job_status\") || service_status=$job_status\n")
+	b.WriteString("exit \"$service_status\"\n")
+
+	return b.String()
 }

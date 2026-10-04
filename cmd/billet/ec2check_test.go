@@ -1449,6 +1449,14 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 		}
 	}
 
+	// EVERY GAP AN UNSTAMPED IMAGE MAY HAVE, the credential exposure among them:
+	// naming only one would present the others as absent.
+	for _, want := range []string{"containerd one", "carries no toolcache", "in an argument list"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report for an unstamped image does not name %q:\n%s", want, out)
+		}
+	}
+
 	// And a stamped image must NOT produce it.
 	ec2cfg.Endpoint = fakeEC2With(t, fakeEC2Topology{
 		accept: "AKIDEXAMPLE", imageState: "available",

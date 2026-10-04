@@ -1,2 +1,3 @@
 # Corpus units removed from the skills on purpose, one per line: `<hash> <reason>`.
 # The hash is the first 12 hex digits of the unit's sha256, as TestEverySkillSentenceIsKeptOrDroppedWithAReason prints it.
+65d8d06981b7 The privilege drop now ends in billet-exec-env (#352); the same rule is restated with the helper and measured on ubuntu:24.04.

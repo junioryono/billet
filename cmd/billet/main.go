@@ -3367,16 +3367,26 @@ func ec2Preflight(
 				built = "a billet that did not record itself"
 			}
 
-			// WHAT IS MISSING DEPENDS ON HOW FAR BEHIND IT IS, and naming only the
-			// oldest gap would send an operator looking for a Docker problem in an
-			// image whose Docker is fine and whose toolcache is absent.
-			missing := "its Docker image store may be the containerd one, which makes the " +
-				"cache publish with no images in it so every job re-pulls"
-			if img.Contract >= 1 {
-				missing = "it carries no toolcache, so every setup-node, setup-go, " +
-					"setup-python and setup-java step downloads a runtime that a " +
-					"microVM tier of this deployment already has baked in"
+			// EVERY GAP IT HAS, BECAUSE THEY ARE DIFFERENT PROBLEMS. Naming only the
+			// oldest would send an operator looking for a Docker problem in an image
+			// whose Docker is fine and whose toolcache is absent, and naming only
+			// the newest would present a credential exposure as a performance note.
+			var gaps []string
+			if img.Contract < 1 {
+				gaps = append(gaps, "its Docker image store may be the containerd one, "+
+					"which makes the cache publish with no images in it so every job re-pulls")
 			}
+			if img.Contract < 2 {
+				gaps = append(gaps, "it carries no toolcache, so every setup-node, setup-go, "+
+					"setup-python and setup-java step downloads a runtime that a microVM "+
+					"tier of this deployment already has baked in")
+			}
+			if img.Contract < 3 {
+				gaps = append(gaps, "it starts the runner with the registration and the "+
+					"cache token in an argument list, which any process in the instance "+
+					"can read until the runner starts")
+			}
+			missing := strings.Join(gaps, "; ")
 
 			fmt.Printf("image    %s meets AMI contract %d and this billet wants %d (built by "+
 				"%s) — %s; rebuild with `billet ami build`\n",

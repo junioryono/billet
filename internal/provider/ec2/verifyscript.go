@@ -1,11 +1,14 @@
 package ec2
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/guestassets"
 	"github.com/junioryono/billet/internal/runnerimages"
 )
 
@@ -302,6 +305,10 @@ func verifyScript(arch string, contract int, nonce string) (string, reportSchema
 	b.WriteString("billet_runner=$(" + verifyRunAsRunner +
 		" /opt/actions-runner/bin/Runner.Listener --version 2>&1 | head -1)\n")
 
+	if contract >= 3 {
+		writeVerifyEntryPoint(&b, step)
+	}
+
 	if contract >= 1 {
 		writeVerifyDocker(&b, step)
 	}
@@ -401,34 +408,12 @@ func toolReports(ts runnerimages.Toolset) ([]toolReport, error) {
 // what /usr/local/bin/billet-runner execs through and imageEnvFile is where it
 // reads its variables; spelling either a second way here would let this pass
 // while every job failed, which is exactly what a hand-written second copy of
-// privilegeDrop caused once already.
-//
-// THE ROTATION IS HOW A SHELL WITH NO ARRAYS PUTS THE ENVIRONMENT IN FRONT OF THE
-// COMMAND. `env` needs its assignments before the program, the function receives
-// the program in `$@`, and building the assignments with `set --` would destroy
-// it. So the assignments are APPENDED and then the leading command words are
-// rotated to the end — which costs a loop and survives a value containing a
-// space, where every shorter version word-splits.
+// privilegeDrop caused once already. writeRunnerEnv builds the environment the
+// way the entry point builds it, so billet-exec-env is proved on the artifact too.
 func writeRunAsRunner(b *strings.Builder) {
 	b.WriteString(verifyRunAsRunner + "() {\n")
-	b.WriteString("  billet_argc=$#\n")
-	b.WriteString("  if [ -r " + imageEnvFile + " ]; then\n")
-	b.WriteString("    while IFS= read -r billet_line; do\n")
-	// THE SAME [A-Za-z_]*=* FILTER AS THE GUEST AND THE ENTRY POINT, so a comment
-	// or a blank line in that file is skipped rather than handed to env as a
-	// malformed assignment.
-	b.WriteString("      case \"$billet_line\" in\n")
-	b.WriteString("        [A-Za-z_]*=*) set -- \"$@\" \"$billet_line\" ;;\n")
-	b.WriteString("      esac\n")
-	b.WriteString("    done <" + imageEnvFile + "\n")
-	b.WriteString("  fi\n")
-	b.WriteString("  billet_i=0\n")
-	b.WriteString("  while [ \"$billet_i\" -lt \"$billet_argc\" ]; do\n")
-	b.WriteString("    billet_head=$1; shift; set -- \"$@\" \"$billet_head\"\n")
-	b.WriteString("    billet_i=$((billet_i+1))\n")
-	b.WriteString("  done\n")
-	b.WriteString("  " + privilegeDrop + " \\\n")
-	b.WriteString("    \"$@\"\n")
+	writeRunnerEnv(b, "  ")
+	b.WriteString("  " + privilegeDrop + " \"$@\"" + runnerEnvStream)
 	b.WriteString("}\n")
 }
 
@@ -490,6 +475,37 @@ func writeVerifyDocker(b *strings.Builder, step func(string)) {
 	// that file having taken effect on a daemon that read it at start.
 	b.WriteString("jq -e '.features[\"containerd-snapshotter\"] == false and " +
 		".[\"storage-driver\"] == \"overlay2\"' /etc/docker/daemon.json >/dev/null\n")
+}
+
+// writeVerifyEntryPoint asserts what AMIContract 3 is about: the entry point every
+// job runs is exactly entryPointScript, which starts the runner through
+// billet-exec-env. That the helper works is proved by each billet_as_runner call,
+// which brings its own launch; that the installed file launches correctly is a
+// fact about the file, and a text search for the launch line passes a file whose
+// privilege drop or environment stream is damaged around it.
+//
+// AND THE HELPER, for the same reason: each billet_as_runner call proves it
+// launches a command, not that it keeps every value out of an argument list.
+//
+// BY DIGEST, because the verification script is user data with a budget and the
+// two files would take half of it. A failed read stops the script under `set -e`:
+// the assignment takes the substitution's status.
+func writeVerifyEntryPoint(b *strings.Builder, step func(string)) {
+	step("entrypoint")
+
+	for _, f := range []struct{ path, body string }{
+		{entryPointPath, entryPointScript()},
+		{execEnvPath, guestassets.ExecEnvScript},
+	} {
+		sum := sha256.Sum256([]byte(f.body))
+		b.WriteString("test -x " + f.path + "\n")
+		b.WriteString("billet_sum=$(sha256sum <" + f.path + ")\n")
+		b.WriteString("case \"$billet_sum\" in\n")
+		b.WriteString("  '" + hex.EncodeToString(sum[:]) + "  -') ;;\n")
+		b.WriteString("  *) echo \"" + f.path + " is not the file this billet installs\" >&2; " +
+			"exit 1 ;;\n")
+		b.WriteString("esac\n")
+	}
 }
 
 // writeVerifyToolcacheInventory records what the image holds, per tool.

@@ -92,7 +92,8 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
 		{jitEnvVar, "the one variable billet's boot script exports"},
 		{"Runner.Listener --version", "an arch mismatch is otherwise invisible until a job"},
-		{"setpriv --reuid=runner --regid=runner --init-groups \\\n  env -i PATH=", "the check has to take the path a job takes with a clean environment"},
+		{privilegeDrop + " /opt/actions-runner/bin/Runner.Listener --version" + runnerEnvStream, "the check has to take the path a job takes with a clean environment"},
+		{"cat > " + execEnvPath + " <<'BILLETEXECENVEOF'\n", "the entry point launches the runner through it"},
 		{"poweroff", "the only signal that provisioning succeeded"},
 	} {
 		if !strings.Contains(got, want.fragment) {
@@ -137,8 +138,8 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 	if !ok {
 		t.Fatal("the EC2 runner entry point is not delimited")
 	}
-	if !strings.Contains(entrypoint, "env -i ") ||
-		!strings.Contains(entrypoint, "BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\"") {
+	if !strings.Contains(entrypoint, privilegeDrop+" ") ||
+		!strings.Contains(entrypoint, "billet_env_add BILLET_CACHE_TOKEN \"${BILLET_CACHE_TOKEN:-}\"\n") {
 		t.Fatal("the EC2 runner does not receive its cache session through a clean environment")
 	}
 	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {
@@ -185,12 +186,17 @@ func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 		{"--reuid=runner", "the runner refuses to run as root and untrusted jobs must not"},
 		{"--init-groups", "setpriv requires a supplementary-group option when it sets the " +
 			"primary GID, and without it the runner never gets the docker group"},
-		{"HOME=/home/runner", "setpriv does not reset the environment, so without this the " +
-			"runner inherits an unwritable HOME=/root and fails jobs, not registration"},
+		{"env -i " + execEnvPath, "the environment crosses on descriptor 3, so the " +
+			"registration is in no argument list"},
 	} {
 		if !strings.Contains(privilegeDrop, required.fragment) {
 			t.Errorf("the privilege drop is missing %q — %s", required.fragment, required.why)
 		}
+	}
+	if !slices.Contains(runnerBaseEnv, "HOME=/home/runner") {
+		t.Error("the runner's base environment has no HOME=/home/runner; setpriv does not " +
+			"reset the environment, so the runner inherits an unwritable HOME=/root and " +
+			"fails jobs, not registration")
 	}
 
 	if n := strings.Count(got, privilegeDrop); n != 2 {
@@ -308,7 +314,7 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	// ASSERTED THROUGH THE CONSTANT, so a rename cannot leave this green while the
 	// image stops working. The boot script that exports this name uses jitEnvVar;
 	// spelling it out on both sides made the two independently editable.
-	if !strings.Contains(entry, jitEnvVar+`="$`+jitEnvVar+`"`) {
+	if !strings.Contains(entry, "billet_env_add "+jitEnvVar+` "$`+jitEnvVar+`"`) {
 		t.Error("the entry point does not forward the JIT config across the user change; the " +
 			"runner would start with no registration and exit, looking like a healthy boot")
 	}
@@ -336,14 +342,14 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	}
 
 	for fragment, why := range map[string]string{
-		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started.sh`:                                         "the runner would not invoke the cold-start measurement hook",
-		`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true`:                                                             "the image store could not distinguish a clean success from a failed job",
-		`ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE="${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"`: "the runner's requested deprecated-version failure would be masked",
-		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:                                                         "the launch timestamp would be lost across the user change",
-		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                                                               "the hook could not split boot from registration and pickup",
-		`/usr/local/bin/billet-docker-cache prepare`:                                                                   "service-container images would be pulled before their cache is mounted",
-		`/usr/local/bin/billet-docker-cache complete "$job_status"`:                                                    "the image-store clone would never be published or discarded",
-		`/usr/local/bin/billet-docker-cache service-status "$job_status"`:                                              "the runner service exit contract would not be preserved",
+		`billet_env_add ACTIONS_RUNNER_HOOK_JOB_STARTED /usr/local/bin/billet-job-started.sh`:                                         "the runner would not invoke the cold-start measurement hook",
+		`billet_env_add ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED true`:                                                             "the image store could not distinguish a clean success from a failed job",
+		`billet_env_add ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE "${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"`: "the runner's requested deprecated-version failure would be masked",
+		`billet_env_add BILLET_LAUNCH_EPOCH_NS "${BILLET_LAUNCH_EPOCH_NS:-}"`:                                                         "the launch timestamp would be lost across the user change",
+		`billet_env_add BILLET_RUNNER_START_EPOCH_NS "$runner_started"`:                                                               "the hook could not split boot from registration and pickup",
+		`/usr/local/bin/billet-docker-cache prepare`:                                                                                  "service-container images would be pulled before their cache is mounted",
+		`/usr/local/bin/billet-docker-cache complete "$job_status"`:                                                                   "the image-store clone would never be published or discarded",
+		`/usr/local/bin/billet-docker-cache service-status "$job_status"`:                                                             "the runner service exit contract would not be preserved",
 	} {
 		if !strings.Contains(entry, fragment) {
 			t.Errorf("the entry point is missing %q — %s", fragment, why)
@@ -366,7 +372,7 @@ func TestTheJobStartHookHasASupportedScriptExtension(t *testing.T) {
 	for _, fragment := range []string{
 		"cat > " + jobTimingHookPath + " <<'BILLETJOBEOF'\n",
 		"chmod 0755 " + jobTimingHookPath + "\n",
-		"ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n",
+		"billet_env_add ACTIONS_RUNNER_HOOK_JOB_STARTED " + jobTimingHookPath + "\n",
 	} {
 		if !strings.Contains(got, fragment) {
 			t.Errorf("the image script is missing %q; GitHub refuses an administrator hook "+
@@ -383,7 +389,7 @@ func TestTheJobStartHookReportsColdStartPhasesWithoutFailingTheJob(t *testing.T)
 
 	dir := t.TempDir()
 	date := filepath.Join(dir, "date")
-	if err := forkSafeWriteFile(date, []byte("#!/bin/sh\nprintf '%s\\n' 3000000000\n"), 0o755); err != nil {
+	if err := forkSafeWriteFile(date, []byte("#!/bin/sh\nprintf '%s\\n' 3000000000\n")); err != nil {
 		t.Fatalf("write fake date: %v", err)
 	}
 
@@ -1118,7 +1124,7 @@ func TestTheImageStoreAssertionsActuallyRefuse(t *testing.T) {
 			}
 			write := func(name, body string) {
 				t.Helper()
-				if err := forkSafeWriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+				if err := forkSafeWriteFile(filepath.Join(bin, name), []byte(body)); err != nil {
 					t.Fatalf("write %s: %v", name, err)
 				}
 			}

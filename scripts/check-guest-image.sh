@@ -586,7 +586,8 @@ for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"' \
 		runner_environment=0
 	fi
 done
-if ! grep -Fq 'env -i "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
+if ! grep -Fq 'env -i "$EXEC_ENV" "${cmd[@]}" 3<<BILLET_RUNNER_ENV' "$AGENT" 2>/dev/null ||
+	! grep -Fq '"${runner_env[@]}")' "$AGENT" 2>/dev/null; then
 	runner_environment=0
 fi
 if ! grep -Fq '"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"' "$AGENT" 2>/dev/null; then
@@ -599,6 +600,33 @@ else
         LOGNAME=runner, or does not request the authoritative one-job result; setup
         actions can lose their user cache and Docker writes cannot be gated safely"
 fi
+
+# THE LAUNCH READS THE JOB'S ENVIRONMENT FROM DESCRIPTOR 3 (#352), so an image
+# without the helper that reads it starts no runner at all: every job would fail
+# at its first instant, on a guest that booted and registered nothing. And the
+# helper is this tree's, byte for byte, because a job's running proves only that
+# the helper worked, not that it kept every value out of an argument list.
+# The agent is compared whole for the same reason: every substring this gate
+# looks for survives an agent that hands the stream to an external printf, whose
+# argv would then carry it. It is the quoted AGENT here-document of the build
+# script that sits beside this one, so the installed file is exactly its body.
+EXEC_ENV_SOURCE="${EXEC_ENV_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)/internal/guestassets/exec-env.sh}"
+AGENT_SOURCE="${AGENT_SOURCE:-$(cd "$(dirname "$0")" && pwd)/build-guest-image.sh}"
+agent_expected=$(mktemp)
+if awk 'on && $0 == "AGENT" { done = 1; exit } on { print } index($0, "<<\047AGENT\047") { on = 1 }
+	END { exit done ? 0 : 1 }' "$AGENT_SOURCE" >"$agent_expected" && [ -s "$agent_expected" ] &&
+	cmp -s "$agent_expected" "$AGENT" &&
+	[ -f "$MNT/usr/local/bin/billet-exec-env" ] && [ -x "$MNT/usr/local/bin/billet-exec-env" ] &&
+	cmp -s "$EXEC_ENV_SOURCE" "$MNT/usr/local/bin/billet-exec-env" &&
+	grep -Fq 'EXEC_ENV="${EXEC_ENV:-/usr/local/bin/billet-exec-env}"' "$AGENT" 2>/dev/null; then
+	pass "the guest agent launches the runner through billet-exec-env, with no value in argv"
+else
+	fail "the image's agent is not the AGENT here-document of build-guest-image.sh, or it
+        has no executable /usr/local/bin/billet-exec-env identical to
+        internal/guestassets/exec-env.sh; the runner's environment is handed to that
+        helper on descriptor 3, and only the exact files prove no value is in an argv"
+fi
+rm -f "$agent_expected"
 
 DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
 if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
