@@ -41,13 +41,28 @@ type ledger struct {
 	// test stage a registration being overtaken by a later one.
 	holdFirst chan struct{}
 	holding   bool
+
+	// open names leases Lease answers as still open, and leaseErr is what it
+	// answers for every lease when set; otherwise every lease is ended.
+	open     map[string]bool
+	leaseErr error
 }
 
 func newLedger() *ledger {
 	return &ledger{gone: map[string]int64{}, withdrawn: map[string]withdrawal{}}
 }
 
-func (*ledger) Lease(context.Context, string) (*alloc.Lease, error) {
+func (l *ledger) Lease(_ context.Context, id string) (*alloc.Lease, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	switch {
+	case l.leaseErr != nil:
+		return nil, l.leaseErr
+	case l.open[id]:
+		return &alloc.Lease{ID: id, Node: "n1"}, nil
+	}
+
 	return nil, alloc.ErrLeaseNotFound
 }
 
