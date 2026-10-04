@@ -16,9 +16,10 @@ func untrustedCacheTier(block string) string {
 }
 
 // A TIER THAT SAYS NOTHING GETS EVERY CACHE IT CAN HAVE: a Linux Firecracker
-// tier the Git, Bazel and Go caches beside the Docker store and sticky disks,
-// with Go test results left off, and a node without a cache listener refuses
-// none of it, because a default that cannot run is simply off.
+// tier the Git cache beside the Docker store and sticky disks, and the Bazel and
+// Go caches only where it can publish them, with Go test results left off; a
+// node without a cache listener refuses none of it, because a default that
+// cannot run is simply off.
 func TestATierWithNoCacheBlockGetsEveryCacheItCanHave(t *testing.T) {
 	t.Parallel()
 
@@ -27,9 +28,41 @@ func TestATierWithNoCacheBlockGetsEveryCacheItCanHave(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	spec := cfg.Tiers[0].EffectiveCache()
-	if !spec.Docker.Enabled || !spec.StickyDisks.Enabled || !spec.Git.Enabled ||
-		!spec.Bazel.Enabled || !spec.Go.Enabled || spec.GoTestResults {
+	if !spec.Docker.Enabled || !spec.StickyDisks.Enabled || !spec.Git.Enabled || spec.GoTestResults {
 		t.Fatalf("effective cache of an unconfigured firecracker tier = %+v", spec)
+	}
+	// AN UNTRUSTED POOL THAT PUBLISHES NOTHING READS A GO OR BAZEL KEY NOBODY
+	// WRITES, and GOCACHEPROG would hide the build cache the workflow restores.
+	if spec.Bazel.Enabled || spec.Go.Enabled {
+		t.Fatalf("an untrusted tier that cannot publish has the content caches on: %+v", spec)
+	}
+	for name, tier := range map[string]Tier{
+		"trusted": {Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadTrusted},
+		"untrusted from its default branch": {Provider: ProviderFirecracker, GuestOS: GuestLinux,
+			CacheScope: &CacheScope{Owner: "acme", Repository: "api"}},
+	} {
+		if got := tier.EffectiveCache(); !got.Bazel.Enabled || !got.Go.Enabled {
+			t.Errorf("a %s tier can publish its content caches but has them off: %+v", name, got)
+		}
+	}
+	if got := (Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Trust: WorkloadTrusted,
+		Cache: &TierCache{Publish: CachePublishOff}}).EffectiveCache(); got.Bazel.Enabled || got.Go.Enabled {
+		t.Errorf("a tier that publishes nothing has the content caches on: %+v", got)
+	}
+	// A BLOCK THAT SETS ONLY A SIZE KEEPS THE DEFAULT, and an explicit enable is
+	// honoured where publication cannot happen: the operator asked for it.
+	partial := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Cache: &TierCache{
+		Go: &GoCache{MaxSize: 10 * GiB}, Bazel: &CacheToggle{MaxSize: 10 * GiB}}}.EffectiveCache()
+	if partial.Go.Enabled || partial.Bazel.Enabled || partial.GoTestResults {
+		t.Errorf("a size-only block turned the content caches on for an untrusted tier: %+v", partial)
+	}
+	on := true
+	explicit := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Cache: &TierCache{
+		Go: &GoCache{Enabled: &on, MaxSize: 10 * GiB}, Bazel: &CacheToggle{Enabled: &on, MaxSize: 10 * GiB}}}.
+		EffectiveCache()
+	if !explicit.Go.Enabled || !explicit.Bazel.Enabled || explicit.Go.MaxSize != 10*GiB ||
+		explicit.Bazel.MaxSize != 10*GiB || explicit.GoTestResults {
+		t.Errorf("explicitly enabled content caches on an untrusted tier = %+v", explicit)
 	}
 	// NO REPOSITORY, SO NO DEFAULT-BRANCH NAMESPACE AND NO ACTIONS CACHE: nothing
 	// could prove whose default branch a job ran on, or scope its archives.
