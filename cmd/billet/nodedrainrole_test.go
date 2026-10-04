@@ -117,7 +117,10 @@ func TestEveryDrainingStopInTheRoleIsRequestedFirstAndReleasedAfter(t *testing.T
 		for _, condition := range want {
 			// THE RESTART'S "SOMETHING CHANGED" IS NARROWED, on purpose, to the
 			// config changing; every other condition the stop has, the request has.
-			if !site.sameConditions && strings.Contains(condition, "billet_config_install.changed") {
+			// And the request covers the endpoint migration's stop as well as the
+			// ordinary restart, so it is not limited to an unmigrated node.
+			if !site.sameConditions && (strings.Contains(condition, "billet_config_install.changed") ||
+				strings.Contains(condition, "billet_endpoint_migrated")) {
 				continue
 			}
 			if !slices.Contains(got, condition) {
