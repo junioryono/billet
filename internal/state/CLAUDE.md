@@ -8,4 +8,6 @@ The control-plane ledger: SQLite or PostgreSQL behind one seam, the migrations, 
 - SQL lives only in `queries/*.sql`, and `ledgerdb/` is what sqlc generates from it; never edit `ledgerdb/`.
 - The claim's epoch is re-read inside every write transaction, and a lost claim stops the process, not only the write.
 
+A test that needs a throwaway SQLite ledger opens `ledgertest.Dir(t)`, a fresh directory seeded from a template migrated once; a test about migrating itself opens an empty one.
+
 Gates: `make check`; `make sqlc-check` after a query or migration; `BILLET_TEST_POSTGRES_DSN` to run the PostgreSQL suite.

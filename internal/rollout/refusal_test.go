@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // THE REASON A DISPATCH WAS REFUSED IS ON THE ROW, and it has exactly three
@@ -42,7 +43,7 @@ func refusalOf(t *testing.T, s *Store, r *Rollout) string {
 // ledger, because it is what an operator reads after the control plane that
 // wrote it has restarted.
 func TestARefusedDispatchRecordsItsReason(t *testing.T) {
-	dir := t.TempDir()
+	dir := ledgertest.Dir(t)
 
 	db, err := state.Open(t.Context(), dir)
 	if err != nil {
@@ -342,7 +343,7 @@ func (d *fencingDispatcher) Upgrade(context.Context, string, string, string, str
 // target and is walked from pending to committed, and without this the old
 // refusal would outlive the upgrade it described.
 func TestAConvergedHostLosesTheRefusalItsAcceptedDispatchCouldNotClear(t *testing.T) {
-	dir := t.TempDir()
+	dir := ledgertest.Dir(t)
 
 	db, err := state.Open(t.Context(), dir)
 	if err != nil {

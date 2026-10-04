@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wiring"
 )
 
@@ -654,6 +656,12 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}, nil)
 	if err != nil {
 		t.Fatalf("scaleset.New: %v", err)
+	}
+
+	// A FRESH STACK STARTS FROM THE TEMPLATE LEDGER; a restarted one reopens what
+	// its predecessor wrote, which a seed would hide.
+	if _, err := os.Stat(state.LedgerPath(dir)); errors.Is(err, os.ErrNotExist) {
+		ledgertest.Seed(t, dir)
 	}
 
 	db, err := state.Open(t.Context(), dir)

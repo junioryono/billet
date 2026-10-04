@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -1523,7 +1524,7 @@ func (f *fakeProvider) add(inst *provider.Instance) {
 func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
 	t.Helper()
 
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -1616,7 +1617,7 @@ func registerElsewhere(t *testing.T, a *alloc.Allocator, kind config.ProviderKin
 func openState(t *testing.T) *state.DB {
 	t.Helper()
 
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
