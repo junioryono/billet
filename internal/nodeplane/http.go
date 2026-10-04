@@ -1296,11 +1296,6 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
-	// AND WHAT A WITHDRAWN PROCESS OF THIS NODE LEFT RUNNING moves to this one, but
-	// only what this process reported holding (#374).
-	if req.InventoryKnown {
-		h.plane.HandOverToSuccessor(req.Node, req.Incarnation, req.Instances)
-	}
 
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)
