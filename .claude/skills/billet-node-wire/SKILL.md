@@ -19,6 +19,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`MinVersion` is a promise about meaning, not about whether fields parse.**
 - **What each version added, and whether an older peer is refused or reported.**
 - **The release string is reduced on ingest.**
+- **The encoding is pinned per version.**
 
 ### Authentication, commands and fences: [references/authentication-and-fences.md](references/authentication-and-fences.md)
 

@@ -1,0 +1,38 @@
+{
+  "label": "",
+  "image": "",
+  "trust": "",
+  "command": [
+    ""
+  ],
+  "workflows": [
+    ""
+  ],
+  "buildkit_cache_mount_limit": 0,
+  "cache_scope": {
+    "Owner": "",
+    "Repository": "",
+    "WorkflowRef": ""
+  },
+  "cache": {
+    "publish": "",
+    "docker": {
+      "enabled": false
+    },
+    "sticky_disks": {
+      "enabled": false
+    },
+    "actions": {
+      "enabled": false
+    },
+    "git": {
+      "enabled": false
+    },
+    "bazel": {
+      "enabled": false
+    },
+    "go": {
+      "enabled": false
+    }
+  }
+}
