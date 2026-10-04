@@ -25,12 +25,12 @@ func TestTheDispatchSentinelsAreTheSameValues(t *testing.T) {
 	}
 }
 
-// AND THE OLD TYPE NAMES ARE ALIASES, NOT NEW TYPES. The compiler would not say
-// so: an interface re-declared as `type Runner dispatch.Runner` is still
-// satisfied by every implementation, because interfaces are structural, and a
-// struct re-declared the same way converts silently at most call sites. Type
-// identity is what a type switch, a reflect comparison and an interface
-// holding one of them all depend on.
+// AND THE OLD TYPE NAMES ARE ALIASES, NOT NEW TYPES. For the interfaces the
+// compiler would not say so: one re-declared as `type Runner dispatch.Runner` is
+// still satisfied by every implementation, because satisfaction is structural,
+// yet it is a type of its own that a type switch or a reflect comparison tells
+// apart. A struct re-declared that way fails to compile at the listener's calls,
+// and is checked here only so all five read the same.
 func TestTheDispatchTypesAreAliases(t *testing.T) {
 	t.Parallel()
 
