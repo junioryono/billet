@@ -1602,6 +1602,17 @@ else
         DNS-remapped to it, so without it interception silently degrades to GitHub's cache"
 fi
 
+# THE PASSTHROUGH RUNS ON THE SYSTEM INTERPRETER, which a job cannot reclaim the
+# way it reclaims the toolcache, so that interpreter must compile it.
+if chroot "$MNT" /usr/bin/python3 -c \
+	'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+	/usr/local/bin/billet-actions-proxy >/dev/null 2>&1; then
+	pass "the system python3 compiles the Actions results passthrough"
+else
+	fail "/usr/bin/python3 cannot compile the Actions results passthrough; the agent runs
+        it on that interpreter, so interception would never start"
+fi
+
 # THE ADAPTER IS PART OF THE INTERCEPTION CONTRACT, so an image that speaks the
 # current contract without it is refused here rather than discovered by a build.
 # Both halves are checked: the script can serve the plaintext endpoint on the docker gateway,
