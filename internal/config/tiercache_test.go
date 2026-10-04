@@ -49,6 +49,21 @@ func TestATierWithNoCacheBlockGetsEveryCacheItCanHave(t *testing.T) {
 		Cache: &TierCache{Publish: CachePublishOff}}).EffectiveCache(); got.Bazel.Enabled || got.Go.Enabled {
 		t.Errorf("a tier that publishes nothing has the content caches on: %+v", got)
 	}
+	// A BLOCK THAT SETS ONLY A SIZE KEEPS THE DEFAULT, and an explicit enable is
+	// honoured where publication cannot happen: the operator asked for it.
+	partial := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Cache: &TierCache{
+		Go: &GoCache{MaxSize: 10 * GiB}, Bazel: &CacheToggle{MaxSize: 10 * GiB}}}.EffectiveCache()
+	if partial.Go.Enabled || partial.Bazel.Enabled || partial.GoTestResults {
+		t.Errorf("a size-only block turned the content caches on for an untrusted tier: %+v", partial)
+	}
+	on := true
+	explicit := Tier{Provider: ProviderFirecracker, GuestOS: GuestLinux, Cache: &TierCache{
+		Go: &GoCache{Enabled: &on, MaxSize: 10 * GiB}, Bazel: &CacheToggle{Enabled: &on, MaxSize: 10 * GiB}}}.
+		EffectiveCache()
+	if !explicit.Go.Enabled || !explicit.Bazel.Enabled || explicit.Go.MaxSize != 10*GiB ||
+		explicit.Bazel.MaxSize != 10*GiB || explicit.GoTestResults {
+		t.Errorf("explicitly enabled content caches on an untrusted tier = %+v", explicit)
+	}
 	// NO REPOSITORY, SO NO DEFAULT-BRANCH NAMESPACE AND NO ACTIONS CACHE: nothing
 	// could prove whose default branch a job ran on, or scope its archives.
 	if spec.Publish != CachePublishTrustedOnly || spec.Actions.Enabled || cfg.NeedsRunEvidence() {
