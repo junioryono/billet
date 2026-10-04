@@ -1749,15 +1749,19 @@ func (p *Plane) adoptOwnershipLocked(
 	// Runs even for an empty snapshot: one-to-zero is exactly the shape that
 	// strands an entry for the life of the process.
 	//
-	// ONLY THIS PROCESS'S OWN. A snapshot speaks for the process that took it,
-	// never for another incarnation of the node: pruning a superseded process's
-	// adoption on its replacement's report let the ledger's launched set hand that
-	// lease to the replacement a moment later, and a replacement reporting nothing
-	// then answered the lease's destroy with a no-op over a guest still running
-	// elsewhere. Another process's record ends when its lease settles.
+	// A REPORT SPEAKS ONLY FOR THE PROCESS THAT SENT IT. With inventoryKnown the
+	// ids are this process's own report, and pruning a superseded process's
+	// adoption on it let the ledger's launched set hand that lease to the
+	// replacement a moment later, so a replacement reporting nothing answered its
+	// destroy with a no-op over a guest still running elsewhere. Without it the
+	// ids include the ledger's launched set (the registration handler's call),
+	// and a snapshot adoption missing from THAT is a lease the ledger says ended,
+	// whichever process adopted it: pruned, or a withdrawn process's stale
+	// adoption, and its withdrawal record, would outlive everything that could
+	// ever name it.
 	for id, owner := range p.owners {
-		if owner.node == node && owner.incarnation == incarnation && owner.requestID == 0 &&
-			!open[id] {
+		if owner.node == node && owner.requestID == 0 && !open[id] &&
+			(owner.incarnation == incarnation || !inventoryKnown) {
 			delete(p.owners, id)
 		}
 	}

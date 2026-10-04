@@ -223,3 +223,39 @@ func TestALateFailedLaunchDoesNotEraseTheSuccessorsOwnership(t *testing.T) {
 		t.Error("a late failed launch from the withdrawn process erased the successor's ownership")
 	}
 }
+
+// A WITHDRAWN PROCESS'S STALE ADOPTION ENDS WITH THE LEDGER'S WORD. A process
+// adopts a lease whose completion has just ended it, then withdraws; the next
+// process's registration carries the ledger's launched set, which no longer holds
+// the lease, and that is what prunes the record and the withdrawal with it.
+func TestAWithdrawnProcesssEndedAdoptionIsPrunedByTheLedgersWord(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p1")
+	p.AdoptOwnershipWithInventory("n1", "p1", []string{"l9"}, true)
+
+	if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
+		t.Fatalf("Withdraw: %v", err)
+	}
+
+	registerAs(t, p, "p2")
+	// The successor reports nothing, and the ledger's launched set no longer
+	// holds l9.
+	p.AdoptOwnershipWithInventory("n1", "p2", nil, true)
+	if owner, ok := ownerOf(p, "l9"); !ok || owner.incarnation != "p1" {
+		t.Fatalf("a report pruned another process's adoption: %+v (ok=%v)", owner, ok)
+	}
+
+	p.AdoptOwnership("n1", "p2", nil)
+	if owner, ok := ownerOf(p, "l9"); ok {
+		t.Errorf("an adoption the ledger says ended outlived the next registration: %+v", owner)
+	}
+
+	p.mu.Lock()
+	left := len(p.withdrawn)
+	p.mu.Unlock()
+	if left != 0 {
+		t.Errorf("the withdrawal record outlived the last lease its process owned: %d left", left)
+	}
+}
