@@ -308,6 +308,7 @@ func TestTheBashHookHoldsTheGitFlow(t *testing.T) {
 		{"git status\ngit push --force origin junior-oct03-work", "force"},
 		{"git status # inspect\ngit push --force origin junior-oct03-work", "force"},
 		{"echo '<<EOF'\ngit push --force origin junior-oct03-work", "force"},
+		{"echo \"<<EOF\"\ngit push --force origin junior-oct03-work", "force"},
 		{"cat <<EOF\nhello\nEOF\ngit push --force origin junior-oct03-work", "force"},
 		{"cat <<-EOF\n\thello\n\tEOF\ngit push --force origin junior-oct03-work", "force"},
 		{"env git push --force origin junior-oct03-work", "force"},
@@ -357,6 +358,12 @@ func TestTheBashHookHoldsTheGitFlow(t *testing.T) {
 		{"cat <<'EOF'\nDon't use git rebase.\nEOF", ""},
 		{"go test ./... | tee out.log", ""},
 		{"gh pr merge 357 --merge", ""},
+		{"git push origin # publish", "must name what it pushes"},
+		{"git push origin junior-oct03-work # merge main", ""},
+		{"git commit -m \"$(cat <<'EOF'\nDocument \"git status; git rebase main\" examples\nEOF\n)\"", ""},
+		{"git push \\\n  -u origin junior-oct03-work", ""},
+		{"git \\\npush origin main", "never pushes to main"},
+		{"if git diff --cached --quiet; then echo clean; else git rebase main; fi", "merging"},
 	} {
 		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command))
 		expectHook(t, tc.command, code, stderr, tc.refuse)
@@ -387,6 +394,10 @@ func TestTheBashHookJudgesTheBranchACommitLandsOn(t *testing.T) {
 		{work, "cd " + onMain + " && git commit -m x", "never commits to main"},
 		{work, "git commit -m x", ""},
 		{onMain, "git push origin HEAD", "never pushes to main"},
+		{work, "(cd " + onMain + " && git status); git commit -m x", ""},
+		{onMain, "(cd " + work + " && git status); git commit -m x", "never commits to main"},
+		{work, "env -C " + onMain + " git commit -m x", "never commits to main"},
+		{onMain, "if git diff --cached --quiet; then echo clean; else git commit -m x; fi", "never commits to main"},
 	} {
 		code, stderr := runClaudeGuard(t, "bash", tc.root, bashPayload(tc.root, tc.command))
 		expectHook(t, tc.command, code, stderr, tc.refuse)
@@ -441,7 +452,9 @@ func TestTheFormatHookRunsGofmtOnGoFilesOnlyAndNeverRefuses(t *testing.T) {
 		t.Errorf("the Go file changed with no gofmt on PATH: %q (%v)", got, err)
 	}
 
-	for label, body := range map[string]string{"not JSON": "not json", "not an object": "[1]"} {
+	for label, body := range map[string]string{
+		"not JSON": "not json", "not an object": "[1]",
+	} {
 		if code, stderr := runClaudeGuardRaw(t, "format", root, []byte(body)); code != 0 {
 			t.Errorf("format with %s input exited %d: %s", label, code, stderr)
 		}

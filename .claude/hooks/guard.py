@@ -182,61 +182,93 @@ WRAPPERS = {
     "builtin": set(),
 }
 HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "fi", "done"}
+COMMENT_STARTS = " \t\n;&|()"
 
 
-def strip_heredocs(text):
-    """Drop the bodies of real heredocs, which are data. Only an unquoted `<<`
-    opens one, so text that merely mentions `<<EOF` in quotes is not swallowed."""
-    out, lines, i = [], text.split("\n"), 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        i += 1
-        for strip_tabs, delimiter in unquoted_heredocs(line):
-            while i < len(lines):
-                body = lines[i].lstrip("\t") if strip_tabs else lines[i]
+def preprocess(text):
+    """Remove what the shell never runs as a command: line continuations,
+    comments and heredoc bodies. Quotes are tracked, and `$(...)` inside double
+    quotes opens a fresh context, so a `#` or a `<<` inside a string is left
+    alone while a heredoc inside a quoted command substitution is still a
+    heredoc."""
+    out, stack, pending, i, n = [], ["top"], [], 0, len(text)
+    while i < n:
+        c, ctx = text[i], stack[-1]
+        if ctx == "'":
+            out.append(c)
+            if c == "'":
+                stack.pop()
+            i += 1
+            continue
+        if c == "\\":
+            if text.startswith("\n", i + 1):  # a continuation joins the lines
+                i += 2
+                continue
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        if ctx == '"':
+            if text.startswith("$(", i):
+                stack.append("$(")
+                out.append("$(")
+                i += 2
+                continue
+            out.append(c)
+            if c == '"':
+                stack.pop()
+            i += 1
+            continue
+        # top level, or inside $( ... ) or ( ... )
+        if c in "'\"":
+            stack.append(c)
+        elif text.startswith("$(", i):
+            stack.append("$(")
+            out.append("$(")
+            i += 2
+            continue
+        elif c == "(":
+            stack.append("(")
+        elif c == ")" and stack[-1] in ("$(", "("):
+            stack.pop()
+        elif c == "#" and (i == 0 or text[i - 1] in COMMENT_STARTS):
+            while i < n and text[i] != "\n":
                 i += 1
-                if body == delimiter:
-                    break
-    return "\n".join(out)
-
-
-def unquoted_heredocs(line):
-    """The heredocs a line opens: (strip leading tabs, delimiter) per unquoted `<<`."""
-    found, quote, j = [], None, 0
-    while j < len(line):
-        c = line[j]
-        if quote:
-            if c == "\\" and quote == '"':
-                j += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c == "\\":
-            j += 2
             continue
-        elif c in "'\"":
-            quote = c
-        elif line.startswith("<<<", j):
-            j += 3
+        elif text.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
             continue
-        elif line.startswith("<<", j):
-            m = HEREDOC_OPEN.match(line, j)
+        elif text.startswith("<<", i):
+            m = HEREDOC_OPEN.match(text, i)
             if m:
-                found.append((m.group(1) == "-", m.group(3)))
-                j = m.end()
+                pending.append((m.group(1) == "-", m.group(3)))
+                out.append(text[i : m.end()])
+                i = m.end()
                 continue
-        j += 1
-    return found
+        elif c == "\n":
+            out.append(c)
+            i += 1
+            for strip_tabs, delimiter in pending:
+                while i < n:
+                    end = text.find("\n", i)
+                    line = text[i : end if end >= 0 else n]
+                    i = end + 1 if end >= 0 else n
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        break
+            pending = []
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def simple_commands(text):
-    """Split a command line into simple commands, as word lists; None when it does not parse."""
-    lexer = shlex.shlex(strip_heredocs(text), posix=True, punctuation_chars=SEPARATOR_CHARS)
+    """The command line as events: a simple command's words, or "(" / ")" where
+    a subshell opens or closes. None when it does not parse."""
+    lexer = shlex.shlex(preprocess(text), posix=True, punctuation_chars=SEPARATOR_CHARS)
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    # No comment handling: shlex would swallow the newline that ends a comment,
-    # joining the next command to this one. A `#` word is just an argument.
     lexer.commenters = ""
     try:
         words = list(lexer)
@@ -248,6 +280,7 @@ def simple_commands(text):
             if current:
                 out.append(current)
             current = []
+            out.extend(ch for ch in w if ch in "()")
         else:
             current.append(w)
     if current:
@@ -256,22 +289,33 @@ def simple_commands(text):
 
 
 def unwrap(words):
-    """Strip assignments and wrappers (env, sudo, command, ...) in front of the real program."""
+    """Strip reserved words, assignments and wrappers in front of the real
+    program, and return the directory a wrapper runs it in (env -C, sudo -D)."""
+    chdir = None
     while words:
+        if words[0] in RESERVED:
+            words = words[1:]
+            continue
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
             continue
-        wrapper = WRAPPERS.get(os.path.basename(words[0]))
+        name = os.path.basename(words[0])
+        wrapper = WRAPPERS.get(name)
         if wrapper is None:
             break
         words = words[1:]
         while words and words[0].startswith("-") and words[0] != "--":
             opt = words.pop(0)
-            if opt in wrapper and words and "=" not in opt:
-                words.pop(0)
+            flag, eq, value = opt.partition("=")
+            if eq and flag in ("--chdir",):
+                chdir = value
+            elif opt in wrapper and words and not eq:
+                value = words.pop(0)
+                if (name, opt) in (("env", "-C"), ("env", "--chdir"), ("sudo", "-D"), ("sudo", "--chdir")):
+                    chdir = value
         if words and words[0] == "--":
             words = words[1:]
-    return words
+    return words, chdir
 
 
 class GitCall:
@@ -321,15 +365,24 @@ class Shell:
             if re.search(r"\bgit\b.*\b(push|rebase|commit|pull|switch|checkout)\b", text, re.S):
                 raise CannotTell("this command line could not be parsed, and it names a git command the hook judges")
             return
-        for words in parsed:
-            words = unwrap(words)
+        saved = []  # the directory each open subshell will return to
+        for event in parsed:
+            if event == "(":
+                saved.append(self.cwd)
+                continue
+            if event == ")":
+                if saved:
+                    self.cwd = saved.pop()
+                continue
+            words, chdir = unwrap(event)
             if not words:
                 continue
+            cwd = os.path.join(self.cwd, os.path.expanduser(chdir)) if chdir else self.cwd
             program = os.path.basename(words[0])
             if program in SHELLS:
                 for i, a in enumerate(words[1:], start=1):
                     if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and i + 1 < len(words):
-                        Shell(self.cwd, self.calls).gather(words[i + 1])
+                        Shell(cwd, self.calls).gather(words[i + 1])
                         break
                 continue
             if program == "cd":
@@ -338,7 +391,7 @@ class Shell:
                 elif words[1] != "-":
                     self.cwd = os.path.join(self.cwd, os.path.expanduser(words[1]))
                 continue
-            call = parse_git(words, self.cwd)
+            call = parse_git(words, cwd)
             if call:
                 self.calls.append(call)
 
@@ -473,10 +526,13 @@ def main():
     mode = sys.argv[1]
     try:
         payload = json.load(sys.stdin)
-    except ValueError as err:
+    # Broad on purpose: an older json raises RecursionError on deep nesting, which
+    # is not a ValueError (Python 3.14 parses it, measured 2026-10-03).
+    except Exception as err:  # noqa: BLE001 - malformed or abnormal input
         if mode == "format":
             sys.exit(0)
-        refuse(f"billet hook: the hook input is not JSON ({err}), so the tool call cannot be judged")
+        refuse(f"billet hook: the hook input is not JSON it can read ({type(err).__name__}), so the tool call "
+               "cannot be judged")
     if mode == "format":
         try:
             format_go(payload)
