@@ -289,10 +289,6 @@ type Listener struct {
 	// once for the pass rather than once per purchase.
 	batchBuying bool
 	batchBought bool
-	// protect, under mu, names the waiters a purchase made ahead of this tier's
-	// turn must leave room for; empty for a purchase made in turn. See
-	// alloc.EscrowLeaving.
-	protect []string
 
 	// heartbeatLock runs immediately before mu is taken at the top of a heartbeat
 	// pass. TEST-ONLY and nil in every deployment; it gates the acquisition
@@ -3480,6 +3476,15 @@ func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 }
 
 func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) error {
+	return l.refillEscrowLeaving(ctx, target, maxNew, nil)
+}
+
+// refillEscrowLeaving is refillEscrowUngated for a purchase made ahead of this
+// tier's turn, which must leave room for each waiter in protect (see
+// alloc.EscrowLeaving). PROTECT IS AN ARGUMENT AND NOT LISTENER STATE: the
+// escrow takes no l.mu on the way, so a heartbeat pass holding the mutex never
+// delays a purchase (TestALeaseNeverConfirmedIsStillBoundedByItsTTL).
+func (l *Listener) refillEscrowLeaving(ctx context.Context, target, maxNew int, protect []string) error {
 	if l.beforeEscrowRefill != nil {
 		l.beforeEscrowRefill()
 	}
@@ -3525,10 +3530,6 @@ func (l *Listener) refillEscrowUngated(ctx context.Context, target, maxNew int) 
 	// machine. The real fix is for Escrow to return the allocator's authoritative
 	// expiry, filed with the rest of the lifecycle work.
 	created := time.Now()
-
-	l.mu.Lock()
-	protect := l.protect
-	l.mu.Unlock()
 
 	leases, err := l.alloc.EscrowLeaving(ctx, l.tier, room, protect)
 
@@ -4001,16 +4002,7 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 				}
 			}
 
-			l.mu.Lock()
-			l.protect = protect
-			l.mu.Unlock()
-
-			err := l.backPoolSlot(ctx)
-
-			l.mu.Lock()
-			l.protect = nil
-			l.mu.Unlock()
-
+			err := l.backPoolSlotLeaving(ctx, protect)
 			if err != nil {
 				l.endBatchBuying()
 
@@ -4149,6 +4141,12 @@ func (l *Listener) launchPool(ctx context.Context, batch []poolLaunch) error {
 // the drain-time reconciliation still runs; buying here would start a runner
 // after the drain began, which it could only then destroy.
 func (l *Listener) backPoolSlot(ctx context.Context) error {
+	return l.backPoolSlotLeaving(ctx, nil)
+}
+
+// backPoolSlotLeaving is backPoolSlot for a purchase ahead of this tier's turn,
+// leaving room for each waiter in protect.
+func (l *Listener) backPoolSlotLeaving(ctx context.Context, protect []string) error {
 	if l.isDraining() {
 		return nil
 	}
@@ -4161,7 +4159,7 @@ func (l *Listener) backPoolSlot(ctx context.Context) error {
 		return nil
 	}
 
-	return l.refillEscrowUngated(ctx, l.capacity()+1, 1)
+	return l.refillEscrowLeaving(ctx, l.capacity()+1, 1, protect)
 }
 
 // backAssignment buys one lease for an assignment this listener holds no promise
