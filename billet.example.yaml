@@ -410,7 +410,7 @@ node:
   # What a SIGTERM does while this node holds compute. "drain" (the default) waits
   # for it. "handoff" withdraws from placement and exits at once, leaving the
   # compute running for the next node process to adopt: for a host restarted to be
-  # upgraded or converged. A host leaving for good is drained first or
+  # upgraded or converged; Firecracker nodes only. A host leaving for good is drained first or
   # decommissioned, because nothing comes back to adopt what a handoff leaves.
   #
   # stop: drain

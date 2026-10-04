@@ -343,7 +343,14 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		})
 	}
 
-	err := register(ctx, c, compute, log, opts, backoff, startJanitor, startWatcher)
+	// recovered says a Recover succeeded in this process, which is the moment it
+	// first knows what this host runs; startWatcher is called exactly then.
+	var recovered atomic.Bool
+
+	err := register(ctx, c, compute, log, opts, backoff, startJanitor, func() {
+		recovered.Store(true)
+		startWatcher()
+	})
 
 	// ONE PLACE DECIDES THAT A STOP MEANS A DRAIN, and it is here because there
 	// are five ways out of the loop below and only one of them used to.
@@ -382,7 +389,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	}
 
 	if ctx.Err() != nil {
-		return stopGracefully(ctx, c, compute, log, opts)
+		return stopGracefully(ctx, c, compute, log, opts, recovered.Load())
 	}
 
 	return err
@@ -573,7 +580,18 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 //
 // Nothing is served during this wait, so no new launch can arrive: serve has
 // already returned, which is what brought us here.
-func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) error {
+func stopGracefully(
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, recovered bool,
+) error {
+	// A REQUESTED DRAIN FIRST LEARNS WHAT THIS HOST RUNS (#374). A process
+	// stopped before its first recovery holds nothing it knows of, while guests a
+	// previous process left are still running, and the operation that asked for
+	// the drain is about to take their host or its networking apart. Recovering
+	// is what makes Holding() see them; a second signal still ends the attempt.
+	if !recovered && opts.DrainRequested != nil && opts.DrainRequested() {
+		recoverBeforeDrain(ctx, c, compute, log, opts)
+	}
+
 	// A node holding nothing stops at once. The drain is for work in flight, not
 	// a delay every restart pays.
 	//
@@ -868,6 +886,43 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 }
 
 // backoffFor is the pause after a failed registration or poll.
+// recoverBeforeDrain registers if this process never did and recovers, until it
+// succeeds or a second signal arrives.
+func recoverBeforeDrain(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) {
+	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+
+	if opts.Hurry != nil {
+		go func() {
+			select {
+			case <-opts.Hurry:
+				cancel()
+			case <-recoverCtx.Done():
+			}
+		}()
+	}
+
+	for recoverCtx.Err() == nil {
+		var err error
+		if c.WireVersion() == 0 {
+			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
+		}
+		if err == nil {
+			err = compute.Recover(recoverCtx)
+		}
+		if err == nil {
+			return
+		}
+
+		log.Error("a drain was asked for before this process knew what its host runs; "+
+			"recovering before deciding whether it holds anything", "error", err)
+
+		if !sleep(recoverCtx, backoffFor(opts)) {
+			return
+		}
+	}
+}
+
 func backoffFor(opts LoopOptions) time.Duration {
 	if opts.Backoff > 0 {
 		return opts.Backoff

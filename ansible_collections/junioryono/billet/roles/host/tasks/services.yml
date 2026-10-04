@@ -812,6 +812,19 @@
 
 # REQUESTED WITHOUT WAITING AND POLLED IN BOUNDED STEPS (node-restart.yml),
 # because the drain in front of the restart has no bound.
+# A CHANGED CONFIG MAY MOVE WHAT THE NEXT PROCESS ADOPTS FROM (#374): a
+# Firecracker chroot base, a state directory or the guests' cache endpoint. A
+# restart for one drains, and the final release below withdraws the request once
+# the restart has been polled to its new process.
+- name: Make a node restart for a changed config a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
+    - not billet_endpoint_migrated | default(false) | bool
+    - billet_config_install.changed | default(false)
+
 - name: Restart the billet node after non-binary inputs change
   ansible.builtin.import_tasks: node-restart.yml
   when:
@@ -889,13 +902,14 @@
   become: true
   notify: billet unit files changed
 
-# THE NODE THAT MAY NOT RUN HERE HAS DRAINED AND STOPPED, by the transaction or by
-# the task above, so a later start may hand over again on its stops (#374).
-- name: Withdraw the drain request once a node that may not run here has stopped
+# EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
+# node is started or stopped as the converge leaves it, any restart was polled to
+# its new process, and the transaction finished. Withdrawn unconditionally, so a
+# request a failed or resumed converge left behind does not keep later stops
+# draining.
+- name: Withdraw the drain request now that the node is where this converge leaves it
   ansible.builtin.include_tasks: release-node-drain.yml
-  when:
-    - not billet_node_should_run
-    - not ansible_check_mode
+  when: not ansible_check_mode
 
 # THE SCHEDULED UPDATER, INSTALLED ON EVERY HOST WITH A CONTROL PLANE AND
 # ENABLED WHEN THE DEPLOYMENT UPDATES ITSELF. The upgrade timer acts on the

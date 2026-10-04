@@ -210,3 +210,64 @@ func TestReadyWaitsForRecoveryAndADrainStillAnswers(t *testing.T) {
 		})
 	}
 }
+
+// A REQUESTED DRAIN RECOVERS BEFORE IT DECIDES (#374). A process stopped before
+// its first recovery knows of nothing it holds while guests a previous process
+// left are still running, so a stop that must drain recovers first, for as long
+// as that takes, and only then judges whether it holds anything.
+func TestARequestedDrainRecoversBeforeItDecides(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+	compute := &fakeCompute{recoverErr: errors.New("the provider could not list its guests")}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+			DrainRequested: func() bool { return true },
+		})
+	}()
+
+	attempts := func() int {
+		compute.mu.Lock()
+		defer compute.mu.Unlock()
+
+		return compute.recovered
+	}
+
+	waitFor(t, func() bool { return attempts() >= 2 })
+	cancel()
+	before := attempts()
+
+	select {
+	case err := <-done:
+		t.Fatalf("a stop asked to drain returned (%v) before this process ever recovered", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if attempts() <= before {
+		t.Error("a stop asked to drain did not keep recovering")
+	}
+
+	compute.mu.Lock()
+	compute.recoverErr = nil
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stop did not end once recovery succeeded and nothing was held")
+	}
+}
