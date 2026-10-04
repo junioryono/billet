@@ -140,12 +140,13 @@ def judge_edit(payload):
     lexical_rel, rels = candidate_paths(payload, root)
 
     # Judged by the name the tool was given, case-insensitively: a write through
-    # .agents/ is refused even though it would land under .claude/.
+    # .agents/ is refused even though it would land under .claude/. Every
+    # AGENTS.md is one, the nested ones beside their directory's CLAUDE.md too.
     low_lexical = (lexical_rel or "").lower()
-    if low_lexical == "agents.md" or low_lexical.startswith(".agents/"):
+    if os.path.basename(low_lexical) == "agents.md" or low_lexical.startswith(".agents/"):
         refuse(
-            f"{lexical_rel} is a committed symlink for Codex. Edit the canonical file instead: CLAUDE.md, or "
-            ".claude/skills/<name>/ for a skill."
+            f"{lexical_rel} is a committed symlink for Codex. Edit the canonical file instead: the CLAUDE.md "
+            "beside it, or .claude/skills/<name>/ for a skill."
         )
 
     # Judged by every spelling, case-insensitively: a symlinked alias or a

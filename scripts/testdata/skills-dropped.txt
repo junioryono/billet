@@ -1,3 +1,9 @@
 # Corpus units removed from the skills on purpose, one per line: `<hash> <reason>`.
 # The hash is the first 12 hex digits of the unit's sha256, as TestEverySkillSentenceIsKeptOrDroppedWithAReason prints it.
 65d8d06981b7 The privilege drop now ends in billet-exec-env (#352); the same rule is restated with the helper and measured on ubuntu:24.04.
+2a17635177eb #363 turned the Go and Bazel caches on by default only where a tier can publish them; billet-config states the narrower default.
+ef2028194cf6 #363 turned the Go and Bazel caches on by default only where a tier can publish them; billet-storage-and-cache states the narrower default.
+8899a7100e48 A new node is refused at registration only when its body carries a field the old plane does not know; versions.md now says so (#356 Phase 0 review).
+a1e418a9618d A node-first upgrade is refused only when its registration carries an unknown field or the ranges do not overlap; versions.md restates it conditionally.
+1ad0df649957 Firecracker nodes run four launches at once (nodeLaunchConcurrency); the rule now states the exception and that every other command waits for them.
+43d1333b82df The queue is not serial for launches on a provider that allows several; restated as a queue in which only launches run beside each other.
