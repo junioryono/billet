@@ -584,13 +584,48 @@ func stopGracefully(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, recovered bool,
 	startJanitor func(),
 ) error {
-	// A REQUESTED DRAIN FIRST LEARNS WHAT THIS HOST RUNS (#374). A process
-	// stopped before its first recovery holds nothing it knows of, while guests a
-	// previous process left are still running, and the operation that asked for
-	// the drain is about to take their host or its networking apart. Recovering
-	// is what makes Holding() see them; a second signal still ends the attempt.
-	if !recovered && opts.DrainRequested != nil && opts.DrainRequested() {
-		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor)
+	drainRequested := opts.DrainRequested != nil && opts.DrainRequested()
+
+	// A HANDOFF ENDS HERE, exactly as a second signal ends the wait below: the
+	// compute keeps running, its leases stay charged, the host leaves placement,
+	// and the next node process adopts what it finds (Recover runs at every
+	// registration). The VMMs live in cgroups of their own, outside the unit's,
+	// so stopping the service does not stop them.
+	//
+	// ONLY ONCE THE WITHDRAWAL HAS LANDED. The next process takes over what this
+	// one owned only from a process the plane recorded as withdrawn; without that
+	// record the leases stay with this exited process and a completion's destroy
+	// never reaches the guest, so a withdrawal that did not land drains instead.
+	// That holds whether or not this process knows what it holds: a successor
+	// stopped before its first recovery may already own what it registered with.
+	if opts.HandOverOnStop && !drainRequested {
+		if withdraw(ctx, c, log, opts) {
+			log.Info("handing over to the next node process: the compute running here keeps " +
+				"running and is adopted when billet node starts again")
+
+			return nil
+		}
+
+		log.Warn("the withdrawal did not land, so the next node process could not take over " +
+			"what this one runs; draining instead")
+	}
+
+	// AN UNRECOVERED PROCESS DOES NOT KNOW IT HOLDS NOTHING (#374). Until its
+	// first recovery Holding() cannot see the guests a previous process left, and
+	// a process that registered may already own them, so it recovers before an
+	// empty answer is believed. A stop asked to drain keeps trying for as long as
+	// it takes, because the operation that asked is about to take the host or its
+	// networking apart; any other stop tries unrecoveredStopAttempts times and
+	// then stops as it always did, so a node whose provider is broken can still
+	// be stopped to be mended, and its next process adopts what it leaves. A
+	// process that never registered was given nothing. A second signal ends the
+	// attempt either way.
+	if !recovered && (drainRequested || c.WireVersion() != 0) {
+		attempts := 0
+		if !drainRequested {
+			attempts = unrecoveredStopAttempts
+		}
+		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -606,28 +641,6 @@ func stopGracefully(
 		withdraw(ctx, c, log, opts)
 
 		return nil
-	}
-
-	// A HANDOFF ENDS HERE, exactly as a second signal ends the wait below: the
-	// compute keeps running, its leases stay charged, the host leaves placement,
-	// and the next node process adopts what it finds (Recover runs at every
-	// registration). The VMMs live in cgroups of their own, outside the unit's,
-	// so stopping the service does not stop them.
-	//
-	// ONLY ONCE THE WITHDRAWAL HAS LANDED. The next process takes over what this
-	// one owned only from a process the plane recorded as withdrawn; without that
-	// record the leases stay with this exited process and a completion's destroy
-	// never reaches the guest, so a withdrawal that did not land drains instead.
-	if opts.HandOverOnStop && (opts.DrainRequested == nil || !opts.DrainRequested()) {
-		if withdraw(ctx, c, log, opts) {
-			log.Info("handing over to the next node process: the compute running here keeps " +
-				"running and is adopted when billet node starts again")
-
-			return nil
-		}
-
-		log.Warn("the withdrawal did not land, so the next node process could not take over " +
-			"what this one runs; draining instead")
 	}
 
 	// THE GUESTS THIS DRAIN WAITS FOR ARE ANSWERED. A stop that arrived while
@@ -897,14 +910,19 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 	return false
 }
 
+// unrecoveredStopAttempts is how often an ordinary stop of a process that never
+// recovered tries to, before it believes an empty Holding().
+const unrecoveredStopAttempts = 3
+
 // recoverBeforeDrain registers if this process never did and recovers, until it
-// succeeds or a second signal arrives. The janitor starts once a registration
+// succeeds, a second signal arrives or, when attempts is positive, that many
+// attempts have failed. The janitor starts once a registration
 // has told it the lease TTL and before anything is recovered, exactly as at an
 // ordinary registration: recovery adopts leases, and a drain can outlast their
 // TTL many times over while Tend's provider calls are not what renews them.
 func recoverBeforeDrain(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
-	startJanitor func(),
+	startJanitor func(), attempts int,
 ) {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
@@ -919,7 +937,7 @@ func recoverBeforeDrain(
 		}()
 	}
 
-	for recoverCtx.Err() == nil {
+	for attempt := 1; recoverCtx.Err() == nil; attempt++ {
 		var err error
 		if c.WireVersion() == 0 {
 			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
@@ -932,8 +950,15 @@ func recoverBeforeDrain(
 			return
 		}
 
-		log.Error("a drain was asked for before this process knew what its host runs; "+
-			"recovering before deciding whether it holds anything", "error", err)
+		if attempts > 0 && attempt >= attempts {
+			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
+				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
+
+			return
+		}
+
+		log.Error("stopping before this process knew what its host runs; recovering before "+
+			"deciding whether it holds anything", "error", err)
 
 		if !sleep(recoverCtx, backoffFor(opts)) {
 			return

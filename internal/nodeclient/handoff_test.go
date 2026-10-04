@@ -373,3 +373,64 @@ func TestADrainThatRegistersFirstKeepsItsLeasesAlive(t *testing.T) {
 		t.Fatal("the drain did not end once the compute was gone")
 	}
 }
+
+// A SUCCESSOR STOPPED BEFORE IT RECOVERED, WHOSE WITHDRAWAL FAILS, RECOVERS AND
+// DRAINS (#374). It registered, so the plane may already have handed it the
+// guests it reported, while its own Holding() still says nothing; exiting on that
+// would leave those leases with a process that never withdrew.
+func TestAnUnrecoveredHandoverWhoseWithdrawalFailsRecoversAndDrains(t *testing.T) {
+	t.Parallel()
+
+	_, c, b := breakableHarness(t)
+	b.failWithdraw.Store(true)
+	// THE FIRST RECOVERY IS HELD until the stop, so this process registers and
+	// never recovers; the one after the stop is released below.
+	compute := &fakeCompute{recoverGate: make(chan struct{}), recoverStarted: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+		})
+	}()
+
+	<-compute.recoverStarted
+	cancel()
+	waitFor(t, func() bool { return b.withdrawAttempts.Load() >= 3 })
+
+	select {
+	case err := <-done:
+		t.Fatalf("an unrecovered node whose withdrawal failed exited (%v) as if it held nothing", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Recovery is let through and finds the guest the previous process left.
+	compute.setHolding(true)
+	close(compute.recoverGate)
+
+	select {
+	case err := <-done:
+		t.Fatalf("the node stopped (%v) while it held a guest it had just recovered", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	compute.setHolding(false)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end once the compute was gone")
+	}
+}
