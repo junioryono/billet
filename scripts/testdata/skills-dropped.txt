@@ -7,3 +7,4 @@ ef2028194cf6 #363 turned the Go and Bazel caches on by default only where a tier
 a1e418a9618d A node-first upgrade is refused only when its registration carries an unknown field or the ranges do not overlap; versions.md restates it conditionally.
 1ad0df649957 Firecracker nodes run four launches at once (nodeLaunchConcurrency); the rule now states the exception and that every other command waits for them.
 43d1333b82df The queue is not serial for launches on a provider that allows several; restated as a queue in which only launches run beside each other.
+14a01b270e4b There is a shared helper now (internal/state/ledgertest, #356 Phase 1); the convention says when to use it and what still runs for real.

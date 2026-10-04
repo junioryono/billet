@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 type presentLeaseRegistrar struct {
@@ -272,7 +273,7 @@ func TestPeriodicReconciliationInstallsOwnershipBeforeCompletionCanUseAbsence(t 
 
 func TestReplacementRegistrationInvalidatesAbsenceBeforeItsEpochWrite(t *testing.T) {
 	now := time.Now().UTC()
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -354,7 +355,7 @@ func TestReplacementRegistrationInvalidatesAbsenceBeforeItsEpochWrite(t *testing
 }
 
 func TestSameNodeRegistrationSerializesTheRealAllocatorCommit(t *testing.T) {
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -671,7 +672,7 @@ func TestAnUnpinnedLeasePicksDeterministically(t *testing.T) {
 // relationship to the quarantine and must not be what frees the capacity.
 func TestABoundCompletionSettlesFromTheReplacementsInventoryOnceQuarantined(t *testing.T) {
 	now := time.Now().UTC()
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -820,7 +821,7 @@ func TestABoundCompletionSettlesFromTheReplacementsInventoryOnceQuarantined(t *t
 // "holder unavailable" for the life of the process.
 func TestABoundCompletionFinishesOnAForcedReleaseWhenItsHostNeverReturns(t *testing.T) {
 	now := time.Now().UTC()
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}

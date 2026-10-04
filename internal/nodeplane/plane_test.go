@@ -18,6 +18,7 @@ import (
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 const deployment = "0123456789abcdef0123456789abcdef"
@@ -1921,7 +1922,7 @@ func answerOneCommand(t *testing.T, p *Plane, incarnation string) {
 // that window and records the other host as owner; the release must still be
 // refused by the ledger's placement and the lease must still be open.
 func TestAnOwnerRecordedAfterAuthorizationDoesNotSkipTheLedger(t *testing.T) {
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
