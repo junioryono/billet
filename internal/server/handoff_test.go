@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -152,7 +154,7 @@ func (f *handoffFixture) owe(id int64) {
 func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff(nil))
+	f := newHandoffFixture(t, WithRestartHandoff())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -230,7 +232,7 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 func TestASealedStopStillDrains(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff(nil))
+	f := newHandoffFixture(t, WithRestartHandoff())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -270,7 +272,7 @@ func TestASealedStopStillDrains(t *testing.T) {
 func TestAStopThatCannotReadAdmissionDrains(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff(nil))
+	f := newHandoffFixture(t, WithRestartHandoff())
 
 	if err := f.db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -306,32 +308,11 @@ func TestAListenerWithoutTheOptionNeverHandsOver(t *testing.T) {
 func TestTheStopHandoffReachesEveryListener(t *testing.T) {
 	t.Parallel()
 
-	s := New(nil, nil, nil, "owner", nil, WithStopHandoff(nil))
+	s := New(nil, nil, nil, "owner", nil, WithStopHandoff())
 
 	l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 	if !l.restartHandoff {
 		t.Fatal("the stop handoff never reached the listener")
-	}
-}
-
-// A STOP THIS HOST MARKED FINAL DRAINS EVEN WHILE THE DEPLOYMENT ADMITS WORK: a
-// package removal has no successor here, and must not seal the deployment its other
-// controllers serve.
-func TestAStopMarkedFinalDrainsWhileAdmitting(t *testing.T) {
-	t.Parallel()
-
-	f := newHandoffFixture(t, WithRestartHandoff(func() bool { return true }))
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	if f.l.handsOff(ctx) {
-		t.Error("a stop marked final chose to hand over")
-	}
-
-	open := newHandoffFixture(t, WithRestartHandoff(func() bool { return false }))
-	if !open.l.handsOff(ctx) {
-		t.Error("an unmarked stop while admitting did not hand over")
 	}
 }
 
@@ -341,7 +322,7 @@ func TestAStopMarkedFinalDrainsWhileAdmitting(t *testing.T) {
 func TestAStopDuringStartupIsDecidedLikeAnyOther(t *testing.T) {
 	t.Parallel()
 
-	live := newHandoffFixture(t, WithRestartHandoff(nil))
+	live := newHandoffFixture(t, WithRestartHandoff())
 	live.l.noteStop(t.Context())
 	if live.l.handingOff {
 		t.Error("a startup failure with no stop asked was taken for a handoff")
@@ -350,9 +331,30 @@ func TestAStopDuringStartupIsDecidedLikeAnyOther(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	f := newHandoffFixture(t, WithRestartHandoff(nil))
+	f := newHandoffFixture(t, WithRestartHandoff())
 	f.l.noteStop(ctx)
 	if !f.l.handingOff {
 		t.Error("a stop during startup while admitting was not a handoff")
+	}
+}
+
+// BOTH WAYS RUN CAN END BEFORE ITS LOOP ASK THE SAME QUESTION. The test above calls
+// noteStop directly, so this is what notices a call site removed from Run.
+func TestRunDecidesAStopAtEveryEarlyReturn(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("listener.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+
+	for _, call := range []string{
+		"if err := l.refreshAdoptedCapacity(ctx); err != nil {\n\t\tl.noteStop(ctx)",
+		"if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {\n\t\t\tl.noteStop(ctx)",
+	} {
+		if !strings.Contains(source, call) {
+			t.Errorf("Run no longer decides a stop before returning here:\n%s", call)
+		}
 	}
 }

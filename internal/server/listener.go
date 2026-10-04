@@ -494,7 +494,6 @@ type Listener struct {
 	// drain; see WithRestartHandoff. handingOff is Run's decision, read only by
 	// its own teardown on the same goroutine.
 	restartHandoff bool
-	stopIsFinal    func() bool
 	handingOff     bool
 
 	// leadershipLost answers whether this process has stopped being this
@@ -811,13 +810,10 @@ func WithHurrySignal(c <-chan struct{}) Option {
 // renewed. Only the destroys this listener already owes, for jobs GitHub has
 // concluded, still run. A SEALED or UNREADABLE admission keeps the drain: an
 // operator who sealed asked for the deployment to stop taking work, and a stop
-// that cannot prove otherwise is not entitled to call itself a restart.
-//
-// final, when it answers true, says THIS host's stop is not a restart even though
-// the deployment admits work: a package removal, which has no successor here and
-// must not seal the deployment its other controllers serve. Nil means never.
-func WithRestartHandoff(final func() bool) Option {
-	return func(l *Listener) { l.restartHandoff, l.stopIsFinal = true, final }
+// that cannot prove otherwise is not entitled to call itself a restart. Stopping a
+// deployment for good is sealing it first (`billet drain`, `local down`).
+func WithRestartHandoff() Option {
+	return func(l *Listener) { l.restartHandoff = true }
 }
 
 // handsOff reports whether a stop arriving now is a handoff: the option is set,
@@ -825,12 +821,6 @@ func WithRestartHandoff(final func() bool) Option {
 // ctx is the cancelled run context, so the read gets its own short bound.
 func (l *Listener) handsOff(ctx context.Context) bool {
 	if !l.restartHandoff || l.alloc == nil || l.fenced() {
-		return false
-	}
-	if l.stopIsFinal != nil && l.stopIsFinal() {
-		l.log.Info("this stop was asked to drain rather than hand over, because nothing on "+
-			"this host will take over", "tier", l.tier)
-
 		return false
 	}
 

@@ -68,10 +68,8 @@ type Server struct {
 	reapEvery time.Duration
 	// hurry, when closed, ends every listener's drain wait early.
 	hurry <-chan struct{}
-	// restartHandoff makes an unsealed stop a handoff, unless stopIsFinal says
-	// this host's stop is final; see WithRestartHandoff.
+	// restartHandoff makes an unsealed stop a handoff; see WithRestartHandoff.
 	restartHandoff bool
-	stopIsFinal    func() bool
 
 	// leadershipLost reports that this process has stopped being this
 	// deployment's controller, so no listener may act on what it holds. Nil
@@ -260,9 +258,9 @@ func WithHurry(c <-chan struct{}) ControlPlaneOption {
 
 // WithStopHandoff makes every listener hand over to the next control plane, rather
 // than drain, when it is stopped while the deployment admits work. See the
-// listener's WithRestartHandoff, which final is forwarded to.
-func WithStopHandoff(final func() bool) ControlPlaneOption {
-	return func(s *Server) { s.restartHandoff, s.stopIsFinal = true, final }
+// listener's WithRestartHandoff.
+func WithStopHandoff() ControlPlaneOption {
+	return func(s *Server) { s.restartHandoff = true }
 }
 
 // WithLeadershipLost gives every listener the question that decides whether its
@@ -732,7 +730,7 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 		opts = append(opts, WithHurrySignal(s.hurry))
 	}
 	if s.restartHandoff {
-		opts = append(opts, WithRestartHandoff(s.stopIsFinal))
+		opts = append(opts, WithRestartHandoff())
 	}
 
 	if s.leadershipLost != nil {

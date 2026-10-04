@@ -673,12 +673,10 @@ func runServer(
 	// back to a deployment that is no longer theirs.
 	//
 	// AND A STOP WHILE ADMISSION IS OPEN IS A RESTART, handed over rather than
-	// drained (#365): `billet drain` and `local down` seal first and still drain,
-	// and a package removal marks this host's stop as final.
-	clearStopMarker(cfg.Server.StateDir)
+	// drained (#365): `billet drain` and `local down` seal first and still drain.
 	opts = append(opts, server.WithHurry(lc.hurry), server.WithLeadershipLost(db.LeadershipLost),
 		server.WithCompletionLedger(db), server.WithTargets(serverTargets...),
-		server.WithStopHandoff(stopIsFinal(cfg.Server.StateDir)))
+		server.WithStopHandoff())
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())

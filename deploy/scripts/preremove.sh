@@ -17,18 +17,13 @@ case "${1:-}" in
         ;;
 esac
 
-# A REAL REMOVAL, AND THIS HOST'S STOP IS MARKED FINAL FIRST. A server stopped
-# while the deployment admits work hands over to the next control plane, leaving
-# its jobs and its message sessions for a successor (#365). A removal has no
-# successor on this host, so the marker below makes its stop the drain it always
-# was. It is a marker on this host and not a seal of the deployment, which other
-# controllers may still be serving. Written unconditionally, before anything is
-# stopped, so no service state read in between can skip it; a marker that cannot
-# be written refuses the removal rather than turning it into a handoff to nobody.
-# cmd/billet/stophandoff.go names the same file.
+# A REAL REMOVAL. `systemctl stop` sends SIGTERM. The node's is a drain. The
+# server's is a drain only once the deployment is sealed: while it still admits
+# work the server hands over to the next control plane (#365) and returns at once,
+# so retiring a controller for good is `billet local down` first, which seals.
+# Sealing here instead would seal a deployment other controllers may serve.
 #
-# `systemctl stop` sends SIGTERM, which begins billet's drain, so
-# this waits for the jobs already running — up to the unit's TimeoutStopSec. That
+# The node's drain waits for the jobs already running — up to the unit's TimeoutStopSec. That
 # is the intended behaviour and it can take a while; an operator in a hurry sends
 # a second SIGTERM with
 #
@@ -45,16 +40,6 @@ if [ -d /run/systemd/system ]; then
     for timer in billet-upgrade.timer billet-images-refresh.timer; do
         systemctl disable --now "${timer}" >/dev/null 2>&1 || true
     done
-
-    server_state=${BILLET_SERVER_STATE_DIR:-/var/lib/billet/server}
-    if [ -d "${server_state}" ]; then
-        if ! : >"${server_state}/drain-on-stop"; then
-            echo "billet: could not mark this host's stop as final in ${server_state}." >&2
-            echo "        Refusing to remove the package: its control plane would hand" >&2
-            echo "        its jobs to a successor that is not coming." >&2
-            exit 1
-        fi
-    fi
 
     for unit in billet-node billet-server; do
         if systemctl is-active --quiet "${unit}" 2>/dev/null; then
