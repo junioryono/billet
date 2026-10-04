@@ -42,6 +42,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Time warns; it does not authorise a teardown.**
 - **A listener's drain does not wait for an anonymous pool slot that never started a job (#220).**
 - **A drain is two barriers, and the second asks the machines.**
+- **An unsealed server stop is a handoff, not a drain (#365, #368).**
 - **A clean exit withdraws; silence still means nothing.**
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**

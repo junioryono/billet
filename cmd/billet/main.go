@@ -671,8 +671,12 @@ func runServer(
 	// listener is unwinding it is already true — which is what lets every one of
 	// them stop without destroying compute, closing a session or handing capacity
 	// back to a deployment that is no longer theirs.
+	//
+	// AND A STOP WHILE ADMISSION IS OPEN IS A RESTART, handed over rather than
+	// drained (#365): `billet drain` and `local down` seal first and still drain.
 	opts = append(opts, server.WithHurry(lc.hurry), server.WithLeadershipLost(db.LeadershipLost),
-		server.WithCompletionLedger(db), server.WithTargets(serverTargets...))
+		server.WithCompletionLedger(db), server.WithTargets(serverTargets...),
+		server.WithStopHandoff())
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())

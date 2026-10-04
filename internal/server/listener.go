@@ -490,6 +490,11 @@ type Listener struct {
 	// Closing it ends the drain's wait without abandoning what is held. Read
 	// here, never closed here.
 	hurry <-chan struct{}
+	// restartHandoff makes a stop while admission is open a handoff rather than a
+	// drain; see WithRestartHandoff. handingOff is Run's decision, read only by
+	// its own teardown on the same goroutine.
+	restartHandoff bool
+	handingOff     bool
 
 	// leadershipLost answers whether this process has stopped being this
 	// deployment's controller. Nil outside the control plane; see
@@ -785,6 +790,55 @@ func WithShutdownGrace(d time.Duration) Option {
 func WithHurrySignal(c <-chan struct{}) Option {
 	return func(l *Listener) { l.hurry = c }
 }
+
+// WithRestartHandoff makes a stop that arrives while the deployment is admitting
+// work a handoff to the next control plane rather than a drain (#365, #368).
+//
+// A DRAIN WAITS FOR THE LONGEST RUNNING JOB, and on 2026-10-04 a consumer's
+// converge stopped the reference deployment's controller for ninety minutes
+// that way, timed out, and launched nothing in between. Worse, the drain lowers
+// the advertisement to what is running, and a job GitHub re-offers in that
+// window (it cancels a declined request after five minutes and offers the job
+// again only to a scale set with room) was never offered again: 28 jobs stayed
+// queued with no runner until somebody re-ran them.
+//
+// SO AN UNSEALED STOP IS A RESTART, and it hands over the way a fenced
+// controller already does (abandon): the jobs keep running on their hosts and the
+// next process re-adopts them, the message session is left open so GitHub goes on
+// seeing the last advertisement and redelivers what it assigns to the successor
+// (measured, 2026-09-04), and capacity comes back when its leases stop being
+// renewed. Only the destroys this listener already owes, for jobs GitHub has
+// concluded, still run. A SEALED or UNREADABLE admission keeps the drain: an
+// operator who sealed asked for the deployment to stop taking work, and a stop
+// that cannot prove otherwise is not entitled to call itself a restart.
+func WithRestartHandoff() Option {
+	return func(l *Listener) { l.restartHandoff = true }
+}
+
+// handsOff reports whether a stop arriving now is a handoff: the option is set,
+// this process is still the controller, and the ledger says admission is open.
+// ctx is the cancelled run context, so the read gets its own short bound.
+func (l *Listener) handsOff(ctx context.Context) bool {
+	if !l.restartHandoff || l.alloc == nil || l.fenced() {
+		return false
+	}
+
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handoffAdmissionRead)
+	defer cancel()
+
+	admission, err := l.alloc.Admission(readCtx)
+	if err != nil {
+		l.log.Warn("could not read whether this deployment is admitting work, so this stop "+
+			"drains rather than handing over", "tier", l.tier, "error", err)
+
+		return false
+	}
+
+	return admission.Mode == state.AdmissionOpen
+}
+
+// handoffAdmissionRead bounds the one ledger read that decides a handoff.
+const handoffAdmissionRead = 5 * time.Second
 
 // WithLeadershipLostCheck supplies the question "has this process stopped being
 // this deployment's controller", which the teardown asks before it acts on
@@ -1187,6 +1241,23 @@ func (l *Listener) Run(ctx context.Context) error {
 		// work should end, and ending it fails builds GitHub will not requeue.
 		destroyed := l.destroyAll(stopCtx, false, nil)
 
+		// A HANDOFF STOPS HERE: the session stays open and nothing is released, as
+		// WithRestartHandoff says. Closing the session is what would let GitHub
+		// lower the advertisement and orphan what it re-offers meanwhile, and the
+		// escrow behind that advertisement is reclaimed once it stops being
+		// renewed, exactly as after a crash.
+		if l.handingOff {
+			l.mu.Lock()
+			held, promised := len(l.held), len(l.acquiring)
+			l.mu.Unlock()
+
+			l.log.Info("handed over: left the message session open and the capacity held for "+
+				"the next control plane", "tier", l.tier, "running", l.Running(),
+				"held", held, "promised", promised)
+
+			return
+		}
+
 		// A FRESH BUDGET FOR THE LOCAL HALF, and one EACH. Sharing the destroy
 		// pass's deadline would hand the close an already-expired context after a
 		// slow destroy, skipping releaseAll; sharing one budget between close and
@@ -1294,6 +1365,16 @@ func (l *Listener) Run(ctx context.Context) error {
 		// lands DURING one rather than between two: the listener spends nearly all
 		// its life inside a long poll.
 		if !draining && ctx.Err() != nil {
+			if l.handsOff(ctx) {
+				l.handingOff = true
+				l.log.Info("handing over to the next control plane: the jobs running here keep "+
+					"running and are re-adopted, and the message session stays open so what "+
+					"GitHub assigns meanwhile is redelivered to the next session",
+					"tier", l.tier, "running", l.Running())
+
+				return ctx.Err()
+			}
+
 			draining = true
 			// The budget starts at the cancellation, so this cannot be hoisted above
 			// the loop; `draining` makes it a once-per-Run assignment.
