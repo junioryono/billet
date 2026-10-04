@@ -117,7 +117,7 @@ func (p *Provider) checkResize2fs(required bool) error {
 
 // checkKVM proves this machine can run a hardware-accelerated guest.
 //
-// OPENED RATHER THAN STAT-ED, which is the same distinction checkPrivateKey draws
+// OPENED RATHER THAN STAT-ED, which is the same distinction github.ReadPrivateKeyFile draws
 // about the App key. A stat says a path exists; it says nothing about whether this
 // process may use it, and the common failure here is exactly that — /dev/kvm is
 // mode 0660 and owned by the `kvm` group, so a node running as an account that is

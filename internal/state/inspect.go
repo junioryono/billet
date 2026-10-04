@@ -80,7 +80,7 @@ func InspectPreflight(stateDir string) error {
 // directory must exist (it holds the identity and the fence), nothing local is
 // created or locked, the connection's default transaction is read-only, the
 // schema is verified exactly and never migrated, and Tx is refused.
-func OpenPostgresInspect(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgresInspect(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	be := newPostgresBackend(dsn)
 
 	if err := be.timeline().require(); err != nil {

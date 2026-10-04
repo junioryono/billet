@@ -3180,7 +3180,7 @@ func cmdVersion(_ context.Context, args []string) error {
 
 // checkEC2Credentials proves this machine can act on its ec2 configuration.
 //
-// THE SAME DISTINCTION checkPrivateKey MAKES, one credential over: config
+// THE SAME DISTINCTION github.ReadPrivateKeyFile MAKES, one credential over: config
 // validation proves the block is coherent, and coherence is not the question an
 // operator running `billet check` is asking. A node whose credentials do not
 // resolve validates perfectly and then fails on the first job of the day, with a
@@ -3218,7 +3218,7 @@ func checkEC2Credentials(
 	// DescribeInstances proves the region and endpoint answer and that this
 	// identity is permitted to ask — which is the difference between a config that
 	// parses and a node that can do its job, and the same distinction
-	// checkPrivateKey makes by parsing the key rather than stat-ing it.
+	// github.ReadPrivateKeyFile makes by parsing the key rather than stat-ing it.
 	//
 	// The same credentials that were just reported, so what is proved is what was
 	// named rather than whatever a second resolution might return.
@@ -3763,7 +3763,7 @@ func distinctEC2TierAMIs(cfg *config.Config) []string {
 
 // checkFirecrackerHost proves this machine can act on its microVM configuration.
 //
-// THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE. Config
+// THE SAME DISTINCTION github.ReadPrivateKeyFile AND checkEC2Credentials MAKE. Config
 // validation proves the block is coherent; it cannot prove firecracker is
 // installed, that /dev/kvm can be opened, that the jail account exists or that the
 // bridge does. A node that is wrong about any of those validates perfectly and
@@ -4003,7 +4003,7 @@ func (noRootDisk) GenerationGone(error) bool { return false }
 
 // checkCephCluster proves this machine can act on its storage configuration.
 //
-// THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE, one backend
+// THE SAME DISTINCTION github.ReadPrivateKeyFile AND checkEC2Credentials MAKE, one backend
 // over. Config validation proves the block is coherent; it cannot prove the
 // monitors answer, the keyring authenticates, or the pools were ever created. A
 // node that is wrong about any of those validates perfectly and then fails on the

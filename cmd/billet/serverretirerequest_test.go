@@ -77,7 +77,7 @@ func newRequestFixture(t *testing.T) *requestFixture {
 
 	// The ledger exists and is BOUND: a row is associated with this host
 	// through the binding.
-	db, err := state.OpenPostgres(t.Context(), identityDir, dsn)
+	db, err := state.OpenPostgres(t.Context(), identityDir, state.DSN(dsn))
 	mustOK(t, err)
 
 	_, err = db.ClaimController(t.Context(), "control-01", id)
@@ -155,7 +155,7 @@ func (f *requestFixture) reserve(t *testing.T) state.Retirement {
 func (f *requestFixture) pgLedger(t *testing.T, fn func(db *state.DB)) {
 	t.Helper()
 
-	db, err := state.OpenPostgres(t.Context(), f.stateDir, os.Getenv("BILLET_STATE_DSN"))
+	db, err := state.OpenPostgres(t.Context(), f.stateDir, state.DSN(os.Getenv("BILLET_STATE_DSN")))
 	mustOK(t, err)
 
 	fn(db)

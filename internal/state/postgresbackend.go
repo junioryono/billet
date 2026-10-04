@@ -32,7 +32,7 @@ type postgresBackend struct {
 	// dsn is the connection string, which arrives from the environment rather
 	// than from the config file: it carries a password, and a secret in YAML ends
 	// up in a backup, a paste buffer and eventually a support thread.
-	dsn string
+	dsn DSN
 
 	// lockKey identifies THE LEDGER, and is read from the server rather than
 	// derived from anything on this machine. See readLockKey for why that
@@ -48,7 +48,7 @@ type postgresBackend struct {
 
 var _ backend = (*postgresBackend)(nil)
 
-func newPostgresBackend(dsn string) *postgresBackend {
+func newPostgresBackend(dsn DSN) *postgresBackend {
 	return &postgresBackend{dsn: dsn}
 }
 
@@ -78,7 +78,7 @@ func (*postgresBackend) sharedLedger() bool { return true }
 // interface stops a caller writing by accident, and this stops the engine
 // carrying out a write that somehow reached it anyway.
 func (b *postgresBackend) dataSources() (ledgerPools, error) {
-	if strings.TrimSpace(b.dsn) == "" {
+	if strings.TrimSpace(string(b.dsn)) == "" {
 		return ledgerPools{}, errors.New(
 			"state: the PostgreSQL data source is empty; it is read from the environment " +
 				"variable named by server.state.postgres.dsn_env")
@@ -101,7 +101,7 @@ func (b *postgresBackend) dataSources() (ledgerPools, error) {
 // reader's own refusal applied to the writer's slot as well, so an inspection
 // cannot write through either.
 func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
-	if strings.TrimSpace(b.dsn) == "" {
+	if strings.TrimSpace(string(b.dsn)) == "" {
 		return ledgerPools{}, errors.New(
 			"state: the PostgreSQL data source is empty; it is read from the environment " +
 				"variable named by server.state.postgres.dsn_env")
@@ -115,6 +115,14 @@ func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
 	return ledgerPools{writer: inspect, reader: inspect}, nil
 }
 
+// errUnparsableDSN is registerConn's refusal of a connection string pgx cannot
+// parse. It names where the value came from and what to check, and nothing the
+// value contains.
+var errUnparsableDSN = errors.New(
+	"state: the PostgreSQL data source could not be parsed as a postgres:// URL or a " +
+		"key=value connection string. The parser's own message is withheld because it can " +
+		"quote the password; try the same value with psql to see what it objects to")
+
 // registerConn parses the operator's DSN, adds billet's own startup parameters
 // and hands back the opaque name database/sql should open.
 //
@@ -122,12 +130,17 @@ func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
 // operator's DSN may be a URL or a key/value string and appending to either by
 // hand is a parser billet would then own. RuntimeParams are sent as startup
 // parameters, which is also what keeps them out of reach of a later statement.
-func registerConn(dsn string, params map[string]string) (string, error) {
-	cfg, err := pgx.ParseConfig(dsn)
+func registerConn(dsn DSN, params map[string]string) (string, error) {
+	cfg, err := pgx.ParseConfig(string(dsn))
 	if err != nil {
-		// THE DSN IS NOT IN THE MESSAGE. It carries a password, and a startup
-		// failure is the most likely thing to be pasted into an issue.
-		return "", fmt.Errorf("state: the PostgreSQL data source could not be parsed: %w", err)
+		// NEITHER THE DSN NOR pgx's MESSAGE IS IN THE ERROR, and the cause is not
+		// wrapped. pgx quotes the connection string with the password masked by
+		// pattern, and the pattern misses: measured 2026-10-04 on pgx v5.10.0, a
+		// URL password holding ':' or '@' that fails to parse, a key/value
+		// "password = x" with spaces and an upper-case PASSWORD key each came back
+		// with the password, or part of it, in the text. A startup failure is the
+		// most likely thing to be pasted into an issue.
+		return "", errUnparsableDSN
 	}
 
 	for k, v := range params {
@@ -622,14 +635,14 @@ func (b *postgresBackend) releaseController() error {
 // carries: the session advisory lock in claimController, which stops a second
 // controller starting, and the epoch in ControllerClaim, which stops the first
 // one writing once a second has legitimately taken over.
-func OpenPostgres(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgres(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{}.with(opts))
 }
 
 // OpenPostgresAdmin is the operator-command form, with the same asymmetry
 // OpenAdmin describes: it proceeds without the directory lock when a control
 // plane holds it, and then VERIFIES the schema rather than migrating it.
-func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgresAdmin(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true}.with(opts))
 }
 
@@ -645,7 +658,7 @@ func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOp
 // schema must be EXACTLY this binary's, so a ledger the survivor has already
 // migrated past is refused with ErrSchemaAhead rather than written to, and the
 // caller hands the row to the survivor instead.
-func OpenPostgresCompletion(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgresCompletion(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{admin: true, completion: true}.with(opts))
 }
 
@@ -667,7 +680,7 @@ func OpenPostgresCompletion(ctx context.Context, stateDir, dsn string, opts ...O
 // would be a second process on one host waiting for a lock its own service
 // manager already restarts it to take. Config refuses the pairing, and the
 // absence of an entry point here is the same refusal one layer down.
-func OpenPostgresStandby(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgresStandby(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{standby: true}.with(opts))
 }
 
@@ -684,7 +697,7 @@ func OpenPostgresStandby(ctx context.Context, stateDir, dsn string, opts ...Open
 // transaction may have raised in this host's identity directory; the fence
 // reaches only local handles, so on this backend it is a courtesy rather than
 // the exclusion it is on SQLite.
-func OpenPostgresProbe(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+func OpenPostgresProbe(ctx context.Context, stateDir string, dsn DSN, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn),
 		openMode{standby: true, maintenanceProbe: true}.with(opts))
 }

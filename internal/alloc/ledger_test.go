@@ -119,7 +119,7 @@ var testSchemaSeq atomic.Int64
 // which is what a deployment gets, and what two of them sharing one schema would
 // not. It also exercises the scoping the backend depends on: every catalogue
 // question it asks is scoped to current_schema().
-func requireTestSchema(t *testing.T) string {
+func requireTestSchema(t *testing.T) state.DSN {
 	t.Helper()
 
 	dsn := os.Getenv(postgresDSNEnv)
@@ -189,7 +189,7 @@ func requireTestSchema(t *testing.T) string {
 	q.Set("search_path", schema)
 	u.RawQuery = q.Encode()
 
-	return u.String()
+	return state.DSN(u.String())
 }
 
 // skipOnPostgres skips a test that asserts something about SQLITE ITSELF.

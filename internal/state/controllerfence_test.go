@@ -464,7 +464,7 @@ func TestAControllerCannotWriteOnceAReplacementHasClaimed(t *testing.T) {
 		t.Fatalf("read the claim session's backend pid: %v", err)
 	}
 
-	admin, err := sql.Open("pgx", dsn)
+	admin, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open an administrative connection: %v", err)
 	}

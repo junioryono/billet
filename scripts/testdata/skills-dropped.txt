@@ -8,3 +8,4 @@ a1e418a9618d A node-first upgrade is refused only when its registration carries 
 1ad0df649957 Firecracker nodes run four launches at once (nodeLaunchConcurrency); the rule now states the exception and that every other command waits for them.
 43d1333b82df The queue is not serial for launches on a provider that allows several; restated as a queue in which only launches run beside each other.
 14a01b270e4b There is a shared helper now (internal/state/ledgertest, #356 Phase 1); the convention says when to use it and what still runs for real.
+a6013ee02375 cmd/billet/open_unix.go and open_other.go are gone (#356 Phase 3a): the App key is opened through internal/regularfile, whose open_linux.go/open_other.go now carry the tag.

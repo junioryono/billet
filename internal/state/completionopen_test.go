@@ -327,10 +327,10 @@ func TestUnreachableIsMeasuredAgainstPgxsOwnShapes(t *testing.T) {
 
 // openProbeConn is a connection through the same stack billet uses, closed
 // with the test.
-func openProbeConn(t *testing.T, dsn string) *sql.DB {
+func openProbeConn(t *testing.T, dsn DSN) *sql.DB {
 	t.Helper()
 
-	conn, err := sql.Open("pgx", dsn)
+	conn, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open a connection: %v", err)
 	}
@@ -343,28 +343,28 @@ func openProbeConn(t *testing.T, dsn string) *sql.DB {
 // replaceDSNPassword and replaceDSNDatabase change one field of the DSN
 // through the parser, so a case cannot silently measure nothing because a
 // literal it replaced was spelled another way.
-func replaceDSNPassword(t *testing.T, dsn, password string) string {
+func replaceDSNPassword(t *testing.T, dsn DSN, password string) DSN {
 	t.Helper()
 
 	u := parseDSN(t, dsn)
 	u.User = url.UserPassword(u.User.Username(), password)
 
-	return u.String()
+	return DSN(u.String())
 }
 
-func replaceDSNDatabase(t *testing.T, dsn, database string) string {
+func replaceDSNDatabase(t *testing.T, dsn DSN, database string) DSN {
 	t.Helper()
 
 	u := parseDSN(t, dsn)
 	u.Path = "/" + database
 
-	return u.String()
+	return DSN(u.String())
 }
 
-func parseDSN(t *testing.T, dsn string) *url.URL {
+func parseDSN(t *testing.T, dsn DSN) *url.URL {
 	t.Helper()
 
-	u, err := url.Parse(dsn)
+	u, err := url.Parse(string(dsn))
 	if err != nil {
 		t.Fatalf("parse the DSN: %v", err)
 	}
@@ -380,7 +380,7 @@ func parseDSN(t *testing.T, dsn string) *url.URL {
 // PostgreSQL's TLS negotiation and then presents a certificate no root this
 // client trusts has signed. The session never reaches the server's own
 // vocabulary, which is the point.
-func selfSignedTLSDSN(t *testing.T, base string) string {
+func selfSignedTLSDSN(t *testing.T, base DSN) DSN {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -460,13 +460,13 @@ func selfSignedTLSDSN(t *testing.T, base string) string {
 	query.Set("sslmode", "verify-full")
 	u.RawQuery = query.Encode()
 
-	return u.String()
+	return DSN(u.String())
 }
 
 // proxiedDSN forwards to the real server until cut is called, which closes
 // every connection it holds AND the listener, so the retry database/sql makes
 // has nowhere to go.
-func proxiedDSN(t *testing.T, base string) (string, func()) {
+func proxiedDSN(t *testing.T, base DSN) (DSN, func()) {
 	t.Helper()
 
 	u := parseDSN(t, base)
@@ -532,7 +532,7 @@ func proxiedDSN(t *testing.T, base string) (string, func()) {
 
 	u.Host = ln.Addr().String()
 
-	return u.String(), cut
+	return DSN(u.String()), cut
 }
 
 // A COMPLETION WRITES ONE ROW AND CLAIMS NOTHING. Its caller is a host whose
@@ -603,7 +603,7 @@ func TestOpenPostgresCompletionRefusesASchemaItWouldHaveToMove(t *testing.T) {
 	// ONE APPLIED VERSION REMOVED FROM THE RECORD is a ledger behind this
 	// binary without touching a table: what the open compares is the recorded
 	// set against its own.
-	conn, err := sql.Open("pgx", dsn)
+	conn, err := sql.Open("pgx", string(dsn))
 	if err != nil {
 		t.Fatalf("open a connection: %v", err)
 	}
@@ -664,7 +664,7 @@ func TestAnOpenThatTimesOutOnItsOwnBudgetSaysSo(t *testing.T) {
 	u := parseDSN(t, base)
 	u.Host = ln.Addr().String()
 
-	_, err = OpenPostgresCompletion(t.Context(), t.TempDir(), u.String())
+	_, err = OpenPostgresCompletion(t.Context(), t.TempDir(), DSN(u.String()))
 	if err == nil {
 		t.Fatal("an open against a listener that says nothing succeeded")
 	}

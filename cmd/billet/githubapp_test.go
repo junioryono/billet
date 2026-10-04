@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -422,6 +423,24 @@ func TestInspectKeyDistinguishesAbsentFromUnverifiable(t *testing.T) {
 		t.Errorf("a truncated PEM: inspectKey = %v, want keyAbsent", got)
 	}
 
+	// What is not a regular file holds no key, and a FIFO is refused before it is
+	// opened for reading, which would wait for a writer and hang this test.
+	notAFile := filepath.Join(dir, "adir")
+	if err := os.Mkdir(notAFile, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	fifo := filepath.Join(dir, "fifo.pem")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	for _, path := range []string{notAFile, fifo} {
+		if got := inspectKey(path); got != keyAbsent {
+			t.Errorf("%s: inspectKey = %v, want keyAbsent", filepath.Base(path), got)
+		}
+	}
+
 	// A file that cannot be opened is UNVERIFIABLE, never absent — the whole
 	// point of the third state.
 	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
@@ -633,125 +652,6 @@ func TestLookupPathDoesNotTreatAnErrorAsAbsence(t *testing.T) {
 		if got := lookupPath(hidden); got != pathUnknown {
 			t.Errorf("an unstattable path: lookupPath = %v, want pathUnknown", got)
 		}
-	}
-}
-
-// maxKeySize is a documented bound. Asserting it against itself would let a
-// production edit move the limit and the test with it.
-func TestMaxKeySizeIsPinned(t *testing.T) {
-	if maxKeySize != 65536 {
-		t.Errorf("maxKeySize = %d, want 65536 (64 KiB, as documented)", maxKeySize)
-	}
-}
-
-// billet check must prove the key is USABLE, not merely present. os.Stat alone
-// accepted every one of these.
-func TestCheckPrivateKeyRejectsUnusableKeys(t *testing.T) {
-	valid := testKey(t)
-
-	for name, setup := range map[string]func(t *testing.T, dir string) (string, string){
-		"missing": func(_ *testing.T, dir string) (string, string) {
-			return filepath.Join(dir, "absent.pem"), ""
-		},
-		"directory": func(t *testing.T, dir string) (string, string) {
-			t.Helper()
-
-			p := filepath.Join(dir, "adir")
-			if err := os.Mkdir(p, 0o700); err != nil {
-				t.Fatalf("mkdir: %v", err)
-			}
-
-			return p, "not a regular file"
-		},
-		"empty": func(t *testing.T, dir string) (string, string) {
-			t.Helper()
-
-			p := filepath.Join(dir, "empty.pem")
-			if err := os.WriteFile(p, nil, 0o600); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-
-			return p, "is empty"
-		},
-		"truncated": func(t *testing.T, dir string) (string, string) {
-			t.Helper()
-
-			p := filepath.Join(dir, "trunc.pem")
-			if err := os.WriteFile(p, valid[:80], 0o600); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-
-			return p, "not PEM-encoded"
-		},
-		"oversized": func(t *testing.T, dir string) (string, string) {
-			t.Helper()
-
-			p := filepath.Join(dir, "huge.pem")
-			if err := os.WriteFile(p, make([]byte, maxKeySize+1), 0o600); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-
-			return p, "not an App key"
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			path, want := setup(t, t.TempDir())
-
-			err := checkPrivateKey(path)
-			if err == nil {
-				t.Fatalf("checkPrivateKey accepted %s", name)
-			}
-
-			if want != "" && !strings.Contains(err.Error(), want) {
-				t.Errorf("error = %v, want it to mention %q", err, want)
-			}
-		})
-	}
-}
-
-// A world-readable App private key is a local credential exposure, and this is
-// the command that exists to catch it.
-func TestCheckPrivateKeyRejectsPermissiveModes(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix permission bits are meaningless on Windows")
-	}
-
-	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o666} {
-		t.Run(mode.String(), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "app.pem")
-			if err := os.WriteFile(path, testKey(t), mode); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-
-			// WriteFile is subject to umask, so set the mode explicitly.
-			if err := os.Chmod(path, mode); err != nil {
-				t.Fatalf("chmod: %v", err)
-			}
-
-			err := checkPrivateKey(path)
-			if err == nil {
-				t.Fatalf("checkPrivateKey accepted mode %04o", mode.Perm())
-			}
-
-			if !strings.Contains(err.Error(), "chmod 600") {
-				t.Errorf("error should give the remedy, got: %v", err)
-			}
-		})
-	}
-}
-
-func TestCheckPrivateKeyAcceptsAGoodKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "app.pem")
-	if err := os.WriteFile(path, testKey(t), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	if err := os.Chmod(path, 0o600); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-
-	if err := checkPrivateKey(path); err != nil {
-		t.Errorf("checkPrivateKey rejected a valid 0600 key: %v", err)
 	}
 }
 

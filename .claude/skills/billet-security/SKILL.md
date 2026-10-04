@@ -31,6 +31,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The JIT registration is never in argv and never in a log.**
 - **Nothing the guest wrote is ever quoted into a billet error.**
 - **Every type that holds a credential redacts itself, on a value receiver, and the table proves it by mutation.**
+- **The ledger's connection string and the App key are types of their own, and an unparsable DSN's error quotes nothing pgx wrote.**
 - **A failed fetch names the URL it was on, and after a redirect that URL is signed.**
 - **A typed nil satisfies an interface and panics on use.**
 - **A connector token is a bearer credential and travels in the environment, never argv.**
