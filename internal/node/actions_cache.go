@@ -27,8 +27,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -486,14 +486,14 @@ func (s *CacheService) actionsKeysFor(
 // next call asks again.
 func (s *CacheService) sessionActionsAuthority(
 	ctx context.Context, session *cacheSession,
-) (server.CacheAuthority, bool) {
+) (dispatch.CacheAuthority, bool) {
 	session.authorityMu.Lock()
 	defer session.authorityMu.Unlock()
 	if session.actionsAuthority != nil {
 		return *session.actionsAuthority, true
 	}
 	if s.authority == nil || session.leaseID == "" || s.now().Before(session.unprovenUntil) {
-		return server.CacheAuthority{}, false
+		return dispatch.CacheAuthority{}, false
 	}
 	askCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
 	defer cancel()
@@ -502,7 +502,7 @@ func (s *CacheService) sessionActionsAuthority(
 		s.log.Warn("could not ask what this job may do with the Actions cache; it goes to GitHub",
 			"instance", session.instance, "error", err)
 
-		return server.CacheAuthority{}, false
+		return dispatch.CacheAuthority{}, false
 	}
 	if !authority.Proven || authority.LeaseID != session.leaseID ||
 		!strings.EqualFold(authority.Owner, session.cache.Owner) ||
@@ -512,7 +512,7 @@ func (s *CacheService) sessionActionsAuthority(
 		// control plane GitHub requests.
 		session.unprovenUntil = s.now().Add(actionsUnprovenFor)
 
-		return server.CacheAuthority{}, false
+		return dispatch.CacheAuthority{}, false
 	}
 	session.actionsAuthority = &authority
 

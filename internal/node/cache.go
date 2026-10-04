@@ -20,9 +20,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -113,7 +113,7 @@ type cacheSession struct {
 	// job, kept once the control plane has proved it. Guarded by authorityMu,
 	// never by mu, because it is asked for inside handlers that take mu.
 	authorityMu      sync.Mutex
-	actionsAuthority *server.CacheAuthority
+	actionsAuthority *dispatch.CacheAuthority
 	// unprovenUntil is when an unproven answer stops standing, under
 	// authorityMu, so a job that cannot be proved asks at most that often.
 	unprovenUntil time.Time

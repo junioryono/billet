@@ -14,10 +14,10 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -41,11 +41,11 @@ type fakeCompute struct {
 	rejectCanceledDestroy bool
 
 	launched   []int64
-	launchJobs []server.Job
+	launchJobs []dispatch.Job
 	destroyed  []int64
 	results    []string
 	// authorities are the cache authorities every completion carried.
-	authorities []server.CacheAuthority
+	authorities []dispatch.CacheAuthority
 	recovered   int
 	swept       int
 
@@ -211,7 +211,7 @@ func (f *fakeCompute) aliveCount() int {
 }
 
 func (f *fakeCompute) Launch(
-	_ context.Context, _ *alloc.Lease, _ *nodeapi.TierSpec, job server.Job,
+	_ context.Context, _ *alloc.Lease, _ *nodeapi.TierSpec, job dispatch.Job,
 ) error {
 	f.mu.Lock()
 	f.launched = append(f.launched, job.RequestID)
@@ -245,7 +245,7 @@ func (f *fakeCompute) Destroy(ctx context.Context, requestID int64) error {
 }
 
 func (f *fakeCompute) DestroyCompleted(ctx context.Context, requestID int64, result string,
-	authority server.CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	f.mu.Lock()
 	f.results = append(f.results, result)
@@ -448,7 +448,7 @@ func TestRecoveryPrecedesTheFirstLaunch(t *testing.T) {
 		Epoch:     1,
 	}
 
-	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err != nil {
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -475,7 +475,7 @@ func TestLaunchPreservesTheAuthenticatedRepositoryScope(t *testing.T) {
 		ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
 		GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1,
 	}
-	want := server.Job{
+	want := dispatch.Job{
 		RequestID:   7,
 		RunID:       8,
 		Event:       "push",
@@ -542,7 +542,7 @@ func TestACompletedDestroyCarriesItsCacheAuthorityToTheCompute(t *testing.T) {
 	wire := &nodeapi.CacheAuthority{LeaseID: "l1", JobID: "job-42", RunID: 9, Owner: "acme",
 		Repository: "api", Event: "push", Ref: "refs/heads/main", BaseRef: "refs/heads/dev",
 		DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true, PublishDefault: true}
-	want := server.CacheAuthority{LeaseID: "l1", JobID: "job-42", RunID: 9, Owner: "acme",
+	want := dispatch.CacheAuthority{LeaseID: "l1", JobID: "job-42", RunID: 9, Owner: "acme",
 		Repository: "api", Event: "push", Ref: "refs/heads/main", BaseRef: "refs/heads/dev",
 		DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true, PublishDefault: true}
 
@@ -560,7 +560,7 @@ func TestACompletedDestroyCarriesItsCacheAuthorityToTheCompute(t *testing.T) {
 		compute.mu.Unlock()
 		expected := want
 		if carried == nil {
-			expected = server.CacheAuthority{}
+			expected = dispatch.CacheAuthority{}
 		}
 		if len(got) != 1 || got[0] != expected {
 			t.Errorf("carrying %+v, the compute was handed %+v, want %+v", carried, got, expected)
@@ -570,7 +570,7 @@ func TestACompletedDestroyCarriesItsCacheAuthorityToTheCompute(t *testing.T) {
 
 // CUSTODY SURVIVES THE ROUND TRIP AS A FLAG.
 //
-// The node's runner says "I may have started something" with server.ErrCustody;
+// The node's runner says "I may have started something" with dispatch.ErrCustody;
 // the server decides whether to release capacity on that basis. If it arrived as
 // prose the server would release a lease whose container is still running.
 func TestCustodyCrossesBackAsAFlag(t *testing.T) {
@@ -578,11 +578,11 @@ func TestCustodyCrossesBackAsAFlag(t *testing.T) {
 
 	p, c := harness(t)
 	compute := &fakeCompute{
-		launchErr: errors.New("create ambiguous: " + server.ErrCustody.Error()),
+		launchErr: errors.New("create ambiguous: " + dispatch.ErrCustody.Error()),
 	}
 
 	// Wrapped so errors.Is finds it, exactly as the real runner does.
-	compute.launchErr = errors.Join(server.ErrCustody, errors.New("create ambiguous"))
+	compute.launchErr = errors.Join(dispatch.ErrCustody, errors.New("create ambiguous"))
 
 	runLoop(t, c, compute)
 	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
@@ -597,12 +597,12 @@ func TestCustodyCrossesBackAsAFlag(t *testing.T) {
 		Epoch:     1,
 	}
 
-	err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("an ambiguous launch reported success")
 	}
 
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("custody did not survive the wire: %v", err)
 	}
 }
@@ -628,12 +628,12 @@ func TestACleanFailureIsNotCustody(t *testing.T) {
 		Epoch:     1,
 	}
 
-	err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a failed launch reported success")
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Errorf("a clean failure was reported as custody, which holds capacity for compute "+
 			"that never started: %v", err)
 	}
@@ -667,12 +667,12 @@ func TestANodeThatCannotRecoverTakesNoWork(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
 	defer cancel()
 
-	err := p.NewRunner().Launch(ctx, lease, server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(ctx, lease, dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a node that cannot reconcile accepted work")
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Errorf("nothing was ever delivered, so this must not be custody: %v", err)
 	}
 
@@ -922,7 +922,7 @@ func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
 			Epoch:     1,
 		}
 
-		launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -934,7 +934,7 @@ func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
 	// The plane stops waiting and hands the listener custody.
 	select {
 	case err := <-launched:
-		if !errors.Is(err, server.ErrCustody) {
+		if !errors.Is(err, dispatch.ErrCustody) {
 			t.Fatalf("an abandoned in-flight launch must report custody, got %v", err)
 		}
 	case <-time.After(30 * time.Second):
@@ -989,7 +989,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 			Epoch:     1,
 		}
 
-		launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -1006,7 +1006,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 
 	select {
 	case err := <-launched:
-		if !errors.Is(err, server.ErrCustody) {
+		if !errors.Is(err, dispatch.ErrCustody) {
 			t.Fatalf("a launch in flight across a re-registration must report custody, got %v",
 				err)
 		}
@@ -1076,7 +1076,7 @@ func TestALostResultMakesTheNodeAssumeCustody(t *testing.T) {
 
 	// The launch's own outcome is not what is under test — the plane reports
 	// custody, correctly — so what matters is what the NODE did about it.
-	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err == nil {
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err == nil {
 		t.Fatal("a launch whose result was lost reported success")
 	}
 

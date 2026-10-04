@@ -19,9 +19,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // JITSource mints single-use credentials for ephemeral pool registrations and
@@ -706,11 +706,11 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 // A COMPILE-TIME PROMISE: the node loop finds this by type assertion, and a
 // signature that drifted would compile and quietly lose every completion's
 // result and cache authority.
-var _ server.CompletionAwareRunner = (*Runner)(nil)
+var _ dispatch.CompletionAwareRunner = (*Runner)(nil)
 
 // DestroyCompleted settles result-dependent cache state before removing compute.
 func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string,
-	authority server.CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
@@ -803,7 +803,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		// when there is no running half to speak for.
 		if leaseID, held := r.unconfirmedForRequest(requestID); held {
 			return fmt.Errorf("%w: lease %s is held here until its compute is confirmed gone",
-				server.ErrCustody, leaseID)
+				dispatch.ErrCustody, leaseID)
 		}
 
 		// Idempotent: a request nothing was started for is success, because this
@@ -897,7 +897,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 			"name", inst.Name, "lease", lease.ID, "request", requestID)
 
 		return fmt.Errorf("%w: %s was asked to stop and has not been confirmed gone",
-			server.ErrCustody, inst.Name)
+			dispatch.ErrCustody, inst.Name)
 	}
 
 	r.cleanupCache(ctx, inst.Name)
@@ -1696,8 +1696,8 @@ func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, e
 }
 
 // Job re-exports the listener's job identity so this package's signature matches
-// server.Runner without importing anything else from it at call sites.
-type Job = server.Job
+// dispatch.Runner without importing anything else from it at call sites.
+type Job = dispatch.Job
 
 // interceptsFor says whether a launch's guest gets the Actions cache
 // interception: a trusted pool's legacy cache, or a default-branch tier's of
