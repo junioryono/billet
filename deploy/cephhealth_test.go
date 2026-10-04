@@ -217,8 +217,9 @@ func TestTheCephHealthAlertReadsTheOldStateAsSeen(t *testing.T) {
 			run(tc.now)
 
 			if _, err := os.Stat(mailed); !os.IsNotExist(err) {
-				body, _ := os.ReadFile(mailed)
-				t.Fatalf("a problem the old script already mailed was mailed again (%v): %q", err, body)
+				body, readErr := os.ReadFile(mailed)
+				t.Fatalf("a problem the old script already mailed was mailed again (%v): %q (read: %v)",
+					err, body, readErr)
 			}
 
 			if state, err := os.ReadFile(stateFile); err != nil || string(state) != tc.state {

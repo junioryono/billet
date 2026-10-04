@@ -795,8 +795,8 @@ func (a *Allocator) escrow(ctx context.Context, t config.Tier, want int, guarded
 // guardedHaveRoom returns short unless every tier in guarded could be granted one
 // lease by an escrow in this transaction now.
 func guardedHaveRoom(ctx context.Context, a *Allocator, tx querier, guarded []config.Tier, short error) error {
-	for _, w := range guarded {
-		room, err := a.headroom(ctx, tx, w)
+	for i := range guarded {
+		room, err := a.headroom(ctx, tx, guarded[i])
 		if err != nil {
 			return err
 		}
