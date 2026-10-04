@@ -1,6 +1,7 @@
 package nodeplane
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -276,5 +277,60 @@ func TestAnotherProcesssQuarantinedAdoptionIsKept(t *testing.T) {
 	if owner, ok := ownerOf(p, "l7"); !ok || owner.incarnation != "p1" {
 		t.Errorf("a superseded process lost a quarantined lease it may still be draining: %+v (ok=%v)",
 			owner, ok)
+	}
+}
+
+// A KEPT ADOPTION IS FORGOTTEN WHEN ITS LEASE ENDS, without another registration.
+// Registration keeps a superseded process's adoption of a quarantined lease; when a
+// reconciliation later ends that lease, the adoption and the withdrawal record it
+// keeps alive go with it, on the ledger's word and only on it.
+func TestAKeptAdoptionIsForgottenWhenItsLeaseEnds(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		open     bool
+		leaseErr error
+		forgets  bool
+	}{
+		{name: "the lease ended", forgets: true},
+		{name: "the lease is still open", open: true},
+		{name: "the ledger could not tell", leaseErr: errors.New("ledger unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ledger := newLedger()
+			p := testPlane(t, WithRegistrar(ledger))
+			registerAs(t, p, "p1")
+			p.AdoptOwnershipWithInventory("n1", "p1", []string{"l7"}, true)
+			if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
+				t.Fatalf("withdraw p1: %v", err)
+			}
+
+			registerAs(t, p, "p2")
+			p.AdoptOwnershipKeeping("n1", "p2", nil, map[string]bool{"l7": true})
+			if _, ok := ownerOf(p, "l7"); !ok {
+				t.Fatal("registration did not keep the quarantined adoption")
+			}
+
+			ledger.mu.Lock()
+			ledger.open = map[string]bool{"l7": tc.open}
+			ledger.leaseErr = tc.leaseErr
+			ledger.mu.Unlock()
+
+			if _, err := p.ReconcileInventory(t.Context(), "n1", "p2", nil); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+
+			_, owned := ownerOf(p, "l7")
+			p.mu.Lock()
+			recorded := p.withdrawn["n1"]["p1"]
+			p.mu.Unlock()
+			if owned == tc.forgets || recorded == tc.forgets {
+				t.Errorf("after reconciliation: owned=%v withdrawal recorded=%v, want both %v",
+					owned, recorded, !tc.forgets)
+			}
+		})
 	}
 }

@@ -1411,6 +1411,19 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 func (p *Plane) ReconcileInventory(
 	ctx context.Context, node, incarnation string, running []string,
 ) (int, error) {
+	freed, err := p.reconcileInventory(ctx, node, incarnation, running)
+	if err != nil {
+		return freed, err
+	}
+
+	p.forgetEndedAdoptions(ctx, node, incarnation)
+
+	return freed, nil
+}
+
+func (p *Plane) reconcileInventory(
+	ctx context.Context, node, incarnation string, running []string,
+) (int, error) {
 	if p.registrar == nil {
 		return 0, nil
 	}
@@ -1447,6 +1460,54 @@ func (p *Plane) ReconcileInventory(
 	p.adoptOwnershipLocked(node, incarnation, running, true, nil)
 
 	return freed, nil
+}
+
+// forgetEndedAdoptions drops another process's snapshot adoption on this node once
+// the ledger says its lease ended (#374).
+//
+// ON PROOF, AND ONLY FOR ANOTHER PROCESS. Registration keeps a superseded
+// process's adoption of a quarantined lease, because the launched set leaves
+// quarantine out; when a reconciliation later ends that lease, nothing names the
+// adoption again: it carries no request id, and only a registration prunes
+// another process's adoptions. Left, it and the withdrawal record it keeps alive
+// would outlive the lease until the node next registers. Registrar.Lease answers
+// ErrLeaseNotFound for a lease that is absent or terminal, which is that proof;
+// any other answer is could-not-tell and keeps the record for the next pass.
+//
+// The reads run outside the plane's mutex, and a record is forgotten only if it
+// is still the one that was read about.
+func (p *Plane) forgetEndedAdoptions(ctx context.Context, node, incarnation string) {
+	if p.registrar == nil {
+		return
+	}
+
+	p.mu.Lock()
+	candidates := make(map[string]leaseOwner)
+	for id, owner := range p.owners {
+		if owner.node == node && owner.requestID == 0 && owner.incarnation != incarnation {
+			candidates[id] = owner
+		}
+	}
+	p.mu.Unlock()
+
+	ended := make(map[string]leaseOwner, len(candidates))
+	for id, owner := range candidates {
+		if _, err := p.registrar.Lease(ctx, id); errors.Is(err, alloc.ErrLeaseNotFound) {
+			ended[id] = owner
+		}
+	}
+	if len(ended) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, owner := range ended {
+		if p.owners[id] == owner {
+			delete(p.owners, id)
+		}
+	}
+	p.pruneWithdrawnLocked()
 }
 
 // checkInventoryPlacement keeps a node's observation from becoming authority over
