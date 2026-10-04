@@ -239,6 +239,13 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 		t.Errorf("two different code lines became the same unit: %q", stars)
 	}
 
+	continued := skillUnits("```\nrun \\\n```\n")
+	broken := skillUnits("```\nrun \\ \n```\n")
+
+	if slices.Equal(continued, broken) {
+		t.Errorf("a space after a continuation backslash was trimmed away: %q", broken)
+	}
+
 	if got, want := normaliseSkillText("- **A**  rule `x  **y**` here"), "A rule `x  **y**` here"; got != want {
 		t.Errorf("normalised to %q, want %q", got, want)
 	}
@@ -275,6 +282,8 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 	for skill, want := range map[string]int{
 		"See [leases](references/leases.md)" + both:                                                      0,
 		"See [leases](<references/leases.md> \"title\")" + both:                                          0,
+		"See [leases](references/leases.md \"title\")" + both:                                            0,
+		"See references/leases.md. It is also [linked](references/leases.md)" + both:                   0,
 		"See [leases][l]" + both + "\n\n[l]: references/leases.md\n":                                     0,
 		"See [leases](references/leases.md#section) and [x](https://example.com/references/y.md)" + both: 0,
 		"See [leases](../other/references/leases.md)" + both:                                             2, // missing; real file unlinked
@@ -287,6 +296,14 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 		if got := referenceProblems(dir, skill); len(got) != want {
 			t.Errorf("%q: %d problems %q, want %d", skill, len(got), got, want)
 		}
+	}
+
+	// The titled link is refused as a link, not only by the mention fallback.
+	titled := referenceProblems(dir, "See [gone](references/gone.md \"title\") and [l](references/leases.md)"+both)
+	if !slices.ContainsFunc(titled, func(p string) bool {
+		return strings.HasPrefix(p, "SKILL.md links references/gone.md")
+	}) {
+		t.Errorf("a titled link to a missing file was not refused as a link: %q", titled)
 	}
 }
 
@@ -345,10 +362,12 @@ func skillUnits(text string) []string {
 		}
 
 		// A line of code is kept as written, less its indentation: emphasis
-		// markers and runs of spaces inside code are meaning, not layout.
+		// markers, runs of spaces and trailing whitespace inside code are
+		// meaning, not layout (a space after a continuation backslash ends the
+		// command).
 		if inFence {
 			if trimmed != "" {
-				units = append(units, trimmed)
+				units = append(units, strings.TrimLeft(line, " \t"))
 			}
 
 			continue
@@ -372,7 +391,7 @@ var (
 	listMarker = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
 	inlineLink = regexp.MustCompile(`\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)`)
 	linkDef    = regexp.MustCompile(`(?m)^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)`)
-	mention    = regexp.MustCompile(`[A-Za-z0-9._/-]*references/[A-Za-z0-9._/-]+`)
+	mention    = regexp.MustCompile(`[A-Za-z0-9._/-]*references/[A-Za-z0-9._/-]*[A-Za-z0-9_]`)
 	url        = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
 	codeSpan   = regexp.MustCompile("`[^`]*`")
 	notProse   = regexp.MustCompile(`^(?:[-*+]\s|\d+\.\s|#|\||>)`)
