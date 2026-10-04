@@ -618,9 +618,11 @@ func stopGracefully(
 	// networking apart; any other stop tries unrecoveredStopAttempts times and
 	// then stops as it always did, so a node whose provider is broken can still
 	// be stopped to be mended, and its next process adopts what it leaves. A
-	// process that never registered was given nothing. A second signal ends the
-	// attempt either way.
-	if !recovered && (drainRequested || c.WireVersion() != 0) {
+	// process that never registered was given nothing; one the plane has since
+	// forgotten was, which is why this asks EverRegistered and not the wire
+	// version a forgotten registration clears. A second signal ends the attempt
+	// either way.
+	if !recovered && (drainRequested || c.EverRegistered()) {
 		attempts := 0
 		if !drainRequested {
 			attempts = unrecoveredStopAttempts

@@ -403,11 +403,11 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 
 	// A `down` TAKES THE NODE OUT OF SERVICE, so its stop drains even where
 	// node.stop says handoff (#374): nothing starts again to adopt what a handoff
-	// would leave running. `local up` withdraws the request. Only a node set to
-	// hand over is asked, which is a Firecracker node and so a root service on
-	// Linux; a node that drains anyway needs nothing, and a Mac's launch agent
-	// could not write the request.
-	if handOver, _ := cfg.Node.HandsOverOnStop(); req.WantNode && handOver {
+	// would leave running. `local up` withdraws the request. Asked of every Linux
+	// node whatever the config on disk says, because the policy that decides is
+	// the running process's, which may have loaded another; not on a Mac, where
+	// handoff is refused and the launch agent could not write the request.
+	if req.WantNode && hostOS == "linux" {
 		if err := requestNodeDrain(nodeDrainRequestPath); err != nil {
 			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}

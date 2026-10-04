@@ -82,7 +82,14 @@ func TestEveryDrainRequestIsWrittenWhereTheNodeReadsItBeforeTheStop(t *testing.T
 	preremove := read("../../deploy/scripts/preremove.sh")
 	before("preremove.sh", preremove, ">"+nodeDrainRequestPath+"; then", `systemctl stop "${unit}"`)
 
-	before("localdown.go", read("localdown.go"), "requestNodeDrain(nodeDrainRequestPath)", "c.StopAndProve(")
+	localdown := read("localdown.go")
+	before("localdown.go", localdown, "requestNodeDrain(nodeDrainRequestPath)", "c.StopAndProve(")
+	// ASKED OF EVERY LINUX NODE, never decided by the stop policy on disk: the
+	// running process's policy is what decides, and it may have loaded another.
+	if !strings.Contains(localdown, "if req.WantNode && hostOS == \"linux\" {\n\t\tif err := "+
+		"requestNodeDrain(nodeDrainRequestPath)") {
+		t.Error("local down's drain request is guarded by something other than a Linux node being stopped")
+	}
 	if !strings.Contains(read("localup.go"), "releaseNodeDrain(nodeDrainRequestPath)") {
 		t.Error("local up does not withdraw the drain request a down left")
 	}

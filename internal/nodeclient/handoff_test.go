@@ -434,3 +434,65 @@ func TestAnUnrecoveredHandoverWhoseWithdrawalFailsRecoversAndDrains(t *testing.T
 		t.Fatal("the drain did not end once the compute was gone")
 	}
 }
+
+// AND SO DOES ONE THE PLANE HAS SINCE FORGOTTEN (#374). A registration the plane
+// forgot clears the wire version, which used to read as "never registered"; but
+// what that registration was given is still this process's to account for, so
+// it registers again and recovers before it believes it holds nothing.
+func TestAForgottenUnrecoveredHandoverRecoversAndDrains(t *testing.T) {
+	t.Parallel()
+
+	plane, c, _ := breakableHarness(t)
+	compute := &fakeCompute{recoverGate: make(chan struct{}), recoverStarted: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+		})
+	}()
+
+	<-compute.recoverStarted
+	// The plane forgets this registration, so the withdrawal is answered
+	// "unregistered" and clears the client's wire version.
+	plane.ForgetForTest("n1")
+	cancel()
+
+	select {
+	case err := <-done:
+		t.Fatalf("a forgotten, unrecovered node exited (%v) as if it held nothing", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if !c.EverRegistered() {
+		t.Fatal("the client forgot it had ever registered")
+	}
+
+	compute.setHolding(true)
+	close(compute.recoverGate)
+
+	select {
+	case err := <-done:
+		t.Fatalf("the node stopped (%v) while it held a guest it had just recovered", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	compute.setHolding(false)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end once the compute was gone")
+	}
+}
