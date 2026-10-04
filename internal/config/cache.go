@@ -198,8 +198,9 @@ func (t Tier) NeedsCacheAwareNode() bool {
 // reads as it.
 //
 // EVERY CACHE IS ON BY DEFAULT WHERE THE TIER CAN HAVE IT. The Docker store and
-// sticky disks are on for every tier; the Git, Bazel and Go caches for a tier
-// whose guest the node controls (servesGuestCaches); the Actions cache where
+// sticky disks are on for every tier; the Git cache for a tier whose guest the
+// node controls (servesGuestCaches), and the Bazel and Go caches for such a tier
+// that can also publish what they hold (publishesContent); the Actions cache where
 // its scope rules already hold (actionsByDefault). Go test results stay off by
 // default, because caching them lets `go test` skip a test whose inputs did not
 // change, which is a change to what a job runs, not only to how fast. A cache
@@ -218,12 +219,22 @@ func (t Tier) EffectiveCache() CacheSpec {
 	}
 
 	guest := t.servesGuestCaches()
+	publish := t.defaultPublish(c.Publish)
+	// THE GO AND BAZEL CACHES ARE ON BY DEFAULT ONLY WHERE THE TIER CAN WARM THEM.
+	// Their keys are scoped by trust, so an untrusted pool that publishes nothing
+	// reads a key nobody ever writes, and every build is cold. That is worse than
+	// no billet cache at all: GOCACHEPROG takes precedence over GOCACHE, so the
+	// build cache a workflow restores itself (setup-go, golangci-lint) is ignored.
+	// Measured 2026-10-04 on the reference deployment: an untrusted, unscoped
+	// tier's Go cache was cold 177 times and warm never in a day, and lint jobs
+	// that had fit their ten minutes ran out of time.
+	content := guest && t.publishesContent(publish)
 	spec := CacheSpec{
-		Publish:     t.defaultPublish(c.Publish),
+		Publish:     publish,
 		Docker:      toggle(c.Docker, true, DefaultDockerCacheSize),
 		StickyDisks: toggle(c.StickyDisks, true, DefaultStickyDiskSize),
 		Git:         toggle(c.Git, guest, DefaultGitCacheSize),
-		Bazel:       toggle(c.Bazel, guest, DefaultBazelCacheSize),
+		Bazel:       toggle(c.Bazel, content, DefaultBazelCacheSize),
 	}
 	spec.Actions = CacheSetting{Enabled: t.Intercept || guest && t.actionsByDefault(spec.Publish),
 		MaxSize: ActionsArchiveLimit}
@@ -236,11 +247,11 @@ func (t Tier) EffectiveCache() CacheSpec {
 		}
 	}
 	if c.Go != nil {
-		spec.Go = toggle(&CacheToggle{Enabled: c.Go.Enabled, MaxSize: c.Go.MaxSize}, guest,
+		spec.Go = toggle(&CacheToggle{Enabled: c.Go.Enabled, MaxSize: c.Go.MaxSize}, content,
 			DefaultGoCacheSize)
 		spec.GoTestResults = spec.Go.Enabled && c.Go.TestResults
 	} else {
-		spec.Go = CacheSetting{Enabled: guest, MaxSize: DefaultGoCacheSize}
+		spec.Go = CacheSetting{Enabled: content, MaxSize: DefaultGoCacheSize}
 	}
 	if spec.Publish == CachePublishDefaultBranch && t.CacheScope != nil {
 		spec.Owner, spec.Repository = t.CacheScope.Owner, t.CacheScope.Repository
@@ -269,6 +280,20 @@ func (t Tier) defaultPublish(publish CachePublish) CachePublish {
 	}
 
 	return CachePublishTrustedOnly
+}
+
+// publishesContent reports whether a content cache keyed by this tier's trust
+// can ever be written: a trusted pool under trusted-only, or any pool from its
+// default branch.
+func (t Tier) publishesContent(publish CachePublish) bool {
+	switch publish {
+	case CachePublishDefaultBranch:
+		return true
+	case CachePublishTrustedOnly:
+		return t.Trust.Effective() == WorkloadTrusted
+	default:
+		return false
+	}
 }
 
 func (t Tier) hasRepositoryScope() bool {
