@@ -265,9 +265,10 @@ func escapeControl(s string) string {
 // release inspector reads systemd environment files with, so a file outside
 // that grammar refuses on every backend rather than being read one way here
 // and another by systemd. The value is used only on PostgreSQL and reaches no
-// argument, no report and no error: pgx's own parse error redacts the
-// password (measured 2026-09-09), and nothing here prints the string.
-func ledgerDSNFrom(cfg *config.Config, environmentFile string) (string, error) {
+// argument, no report and no error: it is a state.DSN, which redacts itself,
+// and the open withholds pgx's parse error, whose own masking of the password
+// misses some shapes (measured 2026-10-04).
+func ledgerDSNFrom(cfg *config.Config, environmentFile string) (state.DSN, error) {
 	if environmentFile == "" {
 		return ledgerDSN(cfg)
 	}
@@ -293,7 +294,7 @@ func ledgerDSNFrom(cfg *config.Config, environmentFile string) (string, error) {
 			"billet has no connection string", name, environmentFile)
 	}
 
-	return value, nil
+	return state.DSN(value), nil
 }
 
 // The seams the report's re-execution goes through: who this process is, who

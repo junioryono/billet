@@ -17,6 +17,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // onboard is github.Onboard behind a seam, so the refusals in front of it are
@@ -1155,16 +1156,18 @@ const (
 // inspectKey reports whether path holds a usable private key, or says that it
 // could not find out.
 //
-// One descriptor, inspected and read through — the same discipline
-// checkPrivateKey uses, and for the same reasons. Lstat-then-ReadFile is two
-// lookups of one name: the file can be swapped in between, so ReadFile would
-// follow a symlink planted after the check, block forever on a FIFO, or read
-// past maxKeySize — and could validate an entirely different file than the one
-// inspected, which here decides what the operator is told about their credential.
+// One descriptor, opened through regularfile and inspected and read through:
+// the same discipline github.ReadPrivateKeyFile uses, and for the same reasons.
+// Lstat-then-ReadFile is two lookups of one name: the file can be swapped in
+// between, so ReadFile would follow a symlink planted after the check, block
+// forever on a FIFO, or read past github.MaxKeySize, and could validate an
+// entirely different file than the one inspected, which here decides what the
+// operator is told about their credential. Only absence and a file that is not
+// regular are absent; every other refusal of the open is could-not-tell.
 func inspectKey(path string) keyState {
-	f, err := openForInspection(path)
+	f, info, err := regularfile.Open(path, regularfile.Options{})
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, regularfile.ErrNotRegular) {
 			return keyAbsent
 		}
 
@@ -1173,21 +1176,20 @@ func inspectKey(path string) keyState {
 
 	defer f.Close()
 
-	info, err := f.Stat()
-	if err != nil {
-		return keyUnverifiable
-	}
-
-	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxKeySize {
+	if info.Size() == 0 || info.Size() > github.MaxKeySize {
 		return keyAbsent
 	}
 
-	contents, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
+	contents, err := regularfile.ReadAllLimited(f, path, github.MaxKeySize)
 	if err != nil {
+		if errors.Is(err, regularfile.ErrTooLarge) {
+			return keyAbsent
+		}
+
 		return keyUnverifiable
 	}
 
-	if len(contents) > maxKeySize || github.ValidatePrivateKey(contents) != nil {
+	if github.ValidatePrivateKey(contents) != nil {
 		return keyAbsent
 	}
 
@@ -1245,98 +1247,6 @@ func openBrowser(ctx context.Context, target string) error {
 	go func() { proc.Wait() }()
 
 	return nil
-}
-
-// maxKeySize bounds what is read from the key path. A real App key is a couple
-// of kilobytes; anything larger is a misconfiguration, and reading it whole
-// would be the misconfiguration's problem to solve rather than billet's.
-const maxKeySize = 64 << 10
-
-// checkPrivateKey proves the App key is usable, not merely present.
-//
-// os.Stat alone accepted a directory, an empty file left behind by an
-// interrupted onboarding, a truncated PEM, and a world-readable one. Each of
-// those is a deployment that looks configured and is not — and mode 0644 on an
-// App private key is a local credential exposure that `billet check` existed to
-// catch and did not.
-func checkPrivateKey(path string) error {
-	_, err := readPrivateKey(path)
-
-	return err
-}
-
-// readPrivateKey validates the App key and returns its bytes.
-//
-// ONE implementation, used by both `billet check` and `billet server`. They had
-// diverged: check rejected a non-regular file, bounded the read, worked from a
-// single descriptor, opened with O_NONBLOCK so a FIFO could not hang it, and
-// refused group- or world-readable modes — while the server did os.ReadFile and
-// parsed the result. So `billet check` refused a mode-0644 organization
-// credential that `billet server` would happily start with, which is the wrong
-// way round for the command that runs unattended.
-func readPrivateKey(path string) ([]byte, error) {
-	// Opened ONCE and inspected through the descriptor. Stat-then-read is two
-	// lookups of the same name: the file can be swapped in between, so the size,
-	// type and mode may describe a different inode than the bytes that get
-	// parsed — and os.ReadFile on a FIFO blocks forever rather than returning.
-	f, err := openForInspection(path)
-	if err != nil {
-		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("github.private_key_path %s is not a regular file", path)
-	}
-
-	if info.Size() == 0 {
-		return nil, fmt.Errorf(
-			"github.private_key_path %s is empty; an interrupted `billet github-app create` leaves "+
-				"a placeholder there. Remove it and re-run that command", path)
-	}
-
-	if info.Size() > maxKeySize {
-		return nil, fmt.Errorf("github.private_key_path %s is %d bytes; that is not an App key",
-			path, info.Size())
-	}
-
-	// Group and other bits on a private key are a local exposure. Checked on
-	// unix only: Windows permissions are ACL-based and these bits are meaningless
-	// there, so testing them would produce a false alarm on every Windows host.
-	if runtime.GOOS != "windows" {
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			return nil, fmt.Errorf(
-				"github.private_key_path %s is mode %04o; it is readable beyond its owner. "+
-					"Run: chmod 600 %s", path, perm, path)
-		}
-	}
-
-	// Read from the descriptor already inspected, and bounded for real: the
-	// size check above describes the inode at that moment, while this limit
-	// holds regardless.
-	pemBytes, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
-	if err != nil {
-		return nil, fmt.Errorf("read github.private_key_path %s: %w", path, err)
-	}
-
-	if len(pemBytes) > maxKeySize {
-		return nil, fmt.Errorf("github.private_key_path %s is larger than %d bytes; that is not an App key",
-			path, maxKeySize)
-	}
-
-	// Parsed, not merely read: a truncated PEM is exactly what an interrupted
-	// write leaves, and it fails at the first API call rather than here.
-	if err := github.ValidatePrivateKey(pemBytes); err != nil {
-		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
-	return pemBytes, nil
 }
 
 // defaultKeyPath is where the default target's App key goes when --key-path is

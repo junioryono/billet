@@ -776,7 +776,7 @@ func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) 
 
 				opens, reads, closes := 0, 0, 0
 
-				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 					opens++
 					db, err := savedOpen(ctx, cfg, dsn)
 					mustOK(t, err)
@@ -1322,7 +1322,7 @@ func TestTheDryRunRecognisesANodeWithoutAttemptingALedgerRead(t *testing.T) {
 	writeFile(t, state.LedgerPath(f.stateDir), "not a database", 0o600)
 	saved := retireReportOpen
 	t.Cleanup(func() { retireReportOpen = saved })
-	retireReportOpen = func(context.Context, *config.Config, string) (*state.DB, error) {
+	retireReportOpen = func(context.Context, *config.Config, state.DSN) (*state.DB, error) {
 		t.Fatal("a node-only classifier attempted a ledger read")
 		return nil, errors.New("unexpected ledger read")
 	}
@@ -1860,7 +1860,7 @@ func TestTheDryRunDoesNotCallEveryUnreadableLedgerBinaryRecovery(t *testing.T) {
 				} else {
 					why = "independent open failure"
 				}
-				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 					db, err := saved(ctx, cfg, dsn)
 					if db != nil || !state.OnlyCause(err, state.ErrMaintenance) {
 						t.Fatalf("the real open did not refuse solely on the fence: %v", err)
@@ -1978,7 +1978,7 @@ func TestTheDryRunKeepsOwnerAndDirectLedgerPreconditionsInOrder(t *testing.T) {
 					mustOK(t, os.Symlink(kept, ledger))
 				}
 				opens := 0
-				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+				retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 					opens++
 					if owner {
 						t.Fatal("root attempted to open another account's SQLite ledger")
@@ -2028,7 +2028,7 @@ func TestTheDryRunAdmitsBinaryRecoveryBeforeTheOwnersReport(t *testing.T) {
 		t.Fatal("the maintenance fence did not refuse the owner's report before re-execution")
 		return nil, 0, errors.New("unexpected re-execution")
 	}
-	retireReportOpen = func(context.Context, *config.Config, string) (*state.DB, error) {
+	retireReportOpen = func(context.Context, *config.Config, state.DSN) (*state.DB, error) {
 		t.Fatal("root attempted to open another account's SQLite ledger")
 		return nil, errors.New("unexpected ledger open")
 	}
@@ -2257,7 +2257,7 @@ func TestTheNewRetireObservationsLeaveBootstrapPathsAbsent(t *testing.T) {
 	f.cfg = writeRetirePostgresConfig(t, missing)
 	savedOpen, savedConverge := retireReportOpen, converge
 	t.Cleanup(func() { retireReportOpen, converge = savedOpen, savedConverge })
-	retireReportOpen = func(context.Context, *config.Config, string) (*state.DB, error) {
+	retireReportOpen = func(context.Context, *config.Config, state.DSN) (*state.DB, error) {
 		t.Fatal("an uncommissioned classifier attempted a ledger open")
 		return nil, errors.New("unexpected ledger open")
 	}
@@ -2326,7 +2326,7 @@ func TestTheDryRunAcceptsAReservationWhoseOnlyIdentityFileWasLost(t *testing.T) 
 
 	// THE LEDGER STILL HOLDS IT. This independent read uses the recorded
 	// deployment, not the lost file the classifier would need to name it.
-	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, f.dsn)
+	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, state.DSN(f.dsn))
 	mustOK(t, err)
 	kept, present, readErr := db.ReadRetirement(t.Context(), f.identity)
 	mustOK(t, db.Close())
@@ -2393,7 +2393,7 @@ func TestTheDryRunKeepsACustomLocatorWhenConfigurationValidationFails(t *testing
 	// THE RESERVATION SURVIVES INDEPENDENTLY OF THE MALFORMED CONFIGURATION.
 	// Reading it by the known deployment proves the admission would cross work
 	// already reserved, rather than merely observing an unused custom directory.
-	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, f.dsn)
+	db, err := state.OpenPostgresInspect(t.Context(), f.stateDir, state.DSN(f.dsn))
 	mustOK(t, err)
 	kept, present, readErr := db.ReadRetirement(t.Context(), f.identity)
 	mustOK(t, db.Close())
@@ -2534,7 +2534,7 @@ func TestTheDryRunObservesTheIdentityUnderHeldWriterLocks(t *testing.T) {
 	identityAccessWait = time.Nanosecond
 	t.Cleanup(func() { identityAccessWait, retireReportOpen, converge = savedWait, savedOpen, savedConverge })
 	opens := 0
-	retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+	retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 		opens++
 		db, err := savedOpen(ctx, cfg, dsn)
 		mustOK(t, err)

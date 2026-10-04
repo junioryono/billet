@@ -247,7 +247,7 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
 	defer cancel()
 
-	db, problem := retireOpenByLocator(bounded, j, func(openCtx context.Context, dir, dsn string) (*state.DB, error) {
+	db, problem := retireOpenByLocator(bounded, j, func(openCtx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
 		if err := openCtx.Err(); err != nil {
 			return nil, err
 		}
@@ -343,7 +343,7 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
 func retireOpenByLocator(ctx context.Context, j retirement.Journal,
-	open func(ctx context.Context, dir, dsn string) (*state.DB, error),
+	open func(ctx context.Context, dir string, dsn state.DSN) (*state.DB, error),
 ) (*state.DB, ledgerProblem) {
 	if j.Locator.Backend != string(config.StatePostgres) {
 		return nil, ledgerProblem{refusal: retireUnknown(retireReasonLedger, fmt.Sprintf("the journal's locator names "+
@@ -415,7 +415,7 @@ type ledgerProblem struct {
 // environment file when it names one and from this process's environment
 // otherwise. A file that is gone or unreadable is a PENDING row: the rewrite
 // took the server's environment away and the survivor completes instead.
-func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRefusal) {
+func retireLocatorDSN(loc retirement.JournalLocator) (state.DSN, string, *retireRefusal) {
 	if loc.DSNEnv == "" {
 		return "", "", retireUnknown(retireReasonLedger, "the journal's locator names no DSN variable, so this host "+
 			"cannot reach the ledger it retired from", "the runbook in docs/operating/upgrades.md")
@@ -427,7 +427,7 @@ func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRef
 			return "", fmt.Sprintf("%s is not set in this process's environment", loc.DSNEnv), nil
 		}
 
-		return value, "", nil
+		return state.DSN(value), "", nil
 	}
 
 	value, found, err := environmentFileValue(loc.EnvironmentFile, loc.DSNEnv)
@@ -439,7 +439,7 @@ func retireLocatorDSN(loc retirement.JournalLocator) (string, string, *retireRef
 		return "", fmt.Sprintf("%s does not set %s", loc.EnvironmentFile, loc.DSNEnv), nil
 	}
 
-	return value, "", nil
+	return state.DSN(value), "", nil
 }
 
 // retirePendingReason is the CLOSED LIST of ways the ledger can be out of this

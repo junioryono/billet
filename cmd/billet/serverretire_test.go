@@ -388,7 +388,7 @@ func TestServerRetireReservesOnAPostgresPair(t *testing.T) {
 
 	f.identity = id
 
-	db, err := state.OpenPostgres(t.Context(), identityDir, dsn)
+	db, err := state.OpenPostgres(t.Context(), identityDir, state.DSN(dsn))
 	mustOK(t, err)
 	mustOK(t, db.Close())
 

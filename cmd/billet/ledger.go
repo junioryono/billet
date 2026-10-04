@@ -144,7 +144,7 @@ func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) 
 // openStateAdminWith is openStateAdmin with the caller's connection string,
 // for a command handed the environment file the unit names rather than the
 // process environment.
-func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 	var (
 		db  *state.DB
 		err error
@@ -207,7 +207,7 @@ func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB)
 // the schema exactly this binary's and the identity verified. The DSN is the
 // caller's, because a report may be handed the environment file the unit
 // names rather than the process environment.
-func openStateInspect(ctx context.Context, cfg *config.Config, dsn string) (*state.DB, error) {
+func openStateInspect(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 	var (
 		db  *state.DB
 		err error
@@ -264,14 +264,14 @@ func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, e
 // AN EMPTY VALUE IS REFUSED HERE rather than passed on, so the diagnostic names
 // the variable an operator has to set instead of arriving several layers down as
 // a connection failure.
-func ledgerDSN(cfg *config.Config) (string, error) {
+func ledgerDSN(cfg *config.Config) (state.DSN, error) {
 	if cfg.Server == nil || cfg.Server.LedgerBackend() != config.StatePostgres {
 		return "", nil
 	}
 
 	name := cfg.Server.LedgerDSNEnv()
 
-	dsn := os.Getenv(name)
+	dsn := state.DSN(os.Getenv(name))
 	if dsn == "" {
 		return "", fmt.Errorf(
 			"server.state.postgres.dsn_env names %s and that variable is empty, so billet has "+

@@ -1946,7 +1946,7 @@ func retireConfigLocator(body []byte) *config.Config {
 // and refuses every write. SQLite's driver sidecars belong to the configured
 // ledger's read, not this PostgreSQL locator.
 func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
-	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir, dsn string) (*state.DB, error) {
+	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
 		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
 	})
 }
