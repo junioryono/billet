@@ -271,3 +271,105 @@ func TestARequestedDrainRecoversBeforeItDecides(t *testing.T) {
 		t.Fatal("the stop did not end once recovery succeeded and nothing was held")
 	}
 }
+
+// A HANDOVER WHOSE WITHDRAWAL DID NOT LAND DRAINS (#374). The next process takes
+// over only what a process the plane recorded as withdrawn owned; without that
+// record the leases stay with an exited process and a completion's destroy never
+// reaches the guest, so the node keeps serving its compute instead.
+func TestAHandoverWhoseWithdrawalFailsDrains(t *testing.T) {
+	t.Parallel()
+
+	_, c, b := breakableHarness(t)
+	b.failWithdraw.Store(true)
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+		})
+	}()
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+	cancel()
+	waitFor(t, func() bool { return b.withdrawAttempts.Load() >= 3 })
+
+	select {
+	case err := <-done:
+		t.Fatalf("the node handed over (returned %v) though its withdrawal never landed", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end once the compute was gone")
+	}
+}
+
+// A FIRST REGISTRATION MADE BY A REQUESTED DRAIN STARTS THE JANITOR (#374). A
+// process that never registered before its stop registers to recover what its
+// host runs, and the leases recovery adopts are renewed by the janitor from then
+// on, exactly as after an ordinary registration, for as long as the drain lasts.
+func TestADrainThatRegistersFirstKeepsItsLeasesAlive(t *testing.T) {
+	t.Parallel()
+
+	_, c, b := breakableHarness(t)
+	b.failRegister.Store(true)
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+			DrainRequested: func() bool { return true },
+		})
+	}()
+
+	waitFor(t, func() bool { return b.registerAttempts.Load() >= 2 })
+	cancel()
+	if got := compute.aliveCount(); got != 0 {
+		t.Fatalf("the janitor started (%d) before any registration succeeded", got)
+	}
+
+	b.failRegister.Store(false)
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end once the compute was gone")
+	}
+}

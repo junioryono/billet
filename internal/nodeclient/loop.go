@@ -389,7 +389,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	}
 
 	if ctx.Err() != nil {
-		return stopGracefully(ctx, c, compute, log, opts, recovered.Load())
+		return stopGracefully(ctx, c, compute, log, opts, recovered.Load(), startJanitor)
 	}
 
 	return err
@@ -582,6 +582,7 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 // already returned, which is what brought us here.
 func stopGracefully(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, recovered bool,
+	startJanitor func(),
 ) error {
 	// A REQUESTED DRAIN FIRST LEARNS WHAT THIS HOST RUNS (#374). A process
 	// stopped before its first recovery holds nothing it knows of, while guests a
@@ -589,7 +590,7 @@ func stopGracefully(
 	// the drain is about to take their host or its networking apart. Recovering
 	// is what makes Holding() see them; a second signal still ends the attempt.
 	if !recovered && opts.DrainRequested != nil && opts.DrainRequested() {
-		recoverBeforeDrain(ctx, c, compute, log, opts)
+		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor)
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -612,12 +613,21 @@ func stopGracefully(
 	// and the next node process adopts what it finds (Recover runs at every
 	// registration). The VMMs live in cgroups of their own, outside the unit's,
 	// so stopping the service does not stop them.
+	//
+	// ONLY ONCE THE WITHDRAWAL HAS LANDED. The next process takes over what this
+	// one owned only from a process the plane recorded as withdrawn; without that
+	// record the leases stay with this exited process and a completion's destroy
+	// never reaches the guest, so a withdrawal that did not land drains instead.
 	if opts.HandOverOnStop && (opts.DrainRequested == nil || !opts.DrainRequested()) {
-		log.Info("handing over to the next node process: the compute running here keeps " +
-			"running and is adopted when billet node starts again")
-		withdraw(ctx, c, log, opts)
+		if withdraw(ctx, c, log, opts) {
+			log.Info("handing over to the next node process: the compute running here keeps " +
+				"running and is adopted when billet node starts again")
 
-		return nil
+			return nil
+		}
+
+		log.Warn("the withdrawal did not land, so the next node process could not take over " +
+			"what this one runs; draining instead")
 	}
 
 	// THE GUESTS THIS DRAIN WAITS FOR ARE ANSWERED. A stop that arrived while
@@ -821,13 +831,13 @@ const withdrawAttempts = 3
 // other hosts at once rather than after the silence window; what it can never
 // change is the exit status, because a stop that did what it was asked is not a
 // failure — so every outcome here ends in a log line and a return.
-func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) {
+func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) bool {
 	wire := c.WireVersion()
 
 	// NEVER REGISTERED, so nothing to withdraw: the plane does not know this
 	// process, and asking would only be answered "register again".
 	if wire == 0 {
-		return
+		return false
 	}
 
 	// CHECKED WHERE IT IS EMITTED. An older control plane has no route for this
@@ -838,7 +848,7 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 			"will keep placing work here until it forgets the node by silence",
 			"protocol", wire, "needs", nodeapi.VersionNodeWithdrawal)
 
-		return
+		return false
 	}
 
 	// THE CALLER'S CONTEXT IS THE CANCELLED ONE — that is what brought the node
@@ -855,24 +865,24 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 			log.Info("withdrew from placement; the control plane will not aim work here " +
 				"until this node registers again")
 
-			return
+			return true
 
 		case errors.Is(err, ErrUnregistered):
 			// The plane forgot this node already, so there is nothing to withdraw.
-			return
+			return false
 
 		case errors.Is(err, ErrSuperseded):
 			log.Info("another process is registered as this node, so this one has nothing "+
 				"to withdraw", "error", err)
 
-			return
+			return false
 
 		case errors.Is(err, ErrRefused):
 			// A verdict rather than an outage; asking again cannot change it.
 			log.Warn("the control plane refused this node's withdrawal; it keeps placing "+
 				"work here until it forgets the node by silence", "error", err)
 
-			return
+			return false
 		}
 
 		if attempt < withdrawAttempts {
@@ -883,12 +893,19 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 	log.Warn("could not withdraw from placement; the control plane keeps placing work "+
 		"here until it forgets this node by silence",
 		"attempts", withdrawAttempts, "error", err)
+
+	return false
 }
 
-// backoffFor is the pause after a failed registration or poll.
 // recoverBeforeDrain registers if this process never did and recovers, until it
-// succeeds or a second signal arrives.
-func recoverBeforeDrain(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) {
+// succeeds or a second signal arrives. The janitor starts once a registration
+// has told it the lease TTL and before anything is recovered, exactly as at an
+// ordinary registration: recovery adopts leases, and a drain can outlast their
+// TTL many times over while Tend's provider calls are not what renews them.
+func recoverBeforeDrain(
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
+	startJanitor func(),
+) {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
@@ -908,6 +925,7 @@ func recoverBeforeDrain(ctx context.Context, c *Client, compute Compute, log *sl
 			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
 		}
 		if err == nil {
+			startJanitor()
 			err = compute.Recover(recoverCtx)
 		}
 		if err == nil {
@@ -923,6 +941,7 @@ func recoverBeforeDrain(ctx context.Context, c *Client, compute Compute, log *sl
 	}
 }
 
+// backoffFor is the pause after a failed registration or poll.
 func backoffFor(opts LoopOptions) time.Duration {
 	if opts.Backoff > 0 {
 		return opts.Backoff

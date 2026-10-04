@@ -323,15 +323,37 @@
     - not ansible_check_mode
     - billet_upgrade_claim_shape == 'guard'
 
+# THE TRANSACTION INSTALLS ITS CANDIDATE CONFIG TOO, and a changed one may move
+# what the next process adopts from (#374), so it is compared with the installed
+# one before the node is stopped: cmp answers 0 for the same bytes, 1 for
+# different ones and anything else for could-not-tell, which drains.
+- name: Compare the transaction's candidate config with the installed one
+  ansible.builtin.command:
+    argv:
+      - cmp
+      - -s
+      - "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
+      - "{{ billet_ordinary_config_path }}"
+  register: billet_candidate_config_compare
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
 - name: Upgrade billet as one recoverable host transaction
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
   become: true
   block:
-    - name: Make the transaction's node stop a drain when the node will not run again
+    - name: Make the transaction's node stop a drain when the node will not run again or its config changes
       ansible.builtin.include_tasks: request-node-drain.yml
-      when: not billet_node_should_run
+      when: >-
+        not billet_node_should_run or
+        (billet_candidate_config_compare.rc | default(2)) != 0
 
     - name: Gracefully stop the billet node before changing its guest contract
       ansible.builtin.systemd_service:
@@ -803,6 +825,19 @@
     - not billet_retirement_node_ordinary | bool
   become: true
 
+# A CHANGED CONFIG MAY MOVE WHAT THE NEXT PROCESS ADOPTS FROM (#374): a
+# Firecracker chroot base, a state directory or the guests' cache endpoint. The
+# node's next stop drains, whether the endpoint migration below or the ordinary
+# restart makes it, and the final release withdraws the request once the node is
+# where this converge leaves it.
+- name: Make a node restart for a changed config a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
+    - billet_config_install.changed | default(false)
+
 # THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
 # afresh whether the running node dials the installed endpoint and, when it
 # does not, stops and starts it under the migration protocol; a migrated node
@@ -812,19 +847,6 @@
 
 # REQUESTED WITHOUT WAITING AND POLLED IN BOUNDED STEPS (node-restart.yml),
 # because the drain in front of the restart has no bound.
-# A CHANGED CONFIG MAY MOVE WHAT THE NEXT PROCESS ADOPTS FROM (#374): a
-# Firecracker chroot base, a state directory or the guests' cache endpoint. A
-# restart for one drains, and the final release below withdraws the request once
-# the restart has been polled to its new process.
-- name: Make a node restart for a changed config a drain
-  ansible.builtin.include_tasks: request-node-drain.yml
-  when:
-    - billet_node_should_run
-    - not ansible_check_mode
-    - not billet_binary_upgrade | default(false)
-    - not billet_endpoint_migrated | default(false) | bool
-    - billet_config_install.changed | default(false)
-
 - name: Restart the billet node after non-binary inputs change
   ansible.builtin.import_tasks: node-restart.yml
   when:

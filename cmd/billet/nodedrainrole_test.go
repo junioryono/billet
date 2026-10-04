@@ -126,18 +126,38 @@ func TestEveryDrainingStopInTheRoleIsRequestedFirstAndReleasedAfter(t *testing.T
 		}
 	}
 
-	// THE TRANSACTION'S STOP, inside its block, for a node that will not run again.
 	services := readRoleTasks(t, "services.yml")
+
+	// A CHANGED CONFIG'S REQUEST COMES BEFORE THE ENDPOINT MIGRATION, which stops
+	// and starts the node in place of the ordinary restart.
+	if request, migration := taskIndex(services, "Make a node restart for a changed config a drain"),
+		taskIndex(services, "Migrate the node's endpoint before the ordinary restart"); request < 0 ||
+		migration < 0 || request >= migration {
+		t.Errorf("the changed config's request (%d) does not precede the endpoint migration (%d)",
+			request, migration)
+	}
+
+	// THE TRANSACTION'S STOP, inside its block, for a node that will not run again
+	// or whose candidate config differs from the installed one, compared first.
 	at := taskIndex(services, "Upgrade billet as one recoverable host transaction")
 	if at < 0 {
 		t.Fatal("services.yml has no upgrade transaction")
 	}
+	compare := taskIndex(services, "Compare the transaction's candidate config with the installed one")
 	block := services[at].Block
-	request := taskIndex(block, "Make the transaction's node stop a drain when the node will not run again")
+	request := taskIndex(block, "Make the transaction's node stop a drain when the node will not run again or its config changes")
 	stop := taskIndex(block, "Gracefully stop the billet node before changing its guest contract")
 	release := taskIndex(services, "Withdraw the drain request now that the node is where this converge leaves it")
-	if request < 0 || stop < 0 || request >= stop || release <= at {
-		t.Errorf("the transaction's request, stop and the release after it are at %d, %d and %d (block at %d)",
-			request, stop, release, at)
+	if compare < 0 || compare >= at || request < 0 || stop < 0 || request >= stop || release <= at {
+		t.Errorf("the transaction's comparison, request, stop and the release after it are at %d, %d, %d and %d "+
+			"(block at %d)", compare, request, stop, release, at)
+	}
+	if request >= 0 {
+		guard := strings.Join(block[request].conditions(), " ")
+		for _, want := range []string{"not billet_node_should_run", "billet_candidate_config_compare.rc"} {
+			if !strings.Contains(guard, want) {
+				t.Errorf("the transaction's request is guarded by %q, without %q", guard, want)
+			}
+		}
 	}
 }
