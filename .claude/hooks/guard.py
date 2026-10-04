@@ -8,9 +8,11 @@ session as the reason. A question this script cannot answer refuses too, saying
 so: could-not-tell never collapses into permission. The format mode never
 refuses.
 
-This is a guard rail for an honest session, not a security boundary: it reads
-the spellings a session uses by accident (newlines, wrappers, `git -C`, a switch
-earlier on the same line), not every way a shell can hide a command.
+This is a guard rail for an honest session, not a security boundary. It does not
+predict what a command line will do to the repository before a later command
+runs: a call that both changes branch and commits or pushes is refused and split
+into two calls, and a push must name what it pushes, so every judgement reads
+the repository as it really is.
 """
 import json
 import os
@@ -25,6 +27,11 @@ GENERATED = "internal/state/ledgerdb/"
 DEFAULT_BRANCH = "main"
 GIT_TIMEOUT = 5
 
+# Configuration isolation a caller set on purpose survives; every other GIT_
+# variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...) would point the
+# inspection at another repository, so it is dropped.
+KEEP_GIT_ENV = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
+
 
 class CannotTell(Exception):
     """A question the hook could not answer; it refuses rather than allows."""
@@ -37,12 +44,18 @@ def refuse(reason):
 
 def git(repo, *args):
     """Run git in repo; raise CannotTell when git itself cannot be run."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k in KEEP_GIT_ENV}
     try:
         return subprocess.run(
-            ["git", "-C", repo, *args], capture_output=True, text=True, check=False, timeout=GIT_TIMEOUT, env=env
+            ["git", "-C", repo, *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            check=False,
+            timeout=GIT_TIMEOUT,
+            env=env,
         )
-    except (OSError, subprocess.SubprocessError) as err:
+    except (OSError, ValueError, subprocess.SubprocessError) as err:
         raise CannotTell(f"git could not be run ({err})") from err
 
 
@@ -53,6 +66,13 @@ def text_field(mapping, key):
     if not isinstance(value, str):
         raise CannotTell(f"the hook input's {key} is not a string")
     return value
+
+
+def project_root(payload):
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or text_field(payload, "cwd")
+    if not root:
+        raise CannotTell("no CLAUDE_PROJECT_DIR and no cwd in the hook input")
+    return root
 
 
 # ---------------------------------------------------------------- edits
@@ -67,30 +87,43 @@ def candidate_paths(payload, root):
     if not path:
         return None, []
     cwd = text_field(payload, "cwd") or root
-    lexical = os.path.normpath(path if os.path.isabs(path) else os.path.join(cwd, path))
+    raw = path if os.path.isabs(path) else os.path.join(cwd, path)
     roots = (root, os.path.realpath(root))
 
-    def inside(path):
-        return [r for r in (os.path.relpath(path, base) for base in roots) if not r.startswith("..")]
+    def inside(p):
+        return [r for r in (os.path.relpath(p, base) for base in roots) if not r.startswith("..")]
 
-    lexical_rels = inside(lexical)
-    rels = list(dict.fromkeys(lexical_rels + inside(os.path.realpath(lexical))))
+    lexical_rels = inside(os.path.normpath(raw))
+    # Resolved from the path as written, before normalising: through a symlinked
+    # component, `alias/../x` is not `x`.
+    rels = list(dict.fromkeys(lexical_rels + inside(os.path.realpath(raw))))
     return (lexical_rels[0] if lexical_rels else None), rels
+
+
+def default_refs(root):
+    """The refs that hold published migrations; a ref that is missing is skipped, one that fails refuses."""
+    refs = []
+    for ref in (f"refs/remotes/origin/{DEFAULT_BRANCH}", f"refs/heads/{DEFAULT_BRANCH}"):
+        # A missing ref answers exit 1 and says nothing; a broken one answers the
+        # same exit and warns "ignoring broken ref" (git 2.51, measured
+        # 2026-10-03; show-ref --quiet cannot tell the two apart).
+        found = git(root, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+        if found.returncode == 0:
+            refs.append(ref)
+        elif found.returncode != 1 or found.stderr.strip():
+            raise CannotTell(f"could not read {ref}: {found.stderr.strip() or 'exit ' + str(found.returncode)}")
+    if not refs:
+        raise CannotTell(
+            f"neither origin/{DEFAULT_BRANCH} nor {DEFAULT_BRANCH} exists here, so it cannot tell whether a "
+            f"migration is published; fetch {DEFAULT_BRANCH} and try again"
+        )
+    return refs
 
 
 def published(root, rel):
     """True when the migration rel exists on main or origin/main, matched case-insensitively."""
     directory, name = os.path.split(rel)
-    refs = []
-    for ref in (f"origin/{DEFAULT_BRANCH}", DEFAULT_BRANCH):
-        if git(root, "rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode == 0:
-            refs.append(ref)
-    if not refs:
-        raise CannotTell(
-            f"neither origin/{DEFAULT_BRANCH} nor {DEFAULT_BRANCH} is a commit here, so it cannot tell whether "
-            f"{rel} is a published migration; fetch {DEFAULT_BRANCH} and try again"
-        )
-    for ref in refs:
+    for ref in default_refs(root):
         # The pathspec form answers an absent directory with nothing, and fails
         # only when the lookup itself fails.
         listing = git(root, "ls-tree", "-z", "--name-only", "--full-tree", ref, "--", directory + "/")
@@ -106,9 +139,10 @@ def judge_edit(payload):
     root = project_root(payload)
     lexical_rel, rels = candidate_paths(payload, root)
 
-    # Judged by the name the tool was given: a write through .agents/ is refused
-    # even though it would land under .claude/.
-    if lexical_rel and (lexical_rel == "AGENTS.md" or lexical_rel.startswith(".agents/")):
+    # Judged by the name the tool was given, case-insensitively: a write through
+    # .agents/ is refused even though it would land under .claude/.
+    low_lexical = (lexical_rel or "").lower()
+    if low_lexical == "agents.md" or low_lexical.startswith(".agents/"):
         refuse(
             f"{lexical_rel} is a committed symlink for Codex. Edit the canonical file instead: CLAUDE.md, or "
             ".claude/skills/<name>/ for a skill."
@@ -132,34 +166,68 @@ def judge_edit(payload):
                 )
 
 
-def project_root(payload):
-    root = os.environ.get("CLAUDE_PROJECT_DIR") or text_field(payload, "cwd")
-    if not root:
-        raise CannotTell("no CLAUDE_PROJECT_DIR and no cwd in the hook input")
-    return root
-
-
 # ---------------------------------------------------------------- shell
 
 SEPARATOR_CHARS = ";&|()\n"
-WRAPPERS = {"env", "command", "exec", "nohup", "time", "sudo", "builtin"}
 SHELLS = {"sh", "bash", "zsh", "dash"}
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# Each wrapper and the options of its that take a value.
+WRAPPERS = {
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "sudo": {"-u", "--user", "-g", "--group", "-C", "-h", "--host", "-p", "--prompt", "-U", "-r", "-t", "-D"},
+    "nice": {"-n", "--adjustment"},
+    "command": set(),
+    "exec": {"-a"},
+    "nohup": set(),
+    "time": {"-f", "-o"},
+    "builtin": set(),
+}
+HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 
 
 def strip_heredocs(text):
-    """Drop heredoc bodies, which are data, keeping the line that opens each."""
+    """Drop the bodies of real heredocs, which are data. Only an unquoted `<<`
+    opens one, so text that merely mentions `<<EOF` in quotes is not swallowed."""
     out, lines, i = [], text.split("\n"), 0
     while i < len(lines):
         line = lines[i]
         out.append(line)
         i += 1
-        for m in HEREDOC.finditer(line):
-            delimiter = m.group(2)
-            while i < len(lines) and lines[i].strip() != delimiter:
+        for strip_tabs, delimiter in unquoted_heredocs(line):
+            while i < len(lines):
+                body = lines[i].lstrip("\t") if strip_tabs else lines[i]
                 i += 1
-            i += 1
+                if body == delimiter:
+                    break
     return "\n".join(out)
+
+
+def unquoted_heredocs(line):
+    """The heredocs a line opens: (strip leading tabs, delimiter) per unquoted `<<`."""
+    found, quote, j = [], None, 0
+    while j < len(line):
+        c = line[j]
+        if quote:
+            if c == "\\" and quote == '"':
+                j += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c == "\\":
+            j += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif line.startswith("<<<", j):
+            j += 3
+            continue
+        elif line.startswith("<<", j):
+            m = HEREDOC_OPEN.match(line, j)
+            if m:
+                found.append((m.group(1) == "-", m.group(3)))
+                j = m.end()
+                continue
+        j += 1
+    return found
 
 
 def simple_commands(text):
@@ -167,7 +235,9 @@ def simple_commands(text):
     lexer = shlex.shlex(strip_heredocs(text), posix=True, punctuation_chars=SEPARATOR_CHARS)
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    lexer.commenters = "#"
+    # No comment handling: shlex would swallow the newline that ends a comment,
+    # joining the next command to this one. A `#` word is just an argument.
+    lexer.commenters = ""
     try:
         words = list(lexer)
     except ValueError:
@@ -186,60 +256,70 @@ def simple_commands(text):
 
 
 def unwrap(words):
-    """Strip assignments and wrappers (env, command, sudo, ...) in front of the real program."""
+    """Strip assignments and wrappers (env, sudo, command, ...) in front of the real program."""
     while words:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
             words = words[1:]
             continue
-        if os.path.basename(words[0]) in WRAPPERS:
+        wrapper = WRAPPERS.get(os.path.basename(words[0]))
+        if wrapper is None:
+            break
+        words = words[1:]
+        while words and words[0].startswith("-") and words[0] != "--":
+            opt = words.pop(0)
+            if opt in wrapper and words and "=" not in opt:
+                words.pop(0)
+        if words and words[0] == "--":
             words = words[1:]
-            while words and words[0].startswith("-"):
-                words = words[1:]
-            continue
-        break
     return words
 
 
-GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+class GitCall:
+    """One git invocation: where it runs, what it overrides, and what it does."""
+
+    def __init__(self, repo, sub, args, overrides, context_options):
+        self.repo = repo
+        self.sub = sub
+        self.args = args
+        self.overrides = overrides  # -c key=value, by key
+        self.context_options = context_options  # --git-dir, --work-tree and the like
 
 
 def parse_git(words, cwd):
-    """(repo, subcommand, args) for a git command, or None."""
     if not words or os.path.basename(words[0]) != "git":
         return None
-    repo, rest = cwd, words[1:]
+    repo, rest, overrides, context = cwd, words[1:], {}, []
     while rest and rest[0].startswith("-"):
         opt = rest.pop(0)
         if opt == "-C" and rest:
-            repo = os.path.join(repo, rest.pop(0))
-        elif opt in GIT_VALUE_OPTIONS and rest:
+            repo = os.path.join(repo, os.path.expanduser(rest.pop(0)))
+        elif opt == "-c" and rest:
+            key, _, value = rest.pop(0).partition("=")
+            overrides[key.lower()] = value
+        elif opt in ("--git-dir", "--work-tree", "--namespace") and rest:
+            context.append(opt)
+            rest.pop(0)
+        elif opt.split("=", 1)[0] in ("--git-dir", "--work-tree", "--namespace", "--bare"):
+            context.append(opt.split("=", 1)[0])
+        elif opt in ("--exec-path", "--config-env") and rest:
             rest.pop(0)
     if not rest:
         return None
-    return repo, rest[0], rest[1:]
+    return GitCall(repo, rest[0], rest[1:], overrides, context)
 
 
 class Shell:
-    """What one command line does to the directory and the branch, in order."""
+    """The git calls a command line makes, gathered first and judged together."""
 
-    def __init__(self, cwd):
+    def __init__(self, cwd, calls=None):
         self.cwd = cwd
-        self.assumed = {}  # repository -> branch a switch earlier on the line moved to
+        self.calls = calls if calls is not None else []
 
-    def branch(self, repo):
-        key = os.path.realpath(repo)
-        if key in self.assumed:
-            return self.assumed[key]
-        head = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-        if head.returncode != 0:
-            raise CannotTell(f"could not read the current branch of {repo}: {head.stderr.strip()}")
-        return head.stdout.strip()
-
-    def judge(self, text):
+    def gather(self, text):
         parsed = simple_commands(text)
         if parsed is None:
-            if re.search(r"\bgit\b.*\b(push|rebase|commit|pull)\b", text):
-                raise CannotTell("this command line could not be parsed, and it names a git push, rebase, pull or commit")
+            if re.search(r"\bgit\b.*\b(push|rebase|commit|pull|switch|checkout)\b", text, re.S):
+                raise CannotTell("this command line could not be parsed, and it names a git command the hook judges")
             return
         for words in parsed:
             words = unwrap(words)
@@ -249,7 +329,7 @@ class Shell:
             if program in SHELLS:
                 for i, a in enumerate(words[1:], start=1):
                     if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and i + 1 < len(words):
-                        Shell(self.cwd).judge(words[i + 1])
+                        Shell(self.cwd, self.calls).gather(words[i + 1])
                         break
                 continue
             if program == "cd":
@@ -258,91 +338,107 @@ class Shell:
                 elif words[1] != "-":
                     self.cwd = os.path.join(self.cwd, os.path.expanduser(words[1]))
                 continue
-            found = parse_git(words, self.cwd)
-            if found:
-                self.judge_git(*found)
+            call = parse_git(words, self.cwd)
+            if call:
+                self.calls.append(call)
 
-    def judge_git(self, repo, sub, args):
-        if sub == "rebase":
-            refuse("billet integrates by merging, never by rebasing; see the billet-git-flow skill.")
-        if sub == "pull":
-            explicit = [a for a in args if a in ("--rebase", "-r", "--no-rebase") or a.startswith("--rebase=")]
-            if any(a != "--no-rebase" and a != "--rebase=false" for a in explicit):
-                refuse("billet integrates by merging, never by rebasing; see the billet-git-flow skill.")
-            if not explicit:
-                configured = git(repo, "config", "--get", "pull.rebase")
-                if configured.stdout.strip() not in ("", "false"):
-                    refuse(
-                        "pull.rebase is set here, so `git pull` would rebase; billet merges. Use "
-                        "`git pull --no-rebase` (billet-git-flow)."
-                    )
-        if sub in ("switch", "checkout"):
-            self.note_switch(repo, sub, args)
-        if sub == "push":
-            self.judge_push(repo, args)
-        if sub == "commit" and self.branch(repo) == DEFAULT_BRANCH:
-            refuse(f"billet never commits to {DEFAULT_BRANCH}; create a branch first (billet-git-flow).")
 
-    def note_switch(self, repo, sub, args):
-        create = {"-c", "-C", "--create", "--force-create", "-b", "-B", "--orphan"}
-        target = None
-        for i, a in enumerate(args):
-            if a in create and i + 1 < len(args):
-                target = args[i + 1]
-                break
-        if target is None:
-            positional = [a for a in args if not a.startswith("-")]
-            if "--" in args:
-                positional = positional[: args.index("--")]
-            if positional:
-                name = positional[0]
-                if sub == "switch" or git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{name}").returncode == 0:
-                    target = name
-        if target is not None:
-            self.assumed[os.path.realpath(repo)] = target
+def switches_branch(call):
+    """True when this call can move HEAD to another branch."""
+    if call.sub == "switch":
+        return True
+    if call.sub != "checkout":
+        return False
+    # `git checkout <tree-ish> -- <paths>` and `git checkout -- <paths>` restore
+    # files and leave HEAD alone.
+    return "--" not in call.args
 
-    def judge_push(self, repo, args):
-        force = any(a.startswith("--force") or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", a) for a in args)
-        if force or any(a.startswith("+") for a in args if not a.startswith("-")):
-            refuse("billet never force-pushes, --force-with-lease included; see the billet-git-flow skill.")
-        if "--all" in args or "--mirror" in args:
-            refuse(f"--all and --mirror push {DEFAULT_BRANCH} with everything else; push one branch by name.")
 
-        positional, remote_given, i = [], False, 0
-        while i < len(args):
-            a = args[i]
-            if a.startswith("--repo="):
-                remote_given = True
-            elif a in ("--repo", "-o", "--push-option", "--receive-pack", "--exec") and i + 1 < len(args):
-                remote_given = remote_given or a == "--repo"
-                i += 1
-            elif not a.startswith("-"):
-                positional.append(a)
-            i += 1
-        refspecs = positional if remote_given else positional[1:]
-
-        for refspec in refspecs:
-            src, _, dest = refspec.partition(":")
-            dest = dest or src
-            if dest == "HEAD":
-                dest = self.branch(repo)
-            if dest.removeprefix("refs/heads/") == DEFAULT_BRANCH:
-                refuse(f"billet never pushes to {DEFAULT_BRANCH}; push a branch and open a pull request.")
-        if refspecs:
-            return
-
-        # No refspec: git pushes the current branch to where @{push} says.
-        if os.path.realpath(repo) in self.assumed:
-            if self.assumed[os.path.realpath(repo)] == DEFAULT_BRANCH:
-                refuse(f"billet never pushes to {DEFAULT_BRANCH}; push a branch and open a pull request.")
-            return
-        upstream = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}")
-        destination = upstream.stdout.strip() if upstream.returncode == 0 else self.branch(repo)
-        if destination.split("/", 1)[-1] == DEFAULT_BRANCH or destination == DEFAULT_BRANCH:
+def judge_calls(calls):
+    moves = [c for c in calls if switches_branch(c)]
+    lands = [c for c in calls if c.sub in ("commit", "push")]
+    if moves and lands:
+        refuse(
+            "this call both changes branch and commits or pushes, so the hook cannot tell which branch the commit "
+            "or push lands on; run the switch and the commit or push as two separate calls."
+        )
+    for call in calls:
+        if call.context_options and call.sub in ("commit", "push", "pull", "rebase"):
             refuse(
-                f"this push has no refspec, and it would go to {DEFAULT_BRANCH}; push a branch by name and open a "
-                "pull request."
+                f"billet's hook cannot judge a git {call.sub} with {', '.join(call.context_options)}; run it from "
+                "the worktree instead."
             )
+        judge_git(call)
+
+
+def judge_git(call):
+    sub, args, repo = call.sub, call.args, call.repo
+    if sub == "rebase":
+        refuse("billet integrates by merging, never by rebasing; see the billet-git-flow skill.")
+    if sub == "pull":
+        explicit = [a for a in args if a in ("--rebase", "-r", "--no-rebase") or a.startswith("--rebase=")]
+        if any(a not in ("--no-rebase", "--rebase=false") for a in explicit):
+            refuse("billet integrates by merging, never by rebasing; see the billet-git-flow skill.")
+        if not explicit:
+            setting = call.overrides.get("pull.rebase")
+            if setting is None:
+                setting = git(repo, "config", "--get", "pull.rebase").stdout.strip()
+            if setting not in ("", "false"):
+                refuse(
+                    "pull.rebase is set, so `git pull` would rebase; billet merges. Use `git pull --no-rebase` "
+                    "(billet-git-flow)."
+                )
+    if sub == "push":
+        judge_push(call)
+    if sub == "commit" and current_branch(repo) == DEFAULT_BRANCH:
+        refuse(f"billet never commits to {DEFAULT_BRANCH}; create a branch first (billet-git-flow).")
+
+
+def current_branch(repo):
+    """The branch HEAD names, unborn included; "HEAD" when detached."""
+    head = git(repo, "symbolic-ref", "--short", "-q", "HEAD")
+    if head.returncode == 0:
+        return head.stdout.strip()
+    if head.returncode == 1 and not head.stderr.strip():
+        return "HEAD"
+    raise CannotTell(f"could not read the current branch of {repo}: {head.stderr.strip()}")
+
+
+def judge_push(call):
+    args = call.args
+    force = any(a.startswith("--force") or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", a) for a in args)
+    if force or any(a.startswith("+") for a in args if not a.startswith("-")):
+        refuse("billet never force-pushes, --force-with-lease included; see the billet-git-flow skill.")
+    if "--all" in args or "--mirror" in args or "--branches" in args:
+        refuse(f"--all, --branches and --mirror push {DEFAULT_BRANCH} with everything else; push one branch by name.")
+
+    positional, remote_given, i = [], False, 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--repo="):
+            remote_given = True
+        elif a in ("--repo", "-o", "--push-option", "--receive-pack", "--exec") and i + 1 < len(args):
+            remote_given = remote_given or a == "--repo"
+            i += 1
+        elif not a.startswith("-"):
+            positional.append(a)
+        i += 1
+    refspecs = positional if remote_given else positional[1:]
+
+    if not refspecs:
+        refuse(
+            "a push must name what it pushes (`git push -u origin <branch>`), so its destination is plain; this "
+            "one leaves it to git's configuration."
+        )
+    for refspec in refspecs:
+        src, colon, dest = refspec.partition(":")
+        if "*" in refspec or (colon and not src and not dest):
+            refuse("billet pushes one named branch; a wildcard or matching refspec can push main.")
+        dest = dest or src
+        if dest == "HEAD":
+            dest = current_branch(call.repo)
+        if dest.removeprefix("refs/heads/") == DEFAULT_BRANCH:
+            refuse(f"billet never pushes to {DEFAULT_BRANCH}; push a branch and open a pull request.")
 
 
 def judge_bash(payload):
@@ -352,7 +448,9 @@ def judge_bash(payload):
     text = text_field(tool_input, "command") or ""
     if "git" not in text:
         return
-    Shell(text_field(payload, "cwd") or project_root(payload)).judge(text)
+    shell = Shell(text_field(payload, "cwd") or project_root(payload))
+    shell.gather(text)
+    judge_calls(shell.calls)
 
 
 # ---------------------------------------------------------------- format
@@ -366,10 +464,7 @@ def format_go(payload):
     gofmt = shutil.which("gofmt")
     if gofmt:
         # A file mid-edit may not parse yet; gofmt then leaves it alone.
-        try:
-            subprocess.run([gofmt, "-w", path], capture_output=True, check=False, timeout=20)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        subprocess.run([gofmt, "-w", path], capture_output=True, check=False, timeout=20)
 
 
 def main():
@@ -394,6 +489,8 @@ def main():
         (judge_edit if mode == "edit" else judge_bash)(payload)
     except CannotTell as err:
         refuse(f"billet hook: {err}")
+    except Exception as err:  # noqa: BLE001 - a crash would let the call through
+        refuse(f"billet hook: an error stopped the judgement ({type(err).__name__}: {err}), so the call is refused")
     sys.exit(0)
 
 
