@@ -283,7 +283,7 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 		"See [leases](references/leases.md)" + both:                                                      0,
 		"See [leases](<references/leases.md> \"title\")" + both:                                          0,
 		"See [leases](references/leases.md \"title\")" + both:                                            0,
-		"See references/leases.md. It is also [linked](references/leases.md)" + both:                   0,
+		"See references/leases.md. It is also [linked](references/leases.md)" + both:                     0,
 		"See [leases][l]" + both + "\n\n[l]: references/leases.md\n":                                     0,
 		"See [leases](references/leases.md#section) and [x](https://example.com/references/y.md)" + both: 0,
 		"See [leases](../other/references/leases.md)" + both:                                             2, // missing; real file unlinked
