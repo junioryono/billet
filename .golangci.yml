@@ -298,6 +298,18 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/config$
 
+        # THE DISPATCH VOCABULARY IMPORTS NO LEDGER AND NO ROLE. The scheduler and
+        # the node runtime both name a Runner, a Job and a CacheAuthority through
+        # it, so whatever it imported the node would import too. Measured at zero
+        # violations when it went in (#356 Phase 2).
+        dispatch:
+          list-mode: strict
+          files:
+            - "**/internal/dispatch/**"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/lease$
+
         # THE NODE WIRE'S VOCABULARY IMPORTS NO LEDGER AND NO ROLE. Both roles
         # import internal/nodeapi, so whatever it imports, a node imports: it names
         # a lease through internal/lease and a tier through internal/config, and

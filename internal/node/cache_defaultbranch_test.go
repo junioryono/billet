@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -19,19 +19,19 @@ const scopedLease = "a1"
 
 // fakeAuthority answers a re-check with whatever the test set, and counts.
 type fakeAuthority struct {
-	authority server.CacheAuthority
+	authority dispatch.CacheAuthority
 	err       error
 	asked     int
 }
 
-func (f *fakeAuthority) CacheAuthority(context.Context, string) (server.CacheAuthority, error) {
+func (f *fakeAuthority) CacheAuthority(context.Context, string) (dispatch.CacheAuthority, error) {
 	f.asked++
 
 	return f.authority, f.err
 }
 
-func publishingAuthority() server.CacheAuthority {
-	return server.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
+func publishingAuthority() dispatch.CacheAuthority {
+	return dispatch.CacheAuthority{LeaseID: scopedLease, JobID: "job-1", RunID: 31, Owner: "acme",
 		Repository: "api", Event: "push", Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 		Proven: true, WriteOwnRef: true, PublishDefault: true}
 }
@@ -109,7 +109,7 @@ func attachAndCommit(t *testing.T, service *CacheService, token string) map[stri
 
 // endSession settles the completion, closes the session as a proved teardown
 // does, and runs the cache loop's pass.
-func endSession(t *testing.T, service *CacheService, instance string, authority server.CacheAuthority) {
+func endSession(t *testing.T, service *CacheService, instance string, authority dispatch.CacheAuthority) {
 	t.Helper()
 
 	if err := service.SettleCompleted(t.Context(), instance, true, authority); err != nil {
@@ -193,7 +193,7 @@ func TestAnUnauthorisedDefaultBranchWriteIsDiscarded(t *testing.T) {
 	pullRequest.PublishDefault = false
 
 	for name, tc := range map[string]struct {
-		completion server.CacheAuthority
+		completion dispatch.CacheAuthority
 		blocked    bool
 	}{
 		"a pull request":                          {completion: pullRequest},

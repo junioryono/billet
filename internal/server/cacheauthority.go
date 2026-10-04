@@ -46,32 +46,6 @@ type ReferencedWorkflow struct {
 	SHA  string
 }
 
-// CacheAuthority is what a cache may do for one job, decided from evidence
-// GitHub produced and billet recorded. The zero value authorises nothing.
-type CacheAuthority struct {
-	LeaseID    string
-	JobID      string
-	RunID      int64
-	Owner      string
-	Repository string
-	Event      string
-	// Ref is the job's own cache scope: `refs/heads/<branch>`,
-	// `refs/tags/<tag>` or `refs/pull/<n>/merge`.
-	Ref string
-	// BaseRef is a pull request's base branch, `refs/heads/<branch>`, which
-	// GitHub also lets a pull request restore from. Empty for everything else.
-	BaseRef string
-	// DefaultRef is `refs/heads/<default branch>` when the authority was decided.
-	DefaultRef string
-	// Proven says every piece of evidence agreed. Nothing below it may be true
-	// without it.
-	Proven bool
-	// WriteOwnRef says the job may write under Ref.
-	WriteOwnRef bool
-	// PublishDefault says the job may publish what the default branch reads.
-	PublishDefault bool
-}
-
 // defaultBranchWriters are the events GitHub itself lets write the default
 // branch's cache: every other event running on the default branch gets a
 // read-only cache token there. From GitHub's changelog of 2026-06-26 ("Read-only

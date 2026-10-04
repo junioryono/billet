@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // scopedNamespaceSuffix separates default-branch namespaces from every key a
@@ -107,7 +107,7 @@ func (session *cacheSession) cacheRepository() string {
 // under its session's policy: a trusted pool's successful job under
 // trusted-only, a proven default-branch job under default-branch, never under
 // off.
-func publicationAllowed(session *cacheSession, succeeded bool, authority server.CacheAuthority) bool {
+func publicationAllowed(session *cacheSession, succeeded bool, authority dispatch.CacheAuthority) bool {
 	switch sessionPolicy(session) {
 	case config.CachePublishTrustedOnly:
 		return succeeded && session.trust == provider.TrustTrusted
@@ -143,7 +143,7 @@ func validateSessionCache(spec *config.CacheSpec) error {
 // its namespace is scoped by, and it must be proven. A grant for another lease
 // on the same request, or for another repository in the same organization
 // pool, publishes nothing.
-func authorisesPublication(session *cacheSession, authority server.CacheAuthority) bool {
+func authorisesPublication(session *cacheSession, authority dispatch.CacheAuthority) bool {
 	return sessionPolicy(session) == config.CachePublishDefaultBranch &&
 		session.leaseID != "" && authority.LeaseID == session.leaseID &&
 		authority.Proven && authority.PublishDefault &&

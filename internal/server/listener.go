@@ -39,52 +39,11 @@ type Session interface {
 	Close(ctx context.Context) error
 }
 
-// Runner turns an assigned lease into running compute, and tears it down again.
-// It is the seam between the control plane and a host.
-//
-// Both methods are called OUTSIDE the escrow mutex: launching pulls images and
-// talks to a hypervisor, and holding the mutex across that would stall every
-// heartbeat behind it.
-type Runner interface {
-	// The lease is already durable and counted against the budget, so a failure
-	// here means capacity is held for something that is not running; the caller
-	// releases it.
-	Launch(ctx context.Context, lease *alloc.Lease, job Job) error
-
-	// MUST be idempotent: it runs on redelivered completions, on shutdown, and on
-	// paths that have already failed once.
-	Destroy(ctx context.Context, requestID int64) error
-}
-
 // RunnerRegistry removes a GitHub registration before its guest is destroyed.
 // A failed removal leaves compute and capacity held so GitHub cannot race a new
 // assignment onto a guest Billet is tearing down.
 type RunnerRegistry interface {
 	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
-}
-
-// CompletionAwareRunner receives GitHub's authoritative completed-job result.
-// It is optional so runners that have no result-dependent teardown keep the
-// smaller Runner contract.
-//
-// The authority is what the completed job's caches may publish; its zero value
-// authorises nothing.
-type CompletionAwareRunner interface {
-	DestroyCompleted(ctx context.Context, requestID int64, result string,
-		authority CacheAuthority) error
-}
-
-// BoundCompletionAwareRunner reconciles teardown with the node and lease that
-// actually held compute before a control-plane restart erased live ownership.
-type BoundCompletionAwareRunner interface {
-	DestroyCompletedBound(
-		ctx context.Context,
-		requestID int64,
-		result, leaseID, nodeName string,
-		leaseEpoch int64,
-		outcome alloc.Phase,
-		authority CacheAuthority,
-	) error
 }
 
 // completionStore is the durable half of result-dependent teardown.
@@ -118,18 +77,6 @@ type Sweeper interface {
 	// purpose. Blocks until ctx is done.
 	KeepAlive(ctx context.Context)
 }
-
-// ErrCustody means the runner has taken responsibility for a lease's capacity,
-// so the caller must NOT release it.
-//
-// Returned from Launch when compute may exist that could not be confirmed gone.
-// Releasing then would hand the capacity back while a container is possibly
-// still running on it.
-var ErrCustody = errors.New("server: the runner is holding this lease's capacity")
-
-// ErrHolderUnavailable means result-dependent teardown has not reached the
-// process that holds the compute, so its durable completion must be retried.
-var ErrHolderUnavailable = errors.New("server: the completion holder is unavailable")
 
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
@@ -210,51 +157,12 @@ type Message struct {
 	Completed []Job
 }
 
-// Job identifies one workflow job.
-//
-// RequestID is billet's numeric scheduler identity. GitHub's positive
-// runnerRequestId is used unchanged; a direct assignment carrying zero receives
-// a durable negative id keyed by JobID, so concurrent jobs never alias at zero.
-type Job struct {
-	RequestID int64
-	RunID     int64
-	// RunnerID and RunnerName identify the pool member GitHub actually bound.
-	// They are authoritative only on JobStarted and JobCompleted messages.
-	RunnerID int64
-	// JobID is GitHub's stable workflow-job identity. It is required when the
-	// direct-assignment path sends RequestID zero.
-	JobID string
-	// CompletionID is the scale-set message that delivered the result. A
-	// redelivery keeps it; a later reuse of RequestID receives a different one.
-	CompletionID int64
-	// RunnerName is GitHub's name for the ephemeral runner. Completed messages
-	// can omit RequestID, so the billet-issued name is the durable route back to
-	// the lease and its assigned request.
-	RunnerName string
-	// Result is GitHub's conclusion on a completed-job message. It is empty on
-	// available and assigned messages.
-	Result string
-	// The GitHub event that queued this job — retained for diagnostics only. A JIT
-	// runner joins a pool before GitHub chooses its job, so event is not launch
-	// authority; the tier's static trust policy is.
-	Event string
-	// Owner, Repository and WorkflowRef are GitHub's authenticated cache scope.
-	// They come from the scale-set assignment, never from a workflow-controlled
-	// environment variable or by decoding the Actions runtime token.
-	Owner       string
-	Repository  string
-	WorkflowRef string
-	// JobName is the job's display name, kept for people to read and never
-	// consulted for a decision.
-	JobName string
-}
-
 // identityWriteLimit bounds one job-identity write, which is a diagnostic on
 // the poll path.
 const identityWriteLimit = 2 * time.Second
 
 // historyJob is what a message said about its job, as job_history keeps it.
-func (j Job) historyJob() alloc.HistoryJob {
+func historyJob(j Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
 		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
 }
@@ -5435,7 +5343,7 @@ func (l *Listener) recordJobIdentity(ctx context.Context, leaseID string, job Jo
 	}
 	ctx, cancel := context.WithTimeout(ctx, identityWriteLimit)
 	defer cancel()
-	if err := l.alloc.RecordJobIdentity(ctx, leaseID, job.historyJob()); err != nil {
+	if err := l.alloc.RecordJobIdentity(ctx, leaseID, historyJob(job)); err != nil {
 		l.log.Warn("could not record which github job a lease ran; its history row "+
 			"will not name the repository, workflow or job",
 			"tier", l.tier, "lease", leaseID, "job", job.JobID, "error", err)

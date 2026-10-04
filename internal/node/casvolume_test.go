@@ -19,9 +19,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/node/reapi"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // deviceVolumes is a mount manager that gives every device a directory of its
@@ -231,7 +231,7 @@ func TestACASVolumePublishesAndMergesIntoTheNewestGeneration(t *testing.T) {
 				}
 			}
 
-			if err := service.SettleCompleted(t.Context(), instance, true, server.CacheAuthority{}); err != nil {
+			if err := service.SettleCompleted(t.Context(), instance, true, dispatch.CacheAuthority{}); err != nil {
 				t.Fatalf("SettleCompleted: %v", err)
 			}
 			if err := service.Close(t.Context(), instance); err != nil {
@@ -458,7 +458,7 @@ func putObject(t *testing.T, service *CacheService, token, body string) int {
 func finish(t *testing.T, service *CacheService, instance string) {
 	t.Helper()
 
-	if err := service.SettleCompleted(t.Context(), instance, true, server.CacheAuthority{}); err != nil {
+	if err := service.SettleCompleted(t.Context(), instance, true, dispatch.CacheAuthority{}); err != nil {
 		t.Fatalf("SettleCompleted: %v", err)
 	}
 	if err := service.Close(t.Context(), instance); err != nil {
