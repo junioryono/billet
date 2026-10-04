@@ -3,6 +3,7 @@ package nodeclient_test
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,13 +16,16 @@ import (
 // The compute below never stops holding, so a drain would never end; the handoff
 // returns without waiting, destroys nothing, and does not move the work into
 // custody either, because nobody is superseding this node: the next process of it
-// adopts what it finds when it registers.
+// adopts what it finds when it registers. It does withdraw, so the plane stops
+// placing on it at once rather than when its silence runs out, and the cache it
+// was asked to start serving was started, once, after it registered.
 func TestANodeSetToHandOverStopsWithoutWaitingOrDestroying(t *testing.T) {
 	t.Parallel()
 
-	_, c := harness(t)
+	plane, c := harness(t)
 
 	compute := &fakeCompute{holding: true}
+	var ready atomic.Int32
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -40,10 +44,12 @@ func TestANodeSetToHandOverStopsWithoutWaitingOrDestroying(t *testing.T) {
 			// An hour, so a drain could not end on its own inside this test.
 			DrainTimeout:   time.Hour,
 			HandOverOnStop: true,
+			Ready:          func() { ready.Add(1) },
 		})
 	}()
 
 	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+	waitFor(t, func() bool { return ready.Load() == 1 })
 
 	cancel()
 
@@ -55,6 +61,13 @@ func TestANodeSetToHandOverStopsWithoutWaitingOrDestroying(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a node set to hand over waited for the compute it holds")
+	}
+
+	if nodes := plane.Nodes(); len(nodes) != 0 {
+		t.Errorf("the handoff did not withdraw; the plane still places on %v", nodes)
+	}
+	if got := ready.Load(); got != 1 {
+		t.Errorf("Ready ran %d times, want once", got)
 	}
 
 	_, _, destroyed := compute.snapshot()

@@ -167,6 +167,13 @@ type LoopOptions struct {
 	// different leases are safe to run together.
 	LaunchConcurrency int
 
+	// Ready is called once, after the first registration whose recovery
+	// succeeded, which is the first moment this process can answer for the
+	// compute on its host. The node's guest cache starts serving there: a
+	// handed-over guest asking earlier would be judged by a process the control
+	// plane does not know yet (#374). Nil does nothing.
+	Ready func()
+
 	// RegistrationRecordPath is where the node publishes its registration
 	// record after every successful registration (see record.go), or empty to
 	// publish nothing, which is what a Mac's launch agent passes: no manager
@@ -266,6 +273,11 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	if backoff <= 0 {
 		backoff = 5 * time.Second
 	}
+
+	if opts.Ready == nil {
+		opts.Ready = func() {}
+	}
+	opts.Ready = sync.OnceFunc(opts.Ready)
 
 	// STARTED ONCE, AFTER THE FIRST SUCCESSFUL REGISTRATION, and stopped with Run.
 	//
@@ -444,6 +456,7 @@ func register(
 		// left by an earlier process has no in-memory owner and would be discarded
 		// as unrelated.
 		startWatcher()
+		opts.Ready()
 
 		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {

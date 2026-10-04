@@ -1705,7 +1705,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 
-	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client,
+	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client,
 		nodeCacheStopGrace(handOver))
 	if err != nil {
 		return err
@@ -1796,6 +1796,9 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		SweepEvery:                5 * time.Minute,
 		DrainTimeout:              drainTimeout,
 		HandOverOnStop:            handOver,
+		// THE GUEST CACHE ANSWERS ONCE THIS PROCESS IS REGISTERED AND RECOVERED;
+		// until then its connections wait in the listener's queue.
+		Ready: serveCache,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
 		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
@@ -1931,54 +1934,58 @@ func startNodeCache(
 	deployment string,
 	cachePolicy nodeCacheControl,
 	stopGrace time.Duration,
-) (*node.CacheService, func(), error) {
+) (*node.CacheService, func(), func(), error) {
 	if cfg.Node.Cache == nil {
-		return nil, func() {}, nil
+		return nil, func() {}, func() {}, nil
 	}
 
 	attacher, ok := p.(provider.VolumeAttacher)
 	if !ok {
-		return nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
+		return nil, nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
 			cfg.Node.Provider)
 	}
 	var storage storecontract.Store
 	switch cfg.Node.Provider {
 	case config.ProviderFirecracker:
 		if cfg.Node.Ceph == nil {
-			return nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
+			return nil, nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
 		var err error
 		storage, err = ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(cacheSessionNames(cfg)))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	case config.ProviderEC2:
 		if cfg.Node.EBSS3 == nil {
-			return nil, nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
+			return nil, nil, nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
 		}
 		var err error
 		storage, err = ebss3.New(*cfg.Node.EBSS3,
 			cacheNamespace(deployment, cfg.Node.Site), awscreds.Default())
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	default:
-		return nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
+		return nil, nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
 	}
 
 	service, err := node.NewCacheService(cfg.Node.Cache.GuestEndpoint,
 		cacheNamespace(deployment, cfg.Node.Site), cfg.Node.StateDir, storage, attacher, slog.Default())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	service.SetActionsPolicy(cachePolicy)
 	service.SetCachePolicy(cachePolicy)
 	service.SetAuthorityReader(cachePolicy)
+	// THE MOUNTS A PREVIOUS PROCESS MADE ARE NOT HERE. The unit has a mount
+	// namespace of its own, so a recovered session's volumes are mounted again
+	// in this one before anything serves from their paths (#374).
+	service.RestoreMounts(ctx)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)
 	if err != nil {
-		return nil, nil, fmt.Errorf("listen for guest cache requests on %s: %w",
+		return nil, nil, nil, fmt.Errorf("listen for guest cache requests on %s: %w",
 			cfg.Node.Cache.Listen, err)
 	}
 
@@ -2005,19 +2012,30 @@ func startNodeCache(
 		if err != nil {
 			_ = ln.Close()
 
-			return nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
+			return nil, nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
 		}
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
 		}
 		serveListener = tls.NewListener(ln, srv.TLSConfig)
 	}
-	go func() {
-		if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
-				"error", err)
-		}
-	}()
+	// BOUND NOW, SERVED ONCE THE NODE IS READY. A failure to bind is a startup
+	// error as it always was, but nothing is answered until this process is
+	// registered and recovered: a handed-over guest's request asked earlier would
+	// be judged by a process the control plane does not know, and the kill
+	// switch reads that as disabled. Connections arriving meanwhile wait in the
+	// listener's queue.
+	var serveOnce sync.Once
+	serve := func() {
+		serveOnce.Do(func() {
+			go func() {
+				if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
+						"error", err)
+				}
+			}()
+		})
+	}
 
 	// Eviction is intentionally best effort. A cache outage may slow a job, but it
 	// must never change that job's result or stop the node from serving compute.
@@ -2088,7 +2106,10 @@ func startNodeCache(
 	slog.Default().Info("serving guest cache requests", "provider", cfg.Node.Provider,
 		"addr", ln.Addr().String())
 
-	return service, func() {
+	return service, serve, func() {
+		// A listener never served is closed here, since Shutdown closes only what
+		// Serve was given; and once this has run, serve does nothing.
+		serveOnce.Do(func() { _ = serveListener.Close() })
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopGrace)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -2107,9 +2128,15 @@ func startNodeCache(
 // connection only waits: the guest's relay redials until the next process
 // listens. A drain stops the listener after its jobs have finished, so nothing
 // is left to wait for.
+//
+// AND NO LONGER THAN A SIXTH OF THE LEASE TTL. Nothing renews the handed-over
+// leases from the withdrawal until the next process registers, and the last
+// renewal may already be a third of the TTL old (the node renews every TTL/3), so
+// this grace comes out of what the restart has left before the reaper
+// quarantines running jobs.
 func nodeCacheStopGrace(handOver bool) time.Duration {
 	if handOver {
-		return time.Minute
+		return alloc.DefaultLeaseTTL / 6
 	}
 
 	return 5 * time.Second
