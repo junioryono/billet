@@ -1462,10 +1462,13 @@ func (p *Plane) reconcileInventory(
 	return freed, nil
 }
 
-// forgetEndedAdoptions drops another process's snapshot adoption on this node once
-// the ledger says its lease ended (#374).
+// forgetEndedAdoptions drops a withdrawn process's snapshot adoption on this node
+// once the ledger says its lease ended (#374).
 //
-// ON PROOF, AND ONLY FOR ANOTHER PROCESS. Registration keeps a superseded
+// ON PROOF, AND ONLY FOR A PROCESS THAT WITHDREW. A superseded process that did
+// not withdraw may still be draining, and an ended lease does not prove its
+// cleanup is done: its heartbeats and runner removal for that lease need the
+// ownership, and nothing would give it back. Registration keeps a superseded
 // process's adoption of a quarantined lease, because the launched set leaves
 // quarantine out; when a reconciliation later ends that lease, nothing names the
 // adoption again: it carries no request id, and only a registration prunes
@@ -1484,7 +1487,8 @@ func (p *Plane) forgetEndedAdoptions(ctx context.Context, node, incarnation stri
 	p.mu.Lock()
 	candidates := make(map[string]leaseOwner)
 	for id, owner := range p.owners {
-		if owner.node == node && owner.requestID == 0 && owner.incarnation != incarnation {
+		if owner.node == node && owner.requestID == 0 && owner.incarnation != incarnation &&
+			p.withdrawn[node][owner.incarnation] {
 			candidates[id] = owner
 		}
 	}

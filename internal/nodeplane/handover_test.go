@@ -288,14 +288,16 @@ func TestAKeptAdoptionIsForgottenWhenItsLeaseEnds(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name     string
-		open     bool
-		leaseErr error
-		forgets  bool
+		name        string
+		open        bool
+		leaseErr    error
+		stillDrains bool
+		forgets     bool
 	}{
 		{name: "the lease ended", forgets: true},
 		{name: "the lease is still open", open: true},
 		{name: "the ledger could not tell", leaseErr: errors.New("ledger unavailable")},
+		{name: "the process did not withdraw", stillDrains: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -304,8 +306,10 @@ func TestAKeptAdoptionIsForgottenWhenItsLeaseEnds(t *testing.T) {
 			p := testPlane(t, WithRegistrar(ledger))
 			registerAs(t, p, "p1")
 			p.AdoptOwnershipWithInventory("n1", "p1", []string{"l7"}, true)
-			if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
-				t.Fatalf("withdraw p1: %v", err)
+			if !tc.stillDrains {
+				if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
+					t.Fatalf("withdraw p1: %v", err)
+				}
 			}
 
 			registerAs(t, p, "p2")
@@ -327,9 +331,11 @@ func TestAKeptAdoptionIsForgottenWhenItsLeaseEnds(t *testing.T) {
 			p.mu.Lock()
 			recorded := p.withdrawn["n1"]["p1"]
 			p.mu.Unlock()
-			if owned == tc.forgets || recorded == tc.forgets {
-				t.Errorf("after reconciliation: owned=%v withdrawal recorded=%v, want both %v",
-					owned, recorded, !tc.forgets)
+			if owned == tc.forgets {
+				t.Errorf("after reconciliation the adoption is owned=%v, want %v", owned, !tc.forgets)
+			}
+			if !tc.stillDrains && recorded == tc.forgets {
+				t.Errorf("after reconciliation the withdrawal is recorded=%v, want %v", recorded, !tc.forgets)
 			}
 		})
 	}
