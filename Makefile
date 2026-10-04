@@ -98,7 +98,7 @@ docs: ## Build the Sphinx documentation with warnings as errors, as Read the Doc
 
 .PHONY: lint
 lint: ## golangci-lint (pinned version), for this platform AND linux
-	golangci-lint run --timeout=5m
+	golangci-lint run --timeout=15m
 	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
 	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
 	@# file, and every branch of a platform-dependent type, is unexamined by the pass
@@ -112,7 +112,7 @@ lint: ## golangci-lint (pinned version), for this platform AND linux
 	@# (uint32), so a linux pass at this Mac's arm64 missed a conversion CI
 	@# refused as unnecessary (2026-09-09); a conversion that must exist on one
 	@# architecture and not another is spelled through a generic widening.
-	GOOS=linux GOARCH=amd64 golangci-lint run --timeout=5m
+	GOOS=linux GOARCH=amd64 golangci-lint run --timeout=15m
 
 .PHONY: lint-custom
 lint-custom: ## billet's own analyzers, and the tests that prove they still detect
@@ -142,7 +142,7 @@ lint-custom: ## billet's own analyzers, and the tests that prove they still dete
 
 .PHONY: lint-fix
 lint-fix:
-	golangci-lint run --fix --timeout=5m
+	golangci-lint run --fix --timeout=15m
 
 .PHONY: fmt
 fmt:
