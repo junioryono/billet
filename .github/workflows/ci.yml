@@ -438,7 +438,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.lint == 'true'
     runs-on: billet-8vcpu-ubuntu-2404
-    timeout-minutes: 25
+    # golangci-lint alone may take fifteen minutes on a cold, loaded guest (see
+    # run.timeout in .golangci.yml), and this job also runs the analyzers, every
+    # cross build and sqlc diff.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
 

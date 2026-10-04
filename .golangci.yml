@@ -6,7 +6,7 @@
 # Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
 # `//nolint:linter-name // reason` when an exception is genuinely justified.
 #
-# Run: golangci-lint run --timeout=5m
+# Run: golangci-lint run --timeout=15m
 #
 # PINNED VERSION: v2.12.2, matching .github/workflows/ci.yml. Install the same
 # version locally so your runs agree with CI:
@@ -17,7 +17,12 @@ version: "2"
 
 run:
   go: "1.26"
-  timeout: 5m
+  # FIFTEEN MINUTES, because the lint job runs on a billet guest whose Go build
+  # cache only warms from a job that succeeds. Measured on 2026-10-04: on a loaded
+  # host, loading packages alone outran five minutes ("context deadline exceeded"),
+  # the job failed, its cache was discarded, and the next run started just as cold.
+  # The job's own timeout-minutes still bounds a lint that hangs.
+  timeout: 15m
   modules-download-mode: readonly
 
 linters:
