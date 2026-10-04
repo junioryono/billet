@@ -139,8 +139,8 @@ Everything here is optional; [Build caches](../operating/build-caches.md) explai
 | `sticky_disks.enabled`, `sticky_disks.max_size` | `true`, `100GiB` | `actions/stickydisk` volumes; a larger request is clamped |
 | `actions.enabled`, `actions.max_archive` | on where the scope already holds, `10GiB` | the transparent Actions cache; an untrusted tier needs `default-branch`, a trusted `trusted-only` one a `cache_scope.workflow_ref` in its `workflows` |
 | `git.enabled`, `git.max_size` | `true` on Linux Firecracker, `50GiB` | the Git mirror for `github.com` fetches; a repository above the ceiling is not mirrored |
-| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker, `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
-| `go.enabled`, `go.max_size` | `true` on Linux Firecracker, `20GiB` | the Go build cache through `GOCACHEPROG` |
+| `bazel.enabled`, `bazel.max_size` | `true` on Linux Firecracker where the tier can publish it (trusted under `trusted-only`, or `default-branch`), `50GiB` | Bazel's HTTP cache and the Remote Execution API for Bazel and Buck2 |
+| `go.enabled`, `go.max_size` | `true` on Linux Firecracker where the tier can publish it, as for Bazel, `20GiB` | the Go build cache through `GOCACHEPROG` |
 | `go.test_results` | `false` | also cache `go test` results; off, the guest sets `GOFLAGS=-count=1` |
 
 A `max_size` is at most `100GiB`, and a baseline larger than a tier's ceiling is not cloned: the job starts cold. A tier an older node would exceed is placed only on a node at protocol 23 or later: every `default-branch` tier (an older node would read the pool's wider pre-#226 keys), a trusted pool publishing `off` or `default-branch`, the Docker store or sticky disks turned off or held smaller, and an Actions archive held below `10GiB`.

@@ -12,11 +12,13 @@ This page is the operator's view: what each cache is, what a tier gets without a
 | Sticky disks | on | any backend with `node.cache` |
 | Actions cache | on where its scope already holds (below) | a Linux Firecracker tier and a repository scope |
 | Git mirror | on | a Linux Firecracker tier |
-| Bazel and Buck2 | on | a Linux Firecracker tier |
-| Go build cache | on | a Linux Firecracker tier |
+| Bazel and Buck2 | on where the tier can publish it (below) | a Linux Firecracker tier |
+| Go build cache | on where the tier can publish it (below) | a Linux Firecracker tier |
 | Go test results | **off** | the Go build cache |
 
 A cache that is on by default but cannot run on a tier is simply off there: a Docker tier gets the image store and sticky disks, and a Firecracker node without `node.cache` runs its jobs cold. Only a cache a tier turns on explicitly is refused where it cannot run, because then the operator asked for something the node cannot give.
+
+The Bazel and Go caches are on by default only where the tier can publish what they hold: a trusted tier under `trusted-only`, or any tier under `default-branch`. Their keys are scoped by trust, so an untrusted tier that publishes nothing would read a key nobody writes and every build would start cold, and that is worse than no billet cache at all: `GOCACHEPROG` takes precedence over `GOCACHE`, so the build cache a workflow restores itself (`setup-go`, `golangci-lint`) would be ignored. Turn either on explicitly to have it anyway.
 
 Go test results are off because caching them lets `go test` skip a test whose inputs did not change, which changes what a job runs, not only how fast. The guest sets `GOFLAGS=-count=1` unless the tier opts in.
 
