@@ -1578,6 +1578,42 @@ log "starting $name with ${#cmd[@]} argument(s)"
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"
 
 cd /home/runner/runner
+# THE BUILD CACHES REACH THE NODE THROUGH A RELAY THAT WAITS OUT A NODE RESTART
+# (#374). A node handing over leaves this guest running while its cache listener
+# is gone until the next process starts, and a `git fetch` sent to the node's own
+# address in that gap is refused and fails the job: nothing in Git falls back.
+# The relay listens on the docker gateway, where the job and its containers can
+# both reach it, and splices each connection to the node, redialling while the
+# node is away. Everything that names the cache after this point (the runner's
+# BILLET_CACHE_ENDPOINT, the git rewrite and its credential helper, bazelrc, the
+# Go helper) names the relay. The Docker image store was attached above, before
+# Docker, and keeps the node's own address. Only a plain-HTTP endpoint: an https
+# one names the node in its certificate, so it is left direct, and so is any
+# endpoint whose relay does not start.
+cache_relay_port=41322
+# BILLET_CACHE_RELAY_BEGIN
+if [ -n "$cache_endpoint" ] && [ "${cache_endpoint%%://*}" = http ]; then
+	if ! relay_bridge=$(ip -4 -o addr show docker0 2>/dev/null |
+		awk 'NR == 1 {split($4, a, "/"); print a[1]}'); then
+		relay_bridge=""
+	fi
+	if [ -x /usr/bin/python3 ] && [ "$relay_bridge" = "$docker_gateway" ] &&
+		systemd-run --quiet --unit=billet-cache-relay --collect --uid=runner --gid=runner \
+			--property=Type=notify --property=NotifyAccess=main --property=TimeoutStartSec=5s \
+			--property=Restart=always --property=RestartSec=100ms \
+			--socket-property=ListenStream="$docker_gateway:$cache_relay_port" \
+			--socket-property=Accept=no --socket-property=FlushPending=no \
+			/usr/bin/python3 /usr/local/bin/billet-actions-proxy \
+			--mode node-relay --systemd-socket --upstream "${cache_endpoint%/}" &&
+		systemctl start billet-cache-relay.service 2>/dev/null; then
+		cache_endpoint="http://$docker_gateway:$cache_relay_port"
+	else
+		log "the cache relay did not start; the build caches name the node directly and a node restart during this job fails a git fetch that lands in it"
+		systemctl stop billet-cache-relay.socket billet-cache-relay.service 2>/dev/null || true
+	fi
+fi
+# BILLET_CACHE_RELAY_END
+
 # RUNNER_TOOL_CACHE IS PASSED THROUGH THE exec, not left to the environment.
 #
 # /etc/environment is read by PAM for login sessions and does NOT apply to systemd
@@ -1630,10 +1666,12 @@ if [ -r "$IMAGE_ENV_FILE" ]; then
 		esac
 	done <"$IMAGE_ENV_FILE"
 fi
+# BILLET_CACHE_ENV_BEGIN
 if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
 fi
+# BILLET_CACHE_ENV_END
 # THE BUILD CACHES, each configured only when the node offered it AND this image
 # carries billet to serve it; an image without the binary builds cold rather than
 # naming a GOCACHEPROG the go command cannot start, which fails every build. The
@@ -1748,6 +1786,7 @@ set -e
 systemctl stop billet-actions-proxy.socket billet-actions-proxy.service 2>/dev/null || true
 systemctl stop billet-actions-cache-adapter.socket \
 	billet-actions-cache-adapter.service 2>/dev/null || true
+systemctl stop billet-cache-relay.socket billet-cache-relay.service 2>/dev/null || true
 
 /usr/local/bin/billet-docker-cache complete "$job_status"
 
