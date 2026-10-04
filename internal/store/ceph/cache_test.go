@@ -913,7 +913,9 @@ func TestACacheLockWaiterCreatesTheIndexOnlyUntilItHasSeenIt(t *testing.T) {
 	// deployment whose index was removed.
 	f.lockAddErr = cacheExitError{code: 2, message: "exit status 2"}
 	f.lockAddErrOn = f.lockAdds + 1
-	_ = c.withCacheLock(t.Context(), now, func(time.Time) error { return nil })
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error { return nil }); err == nil {
+		t.Fatal("withCacheLock succeeded although `lock add` answered ENOENT, so the index was never seen to go")
+	}
 	f.lockAddErr = nil
 
 	before := creates()
@@ -3293,15 +3295,27 @@ func TestHalfRemovedFailuresAtTheFrontDoNotStarveTheRest(t *testing.T) {
 	}
 	c.clock = func() time.Time { return clock }
 
-	_, _ = c.PurgeTrash(t.Context())
+	// The first pass only dates the half-removed images.
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("the first pass: %v", err)
+	}
 	clock = clock.Add(2 * halfRemovedRecheck)
 
-	// The two failures at the front spend the second pass's budget.
-	if n, _ := c.PurgeTrash(t.Context()); n != 0 {
+	// The two failures at the front spend the second pass's budget, and are
+	// reported rather than swallowed.
+	n, err := c.PurgeTrash(t.Context())
+	if err == nil || !strings.Contains(err.Error(), failing[0]) {
+		t.Fatalf("the second pass reported %v, want the failure finishing %s", err, failing[0])
+	}
+	if n != 0 {
 		t.Fatalf("the second pass finished %d, want 0: the two failures spend its budget", n)
 	}
 
-	if n, _ := c.PurgeTrash(t.Context()); n != 2 {
+	n, err = c.PurgeTrash(t.Context())
+	if err == nil || !strings.Contains(err.Error(), failing[0]) {
+		t.Fatalf("the third pass reported %v, want the failure finishing %s again", err, failing[0])
+	}
+	if n != 2 {
 		t.Fatalf("the third pass finished %d, want the 2 images after the failures", n)
 	}
 	for _, image := range half[2:] {
