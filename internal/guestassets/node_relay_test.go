@@ -112,7 +112,39 @@ while True:
 assert answer.endswith(b"hello"), answer
 client.close()
 
-# 3. A CLIENT THAT HAS GONE STOPS THE WAIT at once.
+# 3. A CLIENT THAT SENT ITS REQUEST AND HUNG UP GIVES ITS SLOT BACK while the node
+# is still away, so it cannot hold the relay's bound through an outage. Its own
+# relay, toward a node that is not there, with the one slot the bound allows.
+if hasattr(proxy.select, "POLLRDHUP"):
+    away_port, other_relay = free_port(), free_port()
+    sys.argv = ["billet-actions-proxy", "--mode", "node-relay",
+                "--listen", "127.0.0.1:%d" % other_relay,
+                "--upstream", "http://127.0.0.1:%d" % away_port]
+    threading.Thread(target=proxy.main, daemon=True).start()
+    relay_port = other_relay
+
+    refused.clear()
+    gone = connect()
+    gone.sendall(b"GET /v1/git/gone HTTP/1.0\r\n\r\n")
+    assert refused.wait(10), "the relay never dialled the absent node"
+    gone.close()
+    threading.Event().wait(1)
+
+    waiting = connect()
+    waiting.sendall(b"GET /v1/git/x HTTP/1.0\r\n\r\n")
+    node = socket.create_server(("127.0.0.1", away_port))
+    threading.Thread(target=serve_node, daemon=True).start()
+    waiting.settimeout(15)
+    answer = b""
+    while True:
+        chunk = waiting.recv(4096)
+        if not chunk:
+            break
+        answer += chunk
+    assert answer.endswith(b"hello"), ("a client that hung up kept its slot", answer)
+    waiting.close()
+
+# 4. A CLIENT THAT HAS GONE STOPS THE WAIT at once.
 slept = []
 try:
     proxy.dial_node(("127.0.0.1", free_port()), wait=60, retry=1,
@@ -122,7 +154,7 @@ except OSError:
     pass
 assert slept == [], slept
 
-# 4. A NODE THAT NEVER COMES BACK STILL ENDS THE WAIT.
+# 5. A NODE THAT NEVER COMES BACK STILL ENDS THE WAIT.
 clock = [0.0]
 def now():
     return clock[0]
@@ -136,7 +168,7 @@ except OSError:
     pass
 assert 3 <= len(slept) <= 5, slept
 
-# 5. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
+# 6. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
 assert proxy.node_endpoint("http://172.31.0.1:7718") == ("172.31.0.1", 7718)
 for bad in ("https://172.31.0.1:7718", "http://172.31.0.1", "172.31.0.1:7718"):
     try:

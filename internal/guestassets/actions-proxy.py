@@ -699,8 +699,21 @@ def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sle
 
 
 def client_gone(client):
-    """Whether the client has closed, without consuming anything it sent."""
+    """Whether the client has hung up, without consuming anything it sent.
+
+    A peek alone cannot tell: a client that sent its request and then closed
+    leaves that request ahead of the end, so every peek reads its first byte and
+    the hangup is never seen, and such clients would hold every slot through an
+    outage. Linux reports the hangup itself as POLLRDHUP, whatever is queued. A
+    client that only half-closes counts as gone; no HTTP client this relays does
+    that. Elsewhere (a development host) the peek is the best answer there is.
+    """
     try:
+        hangup = getattr(select, "POLLRDHUP", 0)
+        if hangup and hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(client, hangup | select.POLLHUP | select.POLLERR)
+            return bool(poller.poll(0))
         readable, _, _ = select.select([client], [], [], 0)
         return bool(readable) and not client.recv(1, socket.MSG_PEEK)
     except OSError:
