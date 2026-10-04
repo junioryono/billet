@@ -151,6 +151,10 @@ type LoopOptions struct {
 	// that wait but the work finishing or a second signal. Zero uses a default of
 	// six hours, which is how long GitHub lets a job run.
 	DrainTimeout time.Duration
+	// HandOverOnStop makes a stop while compute is held leave it running for the
+	// next node process to adopt, instead of waiting for it (node.stop: handoff,
+	// #374). It is the second signal's ending, taken at once.
+	HandOverOnStop bool
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
@@ -561,6 +565,19 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 	// Nil for the same reason as the two paths below: this is the shutdown
 	// succeeding, and the caller turns what comes back into a process exit status.
 	if !compute.Holding() {
+		withdraw(ctx, c, log, opts)
+
+		return nil
+	}
+
+	// A HANDOFF ENDS HERE, exactly as a second signal ends the wait below: the
+	// compute keeps running, its leases stay charged, the host leaves placement,
+	// and the next node process adopts what it finds (Recover runs at every
+	// registration). The VMMs live in cgroups of their own, outside the unit's,
+	// so stopping the service does not stop them.
+	if opts.HandOverOnStop {
+		log.Info("handing over to the next node process: the compute running here keeps " +
+			"running and is adopted when billet node starts again")
 		withdraw(ctx, c, log, opts)
 
 		return nil

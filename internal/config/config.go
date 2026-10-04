@@ -641,6 +641,10 @@ type NodeConfig struct {
 	// Separate from the control plane's key: the two are restarted for different
 	// reasons and need not wait the same amount of time.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
+	// Stop is what a SIGTERM does while this node holds compute: "drain" (the
+	// default) waits for it, "handoff" leaves it running for the next node process
+	// to adopt. See NodeConfig.HandsOverOnStop.
+	Stop string `yaml:"stop,omitempty"`
 }
 
 // NodeCacheConfig exposes storage to one guest through short-lived credentials.
@@ -3946,6 +3950,10 @@ func (c *Config) validateNode() []error {
 	// later when a wedged container needed reclaiming and the bound turned out to
 	// be unparseable.
 	if _, err := c.Node.DrainTimeoutDuration(); err != nil {
+		errs = append(errs, err)
+	}
+
+	if _, err := c.Node.HandsOverOnStop(); err != nil {
 		errs = append(errs, err)
 	}
 

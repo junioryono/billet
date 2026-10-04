@@ -1758,6 +1758,10 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	if err != nil {
 		return err
 	}
+	handOver, err := cfg.Node.HandsOverOnStop()
+	if err != nil {
+		return err
+	}
 
 	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
 	// re-registers, and a node that came back reporting a different contribution
@@ -1790,6 +1794,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		Identity:                  identity,
 		SweepEvery:                5 * time.Minute,
 		DrainTimeout:              drainTimeout,
+		HandOverOnStop:            handOver,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
 		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
