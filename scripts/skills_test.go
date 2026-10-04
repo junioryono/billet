@@ -57,7 +57,7 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 
 	dropped := readDropped(t)
 
-	said := map[string]bool{}
+	texts := make([]string, 0, 64)
 
 	for _, path := range skillMarkdown(t, root) {
 		raw, err := os.ReadFile(path)
@@ -65,10 +65,27 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 			t.Fatalf("read %s: %v", path, err)
 		}
 
-		for _, unit := range skillUnits(string(raw)) {
+		texts = append(texts, string(raw))
+	}
+
+	for _, problem := range corpusProblems(corpus, dropped, texts) {
+		t.Error(problem)
+	}
+}
+
+// corpusProblems is the whole decision: each corpus unit must be a whole unit of
+// one of the texts, or be dropped with a reason, and nothing may be dropped that
+// is still said or that names no unit.
+func corpusProblems(corpus []string, dropped map[string]string, texts []string) []string {
+	said := map[string]bool{}
+
+	for _, text := range texts {
+		for _, unit := range skillUnits(text) {
 			said[unit] = true
 		}
 	}
+
+	var problems []string
 
 	known := make(map[string]bool, len(corpus))
 
@@ -77,23 +94,27 @@ func TestEverySkillSentenceIsKeptOrDroppedWithAReason(t *testing.T) {
 		known[hash] = true
 
 		_, droppedOnPurpose := dropped[hash]
-		kept := said[unit]
 
-		switch {
+		switch kept := said[unit]; {
 		case kept && droppedOnPurpose:
-			t.Errorf("%s lists %s as dropped, but the skills still say it: %q", skillDroppedPath, hash,
-				excerpt(unit))
+			problems = append(problems, fmt.Sprintf("%s lists %s as dropped, but the skills still say it: %q",
+				skillDroppedPath, hash, excerpt(unit)))
 		case !kept && !droppedOnPurpose:
-			t.Errorf("a skill no longer says this, and %s gives no reason (add `%s <reason>`): %q",
-				skillDroppedPath, hash, excerpt(unit))
+			problems = append(problems, fmt.Sprintf("a skill no longer says this, and %s gives no reason "+
+				"(add `%s <reason>`): %q", skillDroppedPath, hash, excerpt(unit)))
 		}
 	}
 
 	for hash := range dropped {
 		if !known[hash] {
-			t.Errorf("%s names %s, which is no unit of the corpus", skillDroppedPath, hash)
+			problems = append(problems, fmt.Sprintf("%s names %s, which is no unit of the corpus",
+				skillDroppedPath, hash))
 		}
 	}
+
+	slices.Sort(problems)
+
+	return problems
 }
 
 // THE SKILLS FOLLOW THE RULES THE REPOSITORY STATES ABOUT THEM.
@@ -187,36 +208,81 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 		t.Errorf("units = %q, want %q", got, want)
 	}
 
-	// A sentence that contains a rule while reversing it does not keep the rule.
-	reversed := skillUnits("It is no longer true that SQLite must be on local storage.\n")
-	if slices.Contains(reversed, "SQLite must be on local storage.") {
-		t.Error("a sentence reversing a rule was counted as saying it")
+	// The corpus decision itself: a unit is kept only as a whole unit, so a
+	// sentence that contains a rule while reversing it does not keep it.
+	rule := []string{"SQLite must be on local storage."}
+	for text, want := range map[string]int{
+		"Some prose. SQLite must be on local storage.\n":               0,
+		"It is no longer true that SQLite must be on local storage.\n": 1,
+		"Nothing here.\n": 1,
+	} {
+		if got := corpusProblems(rule, nil, []string{text}); len(got) != want {
+			t.Errorf("%q: %d corpus problems %q, want %d", text, len(got), got, want)
+		}
 	}
 
-	// One strict YAML document, and nothing hidden after it.
-	if _, err := parseFrontmatter("---\nname: x\ndescription: y\n...\n--- # second\nother: [\n---\nbody\n"); err == nil {
-		t.Error("a second YAML document after the frontmatter was accepted")
+	droppedRule := map[string]string{unitHash(rule[0]): "superseded"}
+	if got := corpusProblems(rule, droppedRule, []string{"Nothing here.\n"}); len(got) != 0 {
+		t.Errorf("a unit dropped with a reason was still reported: %q", got)
+	}
+
+	if got := corpusProblems(rule, droppedRule, []string{rule[0] + "\n"}); len(got) != 1 {
+		t.Errorf("a unit dropped while still said was not reported: %q", got)
+	}
+
+	// Code is meaning, not layout: neither a fenced line nor an inline span is
+	// normalised, so two different commands never become one unit.
+	stars := skillUnits("```\nprintf '%s\\n' '**'\n```\n")
+	empty := skillUnits("```\nprintf '%s\\n' ''\n```\n")
+
+	if slices.Equal(stars, empty) {
+		t.Errorf("two different code lines became the same unit: %q", stars)
+	}
+
+	if got, want := normaliseSkillText("- **A**  rule `x  **y**` here"), "A rule `x  **y**` here"; got != want {
+		t.Errorf("normalised to %q, want %q", got, want)
+	}
+
+	// One strict YAML document, and nothing after it, whether the second parses
+	// or not.
+	for fm, says := range map[string]string{
+		"---\nname: x\ndescription: y\n...\n--- # second\nother: [\n---\nbody\n": "continues past",
+		"---\nname: x\ndescription: y\n--- # second\nname: z\n---\nbody\n":       "holds a second YAML document",
+	} {
+		if _, err := parseFrontmatter(fm); err == nil || !strings.Contains(err.Error(), says) {
+			t.Errorf("%q: refused with %v, want an error saying %q", fm, err, says)
+		}
 	}
 
 	if _, err := parseFrontmatter("---\nname: x\ndescription: y\n---\nbody\n"); err != nil {
 		t.Errorf("one plain document was refused: %v", err)
 	}
 
-	// A link is judged by where it resolves, and a mention is not a link.
+	// A link is judged by where it resolves, in every form Markdown spells one,
+	// and neither a mention nor a link shown in code is a link.
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "references"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "references", "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "references", "leases.md"), []byte("x.\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"leases.md", filepath.Join("sub", "rules.md")} {
+		if err := os.WriteFile(filepath.Join(dir, "references", name), []byte("x.\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 
+	both := " and [r](references/sub/rules.md)."
 	for skill, want := range map[string]int{
-		"See [leases](references/leases.md).":                                                      0,
-		"See [leases](../other/references/leases.md).":                                             2, // missing, and the real file unlinked
-		"See references/leases.md, which nothing links.":                                           1,
-		"See [leases](references/leases.md#section) and [x](https://example.com/references/y.md).": 0,
+		"See [leases](references/leases.md)" + both:                                                      0,
+		"See [leases](<references/leases.md> \"title\")" + both:                                          0,
+		"See [leases][l]" + both + "\n\n[l]: references/leases.md\n":                                     0,
+		"See [leases](references/leases.md#section) and [x](https://example.com/references/y.md)" + both: 0,
+		"See [leases](../other/references/leases.md)" + both:                                             2, // missing; real file unlinked
+		"See references/leases.md, which nothing links" + both:                                           1,
+		"See [gone](references/gone.md \"title\") and [l](references/leases.md)" + both:                  1,
+		"See [gone][g] and [l](references/leases.md)" + both + "\n\n[g]: references/gone.md\n":           1,
+		"See [leases](references/leases.md) and [sub](references/sub).":                                  2, // a directory; its file unlinked
+		"See `[leases](references/leases.md)`" + both:                                                    1, // shown in code, not linked
 	} {
 		if got := referenceProblems(dir, skill); len(got) != want {
 			t.Errorf("%q: %d problems %q, want %d", skill, len(got), got, want)
@@ -262,8 +328,8 @@ func skillMarkdown(t *testing.T, root string) []string {
 }
 
 // skillUnits splits a skill into the units the corpus records: each sentence of
-// prose and each line of code, normalised. Frontmatter and headings are left
-// out, because the rewrite replaces them by design.
+// prose and each line of code. Frontmatter and headings are left out, because
+// the rewrite replaces them by design.
 func skillUnits(text string) []string {
 	var units []string
 
@@ -278,9 +344,11 @@ func skillUnits(text string) []string {
 			continue
 		}
 
+		// A line of code is kept as written, less its indentation: emphasis
+		// markers and runs of spaces inside code are meaning, not layout.
 		if inFence {
-			if unit := normaliseSkillText(trimmed); unit != "" {
-				units = append(units, unit)
+			if trimmed != "" {
+				units = append(units, trimmed)
 			}
 
 			continue
@@ -301,21 +369,29 @@ func skillUnits(text string) []string {
 }
 
 var (
-	listMarker   = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
-	markdownLink = regexp.MustCompile(`\]\(([^)\s#]+)(?:#[^)]*)?\)`)
-	notProse     = regexp.MustCompile(`^(?:[-*+]\s|\d+\.\s|#|\||>)`)
-	tableRule    = regexp.MustCompile(`^\|?\s*:?-{3,}`)
-	spaces       = regexp.MustCompile(`\s+`)
+	listMarker = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
+	inlineLink = regexp.MustCompile(`\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)`)
+	linkDef    = regexp.MustCompile(`(?m)^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)`)
+	mention    = regexp.MustCompile(`[A-Za-z0-9._/-]*references/[A-Za-z0-9._/-]+`)
+	url        = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://\S+`)
+	codeSpan   = regexp.MustCompile("`[^`]*`")
+	notProse   = regexp.MustCompile(`^(?:[-*+]\s|\d+\.\s|#|\||>)`)
+	tableRule  = regexp.MustCompile(`^\|?\s*:?-{3,}`)
+	spaces     = regexp.MustCompile(`\s+`)
 )
 
 // normaliseSkillText removes what a restructure changes without changing what a
-// sentence says: emphasis markers, a leading list marker, and runs of spaces.
+// sentence says: a leading list marker, and outside inline code, emphasis
+// markers and runs of spaces. Inside backticks everything is kept.
 func normaliseSkillText(line string) string {
-	line = strings.ReplaceAll(line, "**", "")
-	line = strings.TrimSpace(line)
-	line = listMarker.ReplaceAllString(line, "")
+	line = listMarker.ReplaceAllString(strings.TrimSpace(line), "")
 
-	return strings.TrimSpace(spaces.ReplaceAllString(line, " "))
+	parts := strings.Split(line, "`")
+	for i := 0; i < len(parts); i += 2 {
+		parts[i] = spaces.ReplaceAllString(strings.ReplaceAll(parts[i], "**", ""), " ")
+	}
+
+	return strings.TrimSpace(strings.Join(parts, "`"))
 }
 
 // splitSentences breaks after ., ! or ? (and any closing quote, bracket or
@@ -505,46 +581,105 @@ func checkReferencesAreLinked(t *testing.T, dir, name, skill string) {
 	}
 }
 
-// referenceProblems compares a SKILL.md's Markdown links, resolved against its
-// directory, with the files in its references/ directory: every relative link
-// must name a file that exists, and every reference file must be the
-// destination of a link, not merely a name the text mentions.
+// referenceProblems compares a SKILL.md's links with its references/ directory.
+// Code is taken out first, since a link shown in code is not a link. Every
+// relative link destination (inline, image or reference definition) and every
+// path that names references/ must resolve to a regular file, and every file
+// under references/, at any depth, must be the destination of a link, not
+// merely a name the text mentions.
 func referenceProblems(dir, skill string) []string {
 	var problems []string
 
+	text := codeSpan.ReplaceAllString(withoutFences(skill), "")
 	linked := map[string]bool{}
 
-	for _, m := range markdownLink.FindAllStringSubmatch(skill, -1) {
-		dest := m[1]
-		if strings.Contains(dest, "://") || strings.HasPrefix(dest, "mailto:") {
+	var dests []string
+	for _, m := range inlineLink.FindAllStringSubmatch(text, -1) {
+		dests = append(dests, m[1])
+	}
+
+	for _, m := range linkDef.FindAllStringSubmatch(text, -1) {
+		dests = append(dests, m[1])
+	}
+
+	for _, dest := range dests {
+		dest = strings.TrimSuffix(strings.TrimPrefix(dest, "<"), ">")
+		dest, _, _ = strings.Cut(dest, "#")
+
+		if dest == "" || strings.Contains(dest, "://") || strings.HasPrefix(dest, "mailto:") {
 			continue
 		}
 
 		resolved := filepath.Clean(filepath.Join(dir, dest))
 		linked[resolved] = true
 
-		if _, err := os.Stat(resolved); err != nil {
-			problems = append(problems, fmt.Sprintf("SKILL.md links %s, which cannot be read: %v", dest, err))
+		if problem := notARegularFile(resolved); problem != "" {
+			problems = append(problems, fmt.Sprintf("SKILL.md links %s, which %s", dest, problem))
 		}
 	}
 
-	refs, err := os.ReadDir(filepath.Join(dir, "references"))
-	if os.IsNotExist(err) {
-		return problems
-	}
+	// A path the prose names outside any link, and outside any URL.
+	prose := url.ReplaceAllString(linkDef.ReplaceAllString(inlineLink.ReplaceAllString(text, "]"), ""), "")
 
-	if err != nil {
-		return append(problems, fmt.Sprintf("read references: %v", err))
-	}
-
-	for _, ref := range refs {
-		if !linked[filepath.Join(dir, "references", ref.Name())] {
-			problems = append(problems, fmt.Sprintf("references/%s is the destination of no link in SKILL.md, "+
-				"so no session loads it", ref.Name()))
+	for _, path := range mention.FindAllString(prose, -1) {
+		if problem := notARegularFile(filepath.Join(dir, path)); problem != "" {
+			problems = append(problems, fmt.Sprintf("SKILL.md names %s, which %s", path, problem))
 		}
+	}
+
+	err := filepath.WalkDir(filepath.Join(dir, "references"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.Type().IsRegular() && !linked[path] {
+			rel, _ := filepath.Rel(dir, path) //nolint:errcheck // path is under dir; the message only names it.
+			problems = append(problems, fmt.Sprintf("%s is the destination of no link in SKILL.md, so no "+
+				"session loads it", rel))
+		}
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		problems = append(problems, fmt.Sprintf("walk references: %v", err))
 	}
 
 	return problems
+}
+
+// notARegularFile says why path is not a readable regular file, or "".
+func notARegularFile(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Sprintf("cannot be read: %v", err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return "is not a regular file"
+	}
+
+	return ""
+}
+
+// withoutFences drops fenced code blocks.
+func withoutFences(text string) string {
+	var out []string
+
+	inFence := false
+
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+
+			continue
+		}
+
+		if !inFence {
+			out = append(out, line)
+		}
+	}
+
+	return strings.Join(out, "\n")
 }
 
 func readCorpus(t *testing.T) []string {
