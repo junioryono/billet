@@ -7,7 +7,7 @@ description: "Load when adding a route, a command kind or a field to a wire type
 
 ## What this area is
 
-A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `server.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `cmd/billet/handshakelistener.go` bounds connections on the real wire.
+A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `dispatch.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `cmd/billet/handshakelistener.go` bounds connections on the real wire.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`/v1/register` authenticates before it reads a body.**
 - **A registration discards the host's barrier run before the request is judged.**
 - **Incarnation and epoch are different fences.**
+- **A withdrawn process's leases move to the node's next process when it adopts them (#374).**
 - **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
 - **Placement reads do not hold the shared plane mutex.**
 

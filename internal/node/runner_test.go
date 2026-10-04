@@ -15,9 +15,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 	storecontract "github.com/junioryono/billet/internal/store"
@@ -228,7 +228,7 @@ func TestGitHubSuccessResultPublishesTheDockerStore(t *testing.T) {
 		runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
 	}
 	destroyed := make(chan error, 1)
-	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "succeeded", server.CacheAuthority{}) }()
+	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "succeeded", dispatch.CacheAuthority{}) }()
 
 	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
@@ -283,7 +283,7 @@ func TestGitHubNonSuccessResultsDoNotPublishTheDockerStore(t *testing.T) {
 				},
 				runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
 			}
-			if err := runner.DestroyCompleted(t.Context(), 11, result, server.CacheAuthority{}); err != nil {
+			if err := runner.DestroyCompleted(t.Context(), 11, result, dispatch.CacheAuthority{}); err != nil {
 				t.Fatalf("DestroyCompleted: %v", err)
 			}
 			// THE DISCARD IS NOT ON THE TEARDOWN PATH: the teardown only closes the
@@ -432,7 +432,7 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 
 	err := r.Destroy(t.Context(), 11)
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy answered %v; a teardown the backend only ACCEPTED must answer "+
 			"ErrCustody, or the listener releases the lease and another job starts while "+
 			"this guest is still running", err)
@@ -501,7 +501,7 @@ func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 
@@ -531,7 +531,7 @@ func TestAHostTeardownKeepsItsLaunchObservation(t *testing.T) {
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 15, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 15); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 15); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	p.settle(provider.InstanceName(lease.ID))
@@ -559,7 +559,7 @@ func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testi
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 12, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 12); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 12); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 
@@ -603,7 +603,7 @@ func TestARemoteSightingNeedsSustainedAbsence(t *testing.T) {
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 13, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 13); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 13); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	if err := r.Tend(t.Context()); err != nil {
@@ -673,7 +673,7 @@ func TestErrorsBeforeAFirstRemoteMissDoNotAgeTheAbsence(t *testing.T) {
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 14, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 14); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 14); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	p.settle(provider.InstanceName(lease.ID))
@@ -713,7 +713,7 @@ func TestAnAmbiguousLaunchCarriesItsFirstAbsentObservationIntoCustody(t *testing
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 
-	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 16, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 16, Event: "push"}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 	held := r.custodySnapshot()
@@ -737,7 +737,7 @@ func TestAnAmbiguousLaunchCarriesItsPositiveObservationIntoCustody(t *testing.T)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 17, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 17, Event: "push"}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 	held := r.custodySnapshot()
@@ -760,7 +760,7 @@ func TestFailedLaunchRemovesRegistrationBeforeComputeCleanup(t *testing.T) {
 	lease := assignedLease(t, a)
 	name := provider.InstanceName(lease.ID)
 
-	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 18, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 18, Event: "push"}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 	if len(jit.removed) != 1 || jit.removed[0] != name {
@@ -800,7 +800,7 @@ func TestRestartedFailedLaunchRemovesDurableRegistrationBeforeCompute(t *testing
 
 	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
 		RequestID: lease.RequestID, Event: "push",
-	}); !errors.Is(err, server.ErrCustody) {
+	}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 
@@ -811,7 +811,7 @@ func TestRestartedFailedLaunchRemovesDurableRegistrationBeforeCompute(t *testing
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, server.ErrCustody) {
+	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody while deregistration is unavailable", err)
 	}
 	if len(p.destroyed) != 0 || p.live[name] == nil {
@@ -846,7 +846,7 @@ func TestAnOperatorCanForceAVisibleTeardownThroughItsLiveNode(t *testing.T) {
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 81, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := r.Destroy(t.Context(), 81); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 81); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	if err := r.Tend(t.Context()); err != nil {
@@ -897,7 +897,7 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
-	if err := first.Destroy(t.Context(), 81); !errors.Is(err, server.ErrCustody) {
+	if err := first.Destroy(t.Context(), 81); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	if err := first.Tend(t.Context()); err != nil {
@@ -940,14 +940,14 @@ func TestASecondDestroyForHeldComputeStillReportsCustody(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("the first Destroy answered %v, want ErrCustody", err)
 	}
 
 	// The guest is STILL shutting down, so nothing has changed about what is
 	// known — and the answer must not change either.
 	err := r.Destroy(t.Context(), 11)
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("a second Destroy answered %v while the guest was still shutting down; the "+
 			"caller reads that as proof and releases the capacity", err)
 	}
@@ -1014,7 +1014,7 @@ func TestARequestWithBothCustodyAndARunningInstanceStillDestroysTheRunningOne(t 
 	// half ends in custody too, so ErrCustody is the correct return either way.
 	// What separates the fix from the bug is whether the running instance was
 	// asked to stop before that answer was given.
-	if err := r.Destroy(t.Context(), 11); err != nil && !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 11); err != nil && !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -1089,7 +1089,7 @@ func TestAnAcceptedTeardownRecordsTheJobAsDone(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -2786,7 +2786,7 @@ func TestAFailedHoldRecordsItsReasonWhenReadoptedFromQuarantine(t *testing.T) {
 
 	// A launch that failed after starting something, whose cleanup the backend
 	// did not confirm: held as a failure, and not yet reported.
-	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 19, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 19, Event: "push"}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 
@@ -3102,7 +3102,7 @@ func TestARegistrationRemovalTheLedgerRefusesIsRetriedBeforeCompute(t *testing.T
 
 	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
 		RequestID: lease.RequestID, Event: "push",
-	}); !errors.Is(err, server.ErrCustody) {
+	}); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Launch = %v, want ErrCustody", err)
 	}
 
@@ -3116,7 +3116,7 @@ func TestARegistrationRemovalTheLedgerRefusesIsRetriedBeforeCompute(t *testing.T
 	}
 
 	// The job is reported finished; the removal is refused as not found.
-	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, server.ErrCustody) {
+	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy while the removal is refused = %v, want ErrCustody", err)
 	}
 	if len(p.destroyed) != 0 || p.live[name] == nil {

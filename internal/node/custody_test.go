@@ -10,8 +10,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // A running job survives a controller restart.
@@ -255,7 +255,7 @@ func TestAnUnconfirmedCleanupHoldsTheCapacity(t *testing.T) {
 		t.Fatal("a launch that failed reported success")
 	}
 
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("the caller was not told the capacity is held, so it will release it: %v", err)
 	}
 
@@ -284,7 +284,7 @@ func TestAConfirmedCleanupHoldsNothing(t *testing.T) {
 		t.Fatal("a launch that failed reported success")
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Error("held capacity for compute that was confirmed destroyed")
 	}
 
@@ -781,7 +781,7 @@ func TestAnAbsentStrayIsNotBelievedImmediately(t *testing.T) {
 		t.Fatal("a launch that failed reported success")
 	}
 
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("released the capacity on a single negative observation: %v", err)
 	}
 

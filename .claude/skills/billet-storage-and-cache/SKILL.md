@@ -44,6 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Go and Bazel share a content-addressed host volume per session (`casvolume.go`).**
 - **The Go helper and the Bazel credential helper are billet itself, in the guest.**
 - **The Git proxy serves github.com fetches from a mirror, and only what GitHub would give that job (`gitproxy.go`).**
+- **A guest reaches its build caches through a relay that waits out a node restart (#374).**
 - **What each build cache did is observed like the image store.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).

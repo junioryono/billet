@@ -92,7 +92,7 @@ is_replay_input() {
 		internal/provider/firecracker/* | internal/provider/tart/* | \
 		internal/store/ceph/* | internal/store/ebss3/*) return 1 ;;
 	internal/provider/* | internal/store/*) return 0 ;;
-	internal/alloc/* | internal/config/* | internal/deploymentid/* | internal/durablefile/* | \
+	internal/alloc/* | internal/config/* | internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/importcheck/* | internal/lease/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
 		internal/provenance/* | internal/regularfile/* | internal/replay/* | internal/retirement/* | \

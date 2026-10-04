@@ -11,9 +11,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // A NODE FINISHES ITS CONTAINERS BEFORE IT STOPS, and it does NOT hand them to
@@ -659,7 +659,7 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 		Epoch:     1,
 	}
 
-	err := plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	err := plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Error("a draining node accepted a launch")
 	} else if !strings.Contains(err.Error(), "draining") {

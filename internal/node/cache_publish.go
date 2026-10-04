@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/dispatch"
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
@@ -20,7 +20,7 @@ const publishWindow = 30 * time.Minute
 // CacheAuthorityReader asks the control plane what a lease's job may do with a
 // cache now. The node client implements it.
 type CacheAuthorityReader interface {
-	CacheAuthority(ctx context.Context, leaseID string) (server.CacheAuthority, error)
+	CacheAuthority(ctx context.Context, leaseID string) (dispatch.CacheAuthority, error)
 }
 
 // SetAuthorityReader installs where a default-branch session asks what its job
@@ -342,7 +342,7 @@ func attachmentKind(attachment *cacheAttachment) config.CacheKind {
 // redelivered completion must not queue behind it, and nothing is recorded,
 // which publishes nothing.
 func (s *CacheService) SettleCompleted(
-	ctx context.Context, instance string, succeeded bool, authority server.CacheAuthority,
+	ctx context.Context, instance string, succeeded bool, authority dispatch.CacheAuthority,
 ) error {
 	session := s.sessionOf(instance)
 	if session == nil || session.closing.Load() {

@@ -11,8 +11,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -30,7 +30,7 @@ import (
 // sold to somebody else. That is precisely the failure custody was built to
 // prevent, reintroduced by moving the runner behind a network.
 type Compute interface {
-	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job) error
+	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job dispatch.Job) error
 	Destroy(ctx context.Context, requestID int64) error
 	Recover(ctx context.Context) error
 
@@ -66,7 +66,7 @@ type Compute interface {
 
 type completionAwareCompute interface {
 	DestroyCompleted(ctx context.Context, requestID int64, result string,
-		authority server.CacheAuthority) error
+		authority dispatch.CacheAuthority) error
 }
 
 // upgradableCompute can replace this node's own billet.
@@ -1214,7 +1214,7 @@ func execute(
 			return res
 		}
 
-		err := compute.Launch(ctx, cmd.Lease, cmd.Tier, server.Job{
+		err := compute.Launch(ctx, cmd.Lease, cmd.Tier, dispatch.Job{
 			RequestID:   cmd.Job.RequestID,
 			RunID:       cmd.Job.RunID,
 			Event:       cmd.Job.Event,
@@ -1235,7 +1235,7 @@ func execute(
 		// branches on it to decide whether the lease may be released, and matching
 		// that out of prose is how a reworded error re-advertises capacity that a
 		// container is still using.
-		res.Custody = errors.Is(err, server.ErrCustody)
+		res.Custody = errors.Is(err, dispatch.ErrCustody)
 
 		return res
 
@@ -1262,7 +1262,7 @@ func execute(
 			// listener heartbeats a lease the node's janitor is also renewing and
 			// will release, and the retry re-issues a terminate on every pass for
 			// the life of the process.
-			res.Custody = errors.Is(err, server.ErrCustody)
+			res.Custody = errors.Is(err, dispatch.ErrCustody)
 
 			return res
 		}
@@ -1383,12 +1383,12 @@ func sleep(ctx context.Context, d time.Duration) bool {
 
 // ServerCacheAuthority is an authority received on the wire, or the zero
 // value, which authorises nothing, when none was sent.
-func ServerCacheAuthority(a *nodeapi.CacheAuthority) server.CacheAuthority {
+func ServerCacheAuthority(a *nodeapi.CacheAuthority) dispatch.CacheAuthority {
 	if a == nil {
-		return server.CacheAuthority{}
+		return dispatch.CacheAuthority{}
 	}
 
-	return server.CacheAuthority{
+	return dispatch.CacheAuthority{
 		LeaseID: a.LeaseID, JobID: a.JobID, RunID: a.RunID, Owner: a.Owner,
 		Repository: a.Repository, Event: a.Event, Ref: a.Ref, BaseRef: a.BaseRef,
 		DefaultRef: a.DefaultRef, Proven: a.Proven, WriteOwnRef: a.WriteOwnRef,
