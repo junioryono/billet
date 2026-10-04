@@ -76,6 +76,10 @@ type Plane struct {
 	// its replacement by design, so ownership tied to liveness would vanish exactly when
 	// the drain still needed to renew.
 	owners map[string]leaseOwner
+	// withdrawn names, per node, the incarnations that withdrew: processes that
+	// said they will never poll again. adoptOwnershipLocked hands what one of them
+	// owned to the node's next process when that process's inventory holds it.
+	withdrawn map[string]map[string]bool
 
 	log  *slog.Logger
 	now  func() time.Time
@@ -1708,9 +1712,34 @@ func (p *Plane) adoptOwnershipLocked(
 		// superseded is still draining — which is the exact situation this exists
 		// to survive. A lease already attributed to a process stays with it; the
 		// current incarnation is permitted anyway, by name.
-		if _, taken := p.owners[id]; !taken {
+		//
+		// EXCEPT FROM A PROCESS THAT WITHDREW (#374). Withdrawal is the process
+		// saying, authenticated and fenced to its incarnation, that it will never
+		// poll again, so nothing of it is still draining: a node handing over leaves
+		// its compute running and exits, and the process that adopts that compute is
+		// the only one a completion's destroy can reach. Left with the withdrawn
+		// owner, every such destroy answered "holder unavailable" and a finished
+		// job's VM was never torn down. The request id moves with it, so the destroy
+		// that ends the job still ends the ownership.
+		owner, taken := p.owners[id]
+		switch {
+		case !taken:
 			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
+		case owner.node == node && owner.incarnation != incarnation &&
+			p.withdrawn[node][owner.incarnation]:
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: owner.requestID}
 		}
+	}
+
+	// A WITHDRAWN PROCESS THAT OWNS NOTHING ANY MORE IS FORGOTTEN, so the record
+	// is bounded by what is still in flight.
+	for gone := range p.withdrawn[node] {
+		if !p.ownsAnythingLocked(node, gone) {
+			delete(p.withdrawn[node], gone)
+		}
+	}
+	if len(p.withdrawn[node]) == 0 {
+		delete(p.withdrawn, node)
 	}
 
 	// AND STALE ADOPTIONS ARE DROPPED — but ONLY adoptions.
@@ -2341,10 +2370,35 @@ func (p *Plane) Withdraw(ctx context.Context, name, incarnation string) error {
 
 	p.forgetNodeLocked(n)
 
+	// REMEMBERED ONLY WHILE IT STILL OWNS SOMETHING, which is the only use the
+	// record has: a later process of this node that adopts that work takes its
+	// ownership over (adoptOwnershipLocked).
+	if p.ownsAnythingLocked(name, incarnation) {
+		if p.withdrawn == nil {
+			p.withdrawn = make(map[string]map[string]bool)
+		}
+		if p.withdrawn[name] == nil {
+			p.withdrawn[name] = make(map[string]bool)
+		}
+		p.withdrawn[name][incarnation] = true
+	}
+
 	p.log.Info("a node withdrew from the fleet; nothing is placed on it until it registers again",
 		"node", name)
 
 	return nil
+}
+
+// ownsAnythingLocked reports whether an incarnation of a node is recorded as the
+// owner of any lease. Caller holds p.mu.
+func (p *Plane) ownsAnythingLocked(node, incarnation string) bool {
+	for _, owner := range p.owners {
+		if owner.node == node && owner.incarnation == incarnation {
+			return true
+		}
+	}
+
+	return false
 }
 
 // forgetNodeLocked removes a node's record, keeping the tombstones that must
