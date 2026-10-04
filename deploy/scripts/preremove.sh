@@ -17,8 +17,14 @@ case "${1:-}" in
         ;;
 esac
 
-# A REAL REMOVAL. `systemctl stop` sends SIGTERM, which begins billet's drain, so
-# this waits for the jobs already running — up to the unit's TimeoutStopSec. That
+# A REAL REMOVAL. `systemctl stop` sends SIGTERM. The node's is a drain. The
+# server's is a drain only once the deployment is sealed: while it still admits
+# work the server hands over to the next control plane (#365) and returns at once.
+# Shutting the whole deployment down is `billet local down` first, which seals; a
+# seal is deployment-wide, so this hook does not take one, and retiring one
+# controller of a pair follows the controller-retirement procedure instead.
+#
+# The node's drain waits for the jobs already running — up to the unit's TimeoutStopSec. That
 # is the intended behaviour and it can take a while; an operator in a hurry sends
 # a second SIGTERM with
 #
