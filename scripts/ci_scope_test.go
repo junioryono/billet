@@ -211,6 +211,57 @@ func TestCIScopeSelectsTheFamiliesAChangeReaches(t *testing.T) {
 			event: "pull_request", want: "none", reason: "all 4 paths are documentation",
 		},
 		{
+			// ONLY THE NINE PATHS CHECKED ONE BY ONE ARE DOCUMENTATION; a nested
+			// CLAUDE.md anywhere else keeps its directory's classification.
+			name: "each verified nested CLAUDE.md is documentation",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				for _, d := range []string{
+					"internal/state", "internal/alloc", "internal/server", "internal/nodeplane",
+					"internal/node", "internal/provider", "cmd/billet", "deploy", "terraform",
+				} {
+					mustWrite(t, dir, d+"/CLAUDE.md", "# "+d+"\n")
+				}
+			},
+			event: "pull_request", want: "none", reason: "all 9 paths are documentation",
+		},
+		{
+			// THE COLLECTION'S BUILD PACKS AND HASHES EVERY FILE IN IT, so its
+			// CLAUDE.md is the collection's input like any other file there.
+			name: "the collection's CLAUDE.md is a collection input",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "ansible_collections/junioryono/billet/CLAUDE.md", "# collection\n")
+			},
+			event: "pull_request", want: families("host_lifecycle", "postgres_command", "postgres_retirement"),
+			reason: "1 paths select",
+		},
+		{
+			// A MIGRATION DIRECTORY REFUSES ANY FILE IT DOES NOT EXPECT, so a
+			// CLAUDE.md there is a state change, not documentation.
+			name: "a CLAUDE.md in a migration directory is not documentation",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "internal/state/migrations/CLAUDE.md", "# no\n")
+			},
+			event: "pull_request", want: families(append([]string{"postgres", "replay"}, application...)...),
+			reason: "1 paths select",
+		},
+		{
+			// ONLY THAT NAME. Other markdown beside the code is still the code's.
+			name: "other markdown under internal is not documentation",
+			change: func(t *testing.T, dir string) {
+				t.Helper()
+
+				mustWrite(t, dir, "internal/state/notes.md", "# notes\n")
+			},
+			event: "pull_request", want: families(append([]string{"postgres", "replay"}, application...)...),
+			reason: "1 paths select",
+		},
+		{
 			name: "one code path among docs",
 			change: func(t *testing.T, dir string) {
 				t.Helper()

@@ -69,6 +69,13 @@ is_documentation() {
 	docs/*.md | docs/*.rst | docs/*.css | docs/*.html | docs/*.txt | docs/*.png | docs/*.svg | docs/*.jpg) return 0 ;;
 	docs/conf.py | docs/Makefile) return 0 ;;
 	.claude/*.md | CLAUDE.md) return 0 ;;
+	# NAMED, NOT */CLAUDE.md: a CLAUDE.md is an input where something reads every
+	# file in its directory (the collection's build hashes each file it packs, and
+	# a migration directory refuses any file it does not expect), so each nested
+	# one is listed only after checking that nothing reads it.
+	internal/state/CLAUDE.md | internal/alloc/CLAUDE.md | internal/server/CLAUDE.md | \
+		internal/nodeplane/CLAUDE.md | internal/node/CLAUDE.md | internal/provider/CLAUDE.md | \
+		cmd/billet/CLAUDE.md | deploy/CLAUDE.md | terraform/CLAUDE.md) return 0 ;;
 	*) return 1 ;;
 	esac
 }
