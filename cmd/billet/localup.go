@@ -236,6 +236,14 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		return err
 	}
 
+	// THE NODE IS IN SERVICE AGAIN, so a drain a `down` asked of its stops no
+	// longer applies (#374).
+	if req.WantNode {
+		if err := releaseNodeDrain(nodeDrainRequestPath); err != nil {
+			return err
+		}
+	}
+
 	if err := c.ApplyOwnership(plan.Ownership, uid, gid); err != nil {
 		return err
 	}

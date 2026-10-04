@@ -105,7 +105,7 @@
   check_mode: false
   become: true
 
-- name: Make the stop before changing guest networking a drain
+- name: Make every node stop while guest networking changes a drain
   ansible.builtin.include_tasks: request-node-drain.yml
   when:
     - billet_network_requires_drain
@@ -291,3 +291,10 @@
   when: not ansible_check_mode
   become: true
   notify: billet unit files changed
+
+- name: Let node stops hand over again now that guest networking is in place
+  ansible.builtin.include_tasks: release-node-drain.yml
+  when:
+    - billet_network_requires_drain
+    - billet_node_unit_load_state.stdout | trim != 'not-found'
+    - not ansible_check_mode

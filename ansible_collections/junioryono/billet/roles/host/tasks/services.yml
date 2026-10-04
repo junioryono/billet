@@ -889,6 +889,14 @@
   become: true
   notify: billet unit files changed
 
+# THE NODE THAT MAY NOT RUN HERE HAS DRAINED AND STOPPED, by the transaction or by
+# the task above, so a later start may hand over again on its stops (#374).
+- name: Withdraw the drain request once a node that may not run here has stopped
+  ansible.builtin.include_tasks: release-node-drain.yml
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+
 # THE SCHEDULED UPDATER, INSTALLED ON EVERY HOST WITH A CONTROL PLANE AND
 # ENABLED WHEN THE DEPLOYMENT UPDATES ITSELF. The upgrade timer acts on the
 # rollout a ledger records, so it belongs on a host with a control plane; the

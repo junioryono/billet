@@ -3,61 +3,87 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
 
-// A DRAIN REQUEST APPLIES TO THE PROCESS IT NAMES, AND AN UNREADABLE ONE DRAINS
-// (#374). A request left by an earlier stop names an earlier process and never
-// turns a later handoff into a drain; one that cannot be read is answered the
-// slow way rather than leaving guests on a host being taken apart.
-func TestADrainRequestAppliesOnlyToTheProcessItNames(t *testing.T) {
+// A DRAIN REQUEST HOLDS WHILE IT EXISTS, AND ONE THAT CANNOT BE READ DRAINS
+// (#374). The request is held for the whole operation that must not leave guests
+// behind, so a process systemd started in the middle of it drains as well; an
+// answer that cannot be read is the slow one rather than one that strands guests.
+func TestADrainRequestHoldsWhileItExists(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "billet-node-drain")
-	const pid = 4242
 
-	if drainRequestedFor(path, pid) {
+	if drainRequestedAt(path) {
 		t.Error("no request at all asked for a drain")
 	}
+	if err := requestNodeDrain(path); err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if !drainRequestedAt(path) {
+		t.Error("a request that exists did not ask for a drain")
+	}
+	if err := releaseNodeDrain(path); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if drainRequestedAt(path) {
+		t.Error("a withdrawn request still asked for a drain")
+	}
+	if err := releaseNodeDrain(path); err != nil {
+		t.Errorf("withdrawing a request that is not there failed: %v", err)
+	}
 
-	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
+	file := filepath.Join(dir, "a-file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !drainRequestedFor(path, pid) {
-		t.Error("a request naming this process did not ask for a drain")
-	}
-	if drainRequestedFor(path, pid+1) {
-		t.Error("a request naming another process asked this one to drain")
-	}
-
-	unreadable := filepath.Join(dir, "a-directory")
-	if err := os.Mkdir(unreadable, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if !drainRequestedFor(unreadable, pid) {
+	if !drainRequestedAt(filepath.Join(file, "beneath")) {
 		t.Error("a request that could not be read was taken as no request")
 	}
 }
 
-// AND EVERY WRITER SPELLS THE PATH THE NODE READS. The host role's task file and
-// the package's preremove write it; a different spelling would be a request no
-// node ever sees.
-func TestEveryDrainRequestWriterNamesTheNodesPath(t *testing.T) {
+// AND EVERY WRITER WRITES THE PATH THE NODE READS, BEFORE THE STOP IT IS FOR.
+// The writes themselves are checked, not the path's appearance anywhere, because
+// every one of these files also names it in a comment.
+func TestEveryDrainRequestIsWrittenWhereTheNodeReadsItBeforeTheStop(t *testing.T) {
 	t.Parallel()
 
-	for _, file := range []string{
-		"../../deploy/scripts/preremove.sh",
-		"../../ansible_collections/junioryono/billet/roles/host/tasks/request-node-drain.yml",
-	} {
+	read := func(file string) string {
+		t.Helper()
+
 		body, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)
 		}
-		if !strings.Contains(string(body), nodeDrainRequestPath) {
-			t.Errorf("%s does not write %s", file, nodeDrainRequestPath)
+
+		return string(body)
+	}
+	before := func(file, body, first, then string) {
+		t.Helper()
+
+		at, later := strings.Index(body, first), strings.Index(body, then)
+		if at < 0 || later < 0 || at > later {
+			t.Errorf("%s does not do %q before %q", file, first, then)
 		}
+	}
+
+	roles := "../../ansible_collections/junioryono/billet/roles/host/tasks/"
+	if body := read(roles + "request-node-drain.yml"); !strings.Contains(body, "dest: "+nodeDrainRequestPath+"\n") {
+		t.Errorf("request-node-drain.yml does not write %s", nodeDrainRequestPath)
+	}
+	if body := read(roles + "release-node-drain.yml"); !strings.Contains(body, "path: "+nodeDrainRequestPath+"\n") ||
+		!strings.Contains(body, "state: absent") {
+		t.Errorf("release-node-drain.yml does not remove %s", nodeDrainRequestPath)
+	}
+
+	preremove := read("../../deploy/scripts/preremove.sh")
+	before("preremove.sh", preremove, ">"+nodeDrainRequestPath+"; then", `systemctl stop "${unit}"`)
+
+	before("localdown.go", read("localdown.go"), "requestNodeDrain(nodeDrainRequestPath)", "c.StopAndProve(")
+	if !strings.Contains(read("localup.go"), "releaseNodeDrain(nodeDrainRequestPath)") {
+		t.Error("local up does not withdraw the drain request a down left")
 	}
 }

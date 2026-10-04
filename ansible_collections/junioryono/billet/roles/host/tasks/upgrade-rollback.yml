@@ -451,3 +451,6 @@
 
 - name: Finalize the committed host rollback
   ansible.builtin.include_tasks: upgrade-finalize.yml
+
+- name: Let node stops hand over again now that the ledger is recovered
+  ansible.builtin.include_tasks: release-node-drain.yml

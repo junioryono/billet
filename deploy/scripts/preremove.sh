@@ -44,26 +44,14 @@ if [ -d /run/systemd/system ]; then
 
     # A REMOVAL IS A NODE LEAVING, so its stop must be a drain even where
     # node.stop says handoff (#374): nothing will start again to adopt the guests
-    # a handoff leaves behind. The running node reads its own pid in
-    # /run/billet-node-drain when its stop begins and drains if it finds it; a
-    # release that predates the request ignores the file. Written whatever the
-    # config says, and a failure to write it refuses the removal, because the
-    # stop that followed could leave guests running with nothing to adopt them.
-    if systemctl is-active --quiet billet-node 2>/dev/null; then
-        node_pid=$(systemctl show --property=MainPID --value billet-node 2>/dev/null) || node_pid=""
-        case "${node_pid}" in
-            "" | 0 | *[!0-9]*)
-                echo "billet: could not read which process billet-node runs, so it cannot be" >&2
-                echo "        asked to drain. Refusing to remove the package while it may hand" >&2
-                echo "        its guests to a node that is not coming back." >&2
-                exit 1
-                ;;
-        esac
-        if ! printf '%s\n' "${node_pid}" >/run/billet-node-drain; then
-            echo "billet: could not ask billet-node to drain. Refusing to remove the package" >&2
-            echo "        while it may hand its guests to a node that is not coming back." >&2
-            exit 1
-        fi
+    # a handoff leaves behind. A node process that stops while
+    # /var/run/billet-node-drain exists drains; it is written whatever the config
+    # says, left in place (a reinstall's node drains on its stops until the next
+    # reboot or `billet local up`), and a failure to write it refuses the removal.
+    if ! printf 'drain\n' >/var/run/billet-node-drain; then
+        echo "billet: could not ask billet-node to drain. Refusing to remove the package" >&2
+        echo "        while it may hand its guests to a node that is not coming back." >&2
+        exit 1
     fi
 
     for unit in billet-node billet-server; do

@@ -401,6 +401,15 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		disabledUnits []string
 	)
 
+	// A `down` TAKES THE NODE OUT OF SERVICE, so its stop drains even where
+	// node.stop says handoff (#374): nothing starts again to adopt what a handoff
+	// would leave running. `local up` withdraws the request.
+	if req.WantNode {
+		if err := requestNodeDrain(nodeDrainRequestPath); err != nil {
+			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
+		}
+	}
+
 	for _, unit := range downOrder(c, req) {
 		// OBSERVED, NOT PREDICTED. A stop is a systemd TRANSACTION: `Conflicts=`,
 		// `PartOf=` and `BindsTo=` all reach other units, and the closure is
