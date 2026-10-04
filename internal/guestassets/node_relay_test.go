@@ -12,10 +12,11 @@ import (
 // A node handing over leaves its guests running, and its cache listener is gone
 // until the next process starts. Pointed straight at the node, a guest's `git
 // fetch` in that gap is refused and fails, because nothing in Git falls back. The
-// probe drives the real script: a client connected before the node listens gets
-// the node's answer once it does, a node that never returns still ends the wait,
-// and an endpoint the relay cannot serve (https, whose certificate names the
-// node) is refused before anything listens.
+// probe runs the real entry point, `--mode node-relay --upstream`, and starts the
+// node only after the relay's first dial has been refused, so the answer can come
+// only from a retry. It also proves the relay carries no more connections than its
+// bound, stops waiting for a client that has gone, gives up on a node that never
+// returns, and refuses an endpoint it cannot serve.
 func TestTheNodeRelayWaitsOutANodeRestart(t *testing.T) {
 	t.Parallel()
 
@@ -34,7 +35,6 @@ import importlib.util
 import socket
 import sys
 import threading
-import time
 
 spec = importlib.util.spec_from_file_location("billet_actions_proxy", sys.argv[1])
 proxy = importlib.util.module_from_spec(spec)
@@ -47,34 +47,59 @@ def free_port():
     s.close()
     return port
 
-# 1. A NODE THAT COMES BACK IS REACHED: the dial is refused until the listener
-# exists, and the client's request is answered by it.
-proxy.NODE_RELAY_WAIT = 20
-proxy.NODE_RELAY_RETRY = 0.1
-node_port = free_port()
+# The real entry point, in a thread: signal handlers are a main-thread affair, and
+# the probe is the main thread.
+proxy.signal.signal = lambda *_: None
+proxy.NODE_RELAY_RETRY = 0.05
+proxy.NODE_RELAY_WAIT = 30
+proxy.NODE_RELAY_LIMIT = 1
 
-relay_server = socket.create_server(("127.0.0.1", 0))
-relay_port = relay_server.getsockname()[1]
+refused = threading.Event()
+real_connect = proxy.socket.create_connection
+def observed_connect(address, timeout=None):
+    try:
+        return real_connect(address, timeout)
+    except OSError:
+        refused.set()
+        raise
+proxy.socket.create_connection = observed_connect
 
-def serve_relay():
-    client, _ = relay_server.accept()
-    proxy.handle_node_relay(client, ("127.0.0.1", node_port))
+node_port, relay_port = free_port(), free_port()
+sys.argv = ["billet-actions-proxy", "--mode", "node-relay",
+            "--listen", "127.0.0.1:%d" % relay_port,
+            "--upstream", "http://127.0.0.1:%d" % node_port]
+threading.Thread(target=proxy.main, daemon=True).start()
 
-threading.Thread(target=serve_relay, daemon=True).start()
+def connect():
+    for _ in range(100):
+        try:
+            return real_connect(("127.0.0.1", relay_port), 5)
+        except OSError:
+            threading.Event().wait(0.05)
+    raise AssertionError("the relay never listened")
 
-client = socket.create_connection(("127.0.0.1", relay_port), 5)
+# 1. A NODE THAT COMES BACK IS REACHED, and only by a retry.
+client = connect()
 client.sendall(b"GET /v1/git/x HTTP/1.0\r\n\r\n")
+assert refused.wait(10), "the relay never dialled the absent node"
 
-time.sleep(1.0)  # the node is away: every dial so far was refused
+# 2. THE BOUND HOLDS: with its one slot taken, a second client is closed at once.
+second = connect()
+second.settimeout(5)
+second.sendall(b"GET / HTTP/1.0\r\n\r\n")
+try:
+    assert second.recv(1) == b"", "a connection past the bound was carried"
+except ConnectionResetError:
+    pass
+second.close()
+
 node = socket.create_server(("127.0.0.1", node_port))
-
 def serve_node():
     conn, _ = node.accept()
     request = conn.recv(4096)
     assert request.startswith(b"GET /v1/git/x"), request
     conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
     conn.close()
-
 threading.Thread(target=serve_node, daemon=True).start()
 
 client.settimeout(15)
@@ -87,10 +112,18 @@ while True:
 assert answer.endswith(b"hello"), answer
 client.close()
 
-# 2. A NODE THAT NEVER COMES BACK STILL ENDS THE WAIT, with the failure the
-# client would have had at once.
-clock = [0.0]
+# 3. A CLIENT THAT HAS GONE STOPS THE WAIT at once.
 slept = []
+try:
+    proxy.dial_node(("127.0.0.1", free_port()), wait=60, retry=1,
+                    sleep=slept.append, abandoned=lambda: True)
+    raise AssertionError("a dial for a client that had gone was completed")
+except OSError:
+    pass
+assert slept == [], slept
+
+# 4. A NODE THAT NEVER COMES BACK STILL ENDS THE WAIT.
+clock = [0.0]
 def now():
     return clock[0]
 def sleep(seconds):
@@ -103,12 +136,12 @@ except OSError:
     pass
 assert 3 <= len(slept) <= 5, slept
 
-# 3. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
+# 5. ONLY A PLAIN-HTTP ENDPOINT WITH A PORT.
 assert proxy.node_endpoint("http://172.31.0.1:7718") == ("172.31.0.1", 7718)
-for refused in ("https://172.31.0.1:7718", "http://172.31.0.1", "172.31.0.1:7718"):
+for bad in ("https://172.31.0.1:7718", "http://172.31.0.1", "172.31.0.1:7718"):
     try:
-        proxy.node_endpoint(refused)
-        raise AssertionError("the relay accepted " + refused)
+        proxy.node_endpoint(bad)
+        raise AssertionError("the relay accepted " + bad)
     except ValueError:
         pass
 print("ok")

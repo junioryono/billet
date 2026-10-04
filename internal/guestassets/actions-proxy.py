@@ -103,6 +103,12 @@ RELAY_TIMEOUT = 300
 # node gone for good still ends a client's wait.
 NODE_RELAY_WAIT = 600
 NODE_RELAY_RETRY = 1
+# How many connections the node relay carries at once. Each holds a thread and
+# two descriptors for as long as it waits, so the bound is what keeps a job that
+# opens connections in a loop during an outage from exhausting either, and keeps
+# every descriptor inside select()'s range. A connection past it is closed at
+# once, which is what the node's own listener would have done.
+NODE_RELAY_LIMIT = 64
 # How long the adapter waits for an answer that has not started arriving. It
 # begins once the request body is written -- every read and write before that is
 # bounded per operation by RELAY_TIMEOUT -- and every byte received resets it, so
@@ -671,7 +677,8 @@ def node_endpoint(upstream):
     return parsed.hostname, parsed.port
 
 
-def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep):
+def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sleep,
+              abandoned=lambda: False):
     """Connect to the node, redialling while it is away, until the wait is spent.
 
     A refused or unanswered dial is the node restarting as often as it is the node
@@ -686,12 +693,21 @@ def dial_node(address, wait=None, retry=None, now=time.monotonic, sleep=time.sle
         try:
             return socket.create_connection(address, CONNECT_TIMEOUT)
         except OSError:
-            if now() + retry >= deadline:
+            if now() + retry >= deadline or abandoned():
                 raise
             sleep(retry)
 
 
-def handle_node_relay(client, address):
+def client_gone(client):
+    """Whether the client has closed, without consuming anything it sent."""
+    try:
+        readable, _, _ = select.select([client], [], [], 0)
+        return bool(readable) and not client.recv(1, socket.MSG_PEEK)
+    except OSError:
+        return True
+
+
+def handle_node_relay(client, address, slots=None):
     peer = None
     try:
         # The client's first byte first, as the passthrough does, so a bare
@@ -699,7 +715,7 @@ def handle_node_relay(client, address):
         ready, _, _ = select.select([client], [], [], CONNECT_TIMEOUT)
         if not ready or not client.recv(1, socket.MSG_PEEK):
             return
-        peer = dial_node(address)
+        peer = dial_node(address, abandoned=lambda: client_gone(client))
         client.settimeout(RELAY_TIMEOUT)
         peer.settimeout(RELAY_TIMEOUT)
         relay(client, peer, b"")
@@ -709,6 +725,8 @@ def handle_node_relay(client, address):
         client.close()
         if peer is not None:
             peer.close()
+        if slots is not None:
+            slots.release()
 
 
 def systemd_listener():
@@ -834,6 +852,7 @@ def main():
         server = socket.create_server((parsed.hostname, parsed.port), reuse_port=False)
 
     origin = listener_origin(server) if args.mode == "cache-adapter" else ""
+    slots = threading.BoundedSemaphore(NODE_RELAY_LIMIT) if args.mode == "node-relay" else None
 
     server.settimeout(1)
     stopping = threading.Event()
@@ -856,10 +875,20 @@ def main():
                 client, args.upstream, fallback, args.ca_file, origin,
             )
         elif args.mode == "node-relay":
-            worker, arguments = handle_node_relay, (client, node_address)
+            if not slots.acquire(blocking=False):
+                client.close()
+                continue
+            worker, arguments = handle_node_relay, (client, node_address, slots)
         else:
             worker, arguments = handle, (client, args.upstream, fallback)
-        threading.Thread(target=worker, args=arguments, daemon=True).start()
+        # A THREAD THAT CANNOT START CLOSES ITS CONNECTION, never the process: every
+        # other connection this listener carries is still worth finishing.
+        try:
+            threading.Thread(target=worker, args=arguments, daemon=True).start()
+        except RuntimeError:
+            client.close()
+            if args.mode == "node-relay":
+                slots.release()
     server.close()
 
 

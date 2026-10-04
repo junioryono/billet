@@ -1669,10 +1669,12 @@ if [ -r "$IMAGE_ENV_FILE" ]; then
 		fi
 	done <"$IMAGE_ENV_FILE"
 fi
+# BILLET_CACHE_ENV_BEGIN
 if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
 fi
+# BILLET_CACHE_ENV_END
 # THE BUILD CACHES, each configured only when the node offered it AND this image
 # carries billet to serve it; an image without the binary builds cold rather than
 # naming a GOCACHEPROG the go command cannot start, which fails every build. The

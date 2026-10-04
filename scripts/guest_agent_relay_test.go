@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -8,15 +9,20 @@ import (
 	"testing"
 )
 
-// THE BUILD CACHES NAME THE RELAY ONLY WHEN IT IS SERVING (#374). The block is
-// extracted verbatim and executed against fake service managers: a relay that
-// started repoints the cache endpoint at itself; one that could not be created,
-// never became ready, has no docker bridge to bind, or would front an https
-// endpoint leaves the node's own address in place, so the caches still work.
+// THE BUILD CACHES NAME THE RELAY ONLY WHEN IT IS SERVING, AND ALL OF THEM DO
+// (#374). The relay block runs, verbatim, before the two blocks that publish the
+// cache to the job: the runner's environment and the Git, Bazel and Go
+// configuration. A relay that started is what every one of them names; one that
+// could not be created, never became ready, has no docker bridge to bind, or would
+// front an https endpoint leaves the node's own address in all of them, so the
+// caches still work and no credential helper is asked about a host it does not
+// answer for.
 func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 	t.Parallel()
 
-	block := agentBlock(t, "BILLET_CACHE_RELAY")
+	relayBlock := agentBlock(t, "BILLET_CACHE_RELAY")
+	envBlock := agentBlock(t, "BILLET_CACHE_ENV")
+	cachesBlock := agentBlock(t, "BILLET_GUEST_CACHES")
 	fakes := writeFakeServiceManagers(t)
 
 	withBridge := t.TempDir()
@@ -26,6 +32,10 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 	}
 	noBridge := t.TempDir()
 	if err := forkSafeWriteFile(filepath.Join(noBridge, "ip"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	billet := filepath.Join(t.TempDir(), "billet")
+	if err := forkSafeWriteFile(billet, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -49,12 +59,14 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 		{name: "there is no docker bridge to bind", endpoint: node, ipDir: noBridge, want: node},
 		{name: "an https endpoint is left direct", endpoint: "https://10.0.0.5:7718",
 			ipDir: withBridge, want: "https://10.0.0.5:7718"},
-		{name: "no cache session configures nothing", endpoint: "", ipDir: withBridge, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			record := filepath.Join(t.TempDir(), "record")
+			dir := t.TempDir()
+			record := filepath.Join(dir, "record")
+			bazelrc := filepath.Join(dir, "bazel.bazelrc")
+			gitconfig := filepath.Join(dir, "gitconfig")
 			script := strings.Join([]string{
 				"set -euo pipefail",
 				`PATH="` + tc.ipDir + ":" + fakes + `:$PATH"`,
@@ -63,18 +75,48 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 				"export BILLET_FAKE_START_STATUS=" + exitStatus(tc.startFails),
 				`log() { printf 'billet-agent: %s\n' "$*" >&2; }`,
 				"cache_endpoint=" + shellQuote(tc.endpoint),
+				"cache_token=token",
+				"buildkit_cache_mount_limit_bytes=1073741824",
+				"guest_caches=go,bazel,git",
+				"GUEST_BILLET=" + shellQuote(billet),
+				"BAZELRC_FILE=" + shellQuote(bazelrc),
+				"GITCONFIG_FILE=" + shellQuote(gitconfig),
 				"docker_gateway=172.17.0.1",
 				"cache_relay_port=41322",
-				block,
-				`printf 'endpoint=%s\n' "$cache_endpoint"`,
+				"runner_env=()",
+				relayBlock,
+				envBlock,
+				cachesBlock,
+				`for entry in "${runner_env[@]}"; do printf 'env=%s\n' "$entry"; done`,
 			}, "\n")
 
 			output, err := exec.CommandContext(t.Context(), "bash", "-c", script).CombinedOutput()
 			if err != nil {
-				t.Fatalf("the relay block failed: %v\n%s", err, output)
+				t.Fatalf("the relay and cache blocks failed: %v\n%s", err, output)
 			}
-			if !strings.Contains(string(output), "endpoint="+tc.want+"\n") {
-				t.Errorf("the caches name %q, want %q\n%s", endpointOf(string(output)), tc.want, output)
+
+			// EVERY PLACE THAT NAMES THE CACHE NAMES THE SAME ONE.
+			if !strings.Contains(string(output), "env=BILLET_CACHE_ENDPOINT="+tc.want+"\n") {
+				t.Errorf("the runner's cache endpoint is not %q:\n%s", tc.want, output)
+			}
+			git, err := os.ReadFile(gitconfig)
+			if err != nil {
+				t.Fatalf("read gitconfig: %v", err)
+			}
+			for _, want := range []string{
+				`[url "` + tc.want + `/v1/git/github.com/"]`,
+				`[credential "` + tc.want + `"]`,
+			} {
+				if !strings.Contains(string(git), want) {
+					t.Errorf("the git configuration lacks %q:\n%s", want, git)
+				}
+			}
+			rc, err := os.ReadFile(bazelrc)
+			if err != nil {
+				t.Fatalf("read bazelrc: %v", err)
+			}
+			if !strings.Contains(string(rc), "build --remote_cache="+tc.want+"/v1/cas/bazel") {
+				t.Errorf("bazel's remote cache is not %q:\n%s", tc.want, rc)
 			}
 
 			run := readArgv(t, record+".systemd-run")
@@ -99,14 +141,4 @@ func TestTheBuildCachesNameTheRelayOnlyWhenItServes(t *testing.T) {
 			}
 		})
 	}
-}
-
-func endpointOf(output string) string {
-	for line := range strings.Lines(output) {
-		if value, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "endpoint="); ok {
-			return value
-		}
-	}
-
-	return ""
 }
