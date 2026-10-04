@@ -22,6 +22,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // `billet rollout status --json` IS THE LEDGER'S OWN ACCOUNT, READ THROUGH AN
@@ -39,6 +40,12 @@ const (
 // the fixtures write what the command then reads.
 func statusPlane(t *testing.T, stateDir string, fn func(db *state.DB)) {
 	t.Helper()
+
+	// A DIRECTORY WITH NO LEDGER YET STARTS FROM THE TEMPLATE; one that holds a
+	// ledger is opened as it is, since a seed would hide what the test wrote.
+	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
+		ledgertest.Seed(t, stateDir)
+	}
 
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
