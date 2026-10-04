@@ -14,25 +14,10 @@ import (
 // THE DRAIN REQUEST IS THE FIRST LEVEL, HOWEVER OFTEN IT ARRIVES. A stop sends it
 // on every poll, so if a repeat counted towards escalate's levels the second
 // poll would end the drain's wait; it must cancel and never hurry.
-//
-// AND IT IS A DRAIN EVEN ON A NODE SET TO HAND OVER (#374), recorded before the
-// cancellation that starts the stop, which is where the loop reads it.
 func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
-	var (
-		cancels   atomic.Int32
-		unflagged atomic.Int32
-		lc        *lifecycle
-	)
+	var cancels atomic.Int32
 
-	lc = newLifecycle(func() {
-		cancels.Add(1)
-		if !lc.drainRequested.Load() {
-			unflagged.Add(1)
-		}
-	})
-	if lc.drainRequested.Load() {
-		t.Fatal("a lifecycle no request reached says a drain was requested")
-	}
+	lc := newLifecycle(func() { cancels.Add(1) })
 
 	requests := make(chan os.Signal, 5)
 	for range 5 {
@@ -44,9 +29,6 @@ func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
 
 	if cancels.Load() != 5 {
 		t.Fatalf("five drain requests started the drain %d times, want every one", cancels.Load())
-	}
-	if unflagged.Load() != 0 {
-		t.Errorf("%d drain requests started the stop before saying it must drain", unflagged.Load())
 	}
 
 	select {

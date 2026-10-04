@@ -102,8 +102,8 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/network.yml / Predict the billet network service change | const:/etc/systemd/system/billet-network.service |
 | tasks/network.yml / Inspect whether the billet node unit exists | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/network.yml / Drain billet compute before changing guest networking | parity:shared node stop or node-owned networking service lifecycle (R7.3) |
-| tasks/request-node-drain.yml / Inspect whether a billet node set to hand over is running | parity:node drain request before a node stop that must drain; sent only to a node configured to hand over (#374) |
-| tasks/request-node-drain.yml / Ask the billet node to drain rather than hand over | parity:node drain request before a node stop that must drain; sent only to a node configured to hand over (#374) |
+| tasks/request-node-drain.yml / Read which billet node process a draining stop must reach | parity:node drain request before a node stop that must drain; written for the running node process by pid, read by it when its stop begins (#374) |
+| tasks/request-node-drain.yml / Ask the running billet node to drain rather than hand over | parity:node drain request before a node stop that must drain; written for the running node process by pid, read by it when its stop begins (#374) |
 | tasks/network.yml / Enable IP forwarding for guest bridges | const:/etc/sysctl.d/99-billet-node.conf |
 | tasks/network.yml / Inspect DHCP units for removed guest networks | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/network.yml / Stop and disable DHCP on removed guest networks | parity:shared node stop or node-owned networking service lifecycle (R7.3) |

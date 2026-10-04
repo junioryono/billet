@@ -44,15 +44,25 @@ if [ -d /run/systemd/system ]; then
 
     # A REMOVAL IS A NODE LEAVING, so its stop must be a drain even where
     # node.stop says handoff (#374): nothing will start again to adopt the guests
-    # a handoff leaves behind. The node's drain request overrides handoff, and is
-    # sent only where the config asks for handoff, because a release older than
-    # the request is ended by the signal and a node that drains needs none.
-    if systemctl is-active --quiet billet-node 2>/dev/null &&
-        grep -Eq '^[[:space:]]+stop:[[:space:]]*["'"'"']?handoff["'"'"']?[[:space:]]*(#.*)?$' \
-            /etc/billet/billet.yaml 2>/dev/null; then
-        if ! systemctl kill --kill-whom=main --signal=SIGUSR1 billet-node; then
-            echo "billet: could not ask billet-node to drain; its stop hands its guests over" >&2
-            echo "        to a node that is being removed." >&2
+    # a handoff leaves behind. The running node reads its own pid in
+    # /run/billet-node-drain when its stop begins and drains if it finds it; a
+    # release that predates the request ignores the file. Written whatever the
+    # config says, and a failure to write it refuses the removal, because the
+    # stop that followed could leave guests running with nothing to adopt them.
+    if systemctl is-active --quiet billet-node 2>/dev/null; then
+        node_pid=$(systemctl show --property=MainPID --value billet-node 2>/dev/null) || node_pid=""
+        case "${node_pid}" in
+            "" | 0 | *[!0-9]*)
+                echo "billet: could not read which process billet-node runs, so it cannot be" >&2
+                echo "        asked to drain. Refusing to remove the package while it may hand" >&2
+                echo "        its guests to a node that is not coming back." >&2
+                exit 1
+                ;;
+        esac
+        if ! printf '%s\n' "${node_pid}" >/run/billet-node-drain; then
+            echo "billet: could not ask billet-node to drain. Refusing to remove the package" >&2
+            echo "        while it may hand its guests to a node that is not coming back." >&2
+            exit 1
         fi
     fi
 

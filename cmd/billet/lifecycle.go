@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 
 	"github.com/junioryono/billet/internal/lifeops/launchd"
 )
@@ -31,9 +30,6 @@ type lifecycle struct {
 	cancel context.CancelFunc
 	hurry  chan struct{}
 	once   sync.Once
-	// drainRequested says a drain request arrived, which makes the stop a drain
-	// even on a node configured to hand over.
-	drainRequested atomic.Bool
 }
 
 func newLifecycle(cancel context.CancelFunc) *lifecycle {
@@ -52,13 +48,8 @@ func (lc *lifecycle) rush() {
 // drainOn answers every drain request with the first level and nothing more:
 // however often one arrives it never counts towards escalate's levels, which
 // is what lets a stop repeat it through a crash, a restart or its own retry.
-//
-// AND IT IS A DRAIN, WHATEVER node.stop SAYS. It is what a stop that removes the
-// node, or the networking its guests use, sends first, so it is recorded before
-// the cancellation that starts the stop can read it.
 func (lc *lifecycle) drainOn(requests <-chan os.Signal) {
 	for range requests {
-		lc.drainRequested.Store(true)
 		lc.cancel()
 	}
 }

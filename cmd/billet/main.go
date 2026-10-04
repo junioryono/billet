@@ -1799,7 +1799,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		// THE GUEST CACHE ANSWERS ONCE THIS PROCESS IS REGISTERED AND RECOVERED;
 		// until then its connections wait in the listener's queue.
 		Ready:          serveCache,
-		DrainRequested: lc.drainRequested.Load,
+		DrainRequested: nodeDrainRequested,
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
 		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
@@ -2027,12 +2027,14 @@ func startNodeCache(
 	// (#374): the unit has a mount namespace of its own, and a recovered session's
 	// paths are empty directories until its volumes are mounted again in this
 	// one. In the background, each mount bounded, so storage that stalls delays
-	// only the cache, never the registration and renewal of the compute.
+	// only the cache, never the registration and renewal of the compute; and not
+	// on the node's context, which a stop cancels before a drain serves the
+	// guests it waits for.
 	var serveOnce sync.Once
 	serve := func() {
 		serveOnce.Do(func() {
 			go func() {
-				service.RestoreMounts(ctx)
+				service.RestoreMounts(context.WithoutCancel(ctx))
 				if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
 						"error", err)

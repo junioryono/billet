@@ -329,6 +329,10 @@
     - not ansible_check_mode
   become: true
   block:
+    - name: Make the transaction's node stop a drain when the node will not run again
+      ansible.builtin.include_tasks: request-node-drain.yml
+      when: not billet_node_should_run
+
     - name: Gracefully stop the billet node before changing its guest contract
       ansible.builtin.systemd_service:
         name: billet-node.service

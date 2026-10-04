@@ -137,7 +137,13 @@ func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
 				serves++
 			}
 
-			literal, ok := n.(*ast.FuncLit)
+			// IN A GO STATEMENT, because Ready is called on the node loop's own
+			// goroutine and a remount that stalls there would hold registration.
+			statement, ok := n.(*ast.GoStmt)
+			if !ok {
+				return true
+			}
+			literal, ok := statement.Call.Fun.(*ast.FuncLit)
 			if !ok {
 				return true
 			}
@@ -171,6 +177,47 @@ func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
 		t.Errorf("startNodeCache calls srv.Serve %d times, want exactly the one Ready runs", serves)
 	}
 	if !ordered {
-		t.Error("startNodeCache does not restore the recovered mounts before it serves")
+		t.Error("startNodeCache does not restore the recovered mounts, then serve, in a goroutine of its own")
+	}
+}
+
+// THE NODE LOOP IS GIVEN THE STOP POLICY AND THE DRAIN REQUEST. The loop's tests
+// set both themselves, so only the source shows that cmdNode passes what the
+// config said and what a draining stop asks.
+func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	want := map[string]string{"HandOverOnStop": "handOver", "DrainRequested": "nodeDrainRequested"}
+	found := map[string]bool{}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		literal, ok := n.(*ast.CompositeLit)
+		if !ok || !namesSelector(literal.Type, "nodeclient", "LoopOptions") {
+			return true
+		}
+		for _, element := range literal.Elts {
+			field, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, keyOK := field.Key.(*ast.Ident)
+			value, valueOK := field.Value.(*ast.Ident)
+			if keyOK && valueOK && want[key.Name] == value.Name {
+				found[key.Name] = true
+			}
+		}
+
+		return true
+	})
+
+	for key, value := range want {
+		if !found[key] {
+			t.Errorf("the node loop is not given %s: %s", key, value)
+		}
 	}
 }

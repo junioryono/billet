@@ -2,25 +2,30 @@
 # A STOP THAT MUST BE A DRAIN SAYS SO FIRST (#374). With node.stop: handoff a
 # plain stop leaves the guests running for the next process to adopt, which is
 # wrong when the stop removes the node or the networking its guests use. The
-# node's drain request overrides handoff, so it is sent before such a stop. Only
-# to a node configured to hand over: one that drains anyway needs no request,
-# and a release older than the request would be ended by the signal.
-- name: Inspect whether a billet node set to hand over is running
+# request names the running node process by its pid in /run/billet-node-drain,
+# which that process reads when its stop begins: written before the stop, so
+# nothing races it; bound to the pid, so it never applies to a later process;
+# and sent whatever the config says, because what matters is the policy of the
+# process running now, not the one a converge is about to install. A release
+# that predates the request ignores the file.
+- name: Read which billet node process a draining stop must reach
   ansible.builtin.command:
-    argv: [systemctl, is-active, billet-node.service]
-  register: billet_node_drain_active
+    argv: [systemctl, show, --property=MainPID, --value, billet-node.service]
+  register: billet_node_drain_pid
   changed_when: false
   failed_when: false
   check_mode: false
   become: true
-  when: ((billet_config.node | default({})).stop | default('drain')) == 'handoff'
 
-- name: Ask the billet node to drain rather than hand over
-  ansible.builtin.command:
-    argv: [systemctl, kill, --kill-whom=main, --signal=SIGUSR1, billet-node.service]
+- name: Ask the running billet node to drain rather than hand over
+  ansible.builtin.copy:
+    content: "{{ billet_node_drain_pid.stdout | trim }}\n"
+    dest: /run/billet-node-drain
+    owner: root
+    group: root
+    mode: "0644"
   when:
-    - ((billet_config.node | default({})).stop | default('drain')) == 'handoff'
-    - (billet_node_drain_active.stdout | default('')) | trim == 'active'
+    - billet_node_drain_pid.rc | default(1) == 0
+    - (billet_node_drain_pid.stdout | default('0') | trim) is match('^[1-9][0-9]*$')
     - not ansible_check_mode
-  changed_when: true
   become: true

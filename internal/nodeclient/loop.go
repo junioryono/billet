@@ -155,9 +155,9 @@ type LoopOptions struct {
 	// next node process to adopt, instead of waiting for it (node.stop: handoff,
 	// #374). It is the second signal's ending, taken at once.
 	HandOverOnStop bool
-	// DrainRequested reports whether the operator asked this stop to be a drain
-	// (launchd.DrainSignal, which a stop that removes the node or its guests'
-	// networking sends first). It overrides HandOverOnStop: a host that is
+	// DrainRequested reports whether the stop under way was asked to be a drain,
+	// which a stop that removes the node or its guests' networking does first.
+	// Read when the stop begins, and it overrides HandOverOnStop: a host that is
 	// leaving, or whose bridges are about to go, must not leave guests behind.
 	// Nil is never.
 	DrainRequested func() bool
