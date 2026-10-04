@@ -123,12 +123,26 @@ if hasattr(proxy.select, "POLLRDHUP"):
     threading.Thread(target=proxy.main, daemon=True).start()
     relay_port = other_relay
 
+    # The real handler, observed returning: main() looks it up by name for each
+    # connection, so the wrapper is what runs. Waited for within ten seconds,
+    # well inside the relay's thirty, so a handler that cannot see the hangup
+    # fails here rather than eventually passing.
+    released = threading.Event()
+    real_handler = proxy.handle_node_relay
+    def observed_handler(*args):
+        try:
+            real_handler(*args)
+        finally:
+            released.set()
+    proxy.handle_node_relay = observed_handler
+
     refused.clear()
     gone = connect()
     gone.sendall(b"GET /v1/git/gone HTTP/1.0\r\n\r\n")
     assert refused.wait(10), "the relay never dialled the absent node"
     gone.close()
-    threading.Event().wait(1)
+    assert released.wait(10), "a client that hung up kept its slot while the node was away"
+    proxy.handle_node_relay = real_handler
 
     waiting = connect()
     waiting.sendall(b"GET /v1/git/x HTTP/1.0\r\n\r\n")
