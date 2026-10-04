@@ -259,3 +259,22 @@ func TestAWithdrawnProcesssEndedAdoptionIsPrunedByTheLedgersWord(t *testing.T) {
 		t.Errorf("the withdrawal record outlived the last lease its process owned: %d left", left)
 	}
 }
+
+// A QUARANTINED LEASE IS NOT ENDED. The launched set leaves quarantine out, so a
+// superseded process's adoption of quarantined compute is kept by the ledger's
+// quarantined set, which is never adopted by the registering process.
+func TestAnotherProcesssQuarantinedAdoptionIsKept(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithRegistrar(newLedger()))
+	registerAs(t, p, "p1")
+	p.AdoptOwnershipWithInventory("n1", "p1", []string{"l7"}, true)
+
+	registerAs(t, p, "p2")
+	p.AdoptOwnershipKeeping("n1", "p2", nil, map[string]bool{"l7": true})
+
+	if owner, ok := ownerOf(p, "l7"); !ok || owner.incarnation != "p1" {
+		t.Errorf("a superseded process lost a quarantined lease it may still be draining: %+v (ok=%v)",
+			owner, ok)
+	}
+}
