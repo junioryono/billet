@@ -34,6 +34,8 @@ git checkout <branch> && git merge main
 
 History stays append-only, which keeps shared branches safe.
 
+The `.claude` hook holds these rules for a Claude session: it refuses a rebase (including `git pull --rebase` and a bare pull where `pull.rebase` is set), any force push, a push to main and a commit on main. It judges the repository as it is, never as a command line would leave it, so run a branch switch and a commit or push as two separate calls, and name what you push: `git push -u origin <branch>`.
+
 A stacked PR (its base another PR's branch) is closed by GitHub the moment that base branch is deleted, and a closed PR whose base is gone cannot be reopened or retargeted; it has to be opened again from the same branch. So merge the base PR without `--delete-branch`, retarget the stacked PR to `main` first, and delete the branch afterwards (measured: #101 was lost that way, 2026-09-06).
 
 ## Every commit gets a Codex review, before it is pushed

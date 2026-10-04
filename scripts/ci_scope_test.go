@@ -427,6 +427,8 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/runner-images/upstream/images/ubuntu/scripts/build/install-git.sh", "none"},
 		{"scripts/ci_scope_test.go", "lint"},
 		{"scripts/testdata/skills-corpus.txt", "none"},
+		{".claude/settings.json", "none"},
+		{".claude/hooks/guard.py", "none"},
 		// What drives the jobs, and the module graph: everything.
 		{".github/workflows/ci.yml", "all"},
 		{"Makefile", "all"},
