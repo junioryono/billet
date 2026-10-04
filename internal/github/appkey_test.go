@@ -18,6 +18,16 @@ import (
 	"time"
 )
 
+// Each redacting method is asserted on the value type, for the reason
+// internal/state's DSN test gives: the rendering table cannot see a missing one.
+var (
+	_ fmt.Stringer   = AppKey(nil)
+	_ fmt.GoStringer = AppKey(nil)
+	_ fmt.Formatter  = AppKey(nil)
+	_ json.Marshaler = AppKey(nil)
+	_ slog.LogValuer = AppKey(nil)
+)
+
 // newTestAppKey is a real PEM, because a redaction proved against a placeholder
 // says nothing about the base64 body a key actually carries.
 func newTestAppKey(t *testing.T) AppKey {
@@ -85,6 +95,7 @@ func TestAnAppKeyIsRedactedOnEveryRenderingPath(t *testing.T) {
 	}
 
 	rendered["json"] = string(encoded)
+	rendered["LogValue()"] = key.LogValue().String()
 
 	var logged bytes.Buffer
 

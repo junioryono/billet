@@ -13,6 +13,24 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// EACH REDACTING METHOD IS ASSERTED ON THE VALUE TYPE, because the rendering
+// tables cannot see a missing one: slog falls back to MarshalJSON or to fmt, both
+// of which redact, and a method moved to a pointer receiver is still found
+// through a pointer. A value reached through a field is what each must cover.
+var (
+	_ fmt.Stringer   = DSN("")
+	_ fmt.GoStringer = DSN("")
+	_ fmt.Formatter  = DSN("")
+	_ json.Marshaler = DSN("")
+	_ slog.LogValuer = DSN("")
+
+	_ fmt.Stringer   = postgresBackend{}
+	_ fmt.GoStringer = postgresBackend{}
+	_ fmt.Formatter  = postgresBackend{}
+	_ json.Marshaler = postgresBackend{}
+	_ slog.LogValuer = postgresBackend{}
+)
+
 const testDSNPassword = "hunter2-the-password"
 
 // A DSN CARRIES THE LEDGER'S PASSWORD, and it reaches a log through one careless
@@ -52,6 +70,7 @@ func TestADSNIsRedactedOnEveryRenderingPath(t *testing.T) {
 	}
 
 	rendered["json"] = string(encoded)
+	rendered["LogValue()"] = dsn.LogValue().String()
 
 	var logged bytes.Buffer
 
@@ -187,12 +206,16 @@ func TestThePostgresBackendIsRedactedOnEveryRenderingPath(t *testing.T) {
 		"GoString()":  be.GoString(),
 	}
 
-	encoded, err := json.Marshal(be)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+	for name, v := range map[string]any{"json": *be, "json pointer": be} {
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		rendered[name] = string(encoded)
 	}
 
-	rendered["json"] = string(encoded)
+	rendered["LogValue()"] = be.LogValue().String()
 
 	var logged bytes.Buffer
 
