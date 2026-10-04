@@ -246,6 +246,11 @@ func TestTheSkillRulesRefuseWhatTheyDescribe(t *testing.T) {
 		t.Errorf("a space after a continuation backslash was trimmed away: %q", broken)
 	}
 
+	lf := "Prose here.\n\n```\nmake check\nrun \\\n```\n"
+	if got, want := skillUnits(strings.ReplaceAll(lf, "\n", "\r\n")), skillUnits(lf); !slices.Equal(got, want) {
+		t.Errorf("CRLF line endings changed the units: %q, want %q", got, want)
+	}
+
 	if got, want := normaliseSkillText("- **A**  rule `x  **y**` here"), "A rule `x  **y**` here"; got != want {
 		t.Errorf("normalised to %q, want %q", got, want)
 	}
@@ -350,6 +355,9 @@ func skillMarkdown(t *testing.T, root string) []string {
 func skillUnits(text string) []string {
 	var units []string
 
+	// A line ending is layout, and code keeps its trailing whitespace, so a CRLF
+	// file must not read as every code line changed.
+	text = strings.ReplaceAll(text, "\r\n", "\n")
 	inFence := false
 
 	for line := range strings.SplitSeq(stripFrontmatter(text), "\n") {
