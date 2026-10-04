@@ -178,8 +178,17 @@ jobs:
           before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
 
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/lib/node_modules \
-            "$AGENT_TOOLSDIRECTORY" || true
+            /usr/local/share/boost /usr/local/lib/node_modules || true
+
+          # EVERY TOOLCACHE ENTRY BUT PYTHON. A billet guest image from before the
+          # passthrough moved to the system interpreter runs it on the toolcache's
+          # Python; deleting that refused every later call to the results origin,
+          # and this job's artifact upload failed with ECONNREFUSED after a
+          # two-hour build (2026-10-04).
+          if [ -d "$AGENT_TOOLSDIRECTORY" ]; then
+            sudo find "$AGENT_TOOLSDIRECTORY" -mindepth 1 -maxdepth 1 ! -name Python \
+              -exec rm -rf {} + || true
+          fi
 
           sudo apt-get clean
 

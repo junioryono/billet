@@ -89,7 +89,7 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 				"export BILLET_FAKE_START_STATUS=" + exitStatus(tc.startFails),
 				`log() { printf 'billet-agent: %s\n' "$*" >&2; }`,
 				"actions_cache_active=" + shellQuote(tc.active),
-				"python_runtime=/opt/hostedtoolcache/Python/3.13.0/x64/bin/python",
+				"python_runtime=/usr/bin/python3",
 				"actions_proxy=http://billet:sesh@10.9.8.7:9000",
 				"results_fallback=140.82.114.21,140.82.114.22",
 				"actions_ca_path=/home/runner/runner/_work/_billet/actions-cache-ca.pem",
@@ -143,7 +143,7 @@ func TestTheAgentPublishesTheAdapterURLOnlyWhenItIsServing(t *testing.T) {
 				// differently named unit running something else and nothing here
 				// would notice.
 				{"--unit=billet-actions-cache-adapter"},
-				{"/opt/hostedtoolcache/Python/3.13.0/x64/bin/python",
+				{"/usr/bin/python3",
 					"/usr/local/bin/billet-actions-proxy"},
 				{"--mode", "cache-adapter"},
 				{"--systemd-socket"},

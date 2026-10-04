@@ -1292,9 +1292,15 @@ if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_p
 	# `if ! x=$(...); then x=""` contains that AND guarantees the variable is empty on
 	# failure, so the guard below skips interception -- a job on GitHub's cache
 	# directly, never a dead job.
-	if ! python_runtime=$(find /opt/hostedtoolcache/Python -path '*/x64/bin/python' -type f -o \
-		-path '*/x64/bin/python' -type l 2>/dev/null | sort -V | tail -1); then
-		python_runtime=""
+	# THE SYSTEM INTERPRETER, NEVER ONE FROM THE TOOLCACHE. A job may free disk by
+	# deleting $AGENT_TOOLSDIRECTORY, as the guest-image build itself does and as
+	# the common disk-reclaiming actions do; with the passthrough running from a
+	# toolcache Python, its next restart or lazy import failed, the remapped origin
+	# refused every connection, and the job's artifact upload failed with
+	# ECONNREFUSED after a two-hour build (2026-10-04).
+	python_runtime=""
+	if [ -x /usr/bin/python3 ]; then
+		python_runtime=/usr/bin/python3
 	fi
 	# docker0 must carry the pinned gateway, or the listeners would bind an address
 	# daemon.json's dns list does not name and containers could not reach them.
