@@ -1700,7 +1700,13 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	defer stopDrainRequests()
 	publishNodeDrainReport(hostOS)
 
-	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client)
+	handOver, err := cfg.Node.HandsOverOnStop()
+	if err != nil {
+		return err
+	}
+
+	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client,
+		nodeCacheStopGrace(handOver))
 	if err != nil {
 		return err
 	}
@@ -1758,11 +1764,6 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	if err != nil {
 		return err
 	}
-	handOver, err := cfg.Node.HandsOverOnStop()
-	if err != nil {
-		return err
-	}
-
 	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
 	// re-registers, and a node that came back reporting a different contribution
 	// would move the fleet's arithmetic underneath work it is still holding.
@@ -1929,6 +1930,7 @@ func startNodeCache(
 	p provider.Provider,
 	deployment string,
 	cachePolicy nodeCacheControl,
+	stopGrace time.Duration,
 ) (*node.CacheService, func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, nil
@@ -2087,12 +2089,30 @@ func startNodeCache(
 		"addr", ln.Addr().String())
 
 	return service, func() {
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopGrace)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Default().Warn("the guest cache listener did not shut down cleanly", "error", err)
+			slog.Default().Warn("the guest cache listener did not shut down cleanly",
+				"grace", stopGrace, "error", err)
 		}
 	}, nil
+}
+
+// nodeCacheStopGrace is how long the guest cache listener lets requests already
+// in flight finish when the node stops; Shutdown stops accepting at once and
+// returns as soon as they have.
+//
+// LONGER ON A HANDOVER (#374), because the guests are still running and a git
+// fetch or a build-cache transfer cut off mid-body fails the job, while a new
+// connection only waits: the guest's relay redials until the next process
+// listens. A drain stops the listener after its jobs have finished, so nothing
+// is left to wait for.
+func nodeCacheStopGrace(handOver bool) time.Duration {
+	if handOver {
+		return time.Minute
+	}
+
+	return 5 * time.Second
 }
 
 func cacheNamespace(deployment, site string) string {
