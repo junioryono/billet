@@ -30,6 +30,12 @@ type handoffFixture struct {
 
 	hurry     chan struct{}
 	hurryOnce sync.Once
+
+	// hold makes the next poll block until the run is cancelled, and held says
+	// it is blocked, so a test can change what the listener holds while no poll
+	// is deciding anything.
+	hold atomic.Bool
+	held chan struct{}
 }
 
 // hurryUp ends a drain's wait; safe to call more than once.
@@ -74,7 +80,7 @@ func newHandoffFixture(t *testing.T, opts ...Option) *handoffFixture {
 
 	tiers := []config.Tier{tier("billet-4vcpu-handoff")}
 	f := &handoffFixture{db: openState(t), session: &fakeSession{}, log: &drainLog{},
-		hurry: make(chan struct{})}
+		hurry: make(chan struct{}), held: make(chan struct{}, 1)}
 
 	a, err := alloc.New(f.db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(outlivesTheDrain))
@@ -85,6 +91,20 @@ func newHandoffFixture(t *testing.T, opts ...Option) *handoffFixture {
 	f.a = a
 
 	var assigned atomic.Bool
+
+	f.session.onPollCtx = func(ctx context.Context) error {
+		if !f.hold.Load() {
+			return nil
+		}
+
+		select {
+		case f.held <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+
+		return ctx.Err()
+	}
 
 	f.session.onGet = func() (*Message, error) {
 		slowPoll()
@@ -132,7 +152,7 @@ func (f *handoffFixture) owe(id int64) {
 func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff())
+	f := newHandoffFixture(t, WithRestartHandoff(nil))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -144,6 +164,23 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return f.l.Running() == 1 })
 	f.owe(22)
+
+	// A POLL HELD OPEN while the escrow is staged, so the loop cannot hand that
+	// escrow back as surplus before the stop: what this test sees released is the
+	// stop's doing.
+	f.hold.Store(true)
+	select {
+	case <-f.held:
+	case <-deadline.Done():
+		t.Fatal("the listener never polled again")
+	}
+
+	f.l.mu.Lock()
+	runningLease := f.l.running[11]
+	f.l.mu.Unlock()
+	if runningLease == nil {
+		t.Fatal("request 11 has no running lease")
+	}
 
 	// HELD ESCROW, which releaseAll would hand back and a handoff must not.
 	if err := f.l.refillEscrowUngated(deadline, f.l.capacity()+1, 1); err != nil {
@@ -174,15 +211,9 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 		t.Errorf("the handoff skipped the destroy it owed for a concluded job:\n%s", f.log.String())
 	}
 
-	// AND THE RUNNING JOB'S LEASE IS STILL CHARGED, for the successor to adopt.
-	usage, err := f.a.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
-	if usage.Leases == 0 {
-		t.Error("the handoff handed back the running job's capacity")
-	}
-	for _, h := range held {
+	// AND THE RUNNING JOB'S OWN LEASE IS STILL CHARGED, for the successor to adopt,
+	// and so is the held escrow.
+	for _, h := range append([]*alloc.Lease{runningLease}, held...) {
 		got, err := f.a.Lease(t.Context(), h.ID)
 		if err != nil {
 			t.Fatalf("Lease %s: %v", h.ID, err)
@@ -199,7 +230,7 @@ func TestAStopWhileAdmittingHandsOverWithoutWaiting(t *testing.T) {
 func TestASealedStopStillDrains(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff())
+	f := newHandoffFixture(t, WithRestartHandoff(nil))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -239,7 +270,7 @@ func TestASealedStopStillDrains(t *testing.T) {
 func TestAStopThatCannotReadAdmissionDrains(t *testing.T) {
 	t.Parallel()
 
-	f := newHandoffFixture(t, WithRestartHandoff())
+	f := newHandoffFixture(t, WithRestartHandoff(nil))
 
 	if err := f.db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -275,10 +306,53 @@ func TestAListenerWithoutTheOptionNeverHandsOver(t *testing.T) {
 func TestTheStopHandoffReachesEveryListener(t *testing.T) {
 	t.Parallel()
 
-	s := New(nil, nil, nil, "owner", nil, WithStopHandoff())
+	s := New(nil, nil, nil, "owner", nil, WithStopHandoff(nil))
 
 	l := NewListener(nil, "tier", nil, s.listenerOpts(s.prov)...)
 	if !l.restartHandoff {
 		t.Fatal("the stop handoff never reached the listener")
+	}
+}
+
+// A STOP THIS HOST MARKED FINAL DRAINS EVEN WHILE THE DEPLOYMENT ADMITS WORK: a
+// package removal has no successor here, and must not seal the deployment its other
+// controllers serve.
+func TestAStopMarkedFinalDrainsWhileAdmitting(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(t, WithRestartHandoff(func() bool { return true }))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if f.l.handsOff(ctx) {
+		t.Error("a stop marked final chose to hand over")
+	}
+
+	open := newHandoffFixture(t, WithRestartHandoff(func() bool { return false }))
+	if !open.l.handsOff(ctx) {
+		t.Error("an unmarked stop while admitting did not hand over")
+	}
+}
+
+// A CANCELLATION THAT ENDS RUN BEFORE ITS LOOP IS DECIDED THE SAME WAY, so a stop
+// arriving during startup is not closed and released as if the deployment were
+// leaving.
+func TestAStopDuringStartupIsDecidedLikeAnyOther(t *testing.T) {
+	t.Parallel()
+
+	live := newHandoffFixture(t, WithRestartHandoff(nil))
+	live.l.noteStop(t.Context())
+	if live.l.handingOff {
+		t.Error("a startup failure with no stop asked was taken for a handoff")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	f := newHandoffFixture(t, WithRestartHandoff(nil))
+	f.l.noteStop(ctx)
+	if !f.l.handingOff {
+		t.Error("a stop during startup while admitting was not a handoff")
 	}
 }

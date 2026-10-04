@@ -494,6 +494,7 @@ type Listener struct {
 	// drain; see WithRestartHandoff. handingOff is Run's decision, read only by
 	// its own teardown on the same goroutine.
 	restartHandoff bool
+	stopIsFinal    func() bool
 	handingOff     bool
 
 	// leadershipLost answers whether this process has stopped being this
@@ -811,8 +812,12 @@ func WithHurrySignal(c <-chan struct{}) Option {
 // concluded, still run. A SEALED or UNREADABLE admission keeps the drain: an
 // operator who sealed asked for the deployment to stop taking work, and a stop
 // that cannot prove otherwise is not entitled to call itself a restart.
-func WithRestartHandoff() Option {
-	return func(l *Listener) { l.restartHandoff = true }
+//
+// final, when it answers true, says THIS host's stop is not a restart even though
+// the deployment admits work: a package removal, which has no successor here and
+// must not seal the deployment its other controllers serve. Nil means never.
+func WithRestartHandoff(final func() bool) Option {
+	return func(l *Listener) { l.restartHandoff, l.stopIsFinal = true, final }
 }
 
 // handsOff reports whether a stop arriving now is a handoff: the option is set,
@@ -820,6 +825,12 @@ func WithRestartHandoff() Option {
 // ctx is the cancelled run context, so the read gets its own short bound.
 func (l *Listener) handsOff(ctx context.Context) bool {
 	if !l.restartHandoff || l.alloc == nil || l.fenced() {
+		return false
+	}
+	if l.stopIsFinal != nil && l.stopIsFinal() {
+		l.log.Info("this stop was asked to drain rather than hand over, because nothing on "+
+			"this host will take over", "tier", l.tier)
+
 		return false
 	}
 
@@ -835,6 +846,14 @@ func (l *Listener) handsOff(ctx context.Context) bool {
 	}
 
 	return admission.Mode == state.AdmissionOpen
+}
+
+// noteStop decides a stop that ends Run before its loop, so a cancellation
+// arriving during startup is treated as one arriving later would be.
+func (l *Listener) noteStop(ctx context.Context) {
+	if ctx.Err() != nil && !l.handingOff && l.handsOff(ctx) {
+		l.handingOff = true
+	}
 }
 
 // handoffAdmissionRead bounds the one ledger read that decides a handoff.
@@ -1322,6 +1341,8 @@ func (l *Listener) Run(ctx context.Context) error {
 	}()
 
 	if err := l.refreshAdoptedCapacity(ctx); err != nil {
+		l.noteStop(ctx)
+
 		return err
 	}
 
@@ -1331,6 +1352,8 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
 		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
+			l.noteStop(ctx)
+
 			return err
 		}
 	}
@@ -1368,7 +1391,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			if l.handsOff(ctx) {
 				l.handingOff = true
 				l.log.Info("handing over to the next control plane: the jobs running here keep "+
-					"running and are re-adopted, and the message session stays open so what "+
+					"running and are re-adopted, and no message session is closed, so what "+
 					"GitHub assigns meanwhile is redelivered to the next session",
 					"tier", l.tier, "running", l.Running())
 

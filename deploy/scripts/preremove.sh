@@ -17,12 +17,15 @@ case "${1:-}" in
         ;;
 esac
 
-# A REAL REMOVAL, AND THE DEPLOYMENT IS SEALED FIRST. An unsealed server stop is
-# a handoff to the next control plane, which leaves its jobs and its message
-# sessions for a successor to take over (#365). A removal has no successor, so
-# the control plane is sealed before it is stopped, and its stop is then the
-# drain it always was. A seal that cannot be taken refuses the removal rather
-# than turning it into a handoff to nobody.
+# A REAL REMOVAL, AND THIS HOST'S STOP IS MARKED FINAL FIRST. A server stopped
+# while the deployment admits work hands over to the next control plane, leaving
+# its jobs and its message sessions for a successor (#365). A removal has no
+# successor on this host, so the marker below makes its stop the drain it always
+# was. It is a marker on this host and not a seal of the deployment, which other
+# controllers may still be serving. Written unconditionally, before anything is
+# stopped, so no service state read in between can skip it; a marker that cannot
+# be written refuses the removal rather than turning it into a handoff to nobody.
+# cmd/billet/stophandoff.go names the same file.
 #
 # `systemctl stop` sends SIGTERM, which begins billet's drain, so
 # this waits for the jobs already running — up to the unit's TimeoutStopSec. That
@@ -43,13 +46,12 @@ if [ -d /run/systemd/system ]; then
         systemctl disable --now "${timer}" >/dev/null 2>&1 || true
     done
 
-    if systemctl is-active --quiet billet-server 2>/dev/null; then
-        if ! "${BILLET_BIN:-/usr/bin/billet}" drain --config /etc/billet/billet.yaml \
-            --reason "the billet package is being removed from this host"; then
-            echo "billet: could not seal this deployment before removing the control" >&2
-            echo "        plane. Refusing to remove the package: stopping an unsealed" >&2
-            echo "        server hands its jobs to a control plane that will not come." >&2
-            echo "        Run \`billet drain\` and remove the package again." >&2
+    server_state=${BILLET_SERVER_STATE_DIR:-/var/lib/billet/server}
+    if [ -d "${server_state}" ]; then
+        if ! : >"${server_state}/drain-on-stop"; then
+            echo "billet: could not mark this host's stop as final in ${server_state}." >&2
+            echo "        Refusing to remove the package: its control plane would hand" >&2
+            echo "        its jobs to a successor that is not coming." >&2
             exit 1
         fi
     fi

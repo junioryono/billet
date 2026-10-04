@@ -9,13 +9,15 @@ import (
 	"time"
 )
 
-// A PACKAGE REMOVAL SEALS THE DEPLOYMENT BEFORE IT STOPS THE CONTROL PLANE. An
-// unsealed server stop is a handoff to the next control plane (#365), and a removal
-// has none, so the seal is what keeps its stop the drain it always was; a seal that
-// cannot be taken refuses the removal before anything stops, and an upgrade does
-// neither. Executed in a container against fake systemctl and billet commands that
-// record what they were asked, in order.
-func TestPackageRemovalSealsBeforeItStopsTheServer(t *testing.T) {
+// A PACKAGE REMOVAL MARKS THIS HOST'S STOP FINAL BEFORE IT STOPS THE CONTROL PLANE.
+// A server stopped while the deployment admits work hands over to the next control
+// plane (#365), and a removal has none here, so the marker is what keeps its stop the
+// drain it always was. It is a file on this host, never a seal of the deployment,
+// which other controllers may be serving, and it is written before any service state
+// is read. A marker that cannot be written refuses the removal before anything
+// stops; an upgrade does none of it. Executed in a container against a fake
+// systemctl and billet that record what they were asked, in order.
+func TestPackageRemovalMarksTheStopFinalBeforeItStopsTheServer(t *testing.T) {
 	t.Parallel()
 
 	if _, err := exec.LookPath("docker"); err != nil {
@@ -35,9 +37,17 @@ func TestPackageRemovalSealsBeforeItStopsTheServer(t *testing.T) {
 		"--mount", "type=bind,src="+script+",dst=/preremove.sh,readonly",
 		"-i", "ubuntu:24.04", "sh", "-eu")
 	cmd.Stdin = strings.NewReader(`
-mkdir -p /run/systemd/system
+mkdir -p /run/systemd/system /state
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/bin/sh
+if [ "$1" = stop ] && [ "$2" = billet-server ]; then
+    if [ -e /state/drain-on-stop ]; then
+        echo "systemctl stop billet-server (final)" >>/calls
+    else
+        echo "systemctl stop billet-server (handoff)" >>/calls
+    fi
+    exit 0
+fi
 echo "systemctl $*" >>/calls
 case "$*" in
 "is-active --quiet billet-server") exit 0 ;;
@@ -45,39 +55,44 @@ case "$*" in
 esac
 exit 0
 EOF
-cat >/fake-billet <<'EOF'
+cat >/usr/local/bin/billet <<'EOF'
 #!/bin/sh
 echo "billet $*" >>/calls
-exit "${DRAIN_STATUS:-0}"
+exit 0
 EOF
-chmod +x /usr/local/bin/systemctl /fake-billet
-export BILLET_BIN=/fake-billet
+chmod +x /usr/local/bin/systemctl /usr/local/bin/billet
+export BILLET_SERVER_STATE_DIR=/state
 
 : >/calls
 sh /preremove.sh upgrade
-if [ -s /calls ]; then
-    echo "an upgrade touched the services:" >&2
+if [ -s /calls ] || [ -e /state/drain-on-stop ]; then
+    echo "an upgrade touched the services or marked the stop:" >&2
     cat /calls >&2
     exit 1
 fi
 
 : >/calls
 sh /preremove.sh remove
-drain=$(grep -n '^billet drain --config /etc/billet/billet.yaml --reason ' /calls | cut -d: -f1)
-stop=$(grep -n '^systemctl stop billet-server$' /calls | cut -d: -f1)
-if [ -z "$drain" ] || [ -z "$stop" ] || [ "$drain" -ge "$stop" ]; then
-    echo "a removal did not seal before stopping the server:" >&2
+if ! grep -qx 'systemctl stop billet-server (final)' /calls; then
+    echo "a removal stopped the server without marking the stop final:" >&2
+    cat /calls >&2
+    exit 1
+fi
+if grep -q '^billet ' /calls; then
+    echo "a removal sealed or drained the deployment instead of marking this host:" >&2
     cat /calls >&2
     exit 1
 fi
 
 : >/calls
-if DRAIN_STATUS=1 sh /preremove.sh remove 2>/refusal; then
-    echo "a removal went on after the seal failed" >&2
+rm -f /state/drain-on-stop
+mkdir /state/drain-on-stop
+if sh /preremove.sh remove 2>/refusal; then
+    echo "a removal went on after the marker could not be written" >&2
     exit 1
 fi
-if grep -q '^systemctl stop' /calls; then
-    echo "a removal stopped a service after the seal failed:" >&2
+if grep -q 'stop' /calls; then
+    echo "a removal stopped a service after the marker could not be written:" >&2
     cat /calls >&2
     exit 1
 fi
