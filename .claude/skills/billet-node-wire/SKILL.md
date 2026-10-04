@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`/v1/register` authenticates before it reads a body.**
 - **A registration discards the host's barrier run before the request is judged.**
 - **Incarnation and epoch are different fences.**
+- **A withdrawn process's leases move to the node's next process when it adopts them (#374).**
 - **Commands are a queue with a ten-minute timeout that starts when queued, and only launches run beside each other.**
 - **Placement reads do not hold the shared plane mutex.**
 

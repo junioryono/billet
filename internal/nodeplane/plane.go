@@ -76,6 +76,10 @@ type Plane struct {
 	// its replacement by design, so ownership tied to liveness would vanish exactly when
 	// the drain still needed to renew.
 	owners map[string]leaseOwner
+	// withdrawn names, per node, the incarnations that withdrew: processes that
+	// said they will never poll again. adoptOwnershipLocked hands what one of them
+	// owned to the node's next process when that process's inventory holds it.
+	withdrawn map[string]map[string]bool
 
 	log  *slog.Logger
 	now  func() time.Time
@@ -1347,7 +1351,7 @@ func (p *Plane) register(
 					"node", req.Node, "leases", freed)
 			}
 		}
-		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true)
+		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true, nil)
 	}
 
 	return p.wireResponse(negotiated), nil
@@ -1407,6 +1411,19 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 func (p *Plane) ReconcileInventory(
 	ctx context.Context, node, incarnation string, running []string,
 ) (int, error) {
+	freed, err := p.reconcileInventory(ctx, node, incarnation, running)
+	if err != nil {
+		return freed, err
+	}
+
+	p.forgetEndedAdoptions(ctx, node, incarnation)
+
+	return freed, nil
+}
+
+func (p *Plane) reconcileInventory(
+	ctx context.Context, node, incarnation string, running []string,
+) (int, error) {
 	if p.registrar == nil {
 		return 0, nil
 	}
@@ -1440,9 +1457,61 @@ func (p *Plane) ReconcileInventory(
 	if err != nil {
 		return 0, err
 	}
-	p.adoptOwnershipLocked(node, incarnation, running, true)
+	p.adoptOwnershipLocked(node, incarnation, running, true, nil)
 
 	return freed, nil
+}
+
+// forgetEndedAdoptions drops a withdrawn process's snapshot adoption on this node
+// once the ledger says its lease ended (#374).
+//
+// ON PROOF, AND ONLY FOR A PROCESS THAT WITHDREW. A superseded process that did
+// not withdraw may still be draining, and an ended lease does not prove its
+// cleanup is done: its heartbeats and runner removal for that lease need the
+// ownership, and nothing would give it back. Registration keeps a superseded
+// process's adoption of a quarantined lease, because the launched set leaves
+// quarantine out; when a reconciliation later ends that lease, nothing names the
+// adoption again: it carries no request id, and only a registration prunes
+// another process's adoptions. Left, it and the withdrawal record it keeps alive
+// would outlive the lease until the node next registers. Registrar.Lease answers
+// ErrLeaseNotFound for a lease that is absent or terminal, which is that proof;
+// any other answer is could-not-tell and keeps the record for the next pass.
+//
+// The reads run outside the plane's mutex, and a record is forgotten only if it
+// is still the one that was read about.
+func (p *Plane) forgetEndedAdoptions(ctx context.Context, node, incarnation string) {
+	if p.registrar == nil {
+		return
+	}
+
+	p.mu.Lock()
+	candidates := make(map[string]leaseOwner)
+	for id, owner := range p.owners {
+		if owner.node == node && owner.requestID == 0 && owner.incarnation != incarnation &&
+			p.withdrawn[node][owner.incarnation] {
+			candidates[id] = owner
+		}
+	}
+	p.mu.Unlock()
+
+	ended := make(map[string]leaseOwner, len(candidates))
+	for id, owner := range candidates {
+		if _, err := p.registrar.Lease(ctx, id); errors.Is(err, alloc.ErrLeaseNotFound) {
+			ended[id] = owner
+		}
+	}
+	if len(ended) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, owner := range ended {
+		if p.owners[id] == owner {
+			delete(p.owners, id)
+		}
+	}
+	p.pruneWithdrawnLocked()
 }
 
 // checkInventoryPlacement keeps a node's observation from becoming authority over
@@ -1658,7 +1727,19 @@ func (p *Plane) ForgetLease(node, leaseID string) {
 // The ledger knows what it forgot: a lease bound to this node and still open is
 // this node's, and the process registering now is the one holding it.
 func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
-	p.AdoptOwnershipWithInventory(node, incarnation, leaseIDs, false)
+	p.AdoptOwnershipKeeping(node, incarnation, leaseIDs, nil)
+}
+
+// AdoptOwnershipKeeping is AdoptOwnership for the registration handler, whose ids
+// are the ledger's launched set plus the process's report, with keep the leases
+// the ledger holds in quarantine. keep is never adopted; it only stops another
+// process's adoption of a quarantined lease being pruned as ended, because the
+// launched set leaves quarantine out and a still-draining process would lose the
+// right to maintain or release that compute.
+func (p *Plane) AdoptOwnershipKeeping(node, incarnation string, leaseIDs []string, keep map[string]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.adoptOwnershipLocked(node, incarnation, leaseIDs, false, keep)
 }
 
 // AdoptOwnershipWithInventory atomically restores owners and records whether
@@ -1670,13 +1751,14 @@ func (p *Plane) AdoptOwnershipWithInventory(
 ) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.adoptOwnershipLocked(node, incarnation, leaseIDs, inventoryKnown)
+	p.adoptOwnershipLocked(node, incarnation, leaseIDs, inventoryKnown, nil)
 }
 
 func (p *Plane) adoptOwnershipLocked(
 	node, incarnation string,
 	leaseIDs []string,
 	inventoryKnown bool,
+	keep map[string]bool,
 ) {
 	n := p.nodes[node]
 	if n == nil || n.incarnation != incarnation {
@@ -1708,8 +1790,24 @@ func (p *Plane) adoptOwnershipLocked(
 		// superseded is still draining — which is the exact situation this exists
 		// to survive. A lease already attributed to a process stays with it; the
 		// current incarnation is permitted anyway, by name.
-		if _, taken := p.owners[id]; !taken {
+		//
+		// EXCEPT FROM A PROCESS THAT WITHDREW, and only on the process's own
+		// report (#374). inventoryKnown is set exactly where leaseIDs is what this
+		// process says it holds, at registration and at every reconciliation, never
+		// where it is the ledger's launched set. Withdrawal is the process saying,
+		// authenticated and fenced to its incarnation, that it will never poll
+		// again, so nothing of it is still draining, and the report is the
+		// observation that the compute is on this process's host: a host sharing
+		// the name that does not report the lease never becomes what a completion's
+		// destroy reaches. The request id moves too, so the destroy that ends the
+		// job still ends the ownership.
+		owner, taken := p.owners[id]
+		switch {
+		case !taken:
 			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
+		case inventoryKnown && owner.node == node && owner.incarnation != incarnation &&
+			p.withdrawn[node][owner.incarnation]:
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation, requestID: owner.requestID}
 		}
 	}
 
@@ -1728,11 +1826,28 @@ func (p *Plane) adoptOwnershipLocked(
 	//
 	// Runs even for an empty snapshot: one-to-zero is exactly the shape that
 	// strands an entry for the life of the process.
+	//
+	// A REPORT SPEAKS ONLY FOR THE PROCESS THAT SENT IT. With inventoryKnown the
+	// ids are this process's own report, and pruning a superseded process's
+	// adoption on it let the ledger's launched set hand that lease to the
+	// replacement a moment later, so a replacement reporting nothing answered its
+	// destroy with a no-op over a guest still running elsewhere. Without it the
+	// ids include the ledger's launched set (the registration handler's call),
+	// and keep its quarantined set, so another process's snapshot adoption missing
+	// from both is a lease the ledger no longer holds open on this node: pruned,
+	// or a withdrawn process's stale adoption, and its withdrawal record, would
+	// outlive everything that could ever name it. Quarantine is the case the
+	// launched set alone gets wrong: it leaves quarantine out.
 	for id, owner := range p.owners {
-		if owner.node == node && owner.requestID == 0 && !open[id] {
+		if owner.node != node || owner.requestID != 0 || open[id] {
+			continue
+		}
+		if owner.incarnation == incarnation || (!inventoryKnown && !keep[id]) {
 			delete(p.owners, id)
 		}
 	}
+
+	p.pruneWithdrawnLocked()
 }
 
 // MayMutateLease reports whether this process may change a lease's fate.
@@ -2279,6 +2394,12 @@ func (p *Plane) Withdraw(ctx context.Context, name, incarnation string) error {
 		return err
 	}
 
+	// RECORDED ON RECEIPT, BEFORE THE LEDGER IS WRITTEN. The request is the
+	// process saying it will never poll again, which is true whatever the ledger
+	// answers, and recording it after the write let a registration landing in
+	// between adopt the process's work without seeing it, and then never.
+	p.recordWithdrawnLocked(name, incarnation)
+
 	epoch := n.ledgerEpoch
 
 	p.mu.Unlock()
@@ -2345,6 +2466,60 @@ func (p *Plane) Withdraw(ctx context.Context, name, incarnation string) error {
 		"node", name)
 
 	return nil
+}
+
+// recordWithdrawnLocked remembers that a process of a node withdrew, while it
+// still owns something, which is the only use the record has: the node's next
+// process takes over the leases it reports (adoptOwnershipLocked). Caller holds p.mu.
+func (p *Plane) recordWithdrawnLocked(node, incarnation string) {
+	if incarnation == "" || !p.ownsAnythingLocked(node, incarnation) {
+		return
+	}
+	if p.withdrawn == nil {
+		p.withdrawn = make(map[string]map[string]bool)
+	}
+	if p.withdrawn[node] == nil {
+		p.withdrawn[node] = make(map[string]bool)
+	}
+	p.withdrawn[node][incarnation] = true
+}
+
+// pruneWithdrawnLocked forgets withdrawn processes that own nothing any more,
+// whichever path removed their last lease. Caller holds p.mu.
+//
+// ONE PASS OVER THE OWNERS, then the records against it, because this runs under
+// the plane's mutex on every expiry check.
+func (p *Plane) pruneWithdrawnLocked() {
+	if len(p.withdrawn) == 0 {
+		return
+	}
+
+	owning := make(map[[2]string]bool, len(p.withdrawn))
+	for _, owner := range p.owners {
+		owning[[2]string{owner.node, owner.incarnation}] = true
+	}
+	for node, gone := range p.withdrawn {
+		for incarnation := range gone {
+			if !owning[[2]string{node, incarnation}] {
+				delete(gone, incarnation)
+			}
+		}
+		if len(gone) == 0 {
+			delete(p.withdrawn, node)
+		}
+	}
+}
+
+// ownsAnythingLocked reports whether an incarnation of a node is recorded as the
+// owner of any lease. Caller holds p.mu.
+func (p *Plane) ownsAnythingLocked(node, incarnation string) bool {
+	for _, owner := range p.owners {
+		if owner.node == node && owner.incarnation == incarnation {
+			return true
+		}
+	}
+
+	return false
 }
 
 // forgetNodeLocked removes a node's record, keeping the tombstones that must
@@ -2421,11 +2596,18 @@ func (p *Plane) settleAbandonedLocked(
 	case entry.kind == nodeapi.CommandLaunch && res.OK:
 		return ErrTakeCustody
 
-	case entry.kind == nodeapi.CommandLaunch:
+	case entry.kind == nodeapi.CommandLaunch && !res.Custody &&
+		(entry.incarnation == "" || p.ownedByLocked(entry.requestID, nodeName, entry.incarnation)):
 		// A FAILED LATE LAUNCH NEEDS NO HANDOFF: nothing is running, so there
-		// is nothing to hold — and nothing left to own either.
+		// is nothing to hold — and nothing left to own either. ONLY WHILE ITS OWN
+		// PROCESS OWNS IT: a lease since handed to the node's next process (#374)
+		// is that process's record, and a failure that may have left compute
+		// (Custody) keeps whatever owns it.
 		p.forgetForRequestLocked(entry.requestID)
 
+		return nil
+
+	case entry.kind == nodeapi.CommandLaunch:
 		return nil
 	}
 
@@ -2470,6 +2652,8 @@ func (p *Plane) staleAfter() time.Duration {
 // is answered is the QUEUE: those commands never reached the node, so a caller
 // waiting on a machine that is gone is told plainly that nothing started.
 func (p *Plane) expireStaleLocked() {
+	p.pruneWithdrawnLocked()
+
 	cutoff := p.now().Add(-p.staleAfter())
 
 	for name, n := range p.nodes {
