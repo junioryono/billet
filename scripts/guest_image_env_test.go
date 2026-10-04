@@ -45,6 +45,21 @@ func TestTheImageEnvironmentReachesTheJob(t *testing.T) {
 			denyEnv: []string{"this is not an assignment", "=novalue"},
 		},
 		{
+			// A NAME THAT IS NOT A VARIABLE'S IS SKIPPED TOO. billet-exec-env
+			// refuses one, and an image whose file is damaged should still run jobs.
+			name:    "a name that is not a variable's is skipped",
+			file:    "NOT-A-NAME=x\nImageOS=ubuntu24\n",
+			wantEnv: []string{"ImageOS=ubuntu24"},
+			denyEnv: []string{"NOT-A-NAME"},
+		},
+		{
+			// OPTIND IS THE SHELL'S OWN STATE, which billet-exec-env refuses.
+			name:    "OPTIND is skipped",
+			file:    "OPTIND=x\nImageOS=ubuntu24\n",
+			wantEnv: []string{"ImageOS=ubuntu24"},
+			denyEnv: []string{"OPTIND"},
+		},
+		{
 			// THE RUNNER'S OWN VARIABLES MUST SURVIVE. A block that assigned to the
 			// array instead of appending would drop every one of them, and the job
 			// would start with no HOME, no PATH and no registration.

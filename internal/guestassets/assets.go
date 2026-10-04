@@ -23,3 +23,9 @@ var DNSUpstreamsScript string
 //
 //go:embed runner-service.sh
 var RunnerServiceScript string
+
+// ExecEnvScript execs the runner with an environment read from descriptor 3, so
+// the registration and the cache bearer never appear in an argument list.
+//
+//go:embed exec-env.sh
+var ExecEnvScript string

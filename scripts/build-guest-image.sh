@@ -552,8 +552,8 @@ run_runner_images_build() {
 # ImageOS, ImageVersion, the JAVA_HOME and GOROOT lines, ANDROID_HOME, the tool
 # cache and GitHub's PATH, as a hosted runner exports them.
 #
-# THE AGENT PASSES EACH LINE AS IT IS, through env -i, so each line is made a
-# plain NAME=VALUE here by pam-environment.awk, the reader the build's own steps
+# THE AGENT PASSES EACH LINE AS IT IS, as the job's whole environment, so each
+# line is made a plain NAME=VALUE here by pam-environment.awk, the reader the build's own steps
 # use; and $HOME, which GitHub writes into PATH and XDG_CONFIG_HOME for a login
 # shell to expand, is the runner's home, which nothing downstream expands.
 write_image_env() {
@@ -852,6 +852,8 @@ IMAGEINFO
 		"$rootfs/usr/local/bin/billet-actions-proxy"
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/dns-upstreams.py" \
 		"$rootfs/usr/local/bin/billet-dns-upstreams"
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/exec-env.sh" \
+		"$rootfs/usr/local/bin/billet-exec-env"
 	# THE DOCKER SHIM SITS AHEAD OF THE REAL CLIENT on the job's PATH and points a
 	# build's BuildKit cache client at the adapter, which is what lets a workflow
 	# that changed only `runs-on` export `type=gha` from a container-driver
@@ -1607,16 +1609,17 @@ runner_env=(
 
 # WHAT THE IMAGE SAYS IT IS, added to what the job will see.
 #
-# THIS ARRAY IS THE JOB'S WHOLE ENVIRONMENT -- it is passed through `env -i`, so a
-# variable absent here does not exist for the job whatever /etc/environment says.
+# THIS ARRAY IS THE JOB'S WHOLE ENVIRONMENT -- the launch starts from `env -i`, so
+# a variable absent here does not exist for the job whatever /etc/environment says.
 # The build writes /etc/billet-image-env with the values a hosted runner exports
 # (ImageOS and friends), and they have to be read in HERE to reach a job at all.
 #
 # READ AS DATA, NOT SOURCED. `source` on a file would execute it, and while this
 # one is written by the build, a shell that executes a config file is a shape
-# worth not having. Only NAME=VALUE lines are taken, and a malformed line is
-# skipped rather than ending the launch: an image that lost this file should run
-# jobs that download their own toolchains, not refuse to run jobs at all.
+# worth not having. Only lines whose name is a variable's are taken, and any other
+# line is skipped rather than ending the launch: an image that lost this file
+# should run jobs that download their own toolchains, not refuse to run jobs at
+# all, and billet-exec-env refuses a name that is not a variable's.
 # THE PATH IS A DEFAULTED VARIABLE so a test can drive this exact code against a
 # fixture. Grepping the agent for the assignment proves only that the text is
 # present, which is satisfied by dead code -- the seam is what lets the block be
@@ -1625,9 +1628,9 @@ IMAGE_ENV_FILE="${IMAGE_ENV_FILE:-/etc/billet-image-env}"
 
 if [ -r "$IMAGE_ENV_FILE" ]; then
 	while IFS= read -r line; do
-		case "$line" in
-			[A-Za-z_]*=*) runner_env+=("$line") ;;
-		esac
+		if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && [[ "$line" != OPTIND=* ]]; then
+			runner_env+=("$line")
+		fi
 	done <"$IMAGE_ENV_FILE"
 fi
 if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
@@ -1736,11 +1739,41 @@ if { [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actio
 	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
 fi
 
+# THE ENVIRONMENT CROSSES ON DESCRIPTOR 3, NEVER IN AN ARGUMENT LIST (#352). It
+# carries the registration and the cache bearer, and setpriv's and env's argv are
+# readable by every process in the guest until each execs the next. The here-
+# document reaches billet-exec-env through a pipe or an unlinked file, and printf
+# is a builtin, so no process on the way to the runner carries a value in argv.
+# A value holding a newline cannot travel one line per variable, so it refuses
+# the launch, naming the variable and never the value, and the steps below run
+# as for a failed job. The path is a defaulted variable so a test executes this
+# stanza against the real helper.
+EXEC_ENV="${EXEC_ENV:-/usr/local/bin/billet-exec-env}"
 set +e
 # BILLET_AGENT_LAUNCH_BEGIN
-setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
-	env -i "${runner_env[@]}" "${cmd[@]}"
-job_status=$?
+launch_refused=""
+for entry in "${runner_env[@]}"; do
+	if [[ "$entry" == *$'\n'* ]]; then
+		log "${entry%%=*} holds a newline, which cannot reach the runner; refusing the launch"
+		launch_refused=1
+	fi
+done
+# SERIALIZED AND CHECKED BEFORE THE LAUNCH, so the terminator the here-document
+# appends can never follow a stream that was cut short.
+if [ -z "$launch_refused" ] && ! runner_env_stream=$(printf '%s\n' "${runner_env[@]}"); then
+	log "the runner's environment could not be written out; refusing the launch"
+	launch_refused=1
+fi
+if [ -n "$launch_refused" ]; then
+	job_status=1
+else
+	setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
+		env -i "$EXEC_ENV" "${cmd[@]}" 3<<BILLET_RUNNER_ENV
+$runner_env_stream
+end
+BILLET_RUNNER_ENV
+	job_status=$?
+fi
 # BILLET_AGENT_LAUNCH_END
 set -e
 

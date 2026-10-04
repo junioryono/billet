@@ -1,9 +1,11 @@
 package ec2
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -56,9 +58,9 @@ func TestTheImageDeclaresItsToolcacheAndIdentity(t *testing.T) {
 // THE ENTRY POINT ACTUALLY READS THE FILE, and this runs the emitted shell rather
 // than looking for it.
 //
-// `env -i` means a variable not named on that command line does not exist for the
-// job. So the question is not whether the file is written — it is whether its
-// contents reach the invocation, and only running the block answers that.
+// `env -i` means a variable not in billet_env does not exist for the job. So the
+// question is not whether the file is written — it is whether its contents reach
+// the stream the runner is launched with, and only running the block answers that.
 func TestTheEntryPointCarriesTheImageEnvIntoTheJob(t *testing.T) {
 	t.Parallel()
 
@@ -98,12 +100,28 @@ func TestTheEntryPointCarriesTheImageEnvIntoTheJob(t *testing.T) {
 		},
 		{
 			// COMMENTS AND BLANKS ARE SKIPPED, the same filter the guest applies.
-			// Handed to env, either is a malformed assignment.
+			// billet-exec-env refuses either, which would refuse the launch.
 			name:  "comments and blank lines",
 			write: true,
 			file:  "# a comment\n\nImageOS=ubuntu24\n   \n",
 			want:  []string{"ImageOS=ubuntu24"},
-			deny:  []string{"# a comment"},
+			deny:  []string{"# a comment", "   "},
+		},
+		{
+			// A NAME THAT IS NOT A VARIABLE'S IS SKIPPED for the same reason.
+			name:  "a name with a hyphen",
+			write: true,
+			file:  "NOT-A-NAME=x\nImageOS=ubuntu24\n",
+			want:  []string{"ImageOS=ubuntu24"},
+			deny:  []string{"NOT-A-NAME"},
+		},
+		{
+			// OPTIND IS THE SHELL'S OWN STATE, which billet-exec-env refuses.
+			name:  "OPTIND",
+			write: true,
+			file:  "OPTIND=x\nImageOS=ubuntu24\n",
+			want:  []string{"ImageOS=ubuntu24"},
+			deny:  []string{"OPTIND"},
 		},
 		{
 			// NO FILE IS NOT A FAILURE. The entry point runs under `set -eu`, and
@@ -128,9 +146,8 @@ func TestTheEntryPointCarriesTheImageEnvIntoTheJob(t *testing.T) {
 			// Only the path moves; the commands are the generated script's bytes.
 			runnable := strings.ReplaceAll(block, imageEnvFile, path)
 
-			// Print what would reach `env -i`, one argument per line, so a value
-			// containing a space is visibly one argument rather than two.
-			script := "set -eu\n" + runnable + "\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n"
+			// Print the stream billet-exec-env would read, one assignment per line.
+			script := "set -eu\n" + runnable + "\nprintf '%s' \"$billet_env\"\n"
 
 			out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", script).Output()
 			if err != nil {
@@ -154,22 +171,37 @@ func TestTheEntryPointCarriesTheImageEnvIntoTheJob(t *testing.T) {
 	}
 }
 
-// imageEnvBlock lifts the entry point's image-env read out of the generated
-// script: from `set --` to the `fi` that closes it.
+// entryPoint is the generated billet-runner script, out of the provisioning
+// script that writes it.
+func entryPoint(t *testing.T, script string) string {
+	t.Helper()
+
+	_, after, ok := strings.Cut(script, "cat > /usr/local/bin/billet-runner <<'BILLETEOF'\n")
+	if !ok {
+		t.Fatal("no entry point is written")
+	}
+
+	entry, _, ok := strings.Cut(after, "BILLETEOF\n")
+	if !ok {
+		t.Fatal("the entry point heredoc is not closed")
+	}
+
+	return entry
+}
+
+// imageEnvBlock lifts the entry point's environment build out of the generated
+// script: from the billet_env assignment to the `fi` that closes the image-env
+// read.
 func imageEnvBlock(t *testing.T, script string) string {
 	t.Helper()
 
-	// THE EXACT LINE, not a substring: `set -- "$@" "$billet_line"` inside the loop
-	// contains `set --` too, and lineOf refuses an ambiguous marker rather than
-	// picking one — which is how this was caught instead of silently lifting the
-	// wrong region.
-	lines := strings.Split(script, "\n")
+	lines := strings.Split(entryPoint(t, script), "\n")
 	start := -1
 
 	for i, l := range lines {
-		if l == "set --" {
+		if strings.HasPrefix(l, "billet_env='") {
 			if start >= 0 {
-				t.Fatalf("`set --` opens a block at line %d and again at %d", start, i)
+				t.Fatalf("billet_env is built at line %d and again at %d", start, i)
 			}
 
 			start = i
@@ -177,7 +209,7 @@ func imageEnvBlock(t *testing.T, script string) string {
 	}
 
 	if start < 0 {
-		t.Fatal("the entry point never opens the image-env block")
+		t.Fatal("the entry point never builds billet_env")
 	}
 
 	for i := start; i < len(lines); i++ {
@@ -191,99 +223,188 @@ func imageEnvBlock(t *testing.T, script string) string {
 	return ""
 }
 
-// THE VARIABLES REACH THE CHILD'S ENVIRONMENT, which is the property, and the
-// first version of this file did not test it.
-//
-// TestTheEntryPointCarriesTheImageEnvIntoTheJob lifts the `set --` block and runs
-// it, so it proves the positional parameters get populated. It says nothing about
-// whether they are PASSED — and a mutant deleting `"$@"` from the env invocation
-// survived it. That is the toolcache on disk and invisible, which is the entire
-// failure this phase exists to prevent.
-//
-// So this runs the invocation itself. `setpriv` is Linux-only and this suite runs
-// on macOS too, so the privilege drop is replaced with nothing and the runner
-// with a printenv — everything between them, including `"$@"` and the explicit
-// assignments, is the generated script's own bytes.
-func TestTheImageEnvReachesTheJobsEnvironment(t *testing.T) {
-	t.Parallel()
+// launchFixture is the entry point's launch, from the environment build to the
+// runner's exit status, rewritten to run here: the image env file, the helper
+// and the runner service move, and setpriv is a stub on PATH that records every
+// word of its argv, which is env's argv and the helper's too, before it execs
+// the rest.
+type launchFixture struct {
+	script  string
+	argvLog string
+	path    string
+}
 
-	script := mustScript(t)
-	lines := strings.Split(script, "\n")
+func newLaunchFixture(t *testing.T, imageEnv string) launchFixture {
+	t.Helper()
 
-	start := -1
+	entry := entryPoint(t, mustScript(t))
 
-	for i, l := range lines {
-		if l == "set --" {
-			start = i
-
-			break
-		}
-	}
-
-	if start < 0 {
-		t.Fatal("the entry point never opens the image-env block")
-	}
-
-	end := -1
-
-	for i := start; i < len(lines); i++ {
-		if strings.HasSuffix(lines[i], "/opt/actions-runner/billet-runner-service") {
-			end = i
-
-			break
-		}
-	}
-
-	if end <= start {
-		t.Fatalf("the invocation opens at line %d and never reaches the runner", start)
+	start := strings.Index(entry, "billet_env='")
+	end := strings.Index(entry, "job_status=$?\nfi\n")
+	if start < 0 || end <= start {
+		t.Fatal("the entry point's launch is no longer extractable")
 	}
 
 	dir := t.TempDir()
 	envFile := filepath.Join(dir, "billet-image-env")
+	writeFile(t, envFile, imageEnv, 0o600)
 
-	if err := os.WriteFile(envFile, []byte(
+	runnable := entry[start : end+len("job_status=$?\nfi\n")]
+	runnable = substitute(t, runnable, imageEnvFile, envFile)
+	runnable = substitute(t, runnable, execEnvPath, execEnvForTest(t))
+	runnable = substitute(t, runnable, "/opt/actions-runner/billet-runner-service", "/usr/bin/env")
+
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatalf("make the stub directory: %v", err)
+	}
+
+	argvLog := filepath.Join(dir, "setpriv.argv")
+	stub := "#!/bin/sh\n" +
+		"for word in \"$@\"; do printf '%s\\n' \"$word\"; done >" + argvLog + "\n" +
+		"while [ $# -gt 0 ]; do\n" +
+		"  case \"$1\" in --*) shift ;; *) break ;; esac\n" +
+		"done\n" +
+		"exec \"$@\"\n"
+	if err := forkSafeWriteFile(filepath.Join(bin, "setpriv"), []byte(stub)); err != nil {
+		t.Fatalf("write the setpriv stub: %v", err)
+	}
+
+	return launchFixture{
+		script: "set -eu\nrunner_started=222\n" + runnable +
+			"echo \"after the launch: $job_status\" >&2\nexit \"$job_status\"\n",
+		argvLog: argvLog,
+		path:    bin + ":/usr/bin:/bin",
+	}
+}
+
+// run executes the launch with the given exported variables and the inherited
+// ones a root shell would carry, poisoned so a value that leaked past `env -i`
+// is visible.
+func (f launchFixture) run(t *testing.T, exported map[string]string) (string, string, error) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", f.script)
+	cmd.Env = []string{"PATH=" + f.path, "HOME=/root", "USER=root", "POISON=inherited"}
+	for name, value := range exported {
+		cmd.Env = append(cmd.Env, name+"="+value)
+	}
+
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	return stdout.String(), stderr.String(), err
+}
+
+// THE RUNNER'S ENVIRONMENT IS EXACTLY THE LISTED SET, AND NO VALUE IS IN AN
+// ARGUMENT LIST (#352). This runs the entry point's own launch, so it proves the
+// image's variables, the fixed assignments and the registration all reach the
+// runner, that nothing root's shell carried does, and that the registration and
+// the cache bearer appear in no word of setpriv's argv, which holds env's and
+// billet-exec-env's in turn.
+func TestTheEntryPointLaunchesTheRunnerWithExactlyItsEnvironment(t *testing.T) {
+	t.Parallel()
+
+	const (
+		jit   = `jit s3cr3t $HOME "q" 'x' back\slash =eq`
+		token = "cache-s3cr3t"
+	)
+
+	f := newLaunchFixture(t,
 		"RUNNER_TOOL_CACHE=/opt/hostedtoolcache\n"+
 			"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n"+
 			"ImageOS=ubuntu24\n"+
-			"JAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n"), 0o600); err != nil {
-		t.Fatalf("write the image env: %v", err)
-	}
+			"JAVA_HOME_17_X64=/usr/lib/jvm/temurin-17\n"+
+			"PATH=/image/bin:/usr/bin:/bin\n")
 
-	runnable := strings.Join(lines[start:end+1], "\n") + "\n"
-	runnable = strings.ReplaceAll(runnable, imageEnvFile, envFile)
-
-	// The privilege drop is Linux-only; the assignments after it are the subject.
-	runnable = strings.ReplaceAll(runnable,
-		"setpriv --reuid=runner --regid=runner --init-groups \\\n", "")
-	runnable = strings.ReplaceAll(runnable,
-		"/opt/actions-runner/billet-runner-service", "sh -c printenv")
-
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c",
-		"set -eu\nrunner_started=0\n"+jitEnvVar+"=jit\n"+runnable)
-
-	out, err := cmd.Output()
+	out, stderr, err := f.run(t, map[string]string{
+		jitEnvVar:                                            jit,
+		"BILLET_LAUNCH_EPOCH_NS":                             "111",
+		"BILLET_CACHE_ENDPOINT":                              "http://node:7000",
+		"BILLET_CACHE_TOKEN":                                 token,
+		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES":            "5",
+		"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE": "1",
+	})
 	if err != nil {
-		t.Fatalf("the invocation failed: %v\n--- block ---\n%s", err, runnable)
+		t.Fatalf("the launch failed: %v\n%s", err, stderr)
 	}
 
-	got := string(out)
+	// ALL OF IT: the helper runs under dash, as in the image, and dash adds nothing.
+	got := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	slices.Sort(got)
 
-	for _, want := range []string{
-		"RUNNER_TOOL_CACHE=/opt/hostedtoolcache",
+	want := []string{
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath,
+		jitEnvVar + "=" + jit,
+		"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true",
+		"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1",
 		"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache",
+		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=5",
+		"BILLET_CACHE_ENDPOINT=http://node:7000",
+		"BILLET_CACHE_TOKEN=" + token,
+		"BILLET_LAUNCH_EPOCH_NS=111",
+		"BILLET_RUNNER_START_EPOCH_NS=222",
+		"HOME=/home/runner",
 		"ImageOS=ubuntu24",
 		"JAVA_HOME_17_X64=/usr/lib/jvm/temurin-17",
-	} {
-		if !strings.Contains(got, want+"\n") {
-			t.Errorf("%q never reached the job's environment, so the toolcache is on disk "+
-				"and invisible; env was:\n%s", want, got)
-		}
+		"LANG=C.UTF-8",
+		"LOGNAME=runner",
+		// THE IMAGE'S PATH REPLACES THE BASE ONE, as a later assignment did on
+		// env's command line.
+		"PATH=/image/bin:/usr/bin:/bin",
+		"RUNNER_TOOL_CACHE=/opt/hostedtoolcache",
+		"USER=runner",
+	}
+	slices.Sort(want)
+
+	if !slices.Equal(got, want) {
+		t.Errorf("the runner's environment is\n%s\nwant exactly\n%s",
+			strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 
-	// AND THE EXPLICIT ASSIGNMENTS SURVIVE ALONGSIDE THEM. Putting "$@" in the
-	// wrong place — after the command, say — would carry the image env and drop
-	// these, which no assertion above would notice.
-	if !strings.Contains(got, "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true\n") {
-		t.Errorf("the explicit assignments no longer reach the job; env was:\n%s", got)
+	argv, err := os.ReadFile(f.argvLog)
+	if err != nil {
+		t.Fatalf("read setpriv's argv: %v", err)
+	}
+	for _, secret := range []string{"s3cr3t", "http://node:7000"} {
+		if strings.Contains(string(argv), secret) {
+			t.Errorf("%q is in an argument list on the way to the runner:\n%s", secret, argv)
+		}
+	}
+	if !strings.Contains(string(argv), "\n-i\n") {
+		t.Errorf("the launch does not empty the environment with env -i:\n%s", argv)
+	}
+}
+
+// A VALUE HOLDING A NEWLINE REFUSES THE LAUNCH, naming the variable and not the
+// value. One line per variable cannot carry it, and splitting it would hand the
+// runner a second assignment the value chose.
+func TestTheEntryPointRefusesAValueHoldingANewline(t *testing.T) {
+	t.Parallel()
+
+	f := newLaunchFixture(t, "ImageOS=ubuntu24\n")
+
+	_, stderr, err := f.run(t, map[string]string{
+		jitEnvVar: "first-s3cr3t\nBILLET_CACHE_TOKEN=forged",
+	})
+	exit, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exit.ExitCode() != 1 {
+		t.Fatalf("the launch ended with %v, want exit status 1\n%s", err, stderr)
+	}
+	// THE REFUSAL IS A FAILED JOB, not an exit, so the image-store steps after the
+	// launch still run; the fixture's last line stands in for them.
+	if !strings.Contains(stderr, "after the launch: 1\n") {
+		t.Errorf("the refusal skipped the steps after the launch: %q", stderr)
+	}
+	if !strings.Contains(stderr, jitEnvVar+" holds a newline") {
+		t.Errorf("the refusal %q does not name the variable", stderr)
+	}
+	if strings.Contains(stderr, "s3cr3t") {
+		t.Errorf("the refusal quotes the value: %q", stderr)
+	}
+	if _, err := os.Lstat(f.argvLog); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("setpriv ran after the refusal (lstat: %v)", err)
 	}
 }

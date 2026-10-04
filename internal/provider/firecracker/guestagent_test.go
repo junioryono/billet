@@ -3,6 +3,7 @@ package firecracker
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -245,10 +246,14 @@ func TestTheGuestAgentEstablishesTheRunnerAccountEnvironment(t *testing.T) {
 
 	shadow := t.TempDir()
 	setprivLog := filepath.Join(shadow, "setpriv.log")
+	// EVERY WORD OF setpriv'S ARGV IS RECORDED, which is env's argv and
+	// billet-exec-env's in turn, so a value on any of them is visible (#352).
 	stub := `#!/bin/sh
 : > "$BILLET_TEST_SETPRIV_LOG"
+for word in "$@"; do
+	printf '%s\n' "$word" >> "$BILLET_TEST_SETPRIV_LOG"
+done
 while [ "$#" -gt 0 ]; do
-	printf '%s\n' "$1" >> "$BILLET_TEST_SETPRIV_LOG"
 	if [ "$1" = -- ]; then
 		shift
 		exec "$@"
@@ -260,12 +265,21 @@ exit 97
 	if err := forkSafeWriteFile(filepath.Join(shadow, "setpriv"), []byte(stub), 0o755); err != nil {
 		t.Fatalf("write the validating setpriv stub: %v", err)
 	}
+	helper, err := os.ReadFile(filepath.Join("..", "..", "guestassets", "exec-env.sh"))
+	if err != nil {
+		t.Fatalf("read exec-env.sh: %v", err)
+	}
+	execEnv := filepath.Join(shadow, "billet-exec-env")
+	if err := forkSafeWriteFile(execEnv, helper, 0o755); err != nil {
+		t.Fatalf("write billet-exec-env: %v", err)
+	}
 
 	script := `
 set -euo pipefail
-ACTIONS_RUNNER_INPUT_JITCONFIG=fixture
+ACTIONS_RUNNER_INPUT_JITCONFIG='fixture-s3cr3t $HOME "q"'
+EXEC_ENV=` + execEnv + `
 ` + block + `
-	cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "${ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED-}" "${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE-}" "$(id -u)" "$(id -g)"')
+	cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "${ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED-}" "${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE-}" "${ACTIONS_RUNNER_INPUT_JITCONFIG-}" "$(id -u)" "$(id -g)"')
 ` + launch + `
 exit "$job_status"
 `
@@ -290,7 +304,7 @@ exit "$job_status"
 	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
 	want := []string{
 		"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache",
-		"true", "1",
+		"true", "1", `fixture-s3cr3t $HOME "q"`,
 		strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid()),
 	}
 	if len(fields) != len(want) {
@@ -306,9 +320,115 @@ exit "$job_status"
 	if err != nil {
 		t.Fatalf("read the privilege-drop argv: %v", err)
 	}
-	wantSetpriv := "--reuid=runner\n--regid=runner\n--init-groups\n--inh-caps=-all\n--\n"
-	if string(setprivArgs) != wantSetpriv {
-		t.Errorf("setpriv arguments = %q, want %q", setprivArgs, wantSetpriv)
+	wantSetpriv := "--reuid=runner\n--regid=runner\n--init-groups\n--inh-caps=-all\n--\n" +
+		"env\n-i\n" + execEnv + "\nbash\n-c\n"
+	if !strings.HasPrefix(string(setprivArgs), wantSetpriv) {
+		t.Errorf("setpriv arguments = %q, want them to begin %q", setprivArgs, wantSetpriv)
+	}
+	if strings.Contains(string(setprivArgs), "s3cr3t") {
+		t.Errorf("the registration is in an argument list on the way to the runner:\n%s", setprivArgs)
+	}
+}
+
+// THE SEAM DEFAULTS TO WHERE THE IMAGE INSTALLS THE HELPER, or the launch the
+// test above executes would work only when something sets the path, which
+// nothing does in a real guest.
+func TestTheGuestAgentLaunchesThroughTheInstalledHelper(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh"))
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	for _, want := range []string{
+		`EXEC_ENV="${EXEC_ENV:-/usr/local/bin/billet-exec-env}"`,
+		`install -m 0755 "$SCRIPT_DIR/../internal/guestassets/exec-env.sh" \` + "\n" +
+			`		"$rootfs/usr/local/bin/billet-exec-env"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the guest image does not carry %q", want)
+		}
+	}
+}
+
+// A LAUNCH THE AGENT CANNOT MAKE WHOLE IS REFUSED, naming the reason and never a
+// value, and ends as a failed job with status 1 rather than an exit, so the
+// image-store and proxy steps after it still run. A value holding a newline
+// cannot travel one line per variable; a serialization that failed would
+// otherwise be followed by the terminator the here-document appends.
+func TestTheGuestAgentRefusesALaunchItCannotMakeWhole(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh"))
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	_, after, _ := strings.Cut(string(source), "BILLET_AGENT_LAUNCH_BEGIN")
+	launch, _, found := strings.Cut(after, "BILLET_AGENT_LAUNCH_END")
+	if !found {
+		t.Fatal("the guest agent's launch stanza is no longer extractable")
+	}
+	_, launch, _ = strings.Cut(launch, "\n")
+
+	for _, tc := range []struct {
+		name    string
+		prelude string
+		env     string
+		clause  string
+	}{
+		{
+			name:   "a value holding a newline",
+			env:    `$'ACTIONS_RUNNER_INPUT_JITCONFIG=first-s3cr3t\nHOME=/forged'`,
+			clause: "ACTIONS_RUNNER_INPUT_JITCONFIG holds a newline",
+		},
+		{
+			// A FUNCTION OVERRIDES THE BUILTIN, which is how a failed write is
+			// staged without a full disk.
+			name:    "a serialization that failed",
+			prelude: "printf() { return 1; }\n",
+			env:     `"ACTIONS_RUNNER_INPUT_JITCONFIG=s3cr3t"`,
+			clause:  "could not be written out",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			marker := filepath.Join(t.TempDir(), "setpriv-ran")
+			script := "set -euo pipefail\n" +
+				"log() { echo \"$*\" >&2; }\n" +
+				"setpriv() { : >" + marker + "; }\n" +
+				tc.prelude +
+				"EXEC_ENV=/nonexistent\n" +
+				"cmd=(true)\n" +
+				"runner_env=(\"HOME=/home/runner\" " + tc.env + ")\n" +
+				launch +
+				// This line stands in for the steps after the launch.
+				"\necho \"after the launch: $job_status\" >&2\n" +
+				"exit \"$job_status\"\n"
+			run := exec.CommandContext(t.Context(), "bash", "-c", script)
+			run.Env = []string{"PATH=" + os.Getenv("PATH")}
+			var stderr bytes.Buffer
+			run.Stderr = &stderr
+			err := run.Run()
+			exit, ok := errors.AsType[*exec.ExitError](err)
+			if !ok || exit.ExitCode() != 1 {
+				t.Fatalf("the launch ended with %v, want exit status 1\n%s", err, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "after the launch: 1\n") {
+				t.Errorf("the refusal skipped the steps after the launch: %q", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.clause) {
+				t.Errorf("the refusal %q does not say %q", stderr.String(), tc.clause)
+			}
+			if strings.Contains(stderr.String(), "s3cr3t") {
+				t.Errorf("the refusal quotes the value: %q", stderr.String())
+			}
+			if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("setpriv ran after the refusal (lstat: %v)", err)
+			}
+		})
 	}
 }
 

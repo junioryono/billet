@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/guestassets"
 	"github.com/junioryono/billet/internal/runnerimages"
 )
 
@@ -35,6 +36,36 @@ func substitute(t *testing.T, script, old, replacement string) string {
 	}
 
 	return strings.ReplaceAll(script, old, replacement)
+}
+
+// writeExecutableFile writes a fake the verifier executes, through
+// forkSafeWriteFile: these probes run in parallel, and a fork that inherits an
+// open write descriptor makes the exec fail with ETXTBSY or fall back down PATH.
+func writeExecutableFile(t *testing.T, path, body string) {
+	t.Helper()
+
+	if err := forkSafeWriteFile(path, []byte(body)); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// execEnvForTest is what a test substitutes for execEnvPath: the real
+// guestassets helper, run by dash, the image's /bin/sh, so no test writes an
+// executable.
+func execEnvForTest(t *testing.T) string {
+	t.Helper()
+
+	path, err := filepath.Abs(filepath.Join("..", "..", "guestassets", "exec-env.sh"))
+	if err != nil {
+		t.Fatalf("locate exec-env.sh: %v", err)
+	}
+
+	dash, err := exec.LookPath("dash")
+	if err != nil {
+		t.Fatalf("no dash on PATH; the image runs billet-exec-env under dash: %v", err)
+	}
+
+	return dash + " " + path
 }
 
 // declaredGlobals is every command the declaration says a global package
@@ -122,7 +153,22 @@ type verifyProbe struct {
 	// unwritableConsole points /dev/console at a directory, which is what a
 	// machine billet cannot write a console on looks like.
 	unwritableConsole bool
+	// entryPoint replaces the entry point the image carries; empty is the one
+	// the build writes.
+	entryPoint string
+	// entryPointMode is the entry point's mode; zero is the build's 0755.
+	entryPointMode os.FileMode
+	// execEnv replaces the helper the image carries; empty is guestassets' own.
+	execEnv string
 }
+
+// legacyEntryPoint is the launch an image built before contract 3 carries: the
+// helper may be present, and the registration is still on env's command line.
+const legacyEntryPoint = "#!/bin/sh\nset -eu\n" +
+	"setpriv --reuid=runner --regid=runner --init-groups \\\n" +
+	"  env -i PATH=/usr/bin:/bin HOME=/home/runner \\\n" +
+	"  ACTIONS_RUNNER_INPUT_JITCONFIG=\"$ACTIONS_RUNNER_INPUT_JITCONFIG\" \\\n" +
+	"  /opt/actions-runner/billet-runner-service\n"
 
 // run emits the script, rewrites its absolute paths onto a fake machine, executes
 // it, and returns what billet's own parser makes of the console.
@@ -181,6 +227,31 @@ func (p verifyProbe) run(t *testing.T) (report map[string]string, stdout string)
 
 	script = substitute(t, script, toolcacheDir, tcDir)
 	script = substitute(t, script, imageEnvFile, envFile)
+	// THE HELPER AS THE IMAGE CARRIES IT, an executable file whose bytes the
+	// verifier compares, so it is guestassets' own unless a case tampers with it.
+	helper := p.execEnv
+	if helper == "" {
+		helper = guestassets.ExecEnvScript
+	}
+	helperFile := filepath.Join(root, "billet-exec-env")
+	if err := forkSafeWriteFile(helperFile, []byte(helper)); err != nil {
+		t.Fatalf("write the helper: %v", err)
+	}
+	script = substitute(t, script, execEnvPath, helperFile)
+
+	// THE BUILD'S OWN BYTES, out of the provisioning script rather than the
+	// function the verifier compares against, so the two are proved to agree.
+	entry := p.entryPoint
+	if entry == "" {
+		entry = entryPoint(t, mustScript(t))
+	}
+	mode := p.entryPointMode
+	if mode == 0 {
+		mode = 0o755
+	}
+	entryFile := filepath.Join(root, "billet-runner")
+	writeFile(t, entryFile, entry, mode)
+	script = substitute(t, script, entryPointPath, entryFile)
 	script = substitute(t, script, "/opt/actions-runner", runnerDir)
 	script = substitute(t, script, "/dev/console", console)
 
@@ -361,11 +432,14 @@ func (p verifyProbe) fakeBin(t *testing.T) string {
 		"realpath": "#!/bin/sh\n" +
 			"while [ $# -gt 1 ]; do shift; done\n" +
 			"printf '%s\\n' \"$1\"\n",
-		"jq":       "#!/bin/sh\nexit " + jqStatus + "\n",
-		"sleep":    "#!/bin/sh\nexit 0\n",
-		"poweroff": "#!/bin/sh\nexit 0\n",
+		// A REAL DIGEST, NOT A FAKE ONE: Ubuntu's coreutils carries sha256sum and
+		// a Mac's base system carries only shasum, which prints the same line.
+		"sha256sum": "#!/bin/sh\nexec shasum -a 256 \"$@\"\n",
+		"jq":        "#!/bin/sh\nexit " + jqStatus + "\n",
+		"sleep":     "#!/bin/sh\nexit 0\n",
+		"poweroff":  "#!/bin/sh\nexit 0\n",
 	} {
-		writeFile(t, filepath.Join(dir, name), body, 0o755)
+		writeExecutableFile(t, filepath.Join(dir, name), body)
 	}
 
 	// THE TOOLCHAINS THAT ARE NOT TOOLCACHE ENTRIES. Each is present unless this
@@ -388,7 +462,7 @@ func (p verifyProbe) fakeBin(t *testing.T) string {
 				"*) exit 1 ;;\nesac\nexit " + status + "\n"
 		}
 
-		writeFile(t, filepath.Join(dir, filepath.Base(path)), body, 0o755)
+		writeExecutableFile(t, filepath.Join(dir, filepath.Base(path)), body)
 	}
 
 	// AND THE GLOBALS, READ FROM THE DECLARATION RATHER THAN LISTED HERE. The gate
@@ -412,7 +486,7 @@ func (p verifyProbe) fakeBin(t *testing.T) string {
 			continue
 		}
 
-		writeFile(t, filepath.Join(dir, cmd), "#!/bin/sh\nexit 0\n", 0o755)
+		writeExecutableFile(t, filepath.Join(dir, cmd), "#!/bin/sh\nexit 0\n")
 	}
 
 	return dir
@@ -558,6 +632,55 @@ func TestTheVerifierRefusesEveryBrokenImage(t *testing.T) {
 			name:     "the runner does not execute",
 			probe:    verifyProbe{brokenRunner: true},
 			wantStep: "runner",
+		},
+		{
+			// THE HELPER IS ON THE IMAGE AND THE ENTRY POINT DOES NOT USE IT. Every
+			// billet_as_runner call passes, because the verifier brings its own
+			// launch; only the installed file says what a job does.
+			name:     "the entry point launches the runner the old way",
+			probe:    verifyProbe{entryPoint: legacyEntryPoint},
+			wantStep: "entrypoint",
+		},
+		{
+			// NO REGISTRATION ON A COMMAND LINE, AND NO HELPER EITHER: the runner
+			// would start without its environment at all.
+			name:     "the entry point does not launch through the helper",
+			probe:    verifyProbe{entryPoint: "#!/bin/sh\nexec /opt/actions-runner/billet-runner-service\n"},
+			wantStep: "entrypoint",
+		},
+		{
+			// THE LAUNCH LINE IS THERE AND THE PRIVILEGE DROP AROUND IT IS NOT
+			// WHOLE: setpriv refuses a primary GID without a supplementary-group
+			// option, so every job would fail before the runner started.
+			name: "the entry point's privilege drop is damaged",
+			probe: verifyProbe{
+				entryPoint: strings.Replace(entryPointScript(), " --init-groups", "", 1),
+			},
+			wantStep: "entrypoint",
+		},
+		{
+			// AND THE STREAM IT HANDS THE HELPER IS EMPTY: the runner would start
+			// with no registration and exit, on a machine that looks healthy.
+			name: "the entry point hands the helper no environment",
+			probe: verifyProbe{
+				entryPoint: strings.Replace(entryPointScript(), "${billet_env}end\n", "end\n", 1),
+			},
+			wantStep: "entrypoint",
+		},
+		{
+			name:     "the entry point is not executable",
+			probe:    verifyProbe{entryPointMode: 0o644},
+			wantStep: "entrypoint",
+		},
+		{
+			// THE HELPER STILL LAUNCHES EVERY COMMAND, so each billet_as_runner
+			// passes; only its bytes say it put a value in an argument list.
+			name: "the helper is not this billet's",
+			probe: verifyProbe{
+				execEnv: strings.Replace(guestassets.ExecEnvScript, "exec 3<&-\n",
+					"exec 3<&-\n/bin/echo \"$billet_exec_env_all\" >/dev/null\n", 1),
+			},
+			wantStep: "entrypoint",
 		},
 		{
 			// A DECLARED LINE THE IMAGE DOES NOT CARRY. The build gate would have
