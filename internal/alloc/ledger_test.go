@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // THIS PACKAGE'S TESTS ARE THE CAPACITY CONFORMANCE SUITE, AND THEY RUN AGAINST
@@ -64,7 +65,7 @@ func openTestLedgerPair(t *testing.T, wantSecond bool) (*state.DB, *state.DB) {
 	t.Helper()
 
 	if !testingPostgres() {
-		dir := t.TempDir()
+		dir := ledgertest.Dir(t)
 
 		first := mustOpen(t, func() (*state.DB, error) { return state.Open(t.Context(), dir) })
 		if !wantSecond {

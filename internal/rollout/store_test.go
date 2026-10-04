@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 const (
@@ -17,7 +18,7 @@ const (
 func open(t *testing.T) (*state.DB, *Store) {
 	t.Helper()
 
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestARetargetedTagIsNotTheSameRollout(t *testing.T) {
 // against the same target — not require a second human decision, and not create a
 // second rollout.
 func TestARolloutSurvivesReopeningTheLedger(t *testing.T) {
-	dir := t.TempDir()
+	dir := ledgertest.Dir(t)
 
 	db, err := state.Open(t.Context(), dir)
 	if err != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // cancelWhen cancels a running listener once cond holds, rather than after a
@@ -2154,7 +2155,7 @@ func tier(label string) config.Tier {
 func openState(t *testing.T) *state.DB {
 	t.Helper()
 
-	db, err := state.Open(t.Context(), t.TempDir())
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
