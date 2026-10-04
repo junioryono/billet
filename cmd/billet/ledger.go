@@ -271,7 +271,7 @@ func ledgerDSN(cfg *config.Config) (state.DSN, error) {
 
 	name := cfg.Server.LedgerDSNEnv()
 
-	dsn := os.Getenv(name)
+	dsn := state.DSN(os.Getenv(name))
 	if dsn == "" {
 		return "", fmt.Errorf(
 			"server.state.postgres.dsn_env names %s and that variable is empty, so billet has "+
@@ -280,7 +280,7 @@ func ledgerDSN(cfg *config.Config) (state.DSN, error) {
 			name)
 	}
 
-	return state.DSN(dsn), nil
+	return dsn, nil
 }
 
 // closeIfOpen closes a handle an open may or may not have produced, so an error

@@ -12,8 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // newTestAppKey is a real PEM, because a redaction proved against a placeholder
@@ -173,18 +175,6 @@ func TestReadPrivateKeyFileRefusesWhatIsNotAUsableKey(t *testing.T) {
 
 			return p, "not an App key"
 		},
-		// A FIFO opened for reading blocks until a writer appears, so this case
-		// hangs the test rather than failing it if the reader ever opens one.
-		"fifo": func(t *testing.T, dir string) (string, string) {
-			t.Helper()
-
-			p := filepath.Join(dir, "app.pem")
-			if err := syscall.Mkfifo(p, 0o600); err != nil {
-				t.Fatalf("mkfifo: %v", err)
-			}
-
-			return p, "not a regular file"
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -244,5 +234,62 @@ func TestMaxKeySizeIsPinned(t *testing.T) {
 
 	if MaxKeySize != 65536 {
 		t.Errorf("MaxKeySize = %d, want 65536 (64 KiB, as documented)", MaxKeySize)
+	}
+}
+
+// A FIFO AT THE KEY PATH IS REFUSED WITHOUT WAITING FOR A WRITER. A plain open
+// for reading blocks until one appears, so a writer is supplied after a deadline:
+// an open that waited returns, and the test fails naming the wait rather than
+// hanging the package.
+func TestReadPrivateKeyFileDoesNotWaitOnAFIFO(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "app.pem")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	var waited atomic.Bool
+
+	go func() {
+		defer close(done)
+
+		select {
+		case <-stop:
+			return
+		case <-time.After(5 * time.Second):
+		}
+
+		for {
+			fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+			if err == nil {
+				waited.Store(true)
+				_ = syscall.Close(fd)
+
+				return
+			}
+
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+
+	_, err := ReadPrivateKeyFile(path)
+
+	close(stop)
+	<-done
+
+	if waited.Load() {
+		t.Fatal("ReadPrivateKeyFile waited on the FIFO until a writer appeared")
+	}
+
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("a FIFO was not refused as one: %v", err)
 	}
 }

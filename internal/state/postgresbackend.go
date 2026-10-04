@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	_ "embed" // the bookkeeping DDL is read from schema_migrations_postgres.sql.
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -28,6 +31,8 @@ var bootstrapSchemaMigrationsPostgres string
 // is high availability — exactly one controller may make scheduling decisions
 // either way, and a database's ability to serialize writes is not proof that
 // only one process is polling GitHub.
+//
+//nolint:recvcheck // The redaction methods MUST take a value receiver: a pointer-receiver String is not consulted when a VALUE is formatted, so %+v on a dereferenced backend would print the password out of its unexported dsn field. Every other method needs the pointer, as awsjson.Client's do.
 type postgresBackend struct {
 	// dsn is the connection string, which arrives from the environment rather
 	// than from the config file: it carries a password, and a secret in YAML ends
@@ -47,6 +52,37 @@ type postgresBackend struct {
 }
 
 var _ backend = (*postgresBackend)(nil)
+
+// String and its four siblings redact the backend as a whole: dsn is an
+// unexported field, and fmt, encoding/json and slog reach one by reflection
+// without calling the DSN's own methods, so a %+v of the backend would print the
+// password.
+func (postgresBackend) String() string { return "state.postgresBackend{dsn:" + redactedDSN + "}" }
+
+// GoString covers %#v, which does not consult String.
+func (b postgresBackend) GoString() string { return b.String() }
+
+// Format makes every verb safe, not only the ones fmt.Stringer covers.
+func (b postgresBackend) Format(s fmt.State, verb rune) {
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, b.String())
+
+	_ = verb
+}
+
+// MarshalJSON keeps the connection string out of anything that serializes the
+// backend.
+func (b postgresBackend) MarshalJSON() ([]byte, error) {
+	out, err := json.Marshal(b.String())
+	if err != nil {
+		return nil, fmt.Errorf("state: marshal redacted backend: %w", err)
+	}
+
+	return out, nil
+}
+
+// LogValue is what slog asks for before falling back to reflection.
+func (b postgresBackend) LogValue() slog.Value { return slog.StringValue(b.String()) }
 
 func newPostgresBackend(dsn DSN) *postgresBackend {
 	return &postgresBackend{dsn: dsn}
@@ -78,12 +114,6 @@ func (*postgresBackend) sharedLedger() bool { return true }
 // interface stops a caller writing by accident, and this stops the engine
 // carrying out a write that somehow reached it anyway.
 func (b *postgresBackend) dataSources() (ledgerPools, error) {
-	if strings.TrimSpace(string(b.dsn)) == "" {
-		return ledgerPools{}, errors.New(
-			"state: the PostgreSQL data source is empty; it is read from the environment " +
-				"variable named by server.state.postgres.dsn_env")
-	}
-
 	writer, err := registerConn(b.dsn, map[string]string{"lock_timeout": "50"})
 	if err != nil {
 		return ledgerPools{}, err
@@ -101,12 +131,6 @@ func (b *postgresBackend) dataSources() (ledgerPools, error) {
 // reader's own refusal applied to the writer's slot as well, so an inspection
 // cannot write through either.
 func (b *postgresBackend) inspectDataSources() (ledgerPools, error) {
-	if strings.TrimSpace(string(b.dsn)) == "" {
-		return ledgerPools{}, errors.New(
-			"state: the PostgreSQL data source is empty; it is read from the environment " +
-				"variable named by server.state.postgres.dsn_env")
-	}
-
 	inspect, err := registerConn(b.dsn, map[string]string{"default_transaction_read_only": "on"})
 	if err != nil {
 		return ledgerPools{}, err
@@ -130,8 +154,17 @@ var errUnparsableDSN = errors.New(
 // operator's DSN may be a URL or a key/value string and appending to either by
 // hand is a parser billet would then own. RuntimeParams are sent as startup
 // parameters, which is also what keeps them out of reach of a later statement.
+//
+// The one place the connection string is read as text.
 func registerConn(dsn DSN, params map[string]string) (string, error) {
-	cfg, err := pgx.ParseConfig(string(dsn))
+	text := string(dsn)
+	if strings.TrimSpace(text) == "" {
+		return "", errors.New(
+			"state: the PostgreSQL data source is empty; it is read from the environment " +
+				"variable named by server.state.postgres.dsn_env")
+	}
+
+	cfg, err := pgx.ParseConfig(text)
 	if err != nil {
 		// NEITHER THE DSN NOR pgx's MESSAGE IS IN THE ERROR, and the cause is not
 		// wrapped. pgx quotes the connection string with the password masked by

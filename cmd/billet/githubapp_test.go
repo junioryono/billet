@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -423,22 +422,16 @@ func TestInspectKeyDistinguishesAbsentFromUnverifiable(t *testing.T) {
 		t.Errorf("a truncated PEM: inspectKey = %v, want keyAbsent", got)
 	}
 
-	// What is not a regular file holds no key, and a FIFO is refused before it is
-	// opened for reading, which would wait for a writer and hang this test.
+	// What is not a regular file holds no key. internal/regularfile proves its
+	// open never waits on a FIFO; this proves inspectKey reads its refusal as
+	// absence.
 	notAFile := filepath.Join(dir, "adir")
 	if err := os.Mkdir(notAFile, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	fifo := filepath.Join(dir, "fifo.pem")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatalf("mkfifo: %v", err)
-	}
-
-	for _, path := range []string{notAFile, fifo} {
-		if got := inspectKey(path); got != keyAbsent {
-			t.Errorf("%s: inspectKey = %v, want keyAbsent", filepath.Base(path), got)
-		}
+	if got := inspectKey(notAFile); got != keyAbsent {
+		t.Errorf("a directory: inspectKey = %v, want keyAbsent", got)
 	}
 
 	// A file that cannot be opened is UNVERIFIABLE, never absent — the whole

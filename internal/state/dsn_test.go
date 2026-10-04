@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const testDSNPassword = "hunter2-the-password"
@@ -129,6 +130,21 @@ func TestAnUnparsableDSNNeverRendersItsPassword(t *testing.T) {
 	}
 }
 
+// AN EMPTY DSN NAMES THE VARIABLE IT CAME FROM, on every open that parses one,
+// rather than reaching pgx, which would read it as "connect to the defaults".
+func TestAnEmptyDSNIsRefusedNamingItsVariable(t *testing.T) {
+	t.Parallel()
+
+	for name, open := range map[string]func() (*DB, error){
+		"admin":   func() (*DB, error) { return OpenPostgresAdmin(t.Context(), t.TempDir(), " \t") },
+		"inspect": func() (*DB, error) { return OpenPostgresInspect(t.Context(), t.TempDir(), "") },
+	} {
+		if _, err := open(); err == nil || !strings.Contains(err.Error(), "server.state.postgres.dsn_env") {
+			t.Errorf("%s: an empty DSN answered %v, want the refusal naming dsn_env", name, err)
+		}
+	}
+}
+
 // A WRONG PASSWORD IS NOT ECHOED BACK EITHER. What a refused login says is
 // PostgreSQL's and pgx's to decide, so it is asked of a real server.
 func TestARefusedLoginNeverRendersThePassword(t *testing.T) {
@@ -137,11 +153,66 @@ func TestARefusedLoginNeverRendersThePassword(t *testing.T) {
 	const wrong = "not-the-password-hunter2"
 
 	_, err := OpenPostgresAdmin(t.Context(), t.TempDir(), replaceDSNPassword(t, requirePostgres(t), wrong))
-	if err == nil {
-		t.Fatal("an open with the wrong password succeeded")
+
+	// The server's own refusal first, so a timeout or a local failure cannot
+	// stand in for the login this test is about.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); !ok || pgErr.Code != "28P01" {
+		t.Fatalf("the open answered %v, want PostgreSQL's password refusal (28P01)", err)
 	}
 
 	if strings.Contains(err.Error(), wrong) {
 		t.Errorf("the refused login's error carries the password: %v", err)
+	}
+}
+
+// THE BACKEND HOLDING THE DSN REDACTS ITSELF TOO. Its dsn field is unexported,
+// and fmt, encoding/json and slog reach an unexported field by reflection
+// without calling the field's own methods, so a %+v of the backend printed the
+// password while the DSN alone redacted. Value and pointer, because both reach a
+// format verb.
+func TestThePostgresBackendIsRedactedOnEveryRenderingPath(t *testing.T) {
+	t.Parallel()
+
+	be := newPostgresBackend(DSN("postgres://billet:" + testDSNPassword + "@db.internal/billet"))
+
+	rendered := map[string]string{
+		"%v":          fmt.Sprintf("%v", *be), //nolint:gocritic // the verb path is the subject
+		"%+v":         fmt.Sprintf("%+v", *be),
+		"%#v":         fmt.Sprintf("%#v", *be),
+		"%d":          fmt.Sprintf("%d", *be),
+		"%v pointer":  fmt.Sprintf("%v", be), //nolint:gocritic // the verb path is the subject
+		"%+v pointer": fmt.Sprintf("%+v", be),
+		"%#v pointer": fmt.Sprintf("%#v", be),
+		"String()":    be.String(),
+		"GoString()":  be.GoString(),
+	}
+
+	encoded, err := json.Marshal(be)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rendered["json"] = string(encoded)
+
+	var logged bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("opening", "backend", be)
+
+	rendered["slog json"] = logged.String()
+
+	logged.Reset()
+
+	slog.New(slog.NewTextHandler(&logged, nil)).Info("opening", "backend", *be)
+
+	rendered["slog text"] = logged.String()
+
+	for path, out := range rendered {
+		if strings.Contains(out, testDSNPassword) {
+			t.Errorf("%s rendered the password: %s", path, out)
+		}
+
+		if !strings.Contains(out, redactedDSN) {
+			t.Errorf("%s did not say the value was redacted: %s", path, out)
+		}
 	}
 }
