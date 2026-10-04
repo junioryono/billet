@@ -2,6 +2,7 @@ package nodeclient_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -80,5 +81,132 @@ func TestANodeSetToHandOverStopsWithoutWaitingOrDestroying(t *testing.T) {
 	compute.mu.Unlock()
 	if superseded != 0 {
 		t.Error("the handoff moved the running work into custody as if superseded")
+	}
+}
+
+// A DRAIN REQUEST OVERRIDES HANDOFF (#374). A stop that removes the node or its
+// guests' networking asks for a drain first, and the node then waits for the
+// compute it holds instead of leaving it behind.
+func TestADrainRequestOverridesHandoff(t *testing.T) {
+	t.Parallel()
+
+	plane, c := harness(t)
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:           testNodeVCPU,
+			Memory:         testNodeMemory,
+			Provider:       config.ProviderDocker,
+			Deployment:     deployment,
+			Log:            slog.New(slog.DiscardHandler),
+			Backoff:        20 * time.Millisecond,
+			SweepEvery:     10 * time.Millisecond,
+			DrainTimeout:   time.Hour,
+			HandOverOnStop: true,
+			DrainRequested: func() bool { return true },
+		})
+	}()
+
+	waitFor(t, func() bool { return len(plane.Nodes()) == 1 })
+	cancel()
+
+	select {
+	case err := <-done:
+		t.Fatalf("a node asked to drain handed over instead (returned %v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain did not end once the compute was gone")
+	}
+}
+
+// READY WAITS FOR A RECOVERY THAT SUCCEEDED, and a drain that never saw one
+// still answers the guests it waits for. The cache a handed-over guest reaches
+// must be served by a process that can answer for it, but a stop during
+// recovery that keeps failing must not leave those guests unanswered while it
+// waits for them.
+func TestReadyWaitsForRecoveryAndADrainStillAnswers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		recover bool
+	}{
+		{name: "recovery succeeds", recover: true},
+		{name: "a drain stops a node whose recovery keeps failing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, c := harness(t)
+			compute := &fakeCompute{holding: true, recoverErr: errors.New("heartbeat failed")}
+			var ready atomic.Int32
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			done := make(chan error, 1)
+
+			go func() {
+				done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+					VCPU:         testNodeVCPU,
+					Memory:       testNodeMemory,
+					Provider:     config.ProviderDocker,
+					Deployment:   deployment,
+					Log:          slog.New(slog.DiscardHandler),
+					Backoff:      20 * time.Millisecond,
+					SweepEvery:   10 * time.Millisecond,
+					DrainTimeout: time.Hour,
+					Ready:        func() { ready.Add(1) },
+				})
+			}()
+
+			waitFor(t, func() bool {
+				compute.mu.Lock()
+				defer compute.mu.Unlock()
+
+				return compute.recovered >= 3
+			})
+			if got := ready.Load(); got != 0 {
+				t.Fatalf("Ready ran %d times while recovery was failing", got)
+			}
+
+			if tc.recover {
+				compute.mu.Lock()
+				compute.recoverErr = nil
+				compute.mu.Unlock()
+			}
+			if !tc.recover {
+				cancel()
+			}
+			waitFor(t, func() bool { return ready.Load() == 1 })
+
+			cancel()
+			compute.mu.Lock()
+			compute.holding = false
+			compute.mu.Unlock()
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the node did not stop")
+			}
+			if got := ready.Load(); got != 1 {
+				t.Errorf("Ready ran %d times, want once", got)
+			}
+		})
 	}
 }

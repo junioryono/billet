@@ -2,7 +2,12 @@ package node
 
 import (
 	"context"
+	"time"
 )
+
+// restoreMountLimit bounds asking about and remounting one recovered volume. A
+// mount that outlasts it is could-not-tell, and the volume is refused.
+const restoreMountLimit = 30 * time.Second
 
 // RestoreMounts mounts again, in this process, every volume a recovered session
 // records as mounted, before anything serves from their paths (#374).
@@ -79,6 +84,9 @@ func (s *CacheService) ensureMounted(
 	mount func(ctx context.Context, device, target string) error,
 	device, target string,
 ) error {
+	ctx, cancel := context.WithTimeout(ctx, restoreMountLimit)
+	defer cancel()
+
 	mounted, err := s.actionIO.Mounted(ctx, target)
 	if err != nil {
 		return err

@@ -1,0 +1,26 @@
+---
+# A STOP THAT MUST BE A DRAIN SAYS SO FIRST (#374). With node.stop: handoff a
+# plain stop leaves the guests running for the next process to adopt, which is
+# wrong when the stop removes the node or the networking its guests use. The
+# node's drain request overrides handoff, so it is sent before such a stop. Only
+# to a node configured to hand over: one that drains anyway needs no request,
+# and a release older than the request would be ended by the signal.
+- name: Inspect whether a billet node set to hand over is running
+  ansible.builtin.command:
+    argv: [systemctl, is-active, billet-node.service]
+  register: billet_node_drain_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: ((billet_config.node | default({})).stop | default('drain')) == 'handoff'
+
+- name: Ask the billet node to drain rather than hand over
+  ansible.builtin.command:
+    argv: [systemctl, kill, --kill-whom=main, --signal=SIGUSR1, billet-node.service]
+  when:
+    - ((billet_config.node | default({})).stop | default('drain')) == 'handoff'
+    - (billet_node_drain_active.stdout | default('')) | trim == 'active'
+    - not ansible_check_mode
+  changed_when: true
+  become: true

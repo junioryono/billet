@@ -868,6 +868,12 @@
   become: true
   notify: billet unit files changed
 
+- name: Make the stop of a node that may not run here a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+
 - name: Stop and disable the billet node unless it may run here
   ansible.builtin.systemd_service:
     name: billet-node.service

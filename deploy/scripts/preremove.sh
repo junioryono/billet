@@ -42,6 +42,20 @@ if [ -d /run/systemd/system ]; then
         systemctl disable --now "${timer}" >/dev/null 2>&1 || true
     done
 
+    # A REMOVAL IS A NODE LEAVING, so its stop must be a drain even where
+    # node.stop says handoff (#374): nothing will start again to adopt the guests
+    # a handoff leaves behind. The node's drain request overrides handoff, and is
+    # sent only where the config asks for handoff, because a release older than
+    # the request is ended by the signal and a node that drains needs none.
+    if systemctl is-active --quiet billet-node 2>/dev/null &&
+        grep -Eq '^[[:space:]]+stop:[[:space:]]*["'"'"']?handoff["'"'"']?[[:space:]]*(#.*)?$' \
+            /etc/billet/billet.yaml 2>/dev/null; then
+        if ! systemctl kill --kill-whom=main --signal=SIGUSR1 billet-node; then
+            echo "billet: could not ask billet-node to drain; its stop hands its guests over" >&2
+            echo "        to a node that is being removed." >&2
+        fi
+    fi
+
     for unit in billet-node billet-server; do
         if systemctl is-active --quiet "${unit}" 2>/dev/null; then
             if ! systemctl stop "${unit}"; then

@@ -155,6 +155,12 @@ type LoopOptions struct {
 	// next node process to adopt, instead of waiting for it (node.stop: handoff,
 	// #374). It is the second signal's ending, taken at once.
 	HandOverOnStop bool
+	// DrainRequested reports whether the operator asked this stop to be a drain
+	// (launchd.DrainSignal, which a stop that removes the node or its guests'
+	// networking sends first). It overrides HandOverOnStop: a host that is
+	// leaving, or whose bridges are about to go, must not leave guests behind.
+	// Nil is never.
+	DrainRequested func() bool
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
@@ -588,12 +594,19 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 	// and the next node process adopts what it finds (Recover runs at every
 	// registration). The VMMs live in cgroups of their own, outside the unit's,
 	// so stopping the service does not stop them.
-	if opts.HandOverOnStop {
+	if opts.HandOverOnStop && (opts.DrainRequested == nil || !opts.DrainRequested()) {
 		log.Info("handing over to the next node process: the compute running here keeps " +
 			"running and is adopted when billet node starts again")
 		withdraw(ctx, c, log, opts)
 
 		return nil
+	}
+
+	// THE GUESTS THIS DRAIN WAITS FOR ARE ANSWERED. A stop that arrived while
+	// recovery kept failing never reached Ready, and a recovered guest's cache
+	// would otherwise wait unanswered for the whole drain.
+	if opts.Ready != nil {
+		opts.Ready()
 	}
 
 	grace := opts.DrainTimeout

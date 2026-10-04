@@ -107,3 +107,70 @@ func TestTheNodeCacheIsGivenItsStopGrace(t *testing.T) {
 		t.Error("startNodeCache's srv.Shutdown(shutdownCtx) does not wait stopGrace")
 	}
 }
+
+// THE CACHE SERVES ONLY FROM ITS ONE READY PATH, AND ONLY AFTER ITS MOUNTS ARE
+// RESTORED. startNodeCache calls srv.Serve exactly once, inside the function
+// literal Ready runs, after service.RestoreMounts in that same literal: an eager
+// Serve elsewhere, or one ahead of the remount, would answer a handed-over guest
+// from an empty directory or from a process the control plane does not know.
+func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var (
+		serves  int
+		ordered bool
+	)
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "startNodeCache" {
+			continue
+		}
+
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && namesSelector(call.Fun, "srv", "Serve") {
+				serves++
+			}
+
+			literal, ok := n.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+
+			var restoredAt, servedAt token.Pos
+			for _, statement := range literal.Body.List {
+				ast.Inspect(statement, func(inner ast.Node) bool {
+					call, ok := inner.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if namesSelector(call.Fun, "service", "RestoreMounts") && restoredAt == 0 {
+						restoredAt = call.Pos()
+					}
+					if namesSelector(call.Fun, "srv", "Serve") && servedAt == 0 {
+						servedAt = call.Pos()
+					}
+
+					return true
+				})
+			}
+			if restoredAt != 0 && servedAt != 0 && restoredAt < servedAt {
+				ordered = true
+			}
+
+			return true
+		})
+	}
+
+	if serves != 1 {
+		t.Errorf("startNodeCache calls srv.Serve %d times, want exactly the one Ready runs", serves)
+	}
+	if !ordered {
+		t.Error("startNodeCache does not restore the recovered mounts before it serves")
+	}
+}

@@ -105,6 +105,13 @@
   check_mode: false
   become: true
 
+- name: Make the stop before changing guest networking a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - billet_network_requires_drain
+    - billet_node_unit_load_state.stdout | trim != 'not-found'
+    - not ansible_check_mode
+
 - name: Drain billet compute before changing guest networking
   ansible.builtin.systemd_service:
     name: billet-node.service
