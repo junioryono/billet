@@ -1603,14 +1603,15 @@ else
 fi
 
 # THE PASSTHROUGH RUNS ON THE SYSTEM INTERPRETER, which a job cannot reclaim the
-# way it reclaims the toolcache, so that interpreter must compile it.
+# way it reclaims the toolcache, so that interpreter must compile it and load the
+# TLS it does for the BuildKit adapter, which catches its own ImportError.
 if chroot "$MNT" /usr/bin/python3 -c \
-	'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' \
+	'import ssl, sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec"); ssl.create_default_context()' \
 	/usr/local/bin/billet-actions-proxy >/dev/null 2>&1; then
-	pass "the system python3 compiles the Actions results passthrough"
+	pass "the system python3 compiles the Actions results passthrough and loads ssl"
 else
-	fail "/usr/bin/python3 cannot compile the Actions results passthrough; the agent runs
-        it on that interpreter, so interception would never start"
+	fail "/usr/bin/python3 cannot compile the Actions results passthrough or load ssl; the
+        agent runs it on that interpreter, so interception would never start"
 fi
 
 # THE ADAPTER IS PART OF THE INTERCEPTION CONTRACT, so an image that speaks the

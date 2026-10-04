@@ -25,10 +25,13 @@ func TestTheActionsPassthroughRunsOnTheSystemPython(t *testing.T) {
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		value, found := strings.CutPrefix(trimmed, "python_runtime=")
+		// ANYWHERE IN THE LINE, so an assignment inside a condition
+		// (`if python_runtime=$(find ...)`) is judged as well.
+		_, value, found := strings.Cut(trimmed, "python_runtime=")
 		if !found {
 			continue
 		}
+		value, _, _ = strings.Cut(value, ";")
 		assigned++
 		if value != "/usr/bin/python3" && value != `""` {
 			t.Errorf("the passthrough's interpreter is chosen from somewhere a job can delete: %q", trimmed)
