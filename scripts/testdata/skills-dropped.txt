@@ -1,0 +1,2 @@
+# Corpus units removed from the skills on purpose, one per line: `<hash> <reason>`.
+# The hash is the first 12 hex digits of the unit's sha256, as TestEverySkillSentenceIsKeptOrDroppedWithAReason prints it.
