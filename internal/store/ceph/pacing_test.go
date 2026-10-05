@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -113,21 +114,122 @@ func TestAFakeRunnerReadsNoHostPressure(t *testing.T) {
 	}
 }
 
-// THE IMPORT WRITES NO FASTER THAN ITS RATE (#394), and every byte arrives. An
-// unpaced 80 GiB copy went through the page cache at full speed onto a saturated
-// cluster; paced, the bytes due at any moment are what the rate allows.
-func TestTheImportWritesAtItsRate(t *testing.T) {
+// paceRecorder is pacedCopy's destination in a test: it keeps what was written
+// and the order of writes, syncs and sleeps, and can stall the clock on a write.
+type paceRecorder struct {
+	data    []byte
+	events  []string
+	clock   *time.Time
+	stallOn int
+	stall   time.Duration
+	writes  int
+}
+
+func (r *paceRecorder) Write(p []byte) (int, error) {
+	r.writes++
+	r.data = append(r.data, p...)
+	r.events = append(r.events, "write "+strconv.Itoa(len(p)))
+	if r.writes == r.stallOn {
+		*r.clock = r.clock.Add(r.stall)
+	}
+
+	return len(p), nil
+}
+
+func (r *paceRecorder) Sync() error {
+	r.events = append(r.events, "sync")
+
+	return nil
+}
+
+// THE IMPORT WRITES NO FASTER THAN ITS RATE, FLUSHES AS IT GOES, AND BANKS NO TIME
+// (#394). An unpaced 80 GiB copy went through the page cache at full speed onto a
+// saturated cluster. Every write is followed by its own wait, no more than
+// flushEvery bytes go between syncs, the final partial chunk arrives, and a write
+// that stalls the clock is not made up afterwards with an unpaced burst.
+func TestTheImportWritesAtItsRateAndFlushesAsItGoes(t *testing.T) {
 	t.Parallel()
 
-	content := strings.Repeat("0123456789abcdef", 5<<20/16) // 5 MiB
+	const (
+		chunk      = 1 << 20
+		rate       = 1 << 20
+		flushEvery = 2 << 20
+	)
+	content := strings.Repeat("0123456789abcdef", (5<<20)/16) + "tail"
+
+	clock := time.Unix(0, 0)
+	recorder := &paceRecorder{clock: &clock, stallOn: 2, stall: 30 * time.Second}
+	var sleeps []time.Duration
+	pace := importPace{
+		rate: rate, flushEvery: flushEvery, chunk: chunk,
+		now: func() time.Time { return clock },
+		sleep: func(d time.Duration) {
+			sleeps = append(sleeps, d)
+			recorder.events = append(recorder.events, "sleep")
+			clock = clock.Add(d)
+		},
+	}
+
+	written, err := pacedCopy(recorder, strings.NewReader(content), pace)
+	if err != nil {
+		t.Fatalf("pacedCopy: %v", err)
+	}
+	if written != int64(len(content)) || string(recorder.data) != content {
+		t.Fatalf("wrote %d bytes that are not the image's %d", written, len(content))
+	}
+
+	// FLUSHED AS IT GOES: never more than flushEvery unsynced.
+	var unsynced, syncs int
+	for _, event := range recorder.events {
+		switch {
+		case event == "sync":
+			syncs++
+			unsynced = 0
+		case strings.HasPrefix(event, "write "):
+			n, _ := strconv.Atoi(strings.TrimPrefix(event, "write "))
+			unsynced += n
+			if unsynced > flushEvery {
+				t.Fatalf("%d bytes were written without a sync: %v", unsynced, recorder.events)
+			}
+		}
+	}
+	if syncs < 2 {
+		t.Errorf("a 5 MiB copy synced %d times every 2 MiB", syncs)
+	}
+
+	// PACED AS IT GOES: no two writes without a wait between them, except across
+	// the stalled write, whose lost time is not owed back.
+	for i := 1; i < len(recorder.events); i++ {
+		if strings.HasPrefix(recorder.events[i], "write ") && strings.HasPrefix(recorder.events[i-1], "write ") {
+			t.Errorf("two writes ran with no wait between them: %v", recorder.events)
+		}
+	}
+
+	// NO BANKED TIME: the writes after the stall each still wait a chunk's worth.
+	// An average over the whole copy would have skipped them until it caught up.
+	if len(sleeps) < 4 {
+		t.Fatalf("only %d waits for six chunks: %v", len(sleeps), recorder.events)
+	}
+	for i, d := range sleeps[2:] {
+		if want := time.Duration(float64(chunk) / rate * float64(time.Second)); d < want-time.Millisecond &&
+			i < len(sleeps[2:])-1 {
+			t.Errorf("wait %d after the stall was %v, want a chunk's %v", i+2, d, want)
+		}
+	}
+}
+
+// AND THE IMPORT USES IT: writeImage paces the real device write.
+func TestWriteImagePacesTheDeviceWrite(t *testing.T) {
+	t.Parallel()
+
+	content := strings.Repeat("x", 3<<20)
 	raw, device := stageRaw(t, content)
 
 	clock := time.Unix(0, 0)
 	var slept time.Duration
 	pace := importPace{
-		rate:       1 << 20,
-		flushEvery: 2 << 20,
-		now:        func() time.Time { return clock },
+		rate: 1 << 20, flushEvery: 1 << 20, chunk: 1 << 20,
+		now: func() time.Time { return clock },
 		sleep: func(d time.Duration) {
 			slept += d
 			clock = clock.Add(d)
@@ -137,15 +239,11 @@ func TestTheImportWritesAtItsRate(t *testing.T) {
 	if err := writeImage(raw, device, int64(len(content)), pace); err != nil {
 		t.Fatalf("writeImage: %v", err)
 	}
-
 	got, err := os.ReadFile(device)
-	if err != nil {
-		t.Fatalf("read the device: %v", err)
+	if err != nil || string(got) != content {
+		t.Fatalf("the device does not hold the image: %v", err)
 	}
-	if string(got) != content {
-		t.Fatalf("the device holds %d bytes that are not the image's %d", len(got), len(content))
-	}
-	if slept < 5*time.Second-time.Millisecond || slept > 5*time.Second+time.Millisecond {
-		t.Errorf("5 MiB at 1 MiB/s waited %v, want 5s", slept)
+	if slept < 3*time.Second-time.Millisecond {
+		t.Errorf("3 MiB at 1 MiB/s waited %v, want 3s", slept)
 	}
 }

@@ -1298,11 +1298,12 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 	)
 
 	next := make(chan deletion)
+	budget := newYieldBudget(purgePassYieldMax)
 
 	for range min(max(c.purgeWorkers, 1), len(deletions)) {
 		wg.Go(func() {
 			for d := range next {
-				c.waitForQuietIO(ctx)
+				c.waitForQuietIO(ctx, budget)
 
 				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 

@@ -18,12 +18,12 @@ const kernelLockName = ".billet-kernels.lock"
 // kernelLockWindow and kernelLockRetry bound the wait for the lock.
 //
 // PACKAGE VARIABLES SO A TEST CAN SHORTEN THEM, the same seam kernelInstaller and
-// hostLockDir are. Ten minutes is sized against what the holder does: a pull holds
-// this across rbd's raw write of a multi-gigabyte filesystem, which is deliberately
-// unbounded, while a reap holds it across a handful of metadata reads and some
-// unlinks.
+// hostLockDir are. Thirty minutes is sized against what the holder does: a pull
+// holds this across the raw write of the guest image, which is paced at
+// importWriteRate and takes about eleven minutes for the 80 GiB image (#394), while
+// a reap holds it across a handful of metadata reads and some unlinks.
 var (
-	kernelLockWindow = 10 * time.Minute
+	kernelLockWindow = 30 * time.Minute
 	kernelLockRetry  = 250 * time.Millisecond
 )
 
