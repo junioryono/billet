@@ -2081,7 +2081,7 @@
       ]
     },
     "tasks/ceph.yml / Let Ceph serve client IO ahead of scrubbing and recovery": {
-      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"set\",\"osd\",\"osd_mclock_profile\",\"{{ billet_ceph_osd_mclock_profile }}\"]},\"become\":true,\"changed_when\":false,\"name\":\"Let Ceph serve client IO ahead of scrubbing and recovery\"}",
+      "task": "{\"ansible.builtin.command\":{\"argv\":[\"ceph\",\"config\",\"set\",\"osd\",\"osd_mclock_profile\",\"{{ billet_ceph_osd_mclock_profile }}\"]},\"become\":true,\"changed_when\":false,\"name\":\"Let Ceph serve client IO ahead of scrubbing and recovery\",\"when\":\"billet_ceph_osd_mclock_profile | length > 0\"}",
       "contexts": [
         "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"ceph.yml\",\"name\":\"Configure Ceph\",\"when\":\"billet_ceph_enabled\"}}]"
       ],
