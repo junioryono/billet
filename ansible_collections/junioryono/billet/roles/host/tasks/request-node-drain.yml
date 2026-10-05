@@ -1,0 +1,19 @@
+---
+# AN OPERATION THAT MUST NOT LEAVE GUESTS BEHIND SAYS SO FIRST (#374). With
+# node.stop: handoff a plain stop leaves the guests running for the next process
+# to adopt, which is wrong when the stop removes the node or the networking its
+# guests use. Every node process that stops while /var/run/billet-node-drain
+# exists drains instead, so it is written before the operation's first stop,
+# whatever the config says, and removed by release-node-drain.yml when the
+# operation is done. A failure to write it fails the converge rather than the
+# guests. A release that predates the request ignores the file and drains anyway
+# unless it was set to hand over, which only this release can be.
+- name: Ask every billet node process that stops during this operation to drain
+  ansible.builtin.copy:
+    content: "drain\n"
+    dest: /var/run/billet-node-drain
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+  become: true

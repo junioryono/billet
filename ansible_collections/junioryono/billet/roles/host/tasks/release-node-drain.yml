@@ -1,0 +1,10 @@
+---
+# THE OPERATION THAT ASKED FOR A DRAIN IS DONE (#374), so the node's next stops
+# may hand over again where node.stop says so. Left behind by a converge that
+# failed, the request only makes later stops drain until this runs.
+- name: Withdraw the request that billet node stops drain
+  ansible.builtin.file:
+    path: /var/run/billet-node-drain
+    state: absent
+  when: not ansible_check_mode
+  become: true
