@@ -2035,6 +2035,7 @@ func startNodeCache(
 		serveOnce.Do(func() {
 			go func() {
 				service.RestoreMounts(context.WithoutCancel(ctx))
+				slog.Default().Info("serving guest cache requests", "addr", serveListener.Addr().String())
 				if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 					slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
 						"error", err)
@@ -2109,8 +2110,8 @@ func startNodeCache(
 		}
 	}()
 
-	slog.Default().Info("serving guest cache requests", "provider", cfg.Node.Provider,
-		"addr", ln.Addr().String())
+	slog.Default().Info("listening for guest cache requests; they are answered once this node "+
+		"has registered and recovered", "provider", cfg.Node.Provider, "addr", ln.Addr().String())
 
 	return service, serve, func() {
 		// A listener never served is closed here, since Shutdown closes only what
