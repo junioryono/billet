@@ -25,6 +25,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
+- **Storage background work yields to jobs (#394).**
 - **An intact orphan volume is reclaimed by an operator, on proof, through the trash (#301).**
 
 ### The Actions cache, the kill switch and publication: [references/actions-cache-and-publication.md](references/actions-cache-and-publication.md)

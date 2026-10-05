@@ -165,7 +165,7 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 			image, unmapErr)
 	}()
 
-	if err := writeImage(rawPath, device, info.Size()); err != nil {
+	if err := writeImage(rawPath, device, info.Size(), productionImportPace()); err != nil {
 		return "", err
 	}
 
@@ -395,7 +395,9 @@ func (c *Client) mapImage(ctx context.Context, image string) (string, error) {
 // does not; this one moves four gigabytes and would be severed partway by the
 // same bound — leaving a head image containing half a filesystem and no error
 // that says so.
-func writeImage(rawPath, device string, want int64) error {
+// writeImage copies the raw image onto the mapped head at pace.rate, flushing
+// every pace.flushEvery bytes; see importWriteRate.
+func writeImage(rawPath, device string, want int64, pace importPace) error {
 	src, err := os.Open(rawPath)
 	if err != nil {
 		return fmt.Errorf("ceph: cannot read %s: %w", rawPath, err)
@@ -415,7 +417,7 @@ func writeImage(rawPath, device string, want int64) error {
 
 	defer func() { _ = dst.Close() }()
 
-	written, err := io.Copy(dst, src)
+	written, err := pacedCopy(dst, src, pace)
 	if err != nil {
 		return fmt.Errorf("ceph: could not write the image to %s: %w", device, err)
 	}
@@ -438,4 +440,48 @@ func writeImage(rawPath, device string, want int64) error {
 	}
 
 	return dst.Close()
+}
+
+// importChunk is how much pacedCopy reads and writes at a time.
+const importChunk = 4 << 20
+
+// pacedCopy copies src to dst no faster than pace.rate, syncing dst every
+// pace.flushEvery bytes so the kernel never holds more than that dirty.
+func pacedCopy(dst *os.File, src io.Reader, pace importPace) (int64, error) {
+	buf := make([]byte, importChunk)
+	start := pace.now()
+
+	var written, sinceFlush int64
+
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return written, err
+			}
+			written += int64(n)
+			sinceFlush += int64(n)
+
+			if sinceFlush >= pace.flushEvery {
+				if err := dst.Sync(); err != nil {
+					return written, err
+				}
+				sinceFlush = 0
+			}
+
+			// AHEAD OF THE RATE, WAIT. The target is where this many bytes are
+			// due at pace.rate, so a slow stretch is not made up with a burst.
+			due := time.Duration(float64(written) / float64(pace.rate) * float64(time.Second))
+			if ahead := due - pace.now().Sub(start); ahead > 0 {
+				pace.sleep(ahead)
+			}
+		}
+
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
 }
