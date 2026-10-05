@@ -3,10 +3,13 @@ package ceph
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -205,15 +208,22 @@ func TestTheImportWritesAtItsRateAndFlushesAsItGoes(t *testing.T) {
 		}
 	}
 
-	// NO BANKED TIME: the writes after the stall each still wait a chunk's worth.
-	// An average over the whole copy would have skipped them until it caught up.
-	if len(sleeps) < 4 {
-		t.Fatalf("only %d waits for six chunks: %v", len(sleeps), recorder.events)
+	// EXACTLY A CHUNK'S WORTH AFTER EACH WRITE, AND NO BANKED TIME. The first chunk
+	// waits its second; the stalled one is already a second late and waits
+	// nothing; every chunk after it waits its own second again, where an average
+	// over the whole copy would have skipped them until it caught up; the tail
+	// waits its four bytes' share.
+	perByte := float64(time.Second) / float64(rate)
+	second := time.Duration(float64(chunk) * perByte)
+	tailBytes := len(content) % chunk
+	tail := time.Duration(float64(tailBytes) * perByte)
+	want := []time.Duration{second, second, second, second, tail}
+	if len(sleeps) != len(want) {
+		t.Fatalf("the waits were %v, want %v: %v", sleeps, want, recorder.events)
 	}
-	for i, d := range sleeps[2:] {
-		if want := time.Duration(float64(chunk) / rate * float64(time.Second)); d < want-time.Millisecond &&
-			i < len(sleeps[2:])-1 {
-			t.Errorf("wait %d after the stall was %v, want a chunk's %v", i+2, d, want)
+	for i := range want {
+		if diff := sleeps[i] - want[i]; diff > time.Microsecond || diff < -time.Microsecond {
+			t.Errorf("wait %d was %v, want %v", i, sleeps[i], want[i])
 		}
 	}
 }
@@ -243,7 +253,56 @@ func TestWriteImagePacesTheDeviceWrite(t *testing.T) {
 	if err != nil || string(got) != content {
 		t.Fatalf("the device does not hold the image: %v", err)
 	}
-	if slept < 3*time.Second-time.Millisecond {
+	if slept < 3*time.Second-time.Millisecond || slept > 3*time.Second+time.Millisecond {
 		t.Errorf("3 MiB at 1 MiB/s waited %v, want 3s", slept)
+	}
+}
+
+// A PASS YIELDS FOR AT MOST purgePassYieldMax, SHARED BY ITS WORKERS, AND STILL
+// DELETES EVERYTHING (#394). A backlog on a host that never quietens must not
+// drain at a few deletions a minute while jobs discard more and the pool fills.
+func TestAPurgePassYieldsForABoundedTimeAcrossItsWorkers(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	var (
+		mu        sync.Mutex
+		deletions int
+		pauses    atomic.Int64
+	)
+	// SERIALISED, because the fake is not safe for concurrent calls and four
+	// workers make them.
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if slices.Contains(args, "trash") && slices.Contains(args, "rm") {
+			deletions++
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(run), withPurgeWorkers(4), withIOPressure(
+			func() (float64, bool) { return 40, true },
+			func(context.Context, time.Duration) bool { pauses.Add(1); return true }))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	const backlog = 12
+	for i := range backlog {
+		f.trash[fmt.Sprintf("id-%02d", i)] = fmt.Sprintf("cache-v-%d-0123456789abcdef01234567", 1790048184+i)
+	}
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("PurgeTrash: %v", err)
+	}
+
+	if deletions != backlog {
+		t.Fatalf("%d of %d deletions ran", deletions, backlog)
+	}
+	// THE WHOLE PASS'S BUDGET, ONCE, not one for each worker or each deletion:
+	// twelve deletions at two minutes each would ask for 96 pauses.
+	if got, want := pauses.Load(), int64(purgePassYieldMax/purgeQuietPoll); got != want {
+		t.Errorf("the pass paused %d times, want its budget's %d", got, want)
 	}
 }
