@@ -5,6 +5,7 @@ package usage
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -52,6 +53,19 @@ func TestTheAccountingRecordIsReadInBilletsUnits(t *testing.T) {
 	}
 }
 
+// cpuMicros is the user and system CPU this process has used, as getrusage
+// reports it.
+func cpuMicros(t *testing.T) int64 {
+	t.Helper()
+
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+
+	return ru.Utime.Sec*1_000_000 + int64(ru.Utime.Usec) + ru.Stime.Sec*1_000_000 + int64(ru.Stime.Usec)
+}
+
 // THE REAL KERNEL ANSWERS FOR THIS PROCESS: it has a start, the CPU it just
 // burned, a footprint, and its own executable's path.
 func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
@@ -59,9 +73,19 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read this process: %v", err)
 	}
-	for end := time.Now().Add(300 * time.Millisecond); time.Now().Before(end); {
-		_ = unsafe.Pointer(&end)
+
+	// THE LOOP BURNS CPU, NOT WALL TIME, measured by getrusage, the kernel's other
+	// account of this process. A 300ms wall-clock loop on a machine starved by the
+	// rest of `make check` received 143ms to 194ms of CPU (2026-10-03 and
+	// 2026-10-05, #188) and failed the 200ms floor below while the reader was
+	// right. The wall-clock cap only stops a loop that can never get the CPU.
+	start := cpuMicros(t)
+	for limit := time.Now().Add(30 * time.Second); cpuMicros(t)-start < 300_000; {
+		if time.Now().After(limit) {
+			t.Fatal("30s of wall time gave this process less than 300ms of CPU")
+		}
 	}
+
 	after, err := Reader{}.ProcessCounters(os.Getpid())
 	if err != nil {
 		t.Fatalf("read this process again: %v", err)
