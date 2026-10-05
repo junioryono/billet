@@ -2271,6 +2271,8 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 	if len(f.trash) != 0 {
 		t.Fatalf("eviction left retired writers behind the active cache: %v", f.trash)
 	}
+
+	requireCacheImageRules(t, f.calls, "cp")
 }
 
 func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {
@@ -2945,6 +2947,8 @@ func TestFailedCreateAndSnapshotCleanupTrashTheVolumeAndRemoveTheCandidate(t *te
 		if n, err := c.PurgeTrash(t.Context()); err != nil || n != 1 || len(f.trash) != 0 {
 			t.Errorf("PurgeTrash = %d, %v, trash %v; want the volume deleted", n, err, f.trash)
 		}
+
+		requireCacheImageRules(t, f.calls, "snap purge", "trash mv")
 	})
 
 	// A VOLUME WHOSE STAGING SNAPSHOT COULD NOT BE REMOVED STAYS LISTED, through
@@ -3122,6 +3126,8 @@ func TestThePurgeFinishesHalfRemovedCacheImages(t *testing.T) {
 			t.Errorf("a half-removed image was finished under %s, want about thirty minutes", b)
 		}
 	}
+
+	requireCacheImageRules(t, f.calls, "rm")
 }
 
 // COULD NOT TELL IS NOT HALF-REMOVED. An `rbd info` that fails for any reason but

@@ -823,7 +823,7 @@ func TestImportGenerationWithdrawsASnapshotItCannotDescribe(t *testing.T) {
 func TestWriteImageRefusesASourceThatShrankUnderIt(t *testing.T) {
 	raw, device := stageRaw(t, "twelve bytes")
 
-	err := writeImage(raw, device, 999)
+	err := writeImage(raw, device, 999, productionImportPace())
 	if err == nil {
 		t.Fatal("a short copy was reported as a complete write")
 	}

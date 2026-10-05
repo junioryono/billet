@@ -219,6 +219,8 @@ func TestOrphanVolumesAreReclaimedOnlyOnProofAndThroughTheTrash(t *testing.T) {
 	if n < 1 || len(f.trash) != 0 {
 		t.Errorf("PurgeTrash deleted %d, left %v; want the moved orphan deleted (%v)", n, f.trash, err)
 	}
+
+	requireCacheImageRules(t, f.calls, "trash mv")
 }
 
 // A LISTING CHANGES NOTHING. Without Reclaim the pass asks the same questions

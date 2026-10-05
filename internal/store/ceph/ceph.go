@@ -80,6 +80,11 @@ type Client struct {
 	halfRemovedResume string
 	// purgeWorkers is how many trash deletions PurgeTrash runs at once.
 	purgeWorkers int
+	// ioPressure reads how starved the host is for IO, which each purge deletion
+	// waits out (waitForQuietIO), and pause is how it waits. Nil reads nothing and
+	// paces nothing.
+	ioPressure func() (float64, bool)
+	pause      func(ctx context.Context, d time.Duration) bool
 	// clock replaces time.Now for finishHalfRemoved; only a test sets it.
 	clock func() time.Time
 
@@ -146,7 +151,19 @@ func withRunner(r runner) Option {
 		if r != nil {
 			c.run = r
 			c.purgeWorkers = 1
+			// AND READS NOTHING OF THE HOST IT RUNS ON: a test's purge must not wait
+			// on whatever the machine running the suite is doing.
+			c.ioPressure = nil
 		}
+	}
+}
+
+// withIOPressure gives the purge a pressure reader and a pause of a test's own;
+// only a test sets it, after withRunner.
+func withIOPressure(read func() (float64, bool), pause func(context.Context, time.Duration) bool) Option {
+	return func(c *Client) {
+		c.ioPressure = read
+		c.pause = pause
 	}
 }
 
@@ -207,7 +224,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
-		purgeWorkers: trashPurgeWorkers}
+		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor}
 	for _, opt := range opts {
 		opt(c)
 	}
