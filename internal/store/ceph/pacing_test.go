@@ -306,3 +306,68 @@ func TestAPurgePassYieldsForABoundedTimeAcrossItsWorkers(t *testing.T) {
 		t.Errorf("the pass paused %d times, want its budget's %d", got, want)
 	}
 }
+
+// AND THE HALF-REMOVED FINISHES WAIT ON THE SAME BUDGET (#394). On the pass that
+// finishes them, four trash deletions spend 32 of the budget's 40 pauses, the
+// first half-removed image waits the remaining 8, and the second none: a phase
+// that asked nothing, or kept a budget of its own, pauses 32 or 48 times.
+func TestHalfRemovedFinishesShareThePassYieldBudget(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	var (
+		pauses   int
+		beforeRm []int
+	)
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "rm") && !slices.ContainsFunc(args, func(arg string) bool {
+			return arg == "trash" || arg == "snap" || arg == "lock"
+		}) {
+			beforeRm = append(beforeRm, pauses)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(run), withIOPressure(
+			func() (float64, bool) { return 40, true },
+			func(context.Context, time.Duration) bool { pauses++; return true }))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	for _, image := range []string{
+		fmt.Sprintf("billet-cache/cache-v-%d-0123456789abcdef01234567", old),
+		fmt.Sprintf("billet-cache/cache-g-%d-0123456789abcdef01234567", old),
+	} {
+		f.halfRemoved[image] = true
+	}
+
+	// THE FIRST SIGHTING ONLY RECORDS, with nothing in the trash to delete.
+	clock := time.Now()
+	c.clock = func() time.Time { return clock }
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("first PurgeTrash: %v", err)
+	}
+	if pauses != 0 {
+		t.Fatalf("a pass that deleted nothing paused %d times", pauses)
+	}
+
+	clock = clock.Add(2 * halfRemovedRecheck)
+	for i := range 4 {
+		f.trash[fmt.Sprintf("id-%d", i)] = fmt.Sprintf("cache-v-%d-0123456789abcdef01234567", 1790048184+i)
+	}
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("second PurgeTrash: %v", err)
+	}
+
+	budget := int(purgePassYieldMax / purgeQuietPoll)
+	if pauses != budget {
+		t.Errorf("the pass paused %d times, want its one budget's %d", pauses, budget)
+	}
+	if want := []int{budget, budget}; !slices.Equal(beforeRm, want) {
+		t.Errorf("the half-removed finishes ran after %v pauses, want %v", beforeRm, want)
+	}
+}
