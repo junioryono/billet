@@ -50,6 +50,31 @@ func (n *NodeConfig) DrainTimeoutDuration() (time.Duration, error) {
 	return parseDrainTimeout("node.drain_timeout", n.DrainTimeout)
 }
 
+// HandsOverOnStop reports whether a stopping node leaves the compute it holds
+// running for the next node process to adopt, rather than waiting for it (#374).
+//
+// DRAIN IS THE DEFAULT, and an absent key means it. A drain is what every node did
+// until now, and a handoff rests on a newer node process adopting guests an older
+// one launched, which is set per host by somebody who has watched it work there.
+// A handoff suits a host that is restarted to be upgraded or converged; a host
+// leaving for good is drained (`billet drain --wait`, `local down`) or
+// decommissioned, because nothing comes back to adopt what a handoff leaves.
+func (n *NodeConfig) HandsOverOnStop() (bool, error) {
+	if n == nil {
+		return false, nil
+	}
+
+	switch strings.TrimSpace(n.Stop) {
+	case "", "drain":
+		return false, nil
+	case "handoff":
+		return true, nil
+	default:
+		return false, fmt.Errorf("node.stop: %q is neither \"drain\" (wait for the compute running "+
+			"here) nor \"handoff\" (leave it running for the next node process to adopt)", n.Stop)
+	}
+}
+
 func parseDrainTimeout(key, raw string) (time.Duration, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

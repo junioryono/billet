@@ -16,6 +16,9 @@ type actionsVolumeManager interface {
 	MountWritable(ctx context.Context, device, target string) error
 	Trim(ctx context.Context, target string) error
 	Unmount(ctx context.Context, target string) error
+	// Mounted reports whether something is mounted at target in this process's
+	// mount namespace; an error is could-not-tell, never "no".
+	Mounted(ctx context.Context, target string) (bool, error)
 }
 
 type hostActionsVolumeManager struct{}
@@ -85,27 +88,39 @@ func mountActionsVolume(ctx context.Context, device, target, options string) err
 	return nil
 }
 
-func (hostActionsVolumeManager) Unmount(ctx context.Context, target string) error {
+func (hostActionsVolumeManager) Mounted(ctx context.Context, target string) (bool, error) {
 	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	} else if err != nil {
-		return fmt.Errorf("node: inspect Actions cache mount point: %w", err)
+		return false, fmt.Errorf("node: inspect Actions cache mount point: %w", err)
 	}
 	mountpoint, err := exec.LookPath("mountpoint")
 	if err != nil {
-		return fmt.Errorf("node: mountpoint is required for Actions cache recovery: %w", err)
+		return false, fmt.Errorf("node: mountpoint is required for Actions cache recovery: %w", err)
 	}
 	// util-linux's mountpoint exits 32 for "not a mount point" and 1 for a failure
 	// to look (2.41.3 on the reference deployment, measured 2026-10-03). Reading 1
 	// as unmounted refused every directory a failed mount left behind, and the
 	// session holding it never finished closing.
-	mounted := true
 	if err := exec.CommandContext(ctx, mountpoint, "-q", "--", target).Run(); err != nil {
 		exitErr, ok := errors.AsType[*exec.ExitError](err)
 		if !ok || exitErr.ExitCode() != mountpointNotMounted {
-			return fmt.Errorf("node: inspect Actions cache mount point: %w", err)
+			return false, fmt.Errorf("node: inspect Actions cache mount point: %w", err)
 		}
-		mounted = false
+
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (m hostActionsVolumeManager) Unmount(ctx context.Context, target string) error {
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	mounted, err := m.Mounted(ctx, target)
+	if err != nil {
+		return err
 	}
 	if !mounted {
 		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {

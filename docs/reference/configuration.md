@@ -69,6 +69,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |
 | `drain_timeout` | no | when the node starts reporting a drain as long |
+| `stop` | no | what a SIGTERM does while the node holds compute: `drain` (the default) waits for it; `handoff` (Firecracker nodes only) leaves it running for the next node process to adopt, for a host restarted to be upgraded or converged. A host leaving for good is drained or decommissioned, since nothing comes back to adopt what a handoff leaves |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |
 | `monitoring` | no | measure each job from the host; absent means off; firecracker, docker and tart only (see below) |

@@ -10,16 +10,16 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
-// seedOwner records a lease as delivered to an incarnation, with the job it was
+// seedOwner records a lease as delivered to n1's process p1, with the job it was
 // launched for, the way a launch's delivery records it.
-func seedOwner(p *Plane, lease, incarnation string, requestID int64) {
+func seedOwner(p *Plane, lease string, requestID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.owners == nil {
 		p.owners = make(map[string]leaseOwner)
 	}
-	p.owners[lease] = leaseOwner{node: "n1", incarnation: incarnation, requestID: requestID}
+	p.owners[lease] = leaseOwner{node: "n1", incarnation: "p1", requestID: requestID}
 }
 
 func ownerOf(p *Plane, lease string) (leaseOwner, bool) {
@@ -43,7 +43,7 @@ func TestAProcessThatWithdrewHandsItsLeasesToTheNextOne(t *testing.T) {
 
 	p := testPlane(t, WithRegistrar(newLedger()))
 	registerAs(t, p, "p1")
-	seedOwner(p, "l9", "p1", 7)
+	seedOwner(p, "l9", 7)
 
 	if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
 		t.Fatalf("Withdraw: %v", err)
@@ -85,7 +85,7 @@ func TestAProcessThatDidNotWithdrawKeepsItsLeases(t *testing.T) {
 
 	p := testPlane(t, WithRegistrar(newLedger()))
 	registerAs(t, p, "p1")
-	seedOwner(p, "l9", "p1", 7)
+	seedOwner(p, "l9", 7)
 
 	registerAs(t, p, "p2")
 	p.AdoptOwnershipWithInventory("n1", "p2", []string{"l9"}, true)
@@ -103,8 +103,8 @@ func TestOnlyALeaseTheSuccessorReportedMoves(t *testing.T) {
 
 	p := testPlane(t, WithRegistrar(newLedger()))
 	registerAs(t, p, "p1")
-	seedOwner(p, "l8", "p1", 8)
-	seedOwner(p, "l9", "p1", 9)
+	seedOwner(p, "l8", 8)
+	seedOwner(p, "l9", 9)
 
 	if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
 		t.Fatalf("Withdraw: %v", err)
@@ -135,7 +135,7 @@ func TestAWithdrawalRecordIsForgottenWithItsLastLease(t *testing.T) {
 
 	p := testPlane(t, WithRegistrar(newLedger()))
 	registerAs(t, p, "p1")
-	seedOwner(p, "l9", "p1", 7)
+	seedOwner(p, "l9", 7)
 
 	if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
 		t.Fatalf("Withdraw: %v", err)
@@ -163,7 +163,7 @@ func TestAHandoverWaitsForTheSuccessorsOwnReport(t *testing.T) {
 
 	p := testPlane(t, WithRegistrar(newLedger()))
 	registerAs(t, p, "p1")
-	seedOwner(p, "l9", "p1", 7)
+	seedOwner(p, "l9", 7)
 
 	if err := p.Withdraw(t.Context(), "n1", "p1"); err != nil {
 		t.Fatalf("Withdraw: %v", err)
@@ -218,7 +218,10 @@ func TestALateFailedLaunchDoesNotEraseTheSuccessorsOwnership(t *testing.T) {
 	}
 
 	// The late report from the process that withdrew: a clean failure.
-	_ = p.Result("n1", "p1", nodeapi.CommandResult{ID: launch.ID, Error: "late failure"})
+	// Its answer is not the subject; what it leaves of ownership is.
+	if err := p.Result("n1", "p1", nodeapi.CommandResult{ID: launch.ID, Error: "late failure"}); err != nil {
+		t.Logf("the late report was answered %v", err)
+	}
 
 	if !p.OwnsForTest("l1", "n1", "p2") {
 		t.Error("a late failed launch from the withdrawn process erased the successor's ownership")

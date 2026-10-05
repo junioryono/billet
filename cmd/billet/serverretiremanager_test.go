@@ -28,7 +28,18 @@ func TestMain(m *testing.M) {
 			os.Exit(0)
 		}
 	}
-	os.Exit(m.Run())
+	// THE NODE'S DRAIN REQUEST GOES SOMEWHERE THIS TEST BINARY OWNS, set here
+	// before any test runs: every `local down` test on Linux writes it.
+	dir, err := os.MkdirTemp("", "billet-node-drain-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	nodeDrainRequestFile = filepath.Join(dir, "billet-node-drain")
+
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func retireManagerExecutable(t *testing.T, name string) string {

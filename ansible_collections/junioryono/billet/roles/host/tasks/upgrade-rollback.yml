@@ -40,6 +40,9 @@
       The interrupted upgrade records a previous billet binary, but its durable
       copy is missing or redirected. Refusing automatic recovery.
 
+- name: Make the stop before recovering the ledger a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+
 - name: Stop compute before recovering the authoritative ledger
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -448,3 +451,6 @@
 
 - name: Finalize the committed host rollback
   ansible.builtin.include_tasks: upgrade-finalize.yml
+
+- name: Let node stops hand over again now that the ledger is recovered
+  ansible.builtin.include_tasks: release-node-drain.yml

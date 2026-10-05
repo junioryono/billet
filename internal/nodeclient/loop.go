@@ -151,6 +151,16 @@ type LoopOptions struct {
 	// that wait but the work finishing or a second signal. Zero uses a default of
 	// six hours, which is how long GitHub lets a job run.
 	DrainTimeout time.Duration
+	// HandOverOnStop makes a stop while compute is held leave it running for the
+	// next node process to adopt, instead of waiting for it (node.stop: handoff,
+	// #374). It is the second signal's ending, taken at once.
+	HandOverOnStop bool
+	// DrainRequested reports whether the stop under way was asked to be a drain,
+	// which a stop that removes the node or its guests' networking does first.
+	// Read when the stop begins, and it overrides HandOverOnStop: a host that is
+	// leaving, or whose bridges are about to go, must not leave guests behind.
+	// Nil is never.
+	DrainRequested func() bool
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
@@ -162,6 +172,13 @@ type LoopOptions struct {
 	// launches overlap, and is given only for a provider whose launches of
 	// different leases are safe to run together.
 	LaunchConcurrency int
+
+	// Ready is called once, after the first registration whose recovery
+	// succeeded, which is the first moment this process can answer for the
+	// compute on its host. The node's guest cache starts serving there: a
+	// handed-over guest asking earlier would be judged by a process the control
+	// plane does not know yet (#374). Nil does nothing.
+	Ready func()
 
 	// RegistrationRecordPath is where the node publishes its registration
 	// record after every successful registration (see record.go), or empty to
@@ -263,6 +280,11 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		backoff = 5 * time.Second
 	}
 
+	if opts.Ready == nil {
+		opts.Ready = func() {}
+	}
+	opts.Ready = sync.OnceFunc(opts.Ready)
+
 	// STARTED ONCE, AFTER THE FIRST SUCCESSFUL REGISTRATION, and stopped with Run.
 	//
 	// Custody outlives any single registration: a lease held because a container could
@@ -321,7 +343,14 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		})
 	}
 
-	err := register(ctx, c, compute, log, opts, backoff, startJanitor, startWatcher)
+	// recovered says a Recover succeeded in this process, which is the moment it
+	// first knows what this host runs; startWatcher is called exactly then.
+	var recovered atomic.Bool
+
+	err := register(ctx, c, compute, log, opts, backoff, startJanitor, func() {
+		recovered.Store(true)
+		startWatcher()
+	})
 
 	// ONE PLACE DECIDES THAT A STOP MEANS A DRAIN, and it is here because there
 	// are five ways out of the loop below and only one of them used to.
@@ -360,7 +389,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	}
 
 	if ctx.Err() != nil {
-		return stopGracefully(ctx, c, compute, log, opts)
+		return stopGracefully(ctx, c, compute, log, opts, recovered.Load(), startJanitor)
 	}
 
 	return err
@@ -440,6 +469,7 @@ func register(
 		// left by an earlier process has no in-memory owner and would be discarded
 		// as unrelated.
 		startWatcher()
+		opts.Ready()
 
 		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {
@@ -550,7 +580,56 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 //
 // Nothing is served during this wait, so no new launch can arrive: serve has
 // already returned, which is what brought us here.
-func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) error {
+func stopGracefully(
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, recovered bool,
+	startJanitor func(),
+) error {
+	drainRequested := opts.DrainRequested != nil && opts.DrainRequested()
+
+	// A HANDOFF ENDS HERE, exactly as a second signal ends the wait below: the
+	// compute keeps running, its leases stay charged, the host leaves placement,
+	// and the next node process adopts what it finds (Recover runs at every
+	// registration). The VMMs live in cgroups of their own, outside the unit's,
+	// so stopping the service does not stop them.
+	//
+	// ONLY ONCE THE WITHDRAWAL HAS LANDED. The next process takes over what this
+	// one owned only from a process the plane recorded as withdrawn; without that
+	// record the leases stay with this exited process and a completion's destroy
+	// never reaches the guest, so a withdrawal that did not land drains instead.
+	// That holds whether or not this process knows what it holds: a successor
+	// stopped before its first recovery may already own what it registered with.
+	if opts.HandOverOnStop && !drainRequested {
+		if withdraw(ctx, c, log, opts) {
+			log.Info("handing over to the next node process: the compute running here keeps " +
+				"running and is adopted when billet node starts again")
+
+			return nil
+		}
+
+		log.Warn("the withdrawal did not land, so the next node process could not take over " +
+			"what this one runs; draining instead")
+	}
+
+	// AN UNRECOVERED PROCESS DOES NOT KNOW IT HOLDS NOTHING (#374). Until its
+	// first recovery Holding() cannot see the guests a previous process left, and
+	// a process that registered may already own them, so it recovers before an
+	// empty answer is believed. A stop asked to drain keeps trying for as long as
+	// it takes, because the operation that asked is about to take the host or its
+	// networking apart; any other stop tries unrecoveredStopAttempts times and
+	// then stops as it always did, so a node whose provider is broken can still
+	// be stopped to be mended, and its next process adopts what it leaves. A
+	// process that never registered was given nothing; one the plane has since
+	// forgotten was, which is why this asks EverRegistered and not the wire
+	// version a forgotten registration clears. A second signal ends the attempt
+	// either way.
+	if !recovered && (drainRequested || c.EverRegistered()) {
+		attempts := 0
+		if !drainRequested {
+			attempts = unrecoveredStopAttempts
+		}
+		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+	}
+
 	// A node holding nothing stops at once. The drain is for work in flight, not
 	// a delay every restart pays.
 	//
@@ -564,6 +643,13 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 		withdraw(ctx, c, log, opts)
 
 		return nil
+	}
+
+	// THE GUESTS THIS DRAIN WAITS FOR ARE ANSWERED. A stop that arrived while
+	// recovery kept failing never reached Ready, and a recovered guest's cache
+	// would otherwise wait unanswered for the whole drain.
+	if opts.Ready != nil {
+		opts.Ready()
 	}
 
 	grace := opts.DrainTimeout
@@ -760,13 +846,13 @@ const withdrawAttempts = 3
 // other hosts at once rather than after the silence window; what it can never
 // change is the exit status, because a stop that did what it was asked is not a
 // failure — so every outcome here ends in a log line and a return.
-func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) {
+func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) bool {
 	wire := c.WireVersion()
 
 	// NEVER REGISTERED, so nothing to withdraw: the plane does not know this
 	// process, and asking would only be answered "register again".
 	if wire == 0 {
-		return
+		return false
 	}
 
 	// CHECKED WHERE IT IS EMITTED. An older control plane has no route for this
@@ -777,7 +863,7 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 			"will keep placing work here until it forgets the node by silence",
 			"protocol", wire, "needs", nodeapi.VersionNodeWithdrawal)
 
-		return
+		return false
 	}
 
 	// THE CALLER'S CONTEXT IS THE CANCELLED ONE — that is what brought the node
@@ -794,24 +880,24 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 			log.Info("withdrew from placement; the control plane will not aim work here " +
 				"until this node registers again")
 
-			return
+			return true
 
 		case errors.Is(err, ErrUnregistered):
 			// The plane forgot this node already, so there is nothing to withdraw.
-			return
+			return false
 
 		case errors.Is(err, ErrSuperseded):
 			log.Info("another process is registered as this node, so this one has nothing "+
 				"to withdraw", "error", err)
 
-			return
+			return false
 
 		case errors.Is(err, ErrRefused):
 			// A verdict rather than an outage; asking again cannot change it.
 			log.Warn("the control plane refused this node's withdrawal; it keeps placing "+
 				"work here until it forgets the node by silence", "error", err)
 
-			return
+			return false
 		}
 
 		if attempt < withdrawAttempts {
@@ -822,6 +908,64 @@ func withdraw(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions
 	log.Warn("could not withdraw from placement; the control plane keeps placing work "+
 		"here until it forgets this node by silence",
 		"attempts", withdrawAttempts, "error", err)
+
+	return false
+}
+
+// unrecoveredStopAttempts is how often an ordinary stop of a process that never
+// recovered tries to, before it believes an empty Holding().
+const unrecoveredStopAttempts = 3
+
+// recoverBeforeDrain registers if this process never did and recovers, until it
+// succeeds, a second signal arrives or, when attempts is positive, that many
+// attempts have failed. The janitor starts once a registration
+// has told it the lease TTL and before anything is recovered, exactly as at an
+// ordinary registration: recovery adopts leases, and a drain can outlast their
+// TTL many times over while Tend's provider calls are not what renews them.
+func recoverBeforeDrain(
+	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
+	startJanitor func(), attempts int,
+) {
+	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+
+	if opts.Hurry != nil {
+		go func() {
+			select {
+			case <-opts.Hurry:
+				cancel()
+			case <-recoverCtx.Done():
+			}
+		}()
+	}
+
+	for attempt := 1; recoverCtx.Err() == nil; attempt++ {
+		var err error
+		if c.WireVersion() == 0 {
+			err = c.Register(recoverCtx, registrationWithInventory(recoverCtx, compute, log, opts))
+		}
+		if err == nil {
+			startJanitor()
+			err = compute.Recover(recoverCtx)
+		}
+		if err == nil {
+			return
+		}
+
+		if attempts > 0 && attempt >= attempts {
+			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
+				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
+
+			return
+		}
+
+		log.Error("stopping before this process knew what its host runs; recovering before "+
+			"deciding whether it holds anything", "error", err)
+
+		if !sleep(recoverCtx, backoffFor(opts)) {
+			return
+		}
+	}
 }
 
 // backoffFor is the pause after a failed registration or poll.

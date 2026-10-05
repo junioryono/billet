@@ -641,6 +641,10 @@ type NodeConfig struct {
 	// Separate from the control plane's key: the two are restarted for different
 	// reasons and need not wait the same amount of time.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
+	// Stop is what a SIGTERM does while this node holds compute: "drain" (the
+	// default) waits for it, "handoff" leaves it running for the next node process
+	// to adopt. See NodeConfig.HandsOverOnStop.
+	Stop string `yaml:"stop,omitempty"`
 }
 
 // NodeCacheConfig exposes storage to one guest through short-lived credentials.
@@ -3947,6 +3951,17 @@ func (c *Config) validateNode() []error {
 	// be unparseable.
 	if _, err := c.Node.DrainTimeoutDuration(); err != nil {
 		errs = append(errs, err)
+	}
+
+	if handOver, err := c.Node.HandsOverOnStop(); err != nil {
+		errs = append(errs, err)
+	} else if handOver && c.Node.Provider != ProviderFirecracker {
+		// ONLY WHERE THE GUESTS OUTLIVE THE SERVICE, AND ARE ADOPTED. A
+		// Firecracker VMM runs in a cgroup of its own and the next node process
+		// adopts it; no other backend has been shown to do both (#374).
+		errs = append(errs, fmt.Errorf("node.stop: handoff needs node.provider: firecracker, "+
+			"whose guests outlive the node's service and are adopted by its next process; "+
+			"%s nodes drain", c.Node.Provider))
 	}
 
 	if _, err := c.Node.MaxCustodyDuration(); err != nil {

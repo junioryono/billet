@@ -428,6 +428,16 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 // has said it does not know this node, see forgetRegistration.
 func (c *Client) WireVersion() int { return int(c.wire.Load()) }
 
+// EverRegistered reports whether any registration of this client was accepted.
+// Unlike WireVersion it is not cleared when the plane forgets one, because what
+// a forgotten registration was given may still be this process's to account for.
+func (c *Client) EverRegistered() bool {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+
+	return c.generation > 0
+}
+
 // forgetRegistration records that the control plane no longer knows the
 // registration a request was sent under, so nothing that registration decided
 // is acted on until a new one answers.
