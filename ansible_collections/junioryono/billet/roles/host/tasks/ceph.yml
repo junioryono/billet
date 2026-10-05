@@ -112,6 +112,20 @@
   changed_when: false
   become: true
 
+# JOBS' IO BEFORE SCRUBBING AND RECOVERY (junioryono/billet#394). The cluster
+# exists to serve guests' disks, and on 2026-10-05 a deep scrub ran on drives
+# the trash purge already held near saturation while every job waited. mClock's
+# high_client_ops profile gives client requests the larger share of each OSD,
+# so scrubbing and recovery take longer instead of slowing the jobs. A cluster
+# setting, for every OSD: an empty profile leaves a shared cluster's own policy
+# alone.
+- name: Let Ceph serve client IO ahead of scrubbing and recovery
+  ansible.builtin.command:
+    argv: [ceph, config, set, osd, osd_mclock_profile, "{{ billet_ceph_osd_mclock_profile }}"]
+  when: billet_ceph_osd_mclock_profile | length > 0
+  changed_when: false
+  become: true
+
 - name: Create the scoped billet Ceph identity
   ansible.builtin.command:
     argv:
