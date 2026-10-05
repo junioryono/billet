@@ -95,8 +95,10 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 
 		switch {
 		case base == LockImageName || base == cacheIndexName:
-			if verb == "create" && slices.Contains(features(call), "exclusive-lock") {
-				t.Errorf("a lock image was created with exclusive-lock: %v", call)
+			// EXACTLY `layering`, named: with no feature named, rbd would give the
+			// lock image the cluster's defaults, exclusive-lock among them.
+			if verb == "create" && !slices.Equal(features(call), []string{"layering"}) {
+				t.Errorf("a lock image was not created with layering alone: %v", call)
 			}
 			if verb == "lock rm" && keepsClient(call) {
 				t.Errorf("a lock image's lock rm lost its blocklist fence: %v", call)
@@ -111,7 +113,9 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 			switch verb {
 			case "create", "clone", "cp":
 				have := features(call)
-				for _, feature := range []string{"layering", "exclusive-lock", "object-map", "fast-diff"} {
+				for _, feature := range []string{
+					"layering", "exclusive-lock", "object-map", "fast-diff", "deep-flatten",
+				} {
 					if !slices.Contains(have, feature) {
 						t.Errorf("a cache image was made without %s: %v", feature, call)
 					}
