@@ -468,7 +468,7 @@ func (c *Client) judgeOrphan(
 			"cache volume billet named goes there", bounded(handle))
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", handle)...); err != nil {
 		if isNoSuchFile(err) {
 			return OrphanGone, nil
 		}
