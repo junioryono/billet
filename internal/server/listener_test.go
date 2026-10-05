@@ -17,6 +17,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
@@ -430,7 +431,7 @@ func TestOfferRefillLeavesHeadroomForAConcurrentTier(t *testing.T) {
 	firstDone := make(chan error, 1)
 	go func() {
 		firstDone <- first.handle(t.Context(), &Message{MessageID: 1,
-			Available: []Job{{RequestID: 11, RunID: 101}}})
+			Available: []dispatch.Job{{RequestID: 11, RunID: 101}}})
 	}()
 	select {
 	case <-acquireStarted:
@@ -438,7 +439,7 @@ func TestOfferRefillLeavesHeadroomForAConcurrentTier(t *testing.T) {
 		t.Fatal("first listener never entered AcquireJobs")
 	}
 
-	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []Job{
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []dispatch.Job{
 		{RequestID: 21, RunID: 201}, {RequestID: 22, RunID: 202},
 	}}); err != nil {
 		t.Fatalf("second handle: %v", err)
@@ -465,7 +466,7 @@ func TestReturnedLowerPollReleasesSurplusBeforeAcquireBlocks(t *testing.T) {
 		onGet: func() (*Message, error) {
 			if polls.Add(1) == 1 {
 				return &Message{MessageID: 1,
-					Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+					Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 			}
 			<-finishLaterPoll
 			return nil, ErrNoMessage
@@ -502,7 +503,7 @@ func TestReturnedLowerPollReleasesSurplusBeforeAcquireBlocks(t *testing.T) {
 
 	secondSession := &fakeSession{}
 	second := NewListener(a, tiers[1].Label, secondSession)
-	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []Job{
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []dispatch.Job{
 		{RequestID: 21, RunID: 201}, {RequestID: 22, RunID: 202},
 	}}); err != nil {
 		t.Fatalf("peer handle: %v", err)
@@ -546,7 +547,7 @@ func TestPartialAcquisitionRestoresSameProviderPlacementOrder(t *testing.T) {
 			[]string{original[0].TargetNode, original[1].TargetNode, original[2].TargetNode})
 	}
 
-	if err := l.acquire(t.Context(), []Job{
+	if err := l.acquire(t.Context(), []dispatch.Job{
 		{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102},
 	}); err != nil {
 		t.Fatalf("acquire: %v", err)
@@ -962,18 +963,18 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 	}{
 		{
 			name: "an offer",
-			msg:  Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}},
+			msg:  Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}},
 		},
 		{
 			name: "an assignment",
-			msg:  Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}},
+			msg:  Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}},
 		},
 		{
 			name: "both",
 			msg: Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			},
 		},
 	} {
@@ -1067,9 +1068,9 @@ func TestAdvertisingNothingStillPreservesAndProcessesCompletions(t *testing.T) {
 
 			return errors.New("node unavailable")
 		}}))
-	job := Job{RequestID: 12, RunID: 102, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 12, RunID: 102, Result: "Succeeded"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle completed message while advertising nothing: %v", err)
 	}
 	if !acknowledged || destroys.Load() != 1 {
@@ -1113,8 +1114,8 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 			MessageID: 1,
 			// Different id spaces on purpose: an implementation that acquires the
 			// wrong class acquires the wrong NUMBER, which is what this asserts on.
-			Available: []Job{{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102}},
-			Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			Available: []dispatch.Job{{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102}},
+			Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 		}, nil
 	}
 
@@ -1196,7 +1197,7 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		if deliveries.Add(1) <= 2 {
 			return &Message{
 				MessageID: 1,
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		}
 
@@ -1264,9 +1265,9 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		switch stage.Add(1) {
 		case 1:
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 2:
-			return &Message{MessageID: 2, Completed: []Job{{
+			return &Message{MessageID: 2, Completed: []dispatch.Job{{
 				RequestID: 11, RunID: 101, Result: "succeeded",
 			}}}, nil
 		default:
@@ -1366,18 +1367,18 @@ func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
 	if err := l.refillEscrow(t.Context()); err != nil {
 		t.Fatalf("refill escrow: %v", err)
 	}
-	lease, needsCompute, err := l.assign(t.Context(), Job{RequestID: 11, RunID: 101})
+	lease, needsCompute, err := l.assign(t.Context(), dispatch.Job{RequestID: 11, RunID: 101})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 	if !needsCompute || lease == nil {
 		t.Fatal("assignment did not receive compute")
 	}
-	if err := l.launch(t.Context(), lease, Job{RequestID: 11, RunID: 101}); err != nil {
+	if err := l.launch(t.Context(), lease, dispatch.Job{RequestID: 11, RunID: 101}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 
-	err = l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{{
+	err = l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{{
 		RunID: 101, JobID: "translated-job-guid", Result: "succeeded",
 		RunnerName: provider.InstanceName(lease.ID),
 	}}})
@@ -1423,7 +1424,7 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 	if err := l.refillEscrow(t.Context()); err != nil {
 		t.Fatalf("refill escrow: %v", err)
 	}
-	lease, needsCompute, err := l.assign(t.Context(), Job{RequestID: 11, RunID: 101})
+	lease, needsCompute, err := l.assign(t.Context(), dispatch.Job{RequestID: 11, RunID: 101})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
@@ -1434,7 +1435,7 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 		t.Fatalf("IdentifyDirectJob: %v", err)
 	}
 
-	entry, err := l.resolveActualJob(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
+	entry, err := l.resolveActualJob(t.Context(), dispatch.Job{RunID: 102, JobID: "different-job-guid",
 		RunnerName: provider.InstanceName(lease.ID)}, resolveCompletion, nil)
 	resolved := entry.cleanup
 	if err != nil {
@@ -1465,7 +1466,7 @@ func TestPooledCompletionAndAssignedCountRetireBothPhysicalRunners(t *testing.T)
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+		Assigned: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
 			{RequestID: 12, RunID: 102, JobID: "job-12"}},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("launch pool: %v", err)
@@ -1481,9 +1482,9 @@ func TestPooledCompletionAndAssignedCountRetireBothPhysicalRunners(t *testing.T)
 		}
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 2,
-		Started: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+		Started: []dispatch.Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
 			RunnerName: actual.RunnerName}},
-		Completed: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+		Completed: []dispatch.Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
 			RunnerName: actual.RunnerName, Result: "Succeeded"}},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("settle swapped runner and idle surplus: %v", err)
@@ -1547,7 +1548,7 @@ func TestAssignedCountFillsBeyondTruncatedAssignmentEntries(t *testing.T) {
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "only-visible-job"}},
+		Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "only-visible-job"}},
 		Statistics: &Statistics{TotalAssignedJobs: 3}}); err != nil {
 		t.Fatalf("truncated assignment growth: %v", err)
 	}
@@ -1575,7 +1576,7 @@ func TestAssignedCountConsumesPreviouslyAcquiredEscrow(t *testing.T) {
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Available:  []Job{{RequestID: 11, JobID: "offered-job"}},
+		Available:  []dispatch.Job{{RequestID: 11, JobID: "offered-job"}},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("acquired desired-count growth: %v", err)
 	}
@@ -1584,7 +1585,7 @@ func TestAssignedCountConsumesPreviouslyAcquiredEscrow(t *testing.T) {
 			l.Acquiring(), launched)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 2,
-		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "offered-job"}},
+		Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "offered-job"}},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("individual assignment after aggregate growth: %v", err)
 	}
@@ -1607,7 +1608,7 @@ func TestRunnerRemovalFailureKeepsComputeAndCapacity(t *testing.T) {
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
+		Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("launch pool: %v", err)
 	}
@@ -1616,7 +1617,7 @@ func TestRunnerRemovalFailureKeepsComputeAndCapacity(t *testing.T) {
 		t.Fatalf("pool members = %+v, err %v", members, err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 2,
-		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "job-11",
+		Completed: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11",
 			RunnerName: members[0].RunnerName, Result: "Succeeded"}},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("completion: %v", err)
@@ -1646,7 +1647,7 @@ func TestPooledCompletionAfterServerRestartReleasesTheDurableLease(t *testing.T)
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := first.handle(t.Context(), &Message{MessageID: 1,
-		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
+		Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("launch pool: %v", err)
 	}
@@ -1663,7 +1664,7 @@ func TestPooledCompletionAfterServerRestartReleasesTheDurableLease(t *testing.T)
 		},
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
 	if err := restarted.handle(t.Context(), &Message{MessageID: 2,
-		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "job-11",
+		Completed: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11",
 			RunnerName: members[0].RunnerName, Result: "Succeeded"}},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("post-restart completion: %v", err)
@@ -1712,7 +1713,7 @@ func TestSwappedPoolCompletionKeepsPhysicalIdentityAcrossLostAckAndRestart(t *te
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := first.handle(t.Context(), &Message{MessageID: 1,
-		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+		Assigned: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
 			{RequestID: 12, RunID: 102, JobID: "job-12"}},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("launch pool: %v", err)
@@ -1728,9 +1729,9 @@ func TestSwappedPoolCompletionKeepsPhysicalIdentityAcrossLostAckAndRestart(t *te
 		}
 	}
 	message := &Message{MessageID: 2,
-		Started: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+		Started: []dispatch.Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
 			RunnerName: physical.RunnerName}},
-		Completed: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+		Completed: []dispatch.Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
 			RunnerName: physical.RunnerName, Result: "Succeeded"}},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}
 	if err := first.handle(t.Context(), message); err == nil {
@@ -1783,7 +1784,7 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
 	}
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
-		onDestroy: func(int64) error { return ErrCustody },
+		onDestroy: func(int64) error { return dispatch.ErrCustody },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
 	if err := l.reconcilePool(t.Context(), 0); err != nil {
 		t.Fatalf("reconcile pool: %v", err)
@@ -1818,7 +1819,7 @@ func TestStartedIdentityCannotRetireAnotherTiersPoolMember(t *testing.T) {
 	l := NewListener(a, "tier-a", &fakeSession{}, WithRunner(&fakeRunner{
 		onDestroy: func(int64) error { destroyed++; return nil },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
-	err := l.handle(t.Context(), &Message{MessageID: 1, Started: []Job{{RequestID: 22,
+	err := l.handle(t.Context(), &Message{MessageID: 1, Started: []dispatch.Job{{RequestID: 22,
 		RunID: 202, JobID: "job-22", RunnerID: 77, RunnerName: name}}})
 	if !errors.Is(err, ErrUntrustworthySession) {
 		t.Fatalf("cross-tier start = %v, want fatal session refusal", err)
@@ -1847,7 +1848,7 @@ func TestStartedIdentityOperationalFailureIsNotQuarantined(t *testing.T) {
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err := l.handle(ctx, &Message{MessageID: 1, Started: []Job{{RequestID: 11,
+	err := l.handle(ctx, &Message{MessageID: 1, Started: []dispatch.Job{{RequestID: 11,
 		RunID: 101, JobID: "job-11", RunnerID: 77, RunnerName: name}}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled pool lookup = %v, want operational cancellation", err)
@@ -1872,7 +1873,7 @@ func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+		Assigned: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
 			{RequestID: 12, RunID: 102, JobID: "job-12"}},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("launch pool: %v", err)
@@ -1883,7 +1884,7 @@ func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
 	}
 	bad, good := members[0], members[1]
 	if err := l.handle(t.Context(), &Message{MessageID: 2,
-		Started: []Job{{RequestID: bad.LaunchRequestID, RunID: 101, RunnerID: 77,
+		Started: []dispatch.Job{{RequestID: bad.LaunchRequestID, RunID: 101, RunnerID: 77,
 			RunnerName: bad.RunnerName}},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("a contradictory member stopped its tier: %v", err)
@@ -1935,8 +1936,8 @@ func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 	if err := l.refillEscrow(t.Context()); err != nil {
 		t.Fatalf("refill escrow: %v", err)
 	}
-	assigned := Job{RunID: 101, JobID: "job-guid", Event: "push"}
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{assigned}}); err != nil {
+	assigned := dispatch.Job{RunID: 101, JobID: "job-guid", Event: "push"}
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []dispatch.Job{assigned}}); err != nil {
 		t.Fatalf("handle direct assignment: %v", err)
 	}
 	if got := session.acquiredIDs(); len(got) != 0 {
@@ -1946,8 +1947,8 @@ func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 		t.Fatalf("launch request id = %d, want a negative durable identity", launched)
 	}
 
-	completed := Job{RunID: 101, JobID: "job-guid", Result: "succeeded"}
-	if err := l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{completed}}); err != nil {
+	completed := dispatch.Job{RunID: 101, JobID: "job-guid", Result: "succeeded"}
+	if err := l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{completed}}); err != nil {
 		t.Fatalf("handle direct completion: %v", err)
 	}
 	if destroyed != launched {
@@ -1979,7 +1980,7 @@ func TestDistinctDirectOffersSharingWireIDAreRefused(t *testing.T) {
 	if err := l.refillEscrow(t.Context()); err != nil {
 		t.Fatalf("refill escrow: %v", err)
 	}
-	err := l.acquire(t.Context(), []Job{{JobID: "job-a"}, {JobID: "job-b"}})
+	err := l.acquire(t.Context(), []dispatch.Job{{JobID: "job-a"}, {JobID: "job-b"}})
 	if !errors.Is(err, ErrUntrustworthySession) {
 		t.Fatalf("acquire distinct zero-id offers = %v, want ErrUntrustworthySession", err)
 	}
@@ -1999,7 +2000,7 @@ func TestDirectAssignmentWithoutJobIDFailsClosed(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 	l := NewListener(a, tiers[0].Label, &fakeSession{})
 
-	err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{{}}})
+	err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []dispatch.Job{{}}})
 	if !errors.Is(err, ErrUntrustworthySession) {
 		t.Fatalf("identify zero-id assignment without job id = %v, want ErrUntrustworthySession", err)
 	}
@@ -2603,14 +2604,14 @@ func TestOffersAreAcquiredOnlyUpToFreeEscrow(t *testing.T) {
 			// Consume the only slot.
 			return &Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 2:
 			// Two more offers with nothing free to back either.
 			return &Message{
 				MessageID: 2,
-				Available: []Job{{RequestID: 12, RunID: 102}, {RequestID: 13, RunID: 103}},
+				Available: []dispatch.Job{{RequestID: 12, RunID: 102}, {RequestID: 13, RunID: 103}},
 			}, nil
 		}
 
@@ -2663,21 +2664,21 @@ func TestACompletionFreesTheSlotItsReplacementNeeds(t *testing.T) {
 		case 1:
 			return &Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 2:
 			// The completion of 11 and the offer of 12, together.
 			return &Message{
 				MessageID: 2,
-				Available: []Job{{RequestID: 12, RunID: 102}},
-				Completed: []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 12, RunID: 102}},
+				Completed: []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 3:
 			// And the confirmation that the claim on 12 stuck.
 			return &Message{
 				MessageID: 3,
-				Assigned:  []Job{{RequestID: 12, RunID: 102}},
+				Assigned:  []dispatch.Job{{RequestID: 12, RunID: 102}},
 			}, nil
 		}
 
@@ -2742,8 +2743,8 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 	batch := func(id int64) *Message {
 		return &Message{
 			MessageID: id,
-			Assigned:  []Job{{RequestID: 11, RunID: 101}},
-			Completed: []Job{{RequestID: 11, RunID: 101, Result: "Cancelled"}},
+			Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
+			Completed: []dispatch.Job{{RequestID: 11, RunID: 101, Result: "Cancelled"}},
 		}
 	}
 
@@ -2838,10 +2839,10 @@ func TestOneLeaseCannotBackTwoAcquisitions(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		switch delivered.Add(1) {
 		case 1:
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 2:
 			// A second offer, with the only lease already promised to the first.
-			return &Message{MessageID: 2, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+			return &Message{MessageID: 2, Available: []dispatch.Job{{RequestID: 12, RunID: 102}}}, nil
 		}
 
 		cancel()
@@ -2891,7 +2892,7 @@ func TestEscrowIsReturnedWhenAnOfferIsNotGranted(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		switch delivered.Add(1) {
 		case 1:
-			return &Message{MessageID: 1, Available: []Job{
+			return &Message{MessageID: 1, Available: []dispatch.Job{
 				{RequestID: 11, RunID: 101},
 				{RequestID: 12, RunID: 102},
 			}}, nil
@@ -2945,7 +2946,7 @@ func TestAnUnbackedAssignmentIsDeclinedRatherThanFatal(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		if delivered.Add(1) == 1 {
 			// Assigned with no offer, no promise, and no free escrow.
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		cancel()
@@ -3015,12 +3016,12 @@ func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		switch delivered.Add(1) {
 		case 1:
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 2:
 			// Cancelled before any assignment arrived.
-			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 3:
-			return &Message{MessageID: 3, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+			return &Message{MessageID: 3, Available: []dispatch.Job{{RequestID: 12, RunID: 102}}}, nil
 		}
 
 		cancel()
@@ -3088,7 +3089,7 @@ func TestAStalePromiseIsReportedAndKept(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		if delivered.Add(1) == 1 {
 			// Acquired, and then GitHub never mentions it again.
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// Paced, so the heartbeat goroutine actually gets to run between polls —
@@ -3173,20 +3174,20 @@ func TestAReofferedRequestKeepsItsExistingPromise(t *testing.T) {
 	session.onGet = func() (*Message, error) {
 		switch delivered.Add(1) {
 		case 1:
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 2:
 			// The same offer again, which GitHub may redeliver.
-			return &Message{MessageID: 2, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 2, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 3:
 			// A DIFFERENT request, and this is what makes the bug bite. Without it
 			// the wrongly-freed lease is still sitting in held when the assignment
 			// arrives, and assign's fallback picks it straight back up — so the
 			// test passes against the bug. Something else has to take the lease
 			// first. Confirmed by mutation.
-			return &Message{MessageID: 3, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+			return &Message{MessageID: 3, Available: []dispatch.Job{{RequestID: 12, RunID: 102}}}, nil
 		case 4:
 			// And the assignment billet was promised all along.
-			return &Message{MessageID: 4, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 4, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 5:
 			running.Store(int32(l.Running()))
 
@@ -3253,7 +3254,7 @@ func TestAnAcquisitionOutsideItsRequestStopsTheListener(t *testing.T) {
 	session.onAcquire = func([]int64) ([]int64, error) { return []int64{99}, nil }
 
 	session.onGet = func() (*Message, error) {
-		return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 	}
 
 	l := NewListener(a, tiers[0].Label, session)
@@ -3304,7 +3305,7 @@ func TestTheCursorDoesNotAdvancePastAnUnacknowledgedMessage(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, session)
 
-	msg := &Message{MessageID: 42, Available: []Job{{RequestID: 11, RunID: 101}}}
+	msg := &Message{MessageID: 42, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}
 
 	if err := l.handle(t.Context(), msg); err == nil {
 		t.Fatal("handle reported success despite the acknowledgement failing")
@@ -3372,16 +3373,16 @@ func TestAPoisonedCompletionCannotKeepTheListenerDown(t *testing.T) {
 		if deliveries.Add(1) <= 3 {
 			return &Message{
 				MessageID: 42,
-				Completed: []Job{
+				Completed: []dispatch.Job{
 					{RunnerName: "not-a-billet-runner", Result: "succeeded"},
 					{RequestID: 12, RunID: 102, Result: "succeeded"},
 				},
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		}
 
-		return &Message{MessageID: 43, Completed: []Job{{
+		return &Message{MessageID: 43, Completed: []dispatch.Job{{
 			RequestID: 11,
 			RunID:     101,
 			Result:    "succeeded",
@@ -3417,14 +3418,14 @@ func TestAPoisonedCompletionCannotKeepTheListenerDown(t *testing.T) {
 	if err := l.refillEscrow(ctx); err != nil {
 		t.Fatalf("refill escrow for pre-existing job: %v", err)
 	}
-	lease, needsCompute, err := l.assign(ctx, Job{RequestID: 12, RunID: 102})
+	lease, needsCompute, err := l.assign(ctx, dispatch.Job{RequestID: 12, RunID: 102})
 	if err != nil {
 		t.Fatalf("assign pre-existing job: %v", err)
 	}
 	if !needsCompute || lease == nil {
 		t.Fatal("pre-existing job did not receive compute")
 	}
-	if err := l.launch(ctx, lease, Job{RequestID: 12, RunID: 102}); err != nil {
+	if err := l.launch(ctx, lease, dispatch.Job{RequestID: 12, RunID: 102}); err != nil {
 		t.Fatalf("launch pre-existing job: %v", err)
 	}
 
@@ -3483,7 +3484,7 @@ func TestAPoisonedCompletionIsNotSkippedWhenItsAcknowledgementFails(t *testing.T
 				return nil, errors.New("poisoned completion reached a fourth delivery without a quarantine acknowledgement attempt")
 			}
 
-			return &Message{MessageID: 42, Completed: []Job{{
+			return &Message{MessageID: 42, Completed: []dispatch.Job{{
 				RunnerName: "not-a-billet-runner",
 			}}}, nil
 		},
@@ -3524,14 +3525,14 @@ func TestACompletionForAnotherTierRemainsFatalAndUnacknowledged(t *testing.T) {
 	if err := owner.refillEscrow(t.Context()); err != nil {
 		t.Fatalf("refill owning tier: %v", err)
 	}
-	lease, needsCompute, err := owner.assign(t.Context(), Job{RequestID: 11, RunID: 101})
+	lease, needsCompute, err := owner.assign(t.Context(), dispatch.Job{RequestID: 11, RunID: 101})
 	if err != nil {
 		t.Fatalf("assign owning tier: %v", err)
 	}
 	if !needsCompute || lease == nil {
 		t.Fatal("owning tier did not receive compute")
 	}
-	if err := owner.launch(t.Context(), lease, Job{RequestID: 11, RunID: 101}); err != nil {
+	if err := owner.launch(t.Context(), lease, dispatch.Job{RequestID: 11, RunID: 101}); err != nil {
 		t.Fatalf("launch owning tier: %v", err)
 	}
 
@@ -3545,7 +3546,7 @@ func TestACompletionForAnotherTierRemainsFatalAndUnacknowledged(t *testing.T) {
 				return nil, errors.New("cross-tier completion did not stop the listener")
 			}
 
-			return &Message{MessageID: 42, Completed: []Job{{
+			return &Message{MessageID: 42, Completed: []dispatch.Job{{
 				RunnerName: provider.InstanceName(lease.ID),
 				Result:     "succeeded",
 			}}}, nil
@@ -3577,7 +3578,7 @@ func TestACompletionForAnotherTierRemainsFatalAndUnacknowledged(t *testing.T) {
 		t.Errorf("owning listener has %d running leases after the fatal refusal, want the lease visible for teardown", got)
 	}
 
-	owner.complete(t.Context(), Job{RequestID: 11, RunID: 101, Result: "succeeded"})
+	owner.complete(t.Context(), dispatch.Job{RequestID: 11, RunID: 101, Result: "succeeded"})
 	usage, err := a.Usage(t.Context())
 	if err != nil {
 		t.Fatalf("Usage: %v", err)
@@ -3631,11 +3632,11 @@ func TestComputeIsDestroyedBeforeItsCapacityIsReleased(t *testing.T) {
 		case 1:
 			return &Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 2:
-			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		case 3:
 			cancel()
 		}
@@ -3700,11 +3701,11 @@ func TestCapacityIsHeldWhenTheComputeWillNotDie(t *testing.T) {
 		case 1:
 			return &Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 2:
-			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		cancel()
@@ -3765,8 +3766,8 @@ func TestCapacityIsReturnedWhenTheComputeWillNotStart(t *testing.T) {
 		case 1:
 			return &Message{
 				MessageID: 1,
-				Available: []Job{{RequestID: 11, RunID: 101}},
-				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+				Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		case 2:
 			// Sampled during the run: shutdown releases everything, so anything
@@ -3804,7 +3805,7 @@ func TestLostJITResponseUsesDurableIdentityBeforeReleasingFailedLaunch(t *testin
 		t.Fatalf("refill escrow: %v", err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}}}); err != nil {
+		Assigned: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "job-11"}}}); err != nil {
 		t.Fatalf("failed launch handling: %v", err)
 	}
 	if len(registry.names) != 1 || registry.names[0] != runner.name {
@@ -3829,7 +3830,7 @@ type fakeRunner struct {
 	onDestroy          func(requestID int64) error
 	onDestroyCompleted func(requestID int64, result string) error
 	// authorities are the cache authorities every completion carried, in order.
-	authorities []CacheAuthority
+	authorities []dispatch.CacheAuthority
 }
 
 type journaledFailureRunner struct {
@@ -3839,7 +3840,7 @@ type journaledFailureRunner struct {
 }
 
 func (r *journaledFailureRunner) Launch(
-	ctx context.Context, lease *alloc.Lease, job Job,
+	ctx context.Context, lease *alloc.Lease, job dispatch.Job,
 ) error {
 	r.name = "github-returned-" + lease.ID
 	if err := r.allocator.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: lease.ID,
@@ -3873,7 +3874,7 @@ type boundFakeRunner struct {
 	node       string
 	leaseEpoch int64
 	outcome    alloc.Phase
-	authority  CacheAuthority
+	authority  dispatch.CacheAuthority
 	err        error
 }
 
@@ -3885,7 +3886,7 @@ type absenceResolvingRunner struct {
 
 type bindingFakeRunner struct{ node string }
 
-func (f *bindingFakeRunner) Launch(_ context.Context, lease *alloc.Lease, _ Job) error {
+func (f *bindingFakeRunner) Launch(_ context.Context, lease *alloc.Lease, _ dispatch.Job) error {
 	lease.Node = f.node
 
 	return nil
@@ -3893,7 +3894,7 @@ func (f *bindingFakeRunner) Launch(_ context.Context, lease *alloc.Lease, _ Job)
 
 func (*bindingFakeRunner) Destroy(context.Context, int64) error { return nil }
 
-func (f *boundFakeRunner) Launch(context.Context, *alloc.Lease, Job) error { return nil }
+func (f *boundFakeRunner) Launch(context.Context, *alloc.Lease, dispatch.Job) error { return nil }
 
 func (f *boundFakeRunner) Destroy(context.Context, int64) error { return f.err }
 
@@ -3903,7 +3904,7 @@ func (f *boundFakeRunner) DestroyCompletedBound(
 	result, leaseID, node string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
-	authority CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	f.requestID, f.result, f.leaseID, f.node, f.leaseEpoch, f.outcome =
 		requestID, result, leaseID, node, leaseEpoch, outcome
@@ -3912,7 +3913,7 @@ func (f *boundFakeRunner) DestroyCompletedBound(
 	return f.err
 }
 
-func (*absenceResolvingRunner) Launch(context.Context, *alloc.Lease, Job) error { return nil }
+func (*absenceResolvingRunner) Launch(context.Context, *alloc.Lease, dispatch.Job) error { return nil }
 
 func (*absenceResolvingRunner) Destroy(context.Context, int64) error { return nil }
 
@@ -3922,7 +3923,7 @@ func (r *absenceResolvingRunner) DestroyCompletedBound(
 	_, leaseID, node string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
-	_ CacheAuthority,
+	_ dispatch.CacheAuthority,
 ) error {
 	r.calls.Add(1)
 	settled, err := r.allocator.SettleCompletionOnTerminalLease(ctx, leaseID, leaseEpoch, outcome)
@@ -3930,7 +3931,7 @@ func (r *absenceResolvingRunner) DestroyCompletedBound(
 		return err
 	}
 	if !settled {
-		return ErrHolderUnavailable
+		return dispatch.ErrHolderUnavailable
 	}
 
 	return nil
@@ -3940,7 +3941,7 @@ type cancelAfterDestroyRunner struct {
 	cancel context.CancelFunc
 }
 
-func (r *cancelAfterDestroyRunner) Launch(context.Context, *alloc.Lease, Job) error {
+func (r *cancelAfterDestroyRunner) Launch(context.Context, *alloc.Lease, dispatch.Job) error {
 	return nil
 }
 
@@ -3951,14 +3952,14 @@ func (r *cancelAfterDestroyRunner) Destroy(context.Context, int64) error {
 }
 
 func (r *cancelAfterDestroyRunner) DestroyCompleted(context.Context, int64, string,
-	CacheAuthority,
+	dispatch.CacheAuthority,
 ) error {
 	r.cancel()
 
 	return nil
 }
 
-func (f *fakeRunner) Launch(_ context.Context, _ *alloc.Lease, job Job) error {
+func (f *fakeRunner) Launch(_ context.Context, _ *alloc.Lease, job dispatch.Job) error {
 	if f.onLaunch != nil {
 		return f.onLaunch(job.RequestID)
 	}
@@ -3975,7 +3976,7 @@ func (f *fakeRunner) Destroy(_ context.Context, requestID int64) error {
 }
 
 func (f *fakeRunner) DestroyCompleted(_ context.Context, requestID int64, result string,
-	authority CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	f.authorities = append(f.authorities, authority)
 	if f.onDestroyCompleted != nil {
@@ -4122,8 +4123,8 @@ func TestAcknowledgedCompletionRestoresItsExactResultAfterRestart(t *testing.T) 
 		WithRunner(&fakeRunner{onDestroyCompleted: func(_ int64, _ string) error {
 			return errors.New("node unavailable")
 		}}))
-	job := Job{RequestID: 71, RunID: 81, Result: "Succeeded"}
-	if err := first.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	job := dispatch.Job{RequestID: 71, RunID: 81, Result: "Succeeded"}
+	if err := first.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle completed message: %v", err)
 	}
 	pending, err := db.PendingCompletions(t.Context(), "linux")
@@ -4134,11 +4135,11 @@ func TestAcknowledgedCompletionRestoresItsExactResultAfterRestart(t *testing.T) 
 		t.Fatalf("durable completion = %+v, want result and run from %+v", pending, job)
 	}
 
-	var got Job
+	var got dispatch.Job
 	restarted := NewListener(nil, "linux", &fakeSession{},
 		WithCompletionStore(db), WithCleanupRetryPacing(0, 0),
 		WithRunner(&fakeRunner{onDestroyCompleted: func(requestID int64, result string) error {
-			got = Job{RequestID: requestID, Result: result}
+			got = dispatch.Job{RequestID: requestID, Result: result}
 
 			return nil
 		}}))
@@ -4193,7 +4194,7 @@ func TestCompletionIsNotAcknowledgedWhenItsResultCannotBeMadeDurable(t *testing.
 		return nil
 	}}
 	l := NewListener(nil, "linux", session, WithCompletionStore(db), WithRunner(&fakeRunner{}))
-	err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{{RequestID: 73, Result: "Succeeded"}}})
+	err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{{RequestID: 73, Result: "Succeeded"}}})
 	if err == nil {
 		t.Fatal("completion was handled without durable result storage")
 	}
@@ -4206,7 +4207,7 @@ func TestReleaseOnlyCompletionKeepsItsDurableResultUntilReleaseSettles(t *testin
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 	db := openState(t)
-	job := Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
 	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
 		Tier: tiers[0].Label, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 	}); err != nil {
@@ -4248,7 +4249,7 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 	db := openState(t)
-	job := Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
 	interrupted, cancel := context.WithCancel(t.Context())
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(&cancelAfterDestroyRunner{cancel: cancel}))
@@ -4305,7 +4306,7 @@ func TestRestoredCompletionRetiresAfterAnIndependentTerminalOutcome(t *testing.T
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 	db := openState(t)
-	job := Job{RequestID: 77, RunID: 87, Result: "Succeeded", CompletionID: 27}
+	job := dispatch.Job{RequestID: 77, RunID: 87, Result: "Succeeded", CompletionID: 27}
 	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
 	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
 	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
@@ -4367,7 +4368,7 @@ func TestRestoredCompletionPreservesAForceReleasedOutcome(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers,
 		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(30*time.Second))
 	db := openState(t)
-	job := Job{RequestID: 78, RunID: 88, Result: "Succeeded", CompletionID: 28}
+	job := dispatch.Job{RequestID: 78, RunID: 88, Result: "Succeeded", CompletionID: 28}
 	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
 	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
 	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
@@ -4431,7 +4432,7 @@ func TestRestoredCompletionCorrectsProvisionalInventoryOutcome(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers,
 		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(30*time.Second))
 	db := openState(t)
-	job := Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 29}
+	job := dispatch.Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 29}
 	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
 	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
 	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
@@ -4496,7 +4497,7 @@ func TestCompletionDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 	db := openState(t)
 	store := newFailingCompletionStore(db, 2)
-	job := Job{RequestID: 76, RunID: 86, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 76, RunID: 86, Result: "Succeeded"}
 	var destroys atomic.Int32
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(store),
 		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
@@ -4553,7 +4554,7 @@ func TestReleaseOnlyPersistenceDoesNotExtendAShutdownDeadline(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	ctx, cancel := context.WithDeadline(t.Context(), deadline)
 	defer cancel()
-	err := l.recordReleaseOnly(ctx, Job{RequestID: 78, RunID: 88, Result: "Succeeded"},
+	err := l.recordReleaseOnly(ctx, dispatch.Job{RequestID: 78, RunID: 88, Result: "Succeeded"},
 		&alloc.Lease{ID: "lease-78", Epoch: 2}, alloc.PhaseDone)
 	if err == nil {
 		t.Fatal("recordReleaseOnly succeeded through the injected store failure")
@@ -4572,7 +4573,7 @@ func TestParkedCompletionWritesShareTheShutdownDeadline(t *testing.T) {
 	l.releaseGrace = time.Hour
 	for id := int64(81); id <= 83; id++ {
 		l.cleanup[id] = &pendingCleanup{
-			job:     Job{RequestID: id, RunID: id + 10, Result: "Succeeded", CompletionID: id + 20},
+			job:     dispatch.Job{RequestID: id, RunID: id + 10, Result: "Succeeded", CompletionID: id + 20},
 			lease:   &alloc.Lease{ID: fmt.Sprintf("lease-%d", id), Epoch: 1},
 			outcome: alloc.PhaseDone, releaseOnly: true,
 		}
@@ -4590,7 +4591,7 @@ func TestFailedCompletionRetirementBlocksReuseWithoutRepeatingTeardown(t *testin
 	db := openState(t)
 	store := &failingRetirementStore{completionStore: db}
 	store.failRetire.Store(true)
-	job := Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 10}
+	job := dispatch.Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 10}
 	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
 		Tier: "linux", RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 		MessageID: job.CompletionID,
@@ -4637,7 +4638,7 @@ func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
 	db := openState(t)
 	store := &failingRetirementStore{completionStore: db}
 	store.failDelete.Store(true)
-	job := Job{RequestID: 80, RunID: 90, Result: "Succeeded", CompletionID: 20}
+	job := dispatch.Job{RequestID: 80, RunID: 90, Result: "Succeeded", CompletionID: 20}
 	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
 		Tier: "linux", RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
 		MessageID: job.CompletionID,
@@ -4648,7 +4649,7 @@ func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
 		WithRunner(&fakeRunner{}))
 	l.complete(t.Context(), job)
 	l.acknowledgeCompletions(t.Context(), &Message{
-		MessageID: job.CompletionID, Completed: []Job{job},
+		MessageID: job.CompletionID, Completed: []dispatch.Job{job},
 	})
 	pending, err := db.PendingCompletions(t.Context(), "linux")
 	if err != nil {
@@ -4683,7 +4684,7 @@ func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
 	restarted.running[job.RequestID] = replacement
 	restarted.mu.Unlock()
 	if err := restarted.handle(t.Context(), &Message{
-		MessageID: job.CompletionID, Completed: []Job{job},
+		MessageID: job.CompletionID, Completed: []dispatch.Job{job},
 	}); err != nil {
 		t.Fatalf("redeliver retired completion: %v", err)
 	}
@@ -4736,7 +4737,7 @@ func TestCompletionAcknowledgementPersistsAfterPollCancellation(t *testing.T) {
 	canceled, cancel := context.WithCancel(t.Context())
 	cancel()
 	l.acknowledgeCompletions(canceled, &Message{
-		MessageID: 20, Completed: []Job{{RequestID: 80, RunID: 90, Result: "Succeeded"}},
+		MessageID: 20, Completed: []dispatch.Job{{RequestID: 80, RunID: 90, Result: "Succeeded"}},
 	})
 	if pending, err := db.PendingCompletions(t.Context(), tiers[0].Label); err != nil || len(pending) != 0 {
 		t.Fatalf("acknowledged completion tombstones = %+v, err %v", pending, err)
@@ -4756,7 +4757,7 @@ func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 	if _, err := db.PutPendingCompletion(t.Context(), completion); err != nil {
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
-	runner := &boundFakeRunner{err: fmt.Errorf("%w: holder is registering", ErrHolderUnavailable)}
+	runner := &boundFakeRunner{err: fmt.Errorf("%w: holder is registering", dispatch.ErrHolderUnavailable)}
 	l := NewListener(nil, "linux", &fakeSession{}, WithCompletionStore(db),
 		WithCleanupRetryPacing(0, 0), WithRunner(runner))
 	if err := l.restoreCompletions(t.Context()); err != nil {
@@ -4785,7 +4786,7 @@ func TestNormalLaunchPersistsItsBoundNodeForCompletionRecovery(t *testing.T) {
 	runner := &bindingFakeRunner{node: "holder"}
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(runner))
-	job := Job{RequestID: 82, RunID: 92, Result: "Succeeded", CompletionID: 22}
+	job := dispatch.Job{RequestID: 82, RunID: 92, Result: "Succeeded", CompletionID: 22}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 	if err := l.launch(t.Context(), lease, job); err != nil {
 		t.Fatalf("launch: %v", err)
@@ -4808,7 +4809,7 @@ func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) 
 	db := openState(t)
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
-	job := Job{RequestID: 75, RunID: 85, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 75, RunID: 85, Result: "Succeeded"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 	if _, err := l.recordCompletion(t.Context(), job); err != nil {
 		t.Fatalf("recordCompletion: %v", err)
@@ -4867,7 +4868,7 @@ func TestShutdownPreservesARestoredCompletionUntilItsHolderReturns(t *testing.T)
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
 
-	runner := &boundFakeRunner{err: ErrHolderUnavailable}
+	runner := &boundFakeRunner{err: dispatch.ErrHolderUnavailable}
 	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(runner))
 	if err := restarted.restoreCompletions(t.Context()); err != nil {
@@ -4900,7 +4901,7 @@ func TestShutdownDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T)
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 	db := openState(t)
 	store := newFailingCompletionStore(db, 2)
-	job := Job{RequestID: 77, RunID: 87, Result: "Succeeded"}
+	job := dispatch.Job{RequestID: 77, RunID: 87, Result: "Succeeded"}
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(store),
 		WithRunner(&fakeRunner{}))
 	holdRunning(t, l, a, tiers[0].Label, job.RequestID)
@@ -4993,11 +4994,11 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	// The first completion cannot destroy, so its capacity is held.
-	l.complete(t.Context(), Job{RequestID: 7, Result: "succeeded"})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7, Result: "succeeded"})
 
 	l.mu.Lock()
 	held := len(l.cleanup)
@@ -5092,7 +5093,7 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// A completion whose destroy already failed, so the loop has something to
 	// retry on its first tick.
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	runDone := make(chan struct{})
@@ -5213,7 +5214,7 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -5408,7 +5409,7 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+		7: {job: dispatch.Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
 	}
 	l.mu.Unlock()
 
@@ -5817,14 +5818,14 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 
 	owe := func() {
 		l.mu.Lock()
-		l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+		l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 		l.mu.Unlock()
 	}
 
 	owe()
 
 	for range 5 {
-		if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
+		if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 7}}}); len(got) != 0 {
 			t.Fatalf("reserved %v for a request whose container is still owed", got)
 		}
 	}
@@ -5839,10 +5840,10 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 	// everything above while silencing every request after the first, which is the
 	// version of this that hides an outage behind one line about an unrelated job.
 	l.mu.Lock()
-	l.cleanup[9] = &pendingCleanup{job: Job{RequestID: 9}}
+	l.cleanup[9] = &pendingCleanup{job: dispatch.Job{RequestID: 9}}
 	l.mu.Unlock()
 
-	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 9}}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 9}}}); len(got) != 0 {
 		t.Fatalf("reserved %v for a second blocked request", got)
 	}
 
@@ -5860,7 +5861,7 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 
 	owe()
 
-	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 7}}}); len(got) != 0 {
 		t.Fatalf("reserved %v for a freshly owed request", got)
 	}
 
@@ -5981,7 +5982,7 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 	// test fails for want of material rather than because the budget was starved,
 	// which is the one thing it is meant to detect.
 	l.mu.Lock()
-	l.cleanup[7] = &pendingCleanup{job: Job{RequestID: 7}}
+	l.cleanup[7] = &pendingCleanup{job: dispatch.Job{RequestID: 7}}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -6061,7 +6062,7 @@ func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	// A retry that runs to completion and leaves the obligation in place.
 	l.retryCleanup(t.Context())
@@ -6209,8 +6210,8 @@ func TestASealedCleanupLoopStartsNothingNew(t *testing.T) {
 	// Two obligations, so a snapshot has somewhere to advance TO.
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: Job{RequestID: 7}},
-		9: {job: Job{RequestID: 9}},
+		7: {job: dispatch.Job{RequestID: 7}},
+		9: {job: dispatch.Job{RequestID: 9}},
 	}
 	l.mu.Unlock()
 
@@ -6300,8 +6301,8 @@ func TestRunSealsTheCleanupLoop(t *testing.T) {
 	// Two obligations, so the loop's snapshot has somewhere to advance to.
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: Job{RequestID: 7}},
-		9: {job: Job{RequestID: 9}},
+		7: {job: dispatch.Job{RequestID: 7}},
+		9: {job: dispatch.Job{RequestID: 9}},
 	}
 	l.mu.Unlock()
 
@@ -6436,7 +6437,7 @@ func TestAPanickingRetryStillReleasesItsMark(t *testing.T) {
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	// THROUGH retryCleanup, which is what the cleanup loop calls. Driving
@@ -6565,7 +6566,7 @@ func TestShutdownDoesNotReleaseALeaseTheRunnerIsHolding(t *testing.T) {
 		custodyAnswers.Add(1)
 
 		return fmt.Errorf("%w: the guest was asked to stop and has not been confirmed gone",
-			ErrCustody)
+			dispatch.ErrCustody)
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
@@ -6714,15 +6715,15 @@ func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
 	// The state a lost running lease leaves: no lease, but a container this
 	// listener still has to destroy.
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
 	l.mu.Unlock()
 
-	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 0 {
+	if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 7}}}); len(got) != 0 {
 		t.Errorf("reserved %v for a request whose previous container is still owed; the "+
 			"pending retry would destroy the new job's compute and release its lease", got)
 	}
 
-	lease, ok, err := l.assign(t.Context(), Job{RequestID: 7})
+	lease, ok, err := l.assign(t.Context(), dispatch.Job{RequestID: 7})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
@@ -6738,7 +6739,7 @@ func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
 	delete(l.cleanup, 7)
 	l.mu.Unlock()
 
-	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 7}}}); len(got) != 1 {
+	if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 7}}}); len(got) != 1 {
 		t.Errorf("reserved %v after the obligation was discharged, want one id; the "+
 			"request would never be runnable again", got)
 	}
@@ -7038,7 +7039,7 @@ func TestTheRetryWaitDoublesToACeiling(t *testing.T) {
 	)
 
 	now := time.Now()
-	entry := &pendingCleanup{job: Job{RequestID: 7}}
+	entry := &pendingCleanup{job: dispatch.Job{RequestID: 7}}
 
 	// Recorded ready to run: the first attempt after a failed completion is
 	// immediate, because a node that was briefly busy is the common case.
@@ -7066,7 +7067,7 @@ func TestTheRetryWaitDoublesToACeiling(t *testing.T) {
 	// the sequence lands on it exactly, so the clamp is never reached and a
 	// version without it passes — which is what a mutation run found. Any pacing
 	// whose ceiling is not a power of two multiple of the first wait needs it.
-	overshoot := &pendingCleanup{job: Job{RequestID: 9}}
+	overshoot := &pendingCleanup{job: dispatch.Job{RequestID: 9}}
 
 	overshoot.failed(now, 3*time.Second, 4*time.Second)
 	overshoot.failed(now, 3*time.Second, 4*time.Second)
@@ -7105,7 +7106,7 @@ func TestAFailedRetryWaitsBeforeTheNextOne(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("the completion's own destroy did not run: %d attempts", got)
@@ -7176,7 +7177,7 @@ func TestShutdownDestroysCompletionsWhoseLeaseIsGone(t *testing.T) {
 	// the loop leaves the drain as the only possible source of a destroy.
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+		7: {job: dispatch.Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
 	}
 	l.mu.Unlock()
 
@@ -7252,7 +7253,7 @@ func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
 
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+		7: {job: dispatch.Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
 	}
 	l.mu.Unlock()
 
@@ -7598,7 +7599,7 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -7688,7 +7689,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	if cleanupCount(l) != 1 {
 		t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
@@ -7754,7 +7755,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 	l.mu.Lock()
 	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
 	l.heldOrder[promised.ID] = 99
-	l.cleanup = map[int64]*pendingCleanup{9: {job: Job{RequestID: 9}}}
+	l.cleanup = map[int64]*pendingCleanup{9: {job: dispatch.Job{RequestID: 9}}}
 	l.mu.Unlock()
 
 	time.Sleep(2 * ttl)
@@ -7802,7 +7803,7 @@ func TestACompletionNotHeldIsNotRecorded(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	// No holdRunning: this listener knows nothing about request 7.
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -7879,7 +7880,7 @@ func holdRunningOwedDestroy(t *testing.T, l *Listener, a *alloc.Allocator, tier 
 	// with the running-release path deleted — a fixture quietly covering for the
 	// code it exists to exercise.
 	l.cleanup[requestID] = &pendingCleanup{
-		job: Job{RequestID: requestID},
+		job: dispatch.Job{RequestID: requestID},
 		// Far enough out that the retry loop does not race the teardown for it;
 		// what is under test is the shutdown pass, not the retry's pacing.
 		at: time.Now().Add(time.Hour),
@@ -7928,7 +7929,7 @@ func TestRunStartsTheCleanupLoop(t *testing.T) {
 	// call Destroy on the way in, and this test would then pass on that call
 	// rather than on anything the loop did.
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{11: {job: Job{RequestID: 11}}}
+	l.cleanup = map[int64]*pendingCleanup{11: {job: dispatch.Job{RequestID: 11}}}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -8045,7 +8046,7 @@ func TestAnUnsettledReleaseAfterAFailedLaunchBecomesARetry(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+	if err := l.launch(ctx, lease, dispatch.Job{RequestID: 7, RunID: 7}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 
@@ -8116,7 +8117,7 @@ func TestShutdownReleasesAFailedLaunchWithoutDestroyingPhantomCompute(t *testing
 
 		return &Message{
 			MessageID: 1,
-			Assigned:  []Job{{RequestID: 7, RunID: 70}},
+			Assigned:  []dispatch.Job{{RequestID: 7, RunID: 70}},
 		}, nil
 	}}
 
@@ -8202,7 +8203,7 @@ func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+	if err := l.launch(ctx, lease, dispatch.Job{RequestID: 7, RunID: 7}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 
@@ -8274,7 +8275,7 @@ func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
 	// to give. It used to, and on the poll path that error stopped the listener,
 	// cancelled every other listener, and destroyed every job running on this
 	// host. The signature is what keeps that from coming back.
-	l.complete(ctx, Job{RequestID: 7})
+	l.complete(ctx, dispatch.Job{RequestID: 7})
 
 	// AND THE OBLIGATION SURVIVES, which is the half that makes returning nil
 	// honest rather than a swallow.
@@ -8343,7 +8344,7 @@ func TestDestroyCompletedRecordsRunnerDeregistration(t *testing.T) {
 
 	// Result is empty, so destroyCompleted takes the plain Destroy path, which
 	// fails — the lease stays in launching. RemoveRunner still succeeds first.
-	if err := l.destroyCompleted(t.Context(), Job{RequestID: 7, RunnerName: "billet-x"},
+	if err := l.destroyCompleted(t.Context(), dispatch.Job{RequestID: 7, RunnerName: "billet-x"},
 		lease, alloc.PhaseDone); err == nil {
 		t.Fatal("destroyCompleted returned nil; the failing Destroy should surface")
 	}
@@ -8376,7 +8377,7 @@ func TestDestroyCompletedDoesNotMarkWhenRemoveRunnerFails(t *testing.T) {
 		t.Fatalf("advance: %v", err)
 	}
 
-	if err := l.destroyCompleted(t.Context(), Job{RequestID: 7, RunnerName: "billet-x"},
+	if err := l.destroyCompleted(t.Context(), dispatch.Job{RequestID: 7, RunnerName: "billet-x"},
 		lease, alloc.PhaseDone); err == nil {
 		t.Fatal("destroyCompleted returned nil; the failing RemoveRunner should surface")
 	}
@@ -8404,7 +8405,7 @@ func TestDestroyCompletedSkipsRemovalForAnIdentitylessCompletion(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
 		WithRunnerRegistry(registry))
 
-	if err := l.destroyCompleted(t.Context(), Job{RequestID: 7}, nil, alloc.PhaseDone); err != nil {
+	if err := l.destroyCompleted(t.Context(), dispatch.Job{RequestID: 7}, nil, alloc.PhaseDone); err != nil {
 		t.Fatalf("destroyCompleted for an identityless completion = %v; want nil "+
 			"(RemoveRunner must be skipped, not retried forever)", err)
 	}
@@ -8434,7 +8435,7 @@ func TestDestroyCompletedRemovesAnIdOnlyCompletionsRunner(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
 		WithRunnerRegistry(registry))
 
-	if err := l.destroyCompleted(t.Context(), Job{RequestID: 7, RunnerID: 91}, nil,
+	if err := l.destroyCompleted(t.Context(), dispatch.Job{RequestID: 7, RunnerID: 91}, nil,
 		alloc.PhaseDone); err != nil {
 		t.Fatalf("destroyCompleted for an id-only completion = %v; want nil", err)
 	}
@@ -8481,7 +8482,7 @@ func TestShutdownResolvesAReleaseOnlyLeaseFromQuarantine(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	l.complete(ctx, Job{RequestID: 7})
+	l.complete(ctx, dispatch.Job{RequestID: 7})
 
 	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
 		t.Fatalf("expire: %v", err)
@@ -8570,7 +8571,7 @@ func TestASuccessfulDestroySurvivesTheHeartbeatDroppingItsLease(t *testing.T) {
 		}
 	}
 
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), dispatch.Job{RequestID: 7})
 
 	// THE CAPACITY IS BACK. Its container is confirmed gone, so nothing should be
 	// holding a slot for it.
@@ -8600,10 +8601,10 @@ func TestAHolderUnavailableCompletionStopsRenewingItsLease(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers,
 		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(30*time.Second))
 	runner := &boundFakeRunner{err: fmt.Errorf("%w: the process that launched it is gone",
-		ErrHolderUnavailable)}
+		dispatch.ErrHolderUnavailable)}
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
 		WithCleanupRetryPacing(0, 0))
-	job := Job{RequestID: 77, RunID: 87, Result: "Succeeded", CompletionID: 27}
+	job := dispatch.Job{RequestID: 77, RunID: 87, Result: "Succeeded", CompletionID: 27}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
 		Name: lease.TargetNode, Provider: lease.Providers[0],
@@ -8688,7 +8689,7 @@ func TestAConclusiveLaunchFailureIsArchivedWithItsReason(t *testing.T) {
 
 	// RELEASED AT ONCE.
 	direct := holdRunning(t, l, a, tiers[0].Label, 7)
-	if err := l.launch(t.Context(), direct, Job{RequestID: 7, RunID: 7}); err != nil {
+	if err := l.launch(t.Context(), direct, dispatch.Job{RequestID: 7, RunID: 7}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 	if outcome, err := a.HistoryOutcome(t.Context(), direct.ID); err != nil || outcome != string(alloc.PhaseFailed) {
@@ -8703,7 +8704,7 @@ func TestAConclusiveLaunchFailureIsArchivedWithItsReason(t *testing.T) {
 	parked := holdRunning(t, l, a, tiers[0].Label, 8)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := l.launch(ctx, parked, Job{RequestID: 8, RunID: 8}); err != nil {
+	if err := l.launch(ctx, parked, dispatch.Job{RequestID: 8, RunID: 8}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), parked.ID); err != nil {
@@ -8759,7 +8760,7 @@ func TestAParkedLaunchFailureKeepsItsReasonAcrossTheReaper(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
-			if err := l.launch(ctx, lease, Job{RequestID: 9, RunID: 9}); err != nil {
+			if err := l.launch(ctx, lease, dispatch.Job{RequestID: 9, RunID: 9}); err != nil {
 				t.Fatalf("launch: %v", err)
 			}
 

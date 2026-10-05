@@ -6,6 +6,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // catalogue is a fleet-shaped set of tiers whose shapes sum past the ceiling,
@@ -75,7 +76,7 @@ func directlyAssigned(id int64, job string, assigned int) *Message {
 	return &Message{
 		MessageID:  id,
 		Statistics: &Statistics{TotalAssignedJobs: assigned},
-		Assigned:   []Job{{JobID: job}},
+		Assigned:   []dispatch.Job{{JobID: job}},
 	}
 }
 
@@ -239,7 +240,7 @@ func TestAnUnpromisedAssignmentBuysItsCapacityWhenThereIsRoom(t *testing.T) {
 		},
 	}))
 
-	msg := &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}
+	msg := &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}
 	if err := l.handle(t.Context(), msg); err != nil {
 		t.Fatalf("handle an unpromised assignment: %v", err)
 	}
@@ -275,7 +276,7 @@ func TestAnUnpromisedAssignmentOnAFullFleetStartsNothing(t *testing.T) {
 		},
 	}))
 
-	msg := &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}
+	msg := &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}
 	if err := l.handle(t.Context(), msg); err != nil {
 		t.Fatalf("handle an unpromised assignment on a full fleet: %v", err)
 	}

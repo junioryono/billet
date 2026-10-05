@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // waitUntil polls a condition until it holds or the context ends.
@@ -254,7 +255,7 @@ func TestADrainAdvertisesOnlyWhatIsRunning(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// The completion is delivered only once the test asks for it, so the
@@ -263,7 +264,7 @@ func TestADrainAdvertisesOnlyWhatIsRunning(t *testing.T) {
 		select {
 		case <-finish:
 			if completed.CompareAndSwap(false, true) {
-				return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+				return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 			}
 		default:
 		}
@@ -382,7 +383,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// An OFFER, delivered only once the drain is under way. This is the work
@@ -390,7 +391,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 		select {
 		case <-offerNow:
 			if offered.CompareAndSwap(false, true) {
-				return &Message{MessageID: 2, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+				return &Message{MessageID: 2, Available: []dispatch.Job{{RequestID: 12, RunID: 102}}}, nil
 			}
 		default:
 		}
@@ -398,7 +399,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 		select {
 		case <-finish:
 			if finished.CompareAndSwap(false, true) {
-				return &Message{MessageID: 3, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+				return &Message{MessageID: 3, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 			}
 		default:
 		}
@@ -508,7 +509,7 @@ func TestADrainThatOverrunsDestroysNothingAndKeepsWaiting(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// A REAL LONG POLL BLOCKS, AND SO DOES THIS — see slowPoll. The completion
@@ -629,7 +630,7 @@ func TestADrainDoesNotWaitForAPromiseThatWasNeverAssigned(t *testing.T) {
 		if offered.CompareAndSwap(false, true) {
 			close(settled)
 
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// A REAL LONG POLL BLOCKS, AND SO DOES THIS. Returning ErrNoMessage
@@ -752,7 +753,7 @@ func TestASecondSignalEndsADrainEvenWhenTheSessionIgnoresItsContext(t *testing.T
 	inner := &fakeSession{}
 	inner.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// Blocks briefly rather than spinning — see slowPoll.
@@ -838,13 +839,13 @@ func TestADrainStopsWhenTheWorkFinishesRatherThanWhenItsBudgetDoes(t *testing.T)
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		select {
 		case <-finish:
 			if completed.CompareAndSwap(false, true) {
-				return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+				return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 			}
 		default:
 		}
@@ -924,13 +925,13 @@ func TestACancellationInsideTheLongPollStillDrains(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		select {
 		case <-finish:
 			if completed.CompareAndSwap(false, true) {
-				return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+				return &Message{MessageID: 2, Completed: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 			}
 		default:
 		}
@@ -1073,7 +1074,7 @@ func TestAHurriedDrainStopsWaitingButStillTearsDown(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// No completion ever: without the hurry this drain runs for its full hour.
@@ -1125,7 +1126,7 @@ func TestAHurriedDrainStopsWaitingButStillTearsDown(t *testing.T) {
 	if l.cleanup == nil {
 		l.cleanup = map[int64]*pendingCleanup{}
 	}
-	l.cleanup[22] = &pendingCleanup{job: Job{RequestID: 22}, at: time.Now().Add(time.Hour)}
+	l.cleanup[22] = &pendingCleanup{job: dispatch.Job{RequestID: 22}, at: time.Now().Add(time.Hour)}
 	l.mu.Unlock()
 
 	cancel()
@@ -1307,7 +1308,7 @@ func TestACancellationThatSurfacesAsAnotherErrorStillDrains(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// BLOCKED INSIDE THE POLL until the test has cancelled, because that is
@@ -1374,7 +1375,7 @@ func TestAnUntrustworthyScaleSetResponseStopsTheListenerEvenWhileStopping(t *tes
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if offered.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		return nil, ErrNoMessage
@@ -1437,7 +1438,7 @@ func TestAnErrorDuringTheDrainEndsIt(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		if draining.Load() {
@@ -1518,7 +1519,7 @@ func TestADrainThatOverrunsWhileInsideACallStillReportsGivingUp(t *testing.T) {
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// SLOW, because returning immediately spins the drain loop as fast as the

@@ -16,11 +16,11 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/ec2"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -413,7 +413,7 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 
 	if err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
-		server.Job{RequestID: 501, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 501, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -463,7 +463,7 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 	// operator killing a job. A second job could start for the same repository
 	// while the first was still finishing a deploy.
 	err = s.runner.Destroy(t.Context(), 501)
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy answered %v; while the machine is still shutting down it must "+
 			"answer ErrCustody, or the listener releases the capacity underneath it", err)
 	}
@@ -525,7 +525,7 @@ func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 
 	err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
-		server.Job{RequestID: 502, Event: "push"})
+		dispatch.Job{RequestID: 502, Event: "push"})
 	if err == nil {
 		t.Fatal("a cloud node launched a lease that does not accept its backend")
 	}
@@ -555,7 +555,7 @@ func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
 
 	err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
-		server.Job{RequestID: 503, Event: "pull_request"})
+		dispatch.Job{RequestID: 503, Event: "pull_request"})
 	if err == nil {
 		t.Fatal("a fork pull request reached the cloud with no network described for it")
 	}

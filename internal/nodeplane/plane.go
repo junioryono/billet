@@ -2,7 +2,7 @@
 //
 // It holds what the server knows about each registered node, hands out commands
 // to nodes that are long-polling for them, and collects the results. The
-// Runner it exposes is the same server.Runner the in-process path implements, so
+// Runner it exposes is the same dispatch.Runner the in-process path implements, so
 // the listener cannot tell whether the compute it is driving is a goroutine away
 // or a continent away.
 package nodeplane

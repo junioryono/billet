@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -19,9 +20,9 @@ type actualJobIdentity struct {
 
 type resolvedJob struct {
 	protocolID int64
-	job        Job
+	job        dispatch.Job
 	actual     actualJobIdentity
-	cleanup    Job
+	cleanup    dispatch.Job
 	binding    *alloc.PoolRunner
 	held       []actualJobIdentity
 	// detached is a runner-less completion whose request is the launch identity
@@ -170,7 +171,7 @@ func actualJobCandidates(actual actualJobIdentity, requestID int64, known []actu
 // its runner. Cross-run JobID ambiguity and request-only assignments were unseen.
 // Not every completion does: a job cancelled before any runner took it completes
 // with none (a controller's journal, 2026-09-22), which is what detached is for.
-func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolution,
+func (l *Listener) resolveActualJob(ctx context.Context, job dispatch.Job, mode jobResolution,
 	known []actualJobIdentity,
 ) (resolvedJob, error) {
 	out := resolvedJob{job: job, cleanup: job, protocolID: job.RequestID}
@@ -184,14 +185,14 @@ func (l *Listener) resolveActualJob(ctx context.Context, job Job, mode jobResolu
 					ErrUntrustworthySession, job.RunnerName, binding.Tier)
 			}
 			if mode == resolveCommitment && binding.ActualRequestID != 0 {
-				actual = Job{RequestID: binding.ActualRequestID, JobID: binding.JobID, RunID: binding.RunID}
+				actual = dispatch.Job{RequestID: binding.ActualRequestID, JobID: binding.JobID, RunID: binding.RunID}
 			} else if mode == resolveCommitment && job.RequestID < 0 {
 				_, direct, err := l.alloc.DirectJobID(ctx, job.RequestID)
 				if err != nil {
 					return out, err
 				}
 				if !direct {
-					actual = Job{}
+					actual = dispatch.Job{}
 				}
 			}
 			if mode == resolveCompletion && (job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID ||
@@ -334,7 +335,7 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 	}
 	known := l.currentCommitments(out.committed)
 	for _, jobs := range []struct {
-		wire []Job
+		wire []dispatch.Job
 		dest *[]resolvedJob
 	}{
 		{msg.Assigned, &out.assigned}, {msg.Available, &out.available},
@@ -370,7 +371,7 @@ func (l *Listener) resolveMessage(ctx context.Context, msg *Message) (resolvedMe
 func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, error) {
 	l.mu.Lock()
 	commitments := make([]jobCommitment, 0, len(l.acquiring)+len(l.running))
-	jobs := make([]Job, 0, len(l.acquiring)+len(l.running))
+	jobs := make([]dispatch.Job, 0, len(l.acquiring)+len(l.running))
 	for id, p := range l.acquiring {
 		job := p.job
 		job.RequestID = id
@@ -379,7 +380,7 @@ func (l *Listener) resolveCommitments(ctx context.Context) ([]jobCommitment, err
 	}
 	for id, lease := range l.running {
 		actual := l.runningJobs[id]
-		job := Job{RequestID: id, JobID: actual.job, RunID: actual.run}
+		job := dispatch.Job{RequestID: id, JobID: actual.job, RunID: actual.run}
 		if job.RunID == 0 {
 			job.RunID = lease.RunID
 		}

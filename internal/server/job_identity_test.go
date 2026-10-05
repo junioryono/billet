@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 )
 
@@ -30,7 +31,7 @@ func TestCommitmentReadFailuresNameTheListenerObligationAndPreserveTheCause(t *t
 					t.Fatal(err)
 				}
 				if kind == "promised" {
-					if err := l.acquire(t.Context(), []Job{{RequestID: 23, JobID: "J"}}); err != nil {
+					if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: 23, JobID: "J"}}); err != nil {
 						t.Fatal(err)
 					}
 				} else {
@@ -46,13 +47,13 @@ func TestCommitmentReadFailuresNameTheListenerObligationAndPreserveTheCause(t *t
 				cancel()
 				if caller == "handle" {
 					err = l.handle(ctx, &Message{MessageID: 1,
-						Available: []Job{{RequestID: 24}}, Assigned: []Job{{RequestID: 24}},
-						Completed: []Job{{RequestID: 23, Result: "failed"}},
+						Available: []dispatch.Job{{RequestID: 24}}, Assigned: []dispatch.Job{{RequestID: 24}},
+						Completed: []dispatch.Job{{RequestID: 23, Result: "failed"}},
 					})
 				} else {
 					var lease *alloc.Lease
 					var needsCompute bool
-					lease, needsCompute, err = l.assign(ctx, Job{RequestID: 24})
+					lease, needsCompute, err = l.assign(ctx, dispatch.Job{RequestID: 24})
 					if lease != nil || needsCompute {
 						t.Fatalf("unresolved commitment allowed assignment: %+v, %v", lease, needsCompute)
 					}
@@ -82,18 +83,18 @@ func TestCommitmentReadFailuresNameTheListenerObligationAndPreserveTheCause(t *t
 func TestBatchCompletionUsesEveryActualAlias(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
-		assigned  Job
-		offer     Job
-		completed Job
+		assigned  dispatch.Job
+		offer     dispatch.Job
+		completed dispatch.Job
 		direct    bool
 	}{
-		{name: "translated offer coalesces assignment aliases", assigned: Job{RequestID: 11, JobID: "J", RunID: 101}, offer: Job{RequestID: 12, JobID: "J", RunID: 101}, completed: Job{RequestID: 11, JobID: "J", RunID: 101}},
-		{name: "positive request", assigned: Job{RequestID: 11}, offer: Job{RequestID: 11}, completed: Job{RequestID: 11}},
-		{name: "positive assignment establishes job alias", assigned: Job{RequestID: 11, JobID: "J"}, offer: Job{RequestID: 11, JobID: "J"}, completed: Job{JobID: "J"}},
-		{name: "zero assignment establishes direct alias", assigned: Job{JobID: "J"}, offer: Job{JobID: "J"}, completed: Job{JobID: "J"}},
-		{name: "negative request recovers job alias", direct: true, assigned: Job{RequestID: -1}, offer: Job{RequestID: -1}, completed: Job{JobID: "J"}},
-		{name: "negative completion recovers job alias", direct: true, assigned: Job{RequestID: 11, JobID: "J"}, offer: Job{RequestID: 11, JobID: "J"}, completed: Job{RequestID: -1}},
-		{name: "zero assignment matches positive completion", assigned: Job{JobID: "J"}, offer: Job{JobID: "J"}, completed: Job{RequestID: 11, JobID: "J"}},
+		{name: "translated offer coalesces assignment aliases", assigned: dispatch.Job{RequestID: 11, JobID: "J", RunID: 101}, offer: dispatch.Job{RequestID: 12, JobID: "J", RunID: 101}, completed: dispatch.Job{RequestID: 11, JobID: "J", RunID: 101}},
+		{name: "positive request", assigned: dispatch.Job{RequestID: 11}, offer: dispatch.Job{RequestID: 11}, completed: dispatch.Job{RequestID: 11}},
+		{name: "positive assignment establishes job alias", assigned: dispatch.Job{RequestID: 11, JobID: "J"}, offer: dispatch.Job{RequestID: 11, JobID: "J"}, completed: dispatch.Job{JobID: "J"}},
+		{name: "zero assignment establishes direct alias", assigned: dispatch.Job{JobID: "J"}, offer: dispatch.Job{JobID: "J"}, completed: dispatch.Job{JobID: "J"}},
+		{name: "negative request recovers job alias", direct: true, assigned: dispatch.Job{RequestID: -1}, offer: dispatch.Job{RequestID: -1}, completed: dispatch.Job{JobID: "J"}},
+		{name: "negative completion recovers job alias", direct: true, assigned: dispatch.Job{RequestID: 11, JobID: "J"}, offer: dispatch.Job{RequestID: 11, JobID: "J"}, completed: dispatch.Job{RequestID: -1}},
+		{name: "zero assignment matches positive completion", assigned: dispatch.Job{JobID: "J"}, offer: dispatch.Job{JobID: "J"}, completed: dispatch.Job{RequestID: 11, JobID: "J"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tiers := []config.Tier{tier("work")}
@@ -117,7 +118,7 @@ func TestBatchCompletionUsesEveryActualAlias(t *testing.T) {
 			}
 			tc.completed.Result = "Cancelled"
 			if err := l.handle(t.Context(), &Message{MessageID: 1,
-				Assigned: []Job{tc.assigned}, Available: []Job{tc.offer}, Completed: []Job{tc.completed},
+				Assigned: []dispatch.Job{tc.assigned}, Available: []dispatch.Job{tc.offer}, Completed: []dispatch.Job{tc.completed},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -161,8 +162,8 @@ func TestBusyPoolCompletionFiltersAssignmentDispatchByActualJob(t *testing.T) {
 			if err != nil || len(members) != 1 || members[0].LaunchRequestID != -1 || !slices.Equal(launched, []int64{-1}) {
 				t.Fatalf("pool fixture: members %+v, launches %v, err %v", members, launched, err)
 			}
-			actual := Job{RequestID: 11, RunID: 101, JobID: "J", RunnerID: 77, RunnerName: members[0].RunnerName}
-			if err := l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{actual}}); err != nil {
+			actual := dispatch.Job{RequestID: 11, RunID: 101, JobID: "J", RunnerID: 77, RunnerName: members[0].RunnerName}
+			if err := l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{actual}}); err != nil {
 				t.Fatal(err)
 			}
 			binding, err := a.PoolRunnerByName(t.Context(), actual.RunnerName)
@@ -175,15 +176,15 @@ func TestBusyPoolCompletionFiltersAssignmentDispatchByActualJob(t *testing.T) {
 			if l.idleEscrow() != 1 {
 				t.Fatalf("replacement escrow = %d, want 1", l.idleEscrow())
 			}
-			assigned := Job{RequestID: requestID, RunID: 101, JobID: "J"}
+			assigned := dispatch.Job{RequestID: requestID, RunID: 101, JobID: "J"}
 			wantLaunches := []int64{-1}
 			wantRunning := 0
 			if requestID == -1 {
 				assigned.RunID, assigned.JobID = 102, "unfinished"
 				wantLaunches = append(wantLaunches, -1)
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []Job{assigned},
-				Completed: []Job{{RunnerName: actual.RunnerName, Result: "Cancelled"}},
+			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []dispatch.Job{assigned},
+				Completed: []dispatch.Job{{RunnerName: actual.RunnerName, Result: "Cancelled"}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -198,18 +199,18 @@ func TestBusyPoolCompletionFiltersAssignmentDispatchByActualJob(t *testing.T) {
 func TestKnownIncarnationContradictsAnOfferAlias(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		offer Job
+		offer dispatch.Job
 	}{
-		{name: "different run sharing job", offer: Job{RequestID: 12, RunID: 102, JobID: "J"}},
-		{name: "different job sharing request", offer: Job{RequestID: 11, RunID: 101, JobID: "K"}},
+		{name: "different run sharing job", offer: dispatch.Job{RequestID: 12, RunID: 102, JobID: "J"}},
+		{name: "different job sharing request", offer: dispatch.Job{RequestID: 11, RunID: 101, JobID: "K"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, listeners := wiredListeners(t, []config.Tier{tier("work")}, tierVCPU)
 			l := listeners[0]
 			session := &fakeSession{}
 			l.session = session
-			if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{tc.offer},
-				Completed: []Job{{RequestID: 11, RunID: 101, JobID: "J", Result: "Cancelled"}},
+			if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []dispatch.Job{tc.offer},
+				Completed: []dispatch.Job{{RequestID: 11, RunID: 101, JobID: "J", Result: "Cancelled"}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -242,8 +243,8 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 			if err := l.refillEscrowUngated(t.Context(), 2, 2); err != nil {
 				t.Fatal(err)
 			}
-			job := Job{RequestID: 11, JobID: "J", RunID: 101}
-			if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{job}}); err != nil {
+			job := dispatch.Job{RequestID: 11, JobID: "J", RunID: 101}
+			if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []dispatch.Job{job}}); err != nil {
 				t.Fatal(err)
 			}
 			lease := l.running[11]
@@ -253,9 +254,9 @@ func TestCompletedRunnerDropsOnlyItsDischargedCommitment(t *testing.T) {
 			if l.idleEscrow() != 1 {
 				t.Fatalf("fixture has %d spare leases, want 1", l.idleEscrow())
 			}
-			offer := Job{RequestID: 13, JobID: "J", RunID: 101}
-			if err := l.handle(t.Context(), &Message{MessageID: 2, Available: []Job{offer},
-				Completed: []Job{{RequestID: 12, JobID: "K", RunID: 102,
+			offer := dispatch.Job{RequestID: 13, JobID: "J", RunID: 101}
+			if err := l.handle(t.Context(), &Message{MessageID: 2, Available: []dispatch.Job{offer},
+				Completed: []dispatch.Job{{RequestID: 12, JobID: "K", RunID: 102,
 					RunnerName: provider.InstanceName(lease.ID), Result: "Succeeded"}},
 			}); err != nil {
 				t.Fatal(err)
@@ -304,9 +305,9 @@ func TestCompletionRequestDisambiguatesBothCandidateOrdersThroughHandle(t *testi
 			}
 			offerID := 23 - assignedID
 			if err := l.handle(t.Context(), &Message{MessageID: 1,
-				Assigned:  []Job{{RequestID: assignedID, JobID: "J", RunID: assignedID + 90}},
-				Available: []Job{{RequestID: offerID, JobID: "J", RunID: offerID + 90}},
-				Completed: []Job{{RequestID: 12, JobID: "J", Result: "Cancelled"}},
+				Assigned:  []dispatch.Job{{RequestID: assignedID, JobID: "J", RunID: assignedID + 90}},
+				Available: []dispatch.Job{{RequestID: offerID, JobID: "J", RunID: offerID + 90}},
+				Completed: []dispatch.Job{{RequestID: 12, JobID: "J", Result: "Cancelled"}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -346,13 +347,13 @@ func TestAmbiguousCompletionQuarantinesWithoutSelectingARun(t *testing.T) {
 			}
 			second := 23 - first
 			err := l.handle(t.Context(), &Message{MessageID: 1, Statistics: &Statistics{TotalAssignedJobs: 3},
-				Assigned: []Job{{RequestID: first, JobID: "J", RunID: first + 90},
+				Assigned: []dispatch.Job{{RequestID: first, JobID: "J", RunID: first + 90},
 					{RequestID: second, JobID: "J", RunID: second + 90},
 					{RequestID: 21, JobID: "K", RunID: 201}},
-				Available: []Job{{RequestID: first + 20, JobID: "J", RunID: first + 90},
+				Available: []dispatch.Job{{RequestID: first + 20, JobID: "J", RunID: first + 90},
 					{RequestID: second + 20, JobID: "J", RunID: second + 90},
 					{RequestID: 22, JobID: "L", RunID: 202}},
-				Completed: []Job{{RequestID: requestID, JobID: "J", Result: "Cancelled"},
+				Completed: []dispatch.Job{{RequestID: requestID, JobID: "J", Result: "Cancelled"},
 					{RequestID: first, JobID: "J", RunID: first + 90, Result: "Cancelled"}},
 			})
 			if poison, ok := errors.AsType[*poisonedMessageError](err); !ok || poison == nil || !errors.Is(err, errQuarantinableCompletion) {
@@ -386,14 +387,14 @@ func TestAssignmentConsumesItsDirectPromiseAcrossRequestAliases(t *testing.T) {
 			if err := l.refillEscrowTo(t.Context(), capacity); err != nil {
 				t.Fatal(err)
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{{JobID: "J"}}}); err != nil {
+			if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []dispatch.Job{{JobID: "J"}}}); err != nil {
 				t.Fatal(err)
 			}
 			p := l.acquiring[-1]
 			if p == nil || !slices.Equal(session.acquiredIDs(), []int64{0}) || l.idleEscrow() != capacity-1 {
 				t.Fatalf("direct offer fixture: promise %+v, acquisitions %v, held %d", p, session.acquiredIDs(), l.idleEscrow())
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{{RequestID: 11, JobID: "J"}}}); err != nil {
+			if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []dispatch.Job{{RequestID: 11, JobID: "J"}}}); err != nil {
 				t.Fatal(err)
 			}
 			if l.Acquiring() != 0 || l.running[11] != p.lease || l.idleEscrow() != capacity-1 || !slices.Equal(launched, []int64{11}) {
@@ -406,7 +407,7 @@ func TestAssignmentConsumesItsDirectPromiseAcrossRequestAliases(t *testing.T) {
 			}
 			// The running job keeps the same aliases even when redelivery changes
 			// the request again. Spare escrow must remain unused.
-			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []Job{{RequestID: 12, JobID: "J"}}}); err != nil {
+			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []dispatch.Job{{RequestID: 12, JobID: "J"}}}); err != nil {
 				t.Fatal(err)
 			}
 			if !slices.Equal(launched, []int64{11}) || l.Running() != 1 || l.idleEscrow() != capacity-1 {
@@ -428,7 +429,7 @@ func TestAssignmentRequestSelectsItsPromiseAmongKnownRuns(t *testing.T) {
 		if err := l.refillEscrowTo(t.Context(), 2); err != nil {
 			t.Fatal(err)
 		}
-		if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{
+		if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []dispatch.Job{
 			{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
 		}}); err != nil {
 			t.Fatal(err)
@@ -437,7 +438,7 @@ func TestAssignmentRequestSelectsItsPromiseAmongKnownRuns(t *testing.T) {
 		if p == nil || other == nil || !slices.Equal(session.acquiredIDs(), []int64{11, 12}) {
 			t.Fatalf("fixture promises: selected %+v, other %+v, acquired %v", p, other, session.acquiredIDs())
 		}
-		if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{{RequestID: requestID, JobID: "J"}}}); err != nil {
+		if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []dispatch.Job{{RequestID: requestID, JobID: "J"}}}); err != nil {
 			t.Fatal(err)
 		}
 		if l.running[requestID] != p.lease || l.acquiring[23-requestID] != other || l.Acquiring() != 1 || !slices.Equal(launched, []int64{requestID}) {
@@ -457,14 +458,14 @@ func TestConsumedPromiseRetainsItsRunAndRequestAliases(t *testing.T) {
 	if err := l.refillEscrowTo(t.Context(), 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{{RequestID: 11, JobID: "J", RunID: 101}}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, JobID: "J", RunID: 101}}}); err != nil {
 		t.Fatal(err)
 	}
 	p := l.acquiring[11]
 	if p == nil || l.idleEscrow() != 1 {
 		t.Fatalf("fixture promise %+v, spare escrow %d", p, l.idleEscrow())
 	}
-	if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{{RequestID: 12, JobID: "J"}}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []dispatch.Job{{RequestID: 12, JobID: "J"}}}); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := a.Lease(t.Context(), p.lease.ID)
@@ -472,13 +473,13 @@ func TestConsumedPromiseRetainsItsRunAndRequestAliases(t *testing.T) {
 		t.Fatalf("ledger assignment changed its authoritative fields: %+v, %v", lease, err)
 	}
 	// Without JobID, this redelivery can match only the consumed offer's alias.
-	if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []Job{{RequestID: 11, RunID: 101}}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(launched, []int64{12}) || l.idleEscrow() != 1 {
 		t.Fatalf("offer alias lost: launches %v, spare escrow %d", launched, l.idleEscrow())
 	}
-	if err := l.handle(t.Context(), &Message{MessageID: 4, Assigned: []Job{{RequestID: 13, JobID: "J", RunID: 102}}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 4, Assigned: []dispatch.Job{{RequestID: 13, JobID: "J", RunID: 102}}}); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(launched, []int64{12, 13}) || l.Running() != 2 || l.Acquiring() != 0 || l.running[12] != p.lease {
@@ -507,7 +508,7 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 			if err := l.refillEscrowTo(t.Context(), 3); err != nil {
 				t.Fatal(err)
 			}
-			if err := l.acquire(t.Context(), []Job{
+			if err := l.acquire(t.Context(), []dispatch.Job{
 				{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
 			}); err != nil {
 				t.Fatal(err)
@@ -548,9 +549,9 @@ func TestAmbiguousCompletionNeverAcknowledgesHeldAssignmentsAfterRetries(t *test
 					return &Message{MessageID: 43, Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
 				}
 				return &Message{MessageID: 42, Statistics: &Statistics{TotalAssignedJobs: 2},
-					Assigned: []Job{{RequestID: 11, JobID: "J", RunID: 101},
+					Assigned: []dispatch.Job{{RequestID: 11, JobID: "J", RunID: 101},
 						{RequestID: 12, JobID: "J", RunID: 102}},
-					Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+					Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}},
 				}, nil
 			}
 			session.onClose = func(context.Context) error {
@@ -602,11 +603,11 @@ func TestCancellationAfterAHoldDoesNotReconcileDuringDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := l.handle(t.Context(), &Message{MessageID: 1,
-		Assigned: []Job{{RequestID: 21}, {RequestID: 22}},
+		Assigned: []dispatch.Job{{RequestID: 21}, {RequestID: 22}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.acquire(t.Context(), []Job{
+	if err := l.acquire(t.Context(), []dispatch.Job{
 		{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
 	}); err != nil {
 		t.Fatal(err)
@@ -650,8 +651,8 @@ func TestCancellationAfterAHoldDoesNotReconcileDuringDrain(t *testing.T) {
 		polls++
 		if polls == 1 {
 			return &Message{MessageID: 42,
-				Available: []Job{{RequestID: 31, JobID: "J", RunID: 101}},
-				Completed: []Job{{JobID: "J", Result: "Cancelled"}, {RequestID: 22, Result: "Succeeded"}},
+				Available: []dispatch.Job{{RequestID: 31, JobID: "J", RunID: 101}},
+				Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}, {RequestID: 22, Result: "Succeeded"}},
 			}, nil
 		}
 		if !l.isDraining() || ctx.Err() == nil {
@@ -691,7 +692,7 @@ func TestEquivalentOffersCannotHideAnAmbiguousProtocolID(t *testing.T) {
 			if err := l.refillEscrowTo(t.Context(), 3); err != nil {
 				t.Fatal(err)
 			}
-			offers := []Job{{RequestID: 11, JobID: "J"}, {JobID: "J"}, {JobID: "K"}}
+			offers := []dispatch.Job{{RequestID: 11, JobID: "J"}, {JobID: "J"}, {JobID: "K"}}
 			if reverse {
 				slices.Reverse(offers)
 			}
@@ -733,7 +734,7 @@ func TestRequestOnlyEntriesInheritTheCandidateHoldFromPromises(t *testing.T) {
 			if err := l.refillEscrowTo(t.Context(), 3); err != nil {
 				t.Fatal(err)
 			}
-			if err := l.acquire(t.Context(), []Job{
+			if err := l.acquire(t.Context(), []dispatch.Job{
 				{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
 			}); err != nil {
 				t.Fatal(err)
@@ -743,13 +744,13 @@ func TestRequestOnlyEntriesInheritTheCandidateHoldFromPromises(t *testing.T) {
 				t.Fatal("fixture needs two candidate promises and spare escrow")
 			}
 			msg := &Message{MessageID: 42, Statistics: tc.statistics,
-				Available: []Job{{RequestID: 31, JobID: "J", RunID: 101}, {RequestID: 32, JobID: "J", RunID: 102}},
-				Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+				Available: []dispatch.Job{{RequestID: 31, JobID: "J", RunID: 101}, {RequestID: 32, JobID: "J", RunID: 102}},
+				Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}},
 			}
 			if tc.assignment {
-				msg.Assigned = []Job{{RequestID: 11}}
+				msg.Assigned = []dispatch.Job{{RequestID: 11}}
 			} else {
-				msg.Completed = append(msg.Completed, Job{RequestID: 11, Result: "Cancelled"})
+				msg.Completed = append(msg.Completed, dispatch.Job{RequestID: 11, Result: "Cancelled"})
 			}
 			err := l.handle(t.Context(), msg)
 			poison, ok := errors.AsType[*poisonedMessageError](err)
@@ -786,7 +787,7 @@ func TestEquivalentOffersReserveAndConsumeOnePromise(t *testing.T) {
 			if err := l.refillEscrowTo(t.Context(), 2); err != nil {
 				t.Fatal(err)
 			}
-			offers := []Job{{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 101}}
+			offers := []dispatch.Job{{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 101}}
 			leases := l.Held()
 			if len(leases) != 2 {
 				t.Fatalf("fixture escrow = %d, want 2", len(leases))
@@ -807,7 +808,7 @@ func TestEquivalentOffersReserveAndConsumeOnePromise(t *testing.T) {
 						l.Acquiring(), l.idleEscrow(), session.acquiredIDs())
 				}
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{offers[0]}}); err != nil {
+			if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []dispatch.Job{offers[0]}}); err != nil {
 				t.Fatalf("equivalent owners stopped the listener: %v", err)
 			}
 			if l.Acquiring() != 0 || l.Running() != 1 || l.idleEscrow() != 1 ||
@@ -825,7 +826,7 @@ func TestEquivalentOffersReserveAndConsumeOnePromise(t *testing.T) {
 					t.Fatalf("equivalent promise lease %d = %+v", i, lease)
 				}
 			}
-			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []Job{{RequestID: 12, RunID: 101}}}); err != nil {
+			if err := l.handle(t.Context(), &Message{MessageID: 3, Assigned: []dispatch.Job{{RequestID: 12, RunID: 101}}}); err != nil {
 				t.Fatalf("listener refused the coalesced request alias: %v", err)
 			}
 			if !slices.Equal(launched, []int64{11}) || l.lastMessageID != 3 || l.idleEscrow() != 1 {
@@ -844,7 +845,7 @@ func TestAResolvedRedeliveryKeepsItsStatisticsForTheNextReconciliation(t *testin
 	if err := l.refillEscrowTo(t.Context(), 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.acquire(t.Context(), []Job{
+	if err := l.acquire(t.Context(), []dispatch.Job{
 		{RequestID: 11, JobID: "J", RunID: 101}, {RequestID: 12, JobID: "J", RunID: 102},
 	}); err != nil {
 		t.Fatal(err)
@@ -852,7 +853,7 @@ func TestAResolvedRedeliveryKeepsItsStatisticsForTheNextReconciliation(t *testin
 	stale := &Statistics{}
 	l.observed = stale
 	err := l.handle(t.Context(), &Message{MessageID: 42, Statistics: &Statistics{TotalAssignedJobs: 1},
-		Completed: []Job{{JobID: "J", Result: "Cancelled"}}})
+		Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}}})
 	if poison, ok := errors.AsType[*poisonedMessageError](err); !ok || !poison.held {
 		t.Fatalf("first delivery = %v, want a hold", err)
 	}
@@ -863,7 +864,7 @@ func TestAResolvedRedeliveryKeepsItsStatisticsForTheNextReconciliation(t *testin
 	l.unreserve([]int64{12})
 	current := &Statistics{TotalAssignedJobs: 1}
 	if err := l.handle(t.Context(), &Message{MessageID: 42, Statistics: current,
-		Completed: []Job{{JobID: "J", Result: "Cancelled"}}}); err != nil {
+		Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}}}); err != nil {
 		t.Fatalf("redelivery that no longer holds: %v", err)
 	}
 	if l.observed != current || l.messageHeld() || !slices.Equal(acknowledged, []int64{42}) || l.lastMessageID != 42 {

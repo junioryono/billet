@@ -10,8 +10,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // fenceRegistrar records the ORDER of everything that touches a host's launch
@@ -94,7 +94,7 @@ func TestALaunchChargesItsFenceBeforeANodeCanTakeIt(t *testing.T) {
 		defer close(launched)
 
 		if err := p.NewRunner().Launch(t.Context(), testLease(),
-			server.Job{RequestID: 7}); err != nil {
+			dispatch.Job{RequestID: 7}); err != nil {
 			t.Errorf("Launch: %v", err)
 		}
 	}()
@@ -136,7 +136,7 @@ func TestALaunchThatCannotTakeItsFenceIsNotSent(t *testing.T) {
 	p := testPlane(t, WithRegistrar(reg))
 	register(t, p, barrierHostName, config.ProviderDocker)
 
-	err := p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a launch was sent to a host whose fence could not be advanced")
 	}
@@ -145,7 +145,7 @@ func TestALaunchThatCannotTakeItsFenceIsNotSent(t *testing.T) {
 		t.Errorf("want ErrNoNode so the caller knows nothing started, got %v", err)
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Error("a launch that was never queued reported custody, which holds capacity for " +
 			"compute that cannot exist")
 	}

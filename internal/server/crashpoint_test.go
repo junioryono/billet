@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // THE INVARIANT EVERY CRASH POINT IS CHECKED AGAINST.
@@ -166,7 +167,7 @@ func TestARestartAtEveryBoundaryLeavesOneObligationOrNone(t *testing.T) {
 		drive: func(t *testing.T, _ *crashFixture, l *Listener, _ *fakeSession) {
 			t.Helper()
 
-			if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+			if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
 		},
@@ -181,11 +182,11 @@ func TestARestartAtEveryBoundaryLeavesOneObligationOrNone(t *testing.T) {
 		drive: func(t *testing.T, _ *crashFixture, l *Listener, _ *fakeSession) {
 			t.Helper()
 
-			if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+			if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
 
-			if _, _, err := l.assign(t.Context(), Job{RequestID: requestID}); err != nil {
+			if _, _, err := l.assign(t.Context(), dispatch.Job{RequestID: requestID}); err != nil {
 				t.Fatalf("assign: %v", err)
 			}
 		},
@@ -199,16 +200,16 @@ func TestARestartAtEveryBoundaryLeavesOneObligationOrNone(t *testing.T) {
 		drive: func(t *testing.T, _ *crashFixture, l *Listener, _ *fakeSession) {
 			t.Helper()
 
-			if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+			if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
 
-			lease, _, err := l.assign(t.Context(), Job{RequestID: requestID})
+			lease, _, err := l.assign(t.Context(), dispatch.Job{RequestID: requestID})
 			if err != nil {
 				t.Fatalf("assign: %v", err)
 			}
 
-			if err := l.launch(t.Context(), lease, Job{RequestID: requestID}); err != nil {
+			if err := l.launch(t.Context(), lease, dispatch.Job{RequestID: requestID}); err != nil {
 				t.Fatalf("launch: %v", err)
 			}
 		},
@@ -266,16 +267,16 @@ func TestASuccessorDoesNotRelaunchAJobAlreadyRunning(t *testing.T) {
 		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
-	if err := first.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+	if err := first.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	lease, _, err := first.assign(t.Context(), Job{RequestID: requestID})
+	lease, _, err := first.assign(t.Context(), dispatch.Job{RequestID: requestID})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
-	if err := first.launch(t.Context(), lease, Job{RequestID: requestID}); err != nil {
+	if err := first.launch(t.Context(), lease, dispatch.Job{RequestID: requestID}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 
@@ -292,7 +293,7 @@ func TestASuccessorDoesNotRelaunchAJobAlreadyRunning(t *testing.T) {
 	// GITHUB REDELIVERS THE ASSIGNMENT, which is the case that matters: an
 	// unacknowledged message comes back, and the successor must recognise the
 	// request rather than treating it as new work.
-	if _, _, err := second.assign(t.Context(), Job{RequestID: requestID}); err != nil &&
+	if _, _, err := second.assign(t.Context(), dispatch.Job{RequestID: requestID}); err != nil &&
 		!errors.Is(err, alloc.ErrConflict) {
 		// A refusal is a correct answer here. What is not correct is a second
 		// launch, which the assertion below catches either way.
@@ -327,16 +328,16 @@ func TestACrashLeavesRunningCapacityCharged(t *testing.T) {
 		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
-	if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+	if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	lease, _, err := l.assign(t.Context(), Job{RequestID: requestID})
+	lease, _, err := l.assign(t.Context(), dispatch.Job{RequestID: requestID})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 
-	if err := l.launch(t.Context(), lease, Job{RequestID: requestID}); err != nil {
+	if err := l.launch(t.Context(), lease, dispatch.Job{RequestID: requestID}); err != nil {
 		t.Fatalf("launch: %v", err)
 	}
 
@@ -367,7 +368,7 @@ func TestACrashDuringAnAmbiguousLaunchKeepsTheObligation(t *testing.T) {
 	const requestID = 7
 
 	f := newCrashFixture(t)
-	f.failLaunch[requestID] = fmt.Errorf("%w: the node did not answer", ErrCustody)
+	f.failLaunch[requestID] = fmt.Errorf("%w: the node did not answer", dispatch.ErrCustody)
 
 	l := NewListener(f.alloc, f.tiers[0].Label, &fakeSession{}, WithRunner(f.runner()),
 		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
@@ -376,11 +377,11 @@ func TestACrashDuringAnAmbiguousLaunchKeepsTheObligation(t *testing.T) {
 		t.Fatalf("buy the escrow one offer needs: %v", err)
 	}
 
-	if err := l.acquire(t.Context(), []Job{{RequestID: requestID}}); err != nil {
+	if err := l.acquire(t.Context(), []dispatch.Job{{RequestID: requestID}}); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 
-	lease, _, err := l.assign(t.Context(), Job{RequestID: requestID})
+	lease, _, err := l.assign(t.Context(), dispatch.Job{RequestID: requestID})
 	if err != nil {
 		t.Fatalf("assign: %v", err)
 	}
@@ -390,7 +391,7 @@ func TestACrashDuringAnAmbiguousLaunchKeepsTheObligation(t *testing.T) {
 	// would mean the capacity goes back and GitHub reassigns, which is exactly what
 	// must NOT happen when compute may exist. The listener keeps the lease and the
 	// node holds it.
-	if err := l.launch(t.Context(), lease, Job{RequestID: requestID}); err != nil {
+	if err := l.launch(t.Context(), lease, dispatch.Job{RequestID: requestID}); err != nil {
 		t.Fatalf("an ambiguous launch reported an error, which hands the capacity back "+
 			"while a container may be running: %v", err)
 	}

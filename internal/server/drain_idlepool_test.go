@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // idleLeft is the drain ending with pool slots that never started a job still
@@ -99,7 +100,7 @@ func TestADrainEndsWhenOnlyIdlePoolSlotsRemain(t *testing.T) {
 
 			// THE ASSIGNMENT FINDS NO ESCROW AND IS DECLINED, and GitHub starts
 			// the job on an idle slot.
-			return &Message{MessageID: 2, Assigned: []Job{job12}, Started: []Job{started},
+			return &Message{MessageID: 2, Assigned: []dispatch.Job{job12}, Started: []dispatch.Job{started},
 				Statistics: &Statistics{TotalAssignedJobs: 2}}, nil
 		case 2:
 			select {
@@ -115,7 +116,7 @@ func TestADrainEndsWhenOnlyIdlePoolSlotsRemain(t *testing.T) {
 			done.RunnerID, done.RunnerName, done.Result = 77, busy.Load().RunnerName, "Succeeded"
 
 			// STILL ONE ASSIGNED, so the idle slot is never surplus.
-			return &Message{MessageID: 3, Completed: []Job{done},
+			return &Message{MessageID: 3, Completed: []dispatch.Job{done},
 				Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
 		default:
 			return nil, ErrNoMessage
@@ -249,7 +250,7 @@ func TestADrainStillWaitsForARunnerLaunchedForAnAssignedJob(t *testing.T) {
 		slowPoll()
 
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{job11},
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{job11},
 				Statistics: &Statistics{TotalAssignedJobs: 1}}, nil
 		}
 

@@ -11,8 +11,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeplane"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // targetJIT is one target's credential-holding source, recording what it was
@@ -108,7 +108,7 @@ func TestARegistrationIsMintedWithItsTiersTargetCredential(t *testing.T) {
 
 	launched := make(chan error, 1)
 
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
@@ -279,7 +279,7 @@ func TestAScaleSetIsDescribedByTheTiersRunsOn(t *testing.T) {
 
 	launched := make(chan error, 1)
 
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for p.QueuedForTest("n1") == 0 {

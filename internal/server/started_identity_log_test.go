@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"testing"
+
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // THE JOB'S OWN IDENTITY IS LOGGED WHEN A POOL MEMBER STARTS IT, because what
@@ -25,7 +27,7 @@ func TestAStartedJobLogsTheIdentityGitHubBound(t *testing.T) {
 	started.Owner, started.Repository = "acme", "api"
 	started.WorkflowRef = "acme/api/.github/workflows/ci.yml@refs/heads/main"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("start job 11: %v", err)
 	}

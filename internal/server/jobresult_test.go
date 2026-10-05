@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -31,10 +32,10 @@ func TestHandlingACompletionRecordsWhatGitHubConcluded(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{},
 		WithCompletionStore(openState(t)), WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 21, RunID: 210, Result: "failed"}
+	job := dispatch.Job{RequestID: 21, RunID: 210, Result: "failed"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -50,10 +51,10 @@ func TestHandlingASucceededCompletionRecordsThat(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{},
 		WithCompletionStore(openState(t)), WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 22, RunID: 220, Result: "succeeded"}
+	job := dispatch.Job{RequestID: 22, RunID: 220, Result: "succeeded"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -89,7 +90,7 @@ func TestAFailureToRecordTheResultDoesNotStopTheListener(t *testing.T) {
 		WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 23, RunID: 230, Result: "failed"}
+	job := dispatch.Job{RequestID: 23, RunID: 230, Result: "failed"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 
 	commitments, err := l.resolveCommitments(t.Context())
@@ -116,7 +117,7 @@ func TestAFailureToRecordTheResultDoesNotStopTheListener(t *testing.T) {
 		return writeErr
 	}
 
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("a ledger that could not record a diagnostic stopped the listener: %v", err)
 	}
 
@@ -149,7 +150,7 @@ func TestAFailedJobOnAForgottenHostIsReported(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{},
 		WithCompletionStore(openState(t)), WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 24, RunID: 240, Result: "failed"}
+	job := dispatch.Job{RequestID: 24, RunID: 240, Result: "failed"}
 	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
 
 	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
@@ -166,7 +167,7 @@ func TestAFailedJobOnAForgottenHostIsReported(t *testing.T) {
 		t.Fatalf("NodeGone: %v", err)
 	}
 
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 
@@ -228,7 +229,7 @@ func TestARedeliveredSettledCompletionDoesNotRecordAgainstAReplacementLease(t *t
 
 	const requestID = 77
 
-	delivery := &Message{MessageID: 5, Completed: []Job{
+	delivery := &Message{MessageID: 5, Completed: []dispatch.Job{
 		{RequestID: requestID, RunID: 500, Result: "failed"},
 	}}
 
@@ -299,7 +300,7 @@ func TestARestoredCompletionRecordsTheResultItsCrashLost(t *testing.T) {
 	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 91, RunID: 910, Result: "failed", CompletionID: 6}
+	job := dispatch.Job{RequestID: 91, RunID: 910, Result: "failed", CompletionID: 6}
 	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
 
 	// The delivery is made durable. The crash lands here, before the second write.
@@ -361,7 +362,7 @@ func TestARetiredCompletionStillRecoversItsResult(t *testing.T) {
 	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: 93, RunID: 930, Result: "failed", CompletionID: 8}
+	job := dispatch.Job{RequestID: 93, RunID: 930, Result: "failed", CompletionID: 8}
 	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
 
 	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
@@ -430,11 +431,11 @@ func TestACompletionKnownOnlyByItsRunnerNameStillRecordsItsResult(t *testing.T) 
 	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
 		WithRunner(&fakeRunner{}))
 
-	job := Job{RequestID: requestID, RunID: 960, Result: "failed",
+	job := dispatch.Job{RequestID: requestID, RunID: 960, Result: "failed",
 		RunnerName: provider.InstanceName(lease.ID)}
 
 	if err := restarted.handle(t.Context(), &Message{MessageID: 9,
-		Completed: []Job{job}}); err != nil {
+		Completed: []dispatch.Job{job}}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
 

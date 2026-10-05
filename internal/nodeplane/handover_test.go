@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // seedOwner records a lease as delivered to n1's process p1, with the job it was
@@ -60,7 +60,7 @@ func TestAProcessThatWithdrewHandsItsLeasesToTheNextOne(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, server.CacheAuthority{})
+			t.Context(), 7, "Succeeded", "l9", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{})
 	}()
 
 	cmd, took, err := p.Poll(t.Context(), "n1", "p2")
@@ -192,7 +192,7 @@ func TestALateFailedLaunchDoesNotEraseTheSuccessorsOwnership(t *testing.T) {
 
 	launched := make(chan error, 1)
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitFor(t, "the launch to be queued", func() bool { return p.QueuedForTest("n1") == 1 })

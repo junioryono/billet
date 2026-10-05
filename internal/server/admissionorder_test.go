@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // tierOf builds a tier of a given size, so a test can state the shapes that
@@ -27,7 +28,7 @@ type launchLog struct {
 	started []string
 }
 
-func (l *launchLog) Launch(_ context.Context, lease *alloc.Lease, _ Job) error {
+func (l *launchLog) Launch(_ context.Context, lease *alloc.Lease, _ dispatch.Job) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
