@@ -82,7 +82,14 @@ func TestAnOutputHeldOpenByADescendantIsNotReadWhole(t *testing.T) {
 
 	// The background sleep inherits stdout and keeps it open after the script
 	// exits; the run ends at the wait delay and the prefix is refused.
-	bin := fakeSystemctl(t, "sleep 3 &\necho 'ActiveState=active'\nexit 0\n")
+	//
+	// THE SLEEP OUTLASTS THE BOUND BY A WIDE MARGIN, so the bound separates the
+	// two answers whatever the machine's load. A run that ends at the wait delay
+	// took about 0.75s alone and 5.3s to 6.1s under a full `make check`
+	// (2026-10-04, the process start being the slow part); a run that waited for
+	// the descendant takes the whole sleep. With a 3s sleep under a 5s bound the
+	// second still passed and the first failed every loaded run (#188).
+	bin := fakeSystemctl(t, "sleep 30 &\necho 'ActiveState=active'\nexit 0\n")
 	i := NewInspector(WithSystemctl(bin))
 
 	started := time.Now()
@@ -92,7 +99,7 @@ func TestAnOutputHeldOpenByADescendantIsNotReadWhole(t *testing.T) {
 		t.Fatalf("an output held open past the wait delay: %v (%q)", err, out)
 	}
 
-	if took := time.Since(started); took > 5*time.Second {
+	if took := time.Since(started); took > 20*time.Second {
 		t.Fatalf("the held output took %s to refuse", took)
 	}
 }
