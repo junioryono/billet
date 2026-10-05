@@ -7,15 +7,133 @@ import (
 	"time"
 )
 
-// A CACHE VOLUME AND EVERY CLONE OF ONE CARRY OBJECT-MAP, AND NOTHING THAT CHANGES
-// ONE CAN BLOCKLIST THE HOST. Created with `layering` alone, a discarded volume's
-// deletion removed every object its size could hold: 237 s for a 100 GiB volume
-// with 100 MiB written, against 3.5 s with object-map, and the node's trash purge
-// kept both OSDs saturated for hours (2026-10-05). Object-map brings
-// exclusive-lock, which the kernel holds while a volume is mapped, so every
-// command that changes one must not blocklist the kernel client if it breaks a
-// lock an interrupted unmap left; the cache index's advisory lock keeps its
-// blocklist, which is its fence.
+// cacheCommand reads one recorded rbd call as the verb it ran and the image it
+// ran on, or reports that it is neither a creation nor a change.
+func cacheCommand(call []string) (verb, image string, ok bool) {
+	for i, arg := range call {
+		target := func(offset int) (string, string, bool) {
+			if i+offset >= len(call) {
+				return "", "", false
+			}
+
+			return verb, call[i+offset], true
+		}
+
+		switch arg {
+		case "snap", "trash", "image-meta", "lock":
+			if i+1 >= len(call) {
+				return "", "", false
+			}
+			verb = arg + " " + call[i+1]
+
+			return target(2)
+		case "create", "rm":
+			verb = arg
+
+			return target(1)
+		case "clone", "cp":
+			verb = arg
+
+			return target(2)
+		}
+	}
+
+	return "", "", false
+}
+
+// imageBase is the image a pool/name@snapshot spec names.
+func imageBase(spec string) string {
+	_, name, found := strings.Cut(spec, "/")
+	if !found {
+		name = spec
+	}
+	name, _, _ = strings.Cut(name, "@")
+
+	return name
+}
+
+// requireCacheImageRules holds #394's two rules over every recorded call, and
+// that each verb in want ran on a cache image at least once.
+//
+// A CACHE VOLUME OR GENERATION IS MADE WITH OBJECT-MAP, and every command that
+// changes one keeps the kernel client. Created with `layering` alone, a discarded
+// volume's deletion removed every object its size could hold: 237 s for a
+// 100 GiB volume with 100 MiB written, against 3.5 s with object-map, and the
+// trash purge kept both OSDs saturated for hours (2026-10-05). Object-map brings
+// exclusive-lock, which the kernel holds while a volume is mapped, so a change
+// must not blocklist the kernel client when it breaks a lock an interrupted
+// unmap left. The lock images, the publish lock and the cache index, are the
+// other way round: `layering` alone, because Ceph documents exclusive-lock as
+// incompatible with the advisory locks taken on them, and their `lock rm` keeps
+// the blocklist that is its fence. The feature names are checked one by one, so
+// an edit to cacheImageFeatures cannot quietly drop them.
+func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
+	t.Helper()
+
+	features := func(call []string) []string {
+		i := slices.Index(call, "--image-feature")
+		if i < 0 || i+1 >= len(call) {
+			return nil
+		}
+
+		return strings.Split(call[i+1], ",")
+	}
+	keepsClient := func(call []string) bool {
+		i := slices.Index(call, "--rbd_blocklist_on_break_lock")
+
+		return i >= 0 && i+1 < len(call) && call[i+1] == "false"
+	}
+
+	seen := map[string]bool{}
+
+	for _, call := range calls {
+		verb, spec, ok := cacheCommand(call)
+		if !ok {
+			continue
+		}
+		base := imageBase(spec)
+
+		switch {
+		case base == LockImageName || base == cacheIndexName:
+			if verb == "create" && slices.Contains(features(call), "exclusive-lock") {
+				t.Errorf("a lock image was created with exclusive-lock: %v", call)
+			}
+			if verb == "lock rm" && keepsClient(call) {
+				t.Errorf("a lock image's lock rm lost its blocklist fence: %v", call)
+			}
+
+		default:
+			if _, _, named := cacheImageName(base); !named {
+				continue
+			}
+			seen[verb] = true
+
+			switch verb {
+			case "create", "clone", "cp":
+				have := features(call)
+				for _, feature := range []string{"layering", "exclusive-lock", "object-map", "fast-diff"} {
+					if !slices.Contains(have, feature) {
+						t.Errorf("a cache image was made without %s: %v", feature, call)
+					}
+				}
+			case "rm", "snap create", "snap rm", "snap purge", "trash mv", "image-meta set",
+				"image-meta remove":
+				if !keepsClient(call) {
+					t.Errorf("a command that changes a cache image could blocklist the host: %v", call)
+				}
+			}
+		}
+	}
+
+	// THE FLOW REACHED WHAT IT CLAIMS TO, or the rules above judged nothing.
+	for _, verb := range want {
+		if !seen[verb] {
+			t.Errorf("no %q ran on a cache image; the rules were never applied to it", verb)
+		}
+	}
+}
+
+// A CACHE VOLUME'S LIFE, CREATED TO DISCARDED, KEEPS BOTH RULES (#394).
 func TestCacheVolumesCarryObjectMapAndNeverBlocklistTheHost(t *testing.T) {
 	t.Parallel()
 
@@ -46,57 +164,5 @@ func TestCacheVolumesCarryObjectMapAndNeverBlocklistTheHost(t *testing.T) {
 		t.Fatalf("Discard: %v", err)
 	}
 
-	featured := func(call []string) bool {
-		i := slices.Index(call, "--image-feature")
-
-		return i >= 0 && i+1 < len(call) && call[i+1] == cacheImageFeatures
-	}
-	keepsClient := func(call []string) bool {
-		i := slices.Index(call, "--rbd_blocklist_on_break_lock")
-
-		return i >= 0 && i+1 < len(call) && call[i+1] == "false"
-	}
-	has := func(call []string, verbs ...string) bool {
-		at := slices.Index(call, verbs[0])
-
-		return at >= 0 && at+len(verbs) <= len(call) && slices.Equal(call[at:at+len(verbs)], verbs)
-	}
-
-	var created, cloned, changed int
-	for _, call := range f.calls {
-		switch {
-		// THE PUBLISH LOCK IS `layering` ALONE ON PURPOSE: Ceph documents
-		// exclusive-lock as incompatible with the advisory locks taken on it.
-		case has(call, "create") && slices.ContainsFunc(call, func(arg string) bool {
-			return strings.HasSuffix(arg, "/"+LockImageName)
-		}):
-		case has(call, "create") && !has(call, "snap", "create"):
-			created++
-			if !featured(call) {
-				t.Errorf("a cache volume was created without object-map: %v", call)
-			}
-		case has(call, "clone"), has(call, "cp"):
-			cloned++
-			if !featured(call) {
-				t.Errorf("a cache volume was cloned without object-map: %v", call)
-			}
-		case has(call, "snap", "create"), has(call, "snap", "rm"), has(call, "snap", "purge"),
-			has(call, "trash", "mv"), has(call, "image-meta", "set"), has(call, "image-meta", "remove"),
-			has(call, "rm") && !has(call, "lock", "rm") && !has(call, "trash", "rm"):
-			changed++
-			if !keepsClient(call) {
-				t.Errorf("a command that changes a cache image could blocklist the host: %v", call)
-			}
-		case has(call, "lock", "rm"):
-			if keepsClient(call) {
-				t.Errorf("the cache index's advisory lock lost its blocklist fence: %v", call)
-			}
-		}
-	}
-
-	// THE FLOW REACHED EVERY KIND, or the checks above judged nothing.
-	if created == 0 || cloned == 0 || changed == 0 {
-		t.Fatalf("the flow ran %d creates, %d clones and %d changes; it must exercise each",
-			created, cloned, changed)
-	}
+	requireCacheImageRules(t, f.calls, "create", "clone", "snap create", "trash mv")
 }

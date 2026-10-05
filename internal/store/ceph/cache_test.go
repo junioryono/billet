@@ -2273,6 +2273,8 @@ func TestLineageCompactionLetsEvictionReclaimHistoryBehindAnActiveCache(t *testi
 	if len(f.trash) != 0 {
 		t.Fatalf("eviction left retired writers behind the active cache: %v", f.trash)
 	}
+
+	requireCacheImageRules(t, f.calls, "cp")
 }
 
 func TestCloningALegacyGenerationDoesNotCrossTheDepthLimit(t *testing.T) {

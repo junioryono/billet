@@ -1431,7 +1431,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 			continue
 		}
 
-		if err := c.rbdCmdWithin(ctx, PurgeTimeout, "rm", handle); err != nil &&
+		if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("rm", handle)...); err != nil &&
 			!isNoSuchFile(err) {
 			c.halfRemoved[name] = first
 
