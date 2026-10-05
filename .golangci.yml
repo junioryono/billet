@@ -315,8 +315,10 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/lease$
 
-        # THE NODE RUNTIME IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE PLANE.
-        # A compute host runs internal/node and internal/nodeclient, and names the
+        # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
+        # PLANE, nor any package below them (each is denied exactly and as a prefix
+        # ending in a slash, so a sibling sharing the name is not). A compute host
+        # runs internal/node and internal/nodeclient, and names the
         # dispatch vocabulary through internal/dispatch and a lease through
         # internal/lease. Measured at zero violations when it went in (#356 Phase 2
         # item 5); tests may still stand a real plane up. alloc is not denied yet:
@@ -331,9 +333,15 @@ linters:
           deny:
             - pkg: "github.com/junioryono/billet/internal/server$"
               desc: "The node runtime does not import the scheduler; name the dispatch vocabulary through internal/dispatch."
+            - pkg: "github.com/junioryono/billet/internal/server/"
+              desc: "The node runtime does not import the scheduler; name the dispatch vocabulary through internal/dispatch."
             - pkg: "github.com/junioryono/billet/internal/state$"
               desc: "The node runtime does not open the ledger; the plane owns it."
+            - pkg: "github.com/junioryono/billet/internal/state/"
+              desc: "The node runtime does not open the ledger; the plane owns it."
             - pkg: "github.com/junioryono/billet/internal/nodeplane$"
+              desc: "The node runtime does not import the plane's half of the wire; it speaks to it through internal/nodeapi."
+            - pkg: "github.com/junioryono/billet/internal/nodeplane/"
               desc: "The node runtime does not import the plane's half of the wire; it speaks to it through internal/nodeapi."
 
         # THE NODE WIRE'S VOCABULARY IMPORTS NO LEDGER AND NO ROLE. Both roles
