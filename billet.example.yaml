@@ -407,6 +407,14 @@ node:
   #
   # drain_timeout: 6h
 
+  # What a SIGTERM does while this node holds compute. "drain" (the default) waits
+  # for it. "handoff" withdraws from placement and exits at once, leaving the
+  # compute running for the next node process to adopt: for a host restarted to be
+  # upgraded or converged; Firecracker nodes only. A host leaving for good is drained first or
+  # decommissioned, because nothing comes back to adopt what a handoff leaves.
+  #
+  # stop: drain
+
   # Measure each job from the host: its cgroup's CPU, memory, io and pressure,
   # its tap, the VMM's vCPU and emulation threads, and (with rapl) its share of
   # the package energy counter. The summary and a compressed series reach the

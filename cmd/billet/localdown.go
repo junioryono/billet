@@ -401,6 +401,18 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		disabledUnits []string
 	)
 
+	// A `down` TAKES THE NODE OUT OF SERVICE, so its stop drains even where
+	// node.stop says handoff (#374): nothing starts again to adopt what a handoff
+	// would leave running. `local up` withdraws the request. Asked of every Linux
+	// node whatever the config on disk says, because the policy that decides is
+	// the running process's, which may have loaded another; not on a Mac, where
+	// handoff is refused and the launch agent could not write the request.
+	if req.WantNode && hostOS == "linux" {
+		if err := requestNodeDrain(nodeDrainRequestFile); err != nil {
+			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
+		}
+	}
+
 	for _, unit := range downOrder(c, req) {
 		// OBSERVED, NOT PREDICTED. A stop is a systemd TRANSACTION: `Conflicts=`,
 		// `PartOf=` and `BindsTo=` all reach other units, and the closure is
