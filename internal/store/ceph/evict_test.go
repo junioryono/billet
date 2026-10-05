@@ -82,6 +82,8 @@ func TestEvictionTrashesAnExpiredVolumeAndRemovesAGenerationWithRm(t *testing.T)
 		t.Errorf("PurgeTrash = %d, %v, trash %v; want the evicted volume and the discard deleted",
 			n, err, f.trash)
 	}
+
+	requireCacheImageRules(t, f.calls, "rm", "trash mv")
 }
 
 // A VOLUME ANOTHER NODE'S JOB HOLDS OPEN IS KEPT, AND SO IS ONE THIS NODE'S

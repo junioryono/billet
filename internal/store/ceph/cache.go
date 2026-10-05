@@ -315,7 +315,7 @@ func (c *Client) metaGet(
 }
 
 func (c *Client) metaSet(ctx context.Context, image, key, value string) error {
-	if _, err := c.rbdCmd(ctx, false, "image-meta", "set", image, key, value); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("image-meta", "set", image, key, value)...); err != nil {
 		return fmt.Errorf("ceph: write cache metadata %s: %w", key, err)
 	}
 
@@ -323,7 +323,7 @@ func (c *Client) metaSet(ctx context.Context, image, key, value string) error {
 }
 
 func (c *Client) metaRemove(ctx context.Context, image, key string) error {
-	if _, err := c.rbdCmd(ctx, false, "image-meta", "remove", image, key); err != nil &&
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("image-meta", "remove", image, key)...); err != nil &&
 		!isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache metadata %s: %w", key, err)
 	}
@@ -353,6 +353,27 @@ func (c *Client) writeJSON(ctx context.Context, key string, value any) error {
 	return c.metaSet(ctx, c.cacheIndex(), key, string(encoded))
 }
 
+// cacheImageFeatures are the features every cache volume and generation gets:
+// Ceph's own defaults, named rather than inherited from whatever the cluster's
+// rbd_default_features says.
+//
+// OBJECT-MAP IS THE ONE THAT MATTERS, because without it a deletion cannot know
+// which objects exist and removes every one the image's size could hold. A
+// discarded 100 GiB volume with 100 MiB written took 237 s to delete with
+// `layering` alone and 3.5 s with these, measured on the reference deployment's
+// Linux node under load (2026-10-05); a clone given them of a `layering`-only
+// parent took 11 s. Created with `layering` alone, and every clone inheriting
+// its parent's features, cache volumes kept the node's trash purge deleting
+// objects nobody wrote for hours, both OSDs at 99% and every job's IO waiting
+// behind it. A clone takes them explicitly, so a chain created before this
+// gains them at its next clone.
+//
+// EXCLUSIVE-LOCK COMES WITH IT, which the kernel holds while a volume is mapped,
+// so every command that changes a cache volume runs under keepKernelClient: a
+// lock an interrupted unmap left behind is broken without blocklisting the
+// host's kernel client, the failure recorded for root disks.
+const cacheImageFeatures = "layering,exclusive-lock,object-map,fast-diff,deep-flatten"
+
 // Create maps a new unformatted cache volume.
 func (c *Client) Create(
 	ctx context.Context,
@@ -379,7 +400,7 @@ func (c *Client) Create(
 
 	handle := c.cfg.CachePool + "/" + name
 	if _, err := c.rbdCmd(ctx, false, "create", handle, "--size", strconv.FormatInt(mebibytes, 10)+"M",
-		"--image-feature", "layering"); err != nil {
+		"--image-feature", cacheImageFeatures); err != nil {
 		return storecontract.Volume{}, fmt.Errorf("ceph: create cache volume for %q: %w", key, err)
 	}
 
@@ -580,7 +601,7 @@ func (c *Client) snapshotAt(
 
 	_, generation, _ := strings.Cut(generationName, "cache-s-")
 	stage := volume.Handle + "@" + generation
-	if _, err := c.rbdCmd(ctx, false, "snap", "create", stage); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", stage)...); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, "",
 			fmt.Errorf("ceph: snapshot cache %q: %w", volume.Key, err))
 	}
@@ -599,12 +620,12 @@ func (c *Client) snapshotAt(
 		}
 		depth = 0
 	} else {
-		if _, err := c.rbdCmd(ctx, false, "clone", stage, handle); err != nil {
+		if _, err := c.rbdCmd(ctx, false, "clone", stage, handle, "--image-feature", cacheImageFeatures); err != nil {
 			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
 				fmt.Errorf("ceph: clone immutable candidate for %q: %w", volume.Key, err))
 		}
 
-		if _, err := c.rbdCmd(ctx, false, "snap", "create", handle+"@"+generation); err != nil {
+		if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", handle+"@"+generation)...); err != nil {
 			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
 				fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err))
 		}
@@ -621,7 +642,7 @@ func (c *Client) snapshotAt(
 		}
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "snap", "rm", stage); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "rm", stage)...); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
 			fmt.Errorf("ceph: remove cache staging snapshot: %w", err))
 	}
@@ -700,7 +721,7 @@ func (c *Client) copyCacheCandidate(
 	if err := c.copyCacheImage(ctx, source, destination); err != nil {
 		return err
 	}
-	if _, err := c.rbdCmd(ctx, false, "snap", "create", destination+"@"+generation); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "create", destination+"@"+generation)...); err != nil {
 		return fmt.Errorf("ceph: freeze compacted cache candidate: %w", err)
 	}
 
@@ -710,7 +731,10 @@ func (c *Client) copyCacheCandidate(
 func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {
 	copyCtx, cancelCopy := context.WithTimeout(ctx, cacheCompactionLimit)
 	defer cancelCopy()
-	if _, err := c.run(copyCtx, c.bin, append(c.identity(), "cp", source, destination)); err != nil {
+	// WITH THE CACHE'S FEATURES, because a copy otherwise takes its source's, and
+	// a compacted lineage of a `layering`-only volume would stay one.
+	if _, err := c.run(copyCtx, c.bin, append(c.identity(), "cp", source, destination,
+		"--image-feature", cacheImageFeatures)); err != nil {
 		return fmt.Errorf("ceph: compact cache lineage: %w", err)
 	}
 
@@ -728,7 +752,7 @@ func (c *Client) cleanupSnapshotFailure(
 
 	var failures []error
 	if candidate != "" {
-		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "purge", candidate); err != nil &&
+		if _, err := c.rbdCmd(cleanupCtx, false, keepKernelClient("snap", "purge", candidate)...); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
 		}
@@ -737,7 +761,7 @@ func (c *Client) cleanupSnapshotFailure(
 		}
 	}
 	if stage != "" {
-		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "rm", stage); err != nil &&
+		if _, err := c.rbdCmd(cleanupCtx, false, keepKernelClient("snap", "rm", stage)...); err != nil &&
 			!isNoSuchFile(err) {
 			failures = append(failures, err)
 		}
@@ -964,7 +988,7 @@ func (c *Client) Clone(
 		err = c.copyCacheImage(ctx, source, handle)
 		cloneDepth = 0
 	} else {
-		_, err = c.rbdCmd(ctx, false, "clone", source, handle)
+		_, err = c.rbdCmd(ctx, false, "clone", source, handle, "--image-feature", cacheImageFeatures)
 	}
 	if err != nil {
 		if isNoSuchFile(err) {
@@ -1096,7 +1120,7 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 // copy-on-write child still reads, or an image still open, before it deletes
 // anything. A generation never goes to the trash, where neither is refused.
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
-	if _, err := c.rbdCmd(ctx, false, "rm", handle); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("rm", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache image %s: %w", handle, err)
 	}
 
@@ -1135,12 +1159,12 @@ func (c *Client) discardCacheVolume(ctx context.Context, handle string) error {
 	// can leave its staging snapshot behind, and in the trash that snapshot makes
 	// every `trash rm` answer ENOTEMPTY, which the purge takes for a live child and
 	// waits on forever; listed, the next discard purges it.
-	if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: purge the snapshots of cache volume %s before the trash: %w",
 			handle, err)
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: move cache volume %s to the trash: %w", handle, err)
 	}
 
@@ -1407,7 +1431,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 			continue
 		}
 
-		if err := c.rbdCmdWithin(ctx, PurgeTimeout, "rm", handle); err != nil &&
+		if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("rm", handle)...); err != nil &&
 			!isNoSuchFile(err) {
 			c.halfRemoved[name] = first
 
@@ -1431,7 +1455,7 @@ func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
 			"named is retired", bounded(handle))
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("trash", "mv", handle)...); err != nil {
 		return fmt.Errorf("ceph: retire cache volume %s: %w", handle, err)
 	}
 
@@ -1650,7 +1674,7 @@ func (c *Client) evictGeneration(
 		return nil
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil && !isNoSuchFile(err) {
+	if _, err := c.rbdCmd(ctx, false, keepKernelClient("snap", "purge", handle)...); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
 	}
 
