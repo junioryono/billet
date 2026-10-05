@@ -323,12 +323,38 @@
     - not ansible_check_mode
     - billet_upgrade_claim_shape == 'guard'
 
+# THE TRANSACTION INSTALLS ITS CANDIDATE CONFIG TOO, and a changed one may move
+# what the next process adopts from (#374), so it is compared with the installed
+# one before the node is stopped: cmp answers 0 for the same bytes, 1 for
+# different ones and anything else for could-not-tell, which drains.
+- name: Compare the transaction's candidate config with the installed one
+  ansible.builtin.command:
+    argv:
+      - cmp
+      - -s
+      - "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
+      - "{{ billet_ordinary_config_path }}"
+  register: billet_candidate_config_compare
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
 - name: Upgrade billet as one recoverable host transaction
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
   become: true
   block:
+    - name: Make the transaction's node stop a drain when the node will not run again or its config changes
+      ansible.builtin.include_tasks: request-node-drain.yml
+      when: >-
+        not billet_node_should_run or
+        (billet_candidate_config_compare.rc | default(2)) != 0
+
     - name: Gracefully stop the billet node before changing its guest contract
       ansible.builtin.systemd_service:
         name: billet-node.service
@@ -799,6 +825,19 @@
     - not billet_retirement_node_ordinary | bool
   become: true
 
+# A CHANGED CONFIG MAY MOVE WHAT THE NEXT PROCESS ADOPTS FROM (#374): a
+# Firecracker chroot base, a state directory or the guests' cache endpoint. The
+# node's next stop drains, whether the endpoint migration below or the ordinary
+# restart makes it, and the final release withdraws the request once the node is
+# where this converge leaves it.
+- name: Make a node restart for a changed config a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
+    - billet_config_install.changed | default(false)
+
 # THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
 # afresh whether the running node dials the installed endpoint and, when it
 # does not, stops and starts it under the migration protocol; a migrated node
@@ -868,6 +907,12 @@
   become: true
   notify: billet unit files changed
 
+- name: Make the stop of a node that may not run here a drain
+  ansible.builtin.include_tasks: request-node-drain.yml
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+
 - name: Stop and disable the billet node unless it may run here
   ansible.builtin.systemd_service:
     name: billet-node.service
@@ -878,6 +923,15 @@
     - not ansible_check_mode
   become: true
   notify: billet unit files changed
+
+# EVERY OPERATION OF THIS CONVERGE THAT ASKED FOR A DRAIN IS DONE (#374): the
+# node is started or stopped as the converge leaves it, any restart was polled to
+# its new process, and the transaction finished. Withdrawn unconditionally, so a
+# request a failed or resumed converge left behind does not keep later stops
+# draining.
+- name: Withdraw the drain request now that the node is where this converge leaves it
+  ansible.builtin.include_tasks: release-node-drain.yml
+  when: not ansible_check_mode
 
 # THE SCHEDULED UPDATER, INSTALLED ON EVERY HOST WITH A CONTROL PLANE AND
 # ENABLED WHEN THE DEPLOYMENT UPDATES ITSELF. The upgrade timer acts on the

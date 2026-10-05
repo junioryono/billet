@@ -74,6 +74,10 @@ type actionsArchive struct {
 	Version   string               `json:"version"`
 	Volume    storecontract.Volume `json:"volume"`
 	Unmounted bool                 `json:"unmounted,omitempty"`
+	// lost says this process could not mount the archive's volume again after a
+	// restart (RestoreMounts); it is served and finalized as if absent. Never
+	// recorded.
+	lost bool
 }
 
 type actionsReceipt struct {
@@ -781,7 +785,7 @@ func (s *CacheService) finalizeActionsCache(
 	var archive *actionsArchive
 	for _, candidate := range session.actions {
 		if candidate.Mode == actionsModeUpload && candidate.CacheKey == request.Key &&
-			candidate.Version == request.Version {
+			candidate.Version == request.Version && !candidate.lost {
 			archive = candidate
 
 			break
@@ -1108,7 +1112,8 @@ func (s *CacheService) serveActionsBlob(
 		return nil, err
 	}
 	archive := session.actions[id]
-	if session.closed || archive == nil || req.URL.Query().Get("sig") != archive.Signature {
+	if session.closed || archive == nil || archive.lost ||
+		req.URL.Query().Get("sig") != archive.Signature {
 		session.mu.Unlock()
 
 		return actionsBlobError(http.StatusForbidden, "cache archive is unavailable"), nil

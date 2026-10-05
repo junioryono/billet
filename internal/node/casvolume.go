@@ -74,6 +74,10 @@ type hostVolume struct {
 	Kind    config.CacheKind     `json:"kind"`
 	Volume  storecontract.Volume `json:"volume"`
 	Mounted bool                 `json:"mounted,omitempty"`
+	// lost says this process could not mount again a volume a previous one
+	// recorded as mounted (RestoreMounts), so its path is not the volume and
+	// nothing is served from it. Never recorded: the next process tries again.
+	lost bool
 	// Dirty says something was written, so there is something to publish.
 	Dirty   bool            `json:"dirty,omitempty"`
 	Intent  *publishIntent  `json:"intent,omitempty"`
@@ -118,7 +122,7 @@ func (s *CacheService) casVolume(
 	ctx context.Context, session *cacheSession, kind config.CacheKind,
 ) (*hostVolume, error) {
 	if hv := session.hosts[kind]; hv != nil {
-		if !hv.Mounted {
+		if !hv.Mounted || hv.lost {
 			return nil, errCASNotMounted
 		}
 
@@ -397,7 +401,7 @@ func (s *CacheService) openCASHandle(
 	}
 
 	hv.io.RLock()
-	if !hv.Mounted {
+	if !hv.Mounted || hv.lost {
 		hv.io.RUnlock()
 		admitted()
 

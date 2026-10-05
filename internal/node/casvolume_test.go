@@ -92,6 +92,19 @@ func (d *deviceVolumes) MountReadOnly(_ context.Context, device, target string) 
 
 func (d *deviceVolumes) Trim(context.Context, string) error { return nil }
 
+// Mounted reports a link, which is what this manager's mount makes.
+func (d *deviceVolumes) Mounted(_ context.Context, target string) (bool, error) {
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return info.Mode()&os.ModeSymlink != 0, nil
+}
+
 func (d *deviceVolumes) Unmount(_ context.Context, target string) error {
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return err

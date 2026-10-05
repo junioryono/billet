@@ -106,6 +106,16 @@ func (f *fakeActionsVolumeManager) Unmount(_ context.Context, target string) err
 	return nil
 }
 
+func (f *fakeActionsVolumeManager) Mounted(_ context.Context, target string) (bool, error) {
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 func (f *fakeActionsVolumeManager) Trim(_ context.Context, target string) error {
 	f.trimmed++
 	if f.trimCheck != nil {

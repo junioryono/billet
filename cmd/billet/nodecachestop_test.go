@@ -1,0 +1,223 @@
+package main
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+)
+
+// A HANDOVER LETS THE CACHE FINISH WHAT IT IS SENDING (#374), within what the
+// leases can spare. The guests outlive a node that hands over, so a transfer cut at
+// the old five seconds fails a job; but nothing renews their leases until the next
+// process registers, so the grace stays within a sixth of the TTL. A drain stops
+// the listener after its jobs, and keeps the short grace.
+func TestTheNodeCacheStopsWithAHandoverGrace(t *testing.T) {
+	t.Parallel()
+
+	if got := nodeCacheStopGrace(true); got <= 5*time.Second || got > alloc.DefaultLeaseTTL/6 {
+		t.Errorf("a handover gives in-flight cache requests %v, want more than 5s and at most %v",
+			got, alloc.DefaultLeaseTTL/6)
+	}
+	if got := nodeCacheStopGrace(false); got != 5*time.Second {
+		t.Errorf("a drain gives in-flight cache requests %v, want 5s", got)
+	}
+}
+
+// AND THE NODE STARTS ITS CACHE WITH IT, the listener's Shutdown waits that
+// long, and the cache serves only once the loop says the node is ready. No run-time test reaches startNodeCache without a provider and a
+// listener, so this one reads the source.
+func TestTheNodeCacheIsGivenItsStopGrace(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var passed, honoured, shutdown, gated bool
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.KeyValueExpr:
+			key, keyOK := node.Key.(*ast.Ident)
+			value, valueOK := node.Value.(*ast.Ident)
+			if keyOK && valueOK && key.Name == "Ready" && value.Name == "serveCache" {
+				gated = true
+			}
+		case *ast.CallExpr:
+			name, ok := node.Fun.(*ast.Ident)
+			if !ok || name.Name != "startNodeCache" || len(node.Args) == 0 {
+				return true
+			}
+
+			grace, ok := node.Args[len(node.Args)-1].(*ast.CallExpr)
+			if !ok || len(grace.Args) != 1 {
+				return true
+			}
+
+			fun, funOK := grace.Fun.(*ast.Ident)
+			arg, argOK := grace.Args[0].(*ast.Ident)
+			if funOK && argOK && fun.Name == "nodeCacheStopGrace" && arg.Name == "handOver" {
+				passed = true
+			}
+		case *ast.FuncDecl:
+			if node.Name.Name != "startNodeCache" {
+				return true
+			}
+
+			ast.Inspect(node, func(inner ast.Node) bool {
+				call, ok := inner.(*ast.CallExpr)
+				if !ok || !namesSelector(call.Fun, "context", "WithTimeout") || len(call.Args) != 2 {
+					return true
+				}
+
+				if grace, ok := call.Args[1].(*ast.Ident); ok && grace.Name == "stopGrace" {
+					honoured = true
+				}
+
+				return true
+			})
+			ast.Inspect(node, func(inner ast.Node) bool {
+				call, ok := inner.(*ast.CallExpr)
+				if !ok || !namesSelector(call.Fun, "srv", "Shutdown") || len(call.Args) != 1 {
+					return true
+				}
+				if arg, ok := call.Args[0].(*ast.Ident); ok && arg.Name == "shutdownCtx" {
+					shutdown = true
+				}
+
+				return true
+			})
+		}
+
+		return true
+	})
+
+	if !passed {
+		t.Error("the node starts its cache without nodeCacheStopGrace(handOver)")
+	}
+	if !gated {
+		t.Error("the node loop is not given serveCache as Ready, so the cache answers before registration")
+	}
+	if !honoured || !shutdown {
+		t.Error("startNodeCache's srv.Shutdown(shutdownCtx) does not wait stopGrace")
+	}
+}
+
+// THE CACHE SERVES ONLY FROM ITS ONE READY PATH, AND ONLY AFTER ITS MOUNTS ARE
+// RESTORED. startNodeCache calls srv.Serve exactly once, inside the function
+// literal Ready runs, after service.RestoreMounts in that same literal: an eager
+// Serve elsewhere, or one ahead of the remount, would answer a handed-over guest
+// from an empty directory or from a process the control plane does not know.
+func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	var (
+		serves  int
+		ordered bool
+	)
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "startNodeCache" {
+			continue
+		}
+
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && namesSelector(call.Fun, "srv", "Serve") {
+				serves++
+			}
+
+			// IN A GO STATEMENT, because Ready is called on the node loop's own
+			// goroutine and a remount that stalls there would hold registration.
+			statement, ok := n.(*ast.GoStmt)
+			if !ok {
+				return true
+			}
+			literal, ok := statement.Call.Fun.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+
+			var restoredAt, servedAt token.Pos
+			for _, statement := range literal.Body.List {
+				ast.Inspect(statement, func(inner ast.Node) bool {
+					call, ok := inner.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if namesSelector(call.Fun, "service", "RestoreMounts") && restoredAt == 0 {
+						restoredAt = call.Pos()
+					}
+					if namesSelector(call.Fun, "srv", "Serve") && servedAt == 0 {
+						servedAt = call.Pos()
+					}
+
+					return true
+				})
+			}
+			if restoredAt != 0 && servedAt != 0 && restoredAt < servedAt {
+				ordered = true
+			}
+
+			return true
+		})
+	}
+
+	if serves != 1 {
+		t.Errorf("startNodeCache calls srv.Serve %d times, want exactly the one Ready runs", serves)
+	}
+	if !ordered {
+		t.Error("startNodeCache does not restore the recovered mounts, then serve, in a goroutine of its own")
+	}
+}
+
+// THE NODE LOOP IS GIVEN THE STOP POLICY AND THE DRAIN REQUEST. The loop's tests
+// set both themselves, so only the source shows that cmdNode passes what the
+// config said and what a draining stop asks.
+func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
+	t.Parallel()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse main.go: %v", err)
+	}
+
+	want := map[string]string{"HandOverOnStop": "handOver", "DrainRequested": "nodeDrainRequested"}
+	found := map[string]bool{}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		literal, ok := n.(*ast.CompositeLit)
+		if !ok || !namesSelector(literal.Type, "nodeclient", "LoopOptions") {
+			return true
+		}
+		for _, element := range literal.Elts {
+			field, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, keyOK := field.Key.(*ast.Ident)
+			value, valueOK := field.Value.(*ast.Ident)
+			if keyOK && valueOK && want[key.Name] == value.Name {
+				found[key.Name] = true
+			}
+		}
+
+		return true
+	})
+
+	for key, value := range want {
+		if !found[key] {
+			t.Errorf("the node loop is not given %s: %s", key, value)
+		}
+	}
+}
