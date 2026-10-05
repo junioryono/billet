@@ -1246,14 +1246,17 @@ const halfRemovedBudget = 10 * time.Minute
 // as done, and one that fails for any other reason does not stop the rest: each
 // failure is reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
-	purged, failures := c.purgeTrashEntries(ctx)
+	// ONE YIELDING BUDGET FOR THE WHOLE PASS, both of its deletion phases.
+	budget := newYieldBudget(purgePassYieldMax)
 
-	finished, unfinished := c.finishHalfRemoved(ctx)
+	purged, failures := c.purgeTrashEntries(ctx, budget)
+
+	finished, unfinished := c.finishHalfRemoved(ctx, budget)
 
 	return purged + finished, errors.Join(append(failures, unfinished...)...)
 }
 
-func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
+func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (int, []error) {
 	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
 	if err != nil {
 		return 0, []error{fmt.Errorf("ceph: list the cache pool's trash: %w", err)}
@@ -1302,6 +1305,8 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 	for range min(max(c.purgeWorkers, 1), len(deletions)) {
 		wg.Go(func() {
 			for d := range next {
+				c.waitForQuietIO(ctx, budget)
+
 				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 
 				mu.Lock()
@@ -1352,7 +1357,7 @@ func (c *Client) purgeTrashEntries(ctx context.Context) (int, []error) {
 // on this node's own clock, because the name's time is the creating node's clock. An `rbd info`
 // that fails for another reason is could-not-tell: the image is kept, forgotten
 // and reported.
-func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
+func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (int, []error) {
 	names, err := c.cacheImages(ctx)
 	if err != nil {
 		return 0, []error{err}
@@ -1430,6 +1435,8 @@ func (c *Client) finishHalfRemoved(ctx context.Context) (int, []error) {
 
 			continue
 		}
+
+		c.waitForQuietIO(ctx, budget)
 
 		if err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("rm", handle)...); err != nil &&
 			!isNoSuchFile(err) {
