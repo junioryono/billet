@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -188,19 +191,28 @@ func TestALeftoverChildDoesNotKeepTheLock(t *testing.T) {
 	lock := filepath.Join(dir, "check.lock")
 	up := filepath.Join(dir, "up")
 	release := filepath.Join(dir, "release")
+	finished := filepath.Join(dir, "finished")
 
-	// The child says it is up and stays up until released, so it is alive, and
-	// holding whatever it inherited, for the whole of the next run.
+	// The child writes its pid, stays up until released and then says it
+	// finished; past its watchdog it exits without saying so. It is its own
+	// sh, so $$ is its pid.
 	out, err := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock, "sh", "-c",
-		`(`+holdUntilReleased+`) > /dev/null 2>&1 &
-exit 0`, "leaver", up, release).CombinedOutput()
+		`sh -c '`+leftoverChild+`' child "$1" "$2" "$3" > /dev/null 2>&1 &
+exit 0`, "leaver", up, release, finished).CombinedOutput()
 	if err != nil {
 		t.Fatalf("a run that leaves a child behind: %v (%s)", err, out)
 	}
 
-	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) }) //nolint:errcheck // releasing a child the test no longer watches
+	// Registered after t.TempDir, so it runs first: the child is released and
+	// its finish is awaited before the directory holding the signal goes.
+	t.Cleanup(func() { releaseLeftover(t, release, finished) })
 
 	waitForLockFile(t, up, "the leftover child never started")
+
+	pid, err := readPID(up)
+	if err != nil {
+		t.Fatalf("the leftover child's pid: %v", err)
+	}
 
 	// Bounded on its own: a lock the child kept would make this wait forever.
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
@@ -211,13 +223,69 @@ exit 0`, "leaver", up, release).CombinedOutput()
 		t.Fatalf("the next run, with the leftover child still alive: %v (%s)", err, out)
 	}
 
-	if _, err := os.Stat(release); err == nil {
-		t.Fatal("the leftover child was released before the next run finished, so this proves nothing")
+	// THE CHILD WAS ALIVE FOR THE WHOLE RUN, or this proves nothing: a child
+	// whose watchdog had already fired would have let go of anything it held.
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("the leftover child (pid %d) was gone when the next run finished, so this proves nothing: %v", pid, err)
 	}
 
 	if strings.Contains(string(out), "waiting") {
 		t.Errorf("the next run waited for a lock only a leftover child held: %q", out)
 	}
+
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatalf("release the leftover child: %v", err)
+	}
+
+	waitForLockFile(t, finished, "the leftover child did not finish when released")
+}
+
+// leftoverChild is sh that writes its pid to $1, waits until $2 exists and then
+// writes $3. Past its watchdog it exits 9 without writing $3.
+const leftoverChild = `echo $$ > "$1"
+i=0
+while [ ! -e "$2" ]; do
+	i=$((i + 1))
+	if [ "$i" -gt 1200 ]; then exit 9; fi
+	sleep 0.05
+done
+echo finished > "$3"`
+
+// releaseLeftover releases a leftover child and waits up to ten seconds for it
+// to say it finished, so its directory is not removed under it.
+func releaseLeftover(t *testing.T, release, finished string) {
+	t.Helper()
+
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Errorf("release the leftover child: %v", err)
+
+		return
+	}
+
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if _, err := os.Stat(finished); err == nil {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Errorf("the leftover child did not finish within 10s of its release")
+}
+
+// readPID reads the pid a child wrote to path.
+func readPID(path string) (int, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a pid: %w", raw, err)
+	}
+
+	return pid, nil
 }
 
 // holdUntilReleased is shell that writes "held" to $1, then waits until $2
@@ -276,6 +344,33 @@ func TestAnEmptyLockPathIsTheSharedOne(t *testing.T) {
 	}
 }
 
+// NO PLACE FOR THE SHARED LOCK IS A COURTESY LOST, NOT A GATE: with neither an
+// absolute XDG_CACHE_HOME nor HOME, the command still runs, its status is the
+// script's, and the run says it is unlocked.
+func TestANoHomeCheckStillRuns(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", "", "sh", "-c", "exit 6")
+
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name != "HOME" && name != "XDG_CACHE_HOME" {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 6 {
+		t.Fatalf("a command exiting 6 with no HOME: %v (%s), want exit status 6", err, out)
+	}
+
+	if !strings.Contains(string(out), "not serialised with others") {
+		t.Errorf("the run did not say it went unlocked: %q", out)
+	}
+}
+
 // MAKE CHECK HANDS THE SCRIPT THE PATH WHOLE. With MAKE=echo the recipe runs the
 // real script around an echo instead of the gate, so this is the Makefile's own
 // line, with an XDG_CACHE_HOME holding spaces.
@@ -288,11 +383,18 @@ func TestMakeCheckTakesTheSharedLock(t *testing.T) {
 
 	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "MAKE=echo", "check")
 
-	// The Makefile's own default is the subject, so no inherited CHECK_LOCK.
+	// The Makefile's own default is the subject, and this may run inside a
+	// `make check` holding the lock: an inherited CHECK_LOCK, or one carried in
+	// MAKEFLAGS from `make check CHECK_LOCK=...`, would make this nested make
+	// wait for the lock its own enclosing gate holds.
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "CHECK_LOCK=") {
-			cmd.Env = append(cmd.Env, kv)
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "CHECK_LOCK", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL":
+			continue
 		}
+
+		cmd.Env = append(cmd.Env, kv)
 	}
 
 	cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+xdg)

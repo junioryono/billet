@@ -28,7 +28,13 @@ shift
 if [ -z "$lock" ]; then
 	case "${XDG_CACHE_HOME-}" in
 	/*) lock=$XDG_CACHE_HOME/dev-gate.lock ;;
-	*) lock=$HOME/.cache/dev-gate.lock ;;
+	*)
+		if [ -z "${HOME-}" ]; then
+			echo "with-check-lock: neither an absolute XDG_CACHE_HOME nor HOME is set, so this run is not serialised with others" >&2
+			exec "$@"
+		fi
+		lock=$HOME/.cache/dev-gate.lock
+		;;
 	esac
 fi
 
