@@ -93,8 +93,8 @@ func requireCacheImageRules(t *testing.T, calls [][]string, want ...string) {
 		}
 		base := imageBase(spec)
 
-		switch {
-		case base == LockImageName || base == cacheIndexName:
+		switch base {
+		case LockImageName, cacheIndexName:
 			// EXACTLY `layering`, named: with no feature named, rbd would give the
 			// lock image the cluster's defaults, exclusive-lock among them.
 			if verb == "create" && !slices.Equal(features(call), []string{"layering"}) {

@@ -440,4 +440,3 @@ func writeImage(rawPath, device string, want int64, pace importPace) error {
 
 	return dst.Close()
 }
-
