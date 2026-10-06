@@ -27,6 +27,7 @@ func cephHealthScript(t *testing.T, stateDir string) string {
 		"{{ billet_alert_from | quote }}":  "from@example.com",
 		"{{ billet_alert_email | quote }}": "to@example.com",
 		"state_dir=/var/lib/billet/health": "state_dir='" + stateDir + "'",
+		cephHealthSingleCopyPools:          "'billet-cache'",
 	} {
 		if !strings.Contains(script, from) {
 			t.Fatalf("the template no longer contains %q", from)
@@ -46,6 +47,11 @@ hostname() { printf 'node-1\n'; }
 
 	return path
 }
+
+// cephHealthSingleCopyPools is the template's list of the pools an inventory
+// chose to keep in one copy; the tests render it as the cache pool alone.
+const cephHealthSingleCopyPools = "{{ (([billet_ceph_image_pool] if (billet_ceph_pool_size | int) == 1 else []) + " +
+	"([billet_ceph_cache_pool] if (billet_ceph_cache_pool_size | int) == 1 else [])) | join(' ') | quote }}"
 
 const (
 	healthOK       = "HEALTH_OK\n"
@@ -70,6 +76,15 @@ const (
 	healthDown = `HEALTH_WARN 1 osds down
 [WRN] OSD_DOWN: 1 osds down
     osd.1 is down
+`
+	healthSingleCopy = `HEALTH_WARN 1 pool(s) have no replicas configured
+[WRN] POOL_NO_REDUNDANCY: 1 pool(s) have no replicas configured
+    pool 'billet-cache' has no replicas configured
+`
+	healthUnchosenSingleCopy = `HEALTH_WARN 2 pool(s) have no replicas configured
+[WRN] POOL_NO_REDUNDANCY: 2 pool(s) have no replicas configured
+    pool 'billet-cache' has no replicas configured
+    pool 'billet-images' has no replicas configured
 `
 	healthNameless = "HEALTH_WARN something ceph names no check for\n"
 	// stateMarker is the first line of a state this version writes.
@@ -131,6 +146,11 @@ func TestTheCephHealthAlertMailsEachNewProblemOnce(t *testing.T) {
 		{healthGarbage, true, 6, "and failing again is not mailed again"},
 		{healthEmpty, false, 6, "an empty answer is the same unreadable"},
 		{healthGarbage, false, 6, "and so is one that is not a health report"},
+		{healthOK, false, 6, "recovered"},
+		{healthSingleCopy, false, 6, "a pool the inventory chose to keep in one copy is not a problem"},
+		{healthUnchosenSingleCopy, false, 7, "another pool without copies is"},
+		{healthSingleCopy, false, 7, "the chosen pool alone again clears the episode"},
+		{healthUnchosenSingleCopy, false, 8, "so the other pool coming back is mailed again"},
 	}
 
 	for i, step := range steps {
@@ -161,7 +181,8 @@ func TestTheCephHealthAlertMailsEachNewProblemOnce(t *testing.T) {
 	subjects := mails()
 	if !strings.Contains(subjects[0], "OSD_NEARFULL") || !strings.Contains(subjects[1], "OSD_BACKFILLFULL") ||
 		strings.Contains(subjects[1], "NEARFULL ") || !strings.Contains(subjects[2], "OSD_DOWN") ||
-		!strings.Contains(subjects[4], "HEALTH_WARN") || !strings.Contains(subjects[5], "CEPH_UNREADABLE") {
+		!strings.Contains(subjects[4], "HEALTH_WARN") || !strings.Contains(subjects[5], "CEPH_UNREADABLE") ||
+		!strings.Contains(subjects[6], "POOL_NO_REDUNDANCY") || !strings.Contains(subjects[7], "POOL_NO_REDUNDANCY") {
 		t.Errorf("subjects %q do not name the checks that were new", subjects)
 	}
 }
