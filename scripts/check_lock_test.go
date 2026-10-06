@@ -2,6 +2,7 @@ package scripts_test
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -81,22 +82,12 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 	seen := filepath.Join(dir, "seen")
 
 	first := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock, "sh", "-c",
-		`echo held > "$1"
-i=0
-while [ ! -e "$2" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
-echo done >> "$1"`, "first", trace, release)
+		holdUntilReleased+`echo done >> "$1"`, "first", trace, release)
 	if err := first.Start(); err != nil {
 		t.Fatalf("start the first run: %v", err)
 	}
 
-	// Only a test that failed before waiting below reaps the first run here, by
-	// which time the test's context is cancelled and the result means nothing.
-	t.Cleanup(func() {
-		if first.ProcessState == nil {
-			//nolint:errcheck // reaping only; the run's verdict is asserted in the body
-			first.Wait()
-		}
-	})
+	releaseAndReap(t, first, release)
 
 	waitForLockFile(t, trace, "the first run never started its command")
 
@@ -193,23 +184,130 @@ func TestALeftoverChildDoesNotKeepTheLock(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
-	lock := filepath.Join(t.TempDir(), "check.lock")
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "check.lock")
+	up := filepath.Join(dir, "up")
+	release := filepath.Join(dir, "release")
 
-	out, err := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock,
-		"sh", "-c", "sleep 10 > /dev/null 2>&1 & exit 0").CombinedOutput()
+	// The child says it is up and stays up until released, so it is alive, and
+	// holding whatever it inherited, for the whole of the next run.
+	out, err := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock, "sh", "-c",
+		`(`+holdUntilReleased+`) > /dev/null 2>&1 &
+exit 0`, "leaver", up, release).CombinedOutput()
 	if err != nil {
 		t.Fatalf("a run that leaves a child behind: %v (%s)", err, out)
 	}
 
-	next := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock, "true")
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) }) //nolint:errcheck // releasing a child the test no longer watches
 
-	out, err = next.CombinedOutput()
+	waitForLockFile(t, up, "the leftover child never started")
+
+	// Bounded on its own: a lock the child kept would make this wait forever.
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	out, err = exec.CommandContext(ctx, "./with-check-lock.sh", lock, "true").CombinedOutput()
 	if err != nil {
-		t.Fatalf("the next run: %v (%s)", err, out)
+		t.Fatalf("the next run, with the leftover child still alive: %v (%s)", err, out)
+	}
+
+	if _, err := os.Stat(release); err == nil {
+		t.Fatal("the leftover child was released before the next run finished, so this proves nothing")
 	}
 
 	if strings.Contains(string(out), "waiting") {
 		t.Errorf("the next run waited for a lock only a leftover child held: %q", out)
+	}
+}
+
+// holdUntilReleased is shell that writes "held" to $1, then waits until $2
+// exists. It never gives up and succeeds: past its watchdog it exits 9, so a
+// test whose release never came fails rather than seeing the lock come free.
+const holdUntilReleased = `echo held > "$1"
+i=0
+while [ ! -e "$2" ]; do
+	i=$((i + 1))
+	if [ "$i" -gt 1200 ]; then exit 9; fi
+	sleep 0.05
+done
+`
+
+// releaseAndReap releases a holder and reaps it if the test ends before it
+// does, so no holder outlives its test.
+func releaseAndReap(t *testing.T, cmd *exec.Cmd, release string) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if cmd.ProcessState != nil {
+			return
+		}
+
+		//nolint:errcheck // releasing and reaping only; the run's verdict is asserted in the body
+		os.WriteFile(release, nil, 0o600)
+		//nolint:errcheck // as above
+		cmd.Wait()
+	})
+}
+
+// AN EMPTY LOCK PATH IS THE SHARED ONE, worked out in the shell so an
+// XDG_CACHE_HOME holding spaces stays one path, and a relative one is not used:
+// it would give every checkout a lock of its own.
+func TestAnEmptyLockPathIsTheSharedOne(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+
+	for name, tc := range map[string]struct{ xdg, want string }{
+		"absolute with spaces": {filepath.Join(dir, "a cache"), filepath.Join(dir, "a cache", "dev-gate.lock")},
+		"relative":             {"relative-cache", filepath.Join(home, ".cache", "dev-gate.lock")},
+	} {
+		cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", "", "true")
+		cmd.Env = append(os.Environ(), "HOME="+home, "XDG_CACHE_HOME="+tc.xdg)
+
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v (%s)", name, err, out)
+		}
+
+		if _, err := os.Stat(tc.want); err != nil {
+			t.Errorf("%s: the shared lock was not taken at %s: %v", name, tc.want, err)
+		}
+	}
+}
+
+// MAKE CHECK HANDS THE SCRIPT THE PATH WHOLE. With MAKE=echo the recipe runs the
+// real script around an echo instead of the gate, so this is the Makefile's own
+// line, with an XDG_CACHE_HOME holding spaces.
+func TestMakeCheckTakesTheSharedLock(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	xdg := filepath.Join(dir, "a cache")
+
+	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "MAKE=echo", "check")
+
+	// The Makefile's own default is the subject, so no inherited CHECK_LOCK.
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "CHECK_LOCK=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+
+	cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+xdg)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("make check with MAKE=echo: %v (%s)", err, out)
+	}
+
+	if !strings.Contains(string(out), "check-unlocked") {
+		t.Errorf("the recipe did not run its steps' target under the script: %q", out)
+	}
+
+	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
+		t.Errorf("make check did not take the shared lock under an XDG_CACHE_HOME with spaces: %v (%s)", err, out)
 	}
 }
 

@@ -47,13 +47,13 @@ endif
 
 # ONE GATE AT A TIME PER MACHINE, across projects. Two sessions, two worktrees
 # or two repositories running their gates together is how the measurement above
-# became a starved machine, so `check` takes this lock and a run waits for
-# whichever gate holds it (see scripts/with-check-lock.sh). The path is shared
-# with other repositories' gates on purpose, per user, so XDG_CACHE_HOME counts
-# only when it is absolute: a relative one would give every checkout a lock of
-# its own. It is a courtesy, not a gate: without a lock tool, or a lock that
-# cannot be taken, the run goes ahead and says so.
-CHECK_LOCK ?= $(or $(filter /%,$(XDG_CACHE_HOME)),$(HOME)/.cache)/dev-gate.lock
+# became a starved machine, so `check` takes a lock and a run waits for whichever
+# gate holds it (see scripts/with-check-lock.sh). Left empty, CHECK_LOCK means
+# the path every repository's gate shares, which the script works out: make's
+# word functions would split an XDG_CACHE_HOME holding spaces into another path.
+# It is a courtesy, not a gate: without a lock tool, or a lock that cannot be
+# taken, the run goes ahead and says so.
+CHECK_LOCK ?=
 
 # A dry run (-n), a question (-q) or a touch (-t) runs no step, so it takes no
 # lock: GNU make runs a recipe line naming $(MAKE) even under -n, and the lock
