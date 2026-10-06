@@ -8,10 +8,10 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // A LAUNCH REFUSED BECAUSE THE NODE IS DRAINING TAKES THE HOST OUT OF
@@ -53,7 +53,7 @@ func TestADrainingRefusalOverTheWireTakesTheHostOutOfPlacement(t *testing.T) {
 			lease := &alloc.Lease{ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
 				GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1}
 
-			if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err == nil {
+			if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err == nil {
 				t.Fatal("a refused launch was reported as started")
 			}
 

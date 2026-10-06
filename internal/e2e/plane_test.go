@@ -38,6 +38,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/fakeactions"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
@@ -558,7 +559,7 @@ type directRunner struct {
 	kind config.ProviderKind
 }
 
-func (d directRunner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
+func (d directRunner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Job) error {
 	for i := range d.tiers {
 		if d.tiers[i].Label == lease.Tier {
 			return d.runner.Launch(ctx, lease,

@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -331,7 +332,7 @@ func TestASealedListenerDeclinesOffers(t *testing.T) {
 	// advertisement cannot do: a queued message still arrives and an
 	// unacknowledged one is still redelivered.
 	if err := l.handle(t.Context(), &Message{
-		MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}},
+		MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
 	}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -379,7 +380,7 @@ func TestAnOpenListenerAcceptsTheSameOffer(t *testing.T) {
 	}
 
 	if err := l.handle(t.Context(), &Message{
-		MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}},
+		MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
 	}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -584,7 +585,7 @@ func TestASealLandingDuringThePollIsObservedBeforeHandling(t *testing.T) {
 	}
 
 	if err := l.handle(t.Context(), &Message{
-		MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}},
+		MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
 	}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -704,7 +705,7 @@ func TestTheLoopReObservesTheSealBeforeHandlingAMessage(t *testing.T) {
 			return nil, ErrNoMessage
 		}
 
-		return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		return &Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 	}
 
 	l := NewListener(a, tiers[0].Label, session)
@@ -821,7 +822,7 @@ func TestASealedDeploymentHoldsAnAssignmentUntilAdmissionReopens(t *testing.T) {
 			return &Message{
 				MessageID:  1,
 				Statistics: &Statistics{TotalAssignedJobs: 1},
-				Assigned:   []Job{{RequestID: 11, RunID: 101}},
+				Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		}
 
@@ -1185,7 +1186,7 @@ func TestAnUnreadableAdmissionStateBuysNothing(t *testing.T) {
 			return &Message{
 				MessageID:  1,
 				Statistics: &Statistics{TotalAssignedJobs: 1},
-				Assigned:   []Job{{RequestID: 11, RunID: 101}},
+				Assigned:   []dispatch.Job{{RequestID: 11, RunID: 101}},
 			}, nil
 		}
 

@@ -10,8 +10,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // releasedProtocol is the wire a node built before this control plane speaks.
@@ -549,7 +549,7 @@ func TestAReleasedProtocolNodeStillLaunchesAndDestroys(t *testing.T) {
 	lease := testLease()
 	launched := make(chan error, 1)
 
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
 
 	cmd, took, err := p.Poll(t.Context(), "n1", "n1-1")
 	if err != nil || !took {

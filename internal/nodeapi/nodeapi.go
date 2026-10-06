@@ -915,7 +915,7 @@ type CommandResult struct {
 	// Custody says the node MAY have started something and is keeping the lease.
 	//
 	// Its own field because the server branches on it and must not read it out of
-	// the prose above. In-process this is server.ErrCustody, and the difference it
+	// the prose above. In-process this is dispatch.ErrCustody, and the difference it
 	// makes is total: a clean failure releases the lease, while custody means the
 	// node has taken the lease into its own janitor, is still heartbeating it, and
 	// will release it once the compute is confirmed gone. Releasing as well would

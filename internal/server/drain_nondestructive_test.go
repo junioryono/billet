@@ -9,6 +9,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // A SHUTDOWN LEAVES A RUNNING JOB ALONE, AND KEEPS ITS CAPACITY CHARGED.
@@ -120,7 +121,7 @@ func TestAShutdownStillDestroysWhatACompletionAskedFor(t *testing.T) {
 
 	l.mu.Lock()
 	l.cleanup = map[int64]*pendingCleanup{
-		9: {job: Job{RequestID: 9}, at: time.Now().Add(time.Hour)},
+		9: {job: dispatch.Job{RequestID: 9}, at: time.Now().Add(time.Hour)},
 	}
 	l.mu.Unlock()
 

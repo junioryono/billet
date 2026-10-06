@@ -15,8 +15,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
@@ -107,12 +107,12 @@ func TestALaunchWithNoNodeStartedNothing(t *testing.T) {
 
 	p := testPlane(t)
 
-	err := p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	if !errors.Is(err, ErrNoNode) {
 		t.Fatalf("want ErrNoNode, got %v", err)
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Error("a launch that was never sent reported custody, which holds capacity for " +
 			"compute that cannot exist")
 	}
@@ -129,7 +129,7 @@ func TestASuccessfulRemoteLaunchRecordsItsBoundNodeOnTheLease(t *testing.T) {
 	lease := testLease()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		done <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !took {
@@ -165,8 +165,8 @@ func TestASilentNodeLeavesTheLeaseInCustody(t *testing.T) {
 		}
 	}()
 
-	err := p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
-	if !errors.Is(err, server.ErrCustody) {
+	err := p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("a delivered launch that went unanswered must report custody, got %v", err)
 	}
 
@@ -187,12 +187,12 @@ func TestAnUndeliveredLaunchIsNotCustody(t *testing.T) {
 	register(t, p, "n1", config.ProviderDocker)
 
 	// Nobody polls, so the command sits in the queue.
-	err := p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	if !errors.Is(err, ErrNoNode) {
 		t.Fatalf("want ErrNoNode for a command no node took, got %v", err)
 	}
 
-	if errors.Is(err, server.ErrCustody) {
+	if errors.Is(err, dispatch.ErrCustody) {
 		t.Error("a command that never left the queue reported custody")
 	}
 }
@@ -240,7 +240,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 				}
 			}()
 
-			err := p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+			err := p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 
 			if tc.wantErr && err == nil {
 				t.Fatal("the node's failure did not reach the caller")
@@ -250,7 +250,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 				t.Fatalf("the node succeeded but the caller saw: %v", err)
 			}
 
-			if got := errors.Is(err, server.ErrCustody); got != tc.wantCustdy {
+			if got := errors.Is(err, dispatch.ErrCustody); got != tc.wantCustdy {
 				t.Errorf("custody = %v, want %v (err: %v)", got, tc.wantCustdy, err)
 			}
 		})
@@ -279,7 +279,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 	launched := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -292,7 +292,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 
 	select {
 	case err := <-launched:
-		if !errors.Is(err, server.ErrCustody) {
+		if !errors.Is(err, dispatch.ErrCustody) {
 			t.Fatalf("a launch lost to a node restart must report custody, got %v", err)
 		}
 	case <-time.After(60 * time.Second):
@@ -386,7 +386,7 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 		}()
 	}
 
-	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err != nil {
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -472,7 +472,7 @@ func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
 
 	launched := make(chan error, 1)
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -528,7 +528,7 @@ func TestAPinnedLeaseWillNotWander(t *testing.T) {
 	lease := testLease()
 	lease.TargetNode = "mac-mini-1"
 
-	err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a lease pinned to an absent node was run on a different one")
 	}
@@ -750,7 +750,7 @@ func TestABusyNodeIsNotForgotten(t *testing.T) {
 	inFlight := make(chan error, 1)
 
 	go func() {
-		inFlight <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		inFlight <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -783,7 +783,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 	launched := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	// Nobody polls, so the command sits queued. Wait until it is there, or the
@@ -808,7 +808,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 			t.Fatal("a launch nobody took reported success")
 		}
 
-		if errors.Is(err, server.ErrCustody) {
+		if errors.Is(err, dispatch.ErrCustody) {
 			t.Errorf("a command that never left the queue reported custody: %v", err)
 		}
 	case <-time.After(60 * time.Second):
@@ -878,7 +878,7 @@ func TestATimedOutLaunchWithNoResultStillMeansCustody(t *testing.T) {
 	n.inflight[pend.cmd.ID] = pend
 
 	_, err := p.settle(n, pend, errors.New("the command timed out"))
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("a delivered launch that never answered must report custody, got %v", err)
 	}
 
@@ -919,7 +919,7 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 	// Something is waiting to be delivered.
 	go func() {
 		//nolint:errcheck // the launch's fate is not what this test is about
-		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		_ = p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	deadline := time.Now().Add(60 * time.Second)
@@ -1076,7 +1076,7 @@ func deliverLaunch(t *testing.T, opts ...Option) (*Plane, nodeapi.Command) {
 
 	go func() {
 		//nolint:errcheck // the launch's fate is not what these tests are about
-		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		_ = p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	deadline := time.Now().Add(60 * time.Second)
@@ -1208,7 +1208,7 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 
 	select {
 	case err := <-destroyed:
-		if !errors.Is(err, server.ErrCustody) {
+		if !errors.Is(err, dispatch.ErrCustody) {
 			t.Errorf("a destroy answered by the process that replaced the owner reported %v; "+
 				"the listener releases the lease while the container is still running", err)
 		}
@@ -1577,7 +1577,7 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		func() bool { return p.WaitersForTest("n1") == 1 })
 
 	err := p.NewRunner().Destroy(t.Context(), 7)
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Errorf("a destroy answered by a process that does not hold the container reported "+
 			"%v; the listener releases the lease while the job is still running", err)
 	}
@@ -1595,8 +1595,8 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 	answerOneCommand(t, p, "second")
 	waitFor(t, "the replacement to park on a second poll",
 		func() bool { return p.WaitersForTest("n1") == 1 })
-	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded", server.CacheAuthority{})
-	if !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded", dispatch.CacheAuthority{})
+	if !errors.Is(err, dispatch.ErrHolderUnavailable) || errors.Is(err, dispatch.ErrCustody) {
 		t.Errorf("a completion answered by the process that replaced the holder reported %v; "+
 			"want only holder unavailable", err)
 	}
@@ -1708,7 +1708,7 @@ func TestACancelledCallerIsNotStuck(t *testing.T) {
 		cancel()
 	}()
 
-	err := p.NewRunner().Launch(ctx, testLease(), server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(ctx, testLease(), dispatch.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a cancelled launch reported success")
 	}

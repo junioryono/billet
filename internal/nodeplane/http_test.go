@@ -18,11 +18,11 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	billetnode "github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -682,7 +682,7 @@ func TestACommandAndItsResultCrossTheWire(t *testing.T) {
 		Epoch:     1,
 	}
 
-	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err != nil {
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}); err != nil {
 		t.Fatalf("Launch across the wire: %v", err)
 	}
 
@@ -712,7 +712,7 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 		RequestID: 7, VCPU: 2, Memory: 8 * config.GiB, GuestOS: config.GuestLinux,
 		Providers: []config.ProviderKind{config.ProviderDocker}}
 	launched := make(chan error, 1)
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
@@ -907,7 +907,7 @@ func TestTheLaunchArrivesIntact(t *testing.T) {
 		RequestID: 7,
 	}
 
-	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7, RunID: 8, Event: "push"}); err != nil {
+	if err := p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7, RunID: 8, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -1989,8 +1989,8 @@ func TestRegistrationIntentInvalidatesAbsenceBeforeTheOwnershipRead(t *testing.T
 	<-entered
 
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone, server.CacheAuthority{},
-	); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone, dispatch.CacheAuthority{},
+	); !errors.Is(err, dispatch.ErrHolderUnavailable) || errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("completion during ownership read = %v, want only holder unavailable", err)
 	}
 	close(proceed)
@@ -2255,7 +2255,7 @@ func TestALaunchCarriesTheTierShape(t *testing.T) {
 	// long after the assertions below. The test is about what was DELIVERED.
 	launched := make(chan error, 1)
 
-	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7}) }()
 
 	select {
 	case cmd := <-got:

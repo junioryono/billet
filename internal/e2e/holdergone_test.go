@@ -9,6 +9,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/fakeactions"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
@@ -62,7 +63,7 @@ func killedTeardownStack(t *testing.T) (*codeBuildStack, *offsetClock, *alloc.Le
 
 	if err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: requestID, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -88,7 +89,7 @@ func killedTeardownStack(t *testing.T) (*codeBuildStack, *offsetClock, *alloc.Le
 	s.fake.neverConfirmStops()
 
 	err := s.runner.Destroy(t.Context(), requestID)
-	if !errors.Is(err, server.ErrCustody) {
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy of an unconfirmed stop = %v, want ErrCustody", err)
 	}
 
@@ -408,8 +409,8 @@ func TestAKilledFailedLaunchTeardownIsArchivedAsFailedOnRestart(t *testing.T) {
 
 	err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 607, Event: "push"})
-	if !errors.Is(err, server.ErrCustody) {
+		dispatch.Job{RequestID: 607, Event: "push"})
+	if !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("an ambiguous launch with an unconfirmed cleanup = %v, want ErrCustody", err)
 	}
 

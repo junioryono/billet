@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // A WAITER WHOSE LISTENER STALLS STOPS HOLDING THE LINE, AND TAKES IT BACK FROM
@@ -160,7 +161,7 @@ type slowLauncher struct {
 	release chan struct{}
 }
 
-func (s *slowLauncher) Launch(ctx context.Context, lease *alloc.Lease, job Job) error {
+func (s *slowLauncher) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Job) error {
 	if lease.Tier == s.tier {
 		close(s.began)
 		<-s.release

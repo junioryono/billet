@@ -7,6 +7,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 type fakeRunEvidence struct {
@@ -27,10 +28,10 @@ func (f *fakeRunEvidence) DefaultBranch(context.Context, string, string) (string
 
 // completedPool starts job 11 on the runner launched for it as a push to main
 // and completes it, and returns what the runner was handed.
-func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence) []CacheAuthority {
+func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence) []dispatch.CacheAuthority {
 	t.Helper()
 
-	started := Job{RequestID: 11, RunID: 101, JobID: "job-11", Owner: "acme", Repository: "api",
+	started := dispatch.Job{RequestID: 11, RunID: 101, JobID: "job-11", Owner: "acme", Repository: "api",
 		Event: "push", WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main"}
 	assigned := started
 	assigned.Owner, assigned.Repository, assigned.Event, assigned.WorkflowRef = "", "", "", ""
@@ -42,14 +43,14 @@ func completedPool(t *testing.T, spec config.CacheSpec, evidence RunEvidence) []
 
 	member := p.launchedFor11(t)
 	started.RunnerID, started.RunnerName = 77, member.RunnerName
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 
 	completed := started
 	completed.Result = "succeeded"
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{completed},
 		Statistics: &Statistics{}}); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestATrustedOnlyTierNeverAsksForRunEvidence(t *testing.T) {
 	if evidence.asked != 0 {
 		t.Errorf("GitHub was asked %d times for a trusted-only tier", evidence.asked)
 	}
-	if len(got) != 1 || got[0] != (CacheAuthority{}) {
+	if len(got) != 1 || got[0] != (dispatch.CacheAuthority{}) {
 		t.Fatalf("authorities = %+v, want one zero authority", got)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
@@ -647,7 +648,7 @@ func describeJobs(m *server.Message) string {
 
 	for _, group := range []struct {
 		kind string
-		jobs []server.Job
+		jobs []dispatch.Job
 	}{
 		{"available", m.Available},
 		{"assigned", m.Assigned},
