@@ -22,10 +22,42 @@ TF_MODULES       := $(patsubst %/,%,$(sort $(dir $(shell find terraform/modules 
 BIN              := bin/billet
 COVERPROFILE     := coverage.out
 
+# A LOCAL GATE SHARES THE MACHINE; CI'S RUNS AS IT ALWAYS DID. Measured on a
+# 12-core, 32 GiB Mac on 2026-10-05: `go test -race ./...` at go's default -p
+# (one package per CPU) peaked at 3.36 GiB resident over 96 processes, and beside
+# a container VM holding 24 GiB it pushed swap from 33.4 to 39.4 GiB, at which
+# point DNS and the VPN client stalled with everything else. At -p 4 the same
+# step peaked at 0.99 GiB over 56 processes and finished sooner (2049s against
+# 2299s). So outside CI the race build runs at most TEST_PARALLEL packages at
+# once, and the heavy steps run under nice. nice rather than macOS's taskpolicy:
+# the same package took 37s under nice -n 10 and 27s to 119s unprioritised as
+# the machine's load moved, but 205s clamped to the utility QoS and 485s at
+# background QoS, which throttle disk I/O as well as CPU. Override either on the
+# command line
+# (`make check TEST_PARALLEL= NICE=`); CI sets CI, so neither applies there.
+ifeq ($(CI),)
+TEST_PARALLEL ?= 4
+NICE          ?= nice -n 10
+endif
+GO_TEST_P := $(if $(TEST_PARALLEL),-p $(TEST_PARALLEL))
+
+# ONE GATE AT A TIME PER MACHINE, across projects. Two sessions, two worktrees
+# or two repositories running their gates together is how the measurement above
+# became a starved machine, so `check` takes this lock and a run waits for
+# whichever gate holds it (see scripts/with-check-lock.sh). The path is shared
+# with other repositories' gates on purpose. It is a courtesy, not a gate:
+# without a lock tool the run goes ahead and says so.
+CHECK_LOCK ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/dev-gate.lock
+
 .DEFAULT_GOAL := check
 
 .PHONY: check
-check: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The pre-commit gate (CI runs this and more)
+check: ## The pre-commit gate (CI runs this and more), one run at a time per machine
+	@mkdir -p "$(dir $(CHECK_LOCK))"
+	@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(MAKE) --no-print-directory check-unlocked
+
+.PHONY: check-unlocked
+check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The gate's steps, without the machine-wide lock
 
 .PHONY: build
 build: ## Build ./bin/billet
@@ -53,11 +85,11 @@ test: ## Race-enabled test run, instrumented exactly as CI runs it
 	# 530s under -race and atomic coverage before migration 49 added fourteen
 	# statements to every test ledger's open, against go test's default of 600s,
 	# and cmd/billet crossed 20m on a loaded fleet runner on 2026-09-26.
-	go test -race -count=1 -timeout 35m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
+	$(NICE) go test $(GO_TEST_P) -race -count=1 -timeout 35m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
-	go test -race -count=1 -timeout 35m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
+	$(NICE) go test $(GO_TEST_P) -race -count=1 -timeout 35m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
@@ -98,7 +130,7 @@ docs: ## Build the Sphinx documentation with warnings as errors, as Read the Doc
 
 .PHONY: lint
 lint: ## golangci-lint (pinned version), for this platform AND linux
-	golangci-lint run --timeout=15m
+	$(NICE) golangci-lint run --timeout=15m
 	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
 	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
 	@# file, and every branch of a platform-dependent type, is unexamined by the pass
@@ -112,7 +144,7 @@ lint: ## golangci-lint (pinned version), for this platform AND linux
 	@# (uint32), so a linux pass at this Mac's arm64 missed a conversion CI
 	@# refused as unnecessary (2026-09-09); a conversion that must exist on one
 	@# architecture and not another is spelled through a generic widening.
-	GOOS=linux GOARCH=amd64 golangci-lint run --timeout=15m
+	GOOS=linux GOARCH=amd64 $(NICE) golangci-lint run --timeout=15m
 
 .PHONY: lint-custom
 lint-custom: ## billet's own analyzers, and the tests that prove they still detect
