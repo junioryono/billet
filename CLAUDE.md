@@ -42,7 +42,7 @@ Layering is enforced by `depguard` in `.golangci.yml`, not by convention: `confi
 ## Commands
 
 ```bash
-make check       # the pre-commit gate, one run per machine at a time: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources
+make check       # the pre-commit gate, one run per user at a time across projects (a shared lock): no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources
 make build       # ./bin/billet
 make test        # go test -race -count=1 -covermode=atomic ./...   (coverage counters are part of the gate; they reorder goroutines; locally -p 4 under nice)
 make lint        # golangci-lint for the host AND GOOS=linux (a linter only sees files it would compile)

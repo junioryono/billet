@@ -33,28 +33,40 @@ COVERPROFILE     := coverage.out
 # the same package took 37s under nice -n 10 and 27s to 119s unprioritised as
 # the machine's load moved, but 205s clamped to the utility QoS and 485s at
 # background QoS, which throttle disk I/O as well as CPU. Override either on the
-# command line
-# (`make check TEST_PARALLEL= NICE=`); CI sets CI, so neither applies there.
+# command line (`make check TEST_PARALLEL= NICE=` lifts both, and still takes the
+# lock below). Under CI both are forced empty, whatever the environment says:
+# CI runs the targets one by one with go test's own -p and no nice.
 ifeq ($(CI),)
 TEST_PARALLEL ?= 4
 NICE          ?= nice -n 10
+GO_TEST_P     := $(if $(TEST_PARALLEL),-p $(TEST_PARALLEL))
+else
+override NICE      :=
+override GO_TEST_P :=
 endif
-GO_TEST_P := $(if $(TEST_PARALLEL),-p $(TEST_PARALLEL))
 
 # ONE GATE AT A TIME PER MACHINE, across projects. Two sessions, two worktrees
 # or two repositories running their gates together is how the measurement above
 # became a starved machine, so `check` takes this lock and a run waits for
 # whichever gate holds it (see scripts/with-check-lock.sh). The path is shared
-# with other repositories' gates on purpose. It is a courtesy, not a gate:
-# without a lock tool the run goes ahead and says so.
-CHECK_LOCK ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/dev-gate.lock
+# with other repositories' gates on purpose, per user, so XDG_CACHE_HOME counts
+# only when it is absolute: a relative one would give every checkout a lock of
+# its own. It is a courtesy, not a gate: without a lock tool, or a lock that
+# cannot be taken, the run goes ahead and says so.
+CHECK_LOCK ?= $(or $(filter /%,$(XDG_CACHE_HOME)),$(HOME)/.cache)/dev-gate.lock
+
+# A dry run (-n), a question (-q) or a touch (-t) runs no step, so it takes no
+# lock: GNU make runs a recipe line naming $(MAKE) even under -n, and the lock
+# would make `make -n check` wait behind a whole gate to print commands. The
+# single-letter flags are the first word of MAKEFLAGS (measured on GNU Make 3.81:
+# -n reads "sn", a long option such as --no-print-directory never comes first).
+MAKE_RUNS_NOTHING = $(strip $(foreach flag,n q t,$(findstring $(flag),$(firstword -$(MAKEFLAGS)))))
 
 .DEFAULT_GOAL := check
 
 .PHONY: check
 check: ## The pre-commit gate (CI runs this and more), one run at a time per machine
-	@mkdir -p "$(dir $(CHECK_LOCK))"
-	@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(MAKE) --no-print-directory check-unlocked
+	$(if $(MAKE_RUNS_NOTHING),$(MAKE) --no-print-directory check-unlocked,@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(MAKE) --no-print-directory check-unlocked)
 
 .PHONY: check-unlocked
 check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The gate's steps, without the machine-wide lock

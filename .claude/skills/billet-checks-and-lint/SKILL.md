@@ -18,7 +18,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A green `make check` is necessary, not sufficient.**
 - **Lint runs twice, and the second pass is the one that speaks for production.**
 - **Coverage instrumentation is part of the gate.**
-- **A local gate shares the machine: one `make check` at a time, `go test -p 4`, under `nice`.**
+- **A local gate shares the machine: one gate per user at a time across projects, `go test -p 4`, under `nice`.**
 - **A finding is fixed, or suppressed with a reason that names the linter.**
 - **When a bug is a class, encode it, in this order.**
 - **`make cross` before anything touching a build tag.**
