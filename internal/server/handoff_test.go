@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -112,7 +113,7 @@ func newHandoffFixture(t *testing.T, opts ...Option) *handoffFixture {
 		slowPoll()
 
 		if assigned.CompareAndSwap(false, true) {
-			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 1, Assigned: []dispatch.Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
 		// No completion ever: a drain would wait for this job for as long as it ran.
@@ -142,7 +143,7 @@ func (f *handoffFixture) owe(id int64) {
 	if f.l.cleanup == nil {
 		f.l.cleanup = map[int64]*pendingCleanup{}
 	}
-	f.l.cleanup[id] = &pendingCleanup{job: Job{RequestID: id}, at: time.Now().Add(time.Hour)}
+	f.l.cleanup[id] = &pendingCleanup{job: dispatch.Job{RequestID: id}, at: time.Now().Add(time.Hour)}
 }
 
 // A STOP WHILE THE DEPLOYMENT ADMITS WORK IS A RESTART, AND IT DOES NOT WAIT FOR

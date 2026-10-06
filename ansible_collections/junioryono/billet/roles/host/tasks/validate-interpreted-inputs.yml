@@ -6,6 +6,33 @@
     that: billet_guest_dns_servers is sequence and billet_guest_dns_servers is not string and billet_guest_dns_servers is not mapping
     fail_msg: billet_guest_dns_servers must be a list of IPv4 or IPv6 literals.
 
+# THE COPIES ARE WHOLE NUMBERS, AT LEAST ONE, and a pool never needs more copies
+# to serve IO than it keeps; checked before anything changes, for the same reason
+# as the profile below.
+- name: Validate the billet Ceph pools' copies
+  ansible.builtin.assert:
+    that:
+      - item.0 | string is match('^[1-9][0-9]*$')
+      - item.1 | string is match('^[1-9][0-9]*$')
+      - (item.0 | int) <= 10
+      - (item.1 | int) <= (item.0 | int)
+    fail_msg: >-
+      billet_ceph_pool_size, billet_ceph_cache_pool_size and their min_size must be
+      whole numbers from 1 to 10, Ceph's own bound, each min_size no larger than its
+      size.
+  loop:
+    - ["{{ billet_ceph_pool_size }}", "{{ billet_ceph_pool_min_size }}"]
+    - ["{{ billet_ceph_cache_pool_size }}", "{{ billet_ceph_cache_pool_min_size }}"]
+
+# CHECKED BEFORE ANYTHING CHANGES: refused at the Ceph task instead, a typo would
+# stop a converge that guest networking may already have drained the node for.
+- name: Validate billet_ceph_osd_mclock_profile
+  ansible.builtin.assert:
+    that: billet_ceph_osd_mclock_profile in ['', 'balanced', 'high_client_ops', 'high_recovery_ops', 'custom']
+    fail_msg: >-
+      billet_ceph_osd_mclock_profile must be one of balanced, high_client_ops,
+      high_recovery_ops or custom, or "" to leave the cluster's own profile alone.
+
 - name: Validate each billet_guest_dns_servers literal
   ansible.builtin.assert:
     that: item | junioryono.billet.ip_literal

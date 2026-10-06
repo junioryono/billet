@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -87,7 +88,7 @@ type Server struct {
 	drainTimeout *time.Duration
 	// runner is handed to every listener, so an assigned lease becomes compute.
 	// nil means none is attached and the listeners fail closed.
-	runner Runner
+	runner dispatch.Runner
 	// completionStore is shared by listeners but rows are scoped by tier.
 	completionStore *state.DB
 	// cleanupRetry, when set, paces every listener's cleanup retries. Tests
@@ -169,7 +170,7 @@ func WithAdmissionOrder(order config.AdmissionOrder) ControlPlaneOption {
 //
 // Without it the listeners fail closed: they account for capacity and decline
 // the work, rather than accepting jobs nothing can run.
-func WithNodeRunner(r Runner) ControlPlaneOption {
+func WithNodeRunner(r dispatch.Runner) ControlPlaneOption {
 	return func(s *Server) { s.runner = r }
 }
 

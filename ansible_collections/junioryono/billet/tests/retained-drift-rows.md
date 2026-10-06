@@ -102,6 +102,10 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/network.yml / Predict the billet network service change | const:/etc/systemd/system/billet-network.service |
 | tasks/network.yml / Inspect whether the billet node unit exists | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/network.yml / Drain billet compute before changing guest networking | parity:shared node stop or node-owned networking service lifecycle (R7.3) |
+| tasks/request-node-drain.yml / Ask every billet node process that stops during this operation to drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
+| tasks/release-node-drain.yml / Withdraw the request that billet node stops drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
+| tasks/services.yml / Inspect the billet node a host that may not run one still has | parity:read-only systemd/IP observation with exact argv bound |
+| tasks/services.yml / Compare the transaction's candidate config with the installed one | parity:read-only comparison of the staged candidate config with the installed one, deciding a drain request (#374) |
 | tasks/network.yml / Enable IP forwarding for guest bridges | const:/etc/sysctl.d/99-billet-node.conf |
 | tasks/network.yml / Inspect DHCP units for removed guest networks | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/network.yml / Stop and disable DHCP on removed guest networks | parity:shared node stop or node-owned networking service lifecycle (R7.3) |
@@ -129,7 +133,11 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph.yml / Create billet Ceph pools | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Initialize billet Ceph pools for RBD | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Configure billet Ceph pool replication | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Keep a single copy of each billet Ceph pool asked to | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Keep the no-redundancy warning unmuted | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Allow a billet Ceph pool to keep a single copy | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Require clone-v2-compatible Ceph clients | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Let Ceph serve client IO ahead of scrubbing and recovery | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Protect the billet Ceph keyring | inventory:billet_ceph_keyring_path |
 | tasks/ceph.yml / Verify the scoped Ceph identity can read both pools | parity:read-only Ceph/RBD observation; exact command and inventory operands are fingerprinted |

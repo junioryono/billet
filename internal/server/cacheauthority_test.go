@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 const ciRef = "acme/api/.github/workflows/ci.yml"
@@ -37,45 +38,45 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		binding    alloc.PoolRunner
-		completion *Job
+		completion *dispatch.Job
 		run        WorkflowRun
 		dflt       string
-		want       CacheAuthority
+		want       dispatch.CacheAuthority
 	}{
 		"a push to the default branch publishes": {
 			binding: authorityBinding("push", "refs/heads/main"),
 			run:     authorityRun("push", "main"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true, WriteOwnRef: true, PublishDefault: true},
 		},
 		"a schedule on the default branch publishes": {
 			binding: authorityBinding("schedule", "refs/heads/main"),
 			run:     authorityRun("schedule", "main"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true, WriteOwnRef: true, PublishDefault: true},
 		},
 		"a push to a feature branch writes only its own ref": {
 			binding: authorityBinding("push", "refs/heads/feature"),
 			run:     authorityRun("push", "feature"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
 				Proven: true, WriteOwnRef: true},
 		},
 		"a pull request writes its merge ref and restores from its base": {
 			binding: authorityBinding("pull_request", "refs/pull/7/merge"),
 			run:     pr(), dflt: "main",
-			want: CacheAuthority{Ref: "refs/pull/7/merge", BaseRef: "refs/heads/release",
+			want: dispatch.CacheAuthority{Ref: "refs/pull/7/merge", BaseRef: "refs/heads/release",
 				DefaultRef: "refs/heads/main", Proven: true, WriteOwnRef: true},
 		},
 		"pull_request_target on the default branch reads it and writes nothing": {
 			binding: authorityBinding("pull_request_target", "refs/heads/main"),
 			run:     authorityRun("pull_request_target", "feature"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		"workflow_run on the default branch reads it and writes nothing": {
 			binding: authorityBinding("workflow_run", "refs/heads/main"),
 			run:     authorityRun("workflow_run", "main"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		"issue_comment off the default branch is not proven": {
@@ -144,7 +145,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 					{Path: "acme/api/.github/workflows/build.yml@refs/heads/main", SHA: "abc"}}
 				return run
 			}(), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		"a tag named main calling a workflow pinned to main at the same commit writes nothing": {
@@ -161,7 +162,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 					{Path: "acme/api/.github/workflows/build.yml@refs/heads/main", SHA: "abc"}}
 				return run
 			}(), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		// A self-call GitHub records under a short ref does not match the job's
@@ -175,7 +176,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 					{Path: "ACME/api/.github/workflows/ci.yml@main", SHA: "other-sha"}}
 				return run
 			}(), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		"a reusable workflow on a feature branch at the run's commit writes nothing either": {
@@ -190,7 +191,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 					{Path: "acme/api/.github/workflows/build.yml@refs/heads/feature", SHA: "abc"}}
 				return run
 			}(), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/feature", DefaultRef: "refs/heads/main",
 				Proven: true},
 		},
 		"a cross-repository workflow is never the job's ref": {
@@ -224,7 +225,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 		"a renamed default branch makes main an ordinary branch": {
 			binding: authorityBinding("push", "refs/heads/main"),
 			run:     authorityRun("push", "main"), dflt: "trunk",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/trunk",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/trunk",
 				Proven: true, WriteOwnRef: true},
 		},
 		"a binding with no identity writes nothing": {
@@ -233,21 +234,21 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 		},
 		"a completion for another job writes nothing": {
 			binding: authorityBinding("push", "refs/heads/main"),
-			completion: &Job{JobID: "job-2", RunID: 31, Owner: "acme", Repository: "api",
+			completion: &dispatch.Job{JobID: "job-2", RunID: 31, Owner: "acme", Repository: "api",
 				Event: "push", WorkflowRef: ciRef + "@refs/heads/main"},
 			run: authorityRun("push", "main"), dflt: "main",
 		},
 		"a completion that agrees with the binding publishes": {
 			binding: authorityBinding("push", "refs/heads/main"),
-			completion: &Job{JobID: "job-1", RunID: 31, Owner: "ACME", Repository: "api",
+			completion: &dispatch.Job{JobID: "job-1", RunID: 31, Owner: "ACME", Repository: "api",
 				Event: "push", WorkflowRef: ciRef + "@refs/heads/main"},
 			run: authorityRun("push", "main"), dflt: "main",
-			want: CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
+			want: dispatch.CacheAuthority{Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 				Proven: true, WriteOwnRef: true, PublishDefault: true},
 		},
 		"a completion restored without its identity writes nothing": {
 			binding:    authorityBinding("push", "refs/heads/main"),
-			completion: &Job{RunID: 31},
+			completion: &dispatch.Job{RunID: 31},
 			run:        authorityRun("push", "main"), dflt: "main",
 		},
 	} {
@@ -268,7 +269,7 @@ func TestTheCacheAuthorityRule(t *testing.T) {
 func TestACompletionThatDisagreesInAnyFieldIsNotProven(t *testing.T) {
 	t.Parallel()
 
-	agreeing := Job{JobID: "job-1", RunID: 31, Owner: "acme", Repository: "api",
+	agreeing := dispatch.Job{JobID: "job-1", RunID: 31, Owner: "acme", Repository: "api",
 		Event: "push", WorkflowRef: ciRef + "@refs/heads/main"}
 	binding := authorityBinding("push", "refs/heads/main")
 	run := authorityRun("push", "main")
@@ -276,13 +277,13 @@ func TestACompletionThatDisagreesInAnyFieldIsNotProven(t *testing.T) {
 		t.Fatalf("an agreeing completion did not publish: %+v", got)
 	}
 
-	for field, change := range map[string]func(*Job){
-		"run":          func(j *Job) { j.RunID = 32 },
-		"owner":        func(j *Job) { j.Owner = "other" },
-		"repository":   func(j *Job) { j.Repository = "web" },
-		"event":        func(j *Job) { j.Event = "workflow_dispatch" },
-		"workflow ref": func(j *Job) { j.WorkflowRef = ciRef + "@refs/heads/other" },
-		"empty owner":  func(j *Job) { j.Owner = "" },
+	for field, change := range map[string]func(*dispatch.Job){
+		"run":          func(j *dispatch.Job) { j.RunID = 32 },
+		"owner":        func(j *dispatch.Job) { j.Owner = "other" },
+		"repository":   func(j *dispatch.Job) { j.Repository = "web" },
+		"event":        func(j *dispatch.Job) { j.Event = "workflow_dispatch" },
+		"workflow ref": func(j *dispatch.Job) { j.WorkflowRef = ciRef + "@refs/heads/other" },
+		"empty owner":  func(j *dispatch.Job) { j.Owner = "" },
 	} {
 		completion := agreeing
 		change(&completion)

@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // Runner drives compute on a remote node.
 //
-// It implements server.Runner, so the listener cannot tell a remote node from an
+// It implements dispatch.Runner, so the listener cannot tell a remote node from an
 // in-process one — which is the point of the split, and also why the ambiguity
 // below has to be mapped onto the SAME errors the in-process runner returns
 // rather than onto new ones the listener has never heard of.
@@ -28,11 +28,11 @@ type Runner struct {
 // a signature that drifted would compile and quietly stop delivering GitHub's
 // result and the cache authority with a completion's destroy.
 var (
-	_ server.CompletionAwareRunner      = (*Runner)(nil)
-	_ server.BoundCompletionAwareRunner = (*Runner)(nil)
+	_ dispatch.CompletionAwareRunner      = (*Runner)(nil)
+	_ dispatch.BoundCompletionAwareRunner = (*Runner)(nil)
 )
 
-// NewRunner returns the plane's server.Runner.
+// NewRunner returns the plane's dispatch.Runner.
 func (p *Plane) NewRunner() *Runner { return &Runner{plane: p} }
 
 // Launch asks a node to start compute for a lease.
@@ -46,11 +46,11 @@ func (p *Plane) NewRunner() *Runner { return &Runner{plane: p} }
 //   - The node answered: its answer, translated. A clean failure releases; a
 //     failure the node marked custody keeps the lease, because the node has
 //     taken it into its own janitor.
-//   - The node took the command and said nothing: server.ErrCustody. This is the
+//   - The node took the command and said nothing: dispatch.ErrCustody. This is the
 //     one that matters. The command may be executing right now, so the lease is
 //     kept and the node's own recovery is what finds whatever started. Treating
 //     silence as failure would re-advertise capacity that is in use.
-func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
+func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job dispatch.Job) error {
 	n, selectedProvider, err := r.plane.pick(lease)
 	if err != nil {
 		return err
@@ -123,7 +123,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 	}
 
 	if res.Custody {
-		return fmt.Errorf("%w: node %s: %s", server.ErrCustody, n.name, res.Error)
+		return fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, n.name, res.Error)
 	}
 
 	if res.Draining {
@@ -150,7 +150,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 // DestroyCompleted sends GitHub's authoritative result, and what the job's
 // caches may publish, with a completion-triggered destroy.
 func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string,
-	authority server.CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	return r.destroy(ctx, requestID, result, WireCacheAuthority(authority))
 }
@@ -163,7 +163,7 @@ func (r *Runner) DestroyCompletedBound(
 	result, leaseID, nodeName string,
 	leaseEpoch int64,
 	outcome alloc.Phase,
-	authority server.CacheAuthority,
+	authority dispatch.CacheAuthority,
 ) error {
 	id, err := commandID()
 	if err != nil {
@@ -192,7 +192,7 @@ func (r *Runner) DestroyCompletedBound(
 	}
 	if !res.OK {
 		if res.Custody {
-			return fmt.Errorf("%w: node %s: %s", server.ErrCustody, nodeName, res.Error)
+			return fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, nodeName, res.Error)
 		}
 
 		return fmt.Errorf("node %s could not destroy request %d: %s",
@@ -325,7 +325,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string,
 		failures := make([]error, 0, len(errs))
 
 		for _, err := range errs {
-			if !errors.Is(err, server.ErrCustody) {
+			if !errors.Is(err, dispatch.ErrCustody) {
 				failures = append(failures, err)
 			}
 		}
@@ -474,7 +474,7 @@ func heldByADrainingProcess(node string, requestID int64) error {
 	return fmt.Errorf(
 		"%w: request %d was launched by a process on %s that has since been superseded and "+
 			"is draining; it holds that lease until its compute is confirmed gone",
-		server.ErrCustody, requestID, node)
+		dispatch.ErrCustody, requestID, node)
 }
 
 // completionHolderUnavailable preserves the authoritative result until the
@@ -482,7 +482,7 @@ func heldByADrainingProcess(node string, requestID int64) error {
 func completionHolderUnavailable(node string, requestID int64) error {
 	return fmt.Errorf(
 		"%w: request %d is bound to %s, but its authoritative result has not reached that holder",
-		server.ErrHolderUnavailable, requestID, node)
+		dispatch.ErrHolderUnavailable, requestID, node)
 }
 
 // destroyOn asks one node to remove a request's compute.
@@ -527,7 +527,7 @@ func (r *Runner) destroyOn(
 		// and forgetting it here would let a later destroy be answered by a
 		// replacement that truthfully knows nothing about it.
 		if res.Custody {
-			return "", fmt.Errorf("%w: node %s: %s", server.ErrCustody, n.name, res.Error)
+			return "", fmt.Errorf("%w: node %s: %s", dispatch.ErrCustody, n.name, res.Error)
 		}
 
 		return "", fmt.Errorf("node %s could not destroy request %d: %s",
@@ -830,7 +830,7 @@ func (p *Plane) abandonLocked(n *node, pend *pending, cause error) error {
 
 		if pend.cmd.Kind == nodeapi.CommandLaunch {
 			return fmt.Errorf("%w: %w, so whether compute started is unknown",
-				server.ErrCustody, cause)
+				dispatch.ErrCustody, cause)
 		}
 
 		return cause
@@ -868,15 +868,15 @@ func commandID() (string, error) {
 }
 
 // Compile-time proof that a remote node is substitutable for a local one. If
-// server.Runner grows a method, this fails here rather than at the wiring.
-var _ server.Runner = (*Runner)(nil)
+// dispatch.Runner grows a method, this fails here rather than at the wiring.
+var _ dispatch.Runner = (*Runner)(nil)
 
 var _ = errors.Is
 
 // WireCacheAuthority is the wire's shape of an authority, or nil for the zero
 // value, which authorises nothing and need not travel.
-func WireCacheAuthority(a server.CacheAuthority) *nodeapi.CacheAuthority {
-	if a == (server.CacheAuthority{}) {
+func WireCacheAuthority(a dispatch.CacheAuthority) *nodeapi.CacheAuthority {
+	if a == (dispatch.CacheAuthority{}) {
 		return nil
 	}
 

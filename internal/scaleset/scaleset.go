@@ -19,6 +19,7 @@ import (
 
 	gh "github.com/actions/scaleset"
 
+	"github.com/junioryono/billet/internal/dispatch"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/version"
@@ -329,7 +330,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Available = append(out.Available, server.Job{
+		out.Available = append(out.Available, dispatch.Job{
 			RequestID:   j.RunnerRequestID,
 			RunID:       j.WorkflowRunID,
 			JobID:       j.JobID,
@@ -346,7 +347,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Assigned = append(out.Assigned, server.Job{
+		out.Assigned = append(out.Assigned, dispatch.Job{
 			RequestID:   j.RunnerRequestID,
 			RunID:       j.WorkflowRunID,
 			JobID:       j.JobID,
@@ -363,7 +364,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Started = append(out.Started, server.Job{
+		out.Started = append(out.Started, dispatch.Job{
 			RequestID:   j.RunnerRequestID,
 			RunID:       j.WorkflowRunID,
 			JobID:       j.JobID,
@@ -382,7 +383,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Completed = append(out.Completed, server.Job{
+		out.Completed = append(out.Completed, dispatch.Job{
 			RequestID:   j.RunnerRequestID,
 			RunID:       j.WorkflowRunID,
 			JobID:       j.JobID,

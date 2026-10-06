@@ -17,10 +17,10 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -759,7 +759,7 @@ func TestASupersededHostCanFinishItsOwnLease(t *testing.T) {
 		}
 
 		//nolint:errcheck // the launch's fate is not what this test is about
-		_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		_ = plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	awaitQueued(t, plane)
@@ -954,7 +954,7 @@ func TestAWokenPollFromASupersededProcessIsRefused(t *testing.T) {
 		}
 
 		//nolint:errcheck // the launch's fate is not what this test is about
-		_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		_ = plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	select {
@@ -1203,7 +1203,7 @@ func TestARecreatedScaleSetDoesNotWedgeTheTier(t *testing.T) {
 			}
 
 			//nolint:errcheck // the launch's fate is not what this test is about
-			_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+			_ = plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 		}()
 
 		awaitQueued(t, plane)
@@ -1385,7 +1385,7 @@ func TestATierInANonDefaultRunnerGroupCanStillMint(t *testing.T) {
 			Epoch:     1,
 		}
 
-		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		launched <- plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	awaitQueued(t, plane)
@@ -1438,7 +1438,7 @@ func TestANodeCannotMintIntoAnotherTiersScaleSet(t *testing.T) {
 
 		// Buffered and never read: this launch exists to be IN FLIGHT, and its
 		// eventual outcome is not what the test is about.
-		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+		launched <- plane.NewRunner().Launch(t.Context(), lease, dispatch.Job{RequestID: 7})
 	}()
 
 	awaitQueued(t, plane)

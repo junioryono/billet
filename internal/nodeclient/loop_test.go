@@ -1424,6 +1424,8 @@ type breaker struct {
 	// ones a plane would refuse, which is what makes a node's restraint visible.
 	failWithdrawOnce atomic.Bool
 	withdrawAttempts atomic.Int64
+	// failWithdraw refuses every withdrawal while it is set.
+	failWithdraw atomic.Bool
 }
 
 func (b *breaker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1440,7 +1442,7 @@ func (b *breaker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, "/withdraw") {
 		b.withdrawAttempts.Add(1)
 
-		if b.failWithdrawOnce.CompareAndSwap(true, false) {
+		if b.failWithdraw.Load() || b.failWithdrawOnce.CompareAndSwap(true, false) {
 			http.Error(w, "the ledger is busy", http.StatusServiceUnavailable)
 
 			return

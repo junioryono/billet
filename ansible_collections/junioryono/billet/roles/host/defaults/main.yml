@@ -282,6 +282,18 @@ billet_ceph_image_pool: billet-images
 billet_ceph_cache_pool: billet-cache
 billet_ceph_pool_size: 2
 billet_ceph_pool_min_size: 1
+# The cache pool's copies, which default to the pool size above. The cache pool
+# holds each job's root disk and the build caches, all of which a job can do
+# without, so a single-host cluster may keep one copy and halve every write a job
+# makes (junioryono/billet#394): a lost drive then fails the jobs on it and leaves
+# the caches cold, and the guest images keep billet_ceph_pool_size copies.
+billet_ceph_cache_pool_size: "{{ billet_ceph_pool_size }}"
+billet_ceph_cache_pool_min_size: "{{ billet_ceph_pool_min_size }}"
+# The OSDs' mClock profile: high_client_ops puts jobs' IO ahead of scrubbing and
+# recovery (junioryono/billet#394); balanced is Ceph's own default. It is set for
+# every OSD of the cluster, so a cluster that also serves something else sets ""
+# to leave its own policy alone.
+billet_ceph_osd_mclock_profile: high_client_ops
 billet_ceph_user: billet
 billet_ceph_keyring_path: /etc/ceph/ceph.client.billet.keyring
 

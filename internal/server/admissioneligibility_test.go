@@ -6,6 +6,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // These are #157: the admission order must never let a tier that room cannot
@@ -358,7 +359,7 @@ func TestAnOfferWaitsItsTurn(t *testing.T) {
 
 	// A fresh offer for the small tier, which fits the freed room exactly.
 	if err := small.handle(t.Context(),
-		&Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}); err != nil {
+		&Message{MessageID: 1, Available: []dispatch.Job{{RequestID: 11, RunID: 101}}}); err != nil {
 		t.Fatalf("small tier handle: %v", err)
 	}
 

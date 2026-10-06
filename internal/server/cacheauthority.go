@@ -9,6 +9,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // RunEvidence reads what GitHub records about a workflow run and a repository.
@@ -79,11 +80,11 @@ var defaultBranchReaders = map[string]bool{
 // authority unproven, and an unproven authority writes nothing: could not tell
 // is never publish.
 func DecideCacheAuthority(
-	leaseID string, binding alloc.PoolRunner, completion *Job, run WorkflowRun,
+	leaseID string, binding alloc.PoolRunner, completion *dispatch.Job, run WorkflowRun,
 	defaultBranch string,
-) CacheAuthority {
+) dispatch.CacheAuthority {
 	identity := binding.Identity
-	authority := CacheAuthority{
+	authority := dispatch.CacheAuthority{
 		LeaseID: leaseID, JobID: binding.JobID, RunID: binding.RunID,
 		Owner: identity.Owner, Repository: identity.Repository, Event: identity.Event,
 	}
@@ -224,8 +225,8 @@ const cacheAuthorityLimit = 10 * time.Second
 // which writes nothing.
 func ResolveCacheAuthority(
 	ctx context.Context, evidence RunEvidence, leaseID string, binding alloc.PoolRunner,
-	completion *Job,
-) (CacheAuthority, error) {
+	completion *dispatch.Job,
+) (dispatch.CacheAuthority, error) {
 	unproven := DecideCacheAuthority(leaseID, binding, completion, WorkflowRun{}, "")
 	identity := binding.Identity
 	if evidence == nil || binding.RunID <= 0 || identity.Owner == "" || identity.Repository == "" {
@@ -252,7 +253,7 @@ func ResolveCacheAuthority(
 // ScopedCacheAuthority is the authority a tier with the given cache
 // configuration may act on: a job of another repository than the tier's
 // namespace is not proven for it, whatever GitHub says about the job.
-func ScopedCacheAuthority(spec config.CacheSpec, authority CacheAuthority) CacheAuthority {
+func ScopedCacheAuthority(spec config.CacheSpec, authority dispatch.CacheAuthority) dispatch.CacheAuthority {
 	if spec.Publish != config.CachePublishDefaultBranch ||
 		!strings.EqualFold(authority.Owner, spec.Owner) ||
 		!strings.EqualFold(authority.Repository, spec.Repository) {
@@ -263,10 +264,10 @@ func ScopedCacheAuthority(spec config.CacheSpec, authority CacheAuthority) Cache
 }
 
 // completionCacheAuthority is the authority a completed job's destroy carries.
-func (l *Listener) completionCacheAuthority(ctx context.Context, job Job, leaseID string) CacheAuthority {
+func (l *Listener) completionCacheAuthority(ctx context.Context, job dispatch.Job, leaseID string) dispatch.CacheAuthority {
 	if l.cacheSpec.Publish != config.CachePublishDefaultBranch || l.runEvidence == nil ||
 		l.alloc == nil || leaseID == "" {
-		return CacheAuthority{}
+		return dispatch.CacheAuthority{}
 	}
 
 	binding, err := l.alloc.PoolRunnerByLease(ctx, leaseID)
@@ -274,7 +275,7 @@ func (l *Listener) completionCacheAuthority(ctx context.Context, job Job, leaseI
 		l.log.Warn("could not read the job a completed runner ran; its caches will not publish",
 			"tier", l.tier, "lease", leaseID, "error", err)
 
-		return CacheAuthority{}
+		return dispatch.CacheAuthority{}
 	}
 	authority, err := ResolveCacheAuthority(ctx, l.runEvidence, leaseID, binding, &job)
 	if err != nil {

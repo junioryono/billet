@@ -96,19 +96,64 @@
   changed_when: false
   become: true
 
+# ONE COPY IS A DECISION CEPH MAKES YOU STATE TWICE: the monitors refuse a size of
+# 1 until mon_allow_pool_size_one is set, and the pool command until it is told
+# --yes-i-really-mean-it. Both are said only where an inventory asked for it.
+- name: Allow a billet Ceph pool to keep a single copy
+  ansible.builtin.command:
+    argv: [ceph, config, set, global, mon_allow_pool_size_one, "true"]
+  when: (billet_ceph_pool_size | int) == 1 or (billet_ceph_cache_pool_size | int) == 1
+  changed_when: false
+  become: true
+
 - name: Configure billet Ceph pool replication
   ansible.builtin.command:
     argv: [ceph, osd, pool, set, "{{ item.0 }}", "{{ item.1 }}", "{{ item.2 }}"]
   loop:
     - ["{{ billet_ceph_image_pool }}", size, "{{ billet_ceph_pool_size }}"]
     - ["{{ billet_ceph_image_pool }}", min_size, "{{ billet_ceph_pool_min_size }}"]
-    - ["{{ billet_ceph_cache_pool }}", size, "{{ billet_ceph_pool_size }}"]
-    - ["{{ billet_ceph_cache_pool }}", min_size, "{{ billet_ceph_pool_min_size }}"]
+    - ["{{ billet_ceph_cache_pool }}", size, "{{ billet_ceph_cache_pool_size }}"]
+    - ["{{ billet_ceph_cache_pool }}", min_size, "{{ billet_ceph_cache_pool_min_size }}"]
+  when: item.1 != 'size' or (item.2 | int) > 1
+  changed_when: false
+  become: true
+
+- name: Keep a single copy of each billet Ceph pool asked to
+  ansible.builtin.command:
+    argv: [ceph, osd, pool, set, "{{ item.0 }}", size, "1", --yes-i-really-mean-it]
+  loop:
+    - ["{{ billet_ceph_image_pool }}", "{{ billet_ceph_pool_size }}"]
+    - ["{{ billet_ceph_cache_pool }}", "{{ billet_ceph_cache_pool_size }}"]
+  when: (item.1 | int) == 1
+  changed_when: false
+  become: true
+
+# NEVER MUTED. Ceph can only mute POOL_NO_REDUNDANCY for the whole cluster, which
+# would also hide a pool left with one copy by mistake, so the health alert
+# (ceph-health.sh) drops it only for the pools this inventory chose. Unmuting
+# answers success when nothing is muted, so a failure here is a real one.
+- name: Keep the no-redundancy warning unmuted
+  ansible.builtin.command:
+    argv: [ceph, health, unmute, POOL_NO_REDUNDANCY]
   changed_when: false
   become: true
 
 - name: Require clone-v2-compatible Ceph clients
   ansible.builtin.command: ceph osd set-require-min-compat-client mimic
+  changed_when: false
+  become: true
+
+# JOBS' IO BEFORE SCRUBBING AND RECOVERY (junioryono/billet#394). The cluster
+# exists to serve guests' disks, and on 2026-10-05 a deep scrub ran on drives
+# the trash purge already held near saturation while every job waited. mClock's
+# high_client_ops profile gives client requests the larger share of each OSD,
+# so scrubbing and recovery take longer instead of slowing the jobs. A cluster
+# setting, for every OSD: an empty profile leaves a shared cluster's own policy
+# alone.
+- name: Let Ceph serve client IO ahead of scrubbing and recovery
+  ansible.builtin.command:
+    argv: [ceph, config, set, osd, osd_mclock_profile, "{{ billet_ceph_osd_mclock_profile }}"]
+  when: billet_ceph_osd_mclock_profile | length > 0
   changed_when: false
   become: true
 

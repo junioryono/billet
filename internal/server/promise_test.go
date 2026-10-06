@@ -7,6 +7,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // wiredListeners builds one listener per tier the way the control plane does,
@@ -49,7 +50,7 @@ func TestReleasingIdleEscrowNeverTouchesAPromisedLease(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := l.reserve([]resolvedJob{{job: Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
+	if got := l.reserve([]resolvedJob{{job: dispatch.Job{RequestID: 11}}}); !slices.Equal(got, []int64{11}) {
 		t.Fatalf("reserved %v, want request 11", got)
 	}
 
@@ -105,7 +106,7 @@ func TestAnAmbiguousAcquisitionKeepsItsPromiseAndItsCharge(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err := donor.acquire(t.Context(), []Job{{RequestID: 11, RunID: 101}}); !errors.Is(err, want) {
+			if err := donor.acquire(t.Context(), []dispatch.Job{{RequestID: 11, RunID: 101}}); !errors.Is(err, want) {
 				t.Fatalf("acquire = %v, want %v", err, want)
 			}
 
@@ -143,8 +144,8 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 
 	if err := work.handle(t.Context(), &Message{
 		MessageID: 1,
-		Available: []Job{{RequestID: 11, RunID: 101}},
-		Completed: []Job{{RequestID: 11, RunID: 101}},
+		Available: []dispatch.Job{{RequestID: 11, RunID: 101}},
+		Completed: []dispatch.Job{{RequestID: 11, RunID: 101}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,16 +190,16 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 				t.Fatalf("anonymous pool runner = %+v, err %v", members, err)
 			}
 			member := members[0]
-			actual := Job{RequestID: 12, RunID: 101, JobID: "completed-job",
+			actual := dispatch.Job{RequestID: 12, RunID: 101, JobID: "completed-job",
 				RunnerID: 77, RunnerName: member.RunnerName, Result: "Succeeded"}
-			available := []Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}}
+			available := []dispatch.Job{{RequestID: actual.RequestID, RunID: actual.RunID, JobID: actual.JobID}}
 			var want []int64
 			if unrelated {
-				available = append(available, Job{RequestID: member.LaunchRequestID, RunID: 102, JobID: "unfinished-job"})
+				available = append(available, dispatch.Job{RequestID: member.LaunchRequestID, RunID: 102, JobID: "unfinished-job"})
 				want = []int64{member.LaunchRequestID}
 			}
 			if err := work.handle(t.Context(), &Message{
-				MessageID: 2, Started: []Job{actual}, Completed: []Job{actual}, Available: available,
+				MessageID: 2, Started: []dispatch.Job{actual}, Completed: []dispatch.Job{actual}, Available: available,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -239,8 +240,8 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 			if err := work.refillEscrow(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			actual := Job{RequestID: 11, RunID: 101, JobID: "completed-job"}
-			if err := work.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{actual}}); err != nil {
+			actual := dispatch.Job{RequestID: 11, RunID: 101, JobID: "completed-job"}
+			if err := work.handle(t.Context(), &Message{MessageID: 1, Assigned: []dispatch.Job{actual}}); err != nil {
 				t.Fatal(err)
 			}
 			members, err := a.PoolRunners(t.Context(), work.tier)
@@ -248,20 +249,20 @@ func TestCancelledOfferDoesNotCreateAPromise(t *testing.T) {
 				t.Fatalf("launched runner = %+v, err %v; want request 11", members, err)
 			}
 			actual.RunnerID, actual.RunnerName = 77, members[0].RunnerName
-			if err := work.handle(t.Context(), &Message{MessageID: 2, Started: []Job{actual}}); err != nil {
+			if err := work.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{actual}}); err != nil {
 				t.Fatal(err)
 			}
 			binding, err := a.PoolRunnerByName(t.Context(), actual.RunnerName)
 			if err != nil || binding.Status != alloc.PoolRunnerBusy || binding.ActualRequestID != 11 || binding.JobID != actual.JobID {
 				t.Fatalf("busy binding = %+v, err %v; want actual request 11", binding, err)
 			}
-			completion := Job{RunnerName: actual.RunnerName, Result: "Cancelled"}
+			completion := dispatch.Job{RunnerName: actual.RunnerName, Result: "Cancelled"}
 			if tc.keepJobID {
 				completion.JobID = actual.JobID
 			}
 			if err := work.handle(t.Context(), &Message{
-				MessageID: 3, Completed: []Job{completion},
-				Available: []Job{{RequestID: tc.offerRequestID, RunID: actual.RunID, JobID: actual.JobID}},
+				MessageID: 3, Completed: []dispatch.Job{completion},
+				Available: []dispatch.Job{{RequestID: tc.offerRequestID, RunID: actual.RunID, JobID: actual.JobID}},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -306,8 +307,8 @@ func TestAssignedAndCancelledDirectJobNeverLaunches(t *testing.T) {
 	}
 	err := work.handle(t.Context(), &Message{
 		MessageID: 1,
-		Assigned:  []Job{{JobID: "J"}},
-		Completed: []Job{{JobID: "J", Result: "Cancelled"}},
+		Assigned:  []dispatch.Job{{JobID: "J"}},
+		Completed: []dispatch.Job{{JobID: "J", Result: "Cancelled"}},
 	})
 	if len(launched) != 0 || work.Running() != 0 || work.Acquiring() != 0 {
 		t.Errorf("cancelled direct job launched %v, running %d, promises %d; want none",

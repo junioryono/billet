@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // waitForQueued waits for one command to be queued for a node, so a test that
@@ -52,7 +52,7 @@ func TestACacheConfiguredTierIsNotLaunchedOnAnOlderNode(t *testing.T) {
 	// polls.
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := p.NewRunner().Launch(ctx, testLease(), server.Job{RequestID: 7})
+	err := p.NewRunner().Launch(ctx, testLease(), dispatch.Job{RequestID: 7})
 	if !errors.Is(err, ErrNoNode) || !strings.Contains(err.Error(), "cannot honour") {
 		t.Fatalf("launch = %v, want ErrNoNode naming the cache block", err)
 	}
@@ -76,7 +76,7 @@ func TestAnOlderProcessCannotTakeACacheConfiguredLaunchQueuedForANewerOne(t *tes
 
 	launched := make(chan error, 1)
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 	waitForQueued(t, p, "n1")
 
@@ -104,7 +104,7 @@ func TestACurrentNodeReceivesTheTiersCacheConfiguration(t *testing.T) {
 
 	launched := make(chan error, 1)
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	cmd, took, err := p.Poll(t.Context(), "n1", "")
@@ -131,16 +131,16 @@ func TestACompletionsCacheAuthorityRidesOnItsDestroy(t *testing.T) {
 	p := testPlane(t, WithCommandTimeout(5*time.Second))
 	register(t, p, "n1", config.ProviderDocker)
 
-	authority := server.CacheAuthority{LeaseID: "l1", JobID: "job-7", RunID: 31, Owner: "acme",
+	authority := dispatch.CacheAuthority{LeaseID: "l1", JobID: "job-7", RunID: 31, Owner: "acme",
 		Repository: "api", Event: "push", Ref: "refs/heads/main", DefaultRef: "refs/heads/main",
 		Proven: true, WriteOwnRef: true, PublishDefault: true}
 
 	for _, tc := range []struct {
-		authority server.CacheAuthority
+		authority dispatch.CacheAuthority
 		want      *nodeapi.CacheAuthority
 	}{
 		{authority: authority, want: WireCacheAuthority(authority)},
-		{authority: server.CacheAuthority{}, want: nil},
+		{authority: dispatch.CacheAuthority{}, want: nil},
 	} {
 		done := make(chan error, 1)
 		go func() {

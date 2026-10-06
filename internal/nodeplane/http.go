@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
@@ -2030,7 +2031,7 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 // answered.
 func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	leaseID := r.PathValue("lease")
-	unproven := server.CacheAuthority{LeaseID: leaseID}
+	unproven := dispatch.CacheAuthority{LeaseID: leaseID}
 	lease, err := h.store.Lease(r.Context(), leaseID)
 	if err != nil {
 		writeStoreErr(w, err)
@@ -2056,7 +2057,7 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec := tier.EffectiveCache()
-	answer := func(a server.CacheAuthority) {
+	answer := func(a dispatch.CacheAuthority) {
 		writeJSON(w, http.StatusOK, nodeapi.CacheAuthorityResponse{
 			Authority: *nodeapiAuthority(server.ScopedCacheAuthority(spec, a)),
 		})
@@ -2077,7 +2078,7 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	}
 	authority := h.authorities.resolve(r.Context(), leaseID, binding, time.Now(), func(
 		ctx context.Context,
-	) (server.CacheAuthority, bool) {
+	) (dispatch.CacheAuthority, bool) {
 		authority, err := server.ResolveCacheAuthority(ctx, evidence, leaseID, binding, nil)
 		if err != nil {
 			h.log.Warn("could not read GitHub's record of a running job; its caches stay read-only",
@@ -2106,7 +2107,7 @@ type authorityMemory struct {
 }
 
 type rememberedAuthority struct {
-	authority server.CacheAuthority
+	authority dispatch.CacheAuthority
 	until     time.Time
 	// asking is closed when the question in flight is answered; nil when none
 	// is.
@@ -2115,8 +2116,8 @@ type rememberedAuthority struct {
 
 func (m *authorityMemory) resolve(
 	ctx context.Context, leaseID string, binding alloc.PoolRunner, now time.Time,
-	ask func(context.Context) (server.CacheAuthority, bool),
-) server.CacheAuthority {
+	ask func(context.Context) (dispatch.CacheAuthority, bool),
+) dispatch.CacheAuthority {
 	key := leaseID + "\x00" + binding.JobID + "\x00" + strconv.FormatInt(binding.RunID, 10)
 	m.mu.Lock()
 	if m.entries == nil {
@@ -2149,7 +2150,7 @@ func (m *authorityMemory) resolve(
 
 	// ANSWERED WHATEVER ask DOES, a panic included, or every waiter on this key
 	// would wait forever.
-	authority, decided := server.CacheAuthority{}, false
+	authority, decided := dispatch.CacheAuthority{}, false
 	defer func() {
 		m.mu.Lock()
 		entry.authority, entry.until = authority, now.Add(authorityUndecidedFor)
@@ -2167,7 +2168,7 @@ func (m *authorityMemory) resolve(
 
 // nodeapiAuthority is WireCacheAuthority that never answers nil, for a
 // response that always carries one.
-func nodeapiAuthority(a server.CacheAuthority) *nodeapi.CacheAuthority {
+func nodeapiAuthority(a dispatch.CacheAuthority) *nodeapi.CacheAuthority {
 	if wire := WireCacheAuthority(a); wire != nil {
 		return wire
 	}

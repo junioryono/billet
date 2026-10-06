@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
-	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // GITHUB IS ASKED ONCE ABOUT A JOB WHOSE ANSWER IT DECIDED, however many of the
@@ -23,9 +23,9 @@ func TestAJobsAuthorityIsAskedOnceAndRemembered(t *testing.T) {
 		var asked atomic.Int64
 		now := time.Now()
 		binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
-		want := server.CacheAuthority{LeaseID: "l1", JobID: "job-1", RunID: 31, Proven: true, WriteOwnRef: true}
+		want := dispatch.CacheAuthority{LeaseID: "l1", JobID: "job-1", RunID: 31, Proven: true, WriteOwnRef: true}
 		release := make(chan struct{})
-		decided := func(context.Context) (server.CacheAuthority, bool) {
+		decided := func(context.Context) (dispatch.CacheAuthority, bool) {
 			asked.Add(1)
 			<-release
 
@@ -33,7 +33,7 @@ func TestAJobsAuthorityIsAskedOnceAndRemembered(t *testing.T) {
 		}
 
 		const callers = 8
-		answers := make(chan server.CacheAuthority, callers)
+		answers := make(chan dispatch.CacheAuthority, callers)
 		for range callers {
 			go func() { answers <- memory.resolve(t.Context(), "l1", binding, now, decided) }()
 		}
@@ -65,10 +65,10 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var memory authorityMemory
 		now := time.Now()
-		first := server.CacheAuthority{LeaseID: "l1", JobID: "job-1", RunID: 31, Proven: true}
-		second := server.CacheAuthority{LeaseID: "l1", JobID: "job-2", RunID: 32}
+		first := dispatch.CacheAuthority{LeaseID: "l1", JobID: "job-1", RunID: 31, Proven: true}
+		second := dispatch.CacheAuthority{LeaseID: "l1", JobID: "job-2", RunID: 32}
 		release := make(chan struct{})
-		firstDone, secondDone := make(chan server.CacheAuthority, 1), make(chan server.CacheAuthority, 1)
+		firstDone, secondDone := make(chan dispatch.CacheAuthority, 1), make(chan dispatch.CacheAuthority, 1)
 		defer func() {
 			close(release)
 			if got := <-firstDone; got != first {
@@ -77,7 +77,7 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 		}()
 		go func() {
 			firstDone <- memory.resolve(t.Context(), "l1", alloc.PoolRunner{JobID: "job-1", RunID: 31}, now,
-				func(context.Context) (server.CacheAuthority, bool) {
+				func(context.Context) (dispatch.CacheAuthority, bool) {
 					<-release
 
 					return first, true
@@ -86,7 +86,7 @@ func TestAnotherJobIsAskedOnItsOwnWhileTheFirstIsInFlight(t *testing.T) {
 		synctest.Wait()
 		go func() {
 			secondDone <- memory.resolve(t.Context(), "l1", alloc.PoolRunner{JobID: "job-2", RunID: 32}, now,
-				func(context.Context) (server.CacheAuthority, bool) { return second, true })
+				func(context.Context) (dispatch.CacheAuthority, bool) { return second, true })
 		}()
 		synctest.Wait()
 		select {
@@ -112,8 +112,8 @@ func TestACouldNotTellAnswerIsAskedAgainSoon(t *testing.T) {
 	now := time.Now()
 	binding := alloc.PoolRunner{JobID: "job-1", RunID: 31}
 	var asked atomic.Int64
-	unproven := server.CacheAuthority{LeaseID: "l2", JobID: "job-1", RunID: 31}
-	couldNotTell := func(context.Context) (server.CacheAuthority, bool) {
+	unproven := dispatch.CacheAuthority{LeaseID: "l2", JobID: "job-1", RunID: 31}
+	couldNotTell := func(context.Context) (dispatch.CacheAuthority, bool) {
 		asked.Add(1)
 
 		return unproven, false
@@ -143,16 +143,16 @@ func TestAPanickingQuestionReleasesItsWaiters(t *testing.T) {
 					t.Error("the question did not panic")
 				}
 			}()
-			memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (server.CacheAuthority, bool) {
+			memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (dispatch.CacheAuthority, bool) {
 				<-release
 				panic("github client")
 			})
 		}()
 		synctest.Wait()
-		waiter := make(chan server.CacheAuthority, 1)
+		waiter := make(chan dispatch.CacheAuthority, 1)
 		go func() {
-			waiter <- memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (server.CacheAuthority, bool) {
-				return server.CacheAuthority{Proven: true}, true
+			waiter <- memory.resolve(t.Context(), "l1", binding, now, func(context.Context) (dispatch.CacheAuthority, bool) {
+				return dispatch.CacheAuthority{Proven: true}, true
 			})
 		}()
 		synctest.Wait()

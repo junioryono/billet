@@ -7,6 +7,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 type recordedResult struct{ lease, result string }
@@ -22,7 +23,7 @@ type runnerlessPool struct {
 	results   []recordedResult
 }
 
-func newRunnerlessPool(t *testing.T, assigned ...Job) *runnerlessPool {
+func newRunnerlessPool(t *testing.T, assigned ...dispatch.Job) *runnerlessPool {
 	t.Helper()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
@@ -66,9 +67,9 @@ func (p *runnerlessPool) launchedFor11(t *testing.T) alloc.PoolRunner {
 }
 
 var (
-	job11 = Job{RequestID: 11, RunID: 101, JobID: "job-11"}
-	job12 = Job{RequestID: 12, RunID: 102, JobID: "job-12"}
-	job13 = Job{RequestID: 13, RunID: 103, JobID: "job-13"}
+	job11 = dispatch.Job{RequestID: 11, RunID: 101, JobID: "job-11"}
+	job12 = dispatch.Job{RequestID: 12, RunID: 102, JobID: "job-12"}
+	job13 = dispatch.Job{RequestID: 13, RunID: 103, JobID: "job-13"}
 )
 
 // A RUNNER-LESS CANCELLATION IS NOT THE END OF A RUNNER BUSY WITH ANOTHER JOB.
@@ -92,7 +93,7 @@ func TestARunnerlessCancellationDoesNotSettleARunnerBusyWithAnotherJob(t *testin
 	started := job12
 	started.RunnerID, started.RunnerName = 77, swapped.RunnerName
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("start job 12 on the runner launched for 11: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestARunnerlessCancellationDoesNotSettleARunnerBusyWithAnotherJob(t *testin
 	canceled := job11
 	canceled.Result = "Canceled"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{canceled},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{canceled},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("the runner-less cancellation was refused: %v", err)
 	}
@@ -133,7 +134,7 @@ func TestARunnerlessCancellationDoesNotSettleARunnerBusyWithAnotherJob(t *testin
 	succeeded := started
 	succeeded.Result = "Succeeded"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 4, Completed: []Job{succeeded},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 4, Completed: []dispatch.Job{succeeded},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("job 12's own completion was refused: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestARunnerlessCancellationStillFinishesItsJob(t *testing.T) {
 	started := job12
 	started.RunnerID, started.RunnerName = 77, swapped.RunnerName
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("start job 12 on the runner launched for 11: %v", err)
 	}
@@ -170,8 +171,8 @@ func TestARunnerlessCancellationStillFinishesItsJob(t *testing.T) {
 
 	// The runner's own completion in the same message frees the launch identity
 	// 11, so nothing but the finished job itself stands between it and the offer.
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{canceled, succeeded},
-		Available: []Job{job11, job13}, Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{canceled, succeeded},
+		Available: []dispatch.Job{job11, job13}, Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("the runner-less cancellation was refused: %v", err)
 	}
 
@@ -194,7 +195,7 @@ func TestARunnerlessCancellationRetiresTheIdleRunnerLaunchedForIt(t *testing.T) 
 
 	// No statistics, or the pool's reconciliation to them would retire the idle
 	// runner whatever the completion did.
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{canceled}}); err != nil {
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{canceled}}); err != nil {
 		t.Fatalf("the runner-less cancellation was refused: %v", err)
 	}
 
@@ -215,7 +216,7 @@ func TestARunnerlessCompletionOfTheRunnersOwnJobSettlesIt(t *testing.T) {
 	started := job11
 	started.RunnerID, started.RunnerName = 77, own.RunnerName
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("start job 11 on its own runner: %v", err)
 	}
@@ -223,7 +224,7 @@ func TestARunnerlessCompletionOfTheRunnersOwnJobSettlesIt(t *testing.T) {
 	succeeded := job11
 	succeeded.Result = "Succeeded"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{succeeded},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{succeeded},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("the completion was refused: %v", err)
 	}
@@ -254,7 +255,7 @@ func TestARunnerlessCancellationDoesNotSettleARecoveredBusyRunner(t *testing.T) 
 	canceled := job11
 	canceled.Result = "Canceled"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{canceled}}); err != nil {
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Completed: []dispatch.Job{canceled}}); err != nil {
 		t.Fatalf("the runner-less cancellation was refused: %v", err)
 	}
 

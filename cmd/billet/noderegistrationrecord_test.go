@@ -18,11 +18,11 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/regularfile"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -37,7 +37,7 @@ import (
 
 type stubCompute struct{}
 
-func (stubCompute) Launch(context.Context, *alloc.Lease, *nodeapi.TierSpec, server.Job) error {
+func (stubCompute) Launch(context.Context, *alloc.Lease, *nodeapi.TierSpec, dispatch.Job) error {
 	return errors.New("no launches here")
 }
 func (stubCompute) Destroy(context.Context, int64) error                     { return nil }
@@ -49,7 +49,7 @@ func (stubCompute) Tend(context.Context) error                               { r
 func (stubCompute) AssumeCustody(context.Context, *alloc.Lease, int64) error { return nil }
 func (stubCompute) Holding() bool                                            { return false }
 func (stubCompute) Superseded()                                              {}
-func (stubCompute) DestroyCompleted(context.Context, int64, string, server.CacheAuthority) error {
+func (stubCompute) DestroyCompleted(context.Context, int64, string, dispatch.CacheAuthority) error {
 	return nil
 }
 

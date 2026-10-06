@@ -317,7 +317,13 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 				// READ AT THE INSTANT OF THE ADVERTISEMENT, inside the poll, so the
 				// two describe one moment. Read afterwards it would describe a
 				// listener that has already released everything on the way out.
-				u, err := a.Usage(ctx)
+				//
+				// ON THE TEST'S CONTEXT, NOT THE RUN'S. The goroutine below cancels
+				// ctx to end the run, and a poll landing at that instant read with
+				// a cancelled context and failed the test on "context canceled"
+				// (CI run 37196761416, 2026-10-04): a fact about the shutdown, not
+				// the ledger.
+				u, err := a.Usage(t.Context())
 
 				mu.Lock()
 				advertised = append(advertised, capacity)

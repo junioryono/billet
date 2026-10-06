@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // A POOLED RUNNER'S HISTORY ROW NAMES THE JOB GITHUB GAVE IT, and the
@@ -22,7 +23,7 @@ func TestAPooledJobsHistoryNamesTheJobItRan(t *testing.T) {
 	started.Owner, started.Repository = "acme", "api"
 	started.WorkflowRef = "acme/api/.github/workflows/ci.yml@refs/heads/main"
 
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("start job 11: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestAPooledJobsHistoryNamesTheJobItRan(t *testing.T) {
 	completed := started
 	completed.Result = "Succeeded"
 	completed.JobName = "test (ubuntu-latest)"
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{completed},
 		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
 		t.Fatalf("complete job 11: %v", err)
 	}
@@ -71,14 +72,14 @@ func TestASwappedPoolRunnersHistoryNamesTheJobItRan(t *testing.T) {
 	started.RunnerID, started.RunnerName = 77, swapped.RunnerName
 	started.Event = "push"
 	started.WorkflowRef = "acme/api/.github/workflows/ci.yml@refs/heads/main"
-	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []Job{started},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
 		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
 		t.Fatalf("start job 12 on the runner launched for 11: %v", err)
 	}
 
 	completed := started
 	completed.Result, completed.JobName = "Succeeded", "ran"
-	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed},
+	if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{completed},
 		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
 		t.Fatalf("complete job 12: %v", err)
 	}

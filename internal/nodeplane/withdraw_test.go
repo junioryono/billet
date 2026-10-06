@@ -11,8 +11,8 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/server"
 )
 
 // registerAs registers the docker host n1 as one named process.
@@ -205,7 +205,7 @@ func TestAWithdrawalAnswersQueuedLaunchesAsNeverStarted(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		done <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitFor(t, "the launch to be queued", func() bool { return p.QueuedForTest("n1") == 1 })
@@ -220,7 +220,7 @@ func TestAWithdrawalAnswersQueuedLaunchesAsNeverStarted(t *testing.T) {
 			t.Fatal("a launch queued for a node that withdrew reported success")
 		}
 
-		if errors.Is(err, server.ErrCustody) {
+		if errors.Is(err, dispatch.ErrCustody) {
 			t.Errorf("a launch the node never took was answered with custody: %v", err)
 		}
 
@@ -247,7 +247,7 @@ func TestAWithdrawalWithALaunchInFlightHandsTheNodeCustody(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		done <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitFor(t, "the launch to be queued", func() bool { return p.QueuedForTest("n1") == 1 })
@@ -263,7 +263,7 @@ func TestAWithdrawalWithALaunchInFlightHandsTheNodeCustody(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, server.ErrCustody) {
+		if !errors.Is(err, dispatch.ErrCustody) {
 			t.Fatalf("a launch in flight when its node withdrew = %v, want custody", err)
 		}
 	case <-time.After(10 * time.Second):
@@ -400,7 +400,7 @@ func TestALateDestroyResultAfterAWithdrawalStillEndsOwnership(t *testing.T) {
 	launched := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitFor(t, "the launch to be queued", func() bool { return p.QueuedForTest("n1") == 1 })
@@ -496,7 +496,7 @@ func TestALateDestroyResultAfterExpiryStillEndsOwnership(t *testing.T) {
 	launched := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(launchCtx, testLease(), server.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(launchCtx, testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	waitFor(t, "the launch to be queued", func() bool { return p.QueuedForTest("n1") == 1 })

@@ -14,11 +14,11 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/codebuild"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -624,7 +624,7 @@ func TestAJobReachesACodeBuildBuild(t *testing.T) {
 
 	if err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 601, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 601, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -692,7 +692,7 @@ func TestARestartReadoptsACodeBuildBuildWithoutStoppingIt(t *testing.T) {
 
 	if err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 602, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 602, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -790,14 +790,14 @@ func TestTheControlPlaneSweepsARegistrationADeadNodeLeftBehind(t *testing.T) {
 	dead := s.assignedLease(t, 606)
 	if err := s.runner.Launch(t.Context(), dead,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 606, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 606, Event: "push"}); err != nil {
 		t.Fatalf("Launch(dead): %v", err)
 	}
 
 	alive := s.assignedLease(t, 607)
 	if err := s.runner.Launch(t.Context(), alive,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 607, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 607, Event: "push"}); err != nil {
 		t.Fatalf("Launch(alive): %v", err)
 	}
 
@@ -896,7 +896,7 @@ func TestADrainNeverStopsARunningCodeBuildBuild(t *testing.T) {
 
 	if err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 603, Event: "push"}); err != nil {
+		dispatch.Job{RequestID: 603, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -939,7 +939,7 @@ func TestUntrustedWorkNeverReachesCodeBuild(t *testing.T) {
 
 	err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(untrusted, config.ProviderCodeBuild),
-		server.Job{RequestID: 604, Event: "pull_request"})
+		dispatch.Job{RequestID: 604, Event: "pull_request"})
 	if err == nil {
 		t.Fatal("untrusted work reached the CodeBuild backend")
 	}
@@ -980,7 +980,7 @@ func TestACodeBuildNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 
 	err := s.runner.Launch(t.Context(), lease,
 		nodeapi.TierSpecOf(s.tier, config.ProviderCodeBuild),
-		server.Job{RequestID: 605, Event: "push"})
+		dispatch.Job{RequestID: 605, Event: "push"})
 	if err == nil {
 		t.Fatal("a lease that does not accept codebuild was launched anyway")
 	}
