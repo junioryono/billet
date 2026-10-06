@@ -55,6 +55,12 @@ const (
 	casAttachBackoff = 5 * time.Minute
 )
 
+// casFillDefault is the fill at which a new CacheService stops caching: always
+// casFullFraction. A variable only so this package's tests run whatever the fill
+// of the disk under them (main_test.go), and that file checks it is still the
+// constant before it changes it.
+var casFillDefault = casFullFraction
+
 // errCASBackoff is a transfer refused because its kind's attach failed within
 // casAttachBackoff; the failure itself was logged when it happened.
 var errCASBackoff = errors.New("the cache could not be attached recently, so it is not tried again yet")
