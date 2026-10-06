@@ -72,6 +72,10 @@
             dest: "{{ billet_gate_health_root.path }}/health.sh"
             mode: '0700'
           vars:
+            billet_ceph_image_pool: billet-images
+            billet_ceph_pool_size: 2
+            billet_ceph_cache_pool: billet-cache
+            billet_ceph_cache_pool_size: 1
             billet_gate_health_stubs: |
               ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
               mail() { return 99; }
@@ -153,6 +157,10 @@
             dest: "{{ billet_gate_health_root.path }}/health.sh"
             mode: '0700'
           vars:
+            billet_ceph_image_pool: billet-images
+            billet_ceph_pool_size: 2
+            billet_ceph_cache_pool: billet-cache
+            billet_ceph_cache_pool_size: 1
             billet_gate_health_stubs: |
               ceph() { printf 'HEALTH_OK cluster is healthy\n'; }
               mail() { return 99; }
