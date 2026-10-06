@@ -77,11 +77,13 @@ func TestEveryDrainingStopInTheRoleIsRequestedFirstAndReleasedAfter(t *testing.T
 			sameConditions: true,
 		},
 		{
-			file:           "services.yml",
-			request:        "Make the stop of a node that may not run here a drain",
-			stop:           "Stop and disable the billet node unless it may run here",
-			release:        "Withdraw the drain request now that the node is where this converge leaves it",
-			sameConditions: true,
+			// NARROWED TO A NODE THAT IS UP: an inactive or failed unit has no
+			// process for the stop to drain, and asking anyway on a host that runs
+			// no node changed it on every converge.
+			file:    "services.yml",
+			request: "Make the stop of a node that may not run here a drain",
+			stop:    "Stop and disable the billet node unless it may run here",
+			release: "Withdraw the drain request now that the node is where this converge leaves it",
 		},
 		{
 			file:    "services.yml",
