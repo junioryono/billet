@@ -907,11 +907,28 @@
   become: true
   notify: billet unit files changed
 
+# ONLY A NODE THAT IS UP HAS A STOP TO DRAIN. A host that runs no node (the
+# controller of a split deployment) would otherwise write the request and
+# withdraw it on every converge, and a converge that changes something every
+# time is not idempotent. Anything but inactive or failed may still hold a
+# process (activating, deactivating, reloading), so it is asked.
+- name: Inspect the billet node a host that may not run one still has
+  ansible.builtin.command:
+    argv: [systemctl, is-active, billet-node.service]
+  register: billet_node_unwanted_state
+  changed_when: false
+  failed_when: billet_node_unwanted_state.rc not in [0, 3, 4]
+  when:
+    - not billet_node_should_run
+    - not ansible_check_mode
+  become: true
+
 - name: Make the stop of a node that may not run here a drain
   ansible.builtin.include_tasks: request-node-drain.yml
   when:
     - not billet_node_should_run
     - not ansible_check_mode
+    - billet_node_unwanted_state.stdout | default('') not in ['inactive', 'failed']
 
 - name: Stop and disable the billet node unless it may run here
   ansible.builtin.systemd_service:
