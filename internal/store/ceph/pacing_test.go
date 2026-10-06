@@ -189,7 +189,10 @@ func TestTheImportWritesAtItsRateAndFlushesAsItGoes(t *testing.T) {
 			syncs++
 			unsynced = 0
 		case strings.HasPrefix(event, "write "):
-			n, _ := strconv.Atoi(strings.TrimPrefix(event, "write "))
+			n, err := strconv.Atoi(strings.TrimPrefix(event, "write "))
+			if err != nil {
+				t.Fatalf("the recorder logged %q, which names no byte count: %v", event, err)
+			}
 			unsynced += n
 			if unsynced > flushEvery {
 				t.Fatalf("%d bytes were written without a sync: %v", unsynced, recorder.events)

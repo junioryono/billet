@@ -22,10 +22,63 @@ TF_MODULES       := $(patsubst %/,%,$(sort $(dir $(shell find terraform/modules 
 BIN              := bin/billet
 COVERPROFILE     := coverage.out
 
+# A LOCAL GATE SHARES THE MACHINE; CI'S RUNS AS IT ALWAYS DID. Measured on a
+# 12-core, 32 GiB Mac on 2026-10-05: `go test -race ./...` at go's default -p
+# (one package per CPU) peaked at 3.36 GiB resident over 96 processes, and beside
+# a container VM holding 24 GiB it pushed swap from 33.4 to 39.4 GiB, at which
+# point DNS and the VPN client stalled with everything else. At -p 4 the same
+# step peaked at 0.99 GiB over 56 processes and finished sooner (2049s against
+# 2299s). So outside CI the race build runs at most TEST_PARALLEL packages at
+# once, and the heavy steps run under nice. nice rather than macOS's taskpolicy:
+# the same package took 37s under nice -n 10 and 27s to 119s unprioritised as
+# the machine's load moved, but 205s clamped to the utility QoS and 485s at
+# background QoS, which throttle disk I/O as well as CPU. Override either on the
+# command line (`make check TEST_PARALLEL= NICE=` lifts both, and still takes the
+# lock below). Under CI both are forced empty, whatever the environment says:
+# CI runs the targets one by one with go test's own -p and no nice.
+ifeq ($(CI),)
+TEST_PARALLEL ?= 4
+NICE          ?= nice -n 10
+GO_TEST_P     := $(if $(TEST_PARALLEL),-p $(TEST_PARALLEL))
+else
+override NICE      :=
+override GO_TEST_P :=
+endif
+
+# ONE GATE AT A TIME PER MACHINE, across projects. Two sessions, two worktrees
+# or two repositories running their gates together is how the measurement above
+# became a starved machine, so `check` takes a lock and a run waits for whichever
+# gate holds it (see scripts/with-check-lock.sh). Left empty, CHECK_LOCK means
+# the path every repository's gate shares, which the script works out: make's
+# word functions would split an XDG_CACHE_HOME holding spaces into another path.
+# It is a courtesy, not a gate: without a lock tool, or a lock that cannot be
+# taken, the run goes ahead and says so.
+CHECK_LOCK ?=
+
+# A dry run (-n), a question (-q) or a touch (-t) runs no step, so it takes no
+# lock. GNU make runs a recipe line naming $(MAKE) even under those modes, and
+# the lock would then make `make -n check` wait behind a whole gate; a line that
+# reaches make through another variable is not treated as recursive, so under
+# them it is printed or skipped and never run (measured on GNU Make 3.81: -n
+# prints it, -q answers 1, -t touches nothing because check is phony). It is
+# decided by make itself rather than by reading MAKEFLAGS, whose layout varies:
+# reading its first word took `make check CHECK_LOCK=/tmp/x` for a touch and ran
+# it without the lock. `make -n check-unlocked` lists the steps. The cost: make
+# hands its jobserver only to a line it treats as recursive, so on GNU Make 3.81
+# to 4.3 `make -j check` runs the steps one at a time (the sub-make warns and
+# suggests a `+`), which suits a machine this gate shares. Never add the `+`: it
+# would make the line recursive again and bring the -n wait back. For parallel
+# steps, `make check CHECK_SUBMAKE='$(MAKE) -j4'`.
+CHECK_SUBMAKE = $(MAKE)
+
 .DEFAULT_GOAL := check
 
 .PHONY: check
-check: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The pre-commit gate (CI runs this and more)
+check: ## The pre-commit gate (CI runs this and more), one run at a time per machine
+	@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(CHECK_SUBMAKE) --no-print-directory check-unlocked
+
+.PHONY: check-unlocked
+check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The gate's steps, without the machine-wide lock
 
 .PHONY: build
 build: ## Build ./bin/billet
@@ -53,11 +106,11 @@ test: ## Race-enabled test run, instrumented exactly as CI runs it
 	# 530s under -race and atomic coverage before migration 49 added fourteen
 	# statements to every test ledger's open, against go test's default of 600s,
 	# and cmd/billet crossed 20m on a loaded fleet runner on 2026-09-26.
-	go test -race -count=1 -timeout 35m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
+	$(NICE) go test $(GO_TEST_P) -race -count=1 -timeout 35m -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
-	go test -race -count=1 -timeout 35m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
+	$(NICE) go test $(GO_TEST_P) -race -count=1 -timeout 35m -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
@@ -98,7 +151,7 @@ docs: ## Build the Sphinx documentation with warnings as errors, as Read the Doc
 
 .PHONY: lint
 lint: ## golangci-lint (pinned version), for this platform AND linux
-	golangci-lint run --timeout=15m
+	$(NICE) golangci-lint run --timeout=15m
 	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
 	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
 	@# file, and every branch of a platform-dependent type, is unexamined by the pass
@@ -112,7 +165,7 @@ lint: ## golangci-lint (pinned version), for this platform AND linux
 	@# (uint32), so a linux pass at this Mac's arm64 missed a conversion CI
 	@# refused as unnecessary (2026-09-09); a conversion that must exist on one
 	@# architecture and not another is spelled through a generic widening.
-	GOOS=linux GOARCH=amd64 golangci-lint run --timeout=15m
+	GOOS=linux GOARCH=amd64 $(NICE) golangci-lint run --timeout=15m
 
 .PHONY: lint-custom
 lint-custom: ## billet's own analyzers, and the tests that prove they still detect
