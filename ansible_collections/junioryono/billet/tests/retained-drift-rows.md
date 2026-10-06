@@ -132,6 +132,10 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/ceph.yml / Create billet Ceph pools | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Initialize billet Ceph pools for RBD | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Configure billet Ceph pool replication | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Keep a single copy of each billet Ceph pool asked to | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Unmute the no-redundancy warning once every billet pool keeps copies | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Mute the no-redundancy warning while a billet pool keeps one copy by choice | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
+| tasks/ceph.yml / Allow a billet Ceph pool to keep a single copy | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Require clone-v2-compatible Ceph clients | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Let Ceph serve client IO ahead of scrubbing and recovery | parity:Ceph bootstrap, device selection, daemon accounts, cluster operations and kernel module loading are shared node-host effects (R7.7) |
 | tasks/ceph.yml / Create the scoped billet Ceph identity | inventory:billet_ceph_keyring_path |
