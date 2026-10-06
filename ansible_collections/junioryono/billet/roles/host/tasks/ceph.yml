@@ -128,24 +128,14 @@
   changed_when: false
   become: true
 
-# A POOL WITH ONE COPY IS THE CHOICE, NOT A FAULT, so the health check that says so
-# is muted while one is configured and unmuted when none is: the health alert
-# would otherwise mail about it every interval and bury a real warning under it.
-- name: Mute the no-redundancy warning while a billet pool keeps one copy by choice
-  ansible.builtin.command:
-    argv: [ceph, health, mute, POOL_NO_REDUNDANCY, --sticky]
-  when: (billet_ceph_pool_size | int) == 1 or (billet_ceph_cache_pool_size | int) == 1
-  changed_when: false
-  become: true
-
-- name: Unmute the no-redundancy warning once every billet pool keeps copies
+# NEVER MUTED. Ceph can only mute POOL_NO_REDUNDANCY for the whole cluster, which
+# would also hide a pool left with one copy by mistake, so the health alert
+# (ceph-health.sh) drops it only for the pools this inventory chose. Unmuting
+# answers success when nothing is muted, so a failure here is a real one.
+- name: Keep the no-redundancy warning unmuted
   ansible.builtin.command:
     argv: [ceph, health, unmute, POOL_NO_REDUNDANCY]
-  when:
-    - (billet_ceph_pool_size | int) > 1
-    - (billet_ceph_cache_pool_size | int) > 1
   changed_when: false
-  failed_when: false
   become: true
 
 - name: Require clone-v2-compatible Ceph clients

@@ -14,10 +14,12 @@
     that:
       - item.0 | string is match('^[1-9][0-9]*$')
       - item.1 | string is match('^[1-9][0-9]*$')
+      - (item.0 | int) <= 10
       - (item.1 | int) <= (item.0 | int)
     fail_msg: >-
       billet_ceph_pool_size, billet_ceph_cache_pool_size and their min_size must be
-      whole numbers of at least 1, each min_size no larger than its size.
+      whole numbers from 1 to 10, Ceph's own bound, each min_size no larger than its
+      size.
   loop:
     - ["{{ billet_ceph_pool_size }}", "{{ billet_ceph_pool_min_size }}"]
     - ["{{ billet_ceph_cache_pool_size }}", "{{ billet_ceph_cache_pool_min_size }}"]
