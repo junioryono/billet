@@ -14,6 +14,10 @@ max-ttl=300
 no-resolv
 cache-size={{ billet_guest_dns_cache_size | int }}
 dns-forward-max={{ billet_guest_dns_forward_max | int }}
+# Every forwarded query goes to every upstream and the first answer wins: one
+# query lost on the uplink otherwise costs the guest its resolver's whole retry
+# interval (5 s), longer than many clients wait (shared-uplink record, 2026-10-06).
+all-servers
 {% for server in billet_guest_dns_servers %}
 server={{ server }}
 {% endfor %}
