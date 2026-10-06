@@ -80,6 +80,25 @@ ERROR) now=CEPH_UNREADABLE ;;
 *) now=$(classify "${detail}") ;;
 esac
 
+# A POOL THE INVENTORY CHOSE TO KEEP IN ONE COPY IS NOT A PROBLEM, and any other
+# pool without copies still is (junioryono/billet#394). Ceph can only mute
+# POOL_NO_REDUNDANCY for the whole cluster, so it is dropped here, and only while
+# every pool it names is one of these.
+single_copy_pools={{ (([billet_ceph_image_pool] if (billet_ceph_pool_size | int) == 1 else []) + ([billet_ceph_cache_pool] if (billet_ceph_cache_pool_size | int) == 1 else [])) | join(' ') | quote }}
+if printf '%s\n' "${now}" | grep -qx POOL_NO_REDUNDANCY; then
+    named=$(printf '%s\n' "${detail}" | sed -nE "s/^ +pool '([^']+)' has no replicas configured\$/\1/p")
+    unexpected=""
+    for pool in ${named}; do
+        case " ${single_copy_pools} " in
+        *" ${pool} "*) ;;
+        *) unexpected="${unexpected} ${pool}" ;;
+        esac
+    done
+    if [ -n "${named}" ] && [ -z "${unexpected}" ]; then
+        now=$(printf '%s\n' "${now}" | grep -vx POOL_NO_REDUNDANCY || true)
+    fi
+fi
+
 new=""
 for check in ${now}; do
     if ! printf '%s\n' "${seen}" | grep -qxF -- "${check}"; then
@@ -87,7 +106,10 @@ for check in ${now}; do
     fi
 done
 
-if [ "${status}" = "HEALTH_OK" ]; then
+# NOTHING LEFT TO REPORT CLEARS THE STATE AS HEALTH_OK DOES, or a cluster whose
+# only warning is a chosen single-copy pool would never clear it, and a problem
+# that came back after it had gone would never be mailed again.
+if [ "${status}" = "HEALTH_OK" ] || { [ "${status}" != ERROR ] && [ -z "${now}" ]; }; then
     record=""
 else
     record=$(printf '%s\n%s\n' "${seen}" "${now}" | grep -E '^[A-Z0-9_]+$' | sort -u || true)
