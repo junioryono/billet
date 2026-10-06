@@ -63,7 +63,12 @@ CHECK_LOCK ?=
 # prints it, -q answers 1, -t touches nothing because check is phony). It is
 # decided by make itself rather than by reading MAKEFLAGS, whose layout varies:
 # reading its first word took `make check CHECK_LOCK=/tmp/x` for a touch and ran
-# it without the lock. `make -n check-unlocked` lists the steps.
+# it without the lock. `make -n check-unlocked` lists the steps. The cost: make
+# hands its jobserver only to a line it treats as recursive, so on GNU Make 3.81
+# to 4.3 `make -j check` runs the steps one at a time (the sub-make warns and
+# suggests a `+`), which suits a machine this gate shares. Never add the `+`: it
+# would make the line recursive again and bring the -n wait back. For parallel
+# steps, `make check CHECK_SUBMAKE='$(MAKE) -j4'`.
 CHECK_SUBMAKE = $(MAKE)
 
 .DEFAULT_GOAL := check

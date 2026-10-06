@@ -472,6 +472,9 @@ func TestADryRunCheckTakesNoLock(t *testing.T) {
 
 	cmd := exec.CommandContext(ctx, "make", "-C", "..", "-n", "check", "CHECK_LOCK="+lock)
 	cmd.Env = makeEnv()
+	// Killing make alone would leave the script and the lock tool, its
+	// grandchildren, holding the output pipe open past the deadline.
+	cmd.WaitDelay = 2 * time.Second
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -480,6 +483,10 @@ func TestADryRunCheckTakesNoLock(t *testing.T) {
 
 	if !strings.Contains(string(out), "with-check-lock.sh") {
 		t.Errorf("make -n check did not print the line it would run: %q", out)
+	}
+
+	if strings.Contains(string(out), "waiting") {
+		t.Errorf("make -n check waited for the lock: %q", out)
 	}
 }
 
@@ -498,7 +505,7 @@ func TestARealCheckWithOverridesTakesTheLock(t *testing.T) {
 	// Run from the root rather than with -C, which adds its own flag (w) to
 	// MAKEFLAGS and would hide the shape under test.
 	cmd := exec.CommandContext(t.Context(), "make",
-		"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE=echo", "CHECK_LOCK="+lock, "check")
+		"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE="+printFlags, "CHECK_LOCK="+lock, "check")
 	cmd.Dir = ".."
 	cmd.Env = makeEnv()
 
@@ -510,7 +517,19 @@ func TestARealCheckWithOverridesTakesTheLock(t *testing.T) {
 	if _, err := os.Stat(lock); err != nil {
 		t.Errorf("make check with overrides on the command line did not take the lock: %v (%s)", err, out)
 	}
+
+	// AND THE OVERRIDES REACH THE STEPS: the line the sub-make is reached
+	// through is not recursive to make, and an override still travels to it
+	// in the MAKEFLAGS make exports to every recipe.
+	if !strings.Contains(string(out), "TEST_PARALLEL=2") {
+		t.Errorf("the sub-make did not receive the command line's overrides: %q", out)
+	}
 }
+
+// printFlags stands in for MAKE: it prints the MAKEFLAGS it was handed, so a
+// test sees what the sub-make would have received. Make expands $$ to $ when
+// it reads the command line's value.
+const printFlags = `sh -c 'printf "%s\n" "$$MAKEFLAGS"' sh`
 
 // A LOCK PATH HOLDING SPACES IS ONE PATH: its directories are made and the lock
 // is taken there, not at the pieces a word split would give.
