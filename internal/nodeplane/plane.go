@@ -2153,11 +2153,50 @@ func supersededLocked(n *node, name, incarnation string) error {
 		ErrSuperseded, name, n.incarnation, incarnation)
 }
 
+// lostDestroyLocked returns a destroy this process was given and has not answered.
+//
+// A PROCESS THAT POLLS AGAIN HAS LOST IT. A node runs a destroy in line and
+// reports it before its next poll, so an unanswered one means the answer never
+// came or the command never arrived: a long poll the node had abandoned, whose
+// handler the server had not yet seen go, can take a command and write it to a
+// closed connection. That happens when a node turns from its ordinary loop to a
+// drain, and without this the destroy waited out the whole command timeout
+// while the process that should run it polled beside it. A destroy is addressed
+// by request id and is idempotent, so giving it again is safe; a launch or an
+// upgrade is not, and is never given twice.
+func lostDestroyLocked(n *node, incarnation string) (nodeapi.Command, bool) {
+	if incarnation == "" {
+		return nodeapi.Command{}, false
+	}
+
+	var lost *pending
+
+	for _, pend := range n.inflight {
+		if pend.cmd.Kind != nodeapi.CommandDestroy || pend.incarnation != incarnation {
+			continue
+		}
+
+		if lost == nil || pend.cmd.ID < lost.cmd.ID {
+			lost = pend
+		}
+	}
+
+	if lost == nil {
+		return nodeapi.Command{}, false
+	}
+
+	return lost.cmd, true
+}
+
 // takeLocked moves the first eligible command into flight, recording who took
 // it. A launch is rendered for one provider before it enters this queue, so a
 // replacement process using another provider gets a clean failure rather than
 // a command it cannot interpret.
 func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) {
+	if cmd, lost := lostDestroyLocked(n, incarnation); lost {
+		return cmd, true
+	}
+
 	for len(n.queue) > 0 {
 		pend := n.queue[0]
 		n.queue = n.queue[1:]
