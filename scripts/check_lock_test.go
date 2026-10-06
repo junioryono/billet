@@ -84,7 +84,7 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 	release := filepath.Join(dir, "release")
 	seen := filepath.Join(dir, "seen")
 
-	first := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock, "sh", "-c",
+	first := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
 		holdUntilReleased+`echo done >> "$1"`, "first", trace, release)
 	if err := first.Start(); err != nil {
 		t.Fatalf("start the first run: %v", err)
@@ -240,9 +240,10 @@ exit 0`, "leaver", up, release, finished).CombinedOutput()
 	waitForLockFile(t, finished, "the leftover child did not finish when released")
 }
 
-// leftoverChild is sh that writes its pid to $1, waits until $2 exists and then
-// writes $3. Past its watchdog it exits 9 without writing $3.
-const leftoverChild = `echo $$ > "$1"
+// leftoverChild is sh that writes its pid to $1 (through a rename, so $1 never
+// exists empty), waits until $2 exists and then writes $3. Past its watchdog it
+// exits 9 without writing $3.
+const leftoverChild = `echo $$ > "$1.tmp" && mv "$1.tmp" "$1"
 i=0
 while [ ! -e "$2" ]; do
 	i=$((i + 1))
@@ -300,8 +301,22 @@ while [ ! -e "$2" ]; do
 done
 `
 
+// holderContext is the context a lock holder runs under: not the test's, which
+// is cancelled before cleanup runs and would kill the lock tool and orphan the
+// holder's shell, but one cleanup cancels only after it has released the holder
+// and given it ten seconds to finish.
+func holderContext(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+	t.Cleanup(cancel)
+
+	return ctx
+}
+
 // releaseAndReap releases a holder and reaps it if the test ends before it
-// does, so no holder outlives its test.
+// does, so no holder outlives its test. Registered after holderContext's
+// cancel, it runs before it.
 func releaseAndReap(t *testing.T, cmd *exec.Cmd, release string) {
 	t.Helper()
 
@@ -310,10 +325,22 @@ func releaseAndReap(t *testing.T, cmd *exec.Cmd, release string) {
 			return
 		}
 
-		//nolint:errcheck // releasing and reaping only; the run's verdict is asserted in the body
-		os.WriteFile(release, nil, 0o600)
-		//nolint:errcheck // as above
-		cmd.Wait()
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Errorf("release the holder: %v", err)
+		}
+
+		done := make(chan error, 1)
+
+		go func() { done <- cmd.Wait() }()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the holder did not finish within 10s of its release")
+			//nolint:errcheck // a holder that outlived its release is killed; the error above is the verdict
+			cmd.Process.Kill()
+			<-done
+		}
 	})
 }
 
@@ -383,21 +410,8 @@ func TestMakeCheckTakesTheSharedLock(t *testing.T) {
 
 	cmd := exec.CommandContext(t.Context(), "make", "-C", "..", "MAKE=echo", "check")
 
-	// The Makefile's own default is the subject, and this may run inside a
-	// `make check` holding the lock: an inherited CHECK_LOCK, or one carried in
-	// MAKEFLAGS from `make check CHECK_LOCK=...`, would make this nested make
-	// wait for the lock its own enclosing gate holds.
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		switch name {
-		case "CHECK_LOCK", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL":
-			continue
-		}
-
-		cmd.Env = append(cmd.Env, kv)
-	}
-
-	cmd.Env = append(cmd.Env, "XDG_CACHE_HOME="+xdg)
+	// The Makefile's own default is the subject (see makeEnv).
+	cmd.Env = makeEnv("XDG_CACHE_HOME=" + xdg)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -410,6 +424,91 @@ func TestMakeCheckTakesTheSharedLock(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(xdg, "dev-gate.lock")); err != nil {
 		t.Errorf("make check did not take the shared lock under an XDG_CACHE_HOME with spaces: %v (%s)", err, out)
+	}
+}
+
+// makeEnv is the environment for a nested make: this may run inside a `make
+// check` holding the lock, and an inherited CHECK_LOCK, or one carried in
+// MAKEFLAGS from `make check CHECK_LOCK=...`, would make the nested make wait for
+// the lock its own enclosing gate holds.
+func makeEnv(extra ...string) []string {
+	var env []string
+
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "CHECK_LOCK", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL":
+			continue
+		}
+
+		env = append(env, kv)
+	}
+
+	return append(env, extra...)
+}
+
+// A DRY RUN TAKES NO LOCK. `make -n check` waits for nothing even while another
+// gate holds the lock, and prints the line it would have run.
+func TestADryRunCheckTakesNoLock(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "held.lock")
+	held := filepath.Join(dir, "held")
+	release := filepath.Join(dir, "release")
+
+	holder := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
+		holdUntilReleased, "holder", held, release)
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start the holder: %v", err)
+	}
+
+	releaseAndReap(t, holder, release)
+	waitForLockFile(t, held, "the holder never took the lock")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "make", "-C", "..", "-n", "check", "CHECK_LOCK="+lock)
+	cmd.Env = makeEnv()
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("make -n check while the lock is held: %v (%s)", err, out)
+	}
+
+	if !strings.Contains(string(out), "with-check-lock.sh") {
+		t.Errorf("make -n check did not print the line it would run: %q", out)
+	}
+}
+
+// A REAL RUN TAKES THE LOCK whatever is on the command line: reading MAKEFLAGS'
+// first word took `make check CHECK_LOCK=/tmp/x NICE="nice -n 10"` for a touch
+// and ran it unlocked. With MAKE=echo the recipe runs the real script around an
+// echo instead of the gate.
+func TestARealCheckWithOverridesTakesTheLock(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	lock := filepath.Join(t.TempDir(), "tmp", "override.lock")
+
+	// CHECK_LOCK LAST, its path holding a "t": on GNU Make 3.81 a command line of
+	// only assignments puts the last of them first in MAKEFLAGS, with no flags.
+	// Run from the root rather than with -C, which adds its own flag (w) to
+	// MAKEFLAGS and would hide the shape under test.
+	cmd := exec.CommandContext(t.Context(), "make",
+		"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE=echo", "CHECK_LOCK="+lock, "check")
+	cmd.Dir = ".."
+	cmd.Env = makeEnv()
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("make check with overrides: %v (%s)", err, out)
+	}
+
+	if _, err := os.Stat(lock); err != nil {
+		t.Errorf("make check with overrides on the command line did not take the lock: %v (%s)", err, out)
 	}
 }
 

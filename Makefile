@@ -56,17 +56,21 @@ endif
 CHECK_LOCK ?=
 
 # A dry run (-n), a question (-q) or a touch (-t) runs no step, so it takes no
-# lock: GNU make runs a recipe line naming $(MAKE) even under -n, and the lock
-# would make `make -n check` wait behind a whole gate to print commands. The
-# single-letter flags are the first word of MAKEFLAGS (measured on GNU Make 3.81:
-# -n reads "sn", a long option such as --no-print-directory never comes first).
-MAKE_RUNS_NOTHING = $(strip $(foreach flag,n q t,$(findstring $(flag),$(firstword -$(MAKEFLAGS)))))
+# lock. GNU make runs a recipe line naming $(MAKE) even under those modes, and
+# the lock would then make `make -n check` wait behind a whole gate; a line that
+# reaches make through another variable is not treated as recursive, so under
+# them it is printed or skipped and never run (measured on GNU Make 3.81: -n
+# prints it, -q answers 1, -t touches nothing because check is phony). It is
+# decided by make itself rather than by reading MAKEFLAGS, whose layout varies:
+# reading its first word took `make check CHECK_LOCK=/tmp/x` for a touch and ran
+# it without the lock. `make -n check-unlocked` lists the steps.
+CHECK_SUBMAKE = $(MAKE)
 
 .DEFAULT_GOAL := check
 
 .PHONY: check
 check: ## The pre-commit gate (CI runs this and more), one run at a time per machine
-	$(if $(MAKE_RUNS_NOTHING),$(MAKE) --no-print-directory check-unlocked,@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(MAKE) --no-print-directory check-unlocked)
+	@scripts/with-check-lock.sh "$(CHECK_LOCK)" $(CHECK_SUBMAKE) --no-print-directory check-unlocked
 
 .PHONY: check-unlocked
 check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The gate's steps, without the machine-wide lock
