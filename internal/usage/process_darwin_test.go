@@ -53,8 +53,9 @@ func TestTheAccountingRecordIsReadInBilletsUnits(t *testing.T) {
 	}
 }
 
-// userMicros is the user CPU this process has used, as getrusage reports it.
-func userMicros(t *testing.T) int64 {
+// rusageMicros is the user and system CPU this process has used, as getrusage
+// reports it.
+func rusageMicros(t *testing.T) (user, system int64) {
 	t.Helper()
 
 	var ru syscall.Rusage
@@ -62,8 +63,22 @@ func userMicros(t *testing.T) int64 {
 		t.Fatalf("getrusage: %v", err)
 	}
 
-	return ru.Utime.Sec*1_000_000 + int64(ru.Utime.Usec)
+	return ru.Utime.Sec*1_000_000 + int64(ru.Utime.Usec), ru.Stime.Sec*1_000_000 + int64(ru.Stime.Usec)
 }
+
+// userMicros is the user CPU this process has used, as getrusage reports it.
+func userMicros(t *testing.T) int64 {
+	t.Helper()
+
+	user, _ := rusageMicros(t)
+
+	return user
+}
+
+// bracketSlack is how far billet's reading may exceed getrusage's over a window
+// that contains it: the two count the same task's time at different
+// resolutions (mach ticks and microseconds), never by more than a few ms.
+const bracketSlack = 50_000
 
 // spinSink keeps spin's arithmetic from being optimised away.
 var spinSink uint64
@@ -81,6 +96,10 @@ func spin() {
 // THE REAL KERNEL ANSWERS FOR THIS PROCESS: it has a start, the CPU it just
 // burned, a footprint, and its own executable's path.
 func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
+	// getrusage's own readings bracket billet's two: whatever CPU billet's
+	// reader sees between its reads, getrusage saw at least that between these.
+	outerUser0, outerSystem0 := rusageMicros(t)
+
 	before, err := Reader{}.ProcessCounters(os.Getpid())
 	if err != nil {
 		t.Fatalf("read this process: %v", err)
@@ -108,11 +127,24 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read this process again: %v", err)
 	}
+
+	outerUser1, outerSystem1 := rusageMicros(t)
 	if after.Start == 0 || after.Start != before.Start {
 		t.Errorf("this process's start went from %d to %d", before.Start, after.Start)
 	}
 	if used := after.UserMicros - before.UserMicros; used < 200_000 || used > 30_000_000 {
 		t.Errorf("300ms of user CPU by getrusage read as %dµs of user CPU", used)
+	}
+
+	// AND NO MORE THAN THE KERNEL SAW, both kinds: a reader over-reporting by a
+	// unit or a timebase, or reading the wrong field of the record for system
+	// time, passes every floor and fails here.
+	if used, most := after.UserMicros-before.UserMicros, outerUser1-outerUser0+bracketSlack; used > most {
+		t.Errorf("billet read %dµs of user CPU where getrusage saw at most %dµs", used, most-bracketSlack)
+	}
+
+	if used, most := after.SystemMicros-before.SystemMicros, outerSystem1-outerSystem0+bracketSlack; used < 0 || used > most {
+		t.Errorf("billet read %dµs of system CPU where getrusage saw %dµs", used, most-bracketSlack)
 	}
 	if used := (after.UserMicros + after.SystemMicros) - (before.UserMicros + before.SystemMicros); used < 200_000 ||
 		used > 30_000_000 {
