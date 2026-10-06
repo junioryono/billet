@@ -104,6 +104,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/network.yml / Drain billet compute before changing guest networking | parity:shared node stop or node-owned networking service lifecycle (R7.3) |
 | tasks/request-node-drain.yml / Ask every billet node process that stops during this operation to drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
 | tasks/release-node-drain.yml / Withdraw the request that billet node stops drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
+| tasks/services.yml / Inspect the billet node a host that may not run one still has | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/services.yml / Compare the transaction's candidate config with the installed one | parity:read-only comparison of the staged candidate config with the installed one, deciding a drain request (#374) |
 | tasks/network.yml / Enable IP forwarding for guest bridges | const:/etc/sysctl.d/99-billet-node.conf |
 | tasks/network.yml / Inspect DHCP units for removed guest networks | parity:read-only systemd/IP observation with exact argv bound |
