@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -266,9 +266,13 @@ func (l *handshakingListener) accept(ctx context.Context) {
 					"error", failed, "retry_in", retryIn, "failures_total", total)
 			})
 
+			wait := time.NewTimer(backoff)
+
 			select {
-			case <-time.After(backoff):
+			case <-wait.C:
 			case <-l.closed:
+				wait.Stop()
+
 				return
 			}
 

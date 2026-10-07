@@ -81,7 +81,7 @@ func authorityStoreFor(cfg *config.Config) wireshare.Store {
 // adoptSharedAuthority gives this host the authority the deployment already
 // uses, before anything reads one.
 //
-// BEFORE serveNodeWire AND AFTER THE CLAIM, and both are load-bearing. The node
+// BEFORE app.ServeNodeWire AND AFTER THE CLAIM, and both are load-bearing. The node
 // wire's single authority read goes through LoadOrCreateCA, which CREATES one
 // when the directory is empty — so a promoted standby that reached it first would
 // mint a rival authority and drop the entire fleet, which is the failure this
@@ -114,7 +114,7 @@ func adoptSharedAuthority(
 
 // publishSharedAuthority puts what this host holds into the store.
 //
-// AFTER serveNodeWire, because that is what creates an authority on a first
+// AFTER app.ServeNodeWire, because that is what creates an authority on a first
 // controller and there is nothing to publish before it. On every later start the
 // bytes are identical and the write is a no-op an operator never sees.
 //

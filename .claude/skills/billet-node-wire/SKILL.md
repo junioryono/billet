@@ -1,13 +1,13 @@
 ---
 name: billet-node-wire
-description: "Load when adding a route, a command kind or a field to a wire type; when bumping the protocol version; when touching internal/nodeapi, internal/nodeclient, internal/nodeplane or the two listeners in cmd/billet; when a node cannot register or is fenced; or when touching enrollment, certificate renewal, the bootstrap listener, connection budgets or handshake timeouts."
+description: "Load when adding a route, a command kind or a field to a wire type; when bumping the protocol version; when touching internal/nodeapi, internal/nodeclient, internal/nodeplane or the two listeners in internal/app; when a node cannot register or is fenced; or when touching enrollment, certificate renewal, the bootstrap listener, connection budgets or handshake timeouts."
 ---
 
 # The node wire
 
 ## What this area is
 
-A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `dispatch.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `cmd/billet/handshakelistener.go` bounds connections on the real wire.
+A node dials out and never listens. `internal/nodeapi` declares the request and response types, the command kinds (`CommandLaunch`, `CommandDestroy`, `CommandSweep`, `CommandTend`, `CommandUpgrade`, `CommandInventory`) and the version range. `internal/nodeclient` is the node side (`Register`, `Poll`, `Report`, `Withdraw`, the lease calls, `Renew`, enrollment; `loop.go` drives `Poll → execute → Report` one command at a time). `internal/nodeplane` is the plane side: `Handler` (mTLS routes under `/v1/register` and `/v1/nodes/{node}/…`), `BootstrapHandler` (`/v1/ca` and `/v1/enroll`, no client certificate), `Plane` (dispatch, registrations, the barrier loop), and `Runner`, which implements `dispatch.Runner` so the listener cannot tell whether compute is a goroutine away or a continent away. `internal/app`'s `ServeNodeWire` serves it, and its `handshakelistener.go` bounds connections on the real wire.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -49,7 +49,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/nodeplane/*_test.go` (guards, dispatch fences, barrier loop), `internal/nodeapi/*_test.go` (range negotiation), `internal/nodeclient/*_test.go`.
-- `cmd/billet/handshakelistener_test.go`, `limitedlistener_test.go`, `bootstrapwire_test.go`, `wirewindow_test.go`.
+- `internal/app/handshakelistener_test.go`, `limitedlistener_test.go`, `bootstrapwire_test.go`; `cmd/billet/wirewindow_test.go`, `enrolladdr_test.go`.
 - `internal/e2e/wire_test.go`, `enroll_test.go`, `revocation_test.go`, `mtls_test.go`: `TestAnUnenrolledConnectionCanReachNothingElse` and the superseded-incarnation scenarios.
 
 ## Related skills

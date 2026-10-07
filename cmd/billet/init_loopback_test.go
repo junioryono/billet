@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -20,7 +21,7 @@ import (
 // `billet init` generates binds only loopback and the node wire serving it
 // mints NO certificate authority. The config's own comment promises "nothing is
 // exposed to the network and no certificates are involved" — this is the test
-// that promise answers to, driven through the same serveNodeWire the real
+// that promise answers to, driven through the same app.ServeNodeWire the real
 // server runs.
 func TestAGeneratedLocalConfigServesPlainLoopbackWithoutACA(t *testing.T) {
 	body, _, err := initconfig.Generate(initconfig.Params{
@@ -43,7 +44,7 @@ func TestAGeneratedLocalConfigServesPlainLoopbackWithoutACA(t *testing.T) {
 		t.Fatalf("the generated config does not load: %v", err)
 	}
 
-	// The generated address IS loopback — the same predicate serveNodeWire
+	// The generated address IS loopback — the same predicate app.ServeNodeWire
 	// branches on to decide whether an authority exists at all.
 	if !nodeplane.LoopbackOnly(cfg.Server.Listen) {
 		t.Fatalf("the generated listen %q is not loopback-only", cfg.Server.Listen)
@@ -57,14 +58,14 @@ func TestAGeneratedLocalConfigServesPlainLoopbackWithoutACA(t *testing.T) {
 	cfg.Server.IdentityDir = stateDir
 
 	deploymentID := "0123456789abcdef0123456789abcdef"
-	stop, err := serveNodeWire(t.Context(), cfg,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("serving the node wire on the generated loopback address: %v", err)
 	}
 
-	t.Cleanup(stop.stop)
+	t.Cleanup(stop.Stop)
 
 	// The listener answers PLAIN HTTP at the generated address. A raw TCP dial
 	// would also succeed against a TLS listener before any handshake, so the

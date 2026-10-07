@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bytes"
@@ -45,14 +45,14 @@ func TestTheNodeWireServesAfterItsContextIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	served, err := serveNodeWire(ctx, cfg,
+	served, err := ServeNodeWire(ctx, cfg, noIdentityAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("serving the node wire: %v", err)
 	}
 
-	t.Cleanup(served.stop)
+	t.Cleanup(served.Stop)
 
 	ca, err := wirecert.LoadOrCreateCA(stateDir, deploymentID)
 	if err != nil {
@@ -78,7 +78,7 @@ func TestTheNodeWireServesAfterItsContextIsCancelled(t *testing.T) {
 	}
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		"https://127.0.0.1"+portOf(t, served.addr)+"/v1/register",
+		"https://127.0.0.1"+portOf(t, served.Addr)+"/v1/register",
 		strings.NewReader(`{"node":"epyc-1"}`))
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -119,14 +119,14 @@ func splitWire(t *testing.T, bootstrap string, opts ...wireOption) (string, stri
 		NodeTLSHosts:    []string{"127.0.0.1"},
 	}}
 
-	wire, err := serveNodeWire(t.Context(), cfg,
+	wire, err := ServeNodeWire(t.Context(), cfg, noIdentityAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil, opts...)
 	if err != nil {
 		t.Fatalf("serving the node wire: %v", err)
 	}
 
-	t.Cleanup(wire.stop)
+	t.Cleanup(wire.Stop)
 
 	ca, err := wirecert.LoadOrCreateCA(stateDir, deploymentID)
 	if err != nil {
@@ -137,7 +137,7 @@ func splitWire(t *testing.T, bootstrap string, opts ...wireOption) (string, stri
 	// certificate rule applies at all, and the resolved address it reports is
 	// ":<port>" — which names no host to connect to. 127.0.0.1 is the subject
 	// name the certificate carries.
-	return "127.0.0.1" + portOf(t, wire.addr), bootstrapDialAddr(t, wire.bootstrap), ca
+	return "127.0.0.1" + portOf(t, wire.Addr), bootstrapDialAddr(t, wire.Bootstrap), ca
 }
 
 // portOf is the ":<port>" half of a resolved listen address.
@@ -435,100 +435,15 @@ func TestTheNodeWireBoundsATLSHandshake(t *testing.T) {
 	}
 }
 
-// WHERE AN ENROLLING MACHINE ASKS, and the fallback that used to be the only
-// answer.
-//
-// A control plane serving enrollment on an address of its own cannot be reached
-// for it at node.server_addr: the node wire refuses a connection with no
-// certificate in the handshake, and a machine that is enrolling has none. So the
-// flag and the config key exist, and the fallback stays because it is right for a
-// control plane that has no separate address.
-//
-// TABLE OVER ALL THREE SOURCES, because the ORDER is the whole content: a
-// resolution that reads the config before the flag looks identical in every test
-// that sets only one of them.
-func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
-	t.Parallel()
-
-	for _, c := range []struct {
-		name             string
-		flag, cfgAddr    string
-		serverAddr, want string
-	}{
-		{
-			name: "the flag wins over both",
-			flag: "flag.example:7718", cfgAddr: "cfg.example:7718",
-			serverAddr: "wire.example:7717", want: "https://flag.example:7718",
-		},
-		{
-			name:    "the config key wins over the node wire",
-			cfgAddr: "cfg.example:7718", serverAddr: "wire.example:7717",
-			want: "https://cfg.example:7718",
-		},
-		{
-			name:       "and the node wire is the fallback",
-			serverAddr: "wire.example:7717", want: "https://wire.example:7717",
-		},
-		{
-			name: "whitespace is not an address",
-			flag: "   ", cfgAddr: "\t", serverAddr: "wire.example:7717",
-			want: "https://wire.example:7717",
-		},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := &config.Config{Node: &config.NodeConfig{
-				ServerAddr:    c.serverAddr,
-				BootstrapAddr: c.cfgAddr,
-			}}
-
-			if got := bootstrapBase(cfg, c.flag); got != c.want {
-				t.Errorf("bootstrapBase = %q, want %q", got, c.want)
-			}
-		})
-	}
-}
-
-// AND THE CONTROL PLANE PRINTS THE ADDRESS RATHER THAN LEAVING IT TO BE GUESSED.
-//
-// The operator is already carrying a fingerprint and a join token from the
-// controller to the new machine; the address is the third thing in that hand-off,
-// and getting it wrong ends in a handshake failure that names no cause. A
-// wildcard says which interfaces to accept on and not which name to dial, so only
-// the port is billet's to state.
-func TestTheEnrollmentFlagIsPrintedOnlyWhenThereIsOne(t *testing.T) {
-	t.Parallel()
-
-	for _, c := range []struct {
-		listen, want string
-	}{
-		{listen: "", want: ""},
-		{listen: "billet.example:7718", want: " --bootstrap-addr billet.example:7718"},
-		{listen: "0.0.0.0:7718", want: " --bootstrap-addr <this control plane>:7718"},
-		{listen: ":7718", want: " --bootstrap-addr <this control plane>:7718"},
-		{listen: "[::]:7718", want: " --bootstrap-addr <this control plane>:7718"},
-	} {
-		t.Run(c.listen, func(t *testing.T) {
-			t.Parallel()
-
-			cfg := &config.Config{Server: &config.ServerConfig{BootstrapListen: c.listen}}
-			if got := enrollAddrFlag(cfg); got != c.want {
-				t.Errorf("enrollAddrFlag(%q) = %q, want %q", c.listen, got, c.want)
-			}
-		})
-	}
-}
-
 // TestTheServedWireCarriesTheFleetOntoTheNewAuthority closes the last seam
 // in serving the fleet from one read of the authority, and the only one that
 // can be closed here.
 //
-// internal/app proves the handler it BUILDS is right. What it cannot prove is
-// that serveNodeWire INSTALLS it: rebuilding a bare nodeplane.Handler at the
+// BuildNodeWire's tests prove the handler it BUILDS is right. What it cannot prove is
+// that ServeNodeWire INSTALLS it: rebuilding a bare nodeplane.Handler at the
 // http.Server would drop the certificate guard, revocation, renewal and the trust
 // bundle in one line, and every test in that package would stay green. This
-// drives the real serveNodeWire, over a real handshake, on a deployment mid
+// drives the real ServeNodeWire, over a real handshake, on a deployment mid
 // rotation.
 //
 // RENEWAL IS THE ASSERTION because it is the only way a node ever adopts the new
@@ -567,14 +482,14 @@ func TestTheServedWireCarriesTheFleetOntoTheNewAuthority(t *testing.T) {
 		NodeTLSHosts: []string{"127.0.0.1"},
 	}}
 
-	wire, err := serveNodeWire(t.Context(), cfg,
+	wire, err := ServeNodeWire(t.Context(), cfg, noIdentityAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("serving the node wire: %v", err)
 	}
 
-	t.Cleanup(wire.stop)
+	t.Cleanup(wire.Stop)
 
 	// WHAT THE NODE ALREADY TRUSTS, which during an overlap is the old authority
 	// alone — it has not renewed yet, so it has never been handed the new one.
@@ -606,7 +521,7 @@ func TestTheServedWireCarriesTheFleetOntoTheNewAuthority(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	url := "https://127.0.0.1" + portOf(t, wire.addr) + "/v1/nodes/epyc-1/renew"
+	url := "https://127.0.0.1" + portOf(t, wire.Addr) + "/v1/nodes/epyc-1/renew"
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -661,4 +576,11 @@ func TestTheServedWireCarriesTheFleetOntoTheNewAuthority(t *testing.T) {
 			t.Errorf("the renewal answer omits the %s authority", name)
 		}
 	}
+}
+
+// noIdentityAccess is an IdentityAccess that holds nothing: these tests are
+// about the listeners, and the host's exclusion around the authority read is
+// cmd/billet's, tested there.
+func noIdentityAccess(context.Context, string) (func() error, error) {
+	return func() error { return nil }, nil
 }

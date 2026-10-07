@@ -408,6 +408,18 @@ func serverIdentityAccess(ctx context.Context, dir string) (*identityAccess, err
 	return acc, nil
 }
 
+// serverWireAccess is serverIdentityAccess in the shape the node wire takes it,
+// for app.ServeNodeWire: the access around its authority read, released when
+// the read is done.
+func serverWireAccess(ctx context.Context, dir string) (func() error, error) {
+	acc, err := serverIdentityAccess(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return acc.Release, nil
+}
+
 // parentWritable reports whether this process may create entries in the
 // identity directory's parent, which is exactly where an unprivileged server
 // could recreate a moved directory.
