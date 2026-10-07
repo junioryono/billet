@@ -529,7 +529,8 @@ func TestARecordThatCannotBeWrittenIsLoggedAndTheNodeKeepsServing(t *testing.T) 
 // the one shared constructor (app.NewNodeClient), Node.Run passes the loop the
 // path its host names, and cmd/billet's host names the one record path; no
 // second spelling of the path exists; the record writer installs through the
-// zero-value Installer.
+// zero-value Installer. Run reaches the loop through RunNodeLoop, the runtime
+// billet's own harnesses run too.
 func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	t.Parallel()
 
@@ -732,12 +733,8 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 				}
 			}
 		case *ast.CallExpr:
-			sel, ok := x.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Run" || len(x.Args) != 4 {
-				return true
-			}
-
-			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "nodeclient" {
+			loop, ok := x.Fun.(*ast.Ident)
+			if !ok || loop.Name != "RunNodeLoop" || len(x.Args) != 4 {
 				return true
 			}
 
@@ -768,9 +765,27 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		return true
 	})
 
-	if passed != 1 || calls(app["Run"], "nodeclient", "Run") != 1 {
-		t.Errorf("Node.Run hands nodeclient.Run RegistrationRecordPath: host.RegistrationRecordPath %d times "+
-			"over %d calls of it, want one call and once", passed, calls(app["Run"], "nodeclient", "Run"))
+	loops := 0
+
+	ast.Inspect(app["Run"].Body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "RunNodeLoop" {
+				loops++
+			}
+		}
+
+		return true
+	})
+
+	if passed != 1 || loops != 1 || calls(app["Run"], "nodeclient", "Run") != 0 {
+		t.Errorf("Node.Run hands RunNodeLoop RegistrationRecordPath: host.RegistrationRecordPath %d times "+
+			"over %d calls of it, want one call and once, and no nodeclient.Run of its own", passed, loops)
+	}
+
+	// AND RunNodeLoop IS THE LOOP, passing what it was given and nothing else.
+	if app["RunNodeLoop"] == nil || calls(app["RunNodeLoop"], "nodeclient", "Run") != 1 ||
+		len(app["RunNodeLoop"].Body.List) != 1 {
+		t.Error("app.RunNodeLoop is not the one statement that runs nodeclient.Run")
 	}
 
 	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.

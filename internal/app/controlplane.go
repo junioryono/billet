@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider/firecracker"
@@ -47,6 +48,29 @@ type ControlPlaneOptions struct {
 	// Probe opens the upgrade probe's maintenance handle: the plane is built,
 	// which validates the config and the ledger, and nothing more is done.
 	Probe bool
+	// Steering is what billet's own harnesses change; nil in a deployment.
+	Steering *Steering
+}
+
+// Steering is what the end-to-end suite and the replay harness change about a
+// control plane they assemble the way the CLI does, and nothing a config can
+// say: a clock, a lease TTL and pacing short enough for a test, a provisioner
+// that orders sessions. Every
+// field is optional, and each is applied after what the assembly sets, so it
+// can only steer what is already there.
+type Steering struct {
+	// Allocator are options for the allocator, after its placement.
+	Allocator []alloc.Option
+	// Plane are options for the node plane, after its registrar, sites,
+	// catalogue and barrier store.
+	Plane []nodeplane.Option
+	// Server are options for the scheduler, after everything Schedule sets.
+	Server []server.ControlPlaneOption
+	// Provisioner wraps each target's provisioner.
+	Provisioner func(server.Provisioner) server.Provisioner
+	// Owner names this process to GitHub's message queue instead of the host
+	// name.
+	Owner string
 }
 
 // ControlPlane is a control plane opened and not yet this deployment's
@@ -63,6 +87,7 @@ type ControlPlane struct {
 	targets    []server.Target
 	planeJIT   map[string]nodeplane.JITSource
 	serverOpts []server.ControlPlaneOption
+	steering   Steering
 
 	// self is the address OpenControlPlane made this plane at, for the reason a
 	// Controller records its own: the proofs were earned against what is there,
@@ -79,6 +104,17 @@ func OpenControlPlane(
 	serverTargets, planeJIT, err := BuildTargets(targets)
 	if err != nil {
 		return nil, err
+	}
+
+	var steering Steering
+	if opts.Steering != nil {
+		steering = *opts.Steering
+	}
+
+	if steering.Provisioner != nil {
+		for i := range serverTargets {
+			serverTargets[i].Provisioner = steering.Provisioner(serverTargets[i].Provisioner)
+		}
 	}
 
 	// READ, NOT CLAIMED. The host-wide lock exists to stop two processes managing
@@ -140,7 +176,7 @@ func OpenControlPlane(
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
 		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
+	}, cfg.Tiers, append([]alloc.Option{alloc.WithPlacement(cfg.Server.Placement)}, steering.Allocator...)...)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.Close())
 	}
@@ -164,6 +200,7 @@ func OpenControlPlane(
 		targets:    serverTargets,
 		planeJIT:   planeJIT,
 		serverOpts: serverOpts,
+		steering:   steering,
 	}
 	cp.self = cp
 
@@ -224,6 +261,15 @@ type Controller struct {
 
 // Close joins every loop the controller started.
 func (c *Controller) Close() []error { return c.loops.Wait() }
+
+// Allocator is the capacity allocator this controller schedules with.
+func (c *Controller) Allocator() *alloc.Allocator { return c.cp.allocator }
+
+// Ledger is the ledger this controller holds the claim on.
+func (c *Controller) Ledger() *state.DB { return c.cp.db }
+
+// Deployment is the deployment identity this controller serves.
+func (c *Controller) Deployment() string { return c.cp.deployment }
 
 // errNotController refuses a step on a Controller that holds no claim: one not
 // made by BecomeController.
@@ -308,6 +354,10 @@ type ServingWire struct {
 	servedBy *Controller
 }
 
+// Plane is the node plane this wire serves: who is registered, and the runner
+// that reaches them.
+func (w *ServingWire) Plane() *nodeplane.Plane { return w.nodes }
+
 // ServeWire serves the node wire, which needs the fleet forgotten and the
 // authority adopted first: a node registering before the first would be
 // forgotten by it, and the wire's authority read before the second could mint
@@ -325,7 +375,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 
 	cp := c.cp
 
-	nodes := nodeplane.New(slog.Default(), cp.deployment, cp.allocator.LeaseTTL(),
+	planeOpts := append([]nodeplane.Option{
 		nodeplane.WithRegistrar(cp.allocator),
 		// The declared places, so a node claiming one nobody declared is refused
 		// here rather than recorded. A node's own config cannot make this check —
@@ -339,7 +389,10 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 		// `billet local down` write a request into the ledger; this is what
 		// observes it, because a sealed idle deployment dispatches nothing at all
 		// and there is no other moment at which the fleet would be asked.
-		nodeplane.WithBarrierStore(cp.allocator))
+		nodeplane.WithBarrierStore(cp.allocator),
+	}, cp.steering.Plane...)
+
+	nodes := nodeplane.New(slog.Default(), cp.deployment, cp.allocator.LeaseTTL(), planeOpts...)
 
 	wire, err := ServeNodeWire(ctx, cp.cfg, cp.host.ServerAccess, nodes, cp.allocator,
 		cp.planeJIT, cp.allocator, cp.allocator, cp.db)
@@ -380,6 +433,10 @@ type ScheduleOptions struct {
 	// DryRun advertises nothing: scale sets are created and polled and no job
 	// is accepted.
 	DryRun bool
+	// NodeRunner replaces the node plane's runner, for billet's own harness
+	// that runs the node runtime in process against the allocator; the wire is
+	// still served. Nil in a deployment.
+	NodeRunner dispatch.Runner
 }
 
 // Schedule assembles everything that schedules: the liveness and barrier loops,
@@ -430,6 +487,10 @@ func (c *Controller) Schedule(
 		owner = "billet"
 	}
 
+	if cp.steering.Owner != "" {
+		owner = cp.steering.Owner
+	}
+
 	// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness now decides what its
 	// tier advertises, and an idle deployment never launches, lists or destroys —
 	// so without this a host that crashed on a quiet afternoon would keep its
@@ -474,7 +535,7 @@ func (c *Controller) Schedule(
 	}
 
 	serverOpts = append(serverOpts,
-		server.WithNodeRunner(planeRunner),
+		server.WithNodeRunner(nodeRunner(planeRunner, opts.NodeRunner)),
 		server.WithRolloutCoordinator(coordinator, 0),
 		server.WithRolloutStarter(starter, 0),
 		// AND THE SWEEP OF STAGED CODEBUILD REGISTRATIONS a dead node never reaped.
@@ -486,6 +547,8 @@ func (c *Controller) Schedule(
 		server.WithStagedCredentialSweeper(
 			NewControllerCredentialSweep(cp.allocator, cp.db, awscreds.Default(), slog.Default())),
 	)
+
+	serverOpts = append(serverOpts, cp.steering.Server...)
 
 	plane := server.New(cp.allocator, nil, cp.cfg.Tiers, owner, slog.Default(), serverOpts...)
 
@@ -695,4 +758,14 @@ func stopWhenReplaced(
 			"controller that replaced this one adopts both")
 		stop()
 	}
+}
+
+// nodeRunner is the runner the scheduler dispatches through: the node plane's,
+// unless a harness steers its own in.
+func nodeRunner(plane, steered dispatch.Runner) dispatch.Runner {
+	if steered != nil {
+		return steered
+	}
+
+	return plane
 }

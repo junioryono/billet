@@ -300,7 +300,8 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 }
 
 // THE NODE SAYS IT IS READY ONCE, AFTER ITS RUNNER IS BUILT AND BEFORE THE
-// LOOP, and the guest cache answers only from the loop's readiness. A READY=1
+// LOOP (NewNodeRunner and RunNodeLoop, the runtime billet's harnesses run
+// too), and the guest cache answers only from the loop's readiness. A READY=1
 // sent before the runner exists tells the service manager a node is serving
 // that cannot take a command; one never sent leaves the unit starting until
 // systemd kills it. And serveCache called anywhere but as the loop's Ready
@@ -335,13 +336,15 @@ func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
 			return true
 		}
 
+		id, isIdent := call.Fun.(*ast.Ident)
+
 		switch {
-		case namesSelector(call.Fun, "node", "New") && !built.IsValid():
+		case isIdent && id.Name == "NewNodeRunner" && !built.IsValid():
 			built = call.Pos()
 		case namesSelector(call.Fun, "host", "Ready"):
 			readies++
 			ready = call.Pos()
-		case namesSelector(call.Fun, "nodeclient", "Run") && !looped.IsValid():
+		case isIdent && id.Name == "RunNodeLoop" && !looped.IsValid():
 			looped = call.Pos()
 		}
 
@@ -349,7 +352,7 @@ func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
 	})
 
 	if readies != 1 || !built.IsValid() || !looped.IsValid() || ready < built || ready > looped {
-		t.Errorf("Node.Run calls host.Ready %d times, want once after node.New and before nodeclient.Run", readies)
+		t.Errorf("Node.Run calls host.Ready %d times, want once after NewNodeRunner and before RunNodeLoop", readies)
 	}
 
 	// EVERYWHERE IN Run, closures, deferred and go statements included: a

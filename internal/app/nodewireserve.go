@@ -123,6 +123,15 @@ func withHandshakeTimeout(d time.Duration) wireOption {
 // cancelled — that cancellation is what brought us here — so deriving from it
 // would abort the drain instantly and cut the very connections this exists to
 // let finish.
+//
+// THE DEADLINE CAN EXPIRE WITH NOTHING IN FLIGHT, and Close is what ends that
+// case. A connection the server has ACCEPTED but that has sent no request
+// header is StateNew, and Shutdown counts it as idle only once it has been so
+// for more than five seconds (net/http's closeIdleConns, "Issue 22682"), so a
+// five-second deadline is a photo finish the deadline wins. Measured with a
+// standalone probe: one accepted-but-silent connection returned `context
+// deadline exceeded` after exactly 5s under a 5s deadline. A node makes one
+// whenever its loop is cancelled between dialling and writing a request.
 func stopServing(ctx context.Context, srv *http.Server, what string) {
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()

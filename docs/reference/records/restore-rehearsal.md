@@ -10,7 +10,7 @@ Two legs now do that on every pull request. They are split because neither can d
 
 | | What it is | What only it can prove |
 |---|---|---|
-| `go test ./internal/e2e -run TestARestoredDeployment` | A deployment assembled through `internal/wiring`, exactly as `billet server` assembles one, backed up and restored into a directory that has never seen it | That the restored control plane **serves**: the same node, holding the certificate the ORIGINAL deployment issued and having enrolled with nothing, connects over the real mTLS wire and is accepted |
+| `go test ./internal/e2e -run TestARestoredDeployment` | A deployment whose node wire is assembled through `internal/app`'s `BuildNodeWire`, exactly as `billet server` assembles it, backed up and restored into a directory that has never seen it | That the restored control plane **serves**: the same node, holding the certificate the ORIGINAL deployment issued and having enrolled with nothing, connects over the real mTLS wire and is accepted |
 | `make restore-rehearsal` | The real `.deb` in a container that has never run billet, driving the real `billet local backup`, `restore` and `recover` | That a **packaged Linux host** can do it: the `billet` service account, the state directory's ownership and modes, and the config template an operator actually edits |
 
 Both run in CI — the first with the ordinary test suite, the second in the `package-lifecycle` job — so this is a gate rather than a document, and it is cheap enough that no schedule is needed.

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/simulated"
 )
@@ -123,11 +122,6 @@ func (f Fleet) boot() time.Duration {
 	}
 
 	return DefaultBoot
-}
-
-// limits is the allocator's ceiling, as cmd/billet builds it from a config.
-func (f Fleet) limits() alloc.Limits {
-	return alloc.Limits{MaxVCPU: f.MaxVCPU, MaxMemory: f.MaxMemory}
 }
 
 // tiers renders the fleet's shapes as the catalogue alloc.New and the plane

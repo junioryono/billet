@@ -110,6 +110,8 @@ type Plane struct {
 	// barriers is the durable half of a compute barrier, or nil for a plane that
 	// is not asked to prove anything.
 	barriers BarrierStore
+	// barrierPace replaces the loop's own waits between rounds when set.
+	barrierPace time.Duration
 
 	// deployment is the identity this control plane belongs to. A node carrying a
 	// different one is refused: it would label its compute with an identity this

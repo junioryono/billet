@@ -20,7 +20,6 @@ import (
 	"github.com/junioryono/billet/internal/provider/codebuild"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
-	"github.com/junioryono/billet/internal/state"
 )
 
 // THE HOLDER-GONE REPRODUCTIONS, WRITTEN BEFORE ANY FIX.
@@ -588,14 +587,6 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 		t.Fatalf("scaleset.New: %v", err)
 	}
 
-	db, err := state.Open(t.Context(), dir)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-
-	closeDB := sync.OnceFunc(func() { _ = db.Close() })
-	t.Cleanup(closeDB)
-
 	// THE FAKE GITHUB SERVES ONE SCALE SET, under testTier's label, so the tier
 	// carries that label whatever backend runs it.
 	tiers := []config.Tier{{
@@ -613,16 +604,34 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 
 	clock := &offsetClock{}
 
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, tiers,
-		alloc.WithClock(clock.now), alloc.WithLeaseTTL(cbWireTTL))
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
+	reapEvery := wc.reapEvery
+	if reapEvery == 0 {
+		reapEvery = 200 * time.Millisecond
 	}
 
-	deployment, err := state.DeploymentID(dir)
-	if err != nil {
-		t.Fatalf("DeploymentID: %v", err)
-	}
+	// THE SERVER'S OWN SECOND SIGNAL, separate from the node's: this stack stops
+	// a node process while the control plane keeps running, and a channel shared
+	// with the server would end the plane's drain later for the wrong reason.
+	serverHurry := make(chan struct{})
+
+	c := openAssembled(t, harnessConfig(dir, 64, 256*config.GiB, tiers),
+		[]app.Target{{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client}},
+		&app.Steering{
+			Allocator: []alloc.Option{alloc.WithClock(clock.now), alloc.WithLeaseTTL(cbWireTTL)},
+			// A SHORT COMMAND TIMEOUT, because a destroy queued for a process that is
+			// gone otherwise waits ten minutes before the plane will say so.
+			Plane: []nodeplane.Option{nodeplane.WithCommandTimeout(10 * time.Second)},
+			Owner: harnessOwner,
+			Server: []server.ControlPlaneOption{
+				server.WithReapInterval(reapEvery),
+				server.WithDrainTimeout(200 * time.Millisecond),
+				// A completion whose holder is gone settles on a LATER attempt, and the
+				// default pacing would wait fifteen seconds and then minutes for it.
+				server.WithCleanupRetry(200*time.Millisecond, time.Second),
+			},
+		})
+
+	deployment := c.ctl.Deployment()
 
 	shapes := []config.RemoteShape{
 		{Type: "BUILD_GENERAL1_MEDIUM", VCPU: 4, Memory: 7 * config.GiB, PriceUSDPerHour: 10000},
@@ -654,46 +663,27 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 	const host = "aws-cb-wire"
 
 	// THE NODE'S OWN SECOND SIGNAL, separate from the server's: this stack stops
-	// a node process while the control plane keeps running, and a channel shared
-	// with the server would end the plane's drain later for the wrong reason.
+	// a node process while the control plane keeps running.
 	nodeHurry := make(chan struct{})
-	serverHurry := make(chan struct{})
 
-	// A SHORT COMMAND TIMEOUT, because a destroy queued for a process that is
-	// gone otherwise waits ten minutes before the plane will say so.
-	first, wire, wireAddr, serverOpts := wireUp(
-		t, log, a, client, prov, config.ProviderCodeBuild, shapes, tiers, deployment,
-		host, nodeHurry, wireOptions{
-			plane:        []nodeplane.Option{nodeplane.WithCommandTimeout(10 * time.Second)},
-			supersedable: wc.supersedable,
-		})
+	first := startFirstNode(t, log, c, nodeProcess{
+		host: host, deployment: deployment, provider: prov, kind: config.ProviderCodeBuild, shapes: shapes,
+		hurry: nodeHurry, supersedable: wc.supersedable,
+	})
 
 	stopWithHurry := sync.OnceFunc(func() {
 		close(nodeHurry)
 		first.stop()
 	})
 
-	reapEvery := wc.reapEvery
-	if reapEvery == 0 {
-		reapEvery = 200 * time.Millisecond
-	}
-
-	serverOpts = append(serverOpts,
-		server.WithReapInterval(reapEvery),
-		server.WithDrainTimeout(200*time.Millisecond),
-		server.WithHurry(serverHurry),
-		// A completion whose holder is gone settles on a LATER attempt, and the
-		// default pacing would wait fifteen seconds and then minutes for it.
-		server.WithCleanupRetry(200*time.Millisecond, time.Second))
-
-	srv := server.New(a, app.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
+	scheduler := c.schedule(t, app.ScheduleOptions{Hurry: serverHurry})
 
 	return &wiredCodeBuild{
 		stack: &stack{
 			hurry: serverHurry,
-			dir:   dir, closeDB: closeDB, plane: p, alloc: a, db: db,
-			runner: first.runner, server: srv, provider: prov, node: host, tiers: tiers,
-			wire: wire, stopNode: stopWithHurry, wireAddr: wireAddr,
+			dir:   dir, closeDB: c.close, plane: p, alloc: c.ctl.Allocator(), db: c.ctl.Ledger(),
+			runner: first.runner, scheduler: scheduler, provider: prov, node: host, tiers: tiers,
+			wire: c.wire.Plane(), stopNode: stopWithHurry, wireAddr: c.wire.Addr,
 		},
 		fake:       fake,
 		clock:      clock,

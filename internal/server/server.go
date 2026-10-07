@@ -301,6 +301,9 @@ func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
 	}, nil
 }
 
+// Owner is the name this control plane gives GitHub's message queue.
+func (s *Server) Owner() string { return s.owner }
+
 // AdvertiseNothing makes every listener advertise zero capacity.
 //
 // It exists so the whole path — App auth, scale-set reconciliation, session,
