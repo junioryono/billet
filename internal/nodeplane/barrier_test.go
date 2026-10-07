@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -955,10 +956,10 @@ func (s *countingBarrierStore) ComputeBarrierInForce(ctx context.Context) (alloc
 	return s.barrierStore.ComputeBarrierInForce(ctx)
 }
 
-// A STEERED PACE IS THE LOOP'S PACE. With nothing to prove the loop waits its
-// own five seconds between rounds; a pace of a millisecond must make it ask
-// many times in the span the default asks once, and a pace of an hour must
-// leave it at the one round it starts with.
+// A STEERED PACE IS THE LOOP'S PACE. Unsteered, the loop starts with a round and
+// waits its own five seconds between rounds; a pace of a millisecond must make
+// it ask many times in the span the default asks once, and a pace of an hour
+// must hold even the first round back, which the default does not.
 func TestTheBarrierLoopKeepsASteeredPace(t *testing.T) {
 	t.Parallel()
 
@@ -993,7 +994,50 @@ func TestTheBarrierLoopKeepsASteeredPace(t *testing.T) {
 	}
 
 	held := time.Now().Add(200 * time.Millisecond)
-	if n := run(time.Hour, func(int64) bool { return time.Now().After(held) }); n != 1 {
-		t.Errorf("an hour's pace started %d rounds in 200ms, want the one it starts with", n)
+	if n := run(0, func(int64) bool { return time.Now().After(held) }); n != 1 {
+		t.Errorf("the unsteered loop started %d rounds in 200ms, want the one it starts with", n)
 	}
+}
+
+// AND A LONG PACE HOLDS FOR ALL OF ITS LENGTH, past the loop's own five
+// seconds: no round before the first hour, one at it, and no second before the
+// next. In a synctest bubble, so the hours are the bubble's.
+func TestTheBarrierLoopWaitsOutALongPace(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		store := &countingBarrierStore{barrierStore: newBarrierStore()}
+		store.hasBarrier = false
+
+		p := testPlane(t, WithBarrierStore(store), WithBarrierPace(time.Hour))
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			p.BarrierLoop(ctx)
+		}()
+
+		for _, step := range []struct {
+			after time.Duration
+			want  int64
+		}{
+			{59 * time.Minute, 0},
+			{2 * time.Minute, 1},
+			{58 * time.Minute, 1},
+			{2 * time.Minute, 2},
+		} {
+			time.Sleep(step.after)
+			synctest.Wait()
+
+			if n := store.rounds.Load(); n != step.want {
+				t.Fatalf("%d rounds after another %v under an hour's pace, want %d", n, step.after, step.want)
+			}
+		}
+
+		cancel()
+		<-done
+	})
 }

@@ -560,12 +560,22 @@ linters:
         # production assembly would be one the order and the tests do not reach.
         # These are the constructors with no production caller outside it,
         # measured at zero when the ban went in (#356 Phase 3c); the owning
-        # packages and tests are exempt below. The
-        # constructors cmd/billet's operator commands still call (state.Open*,
-        # alloc.New, the backends' and stores' New, awscreds.Default,
-        # scaleset.New) join this as #356 Phase 4 moves those commands out.
-        - pattern: '^(server\.New|nodeplane\.(New|Handler|BootstrapHandler)|node\.New|nodeclient\.(New|Run)|rollout\.NewCoordinator)$'
-          msg: "Build the control plane and the node through internal/app (OpenControlPlane and the Controller's steps, OpenNode, NewNodeClient, NewNodeRunner, RunNodeLoop); see ADR-015."
+        # packages and tests are exempt below, one message per constructor's
+        # package so each package's exemption covers its own constructor and no
+        # other. The constructors cmd/billet's operator commands still call
+        # (state.Open*, alloc.New, the backends' and stores' New,
+        # awscreds.Default, scaleset.New) join this as #356 Phase 4 moves those
+        # commands out.
+        - pattern: '^server\.New$'
+          msg: "Build the scheduler through internal/app (ADR-015)."
+        - pattern: '^nodeplane\.(New|Handler|BootstrapHandler)$'
+          msg: "Build the node plane through internal/app (ADR-015)."
+        - pattern: '^node\.New$'
+          msg: "Build the node runtime through internal/app (ADR-015)."
+        - pattern: '^nodeclient\.(New|Run)$'
+          msg: "Build the node client and its loop through internal/app (ADR-015)."
+        - pattern: '^rollout\.NewCoordinator$'
+          msg: "Build the rollout coordinator through internal/app (ADR-015)."
         - pattern: '^ledgerdb\.New$'
           msg: "Bind the generated queries through state.ReadQueries or state.WriteQueries. ledgerdb.New returns every method, which gives away the compile-time read/write split those two exist to keep."
 
@@ -656,15 +666,35 @@ linters:
 
       # internal/app IS the composition root, so it is the one package that
       # calls the role constructors, and each constructor's own package may call
-      # it too (forbidigo names an unqualified New by its package, as server.New).
-      # Anchored to files directly in each package, as the ledgerdb exclusion
-      # above is, so no subpackage inherits the permission, and matched on the
-      # ban's message rather than on how the call is spelled, which an import
-      # alias changes.
-      - path: (^|/)internal/(app|server|nodeplane|node|nodeclient|rollout)/[^/]+\.go$
+      # that constructor (forbidigo names an unqualified New by its package, as
+      # server.New) and no other. Anchored to files directly in each package, as
+      # the ledgerdb exclusion above is, so no subpackage inherits the
+      # permission, and matched on each ban's own message rather than on how the
+      # call is spelled, which an import alias changes.
+      - path: (^|/)internal/(app|server)/[^/]+\.go$
         linters:
           - forbidigo
-        text: 'forbidden because "Build the control plane and the node through internal/app'
+        text: 'forbidden because "Build the scheduler through internal/app'
+
+      - path: (^|/)internal/(app|nodeplane)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the node plane through internal/app'
+
+      - path: (^|/)internal/(app|node)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the node runtime through internal/app'
+
+      - path: (^|/)internal/(app|nodeclient)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the node client and its loop through internal/app'
+
+      - path: (^|/)internal/(app|rollout)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the rollout coordinator through internal/app'
 
       # THE USER-SPACE RESOLVER IS THE CONTAINMENT. resolveInRoot walks a path
       # component by component under a root and stats every step, which is how
@@ -767,9 +797,13 @@ linters:
       # program DIRECTORY, so a stray .go file directly under scripts/ — which
       # would be part of the package the shell-script tests live in — is not
       # covered.
+      #
+      # EVERY BAN BUT THE ASSEMBLY'S, as cmd/billet's exemption above: a tool
+      # here that built a control plane or a node would be a second assembly.
       - path: (^|/)scripts/[a-z]+/
         linters:
           - forbidigo
+        text: 'forbidden because "(Use log/slog|Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
 
 issues:
   max-issues-per-linter: 0

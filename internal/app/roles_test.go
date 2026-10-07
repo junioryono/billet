@@ -282,21 +282,38 @@ func TestSteeredSchedulerOptionsComeLast(t *testing.T) {
 		return true
 	})
 
+	// EXACTLY serverOpts = append(serverOpts, cp.steering.Server...): the
+	// assembly's options first, the steered ones after them, all of them kept.
 	steered := false
 
 	if lastAssign != nil && len(lastAssign.Rhs) == 1 {
-		ast.Inspect(lastAssign.Rhs[0], func(n ast.Node) bool {
-			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Server" {
-				if inner, ok := sel.X.(*ast.SelectorExpr); ok && inner.Sel.Name == "steering" {
-					steered = true
-				}
-			}
+		if call, ok := lastAssign.Rhs[0].(*ast.CallExpr); ok && len(call.Args) == 2 && call.Ellipsis.IsValid() {
+			fn, fnOK := call.Fun.(*ast.Ident)
+			first, firstOK := call.Args[0].(*ast.Ident)
+			second, secondOK := call.Args[1].(*ast.SelectorExpr)
 
-			return true
-		})
+			if fnOK && firstOK && secondOK && fn.Name == "append" && first.Name == "serverOpts" &&
+				second.Sel.Name == "Server" && namesSelector(second.X, "cp", "steering") {
+				steered = true
+			}
+		}
 	}
 
-	if !built || !steered {
-		t.Error("Schedule's last assignment to its scheduler options before server.New does not append the steered ones")
+	// AND THAT IS WHAT server.New IS GIVEN, as its last argument, spread.
+	consumed := false
+
+	ast.Inspect(schedule.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && namesSelector(call.Fun, "server", "New") && call.Ellipsis.IsValid() {
+			if last, ok := call.Args[len(call.Args)-1].(*ast.Ident); ok && last.Name == "serverOpts" {
+				consumed = true
+			}
+		}
+
+		return true
+	})
+
+	if !built || !steered || !consumed {
+		t.Error("Schedule does not hand server.New its options with the steered ones appended last: " +
+			"want serverOpts = append(serverOpts, cp.steering.Server...) then server.New(..., serverOpts...)")
 	}
 }
