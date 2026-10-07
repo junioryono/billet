@@ -614,6 +614,10 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		}
 	}
 
+	if n := calls(app["NewNodeClient"], "nodeclient", "New"); n != 1 {
+		t.Errorf("app.NewNodeClient calls nodeclient.New %d times, want once", n)
+	}
+
 	if app["open"] == nil {
 		t.Fatal("(*Node).open is not in internal/app/node.go")
 	}
@@ -690,8 +694,20 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 
 	ast.Inspect(app["Run"].Body, func(node ast.Node) bool {
 		switch x := node.(type) {
+		case *ast.ValueSpec:
+			for _, name := range x.Names {
+				if name.Name == "host" {
+					t.Error("Node.Run declares a host of its own, shadowing the one it was given")
+				}
+			}
 		case *ast.AssignStmt:
 			for _, lhs := range x.Lhs {
+				// THE HOST WHOLE, ONE OF ITS FIELDS, OR A NEW host SHADOWING IT:
+				// each would hand the loop something other than what cmdNode gave.
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == "host" {
+					t.Errorf("Node.Run assigns host itself (%s)", x.Tok)
+				}
+
 				if sel, ok := lhs.(*ast.SelectorExpr); ok {
 					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "host" {
 						t.Errorf("Node.Run writes host.%s", sel.Sel.Name)
@@ -735,8 +751,9 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		return true
 	})
 
-	if passed != 1 {
-		t.Errorf("Node.Run hands nodeclient.Run RegistrationRecordPath: host.RegistrationRecordPath %d times, want once", passed)
+	if passed != 1 || calls(app["Run"], "nodeclient", "Run") != 1 {
+		t.Errorf("Node.Run hands nodeclient.Run RegistrationRecordPath: host.RegistrationRecordPath %d times "+
+			"over %d calls of it, want one call and once", passed, calls(app["Run"], "nodeclient", "Run"))
 	}
 
 	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.
