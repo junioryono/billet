@@ -233,9 +233,10 @@ func ServeNodeWire(
 	// ASSEMBLED BY BuildNodeWire, NOT HERE, AND IT HANDS BACK THE HANDLER
 	// RATHER THAN THE PIECES. What the server presents, what it accepts and what
 	// renewal signs with are three answers that must describe one moment and one
-	// authority — and this function takes six collaborators to stand up, so
-	// little here is asserted directly. Returning the options and installing them
-	// from the caller was the first attempt and had
+	// authority, so BuildNodeWire assembles them from one read and this function
+	// only installs what it returns; the serving tests here prove it is installed
+	// (TestTheServedWireCarriesTheFleetOntoTheNewAuthority). Returning the options
+	// and installing them from the caller was the first attempt and had
 	// the same shape as the bug it fixed: deleting the line that installed them
 	// left every test green.
 	wire, err := BuildNodeWire(NodeWireRequest{
