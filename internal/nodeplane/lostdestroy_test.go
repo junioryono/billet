@@ -29,11 +29,14 @@ func TestALostDestroyIsGivenAgainToTheProcessThatPolls(t *testing.T) {
 	t.Parallel()
 
 	p := testPlane(t, WithCommandTimeout(time.Hour))
+	p.SetPollWindowForTest(50 * time.Millisecond)
 	registerIncarnation(t, p, "n1", "n1-a")
 
 	destroyed := make(chan error, 1)
 
 	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
+
+	waitForQueued(t, p, "n1")
 
 	lost, ok, err := p.Poll(t.Context(), "n1", "n1-a")
 	if err != nil || !ok || lost.Kind != nodeapi.CommandDestroy {
@@ -78,6 +81,10 @@ func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 		_ = p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
+	// QUEUED BEFORE IT IS POLLED FOR, because the window is short for the polls
+	// that must find nothing, and a slow dispatch would read as a refusal.
+	waitForQueued(t, p, "n1")
+
 	launch, ok, err := p.Poll(t.Context(), "n1", "n1-a")
 	if err != nil || !ok || launch.Kind != nodeapi.CommandLaunch {
 		t.Fatalf("the first poll took %+v (ok %v, err %v), want the launch", launch, ok, err)
@@ -90,6 +97,8 @@ func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 	destroyed := make(chan error, 1)
 
 	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 43) }()
+
+	waitForQueued(t, p, "n1")
 
 	destroy, ok, err := p.Poll(t.Context(), "n1", "n1-a")
 	if err != nil || !ok || destroy.Kind != nodeapi.CommandDestroy {
