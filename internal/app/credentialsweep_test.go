@@ -262,11 +262,16 @@ func TestTheControllerSweepRecordsEveryPathAndContinuesPastAFailingOne(t *testin
 
 	passA, passB := recs[0], recs[1]
 
-	if passA.Path != "/billet/a/jit" || passA.Removed != 1 || passA.Unaccounted != 1 || passA.Error != "" {
+	// EXACTLY THESE RECORDS, because cmd/billet's status test prints the same
+	// two from the ledger: a region, a total or an error written differently
+	// here would leave that test proving a report of records the sweep never
+	// writes.
+	if passA.Path != "/billet/a/jit" || passA.Region != "us-west-2" || passA.Removed != 1 ||
+		passA.Unaccounted != 1 || passA.Error != "" {
 		t.Errorf("path a recorded as %+v", passA)
 	}
 
-	if passB.Path != "/billet/b/jit" || !strings.Contains(passB.Error, "scripted refusal") {
+	if passB.Path != "/billet/b/jit" || passB.Region != "us-west-2" || passB.Error != "scripted refusal of path b" {
 		t.Errorf("path b recorded as %+v; a path whose sweeper could not be built must say so", passB)
 	}
 }

@@ -11,9 +11,9 @@ import (
 )
 
 // STATUS SAYS EVERY SWEEP THE LEDGER RECORDED, including the host nothing sweeps
-// after. The passes are written as the controller's sweep records them
-// (internal/app's credential sweep test drives the sweep itself); this is the
-// report another process prints from them.
+// after. The two passes are the ones internal/app's credential sweep test
+// drives the sweep to record and pins field by field; this is the report
+// another process prints from them.
 func TestStatusReportsEveryRecordedCredentialSweep(t *testing.T) {
 	db, err := state.Open(t.Context(), t.TempDir())
 	if err != nil {
