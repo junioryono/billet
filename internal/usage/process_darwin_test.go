@@ -3,7 +3,9 @@
 package usage
 
 import (
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -93,6 +95,15 @@ func spin() {
 	spinSink = x
 }
 
+// systemMicros is the system CPU this process has used, as getrusage reports it.
+func systemMicros(t *testing.T) int64 {
+	t.Helper()
+
+	_, system := rusageMicros(t)
+
+	return system
+}
+
 // THE REAL KERNEL ANSWERS FOR THIS PROCESS: it has a start, the CPU it just
 // burned, a footprint, and its own executable's path.
 func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
@@ -123,6 +134,28 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 		spin()
 	}
 
+	// AND SYSTEM CPU THE SAME WAY: reading /dev/zero is the kernel filling a
+	// buffer, so it burns system time until getrusage says 100ms more of it was
+	// used, and a reader that lost system time (a zero, or a field read from the
+	// wrong offset) fails the floor below rather than passing on user time alone.
+	zero, err := os.Open("/dev/zero")
+	if err != nil {
+		t.Fatalf("open /dev/zero: %v", err)
+	}
+	defer zero.Close()
+
+	buf := make([]byte, 1<<20)
+	startSystem := systemMicros(t)
+	for limit := time.Now().Add(30 * time.Second); systemMicros(t)-startSystem < 100_000; {
+		if time.Now().After(limit) {
+			t.Fatal("30s of wall time gave this process less than 100ms of system CPU")
+		}
+
+		if _, err := io.ReadFull(zero, buf); err != nil {
+			t.Fatalf("read /dev/zero: %v", err)
+		}
+	}
+
 	after, err := Reader{}.ProcessCounters(os.Getpid())
 	if err != nil {
 		t.Fatalf("read this process again: %v", err)
@@ -143,8 +176,9 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 		t.Errorf("billet read %dµs of user CPU where getrusage saw at most %dµs", used, most-bracketSlack)
 	}
 
-	if used, most := after.SystemMicros-before.SystemMicros, outerSystem1-outerSystem0+bracketSlack; used < 0 || used > most {
-		t.Errorf("billet read %dµs of system CPU where getrusage saw %dµs", used, most-bracketSlack)
+	if used, most := after.SystemMicros-before.SystemMicros, outerSystem1-outerSystem0+bracketSlack; used < 50_000 || used > most {
+		t.Errorf("100ms of system CPU by getrusage read as %dµs of system CPU, where getrusage saw %dµs "+
+			"over the whole window", used, most-bracketSlack)
 	}
 	if used := (after.UserMicros + after.SystemMicros) - (before.UserMicros + before.SystemMicros); used < 200_000 ||
 		used > 30_000_000 {
@@ -175,5 +209,37 @@ func TestThisProcessReadsItsOwnAccounting(t *testing.T) {
 	}
 	if _, err := ProcessPath(1 << 30); err == nil {
 		t.Error("ProcessPath answered for a pid no process has")
+	}
+	if _, err := (Reader{}).ProcessCounters(1 << 30); err == nil {
+		t.Error("ProcessCounters answered for a pid no process has")
+	}
+}
+
+// THE PID ASKED FOR IS THE PROCESS READ: a child's record carries its own
+// start, not this process's, so a reader that ignored its argument and read
+// itself fails here.
+func TestAnotherProcessIsReadByItsPid(t *testing.T) {
+	self, err := Reader{}.ProcessCounters(os.Getpid())
+	if err != nil {
+		t.Fatalf("read this process: %v", err)
+	}
+
+	child := exec.CommandContext(t.Context(), "/bin/sleep", "30")
+	if err := child.Start(); err != nil {
+		t.Fatalf("start a child: %v", err)
+	}
+	t.Cleanup(func() {
+		//nolint:errcheck // the child is killed on purpose; its exit status says nothing.
+		_ = child.Process.Kill()
+		//nolint:errcheck // as above.
+		_ = child.Wait()
+	})
+
+	other, err := Reader{}.ProcessCounters(child.Process.Pid)
+	if err != nil {
+		t.Fatalf("read the child: %v", err)
+	}
+	if other.Start == 0 || other.Start == self.Start {
+		t.Errorf("the child's start read as %d, this process's is %d", other.Start, self.Start)
 	}
 }

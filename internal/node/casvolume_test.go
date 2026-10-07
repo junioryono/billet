@@ -721,6 +721,31 @@ func TestAFailedMergeDiscardsItsClone(t *testing.T) {
 	}
 }
 
+// A FULL VOLUME REFUSES A WRITE with 507 and stores nothing, and the same write
+// is taken once the volume has room again; the job builds either way.
+func TestAFullVolumeRefusesAWrite(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := casService(t, provider.TrustTrusted, goBazelCache(), &fakeCacheStore{})
+	if code := putObject(t, service, token, "before it filled"); code != http.StatusOK {
+		t.Fatalf("PUT on a volume with room = %d", code)
+	}
+
+	service.casFill = 0
+	if code := putObject(t, service, token, "once it filled"); code != http.StatusInsufficientStorage {
+		t.Fatalf("PUT on a full volume = %d, want %d", code, http.StatusInsufficientStorage)
+	}
+
+	service.casFill = 1
+	get := casRequest(t, service, token, http.MethodGet, "/v1/cas/go/cas/"+digestOf("once it filled"), "")
+	if get.Code != http.StatusNotFound {
+		t.Fatalf("GET of the refused object = %d, want %d: the full volume stored it", get.Code, http.StatusNotFound)
+	}
+	if code := putObject(t, service, token, "once it filled"); code != http.StatusOK {
+		t.Fatalf("PUT once the volume has room = %d", code)
+	}
+}
+
 // A FULL GENERATION IS NOT MERGED INTO FOREVER: a job that finds its clone
 // past the fill line starts empty, and what it publishes replaces the full
 // generation rather than being refused alongside it.
