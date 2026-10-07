@@ -659,7 +659,7 @@ func runServer(
 	// is what makes a failover a failover rather than an outage.
 	//
 	// A NO-OP unless this deployment keeps its identity in a store.
-	if err := adoptSharedAuthority(ctx, cfg, deployment, slog.Default()); err != nil {
+	if err := app.AdoptSharedAuthority(ctx, cfg, authorityLockAccess, deployment, slog.Default()); err != nil {
 		return fmt.Errorf("node-wire authority: %w", err)
 	}
 
@@ -761,7 +761,7 @@ func runServer(
 	// by now, and a store that cannot be written is a reason to look at IAM rather
 	// than to take a working deployment offline. What it costs is that the other
 	// controller has nothing to adopt.
-	publishSharedAuthority(ctx, cfg, deployment, slog.Default())
+	app.PublishSharedAuthority(ctx, cfg, authorityLockAccess, deployment, slog.Default())
 
 	// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness now decides what its
 	// tier advertises, and an idle deployment never launches, lists or destroys —
@@ -790,8 +790,8 @@ func runServer(
 	// process was assembled, not of the scheduler.
 	coordinator := rollout.NewCoordinator(
 		rollout.New(db),
-		ledgerFleet{alloc: allocator},
-		planeDispatcher{runner: planeRunner},
+		app.LedgerFleet{Alloc: allocator},
+		app.PlaneDispatcher{Runner: planeRunner},
 		version.Version(),
 		nodeapi.VersionNodeUpgrade,
 		rollout.WithCoordinatorLogger(slog.Default()),
@@ -802,7 +802,7 @@ func runServer(
 	// exist when the channel advances. It resolves the channel through the same
 	// functions `billet rollout start` does, so the two cannot disagree about
 	// what a target is.
-	starter, err := newRolloutStarter(cfg, rollout.New(db), ledgerFleet{alloc: allocator},
+	starter, err := app.NewRolloutStarter(cfg, rollout.New(db), app.LedgerFleet{Alloc: allocator},
 		releasesource.Host(version.Version(),
 			releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
 			state.LatestSchemaVersion(), firecracker.GuestContract))
@@ -821,7 +821,7 @@ func runServer(
 		// the fleet's registrations, so a deployment with no codebuild node sweeps
 		// nothing and resolves no credential.
 		server.WithStagedCredentialSweeper(
-			newControllerCredentialSweep(allocator, db, awscreds.Default(), slog.Default())),
+			app.NewControllerCredentialSweep(allocator, db, awscreds.Default(), slog.Default())),
 	)
 
 	plane := server.New(allocator, nil, cfg.Tiers, owner, slog.Default(), opts...)

@@ -35,7 +35,7 @@ var authoritativeAfterTheClaim = []string{
 	"Run",
 	// AND THE AUTHORITY IS ADOPTED AFTER THE CLAIM TOO, because installing
 	// identity material is a write on a deployment this host may not hold.
-	"adoptSharedAuthority",
+	"AdoptSharedAuthority",
 }
 
 // EVERYTHING AUTHORITATIVE HAPPENS AFTER THE CLAIM.
@@ -146,9 +146,9 @@ func TestTheAuthorityIsAdoptedBeforeTheWireAndPublishedAfterIt(t *testing.T) {
 		return true
 	})
 
-	adopt, adopted := first["adoptSharedAuthority"]
+	adopt, adopted := first["AdoptSharedAuthority"]
 	wire, served := first["ServeNodeWire"]
-	publish, published := first["publishSharedAuthority"]
+	publish, published := first["PublishSharedAuthority"]
 
 	switch {
 	case !adopted:

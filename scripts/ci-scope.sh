@@ -83,21 +83,25 @@ is_documentation() {
 # The packages the replay harness builds and runs (go list -deps of
 # internal/replay's tests), with their embedded assets and testdata;
 # TestCIScopeReplayRuleCoversTheReplayClosure holds this list to that closure.
-# provider and store include everything but their backend packages, which
-# replay does not import, so a new asset or testdata directory under either is
-# included rather than silently left out.
+# provider and store include everything but the backend packages replay does
+# not import, so a new asset or testdata directory under either is included
+# rather than silently left out. codebuild is one it does import, through
+# internal/app's credential sweep.
 is_replay_input() {
 	case "$1" in
-	internal/provider/codebuild/* | internal/provider/docker/* | internal/provider/ec2/* | \
+	internal/provider/docker/* | internal/provider/ec2/* | \
 		internal/provider/firecracker/* | internal/provider/tart/* | \
 		internal/store/ceph/* | internal/store/ebss3/*) return 1 ;;
 	internal/provider/* | internal/store/*) return 0 ;;
-	internal/alloc/* | internal/app/* | internal/config/* | internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
+	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
+		internal/awsquota/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
+		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/importcheck/* | internal/lease/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
-		internal/provenance/* | internal/regularfile/* | internal/replay/* | internal/retirement/* | \
+		internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
+		internal/replay/* | internal/retirement/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
-		internal/usage/* | internal/version/* | internal/wirecert/*) return 0 ;;
+		internal/usage/* | internal/version/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
 	*) return 1 ;;
 	esac
 }

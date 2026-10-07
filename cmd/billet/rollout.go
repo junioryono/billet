@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider/firecracker"
@@ -134,12 +135,12 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		return err
 	}
 
-	policy, err := releasePolicyFor(cfg, *skipVerify)
+	policy, err := app.ReleasePolicyFor(cfg, *skipVerify)
 	if err != nil {
 		return err
 	}
 
-	target, digest, err := resolveTarget(ctx, client, policy, *channel, *pin)
+	target, digest, err := app.ResolveTarget(ctx, client, policy, *channel, *pin)
 	if err != nil {
 		return err
 	}
@@ -220,33 +221,6 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 	return nil
 }
 
-// releasePolicyFor decides what a release manifest must be signed by for this
-// deployment.
-//
-// ONE ANSWER FOR THE COMMAND, THE UPDATER AND THE AUTOMATIC STARTER. A
-// deployment mirroring billet's releases internally names its own signing
-// identity and issuer in `release:`, and a path that consulted only the built-in
-// default would refuse that mirror's every manifest — or, with the waiver, trust
-// it unsigned. The waiver still wins, because skipping verification is an act
-// somebody performs on the command line rather than something a config implies.
-func releasePolicyFor(cfg *config.Config, skipVerify bool) (releasesource.Policy, error) {
-	policy, err := releasesource.PolicyForRelease(skipVerify)
-	if err != nil || skipVerify || cfg == nil || cfg.Release == nil {
-		return policy, err
-	}
-
-	if cfg.Release.SigningIdentity != "" {
-		if cfg.Release.SigningIdentity != policy.Identity ||
-			cfg.Release.SigningIssuer != policy.Issuer {
-			policy.SourceRepositoryURI = ""
-		}
-		policy.Identity = cfg.Release.SigningIdentity
-		policy.Issuer = cfg.Release.SigningIssuer
-	}
-
-	return policy, nil
-}
-
 // ErrDowngrade means a target older than the running release was asked for
 // without saying so.
 var ErrDowngrade = errors.New("this target is older than the release running here")
@@ -300,26 +274,6 @@ func checkConvergibleDowngrade(target string) error {
 		"control plane would dispatch no node. Move hosts one at a time with "+
 		"`billet host-upgrade --version %s --allow-downgrade`", ErrDowngrade, target,
 		firstSelfNamingRelease, target)
-}
-
-// resolveTarget turns a channel or an exact pin into one immutable manifest.
-func resolveTarget(ctx context.Context, client *releasesource.Client,
-	policy releasesource.Policy, channel, pin string,
-) (*releasesource.Manifest, string, error) {
-	// AN EXACT PIN NEVER MOVES, and it is resolved without touching a channel at
-	// all. An operator who typed a version is asking for that version, and
-	// consulting a pointer would let a channel's opinion reach a decision the
-	// operator had already made.
-	if pin != "" {
-		return client.Manifest(ctx, pin, "", policy)
-	}
-
-	statement, err := client.Resolve(ctx, channel, policy)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return client.Manifest(ctx, statement.Tag, statement.ManifestSHA256, policy)
 }
 
 func channelOrPin(channel, pin string) string {

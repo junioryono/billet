@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -44,7 +45,7 @@ func cmdCASync(ctx context.Context, args []string) error {
 		return err
 	}
 
-	store := authorityStoreFor(cfg)
+	store := app.AuthorityStoreFor(cfg)
 	if store == nil {
 		return fmt.Errorf(
 			"this deployment keeps its node-wire authority as files in %s (server.identity."+
@@ -78,7 +79,7 @@ func cmdCASync(ctx context.Context, args []string) error {
 					"replaces the store's copy either way")
 		}
 
-		if err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
+		if err := app.WithAuthorityLock(ctx, cfg, authorityLockAccess, log, func(dir string) error {
 			return wireshare.Publish(ctx, store, dir, deployment)
 		}); err != nil {
 			return err
@@ -93,7 +94,7 @@ func cmdCASync(ctx context.Context, args []string) error {
 
 	var adopted wireshare.Adopted
 
-	if err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
+	if err := app.WithAuthorityLock(ctx, cfg, authorityLockAccess, log, func(dir string) error {
 		var err error
 		adopted, err = wireshare.Adopt(ctx, store, dir, deployment, *force)
 

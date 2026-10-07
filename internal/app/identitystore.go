@@ -1,11 +1,9 @@
-package main
+package app
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsssm"
@@ -68,9 +66,9 @@ func (s *ssmAuthorityStore) PutAuthority(ctx context.Context, body []byte) error
 	return err
 }
 
-// authorityStoreFor is the deployment's identity store, or nil when it keeps its
+// AuthorityStoreFor is the deployment's identity store, or nil when it keeps its
 // authority as files.
-func authorityStoreFor(cfg *config.Config) wireshare.Store {
+func AuthorityStoreFor(cfg *config.Config) wireshare.Store {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return nil
 	}
@@ -78,8 +76,8 @@ func authorityStoreFor(cfg *config.Config) wireshare.Store {
 	return newSSMAuthorityStore(cfg.Server.IdentitySSM())
 }
 
-// adoptSharedAuthority gives this host the authority the deployment already
-// uses, before anything reads one.
+// AdoptSharedAuthority gives this host the authority the deployment already
+// uses, before anything reads one, holding access while it writes.
 //
 // BEFORE app.ServeNodeWire AND AFTER THE CLAIM, and both are load-bearing. The node
 // wire's single authority read goes through LoadOrCreateCA, which CREATES one
@@ -90,15 +88,15 @@ func authorityStoreFor(cfg *config.Config) wireshare.Store {
 //
 // IT TAKES THE AUTHORITY LOCK, because it writes the five files a rotation
 // mutates in sequence.
-func adoptSharedAuthority(
-	ctx context.Context, cfg *config.Config, deployment string, log *slog.Logger,
+func AdoptSharedAuthority(
+	ctx context.Context, cfg *config.Config, access IdentityAccess, deployment string, log *slog.Logger,
 ) error {
-	store := authorityStoreFor(cfg)
+	store := AuthorityStoreFor(cfg)
 	if store == nil {
 		return nil
 	}
 
-	return withAuthorityLock(ctx, cfg, log, func(dir string) error {
+	return WithAuthorityLock(ctx, cfg, access, log, func(dir string) error {
 		adopted, err := wireshare.Adopt(ctx, store, dir, deployment, false)
 		if err != nil {
 			return err
@@ -112,7 +110,8 @@ func adoptSharedAuthority(
 	})
 }
 
-// publishSharedAuthority puts what this host holds into the store.
+// PublishSharedAuthority puts what this host holds into the store, holding
+// access while it reads.
 //
 // AFTER app.ServeNodeWire, because that is what creates an authority on a first
 // controller and there is nothing to publish before it. On every later start the
@@ -123,15 +122,15 @@ func adoptSharedAuthority(
 // rather than to take a working deployment offline — what it costs is that the
 // OTHER host has nothing to adopt yet, which `billet ca sync` and `billet check`
 // both say.
-func publishSharedAuthority(
-	ctx context.Context, cfg *config.Config, deployment string, log *slog.Logger,
+func PublishSharedAuthority(
+	ctx context.Context, cfg *config.Config, access IdentityAccess, deployment string, log *slog.Logger,
 ) {
-	store := authorityStoreFor(cfg)
+	store := AuthorityStoreFor(cfg)
 	if store == nil {
 		return
 	}
 
-	err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
+	err := WithAuthorityLock(ctx, cfg, access, log, func(dir string) error {
 		return wireshare.Publish(ctx, store, dir, deployment)
 	})
 	if err != nil {
@@ -144,52 +143,22 @@ func publishSharedAuthority(
 	log.Info("published this deployment's node-wire authority to the identity store")
 }
 
-// publishRotatedAuthority carries a rotation or a retirement into the store.
-//
-// A ROTATION NOBODY ELSE HEARS ABOUT IS HALF A ROTATION. On a deployment with a
-// second controller the store is how that host learns there is a new authority at
-// all — and after a RETIREMENT it is how that host learns the previous pair is
-// gone, which it would otherwise keep presenting a certificate from.
-//
-// REPORTED AND NOT FATAL, because by the time this runs the operation on THIS
-// host is complete and irreversible. Returning an error would tell an operator
-// their rotation failed when it did not; what they need is the one command that
-// finishes the job.
-func publishRotatedAuthority(ctx context.Context, cfg *config.Config, deployment string) {
-	store := authorityStoreFor(cfg)
-	if store == nil {
-		return
-	}
-
-	log := slog.Default()
-
-	err := withAuthorityLock(ctx, cfg, log, func(dir string) error {
-		return wireshare.Publish(ctx, store, dir, deployment)
-	})
-	if err == nil {
-		fmt.Println("Published the new authority to this deployment's identity store.")
-
-		return
-	}
-
-	fmt.Fprintf(os.Stderr,
-		"\nThis host is done, but publishing to the identity store failed:\n  %v\n\n"+
-			"The other controller cannot see this change until it is published. Fix the\n"+
-			"problem above and run:\n  billet ca sync --push\n", err)
-}
-
-// withAuthorityLock runs fn while this host holds the authority lock.
+// WithAuthorityLock runs fn while this host holds the authority lock, taken
+// through access.
 //
 // ONE PLACE THAT TAKES IT, so the two callers cannot disagree about whether they
 // hold it — and neither of them may call the other, because a second flock on a
 // separate descriptor in the SAME process is denied.
-func withAuthorityLock(ctx context.Context, cfg *config.Config, log *slog.Logger, fn func(dir string) error) error {
+func WithAuthorityLock(
+	ctx context.Context, cfg *config.Config, access IdentityAccess, log *slog.Logger, fn func(dir string) error,
+) error {
 	dir := cfg.Server.IdentityDir
 
 	// THE WHOLE EXCLUSION, not the inner lock alone: on a prepared host the
 	// global lock admitted first, on a legacy host the inner lock with its
-	// recheck. Non-blocking, as an operator command wants.
-	acc, err := openIdentityAccess(ctx, dir, identityIntent{})
+	// recheck. Non-blocking, as an operator command wants (cmd/billet's
+	// authorityLockAccess).
+	release, err := access(ctx, dir)
 	if err != nil {
 		return err
 	}
@@ -200,7 +169,7 @@ func withAuthorityLock(ctx context.Context, cfg *config.Config, log *slog.Logger
 	// authority it just adopted.
 	err = fn(dir)
 
-	if rerr := acc.Release(); rerr != nil {
+	if rerr := release(); rerr != nil {
 		log.Warn("could not release the authority lock", "error", rerr)
 
 		err = errors.Join(err, rerr)
