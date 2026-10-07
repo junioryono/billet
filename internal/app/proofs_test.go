@@ -26,22 +26,26 @@ const appPath = "github.com/junioryono/billet/internal/app"
 
 // proofMakers names, for each value the control plane's order is built from,
 // the one function allowed to create it and the operation it must have
-// performed, successfully, before it does, as the type checker names the
-// function: what is called, not how the call is spelled.
+// performed, successfully, before it does, both as the type checker names a
+// function: what is declared or called, not how it is spelled, so a method of
+// another type with a maker's name is not that maker.
 var proofMakers = map[string]struct{ maker, operation string }{
-	"Controller":         {"BecomeController", appPath + ".becomeController"},
-	"FleetForgotten":     {"ForgetFleet", "(*github.com/junioryono/billet/internal/alloc.Allocator).ForgetEveryNode"},
-	"AdoptedAuthority":   {"AdoptAuthority", appPath + ".AdoptSharedAuthority"},
-	"AuthorityPublished": {"PublishAuthority", appPath + ".PublishSharedAuthority"},
-	"ServingWire":        {"ServeWire", appPath + ".ServeNodeWire"},
-	"Scheduler":          {"Schedule", "github.com/junioryono/billet/internal/server.New"},
+	"Controller": {"(*" + appPath + ".ControlPlane).BecomeController", appPath + ".becomeController"},
+	"FleetForgotten": {
+		"(*" + appPath + ".Controller).ForgetFleet",
+		"(*github.com/junioryono/billet/internal/alloc.Allocator).ForgetEveryNode",
+	},
+	"AdoptedAuthority":   {"(*" + appPath + ".Controller).AdoptAuthority", appPath + ".AdoptSharedAuthority"},
+	"AuthorityPublished": {"(*" + appPath + ".Controller).PublishAuthority", appPath + ".PublishSharedAuthority"},
+	"ServingWire":        {"(*" + appPath + ".Controller).ServeWire", appPath + ".ServeNodeWire"},
+	"Scheduler":          {"(*" + appPath + ".Controller).Schedule", "github.com/junioryono/billet/internal/server.New"},
 }
 
 // owners are the types that are no proof but whose value the proofs rely on,
 // each with the one function that may build it or write its fields: a
 // ControlPlane reset field by field under a controller would serve the wire
 // with resources the controller never forgot or adopted for.
-var owners = map[string]string{"ControlPlane": "OpenControlPlane"}
+var owners = map[string]string{"ControlPlane": appPath + ".OpenControlPlane"}
 
 // makerOf is the one function that may build or write a value of the named
 // type, if the type is a proof or owned.
@@ -515,12 +519,12 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 			where := "package scope"
 
 			if fn, ok := decl.(*ast.FuncDecl); ok {
-				where = fn.Name.Name
-
 				obj, ok := pkg.info.Defs[fn.Name].(*types.Func)
 				if !ok {
-					t.Fatalf("the type checker defined no function for %s", where)
+					t.Fatalf("the type checker defined no function for %s", fn.Name.Name)
 				}
+
+				where = obj.FullName()
 
 				results := obj.Signature().Results()
 				for i := range results.Len() {
@@ -645,8 +649,8 @@ func assigned(stmt ast.Node) []ast.Expr {
 	return nil
 }
 
-// function returns the one function or method of this package named name, as
-// type-checked.
+// function returns the declaration of the function or method of this package
+// the type checker names name.
 func (pkg *checkedPackage) function(t *testing.T, name string) *ast.FuncDecl {
 	t.Helper()
 
@@ -654,11 +658,12 @@ func (pkg *checkedPackage) function(t *testing.T, name string) *ast.FuncDecl {
 
 	for _, file := range pkg.files {
 		for _, decl := range file.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == name && fn.Body != nil {
-				if found != nil {
-					t.Fatalf("%s is declared more than once in this package", name)
-				}
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
 
+			if obj, ok := pkg.info.Defs[fn.Name].(*types.Func); ok && obj.FullName() == name {
 				found = fn
 			}
 		}
