@@ -221,9 +221,16 @@ func TestTheNodeHoldsItsLockUntilTheCommandReturns(t *testing.T) {
 			t.Fatal("the statement after cmdNode's open check is not a deferred close of the node")
 		}
 
+		// IN THE DEFERRED FUNCTION'S BODY, never its arguments, which are
+		// evaluated where the defer stands: defer f(n.Close()) closes at once.
+		literal, ok := deferred.Call.Fun.(*ast.FuncLit)
+		if !ok || len(deferred.Call.Args) != 0 {
+			t.Fatal("cmdNode's deferred statement after the open is not a function literal called with nothing")
+		}
+
 		closes := false
 
-		ast.Inspect(deferred, func(n ast.Node) bool {
+		ast.Inspect(literal.Body, func(n ast.Node) bool {
 			if c, ok := n.(*ast.CallExpr); ok {
 				if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Close" {
 					if id, ok := sel.X.(*ast.Ident); ok && id.Name == node.Name {

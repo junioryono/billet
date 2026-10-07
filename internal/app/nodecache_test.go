@@ -312,7 +312,22 @@ func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
 
 	readies, eager := 0, 0
 
+	// SAID WHERE IT STANDS: a host.Ready in a function literal, a deferred or
+	// a go statement runs at another time than its place in the source.
 	ast.Inspect(run.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.FuncLit, *ast.DeferStmt, *ast.GoStmt:
+			ast.Inspect(x, func(inner ast.Node) bool {
+				if call, ok := inner.(*ast.CallExpr); ok && namesSelector(call.Fun, "host", "Ready") {
+					t.Error("Node.Run calls host.Ready from a closure, a deferred or a go statement")
+				}
+
+				return true
+			})
+
+			return false
+		}
+
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
@@ -342,6 +357,19 @@ func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
 	if eager != 0 {
 		t.Errorf("Node.Run calls serveCache itself %d times; the cache is served only from the loop's Ready", eager)
 	}
+
+	// AND startNodeCache NEVER CALLS THE serve IT RETURNS: the one Serve is in
+	// that callback (TestTheNodeCacheServesOnlyAfterRestoringItsMounts), so a
+	// call of it here would serve before the loop is ready.
+	ast.Inspect(nodeFunc(t, "nodecache.go", "startNodeCache").Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "serve" {
+				t.Error("startNodeCache calls the serve callback it returns, so the cache answers before the loop is ready")
+			}
+		}
+
+		return true
+	})
 }
 
 // nodeFunc parses file, one of this package's sources, and returns its
