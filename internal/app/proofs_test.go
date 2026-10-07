@@ -4,25 +4,39 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // proofMakers names, for each value the control plane's order is built from,
-// the one function allowed to create it, and the fields only that function may
-// set.
+// the one function allowed to create it, the fields only that function may set,
+// and the operation it must have performed, successfully, before it does.
 var proofMakers = map[string]struct {
-	maker  string
-	fields []string
+	maker     string
+	fields    []string
+	operation string
 }{
-	"Controller":         {"BecomeController", []string{"cp", "claim", "loops"}},
-	"FleetForgotten":     {"ForgetFleet", []string{"forgottenBy"}},
-	"AdoptedAuthority":   {"AdoptAuthority", []string{"adoptedBy"}},
-	"AuthorityPublished": {"PublishAuthority", []string{"publishedBy"}},
-	"ServingWire":        {"ServeWire", []string{"servedBy"}},
-	"Scheduler":          {"Schedule", []string{"plane"}},
+	"Controller":         {"BecomeController", []string{"cp", "claim", "loops"}, "becomeController"},
+	"FleetForgotten":     {"ForgetFleet", []string{"forgottenBy"}, "ForgetEveryNode"},
+	"AdoptedAuthority":   {"AdoptAuthority", []string{"adoptedBy"}, "AdoptSharedAuthority"},
+	"AuthorityPublished": {"PublishAuthority", []string{"publishedBy"}, "PublishSharedAuthority"},
+	"ServingWire":        {"ServeWire", []string{"servedBy"}, "ServeNodeWire"},
+	"Scheduler":          {"Schedule", []string{"plane"}, "server.New"},
+}
+
+// proofFields are the fields whose names belong to a proof alone, so a keyed
+// element naming one builds that proof whatever the literal's spelled type.
+var proofFields = map[string]string{
+	"forgottenBy": "FleetForgotten",
+	"adoptedBy":   "AdoptedAuthority",
+	"publishedBy": "AuthorityPublished",
+	"servedBy":    "ServingWire",
 }
 
 // ONLY THE STEP THAT PROVES A THING MAKES ITS PROOF.
@@ -31,10 +45,11 @@ var proofMakers = map[string]struct {
 // BecomeController, the node wire is served only with the two proofs only this
 // controller's ForgetFleet and AdoptAuthority make, and scheduling needs the
 // proof PublishAuthority makes. That holds while nothing else in this package
-// creates one, which no compiler checks: an exported constructor, a literal,
-// a new(T), a conversion or a field written in some other function would hand
-// out the proof without the step. So this reads the package for all five, and
-// for any function but the maker returning one.
+// creates one, which no compiler checks, so this reads every production file
+// whole, package-level initializers included, for every way to make one: a
+// literal (its type spelled, or elided inside a literal of proofs), a keyed
+// proof field, new(T), a conversion, a field written, a type declared on a
+// proof (an alias builds it under another name), or a function returning one.
 func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 	t.Parallel()
 
@@ -48,60 +63,82 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 
 	var violations []string
 
-	for _, fn := range packageFuncs(t) {
-		name := fn.Name.Name
-		mayMake := func(typ string) bool { return proofMakers[typ].maker == name }
+	report := func(where, what string) { violations = append(violations, where+" "+what) }
 
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			switch x := n.(type) {
-			case *ast.CompositeLit:
-				if id, ok := x.Type.(*ast.Ident); ok {
-					if _, proof := proofMakers[id.Name]; proof && !mayMake(id.Name) {
-						violations = append(violations, name+" builds a "+id.Name+" literal")
+	for _, file := range packageFiles(t) {
+		for _, decl := range file.Decls {
+			where, body := "package scope", ast.Node(decl)
+
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				where = fn.Name.Name
+
+				for _, typ := range returnedProofs(fn) {
+					if proofMakers[typ].maker != where {
+						report(where, "returns a "+typ)
 					}
 				}
-			case *ast.CallExpr:
-				if id, ok := x.Fun.(*ast.Ident); ok {
-					if _, proof := proofMakers[id.Name]; proof {
-						violations = append(violations, name+" converts to "+id.Name)
+			}
+
+			mayMake := func(typ string) bool { return proofMakers[typ].maker == where }
+
+			if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.TYPE {
+				for _, spec := range gen.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						if name, proof := proofName(ts.Type); proof {
+							report(where, "declares "+ts.Name.Name+" on "+name)
+						}
+					}
+				}
+			}
+
+			ast.Inspect(body, func(n ast.Node) bool {
+				switch x := n.(type) {
+				case *ast.CompositeLit:
+					if name, proof := proofName(x.Type); proof && !mayMake(name) {
+						report(where, "builds a "+name+" literal")
 					}
 
-					if id.Name == "new" && len(x.Args) == 1 {
-						if arg, ok := x.Args[0].(*ast.Ident); ok {
-							if _, proof := proofMakers[arg.Name]; proof && !mayMake(arg.Name) {
-								violations = append(violations, name+" allocates a "+arg.Name)
+					// AN ELIDED ELEMENT TYPE IS THE CONTAINER'S: []AdoptedAuthority{{...}}
+					// builds the proof with no type spelled at the inner literal.
+					if elem, proof := elementProof(x.Type); proof && !mayMake(elem) {
+						for _, elt := range x.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								elt = kv.Value
+							}
+
+							if lit, ok := elt.(*ast.CompositeLit); ok && lit.Type == nil {
+								report(where, "builds an elided "+elem)
+							}
+						}
+					}
+				case *ast.KeyValueExpr:
+					if key, ok := x.Key.(*ast.Ident); ok {
+						if typ, proof := proofFields[key.Name]; proof && !mayMake(typ) {
+							report(where, "sets "+typ+"."+key.Name+" in a literal")
+						}
+					}
+				case *ast.CallExpr:
+					if name, proof := proofName(x.Fun); proof {
+						report(where, "converts to "+name)
+					}
+
+					if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "new" && len(x.Args) == 1 {
+						if name, proof := proofName(x.Args[0]); proof && !mayMake(name) {
+							report(where, "allocates a "+name)
+						}
+					}
+				case *ast.AssignStmt:
+					for _, lhs := range x.Lhs {
+						if sel, ok := lhs.(*ast.SelectorExpr); ok {
+							if typ, guarded := guardedField[sel.Sel.Name]; guarded && !mayMake(typ) {
+								report(where, "sets "+typ+"."+sel.Sel.Name)
 							}
 						}
 					}
 				}
-			case *ast.AssignStmt:
-				for _, lhs := range x.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok {
-						if typ, guarded := guardedField[sel.Sel.Name]; guarded && !mayMake(typ) {
-							violations = append(violations, name+" sets "+typ+"."+sel.Sel.Name)
-						}
-					}
-				}
-			}
 
-			return true
-		})
-
-		if fn.Type.Results == nil {
-			continue
-		}
-
-		for _, field := range fn.Type.Results.List {
-			typ := field.Type
-			if star, ok := typ.(*ast.StarExpr); ok {
-				typ = star.X
-			}
-
-			if id, ok := typ.(*ast.Ident); ok {
-				if _, proof := proofMakers[id.Name]; proof && !mayMake(id.Name) {
-					violations = append(violations, name+" returns a "+id.Name)
-				}
-			}
+				return true
+			})
 		}
 	}
 
@@ -109,28 +146,179 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 		t.Errorf("a proof is made outside the step that proves it, which hands it out "+
 			"without the step: %v", violations)
 	}
+}
 
-	// AND EACH MAKER STILL MAKES IT, or the audit above passes on a package that
-	// no longer builds the proof at all.
+// EACH MAKER DOES ITS STEP BEFORE IT MAKES ITS PROOF. Only one function may make
+// each proof; that is worth nothing if the function makes it without the step.
+// So each maker must call its operation, test the error that call returns, and
+// build the proof with its field set only after both: a maker that dropped the
+// call, ignored its error, or built the proof first fails here.
+func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
+	t.Parallel()
+
 	for typ, m := range proofMakers {
 		fn := findFunc(t, m.maker)
 
-		found := false
+		var calledAt, checkedAt, builtAt token.Pos
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if lit, ok := n.(*ast.CompositeLit); ok {
-				if id, ok := lit.Type.(*ast.Ident); ok && id.Name == typ {
-					found = true
+			switch x := n.(type) {
+			case *ast.CallExpr:
+				if calls(x, m.operation) && !calledAt.IsValid() {
+					calledAt = x.Pos()
+				}
+			case *ast.IfStmt:
+				// `if err := op(); err != nil` tests the call it holds; any other
+				// `if err != nil` after the call tests what the call returned.
+				holds := x.Init != nil && containsCall(x.Init, m.operation)
+				after := calledAt.IsValid() && x.Pos() >= calledAt
+
+				if (holds || after) && !checkedAt.IsValid() && testsErr(x.Cond) {
+					checkedAt = x.Pos()
+				}
+			case *ast.CompositeLit:
+				if name, proof := proofName(x.Type); proof && name == typ && len(x.Elts) > 0 && !builtAt.IsValid() {
+					builtAt = x.Pos()
 				}
 			}
 
 			return true
 		})
 
-		if !found {
+		switch {
+		case !calledAt.IsValid():
+			t.Errorf("%s no longer calls %s, so the %s it makes proves nothing", m.maker, m.operation, typ)
+		case !builtAt.IsValid():
 			t.Errorf("%s no longer builds the %s it proves", m.maker, typ)
+		case builtAt < calledAt && !containsCallBefore(fn, m.operation, builtAt):
+			t.Errorf("%s builds its %s before it calls %s", m.maker, typ, m.operation)
+		case m.operation != "server.New" && m.operation != "PublishSharedAuthority" &&
+			(!checkedAt.IsValid() || checkedAt > builtAt):
+			// server.New returns no error, and the publication is non-fatal by
+			// design; every other operation's failure must stop the proof.
+			t.Errorf("%s builds its %s without testing %s's error first", m.maker, typ, m.operation)
 		}
 	}
+}
+
+// calls reports whether call invokes operation: "pkg.Name" a qualified call
+// exactly, a bare name any call of that name.
+func calls(call *ast.CallExpr, operation string) bool {
+	pkg, name, qualified := strings.Cut(operation, ".")
+	if !qualified {
+		return calleeName(call) == operation
+	}
+
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
+		return false
+	}
+
+	id, ok := sel.X.(*ast.Ident)
+
+	return ok && id.Name == pkg
+}
+
+// containsCall reports whether n holds a call of operation.
+func containsCall(n ast.Node, operation string) bool {
+	found := false
+
+	ast.Inspect(n, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && calls(call, operation) {
+			found = true
+		}
+
+		return true
+	})
+
+	return found
+}
+
+// containsCallBefore reports whether fn calls operation before pos.
+func containsCallBefore(fn *ast.FuncDecl, operation string, pos token.Pos) bool {
+	found := false
+
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && calls(call, operation) && call.Pos() < pos {
+			found = true
+		}
+
+		return true
+	})
+
+	return found
+}
+
+// testsErr reports whether cond is `err != nil` (or contains it).
+func testsErr(cond ast.Expr) bool {
+	found := false
+
+	ast.Inspect(cond, func(n ast.Node) bool {
+		if bin, ok := n.(*ast.BinaryExpr); ok && bin.Op == token.NEQ {
+			if id, ok := bin.X.(*ast.Ident); ok && id.Name == "err" {
+				found = true
+			}
+		}
+
+		return true
+	})
+
+	return found
+}
+
+// proofName is the proof a type expression names, through a pointer.
+func proofName(expr ast.Expr) (string, bool) {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+
+	if paren, ok := expr.(*ast.ParenExpr); ok {
+		expr = paren.X
+	}
+
+	if id, ok := expr.(*ast.Ident); ok {
+		_, proof := proofMakers[id.Name]
+
+		return id.Name, proof
+	}
+
+	return "", false
+}
+
+// elementProof is the proof a container literal's elided elements build.
+func elementProof(expr ast.Expr) (string, bool) {
+	switch x := expr.(type) {
+	case *ast.ArrayType:
+		return proofName(x.Elt)
+	case *ast.MapType:
+		return proofName(x.Value)
+	default:
+		return "", false
+	}
+}
+
+// returnedProofs are the proofs fn's results name, through pointers and
+// containers.
+func returnedProofs(fn *ast.FuncDecl) []string {
+	if fn.Type.Results == nil {
+		return nil
+	}
+
+	var out []string
+
+	for _, field := range fn.Type.Results.List {
+		ast.Inspect(field.Type, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				if _, proof := proofMakers[id.Name]; proof {
+					out = append(out, id.Name)
+				}
+			}
+
+			return true
+		})
+	}
+
+	return out
 }
 
 // THE PROOFS DO NOT CONVERT INTO ONE ANOTHER. Two struct types with identical
@@ -213,9 +401,97 @@ func TestAForeignOrZeroProofIsRefused(t *testing.T) {
 	}
 }
 
-// packageFuncs parses this package's non-test sources and returns every
-// function and method declaration.
-func packageFuncs(t *testing.T) []*ast.FuncDecl {
+// THE CONTROL PLANE ASSEMBLES, EACH STEP'S PROOF OPENING THE NEXT. A real
+// control plane over a migrated SQLite ledger and a loopback node wire walks
+// every step a server does short of polling GitHub: it opens, takes the claim
+// (no standby on SQLite), forgets the fleet, adopts the authority (a no-op with
+// no identity store), serves the wire, publishes (likewise), and schedules,
+// sending READY=1. A step that stopped producing a usable proof, or refused one
+// it made, stops here.
+func TestTheControlPlaneAssemblesStepByStep(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen:      "127.0.0.1:0",
+		IdentityDir: ledgertest.Dir(t),
+		MaxVCPU:     8,
+		MaxMemory:   16 * config.GiB,
+	}}
+
+	var readies int
+
+	host := Host{
+		ServerAccess:  noIdentityAccess,
+		AuthorityLock: noIdentityAccess,
+		Ready: func() error {
+			readies++
+
+			return nil
+		},
+		Status: func(string) error { return nil },
+		Out:    io.Discard,
+	}
+
+	cp, err := OpenControlPlane(ctx, cfg, host, nil, ControlPlaneOptions{})
+	if err != nil {
+		t.Fatalf("OpenControlPlane: %v", err)
+	}
+
+	t.Cleanup(func() { _ = cp.Close() })
+
+	stopped := false
+
+	ctl, err := cp.BecomeController(ctx, func() { stopped = true })
+	if err != nil {
+		t.Fatalf("BecomeController: %v", err)
+	}
+
+	defer ctl.Close()
+
+	adopted, err := ctl.AdoptAuthority(ctx)
+	if err != nil {
+		t.Fatalf("AdoptAuthority: %v", err)
+	}
+
+	fleet, err := ctl.ForgetFleet(ctx)
+	if err != nil {
+		t.Fatalf("ForgetFleet: %v", err)
+	}
+
+	wire, err := ctl.ServeWire(ctx, fleet, adopted)
+	if err != nil {
+		t.Fatalf("ServeWire: %v", err)
+	}
+
+	defer wire.Stop()
+
+	if wire.Addr == "" {
+		t.Error("the served wire has no address")
+	}
+
+	published, err := ctl.PublishAuthority(ctx, wire)
+	if err != nil {
+		t.Fatalf("PublishAuthority: %v", err)
+	}
+
+	scheduler, err := ctl.Schedule(wire, published, ScheduleOptions{})
+	if err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+
+	if scheduler == nil || readies != 1 {
+		t.Errorf("Schedule returned %v having sent READY=1 %d times, want a scheduler and once", scheduler, readies)
+	}
+
+	if stopped || cp.LeadershipLost() {
+		t.Error("an unfenced controller stopped itself")
+	}
+}
+
+// packageFiles parses this package's non-test sources.
+func packageFiles(t *testing.T) []*ast.File {
 	t.Helper()
 
 	entries, err := os.ReadDir(".")
@@ -225,7 +501,7 @@ func packageFuncs(t *testing.T) []*ast.FuncDecl {
 
 	fset := token.NewFileSet()
 
-	var out []*ast.FuncDecl
+	var out []*ast.File
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -238,6 +514,20 @@ func packageFuncs(t *testing.T) []*ast.FuncDecl {
 			t.Fatalf("parse %s: %v", name, err)
 		}
 
+		out = append(out, file)
+	}
+
+	return out
+}
+
+// packageFuncs is every function and method declaration of this package's
+// non-test sources.
+func packageFuncs(t *testing.T) []*ast.FuncDecl {
+	t.Helper()
+
+	var out []*ast.FuncDecl
+
+	for _, file := range packageFiles(t) {
 		for _, decl := range file.Decls {
 			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
 				out = append(out, fn)
@@ -277,16 +567,7 @@ func findMethod(t *testing.T, recv, name string) *ast.FuncDecl {
 	t.Helper()
 
 	for _, fn := range packageFuncs(t) {
-		if fn.Recv == nil || fn.Name.Name != name || len(fn.Recv.List) != 1 {
-			continue
-		}
-
-		typ := fn.Recv.List[0].Type
-		if star, ok := typ.(*ast.StarExpr); ok {
-			typ = star.X
-		}
-
-		if id, ok := typ.(*ast.Ident); ok && id.Name == recv {
+		if isMethod(fn, recv, name) {
 			return fn
 		}
 	}

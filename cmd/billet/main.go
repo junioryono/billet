@@ -586,8 +586,11 @@ func runServer(
 	err = scheduler.Run(ctx)
 
 	// A FENCED CONTROLLER'S ERROR IS ITS OWN, never a GitHub access problem to
-	// explain: Run already says what happened and what a restart does.
-	if cp.LeadershipLost() {
+	// explain: Run already says what happened and what a restart does. ASKED OF
+	// THE ERROR, not of the ledger again: Run read the fence once, after the
+	// plane stopped, and a second read here could see a fence latched since and
+	// still return the nil Run answered before it.
+	if errors.Is(err, state.ErrLeadershipLost) {
 		return err
 	}
 

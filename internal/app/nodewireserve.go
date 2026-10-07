@@ -115,8 +115,8 @@ func withHandshakeTimeout(d time.Duration) wireOption {
 //
 // SHUTDOWN ALONE IS NOT A STOP. It returns ctx.Err() on expiry and leaves every
 // active connection and handler RUNNING, with their request contexts uncancelled
-// — so an enrollment blocked in the ledger outlives serveNodeWire and is still
-// using the database when runServer's `defer db.Close()` runs, one defer later.
+// — so an enrollment blocked in the ledger outlives ServeNodeWire and is still
+// using the database when the control plane closes the ledger after the wire.
 // Close is what ends them.
 //
 // A FRESH CONTEXT, deliberately. This runs while the caller's context is already

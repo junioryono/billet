@@ -8,7 +8,7 @@ import (
 // THE CONTROL PLANE IS GIVEN THE STARTER, NOT ONLY THE COORDINATOR.
 //
 // `release.automatic` is true by default, and the whole of what makes that true
-// is one option passed in runServer. The starter works in its own tests against
+// is one option passed in Controller.Schedule. The starter works in its own tests against
 // a fake resolver; what nothing there can see is the control plane being
 // assembled without it — which is a deployment that documents automatic updates
 // and never starts one, and every surface reads healthy.

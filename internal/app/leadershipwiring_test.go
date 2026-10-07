@@ -68,7 +68,7 @@ func TestTheLeadershipWatcherReturnsOnAnOrdinaryShutdown(t *testing.T) {
 // PROVING THE MECHANISM IS NOT PROVING IT IS USED, and this is the one seam no
 // package-local test can reach. internal/state latches the fact, internal/server
 // acts on it, and both are tested where they live — but the only thing that
-// joins them is one argument in this package (Controller.Run), and one watcher
+// joins them is one argument in this package (Controller.Schedule), and one watcher
 // (ControlPlane.BecomeController). Delete it and every suite stays
 // green while a replaced control plane goes back to destroying compute, closing
 // the deployment's message session and handing capacity back on its way out.
