@@ -60,3 +60,38 @@ func TestANodeBuildsItsProviderOnlyUnderTheLock(t *testing.T) {
 		t.Errorf("release: %v", err)
 	}
 }
+
+// AND AN OPEN THAT SUCCEEDS HOLDS THE LOCK UNTIL IT IS CLOSED. A node that let
+// it go once its provider was built would let a second process manage the same
+// compute beside it. The docker backend's constructor reaches no daemon, so the
+// open succeeds wherever the test runs.
+func TestAnOpenNodeHoldsTheLockUntilClosed(t *testing.T) {
+	t.Parallel()
+
+	stateDir, lockDir := t.TempDir(), t.TempDir()
+
+	cfg := openNodeConfig(t, stateDir, lockDir)
+	cfg.Node.Provider = config.ProviderDocker
+
+	n, err := OpenNode(cfg, NodeOptions{})
+	if err != nil {
+		t.Fatalf("OpenNode over docker: %v", err)
+	}
+
+	if _, _, err := ClaimNodeDeployment(openNodeConfig(t, stateDir, lockDir), nil); !errors.Is(err, state.ErrDeploymentLocked) {
+		t.Fatalf("a second claim beside an open node = %v, want the lock's refusal", err)
+	}
+
+	if err := n.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, again, err := ClaimNodeDeployment(openNodeConfig(t, stateDir, lockDir), nil)
+	if err != nil {
+		t.Fatalf("a closed node kept the lock: %v", err)
+	}
+
+	if err := again.Release(); err != nil {
+		t.Errorf("release: %v", err)
+	}
+}
