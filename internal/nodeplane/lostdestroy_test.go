@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/server"
 )
 
 func registerIncarnation(t *testing.T, p *Plane, name, incarnation string) {
@@ -81,7 +81,7 @@ func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 	launched := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
 	// QUEUED BEFORE IT IS POLLED FOR, because the window is short for the polls
