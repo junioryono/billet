@@ -85,7 +85,7 @@ type CacheService struct {
 	remoteAPI http.Handler
 	// git serves github.com fetches from mirrors on the node.
 	git *gitProxy
-	// casFill is casFullFraction, a field so a test is not decided by the fill
+	// casFill is casFillDefault, a field so a test is not decided by the fill
 	// of the disk it runs on.
 	casFill float64
 	// closed wakes whatever runs RetryClosed when a session is closed with its
@@ -303,7 +303,7 @@ func NewCacheService(
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
-	service.casFill = casFullFraction
+	service.casFill = casFillDefault
 	if err := service.loadSessions(); err != nil {
 		return nil, err
 	}
