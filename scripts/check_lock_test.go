@@ -502,20 +502,42 @@ func TestALockPathThatIsAFIFORunsUnlocked(t *testing.T) {
 
 // A COMMAND ENDED BY A SIGNAL REPORTS THE SHELL'S 128+N under the lock, as it
 // does run directly: macOS lockf reports any signalled child as 70, so the
-// command runs as the child of a shell that exits with its status.
+// command runs as the child of a shell that exits with its status. And with
+// dash as the `sh` that shell is, where dash is installed: dash runs a subshell
+// that is the last command of `sh -c` in place, which put the command back under
+// lockf (measured 2026-10-07). util-linux flock reports 128+n itself, so on
+// Linux both cases pass either way.
 func TestACommandEndedByASignalReportsItsOwnStatus(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
-	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(t.TempDir(), "check.lock"),
-		"sh", "-c", `kill -TERM $$`)
-	cmd.Env = scriptEnv()
+	shells := map[string]string{"the default sh": ""}
 
-	out, err := cmd.CombinedOutput()
+	if dash, err := exec.LookPath("dash"); err == nil {
+		bin := t.TempDir()
+		if err := os.Symlink(dash, filepath.Join(bin, "sh")); err != nil {
+			t.Fatalf("put dash on PATH as sh: %v", err)
+		}
 
-	exitErr, ok := errors.AsType[*exec.ExitError](err)
-	if !ok || exitErr.ExitCode() != 128+int(syscall.SIGTERM) {
-		t.Fatalf("a command ended by SIGTERM: %v (%s), want exit status %d", err, out, 128+int(syscall.SIGTERM))
+		shells["dash as sh"] = bin
+	}
+
+	for name, bin := range shells {
+		cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(t.TempDir(), "check.lock"),
+			"sh", "-c", `kill -TERM $$`)
+		cmd.Env = scriptEnv()
+
+		if bin != "" {
+			cmd.Env = scriptEnv("PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"))
+		}
+
+		out, err := cmd.CombinedOutput()
+
+		exitErr, ok := errors.AsType[*exec.ExitError](err)
+		if !ok || exitErr.ExitCode() != 128+int(syscall.SIGTERM) {
+			t.Errorf("%s: a command ended by SIGTERM: %v (%s), want exit status %d",
+				name, err, out, 128+int(syscall.SIGTERM))
+		}
 	}
 }
 
