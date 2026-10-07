@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
@@ -56,7 +57,6 @@ import (
 	"github.com/junioryono/billet/internal/supervise"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // errNotImplemented marks a role that is scaffolded but cannot serve yet.
@@ -529,7 +529,7 @@ func runServer(
 		return err
 	}
 
-	serverTargets, planeJIT, err := wiring.BuildTargets(targets)
+	serverTargets, planeJIT, err := app.BuildTargets(targets)
 	if err != nil {
 		return err
 	}
@@ -1093,7 +1093,7 @@ func serveNodeWire(
 		}
 	}
 
-	// ASSEMBLED IN internal/wiring, NOT HERE, AND IT HANDS BACK THE HANDLER
+	// ASSEMBLED IN internal/app, NOT HERE, AND IT HANDS BACK THE HANDLER
 	// RATHER THAN THE PIECES. What the server presents, what it accepts and what
 	// renewal signs with are three answers that must describe one moment and one
 	// authority — and this file is excluded from coverage and takes six
@@ -1101,7 +1101,7 @@ func serveNodeWire(
 	// options and installing them from this file was the first attempt and had
 	// the same shape as the bug it fixed: deleting the line that installed them
 	// left every test green.
-	wire, err := wiring.BuildNodeWire(wiring.NodeWireRequest{
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
 		StateDir:    cfg.Server.IdentityDir,
 		Deployment:  deployment,
 		Hosts:       hosts,
@@ -1340,7 +1340,7 @@ func serveBootstrapWire(
 		handshakeBounds{handshakeFor: handshakeFor}, slog.Default())
 
 	srv := &http.Server{
-		// ASSEMBLED IN internal/wiring FROM THE SAME ONE READ the operational wire
+		// ASSEMBLED IN internal/app FROM THE SAME ONE READ the operational wire
 		// used, rather than here from pieces handed across: two call sites reading
 		// the authority separately is the defect wiring exists to remove, and this
 		// listener is its second consumer.

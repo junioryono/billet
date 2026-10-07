@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/fakeactions"
@@ -20,7 +21,6 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // THE HOLDER-GONE REPRODUCTIONS, WRITTEN BEFORE ANY FIX.
@@ -686,7 +686,7 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 		// default pacing would wait fifteen seconds and then minutes for it.
 		server.WithCleanupRetry(200*time.Millisecond, time.Second))
 
-	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
+	srv := server.New(a, app.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
 
 	return &wiredCodeBuild{
 		stack: &stack{

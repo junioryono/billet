@@ -1,4 +1,4 @@
-package wiring_test
+package app_test
 
 import (
 	"bytes"
@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/wirecert"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 const wireDeployment = "0123456789abcdef0123456789abcdef"
@@ -71,16 +71,16 @@ func (e *enrollments) LookupEnrollment(context.Context, string) (alloc.Enrollmen
 	return alloc.Enrollment{}, false, nil
 }
 
-func buildWire(t *testing.T, dir string) wiring.NodeWire {
+func buildWire(t *testing.T, dir string) app.NodeWire {
 	t.Helper()
 
 	return buildWireWith(t, dir, &enrollments{})
 }
 
-func buildWireWith(t *testing.T, dir string, enroll nodeplane.Enrollments) wiring.NodeWire {
+func buildWireWith(t *testing.T, dir string, enroll nodeplane.Enrollments) app.NodeWire {
 	t.Helper()
 
-	wire, err := wiring.BuildNodeWire(wiring.NodeWireRequest{
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
 		StateDir:    dir,
 		Deployment:  wireDeployment,
 		Hosts:       []string{"127.0.0.1"},
@@ -405,7 +405,7 @@ func TestALoopbackWireHasNoCertificatesAndAsksForNoAuthority(t *testing.T) {
 
 	policy := &cachePolicy{}
 
-	wire, err := wiring.BuildNodeWire(wiring.NodeWireRequest{
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
 		StateDir:    dir,
 		Deployment:  wireDeployment,
 		Loopback:    true,

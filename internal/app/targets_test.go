@@ -1,4 +1,4 @@
-package wiring
+package app
 
 import (
 	"crypto/rand"

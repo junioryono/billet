@@ -1,4 +1,4 @@
-package wiring
+package app
 
 import (
 	"crypto/tls"
@@ -107,7 +107,7 @@ type NodeWireRequest struct {
 //   - What renewal SIGNS with is the ISSUING authority — the new one — because
 //     renewal is the only way the new authority reaches the fleet at all.
 //
-// In wiring rather than wirecert because nodeplane imports wirecert, so the
+// In app rather than wirecert because nodeplane imports wirecert, so the
 // dependency only points this way.
 func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 	// THE CACHE KILL SWITCH IS ON BOTH WIRES, authenticated or not: a loopback
@@ -138,7 +138,7 @@ func BuildNodeWire(req NodeWireRequest) (NodeWire, error) {
 		bundle.CAPEM = authority.Trust
 
 		if wire.TLS, err = wirecert.ServerTLS(bundle); err != nil {
-			return NodeWire{}, fmt.Errorf("wiring: build the node wire's TLS config: %w", err)
+			return NodeWire{}, fmt.Errorf("app: build the node wire's TLS config: %w", err)
 		}
 
 		opts = append(opts,

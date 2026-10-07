@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
@@ -20,7 +21,6 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // stack is billet, assembled the way cmd/billet assembles it: a real control
@@ -105,12 +105,12 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		nodeplane.WithRegistrar(a), nodeplane.WithTierCatalog(tiers),
 		nodeplane.WithBarrierStore(a), nodeplane.WithPollTimeout(planePoll))
 
-	wire, err := wiring.BuildNodeWire(wiring.NodeWireRequest{
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
 		Loopback:    true,
 		Log:         log,
 		Plane:       plane,
 		Leases:      a,
-		JIT:         wiring.NodeJIT{Client: client},
+		JIT:         app.NodeJIT{Client: client},
 		CachePolicy: db,
 	})
 	if err != nil {
@@ -200,7 +200,7 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	prov := orderedSessions{Provisioner: wiring.Provisioner{Client: client}, actions: actions}
+	prov := orderedSessions{Provisioner: app.Provisioner{Client: client}, actions: actions}
 
 	// The one target, assembled the way the CLI assembles one, so the scale-set
 	// record carries the owner's path and every tier resolves through it.
@@ -236,7 +236,7 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 // client serialises its calls under one mutex and a request held open in the
 // handler would hold every other tier's request behind it.
 type orderedSessions struct {
-	wiring.Provisioner
+	app.Provisioner
 
 	actions *plane
 }

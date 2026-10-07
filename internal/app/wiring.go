@@ -1,18 +1,21 @@
-// Package wiring adapts the scale-set client to what the control plane and the
-// node consume.
+// Package app assembles billet: the one place its roles are built from a
+// config, so the CLI and the tests build them the same way. Today it holds the
+// adapters from the scale-set client to what the control plane and the node
+// consume, and the node wire's TLS assembly; the ledger modes and the role
+// assemblies follow it here (#356 Phase 3c).
 //
-// It exists because internal/scaleset returns its OWN types: the alternative is
-// that package importing internal/server purely to name a two-field struct,
-// which points the dependency the wrong way for a package whose whole job is to
-// keep a preview API at arm's length.
+// The adapters exist because internal/scaleset returns its OWN types: the
+// alternative is that package importing internal/server purely to name a
+// two-field struct, which points the dependency the wrong way for a package
+// whose whole job is to keep a preview API at arm's length.
 //
-// It is a package rather than a few funcs in main because the end-to-end test
-// assembles billet the same way the CLI does, and a hand-copied adapter defeats
-// that. The copy in the test had already drifted — it dereferenced a scale set
-// the client returns as nil for "no such set", which the original checks for —
-// and a test that exercises different wiring than production is testing the
-// wrong program.
-package wiring
+// They are a package rather than a few funcs in main because the end-to-end
+// test assembles billet the same way the CLI does, and a hand-copied adapter
+// defeats that. The copy in the test had already drifted — it dereferenced a
+// scale set the client returns as nil for "no such set", which the original
+// checks for — and a test that exercises different wiring than production is
+// testing the wrong program.
+package app
 
 import (
 	"context"
@@ -60,16 +63,16 @@ func BuildTargets(targets []Target) ([]server.Target, map[string]nodeplane.JITSo
 	for _, t := range targets {
 		switch {
 		case t.Config.Name == "":
-			return nil, nil, errors.New("wiring: a target with no name")
+			return nil, nil, errors.New("app: a target with no name")
 		case t.Client == nil:
-			return nil, nil, fmt.Errorf("wiring: target %q has no client", t.Config.Name)
+			return nil, nil, fmt.Errorf("app: target %q has no client", t.Config.Name)
 		case t.Client.Target().Path() != t.Config.Path():
-			return nil, nil, fmt.Errorf("wiring: target %q is %s in the config and %s on its client",
+			return nil, nil, fmt.Errorf("app: target %q is %s in the config and %s on its client",
 				t.Config.Name, t.Config.Path(), t.Client.Target().Path())
 		}
 
 		if _, dup := jit[t.Config.Name]; dup {
-			return nil, nil, fmt.Errorf("wiring: two targets named %q", t.Config.Name)
+			return nil, nil, fmt.Errorf("app: two targets named %q", t.Config.Name)
 		}
 
 		servers = append(servers, server.Target{Config: t.Config, Provisioner: Provisioner{Client: t.Client}})
@@ -194,7 +197,7 @@ func (j JITSource) RemoveRunner(
 // control-plane journal before recovered compute is touched.
 func (j JITSource) EnsureRunnerRemoved(ctx context.Context, leaseID string) error {
 	if j.Pool == nil {
-		return errors.New("wiring: runner identity storage is unavailable")
+		return errors.New("app: runner identity storage is unavailable")
 	}
 	binding, err := j.Pool.PoolRunnerByLease(ctx, leaseID)
 	if errors.Is(err, alloc.ErrLeaseNotFound) {
@@ -221,15 +224,15 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 	leaseID, tier string, requestID int64, runnerName string,
 ) (node.RunnerRecovery, error) {
 	if pool == nil {
-		return "", errors.New("wiring: runner identity storage is unavailable")
+		return "", errors.New("app: runner identity storage is unavailable")
 	}
 	if client == nil {
-		return "", errors.New("wiring: runner recovery client is unavailable")
+		return "", errors.New("app: runner recovery client is unavailable")
 	}
 	binding, err := pool.PoolRunnerByLease(ctx, leaseID)
 	if err == nil {
 		if binding.Tier != tier || binding.LaunchRequestID != requestID {
-			return "", errors.New("wiring: durable runner identity does not match its lease")
+			return "", errors.New("app: durable runner identity does not match its lease")
 		}
 		switch binding.Status {
 		case alloc.PoolRunnerBusy:
@@ -247,7 +250,7 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 		case alloc.PoolRunnerRetired:
 			return node.RunnerRecoveryRetired, nil
 		default:
-			return "", errors.New("wiring: durable runner identity has an unknown status")
+			return "", errors.New("app: durable runner identity has an unknown status")
 		}
 	}
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
@@ -259,7 +262,7 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 	}
 	if recovery.Present && binding.LeaseID != "" && binding.RunnerID != 0 &&
 		binding.RunnerID != recovery.RunnerID {
-		return "", errors.New("wiring: recovered runner id changed; refusing replacement identity")
+		return "", errors.New("app: recovered runner id changed; refusing replacement identity")
 	}
 	if recovery.Busy {
 		if err := pool.PreserveRecoveredBusyPoolRunner(ctx, alloc.PoolRunner{

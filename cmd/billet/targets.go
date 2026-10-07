@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/scaleset"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // githubTarget is a config target as the github package sees it.
@@ -117,13 +117,13 @@ func newScaleSetClientFor(ctx context.Context, cfg *config.Config, target config
 // ALL OF THEM BEFORE ANY IS USED: a control plane that could reach one owner's
 // App and not another's must not start serving the one, because the tiers on
 // the other would advertise nothing with nothing saying why.
-func newScaleSetClients(ctx context.Context, cfg *config.Config) ([]wiring.Target, error) {
+func newScaleSetClients(ctx context.Context, cfg *config.Config) ([]app.Target, error) {
 	targets := cfg.GitHubTargets()
 	if len(targets) == 0 {
 		return nil, errors.New("no github section or targets list in the config")
 	}
 
-	out := make([]wiring.Target, 0, len(targets))
+	out := make([]app.Target, 0, len(targets))
 
 	for _, target := range targets {
 		client, err := newScaleSetClientFor(ctx, cfg, target)
@@ -131,7 +131,7 @@ func newScaleSetClients(ctx context.Context, cfg *config.Config) ([]wiring.Targe
 			return nil, err
 		}
 
-		out = append(out, wiring.Target{Config: target, Client: client})
+		out = append(out, app.Target{Config: target, Client: client})
 	}
 
 	return out, nil

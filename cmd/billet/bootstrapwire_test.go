@@ -524,7 +524,7 @@ func TestTheEnrollmentFlagIsPrintedOnlyWhenThereIsOne(t *testing.T) {
 // in serving the fleet from one read of the authority, and the only one that
 // can be closed here.
 //
-// internal/wiring proves the handler it BUILDS is right. What it cannot prove is
+// internal/app proves the handler it BUILDS is right. What it cannot prove is
 // that serveNodeWire INSTALLS it: rebuilding a bare nodeplane.Handler at the
 // http.Server would drop the certificate guard, revocation, renewal and the trust
 // bundle in one line, and every test in that package would stay green. This
