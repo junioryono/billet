@@ -624,16 +624,19 @@ func TestFakeLockfProcess(t *testing.T) {
 	child.Env = os.Environ()
 
 	if err := child.Run(); err != nil {
-		if ws, ok := child.ProcessState.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		// A child that never started has no state to read: that is the
+		// diagnostic and 71, as lockf answers a command it cannot run.
+		exitErr, ok := errors.AsType[*exec.ExitError](err)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "fake lockf:", err)
+			os.Exit(71)
+		}
+
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			os.Exit(70)
 		}
 
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			os.Exit(exitErr.ExitCode())
-		}
-
-		fmt.Fprintln(os.Stderr, "fake lockf:", err)
-		os.Exit(71)
+		os.Exit(exitErr.ExitCode())
 	}
 
 	os.Exit(0)
