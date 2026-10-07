@@ -343,16 +343,24 @@ func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
 			looped = call.Pos()
 		}
 
-		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "serveCache" {
-			eager++
-		}
-
 		return true
 	})
 
 	if readies != 1 || !built.IsValid() || !looped.IsValid() || ready < built || ready > looped {
 		t.Errorf("Node.Run calls host.Ready %d times, want once after node.New and before nodeclient.Run", readies)
 	}
+
+	// EVERYWHERE IN Run, closures, deferred and go statements included: a
+	// `go serveCache()` serves as early as a direct call.
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "serveCache" {
+				eager++
+			}
+		}
+
+		return true
+	})
 
 	if eager != 0 {
 		t.Errorf("Node.Run calls serveCache itself %d times; the cache is served only from the loop's Ready", eager)
