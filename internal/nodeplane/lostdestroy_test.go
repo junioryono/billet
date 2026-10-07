@@ -28,7 +28,7 @@ func registerIncarnation(t *testing.T, p *Plane, name, incarnation string) {
 func TestALostDestroyIsGivenAgainToTheProcessThatPolls(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(time.Hour))
+	p := testPlane(t, WithClock(newTestClock().now), WithCommandTimeout(time.Hour))
 	p.SetPollWindowForTest(50 * time.Millisecond)
 	registerIncarnation(t, p, "n1", "n1-a")
 
@@ -72,7 +72,7 @@ func TestALostDestroyIsGivenAgainToTheProcessThatPolls(t *testing.T) {
 func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(time.Hour))
+	p := testPlane(t, WithClock(newTestClock().now), WithCommandTimeout(time.Hour))
 	p.SetPollWindowForTest(50 * time.Millisecond)
 	registerIncarnation(t, p, "n1", "n1-a")
 
