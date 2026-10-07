@@ -30,20 +30,20 @@ func TestALostDestroyIsGivenAgainToTheProcessThatPolls(t *testing.T) {
 
 	p := testPlane(t, WithClock(newTestClock().now), WithCommandTimeout(time.Hour))
 	p.SetPollWindowForTest(50 * time.Millisecond)
-	registerIncarnation(t, p, "n1", "n1-a")
+	registerIncarnation(t, p, "holder", "holder-1")
 
 	destroyed := make(chan error, 1)
 
 	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 42) }()
 
-	waitForQueued(t, p, "n1")
+	waitForQueued(t, p, "holder")
 
-	lost, ok, err := p.Poll(t.Context(), "n1", "n1-a")
+	lost, ok, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !ok || lost.Kind != nodeapi.CommandDestroy {
 		t.Fatalf("the first poll took %+v (ok %v, err %v), want the destroy", lost, ok, err)
 	}
 
-	again, ok, err := p.Poll(t.Context(), "n1", "n1-a")
+	again, ok, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !ok {
 		t.Fatalf("the process polled again and was given nothing (ok %v, err %v); "+
 			"the destroy it never received waits out the command timeout", ok, err)
@@ -53,7 +53,7 @@ func TestALostDestroyIsGivenAgainToTheProcessThatPolls(t *testing.T) {
 		t.Fatalf("the second poll was given %+v, want the lost destroy %q again", again, lost.ID)
 	}
 
-	if err := p.Result("n1", "n1-a", nodeapi.CommandResult{ID: again.ID, OK: true}); err != nil {
+	if err := p.Result("holder", "holder-1", nodeapi.CommandResult{ID: again.ID, OK: true}); err != nil {
 		t.Fatalf("report the destroy: %v", err)
 	}
 
@@ -74,23 +74,26 @@ func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 
 	p := testPlane(t, WithClock(newTestClock().now), WithCommandTimeout(time.Hour))
 	p.SetPollWindowForTest(50 * time.Millisecond)
-	registerIncarnation(t, p, "n1", "n1-a")
+	registerIncarnation(t, p, "holder", "holder-1")
+
+	// Buffered and never read: the launch's outcome is not this test's, it only
+	// has to be in flight.
+	launched := make(chan error, 1)
 
 	go func() {
-		// Its outcome is not this test's: the launch only has to be in flight.
-		_ = p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), dispatch.Job{RequestID: 7})
 	}()
 
 	// QUEUED BEFORE IT IS POLLED FOR, because the window is short for the polls
 	// that must find nothing, and a slow dispatch would read as a refusal.
-	waitForQueued(t, p, "n1")
+	waitForQueued(t, p, "holder")
 
-	launch, ok, err := p.Poll(t.Context(), "n1", "n1-a")
+	launch, ok, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !ok || launch.Kind != nodeapi.CommandLaunch {
 		t.Fatalf("the first poll took %+v (ok %v, err %v), want the launch", launch, ok, err)
 	}
 
-	if again, ok, err := p.Poll(t.Context(), "n1", "n1-a"); err != nil || ok {
+	if again, ok, err := p.Poll(t.Context(), "holder", "holder-1"); err != nil || ok {
 		t.Fatalf("a launch already in flight was given again: %+v (ok %v, err %v)", again, ok, err)
 	}
 
@@ -98,18 +101,18 @@ func TestNeitherALaunchNorAnAnsweredDestroyIsGivenAgain(t *testing.T) {
 
 	go func() { destroyed <- p.NewRunner().Destroy(t.Context(), 43) }()
 
-	waitForQueued(t, p, "n1")
+	waitForQueued(t, p, "holder")
 
-	destroy, ok, err := p.Poll(t.Context(), "n1", "n1-a")
+	destroy, ok, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !ok || destroy.Kind != nodeapi.CommandDestroy {
 		t.Fatalf("the node took %+v (ok %v, err %v), want the destroy", destroy, ok, err)
 	}
 
-	if err := p.Result("n1", "n1-a", nodeapi.CommandResult{ID: destroy.ID, OK: true}); err != nil {
+	if err := p.Result("holder", "holder-1", nodeapi.CommandResult{ID: destroy.ID, OK: true}); err != nil {
 		t.Fatalf("report the destroy: %v", err)
 	}
 
-	if cmd, ok, err := p.Poll(t.Context(), "n1", "n1-a"); err != nil || ok {
+	if cmd, ok, err := p.Poll(t.Context(), "holder", "holder-1"); err != nil || ok {
 		t.Fatalf("an answered destroy was given again: %+v (ok %v, err %v)", cmd, ok, err)
 	}
 
