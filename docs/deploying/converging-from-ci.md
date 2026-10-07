@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - uses: junioryono/billet/actions/converge-fleet@v0.12.43
+      - uses: junioryono/billet/actions/converge-fleet@v0.12.44
         with:
           mode: check
           inventory: fleet/inventory.yml
@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
-      - uses: junioryono/billet/actions/converge-fleet@v0.12.43
+      - uses: junioryono/billet/actions/converge-fleet@v0.12.44
         with:
           mode: converge
           inventory: fleet/inventory.yml
