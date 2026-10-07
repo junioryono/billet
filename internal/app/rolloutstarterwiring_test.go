@@ -13,7 +13,7 @@ import (
 // assembled without it — which is a deployment that documents automatic updates
 // and never starts one, and every surface reads healthy.
 func TestTheControlPlaneIsWiredWithTheRolloutStarter(t *testing.T) {
-	fn := findMethod(t, "Controller", "Run")
+	fn := findMethod(t, "Controller", "Schedule")
 
 	var starter, coordinator, built bool
 
@@ -36,11 +36,11 @@ func TestTheControlPlaneIsWiredWithTheRolloutStarter(t *testing.T) {
 	})
 
 	if !coordinator {
-		t.Fatal("Controller.Run no longer passes WithRolloutCoordinator; this test's premise moved")
+		t.Fatal("Controller.Schedule no longer passes WithRolloutCoordinator; this test's premise moved")
 	}
 
 	if !built || !starter {
-		t.Fatalf("Controller.Run builds the starter (%v) and passes WithRolloutStarter (%v); both "+
+		t.Fatalf("Controller.Schedule builds the starter (%v) and passes WithRolloutStarter (%v); both "+
 			"must be true or the channel advances and nothing ever starts a rollout",
 			built, starter)
 	}

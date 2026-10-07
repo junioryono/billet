@@ -210,15 +210,34 @@ type Controller struct {
 // Close joins every loop the controller started.
 func (c *Controller) Close() []error { return c.loops.Wait() }
 
+// errNotController refuses a step on a Controller that holds no claim: one not
+// made by BecomeController.
+var errNotController = errors.New("app: this step is the controller's, and this value holds no controller claim")
+
+// held reports whether c was made by BecomeController: it has a control plane
+// and the claim's epoch, which the ledger never writes as zero.
+func (c *Controller) held() bool { return c != nil && c.cp != nil && c.claim.Epoch >= 1 }
+
+// THE PROOFS DIFFER IN THEIR FIELDS' NAMES, not only their types' names: two
+// struct types with the same fields convert into one another, so a caller could
+// turn one step's proof into another's (TestTheProofsDoNotConvert).
+
 // FleetForgotten is ForgetFleet's proof that this controller cleared the
 // fleet's liveness. Only ForgetFleet makes one, and ServeWire refuses one any
 // other controller made, or the zero value.
-type FleetForgotten struct{ by *Controller }
+type FleetForgotten struct{ forgottenBy *Controller }
 
 // AdoptedAuthority is AdoptAuthority's proof that this host holds the
 // deployment's node-wire authority, not one of its own. Only AdoptAuthority
 // makes one, and ServeWire refuses one any other controller made.
-type AdoptedAuthority struct{ by *Controller }
+type AdoptedAuthority struct{ adoptedBy *Controller }
+
+// AuthorityPublished is PublishAuthority's proof that the authority this
+// controller serves with was offered to the identity store, whether or not the
+// store took it. Schedule requires it, so a controller cannot schedule without
+// having tried, and a successor is never left with nothing to adopt because a
+// call went missing.
+type AuthorityPublished struct{ publishedBy *Controller }
 
 // ForgetFleet clears every node's liveness before anything registers.
 //
@@ -228,11 +247,15 @@ type AdoptedAuthority struct{ by *Controller }
 // one has never heard from. Every node re-registers over the wire within a
 // poll, so the cost is a brief zero that is also the truth.
 func (c *Controller) ForgetFleet(ctx context.Context) (FleetForgotten, error) {
+	if !c.held() {
+		return FleetForgotten{}, errNotController
+	}
+
 	if err := c.cp.allocator.ForgetEveryNode(ctx); err != nil {
 		return FleetForgotten{}, fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
 	}
 
-	return FleetForgotten{by: c}, nil
+	return FleetForgotten{forgottenBy: c}, nil
 }
 
 // AdoptAuthority gives this host the deployment's node-wire authority before
@@ -246,12 +269,16 @@ func (c *Controller) ForgetFleet(ctx context.Context) (FleetForgotten, error) {
 // failover a failover rather than an outage. A no-op unless this deployment
 // keeps its identity in a store.
 func (c *Controller) AdoptAuthority(ctx context.Context) (AdoptedAuthority, error) {
+	if !c.held() {
+		return AdoptedAuthority{}, errNotController
+	}
+
 	cp := c.cp
 	if err := AdoptSharedAuthority(ctx, cp.cfg, cp.host.AuthorityLock, cp.deployment, slog.Default()); err != nil {
 		return AdoptedAuthority{}, fmt.Errorf("node-wire authority: %w", err)
 	}
 
-	return AdoptedAuthority{by: c}, nil
+	return AdoptedAuthority{adoptedBy: c}, nil
 }
 
 // ServingWire is the node wire this controller is serving. Stop it before the
@@ -259,8 +286,8 @@ func (c *Controller) AdoptAuthority(ctx context.Context) (AdoptedAuthority, erro
 type ServingWire struct {
 	*ServedWire
 
-	nodes *nodeplane.Plane
-	by    *Controller
+	nodes    *nodeplane.Plane
+	servedBy *Controller
 }
 
 // ServeWire serves the node wire, which needs the fleet forgotten and the
@@ -273,7 +300,7 @@ type ServingWire struct {
 // first node's setup a chicken-and-egg problem, and there is nothing to guard:
 // an empty fleet answers every request with "I do not know you".
 func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopted AdoptedAuthority) (*ServingWire, error) {
-	if fleet.by != c || adopted.by != c {
+	if !c.held() || fleet.forgottenBy != c || adopted.adoptedBy != c {
 		return nil, errors.New("app: the node wire is served only after this controller forgot the fleet " +
 			"and adopted the authority")
 	}
@@ -302,7 +329,7 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 		return nil, err
 	}
 
-	return &ServingWire{ServedWire: wire, nodes: nodes, by: c}, nil
+	return &ServingWire{ServedWire: wire, nodes: nodes, servedBy: c}, nil
 }
 
 // PublishAuthority puts the authority this host serves with into the
@@ -314,19 +341,22 @@ func (c *Controller) ServeWire(ctx context.Context, fleet FleetForgotten, adopte
 // NOT FATAL, and reported rather than swallowed: the control plane is serving
 // by now, and a store that cannot be written is a reason to look at IAM rather
 // than to take a working deployment offline.
-func (c *Controller) PublishAuthority(ctx context.Context, wire *ServingWire) {
-	if wire == nil || wire.by != c {
-		slog.Default().Error("app: not publishing an authority this controller is not serving")
-
-		return
+// It returns the proof Schedule needs whether or not the store took the
+// authority; it refuses only a wire this controller is not serving.
+func (c *Controller) PublishAuthority(ctx context.Context, wire *ServingWire) (AuthorityPublished, error) {
+	if !c.held() || wire == nil || wire.servedBy != c {
+		return AuthorityPublished{}, errors.New("app: the authority is published only by the controller " +
+			"serving the wire it was read for")
 	}
 
 	cp := c.cp
 	PublishSharedAuthority(ctx, cp.cfg, cp.host.AuthorityLock, cp.deployment, slog.Default())
+
+	return AuthorityPublished{publishedBy: c}, nil
 }
 
-// RunOptions are how the controller was invoked.
-type RunOptions struct {
+// ScheduleOptions are how the controller was invoked.
+type ScheduleOptions struct {
 	// Hurry is closed by the second signal, reaching the drain that honours it.
 	Hurry <-chan struct{}
 	// DryRun advertises nothing: scale sets are created and polled and no job
@@ -334,13 +364,18 @@ type RunOptions struct {
 	DryRun bool
 }
 
-// Run schedules: the liveness and barrier loops, the node plane's runner, the
-// rollout coordinator and starter, the staged-credential sweep and one
-// scale-set listener per tier, until ctx ends. A controller fenced out of its
-// deployment returns state.ErrLeadershipLost, whatever else happened.
-func (c *Controller) Run(ctx context.Context, wire *ServingWire, opts RunOptions) error {
-	if wire == nil || wire.by != c {
-		return errors.New("app: Run needs the node wire this controller serves")
+// Schedule assembles everything that schedules: the liveness and barrier loops,
+// the node plane's runner, the rollout coordinator and starter, the
+// staged-credential sweep and the scale-set listeners. It tells the service
+// manager this process is serving, and returns the Scheduler whose Run polls
+// GitHub. An error here is the assembly's or the service manager's, never
+// GitHub's.
+func (c *Controller) Schedule(
+	wire *ServingWire, published AuthorityPublished, opts ScheduleOptions,
+) (*Scheduler, error) {
+	if !c.held() || wire == nil || wire.servedBy != c || published.publishedBy != c {
+		return nil, errors.New("app: scheduling needs the node wire this controller serves and its " +
+			"authority published")
 	}
 
 	cp := c.cp
@@ -417,7 +452,7 @@ func (c *Controller) Run(ctx context.Context, wire *ServingWire, opts RunOptions
 			releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
 			state.LatestSchemaVersion(), firecracker.GuestContract))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	serverOpts = append(serverOpts,
@@ -451,9 +486,23 @@ func (c *Controller) Run(ctx context.Context, wire *ServingWire, opts RunOptions
 	// listening, the reaper is running, and every tier whose session opened is
 	// polling. A tier still waiting says so in the journal every thirty seconds.
 	if err := cp.host.Ready(); err != nil {
-		return fmt.Errorf("server readiness: %w", err)
+		return nil, fmt.Errorf("server readiness: %w", err)
 	}
 
+	return &Scheduler{plane: plane, db: cp.db}, nil
+}
+
+// Scheduler is a controller's scheduling, assembled and announced, not yet
+// polling.
+type Scheduler struct {
+	plane *server.Server
+	db    *state.DB
+}
+
+// Run polls GitHub and schedules until ctx ends. A controller fenced out of its
+// deployment returns state.ErrLeadershipLost, whatever else happened; any other
+// error is the scheduler's own.
+func (s *Scheduler) Run(ctx context.Context) error {
 	// A LOST LEADERSHIP EXITS NON-ZERO, AND THE RESTART THAT FOLLOWS IS THE POINT
 	// RATHER THAN A LOOP TO BE AVOIDED. The packaged unit is Restart=on-failure,
 	// so systemd starts this process again and ClaimController either takes the
@@ -462,13 +511,13 @@ func (c *Controller) Run(ctx context.Context, wire *ServingWire, opts RunOptions
 	// exit would leave a deployment whose partition has healed with no controller
 	// at all, silently, which is the failure this whole fence exists to make
 	// impossible.
-	err = plane.Run(ctx)
+	err := s.plane.Run(ctx)
 
 	// ASKED BEFORE THE ERROR IS CLASSIFIED, and asked at all because the plane
 	// stops through a CANCELLED CONTEXT here, which Run reports as a clean stop.
 	// Returning nil would exit 0 — a control plane that was fenced out of its own
 	// deployment reporting a successful shutdown, and systemd leaving it stopped.
-	if cp.db.LeadershipLost() {
+	if s.db.LeadershipLost() {
 		return fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
 			"handed back; the controller that replaced this one adopts both. If that "+
 			"replacement was itself transient, restarting is how this host takes the "+

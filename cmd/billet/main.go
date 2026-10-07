@@ -573,9 +573,17 @@ func runServer(
 
 	defer wire.Stop()
 
-	ctl.PublishAuthority(ctx, wire)
+	published, err := ctl.PublishAuthority(ctx, wire)
+	if err != nil {
+		return err
+	}
 
-	err = ctl.Run(ctx, wire, app.RunOptions{Hurry: lc.hurry, DryRun: dryRun})
+	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: lc.hurry, DryRun: dryRun})
+	if err != nil {
+		return err
+	}
+
+	err = scheduler.Run(ctx)
 
 	// A FENCED CONTROLLER'S ERROR IS ITS OWN, never a GitHub access problem to
 	// explain: Run already says what happened and what a restart does.
