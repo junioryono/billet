@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/state"
@@ -352,7 +353,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 
 		var bundle *wirecert.Bundle
 		if cfg.Node.TLS != nil {
-			b, err := nodeBundle(cfg)
+			b, err := app.NodeBundle(cfg)
 			if err != nil {
 				// NO HEADER HERE: this is the one path where the node's name was
 				// never established. The verdict is printed anyway, because it

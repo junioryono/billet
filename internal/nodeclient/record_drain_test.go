@@ -525,64 +525,241 @@ func TestARecordThatCannotBeWrittenIsLoggedAndTheNodeKeepsServing(t *testing.T) 
 	})
 }
 
-// R6: STRUCTURAL. The node command builds its client through the one shared
-// constructor and passes the loop the one record path; no second spelling of
-// the path exists; the record writer installs through the zero-value Installer.
+// R6: STRUCTURAL. The node is assembled in internal/app: its client comes from
+// the one shared constructor (app.NewNodeClient), Node.Run passes the loop the
+// path its host names, and cmd/billet's host names the one record path; no
+// second spelling of the path exists; the record writer installs through the
+// zero-value Installer.
 func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
 
-	main, err := parser.ParseFile(fset, "../../cmd/billet/main.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
+	funcs := func(path string) map[string]*ast.FuncDecl {
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		out := map[string]*ast.FuncDecl{}
+
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				out[fn.Name.Name] = fn
+			}
+		}
+
+		return out
 	}
 
-	var cmdNode *ast.FuncDecl
+	cmd := funcs("../../cmd/billet/main.go")
+	app := funcs("../app/node.go")
 
-	for _, d := range main.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "cmdNode" {
-			cmdNode = fn
+	for _, name := range []string{"cmdNode", "nodeHost"} {
+		if cmd[name] == nil {
+			t.Fatalf("%s is not in cmd/billet/main.go", name)
 		}
 	}
 
-	if cmdNode == nil {
-		t.Fatal("cmdNode is not in cmd/billet/main.go")
+	for _, name := range []string{"Run", "NewNodeClient"} {
+		if app[name] == nil {
+			t.Fatalf("%s is not in internal/app/node.go", name)
+		}
 	}
 
-	var newCalls, runWithPath int
+	// calls counts the calls of pkg.name in fn.
+	calls := func(fn *ast.FuncDecl, pkg, name string) (n int) {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == name {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == pkg {
+						n++
+					}
+				}
+			}
 
-	ast.Inspect(cmdNode.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+			return true
+		})
+
+		return n
+	}
+
+	// pathFields counts the RegistrationRecordPath elements in fn whose value
+	// matches.
+	pathFields := func(fn *ast.FuncDecl, matches func(ast.Expr) bool) (n int) {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if kv, ok := node.(*ast.KeyValueExpr); ok {
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "RegistrationRecordPath" && matches(kv.Value) {
+					n++
+				}
+			}
+
+			return true
+		})
+
+		return n
+	}
+
+	if n := calls(cmd["cmdNode"], "nodeclient", "New"); n != 0 {
+		t.Errorf("cmdNode calls nodeclient.New %d times beside app.NewNodeClient", n)
+	}
+
+	// THE CLIENT IS BUILT WHERE THE NODE IS ASSEMBLED, through the shared
+	// constructor and with the TLS the identity gave: one NewNodeClient(cfg,
+	// tlsConf) in (*Node).open, and no nodeclient.New anywhere in node.go but
+	// the constructor itself.
+	for name, fn := range app {
+		if n := calls(fn, "nodeclient", "New"); name != "NewNodeClient" && n != 0 {
+			t.Errorf("internal/app's %s calls nodeclient.New %d times beside NewNodeClient", name, n)
+		}
+	}
+
+	if n := calls(app["NewNodeClient"], "nodeclient", "New"); n != 1 {
+		t.Errorf("app.NewNodeClient calls nodeclient.New %d times, want once", n)
+	}
+
+	if app["open"] == nil {
+		t.Fatal("(*Node).open is not in internal/app/node.go")
+	}
+
+	shared := 0
+
+	ast.Inspect(app["open"].Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 
-		if fn, ok := call.Fun.(*ast.SelectorExpr); ok {
-			if id, ok := fn.X.(*ast.Ident); ok && id.Name == "nodeclient" && fn.Sel.Name == "New" {
-				newCalls++
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "NewNodeClient" && len(call.Args) == 2 {
+			cfg, cfgOK := call.Args[0].(*ast.Ident)
+			conf, confOK := call.Args[1].(*ast.Ident)
+
+			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "tlsConf" {
+				shared++
+			}
+		}
+
+		return true
+	})
+
+	if shared != 1 {
+		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, tlsConf) %d times, want once", shared)
+	}
+
+	// THE PATH REACHES THE LOOP, link by link: cmdNode hands Run the host
+	// nodeHost builds and nothing else; nodeHost names the one path; Run puts
+	// the host's path in the LoopOptions it hands nodeclient.Run, and writes
+	// nothing of the host's on the way.
+	handed := 0
+
+	for _, stmt := range cmd["cmdNode"].Body.List {
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			continue
+		}
+
+		call, ok := ret.Results[0].(*ast.CallExpr)
+		if !ok || len(call.Args) != 2 {
+			continue
+		}
+
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
+			// nodeHost(lc, hostOS): THIS PROCESS'S signals and THIS HOST'S
+			// platform, which decides whether a record is published at all.
+			if host, ok := call.Args[1].(*ast.CallExpr); ok && len(host.Args) == 2 {
+				fn, fnOK := host.Fun.(*ast.Ident)
+				lc, lcOK := host.Args[0].(*ast.Ident)
+				platform, platformOK := host.Args[1].(*ast.Ident)
+
+				if fnOK && lcOK && platformOK && fn.Name == "nodeHost" && lc.Name == "lc" && platform.Name == "hostOS" {
+					handed++
+				}
+			}
+		}
+	}
+
+	if handed != 1 {
+		t.Errorf("cmdNode returns n.Run(ctx, nodeHost(lc, hostOS)) %d times, want once", handed)
+	}
+
+	// THE FIELD IS THE RETURNED HOST'S: nodeHost is one return of one literal,
+	// so nothing between building the host and returning it can change it.
+	// (cmd/billet's TestTheNodeHostCarriesTheDrainRequest checks the values.)
+	if body := cmd["nodeHost"].Body.List; len(body) != 1 {
+		t.Errorf("cmd/billet's nodeHost is %d statements, want the one return of its host", len(body))
+	} else if ret, ok := body[0].(*ast.ReturnStmt); !ok || len(ret.Results) != 1 {
+		t.Error("cmd/billet's nodeHost does not return its host directly")
+	} else if _, ok := ret.Results[0].(*ast.CompositeLit); !ok {
+		t.Error("cmd/billet's nodeHost does not return the host literal itself")
+	}
+
+	named := pathFields(cmd["nodeHost"], func(v ast.Expr) bool {
+		c, ok := v.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+
+		id, ok := c.Fun.(*ast.Ident)
+
+		return ok && id.Name == "nodeRegistrationRecordPath"
+	})
+	if named != 1 {
+		t.Errorf("cmd/billet's nodeHost names RegistrationRecordPath: nodeRegistrationRecordPath(...) %d times, want once", named)
+	}
+
+	passed := 0
+
+	ast.Inspect(app["Run"].Body, func(node ast.Node) bool {
+		switch x := node.(type) {
+		case *ast.ValueSpec:
+			for _, name := range x.Names {
+				if name.Name == "host" {
+					t.Error("Node.Run declares a host of its own, shadowing the one it was given")
+				}
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range x.Lhs {
+				// THE HOST WHOLE, ONE OF ITS FIELDS, OR A NEW host SHADOWING IT:
+				// each would hand the loop something other than what cmdNode gave.
+				if id, ok := lhs.(*ast.Ident); ok && id.Name == "host" {
+					t.Errorf("Node.Run assigns host itself (%s)", x.Tok)
+				}
+
+				if sel, ok := lhs.(*ast.SelectorExpr); ok {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "host" {
+						t.Errorf("Node.Run writes host.%s", sel.Sel.Name)
+					}
+				}
+			}
+		case *ast.CallExpr:
+			sel, ok := x.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Run" || len(x.Args) != 4 {
+				return true
 			}
 
-			if id, ok := fn.X.(*ast.Ident); ok && id.Name == "nodeclient" && fn.Sel.Name == "Run" {
-				for _, arg := range call.Args {
-					lit, ok := arg.(*ast.CompositeLit)
-					if !ok {
-						continue
-					}
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "nodeclient" {
+				return true
+			}
 
-					for _, elt := range lit.Elts {
-						kv, ok := elt.(*ast.KeyValueExpr)
-						if !ok {
-							continue
-						}
+			lit, ok := x.Args[3].(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
 
-						if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "RegistrationRecordPath" {
-							if c, ok := kv.Value.(*ast.CallExpr); ok {
-								if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "nodeRegistrationRecordPath" {
-									runWithPath++
-								}
-							}
-						}
+			for _, elt := range lit.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok || key.Name != "RegistrationRecordPath" {
+					continue
+				}
+
+				if value, ok := kv.Value.(*ast.SelectorExpr); ok && value.Sel.Name == "RegistrationRecordPath" {
+					if id, ok := value.X.(*ast.Ident); ok && id.Name == "host" {
+						passed++
 					}
 				}
 			}
@@ -591,18 +768,15 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		return true
 	})
 
-	if newCalls != 0 {
-		t.Errorf("cmdNode calls nodeclient.New %d times beside newNodeClientFor", newCalls)
+	if passed != 1 || calls(app["Run"], "nodeclient", "Run") != 1 {
+		t.Errorf("Node.Run hands nodeclient.Run RegistrationRecordPath: host.RegistrationRecordPath %d times "+
+			"over %d calls of it, want one call and once", passed, calls(app["Run"], "nodeclient", "Run"))
 	}
 
-	if runWithPath != 1 {
-		t.Errorf("cmdNode passes RegistrationRecordPath: nodeRegistrationRecordPath(...) to Run %d times, want once", runWithPath)
-	}
-
-	// ONE SPELLING OF THE PATH, in cmd/billet and here.
+	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.
 	spellings := 0
 
-	for _, dir := range []string{"../../cmd/billet", "."} {
+	for _, dir := range []string{"../../cmd/billet", "../app", "."} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatal(err)

@@ -33,3 +33,4 @@ adbfe22c58a4 The rollout-starter wiring test moved to internal/app, over Control
 d4dec390aea4 The standby is the control plane stopped at BecomeController, its order now internal/app's types (#356 Phase 3c); the sentence says so.
 deedfda57b81 The two runServer order tests were replaced by TestOnlyTheProvingStepsMakeTheirProofs (#356 Phase 3c).
 174174c32dbe The control plane's three ledger modes moved to internal/app (#356 Phase 3c); the sentence names both files and their tests.
+8217e65b541a The node role moved to internal/app (#356 Phase 3c); startNodeCache now passes the exported CacheSessionNames, and the sentence names its file.

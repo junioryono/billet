@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
@@ -120,14 +121,14 @@ func TestCacheOrphansNeedTheSessionsOfANodeThatKeepsThem(t *testing.T) {
 	t.Parallel()
 
 	withoutListener := &config.Config{Node: &config.NodeConfig{StateDir: t.TempDir()}}
-	if _, err := cacheSessionRecords(withoutListener); err != nil {
+	if _, err := app.CacheSessionRecords(withoutListener); err != nil {
 		t.Errorf("a node without a cache listener was refused: %v", err)
 	}
 
 	withListener := &config.Config{Node: &config.NodeConfig{
 		StateDir: t.TempDir(), Cache: &config.NodeCacheConfig{},
 	}}
-	if _, err := cacheSessionRecords(withListener); err == nil {
+	if _, err := app.CacheSessionRecords(withListener); err == nil {
 		t.Error("a cache node whose sessions could not be read was judged anyway")
 	}
 }

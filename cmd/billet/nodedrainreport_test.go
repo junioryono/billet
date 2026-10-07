@@ -3,6 +3,7 @@ package main
 import (
 	"go/ast"
 	"os"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -105,12 +106,12 @@ func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
 // a call that runs where it stands, and `defer stop()` follows it (a call wrapped
 // in a deferred closure would run at return), the report is a plain statement after it, the
 // probe is the `if *upgradeProbe` block that returns, and serving is the final
-// `return nodeclient.Run(...)`.
+// `return n.Run(...)` on the node app.OpenNode returned.
 func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 	fn := findFunc(t, "cmdNode")
 
 	probe, handler, stopped, report, serve := -1, -1, -1, -1, -1
-	stopName := ""
+	stopName, nodeName := "", ""
 
 	for i, stmt := range fn.Body.List {
 		switch s := stmt.(type) {
@@ -125,6 +126,12 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			}
 
 		case *ast.AssignStmt:
+			if opened, ok := s.Rhs[0].(*ast.CallExpr); ok && len(s.Lhs) == 2 && calleeName(opened) == "OpenNode" {
+				if name, ok := s.Lhs[0].(*ast.Ident); ok {
+					nodeName = name.Name
+				}
+			}
+
 			if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 				continue
 			}
@@ -157,7 +164,7 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			}
 
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
-				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "nodeclient" {
+				if recv, ok := sel.X.(*ast.Ident); ok && nodeName != "" && recv.Name == nodeName {
 					serve = i
 				}
 			}
@@ -183,5 +190,101 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 
 	if serve < report {
 		t.Error("the node serves before it reports it handles the drain request")
+	}
+}
+
+// THE NODE'S LOCK IS RELEASED WHEN cmdNode RETURNS, NOT BEFORE. The statement
+// after the open's error check defers a function that closes the node; a
+// close that ran there instead would hand the deployment's compute to any
+// other process for as long as this one runs.
+func TestTheNodeHoldsItsLockUntilTheCommandReturns(t *testing.T) {
+	fn := findFunc(t, "cmdNode")
+
+	for i, stmt := range fn.Body.List {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) != 2 {
+			continue
+		}
+
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || calleeName(call) != "OpenNode" {
+			continue
+		}
+
+		node, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || i+2 >= len(fn.Body.List) {
+			t.Fatal("cmdNode opens its node without a name or a check")
+		}
+
+		deferred, ok := fn.Body.List[i+2].(*ast.DeferStmt)
+		if !ok {
+			t.Fatal("the statement after cmdNode's open check is not a deferred close of the node")
+		}
+
+		// IN THE DEFERRED FUNCTION'S BODY, never its arguments, which are
+		// evaluated where the defer stands: defer f(n.Close()) closes at once.
+		literal, ok := deferred.Call.Fun.(*ast.FuncLit)
+		if !ok || len(deferred.Call.Args) != 0 {
+			t.Fatal("cmdNode's deferred statement after the open is not a function literal called with nothing")
+		}
+
+		closes := false
+
+		ast.Inspect(literal.Body, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Close" {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == node.Name {
+						closes = true
+					}
+				}
+			}
+
+			return true
+		})
+
+		if !closes {
+			t.Errorf("cmdNode's deferred statement after the open does not close %s", node.Name)
+		}
+
+		return
+	}
+
+	t.Fatal("cmdNode does not open its node through app.OpenNode")
+}
+
+// THE NODE IS GIVEN WHAT A STOP ASKS OF IT. Node.Run hands the loop whatever
+// its host says (internal/app reads that), so this holds the host cmdNode
+// gives it: the drain-request file, the second signal, the service manager's
+// notification, stdout and the one record path. Without the first, a node set
+// to hand over would leave guests behind under an operation that must not.
+// The callbacks are compared by the function they are, which is what the
+// loop will call.
+func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
+	lc := newLifecycle(func() {})
+	// LINUX'S SPELLING, where a record is published; a Mac publishes none.
+	host := nodeHost(lc, "linux")
+
+	same := func(a, b any) bool { return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() }
+
+	if host.DrainRequested == nil || !same(host.DrainRequested, nodeDrainRequested) {
+		t.Error("nodeHost does not give the node nodeDrainRequested")
+	}
+
+	if host.Ready == nil || !same(host.Ready, notifyReady) {
+		t.Error("nodeHost does not give the node notifyReady")
+	}
+
+	var hurry <-chan struct{} = lc.hurry
+
+	if host.Hurry == nil || host.Hurry != hurry {
+		t.Error("nodeHost does not give the node this process's second signal")
+	}
+
+	if host.Out != os.Stdout {
+		t.Error("nodeHost does not give the node stdout")
+	}
+
+	if want := nodeRegistrationRecordPath("linux"); want == "" || host.RegistrationRecordPath != want {
+		t.Errorf("nodeHost gives a Linux node the record path %q, want %q", host.RegistrationRecordPath, want)
 	}
 }

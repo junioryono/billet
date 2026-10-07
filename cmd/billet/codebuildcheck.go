@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/codebuild"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -167,7 +168,7 @@ func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecer
 	}
 
 	p, err := codebuild.New(owner, *cfg.Node.CodeBuild,
-		codebuild.WithCredentials(awsCredentials()))
+		codebuild.WithCredentials(app.AWSCredentials()))
 	if err != nil {
 		return err
 	}

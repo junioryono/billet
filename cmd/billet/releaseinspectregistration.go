@@ -295,7 +295,7 @@ func decodeRegistrationRecord(body []byte) (*registrationRecord, error) {
 
 // registrationIdentity is what the record must name to be this node's: the
 // node's name and its deployment, each from the source the node itself takes
-// it from (nodeDeploymentID, claimIdentity), or the reason the comparison
+// it from (app.NodeDeploymentID, and the claim app.ClaimNodeDeployment takes), or the reason the comparison
 // cannot be made.
 type registrationIdentity struct {
 	node, deployment string

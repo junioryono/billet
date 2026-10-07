@@ -332,13 +332,25 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 		f := newEndpointFixture(t)
 		f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA, "node": "node-b"}))
 
-		started := time.Now()
+		// NOT WAITED ON, COUNTED RATHER THAN TIMED: a wait reads the record again,
+		// so a refusal that did not wait reads it as often with --wait as
+		// without. A bound on how long the refusal took failed under a loaded
+		// gate (#188) without anything having waited.
+		reads := 0
+		prev := inspectAfterRecordRead
+		inspectAfterRecordRead = func() { reads++ }
+		t.Cleanup(func() { inspectAfterRecordRead = prev })
+
+		mustEndpointRefusal(t, f.migrate(t, f.rendering(endpointB), "--dry-run"), outcomeUnknown, endpointReasonRecord)
+
+		unwaited := reads
+		reads = 0
 
 		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "3s")
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
 
-		if time.Since(started) > 2*time.Second {
-			t.Error("a foreign record was waited on")
+		if unwaited == 0 || reads != unwaited {
+			t.Errorf("a foreign record was waited on: %d record reads with --wait, %d without", reads, unwaited)
 		}
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider"
@@ -309,7 +310,7 @@ func TestAnIdentityBilletDidNotMintIsRefusedBeforeAnythingDerivesFromIt(t *testi
 	// broken fixture would not produce a false pass (the refusal below would simply
 	// not arrive), but it would report the guard as missing when what is missing is
 	// the certificate. This separates the two.
-	loaded, err := nodeBundle(cfg)
+	loaded, err := app.NodeBundle(cfg)
 	if err != nil || loaded == nil {
 		t.Fatalf("the bundle this test turns on did not load: bundle=%v err=%v", loaded, err)
 	}

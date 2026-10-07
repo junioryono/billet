@@ -2,18 +2,16 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
 
@@ -45,7 +43,7 @@ func cmdCacheOrphans(ctx context.Context, args []string) error {
 			"pool it should read", *cfgPath)
 	}
 
-	sessions, err := cacheSessionRecords(cfg)
+	sessions, err := app.CacheSessionRecords(cfg)
 	if err != nil {
 		return err
 	}
@@ -58,35 +56,6 @@ func cmdCacheOrphans(ctx context.Context, args []string) error {
 	return reclaimCacheOrphans(ctx, os.Stdout, client, ceph.OrphanOptions{
 		OlderThan: *olderThan, Limit: *limit, Reclaim: *reclaim, InSession: sessions.Mentions,
 	})
-}
-
-// cacheSessionRecords reads this node's cache custody records. A node with no
-// cache listener keeps none, so only there is a missing directory an empty set.
-func cacheSessionRecords(cfg *config.Config) (node.CacheSessionRecords, error) {
-	records, err := node.ReadCacheSessionRecords(cfg.Node.StateDir)
-	if err != nil {
-		if cfg.Node.Cache == nil && errors.Is(err, fs.ErrNotExist) {
-			return node.CacheSessionRecords{}, nil
-		}
-
-		return node.CacheSessionRecords{}, fmt.Errorf("could not tell which cache volumes this node's "+
-			"sessions hold, so nothing is judged: %w", err)
-	}
-
-	return records, nil
-}
-
-// cacheSessionNames reads this node's cache custody records afresh each time
-// eviction asks, so a volume a session names is never moved to the trash.
-func cacheSessionNames(cfg *config.Config) func() (func(name string) bool, error) {
-	return func() (func(name string) bool, error) {
-		records, err := cacheSessionRecords(cfg)
-		if err != nil {
-			return nil, err
-		}
-
-		return records.Mentions, nil
-	}
 }
 
 // orphanListed are the verdicts printed one line per image; the rest are counted.

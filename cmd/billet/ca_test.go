@@ -353,7 +353,7 @@ func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
 	nodeState := t.TempDir()
 	cfg := nodeConfigFor(t, "epyc-1", nodeState, out)
 
-	bundle, err := nodeBundle(cfg)
+	bundle, err := app.NodeBundle(cfg)
 	if err != nil {
 		t.Fatalf("the node could not load the bundle it was given: %v", err)
 	}
@@ -362,10 +362,17 @@ func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
 		t.Fatal("a node configured with node.tls loaded no bundle")
 	}
 
-	deployment, _, err := claimNodeDeployment(cfg, bundle)
+	// THROUGH THE ASSEMBLY, so what is held is that the bundle OpenNode reads
+	// is the one it claims the identity with. Docker's constructor reaches no
+	// daemon.
+	n, err := app.OpenNode(cfg, app.NodeOptions{})
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("open the node: %v", err)
 	}
+
+	t.Cleanup(func() { _ = n.Close() })
+
+	deployment := n.Deployment()
 
 	want, err := os.ReadFile(filepath.Join(serverState, "deployment-id"))
 	if err != nil {
@@ -409,7 +416,7 @@ func TestANodeRefusesABundleIssuedForSomebodyElse(t *testing.T) {
 
 	cfg := nodeConfigFor(t, "epyc-1", t.TempDir(), out)
 
-	_, err := nodeBundle(cfg)
+	_, err := app.NodeBundle(cfg)
 	if err == nil {
 		t.Fatal("a node called epyc-1 accepted a bundle issued for mac-mini-1")
 	}
@@ -456,7 +463,7 @@ func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
 	nodeState := t.TempDir()
 	cfg := nodeConfigFor(t, "epyc-1", nodeState, out)
 
-	if _, err := nodeBundle(cfg); err == nil {
+	if _, err := app.NodeBundle(cfg); err == nil {
 		t.Fatal("a certificate and an unrelated key were accepted as a bundle")
 	}
 
@@ -494,7 +501,7 @@ func TestANodeWithABundleNeedsNoName(t *testing.T) {
 			"is the authority and the hostname default only ever fights it", cfg.Node.Name)
 	}
 
-	if _, err := nodeBundle(cfg); err != nil {
+	if _, err := app.NodeBundle(cfg); err != nil {
 		t.Fatalf("loading the bundle: %v", err)
 	}
 
@@ -520,7 +527,7 @@ func TestANameThatContradictsTheCertificateIsRefused(t *testing.T) {
 
 	cfg := nodeConfigFor(t, "mac-mini-1", t.TempDir(), out)
 
-	_, err := nodeBundle(cfg)
+	_, err := app.NodeBundle(cfg)
 	if err == nil {
 		t.Fatal("a node claimed a name its certificate does not carry")
 	}
