@@ -96,7 +96,7 @@ is_replay_input() {
 		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/importcheck/* | internal/lease/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
 		internal/provenance/* | internal/regularfile/* | internal/replay/* | internal/retirement/* | \
-		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | \
+		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
 		internal/usage/* | internal/version/* | internal/wirecert/* | internal/wiring/*) return 0 ;;
 	*) return 1 ;;
 	esac

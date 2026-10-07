@@ -20,6 +20,12 @@ type sweepingRunner struct {
 	keepAliveExited  chan struct{}
 	startedOnce      atomic.Bool
 
+	// keepAliveCancelled is closed once the keep-alive has seen its context end,
+	// and holdAfterCancel, when set, keeps it from returning until it is closed:
+	// a keep-alive still finishing a renewal as the control plane stops.
+	keepAliveCancelled chan struct{}
+	holdAfterCancel    chan struct{}
+
 	tends  atomic.Int64
 	sweeps atomic.Int64
 }
@@ -31,8 +37,77 @@ func (s *sweepingRunner) KeepAlive(ctx context.Context) {
 
 	<-ctx.Done()
 
+	if s.keepAliveCancelled != nil {
+		close(s.keepAliveCancelled)
+	}
+
+	if s.holdAfterCancel != nil {
+		<-s.holdAfterCancel
+	}
+
 	if s.keepAliveExited != nil {
 		close(s.keepAliveExited)
+	}
+}
+
+// RUN DOES NOT RETURN WHILE ITS KEEP-ALIVE IS STILL RUNNING. A control plane
+// whose Run came back with a loop still live would have the ledger closed under
+// that loop by its caller's next defer. The keep-alive here, once cancelled,
+// holds until released: Run must still be inside when the keep-alive has seen
+// its cancellation, and return only after the release.
+func TestRunReturnsOnlyOnceItsKeepAliveHas(t *testing.T) {
+	t.Parallel()
+
+	runner := &sweepingRunner{
+		keepAliveStarted:   make(chan struct{}),
+		keepAliveExited:    make(chan struct{}),
+		keepAliveCancelled: make(chan struct{}),
+		holdAfterCancel:    make(chan struct{}),
+	}
+
+	prov := &fakeProvisioner{
+		onEnsure: func(string) error {
+			return errors.New("stopping the test here")
+		},
+	}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("billet-4vcpu-a")})
+
+	srv := New(a, prov, []config.Tier{tier("billet-4vcpu-a")}, "billet-test", nil,
+		WithNodeRunner(runner))
+
+	done := make(chan error, 1)
+
+	go func() { done <- srv.Run(t.Context()) }()
+
+	select {
+	case <-runner.keepAliveCancelled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the keep-alive was never cancelled; Run did not reach its return")
+	}
+
+	// THE KEEP-ALIVE IS HELD, SO A Run THAT JOINS IT CANNOT HAVE RETURNED. One
+	// that does not join returns at once, and this window is how long it is
+	// given to show it: a correct Run is never failed by it.
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned (%v) while its keep-alive was still running", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(runner.holdAfterCancel)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return once its keep-alive had")
+	}
+
+	select {
+	case <-runner.keepAliveExited:
+	default:
+		t.Error("Run returned before its keep-alive did")
 	}
 }
 
