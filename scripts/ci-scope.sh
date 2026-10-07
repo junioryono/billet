@@ -83,23 +83,20 @@ is_documentation() {
 # The packages the replay harness builds and runs (go list -deps of
 # internal/replay's tests), with their embedded assets and testdata;
 # TestCIScopeReplayRuleCoversTheReplayClosure holds this list to that closure.
-# provider and store include everything but the backend packages replay does
-# not import, so a new asset or testdata directory under either is included
-# rather than silently left out. codebuild and firecracker are ones it does
-# import, through internal/app's credential sweep and the control plane's guest
-# contract.
+# Every provider and store is in it, because internal/app builds every backend
+# for the node role, so a new asset or testdata directory under either is
+# included rather than silently left out.
 is_replay_input() {
 	case "$1" in
-	internal/provider/docker/* | internal/provider/ec2/* | internal/provider/tart/* | \
-		internal/store/ceph/* | internal/store/ebss3/*) return 1 ;;
 	internal/provider/* | internal/store/*) return 0 ;;
 	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
-		internal/awsquota/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
+		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
-		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/importcheck/* | internal/lease/* | \
+		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/guestassets/* | \
+		internal/importcheck/* | internal/lease/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
 		internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
-		internal/replay/* | internal/retirement/* | internal/runnerrelease/* | \
+		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \
 		internal/rollout/* | internal/scaleset/* | internal/server/* | internal/state/* | internal/supervise/* | \
 		internal/usage/* | internal/version/* | internal/wirecert/* | internal/wireshare/*) return 0 ;;
 	*) return 1 ;;

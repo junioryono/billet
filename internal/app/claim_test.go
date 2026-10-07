@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"errors"
@@ -25,7 +25,7 @@ func claimConfig(t *testing.T, stateDir, lockDir string) *config.Config {
 }
 
 func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
-	return claimNodeDeployment(cfg, nil)
+	return ClaimNodeDeployment(cfg, nil)
 }
 
 // A node claims the identity and takes the lock.
@@ -160,7 +160,7 @@ func TestTheNodeLocksWhereItWasTold(t *testing.T) {
 		LockDir:  lockDir,
 	}}
 
-	id, lock, err := claimNodeDeployment(cfg, nil)
+	id, lock, err := ClaimNodeDeployment(cfg, nil)
 	if err != nil {
 		t.Fatalf("claimNodeDeployment: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestTwoNodesOnOneHostCollide(t *testing.T) {
 		Name: "host-1", StateDir: stateDir, LockDir: lockDir,
 	}}
 
-	_, lock, err := claimNodeDeployment(first, nil)
+	_, lock, err := ClaimNodeDeployment(first, nil)
 	if err != nil {
 		t.Fatalf("the first node could not claim: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestTwoNodesOnOneHostCollide(t *testing.T) {
 		Name: "host-2", StateDir: stateDir, LockDir: lockDir,
 	}}
 
-	if _, _, err := claimNodeDeployment(second, nil); !errors.Is(err, state.ErrDeploymentLocked) {
+	if _, _, err := ClaimNodeDeployment(second, nil); !errors.Is(err, state.ErrDeploymentLocked) {
 		t.Fatalf("a second node started alongside one holding the same identity: %v", err)
 	}
 }
@@ -260,7 +260,7 @@ func TestACertlessNodeJoinsTheServerInItsOwnConfig(t *testing.T) {
 		},
 	}
 
-	got, lock, err := claimNodeDeployment(cfg, nil)
+	got, lock, err := ClaimNodeDeployment(cfg, nil)
 	if err != nil {
 		t.Fatalf("claimNodeDeployment: %v", err)
 	}

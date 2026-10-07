@@ -9,16 +9,12 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,7 +22,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -34,21 +29,15 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
-	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
-	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
-	"github.com/junioryono/billet/internal/provider/codebuild"
-	"github.com/junioryono/billet/internal/provider/docker"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/provider/tart"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/state"
-	storecontract "github.com/junioryono/billet/internal/store"
 	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/store/ebss3"
 	"github.com/junioryono/billet/internal/version"
@@ -358,140 +347,6 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe, *holdProbeFlag)
 }
 
-// claimNodeDeployment reads this host's identity and takes the host-wide lock on
-// it.
-//
-// THE LOCK IS THE NODE'S ALONE, because the node is the role that manages
-// containers. It stops two processes carrying one deployment identity from
-// managing the same compute, and a control plane manages none — so the server
-// takes no lock, and `server.lock_dir` is gone.
-//
-// That is not tidying, it is a requirement. The lock is EXCLUSIVE per identity,
-// so a server that took it would keep a node on the same machine from ever
-// starting — and one machine running both is the single-machine deployment,
-// which is now precisely `billet server` and `billet node` side by side.
-//
-// MUST BE CALLED BEFORE newProvider: nothing may touch a container before the
-// right to manage containers under this identity is established.
-func claimNodeDeployment(cfg *config.Config, bundle *wirecert.Bundle) (string, *state.DeploymentLock, error) {
-	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE, and the whole question is what
-	// tells it which one. A certificate answers directly. Without one, the node can
-	// only reach a control plane inside this machine — validation guarantees that,
-	// because a certless node may dial nothing but loopback — and if this file also
-	// describes that control plane, its state directory holds the answer.
-	//
-	// Falling back to the node's OWN directory is not an option, and fails invisibly:
-	// a state directory with no identity MINTS a fresh random one, so the node invents
-	// a deployment nobody has heard of, the plane refuses it for belonging elsewhere,
-	// and that refusal is ErrRefused — which the node loop reads as a verdict rather
-	// than an outage, so the process exits and nothing repairs it.
-	deployment, err := nodeDeploymentID(cfg, bundle)
-	if err != nil {
-		return "", nil, err
-	}
-
-	if deployment != "" {
-		if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
-			return "", nil, err
-		}
-	}
-
-	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, cfg.Node.AllowUnlockedDeployment)
-}
-
-// nodeDeploymentID is the identity this host must claim, or "" when only its own
-// state directory can say.
-//
-// The certificate outranks the config file: a bundle is proof issued BY the
-// control plane, while a `server:` section is merely a description sitting next
-// to the node's own. They agree in every sane deployment, and where they do not,
-// the one the plane will actually check is the certificate.
-func nodeDeploymentID(cfg *config.Config, bundle *wirecert.Bundle) (string, error) {
-	if bundle != nil {
-		return bundle.Deployment()
-	}
-
-	if cfg.Server != nil {
-		// Founding it here is correct if the server has not started yet: whichever
-		// role runs first mints the identity, and the other reads that same file.
-		return state.DeploymentID(cfg.Server.IdentityDir)
-	}
-
-	// A node whose file says nothing about the control plane it dials. Its own
-	// directory is the only answer available, so it must already hold the right
-	// one — see the node.state_dir note in billet.example.yaml.
-	return "", nil
-}
-
-// claimIdentity reads an installation identity and takes the host-wide lock.
-func claimIdentity(
-	stateDir, lockDir string, allowUnplaceable bool,
-) (string, *state.DeploymentLock, error) {
-	deployment, err := state.DeploymentID(stateDir)
-	if err != nil {
-		return "", nil, err
-	}
-
-	// The state directory's own lock guards a PATH, so a copied directory is a
-	// different inode and both copies lock happily — while both carry the same
-	// deployment identity and therefore manage the same containers against the
-	// same daemon. This lock is keyed by the identity, so the copy collides.
-	lock, err := state.LockDeployment(deployment, state.LockOptions{
-		Dir:              lockDir,
-		AllowUnplaceable: allowUnplaceable,
-	})
-	if err != nil {
-		return "", nil, err
-	}
-
-	if why := lock.Degraded(); why != "" {
-		// Reached only because the operator asked for it. Still said out loud every
-		// boot: billet is back to the directory lock alone, which is what it had
-		// before this existed and still lets two copies of a state directory run at
-		// once.
-		slog.Default().Warn("starting WITHOUT a host-wide deployment lock because "+
-			"allow_unlocked_deployment is set, so nothing stops a COPY of this state "+
-			"directory from running alongside it and managing the same containers",
-			"reason", why)
-
-		return deployment, lock, nil
-	}
-
-	// LOGGED SO A MISMATCH IS VISIBLE. The default location is per-user, so two
-	// billets that ought to collide can quietly pick different directories and
-	// both start. The path is the only evidence of which collision domain this
-	// process actually joined.
-	slog.Default().Info("holding the host-wide deployment lock",
-		"identity", deployment, "path", lock.Path())
-
-	return deployment, lock, nil
-}
-
-// nodeContribution is what this host offers: what it detected, unless its own
-// config said otherwise.
-//
-// ONE DEFINITION, ONE CALLER, because `billet node` is the only way a host joins.
-// Two paths resolving it independently would let the same file describe a
-// different machine depending on which process read it.
-func nodeContribution(cfg *config.Config) (config.Contribution, error) {
-	// NOT MEASURED WHEN THE WORK RUNS SOMEWHERE ELSE. An ec2 node is an
-	// orchestrator: it calls an API and the compute appears in a region, so this
-	// machine's cores are a default for nothing — config validation requires the
-	// numbers outright. Detecting anyway would spend a syscall on an answer whose
-	// only use would be comparing it against a declaration it has no relationship
-	// with.
-	if !cfg.Node.Provider.RunsOnHost() {
-		return cfg.Node.Contribution(0, 0), nil
-	}
-
-	vcpu, memory, err := config.DetectHostCapacity()
-	if err != nil {
-		return config.Contribution{}, err
-	}
-
-	return cfg.Node.Contribution(vcpu, memory), nil
-}
-
 // runServer starts the control plane and blocks until it is told to stop.
 //
 // THE ORDER IS THE TYPES': internal/app's control plane hands out a Controller
@@ -616,189 +471,6 @@ func serverHost() app.Host {
 	}
 }
 
-// serverHostname is the name a node checks its control plane's certificate
-// against.
-//
-// Taken from node.server_addr, which is the address the node actually dials, so
-// the certificate is verified against the thing that was reached rather than
-// against whatever the certificate happens to claim.
-func serverHostname(addr string) (string, error) {
-	s := addr
-	if !strings.Contains(s, "://") {
-		s = "https://" + s
-	}
-
-	u, err := url.Parse(s)
-	if err != nil {
-		return "", fmt.Errorf("node.server_addr %q is not an address billet can dial: %w", addr, err)
-	}
-
-	if u.Hostname() == "" {
-		return "", fmt.Errorf("node.server_addr %q names no host, so there is nothing to verify "+
-			"the control plane's certificate against", addr)
-	}
-
-	return u.Hostname(), nil
-}
-
-// newProvider builds the compute backend this host runs.
-//
-// docker, ec2 and firecracker exist. tart needs Apple Silicon and a licence
-// carve-out — each is a separate implementation of the same interface, and it is
-// refused explicitly rather than falling through to something that happens to
-// compile.
-func newProvider(cfg *config.Config, deployment string) (provider.Provider, error) {
-	switch cfg.Node.Provider {
-	case config.ProviderDocker:
-		// Labelled with the DEPLOYMENT id, not the node name. Two billets on one
-		// machine share a hostname — and therefore a default node name — while
-		// keeping separate state directories, so a node-name label would let each
-		// enumerate the other's containers and destroy them as orphans.
-		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
-
-	case config.ProviderEC2:
-		// Config validation is what guarantees this is non-nil, and the constructor
-		// refuses an empty deployment identity for the same reason docker is
-		// labelled with one: instances are TAGGED with it, and List feeds a loop
-		// that terminates, so two installations sharing a tag is a way for one to
-		// destroy the other's live jobs.
-		if cfg.Node.EC2 == nil {
-			return nil, errors.New("billet: node.ec2 is missing; the provider is ec2")
-		}
-
-		ec2Config := *cfg.Node.EC2
-		ec2Config.NodeName = cfg.Node.Name
-
-		return ec2.New(deployment, ec2Config, ec2.WithLogger(slog.Default()))
-
-	case config.ProviderCodeBuild:
-		if cfg.Node.CodeBuild == nil {
-			return nil, errors.New("billet: node.codebuild is missing; the provider is codebuild")
-		}
-
-		// THE DEPLOYMENT IDENTITY IS EVEN MORE LOAD-BEARING HERE THAN ON EC2, because
-		// a CodeBuild build CANNOT BE TAGGED: `StartBuild` has no field that becomes
-		// one, so the per-instance owner tag the ec2 backend filters List on does not
-		// exist. What replaces it is a dedicated project plus this identity carried as
-		// an environment-variable marker — and List feeds a loop that STOPS builds, so
-		// two installations sharing a project and an identity is a way for one to stop
-		// the other's live jobs.
-		//
-		// THE CREDENTIAL CHAIN IS ADAPTED RATHER THAN DUPLICATED. It lives in
-		// internal/provider/ec2 and a compute backend must not import a sibling
-		// compute backend, so this is the one place that knows about both — exactly
-		// what openArchiveStore already does for internal/archivestore. Extracting the
-		// chain into a shared package is a separate change; moving a four-types-deep
-		// redaction table is a security refactor that wants its own review and its
-		// own mutation run rather than riding along here.
-		return codebuild.New(deployment, *cfg.Node.CodeBuild,
-			codebuild.WithLogger(slog.Default()),
-			codebuild.WithCredentials(awsCredentials()))
-
-	case config.ProviderFirecracker:
-		// BOTH BLOCKS ARE GUARANTEED BY VALIDATION — node.ceph is required for this
-		// backend and refused for every other, and node.firecracker likewise — so
-		// these are the guards that keep that true rather than cases that happen.
-		if cfg.Node.Firecracker == nil {
-			return nil, errors.New("billet: node.firecracker is missing; the provider is firecracker")
-		}
-
-		if cfg.Node.Ceph == nil {
-			return nil, errors.New("billet: node.ceph is missing; every guest boots from a clone " +
-				"of a golden image in the site's cluster")
-		}
-
-		// THE STORAGE IS BUILT HERE AND HANDED IN, because a provider and a store
-		// are siblings that may not import each other. This is the one place that
-		// knows about both.
-		store, err := ceph.New(*cfg.Node.Ceph)
-		if err != nil {
-			return nil, err
-		}
-
-		return firecracker.New(deployment, *cfg.Node.Firecracker, store, firecrackerOptions(cfg)...)
-
-	case config.ProviderTart:
-		// Labelled with the DEPLOYMENT id for the docker backend's reason: two
-		// billets on one Mac share a hostname, and the ownership marker is what
-		// keeps each from destroying the other's guests as orphans.
-		var tartCfg config.TartConfig
-		if cfg.Node.Tart != nil {
-			tartCfg = *cfg.Node.Tart
-		}
-
-		return tart.New(deployment,
-			tart.WithLogger(slog.Default()),
-			tart.WithConfig(tartCfg))
-
-	case config.ProviderSimulated:
-		// UNREACHABLE THROUGH config.Load, WHICH REFUSES THE KIND, and refused again
-		// here because this switch is the one place that turns a kind into compute.
-		// The simulated backend fabricates completions; a host running it would
-		// report every job finished and run none.
-		return nil, errors.New("billet: the simulated backend exists for billet's own test " +
-			"harness and is never constructed by the CLI")
-
-	default:
-		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
-	}
-}
-
-// nodeBundle loads the certificate this node presents, if it has one.
-//
-// Config validation is what refuses a network address without a bundle, so a nil
-// return here means loopback — the one case where the control plane is inside
-// this machine and there is nothing between the two to authenticate against.
-func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
-	if cfg.Node.TLS == nil {
-		return nil, nil //nolint:nilnil // no bundle is a state, not an error
-	}
-
-	bundle, err := wirecert.LoadBundle(cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// VALIDATED BEFORE ANYTHING IS WRITTEN FROM IT, because the deployment
-	// identity this bundle names is about to be recorded permanently. A malformed
-	// or mixed bundle would otherwise write deployment A into the state directory
-	// and only then fail on the key pair — after which the CORRECT bundle for
-	// deployment B is refused as an identity conflict, and an operator has to
-	// clear state by hand for an enrollment that never succeeded.
-	if _, err := wirecert.ClientTLS(bundle); err != nil {
-		return nil, err
-	}
-
-	// CHECKED HERE, WHERE THE FILES ARE NAMED. The control plane refuses a
-	// mismatch too, but it can only say "you are not who you claim" — this can say
-	// which file on this host holds the wrong certificate, which is the sentence
-	// an operator can act on.
-	name, err := bundle.NodeName()
-	if err != nil {
-		return nil, err
-	}
-
-	// THE CERTIFICATE IS THE NAME, and an absent node.name is filled in from it
-	// rather than defaulted from the hostname. The control plane authorises by
-	// this name, so a machine whose hostname differs from it would otherwise be
-	// refused for a value the operator never chose.
-	if cfg.Node.Name == "" {
-		cfg.Node.Name = name
-
-		return &bundle, nil
-	}
-
-	if name != cfg.Node.Name {
-		return nil, fmt.Errorf(
-			"node.name is %q but %s was issued for %q; the control plane authorises by the "+
-				"name in the certificate, so this node could only ever act as %q. Remove "+
-				"node.name to take it from the certificate",
-			cfg.Node.Name, cfg.Node.TLS.CertPath, name, name)
-	}
-
-	return &bundle, nil
-}
-
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
 	// migration and the receipt are commands about the node this host runs,
@@ -863,87 +535,23 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 
-	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
-	// decides the identity. A node JOINS a deployment; it does not found one.
-	bundle, err := nodeBundle(cfg)
-	if err != nil {
-		return err
-	}
-
-	// THE NODE'S IDENTITY COMES FROM THE CERTIFICATE IT WAS ISSUED, falling back
-	// to its own state directory only when there is no control plane beyond this
-	// machine to join. It labels its compute with this, and the control plane
-	// refuses a node whose deployment differs — otherwise a host would start
-	// containers this installation could never attribute.
-	// THE NODE'S LOCK MUST LAND WHERE THE SERVER'S DOES. Both roles can run on
-	// one host, and a server honouring server.lock_dir while this used the
-	// per-user default would take two different locks for one identity — after
-	// which both manage the same containers and either can adopt or destroy the
-	// other's live work. Sharing the claim is what keeps that true.
-	deployment, lock, err := claimNodeDeployment(cfg, bundle)
+	// THE IDENTITY, ITS LOCK AND THE PROVIDER, IN THAT ORDER: see app.OpenNode.
+	n, err := app.OpenNode(cfg, app.NodeOptions{Upgrader: upgrader})
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		if err := lock.Release(); err != nil {
+		if err := n.Close(); err != nil {
 			slog.Default().Warn("could not release the deployment lock", "error", err)
 		}
 	}()
 
-	// A ROTATING IDENTITY, so a renewal takes effect without a restart. The
-	// callback is answered per handshake, which is what makes it safe to replace
-	// the certificate under a node holding long-lived connections.
-	var (
-		tlsConf  *tls.Config
-		identity *wirecert.Rotating
-	)
-
-	if bundle != nil {
-		identity, err = wirecert.NewRotating(
-			cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
-		if err != nil {
-			return err
-		}
-
-		// SAID OUT LOUD, because nothing is broken and something did go wrong. A
-		// renewal was interrupted partway through installing itself and this node
-		// came back on the generation it was replacing — which still works, and
-		// which is closer to expiry than the one that did not land.
-		if stale := identity.StaleCopies(); stale != nil {
-			slog.Default().Warn("a superseded certificate generation could not be removed, so a "+
-				"second copy of this node's private key is still on disk; delete it",
-				"error", stale)
-		}
-
-		if identity.RolledBack() {
-			slog.Default().Warn("a certificate renewal was interrupted before it finished "+
-				"installing; this node is running on the one it replaced and will try again",
-				"expires", identity.Leaf().NotAfter.Format(time.DateOnly))
-		}
-
-		host, hostErr := serverHostname(cfg.Node.ServerAddr)
-		if hostErr != nil {
-			return hostErr
-		}
-
-		tlsConf = identity.ClientTLS(host)
-	}
-
-	client, err := newNodeClientFor(cfg, tlsConf)
-	if err != nil {
-		return err
-	}
-
-	p, err := newProvider(cfg, deployment)
-	if err != nil {
-		return err
-	}
 	if *upgradeProbe {
 		if err := notifyReady(); err != nil {
 			return fmt.Errorf("node upgrade-probe readiness: %w", err)
 		}
-		holdProbe(ctx, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, cfg.Node.Name))
+		holdProbe(ctx, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, n.Name()))
 
 		return nil
 	}
@@ -954,508 +562,20 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	defer stopDrainRequests()
 	publishNodeDrainReport(hostOS)
 
-	handOver, err := cfg.Node.HandsOverOnStop()
-	if err != nil {
-		return err
-	}
+	return n.Run(ctx, nodeHost(lc))
+}
 
-	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client,
-		nodeCacheStopGrace(handOver))
-	if err != nil {
-		return err
-	}
-	defer stopCache()
-
-	maxCustody, err := cfg.Node.MaxCustodyDuration()
-	if err != nil {
-		return err
-	}
-
-	// THE CLIENT IS BOTH THE LEDGER AND THE MINT.
-	//
-	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
-	// the runner needs no idea it is remote: the interfaces it already took are
-	// the seam the network went through.
-	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody)}
-	if cacheService != nil {
-		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
-	}
-	if cfg.Node.RegistryMirrors != nil {
-		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors))
-	}
-
-	// AND THE ABILITY TO REPLACE ITSELF, which is what makes a rollout reach a
-	// node at all. It is given here rather than defaulted inside the runner
-	// because it is a property of how this process was INSTALLED — a node started
-	// out of a working directory has no packaged binary to replace, and the
-	// runner refusing the command with a sentence an operator can act on is better
-	// than one attempting a transaction against a machine that is not shaped for
-	// it.
-	runnerOpts = append(runnerOpts, node.WithUpgrader(upgrader))
-
-	// THE SAMPLER OUTLIVES THE SHUTDOWN SIGNAL, as the drain does: jobs keep
-	// running and being measured until this command returns.
-	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
-	defer stopMonitor()
-	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
-	if err != nil {
-		return err
-	}
-	runnerOpts = append(runnerOpts, monitorOpts...)
-
-	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)
-
-	fmt.Printf("billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
-
-	// NO GUEST-OS CLAIM. A host's allowlist lives in the SERVER's fleet
-	// configuration, not here, and Bind is what enforces it. Sending one from the
-	// node would be a second authority for a fact the operator already stated in
-	// one place — and the node's copy is the one nobody would think to update.
-	// Parsed rather than trusted: Validate rejected a bad value when the file was
-	// read, so this cannot normally fail — but reading it is the only thing that
-	// makes node.drain_timeout take effect.
-	drainTimeout, err := cfg.Node.DrainTimeoutDuration()
-	if err != nil {
-		return err
-	}
-	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
-	// re-registers, and a node that came back reporting a different contribution
-	// would move the fleet's arithmetic underneath work it is still holding.
-	contribution, err := nodeContribution(cfg)
-	if err != nil {
-		return err
-	}
-
-	for _, w := range contribution.Warnings {
-		slog.Default().Warn(w, "node", cfg.Node.Name)
-	}
-	if err := notifyReady(); err != nil {
-		return fmt.Errorf("node readiness: %w", err)
-	}
-
-	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
-		Provider:       cfg.Node.Provider,
-		Deployment:     deployment,
-		Site:           cfg.Node.Site,
-		VCPU:           contribution.VCPU,
-		Memory:         contribution.Memory,
-		GuestOS:        nodeGuestOS(cfg),
-		EC2Shapes:      remoteShapes(cfg),
-		CodeBuildFleet: codeBuildFleet(cfg),
-
-		CodeBuildJITParameterPath: codeBuildJITPath(cfg),
-		CodeBuildRegion:           codeBuildRegion(cfg),
-		Log:                       slog.Default(),
-		Identity:                  identity,
-		SweepEvery:                5 * time.Minute,
-		DrainTimeout:              drainTimeout,
-		HandOverOnStop:            handOver,
-		// THE GUEST CACHE ANSWERS ONCE THIS PROCESS IS REGISTERED AND RECOVERED;
-		// until then its connections wait in the listener's queue.
-		Ready:          serveCache,
-		DrainRequested: nodeDrainRequested,
-		// The second signal, reaching the wait that honours it.
-		Hurry: lc.hurry,
-		// OVERLAPPING LAUNCHES ONLY WHERE THE PROVIDER WAS BUILT FOR THEM: Firecracker
-		// locks each lease separately and allocates by atomic link. The others keep
-		// one command at a time until each is shown to be safe the same way.
-		LaunchConcurrency: nodeLaunchConcurrency(cfg.Node.Provider),
-		// Where the node publishes its registration record after every accepted
-		// registration, for the inspector to read: the one spelling, empty on a
-		// Mac.
+// nodeHost is what the node takes from this process and machine: the service
+// manager's notification, the drain request a stop may carry, the second
+// signal, stdout, and where the registration record is published.
+func nodeHost(lc *lifecycle) app.NodeHost {
+	return app.NodeHost{
+		Ready:                  notifyReady,
+		DrainRequested:         nodeDrainRequested,
+		Hurry:                  lc.hurry,
+		Out:                    os.Stdout,
 		RegistrationRecordPath: nodeRegistrationRecordPath(hostOS),
-	})
-}
-
-// newNodeClientFor is THE ONE CONSTRUCTION of the node's client from its
-// configuration: the address, the name and the TLS state as the command
-// resolves them, so a fixture that builds the client the way the command does
-// and the command itself cannot disagree about the request base.
-func newNodeClientFor(cfg *config.Config, tlsConf *tls.Config) (*nodeclient.Client, error) {
-	return nodeclient.New(nodeclient.Options{
-		Base: cfg.Node.ServerAddr,
-		Node: cfg.Node.Name,
-		TLS:  tlsConf,
-	})
-}
-
-const cacheEvictionAge = 7 * 24 * time.Hour
-
-const cacheConnectionLimit = 128
-
-// nodeCacheControl is what the node's cache service asks the control plane:
-// the kill switch, and what a job may publish. The node client is both.
-type nodeCacheControl interface {
-	node.ActionsPolicy
-	node.CachePolicy
-	node.CacheAuthorityReader
-}
-
-// startNodeCache exposes the site's clone store to its managed guests.
-func startNodeCache(
-	ctx context.Context,
-	cfg *config.Config,
-	p provider.Provider,
-	deployment string,
-	cachePolicy nodeCacheControl,
-	stopGrace time.Duration,
-) (*node.CacheService, func(), func(), error) {
-	if cfg.Node.Cache == nil {
-		return nil, func() {}, func() {}, nil
 	}
-
-	attacher, ok := p.(provider.VolumeAttacher)
-	if !ok {
-		return nil, nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
-			cfg.Node.Provider)
-	}
-	var storage storecontract.Store
-	switch cfg.Node.Provider {
-	case config.ProviderFirecracker:
-		if cfg.Node.Ceph == nil {
-			return nil, nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
-		}
-		var err error
-		storage, err = ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(cacheSessionNames(cfg)))
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	case config.ProviderEC2:
-		if cfg.Node.EBSS3 == nil {
-			return nil, nil, nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
-		}
-		var err error
-		storage, err = ebss3.New(*cfg.Node.EBSS3,
-			cacheNamespace(deployment, cfg.Node.Site), awscreds.Default())
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	default:
-		return nil, nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
-	}
-
-	service, err := node.NewCacheService(cfg.Node.Cache.GuestEndpoint,
-		cacheNamespace(deployment, cfg.Node.Site), cfg.Node.StateDir, storage, attacher, slog.Default())
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	service.SetActionsPolicy(cachePolicy)
-	service.SetCachePolicy(cachePolicy)
-	service.SetAuthorityReader(cachePolicy)
-
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("listen for guest cache requests on %s: %w",
-			cfg.Node.Cache.Listen, err)
-	}
-
-	ln = app.LimitListener(ln, cacheConnectionLimit)
-	srv := &http.Server{
-		Handler:           service,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		IdleTimeout:       time.Minute,
-		MaxHeaderBytes:    16 << 10,
-	}
-	// BAZEL'S AND BUCK2'S REMOTE CACHES SPEAK gRPC, which is HTTP/2, and a guest
-	// reaches this listener in the clear on its own bridge, so it takes HTTP/2
-	// with prior knowledge beside HTTP/1. The read timeout applies per stream,
-	// and a cache transfer extends its own.
-	if cfg.Node.Provider != config.ProviderEC2 {
-		srv.Protocols = new(http.Protocols)
-		srv.Protocols.SetHTTP1(true)
-		srv.Protocols.SetUnencryptedHTTP2(true)
-	}
-	serveListener := ln
-	if cfg.Node.Provider == config.ProviderEC2 {
-		certificate, err := tls.LoadX509KeyPair(cfg.Node.Cache.TLSCert, cfg.Node.Cache.TLSKey)
-		if err != nil {
-			_ = ln.Close()
-
-			return nil, nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
-		}
-		srv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
-		}
-		serveListener = tls.NewListener(ln, srv.TLSConfig)
-	}
-	// BOUND NOW, SERVED ONCE THE NODE IS READY. A failure to bind is a startup
-	// error as it always was, but nothing is answered until this process is
-	// registered and recovered: a handed-over guest's request asked earlier would
-	// be judged by a process the control plane does not know, and the kill
-	// switch reads that as disabled. Connections arriving meanwhile wait in the
-	// listener's queue.
-	//
-	// THE MOUNTS A PREVIOUS PROCESS MADE ARE NOT HERE, so they are restored first
-	// (#374): the unit has a mount namespace of its own, and a recovered session's
-	// paths are empty directories until its volumes are mounted again in this
-	// one. In the background, each mount bounded, so storage that stalls delays
-	// only the cache, never the registration and renewal of the compute; and not
-	// on the node's context, which a stop cancels before a drain serves the
-	// guests it waits for.
-	var serveOnce sync.Once
-	serve := func() {
-		serveOnce.Do(func() {
-			go func() {
-				service.RestoreMounts(context.WithoutCancel(ctx))
-				slog.Default().Info("serving guest cache requests", "addr", serveListener.Addr().String())
-				if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
-						"error", err)
-				}
-			}()
-		})
-	}
-
-	// Eviction is intentionally best effort. A cache outage may slow a job, but it
-	// must never change that job's result or stop the node from serving compute.
-	//
-	// ITS OWN GOROUTINE, because a pass asks rbd several questions about every old
-	// volume and can run for many minutes, and the loop below finishes closed
-	// sessions, whose publications are abandoned after publishWindow. It starts
-	// after the first renewal, so a restarted node's live clones are renewed before
-	// any eviction pass reads their records.
-	go func() {
-		cleanupTicker := time.NewTicker(5 * time.Minute)
-		defer cleanupTicker.Stop()
-
-		retryClosed := func() {
-			if err := service.RetryClosed(ctx); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not finish closed cache sessions; will retry",
-					"error", err)
-			}
-		}
-		renewActive := func() {
-			if err := service.RenewActive(ctx, time.Now().Add(7*time.Hour)); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not renew active cache generations; will retry",
-					"error", err)
-			}
-		}
-		evict := func() {
-			if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not evict expired cache generations; will retry",
-					"error", err)
-			}
-			if err := service.ReapGitMirrors(ctx); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not reap unused git mirrors; will retry", "error", err)
-			}
-		}
-
-		retryClosed()
-		renewActive()
-
-		go func() {
-			evictionTicker := time.NewTicker(6 * time.Hour)
-			defer evictionTicker.Stop()
-
-			evict()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-evictionTicker.C:
-					evict()
-				}
-			}
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-cleanupTicker.C:
-				retryClosed()
-				renewActive()
-			case <-service.ClosedSessions():
-				retryClosed()
-			}
-		}
-	}()
-
-	slog.Default().Info("listening for guest cache requests; they are answered once this node "+
-		"has registered and recovered", "provider", cfg.Node.Provider, "addr", ln.Addr().String())
-
-	return service, serve, func() {
-		// A listener never served is closed here, since Shutdown closes only what
-		// Serve was given; and once this has run, serve does nothing.
-		serveOnce.Do(func() { _ = serveListener.Close() })
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopGrace)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Default().Warn("the guest cache listener did not shut down cleanly",
-				"grace", stopGrace, "error", err)
-		}
-	}, nil
-}
-
-// nodeCacheStopGrace is how long the guest cache listener lets requests already
-// in flight finish when the node stops; Shutdown stops accepting at once and
-// returns as soon as they have.
-//
-// LONGER ON A HANDOVER (#374), because the guests are still running and a git
-// fetch or a build-cache transfer cut off mid-body fails the job, while a new
-// connection only waits: the guest's relay redials until the next process
-// listens. A drain stops the listener after its jobs have finished, so nothing
-// is left to wait for.
-//
-// AND NO LONGER THAN A SIXTH OF THE LEASE TTL. Nothing renews the handed-over
-// leases from the withdrawal until the next process registers, and the last
-// renewal may already be a third of the TTL old (the node renews every TTL/3), so
-// this grace comes out of what the restart has left before the reaper
-// quarantines running jobs.
-func nodeCacheStopGrace(handOver bool) time.Duration {
-	if handOver {
-		return alloc.DefaultLeaseTTL / 6
-	}
-
-	return 5 * time.Second
-}
-
-func cacheNamespace(deployment, site string) string {
-	if site == "" {
-		site = "local"
-	}
-
-	return deployment + "/" + site
-}
-
-// remoteShapes is the ordered shape catalogue this node registers, whichever
-// remote backend it runs.
-//
-// nodeLaunchConcurrency is how many launches a node of this provider runs at once.
-// Four keeps a host starting guests while no single burst outruns its disk and
-// network setup; one is a node as it always was.
-func nodeLaunchConcurrency(kind config.ProviderKind) int {
-	if kind == config.ProviderFirecracker {
-		return 4
-	}
-
-	return 1
-}
-
-// CLONED, because the registration is carried across every reconnect and the
-// caller keeps the config: a slice shared with cfg would let anything holding the
-// config widen what this host claims it may buy after the numbers were validated.
-//
-// A HOST-BACKED PROVIDER REGISTERS NONE, and the allocator refuses one that does —
-// its capacity is the machine, so a shape catalogue there is a purchase decision
-// about compute nobody buys.
-func remoteShapes(cfg *config.Config) []config.RemoteShape {
-	switch cfg.Node.Provider {
-	case config.ProviderEC2:
-		if cfg.Node.EC2 != nil {
-			return slices.Clone(cfg.Node.EC2.InstanceTypes)
-		}
-
-	case config.ProviderCodeBuild:
-		if cfg.Node.CodeBuild != nil {
-			return slices.Clone(cfg.Node.CodeBuild.ComputeTypes)
-		}
-
-	case config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart:
-		return nil
-	}
-
-	return nil
-}
-
-// awsCredentials adapts billet's one AWS credential chain to a consumer that
-// declares its own interface over awssig.Credentials.
-//
-// ONE CHAIN, ADAPTED AT THE EDGE. The chain — environment variables, then this
-// instance's IAM role over IMDSv2, with v1 refused rather than used as a fallback —
-// lives in internal/provider/ec2 and carries a redaction table that took several
-// rounds to get right. A second copy would be a second security boundary, and a
-// compute backend importing a sibling compute backend would make one of them a
-// library for the other. So consumers declare a narrow interface and cmd/billet
-// converts, which is what openArchiveStore already does for internal/archivestore.
-//
-// Extracting the chain into internal/awscreds is a separate change.
-func awsCredentials() codebuild.CredentialSource {
-	resolver := awscreds.Default()
-
-	return credentialSourceFunc(func(ctx context.Context) (awssig.Credentials, error) {
-		resolved, err := resolver.Credentials(ctx)
-		if err != nil {
-			return awssig.Credentials{}, err
-		}
-
-		return awssig.Credentials{
-			AccessKeyID:     resolved.AccessKeyID,
-			SecretAccessKey: resolved.SecretAccessKey,
-			SessionToken:    resolved.SessionToken,
-		}, nil
-	})
-}
-
-// credentialSourceFunc adapts a function to the interface.
-type credentialSourceFunc func(context.Context) (awssig.Credentials, error)
-
-func (f credentialSourceFunc) Credentials(ctx context.Context) (awssig.Credentials, error) {
-	return f(ctx)
-}
-
-// nodeGuestOS is what this host tells the control plane it can boot, and it is
-// derived ONLY for codebuild.
-//
-// A CODEBUILD NODE'S ENVIRONMENT TYPE DECIDES ITS GUEST OS OUTRIGHT: a MAC_ARM
-// project boots macOS and every other permitted environment boots Linux, and there
-// is no configuration that could make one serve the other. Reporting it lets the
-// plane refuse an obviously wrong dispatch at pick time instead of at the first
-// launch, and `alloc.Bind` remains the durable check a node cannot route around.
-//
-// EVERY OTHER BACKEND KEEPS REPORTING NOTHING, which the plane reads as
-// unconstrained. That is today's behaviour and changing it is not this backend's
-// business: a firecracker or tart host's real capability comes from its images and
-// its `nodes:` policy, and having the node start asserting a narrower answer would
-// silently stop dispatching leases that place correctly now.
-func nodeGuestOS(cfg *config.Config) []config.GuestOS {
-	if cfg.Node.Provider != config.ProviderCodeBuild || cfg.Node.CodeBuild == nil {
-		return nil
-	}
-
-	if !cfg.Node.CodeBuild.EnvironmentType.Valid() {
-		return nil
-	}
-
-	return []config.GuestOS{cfg.Node.CodeBuild.EnvironmentType.GuestOS()}
-}
-
-// codeBuildFleet is the reserved-capacity fleet this node draws on, or empty.
-//
-// Read only for a codebuild node: the allocator refuses a fleet reported by any
-// other backend, because a shared-pool claim from a host that draws on no pool
-// would keep a legitimate second node out of a fleet its provider never reads.
-func codeBuildFleet(cfg *config.Config) string {
-	if cfg.Node.Provider != config.ProviderCodeBuild || cfg.Node.CodeBuild == nil {
-		return ""
-	}
-
-	return cfg.Node.CodeBuild.FleetARN
-}
-
-// codeBuildJITPath is where this node stages runner registrations, or empty.
-//
-// Reported for the same reason the fleet is and read under the same guard: the
-// control plane sweeps registrations a dead node left behind, and the path is a
-// codebuild fact the allocator refuses from any other backend.
-func codeBuildJITPath(cfg *config.Config) string {
-	if cfg.Node.Provider != config.ProviderCodeBuild || cfg.Node.CodeBuild == nil {
-		return ""
-	}
-
-	return cfg.Node.CodeBuild.JITParameterPath
-}
-
-// codeBuildRegion is the region those registrations live in, or empty.
-func codeBuildRegion(cfg *config.Config) string {
-	if cfg.Node.Provider != config.ProviderCodeBuild || cfg.Node.CodeBuild == nil {
-		return ""
-	}
-
-	return cfg.Node.CodeBuild.Region
 }
 
 // cmdTeardown removes the scale sets billet created.
@@ -2149,7 +1269,7 @@ var iamEndpointOverride = ""
 
 // printRemoteCost bounds what this node's own declarations can cost per hour.
 //
-// EVERY REMOTE BACKEND, THROUGH remoteShapes, and it used to read node.ec2 directly.
+// EVERY REMOTE BACKEND, THROUGH app.RemoteShapes, and it used to read node.ec2 directly.
 // A codebuild node declares ordered shapes with a price per hour for the same reason
 // an ec2 node does — placement charges the first that fits — so reading one block by
 // name meant a check that reported the cost exposure of an ec2 node and stayed silent
@@ -2160,7 +1280,7 @@ var iamEndpointOverride = ""
 // build-minute rate expressed per hour, and an operator comparing the two numbers
 // needs to know which they are looking at.
 func printRemoteCost(cfg *config.Config) error {
-	shapes := remoteShapes(cfg)
+	shapes := app.RemoteShapes(cfg)
 	if len(shapes) == 0 {
 		return nil
 	}
@@ -2682,7 +1802,7 @@ func ec2Preflight(
 		default:
 			// The SAME namespace the runtime and decommission use, or the probe
 			// reads a prefix no job ever touches.
-			store, err := ebss3.New(*cfg.Node.EBSS3, cacheNamespace(owner, cfg.Node.Site), creds)
+			store, err := ebss3.New(*cfg.Node.EBSS3, app.CacheNamespace(owner, cfg.Node.Site), creds)
 			if err != nil {
 				return fmt.Errorf("node.ebs_s3: %w", err)
 			}

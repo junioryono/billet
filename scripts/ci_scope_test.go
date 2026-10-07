@@ -443,10 +443,10 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		// postgres's raw-SQL walk for non-test Go and replay for its packages.
 		{"internal/server/listener.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/server/listener_test.go", families(append([]string{"replay"}, application...)...)},
-		{"internal/provider/docker/docker.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/provider/docker/docker.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/provider.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/simulated/sim.go", families(append([]string{"postgres", "replay"}, application...)...)},
-		{"internal/store/ceph/ceph.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/store/ceph/ceph.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"internal/provider/testdata/shape.json", families(append([]string{"replay"}, application...)...)},
 		{"internal/store/embedded/schema.json", families(append([]string{"replay"}, application...)...)},
 		{"tools/lint/go.work", "all"},

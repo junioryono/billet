@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -177,7 +178,7 @@ func TestAConfigurationInstalledAfterTheStartChangesNothingTheNodePublishes(t *t
 			}
 
 			// THE PRODUCTION CONSTRUCTOR, then the recording transport.
-			client, err := newNodeClientFor(cfgA, nil)
+			client, err := app.NewNodeClient(cfgA, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

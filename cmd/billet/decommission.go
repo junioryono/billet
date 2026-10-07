@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/ec2"
@@ -47,7 +48,7 @@ func cmdDecommission(ctx context.Context, args []string) error {
 	// (peeked, never minted). It scopes every List and delete to what THIS
 	// deployment owns — decommission must never reach into another deployment's
 	// resources, and an unresolved identity would do exactly that if defaulted.
-	bundle, err := nodeBundle(cfg)
+	bundle, err := app.NodeBundle(cfg)
 	if err != nil {
 		return fmt.Errorf("node identity: %w", err)
 	}
@@ -143,7 +144,7 @@ func decommissionCache(
 		return nil
 	}
 
-	store, err := ebss3.New(*cfg.Node.EBSS3, cacheNamespace(owner, cfg.Node.Site), creds)
+	store, err := ebss3.New(*cfg.Node.EBSS3, app.CacheNamespace(owner, cfg.Node.Site), creds)
 	if err != nil {
 		return fmt.Errorf("node.ebs_s3: %w", err)
 	}

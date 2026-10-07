@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"strings"
@@ -10,14 +10,14 @@ import (
 // THE CLI NEVER BUILDS THE SIMULATED BACKEND.
 //
 // config.Load refuses the kind, so this is unreachable from a file; it is asserted
-// anyway because newProvider is the one place a kind becomes compute, and the
+// anyway because NewProvider is the one place a kind becomes compute, and the
 // fallback for a kind the switch does not name is a generic "unknown provider"
 // that says nothing about why. The config is built in code because Load will
 // not hand one over.
 func TestTheSimulatedBackendIsNeverConstructedByTheCLI(t *testing.T) {
 	t.Parallel()
 
-	_, err := newProvider(&config.Config{Node: &config.NodeConfig{
+	_, err := NewProvider(&config.Config{Node: &config.NodeConfig{
 		Name:     "sim-1",
 		Provider: config.ProviderSimulated,
 	}}, "deployment-1")

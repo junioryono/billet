@@ -105,12 +105,12 @@ func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
 // a call that runs where it stands, and `defer stop()` follows it (a call wrapped
 // in a deferred closure would run at return), the report is a plain statement after it, the
 // probe is the `if *upgradeProbe` block that returns, and serving is the final
-// `return nodeclient.Run(...)`.
+// `return n.Run(...)` on the node app.OpenNode returned.
 func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 	fn := findFunc(t, "cmdNode")
 
 	probe, handler, stopped, report, serve := -1, -1, -1, -1, -1
-	stopName := ""
+	stopName, nodeName := "", ""
 
 	for i, stmt := range fn.Body.List {
 		switch s := stmt.(type) {
@@ -125,6 +125,12 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			}
 
 		case *ast.AssignStmt:
+			if opened, ok := s.Rhs[0].(*ast.CallExpr); ok && len(s.Lhs) == 2 && calleeName(opened) == "OpenNode" {
+				if name, ok := s.Lhs[0].(*ast.Ident); ok {
+					nodeName = name.Name
+				}
+			}
+
 			if len(s.Lhs) != 1 || len(s.Rhs) != 1 {
 				continue
 			}
@@ -157,7 +163,7 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			}
 
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
-				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "nodeclient" {
+				if recv, ok := sel.X.(*ast.Ident); ok && nodeName != "" && recv.Name == nodeName {
 					serve = i
 				}
 			}

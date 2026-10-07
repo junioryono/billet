@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider"
@@ -413,7 +414,7 @@ func firecrackerTierImages(cfg *config.Config) ([]string, error) {
 		return nil, nil
 	}
 
-	if _, err := nodeBundle(cfg); err != nil {
+	if _, err := app.NodeBundle(cfg); err != nil {
 		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
 	}
 
@@ -454,7 +455,7 @@ func tartTierImages(cfg *config.Config) ([]string, error) {
 	// cfg.Node.Name skips every tier pinned to this machine, and the images
 	// those tiers need are never fetched. The failure lands later, as jobs that
 	// cannot launch on a host somebody just prepared.
-	if _, err := nodeBundle(cfg); err != nil {
+	if _, err := app.NodeBundle(cfg); err != nil {
 		return nil, fmt.Errorf("select tart tier images: resolve node identity: %w", err)
 	}
 
@@ -651,7 +652,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	// A separate identity puts the probe outside what that sweep will touch: a jail
 	// whose owner marker is another billet's is "not ours to report and emphatically
 	// not ours to destroy". This command cleans up its own, below and on the way out.
-	prov, err := newProvider(cfg, probeDeployment(deployment))
+	prov, err := app.NewProvider(cfg, probeDeployment(deployment))
 	if err != nil {
 		return err
 	}
@@ -1248,7 +1249,7 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 	// A bundle is proof issued BY the control plane. Loading it is best-effort here:
 	// a machine that has not enrolled yet can still verify an image, and refusing on
 	// that would make this command need a control plane to check a local artifact.
-	bundle, err := nodeBundle(cfg)
+	bundle, err := app.NodeBundle(cfg)
 	if err != nil {
 		// A machine that has not enrolled yet can still verify an image, and refusing
 		// here would make a local check depend on a control plane. The next rule
@@ -1256,7 +1257,7 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 		bundle = nil
 	}
 
-	deployment, err := nodeDeploymentID(cfg, bundle)
+	deployment, err := app.NodeDeploymentID(cfg, bundle)
 	if err != nil {
 		return "", err
 	}

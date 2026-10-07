@@ -525,84 +525,121 @@ func TestARecordThatCannotBeWrittenIsLoggedAndTheNodeKeepsServing(t *testing.T) 
 	})
 }
 
-// R6: STRUCTURAL. The node command builds its client through the one shared
-// constructor and passes the loop the one record path; no second spelling of
-// the path exists; the record writer installs through the zero-value Installer.
+// R6: STRUCTURAL. The node is assembled in internal/app: its client comes from
+// the one shared constructor (app.NewNodeClient), Node.Run passes the loop the
+// path its host names, and cmd/billet's host names the one record path; no
+// second spelling of the path exists; the record writer installs through the
+// zero-value Installer.
 func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
 
-	main, err := parser.ParseFile(fset, "../../cmd/billet/main.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var cmdNode *ast.FuncDecl
-
-	for _, d := range main.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == "cmdNode" {
-			cmdNode = fn
-		}
-	}
-
-	if cmdNode == nil {
-		t.Fatal("cmdNode is not in cmd/billet/main.go")
-	}
-
-	var newCalls, runWithPath int
-
-	ast.Inspect(cmdNode.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+	funcs := func(path string) map[string]*ast.FuncDecl {
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		if fn, ok := call.Fun.(*ast.SelectorExpr); ok {
-			if id, ok := fn.X.(*ast.Ident); ok && id.Name == "nodeclient" && fn.Sel.Name == "New" {
-				newCalls++
+		out := map[string]*ast.FuncDecl{}
+
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok {
+				out[fn.Name.Name] = fn
 			}
+		}
 
-			if id, ok := fn.X.(*ast.Ident); ok && id.Name == "nodeclient" && fn.Sel.Name == "Run" {
-				for _, arg := range call.Args {
-					lit, ok := arg.(*ast.CompositeLit)
-					if !ok {
-						continue
-					}
+		return out
+	}
 
-					for _, elt := range lit.Elts {
-						kv, ok := elt.(*ast.KeyValueExpr)
-						if !ok {
-							continue
-						}
+	cmd := funcs("../../cmd/billet/main.go")
+	app := funcs("../app/node.go")
 
-						if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "RegistrationRecordPath" {
-							if c, ok := kv.Value.(*ast.CallExpr); ok {
-								if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "nodeRegistrationRecordPath" {
-									runWithPath++
-								}
-							}
-						}
+	for _, name := range []string{"cmdNode", "nodeHost"} {
+		if cmd[name] == nil {
+			t.Fatalf("%s is not in cmd/billet/main.go", name)
+		}
+	}
+
+	for _, name := range []string{"Run", "NewNodeClient"} {
+		if app[name] == nil {
+			t.Fatalf("%s is not in internal/app/node.go", name)
+		}
+	}
+
+	// calls counts the calls of pkg.name in fn.
+	calls := func(fn *ast.FuncDecl, pkg, name string) (n int) {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == name {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == pkg {
+						n++
 					}
 				}
 			}
+
+			return true
+		})
+
+		return n
+	}
+
+	// pathFields counts the RegistrationRecordPath elements in fn whose value
+	// matches.
+	pathFields := func(fn *ast.FuncDecl, matches func(ast.Expr) bool) (n int) {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if kv, ok := node.(*ast.KeyValueExpr); ok {
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "RegistrationRecordPath" && matches(kv.Value) {
+					n++
+				}
+			}
+
+			return true
+		})
+
+		return n
+	}
+
+	if n := calls(cmd["cmdNode"], "nodeclient", "New"); n != 0 {
+		t.Errorf("cmdNode calls nodeclient.New %d times beside app.NewNodeClient", n)
+	}
+
+	if n := calls(app["NewNodeClient"], "nodeclient", "New"); n != 1 {
+		t.Errorf("app.NewNodeClient calls nodeclient.New %d times, want once", n)
+	}
+
+	named := pathFields(cmd["nodeHost"], func(v ast.Expr) bool {
+		c, ok := v.(*ast.CallExpr)
+		if !ok {
+			return false
 		}
 
-		return true
+		id, ok := c.Fun.(*ast.Ident)
+
+		return ok && id.Name == "nodeRegistrationRecordPath"
 	})
-
-	if newCalls != 0 {
-		t.Errorf("cmdNode calls nodeclient.New %d times beside newNodeClientFor", newCalls)
+	if named != 1 {
+		t.Errorf("cmd/billet's nodeHost names RegistrationRecordPath: nodeRegistrationRecordPath(...) %d times, want once", named)
 	}
 
-	if runWithPath != 1 {
-		t.Errorf("cmdNode passes RegistrationRecordPath: nodeRegistrationRecordPath(...) to Run %d times, want once", runWithPath)
+	passed := pathFields(app["Run"], func(v ast.Expr) bool {
+		sel, ok := v.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "RegistrationRecordPath" {
+			return false
+		}
+
+		id, ok := sel.X.(*ast.Ident)
+
+		return ok && id.Name == "host"
+	})
+	if passed != 1 || calls(app["Run"], "nodeclient", "Run") != 1 {
+		t.Errorf("Node.Run passes the loop RegistrationRecordPath: host.RegistrationRecordPath %d times, want once", passed)
 	}
 
-	// ONE SPELLING OF THE PATH, in cmd/billet and here.
+	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.
 	spellings := 0
 
-	for _, dir := range []string{"../../cmd/billet", "."} {
+	for _, dir := range []string{"../../cmd/billet", "../app", "."} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatal(err)
