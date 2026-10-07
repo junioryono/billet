@@ -24,17 +24,25 @@
 # this one, so a process a gate left behind does not carry the lock with it. A
 # process tree that cannot be read is a question with no answer, and the run
 # goes ahead unlocked rather than risk waiting on its own ancestor.
+#
+# Several statuses here are answers rather than failures, so errexit is turned
+# off outright: bash takes it from an exported SHELLOPTS.
 set -u
+set +e
 
 nl='
 '
 
 # held_by_ancestor PATH exits 0 when a run this one is inside holds PATH, 1 when
 # none does, and 2 when an entry names PATH and the process tree could not say
-# whether its run is an ancestor.
+# whether its run is an ancestor. The list is split on newlines alone, with
+# globbing off, rather than read from a here-document, whose temporary file
+# can fail to be written and leave the loop silently empty.
 held_by_ancestor() (
 	verdict=1
-	while IFS= read -r entry; do
+	set -f
+	IFS=$nl
+	for entry in ${DEV_GATE_LOCK_HELD-}; do
 		[ "${entry#*:}" = "$1" ] || continue
 		holder=${entry%%:*}
 		case "$holder" in
@@ -48,7 +56,7 @@ held_by_ancestor() (
 				verdict=2
 				continue 2
 			fi
-			ppid=$(printf '%s' "$ppid" | tr -d ' \t\n')
+			ppid=$(printf '%s' "$ppid" | tr -d " \t$nl")
 			case "$ppid" in
 			'' | *[!0-9]*)
 				verdict=2
@@ -63,9 +71,7 @@ held_by_ancestor() (
 			depth=$((depth + 1))
 		done
 		verdict=2
-	done <<EOF
-${DEV_GATE_LOCK_HELD-}
-EOF
+	done
 	exit "$verdict"
 )
 
@@ -160,12 +166,16 @@ esac
 # in a directory made for this run alone, apart from the lock's, so nothing
 # another run does to either can stand in for it. The write is in a subshell
 # because a failed redirection on `:` ends a dash script outright.
-if ! private=$(mktemp -d "${TMPDIR:-/tmp}/with-check-lock.XXXXXX" 2>/dev/null) ||
-	! (: > "$private/started") 2>/dev/null; then
+if ! private=$(mktemp -d "${TMPDIR:-/tmp}/with-check-lock.XXXXXX" 2>/dev/null); then
 	echo "with-check-lock: could not make a private directory for this run, so it is not serialised with others" >&2
 	exec "$@"
 fi
 started=$private/started
+if ! (: > "$started") 2>/dev/null; then
+	rm -rf -- "$private"
+	echo "with-check-lock: could not write in $private, so this run is not serialised with others" >&2
+	exec "$@"
+fi
 
 # Only the locked command is told this run holds the lock; the unlocked fallback
 # below inherits what this run was given and nothing more.
