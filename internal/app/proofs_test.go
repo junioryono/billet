@@ -37,6 +37,24 @@ var proofMakers = map[string]struct{ maker, operation string }{
 	"Scheduler":          {"Schedule", "github.com/junioryono/billet/internal/server.New"},
 }
 
+// owners are the types that are no proof but whose value the proofs rely on,
+// each with the one function that may build it or write its fields: a
+// ControlPlane reset field by field under a controller would serve the wire
+// with resources the controller never forgot or adopted for.
+var owners = map[string]string{"ControlPlane": "OpenControlPlane"}
+
+// makerOf is the one function that may build or write a value of the named
+// type, if the type is a proof or owned.
+func makerOf(name string) (string, bool) {
+	if m, proof := proofMakers[name]; proof {
+		return m.maker, true
+	}
+
+	maker, owned := owners[name]
+
+	return maker, owned
+}
+
 // errorless are the operations that return no error to test: server.New, and
 // the publication, which is non-fatal by design.
 var errorless = map[string]bool{
@@ -157,7 +175,16 @@ func checkedApp(t *testing.T) *checkedPackage {
 
 	structs := map[string]*types.Struct{}
 
+	guarded := []string{}
 	for name := range proofMakers {
+		guarded = append(guarded, name)
+	}
+
+	for name := range owners {
+		guarded = append(guarded, name)
+	}
+
+	for _, name := range guarded {
 		obj := checked.Scope().Lookup(name)
 		if obj == nil {
 			t.Fatalf("the proof %s is not declared in this package", name)
@@ -196,7 +223,7 @@ func (pkg *checkedPackage) proofOfDepth(typ types.Type, depth int) (string, bool
 			return "", false
 		}
 
-		if _, proof := proofMakers[x.Obj().Name()]; proof {
+		if _, proof := makerOf(x.Obj().Name()); proof {
 			return x.Obj().Name(), true
 		}
 
@@ -378,6 +405,9 @@ func (pkg *checkedPackage) writtenProofs(expr ast.Expr) []string {
 // overwritten in place, a function returning one in any container or struct,
 // and a conversion to one anywhere.
 //
+// A ControlPlane is held to OpenControlPlane the same way: no proof, but what
+// the proofs were earned against.
+//
 // IT STOPS AN EDIT, NOT AN ADVERSARY. What it is for is that a refactor, a new
 // helper or a convenience constructor cannot hand out a proof without its step
 // unnoticed. What it cannot read (reflect, unsafe, a generic helper over any T
@@ -400,7 +430,11 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 	var audit func(node ast.Node, where string)
 
 	audit = func(node ast.Node, where string) {
-		mayMake := func(name string) bool { return proofMakers[name].maker == where }
+		mayMake := func(name string) bool {
+			maker, _ := makerOf(name)
+
+			return maker == where
+		}
 
 		var written []ast.Expr
 
@@ -491,7 +525,7 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 				results := obj.Signature().Results()
 				for i := range results.Len() {
 					for _, name := range pkg.carriedProofs(results.At(i).Type()) {
-						if proofMakers[name].maker != where {
+						if maker, _ := makerOf(name); maker != where {
 							report(where, "returns a "+name)
 						}
 					}
@@ -575,8 +609,12 @@ func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 			case *ast.AssignStmt, *ast.IncDecStmt, *ast.RangeStmt:
 				for _, lhs := range assigned(x) {
 					for _, name := range pkg.writtenProofs(lhs) {
-						if x.Pos() < guardEnd {
+						switch {
+						case x.Pos() < guardEnd:
 							t.Errorf("%s writes a %s before %s has succeeded", m.maker, name, m.operation)
+						case name == typ && !built.IsValid():
+							// new(T) and its fields set one by one builds it too.
+							built = x.Pos()
 						}
 					}
 				}
