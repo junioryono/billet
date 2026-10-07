@@ -223,15 +223,17 @@ func TestTheNodeCacheServesOnlyAfterRestoringItsMounts(t *testing.T) {
 
 		var restoredAt, servedAt token.Pos
 		for _, statement := range literal.Body.List {
-			ast.Inspect(statement, func(inner ast.Node) bool {
-				call, ok := inner.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if namesSelector(call.Fun, "service", "RestoreMounts") && restoredAt == 0 {
+			// RESTORED BY THE SERVING GOROUTINE ITSELF, as a statement of its own
+			// before Serve: a restore in another goroutine, a deferred call or a
+			// closure would still be running, or not yet run, when Serve answers.
+			if expr, ok := statement.(*ast.ExprStmt); ok {
+				if call, ok := expr.X.(*ast.CallExpr); ok && namesSelector(call.Fun, "service", "RestoreMounts") && restoredAt == 0 {
 					restoredAt = call.Pos()
 				}
-				if namesSelector(call.Fun, "srv", "Serve") && servedAt == 0 {
+			}
+
+			ast.Inspect(statement, func(inner ast.Node) bool {
+				if call, ok := inner.(*ast.CallExpr); ok && namesSelector(call.Fun, "srv", "Serve") && servedAt == 0 {
 					servedAt = call.Pos()
 				}
 
