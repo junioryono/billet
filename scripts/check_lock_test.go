@@ -399,16 +399,18 @@ func TestANestedRunThatCannotReadItsAncestryRunsUnlocked(t *testing.T) {
 // AN INHERITED ERREXIT NEITHER STOPS THE SCRIPT NOR IS TAKEN FROM THE COMMAND.
 // bash takes errexit from an exported SHELLOPTS, so a status the script reads
 // as an answer would end it (measured on macOS's /bin/sh, 2026-10-06: exit 1,
-// the command never run), and a `set +e` to prevent that rewrites the
-// SHELLOPTS the command inherits, so a command relying on errexit went green.
-// The command under the lock must behave exactly as it does run directly. dash
-// ignores SHELLOPTS, so on Linux both runs simply agree.
+// the command never run), and any option the script sets rewrites the
+// SHELLOPTS the command inherits: a `set +e` took the command's errexit away,
+// and a `set -u` gave it nounset. The command under the lock must behave
+// exactly as it does run directly, through an unset expansion and a failure.
+// dash ignores SHELLOPTS, so on Linux both runs simply agree.
 func TestAnInheritedErrexitReachesTheCommandUnchanged(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
 	dir := t.TempDir()
-	command := []string{"sh", "-c", `echo ran >> "$1"; false; echo "carried on" >> "$1"`, "command"}
+	command := []string{"sh", "-c",
+		`echo ran >> "$1"; unset optional; echo "optional=$optional" >> "$1"; false; echo "carried on" >> "$1"`, "command"}
 
 	run := func(name string, argv ...string) (int, string) {
 		runs := filepath.Join(dir, name)
@@ -517,6 +519,40 @@ func TestACommandEndedByASignalReportsItsOwnStatus(t *testing.T) {
 	}
 }
 
+// THE COMMAND IS THE PROGRAM IT NAMES, NOT A SHELL BUILTIN OF THAT NAME: under
+// the lock it runs from a shell, and `test` there would be the builtin while
+// the unlocked fallback runs the program on PATH.
+func TestALockedCommandIsTheProgramOnPath(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	runs := filepath.Join(dir, "runs")
+
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatalf("make the program's directory: %v", err)
+	}
+
+	if err := forkSafeWriteFile(filepath.Join(bin, "test"), []byte("#!/bin/sh\necho ran >> \"$TEST_LOCK_RUNS\"\nexit 7\n"), 0o700); err != nil {
+		t.Fatalf("write the program: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(dir, "check.lock"), "test", "x")
+	cmd.Env = scriptEnv("PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "TEST_LOCK_RUNS="+runs)
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("`test x` under the lock: %v (%s), want the program's exit status 7", err, out)
+	}
+
+	if got, err := os.ReadFile(runs); err != nil || string(got) != "ran\n" {
+		t.Errorf("the program on PATH ran %q (%v), want once", got, err)
+	}
+}
+
 // A DIAGNOSTIC NAMING A PATH PRINTS THE PATH: echo in dash, and in macOS's
 // /bin/sh, reads a backslash sequence as an escape, and \c ends the output
 // there.
@@ -612,9 +648,13 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 
 	recorder, takes := recordTakes(t)
 
-	second := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock,
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	second := exec.CommandContext(ctx, "./with-check-lock.sh", lock,
 		"sh", "-c", `cat "$1" > "$2"`, "second", trace, seen)
 	second.Env = scriptEnv(recorder...)
+	inGroup(second)
 
 	stderr, err := second.StderrPipe()
 	if err != nil {
@@ -625,7 +665,18 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 		t.Fatalf("start the second run: %v", err)
 	}
 
-	lines := make(chan string)
+	// Reaped on every path out, a failure below included: the group kill ends
+	// it, and with it the lock tool that would otherwise start its command once
+	// the holder is released.
+	t.Cleanup(func() {
+		cancel()
+		//nolint:errcheck // reaping only; the verdict is the test's
+		second.Wait()
+	})
+
+	// Buffered past anything the script prints, so the reader never blocks
+	// on a test that stopped listening.
+	lines := make(chan string, 64)
 
 	go func() {
 		defer close(lines)

@@ -25,11 +25,11 @@
 # process tree that cannot be read is a question with no answer, and the run
 # goes ahead unlocked rather than risk waiting on its own ancestor.
 #
-# Every status the script reads is taken inside an if, so an errexit bash took
-# from an exported SHELLOPTS cannot end it on an answer; the option is left as
-# it came, because setting it here would change the SHELLOPTS the command
-# inherits.
-set -u
+# The script sets no shell option: bash rewrites an exported SHELLOPTS when one
+# changes, and the command inherits it. Every expansion carries its own default
+# instead of nounset, and every status the script reads, or a step that can
+# fail, is taken inside an if or an or-list, so an errexit bash took from that
+# SHELLOPTS cannot end it on an answer.
 
 nl='
 '
@@ -37,7 +37,7 @@ nl='
 # say prints one diagnostic line. printf rather than echo, which in dash reads
 # backslash sequences in a path as escapes.
 say() {
-	printf 'with-check-lock: %s\n' "$*" >&2
+	printf 'with-check-lock: %s\n' "$*" >&2 || :
 }
 
 # held_by_ancestor PATH exits 0 when a run this one is inside holds PATH, 1 when
@@ -63,7 +63,10 @@ held_by_ancestor() (
 				verdict=2
 				continue 2
 			fi
-			ppid=$(printf '%s' "$ppid" | tr -d " \t$nl")
+			if ! ppid=$(printf '%s' "$ppid" | tr -d " \t$nl"); then
+				verdict=2
+				continue 2
+			fi
 			case "$ppid" in
 			'' | *[!0-9]*)
 				verdict=2
@@ -108,7 +111,13 @@ fi
 # a newline in it cannot be one line of DEV_GATE_LOCK_HELD.
 case "$lock" in
 /*) ;;
-*) lock=$(pwd -P)/$lock ;;
+*)
+	if ! here=$(pwd -P); then
+		say "could not read this directory, so this run is not serialised with others"
+		exec "$@"
+	fi
+	lock=$here/$lock
+	;;
 esac
 case "$lock" in
 *"$nl"*)
@@ -127,7 +136,8 @@ case "$ancestry" in
 	say "$lock is held by the run this one is inside; running under it"
 	exec "$@"
 	;;
-2)
+1) ;;
+*)
 	say "could not tell whether a run this one is inside holds $lock, so this run is not serialised with others"
 	exec "$@"
 	;;
@@ -137,9 +147,8 @@ esac
 # path, and a directory that cannot be made still ends in the command running,
 # unlocked and saying so. Something other than a file where the lock goes (a
 # FIFO, whose open waits for a writer) is not taken either.
-dir=$(dirname -- "$lock")
-if ! mkdir -p -- "$dir" 2>/dev/null; then
-	say "could not create $dir, so this run is not serialised with others"
+if ! dir=$(dirname -- "$lock") || ! mkdir -p -- "$dir" 2>/dev/null; then
+	say "could not create ${dir:-the directory of $lock}, so this run is not serialised with others"
 	exec "$@"
 fi
 if [ -e "$lock" ] && [ ! -f "$lock" ]; then
@@ -195,13 +204,14 @@ fi
 # below inherits what this run was given and nothing more.
 holding="${DEV_GATE_LOCK_HELD-}${DEV_GATE_LOCK_HELD:+$nl}$$:$lock"
 
-# The inner shell runs the command as its child rather than exec'ing it, so a
-# command ended by a signal reports the shell's 128+n: macOS lockf reports any
-# signalled child as 70. $held is one of the two literal spellings above, split
+# The inner shell runs the command in a child it waits for rather than exec'ing
+# it, so a command ended by a signal reports the shell's 128+n (macOS lockf
+# reports any signalled child as 70); the child execs it, so a program is never
+# swapped for a shell builtin of the same name. $held is one of the two literal spellings above, split
 # on purpose; the inner script's $1 and $@ are its own, so they stay in single
 # quotes.
 # shellcheck disable=SC2086,SC2016
-if DEV_GATE_LOCK_HELD=$holding $held "$lock" sh -c 'rm -f -- "$1" || exit; shift; "$@"' with-check-lock "$started" "$@"; then
+if DEV_GATE_LOCK_HELD=$holding $held "$lock" sh -c 'rm -f -- "$1" || exit; shift; (exec "$@")' with-check-lock "$started" "$@"; then
 	status=0
 else
 	status=$?
