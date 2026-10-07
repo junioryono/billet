@@ -79,30 +79,32 @@ func TestRunServerReturnsNothingWhenTheClaimWasStopped(t *testing.T) {
 
 	fn := findFunc(t, "runServer")
 
+	// THE BRANCH IS THE STATEMENT RIGHT AFTER THE CLAIM: the claim is taken
+	// in an assignment of its own and its error tested by the next `if`.
 	var branch *ast.IfStmt
 
-	ast.Inspect(fn, func(n ast.Node) bool {
-		// AN `if` WITHOUT AN Init IS THE COMMON CASE, and ast.Inspect panics on a
-		// nil node rather than ignoring it.
-		stmt, ok := n.(*ast.IfStmt)
-		if !ok || branch != nil || stmt.Init == nil {
-			return true
+	for i, stmt := range fn.Body.List {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 {
+			continue
 		}
 
-		ast.Inspect(stmt.Init, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok && calleeName(call) == "becomeController" {
-				branch = stmt
+		if call, ok := assign.Rhs[0].(*ast.CallExpr); !ok || calleeName(call) != "BecomeController" {
+			continue
+		}
+
+		if i+1 < len(fn.Body.List) {
+			if next, isIf := fn.Body.List[i+1].(*ast.IfStmt); isIf {
+				branch = next
 			}
+		}
 
-			return true
-		})
-
-		return true
-	})
+		break
+	}
 
 	if branch == nil {
 		t.Fatal("runServer no longer takes this deployment's controller claim in an " +
-			"`if err := becomeController(...); err != nil` of its own")
+			"assignment from BecomeController followed by the `if` that tests its error")
 	}
 
 	// THE BRANCH RETURNS WHAT THE CLASSIFIER ANSWERS, AND NOTHING ELSE. A body

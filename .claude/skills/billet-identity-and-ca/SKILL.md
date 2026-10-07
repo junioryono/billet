@@ -47,7 +47,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/wirecert/*_test.go`: rotation ordering, `LoadServing` tears and re-reads, retire refusals, the `billet-replaces:` claim, one-block PEM proof.
-- `internal/wireshare/*_test.go`; `cmd/billet/promotionorder_test.go` (`TestTheAuthorityIsAdoptedBeforeTheWireAndPublishedAfterIt`), `casync` tests, `identitystore` tests.
+- `internal/wireshare/*_test.go`; `internal/app/proofs_test.go` (the adopt-before-serve order is `app.Controller.ServeWire`'s signature), `casync` tests, `identitystore` tests.
 - `internal/github/*_test.go` (manifest permissions, redaction, code handling), `cmd/billet/githubapp_test.go`, `configedit_test.go`, `githubaccess_test.go` (`TestAnUnreachableGitHubIsNotReportedAsABadCredential`, `TestAStartupFailureNamesAnUninstalledApp`).
 - `cmd/billet/ca_test.go` (`TestCAIssueDuringARotationWritesABundleThatCanVerifyTheServer`, `TestCAIssueWillNotOverwriteABundle`), `internal/e2e/enroll_test.go`, `revocation_test.go`, `restore_test.go`.
 

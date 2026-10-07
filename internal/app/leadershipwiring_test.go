@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -68,7 +68,8 @@ func TestTheLeadershipWatcherReturnsOnAnOrdinaryShutdown(t *testing.T) {
 // PROVING THE MECHANISM IS NOT PROVING IT IS USED, and this is the one seam no
 // package-local test can reach. internal/state latches the fact, internal/server
 // acts on it, and both are tested where they live — but the only thing that
-// joins them is one argument in this file. Delete it and every suite stays
+// joins them is one argument in this package (Controller.Schedule), and one watcher
+// (ControlPlane.BecomeController). Delete it and every suite stays
 // green while a replaced control plane goes back to destroying compute, closing
 // the deployment's message session and handing capacity back on its way out.
 //
@@ -104,7 +105,13 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Name.Name != "runServer" {
+			if !ok || (!isMethod(fn, "Controller", "Schedule") && !isMethod(fn, "ControlPlane", "BecomeController")) {
+				continue
+			}
+
+			// `cp` IS THIS CONTROLLER'S OWN CONTROL PLANE: the receiver itself, or
+			// bound from the receiver's field, never some other value of that name.
+			if !bindsItsControlPlane(fn) {
 				continue
 			}
 
@@ -143,8 +150,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 					return true
 				}
 
-				recv, ok := arg.X.(*ast.Ident)
-				if !ok || recv.Name != "db" {
+				if !isTheControlPlanesLedger(arg.X) {
 					return true
 				}
 
@@ -156,7 +162,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 
 	if len(found) == 0 {
-		t.Error("runServer does not pass the ledger's LeadershipLost to " +
+		t.Error("Controller.Schedule does not pass the ledger's LeadershipLost to " +
 			"server.WithLeadershipLost.\n" +
 			"Without it a control plane that has been replaced tears down normally: it " +
 			"destroys the compute its completions asked for, closes this deployment's " +
@@ -166,7 +172,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 
 	if len(watched) == 0 {
-		t.Error("runServer does not watch the ledger's LeadershipLostSignal through " +
+		t.Error("BecomeController does not watch the ledger's LeadershipLostSignal through " +
 			"stopWhenReplaced.\n" +
 			"Refusing a write is not stopping a process: nothing here treats an " +
 			"unclassifiable error as a reason to stop, so a replaced controller would " +
@@ -176,8 +182,8 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 }
 
-// signalsTheLedger reports whether a stopWhenReplaced call is watching
-// db.LeadershipLostSignal() rather than some other channel.
+// signalsTheLedger reports whether a stopWhenReplaced call is watching the
+// ledger's LeadershipLostSignal() rather than some other channel.
 func signalsTheLedger(call *ast.CallExpr) bool {
 	for _, arg := range call.Args {
 		inner, ok := arg.(*ast.CallExpr)
@@ -190,9 +196,77 @@ func signalsTheLedger(call *ast.CallExpr) bool {
 			continue
 		}
 
-		if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "db" {
+		if isTheControlPlanesLedger(sel.X) {
 			return true
 		}
+	}
+
+	return false
+}
+
+// isTheControlPlanesLedger reports whether expr is `cp.db`: the ledger of the
+// control plane bindsItsControlPlane established `cp` to be.
+func isTheControlPlanesLedger(expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "db" {
+		return false
+	}
+
+	id, ok := sel.X.(*ast.Ident)
+
+	return ok && id.Name == "cp"
+}
+
+// isMethod reports whether fn is the method name of the receiver type recv.
+func isMethod(fn *ast.FuncDecl, recv, name string) bool {
+	if fn.Recv == nil || fn.Name.Name != name || len(fn.Recv.List) != 1 {
+		return false
+	}
+
+	typ := fn.Recv.List[0].Type
+	if star, ok := typ.(*ast.StarExpr); ok {
+		typ = star.X
+	}
+
+	id, ok := typ.(*ast.Ident)
+
+	return ok && id.Name == recv
+}
+
+// bindsItsControlPlane reports whether, inside fn, `cp` names the method's own
+// control plane: the receiver of a ControlPlane method named cp, or, in a
+// Controller method, `cp := <receiver>.cp`.
+func bindsItsControlPlane(fn *ast.FuncDecl) bool {
+	recv := fn.Recv.List[0]
+	if len(recv.Names) != 1 {
+		return false
+	}
+
+	self := recv.Names[0].Name
+
+	if isMethod(fn, "ControlPlane", fn.Name.Name) {
+		return self == "cp"
+	}
+
+	for _, stmt := range fn.Body.List {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.DEFINE || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			continue
+		}
+
+		lhs, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || lhs.Name != "cp" {
+			continue
+		}
+
+		rhs, ok := assign.Rhs[0].(*ast.SelectorExpr)
+		if !ok || rhs.Sel.Name != "cp" {
+			return false
+		}
+
+		x, ok := rhs.X.(*ast.Ident)
+
+		return ok && x.Name == self
 	}
 
 	return false

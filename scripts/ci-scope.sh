@@ -85,12 +85,12 @@ is_documentation() {
 # TestCIScopeReplayRuleCoversTheReplayClosure holds this list to that closure.
 # provider and store include everything but the backend packages replay does
 # not import, so a new asset or testdata directory under either is included
-# rather than silently left out. codebuild is one it does import, through
-# internal/app's credential sweep.
+# rather than silently left out. codebuild and firecracker are ones it does
+# import, through internal/app's credential sweep and the control plane's guest
+# contract.
 is_replay_input() {
 	case "$1" in
-	internal/provider/docker/* | internal/provider/ec2/* | \
-		internal/provider/firecracker/* | internal/provider/tart/* | \
+	internal/provider/docker/* | internal/provider/ec2/* | internal/provider/tart/* | \
 		internal/store/ceph/* | internal/store/ebss3/*) return 1 ;;
 	internal/provider/* | internal/store/*) return 0 ;;
 	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
