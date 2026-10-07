@@ -17,13 +17,13 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // The rehearsal: a deployment is backed up, restored where nothing has seen it,
@@ -40,7 +40,7 @@ import (
 //
 // WHAT IS REAL HERE AND WHAT IS NOT. The ledger, the deployment identity, the
 // authority, the archive, the node wire, its TLS and the node client are all the
-// production ones, assembled through internal/wiring exactly as `billet server`
+// production ones, assembled through internal/app exactly as `billet server`
 // assembles them. GitHub is absent rather than faked, because none of the four
 // things a backup captures needs it — and `billet server` cannot START without
 // reaching GitHub (server.Run returns an error when EnsureScaleSet fails, and no
@@ -88,7 +88,7 @@ type controlPlane struct {
 
 // startControlPlane brings one up over dir, the way `billet server` does.
 //
-// THROUGH wiring.BuildNodeWire RATHER THAN BY HAND, because that seam is as much
+// THROUGH app.BuildNodeWire RATHER THAN BY HAND, because that seam is as much
 // under test as the archive is: what the server PRESENTS, what it ACCEPTS and
 // what renewal SIGNS with are three answers that have to come from one read of
 // the restored authority, and a hand-assembled wire in a test is a different
@@ -136,7 +136,7 @@ func startControlPlane(t *testing.T, dir string) *controlPlane {
 		nodeplane.WithRegistrar(a),
 		nodeplane.WithTierCatalog(tiers))
 
-	wire, err := wiring.BuildNodeWire(wiring.NodeWireRequest{
+	wire, err := app.BuildNodeWire(app.NodeWireRequest{
 		StateDir:    dir,
 		Deployment:  deployment,
 		Hosts:       []string{"127.0.0.1"},

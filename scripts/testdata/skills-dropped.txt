@@ -12,3 +12,10 @@ a6013ee02375 cmd/billet/open_unix.go and open_other.go are gone (#356 Phase 3a):
 107711fec594 CacheAuthority moved to internal/dispatch (#356 Phase 2 item 3); the sentence now names dispatch.CacheAuthority.
 39f93bcbb585 CacheAuthority moved to internal/dispatch (#356 Phase 2 item 3); the sentence now names dispatch.CacheAuthority, decided still by server.DecideCacheAuthority.
 78939d8427eb Runner moved to internal/dispatch (#356 Phase 2 item 3); the plane's Runner now implements dispatch.Runner.
+6bf7e6520df3 internal/wiring became internal/app (#356 Phase 3c); the sentence now names internal/app.
+7d7e522a6fa8 internal/wiring became internal/app (#356 Phase 3c); the registry is now app.Provisioner.
+e2bce4afa438 internal/wiring became internal/app (#356 Phase 3c); the e2e suite now goes through internal/app.
+62f848297dcc internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.BuildTargets.
+91f43b148d81 internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.BuildTargets.
+a6008020b506 internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.Provisioner and app.NodeJIT.
+f93edbb8ea27 #349 forwarded run evidence through both adapters when it closed #318; the sentence now says what was and what is.

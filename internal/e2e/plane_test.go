@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/fakeactions"
@@ -52,7 +53,6 @@ import (
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
-	"github.com/junioryono/billet/internal/wiring"
 )
 
 // A registered host in these tests is deliberately larger than any budget they
@@ -711,7 +711,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}
 
 	// A SECOND TARGET, ASSEMBLED THE WAY THE CLI ASSEMBLES ONE: a client per
-	// target through wiring.BuildTargets, the server told its targets and the
+	// target through app.BuildTargets, the server told its targets and the
 	// node plane given one source per target. The second tier is the first
 	// with its own label.
 	//
@@ -723,7 +723,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// mechanism whichever scope the second target has; the repository path is
 	// proved by internal/scaleset's wire test and the live measurement.
 	var (
-		targets       []wiring.Target
+		targets       []app.Target
 		serverTargets []server.Target
 		planeJIT      map[string]nodeplane.JITSource
 	)
@@ -753,14 +753,14 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			t.Fatalf("scaleset.New for the second target: %v", err)
 		}
 
-		targets = []wiring.Target{
+		targets = []app.Target{
 			{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client},
 			{Config: config.GitHubTarget{Name: "beta", Org: "beta"}, Client: second},
 		}
 
-		serverTargets, planeJIT, err = wiring.BuildTargets(targets)
+		serverTargets, planeJIT, err = app.BuildTargets(targets)
 		if err != nil {
-			t.Fatalf("wiring.BuildTargets: %v", err)
+			t.Fatalf("app.BuildTargets: %v", err)
 		}
 	}
 
@@ -864,7 +864,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		runner, stopNode = first.runner, first.stop
 		serverOpts = append(serverOpts, wireOpts...)
 	} else {
-		runner = node.New(a, host, wiring.JITSource{Client: client, Pool: a}, prov, log)
+		runner = node.New(a, host, app.JITSource{Client: client, Pool: a}, prov, log)
 		serverOpts = []server.ControlPlaneOption{
 			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers, kind: kind}),
 		}
@@ -894,7 +894,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		server.WithDrainTimeout(200*time.Millisecond),
 		server.WithHurry(hurry))
 
-	var prov0 server.Provisioner = wiring.Provisioner{Client: client}
+	var prov0 server.Provisioner = app.Provisioner{Client: client}
 	if targets != nil {
 		// Every tier resolves through WithTargets; a fallback provisioner would
 		// be a second credential nothing should reach.
@@ -966,7 +966,7 @@ func wireUp(
 	}
 
 	wire := &http.Server{
-		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}, handlerOpts...),
+		Handler:           nodeplane.Handler(log, plane, a, app.NodeJIT{Client: client}, handlerOpts...),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
