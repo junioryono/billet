@@ -239,7 +239,8 @@ func (pkg *checkedPackage) proofOfDepth(typ types.Type, depth int) (string, bool
 		}
 	case *types.Struct:
 		for name, st := range pkg.structs {
-			if types.Identical(x, st) {
+			// Tags do not stop a conversion, so they do not tell two shapes apart.
+			if types.IdenticalIgnoreTags(x, st) {
 				return name, true
 			}
 		}
@@ -558,7 +559,9 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 // proof (nil or a zero literal), nothing before it builds or writes one, and
 // the proof is built after it. A maker that hands its construction to a
 // closure or a helper is refused too, on purpose: the proof is built in the
-// maker's own body, where this test can read the order it is built in.
+// maker's own body, where this test can read the order it is built in. So is an
+// error branch ending in anything but a return: classify the error in the
+// returned expression, not in a switch around the return.
 func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 	t.Parallel()
 
