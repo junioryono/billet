@@ -1,8 +1,9 @@
 package app
 
 import (
-	"errors"
+	"go/ast"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -136,8 +137,8 @@ func TestEveryRoleAssembles(t *testing.T) {
 			_ = db.Close()
 
 			t.Error("a SQLite ledger was opened as a standby")
-		} else if errors.Is(err, state.ErrStandby) {
-			t.Errorf("the standby open refused for the wrong reason: %v", err)
+		} else if !strings.Contains(err.Error(), "should have refused that pairing") {
+			t.Errorf("the standby open refused for another reason than its backend: %v", err)
 		}
 	})
 }
@@ -153,17 +154,24 @@ func TestSteeringIsApplied(t *testing.T) {
 
 	ctx := t.Context()
 
-	var allocations, planes, schedulers, provisioners int
+	var (
+		allocations, planes, schedulers, provisioners int
+		owner                                         string
+	)
 
 	steering := &Steering{
 		Allocator: []alloc.Option{func(*alloc.Allocator) { allocations++ }},
 		Plane:     []nodeplane.Option{func(*nodeplane.Plane) { planes++ }},
-		Server:    []server.ControlPlaneOption{func(*server.Server) { schedulers++ }},
+		Server: []server.ControlPlaneOption{func(s *server.Server) {
+			schedulers++
+			owner = s.Owner()
+		}},
 		Provisioner: func(p server.Provisioner) server.Provisioner {
 			provisioners++
 
-			return p
+			return steeredProvisioner{Provisioner: p}
 		},
+		Owner: "steered-owner",
 	}
 
 	cfg := &config.Config{Server: &config.ServerConfig{
@@ -227,5 +235,68 @@ func TestSteeringIsApplied(t *testing.T) {
 		if n != 1 {
 			t.Errorf("%s was applied %d times, want once", what, n)
 		}
+	}
+
+	// WHAT THE STEERING RETURNED IS WHAT IS USED: the wrapper's value is the
+	// target's provisioner, and the steered owner is the scheduler's.
+	if len(cp.targets) != 1 {
+		t.Fatalf("the control plane has %d targets, want 1", len(cp.targets))
+	}
+
+	if _, wrapped := cp.targets[0].Provisioner.(steeredProvisioner); !wrapped {
+		t.Errorf("the target's provisioner is a %T, not what the steering returned", cp.targets[0].Provisioner)
+	}
+
+	if owner != "steered-owner" {
+		t.Errorf("the scheduler names itself %q, want the steered owner", owner)
+	}
+}
+
+// steeredProvisioner is a provisioner wrapper a test can recognise.
+type steeredProvisioner struct{ server.Provisioner }
+
+// THE STEERED SCHEDULER OPTIONS COME LAST, so they override what the assembly
+// set rather than being overridden by it: Schedule's final assignment to its
+// options before server.New appends cp.steering.Server.
+func TestSteeredSchedulerOptionsComeLast(t *testing.T) {
+	t.Parallel()
+
+	schedule := checkedApp(t).function(t, "(*"+appPath+".Controller).Schedule")
+
+	var lastAssign *ast.AssignStmt
+
+	built := false
+
+	ast.Inspect(schedule.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			if id, ok := x.Lhs[0].(*ast.Ident); ok && id.Name == "serverOpts" && !built {
+				lastAssign = x
+			}
+		case *ast.CallExpr:
+			if namesSelector(x.Fun, "server", "New") {
+				built = true
+			}
+		}
+
+		return true
+	})
+
+	steered := false
+
+	if lastAssign != nil && len(lastAssign.Rhs) == 1 {
+		ast.Inspect(lastAssign.Rhs[0], func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Server" {
+				if inner, ok := sel.X.(*ast.SelectorExpr); ok && inner.Sel.Name == "steering" {
+					steered = true
+				}
+			}
+
+			return true
+		})
+	}
+
+	if !built || !steered {
+		t.Error("Schedule's last assignment to its scheduler options before server.New does not append the steered ones")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -62,8 +63,12 @@ func barrierStack(t *testing.T, opts ...stackOpt) (*stack, *offsetClock) {
 
 	clock := &offsetClock{}
 
+	// THE SCENARIOS DRIVE THE BARRIER'S ROUNDS THEMSELVES, on the steered clock,
+	// so the plane's own loop is paced out of the way: one asking the fleet beside
+	// them would record answers between theirs and reset the run they measure.
 	return newStackIn(t, t.TempDir(), newPlane(t), append([]stackOpt{overTheWire,
-		withClock(clock.now), withReapInterval(time.Hour)}, opts...)...), clock
+		withClock(clock.now), withReapInterval(time.Hour),
+		withPlane(nodeplane.WithBarrierPace(24 * time.Hour))}, opts...)...), clock
 }
 
 // runBarrierStack starts the control plane and returns a stop that is safe to

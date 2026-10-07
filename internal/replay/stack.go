@@ -93,6 +93,10 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		t.Fatalf("scaleset.New: %v", err)
 	}
 
+	// AUTOMATIC UPDATES OFF: an absent release block turns them on, and the
+	// starter would ask the public release channel from inside a replay.
+	automatic := false
+
 	cfg := &config.Config{
 		Server: &config.ServerConfig{
 			IdentityDir: t.TempDir(),
@@ -101,7 +105,8 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 			MaxMemory:   fleet.MaxMemory,
 			Placement:   fleet.Placement,
 		},
-		Tiers: tiers,
+		Release: &config.ReleaseConfig{Automatic: &automatic},
+		Tiers:   tiers,
 	}
 
 	// THE OPERATOR'S SECOND SIGNAL, wired as `billet node` and `billet server`

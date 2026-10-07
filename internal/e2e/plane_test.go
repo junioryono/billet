@@ -522,6 +522,8 @@ type stackConfig struct {
 	// tell the two apart, because it never reaches one. Set it small and a drain
 	// that is still waiting long past it is the difference, observed.
 	nodeDrainTimeout time.Duration
+	// plane are options for the node plane, after the assembly's own.
+	plane []nodeplane.Option
 	// second, when set, adds a SECOND GitHub target: a repository served by
 	// its own fake Actions service and its own client, with one untrusted tier
 	// on it. Only the wire stack carries it, because that is the shape in
@@ -584,6 +586,11 @@ func overTheWire(c *stackConfig) { c.wire = true }
 // one, so a test can prove a generated config's tiers launch.
 func withTiers(ts []config.Tier) stackOpt {
 	return func(c *stackConfig) { c.tiers = ts }
+}
+
+// withPlane steers the node plane, after the assembly's own options.
+func withPlane(opts ...nodeplane.Option) stackOpt {
+	return func(c *stackConfig) { c.plane = append(c.plane, opts...) }
 }
 
 // withReapInterval replaces the harness's reaper tick.
@@ -748,6 +755,8 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	}
 
 	steering := &app.Steering{
+		Plane: sc.plane,
+		Owner: harnessOwner,
 		Server: []server.ControlPlaneOption{
 			// Fast, because the sweep rides this tick and a test that waits a minute
 			// for it is a test nobody runs.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -938,5 +939,61 @@ func TestALoopWithNoBarrierStoreReturns(t *testing.T) {
 	case <-done:
 	case <-ctx.Done():
 		t.Fatal("BarrierLoop did not return on a plane with nothing to prove")
+	}
+}
+
+// countingBarrierStore counts the rounds BarrierLoop starts.
+type countingBarrierStore struct {
+	*barrierStore
+
+	rounds atomic.Int64
+}
+
+func (s *countingBarrierStore) ComputeBarrierInForce(ctx context.Context) (alloc.ComputeBarrier, bool, error) {
+	s.rounds.Add(1)
+
+	return s.barrierStore.ComputeBarrierInForce(ctx)
+}
+
+// A STEERED PACE IS THE LOOP'S PACE. With nothing to prove the loop waits its
+// own five seconds between rounds; a pace of a millisecond must make it ask
+// many times in the span the default asks once, and a pace of an hour must
+// leave it at the one round it starts with.
+func TestTheBarrierLoopKeepsASteeredPace(t *testing.T) {
+	t.Parallel()
+
+	run := func(pace time.Duration, until func(int64) bool) int64 {
+		store := &countingBarrierStore{barrierStore: newBarrierStore()}
+		store.hasBarrier = false
+
+		p := testPlane(t, WithBarrierStore(store), WithBarrierPace(pace))
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			p.BarrierLoop(ctx)
+		}()
+
+		deadline := time.Now().Add(10 * time.Second)
+		for !until(store.rounds.Load()) && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		cancel()
+		<-done
+
+		return store.rounds.Load()
+	}
+
+	if n := run(time.Millisecond, func(n int64) bool { return n >= 5 }); n < 5 {
+		t.Errorf("a millisecond pace started %d rounds in ten seconds, want at least 5", n)
+	}
+
+	held := time.Now().Add(200 * time.Millisecond)
+	if n := run(time.Hour, func(int64) bool { return time.Now().After(held) }); n != 1 {
+		t.Errorf("an hour's pace started %d rounds in 200ms, want the one it starts with", n)
 	}
 }

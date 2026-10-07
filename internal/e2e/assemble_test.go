@@ -41,7 +41,13 @@ type assembled struct {
 
 // harnessConfig is the config a stack's control plane is assembled from: its
 // state directory, a loopback wire, the deployment's ceiling and the catalogue.
+//
+// AUTOMATIC UPDATES OFF. An absent release block turns them on, and the starter
+// Schedule assembles would then ask the public release channel from inside a
+// test, and could start a rollout in the test's ledger from what it answered.
 func harnessConfig(dir string, maxVCPU int, maxMemory config.ByteSize, tiers []config.Tier) *config.Config {
+	automatic := false
+
 	return &config.Config{
 		Server: &config.ServerConfig{
 			IdentityDir: dir,
@@ -49,9 +55,14 @@ func harnessConfig(dir string, maxVCPU int, maxMemory config.ByteSize, tiers []c
 			MaxVCPU:     maxVCPU,
 			MaxMemory:   maxMemory,
 		},
-		Tiers: tiers,
+		Release: &config.ReleaseConfig{Automatic: &automatic},
+		Tiers:   tiers,
 	}
 }
+
+// harnessOwner is what the harness's control plane names itself to the fake
+// Actions service's message queue, rather than this machine's host name.
+const harnessOwner = "billet-test"
 
 // openAssembled assembles a control plane up to its served wire.
 func openAssembled(

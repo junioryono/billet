@@ -74,6 +74,12 @@ type BarrierStore interface {
 // WithBarrierStore lets this plane answer a compute barrier.
 func WithBarrierStore(s BarrierStore) Option { return func(p *Plane) { p.barriers = s } }
 
+// WithBarrierPace makes BarrierLoop wait d between rounds, whatever the round
+// found, in place of its own pacing. For billet's harnesses, whose barrier
+// scenarios drive the rounds themselves on a steered clock: a loop asking the
+// fleet beside them records answers between theirs. A deployment never sets it.
+func WithBarrierPace(d time.Duration) Option { return func(p *Plane) { p.barrierPace = d } }
+
 // BarrierLoop asks the fleet what it is running, for as long as somebody is
 // waiting for an answer.
 //
@@ -92,6 +98,9 @@ func (p *Plane) BarrierLoop(ctx context.Context) {
 
 	for {
 		wait := p.barrierPass(ctx)
+		if p.barrierPace > 0 {
+			wait = p.barrierPace
+		}
 
 		timer := time.NewTimer(wait)
 

@@ -309,6 +309,11 @@ func TestAMultiDayJobSurvivesAControlPlaneShutdown(t *testing.T) {
 				t.Fatalf("nothing was charged for a running job: %+v", before)
 			}
 
+			// SEALED FIRST, as `billet drain` seals, so the stop is the drain's: a stop
+			// while admission is open is a restart and hands over instead, and the
+			// hurried drain is the give-up path this scenario is about.
+			s.seal(t)
+
 			// THE CONTROL PLANE STOPS, hurried.
 			stop()
 

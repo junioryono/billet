@@ -560,7 +560,7 @@ linters:
         # production assembly would be one the order and the tests do not reach.
         # These are the constructors with no production caller outside it,
         # measured at zero when the ban went in (#356 Phase 3c); the owning
-        # packages call their own unqualified, and tests are exempt below. The
+        # packages and tests are exempt below. The
         # constructors cmd/billet's operator commands still call (state.Open*,
         # alloc.New, the backends' and stores' New, awscreds.Default,
         # scaleset.New) join this as #356 Phase 4 moves those commands out.
@@ -655,12 +655,16 @@ linters:
         text: ledgerdb\.New
 
       # internal/app IS the composition root, so it is the one package that
-      # calls the role constructors. Anchored to files directly in it, as the
-      # ledgerdb exclusion above is, so no subpackage inherits the permission.
-      - path: (^|/)internal/app/[^/]+\.go$
+      # calls the role constructors, and each constructor's own package may call
+      # it too (forbidigo names an unqualified New by its package, as server.New).
+      # Anchored to files directly in each package, as the ledgerdb exclusion
+      # above is, so no subpackage inherits the permission, and matched on the
+      # ban's message rather than on how the call is spelled, which an import
+      # alias changes.
+      - path: (^|/)internal/(app|server|nodeplane|node|nodeclient|rollout)/[^/]+\.go$
         linters:
           - forbidigo
-        text: (server\.New|nodeplane\.(New|Handler|BootstrapHandler)|node\.New|nodeclient\.(New|Run)|rollout\.NewCoordinator)
+        text: 'forbidden because "Build the control plane and the node through internal/app'
 
       # THE USER-SPACE RESOLVER IS THE CONTAINMENT. resolveInRoot walks a path
       # component by component under a root and stats every step, which is how

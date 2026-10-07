@@ -621,6 +621,7 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 			// A SHORT COMMAND TIMEOUT, because a destroy queued for a process that is
 			// gone otherwise waits ten minutes before the plane will say so.
 			Plane: []nodeplane.Option{nodeplane.WithCommandTimeout(10 * time.Second)},
+			Owner: harnessOwner,
 			Server: []server.ControlPlaneOption{
 				server.WithReapInterval(reapEvery),
 				server.WithDrainTimeout(200 * time.Millisecond),
