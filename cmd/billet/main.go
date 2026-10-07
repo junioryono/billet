@@ -562,19 +562,19 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	defer stopDrainRequests()
 	publishNodeDrainReport(hostOS)
 
-	return n.Run(ctx, nodeHost(lc))
+	return n.Run(ctx, nodeHost(lc, hostOS))
 }
 
 // nodeHost is what the node takes from this process and machine: the service
 // manager's notification, the drain request a stop may carry, the second
-// signal, stdout, and where the registration record is published.
-func nodeHost(lc *lifecycle) app.NodeHost {
+// signal, stdout, and where the registration record is published on platform.
+func nodeHost(lc *lifecycle, platform string) app.NodeHost {
 	return app.NodeHost{
 		Ready:                  notifyReady,
 		DrainRequested:         nodeDrainRequested,
 		Hurry:                  lc.hurry,
 		Out:                    os.Stdout,
-		RegistrationRecordPath: nodeRegistrationRecordPath(hostOS),
+		RegistrationRecordPath: nodeRegistrationRecordPath(platform),
 	}
 }
 

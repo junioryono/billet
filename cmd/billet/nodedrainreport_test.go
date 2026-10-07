@@ -3,6 +3,7 @@ package main
 import (
 	"go/ast"
 	"os"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -193,51 +194,38 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 }
 
 // THE NODE IS GIVEN WHAT A STOP ASKS OF IT. Node.Run hands the loop whatever
-// its host says (internal/app reads that), so only this package's source shows
-// the host names the drain-request file, the second signal and the service
-// manager's notification: without the first, a node set to hand over would
-// leave guests behind under an operation that must not.
+// its host says (internal/app reads that), so this holds the host cmdNode
+// gives it: the drain-request file, the second signal, the service manager's
+// notification, stdout and the one record path. Without the first, a node set
+// to hand over would leave guests behind under an operation that must not.
+// The callbacks are compared by the function they are, which is what the
+// loop will call.
 func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
-	fn := findFunc(t, "nodeHost")
+	lc := newLifecycle(func() {})
+	// LINUX'S SPELLING, where a record is published; a Mac publishes none.
+	host := nodeHost(lc, "linux")
 
-	isIdent := func(name string) func(ast.Expr) bool {
-		return func(v ast.Expr) bool {
-			id, ok := v.(*ast.Ident)
+	same := func(a, b any) bool { return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() }
 
-			return ok && id.Name == name
-		}
+	if host.DrainRequested == nil || !same(host.DrainRequested, nodeDrainRequested) {
+		t.Error("nodeHost does not give the node nodeDrainRequested")
 	}
 
-	want := map[string]func(ast.Expr) bool{
-		"DrainRequested": isIdent("nodeDrainRequested"),
-		"Ready":          isIdent("notifyReady"),
-		"Hurry": func(v ast.Expr) bool {
-			sel, ok := v.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "hurry" {
-				return false
-			}
-
-			return isIdent("lc")(sel.X)
-		},
+	if host.Ready == nil || !same(host.Ready, notifyReady) {
+		t.Error("nodeHost does not give the node notifyReady")
 	}
-	found := map[string]bool{}
 
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		kv, ok := n.(*ast.KeyValueExpr)
-		if !ok {
-			return true
-		}
+	var hurry <-chan struct{} = lc.hurry
 
-		if key, ok := kv.Key.(*ast.Ident); ok && want[key.Name] != nil && want[key.Name](kv.Value) {
-			found[key.Name] = true
-		}
+	if host.Hurry == nil || host.Hurry != hurry {
+		t.Error("nodeHost does not give the node this process's second signal")
+	}
 
-		return true
-	})
+	if host.Out != os.Stdout {
+		t.Error("nodeHost does not give the node stdout")
+	}
 
-	for key := range want {
-		if !found[key] {
-			t.Errorf("nodeHost does not give the node %s", key)
-		}
+	if want := nodeRegistrationRecordPath("linux"); want == "" || host.RegistrationRecordPath != want {
+		t.Errorf("nodeHost gives a Linux node the record path %q, want %q", host.RegistrationRecordPath, want)
 	}
 }

@@ -676,6 +676,17 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		t.Errorf("cmdNode returns n.Run(ctx, nodeHost(...)) %d times, want once", handed)
 	}
 
+	// THE FIELD IS THE RETURNED HOST'S: nodeHost is one return of one literal,
+	// so nothing between building the host and returning it can change it.
+	// (cmd/billet's TestTheNodeHostCarriesTheDrainRequest checks the values.)
+	if body := cmd["nodeHost"].Body.List; len(body) != 1 {
+		t.Errorf("cmd/billet's nodeHost is %d statements, want the one return of its host", len(body))
+	} else if ret, ok := body[0].(*ast.ReturnStmt); !ok || len(ret.Results) != 1 {
+		t.Error("cmd/billet's nodeHost does not return its host directly")
+	} else if _, ok := ret.Results[0].(*ast.CompositeLit); !ok {
+		t.Error("cmd/billet's nodeHost does not return the host literal itself")
+	}
+
 	named := pathFields(cmd["nodeHost"], func(v ast.Expr) bool {
 		c, ok := v.(*ast.CallExpr)
 		if !ok {
