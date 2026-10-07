@@ -1,42 +1,184 @@
 package app
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
+// appPath is this package's import path, which the type checker names it by.
+const appPath = "github.com/junioryono/billet/internal/app"
+
 // proofMakers names, for each value the control plane's order is built from,
-// the one function allowed to create it, the fields only that function may set,
-// and the operation it must have performed, successfully, before it does.
-var proofMakers = map[string]struct {
-	maker     string
-	fields    []string
-	operation string
-}{
-	"Controller":         {"BecomeController", []string{"cp", "claim", "loops"}, "becomeController"},
-	"FleetForgotten":     {"ForgetFleet", []string{"forgottenBy"}, "ForgetEveryNode"},
-	"AdoptedAuthority":   {"AdoptAuthority", []string{"adoptedBy"}, "AdoptSharedAuthority"},
-	"AuthorityPublished": {"PublishAuthority", []string{"publishedBy"}, "PublishSharedAuthority"},
-	"ServingWire":        {"ServeWire", []string{"servedBy"}, "ServeNodeWire"},
-	"Scheduler":          {"Schedule", []string{"plane"}, "server.New"},
+// the one function allowed to create it and the operation it must have
+// performed, successfully, before it does.
+var proofMakers = map[string]struct{ maker, operation string }{
+	"Controller":         {"BecomeController", "becomeController"},
+	"FleetForgotten":     {"ForgetFleet", "ForgetEveryNode"},
+	"AdoptedAuthority":   {"AdoptAuthority", "AdoptSharedAuthority"},
+	"AuthorityPublished": {"PublishAuthority", "PublishSharedAuthority"},
+	"ServingWire":        {"ServeWire", "ServeNodeWire"},
+	"Scheduler":          {"Schedule", "server.New"},
 }
 
-// proofFields are the fields whose names belong to a proof alone, so a keyed
-// element naming one builds that proof whatever the literal's spelled type.
-var proofFields = map[string]string{
-	"forgottenBy": "FleetForgotten",
-	"adoptedBy":   "AdoptedAuthority",
-	"publishedBy": "AuthorityPublished",
-	"servedBy":    "ServingWire",
+// checkedPackage is this package's production files, type-checked.
+type checkedPackage struct {
+	files []*ast.File
+	types *types.Package
+	info  *types.Info
+}
+
+var (
+	checkedMu   sync.Mutex
+	checkedOnce *checkedPackage
+)
+
+// checkedApp type-checks this package's production files against its
+// dependencies' export data, once per test binary. The type checker, not a
+// reading of the syntax, says what each literal, conversion and field is, so an
+// alias, an elided element type or a named container cannot hide a proof.
+func checkedApp(t *testing.T) *checkedPackage {
+	t.Helper()
+
+	checkedMu.Lock()
+	defer checkedMu.Unlock()
+
+	if checkedOnce != nil {
+		return checkedOnce
+	}
+
+	// THE SAME VARIANT AS THIS TEST BINARY, so its build cache answers.
+	args := []string{"list", "-export", "-deps", "-f", "{{.ImportPath}}\t{{.Export}}"}
+	if raceBuild {
+		args = append(args, "-race")
+	}
+
+	out, err := exec.CommandContext(t.Context(), "go", append(args, ".")...).Output()
+	if err != nil {
+		t.Fatalf("go list -export: %v", err)
+	}
+
+	exports := map[string]string{}
+
+	for line := range strings.Lines(string(out)) {
+		path, file, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if ok && file != "" {
+			exports[path] = file
+		}
+	}
+
+	fset := token.NewFileSet()
+	files := packageFilesIn(t, fset)
+
+	info := &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+	}
+
+	conf := types.Config{Importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		file, ok := exports[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+
+		return os.Open(file)
+	})}
+
+	checked, err := conf.Check(appPath, fset, files, info)
+	if err != nil {
+		t.Fatalf("type-check %s: %v", appPath, err)
+	}
+
+	checkedOnce = &checkedPackage{files: files, types: checked, info: info}
+
+	return checkedOnce
+}
+
+// proofOf names the proof typ is, through aliases and one pointer.
+func proofOf(typ types.Type) (string, bool) {
+	typ = types.Unalias(typ)
+	if p, ok := typ.(*types.Pointer); ok {
+		typ = types.Unalias(p.Elem())
+	}
+
+	named, ok := typ.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil || named.Obj().Pkg().Path() != appPath {
+		return "", false
+	}
+
+	_, proof := proofMakers[named.Obj().Name()]
+
+	return named.Obj().Name(), proof
+}
+
+// carriedProofs are the proofs typ is or holds: through a pointer, slice,
+// array, map or channel, a struct's fields, or a type of this package declared
+// over any of those. A proof is a leaf: what it holds is its own business.
+func carriedProofs(typ types.Type) []string {
+	var out []string
+
+	seen := map[types.Type]bool{}
+
+	var walk func(types.Type)
+
+	walk = func(typ types.Type) {
+		typ = types.Unalias(typ)
+		if seen[typ] {
+			return
+		}
+
+		seen[typ] = true
+
+		if name, proof := proofOf(typ); proof {
+			out = append(out, name)
+
+			return
+		}
+
+		switch x := typ.(type) {
+		case *types.Pointer:
+			walk(x.Elem())
+		case *types.Slice:
+			walk(x.Elem())
+		case *types.Array:
+			walk(x.Elem())
+		case *types.Map:
+			walk(x.Key())
+			walk(x.Elem())
+		case *types.Chan:
+			walk(x.Elem())
+		case *types.Struct:
+			for i := range x.NumFields() {
+				walk(x.Field(i).Type())
+			}
+		case *types.Named:
+			// Another package's type cannot hold one of this package's.
+			if x.Obj().Pkg() != nil && x.Obj().Pkg().Path() == appPath {
+				walk(x.Underlying())
+			}
+		}
+	}
+
+	walk(typ)
+
+	return out
 }
 
 // ONLY THE STEP THAT PROVES A THING MAKES ITS PROOF.
@@ -45,97 +187,135 @@ var proofFields = map[string]string{
 // BecomeController, the node wire is served only with the two proofs only this
 // controller's ForgetFleet and AdoptAuthority make, and scheduling needs the
 // proof PublishAuthority makes. That holds while nothing else in this package
-// creates one, which no compiler checks, so this reads every production file
-// whole, package-level initializers included, for every way to make one: a
-// literal (its type spelled, or elided inside a literal of proofs), a keyed
-// proof field, new(T), a conversion, a field written, a type declared on a
-// proof (an alias builds it under another name), or a function returning one.
+// creates one, which no compiler checks. So this type-checks every production
+// file, package-level initializers included, and holds every way to make one to
+// its maker: a literal of a proof type (however its type is spelled, or elided),
+// new(T), a field of a proof written or addressed, a function returning one in
+// any container or struct, and a conversion to one anywhere.
 func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 	t.Parallel()
 
-	guardedField := map[string]string{}
-
-	for typ, m := range proofMakers {
-		for _, f := range m.fields {
-			guardedField[f] = typ
-		}
-	}
+	pkg := checkedApp(t)
 
 	var violations []string
 
 	report := func(where, what string) { violations = append(violations, where+" "+what) }
 
-	for _, file := range packageFiles(t) {
+	// Every field of every proof, as the objects a selector resolves to, so a
+	// field reached through an embedding or a chain (c.claim.Epoch) is still one.
+	fieldOf := map[types.Object]string{}
+
+	for name := range proofMakers {
+		st, ok := pkg.types.Scope().Lookup(name).Type().Underlying().(*types.Struct)
+		if !ok {
+			t.Fatalf("the proof %s is not a struct", name)
+		}
+
+		for i := range st.NumFields() {
+			fieldOf[st.Field(i)] = name
+		}
+	}
+
+	// writtenProofs are the proofs whose fields an assigned or addressed
+	// expression reaches, at any depth of its selector chain.
+	writtenProofs := func(expr ast.Expr) []string {
+		var out []string
+
+		for expr != nil {
+			switch x := expr.(type) {
+			case *ast.SelectorExpr:
+				if name, proof := fieldOf[pkg.info.Uses[x.Sel]]; proof {
+					out = append(out, name)
+				}
+
+				expr = x.X
+			case *ast.ParenExpr:
+				expr = x.X
+			case *ast.StarExpr:
+				expr = x.X
+			case *ast.IndexExpr:
+				expr = x.X
+			default:
+				expr = nil
+			}
+		}
+
+		return out
+	}
+
+	for _, file := range pkg.files {
 		for _, decl := range file.Decls {
-			where, body := "package scope", ast.Node(decl)
+			where := "package scope"
 
 			if fn, ok := decl.(*ast.FuncDecl); ok {
 				where = fn.Name.Name
 
-				for _, typ := range returnedProofs(fn) {
-					if proofMakers[typ].maker != where {
-						report(where, "returns a "+typ)
-					}
+				obj, ok := pkg.info.Defs[fn.Name].(*types.Func)
+				if !ok {
+					t.Fatalf("the type checker defined no function for %s", where)
 				}
-			}
 
-			mayMake := func(typ string) bool { return proofMakers[typ].maker == where }
-
-			if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.TYPE {
-				for _, spec := range gen.Specs {
-					if ts, ok := spec.(*ast.TypeSpec); ok {
-						if name, proof := proofName(ts.Type); proof {
-							report(where, "declares "+ts.Name.Name+" on "+name)
+				results := obj.Signature().Results()
+				for i := range results.Len() {
+					for _, name := range carriedProofs(results.At(i).Type()) {
+						if proofMakers[name].maker != where {
+							report(where, "returns a "+name)
 						}
 					}
 				}
 			}
 
-			ast.Inspect(body, func(n ast.Node) bool {
+			mayMake := func(name string) bool { return proofMakers[name].maker == where }
+
+			var written []ast.Expr
+
+			ast.Inspect(decl, func(n ast.Node) bool {
 				switch x := n.(type) {
 				case *ast.CompositeLit:
-					if name, proof := proofName(x.Type); proof && !mayMake(name) {
-						report(where, "builds a "+name+" literal")
-					}
-
-					// AN ELIDED ELEMENT TYPE IS THE CONTAINER'S: []AdoptedAuthority{{...}}
-					// builds the proof with no type spelled at the inner literal.
-					if elem, proof := elementProof(x.Type); proof && !mayMake(elem) {
-						for _, elt := range x.Elts {
-							if kv, ok := elt.(*ast.KeyValueExpr); ok {
-								elt = kv.Value
-							}
-
-							if lit, ok := elt.(*ast.CompositeLit); ok && lit.Type == nil {
-								report(where, "builds an elided "+elem)
-							}
-						}
-					}
-				case *ast.KeyValueExpr:
-					if key, ok := x.Key.(*ast.Ident); ok {
-						if typ, proof := proofFields[key.Name]; proof && !mayMake(typ) {
-							report(where, "sets "+typ+"."+key.Name+" in a literal")
-						}
+					if name, proof := proofOf(pkg.info.TypeOf(x)); proof && !mayMake(name) {
+						report(where, "builds a "+name)
 					}
 				case *ast.CallExpr:
-					if name, proof := proofName(x.Fun); proof {
-						report(where, "converts to "+name)
+					if tv, ok := pkg.info.Types[x.Fun]; ok && tv.IsType() {
+						if name, proof := proofOf(tv.Type); proof {
+							report(where, "converts to "+name)
+						}
 					}
 
-					if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "new" && len(x.Args) == 1 {
-						if name, proof := proofName(x.Args[0]); proof && !mayMake(name) {
-							report(where, "allocates a "+name)
+					if id, ok := x.Fun.(*ast.Ident); ok && len(x.Args) == 1 {
+						if b, isBuiltin := pkg.info.Uses[id].(*types.Builtin); isBuiltin && b.Name() == "new" {
+							if name, proof := proofOf(pkg.info.TypeOf(x.Args[0])); proof && !mayMake(name) {
+								report(where, "allocates a "+name)
+							}
 						}
 					}
 				case *ast.AssignStmt:
-					for _, lhs := range x.Lhs {
-						if sel, ok := lhs.(*ast.SelectorExpr); ok {
-							if typ, guarded := guardedField[sel.Sel.Name]; guarded && !mayMake(typ) {
-								report(where, "sets "+typ+"."+sel.Sel.Name)
+					written = append(written, x.Lhs...)
+				case *ast.IncDecStmt:
+					written = append(written, x.X)
+				case *ast.RangeStmt:
+					if x.Tok == token.ASSIGN {
+						written = append(written, x.Key, x.Value)
+					}
+				case *ast.UnaryExpr:
+					if x.Op == token.AND {
+						for _, name := range writtenProofs(x.X) {
+							if !mayMake(name) {
+								report(where, "takes the address of a field of a "+name)
 							}
 						}
 					}
 				}
+
+				for _, lhs := range written {
+					for _, name := range writtenProofs(lhs) {
+						if !mayMake(name) {
+							report(where, "sets a field of a "+name)
+						}
+					}
+				}
+
+				written = written[:0]
 
 				return true
 			})
@@ -150,31 +330,67 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 
 // EACH MAKER DOES ITS STEP BEFORE IT MAKES ITS PROOF. Only one function may make
 // each proof; that is worth nothing if the function makes it without the step.
-// So each maker must call its operation, test the error that call returns, and
-// build the proof with its field set only after both: a maker that dropped the
-// call, ignored its error, or built the proof first fails here.
+// So each maker must call its operation unconditionally, in a statement of its
+// own body (not under a branch or a loop, in a goroutine, a deferred call or a
+// closure), test that call's error in an `if` of its own body whose branch
+// returns an error and builds no proof, and build its proof only after both. Two
+// operations return no error to test: server.New, and the publication, which is
+// non-fatal by design.
 func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 	t.Parallel()
 
 	for typ, m := range proofMakers {
 		fn := findFunc(t, m.maker)
 
-		var calledAt, checkedAt, builtAt token.Pos
+		var (
+			calledAt, checkedAt, builtAt token.Pos
+			branchProblem                string
+			stack                        []ast.Node
+		)
+
+		// unconditional reports whether the call being visited runs whenever the
+		// maker does: stack holds its ancestors, the body first.
+		unconditional := func(call *ast.CallExpr) bool {
+			for _, n := range stack {
+				switch n.(type) {
+				case *ast.FuncLit, *ast.GoStmt, *ast.DeferStmt:
+					return false
+				}
+			}
+
+			if len(stack) < 2 {
+				return false
+			}
+
+			switch top := stack[1].(type) {
+			case *ast.AssignStmt, *ast.ExprStmt, *ast.DeclStmt:
+				return true
+			case *ast.IfStmt:
+				return top.Init != nil && containsNode(top.Init, call)
+			default:
+				return false
+			}
+		}
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if n == nil {
+				stack = stack[:len(stack)-1]
+
+				return false
+			}
+
 			switch x := n.(type) {
 			case *ast.CallExpr:
-				if calls(x, m.operation) && !calledAt.IsValid() {
+				if calls(x, m.operation) && !calledAt.IsValid() && unconditional(x) {
 					calledAt = x.Pos()
 				}
 			case *ast.IfStmt:
-				// `if err := op(); err != nil` tests the call it holds; any other
-				// `if err != nil` after the call tests what the call returned.
 				holds := x.Init != nil && containsCall(x.Init, m.operation)
 				after := calledAt.IsValid() && x.Pos() >= calledAt
 
-				if (holds || after) && !checkedAt.IsValid() && testsErr(x.Cond) {
+				if (holds || after) && len(stack) == 1 && !checkedAt.IsValid() && testsErr(x.Cond) {
 					checkedAt = x.Pos()
+					branchProblem = refusesWithoutAProof(x.Body, typ)
 				}
 			case *ast.CompositeLit:
 				if name, proof := proofName(x.Type); proof && name == typ && len(x.Elts) > 0 && !builtAt.IsValid() {
@@ -182,23 +398,74 @@ func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 				}
 			}
 
+			stack = append(stack, n)
+
 			return true
 		})
 
+		errorless := m.operation == "server.New" || m.operation == "PublishSharedAuthority"
+
 		switch {
 		case !calledAt.IsValid():
-			t.Errorf("%s no longer calls %s, so the %s it makes proves nothing", m.maker, m.operation, typ)
+			t.Errorf("%s no longer calls %s itself, so the %s it makes proves nothing", m.maker, m.operation, typ)
 		case !builtAt.IsValid():
 			t.Errorf("%s no longer builds the %s it proves", m.maker, typ)
-		case builtAt < calledAt && !containsCallBefore(fn, m.operation, builtAt):
+		case builtAt < calledAt:
 			t.Errorf("%s builds its %s before it calls %s", m.maker, typ, m.operation)
-		case m.operation != "server.New" && m.operation != "PublishSharedAuthority" &&
-			(!checkedAt.IsValid() || checkedAt > builtAt):
-			// server.New returns no error, and the publication is non-fatal by
-			// design; every other operation's failure must stop the proof.
+		case !errorless && (!checkedAt.IsValid() || checkedAt > builtAt):
 			t.Errorf("%s builds its %s without testing %s's error first", m.maker, typ, m.operation)
+		case !errorless && branchProblem != "":
+			t.Errorf("%s's branch for a failed %s %s", m.maker, m.operation, branchProblem)
 		}
 	}
+}
+
+// refusesWithoutAProof says what is wrong with an error branch, or "" when it
+// ends in a return whose last value is not nil (the error) and builds no proof
+// of typ with its field set.
+func refusesWithoutAProof(body *ast.BlockStmt, typ string) string {
+	if len(body.List) == 0 {
+		return "is empty"
+	}
+
+	ret, ok := body.List[len(body.List)-1].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) == 0 {
+		return "does not end in a return"
+	}
+
+	if id, ok := ret.Results[len(ret.Results)-1].(*ast.Ident); ok && id.Name == "nil" {
+		return "returns no error"
+	}
+
+	problem := ""
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.CompositeLit); ok {
+			if name, proof := proofName(lit.Type); proof && name == typ && len(lit.Elts) > 0 {
+				problem = "builds the proof anyway"
+			}
+		}
+
+		return true
+	})
+
+	return problem
+}
+
+// proofName is the proof a type expression spells, through a pointer, for
+// the makers' own literals, which spell their types.
+func proofName(expr ast.Expr) (string, bool) {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+
+	if id, ok := expr.(*ast.Ident); ok {
+		_, proof := proofMakers[id.Name]
+
+		return id.Name, proof
+	}
+
+	return "", false
 }
 
 // calls reports whether call invokes operation: "pkg.Name" a qualified call
@@ -219,27 +486,27 @@ func calls(call *ast.CallExpr, operation string) bool {
 	return ok && id.Name == pkg
 }
 
+// containsNode reports whether n holds target.
+func containsNode(n, target ast.Node) bool {
+	found := false
+
+	ast.Inspect(n, func(n ast.Node) bool {
+		if n == target {
+			found = true
+		}
+
+		return !found
+	})
+
+	return found
+}
+
 // containsCall reports whether n holds a call of operation.
 func containsCall(n ast.Node, operation string) bool {
 	found := false
 
 	ast.Inspect(n, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok && calls(call, operation) {
-			found = true
-		}
-
-		return true
-	})
-
-	return found
-}
-
-// containsCallBefore reports whether fn calls operation before pos.
-func containsCallBefore(fn *ast.FuncDecl, operation string, pos token.Pos) bool {
-	found := false
-
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		if call, ok := n.(*ast.CallExpr); ok && calls(call, operation) && call.Pos() < pos {
 			found = true
 		}
 
@@ -264,61 +531,6 @@ func testsErr(cond ast.Expr) bool {
 	})
 
 	return found
-}
-
-// proofName is the proof a type expression names, through a pointer.
-func proofName(expr ast.Expr) (string, bool) {
-	if star, ok := expr.(*ast.StarExpr); ok {
-		expr = star.X
-	}
-
-	if paren, ok := expr.(*ast.ParenExpr); ok {
-		expr = paren.X
-	}
-
-	if id, ok := expr.(*ast.Ident); ok {
-		_, proof := proofMakers[id.Name]
-
-		return id.Name, proof
-	}
-
-	return "", false
-}
-
-// elementProof is the proof a container literal's elided elements build.
-func elementProof(expr ast.Expr) (string, bool) {
-	switch x := expr.(type) {
-	case *ast.ArrayType:
-		return proofName(x.Elt)
-	case *ast.MapType:
-		return proofName(x.Value)
-	default:
-		return "", false
-	}
-}
-
-// returnedProofs are the proofs fn's results name, through pointers and
-// containers.
-func returnedProofs(fn *ast.FuncDecl) []string {
-	if fn.Type.Results == nil {
-		return nil
-	}
-
-	var out []string
-
-	for _, field := range fn.Type.Results.List {
-		ast.Inspect(field.Type, func(n ast.Node) bool {
-			if id, ok := n.(*ast.Ident); ok {
-				if _, proof := proofMakers[id.Name]; proof {
-					out = append(out, id.Name)
-				}
-			}
-
-			return true
-		})
-	}
-
-	return out
 }
 
 // THE PROOFS DO NOT CONVERT INTO ONE ANOTHER. Two struct types with identical
@@ -398,6 +610,48 @@ func TestAForeignOrZeroProofIsRefused(t *testing.T) {
 		if sched, err := ours.Schedule(tc.wire, tc.published, ScheduleOptions{}); err == nil || sched != nil {
 			t.Errorf("%s: Schedule assembled (%v, %v)", name, sched, err)
 		}
+	}
+}
+
+// A FAILED ADOPTION MAKES NO PROOF. A deployment that keeps its authority in a
+// store adopts it under the authority lock; when that lock cannot be taken,
+// AdoptAuthority must return the error and no proof ServeWire would accept, or
+// the wire would read (and on an empty directory mint) a rival authority.
+func TestAFailedAdoptionMakesNoProof(t *testing.T) {
+	t.Parallel()
+
+	refused := errors.New("the authority lock is held")
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		IdentityDir: t.TempDir(),
+		Identity: &config.IdentityConfig{
+			Backend: config.IdentitySSM,
+			AWSSSM:  &config.IdentitySSMConfig{Region: "us-east-1", Prefix: "/billet/test"},
+		},
+	}}
+
+	locks := 0
+
+	ctl := &Controller{cp: &ControlPlane{cfg: cfg, host: Host{
+		AuthorityLock: func(context.Context, string) (func() error, error) {
+			locks++
+
+			return nil, refused
+		},
+	}}}
+	ctl.claim.Epoch = 1
+
+	adopted, err := ctl.AdoptAuthority(t.Context())
+	if !errors.Is(err, refused) {
+		t.Fatalf("AdoptAuthority = %v, want the lock's refusal", err)
+	}
+
+	if locks != 1 {
+		t.Errorf("AdoptAuthority asked for the authority lock %d times, want once", locks)
+	}
+
+	if adopted != (AdoptedAuthority{}) {
+		t.Errorf("a failed adoption returned a proof made by %p", adopted.adoptedBy)
 	}
 }
 
@@ -490,16 +744,14 @@ func TestTheControlPlaneAssemblesStepByStep(t *testing.T) {
 	}
 }
 
-// packageFiles parses this package's non-test sources.
-func packageFiles(t *testing.T) []*ast.File {
+// packageFilesIn parses this package's non-test sources into fset.
+func packageFilesIn(t *testing.T, fset *token.FileSet) []*ast.File {
 	t.Helper()
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read the package directory: %v", err)
 	}
-
-	fset := token.NewFileSet()
 
 	var out []*ast.File
 
@@ -518,6 +770,13 @@ func packageFiles(t *testing.T) []*ast.File {
 	}
 
 	return out
+}
+
+// packageFiles parses this package's non-test sources.
+func packageFiles(t *testing.T) []*ast.File {
+	t.Helper()
+
+	return packageFilesIn(t, token.NewFileSet())
 }
 
 // packageFuncs is every function and method declaration of this package's
