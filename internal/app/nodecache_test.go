@@ -280,8 +280,8 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 				if value, ok := field.Value.(*ast.Ident); ok && value.Name == "handOver" {
 					found[key.Name] = true
 				}
-			case key.Name == "DrainRequested":
-				if namesSelector(field.Value, "host", "DrainRequested") {
+			case key.Name == "DrainRequested", key.Name == "Hurry":
+				if namesSelector(field.Value, "host", key.Name) {
 					found[key.Name] = true
 				}
 			}
@@ -290,10 +290,57 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 		return true
 	})
 
-	for _, key := range []string{"HandOverOnStop", "DrainRequested"} {
+	for _, key := range []string{"HandOverOnStop", "DrainRequested", "Hurry"} {
 		if !found[key] {
 			t.Errorf("the node loop is not given %s from what the config and the host say", key)
 		}
+	}
+}
+
+// THE NODE SAYS IT IS READY ONCE, AFTER ITS RUNNER IS BUILT AND BEFORE THE
+// LOOP, and the guest cache answers only from the loop's readiness. A READY=1
+// sent before the runner exists tells the service manager a node is serving
+// that cannot take a command; one never sent leaves the unit starting until
+// systemd kills it. And serveCache called anywhere but as the loop's Ready
+// answers a guest before this process is registered and recovered.
+func TestTheNodeIsReadyBeforeItsLoopAndServesTheCacheOnlyFromIt(t *testing.T) {
+	t.Parallel()
+
+	run := nodeFunc(t, "node.go", "Run")
+
+	var built, ready, looped token.Pos
+
+	readies, eager := 0, 0
+
+	ast.Inspect(run.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		switch {
+		case namesSelector(call.Fun, "node", "New") && !built.IsValid():
+			built = call.Pos()
+		case namesSelector(call.Fun, "host", "Ready"):
+			readies++
+			ready = call.Pos()
+		case namesSelector(call.Fun, "nodeclient", "Run") && !looped.IsValid():
+			looped = call.Pos()
+		}
+
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "serveCache" {
+			eager++
+		}
+
+		return true
+	})
+
+	if readies != 1 || !built.IsValid() || !looped.IsValid() || ready < built || ready > looped {
+		t.Errorf("Node.Run calls host.Ready %d times, want once after node.New and before nodeclient.Run", readies)
+	}
+
+	if eager != 0 {
+		t.Errorf("Node.Run calls serveCache itself %d times; the cache is served only from the loop's Ready", eager)
 	}
 }
 

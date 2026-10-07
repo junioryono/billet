@@ -193,6 +193,58 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 	}
 }
 
+// THE NODE'S LOCK IS RELEASED WHEN cmdNode RETURNS, NOT BEFORE. The statement
+// after the open's error check defers a function that closes the node; a
+// close that ran there instead would hand the deployment's compute to any
+// other process for as long as this one runs.
+func TestTheNodeHoldsItsLockUntilTheCommandReturns(t *testing.T) {
+	fn := findFunc(t, "cmdNode")
+
+	for i, stmt := range fn.Body.List {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) != 2 {
+			continue
+		}
+
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || calleeName(call) != "OpenNode" {
+			continue
+		}
+
+		node, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || i+2 >= len(fn.Body.List) {
+			t.Fatal("cmdNode opens its node without a name or a check")
+		}
+
+		deferred, ok := fn.Body.List[i+2].(*ast.DeferStmt)
+		if !ok {
+			t.Fatal("the statement after cmdNode's open check is not a deferred close of the node")
+		}
+
+		closes := false
+
+		ast.Inspect(deferred, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Close" {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == node.Name {
+						closes = true
+					}
+				}
+			}
+
+			return true
+		})
+
+		if !closes {
+			t.Errorf("cmdNode's deferred statement after the open does not close %s", node.Name)
+		}
+
+		return
+	}
+
+	t.Fatal("cmdNode does not open its node through app.OpenNode")
+}
+
 // THE NODE IS GIVEN WHAT A STOP ASKS OF IT. Node.Run hands the loop whatever
 // its host says (internal/app reads that), so this holds the host cmdNode
 // gives it: the drain-request file, the second signal, the service manager's

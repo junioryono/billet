@@ -362,10 +362,17 @@ func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
 		t.Fatal("a node configured with node.tls loaded no bundle")
 	}
 
-	deployment, _, err := app.ClaimNodeDeployment(cfg, bundle)
+	// THROUGH THE ASSEMBLY, so what is held is that the bundle OpenNode reads
+	// is the one it claims the identity with. Docker's constructor reaches no
+	// daemon.
+	n, err := app.OpenNode(cfg, app.NodeOptions{})
 	if err != nil {
-		t.Fatalf("claim: %v", err)
+		t.Fatalf("open the node: %v", err)
 	}
+
+	t.Cleanup(func() { _ = n.Close() })
+
+	deployment := n.Deployment()
 
 	want, err := os.ReadFile(filepath.Join(serverState, "deployment-id"))
 	if err != nil {

@@ -143,6 +143,9 @@ func (n *Node) open(bundle *wirecert.Bundle) error {
 // when it has one.
 func (n *Node) Name() string { return n.cfg.Node.Name }
 
+// Deployment is the deployment identity this node claimed.
+func (n *Node) Deployment() string { return n.deployment }
+
 // Close releases the host-wide deployment lock.
 func (n *Node) Close() error { return n.lock.Release() }
 
