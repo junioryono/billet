@@ -377,6 +377,13 @@ func (pkg *checkedPackage) writtenProofs(expr ast.Expr) []string {
 // is spelled or elided, new(T), a field of one written or addressed, one
 // overwritten in place, a function returning one in any container or struct,
 // and a conversion to one anywhere.
+//
+// IT STOPS AN EDIT, NOT AN ADVERSARY. What it is for is that a refactor, a new
+// helper or a convenience constructor cannot hand out a proof without its step
+// unnoticed. What it cannot read (reflect, unsafe, a generic helper over any T
+// copying a Controller) the steps refuse at run time where they can: a
+// Controller and its control plane are bound to the addresses they were made
+// at (TestAForeignOrZeroProofIsRefused).
 func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 	t.Parallel()
 
@@ -511,7 +518,9 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 // either in the call's own `if` or in the statement after it, in a branch that
 // ends in a return carrying an error. Every return up to that test carries no
 // proof (nil or a zero literal), nothing before it builds or writes one, and
-// the proof is built after it.
+// the proof is built after it. A maker that hands its construction to a
+// closure or a helper is refused too, on purpose: the proof is built in the
+// maker's own body, where this test can read the order it is built in.
 func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 	t.Parallel()
 
@@ -563,8 +572,8 @@ func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 						built = x.Pos()
 					}
 				}
-			case *ast.AssignStmt:
-				for _, lhs := range x.Lhs {
+			case *ast.AssignStmt, *ast.IncDecStmt, *ast.RangeStmt:
+				for _, lhs := range assigned(x) {
 					for _, name := range pkg.writtenProofs(lhs) {
 						if x.Pos() < guardEnd {
 							t.Errorf("%s writes a %s before %s has succeeded", m.maker, name, m.operation)
@@ -580,6 +589,22 @@ func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 			t.Errorf("%s no longer builds the %s it proves", m.maker, typ)
 		}
 	}
+}
+
+// assigned are the expressions a statement writes.
+func assigned(stmt ast.Node) []ast.Expr {
+	switch x := stmt.(type) {
+	case *ast.AssignStmt:
+		return x.Lhs
+	case *ast.IncDecStmt:
+		return []ast.Expr{x.X}
+	case *ast.RangeStmt:
+		if x.Tok == token.ASSIGN {
+			return []ast.Expr{x.Key, x.Value}
+		}
+	}
+
+	return nil
 }
 
 // function returns the one function or method of this package named name, as
@@ -883,6 +908,22 @@ func TestAForeignOrZeroProofIsRefused(t *testing.T) {
 			wire, err)
 	}
 
+	// AND THE SAME FOR ITS CONTROL PLANE: proofs earned against one plane do not
+	// serve the plane written over it.
+	replanned := lookingClaimed(&ControlPlane{})
+	earned = FleetForgotten{forgottenBy: replanned}
+	adopted = AdoptedAuthority{adoptedBy: replanned}
+	*replanned.cp = *theirs.cp
+
+	if replanned.held() {
+		t.Fatal("a Controller whose control plane was overwritten with another's holds a claim")
+	}
+
+	if wire, err := replanned.ServeWire(ctx, earned, adopted); err == nil || wire != nil {
+		t.Errorf("a Controller over an overwritten control plane served with the proofs it had earned: (%v, %v)",
+			wire, err)
+	}
+
 	for name, tc := range map[string]struct {
 		fleet   FleetForgotten
 		adopted AdoptedAuthority
@@ -961,6 +1002,7 @@ func TestAFailedAdoptionMakesNoProof(t *testing.T) {
 // lookingClaimed is a Controller over cp that passes held() without a ledger,
 // for the tests that show what a step refuses.
 func lookingClaimed(cp *ControlPlane) *Controller {
+	cp.self = cp
 	ctl := &Controller{cp: cp}
 	ctl.claim.Epoch = 1
 	ctl.self = ctl

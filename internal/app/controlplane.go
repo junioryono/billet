@@ -63,6 +63,11 @@ type ControlPlane struct {
 	targets    []server.Target
 	planeJIT   map[string]nodeplane.JITSource
 	serverOpts []server.ControlPlaneOption
+
+	// self is the address OpenControlPlane made this plane at, for the reason a
+	// Controller records its own: the proofs were earned against what is there,
+	// and a plane overwritten with another's value is not it.
+	self *ControlPlane
 }
 
 // OpenControlPlane opens a control plane over the scale-set targets the caller
@@ -149,7 +154,7 @@ func OpenControlPlane(
 		return nil, errors.Join(err, db.Close())
 	}
 
-	return &ControlPlane{
+	cp := &ControlPlane{
 		cfg:        cfg,
 		host:       host,
 		db:         db,
@@ -159,7 +164,10 @@ func OpenControlPlane(
 		targets:    serverTargets,
 		planeJIT:   planeJIT,
 		serverOpts: serverOpts,
-	}, nil
+	}
+	cp.self = cp
+
+	return cp, nil
 }
 
 // Close closes the ledger. Close the Controller, if one was made, first.
@@ -221,11 +229,11 @@ func (c *Controller) Close() []error { return c.loops.Wait() }
 // made by BecomeController.
 var errNotController = errors.New("app: this step is the controller's, and this value holds no controller claim")
 
-// held reports whether c was made by BecomeController and is still where it
-// was made: it has a control plane and the claim's epoch, which the ledger
-// never writes as zero.
+// held reports whether c was made by BecomeController and it and its control
+// plane are still where they were made: it has the claim's epoch, which the
+// ledger never writes as zero.
 func (c *Controller) held() bool {
-	return c != nil && c.self == c && c.cp != nil && c.claim.Epoch >= 1
+	return c != nil && c.self == c && c.cp != nil && c.cp.self == c.cp && c.claim.Epoch >= 1
 }
 
 // THE PROOFS DIFFER IN THEIR FIELDS' NAMES, not only their types' names: two
