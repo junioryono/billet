@@ -28,7 +28,7 @@ func TestTheControlPlaneIsWiredWithTheRolloutStarter(t *testing.T) {
 			starter = true
 		case "WithRolloutCoordinator":
 			coordinator = true
-		case "newRolloutStarter":
+		case "NewRolloutStarter":
 			built = true
 		}
 

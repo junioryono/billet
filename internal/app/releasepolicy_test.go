@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"testing"
@@ -29,7 +29,7 @@ func TestReleasePolicyBindsTheRepositoryUnlessTheSignerIsOverridden(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			policy, err := releasePolicyFor(&config.Config{Release: tc.release}, false)
+			policy, err := ReleasePolicyFor(&config.Config{Release: tc.release}, false)
 			if err != nil {
 				t.Fatal(err)
 			}

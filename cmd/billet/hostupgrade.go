@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -230,7 +231,7 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 
 	target.skipVerify = skipVerify
 
-	policy, err := releasePolicyFor(cfg, target.skipVerify)
+	policy, err := app.ReleasePolicyFor(cfg, target.skipVerify)
 	if err != nil {
 		return err
 	}
@@ -631,7 +632,7 @@ type hostUpgradeTarget struct {
 func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck,
 ) error {
-	policy, err := releasePolicyFor(cfg, target.skipVerify)
+	policy, err := app.ReleasePolicyFor(cfg, target.skipVerify)
 	if err != nil {
 		return err
 	}
@@ -704,7 +705,7 @@ func startHostUpgradeHolding(ctx context.Context, cfg *config.Config, cfgPath st
 // and its settlement.
 var (
 	checkBinaryDir = checkBinaryDirWritable
-	resolveRelease = resolveTarget
+	resolveRelease = app.ResolveTarget
 	timerBarrier   func(step string)
 	// resumeBarrier is where a resume has passed every refusal and is about to
 	// act on the journal it read; a fixture that must prove a refusal happened

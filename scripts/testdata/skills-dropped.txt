@@ -22,3 +22,6 @@ f93edbb8ea27 #349 forwarded run evidence through both adapters when it closed #3
 302d5494b9ae The node wire's serving moved to internal/app (#356 Phase 3c); the test list now names internal/app's files.
 8d6bd835b18c The node wire's serving moved to internal/app (#356 Phase 3c); the sentence now names app.ServeNodeWire and its handshake listener.
 ce3a77f40d30 The node wire's serving moved to internal/app (#356 Phase 3c); the sentence now names app.ServeNodeWire.
+0e98df881bc6 The shared-authority adopt and publish moved to internal/app (#356 Phase 3c); the list now names internal/app/identitystore.go and cmd/billet/authoritypublish.go.
+75414c595d0a The rollout wiring moved to internal/app (#356 Phase 3c); the sentence now names internal/app/rolloutwiring.go, app.ResolveTarget and app.ReleasePolicyFor.
+7e3737dd450f The credential sweep moved to internal/app (#356 Phase 3c); its test is now internal/app/credentialsweep_test.go beside cmd/billet's status test.
