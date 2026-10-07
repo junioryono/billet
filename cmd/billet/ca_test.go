@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
@@ -560,7 +561,7 @@ node:
 
 // THE WIRE'S AUTHORITY BELONGS TO THE DEPLOYMENT, NOT TO THE HOSTNAME.
 //
-// serveNodeWire's third parameter is the deployment id, and every mTLS
+// ServeNodeWire's deployment once came in as a parameter, and every mTLS
 // deployment turns on it: the CA is minted with the deployment in its
 // Organization, a node reads its own deployment out of the certificate it is
 // given, and Plane.Register refuses a node whose deployment is not this one's.
@@ -590,14 +591,14 @@ func TestTheNodeWireMintsItsAuthorityForTheDeployment(t *testing.T) {
 		Listen: ":0", IdentityDir: stateDir, NodeTLSHosts: []string{"billet.example"},
 	}}
 
-	stop, err := serveNodeWire(t.Context(), cfg,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("serving the node wire on a network address: %v", err)
 	}
 
-	t.Cleanup(stop.stop)
+	t.Cleanup(stop.Stop)
 
 	// The authority on disk has to be one this deployment can load. It is the
 	// same call `billet ca issue` and `billet nodes approve` make, so an
@@ -627,14 +628,14 @@ func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
 		Listen: ":0", IdentityDir: stateDir, NodeTLSHosts: []string{"billet.example"},
 	}}
 
-	stop, err := serveNodeWire(t.Context(), cfg,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("the control plane refused the authority its own CLI minted: %v", err)
 	}
 
-	t.Cleanup(stop.stop)
+	t.Cleanup(stop.Stop)
 }
 
 // AN INTERRUPTED ENROLLMENT COMES BACK AS THE SAME REQUEST.

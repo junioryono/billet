@@ -29,7 +29,7 @@ import (
 //   - plane.Run polls GitHub, opens message sessions and dispatches.
 var authoritativeAfterTheClaim = []string{
 	"ForgetEveryNode",
-	"serveNodeWire",
+	"ServeNodeWire",
 	"Watch",
 	"BarrierLoop",
 	"Run",
@@ -147,7 +147,7 @@ func TestTheAuthorityIsAdoptedBeforeTheWireAndPublishedAfterIt(t *testing.T) {
 	})
 
 	adopt, adopted := first["adoptSharedAuthority"]
-	wire, served := first["serveNodeWire"]
+	wire, served := first["ServeNodeWire"]
 	publish, published := first["publishSharedAuthority"]
 
 	switch {
@@ -155,7 +155,7 @@ func TestTheAuthorityIsAdoptedBeforeTheWireAndPublishedAfterIt(t *testing.T) {
 		t.Fatal("runServer no longer adopts this deployment's authority, so a promoted " +
 			"standby with an empty ca directory would mint a rival one and drop the fleet")
 	case !served:
-		t.Fatal("runServer no longer calls serveNodeWire")
+		t.Fatal("runServer no longer calls app.ServeNodeWire")
 	case !published:
 		t.Fatal("runServer no longer publishes this deployment's authority, so a second " +
 			"controller would have nothing to adopt")
