@@ -96,6 +96,11 @@ func TestTheSignalMessagesDescribeWhatTheSignalsActuallyDo(t *testing.T) {
 		}
 	}
 
+	// THE THIRD SAYS IT GIVES UP, and what it leaves.
+	if !strings.Contains(out, "third signal; exiting without finishing the shutdown") {
+		t.Errorf("the third signal does not say it gives up:\n%s", out)
+	}
+
 	// AND IT NAMES NO PARTICULAR ROLE. `billet server` and `billet node` install
 	// this same handler, and what recovers the work differs: a control plane
 	// re-adopts leases when IT returns, a node's provider inventory when the NODE

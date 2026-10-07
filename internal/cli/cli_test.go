@@ -9,30 +9,41 @@ import (
 	"testing"
 )
 
-// testTree is a tree of commands that answer as told.
-func testTree(answers map[string]error) Tree {
+// testTree is a tree of commands that answer as told, in the order given.
+func testTree(names []string, answers map[string]error) Tree {
 	return func(*Lifecycle) []Command {
-		var out []Command
+		out := make([]Command, 0, len(names))
 
-		for name, err := range answers {
+		for _, name := range names {
 			out = append(out, Command{Name: name, Summary: "answers " + name,
-				Run: func(context.Context, []string) error { return err }})
+				Run: func(context.Context, []string) error { return answers[name] }})
 		}
 
 		return out
 	}
 }
 
-// WHAT THE PROCESS EXITS WITH, AND WHAT IT SAYS. A command's success and an
-// explicit request for help are 0; a status a command answers with is that
-// status, printed unless it is quiet (a child's, whose output already went
-// through); anything else is 1, printed; and no command, or one the tree does
-// not have, is 1 with the usage.
+// fixtureUsage is what Usage prints for testTree(fixtureNames, ...).
+const fixtureUsage = "billet — self-hosted GitHub Actions runners\n\nusage: billet <command> [flags]\n\n" +
+	"  ok          answers ok\n" +
+	"  asks-help   answers asks-help\n" +
+	"  due         answers due\n" +
+	"  quiet       answers quiet\n" +
+	"  failure     answers failure\n" +
+	"\nRun 'billet <command> -h' for details.\n"
+
+var fixtureNames = []string{"ok", "asks-help", "due", "quiet", "failure"}
+
+// WHAT THE PROCESS EXITS WITH, AND EXACTLY WHAT IT SAYS WHERE. A command's
+// success and an explicit request for help are 0; a status a command answers
+// with is that status, printed unless it is quiet (a child's, whose output
+// already went through); anything else is 1, printed; no command, or one the
+// tree does not have, is 1 after the usage; and -h, --help and help print the
+// usage and are 0. Nothing goes to stdout: a command's own output is its own.
 func TestMainAnswersWithTheStatusACommandGives(t *testing.T) {
 	t.Parallel()
 
-	tree := testTree(map[string]error{
-		"ok":        nil,
+	tree := testTree(fixtureNames, map[string]error{
 		"asks-help": flag.ErrHelp,
 		"due":       &ExitError{Code: 2, Msg: "the runner image is due to be rebuilt"},
 		"quiet":     &ExitError{Code: 4},
@@ -49,27 +60,24 @@ func TestMainAnswersWithTheStatusACommandGives(t *testing.T) {
 		{[]string{"due"}, 2, "billet: the runner image is due to be rebuilt\n"},
 		{[]string{"quiet"}, 4, ""},
 		{[]string{"failure"}, 1, "billet: it broke\n"},
-		{nil, 1, "no command given"},
-		{[]string{"nope"}, 1, `unknown command "nope"`},
+		{nil, 1, fixtureUsage + "billet: no command given\n"},
+		{[]string{"nope"}, 1, fixtureUsage + "billet: unknown command \"nope\"\n"},
+		{[]string{"-h"}, 0, fixtureUsage},
+		{[]string{"--help"}, 0, fixtureUsage},
+		{[]string{"help"}, 0, fixtureUsage},
 	} {
 		var stdout, stderr bytes.Buffer
 
-		env := Env{Stdout: &stdout, Stderr: &stderr}
-
 		exited := false
 
-		code := Main(tc.args, env, tree, func(int) { exited = true })
+		code := Main(tc.args, Env{Stdout: &stdout, Stderr: &stderr}, tree, func(int) { exited = true })
 
 		if code != tc.code || exited {
 			t.Errorf("Main(%q) = %d (exited by signal: %v), want %d", tc.args, code, exited, tc.code)
 		}
 
-		if tc.stderr == "" && stderr.Len() != 0 {
-			t.Errorf("Main(%q) printed %q, want nothing", tc.args, stderr.String())
-		}
-
-		if tc.stderr != "" && !strings.Contains(stderr.String(), tc.stderr) {
-			t.Errorf("Main(%q) printed %q, want it to contain %q", tc.args, stderr.String(), tc.stderr)
+		if stderr.String() != tc.stderr {
+			t.Errorf("Main(%q) printed to stderr:\n%q\nwant:\n%q", tc.args, stderr.String(), tc.stderr)
 		}
 
 		if stdout.Len() != 0 {
@@ -78,21 +86,33 @@ func TestMainAnswersWithTheStatusACommandGives(t *testing.T) {
 	}
 }
 
-// THE USAGE LISTS EVERY COMMAND, and is what -h and an unknown command print.
-func TestTheUsageListsEveryCommand(t *testing.T) {
+// THE LIFECYCLE A COMMAND IS GIVEN TELLS THE OPERATOR ON THE ENV'S STDERR: the
+// second and third signals' warnings go where the binary's stderr is, not
+// to its stdout or nowhere.
+func TestTheLifecycleACommandIsGivenWritesToTheEnvsStderr(t *testing.T) {
 	t.Parallel()
 
-	var stderr bytes.Buffer
+	var (
+		stdout, stderr bytes.Buffer
+		given          *Lifecycle
+	)
 
-	if code := Main([]string{"-h"}, Env{Stdout: &bytes.Buffer{}, Stderr: &stderr},
-		testTree(map[string]error{"server": nil, "node": nil}), func(int) {}); code != 0 {
-		t.Fatalf("Main(-h) = %d, want 0", code)
+	env := Env{Stdout: &stdout, Stderr: &stderr}
+
+	tree := func(lc *Lifecycle) []Command {
+		return []Command{{Name: "server", Run: func(context.Context, []string) error {
+			given = lc
+
+			return nil
+		}}}
 	}
 
-	for _, want := range []string{"usage: billet <command> [flags]", "server", "answers server", "node"} {
-		if !strings.Contains(stderr.String(), want) {
-			t.Errorf("the usage does not say %q:\n%s", want, stderr.String())
-		}
+	if err := Run([]string{"server"}, env, tree, func(int) {}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if given == nil || given.stderr != env.Stderr {
+		t.Fatal("the lifecycle the command was given does not write to the env's stderr")
 	}
 }
 

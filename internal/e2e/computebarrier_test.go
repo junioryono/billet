@@ -111,6 +111,30 @@ func (s *stack) seal(t *testing.T) state.Admission {
 	return sealed
 }
 
+// awaitNothingOutstanding waits until the ledger holds no open lease.
+func (s *stack) awaitNothingOutstanding(t *testing.T) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		q, err := s.alloc.Quiescence(t.Context())
+		if err != nil {
+			t.Fatalf("Quiescence: %v", err)
+		}
+
+		if len(q.Outstanding) == 0 {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the ledger still holds leases: %+v", q.Outstanding)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // clearanceFor is one host's line out of the fleet's answer.
 func (s *stack) clearanceFor(
 	t *testing.T, node string,
@@ -204,6 +228,11 @@ func TestTheBarrierSeesRealComputeWhoseLeaseIsGone(t *testing.T) {
 				fakeactions.JobJSON("JobCompleted", 4101, "push", testTier))
 
 			s.awaitGone(t)
+
+			// THE LEDGER RELEASES THE JOB TOO, before the plane stops: the container
+			// goes before the node reports the destroy, and a stop in between leaves
+			// the lease open, which the quiet ledger asserted below is not.
+			s.awaitNothingOutstanding(t)
 
 			// THE CONTROL PLANE STOPS. Nothing sweeps after this: the reaper rode the
 			// server's own tick, and this node's sweep is not on a timer.
