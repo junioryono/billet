@@ -723,7 +723,15 @@ func cmdRolloutAbort(ctx context.Context, args []string) error {
 // cmdRolloutNodePhase records an operator's judgement about one host.
 func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, verb string,
 ) error {
-	fs := cli.NewFlagSet("billet rollout "+verb, os.Stdout)
+	name := "billet rollout retry"
+	switch verb {
+	case "exempt":
+		name = "billet rollout exempt"
+	case "decommission":
+		name = "billet rollout decommission"
+	}
+
+	fs := cli.NewFlagSet(name, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "the operator's reason, recorded against this host")
 

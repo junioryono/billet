@@ -19,28 +19,13 @@ import (
 // reference documents has a flag set; and every flag the reference documents
 // for a command is one that command defines. `--config` is documented once, in
 // the reference's introduction, for every command that reads a configuration.
+// A command the reference names anywhere else, in a sentence, is one the
+// binary has, with flags that command defines.
 func TestTheCLIReferenceMatchesTheCommands(t *testing.T) {
 	t.Parallel()
 
-	code, wildcards := declaredFlagSets(t)
-	docs := documentedCommands(t)
-
-	// A FLAG SET NAMED BY CONCATENATION ("billet nodes " + decision) is every
-	// documented command under that prefix that has no flag set of its own.
-	for prefix, flags := range wildcards {
-		matched := 0
-
-		for path := range docs {
-			if _, own := code[path]; !own && strings.HasPrefix(path, prefix) && !strings.Contains(path[len(prefix):], " ") {
-				code[path] = flags
-				matched++
-			}
-		}
-
-		if matched == 0 {
-			t.Errorf("the flag set named %q* matches no command the reference documents", prefix)
-		}
-	}
+	code := declaredFlagSets(t)
+	docs, mentions := documentedCommands(t)
 
 	for _, path := range sortedKeys(code) {
 		documented, ok := docs[path]
@@ -68,6 +53,37 @@ func TestTheCLIReferenceMatchesTheCommands(t *testing.T) {
 			t.Errorf("the reference documents %s, which no flag set declares", path)
 		}
 	}
+
+	for _, m := range mentions {
+		for _, path := range m.paths {
+			flags, command := code[path]
+
+			group := false
+			for other := range code {
+				group = group || strings.HasPrefix(other, path+" ")
+			}
+
+			switch {
+			case !command && !group:
+				t.Errorf("the reference names %s (line %d), which is not a command", path, m.line)
+			case !command && len(m.flags) > 0:
+				t.Errorf("the reference gives %s flags (line %d), but it is a group of commands", path, m.line)
+			}
+
+			for _, flag := range m.flags {
+				if command && flag != "config" && flag != "h" && !flags[flag] {
+					t.Errorf("the reference names --%s for %s (line %d), which defines no such flag", flag, path, m.line)
+				}
+			}
+		}
+	}
+}
+
+// mention is a backticked command in the reference's prose.
+type mention struct {
+	line  int
+	paths []string
+	flags []string
 }
 
 // flagDefiners are the FlagSet methods that define a flag, and which argument
@@ -80,12 +96,25 @@ var flagDefiners = map[string]int{
 }
 
 // declaredFlagSets reads this package's sources for every NewFlagSet and the
-// flags defined on it, through any function the flag set is handed to. A
-// name built by concatenation is returned as a wildcard on its literal prefix.
-func declaredFlagSets(t *testing.T) (map[string]map[string]bool, map[string]map[string]bool) {
+// flags defined on it, through any function the flag set is handed to. Every
+// NewFlagSet call must be one this reads: a flag set made any other way (a
+// package variable, a field, a helper's return) fails rather than escaping.
+func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 	t.Helper()
 
 	files := cliSources(t)
+
+	calls := 0
+
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && calleeName(call) == "NewFlagSet" {
+				calls++
+			}
+
+			return true
+		})
+	}
 
 	// helpers: functions taking a *flag.FlagSet, by name, with that parameter.
 	type helper struct {
@@ -167,7 +196,8 @@ func declaredFlagSets(t *testing.T) (map[string]map[string]bool, map[string]map[
 		return out
 	}
 
-	code, wildcards := map[string]map[string]bool{}, map[string]map[string]bool{}
+	code := map[string]map[string]bool{}
+	read := 0
 
 	for _, f := range files {
 		for _, d := range f.Decls {
@@ -192,24 +222,20 @@ func declaredFlagSets(t *testing.T) (map[string]map[string]bool, map[string]map[
 					return true
 				}
 
+				read++
+
 				flags := map[string]bool{}
 				for _, name := range flagsOn(fn.Body, set.Name, map[string]bool{}) {
 					flags[name] = true
 				}
 
 				for _, name := range flagSetNames(t, fn, call.Args[0]) {
-					target := code
-
-					if prefix, wild := strings.CutSuffix(name, "*"); wild {
-						name, target = prefix, wildcards
-					}
-
-					if target[name] == nil {
-						target[name] = map[string]bool{}
+					if code[name] == nil {
+						code[name] = map[string]bool{}
 					}
 
 					for flag := range flags {
-						target[name][flag] = true
+						code[name][flag] = true
 					}
 				}
 
@@ -218,12 +244,22 @@ func declaredFlagSets(t *testing.T) (map[string]map[string]bool, map[string]map[
 		}
 	}
 
-	return code, wildcards
+	if read != calls {
+		t.Errorf("this package makes %d flag sets and the test read %d: make one as `fs := cli.NewFlagSet(...)` "+
+			"inside the function that parses it", calls, read)
+	}
+
+	if len(code) == 0 {
+		t.Fatal("the test read no flag set at all")
+	}
+
+	return code
 }
 
-// flagSetNames are the command paths a NewFlagSet name can be: a literal, a
-// literal concatenated with something (a wildcard on the literal), or a
-// variable given each of the literals the function assigns it.
+// flagSetNames are the command paths a NewFlagSet name can be: a literal, or a
+// variable given each of the literals the function assigns it and nothing
+// else. A name built at run time is refused, because the test could only guess
+// which commands it is.
 func flagSetNames(t *testing.T, fn *ast.FuncDecl, expr ast.Expr) []string {
 	t.Helper()
 
@@ -243,17 +279,11 @@ func flagSetNames(t *testing.T, fn *ast.FuncDecl, expr ast.Expr) []string {
 		}
 
 		return []string{full(s)}
-	case *ast.BinaryExpr:
-		if lit, ok := x.X.(*ast.BasicLit); ok {
-			s, err := strconv.Unquote(lit.Value)
-			if err != nil {
-				t.Fatalf("unquote %s: %v", lit.Value, err)
-			}
-
-			return []string{full(s) + "*"}
-		}
 	case *ast.Ident:
-		var names []string
+		var (
+			names []string
+			other bool
+		)
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			assign, ok := n.(*ast.AssignStmt)
@@ -262,20 +292,25 @@ func flagSetNames(t *testing.T, fn *ast.FuncDecl, expr ast.Expr) []string {
 			}
 
 			if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name == x.Name {
-				if lit, ok := assign.Rhs[0].(*ast.BasicLit); ok {
-					s, err := strconv.Unquote(lit.Value)
-					if err != nil {
-						t.Fatalf("unquote %s: %v", lit.Value, err)
-					}
+				lit, ok := assign.Rhs[0].(*ast.BasicLit)
+				if !ok {
+					other = true
 
-					names = append(names, full(s))
+					return true
 				}
+
+				s, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquote %s: %v", lit.Value, err)
+				}
+
+				names = append(names, full(s))
 			}
 
 			return true
 		})
 
-		if len(names) > 0 {
+		if len(names) > 0 && !other {
 			return names
 		}
 	}
@@ -298,8 +333,9 @@ var (
 // documentedCommands reads the reference's commands and the flags it
 // documents for each: a heading's command and its flag table (a column
 // "Applies to" limiting a row to some of the heading's commands), and a
-// table row's command with the flags its command cell names.
-func documentedCommands(t *testing.T) map[string]map[string]bool {
+// table row's command with the flags its command cell names. Every other
+// backticked command, in a sentence or a cell, is returned as a mention.
+func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 	t.Helper()
 
 	body, err := os.ReadFile("../../docs/reference/cli.md")
@@ -322,13 +358,45 @@ func documentedCommands(t *testing.T) map[string]map[string]bool {
 	}
 
 	var (
-		heading []string
-		applies bool
+		heading  []string
+		applies  bool
+		mentions []mention
+		fenced   bool
 	)
 
+	// mentioned records every backticked command in text the switch below did
+	// not read as a declaration.
+	mentioned := func(n int, text string) {
+		for _, m := range referenceCommand.FindAllStringSubmatch(text, -1) {
+			var flags []string
+			for _, f := range referenceFlag.FindAllStringSubmatch(m[1], -1) {
+				flags = append(flags, f[1])
+			}
+
+			mentions = append(mentions, mention{line: n, paths: commandPaths(m[1]), flags: flags})
+		}
+	}
+
+	n := 0
+
 	for line := range strings.Lines(string(body)) {
+		n++
 		line = strings.TrimRight(line, "\n")
-		cells := strings.Split(line, " | ")
+
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
+
+			continue
+		}
+
+		if fenced {
+			continue
+		}
+
+		var cells []string
+		if strings.HasPrefix(line, "|") {
+			cells = tableCells(line)
+		}
 
 		switch {
 		case strings.HasPrefix(line, "#") && strings.Contains(line, "`billet "):
@@ -337,36 +405,89 @@ func documentedCommands(t *testing.T) map[string]map[string]bool {
 			add(heading, m[1])
 		case strings.HasPrefix(line, "#"):
 			heading, applies = nil, false
-		case strings.HasPrefix(line, "| Flag | Applies to |"):
+		case len(cells) > 1 && cells[0] == "Flag" && cells[1] == "Applies to":
 			applies = true
-		case strings.HasPrefix(line, "| `billet"):
-			if m := referenceCommand.FindStringSubmatch(cells[0]); m != nil {
-				add(commandPaths(m[1]), cells[0])
+		case len(cells) > 0 && strings.HasPrefix(cells[0], "`billet "):
+			m := referenceCommand.FindStringSubmatch(cells[0])
+			if m == nil {
+				t.Errorf("the reference's command cell on line %d is not one backticked command", n)
+
+				continue
 			}
-		case strings.HasPrefix(line, "| `-") && heading != nil:
+
+			add(commandPaths(m[1]), cells[0])
+			mentioned(n, strings.Join(cells[1:], " | "))
+		case len(cells) > 0 && strings.HasPrefix(cells[0], "`-"):
+			if heading == nil {
+				t.Errorf("the reference's flag row on line %d is under no command's heading", n)
+
+				continue
+			}
+
 			paths := heading
 
-			if applies && len(cells) > 1 {
+			if applies {
 				paths = nil
 
-				for _, sub := range strings.Split(cells[1], ",") {
-					for _, path := range heading {
-						if strings.HasSuffix(path, " "+strings.TrimSpace(sub)) {
-							paths = append(paths, path)
-						}
-					}
+				if len(cells) < 2 {
+					t.Errorf("the reference's flag row on line %d has no Applies to cell", n)
 				}
 
-				if len(paths) == 0 {
-					t.Errorf("the reference's row %q applies to none of %v", line, heading)
+				for _, sub := range strings.Split(cells[min(1, len(cells)-1)], ",") {
+					found := false
+
+					for _, path := range heading {
+						if strings.HasSuffix(path, " "+strings.TrimSpace(sub)) {
+							paths, found = append(paths, path), true
+						}
+					}
+
+					if !found {
+						t.Errorf("the reference's row on line %d applies to %q, which is not one of %v",
+							n, strings.TrimSpace(sub), heading)
+					}
 				}
 			}
 
 			add(paths, cells[0])
+			mentioned(n, strings.Join(cells[1:], " | "))
+		default:
+			mentioned(n, line)
 		}
 	}
 
-	return docs
+	return docs, mentions
+}
+
+// tableCells splits a table row on its unescaped pipes; an escaped one (\|)
+// stays in its cell, as the renderer keeps it.
+func tableCells(line string) []string {
+	var (
+		cells []string
+		cell  strings.Builder
+	)
+
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "|")
+
+	for i := 0; i < len(line); i++ {
+		switch {
+		case line[i] == '\\' && i+1 < len(line) && line[i+1] == '|':
+			cell.WriteString(`\|`)
+			i++
+		case line[i] == '|':
+			cells = append(cells, strings.TrimSpace(cell.String()))
+			cell.Reset()
+		default:
+			cell.WriteByte(line[i])
+		}
+	}
+
+	if rest := strings.TrimSpace(cell.String()); rest != "" {
+		cells = append(cells, rest)
+	}
+
+	return cells
 }
 
 // commandPaths expands a documented command into the paths it names:

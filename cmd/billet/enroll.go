@@ -238,7 +238,13 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 // Approving by name alone approves whatever currently holds the name; approving
 // by fingerprint approves the machine whose key an operator actually compared.
 func cmdNodesDecide(ctx context.Context, args []string, decision string) (err error) {
-	fs := cli.NewFlagSet("billet nodes "+decision, os.Stdout)
+	// The command's own word, not the decision recorded: approve records approved.
+	command := "billet nodes approve"
+	if decision == alloc.EnrollDenied {
+		command = "billet nodes deny"
+	}
+
+	fs := cli.NewFlagSet(command, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	fingerprint := fs.String("fingerprint", "",
 		"the fingerprint you compared against the node's console (required)")

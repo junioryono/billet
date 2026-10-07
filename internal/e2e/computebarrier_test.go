@@ -115,10 +115,13 @@ func (s *stack) seal(t *testing.T) state.Admission {
 func (s *stack) awaitNothingOutstanding(t *testing.T) {
 	t.Helper()
 
-	deadline := time.Now().Add(30 * time.Second)
+	// THE DEADLINE BOUNDS THE READ TOO, so a stalled ledger fails here rather
+	// than hanging the test past it.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
 
 	for {
-		q, err := s.alloc.Quiescence(t.Context())
+		q, err := s.alloc.Quiescence(ctx)
 		if err != nil {
 			t.Fatalf("Quiescence: %v", err)
 		}
@@ -127,11 +130,11 @@ func (s *stack) awaitNothingOutstanding(t *testing.T) {
 			return
 		}
 
-		if time.Now().After(deadline) {
+		select {
+		case <-ctx.Done():
 			t.Fatalf("the ledger still holds leases: %+v", q.Outstanding)
+		case <-time.After(50 * time.Millisecond):
 		}
-
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
