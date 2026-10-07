@@ -1,6 +1,6 @@
 ---
 name: billet-state
-description: "Load when adding a migration or a query, touching internal/state, internal/state/queries, internal/alloc's or internal/rollout's SQL, sqlc.yaml, anything that opens the ledger (Open, OpenAdmin, OpenMaintenance, OpenPostgresStandby, OpenInspect), DB.Tx or DB.View, the locks and fences, the release watermark, or the controller claim, its epoch fence and the standby code in cmd/billet."
+description: "Load when adding a migration or a query, touching internal/state, internal/state/queries, internal/alloc's or internal/rollout's SQL, sqlc.yaml, anything that opens the ledger (Open, OpenAdmin, OpenMaintenance, OpenPostgresStandby, OpenInspect), DB.Tx or DB.View, the locks and fences, the release watermark, or the controller claim, its epoch fence and the standby code in internal/app's control plane."
 ---
 
 # The ledger
@@ -62,7 +62,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 - `internal/state/migrationfreeze_test.go` (`migrationsAreFrozen`, `TestNoShippedMigrationHasBeenEdited`), `migrationfiles_test.go`, `pgmigrations_test.go` (`TestEveryPostgresMigrationIsItsSQLiteTwinTranslated`, `TestMigrationVersionsAreDenseFromOne`).
 - `internal/state/queryset_test.go` (prepares every query, claims each by exactly one half, `BIGINT`, ASCII, no wildcard), `rawsqlallowlist_test.go`, `faultdriver_test.go`.
 - `internal/state/deploymentlock_process_test.go` (a real second process), `controller_test.go`, `postgresbackend_test.go` (gated by `BILLET_TEST_POSTGRES_DSN`).
-- `cmd/billet/promotionorder_test.go`, `claim_test.go`, `leadershipwiring_test.go`, `adminlock_test.go`.
+- `cmd/billet/claim_test.go`, `standbystop_test.go`, `adminlock_test.go`; `internal/app/proofs_test.go`, `leadershipwiring_test.go`.
 
 ## Related skills
 

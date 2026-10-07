@@ -25,3 +25,10 @@ ce3a77f40d30 The node wire's serving moved to internal/app (#356 Phase 3c); the 
 0e98df881bc6 The shared-authority adopt and publish moved to internal/app (#356 Phase 3c); the list now names internal/app/identitystore.go and cmd/billet/authoritypublish.go.
 75414c595d0a The rollout wiring moved to internal/app (#356 Phase 3c); the sentence now names internal/app/rolloutwiring.go, app.ResolveTarget and app.ReleasePolicyFor.
 7e3737dd450f The credential sweep moved to internal/app (#356 Phase 3c); its test is now internal/app/credentialsweep_test.go beside cmd/billet's status test.
+08c7326d283e The control plane's order moved into internal/app's types (#356 Phase 3c); the test list now names internal/app/proofs_test.go.
+1f98dd27249d stopWhenReplaced moved to internal/app, started by BecomeController (#356 Phase 3c); the sentence says so.
+66470f78ab92 The order and leadership-wiring tests moved to internal/app (#356 Phase 3c); the list now names where each lives.
+6710f1bd7ad0 promotionorder_test.go was replaced by internal/app's proofs and rollout-starter tests (#356 Phase 3c).
+adbfe22c58a4 The rollout-starter wiring test moved to internal/app, over Controller.Run (#356 Phase 3c).
+d4dec390aea4 The standby is the control plane stopped at BecomeController, its order now internal/app's types (#356 Phase 3c); the sentence says so.
+deedfda57b81 The two runServer order tests were replaced by TestOnlyTheProvingStepsMakeTheirProofs (#356 Phase 3c).

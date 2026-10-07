@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -68,7 +68,8 @@ func TestTheLeadershipWatcherReturnsOnAnOrdinaryShutdown(t *testing.T) {
 // PROVING THE MECHANISM IS NOT PROVING IT IS USED, and this is the one seam no
 // package-local test can reach. internal/state latches the fact, internal/server
 // acts on it, and both are tested where they live — but the only thing that
-// joins them is one argument in this file. Delete it and every suite stays
+// joins them is one argument in this package (Controller.Run), and one watcher
+// (ControlPlane.BecomeController). Delete it and every suite stays
 // green while a replaced control plane goes back to destroying compute, closing
 // the deployment's message session and handing capacity back on its way out.
 //
@@ -104,7 +105,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Name.Name != "runServer" {
+			if !ok || fn.Recv == nil || (fn.Name.Name != "Run" && fn.Name.Name != "BecomeController") {
 				continue
 			}
 
@@ -143,8 +144,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 					return true
 				}
 
-				recv, ok := arg.X.(*ast.Ident)
-				if !ok || recv.Name != "db" {
+				if !isLedger(arg.X) {
 					return true
 				}
 
@@ -156,7 +156,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 
 	if len(found) == 0 {
-		t.Error("runServer does not pass the ledger's LeadershipLost to " +
+		t.Error("Controller.Run does not pass the ledger's LeadershipLost to " +
 			"server.WithLeadershipLost.\n" +
 			"Without it a control plane that has been replaced tears down normally: it " +
 			"destroys the compute its completions asked for, closes this deployment's " +
@@ -166,7 +166,7 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 
 	if len(watched) == 0 {
-		t.Error("runServer does not watch the ledger's LeadershipLostSignal through " +
+		t.Error("BecomeController does not watch the ledger's LeadershipLostSignal through " +
 			"stopWhenReplaced.\n" +
 			"Refusing a write is not stopping a process: nothing here treats an " +
 			"unclassifiable error as a reason to stop, so a replaced controller would " +
@@ -176,8 +176,8 @@ func TestTheServerIsGivenTheLedgersLeadershipCheck(t *testing.T) {
 	}
 }
 
-// signalsTheLedger reports whether a stopWhenReplaced call is watching
-// db.LeadershipLostSignal() rather than some other channel.
+// signalsTheLedger reports whether a stopWhenReplaced call is watching the
+// ledger's LeadershipLostSignal() rather than some other channel.
 func signalsTheLedger(call *ast.CallExpr) bool {
 	for _, arg := range call.Args {
 		inner, ok := arg.(*ast.CallExpr)
@@ -190,10 +190,23 @@ func signalsTheLedger(call *ast.CallExpr) bool {
 			continue
 		}
 
-		if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "db" {
+		if isLedger(sel.X) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// isLedger reports whether expr is the ledger this control plane writes
+// through: the db field of its ControlPlane, or a variable named db.
+func isLedger(expr ast.Expr) bool {
+	switch x := expr.(type) {
+	case *ast.Ident:
+		return x.Name == "db"
+	case *ast.SelectorExpr:
+		return x.Sel.Name == "db"
+	default:
+		return false
+	}
 }

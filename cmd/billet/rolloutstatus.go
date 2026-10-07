@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"unicode"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -270,7 +271,7 @@ func escapeControl(s string) string {
 // misses some shapes (measured 2026-10-04).
 func ledgerDSNFrom(cfg *config.Config, environmentFile string) (state.DSN, error) {
 	if environmentFile == "" {
-		return ledgerDSN(cfg)
+		return app.LedgerDSN(cfg)
 	}
 
 	postgres := cfg.Server != nil && cfg.Server.LedgerBackend() == config.StatePostgres

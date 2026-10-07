@@ -46,15 +46,11 @@ import (
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/provider/tart"
-	"github.com/junioryono/billet/internal/releasesource"
-	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/scaleset"
-	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	storecontract "github.com/junioryono/billet/internal/store"
 	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/store/ebss3"
-	"github.com/junioryono/billet/internal/supervise"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -497,24 +493,13 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
-// controllerName is what this process calls itself in the controller claim.
 //
-// A DIAGNOSTIC, NOT AN IDENTITY. Nothing compares it and nothing decides from
-// it; what excludes a second controller is a lock. It exists so a refusal can
-// tell an operator with two machines which one to go and stop, which "already
-// claimed" cannot.
-func controllerName(cfg *config.Config) string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		// The identity directory is the fallback because it is stable and
-		// already in the operator's config. A blank holder would make the
-		// refusal say nothing at all.
-		return cfg.Server.IdentityDir
-	}
-
-	return fmt.Sprintf("%s (pid %d)", host, os.Getpid())
-}
-
+// THE ORDER IS THE TYPES': internal/app's control plane hands out a Controller
+// only from BecomeController, and the node wire only to a controller that has
+// forgotten the fleet and adopted the authority, so a step moved above the claim
+// does not compile. What stays here is how the process was invoked: the
+// scale-set clients, the probe's hold, the signals, and what exit status a stop
+// earns.
 func runServer(
 	ctx context.Context,
 	lc *lifecycle,
@@ -529,75 +514,14 @@ func runServer(
 		return err
 	}
 
-	serverTargets, planeJIT, err := app.BuildTargets(targets)
+	cp, err := app.OpenControlPlane(ctx, cfg, serverHost(), targets,
+		app.ControlPlaneOptions{Probe: upgradeProbe})
 	if err != nil {
 		return err
 	}
 
-	// READ, NOT CLAIMED. The host-wide lock exists to stop two processes managing
-	// one deployment's containers, and a control plane manages none — the node
-	// takes that lock. A server that took it too would be holding the identity a
-	// co-resident node needs, which is the single-machine deployment refusing to
-	// start.
-	//
-	// The identity itself is still required: the node wire refuses a node whose
-	// deployment differs from this plane's, so a server that never learned its
-	// own would compare every node against "" and refuse the entire fleet — the
-	// feature failing closed for a reason nobody could see.
-	//
-	// FOUNDED HERE IN THE ORDINARY CASE, before the database is opened. Whichever
-	// role starts first mints it; the other reads that same file.
-	// THE EXCLUSION AROUND THE IDENTITY READ AND THE OPEN, released before the
-	// claim's wait (a standby can wait for days, and a backup must not wait with
-	// it) and taken again after promotion around the authority load.
-	acc, err := serverIdentityAccess(ctx, cfg.Server.IdentityDir)
-	if err != nil {
-		return err
-	}
+	defer cp.Close()
 
-	deployment, err := state.DeploymentID(cfg.Server.IdentityDir)
-	if err != nil {
-		return errors.Join(err, acc.Release())
-	}
-
-	// A STANDBY OPENS A HANDLE THAT CANNOT WRITE, which is what makes "does
-	// nothing authoritative before promotion" a property of the store rather than
-	// a rule this function has to keep. See state.OpenPostgresStandby.
-	standby := !upgradeProbe && cfg.Server.Controllers == config.ControllersActivePassive
-
-	var db *state.DB
-
-	switch {
-	case upgradeProbe:
-		db, err = openStateMaintenance(ctx, cfg)
-	case standby:
-		db, err = openStateStandby(ctx, cfg)
-	default:
-		db, err = openState(ctx, cfg)
-	}
-
-	// THE ACCESS ENDS WITH THE OPEN, whatever the open said: what follows waits
-	// on the claim, and nothing waits on a lock while it does.
-	if err := errors.Join(err, acc.Release()); err != nil {
-		return fmt.Errorf("server state: %w", err)
-	}
-
-	defer db.Close()
-
-	// BUILT BEFORE THE CLAIM, DELIBERATELY, because it validates the CONFIG and
-	// reaches the ledger for nothing. A tier the catalogue refuses, a missing
-	// ceiling or a host policy that contradicts itself should stop this process at
-	// startup rather than at a failover, which is the one moment nobody wants to
-	// discover a config error.
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
-	if err != nil {
-		return fmt.Errorf("capacity allocator: %w", err)
-	}
 	if upgradeProbe {
 		if err := notifyReady(); err != nil {
 			return fmt.Errorf("server upgrade-probe readiness: %w", err)
@@ -611,266 +535,52 @@ func runServer(
 	// releases escrowed capacity — see the listener's deferred release. A hard
 	// kill skips that and leaves the reaper to expire it.
 	//
-	// AND IT IS INSTALLED BEFORE THE CLAIM, because a standby may wait here for
+	// AND IT IS INSTALLED BEFORE THE CLAIM, because a standby may wait there for
 	// days and an operator stopping one must not have to kill it.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// THE CONTROLLER CLAIM, BEFORE ANYTHING POLLS GITHUB OR DISPATCHES A NODE.
 	//
-	// The exclusive lock on the state directory excludes a second control plane
-	// on THIS HOST, which is the whole of the problem while the ledger is a file
-	// and half of it once the ledger is a database two machines can reach. This
-	// is the other half, and its position is the point: a claim taken after the
-	// listeners are up is a claim taken after two controllers have both admitted
-	// work.
-	//
-	// EVERYTHING AUTHORITATIVE IS BELOW THIS LINE, and that is the whole of the
-	// standby design. There is no second implementation of a control plane: a
-	// standby is this same function, stopped here until it can go on.
 	// A STOP WHILE THIS HOST IS STILL TRYING IS A STOP, NOT A FAILURE. See
 	// stoppedBeforeTheClaim: exiting non-zero here left systemd holding a failed
 	// unit for a standby that was asked to stop, and `billet server retire`
 	// refuses to act against one.
-	if err := becomeController(ctx, cfg, db, deployment, standby); err != nil {
+	ctl, err := cp.BecomeController(ctx, stop)
+	if err != nil {
 		// THE FENCE IS READ AFTER THE ATTEMPT, not beside it: the claim's own
 		// write is one a successor can refuse.
-		return stoppedBeforeTheClaim(ctx, db.LeadershipLost(), err)
+		return stoppedBeforeTheClaim(ctx, cp.LeadershipLost(), err)
 	}
 
-	// THE LOOPS BESIDE THE PLANE ARE JOINED BEFORE THIS RETURNS, and so before
-	// the ledger they write closes: the deferred Wait runs ahead of db.Close.
-	loops := supervise.New(ctx, slog.Default())
-	defer loops.Wait()
+	// THE LOOPS ARE JOINED BEFORE THE LEDGER CLOSES: this runs ahead of cp.Close.
+	defer ctl.Close()
 
-	// AND A LOST CLAIM STOPS THEM THE SAME WAY, WHICH IS THE HALF THAT REFUSING A
-	// WRITE DOES NOT DO. See stopWhenReplaced.
-	loops.Background("controller fence", func(ctx context.Context) {
-		stopWhenReplaced(ctx, db.LeadershipLostSignal(), stop, slog.Default())
-	})
-
-	// THE DEPLOYMENT'S AUTHORITY, BEFORE ANYTHING READS ONE.
-	//
-	// app.ServeNodeWire's single authority read goes through LoadOrCreateCA, which
-	// CREATES one when the directory is empty. On a promoted standby that has
-	// never held this deployment's CA that would mint a RIVAL authority, after
-	// which every node in the fleet fails to verify the control plane and drops
-	// off at once — while the control plane itself looks perfectly healthy. This
-	// is what makes a failover a failover rather than an outage.
-	//
-	// A NO-OP unless this deployment keeps its identity in a store.
-	if err := app.AdoptSharedAuthority(ctx, cfg, authorityLockAccess, deployment, slog.Default()); err != nil {
-		return fmt.Errorf("node-wire authority: %w", err)
-	}
-
-	// Everything billet.yaml says about the control plane, assembled in one place
-	// inside the server package so the config-to-listener chain is testable
-	// without spanning two packages. Whatever this command adds below is about
-	// how it was INVOKED — a flag, a co-resident node — not about the file.
-	opts, err := server.OptionsFromConfig(cfg)
+	adopted, err := ctl.AdoptAuthority(ctx)
 	if err != nil {
 		return err
 	}
 
-	// The second signal, reaching the drain that honours it.
-	//
-	// AND THE FENCE, REACHING THE TEARDOWN THAT HONOURS IT. `db.LeadershipLost`
-	// latches inside the write transaction the ledger refused, so by the time any
-	// listener is unwinding it is already true — which is what lets every one of
-	// them stop without destroying compute, closing a session or handing capacity
-	// back to a deployment that is no longer theirs.
-	//
-	// AND A STOP WHILE ADMISSION IS OPEN IS A RESTART, handed over rather than
-	// drained (#365): `billet drain` and `local down` seal first and still drain.
-	opts = append(opts, server.WithHurry(lc.hurry), server.WithLeadershipLost(db.LeadershipLost),
-		server.WithCompletionLedger(db), server.WithTargets(serverTargets...),
-		server.WithStopHandoff())
-
-	if dryRun {
-		opts = append(opts, server.AdvertiseNothing())
-
-		fmt.Printf("billet server (DRY RUN): %d tiers, advertising ZERO capacity.\n", len(cfg.Tiers))
-		fmt.Printf("Scale sets are created and polled; no job will be accepted.\n")
-	} else {
-		fmt.Printf("billet server: %d tiers, ceiling %d vCPU / %s\n",
-			len(cfg.Tiers), cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	fleet, err := ctl.ForgetFleet(ctx)
+	if err != nil {
+		return err
 	}
 
-	// The owner identifies this process to GitHub's message queue so a session
-	// left by a crashed run is distinguishable from a live one.
-	owner, err := os.Hostname()
-	if err != nil || owner == "" {
-		owner = "billet"
-	}
-
-	// NOTHING IS LIVE UNTIL IT SAYS SO AGAIN, and this has to happen BEFORE
-	// anything registers.
-	//
-	// Liveness is the plane's judgement and this plane has just started, so it has
-	// none: its map is empty. Rows left by the previous process would otherwise
-	// back advertisements for machines this one has never heard from.
-	//
-	// Every node re-registers over the wire within a poll, so the cost is a brief
-	// zero that is also the truth. That was NOT true while --dev ran a node in
-	// this process: it registered straight into the ledger and never dialled the
-	// wire, so a sweep after it registered marked it dead with no second chance —
-	// the colocated runner advertised zero forever, on the one deployment shape
-	// with no other machine to fall back on. Deleting that path deleted the
-	// ordering hazard with it.
-	if err := allocator.ForgetEveryNode(ctx); err != nil {
-		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
-	}
-
-	// THE NODE WIRE IS SERVED WHETHER OR NOT ANY NODE EXISTS YET.
-	//
-	// A control plane that only opened its listener once a node was configured
-	// would make the first node's setup a chicken-and-egg problem, and there is
-	// nothing to guard: an empty fleet answers every request with "I do not know
-	// you".
-	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL(),
-		nodeplane.WithRegistrar(allocator),
-		// The declared places, so a node claiming one nobody declared is refused
-		// here rather than recorded. A node's own config cannot make this check —
-		// sites are the control plane's to declare and the node's file has no
-		// reason to list them.
-		nodeplane.WithSites(cfg.Sites),
-		// The catalogue lives here, and a launch carries the shape a node needs, so
-		// no node keeps a copy that can drift from this one.
-		nodeplane.WithTierCatalog(cfg.Tiers),
-		// The durable half of a compute barrier. `billet drain` and
-		// `billet local down` write a request into the ledger; this is what
-		// observes it, because a sealed idle deployment dispatches nothing at all
-		// and there is no other moment at which the fleet would be asked.
-		nodeplane.WithBarrierStore(allocator))
-
-	wire, err := app.ServeNodeWire(ctx, cfg, serverWireAccess, nodes, allocator,
-		planeJIT, allocator, allocator, db)
+	wire, err := ctl.ServeWire(ctx, fleet, adopted)
 	if err != nil {
 		return err
 	}
 
 	defer wire.Stop()
 
-	// AND THE AUTHORITY GOES INTO THE STORE, now that there certainly is one.
-	//
-	// AFTER THE WIRE RATHER THAN BEFORE IT, because on a first controller the wire
-	// is what creates the authority: publishing earlier would publish nothing. On
-	// every later start the bytes are identical and this is a write nobody sees.
-	//
-	// NOT FATAL, and reported rather than swallowed: the control plane is serving
-	// by now, and a store that cannot be written is a reason to look at IAM rather
-	// than to take a working deployment offline. What it costs is that the other
-	// controller has nothing to adopt.
-	app.PublishSharedAuthority(ctx, cfg, authorityLockAccess, deployment, slog.Default())
+	ctl.PublishAuthority(ctx, wire)
 
-	// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness now decides what its
-	// tier advertises, and an idle deployment never launches, lists or destroys —
-	// so without this a host that crashed on a quiet afternoon would keep its
-	// capacity advertised until somebody happened to need it.
-	loops.Background("node liveness", func(ctx context.Context) { nodes.Watch(ctx) })
+	err = ctl.Run(ctx, wire, app.RunOptions{Hurry: lc.hurry, DryRun: dryRun})
 
-	// AND A SECOND ONE, for the same reason. A drain asks the fleet what it is
-	// running through a durable request row, because the command that wants the
-	// answer runs in another process; nothing on a sealed, idle deployment would
-	// otherwise ever put that question to a node.
-	loops.Background("compute barrier", func(ctx context.Context) { nodes.BarrierLoop(ctx) })
-
-	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A
-	// control plane without it serves the node wire, accepts registrations, and then
-	// never sends a single command.
-	planeRunner := nodes.NewRunner()
-
-	// AND THE ROLLOUT COORDINATOR, which is what makes `billet rollout start` mean
-	// anything: without it the decision is a durable record nobody acts on, so
-	// every rollout stays open forever and blocks the next one.
-	//
-	// GIVEN THE NODE PLANE'S RUNNER, because that is the only thing that can reach
-	// a host. It is wired here rather than inside server.New for the same reason
-	// the runner is: what a control plane can talk to is a property of how this
-	// process was assembled, not of the scheduler.
-	coordinator := rollout.NewCoordinator(
-		rollout.New(db),
-		app.LedgerFleet{Alloc: allocator},
-		app.PlaneDispatcher{Runner: planeRunner},
-		version.Version(),
-		nodeapi.VersionNodeUpgrade,
-		rollout.WithCoordinatorLogger(slog.Default()),
-	)
-
-	// AND THE STARTER, which is what makes `release.automatic` true: the
-	// coordinator converges a rollout that exists, and this is what makes one
-	// exist when the channel advances. It resolves the channel through the same
-	// functions `billet rollout start` does, so the two cannot disagree about
-	// what a target is.
-	starter, err := app.NewRolloutStarter(cfg, rollout.New(db), app.LedgerFleet{Alloc: allocator},
-		releasesource.Host(version.Version(),
-			releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
-			state.LatestSchemaVersion(), firecracker.GuestContract))
-	if err != nil {
+	// A FENCED CONTROLLER'S ERROR IS ITS OWN, never a GitHub access problem to
+	// explain: Run already says what happened and what a restart does.
+	if cp.LeadershipLost() {
 		return err
-	}
-
-	opts = append(opts,
-		server.WithNodeRunner(planeRunner),
-		server.WithRolloutCoordinator(coordinator, 0),
-		server.WithRolloutStarter(starter, 0),
-		// AND THE SWEEP OF STAGED CODEBUILD REGISTRATIONS a dead node never reaped.
-		// Wired here because it needs what only this process has: the ledger, which
-		// is the sole authority for deleting one, and the host's AWS credentials —
-		// the same chain the backup upload uses. Which paths it sweeps comes from
-		// the fleet's registrations, so a deployment with no codebuild node sweeps
-		// nothing and resolves no credential.
-		server.WithStagedCredentialSweeper(
-			app.NewControllerCredentialSweep(allocator, db, awscreds.Default(), slog.Default())),
-	)
-
-	plane := server.New(allocator, nil, cfg.Tiers, owner, slog.Default(), opts...)
-
-	// READINESS IS REPORTED BEFORE THE LISTENERS OPEN THEIR SESSIONS, AND MOVING IT
-	// AFTER THEM WOULD BE A RESTART LOOP.
-	//
-	// A tier's session can now be held by a control plane that was killed rather
-	// than stopped, and GitHub does not hand one over: server.openSession waits for
-	// GitHub to expire it, which takes as long as it takes. The unit is
-	// Type=notify with TimeoutStartSec=120 and Restart=on-failure, so withholding
-	// READY=1 until every session is open means systemd kills billet at two
-	// minutes, restarts it, and it waits again — forever, because nothing about
-	// restarting makes a remote session expire sooner. That is strictly worse than
-	// a control plane that is up: the node wire would go down with it on every
-	// cycle, and with it the registrations and heartbeats that hold running
-	// compute.
-	//
-	// SO READINESS MEANS "THIS PROCESS IS SERVING", WHICH IS TRUE. The node wire is
-	// listening, the reaper is running, and every tier whose session opened is
-	// polling. A tier still waiting says so in the journal every thirty seconds,
-	// which is what `systemctl status` shows — the absence is visible where an
-	// operator looks, rather than being converted into a unit that cannot start.
-	if err := notifyReady(); err != nil {
-		return fmt.Errorf("server readiness: %w", err)
-	}
-	// A LOST LEADERSHIP EXITS NON-ZERO, AND THE RESTART THAT FOLLOWS IS THE POINT
-	// RATHER THAN A LOOP TO BE AVOIDED.
-	//
-	// The packaged unit is Restart=on-failure, so systemd starts this process
-	// again and ClaimController either takes the deployment back — which is
-	// exactly right when the successor was itself transient, a session dropped by
-	// a pooling proxy or a database failover — or is refused with ErrControllerHeld
-	// naming the holder and its epoch. That refusal repeating every RestartSec is
-	// a real misconfiguration being reported, and it is the reason billet does not
-	// exit 0 here: a clean exit would leave a deployment whose partition has
-	// healed with no controller at all, silently, which is the failure this whole
-	// fence exists to make impossible.
-	err = plane.Run(ctx)
-
-	// ASKED BEFORE THE ERROR IS CLASSIFIED, and asked at all because the plane
-	// stops through a CANCELLED CONTEXT here, which Run reports as a clean stop.
-	// Returning nil would exit 0 — a control plane that was fenced out of its own
-	// deployment reporting a successful shutdown, and systemd leaving it stopped.
-	if db.LeadershipLost() {
-		return fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
-			"handed back; the controller that replaced this one adopts both. If that "+
-			"replacement was itself transient, restarting is how this host takes the "+
-			"deployment back", state.ErrLeadershipLost)
 	}
 
 	if err != nil {
@@ -880,6 +590,19 @@ func runServer(
 	fmt.Println("billet server: stopped")
 
 	return nil
+}
+
+// serverHost is what the control plane takes from this process and machine:
+// the identity exclusions the host authority provides, the service manager's
+// notifications, and stdout for the lines an operator reads.
+func serverHost() app.Host {
+	return app.Host{
+		ServerAccess:  serverWireAccess,
+		AuthorityLock: authorityLockAccess,
+		Ready:         notifyReady,
+		Status:        notifyStatus,
+		Out:           os.Stdout,
+	}
 }
 
 // serverHostname is the name a node checks its control plane's certificate

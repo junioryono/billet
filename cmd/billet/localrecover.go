@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/state"
@@ -391,7 +392,7 @@ func sealRecoveredDeployment(ctx context.Context, cfg *config.Config, o recoverO
 	// the typed crossing, and it takes the directory lock, which Execute has by
 	// now released. It also migrates, which is what the next `billet server`
 	// start would do to an older archive's ledger anyway.
-	db, err := openStateMaintenance(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
 	if err != nil {
 		return recoveredButOpen(fmt.Errorf("open the restored ledger to seal it: %w", err))
 	}

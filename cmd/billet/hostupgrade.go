@@ -2047,7 +2047,7 @@ func (h *ledgerHost) SnapshotLedger(ctx context.Context, dest string) error {
 	// The typed entry is the authorised crossing: it exists precisely so
 	// fence-crossing comes from code that KNOWS it is the transaction, rather than
 	// from an ambient environment variable any inherited shell could carry.
-	db, err := openStateMaintenance(ctx, h.cfg)
+	db, err := app.OpenLedger(ctx, h.cfg, app.LedgerMaintenance)
 	if err != nil {
 		return fmt.Errorf("open the ledger to snapshot it: %w", err)
 	}
