@@ -584,3 +584,42 @@ func TestTheServedWireCarriesTheFleetOntoTheNewAuthority(t *testing.T) {
 func noIdentityAccess(context.Context, string) (func() error, error) {
 	return func() error { return nil }, nil
 }
+
+// A REFUSAL RELEASES THE IDENTITY ACCESS IT TOOK. A wildcard listen address
+// with no node_tls_hosts says nothing about the name a node dials, so the wire
+// refuses to start; the exclusion it took around the authority read is given
+// back on that path too, or the next command on this host waits on a lock no
+// process will release.
+func TestARefusedNodeWireReleasesItsIdentityAccess(t *testing.T) {
+	t.Parallel()
+
+	var taken, released int
+
+	access := func(context.Context, string) (func() error, error) {
+		taken++
+
+		return func() error {
+			released++
+
+			return nil
+		}, nil
+	}
+
+	cfg := &config.Config{Server: &config.ServerConfig{Listen: "0.0.0.0:0", IdentityDir: t.TempDir()}}
+
+	wire, err := ServeNodeWire(t.Context(), cfg, access,
+		nodeplane.New(slog.New(slog.DiscardHandler), "0123456789abcdef0123456789abcdef", time.Minute),
+		nil, nil, nil, nil, nil)
+	if err == nil {
+		wire.Stop()
+		t.Fatal("a wildcard listen address with no node_tls_hosts was served")
+	}
+
+	if !strings.Contains(err.Error(), "node_tls_hosts") {
+		t.Errorf("the refusal does not name what to set: %v", err)
+	}
+
+	if taken != 1 || released != 1 {
+		t.Errorf("the identity access was taken %d times and released %d, want once each", taken, released)
+	}
+}

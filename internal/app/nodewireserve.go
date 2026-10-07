@@ -226,16 +226,16 @@ func ServeNodeWire(
 
 	if !loopback {
 		if hosts, err = nodeTLSHosts(cfg); err != nil {
-			return nil, err
+			return nil, errors.Join(err, release())
 		}
 	}
 
 	// ASSEMBLED BY BuildNodeWire, NOT HERE, AND IT HANDS BACK THE HANDLER
 	// RATHER THAN THE PIECES. What the server presents, what it accepts and what
 	// renewal signs with are three answers that must describe one moment and one
-	// authority — and this file is excluded from coverage and takes six
-	// collaborators to stand up, so nothing here can be asserted. Returning the
-	// options and installing them from this file was the first attempt and had
+	// authority — and this function takes six collaborators to stand up, so
+	// little here is asserted directly. Returning the options and installing them
+	// from the caller was the first attempt and had
 	// the same shape as the bug it fixed: deleting the line that installed them
 	// left every test green.
 	wire, err := BuildNodeWire(NodeWireRequest{
