@@ -263,10 +263,10 @@ func TestALockHeldOutsideThisRunsAncestryIsWaitedFor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
-	path, takes := recordTakes(t)
+	recorder, takes := recordTakes(t)
 
 	stale := exec.CommandContext(ctx, "./with-check-lock.sh", lock, "sh", "-c", `cat "$1" > "$2"`, "stale", trace, seen)
-	stale.Env = scriptEnv(path, fmt.Sprintf("DEV_GATE_LOCK_HELD=%d:%s", holder.Process.Pid, lock))
+	stale.Env = scriptEnv(append(recorder, fmt.Sprintf("DEV_GATE_LOCK_HELD=%d:%s", holder.Process.Pid, lock))...)
 	inGroup(stale)
 
 	stderr, err := stale.StderrPipe()
@@ -396,31 +396,49 @@ func TestANestedRunThatCannotReadItsAncestryRunsUnlocked(t *testing.T) {
 	}
 }
 
-// AN INHERITED ERREXIT DOES NOT STOP THE COMMAND: bash takes errexit from an
-// exported SHELLOPTS, and several of the script's statuses are answers rather
-// than failures (measured on macOS's /bin/sh, 2026-10-06: without the script's
-// own `set +e` it exited 1 and never ran the command). dash ignores SHELLOPTS,
-// so on Linux this passes either way.
-func TestAnInheritedErrexitStillRunsTheCommand(t *testing.T) {
+// AN INHERITED ERREXIT NEITHER STOPS THE SCRIPT NOR IS TAKEN FROM THE COMMAND.
+// bash takes errexit from an exported SHELLOPTS, so a status the script reads
+// as an answer would end it (measured on macOS's /bin/sh, 2026-10-06: exit 1,
+// the command never run), and a `set +e` to prevent that rewrites the
+// SHELLOPTS the command inherits, so a command relying on errexit went green.
+// The command under the lock must behave exactly as it does run directly. dash
+// ignores SHELLOPTS, so on Linux both runs simply agree.
+func TestAnInheritedErrexitReachesTheCommandUnchanged(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
 	dir := t.TempDir()
-	runs := filepath.Join(dir, "runs")
+	command := []string{"sh", "-c", `echo ran >> "$1"; false; echo "carried on" >> "$1"`, "command"}
 
-	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(dir, "check.lock"),
-		"sh", "-c", `echo ran >> "$1"; exit 4`, "command", runs)
-	cmd.Env = scriptEnv("SHELLOPTS=errexit")
+	run := func(name string, argv ...string) (int, string) {
+		runs := filepath.Join(dir, name)
 
-	out, err := cmd.CombinedOutput()
+		cmd := exec.CommandContext(t.Context(), argv[0], append(argv[1:], runs)...)
+		cmd.Env = scriptEnv("SHELLOPTS=errexit")
 
-	exitErr, ok := errors.AsType[*exec.ExitError](err)
-	if !ok || exitErr.ExitCode() != 4 {
-		t.Fatalf("a run under SHELLOPTS=errexit: %v (%s), want the command's exit status 4", err, out)
+		out, err := cmd.CombinedOutput()
+
+		code := 0
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+			code = exitErr.ExitCode()
+		} else if err != nil {
+			t.Fatalf("%s: %v (%s)", name, err, out)
+		}
+
+		got, err := os.ReadFile(runs)
+		if err != nil {
+			t.Fatalf("%s: the command never ran: %v (%s)", name, err, out)
+		}
+
+		return code, string(got)
 	}
 
-	if got, err := os.ReadFile(runs); err != nil || string(got) != "ran\n" {
-		t.Errorf("the command ran %q (%v), want once", got, err)
+	directCode, direct := run("direct", command...)
+	lockedCode, locked := run("locked", append([]string{"./with-check-lock.sh", filepath.Join(dir, "check.lock")}, command...)...)
+
+	if lockedCode != directCode || locked != direct {
+		t.Errorf("under SHELLOPTS=errexit the locked command exited %d having written %q; run directly it exited %d having written %q",
+			lockedCode, locked, directCode, direct)
 	}
 }
 
@@ -445,6 +463,83 @@ func TestALockPathWithANewlineRunsUnlocked(t *testing.T) {
 
 	if !strings.Contains(string(out), "holds a newline") {
 		t.Errorf("the run did not say why it went unlocked: %q", out)
+	}
+}
+
+// SOMETHING OTHER THAN A FILE WHERE THE LOCK GOES IS NOT OPENED: a FIFO's open
+// waits for a writer, so the probe would hang and the command never run. The
+// run goes ahead unlocked and says so. Bounded on its own, because the failure
+// is that wait.
+func TestALockPathThatIsAFIFORunsUnlocked(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	lock := filepath.Join(t.TempDir(), "check.lock")
+	if err := syscall.Mkfifo(lock, 0o600); err != nil {
+		t.Fatalf("make a FIFO where the lock goes: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "./with-check-lock.sh", lock, "sh", "-c", "exit 9")
+	cmd.Env = scriptEnv()
+	inGroup(cmd)
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 9 {
+		t.Fatalf("a FIFO where the lock goes: %v (%s), want the command's exit status 9", err, out)
+	}
+
+	if !strings.Contains(string(out), "not a regular file") {
+		t.Errorf("the run did not say why it went unlocked: %q", out)
+	}
+}
+
+// A COMMAND ENDED BY A SIGNAL REPORTS THE SHELL'S 128+N under the lock, as it
+// does run directly: macOS lockf reports any signalled child as 70, so the
+// command runs as the child of a shell that exits with its status.
+func TestACommandEndedByASignalReportsItsOwnStatus(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(t.TempDir(), "check.lock"),
+		"sh", "-c", `kill -TERM $$`)
+	cmd.Env = scriptEnv()
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 128+int(syscall.SIGTERM) {
+		t.Fatalf("a command ended by SIGTERM: %v (%s), want exit status %d", err, out, 128+int(syscall.SIGTERM))
+	}
+}
+
+// A DIAGNOSTIC NAMING A PATH PRINTS THE PATH: echo in dash, and in macOS's
+// /bin/sh, reads a backslash sequence as an escape, and \c ends the output
+// there.
+func TestADiagnosticPrintsAPathWithABackslashWhole(t *testing.T) {
+	t.Parallel()
+
+	// One file name holding a backslash, not two path elements.
+	name := `cut\cshort`
+	blocker := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatalf("write a file to stand where a directory must go: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(blocker, "sub", "check.lock"), "true")
+	cmd.Env = scriptEnv()
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a run beside a lock that cannot be made: %v (%s)", err, out)
+	}
+
+	if !strings.Contains(string(out), filepath.Join(blocker, "sub")+", so this run is not serialised") {
+		t.Errorf("the diagnostic did not carry the path whole: %q", out)
 	}
 }
 
@@ -515,11 +610,11 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 
 	waitForLockFile(t, trace, "the first run never started its command")
 
-	path, takes := recordTakes(t)
+	recorder, takes := recordTakes(t)
 
 	second := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock,
 		"sh", "-c", `cat "$1" > "$2"`, "second", trace, seen)
-	second.Env = scriptEnv(path)
+	second.Env = scriptEnv(recorder...)
 
 	stderr, err := second.StderrPipe()
 	if err != nil {
@@ -612,8 +707,9 @@ func waitForLockFile(t *testing.T, path, msg string) {
 // of PATH: it appends a line to the returned file for every blocking take (any
 // call that is not the probe's -t 0 or -n) and then runs the real tool, so a
 // test can wait until a run is waiting in the lock rather than until it has
-// said it will. It returns the PATH entry for the run's environment.
-func recordTakes(t *testing.T) (string, string) {
+// said it will. It returns the run's environment entries; the stand-in reads
+// both paths from them, so no path is ever quoted into its source.
+func recordTakes(t *testing.T) ([]string, string) {
 	t.Helper()
 
 	tool := "lockf"
@@ -628,14 +724,18 @@ func recordTakes(t *testing.T) (string, string) {
 
 	dir := t.TempDir()
 	takes := filepath.Join(dir, "takes")
-	shim := fmt.Sprintf("#!/bin/sh\ncase \" $* \" in *\" -t 0 \"*|*\" -n \"*) ;; *) echo take >> '%s' ;; esac\nexec '%s' \"$@\"\n",
-		takes, toolPath)
+	shim := "#!/bin/sh\ncase \" $* \" in *\" -t 0 \"*|*\" -n \"*) ;; *) echo take >> \"$TEST_LOCK_TAKES\" ;; esac\n" +
+		"exec \"$TEST_LOCK_TOOL\" \"$@\"\n"
 
 	if err := forkSafeWriteFile(filepath.Join(dir, tool), []byte(shim), 0o700); err != nil {
 		t.Fatalf("write the %s stand-in: %v", tool, err)
 	}
 
-	return "PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), takes
+	return []string{
+		"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"TEST_LOCK_TAKES=" + takes,
+		"TEST_LOCK_TOOL=" + toolPath,
+	}, takes
 }
 
 // A PROCESS THE COMMAND LEAVES BEHIND DOES NOT KEEP THE LOCK. util-linux flock
