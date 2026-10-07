@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"errors"
@@ -31,17 +31,18 @@ func TestOnlyBilletsOwnCodesBecomeAnExitStatus(t *testing.T) {
 
 	wrapped := fmt.Errorf("ceph: unmap a device: %w", subprocess)
 
-	if got := exitStatus(wrapped); got != 1 {
+	if got := ExitStatus(wrapped); got != 1 {
 		t.Errorf("a failed subprocess sets billet's exit status to %d; that is a number "+
 			"`billet runner check` gives its own meaning, and a monitor would act on it", got)
 	}
 
 	// AND BILLET'S OWN STILL DO, including through a wrap and a join, which is how
 	// they actually travel: a verification joins its verdict with its cleanup.
-	ours := errors.Join(fmt.Errorf("something else went wrong: %w", subprocess), errRunnerDue)
+	due := &ExitError{Code: 2, Msg: "the runner image is due to be rebuilt"}
+	ours := errors.Join(fmt.Errorf("something else went wrong: %w", subprocess), due)
 
-	if got := exitStatus(ours); got != 2 {
-		t.Errorf("billet's own exit code came out as %d; errRunnerDue is documented as 2, and it "+
-			"has to survive being joined with another error because that is how it travels", got)
+	if got := ExitStatus(ours); got != 2 {
+		t.Errorf("billet's own exit code came out as %d; a status of 2 has to survive being "+
+			"joined with another error because that is how it travels", got)
 	}
 }

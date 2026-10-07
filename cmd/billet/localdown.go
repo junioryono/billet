@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
@@ -58,7 +60,7 @@ type downOptions struct {
 // guess that ends in killed work. --timeout is available for somebody who knows
 // their fleet and wants a bound; without it this waits.
 func cmdLocalDown(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local down")
+	fs := cli.NewFlagSet("billet local down", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this host is going down, recorded on the seal for whoever finds it sealed")
@@ -73,7 +75,7 @@ func cmdLocalDown(ctx context.Context, args []string) error {
 		"stop once the LEDGER is quiet, without asking each host what it is actually "+
 			"running (faster, and it cannot see compute whose lease has already gone)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // cmdLeases is the operator's view of capacity that has not come back.
@@ -39,9 +40,9 @@ func cmdLeases(ctx context.Context, args []string) error {
 // cmdLeasesHeld shows every lease whose compute has not been confirmed gone,
 // including proof obligations a healthy node is actively tending.
 func cmdLeasesHeld(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet leases held")
+	fs := cli.NewFlagSet("billet leases held", os.Stdout)
 	cfgPath := addConfigFlag(fs)
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -231,10 +232,10 @@ func heldFor(since string) string {
 // the host until somebody who can see that machine says otherwise. Without this
 // the number is simply smaller than it was, with nothing to read.
 func cmdLeasesQuarantined(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet leases quarantined")
+	fs := cli.NewFlagSet("billet leases quarantined", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -283,11 +284,11 @@ func cmdLeasesQuarantined(ctx context.Context, args []string) error {
 // and if they are wrong, the capacity is sold to a second job while the first is
 // still running on it.
 func cmdLeasesRelease(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet leases release")
+	fs := cli.NewFlagSet("billet leases release", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false, "release it even though nothing has confirmed the compute is gone")
 
-	leaseID, err := parseWithName(fs, args)
+	leaseID, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}

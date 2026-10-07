@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -407,8 +408,8 @@ func TestRegistrationOpensNothingAndPreservesTheChildsExit(t *testing.T) {
 			switch {
 			case c.code == 0 && runErr != nil:
 				t.Errorf("err %v for a child that exited 0", runErr)
-			case c.code != 0 && exitStatus(runErr) != c.code:
-				t.Errorf("exit %d (err %v), want the child's %d", exitStatus(runErr), runErr, c.code)
+			case c.code != 0 && cli.ExitStatus(runErr) != c.code:
+				t.Errorf("exit %d (err %v), want the child's %d", cli.ExitStatus(runErr), runErr, c.code)
 			}
 		})
 	}

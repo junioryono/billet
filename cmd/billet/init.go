@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/state"
@@ -101,7 +102,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		return cmdInitHybrid(ctx, args[1:])
 	}
 
-	fs := newFlagSet("billet init")
+	fs := cli.NewFlagSet("billet init", os.Stdout)
 
 	// A PARSE DIAGNOSTIC MUST NOT REACH AN APPENDED INVENTORY. newFlagSet sends
 	// help and errors to stdout deliberately, so `-h` stays pipeable — but for an
@@ -242,7 +243,7 @@ func cmdInit(ctx context.Context, args []string) error {
 			"lift. Required: it changes nothing about how billet behaves and exists so the "+
 			"sentence is read before a tier advertises capacity")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

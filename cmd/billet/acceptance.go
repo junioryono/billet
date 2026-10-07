@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awssts"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 
@@ -162,7 +163,7 @@ func cmdAcceptance(ctx context.Context, args []string) error {
 
 // cmdAcceptanceUp derives the isolated deployment and writes the workspace.
 func cmdAcceptanceUp(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet acceptance up")
+	fs := cli.NewFlagSet("billet acceptance up", os.Stdout)
 	base := fs.String("config", defaultConfigPath(),
 		"the config to derive an isolated acceptance deployment FROM; it is read, never written")
 	workspace := fs.String("workspace", "",
@@ -177,7 +178,7 @@ func cmdAcceptanceUp(ctx context.Context, args []string) error {
 	region := fs.String("region", "",
 		"the region to ask sts:GetCallerIdentity in (default: the config's own)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

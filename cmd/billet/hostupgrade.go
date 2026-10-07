@@ -20,6 +20,7 @@ import (
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -66,7 +67,7 @@ const activePointer = "active"
 // makes an interrupted upgrade a thing that recovers rather than a thing somebody
 // reconstructs by hand.
 func cmdHostUpgrade(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet host-upgrade")
+	fs := cli.NewFlagSet("billet host-upgrade", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve when no --version is given")
@@ -97,7 +98,7 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		"act on the rollout this deployment's ledger records, the way the scheduled "+
 			"updater on a control-plane host does; nothing to act on exits 0")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

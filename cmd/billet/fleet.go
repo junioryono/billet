@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/releasesource"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -44,7 +45,7 @@ type fleetOptions struct {
 func cmdFleetConverge(ctx context.Context, args []string) error {
 	var o fleetOptions
 
-	flags := newFlagSet("billet fleet converge")
+	flags := cli.NewFlagSet("billet fleet converge", os.Stdout)
 	flags.StringVar(&o.inventory, "inventory", "", "the inventory file (required)")
 	flags.StringVar(&o.playbook, "playbook", "", "the playbook to run; the collection's junioryono.billet.fleet when empty")
 	flags.StringVar(&o.knownHosts, "known-hosts", "", "a file of pinned host keys, appended to ~/.ssh/known_hosts")
@@ -60,7 +61,7 @@ func cmdFleetConverge(ctx context.Context, args []string) error {
 	flags.StringVar(&o.ref, "ref", "", "the billet release whose collection converges the fleet; this binary's own when empty")
 	flags.StringVar(&o.source, "source", "", "a billet checkout to converge from instead of a release (development)")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 

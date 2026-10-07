@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops"
 )
 
@@ -80,9 +81,9 @@ func TestUpReportsAScheduleItCouldNotInstall(t *testing.T) {
 		t.Fatal("a schedule that could not be installed was reported as up")
 	}
 
-	if exitStatus(err) != 2 || !strings.Contains(err.Error(), deploy.UpgradeAgentLabel) {
+	if cli.ExitStatus(err) != 2 || !strings.Contains(err.Error(), deploy.UpgradeAgentLabel) {
 		t.Errorf("the failure is %v (exit %d), want exit 2 naming the agent", err,
-			exitStatus(err))
+			cli.ExitStatus(err))
 	}
 
 	if !strings.Contains(strings.Join(f.trace, " "), "start "+deploy.NodeUnitName) {

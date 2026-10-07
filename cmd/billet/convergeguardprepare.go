@@ -21,6 +21,7 @@ import (
 	"golang.org/x/mod/semver"
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/version"
 )
 
@@ -255,7 +256,7 @@ func answerJSON(v any, code int, msg string) error {
 		return nil
 	}
 
-	return &exitError{code: code, msg: msg}
+	return &cli.ExitError{Code: code, Msg: msg}
 }
 
 func answerRefusal(r *prepareRefusal) error {
@@ -268,7 +269,7 @@ func answerRefusal(r *prepareRefusal) error {
 }
 
 func cmdGuardPrepare(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet converge-guard prepare")
+	flags := cli.NewFlagSet("billet converge-guard prepare", os.Stdout)
 	holder := flags.String("holder", "", "who holds the guard: the converge's run id, or an operator's handle")
 	validate := flags.Bool("validate", false, "the first call: acquire a guard when there is none, or validate this holder's")
 	candidate := flags.String("candidate", "", "the staged candidate this converge intends to install; with --validate, "+
@@ -286,7 +287,7 @@ func cmdGuardPrepare(ctx context.Context, args []string) error {
 		"guard is acquired and kept for its life; ignored when the guard already exists")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1175,12 +1176,12 @@ func refuseShapeJSON(shape claimShape) *prepareRefusal {
 
 // cmdGuardSettle closes the acquirer's preparation window.
 func cmdGuardSettle(args []string) error {
-	flags := newFlagSet("billet converge-guard settle")
+	flags := cli.NewFlagSet("billet converge-guard settle", os.Stdout)
 	holder := flags.String("holder", "", "the holder whose guard is settled")
 	token := flags.String("token", "", "the acquiring invocation's token")
 	asJSON := flags.Bool("json", false, "print the answer as JSON")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1238,11 +1239,11 @@ func cmdGuardSettle(args []string) error {
 	}
 
 	if !shape.Guard.Preparing {
-		return &exitError{code: exitRefused, msg: "the guard is already settled; nothing was written"}
+		return &cli.ExitError{Code: exitRefused, Msg: "the guard is already settled; nothing was written"}
 	}
 
 	if shape.Guard.Token != *token {
-		return &exitError{code: exitRefused, msg: "the token is not this guard's; nothing was settled"}
+		return &cli.ExitError{Code: exitRefused, Msg: "the token is not this guard's; nothing was settled"}
 	}
 
 	record := shape.Guard
@@ -1282,12 +1283,12 @@ func cleanupRelease(root *txLock, dir *os.File, shape claimShape, holder, token 
 	}
 
 	if !shape.Guard.Preparing {
-		return &exitError{code: exitRefused, msg: fmt.Sprintf("the preparation window has closed; "+
+		return &cli.ExitError{Code: exitRefused, Msg: fmt.Sprintf("the preparation window has closed; "+
 			"`billet converge-guard release --holder %s` releases it", holder)}
 	}
 
 	if shape.Guard.Token != token {
-		return &exitError{code: exitRefused, msg: "the token is not this guard's; nothing was released"}
+		return &cli.ExitError{Code: exitRefused, Msg: "the token is not this guard's; nothing was released"}
 	}
 
 	if err := requireNoPointerAt(dir); err != nil {

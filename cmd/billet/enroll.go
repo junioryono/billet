@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/state"
@@ -64,13 +65,13 @@ func cmdNodes(ctx context.Context, args []string) error {
 // `billet status`. That is the difference between billet knowing a machine is
 // idle and an operator asserting it.
 func cmdNodesDecommission(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet nodes decommission")
+	fs := cli.NewFlagSet("billet nodes decommission", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false,
 		"exclude the host even though nothing has proved it is running no compute; "+
 			"the exclusion is recorded as UNPROVEN and every later drain says so")
 
-	name, err := parseWithName(fs, args)
+	name, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -128,11 +129,11 @@ func cmdNodesDecommission(ctx context.Context, args []string) error {
 // same as banning a name. It revokes the serials outstanding at this moment; a
 // certificate issued afterwards is not one of them.
 func cmdNodesRevoke(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet nodes revoke")
+	fs := cli.NewFlagSet("billet nodes revoke", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
-	name, err := parseWithName(fs, args)
+	name, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -182,11 +183,11 @@ func cmdNodesRevoke(ctx context.Context, args []string) error {
 
 // cmdNodesPending lists machines waiting to be let in.
 func cmdNodesPending(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet nodes pending")
+	fs := cli.NewFlagSet("billet nodes pending", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	all := fs.Bool("all", false, "include decided requests")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -237,12 +238,12 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 // Approving by name alone approves whatever currently holds the name; approving
 // by fingerprint approves the machine whose key an operator actually compared.
 func cmdNodesDecide(ctx context.Context, args []string, decision string) (err error) {
-	fs := newFlagSet("billet nodes " + decision)
+	fs := cli.NewFlagSet("billet nodes "+decision, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	fingerprint := fs.String("fingerprint", "",
 		"the fingerprint you compared against the node's console (required)")
 
-	name, err := parseWithName(fs, args)
+	name, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -744,13 +745,13 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 // fingerprints; what the token stops is a stranger who can reach the port filling
 // the pending list, or taking a name before the machine that should have it.
 func cmdCAToken(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca token")
+	fs := cli.NewFlagSet("billet ca token", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
 	uses := fs.Int("uses", 1, "how many machines may enroll with it")
 	note := fs.String("note", "", "what it is for, recorded alongside it")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -822,10 +823,10 @@ func enrollAddrFlag(cfg *config.Config) string {
 // retire` is what ends it, and running that before the fleet has renewed is what
 // would cut a node off.
 func cmdCARotate(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca rotate")
+	fs := cli.NewFlagSet("billet ca rotate", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -880,11 +881,11 @@ func cmdCARotate(ctx context.Context, args []string) error {
 
 // cmdCARetire finishes a rotation by dropping the old authority.
 func cmdCARetire(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca retire")
+	fs := cli.NewFlagSet("billet ca retire", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false, "retire even though a node may not have renewed")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

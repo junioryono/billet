@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -103,7 +105,7 @@ type migrateEvidence struct {
 }
 
 func cmdNodeMigrate(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet node migrate-endpoint")
+	flags := cli.NewFlagSet("billet node migrate-endpoint", os.Stdout)
 	configPath := flags.String("config", "", "the installed configuration (required)")
 	desired := flags.String("desired", "", "the rendering the role installed, or means to: a path, or - for stdin")
 	stopTimeout := flags.Duration("stop-timeout", time.Hour, "the migration's own deadline for the node's stop; "+
@@ -113,7 +115,7 @@ func cmdNodeMigrate(ctx context.Context, args []string) error {
 	dryRun := flags.Bool("dry-run", false, "decide and report; stop nothing")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 

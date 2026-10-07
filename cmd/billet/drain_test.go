@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -346,7 +347,7 @@ func TestDrainWaitTimesOutWithItsOwnStatusAndKeepsTheSeal(t *testing.T) {
 		if !errors.Is(err, errStillDraining) {
 			t.Errorf("the timeout returned %v, want the still-draining answer", err)
 		}
-		if got := exitStatus(err); got != 2 {
+		if got := cli.ExitStatus(err); got != 2 {
 			t.Errorf("giving up waiting exits %d; a monitor cannot tell it from a failure", got)
 		}
 	})
@@ -561,7 +562,7 @@ func TestInterruptingAWaitDoesNotReportTheDeploymentDrained(t *testing.T) {
 	if !errors.Is(got, errWaitInterrupted) {
 		t.Errorf("an interrupted wait returned %v, want the interrupted answer", got)
 	}
-	if code := exitStatus(got); code != 2 {
+	if code := cli.ExitStatus(got); code != 2 {
 		t.Errorf("an interrupted wait exits %d, want 2 — the same answer as any other "+
 			"not-drained outcome, and distinct from both success and failure", code)
 	}
@@ -772,7 +773,7 @@ func TestAWaitThatCannotReadTheLedgerFailsRatherThanReportingATimeout(t *testing
 	if errors.Is(got, errStillDraining) || errors.Is(got, errWaitInterrupted) {
 		t.Fatalf("a broken ledger was reported as an answer rather than a failure: %v", got)
 	}
-	if code := exitStatus(got); code != 1 {
+	if code := cli.ExitStatus(got); code != 1 {
 		t.Errorf("a broken ledger exits %d, want 1; 2 is reserved for answers a monitor "+
 			"acts on differently", code)
 	}

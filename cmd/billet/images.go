@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider"
@@ -72,13 +73,13 @@ func cmdImages(ctx context.Context, args []string) error {
 // the generation. A pre-metadata generation is boot-verified once and backfilled;
 // after that every ordinary host converge is a metadata read.
 func cmdImagesCompatible(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images compatible")
+	fs := cli.NewFlagSet("billet images compatible", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
 	resultFile := fs.String("result-file", "",
 		"write the bare names of floating images that need replacement here")
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -115,7 +116,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 		if err == nil {
 			continue
 		}
-		if exitStatus(err) != 2 {
+		if cli.ExitStatus(err) != 2 {
 			return err
 		}
 
@@ -133,7 +134,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 		}
 	}
 
-	return &exitError{code: 2, msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
+	return &cli.ExitError{Code: 2, Msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
 }
 
 func checkImageCompatible(
@@ -277,7 +278,7 @@ func guestNeedsCompatibilityBoot(
 }
 
 func incompatibleGuest(image, reason string) error {
-	return &exitError{code: 2, msg: fmt.Sprintf("%s is not compatible: %s", image, reason)}
+	return &cli.ExitError{Code: 2, Msg: fmt.Sprintf("%s is not compatible: %s", image, reason)}
 }
 
 // cmdImagesDue reports whether the golden image is old enough to rebuild.
@@ -303,12 +304,12 @@ func incompatibleGuest(image, reason string) error {
 // generation has succeeded at its job, and a unit reporting failure every week on
 // every machine but one teaches an operator to ignore it.
 func cmdImagesDue(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images due")
+	fs := cli.NewFlagSet("billet images due", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	maxAge := fs.Duration("max-age", 6*24*time.Hour,
 		"rebuild when the newest generation is older than this")
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -393,7 +394,7 @@ func generationDue(
 
 // errNothingToBuild says a rebuild is not due. It is an ANSWER rather than a
 // failure, which is why it carries a status of its own.
-var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already exists"}
+var errNothingToBuild = &cli.ExitError{Code: 2, Msg: "a recent generation already exists"}
 
 // firecrackerTierImage is the first image this deployment's microVM tiers boot.
 func firecrackerTierImage(cfg *config.Config) (string, error) {
@@ -571,7 +572,7 @@ func plural(n int, one, many string) string {
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
 func cmdImagesVerify(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images verify")
+	fs := cli.NewFlagSet("billet images verify", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
 	record := fs.Bool("record", true,
@@ -582,7 +583,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		"grow the probe's root disk to this size before boot (default: the largest disk a "+
 			"firecracker tier asks for, else "+verifyDiskFallback.String()+")")
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -1290,10 +1291,10 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 		name = "billet images unpromote"
 	}
 
-	fs := newFlagSet(name)
+	fs := cli.NewFlagSet(name, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -1362,7 +1363,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 // code than the operation is a preview that eventually stops describing it, which
 // for an irreversible command against a cluster is the property most worth having.
 func cmdImagesReap(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images reap")
+	fs := cli.NewFlagSet("billet images reap", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3,
 		"how many VERIFIED generations to leave per guest contract, newest first")
@@ -1370,7 +1371,7 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	kernelDir := fs.String("kernel-dir", "",
 		"where pulled kernels are kept; orphans there are reaped too (default: node config)")
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -1697,10 +1698,10 @@ func configuredKernelName(cfg *config.Config, kernelDir string) string {
 //
 // A TIER SAYING `@verified` IS NOT AN ANSWER to what it boots, so this resolves it.
 func cmdImagesList(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images list")
+	fs := cli.NewFlagSet("billet images list", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -38,13 +40,13 @@ func cmdCache(ctx context.Context, args []string) error {
 		return errors.New("usage: billet cache <disable|enable|status|orphans|conformance> [flags]")
 	}
 	action := args[0]
-	fs := newFlagSet("billet cache " + action)
+	fs := cli.NewFlagSet("billet cache "+action, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	organisation := fs.String("org", "", "GitHub organisation whose repositories this policy covers")
 	repository := fs.String("repository", "", "GitHub owner/repository this policy covers")
 	kindFlag := fs.String("kind", "all", "the cache this policy covers: "+
 		"docker, sticky, actions, git, bazel, go, or all")
-	if err := parse(fs, args[1:]); err != nil {
+	if err := cli.Parse(fs, args[1:]); err != nil {
 		return err
 	}
 	scope, label, err := cachePolicyScope(*organisation, *repository)

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/state"
@@ -51,7 +53,7 @@ type recoverOptions struct {
 // this deployment (the authority, the App key) is byte-identical or the whole
 // operation is refused, again by the same code.
 func cmdLocalRecover(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local recover")
+	fs := cli.NewFlagSet("billet local recover", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	from := fs.String("from", "", "the backup directory written by `billet local backup`")
 	fromBackup := fs.String("from-backup", "",
@@ -75,7 +77,7 @@ func cmdLocalRecover(ctx context.Context, args []string) error {
 		"undo an interrupted recovery, removing only what it created and putting the ledger "+
 			"it moved aside back")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -432,7 +434,7 @@ func recoveredButOpen(cause error) error {
 	fmt.Printf("         The state directory is STILL FENCED, so nothing can start on it.\n")
 	fmt.Printf("         Run this command again; it resumes, seals, and lifts the fence.\n")
 
-	return &exitError{code: 1, msg: "recovered and fenced, but the deployment could not be sealed"}
+	return &cli.ExitError{Code: 1, Msg: "recovered and fenced, but the deployment could not be sealed"}
 }
 
 // quiesceForRecovery seals this deployment and establishes that it is holding

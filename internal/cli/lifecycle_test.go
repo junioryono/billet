@@ -1,7 +1,9 @@
-package main
+package cli
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"strings"
 	"syscall"
@@ -46,17 +48,19 @@ func TestTheSignalMessagesDescribeWhatTheSignalsActuallyDo(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	lc := newLifecycle(cancel)
+	var stderr bytes.Buffer
+
+	lc := NewLifecycle(cancel, &stderr)
 
 	exited := make(chan int, 1)
 
-	out := captureStderr(t, func() {
+	func() {
 		done := make(chan struct{})
 
 		go func() {
 			defer close(done)
 
-			lc.escalate(signals, func(code int) { exited <- code })
+			lc.Escalate(signals, func(code int) { exited <- code })
 		}()
 
 		signals <- syscall.SIGTERM
@@ -65,7 +69,7 @@ func TestTheSignalMessagesDescribeWhatTheSignalsActuallyDo(t *testing.T) {
 		signals <- syscall.SIGTERM
 		waitFor(t, "the second signal to hurry the drain", func() bool {
 			select {
-			case <-lc.hurry:
+			case <-lc.Hurry():
 				return true
 			default:
 				return false
@@ -81,7 +85,9 @@ func TestTheSignalMessagesDescribeWhatTheSignalsActuallyDo(t *testing.T) {
 		}
 
 		<-done
-	})
+	}()
+
+	out := stderr.String()
 
 	// THE SECOND SIGNAL LEAVES THE WORK ALONE, and says so.
 	for _, want := range []string{"no longer waiting", "LEFT RUNNING", "re-adopted"} {
@@ -125,7 +131,7 @@ func TestTheSecondSignalSkipsTheDrainAndTheThirdGivesUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	lc := newLifecycle(cancel)
+	lc := NewLifecycle(cancel, io.Discard)
 
 	exited := make(chan int, 1)
 
@@ -134,7 +140,7 @@ func TestTheSecondSignalSkipsTheDrainAndTheThirdGivesUp(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		lc.escalate(signals, func(code int) { exited <- code })
+		lc.Escalate(signals, func(code int) { exited <- code })
 	}()
 
 	// FIRST: drain. The context is cancelled, which is what starts it, and
@@ -144,7 +150,7 @@ func TestTheSecondSignalSkipsTheDrainAndTheThirdGivesUp(t *testing.T) {
 	waitFor(t, "the first signal to cancel", func() bool { return ctx.Err() != nil })
 
 	select {
-	case <-lc.hurry:
+	case <-lc.Hurry():
 		t.Fatal("the first signal skipped the drain")
 	case code := <-exited:
 		t.Fatalf("the first signal exited with %d", code)
@@ -156,7 +162,7 @@ func TestTheSecondSignalSkipsTheDrainAndTheThirdGivesUp(t *testing.T) {
 
 	waitFor(t, "the second signal to hurry the drain", func() bool {
 		select {
-		case <-lc.hurry:
+		case <-lc.Hurry():
 			return true
 		default:
 			return false
@@ -188,14 +194,14 @@ func TestTheSecondSignalSkipsTheDrainAndTheThirdGivesUp(t *testing.T) {
 // than three, and a second close of the same channel is a panic that would take
 // the process down in the middle of a teardown — the one moment it must not.
 func TestHurryingIsIdempotent(t *testing.T) {
-	lc := newLifecycle(func() {})
+	lc := NewLifecycle(func() {}, io.Discard)
 
-	lc.rush()
-	lc.rush()
-	lc.rush()
+	lc.Rush()
+	lc.Rush()
+	lc.Rush()
 
 	select {
-	case <-lc.hurry:
+	case <-lc.Hurry():
 	default:
 		t.Fatal("rush did not signal")
 	}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/state"
@@ -39,13 +40,13 @@ type backupOptions struct {
 // custody state, which must never be restored blindly while compute may still
 // exist, and cache data, which repopulates.
 func cmdLocalBackup(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local backup")
+	fs := cli.NewFlagSet("billet local backup", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	out := fs.String("out", "", "the directory to write the backup to (created, must be empty)")
 	noUpload := fs.Bool("no-upload", false,
 		"write the archive and do NOT copy it to backup.s3, even though the config names one")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

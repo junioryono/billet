@@ -5,11 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -92,9 +94,9 @@ var inspect = func(ctx context.Context, cfgPath string, keyPaths []string) (life
 // resolve are all things to REPORT rather than reasons to fail. The one thing
 // it will not do is invent an answer — every uncertain fact says so by name.
 func cmdLocalStatus(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local status")
+	fs := cli.NewFlagSet("billet local status", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

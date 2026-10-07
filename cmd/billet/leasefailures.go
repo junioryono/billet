@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // cmdLeasesFailures shows jobs that did not succeed while billet's own
@@ -26,12 +27,12 @@ import (
 // out loud that the pairing is circumstantial, because a view that reads as a
 // verdict is worse than no view.
 func cmdLeasesFailures(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet leases failures")
+	fs := cli.NewFlagSet("billet leases failures", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to look")
 	limit := fs.Int("limit", 50, "most rows to print")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

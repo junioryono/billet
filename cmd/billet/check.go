@@ -14,6 +14,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/state"
@@ -105,7 +106,7 @@ type checkReport struct {
 // directory, so a first run sets the schema up; against a live plane it verifies
 // and refuses rather than upgrading a schema that plane is using.
 func cmdCheck(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet check")
+	fs := cli.NewFlagSet("billet check", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	authorize := fs.Bool("authorize", false,
 		"also DRY-RUN a launch against AWS to prove the ec2 role may RunInstances "+
@@ -115,7 +116,7 @@ func cmdCheck(ctx context.Context, args []string) error {
 		"this run is the host-upgrade transaction's quiescent probe: open the ledger "+
 			"through the maintenance fence and skip the App verification and every AWS call "+
 			"(local and cluster checks still run)")
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

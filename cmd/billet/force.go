@@ -8,6 +8,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -16,9 +17,9 @@ import (
 //
 // NON-ZERO, because nothing was destroyed. Automation that read an exit status of
 // zero would carry on believing the compute is gone and the capacity is back.
-var errForceRefused = &exitError{
-	code: 2,
-	msg:  "nothing was destroyed",
+var errForceRefused = &cli.ExitError{
+	Code: 2,
+	Msg:  "nothing was destroyed",
 }
 
 // cmdForceDestroy destroys compute that is still running a job.
@@ -36,7 +37,7 @@ var errForceRefused = &exitError{
 // that fails and stays failed. Naming the run ids is what lets an operator
 // recognise whose work they are about to end; "7 leases" tells them nothing.
 func cmdForceDestroy(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet force-destroy")
+	fs := cli.NewFlagSet("billet force-destroy", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why running work is being destroyed, for whoever finds the failed builds")
@@ -45,7 +46,7 @@ func cmdForceDestroy(ctx context.Context, args []string) error {
 	yes := fs.Bool("yes", false,
 		"actually destroy it (without this, only report what would be destroyed)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

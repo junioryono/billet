@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // The half of `billet acceptance` that runs the deployment and takes it down.
@@ -42,7 +44,7 @@ const (
 )
 
 func cmdAcceptanceRun(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet acceptance run")
+	fs := cli.NewFlagSet("billet acceptance run", os.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	jobs := fs.Int("jobs", 1, "how many jobs must reach a terminal outcome before this stops waiting")
 	wait := fs.Duration("wait", 30*time.Minute,
@@ -51,7 +53,7 @@ func cmdAcceptanceRun(ctx context.Context, args []string) error {
 		"stop the services and write the evidence, but DESTROY NOTHING — this run's scale "+
 			"sets and compute are left for `billet acceptance down`, which you then own")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

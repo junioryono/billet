@@ -29,6 +29,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -52,233 +53,77 @@ import (
 // job is ever picked up. Failing loudly is the honest behaviour for pre-alpha.
 var errNotImplemented = errors.New("not implemented yet")
 
-// exitError carries a specific exit status out of a command.
-//
-// MOST FAILURES ARE JUST FAILURES and exit 1. A few are ANSWERS rather than errors:
-// `billet runner check` reporting that the runner image is due to be rebuilt is a
-// fact a monitor acts on differently from "billet could not run", and differently
-// again from "GitHub has already stopped queueing jobs". Collapsing those into one
-// status means a cron entry cannot tell a task from an outage, and will end up
-// treating both like whichever it saw first.
-type exitError struct {
-	code int
-	msg  string
-	// err is the cause when a status is being given to one, so `errors.Is` and
-	// `errors.As` still reach it: a refusal that carries its own exit code is
-	// still the refusal it was, and callers match on its type.
-	err error
-}
-
-func (e *exitError) Error() string { return e.msg }
-
-func (e *exitError) Unwrap() error { return e.err }
-
-// exitStatus is what the process exits with for an error.
-//
-// THE CONCRETE TYPE, NOT AN ANONYMOUS INTERFACE. `interface{ ExitCode() int }` also
-// matches *exec.ExitError, which every failed subprocess in this program produces —
-// so `rbd` exiting 2 made BILLET exit 2, which is the status `billet runner check`
-// documents as "the runner image is due to be rebuilt". A monitor reading that would
-// act on a storage error as though it were a scheduled task. Measured: a verify
-// against a missing image exited 2, carrying rbd's status.
-//
-// A FUNCTION RATHER THAN FOUR LINES IN main, because the first test written for this
-// replicated the decision instead of exercising it, and passed against the very bug
-// it described.
-func exitStatus(err error) int {
-	if coded, ok := errors.AsType[*exitError](err); ok {
-		return coded.code
-	}
-
-	return 1
-}
-
-// ExitCode is what the process should exit with.
-func (e *exitError) ExitCode() int { return e.code }
-
-func main() {
-	if err := run(os.Args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			// Explicit -h is a successful request for help, not a usage error.
-			os.Exit(0)
-		}
-
-		// A QUIET EXIT carries a child's status whose output was already
-		// passed through: nothing more is printed.
-		if coded, ok := errors.AsType[*exitError](err); ok && coded.msg == "" {
-			os.Exit(coded.code)
-		}
-
-		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
-		os.Exit(exitStatus(err))
-	}
-}
-
-type command struct {
-	name    string
-	summary string
-	run     func(ctx context.Context, args []string) error
-}
-
 // commands takes the lifecycle so the two long-running roles can close over it.
 //
 // Only `server` and `node` can be hurried — the rest either exit on their own or
 // have nothing running to wait for — so it is captured by those two rather than
 // widening every command's signature or, worse, becoming package state.
-func commands(lc *lifecycle) []command {
-	return []command{
-		{"server", "run the control plane (run `billet node` alongside it to run jobs here)",
-			func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
-		{"node", "run a compute host that dials a control plane",
-			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
-		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
-		{"ca", "issue the certificates nodes authenticate with", cmdCA},
-		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
-		{"jobs", "show which GitHub job a lease ran and what it did to the host", cmdJobs},
-		{"cache", "manage transparent Actions caching and install its conformance gate", cmdCache},
-		{"check", "validate the config and state directory, then exit", cmdCheck},
-		{"init", "generate a billet.yaml interactively", cmdInit},
-		{"ami", "build and verify the machine image the ec2 backend launches", cmdAMI},
-		{"runner", "report how close the pinned actions/runner is to being refused", cmdRunner},
-		{"images", "verify the golden image a microVM guest boots from", cmdImages},
-		{"fleet", "converge a fleet from this machine with the collection of this billet's release", cmdFleet},
-		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
-		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
-		{"decommission", "remove the ec2 instances and cache billet made outside Terraform",
-			cmdDecommission},
-		{"local", "run the billet services on this machine, and back up or restore what makes " +
-			"them this deployment", cmdLocal},
-		{"drain", "stop admitting new work and let what is running finish", cmdDrain},
-		{"resume", "start admitting work again after a drain", cmdResume},
-		{"force-destroy", "DESTROY compute that is still running a job, failing those builds",
-			cmdForceDestroy},
-		{"rollout", "move this whole deployment to one release, and watch it converge",
-			cmdRollout},
-		{"host-upgrade", "replace billet on THIS machine transactionally, with rollback",
-			cmdHostUpgrade},
-		{"converge-guard", "hold the upgrade root's one claim for a converge, so no transaction " +
-			"moves this host under it", cmdConvergeGuard},
-		{"release", "record which signed manifest produced the billet installed here",
-			cmdRelease},
-		{"acceptance", "stand an ISOLATED deployment up beside this one, run a real job on " +
-			"it, and destroy exactly what it made", cmdAcceptance},
-		{"status", "show cluster status", cmdStatus},
-		{"version", "print version information", cmdVersion},
-	}
+func main() {
+	env := cli.Env{Stdout: os.Stdout, Stderr: os.Stderr, Stdin: os.Stdin, Getenv: os.Getenv}
+
+	os.Exit(cli.Main(os.Args[1:], env, commands, os.Exit))
 }
 
-func run(args []string) error {
-	if len(args) == 0 {
-		usage()
-		return errors.New("no command given")
+func commands(lc *cli.Lifecycle) []cli.Command {
+	return []cli.Command{
+		{Name: "server", Summary: "run the control plane (run `billet node` alongside it to run jobs here)",
+			Run: func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
+		{Name: "node", Summary: "run a compute host that dials a control plane",
+			Run: func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
+		{Name: "nodes", Summary: "approve the machines asking to join this deployment",
+			Run: cmdNodes},
+		{Name: "ca", Summary: "issue the certificates nodes authenticate with",
+			Run: cmdCA},
+		{Name: "leases", Summary: "show capacity held for compute nobody has accounted for",
+			Run: cmdLeases},
+		{Name: "jobs", Summary: "show which GitHub job a lease ran and what it did to the host",
+			Run: cmdJobs},
+		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
+			Run: cmdCache},
+		{Name: "check", Summary: "validate the config and state directory, then exit",
+			Run: cmdCheck},
+		{Name: "init", Summary: "generate a billet.yaml interactively",
+			Run: cmdInit},
+		{Name: "ami", Summary: "build and verify the machine image the ec2 backend launches",
+			Run: cmdAMI},
+		{Name: "runner", Summary: "report how close the pinned actions/runner is to being refused",
+			Run: cmdRunner},
+		{Name: "images", Summary: "verify the golden image a microVM guest boots from",
+			Run: cmdImages},
+		{Name: "fleet", Summary: "converge a fleet from this machine with the collection of this billet's release",
+			Run: cmdFleet},
+		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
+			Run: cmdGitHubApp},
+		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",
+			Run: cmdTeardown},
+		{Name: "decommission", Summary: "remove the ec2 instances and cache billet made outside Terraform",
+			Run: cmdDecommission},
+		{Name: "local", Summary: "run the billet services on this machine, and back up or restore what makes " +
+			"them this deployment",
+			Run: cmdLocal},
+		{Name: "drain", Summary: "stop admitting new work and let what is running finish",
+			Run: cmdDrain},
+		{Name: "resume", Summary: "start admitting work again after a drain",
+			Run: cmdResume},
+		{Name: "force-destroy", Summary: "DESTROY compute that is still running a job, failing those builds",
+			Run: cmdForceDestroy},
+		{Name: "rollout", Summary: "move this whole deployment to one release, and watch it converge",
+			Run: cmdRollout},
+		{Name: "host-upgrade", Summary: "replace billet on THIS machine transactionally, with rollback",
+			Run: cmdHostUpgrade},
+		{Name: "converge-guard", Summary: "hold the upgrade root's one claim for a converge, so no transaction " +
+			"moves this host under it",
+			Run: cmdConvergeGuard},
+		{Name: "release", Summary: "record which signed manifest produced the billet installed here",
+			Run: cmdRelease},
+		{Name: "acceptance", Summary: "stand an ISOLATED deployment up beside this one, run a real job on " +
+			"it, and destroy exactly what it made",
+			Run: cmdAcceptance},
+		{Name: "status", Summary: "show cluster status",
+			Run: cmdStatus},
+		{Name: "version", Summary: "print version information",
+			Run: cmdVersion},
 	}
-	switch args[0] {
-	case "-h", "--help", "help":
-		usage()
-		return nil
-	}
-
-	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather than
-	// dropping jobs: a runner killed mid-job leaves an orphaned registration on GitHub.
-	//
-	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE registration,
-	// because two both receive every signal. See lifecycle.escalate.
-	ctx, cancelGraceful := context.WithCancel(context.Background())
-	defer cancelGraceful()
-
-	lc := newLifecycle(cancelGraceful)
-
-	// Buffered for three, because there are now three levels and a signal that
-	// arrives while the goroutine is between receives must not be dropped.
-	signals := make(chan os.Signal, 3)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-
-	defer signal.Stop(signals)
-
-	go lc.escalate(signals, os.Exit)
-
-	for _, c := range commands(lc) {
-		if c.name == args[0] {
-			return c.run(ctx, args[1:])
-		}
-	}
-	usage()
-	return fmt.Errorf("unknown command %q", args[0])
-}
-
-func usage() {
-	fmt.Fprint(os.Stderr, "billet — self-hosted GitHub Actions runners\n\nusage: billet <command> [flags]\n\n")
-	w := tabwriter.NewWriter(os.Stderr, 0, 0, 3, ' ', 0)
-	// A lifecycle nothing will use: usage only reads names and summaries, and
-	// building one here keeps commands() from needing a nil-safe path that only
-	// this call site would ever exercise.
-	for _, c := range commands(newLifecycle(func() {})) {
-		fmt.Fprintf(w, "  %s\t%s\n", c.name, c.summary)
-	}
-	_ = w.Flush()
-	fmt.Fprint(os.Stderr, "\nRun 'billet <command> -h' for details.\n")
-}
-
-// newFlagSet returns a FlagSet whose help output goes to stdout and which does
-// not print its own error banner on top of ours.
-func newFlagSet(name string) *flag.FlagSet {
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(os.Stdout)
-	return fs
-}
-
-// parse rejects leftover positional arguments, so a typo like
-// `billet server --dry-run extra` fails instead of being silently ignored.
-func parse(fs *flag.FlagSet, args []string) error {
-	return parseWithArgs(fs, args, 0)
-}
-
-// parseWithArgs parses flags for a command that takes positional arguments.
-//
-// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero catches a typo'd flag,
-// which flag.Parse hands back as a positional rather than rejecting: `billet server
-// -dvе` becomes an argument, the flag stays false, and the process runs in a mode
-// nobody asked for.
-func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if fs.NArg() > want {
-		return fmt.Errorf("unexpected argument %q", fs.Arg(want))
-	}
-
-	return nil
-}
-
-// parseWithName parses a command that takes one positional argument, whichever side
-// of the flags it was written on.
-//
-// GO'S FLAG PACKAGE STOPS AT THE FIRST POSITIONAL, so `billet ca issue epyc-1
-// --config x.yaml` leaves the config path sitting in the argument list, silently
-// ignored — and that is the order every operator writes and every README example
-// uses. So the flags are parsed twice.
-func parseWithName(fs *flag.FlagSet, args []string) (string, error) {
-	if err := fs.Parse(args); err != nil {
-		return "", err
-	}
-
-	rest := fs.Args()
-	if len(rest) == 0 {
-		return "", nil
-	}
-
-	name := rest[0]
-
-	if err := fs.Parse(rest[1:]); err != nil {
-		return "", err
-	}
-
-	if fs.NArg() > 0 {
-		return "", fmt.Errorf("unexpected argument %q", fs.Arg(0))
-	}
-
-	return name, nil
 }
 
 // defaultConfigPath deliberately does NOT look in the working directory.
@@ -299,14 +144,14 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
 }
 
-func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
+func cmdServer(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	// `billet server retire` is a controller's retirement, an operator command
 	// that runs under a converge guard; it never starts the plane.
 	if len(args) > 0 && args[0] == "retire" {
 		return cmdServerRetire(ctx, args[1:])
 	}
 
-	fs := newFlagSet("billet server")
+	fs := cli.NewFlagSet("billet server", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
@@ -315,7 +160,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	holdProbeFlag := fs.Bool("upgrade-probe-hold", false,
 		"with --upgrade-probe, stay up until stopped instead of exiting once ready; the "+
 			"Ansible role's Type=notify probe unit passes this")
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 	if *dryRun && *upgradeProbe {
@@ -357,7 +202,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 // earns.
 func runServer(
 	ctx context.Context,
-	lc *lifecycle,
+	lc *cli.Lifecycle,
 	cfg *config.Config,
 	dryRun, upgradeProbe, holdProbeFlag bool,
 ) error {
@@ -433,7 +278,7 @@ func runServer(
 		return err
 	}
 
-	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: lc.hurry, DryRun: dryRun})
+	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: lc.Hurry(), DryRun: dryRun})
 	if err != nil {
 		return err
 	}
@@ -471,7 +316,7 @@ func serverHost() app.Host {
 	}
 }
 
-func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
+func cmdNode(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
 	// migration and the receipt are commands about the node this host runs,
 	// invoked by the role and never by the service.
@@ -484,7 +329,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		}
 	}
 
-	fs := newFlagSet("billet node")
+	fs := cli.NewFlagSet("billet node", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
 		"ask the control plane to admit this machine, then wait for an operator to approve it")
@@ -501,7 +346,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		"with --upgrade-probe, stay up until stopped instead of exiting once ready; the "+
 			"Ansible role's Type=notify probe unit passes this")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 	if *enroll && *upgradeProbe {
@@ -558,7 +403,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 
 	// THE HANDLER BEFORE THE REPORT that says this process has one, and neither
 	// for a probe, which is not the node a stop is asking.
-	stopDrainRequests := lc.handleDrainRequests()
+	stopDrainRequests := lc.HandleDrainRequests()
 	defer stopDrainRequests()
 	publishNodeDrainReport(hostOS)
 
@@ -568,11 +413,11 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 // nodeHost is what the node takes from this process and machine: the service
 // manager's notification, the drain request a stop may carry, the second
 // signal, stdout, and where the registration record is published on platform.
-func nodeHost(lc *lifecycle, platform string) app.NodeHost {
+func nodeHost(lc *cli.Lifecycle, platform string) app.NodeHost {
 	return app.NodeHost{
 		Ready:                  notifyReady,
 		DrainRequested:         nodeDrainRequested,
-		Hurry:                  lc.hurry,
+		Hurry:                  lc.Hurry(),
 		Out:                    os.Stdout,
 		RegistrationRecordPath: nodeRegistrationRecordPath(platform),
 	}
@@ -591,7 +436,7 @@ func nodeHost(lc *lifecycle, platform string) app.NodeHost {
 // second host, would find their tiers dismantled underneath them. Teardown is a
 // thing an operator asks for, once, on purpose.
 func cmdTeardown(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet teardown")
+	fs := cli.NewFlagSet("billet teardown", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
@@ -603,7 +448,7 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		"the one target to act on for --tier (default: every target declaring it, or the only one)")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -845,12 +690,12 @@ func cmdCA(ctx context.Context, args []string) error {
 // WRITES TO THE LEDGER, so it takes effect on the next request the revoked host
 // makes rather than at the next restart of anything.
 func cmdCARevoke(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca revoke")
+	fs := cli.NewFlagSet("billet ca revoke", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
-	name, err := parseWithName(fs, args)
+	name, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -906,10 +751,10 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 
 // cmdCARevocations lists what has been withdrawn.
 func cmdCARevocations(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca revocations")
+	fs := cli.NewFlagSet("billet ca revocations", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -984,7 +829,7 @@ func serialFromCert(path string) (string, error) {
 }
 
 func cmdCAIssue(ctx context.Context, args []string) (err error) {
-	fs := newFlagSet("billet ca issue")
+	fs := cli.NewFlagSet("billet ca issue", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
 	reissue := fs.Bool("reissue", false,
@@ -995,7 +840,7 @@ func cmdCAIssue(ctx context.Context, args []string) (err error) {
 			"own once less than a third remains). Shorter for a short-lived host or a "+
 			"rotation rehearsal; never below "+wirecert.MinIssuedLifetime.String())
 
-	name, err := parseWithName(fs, args)
+	name, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}
@@ -1197,10 +1042,10 @@ func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bun
 }
 
 func cmdCAShow(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ca show")
+	fs := cli.NewFlagSet("billet ca show", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -1304,9 +1149,9 @@ func printRemoteCost(cfg *config.Config) error {
 }
 
 func cmdStatus(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet status")
+	fs := cli.NewFlagSet("billet status", os.Stdout)
 	cfgPath := addConfigFlag(fs)
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -1504,8 +1349,8 @@ func printRemoteFleetCost(ctx context.Context, a *alloc.Allocator, cfg *config.C
 }
 
 func cmdVersion(_ context.Context, args []string) error {
-	fs := newFlagSet("billet version")
-	if err := parse(fs, args); err != nil {
+	fs := cli.NewFlagSet("billet version", os.Stdout)
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

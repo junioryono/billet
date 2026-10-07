@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -52,7 +53,7 @@ func TestNodeStartupRejectsAnUnusableUpgradeSocketPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := cmdNode(t.Context(), newLifecycle(func() {}), []string{"--config", path, "--upgrade-probe"})
+	err := cmdNode(t.Context(), cli.NewLifecycle(func() {}, os.Stderr), []string{"--config", path, "--upgrade-probe"})
 	if err == nil || !strings.Contains(err.Error(), "use a shorter node.state_dir path") {
 		t.Fatalf("node startup did not diagnose its unusable upgrade socket path: %v", err)
 	}

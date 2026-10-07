@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // cmdJobs is the operator's view of what jobs did.
@@ -26,9 +27,9 @@ func cmdJobs(ctx context.Context, args []string) error {
 
 // cmdJobsShow prints one job's history and what the host measured it do.
 func cmdJobsShow(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet jobs show")
+	fs := cli.NewFlagSet("billet jobs show", os.Stdout)
 	cfgPath := addConfigFlag(fs)
-	if err := parseWithArgs(fs, args, 1); err != nil {
+	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {

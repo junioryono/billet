@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/store/ebss3"
@@ -23,14 +25,14 @@ import (
 // instance may still be serving a job, so the cache it depends on must not be
 // pulled out from under it.
 func cmdDecommission(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet decommission")
+	fs := cli.NewFlagSet("billet decommission", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")
 	terminateInstances := fs.Bool("terminate-instances", false,
 		"terminate leftover instances too — this FAILS any job still running on them, "+
 			"so prefer stopping the node to drain them first")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

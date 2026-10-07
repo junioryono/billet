@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
 	"github.com/junioryono/billet/internal/store/ceph"
@@ -63,13 +65,13 @@ var (
 // documentation has always used as its example; it never removes what a tier
 // pins or a job is booting.
 func cmdImagesRefresh(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images refresh")
+	fs := cli.NewFlagSet("billet images refresh", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3, "how many verified generations to leave per guest contract "+
 		"after a pull; 0 reaps nothing")
 	dryRun := fs.Bool("dry-run", false, "say what would be pulled and pull nothing")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -29,14 +31,14 @@ import (
 // what is being set aside is a private key and an operator who chose the wrong
 // direction has to be able to put it back.
 func cmdCASync(ctx context.Context, args []string) error {
-	fs := newFlagSet("ca sync")
+	fs := cli.NewFlagSet("ca sync", os.Stdout)
 	cfgPath := fs.String("config", "", "path to billet.yaml")
 	push := fs.Bool("push", false,
 		"publish this host's authority to the identity store instead of adopting from it")
 	force := fs.Bool("force", false,
 		"replace this host's authority with the published one (it is moved aside, not deleted)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

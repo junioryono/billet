@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
@@ -23,14 +24,14 @@ type orphanReclaimer interface {
 // cmdCacheOrphans lists the intact writable cache volumes nothing needs and,
 // with --reclaim, moves them to the cache pool's trash.
 func cmdCacheOrphans(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet cache orphans")
+	flags := cli.NewFlagSet("billet cache orphans", os.Stdout)
 	cfgPath := addConfigFlag(flags)
 	olderThan := flags.Duration("older-than", ceph.DefaultOrphanAge,
 		fmt.Sprintf("how long ago a volume must have been named, at least %s", ceph.OrphanMinimumAge))
 	limit := flags.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass moves, or lists as reclaimable")
 	reclaim := flags.Bool("reclaim", false, "move what the listing calls reclaimable to the trash; "+
 		"without it nothing is changed")
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -124,7 +125,7 @@ func reclaimCacheOrphans(
 			"have happened", n))
 	}
 	if len(failures) > 0 {
-		return &exitError{code: 1, msg: strings.Join(failures, "; ")}
+		return &cli.ExitError{Code: 1, Msg: strings.Join(failures, "; ")}
 	}
 
 	return nil

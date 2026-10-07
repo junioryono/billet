@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
@@ -47,10 +48,10 @@ func TestCacheOrphansPrintsEachVerdictAndFailsOnCouldNotTell(t *testing.T) {
 	opts := ceph.OrphanOptions{OlderThan: ceph.DefaultOrphanAge, Limit: 7, InSession: func(string) bool { return false }}
 	err := reclaimCacheOrphans(t.Context(), &out, store, opts)
 
-	var exit *exitError
-	if !errors.As(err, &exit) || exit.code != 1 ||
-		!strings.Contains(exit.msg, "1 cache volume(s) could not be judged") ||
-		!strings.Contains(exit.msg, "1 move(s) to the trash were not confirmed") {
+	var exit *cli.ExitError
+	if !errors.As(err, &exit) || exit.Code != 1 ||
+		!strings.Contains(exit.Msg, "1 cache volume(s) could not be judged") ||
+		!strings.Contains(exit.Msg, "1 move(s) to the trash were not confirmed") {
 		t.Errorf("a could-not-tell volume and an unconfirmed move returned %v, want exit status 1 "+
 			"naming both", err)
 	}
@@ -95,8 +96,8 @@ func TestCacheOrphansFailsOnAnUnconfirmedMove(t *testing.T) {
 		OlderThan: ceph.DefaultOrphanAge, Limit: 7, Reclaim: true, InSession: func(string) bool { return false },
 	})
 
-	var exit *exitError
-	if !errors.As(err, &exit) || exit.code != 1 || !strings.Contains(exit.msg, "not confirmed") {
+	var exit *cli.ExitError
+	if !errors.As(err, &exit) || exit.Code != 1 || !strings.Contains(exit.Msg, "not confirmed") {
 		t.Errorf("an unconfirmed move returned %v, want exit status 1 saying so", err)
 	}
 
