@@ -184,6 +184,7 @@ func (cp *ControlPlane) BecomeController(ctx context.Context, stop func()) (*Con
 	}
 
 	ctl := &Controller{cp: cp, claim: claim}
+	ctl.self = ctl
 
 	// THE LOOPS BESIDE THE PLANE ARE JOINED BEFORE THE LEDGER THEY WRITE CLOSES:
 	// Close the Controller before the ControlPlane.
@@ -205,6 +206,12 @@ type Controller struct {
 	cp    *ControlPlane
 	claim state.ControllerClaim
 	loops *supervise.Group
+
+	// self is the address BecomeController made this Controller at. The proofs
+	// name their controller by address, so a copy, or a Controller overwritten
+	// with another's value, must hold no claim, or proofs one control plane
+	// earned would serve another.
+	self *Controller
 }
 
 // Close joins every loop the controller started.
@@ -214,9 +221,12 @@ func (c *Controller) Close() []error { return c.loops.Wait() }
 // made by BecomeController.
 var errNotController = errors.New("app: this step is the controller's, and this value holds no controller claim")
 
-// held reports whether c was made by BecomeController: it has a control plane
-// and the claim's epoch, which the ledger never writes as zero.
-func (c *Controller) held() bool { return c != nil && c.cp != nil && c.claim.Epoch >= 1 }
+// held reports whether c was made by BecomeController and is still where it
+// was made: it has a control plane and the claim's epoch, which the ledger
+// never writes as zero.
+func (c *Controller) held() bool {
+	return c != nil && c.self == c && c.cp != nil && c.claim.Epoch >= 1
+}
 
 // THE PROOFS DIFFER IN THEIR FIELDS' NAMES, not only their types' names: two
 // struct types with the same fields convert into one another, so a caller could

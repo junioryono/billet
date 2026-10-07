@@ -26,19 +26,23 @@ const appPath = "github.com/junioryono/billet/internal/app"
 
 // proofMakers names, for each value the control plane's order is built from,
 // the one function allowed to create it and the operation it must have
-// performed, successfully, before it does.
+// performed, successfully, before it does, as the type checker names the
+// function: what is called, not how the call is spelled.
 var proofMakers = map[string]struct{ maker, operation string }{
-	"Controller":         {"BecomeController", "becomeController"},
-	"FleetForgotten":     {"ForgetFleet", "ForgetEveryNode"},
-	"AdoptedAuthority":   {"AdoptAuthority", "AdoptSharedAuthority"},
-	"AuthorityPublished": {"PublishAuthority", "PublishSharedAuthority"},
-	"ServingWire":        {"ServeWire", "ServeNodeWire"},
-	"Scheduler":          {"Schedule", "server.New"},
+	"Controller":         {"BecomeController", appPath + ".becomeController"},
+	"FleetForgotten":     {"ForgetFleet", "(*github.com/junioryono/billet/internal/alloc.Allocator).ForgetEveryNode"},
+	"AdoptedAuthority":   {"AdoptAuthority", appPath + ".AdoptSharedAuthority"},
+	"AuthorityPublished": {"PublishAuthority", appPath + ".PublishSharedAuthority"},
+	"ServingWire":        {"ServeWire", appPath + ".ServeNodeWire"},
+	"Scheduler":          {"Schedule", "github.com/junioryono/billet/internal/server.New"},
 }
 
 // errorless are the operations that return no error to test: server.New, and
 // the publication, which is non-fatal by design.
-var errorless = map[string]bool{"server.New": true, "PublishSharedAuthority": true}
+var errorless = map[string]bool{
+	"github.com/junioryono/billet/internal/server.New": true,
+	appPath + ".PublishSharedAuthority":                true,
+}
 
 // checkedPackage is this package's production files, type-checked.
 type checkedPackage struct {
@@ -98,14 +102,21 @@ func checkedApp(t *testing.T) *checkedPackage {
 	// not read, so one is refused until the audit runs per variant.
 	var names []string
 
-	for line := range strings.Lines(golist("-f", "{{range .GoFiles}}{{.}}\n{{end}}{{range .IgnoredGoFiles}}ignored:{{.}}\n{{end}}", ".")) {
-		name := strings.TrimSpace(line)
+	const listed = "{{range .GoFiles}}{{.}}\n{{end}}" +
+		"{{range .IgnoredGoFiles}}ignored:{{.}}\n{{end}}{{range .CgoFiles}}cgo:{{.}}\n{{end}}"
 
-		switch ignored, found := strings.CutPrefix(name, "ignored:"); {
-		case found && !strings.HasSuffix(ignored, "_test.go"):
+	for line := range strings.Lines(golist("-f", listed, ".")) {
+		name := strings.TrimSpace(line)
+		ignored, isIgnored := strings.CutPrefix(name, "ignored:")
+		cgo, isCgo := strings.CutPrefix(name, "cgo:")
+
+		switch {
+		case isIgnored && !strings.HasSuffix(ignored, "_test.go"):
 			t.Fatalf("%s is left out of this build by a constraint, so this audit cannot read it; "+
 				"audit each build variant before adding one", ignored)
-		case !found && name != "":
+		case isCgo:
+			t.Fatalf("%s uses cgo, which billet does not build with and this audit does not read", cgo)
+		case !isIgnored && name != "":
 			names = append(names, name)
 		}
 	}
@@ -167,8 +178,13 @@ func checkedApp(t *testing.T) *checkedPackage {
 
 // proofOf names the proof typ is, through aliases and one pointer: the proof
 // itself, an unnamed struct identical to its underlying type (assignable to it
-// with no conversion), or a type parameter whose constraint admits either.
+// with no conversion), a type of this package declared over either, or a type
+// parameter whose constraint admits any of them.
 func (pkg *checkedPackage) proofOf(typ types.Type) (string, bool) {
+	return pkg.proofOfDepth(typ, 0)
+}
+
+func (pkg *checkedPackage) proofOfDepth(typ types.Type, depth int) (string, bool) {
 	typ = types.Unalias(typ)
 	if p, ok := typ.(*types.Pointer); ok {
 		typ = types.Unalias(p.Elem())
@@ -180,9 +196,16 @@ func (pkg *checkedPackage) proofOf(typ types.Type) (string, bool) {
 			return "", false
 		}
 
-		_, proof := proofMakers[x.Obj().Name()]
+		if _, proof := proofMakers[x.Obj().Name()]; proof {
+			return x.Obj().Name(), true
+		}
 
-		return x.Obj().Name(), proof
+		// A TYPE DECLARED OVER A PROOF'S SHAPE converts to it, and through an
+		// unnamed struct is assignable to it, so it is one. The depth bounds a
+		// type declared over a pointer to itself.
+		if depth < 8 {
+			return pkg.proofOfDepth(x.Underlying(), depth+1)
+		}
 	case *types.Struct:
 		for name, st := range pkg.structs {
 			if types.Identical(x, st) {
@@ -363,6 +386,89 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 
 	report := func(where, what string) { violations = append(violations, where+" "+what) }
 
+	// audit holds node to what where may make. A closure is audited as its own
+	// scope, with no maker's permission: a function literal inside a maker runs
+	// whenever something calls it, a deferred one after the maker has chosen
+	// what to return.
+	var audit func(node ast.Node, where string)
+
+	audit = func(node ast.Node, where string) {
+		mayMake := func(name string) bool { return proofMakers[name].maker == where }
+
+		var written []ast.Expr
+
+		ast.Inspect(node, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.FuncLit); ok && n != node {
+				audit(lit, where+"'s closure")
+
+				return false
+			}
+
+			switch x := n.(type) {
+			case *ast.CompositeLit:
+				if name, proof := pkg.proofOf(pkg.info.TypeOf(x)); proof && !mayMake(name) {
+					report(where, "builds a "+name)
+				}
+			case *ast.CallExpr:
+				if tv, ok := pkg.info.Types[x.Fun]; ok && tv.IsType() {
+					if name, proof := pkg.proofOf(tv.Type); proof {
+						report(where, "converts to "+name)
+					}
+				}
+
+				if id, ok := ast.Unparen(x.Fun).(*ast.Ident); ok && len(x.Args) >= 1 {
+					b, isBuiltin := pkg.info.Uses[id].(*types.Builtin)
+
+					switch {
+					case !isBuiltin:
+					case b.Name() == "new":
+						if name, proof := pkg.proofOf(pkg.info.TypeOf(x.Args[0])); proof && !mayMake(name) {
+							report(where, "allocates a "+name)
+						}
+					case b.Name() == "copy":
+						for _, name := range pkg.carriedProofs(pkg.info.TypeOf(x.Args[0])) {
+							if !mayMake(name) {
+								report(where, "copies over a "+name)
+							}
+						}
+					}
+				}
+			case *ast.AssignStmt:
+				written = append(written, x.Lhs...)
+			case *ast.IncDecStmt:
+				written = append(written, x.X)
+			case *ast.RangeStmt:
+				if x.Tok == token.ASSIGN {
+					written = append(written, x.Key, x.Value)
+				}
+			case *ast.UnaryExpr:
+				if x.Op == token.AND {
+					for _, name := range pkg.writtenProofs(x.X) {
+						if !mayMake(name) {
+							report(where, "takes the address of a "+name+"'s storage")
+						}
+					}
+				}
+			}
+
+			for _, lhs := range written {
+				if lhs == nil {
+					continue
+				}
+
+				for _, name := range pkg.writtenProofs(lhs) {
+					if !mayMake(name) {
+						report(where, "writes a "+name+"'s storage")
+					}
+				}
+			}
+
+			written = written[:0]
+
+			return true
+		})
+	}
+
 	for _, file := range pkg.files {
 		for _, decl := range file.Decls {
 			where := "package scope"
@@ -385,64 +491,7 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 				}
 			}
 
-			mayMake := func(name string) bool { return proofMakers[name].maker == where }
-
-			var written []ast.Expr
-
-			ast.Inspect(decl, func(n ast.Node) bool {
-				switch x := n.(type) {
-				case *ast.CompositeLit:
-					if name, proof := pkg.proofOf(pkg.info.TypeOf(x)); proof && !mayMake(name) {
-						report(where, "builds a "+name)
-					}
-				case *ast.CallExpr:
-					if tv, ok := pkg.info.Types[x.Fun]; ok && tv.IsType() {
-						if name, proof := pkg.proofOf(tv.Type); proof {
-							report(where, "converts to "+name)
-						}
-					}
-
-					if id, ok := ast.Unparen(x.Fun).(*ast.Ident); ok && len(x.Args) == 1 {
-						if b, isBuiltin := pkg.info.Uses[id].(*types.Builtin); isBuiltin && b.Name() == "new" {
-							if name, proof := pkg.proofOf(pkg.info.TypeOf(x.Args[0])); proof && !mayMake(name) {
-								report(where, "allocates a "+name)
-							}
-						}
-					}
-				case *ast.AssignStmt:
-					written = append(written, x.Lhs...)
-				case *ast.IncDecStmt:
-					written = append(written, x.X)
-				case *ast.RangeStmt:
-					if x.Tok == token.ASSIGN {
-						written = append(written, x.Key, x.Value)
-					}
-				case *ast.UnaryExpr:
-					if x.Op == token.AND {
-						for _, name := range pkg.writtenProofs(x.X) {
-							if !mayMake(name) {
-								report(where, "takes the address of a "+name+"'s storage")
-							}
-						}
-					}
-				}
-
-				for _, lhs := range written {
-					if lhs == nil {
-						continue
-					}
-
-					for _, name := range pkg.writtenProofs(lhs) {
-						if !mayMake(name) {
-							report(where, "writes a "+name+"'s storage")
-						}
-					}
-				}
-
-				written = written[:0]
-
-				return true
-			})
+			audit(decl, where)
 		}
 	}
 
@@ -454,7 +503,9 @@ func TestOnlyTheProvingStepsMakeTheirProofs(t *testing.T) {
 
 // EACH MAKER DOES ITS STEP BEFORE IT MAKES ITS PROOF. Only one function may make
 // each proof; that is worth nothing if the function makes it without the step.
-// So each maker calls its operation exactly once, as a statement of its own body
+// So each maker has unnamed results, no deferred call and no label, and calls
+// its operation (the function the type checker resolves, not one spelled like
+// it) exactly once and names it nowhere else, as a statement of its own body
 // (never under a branch, in a goroutine, a deferred call or a closure), binds
 // the error that call returns and tests exactly `err != nil` on that variable,
 // either in the call's own `if` or in the statement after it, in a branch that
@@ -469,18 +520,16 @@ func TestEachMakerDoesItsStepBeforeItsProof(t *testing.T) {
 	for typ, m := range proofMakers {
 		fn := pkg.function(t, m.maker)
 
-		var calls []*ast.CallExpr
+		if problem := pkg.plainMaker(fn); problem != "" {
+			t.Errorf("%s %s, so what it returns is not only what its body says", m.maker, problem)
 
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok && callsOperation(call, m.operation) {
-				calls = append(calls, call)
-			}
+			continue
+		}
 
-			return true
-		})
-
-		if len(calls) != 1 {
-			t.Errorf("%s calls %s %d times, want exactly once", m.maker, m.operation, len(calls))
+		calls, refs := pkg.operationCalls(fn.Body, m.operation)
+		if len(calls) != 1 || refs != 1 {
+			t.Errorf("%s calls %s %d times and names it %d times, want exactly one call and nothing else",
+				m.maker, m.operation, len(calls), refs)
 
 			continue
 		}
@@ -692,22 +741,76 @@ func (pkg *checkedPackage) zeroProof(expr ast.Expr) bool {
 	return pkg.isNil(expr)
 }
 
-// callsOperation reports whether call invokes operation: "pkg.Name" a qualified
-// call exactly, a bare name any call of that name.
-func callsOperation(call *ast.CallExpr, operation string) bool {
-	pkg, name, qualified := strings.Cut(operation, ".")
-	if !qualified {
-		return calleeName(call) == operation
+// operationCalls finds the calls in body whose callee the type checker
+// resolves to operation, and counts every reference to it, called or not: a
+// method value or a variable holding the function is a second way to run it.
+func (pkg *checkedPackage) operationCalls(body *ast.BlockStmt, operation string) ([]*ast.CallExpr, int) {
+	names := func(id *ast.Ident) bool {
+		fn, ok := pkg.info.Uses[id].(*types.Func)
+
+		return ok && fn.FullName() == operation
 	}
 
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != name {
-		return false
+	var (
+		calls []*ast.CallExpr
+		refs  int
+	)
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.Ident:
+			if names(x) {
+				refs++
+			}
+		case *ast.CallExpr:
+			var callee *ast.Ident
+
+			switch fun := ast.Unparen(x.Fun).(type) {
+			case *ast.Ident:
+				callee = fun
+			case *ast.SelectorExpr:
+				callee = fun.Sel
+			}
+
+			if callee != nil && names(callee) {
+				calls = append(calls, x)
+			}
+		}
+
+		return true
+	})
+
+	return calls, refs
+}
+
+// plainMaker says what lets a maker's result differ from what its returns
+// say, or "": named results (which a deferred function can rewrite after the
+// maker has returned), a deferred call, or a label to jump to.
+func (pkg *checkedPackage) plainMaker(fn *ast.FuncDecl) string {
+	if fn.Type.Results != nil {
+		for _, field := range fn.Type.Results.List {
+			if len(field.Names) > 0 {
+				return "names its results"
+			}
+		}
 	}
 
-	id, ok := sel.X.(*ast.Ident)
+	problem := ""
 
-	return ok && id.Name == pkg
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.DeferStmt:
+			problem = "defers a call"
+		case *ast.LabeledStmt:
+			problem = "declares a label"
+		}
+
+		return problem == ""
+	})
+
+	return problem
 }
 
 // THE PROOFS DO NOT CONVERT INTO ONE ANOTHER. Two struct types with identical
@@ -734,7 +837,10 @@ func TestTheProofsDoNotConvert(t *testing.T) {
 // A PROOF ANOTHER CONTROLLER MADE, OR NONE, IS REFUSED, AND SO IS A CONTROLLER
 // THAT HOLDS NO CLAIM. Omitting a proof does not compile; a zero one does, and
 // so does another controller's, and so does a Controller nobody claimed with,
-// so every step checks before it touches anything.
+// so every step checks before it touches anything. A copy of a controller, or
+// one overwritten with another's value, holds no claim either: the proofs name
+// their controller by address, and the value at that address is no longer the
+// one that earned them.
 func TestAForeignOrZeroProofIsRefused(t *testing.T) {
 	t.Parallel()
 
@@ -749,12 +855,33 @@ func TestAForeignOrZeroProofIsRefused(t *testing.T) {
 		t.Error("a Controller holding no claim adopted the authority")
 	}
 
-	// Two controllers that each look as if they hold a claim, built here (inside
-	// the package) only to show that one's proofs do not serve the other.
-	ours := &Controller{cp: &ControlPlane{}}
-	ours.claim.Epoch = 1
-	theirs := &Controller{cp: &ControlPlane{}}
-	theirs.claim.Epoch = 1
+	// Controllers that each look as if they hold a claim, built here (inside the
+	// package) only to show that one's proofs do not serve another.
+	ours := lookingClaimed(&ControlPlane{})
+	theirs := lookingClaimed(&ControlPlane{})
+
+	copied := *ours
+	if copied.held() {
+		t.Fatal("a copy of a Controller holds its claim")
+	}
+
+	if _, err := copied.ForgetFleet(ctx); err == nil {
+		t.Error("a copy of a Controller forgot the fleet")
+	}
+
+	overwritten := lookingClaimed(&ControlPlane{})
+	earned := FleetForgotten{forgottenBy: overwritten}
+	adopted := AdoptedAuthority{adoptedBy: overwritten}
+	*overwritten = *theirs
+
+	if overwritten.held() {
+		t.Fatal("a Controller overwritten with another's value holds a claim")
+	}
+
+	if wire, err := overwritten.ServeWire(ctx, earned, adopted); err == nil || wire != nil {
+		t.Errorf("a Controller overwritten with another's value served with the proofs it had earned: (%v, %v)",
+			wire, err)
+	}
 
 	for name, tc := range map[string]struct {
 		fleet   FleetForgotten
@@ -809,14 +936,13 @@ func TestAFailedAdoptionMakesNoProof(t *testing.T) {
 
 	locks := 0
 
-	ctl := &Controller{cp: &ControlPlane{cfg: cfg, host: Host{
+	ctl := lookingClaimed(&ControlPlane{cfg: cfg, host: Host{
 		AuthorityLock: func(context.Context, string) (func() error, error) {
 			locks++
 
 			return nil, refused
 		},
-	}}}
-	ctl.claim.Epoch = 1
+	}})
 
 	adopted, err := ctl.AdoptAuthority(t.Context())
 	if !errors.Is(err, refused) {
@@ -830,6 +956,16 @@ func TestAFailedAdoptionMakesNoProof(t *testing.T) {
 	if adopted != (AdoptedAuthority{}) {
 		t.Errorf("a failed adoption returned a proof made by %p", adopted.adoptedBy)
 	}
+}
+
+// lookingClaimed is a Controller over cp that passes held() without a ledger,
+// for the tests that show what a step refuses.
+func lookingClaimed(cp *ControlPlane) *Controller {
+	ctl := &Controller{cp: cp}
+	ctl.claim.Epoch = 1
+	ctl.self = ctl
+
+	return ctl
 }
 
 // THE CONTROL PLANE ASSEMBLES, EACH STEP'S PROOF OPENING THE NEXT. A real
