@@ -17,10 +17,38 @@
 # command runs without it.
 #
 # A run inside a command that already holds the same lock (a gate that runs
-# another gate) runs under it: the command is handed DEV_GATE_LOCK_HELD naming
-# the lock, and a run that finds its own lock there would otherwise wait for an
-# ancestor that cannot finish until it does.
+# another gate, directly or through another lock) runs under it, or it would
+# wait for an ancestor that cannot finish until it does. The command is handed
+# DEV_GATE_LOCK_HELD, one "PID:PATH" line per lock its ancestors hold, PID being
+# the run that holds PATH; an entry counts only while that run is an ancestor of
+# this one, so a process a gate left behind does not carry the lock with it.
 set -u
+
+nl='
+'
+
+# held_by_ancestor PATH answers whether a run this one is inside holds PATH. A
+# process tree that cannot be read (no ps) answers no, and the run takes the
+# lock as it would anyway.
+held_by_ancestor() (
+	set -f
+	IFS=$nl
+	for entry in ${DEV_GATE_LOCK_HELD-}; do
+		[ "${entry#*:}" = "$1" ] || continue
+		holder=${entry%%:*}
+		pid=$$
+		depth=0
+		while [ "$depth" -lt 128 ]; do
+			pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+			case "$pid" in
+			'' | 0 | 1) break ;;
+			"$holder") exit 0 ;;
+			esac
+			depth=$((depth + 1))
+		done
+	done
+	exit 1
+)
 
 if [ "$#" -lt 2 ]; then
 	echo "usage: with-check-lock.sh LOCKFILE COMMAND [ARG...]" >&2
@@ -43,7 +71,14 @@ if [ -z "$lock" ]; then
 	esac
 fi
 
-if [ "${DEV_GATE_LOCK_HELD-}" = "$lock" ]; then
+# A relative path names a lock in this directory, so it is made absolute before
+# it is compared with or handed to anything that may run elsewhere.
+case "$lock" in
+/*) ;;
+*) lock=$(pwd -P)/$lock ;;
+esac
+
+if held_by_ancestor "$lock"; then
 	echo "with-check-lock: $lock is held by the run this one is inside; running under it" >&2
 	exec "$@"
 fi
@@ -86,21 +121,24 @@ esac
 
 # The lock is taken a second time, now waiting, and that take can fail too (the
 # file's directory replaced since the probe, say). The command's first act under
-# the lock removes a marker, so a failure that leaves the marker never ran the
-# command, and the command runs unlocked; any other status is the command's own.
-# Without a marker to tell the two apart, the take is the last act, as before.
-if ! started=$(mktemp "${TMPDIR:-/tmp}/with-check-lock.XXXXXX" 2>/dev/null); then
-	# An assignment before exec is not exported everywhere, so it is exported.
-	DEV_GATE_LOCK_HELD=$lock
-	export DEV_GATE_LOCK_HELD
-	# $held is one of the two literal spellings above; it is split on purpose.
-	# shellcheck disable=SC2086
-	exec $held "$lock" "$@"
+# the lock is to remove a marker, and the command runs only once that removal
+# succeeded, so a failure that leaves the marker never ran the command and the
+# command runs unlocked; any other status is the command's own. The marker sits
+# beside the lock, in the directory made above, named for this run.
+started=$dir/.with-check-lock.$$
+if ! : > "$started" 2>/dev/null; then
+	echo "with-check-lock: could not write beside $lock, so this run is not serialised with others" >&2
+	exec "$@"
 fi
 
-# The inner script's $1 and $@ are its own, so they stay in single quotes.
+# Only the locked command is told this run holds the lock; the unlocked fallback
+# below inherits what this run was given and nothing more.
+holding="${DEV_GATE_LOCK_HELD-}${DEV_GATE_LOCK_HELD:+$nl}$$:$lock"
+
+# $held is one of the two literal spellings above, split on purpose; the inner
+# script's $1 and $@ are its own, so they stay in single quotes.
 # shellcheck disable=SC2086,SC2016
-DEV_GATE_LOCK_HELD=$lock $held "$lock" sh -c 'rm -f -- "$1"; shift; exec "$@"' with-check-lock "$started" "$@"
+DEV_GATE_LOCK_HELD=$holding $held "$lock" sh -c 'rm -f -- "$1" && shift && exec "$@"' with-check-lock "$started" "$@"
 status=$?
 
 if [ "$status" -ne 0 ] && [ -e "$started" ]; then
