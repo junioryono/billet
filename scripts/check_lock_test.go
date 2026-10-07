@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,18 +56,149 @@ func lookPath(tool string) bool {
 }
 
 // THE COMMAND'S EXIT STATUS IS THE SCRIPT'S, so `make check` failing under the
-// lock still fails.
+// lock still fails, and a command that failed is not run again unlocked.
 func TestTheCheckLockReturnsTheCommandsStatus(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
-	err := exec.CommandContext(t.Context(), "./with-check-lock.sh",
-		filepath.Join(t.TempDir(), "check.lock"), "sh", "-c", "exit 3").Run()
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "runs")
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh",
+		filepath.Join(dir, "check.lock"), "sh", "-c", `echo ran >> "$1"; exit 3`, "failing", runs)
+	cmd.Env = scriptEnv()
+
+	err := cmd.Run()
 
 	exitErr, ok := errors.AsType[*exec.ExitError](err)
 	if !ok || exitErr.ExitCode() != 3 {
 		t.Fatalf("a command exiting 3 under the lock: %v, want exit status 3", err)
 	}
+
+	got, err := os.ReadFile(runs)
+	if err != nil {
+		t.Fatalf("read the command's runs: %v", err)
+	}
+
+	if string(got) != "ran\n" {
+		t.Errorf("the failing command ran %q, want once", got)
+	}
+}
+
+// A RUN INSIDE A RUN HOLDING THE SAME LOCK RUNS UNDER IT. A gate that runs
+// another gate would otherwise wait for an ancestor that cannot finish until it
+// does. Bounded on its own, because the failure is a wait that never ends.
+func TestANestedRunRunsUnderItsAncestorsLock(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	lock := filepath.Join(t.TempDir(), "check.lock")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "./with-check-lock.sh", lock,
+		"./with-check-lock.sh", lock, "sh", "-c", "echo inner; exit 7")
+	cmd.Env = scriptEnv()
+	inGroup(cmd)
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("a run inside a run holding its lock: %v (%s), want the inner command's exit status 7", err, out)
+	}
+
+	if !strings.Contains(string(out), "inner") || !strings.Contains(string(out), "running under it") {
+		t.Errorf("the nested run did not run its command under its ancestor's lock: %q", out)
+	}
+}
+
+// A TAKE THAT FAILS AFTER THE PROBE SUCCEEDED STILL RUNS THE COMMAND, unlocked
+// and saying so, with the command's own status. The lock tool here answers the
+// probe and refuses the take, as one whose file vanished in between would.
+func TestAFailedTakeAfterTheProbeStillRunsTheCommand(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	runs := filepath.Join(dir, "runs")
+
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatalf("make the fake tool's directory: %v", err)
+	}
+
+	// The probe is the only call with -t; every other take is refused before
+	// any command runs, as lockf refuses a file it cannot open. The script
+	// prefers lockf, so this stands in on Linux too.
+	fake := "#!/bin/sh\ncase \" $* \" in *\" -t \"*) exit 0 ;; esac\necho \"lockf: cannot open\" >&2\nexit 71\n"
+	if err := forkSafeWriteFile(filepath.Join(bin, "lockf"), []byte(fake), 0o700); err != nil {
+		t.Fatalf("write the fake lock tool: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(dir, "check.lock"),
+		"sh", "-c", `echo ran >> "$1"; exit 5`, "command", runs)
+	cmd.Env = scriptEnv("PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"))
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 5 {
+		t.Fatalf("a command whose lock could not be taken: %v (%s), want its own exit status 5", err, out)
+	}
+
+	got, err := os.ReadFile(runs)
+	if err != nil {
+		t.Fatalf("the command never ran: %v (%s)", err, out)
+	}
+
+	if string(got) != "ran\n" {
+		t.Errorf("the command ran %q, want once", got)
+	}
+
+	if !strings.Contains(string(out), "not serialised with others") {
+		t.Errorf("the run did not say it went unlocked: %q", out)
+	}
+}
+
+// scriptEnv is this process's environment, without the variable naming a lock
+// an enclosing gate holds (this may run inside `make check`, and a test's run of
+// the script must not take that lock for its ancestor's), plus extra, which
+// replaces a variable of the same name.
+func scriptEnv(extra ...string) []string {
+	var env []string
+
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name == "DEV_GATE_LOCK_HELD" || setIn(extra, name) {
+			continue
+		}
+
+		env = append(env, kv)
+	}
+
+	return append(env, extra...)
+}
+
+// setIn reports whether one of kvs assigns name.
+func setIn(kvs []string, name string) bool {
+	for _, kv := range kvs {
+		if n, _, _ := strings.Cut(kv, "="); n == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+// inGroup starts cmd in a process group of its own and has its cancellation
+// kill the whole group, so a lock tool, a shell or a sub-make it started cannot
+// outlive the test.
+func inGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	// A killed group's pipes close with it; this bounds a straggler holding one.
+	cmd.WaitDelay = 2 * time.Second
 }
 
 // A SECOND RUN WAITS FOR THE FIRST, says so in one line of its own, and starts
@@ -86,6 +218,8 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 
 	first := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
 		holdUntilReleased+`echo done >> "$1"`, "first", trace, release)
+	first.Env = scriptEnv()
+	inGroup(first)
 	if err := first.Start(); err != nil {
 		t.Fatalf("start the first run: %v", err)
 	}
@@ -96,6 +230,7 @@ func TestASecondCheckWaitsForTheFirst(t *testing.T) {
 
 	second := exec.CommandContext(t.Context(), "./with-check-lock.sh", lock,
 		"sh", "-c", `cat "$1" > "$2"`, "second", trace, seen)
+	second.Env = scriptEnv()
 
 	stderr, err := second.StderrPipe()
 	if err != nil {
@@ -316,7 +451,8 @@ func holderContext(t *testing.T) context.Context {
 
 // releaseAndReap releases a holder and reaps it if the test ends before it
 // does, so no holder outlives its test. Registered after holderContext's
-// cancel, it runs before it.
+// cancel, it runs before it. The holder was started inGroup, so a kill reaches
+// everything it started.
 func releaseAndReap(t *testing.T, cmd *exec.Cmd, release string) {
 	t.Helper()
 
@@ -337,8 +473,9 @@ func releaseAndReap(t *testing.T, cmd *exec.Cmd, release string) {
 		case <-done:
 		case <-time.After(10 * time.Second):
 			t.Errorf("the holder did not finish within 10s of its release")
+			// The whole group: the lock tool, and the shell holding the lock under it.
 			//nolint:errcheck // a holder that outlived its release is killed; the error above is the verdict
-			cmd.Process.Kill()
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-done
 		}
 	})
@@ -427,24 +564,26 @@ func TestMakeCheckTakesTheSharedLock(t *testing.T) {
 	}
 }
 
-// makeEnv is the environment for a nested make: this may run inside a `make
-// check` holding the lock, and an inherited CHECK_LOCK, or one carried in
-// MAKEFLAGS from `make check CHECK_LOCK=...`, would make the nested make wait for
-// the lock its own enclosing gate holds.
+// makeEnv is scriptEnv for a nested make: this may run inside a `make check`
+// holding the lock, and an inherited CHECK_LOCK, or one carried in MAKEFLAGS
+// from `make check CHECK_LOCK=...`, would make the nested make wait for the lock
+// its own enclosing gate holds.
 func makeEnv(extra ...string) []string {
 	var env []string
 
-	for _, kv := range os.Environ() {
+	for _, kv := range scriptEnv(extra...) {
 		name, _, _ := strings.Cut(kv, "=")
 		switch name {
 		case "CHECK_LOCK", "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL":
-			continue
+			if !setIn(extra, name) {
+				continue
+			}
 		}
 
 		env = append(env, kv)
 	}
 
-	return append(env, extra...)
+	return env
 }
 
 // A DRY RUN TAKES NO LOCK. `make -n check` waits for nothing even while another
@@ -460,6 +599,8 @@ func TestADryRunCheckTakesNoLock(t *testing.T) {
 
 	holder := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
 		holdUntilReleased, "holder", held, release)
+	holder.Env = scriptEnv()
+	inGroup(holder)
 	if err := holder.Start(); err != nil {
 		t.Fatalf("start the holder: %v", err)
 	}
@@ -473,8 +614,9 @@ func TestADryRunCheckTakesNoLock(t *testing.T) {
 	cmd := exec.CommandContext(ctx, "make", "-C", "..", "-n", "check", "CHECK_LOCK="+lock)
 	cmd.Env = makeEnv()
 	// Killing make alone would leave the script and the lock tool, its
-	// grandchildren, holding the output pipe open past the deadline.
-	cmd.WaitDelay = 2 * time.Second
+	// grandchildren, waiting for the lock and starting the steps once the holder
+	// is released.
+	inGroup(cmd)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -492,44 +634,57 @@ func TestADryRunCheckTakesNoLock(t *testing.T) {
 
 // A REAL RUN TAKES THE LOCK whatever is on the command line: reading MAKEFLAGS'
 // first word took `make check CHECK_LOCK=/tmp/x NICE="nice -n 10"` for a touch
-// and ran it unlocked. With MAKE=echo the recipe runs the real script around an
-// echo instead of the gate.
+// and ran it unlocked. With MAKE="make -n" the recipe runs the real script
+// around a sub-make that prints its steps instead of running them, so what is
+// asserted is the race test line the steps would run: the overrides reach it
+// locally, and under CI the Makefile forces both caps empty whatever the
+// command line says.
 func TestARealCheckWithOverridesTakesTheLock(t *testing.T) {
 	t.Parallel()
 	requireLockTool(t)
 
-	lock := filepath.Join(t.TempDir(), "tmp", "override.lock")
+	goTest := regexp.MustCompile(`(?m)^(.*)go test(.*) -race -count=1 -timeout`)
 
-	// CHECK_LOCK LAST, its path holding a "t": on GNU Make 3.81 a command line of
-	// only assignments puts the last of them first in MAKEFLAGS, with no flags.
-	// Run from the root rather than with -C, which adds its own flag (w) to
-	// MAKEFLAGS and would hide the shape under test.
-	cmd := exec.CommandContext(t.Context(), "make",
-		"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE="+printFlags, "CHECK_LOCK="+lock, "check")
-	cmd.Dir = ".."
-	cmd.Env = makeEnv()
+	for name, tc := range map[string]struct{ ci, nice, parallel string }{
+		"local": {ci: "", nice: "nice -n 10 ", parallel: " -p 2"},
+		"CI":    {ci: "true", nice: "", parallel: ""},
+	} {
+		lock := filepath.Join(t.TempDir(), "tmp", "override.lock")
 
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("make check with overrides: %v (%s)", err, out)
-	}
+		// CHECK_LOCK LAST, its path holding a "t": on GNU Make 3.81 a command line
+		// of only assignments puts the last of them first in MAKEFLAGS, with no
+		// flags. Run from the root rather than with -C, which adds its own flag
+		// (w) to MAKEFLAGS and would hide the shape under test.
+		cmd := exec.CommandContext(t.Context(), "make",
+			"NICE=nice -n 10", "TEST_PARALLEL=2", "MAKE=make -n", "CHECK_LOCK="+lock, "check")
+		cmd.Dir = ".."
+		cmd.Env = makeEnv("CI=" + tc.ci)
+		inGroup(cmd)
 
-	if _, err := os.Stat(lock); err != nil {
-		t.Errorf("make check with overrides on the command line did not take the lock: %v (%s)", err, out)
-	}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: make check with overrides: %v (%s)", name, err, out)
+		}
 
-	// AND THE OVERRIDES REACH THE STEPS: the line the sub-make is reached
-	// through is not recursive to make, and an override still travels to it
-	// in the MAKEFLAGS make exports to every recipe.
-	if !strings.Contains(string(out), "TEST_PARALLEL=2") {
-		t.Errorf("the sub-make did not receive the command line's overrides: %q", out)
+		if _, err := os.Stat(lock); err != nil {
+			t.Errorf("%s: make check with overrides on the command line did not take the lock: %v (%s)",
+				name, err, out)
+		}
+
+		// AND THE OVERRIDES REACH THE STEPS: the line the sub-make is reached
+		// through is not recursive to make, and an override still travels to it
+		// in the MAKEFLAGS make exports to every recipe.
+		m := goTest.FindStringSubmatch(string(out))
+		if m == nil {
+			t.Fatalf("%s: the sub-make printed no race test line: %q", name, out)
+		}
+
+		if m[1] != tc.nice || strings.TrimRight(m[2], " ") != tc.parallel {
+			t.Errorf("%s: the test step would run as %q, want %q before go test and %q after it",
+				name, m[0], tc.nice, tc.parallel)
+		}
 	}
 }
-
-// printFlags stands in for MAKE: it prints the MAKEFLAGS it was handed, so a
-// test sees what the sub-make would have received. Make expands $$ to $ when
-// it reads the command line's value.
-const printFlags = `sh -c 'printf "%s\n" "$$MAKEFLAGS"' sh`
 
 // A LOCK PATH HOLDING SPACES IS ONE PATH: its directories are made and the lock
 // is taken there, not at the pieces a word split would give.
