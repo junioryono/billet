@@ -14,40 +14,59 @@
 # macOS ships lockf(1) and no flock(1); Linux ships flock(1) and no lockf(1). The
 # lock is a courtesy to the rest of the machine and never a gate, so a lock that
 # cannot be taken (no tool, a file that cannot be created) is reported and the
-# command runs without it.
+# command runs without it, once.
 #
 # A run inside a command that already holds the same lock (a gate that runs
 # another gate, directly or through another lock) runs under it, or it would
 # wait for an ancestor that cannot finish until it does. The command is handed
 # DEV_GATE_LOCK_HELD, one "PID:PATH" line per lock its ancestors hold, PID being
 # the run that holds PATH; an entry counts only while that run is an ancestor of
-# this one, so a process a gate left behind does not carry the lock with it.
+# this one, so a process a gate left behind does not carry the lock with it. A
+# process tree that cannot be read is a question with no answer, and the run
+# goes ahead unlocked rather than risk waiting on its own ancestor.
 set -u
 
 nl='
 '
 
-# held_by_ancestor PATH answers whether a run this one is inside holds PATH. A
-# process tree that cannot be read (no ps) answers no, and the run takes the
-# lock as it would anyway.
+# held_by_ancestor PATH exits 0 when a run this one is inside holds PATH, 1 when
+# none does, and 2 when an entry names PATH and the process tree could not say
+# whether its run is an ancestor.
 held_by_ancestor() (
-	set -f
-	IFS=$nl
-	for entry in ${DEV_GATE_LOCK_HELD-}; do
+	verdict=1
+	while IFS= read -r entry; do
 		[ "${entry#*:}" = "$1" ] || continue
 		holder=${entry%%:*}
+		case "$holder" in
+		'' | *[!0-9]*) continue ;;
+		esac
+
 		pid=$$
 		depth=0
 		while [ "$depth" -lt 128 ]; do
-			pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-			case "$pid" in
-			'' | 0 | 1) break ;;
-			"$holder") exit 0 ;;
+			if ! ppid=$(ps -o ppid= -p "$pid" 2>/dev/null); then
+				verdict=2
+				continue 2
+			fi
+			ppid=$(printf '%s' "$ppid" | tr -d ' \t\n')
+			case "$ppid" in
+			'' | *[!0-9]*)
+				verdict=2
+				continue 2
+				;;
 			esac
+			# Compared before the walk stops at the root, so a holder that is a
+			# container's pid 1 is still found.
+			[ "$ppid" = "$holder" ] && exit 0
+			[ "$ppid" -le 1 ] && continue 2
+			pid=$ppid
 			depth=$((depth + 1))
 		done
-	done
-	exit 1
+		verdict=2
+	done <<EOF
+${DEV_GATE_LOCK_HELD-}
+EOF
+	exit "$verdict"
 )
 
 if [ "$#" -lt 2 ]; then
@@ -72,16 +91,30 @@ if [ -z "$lock" ]; then
 fi
 
 # A relative path names a lock in this directory, so it is made absolute before
-# it is compared with or handed to anything that may run elsewhere.
+# it is compared with or handed to anything that may run elsewhere. A path with
+# a newline in it cannot be one line of DEV_GATE_LOCK_HELD.
 case "$lock" in
 /*) ;;
 *) lock=$(pwd -P)/$lock ;;
 esac
+case "$lock" in
+*"$nl"*)
+	echo "with-check-lock: the lock path holds a newline, so this run is not serialised with others" >&2
+	exec "$@"
+	;;
+esac
 
-if held_by_ancestor "$lock"; then
+held_by_ancestor "$lock"
+case $? in
+0)
 	echo "with-check-lock: $lock is held by the run this one is inside; running under it" >&2
 	exec "$@"
-fi
+	;;
+2)
+	echo "with-check-lock: could not tell whether a run this one is inside holds $lock, so this run is not serialised with others" >&2
+	exec "$@"
+	;;
+esac
 
 # The lock's directory is made here, quoted, so a path holding spaces is one
 # path, and a directory that cannot be made still ends in the command running,
@@ -123,13 +156,16 @@ esac
 # file's directory replaced since the probe, say). The command's first act under
 # the lock is to remove a marker, and the command runs only once that removal
 # succeeded, so a failure that leaves the marker never ran the command and the
-# command runs unlocked; any other status is the command's own. The marker sits
-# beside the lock, in the directory made above, named for this run.
-started=$dir/.with-check-lock.$$
-if ! : > "$started" 2>/dev/null; then
-	echo "with-check-lock: could not write beside $lock, so this run is not serialised with others" >&2
+# command runs unlocked; any other status is the command's own. The marker lives
+# in a directory made for this run alone, apart from the lock's, so nothing
+# another run does to either can stand in for it. The write is in a subshell
+# because a failed redirection on `:` ends a dash script outright.
+if ! private=$(mktemp -d "${TMPDIR:-/tmp}/with-check-lock.XXXXXX" 2>/dev/null) ||
+	! (: > "$private/started") 2>/dev/null; then
+	echo "with-check-lock: could not make a private directory for this run, so it is not serialised with others" >&2
 	exec "$@"
 fi
+started=$private/started
 
 # Only the locked command is told this run holds the lock; the unlocked fallback
 # below inherits what this run was given and nothing more.
@@ -142,10 +178,10 @@ DEV_GATE_LOCK_HELD=$holding $held "$lock" sh -c 'rm -f -- "$1" && shift && exec 
 status=$?
 
 if [ "$status" -ne 0 ] && [ -e "$started" ]; then
-	rm -f -- "$started"
+	rm -rf -- "$private"
 	echo "with-check-lock: could not take $lock (status $status), so this run is not serialised with others" >&2
 	exec "$@"
 fi
 
-rm -f -- "$started"
+rm -rf -- "$private"
 exit "$status"

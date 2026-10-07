@@ -122,9 +122,19 @@ func TestAFailedTakeAfterTheProbeStillRunsTheCommand(t *testing.T) {
 
 	// The probe is the only call with -t; every other take is refused before
 	// any command runs, as lockf refuses a file it cannot open.
-	runOnceUnlocked(t, map[string]string{
+	runOnceUnlocked(t, "", map[string]string{
 		"lockf": "#!/bin/sh\ncase \" $* \" in *\" -t \"*) exit 0 ;; esac\necho \"lockf: cannot open\" >&2\nexit 71\n",
 	})
+}
+
+// NO PRIVATE DIRECTORY FOR THE MARKER IS A COURTESY LOST: without one a failed
+// take could not be told from a failed command, so the command runs unlocked,
+// once, and says so.
+func TestARunWithNoPrivateDirectoryRunsUnlockedOnce(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	runOnceUnlocked(t, filepath.Join(t.TempDir(), "absent", "tmp"), nil)
 }
 
 // A MARKER THAT CANNOT BE REMOVED RUNS THE COMMAND ONCE, UNLOCKED: under the
@@ -136,23 +146,27 @@ func TestAMarkerThatCannotBeRemovedRunsTheCommandOnce(t *testing.T) {
 
 	// This lockf takes nothing and runs its command (after -k and the path);
 	// this rm removes nothing.
-	runOnceUnlocked(t, map[string]string{
+	runOnceUnlocked(t, "", map[string]string{
 		"lockf": "#!/bin/sh\ncase \" $* \" in *\" -t \"*) exit 0 ;; esac\nshift 2\nexec \"$@\"\n",
 		"rm":    "#!/bin/sh\nexit 1\n",
 	})
 }
 
 // runOnceUnlocked runs a command that records its runs and exits 5 under the
-// script, with fakes standing in front of PATH for the named tools (the script
-// prefers lockf, so a fake lockf stands in on Linux too), and requires that the
-// command ran exactly once, with its own status, and that the run said it went
-// unlocked.
-func runOnceUnlocked(t *testing.T, fakes map[string]string) {
+// script, with TMPDIR at tmp (a directory of the test's own when empty) and
+// fakes standing in front of PATH for the named tools (the script prefers lockf,
+// so a fake lockf stands in on Linux too), and requires that the command ran
+// exactly once, with its own status, and that the run said it went unlocked.
+func runOnceUnlocked(t *testing.T, tmp string, fakes map[string]string) {
 	t.Helper()
 
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
 	runs := filepath.Join(dir, "runs")
+
+	if tmp == "" {
+		tmp = dir
+	}
 
 	if err := os.Mkdir(bin, 0o700); err != nil {
 		t.Fatalf("make the fake tools' directory: %v", err)
@@ -166,7 +180,7 @@ func runOnceUnlocked(t *testing.T, fakes map[string]string) {
 
 	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(dir, "check.lock"),
 		"sh", "-c", `echo ran >> "$1"; exit 5`, "command", runs)
-	cmd.Env = scriptEnv("PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"))
+	cmd.Env = scriptEnv("PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+tmp)
 
 	out, err := cmd.CombinedOutput()
 
@@ -230,11 +244,12 @@ func TestALockHeldOutsideThisRunsAncestryIsWaitedFor(t *testing.T) {
 
 	dir := t.TempDir()
 	lock := filepath.Join(dir, "check.lock")
-	held := filepath.Join(dir, "held")
+	trace := filepath.Join(dir, "trace")
 	release := filepath.Join(dir, "release")
+	seen := filepath.Join(dir, "seen")
 
 	holder := exec.CommandContext(holderContext(t), "./with-check-lock.sh", lock, "sh", "-c",
-		holdUntilReleased, "holder", held, release)
+		holdUntilReleased+`echo done >> "$1"`, "holder", trace, release)
 	holder.Env = scriptEnv()
 	inGroup(holder)
 
@@ -243,12 +258,12 @@ func TestALockHeldOutsideThisRunsAncestryIsWaitedFor(t *testing.T) {
 	}
 
 	releaseAndReap(t, holder, release)
-	waitForLockFile(t, held, "the holder never took the lock")
+	waitForLockFile(t, trace, "the holder never took the lock")
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
-	stale := exec.CommandContext(ctx, "./with-check-lock.sh", lock, "true")
+	stale := exec.CommandContext(ctx, "./with-check-lock.sh", lock, "sh", "-c", `cat "$1" > "$2"`, "stale", trace, seen)
 	stale.Env = scriptEnv(fmt.Sprintf("DEV_GATE_LOCK_HELD=%d:%s", holder.Process.Pid, lock))
 	inGroup(stale)
 
@@ -260,6 +275,14 @@ func TestALockHeldOutsideThisRunsAncestryIsWaitedFor(t *testing.T) {
 	if err := stale.Start(); err != nil {
 		t.Fatalf("start the run: %v", err)
 	}
+
+	// Reaped on every path out, a failure below included; the group kill above
+	// ends it first.
+	t.Cleanup(func() {
+		cancel()
+		//nolint:errcheck // reaping only; the verdict is the test's
+		stale.Wait()
+	})
 
 	line, err := bufio.NewReader(stderr).ReadString('\n')
 	if err != nil {
@@ -276,6 +299,18 @@ func TestALockHeldOutsideThisRunsAncestryIsWaitedFor(t *testing.T) {
 
 	if err := stale.Wait(); err != nil {
 		t.Fatalf("the run, once the holder let go: %v", err)
+	}
+
+	// AND ITS COMMAND STARTED ONLY ONCE THE HOLDER HAD FINISHED: the message
+	// alone is printed before the take, so a run that said it was waiting and
+	// then went ahead unlocked would have seen the holder's trace unfinished.
+	got, err := os.ReadFile(seen)
+	if err != nil {
+		t.Fatalf("read what the run saw: %v", err)
+	}
+
+	if string(got) != "held\ndone\n" {
+		t.Errorf("the run's command saw %q, want the holder's whole trace: it did not wait", got)
 	}
 }
 
@@ -315,6 +350,67 @@ func TestARelativeLockPathIsItsOwnDirectorysLock(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, "check.lock")); err != nil {
 			t.Errorf("no lock was taken in %s: %v", dir, err)
 		}
+	}
+}
+
+// A PROCESS TREE THAT CANNOT BE READ IS NOT AN ANSWER: a nested run whose
+// ancestry ps cannot report goes ahead unlocked and says so, rather than read
+// "could not tell" as "not an ancestor" and wait forever on the run it is
+// inside. Bounded on its own for that reason.
+func TestANestedRunThatCannotReadItsAncestryRunsUnlocked(t *testing.T) {
+	t.Parallel()
+	requireLockTool(t)
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	lock := filepath.Join(dir, "check.lock")
+
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatalf("make the fake tool's directory: %v", err)
+	}
+
+	if err := forkSafeWriteFile(filepath.Join(bin, "ps"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatalf("write the fake ps: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "./with-check-lock.sh", lock,
+		"./with-check-lock.sh", lock, "sh", "-c", "echo inner; exit 7")
+	cmd.Env = scriptEnv("PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"))
+	inGroup(cmd)
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("a nested run with no readable ancestry: %v (%s), want the inner command's exit status 7", err, out)
+	}
+
+	if !strings.Contains(string(out), "could not tell") {
+		t.Errorf("the nested run did not say it could not tell: %q", out)
+	}
+}
+
+// A LOCK PATH WITH A NEWLINE CANNOT BE HANDED DOWN, so the run goes ahead
+// unlocked rather than hold a lock a nested run could not recognise.
+func TestALockPathWithANewlineRunsUnlocked(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh",
+		filepath.Join(t.TempDir(), "check\nlock"), "sh", "-c", "exit 8")
+	cmd.Env = scriptEnv()
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 8 {
+		t.Fatalf("a lock path with a newline: %v (%s), want the command's exit status 8", err, out)
+	}
+
+	if !strings.Contains(string(out), "holds a newline") {
+		t.Errorf("the run did not say why it went unlocked: %q", out)
 	}
 }
 
