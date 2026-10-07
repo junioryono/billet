@@ -191,3 +191,53 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 		t.Error("the node serves before it reports it handles the drain request")
 	}
 }
+
+// THE NODE IS GIVEN WHAT A STOP ASKS OF IT. Node.Run hands the loop whatever
+// its host says (internal/app reads that), so only this package's source shows
+// the host names the drain-request file, the second signal and the service
+// manager's notification: without the first, a node set to hand over would
+// leave guests behind under an operation that must not.
+func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
+	fn := findFunc(t, "nodeHost")
+
+	isIdent := func(name string) func(ast.Expr) bool {
+		return func(v ast.Expr) bool {
+			id, ok := v.(*ast.Ident)
+
+			return ok && id.Name == name
+		}
+	}
+
+	want := map[string]func(ast.Expr) bool{
+		"DrainRequested": isIdent("nodeDrainRequested"),
+		"Ready":          isIdent("notifyReady"),
+		"Hurry": func(v ast.Expr) bool {
+			sel, ok := v.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "hurry" {
+				return false
+			}
+
+			return isIdent("lc")(sel.X)
+		},
+	}
+	found := map[string]bool{}
+
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		kv, ok := n.(*ast.KeyValueExpr)
+		if !ok {
+			return true
+		}
+
+		if key, ok := kv.Key.(*ast.Ident); ok && want[key.Name] != nil && want[key.Name](kv.Value) {
+			found[key.Name] = true
+		}
+
+		return true
+	})
+
+	for key := range want {
+		if !found[key] {
+			t.Errorf("nodeHost does not give the node %s", key)
+		}
+	}
+}

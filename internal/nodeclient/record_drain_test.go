@@ -604,8 +604,72 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		t.Errorf("cmdNode calls nodeclient.New %d times beside app.NewNodeClient", n)
 	}
 
-	if n := calls(app["NewNodeClient"], "nodeclient", "New"); n != 1 {
-		t.Errorf("app.NewNodeClient calls nodeclient.New %d times, want once", n)
+	// THE CLIENT IS BUILT WHERE THE NODE IS ASSEMBLED, through the shared
+	// constructor and with the TLS the identity gave: one NewNodeClient(cfg,
+	// tlsConf) in (*Node).open, and no nodeclient.New anywhere in node.go but
+	// the constructor itself.
+	for name, fn := range app {
+		if n := calls(fn, "nodeclient", "New"); name != "NewNodeClient" && n != 0 {
+			t.Errorf("internal/app's %s calls nodeclient.New %d times beside NewNodeClient", name, n)
+		}
+	}
+
+	if app["open"] == nil {
+		t.Fatal("(*Node).open is not in internal/app/node.go")
+	}
+
+	shared := 0
+
+	ast.Inspect(app["open"].Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "NewNodeClient" && len(call.Args) == 2 {
+			cfg, cfgOK := call.Args[0].(*ast.Ident)
+			conf, confOK := call.Args[1].(*ast.Ident)
+
+			if cfgOK && confOK && cfg.Name == "cfg" && conf.Name == "tlsConf" {
+				shared++
+			}
+		}
+
+		return true
+	})
+
+	if shared != 1 {
+		t.Errorf("(*Node).open builds its client with NewNodeClient(cfg, tlsConf) %d times, want once", shared)
+	}
+
+	// THE PATH REACHES THE LOOP, link by link: cmdNode hands Run the host
+	// nodeHost builds and nothing else; nodeHost names the one path; Run puts
+	// the host's path in the LoopOptions it hands nodeclient.Run, and writes
+	// nothing of the host's on the way.
+	handed := 0
+
+	for _, stmt := range cmd["cmdNode"].Body.List {
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			continue
+		}
+
+		call, ok := ret.Results[0].(*ast.CallExpr)
+		if !ok || len(call.Args) != 2 {
+			continue
+		}
+
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
+			if host, ok := call.Args[1].(*ast.CallExpr); ok {
+				if id, ok := host.Fun.(*ast.Ident); ok && id.Name == "nodeHost" {
+					handed++
+				}
+			}
+		}
+	}
+
+	if handed != 1 {
+		t.Errorf("cmdNode returns n.Run(ctx, nodeHost(...)) %d times, want once", handed)
 	}
 
 	named := pathFields(cmd["nodeHost"], func(v ast.Expr) bool {
@@ -622,18 +686,57 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		t.Errorf("cmd/billet's nodeHost names RegistrationRecordPath: nodeRegistrationRecordPath(...) %d times, want once", named)
 	}
 
-	passed := pathFields(app["Run"], func(v ast.Expr) bool {
-		sel, ok := v.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "RegistrationRecordPath" {
-			return false
+	passed := 0
+
+	ast.Inspect(app["Run"].Body, func(node ast.Node) bool {
+		switch x := node.(type) {
+		case *ast.AssignStmt:
+			for _, lhs := range x.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok {
+					if id, ok := sel.X.(*ast.Ident); ok && id.Name == "host" {
+						t.Errorf("Node.Run writes host.%s", sel.Sel.Name)
+					}
+				}
+			}
+		case *ast.CallExpr:
+			sel, ok := x.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Run" || len(x.Args) != 4 {
+				return true
+			}
+
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "nodeclient" {
+				return true
+			}
+
+			lit, ok := x.Args[3].(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+
+			for _, elt := range lit.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok || key.Name != "RegistrationRecordPath" {
+					continue
+				}
+
+				if value, ok := kv.Value.(*ast.SelectorExpr); ok && value.Sel.Name == "RegistrationRecordPath" {
+					if id, ok := value.X.(*ast.Ident); ok && id.Name == "host" {
+						passed++
+					}
+				}
+			}
 		}
 
-		id, ok := sel.X.(*ast.Ident)
-
-		return ok && id.Name == "host"
+		return true
 	})
-	if passed != 1 || calls(app["Run"], "nodeclient", "Run") != 1 {
-		t.Errorf("Node.Run passes the loop RegistrationRecordPath: host.RegistrationRecordPath %d times, want once", passed)
+
+	if passed != 1 {
+		t.Errorf("Node.Run hands nodeclient.Run RegistrationRecordPath: host.RegistrationRecordPath %d times, want once", passed)
 	}
 
 	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.
