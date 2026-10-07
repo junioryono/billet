@@ -542,6 +542,95 @@ func TestACommandEndedByASignalReportsItsOwnStatus(t *testing.T) {
 	}
 }
 
+// AND THE SAME UNDER A LOCK TOOL THAT REPORTS A SIGNALLED CHILD AS 70, on every
+// platform: the stand-in below is the test binary acting as macOS lockf does, so
+// a script that exec'd the command straight under the lock tool fails here on
+// Linux too, where util-linux flock reports 128+n itself. It does not see a
+// missing exit after the subshell, which only macOS's dash would expose.
+func TestASignalledCommandIsNotReportedAsTheLockToolsFailure(t *testing.T) {
+	t.Parallel()
+
+	bin := t.TempDir()
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("find this test binary: %v", err)
+	}
+
+	stub := "#!/bin/sh\nexec \"$FAKE_LOCKF_BINARY\" -test.run='^TestFakeLockfProcess$' -- \"$@\"\n"
+	if err := forkSafeWriteFile(filepath.Join(bin, "lockf"), []byte(stub), 0o700); err != nil {
+		t.Fatalf("write the stand-in lockf: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "./with-check-lock.sh", filepath.Join(t.TempDir(), "check.lock"),
+		"sh", "-c", `kill -TERM $$`)
+	cmd.Env = scriptEnv("PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"FAKE_LOCKF=1", "FAKE_LOCKF_BINARY="+self)
+	inGroup(cmd)
+
+	out, err := cmd.CombinedOutput()
+
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 128+int(syscall.SIGTERM) {
+		t.Fatalf("a command ended by SIGTERM under a lock tool reporting signalled children as 70: %v (%s), "+
+			"want exit status %d", err, out, 128+int(syscall.SIGTERM))
+	}
+}
+
+// TestFakeLockfProcess is not a test of its own. Run with FAKE_LOCKF=1 it is a
+// lock tool shaped like macOS lockf (`lockf [-k] [-t secs] file command...`)
+// that locks nothing, runs the command as its child and, as lockf does, exits
+// 70 when that child was ended by a signal and with its status otherwise.
+func TestFakeLockfProcess(t *testing.T) {
+	if os.Getenv("FAKE_LOCKF") != "1" {
+		t.Skip("the stand-in lockf, run only by TestASignalledCommandIsNotReportedAsTheLockToolsFailure")
+	}
+
+	args := os.Args
+	for i, a := range args {
+		if a == "--" {
+			args = args[i+1:]
+
+			break
+		}
+	}
+
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		if args[0] == "-t" {
+			args = args[1:]
+		}
+
+		args = args[1:]
+	}
+
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "fake lockf: usage: lockf [-k] [-t secs] file command...")
+		os.Exit(64)
+	}
+
+	child := exec.CommandContext(t.Context(), args[1], args[2:]...)
+	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+	child.Env = os.Environ()
+
+	if err := child.Run(); err != nil {
+		// A child that never started has no state to read: that is the
+		// diagnostic and 71, as lockf answers a command it cannot run.
+		exitErr, ok := errors.AsType[*exec.ExitError](err)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "fake lockf:", err)
+			os.Exit(71)
+		}
+
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			os.Exit(70)
+		}
+
+		os.Exit(exitErr.ExitCode())
+	}
+
+	os.Exit(0)
+}
+
 // THE COMMAND IS THE PROGRAM IT NAMES, NOT A SHELL BUILTIN OF THAT NAME: under
 // the lock it runs from a shell, and `test` there would be the builtin while
 // the unlocked fallback runs the program on PATH.
