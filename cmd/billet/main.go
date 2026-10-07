@@ -53,6 +53,7 @@ import (
 	storecontract "github.com/junioryono/billet/internal/store"
 	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/store/ebss3"
+	"github.com/junioryono/billet/internal/supervise"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
@@ -637,9 +638,16 @@ func runServer(
 		return stoppedBeforeTheClaim(ctx, db.LeadershipLost(), err)
 	}
 
+	// THE LOOPS BESIDE THE PLANE ARE JOINED BEFORE THIS RETURNS, and so before
+	// the ledger they write closes: the deferred Wait runs ahead of db.Close.
+	loops := supervise.New(ctx, slog.Default())
+	defer loops.Wait()
+
 	// AND A LOST CLAIM STOPS THEM THE SAME WAY, WHICH IS THE HALF THAT REFUSING A
 	// WRITE DOES NOT DO. See stopWhenReplaced.
-	go stopWhenReplaced(ctx, db.LeadershipLostSignal(), stop, slog.Default())
+	loops.Background("controller fence", func(ctx context.Context) {
+		stopWhenReplaced(ctx, db.LeadershipLostSignal(), stop, slog.Default())
+	})
 
 	// THE DEPLOYMENT'S AUTHORITY, BEFORE ANYTHING READS ONE.
 	//
@@ -759,13 +767,13 @@ func runServer(
 	// tier advertises, and an idle deployment never launches, lists or destroys —
 	// so without this a host that crashed on a quiet afternoon would keep its
 	// capacity advertised until somebody happened to need it.
-	go nodes.Watch(ctx)
+	loops.Background("node liveness", func(ctx context.Context) { nodes.Watch(ctx) })
 
 	// AND A SECOND ONE, for the same reason. A drain asks the fleet what it is
 	// running through a durable request row, because the command that wants the
 	// answer runs in another process; nothing on a sealed, idle deployment would
 	// otherwise ever put that question to a node.
-	go nodes.BarrierLoop(ctx)
+	loops.Background("compute barrier", func(ctx context.Context) { nodes.BarrierLoop(ctx) })
 
 	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A
 	// control plane without it serves the node wire, accepts registrations, and then

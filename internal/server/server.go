@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/supervise"
 )
 
 // ScaleSet is one provisioned scale set.
@@ -367,6 +368,14 @@ func (s *Server) Run(ctx context.Context) error {
 		return errors.New("server: no tiers configured; there is nothing to listen for")
 	}
 
+	// EVERY LOOP THIS STARTS IS JOINED BEFORE IT RETURNS, on every path out:
+	// the tiers and the reaper are essential and the first of them to fail
+	// stops the others; the keep-alive, the coordinator and the starter run
+	// beside them until they have all returned, so a lease is still renewed
+	// while a tier stopped by another's failure unwinds.
+	group := supervise.New(ctx, s.log)
+	defer group.Wait()
+
 	// STARTED BEFORE ANYTHING SLOW, and before the first reap.
 	//
 	// Recovery renews each adopted lease once as it adopts, but scale-set
@@ -375,10 +384,7 @@ func (s *Server) Run(ctx context.Context) error {
 	// The reaper would then terminalize a lease billet is deliberately holding,
 	// and a listener would advertise its capacity while the container ran on.
 	if sweeper, ok := s.runner.(Sweeper); ok {
-		keepAlive, stopKeepAlive := context.WithCancel(ctx)
-		defer stopKeepAlive()
-
-		go sweeper.KeepAlive(keepAlive)
+		group.Background("lease keep-alive", sweeper.KeepAlive)
 	}
 
 	// THE ROLLOUT IS DRIVEN BY THE CONTROL PLANE, which is what makes
@@ -391,10 +397,9 @@ func (s *Server) Run(ctx context.Context) error {
 	// scheduling to report an upgrade problem has turned a slow rollout into an
 	// outage.
 	if s.converge != nil {
-		converging, stopConverging := context.WithCancel(ctx)
-		defer stopConverging()
-
-		go s.converge.Run(converging, s.convergeInterval())
+		group.Background("rollout coordinator", func(ctx context.Context) {
+			s.converge.Run(ctx, s.convergeInterval())
+		})
 	}
 
 	// AND THE STARTER BESIDE IT, under the same rule: a tick that fails is
@@ -402,10 +407,9 @@ func (s *Server) Run(ctx context.Context) error {
 	// makes `release.automatic` mean anything — without it the channel could
 	// advance forever and no rollout would ever exist to converge.
 	if s.starter != nil {
-		starting, stopStarting := context.WithCancel(ctx)
-		defer stopStarting()
-
-		go s.starter.Run(starting, s.startEvery)
+		group.Background("rollout starter", func(ctx context.Context) {
+			s.starter.Run(ctx, s.startEvery)
+		})
 	}
 
 	sets := make(map[string]*ScaleSet, len(s.tiers))
@@ -519,42 +523,21 @@ func (s *Server) Run(ctx context.Context) error {
 	// (WithSessionReopen) rather than stopping every tier of every target (#207).
 	// A lost controller claim, a session response billet cannot act on, and a
 	// misconfigured listener still return, and still stop everything.
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	group.Essential(func(ctx context.Context) error {
+		s.reapPeriodically(ctx)
 
-	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		errs []error
-	)
-
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		s.reapPeriodically(runCtx)
-	}()
+		return nil
+	})
 
 	for i := range s.tiers {
 		t := &s.tiers[i]
 
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			if err := s.runTier(runCtx, t, sets[t.Label], targets[t.Label].Provisioner); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-
-				cancel()
-			}
-		}()
+		group.Essential(func(ctx context.Context) error {
+			return s.runTier(ctx, t, sets[t.Label], targets[t.Label].Provisioner)
+		})
 	}
 
-	wg.Wait()
+	errs := group.Wait()
 
 	// A cancelled context is how this stops on purpose, so it is not an error to
 	// report — but a listener that failed for its own reason is, even if the

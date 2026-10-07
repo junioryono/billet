@@ -315,6 +315,16 @@ linters:
             - $gostd
             - github.com/junioryono/billet/internal/lease$
 
+        # THE SUPERVISOR IS A LEAF. The control plane's and the node's loops run
+        # under it, so anything it imported every role would import. The standard
+        # library only (#356 Phase 3c).
+        supervise:
+          list-mode: strict
+          files:
+            - "**/internal/supervise/**"
+          allow:
+            - $gostd
+
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix
         # ending in a slash, so a sibling sharing the name is not). A compute host
