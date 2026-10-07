@@ -18,3 +18,4 @@ e2bce4afa438 internal/wiring became internal/app (#356 Phase 3c); the e2e suite 
 62f848297dcc internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.BuildTargets.
 91f43b148d81 internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.BuildTargets.
 a6008020b506 internal/wiring became internal/app (#356 Phase 3c); the sentence now names app.Provisioner and app.NodeJIT.
+f93edbb8ea27 #349 forwarded run evidence through both adapters when it closed #318; the sentence now says what was and what is.
