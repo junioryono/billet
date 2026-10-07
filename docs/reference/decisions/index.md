@@ -19,6 +19,7 @@ adr-011-targets-and-repository-scope
 adr-012-steady-advertisement
 adr-013-branch-protected-caches
 adr-014-guest-image-from-githubs-template
+adr-015-typed-composition-root
 ```
 
 | Record | Decides |
@@ -37,3 +38,4 @@ adr-014-guest-image-from-githubs-template
 | [ADR-012](adr-012-steady-advertisement.md) | why every tier advertises what it could run rather than what it holds, why capacity is bought when a runner starts, and what the two shipped designs that reserved before advertising cost |
 | [ADR-013](adr-013-branch-protected-caches.md) | how a pooled runner's caches publish: by the ref GitHub proves at the completion, in a namespace of the pool's static repository, with every cache on by default where a tier can have it |
 | [ADR-014](adr-014-guest-image-from-githubs-template.md) | why the Firecracker guest image is GitHub's own runner-images build, run under systemd-nspawn on Ubuntu's cloud root filesystem, with every difference in one reviewed file |
+| [ADR-015](adr-015-typed-composition-root.md) | why billet assembles itself in one typed composition root rather than a dependency-injection container, how the control plane's startup order became proof types, and the lint that keeps the roles built in one place |

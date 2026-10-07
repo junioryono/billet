@@ -3,9 +3,8 @@ package replay
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
-	"net"
-	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	billetgithub "github.com/junioryono/billet/internal/github"
-	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider/simulated"
@@ -23,14 +21,15 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-// stack is billet, assembled the way cmd/billet assembles it: a real control
-// plane and ledger, a real node wire on loopback, and one real node runtime per
-// simulated host, all over the scripted Actions service.
+// stack is billet, assembled the way cmd/billet assembles it, through
+// internal/app: a control plane that claims its ledger, serves the node wire on
+// loopback and schedules, and one node runtime per simulated host, all over the
+// scripted Actions service.
 type stack struct {
-	db     *state.DB
-	alloc  *alloc.Allocator
-	plane  *nodeplane.Plane
-	server *server.Server
+	db        *state.DB
+	alloc     *alloc.Allocator
+	plane     *nodeplane.Plane
+	scheduler *app.Scheduler
 
 	closeDB   func()
 	stopNodes func()
@@ -44,13 +43,27 @@ type stack struct {
 const (
 	registrationWait = 30 * time.Second
 	shutdownWait     = 60 * time.Second
-	wireShutdownWait = 30 * time.Second
 	// planePoll is the long-poll window nodes are told to wait out. Short, so a
 	// stopping node loop returns quickly; it also sets how long a silent node
 	// survives (four windows), which no simulated host approaches while the
 	// plane stays on wall time.
 	planePoll = 2 * time.Second
 )
+
+// harnessHost is the host a harness gives the control plane: no identity
+// exclusion to take (each replay has its own directory), no service manager,
+// and nowhere for the operator's lines to go.
+func harnessHost() app.Host {
+	none := func(context.Context, string) (func() error, error) { return func() error { return nil }, nil }
+
+	return app.Host{
+		ServerAccess:  none,
+		AuthorityLock: none,
+		Ready:         func() error { return nil },
+		Status:        func(string) error { return nil },
+		Out:           io.Discard,
+	}
+}
 
 // buildStack stands billet up over the fleet.
 //
@@ -80,66 +93,16 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 		t.Fatalf("scaleset.New: %v", err)
 	}
 
-	dir := t.TempDir()
-
-	db, err := state.Open(t.Context(), dir)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
+	cfg := &config.Config{
+		Server: &config.ServerConfig{
+			IdentityDir: t.TempDir(),
+			Listen:      "127.0.0.1:0",
+			MaxVCPU:     fleet.MaxVCPU,
+			MaxMemory:   fleet.MaxMemory,
+			Placement:   fleet.Placement,
+		},
+		Tiers: tiers,
 	}
-
-	closeDB := sync.OnceFunc(func() { _ = db.Close() })
-	t.Cleanup(closeDB)
-
-	a, err := alloc.New(db, fleet.limits(), tiers,
-		alloc.WithClock(clock.Now), alloc.WithPlacement(fleet.Placement))
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
-
-	deployment, err := state.DeploymentID(dir)
-	if err != nil {
-		t.Fatalf("DeploymentID: %v", err)
-	}
-
-	plane := nodeplane.New(log, deployment, a.LeaseTTL(),
-		nodeplane.WithRegistrar(a), nodeplane.WithTierCatalog(tiers),
-		nodeplane.WithBarrierStore(a), nodeplane.WithPollTimeout(planePoll))
-
-	wire, err := app.BuildNodeWire(app.NodeWireRequest{
-		Loopback:    true,
-		Log:         log,
-		Plane:       plane,
-		Leases:      a,
-		JIT:         app.NodeJIT{Client: client},
-		CachePolicy: db,
-	})
-	if err != nil {
-		t.Fatalf("BuildNodeWire: %v", err)
-	}
-
-	var lc net.ListenConfig
-
-	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	wireServer := &http.Server{Handler: wire.Handler, ReadHeaderTimeout: 10 * time.Second}
-
-	go func() {
-		if err := wireServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			t.Errorf("the node wire stopped unexpectedly: %v", err)
-		}
-	}()
-
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), wireShutdownWait)
-		defer cancel()
-
-		if err := wireServer.Shutdown(ctx); err != nil {
-			t.Errorf("the node wire did not shut down cleanly: %v", err)
-		}
-	})
 
 	// THE OPERATOR'S SECOND SIGNAL, wired as `billet node` and `billet server`
 	// wire it. A replay ends with nothing running, so a drain ends by itself;
@@ -147,28 +110,101 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 	// hanging in cleanup instead of in the assertion that named the failure.
 	hurry := make(chan struct{})
 
-	loopCtx, cancelLoops := context.WithCancel(t.Context())
+	// The one target, assembled the way the CLI assembles one, so the scale-set
+	// record carries the owner's path and every tier resolves through it.
+	targets := []app.Target{{
+		Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: DefaultOwner},
+		Client: client,
+	}}
+
+	cp, err := app.OpenControlPlane(t.Context(), cfg, harnessHost(), targets, app.ControlPlaneOptions{
+		Steering: &app.Steering{
+			Allocator: []alloc.Option{alloc.WithClock(clock.Now)},
+			Plane:     []nodeplane.Option{nodeplane.WithPollTimeout(planePoll)},
+			Server: []server.ControlPlaneOption{
+				// NEVER, for a replay: a jumped clock would expire every lease between two
+				// heartbeats. The startup reap still runs, on an empty ledger.
+				server.WithReapInterval(24 * time.Hour),
+				server.WithDrainTimeout(time.Hour),
+			},
+			// THE CLI'S OWN ADAPTER, KEPT CONCRETE in the wrapper, so every
+			// capability the scheduler finds by asserting it still is.
+			Provisioner: func(p server.Provisioner) server.Provisioner {
+				adapter, ok := p.(app.Provisioner)
+				if !ok {
+					t.Fatalf("the target's provisioner is a %T, not the CLI's adapter", p)
+				}
+
+				return orderedSessions{Provisioner: adapter, actions: actions}
+			},
+			Owner: owner,
+		},
+	})
+	if err != nil {
+		t.Fatalf("app.OpenControlPlane: %v", err)
+	}
+
+	// The controller's own loops end with this, at close; the plane's Run ends
+	// with the context run hands it.
+	loopCtx, cancelLoops := context.WithCancel(context.WithoutCancel(t.Context()))
+
+	ctl, err := cp.BecomeController(loopCtx, cancelLoops)
+	if err != nil {
+		t.Fatalf("BecomeController: %v", err)
+	}
+
+	adopted, err := ctl.AdoptAuthority(t.Context())
+	if err != nil {
+		t.Fatalf("AdoptAuthority: %v", err)
+	}
+
+	forgotten, err := ctl.ForgetFleet(t.Context())
+	if err != nil {
+		t.Fatalf("ForgetFleet: %v", err)
+	}
+
+	wire, err := ctl.ServeWire(t.Context(), forgotten, adopted)
+	if err != nil {
+		t.Fatalf("ServeWire: %v", err)
+	}
+
+	closeDB := sync.OnceFunc(func() {
+		wire.Stop()
+		cancelLoops()
+
+		if errs := ctl.Close(); len(errs) > 0 {
+			t.Errorf("the controller's loops: %v", errs)
+		}
+
+		if err := cp.Close(); err != nil {
+			t.Errorf("close the ledger: %v", err)
+		}
+	})
+	t.Cleanup(closeDB)
+
+	nodeCtx, cancelNodes := context.WithCancel(t.Context())
 
 	var loops sync.WaitGroup
 
 	for _, h := range fleet.Hosts {
-		nc, err := nodeclient.New(nodeclient.Options{Base: "http://" + ln.Addr().String(), Node: h.Name})
+		nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
+			Name: h.Name, ServerAddr: "http://" + wire.Addr,
+		}}, nil)
 		if err != nil {
-			t.Fatalf("nodeclient.New(%s): %v", h.Name, err)
+			t.Fatalf("NewNodeClient(%s): %v", h.Name, err)
 		}
 
-		prov, err := simulated.New(deployment, simulated.WithClock(clock.Now), simulated.WithLogger(log))
+		prov, err := simulated.New(ctl.Deployment(), simulated.WithClock(clock.Now), simulated.WithLogger(log))
 		if err != nil {
 			t.Fatalf("simulated.New(%s): %v", h.Name, err)
 		}
 
-		// THE CLIENT IS BOTH LEDGER AND MINT, exactly as `billet node` wires it.
-		runner := node.New(nc, h.Name, nc, prov, log)
+		runner := app.NewNodeRunner(nc, h.Name, prov, log)
 
 		loops.Go(func() {
-			err := nodeclient.Run(loopCtx, nc, runner, nodeclient.LoopOptions{
+			err := app.RunNodeLoop(nodeCtx, nc, runner, nodeclient.LoopOptions{
 				Provider:   config.ProviderSimulated,
-				Deployment: deployment,
+				Deployment: ctl.Deployment(),
 				Site:       h.Site,
 				VCPU:       h.VCPU,
 				Memory:     h.Memory,
@@ -183,7 +219,7 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 	}
 
 	stopNodes := sync.OnceFunc(func() {
-		cancelLoops()
+		cancelNodes()
 		loops.Wait()
 	})
 	t.Cleanup(stopNodes)
@@ -192,33 +228,26 @@ func buildStack(t *testing.T, log *slog.Logger, fleet Fleet, tiers []config.Tier
 	// escrow finds a partial fleet and the replay measures startup order.
 	deadline := time.Now().Add(registrationWait)
 
-	for len(plane.Nodes()) < len(fleet.Hosts) {
+	for len(wire.Plane().Nodes()) < len(fleet.Hosts) {
 		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d hosts registered over the wire", len(plane.Nodes()), len(fleet.Hosts))
+			t.Fatalf("only %d of %d hosts registered over the wire", len(wire.Plane().Nodes()), len(fleet.Hosts))
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	prov := orderedSessions{Provisioner: app.Provisioner{Client: client}, actions: actions}
+	published, err := ctl.PublishAuthority(t.Context(), wire)
+	if err != nil {
+		t.Fatalf("PublishAuthority: %v", err)
+	}
 
-	// The one target, assembled the way the CLI assembles one, so the scale-set
-	// record carries the owner's path and every tier resolves through it.
-	ctl := server.New(a, nil, tiers, owner, log,
-		server.WithNodeRunner(plane.NewRunner()),
-		server.WithCompletionLedger(db),
-		server.WithTargets(server.Target{
-			Config:      config.GitHubTarget{Name: config.DefaultTargetName, Org: DefaultOwner},
-			Provisioner: prov,
-		}),
-		// NEVER, for a replay: a jumped clock would expire every lease between two
-		// heartbeats. The startup reap still runs, on an empty ledger.
-		server.WithReapInterval(24*time.Hour),
-		server.WithDrainTimeout(time.Hour),
-		server.WithHurry(hurry))
+	scheduler, err := ctl.Schedule(wire, published, app.ScheduleOptions{Hurry: hurry})
+	if err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
 
 	return &stack{
-		db: db, alloc: a, plane: plane, server: ctl,
+		db: ctl.Ledger(), alloc: ctl.Allocator(), plane: wire.Plane(), scheduler: scheduler,
 		closeDB: closeDB, stopNodes: stopNodes, hurry: hurry,
 	}
 }
@@ -266,7 +295,7 @@ func (s *stack) run(t *testing.T) func() {
 	finished := make(chan struct{})
 
 	go func() {
-		runErr = s.server.Run(ctx)
+		runErr = s.scheduler.Run(ctx)
 
 		close(finished)
 	}()

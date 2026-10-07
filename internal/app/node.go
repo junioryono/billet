@@ -139,6 +139,25 @@ func (n *Node) open(bundle *wirecert.Bundle) error {
 	return nil
 }
 
+// NewNodeRunner is the node runtime over provider p, reaching its control plane
+// through client.
+//
+// THE CLIENT IS BOTH THE LEDGER AND THE MINT: it satisfies node.LeaseStore and
+// node.JITSource, which is the whole reason the runner needs no idea it is
+// remote. Node.Run builds the node's through this, and so do billet's own
+// harnesses, one per host they simulate.
+func NewNodeRunner(
+	client *nodeclient.Client, name string, p provider.Provider, log *slog.Logger, opts ...node.Option,
+) *node.Runner {
+	return node.New(client, name, client, p, log, opts...)
+}
+
+// RunNodeLoop registers the node and executes what its control plane sends
+// until ctx ends and the node has drained or handed over.
+func RunNodeLoop(ctx context.Context, client *nodeclient.Client, runner *node.Runner, loop nodeclient.LoopOptions) error {
+	return nodeclient.Run(ctx, client, runner, loop)
+}
+
 // Name is the name this node registers under, which the certificate decides
 // when it has one.
 func (n *Node) Name() string { return n.cfg.Node.Name }
@@ -220,7 +239,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	}
 	runnerOpts = append(runnerOpts, monitorOpts...)
 
-	runner := node.New(n.client, cfg.Node.Name, n.client, p, slog.Default(), runnerOpts...)
+	runner := NewNodeRunner(n.client, cfg.Node.Name, p, slog.Default(), runnerOpts...)
 
 	fmt.Fprintf(host.Out, "billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
 
@@ -250,7 +269,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 		return fmt.Errorf("node readiness: %w", err)
 	}
 
-	return nodeclient.Run(ctx, n.client, runner, nodeclient.LoopOptions{
+	return RunNodeLoop(ctx, n.client, runner, nodeclient.LoopOptions{
 		Provider:       cfg.Node.Provider,
 		Deployment:     n.deployment,
 		Site:           cfg.Node.Site,

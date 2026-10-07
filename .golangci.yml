@@ -325,6 +325,25 @@ linters:
           allow:
             - $gostd
 
+        # THE ASSEMBLY IS IMPORTED BY WHAT INVOKES IT, AND NOTHING IT ASSEMBLES.
+        # internal/app builds the control plane and the node from a config, so a
+        # package below it that imported it would import every role; the binary
+        # and billet's own harnesses (the end-to-end suite, the boundary tests and
+        # the replay) are the ones that invoke it. Measured at zero violations
+        # when it went in (#356 Phase 3c, ADR-015).
+        appconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/cmd/billet/**"
+            - "!**/internal/app/**"
+            - "!**/internal/e2e/**"
+            - "!**/internal/integration/**"
+            - "!**/internal/replay/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/app$"
+              desc: "internal/app is the assembly; only cmd/billet and billet's harnesses invoke it (ADR-015)."
+
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix
         # ending in a slash, so a sibling sharing the name is not). A compute host
@@ -535,6 +554,18 @@ linters:
         # the package as `gen` and calling `gen.New` is still reported as
         # `gen.New` against this pattern. A pattern that matched only the spelling
         # would be one rename away from silence.
+        # THE CONTROL PLANE AND THE NODE ARE BUILT IN ONE PLACE. internal/app is
+        # the composition root (ADR-015): its types hold the control plane's
+        # startup order, and the harnesses build through it, so a second
+        # production assembly would be one the order and the tests do not reach.
+        # These are the constructors with no production caller outside it,
+        # measured at zero when the ban went in (#356 Phase 3c); the owning
+        # packages call their own unqualified, and tests are exempt below. The
+        # constructors cmd/billet's operator commands still call (state.Open*,
+        # alloc.New, the backends' and stores' New, awscreds.Default,
+        # scaleset.New) join this as #356 Phase 4 moves those commands out.
+        - pattern: '^(server\.New|nodeplane\.(New|Handler|BootstrapHandler)|node\.New|nodeclient\.(New|Run)|rollout\.NewCoordinator)$'
+          msg: "Build the control plane and the node through internal/app (OpenControlPlane and the Controller's steps, OpenNode, NewNodeClient, NewNodeRunner, RunNodeLoop); see ADR-015."
         - pattern: '^ledgerdb\.New$'
           msg: "Bind the generated queries through state.ReadQueries or state.WriteQueries. ledgerdb.New returns every method, which gives away the compile-time read/write split those two exist to keep."
 
@@ -623,6 +654,14 @@ linters:
           - forbidigo
         text: ledgerdb\.New
 
+      # internal/app IS the composition root, so it is the one package that
+      # calls the role constructors. Anchored to files directly in it, as the
+      # ledgerdb exclusion above is, so no subpackage inherits the permission.
+      - path: (^|/)internal/app/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: (server\.New|nodeplane\.(New|Handler|BootstrapHandler)|node\.New|nodeclient\.(New|Run)|rollout\.NewCoordinator)
+
       # THE USER-SPACE RESOLVER IS THE CONTAINMENT. resolveInRoot walks a path
       # component by component under a root and stats every step, which is how
       # it keeps the walk inside the root; gosec's taint analysis (G703) sees a
@@ -698,9 +737,15 @@ linters:
       #
       # The neighbouring `_test\.go` was never anchored and never had the problem.
       # `(^|/)` keeps the component boundary that `^` was there for.
+      #
+      # EVERY BAN BUT THE ASSEMBLY'S. The text names each message this
+      # exemption exists for, so the ban on building the control plane or the
+      # node outside internal/app (ADR-015) reaches cmd/billet too: the binary
+      # is exactly where a second assembly would be written.
       - path: (^|/)cmd/billet/
         linters:
           - forbidigo
+        text: 'forbidden because "(Use log/slog|Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
 
       # THE STANDALONE TOOLS UNDER scripts/ ARE OPERATOR OUTPUT TOO, and are not
       # part of the billet binary. Each is its own `package main` that runs once —

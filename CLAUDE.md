@@ -27,7 +27,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | `internal/supervise` | The group a process's long-lived loops run in: an essential loop's error stops the others, a background loop stops nothing and runs until the essential ones have returned, and every loop is joined before the group returns. The standard library only. |
 | `internal/rollout`, `internal/hostupgrade` | The durable fleet-upgrade decision and coordinator; the journaled transaction that replaces billet on one host. |
 | `internal/awssig`, `awscreds`, `awsjson`, `awspolicy`, `awsquota`, `awss3`, `awsssm`, `awssts` | billet's own SigV4 signer and AWS clients; what S3 said in a refusal; least-privilege IAM generation. |
-| `internal/initconfig`, `internal/app`, `internal/version`, `internal/tfclass`, `internal/tfpolicy` | Config generation for `billet init`; assembling the pieces the way the CLI does; the version; Terraform plan classification and IAM drift. |
+| `internal/initconfig`, `internal/app`, `internal/version`, `internal/tfclass`, `internal/tfpolicy` | Config generation for `billet init`; the composition root, both roles' assembly with the control plane's startup order held as proof types, which the CLI and the harnesses alike build through (ADR-015); the version; Terraform plan classification and IAM drift. |
 | `internal/e2e`, `internal/integration` | The end-to-end suite (real plane, wire and runtime against `fakeactions`) and cross-package boundary tests. |
 | `internal/replay`, `internal/importcheck` | The trace replay harness: a workload driven through the real listener, allocator, placer and node over the simulated backend at compressed time, read back from the ledger; and the one walker that proves a test-side package has no production importer. |
 | `deploy/` | The systemd units, launchd plists, packaged config template and package scripts. |
@@ -70,6 +70,7 @@ Load the skill before starting, not after being stuck. Each holds rules that cos
 | `billet-shell-gates` | editing any `.sh`, any Go that emits shell, or any gate whose verdict is an exit status |
 | `billet-config` | `internal/config`, `internal/initconfig`, `billet.yaml`, `billet init`, tier/node/site validation |
 | `billet-state` | migrations, queries, `internal/state`, the controller claim, anything that opens the ledger |
+| `billet-assembly` | `internal/app`, `runServer` or `cmdNode`, the proof types and their audit, `OpenNode`, the harnesses' assembly, the role-constructor bans |
 | `billet-capacity` | `internal/alloc`, the listener, `nodeplane`, `node`; what a tier advertises; leases, custody, drains, teardown |
 | `billet-node-wire` | routes, command kinds, wire types, protocol versions, enrollment, renewal, listeners |
 | `billet-identity-and-ca` | deployment identity, `wirecert`, `wireshare`, the App key, `ca *`, `nodes *`, `github-app create` |

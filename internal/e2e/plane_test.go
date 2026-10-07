@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -354,8 +353,8 @@ type stack struct {
 	runner *node.Runner
 	// tiers is the catalogue this stack was built with, so a test driving the
 	// runner directly can send the shape the control plane would have sent.
-	tiers  []config.Tier
-	server *server.Server
+	tiers     []config.Tier
+	scheduler *app.Scheduler
 	// provider is the compute backend the node runs: Docker unless the stack was
 	// built with withBackend. kind and backend are what built it, so a restarted
 	// stack over this one's state directory can run the same backend over the
@@ -665,15 +664,6 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		ledgertest.Seed(t, dir)
 	}
 
-	db, err := state.Open(t.Context(), dir)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-
-	closeDB := sync.OnceFunc(func() { _ = db.Close() })
-
-	t.Cleanup(closeDB)
-
 	// WHAT THE TIER RUNS FOLLOWS THE BACKEND. The docker tier sleeps inside a
 	// container that keeps running; the simulated tier's command is the backend's
 	// own vocabulary for the same thing.
@@ -710,10 +700,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		tiers[0].Workflows = nil
 	}
 
-	// A SECOND TARGET, ASSEMBLED THE WAY THE CLI ASSEMBLES ONE: a client per
-	// target through app.BuildTargets, the server told its targets and the
-	// node plane given one source per target. The second tier is the first
-	// with its own label.
+	// THE TARGETS, ASSEMBLED THE WAY THE CLI ASSEMBLES THEM: a client per
+	// target, which internal/app turns into the server's targets and the node
+	// plane's one registration source per target. The second tier, when there
+	// is one, is the first with its own label.
 	//
 	// A SECOND ORGANIZATION, NOT A REPOSITORY, and the reason is the harness:
 	// a repository target's tiers are untrusted by rule, and both backends
@@ -722,11 +712,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// repository target can run in this suite. Per-target routing is the same
 	// mechanism whichever scope the second target has; the repository path is
 	// proved by internal/scaleset's wire test and the live measurement.
-	var (
-		targets       []app.Target
-		serverTargets []server.Target
-		planeJIT      map[string]nodeplane.JITSource
-	)
+	targets := []app.Target{{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client}}
 
 	if sc.second != nil {
 		if !sc.wire {
@@ -753,46 +739,47 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 			t.Fatalf("scaleset.New for the second target: %v", err)
 		}
 
-		targets = []app.Target{
-			{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client},
-			{Config: config.GitHubTarget{Name: "beta", Org: "beta"}, Client: second},
-		}
-
-		serverTargets, planeJIT, err = app.BuildTargets(targets)
-		if err != nil {
-			t.Fatalf("app.BuildTargets: %v", err)
-		}
+		targets = append(targets, app.Target{Config: config.GitHubTarget{Name: "beta", Org: "beta"}, Client: second})
 	}
 
-	var allocOpts []alloc.Option
+	reapEvery := sc.reapEvery
+	if reapEvery == 0 {
+		reapEvery = 200 * time.Millisecond
+	}
+
+	steering := &app.Steering{
+		Server: []server.ControlPlaneOption{
+			// Fast, because the sweep rides this tick and a test that waits a minute
+			// for it is a test nobody runs.
+			server.WithReapInterval(reapEvery),
+			// AND A DRAIN THESE TESTS DO NOT WAIT OUT.
+			//
+			// Stopping the plane begins a drain, and these scenarios stop it while a
+			// container is deliberately still running — the fake GitHub never sends
+			// the completion, because the point of the scenario was what happens
+			// BEFORE one. A drain waits for as long as the work takes, so the plane
+			// correctly sits there forever; `hurry` below is what ends it.
+			//
+			// THE TIMEOUT NO LONGER ENDS ANYTHING, and using it to stop the plane was
+			// only ever available while expiry destroyed the running job. It is left
+			// short so these scenarios exercise the overrun REPORT rather than
+			// sitting silent, which is all it decides now.
+			server.WithDrainTimeout(200 * time.Millisecond),
+		},
+	}
 	if sc.now != nil {
-		allocOpts = append(allocOpts, alloc.WithClock(sc.now))
+		steering.Allocator = append(steering.Allocator, alloc.WithClock(sc.now))
 	}
 
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, tiers, allocOpts...)
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
-
-	const host = "e2e-host"
-
-	// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK. Over the wire the plane's own
-	// registration must write this row, so doing it here would hide a regression
-	// that stopped it — the node would bind happily against a row this harness
-	// had helpfully created.
-	if !sc.wire {
-		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: kind, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
-			t.Fatalf("RegisterNode: %v", err)
-		}
-	}
+	c := openAssembled(t, harnessConfig(dir, 8, 16*config.GiB, tiers), targets, steering)
+	a := c.ctl.Allocator()
 
 	// A per-test deployment identity, so two of these running concurrently do not
 	// enumerate each other's containers. This is the property state.DeploymentID
 	// exists for, exercised here rather than asserted about.
-	deployment, err := state.DeploymentID(dir)
-	if err != nil {
-		t.Fatalf("DeploymentID: %v", err)
-	}
+	deployment := c.ctl.Deployment()
+
+	const host = "e2e-host"
 
 	var prov provider.Provider = docker.New(deployment)
 	if sc.backend != nil {
@@ -834,74 +821,42 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 
 	log := testLogger(t)
 
-	var (
-		runner      *node.Runner
-		wire        *nodeplane.Plane
-		stopNode    = func() {}
-		wireAddr    string
-		serverOpts  []server.ControlPlaneOption
-		computeName = host
-	)
-
-	if len(serverTargets) > 0 {
-		serverOpts = append(serverOpts, server.WithTargets(serverTargets...))
-	}
-
-	// CREATED BEFORE THE WIRE, because the node loop takes it too. A drain is a
+	// CREATED BEFORE THE NODE, because the node loop takes it too. A drain is a
 	// drain on both sides of the wire: a node whose compute never completes waits
 	// exactly as the control plane does, and without the second signal these
 	// scenarios hang in cleanup rather than in an assertion.
 	hurry := make(chan struct{})
 
+	var (
+		runner     *node.Runner
+		wire       *nodeplane.Plane
+		stopNode   = func() {}
+		wireAddr   string
+		nodeRunner dispatch.Runner
+	)
+
 	if sc.wire {
-		var first *nodeLoop
-
-		var wireOpts []server.ControlPlaneOption
-
-		first, wire, wireAddr, wireOpts = wireUp(
-			t, log, a, client, prov, kind, nil, tiers, deployment,
-			computeName, hurry, wireOptions{drainTimeout: sc.nodeDrainTimeout, targetJIT: planeJIT})
+		first := startFirstNode(t, log, c, nodeProcess{
+			host: host, deployment: deployment, provider: prov, kind: kind,
+			hurry: hurry, drainTimeout: sc.nodeDrainTimeout,
+		})
 		runner, stopNode = first.runner, first.stop
-		serverOpts = append(serverOpts, wireOpts...)
+		wire, wireAddr = c.wire.Plane(), c.wire.Addr
 	} else {
-		runner = node.New(a, host, app.JITSource{Client: client, Pool: a}, prov, log)
-		serverOpts = []server.ControlPlaneOption{
-			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers, kind: kind}),
+		// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK, and after the fleet was
+		// forgotten, as a registration over the wire would be. Over the wire the
+		// plane's own registration must write this row, so doing it there would
+		// hide a regression that stopped it — the node would bind happily against
+		// a row this harness had helpfully created.
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: kind, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+			t.Fatalf("RegisterNode: %v", err)
 		}
+
+		runner = node.New(a, host, app.JITSource{Client: client, Pool: a}, prov, log)
+		nodeRunner = directRunner{runner: runner, tiers: tiers, kind: kind}
 	}
 
-	reapEvery := sc.reapEvery
-	if reapEvery == 0 {
-		reapEvery = 200 * time.Millisecond
-	}
-
-	serverOpts = append(serverOpts,
-		// Fast, because the sweep rides this tick and a test that waits a minute
-		// for it is a test nobody runs.
-		server.WithReapInterval(reapEvery),
-		// AND A DRAIN THESE TESTS DO NOT WAIT OUT.
-		//
-		// Stopping the plane begins a drain, and these scenarios stop it while a
-		// container is deliberately still running — the fake GitHub never sends the
-		// completion, because the point of the scenario was what happens BEFORE
-		// one. A drain waits for as long as the work takes, so the plane correctly
-		// sits there forever; `hurry` below is what ends it.
-		//
-		// THE TIMEOUT NO LONGER ENDS ANYTHING, and using it to stop the plane was
-		// only ever available while expiry destroyed the running job. It is left
-		// short so these scenarios exercise the overrun REPORT rather than sitting
-		// silent, which is all it decides now.
-		server.WithDrainTimeout(200*time.Millisecond),
-		server.WithHurry(hurry))
-
-	var prov0 server.Provisioner = app.Provisioner{Client: client}
-	if targets != nil {
-		// Every tier resolves through WithTargets; a fallback provisioner would
-		// be a second credential nothing should reach.
-		prov0 = nil
-	}
-
-	srv := server.New(a, prov0, tiers, "billet-test", log, serverOpts...)
+	scheduler := c.schedule(t, app.ScheduleOptions{Hurry: hurry, NodeRunner: nodeRunner})
 
 	var secondPlane *plane
 	if sc.second != nil {
@@ -910,101 +865,23 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 
 	return &stack{
 		hurry: hurry,
-		dir:   dir, closeDB: closeDB, plane: p, second: secondPlane, alloc: a, db: db,
-		runner: runner, server: srv, provider: prov, kind: kind, backend: sc.backend,
+		dir:   dir, closeDB: c.close, plane: p, second: secondPlane, alloc: a, db: c.ctl.Ledger(),
+		runner: runner, scheduler: scheduler, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
 		wire: wire, stopNode: stopNode, wireAddr: wireAddr,
 	}
 }
 
-// wireOptions varies the wire and the first node process wireUp starts.
-type wireOptions struct {
-	plane []nodeplane.Option
-	// supersedable tolerates the first process ending with ErrSuperseded.
-	supersedable bool
-	// drainTimeout is the first process's drain_timeout; see nodeProcess.
-	drainTimeout time.Duration
-	// targetJIT gives the plane one credential-holding source per target.
-	targetJIT map[string]nodeplane.JITSource
-}
-
-// wireUp puts a real HTTP node wire between the control plane and the runner.
-//
-// kind and shapes are what the node REGISTERS as: the backend it runs, and for a
-// remote one the ordered shapes it may buy.
-func wireUp(
-	t *testing.T,
-	log *slog.Logger,
-	a *alloc.Allocator,
-	client *scaleset.Client,
-	prov provider.Provider,
-	kind config.ProviderKind,
-	shapes []config.RemoteShape,
-	tiers []config.Tier,
-	deployment, host string,
-	hurry <-chan struct{},
-	wo wireOptions,
-) (*nodeLoop, *nodeplane.Plane, string, []server.ControlPlaneOption) {
+// startFirstNode starts the first node process against the control plane's
+// wire and waits for it to register, as `billet node` on a host beside the
+// control plane would.
+func startFirstNode(t *testing.T, log *slog.Logger, c *assembled, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	plane := nodeplane.New(log, deployment, a.LeaseTTL(),
-		append([]nodeplane.Option{
-			nodeplane.WithRegistrar(a), nodeplane.WithTierCatalog(tiers),
-			nodeplane.WithBarrierStore(a),
-		}, wo.plane...)...)
+	first := startNodeLoop(t, log, c.wire.Addr, np)
+	c.awaitRegistered(t, 1)
 
-	var lc net.ListenConfig
-
-	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	var handlerOpts []nodeplane.HandlerOption
-	if len(wo.targetJIT) > 0 {
-		handlerOpts = append(handlerOpts, nodeplane.WithTargetJIT(wo.targetJIT))
-	}
-
-	wire := &http.Server{
-		Handler:           nodeplane.Handler(log, plane, a, app.NodeJIT{Client: client}, handlerOpts...),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		// Ends when Shutdown is called, which is the only way this test stops it.
-		if err := wire.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			t.Errorf("the node wire stopped unexpectedly: %v", err)
-		}
-	}()
-
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), wireShutdownGrace)
-		defer cancel()
-
-		if err := wire.Shutdown(ctx); err != nil {
-			t.Errorf("the node wire did not shut down cleanly: %v", err)
-		}
-	})
-
-	first := startNodeLoop(t, log, ln.Addr().String(), nodeProcess{
-		host: host, deployment: deployment, provider: prov, kind: kind, shapes: shapes,
-		hurry: hurry, supersedable: wo.supersedable, drainTimeout: wo.drainTimeout,
-	})
-
-	// REGISTERED BEFORE THE CONTROL PLANE HAS ANYTHING TO GIVE IT. Otherwise the
-	// first launch legitimately finds no node and the test measures startup order
-	// rather than the wire.
-	deadline := time.Now().Add(30 * time.Second)
-	for len(plane.Nodes()) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the node never registered over the wire")
-		}
-
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	return first, plane, ln.Addr().String(),
-		[]server.ControlPlaneOption{server.WithNodeRunner(plane.NewRunner())}
+	return first
 }
 
 // nodeProcess is one node process worth of configuration: what it runs, who it
@@ -1044,44 +921,19 @@ type nodeLoop struct {
 // comes back so a test can wait for THAT process to be current rather than for
 // the previous one to be gone, and `done` so a test can wait for a superseded
 // process to finish draining on its own.
-// wireShutdownGrace is how long the node wire is given to stop.
-//
-// IT MUST EXCEED GO'S OWN FIVE SECONDS, AND IT USED TO EQUAL THEM. A connection
-// the server has ACCEPTED but that has not sent a request header is StateNew, and
-// http.Server.Shutdown does not close one: net/http's closeIdleConns treats
-// StateNew as idle only once it has been in that state for more than five seconds
-// — "Issue 22682" in server.go — and until then Shutdown reports the server as
-// not quiescent and keeps waiting.
-//
-// So a five-second deadline against a five-second grace is a photo finish, and
-// the deadline is what fires. MEASURED with a standalone probe rather than read:
-// a server with one accepted-but-silent connection returns `context deadline
-// exceeded` after exactly 5s under a 5s deadline, and shuts down cleanly under a
-// 20s one.
-//
-// WHERE SUCH A CONNECTION COMES FROM is the node's own transport: it dials, the
-// loop's context is cancelled before the request is written, and the server is
-// left holding an accepted connection that will never speak. That is why the
-// failure is intermittent rather than constant, and why the flake's report could
-// record that the node loop had already ended and the poll handler was not the
-// culprit — nothing was in flight, and that was precisely the problem.
-//
-// THIRTY SECONDS IS A CEILING ON A HANG, NOT A TARGET. Shutdown returns as soon
-// as the server is quiescent, which the same probe measured at ~1s once the
-// grace has elapsed, so a passing run pays nothing for the larger number.
-const wireShutdownGrace = 30 * time.Second
-
 func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) *nodeLoop {
 	t.Helper()
 
-	nc, err := nodeclient.New(nodeclient.Options{Base: "http://" + addr, Node: np.host})
+	nc, err := app.NewNodeClient(&config.Config{Node: &config.NodeConfig{
+		Name: np.host, ServerAddr: "http://" + addr,
+	}}, nil)
 	if err != nil {
-		t.Fatalf("nodeclient.New: %v", err)
+		t.Fatalf("app.NewNodeClient: %v", err)
 	}
 
 	// THE CLIENT IS BOTH LEDGER AND MINT, exactly as `billet node` wires it. The
 	// runner has no idea it became remote.
-	runner := node.New(nc, np.host, nc, np.provider, log)
+	runner := app.NewNodeRunner(nc, np.host, np.provider, log)
 
 	loopCtx, cancel := context.WithCancel(t.Context())
 	ctx := loopCtx
@@ -1098,7 +950,7 @@ func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) 
 
 		// Run only ends when the context does; anything else is a real failure —
 		// unless the test is about this process being superseded.
-		err := nodeclient.Run(ctx, nc, runner, nodeclient.LoopOptions{
+		err := app.RunNodeLoop(ctx, nc, runner, nodeclient.LoopOptions{
 			Provider:   np.kind,
 			Deployment: np.deployment,
 			// What this host contributes. Required now: a node reporting nothing is
@@ -1108,6 +960,9 @@ func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) 
 			EC2Shapes: np.shapes,
 			Log:       log,
 			Backoff:   50 * time.Millisecond,
+			// The node's drain_timeout, when a scenario sets one; zero leaves the
+			// loop's own default.
+			DrainTimeout: np.drainTimeout,
 			// THE OPERATOR'S SECOND SIGNAL, wired exactly as `billet node` wires
 			// it. A node's drain has no timeout — it waits for as long as the work
 			// runs — so this is the only thing that ends one holding compute whose
@@ -1158,7 +1013,7 @@ func (s *stack) run(t *testing.T) func() {
 	finished := make(chan struct{})
 
 	go func() {
-		runErr = s.server.Run(ctx)
+		runErr = s.scheduler.Run(ctx)
 
 		close(finished)
 	}()
