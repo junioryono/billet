@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -18,8 +17,8 @@ import (
 
 // cmdCacheStatus prints every tier's caches, every kill-switch block, and what
 // each cache did for the jobs assigned recently.
-func cmdCacheStatus(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet cache status", os.Stdout)
+func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet cache status", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to count what the caches did")
 	if err := cli.Parse(fs, args); err != nil {
@@ -33,10 +32,10 @@ func cmdCacheStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	printTierCaches(os.Stdout, cfg.Tiers)
+	printTierCaches(env.Stdout, cfg.Tiers)
 
 	if cfg.Server == nil {
-		fmt.Println("\nno server section, so no central kill switch to read")
+		fmt.Fprintln(env.Stdout, "\nno server section, so no central kill switch to read")
 
 		return nil
 	}
@@ -49,7 +48,7 @@ func cmdCacheStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	printCacheBlocks(os.Stdout, blocks)
+	printCacheBlocks(env.Stdout, blocks)
 	if err := db.Close(); err != nil {
 		return err
 	}
@@ -63,7 +62,7 @@ func cmdCacheStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	printCacheOutcomes(os.Stdout, counts, jobs, *since)
+	printCacheOutcomes(env.Stdout, counts, jobs, *since)
 
 	return nil
 }

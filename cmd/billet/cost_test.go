@@ -25,7 +25,7 @@ func TestEC2CostStatesItsBoundAndSource(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := printRemoteCost(cfg); err != nil {
+		if err := printRemoteCost(processEnv(), cfg); err != nil {
 			t.Fatalf("printRemoteCost: %v", err)
 		}
 	})
@@ -65,7 +65,7 @@ func TestRemoteFleetCostStatesItsDeploymentBoundAndScope(t *testing.T) {
 	}}
 
 	out := capture(t, func() {
-		if err := printRemoteFleetCost(t.Context(), a, cfg); err != nil {
+		if err := printRemoteFleetCost(t.Context(), processEnv(), a, cfg); err != nil {
 			t.Fatalf("printRemoteFleetCost: %v", err)
 		}
 	})
@@ -115,7 +115,7 @@ func TestRemoteFleetCostCoversACodeBuildOnlyDeployment(t *testing.T) {
 	}}
 
 	out := capture(t, func() {
-		if err := printRemoteFleetCost(t.Context(), a, cfg); err != nil {
+		if err := printRemoteFleetCost(t.Context(), processEnv(), a, cfg); err != nil {
 			t.Fatalf("printRemoteFleetCost: %v", err)
 		}
 	})
@@ -158,7 +158,7 @@ func TestRemoteFleetCostLeavesStatusUsableForARetiredLegacyNode(t *testing.T) {
 	}}
 
 	out := capture(t, func() {
-		if err := printRemoteFleetCost(t.Context(), a, cfg); err != nil {
+		if err := printRemoteFleetCost(t.Context(), processEnv(), a, cfg); err != nil {
 			t.Fatalf("printRemoteFleetCost made status fail: %v", err)
 		}
 	})

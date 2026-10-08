@@ -95,7 +95,7 @@ func TestTheReportedRootFilesystemMustBeTheGrownOne(t *testing.T) {
 	grown := strconv.FormatInt(int64(disk)/100*97, 10)
 	ungrown := strconv.FormatInt(int64(36*config.GiB), 10)
 
-	if err := checkGuestReport(report(grown), "probe-secret", disk); err != nil {
+	if err := checkGuestReport(processEnv(), report(grown), "probe-secret", disk); err != nil {
 		t.Errorf("a filesystem at its grown size was refused: %v", err)
 	}
 	for name, tc := range map[string]struct{ rootfs, clause string }{
@@ -107,12 +107,12 @@ func TestTheReportedRootFilesystemMustBeTheGrownOne(t *testing.T) {
 		"another field": {ungrown + "\nother_rootfs=" + grown, "did not reach it"},
 		"twice":         {grown + "\nrootfs=" + grown, "2 times"},
 	} {
-		err := checkGuestReport(report(tc.rootfs), "probe-secret", disk)
+		err := checkGuestReport(processEnv(), report(tc.rootfs), "probe-secret", disk)
 		if err == nil || !strings.Contains(err.Error(), tc.clause) {
 			t.Errorf("%s: checkGuestReport = %v, want a refusal saying %q", name, err, tc.clause)
 		}
 	}
-	if err := checkGuestReport(report(""), "probe-secret", 0); err != nil {
+	if err := checkGuestReport(processEnv(), report(""), "probe-secret", 0); err != nil {
 		t.Errorf("with no grow asked for, a report without rootfs was refused: %v", err)
 	}
 }
@@ -130,7 +130,7 @@ func TestTheReportIsJudgedAgainstTheGrownDisk(t *testing.T) {
 	}, "\n")
 	report := make(chan string, 1)
 	report <- body
-	err := awaitGuestReport(t.Context(), report, nil, "ubuntu-2404-x64@g1", "probe-secret",
+	err := awaitGuestReport(t.Context(), processEnv(), report, nil, "ubuntu-2404-x64@g1", "probe-secret",
 		80*config.GiB, time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "did not reach it") {
 		t.Fatalf("awaitGuestReport = %v, want an ungrown filesystem refused", err)
@@ -164,8 +164,8 @@ func TestTheVerifyCommandLaunchesOnTheDiskItChose(t *testing.T) {
 				}
 			}
 		case *ast.CallExpr:
-			if isCallTo(n, "verifyGuestImage") && len(n.Args) == 8 {
-				passed = isIdent(n.Args[6], "disk")
+			if isCallTo(n, "verifyGuestImage") && len(n.Args) == 9 {
+				passed = isIdent(n.Args[7], "disk")
 			}
 		}
 
@@ -238,7 +238,7 @@ func (l *launchRecorder) Destroy(context.Context, string) (provider.Teardown, er
 func TestAVerificationLaunchesOnTheGrownDisk(t *testing.T) {
 	backend := &launchRecorder{}
 	fakeGuestListener(t, backend)
-	err := verifyGuestImage(t.Context(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
+	err := verifyGuestImage(t.Context(), processEnv(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
 		120*config.GiB, time.Second)
 	if err == nil || !strings.Contains(err.Error(), "did not launch") {
 		t.Fatalf("verifyGuestImage = %v, want the refused launch reported", err)
@@ -261,7 +261,7 @@ func TestAnUngrownGuestFailsTheVerification(t *testing.T) {
 	}, "\n")}
 	fakeGuestListener(t, backend)
 
-	err := verifyGuestImage(t.Context(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
+	err := verifyGuestImage(t.Context(), processEnv(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
 		120*config.GiB, time.Minute)
 	if err == nil || !strings.Contains(err.Error(), "did not reach it") {
 		t.Fatalf("verifyGuestImage = %v, want the ungrown filesystem refused", err)

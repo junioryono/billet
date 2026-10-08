@@ -405,8 +405,8 @@ type inspectPreparation struct {
 	TransactionLock maybe `json:"transaction_lock"`
 }
 
-func cmdReleaseInspect(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet release inspect", os.Stdout)
+func cmdReleaseInspect(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet release inspect", env.Stdout)
 	configPath := flags.String("config", defaultConfigPath(), "path to billet.yaml")
 	asJSON := flags.Bool("json", false, "print the report as JSON")
 	if err := cli.Parse(flags, args); err != nil {
@@ -418,10 +418,10 @@ func cmdReleaseInspect(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("render the report: %w", err)
 		}
-		fmt.Println(string(body))
+		fmt.Fprintln(env.Stdout, string(body))
 		return nil
 	}
-	printInspectReport(report)
+	printInspectReport(env, report)
 	return nil
 }
 
@@ -2092,39 +2092,39 @@ func inspectGuardOf(active string) (maybe, maybe) {
 	return known("converge-guard"), known(out)
 }
 
-func printInspectReport(r inspectReport) {
-	fmt.Printf("config        %s", r.Config.Path)
+func printInspectReport(env cli.Env, r inspectReport) {
+	fmt.Fprintf(env.Stdout, "config        %s", r.Config.Path)
 	if !r.Config.Readable {
-		fmt.Printf(" (unreadable: %s)", r.Config.Error)
+		fmt.Fprintf(env.Stdout, " (unreadable: %s)", r.Config.Error)
 	}
-	fmt.Println()
-	fmt.Printf("executable    %s %s\n", r.Executable.Version, describeMaybe(r.Executable.SHA256))
-	fmt.Printf("provenance    %s", r.Provenance.Verdict)
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "executable    %s %s\n", r.Executable.Version, describeMaybe(r.Executable.SHA256))
+	fmt.Fprintf(env.Stdout, "provenance    %s", r.Provenance.Verdict)
 	if r.Provenance.Reason != "" {
-		fmt.Printf(" (%s)", r.Provenance.Reason)
+		fmt.Fprintf(env.Stdout, " (%s)", r.Provenance.Reason)
 	}
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 	for _, role := range []string{"server", "node"} {
 		svc := r.Services[role]
 		if svc.UnitPresent.known && svc.UnitPresent.value == false {
-			fmt.Printf("%-13s no unit\n", role)
+			fmt.Fprintf(env.Stdout, "%-13s no unit\n", role)
 			continue
 		}
-		fmt.Printf("%-13s %s/%s shape=%s image=%s\n", role, describeMaybe(svc.ActiveState),
+		fmt.Fprintf(env.Stdout, "%-13s %s/%s shape=%s image=%s\n", role, describeMaybe(svc.ActiveState),
 			describeMaybe(svc.SubState), describeMaybe(svc.Shape), describeMaybe(svc.SameAsExecutable))
 	}
 	for _, key := range []string{"upgrade_timer", "backup_timer", "backup_service"} {
 		svc := r.Services[key]
 		if svc.UnitPresent.known && svc.UnitPresent.value == false {
-			fmt.Printf("%-13s no unit (%s/%s)\n", key, describeMaybe(svc.ActiveState), describeMaybe(svc.SubState))
+			fmt.Fprintf(env.Stdout, "%-13s no unit (%s/%s)\n", key, describeMaybe(svc.ActiveState), describeMaybe(svc.SubState))
 			continue
 		}
-		fmt.Printf("%-13s %s/%s enabled=%s\n", key, describeMaybe(svc.ActiveState),
+		fmt.Fprintf(env.Stdout, "%-13s %s/%s enabled=%s\n", key, describeMaybe(svc.ActiveState),
 			describeMaybe(svc.SubState), describeMaybe(svc.Enabled))
 	}
-	fmt.Printf("binding       %s\n", describeMaybe(r.ConfigBinding))
-	fmt.Printf("deployment    %s\n", describeMaybe(r.Host.DeploymentID))
-	fmt.Printf("transaction   root=%s active=%s lock_held=%s\n", r.Transaction.Root,
+	fmt.Fprintf(env.Stdout, "binding       %s\n", describeMaybe(r.ConfigBinding))
+	fmt.Fprintf(env.Stdout, "deployment    %s\n", describeMaybe(r.Host.DeploymentID))
+	fmt.Fprintf(env.Stdout, "transaction   root=%s active=%s lock_held=%s\n", r.Transaction.Root,
 		describeMaybe(r.Transaction.Active), describeMaybe(r.Transaction.LockHeld))
 }
 

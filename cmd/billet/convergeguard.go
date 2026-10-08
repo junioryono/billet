@@ -303,26 +303,26 @@ func guardObserve(kind, path string, f *os.File) error {
 }
 
 // cmdConvergeGuard is the operator's and the role's entry to the guard.
-func cmdConvergeGuard(ctx context.Context, args []string) error {
+func cmdConvergeGuard(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet converge-guard prepare|settle|hold|release|status|recover|holder")
 	}
 
 	switch args[0] {
 	case "prepare":
-		return cmdGuardPrepare(ctx, args[1:])
+		return cmdGuardPrepare(ctx, env, args[1:])
 	case "settle":
-		return cmdGuardSettle(args[1:])
+		return cmdGuardSettle(env, args[1:])
 	case "hold":
-		return cmdGuardHold(args[1:])
+		return cmdGuardHold(env, args[1:])
 	case "release":
-		return cmdGuardRelease(args[1:])
+		return cmdGuardRelease(env, args[1:])
 	case "status":
-		return cmdGuardStatus(args[1:])
+		return cmdGuardStatus(env, args[1:])
 	case "recover":
-		return cmdGuardRecover(args[1:])
+		return cmdGuardRecover(env, args[1:])
 	case "holder":
-		return cmdGuardHolder(args[1:])
+		return cmdGuardHolder(env, args[1:])
 	}
 
 	return fmt.Errorf("unknown converge-guard command %q; try prepare, settle, hold, release, status, recover or holder", args[0])
@@ -348,8 +348,8 @@ func checkHolder(holder string) error {
 	return nil
 }
 
-func cmdGuardHold(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard hold", os.Stdout)
+func cmdGuardHold(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard hold", env.Stdout)
 	holder := flags.String("holder", "", "who holds the guard: the converge's run id, or an operator's handle")
 	candidate := flags.String("candidate", "", "the release executable this guard records, staged by the role "+
 		"in a recovery directory under the upgrade root; the managed binary when absent")
@@ -1035,8 +1035,8 @@ func hashManagedBinary() (string, string, error) {
 	return installedBinary, sum, nil
 }
 
-func cmdGuardRelease(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard release", os.Stdout)
+func cmdGuardRelease(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard release", env.Stdout)
 	holder := flags.String("holder", "", "the holder releasing its guard")
 	cleanup := flags.Bool("cleanup", false, "the acquiring invocation releasing, inside its preparation window; "+
 		"needs --token")
@@ -1164,8 +1164,8 @@ func removeUnpublishedDirAt(root *txLock, dir *os.File) error {
 	return syncDirFD(root.dir)
 }
 
-func cmdGuardRecover(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard recover", os.Stdout)
+func cmdGuardRecover(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard recover", env.Stdout)
 	holder := flags.String("holder", "", "remove the guard this holder left with no transaction pointer")
 	unpublished := flags.Bool("unpublished", false, "remove a hold that never returned from its publication")
 	oldStopped := flags.Bool("old-driver-stopped", false, "assert that the holder's driver is stopped or cannot "+
@@ -1496,8 +1496,8 @@ func takeOverGuard(root *txLock, old, holder string) error {
 	return syncDirFD(root.dir)
 }
 
-func cmdGuardStatus(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard status", os.Stdout)
+func cmdGuardStatus(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard status", env.Stdout)
 	asJSON := flags.Bool("json", false, "print the claim's shape and record as JSON")
 
 	if err := cli.Parse(flags, args); err != nil {
@@ -1515,18 +1515,18 @@ func cmdGuardStatus(args []string) error {
 			return err
 		}
 
-		fmt.Println(string(body))
+		fmt.Fprintln(env.Stdout, string(body))
 
 		return nil
 	}
 
-	fmt.Println(shape.String())
+	fmt.Fprintln(env.Stdout, shape.String())
 
 	return nil
 }
 
-func cmdGuardHolder(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard holder", os.Stdout)
+func cmdGuardHolder(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard holder", env.Stdout)
 
 	if err := cli.Parse(flags, args); err != nil {
 		return err
@@ -1545,7 +1545,7 @@ func cmdGuardHolder(args []string) error {
 		return fmt.Errorf("%w, and its record cannot be read (%s)", errGuardHeld, shape.RecordErr)
 	}
 
-	fmt.Println(shape.Guard.Holder)
+	fmt.Fprintln(env.Stdout, shape.Guard.Holder)
 
 	return nil
 }
@@ -2118,32 +2118,32 @@ func refuseShape(shape claimShape) error {
 const guardStaleAfter = 24 * time.Hour
 
 // printGuard is the one line `billet status` gives the host's guard.
-func printGuard() {
+func printGuard(env cli.Env) {
 	shape, err := classifyClaim()
 
 	switch {
 	case err != nil:
-		fmt.Printf("guard     could not be read: %v\n", err)
+		fmt.Fprintf(env.Stdout, "guard     could not be read: %v\n", err)
 	case shape.Kind == claimGuard:
-		fmt.Printf("guard     %s\n", describeGuardAge(shape))
+		fmt.Fprintf(env.Stdout, "guard     %s\n", describeGuardAge(shape))
 	case shape.Kind == claimUnpublished:
-		fmt.Printf("guard     %s\n", shape)
+		fmt.Fprintf(env.Stdout, "guard     %s\n", shape)
 	}
 }
 
 // checkGuard is `billet check`'s report of the host's guard: a fresh one is
 // informational, one past guardStaleAfter is a warning naming the recovery, and
 // a record whose time cannot be read is could-not-tell, never fresh.
-func checkGuard() {
+func checkGuard(env cli.Env) {
 	shape, err := classifyClaim()
 
 	switch {
 	case err != nil:
-		fmt.Printf("guard    could not be read: %v\n", err)
+		fmt.Fprintf(env.Stdout, "guard    could not be read: %v\n", err)
 
 		return
 	case shape.Kind == claimUnpublished:
-		fmt.Printf("guard    WARNING: %s\n", shape)
+		fmt.Fprintf(env.Stdout, "guard    WARNING: %s\n", shape)
 
 		return
 	case shape.Kind != claimGuard:
@@ -2151,7 +2151,7 @@ func checkGuard() {
 	}
 
 	if shape.RecordErr != "" {
-		fmt.Printf("guard    WARNING: a guard whose record cannot be read (%s); `billet converge-guard status`\n",
+		fmt.Fprintf(env.Stdout, "guard    WARNING: a guard whose record cannot be read (%s); `billet converge-guard status`\n",
 			shape.RecordErr)
 
 		return
@@ -2159,7 +2159,7 @@ func checkGuard() {
 
 	at, err := time.Parse(time.RFC3339, shape.Guard.ClaimedAt)
 	if err != nil {
-		fmt.Printf("guard    WARNING: held by %s, claimed at %q which is not a time, so its age cannot be "+
+		fmt.Fprintf(env.Stdout, "guard    WARNING: held by %s, claimed at %q which is not a time, so its age cannot be "+
 			"told; `billet converge-guard status`\n", shape.Guard.Holder, shape.Guard.ClaimedAt)
 
 		return
@@ -2167,14 +2167,14 @@ func checkGuard() {
 
 	age := guardNow().Sub(at)
 	if age >= guardStaleAfter {
-		fmt.Printf("guard    WARNING: held by %s for %s (since %s); if that converge is over, "+
+		fmt.Fprintf(env.Stdout, "guard    WARNING: held by %s for %s (since %s); if that converge is over, "+
 			"`billet converge-guard recover --holder %s --old-driver-stopped` removes it\n",
 			shape.Guard.Holder, age.Truncate(time.Minute), shape.Guard.ClaimedAt, shape.Guard.Holder)
 
 		return
 	}
 
-	fmt.Printf("guard    held by %s for %s (since %s)\n", shape.Guard.Holder, age.Truncate(time.Second),
+	fmt.Fprintf(env.Stdout, "guard    held by %s for %s (since %s)\n", shape.Guard.Holder, age.Truncate(time.Second),
 		shape.Guard.ClaimedAt)
 }
 

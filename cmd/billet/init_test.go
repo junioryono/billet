@@ -34,7 +34,7 @@ const (
 func TestInitWritesAConfigThatLoads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -100,7 +100,7 @@ func TestInitWritesAConfigThatLoads(t *testing.T) {
 func TestInitFirecrackerWritesAnUntrustedConfigThatLoads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--provider", "firecracker",
 	}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -200,7 +200,7 @@ func TestInitWritesAConfigThatLoadsOnAnySizeOfMachine(t *testing.T) {
 					t.Fatalf("write: %v", err)
 				}
 
-				if err := writeGitHubBlock(path, githubBlock{
+				if err := writeGitHubBlock(processEnv(), path, githubBlock{
 					Org: "acme", AppID: 1, InstallationID: 2,
 					PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
 				}); err != nil {
@@ -288,7 +288,7 @@ func TestInitFirecrackerGuidanceFollowsTheRealTrust(t *testing.T) {
 func TestInitRefusesADockerTrialWithNoPolicy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	err := cmdInit(t.Context(), []string{"--config", path, "--org", "acme"})
+	err := cmdInit(t.Context(), processEnv(), []string{"--config", path, "--org", "acme"})
 	if err == nil {
 		t.Fatal("init wrote a docker config with no runner-group/workflow policy")
 	}
@@ -337,7 +337,7 @@ func TestInitRefusesAMalformedPolicy(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "billet.yaml")
-			err := cmdInit(t.Context(), append([]string{"--config", path, "--org", "acme"}, tc.args...))
+			err := cmdInit(t.Context(), processEnv(), append([]string{"--config", path, "--org", "acme"}, tc.args...))
 			if err == nil {
 				t.Fatalf("init accepted %s", tc.name)
 			}
@@ -360,7 +360,7 @@ func TestInitWillNotClobber(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), []string{
+		if err := cmdInit(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -421,7 +421,7 @@ github:
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: 42, InstallationID: 99, ClientID: "Iv1.abc",
 		PrivateKeyPath: "/etc/billet/key.pem",
 	}); err != nil {
@@ -458,7 +458,7 @@ func runInit(t *testing.T, args ...string) (string, *config.Config) {
 	full := append([]string{"--config", path, "--org", "acme"}, args...)
 
 	var initErr error
-	out := capture(t, func() { initErr = cmdInit(t.Context(), full) })
+	out := capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), full) })
 	if initErr != nil {
 		t.Fatalf("init: %v", initErr)
 	}
@@ -503,7 +503,7 @@ func TestShellArgQuotesForPaste(t *testing.T) {
 // no spaces), so the quoting is exercised rather than assumed.
 func TestInitNextGuidanceIsShellSafe(t *testing.T) {
 	out := capture(t, func() {
-		printInitNext("/tmp/a b/billet.yaml", initconfig.Params{
+		printInitNext(processEnv(), "/tmp/a b/billet.yaml", initconfig.Params{
 			Provider: config.ProviderDocker, Profile: initconfig.ProfileLocal,
 		}, true)
 	})
@@ -528,7 +528,7 @@ func TestInitLocalServiceWritesAGroupReadableConfig(t *testing.T) {
 	asLinux(t)
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--profile", "local-service",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -607,7 +607,7 @@ func theServiceShapeIsGroupReadable(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--profile", "local-service", "--force",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -628,7 +628,7 @@ func theUserSessionShapeIsPrivate(t *testing.T) {
 	t.Helper()
 
 	localPath := filepath.Join(t.TempDir(), "billet.yaml")
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", localPath, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -654,7 +654,7 @@ func TestInitRefusesLocalServiceWhereBilletShipsNoServices(t *testing.T) {
 	hostOS = "plan9"
 	t.Cleanup(func() { hostOS = prev })
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--profile", "local-service",
 		"--runner-group", testTrialGroup,
@@ -682,7 +682,7 @@ func TestInitAcceptsLocalServiceOnAMac(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path,
 		"--org", "acme", "--profile", "local-service",
 		"--provider", "docker",
@@ -778,7 +778,7 @@ func TestTheServiceNextStepsNameCommandsThatExistOnThisPlatform(t *testing.T) {
 	hostOS = "darwin"
 
 	mac := capture(t, func() {
-		printInitNext(cfg, initconfig.Params{
+		printInitNext(processEnv(), cfg, initconfig.Params{
 			Org: "acme", Provider: config.ProviderDocker,
 			Profile: initconfig.ProfileLocalService,
 		}, true)
@@ -787,7 +787,7 @@ func TestTheServiceNextStepsNameCommandsThatExistOnThisPlatform(t *testing.T) {
 	hostOS = "linux"
 
 	linux := capture(t, func() {
-		printInitNext(cfg, initconfig.Params{
+		printInitNext(processEnv(), cfg, initconfig.Params{
 			Org: "acme", Provider: config.ProviderDocker,
 			Profile: initconfig.ProfileLocalService,
 		}, true)
@@ -918,7 +918,7 @@ func TestEveryServiceInstructionInitPrintsExistsOnItsPlatform(t *testing.T) {
 
 		notes := captureStderr(t, func() {
 			out = capture(t, func() {
-				initErr = cmdInit(t.Context(), []string{
+				initErr = cmdInit(t.Context(), processEnv(), []string{
 					"--config", path, "--org", "acme", "--profile", "local-service",
 					"--provider", "docker",
 					"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -979,7 +979,7 @@ func TestEveryServiceInstructionInitPrintsExistsOnItsPlatform(t *testing.T) {
 			hostOS = goos
 
 			out := capture(t, func() {
-				printInitNextFor("/etc/billet/billet.yaml", initconfig.Params{
+				printInitNextFor(processEnv(), "/etc/billet/billet.yaml", initconfig.Params{
 					Org: "acme", Provider: config.ProviderDocker,
 					Profile: initconfig.ProfileLocalService,
 				}, true, true)
@@ -1144,7 +1144,7 @@ func TestBothWritePathsExplainAPermissionFailure(t *testing.T) {
 				}
 			})
 
-			err := cmdInit(t.Context(), []string{
+			err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", path, "--org", "acme", "--profile", "local-service",
 				"--provider", "docker",
 				"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1235,7 +1235,7 @@ func TestTheServiceProfileRefusesToWriteAConfigAsRoot(t *testing.T) {
 
 	dir := filepath.Join(t.TempDir(), "etc", "billet")
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(dir, "billet.yaml"),
 		"--org", "acme", "--profile", "local-service", "--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1264,7 +1264,7 @@ func TestTheServiceProfileRefusesToWriteAConfigAsRoot(t *testing.T) {
 	hostOS = "linux"
 
 	linuxPath := filepath.Join(t.TempDir(), "billet.yaml")
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", linuxPath, "--org", "acme", "--profile", "local-service",
 		"--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1275,7 +1275,7 @@ func TestTheServiceProfileRefusesToWriteAConfigAsRoot(t *testing.T) {
 	hostOS = "darwin"
 
 	userSession := filepath.Join(t.TempDir(), "billet.yaml")
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", userSession, "--org", "acme", "--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
 	}); err != nil {
@@ -1286,7 +1286,7 @@ func TestTheServiceProfileRefusesToWriteAConfigAsRoot(t *testing.T) {
 
 	_ = captureStderr(t, func() {
 		_ = capture(t, func() {
-			emitErr = cmdInit(t.Context(), append(
+			emitErr = cmdInit(t.Context(), processEnv(), append(
 				emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
 				"--max-vcpu", "8", "--max-memory", "32GiB"))
 		})
@@ -1312,7 +1312,7 @@ func TestTheServiceProfileAcceptsAnOrdinaryMacRun(t *testing.T) {
 	hostOS = "darwin"
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--profile", "local-service",
 		"--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1340,7 +1340,7 @@ func TestTheServiceProfileAcceptsAnOrdinaryMacRun(t *testing.T) {
 		}
 	})
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(locked, "sub", "billet.yaml"),
 		"--org", "acme", "--profile", "local-service", "--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1374,7 +1374,7 @@ func TestTheGuidanceAndTheConfigNameOneAppKey(t *testing.T) {
 			hostOS = goos
 
 			path := filepath.Join(t.TempDir(), "billet.yaml")
-			if err := cmdInit(t.Context(), []string{
+			if err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", path, "--org", "acme", "--profile", "local-service",
 				"--provider", "docker",
 				"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1401,7 +1401,7 @@ func TestTheGuidanceAndTheConfigNameOneAppKey(t *testing.T) {
 			}
 
 			out := capture(t, func() {
-				printInitNext(path, initconfig.Params{
+				printInitNext(processEnv(), path, initconfig.Params{
 					Org: "acme", Provider: config.ProviderDocker,
 					Profile: initconfig.ProfileLocalService,
 				}, true)
@@ -1443,7 +1443,7 @@ func TestTheOwnershipNoteIsSilentWhereTheServicesRunAsTheOperator(t *testing.T) 
 
 	hostOS = "darwin"
 
-	if out := capture(t, func() { serviceOwnership(path) }); out != "" {
+	if out := capture(t, func() { serviceOwnership(processEnv(), path) }); out != "" {
 		t.Errorf("the ownership note speaks on a Mac, where there is no service account:\n%s", out)
 	}
 
@@ -1451,7 +1451,7 @@ func TestTheOwnershipNoteIsSilentWhereTheServicesRunAsTheOperator(t *testing.T) 
 	// pass the assertion above and silently drop the one remedy that is real.
 	hostOS = "linux"
 
-	out := capture(t, func() { serviceOwnership(path) })
+	out := capture(t, func() { serviceOwnership(processEnv(), path) })
 	for _, want := range []string{"chown root:" + initconfig.ServiceGroup, "billet package"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the Linux ownership note lost %q:\n%s", want, out)
@@ -1464,7 +1464,7 @@ func TestTheOwnershipNoteIsSilentWhereTheServicesRunAsTheOperator(t *testing.T) 
 func TestInitListenFlagReachesBothEnds(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--listen", "127.0.0.1:7901",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -1495,7 +1495,7 @@ func TestInitListenFlagReachesBothEnds(t *testing.T) {
 func loadWrittenConfig(t *testing.T, path string) *config.Config {
 	t.Helper()
 
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: 1, InstallationID: 2,
 		PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
 	}); err != nil {
@@ -1526,7 +1526,7 @@ func TestInitTartWritesAConfigThatLoads(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--provider", "tart", "--profile", "local-service",
 		"--node-name", "mac-mini-1",
 		"--guest-os", "macos", "--guest-os", "linux",
@@ -1606,7 +1606,7 @@ func TestInitRefusesATartConfigOffAppleSilicon(t *testing.T) {
 
 			path := filepath.Join(t.TempDir(), "billet.yaml")
 
-			err := cmdInit(t.Context(), []string{
+			err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", path, "--org", "acme", "--provider", "tart",
 				"--profile", host.profile,
 			})
@@ -1627,7 +1627,7 @@ func TestInitRefusesATartConfigOffAppleSilicon(t *testing.T) {
 			// AND THE HOSTNAME CLAUSE GOES WHEN THE OPERATOR SUPPLIED THE NAME,
 			// because it is then false: billet reads nothing off this machine for
 			// it. The refusal is still correct; one of its reasons would not be.
-			named := cmdInit(t.Context(), []string{
+			named := cmdInit(t.Context(), processEnv(), []string{
 				"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 				"--org", "acme", "--provider", "tart", "--profile", "local-service",
 				"--node-name", "mac-mini-1",
@@ -1669,7 +1669,7 @@ func TestInitRefusesATartConfigOffAppleSilicon(t *testing.T) {
 func TestInitRefusesTartOnlyFlagsOnAnotherBackend(t *testing.T) {
 	for _, flag := range []string{"--guest-os", "--node-name", "--macos-image", "--linux-image"} {
 		t.Run(flag, func(t *testing.T) {
-			err := cmdInit(t.Context(), []string{
+			err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 				"--org", "acme", "--provider", "docker",
 				"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1699,7 +1699,7 @@ func TestInitReportsAnInvalidGuestKindRatherThanTheHostname(t *testing.T) {
 	t.Cleanup(func() { hostName = restore })
 	hostName = func() (string, error) { return "Junior's MacBook Pro.local", nil }
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "tart", "--profile", "local-service",
 		"--guest-os", "freebsd",
@@ -1736,7 +1736,7 @@ func TestInitAsksForANameWhenItCannotReadTheHostname(t *testing.T) {
 			t.Cleanup(func() { hostName = restore })
 			hostName = func() (string, error) { return "", errors.New("no hostname here") }
 
-			err := cmdInit(t.Context(), []string{
+			err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 				"--org", "acme", "--provider", "tart", "--profile", "local-service",
 				"--guest-os", tc.guest,
@@ -1775,7 +1775,7 @@ func TestInitRefusesAnEmptyTartFlag(t *testing.T) {
 
 	for _, flag := range []string{"--node-name", "--macos-image", "--linux-image"} {
 		t.Run(flag, func(t *testing.T) {
-			err := cmdInit(t.Context(), []string{
+			err := cmdInit(t.Context(), processEnv(), []string{
 				"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 				"--org", "acme", "--provider", "tart", "--profile", "local-service",
 				"--guest-os", "macos", "--guest-os", "linux",
@@ -1800,7 +1800,7 @@ func TestInitRefusesAnEmptyTartFlag(t *testing.T) {
 // looks like, so the flag was accepted and silently discarded. The same rule
 // --runner-group and the tart flags already follow.
 func TestInitRefusesAnEmptyStateDSNEnv(t *testing.T) {
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1820,7 +1820,7 @@ func TestInitRefusesAnEmptyStateDSNEnv(t *testing.T) {
 // way — what separates them is WHICH sentence the operator reads, and only one
 // of the two names something they typed.
 func TestInitRefusesADSNEnvNameNothingCouldExport(t *testing.T) {
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "docker",
 		"--runner-group", testTrialGroup, "--workflow", testTrialWorkflow,
@@ -1857,7 +1857,7 @@ func TestInitClaimsAnImageSizeOnlyForTheImageItMeasured(t *testing.T) {
 
 		var err error
 
-		out := capture(t, func() { err = cmdInit(t.Context(), args) })
+		out := capture(t, func() { err = cmdInit(t.Context(), processEnv(), args) })
 		if err != nil {
 			t.Fatalf("init: %v", err)
 		}
@@ -1900,7 +1900,7 @@ func TestInitClaimsAnImageSizeOnlyForTheImageItMeasured(t *testing.T) {
 // block whose every path is for a machine that cannot run the backend it names —
 // the same defect as an emission from a Mac describing the Mac.
 func TestInitRefusesAnAnsibleEmissionForTart(t *testing.T) {
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "tart", "--profile", "local-service", "--node-name", "mac-mini-1",
 		"--emit", "ansible",
@@ -1931,7 +1931,7 @@ func TestInitRefusesAMacOSTierWhenTheHostnameCannotBeANodeName(t *testing.T) {
 	t.Cleanup(func() { hostName = restore })
 	hostName = func() (string, error) { return "Junior's MacBook Pro.local", nil }
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "tart", "--profile", "local-service",
 	})
@@ -1956,7 +1956,7 @@ func TestInitTakesTheNodeNameFromAUsableHostname(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--provider", "tart", "--profile", "local-service",
 	}); err != nil {
 		t.Fatalf("`billet init --provider tart`: %v", err)
@@ -1983,7 +1983,7 @@ func TestInitAsksALinuxOnlyMacForANameItsHostnameCannotSupply(t *testing.T) {
 	t.Cleanup(func() { hostName = restore })
 	hostName = func() (string, error) { return "Junior's MacBook Pro.local", nil }
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--provider", "tart", "--profile", "local-service", "--guest-os", "linux",
 	})
@@ -2016,7 +2016,7 @@ func TestInitWritesTheNodeNameForALinuxOnlyMac(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--provider", "tart", "--profile", "local-service", "--guest-os", "linux",
 	}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -2067,7 +2067,7 @@ func TestInitTreatsAPaddedGuestKindAsTheKindItNames(t *testing.T) {
 	var initErr error
 
 	out := capture(t, func() {
-		initErr = cmdInit(t.Context(), []string{
+		initErr = cmdInit(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme", "--provider", "tart", "--profile", "local-service",
 			"--guest-os", "  macos  ",
 		})
@@ -2118,7 +2118,7 @@ func TestInitSizesATartConfigFromTheSeamRatherThanTheRunner(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--provider", "tart", "--profile", "local-service",
 		"--node-name", "mac-mini-1",
 	}); err != nil {
@@ -2152,7 +2152,7 @@ func TestInitStillGeneratesForEveryWritableProvider(t *testing.T) {
 	// "every writable provider" and covered two of three, and returning
 	// errNotImplemented for ec2 would have stayed green.
 	t.Run("ec2", func(t *testing.T) {
-		err := cmdInit(t.Context(), []string{
+		err := cmdInit(t.Context(), processEnv(), []string{
 			"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 			"--org", "acme", "--provider", "ec2",
 		})
@@ -2196,7 +2196,7 @@ func TestInitStillGeneratesForEveryWritableProvider(t *testing.T) {
 					"--node-name", "mac-mini-1", "--profile", "local-service")
 			}
 
-			if err := cmdInit(t.Context(), args); err != nil {
+			if err := cmdInit(t.Context(), processEnv(), args); err != nil {
 				t.Fatalf("`billet init --provider %s` no longer generates: %v", provider, err)
 			}
 		})

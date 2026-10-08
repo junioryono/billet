@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -15,30 +17,30 @@ import (
 //
 // IT NEVER FAILS THE COMMAND, for the reason printRollout does not: status is what
 // somebody runs when something is already wrong.
-func printCredentialSweeps(ctx context.Context, a *alloc.Allocator, db *state.DB) {
+func printCredentialSweeps(ctx context.Context, env cli.Env, a *alloc.Allocator, db *state.DB) {
 	sweeps, err := db.CredentialSweeps(ctx)
 	if err != nil {
-		fmt.Printf("staged    unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "staged    unavailable: %v\n", err)
 
 		return
 	}
 
 	paths, err := a.CodeBuildRegistrationPaths(ctx)
 	if err != nil {
-		fmt.Printf("staged    unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "staged    unavailable: %v\n", err)
 
 		return
 	}
 
 	for _, sw := range sweeps {
-		fmt.Printf("staged    %s (%s): %d registration(s) removed in total, %d last pass; %d waiting "+
+		fmt.Fprintf(env.Stdout, "staged    %s (%s): %d registration(s) removed in total, %d last pass; %d waiting "+
 			"on their leases, %d naming leases this ledger has never seen, %d not billet's; last "+
 			"swept %s\n",
 			sw.Path, sw.Region, sw.RemovedTotal, sw.Removed, sw.Kept, sw.Unaccounted,
 			sw.ForeignNames, formatSweptAt(sw.SweptAt))
 
 		if sw.Error != "" {
-			fmt.Printf("          the last pass stopped: %s\n", sw.Error)
+			fmt.Fprintf(env.Stdout, "          the last pass stopped: %s\n", sw.Error)
 		}
 	}
 
@@ -49,7 +51,7 @@ func printCredentialSweeps(ctx context.Context, a *alloc.Allocator, db *state.DB
 			continue
 		}
 
-		fmt.Printf("staged    node %s registered without its registration path, so nothing "+
+		fmt.Fprintf(env.Stdout, "staged    node %s registered without its registration path, so nothing "+
 			"sweeps the registrations it stages; upgrade it so its registration names "+
 			"node.codebuild.jit_parameter_path\n", p.Node)
 	}

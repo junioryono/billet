@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
@@ -84,7 +86,7 @@ type retireStep struct {
 // THE LIFECYCLE LOCK COVERS THE STOP-TO-ARCHIVE WINDOW AND NOTHING MORE:
 // `local up` must not start what this is stopping, and the node's restart past
 // the archive is a drain nobody should be queued behind.
-func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObservation, j retirement.Journal,
+func retireTransition(ctx context.Context, env cli.Env, m retireMode, obs *installedConfigObservation, j retirement.Journal,
 ) (retirement.Journal, []retireStep, *retireRefusal) {
 	var (
 		steps []retireStep
@@ -97,7 +99,7 @@ func retireTransition(ctx context.Context, m retireMode, obs *installedConfigObs
 		}
 
 		if err := host.release(); err != nil {
-			fmt.Fprintln(os.Stderr, "billet: release the lifecycle lock: "+err.Error())
+			fmt.Fprintln(env.Stderr, "billet: release the lifecycle lock: "+err.Error())
 		}
 	}()
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -59,8 +58,8 @@ type downOptions struct {
 // billet imposes no limit on one, so any default this command picked would be a
 // guess that ends in killed work. --timeout is available for somebody who knows
 // their fleet and wants a bound; without it this waits.
-func cmdLocalDown(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local down", os.Stdout)
+func cmdLocalDown(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local down", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this host is going down, recorded on the seal for whoever finds it sealed")
@@ -84,13 +83,13 @@ func cmdLocalDown(ctx context.Context, args []string) error {
 			"wait for as long as the jobs take", *timeout)
 	}
 
-	return runLocalDown(ctx, downOptions{
+	return runLocalDown(ctx, env, downOptions{
 		configPath: *cfgPath, reason: *reason, timeout: *timeout,
 		dryRun: *dryRun, force: *force, withoutProof: *withoutProof,
 	})
 }
 
-func runLocalDown(ctx context.Context, o downOptions) error {
+func runLocalDown(ctx context.Context, env cli.Env, o downOptions) error {
 	cfg, err := config.Load(o.configPath)
 	if err != nil {
 		return err
@@ -124,9 +123,9 @@ func runLocalDown(ctx context.Context, o downOptions) error {
 	}
 
 	if o.dryRun {
-		printDownPlan(c, req, o)
+		printDownPlan(env, c, req, o)
 
-		fmt.Println("\nNothing was changed (--dry-run).")
+		fmt.Fprintln(env.Stdout, "\nNothing was changed (--dry-run).")
 
 		return nil
 	}
@@ -149,17 +148,17 @@ func runLocalDown(ctx context.Context, o downOptions) error {
 
 		defer func() {
 			if err := lock.release(); err != nil {
-				fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+				fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 			}
 		}()
 	}
 
-	generation, proved, err := sealForShutdown(ctx, c, cfg, req, running, o)
+	generation, proved, err := sealForShutdown(ctx, env, c, cfg, req, running, o)
 	if err != nil {
 		return err
 	}
 
-	return stopAndDisable(ctx, c, cfg, req, generation, proved)
+	return stopAndDisable(ctx, env, c, cfg, req, generation, proved)
 }
 
 // serverIsRunning reports whether the control-plane unit has a live process.
@@ -229,18 +228,18 @@ func refuseForeignBuilds(services []lifeops.RunningFacts, force bool) error {
 // `billet drain` against the control plane stops new ones arriving. Saying that
 // plainly is the difference between an operator who runs the right command next
 // and one who believes this host is safely fenced.
-func sealForShutdown(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest,
+func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest,
 	running []lifeops.RunningFacts, o downOptions,
 ) (int64, bool, error) {
 	if !req.WantServer {
-		fmt.Printf("seal     SKIPPED: this host runs a node and no control plane, so it has\n")
-		fmt.Printf("         no admission ledger to seal. Stopping the node below drains the\n")
-		fmt.Printf("         work already on it, and NOTHING HERE stops the control plane\n")
-		fmt.Printf("         assigning more in the meantime — run `billet drain` against the\n")
-		fmt.Printf("         control plane first if that matters.\n\n")
-		fmt.Printf("         Nothing here can ask this host what it is running either: that\n")
-		fmt.Printf("         question goes through the control plane, which is on another\n")
-		fmt.Printf("         machine. `billet drain --wait` there covers this host too.\n\n")
+		fmt.Fprintf(env.Stdout, "seal     SKIPPED: this host runs a node and no control plane, so it has\n")
+		fmt.Fprintf(env.Stdout, "         no admission ledger to seal. Stopping the node below drains the\n")
+		fmt.Fprintf(env.Stdout, "         work already on it, and NOTHING HERE stops the control plane\n")
+		fmt.Fprintf(env.Stdout, "         assigning more in the meantime — run `billet drain` against the\n")
+		fmt.Fprintf(env.Stdout, "         control plane first if that matters.\n\n")
+		fmt.Fprintf(env.Stdout, "         Nothing here can ask this host what it is running either: that\n")
+		fmt.Fprintf(env.Stdout, "         question goes through the control plane, which is on another\n")
+		fmt.Fprintf(env.Stdout, "         machine. `billet drain --wait` there covers this host too.\n\n")
 
 		return 0, false, nil
 	}
@@ -278,9 +277,9 @@ func sealForShutdown(ctx context.Context, c converger, cfg *config.Config, req l
 	// deliberately, silently reopening a deployment they had quiesced for their
 	// own reasons.
 	if current.Mode == state.AdmissionSealed && current.Provenance == state.ProvenanceOperator {
-		fmt.Printf("seal     already held by an operator%s; leaving it as it is, so bringing\n",
+		fmt.Fprintf(env.Stdout, "seal     already held by an operator%s; leaving it as it is, so bringing\n",
 			byWhom(current))
-		fmt.Printf("         this host back up will NOT reopen admission\n\n")
+		fmt.Fprintf(env.Stdout, "         this host back up will NOT reopen admission\n\n")
 	} else {
 		reason := o.reason
 		if reason == "" {
@@ -291,14 +290,14 @@ func sealForShutdown(ctx context.Context, c converger, cfg *config.Config, req l
 			Expect:       current.Generation,
 			Provenance:   state.ProvenanceLocalDown,
 			Reason:       reason,
-			Actor:        actor(),
+			Actor:        actor(env),
 			KeepExisting: true,
 		})
 		if err != nil {
 			return 0, false, err
 		}
 
-		fmt.Printf("seal     admission sealed at generation %d; `billet local up` clears it\n\n",
+		fmt.Fprintf(env.Stdout, "seal     admission sealed at generation %d; `billet local up` clears it\n\n",
 			sealed.Generation)
 
 		current = sealed
@@ -313,17 +312,17 @@ func sealForShutdown(ctx context.Context, c converger, cfg *config.Config, req l
 
 	switch {
 	case o.withoutProof:
-		fmt.Printf("prove    SKIPPED by --without-compute-proof: no host will be asked what it\n")
-		fmt.Printf("         is running, so the ledger being empty is all this establishes\n\n")
+		fmt.Fprintf(env.Stdout, "prove    SKIPPED by --without-compute-proof: no host will be asked what it\n")
+		fmt.Fprintf(env.Stdout, "         is running, so the ledger being empty is all this establishes\n\n")
 	case !serverIsRunning(c, running):
-		fmt.Printf("prove    SKIPPED: the control plane on this host is not running, and it is\n")
-		fmt.Printf("         what asks each host what it is holding. Start it and re-run to\n")
-		fmt.Printf("         prove this machine idle, or accept what the ledger knows.\n\n")
+		fmt.Fprintf(env.Stdout, "prove    SKIPPED: the control plane on this host is not running, and it is\n")
+		fmt.Fprintf(env.Stdout, "         what asks each host what it is holding. Start it and re-run to\n")
+		fmt.Fprintf(env.Stdout, "         prove this machine idle, or accept what the ledger knows.\n\n")
 
 		withoutProof = true
 	}
 
-	if err := waitForQuiet(ctx, db, cfg, current.Generation, waitOptions{
+	if err := waitForQuiet(ctx, env, db, cfg, current.Generation, waitOptions{
 		timeout:      o.timeout,
 		withoutProof: withoutProof,
 	}); err != nil {
@@ -343,7 +342,7 @@ func sealForShutdown(ctx context.Context, c converger, cfg *config.Config, req l
 // start. There is little left to report by this point, since the barrier is
 // already quiet, but the ordering costs nothing and the failure it prevents is
 // silent.
-func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest,
+func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest,
 	generation int64, proved bool,
 ) error {
 	// THE FENCE, and it is the reason the barrier's answer is still worth
@@ -363,14 +362,14 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 	// same distinction and it matters more here: that command only waits, and this
 	// one is about to stop the services.
 	if proved {
-		fmt.Printf("\nnote     the ledger records nothing outstanding, and every host billet\n")
-		fmt.Printf("         expects an answer from says it is running no compute.\n\n")
+		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding, and every host billet\n")
+		fmt.Fprintf(env.Stdout, "         expects an answer from says it is running no compute.\n\n")
 	} else {
-		fmt.Printf("\nnote     the ledger records nothing outstanding. NO HOST WAS ASKED what it\n")
-		fmt.Printf("         is actually running, and compute whose lease has already gone is not\n")
-		fmt.Printf("         visible to the ledger — so this does not establish that the machines\n")
-		fmt.Printf("         are idle. `billet leases` and the node's own inventory are what\n")
-		fmt.Printf("         confirm that.\n\n")
+		fmt.Fprintf(env.Stdout, "\nnote     the ledger records nothing outstanding. NO HOST WAS ASKED what it\n")
+		fmt.Fprintf(env.Stdout, "         is actually running, and compute whose lease has already gone is not\n")
+		fmt.Fprintf(env.Stdout, "         visible to the ledger — so this does not establish that the machines\n")
+		fmt.Fprintf(env.Stdout, "         are idle. `billet leases` and the node's own inventory are what\n")
+		fmt.Fprintf(env.Stdout, "         confirm that.\n\n")
 	}
 
 	// THE COMPUTE PROOF IS RE-READ LAST, IMMEDIATELY BEFORE THE FIRST STOP.
@@ -411,7 +410,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 	// handoff is refused and the launch agent could not write the request.
 	if req.WantNode && hostOS == "linux" {
 		if err := requestNodeDrain(nodeDrainRequestFile); err != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}
 	}
 
@@ -428,7 +427,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		// otherwise name only the node.
 		others, err := snapshotOthers(ctx, c, unit)
 		if err != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}
 
 		// UNDER THE UNIT'S OWN STOP BOUND: a node's stop is a drain that
@@ -464,11 +463,11 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		stoppedUnits = append(stoppedUnits, disturbed...)
 
 		if stopErr != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, stopErr)
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, stopErr)
 		}
 
 		if collErr != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, collErr)
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, collErr)
 		}
 
 		// THE VERDICT, NOT THE ABSENCE OF AN ERROR. A backend that answered "not
@@ -479,7 +478,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		// on that is relying on a convention every future backend has to remember
 		// rather than on the answer itself.
 		if stopped.Gone != lifeops.Yes {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits,
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
 				fmt.Errorf("%s %s, so its process is not proved gone and this host is not down",
 					unit, stopped.How))
 		}
@@ -489,7 +488,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		// the two do not describe an ending in the same words: systemd has a
 		// state and a Result, while launchd has a domain the service is no
 		// longer in.
-		fmt.Printf("stop     %s %s\n", unit, stopped.How)
+		fmt.Fprintf(env.Stdout, "stop     %s %s\n", unit, stopped.How)
 	}
 
 	// THE SAME SHAPE FOR ENABLEMENT, because `systemctl disable` follows
@@ -498,7 +497,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 	// disable the server too, and nothing about the node reports that.
 	enablementBefore, err := enablementOfBoth(ctx, c)
 	if err != nil {
-		return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, err)
+		return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, err)
 	}
 
 	for _, unit := range downOrder(c, req) {
@@ -512,7 +511,7 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 		endObserve()
 
 		if readErr != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits,
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
 				errors.Join(disableErr, readErr))
 		}
 
@@ -524,26 +523,26 @@ func stopAndDisable(ctx context.Context, c converger, cfg *config.Config, req li
 			downOrder(c, req))
 
 		if disableErr != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits,
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
 				errors.Join(disableErr, collErr))
 		}
 
 		if collErr != nil {
-			return partialDown(ctx, c, cfg, req, stoppedUnits, disabledUnits, collErr)
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, collErr)
 		}
 
 		enablementBefore = enablementAfter
 
-		fmt.Printf("disable  %s will not start at boot\n", unit)
+		fmt.Fprintf(env.Stdout, "disable  %s will not start at boot\n", unit)
 	}
 
-	fmt.Printf("\nThis host is down. `billet local up` starts it again")
+	fmt.Fprintf(env.Stdout, "\nThis host is down. `billet local up` starts it again")
 
 	if req.WantServer {
-		fmt.Printf(" and clears the seal")
+		fmt.Fprintf(env.Stdout, " and clears the seal")
 	}
 
-	fmt.Printf(".\n")
+	fmt.Fprintf(env.Stdout, ".\n")
 
 	return nil
 }
@@ -616,19 +615,19 @@ func disabledBeyondTheOneAsked(before, after map[string]lifeops.Enablement, aske
 // WILL come back at the next boot, which is the state most likely to surprise
 // somebody who has just been told their host is down. It is called out by name
 // rather than left to be inferred from two lists.
-func partialDown(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest,
+func partialDown(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest,
 	stopped, disabled []string, cause error,
 ) error {
-	fmt.Printf("\n")
+	fmt.Fprintf(env.Stdout, "\n")
 
 	if len(stopped) == 0 {
-		fmt.Printf("state    nothing was stopped; this host is as it was\n")
+		fmt.Fprintf(env.Stdout, "state    nothing was stopped; this host is as it was\n")
 	} else {
-		fmt.Printf("state    stopped: %s\n", strings.Join(stopped, ", "))
+		fmt.Fprintf(env.Stdout, "state    stopped: %s\n", strings.Join(stopped, ", "))
 	}
 
 	if len(disabled) > 0 {
-		fmt.Printf("state    disabled: %s\n", strings.Join(disabled, ", "))
+		fmt.Fprintf(env.Stdout, "state    disabled: %s\n", strings.Join(disabled, ", "))
 	}
 
 	// READ, NOT INFERRED FROM WHICH COMMANDS SUCCEEDED. Deriving this from the
@@ -644,12 +643,12 @@ func partialDown(ctx context.Context, c converger, cfg *config.Config, req lifeo
 	defer cancel()
 
 	if now, err := enablementOfBoth(reportCtx, c); err != nil {
-		fmt.Printf("state    enablement could NOT be read (%v); `billet local status` says\n", err)
-		fmt.Printf("         which units start at boot\n")
+		fmt.Fprintf(env.Stdout, "state    enablement could NOT be read (%v); `billet local status` says\n", err)
+		fmt.Fprintf(env.Stdout, "         which units start at boot\n")
 	} else {
 		for _, unit := range downOrder(c, req) {
 			if now[unit].Enabled == lifeops.Yes {
-				fmt.Printf("state    %s is STILL ENABLED, so a reboot starts it\n", unit)
+				fmt.Fprintf(env.Stdout, "state    %s is STILL ENABLED, so a reboot starts it\n", unit)
 			}
 		}
 	}
@@ -669,15 +668,15 @@ func partialDown(ctx context.Context, c converger, cfg *config.Config, req lifeo
 
 		switch now, err := readAdmission(reportCtx, cfg); {
 		case err != nil:
-			fmt.Printf("state    admission could NOT be read (%v); `billet status` is what\n", err)
-			fmt.Printf("         says whether this deployment is taking work\n")
+			fmt.Fprintf(env.Stdout, "state    admission could NOT be read (%v); `billet status` is what\n", err)
+			fmt.Fprintf(env.Stdout, "         says whether this deployment is taking work\n")
 		case now.Mode == state.AdmissionOpen:
-			fmt.Printf("state    admission is OPEN — this deployment is taking work again,\n")
-			fmt.Printf("         onto a host that is part way down. `billet drain` seals it\n")
+			fmt.Fprintf(env.Stdout, "state    admission is OPEN — this deployment is taking work again,\n")
+			fmt.Fprintf(env.Stdout, "         onto a host that is part way down. `billet drain` seals it\n")
 		default:
-			fmt.Printf("state    admission is %s; `billet local up` clears a shutdown's seal,\n",
+			fmt.Fprintf(env.Stdout, "state    admission is %s; `billet local up` clears a shutdown's seal,\n",
 				now.Mode)
-			fmt.Printf("         and `billet status` says what the deployment holds\n")
+			fmt.Fprintf(env.Stdout, "         and `billet status` says what the deployment holds\n")
 		}
 	}
 
@@ -797,36 +796,36 @@ func byWhom(a state.Admission) string {
 	return " (" + a.Actor + ")"
 }
 
-func printDownPlan(c converger, req lifeops.UpRequest, o downOptions) {
-	fmt.Printf("plan     what `billet local down` would do on this host:\n")
+func printDownPlan(env cli.Env, c converger, req lifeops.UpRequest, o downOptions) {
+	fmt.Fprintf(env.Stdout, "plan     what `billet local down` would do on this host:\n")
 
 	if req.WantServer {
-		fmt.Printf("         1. seal admission (local-down), so nothing new is taken\n")
-		fmt.Printf("         2. wait for work already running to finish")
+		fmt.Fprintf(env.Stdout, "         1. seal admission (local-down), so nothing new is taken\n")
+		fmt.Fprintf(env.Stdout, "         2. wait for work already running to finish")
 
 		if o.timeout > 0 {
-			fmt.Printf(", giving up after %s", o.timeout)
+			fmt.Fprintf(env.Stdout, ", giving up after %s", o.timeout)
 		}
 
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		if o.withoutProof {
-			fmt.Printf("         3. NOT ask any host what it is running " +
+			fmt.Fprintf(env.Stdout, "         3. NOT ask any host what it is running "+
 				"(--without-compute-proof)\n")
 		} else {
-			fmt.Printf("         3. ask every host what it is actually running, and wait until\n")
-			fmt.Printf("            each says it is running nothing\n")
+			fmt.Fprintf(env.Stdout, "         3. ask every host what it is actually running, and wait until\n")
+			fmt.Fprintf(env.Stdout, "            each says it is running nothing\n")
 		}
 	} else {
-		fmt.Printf("         1. nothing to seal: this host runs no control plane, and nothing\n")
-		fmt.Printf("            here can ask it what it is running either\n")
+		fmt.Fprintf(env.Stdout, "         1. nothing to seal: this host runs no control plane, and nothing\n")
+		fmt.Fprintf(env.Stdout, "            here can ask it what it is running either\n")
 	}
 
 	for _, unit := range downOrder(c, req) {
-		fmt.Printf("         .  stop %s\n", unit)
+		fmt.Fprintf(env.Stdout, "         .  stop %s\n", unit)
 	}
 
 	for _, unit := range downOrder(c, req) {
-		fmt.Printf("         .  disable %s\n", unit)
+		fmt.Fprintf(env.Stdout, "         .  disable %s\n", unit)
 	}
 }

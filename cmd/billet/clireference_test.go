@@ -113,15 +113,11 @@ func TestEveryDocumentedCommandDispatchesToItsFlagSet(t *testing.T) {
 	for _, path := range sortedKeys(docs) {
 		args := slices.Concat(strings.Fields(path)[1:], []string{"-h"})
 
-		var (
-			stderr bytes.Buffer
-			err    error
-		)
+		var stdout, stderr bytes.Buffer
 
-		out := capture(t, func() {
-			err = cli.Run(args, cli.Env{Stdout: os.Stdout, Stderr: &stderr, Stdin: strings.NewReader(""),
-				Getenv: func(string) string { return "" }}, commands, func(int) {})
-		})
+		err := cli.Run(args, cli.Env{Stdout: &stdout, Stderr: &stderr, Stdin: strings.NewReader(""),
+			Getenv: func(string) string { return "" }}, commands, func(int) {})
+		out := stdout.String()
 
 		if !errors.Is(err, flag.ErrHelp) {
 			t.Errorf("%s -h answered %v, not a request for help (stderr: %q)", path, err, stderr.String())

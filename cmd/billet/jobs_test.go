@@ -81,7 +81,7 @@ func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 	})
 
 	out := capture(t, func() {
-		if err := cmdJobs(t.Context(), []string{"show", "--config", cfg, lease}); err != nil {
+		if err := cmdJobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
 			t.Errorf("billet jobs show: %v", err)
 		}
 	})
@@ -114,7 +114,7 @@ func TestJobsShowSaysWhenNothingWasMeasured(t *testing.T) {
 	lease := seedMeasuredJob(t, stateDir, -3, nil)
 
 	out := capture(t, func() {
-		if err := cmdJobs(t.Context(), []string{"show", "--config", cfg, lease}); err != nil {
+		if err := cmdJobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
 			t.Errorf("billet jobs show: %v", err)
 		}
 	})
@@ -125,7 +125,7 @@ func TestJobsShowSaysWhenNothingWasMeasured(t *testing.T) {
 		t.Errorf("a pooled lease's internal request id was printed:\n%s", out)
 	}
 
-	err := cmdJobs(t.Context(), []string{"show", "--config", cfg, "no-such-lease"})
+	err := cmdJobs(t.Context(), processEnv(), []string{"show", "--config", cfg, "no-such-lease"})
 	if !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Errorf("an unknown lease = %v, want ErrLeaseNotFound", err)
 	}

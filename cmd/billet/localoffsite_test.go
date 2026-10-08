@@ -137,7 +137,7 @@ func TestABackupIsUploadedAfterItIsWritten(t *testing.T) {
 	f := newBackupFixture(t, true)
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--out", dest,
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -179,7 +179,7 @@ func TestAnUploadFailureLeavesTheLocalArchiveIntact(t *testing.T) {
 	f := newBackupFixture(t, true)
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	err := cmdLocalBackup(t.Context(), []string{"--config", f.configPath, "--out", dest})
+	err := cmdLocalBackup(t.Context(), processEnv(), []string{"--config", f.configPath, "--out", dest})
 	if err == nil {
 		t.Fatal("an upload that failed reported success")
 	}
@@ -196,7 +196,7 @@ func TestNoUploadWritesTheArchiveAndUploadsNothing(t *testing.T) {
 	f := newBackupFixture(t, true)
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--out", dest, "--no-upload",
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -220,7 +220,7 @@ func TestARestoreFetchesFromTheBucketAndPutsTheDeploymentBack(t *testing.T) {
 
 	src := newBackupFixture(t, true)
 
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", src.configPath, "--out", filepath.Join(t.TempDir(), "backup"),
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -232,7 +232,7 @@ func TestARestoreFetchesFromTheBucketAndPutsTheDeploymentBack(t *testing.T) {
 
 	into := filepath.Join(t.TempDir(), "fetched")
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest",
 		"--into", into, "--old-controller-fenced",
 	}); err != nil {
@@ -313,7 +313,7 @@ func TestAFetchedArchiveMayNotLandInTheStateDirectory(t *testing.T) {
 
 	src := newBackupFixture(t, true)
 
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", src.configPath, "--out", filepath.Join(t.TempDir(), "backup"),
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -323,7 +323,7 @@ func TestAFetchedArchiveMayNotLandInTheStateDirectory(t *testing.T) {
 
 	inside := filepath.Join(tgt.stateDir, "archive")
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest",
 		"--into", inside, "--old-controller-fenced",
 	})
@@ -347,7 +347,7 @@ func TestFromBackupWithoutABucketSaysWhatIsMissing(t *testing.T) {
 
 	f := newBackupFixture(t, false)
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from-backup", "latest", "--old-controller-fenced",
 	})
 	if err == nil {
@@ -375,7 +375,7 @@ func TestARefetchReusesTheArchiveTheFirstAttemptKept(t *testing.T) {
 
 	src := newBackupFixture(t, true)
 
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", src.configPath, "--out", filepath.Join(t.TempDir(), "backup"),
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -389,7 +389,7 @@ func TestARefetchReusesTheArchiveTheFirstAttemptKept(t *testing.T) {
 
 	// A FIRST ATTEMPT THAT FETCHED AND THEN REFUSED: --dry-run reports and
 	// changes nothing about the deployment, and the archive it downloaded stays.
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest", "--into", into, "--dry-run",
 	}); err != nil {
 		t.Fatalf("the first --from-backup run: %v", err)
@@ -407,7 +407,7 @@ func TestARefetchReusesTheArchiveTheFirstAttemptKept(t *testing.T) {
 		t.Fatalf("widen the kept directory: %v", err)
 	}
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest",
 		"--into", into, "--old-controller-fenced",
 	}); err != nil {
@@ -448,7 +448,7 @@ func TestARefetchStillRefusesADirectoryThatIsNotThisArchive(t *testing.T) {
 	src := newBackupFixture(t, true)
 
 	kept := filepath.Join(t.TempDir(), "backup")
-	if err := cmdLocalBackup(t.Context(), []string{
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{
 		"--config", src.configPath, "--out", kept,
 	}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
@@ -469,7 +469,7 @@ func TestARefetchStillRefusesADirectoryThatIsNotThisArchive(t *testing.T) {
 		t.Fatalf("stage a file in it: %v", err)
 	}
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest",
 		"--into", occupied, "--old-controller-fenced",
 	})
@@ -492,7 +492,7 @@ func TestARefetchStillRefusesADirectoryThatIsNotThisArchive(t *testing.T) {
 		t.Fatalf("damage the copy: %v", err)
 	}
 
-	err = cmdLocalRestore(t.Context(), []string{
+	err = cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from-backup", "latest",
 		"--into", damaged, "--old-controller-fenced",
 	})

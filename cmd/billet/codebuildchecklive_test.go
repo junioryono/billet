@@ -97,7 +97,7 @@ func TestTheLiveCodeBuildCheckRefusesADeclaredLimitAboveTheFleet(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = checkCodeBuildLive(t.Context(), deployment(2), nil)
+		err = checkCodeBuildLive(t.Context(), processEnv(), deployment(2), nil)
 	})
 
 	if err == nil || !strings.Contains(err.Error(), "macos_vm_limit 2") ||
@@ -108,7 +108,7 @@ func TestTheLiveCodeBuildCheckRefusesADeclaredLimitAboveTheFleet(t *testing.T) {
 	// EXACTLY THE FLEET: no refusal, and the check still printed the fleet it saw,
 	// so the pass is a pass through the same path rather than an early return.
 	out = capture(t, func() {
-		err = checkCodeBuildLive(t.Context(), deployment(1), nil)
+		err = checkCodeBuildLive(t.Context(), processEnv(), deployment(1), nil)
 	})
 
 	if err != nil {
@@ -123,7 +123,7 @@ func TestTheLiveCodeBuildCheckRefusesADeclaredLimitAboveTheFleet(t *testing.T) {
 	fleet["scalingConfiguration"] = map[string]any{"maxCapacity": 2}
 
 	out = capture(t, func() {
-		err = checkCodeBuildLive(t.Context(), deployment(2), nil)
+		err = checkCodeBuildLive(t.Context(), processEnv(), deployment(2), nil)
 	})
 
 	if err != nil {

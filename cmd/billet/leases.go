@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,22 +14,22 @@ import (
 )
 
 // cmdLeases is the operator's view of capacity that has not come back.
-func cmdLeases(ctx context.Context, args []string) error {
+func cmdLeases(ctx context.Context, env cli.Env, args []string) error {
 	// Bare `billet leases` — with or without flags — is the documented form and
 	// means `held`; only a word selects another view.
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return cmdLeasesHeld(ctx, args)
+		return cmdLeasesHeld(ctx, env, args)
 	}
 
 	switch args[0] {
 	case "held":
-		return cmdLeasesHeld(ctx, args[1:])
+		return cmdLeasesHeld(ctx, env, args[1:])
 	case "quarantined":
-		return cmdLeasesQuarantined(ctx, args[1:])
+		return cmdLeasesQuarantined(ctx, env, args[1:])
 	case "failures":
-		return cmdLeasesFailures(ctx, args[1:])
+		return cmdLeasesFailures(ctx, env, args[1:])
 	case "release":
-		return cmdLeasesRelease(ctx, args[1:])
+		return cmdLeasesRelease(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown leases command %q; try held, quarantined, failures, or release",
@@ -39,8 +38,8 @@ func cmdLeases(ctx context.Context, args []string) error {
 
 // cmdLeasesHeld shows every lease whose compute has not been confirmed gone,
 // including proof obligations a healthy node is actively tending.
-func cmdLeasesHeld(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet leases held", os.Stdout)
+func cmdLeasesHeld(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet leases held", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -58,24 +57,24 @@ func cmdLeasesHeld(ctx context.Context, args []string) error {
 	}
 
 	if len(held) == 0 {
-		fmt.Println("Nothing is held: no lease is waiting for compute to be confirmed gone.")
+		fmt.Fprintln(env.Stdout, "Nothing is held: no lease is waiting for compute to be confirmed gone.")
 
 		return nil
 	}
 
-	printHeld(held)
-	fmt.Printf("\nCustody preserves adopted work; teardown is a live node waiting for its backend\n")
-	fmt.Printf("to confirm removal; quarantine has no current holder. When you have independent\n")
-	fmt.Printf("proof the compute is gone:\n\n  billet leases release <lease> --force\n")
-	printHolderNote(os.Stdout, held)
-	fmt.Printf("\nFor jobs that FAILED while billet's own infrastructure was disrupted:\n\n")
-	fmt.Printf("  billet leases failures\n")
+	printHeld(env, held)
+	fmt.Fprintf(env.Stdout, "\nCustody preserves adopted work; teardown is a live node waiting for its backend\n")
+	fmt.Fprintf(env.Stdout, "to confirm removal; quarantine has no current holder. When you have independent\n")
+	fmt.Fprintf(env.Stdout, "proof the compute is gone:\n\n  billet leases release <lease> --force\n")
+	printHolderNote(env.Stdout, held)
+	fmt.Fprintf(env.Stdout, "\nFor jobs that FAILED while billet's own infrastructure was disrupted:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet leases failures\n")
 
 	return nil
 }
 
-func printHeld(held []alloc.HeldLease) {
-	printHeldTo(os.Stdout, held)
+func printHeld(env cli.Env, held []alloc.HeldLease) {
+	printHeldTo(env.Stdout, held)
 }
 
 // printHeldTo renders the held table, naming the process holding each lease.
@@ -177,15 +176,15 @@ func printHolderNote(out io.Writer, held []alloc.HeldLease) {
 // line the only visible fact was a slot in use. It never fails the command, for
 // the reason printReportedInventory gives: `billet status` is what somebody runs
 // when something is already wrong.
-func printReplacedHolders(ctx context.Context, a *alloc.Allocator) {
+func printReplacedHolders(ctx context.Context, env cli.Env, a *alloc.Allocator) {
 	orphaned, err := a.RunningWithReplacedHolder(ctx)
 	if err != nil {
-		fmt.Printf("bound     unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "bound     unavailable: %v\n", err)
 
 		return
 	}
 
-	printReplacedHoldersTo(os.Stdout, orphaned)
+	printReplacedHoldersTo(env.Stdout, orphaned)
 }
 
 func printReplacedHoldersTo(out io.Writer, orphaned []alloc.ReplacedHolderLease) {
@@ -231,8 +230,8 @@ func heldFor(since string) string {
 // heartbeating while a container may still be running, so billet keeps charging
 // the host until somebody who can see that machine says otherwise. Without this
 // the number is simply smaller than it was, with nothing to read.
-func cmdLeasesQuarantined(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet leases quarantined", os.Stdout)
+func cmdLeasesQuarantined(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet leases quarantined", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -252,12 +251,12 @@ func cmdLeasesQuarantined(ctx context.Context, args []string) error {
 	}
 
 	if len(held) == 0 {
-		fmt.Println("Nothing is quarantined: every lease is either running or finished.")
+		fmt.Fprintln(env.Stdout, "Nothing is quarantined: every lease is either running or finished.")
 
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
 
 	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tVCPU\tMEMORY\tSINCE")
 
@@ -268,9 +267,9 @@ func cmdLeasesQuarantined(ctx context.Context, args []string) error {
 
 	_ = w.Flush()
 
-	fmt.Printf("\nEach is holding its host's capacity because the container behind it has not\n")
-	fmt.Printf("been confirmed gone. A host that comes back frees them by itself. For one that\n")
-	fmt.Printf("never will:\n\n  billet leases release <lease> --force\n")
+	fmt.Fprintf(env.Stdout, "\nEach is holding its host's capacity because the container behind it has not\n")
+	fmt.Fprintf(env.Stdout, "been confirmed gone. A host that comes back frees them by itself. For one that\n")
+	fmt.Fprintf(env.Stdout, "never will:\n\n  billet leases release <lease> --force\n")
 
 	return nil
 }
@@ -283,8 +282,8 @@ func cmdLeasesQuarantined(ctx context.Context, args []string) error {
 // operator is asserting it, usually about a machine that is never coming back —
 // and if they are wrong, the capacity is sold to a second job while the first is
 // still running on it.
-func cmdLeasesRelease(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet leases release", os.Stdout)
+func cmdLeasesRelease(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet leases release", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false, "release it even though nothing has confirmed the compute is gone")
 
@@ -315,14 +314,14 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 				continue
 			}
 
-			fmt.Printf("Lease %s has been holding %d vCPU and %s on node %q as %s for %s,\n",
+			fmt.Fprintf(env.Stdout, "Lease %s has been holding %d vCPU and %s on node %q as %s for %s,\n",
 				leaseID, held[i].VCPU, held[i].Memory, held[i].Node, held[i].State,
 				heldFor(held[i].Since))
-			fmt.Printf("held by %s.\n\n", describeHolder(held[i].Holder))
-			fmt.Printf("Nothing has confirmed that its container is gone. If that machine is\n")
-			fmt.Printf("coming back it will free this by itself, and releasing it now means the\n")
-			fmt.Printf("capacity can be sold to a second job while the first is still running.\n\n")
-			fmt.Printf("Re-run with --force when you know the compute is gone.\n")
+			fmt.Fprintf(env.Stdout, "held by %s.\n\n", describeHolder(held[i].Holder))
+			fmt.Fprintf(env.Stdout, "Nothing has confirmed that its container is gone. If that machine is\n")
+			fmt.Fprintf(env.Stdout, "coming back it will free this by itself, and releasing it now means the\n")
+			fmt.Fprintf(env.Stdout, "capacity can be sold to a second job while the first is still running.\n\n")
+			fmt.Fprintf(env.Stdout, "Re-run with --force when you know the compute is gone.\n")
 
 			// NON-ZERO, because nothing was released. Automation that reads an exit
 			// status would otherwise carry on believing the capacity came back.
@@ -339,13 +338,13 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 	}
 
 	if result.Pending {
-		fmt.Printf("Asked node %q to release %s. The node will drop its local custody record and "+
+		fmt.Fprintf(env.Stdout, "Asked node %q to release %s. The node will drop its local custody record and "+
 			"return the capacity on its next tend.\n", result.Node, leaseID)
-		fmt.Printf("\nOnly the process holding the lease can observe that request. If it is gone,\n")
-		fmt.Printf("nothing renews the lease: it is quarantined within the lease TTL, and re-running\n")
-		fmt.Printf("this command then releases it on the spot. `billet leases` names the holder.\n")
+		fmt.Fprintf(env.Stdout, "\nOnly the process holding the lease can observe that request. If it is gone,\n")
+		fmt.Fprintf(env.Stdout, "nothing renews the lease: it is quarantined within the lease TTL, and re-running\n")
+		fmt.Fprintf(env.Stdout, "this command then releases it on the spot. `billet leases` names the holder.\n")
 	} else {
-		fmt.Printf("Released %s. Its capacity is available again.\n", leaseID)
+		fmt.Fprintf(env.Stdout, "Released %s. Its capacity is available again.\n", leaseID)
 	}
 
 	return nil

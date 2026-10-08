@@ -59,7 +59,7 @@ func TestStatusReportsWhoSealedTheDeploymentAndWhetherItSurvives(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := capture(t, func() { printAdmission(tc.given) })
+			out := capture(t, func() { printAdmission(processEnv(), tc.given) })
 
 			for _, want := range tc.want {
 				if !strings.Contains(out, want) {
@@ -96,7 +96,7 @@ func TestStatusReportsTheSealBeforeAnythingElse(t *testing.T) {
 	// Open first: the assertions below must not pass against a status command
 	// that says "sealed" unconditionally.
 	openOut := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status on an open deployment: %v", err)
 		}
 	})
@@ -116,7 +116,7 @@ func TestStatusReportsTheSealBeforeAnythingElse(t *testing.T) {
 	}
 
 	sealedOut := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status on a sealed deployment: %v", err)
 		}
 	})
@@ -196,7 +196,7 @@ func TestStatusShowsWhatEachHostReportedWithoutCallingItIdle(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -282,7 +282,7 @@ func TestStatusSaysWhenItCannotReachAHostThatReported(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -329,7 +329,7 @@ func TestStatusSurvivesTelemetryItCannotRead(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status failed because it could not read telemetry: %v", err)
 		}
 	})

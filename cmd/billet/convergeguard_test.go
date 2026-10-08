@@ -124,7 +124,7 @@ func (f *guardFixture) record(t *testing.T) guardRecord {
 func guardRun(t *testing.T, args ...string) error {
 	t.Helper()
 
-	return cmdConvergeGuard(t.Context(), args)
+	return cmdConvergeGuard(t.Context(), processEnv(), args)
 }
 
 func mustHold(t *testing.T, holder string) {
@@ -478,7 +478,7 @@ func TestGuardHelperProcess(t *testing.T) {
 			t.Fatalf("the helper was launched with %v, want host-upgrade ...", args)
 		}
 
-		if err := cmdHostUpgrade(t.Context(), args[1:]); err != nil {
+		if err := cmdHostUpgrade(t.Context(), processEnv(), args[1:]); err != nil {
 			announce("REFUSED:" + err.Error())
 			os.Exit(2)
 		}
@@ -533,7 +533,7 @@ func TestGuardHelperProcess(t *testing.T) {
 			}
 		}
 
-		err := cmdConvergeGuard(t.Context(), strings.Split(os.Getenv(guardHelperArgsEnv), "\x1f"))
+		err := cmdConvergeGuard(t.Context(), processEnv(), strings.Split(os.Getenv(guardHelperArgsEnv), "\x1f"))
 		if err != nil {
 			announce("REFUSED:" + err.Error())
 			os.Exit(2)

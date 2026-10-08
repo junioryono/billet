@@ -34,7 +34,7 @@ func (p *kernelLockProbe) observe() {
 
 	p.tried++
 
-	lock, err := takeKernelDirLock(p.t.Context(), p.dir, "probe the kernel directory lock")
+	lock, err := takeKernelDirLock(p.t.Context(), processEnv(), p.dir, "probe the kernel directory lock")
 	if err != nil {
 		if errors.Is(err, errKernelLockBusy) {
 			p.refused++
@@ -166,7 +166,7 @@ func TestAPullReleasesTheKernelDirectoryLock(t *testing.T) {
 				t.Fatalf("images pull: %v", err)
 			}
 
-			after, err := takeKernelDirLock(t.Context(), fixture.kernelDir, "collect kernels")
+			after, err := takeKernelDirLock(t.Context(), processEnv(), fixture.kernelDir, "collect kernels")
 			if err != nil {
 				t.Fatalf("the kernel directory is still locked after the pull returned, so no "+
 					"reap can ever run on this host again: %v", err)
@@ -198,7 +198,7 @@ func TestAPullInstallsTheKernelWhereTheNodeIsConfiguredToLookForIt(t *testing.T)
 
 	usePullSeams(t, fixture.publisher, durablefile.Installer{}, currentRunner)
 
-	if err := cmdImagesPull(t.Context(), []string{
+	if err := cmdImagesPull(t.Context(), processEnv(), []string{
 		"--config", fixture.cfgPath,
 		"--from", fixture.from,
 		"--staging-dir", fixture.staging,

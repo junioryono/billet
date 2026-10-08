@@ -57,12 +57,12 @@ type cacheConformanceInstallOptions struct {
 	force                 bool
 }
 
-func cmdCacheConformance(ctx context.Context, args []string) error {
+func cmdCacheConformance(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 || args[0] != "install" {
 		return errors.New("usage: billet cache conformance install --repository <owner/repository> --runner-label <label> [flags]")
 	}
 
-	fs := cli.NewFlagSet("billet cache conformance install", os.Stdout)
+	fs := cli.NewFlagSet("billet cache conformance install", env.Stdout)
 	repository := fs.String("repository", "", "consumer owner/repository that will own the workflow")
 	runnerLabel := fs.String("runner-label", "", "exact trusted Billet runner label under test")
 	billetRepository := fs.String("billet-repository", defaultConformanceRepository,
@@ -102,9 +102,9 @@ func cmdCacheConformance(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Wrote %s from %s@%s\n\n", options.output, options.billetRepository, options.billetRef)
-	fmt.Printf("Restrict the trusted runner group and the tier's workflows/cache_scope.workflow_ref to:\n\n")
-	fmt.Printf("  %s\n", identity)
+	fmt.Fprintf(env.Stdout, "Wrote %s from %s@%s\n\n", options.output, options.billetRepository, options.billetRef)
+	fmt.Fprintf(env.Stdout, "Restrict the trusted runner group and the tier's workflows/cache_scope.workflow_ref to:\n\n")
+	fmt.Fprintf(env.Stdout, "  %s\n", identity)
 
 	return nil
 }

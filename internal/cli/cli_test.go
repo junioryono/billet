@@ -16,7 +16,7 @@ func testTree(names []string, answers map[string]error) Tree {
 
 		for _, name := range names {
 			out = append(out, Command{Name: name, Summary: "answers " + name,
-				Run: func(context.Context, []string) error { return answers[name] }})
+				Run: func(context.Context, Env, []string) error { return answers[name] }})
 		}
 
 		return out
@@ -86,22 +86,24 @@ func TestMainAnswersWithTheStatusACommandGives(t *testing.T) {
 	}
 }
 
-// THE LIFECYCLE A COMMAND IS GIVEN TELLS THE OPERATOR ON THE ENV'S STDERR: the
+// THE LIFECYCLE A COMMAND IS GIVEN TELLS THE OPERATOR ON THE ENV'S STDERR, and
+// the command is handed that env to write to: the
 // second and third signals' warnings go where the binary's stderr is, not
 // to its stdout or nowhere.
 func TestTheLifecycleACommandIsGivenWritesToTheEnvsStderr(t *testing.T) {
 	t.Parallel()
 
 	var (
-		stdout, stderr bytes.Buffer
-		given          *Lifecycle
+		stdout, stderr, stdin bytes.Buffer
+		given                 *Lifecycle
+		gotEnv                Env
 	)
 
-	env := Env{Stdout: &stdout, Stderr: &stderr}
+	env := Env{Stdout: &stdout, Stderr: &stderr, Stdin: &stdin, Getenv: func(string) string { return "set" }}
 
 	tree := func(lc *Lifecycle) []Command {
-		return []Command{{Name: "server", Run: func(context.Context, []string) error {
-			given = lc
+		return []Command{{Name: "server", Run: func(_ context.Context, e Env, _ []string) error {
+			given, gotEnv = lc, e
 
 			return nil
 		}}}
@@ -114,6 +116,12 @@ func TestTheLifecycleACommandIsGivenWritesToTheEnvsStderr(t *testing.T) {
 	if given == nil || given.stderr != env.Stderr {
 		t.Fatal("the lifecycle the command was given does not write to the env's stderr")
 	}
+
+	// AND THE COMMAND IS HANDED THE ENV ITSELF, every field of it.
+	if gotEnv.Stdout != env.Stdout || gotEnv.Stderr != env.Stderr || gotEnv.Stdin != env.Stdin ||
+		gotEnv.Getenv == nil || gotEnv.Getenv("X") != "set" {
+		t.Errorf("the command was handed %+v, not the env Run was given", gotEnv)
+	}
 }
 
 // A COMMAND IS GIVEN THE ARGUMENTS AFTER ITS NAME, and a context the first
@@ -124,7 +132,7 @@ func TestACommandIsGivenItsArguments(t *testing.T) {
 	var got []string
 
 	tree := func(*Lifecycle) []Command {
-		return []Command{{Name: "ca", Run: func(ctx context.Context, args []string) error {
+		return []Command{{Name: "ca", Run: func(ctx context.Context, _ Env, args []string) error {
 			if ctx.Err() != nil {
 				return errors.New("the command's context was already cancelled")
 			}

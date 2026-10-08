@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"text/tabwriter"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -36,8 +35,8 @@ var errForceRefused = &cli.ExitError{
 // documents is for a job never acquired in time — so each of these is a build
 // that fails and stays failed. Naming the run ids is what lets an operator
 // recognise whose work they are about to end; "7 leases" tells them nothing.
-func cmdForceDestroy(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet force-destroy", os.Stdout)
+func cmdForceDestroy(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet force-destroy", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why running work is being destroyed, for whoever finds the failed builds")
@@ -73,7 +72,7 @@ func cmdForceDestroy(ctx context.Context, args []string) error {
 	if open, found, err := allocator.OpenForceDestroy(ctx); err != nil {
 		return fmt.Errorf("read force-destroy: %w", err)
 	} else if found {
-		return reportOpenForce(ctx, allocator, open)
+		return reportOpenForce(ctx, env, allocator, open)
 	}
 
 	admission, err := db.Admission(ctx)
@@ -107,19 +106,19 @@ func cmdForceDestroy(ctx context.Context, args []string) error {
 	}
 
 	if len(candidates) == 0 {
-		fmt.Printf("Nothing is running that this would destroy.\n")
+		fmt.Fprintf(env.Stdout, "Nothing is running that this would destroy.\n")
 
-		return reportHeldElsewhere(ctx, allocator)
+		return reportHeldElsewhere(ctx, env, allocator)
 	}
 
-	printForceCandidates(candidates)
+	printForceCandidates(env, candidates)
 
-	if err := reportHeldElsewhere(ctx, allocator); err != nil {
+	if err := reportHeldElsewhere(ctx, env, allocator); err != nil {
 		return err
 	}
 
 	if !*yes {
-		fmt.Printf("\nRe-run with --yes and --reason to destroy these.\n")
+		fmt.Fprintf(env.Stdout, "\nRe-run with --yes and --reason to destroy these.\n")
 
 		return errForceRefused
 	}
@@ -153,7 +152,7 @@ func cmdForceDestroy(ctx context.Context, args []string) error {
 	recorded, err := allocator.RequestForceDestroy(ctx, state.ForceDestroyRequest{
 		ExpectAdmission: admission.Generation,
 		Reason:          *reason,
-		Actor:           actor(),
+		Actor:           actor(env),
 		Targets:         targets,
 	})
 	if err != nil {
@@ -164,23 +163,23 @@ func cmdForceDestroy(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nRecorded force-destroy %d covering %d lease(s).\n",
+	fmt.Fprintf(env.Stdout, "\nRecorded force-destroy %d covering %d lease(s).\n",
 		recorded.Generation, len(targets))
-	fmt.Printf("\nThe listeners act on this on their next poll, which can take most of a\n")
-	fmt.Printf("minute. Watch it with `billet status`; the record says what became of every\n")
-	fmt.Printf("lease, including any this could not destroy.\n")
+	fmt.Fprintf(env.Stdout, "\nThe listeners act on this on their next poll, which can take most of a\n")
+	fmt.Fprintf(env.Stdout, "minute. Watch it with `billet status`; the record says what became of every\n")
+	fmt.Fprintf(env.Stdout, "lease, including any this could not destroy.\n")
 
 	return nil
 }
 
 // printForceCandidates names every job about to be ended.
-func printForceCandidates(candidates []alloc.ForceCandidate) {
-	fmt.Printf("This will DESTROY %d running job(s). GitHub does NOT requeue a job whose\n",
+func printForceCandidates(env cli.Env, candidates []alloc.ForceCandidate) {
+	fmt.Fprintf(env.Stdout, "This will DESTROY %d running job(s). GitHub does NOT requeue a job whose\n",
 		len(candidates))
-	fmt.Printf("runner vanishes after it has started, so every one of these builds fails\n")
-	fmt.Printf("and stays failed.\n\n")
+	fmt.Fprintf(env.Stdout, "runner vanishes after it has started, so every one of these builds fails\n")
+	fmt.Fprintf(env.Stdout, "and stays failed.\n\n")
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tPHASE\tRUN\tRUNNING FOR")
 
 	for i := range candidates {
@@ -212,7 +211,7 @@ func printForceCandidates(candidates []alloc.ForceCandidate) {
 // that still believes it owns the proof obligation. Silently including them here
 // would be a second mechanism for the same situation, and the one that skips the
 // handoff; silently omitting them leaves somebody hunting for the difference.
-func reportHeldElsewhere(ctx context.Context, a *alloc.Allocator) error {
+func reportHeldElsewhere(ctx context.Context, env cli.Env, a *alloc.Allocator) error {
 	held, err := a.Held(ctx)
 	if err != nil {
 		return fmt.Errorf("list held leases: %w", err)
@@ -222,12 +221,12 @@ func reportHeldElsewhere(ctx context.Context, a *alloc.Allocator) error {
 		return nil
 	}
 
-	fmt.Printf("\n%d lease(s) are held by a node rather than by a listener, and this\n",
+	fmt.Fprintf(env.Stdout, "\n%d lease(s) are held by a node rather than by a listener, and this\n",
 		len(held))
-	fmt.Printf("command does not touch them:\n\n")
-	printHeld(held)
-	fmt.Printf("\nEach is a proof obligation its holder is still working on. When you know\n")
-	fmt.Printf("that compute is gone:\n\n  billet leases release <lease> --force\n")
+	fmt.Fprintf(env.Stdout, "command does not touch them:\n\n")
+	printHeld(env, held)
+	fmt.Fprintf(env.Stdout, "\nEach is a proof obligation its holder is still working on. When you know\n")
+	fmt.Fprintf(env.Stdout, "that compute is gone:\n\n  billet leases release <lease> --force\n")
 
 	return nil
 }
@@ -240,10 +239,10 @@ func reportHeldElsewhere(ctx context.Context, a *alloc.Allocator) error {
 // finished, and an operator arriving afterwards has no other way to learn it
 // happened — the listener logs scroll away, and every other line in that report
 // reads perfectly normally.
-func printForceDestroy(ctx context.Context, a *alloc.Allocator, admission state.Admission) {
+func printForceDestroy(ctx context.Context, env cli.Env, a *alloc.Allocator, admission state.Admission) {
 	last, found, err := a.LatestForceDestroy(ctx)
 	if err != nil {
-		fmt.Printf("force     unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "force     unavailable: %v\n", err)
 
 		return
 	}
@@ -254,7 +253,7 @@ func printForceDestroy(ctx context.Context, a *alloc.Allocator, admission state.
 
 	targets, err := a.ForceTargets(ctx, last.Generation)
 	if err != nil {
-		fmt.Printf("force     %d: %v\n", last.Generation, err)
+		fmt.Fprintf(env.Stdout, "force     %d: %v\n", last.Generation, err)
 
 		return
 	}
@@ -273,30 +272,30 @@ func printForceDestroy(ctx context.Context, a *alloc.Allocator, admission state.
 	}
 
 	if last.State == state.ForceRequested {
-		fmt.Printf("force     %d IN PROGRESS - destroying running compute on an operator's "+
+		fmt.Fprintf(env.Stdout, "force     %d IN PROGRESS - destroying running compute on an operator's "+
 			"instruction\n", last.Generation)
 	} else {
-		fmt.Printf("force     %d finished at %s\n", last.Generation, last.CompletedAt)
+		fmt.Fprintf(env.Stdout, "force     %d finished at %s\n", last.Generation, last.CompletedAt)
 	}
 
 	if last.Actor != "" {
-		fmt.Printf("          requested by %s: %s\n", last.Actor, last.Reason)
+		fmt.Fprintf(env.Stdout, "          requested by %s: %s\n", last.Actor, last.Reason)
 	}
 
-	fmt.Printf("          %d lease(s): %d destroyed, %d not destroyed, %d still to act on\n",
+	fmt.Fprintf(env.Stdout, "          %d lease(s): %d destroyed, %d not destroyed, %d still to act on\n",
 		len(targets), destroyed, failed, pending)
 
 	// A DESTROYED JOB DOES NOT COME BACK, said here because this report is where
 	// somebody lands when they are working out why a build vanished.
 	if destroyed > 0 {
-		fmt.Printf("          those builds FAILED; GitHub does not requeue a job whose " +
+		fmt.Fprintf(env.Stdout, "          those builds FAILED; GitHub does not requeue a job whose "+
 			"runner vanished after starting\n")
 	}
 
 	// NOT DESTROYED IS NOT PROOF IT SURVIVED, and the capacity stays charged
 	// either way — which is the thing an operator will otherwise go looking for.
 	if failed > 0 {
-		fmt.Printf("          %d could not be confirmed destroyed and stay charged; "+
+		fmt.Fprintf(env.Stdout, "          %d could not be confirmed destroyed and stay charged; "+
 			"`billet leases` says what is holding them\n", failed)
 	}
 
@@ -305,23 +304,23 @@ func printForceDestroy(ctx context.Context, a *alloc.Allocator, admission state.
 	// deployment now at N+2 was authorised in a state that no longer holds, and
 	// that belongs beside the result rather than being reconstructed.
 	if admission.Generation != last.AdmissionGeneration {
-		fmt.Printf("          authorised against admission generation %d; the ledger is now "+
+		fmt.Fprintf(env.Stdout, "          authorised against admission generation %d; the ledger is now "+
 			"at %d\n", last.AdmissionGeneration, admission.Generation)
 	}
 }
 
 // reportOpenForce describes a force-destroy that has not finished.
-func reportOpenForce(ctx context.Context, a *alloc.Allocator, open state.ForceDestroy) error {
+func reportOpenForce(ctx context.Context, env cli.Env, a *alloc.Allocator, open state.ForceDestroy) error {
 	targets, err := a.ForceTargets(ctx, open.Generation)
 	if err != nil {
 		return fmt.Errorf("read force-destroy targets: %w", err)
 	}
 
-	fmt.Printf("Force-destroy %d is still running, requested by %s: %s\n",
+	fmt.Fprintf(env.Stdout, "Force-destroy %d is still running, requested by %s: %s\n",
 		open.Generation, open.Actor, open.Reason)
-	fmt.Printf("\n")
+	fmt.Fprintf(env.Stdout, "\n")
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tRUN\tSTATE\tDETAIL")
 
 	for i := range targets {
@@ -332,9 +331,9 @@ func reportOpenForce(ctx context.Context, a *alloc.Allocator, open state.ForceDe
 
 	_ = w.Flush()
 
-	fmt.Printf("\nA listener acts on its own tier's leases on its next poll. Only one\n")
-	fmt.Printf("force-destroy runs at a time, so this one finishes before another can\n")
-	fmt.Printf("be taken.\n")
+	fmt.Fprintf(env.Stdout, "\nA listener acts on its own tier's leases on its next poll. Only one\n")
+	fmt.Fprintf(env.Stdout, "force-destroy runs at a time, so this one finishes before another can\n")
+	fmt.Fprintf(env.Stdout, "be taken.\n")
 
 	// NON-ZERO, because this request was not taken. A script that read zero would
 	// believe its own force had been recorded.

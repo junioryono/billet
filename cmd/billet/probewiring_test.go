@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 	"testing"
 )
 
@@ -14,8 +15,8 @@ import (
 // probe step again, which is the outage this guards. The call site cannot be
 // reached from a unit test without a ledger and a GitHub, so the source is
 // asserted: exactly two upgrade-probe branches, each calling holdProbe with the
-// hold flag itself as the second argument and one of the two constant lines in
-// the third, neither printing nor receiving from a channel on its own.
+// hold flag itself as the third argument and one of the two constant lines in
+// the fourth, neither printing nor receiving from a channel on its own.
 func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
 	fset := token.NewFileSet()
 
@@ -58,7 +59,7 @@ func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
 		pos := fset.Position(stmt.Pos())
 
 		if holds != 1 {
-			t.Errorf("%s: the upgrade-probe branch calls holdProbe(ctx, <hold flag>, <line "+
+			t.Errorf("%s: the upgrade-probe branch calls holdProbe(ctx, env, <hold flag>, <line "+
 				"constant>) %d times, want 1", pos, holds)
 		}
 
@@ -99,21 +100,21 @@ func isFlagRef(e ast.Expr, name string) bool {
 	return false
 }
 
-// isHoldProbeCall recognises holdProbe(ctx, holdProbeFlag | *holdProbeFlag, <an
+// isHoldProbeCall recognises holdProbe(ctx, env, holdProbeFlag | *holdProbeFlag, <an
 // expression naming serverProbeReadyLine or nodeProbeReadyFormat>).
 func isHoldProbeCall(call *ast.CallExpr) bool {
 	id, ok := call.Fun.(*ast.Ident)
-	if !ok || id.Name != "holdProbe" || len(call.Args) != 3 {
+	if !ok || id.Name != "holdProbe" || len(call.Args) != 4 {
 		return false
 	}
 
-	if !isFlagRef(call.Args[1], "holdProbeFlag") {
+	if !isFlagRef(call.Args[2], "holdProbeFlag") {
 		return false
 	}
 
 	found := false
 
-	ast.Inspect(call.Args[2], func(n ast.Node) bool {
+	ast.Inspect(call.Args[3], func(n ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok &&
 			(id.Name == "serverProbeReadyLine" || id.Name == "nodeProbeReadyFormat") {
 			found = true
@@ -125,7 +126,8 @@ func isHoldProbeCall(call *ast.CallExpr) bool {
 	return found
 }
 
-// isFmtPrint recognises fmt.Print, fmt.Println and fmt.Printf.
+// isFmtPrint recognises every fmt print: to the process's stdout, or to a
+// writer such as the env's.
 func isFmtPrint(fun ast.Expr) bool {
 	sel, ok := fun.(*ast.SelectorExpr)
 	if !ok {
@@ -133,7 +135,7 @@ func isFmtPrint(fun ast.Expr) bool {
 	}
 
 	pkg, ok := sel.X.(*ast.Ident)
+	name := strings.TrimPrefix(sel.Sel.Name, "F")
 
-	return ok && pkg.Name == "fmt" && (sel.Sel.Name == "Print" || sel.Sel.Name == "Println" ||
-		sel.Sel.Name == "Printf")
+	return ok && pkg.Name == "fmt" && (name == "Print" || name == "Println" || name == "Printf")
 }

@@ -22,13 +22,13 @@ import (
 
 // cmdFleet converges a fleet from an operator's machine with the same
 // implementation actions/converge-fleet runs in CI.
-func cmdFleet(ctx context.Context, args []string) error {
+func cmdFleet(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet fleet converge -inventory <file> [flags]")
 	}
 
 	if args[0] == "converge" {
-		return cmdFleetConverge(ctx, args[1:])
+		return cmdFleetConverge(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown fleet command %q; try converge", args[0])
@@ -42,10 +42,10 @@ type fleetOptions struct {
 	ref, source                                               string
 }
 
-func cmdFleetConverge(ctx context.Context, args []string) error {
+func cmdFleetConverge(ctx context.Context, env cli.Env, args []string) error {
 	var o fleetOptions
 
-	flags := cli.NewFlagSet("billet fleet converge", os.Stdout)
+	flags := cli.NewFlagSet("billet fleet converge", env.Stdout)
 	flags.StringVar(&o.inventory, "inventory", "", "the inventory file (required)")
 	flags.StringVar(&o.playbook, "playbook", "", "the playbook to run; the collection's junioryono.billet.fleet when empty")
 	flags.StringVar(&o.knownHosts, "known-hosts", "", "a file of pinned host keys, appended to ~/.ssh/known_hosts")
@@ -73,12 +73,12 @@ func cmdFleetConverge(ctx context.Context, args []string) error {
 		return errors.New("billet fleet converge: -ref and -source name two collections; give one")
 	}
 
-	src, ref, err := fleetSource(ctx, o)
+	src, ref, err := fleetSource(ctx, env, o)
 	if err != nil {
 		return err
 	}
 
-	return runFleetConverge(ctx, src, ref, o)
+	return runFleetConverge(ctx, env, src, ref, o)
 }
 
 // fleetRepository is where a release's source is fetched from; a var so a test
@@ -92,7 +92,7 @@ var fleetRepository = "https://github.com/" + releasesource.DefaultRepo + ".git"
 // restarts every host, so the laptop converges with the release this binary is
 // (or the one -ref names), exactly as the action's `uses:` ref pins CI. A
 // development build has no release to match and must say which it wants.
-func fleetSource(ctx context.Context, o fleetOptions) (string, string, error) {
+func fleetSource(ctx context.Context, env cli.Env, o fleetOptions) (string, string, error) {
 	if o.source != "" {
 		src, err := filepath.Abs(o.source)
 		if err != nil {
@@ -124,7 +124,7 @@ func fleetSource(ctx context.Context, o fleetOptions) (string, string, error) {
 		return "", "", fmt.Errorf("billet fleet converge: no cache directory to keep %s in: %w", ref, err)
 	}
 
-	src, err := fetchFleetSource(ctx, filepath.Join(cache, "billet", "fleet"), ref)
+	src, err := fetchFleetSource(ctx, env, filepath.Join(cache, "billet", "fleet"), ref)
 	if err != nil {
 		return "", "", err
 	}
@@ -138,7 +138,7 @@ const fleetSourceMarker = ".billet-fleet-ref"
 
 // fetchFleetSource returns root/<ref>, cloning the tag there when it is not
 // already complete.
-func fetchFleetSource(ctx context.Context, root, ref string) (string, error) {
+func fetchFleetSource(ctx context.Context, env cli.Env, root, ref string) (string, error) {
 	dir := filepath.Join(root, ref)
 
 	if marker, err := os.ReadFile(filepath.Join(dir, fleetSourceMarker)); err == nil &&
@@ -160,7 +160,7 @@ func fetchFleetSource(ctx context.Context, root, ref string) (string, error) {
 	// but a leading dash in either must never reach git as an option.
 	clone := exec.CommandContext(ctx, "git", "clone", "--quiet", "--depth", "1", "--branch", ref,
 		"--", fleetRepository, filepath.Join(staging, "src"))
-	clone.Stdout, clone.Stderr = os.Stderr, os.Stderr
+	clone.Stdout, clone.Stderr = env.Stderr, env.Stderr
 
 	if err := clone.Run(); err != nil {
 		return "", fmt.Errorf("billet fleet converge: fetch billet %s from %s: %w", ref, fleetRepository, err)
@@ -219,7 +219,7 @@ func prefixed(prefix string, names []string) []string {
 // runFleetConverge runs the action's scripts from src in the action's order,
 // carrying GITHUB_ENV and GITHUB_PATH between them as a runner does, and
 // releases the guard and cleans up however the converge ends.
-func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) error {
+func runFleetConverge(ctx context.Context, env cli.Env, src, ref string, o fleetOptions) error {
 	secrets := map[string]string{}
 
 	for name, file := range map[string]string{
@@ -254,8 +254,8 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 	}
 	defer os.RemoveAll(temp)
 
-	env := fleetBaseEnv(os.Environ())
-	basePath := env["PATH"]
+	childEnv := fleetBaseEnv(os.Environ())
+	basePath := childEnv["PATH"]
 	files := map[string]string{
 		"GITHUB_ENV":    filepath.Join(temp, "github-env"),
 		"GITHUB_PATH":   filepath.Join(temp, "github-path"),
@@ -267,7 +267,7 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 			return err
 		}
 
-		env[name] = path
+		childEnv[name] = path
 	}
 
 	mode := "converge"
@@ -281,10 +281,10 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 	}
 
 	actionPath := filepath.Join(src, "actions", "converge-fleet")
-	env["RUNNER_TEMP"] = temp
-	env["GITHUB_ACTION_PATH"] = actionPath
-	env["BILLET_ACTION_REF"] = ref
-	env["BILLET_CONVERGE_GUARD_HOLDER"] = holder
+	childEnv["RUNNER_TEMP"] = temp
+	childEnv["GITHUB_ACTION_PATH"] = actionPath
+	childEnv["BILLET_ACTION_REF"] = ref
+	childEnv["BILLET_CONVERGE_GUARD_HOLDER"] = holder
 
 	inputs := map[string]string{
 		"BILLET_MODE":             mode,
@@ -301,16 +301,16 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 	// step: it writes each to a 0600 file under RUNNER_TEMP and unsets it, and no
 	// other step has a use for them.
 	step := func(name string, extra ...map[string]string) error {
-		stepEnv := mergeEnv(env, extra...)
+		stepEnv := mergeEnv(childEnv, extra...)
 		// The script is one of fleetSteps, inside a checkout checkFleetSource proved.
 		cmd := exec.CommandContext(ctx, "bash", filepath.Join(actionPath, name)) //nolint:gosec // G204: a fixed step name in a verified checkout
 		cmd.Env = envList(stepEnv)
 		cmd.Stdin = nil
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Stdout, cmd.Stderr = env.Stdout, env.Stderr
 
 		runErr := cmd.Run()
 
-		if err := applyRunnerFiles(env, files["GITHUB_ENV"], files["GITHUB_PATH"], basePath); err != nil {
+		if err := applyRunnerFiles(childEnv, files["GITHUB_ENV"], files["GITHUB_PATH"], basePath); err != nil {
 			return errors.Join(runErr, err)
 		}
 
@@ -342,8 +342,8 @@ func runFleetConverge(ctx context.Context, src, ref string, o fleetOptions) erro
 		// the next converge and every rollout on those hosts.
 		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		cmd := exec.CommandContext(finalCtx, "bash", filepath.Join(actionPath, name)) //nolint:gosec // G204: a fixed step name in a verified checkout
-		cmd.Env = envList(mergeEnv(env, inputs))
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Env = envList(mergeEnv(childEnv, inputs))
+		cmd.Stdout, cmd.Stderr = env.Stdout, env.Stderr
 
 		if err := cmd.Run(); err != nil {
 			finished = errors.Join(finished, fmt.Errorf("%s: %w", name, err))

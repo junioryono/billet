@@ -8,7 +8,7 @@ import (
 func TestCacheCommandRoutesTheConformanceInstaller(t *testing.T) {
 	t.Parallel()
 
-	err := cmdCache(t.Context(), []string{"conformance"})
+	err := cmdCache(t.Context(), processEnv(), []string{"conformance"})
 	if err == nil || !strings.Contains(err.Error(), "cache conformance install") {
 		t.Fatalf("cache conformance error = %v, want the installer usage", err)
 	}

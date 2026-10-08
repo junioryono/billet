@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -492,7 +493,7 @@ func stageUp(t *testing.T, f *fakeConverger, verdict githubVerdict) *fakeConverg
 	}
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
-	check = func(_ context.Context, opts checkOptions) (checkReport, error) {
+	check = func(_ context.Context, _ cli.Env, opts checkOptions) (checkReport, error) {
 		f.record("check")
 
 		// THE REAL CHECK INITIALISES THE HOST: it creates the identity
@@ -593,7 +594,7 @@ func TestUpFollowsTheOrderItsSafetyDependsOn(t *testing.T) {
 	cfg := serviceConfig(t)
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
@@ -643,7 +644,7 @@ func TestUpStartsNothingWhenGitHubWasNotProved(t *testing.T) {
 			cfg := serviceConfig(t)
 			f := stageUp(t, &fakeConverger{plan: bothUnits()}, verdict)
 
-			err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+			err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 			if err == nil {
 				t.Fatal("a control plane was started on a credential nothing proved")
 			}
@@ -673,7 +674,7 @@ func TestUpDoesNotRequireGitHubForANodeOnlyHost(t *testing.T) {
 		Units: []lifeops.UnitPlan{{Name: deploy.NodeUnitName, Start: true, Enable: true}},
 	}}, githubNotConfigured)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a node-only host was refused: %v", err)
 	}
 	if !strings.Contains(strings.Join(f.trace, " "), "start "+deploy.NodeUnitName) {
@@ -693,7 +694,7 @@ func TestUpUndoesTheEnablementItPerformedWhenALaterUnitFails(t *testing.T) {
 		startErr: map[string]error{deploy.NodeUnitName: errors.New("the node never came up")},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a failed node was reported as success")
 	}
@@ -725,7 +726,7 @@ func TestUpNeverDisablesAnEnablementItDidNotPerform(t *testing.T) {
 		startErr: map[string]error{deploy.NodeUnitName: errors.New("the node never came up")},
 	}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
 		t.Fatal("a run that found the server already enabled was reported as success")
 	}
 
@@ -752,7 +753,7 @@ func TestUpEnablesOnlyAUnitItFindsDisabled(t *testing.T) {
 				enabled: map[string]string{deploy.ServerUnitName: state},
 			}, githubVerified)
 
-			err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+			err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 			if err == nil {
 				t.Fatalf("a unit that was %q was enabled anyway", state)
 			}
@@ -794,7 +795,7 @@ func TestUpUndoesAnEnableThatFailedAfterWritingLinks(t *testing.T) {
 		cancelOnEnable: cancel,
 	}, githubVerified)
 
-	if err := runLocalUp(ctx, upOptions{configPath: cfg, servicePath: cfg}); err == nil {
+	if err := runLocalUp(ctx, processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
 		t.Fatal("an interrupted enable was reported as success")
 	}
 
@@ -826,7 +827,7 @@ func TestUpRollsBackEvenWhenTheContextIsCancelled(t *testing.T) {
 		return &cancellingConverger{fakeConverger: f, cancel: cancel}
 	}
 
-	if err := runLocalUp(ctx, upOptions{configPath: cfg, servicePath: cfg}); err == nil {
+	if err := runLocalUp(ctx, processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
 		t.Fatal("a cancelled run was reported as success")
 	}
 
@@ -876,7 +877,7 @@ func TestUpProvesARunningServiceBeforeEnablingIt(t *testing.T) {
 		},
 	}}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a running host was refused: %v", err)
 	}
 
@@ -907,7 +908,7 @@ func TestUpDoesNotEnableARunningServiceThatCannotBeProved(t *testing.T) {
 		proveErr: map[string]error{deploy.ServerUnitName: errors.New("crash loop")},
 	}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err == nil {
 		t.Fatal("a crash-looping service was enabled")
 	}
 	if strings.Contains(strings.Join(f.trace, " "), "enable ") {
@@ -923,7 +924,7 @@ func TestUpDryRunMutatesNothing(t *testing.T) {
 	cfg := serviceConfig(t)
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg, dryRun: true}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg, dryRun: true}); err != nil {
 		t.Fatalf("--dry-run failed: %v", err)
 	}
 
@@ -936,7 +937,7 @@ func TestUpDryRunMutatesNothing(t *testing.T) {
 func TestUpRefusesAConfigThePackagedUnitsCannotUse(t *testing.T) {
 	asLinux(t)
 
-	err := cmdLocalUp(t.Context(), []string{"--config", nodeOnlyConfig(t)})
+	err := cmdLocalUp(t.Context(), processEnv(), []string{"--config", nodeOnlyConfig(t)})
 	if err == nil {
 		t.Fatal("a config at the wrong path was accepted")
 	}
@@ -982,7 +983,7 @@ tiers:
 
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("an App key outside the service's reach was accepted")
 	}
@@ -1004,7 +1005,7 @@ func TestUpReportsEveryRefusalWithItsRemedy(t *testing.T) {
 		{What: "the node unit is masked", Remedy: "systemctl unmask billet-node.service"},
 	}}}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: nodeOnlyConfig(t)})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: nodeOnlyConfig(t)})
 	if err == nil {
 		t.Fatal("an unprepared host was accepted")
 	}
@@ -1039,7 +1040,7 @@ func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 	}
 
 	t.Run("up", func(t *testing.T) {
-		err := cmdLocalUp(t.Context(), nil)
+		err := cmdLocalUp(t.Context(), processEnv(), nil)
 		if err == nil {
 			t.Fatal("up succeeded without a config")
 		}
@@ -1059,7 +1060,7 @@ func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 			return lifeops.Report{ConfigPath: cfgPath}, nil
 		}
 
-		if err := cmdLocalStatus(t.Context(), nil); err != nil {
+		if err := cmdLocalStatus(t.Context(), processEnv(), nil); err != nil {
 			t.Fatalf("status: %v", err)
 		}
 		if asked != initconfig.ServiceConfigPathFor(hostOS) {
@@ -1082,7 +1083,7 @@ func TestUpStopsBeforeMutatingWhenTheIdentityIsUnresolvable(t *testing.T) {
 		identity: func() (int, int, error) { return -1, -1, errors.New("no billet account") },
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a host with no service account was converged anyway")
 	}
@@ -1112,7 +1113,7 @@ func TestUpUndoesEarlierEnablementWhenALaterEnableFails(t *testing.T) {
 		enableErr: map[string]error{deploy.NodeUnitName: errors.New("systemctl enable: read-only")},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a failed enable was reported as success")
 	}
@@ -1147,7 +1148,7 @@ func TestUpDoesNotDisableAStateItCannotShowItCreated(t *testing.T) {
 		enableLeaves: map[string]string{deploy.ServerUnitName: "masked"},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a failed enable was reported as success")
 	}
@@ -1187,7 +1188,7 @@ func TestUpRefusesWhenStartingOneServiceDisturbsTheOther(t *testing.T) {
 		},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a start that stopped the other service was reported as success")
 	}
@@ -1221,7 +1222,7 @@ func TestUpAcceptsAStartThatDisturbsNothing(t *testing.T) {
 		},
 	}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a run that disturbed nothing was refused: %v", err)
 	}
 	if !strings.Contains(strings.Join(f.trace, " → "), "start "+deploy.ServerUnitName) {
@@ -1250,7 +1251,7 @@ func TestUpRefusesWhenEnablingOneUnitEnablesTheOther(t *testing.T) {
 		alsoEnables: map[string]string{deploy.NodeUnitName: deploy.ServerUnitName},
 	}, githubNotConfigured)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("an enable that committed the other unit was reported as success")
 	}
@@ -1294,7 +1295,7 @@ func TestUpRefusesWhenStartingTheNodeStartsTheServer(t *testing.T) {
 		},
 	}, githubNotConfigured)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("starting the node started a control plane and the run reported success")
 	}
@@ -1324,7 +1325,7 @@ func TestUpStopsWhenItCannotTellWhetherItDisturbedAnything(t *testing.T) {
 			snapshotErrAfter: 1,
 		}, githubVerified)
 
-		err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+		err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 		if err == nil {
 			t.Fatal("a run that could not look at the other service reported success")
 		}
@@ -1348,7 +1349,7 @@ func TestUpStopsWhenItCannotTellWhetherItDisturbedAnything(t *testing.T) {
 			enabledErrAfter: 4,
 		}, githubVerified)
 
-		err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+		err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 		if err == nil {
 			t.Fatal("a run that could not read enablement reported success")
 		}
@@ -1383,7 +1384,7 @@ func TestUpReportsWhenItsOwnUndoingRemovedSomethingOlder(t *testing.T) {
 		startErr: map[string]error{deploy.ServerUnitName: errors.New("the server never came up")},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a failed run was reported as success")
 	}
@@ -1415,7 +1416,7 @@ func TestUpRefusesAnEnableThatSucceededWithoutEnabling(t *testing.T) {
 		enableLeaves: map[string]string{deploy.ServerUnitName: "disabled"},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("an enable that committed nothing was reported as success")
 	}
@@ -1444,7 +1445,7 @@ func TestUpAsksAgainImmediatelyBeforeActing(t *testing.T) {
 		},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a unit that changed under the run was started anyway")
 	}
@@ -1492,7 +1493,7 @@ func TestUpUsesTheBackendsOwnServiceNamesAndNoOthers(t *testing.T) {
 		},
 	}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("runLocalUp: %v", err)
 	}
 
@@ -1549,7 +1550,7 @@ func TestUpRefusesWithTheBackendsOwnCommand(t *testing.T) {
 		enabled: map[string]string{server: "masked"},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a masked service was enabled anyway")
 	}
@@ -1589,7 +1590,7 @@ func TestUpEnablesBeforeStartingWhereTheManagerRequiresIt(t *testing.T) {
 		},
 	}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("runLocalUp: %v", err)
 	}
 
@@ -1638,7 +1639,7 @@ func TestUpUndoesAnEarlyEnableWhenTheStartFails(t *testing.T) {
 		},
 	}, githubVerified)
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a service that would not start was left committed to boot")
 	}
@@ -1669,7 +1670,7 @@ func TestUpPrintsTheBackendsOwnProof(t *testing.T) {
 	stageUp(t, &fakeConverger{plan: bothUnits(), startProof: proof}, githubVerified)
 
 	out := capture(t, func() {
-		if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+		if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 			t.Fatalf("runLocalUp: %v", err)
 		}
 	})
@@ -1694,7 +1695,7 @@ func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
 	cfg := refreshConfig(t)
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a firecracker control-plane host was refused: %v", err)
 	}
 
@@ -1717,7 +1718,7 @@ func TestUpArmsTheTimersEachHostNeeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enableTimers(t.Context(), other, loaded, lifeops.UpRequest{WantServer: true})
+	enableTimers(t.Context(), processEnv(), other, loaded, lifeops.UpRequest{WantServer: true})
 	if len(other.trace) != 0 {
 		t.Errorf("a manager with no timers was asked to %v", other.trace)
 	}

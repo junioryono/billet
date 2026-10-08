@@ -28,11 +28,12 @@ type Env struct {
 	Getenv func(string) string
 }
 
-// Command is one entry of the command tree.
+// Command is one entry of the command tree. Run is handed the env the
+// binary was given, and writes to it rather than to the process's streams.
 type Command struct {
 	Name    string
 	Summary string
-	Run     func(ctx context.Context, args []string) error
+	Run     func(ctx context.Context, env Env, args []string) error
 }
 
 // Tree is the commands the binary dispatches, built over the lifecycle so the
@@ -98,7 +99,7 @@ func Run(args []string, env Env, tree Tree, exit func(int)) error {
 
 	for _, c := range tree(lc) {
 		if c.Name == args[0] {
-			return c.Run(ctx, args[1:])
+			return c.Run(ctx, env, args[1:])
 		}
 	}
 

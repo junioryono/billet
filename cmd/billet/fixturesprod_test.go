@@ -290,7 +290,9 @@ func TestTheReleaseInspectFixturesAreTheCommandsOwn(t *testing.T) {
 
 			var runErr error
 
-			out := capture(t, func() { runErr = cmdReleaseInspect(t.Context(), []string{"--json", "--config", p.configPath}) })
+			out := capture(t, func() {
+				runErr = cmdReleaseInspect(t.Context(), processEnv(), []string{"--json", "--config", p.configPath})
+			})
 			mustOK(t, runErr)
 
 			compareFixture(t, "release-inspect", name, normaliseReport(t, out, p.spellings))

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/config"
@@ -136,8 +138,8 @@ func takeRetireInspectionLock() (*txLock, error) {
 	return tx, nil
 }
 
-func retireCheckNodeConfig(ctx context.Context, m retireMode) (any, *retireRefusal) {
-	raw, r := readRetireDocument(4 * retirement.MaxStageBytes)
+func retireCheckNodeConfig(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
+	raw, r := readRetireDocument(env, 4*retirement.MaxStageBytes)
 	if r != nil {
 		return nil, r
 	}

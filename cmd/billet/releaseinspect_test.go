@@ -2796,16 +2796,16 @@ func TestBusLabelEscapesLikeSystemd(t *testing.T) {
 // THE COMMAND PARSES ITS FLAGS AND RENDERS: a smoke test of the entry point.
 func TestReleaseInspectCommandRuns(t *testing.T) {
 	f := newInspectFixture(t)
-	if err := cmdReleaseInspect(t.Context(), []string{"--json", "--config", f.configPath}); err != nil {
+	if err := cmdReleaseInspect(t.Context(), processEnv(), []string{"--json", "--config", f.configPath}); err != nil {
 		t.Fatalf("release inspect --json: %v", err)
 	}
-	if err := cmdReleaseInspect(t.Context(), []string{"--config", f.configPath}); err != nil {
+	if err := cmdReleaseInspect(t.Context(), processEnv(), []string{"--config", f.configPath}); err != nil {
 		t.Fatalf("release inspect: %v", err)
 	}
-	if err := cmdRelease(t.Context(), []string{"inspect", "--json", "--config", f.configPath}); err != nil {
+	if err := cmdRelease(t.Context(), processEnv(), []string{"inspect", "--json", "--config", f.configPath}); err != nil {
 		t.Fatalf("release inspect through the dispatcher: %v", err)
 	}
-	if err := cmdRelease(t.Context(), []string{"nonsense"}); err == nil || !strings.Contains(err.Error(), "inspect") {
+	if err := cmdRelease(t.Context(), processEnv(), []string{"nonsense"}); err == nil || !strings.Contains(err.Error(), "inspect") {
 		t.Errorf("an unknown release command does not name inspect: %v", err)
 	}
 }

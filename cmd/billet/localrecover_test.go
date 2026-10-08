@@ -111,7 +111,7 @@ func TestARecoveryReplacesThisDeploymentsLedgerAndKeepsTheOldOne(t *testing.T) {
 
 	before := digestOf(t, filepath.Join(f.stateDir, "billet.db"))
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local recover: %v", err)
@@ -175,7 +175,7 @@ func TestARecoveryRefusesAHostThatIsNotAlreadyThisDeployment(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if err == nil {
@@ -205,7 +205,7 @@ func TestARecoveryRefusesAnotherDeploymentsArchive(t *testing.T) {
 
 	mine := newBackupFixture(t, true)
 
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", mine.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if err == nil {
@@ -238,7 +238,7 @@ func TestARecoveryWillNotStrandRunningWorkUnasked(t *testing.T) {
 
 	// A timeout, or this waits forever for work nothing is going to finish —
 	// which is the correct production behaviour and an unusable test.
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 		"--timeout", "10ms",
 	})
@@ -270,7 +270,7 @@ func TestARecoveryProceedsWhenTheJobsAreAcceptedByName(t *testing.T) {
 
 	populateLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 		"--accept-failing-jobs",
 	}); err != nil {
@@ -296,7 +296,7 @@ func TestARecoveryDryRunSealsNothingAndMovesNothing(t *testing.T) {
 
 	populateLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--dry-run",
 	}); err != nil {
 		t.Fatalf("billet local recover --dry-run: %v", err)
@@ -332,7 +332,7 @@ func TestARecoveryRefusesWithoutTheFleetFencingAssertion(t *testing.T) {
 
 	populateLedger(t, f)
 
-	err := cmdLocalRecover(t.Context(), []string{"--config", f.configPath, "--from", archive})
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{"--config", f.configPath, "--from", archive})
 	if err == nil {
 		t.Fatal("a recovery ran without --old-controller-fenced")
 	}
@@ -369,7 +369,7 @@ func TestAnAbandonedRecoveryPutsTheLedgerBack(t *testing.T) {
 	// find on a machine somebody is in the middle of repairing.
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -379,7 +379,7 @@ func TestAnAbandonedRecoveryPutsTheLedgerBack(t *testing.T) {
 		t.Fatal("the interruption did not get as far as moving the ledger aside")
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("billet local recover --abandon: %v", err)
@@ -423,7 +423,7 @@ func TestAnInterruptedRecoveryResumes(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -439,7 +439,7 @@ func TestAnInterruptedRecoveryResumes(t *testing.T) {
 		t.Fatalf("restore write permission: %v", err)
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("the resumed recovery: %v", err)
@@ -491,7 +491,7 @@ func TestTheFenceOutlivesThePublicationUntilTheSealIsTaken(t *testing.T) {
 	}
 
 	res, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -589,7 +589,7 @@ func TestFinishRefusesAnotherOperationsJournal(t *testing.T) {
 	}
 
 	if _, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	}); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -855,7 +855,7 @@ func TestAnAbandonedRecoveryPutsBackASidecarTheLedgerNeverFollowed(t *testing.T)
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -883,7 +883,7 @@ func TestAnAbandonedRecoveryPutsBackASidecarTheLedgerNeverFollowed(t *testing.T)
 	wal := []byte("committed transactions this ledger has not checkpointed")
 	supersedeSidecar(t, f.stateDir, aside+"-wal", wal)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("billet local recover --abandon: %v", err)
@@ -923,7 +923,7 @@ func TestAnAbandonedRecoveryRefusesToAttachAForeignLog(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -955,7 +955,7 @@ func TestAnAbandonedRecoveryRefusesToAttachAForeignLog(t *testing.T) {
 	// and "this directory is ready to start" must never be the same answer. An
 	// abandon that returned nil here would go on to remove the journal and lift
 	// the fence over a directory with no billet.db in it at all.
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	})
 	if err == nil {
@@ -1008,7 +1008,7 @@ func TestAnAbandonResumesItsOwnPutBack(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1034,7 +1034,7 @@ func TestAnAbandonResumesItsOwnPutBack(t *testing.T) {
 	wal := []byte("committed transactions this ledger has not checkpointed")
 	supersedeSidecar(t, f.stateDir, aside+"-wal", wal)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("the abandon resuming its own put-back: %v", err)
@@ -1072,7 +1072,7 @@ func TestAnAbandonRefusesToOpenADeploymentWithNoLedger(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1090,7 +1090,7 @@ func TestAnAbandonRefusesToOpenADeploymentWithNoLedger(t *testing.T) {
 		t.Fatalf("move the superseded ledger away: %v", err)
 	}
 
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	})
 	if err == nil {
@@ -1137,7 +1137,7 @@ func TestARecoveryThatAlreadyPublishedIsFinishedRatherThanRepublished(t *testing
 	// STOPPED EXACTLY WHERE THE CRASH LANDS: the executor publishes and returns
 	// Unfinished, and nothing seals or lifts the fence.
 	res, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -1161,7 +1161,7 @@ func TestARecoveryThatAlreadyPublishedIsFinishedRatherThanRepublished(t *testing
 	// decide on a second supersede.
 	sealThroughTheFence(t, f.stateDir)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("the retry after a published recovery: %v", err)
@@ -1215,7 +1215,7 @@ func TestAnAbandonRefusesAnOperationThatFinished(t *testing.T) {
 	// the state the guard is about. Staging "finished" onto a run that stopped
 	// early would fire the guard while reproducing nothing it describes.
 	res, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -1237,7 +1237,7 @@ func TestAnAbandonRefusesAnOperationThatFinished(t *testing.T) {
 	// a finished, sealed deployment whose journal is still here.
 	setJournalPhase(t, f.stateDir, "finished")
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err == nil {
 		t.Fatal("an abandon undid an operation that had finished")
@@ -1255,7 +1255,7 @@ func TestAnAbandonRefusesAnOperationThatFinished(t *testing.T) {
 
 	// AND RE-RUNNING WITHOUT --abandon IS THE WAY OUT, which is what the refusal
 	// tells the operator to do.
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("the retry after a finished operation: %v", err)
@@ -1341,7 +1341,7 @@ func TestAJournalThisBuildDoesNotUnderstandIsNeverActedOn(t *testing.T) {
 				t.Fatalf("stage the journal: %v", err)
 			}
 
-			if err := cmdLocalRecover(t.Context(), []string{
+			if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 				"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 			}); err == nil {
 				t.Fatal("a recovery acted on a journal this build does not understand")
@@ -1395,7 +1395,7 @@ func TestFinishRefusesAPublicationThatDidNotFinish(t *testing.T) {
 	}
 
 	if _, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	}); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -1456,7 +1456,7 @@ func TestAnAbandonPutsTheLedgerBackBeforeItsSidecars(t *testing.T) {
 	}
 
 	if _, err := deployarchive.Execute(t.Context(), deployarchive.RestoreRequest{
-		Plan: plan, InstallAppKey: installAppKey, Now: time.Now, Actor: "test",
+		Plan: plan, InstallAppKey: installAppKeyHere, Now: time.Now, Actor: "test",
 	}); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -1519,7 +1519,7 @@ func TestARestoreRefusesALedgerNameBesideAStrayWriteAheadLog(t *testing.T) {
 		t.Fatalf("stage the stray log: %v", err)
 	}
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if err == nil {
@@ -1550,7 +1550,7 @@ func TestARecoveryRefusesATornSupersede(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1583,7 +1583,7 @@ func TestARecoveryRefusesATornSupersede(t *testing.T) {
 		t.Fatalf("clear the fence: %v", err)
 	}
 
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if err == nil {
@@ -1624,7 +1624,7 @@ func TestAnAbandonRefusesALedgerNameThatIsNotAFile(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1651,7 +1651,7 @@ func TestAnAbandonRefusesALedgerNameThatIsNotAFile(t *testing.T) {
 		t.Fatalf("stage the link: %v", err)
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err == nil {
 		t.Fatal("an abandon lifted the fence over a link standing in for the ledger")
@@ -1681,7 +1681,7 @@ func TestAnAbandonRefusesALedgerThatIsNotTheOneItMovedAside(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1709,7 +1709,7 @@ func TestAnAbandonRefusesALedgerThatIsNotTheOneItMovedAside(t *testing.T) {
 		t.Fatalf("stage the empty ledger: %v", err)
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err == nil {
 		t.Fatal("an abandon lifted the fence over a ledger it had never moved aside")
@@ -1744,7 +1744,7 @@ func TestAnAbandonAcceptsTheLedgerItMovedAside(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1764,7 +1764,7 @@ func TestAnAbandonAcceptsTheLedgerItMovedAside(t *testing.T) {
 			"digests to %q", recorded, moved)
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("billet local recover --abandon: %v", err)
@@ -1881,7 +1881,7 @@ func TestAnAbandonRefusesAWriteAheadLogItNeverMovedAside(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1900,7 +1900,7 @@ func TestAnAbandonRefusesAWriteAheadLogItNeverMovedAside(t *testing.T) {
 		t.Fatalf("stage the substituted log: %v", err)
 	}
 
-	err := cmdLocalRecover(t.Context(), []string{
+	err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	})
 	if err == nil {
@@ -1946,7 +1946,7 @@ func TestAnAbandonRefusesAWriteAheadLogThatChanged(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -1965,7 +1965,7 @@ func TestAnAbandonRefusesAWriteAheadLogThatChanged(t *testing.T) {
 		t.Fatalf("swap the log: %v", err)
 	}
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err == nil {
 		t.Fatal("an abandon put back a log that is not the one it moved aside")
@@ -2016,7 +2016,7 @@ func TestARestoresAbandonWillNotActOnARecoverysJournal(t *testing.T) {
 
 	stopAfterTheLedger(t, f)
 
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--old-controller-fenced",
 	}); err == nil {
 		t.Fatal("the interrupted recovery reported success")
@@ -2033,7 +2033,7 @@ func TestARestoresAbandonWillNotActOnARecoverysJournal(t *testing.T) {
 		t.Fatalf("clear the fence: %v", err)
 	}
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	})
 	if err == nil {
@@ -2070,7 +2070,7 @@ func TestARestoresAbandonWillNotActOnARecoverysJournal(t *testing.T) {
 	}
 
 	// SO THE COMMAND THAT OWNS IT STILL WORKS.
-	if err := cmdLocalRecover(t.Context(), []string{
+	if err := cmdLocalRecover(t.Context(), processEnv(), []string{
 		"--config", f.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("the recovery's own abandon after the refused one: %v", err)

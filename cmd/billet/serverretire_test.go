@@ -48,11 +48,11 @@ func newRetireFixture(t *testing.T) *retireFixture {
 		mustOK(t, err)
 	})
 
-	savedNow, savedID, savedStdin := retireNow, retireTransitionID, retireStdin
+	savedNow, savedID, savedStdin := retireNow, retireTransitionID, testStdin
 	retireNow = func() time.Time { return time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC) }
 	retireTransitionID = func() (string, error) { return retireTestID, nil }
 
-	t.Cleanup(func() { retireNow, retireTransitionID, retireStdin = savedNow, savedID, savedStdin })
+	t.Cleanup(func() { retireNow, retireTransitionID, testStdin = savedNow, savedID, savedStdin })
 
 	installRetireHostManager(t, &requestFixture{retireFixture: f})
 	return f
@@ -83,12 +83,12 @@ func (f *retireFixture) run(t *testing.T, stdin string, args ...string) (string,
 func (f *retireFixture) runRaw(t *testing.T, stdin string, args ...string) (string, int) {
 	t.Helper()
 
-	retireStdin = strings.NewReader(stdin)
+	testStdin = strings.NewReader(stdin)
 
 	var runErr error
 
 	out := capture(t, func() {
-		runErr = cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, args...))
+		runErr = cmdServer(t.Context(), processEnv(), nil, append([]string{"retire", "--json", "--config", f.cfg}, args...))
 	})
 
 	code := 0
@@ -291,7 +291,7 @@ func TestServerRetireRefusesEachCombinationBeforeOpeningAnything(t *testing.T) {
 	}
 
 	// Without --json there is no answer at all.
-	err := cmdServer(t.Context(), nil, []string{"retire", "--dry-run", "--retiring-host", "control-a", "--config", f.cfg})
+	err := cmdServer(t.Context(), processEnv(), nil, []string{"retire", "--dry-run", "--retiring-host", "control-a", "--config", f.cfg})
 	if err == nil || !strings.Contains(err.Error(), "--json") {
 		t.Fatalf("a run without --json must be refused naming it, got %v", err)
 	}

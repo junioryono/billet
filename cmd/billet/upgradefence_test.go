@@ -124,7 +124,7 @@ func TestANoOpUpgradeRecordsTheDecisionBeforeAcceptingIt(t *testing.T) {
 
 	ack, answer := ackReader(t)
 
-	err := actOnResolved(t.Context(), &config.Config{}, "", hostUpgradeTarget{generation: 10},
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{generation: 10},
 		ack, nil, installedManifest(t), strings.Repeat("b", 64), heldTxLock(t))
 	if err != nil {
 		t.Fatalf("a machine already on the target refused the instruction: %v", err)
@@ -163,7 +163,7 @@ func TestASupersededNoOpNeitherAcceptsNorRecords(t *testing.T) {
 
 	ack, answer := ackReader(t)
 
-	err := actOnResolved(t.Context(), &config.Config{}, "", hostUpgradeTarget{generation: 9},
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{generation: 9},
 		ack, nil, installedManifest(t), strings.Repeat("b", 64), heldTxLock(t))
 	if !errors.Is(err, ErrSuperseded) {
 		t.Fatalf("a superseded no-op returned %v, want ErrSuperseded", err)
@@ -321,7 +321,7 @@ func TestTheFastPathDoesNotWaveThroughADisagreeingHost(t *testing.T) {
 
 	ack, _ := ackReader(t)
 
-	err := actOnResolved(t.Context(), &config.Config{}, "", hostUpgradeTarget{},
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{},
 		ack, &releasesource.Client{HTTP: &http.Client{Transport: unreachable{}}},
 		installedManifest(t), strings.Repeat("b", 64), heldTxLock(t))
 	if err == nil {
@@ -351,7 +351,7 @@ func TestTheFastPathLeavesAHostThatCannotSayAlone(t *testing.T) {
 
 	ack, _ := ackReader(t)
 
-	err := actOnResolved(t.Context(), &config.Config{}, "", hostUpgradeTarget{},
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{},
 		ack, &releasesource.Client{HTTP: &http.Client{Transport: unreachable{}}},
 		installedManifest(t), strings.Repeat("b", 64), heldTxLock(t))
 	if err != nil {
@@ -382,7 +382,7 @@ func TestReinstallInstallsEvenWhenTheVersionAlreadyMatches(t *testing.T) {
 
 	ack, _ := ackReader(t)
 
-	err := actOnResolved(t.Context(), &config.Config{}, "",
+	err := actOnResolved(t.Context(), processEnv(), &config.Config{}, "",
 		hostUpgradeTarget{reinstall: true}, ack,
 		&releasesource.Client{HTTP: &http.Client{Transport: unreachable{}}},
 		installedManifest(t), strings.Repeat("b", 64), heldTxLock(t))

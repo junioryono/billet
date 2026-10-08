@@ -122,7 +122,7 @@ func (f *requestFixture) drive(t *testing.T, j retirement.Journal) (retirement.J
 	// and it is handed exactly what the command could hand it.
 	obs, _ := observeRetireConfig(f.cfg)
 
-	return retireTransition(t.Context(), retireMode{configPath: f.cfg, run: requestRun,
+	return retireTransition(t.Context(), processEnv(), retireMode{configPath: f.cfg, run: requestRun,
 		retiringHost: requestRetiring}, obs, j)
 }
 

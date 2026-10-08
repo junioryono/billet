@@ -47,7 +47,7 @@ func TestUpInstallsTheScheduledAgentsAfterTheServicesOnAMac(t *testing.T) {
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
@@ -76,7 +76,7 @@ func TestUpReportsAScheduleItCouldNotInstall(t *testing.T) {
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
 
-	err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg})
+	err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg})
 	if err == nil {
 		t.Fatal("a schedule that could not be installed was reported as up")
 	}
@@ -99,7 +99,7 @@ func TestUpInstallsNoScheduleWhereTheManagerHasNone(t *testing.T) {
 	cfg := serviceConfig(t)
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 

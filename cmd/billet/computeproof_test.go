@@ -181,7 +181,7 @@ func TestDrainWaitsForEveryHostToSayItIsRunningNothing(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		if err := cmdDrain(ctx, []string{"--config", cfgPath, "--wait"}); err != nil {
+		if err := cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"}); err != nil {
 			t.Errorf("drain --wait: %v", err)
 		}
 	})
@@ -213,7 +213,7 @@ func TestDrainDoesNotFinishWhileAHostSaysItIsRunningWork(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		err := cmdDrain(ctx, []string{"--config", cfgPath, "--wait", "--timeout", "3s"})
+		err := cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait", "--timeout", "3s"})
 		if err == nil {
 			t.Error("a drain finished while a host said it was running compute")
 		}
@@ -307,7 +307,7 @@ func TestDrainStopsIfAdmissionMovesWhileProvingTheFleet(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		err := cmdDrain(ctx, []string{"--config", cfgPath, "--wait"})
+		err := cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"})
 		if err == nil {
 			t.Error("a drain reported the fleet proved idle after admission moved underneath it")
 
@@ -338,7 +338,7 @@ func TestDrainWithoutComputeProofSaysWhatItDidNotEstablish(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		if err := cmdDrain(ctx, []string{
+		if err := cmdDrain(ctx, processEnv(), []string{
 			"--config", cfgPath, "--wait", "--without-compute-proof",
 		}); err != nil {
 			t.Errorf("drain --wait --without-compute-proof: %v", err)
@@ -360,7 +360,7 @@ func TestDrainWithoutComputeProofSaysWhatItDidNotEstablish(t *testing.T) {
 func TestDrainRefusesTheEscapeWithoutAWait(t *testing.T) {
 	_, cfgPath := drainFixture(t)
 
-	err := cmdDrain(t.Context(), []string{"--config", cfgPath, "--without-compute-proof"})
+	err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfgPath, "--without-compute-proof"})
 	if err == nil {
 		t.Fatal("--without-compute-proof was accepted on a drain that waits for nothing")
 	}
@@ -390,7 +390,7 @@ func TestDownStopsNothingWhileAHostSaysItIsRunningCompute(t *testing.T) {
 
 	answered := answerBarrierWhenAsked(t, db, cfg, "probe-node", false)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath, timeout: 3 * time.Second})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, timeout: 3 * time.Second})
 
 	<-answered
 
@@ -431,7 +431,7 @@ func TestDownStopsOnceTheFleetIsProvedIdle(t *testing.T) {
 	answered := answerBarrierWhenAsked(t, db, cfg, "probe-node", true)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("a proved-idle host was refused: %v", err)
 		}
 	})
@@ -488,7 +488,7 @@ func TestDownStopsNothingIfTheFleetStoppedBeingProvedBeforeItActed(t *testing.T)
 	// useless.
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
-	if err := stopAndDisable(t.Context(), f, cfg, req, sealed.Generation, true); err != nil {
+	if err := stopAndDisable(t.Context(), processEnv(), f, cfg, req, sealed.Generation, true); err != nil {
 		t.Fatalf("a fleet that is still proved idle was refused: %v", err)
 	}
 
@@ -504,7 +504,7 @@ func TestDownStopsNothingIfTheFleetStoppedBeingProvedBeforeItActed(t *testing.T)
 
 	after := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
-	err = stopAndDisable(t.Context(), after, cfg, req, sealed.Generation, true)
+	err = stopAndDisable(t.Context(), processEnv(), after, cfg, req, sealed.Generation, true)
 	if err == nil {
 		t.Fatal("a host whose proof had been discarded by a later launch was stopped anyway")
 	}
@@ -554,7 +554,7 @@ func TestDownSaysWhenThereIsNoControlPlaneToAskThroughAndStopsAnyway(t *testing.
 	}, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("a host with no control plane to ask through was refused: %v", err)
 		}
 	})
@@ -586,7 +586,7 @@ func TestDownWithoutComputeProofSaysWhatItDidNotEstablish(t *testing.T) {
 	stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{
 			configPath: cfgPath, withoutProof: true,
 		}); err != nil {
 			t.Errorf("a waived proof refused the command: %v", err)
@@ -621,7 +621,7 @@ func TestDecommissionWithoutProofSaysTheExclusionIsUnproven(t *testing.T) {
 	}
 
 	// Without --force it is refused, and the refusal names what is missing.
-	err = cmdNodes(t.Context(), []string{"decommission", "retired-host", "--config", cfgPath})
+	err = cmdNodes(t.Context(), processEnv(), []string{"decommission", "retired-host", "--config", cfgPath})
 	if err == nil {
 		t.Fatal("a host nothing had proved idle was decommissioned")
 	}
@@ -630,7 +630,7 @@ func TestDecommissionWithoutProofSaysTheExclusionIsUnproven(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdNodes(t.Context(), []string{
+		if err := cmdNodes(t.Context(), processEnv(), []string{
 			"decommission", "retired-host", "--config", cfgPath, "--force",
 		}); err != nil {
 			t.Errorf("a forced decommission was refused: %v", err)
@@ -672,7 +672,7 @@ func TestADrainNamesAHostExcludedWithoutProof(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		if err := cmdDrain(ctx, []string{"--config", cfgPath, "--wait"}); err != nil {
+		if err := cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"}); err != nil {
 			t.Errorf("drain --wait: %v", err)
 		}
 	})

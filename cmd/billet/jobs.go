@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"time"
 
@@ -14,20 +13,20 @@ import (
 )
 
 // cmdJobs is the operator's view of what jobs did.
-func cmdJobs(ctx context.Context, args []string) error {
+func cmdJobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease>")
 	}
 	if args[0] == "show" {
-		return cmdJobsShow(ctx, args[1:])
+		return cmdJobsShow(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown jobs command %q; try show", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do.
-func cmdJobsShow(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet jobs show", os.Stdout)
+func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet jobs show", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
@@ -55,7 +54,7 @@ func cmdJobsShow(ctx context.Context, args []string) error {
 		return err
 	}
 
-	renderJob(os.Stdout, rec, measured)
+	renderJob(env.Stdout, rec, measured)
 
 	return nil
 }

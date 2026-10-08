@@ -226,7 +226,7 @@ func TestCompatibilitySelectionUsesTheCertificateDerivedNodeName(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", bundleDir}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", bundleDir}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 

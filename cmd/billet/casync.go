@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -30,8 +29,8 @@ import (
 // direction deletes anything: a replaced local authority is moved aside, because
 // what is being set aside is a private key and an operator who chose the wrong
 // direction has to be able to put it back.
-func cmdCASync(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca sync", os.Stdout)
+func cmdCASync(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca sync", env.Stdout)
 	cfgPath := fs.String("config", "", "path to billet.yaml")
 	push := fs.Bool("push", false,
 		"publish this host's authority to the identity store instead of adopting from it")
@@ -87,8 +86,8 @@ func cmdCASync(ctx context.Context, args []string) error {
 			return err
 		}
 
-		fmt.Println("Published this host's node-wire authority to the identity store.")
-		fmt.Println("A controller that holds a DIFFERENT one still refuses to adopt it; " +
+		fmt.Fprintln(env.Stdout, "Published this host's node-wire authority to the identity store.")
+		fmt.Fprintln(env.Stdout, "A controller that holds a DIFFERENT one still refuses to adopt it; "+
 			"run `billet ca sync --force` there once you are sure this is the right one.")
 
 		return nil
@@ -107,14 +106,14 @@ func cmdCASync(ctx context.Context, args []string) error {
 
 	switch adopted {
 	case wireshare.AdoptedNothing:
-		fmt.Println("The identity store holds no authority for this deployment yet.")
-		fmt.Println("Run `billet ca sync --push` on the controller that has one.")
+		fmt.Fprintln(env.Stdout, "The identity store holds no authority for this deployment yet.")
+		fmt.Fprintln(env.Stdout, "Run `billet ca sync --push` on the controller that has one.")
 	case wireshare.AdoptedAlreadyHeld:
-		fmt.Println("This host already holds the authority the identity store publishes.")
+		fmt.Fprintln(env.Stdout, "This host already holds the authority the identity store publishes.")
 	case wireshare.AdoptedInstalled:
-		fmt.Printf("This host now holds this deployment's node-wire authority (%s).\n",
+		fmt.Fprintf(env.Stdout, "This host now holds this deployment's node-wire authority (%s).\n",
 			currentAuthorityFingerprint(cfg.Server.IdentityDir))
-		fmt.Println("Restart the control plane here so it serves the authority it now holds.")
+		fmt.Fprintln(env.Stdout, "Restart the control plane here so it serves the authority it now holds.")
 	}
 
 	return nil

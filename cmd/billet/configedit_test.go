@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,7 +153,7 @@ func TestGitHubAppCreateRefusesAConfigItCannotUpdate(t *testing.T) {
 			var err error
 
 			out := capture(t, func() {
-				err = githubAppCreate(t.Context(), []string{
+				err = githubAppCreate(t.Context(), processEnv(), []string{
 					"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 				})
 			})
@@ -301,7 +303,7 @@ func TestThePreflightAgreesWithTheWrite(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				writeErrs = append(writeErrs, writeGitHubBlock(attempt, shape))
+				writeErrs = append(writeErrs, writeGitHubBlock(processEnv(), attempt, shape))
 				written = append(written, attempt)
 			}
 
@@ -368,7 +370,7 @@ func TestGitHubAppCreateSaysItWillEditTheConfigBeforeItDoes(t *testing.T) {
 		var err error
 
 		out := capture(t, func() {
-			err = githubAppCreate(t.Context(), []string{
+			err = githubAppCreate(t.Context(), processEnv(), []string{
 				"--org", "acme", "--config", cfgPath,
 				"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 			})
@@ -426,7 +428,7 @@ func TestGitHubAppCreateSaysItWillEditTheConfigBeforeItDoes(t *testing.T) {
 			var err error
 
 			out := capture(t, func() {
-				err = githubAppCreate(t.Context(), []string{
+				err = githubAppCreate(t.Context(), processEnv(), []string{
 					"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 				})
 			})
@@ -506,7 +508,7 @@ func TestTheNoticeNamesTheIdentityItWillReplace(t *testing.T) {
 	stubOnboard(t, testKey(t), errors.New("stop here"))
 
 	out := capture(t, func() {
-		_ = githubAppCreate(t.Context(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
+		_ = githubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
 			"--org", "acme", "--config", cfgPath,
 			"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
@@ -529,7 +531,7 @@ func TestTheNoticeSaysWhenNothingWillBeEdited(t *testing.T) {
 	stubOnboard(t, testKey(t), errors.New("stop here"))
 
 	out := capture(t, func() {
-		_ = githubAppCreate(t.Context(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
+		_ = githubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
 			"--org", "acme", "--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
 	})
@@ -550,7 +552,7 @@ func TestTheNoticeSaysWhenNothingWillBeEdited(t *testing.T) {
 // the fix — two rules is the defect.
 func TestInitNextStepsSayTheAppCommandEditsTheConfig(t *testing.T) {
 	out := capture(t, func() {
-		printInitNext("/tmp/billet.yaml", initconfig.Params{
+		printInitNext(processEnv(), "/tmp/billet.yaml", initconfig.Params{
 			Org: "acme", Provider: config.ProviderDocker,
 			Profile: initconfig.ProfileLocal,
 		}, true)
@@ -596,7 +598,7 @@ func TestTheConfigWriteNeverClobbersTheKeyPath(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 		})
 	})
@@ -644,7 +646,7 @@ func TestInitNeverClobbersAFileAtTheStagingName(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{
+		err = cmdInit(t.Context(), processEnv(), []string{
 			"--config", cfgPath, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -711,7 +713,7 @@ func TestASymlinkedConfigIsFollowedRatherThanReplaced(t *testing.T) {
 	// NO --key-path, so the default is exercised too: the key belongs beside the
 	// file that actually holds the config, not beside the link.
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", link, "--no-browser",
 		})
 	})
@@ -779,7 +781,7 @@ func TestTheMissingConfigRefusalDoesNotDependOnKeyPath(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--no-browser",
 		})
 	})
@@ -832,7 +834,7 @@ func TestAnUndeliverableNoticeStopsTheRun(t *testing.T) {
 		_ = w.Close()
 	})
 
-	err := githubAppCreate(t.Context(), []string{
+	err := githubAppCreate(t.Context(), processEnv(), []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
@@ -883,7 +885,7 @@ func TestTheNoticeComesBeforeTheFirstSideEffect(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 		})
 	})
@@ -946,7 +948,7 @@ func TestTheRecoveryBlockGoesToStderr(t *testing.T) {
 
 	stderr := captureStderr(t, func() {
 		stdout = capture(t, func() {
-			err = githubAppCreate(t.Context(), []string{
+			err = githubAppCreate(t.Context(), processEnv(), []string{
 				"--org", "acme", "--config", cfgPath,
 				"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 			})
@@ -1038,7 +1040,7 @@ func TestTheConfigWriteLeavesNoStagedFile(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1092,7 +1094,7 @@ func TestReplacingAnIdentityLeavesNoneOfTheOldOne(t *testing.T) {
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}
 
-	if err := writeGitHubBlock(path, want); err != nil {
+	if err := writeGitHubBlock(processEnv(), path, want); err != nil {
 		t.Fatalf("writeGitHubBlock: %v", err)
 	}
 
@@ -1143,7 +1145,7 @@ func TestOwnershipIsProvedBeforeTheAppIsCreated(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath,
 			"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
@@ -1227,7 +1229,7 @@ func TestAnAliasedKeyIsNotTheKeyItNames(t *testing.T) {
 	}
 
 	// An identity with NO client id, which is what makes the removal run.
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1271,7 +1273,7 @@ func TestAnAliasWhoseValueIsTheKeyIsTheKey(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1332,31 +1334,35 @@ func TestAPostAppFailureNeverAsksToBeRerun(t *testing.T) {
 	// AND BOTH STREAMS BREAK ONCE THE APP EXISTS, which is the case that used to
 	// return an error. They are broken from INSIDE the stub, because breaking
 	// them earlier would refuse at the notice instead — correctly, and before an
-	// App exists, which is a different rule and a different test.
-	savedOut, savedErr := os.Stdout, os.Stderr
-
-	t.Cleanup(func() { os.Stdout, os.Stderr = savedOut, savedErr })
+	// App exists, which is a different rule and a different test. The streams
+	// broken are the command's own: the env it was handed.
+	stdout, stderr := &switchWriter{w: io.Discard}, &switchWriter{w: io.Discard}
+	env := processEnv()
+	env.Stdout, env.Stderr = stdout, stderr
 
 	inner := onboard
 	onboard = func(ctx context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		result, err := inner(ctx, opts)
 
-		os.Stdout = brokenPipe(t)
-		os.Stderr = brokenPipe(t)
+		stdout.w, stderr.w = brokenPipe(t), brokenPipe(t)
 
 		return result, err
 	}
 
-	err := githubAppCreate(t.Context(), []string{
+	err := githubAppCreate(t.Context(), env, []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
-
-	os.Stdout, os.Stderr = savedOut, savedErr
-
 	if err != nil {
 		t.Errorf("a run that created an App and could not report it returned an error, which "+
 			"reads as `run me again`: %v", err)
+	}
+
+	// BOTH WERE TRIED, AND BOTH FAILED, so the run above is the one the rule is
+	// about and not one that never reached a broken stream.
+	if stdout.failed == 0 || stderr.failed == 0 {
+		t.Errorf("the run did not meet both broken streams (stdout failed %d writes, stderr %d)",
+			stdout.failed, stderr.failed)
 	}
 }
 
@@ -1397,8 +1403,11 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 	prev := onboard
 	t.Cleanup(func() { onboard = prev })
 
-	savedErr := os.Stderr
-	t.Cleanup(func() { os.Stderr = savedErr })
+	var stdout bytes.Buffer
+
+	stderr := &switchWriter{w: io.Discard}
+	env := processEnv()
+	env.Stdout, env.Stderr = &stdout, stderr
 
 	onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		app := &github.App{ID: stubAppID, ClientID: "Iv1.stub", PEM: string(testKey(t))}
@@ -1413,7 +1422,7 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 			return nil, err
 		}
 
-		os.Stderr = brokenPipe(t)
+		stderr.w = brokenPipe(t)
 
 		return &github.Onboarding{
 			App:          app,
@@ -1421,23 +1430,32 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 		}, nil
 	}
 
-	var err error
-
-	stdout := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
-			"--org", "acme", "--config", cfgPath,
-			"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
-		})
+	err := githubAppCreate(t.Context(), env, []string{
+		"--org", "acme", "--config", cfgPath,
+		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
-
-	os.Stderr = savedErr
-
 	if err != nil {
 		t.Fatalf("the fallback must stay non-fatal: %v", err)
 	}
 
-	if !strings.Contains(stdout, fmt.Sprintf("app_id: %d", stubAppID)) {
+	if !strings.Contains(stdout.String(), fmt.Sprintf("app_id: %d", stubAppID)) {
 		t.Errorf("the App's only record was not written to the stream that still worked:\n%s",
-			stdout)
+			stdout.String())
 	}
+}
+
+// switchWriter is a stream a test can break part-way through a command, counting
+// the writes that failed once it was.
+type switchWriter struct {
+	w      io.Writer
+	failed int
+}
+
+func (s *switchWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if err != nil {
+		s.failed++
+	}
+
+	return n, err
 }

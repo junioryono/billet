@@ -781,7 +781,7 @@ func (f *pullFixture) pull(t *testing.T) error {
 
 // pullWith is the pull with its context supplied, for a caller that must not touch t.
 func (f *pullFixture) pullWith(ctx context.Context) error {
-	return cmdImagesPull(ctx, []string{
+	return cmdImagesPull(ctx, processEnv(), []string{
 		"--config", f.cfgPath,
 		"--from", f.from,
 		"--staging-dir", f.staging,

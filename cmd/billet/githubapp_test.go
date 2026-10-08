@@ -226,7 +226,7 @@ func TestWriteKeyAtomicallyInstallsTheKey(t *testing.T) {
 	key := testKey(t)
 	installed := false
 
-	if err := writeKeyAtomically(reserved, path, key, func() { installed = true }); err != nil {
+	if err := writeKeyAtomically(processEnv(), reserved, path, key, func() { installed = true }); err != nil {
 		t.Fatalf("writeKeyAtomically: %v", err)
 	}
 
@@ -267,7 +267,7 @@ func TestWriteKeyAtomicallyLeavesNoSecondCopy(t *testing.T) {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
 
-	if err := writeKeyAtomically(reserved, path, testKey(t), func() {}); err != nil {
+	if err := writeKeyAtomically(processEnv(), reserved, path, testKey(t), func() {}); err != nil {
 		t.Fatalf("writeKeyAtomically: %v", err)
 	}
 
@@ -311,7 +311,7 @@ func TestWriteKeyAtomicallyRefusesToReplaceTheDestination(t *testing.T) {
 	ours := testKey(t)
 	installed := false
 
-	writeErr := writeKeyAtomically(reserved, path, ours, func() { installed = true })
+	writeErr := writeKeyAtomically(processEnv(), reserved, path, ours, func() { installed = true })
 	if writeErr == nil {
 		t.Fatal("writeKeyAtomically installed over a destination it did not create")
 	}
@@ -715,7 +715,7 @@ func TestWriteGitHubBlockPreservesTheMode(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Org: "acme", AppID: 7, InstallationID: 9, PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
 		t.Fatalf("writeGitHubBlock: %v", err)
@@ -760,7 +760,7 @@ func TestWriteGitHubBlockFillsOrRefusesEverySeedShape(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				if err := writeGitHubBlock(path, want); err != nil {
+				if err := writeGitHubBlock(processEnv(), path, want); err != nil {
 					t.Fatalf("writing an identity into %s: %v", name, err)
 				}
 
@@ -800,7 +800,7 @@ func TestWriteGitHubBlockFillsOrRefusesEverySeedShape(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				err := writeGitHubBlock(path, want)
+				err := writeGitHubBlock(processEnv(), path, want)
 				if err == nil {
 					t.Fatalf("%s was overwritten instead of refused", name)
 				}

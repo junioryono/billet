@@ -3,8 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
+
+	"github.com/junioryono/billet/internal/cli"
 
 	"github.com/junioryono/billet/internal/awspolicy"
 	"github.com/junioryono/billet/internal/config"
@@ -33,7 +34,7 @@ import (
 // per-deployment resources rather than per-deployment conditions. The boundary is
 // just as real; it is enforced by a different mechanism, and it is why the project
 // must be billet's alone.
-func printCodeBuildIAM(cfg *config.Config, buildRole bool, kmsKeyARN, account string) error {
+func printCodeBuildIAM(env cli.Env, cfg *config.Config, buildRole bool, kmsKeyARN, account string) error {
 	if cfg.Node.CodeBuild == nil {
 		return fmt.Errorf("`billet init iam` needs node.codebuild for a codebuild node")
 	}
@@ -99,16 +100,16 @@ func printCodeBuildIAM(cfg *config.Config, buildRole bool, kmsKeyARN, account st
 		return fmt.Errorf("render the policy: %w", err)
 	}
 
-	fmt.Println(string(body))
+	fmt.Fprintln(env.Stdout, string(body))
 
 	// SAID OUT LOUD, because the document alone does not say which of the two roles
 	// it belongs on — and attaching the build role's policy to the node (or the
 	// reverse) produces a deployment that validates and cannot work.
 	if buildRole {
-		fmt.Fprintln(os.Stderr, "\n# Attach this to the CodeBuild project's SERVICE ROLE — the role "+
+		fmt.Fprintln(env.Stderr, "\n# Attach this to the CodeBuild project's SERVICE ROLE — the role "+
 			"a build runs AS.\n# Every permission in it is one the workflow holds.")
 	} else {
-		fmt.Fprintln(os.Stderr, "\n# Attach this to the role the machine running `billet node` "+
+		fmt.Fprintln(env.Stderr, "\n# Attach this to the role the machine running `billet node` "+
 			"assumes.\n# Pass --build-role for the project's service role, which is a "+
 			"different principal.")
 	}
@@ -127,7 +128,7 @@ func printCodeBuildIAM(cfg *config.Config, buildRole bool, kmsKeyARN, account st
 //
 // IT IS RUN AGAINST THE NODE'S CONFIG, because that is where the path lives; the
 // control plane's own file usually carries no node.codebuild block at all.
-func printCodeBuildSweepIAM(cfg *config.Config, buildRole bool, kmsKeyARN, account string) error {
+func printCodeBuildSweepIAM(env cli.Env, cfg *config.Config, buildRole bool, kmsKeyARN, account string) error {
 	if cfg.Node.CodeBuild == nil {
 		return fmt.Errorf("`billet init iam --controller-sweep` needs node.codebuild, because the " +
 			"path it grants over is node.codebuild.jit_parameter_path")
@@ -172,9 +173,9 @@ func printCodeBuildSweepIAM(cfg *config.Config, buildRole bool, kmsKeyARN, accou
 		return fmt.Errorf("render the policy: %w", err)
 	}
 
-	fmt.Println(string(body))
+	fmt.Fprintln(env.Stdout, string(body))
 
-	fmt.Fprintln(os.Stderr, "\n# Attach this to the role the machine running `billet server` "+
+	fmt.Fprintln(env.Stderr, "\n# Attach this to the role the machine running `billet server` "+
 		"assumes — the CONTROL PLANE.\n# Not the node's role and never the build's: it lists and "+
 		"deletes under the path, and nothing else.")
 

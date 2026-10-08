@@ -24,7 +24,7 @@ func TestRolloutRetryIsRoutedAndAsksForTheRightPhase(t *testing.T) {
 	t.Parallel()
 
 	// ROUTED: an unknown subcommand names what does exist, and `retry` is in it.
-	err := cmdRollout(t.Context(), []string{"no-such-subcommand"})
+	err := cmdRollout(t.Context(), processEnv(), []string{"no-such-subcommand"})
 	if err == nil {
 		t.Fatal("an unknown rollout subcommand was accepted")
 	}
@@ -35,7 +35,7 @@ func TestRolloutRetryIsRoutedAndAsksForTheRightPhase(t *testing.T) {
 
 	// AND IT REACHES ITS OWN USAGE rather than the dispatcher's, which is what
 	// says the route resolves to a command rather than falling through.
-	err = cmdRollout(t.Context(), []string{"retry"})
+	err = cmdRollout(t.Context(), processEnv(), []string{"retry"})
 	if err == nil {
 		t.Fatal("`billet rollout retry` with no host was accepted")
 	}

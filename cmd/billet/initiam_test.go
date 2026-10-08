@@ -84,7 +84,7 @@ func TestInitIAMDerivesThePolicyFromTheConfig(t *testing.T) {
 
 	var err error
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{
+		err = cmdInit(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--builder", "--deployment", testDeployID,
 			"--role-arn", "arn:aws:iam::123456789012:role/billet-node",
 		})
@@ -148,7 +148,9 @@ node:
 	}
 
 	var err error
-	out := capture(t, func() { err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID}) })
+	out := capture(t, func() {
+		err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--deployment", testDeployID})
+	})
 	if err != nil {
 		t.Fatalf("init iam: %v", err)
 	}
@@ -186,7 +188,7 @@ node:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdInit(t.Context(), []string{"iam", "--config", path})
+	err := cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path})
 	if err == nil {
 		t.Fatal("init iam produced a policy for a docker node")
 	}
@@ -224,7 +226,7 @@ node:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"iam", "--config", path, "--account-wide", "--kms-key-arn", "arn:aws:kms:us-west-2:1:key/k",
 	})
 	if err == nil {
@@ -301,7 +303,7 @@ func TestSQSQueueARN(t *testing.T) {
 func TestInitIAMRequiresRoleARNForAnInstanceProfile(t *testing.T) {
 	path := ec2NodeConfig(t)
 
-	err := cmdInit(t.Context(), []string{"iam", "--config", path, "--account-wide"})
+	err := cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--account-wide"})
 	if err == nil {
 		t.Fatal("init iam scoped PassRole to an instance-profile name")
 	}
@@ -343,7 +345,7 @@ node:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdInit(t.Context(), []string{"iam", "--config", path, "--account-wide"})
+	err := cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--account-wide"})
 	if err == nil {
 		t.Fatal("init iam scoped KMS to a non-ARN key id")
 	}
@@ -397,7 +399,7 @@ func TestInitIAMDeniesALaunchFromAnUnownedSnapshot(t *testing.T) {
 
 			args := append([]string{"iam", "--config", path,
 				"--role-arn", "arn:aws:iam::123456789012:role/billet-node"}, tc.args...)
-			out := capture(t, func() { err = cmdInit(t.Context(), args) })
+			out := capture(t, func() { err = cmdInit(t.Context(), processEnv(), args) })
 			if err != nil {
 				t.Fatalf("init iam: %v", err)
 			}
@@ -479,7 +481,7 @@ func TestInitIAMScopesToTheDeploymentID(t *testing.T) {
 
 	var err error
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{
+		err = cmdInit(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--deployment", testDeployID,
 			"--role-arn", "arn:aws:iam::123456789012:role/billet-node",
 		})
@@ -524,7 +526,7 @@ node:
 	}
 
 	var err error
-	out := capture(t, func() { err = cmdInit(t.Context(), []string{"iam", "--config", path}) })
+	out := capture(t, func() { err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path}) })
 	if err != nil {
 		t.Fatalf("init iam: %v", err)
 	}
@@ -541,7 +543,7 @@ func TestInitIAMAccountWideUsesPresence(t *testing.T) {
 
 	var err error
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{
+		err = cmdInit(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--account-wide",
 			"--role-arn", "arn:aws:iam::123456789012:role/billet-node",
 		})
@@ -564,7 +566,7 @@ func TestInitIAMAccountWideUsesPresence(t *testing.T) {
 func TestInitIAMRefusesWithoutADeploymentID(t *testing.T) {
 	path := ec2NodeConfig(t) // its state dir is empty (no deployment-id file)
 
-	err := cmdInit(t.Context(), []string{"iam", "--config", path})
+	err := cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path})
 	if err == nil {
 		t.Fatal("init iam generated a policy with no deployment identity and no --account-wide")
 	}
@@ -603,7 +605,7 @@ node:
 
 	// --account-wide beats the on-disk id: presence, not value.
 	var err error
-	out := capture(t, func() { err = cmdInit(t.Context(), []string{"iam", "--config", path, "--account-wide"}) })
+	out := capture(t, func() { err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--account-wide"}) })
 	if err != nil {
 		t.Fatalf("init iam: %v", err)
 	}
@@ -616,7 +618,7 @@ node:
 	}
 
 	// --deployment and --account-wide together are refused.
-	err = cmdInit(t.Context(), []string{"iam", "--config", path, "--account-wide", "--deployment", testDeployID})
+	err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--account-wide", "--deployment", testDeployID})
 	if err == nil {
 		t.Fatal("init iam accepted both --deployment and --account-wide")
 	}
@@ -654,7 +656,9 @@ node:
 	}
 
 	var err error
-	out := capture(t, func() { err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID}) })
+	out := capture(t, func() {
+		err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--deployment", testDeployID})
+	})
 	if err != nil {
 		t.Fatalf("init iam: %v", err)
 	}
@@ -703,7 +707,7 @@ func TestInitIAMBuilderPayloadBucketIsScoped(t *testing.T) {
 	path := plainEC2NodeConfig(t)
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), []string{
+		if err := cmdInit(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--account-wide", "--builder",
 			"--payload-bucket", "billet-ami-payloads",
 		}); err != nil {
@@ -725,7 +729,7 @@ func TestInitIAMBuilderPayloadBucketIsScoped(t *testing.T) {
 func TestInitIAMRefusesAPayloadBucketWithoutTheBuilder(t *testing.T) {
 	path := plainEC2NodeConfig(t)
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"iam", "--config", path, "--account-wide", "--payload-bucket", "billet-ami-payloads",
 	})
 	if err == nil {
@@ -742,7 +746,7 @@ func TestInitIAMBuilderWithoutAPayloadBucketGrantsNoS3(t *testing.T) {
 	path := plainEC2NodeConfig(t)
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), []string{
+		if err := cmdInit(t.Context(), processEnv(), []string{
 			"iam", "--config", path, "--account-wide", "--builder",
 		}); err != nil {
 			t.Fatalf("init iam: %v", err)
@@ -764,7 +768,7 @@ func TestInitIAMBuilderWithoutAPayloadBucketGrantsNoS3(t *testing.T) {
 func TestInitIAMRefusesADottedPayloadBucket(t *testing.T) {
 	path := plainEC2NodeConfig(t)
 
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"iam", "--config", path, "--account-wide", "--builder",
 		"--payload-bucket", "billet.ami.payloads",
 	})
@@ -824,7 +828,7 @@ node:
 
 	var err error
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID})
+		err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--deployment", testDeployID})
 	})
 	if err != nil {
 		t.Fatalf("init iam refused a cn-north-1 config naming its own partition's queue host: %v", err)
@@ -869,7 +873,7 @@ node:
 
 	var err error
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), []string{"iam", "--config", path, "--deployment", testDeployID})
+		err = cmdInit(t.Context(), processEnv(), []string{"iam", "--config", path, "--deployment", testDeployID})
 	})
 	if err == nil {
 		t.Fatalf("init iam rendered a policy for a queue host that does not exist:\n%s", out)

@@ -96,7 +96,7 @@ func TestFleetConvergeRunsTheActionsStepsAsARunnerWould(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := runFleetConverge(t.Context(), src, "source "+src, fleetOptions{
+	err := runFleetConverge(t.Context(), processEnv(), src, "source "+src, fleetOptions{
 		inventory: "fleet/inventory.yml", check: true, sshKeyFile: key, holder: "fleet-test-1",
 	})
 	if err != nil {
@@ -151,7 +151,7 @@ func TestFleetConvergeReleasesTheGuardHoweverItEnds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := runFleetConverge(t.Context(), src, "source "+src, fleetOptions{inventory: "inv.yml", holder: "fleet-test-2"})
+		err := runFleetConverge(t.Context(), processEnv(), src, "source "+src, fleetOptions{inventory: "inv.yml", holder: "fleet-test-2"})
 		if err == nil || !strings.Contains(err.Error(), failing) {
 			t.Errorf("a failing %s returned %v; want an error naming it", failing, err)
 		}
@@ -176,7 +176,7 @@ func TestFleetConvergeRefusesAHolderTheGuardWouldRefuse(t *testing.T) {
 
 	src, log := fakeFleetSource(t)
 
-	err := runFleetConverge(t.Context(), src, "source "+src, fleetOptions{inventory: "inv.yml", holder: "a/b"})
+	err := runFleetConverge(t.Context(), processEnv(), src, "source "+src, fleetOptions{inventory: "inv.yml", holder: "a/b"})
 	if err == nil || !strings.Contains(err.Error(), "slash") {
 		t.Fatalf("holder a/b returned %v; want the guard's refusal", err)
 	}
@@ -191,13 +191,13 @@ func TestFleetConvergeRefusesAHolderTheGuardWouldRefuse(t *testing.T) {
 func TestFleetSourceRefusesAnythingButARelease(t *testing.T) {
 	t.Parallel()
 
-	if _, _, err := fleetSource(t.Context(), fleetOptions{inventory: "inv.yml"}); err == nil ||
+	if _, _, err := fleetSource(t.Context(), processEnv(), fleetOptions{inventory: "inv.yml"}); err == nil ||
 		!strings.Contains(err.Error(), "-ref vX.Y.Z") {
 		t.Errorf("a development build with no -ref returned %v; want a refusal naming -ref", err)
 	}
 
 	for _, ref := range []string{"main", "v1.2", "--upload-pack=x", "v1.2.3-rc1"} {
-		if _, _, err := fleetSource(t.Context(), fleetOptions{inventory: "inv.yml", ref: ref}); err == nil ||
+		if _, _, err := fleetSource(t.Context(), processEnv(), fleetOptions{inventory: "inv.yml", ref: ref}); err == nil ||
 			!strings.Contains(err.Error(), "not a release") {
 			t.Errorf("-ref %q returned %v; want not a release", ref, err)
 		}
@@ -227,7 +227,7 @@ func TestFetchFleetSourceClonesTheTagOnceAndReusesIt(t *testing.T) {
 
 	root := t.TempDir()
 
-	dir, err := fetchFleetSource(t.Context(), root, "v9.9.9")
+	dir, err := fetchFleetSource(t.Context(), processEnv(), root, "v9.9.9")
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestFetchFleetSourceClonesTheTagOnceAndReusesIt(t *testing.T) {
 	// The origin disappears: a second fetch must be the cache's.
 	fleetRepository = filepath.Join(t.TempDir(), "gone")
 
-	again, err := fetchFleetSource(t.Context(), root, "v9.9.9")
+	again, err := fetchFleetSource(t.Context(), processEnv(), root, "v9.9.9")
 	if err != nil || again != dir {
 		t.Fatalf("second fetch = %q, %v; want the cached %q", again, err, dir)
 	}
@@ -248,7 +248,7 @@ func TestFetchFleetSourceClonesTheTagOnceAndReusesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := fetchFleetSource(t.Context(), root, "v9.9.9"); err == nil {
+	if _, err := fetchFleetSource(t.Context(), processEnv(), root, "v9.9.9"); err == nil {
 		t.Error("a checkout without its marker was trusted instead of fetched again")
 	}
 }

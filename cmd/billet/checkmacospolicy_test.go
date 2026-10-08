@@ -81,7 +81,7 @@ tiers:
 	pointGitHubAt(t, exactInstallation)
 
 	out := capture(t, func() {
-		if _, err := runCheck(t.Context(), checkOptions{configPath: cfgPath}); err != nil {
+		if _, err := runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("runCheck: %v", err)
 		}
 	})

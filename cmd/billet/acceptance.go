@@ -139,22 +139,22 @@ type acceptanceWorkspace struct {
 // understood a newer one would tear down what it could see and leave the rest.
 const acceptanceRecordVersion = 1
 
-func cmdAcceptance(ctx context.Context, args []string) error {
+func cmdAcceptance(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("billet acceptance needs a subcommand: up, run, evidence, down or sweep")
 	}
 
 	switch args[0] {
 	case "up":
-		return cmdAcceptanceUp(ctx, args[1:])
+		return cmdAcceptanceUp(ctx, env, args[1:])
 	case "run":
-		return cmdAcceptanceRun(ctx, args[1:])
+		return cmdAcceptanceRun(ctx, env, args[1:])
 	case "evidence":
-		return cmdAcceptanceEvidence(ctx, args[1:])
+		return cmdAcceptanceEvidence(ctx, env, args[1:])
 	case "down":
-		return cmdAcceptanceDown(ctx, args[1:])
+		return cmdAcceptanceDown(ctx, env, args[1:])
 	case "sweep":
-		return cmdAcceptanceSweep(ctx, args[1:])
+		return cmdAcceptanceSweep(ctx, env, args[1:])
 	default:
 		return fmt.Errorf("billet acceptance %s: unknown subcommand; it is up, run, evidence, "+
 			"down or sweep", args[0])
@@ -162,8 +162,8 @@ func cmdAcceptance(ctx context.Context, args []string) error {
 }
 
 // cmdAcceptanceUp derives the isolated deployment and writes the workspace.
-func cmdAcceptanceUp(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet acceptance up", os.Stdout)
+func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance up", env.Stdout)
 	base := fs.String("config", defaultConfigPath(),
 		"the config to derive an isolated acceptance deployment FROM; it is read, never written")
 	workspace := fs.String("workspace", "",
@@ -194,7 +194,7 @@ func cmdAcceptanceUp(ctx context.Context, args []string) error {
 		return err
 	}
 
-	printAcceptanceUp(ws)
+	printAcceptanceUp(env, ws)
 
 	return nil
 }
@@ -618,20 +618,20 @@ func documentRoot(doc *yaml.Node) *yaml.Node {
 	return doc
 }
 
-func printAcceptanceUp(ws acceptanceWorkspace) {
-	fmt.Printf("Derived an isolated acceptance deployment.\n\n")
-	fmt.Printf("  config       %s\n", ws.ConfigPath)
-	fmt.Printf("  deployment   %s\n", ws.DeploymentID)
-	fmt.Printf("  listen       %s\n", ws.Listen)
-	fmt.Printf("  tiers        %s\n", strings.Join(ws.Tiers, ", "))
+func printAcceptanceUp(env cli.Env, ws acceptanceWorkspace) {
+	fmt.Fprintf(env.Stdout, "Derived an isolated acceptance deployment.\n\n")
+	fmt.Fprintf(env.Stdout, "  config       %s\n", ws.ConfigPath)
+	fmt.Fprintf(env.Stdout, "  deployment   %s\n", ws.DeploymentID)
+	fmt.Fprintf(env.Stdout, "  listen       %s\n", ws.Listen)
+	fmt.Fprintf(env.Stdout, "  tiers        %s\n", strings.Join(ws.Tiers, ", "))
 
 	if ws.Account != "" {
-		fmt.Printf("  account      %s (%s)\n", ws.Account, ws.CallerARN)
+		fmt.Fprintf(env.Stdout, "  account      %s (%s)\n", ws.Account, ws.CallerARN)
 	}
 
-	fmt.Printf("\nEverything this run creates carries deployment %s, which nothing else does —\n",
+	fmt.Fprintf(env.Stdout, "\nEverything this run creates carries deployment %s, which nothing else does —\n",
 		ws.DeploymentID)
-	fmt.Printf("so `billet acceptance down --workspace %s` destroys exactly what it made.\n",
+	fmt.Fprintf(env.Stdout, "so `billet acceptance down --workspace %s` destroys exactly what it made.\n",
 		filepath.Dir(ws.ConfigPath))
 }
 

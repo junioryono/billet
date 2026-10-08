@@ -139,8 +139,8 @@ type acceptanceExclusion struct {
 
 const acceptanceEvidenceVersion = 1
 
-func cmdAcceptanceEvidence(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet acceptance evidence", os.Stdout)
+func cmdAcceptanceEvidence(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance evidence", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	out := fs.String("out", "", "where to write it (default: <workspace>/"+acceptanceEvidence+")")
 
@@ -158,10 +158,10 @@ func cmdAcceptanceEvidence(ctx context.Context, args []string) error {
 		path = filepath.Join(filepath.Dir(ws.ConfigPath), acceptanceEvidence)
 	}
 
-	return writeAcceptanceEvidence(ctx, ws, path)
+	return writeAcceptanceEvidence(ctx, env, ws, path)
 }
 
-func writeAcceptanceEvidence(ctx context.Context, ws acceptanceWorkspace, path string) error {
+func writeAcceptanceEvidence(ctx context.Context, env cli.Env, ws acceptanceWorkspace, path string) error {
 	doc, err := collectAcceptanceEvidence(ctx, ws)
 	if err != nil {
 		return err
@@ -176,7 +176,7 @@ func writeAcceptanceEvidence(ctx context.Context, ws acceptanceWorkspace, path s
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 
-	fmt.Printf("evidence written to %s (%d job(s), %d outstanding)\n",
+	fmt.Fprintf(env.Stdout, "evidence written to %s (%d job(s), %d outstanding)\n",
 		path, len(doc.Jobs), len(doc.Outstanding))
 
 	return nil

@@ -45,8 +45,8 @@ const (
 	acceptanceDrainWait = 20 * time.Minute
 )
 
-func cmdAcceptanceDown(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet acceptance down", os.Stdout)
+func cmdAcceptanceDown(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance down", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	wait := fs.Duration("wait", acceptanceDrainWait,
 		"how long to let a running job finish before reporting that one is still there")
@@ -67,7 +67,7 @@ func cmdAcceptanceDown(ctx context.Context, args []string) error {
 	// proof while its control plane is still up; an operator running `down` on its
 	// own has a stopped one, and the barrier cannot be answered by a control plane
 	// that is not there.
-	if err := tearDownAcceptanceWithin(ctx, ws, *wait, false); err != nil {
+	if err := tearDownAcceptanceWithin(ctx, env, ws, *wait, false); err != nil {
 		return err
 	}
 
@@ -75,26 +75,26 @@ func cmdAcceptanceDown(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	return removeAcceptanceWorkspace(ws)
+	return removeAcceptanceWorkspace(env, ws)
 }
 
 // tearDownAcceptance is `run`'s teardown, told whether the compute barrier
 // already proved the fleet clear while the services were up.
-func tearDownAcceptance(ctx context.Context, ws acceptanceWorkspace, computeProved bool) error {
-	return tearDownAcceptanceWithin(ctx, ws, acceptanceDrainWait, computeProved)
+func tearDownAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, computeProved bool) error {
+	return tearDownAcceptanceWithin(ctx, env, ws, acceptanceDrainWait, computeProved)
 }
 
 func tearDownAcceptanceWithin(
-	ctx context.Context, ws acceptanceWorkspace, wait time.Duration, computeProved bool,
+	ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration, computeProved bool,
 ) error {
-	fmt.Printf("\nTearing down deployment %s.\n", ws.DeploymentID)
+	fmt.Fprintf(env.Stdout, "\nTearing down deployment %s.\n", ws.DeploymentID)
 
 	var problems []error
 
 	// 1. SEAL AND WAIT. Every later step assumes nothing new is starting, and a
 	// seal is what makes that true — but only for ADMISSION, so the wait is what
 	// covers the work already in flight.
-	if err := drainAcceptance(ctx, ws, wait); err != nil {
+	if err := drainAcceptance(ctx, env, ws, wait); err != nil {
 		problems = append(problems, err)
 	}
 
@@ -105,7 +105,7 @@ func tearDownAcceptanceWithin(
 	//
 	// SCOPED BY THE DERIVED CONFIG, whose tier labels carry this run's prefix — so
 	// `--all` is every scale set THIS RUN owns and none that anything else does.
-	if err := runBilletSubcommand(ctx, cmdTeardown, "teardown",
+	if err := runBilletSubcommand(ctx, env, cmdTeardown, "teardown",
 		"--config", ws.ConfigPath, "--all", "--yes"); err != nil {
 		problems = append(problems, err)
 	}
@@ -118,7 +118,7 @@ func tearDownAcceptanceWithin(
 	// a config with no ec2 node, correctly, because there is nothing for it to
 	// remove — and an acceptance run against a docker or firecracker deployment is
 	// an ordinary thing to do.
-	if err := decommissionAcceptance(ctx, ws); err != nil {
+	if err := decommissionAcceptance(ctx, env, ws); err != nil {
 		problems = append(problems, err)
 	}
 
@@ -126,7 +126,7 @@ func tearDownAcceptanceWithin(
 	// is nothing left". Everything above can succeed while something survives —
 	// a destroy that raced a launch, an instance whose lease had already gone —
 	// so the teardown ends by ASKING rather than by assuming.
-	if err := sweepAcceptance(ctx, ws, computeProved); err != nil {
+	if err := sweepAcceptance(ctx, env, ws, computeProved); err != nil {
 		problems = append(problems, err)
 	}
 
@@ -135,14 +135,14 @@ func tearDownAcceptanceWithin(
 			errors.Join(problems...))
 	}
 
-	fmt.Printf("Torn down: nothing carrying %s remains.\n", ws.DeploymentID)
+	fmt.Fprintf(env.Stdout, "Torn down: nothing carrying %s remains.\n", ws.DeploymentID)
 
 	return nil
 }
 
 // drainAcceptance seals and waits, through the same code `billet drain --wait`
 // runs.
-func drainAcceptance(ctx context.Context, ws acceptanceWorkspace, wait time.Duration) error {
+func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration) error {
 	db, cfg, err := openLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("open this run's ledger: %w", err)
@@ -155,7 +155,7 @@ func drainAcceptance(ctx context.Context, ws acceptanceWorkspace, wait time.Dura
 		return fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, db, current, "billet acceptance down")
+	sealed, err := takeTheSeal(ctx, env, db, current, "billet acceptance down")
 	if err != nil {
 		return fmt.Errorf("seal this run: %w", err)
 	}
@@ -166,7 +166,7 @@ func drainAcceptance(ctx context.Context, ws acceptanceWorkspace, wait time.Dura
 	// clean run. The LEDGER barrier still holds, and the sweep below is what
 	// covers the class the ledger cannot see. `evidence` records whatever the
 	// barrier did manage to establish while the plane was up.
-	return waitForQuiet(ctx, db, cfg, sealed.Generation, waitOptions{
+	return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
 		timeout:      wait,
 		withoutProof: true,
 	})
@@ -174,8 +174,8 @@ func drainAcceptance(ctx context.Context, ws acceptanceWorkspace, wait time.Dura
 
 // decommissionAcceptance removes the cloud resources this run created, and
 // tolerates a config that has none.
-func decommissionAcceptance(ctx context.Context, ws acceptanceWorkspace) error {
-	err := runBilletSubcommand(ctx, cmdDecommission, "decommission",
+func decommissionAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
+	err := runBilletSubcommand(ctx, env, cmdDecommission, "decommission",
 		"--config", ws.ConfigPath, "--yes")
 	if err == nil {
 		return nil
@@ -187,7 +187,7 @@ func decommissionAcceptance(ctx context.Context, ws acceptanceWorkspace) error {
 	// naming as the weakness it is: a reworded refusal would turn this into a
 	// teardown that reports a problem it does not have. It is the safe direction.
 	if isNoCloudBackend(err) {
-		fmt.Printf("decommission: this config has no cloud backend, so there is nothing " +
+		fmt.Fprintf(env.Stdout, "decommission: this config has no cloud backend, so there is nothing "+
 			"outside Terraform for it to remove\n")
 
 		return nil
@@ -240,8 +240,8 @@ var errAcceptanceUnswept = errors.New("the provider was not swept")
 // here" — which makes a reworded diagnostic silently turn a red job green, and
 // puts the one decision that has to be right in a place no test can reach. The
 // answer is decided here, in Go, and the workflow reads an exit status.
-func cmdAcceptanceSweep(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet acceptance sweep", os.Stdout)
+func cmdAcceptanceSweep(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance sweep", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -257,7 +257,7 @@ func cmdAcceptanceSweep(ctx context.Context, args []string) error {
 	// while the control plane is still up and hands that fact to the teardown;
 	// invoked on its own, this has only the provider inventory — which for a
 	// backend `decommission` does not know is nothing at all, and says so.
-	return sweepAcceptance(ctx, ws, false)
+	return sweepAcceptance(ctx, env, ws, false)
 }
 
 // sweepAcceptance is the final ASK: does anything still carry this deployment.
@@ -267,12 +267,12 @@ func cmdAcceptanceSweep(ctx context.Context, args []string) error {
 // already gone, which is the class the ledger has never been able to see. So this
 // asks the provider, through the same inventory `decommission` uses, and FAILS if
 // it finds anything.
-func sweepAcceptance(ctx context.Context, ws acceptanceWorkspace, computeProved bool) error {
+func sweepAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, computeProved bool) error {
 	// THROUGH `decommission` WITHOUT --yes, which reports what it FINDS and
 	// deletes nothing. Running the report as the last step means the answer comes
 	// from the same code that would have removed it, rather than from a second
 	// implementation that could disagree about what belongs to this deployment.
-	err := runBilletSubcommand(ctx, cmdDecommission, "decommission", "--config", ws.ConfigPath)
+	err := runBilletSubcommand(ctx, env, cmdDecommission, "decommission", "--config", ws.ConfigPath)
 
 	switch {
 	case isNoCloudBackend(err) && computeProved:
@@ -282,7 +282,7 @@ func sweepAcceptance(ctx context.Context, ws acceptanceWorkspace, computeProved 
 		// that can see compute whose lease has already gone. A run that got a
 		// clearance while its control plane was up has been swept by something
 		// better than this.
-		fmt.Printf("sweep: the compute barrier proved every host clear while this run's "+
+		fmt.Fprintf(env.Stdout, "sweep: the compute barrier proved every host clear while this run's "+
 			"control plane was up; nothing carrying %s remains\n", ws.DeploymentID)
 
 		return nil
@@ -309,7 +309,7 @@ func sweepAcceptance(ctx context.Context, ws acceptanceWorkspace, computeProved 
 			errAcceptanceUnswept, ws.DeploymentID)
 
 	case err == nil:
-		fmt.Printf("sweep: nothing carrying %s remains\n", ws.DeploymentID)
+		fmt.Fprintf(env.Stdout, "sweep: nothing carrying %s remains\n", ws.DeploymentID)
 
 		return nil
 
@@ -347,11 +347,11 @@ func isLiveCompute(err error) bool {
 // scoping those commands already implement. Shelling out would add an argv
 // quoting surface and a second way for the teardown to lose an error.
 func runBilletSubcommand(
-	ctx context.Context, fn func(context.Context, []string) error, name string, args ...string,
+	ctx context.Context, env cli.Env, fn func(context.Context, cli.Env, []string) error, name string, args ...string,
 ) error {
-	fmt.Printf("\n$ billet %s %v\n", name, args)
+	fmt.Fprintf(env.Stdout, "\n$ billet %s %v\n", name, args)
 
-	if err := fn(ctx, args); err != nil {
+	if err := fn(ctx, env, args); err != nil {
 		return fmt.Errorf("billet %s: %w", name, err)
 	}
 
@@ -365,7 +365,7 @@ func runBilletSubcommand(
 // identity every destroy is scoped by, so removing it first would leave any
 // surviving compute owned by an identity nothing on the machine can name — which
 // is the one state this whole command exists to avoid.
-func removeAcceptanceWorkspace(ws acceptanceWorkspace) error {
+func removeAcceptanceWorkspace(env cli.Env, ws acceptanceWorkspace) error {
 	dir := filepath.Dir(ws.ConfigPath)
 
 	// PROVED TO BE A WORKSPACE BEFORE IT IS REMOVED. `down` takes a path from an
@@ -385,7 +385,7 @@ func removeAcceptanceWorkspace(ws acceptanceWorkspace) error {
 	// record is where that distinction is kept, because by now the directory
 	// itself cannot say.
 	if !current.Created {
-		fmt.Printf("workspace %s was not created by billet, so it is left in place\n", dir)
+		fmt.Fprintf(env.Stdout, "workspace %s was not created by billet, so it is left in place\n", dir)
 
 		return nil
 	}
@@ -394,7 +394,7 @@ func removeAcceptanceWorkspace(ws acceptanceWorkspace) error {
 		return fmt.Errorf("remove the workspace: %w", err)
 	}
 
-	fmt.Printf("workspace %s removed\n", dir)
+	fmt.Fprintf(env.Stdout, "workspace %s removed\n", dir)
 
 	return nil
 }

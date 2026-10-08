@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -48,14 +50,14 @@ type launchdHost struct {
 	tartImages func(ctx context.Context) error
 }
 
-func newLaunchdHost(cfg *config.Config, cfgPath, staged string,
+func newLaunchdHost(env cli.Env, cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) *launchdHost {
 	return &launchdHost{
-		ledgerHost: newLedgerHost(cfg, cfgPath, journal),
+		ledgerHost: newLedgerHost(env, cfg, cfgPath, journal),
 		staged:     staged,
 		agents:     launchd.New(),
-		tartImages: func(ctx context.Context) error { return pullTartImages(ctx, cfg, "") },
+		tartImages: func(ctx context.Context) error { return pullTartImages(ctx, env, cfg, "") },
 	}
 }
 
@@ -91,7 +93,7 @@ func (h *launchdHost) stop(ctx context.Context, label string) error {
 		return fmt.Errorf("stopping %s: it %s, which is not proved stopped", label, result.How)
 	}
 
-	fmt.Printf("  stopped %s (%s)\n", label, result.How)
+	fmt.Fprintf(h.env.Stdout, "  stopped %s (%s)\n", label, result.How)
 
 	return nil
 }
@@ -184,7 +186,7 @@ func (h *launchdHost) StartServices(ctx context.Context) error {
 			return fmt.Errorf("starting %s: %w", label, err)
 		}
 
-		fmt.Printf("  started %s (%s)\n", label, proof)
+		fmt.Fprintf(h.env.Stdout, "  started %s (%s)\n", label, proof)
 	}
 
 	return nil

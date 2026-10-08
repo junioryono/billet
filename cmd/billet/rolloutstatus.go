@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"unicode"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
@@ -209,7 +211,7 @@ func buildRolloutStatusReport(ctx context.Context, store *rollout.Store, identit
 	return report, nil
 }
 
-func printRolloutStatusJSON(report *rolloutStatusReport) error {
+func printRolloutStatusJSON(env cli.Env, report *rolloutStatusReport) error {
 	body, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		return fmt.Errorf("render the report: %w", err)
@@ -217,7 +219,7 @@ func printRolloutStatusJSON(report *rolloutStatusReport) error {
 
 	// A REPORT THAT DID NOT ARRIVE IS A FAILURE: a machine reading a redirected
 	// file must not find a cut JSON behind a zero exit.
-	var out io.Writer = os.Stdout
+	out := env.Stdout
 	if statusOut != nil {
 		out = statusOut
 	}
@@ -338,7 +340,7 @@ func pathOwner(path string) (uint32, uint32, error) {
 // root would. A PostgreSQL ledger has no sidecar, so there the rule is root's
 // alone. A directory that does not exist is left for the open to refuse with
 // its own diagnostic.
-func runAsLedgerOwner(ctx context.Context, cfg *config.Config, args []string) (bool, error) {
+func runAsLedgerOwner(ctx context.Context, env cli.Env, cfg *config.Config, args []string) (bool, error) {
 	if cfg.Server == nil {
 		return false, nil
 	}
@@ -364,7 +366,7 @@ func runAsLedgerOwner(ctx context.Context, cfg *config.Config, args []string) (b
 			"which runs it as the owner", cfg.Server.IdentityDir, uid, euid)
 	}
 
-	code, err := statusReexec(ctx, uid, gid, args)
+	code, err := statusReexec(ctx, env, uid, gid, args)
 	if err != nil {
 		return true, err
 	}
@@ -397,14 +399,14 @@ var errStatusChildFailed = errors.New("billet rollout status failed as the ledge
 // reexecAs runs this executable again with the same arguments as uid:gid, its
 // output and errors passed through, and returns the child's exit status. The
 // child is not root, so it runs the report in place rather than here again.
-func reexecAs(ctx context.Context, uid, gid uint32, args []string) (int, error) {
+func reexecAs(ctx context.Context, env cli.Env, uid, gid uint32, args []string) (int, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return 0, fmt.Errorf("find this billet to run the report as the ledger's owner: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, self, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = env.Stdin, env.Stdout, env.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{gid}},
 	}

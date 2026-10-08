@@ -59,7 +59,7 @@ func macHost(t *testing.T, cfg *config.Config) (*launchdHost, *fakeAgents) {
 	agents := &fakeAgents{agentsDir: t.TempDir()}
 
 	h := &launchdHost{
-		ledgerHost: newLedgerHost(cfg, "/usr/local/etc/billet/billet.yaml", nil),
+		ledgerHost: newLedgerHost(processEnv(), cfg, "/usr/local/etc/billet/billet.yaml", nil),
 		staged:     filepath.Join(t.TempDir(), "billet"),
 		agents:     agents,
 		tartImages: func(context.Context) error { return errors.New("tart was reached") },
@@ -193,7 +193,7 @@ func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
 
 	hostOS = "darwin"
 
-	if h, err := newHostFor(cfg, "", "/staged", journal); err != nil {
+	if h, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err != nil {
 		t.Fatalf("darwin: %v", err)
 	} else if _, ok := h.(*launchdHost); !ok {
 		t.Fatalf("darwin built %T, want the launchd host", h)
@@ -201,7 +201,7 @@ func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
 
 	hostOS = "linux"
 
-	if h, err := newHostFor(cfg, "", "/staged", journal); err != nil {
+	if h, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err != nil {
 		t.Fatalf("linux: %v", err)
 	} else if _, ok := h.(*systemdHost); !ok {
 		t.Fatalf("linux built %T, want the systemd host", h)
@@ -209,7 +209,7 @@ func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
 
 	hostOS = "freebsd"
 
-	if _, err := newHostFor(cfg, "", "/staged", journal); err == nil {
+	if _, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err == nil {
 		t.Fatal("a platform with no host implementation was accepted")
 	}
 }

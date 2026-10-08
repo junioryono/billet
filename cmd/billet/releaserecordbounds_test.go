@@ -31,7 +31,7 @@ func TestReleaseRecordRefusesABinaryTooLargeToBeAMember(t *testing.T) {
 
 	t.Cleanup(func() { maxMemberBytes = original })
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("a binary larger than any member could be was recorded")
 	}
@@ -67,7 +67,7 @@ func TestReleaseRecordRefusesAnythingAfterTheGzipStream(t *testing.T) {
 	appendTo(t, f.archive, strings.Repeat("bytes past the end of the gzip stream. ", 4096))
 	describeArchive(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive with bytes after its gzip stream was accepted, so a second " +
 			"member named billet can hide behind the first stream")
@@ -97,7 +97,7 @@ func TestReleaseRecordRefusesASecondConcatenatedArchive(t *testing.T) {
 	appendTo(t, f.archive, string(body))
 	describeArchive(t, f)
 
-	err = cmdReleaseRecord(t.Context(), f.args())
+	err = cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("two concatenated archives were accepted as one, so which billet a host " +
 			"installs depends on how it unpacks the file")
@@ -185,7 +185,7 @@ func TestReleaseRecordRefusesAnArchiveThatDecompressesPastTheBound(t *testing.T)
 
 	t.Cleanup(func() { maxArchiveBytes = original })
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive past the decompression bound was accepted, so an oversized " +
 			"one is read as however much of it happened to fit")
@@ -219,7 +219,7 @@ func TestReleaseRecordRefusesContentBehindTheEndOfArchiveMarker(t *testing.T) {
 		"a second tar entry hiding behind the end-of-archive marker")
 	describeArchive(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive with content behind its end-of-archive marker was accepted, " +
 			"so a member the walk cannot see can travel inside a release billet attests to")
@@ -298,7 +298,7 @@ func TestReleaseRecordAcceptsExactlyTheEntryLimit(t *testing.T) {
 	})
 	describeArchive(t, f)
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err != nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err != nil {
 		t.Fatalf("an archive with exactly the entry limit was refused: %v", err)
 	}
 }
@@ -320,7 +320,7 @@ func TestReleaseRecordRefusesOnePastTheEntryLimit(t *testing.T) {
 	})
 	describeArchive(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive past the entry limit was accepted")
 	}
@@ -463,7 +463,7 @@ func TestReleaseRecordAcceptsAnArchiveExactlyAtTheBound(t *testing.T) {
 
 	t.Cleanup(func() { maxArchiveBytes = original })
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err != nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err != nil {
 		t.Fatalf("an archive decompressing to exactly the bound (%d bytes) was refused: %v",
 			exact, err)
 	}
@@ -480,7 +480,7 @@ func TestReleaseRecordRefusesAnArchiveOneByteOverTheBound(t *testing.T) {
 
 	t.Cleanup(func() { maxArchiveBytes = original })
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err == nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err == nil {
 		t.Fatalf("an archive decompressing to %d bytes was accepted under a bound of %d",
 			exact, exact-1)
 	}
@@ -583,7 +583,7 @@ func TestReleaseRecordRefusesAStreamWhoseChecksumDoesNotMatch(t *testing.T) {
 
 	describeArchive(t, f)
 
-	err = cmdReleaseRecord(t.Context(), f.args())
+	err = cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive whose gzip checksum does not match its contents was recorded, " +
 			"so nothing reads the stream to its end and the checksum is never verified")

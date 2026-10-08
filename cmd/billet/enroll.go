@@ -27,7 +27,7 @@ import (
 const enrollPollEvery = 5 * time.Second
 
 // cmdNodes is the operator's side of enrollment.
-func cmdNodes(ctx context.Context, args []string) error {
+func cmdNodes(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet nodes pending | billet nodes approve <node> --fingerprint <fp> | " +
 			"billet nodes deny <node> --fingerprint <fp> | billet nodes revoke <node> | " +
@@ -36,15 +36,15 @@ func cmdNodes(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "pending":
-		return cmdNodesPending(ctx, args[1:])
+		return cmdNodesPending(ctx, env, args[1:])
 	case "approve":
-		return cmdNodesDecide(ctx, args[1:], alloc.EnrollApproved)
+		return cmdNodesDecide(ctx, env, args[1:], alloc.EnrollApproved)
 	case "deny":
-		return cmdNodesDecide(ctx, args[1:], alloc.EnrollDenied)
+		return cmdNodesDecide(ctx, env, args[1:], alloc.EnrollDenied)
 	case "revoke":
-		return cmdNodesRevoke(ctx, args[1:])
+		return cmdNodesRevoke(ctx, env, args[1:])
 	case "decommission":
-		return cmdNodesDecommission(ctx, args[1:])
+		return cmdNodesDecommission(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf(
@@ -64,8 +64,8 @@ func cmdNodes(ctx context.Context, args []string) error {
 // UNPROVEN — permanently, and visibly in every later drain and in
 // `billet status`. That is the difference between billet knowing a machine is
 // idle and an operator asserting it.
-func cmdNodesDecommission(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet nodes decommission", os.Stdout)
+func cmdNodesDecommission(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet nodes decommission", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false,
 		"exclude the host even though nothing has proved it is running no compute; "+
@@ -93,25 +93,25 @@ func cmdNodesDecommission(ctx context.Context, args []string) error {
 	// in between — the host re-registers, and the exclusion is recorded as proved
 	// about a machine that has just come back.
 	proven, err := a.Decommission(ctx, alloc.DecommissionRequest{
-		Node: name, Actor: actor(), Force: *force,
+		Node: name, Actor: actor(env), Force: *force,
 	})
 	if err != nil {
 		return err
 	}
 
 	if proven {
-		fmt.Printf("%s is no longer part of this deployment's fleet.\n\n", name)
-		fmt.Printf("It was proved to be running no compute before this, so a later drain can\n")
-		fmt.Printf("report the fleet clear without it.\n")
+		fmt.Fprintf(env.Stdout, "%s is no longer part of this deployment's fleet.\n\n", name)
+		fmt.Fprintf(env.Stdout, "It was proved to be running no compute before this, so a later drain can\n")
+		fmt.Fprintf(env.Stdout, "report the fleet clear without it.\n")
 	} else {
-		fmt.Printf("%s is no longer part of this deployment's fleet, and the exclusion is\n", name)
-		fmt.Printf("recorded as UNPROVEN.\n\n")
-		fmt.Printf("Nothing established that it is running no compute, so every later drain\n")
-		fmt.Printf("will name it as excluded without proof rather than reporting the fleet\n")
-		fmt.Printf("clear. That is deliberate: billet does not know what is on that machine.\n")
+		fmt.Fprintf(env.Stdout, "%s is no longer part of this deployment's fleet, and the exclusion is\n", name)
+		fmt.Fprintf(env.Stdout, "recorded as UNPROVEN.\n\n")
+		fmt.Fprintf(env.Stdout, "Nothing established that it is running no compute, so every later drain\n")
+		fmt.Fprintf(env.Stdout, "will name it as excluded without proof rather than reporting the fleet\n")
+		fmt.Fprintf(env.Stdout, "clear. That is deliberate: billet does not know what is on that machine.\n")
 	}
 
-	fmt.Printf("\nIf it registers again it rejoins the fleet and this is cleared.\n")
+	fmt.Fprintf(env.Stdout, "\nIf it registers again it rejoins the fleet and this is cleared.\n")
 
 	return nil
 }
@@ -128,8 +128,8 @@ func cmdNodesDecommission(ctx context.Context, args []string) error {
 // A REPLACEMENT UNDER THE SAME NAME IS UNAFFECTED, which is why this is not the
 // same as banning a name. It revokes the serials outstanding at this moment; a
 // certificate issued afterwards is not one of them.
-func cmdNodesRevoke(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet nodes revoke", os.Stdout)
+func cmdNodesRevoke(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet nodes revoke", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
@@ -153,7 +153,7 @@ func cmdNodesRevoke(ctx context.Context, args []string) error {
 	// admitted before billet recorded serials. Without this an upgraded
 	// deployment answers "holds no certificate" for a machine that is holding a
 	// working one.
-	if err := backfillIssuedCerts(ctx, a); err != nil {
+	if err := backfillIssuedCerts(ctx, env, a); err != nil {
 		return err
 	}
 
@@ -163,27 +163,27 @@ func cmdNodesRevoke(ctx context.Context, args []string) error {
 	}
 
 	if len(revoked) == 0 {
-		fmt.Printf("%s holds no certificate this deployment issued, so there is nothing to "+
+		fmt.Fprintf(env.Stdout, "%s holds no certificate this deployment issued, so there is nothing to "+
 			"take back.\n", name)
 
 		return nil
 	}
 
-	fmt.Printf("Revoked %d certificate(s) held by %s:\n\n", len(revoked), name)
+	fmt.Fprintf(env.Stdout, "Revoked %d certificate(s) held by %s:\n\n", len(revoked), name)
 
 	for i := range revoked {
-		fmt.Printf("  %s  %s  expires %s\n", revoked[i].Serial, revoked[i].Source, revoked[i].NotAfter)
+		fmt.Fprintf(env.Stdout, "  %s  %s  expires %s\n", revoked[i].Serial, revoked[i].Source, revoked[i].NotAfter)
 	}
 
-	fmt.Printf("\nEach is refused on the next request it makes. Issue a replacement with\n")
-	fmt.Printf("`billet ca issue %s` if the machine is coming back.\n", name)
+	fmt.Fprintf(env.Stdout, "\nEach is refused on the next request it makes. Issue a replacement with\n")
+	fmt.Fprintf(env.Stdout, "`billet ca issue %s` if the machine is coming back.\n", name)
 
 	return nil
 }
 
 // cmdNodesPending lists machines waiting to be let in.
-func cmdNodesPending(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet nodes pending", os.Stdout)
+func cmdNodesPending(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet nodes pending", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	all := fs.Bool("all", false, "include decided requests")
 
@@ -209,12 +209,12 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 	}
 
 	if len(pending) == 0 {
-		fmt.Println("No nodes are waiting to be approved.")
+		fmt.Fprintln(env.Stdout, "No nodes are waiting to be approved.")
 
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tASKED")
 
 	for i := range pending {
@@ -226,8 +226,8 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nCompare a fingerprint against what the node printed on its own console, then:\n")
-	fmt.Printf("  billet nodes approve <node> --fingerprint <the value you compared>\n")
+	fmt.Fprintf(env.Stdout, "\nCompare a fingerprint against what the node printed on its own console, then:\n")
+	fmt.Fprintf(env.Stdout, "  billet nodes approve <node> --fingerprint <the value you compared>\n")
 
 	return nil
 }
@@ -237,14 +237,14 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 // THE FINGERPRINT IS REQUIRED, and that is the whole security of this command.
 // Approving by name alone approves whatever currently holds the name; approving
 // by fingerprint approves the machine whose key an operator actually compared.
-func cmdNodesDecide(ctx context.Context, args []string, decision string) (err error) {
+func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision string) (err error) {
 	// The command's own word, not the decision recorded: approve records approved.
 	command := "billet nodes approve"
 	if decision == alloc.EnrollDenied {
 		command = "billet nodes deny"
 	}
 
-	fs := cli.NewFlagSet(command, os.Stdout)
+	fs := cli.NewFlagSet(command, env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	fingerprint := fs.String("fingerprint", "",
 		"the fingerprint you compared against the node's console (required)")
@@ -340,17 +340,17 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) (err er
 		return err
 	}
 
-	fmt.Printf("%s %s\n", map[string]string{
+	fmt.Fprintf(env.Stdout, "%s %s\n", map[string]string{
 		alloc.EnrollApproved: "Approved", alloc.EnrollDenied: "Denied",
 	}[decision], name)
 
 	if decision == alloc.EnrollDenied {
-		fmt.Printf("\nThe name is free again: another key may now ask for it. That is the way " +
+		fmt.Fprintf(env.Stdout, "\nThe name is free again: another key may now ask for it. That is the way "+
 			"back\nfor a machine that lost its key while waiting to be approved.\n")
 	}
 
 	if decision == alloc.EnrollApproved {
-		fmt.Printf("\nIt picks up its certificate on its next attempt, within a few seconds.\n")
+		fmt.Fprintf(env.Stdout, "\nIt picks up its certificate on its next attempt, within a few seconds.\n")
 	}
 
 	return nil
@@ -369,7 +369,7 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) (err er
 // and `billet ca issue` — stored the certificate they handed over, so the serial
 // can be read back out of it. Idempotent, so running it on every revocation
 // costs one query on a deployment that is already complete.
-func backfillIssuedCerts(ctx context.Context, a *alloc.Allocator) error {
+func backfillIssuedCerts(ctx context.Context, env cli.Env, a *alloc.Allocator) error {
 	admitted, err := a.Enrollments(ctx, alloc.EnrollApproved)
 	if err != nil {
 		return err
@@ -386,7 +386,7 @@ func backfillIssuedCerts(ctx context.Context, a *alloc.Allocator) error {
 			// A stored certificate billet cannot read is worth saying out loud —
 			// that node's credential is outside revocation — but it must not stop
 			// the ones that can be read from being recorded.
-			fmt.Fprintf(os.Stderr, "the certificate recorded for node %q cannot be parsed, so "+
+			fmt.Fprintf(env.Stderr, "the certificate recorded for node %q cannot be parsed, so "+
 				"it cannot be revoked by serial: %v\n", rec.Name, err)
 
 			continue
@@ -512,7 +512,7 @@ func bootstrapBase(cfg *config.Config, flag string) string {
 // ends displaying the same number, over a channel an attacker on the network
 // does not control. That comparison is the trust decision; everything else here
 // is transport.
-func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, joinToken string) error {
+func enrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken string) error {
 	if cfg.Node.TLS == nil {
 		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
 	}
@@ -536,7 +536,7 @@ func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, jo
 	// machine came back with a NEW key and was refused: the name was claimed by a
 	// fingerprint nothing could present any more. Reusing the staged key makes a
 	// retry the same request rather than a second one.
-	csrPEM, keyPEM, err := pendingIdentity(cfg.Node.TLS, name)
+	csrPEM, keyPEM, err := pendingIdentity(env, cfg.Node.TLS, name)
 	if err != nil {
 		return err
 	}
@@ -546,10 +546,10 @@ func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, jo
 		return err
 	}
 
-	fmt.Printf("Asking to join deployment %s as %q.\n\n", deployment, name)
-	fmt.Printf("  this node's fingerprint  %s\n\n", fingerprint)
-	fmt.Printf("On the control plane, check it matches and approve:\n\n")
-	fmt.Printf("  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
+	fmt.Fprintf(env.Stdout, "Asking to join deployment %s as %q.\n\n", deployment, name)
+	fmt.Fprintf(env.Stdout, "  this node's fingerprint  %s\n\n", fingerprint)
+	fmt.Fprintf(env.Stdout, "On the control plane, check it matches and approve:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
 	for {
 		certPEM, signedBy, err := nodeclient.Enroll(ctx, base, name, joinToken, caPEM, csrPEM)
@@ -568,13 +568,13 @@ func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, jo
 					"returned does not verify against itself, so it would not start: %w", verifyErr)
 			}
 
-			if err := writeBundle(cfg.Node.TLS, certPEM, keyPEM, signedBy); err != nil {
+			if err := writeBundle(env, cfg.Node.TLS, certPEM, keyPEM, signedBy); err != nil {
 				return err
 			}
 
 			// The staged request has become a certificate, so the copy of the key
 			// beside it is a second copy of a secret and nothing else.
-			clearPendingIdentity(cfg.Node.TLS)
+			clearPendingIdentity(env, cfg.Node.TLS)
 
 			return nil
 		case errors.Is(err, nodeclient.ErrDenied):
@@ -585,7 +585,7 @@ func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, jo
 			// NOT A VERDICT, so this keeps waiting. Giving up here abandoned a
 			// request the control plane had already recorded and a join token it had
 			// already spent, over a busy ledger.
-			fmt.Printf("  the control plane is busy; still waiting\n")
+			fmt.Fprintf(env.Stdout, "  the control plane is busy; still waiting\n")
 		default:
 			return err
 		}
@@ -608,7 +608,7 @@ func enrollNode(ctx context.Context, cfg *config.Config, base, caFingerprint, jo
 //
 // Written 0600 with O_EXCL, so a stale staging file is reused rather than
 // silently replaced — replacing it is the very thing that strands the name.
-func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
+func pendingIdentity(env cli.Env, tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 	dir := filepath.Dir(tls.KeyPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create %s: %w", dir, err)
@@ -637,7 +637,7 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 
 	switch {
 	case keyErr == nil && csrErr == nil && forErr == nil && string(stagedFor) == name:
-		fmt.Printf("Resuming the enrollment already staged in %s.\n\n", dir)
+		fmt.Fprintf(env.Stdout, "Resuming the enrollment already staged in %s.\n\n", dir)
 
 		return stagedCSR, staged, nil
 
@@ -691,7 +691,7 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 }
 
 // clearPendingIdentity drops the staged request once it has become a bundle.
-func clearPendingIdentity(tls *config.NodeTLS) {
+func clearPendingIdentity(env cli.Env, tls *config.NodeTLS) {
 	dir := filepath.Dir(tls.KeyPath)
 
 	for _, name := range []string{"pending.key", "pending.csr", "pending.node"} {
@@ -699,7 +699,7 @@ func clearPendingIdentity(tls *config.NodeTLS) {
 			// SAID OUT LOUD rather than swallowed: what is left behind is a second
 			// copy of a private key, and the enrollment itself succeeded — so this
 			// is a warning, not a failure.
-			fmt.Fprintf(os.Stderr, "the enrollment succeeded but %s could not be removed: %v\n"+
+			fmt.Fprintf(env.Stderr, "the enrollment succeeded but %s could not be removed: %v\n"+
 				"That file is a copy of this node's private key; delete it.\n",
 				filepath.Join(dir, name), err)
 		}
@@ -707,7 +707,7 @@ func clearPendingIdentity(tls *config.NodeTLS) {
 }
 
 // writeBundle puts an enrolled identity on disk, the key first and 0600.
-func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
+func writeBundle(env cli.Env, tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 	for _, dir := range []string{filepath.Dir(tls.KeyPath), filepath.Dir(tls.CertPath),
 		filepath.Dir(tls.CAPath)} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -736,8 +736,8 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 		}
 	}
 
-	fmt.Printf("Approved. Wrote:\n  %s\n  %s\n  %s\n\n", tls.CertPath, tls.KeyPath, tls.CAPath)
-	fmt.Printf("Start the node normally now: billet node\n")
+	fmt.Fprintf(env.Stdout, "Approved. Wrote:\n  %s\n  %s\n  %s\n\n", tls.CertPath, tls.KeyPath, tls.CAPath)
+	fmt.Fprintf(env.Stdout, "Start the node normally now: billet node\n")
 
 	return nil
 }
@@ -750,8 +750,8 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 // It admits nothing on its own. A request still waits for an operator to compare
 // fingerprints; what the token stops is a stranger who can reach the port filling
 // the pending list, or taking a name before the machine that should have it.
-func cmdCAToken(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca token", os.Stdout)
+func cmdCAToken(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca token", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
 	uses := fs.Int("uses", 1, "how many machines may enroll with it")
@@ -783,9 +783,9 @@ func cmdCAToken(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
-	fmt.Printf("On the machine that should join:\n\n")
-	fmt.Printf("  billet node --enroll --ca-fingerprint <from `billet ca show`> --join-token %s%s\n",
+	fmt.Fprintf(env.Stdout, "Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
+	fmt.Fprintf(env.Stdout, "On the machine that should join:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint <from `billet ca show`> --join-token %s%s\n",
 		token, enrollAddrFlag(cfg))
 
 	return nil
@@ -828,8 +828,8 @@ func enrollAddrFlag(cfg *config.Config) string {
 // Nothing breaks at this point, and nothing is finished either: `billet ca
 // retire` is what ends it, and running that before the fleet has renewed is what
 // would cut a node off.
-func cmdCARotate(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca rotate", os.Stdout)
+func cmdCARotate(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca rotate", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -870,24 +870,24 @@ func cmdCARotate(ctx context.Context, args []string) error {
 	// REPORTED AND NOT FATAL. The rotation is complete on this host by now, and a
 	// store that cannot be written is a reason to run `billet ca sync --push`
 	// rather than to leave an operator believing the rotation failed.
-	publishRotatedAuthority(ctx, cfg, deployment)
+	publishRotatedAuthority(ctx, env, cfg, deployment)
 
-	fmt.Printf("Rotated. The new authority is %s\n\n", ca.Fingerprint())
-	fmt.Printf("  new node certificates are issued by it\n")
-	fmt.Printf("  the previous authority still signs what the control plane presents\n")
-	fmt.Printf("  both are trusted, so nothing has to be restarted in a hurry\n\n")
-	fmt.Printf("Restart the control plane to pick this up, then let nodes renew. Watch\n")
-	fmt.Printf("`billet ca show` until nothing is left on the old authority, and finish with:\n\n")
-	fmt.Printf("  billet ca retire --config %s\n\n", *cfgPath)
-	fmt.Printf("A node that never renews during the overlap has to be re-enrolled, which is\n")
-	fmt.Printf("why retiring is yours to run rather than something that happens on a timer.\n")
+	fmt.Fprintf(env.Stdout, "Rotated. The new authority is %s\n\n", ca.Fingerprint())
+	fmt.Fprintf(env.Stdout, "  new node certificates are issued by it\n")
+	fmt.Fprintf(env.Stdout, "  the previous authority still signs what the control plane presents\n")
+	fmt.Fprintf(env.Stdout, "  both are trusted, so nothing has to be restarted in a hurry\n\n")
+	fmt.Fprintf(env.Stdout, "Restart the control plane to pick this up, then let nodes renew. Watch\n")
+	fmt.Fprintf(env.Stdout, "`billet ca show` until nothing is left on the old authority, and finish with:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet ca retire --config %s\n\n", *cfgPath)
+	fmt.Fprintf(env.Stdout, "A node that never renews during the overlap has to be re-enrolled, which is\n")
+	fmt.Fprintf(env.Stdout, "why retiring is yours to run rather than something that happens on a timer.\n")
 
 	return nil
 }
 
 // cmdCARetire finishes a rotation by dropping the old authority.
-func cmdCARetire(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca retire", os.Stdout)
+func cmdCARetire(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca retire", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	force := fs.Bool("force", false, "retire even though a node may not have renewed")
 
@@ -910,7 +910,7 @@ func cmdCARetire(ctx context.Context, args []string) error {
 	}
 
 	if prev == nil {
-		fmt.Println("No rotation is running; there is nothing to retire.")
+		fmt.Fprintln(env.Stdout, "No rotation is running; there is nothing to retire.")
 
 		return nil
 	}
@@ -922,11 +922,11 @@ func cmdCARetire(ctx context.Context, args []string) error {
 	if !*force {
 		age, _ := wirecert.RotationAge(cfg.Server.IdentityDir)
 
-		fmt.Printf("This rotation started %s ago.\n\n", age.Round(time.Hour))
-		fmt.Printf("Every node has to have renewed since then. A node that has not still trusts\n")
-		fmt.Printf("only the old authority, and retiring it means that node can no longer verify\n")
-		fmt.Printf("this control plane — it would have to be re-enrolled by hand.\n\n")
-		fmt.Printf("Re-run with --force when you have checked.\n")
+		fmt.Fprintf(env.Stdout, "This rotation started %s ago.\n\n", age.Round(time.Hour))
+		fmt.Fprintf(env.Stdout, "Every node has to have renewed since then. A node that has not still trusts\n")
+		fmt.Fprintf(env.Stdout, "only the old authority, and retiring it means that node can no longer verify\n")
+		fmt.Fprintf(env.Stdout, "this control plane — it would have to be re-enrolled by hand.\n\n")
+		fmt.Fprintf(env.Stdout, "Re-run with --force when you have checked.\n")
 
 		return nil
 	}
@@ -953,10 +953,10 @@ func cmdCARetire(ctx context.Context, args []string) error {
 	// PUBLISHED, FOR THE SAME REASON A ROTATION IS. A retirement removes the
 	// previous pair, and a second controller still holding it would keep
 	// presenting a certificate this deployment has just withdrawn.
-	publishRotatedAuthority(ctx, cfg, deployment)
+	publishRotatedAuthority(ctx, env, cfg, deployment)
 
-	fmt.Println("Retired the previous authority. Restart the control plane to present a")
-	fmt.Println("certificate from the new one.")
+	fmt.Fprintln(env.Stdout, "Retired the previous authority. Restart the control plane to present a")
+	fmt.Fprintln(env.Stdout, "certificate from the new one.")
 
 	return nil
 }

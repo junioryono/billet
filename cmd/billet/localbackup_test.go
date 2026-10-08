@@ -127,7 +127,7 @@ func TestLocalBackupCapturesTheWholeDeployment(t *testing.T) {
 	f := newBackupFixture(t, true)
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	if err := cmdLocalBackup(t.Context(), []string{"--config", f.configPath, "--out", dest}); err != nil {
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{"--config", f.configPath, "--out", dest}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
 	}
 
@@ -170,7 +170,7 @@ node:
 		t.Fatalf("write the config: %v", err)
 	}
 
-	err := cmdLocalBackup(t.Context(),
+	err := cmdLocalBackup(t.Context(), processEnv(),
 		[]string{"--config", configPath, "--out", filepath.Join(root, "backup")})
 	if err == nil {
 		t.Fatal("a backup on a node-only host succeeded")
@@ -188,7 +188,7 @@ func TestLocalBackupRefusesAnUncommissionedHost(t *testing.T) {
 	f := newBackupFixture(t, false)
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	err := cmdLocalBackup(t.Context(), []string{"--config", f.configPath, "--out", dest})
+	err := cmdLocalBackup(t.Context(), processEnv(), []string{"--config", f.configPath, "--out", dest})
 	if err == nil {
 		t.Fatal("a backup of a host with no deployment identity succeeded")
 	}
@@ -206,7 +206,7 @@ func TestLocalBackupRefusesAnUncommissionedHost(t *testing.T) {
 func TestLocalBackupNeedsAnOutDirectory(t *testing.T) {
 	f := newBackupFixture(t, true)
 
-	err := cmdLocalBackup(t.Context(), []string{"--config", f.configPath})
+	err := cmdLocalBackup(t.Context(), processEnv(), []string{"--config", f.configPath})
 	if err == nil || !strings.Contains(err.Error(), "--out") {
 		t.Errorf("a backup with no destination was not refused for that: %v", err)
 	}
@@ -269,7 +269,7 @@ tiers:
 
 	dest := filepath.Join(t.TempDir(), "archive")
 
-	err := runLocalBackup(t.Context(), backupOptions{
+	err := runLocalBackup(t.Context(), processEnv(), backupOptions{
 		configPath: configPath,
 		out:        dest,
 		noUpload:   true,
@@ -455,7 +455,7 @@ tiers:
 
 	dest := filepath.Join(t.TempDir(), "archive")
 
-	if err := runLocalBackup(t.Context(), backupOptions{
+	if err := runLocalBackup(t.Context(), processEnv(), backupOptions{
 		configPath: configPath,
 		out:        dest,
 		noUpload:   true,

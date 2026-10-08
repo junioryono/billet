@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -23,8 +22,8 @@ type orphanReclaimer interface {
 
 // cmdCacheOrphans lists the intact writable cache volumes nothing needs and,
 // with --reclaim, moves them to the cache pool's trash.
-func cmdCacheOrphans(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet cache orphans", os.Stdout)
+func cmdCacheOrphans(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet cache orphans", env.Stdout)
 	cfgPath := addConfigFlag(flags)
 	olderThan := flags.Duration("older-than", ceph.DefaultOrphanAge,
 		fmt.Sprintf("how long ago a volume must have been named, at least %s", ceph.OrphanMinimumAge))
@@ -54,7 +53,7 @@ func cmdCacheOrphans(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return reclaimCacheOrphans(ctx, os.Stdout, client, ceph.OrphanOptions{
+	return reclaimCacheOrphans(ctx, env.Stdout, client, ceph.OrphanOptions{
 		OlderThan: *olderThan, Limit: *limit, Reclaim: *reclaim, InSession: sessions.Mentions,
 	})
 }

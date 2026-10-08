@@ -54,7 +54,7 @@ func TestAMIDispatchesToTheSubcommandThatWasTyped(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := cmdAMI(t.Context(), tc.args)
+			err := cmdAMI(t.Context(), processEnv(), tc.args)
 			if err == nil {
 				t.Fatalf("billet ami %v returned success; it should have refused before "+
 					"launching anything", tc.args)
@@ -87,7 +87,7 @@ func TestAMIDispatchesToTheSubcommandThatWasTyped(t *testing.T) {
 func TestTheBuilderOwnerCarriesTheDeployment(t *testing.T) {
 	const id = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
-	got, err := builderOwner(filepath.Join(t.TempDir(), "none.yaml"), id, "billet-runner-1")
+	got, err := builderOwner(processEnv(), filepath.Join(t.TempDir(), "none.yaml"), id, "billet-runner-1")
 	if err != nil {
 		t.Fatalf("builderOwner: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestTheBuilderOwnerCarriesTheDeployment(t *testing.T) {
 func builderOwnerFor(t *testing.T, deployment, name string) string {
 	t.Helper()
 
-	owner, err := builderOwner(filepath.Join(t.TempDir(), "none.yaml"), deployment, name)
+	owner, err := builderOwner(processEnv(), filepath.Join(t.TempDir(), "none.yaml"), deployment, name)
 	if err != nil {
 		t.Fatalf("builderOwner: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestTheBuilderOwnerReadsTheDeploymentOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := builderOwner(cfgPath, "", "billet-runner-1")
+	got, err := builderOwner(processEnv(), cfgPath, "", "billet-runner-1")
 	if err != nil {
 		t.Fatalf("builderOwner: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestTheBuilderOwnerSaysWhenItHasNoDeployment(t *testing.T) {
 
 	printed := captureStderr(t, func() {
 		var err error
-		owner, err = builderOwner(filepath.Join(t.TempDir(), "none.yaml"), "", "billet-runner-1")
+		owner, err = builderOwner(processEnv(), filepath.Join(t.TempDir(), "none.yaml"), "", "billet-runner-1")
 		if err != nil {
 			t.Fatalf("builderOwner: %v", err)
 		}
@@ -232,7 +232,7 @@ func TestTheBuilderOwnerSaysWhenItHasNoDeployment(t *testing.T) {
 // value that is not the deployment's id produces a tag no policy admits and a
 // build that fails at its first call.
 func TestTheBuilderOwnerRefusesAMalformedDeployment(t *testing.T) {
-	_, err := builderOwner(filepath.Join(t.TempDir(), "none.yaml"), "NOT-AN-ID", "billet-runner-1")
+	_, err := builderOwner(processEnv(), filepath.Join(t.TempDir(), "none.yaml"), "NOT-AN-ID", "billet-runner-1")
 	if err == nil || !strings.Contains(err.Error(), "--deployment") {
 		t.Fatalf("a malformed deployment must be refused by name, got %v", err)
 	}
@@ -286,7 +286,7 @@ func TestTheBuilderOwnerRefusesAConfigItCannotRead(t *testing.T) {
 	)
 
 	printed := captureStderr(t, func() {
-		owner, err = builderOwner(cfgPath, "", "billet-runner-1")
+		owner, err = builderOwner(processEnv(), cfgPath, "", "billet-runner-1")
 	})
 
 	if err == nil {

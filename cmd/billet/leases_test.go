@@ -40,7 +40,7 @@ func TestHeldLeasesNameTheirHolderAndWhetherItWasReplaced(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		printHeld(held)
+		printHeld(processEnv(), held)
 		printHolderNote(os.Stdout, held)
 	})
 
@@ -140,7 +140,7 @@ func TestStatusReportsARunningLeaseWhoseHolderWasReplaced(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	before := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfgPath}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfgPath}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -170,7 +170,7 @@ func TestStatusReportsARunningLeaseWhoseHolderWasReplaced(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdStatus(ctx, []string{"--config", cfgPath}); err != nil {
+		if err := cmdStatus(ctx, processEnv(), []string{"--config", cfgPath}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})

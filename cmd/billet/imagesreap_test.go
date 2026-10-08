@@ -175,7 +175,7 @@ func newReapFixture(t *testing.T, onDisk ...string) *reapFixture {
 func (f *reapFixture) run(t *testing.T, dryRun bool) error {
 	t.Helper()
 
-	return runImagesReap(t.Context(), f.store, f.cfg, "ubuntu-2404-x64", f.kernelDir, 3, dryRun)
+	return runImagesReap(t.Context(), processEnv(), f.store, f.cfg, "ubuntu-2404-x64", f.kernelDir, 3, dryRun)
 }
 
 // A REAP HOLDS THE KERNEL DIRECTORY WHILE IT DECIDES AND WHILE IT DELETES.
@@ -297,7 +297,7 @@ func TestAReapWaitsForAPullRatherThanDeletingTheKernelItIsAboutToPublish(t *test
 
 	// The pull: it has installed the kernel and holds the directory, and no generation
 	// names the file yet.
-	pull, err := takeKernelDirLock(t.Context(), fixture.kernelDir,
+	pull, err := takeKernelDirLock(t.Context(), processEnv(), fixture.kernelDir,
 		"install the kernel this generation will name")
 	if err != nil {
 		t.Fatalf("take the pull's lock: %v", err)
@@ -337,7 +337,7 @@ func TestAReapWaitsForAPullRatherThanDeletingTheKernelItIsAboutToPublish(t *test
 	go func() {
 		defer running.Done()
 
-		done <- runImagesReap(ctx, store, cfg, "ubuntu-2404-x64", kernelDir, 3, false)
+		done <- runImagesReap(ctx, processEnv(), store, cfg, "ubuntu-2404-x64", kernelDir, 3, false)
 	}()
 
 	// AND THE GOROUTINE IS STOPPED BEFORE THE CLEANUPS THAT WOULD RACE IT. Every

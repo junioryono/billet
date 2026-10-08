@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 
@@ -34,8 +33,8 @@ import (
 // be named differently), and node.ebs_s3.kms_key_id may be a bare key id or an
 // alias. So --role-arn and --kms-key-arn supply those exact ARNs; without them a
 // policy would be scoped to the wrong thing or to everything.
-func cmdInitIAM(_ context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet init iam", os.Stdout)
+func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet init iam", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	builder := fs.Bool("builder", false,
 		"also grant what `billet ami build` needs: ec2:CreateImage, tagging the image it "+
@@ -101,10 +100,10 @@ func cmdInitIAM(_ context.Context, args []string) error {
 	// identity, which every ec2 condition turns on, appears in none of it.
 	if cfg.Node.Provider == config.ProviderCodeBuild {
 		if *controllerSweep {
-			return printCodeBuildSweepIAM(cfg, *buildRole, *kmsKeyARN, *account)
+			return printCodeBuildSweepIAM(env, cfg, *buildRole, *kmsKeyARN, *account)
 		}
 
-		return printCodeBuildIAM(cfg, *buildRole, *kmsKeyARN, *account)
+		return printCodeBuildIAM(env, cfg, *buildRole, *kmsKeyARN, *account)
 	}
 
 	if *controllerSweep {
@@ -138,7 +137,7 @@ func cmdInitIAM(_ context.Context, args []string) error {
 		return fmt.Errorf("render the policy: %w", err)
 	}
 
-	fmt.Println(string(body))
+	fmt.Fprintln(env.Stdout, string(body))
 
 	return nil
 }

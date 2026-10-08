@@ -69,7 +69,7 @@ func TestCAIssueWritesAUsableBundle(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "bundle")
 
 	// The order an operator writes: the subject first, the options after.
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestCAIssueDuringARotationWritesABundleThatCanVerifyTheServer(t *testing.T)
 	}
 
 	out := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestCAIssueAcceptsFlagsBeforeTheNode(t *testing.T) {
 	cfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"--config", cfg, "--out", out, "mac-mini-1"}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"--config", cfg, "--out", out, "mac-mini-1"}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -220,7 +220,7 @@ func TestCAIssueRefusesAnUnusableNodeName(t *testing.T) {
 
 	cfg := writeCAConfig(t, t.TempDir())
 
-	err := cmdCAIssue(t.Context(), []string{"Not A Name", "--config", cfg, "--out", filepath.Join(t.TempDir(), "b")})
+	err := cmdCAIssue(t.Context(), processEnv(), []string{"Not A Name", "--config", cfg, "--out", filepath.Join(t.TempDir(), "b")})
 	if err == nil {
 		t.Fatal("a certificate was issued for a name that is not a legal node name")
 	}
@@ -234,11 +234,11 @@ func TestCAIssueWillNotOverwriteABundle(t *testing.T) {
 	cfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
-	err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out})
+	err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out})
 	if err == nil {
 		t.Fatal("a second bundle was written over the first")
 	}
@@ -280,7 +280,7 @@ tiers:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", path, "--out", filepath.Join(dir, "b")})
+	err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", path, "--out", filepath.Join(dir, "b")})
 	if err == nil {
 		t.Fatal("a node-only host issued a certificate")
 	}
@@ -346,7 +346,7 @@ func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
 	serverCfg := writeCAConfig(t, serverState)
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -410,7 +410,7 @@ func TestANodeRefusesABundleIssuedForSomebodyElse(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"mac-mini-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"mac-mini-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -440,14 +440,14 @@ func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
 	// A key that belongs to a different certificate, which is what half a copy
 	// looks like.
 	other := filepath.Join(t.TempDir(), "other")
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", writeCAConfig(t, t.TempDir()), "--out", other}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", writeCAConfig(t, t.TempDir()), "--out", other}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -490,7 +490,7 @@ func TestANodeWithABundleNeedsNoName(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -521,7 +521,7 @@ func TestANameThatContradictsTheCertificateIsRefused(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -659,13 +659,13 @@ func TestAnInterruptedEnrollmentReusesItsStagedKey(t *testing.T) {
 		CAPath:   filepath.Join(dir, "ca.crt"),
 	}
 
-	firstCSR, firstKey, err := pendingIdentity(tls, "epyc-1")
+	firstCSR, firstKey, err := pendingIdentity(processEnv(), tls, "epyc-1")
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 
 	// The process dies here, and the operator starts it again.
-	secondCSR, secondKey, err := pendingIdentity(tls, "epyc-1")
+	secondCSR, secondKey, err := pendingIdentity(processEnv(), tls, "epyc-1")
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -691,7 +691,7 @@ func TestAnInterruptedEnrollmentReusesItsStagedKey(t *testing.T) {
 	}
 
 	// And once it becomes a bundle, the spare copy goes.
-	clearPendingIdentity(tls)
+	clearPendingIdentity(processEnv(), tls)
 
 	if _, err := os.Stat(filepath.Join(dir, "pending.key")); !os.IsNotExist(err) {
 		t.Error("the staged key outlived the enrollment, leaving a second copy of a private key")
@@ -713,11 +713,11 @@ func TestAStagedEnrollmentRefusesADifferentNodeName(t *testing.T) {
 		CAPath:   filepath.Join(dir, "ca.crt"),
 	}
 
-	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+	if _, _, err := pendingIdentity(processEnv(), tls, "epyc-1"); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 
-	_, _, err := pendingIdentity(tls, "epyc-2")
+	_, _, err := pendingIdentity(processEnv(), tls, "epyc-2")
 	if err == nil {
 		t.Fatal("a key staged for epyc-1 was reused to ask for epyc-2; one compromised key " +
 			"would hold two identities and revoking one would not reach the other")
@@ -742,7 +742,7 @@ func TestAStagedEnrollmentRefusesAWorldReadableKey(t *testing.T) {
 		CAPath:   filepath.Join(dir, "ca.crt"),
 	}
 
-	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+	if _, _, err := pendingIdentity(processEnv(), tls, "epyc-1"); err != nil {
 		t.Fatalf("stage: %v", err)
 	}
 
@@ -750,7 +750,7 @@ func TestAStagedEnrollmentRefusesAWorldReadableKey(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	if _, _, err := pendingIdentity(tls, "epyc-1"); err == nil {
+	if _, _, err := pendingIdentity(processEnv(), tls, "epyc-1"); err == nil {
 		t.Fatal("a world-readable staged key was used to enroll; whoever can read it can be " +
 			"this node once it is approved")
 	}
@@ -817,7 +817,7 @@ func TestRevocationReachesACertificateAdmittedBeforeSerialsWereTracked(t *testin
 	// which is the wiring it exists to protect.
 	closeDB()
 
-	if err := cmdNodesRevoke(t.Context(), []string{"epyc-1", "--config", cfg}); err != nil {
+	if err := cmdNodesRevoke(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg}); err != nil {
 		t.Fatalf("billet nodes revoke: %v", err)
 	}
 
@@ -857,7 +857,7 @@ func TestAPartlyMissingStageDoesNotReplaceTheKey(t *testing.T) {
 				CAPath:   filepath.Join(dir, "ca.crt"),
 			}
 
-			if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+			if _, _, err := pendingIdentity(processEnv(), tls, "epyc-1"); err != nil {
 				t.Fatalf("stage: %v", err)
 			}
 
@@ -870,7 +870,7 @@ func TestAPartlyMissingStageDoesNotReplaceTheKey(t *testing.T) {
 				t.Fatalf("remove %s: %v", lost, err)
 			}
 
-			if _, _, err := pendingIdentity(tls, "epyc-1"); err == nil {
+			if _, _, err := pendingIdentity(processEnv(), tls, "epyc-1"); err == nil {
 				t.Error("a partly missing stage was treated as no stage at all")
 			}
 
@@ -897,7 +897,7 @@ func TestCAIssueReissueReplacesDeliberately(t *testing.T) {
 	cfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 	oldKey, err := os.ReadFile(filepath.Join(out, "node.key"))
@@ -906,7 +906,7 @@ func TestCAIssueReissueReplacesDeliberately(t *testing.T) {
 	}
 
 	output := capture(t, func() {
-		if err := cmdCAIssue(t.Context(),
+		if err := cmdCAIssue(t.Context(), processEnv(),
 			[]string{"epyc-1", "--config", cfg, "--out", out, "--reissue"}); err != nil {
 			t.Fatalf("ca issue --reissue: %v", err)
 		}
@@ -938,7 +938,7 @@ func TestCAIssueReissueReplacesDeliberately(t *testing.T) {
 	// copy of the certificate the revoke command reads, so a further --reissue
 	// refuses while it exists rather than silently deleting an unrevoked
 	// credential's only handle.
-	err = cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out, "--reissue"})
+	err = cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out, "--reissue"})
 	if err == nil {
 		t.Fatal("a second --reissue destroyed the archived bundle")
 	}
@@ -964,7 +964,7 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 
 	before := time.Now()
 
-	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out,
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", cfg, "--out", out,
 		"--lifetime", "20m"}); err != nil {
 		t.Fatalf("ca issue --lifetime 20m: %v", err)
 	}
@@ -1005,7 +1005,7 @@ func TestCAIssueHonoursALifetime(t *testing.T) {
 		{"8761h", "outside"},
 		{"0s", "outside"},
 	} {
-		err := cmdCAIssue(t.Context(), []string{"epyc-2", "--config", cfg,
+		err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-2", "--config", cfg,
 			"--out", filepath.Join(t.TempDir(), "b"), "--lifetime", tc.lifetime})
 		if err == nil {
 			t.Fatalf("--lifetime %s was accepted", tc.lifetime)

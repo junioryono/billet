@@ -57,8 +57,8 @@ type hybridInputs struct {
 // is the certificate: the co-located node names a bundle that exists only
 // after billet ca issue has run on the prepared host, and the role's billet
 // check refuses a missing one.
-func cmdInitHybrid(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet init hybrid", os.Stdout)
+func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet init hybrid", env.Stdout)
 
 	out := fs.String("out", "", "the directory to write the generation into (required)")
 	name := fs.String("name", "billet", "the Terraform module's name prefix for every AWS resource")
@@ -281,11 +281,11 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 		gb, _, ok := existingGitHubBlock(raw)
 		switch {
 		case ok && !gb.usable():
-			fmt.Fprintf(os.Stdout, "NOTE: the App identity at %s is not complete (target %q, installation %d), "+
+			fmt.Fprintf(env.Stdout, "NOTE: the App identity at %s is not complete (target %q, installation %d), "+
 				"so it was NOT carried; re-run `billet github-app create` to record it together.\n\n",
 				*cfgPath, gb.scopePath(), gb.InstallationID)
 		case ok && p.TargetPath() != "" && gb.scopePath() != p.TargetPath():
-			fmt.Fprintf(os.Stdout, "NOTE: the App at %s belongs to %q, but this run is for %q; the identity "+
+			fmt.Fprintf(env.Stdout, "NOTE: the App at %s belongs to %q, but this run is for %q; the identity "+
 				"was NOT carried.\n\n", *cfgPath, gb.scopePath(), p.TargetPath())
 		case ok:
 			p.AppID, p.InstallationID, p.ClientID = gb.AppID, gb.InstallationID, gb.ClientID
@@ -318,12 +318,12 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	}
 	files[HybridRunbookFile] = renderHybridRunbook(in, p, trusted, carried)
 
-	written, beside, err := writeHybridFiles(*out, files, *force)
+	written, beside, err := writeHybridFiles(env, *out, files, *force)
 	if err != nil {
 		return err
 	}
 
-	report := os.Stdout
+	report := env.Stdout
 	fmt.Fprintf(report, "Wrote the %s render of the hybrid shape into %s:\n", hybridRenderName(p), *out)
 	for _, f := range written {
 		fmt.Fprintf(report, "  %s\n", f)
@@ -459,7 +459,7 @@ func hybridRenderName(p initconfig.HybridParams) string {
 
 // writeHybridFiles lands every file under dir by the marker rule, returning
 // what was written and what went beside an operator's own file.
-func writeHybridFiles(dir string, files map[string]string, force bool) ([]string, []string, error) {
+func writeHybridFiles(env cli.Env, dir string, files map[string]string, force bool) ([]string, []string, error) {
 	var written, beside []string
 
 	names := make([]string, 0, len(files))
@@ -501,7 +501,7 @@ func writeHybridFiles(dir string, files map[string]string, force bool) ([]string
 			beside = append(beside, side)
 
 		case err == nil || errors.Is(err, os.ErrNotExist):
-			if err := commitConfig(path, []byte(files[rel]), 0o644); err != nil {
+			if err := commitConfig(env, path, []byte(files[rel]), 0o644); err != nil {
 				return nil, nil, err
 			}
 

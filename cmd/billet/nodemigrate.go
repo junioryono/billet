@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/junioryono/billet/deploy"
@@ -104,8 +103,8 @@ type migrateEvidence struct {
 	Stopped         migrateStopped `json:"stopped"`
 }
 
-func cmdNodeMigrate(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet node migrate-endpoint", os.Stdout)
+func cmdNodeMigrate(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet node migrate-endpoint", env.Stdout)
 	configPath := flags.String("config", "", "the installed configuration (required)")
 	desired := flags.String("desired", "", "the rendering the role installed, or means to: a path, or - for stdin")
 	stopTimeout := flags.Duration("stop-timeout", time.Hour, "the migration's own deadline for the node's stop; "+
@@ -126,21 +125,21 @@ func cmdNodeMigrate(ctx context.Context, args []string) error {
 	m := migrateMode{configPath: *configPath, desired: *desired, stopTimeout: *stopTimeout, wait: *wait, dryRun: *dryRun}
 
 	if r := checkMigrateCombination(m); r != nil {
-		return answerEndpointRefusal(r)
+		return answerEndpointRefusal(env, r)
 	}
 
 	if hostOS == "darwin" {
-		return answerEndpointRefusal(endpointRefuse(endpointReasonPlatform,
+		return answerEndpointRefusal(env, endpointRefuse(endpointReasonPlatform,
 			"an endpoint migration needs systemd and the node's runtime record, and this platform has neither",
 			"", stateNothing))
 	}
 
-	answer, r := migrateEndpoint(ctx, m)
+	answer, r := migrateEndpoint(ctx, env, m)
 	if r != nil {
-		return answerEndpointRefusal(r)
+		return answerEndpointRefusal(env, r)
 	}
 
-	return answerObject(answer)
+	return answerObject(env, answer)
 }
 
 func checkMigrateCombination(m migrateMode) *endpointRefusal {
@@ -165,7 +164,7 @@ func checkMigrateCombination(m migrateMode) *endpointRefusal {
 
 // migrateEndpoint is the command's order of operations; every step's refusal
 // names the state the host is left in.
-func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal) {
+func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *endpointRefusal) {
 	// (3) THE INSTALLED CONFIGURATION, one observation; the loader's whole
 	// judgement for the action, the node section's for a dry run.
 	installed, r := observeInstalledConfig(m.configPath, !m.dryRun)
@@ -179,7 +178,7 @@ func migrateEndpoint(ctx context.Context, m migrateMode) (any, *endpointRefusal)
 	)
 
 	if m.desired != "" {
-		body, cfg, r := readRendering(m.desired, !m.dryRun)
+		body, cfg, r := readRendering(env, m.desired, !m.dryRun)
 		if r != nil {
 			return nil, r
 		}

@@ -27,7 +27,7 @@ func TestInitRefusesAnEmptyJoin(t *testing.T) {
 	for _, addr := range []string{"", "  "} {
 		path := filepath.Join(t.TempDir(), "billet.yaml")
 
-		err := cmdInit(t.Context(), joinArgs(path, "--join", addr))
+		err := cmdInit(t.Context(), processEnv(), joinArgs(path, "--join", addr))
 		if err == nil || !strings.Contains(err.Error(), "--join") {
 			t.Errorf("--join %q was not refused by name: %v", addr, err)
 		}
@@ -44,14 +44,14 @@ func TestInitJoinWritesANodeWithoutTheAppIdentity(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if err := cmdInit(t.Context(), joinArgs("billet.yaml")); err != nil {
+	if err := cmdInit(t.Context(), processEnv(), joinArgs("billet.yaml")); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
 	keyPath, err := defaultKeyPath(filepath.Join(dir, "billet.yaml"))
 	if err != nil {
 		t.Fatalf("resolve the key path: %v", err)
 	}
-	if err := writeGitHubBlock("billet.yaml", githubBlock{
+	if err := writeGitHubBlock(processEnv(), "billet.yaml", githubBlock{
 		Org: "acme", AppID: 7, InstallationID: 42, ClientID: "Iv1.abc",
 		PrivateKeyPath: keyPath,
 	}); err != nil {
@@ -59,7 +59,7 @@ func TestInitJoinWritesANodeWithoutTheAppIdentity(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), joinArgs("billet.yaml", "--force",
+		if err := cmdInit(t.Context(), processEnv(), joinArgs("billet.yaml", "--force",
 			"--join", "controller.example:7717")); err != nil {
 			t.Fatalf("join: %v", err)
 		}
@@ -101,7 +101,7 @@ func TestInitJoinRefusesReplacingALiveControlPlane(t *testing.T) {
 	ownHome(t)
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), joinArgs(path)); err != nil {
+	if err := cmdInit(t.Context(), processEnv(), joinArgs(path)); err != nil {
 		t.Fatalf("first init: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -120,7 +120,7 @@ func TestInitJoinRefusesReplacingALiveControlPlane(t *testing.T) {
 		t.Fatalf("mint identity: %v", err)
 	}
 
-	joinErr := cmdInit(t.Context(), joinArgs(path, "--force", "--join", "controller.example:7717"))
+	joinErr := cmdInit(t.Context(), processEnv(), joinArgs(path, "--force", "--join", "controller.example:7717"))
 	if joinErr == nil {
 		t.Fatal("--join --force replaced a live control plane's config")
 	}

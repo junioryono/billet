@@ -36,7 +36,7 @@ func TestAControlPlaneStoppedWhileItTakesTheClaimEndsCleanly(t *testing.T) {
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := stoppedBeforeTheClaim(cancelled, false, claimCancellation()); err != nil {
+	if err := stoppedBeforeTheClaim(cancelled, processEnv(), false, claimCancellation()); err != nil {
 		t.Errorf("a control plane asked to stop while it took the claim returns %v, so "+
 			"it exits non-zero, systemd holds a failed unit, and `billet server retire` "+
 			"refuses to act against it", err)
@@ -45,14 +45,14 @@ func TestAControlPlaneStoppedWhileItTakesTheClaimEndsCleanly(t *testing.T) {
 	// A REAL FAULT IS STILL A FAULT. The ledger names another deployment, or the
 	// schema is unreadable: neither resolves by waiting and neither may exit 0.
 	fault := errors.New("ledger bound to another deployment")
-	if err := stoppedBeforeTheClaim(cancelled, false, fault); !errors.Is(err, fault) {
+	if err := stoppedBeforeTheClaim(cancelled, processEnv(), false, fault); !errors.Is(err, fault) {
 		t.Errorf("a claim that failed for its own reason returns %v, want the fault", err)
 	}
 
 	// A CANCELLATION IS NOT BY ITSELF A SHUTDOWN. An inner context cancelled
 	// while this one is live is a failure whose error happens to carry
 	// context.Canceled, and exiting 0 on it would be could-not-tell read as yes.
-	if err := stoppedBeforeTheClaim(t.Context(), false, claimCancellation()); err == nil {
+	if err := stoppedBeforeTheClaim(t.Context(), processEnv(), false, claimCancellation()); err == nil {
 		t.Error("a cancellation reaching a process nobody asked to stop is read as a " +
 			"stop, so a real fault exits 0")
 	}
@@ -60,12 +60,12 @@ func TestAControlPlaneStoppedWhileItTakesTheClaimEndsCleanly(t *testing.T) {
 	// AND A FENCED HOST EXITS NON-ZERO WHATEVER ELSE IS TRUE. Below the claim a
 	// clean exit leaves a healed deployment with no controller at all, which is
 	// the failure the whole fence exists to make impossible.
-	if err := stoppedBeforeTheClaim(cancelled, true, claimCancellation()); err == nil {
+	if err := stoppedBeforeTheClaim(cancelled, processEnv(), true, claimCancellation()); err == nil {
 		t.Error("a host whose claim was refused by a successor reports a clean stop, so " +
 			"systemd leaves it down and the deployment keeps no controller")
 	}
 
-	if err := stoppedBeforeTheClaim(cancelled, false, nil); err != nil {
+	if err := stoppedBeforeTheClaim(cancelled, processEnv(), false, nil); err != nil {
 		t.Errorf("a claim that succeeded returns %v", err)
 	}
 }

@@ -64,7 +64,7 @@ func ledgerWithRollout(t *testing.T, target string) (*config.Config, *rollout.Ro
 func TestFromRolloutTakesTheWholeInstructionFromTheLedger(t *testing.T) {
 	cfg, r := ledgerWithRollout(t, "v9.9.9")
 
-	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	got, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil {
 		t.Fatalf("rolloutInstruction: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestFromRolloutHasNothingToDoWithoutADecisionToAct(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, ok, err := rolloutInstruction(t.Context(), c.cfg(t))
+			_, ok, err := rolloutInstruction(t.Context(), processEnv(), c.cfg(t))
 			if err != nil {
 				t.Fatalf("rolloutInstruction: %v", err)
 			}
@@ -165,7 +165,7 @@ func TestFromRolloutMovesAHostBehindAConvergedController(t *testing.T) {
 
 	advanceController(t, cfg, r)
 
-	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	got, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil {
 		t.Fatalf("rolloutInstruction: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestFromRolloutMovesAStandbyToTheLastCompletedRollout(t *testing.T) {
 
 	finish(t, cfg, r.ID, rollout.StateCompleted)
 
-	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	got, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil {
 		t.Fatalf("rolloutInstruction: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestFromRolloutMovesAStandbyToTheLastCompletedRollout(t *testing.T) {
 
 	finish(t, aborted, a.ID, rollout.StateAborted)
 
-	if _, ok, err := rolloutInstruction(t.Context(), aborted); err != nil || ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), aborted); err != nil || ok {
 		t.Fatalf("an aborted rollout was acted on (ok=%v, err=%v)", ok, err)
 	}
 }
@@ -213,38 +213,38 @@ func TestFromRolloutMovesAStandbyToTheLastCompletedRollout(t *testing.T) {
 func TestFromRolloutRefusesADecisionThatChangedSinceItWasRead(t *testing.T) {
 	cfg, r := ledgerWithRollout(t, "v9.9.9")
 
-	target, ok, err := rolloutInstruction(t.Context(), cfg)
+	target, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil || !ok {
 		t.Fatalf("rolloutInstruction: ok=%v err=%v", ok, err)
 	}
 
-	if err := confirmFleetDecision(t.Context(), cfg, target); err != nil {
+	if err := confirmFleetDecision(t.Context(), processEnv(), cfg, target); err != nil {
 		t.Fatalf("an unchanged decision was not confirmed: %v", err)
 	}
 
 	finish(t, cfg, r.ID, rollout.StateCompleted)
 
-	if err := confirmFleetDecision(t.Context(), cfg, target); err != nil {
+	if err := confirmFleetDecision(t.Context(), processEnv(), cfg, target); err != nil {
 		t.Fatalf("a decision that completed meanwhile was not confirmed: %v", err)
 	}
 
 	aborted, a := ledgerWithRollout(t, "v9.9.9")
 
-	target, _, err = rolloutInstruction(t.Context(), aborted)
+	target, _, err = rolloutInstruction(t.Context(), processEnv(), aborted)
 	if err != nil {
 		t.Fatalf("rolloutInstruction: %v", err)
 	}
 
 	finish(t, aborted, a.ID, rollout.StateAborted)
 
-	if err := confirmFleetDecision(t.Context(), aborted, target); !errors.Is(err, ErrSuperseded) {
+	if err := confirmFleetDecision(t.Context(), processEnv(), aborted, target); !errors.Is(err, ErrSuperseded) {
 		t.Fatalf("a decision aborted since it was read was confirmed: %v", err)
 	}
 
 	other := target
 	other.generation++
 
-	if err := confirmFleetDecision(t.Context(), cfg, other); !errors.Is(err, ErrSuperseded) {
+	if err := confirmFleetDecision(t.Context(), processEnv(), cfg, other); !errors.Is(err, ErrSuperseded) {
 		t.Fatalf("a decision with another generation was confirmed: %v", err)
 	}
 }
@@ -329,7 +329,7 @@ func TestFromRolloutReinstallsATargetVersionFromAnotherManifest(t *testing.T) {
 
 	cfg, r := ledgerWithRollout(t, version.Version())
 
-	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || ok {
 		t.Fatalf("a host with no record was reinstalled (ok=%v, err=%v)", ok, err)
 	}
 
@@ -339,7 +339,7 @@ func TestFromRolloutReinstallsATargetVersionFromAnotherManifest(t *testing.T) {
 		t.Fatalf("Write the provenance record: %v", err)
 	}
 
-	got, ok, err := rolloutInstruction(t.Context(), cfg)
+	got, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil || !ok {
 		t.Fatalf("a host from another manifest was left alone (ok=%v, err=%v)", ok, err)
 	}
@@ -356,7 +356,7 @@ func TestFromRolloutReinstallsATargetVersionFromAnotherManifest(t *testing.T) {
 func TestFromRolloutRecordsTheDecisionItHadNothingToDoAbout(t *testing.T) {
 	cfg, r := ledgerWithRollout(t, version.Version())
 
-	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || ok {
 		t.Fatalf("a host on the target was told to act (ok=%v, err=%v)", ok, err)
 	}
 
@@ -387,7 +387,7 @@ func TestFromRolloutSettlesNothingWhileAnUpgradeHoldsTheHost(t *testing.T) {
 
 	defer tx.release()
 
-	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || ok {
 		t.Fatalf("under another transaction's lock: ok=%v err=%v, want nothing to do and no error",
 			ok, err)
 	}
@@ -412,7 +412,7 @@ func TestFromRolloutFollowsACompletedRolloutOnlyUntilThisHostSettlesOnIt(t *test
 		t.Fatalf("record the decision: %v", err)
 	}
 
-	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || !ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || !ok {
 		t.Fatalf("a host that rolled back on the completed rollout was not asked again (ok=%v, "+
 			"err=%v)", ok, err)
 	}
@@ -422,7 +422,7 @@ func TestFromRolloutFollowsACompletedRolloutOnlyUntilThisHostSettlesOnIt(t *test
 		t.Fatalf("recordSettled: %v", err)
 	}
 
-	if _, ok, err := rolloutInstruction(t.Context(), cfg); err != nil || ok {
+	if _, ok, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || ok {
 		t.Fatalf("a host that settled on the completed rollout was moved to it again (ok=%v, "+
 			"err=%v)", ok, err)
 	}
@@ -593,17 +593,17 @@ func TestAManualRunSettlesThroughTheLastCompletedRollout(t *testing.T) {
 	manual := hostUpgradeTarget{pin: "v0.4.0"}
 
 	cfg, r := ledgerWithRollout(t, "v9.9.9")
-	if got := settlesThrough(t.Context(), cfg, manual); got != 0 {
+	if got := settlesThrough(t.Context(), processEnv(), cfg, manual); got != 0 {
 		t.Errorf("an open rollout was settled through as %d", got)
 	}
 
 	finish(t, cfg, r.ID, rollout.StateCompleted)
 
-	if got := settlesThrough(t.Context(), cfg, manual); got != r.Generation {
+	if got := settlesThrough(t.Context(), processEnv(), cfg, manual); got != r.Generation {
 		t.Errorf("a completed rollout settled through as %d, want %d", got, r.Generation)
 	}
 
-	if got := settlesThrough(t.Context(), cfg, hostUpgradeTarget{
+	if got := settlesThrough(t.Context(), processEnv(), cfg, hostUpgradeTarget{
 		generation: r.Generation, fromRollout: true,
 	}); got != 0 {
 		t.Errorf("a run serving a rollout settled through %d as well", got)
@@ -613,11 +613,11 @@ func TestAManualRunSettlesThroughTheLastCompletedRollout(t *testing.T) {
 
 	finish(t, aborted, a.ID, rollout.StateAborted)
 
-	if got := settlesThrough(t.Context(), aborted, manual); got != 0 {
+	if got := settlesThrough(t.Context(), processEnv(), aborted, manual); got != 0 {
 		t.Errorf("an aborted rollout was settled through as %d", got)
 	}
 
-	if got := settlesThrough(t.Context(), &config.Config{Node: &config.NodeConfig{}}, manual); got != 0 {
+	if got := settlesThrough(t.Context(), processEnv(), &config.Config{Node: &config.NodeConfig{}}, manual); got != 0 {
 		t.Errorf("a node-only host settled through %d", got)
 	}
 }
@@ -653,7 +653,7 @@ func TestAnOvertakenTimerSettlesRatherThanReinstalling(t *testing.T) {
 
 	ack, answer := ackReader(t)
 
-	err = actOnResolved(t.Context(), &config.Config{}, "",
+	err = actOnResolved(t.Context(), processEnv(), &config.Config{}, "",
 		hostUpgradeTarget{pin: "v9.9.9", digest: digest, generation: 12, fromRollout: true},
 		ack, nil, installedManifest(t), digest, heldTxLock(t))
 	if err != nil {

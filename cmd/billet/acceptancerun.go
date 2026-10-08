@@ -43,8 +43,8 @@ const (
 	acceptanceStopGrace = 5 * time.Minute
 )
 
-func cmdAcceptanceRun(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet acceptance run", os.Stdout)
+func cmdAcceptanceRun(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet acceptance run", env.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	jobs := fs.Int("jobs", 1, "how many jobs must reach a terminal outcome before this stops waiting")
 	wait := fs.Duration("wait", 30*time.Minute,
@@ -78,7 +78,7 @@ func cmdAcceptanceRun(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return runAcceptance(ctx, ws, acceptanceRunOptions{
+	return runAcceptance(ctx, env, ws, acceptanceRunOptions{
 		jobs:       *jobs,
 		wait:       *wait,
 		noTeardown: *noTeardown,
@@ -94,7 +94,7 @@ type acceptanceRunOptions struct {
 	noTeardown bool
 }
 
-func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
+func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate this billet binary, which is what the run supervises: %w", err)
@@ -102,7 +102,7 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 
 	dir := filepath.Dir(ws.ConfigPath)
 
-	server, err := startAcceptanceService(ctx, self, "server", ws.ConfigPath, dir)
+	server, err := startAcceptanceService(ctx, env, self, "server", ws.ConfigPath, dir)
 	if err != nil {
 		// NOTHING TO TEAR DOWN. The server never came up, so it created no scale
 		// set and dispatched no launch — and a teardown here would be scoped to a
@@ -117,11 +117,11 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 	// node-start failure below used to be exactly such a return.
 	var waitErr error
 
-	node, nodeErr := startAcceptanceService(ctx, self, "node", ws.ConfigPath, dir)
+	node, nodeErr := startAcceptanceService(ctx, env, self, "node", ws.ConfigPath, dir)
 	if nodeErr != nil {
 		waitErr = nodeErr
 	} else {
-		waitErr = waitForAcceptanceJobs(ctx, ws, opts)
+		waitErr = waitForAcceptanceJobs(ctx, env, ws, opts)
 	}
 
 	// THE COMPUTE PROOF IS TAKEN WHILE THE SERVICES ARE STILL UP, and that is the
@@ -139,9 +139,9 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 	// ITS FAILURE IS NOT THE RUN'S. A fleet that will not go quiet is worth
 	// reporting and is not a reason to skip the teardown, so the error is
 	// collected and everything below happens either way.
-	proved, proofErr := proveAcceptanceComputeClear(ctx, ws, opts.wait)
+	proved, proofErr := proveAcceptanceComputeClear(ctx, env, ws, opts.wait)
 	if proofErr != nil {
-		fmt.Fprintf(os.Stderr, "acceptance: the compute barrier did not clear: %v\n", proofErr)
+		fmt.Fprintf(env.Stderr, "acceptance: the compute barrier did not clear: %v\n", proofErr)
 	}
 
 	// THE STOP AND THE TEARDOWN RUN WHATEVER HAPPENED ABOVE, and on a context
@@ -161,12 +161,12 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 	// EVIDENCE BEFORE THE TEARDOWN, because the teardown destroys the compute the
 	// evidence is about — and after the services stop, so what it reads is not
 	// moving underneath it.
-	stopAcceptanceService(node)
-	stopAcceptanceService(server)
+	stopAcceptanceService(env, node)
+	stopAcceptanceService(env, server)
 
 	evidencePath := filepath.Join(dir, acceptanceEvidence)
-	if err := writeAcceptanceEvidence(teardownCtx, ws, evidencePath); err != nil {
-		fmt.Fprintf(os.Stderr, "acceptance: could not write the evidence: %v\n", err)
+	if err := writeAcceptanceEvidence(teardownCtx, env, ws, evidencePath); err != nil {
+		fmt.Fprintf(env.Stderr, "acceptance: could not write the evidence: %v\n", err)
 	}
 
 	if opts.noTeardown {
@@ -174,15 +174,15 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 		// the deployment "was left standing", which was false — both children are
 		// signalled above, unconditionally, because the evidence has to be read
 		// off a ledger nothing is writing to. What this flag skips is the DESTROY.
-		fmt.Printf("\n--no-teardown: the services are stopped and the evidence is written, " +
+		fmt.Fprintf(env.Stdout, "\n--no-teardown: the services are stopped and the evidence is written, "+
 			"but nothing was destroyed.\n")
-		fmt.Printf("This run's scale sets and compute are still there. Destroy them with\n")
-		fmt.Printf("  billet acceptance down --workspace %s\n", dir)
+		fmt.Fprintf(env.Stdout, "This run's scale sets and compute are still there. Destroy them with\n")
+		fmt.Fprintf(env.Stdout, "  billet acceptance down --workspace %s\n", dir)
 
 		return waitErr
 	}
 
-	downErr := tearDownAcceptance(teardownCtx, ws, proved)
+	downErr := tearDownAcceptance(teardownCtx, env, ws, proved)
 
 	// THE RUN'S OWN FAILURE WINS. A teardown that also failed is reported beside
 	// it rather than replacing it, because "the job did not run" and "the cleanup
@@ -199,7 +199,7 @@ func runAcceptance(ctx context.Context, ws acceptanceWorkspace, opts acceptanceR
 // the still-running control plane observe the barrier and put the question to
 // each host. `takeTheSeal` is a no-op against a deployment that is already sealed.
 func proveAcceptanceComputeClear(
-	ctx context.Context, ws acceptanceWorkspace, wait time.Duration,
+	ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration,
 ) (bool, error) {
 	db, cfg, err := openLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
@@ -213,12 +213,12 @@ func proveAcceptanceComputeClear(
 		return false, fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, db, current, "billet acceptance run")
+	sealed, err := takeTheSeal(ctx, env, db, current, "billet acceptance run")
 	if err != nil {
 		return false, fmt.Errorf("seal this run: %w", err)
 	}
 
-	if err := waitForQuiet(ctx, db, cfg, sealed.Generation, waitOptions{timeout: wait}); err != nil {
+	if err := waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{timeout: wait}); err != nil {
 		return false, err
 	}
 
@@ -257,7 +257,7 @@ type acceptanceService struct {
 // startAcceptanceService execs `billet <role> --config <derived>` and proves it
 // is still there a moment later.
 func startAcceptanceService(
-	ctx context.Context, self, role, cfgPath, dir string,
+	ctx context.Context, env cli.Env, self, role, cfgPath, dir string,
 ) (*acceptanceService, error) {
 	logPath := filepath.Join(dir, role+".log")
 
@@ -307,12 +307,12 @@ func startAcceptanceService(
 		// THE CHILD IS STOPPED, not left behind. A cancelled start still forked a
 		// process, and returning without it is how a control plane ends up polling
 		// GitHub with nothing tracking it.
-		stopAcceptanceService(svc)
+		stopAcceptanceService(env, svc)
 
 		return nil, fmt.Errorf("cancelled while starting billet %s: %w", role, ctx.Err())
 	}
 
-	fmt.Printf("started billet %s (pid %d), logging to %s\n", role, cmd.Process.Pid, logPath)
+	fmt.Fprintf(env.Stdout, "started billet %s (pid %d), logging to %s\n", role, cmd.Process.Pid, logPath)
 
 	return svc, nil
 }
@@ -324,7 +324,7 @@ func startAcceptanceService(
 // would fail somebody's build to save itself a wait — the exact thing billet's own
 // shutdown ordering refuses — so what is bounded here is how long this command
 // WATCHES, and an overrun is reported rather than escalated.
-func stopAcceptanceService(s *acceptanceService) {
+func stopAcceptanceService(env cli.Env, s *acceptanceService) {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
@@ -346,9 +346,9 @@ func stopAcceptanceService(s *acceptanceService) {
 
 	select {
 	case <-s.done:
-		fmt.Printf("billet %s stopped\n", s.name)
+		fmt.Fprintf(env.Stdout, "billet %s stopped\n", s.name)
 	case <-time.After(acceptanceStopGrace):
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(env.Stderr,
 			"acceptance: billet %s is still draining after %s. It has NOT been killed — a "+
 				"drain has no deadline and stopping it would fail whatever job it is waiting "+
 				"for. This command has stopped watching; the process is still there.\n",
@@ -363,7 +363,7 @@ func stopAcceptanceService(s *acceptanceService) {
 // result beside billet's own conclusion, and the two disagreeing is exactly the
 // finding worth having. Asking GitHub instead would answer a question about
 // GitHub.
-func waitForAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
+func waitForAcceptanceJobs(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opts acceptanceRunOptions) error {
 	deadline := time.Now().Add(opts.wait)
 
 	// THE JOBS THIS RUN CAUSED, NOT THE JOBS IN THE LEDGER.
@@ -393,13 +393,13 @@ func waitForAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace, opts acc
 	}
 
 	if len(baseline) > 0 {
-		fmt.Printf("\n%d job(s) already finished in this workspace before now; they do not "+
+		fmt.Fprintf(env.Stdout, "\n%d job(s) already finished in this workspace before now; they do not "+
 			"count towards --jobs.\n", len(baseline))
 	}
 
-	fmt.Printf("\nWaiting for %d NEW job(s) to finish on %s (up to %s).\n",
+	fmt.Fprintf(env.Stdout, "\nWaiting for %d NEW job(s) to finish on %s (up to %s).\n",
 		opts.jobs, acceptanceScaleSets(ws.Tiers), opts.wait)
-	fmt.Printf("Nothing here dispatches one — start a workflow that names one of those labels.\n\n")
+	fmt.Fprintf(env.Stdout, "Nothing here dispatches one — start a workflow that names one of those labels.\n\n")
 
 	ticker := time.NewTicker(acceptancePoll)
 	defer ticker.Stop()
@@ -416,7 +416,7 @@ func waitForAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace, opts acc
 		if len(terminal) > reported {
 			for i := range terminal[reported:] {
 				j := &terminal[reported+i]
-				fmt.Printf("  %s  tier=%s run=%d github=%q billet=%q\n",
+				fmt.Fprintf(env.Stdout, "  %s  tier=%s run=%d github=%q billet=%q\n",
 					j.LeaseID, j.Tier, j.RunID, j.GitHub, j.Billet)
 			}
 
@@ -424,7 +424,7 @@ func waitForAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace, opts acc
 		}
 
 		if len(terminal) >= opts.jobs {
-			fmt.Printf("\n%d job(s) finished.\n", len(terminal))
+			fmt.Fprintf(env.Stdout, "\n%d job(s) finished.\n", len(terminal))
 
 			return nil
 		}

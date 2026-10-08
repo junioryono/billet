@@ -18,7 +18,7 @@ func backupInto(t *testing.T, f backupFixture) string {
 
 	dest := filepath.Join(t.TempDir(), "backup")
 
-	if err := cmdLocalBackup(t.Context(), []string{"--config", f.configPath, "--out", dest}); err != nil {
+	if err := cmdLocalBackup(t.Context(), processEnv(), []string{"--config", f.configPath, "--out", dest}); err != nil {
 		t.Fatalf("billet local backup: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestLocalRestoreRefusesWithoutTheFleetFencingAssertion(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	err := cmdLocalRestore(t.Context(),
+	err := cmdLocalRestore(t.Context(), processEnv(),
 		[]string{"--config", tgt.configPath, "--from", archive})
 	if err == nil {
 		t.Fatal("a restore ran without the fencing assertion")
@@ -91,7 +91,7 @@ func TestLocalRestoreDryRunChangesNothing(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--dry-run",
 		"--old-controller-fenced",
 	}); err != nil {
@@ -123,7 +123,7 @@ func TestLocalRestorePutsTheDeploymentBack(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local restore: %v", err)
@@ -205,7 +205,7 @@ func TestLocalRestoreWillNotReplaceADifferentAppKey(t *testing.T) {
 	// A DISTINCT NAME FOR THE REFUSAL. Reusing err here is how a test comes to
 	// call Error() on the nil a later ReadFile assigned, which panics — and a
 	// panicking test looks exactly like a failing assertion.
-	refusal := cmdLocalRestore(t.Context(), []string{
+	refusal := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if refusal == nil {
@@ -258,7 +258,7 @@ func TestAbandonClearsAFenceLeftWithNoJournal(t *testing.T) {
 		t.Fatalf("stage the fence: %v", err)
 	}
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--abandon",
 	}); err != nil {
 		t.Fatalf("billet local restore --abandon: %v", err)
@@ -289,7 +289,7 @@ func TestAbandonLeavesSomebodyElsesFenceAlone(t *testing.T) {
 		t.Fatalf("stage somebody else's fence: %v", err)
 	}
 
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--abandon",
 	})
 	if err == nil {
@@ -321,7 +321,7 @@ func TestASecondRestoreConfirmsUnderTheLockRatherThanReportingFromAStalePlan(t *
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local restore: %v", err)
@@ -358,7 +358,7 @@ func TestASecondRestoreConfirmsUnderTheLockRatherThanReportingFromAStalePlan(t *
 
 	t.Cleanup(func() { lifecycleLock = prev })
 
-	err = cmdLocalRestore(t.Context(), []string{
+	err = cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	})
 
@@ -404,7 +404,7 @@ func TestANoOpRestoreThatRefusesLeavesTheDeploymentUnfenced(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local restore: %v", err)
@@ -429,7 +429,7 @@ func TestANoOpRestoreThatRefusesLeavesTheDeploymentUnfenced(t *testing.T) {
 	// this pass for the wrong reason: if the locked recheck stopped noticing the
 	// staged change, the restore would succeed, its ordinary teardown would clear
 	// the fence, and every assertion below would still hold.
-	err := cmdLocalRestore(t.Context(), []string{
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	})
 	if err == nil {
@@ -460,7 +460,7 @@ func TestANoOpRestoreThatRefusesLeavesTheDeploymentUnfenced(t *testing.T) {
 func TestLocalRestoreNeedsAFromDirectory(t *testing.T) {
 	f := newBackupFixture(t, false)
 
-	err := cmdLocalRestore(t.Context(), []string{"--config", f.configPath})
+	err := cmdLocalRestore(t.Context(), processEnv(), []string{"--config", f.configPath})
 	if err == nil || !strings.Contains(err.Error(), "--from") {
 		t.Errorf("a restore with no source was not refused for that: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestLocalRestoreNeedsAFromDirectory(t *testing.T) {
 // TestLocalUsageNamesBackupAndRestore, so an operator who types `billet local`
 // discovers them.
 func TestLocalUsageNamesBackupAndRestore(t *testing.T) {
-	err := cmdLocal(t.Context(), nil)
+	err := cmdLocal(t.Context(), processEnv(), nil)
 	if err == nil {
 		t.Fatal("`billet local` with no subcommand succeeded")
 	}
@@ -480,7 +480,7 @@ func TestLocalUsageNamesBackupAndRestore(t *testing.T) {
 		}
 	}
 
-	err = cmdLocal(t.Context(), []string{"backyp"})
+	err = cmdLocal(t.Context(), processEnv(), []string{"backyp"})
 	if err == nil {
 		t.Fatal("an unknown local subcommand succeeded")
 	}

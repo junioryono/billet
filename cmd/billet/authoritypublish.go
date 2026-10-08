@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
+
+	"github.com/junioryono/billet/internal/cli"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
@@ -34,7 +35,7 @@ func authorityLockAccess(ctx context.Context, dir string) (func() error, error) 
 // host is complete and irreversible. Returning an error would tell an operator
 // their rotation failed when it did not; what they need is the one command that
 // finishes the job.
-func publishRotatedAuthority(ctx context.Context, cfg *config.Config, deployment string) {
+func publishRotatedAuthority(ctx context.Context, env cli.Env, cfg *config.Config, deployment string) {
 	store := app.AuthorityStoreFor(cfg)
 	if store == nil {
 		return
@@ -46,12 +47,12 @@ func publishRotatedAuthority(ctx context.Context, cfg *config.Config, deployment
 		return wireshare.Publish(ctx, store, dir, deployment)
 	})
 	if err == nil {
-		fmt.Println("Published the new authority to this deployment's identity store.")
+		fmt.Fprintln(env.Stdout, "Published the new authority to this deployment's identity store.")
 
 		return
 	}
 
-	fmt.Fprintf(os.Stderr,
+	fmt.Fprintf(env.Stderr,
 		"\nThis host is done, but publishing to the identity store failed:\n  %v\n\n"+
 			"The other controller cannot see this change until it is published. Fix the\n"+
 			"problem above and run:\n  billet ca sync --push\n", err)

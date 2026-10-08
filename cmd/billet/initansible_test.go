@@ -38,7 +38,7 @@ func TestEmitAnsibleWritesNothing(t *testing.T) {
 	path := filepath.Join(dir, "billet.yaml")
 
 	var initErr error
-	_ = capture(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+	_ = capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 	if initErr != nil {
 		t.Fatalf("init --emit ansible: %v", initErr)
 	}
@@ -88,7 +88,7 @@ func TestEmitAnsibleLeavesAnExistingConfigAlone(t *testing.T) {
 		)
 
 		out = capture(t, func() {
-			initErr = cmdInit(t.Context(), append(emitAnsibleArgs(path), extra...))
+			initErr = cmdInit(t.Context(), processEnv(), append(emitAnsibleArgs(path), extra...))
 		})
 		if initErr != nil {
 			t.Fatalf("init --emit ansible %v: %v", extra, initErr)
@@ -157,7 +157,7 @@ func TestEmitAnsibleStdoutIsOnlyTheBlock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
 	var initErr error
-	out := capture(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+	out := capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 	if initErr != nil {
 		t.Fatalf("init --emit ansible: %v", initErr)
 	}
@@ -221,7 +221,7 @@ func TestEmitAnsibleDefaultsToTheServiceShape(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
 	var initErr error
-	out := capture(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+	out := capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 	if initErr != nil {
 		t.Fatalf("init --emit ansible: %v", initErr)
 	}
@@ -261,7 +261,7 @@ func TestEmitAnsibleDefaultsToTheServiceShape(t *testing.T) {
 func TestEmitAnsibleRefusesTheUserSessionShape(t *testing.T) {
 	asLinux(t)
 
-	err := cmdInit(t.Context(), append(emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
+	err := cmdInit(t.Context(), processEnv(), append(emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
 		"--profile", "local"))
 	if err == nil {
 		t.Fatal("--emit ansible --profile local was not refused")
@@ -276,7 +276,7 @@ func TestEmitAnsibleRefusesTheUserSessionShape(t *testing.T) {
 func TestEmitAnsibleRefusesAJoin(t *testing.T) {
 	asLinux(t)
 
-	err := cmdInit(t.Context(), append(emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
+	err := cmdInit(t.Context(), processEnv(), append(emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")),
 		"--join", "controller.example:7717"))
 	if err == nil {
 		t.Fatal("--emit ansible --join was not refused")
@@ -299,7 +299,7 @@ func TestEmitAnsibleOffLinuxNamesTheRemedy(t *testing.T) {
 	hostOS = "darwin"
 	t.Cleanup(func() { hostOS = prev })
 
-	err := cmdInit(t.Context(), emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")))
+	err := cmdInit(t.Context(), processEnv(), emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")))
 	if err == nil {
 		t.Fatal("an emission for another machine was not refused")
 	}
@@ -313,7 +313,7 @@ func TestEmitAnsibleOffLinuxNamesTheRemedy(t *testing.T) {
 // AN UNKNOWN --emit IS REFUSED BY NAME, before capacity detection or any live
 // AWS fetch — the same contract --profile and --listen already have.
 func TestEmitRefusesAnUnknownDestination(t *testing.T) {
-	err := cmdInit(t.Context(), []string{
+	err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--emit", "inventory",
 		"--runner-group", testTrialGroup,
@@ -377,7 +377,7 @@ func TestEmitAnsibleRefusesAnExplicitlyEmptyProfile(t *testing.T) {
 	t.Run("on linux it is the user-session shape, and refused", func(t *testing.T) {
 		asLinux(t)
 
-		err := cmdInit(t.Context(), append(
+		err := cmdInit(t.Context(), processEnv(), append(
 			emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")), "--profile="))
 		if err == nil {
 			t.Fatal("--profile= was accepted for an emission")
@@ -392,7 +392,7 @@ func TestEmitAnsibleRefusesAnExplicitlyEmptyProfile(t *testing.T) {
 		hostOS = "darwin"
 		t.Cleanup(func() { hostOS = prev })
 
-		err := cmdInit(t.Context(), append(
+		err := cmdInit(t.Context(), processEnv(), append(
 			emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")), "--profile="))
 		if err == nil {
 			t.Fatal("--profile= emitted for another machine")
@@ -435,7 +435,7 @@ func TestEmitAnsibleWillNotCarryAnIncompleteApp(t *testing.T) {
 			)
 
 			notes := captureStderr(t, func() {
-				out = capture(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+				out = capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 			})
 			if initErr != nil {
 				t.Fatalf("init --emit ansible: %v", initErr)
@@ -487,7 +487,7 @@ func TestEmitAnsibleSaysTheAppKeyHasToMove(t *testing.T) {
 	var initErr error
 
 	notes := captureStderr(t, func() {
-		_ = capture(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+		_ = capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 	})
 	if initErr != nil {
 		t.Fatalf("init --emit ansible: %v", initErr)
@@ -538,7 +538,7 @@ func TestEmitAnsibleCarriesTheRoleFlagsItsProviderNeeds(t *testing.T) {
 			var initErr error
 
 			out := capture(t, func() {
-				initErr = cmdInit(t.Context(), append(emitAnsibleArgs(path), tc.args...))
+				initErr = cmdInit(t.Context(), processEnv(), append(emitAnsibleArgs(path), tc.args...))
 			})
 			if initErr != nil {
 				t.Fatalf("init --emit ansible %v: %v", tc.args, initErr)
@@ -591,7 +591,7 @@ func TestEmitAnsibleKeepsParseErrorsOffStdout(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var initErr error
 
-			out := capture(t, func() { initErr = cmdInit(t.Context(), args) })
+			out := capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), args) })
 			if initErr == nil {
 				t.Fatal("the bad invocation was accepted")
 			}
@@ -646,7 +646,7 @@ func TestEmitAnsibleBootstrapCarriesTheFlagsThatWereUsed(t *testing.T) {
 	var initErr error
 
 	notes := captureStderr(t, func() {
-		_ = capture(t, func() { initErr = cmdInit(t.Context(), args) })
+		_ = capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), args) })
 	})
 	if initErr != nil {
 		t.Fatalf("init --emit ansible: %v", initErr)
@@ -851,7 +851,7 @@ func TestEmitAnsibleFailsLoudlyWhenStdoutCannotBeWritten(t *testing.T) {
 
 	var initErr error
 
-	notes := captureStderr(t, func() { initErr = cmdInit(t.Context(), emitAnsibleArgs(path)) })
+	notes := captureStderr(t, func() { initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(path)) })
 
 	os.Stdout = saved
 	_ = w.Close()
@@ -938,7 +938,7 @@ func TestNoIdentityGuidance(t *testing.T) {
 		}
 
 		// Exactly what `github-app create --config` does once GitHub answers.
-		if err := writeGitHubBlock(identity, githubBlock{
+		if err := writeGitHubBlock(processEnv(), identity, githubBlock{
 			Org: "acme", AppID: 7, InstallationID: 9,
 			PrivateKeyPath: filepath.Join(dir, "app-private-key.pem"),
 		}); err != nil {
@@ -948,7 +948,7 @@ func TestNoIdentityGuidance(t *testing.T) {
 		var initErr error
 
 		out := capture(t, func() {
-			initErr = cmdInit(t.Context(), emitAnsibleArgs(identity))
+			initErr = cmdInit(t.Context(), processEnv(), emitAnsibleArgs(identity))
 		})
 		if initErr != nil {
 			t.Fatalf("re-emitting against the identity file: %v", initErr)
@@ -1045,7 +1045,7 @@ func TestTheThirdPrintedCommandActuallyRuns(t *testing.T) {
 	}
 
 	// Step two's effect: what `github-app create --config` writes on success.
-	if err := writeGitHubBlock(identity, githubBlock{
+	if err := writeGitHubBlock(processEnv(), identity, githubBlock{
 		Org: "acme", AppID: 7, InstallationID: 9,
 		PrivateKeyPath: filepath.Join(dir, "app-private-key.pem"),
 	}); err != nil {
@@ -1090,7 +1090,7 @@ func TestTheThirdPrintedCommandActuallyRuns(t *testing.T) {
 
 	var initErr error
 
-	out := capture(t, func() { initErr = cmdInit(t.Context(), args) })
+	out := capture(t, func() { initErr = cmdInit(t.Context(), processEnv(), args) })
 	if initErr != nil {
 		t.Fatalf("the printed command does not run: %v\n  %s", initErr, printed)
 	}
@@ -1140,7 +1140,7 @@ func TestEmitAnsibleCanDescribeAnotherMachine(t *testing.T) {
 	// those lines went back to describing the emitting machine.
 	notes := captureStderr(t, func() {
 		out = capture(t, func() {
-			initErr = cmdInit(t.Context(), append(emitAnsibleArgs(path),
+			initErr = cmdInit(t.Context(), processEnv(), append(emitAnsibleArgs(path),
 				"--max-vcpu", "8", "--max-memory", "32GiB"))
 		})
 	})
@@ -1221,7 +1221,7 @@ func TestEmitAnsibleOffLinuxNamesBothRemedies(t *testing.T) {
 	hostOS = "darwin"
 	t.Cleanup(func() { hostOS = prev })
 
-	err := cmdInit(t.Context(), emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")))
+	err := cmdInit(t.Context(), processEnv(), emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")))
 	if err == nil {
 		t.Fatal("an emission for another machine was accepted with nothing declared")
 	}
@@ -1246,7 +1246,7 @@ func TestEmitAnsibleRefusesHalfADeclaration(t *testing.T) {
 		"only memory": {"--max-memory", "32GiB"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := cmdInit(t.Context(), append(
+			err := cmdInit(t.Context(), processEnv(), append(
 				emitAnsibleArgs(filepath.Join(t.TempDir(), "billet.yaml")), extra...))
 			if err == nil {
 				t.Fatal("half a declaration was accepted")

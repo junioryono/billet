@@ -676,7 +676,7 @@ func TestTheRecordedExecutableIsNeverRun(t *testing.T) {
 				t.Errorf("same-holder hold: %v", err)
 			}
 
-			_ = capture(t, func() { reportUpgradeStatus() })
+			_ = capture(t, func() { reportUpgradeStatus(processEnv()) })
 
 			if err := guardRun(t, "release", "--holder", "ci-1"); err != nil {
 				t.Errorf("release: %v", err)
@@ -756,7 +756,7 @@ func TestStatusReportsTheHostsOwnGuard(t *testing.T) {
 	cfgPath := writeCAConfig(t, stateDir)
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfgPath}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfgPath}); err != nil {
 			t.Errorf("status without a guard: %v", err)
 		}
 	})
@@ -768,7 +768,7 @@ func TestStatusReportsTheHostsOwnGuard(t *testing.T) {
 	mustHold(t, "ci-42")
 
 	out = capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfgPath}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfgPath}); err != nil {
 			t.Errorf("status with a guard: %v", err)
 		}
 	})
@@ -802,7 +802,7 @@ func TestCheckWarnsOnAGuardHeldPastADay(t *testing.T) {
 		guardNow = func() time.Time { return claimed.Add(c.age) }
 
 		out := capture(t, func() {
-			_, _ = runCheck(t.Context(), checkOptions{configPath: cfgPath, maintenanceProbe: true}) //nolint:errcheck // the verdict is not what this fixture reads; the printed guard line is
+			_, _ = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath, maintenanceProbe: true}) //nolint:errcheck // the verdict is not what this fixture reads; the printed guard line is
 		})
 
 		if !strings.Contains(out, c.want) {
@@ -821,7 +821,7 @@ func TestCheckWarnsOnAGuardHeldPastADay(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		_, _ = runCheck(t.Context(), checkOptions{configPath: cfgPath, maintenanceProbe: true}) //nolint:errcheck // the verdict is not what this fixture reads; the printed guard line is
+		_, _ = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath, maintenanceProbe: true}) //nolint:errcheck // the verdict is not what this fixture reads; the printed guard line is
 	})
 
 	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "not a time") {
@@ -1144,7 +1144,7 @@ func TestAJournalIsNeverReadThroughADisplacedRoot(t *testing.T) {
 		guardHook = displace(t, f.guardFixture, outside)
 
 		out := capture(t, func() {
-			if err := resumeHostUpgrade(t.Context(), f.cfg); err != nil {
+			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err != nil {
 				t.Errorf("a resume over a root displaced under its lock: %v", err)
 			}
 		})
@@ -1320,7 +1320,7 @@ func TestAClaimTargetIsExactlyOneChildOfTheRootByItsText(t *testing.T) {
 			target := f.root + spelling
 			mustOK(t, os.Symlink(target, f.active()))
 
-			err := resumeHostUpgrade(t.Context(), f.cfg)
+			err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg)
 			if err == nil || !strings.Contains(err.Error(), "is not a recovery directory in") {
 				t.Errorf("a resume over the target %q: err = %v, want the refusal naming the root", target, err)
 			}
@@ -1446,7 +1446,7 @@ func TestARecoveryDirectoryAndItsJournalAreJudgedBeforeTheyAreBelieved(t *testin
 
 			plant(t, recovery)
 
-			if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errTrustBoundary) {
+			if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errTrustBoundary) {
 				t.Errorf("a resume over %s: err = %v, want the trust boundary", name, err)
 			}
 
@@ -1522,7 +1522,7 @@ func TestATrustedJournalTakesAResumeToTheBarrier(t *testing.T) {
 	writeJournalFixture(t, recovery, "claimed")
 	mustOK(t, os.Symlink(recovery, f.active()))
 
-	if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errStoppedAtTheBarrier) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errStoppedAtTheBarrier) {
 		t.Fatalf("a resume over a trusted journal: err = %v, want the barrier's", err)
 	}
 

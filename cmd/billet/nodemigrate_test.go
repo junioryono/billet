@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -309,17 +310,16 @@ func (o endpointOut) boolean(key string) bool { return asBool(o.doc[key]) }
 
 // runEndpoint runs one of the endpoint commands with the rendering on stdin
 // and decodes its answer.
-func runEndpoint(t *testing.T, fn func(context.Context, []string) error, stdin string, args ...string) endpointOut {
+func runEndpoint(t *testing.T, fn func(context.Context, cli.Env, []string) error, stdin string, args ...string) endpointOut {
 	t.Helper()
 
-	prev := renderingStdin
-	renderingStdin = strings.NewReader(stdin)
+	var stdout bytes.Buffer
 
-	t.Cleanup(func() { renderingStdin = prev })
+	env := processEnv()
+	env.Stdout, env.Stdin = &stdout, strings.NewReader(stdin)
 
-	var err error
-
-	out := capture(t, func() { err = fn(t.Context(), append(args, "--json")) })
+	err := fn(t.Context(), env, append(args, "--json"))
+	out := stdout.String()
 
 	o := endpointOut{err: err, raw: out}
 	if err != nil {

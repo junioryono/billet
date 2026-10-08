@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -31,16 +30,16 @@ var (
 	openRefreshStore = func(cfg *config.Config) (refreshStore, error) {
 		return ceph.New(*cfg.Node.Ceph)
 	}
-	fetchImageManifest = func(ctx context.Context, cfg *config.Config) (*imagesource.Manifest, error) {
-		manifest, _, err := resolveImageManifest(ctx, cfg, stageOptions{})
+	fetchImageManifest = func(ctx context.Context, env cli.Env, cfg *config.Config) (*imagesource.Manifest, error) {
+		manifest, _, err := resolveImageManifest(ctx, env, cfg, stageOptions{})
 
 		return manifest, err
 	}
-	refreshPull = func(ctx context.Context, cfgPath, image string) error {
-		return cmdImagesPull(ctx, []string{"--config", cfgPath, "--verify", image})
+	refreshPull = func(ctx context.Context, env cli.Env, cfgPath, image string) error {
+		return cmdImagesPull(ctx, env, []string{"--config", cfgPath, "--verify", image})
 	}
-	refreshReap = func(ctx context.Context, cfgPath, image string, keep int) error {
-		return cmdImagesReap(ctx, []string{"--config", cfgPath, "--keep", strconv.Itoa(keep),
+	refreshReap = func(ctx context.Context, env cli.Env, cfgPath, image string, keep int) error {
+		return cmdImagesReap(ctx, env, []string{"--config", cfgPath, "--keep", strconv.Itoa(keep),
 			image})
 	}
 )
@@ -64,8 +63,8 @@ var (
 // newest verified generations per guest contract, which is what the
 // documentation has always used as its example; it never removes what a tier
 // pins or a job is booting.
-func cmdImagesRefresh(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images refresh", os.Stdout)
+func cmdImagesRefresh(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images refresh", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3, "how many verified generations to leave per guest contract "+
 		"after a pull; 0 reaps nothing")
@@ -85,14 +84,14 @@ func cmdImagesRefresh(ctx context.Context, args []string) error {
 	// so this runs daily where nothing boots a guest; a red unit there would be a
 	// standing false alarm.
 	if cfg.Node == nil {
-		fmt.Printf("this host has no node section, so nothing here boots a guest image; " +
+		fmt.Fprintf(env.Stdout, "this host has no node section, so nothing here boots a guest image; "+
 			"nothing to do.\n")
 
 		return nil
 	}
 
 	if !cfg.Release.AutomaticUpdates() {
-		fmt.Printf("release.automatic is false, so guest images are left to an operator; " +
+		fmt.Fprintf(env.Stdout, "release.automatic is false, so guest images are left to an operator; "+
 			"nothing to do.\n")
 
 		return nil
@@ -106,19 +105,19 @@ func cmdImagesRefresh(ctx context.Context, args []string) error {
 		// have changed is a decision a person makes. What it does is make sure
 		// every configured image is present.
 		if *dryRun {
-			fmt.Printf("a tart node pulls only images that are absent; nothing is " +
+			fmt.Fprintf(env.Stdout, "a tart node pulls only images that are absent; nothing is "+
 				"compared against a channel\n")
 
 			return nil
 		}
 
-		return pullTartImages(ctx, cfg, "")
+		return pullTartImages(ctx, env, cfg, "")
 
 	case config.ProviderFirecracker:
-		return refreshFirecrackerImages(ctx, cfg, *cfgPath, *keep, *dryRun)
+		return refreshFirecrackerImages(ctx, env, cfg, *cfgPath, *keep, *dryRun)
 
 	default:
-		fmt.Printf("a %s node boots no image billet publishes; nothing to do.\n",
+		fmt.Fprintf(env.Stdout, "a %s node boots no image billet publishes; nothing to do.\n",
 			cfg.Node.Provider)
 
 		return nil
@@ -127,7 +126,7 @@ func cmdImagesRefresh(ctx context.Context, args []string) error {
 
 // refreshFirecrackerImages compares each configured image against the channel
 // and takes up the ones the channel has moved past.
-func refreshFirecrackerImages(ctx context.Context, cfg *config.Config, cfgPath string,
+func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string,
 	keep int, dryRun bool,
 ) error {
 	if cfg.Node.Ceph == nil {
@@ -141,12 +140,12 @@ func refreshFirecrackerImages(ctx context.Context, cfg *config.Config, cfgPath s
 	}
 
 	if len(configured) == 0 {
-		fmt.Printf("no firecracker tier on this node names an image; nothing to do.\n")
+		fmt.Fprintf(env.Stdout, "no firecracker tier on this node names an image; nothing to do.\n")
 
 		return nil
 	}
 
-	manifest, err := fetchImageManifest(ctx, cfg)
+	manifest, err := fetchImageManifest(ctx, env, cfg)
 	if err != nil {
 		return err
 	}
@@ -172,20 +171,20 @@ func refreshFirecrackerImages(ctx context.Context, cfg *config.Config, cfgPath s
 		}
 
 		if !due {
-			fmt.Printf("%-24s up to date: %s\n", image, why)
+			fmt.Fprintf(env.Stdout, "%-24s up to date: %s\n", image, why)
 
 			continue
 		}
 
 		if dryRun {
-			fmt.Printf("%-24s would pull: %s\n", image, why)
+			fmt.Fprintf(env.Stdout, "%-24s would pull: %s\n", image, why)
 
 			continue
 		}
 
-		fmt.Printf("%-24s pulling: %s\n", image, why)
+		fmt.Fprintf(env.Stdout, "%-24s pulling: %s\n", image, why)
 
-		if err := refreshPull(ctx, cfgPath, image); err != nil {
+		if err := refreshPull(ctx, env, cfgPath, image); err != nil {
 			// NO REAP AFTER A FAILED PULL. Reaping is bounded by what exists, and
 			// a pull that failed partway left nothing new; running it anyway would
 			// be a cleanup nobody asked for on a day something else went wrong.
@@ -195,7 +194,7 @@ func refreshFirecrackerImages(ctx context.Context, cfg *config.Config, cfgPath s
 		}
 
 		if keep > 0 {
-			if err := refreshReap(ctx, cfgPath, image, keep); err != nil {
+			if err := refreshReap(ctx, env, cfgPath, image, keep); err != nil {
 				problems = append(problems, fmt.Errorf("reap %s after its refresh: %w", image, err))
 			}
 		}

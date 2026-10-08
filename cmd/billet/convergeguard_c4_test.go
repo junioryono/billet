@@ -399,7 +399,7 @@ func TestATakeoverProvesTheRolesTransactionCompleteWithoutLoadingIt(t *testing.T
 		plantRoleJournal(t, recovery, roleManifestFixture(t))
 		mustOK(t, os.Symlink(recovery, g.active()))
 
-		err := resumeHostUpgrade(t.Context(), g.cfg)
+		err := resumeHostUpgrade(t.Context(), processEnv(), g.cfg)
 		if !errors.Is(err, errRoleJournal) {
 			t.Fatalf("a resume over a role journal: err = %v, want the role's refusal", err)
 		}

@@ -48,7 +48,7 @@ func shortKernelLockWait(t *testing.T) {
 func heldKernelLock(t *testing.T, dir string) *kernelLock {
 	t.Helper()
 
-	lock, err := takeKernelDirLock(t.Context(), dir, "hold it for this test")
+	lock, err := takeKernelDirLock(t.Context(), processEnv(), dir, "hold it for this test")
 	if err != nil {
 		t.Fatalf("takeKernelDirLock(%s): %v", dir, err)
 	}
@@ -104,7 +104,7 @@ func TestASecondKernelCollectionWaitsAndThenSaysWhatHasTheLock(t *testing.T) {
 	dir := t.TempDir()
 	held := heldKernelLock(t, dir)
 
-	second, err := takeKernelDirLock(t.Context(), dir, "collect kernels")
+	second, err := takeKernelDirLock(t.Context(), processEnv(), dir, "collect kernels")
 	if err == nil {
 		if releaseErr := second.release(); releaseErr != nil {
 			t.Errorf("release the second lock: %v", releaseErr)
@@ -139,7 +139,7 @@ func TestASecondKernelCollectionWaitsAndThenSaysWhatHasTheLock(t *testing.T) {
 		t.Fatalf("release the first lock: %v", err)
 	}
 
-	after, err := takeKernelDirLock(t.Context(), dir, "collect kernels")
+	after, err := takeKernelDirLock(t.Context(), processEnv(), dir, "collect kernels")
 	if err != nil {
 		t.Fatalf("the lock stayed held after it was released: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestTheKernelDirectoryLockRefusesASymlinkedLockFile(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	lock, err := takeKernelDirLock(t.Context(), dir, "collect kernels")
+	lock, err := takeKernelDirLock(t.Context(), processEnv(), dir, "collect kernels")
 	if err == nil {
 		if releaseErr := lock.release(); releaseErr != nil {
 			t.Errorf("release: %v", releaseErr)
@@ -207,7 +207,7 @@ func TestTheKernelDirectoryLockStopsWaitingWhenItsCallerDoes(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := takeKernelDirLock(ctx, dir, "collect kernels")
+	_, err := takeKernelDirLock(ctx, processEnv(), dir, "collect kernels")
 	if err == nil {
 		t.Fatal("a cancelled caller took the lock somebody else was holding")
 	}
@@ -246,7 +246,7 @@ func TestTheKernelDirectoryLockIsNotHandedToACallerWithNoBudgetLeft(t *testing.T
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	lock, err := takeKernelDirLock(ctx, dir, "collect kernels")
+	lock, err := takeKernelDirLock(ctx, processEnv(), dir, "collect kernels")
 	if err == nil {
 		if releaseErr := lock.release(); releaseErr != nil {
 			t.Errorf("release: %v", releaseErr)
@@ -274,7 +274,7 @@ func TestTheKernelDirectoryLockIsNotHandedToACallerWithNoBudgetLeft(t *testing.T
 	// AND THE LOCK IS NOT LEFT HELD. It was taken before the budget was checked, so a
 	// refusal that forgot to give it back would wedge every later pull and reap on
 	// this host until the process exited.
-	after, err := takeKernelDirLock(t.Context(), dir, "collect kernels")
+	after, err := takeKernelDirLock(t.Context(), processEnv(), dir, "collect kernels")
 	if err != nil {
 		t.Fatalf("the refused acquisition kept the lock: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestTwoKernelDirectoriesDoNotContend(t *testing.T) {
 // is the sink re-applying an invariant its callers already hold; state.LockDeployment
 // and takeProbeLock check the same thing in the same place for the same reason.
 func TestTheKernelDirectoryLockRefusesAnEmptyDirectory(t *testing.T) {
-	_, err := takeKernelDirLock(t.Context(), "", "collect kernels")
+	_, err := takeKernelDirLock(t.Context(), processEnv(), "", "collect kernels")
 	if err == nil {
 		t.Fatal("the kernel directory lock accepted an empty directory, which puts the file " +
 			"it locks wherever the command was run from")

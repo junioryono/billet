@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
@@ -161,8 +163,8 @@ func appKeyFilePaths(cfg *config.Config) []string {
 // Read on a goroutine so the context still wins. fmt.Scanln does not observe
 // cancellation, so a Ctrl-C at the prompt would otherwise cancel ctx and leave
 // the process blocked on stdin.
-func confirmTarget(ctx context.Context, path string) error {
-	fmt.Printf("\nType the target (%s) to confirm: ", path)
+func confirmTarget(ctx context.Context, env cli.Env, path string) error {
+	fmt.Fprintf(env.Stdout, "\nType the target (%s) to confirm: ", path)
 
 	typed := make(chan string, 1)
 	failed := make(chan error, 1)
@@ -181,7 +183,7 @@ func confirmTarget(ctx context.Context, path string) error {
 
 	select {
 	case <-ctx.Done():
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		return ctx.Err()
 	case err := <-failed:

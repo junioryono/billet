@@ -432,8 +432,8 @@ func boundedFirst(decompressed *countingReader, path string, err error) error {
 // entry for this platform — and parsing JSON in POSIX shell to decide something
 // this load-bearing is how a half-check that looks like a check gets written. So
 // the shell downloads and this decides.
-func cmdReleaseRecord(_ context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet release record", os.Stdout)
+func cmdReleaseRecord(_ context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet release record", env.Stdout)
 	manifestPath := fs.String("manifest", "", "the release manifest this install came from")
 	archivePath := fs.String("archive", "", "the archive the binary was extracted from")
 	binaryPath := fs.String("binary", "", "the installed binary the record will describe")
@@ -583,7 +583,7 @@ func cmdReleaseRecord(_ context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Recorded that %s came from manifest %s.\n", manifest.Version, digest)
+	fmt.Fprintf(env.Stdout, "Recorded that %s came from manifest %s.\n", manifest.Version, digest)
 
 	return nil
 }

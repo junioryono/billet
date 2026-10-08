@@ -142,7 +142,7 @@ func TestDownSealsWaitsThenStopsTheNodeBeforeTheServer(t *testing.T) {
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("an idle host was refused: %v", err)
 		}
 	})
@@ -196,7 +196,7 @@ func TestDownStopsNothingWhileAJobIsStillRunning(t *testing.T) {
 
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath, timeout: time.Second})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, timeout: time.Second})
 	if err == nil {
 		t.Fatal("a host with a job still running was taken down")
 	}
@@ -232,7 +232,7 @@ func TestDownOnANodeOnlyHostSaysItCannotSealAndNamesTheRemedy(t *testing.T) {
 	f := stageDown(t, &fakeConverger{}, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("a node-only host was refused: %v", err)
 		}
 	})
@@ -274,7 +274,7 @@ func TestDownRefusesAUnitRunningADifferentBuild(t *testing.T) {
 	}}
 	stageDown(t, f)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	if err == nil {
 		t.Fatal("a unit running a different build was stopped without being asked twice")
 	}
@@ -315,7 +315,7 @@ func TestDownForceStopsAUnitRunningADifferentBuild(t *testing.T) {
 	}
 
 	capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath, force: true}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, force: true}); err != nil {
 			t.Errorf("--force was refused: %v", err)
 		}
 	})
@@ -365,7 +365,7 @@ func TestDownStopsNothingIfAdmissionMovedWhileItWasGettingReady(t *testing.T) {
 	// assertion that nothing was stopped could not fail. Adversarial review found
 	// it; it is the shape billet-testing calls "proving the mechanism is not
 	// proving it is USED", one argument over.
-	err = stopAndDisable(t.Context(), f, cfg, req, sealed.Generation, false)
+	err = stopAndDisable(t.Context(), processEnv(), f, cfg, req, sealed.Generation, false)
 	if err == nil {
 		t.Fatal("a host whose admission moved underneath the drain was stopped anyway")
 	}
@@ -388,7 +388,7 @@ func TestDownDryRunSealsNothingAndStopsNothing(t *testing.T) {
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath, dryRun: true}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath, dryRun: true}); err != nil {
 			t.Errorf("dry run: %v", err)
 		}
 	})
@@ -424,7 +424,7 @@ func TestDownLeavesAnOperatorSealAlone(t *testing.T) {
 	stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	out := capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("down: %v", err)
 		}
 	})
@@ -457,7 +457,7 @@ func TestUpClearsAShutdownSeal(t *testing.T) {
 	stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
 	out := capture(t, func() {
-		if err := runLocalUp(t.Context(), upOptions{
+		if err := runLocalUp(t.Context(), processEnv(), upOptions{
 			configPath: cfgPath, servicePath: cfgPath,
 		}); err != nil {
 			t.Errorf("up: %v", err)
@@ -494,7 +494,7 @@ func TestUpLeavesAnOperatorSealAloneAndSaysSo(t *testing.T) {
 	stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
 	out := capture(t, func() {
-		if err := runLocalUp(t.Context(), upOptions{
+		if err := runLocalUp(t.Context(), processEnv(), upOptions{
 			configPath: cfgPath, servicePath: cfgPath,
 		}); err != nil {
 			t.Errorf("up: %v", err)
@@ -545,7 +545,7 @@ func TestAFailedStopSaysWhatIsStoppedAndWhatComesBackAtBoot(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {
@@ -595,7 +595,7 @@ func TestDownDisablesNothingWhenAUnitWillNotStop(t *testing.T) {
 	}
 	stageDown(t, f, deploy.ServerUnitName, deploy.NodeUnitName)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	if err == nil {
 		t.Fatal("a down whose unit would not stop reported success")
 	}
@@ -651,7 +651,7 @@ func TestAFailedStopReportsAdmissionAsItFindsIt(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {
@@ -699,7 +699,7 @@ func TestDownRefusesToSealOverAnUnreadableAdmissionRow(t *testing.T) {
 
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	if err == nil {
 		t.Fatal("a down sealed over an admission row billet cannot read")
 	}
@@ -758,7 +758,7 @@ func TestUpExitsNonZeroWhenItCannotReopenAdmission(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalUp(t.Context(), upOptions{configPath: cfgPath, servicePath: cfgPath})
+		err = runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfgPath, servicePath: cfgPath})
 	})
 
 	if err == nil {
@@ -813,7 +813,7 @@ func TestDownRefusesToGoOnWhenAStopIsNotProved(t *testing.T) {
 			}}
 			stageDown(t, f, deploy.ServerUnitName, deploy.NodeUnitName)
 
-			err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+			err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 			if err == nil {
 				t.Fatal("a host whose node was not proved stopped was reported down")
 			}
@@ -898,7 +898,7 @@ func TestDownRefusesAServiceItCannotTellIsRunning(t *testing.T) {
 			}}
 			stageDown(t, f, deploy.ServerUnitName, deploy.NodeUnitName)
 
-			err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+			err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 
 			switch {
 			case tc.refuse && err == nil:
@@ -946,7 +946,7 @@ func TestDownRefusesWhenStoppingOneUnitStopsTheOther(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {
@@ -990,7 +990,7 @@ func TestDownRefusesWhenDisablingOneUnitDisablesTheOther(t *testing.T) {
 	}
 	stageDown(t, f, deploy.NodeUnitName)
 
-	err := runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+	err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	if err == nil {
 		t.Fatal("disabling the node also disabled the server and the command reported success")
 	}
@@ -1021,7 +1021,7 @@ func TestDownIsNotRefusedForDisablingUnitsItPlannedToDisable(t *testing.T) {
 	stageDown(t, f, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("a two-role down was refused for disabling both units: %v", err)
 		}
 	})
@@ -1050,7 +1050,7 @@ func TestAStopThatFailsAfterDisturbingTheOtherUnitStillReportsIt(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {
@@ -1087,7 +1087,7 @@ func TestADisableThatFailsAfterRemovingLinksReportsWhatIsTrue(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {
@@ -1133,7 +1133,7 @@ func TestTheComesBackAtBootWarningNamesOnlyUnitsThatActuallyDo(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = runLocalDown(t.Context(), downOptions{configPath: cfgPath})
+		err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath})
 	})
 
 	if err == nil {

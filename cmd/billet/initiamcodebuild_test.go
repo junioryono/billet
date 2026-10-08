@@ -25,7 +25,7 @@ func TestTheKMSKeyARNFlagReachesTheCodeBuildPolicy(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, "alias/billet-jit")
 
 	out := capture(t, func() {
-		if err := printCodeBuildIAM(cfg, false, keyARN, testAccount); err != nil {
+		if err := printCodeBuildIAM(processEnv(), cfg, false, keyARN, testAccount); err != nil {
 			t.Fatalf("printCodeBuildIAM: %v", err)
 		}
 	})
@@ -49,7 +49,7 @@ func TestABareKMSKeyWithoutTheFlagIsRefused(t *testing.T) {
 	for _, key := range []string{"alias/billet-jit", "11111111-2222-3333-4444-555555555555"} {
 		cfg := codeBuildIAMConfig(t, key)
 
-		err := printCodeBuildIAM(cfg, false, "", testAccount)
+		err := printCodeBuildIAM(processEnv(), cfg, false, "", testAccount)
 		if err == nil {
 			t.Errorf("jit_kms_key_id %q produced a policy with no KMS grant, which applies "+
 				"cleanly and then fails every build's decryption", key)
@@ -94,7 +94,7 @@ func TestTheKMSRemedyIsSafeForBothPrincipals(t *testing.T) {
 	for _, buildRole := range []bool{false, true} {
 		cfg := codeBuildIAMConfig(t, "alias/billet-jit")
 
-		err := printCodeBuildIAM(cfg, buildRole, "", testAccount)
+		err := printCodeBuildIAM(processEnv(), cfg, buildRole, "", testAccount)
 		if err == nil {
 			t.Fatalf("buildRole=%v: a bare alias produced a policy with no KMS grant", buildRole)
 		}
@@ -139,7 +139,7 @@ func TestTheKMSRemedyQuotesTheConfiguredKey(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := codeBuildIAMConfig(t, key)
 
-			err := printCodeBuildIAM(cfg, false, "", testAccount)
+			err := printCodeBuildIAM(processEnv(), cfg, false, "", testAccount)
 			if err == nil {
 				t.Fatal("a bare alias produced a policy with no KMS grant")
 			}
@@ -228,7 +228,7 @@ func commandLineIn(t *testing.T, message, prefix string) string {
 func TestTheKMSKeyARNFlagWithoutAConfiguredKeyIsRefused(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, "")
 
-	err := printCodeBuildIAM(cfg, false,
+	err := printCodeBuildIAM(processEnv(), cfg, false,
 		"arn:aws:kms:us-west-2:000000000000:key/11111111-2222-3333-4444-555555555555",
 		testAccount)
 	if err == nil {
@@ -250,7 +250,7 @@ func TestAFullKMSARNInTheConfigNeedsNoFlag(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, keyARN)
 
 	out := capture(t, func() {
-		if err := printCodeBuildIAM(cfg, false, "", testAccount); err != nil {
+		if err := printCodeBuildIAM(processEnv(), cfg, false, "", testAccount); err != nil {
 			t.Fatalf("printCodeBuildIAM: %v", err)
 		}
 	})
@@ -271,7 +271,7 @@ func TestTheBuildRolePolicyNamesADerivedLogGroup(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, "")
 
 	out := capture(t, func() {
-		if err := printCodeBuildIAM(cfg, true, "", testAccount); err != nil {
+		if err := printCodeBuildIAM(processEnv(), cfg, true, "", testAccount); err != nil {
 			t.Fatalf("printCodeBuildIAM: %v", err)
 		}
 	})
@@ -312,7 +312,7 @@ func TestTheControllerSweepPolicyListsAndDeletesUnderThePath(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, "")
 
 	out := capture(t, func() {
-		if err := printCodeBuildSweepIAM(cfg, false, "", testAccount); err != nil {
+		if err := printCodeBuildSweepIAM(processEnv(), cfg, false, "", testAccount); err != nil {
 			t.Fatalf("printCodeBuildSweepIAM: %v", err)
 		}
 	})
@@ -335,15 +335,15 @@ func TestTheControllerSweepPolicyListsAndDeletesUnderThePath(t *testing.T) {
 	}
 
 	// AND IT REFUSES TO DESCRIBE TWO PRINCIPALS AT ONCE, or a key it has no use for.
-	if err := printCodeBuildSweepIAM(cfg, true, "", testAccount); err == nil {
+	if err := printCodeBuildSweepIAM(processEnv(), cfg, true, "", testAccount); err == nil {
 		t.Error("--controller-sweep with --build-role printed a policy for two principals")
 	}
 
-	if err := printCodeBuildSweepIAM(cfg, false, "arn:aws:kms:us-west-2:"+testAccount+":key/k", testAccount); err == nil {
+	if err := printCodeBuildSweepIAM(processEnv(), cfg, false, "arn:aws:kms:us-west-2:"+testAccount+":key/k", testAccount); err == nil {
 		t.Error("--controller-sweep with --kms-key-arn printed a grant the sweep cannot use")
 	}
 
-	if err := printCodeBuildSweepIAM(cfg, false, "", ""); err == nil {
+	if err := printCodeBuildSweepIAM(processEnv(), cfg, false, "", ""); err == nil {
 		t.Error("--controller-sweep without --account printed a policy with no account to scope to")
 	}
 }
@@ -368,7 +368,7 @@ func TestTheCodeBuildIAMCommandRefusesWithoutAnAccount(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := codeBuildIAMConfig(t, "")
 
-			err := printCodeBuildIAM(cfg, false, "", account)
+			err := printCodeBuildIAM(processEnv(), cfg, false, "", account)
 			if err == nil {
 				t.Fatalf("--account %q was accepted; it lands in an IAM Resource", account)
 			}
@@ -385,7 +385,7 @@ func TestTheCodeBuildIAMCommandRefusesWithoutAnAccount(t *testing.T) {
 	cfg := codeBuildIAMConfig(t, "")
 
 	out := capture(t, func() {
-		if err := printCodeBuildIAM(cfg, false, "", testAccount); err != nil {
+		if err := printCodeBuildIAM(processEnv(), cfg, false, "", testAccount); err != nil {
 			t.Fatalf("printCodeBuildIAM: %v", err)
 		}
 	})

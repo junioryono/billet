@@ -87,16 +87,16 @@ func TestTheSystemdHostLowersTheWatermarkOnlyWhenTheJournalSaysSo(t *testing.T) 
 
 	cfg := &config.Config{}
 
-	plain := newSystemdHost(cfg, "", "/staged/billet", &hostupgrade.Journal{ToVersion: "v0.4.0"})
+	plain := newSystemdHost(processEnv(), cfg, "", "/staged/billet", &hostupgrade.Journal{ToVersion: "v0.4.0"})
 	if plain.downgradeTo != "" {
 		t.Errorf("a journal without the flag set downgradeTo = %q", plain.downgradeTo)
 	}
 
-	if none := newSystemdHost(cfg, "", "/staged/billet", nil); none.downgradeTo != "" {
+	if none := newSystemdHost(processEnv(), cfg, "", "/staged/billet", nil); none.downgradeTo != "" {
 		t.Errorf("no journal set downgradeTo = %q", none.downgradeTo)
 	}
 
-	asked := newSystemdHost(cfg, "", "/staged/billet",
+	asked := newSystemdHost(processEnv(), cfg, "", "/staged/billet",
 		&hostupgrade.Journal{FromVersion: "v0.5.0", ToVersion: "v0.4.0", AllowDowngrade: true})
 	if asked.downgradeTo != "v0.4.0" {
 		t.Errorf("a journal with the flag set downgradeTo = %q, want v0.4.0", asked.downgradeTo)
@@ -110,7 +110,7 @@ func TestTheSystemdHostLowersTheWatermarkOnlyWhenTheJournalSaysSo(t *testing.T) 
 		"the same":       {FromVersion: "v0.5.0", ToVersion: "v0.5.0", AllowDowngrade: true},
 		"could not tell": {FromVersion: "(devel)", ToVersion: "v0.4.0", AllowDowngrade: true},
 	} {
-		if h := newSystemdHost(cfg, "", "/staged/billet", j); h.downgradeTo != "" {
+		if h := newSystemdHost(processEnv(), cfg, "", "/staged/billet", j); h.downgradeTo != "" {
 			t.Errorf("%s with the flag set downgradeTo = %q", name, h.downgradeTo)
 		}
 	}
@@ -162,12 +162,12 @@ func TestTheDowngradeCheckPrecedesTheClaim(t *testing.T) {
 func TestTheHostKnowsWhetherItsLedgerIsExternal(t *testing.T) {
 	t.Parallel()
 
-	local := newSystemdHost(&config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet", nil)
+	local := newSystemdHost(processEnv(), &config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet", nil)
 	if local.external {
 		t.Error("a SQLite control plane read as an external ledger")
 	}
 
-	postgres := newSystemdHost(&config.Config{Server: &config.ServerConfig{
+	postgres := newSystemdHost(processEnv(), &config.Config{Server: &config.ServerConfig{
 		State: &config.StateConfig{Backend: config.StatePostgres},
 	}}, "", "/staged/billet", nil)
 	if !postgres.external {
@@ -213,14 +213,14 @@ func TestTheMarkIsLoweredBeforeTheCandidateIsProbed(t *testing.T) {
 
 	journal := &hostupgrade.Journal{FromVersion: "v0.5.0", ToVersion: "v0.4.0", AllowDowngrade: true}
 
-	external := newSystemdHost(&config.Config{Server: &config.ServerConfig{
+	external := newSystemdHost(processEnv(), &config.Config{Server: &config.ServerConfig{
 		State: &config.StateConfig{Backend: config.StatePostgres},
 	}}, "", "/staged/billet", journal)
 	if err := external.ProbeReady(t.Context()); err != nil {
 		t.Fatalf("ProbeReady on an external ledger: %v", err)
 	}
 
-	local := newSystemdHost(&config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet",
+	local := newSystemdHost(processEnv(), &config.Config{Server: &config.ServerConfig{}}, "", "/staged/billet",
 		journal)
 	if err := local.Migrate(t.Context()); err != nil {
 		t.Fatalf("Migrate on a local ledger: %v", err)

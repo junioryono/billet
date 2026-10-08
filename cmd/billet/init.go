@@ -87,22 +87,22 @@ func checkEmit(e emitMode) error {
 // the thing no generator can merge for an operator. Both are right for what they
 // do, and for a while nothing said which was about to happen — so configEditRule
 // is the sentence both of them print.
-func cmdInit(ctx context.Context, args []string) error {
+func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 	// `billet init iam` is a sub-command: it does not write a config, it prints the
 	// IAM policy the written config's node needs. Peeled before flag parsing so its
 	// flags are its own.
 	if len(args) > 0 && args[0] == "iam" {
-		return cmdInitIAM(ctx, args[1:])
+		return cmdInitIAM(ctx, env, args[1:])
 	}
 
 	// `billet init hybrid` writes a DIRECTORY -- a Terraform root, an inventory
 	// with both hosts, a playbook, the collection pin and a runbook -- rather
 	// than one config, so it is its own command with its own flags.
 	if len(args) > 0 && args[0] == "hybrid" {
-		return cmdInitHybrid(ctx, args[1:])
+		return cmdInitHybrid(ctx, env, args[1:])
 	}
 
-	fs := cli.NewFlagSet("billet init", os.Stdout)
+	fs := cli.NewFlagSet("billet init", env.Stdout)
 
 	// A PARSE DIAGNOSTIC MUST NOT REACH AN APPENDED INVENTORY. newFlagSet sends
 	// help and errors to stdout deliberately, so `-h` stays pipeable — but for an
@@ -111,7 +111,7 @@ func cmdInit(ctx context.Context, args []string) error {
 	// destination is only known after parsing, so it is read from the raw args
 	// here; a wrong guess costs a diagnostic on the other stream and nothing else.
 	if wantsAnsibleEmission(args) {
-		fs.SetOutput(os.Stderr)
+		fs.SetOutput(env.Stderr)
 	}
 
 	cfgPath := addConfigFlag(fs)
@@ -267,9 +267,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	// inventory is the obvious use, and one NOTE landing in the middle of the
 	// YAML is a corrupted inventory whose cause is invisible in the file that
 	// broke.
-	notes := io.Writer(os.Stdout)
+	notes := env.Stdout
 	if emitValue == emitAnsible {
-		notes = os.Stderr
+		notes = env.Stderr
 	}
 
 	// THE BACKEND IS RESOLVED BEFORE THE EMISSION RULES, because two of those
@@ -887,7 +887,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		// CHECKED, because the intended use appends to a file. A full disk after
 		// part of the block was accepted would otherwise exit 0 over a corrupted
 		// inventory. This cannot un-append what landed; it makes the command say so.
-		if _, err := os.Stdout.WriteString(block); err != nil {
+		if _, err := io.WriteString(env.Stdout, block); err != nil {
 			return fmt.Errorf("write the %s block: %w", initconfig.AnsibleVar, err)
 		}
 
@@ -1025,7 +1025,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		// ATOMIC over the live path: a truncating write here is a crash away
 		// from a deployment whose ONLY config is half a file. Staged beside,
 		// synced, renamed.
-		if err := commitConfig(writePath, final, mode); err != nil {
+		if err := commitConfig(env, writePath, final, mode); err != nil {
 			// THE DIRECTORY CAN ALREADY EXIST AND STILL NOT BE YOURS, in which
 			// case MkdirAll succeeded and this is where a stock Mac fails — with
 			// a bare permission error naming nothing an operator can act on.
@@ -1047,9 +1047,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	sayKeyMoved()
 
 	if writePath != *cfgPath {
-		fmt.Printf("Wrote %s — the existing %s was NOT touched.\n\n", writePath, *cfgPath)
+		fmt.Fprintf(env.Stdout, "Wrote %s — the existing %s was NOT touched.\n\n", writePath, *cfgPath)
 		report()
-		fmt.Printf("\nThe existing file carries content this command will not merge for you "+
+		fmt.Fprintf(env.Stdout, "\nThe existing file carries content this command will not merge for you "+
 			"(edited values, sites, extra tiers, or a different billet version's shape). "+
 			"Compare and merge deliberately:\n\n  diff -u %s %s\n\nThen move the merged "+
 			"result into place yourself.\n", shellArg(*cfgPath), shellArg(writePath))
@@ -1057,7 +1057,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		// A joined node has no App to create; the rest of its guidance is the
 		// same once the merged file is in place.
 		if joining {
-			printJoinNext(*cfgPath, params.Profile, joined, true)
+			printJoinNext(env, *cfgPath, params.Profile, joined, true)
 
 			return nil
 		}
@@ -1067,7 +1067,7 @@ func cmdInit(ctx context.Context, args []string) error {
 		// them, cannot read.
 		if params.Profile == initconfig.ProfileLocalService {
 			if account := initconfig.ServiceAccountFor(hostOS); account != "" {
-				fmt.Printf("After moving it into place: chown root:%s %s && chmod 0640 %s\n",
+				fmt.Fprintf(env.Stdout, "After moving it into place: chown root:%s %s && chmod 0640 %s\n",
 					account, shellArg(*cfgPath), shellArg(*cfgPath))
 			}
 
@@ -1076,8 +1076,8 @@ func cmdInit(ctx context.Context, args []string) error {
 			// holding a config the running services have not read — and on a Mac
 			// it was the whole of the output, because the chown above is the only
 			// other thing it said.
-			fmt.Printf("Then have the services read it:\n" +
-				"  billet local down --reason 'merged a regenerated config'\n" +
+			fmt.Fprintf(env.Stdout, "Then have the services read it:\n"+
+				"  billet local down --reason 'merged a regenerated config'\n"+
 				"  billet local up\n")
 		}
 
@@ -1085,30 +1085,30 @@ func cmdInit(ctx context.Context, args []string) error {
 		// commands in one sequence, and this branch is exactly where they find out
 		// that init leaves their config alone — so it is where the difference
 		// belongs, along with which of the two files the next command wants.
-		fmt.Printf("\n%s So when you create the App, point it at %s — the file the deployment "+
+		fmt.Fprintf(env.Stdout, "\n%s So when you create the App, point it at %s — the file the deployment "+
 			"reads — rather than at %s.\n", configEditRule, shellArg(*cfgPath), shellArg(writePath))
 
 		return nil
 	}
 
 	if converged {
-		fmt.Printf("Converged %s (it was pristine init output; nothing you wrote was lost)\n\n", *cfgPath)
+		fmt.Fprintf(env.Stdout, "Converged %s (it was pristine init output; nothing you wrote was lost)\n\n", *cfgPath)
 	} else {
-		fmt.Printf("Wrote %s\n\n", *cfgPath)
+		fmt.Fprintf(env.Stdout, "Wrote %s\n\n", *cfgPath)
 	}
 
 	if params.Profile == initconfig.ProfileLocalService {
-		serviceOwnership(*cfgPath)
+		serviceOwnership(env, *cfgPath)
 	}
 
 	report()
 	if joining {
-		printJoinNext(*cfgPath, params.Profile, joined, false)
+		printJoinNext(env, *cfgPath, params.Profile, joined, false)
 
 		return nil
 	}
-	warnIfListenBusy(ctx, params.Listen)
-	printInitNextFor(*cfgPath, params, trusted, carried)
+	warnIfListenBusy(ctx, env, params.Listen)
+	printInitNextFor(env, *cfgPath, params, trusted, carried)
 
 	return nil
 }
@@ -1116,20 +1116,20 @@ func cmdInit(ctx context.Context, args []string) error {
 // printJoinNext says what a joined node still needs once its config is
 // written: the control plane's half, its certificate bundle, and a start.
 // replaced is a config merged over one the services may already be running.
-func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult,
+func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, joined initconfig.JoinResult,
 	replaced bool,
 ) {
-	printJoinControlPlane(joined)
+	printJoinControlPlane(env, joined)
 
 	pathArg := shellArg(cfgPath)
 	step := 3
 
-	fmt.Printf("Then on this machine:\n\n")
-	fmt.Printf("  1. Install the certificate bundle the config's node.tls names — from " +
+	fmt.Fprintf(env.Stdout, "Then on this machine:\n\n")
+	fmt.Fprintf(env.Stdout, "  1. Install the certificate bundle the config's node.tls names — from "+
 		"`billet ca issue <name>` on the control plane, or the enrollment ceremony.\n")
-	fmt.Printf("  2. billet check --config %s\n", pathArg)
+	fmt.Fprintf(env.Stdout, "  2. billet check --config %s\n", pathArg)
 	if profile != initconfig.ProfileLocalService {
-		fmt.Printf("  3. billet node --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "  3. billet node --config %s\n", pathArg)
 
 		return
 	}
@@ -1142,37 +1142,37 @@ func printJoinNext(cfgPath string, profile initconfig.Profile, joined initconfig
 		raw, err := os.ReadFile(service)
 		switch {
 		case err != nil && !os.IsNotExist(err):
-			fmt.Printf("  3. Do NOT install it at %s yet: billet cannot read that file to rule "+
+			fmt.Fprintf(env.Stdout, "  3. Do NOT install it at %s yet: billet cannot read that file to rule "+
 				"out a live control plane (%v).\n", service, err)
 
 			return
 		case err == nil:
 			if refuse := refuseServerRemoval(service, raw); refuse != nil {
-				fmt.Printf("  3. Do NOT install it at %s yet: %v\n", service, refuse)
+				fmt.Fprintf(env.Stdout, "  3. Do NOT install it at %s yet: %v\n", service, refuse)
 
 				return
 			}
 		}
 
-		fmt.Printf("  3. Install the file where the services billet ships read it:\n")
-		fmt.Printf("       cp %s %s\n", pathArg, shellArg(service))
+		fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
+		fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, shellArg(service))
 		if account := initconfig.ServiceAccountFor(hostOS); account != "" {
-			fmt.Printf("       chown root:%s %s && chmod 0640 %s\n",
+			fmt.Fprintf(env.Stdout, "       chown root:%s %s && chmod 0640 %s\n",
 				account, shellArg(service), shellArg(service))
 		}
 		step = 4
 	}
 	if replaced {
-		fmt.Printf("  %d. billet local down --reason 'joined a control plane'\n", step)
+		fmt.Fprintf(env.Stdout, "  %d. billet local down --reason 'joined a control plane'\n", step)
 		step++
 	}
-	fmt.Printf("  %d. billet local up\n", step)
+	fmt.Fprintf(env.Stdout, "  %d. billet local up\n", step)
 }
 
 // printJoinControlPlane prints the half of a join that belongs in the control
 // plane's config.
-func printJoinControlPlane(joined initconfig.JoinResult) {
-	fmt.Printf("\nOn the control plane:\n\n%s\n", joined.ControlPlane)
+func printJoinControlPlane(env cli.Env, joined initconfig.JoinResult) {
+	fmt.Fprintf(env.Stdout, "\nOn the control plane:\n\n%s\n", joined.ControlPlane)
 }
 
 // existingGitHubBlock reads the App identity out of the file being replaced —
@@ -1281,11 +1281,11 @@ func configuredKeyPathOf(body string) string {
 // something already holds it — usually this deployment's own running server,
 // which an operator re-running init mid-flight should hear about now rather
 // than from a bind error at the next start.
-func warnIfListenBusy(ctx context.Context, listen string) {
+func warnIfListenBusy(ctx context.Context, env cli.Env, listen string) {
 	var lc net.ListenConfig
 	l, err := lc.Listen(ctx, "tcp", listen)
 	if err != nil {
-		fmt.Printf("NOTE: %s is already in use (likely a running billet server). The config "+
+		fmt.Fprintf(env.Stdout, "NOTE: %s is already in use (likely a running billet server). The config "+
 			"is written; a second server on this address will not start until the first "+
 			"stops, and a different --listen needs both ends regenerated.\n\n", listen)
 
@@ -1304,7 +1304,7 @@ func warnIfListenBusy(ctx context.Context, listen string) {
 // correct, it just cannot be read by a unit that also does not exist yet. The
 // note names the exact remedy instead of leaving a permission failure for
 // systemd to report later.
-func serviceOwnership(path string) {
+func serviceOwnership(env cli.Env, path string) {
 	// THERE IS NOTHING TO HAND OVER ON macOS. A launch agent runs as the operator
 	// who installed it, so the file they just wrote is already the one the
 	// service reads — and telling them to chown it to a `billet` group that does
@@ -1316,7 +1316,7 @@ func serviceOwnership(path string) {
 	grp, err := user.LookupGroup(initconfig.ServiceGroup)
 	if err == nil {
 		if gid, convErr := strconv.Atoi(grp.Gid); convErr == nil {
-			if err := os.Chown(path, -1, gid); err == nil { //nolint:gosec // path is the config file this command just wrote at the operator's own --config; handing it to the service group is the point
+			if err := os.Chown(path, -1, gid); err == nil { // path is the config file this command just wrote at the operator's own --config; handing it to the service group is the point
 				return
 			}
 		}
@@ -1325,7 +1325,7 @@ func serviceOwnership(path string) {
 	// The remedy covers the DIRECTORY too: when init created /etc/billet itself
 	// it is root:root 0750, and the billet group cannot traverse it no matter
 	// what mode the file has.
-	fmt.Printf("NOTE: could not set %s to group %s (the group the packaged billet-server "+
+	fmt.Fprintf(env.Stdout, "NOTE: could not set %s to group %s (the group the packaged billet-server "+
 		"unit reads it with). Install the billet package — its postinstall creates the user and "+
 		"group — or run `chown root:%s %s %s` before `billet local up`.\n\n",
 		path, initconfig.ServiceGroup, initconfig.ServiceGroup, filepath.Dir(path), path)
@@ -1398,63 +1398,63 @@ func refuseEmptyStateFlags(set map[string]bool, backend, dsnEnv string) error {
 // one. Without it the control plane starts, finds the variable empty, and
 // complains about a data source rather than about the step nobody was told to
 // take.
-func printStateNext(p initconfig.Params) {
+func printStateNext(env cli.Env, p initconfig.Params) {
 	if p.State == nil || p.State.Backend != config.StatePostgres {
 		return
 	}
 
-	fmt.Printf("\nThis config's ledger is in PostgreSQL, and the connection string is NAMED "+
+	fmt.Fprintf(env.Stdout, "\nThis config's ledger is in PostgreSQL, and the connection string is NAMED "+
 		"rather than written: billet reads it from $%s, because a DSN carries a password and a "+
 		"secret in this file ends up in a backup. Nothing starts until that variable is "+
 		"exported to the control plane.\n", p.State.DSNEnv)
 
 	if p.Profile == initconfig.ProfileLocalService {
-		fmt.Printf("\nFor the packaged unit, an EnvironmentFile is the place for it — the " +
-			"junioryono.billet.host role writes /etc/billet/server.env from " +
-			"billet_server_environment and names it in the unit it renders. Never a systemd " +
-			"drop-in: the transactional host upgrade refuses effective drop-ins it cannot " +
+		fmt.Fprintf(env.Stdout, "\nFor the packaged unit, an EnvironmentFile is the place for it — the "+
+			"junioryono.billet.host role writes /etc/billet/server.env from "+
+			"billet_server_environment and names it in the unit it renders. Never a systemd "+
+			"drop-in: the transactional host upgrade refuses effective drop-ins it cannot "+
 			"replace and recover.\n")
 	}
 
-	fmt.Printf("\nWhat billet needs of that database: a schema of its own (point the DSN's " +
-		"search_path at it), a role that can create tables in it, synchronous_commit not off " +
-		"— billet checks that at startup and refuses — and PostgreSQL 13 or later. No " +
+	fmt.Fprintf(env.Stdout, "\nWhat billet needs of that database: a schema of its own (point the DSN's "+
+		"search_path at it), a role that can create tables in it, synchronous_commit not off "+
+		"— billet checks that at startup and refuses — and PostgreSQL 13 or later. No "+
 		"extension.\n")
 
-	fmt.Printf("\nAnd `billet local backup` REFUSES the ledger on this profile. It archives " +
-		"server.identity_dir — the deployment identity, the node-wire CA and the App key — and " +
-		"a consistent copy of the database is pg_dump or your provider's snapshot, which is " +
+	fmt.Fprintf(env.Stdout, "\nAnd `billet local backup` REFUSES the ledger on this profile. It archives "+
+		"server.identity_dir — the deployment identity, the node-wire CA and the App key — and "+
+		"a consistent copy of the database is pg_dump or your provider's snapshot, which is "+
 		"yours to take. Restore the two halves from the same moment.\n")
 }
 
-func printInitNextFor(cfgPath string, p initconfig.Params, trusted, carried bool) {
+func printInitNextFor(env cli.Env, cfgPath string, p initconfig.Params, trusted, carried bool) {
 	if !carried {
-		printInitNext(cfgPath, p, trusted)
+		printInitNext(env, cfgPath, p, trusted)
 
 		return
 	}
 
-	printStateNext(p)
+	printStateNext(env, p)
 
 	pathArg := shellArg(cfgPath)
 
-	fmt.Printf("\nNext (the GitHub App identity was carried over — do not create it again):\n\n")
-	fmt.Printf("  1. Confirm the config, its host prerequisites and any runner-group policy:\n")
-	fmt.Printf("       billet check --config %s\n", pathArg)
+	fmt.Fprintf(env.Stdout, "\nNext (the GitHub App identity was carried over — do not create it again):\n\n")
+	fmt.Fprintf(env.Stdout, "  1. Confirm the config, its host prerequisites and any runner-group policy:\n")
+	fmt.Fprintf(env.Stdout, "       billet check --config %s\n", pathArg)
 	if p.Profile == initconfig.ProfileLocalService {
 		// A DRAIN AND A START, NOT A RESTART. `systemctl restart` does not exist
 		// on a Mac at all, and on Linux it skips both halves that matter: `down`
 		// seals admission and waits for the jobs already running rather than
 		// killing them, and `up` re-proves the App against the regenerated file
 		// before a control plane starts on somebody's organization.
-		fmt.Printf("  2. Drain the host and bring it back on the regenerated file:\n")
-		fmt.Printf("       billet local down --reason 'regenerated the config'\n")
-		fmt.Printf("       billet local up\n")
+		fmt.Fprintf(env.Stdout, "  2. Drain the host and bring it back on the regenerated file:\n")
+		fmt.Fprintf(env.Stdout, "       billet local down --reason 'regenerated the config'\n")
+		fmt.Fprintf(env.Stdout, "       billet local up\n")
 	} else {
-		fmt.Printf("  2. Restart the control plane and the compute host so they read the " +
+		fmt.Fprintf(env.Stdout, "  2. Restart the control plane and the compute host so they read the "+
 			"regenerated file:\n")
-		fmt.Printf("       billet server --config %s\n", pathArg)
-		fmt.Printf("       billet node   --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "       billet server --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "       billet node   --config %s\n", pathArg)
 	}
 }
 
@@ -1478,7 +1478,7 @@ func printInitNextFor(cfgPath string, p initconfig.Params, trusted, carried bool
 // firecracker host given a runner group and workflow allowlist emits trusted
 // tiers, and telling that operator their jobs run isolated on the untrusted
 // bridge would be a dangerous falsehood — the guidance follows the real trust.
-func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
+func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted bool) {
 	kind, profile := p.Provider, p.Profile
 
 	// These lines are meant to be copy-pasted, so every interpolated value is
@@ -1491,38 +1491,38 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 	pathArg := shellArg(cfgPath)
 
 	if kind == config.ProviderFirecracker {
-		fmt.Printf("\nBefore this config can launch a guest, the host must provide what billet " +
-			"cannot: a guest kernel you place at node.firecracker.kernel_image yourself, the two " +
-			"bridges node.firecracker names, and a Ceph cluster for the cache. `billet check` " +
-			"reports what is missing; the junioryono.billet.host Ansible role installs the bridges " +
-			"and bootstraps Ceph, but the guest kernel is yours to build (see the config's comment " +
+		fmt.Fprintf(env.Stdout, "\nBefore this config can launch a guest, the host must provide what billet "+
+			"cannot: a guest kernel you place at node.firecracker.kernel_image yourself, the two "+
+			"bridges node.firecracker names, and a Ceph cluster for the cache. `billet check` "+
+			"reports what is missing; the junioryono.billet.host Ansible role installs the bridges "+
+			"and bootstraps Ceph, but the guest kernel is yours to build (see the config's comment "+
 			"on kernel_image).\n")
 	}
 
 	if kind == config.ProviderTart {
-		printTartNext(cfgPath, trusted, p.Tart)
+		printTartNext(env, cfgPath, trusted, p.Tart)
 	}
 
-	printStateNext(p)
+	printStateNext(env, p)
 
 	if kind == config.ProviderEC2 {
-		fmt.Printf("\nEvery tier's `image:` is a PLACEHOLDER (%s): an EC2 tier launches an AMI, and "+
+		fmt.Fprintf(env.Stdout, "\nEvery tier's `image:` is a PLACEHOLDER (%s): an EC2 tier launches an AMI, and "+
 			"none exists yet. Build one and paste its id over the placeholder:\n\n", initconfig.PlaceholderAMI)
-		fmt.Printf("       billet ami build --config %s --base-image ami-<a dnf-based base>\n\n", pathArg)
-		fmt.Printf("The orchestrator's own AWS role needs an IAM policy. `billet init iam` prints " +
+		fmt.Fprintf(env.Stdout, "       billet ami build --config %s --base-image ami-<a dnf-based base>\n\n", pathArg)
+		fmt.Fprintf(env.Stdout, "The orchestrator's own AWS role needs an IAM policy. `billet init iam` prints "+
 			"exactly what this config exercises, scoped to this deployment:\n\n")
-		fmt.Printf("       billet init iam --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "       billet init iam --config %s\n", pathArg)
 	}
 
-	fmt.Printf("\nNext:\n\n")
+	fmt.Fprintf(env.Stdout, "\nNext:\n\n")
 	// THE CLAUSE, NOT THE PARAGRAPH. These are numbered steps an operator reads
 	// as a list of commands, and the full rule four lines deep inside step 1
 	// buries the steps either side of it; the command that is about to act says
 	// the whole thing, before it acts.
-	fmt.Printf("  1. Create the GitHub App and install it (%s):\n", configEditBrief)
-	fmt.Printf("       billet github-app create %s --config %s\n", orgFlag, pathArg)
-	fmt.Printf("  2. Confirm the config, its host prerequisites and any runner-group policy:\n")
-	fmt.Printf("       billet check --config %s\n", pathArg)
+	fmt.Fprintf(env.Stdout, "  1. Create the GitHub App and install it (%s):\n", configEditBrief)
+	fmt.Fprintf(env.Stdout, "       billet github-app create %s --config %s\n", orgFlag, pathArg)
+	fmt.Fprintf(env.Stdout, "  2. Confirm the config, its host prerequisites and any runner-group policy:\n")
+	fmt.Fprintf(env.Stdout, "       billet check --config %s\n", pathArg)
 	if profile == initconfig.ProfileLocalService {
 		step := 3
 		// The units' ExecStart reads exactly one path. A config generated
@@ -1533,14 +1533,14 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 		account := initconfig.ServiceAccountFor(hostOS)
 
 		if cfgPath != service {
-			fmt.Printf("  3. Install the file where the services billet ships read it:\n")
-			fmt.Printf("       cp %s %s\n", pathArg, shellArg(service))
+			fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
+			fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, shellArg(service))
 
 			// ONLY WHERE THERE IS AN ACCOUNT TO HAND IT TO. On macOS the services
 			// run as the operator, so a chown to a group that does not exist is
 			// an instruction that fails and explains nothing.
 			if account != "" {
-				fmt.Printf("       chown root:%s %s && chmod 0640 %s\n",
+				fmt.Fprintf(env.Stdout, "       chown root:%s %s && chmod 0640 %s\n",
 					account, shellArg(service), shellArg(service))
 			}
 
@@ -1553,8 +1553,8 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 		// and enables only what it proved — none of which `systemctl enable
 		// --now` or `launchctl bootstrap` does, and the second of which cannot
 		// even be spelled on macOS without the override database.
-		fmt.Printf("  %d. Start both roles as the services billet ships:\n", step)
-		fmt.Printf("       billet local up\n")
+		fmt.Fprintf(env.Stdout, "  %d. Start both roles as the services billet ships:\n", step)
+		fmt.Fprintf(env.Stdout, "       billet local up\n")
 
 		// THE KEY PATH IS THE ONE THIS CONFIG NAMES, read from the generator
 		// rather than rebuilt here. It used to be a literal
@@ -1563,49 +1563,49 @@ func printInitNext(cfgPath string, p initconfig.Params, trusted bool) {
 		key := initconfig.ServiceKeyPathFor(hostOS)
 
 		if account != "" {
-			fmt.Printf("\nThe App key at %s must be readable by the service alone: "+
+			fmt.Fprintf(env.Stdout, "\nThe App key at %s must be readable by the service alone: "+
 				"`chown %s:%s` it with mode 0600, or billet refuses a key other accounts can "+
 				"read.\n", key, account, account)
 		} else {
-			fmt.Printf("\nThe App key at %s must be readable by you alone, mode 0600 — billet "+
+			fmt.Fprintf(env.Stdout, "\nThe App key at %s must be readable by you alone, mode 0600 — billet "+
 				"refuses a key other accounts can read. The services run as you, so there is "+
 				"nothing to chown it to.\n", key)
 		}
 	} else {
-		fmt.Printf("  3. Run the control plane and a compute host, in two terminals:\n")
-		fmt.Printf("       billet server --config %s\n", pathArg)
-		fmt.Printf("       billet node   --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "  3. Run the control plane and a compute host, in two terminals:\n")
+		fmt.Fprintf(env.Stdout, "       billet server --config %s\n", pathArg)
+		fmt.Fprintf(env.Stdout, "       billet node   --config %s\n", pathArg)
 	}
 
 	// Untrusted is reachable on firecracker and ec2; docker always errors before
 	// here without a policy, so a docker config that got printed is trusted.
 	if !trusted && kind == config.ProviderFirecracker {
-		fmt.Printf("\nThe tiers are `trust: untrusted`: a firecracker guest runs under its own " +
-			"kernel on the untrusted bridge, so a fork's pull request is isolated from the host. " +
+		fmt.Fprintf(env.Stdout, "\nThe tiers are `trust: untrusted`: a firecracker guest runs under its own "+
+			"kernel on the untrusted bridge, so a fork's pull request is isolated from the host. "+
 			"Add a trusted tier only with a runner group and workflow allowlist.\n")
 		return
 	}
 
 	if !trusted && kind == config.ProviderTart {
-		fmt.Printf("\nThe tiers are `trust: untrusted`: each job runs in its own VM with its " +
-			"own kernel, and softnet confines that VM's network — a tart guest isolates the " +
-			"kernel but not the bridge, and tart's default NAT reaches the host. Add a trusted " +
+		fmt.Fprintf(env.Stdout, "\nThe tiers are `trust: untrusted`: each job runs in its own VM with its "+
+			"own kernel, and softnet confines that VM's network — a tart guest isolates the "+
+			"kernel but not the bridge, and tart's default NAT reaches the host. Add a trusted "+
 			"tier only with a runner group and workflow allowlist.\n")
 
 		return
 	}
 
 	if !trusted && kind == config.ProviderEC2 {
-		fmt.Printf("\nThe tiers are `trust: untrusted`: each job runs on its own EC2 instance in " +
-			"the untrusted security group, so a fork's pull request is isolated by the instance " +
-			"boundary and reaches only what that group allows. Add a trusted tier only with a " +
+		fmt.Fprintf(env.Stdout, "\nThe tiers are `trust: untrusted`: each job runs on its own EC2 instance in "+
+			"the untrusted security group, so a fork's pull request is isolated by the instance "+
+			"boundary and reaches only what that group allows. Add a trusted tier only with a "+
 			"runner group and workflow allowlist.\n")
 		return
 	}
 
-	fmt.Printf("\nThe tiers are `trust: trusted`: only the workflows you allowlisted, from " +
-		"repositories your runner group permits, reach them. Launch authority is the tier's " +
-		"static trust, not the job's event, so an allowlisted workflow must never check out or " +
+	fmt.Fprintf(env.Stdout, "\nThe tiers are `trust: trusted`: only the workflows you allowlisted, from "+
+		"repositories your runner group permits, reach them. Launch authority is the tier's "+
+		"static trust, not the job's event, so an allowlisted workflow must never check out or "+
 		"run code you do not control — a fork's pull request included.\n")
 }
 
@@ -1660,7 +1660,7 @@ func shellSafeRune(r rune) bool {
 // This one also creates files that did not exist, and where it does replace
 // one, `serviceOwnership` is what hands the result to the group the packaged
 // unit reads it with — adding a second answer would be two rules for one fact.
-func commitConfig(path string, body []byte, mode os.FileMode) error {
+func commitConfig(env cli.Env, path string, body []byte, mode os.FileMode) error {
 	staged, err := os.CreateTemp(filepath.Dir(path), ".billet-config-*")
 	if err != nil {
 		return fmt.Errorf("stage a replacement for %s: %w", path, err)
@@ -1730,7 +1730,7 @@ func commitConfig(path string, body []byte, mode os.FileMode) error {
 	// the caller the replace failed would be false, and would send an operator
 	// looking for a file that is already there.
 	if err := syncDir(filepath.Dir(path)); err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: %s was written, but that could not be flushed to "+
+		fmt.Fprintf(env.Stderr, "\nWarning: %s was written, but that could not be flushed to "+
 			"disk (%v). Confirm it is still there after a reboot.\n", path, err)
 	}
 

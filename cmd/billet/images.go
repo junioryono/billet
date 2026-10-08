@@ -39,30 +39,30 @@ import (
 // the jailer exited 0, the API accepted every call, the VMM answered, the DHCP lease
 // appeared. The only thing that knew otherwise was the guest, and the only way to ask
 // it is to give it something to say and a place to say it.
-func cmdImages(ctx context.Context, args []string) error {
+func cmdImages(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	switch args[0] {
 	case "pull":
-		return cmdImagesPull(ctx, args[1:])
+		return cmdImagesPull(ctx, env, args[1:])
 	case "refresh":
-		return cmdImagesRefresh(ctx, args[1:])
+		return cmdImagesRefresh(ctx, env, args[1:])
 	case "compatible":
-		return cmdImagesCompatible(ctx, args[1:])
+		return cmdImagesCompatible(ctx, env, args[1:])
 	case "verify":
-		return cmdImagesVerify(ctx, args[1:])
+		return cmdImagesVerify(ctx, env, args[1:])
 	case "due":
-		return cmdImagesDue(ctx, args[1:])
+		return cmdImagesDue(ctx, env, args[1:])
 	case "list":
-		return cmdImagesList(ctx, args[1:])
+		return cmdImagesList(ctx, env, args[1:])
 	case "reap":
-		return cmdImagesReap(ctx, args[1:])
+		return cmdImagesReap(ctx, env, args[1:])
 	case "promote":
-		return cmdImagesPromote(ctx, args[1:], true)
+		return cmdImagesPromote(ctx, env, args[1:], true)
 	case "unpromote":
-		return cmdImagesPromote(ctx, args[1:], false)
+		return cmdImagesPromote(ctx, env, args[1:], false)
 	default:
 		return fmt.Errorf("billet images: unknown subcommand %q", args[0])
 	}
@@ -72,8 +72,8 @@ func cmdImages(ctx context.Context, args []string) error {
 // guest contract without downloading another image when the answer is already on
 // the generation. A pre-metadata generation is boot-verified once and backfilled;
 // after that every ordinary host converge is a metadata read.
-func cmdImagesCompatible(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images compatible", os.Stdout)
+func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images compatible", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
 	resultFile := fs.String("result-file", "",
@@ -112,7 +112,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 
 	refresh := make([]string, 0, len(images))
 	for _, image := range images {
-		err := checkImageCompatible(ctx, cfg, *cfgPath, image, *wait)
+		err := checkImageCompatible(ctx, env, cfg, *cfgPath, image, *wait)
 		if err == nil {
 			continue
 		}
@@ -122,7 +122,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 
 		name, _, _ := strings.Cut(image, "@")
 		refresh = append(refresh, name)
-		fmt.Println(err)
+		fmt.Fprintln(env.Stdout, err)
 	}
 
 	if len(refresh) == 0 {
@@ -138,7 +138,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 }
 
 func checkImageCompatible(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	cfg *config.Config,
 	cfgPath, image string,
 	wait time.Duration,
@@ -224,7 +224,7 @@ func checkImageCompatible(
 		return err
 	}
 	if !needsBoot {
-		fmt.Printf("%s speaks guest contract %s; no image download is needed\n",
+		fmt.Fprintf(env.Stdout, "%s speaks guest contract %s; no image download is needed\n",
 			exact, firecracker.GuestContract)
 
 		return nil
@@ -233,7 +233,7 @@ func checkImageCompatible(
 	// A GENERATION FROM BEFORE CONTRACT METADATA IS NOT ASSUMED INCOMPATIBLE. A
 	// real boot is cheaper than a multi-gigabyte replacement and produces the fact
 	// future upgrades can read without booting again.
-	if err := cmdImagesVerify(ctx, []string{
+	if err := cmdImagesVerify(ctx, env, []string{
 		"--config", cfgPath,
 		"--wait", wait.String(),
 		exact,
@@ -241,7 +241,7 @@ func checkImageCompatible(
 		return compatibilityBootFailure(exact, floating, err)
 	}
 
-	fmt.Printf("%s passed a compatibility boot and now records guest contract %s\n",
+	fmt.Fprintf(env.Stdout, "%s passed a compatibility boot and now records guest contract %s\n",
 		exact, firecracker.GuestContract)
 
 	return nil
@@ -303,8 +303,8 @@ func incompatibleGuest(image, reason string) error {
 // EXIT 2 MEANS "NOTHING TO DO" RATHER THAN FAILURE. A node that finds a fresh
 // generation has succeeded at its job, and a unit reporting failure every week on
 // every machine but one teaches an operator to ignore it.
-func cmdImagesDue(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images due", os.Stdout)
+func cmdImagesDue(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images due", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	maxAge := fs.Duration("max-age", 6*24*time.Hour,
 		"rebuild when the newest generation is older than this")
@@ -346,7 +346,7 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Println(why)
+	fmt.Fprintln(env.Stdout, why)
 
 	if !due {
 		return errNothingToBuild
@@ -492,7 +492,7 @@ func tartTierImages(cfg *config.Config) ([]string, error) {
 // OCI reference tart pulls into its own store, with the registry's own
 // provenance. Sharing the operator's command while not sharing the pipeline is
 // the honest arrangement: "fetch what my tiers need" is one question.
-func pullTartImages(ctx context.Context, cfg *config.Config, only string) error {
+func pullTartImages(ctx context.Context, env cli.Env, cfg *config.Config, only string) error {
 	// A PULL OWNS NOTHING. The deployment identity exists so a VM billet creates
 	// carries a marker saying whose it is; a pull writes into tart's shared OCI
 	// cache, which every deployment on this Mac reads and none owns. So this is
@@ -521,18 +521,18 @@ func pullTartImages(ctx context.Context, cfg *config.Config, only string) error 
 		// gigabytes; re-pulling one an operator already has because a second tier
 		// mentions it is an hour nobody asked for.
 		if p.Pulled(ctx, image) {
-			fmt.Printf("image    %-56s already pulled\n", image)
+			fmt.Fprintf(env.Stdout, "image    %-56s already pulled\n", image)
 
 			continue
 		}
 
-		fmt.Printf("image    %-56s pulling\n", image)
+		fmt.Fprintf(env.Stdout, "image    %-56s pulling\n", image)
 
-		if err := p.Pull(ctx, image, os.Stderr); err != nil {
+		if err := p.Pull(ctx, image, env.Stderr); err != nil {
 			return fmt.Errorf("billet images pull: %w", err)
 		}
 
-		fmt.Printf("image    %-56s pulled\n", image)
+		fmt.Fprintf(env.Stdout, "image    %-56s pulled\n", image)
 	}
 
 	// AND ONE MORE PASS OVER ALL OF THEM, because verifying each image straight
@@ -571,8 +571,8 @@ func plural(n int, one, many string) string {
 }
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
-func cmdImagesVerify(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images verify", os.Stdout)
+func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images verify", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
 	record := fs.Bool("record", true,
@@ -667,7 +667,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	// a killed run leaves behind carries an owner marker matching no deployment on
 	// this host — deliberately, since that is what keeps the node's sweep off it — so
 	// the run that creates one is the only place the two can be connected.
-	fmt.Printf("probe %s is owned by %s, not by this node's %s, so the node's sweep "+
+	fmt.Fprintf(env.Stdout, "probe %s is owned by %s, not by this node's %s, so the node's sweep "+
 		"will leave it alone\n",
 		provider.InstanceName(lease), probeDeployment(deployment), deployment)
 
@@ -687,7 +687,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warning: the verification lock was not released: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warning: the verification lock was not released: %v\n", err)
 		}
 	}()
 
@@ -700,7 +700,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if err := verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge,
+	if err := verifyGuestImage(ctx, env, prov, cfg.Node.Firecracker.Bridge,
 		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait); err != nil {
 		return err
 	}
@@ -764,14 +764,14 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		}
 
 		if record != "" {
-			fmt.Printf("\nrecorded %s as the kernel this generation was proved against\n", record)
+			fmt.Fprintf(env.Stdout, "\nrecorded %s as the kernel this generation was proved against\n", record)
 		}
 
 		if note != "" {
-			fmt.Printf("\nnote: %s\n", note)
+			fmt.Fprintf(env.Stdout, "\nnote: %s\n", note)
 		}
 
-		fmt.Printf("\nrecorded %s as verified; a tier naming @%s will boot it\n",
+		fmt.Fprintf(env.Stdout, "\nrecorded %s as verified; a tier naming @%s will boot it\n",
 			rest, ceph.Verified)
 	}
 
@@ -812,7 +812,7 @@ func verifyDisk(cfg *config.Config, override config.ByteSize) config.ByteSize {
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
 func verifyGuestImage(
-	ctx context.Context, prov provider.Provider, bridge string, port int,
+	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
 	image, lease string, disk config.ByteSize, wait time.Duration,
 ) error {
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
@@ -834,14 +834,14 @@ func verifyGuestImage(
 
 	defer func() {
 		if err := srv.Close(); err != nil {
-			fmt.Printf("warning: the report listener did not close: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warning: the report listener did not close: %v\n", err)
 		}
 	}()
 
 	name := provider.InstanceName(lease)
 	spec := probeSpec(name, image, addr, secret, disk)
 
-	fmt.Printf("verifying %s on a root disk grown to %s\n", image, disk)
+	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
 
 	if _, err := prov.Launch(ctx, spec); err != nil {
 		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
@@ -855,7 +855,7 @@ func verifyGuestImage(
 		)
 	}
 
-	verdict := awaitGuestReport(ctx, report, serveErr, image, secret, disk, wait)
+	verdict := awaitGuestReport(ctx, env, report, serveErr, image, secret, disk, wait)
 
 	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
 	// printed a line and returned success, so the weekly job would announce a
@@ -915,7 +915,7 @@ func probeSpec(name, image, addr, secret string, disk config.ByteSize) provider.
 
 // awaitGuestReport waits for the guest to say something, or for a reason it cannot.
 func awaitGuestReport(
-	ctx context.Context, report <-chan string, serveErr <-chan error,
+	ctx context.Context, env cli.Env, report <-chan string, serveErr <-chan error,
 	image, secret string, disk config.ByteSize, wait time.Duration,
 ) error {
 	timer := time.NewTimer(wait)
@@ -923,7 +923,7 @@ func awaitGuestReport(
 
 	select {
 	case body := <-report:
-		return checkGuestReport(body, secret, disk)
+		return checkGuestReport(env, body, secret, disk)
 
 	case err := <-serveErr:
 		// THE LISTENER DIED, WHICH IS NOT THE IMAGE'S FAULT. Without this the wait
@@ -1062,14 +1062,14 @@ func listenForGuestReport(
 }
 
 // checkGuestReport turns what the guest said into a verdict.
-func checkGuestReport(body, secret string, disk config.ByteSize) error {
-	fmt.Println()
+func checkGuestReport(env cli.Env, body, secret string, disk config.ByteSize) error {
+	fmt.Fprintln(env.Stdout)
 
 	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
-		fmt.Println("  " + strings.TrimSpace(line))
+		fmt.Fprintln(env.Stdout, "  "+strings.TrimSpace(line))
 	}
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	var failures []string
 
@@ -1121,8 +1121,8 @@ func checkGuestReport(body, secret string, disk config.ByteSize) error {
 			strings.Join(failures, "\n  - "))
 	}
 
-	fmt.Println("this image boots, takes its registration from the metadata service, runs the")
-	fmt.Println("actions runner and runs a container.")
+	fmt.Fprintln(env.Stdout, "this image boots, takes its registration from the metadata service, runs the")
+	fmt.Fprintln(env.Stdout, "actions runner and runs a container.")
 
 	return nil
 }
@@ -1285,13 +1285,13 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 // generation back or deliberately restoring one that already records this binary's
 // guest contract. Rollback is one command against the cluster rather than an edit on
 // every node.
-func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
+func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified bool) error {
 	name := "billet images promote"
 	if !verified {
 		name = "billet images unpromote"
 	}
 
-	fs := cli.NewFlagSet(name, os.Stdout)
+	fs := cli.NewFlagSet(name, env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	rest, err := cli.ParseWithName(fs, args)
@@ -1322,7 +1322,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 			return err
 		}
 
-		fmt.Printf("%s is verified; a tier naming @%s will boot it\n", rest, ceph.Verified)
+		fmt.Fprintf(env.Stdout, "%s is verified; a tier naming @%s will boot it\n", rest, ceph.Verified)
 
 		return nil
 	}
@@ -1339,13 +1339,13 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 	// SAYING WHAT HAPPENS NEXT, because withdrawing a verification is done in a hurry
 	// and the question immediately after it is "so what boots now".
 	if found {
-		fmt.Printf("%s is no longer verified; @%s now resolves to %s\n",
+		fmt.Fprintf(env.Stdout, "%s is no longer verified; @%s now resolves to %s\n",
 			rest, ceph.Verified, newest.Name)
 
 		return nil
 	}
 
-	fmt.Printf("%s is no longer verified, and NO generation is — a tier naming @%s now has "+
+	fmt.Fprintf(env.Stdout, "%s is no longer verified, and NO generation is — a tier naming @%s now has "+
 		"nothing to boot\n", rest, ceph.Verified)
 
 	return nil
@@ -1362,8 +1362,8 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 // THE PLAN AND THE ACTION SHARE ONE FUNCTION. A `--dry-run` computed by different
 // code than the operation is a preview that eventually stops describing it, which
 // for an irreversible command against a cluster is the property most worth having.
-func cmdImagesReap(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images reap", os.Stdout)
+func cmdImagesReap(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images reap", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3,
 		"how many VERIFIED generations to leave per guest contract, newest first")
@@ -1407,7 +1407,7 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		dir = nodeKernelDir(cfg)
 	}
 
-	return runImagesReap(ctx, store, cfg, image, dir, *keep, *dryRun)
+	return runImagesReap(ctx, env, store, cfg, image, dir, *keep, *dryRun)
 }
 
 // reapStore is what a reap needs from the cluster.
@@ -1454,7 +1454,7 @@ var openReapStore = func(cfg *config.Config) (reapStore, error) {
 // publish lock and never touch the kernel directory, and `billet images pull
 // --verify` releases this lock before it verifies.
 func runImagesReap(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	store reapStore,
 	cfg *config.Config,
 	image, kernelDir string,
@@ -1470,14 +1470,14 @@ func runImagesReap(
 	//
 	// The plan that is ACTED on is the one computed below, inside the exclusion.
 	if !dryRun {
-		lock, err := takeKernelDirLock(ctx, kernelDir, "collect kernels")
+		lock, err := takeKernelDirLock(ctx, env, kernelDir, "collect kernels")
 		if err != nil {
 			return err
 		}
 
 		defer func() {
 			if err := lock.release(); err != nil {
-				fmt.Printf("warning: the kernel directory lock was not released: %v\n", err)
+				fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", err)
 			}
 		}()
 	}
@@ -1511,7 +1511,7 @@ func runImagesReap(
 
 	for _, item := range plan {
 		if item.Reason != "" {
-			fmt.Printf("  keep    %s  (%s)\n", item.Generation.Name, item.Reason)
+			fmt.Fprintf(env.Stdout, "  keep    %s  (%s)\n", item.Generation.Name, item.Reason)
 		}
 	}
 
@@ -1521,19 +1521,19 @@ func runImagesReap(
 		if item.Reason == "" {
 			removing++
 
-			fmt.Printf("  remove  %s\n", item.Generation.Name)
+			fmt.Fprintf(env.Stdout, "  remove  %s\n", item.Generation.Name)
 		}
 	}
 
 	switch {
 	case removing == 0:
-		fmt.Println("no generation needs reaping")
+		fmt.Fprintln(env.Stdout, "no generation needs reaping")
 	case dryRun:
-		fmt.Printf("\n%d generation(s) would be removed; this was a dry run\n", removing)
+		fmt.Fprintf(env.Stdout, "\n%d generation(s) would be removed; this was a dry run\n", removing)
 	default:
 		removed, reapErr := store.Reap(ctx, image, plan, retention)
 
-		fmt.Printf("\nremoved %d generation(s)\n", len(removed))
+		fmt.Fprintf(env.Stdout, "\nremoved %d generation(s)\n", len(removed))
 
 		if reapErr != nil {
 			return reapErr
@@ -1547,7 +1547,7 @@ func runImagesReap(
 	// leaves a kernel behind. Returning early when no generation needs reaping --
 	// which is the common case -- would mean the kernels were never collected at
 	// all, and the directory grows by 46MB a week regardless.
-	return reapKernels(ctx, store, cfg, kernelDir, dryRun)
+	return reapKernels(ctx, env, store, cfg, kernelDir, dryRun)
 }
 
 // reapKernels removes pulled kernels no surviving generation is paired with.
@@ -1568,7 +1568,7 @@ func runImagesReap(
 // act on an answer a concurrent pull has already made wrong -- which is why taking
 // the lock around the unlinks alone would not have closed the race.
 func reapKernels(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	store reapStore,
 	cfg *config.Config,
 	kernelDir string,
@@ -1616,10 +1616,10 @@ func reapKernels(
 		verb = "would remove"
 	}
 
-	fmt.Printf("\n%s %d kernel(s) no generation is paired with:\n", verb, len(removed))
+	fmt.Fprintf(env.Stdout, "\n%s %d kernel(s) no generation is paired with:\n", verb, len(removed))
 
 	for _, name := range removed {
-		fmt.Printf("  %s\n", name)
+		fmt.Fprintf(env.Stdout, "  %s\n", name)
 	}
 
 	return nil
@@ -1697,8 +1697,8 @@ func configuredKernelName(cfg *config.Config, kernelDir string) string {
 // thing they should have to reconstruct.
 //
 // A TIER SAYING `@verified` IS NOT AN ANSWER to what it boots, so this resolves it.
-func cmdImagesList(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images list", os.Stdout)
+func cmdImagesList(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images list", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	rest, err := cli.ParseWithName(fs, args)
@@ -1752,10 +1752,10 @@ func cmdImagesList(ctx context.Context, args []string) error {
 
 	sort.Slice(all, func(i, j int) bool { return all[i].Built.After(all[j].Built) })
 
-	fmt.Println(name)
+	fmt.Fprintln(env.Stdout, name)
 
 	if len(all) == 0 {
-		fmt.Println("  (no generations published)")
+		fmt.Fprintln(env.Stdout, "  (no generations published)")
 	}
 
 	for _, gen := range all {
@@ -1781,15 +1781,15 @@ func cmdImagesList(ctx context.Context, args []string) error {
 			marks += "  <- @" + ceph.Verified
 		}
 
-		fmt.Printf("  %s  %-8s  %-16s%s\n", gen.Name,
+		fmt.Fprintf(env.Stdout, "  %s  %-8s  %-16s%s\n", gen.Name,
 			shortAge(time.Since(gen.Built)), runnerText, marks)
 	}
 
-	return listTierImages(ctx, store, cfg)
+	return listTierImages(ctx, env, store, cfg)
 }
 
 // listTierImages says which generation each tier will actually boot.
-func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config) error {
+func listTierImages(ctx context.Context, env cli.Env, store *ceph.Client, cfg *config.Config) error {
 	shown := false
 
 	for i := range cfg.Tiers {
@@ -1800,7 +1800,7 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 		}
 
 		if !shown {
-			fmt.Println("\ntiers")
+			fmt.Fprintln(env.Stdout, "\ntiers")
 
 			shown = true
 		}
@@ -1810,18 +1810,18 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 			// NOT FATAL, and printed rather than returned: a tier that cannot resolve
 			// is exactly what somebody is running this command to find out about, and
 			// stopping at the first one would hide the others.
-			fmt.Printf("  %-20s %s -> cannot resolve: %v\n", tier.Label, image, err)
+			fmt.Fprintf(env.Stdout, "  %-20s %s -> cannot resolve: %v\n", tier.Label, image, err)
 
 			continue
 		}
 
 		if resolved == image {
-			fmt.Printf("  %-20s %s\n", tier.Label, image)
+			fmt.Fprintf(env.Stdout, "  %-20s %s\n", tier.Label, image)
 
 			continue
 		}
 
-		fmt.Printf("  %-20s %s -> %s\n", tier.Label, image, resolved)
+		fmt.Fprintf(env.Stdout, "  %-20s %s -> %s\n", tier.Label, image, resolved)
 	}
 
 	return nil

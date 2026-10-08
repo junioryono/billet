@@ -96,7 +96,7 @@ func TestLocalRefusesAHostWithNeitherServiceManager(t *testing.T) {
 
 	for _, sub := range []string{"status", "up", "down", "uninstall"} {
 		t.Run(sub, func(t *testing.T) {
-			err := cmdLocal(t.Context(), []string{sub, "--config", cfg})
+			err := cmdLocal(t.Context(), processEnv(), []string{sub, "--config", cfg})
 			if err == nil {
 				t.Fatalf("`billet local %s` acted on a host with no service manager", sub)
 			}
@@ -119,7 +119,7 @@ func TestLocalAdmitsAMac(t *testing.T) {
 	hostOS = "darwin"
 	t.Cleanup(func() { hostOS = prev })
 
-	err := cmdLocal(t.Context(), []string{"nonsense", "--config", writeLocalConfig(t)})
+	err := cmdLocal(t.Context(), processEnv(), []string{"nonsense", "--config", writeLocalConfig(t)})
 	if err == nil {
 		t.Fatal("an unknown subcommand was accepted")
 	}
@@ -143,7 +143,7 @@ func TestLocalStatusReportsAHealthyHostAndRaisesNoAlarm(t *testing.T) {
 	stubInspect(t, healthy())
 
 	var err error
-	out := capture(t, func() { err = cmdLocalStatus(t.Context(), []string{"--config", writeLocalConfig(t)}) })
+	out := capture(t, func() { err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", writeLocalConfig(t)}) })
 	if err != nil {
 		t.Fatalf("status failed on a healthy host: %v\n%s", err, out)
 	}
@@ -183,7 +183,7 @@ func TestLocalStatusNamesABinaryMismatch(t *testing.T) {
 	stubInspect(t, report)
 
 	var err error
-	out := capture(t, func() { err = cmdLocalStatus(t.Context(), []string{"--config", writeLocalConfig(t)}) })
+	out := capture(t, func() { err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", writeLocalConfig(t)}) })
 	if err != nil {
 		t.Fatalf("status failed: %v\n%s", err, out)
 	}
@@ -237,7 +237,7 @@ func TestLocalStatusNamesEachWayAUnitDiffers(t *testing.T) {
 
 			var err error
 			out := capture(t, func() {
-				err = cmdLocalStatus(t.Context(), []string{"--config", writeLocalConfig(t)})
+				err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", writeLocalConfig(t)})
 			})
 			if err != nil {
 				t.Fatalf("status failed: %v\n%s", err, out)
@@ -259,7 +259,7 @@ func TestLocalStatusSaysWhereTheUnitsComeFrom(t *testing.T) {
 	stubInspect(t, report)
 
 	var err error
-	out := capture(t, func() { err = cmdLocalStatus(t.Context(), []string{"--config", writeLocalConfig(t)}) })
+	out := capture(t, func() { err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", writeLocalConfig(t)}) })
 	if err != nil {
 		t.Fatalf("status failed: %v\n%s", err, out)
 	}
@@ -286,7 +286,7 @@ func TestLocalStatusStillReportsWhenTheConfigWillNotLoad(t *testing.T) {
 	}
 
 	var err error
-	out := capture(t, func() { err = cmdLocalStatus(t.Context(), []string{"--config", bad}) })
+	out := capture(t, func() { err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", bad}) })
 	if err != nil {
 		t.Fatalf("an unreadable config made status fail outright: %v\n%s", err, out)
 	}
@@ -313,7 +313,7 @@ func TestLocalStatusReportsWhatUpWouldRefuse(t *testing.T) {
 	stubInspect(t, report)
 
 	var err error
-	out := capture(t, func() { err = cmdLocalStatus(t.Context(), []string{"--config", writeLocalConfig(t)}) })
+	out := capture(t, func() { err = cmdLocalStatus(t.Context(), processEnv(), []string{"--config", writeLocalConfig(t)}) })
 	if err != nil {
 		t.Fatalf("status: %v\n%s", err, out)
 	}

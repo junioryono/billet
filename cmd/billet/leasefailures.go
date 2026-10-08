@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"text/tabwriter"
 	"time"
@@ -26,8 +25,8 @@ import (
 // the job, and what billet observed happening to that lease. The footer says
 // out loud that the pairing is circumstantial, because a view that reads as a
 // verdict is worse than no view.
-func cmdLeasesFailures(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet leases failures", os.Stdout)
+func cmdLeasesFailures(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet leases failures", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to look")
 	limit := fs.Int("limit", 50, "most rows to print")
@@ -57,29 +56,29 @@ func cmdLeasesFailures(ctx context.Context, args []string) error {
 	}
 
 	if len(failures) == 0 {
-		fmt.Printf("No job in the last %s failed while billet's infrastructure was disrupted.\n",
+		fmt.Fprintf(env.Stdout, "No job in the last %s failed while billet's infrastructure was disrupted.\n",
 			shortDuration(*since))
 
 		return nil
 	}
 
-	printAttributedFailures(failures)
+	printAttributedFailures(env, failures)
 
-	fmt.Printf("\nThese jobs did not succeed, and billet's own infrastructure was disrupted while\n")
-	fmt.Printf("their leases could still have been running them. That is CIRCUMSTANTIAL: billet\n")
-	fmt.Printf("cannot tell a broken host from a broken build, and a job on this list may have\n")
-	fmt.Printf("failed on its own merits.\n\n")
-	fmt.Printf("Nothing has been re-run. GitHub does not requeue a job whose runner vanished\n")
-	fmt.Printf("mid-execution, and billet does not re-run one for you — re-running is a side\n")
-	fmt.Printf("effect on your repository, and a deploy or a migration must not happen twice\n")
-	fmt.Printf("because a machine went away. Re-run failed jobs from the workflow run page if\n")
-	fmt.Printf("the disruption explains the failure.\n")
+	fmt.Fprintf(env.Stdout, "\nThese jobs did not succeed, and billet's own infrastructure was disrupted while\n")
+	fmt.Fprintf(env.Stdout, "their leases could still have been running them. That is CIRCUMSTANTIAL: billet\n")
+	fmt.Fprintf(env.Stdout, "cannot tell a broken host from a broken build, and a job on this list may have\n")
+	fmt.Fprintf(env.Stdout, "failed on its own merits.\n\n")
+	fmt.Fprintf(env.Stdout, "Nothing has been re-run. GitHub does not requeue a job whose runner vanished\n")
+	fmt.Fprintf(env.Stdout, "mid-execution, and billet does not re-run one for you — re-running is a side\n")
+	fmt.Fprintf(env.Stdout, "effect on your repository, and a deploy or a migration must not happen twice\n")
+	fmt.Fprintf(env.Stdout, "because a machine went away. Re-run failed jobs from the workflow run page if\n")
+	fmt.Fprintf(env.Stdout, "the disruption explains the failure.\n")
 
 	return nil
 }
 
-func printAttributedFailures(failures []alloc.AttributedFailure) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+func printAttributedFailures(env cli.Env, failures []alloc.AttributedFailure) {
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
 	// THE LEASE LEADS, as in every other `billet leases` view, so a row here can be
 	// carried straight to `billet leases held` — a job whose teardown is still
 	// wedged on the host that vanished appears in both.
