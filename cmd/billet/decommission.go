@@ -54,7 +54,7 @@ func cmdDecommission(ctx context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("node identity: %w", err)
 	}
 
-	owner, err := authorizeOwner(cfg, bundle)
+	owner, err := app.AuthorizeOwner(cfg, bundle)
 	if err != nil {
 		return fmt.Errorf("node.ec2: %w", err)
 	}

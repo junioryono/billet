@@ -175,7 +175,7 @@ func runServer(
 	// Built by the SHARED constructor, one client per target, so the server and
 	// teardown authenticate identically. Two near-identical constructions is how
 	// one of them ends up pointed at a different owner than the other.
-	targets, err := newScaleSetClients(ctx, cfg)
+	targets, err := app.NewScaleSetClients(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -388,11 +388,6 @@ func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 		RegistrationRecordPath: nodeRegistrationRecordPath(platform),
 	}
 }
-
-// githubAPIBase is the API base cmdCheck verifies the App against — a var
-// rather than the constant so tests can point it at a fake instead of the real
-// GitHub, which a unit test must never reach. Empty selects the default.
-var githubAPIBase = ""
 
 // iamEndpointOverride points the instance-profile probe at a fake for tests —
 // production always derives the partition-global IAM endpoint from the region.

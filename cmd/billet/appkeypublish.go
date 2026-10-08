@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsssm"
 	"github.com/junioryono/billet/internal/cli"
@@ -28,7 +30,7 @@ func publishAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 			"this deployment does not keep its App key in an identity store")
 	}
 
-	name := appKeyPath(ssm, target)
+	name := app.KeyPath(ssm, target)
 
 	_, err := awsssm.New(ssm.Region, awscreds.Default()).Put(ctx, name, string(pem), awsssm.PutOptions{
 		Overwrite: false,
@@ -89,7 +91,7 @@ func githubAppStoreKey(ctx context.Context, env cli.Env, args []string) error {
 			cfg.Server.IdentityBackendKind())
 	}
 
-	target, err := targetByName(cfg, *targetName)
+	target, err := app.TargetByName(cfg, *targetName)
 	if err != nil {
 		return err
 	}
@@ -103,7 +105,7 @@ func githubAppStoreKey(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	fmt.Fprintf(env.Stdout, "Published the App private key to %s\n", appKeyLocation(cfg, target))
+	fmt.Fprintf(env.Stdout, "Published the App private key to %s\n", app.KeyLocation(cfg, target))
 	fmt.Fprintf(env.Stdout, "\nThe copy at %s is now a second copy of an unrepeatable credential.\n"+
 		"Remove it once `billet check` reports this deployment healthy.\n", *from)
 
@@ -123,7 +125,7 @@ func storeAppKeyDuringOnboarding(ctx context.Context, env cli.Env, cfgPath, targ
 
 	cfg, err := config.Load(cfgPath)
 	if err == nil {
-		target, err = targetByName(cfg, targetName)
+		target, err = app.TargetByName(cfg, targetName)
 	}
 
 	if err == nil {
@@ -141,7 +143,7 @@ func storeAppKeyDuringOnboarding(ctx context.Context, env cli.Env, cfgPath, targ
 		return
 	}
 
-	fmt.Fprintf(env.Stdout, "Published the private key to %s\n", appKeyLocation(cfg, target))
+	fmt.Fprintf(env.Stdout, "Published the private key to %s\n", app.KeyLocation(cfg, target))
 	fmt.Fprintf(env.Stdout, "The copy at %s is a second copy of an unrepeatable credential; "+
 		"remove it once `billet check` reports this deployment healthy.\n", keyPath)
 }

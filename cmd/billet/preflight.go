@@ -20,7 +20,6 @@ import (
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/provider/tart"
-	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/store/ebss3"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -297,7 +296,7 @@ func ec2Preflight(
 	// job will actually use. Skipped when no identity is minted yet, because
 	// the prefix is derived from it.
 	if cfg.Node.EBSS3 != nil {
-		owner, err := authorizeOwner(cfg, bundle)
+		owner, err := app.AuthorizeOwner(cfg, bundle)
 		switch {
 		case err != nil:
 			return fmt.Errorf("node.ebs_s3: resolve the deployment identity: %w", err)
@@ -350,38 +349,6 @@ func ec2Preflight(
 	return ec2Authorize(ctx, env, cfg, ec2cfg, creds, bundle, images)
 }
 
-// ec2Authorize dry-runs the launch a job needs, to prove the role may RunInstances
-// — the one thing the read-only describes cannot. A DryRun has no side effect (AWS
-// validates and checks IAM, then refuses and starts nothing), which is why this is
-// opt-in behind --authorize rather than run by default: it is the only probe here
-// that asks a write-shaped question, and an operator should choose to. Teardown is
-// NOT dry-run here: a DryRun TerminateInstances validates the instance id before
-// the permission verdict (measured), so ec2:TerminateInstances cannot be proved
-// without a real instance and stays advisory.
-// authorizeOwner resolves the deployment identity the dry-run must tag as, the way
-// the node runtime does (nodeDeploymentID): the certificate outranks the config,
-// because the certificate is what the control plane actually checks. It PEEKS only
-// — a diagnostic must never mint an identity — so an unenrolled, never-started
-// deployment returns "" and the caller skips the probe rather than tagging a
-// value a per-deployment policy would reject.
-func authorizeOwner(cfg *config.Config, bundle *wirecert.Bundle) (string, error) {
-	if bundle != nil {
-		return bundle.Deployment()
-	}
-
-	for _, dir := range cfg.DeploymentStateDirs() {
-		id, found, err := state.PeekDeploymentID(dir)
-		if err != nil {
-			return "", err
-		}
-		if found {
-			return id, nil
-		}
-	}
-
-	return "", nil
-}
-
 // hasEC2Tier reports whether any tier in this file can run on the ec2 provider — a
 // fleet node file has none, because its tiers live on the control plane.
 func hasEC2Tier(cfg *config.Config) bool {
@@ -404,7 +371,7 @@ func ec2Authorize(
 	// against the very policy `billet init iam` generates. The real launch tags with
 	// the deployment id, so the probe must too. Peek, never mint: a diagnostic must
 	// not create an identity.
-	owner, err := authorizeOwner(cfg, bundle)
+	owner, err := app.AuthorizeOwner(cfg, bundle)
 	if err != nil {
 		return fmt.Errorf("node.ec2: %w", err)
 	}

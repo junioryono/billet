@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/junioryono/billet/internal/app"
 )
 
 // checkConfigFixture writes a control-plane config and its App key, and returns
@@ -69,9 +71,9 @@ func pointGitHubAt(t *testing.T, handler http.HandlerFunc) {
 	srv := httptest.NewServer(withRunnerGroupEndpoints(handler))
 	t.Cleanup(srv.Close)
 
-	prev := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = prev })
+	prev := app.GitHubAPIBase
+	app.GitHubAPIBase = srv.URL
+	t.Cleanup(func() { app.GitHubAPIBase = prev })
 }
 
 func exactInstallation(w http.ResponseWriter, _ *http.Request) {

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/config"
@@ -105,9 +107,9 @@ func installationAt(t *testing.T, want map[string]string) *[]string {
 	}))
 	t.Cleanup(srv.Close)
 
-	prev := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = prev })
+	prev := app.GitHubAPIBase
+	app.GitHubAPIBase = srv.URL
+	t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 	return &asked
 }

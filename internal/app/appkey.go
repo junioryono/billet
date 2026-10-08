@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -24,7 +24,7 @@ const appKeyParameter = "github-app-key"
 // appKeyPath is where one target's App key lives in Parameter Store: the bare
 // leaf for the default target, so every deployment onboarded before targets
 // existed keeps its key where it was, and a suffixed leaf for the rest.
-func appKeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) string {
+func KeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) string {
 	return awsssm.PathFor(ssm.Prefix, target.KeyName(appKeyParameter))
 }
 
@@ -43,13 +43,13 @@ func appKeyPath(ssm *config.IdentitySSMConfig, target config.GitHubTarget) strin
 // which is the validating reader: one descriptor that a FIFO cannot hang, a
 // regular file, no group or other permission bits, a bounded read, and actually
 // parsed. None of that has an equivalent in a store, where the equivalent is IAM.
-func resolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget) (github.AppKey, error) {
+func ResolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHubTarget) (github.AppKey, error) {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return github.ReadPrivateKeyFile(target.PrivateKeyPath)
 	}
 
 	ssm := cfg.Server.IdentitySSM()
-	path := appKeyPath(ssm, target)
+	path := KeyPath(ssm, target)
 
 	param, err := awsssm.New(ssm.Region, awscreds.Default()).Get(ctx, path)
 	if err != nil {
@@ -87,10 +87,10 @@ func resolveAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 // two a deployment is using, because "the App key is fine" is a different fact
 // depending on where it was read from and an operator debugging a failover needs
 // to know which one they are looking at.
-func appKeyLocation(cfg *config.Config, target config.GitHubTarget) string {
+func KeyLocation(cfg *config.Config, target config.GitHubTarget) string {
 	if cfg.Server.IdentityBackendKind() != config.IdentitySSM {
 		return target.PrivateKeyPath
 	}
 
-	return "AWS Parameter Store " + appKeyPath(cfg.Server.IdentitySSM(), target)
+	return "AWS Parameter Store " + KeyPath(cfg.Server.IdentitySSM(), target)
 }

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -100,7 +102,7 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 // several targets declare can be torn down on one of them, and a set one target
 // no longer declares is undeclared there whatever the others say.
 func tiersOnTarget(cfg *config.Config, name string) ([]config.Tier, error) {
-	target, err := targetByName(cfg, name)
+	target, err := app.TargetByName(cfg, name)
 	if err != nil {
 		return nil, err
 	}

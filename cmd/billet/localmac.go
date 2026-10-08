@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/cli"
 
 	"github.com/junioryono/billet/internal/config"
@@ -37,7 +39,7 @@ func macStatus(ctx context.Context, env cli.Env, cfgPath string) error {
 	case cfgErr != nil:
 		fmt.Fprintf(env.Stdout, "         UNREADABLE: %v\n", cfgErr)
 	default:
-		keyPaths = appKeyFilePaths(cfg)
+		keyPaths = app.KeyFilePaths(cfg)
 	}
 
 	printMacFile(env, "config", cfgPath)

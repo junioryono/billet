@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/scaleset"
@@ -106,7 +108,7 @@ func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
 			case undeclared:
 				// An undeclared tier names its target with --target, or has the
 				// only target there is.
-				resolved, err := targetByName(cfg, *targetName)
+				resolved, err := app.TargetByName(cfg, *targetName)
 				if err != nil {
 					return err
 				}
@@ -141,7 +143,7 @@ func teardownOnTarget(
 	ctx context.Context, env cli.Env, cfg *config.Config, target config.GitHubTarget,
 	wanted []config.Tier, force, yes bool,
 ) error {
-	client, err := newScaleSetClientFor(ctx, cfg, target)
+	client, err := app.NewScaleSetClientFor(ctx, cfg, target)
 	if err != nil {
 		return err
 	}
@@ -151,7 +153,7 @@ func teardownOnTarget(
 	// The ACTUAL objects, fetched before anything is destroyed. An operator
 	// confirming a destructive act should be shown what is on GitHub, not the
 	// names they typed into their own config.
-	fmt.Fprintf(env.Stdout, "This deletes the following from %s (target %s):\n\n", describeGitHubTarget(target), target.Name)
+	fmt.Fprintf(env.Stdout, "This deletes the following from %s (target %s):\n\n", app.DescribeGitHubTarget(target), target.Name)
 
 	present := make([]config.Tier, 0, len(wanted))
 
@@ -228,4 +230,47 @@ func groupOrDefault(group string) string {
 	}
 
 	return group
+}
+
+// confirmTarget makes the operator type the target's GitHub path.
+//
+// Typed confirmation rather than y/N: this is destructive against somebody's
+// organization or repository, and the cost of a stray keystroke is a tier that
+// silently stops accepting work.
+//
+// Read on a goroutine so the context still wins. fmt.Scanln does not observe
+// cancellation, so a Ctrl-C at the prompt would otherwise cancel ctx and leave
+// the process blocked on stdin.
+func confirmTarget(ctx context.Context, env cli.Env, path string) error {
+	fmt.Fprintf(env.Stdout, "\nType the target (%s) to confirm: ", path)
+
+	typed := make(chan string, 1)
+	failed := make(chan error, 1)
+
+	go func() {
+		var answer string
+
+		if _, err := fmt.Scanln(&answer); err != nil {
+			failed <- err
+
+			return
+		}
+
+		typed <- answer
+	}()
+
+	select {
+	case <-ctx.Done():
+		fmt.Fprintln(env.Stdout)
+
+		return ctx.Err()
+	case err := <-failed:
+		return fmt.Errorf("teardown cancelled: %w", err)
+	case answer := <-typed:
+		if answer != path {
+			return errors.New("teardown cancelled")
+		}
+
+		return nil
+	}
 }

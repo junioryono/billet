@@ -6,6 +6,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
@@ -172,7 +174,7 @@ func printPreserved(env cli.Env, cfg *config.Config, cfgPath string) {
 	fmt.Fprintln(env.Stdout, "Left alone, because this is what makes it THIS deployment rather than a new one:")
 	fmt.Fprintf(env.Stdout, "         config    %s\n", cfgPath)
 
-	for _, keyPath := range appKeyFilePaths(cfg) {
+	for _, keyPath := range app.KeyFilePaths(cfg) {
 		fmt.Fprintf(env.Stdout, "         app key   %s  (GitHub issues this ONCE and will not reissue it)\n",
 			keyPath)
 	}

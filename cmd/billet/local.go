@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -115,7 +117,7 @@ func cmdLocalStatus(ctx context.Context, env cli.Env, args []string) error {
 	if cfgErr != nil {
 		fmt.Fprintf(env.Stdout, "         UNREADABLE: %v\n", cfgErr)
 	} else {
-		keyPaths = appKeyFilePaths(cfg)
+		keyPaths = app.KeyFilePaths(cfg)
 	}
 
 	report, err := inspect(ctx, *cfgPath, keyPaths)

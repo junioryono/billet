@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 )
@@ -98,14 +100,14 @@ func gitHubAccessNote(ctx context.Context, cfg *config.Config) string {
 
 // gitHubTargetAccessNote is one target's paragraph.
 func gitHubTargetAccessNote(ctx context.Context, cfg *config.Config, gh config.GitHubTarget) string {
-	key, err := resolveAppKey(ctx, cfg, gh)
+	key, err := app.ResolveAppKey(ctx, cfg, gh)
 	if err != nil {
 		return fmt.Sprintf("billet could not read the App key for target %s at %s to find out why: %v",
-			gh.Name, appKeyLocation(cfg, gh), err)
+			gh.Name, app.KeyLocation(cfg, gh), err)
 	}
 
-	inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, gh.AppID, key,
-		githubTarget(gh), gh.InstallationID, cfg.TargetNeedsRunEvidence(gh.Name))
+	inst, err := github.VerifyAppAt(ctx, nil, app.GitHubAPIBase, gh.AppID, key,
+		app.GitHubTargetOf(gh), gh.InstallationID, cfg.TargetNeedsRunEvidence(gh.Name))
 
 	switch {
 	case ctx.Err() != nil:

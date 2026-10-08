@@ -132,7 +132,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 
 	for _, target := range targets {
 		if len(targets) > 1 {
-			fmt.Fprintf(env.Stdout, "target    %s (%s)\n", target.Name, describeGitHubTarget(target))
+			fmt.Fprintf(env.Stdout, "target    %s (%s)\n", target.Name, app.DescribeGitHubTarget(target))
 		}
 
 		for i := range cfg.Tiers {

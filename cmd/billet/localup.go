@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -160,7 +162,7 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 		// rollout drain the node and then fail to land.
 		BinaryDir: hostPathsFor(hostOS).binaryDir(),
 	}
-	req.KeyPaths = appKeyFilePaths(cfg)
+	req.KeyPaths = app.KeyFilePaths(cfg)
 
 	c := converge()
 
