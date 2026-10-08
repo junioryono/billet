@@ -244,9 +244,11 @@ func isSnapshotName(name string) bool {
 // Stop waits for the snapshots being written, then stops recording. A
 // Snapshot after Stop does nothing.
 //
-// THE WAIT IS BOUNDED. A snapshot still being written after stopWait is left to
-// the process's exit, and the runtime's recorder is left running with it,
-// because stopping it waits for that same write.
+// THE WAIT IS BOUNDED, AND IT BOUNDS THE RUNTIME'S STOP TOO. A snapshot still
+// being written after stopWait is left to the process's exit; so is stopping
+// the runtime's recorder, which waits for that same write and can wait behind
+// another consumer of the runtime's trace, a profiler client that stopped
+// reading among them.
 func (r *Recorder) Stop() {
 	if r == nil {
 		return
@@ -256,21 +258,21 @@ func (r *Recorder) Stop() {
 	r.stopped = true
 	r.mu.Unlock()
 
-	written := make(chan struct{})
+	stopped := make(chan struct{})
 
 	go func() {
 		r.writes.Wait()
-		close(written)
+		r.window.Stop()
+		close(stopped)
 	}()
 
 	bound := time.NewTimer(r.stopWait)
 	defer bound.Stop()
 
 	select {
-	case <-written:
-		r.window.Stop()
+	case <-stopped:
 	case <-bound.C:
-		r.log.Error("flight recorder: a snapshot was still being written when the process stopped; "+
-			"it is left unfinished", "dir", r.dir, "waited", r.stopWait)
+		r.log.Error("flight recorder: still writing a snapshot or stopping the recorder when the "+
+			"process stopped; it is left unfinished", "dir", r.dir, "waited", r.stopWait)
 	}
 }

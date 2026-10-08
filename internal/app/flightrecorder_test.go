@@ -162,7 +162,7 @@ func TestALostClaimTheWatcherMissedIsRecordedOnClose(t *testing.T) {
 
 // THE RECORDER IS WIRED WHERE IT IS ASKED: Schedule hands the listeners this
 // controller's heartbeatOverrun, and BecomeController hands the fence this
-// controller's recorder. A structural test, because the tests above call both
+// controller's recorder and Close the ledger's LeadershipLost. A structural test, because the tests above call both
 // directly and neither would notice the wire being cut; the control plane
 // that would is one polling GitHub.
 func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
@@ -175,7 +175,7 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var overrun, fence bool
+	var overrun, fence, lost bool
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -184,6 +184,27 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		}
 
 		ast.Inspect(fn, func(n ast.Node) bool {
+			// THE CONTROLLER'S claimLost IS THE LEDGER'S LeadershipLost, which
+			// Close asks: set where BecomeController makes the Controller.
+			if lit, ok := n.(*ast.CompositeLit); ok && isMethod(fn, "ControlPlane", "BecomeController") {
+				for _, elt := range lit.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+
+					key, ok := kv.Key.(*ast.Ident)
+					if !ok || key.Name != "claimLost" {
+						continue
+					}
+
+					if sel, ok := kv.Value.(*ast.SelectorExpr); ok && sel.Sel.Name == "LeadershipLost" &&
+						isSelector(sel.X, "cp", "db") {
+						lost = true
+					}
+				}
+			}
+
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -207,6 +228,11 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 
 	if !fence {
 		t.Error("BecomeController does not hand stopWhenReplaced ctl.recorder: a lost claim would leave no trace")
+	}
+
+	if !lost {
+		t.Error("BecomeController does not set the Controller's claimLost to cp.db.LeadershipLost: " +
+			"a lost claim the fence's watcher missed would leave no trace")
 	}
 }
 

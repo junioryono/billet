@@ -23,6 +23,8 @@ type fakeWindow struct {
 	gate     chan struct{}
 	entered  chan struct{}
 	writeErr error
+	// stopGate, when set, holds Stop until it is closed.
+	stopGate chan struct{}
 }
 
 func (w *fakeWindow) Start() error {
@@ -35,6 +37,10 @@ func (w *fakeWindow) Start() error {
 }
 
 func (w *fakeWindow) Stop() {
+	if w.stopGate != nil {
+		<-w.stopGate
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -347,6 +353,32 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 
 	if w.stopped {
 		t.Error("the window was stopped under a write still in progress")
+	}
+}
+
+// AND A RUNTIME RECORDER THAT WILL NOT STOP holds Stop for the same bound and
+// no longer, with nothing being written.
+func TestStopDoesNotWaitForeverForTheRecorderToStop(t *testing.T) {
+	t.Parallel()
+
+	w := &fakeWindow{stopGate: make(chan struct{})}
+
+	r, _ := startFake(t, t.TempDir(), w)
+	r.stopWait = 50 * time.Millisecond
+
+	t.Cleanup(func() { close(w.stopGate) })
+
+	stopped := make(chan struct{})
+
+	go func() {
+		r.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop waited past its bound for a recorder that would not stop")
 	}
 }
 
