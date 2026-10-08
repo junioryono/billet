@@ -14,8 +14,9 @@ import (
 func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 	for _, c := range []struct {
 		fn, role, block, before string
+		sources                 []string // the methods whose results are its sources, in order
 	}{
-		{fn: "runServer", role: "server", block: "Server", before: "BecomeController"},
+		{fn: "runServer", role: "server", block: "Server", before: "BecomeController", sources: []string{"LedgerMetrics"}},
 		{fn: "cmdNode", role: "node", block: "Node", before: "Run"},
 	} {
 		t.Run(c.fn, func(t *testing.T) {
@@ -46,7 +47,7 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 						serves++
 					}
 
-					if isServeMetrics(call, c.role, c.block) && serve < 0 {
+					if isServeMetrics(call, c.role, c.block, c.sources) && serve < 0 {
 						serve = i
 					}
 
@@ -85,11 +86,20 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 	}
 }
 
-// isServeMetrics recognises app.ServeMetrics(ctx, "<role>", cfg.<Block>.Metrics).
-func isServeMetrics(call *ast.CallExpr, role, block string) bool {
+// isServeMetrics recognises app.ServeMetrics(ctx, "<role>", cfg.<Block>.Metrics,
+// <x>.<source>()...), the sources exactly those named: a control plane that
+// served only the runtime's metrics would pass a check that counted fewer.
+func isServeMetrics(call *ast.CallExpr, role, block string, sources []string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "ServeMetrics" || len(call.Args) != 3 {
+	if !ok || sel.Sel.Name != "ServeMetrics" || len(call.Args) != 3+len(sources) {
 		return false
+	}
+
+	for i, want := range sources {
+		src, ok := call.Args[3+i].(*ast.CallExpr)
+		if !ok || calleeName(src) != want {
+			return false
+		}
 	}
 
 	if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "app" {

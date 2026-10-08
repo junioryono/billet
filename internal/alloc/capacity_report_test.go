@@ -135,3 +135,62 @@ func TestCapacityReportCountsAnUnreconciledRunnerAsUnknown(t *testing.T) {
 		}
 	}
 }
+
+// THE BATCHED REPORT IS EACH TIER'S OWN, from one snapshot: every tier is
+// there, and each matches what CapacityReport says of it alone, so a lease is
+// counted in its own tier and in no other.
+func TestCapacityReportsIsEachTiersReport(t *testing.T) {
+	small, large := tier("small", 1, config.GiB), tier("large", 2, 2*config.GiB)
+	large.Reserved = 1
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{small, large})
+
+	smallLeases, err := a.Escrow(t.Context(), small.Label, 3)
+	if err != nil || len(smallLeases) != 3 {
+		t.Fatalf("escrow small = %v, %v", smallLeases, err)
+	}
+
+	if _, err := a.Escrow(t.Context(), large.Label, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.RecordListenerCapacity(t.Context(), small.Label, ListenerCapacity{
+		Discovery: []string{smallLeases[0].ID}, Pending: []string{smallLeases[1].ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reports, err := a.CapacityReports(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(reports) != 2 {
+		t.Fatalf("CapacityReports covers %d tiers, want 2: %+v", len(reports), reports)
+	}
+
+	for _, label := range []string{small.Label, large.Label} {
+		alone, err := a.CapacityReport(t.Context(), label)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		batched, ok := reports[label]
+		if !ok {
+			t.Fatalf("CapacityReports has no %s", label)
+		}
+
+		if batched.Discovery != alone.Discovery || batched.Pending != alone.Pending ||
+			batched.Unknown != alone.Unknown || batched.Floor != alone.Floor || batched.Headroom != alone.Headroom ||
+			batched.ObservedAt != alone.ObservedAt {
+			t.Errorf("%s: batched %+v, alone %+v", label, batched, alone)
+		}
+	}
+
+	if got := reports[small.Label]; got.Discovery != 1 || got.Pending != 1 || got.Unknown != 1 {
+		t.Errorf("small = %+v, want one each of discovery, pending and unknown", got)
+	}
+
+	if got := reports[large.Label]; got.Unknown != 2 || got.Discovery != 0 || got.Floor != 1 || got.ObservedAt != "" {
+		t.Errorf("large = %+v, want its two unobserved leases unknown, its floor, and no report", got)
+	}
+}

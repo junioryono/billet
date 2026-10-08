@@ -197,7 +197,7 @@ func runServer(
 
 	// AFTER THE PROBE, which runs beside the service that holds the port, and
 	// BEFORE THE CLAIM, so a standby can be scraped while it waits.
-	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics)
+	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics, cp.LedgerMetrics())
 	if err != nil {
 		return err
 	}
