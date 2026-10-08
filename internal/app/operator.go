@@ -38,7 +38,7 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 		return nil, nil, nil, fmt.Errorf("server state: %w", err)
 	}
 
-	a, err := alloc.New(db, allocatorLimits(cfg), cfg.Tiers)
+	a, err := NewAllocator(cfg, db)
 	if err != nil {
 		db.Close()
 
@@ -46,6 +46,14 @@ func OpenOperator(ctx context.Context, cfgPath string) (*alloc.Allocator, *state
 	}
 
 	return a, db, func() { db.Close() }, nil
+}
+
+// NewAllocator is the capacity allocator an operator command works with over a
+// ledger it opened: the control plane's own limits and tiers, so a command and
+// the plane it runs beside never disagree about what the deployment may hold.
+// cfg must have a server section.
+func NewAllocator(cfg *config.Config, db *state.DB) (*alloc.Allocator, error) {
+	return alloc.New(db, allocatorLimits(cfg), cfg.Tiers)
 }
 
 // allocatorLimits is what a deployment's configuration lets the allocator

@@ -16,7 +16,6 @@ import (
 	opsimages "github.com/junioryono/billet/internal/ops/images"
 
 	"github.com/junioryono/billet/deploy"
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -308,12 +307,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			"a recorded rollout waits on this host until somebody runs "+
 				"billet host-upgrade --from-rollout")
 
-		a, err := alloc.New(db, alloc.Limits{
-			MaxVCPU:   cfg.Server.MaxVCPU,
-			MaxMemory: cfg.Server.MaxMemory,
-			Nodes:     cfg.NodePolicies(),
-			Shares:    cfg.TargetShares(),
-		}, cfg.Tiers)
+		a, err := app.NewAllocator(cfg, db)
 		if err != nil {
 			return report, fmt.Errorf("capacity allocator: %w", err)
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -282,12 +283,7 @@ func collectAcceptanceEvidence(
 // acceptanceAllocator builds the allocator the evidence and the teardown read
 // through, from the derived config's own catalogue.
 func acceptanceAllocator(db *state.DB, cfg *config.Config) (*alloc.Allocator, error) {
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
+	allocator, err := app.NewAllocator(cfg, db)
 	if err != nil {
 		return nil, fmt.Errorf("capacity allocator: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -56,12 +57,7 @@ func ForceDestroy(ctx context.Context, env cli.Env, args []string) error {
 
 	defer db.Close()
 
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
+	allocator, err := app.NewAllocator(cfg, db)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
 	}

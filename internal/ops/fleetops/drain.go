@@ -352,12 +352,7 @@ func Resume(ctx context.Context, env cli.Env, args []string) error {
 func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Config, generation int64,
 	opts WaitOptions,
 ) error {
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
+	allocator, err := app.NewAllocator(cfg, db)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
 	}

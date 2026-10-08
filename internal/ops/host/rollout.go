@@ -78,12 +78,7 @@ func rolloutStore(ctx context.Context, cfgPath string,
 		return nil, nil, nil, fmt.Errorf("server state: %w", err)
 	}
 
-	a, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
+	a, err := app.NewAllocator(cfg, db)
 	if err != nil {
 		_ = db.Close()
 
