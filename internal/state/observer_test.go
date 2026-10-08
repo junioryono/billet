@@ -238,12 +238,43 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 			db.Observe(obs)
 
 			bound, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
+
+			// RELEASED AND JOINED HOWEVER THE TEST ENDS, before the ledger
+			// closes, so a write held in its observer outlives nothing.
+			var (
+				released atomic.Bool
+				writes   sync.WaitGroup
+			)
+
+			release := func() {
+				if released.CompareAndSwap(false, true) {
+					close(obs.release)
+				}
+			}
+
+			t.Cleanup(func() {
+				release()
+				cancel()
+
+				joined := make(chan struct{})
+
+				go func() {
+					writes.Wait()
+					close(joined)
+				}()
+
+				select {
+				case <-joined:
+				case <-time.After(10 * time.Second):
+					t.Error("a write outlived the test")
+				}
+			})
 
 			failed := errors.New("rolled back on purpose")
-			first := make(chan error, 1)
+			first, second := make(chan error, 1), make(chan error, 1)
+			begun := time.Now()
 
-			go func() {
+			writes.Go(func() {
 				first <- db.Tx(bound, func(*sql.Tx) error {
 					if commit {
 						return nil
@@ -251,7 +282,7 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 
 					return failed
 				})
-			}()
+			})
 
 			select {
 			case <-obs.entered:
@@ -259,13 +290,12 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 				t.Fatal("the first write never told its observer")
 			}
 
-			// HELD INSIDE THE CALLBACK, long enough that a hold measured across
-			// it could not be mistaken for one that was not.
-			const held = 200 * time.Millisecond
+			// AN UPPER BOUND ON THE FIRST WRITE'S HOLD: it began after begun and
+			// was measured before its observer was entered. The callback is then
+			// held for longer than that, so a hold that counted it cannot pass.
+			ceiling := time.Since(begun)
 
-			second := make(chan error, 1)
-
-			go func() { second <- db.Tx(bound, func(*sql.Tx) error { return nil }) }()
+			writes.Go(func() { second <- db.Tx(bound, func(*sql.Tx) error { return nil }) })
 
 			select {
 			case err := <-second:
@@ -276,22 +306,34 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 				t.Fatal("a second write could not take the slot while the first write's observer ran")
 			}
 
-			time.Sleep(held) // the callback's own time, which is the scenario
-			close(obs.release)
-
-			if err := <-first; commit != (err == nil) {
-				t.Fatalf("the first write returned %v", err)
+			// THE SECOND WRITE'S HOLD, told before it returned. Only its arrival
+			// is asserted: its length is the scheduler's.
+			select {
+			case <-obs.heldTold:
+			case <-bound.Done():
+				t.Fatal("the second write's hold was never told")
 			}
 
-			for range 2 {
-				select {
-				case d := <-obs.heldTold:
-					if d >= held {
-						t.Errorf("a hold of %v was reported, which counts the observer's own %v", d, held)
-					}
-				case <-bound.Done():
-					t.Fatal("a hold was never told")
+			time.Sleep(ceiling + 200*time.Millisecond) // the callback's own time, which is the scenario
+			release()
+
+			select {
+			case err := <-first:
+				if commit != (err == nil) {
+					t.Fatalf("the first write returned %v", err)
 				}
+			case <-bound.Done():
+				t.Fatal("the first write never returned once its observer was released")
+			}
+
+			select {
+			case d := <-obs.heldTold:
+				if d > ceiling {
+					t.Errorf("the first write was told a hold of %v, more than the %v it can have taken: "+
+						"it counts the observer's own time", d, ceiling)
+				}
+			case <-bound.Done():
+				t.Fatal("the first write's hold was never told")
 			}
 		})
 	}
