@@ -156,6 +156,17 @@ server:
   #
   # drain_timeout: 6h
 
+  # Prometheus metrics for this control plane, at http://<listen>/metrics.
+  # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
+  # not localhost) unless allow_remote is true: the endpoint has no
+  # authentication. pprof also serves Go's profiler under /debug/pprof/, on a
+  # loopback address only, because a profile carries memory.
+  #
+  # metrics:
+  #   listen: 127.0.0.1:9180
+  #   allow_remote: false
+  #   pprof: false
+
   # Hard ceiling on what the allocator will hand out across every tier combined.
   # Capacity is escrowed before each scale-set listener advertises to GitHub, so
   # this is what stops concurrent tiers from collectively overcommitting the box.
@@ -406,6 +417,12 @@ node:
   # are restarted for different reasons and need not wait the same amount of time.
   #
   # drain_timeout: 6h
+
+  # Prometheus metrics for this node, under the same rules as server.metrics.
+  # On a single machine running both roles, give each its own port.
+  #
+  # metrics:
+  #   listen: 127.0.0.1:9181
 
   # What a SIGTERM does while this node holds compute. "drain" (the default) waits
   # for it. "handoff" withdraws from placement and exits at once, leaving the

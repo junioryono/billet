@@ -36,6 +36,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A typed nil satisfies an interface and panics on use.**
 - **A connector token is a bearer credential and travels in the environment, never argv.**
 - **The converge action's credentials land in files or the environment, never argv, and its cleanup removes only what the run created.**
+- **The metrics endpoint is loopback unless asked for, and the profiler is loopback only.**
 
 ### Cache credentials: [references/cache-credentials.md](references/cache-credentials.md)
 

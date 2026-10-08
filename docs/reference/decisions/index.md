@@ -20,6 +20,7 @@ adr-012-steady-advertisement
 adr-013-branch-protected-caches
 adr-014-guest-image-from-githubs-template
 adr-015-typed-composition-root
+adr-016-prometheus-metrics
 ```
 
 | Record | Decides |
@@ -39,3 +40,4 @@ adr-015-typed-composition-root
 | [ADR-013](adr-013-branch-protected-caches.md) | how a pooled runner's caches publish: by the ref GitHub proves at the completion, in a namespace of the pool's static repository, with every cache on by default where a tier can have it |
 | [ADR-014](adr-014-guest-image-from-githubs-template.md) | why the Firecracker guest image is GitHub's own runner-images build, run under systemd-nspawn on Ubuntu's cloud root filesystem, with every difference in one reviewed file |
 | [ADR-015](adr-015-typed-composition-root.md) | why billet assembles itself in one typed composition root rather than a dependency-injection container, how the control plane's startup order became proof types, and the lint that keeps the roles built in one place |
+| [ADR-016](adr-016-prometheus-metrics.md) | why billet serves Prometheus metrics through one package and only when asked, what the client costs in the binary, and why the profiler is loopback only |

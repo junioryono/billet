@@ -44,6 +44,7 @@
    :hidden:
 
    operating/status-and-leases
+   operating/metrics
    operating/nodes
    operating/guest-images
    operating/build-caches

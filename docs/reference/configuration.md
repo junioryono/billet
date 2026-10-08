@@ -22,6 +22,9 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `placement` | no | `pack` (default) or `spread` |
 | `admission_order` | no | `fair` (default) or `fill`; which waiting tier takes the room a finished job leaves |
 | `drain_timeout` | no | when billet starts reporting a drain as long; never a deadline |
+| `metrics.listen` | with `metrics` | the control plane's Prometheus endpoint (`/metrics`); absent block, no endpoint. A literal loopback address (`127.0.0.1` or `[::1]`, not `localhost`) unless `metrics.allow_remote`; may not share a socket with any other listener in the file, however it is spelled. See [Metrics](../operating/metrics.md) |
+| `metrics.allow_remote` | no | admits a non-loopback `metrics.listen`; the endpoint has no authentication |
+| `metrics.pprof` | no | also serves Go's profiler under `/debug/pprof/`; refused on any `listen` that is not a literal loopback address, `allow_remote` or not, because a profile carries memory |
 
 ## `github`
 
@@ -69,6 +72,7 @@ Every target's tiers buy from the one deployment ceiling, so a burst of one targ
 | `state_dir` | yes | generation pointers, image cache, the node's identity |
 | `max_custody` | no | a bound on compute billet is holding without a completion; empty means none, and a job killed by it is archived failed |
 | `drain_timeout` | no | when the node starts reporting a drain as long |
+| `metrics.listen`, `metrics.allow_remote`, `metrics.pprof` | no | the node's Prometheus endpoint, under the same rules as the server's |
 | `stop` | no | what a SIGTERM does while the node holds compute: `drain` (the default) waits for it; `handoff` (Firecracker nodes only) leaves it running for the next node process to adopt, for a host restarted to be upgraded or converged. A host leaving for good is drained or decommissioned, since nothing comes back to adopt what a handoff leaves |
 | `cache.listen` | for interception and EC2 caches | one literal non-loopback address; `tls_cert`/`tls_key` required for EC2 and refused on the Firecracker bridge |
 | `registry_mirrors` | no | `docker.io`, `ghcr.io`, `quay.io` origins |

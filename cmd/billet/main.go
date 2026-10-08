@@ -195,6 +195,15 @@ func runServer(
 		return nil
 	}
 
+	// AFTER THE PROBE, which runs beside the service that holds the port, and
+	// BEFORE THE CLAIM, so a standby can be scraped while it waits.
+	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics)
+	if err != nil {
+		return err
+	}
+
+	defer served.Close(ctx)
+
 	// Ctrl-C and SIGTERM stop the listeners through the context, which is what
 	// releases escrowed capacity — see the listener's deferred release. A hard
 	// kill skips that and leaves the reaper to expire it.
@@ -364,6 +373,14 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 
 		return nil
 	}
+
+	// AFTER THE PROBE, which runs beside the service that holds the port.
+	served, err := app.ServeMetrics(ctx, "node", cfg.Node.Metrics)
+	if err != nil {
+		return err
+	}
+
+	defer served.Close(ctx)
 
 	// THE HANDLER BEFORE THE REPORT that says this process has one, and neither
 	// for a probe, which is not the node a stop is asking.

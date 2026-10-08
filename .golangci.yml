@@ -384,6 +384,22 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/cli$"
               desc: "internal/cli is the command line; only cmd/billet and its command families under internal/ops use it (#356 Phase 5)."
 
+        # ONE REGISTRY (#356 Phase 6). The Prometheus client lives in
+        # internal/metrics alone, so a ledger writer or the node runtime reports
+        # through what that package declares and never imports a metrics library;
+        # and net/http/pprof with it, because importing it registers the profiler
+        # on http.DefaultServeMux, which must have one known home.
+        metrics:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/internal/metrics/**"
+          deny:
+            - pkg: "github.com/prometheus/"
+              desc: "The Prometheus client is internal/metrics' alone; report through what that package declares (#356 Phase 6)."
+            - pkg: "net/http/pprof$"
+              desc: "The profiler is served by internal/metrics, behind its own switch and on loopback only (#356 Phase 6)."
+
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix
         # ending in a slash, so a sibling sharing the name is not). A compute host
