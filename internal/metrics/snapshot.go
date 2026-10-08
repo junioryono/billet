@@ -2,10 +2,9 @@ package metrics
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,7 +39,8 @@ const upFamily = "billet_scrape_up"
 // THE BOUND IS THE COLLECTOR'S, NOT ONLY THE READ'S. A deadline asks a read to
 // stop; one that does not listen would hold the scrape, and the runtime's
 // metrics with it. So the scrape waits at most timeout and reports the source
-// failed, and while a read that overran is still running no second one starts.
+// failed, and while a read is still running no second one starts: a scrape
+// that arrives meanwhile waits for it.
 func (r *Registry) RegisterSnapshot(ctx context.Context, source string, families []Family,
 	timeout time.Duration, read func(context.Context) (Snapshot, error),
 ) error {
@@ -79,37 +79,53 @@ type snapshotCollector struct {
 	timeout  time.Duration
 	read     func() (Snapshot, error)
 
-	// reading is set while a read runs, which can outlive the scrape that
+	// mu guards current, the read in flight, which can outlive the scrape that
 	// started it.
-	reading atomic.Bool
+	mu      sync.Mutex
+	current *snapshotFlight
 }
 
-type snapshotResult struct {
+// snapshotFlight is one read and, once done is closed, what it returned.
+type snapshotFlight struct {
+	done chan struct{}
 	snap Snapshot
 	err  error
 }
 
-// collect runs one read, bounded by the collector's own timeout.
+// collect answers with one read, bounded by the collector's own timeout.
+//
+// ONE READ AT A TIME, SHARED. A scrape that arrives while a read is running
+// waits for that read, within its own bound, rather than starting another or
+// being turned away: two scrapers at once both get an answer, and a read that
+// overran does not have a second stacked behind it on every scrape.
 func (c *snapshotCollector) collect() (Snapshot, error) {
-	if !c.reading.CompareAndSwap(false, true) {
-		return nil, errors.New("the previous read has not finished")
+	c.mu.Lock()
+
+	f := c.current
+	if f == nil {
+		f = &snapshotFlight{done: make(chan struct{})}
+		c.current = f
+
+		go func() {
+			snap, err := c.read()
+
+			c.mu.Lock()
+			f.snap, f.err = snap, err
+			c.current = nil
+			c.mu.Unlock()
+
+			close(f.done)
+		}()
 	}
 
-	done := make(chan snapshotResult, 1)
-
-	go func() {
-		defer c.reading.Store(false)
-
-		snap, err := c.read()
-		done <- snapshotResult{snap: snap, err: err}
-	}()
+	c.mu.Unlock()
 
 	wait := time.NewTimer(c.timeout)
 	defer wait.Stop()
 
 	select {
-	case r := <-done:
-		return r.snap, r.err
+	case <-f.done:
+		return f.snap, f.err
 	case <-wait.C:
 		return nil, fmt.Errorf("no answer within %s", c.timeout)
 	}

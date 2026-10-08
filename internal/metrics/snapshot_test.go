@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -94,37 +95,76 @@ func TestAFailedReadServesAGapNotZeros(t *testing.T) {
 	}
 }
 
+// getWithin is get with a deadline of the request's own, so a collector that
+// stopped bounding its reads fails the test rather than hangs it.
+func getWithin(t *testing.T, srv *Server, path string) (string, time.Duration) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+srv.Addr().String()+path, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	begun := time.Now()
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the scrape did not answer within its own deadline: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(body), time.Since(begun)
+}
+
 // THE COLLECTOR BOUNDS THE READ ITSELF. A read that ignores its deadline holds
 // neither this scrape nor the next past the bound, is reported failed, and no
-// second read starts while it still runs.
+// second read starts while it runs; once it returns, the next scrape reads
+// afresh.
 func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	t.Parallel()
 
 	release := make(chan struct{})
-	deadlines := make(chan bool, 4)
+	deadlines := make(chan bool, 8)
 
-	var reads atomic.Int32
+	var (
+		reads    atomic.Int32
+		released atomic.Bool
+	)
 
 	srv := serveSnapshot(t, 50*time.Millisecond, func(ctx context.Context) (Snapshot, error) {
-		reads.Add(1)
+		n := reads.Add(1)
 
 		_, ok := ctx.Deadline()
 		deadlines <- ok
 
-		<-release // deaf to its context, on purpose
+		if n == 1 {
+			<-release // deaf to its context, on purpose
+		}
 
-		return Snapshot{"billet_test_nodes": {{Value: 1}}}, nil
+		return Snapshot{"billet_test_nodes": {{Value: float64(n)}}}, nil
 	})
 
 	// Registered after serveSnapshot's, so it runs first: the read is let go
-	// before the endpoint closes.
-	t.Cleanup(func() { close(release) })
+	// before the endpoint closes, whatever the test concluded.
+	t.Cleanup(func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	})
 
 	for scrape := range 2 {
-		begun := time.Now()
-		_, body := get(t, srv, "/metrics")
+		body, took := getWithin(t, srv, "/metrics")
 
-		if took := time.Since(begun); took > 2*time.Second {
+		if took > 2*time.Second {
 			t.Errorf("scrape %d took %v against a 50ms bound", scrape, took)
 		}
 
@@ -138,11 +178,66 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	}
 
 	if n := reads.Load(); n != 1 {
-		t.Errorf("%d reads started, want 1: a second began while the first was still running", n)
+		t.Errorf("%d reads started while the first was stuck, want 1", n)
 	}
 
 	if !<-deadlines {
 		t.Error("the read was given no deadline")
+	}
+
+	released.Store(true)
+	close(release)
+
+	// ONCE IT RETURNS, A NEW READ ANSWERS: within a bound, a scrape serves the
+	// second read's value.
+	until := time.Now().Add(5 * time.Second)
+
+	for {
+		body, _ := getWithin(t, srv, "/metrics")
+		if strings.Contains(body, `billet_scrape_up{source="ledger"} 1`) && strings.Contains(body, "billet_test_nodes 2") {
+			break
+		}
+
+		if time.Now().After(until) {
+			t.Fatalf("no fresh read answered after the stuck one returned:\n%s", body)
+		}
+	}
+}
+
+// TWO SCRAPES AT ONCE BOTH GET AN ANSWER from a read that is slow but within
+// its bound: the second waits for the first's read rather than being turned
+// away.
+func TestConcurrentScrapesShareAHealthyRead(t *testing.T) {
+	t.Parallel()
+
+	var reads atomic.Int32
+
+	srv := serveSnapshot(t, 2*time.Second, func(context.Context) (Snapshot, error) {
+		reads.Add(1)
+		time.Sleep(200 * time.Millisecond) // a slow read, which is the scenario
+
+		return Snapshot{"billet_test_nodes": {{Value: 3}}}, nil
+	})
+
+	bodies := make(chan string, 2)
+
+	for range 2 {
+		go func() {
+			body, _ := getWithin(t, srv, "/metrics")
+			bodies <- body
+		}()
+	}
+
+	for range 2 {
+		body := <-bodies
+
+		if !strings.Contains(body, `billet_scrape_up{source="ledger"} 1`) || !strings.Contains(body, "billet_test_nodes 3") {
+			t.Errorf("a concurrent scrape was not answered:\n%s", body)
+		}
+	}
+
+	if n := reads.Load(); n < 1 || n > 2 {
+		t.Errorf("%d reads for two scrapes", n)
 	}
 }
 
