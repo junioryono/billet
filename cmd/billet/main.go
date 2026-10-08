@@ -12,7 +12,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -25,6 +24,8 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+
+	"github.com/junioryono/billet/internal/ops/cache"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
@@ -80,7 +81,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "jobs", Summary: "show which GitHub job a lease ran and what it did to the host",
 			Run: cmdJobs},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
-			Run: cmdCache},
+			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",
 			Run: cmdCheck},
 		{Name: "init", Summary: "generate a billet.yaml interactively",
@@ -127,24 +128,6 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 	}
 }
 
-// defaultConfigPath deliberately does NOT look in the working directory.
-//
-// A server started from an attacker-writable directory would otherwise silently
-// adopt that directory's billet.yaml — which chooses the state directory, the
-// GitHub App key path, and every tier's resources. For a process that is often
-// run as root by a unit file, that is privileged config injection. Use --config
-// to point anywhere else.
-func defaultConfigPath() string {
-	if dir, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(dir, "billet", "billet.yaml")
-	}
-	return "/etc/billet/billet.yaml"
-}
-
-func addConfigFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
-}
-
 func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string) error {
 	// `billet server retire` is a controller's retirement, an operator command
 	// that runs under a converge guard; it never starts the plane.
@@ -153,7 +136,7 @@ func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []strin
 	}
 
 	fs := cli.NewFlagSet("billet server", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	upgradeProbe := fs.Bool("upgrade-probe", false,
@@ -331,7 +314,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	fs := cli.NewFlagSet("billet node", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
 		"ask the control plane to admit this machine, then wait for an operator to approve it")
 	caFingerprint := fs.String("ca-fingerprint", "",
@@ -438,7 +421,7 @@ func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 // thing an operator asks for, once, on purpose.
 func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet teardown", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
 	force := fs.Bool("force", false,
@@ -692,7 +675,7 @@ func cmdCA(ctx context.Context, env cli.Env, args []string) error {
 // makes rather than at the next restart of anything.
 func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revoke", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
@@ -753,7 +736,7 @@ func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 // cmdCARevocations lists what has been withdrawn.
 func cmdCARevocations(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revocations", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -831,7 +814,7 @@ func serialFromCert(path string) (string, error) {
 
 func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 	fs := cli.NewFlagSet("billet ca issue", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
 	reissue := fs.Bool("reissue", false,
 		"deliberately replace an existing bundle directory (the old one is moved to "+
@@ -1044,7 +1027,7 @@ func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle
 
 func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca show", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -1151,7 +1134,7 @@ func printRemoteCost(env cli.Env, cfg *config.Config) error {
 
 func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet status", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -1655,8 +1638,8 @@ func ec2Preflight(
 			// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
 			// answer means is in cacheprobe.go, where a test can reach it.
 			probeErr := store.CheckAccess(ctx)
-			switch judgeCacheProbe(probeErr) {
-			case cacheProbeAnswered:
+			switch cache.JudgeProbe(probeErr) {
+			case cache.ProbeAnswered:
 				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
 				// listener nothing on this host ever reads or writes that prefix,
 				// and this line read as though the cache were working — which is
@@ -1670,12 +1653,12 @@ func ec2Preflight(
 
 				fmt.Fprintf(env.Stdout, "cache    bucket %s answers under this deployment's prefix%s\n",
 					cfg.Node.EBSS3.Bucket, reachable)
-			case cacheProbeInconclusive:
+			case cache.ProbeInconclusive:
 				fmt.Fprintf(env.Stdout, "cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
 				fmt.Fprintf(env.Stdout, "         (a 403 here is EITHER a refused identity OR a healthy miss "+
 					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot "+
 					"match a GetObject; a real job read will settle it)\n")
-			case cacheProbeFailed:
+			case cache.ProbeFailed:
 				return fmt.Errorf("node.ebs_s3: %w", probeErr)
 			}
 		}

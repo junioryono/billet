@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"context"
@@ -24,7 +24,7 @@ type orphanReclaimer interface {
 // with --reclaim, moves them to the cache pool's trash.
 func cmdCacheOrphans(ctx context.Context, env cli.Env, args []string) error {
 	flags := cli.NewFlagSet("billet cache orphans", env.Stdout)
-	cfgPath := addConfigFlag(flags)
+	cfgPath := cli.AddConfigFlag(flags)
 	olderThan := flags.Duration("older-than", ceph.DefaultOrphanAge,
 		fmt.Sprintf("how long ago a volume must have been named, at least %s", ceph.OrphanMinimumAge))
 	limit := flags.Int("limit", ceph.DefaultOrphanLimit, "how many volumes one pass moves, or lists as reclaimable")

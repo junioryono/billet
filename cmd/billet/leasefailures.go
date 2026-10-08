@@ -27,7 +27,7 @@ import (
 // verdict is worse than no view.
 func cmdLeasesFailures(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet leases failures", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to look")
 	limit := fs.Int("limit", 50, "most rows to print")
 
@@ -57,7 +57,7 @@ func cmdLeasesFailures(ctx context.Context, env cli.Env, args []string) error {
 
 	if len(failures) == 0 {
 		fmt.Fprintf(env.Stdout, "No job in the last %s failed while billet's infrastructure was disrupted.\n",
-			shortDuration(*since))
+			cli.ShortDuration(*since))
 
 		return nil
 	}
@@ -172,23 +172,4 @@ func ago(stamp string) string {
 	}
 
 	return d.Round(time.Minute).String() + " ago"
-}
-
-// shortDuration renders a flag value the way an operator typed it, so the empty
-// report names the window it actually looked at.
-//
-// NEVER ROUNDED TO ZERO. `--since 1ns` reporting "the last 0s" tells an operator
-// billet looked at no time at all, when what it did was look at the window they
-// asked for and find nothing — two different answers.
-func shortDuration(d time.Duration) string {
-	rounded := d.Round(time.Second)
-	if d >= time.Hour {
-		rounded = d.Round(time.Minute)
-	}
-
-	if rounded == 0 {
-		return d.String()
-	}
-
-	return rounded.String()
 }

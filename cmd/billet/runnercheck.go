@@ -45,7 +45,7 @@ func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	fs := cli.NewFlagSet("billet runner check", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	quiet := fs.Bool("quiet", false, "print nothing unless something needs doing")
 
 	if err := cli.Parse(fs, args[1:]); err != nil {

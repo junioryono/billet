@@ -108,7 +108,7 @@ type checkReport struct {
 // and refuses rather than upgrading a schema that plane is using.
 func cmdCheck(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet check", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	authorize := fs.Bool("authorize", false,
 		"also DRY-RUN a launch against AWS to prove the ec2 role may RunInstances "+
 			"(a DryRun has no side effect); teardown cannot be dry-run, so "+

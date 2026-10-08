@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/runnerrelease"
 	"github.com/junioryono/billet/internal/version"
@@ -625,7 +626,7 @@ func writeCacheConformanceWorkflow(path string, body []byte, force bool) error {
 			return fmt.Errorf("remove the staging name for %s: %w", path, err)
 		}
 	}
-	if err := syncDir(dir); err != nil {
+	if err := (durablefile.Installer{}).SyncDirectory(dir); err != nil {
 		return fmt.Errorf("flush workflow directory %s: %w", dir, err)
 	}
 

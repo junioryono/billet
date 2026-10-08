@@ -164,7 +164,7 @@ func cmdAcceptance(ctx context.Context, env cli.Env, args []string) error {
 // cmdAcceptanceUp derives the isolated deployment and writes the workspace.
 func cmdAcceptanceUp(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet acceptance up", env.Stdout)
-	base := fs.String("config", defaultConfigPath(),
+	base := fs.String("config", cli.DefaultConfigPath(),
 		"the config to derive an isolated acceptance deployment FROM; it is read, never written")
 	workspace := fs.String("workspace", "",
 		"a directory this run owns entirely: the derived config, both state directories, "+

@@ -55,7 +55,7 @@ func cmdAMI(ctx context.Context, env cli.Env, args []string) error {
 
 func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ami build", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
 	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
 	disk := fs.Int64("builder-disk", 0,
@@ -230,7 +230,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 // before verification existed, and for one built with --verify=false.
 func cmdAMIVerify(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ami verify", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	shape := fs.String("instance-type", "",
 		"shape the verifier runs on (default: a small Nitro shape for the image's arch)")
 	deployment := fs.String("deployment", "",

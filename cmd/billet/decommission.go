@@ -25,7 +25,7 @@ import (
 // pulled out from under it.
 func cmdDecommission(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet decommission", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")
 	terminateInstances := fs.Bool("terminate-instances", false,
 		"terminate leftover instances too — this FAILS any job still running on them, "+

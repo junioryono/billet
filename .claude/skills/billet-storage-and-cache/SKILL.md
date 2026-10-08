@@ -60,7 +60,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/store/ceph/*_test.go` and `internal/store/ebss3/*_test.go` (including each `writer_test.go`, the conformance shared by both backends), `internal/integration/firecracker_ceph_test.go` (real Ceph growth becomes guest capacity).
-- `internal/node/actions_*_test.go`, `cmd/billet/cache_test.go`, `cacheconformance_test.go`, `cephcheck_test.go`, `sitecheck_test.go`, `cachecheck_test.go`.
+- `internal/node/actions_*_test.go`; `internal/ops/cache/*_test.go` (`billet cache`, the conformance gate, the probe's verdict); `cmd/billet/cephcheck_test.go`, `sitecheck_test.go`, `cachecheck_test.go`.
 - `actions/actions_test.go`, `siblingrefs_test.go`, `scripts/cache_conformance_cached_test.go`; the live matrix in `.github/workflows/cache-conformance.yml`.
 
 ## Related skills

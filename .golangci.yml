@@ -337,12 +337,28 @@ linters:
             - "$all"
             - "!**/cmd/billet/**"
             - "!**/internal/app/**"
+            - "!**/internal/ops/**"
             - "!**/internal/e2e/**"
             - "!**/internal/integration/**"
             - "!**/internal/replay/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/app$"
-              desc: "internal/app is the assembly; only cmd/billet and billet's harnesses invoke it (ADR-015)."
+              desc: "internal/app is the assembly; only cmd/billet, its command families under internal/ops and billet's harnesses invoke it (ADR-015)."
+
+        # A COMMAND FAMILY IS THE BINARY'S, and only the binary dispatches to it
+        # (#356 Phase 4). A runtime package importing one would be a layer below
+        # reaching up into an operator command; a family importing another is
+        # where two families come to share a helper that belongs lower down.
+        opsconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/cmd/billet/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/ops$"
+              desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
+            - pkg: "github.com/junioryono/billet/internal/ops/"
+              desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
 
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix

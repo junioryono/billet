@@ -65,7 +65,7 @@ var (
 // pins or a job is booting.
 func cmdImagesRefresh(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images refresh", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	keep := fs.Int("keep", 3, "how many verified generations to leave per guest contract "+
 		"after a pull; 0 reaps nothing")
 	dryRun := fs.Bool("dry-run", false, "say what would be pulled and pull nothing")

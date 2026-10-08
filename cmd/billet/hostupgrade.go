@@ -68,7 +68,7 @@ const activePointer = "active"
 // reconstructs by hand.
 func cmdHostUpgrade(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet host-upgrade", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve when no --version is given")
 	pin := fs.String("version", "", "an exact release to install; it never moves")

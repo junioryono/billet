@@ -37,7 +37,7 @@ var errForceRefused = &cli.ExitError{
 // recognise whose work they are about to end; "7 leases" tells them nothing.
 func cmdForceDestroy(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet force-destroy", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why running work is being destroyed, for whoever finds the failed builds")
 	tier := fs.String("tier", "", "only destroy compute in this tier")

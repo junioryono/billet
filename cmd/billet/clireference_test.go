@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -178,6 +179,10 @@ var flagDefiners = map[string]int{
 	"DurationVar": 1, "Float64Var": 1, "Var": 1, "TextVar": 1,
 }
 
+// cliFlagHelpers are internal/cli's functions that define a flag on the set
+// they are handed, by the flag each defines.
+var cliFlagHelpers = map[string]string{"AddConfigFlag": "config"}
+
 // declaredFlagSets reads this package's sources for every NewFlagSet and the
 // flags defined on it, through any function the flag set is handed to. Every
 // NewFlagSet call must be one this reads: a flag set made any other way (a
@@ -226,6 +231,7 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 	type helper struct {
 		param string
 		body  *ast.BlockStmt
+		pkg   string
 	}
 
 	helpers := map[string]helper{}
@@ -244,7 +250,7 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 				}
 
 				if sel, ok := star.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "FlagSet" && len(field.Names) == 1 {
-					helpers[fn.Name.Name] = helper{param: field.Names[0].Name, body: fn.Body}
+					helpers[f.Name.Name+"."+fn.Name.Name] = helper{param: field.Names[0].Name, body: fn.Body, pkg: f.Name.Name}
 				}
 			}
 		}
@@ -275,9 +281,9 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 		})
 	}
 
-	var flagsOn func(body ast.Node, set string, via map[string]bool) []string
+	var flagsOn func(pkg string, body ast.Node, set string, via map[string]bool) []string
 
-	flagsOn = func(body ast.Node, set string, via map[string]bool) []string {
+	flagsOn = func(pkg string, body ast.Node, set string, via map[string]bool) []string {
 		var out []string
 
 		ast.Inspect(body, func(n ast.Node) bool {
@@ -322,8 +328,19 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 				}
 			}
 
+			// internal/cli's flag helpers, which take the set and define on it.
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "cli" {
+					if flag, known := cliFlagHelpers[sel.Sel.Name]; known && len(call.Args) > 0 {
+						if a, ok := call.Args[0].(*ast.Ident); ok && a.Name == set {
+							out = append(out, flag)
+						}
+					}
+				}
+			}
+
 			if id, ok := call.Fun.(*ast.Ident); ok && !via[id.Name] {
-				if h, isHelper := helpers[id.Name]; isHelper {
+				if h, isHelper := helpers[pkg+"."+id.Name]; isHelper {
 					for _, arg := range call.Args {
 						if a, ok := arg.(*ast.Ident); ok && a.Name == set {
 							next := map[string]bool{id.Name: true}
@@ -331,7 +348,7 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 								next[k] = true
 							}
 
-							out = append(out, flagsOn(h.body, h.param, next)...)
+							out = append(out, flagsOn(h.pkg, h.body, h.param, next)...)
 						}
 					}
 				}
@@ -374,7 +391,7 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 				methodValues(fn.Body, set.Name)
 
 				flags := map[string]bool{}
-				for _, name := range flagsOn(fn.Body, set.Name, map[string]bool{}) {
+				for _, name := range flagsOn(f.Name.Name, fn.Body, set.Name, map[string]bool{}) {
 					flags[name] = true
 				}
 
@@ -753,27 +770,34 @@ func commandPaths(command string) []string {
 func cliSources(t *testing.T) []*ast.File {
 	t.Helper()
 
-	entries, err := os.ReadDir(".")
+	families, err := filepath.Glob("../../internal/ops/*")
 	if err != nil {
-		t.Fatalf("read the package directory: %v", err)
+		t.Fatalf("list the command families: %v", err)
 	}
 
 	fset := token.NewFileSet()
 
 	var out []*ast.File
 
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-
-		file, err := parser.ParseFile(fset, name, nil, 0)
+	for _, dir := range append([]string{"."}, families...) {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
+			t.Fatalf("read %s: %v", dir, err)
 		}
 
-		out = append(out, file)
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+
+			file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+
+			out = append(out, file)
+		}
 	}
 
 	return out

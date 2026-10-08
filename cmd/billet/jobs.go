@@ -27,7 +27,7 @@ func cmdJobs(ctx context.Context, env cli.Env, args []string) error {
 // cmdJobsShow prints one job's history and what the host measured it do.
 func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet jobs show", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}

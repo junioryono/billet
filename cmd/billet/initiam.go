@@ -35,7 +35,7 @@ import (
 // policy would be scoped to the wrong thing or to everything.
 func cmdInitIAM(_ context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet init iam", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	builder := fs.Bool("builder", false,
 		"also grant what `billet ami build` needs: ec2:CreateImage, tagging the image it "+
 			"creates, ec2:GetConsoleOutput to read the verification's report, and the "+

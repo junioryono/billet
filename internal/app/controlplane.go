@@ -172,12 +172,8 @@ func OpenControlPlane(
 	// startup rather than at a failover, which is the one moment nobody wants to
 	// discover a config error. The scheduler's options are read from the config
 	// here for the same reason.
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers, append([]alloc.Option{alloc.WithPlacement(cfg.Server.Placement)}, steering.Allocator...)...)
+	allocator, err := alloc.New(db, allocatorLimits(cfg), cfg.Tiers,
+		append([]alloc.Option{alloc.WithPlacement(cfg.Server.Placement)}, steering.Allocator...)...)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("capacity allocator: %w", err), db.Close())
 	}

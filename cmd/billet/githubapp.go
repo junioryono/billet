@@ -1282,7 +1282,7 @@ func defaultKeyPathFor(cfgPath, target string) (string, error) {
 		return filepath.Join(filepath.Dir(cfgPath), file), nil
 	}
 
-	return filepath.Join(filepath.Dir(defaultConfigPath()), file), nil
+	return filepath.Join(filepath.Dir(cli.DefaultConfigPath()), file), nil
 }
 
 // configuredKeyPath reads a target's private_key_path out of a config file

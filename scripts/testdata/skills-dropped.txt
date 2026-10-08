@@ -45,3 +45,5 @@ b216b3a2a0f5 The identity access moved to internal/hostauthority (#356 Phase 4);
 b328ae11a010 The fresh branch of the identity access moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Open.
 4c9719ee3eda The operator and report opens moved into internal/app with the control plane's (#356 Phase 4); the sentence names internal/app/ledger.go and its structural test.
 e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase 4); the sentence names it and the test that exempts it.
+1793c3990d6e The cache commands moved to internal/ops/cache (#356 Phase 4); the sentence names the file there.
+781836ce56c7 The cache commands moved to internal/ops/cache (#356 Phase 4); the list names their tests there.
