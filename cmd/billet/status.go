@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -17,42 +19,6 @@ import (
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
-
-// printRemoteCost bounds what this node's own declarations can cost per hour.
-//
-// EVERY REMOTE BACKEND, THROUGH app.RemoteShapes, and it used to read node.ec2 directly.
-// A codebuild node declares ordered shapes with a price per hour for the same reason
-// an ec2 node does — placement charges the first that fits — so reading one block by
-// name meant a check that reported the cost exposure of an ec2 node and stayed silent
-// for a codebuild one, which reads as compute that is free.
-//
-// THE NODE'S PROVIDER NAMES ITSELF in the line, because the two backends bill for
-// different things: an ec2 shape is an instance-hour, a codebuild compute type is a
-// build-minute rate expressed per hour, and an operator comparing the two numbers
-// needs to know which they are looking at.
-func printRemoteCost(env cli.Env, cfg *config.Config) error {
-	shapes := app.RemoteShapes(cfg)
-	if len(shapes) == 0 {
-		return nil
-	}
-
-	maxVCPU := cfg.Node.MaxVCPU
-	maxMemory := cfg.Node.MaxMemory
-	if cfg.Server != nil {
-		maxVCPU = min(maxVCPU, cfg.Server.MaxVCPU)
-		maxMemory = min(maxMemory, cfg.Server.MaxMemory)
-	}
-
-	peak, err := config.RemotePeakHourlyExposure(maxVCPU, maxMemory, shapes)
-	if err != nil {
-		return err
-	}
-
-	fmt.Fprintf(env.Stdout, "%-8s <= %s compute (%s/month at 730h), from declared shape prices\n",
-		string(cfg.Node.Provider)+" max", &peak, peak.ForHours(730))
-
-	return nil
-}
 
 func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet status", env.Stdout)
@@ -90,12 +56,12 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// operator is looking at: hosts on two versions, capacity down by one machine,
 	// a node reporting nothing. `billet rollout status` is the full picture; this
 	// is what says to go and look at it.
-	printRollout(ctx, env, db)
+	host.PrintRollout(ctx, env, db)
 
 	// AND THE HOST'S OWN GUARD, read from this host's upgrade root and never
 	// from the ledger: a converge holding this host is why a rollout is refusing
 	// to move it.
-	printGuard(env)
+	host.PrintGuard(env)
 
 	// AND WHO THE DEPLOYMENT'S CONTROLLER IS, because the epoch beside it is a
 	// fence rather than a note. Every write is refused once that number moves, so
@@ -158,7 +124,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// WHAT THE CONTROL PLANE HAS SWEPT out of Parameter Store, and which codebuild
 	// hosts it cannot sweep after. A leaked registration is one nobody sees, which
 	// is why the count is durable and printed rather than logged.
-	printCredentialSweeps(ctx, env, a, db)
+	host.PrintCredentialSweeps(ctx, env, a, db)
 
 	printReportedInventory(ctx, env, a)
 	printComputeBarrier(ctx, env, a)
@@ -252,16 +218,6 @@ func printRemoteFleetCost(ctx context.Context, env cli.Env, a *alloc.Allocator, 
 		&peak, peak.ForHours(730), len(nodes))
 
 	return nil
-}
-
-// spotLabel names the market a node buys in, because it decides whether a build
-// can be killed by somebody else.
-func spotLabel(spot bool) string {
-	if spot {
-		return "spot (a reclaim fails the build; github does not requeue it)"
-	}
-
-	return "on-demand"
 }
 
 // printReportedInventory shows what each host last SAID it was running.

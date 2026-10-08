@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/ops/setup"
 
 	"github.com/junioryono/billet/internal/ops/fleetops"
@@ -133,7 +135,7 @@ func TestCheckAtRepositoryScopeSkipsTheRunnerGroupProbeAndSaysSo(t *testing.T) {
 
 	var checkErr error
 
-	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { checkErr = host.Check(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr != nil {
 		t.Fatalf("check at repository scope failed: %v\n%s", checkErr, out)
 	}
@@ -189,7 +191,7 @@ targets:
 
 	var checkErr error
 
-	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { checkErr = host.Check(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr == nil {
 		t.Fatalf("a deployment with one uninstalled target passed the check:\n%s", out)
 	}

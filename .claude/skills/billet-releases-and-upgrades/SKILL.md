@@ -1,13 +1,13 @@
 ---
 name: billet-releases-and-upgrades
-description: "Load when tagging a release; touching .goreleaser.yaml, the release or cut-release workflows, deploy/, internal/releasesource, internal/provenance, internal/rollout, internal/hostupgrade, the converge guard, `billet release inspect`, `billet node migrate-endpoint` or `receipt`, or cmd/billet's rollout*, hostupgrade*, upgrade* and convergeguard* files; or when answering how a release, a rollout or a host upgrade behaves."
+description: "Load when tagging a release; touching .goreleaser.yaml, the release or cut-release workflows, deploy/, internal/releasesource, internal/provenance, internal/rollout, internal/hostupgrade, the converge guard, `billet release inspect`, `billet node migrate-endpoint` or `receipt`, or internal/ops/host's rollout*, hostupgrade*, upgrade* and convergeguard* files; or when answering how a release, a rollout or a host upgrade behaves."
 ---
 
 # Releases, rollouts and host upgrades
 
 ## What this area is
 
-A release is a semantic-version tag (`vX.Y.Z`, because Go resolves nothing else; staying on `v0` keeps the module path free of a suffix) cut from a `release/vX.Y` branch by the `cut-release.yml` workflow, built by `release.yml` through GoReleaser (`.goreleaser.yaml`), and published as immutable archives, `.deb`/`.rpm` packages, a signed `release-manifest.json` and a moving `v0` tag. `internal/releasesource` reads manifests and channel statements; `internal/provenance` records which manifest produced the installed binary. `internal/rollout` is one durable fleet decision and its coordinator; `internal/hostupgrade` is the journaled transaction that replaces billet on one machine; `cmd/billet/upgradedecision.go` is the fence between them. `docs/reference/decisions/adr-006-rollouts.md` and `docs/operating/upgrades.md` are the design and the operator page.
+A release is a semantic-version tag (`vX.Y.Z`, because Go resolves nothing else; staying on `v0` keeps the module path free of a suffix) cut from a `release/vX.Y` branch by the `cut-release.yml` workflow, built by `release.yml` through GoReleaser (`.goreleaser.yaml`), and published as immutable archives, `.deb`/`.rpm` packages, a signed `release-manifest.json` and a moving `v0` tag. `internal/releasesource` reads manifests and channel statements; `internal/provenance` records which manifest produced the installed binary. `internal/rollout` is one durable fleet decision and its coordinator; `internal/hostupgrade` is the journaled transaction that replaces billet on one machine; `internal/ops/host/upgradedecision.go` is the fence between them. `docs/reference/decisions/adr-006-rollouts.md` and `docs/operating/upgrades.md` are the design and the operator page.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -81,7 +81,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/rollout/*_test.go` (`dispatchguard_test.go`: no host is disturbed by a pass that could not settle), `internal/hostupgrade/upgrade_test.go` (fourteen ordering tests), `internal/releasesource/*_test.go`, `internal/provenance/*_test.go`.
-- `cmd/billet/upgradedecision_test.go`, `upgradefence_test.go`, `upgradetxlock_test.go`, `upgradeprobe_test.go`, `hostupgradegate_test.go`, `releaserecord_test.go`, `releaserecordbounds_test.go`, `rollout*_test.go`; `internal/app/proofs_test.go`, `rolloutstarterwiring_test.go`.
+- `internal/ops/host/upgradedecision_test.go`, `upgradefence_test.go`, `upgradetxlock_test.go`, `hostupgradegate_test.go`, `releaserecord_test.go`, `releaserecordbounds_test.go`, `rollout*_test.go`; `cmd/billet/upgradeprobe_test.go`; `internal/app/proofs_test.go`, `rolloutstarterwiring_test.go`.
 - `scripts/releasemanifest_test.go`, `scripts/movingmajor_test.go`, `scripts/scripts_test.go` (install.sh), the Ansible scenario targets.
 - `scripts/rollout-rehearsal.sh` (`make rollout-rehearsal`): two packaged hosts moved from one published release to the next by a rollout under real systemd, the controller through `billet-upgrade.timer` (or, on a FROM before v0.6.0, the operator's `host-upgrade`), then a downgrade candidate that cannot open the migrated ledger proved to roll back; the first real run of `hostupgrade.go`'s doing rather than its ordering, recorded in `docs/reference/records/host-rehearsals.md`.
 

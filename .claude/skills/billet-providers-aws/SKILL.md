@@ -54,7 +54,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 - `internal/provider/ec2/*_test.go` (`sign_test.go`, `payload_test.go`, `userdata_test.go`, `authorize_test.go`, `build_freespace_test.go`, `toolcache_gate_test.go`, `sqs_test.go`, `reals3_test.go`, `live_test.go`).
 - `internal/provider/codebuild/*_test.go` (`harness_test.go`, `api_test.go`, `sweep_test.go`, `buildspec_test.go`, `quota_test.go`, `realcodebuild_test.go`, `realwalk_test.go`).
-- `internal/awssig`, `awsjson`, `awscreds`, `awspolicy`, `awsssm`, `awsquota`, `awssts` tests; `internal/tfpolicy` (drift), `internal/e2e/ec2_test.go`, `codebuild_test.go`, `holdergone_test.go`, `holdergone_live_test.go`; `internal/ops/images/ami_test.go`, `internal/ops/setup/initiam_test.go`, `initiamcodebuild_test.go`, `cmd/billet/credentialsweep_test.go`; `internal/app/credentialsweep_test.go`.
+- `internal/awssig`, `awsjson`, `awscreds`, `awspolicy`, `awsssm`, `awsquota`, `awssts` tests; `internal/tfpolicy` (drift), `internal/e2e/ec2_test.go`, `codebuild_test.go`, `holdergone_test.go`, `holdergone_live_test.go`; `internal/ops/images/ami_test.go`, `internal/ops/setup/initiam_test.go`, `initiamcodebuild_test.go`, `internal/ops/host/credentialsweep_test.go`; `internal/app/credentialsweep_test.go`.
 
 ## Related skills
 

@@ -75,7 +75,7 @@ is_documentation() {
 	# one is listed only after checking that nothing reads it.
 	internal/state/CLAUDE.md | internal/alloc/CLAUDE.md | internal/server/CLAUDE.md | \
 		internal/nodeplane/CLAUDE.md | internal/node/CLAUDE.md | internal/provider/CLAUDE.md | \
-		cmd/billet/CLAUDE.md | deploy/CLAUDE.md | terraform/CLAUDE.md) return 0 ;;
+		cmd/billet/CLAUDE.md | internal/ops/host/CLAUDE.md | deploy/CLAUDE.md | terraform/CLAUDE.md) return 0 ;;
 	*) return 1 ;;
 	esac
 }

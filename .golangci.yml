@@ -347,13 +347,19 @@ linters:
 
         # A COMMAND FAMILY IS THE BINARY'S, and only the binary dispatches to it
         # (#356 Phase 4). A runtime package importing one would be a layer below
-        # reaching up into an operator command; a family importing another is
+        # reaching up into an operator command; a leaf family importing another is
         # where two families come to share a helper that belongs lower down.
+        # internal/ops/host is the one family above the others: a host's
+        # lifecycle drains through fleetops, installs a restored App key through
+        # setup's writer and pulls Tart images through images, and `billet check`,
+        # which `local up` and the upgrade probe run, checks every family's
+        # configuration. Nothing but cmd/billet imports host.
         opsconsumers:
           list-mode: lax
           files:
             - "$all"
             - "!**/cmd/billet/**"
+            - "!**/internal/ops/host/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/ops$"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
@@ -730,7 +736,7 @@ linters:
       # !linux openInRoot gives it a production caller (the Linux build reaches
       # the kernel's openat2 instead), so a nolint directive is used on one
       # GOOS and reported unused on the other. Excluded here, by file and rule.
-      - path: (^|/)cmd/billet/releaseinspect_resolve\.go$
+      - path: (^|/)internal/ops/host/releaseinspect_resolve\.go$
         linters:
           - gosec
         text: G703

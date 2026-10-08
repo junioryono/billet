@@ -4,7 +4,7 @@
 # and nothing else, then asked to take a candidate that cannot serve them and
 # proved to roll back.
 #
-# WHAT THIS PROVES THAT NO TEST DOES. `cmd/billet/hostupgrade.go` stops a
+# WHAT THIS PROVES THAT NO TEST DOES. `internal/ops/host/hostupgrade.go` stops a
 # service, replaces a binary and migrates a ledger; every test of it supplies a
 # fake host and asserts the ORDER those are called in. This is the first place
 # the doing happens: systemd's `Type=notify` start, the packaged units, the

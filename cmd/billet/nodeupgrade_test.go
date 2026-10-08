@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -19,7 +21,7 @@ func TestTheNodeUpgraderUsesTheConfiguredLedgerVariable(t *testing.T) {
 		}},
 	}
 
-	upgrader, err := nodeUpgrader(cfg, "/etc/billet/custom.yaml")
+	upgrader, err := host.NodeUpgrader(cfg, "/etc/billet/custom.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +32,7 @@ func TestTheNodeUpgraderUsesTheConfiguredLedgerVariable(t *testing.T) {
 	}
 
 	cfg.Server = nil
-	upgrader, err = nodeUpgrader(cfg, "")
+	upgrader, err = host.NodeUpgrader(cfg, "")
 	if err != nil || upgrader.DSNEnv != "" {
 		t.Errorf("a node-only host unexpectedly needs a ledger environment: %+v, %v", upgrader, err)
 	}

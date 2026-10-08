@@ -17,6 +17,8 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/ops/setup"
 
 	"github.com/junioryono/billet/internal/ops/fleetops"
@@ -61,7 +63,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
 			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",
-			Run: cmdCheck},
+			Run: host.Check},
 		{Name: "init", Summary: "generate a billet.yaml interactively",
 			Run: setup.Init},
 		{Name: "ami", Summary: "build and verify the machine image the ec2 backend launches",
@@ -71,7 +73,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "images", Summary: "verify the golden image a microVM guest boots from",
 			Run: opsimages.Run},
 		{Name: "fleet", Summary: "converge a fleet from this machine with the collection of this billet's release",
-			Run: cmdFleet},
+			Run: host.Fleet},
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
 			Run: setup.GitHubApp},
 		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",
@@ -80,7 +82,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: fleetops.Decommission},
 		{Name: "local", Summary: "run the billet services on this machine, and back up or restore what makes " +
 			"them this deployment",
-			Run: cmdLocal},
+			Run: host.Local},
 		{Name: "drain", Summary: "stop admitting new work and let what is running finish",
 			Run: fleetops.Drain},
 		{Name: "resume", Summary: "start admitting work again after a drain",
@@ -88,14 +90,14 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "force-destroy", Summary: "DESTROY compute that is still running a job, failing those builds",
 			Run: fleetops.ForceDestroy},
 		{Name: "rollout", Summary: "move this whole deployment to one release, and watch it converge",
-			Run: cmdRollout},
+			Run: host.Rollout},
 		{Name: "host-upgrade", Summary: "replace billet on THIS machine transactionally, with rollback",
-			Run: cmdHostUpgrade},
+			Run: host.Upgrade},
 		{Name: "converge-guard", Summary: "hold the upgrade root's one claim for a converge, so no transaction " +
 			"moves this host under it",
-			Run: cmdConvergeGuard},
+			Run: host.ConvergeGuard},
 		{Name: "release", Summary: "record which signed manifest produced the billet installed here",
-			Run: cmdRelease},
+			Run: host.Release},
 		{Name: "acceptance", Summary: "stand an ISOLATED deployment up beside this one, run a real job on " +
 			"it, and destroy exactly what it made",
 			Run: cmdAcceptance},
@@ -110,7 +112,7 @@ func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []strin
 	// `billet server retire` is a controller's retirement, an operator command
 	// that runs under a converge guard; it never starts the plane.
 	if len(args) > 0 && args[0] == "retire" {
-		return cmdServerRetire(ctx, env, args[1:])
+		return host.ServerRetire(ctx, env, args[1:])
 	}
 
 	fs := cli.NewFlagSet("billet server", env.Stdout)
@@ -185,10 +187,10 @@ func runServer(
 	defer cp.Close()
 
 	if upgradeProbe {
-		if err := notifyReady(env); err != nil {
+		if err := host.NotifyReady(env); err != nil {
 			return fmt.Errorf("server upgrade-probe readiness: %w", err)
 		}
-		holdProbe(ctx, env, holdProbeFlag, serverProbeReadyLine)
+		host.HoldProbe(ctx, env, holdProbeFlag, host.ServerProbeReadyLine)
 
 		return nil
 	}
@@ -257,7 +259,7 @@ func runServer(
 	}
 
 	if err != nil {
-		return explainGitHubAccess(ctx, cfg, err)
+		return host.ExplainGitHubAccess(ctx, cfg, err)
 	}
 
 	fmt.Fprintln(env.Stdout, "billet server: stopped")
@@ -272,8 +274,8 @@ func serverHost(env cli.Env) app.Host {
 	return app.Host{
 		ServerAccess:  hostauthority.ServerWireAccess,
 		AuthorityLock: fleetops.AuthorityLockAccess,
-		Ready:         func() error { return notifyReady(env) },
-		Status:        func(text string) error { return notifyStatus(env, text) },
+		Ready:         func() error { return host.NotifyReady(env) },
+		Status:        func(text string) error { return host.NotifyStatus(env, text) },
 		Out:           env.Stdout,
 	}
 }
@@ -285,9 +287,9 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	if len(args) > 0 {
 		switch args[0] {
 		case "migrate-endpoint":
-			return cmdNodeMigrate(ctx, env, args[1:])
+			return host.NodeMigrate(ctx, env, args[1:])
 		case "receipt":
-			return cmdNodeReceipt(ctx, env, args[1:])
+			return host.NodeReceipt(ctx, env, args[1:])
 		}
 	}
 
@@ -337,7 +339,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 		return fleetops.EnrollNode(ctx, env, cfg, fleetops.BootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
 	}
 
-	upgrader, err := nodeUpgrader(cfg, *cfgPath)
+	upgrader, err := host.NodeUpgrader(cfg, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -355,10 +357,10 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}()
 
 	if *upgradeProbe {
-		if err := notifyReady(env); err != nil {
+		if err := host.NotifyReady(env); err != nil {
 			return fmt.Errorf("node upgrade-probe readiness: %w", err)
 		}
-		holdProbe(ctx, env, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, n.Name()))
+		host.HoldProbe(ctx, env, *holdProbeFlag, fmt.Sprintf(host.NodeProbeReadyFormat, n.Name()))
 
 		return nil
 	}
@@ -367,7 +369,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	// for a probe, which is not the node a stop is asking.
 	stopDrainRequests := lc.HandleDrainRequests()
 	defer stopDrainRequests()
-	publishNodeDrainReport(cli.HostOS)
+	host.PublishNodeDrainReport(cli.HostOS)
 
 	return n.Run(ctx, nodeHost(env, lc, cli.HostOS))
 }
@@ -377,17 +379,13 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 // signal, stdout, and where the registration record is published on platform.
 func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 	return app.NodeHost{
-		Ready:                  func() error { return notifyReady(env) },
-		DrainRequested:         nodeDrainRequested,
+		Ready:                  func() error { return host.NotifyReady(env) },
+		DrainRequested:         host.NodeDrainRequested,
 		Hurry:                  lc.Hurry(),
 		Out:                    env.Stdout,
-		RegistrationRecordPath: nodeRegistrationRecordPath(platform),
+		RegistrationRecordPath: host.NodeRegistrationRecordPath(platform),
 	}
 }
-
-// iamEndpointOverride points the instance-profile probe at a fake for tests —
-// production always derives the partition-global IAM endpoint from the region.
-var iamEndpointOverride = ""
 
 func cmdVersion(_ context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet version", env.Stdout)

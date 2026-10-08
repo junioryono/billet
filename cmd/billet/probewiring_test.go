@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-// BOTH PROBES HAND THEIR WAIT, THEIR FLAG AND THEIR LINE TO holdProbe.
+// BOTH PROBES HAND THEIR WAIT, THEIR FLAG AND THEIR LINE TO host.HoldProbe.
 //
 // The helper's own tests cannot see whether anything calls it: a probe branch
 // put back to `<-ctx.Done()` would leave them green and the fleet hanging at the
 // probe step again, which is the outage this guards. The call site cannot be
 // reached from a unit test without a ledger and a GitHub, so the source is
-// asserted: exactly two upgrade-probe branches, each calling holdProbe with the
+// asserted: exactly two upgrade-probe branches, each calling host.HoldProbe with the
 // hold flag itself as the third argument and one of the two constant lines in
 // the fourth, neither printing nor receiving from a channel on its own.
 func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
@@ -59,18 +59,18 @@ func TestBothUpgradeProbesHandTheWaitToHoldProbe(t *testing.T) {
 		pos := fset.Position(stmt.Pos())
 
 		if holds != 1 {
-			t.Errorf("%s: the upgrade-probe branch calls holdProbe(ctx, env, <hold flag>, <line "+
+			t.Errorf("%s: the upgrade-probe branch calls host.HoldProbe(ctx, env, <hold flag>, <line "+
 				"constant>) %d times, want 1", pos, holds)
 		}
 
 		if prints != 0 {
 			t.Errorf("%s: the upgrade-probe branch prints on its own; the readiness line is "+
-				"holdProbe's to print, and only when holding", pos)
+				"host.HoldProbe's to print, and only when holding", pos)
 		}
 
 		if receives != 0 {
 			t.Errorf("%s: the upgrade-probe branch receives from a channel itself; the wait "+
-				"belongs to holdProbe, which knows when not to", pos)
+				"belongs to host.HoldProbe, which knows when not to", pos)
 		}
 
 		return false
@@ -100,11 +100,11 @@ func isFlagRef(e ast.Expr, name string) bool {
 	return false
 }
 
-// isHoldProbeCall recognises holdProbe(ctx, env, holdProbeFlag | *holdProbeFlag, <an
-// expression naming serverProbeReadyLine or nodeProbeReadyFormat>).
+// isHoldProbeCall recognises host.HoldProbe(ctx, env, holdProbeFlag | *holdProbeFlag,
+// <an expression naming host.ServerProbeReadyLine or host.NodeProbeReadyFormat>).
 func isHoldProbeCall(call *ast.CallExpr) bool {
-	id, ok := call.Fun.(*ast.Ident)
-	if !ok || id.Name != "holdProbe" || len(call.Args) != 4 {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || !isHostSelector(sel, "HoldProbe") || len(call.Args) != 4 {
 		return false
 	}
 
@@ -115,8 +115,8 @@ func isHoldProbeCall(call *ast.CallExpr) bool {
 	found := false
 
 	ast.Inspect(call.Args[3], func(n ast.Node) bool {
-		if id, ok := n.(*ast.Ident); ok &&
-			(id.Name == "serverProbeReadyLine" || id.Name == "nodeProbeReadyFormat") {
+		if sel, ok := n.(*ast.SelectorExpr); ok &&
+			(isHostSelector(sel, "ServerProbeReadyLine") || isHostSelector(sel, "NodeProbeReadyFormat")) {
 			found = true
 		}
 
@@ -124,6 +124,13 @@ func isHoldProbeCall(call *ast.CallExpr) bool {
 	})
 
 	return found
+}
+
+// isHostSelector recognises host.<name>.
+func isHostSelector(sel *ast.SelectorExpr, name string) bool {
+	pkg, ok := sel.X.(*ast.Ident)
+
+	return ok && pkg.Name == "host" && sel.Sel.Name == name
 }
 
 // isFmtPrint recognises every fmt print: to the process's stdout, or to a

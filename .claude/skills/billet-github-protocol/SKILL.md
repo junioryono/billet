@@ -45,7 +45,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/scaleset/*_test.go` (`endtoend_test.go`, `sessionconflict_test.go`, `teardown_test.go`, `wire_test.go`, `repository_test.go`, `version_test.go`), `internal/integration/repositoryscope_live_test.go` (opt-in, `BILLET_LIVE_REPOSITORY`), `internal/e2e/targets_test.go`, `internal/ops/fleetops/teardowntargets_test.go`, `internal/server/sessionconflict_test.go`, `sessionrecovery_test.go`, `jobresult_test.go`, `scaleset_provenance_test.go`, `runnerless_completion_test.go`, `internal/scaleset/broker_health_test.go`.
-- `internal/github/*_test.go` (manifest, permissions, redaction), `internal/ops/setup/githubapp_test.go`, `internal/ops/fleetops/teardown_test.go`, `cmd/billet/githubaccess_test.go`.
+- `internal/github/*_test.go` (manifest, permissions, redaction), `internal/ops/setup/githubapp_test.go`, `internal/ops/fleetops/teardown_test.go`, `internal/ops/host/githubaccess_test.go`.
 - `internal/integration/sessionreplacement_test.go`, `configboundary_test.go`; `internal/e2e/lifecycle_test.go` (a message is acked only after its work is done; a redelivered message does not start the job twice).
 
 ## Related skills

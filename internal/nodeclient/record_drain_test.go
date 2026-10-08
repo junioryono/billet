@@ -708,12 +708,17 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 			return false
 		}
 
-		id, ok := c.Fun.(*ast.Ident)
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
 
-		return ok && id.Name == "nodeRegistrationRecordPath"
+		pkg, ok := sel.X.(*ast.Ident)
+
+		return ok && pkg.Name == "host" && sel.Sel.Name == "NodeRegistrationRecordPath"
 	})
 	if named != 1 {
-		t.Errorf("cmd/billet's nodeHost names RegistrationRecordPath: nodeRegistrationRecordPath(...) %d times, want once", named)
+		t.Errorf("cmd/billet's nodeHost names RegistrationRecordPath: host.NodeRegistrationRecordPath(...) %d times, want once", named)
 	}
 
 	passed := 0
@@ -796,10 +801,11 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		t.Error("app.RunNodeLoop is not the one statement that runs nodeclient.Run")
 	}
 
-	// ONE SPELLING OF THE PATH, in cmd/billet, internal/app and here.
+	// ONE SPELLING OF THE PATH, in cmd/billet, internal/ops/host, internal/app and
+	// here.
 	spellings := 0
 
-	for _, dir := range []string{"../../cmd/billet", "../app", "."} {
+	for _, dir := range []string{"../../cmd/billet", "../ops/host", "../app", "."} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatal(err)
