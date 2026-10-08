@@ -154,6 +154,11 @@ lint: ## golangci-lint (pinned version), for this platform AND linux
 	@# --allow-serial-runners WAITS for another golangci-lint on this machine
 	@# rather than failing: its lock is machine-wide, and a lint another project
 	@# runs outside the gate lock failed this gate (2026-10-06).
+	@#
+	@# A CHECKOUT PATH WITH GLOB SYNTAX IN IT IS REFUSED. depguard's file globs
+	@# start at $${config-path}, which golangci-lint substitutes unescaped, so under
+	@# a directory named `billet[2]` every rule would select nothing and pass.
+	@case '$(CURDIR)' in *[][*?{}]*) echo "make lint: $(CURDIR) contains glob syntax ([ ] * ? { }), which depguard's file patterns would read as a pattern and match nothing; lint from a checkout whose path has none" >&2; exit 1;; esac
 	$(NICE) golangci-lint run --timeout=15m --allow-serial-runners
 	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
 	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
