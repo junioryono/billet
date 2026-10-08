@@ -6,7 +6,8 @@
 # Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
 # `//nolint:linter-name // reason` when an exception is genuinely justified.
 #
-# Run: golangci-lint run --timeout=15m
+# Run: make lint (both platforms, and it refuses a checkout path with glob
+# syntax in it, which the depguard rules below would read as a pattern).
 #
 # PINNED VERSION: v2.12.2, matching .github/workflows/ci.yml. Install the same
 # version locally so your runs agree with CI:
@@ -182,7 +183,7 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/internal/state/**"
+            - "!${config-path}/internal/state/**"
           deny:
             - pkg: "modernc.org/sqlite"
               desc: "Open the control-plane database through internal/state, which verifies WAL + synchronous=FULL and takes the process lock."
@@ -198,7 +199,7 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/internal/scaleset/**"
+            - "!${config-path}/internal/scaleset/**"
           deny:
             - pkg: "github.com/actions/scaleset"
               desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
@@ -211,7 +212,7 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/internal/node/reapi/**"
+            - "!${config-path}/internal/node/reapi/**"
           deny:
             - pkg: "github.com/bazelbuild/remote-apis"
               desc: "Serve the Remote Execution API through internal/node/reapi."
@@ -227,7 +228,7 @@ linters:
         provider:
           list-mode: lax
           files:
-            - "**/internal/provider/**"
+            - "${config-path}/internal/provider/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/server"
               desc: "A provider is a lower layer than the scheduler; invert the dependency."
@@ -240,7 +241,7 @@ linters:
         store:
           list-mode: lax
           files:
-            - "**/internal/store/**"
+            - "${config-path}/internal/store/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/server"
               desc: "The store is a lower layer than the scheduler."
@@ -260,7 +261,7 @@ linters:
         lifeops:
           list-mode: strict
           files:
-            - "**/internal/lifeops/**"
+            - "${config-path}/internal/lifeops/**"
           # ANCHORED WITH $, because depguard matches a PREFIX otherwise —
           # without it "internal/config" would also admit a future
           # internal/config/secrets, which is not what the sentence above says.
@@ -298,7 +299,7 @@ linters:
         lease:
           list-mode: strict
           files:
-            - "**/internal/lease/**"
+            - "${config-path}/internal/lease/**"
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/config$
@@ -310,7 +311,7 @@ linters:
         dispatch:
           list-mode: strict
           files:
-            - "**/internal/dispatch/**"
+            - "${config-path}/internal/dispatch/**"
           allow:
             - $gostd
             - github.com/junioryono/billet/internal/lease$
@@ -321,7 +322,7 @@ linters:
         supervise:
           list-mode: strict
           files:
-            - "**/internal/supervise/**"
+            - "${config-path}/internal/supervise/**"
           allow:
             - $gostd
 
@@ -335,12 +336,12 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/cmd/billet/**"
-            - "!**/internal/app/**"
-            - "!**/internal/ops/**"
-            - "!**/internal/e2e/**"
-            - "!**/internal/integration/**"
-            - "!**/internal/replay/**"
+            - "!${config-path}/cmd/billet/**"
+            - "!${config-path}/internal/app/**"
+            - "!${config-path}/internal/ops/**"
+            - "!${config-path}/internal/e2e/**"
+            - "!${config-path}/internal/integration/**"
+            - "!${config-path}/internal/replay/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/app$"
               desc: "internal/app is the assembly; only cmd/billet, its command families under internal/ops and billet's harnesses invoke it (ADR-015)."
@@ -358,13 +359,30 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/cmd/billet/**"
-            - "!**/internal/ops/host/**"
+            - "!${config-path}/cmd/billet/**"
+            - "!${config-path}/internal/ops/host/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/ops$"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
             - pkg: "github.com/junioryono/billet/internal/ops/"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
+
+        # THE COMMAND LINE IS THE TOP LAYER. internal/cli is the command tree, the
+        # Env a command writes to and the exit statuses; a runtime package that
+        # imported it would be a layer below reaching up into the CLI. Only the
+        # binary and its command families use it. Measured at zero violations
+        # when it went in (#356 Phase 5, the one layer rule the regroup was to add
+        # that was not already held package by package).
+        cliconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/cmd/billet/**"
+            - "!${config-path}/internal/cli/**"
+            - "!${config-path}/internal/ops/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/cli$"
+              desc: "internal/cli is the command line; only cmd/billet and its command families under internal/ops use it (#356 Phase 5)."
 
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix
@@ -378,8 +396,8 @@ linters:
         # interface (#356 Plan changes, 2026-10-04).
         noderuntime:
           files:
-            - "**/internal/node/**"
-            - "**/internal/nodeclient/**"
+            - "${config-path}/internal/node/**"
+            - "${config-path}/internal/nodeclient/**"
             - "!$test"
           deny:
             - pkg: "github.com/junioryono/billet/internal/server$"
@@ -403,7 +421,7 @@ linters:
         nodeapi:
           list-mode: strict
           files:
-            - "**/internal/nodeapi/**"
+            - "${config-path}/internal/nodeapi/**"
             - "!$test"
           allow:
             - $gostd
@@ -437,9 +455,9 @@ linters:
           list-mode: lax
           files:
             - "$all"
-            - "!**/internal/state/**"
-            - "!**/internal/alloc/**"
-            - "!**/internal/rollout/**"
+            - "!${config-path}/internal/state/**"
+            - "!${config-path}/internal/alloc/**"
+            - "!${config-path}/internal/rollout/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal/state/ledgerdb"
               desc: "Generated queries are bound by internal/state's adapters; reach the ledger through internal/state, which takes the lock and owns the transaction."
@@ -448,7 +466,7 @@ linters:
         sqlcgenerated:
           list-mode: lax
           files:
-            - "**/internal/state/ledgerdb/**"
+            - "${config-path}/internal/state/ledgerdb/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal"
               desc: "Generated code imports nothing of billet's; it is the bottom of the stack."
@@ -457,7 +475,7 @@ linters:
         config:
           list-mode: lax
           files:
-            - "**/internal/config/**"
+            - "${config-path}/internal/config/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal"
               desc: "config is a leaf package — it must not import other billet packages."
@@ -468,7 +486,7 @@ linters:
         usage:
           list-mode: lax
           files:
-            - "**/internal/usage/**"
+            - "${config-path}/internal/usage/**"
           deny:
             - pkg: "github.com/junioryono/billet/internal"
               desc: "usage is a leaf package — it must not import other billet packages."
@@ -508,9 +526,9 @@ linters:
         ledgerwriters:
           list-mode: lax
           files:
-            - "**/internal/state/**"
-            - "**/internal/alloc/**"
-            - "**/internal/rollout/**"
+            - "${config-path}/internal/state/**"
+            - "${config-path}/internal/alloc/**"
+            - "${config-path}/internal/rollout/**"
             - "!$test"
           deny:
             - pkg: "net/http"
