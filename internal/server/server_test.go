@@ -292,6 +292,10 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
+	// wantPolls recorded means seven gaps of 8/15 of the TTL, about 3.7 TTLs: a
+	// listener that did not heartbeat would lose its escrow more than once.
+	const wantPolls = 8
+
 	var (
 		mu         sync.Mutex
 		advertised []int
@@ -329,6 +333,14 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 				advertised = append(advertised, capacity)
 				backed = append(backed, u.VCPU)
 
+				// THE RUN ENDS ON A COUNT OF POLLS, NOT A WALL TIME: what has to be
+				// outlived is the TTL, which enough polls at this cadence are, and a
+				// loaded runner that polls slowly still gets them all (CI run
+				// 37720122315, 2026-10-08, ended a fixed 8×TTL after three).
+				if len(advertised) == wantPolls {
+					cancel()
+				}
+
 				// THE ERROR IS KEPT, NOT DISCARDED. Usage returns the zero value
 				// beside its error, and a zero would otherwise read as "the ledger
 				// holds nothing" — which is the exact failure this test exists to
@@ -347,11 +359,6 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 			}}
 		},
 	}
-
-	go func() {
-		time.Sleep(8 * leaseTTL)
-		cancel()
-	}()
 
 	// The reaper must actually FIRE inside this test, or it proves nothing about
 	// the interaction it is named for.
@@ -383,7 +390,7 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if len(advertised) < 4 {
+	if len(advertised) < wantPolls {
 		t.Fatalf("only %d polls; not enough to outlive the TTL and prove anything", len(advertised))
 	}
 
