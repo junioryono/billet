@@ -46,6 +46,10 @@ const (
 	Every = 10 * time.Minute
 	// Keep is how many snapshots the directory holds; the oldest go first.
 	Keep = 4
+	// stopWait bounds how long Stop waits for a snapshot being written. A
+	// stopping controller holds its claim until it exits, and evidence is not
+	// worth keeping a successor waiting on a hung disk.
+	stopWait = 10 * time.Second
 	// DirName is the directory the control plane records into, under its
 	// identity directory.
 	DirName = "flight-recorder"
@@ -71,6 +75,8 @@ type Recorder struct {
 	log    *slog.Logger
 	window window
 	now    func() time.Time
+	// stopWait is the constant of that name, a field so a test can shorten it.
+	stopWait time.Duration
 
 	mu      sync.Mutex
 	last    map[Reason]time.Time
@@ -90,8 +96,10 @@ func Start(dir string, log *slog.Logger) (*Recorder, error) {
 }
 
 func start(dir string, log *slog.Logger, w window, now func() time.Time) (*Recorder, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("flight recorder: create %s: %w", dir, err)
+	// DURABLY, its entry in the identity directory included, or a crash could
+	// take the directory and every snapshot installed in it.
+	if err := (durablefile.Installer{}).MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("flight recorder: %w", err)
 	}
 
 	// A DIRECTORY, NOT A LINK TO ONE: a snapshot lands where the configuration
@@ -109,7 +117,9 @@ func start(dir string, log *slog.Logger, w window, now func() time.Time) (*Recor
 		return nil, fmt.Errorf("flight recorder: start: %w", err)
 	}
 
-	return &Recorder{dir: dir, log: log, window: w, now: now, last: map[Reason]time.Time{}}, nil
+	return &Recorder{
+		dir: dir, log: log, window: w, now: now, stopWait: stopWait, last: map[Reason]time.Time{},
+	}, nil
 }
 
 // Snapshot writes the window to a file for reason, on a goroutine of its own,
@@ -213,7 +223,13 @@ func isSnapshotName(name string) bool {
 		return false
 	}
 
-	if _, err := time.Parse(stampLayout, rest[:len(stampLayout)]); err != nil {
+	// THE NAME AS WRITE WOULD SPELL IT, not merely one the parser accepts: it
+	// takes a comma for the decimal point, and a file named that way is not one
+	// this package wrote.
+	stamp := rest[:len(stampLayout)]
+
+	at, err := time.Parse(stampLayout, stamp)
+	if err != nil || at.UTC().Format(stampLayout) != stamp {
 		return false
 	}
 
@@ -227,6 +243,10 @@ func isSnapshotName(name string) bool {
 
 // Stop waits for the snapshots being written, then stops recording. A
 // Snapshot after Stop does nothing.
+//
+// THE WAIT IS BOUNDED. A snapshot still being written after stopWait is left to
+// the process's exit, and the runtime's recorder is left running with it,
+// because stopping it waits for that same write.
 func (r *Recorder) Stop() {
 	if r == nil {
 		return
@@ -236,6 +256,21 @@ func (r *Recorder) Stop() {
 	r.stopped = true
 	r.mu.Unlock()
 
-	r.writes.Wait()
-	r.window.Stop()
+	written := make(chan struct{})
+
+	go func() {
+		r.writes.Wait()
+		close(written)
+	}()
+
+	bound := time.NewTimer(r.stopWait)
+	defer bound.Stop()
+
+	select {
+	case <-written:
+		r.window.Stop()
+	case <-bound.C:
+		r.log.Error("flight recorder: a snapshot was still being written when the process stopped; "+
+			"it is left unfinished", "dir", r.dir, "waited", r.stopWait)
+	}
 }

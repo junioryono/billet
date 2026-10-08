@@ -215,6 +215,8 @@ func TestOnlyTheNewestSnapshotsRemainAndNothingElseIsRemoved(t *testing.T) {
 		"notes.txt",
 		"flight-20261001T000000.000Z-something-else.trace",
 		"flight-garbage.trace",
+		"flight-20261001T000000,000Z-heartbeat-overrun.trace",
+		"flight-20261001T000000.000Z-heartbeat-overrun.trace.bak",
 		".durable-123",
 	}
 
@@ -302,6 +304,49 @@ func TestASnapshotNeverHoldsItsCaller(t *testing.T) {
 
 	if got := snapshots(t, dir); len(got) != 2 {
 		t.Errorf("the directory holds %q, want both snapshots", got)
+	}
+}
+
+// STOP IS BOUNDED: a snapshot whose write never finishes holds Stop for its
+// bound and no longer, and the window is left running rather than stopped
+// under it.
+func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	w := &fakeWindow{content: "w", gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+
+	r, _ := startFake(t, dir, w)
+	r.stopWait = 50 * time.Millisecond
+
+	t.Cleanup(func() { close(w.gate) })
+
+	r.Snapshot(HeartbeatOverrun)
+
+	select {
+	case <-w.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no snapshot began writing")
+	}
+
+	stopped := make(chan struct{})
+
+	go func() {
+		r.Stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop waited past its bound for a write that never finishes")
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.stopped {
+		t.Error("the window was stopped under a write still in progress")
 	}
 }
 

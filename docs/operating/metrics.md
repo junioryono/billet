@@ -89,13 +89,13 @@ server:
 | `heartbeat-overrun` | a tier's heartbeat pass, which renews every lease the tier holds, is still running when the next pass is due. The file is written while the pass is stuck, so it shows what the pass is waiting for |
 | `leadership-lost` | the ledger refused a write because another controller took the deployment; written before the process stops |
 
-A file lands in `flight-recorder/` under the identity directory, named for the time and the reason (`flight-20261008T150405.123Z-heartbeat-overrun.trace`), readable by the service account alone. Each reason is written at most once every ten minutes, so a stall that repeats every pass leaves one file rather than one a pass, and the four newest files are kept: a few tens of megabytes at most. Only the controller records; a standby starts recording once it takes the claim.
+A file lands in `flight-recorder/` under the identity directory, named for the time and the reason (`flight-20261008T150405.123Z-heartbeat-overrun.trace`), readable by the service account alone. Each reason is written at most once every ten minutes, so a stall that repeats every pass leaves one file rather than one a pass, and the four newest files are kept. The window aims at 32 MiB, which the runtime treats as a target rather than a limit and may meet by keeping less than two minutes, so allow for four files of about that size, and one more being written. Only the controller records; a standby starts recording once it takes the claim.
 
 ```bash
 go tool trace /var/lib/billet/flight-recorder/flight-20261008T150405.123Z-heartbeat-overrun.trace
 ```
 
-A trace holds what each goroutine did and where, with its stacks, and nothing of the process's memory. The runtime's tracer costs CPU for as long as it records, and the window up to 32 MiB of memory, which is why it is off unless asked for.
+A trace holds what each goroutine did and where, with its stacks, and nothing of the process's memory. The runtime's tracer costs CPU for as long as it records, and the window holds about that much memory, which is why it is off unless asked for. A snapshot still being written when the controller stops is waited for ten seconds and then left unfinished, so a slow disk never holds the claim from a successor.
 
 ## A scrape configuration
 

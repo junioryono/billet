@@ -227,7 +227,7 @@ func (cp *ControlPlane) BecomeController(ctx context.Context, stop func()) (*Con
 		return nil, err
 	}
 
-	ctl := &Controller{cp: cp, claim: claim}
+	ctl := &Controller{cp: cp, claim: claim, claimLost: cp.db.LeadershipLost}
 	ctl.self = ctl
 
 	// ONLY ONCE THE CLAIM IS HELD: a standby has no heartbeats to overrun and no
@@ -264,6 +264,9 @@ type Controller struct {
 	// recorder is the flight recorder, or nil when server.flight_recorder is
 	// off; a nil one records nothing.
 	recorder *flightrecorder.Recorder
+	// claimLost is the ledger's LeadershipLost, which Close asks once the loops
+	// are joined.
+	claimLost func() bool
 
 	// self is the address BecomeController made this Controller at. The proofs
 	// name their controller by address, so a copy, or a Controller overwritten
@@ -274,8 +277,19 @@ type Controller struct {
 
 // Close joins every loop the controller started, then the flight recorder's
 // snapshots, so one taken as the process stopped is on disk before it exits.
+//
+// A LOST CLAIM IS RECORDED HERE TOO. The fence's watcher can see the plane's
+// context end before it sees the claim's signal, when a refused write stopped
+// the plane first, and then records nothing; asked again here, once every loop
+// has returned, the latched fact is not missed. The recorder's rate limit keeps
+// it to one snapshot when the watcher did record it.
 func (c *Controller) Close() []error {
 	errs := c.loops.Wait()
+
+	if c.claimLost != nil && c.claimLost() {
+		c.recorder.Snapshot(flightrecorder.LeadershipLost)
+	}
+
 	c.recorder.Stop()
 
 	return errs
@@ -492,11 +506,10 @@ func (c *Controller) Schedule(
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
 		server.WithStopHandoff())
 
-	// ONLY WITH A RECORDER: without one, a timer armed around every pass would
-	// tell nobody.
-	if c.recorder != nil {
-		serverOpts = append(serverOpts, server.WithHeartbeatOverrun(c.heartbeatOverrun))
-	}
+	// WHETHER OR NOT THERE IS A RECORDER, which a nil one makes a no-op: one
+	// timer a pass is nothing beside the pass, and wiring that depends on a
+	// branch is wiring a reversed branch removes.
+	serverOpts = append(serverOpts, server.WithHeartbeatOverrun(c.heartbeatOverrun))
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())

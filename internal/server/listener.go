@@ -411,9 +411,14 @@ type Listener struct {
 	leadershipLost func() bool
 
 	// heartbeatOverrun is told when a heartbeat pass is still running as the
-	// next falls due. Nil unless the flight recorder is on; see
+	// next falls due. Nil outside the control plane; see
 	// WithHeartbeatOverrunReport.
 	heartbeatOverrun func()
+	// overrunTimer replaces time.AfterFunc for the overrun's timer when non-nil.
+	// TEST-ONLY and nil in every deployment: a pass that must NOT be reported is
+	// one whose timer was stopped, which a real timer can only show by racing
+	// the machine's scheduler.
+	overrunTimer func(d time.Duration, f func()) (stop func() bool)
 
 	// reopen opens a replacement session after a poll failed past the client's
 	// own retries. Nil for a standalone listener, whose Run returns that failure
@@ -2655,6 +2660,11 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 		defer l.heartbeatStopped()
 	}
 
+	// AN OVERRUN THAT FIRED IS JOINED BEFORE THE LOOP RETURNS, so a report under
+	// way as the plane stops reaches whoever it tells before they stop too.
+	var overruns sync.WaitGroup
+	defer overruns.Wait()
+
 	ticks := l.heartbeatTicks
 	if ticks == nil {
 		ticker := time.NewTicker(l.heartbeatInterval())
@@ -2671,20 +2681,42 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 			// ARMED BEFORE THE PASS AND STOPPED AFTER IT, so an overrun is told
 			// while the pass is still stuck, lock wait included, rather than once
 			// it has ended and the evidence with it.
-			var overrun *time.Timer
-			if l.heartbeatOverrun != nil {
-				overrun = time.AfterFunc(l.heartbeatInterval(), l.heartbeatOverrun)
-			}
+			disarm := l.armOverrun(&overruns)
 
 			l.heartbeatPass(ctx)
 
-			if overrun != nil {
-				overrun.Stop()
-			}
+			disarm()
 
 			if l.heartbeatPassed != nil {
 				l.heartbeatPassed()
 			}
+		}
+	}
+}
+
+// armOverrun starts the timer that reports this pass as overrun, counting it in
+// told until it is either stopped before it fired or has finished telling.
+func (l *Listener) armOverrun(told *sync.WaitGroup) (disarm func()) {
+	if l.heartbeatOverrun == nil {
+		return func() {}
+	}
+
+	after := l.overrunTimer
+	if after == nil {
+		after = func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+	}
+
+	told.Add(1)
+
+	stop := after(l.heartbeatInterval(), func() {
+		defer told.Done()
+
+		l.heartbeatOverrun()
+	})
+
+	return func() {
+		if stop() {
+			told.Done()
 		}
 	}
 }

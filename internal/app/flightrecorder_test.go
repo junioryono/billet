@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -77,8 +78,8 @@ func TestAControllerRecordsNothingByDefault(t *testing.T) {
 // under the identity directory before Close returns: an overrunning heartbeat
 // pass as the listeners report it, and a lost claim as the fence reports it.
 //
-// NOT PARALLEL: the runtime allows one flight recorder per process, and this
-// is the only test in the package that starts one.
+// NOT PARALLEL: the runtime allows one flight recorder per process, and the
+// tests in this package that start one run one at a time.
 func TestAControllerRecordsAnOverrunAndALostClaim(t *testing.T) {
 	ctl, dir := becomeTestController(t, true)
 
@@ -122,6 +123,40 @@ func TestAControllerRecordsAnOverrunAndALostClaim(t *testing.T) {
 
 	if len(reasons) != 2 || reasons[0] == reasons[1] {
 		t.Errorf("the recorder wrote %q, want one snapshot for each reason", reasons)
+	}
+}
+
+// A LOST CLAIM THE FENCE'S WATCHER MISSED IS RECORDED BY CLOSE: the watcher
+// can see the plane's context end first and record nothing, and Close asks the
+// ledger's latched fact once the loops are joined.
+//
+// NOT PARALLEL, for the reason the test above gives.
+func TestALostClaimTheWatcherMissedIsRecordedOnClose(t *testing.T) {
+	ctl, dir := becomeTestController(t, true)
+
+	ctl.claimLost = func() bool { return true }
+
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	stopWhenReplaced(ended, make(chan struct{}), func() {
+		t.Error("a watcher whose context ended stopped the process")
+	}, ctl.recorder, slog.New(slog.DiscardHandler))
+
+	ctl.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), "-"+string(flightrecorder.LeadershipLost)+".trace") {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+
+		t.Errorf("Close left %q, want one leadership-lost snapshot", names)
 	}
 }
 
