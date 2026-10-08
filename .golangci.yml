@@ -595,10 +595,16 @@ linters:
         # measured at zero when the ban went in (#356 Phase 3c); the owning
         # packages and tests are exempt below, one message per constructor's
         # package so each package's exemption covers its own constructor and no
-        # other. The constructors cmd/billet's operator commands still call
-        # (state.Open*, alloc.New, the backends' and stores' New,
-        # awscreds.Default, scaleset.New) join this as #356 Phase 4 moves those
-        # commands out.
+        # other.
+        #
+        # Three more are the operator commands' (#356 Phase 4, measured at zero
+        # once every family had moved): the allocator, whose limits a hand-built
+        # copy spells out again; the ledger, whose modes apply the release
+        # watermark and the identity check; and the scale-set client. NOT the
+        # backends' and stores' constructors, which the families call to build a
+        # probe or an image pull with options of their own, nor awscreds.Default,
+        # which is the credential chain the AWS packages read by design (#356
+        # Plan changes, 2026-10-08).
         - pattern: '^server\.New$'
           msg: "Build the scheduler through internal/app (ADR-015)."
         - pattern: '^nodeplane\.(New|Handler|BootstrapHandler)$'
@@ -609,6 +615,12 @@ linters:
           msg: "Build the node client and its loop through internal/app (ADR-015)."
         - pattern: '^rollout\.NewCoordinator$'
           msg: "Build the rollout coordinator through internal/app (ADR-015)."
+        - pattern: '^alloc\.New$'
+          msg: "Build the allocator through internal/app (app.NewAllocator), which charges the control plane's own limits (ADR-015)."
+        - pattern: '^state\.Open'
+          msg: "Open the ledger through internal/app (app.OpenLedger), whose modes apply the release watermark and the identity check (ADR-015)."
+        - pattern: '^scaleset\.New$'
+          msg: "Build the scale-set client through internal/app (app.NewScaleSetClientFor) (ADR-015)."
         - pattern: '^ledgerdb\.New$'
           msg: "Bind the generated queries through state.ReadQueries or state.WriteQueries. ledgerdb.New returns every method, which gives away the compile-time read/write split those two exist to keep."
 
@@ -728,6 +740,31 @@ linters:
         linters:
           - forbidigo
         text: 'forbidden because "Build the rollout coordinator through internal/app'
+
+      - path: (^|/)internal/(app|alloc)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the allocator through internal/app'
+
+      # The state package's own test template opens the throwaway ledger every
+      # test copies; retirement opens its restricted handles (an admin open of
+      # the archived directory, the inspection and the completion) itself, kept
+      # apart from every ordinary mode on purpose (billet-controller-retirement).
+      - path: (^|/)internal/(app|state|state/ledgertest)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Open the ledger through internal/app'
+
+      - path: (^|/)internal/ops/host/serverretire[a-z]*\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Open the ledger through internal/app'
+
+      # The replay harness builds its client against the scripted Actions service.
+      - path: (^|/)internal/(app|scaleset|replay)/[^/]+\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "Build the scale-set client through internal/app'
 
       # THE USER-SPACE RESOLVER IS THE CONTAINMENT. resolveInRoot walks a path
       # component by component under a root and stats every step, which is how

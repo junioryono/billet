@@ -13,7 +13,6 @@ import (
 	"github.com/junioryono/billet/internal/app"
 
 	"github.com/junioryono/billet/deploy"
-	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -738,12 +737,7 @@ func stillClear(ctx context.Context, cfg *config.Config) error {
 
 	defer db.Close()
 
-	allocator, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
+	allocator, err := app.NewAllocator(cfg, db)
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
 	}
