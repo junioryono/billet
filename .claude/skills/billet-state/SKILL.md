@@ -17,6 +17,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 
 - **The engine is a seam and the invariants are not.**
 - **Every write transaction begins IMMEDIATE, and that is not tuning.**
+- **The writer slot is observed from inside `DB.Tx`, and the observer must return at once.**
 - **A ledger writer reaches no network.**
 - **Three open modes, and what each may do.**
 - **An open's own startup budget is a deadline, and a caller can tell it from its own.**
