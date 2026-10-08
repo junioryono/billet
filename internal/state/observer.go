@@ -7,9 +7,14 @@ import "time"
 // and each time a busy BEGIN was retried. It is what shows the single writer
 // slot filling up before scheduling stalls behind it.
 //
-// CALLED ON THE WRITER'S OWN GOROUTINE, the wait and the retry while no
-// transaction is open and the hold after it has ended, so an implementation
-// must return at once and touch nothing that could reach the ledger.
+// CALLED ON THE WRITER'S OWN GOROUTINE: a retry while the write waits, before
+// any transaction is open, and the wait and the hold together once the
+// transaction has ended, each measured where it ended so the observer's own
+// time is in neither. An implementation must still return at once and touch
+// nothing that could reach the ledger. The hold ends when Tx's own commit or
+// rollback returns; a rollback database/sql runs by itself after the context
+// is cancelled can still be finishing then, so a hold cut short by
+// cancellation is the lower bound of the true one.
 type Observer interface {
 	WriteWaited(d time.Duration)
 	WriteHeld(d time.Duration, committed bool)

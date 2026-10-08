@@ -1207,16 +1207,20 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return err
 	}
 
+	acquired := time.Now()
 	committed := false
 
-	// REGISTERED BEFORE THE ROLLBACK, so it runs after it: the hold ends when
-	// the transaction does, not when fn returns.
+	// BOTH ARE TOLD AFTER THE TRANSACTION ENDS, from times taken where each
+	// ended: the observer runs while nothing holds the writer slot, and its own
+	// time is in neither figure. Registered before the rollback, so it runs
+	// after it.
 	if obs != nil {
-		obs.WriteWaited(time.Since(began))
+		defer func() {
+			held := time.Since(acquired)
 
-		held := time.Now()
-
-		defer func() { obs.WriteHeld(time.Since(held), committed) }()
+			obs.WriteWaited(acquired.Sub(began))
+			obs.WriteHeld(held, committed)
+		}()
 	}
 
 	defer func() {

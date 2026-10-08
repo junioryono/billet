@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -312,44 +313,85 @@ func TestTheLedgerSourceServesGaugesAndWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	scrape := func() string {
+		t.Helper()
+
+		ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+m.srv.Addr().String()+"/metrics", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return string(body)
+	}
+
+	// A BASELINE AFTER THE HOST REGISTERED, so what moves next is the escrow's.
+	before := scrape()
+
 	if leases, err := a.Escrow(t.Context(), tier.Label, 1); err != nil || len(leases) != 1 {
 		t.Fatalf("Escrow: %d leases, %v", len(leases), err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+m.srv.Addr().String()+"/metrics", http.NoBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if err != nil {
-		t.Fatal(err)
-	}
+	after := scrape()
 
 	for _, want := range []string{
 		`billet_tier_leases{state="unknown",tier="billet-2vcpu"} 1`,
 		`billet_scrape_up{source="ledger"} 1`,
-		`billet_ledger_write_held_seconds_count{outcome="committed"}`,
-		`billet_ledger_write_held_seconds_count{outcome="rolled_back"} 0`,
-		"billet_ledger_write_wait_seconds_count ",
 		"billet_ledger_write_busy_retries_total 0",
 	} {
-		if !strings.Contains(string(body), want) {
+		if !strings.Contains(after, want) {
 			t.Errorf("/metrics does not carry %q", want)
 		}
 	}
 
-	if strings.Contains(string(body), "billet_ledger_write_wait_seconds_count 0\n") {
-		t.Error("the escrow's write was not told to the endpoint")
+	delta := func(series string) float64 {
+		return sampleValue(t, after, series) - sampleValue(t, before, series)
 	}
+
+	waits := delta("billet_ledger_write_wait_seconds_count")
+	committed := delta(`billet_ledger_write_held_seconds_count{outcome="committed"}`)
+	rolledBack := delta(`billet_ledger_write_held_seconds_count{outcome="rolled_back"}`)
+
+	if waits < 1 || committed != waits || rolledBack != 0 {
+		t.Errorf("the escrow moved the wait count by %v, the committed holds by %v and the rolled-back ones by %v; "+
+			"want at least one write, each told as one wait and one committed hold, and nothing rolled back",
+			waits, committed, rolledBack)
+	}
+}
+
+// sampleValue is the value of one series in a scrape.
+func sampleValue(t *testing.T, body, series string) float64 {
+	t.Helper()
+
+	for _, line := range strings.Split(body, "\n") {
+		value, ok := strings.CutPrefix(line, series+" ")
+		if !ok {
+			continue
+		}
+
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			t.Fatalf("%s has value %q: %v", series, value, err)
+		}
+
+		return v
+	}
+
+	t.Fatalf("the scrape has no %s", series)
+
+	return 0
 }
