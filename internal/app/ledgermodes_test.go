@@ -40,15 +40,18 @@ func TestEachLedgerModeIsTheOpenItsNameSays(t *testing.T) {
 
 	cfg := &config.Config{Server: &config.ServerConfig{IdentityDir: dir}}
 
-	if _, err := OpenLedger(t.Context(), cfg, LedgerDecision); !errors.Is(err, ErrNoLedgerYet) {
+	if db, err := OpenLedger(t.Context(), cfg, LedgerDecision); !errors.Is(err, ErrNoLedgerYet) {
+		closeUnexpected(t, db)
 		t.Fatalf("the decision read of an empty directory answered %v, want ErrNoLedgerYet", err)
 	}
 
-	if _, err := OpenLedger(t.Context(), cfg, LedgerInspect); !errors.Is(err, state.ErrNoLedger) {
+	if db, err := OpenLedger(t.Context(), cfg, LedgerInspect); !errors.Is(err, state.ErrNoLedger) {
+		closeUnexpected(t, db)
 		t.Fatalf("the report of an empty directory answered %v, want state.ErrNoLedger", err)
 	}
 
-	if _, err := OpenLedgerWith(t.Context(), cfg, LedgerInspect, ""); !errors.Is(err, state.ErrNoLedger) {
+	if db, err := OpenLedgerWith(t.Context(), cfg, LedgerInspect, ""); !errors.Is(err, state.ErrNoLedger) {
+		closeUnexpected(t, db)
 		t.Fatalf("the report handed a connection string, of an empty directory, answered %v, want state.ErrNoLedger", err)
 	}
 
@@ -125,8 +128,9 @@ func TestEachLedgerModeIsTheOpenItsNameSays(t *testing.T) {
 		Backend: config.StatePostgres, Postgres: &config.PostgresStateConfig{DSNEnv: "BILLET_TEST_UNSET_LEDGER_DSN"},
 	}}}
 
-	if _, err := OpenLedger(t.Context(), pg, LedgerInspect); err == nil ||
+	if db, err := OpenLedger(t.Context(), pg, LedgerInspect); err == nil ||
 		!strings.Contains(err.Error(), "BILLET_TEST_UNSET_LEDGER_DSN") {
+		closeUnexpected(t, db)
 		t.Fatalf("the report read its connection string from somewhere other than the environment: %v", err)
 	}
 
@@ -142,5 +146,17 @@ func TestEachLedgerModeIsTheOpenItsNameSays(t *testing.T) {
 	case <-dialled:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the report was handed a connection string and never dialled it")
+	}
+}
+
+// closeUnexpected closes a handle an open that should have refused returned, so
+// the failure it reports leaves no pool or directory lock to the tests after it.
+func closeUnexpected(t *testing.T, db *state.DB) {
+	t.Helper()
+
+	if db != nil {
+		if err := db.Close(); err != nil {
+			t.Errorf("close the handle an open should not have returned: %v", err)
+		}
 	}
 }
