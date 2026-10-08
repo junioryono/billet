@@ -64,7 +64,7 @@ func publishAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 // It reads through the same validating reader the file backend uses, so a value
 // that is not a key is refused here rather than at the first token mint.
 func githubAppStoreKey(ctx context.Context, env cli.Env, args []string) error {
-	fs := cli.NewFlagSet("github-app store-key", env.Stdout)
+	fs := cli.NewFlagSet("billet github-app store-key", env.Stdout)
 	from := fs.String("from", "", "the file holding the App private key")
 	configPath := fs.String("config", "", "path to billet.yaml")
 	targetName := fs.String("target", "", "the target this key belongs to (default: the only one)")

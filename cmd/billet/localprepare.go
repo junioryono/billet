@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,7 +48,7 @@ type hostPrepareAnswer struct {
 // exists, else the packaged default, so a fresh package install prepares the
 // directory the server will use before any metadata exists beside it.
 func cmdLocalPrepare(ctx context.Context, env cli.Env, args []string) error {
-	flags := flag.NewFlagSet("billet local prepare", flag.ContinueOnError)
+	flags := cli.NewFlagSet("billet local prepare", env.Stdout)
 	cfgPath := addServiceConfigFlag(flags)
 	account := flags.String("account", initconfig.ServiceGroup, "the service account the units run as")
 	group := flags.String("group", "", "the service group (defaults to the account's name)")

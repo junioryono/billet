@@ -66,14 +66,14 @@ func TestMainHandsCommandsTheProcessStreams(t *testing.T) {
 			switch x := n.(type) {
 			case *ast.AssignStmt:
 				for i, lhs := range x.Lhs {
-					root := lhs
+					root := ast.Unparen(lhs)
 					for {
 						sel, isSel := root.(*ast.SelectorExpr)
 						if !isSel {
 							break
 						}
 
-						root = sel.X
+						root = ast.Unparen(sel.X)
 					}
 
 					if r, isID := root.(*ast.Ident); !isID || r.Name != id.Name {
@@ -82,7 +82,7 @@ func TestMainHandsCommandsTheProcessStreams(t *testing.T) {
 
 					assignments++
 
-					if l, isLit := x.Rhs[min(i, len(x.Rhs)-1)].(*ast.CompositeLit); isLit && lhs == root {
+					if l, isLit := x.Rhs[min(i, len(x.Rhs)-1)].(*ast.CompositeLit); isLit && ast.Unparen(lhs) == root {
 						lit, ok = l, true
 					} else {
 						t.Errorf("main changes the env it hands cli.Main: %s", types.ExprString(lhs))
