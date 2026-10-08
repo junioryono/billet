@@ -6,7 +6,8 @@
 # Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
 # `//nolint:linter-name // reason` when an exception is genuinely justified.
 #
-# Run: golangci-lint run --timeout=15m
+# Run: make lint (both platforms, and it refuses a checkout path with glob
+# syntax in it, which the depguard rules below would read as a pattern).
 #
 # PINNED VERSION: v2.12.2, matching .github/workflows/ci.yml. Install the same
 # version locally so your runs agree with CI:

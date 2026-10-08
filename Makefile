@@ -150,15 +150,19 @@ docs: ## Build the Sphinx documentation with warnings as errors, as Read the Doc
 		$(MAKE) -C docs html BUILDDIR="$$build_dir" SPHINXOPTS="-W --keep-going"
 
 .PHONY: lint
-lint: ## golangci-lint (pinned version), for this platform AND linux
+.PHONY: lint-path
+lint-path:
+	@# A CHECKOUT PATH WITH GLOB SYNTAX IN IT IS REFUSED, before any golangci-lint
+	@# run. depguard's file globs start at $${config-path}, which golangci-lint
+	@# substitutes unescaped (2.12.2), so under a directory named `billet[2]` a rule
+	@# that selects files under the root selects none, and one that exempts them
+	@# exempts none. The path is read by the shell, never pasted into it.
+	@dir=$$(pwd); case "$$dir" in *[][*?{}]*) printf 'make: %s contains glob syntax ([ ] * ? { }), which depguard would read as a pattern: a rule could check no file, or exempt none. Lint from a checkout whose path has none.\n' "$$dir" >&2; exit 1;; esac
+
+lint: lint-path ## golangci-lint (pinned version), for this platform AND linux
 	@# --allow-serial-runners WAITS for another golangci-lint on this machine
 	@# rather than failing: its lock is machine-wide, and a lint another project
 	@# runs outside the gate lock failed this gate (2026-10-06).
-	@#
-	@# A CHECKOUT PATH WITH GLOB SYNTAX IN IT IS REFUSED. depguard's file globs
-	@# start at $${config-path}, which golangci-lint substitutes unescaped, so under
-	@# a directory named `billet[2]` every rule would select nothing and pass.
-	@case '$(CURDIR)' in *[][*?{}]*) echo "make lint: $(CURDIR) contains glob syntax ([ ] * ? { }), which depguard's file patterns would read as a pattern and match nothing; lint from a checkout whose path has none" >&2; exit 1;; esac
 	$(NICE) golangci-lint run --timeout=15m --allow-serial-runners
 	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
 	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
@@ -202,7 +206,7 @@ lint-custom: ## billet's own analyzers, and the tests that prove they still dete
 	done
 
 .PHONY: lint-fix
-lint-fix:
+lint-fix: lint-path
 	golangci-lint run --fix --timeout=15m
 
 .PHONY: fmt
