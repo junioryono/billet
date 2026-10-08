@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/ops/images"
 
 	"github.com/junioryono/billet/internal/config"
@@ -15,7 +17,7 @@ func TestCompatibilitySelectionUsesTheCertificateDerivedNodeName(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", bundleDir}); err != nil {
+	if err := fleetops.CAIssue(t.Context(), processEnv(), []string{"epyc-1", "--config", serverCfg, "--out", bundleDir}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 

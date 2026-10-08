@@ -1,9 +1,10 @@
-package main
+package fleetops
 
 import (
 	"context"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -26,7 +27,7 @@ func forgetScaleSet(ctx context.Context, cfg *config.Config, target, group, labe
 		return nil
 	}
 
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return fmt.Errorf("open the ledger at %s: %w", cfg.Server.IdentityDir, err)
 	}

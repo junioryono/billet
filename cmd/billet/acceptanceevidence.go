@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -185,7 +187,7 @@ func writeAcceptanceEvidence(ctx context.Context, env cli.Env, ws acceptanceWork
 func collectAcceptanceEvidence(
 	ctx context.Context, ws acceptanceWorkspace,
 ) (acceptanceEvidenceDoc, error) {
-	db, cfg, err := openLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return acceptanceEvidenceDoc{}, err
 	}
@@ -325,7 +327,7 @@ func readJobHistory(ctx context.Context, db *state.DB) ([]acceptanceJob, error) 
 
 // readAcceptanceJobs is what the wait loop asks.
 func readAcceptanceJobs(ctx context.Context, ws acceptanceWorkspace) ([]acceptanceJob, error) {
-	db, _, err := openLedgerForAdmission(ctx, ws.ConfigPath)
+	db, _, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return nil, err
 	}

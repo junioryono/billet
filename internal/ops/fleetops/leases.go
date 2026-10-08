@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 )
 
 // cmdLeases is the operator's view of capacity that has not come back.
-func cmdLeases(ctx context.Context, env cli.Env, args []string) error {
+func Leases(ctx context.Context, env cli.Env, args []string) error {
 	// Bare `billet leases` — with or without flags — is the documented form and
 	// means `held`; only a word selects another view.
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
@@ -25,7 +25,7 @@ func cmdLeases(ctx context.Context, env cli.Env, args []string) error {
 	case "held":
 		return cmdLeasesHeld(ctx, env, args[1:])
 	case "quarantined":
-		return cmdLeasesQuarantined(ctx, env, args[1:])
+		return LeasesQuarantined(ctx, env, args[1:])
 	case "failures":
 		return cmdLeasesFailures(ctx, env, args[1:])
 	case "release":
@@ -45,7 +45,7 @@ func cmdLeasesHeld(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -62,18 +62,18 @@ func cmdLeasesHeld(ctx context.Context, env cli.Env, args []string) error {
 		return nil
 	}
 
-	printHeld(env, held)
+	PrintHeld(env, held)
 	fmt.Fprintf(env.Stdout, "\nCustody preserves adopted work; teardown is a live node waiting for its backend\n")
 	fmt.Fprintf(env.Stdout, "to confirm removal; quarantine has no current holder. When you have independent\n")
 	fmt.Fprintf(env.Stdout, "proof the compute is gone:\n\n  billet leases release <lease> --force\n")
-	printHolderNote(env.Stdout, held)
+	PrintHolderNote(env.Stdout, held)
 	fmt.Fprintf(env.Stdout, "\nFor jobs that FAILED while billet's own infrastructure was disrupted:\n\n")
 	fmt.Fprintf(env.Stdout, "  billet leases failures\n")
 
 	return nil
 }
 
-func printHeld(env cli.Env, held []alloc.HeldLease) {
+func PrintHeld(env cli.Env, held []alloc.HeldLease) {
 	printHeldTo(env.Stdout, held)
 }
 
@@ -151,7 +151,7 @@ func shortIncarnation(s string) string {
 // releases it on the spot; a lease still being renewed after that has a LIVE
 // holder — a superseded process draining what it holds — and the force request
 // goes through that process. Time is not evidence of either; renewal is.
-func printHolderNote(out io.Writer, held []alloc.HeldLease) {
+func PrintHolderNote(out io.Writer, held []alloc.HeldLease) {
 	for i := range held {
 		if !held[i].Holder.Replaced() {
 			continue
@@ -176,7 +176,7 @@ func printHolderNote(out io.Writer, held []alloc.HeldLease) {
 // line the only visible fact was a slot in use. It never fails the command, for
 // the reason printReportedInventory gives: `billet status` is what somebody runs
 // when something is already wrong.
-func printReplacedHolders(ctx context.Context, env cli.Env, a *alloc.Allocator) {
+func PrintReplacedHolders(ctx context.Context, env cli.Env, a *alloc.Allocator) {
 	orphaned, err := a.RunningWithReplacedHolder(ctx)
 	if err != nil {
 		fmt.Fprintf(env.Stdout, "bound     unavailable: %v\n", err)
@@ -230,7 +230,7 @@ func heldFor(since string) string {
 // heartbeating while a container may still be running, so billet keeps charging
 // the host until somebody who can see that machine says otherwise. Without this
 // the number is simply smaller than it was, with nothing to read.
-func cmdLeasesQuarantined(ctx context.Context, env cli.Env, args []string) error {
+func LeasesQuarantined(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet leases quarantined", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 
@@ -238,7 +238,7 @@ func cmdLeasesQuarantined(ctx context.Context, env cli.Env, args []string) error
 		return err
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -296,7 +296,7 @@ func cmdLeasesRelease(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("usage: billet leases release <lease> --force")
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}

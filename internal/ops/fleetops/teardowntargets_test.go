@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"net/http"
@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/app"
 
 	"github.com/junioryono/billet/internal/fakeactions"
 )
@@ -62,9 +64,9 @@ targets:
 		}
 	})
 
-	prevWeb, prevAPI := scaleSetGitHubURL, githubAPIBase
-	scaleSetGitHubURL, githubAPIBase = fake.URL, fake.URL+"/api/v3"
-	t.Cleanup(func() { scaleSetGitHubURL, githubAPIBase = prevWeb, prevAPI })
+	prevWeb, prevAPI := app.ScaleSetGitHubURL, app.GitHubAPIBase
+	app.ScaleSetGitHubURL, app.GitHubAPIBase = fake.URL, fake.URL+"/api/v3"
+	t.Cleanup(func() { app.ScaleSetGitHubURL, app.GitHubAPIBase = prevWeb, prevAPI })
 
 	// The fake's throwaway key stands in for both targets' keys.
 	for _, name := range []string{"app.pem", "app-personal.pem"} {
@@ -76,7 +78,7 @@ targets:
 	var err error
 
 	out := capture(t, func() {
-		err = cmdTeardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--yes"})
+		err = Teardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--yes"})
 	})
 	if err != nil {
 		t.Fatalf("teardown --all: %v\n%s", err, out)

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
@@ -116,7 +118,7 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	// FIFO cannot hang this, regular-file, bounded, mode-checked and actually
 	// parsed — the same rules `billet check` and `billet server` apply, because a
 	// second implementation of them is a second thing to keep right.
-	appKey, err := resolveAppKey(ctx, cfg, targets[0])
+	appKey, err := app.ResolveAppKey(ctx, cfg, targets[0])
 	if err != nil {
 		return err
 	}
@@ -127,7 +129,7 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	further := make([]deployarchive.TargetKey, 0, len(targets))
 
 	for _, target := range targets[1:] {
-		pem, err := resolveAppKey(ctx, cfg, target)
+		pem, err := app.ResolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return fmt.Errorf("target %s: %w", target.Name, err)
 		}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/imagesource"
@@ -349,7 +350,7 @@ func TestHumanBytesReadsTheWayAnOperatorReadsIt(t *testing.T) {
 		{397_000_000, "378.6 MiB"},
 		{4 << 30, "4.0 GiB"},
 	} {
-		if got := HumanBytes(tc.in); got != tc.want {
+		if got := cli.HumanBytes(tc.in); got != tc.want {
 			t.Errorf("humanBytes(%d) = %q, want %q", tc.in, got, tc.want)
 		}
 	}

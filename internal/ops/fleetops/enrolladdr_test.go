@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"testing"
@@ -54,7 +54,7 @@ func TestTheEnrollmentAddressPrefersTheFlagThenTheConfig(t *testing.T) {
 				BootstrapAddr: c.cfgAddr,
 			}}
 
-			if got := bootstrapBase(cfg, c.flag); got != c.want {
+			if got := BootstrapBase(cfg, c.flag); got != c.want {
 				t.Errorf("bootstrapBase = %q, want %q", got, c.want)
 			}
 		})

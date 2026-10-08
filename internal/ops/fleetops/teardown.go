@@ -1,8 +1,10 @@
-package main
+package fleetops
 
 import (
 	"errors"
 	"fmt"
+
+	"github.com/junioryono/billet/internal/app"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -99,8 +101,8 @@ func teardownTargets(tiers []config.Tier, tier, group string, force bool) ([]con
 // tiersOnTarget narrows the config's tiers to one target's, so a scale-set name
 // several targets declare can be torn down on one of them, and a set one target
 // no longer declares is undeclared there whatever the others say.
-func tiersOnTarget(cfg *config.Config, name string) ([]config.Tier, error) {
-	target, err := targetByName(cfg, name)
+func TiersOnTarget(cfg *config.Config, name string) ([]config.Tier, error) {
+	target, err := app.TargetByName(cfg, name)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +120,7 @@ func tiersOnTarget(cfg *config.Config, name string) ([]config.Tier, error) {
 
 // tierDisplay names a tier for an operator, with the runs-on name workflows use
 // when it is not the label.
-func tierDisplay(t *config.Tier) string {
+func TierDisplay(t *config.Tier) string {
 	if t.ScaleSetName() == t.Label {
 		return t.Label
 	}

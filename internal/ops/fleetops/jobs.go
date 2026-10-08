@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -8,14 +8,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/junioryono/billet/internal/ops/images"
-
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 )
 
 // cmdJobs is the operator's view of what jobs did.
-func cmdJobs(ctx context.Context, env cli.Env, args []string) error {
+func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet jobs show <lease>")
 	}
@@ -38,7 +36,7 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	}
 	leaseID := fs.Arg(0)
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -80,7 +78,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("lease", "%s", rec.LeaseID)
 	shape := ""
 	if rec.VCPU > 0 {
-		shape = fmt.Sprintf(", %d vCPU, %s", rec.VCPU, images.HumanBytes(rec.Memory))
+		shape = fmt.Sprintf(", %d vCPU, %s", rec.VCPU, cli.HumanBytes(rec.Memory))
 	}
 	line("tier", "%s on %s (%s%s)", rec.Tier, orUnknown(rec.Node), orUnknown(rec.ChosenProvider), shape)
 	// NO REQUEST ID FOR A POOLED LEASE, for `billet leases failures`' reason:
@@ -125,17 +123,17 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	})
 	group(alloc.UsageMemory, "memory", func() string {
 		if !u.Measured(alloc.UsageOOM) {
-			return fmt.Sprintf("peak %s, oom kills not measured", images.HumanBytes(u.MemoryPeakBytes))
+			return fmt.Sprintf("peak %s, oom kills not measured", cli.HumanBytes(u.MemoryPeakBytes))
 		}
-		return fmt.Sprintf("peak %s, oom kills %d", images.HumanBytes(u.MemoryPeakBytes), u.OOMKills)
+		return fmt.Sprintf("peak %s, oom kills %d", cli.HumanBytes(u.MemoryPeakBytes), u.OOMKills)
 	})
 	group(alloc.UsageIO, "disk", func() string {
 		return fmt.Sprintf("read %s, written %s (host io, not the guest's page cache)",
-			images.HumanBytes(u.DiskReadBytes), images.HumanBytes(u.DiskWriteBytes))
+			cli.HumanBytes(u.DiskReadBytes), cli.HumanBytes(u.DiskWriteBytes))
 	})
 	group(alloc.UsageNet, "network", func() string {
 		return fmt.Sprintf("received %s, sent %s (the guest's view)",
-			images.HumanBytes(u.NetRxBytes), images.HumanBytes(u.NetTxBytes))
+			cli.HumanBytes(u.NetRxBytes), cli.HumanBytes(u.NetTxBytes))
 	})
 	group(alloc.UsagePressure, "stalled", func() string {
 		return fmt.Sprintf("cpu %s, memory %s (full %s), io %s (full %s)", seconds(u.CPUSomeMicros),

@@ -9,6 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -160,7 +164,7 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 		// rollout drain the node and then fail to land.
 		BinaryDir: hostPathsFor(hostOS).binaryDir(),
 	}
-	req.KeyPaths = appKeyFilePaths(cfg)
+	req.KeyPaths = app.KeyFilePaths(cfg)
 
 	c := converge()
 
@@ -454,7 +458,7 @@ func clearShutdownSeal(ctx context.Context, env cli.Env, cfg *config.Config, req
 	resumed, err := db.Resume(ctx, state.ResumeRequest{
 		Expect: current.Generation,
 		Clears: state.ProvenanceLocalDown,
-		Actor:  actor(env),
+		Actor:  fleetops.Actor(env),
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrAdmissionProvenance) {

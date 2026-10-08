@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -80,7 +80,7 @@ func cmdCASync(ctx context.Context, env cli.Env, args []string) error {
 					"replaces the store's copy either way")
 		}
 
-		if err := app.WithAuthorityLock(ctx, cfg, authorityLockAccess, log, func(dir string) error {
+		if err := app.WithAuthorityLock(ctx, cfg, AuthorityLockAccess, log, func(dir string) error {
 			return wireshare.Publish(ctx, store, dir, deployment)
 		}); err != nil {
 			return err
@@ -95,7 +95,7 @@ func cmdCASync(ctx context.Context, env cli.Env, args []string) error {
 
 	var adopted wireshare.Adopted
 
-	if err := app.WithAuthorityLock(ctx, cfg, authorityLockAccess, log, func(dir string) error {
+	if err := app.WithAuthorityLock(ctx, cfg, AuthorityLockAccess, log, func(dir string) error {
 		var err error
 		adopted, err = wireshare.Adopt(ctx, store, dir, deployment, *force)
 

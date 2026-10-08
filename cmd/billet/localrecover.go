@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -250,7 +252,7 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 			Plan:          plan,
 			InstallAppKey: func(path string, pem []byte) error { return installAppKey(env, path, pem) },
 			Now:           time.Now,
-			Actor:         actor(env),
+			Actor:         fleetops.Actor(env),
 		})
 		if rerr := acc.Release(); rerr != nil {
 			err = errors.Join(err, rerr)
@@ -411,7 +413,7 @@ func sealRecoveredDeployment(ctx context.Context, env cli.Env, cfg *config.Confi
 		reason = "billet local recover"
 	}
 
-	if _, err := takeTheSeal(ctx, env, db, current, reason); err != nil {
+	if _, err := fleetops.TakeTheSeal(ctx, env, db, current, reason); err != nil {
 		return recoveredButOpen(env, err)
 	}
 
@@ -469,7 +471,7 @@ func quiesceForRecovery(ctx context.Context, env cli.Env, cfg *config.Config, o 
 		reason = "billet local recover"
 	}
 
-	sealed, err := takeTheSeal(ctx, env, db, current, reason)
+	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, reason)
 	if err != nil {
 		return err
 	}
@@ -498,7 +500,7 @@ func quiesceForRecovery(ctx context.Context, env cli.Env, cfg *config.Config, o 
 	// STILL HOLDING WORK, and there are exactly two ways forward: wait for it, or
 	// accept losing it BY NAME. Neither is chosen for the operator.
 	if !o.acceptJobs {
-		fmt.Fprintf(env.Stdout, "\n%s\n", outstandingSummary(q))
+		fmt.Fprintf(env.Stdout, "\n%s\n", fleetops.OutstandingSummary(q))
 
 		// THE LEDGER BARRIER ONLY, DELIBERATELY. `drain --wait` and `local down`
 		// take the compute proof as a second stage; this command is the disaster
@@ -507,8 +509,8 @@ func quiesceForRecovery(ctx context.Context, env cli.Env, cfg *config.Config, o 
 		// exists for. What protects an operator here is the same thing it always
 		// was: every job this would strand is NAMED, and losing them has to be
 		// accepted by name.
-		return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
-			timeout: o.timeout, withoutProof: true,
+		return fleetops.WaitForQuiet(ctx, env, db, cfg, sealed.Generation, fleetops.WaitOptions{
+			Timeout: o.timeout, WithoutProof: true,
 		})
 	}
 

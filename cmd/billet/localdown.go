@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
+	"github.com/junioryono/billet/internal/app"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
@@ -100,7 +104,7 @@ func runLocalDown(ctx context.Context, env cli.Env, o downOptions) error {
 		WantServer: cfg.Server != nil,
 		WantNode:   cfg.Node != nil,
 	}
-	req.KeyPaths = appKeyFilePaths(cfg)
+	req.KeyPaths = app.KeyFilePaths(cfg)
 
 	if !req.WantServer && !req.WantNode {
 		return fmt.Errorf("%s declares neither a server nor a node, so there is nothing on "+
@@ -290,7 +294,7 @@ func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.
 			Expect:       current.Generation,
 			Provenance:   state.ProvenanceLocalDown,
 			Reason:       reason,
-			Actor:        actor(env),
+			Actor:        fleetops.Actor(env),
 			KeepExisting: true,
 		})
 		if err != nil {
@@ -322,9 +326,9 @@ func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.
 		withoutProof = true
 	}
 
-	if err := waitForQuiet(ctx, env, db, cfg, current.Generation, waitOptions{
-		timeout:      o.timeout,
-		withoutProof: withoutProof,
+	if err := fleetops.WaitForQuiet(ctx, env, db, cfg, current.Generation, fleetops.WaitOptions{
+		Timeout:      o.timeout,
+		WithoutProof: withoutProof,
 	}); err != nil {
 		return 0, false, err
 	}

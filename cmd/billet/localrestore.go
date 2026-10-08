@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
@@ -226,7 +228,7 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 		Plan:          plan,
 		InstallAppKey: func(path string, pem []byte) error { return installAppKey(env, path, pem) },
 		Now:           time.Now,
-		Actor:         actor(env),
+		Actor:         fleetops.Actor(env),
 	})
 	if rerr := acc.Release(); rerr != nil {
 		err = errors.Join(err, rerr)

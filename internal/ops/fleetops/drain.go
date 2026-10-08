@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -56,7 +57,7 @@ var errWaitInterrupted = &cli.ExitError{
 // It is a LABEL, not an identity: nothing authenticates it, and the ledger
 // treats it as text. It exists so a person can be found, not so a permission can
 // be granted.
-func actor(env cli.Env) string {
+func Actor(env cli.Env) string {
 	name := env.Getenv("SUDO_USER")
 
 	if name == "" {
@@ -81,7 +82,7 @@ func actor(env cli.Env) string {
 // command does: through OpenAdmin, so it works WHILE a control plane is running.
 // Taking the directory lock would make `billet drain` fail against exactly the
 // deployment it exists to drain.
-func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *config.Config, error) {
+func OpenLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *config.Config, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, nil, err
@@ -92,7 +93,7 @@ func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *co
 			"config has no server section")
 	}
 
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return nil, nil, fmt.Errorf("server state: %w", err)
 	}
@@ -107,7 +108,7 @@ func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *co
 // and every job already running finishes. Killing compute is `billet local down`
 // and the node's own shutdown, and conflating the two is how a maintenance
 // window fails somebody's build.
-func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
+func Drain(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet drain", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "",
@@ -146,7 +147,7 @@ func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
 			"command seals and returns immediately, and proves nothing about any host")
 	}
 
-	db, cfg, err := openLedgerForAdmission(ctx, *cfgPath)
+	db, cfg, err := OpenLedgerForAdmission(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -158,7 +159,7 @@ func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, env, db, current, *reason)
+	sealed, err := TakeTheSeal(ctx, env, db, current, *reason)
 	if err != nil {
 		return err
 	}
@@ -170,20 +171,20 @@ func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
 		return nil
 	}
 
-	return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
-		timeout:      *timeout,
-		withoutProof: *withoutProof,
+	return WaitForQuiet(ctx, env, db, cfg, sealed.Generation, WaitOptions{
+		Timeout:      *timeout,
+		WithoutProof: *withoutProof,
 	})
 }
 
 // waitOptions is what a caller of waitForQuiet decided.
-type waitOptions struct {
-	timeout time.Duration
+type WaitOptions struct {
+	Timeout time.Duration
 	// withoutProof stops after the LEDGER barrier, skipping the question put to
 	// each host. It exists because the proof cannot always be obtained — a host
 	// that is off, or too old to answer, never will — and an operator has to be
 	// able to proceed knowing that is what they did.
-	withoutProof bool
+	WithoutProof bool
 }
 
 // takeTheSeal records the operator's decision and returns the admission the
@@ -195,7 +196,7 @@ type waitOptions struct {
 // and exit 0 against a deployment that is now OPEN — after which somebody starts
 // maintenance while work is being admitted. state.Seal makes the same-provenance
 // no-op inside the write transaction, so the answer here is the ledger's.
-func takeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.Admission,
+func TakeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.Admission,
 	reason string,
 ) (state.Admission, error) {
 	// A SHUTDOWN'S SEAL IS ESCALATED, and that is a real change rather than a
@@ -210,7 +211,7 @@ func takeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.A
 		Expect:     current.Generation,
 		Provenance: state.ProvenanceOperator,
 		Reason:     reason,
-		Actor:      actor(env),
+		Actor:      Actor(env),
 		// `billet drain` is "make sure this is sealed", so running it twice must
 		// leave the first operator's attribution and fence alone.
 		KeepExisting: true,
@@ -271,7 +272,7 @@ func takeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.A
 }
 
 // cmdResume lets the deployment admit work again.
-func cmdResume(ctx context.Context, env cli.Env, args []string) error {
+func Resume(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet resume", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 
@@ -279,7 +280,7 @@ func cmdResume(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	db, _, err := openLedgerForAdmission(ctx, *cfgPath)
+	db, _, err := OpenLedgerForAdmission(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -311,7 +312,7 @@ func cmdResume(ctx context.Context, env cli.Env, args []string) error {
 	resumed, err := db.Resume(ctx, state.ResumeRequest{
 		Expect: current.Generation,
 		Clears: state.ProvenanceOperator,
-		Actor:  actor(env),
+		Actor:  Actor(env),
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrAdmissionProvenance) {
@@ -348,8 +349,8 @@ func cmdResume(ctx context.Context, env cli.Env, args []string) error {
 // and an offer accepted just before that is real work with real compute behind
 // it. So the question "is it safe to stop this now" is answered by asking what
 // the deployment is still holding, never by the fact that a seal was taken.
-func waitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Config, generation int64,
-	opts waitOptions,
+func WaitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Config, generation int64,
+	opts WaitOptions,
 ) error {
 	allocator, err := alloc.New(db, alloc.Limits{
 		MaxVCPU:   cfg.Server.MaxVCPU,
@@ -361,10 +362,10 @@ func waitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 		return fmt.Errorf("capacity allocator: %w", err)
 	}
 
-	if opts.timeout > 0 {
+	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
 
-		ctx, cancel = context.WithTimeout(ctx, opts.timeout)
+		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 	}
 
@@ -424,7 +425,7 @@ func waitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			fmt.Fprintf(env.Stdout, "Drained: this deployment is sealed and the ledger records no\n")
 			fmt.Fprintf(env.Stdout, "outstanding lease.\n\n")
 
-			if opts.withoutProof {
+			if opts.WithoutProof {
 				fmt.Fprintf(env.Stdout, "No host was asked what it is running (--without-compute-proof).\n")
 				fmt.Fprintf(env.Stdout, "Compute whose lease has already gone is not visible to the ledger, so\n")
 				fmt.Fprintf(env.Stdout, "this does NOT establish that the machines are idle.\n")
@@ -435,7 +436,7 @@ func waitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Co
 			return proveComputeClear(ctx, env, allocator, generation, ticker)
 		}
 
-		if summary := outstandingSummary(q); summary != last {
+		if summary := OutstandingSummary(q); summary != last {
 			fmt.Fprintf(env.Stdout, "%s\n", summary)
 			last = summary
 		}
@@ -474,7 +475,7 @@ const barrierSilentAfter = 4 * drainPollInterval
 func proveComputeClear(
 	ctx context.Context, env cli.Env, allocator *alloc.Allocator, generation int64, ticker *time.Ticker,
 ) error {
-	barrier, err := allocator.RequestComputeBarrier(ctx, generation, actor(env))
+	barrier, err := allocator.RequestComputeBarrier(ctx, generation, Actor(env))
 	if err != nil {
 		return fmt.Errorf("ask the fleet what it is running: %w", err)
 	}
@@ -529,7 +530,7 @@ func proveComputeClear(
 			return nil
 		}
 
-		heard = heard || anyoneAnswered(clearance)
+		heard = heard || AnyoneAnswered(clearance)
 
 		if summary := clearanceSummary(clearance); summary != last {
 			fmt.Fprintf(env.Stdout, "%s\n", summary)
@@ -561,7 +562,7 @@ func proveComputeClear(
 // from the state alone told an operator "nothing has answered yet, check that
 // `billet server` is up" about a fleet that had answered, and sent them to look
 // at a control plane that was fine.
-func anyoneAnswered(c alloc.ComputeClearance) bool {
+func AnyoneAnswered(c alloc.ComputeClearance) bool {
 	for _, n := range c.Nodes {
 		if n.EmptySince != "" {
 			return true
@@ -673,7 +674,7 @@ func stillDraining(env cli.Env, err error) error {
 // NAMED RATHER THAN COUNTED, because a report somebody cannot recognise their
 // own work in is not a report — "3 leases" tells an operator nothing about
 // whether to keep waiting, and a run id tells them exactly whose build it is.
-func outstandingSummary(q alloc.Quiescence) string {
+func OutstandingSummary(q alloc.Quiescence) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "waiting on %d", len(q.Outstanding))

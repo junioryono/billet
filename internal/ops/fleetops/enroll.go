@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -29,7 +29,7 @@ import (
 const enrollPollEvery = 5 * time.Second
 
 // cmdNodes is the operator's side of enrollment.
-func cmdNodes(ctx context.Context, env cli.Env, args []string) error {
+func Nodes(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet nodes pending | billet nodes approve <node> --fingerprint <fp> | " +
 			"billet nodes deny <node> --fingerprint <fp> | billet nodes revoke <node> | " +
@@ -38,7 +38,7 @@ func cmdNodes(ctx context.Context, env cli.Env, args []string) error {
 
 	switch args[0] {
 	case "pending":
-		return cmdNodesPending(ctx, env, args[1:])
+		return NodesPending(ctx, env, args[1:])
 	case "approve":
 		return cmdNodesDecide(ctx, env, args[1:], alloc.EnrollApproved)
 	case "deny":
@@ -82,7 +82,7 @@ func cmdNodesDecommission(ctx context.Context, env cli.Env, args []string) error
 		return errors.New("usage: billet nodes decommission <node> [--force]")
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func cmdNodesDecommission(ctx context.Context, env cli.Env, args []string) error
 	// in between — the host re-registers, and the exclusion is recorded as proved
 	// about a machine that has just come back.
 	proven, err := a.Decommission(ctx, alloc.DecommissionRequest{
-		Node: name, Actor: actor(env), Force: *force,
+		Node: name, Actor: Actor(env), Force: *force,
 	})
 	if err != nil {
 		return err
@@ -144,7 +144,7 @@ func cmdNodesRevoke(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("usage: billet nodes revoke <node> [--reason why]")
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -184,7 +184,7 @@ func cmdNodesRevoke(ctx context.Context, env cli.Env, args []string) error {
 }
 
 // cmdNodesPending lists machines waiting to be let in.
-func cmdNodesPending(ctx context.Context, env cli.Env, args []string) error {
+func NodesPending(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet nodes pending", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	all := fs.Bool("all", false, "include decided requests")
@@ -193,7 +193,7 @@ func cmdNodesPending(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -283,7 +283,7 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 
 	defer func() { err = errors.Join(err, acc.Release()) }()
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -437,15 +437,15 @@ func recordIssuedCert(
 
 // controlPlaneAllocator is app.OpenOperator's allocator, for a command that
 // runs on the server and needs nothing else.
-func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
-	a, _, closeDB, err := controlPlaneStores(ctx, cfgPath)
+func ControlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
+	a, _, closeDB, err := ControlPlaneStores(ctx, cfgPath)
 
 	return a, closeDB, err
 }
 
 // controlPlaneStores is app.OpenOperator: the allocator and the ledger, for a
 // command that also needs the ledger directly.
-func controlPlaneStores(
+func ControlPlaneStores(
 	ctx context.Context, cfgPath string,
 ) (*alloc.Allocator, *state.DB, func(), error) {
 	return app.OpenOperator(ctx, cfgPath)
@@ -460,7 +460,7 @@ func controlPlaneStores(
 // a machine that is enrolling has none. The flag exists because the operator is
 // already carrying the fingerprint and the join token out of band, and `billet
 // ca token` prints all three together.
-func bootstrapBase(cfg *config.Config, flag string) string {
+func BootstrapBase(cfg *config.Config, flag string) string {
 	for _, addr := range []string{flag, cfg.Node.BootstrapAddr, cfg.Node.ServerAddr} {
 		if addr = strings.TrimSpace(addr); addr != "" {
 			return "https://" + addr
@@ -477,7 +477,7 @@ func bootstrapBase(cfg *config.Config, flag string) string {
 // ends displaying the same number, over a channel an attacker on the network
 // does not control. That comparison is the trust decision; everything else here
 // is transport.
-func enrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken string) error {
+func EnrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFingerprint, joinToken string) error {
 	if cfg.Node.TLS == nil {
 		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
 	}
@@ -555,10 +555,14 @@ func enrollNode(ctx context.Context, env cli.Env, cfg *config.Config, base, caFi
 			return err
 		}
 
+		wait := time.NewTimer(enrollPollEvery)
+
 		select {
 		case <-ctx.Done():
+			wait.Stop()
+
 			return ctx.Err()
-		case <-time.After(enrollPollEvery):
+		case <-wait.C:
 		}
 	}
 }
@@ -715,7 +719,7 @@ func writeBundle(env cli.Env, tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte
 // It admits nothing on its own. A request still waits for an operator to compare
 // fingerprints; what the token stops is a stranger who can reach the port filling
 // the pending list, or taking a name before the machine that should have it.
-func cmdCAToken(ctx context.Context, env cli.Env, args []string) error {
+func CAToken(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca token", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
@@ -726,7 +730,7 @@ func cmdCAToken(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}

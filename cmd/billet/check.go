@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	opsimages "github.com/junioryono/billet/internal/ops/images"
 
 	"github.com/junioryono/billet/deploy"
@@ -177,7 +179,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		switch {
 		case len(targets) > 1:
 			fmt.Fprintf(env.Stdout, "target   %s: %s (app %d, installation %d)\n",
-				target.Name, describeGitHubTarget(target), target.AppID, target.InstallationID)
+				target.Name, app.DescribeGitHubTarget(target), target.AppID, target.InstallationID)
 		case target.IsRepository():
 			fmt.Fprintf(env.Stdout, "repo     %s (app %d, installation %d)\n",
 				target.Repository, target.AppID, target.InstallationID)
@@ -190,9 +192,9 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// FACT DEPENDING ON WHICH. An operator debugging a failover has to know
 		// whether this host read a file of its own or the deployment's shared
 		// store, and the two look identical in every other line of this report.
-		fmt.Fprintf(env.Stdout, "app key  %s\n", appKeyLocation(cfg, target))
+		fmt.Fprintf(env.Stdout, "app key  %s\n", app.KeyLocation(cfg, target))
 
-		key, err := resolveAppKey(ctx, cfg, target)
+		key, err := app.ResolveAppKey(ctx, cfg, target)
 		if err != nil {
 			return report, err
 		}
@@ -211,8 +213,8 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 			verdict = githubSkipped
 			fmt.Fprintf(env.Stdout, "github   (verification skipped during maintenance)\n")
 		default:
-			inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, target.AppID, key,
-				githubTarget(target), target.InstallationID, cfg.TargetNeedsRunEvidence(target.Name))
+			inst, err := github.VerifyAppAt(ctx, nil, app.GitHubAPIBase, target.AppID, key,
+				app.GitHubTargetOf(target), target.InstallationID, cfg.TargetNeedsRunEvidence(target.Name))
 			switch {
 			case errors.Is(err, github.ErrAppUnverifiable):
 				verdict = githubUnverifiable
@@ -537,7 +539,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 
 		fmt.Fprintf(env.Stdout, "  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
-			tierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
+			fleetops.TierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
 
 		// THE SERVER REFUSES ON THIS AND CHECK USED TO PASS OVER IT.
@@ -664,12 +666,12 @@ func checkTierRunnerGroup(
 		return true, nil
 	}
 
-	key, err := resolveAppKey(ctx, cfg, target)
+	key, err := app.ResolveAppKey(ctx, cfg, target)
 	if err != nil {
 		return false, err
 	}
 
-	policy := github.NewRunnerGroupPolicyClientAt(githubAPIBase, githubTarget(target), target.AppID,
+	policy := github.NewRunnerGroupPolicyClientAt(app.GitHubAPIBase, app.GitHubTargetOf(target), target.AppID,
 		target.InstallationID, key)
 
 	id, isDefault, err := policy.FindRunnerGroupID(ctx, t.RunnerGroup)

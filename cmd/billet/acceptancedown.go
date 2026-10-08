@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/cli"
 )
 
@@ -105,7 +107,7 @@ func tearDownAcceptanceWithin(
 	//
 	// SCOPED BY THE DERIVED CONFIG, whose tier labels carry this run's prefix — so
 	// `--all` is every scale set THIS RUN owns and none that anything else does.
-	if err := runBilletSubcommand(ctx, env, cmdTeardown, "teardown",
+	if err := runBilletSubcommand(ctx, env, fleetops.Teardown, "teardown",
 		"--config", ws.ConfigPath, "--all", "--yes"); err != nil {
 		problems = append(problems, err)
 	}
@@ -143,7 +145,7 @@ func tearDownAcceptanceWithin(
 // drainAcceptance seals and waits, through the same code `billet drain --wait`
 // runs.
 func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration) error {
-	db, cfg, err := openLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("open this run's ledger: %w", err)
 	}
@@ -155,7 +157,7 @@ func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, w
 		return fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, env, db, current, "billet acceptance down")
+	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, "billet acceptance down")
 	if err != nil {
 		return fmt.Errorf("seal this run: %w", err)
 	}
@@ -166,16 +168,16 @@ func drainAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, w
 	// clean run. The LEDGER barrier still holds, and the sweep below is what
 	// covers the class the ledger cannot see. `evidence` records whatever the
 	// barrier did manage to establish while the plane was up.
-	return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
-		timeout:      wait,
-		withoutProof: true,
+	return fleetops.WaitForQuiet(ctx, env, db, cfg, sealed.Generation, fleetops.WaitOptions{
+		Timeout:      wait,
+		WithoutProof: true,
 	})
 }
 
 // decommissionAcceptance removes the cloud resources this run created, and
 // tolerates a config that has none.
 func decommissionAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace) error {
-	err := runBilletSubcommand(ctx, env, cmdDecommission, "decommission",
+	err := runBilletSubcommand(ctx, env, fleetops.Decommission, "decommission",
 		"--config", ws.ConfigPath, "--yes")
 	if err == nil {
 		return nil
@@ -272,7 +274,7 @@ func sweepAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, c
 	// deletes nothing. Running the report as the last step means the answer comes
 	// from the same code that would have removed it, rather than from a second
 	// implementation that could disagree about what belongs to this deployment.
-	err := runBilletSubcommand(ctx, env, cmdDecommission, "decommission", "--config", ws.ConfigPath)
+	err := runBilletSubcommand(ctx, env, fleetops.Decommission, "decommission", "--config", ws.ConfigPath)
 
 	switch {
 	case isNoCloudBackend(err) && computeProved:

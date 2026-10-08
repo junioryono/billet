@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/app"
 )
 
 // stubGitHubUnverifiable points cmdCheck's App verification at a fake that
@@ -28,9 +30,9 @@ func stubGitHubUnverifiable(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	prev := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = prev })
+	prev := app.GitHubAPIBase
+	app.GitHubAPIBase = srv.URL
+	t.Cleanup(func() { app.GitHubAPIBase = prev })
 }
 
 // THE CHECK'S GITHUB LINE, both bands, through the real cmdCheck wiring: an
@@ -52,9 +54,9 @@ func TestCheckReportsTheGitHubVerdictBands(t *testing.T) {
 			"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 		})))
 	t.Cleanup(exact.Close)
-	prev := githubAPIBase
-	githubAPIBase = exact.URL
-	t.Cleanup(func() { githubAPIBase = prev })
+	prev := app.GitHubAPIBase
+	app.GitHubAPIBase = exact.URL
+	t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 	var checkErr error
 	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
@@ -81,7 +83,7 @@ func TestCheckReportsTheGitHubVerdictBands(t *testing.T) {
 			"metadata": "read", "organization_self_hosted_runners": "write"}}`)
 	}))
 	t.Cleanup(wrong.Close)
-	githubAPIBase = wrong.URL
+	app.GitHubAPIBase = wrong.URL
 
 	out = capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr == nil {
@@ -244,9 +246,9 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 
-		prev := githubAPIBase
-		githubAPIBase = srv.URL
-		t.Cleanup(func() { githubAPIBase = prev })
+		prev := app.GitHubAPIBase
+		app.GitHubAPIBase = srv.URL
+		t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 		var checkErr error
 		out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
@@ -306,9 +308,9 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			prev := githubAPIBase
-			githubAPIBase = srv.URL
-			t.Cleanup(func() { githubAPIBase = prev })
+			prev := app.GitHubAPIBase
+			app.GitHubAPIBase = srv.URL
+			t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 			var (
 				report   checkReport
@@ -373,9 +375,9 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		}))
 		t.Cleanup(srv.Close)
 
-		prev := githubAPIBase
-		githubAPIBase = srv.URL
-		t.Cleanup(func() { githubAPIBase = prev })
+		prev := app.GitHubAPIBase
+		app.GitHubAPIBase = srv.URL
+		t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 		var checkErr error
 		out := capture(t, func() { _, checkErr = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath}) })
@@ -569,9 +571,9 @@ func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
 
 		srv, _ := defaultGroupServer(t, "selected", 0)
 
-		prev := githubAPIBase
-		githubAPIBase = srv.URL
-		t.Cleanup(func() { githubAPIBase = prev })
+		prev := app.GitHubAPIBase
+		app.GitHubAPIBase = srv.URL
+		t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 		var err error
 		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
@@ -594,9 +596,9 @@ func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
 
 		srv, _ := defaultGroupServer(t, "selected", 1)
 
-		prev := githubAPIBase
-		githubAPIBase = srv.URL
-		t.Cleanup(func() { githubAPIBase = prev })
+		prev := app.GitHubAPIBase
+		app.GitHubAPIBase = srv.URL
+		t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 		var err error
 		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
@@ -639,9 +641,9 @@ func TestCheckAsksAboutTheDefaultGroupOncePerCheck(t *testing.T) {
 
 	srv, repoCalls := defaultGroupServer(t, "selected", 1)
 
-	prev := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = prev })
+	prev := app.GitHubAPIBase
+	app.GitHubAPIBase = srv.URL
+	t.Cleanup(func() { app.GitHubAPIBase = prev })
 
 	var err error
 	out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
