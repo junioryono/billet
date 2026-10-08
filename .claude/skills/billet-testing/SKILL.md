@@ -41,6 +41,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Real and live tests skip without their resource and never spend money by accident.**
 - **PostgreSQL is tested against a real server or not at all.**
 - **Coverage is a signal, not a goal.**
+- **A benchmark measures the ledger the run exercises, and a change to the hot paths shows its numbers before and after.**
 - **The host rehearsals run the real commands on packaged hosts under real systemd, and each needs a real App.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
