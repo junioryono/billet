@@ -366,6 +366,23 @@ linters:
             - pkg: "github.com/junioryono/billet/internal/ops/"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
 
+        # THE COMMAND LINE IS THE TOP LAYER. internal/cli is the command tree, the
+        # Env a command writes to and the exit statuses; a runtime package that
+        # imported it would be a layer below reaching up into the CLI. Only the
+        # binary and its command families use it. Measured at zero violations
+        # when it went in (#356 Phase 5, the one layer rule the regroup was to add
+        # that was not already held package by package).
+        cliconsumers:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/cmd/billet/**"
+            - "!**/internal/cli/**"
+            - "!**/internal/ops/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/cli$"
+              desc: "internal/cli is the command line; only cmd/billet and its command families under internal/ops use it (#356 Phase 5)."
+
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
         # PLANE, nor any package below them (each is denied exactly and as a prefix
         # ending in a slash, so a sibling sharing the name is not). A compute host
