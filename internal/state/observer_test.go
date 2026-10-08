@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -183,5 +184,115 @@ func TestTheObserverIsToldOfEachBusyRetry(t *testing.T) {
 
 	if waited < busyRetryInterval {
 		t.Errorf("a write that retried was told it waited %v, less than one retry's pause (%v)", waited, busyRetryInterval)
+	}
+}
+
+// blockingObserver holds its first WriteWaited until released, and passes on
+// each hold it is told.
+type blockingObserver struct {
+	recordingObserver
+
+	first    atomic.Bool
+	entered  chan struct{}
+	release  chan struct{}
+	heldTold chan time.Duration
+}
+
+func (o *blockingObserver) WriteWaited(d time.Duration) {
+	o.recordingObserver.WriteWaited(d)
+
+	// ONLY THE FIRST CALL IS HELD; a later write's callback passes through,
+	// which sync.Once would not let it do while the first was still held.
+	if o.first.CompareAndSwap(false, true) {
+		close(o.entered)
+		<-o.release
+	}
+}
+
+func (o *blockingObserver) WriteHeld(d time.Duration, committed bool) {
+	o.recordingObserver.WriteHeld(d, committed)
+
+	select {
+	case o.heldTold <- d:
+	default:
+	}
+}
+
+// THE OBSERVER RUNS ONCE THE SLOT IS FREE. While it is held inside its first
+// callback, another write on the same handle, whose writer pool is one
+// connection, still goes through; and the hold it reports for the first write
+// leaves out the time the callback was held.
+func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
+	for _, commit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "commit", false: "rollback"}[commit], func(t *testing.T) {
+			db, err := Open(t.Context(), t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { _ = db.Close() })
+
+			obs := &blockingObserver{
+				entered: make(chan struct{}), release: make(chan struct{}), heldTold: make(chan time.Duration, 4),
+			}
+			db.Observe(obs)
+
+			bound, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			failed := errors.New("rolled back on purpose")
+			first := make(chan error, 1)
+
+			go func() {
+				first <- db.Tx(bound, func(*sql.Tx) error {
+					if commit {
+						return nil
+					}
+
+					return failed
+				})
+			}()
+
+			select {
+			case <-obs.entered:
+			case <-bound.Done():
+				t.Fatal("the first write never told its observer")
+			}
+
+			// HELD INSIDE THE CALLBACK, long enough that a hold measured across
+			// it could not be mistaken for one that was not.
+			const held = 200 * time.Millisecond
+
+			second := make(chan error, 1)
+
+			go func() { second <- db.Tx(bound, func(*sql.Tx) error { return nil }) }()
+
+			select {
+			case err := <-second:
+				if err != nil {
+					t.Fatalf("a write while the observer ran: %v", err)
+				}
+			case <-bound.Done():
+				t.Fatal("a second write could not take the slot while the first write's observer ran")
+			}
+
+			time.Sleep(held) // the callback's own time, which is the scenario
+			close(obs.release)
+
+			if err := <-first; commit != (err == nil) {
+				t.Fatalf("the first write returned %v", err)
+			}
+
+			for range 2 {
+				select {
+				case d := <-obs.heldTold:
+					if d >= held {
+						t.Errorf("a hold of %v was reported, which counts the observer's own %v", d, held)
+					}
+				case <-bound.Done():
+					t.Fatal("a hold was never told")
+				}
+			}
+		})
 	}
 }
