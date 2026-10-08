@@ -1,7 +1,6 @@
 package tart
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -1485,33 +1484,23 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 // reaped still answers `kill -0` and still carries its start time, so its
 // identity matches; without billet_zombie the proof called it alive on both
 // platforms (measured 2026-10-08). Here a real zombie is the announced runner:
-// a child whose parent never waits for it.
+// a child of this test, which does not wait for it until the test ends.
 func TestAZombieRunnerIsNotProved(t *testing.T) {
 	s := newStub(t)
 
-	parent := exec.CommandContext(t.Context(), "/bin/sh", "-c", `sleep 0 & echo "$!"; exec sleep 120`)
-
-	out, err := parent.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
+	// THE TEST OWNS IT, so nothing reaps it early and it is reaped at the end.
+	zombie := exec.CommandContext(t.Context(), "sleep", "0")
+	if err := zombie.Start(); err != nil {
+		t.Fatalf("start the runner that will exit: %v", err)
 	}
 
-	if err := parent.Start(); err != nil {
-		t.Fatalf("start the zombie's parent: %v", err)
-	}
+	t.Cleanup(func() {
+		if err := zombie.Wait(); err != nil {
+			t.Logf("the runner that exited: %v", err)
+		}
+	})
 
-	// Killing the parent hands the zombie to init, which reaps it.
-	t.Cleanup(func() { stopStandIn(t, parent) })
-
-	line, err := bufio.NewReader(out).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read the zombie's pid: %v", err)
-	}
-
-	pid, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil {
-		t.Fatalf("the zombie's pid %q: %v", line, err)
-	}
+	pid := zombie.Process.Pid
 
 	// A ZOMBIE BEFORE IT IS ANNOUNCED, established rather than assumed.
 	until := time.Now().Add(10 * time.Second)
@@ -1539,13 +1528,83 @@ func TestAZombieRunnerIsNotProved(t *testing.T) {
 		}
 	}
 
-	_, err = newProvider(t, s).Launch(t.Context(), validSpec("billet-lease1"))
+	_, err := newProvider(t, s).Launch(t.Context(), validSpec("billet-lease1"))
 	if err == nil {
 		t.Fatal("Launch proved a runner that had exited and was not yet reaped")
 	}
 
 	if !strings.Contains(err.Error(), "the guest says dead") {
 		t.Errorf("Launch = %v, want the zombie reported dead", err)
+	}
+}
+
+// billetZombie runs billet's own billet_zombie on pid with PATH set to path,
+// and reports whether it said zombie.
+func billetZombie(t *testing.T, pid int, path string) bool {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", zombieFunc+`billet_zombie "$1"`, "sh", strconv.Itoa(pid))
+	cmd.Env = append(os.Environ(), "PATH="+path)
+
+	err := cmd.Run()
+	if err == nil {
+		return true
+	}
+
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {
+		t.Fatalf("billet_zombie(%d): %v", pid, err)
+	}
+
+	return false
+}
+
+// A LIVE PROCESS IS NEVER A ZOMBIE, and a ps that fails decides nothing
+// whatever it printed. A false "dead" fails a healthy launch and destroys the
+// VM, so the check answers only on evidence.
+func TestOnlyEvidenceMakesAZombie(t *testing.T) {
+	live := exec.CommandContext(t.Context(), "sleep", "120")
+	if err := live.Start(); err != nil {
+		t.Fatalf("start a live process: %v", err)
+	}
+
+	t.Cleanup(func() { stopStandIn(t, live) })
+
+	if billetZombie(t, live.Process.Pid, os.Getenv("PATH")) {
+		t.Error("a live process was called a zombie")
+	}
+
+	// THE ps BRANCH, which a guest without /proc takes.
+	if _, err := os.Stat("/proc/self/stat"); err == nil {
+		t.Skip("this host has /proc, so billet_zombie never asks ps here")
+	}
+
+	// Each a ps answering for the live process. Only a single Z token, from a
+	// ps that succeeded, is a zombie: "Zl" is a leader whose other threads
+	// still run (Linux procps; measured on Ubuntu 24.04).
+	for _, c := range []struct {
+		answer string
+		exit   int
+		zombie bool
+	}{
+		{"Z", 0, true},
+		{"Zs", 0, true},
+		{"Z", 1, false},
+		{"Zl", 0, false},
+		{"Zsl", 0, false},
+		{"Z extra", 0, false},
+		{"S", 0, false},
+		{"", 0, false},
+	} {
+		fake := t.TempDir()
+
+		script := "#!/bin/sh\necho '" + c.answer + "'\nexit " + strconv.Itoa(c.exit) + "\n"
+		if err := os.WriteFile(filepath.Join(fake, "ps"), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := billetZombie(t, live.Process.Pid, fake+":"+os.Getenv("PATH")); got != c.zombie {
+			t.Errorf("ps answering %q and exiting %d: zombie = %v, want %v", c.answer, c.exit, got, c.zombie)
+		}
 	}
 }
 

@@ -1658,16 +1658,29 @@ const birthFunc = `billet_birth() {
 // that has exited and not been reaped. Such a process still answers `kill -0`
 // and still carries its start time, so billet_birth matches it: measured on
 // macOS and on Ubuntu 24.04 (2026-10-08), a dead runner whose parent had not
-// yet waited for it was proved alive. It fails, and so decides nothing, where
-// neither /proc nor ps can say.
+// yet waited for it was proved alive.
+//
+// THE WHOLE THREAD GROUP, NOT ITS LEADER. On Linux a leader that called
+// pthread_exit is state Z while its other threads still run (measured on Ubuntu
+// 24.04: Z with num_threads 2, ps "Zl"; a true zombie is Z with 1, ps "Z"), and
+// calling that dead would fail a healthy runner's launch and destroy its VM. So
+// /proc must say Z with one thread, and ps a single Z token without the
+// multi-threaded flag; macOS shows such a leader as S. Anything else, a failed
+// ps included, decides nothing.
 const zombieFunc = `billet_zombie() {
   if [ -r "/proc/$1/stat" ]; then
     _z=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
     _z=${_z##*') '}
-    case "$_z" in Z*) return 0 ;; esac
-    return 1
+    # shellcheck disable=SC2086
+    set -- $_z
+    [ "${1:-}" = Z ] && [ "${18:-}" = 1 ]
+    return
   fi
-  case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) return 0 ;; esac
+  _z=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  # shellcheck disable=SC2086
+  set -- $_z
+  [ "$#" -eq 1 ] || return 1
+  case "$1" in *l*) return 1 ;; Z*) return 0 ;; esac
   return 1
 }
 `
