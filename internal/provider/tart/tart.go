@@ -1654,6 +1654,43 @@ const birthFunc = `billet_birth() {
 }
 `
 
+// zombieFunc defines billet_zombie, which succeeds when a pid names a process
+// that has exited and not been reaped. Such a process still answers `kill -0`
+// and still carries its start time, so billet_birth matches it: measured on
+// macOS and on Ubuntu 24.04 (2026-10-08), a dead runner whose parent had not
+// yet waited for it was proved alive.
+//
+// THE WHOLE THREAD GROUP, NOT ITS LEADER. On Linux a leader that called
+// pthread_exit is state Z while its other threads still run (measured on Ubuntu
+// 24.04: Z with num_threads 2, ps "Zl"; a true zombie is Z with 1, ps "Z"), and
+// calling that dead would fail a healthy runner's launch and destroy its VM. So
+// /proc must say Z with one thread, and ps a single Z token without the
+// multi-threaded flag; macOS shows such a leader as S. Anything else, a failed
+// ps included, decides nothing.
+//
+// billet_procstat is the one read of /proc, a function of its own so a test can
+// answer for it with the records a kernel writes.
+const zombieFunc = `billet_procstat() {
+  [ -r "/proc/$1/stat" ] || return 1
+  cat "/proc/$1/stat" 2>/dev/null
+}
+billet_zombie() {
+  if _z=$(billet_procstat "$1"); then
+    _z=${_z##*') '}
+    # shellcheck disable=SC2086
+    set -- $_z
+    [ "${1:-}" = Z ] && [ "${18:-}" = 1 ]
+    return
+  fi
+  _z=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  # shellcheck disable=SC2086
+  set -- $_z
+  [ "$#" -eq 1 ] || return 1
+  case "$1" in *l*) return 1 ;; Z*) return 0 ;; esac
+  return 1
+}
+`
+
 // proveRunning asks the guest whether the runner it was told to start is still
 // alive, and fails the launch when it is not.
 //
@@ -1680,11 +1717,12 @@ func (p *Provider) proveRunning(ctx context.Context, name string) error {
 	// billet older than this one leaves — read as `alive` on nothing more than a
 	// pid being in use, and a recycled number then adopted a stranger. Absent,
 	// unreadable and mismatched are all "cannot prove this is our runner".
-	script := birthFunc + `p=$(cat "$HOME/` + runnerPIDFile + `" 2>/dev/null || true)
+	script := birthFunc + zombieFunc + `p=$(cat "$HOME/` + runnerPIDFile + `" 2>/dev/null || true)
 b=$(cat "$HOME/` + runnerBirthFile + `" 2>/dev/null || true)
 if [ -z "$p" ]; then echo no-pid; exit 0; fi
 if [ -z "$b" ]; then echo no-identity; exit 0; fi
 if ! kill -0 "$p" 2>/dev/null; then echo dead; exit 0; fi
+if billet_zombie "$p"; then echo dead; exit 0; fi
 now=$(billet_birth "$p" || true)
 if [ -z "$now" ]; then echo unreadable; exit 0; fi
 if [ "$now" != "$b" ]; then echo recycled; exit 0; fi
