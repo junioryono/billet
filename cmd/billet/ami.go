@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider/ec2"
@@ -53,7 +54,7 @@ func cmdAMI(ctx context.Context, args []string) error {
 }
 
 func cmdAMIBuild(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ami build")
+	fs := cli.NewFlagSet("billet ami build", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
 	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
@@ -105,7 +106,7 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 	verifyShape := fs.String("verify-instance-type", "",
 		"shape the VERIFIER runs on (default: a small Nitro shape for the image's arch)")
 
-	if err := parse(fs, args[1:]); err != nil {
+	if err := cli.Parse(fs, args[1:]); err != nil {
 		return err
 	}
 
@@ -228,7 +229,7 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 // builder and run the whole thing again. It is also the answer for an image built
 // before verification existed, and for one built with --verify=false.
 func cmdAMIVerify(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet ami verify")
+	fs := cli.NewFlagSet("billet ami verify", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	shape := fs.String("instance-type", "",
 		"shape the verifier runs on (default: a small Nitro shape for the image's arch)")
@@ -252,7 +253,7 @@ func cmdAMIVerify(ctx context.Context, args []string) error {
 	// WRITES. Go's flag package stops at the first positional, so a plain parse
 	// leaves `--config` sitting in the argument list, silently ignored — against a
 	// command whose config decides which region it launches in.
-	image, err := parseWithName(fs, args)
+	image, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}

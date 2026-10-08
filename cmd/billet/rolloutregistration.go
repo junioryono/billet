@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -62,7 +64,7 @@ var registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.
 }
 
 func cmdRolloutRegistration(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet rollout registration")
+	fs := cli.NewFlagSet("billet rollout registration", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	node := fs.String("node", "", "the node whose registration is asked about")
 	incarnation := fs.String("incarnation", "", "the incarnation the migrated node presents (32 hex characters)")
@@ -71,7 +73,7 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 		"environment file, the one the unit names, instead of the process environment")
 	asJSON := fs.Bool("json", false, "print the answer as JSON (the only form)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -115,7 +117,7 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 
 	if done {
 		if code != 0 {
-			return &exitError{code: code}
+			return &cli.ExitError{Code: code}
 		}
 
 		return nil

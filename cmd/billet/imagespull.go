@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/imagesource"
@@ -83,7 +84,7 @@ var kernelInstaller = durablefile.Installer{}
 // deleting a file. Staging costs one disk write and makes every failure before
 // the import a no-op.
 func cmdImagesPull(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet images pull")
+	fs := cli.NewFlagSet("billet images pull", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	from := fs.String("from", "",
@@ -109,7 +110,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	skipSignature := fs.Bool("skip-signature-verification", false,
 		"import without proving who published the manifest; for a source trusted by other means")
 
-	rest, err := parseWithName(fs, args)
+	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}

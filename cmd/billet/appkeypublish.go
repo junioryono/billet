@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/awsssm"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 )
@@ -64,12 +65,12 @@ func publishAppKey(ctx context.Context, cfg *config.Config, target config.GitHub
 // It reads through the same validating reader the file backend uses, so a value
 // that is not a key is refused here rather than at the first token mint.
 func githubAppStoreKey(ctx context.Context, args []string) error {
-	fs := newFlagSet("github-app store-key")
+	fs := cli.NewFlagSet("billet github-app store-key", os.Stdout)
 	from := fs.String("from", "", "the file holding the App private key")
 	configPath := fs.String("config", "", "path to billet.yaml")
 	targetName := fs.String("target", "", "the target this key belongs to (default: the only one)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

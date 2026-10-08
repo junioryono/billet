@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -139,11 +140,11 @@ type acceptanceExclusion struct {
 const acceptanceEvidenceVersion = 1
 
 func cmdAcceptanceEvidence(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet acceptance evidence")
+	fs := cli.NewFlagSet("billet acceptance evidence", os.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	out := fs.String("out", "", "where to write it (default: <workspace>/"+acceptanceEvidence+")")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -322,7 +323,7 @@ func runEndpoint(t *testing.T, fn func(context.Context, []string) error, stdin s
 
 	o := endpointOut{err: err, raw: out}
 	if err != nil {
-		o.code = exitStatus(err)
+		o.code = cli.ExitStatus(err)
 	}
 
 	if strings.TrimSpace(out) == "" {

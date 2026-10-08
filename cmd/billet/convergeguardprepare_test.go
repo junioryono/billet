@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // The fixtures of `converge-guard prepare`, `settle` and `release --cleanup`
@@ -72,7 +74,7 @@ func runPrepare(t *testing.T, args ...string) prepareOut {
 
 	o := prepareOut{err: err}
 	if err != nil {
-		o.code = exitStatus(err)
+		o.code = cli.ExitStatus(err)
 	}
 
 	if strings.TrimSpace(out) == "" {
@@ -938,14 +940,14 @@ func TestSettleAndTheCleanupRelease(t *testing.T) {
 		}
 
 		err := guardRun(t, "settle", "--holder", "ci-1", "--token", token)
-		if err == nil || exitStatus(err) != exitRefused || !strings.Contains(err.Error(), "already settled") {
+		if err == nil || cli.ExitStatus(err) != exitRefused || !strings.Contains(err.Error(), "already settled") {
 			t.Errorf("settle over a settled guard: %v", err)
 		}
 
 		// THE STALE-TOKEN PROOF: cleanup after settlement refuses naming the
 		// operator's release, and the guard stays.
 		err = guardRun(t, "release", "--holder", "ci-1", "--cleanup", "--token", token)
-		if err == nil || exitStatus(err) != exitRefused || !strings.Contains(err.Error(), "window has closed") {
+		if err == nil || cli.ExitStatus(err) != exitRefused || !strings.Contains(err.Error(), "window has closed") {
 			t.Errorf("cleanup over a settled guard: %v", err)
 		}
 

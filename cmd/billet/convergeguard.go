@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 )
@@ -348,7 +349,7 @@ func checkHolder(holder string) error {
 }
 
 func cmdGuardHold(args []string) error {
-	flags := newFlagSet("billet converge-guard hold")
+	flags := cli.NewFlagSet("billet converge-guard hold", os.Stdout)
 	holder := flags.String("holder", "", "who holds the guard: the converge's run id, or an operator's handle")
 	candidate := flags.String("candidate", "", "the release executable this guard records, staged by the role "+
 		"in a recovery directory under the upgrade root; the managed binary when absent")
@@ -359,7 +360,7 @@ func cmdGuardHold(args []string) error {
 	note := flags.String("note", "", "one line for whoever finds this guard: the run that holds it, or why an "+
 		"operator does; written at acquisition and kept for the guard's life")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1035,13 +1036,13 @@ func hashManagedBinary() (string, string, error) {
 }
 
 func cmdGuardRelease(args []string) error {
-	flags := newFlagSet("billet converge-guard release")
+	flags := cli.NewFlagSet("billet converge-guard release", os.Stdout)
 	holder := flags.String("holder", "", "the holder releasing its guard")
 	cleanup := flags.Bool("cleanup", false, "the acquiring invocation releasing, inside its preparation window; "+
 		"needs --token")
 	token := flags.String("token", "", "the acquiring invocation's token, with --cleanup")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1164,13 +1165,13 @@ func removeUnpublishedDirAt(root *txLock, dir *os.File) error {
 }
 
 func cmdGuardRecover(args []string) error {
-	flags := newFlagSet("billet converge-guard recover")
+	flags := cli.NewFlagSet("billet converge-guard recover", os.Stdout)
 	holder := flags.String("holder", "", "remove the guard this holder left with no transaction pointer")
 	unpublished := flags.Bool("unpublished", false, "remove a hold that never returned from its publication")
 	oldStopped := flags.Bool("old-driver-stopped", false, "assert that the holder's driver is stopped or cannot "+
 		"dispatch further work, and that its remote work has finished")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1496,10 +1497,10 @@ func takeOverGuard(root *txLock, old, holder string) error {
 }
 
 func cmdGuardStatus(args []string) error {
-	flags := newFlagSet("billet converge-guard status")
+	flags := cli.NewFlagSet("billet converge-guard status", os.Stdout)
 	asJSON := flags.Bool("json", false, "print the claim's shape and record as JSON")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 
@@ -1525,9 +1526,9 @@ func cmdGuardStatus(args []string) error {
 }
 
 func cmdGuardHolder(args []string) error {
-	flags := newFlagSet("billet converge-guard holder")
+	flags := cli.NewFlagSet("billet converge-guard holder", os.Stdout)
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 

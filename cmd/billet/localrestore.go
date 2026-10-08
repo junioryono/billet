@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -55,7 +56,7 @@ type restoreOptions struct {
 // them reaches is another MACHINE, which is why --old-controller-fenced exists
 // and why it is required rather than defaulted.
 func cmdLocalRestore(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local restore")
+	fs := cli.NewFlagSet("billet local restore", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	from := fs.String("from", "", "the backup directory written by `billet local backup`")
 	fromBackup := fs.String("from-backup", "",
@@ -76,7 +77,7 @@ func cmdLocalRestore(ctx context.Context, args []string) error {
 		"assert that the external ledger this backup's identity belongs to has been restored "+
 			"and this host's config points at it")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

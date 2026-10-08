@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/version"
@@ -57,7 +58,7 @@ type hybridInputs struct {
 // after billet ca issue has run on the prepared host, and the role's billet
 // check refuses a missing one.
 func cmdInitHybrid(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet init hybrid")
+	fs := cli.NewFlagSet("billet init hybrid", os.Stdout)
 
 	out := fs.String("out", "", "the directory to write the generation into (required)")
 	name := fs.String("name", "billet", "the Terraform module's name prefix for every AWS resource")
@@ -129,7 +130,7 @@ func cmdInitHybrid(ctx context.Context, args []string) error {
 	ami := fs.String("ami", "", "the AMI `billet ami build` produced, for every tier's launch.ec2 (with --commission)")
 	force := fs.Bool("force", false, "replace a file in --out even when it is not billet's own")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

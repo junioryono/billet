@@ -17,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/runnerrelease"
 	"github.com/junioryono/billet/internal/version"
@@ -61,7 +62,7 @@ func cmdCacheConformance(ctx context.Context, args []string) error {
 		return errors.New("usage: billet cache conformance install --repository <owner/repository> --runner-label <label> [flags]")
 	}
 
-	fs := newFlagSet("billet cache conformance install")
+	fs := cli.NewFlagSet("billet cache conformance install", os.Stdout)
 	repository := fs.String("repository", "", "consumer owner/repository that will own the workflow")
 	runnerLabel := fs.String("runner-label", "", "exact trusted Billet runner label under test")
 	billetRepository := fs.String("billet-repository", defaultConformanceRepository,
@@ -78,7 +79,7 @@ func cmdCacheConformance(ctx context.Context, args []string) error {
 		"repository-relative workflow file directly in .github/workflows")
 	force := fs.Bool("force", false, "atomically replace an existing generated workflow")
 
-	if err := parse(fs, args[1:]); err != nil {
+	if err := cli.Parse(fs, args[1:]); err != nil {
 		return err
 	}
 

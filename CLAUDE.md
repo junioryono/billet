@@ -11,6 +11,7 @@ Never hard-wrap prose at a column. Every paragraph in a `.md` or `.txt` file, a 
 | Path | What it is |
 |---|---|
 | `cmd/billet` | The binary: the `server` and `node` roles and the whole operator CLI (`init`, `github-app`, `check`, `local *`, `ca *`, `nodes *`, `leases *`, `drain`, `images *`, `ami *`, `rollout *`, `host-upgrade`, `converge-guard *`, `cache *`, `acceptance *`, `teardown`, `decommission`). The only package allowed stdout and `os.Exit`. |
+| `internal/cli` | The command line: the command tree and its dispatch, the `Env` a command writes to, the exit status a command answers with, the flag helpers and the signal lifecycle. Commands move here and under `internal/ops` one family at a time (#356 Phase 4). |
 | `internal/config` | `billet.yaml` schema and validation. A leaf: it imports nothing else of billet's. |
 | `internal/state` | The ledger: SQLite or PostgreSQL behind one seam, migrations (`migrations/`, `pgmigrations/`), the sqlc query set (`queries/`, `ledgerdb/`), locks, fences, the controller claim; and `ledgertest`, the test-side template a test seeds its throwaway SQLite ledger from. |
 | `internal/alloc` | The capacity allocator: escrow, leases and their state machine, placement, floors, the compute barrier, quarantine, force operations, enrollment records. |

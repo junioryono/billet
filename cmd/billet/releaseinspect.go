@@ -26,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -405,10 +406,10 @@ type inspectPreparation struct {
 }
 
 func cmdReleaseInspect(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet release inspect")
+	flags := cli.NewFlagSet("billet release inspect", os.Stdout)
 	configPath := flags.String("config", defaultConfigPath(), "path to billet.yaml")
 	asJSON := flags.Bool("json", false, "print the report as JSON")
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 	report := inspectHostRelease(ctx, *configPath)

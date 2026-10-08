@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/runnerrelease"
 	"github.com/junioryono/billet/internal/store/ceph"
@@ -44,11 +45,11 @@ func cmdRunner(ctx context.Context, args []string) error {
 		return errors.New("usage: billet runner check")
 	}
 
-	fs := newFlagSet("billet runner check")
+	fs := cli.NewFlagSet("billet runner check", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	quiet := fs.Bool("quiet", false, "print nothing unless something needs doing")
 
-	if err := parse(fs, args[1:]); err != nil {
+	if err := cli.Parse(fs, args[1:]); err != nil {
 		return err
 	}
 
@@ -233,8 +234,8 @@ var resolveRunnerFreshness = runnerrelease.Resolve
 // is a task to schedule and the other is an outage to page for, and a monitor that
 // cannot tell them apart will treat both like whichever it saw first.
 var (
-	errRunnerDue     = &exitError{code: 2, msg: "the runner image is due to be rebuilt"}
-	errExpiredRunner = &exitError{code: 3, msg: "github is no longer queueing jobs to this runner"}
+	errRunnerDue     = &cli.ExitError{Code: 2, Msg: "the runner image is due to be rebuilt"}
+	errExpiredRunner = &cli.ExitError{Code: 3, Msg: "github is no longer queueing jobs to this runner"}
 )
 
 // fleetRunnerVersion reports the OLDEST runner any tier's image boots.

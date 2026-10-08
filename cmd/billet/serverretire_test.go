@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -93,12 +94,12 @@ func (f *retireFixture) runRaw(t *testing.T, stdin string, args ...string) (stri
 	code := 0
 
 	if runErr != nil {
-		var exit *exitError
+		var exit *cli.ExitError
 		if !errors.As(runErr, &exit) {
 			t.Fatalf("the command failed outside its answer: %v\n%s", runErr, out)
 		}
 
-		code = exit.code
+		code = exit.Code
 	}
 
 	return out, code

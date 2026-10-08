@@ -17,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
@@ -296,7 +297,7 @@ var retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.Stat
 var retireReportClose = (*state.DB).Close
 
 func cmdServerRetire(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet server retire")
+	flags := cli.NewFlagSet("billet server retire", os.Stdout)
 	m := retireMode{}
 
 	flags.StringVar(&m.configPath, "config", defaultConfigPath(), "the installed configuration")
@@ -338,7 +339,7 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	flags.DurationVar(&m.reportMaxAge, "report-max-age", 10*time.Minute, "with --input: how old the collection round may be")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 

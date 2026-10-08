@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -111,7 +112,7 @@ func openIdentityAccess(ctx context.Context, dir string, intent identityIntent) 
 	var retiring retirement.ErrRetiring
 
 	if errors.As(err, &retiring) {
-		return nil, &exitError{code: exitRetiring, msg: err.Error(), err: err}
+		return nil, &cli.ExitError{Code: exitRetiring, Msg: err.Error(), Err: err}
 	}
 
 	return acc, err

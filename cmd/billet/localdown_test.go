@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -764,7 +765,7 @@ func TestUpExitsNonZeroWhenItCannotReopenAdmission(t *testing.T) {
 		t.Fatal("up reported success while this deployment was still sealed and taking " +
 			"nothing")
 	}
-	if code := exitStatus(err); code != 2 {
+	if code := cli.ExitStatus(err); code != 2 {
 		t.Errorf("an up that could not reopen admission exits %d; 1 says the host did not "+
 			"come up, which is not what happened", code)
 	}

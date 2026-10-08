@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -47,7 +47,7 @@ type hostPrepareAnswer struct {
 // exists, else the packaged default, so a fresh package install prepares the
 // directory the server will use before any metadata exists beside it.
 func cmdLocalPrepare(ctx context.Context, args []string) error {
-	flags := flag.NewFlagSet("billet local prepare", flag.ContinueOnError)
+	flags := cli.NewFlagSet("billet local prepare", os.Stdout)
 	cfgPath := addServiceConfigFlag(flags)
 	account := flags.String("account", initconfig.ServiceGroup, "the service account the units run as")
 	group := flags.String("group", "", "the service group (defaults to the account's name)")

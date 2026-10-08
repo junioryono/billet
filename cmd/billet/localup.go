@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -110,12 +111,12 @@ var (
 // enabled. `enable --now` would commit a unit to every future boot before
 // anything established it can run at all.
 func cmdLocalUp(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local up")
+	fs := cli.NewFlagSet("billet local up", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"report what would change and refuse nothing — no service is started, enabled "+
 			"or chowned")
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -333,9 +334,9 @@ func enableScheduledAgents(ctx context.Context, c converger) error {
 		if err := s.EnableScheduled(ctx, label); err != nil {
 			fmt.Printf("schedule %s could not be installed: %v\n", label, err)
 
-			return &exitError{
-				code: 2,
-				msg: "the services are running but " + label + " could not be installed, so " +
+			return &cli.ExitError{
+				Code: 2,
+				Msg: "the services are running but " + label + " could not be installed, so " +
 					"this Mac will not act on rollouts or refresh images until it is: " +
 					err.Error(),
 			}
@@ -482,9 +483,9 @@ func upButSealed(cause error) error {
 	fmt.Printf("\nseal     the services are up, but admission could not be reopened: %v\n", cause)
 	fmt.Printf("         this deployment takes no work until `billet resume` runs\n")
 
-	return &exitError{
-		code: 2,
-		msg: "the services are running but admission is still sealed, so this deployment " +
+	return &cli.ExitError{
+		Code: 2,
+		Msg: "the services are running but admission is still sealed, so this deployment " +
 			"takes no work: " + cause.Error(),
 	}
 }

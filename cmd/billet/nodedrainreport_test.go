@@ -7,8 +7,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
 )
 
@@ -18,7 +20,7 @@ import (
 func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
 	var cancels atomic.Int32
 
-	lc := newLifecycle(func() { cancels.Add(1) })
+	lc := cli.NewLifecycle(func() { cancels.Add(1) }, os.Stderr)
 
 	requests := make(chan os.Signal, 5)
 	for range 5 {
@@ -26,14 +28,14 @@ func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
 	}
 
 	close(requests)
-	lc.drainOn(requests)
+	lc.DrainOn(requests)
 
 	if cancels.Load() != 5 {
 		t.Fatalf("five drain requests started the drain %d times, want every one", cancels.Load())
 	}
 
 	select {
-	case <-lc.hurry:
+	case <-lc.Hurry():
 		t.Fatal("repeated drain requests hurried the drain: a stop repeating its request would end the wait")
 	default:
 	}
@@ -45,9 +47,9 @@ func TestADrainRequestDrainsAndNeverEscalates(t *testing.T) {
 func TestTheDrainSignalReachesTheDrain(t *testing.T) {
 	var cancels atomic.Int32
 
-	lc := newLifecycle(func() { cancels.Add(1) })
+	lc := cli.NewLifecycle(func() { cancels.Add(1) }, os.Stderr)
 
-	stop := lc.handleDrainRequests()
+	stop := lc.HandleDrainRequests()
 
 	// ONE AT A TIME, each acknowledged before the next, so no two coalesce and
 	// every repeat is one the handler actually received.
@@ -62,7 +64,7 @@ func TestTheDrainSignalReachesTheDrain(t *testing.T) {
 	stop()
 
 	select {
-	case <-lc.hurry:
+	case <-lc.Hurry():
 		t.Fatal("the drain request hurried the drain")
 	default:
 	}
@@ -102,7 +104,7 @@ func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
 // before either, because it is not the node a stop asks.
 //
 // EACH IS A STATEMENT OF cmdNode's OWN BODY, IN ITS SHAPE, not a call found
-// anywhere in it: the handler is installed by `stop := lc.handleDrainRequests()`,
+// anywhere in it: the handler is installed by `stop := lc.HandleDrainRequests()`,
 // a call that runs where it stands, and `defer stop()` follows it (a call wrapped
 // in a deferred closure would run at return), the report is a plain statement after it, the
 // probe is the `if *upgradeProbe` block that returns, and serving is the final
@@ -139,7 +141,7 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			call, isCall := s.Rhs[0].(*ast.CallExpr)
 			name, isName := s.Lhs[0].(*ast.Ident)
 
-			if isCall && isName && calleeName(call) == "handleDrainRequests" {
+			if isCall && isName && calleeName(call) == "HandleDrainRequests" {
 				handler, stopName = i, name.Name
 			}
 
@@ -260,7 +262,7 @@ func TestTheNodeHoldsItsLockUntilTheCommandReturns(t *testing.T) {
 // The callbacks are compared by the function they are, which is what the
 // loop will call.
 func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
-	lc := newLifecycle(func() {})
+	lc := cli.NewLifecycle(func() {}, os.Stderr)
 	// LINUX'S SPELLING, where a record is published; a Mac publishes none.
 	host := nodeHost(lc, "linux")
 
@@ -274,7 +276,7 @@ func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 		t.Error("nodeHost does not give the node notifyReady")
 	}
 
-	var hurry <-chan struct{} = lc.hurry
+	hurry := lc.Hurry()
 
 	if host.Hurry == nil || host.Hurry != hurry {
 		t.Error("nodeHost does not give the node this process's second signal")
@@ -286,5 +288,25 @@ func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 
 	if want := nodeRegistrationRecordPath("linux"); want == "" || host.RegistrationRecordPath != want {
 		t.Errorf("nodeHost gives a Linux node the record path %q, want %q", host.RegistrationRecordPath, want)
+	}
+}
+
+// waitFor polls a condition rather than sleeping a fixed amount.
+//
+// The deadline bounds a STALL rather than budgeting the work, so it is far
+// larger than any of these waits needs. Five seconds looked ample and was not:
+// under the full suite, with -race and -covermode=atomic, a goroutine can go
+// unscheduled that long and the test then fails on the wait rather than on
+// what it asserts.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+
+		time.Sleep(time.Millisecond)
 	}
 }

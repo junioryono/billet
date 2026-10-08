@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/durablefile"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -65,7 +66,7 @@ var (
 )
 
 func cmdNodeReceipt(ctx context.Context, args []string) error {
-	flags := newFlagSet("billet node receipt")
+	flags := cli.NewFlagSet("billet node receipt", os.Stdout)
 	evidence := flags.String("evidence", "", "the migration's answer, as a file (evidence mode)")
 	confirmation := flags.String("confirmation", "", "the controller's `rollout registration` answer, as a file (evidence mode)")
 	configPath := flags.String("config", "", "the installed configuration (required in both modes)")
@@ -76,7 +77,7 @@ func cmdNodeReceipt(ctx context.Context, args []string) error {
 	wait := flags.Duration("wait", time.Minute, "with --refresh: how long to wait for a running node's current record")
 	asJSON := flags.Bool("json", false, "print the answer as JSON (the only form)")
 
-	if err := parse(flags, args); err != nil {
+	if err := cli.Parse(flags, args); err != nil {
 		return err
 	}
 

@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -18,10 +19,10 @@ import (
 // cmdCacheStatus prints every tier's caches, every kill-switch block, and what
 // each cache did for the jobs assigned recently.
 func cmdCacheStatus(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet cache status")
+	fs := cli.NewFlagSet("billet cache status", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to count what the caches did")
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 	if *since <= 0 {

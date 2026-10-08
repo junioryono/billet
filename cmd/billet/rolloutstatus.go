@@ -403,7 +403,6 @@ func reexecAs(ctx context.Context, uid, gid uint32, args []string) (int, error) 
 		return 0, fmt.Errorf("find this billet to run the report as the ledger's owner: %w", err)
 	}
 
-	//nolint:gosec // this executable, with this command's own arguments, under the ledger owner's identity
 	cmd := exec.CommandContext(ctx, self, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{

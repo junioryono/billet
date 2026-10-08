@@ -35,3 +35,5 @@ deedfda57b81 The two runServer order tests were replaced by TestOnlyTheProvingSt
 174174c32dbe The control plane's three ledger modes moved to internal/app (#356 Phase 3c); the sentence names both files and their tests.
 8217e65b541a The node role moved to internal/app (#356 Phase 3c); startNodeCache now passes the exported CacheSessionNames, and the sentence names its file.
 130e22663053 The end-to-end suite assembles through internal/app (#356 Phase 3c, ADR-015); the clock is steered through app.Steering, and the sentence says so.
+5678b07cd1a1 The signal lifecycle moved to internal/cli as cli.Lifecycle (#356 Phase 4); the sentence names its methods there.
+e49331495156 The exit-status type moved to internal/cli as cli.ExitError (#356 Phase 4); the sentence names it there.

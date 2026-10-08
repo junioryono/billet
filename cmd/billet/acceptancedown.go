@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // The teardown, which is the half of `billet acceptance` that has to work when
@@ -44,7 +46,7 @@ const (
 )
 
 func cmdAcceptanceDown(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet acceptance down")
+	fs := cli.NewFlagSet("billet acceptance down", os.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 	wait := fs.Duration("wait", acceptanceDrainWait,
 		"how long to let a running job finish before reporting that one is still there")
@@ -52,7 +54,7 @@ func cmdAcceptanceDown(ctx context.Context, args []string) error {
 		"leave the workspace directory in place (the state directory holds this run's "+
 			"deployment identity, so a later `down` can still be scoped to it)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -239,10 +241,10 @@ var errAcceptanceUnswept = errors.New("the provider was not swept")
 // puts the one decision that has to be right in a place no test can reach. The
 // answer is decided here, in Go, and the workflow reads an exit status.
 func cmdAcceptanceSweep(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet acceptance sweep")
+	fs := cli.NewFlagSet("billet acceptance sweep", os.Stdout)
 	workspace := fs.String("workspace", "", "the workspace `billet acceptance up` created")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

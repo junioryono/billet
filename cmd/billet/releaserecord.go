@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/releasesource"
@@ -432,12 +433,12 @@ func boundedFirst(decompressed *countingReader, path string, err error) error {
 // this load-bearing is how a half-check that looks like a check gets written. So
 // the shell downloads and this decides.
 func cmdReleaseRecord(_ context.Context, args []string) error {
-	fs := newFlagSet("billet release record")
+	fs := cli.NewFlagSet("billet release record", os.Stdout)
 	manifestPath := fs.String("manifest", "", "the release manifest this install came from")
 	archivePath := fs.String("archive", "", "the archive the binary was extracted from")
 	binaryPath := fs.String("binary", "", "the installed binary the record will describe")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

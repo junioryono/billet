@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
 	"github.com/junioryono/billet/internal/awspolicy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/provider/ec2"
@@ -33,7 +35,7 @@ import (
 // alias. So --role-arn and --kms-key-arn supply those exact ARNs; without them a
 // policy would be scoped to the wrong thing or to everything.
 func cmdInitIAM(_ context.Context, args []string) error {
-	fs := newFlagSet("billet init iam")
+	fs := cli.NewFlagSet("billet init iam", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	builder := fs.Bool("builder", false,
 		"also grant what `billet ami build` needs: ec2:CreateImage, tagging the image it "+
@@ -67,7 +69,7 @@ func cmdInitIAM(_ context.Context, args []string) error {
 			"registrations a dead node left under this node's parameter path (codebuild "+
 			"only) — list and delete under the path, nothing else")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

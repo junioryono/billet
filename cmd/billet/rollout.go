@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider/firecracker"
@@ -98,7 +99,7 @@ func rolloutStore(ctx context.Context, cfgPath string,
 // which is why nothing downstream ever consults the channel again, and why the
 // record carries the manifest's digest rather than only its tag.
 func cmdRolloutStart(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet rollout start")
+	fs := cli.NewFlagSet("billet rollout start", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve, e.g. stable or candidate")
@@ -113,7 +114,7 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		"move the fleet to a release OLDER than the one this control plane is running; "+
 			"the ledger's release watermark is lowered to admit it")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -291,7 +292,7 @@ func channelOrPin(channel, pin string) string {
 // on every controller, and one that migrated, locked, minted or left a
 // root-owned file behind would hand the converge a host the check changed.
 func cmdRolloutStatus(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet rollout status")
+	fs := cli.NewFlagSet("billet rollout status", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	asJSON := fs.Bool("json", false, "print the report as JSON: the rollout, its hosts with the "+
 		"reason their last dispatch was refused, every host's current registration, and the "+
@@ -300,7 +301,7 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 		"from this systemd environment file, the one the unit names, instead of the process "+
 		"environment")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -680,11 +681,11 @@ func printRollout(ctx context.Context, db *state.DB) {
 // own; what ends is billet's intent to move anything else. A command that also
 // reverted hosts would be a second, undeclared rollout in the opposite direction.
 func cmdRolloutAbort(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet rollout abort")
+	fs := cli.NewFlagSet("billet rollout abort", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "why this rollout is being abandoned")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -722,7 +723,15 @@ func cmdRolloutAbort(ctx context.Context, args []string) error {
 // cmdRolloutNodePhase records an operator's judgement about one host.
 func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, verb string,
 ) error {
-	fs := newFlagSet("billet rollout " + verb)
+	name := "billet rollout retry"
+	switch verb {
+	case "exempt":
+		name = "billet rollout exempt"
+	case "decommission":
+		name = "billet rollout decommission"
+	}
+
+	fs := cli.NewFlagSet(name, os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "the operator's reason, recorded against this host")
 
@@ -733,7 +742,7 @@ func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, v
 		"record the decommission even though nothing has proved the host is running no "+
 			"compute; the exclusion is recorded as UNPROVEN and every later drain says so")
 
-	node, err := parseWithName(fs, args)
+	node, err := cli.ParseWithName(fs, args)
 	if err != nil {
 		return err
 	}

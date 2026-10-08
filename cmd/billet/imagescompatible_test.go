@@ -6,13 +6,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 )
 
 func TestIncompatibleGuestHasTheDocumentedRefreshExitStatus(t *testing.T) {
 	err := incompatibleGuest("ubuntu-2404-x64@g20260815033431", "contract mismatch")
-	if got := exitStatus(err); got != 2 {
+	if got := cli.ExitStatus(err); got != 2 {
 		t.Fatalf("exit status = %d, want 2", got)
 	}
 	if !strings.Contains(err.Error(), "contract mismatch") {
@@ -63,7 +64,7 @@ func TestExactPinMismatchCannotBeRepairedByPromotingAnotherGeneration(t *testing
 	if err == nil {
 		t.Fatal("an exact incompatible pin was treated as refreshable through promotion")
 	}
-	if got := exitStatus(err); got == 2 {
+	if got := cli.ExitStatus(err); got == 2 {
 		t.Fatalf("exact-pin mismatch exit status = %d, which asks the role to pull without changing the pin", got)
 	}
 	if !strings.Contains(err.Error(), "update the exact generation pin") {
@@ -75,7 +76,7 @@ func TestFailedLegacyExactPinCompatibilityBootRequiresAPinChange(t *testing.T) {
 	err := compatibilityBootFailure("ubuntu-2404-x64@g20260815033431", false,
 		os.ErrDeadlineExceeded)
 
-	if got := exitStatus(err); got == 2 {
+	if got := cli.ExitStatus(err); got == 2 {
 		t.Fatalf("exact-pin boot failure exit status = %d, which asks the role to pull an unused replacement", got)
 	}
 	if !strings.Contains(err.Error(), "update the exact generation pin") {
@@ -87,7 +88,7 @@ func TestFailedFloatingCompatibilityBootRequestsAReplacement(t *testing.T) {
 	err := compatibilityBootFailure("ubuntu-2404-x64@g20260815033431", true,
 		os.ErrDeadlineExceeded)
 
-	if got := exitStatus(err); got != 2 {
+	if got := cli.ExitStatus(err); got != 2 {
 		t.Fatalf("floating boot failure exit status = %d, want replacement status 2", got)
 	}
 }

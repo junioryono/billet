@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
 )
@@ -37,7 +38,7 @@ type uninstallOptions struct {
 // it left, so an operator who does want it gone can act on a list rather than
 // on a memory.
 func cmdLocalUninstall(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet local uninstall")
+	fs := cli.NewFlagSet("billet local uninstall", os.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this host is being uninstalled, recorded on the seal for whoever finds it sealed")
@@ -49,7 +50,7 @@ func cmdLocalUninstall(ctx context.Context, args []string) error {
 	force := fs.Bool("force", false,
 		"stop services running a different billet build than this one")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

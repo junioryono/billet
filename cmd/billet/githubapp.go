@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/regularfile"
@@ -68,7 +69,7 @@ func cmdGitHubApp(ctx context.Context, args []string) error {
 // and reserveKeyFile proves the key has somewhere to go, and only then does
 // anything reach GitHub.
 func githubAppCreate(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet github-app create")
+	fs := cli.NewFlagSet("billet github-app create", os.Stdout)
 	org := fs.String("org", "", "GitHub organization to create the App for (exactly one of --org and --repository)")
 	repository := fs.String("repository", "", "GitHub repository, as owner/name, to create the App for")
 	targetName := fs.String("target", config.DefaultTargetName,
@@ -83,7 +84,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 			"untrusted tier with a repository) needs to prove a job's branch from GitHub's record "+
 			"of its run; --actions-read=false leaves it out")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 

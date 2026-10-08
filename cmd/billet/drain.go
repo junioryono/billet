@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -27,9 +28,9 @@ const drainPollInterval = 5 * time.Second
 // "billet failed" and must not exit the same way. A monitor running
 // `billet drain --wait --timeout 30m` acts on the two differently, and the seal
 // is still in place either way.
-var errStillDraining = &exitError{
-	code: 2,
-	msg: "the deployment is still draining; it remains sealed, so nothing new was ADMITTED " +
+var errStillDraining = &cli.ExitError{
+	Code: 2,
+	Msg: "the deployment is still draining; it remains sealed, so nothing new was ADMITTED " +
 		"while this waited — which is not the same as nothing new starting, because escrow " +
 		"taken before the seal can still become a running job",
 }
@@ -40,9 +41,9 @@ var errStillDraining = &exitError{
 // drained than it was a moment earlier, and exiting 0 would tell a script that
 // it is safe to proceed. It shares the still-draining status because it is the
 // same answer: not drained, not broken.
-var errWaitInterrupted = &exitError{
-	code: 2,
-	msg:  "stopped waiting before the deployment finished draining; it remains sealed",
+var errWaitInterrupted = &cli.ExitError{
+	Code: 2,
+	Msg:  "stopped waiting before the deployment finished draining; it remains sealed",
 }
 
 // actor names whoever ran the command, for the attribution the seal carries.
@@ -107,7 +108,7 @@ func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *co
 // and the node's own shutdown, and conflating the two is how a maintenance
 // window fails somebody's build.
 func cmdDrain(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet drain")
+	fs := cli.NewFlagSet("billet drain", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this deployment is not taking work, for whoever finds it sealed")
@@ -119,7 +120,7 @@ func cmdDrain(ctx context.Context, args []string) error {
 		"stop once the LEDGER is quiet, without asking each host what it is actually "+
 			"running (faster, and it cannot see compute whose lease has already gone)")
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
@@ -271,10 +272,10 @@ func takeTheSeal(ctx context.Context, db *state.DB, current state.Admission,
 
 // cmdResume lets the deployment admit work again.
 func cmdResume(ctx context.Context, args []string) error {
-	fs := newFlagSet("billet resume")
+	fs := cli.NewFlagSet("billet resume", os.Stdout)
 	cfgPath := addConfigFlag(fs)
 
-	if err := parse(fs, args); err != nil {
+	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
