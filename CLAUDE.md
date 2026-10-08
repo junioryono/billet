@@ -52,6 +52,7 @@ make build       # ./bin/billet
 make test        # go test -race -count=1 -covermode=atomic ./...   (coverage counters are part of the gate; they reorder goroutines; locally -p 4 under nice)
 make lint        # golangci-lint for the host AND GOOS=linux (a linter only sees files it would compile)
 make lint-custom # tools/lint: build, run its own tests, run billetlint for darwin/arm64 and linux/amd64
+make fuzz        # search past every fuzz target's seeds, FUZZTIME each (default 1m); the seeds already run in make test
 make cross       # build linux/amd64, linux/arm64, darwin/arm64 — before anything touching a build tag
 make docs        # Sphinx with -W, as CI and Read the Docs run it — after any change under docs/
 make sqlc        # regenerate internal/state/ledgerdb after editing queries/ or adding a migration

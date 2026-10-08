@@ -1,0 +1,58 @@
+# Search past the fuzz seeds, on main, every night.
+#
+# THE SEEDS ALREADY RUN ON EVERY PULL REQUEST: `go test` runs each Fuzz
+# function's corpus (its f.Add seeds and anything under testdata/fuzz) as
+# ordinary tests, so ci.yml's test job replays them all. What a pull request
+# does not do is search beyond them. A search that finds nothing proves little
+# about the minutes it was given, and one that does find something has found it
+# in code that already merged, so the search runs here, where a finding is a
+# bug to fix rather than a red pull request nobody can act on.
+#
+# A FINDING IS A FAILED JOB AND AN ARTIFACT. Go writes the failing input under
+# the package's testdata/fuzz/<Fuzz>/; the job keeps it, and committing it
+# beside the fix makes it a seed that every later run and every pull request
+# replays.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: billet-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { package: ./internal/config, fuzz: FuzzConfigParse }
+          - { package: ./internal/state, fuzz: FuzzParseMigrationStatements }
+          - { package: ./internal/nodeplane, fuzz: FuzzPlaneDecode }
+          - { package: ./internal/version, fuzz: FuzzVersionCompare }
+          - { package: ./internal/endpoint, fuzz: FuzzEndpointParse }
+          - { package: ./internal/cli, fuzz: FuzzParseWithName }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Fuzz ${{ matrix.target.fuzz }}
+        env:
+          PACKAGE: ${{ matrix.target.package }}
+          FUZZ: ${{ matrix.target.fuzz }}
+        run: go test "$PACKAGE" -run '^$' -fuzz "^${FUZZ}\$" -fuzztime 10m
+
+      - name: Keep what it found
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target.fuzz }}
+          path: ${{ matrix.target.package }}/testdata/fuzz/
+          if-no-files-found: ignore

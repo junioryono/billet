@@ -114,6 +114,23 @@ cover: ## Coverage profile + HTML report
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
+FUZZTIME ?= 1m
+
+.PHONY: fuzz
+fuzz: ## Search past every fuzz target's seeds for FUZZTIME each; `test` already runs the seeds
+	@# ONE TARGET A RUN, because `go test -fuzz` takes exactly one. Every Fuzz
+	@# function lives in a fuzz_test.go, and the nightly workflow lists the same
+	@# set (TestEveryFuzzTargetIsSearchedNightly). A finding is written under
+	@# the package's testdata/fuzz/, and committed beside its fix it becomes a seed.
+	@set -eu; \
+	for file in $$(find . -name fuzz_test.go -not -path './tools/*' | sort); do \
+		pkg=$$(dirname "$$file"); \
+		for fn in $$(sed -n 's/^func \(Fuzz[A-Za-z0-9_]*\)(f \*testing\.F) {$$/\1/p' "$$file"); do \
+			echo "== $$pkg $$fn"; \
+			$(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME); \
+		done; \
+	done
+
 .PHONY: no-mutants
 no-mutants: ## Refuse to proceed while a killed mutation run has left a mutant on disk
 	@# FIRST in `check`, unlike tests-kept, because this one cannot be a false
