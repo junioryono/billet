@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/endpoint"
@@ -45,7 +46,7 @@ func nodeRegistrationRecordPath(platform string) string {
 
 // registrationRecordPath is the record's path for this host, a variable so a
 // fixture can point the inspector at a temporary one.
-var registrationRecordPath = nodeRegistrationRecordPath(hostOS)
+var registrationRecordPath = nodeRegistrationRecordPath(cli.HostOS)
 
 // maxRegistrationRecordBytes bounds the record: a longer file is not one the
 // node wrote.
@@ -447,7 +448,7 @@ func judgeRegistration(ev registrationEvidence, unitInvocation maybe, identity r
 // running (its sample is what reads the record), else the sample's evidence
 // judged for currency and identity.
 func hostRegistration(node inspectService, id registrationIdentity) maybe {
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return unknown("no runtime record on this platform")
 	}
 

@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/regularfile"
@@ -63,15 +64,15 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 		read                                                                               func(string) ([]byte, error)
 		after                                                                              func(string)
 		samples                                                                            int
-	}{hostOS, procRoot, selfExePath, installedBinary, systemctlBinary, busctlBinary, retiredJournalPath, upgradeRoot,
+	}{cli.HostOS, procRoot, selfExePath, installedBinary, systemctlBinary, busctlBinary, retiredJournalPath, upgradeRoot,
 		provenance.Path, openImage, readPublicFile, inspectAfterOpen, inspectSamples}
 	t.Cleanup(func() {
-		hostOS, procRoot, selfExePath, installedBinary = prev.hostOS, prev.procRoot, prev.selfExe, prev.installed
+		cli.HostOS, procRoot, selfExePath, installedBinary = prev.hostOS, prev.procRoot, prev.selfExe, prev.installed
 		systemctlBinary, busctlBinary, retiredJournalPath, upgradeRoot = prev.systemctl, prev.busctl, prev.receipt, prev.root
 		provenance.Path, openImage, readPublicFile = prev.provenance, prev.open, prev.read
 		inspectAfterOpen, inspectSamples = prev.after, prev.samples
 	})
-	hostOS = "linux"
+	cli.HostOS = "linux"
 	procRoot = f.procDir
 	selfExePath, installedBinary = f.binPath, f.binPath
 	systemctlBinary = filepath.Join(dir, "bin", "systemctl")
@@ -1733,7 +1734,7 @@ func TestReleaseInspectRefusesASpecialFileAtADelegatedInput(t *testing.T) {
 	})
 	t.Run("darwin's managed executable", func(t *testing.T) {
 		f := newInspectFixture(t)
-		hostOS = "darwin"
+		cli.HostOS = "darwin"
 		if err := os.Remove(installedBinary); err != nil {
 			t.Fatal(err)
 		}
@@ -2390,7 +2391,7 @@ func TestReleaseInspectSeesAHeldTransactionLock(t *testing.T) {
 // asserted by value.
 func TestReleaseInspectOnDarwinIsPathEvidence(t *testing.T) {
 	f := newInspectFixture(t)
-	hostOS = "darwin"
+	cli.HostOS = "darwin"
 	r := f.report(t)
 	if r.Executable.ProcessBound {
 		t.Error("darwin reports a process-bound image")

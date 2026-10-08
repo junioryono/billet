@@ -755,7 +755,7 @@ linters:
       # that, 2026-09-11; reverting either of two unrelated files made the report
       # vanish), so a nolint directive here would be reported unused on a
       # smaller build. Excluded by file and rule, like the resolver above.
-      - path: (^|/)cmd/billet/githubapp\.go$
+      - path: (^|/)internal/ops/setup/githubapp\.go$
         linters:
           - gosec
         text: G703

@@ -81,7 +81,7 @@ var (
 	// this line is one piece of code that imposes one ORDER on both managers;
 	// everything below knows which manager it is.
 	converge = func(opts ...lifeops.ConvergeOption) converger {
-		if hostOS == "darwin" {
+		if cli.HostOS == "darwin" {
 			// NO OPTIONS ARE DROPPED SILENTLY. These configure the systemd
 			// converger and have no launchd counterpart; nothing passes one
 			// today, and a caller that starts to would otherwise have it
@@ -141,7 +141,7 @@ type upOptions struct {
 
 func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 	if o.servicePath == "" {
-		o.servicePath = initconfig.ServiceConfigPathFor(hostOS)
+		o.servicePath = initconfig.ServiceConfigPathFor(cli.HostOS)
 	}
 
 	cfg, err := config.Load(o.configPath)
@@ -162,7 +162,7 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 		// account and /usr/local/bin is root-owned until the setup's chown; the
 		// launchd planner refuses with that command rather than letting the first
 		// rollout drain the node and then fail to land.
-		BinaryDir: hostPathsFor(hostOS).binaryDir(),
+		BinaryDir: hostPathsFor(cli.HostOS).binaryDir(),
 	}
 	req.KeyPaths = app.KeyFilePaths(cfg)
 
@@ -1007,7 +1007,7 @@ func printPlan(env cli.Env, plan lifeops.UpPlan) {
 // and refuses a closed authority. A node-only host, a darwin host or an
 // unprivileged run has nothing to prepare and nothing to refuse.
 func prepareHostForUp(ctx context.Context, env cli.Env, req lifeops.UpRequest, cfg *config.Config, uid, gid int) error {
-	if !req.WantServer || !retirement.Supported(hostOS) || os.Geteuid() != 0 || cfg.Server == nil {
+	if !req.WantServer || !retirement.Supported(cli.HostOS) || os.Geteuid() != 0 || cfg.Server == nil {
 		return nil
 	}
 

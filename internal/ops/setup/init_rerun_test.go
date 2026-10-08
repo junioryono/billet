@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"bytes"
@@ -32,7 +32,7 @@ func TestInitReRunConvergesAPristineConfig(t *testing.T) {
 	ownHome(t)
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -47,7 +47,7 @@ func TestInitReRunConvergesAPristineConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve the key path: %v", err)
 	}
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := WriteGitHubBlock(processEnv(), path, GitHubBlock{
 		Org: "acme", AppID: 7, InstallationID: 42, ClientID: "Iv1.abc",
 		PrivateKeyPath: keyPath,
 	}); err != nil {
@@ -55,7 +55,7 @@ func TestInitReRunConvergesAPristineConfig(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), processEnv(), []string{
+		if err := Init(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -92,7 +92,7 @@ func TestInitReRunWritesBesideAnEditedConfig(t *testing.T) {
 	ownHome(t)
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -111,7 +111,7 @@ func TestInitReRunWritesBesideAnEditedConfig(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), processEnv(), []string{
+		if err := Init(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -161,7 +161,7 @@ func TestInitRefusesPointingAwayFromALiveIdentity(t *testing.T) {
 	// WITHOUT --force this lands on the write-beside path, which moves no
 	// pointer and so is NOT refused: the original stays byte-identical and the
 	// identity stays live.
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -175,7 +175,7 @@ func TestInitRefusesPointingAwayFromALiveIdentity(t *testing.T) {
 
 	// --force REPLACES the file, and that is exactly what the refusal covers —
 	// with deliberately no override flag.
-	forceErr := cmdInit(t.Context(), processEnv(), []string{
+	forceErr := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--force",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -200,7 +200,7 @@ func TestInitRefusesPointingAwayFromALiveIdentity(t *testing.T) {
 		}
 	})
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--force",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -218,7 +218,7 @@ func TestInitForceRefusesUnreadableYAML(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	err := cmdInit(t.Context(), processEnv(), []string{
+	err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--force",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -239,7 +239,7 @@ func TestInitReRunNeverRotatesAuthority(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -266,7 +266,7 @@ func TestInitReRunNeverRotatesAuthority(t *testing.T) {
 
 	before := snapshotDir(t, stateDir)
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,
@@ -342,7 +342,7 @@ func TestInitWarnsWhenTheListenAddressIsBusy(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), processEnv(), []string{
+		if err := Init(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme", "--listen", l.Addr().String(),
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -375,7 +375,7 @@ func TestInitWarnsWhenTheDefaultListenIsBusy(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 	out := capture(t, func() {
-		if err := cmdInit(t.Context(), processEnv(), []string{
+		if err := Init(t.Context(), processEnv(), []string{
 			"--config", path, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -411,7 +411,7 @@ func TestInitIdempotenceTable(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "billet.yaml")
 			args := append([]string{"--config", path}, flags...)
 
-			if err := cmdInit(t.Context(), processEnv(), args); err != nil {
+			if err := Init(t.Context(), processEnv(), args); err != nil {
 				t.Fatalf("first init: %v", err)
 			}
 			first, err := os.ReadFile(path)
@@ -420,7 +420,7 @@ func TestInitIdempotenceTable(t *testing.T) {
 			}
 
 			out := capture(t, func() {
-				if err := cmdInit(t.Context(), processEnv(), args); err != nil {
+				if err := Init(t.Context(), processEnv(), args); err != nil {
 					t.Fatalf("re-run: %v", err)
 				}
 			})
@@ -463,7 +463,7 @@ func TestInitForceRefusesAdoptingAForeignIdentity(t *testing.T) {
 		t.Fatalf("mint foreign identity: %v", err)
 	}
 
-	err := cmdInit(t.Context(), processEnv(), []string{
+	err := Init(t.Context(), processEnv(), []string{
 		"--config", path, "--org", "acme", "--force",
 		"--runner-group", testTrialGroup,
 		"--workflow", testTrialWorkflow,

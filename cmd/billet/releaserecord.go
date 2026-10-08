@@ -474,10 +474,10 @@ func cmdReleaseRecord(_ context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("this is not a release manifest billet can act on: %w", err)
 	}
 
-	artifact, err := manifest.Select(hostOS, runtime.GOARCH, releasesource.KindArchive)
+	artifact, err := manifest.Select(cli.HostOS, runtime.GOARCH, releasesource.KindArchive)
 	if err != nil {
 		return fmt.Errorf("%s publishes nothing for %s/%s, so it cannot be what produced "+
-			"this binary: %w", manifest.Version, hostOS, runtime.GOARCH, err)
+			"this binary: %w", manifest.Version, cli.HostOS, runtime.GOARCH, err)
 	}
 
 	// THE CHAIN THAT MAKES THE RECORD TRUE, and every link is checked below rather

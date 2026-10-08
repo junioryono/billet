@@ -126,8 +126,8 @@ PUBLISH="${PUBLISH:-yes}"
 # hosted runner holds by construction and the difference is one reviewed file
 # (scripts/runner-images/differences.tsv).
 
-# PINNED, NOT "LATEST", for the reason cmd/billet/ami.go gives about the AMI: an
-# image is a thing you reproduce, and a build that silently tracked the newest
+# PINNED, NOT "LATEST", for the reason internal/ops/images/ami.go gives about the AMI:
+# an image is a thing you reproduce, and a build that silently tracked the newest
 # release would make two runs of the same command produce different images — a
 # difference that surfaces as a job failing on one generation and not another.
 #

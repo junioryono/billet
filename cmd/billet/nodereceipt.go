@@ -92,7 +92,7 @@ func cmdNodeReceipt(ctx context.Context, env cli.Env, args []string) error {
 		return answerEndpointRefusal(env, r)
 	}
 
-	if hostOS == "darwin" || receiptPath == "" {
+	if cli.HostOS == "darwin" || receiptPath == "" {
 		return answerEndpointRefusal(env, endpointRefuse(endpointReasonPlatform,
 			"an endpoint receipt needs systemd and the node's runtime record, and this platform has neither", "", ""))
 	}

@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"bytes"
@@ -40,7 +40,7 @@ func TestReserveKeyFileStagesBesideTheDestination(t *testing.T) {
 	path := filepath.Join(dir, "app.pem")
 	staging := filepath.Join(dir, ".app.pem.billet-partial")
 
-	f, err := reserveKeyFile(path)
+	f, err := ReserveKeyFile(path)
 	if err != nil {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestReserveKeyFileRefusesAnExistingKey(t *testing.T) {
 		t.Fatalf("seed key: %v", err)
 	}
 
-	_, err := reserveKeyFile(path)
+	_, err := ReserveKeyFile(path)
 	if err == nil {
 		t.Fatal("reserveKeyFile accepted an occupied destination")
 	}
@@ -107,7 +107,7 @@ func TestReserveKeyFileRefusesALeftoverReservation(t *testing.T) {
 		t.Fatalf("seed leftover: %v", err)
 	}
 
-	_, err := reserveKeyFile(path)
+	_, err := ReserveKeyFile(path)
 	if err == nil {
 		t.Fatal("reserveKeyFile adopted a leftover reservation")
 	}
@@ -132,7 +132,7 @@ func TestReserveKeyFileReportsAStagedKey(t *testing.T) {
 		t.Fatalf("seed staged key: %v", err)
 	}
 
-	f, err := reserveKeyFile(path)
+	f, err := ReserveKeyFile(path)
 	if err == nil {
 		f.Close()
 		t.Fatal("reserveKeyFile ignored an orphaned key")
@@ -173,7 +173,7 @@ func TestReserveKeyFileWillNotRecommendClobberingASecondKey(t *testing.T) {
 		t.Fatalf("seed destination key: %v", err)
 	}
 
-	_, err := reserveKeyFile(path)
+	_, err := ReserveKeyFile(path)
 	if err == nil {
 		t.Fatal("reserveKeyFile proceeded with two keys present")
 	}
@@ -202,7 +202,7 @@ func TestReserveKeyFileDoesNotReportAFragmentAsAKey(t *testing.T) {
 		t.Fatalf("seed fragment: %v", err)
 	}
 
-	_, err := reserveKeyFile(path)
+	_, err := ReserveKeyFile(path)
 	if err == nil {
 		t.Fatal("reserveKeyFile adopted a fragment")
 	}
@@ -218,7 +218,7 @@ func TestWriteKeyAtomicallyInstallsTheKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.pem")
 
-	reserved, err := reserveKeyFile(path)
+	reserved, err := ReserveKeyFile(path)
 	if err != nil {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestWriteKeyAtomicallyInstallsTheKey(t *testing.T) {
 	key := testKey(t)
 	installed := false
 
-	if err := writeKeyAtomically(processEnv(), reserved, path, key, func() { installed = true }); err != nil {
+	if err := WriteKeyAtomically(processEnv(), reserved, path, key, func() { installed = true }); err != nil {
 		t.Fatalf("writeKeyAtomically: %v", err)
 	}
 
@@ -262,12 +262,12 @@ func TestWriteKeyAtomicallyLeavesNoSecondCopy(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.pem")
 
-	reserved, err := reserveKeyFile(path)
+	reserved, err := ReserveKeyFile(path)
 	if err != nil {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
 
-	if err := writeKeyAtomically(processEnv(), reserved, path, testKey(t), func() {}); err != nil {
+	if err := WriteKeyAtomically(processEnv(), reserved, path, testKey(t), func() {}); err != nil {
 		t.Fatalf("writeKeyAtomically: %v", err)
 	}
 
@@ -295,7 +295,7 @@ func TestWriteKeyAtomicallyRefusesToReplaceTheDestination(t *testing.T) {
 	path := filepath.Join(dir, "app.pem")
 	staging := filepath.Join(dir, ".app.pem.billet-partial")
 
-	reserved, err := reserveKeyFile(path)
+	reserved, err := ReserveKeyFile(path)
 	if err != nil {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestWriteKeyAtomicallyRefusesToReplaceTheDestination(t *testing.T) {
 	ours := testKey(t)
 	installed := false
 
-	writeErr := writeKeyAtomically(processEnv(), reserved, path, ours, func() { installed = true })
+	writeErr := WriteKeyAtomically(processEnv(), reserved, path, ours, func() { installed = true })
 	if writeErr == nil {
 		t.Fatal("writeKeyAtomically installed over a destination it did not create")
 	}
@@ -360,7 +360,7 @@ func TestDestinationIsStillReservedDetectsAReplacedFile(t *testing.T) {
 	path := filepath.Join(dir, "app.pem")
 	staging := filepath.Join(dir, ".app.pem.billet-partial")
 
-	reserved, err := reserveKeyFile(path)
+	reserved, err := ReserveKeyFile(path)
 	if err != nil {
 		t.Fatalf("reserveKeyFile: %v", err)
 	}
@@ -487,7 +487,7 @@ func TestReserveKeyFileWillNotOfferToDeleteAFileItCannotRead(t *testing.T) {
 		}
 	})
 
-	_, err := reserveKeyFile(path)
+	_, err := ReserveKeyFile(path)
 	if err == nil {
 		t.Fatal("reserveKeyFile proceeded past a file it could not read")
 	}
@@ -715,7 +715,7 @@ func TestWriteGitHubBlockPreservesTheMode(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := WriteGitHubBlock(processEnv(), path, GitHubBlock{
 		Org: "acme", AppID: 7, InstallationID: 9, PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
 		t.Fatalf("writeGitHubBlock: %v", err)
@@ -740,7 +740,7 @@ func TestWriteGitHubBlockPreservesTheMode(t *testing.T) {
 // App exists and its one-time key is spent, so re-running mints a second App
 // rather than recovering.
 func TestWriteGitHubBlockFillsOrRefusesEverySeedShape(t *testing.T) {
-	want := githubBlock{
+	want := GitHubBlock{
 		Org: "acme", AppID: 7, InstallationID: 9,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}
@@ -760,7 +760,7 @@ func TestWriteGitHubBlockFillsOrRefusesEverySeedShape(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				if err := writeGitHubBlock(processEnv(), path, want); err != nil {
+				if err := WriteGitHubBlock(processEnv(), path, want); err != nil {
 					t.Fatalf("writing an identity into %s: %v", name, err)
 				}
 
@@ -800,7 +800,7 @@ func TestWriteGitHubBlockFillsOrRefusesEverySeedShape(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				err := writeGitHubBlock(processEnv(), path, want)
+				err := WriteGitHubBlock(processEnv(), path, want)
 				if err == nil {
 					t.Fatalf("%s was overwritten instead of refused", name)
 				}

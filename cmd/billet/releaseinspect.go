@@ -265,7 +265,7 @@ var scheduledUnits = map[string]string{
 // value that is not a number). `LoadState=not-found` is a positive answer.
 func inspectScheduledUnit(ctx context.Context, unit string, service bool) inspectService {
 	svc := inspectService{scheduled: true, hasMainPID: service}
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		why := "launchd has no unit shape this inspector reads"
 		svc.UnitPresent, svc.UnitFileState, svc.Enabled = unknown(why), unknown(why), unknown(why)
 		svc.ActiveState, svc.SubState, svc.MainPID = unknown(why), unknown(why), unknown(why)
@@ -642,7 +642,7 @@ func inspectExecutableSection(report *inspectReport) (string, os.FileInfo) {
 		IsRelease:     version.IsRelease(version.Version()),
 	}
 	image := selfExePath
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		image = installedBinary
 	} else {
 		exe.ProcessBound = true
@@ -653,7 +653,7 @@ func inspectExecutableSection(report *inspectReport) (string, os.FileInfo) {
 	// managed path is a pathname like any other and goes through the
 	// regular-file rule, so a FIFO or a device there is could-not-tell.
 	hash := hashImage
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		hash = func(p string) (string, os.FileInfo, error) { return hashRegular(p, maxExecutableBytes) }
 	}
 	sum, info, err := hash(image)
@@ -1030,7 +1030,7 @@ func inspectServiceSection(ctx context.Context, role, unit string, cfg *config.C
 	inspectorConfig string, inspectorInfo os.FileInfo, inspectorSHA string, exeSHA string, exeInfo os.FileInfo,
 ) (inspectService, maybe) {
 	svc := inspectService{LoadedConfig: unknown("nothing on the disk proves what a process read at start")}
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return serviceAllUnknown(svc, "launchd has no unit shape this inspector reads"), unknown("launchd has no unit shape this inspector reads")
 	}
 	props, err := unitProperties(ctx, unit)
@@ -1784,7 +1784,7 @@ func inspectInstalledSection(cfg *config.Config, configPath string, loaded inspe
 // confirming-read snapshot with no lock, and a node's bundle is read without
 // its key.
 func inspectHostSection(cfg *config.Config, regID registrationIdentity) inspectHost {
-	host := inspectHost{OS: hostOS}
+	host := inspectHost{OS: cli.HostOS}
 	host.Retirement = inspectRetirement()
 	host.Addresses = inspectAddresses()
 	host.NodeEffectiveName = inspectNodeEffectiveName(cfg, regID)
@@ -1825,7 +1825,7 @@ func inspectHostSection(cfg *config.Config, regID registrationIdentity) inspectH
 // inspectAddresses is host.addresses: every unicast address this host holds,
 // from the kernel, on Linux.
 func inspectAddresses() maybe {
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return unknown("addresses are not reported on darwin: no retirement compares them there")
 	}
 
@@ -1867,7 +1867,7 @@ func inspectNodeEffectiveName(cfg *config.Config, id registrationIdentity) maybe
 // phases a retiring controller has durably reached, which the loader follows
 // to decide where that host's identity now lives.
 func inspectRetirement() maybe {
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return unknown("retirement is not tracked on darwin: a launch agent's account owns no /var/lib/billet")
 	}
 	body, err := readPublicFile(retiredJournalPath)

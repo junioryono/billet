@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"bytes"
@@ -41,10 +41,10 @@ func stubOnboard(t *testing.T, key []byte, fail error) *int {
 
 	calls := 0
 
-	prev := onboard
-	t.Cleanup(func() { onboard = prev })
+	prev := Onboard
+	t.Cleanup(func() { Onboard = prev })
 
-	onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
+	Onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		calls++
 
 		if fail != nil {
@@ -153,7 +153,7 @@ func TestGitHubAppCreateRefusesAConfigItCannotUpdate(t *testing.T) {
 			var err error
 
 			out := capture(t, func() {
-				err = githubAppCreate(t.Context(), processEnv(), []string{
+				err = GitHubAppCreate(t.Context(), processEnv(), []string{
 					"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 				})
 			})
@@ -205,7 +205,7 @@ func TestGitHubAppCreateRefusesAConfigItCannotUpdate(t *testing.T) {
 
 			// And nothing was reserved on the way, so a re-run after the fix is a
 			// clean re-run rather than one that trips over its own leftovers.
-			for _, path := range []string{keyPath, stagingPath(keyPath)} {
+			for _, path := range []string{keyPath, StagingPath(keyPath)} {
 				if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
 					t.Errorf("%s was created before the refusal (%v)", path, statErr)
 				}
@@ -224,7 +224,7 @@ func TestGitHubAppCreateRefusesAConfigItCannotUpdate(t *testing.T) {
 // legitimate onboarding, and one that accepts something the write refuses puts
 // the failure back after the App exists.
 func TestThePreflightAgreesWithTheWrite(t *testing.T) {
-	identity := githubBlock{
+	identity := GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}
@@ -294,7 +294,7 @@ func TestThePreflightAgreesWithTheWrite(t *testing.T) {
 				written   []string
 			)
 
-			for _, shape := range []githubBlock{withClientID, identity} {
+			for _, shape := range []GitHubBlock{withClientID, identity} {
 				// A FRESH COPY PER SHAPE: the write mutates the file, so the
 				// second shape would otherwise be answering about the first
 				// one's output rather than about the seed.
@@ -303,7 +303,7 @@ func TestThePreflightAgreesWithTheWrite(t *testing.T) {
 					t.Fatalf("seed: %v", err)
 				}
 
-				writeErrs = append(writeErrs, writeGitHubBlock(processEnv(), attempt, shape))
+				writeErrs = append(writeErrs, WriteGitHubBlock(processEnv(), attempt, shape))
 				written = append(written, attempt)
 			}
 
@@ -320,7 +320,7 @@ func TestThePreflightAgreesWithTheWrite(t *testing.T) {
 			// over a config carrying somebody else's client id — which is
 			// exactly what it did, because the field the render may LEAVE ALONE
 			// is the one nothing checked.
-			for i, shape := range []githubBlock{withClientID, identity} {
+			for i, shape := range []GitHubBlock{withClientID, identity} {
 				if writeErrs[i] != nil {
 					continue
 				}
@@ -370,7 +370,7 @@ func TestGitHubAppCreateSaysItWillEditTheConfigBeforeItDoes(t *testing.T) {
 		var err error
 
 		out := capture(t, func() {
-			err = githubAppCreate(t.Context(), processEnv(), []string{
+			err = GitHubAppCreate(t.Context(), processEnv(), []string{
 				"--org", "acme", "--config", cfgPath,
 				"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 			})
@@ -428,7 +428,7 @@ func TestGitHubAppCreateSaysItWillEditTheConfigBeforeItDoes(t *testing.T) {
 			var err error
 
 			out := capture(t, func() {
-				err = githubAppCreate(t.Context(), processEnv(), []string{
+				err = GitHubAppCreate(t.Context(), processEnv(), []string{
 					"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 				})
 			})
@@ -508,7 +508,7 @@ func TestTheNoticeNamesTheIdentityItWillReplace(t *testing.T) {
 	stubOnboard(t, testKey(t), errors.New("stop here"))
 
 	out := capture(t, func() {
-		_ = githubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
+		_ = GitHubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
 			"--org", "acme", "--config", cfgPath,
 			"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
@@ -531,7 +531,7 @@ func TestTheNoticeSaysWhenNothingWillBeEdited(t *testing.T) {
 	stubOnboard(t, testKey(t), errors.New("stop here"))
 
 	out := capture(t, func() {
-		_ = githubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
+		_ = GitHubAppCreate(t.Context(), processEnv(), []string{ //nolint:errcheck // the stub's refusal is not what this asserts
 			"--org", "acme", "--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
 	})
@@ -598,7 +598,7 @@ func TestTheConfigWriteNeverClobbersTheKeyPath(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 		})
 	})
@@ -646,7 +646,7 @@ func TestInitNeverClobbersAFileAtTheStagingName(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = cmdInit(t.Context(), processEnv(), []string{
+		err = Init(t.Context(), processEnv(), []string{
 			"--config", cfgPath, "--org", "acme",
 			"--runner-group", testTrialGroup,
 			"--workflow", testTrialWorkflow,
@@ -713,7 +713,7 @@ func TestASymlinkedConfigIsFollowedRatherThanReplaced(t *testing.T) {
 	// NO --key-path, so the default is exercised too: the key belongs beside the
 	// file that actually holds the config, not beside the link.
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", link, "--no-browser",
 		})
 	})
@@ -781,7 +781,7 @@ func TestTheMissingConfigRefusalDoesNotDependOnKeyPath(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--no-browser",
 		})
 	})
@@ -834,7 +834,7 @@ func TestAnUndeliverableNoticeStopsTheRun(t *testing.T) {
 		_ = w.Close()
 	})
 
-	err := githubAppCreate(t.Context(), processEnv(), []string{
+	err := GitHubAppCreate(t.Context(), processEnv(), []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
@@ -854,7 +854,7 @@ func TestAnUndeliverableNoticeStopsTheRun(t *testing.T) {
 
 // AND THE NOTICE COMES BEFORE ANYTHING THAT OUTLIVES THE COMMAND.
 //
-// The failed-onboarding case proves the notice precedes `onboard`. It does not
+// The failed-onboarding case proves the notice precedes `Onboard`. It does not
 // prove it precedes the key reservation, which is the first thing this command
 // creates and LEAVES on disk — moving sayConfigEdit between the two would leave
 // that case green. Here the reservation fails, so a notice printed after it
@@ -885,7 +885,7 @@ func TestTheNoticeComesBeforeTheFirstSideEffect(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath, "--key-path", keyPath, "--no-browser",
 		})
 	})
@@ -922,10 +922,10 @@ func TestTheRecoveryBlockGoesToStderr(t *testing.T) {
 	// The config disappears the instant the App exists, which is the state this
 	// fallback is for and the one place a test can create it: everything the
 	// preflight checks was true when it ran.
-	prev := onboard
-	t.Cleanup(func() { onboard = prev })
+	prev := Onboard
+	t.Cleanup(func() { Onboard = prev })
 
-	onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
+	Onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		app := &github.App{ID: stubAppID, ClientID: "Iv1.stub", PEM: string(testKey(t))}
 		if err := opts.OnAppCreated(app); err != nil {
 			return nil, err
@@ -948,7 +948,7 @@ func TestTheRecoveryBlockGoesToStderr(t *testing.T) {
 
 	stderr := captureStderr(t, func() {
 		stdout = capture(t, func() {
-			err = githubAppCreate(t.Context(), processEnv(), []string{
+			err = GitHubAppCreate(t.Context(), processEnv(), []string{
 				"--org", "acme", "--config", cfgPath,
 				"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 			})
@@ -1040,7 +1040,7 @@ func TestTheConfigWriteLeavesNoStagedFile(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := WriteGitHubBlock(processEnv(), path, GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1089,12 +1089,12 @@ func TestReplacingAnIdentityLeavesNoneOfTheOldOne(t *testing.T) {
 
 	// The new App has no client id, which is the case the old code could not
 	// express: every other field is written and that one is left behind.
-	want := githubBlock{
+	want := GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}
 
-	if err := writeGitHubBlock(processEnv(), path, want); err != nil {
+	if err := WriteGitHubBlock(processEnv(), path, want); err != nil {
 		t.Fatalf("writeGitHubBlock: %v", err)
 	}
 
@@ -1145,7 +1145,7 @@ func TestOwnershipIsProvedBeforeTheAppIsCreated(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--org", "acme", "--config", cfgPath,
 			"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 		})
@@ -1170,7 +1170,7 @@ func TestOwnershipIsProvedBeforeTheAppIsCreated(t *testing.T) {
 // path containing " #" became a comment, so the value read back short and the
 // server would open a file that is not the key.
 func TestThePrintedBlockSurvivesBeingReadBack(t *testing.T) {
-	awkward := githubBlock{
+	awkward := GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		ClientID:       "Iv1.stub",
 		PrivateKeyPath: "/tmp/keys/app # not a comment.pem",
@@ -1229,7 +1229,7 @@ func TestAnAliasedKeyIsNotTheKeyItNames(t *testing.T) {
 	}
 
 	// An identity with NO client id, which is what makes the removal run.
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := WriteGitHubBlock(processEnv(), path, GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1273,7 +1273,7 @@ func TestAnAliasWhoseValueIsTheKeyIsTheKey(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := WriteGitHubBlock(processEnv(), path, GitHubBlock{
 		Org: "acme", AppID: stubAppID, InstallationID: stubInstallationID,
 		PrivateKeyPath: "/etc/billet/app-private-key.pem",
 	}); err != nil {
@@ -1310,10 +1310,10 @@ func TestAPostAppFailureNeverAsksToBeRerun(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	prev := onboard
-	t.Cleanup(func() { onboard = prev })
+	prev := Onboard
+	t.Cleanup(func() { Onboard = prev })
 
-	onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
+	Onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		app := &github.App{ID: stubAppID, ClientID: "Iv1.stub", PEM: string(testKey(t))}
 		if err := opts.OnAppCreated(app); err != nil {
 			return nil, err
@@ -1340,8 +1340,8 @@ func TestAPostAppFailureNeverAsksToBeRerun(t *testing.T) {
 	env := processEnv()
 	env.Stdout, env.Stderr = stdout, stderr
 
-	inner := onboard
-	onboard = func(ctx context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
+	inner := Onboard
+	Onboard = func(ctx context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		result, err := inner(ctx, opts)
 
 		stdout.w, stderr.w = brokenPipe(t), brokenPipe(t)
@@ -1349,7 +1349,7 @@ func TestAPostAppFailureNeverAsksToBeRerun(t *testing.T) {
 		return result, err
 	}
 
-	err := githubAppCreate(t.Context(), env, []string{
+	err := GitHubAppCreate(t.Context(), env, []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
@@ -1400,8 +1400,8 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	prev := onboard
-	t.Cleanup(func() { onboard = prev })
+	prev := Onboard
+	t.Cleanup(func() { Onboard = prev })
 
 	var stdout bytes.Buffer
 
@@ -1409,7 +1409,7 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 	env := processEnv()
 	env.Stdout, env.Stderr = &stdout, stderr
 
-	onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
+	Onboard = func(_ context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		app := &github.App{ID: stubAppID, ClientID: "Iv1.stub", PEM: string(testKey(t))}
 		if err := opts.OnAppCreated(app); err != nil {
 			return nil, err
@@ -1430,7 +1430,7 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 		}, nil
 	}
 
-	err := githubAppCreate(t.Context(), env, []string{
+	err := GitHubAppCreate(t.Context(), env, []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})

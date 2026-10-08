@@ -6,6 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/initconfig"
@@ -119,10 +120,10 @@ func generatedPaths(t *testing.T, profile initconfig.Profile, goos string) (stri
 	t.Helper()
 
 	if goos != "" {
-		prev := hostOS
-		hostOS = goos
+		prev := cli.HostOS
+		cli.HostOS = goos
 
-		t.Cleanup(func() { hostOS = prev })
+		t.Cleanup(func() { cli.HostOS = prev })
 	}
 
 	body, _, err := initconfig.Generate(initconfig.Params{

@@ -356,7 +356,7 @@ func cmdServerRetire(ctx context.Context, env cli.Env, args []string) error {
 		return answerRetireModeRefusal(env, m, retireUnexaminedFor(m, drainedBefore(env, m, r)))
 	}
 
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return answerRetireModeRefusal(env, m, retireUnexaminedFor(m, drainedBefore(env, m, retireRefuse(retireReasonPlatform,
 			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", ""))))
 	}

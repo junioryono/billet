@@ -49,7 +49,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/nodeplane/*_test.go` (guards, dispatch fences, barrier loop), `internal/nodeapi/*_test.go` (range negotiation), `internal/nodeclient/*_test.go`.
-- `internal/app/handshakelistener_test.go`, `limitedlistener_test.go`, `bootstrapwire_test.go`; `cmd/billet/wirewindow_test.go`, `enrolladdr_test.go`.
+- `internal/app/handshakelistener_test.go`, `limitedlistener_test.go`, `bootstrapwire_test.go`; `cmd/billet/wirewindow_test.go`; `internal/ops/fleetops/enrolladdr_test.go`.
 - `internal/e2e/wire_test.go`, `enroll_test.go`, `revocation_test.go`, `mtls_test.go`: `TestAnUnenrolledConnectionCanReachNothingElse` and the superseded-incarnation scenarios.
 
 ## Related skills

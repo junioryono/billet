@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -21,7 +23,7 @@ import (
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
-// geteuid is a seam for the same reason hostOS and converge are: whether this
+// geteuid is a seam for the same reason cli.HostOS and converge are: whether this
 // process is root decides whether a restore hands its work to the service
 // account, and no test can be root.
 var geteuid = os.Geteuid
@@ -272,7 +274,7 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 func repairRestoredOwnership(env cli.Env, plan deployarchive.Plan) {
 	// NOT ON macOS: the launch agent runs as the operator, so a restore they ran
 	// already wrote files that account owns.
-	if hostOS != "linux" {
+	if cli.HostOS != "linux" {
 		return
 	}
 
@@ -481,12 +483,12 @@ func restoreUnfinished(stateDir string) (bool, error) {
 // rounds went into those rules; a restore installs the same kind of file and
 // must use the same code.
 func installAppKey(env cli.Env, path string, pem []byte) error {
-	reserved, err := reserveKeyFile(path)
+	reserved, err := setup.ReserveKeyFile(path)
 	if err != nil {
 		return err
 	}
 
-	return writeKeyAtomically(env, reserved, path, pem, func() {})
+	return setup.WriteKeyAtomically(env, reserved, path, pem, func() {})
 }
 
 // errFleetNotFenced is the refusal that no lock on this machine can substitute

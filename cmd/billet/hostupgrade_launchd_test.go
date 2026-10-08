@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -185,13 +186,13 @@ func TestTheLaunchdHostRefreshesImagesOnlyForTart(t *testing.T) {
 // BEFORE A CLAIM. A dispatching node then reports the refusal, and the rollout
 // backs off rather than cordoning a machine nothing could move.
 func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
-	restore := hostOS
-	t.Cleanup(func() { hostOS = restore })
+	restore := cli.HostOS
+	t.Cleanup(func() { cli.HostOS = restore })
 
 	cfg := &config.Config{Node: &config.NodeConfig{}}
 	journal := &hostupgrade.Journal{ToVersion: "v0.5.0"}
 
-	hostOS = "darwin"
+	cli.HostOS = "darwin"
 
 	if h, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err != nil {
 		t.Fatalf("darwin: %v", err)
@@ -199,7 +200,7 @@ func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
 		t.Fatalf("darwin built %T, want the launchd host", h)
 	}
 
-	hostOS = "linux"
+	cli.HostOS = "linux"
 
 	if h, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err != nil {
 		t.Fatalf("linux: %v", err)
@@ -207,7 +208,7 @@ func TestNewHostForPicksTheServiceManagerByPlatform(t *testing.T) {
 		t.Fatalf("linux built %T, want the systemd host", h)
 	}
 
-	hostOS = "freebsd"
+	cli.HostOS = "freebsd"
 
 	if _, err := newHostFor(processEnv(), cfg, "", "/staged", journal); err == nil {
 		t.Fatal("a platform with no host implementation was accepted")

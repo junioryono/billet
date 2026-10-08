@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/config"
 
 	"gopkg.in/yaml.v3"
@@ -67,20 +69,20 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 			return nil, err
 		}
 
-		setScalar(server, "listen", listen)
+		setup.SetScalar(server, "listen", listen)
 
 		// AN ACCEPTANCE RUN NEVER SERVES THE FLEET. A base config binding a real
 		// address would have this deployment listening where the real one does, or
 		// racing it for the port; loopback is what an isolated run needs and is
 		// what `up` picked a port on.
-		removeScalar(server, "bootstrap_listen")
-		removeScalar(server, "node_tls_hosts")
+		setup.RemoveScalar(server, "bootstrap_listen")
+		setup.RemoveScalar(server, "node_tls_hosts")
 	}
 
 	if node := mappingValue(root, "node"); node != nil {
-		setScalar(node, "state_dir", filepath.Join(dir, "node"))
-		setScalar(node, "lock_dir", filepath.Join(dir, "locks"))
-		setScalar(node, "server_addr", listen)
+		setup.SetScalar(node, "state_dir", filepath.Join(dir, "node"))
+		setup.SetScalar(node, "lock_dir", filepath.Join(dir, "locks"))
+		setup.SetScalar(node, "server_addr", listen)
 
 		// THE NODE'S NAME IS A FLEET IDENTIFIER, so it is prefixed for the reason
 		// tier labels are: the control plane keys placement, custody and the
@@ -92,7 +94,7 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 		// carry it for a real fleet. Removing it here is not a simplification of
 		// the thing under test: a loopback wire serves plain HTTP by design, and
 		// leaving this would make the derived config refuse to load.
-		removeScalar(node, "tls")
+		setup.RemoveScalar(node, "tls")
 	}
 
 	// THE BACKUP DESTINATION IS DROPPED. An acceptance run's archives have no
@@ -100,7 +102,7 @@ func rewriteForAcceptance(root *yaml.Node, dir, prefix, listen string) ([]string
 	// from it's own, under a prefix its retention rule governs — and billet's
 	// no-clobber writes mean the collision would surface as a failure rather than
 	// as corruption, which is still a failure nobody asked for.
-	removeScalar(root, "backup")
+	setup.RemoveScalar(root, "backup")
 
 	// NEVER ON AUTOMATIC UPDATES. The binary under acceptance is whatever the
 	// workflow built, which reports no release, and a fleet whose hosts report no
@@ -175,12 +177,12 @@ func setStateDir(server *yaml.Node, dir string) error {
 	}
 
 	if identity != nil {
-		setScalar(server, "identity_dir", dir)
+		setup.SetScalar(server, "identity_dir", dir)
 
 		return nil
 	}
 
-	setScalar(server, "state_dir", dir)
+	setup.SetScalar(server, "state_dir", dir)
 
 	return nil
 }
@@ -296,7 +298,7 @@ func prefixNodeNames(root *yaml.Node, prefix string) {
 // dropMappingKey removes key and its value from a mapping, if present.
 func dropMappingKey(m *yaml.Node, key string) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if setup.IsKey(m.Content[i], key) {
 			m.Content = append(m.Content[:i], m.Content[i+2:]...)
 
 			return
@@ -316,7 +318,7 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 	}
 
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if setup.IsKey(m.Content[i], key) {
 			return m.Content[i+1]
 		}
 	}
@@ -334,7 +336,7 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 // gives; a mapping is kept as it is, anchor and all, because nothing is replaced.
 func ensureMapping(m *yaml.Node, key string) (*yaml.Node, error) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if setup.IsKey(m.Content[i], key) {
 			if old := m.Content[i+1]; old.Kind != yaml.MappingNode {
 				if old.Anchor != "" {
 					return nil, anchoredValue(key, old.Anchor)
@@ -396,7 +398,7 @@ func joinComments(a, b string) string {
 // asked to write the value out where it is aliased.
 func forceScalar(m *yaml.Node, key, value string) error {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if setup.IsKey(m.Content[i], key) {
 			old := m.Content[i+1]
 			if old.Anchor != "" {
 				return anchoredValue(key, old.Anchor)

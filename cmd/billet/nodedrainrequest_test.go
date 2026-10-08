@@ -86,7 +86,7 @@ func TestEveryDrainRequestIsWrittenWhereTheNodeReadsItBeforeTheStop(t *testing.T
 	before("localdown.go", localdown, "requestNodeDrain(nodeDrainRequestFile)", "c.StopAndProve(")
 	// ASKED OF EVERY LINUX NODE, never decided by the stop policy on disk: the
 	// running process's policy is what decides, and it may have loaded another.
-	if !strings.Contains(localdown, "if req.WantNode && hostOS == \"linux\" {\n\t\tif err := "+
+	if !strings.Contains(localdown, "if req.WantNode && cli.HostOS == \"linux\" {\n\t\tif err := "+
 		"requestNodeDrain(nodeDrainRequestFile)") {
 		t.Error("local down's drain request is guarded by something other than a Linux node being stopped")
 	}

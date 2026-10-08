@@ -412,7 +412,7 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 	// node whatever the config on disk says, because the policy that decides is
 	// the running process's, which may have loaded another; not on a Mac, where
 	// handoff is refused and the launch agent could not write the request.
-	if req.WantNode && hostOS == "linux" {
+	if req.WantNode && cli.HostOS == "linux" {
 		if err := requestNodeDrain(nodeDrainRequestFile); err != nil {
 			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, err)
 		}

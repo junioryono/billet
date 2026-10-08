@@ -944,7 +944,7 @@ func TestUpRefusesAConfigThePackagedUnitsCannotUse(t *testing.T) {
 	}
 
 	// It names the path the units actually read, and how to get one there.
-	if !strings.Contains(err.Error(), initconfig.ServiceConfigPathFor(hostOS)) {
+	if !strings.Contains(err.Error(), initconfig.ServiceConfigPathFor(cli.HostOS)) {
 		t.Errorf("the refusal does not name the path the units read: %v", err)
 	}
 	if !strings.Contains(err.Error(), "--profile local-service") {
@@ -1035,9 +1035,9 @@ func TestUpReportsEveryRefusalWithItsRemedy(t *testing.T) {
 func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 	asLinux(t)
 
-	if _, err := os.Stat(initconfig.ServiceConfigPathFor(hostOS)); err == nil {
+	if _, err := os.Stat(initconfig.ServiceConfigPathFor(cli.HostOS)); err == nil {
 		t.Skipf("this machine has a real %s, so the error below would not be about "+
-			"the path being defaulted", initconfig.ServiceConfigPathFor(hostOS))
+			"the path being defaulted", initconfig.ServiceConfigPathFor(cli.HostOS))
 	}
 
 	t.Run("up", func(t *testing.T) {
@@ -1045,7 +1045,7 @@ func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 		if err == nil {
 			t.Fatal("up succeeded without a config")
 		}
-		if !strings.Contains(err.Error(), initconfig.ServiceConfigPathFor(hostOS)) {
+		if !strings.Contains(err.Error(), initconfig.ServiceConfigPathFor(cli.HostOS)) {
 			t.Errorf("up with no --config looked somewhere else: %v", err)
 		}
 	})
@@ -1064,9 +1064,9 @@ func TestLocalCommandsDefaultToTheConfigTheUnitsRead(t *testing.T) {
 		if err := cmdLocalStatus(t.Context(), processEnv(), nil); err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		if asked != initconfig.ServiceConfigPathFor(hostOS) {
+		if asked != initconfig.ServiceConfigPathFor(cli.HostOS) {
 			t.Errorf("status with no --config inspected %q, want %q",
-				asked, initconfig.ServiceConfigPathFor(hostOS))
+				asked, initconfig.ServiceConfigPathFor(cli.HostOS))
 		}
 	})
 }

@@ -33,12 +33,12 @@ func cmdLocal(ctx context.Context, env cli.Env, args []string) error {
 	// inherits it rather than having to remember. It is a switch now rather than
 	// a refusal: billet manages systemd units on Linux and launch agents on
 	// macOS, and everything else has neither.
-	switch hostOS {
+	switch cli.HostOS {
 	case "linux", "darwin":
 	default:
 		return fmt.Errorf("billet local manages the services billet ships — systemd units on "+
 			"Linux, launch agents on macOS — and this host is %s. Run the two roles directly "+
-			"(`billet server` and `billet node`)", hostOS)
+			"(`billet server` and `billet node`)", cli.HostOS)
 	}
 
 	switch args[0] {
@@ -76,7 +76,7 @@ func cmdLocal(ctx context.Context, env cli.Env, args []string) error {
 // directory did not exist, which is true, unhelpful, and about a file nothing
 // ever creates.
 func addServiceConfigFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", initconfig.ServiceConfigPathFor(hostOS),
+	return fs.String("config", initconfig.ServiceConfigPathFor(cli.HostOS),
 		"path to billet.yaml (defaults to the config the services billet ships read)")
 }
 
@@ -103,7 +103,7 @@ func cmdLocalStatus(ctx context.Context, env cli.Env, args []string) error {
 
 	// EACH MANAGER REPORTS ITS OWN FACTS. See macStatus for why this is a second
 	// renderer rather than the same one with different words.
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return macStatus(ctx, env, *cfgPath)
 	}
 

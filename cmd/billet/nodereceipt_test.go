@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/durablefile"
 )
 
@@ -717,7 +718,7 @@ func TestReceiptRefreshRefusesWhatItCannotCertify(t *testing.T) {
 	t.Run("darwin", func(t *testing.T) {
 		t.Helper()
 		f := newReceiptCmdFixture(t)
-		hostOS = "darwin"
+		cli.HostOS = "darwin"
 
 		o := f.refresh(t, f.rendering(endpointB))
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonPlatform)

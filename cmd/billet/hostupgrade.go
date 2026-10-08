@@ -43,7 +43,7 @@ import (
 // A VAR RATHER THAN A CONST, so a test can own the directory it writes into. The
 // bookkeeping under this path is durable by design and a test that wrote to the
 // real one would be a test that upgrades the machine running it.
-var upgradeRoot = hostPathsFor(hostOS).upgradeRoot
+var upgradeRoot = hostPathsFor(cli.HostOS).upgradeRoot
 
 // activePointer is the claim one upgrade holds for the duration.
 //
@@ -684,8 +684,8 @@ func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Confi
 	// the setup's chown, and finding that at the rename would be a rollback
 	// after a drain nobody needed. After the lock, so a second start is still
 	// refused for the lock and nothing else.
-	if hostOS == "darwin" {
-		if err := checkBinaryDir(hostPathsFor(hostOS)); err != nil {
+	if cli.HostOS == "darwin" {
+		if err := checkBinaryDir(hostPathsFor(cli.HostOS)); err != nil {
 			return err
 		}
 	}
@@ -1724,7 +1724,7 @@ func stageCandidate(ctx context.Context, client *releasesource.Client,
 	// GoReleaser's name template interpolates and what the install script derives.
 	// Using the wrong one here selects nothing and reports the platform as
 	// unpublished.
-	artifact, err := manifest.Select(hostOS, runtime.GOARCH, releasesource.KindArchive)
+	artifact, err := manifest.Select(cli.HostOS, runtime.GOARCH, releasesource.KindArchive)
 	if err != nil {
 		return "", err
 	}
@@ -1858,14 +1858,14 @@ func newSystemdHost(env cli.Env, cfg *config.Config, cfgPath, staged string,
 func newHostFor(env cli.Env, cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) (hostupgrade.Host, error) {
-	switch hostOS {
+	switch cli.HostOS {
 	case "linux":
 		return newSystemdHost(env, cfg, cfgPath, staged, journal), nil
 	case "darwin":
 		return newLaunchdHost(env, cfg, cfgPath, staged, journal), nil
 	default:
 		return nil, fmt.Errorf("billet host-upgrade replaces billet under systemd or launchd, "+
-			"and this host is %s; upgrade it the way it was installed", hostOS)
+			"and this host is %s; upgrade it the way it was installed", cli.HostOS)
 	}
 }
 
@@ -2783,7 +2783,7 @@ func (h *ledgerHost) configPath() string {
 		return h.cfgPath
 	}
 
-	return initconfig.ServiceConfigPathFor(hostOS)
+	return initconfig.ServiceConfigPathFor(cli.HostOS)
 }
 
 // StartServices starts the steady-state units and proves each came up.

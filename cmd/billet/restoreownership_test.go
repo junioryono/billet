@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
@@ -28,12 +29,12 @@ import (
 func asRootOnLinux(t *testing.T) *fakeConverger {
 	t.Helper()
 
-	prevOS, prevUID, prevConverge := hostOS, geteuid, converge
+	prevOS, prevUID, prevConverge := cli.HostOS, geteuid, converge
 
-	t.Cleanup(func() { hostOS, geteuid, converge = prevOS, prevUID, prevConverge })
+	t.Cleanup(func() { cli.HostOS, geteuid, converge = prevOS, prevUID, prevConverge })
 
 	f := &fakeConverger{}
-	hostOS = "linux"
+	cli.HostOS = "linux"
 	geteuid = func() int { return 0 }
 	converge = func(...lifeops.ConvergeOption) converger { return f }
 

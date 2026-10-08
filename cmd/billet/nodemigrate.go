@@ -128,7 +128,7 @@ func cmdNodeMigrate(ctx context.Context, env cli.Env, args []string) error {
 		return answerEndpointRefusal(env, r)
 	}
 
-	if hostOS == "darwin" {
+	if cli.HostOS == "darwin" {
 		return answerEndpointRefusal(env, endpointRefuse(endpointReasonPlatform,
 			"an endpoint migration needs systemd and the node's runtime record, and this platform has neither",
 			"", stateNothing))

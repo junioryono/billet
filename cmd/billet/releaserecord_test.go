@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provenance"
 	"github.com/junioryono/billet/internal/provider/firecracker"
@@ -47,7 +48,7 @@ func buildRecordFixture(t *testing.T) recordFixture {
 	// A REAL ARCHIVE CARRYING THAT BINARY, because the command checks the link
 	// rather than assuming it. A fixture that wrote arbitrary bytes and called them
 	// an archive would exercise the manifest comparison and nothing else.
-	archive := filepath.Join(dir, "billet_0.4.0_"+hostOS+"_"+runtime.GOARCH+".tar.gz")
+	archive := filepath.Join(dir, "billet_0.4.0_"+cli.HostOS+"_"+runtime.GOARCH+".tar.gz")
 	writeBilletArchive(t, archive, archiveBody)
 
 	sum, err := provenance.HashFile(archive)
@@ -65,7 +66,7 @@ func buildRecordFixture(t *testing.T) recordFixture {
 		GuestContract: firecracker.GuestContract,
 		Actions:       "v0.4.0",
 		Artifacts: []releasesource.Artifact{{
-			Name: filepath.Base(archive), OS: hostOS, Arch: runtime.GOARCH,
+			Name: filepath.Base(archive), OS: cli.HostOS, Arch: runtime.GOARCH,
 			Kind: releasesource.KindArchive, SHA256: sum, Size: archiveSize(t, archive),
 		}},
 	})

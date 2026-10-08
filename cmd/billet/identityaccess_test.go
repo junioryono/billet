@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -25,12 +26,12 @@ func useRetirementRoot(t *testing.T) {
 	oldRoot := retirement.Root
 	retirement.Root = t.TempDir()
 
-	oldOS, oldPlatform := hostOS, retirement.Platform
-	hostOS, retirement.Platform = "linux", "linux"
+	oldOS, oldPlatform := cli.HostOS, retirement.Platform
+	cli.HostOS, retirement.Platform = "linux", "linux"
 
 	t.Cleanup(func() {
 		retirement.Root = oldRoot
-		hostOS, retirement.Platform = oldOS, oldPlatform
+		cli.HostOS, retirement.Platform = oldOS, oldPlatform
 	})
 }
 
@@ -67,10 +68,10 @@ func locked(t *testing.T, path string) bool {
 }
 
 func TestLocalPrepareRefusesTheCallersItIsNotFor(t *testing.T) {
-	old := hostOS
-	t.Cleanup(func() { hostOS = old })
+	old := cli.HostOS
+	t.Cleanup(func() { cli.HostOS = old })
 
-	hostOS = "darwin"
+	cli.HostOS = "darwin"
 
 	if err := cmdLocalPrepare(t.Context(), processEnv(), []string{"--json"}); err == nil ||
 		!strings.Contains(err.Error(), "Linux") {
@@ -81,7 +82,7 @@ func TestLocalPrepareRefusesTheCallersItIsNotFor(t *testing.T) {
 		t.Skip("the root refusal is for a caller that is not root")
 	}
 
-	hostOS = "linux"
+	cli.HostOS = "linux"
 
 	if err := cmdLocalPrepare(t.Context(), processEnv(), []string{"--json"}); err == nil ||
 		!strings.Contains(err.Error(), "only root") {

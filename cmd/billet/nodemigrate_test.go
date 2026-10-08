@@ -876,7 +876,7 @@ func TestMigrateRefusesInputsItCannotJudge(t *testing.T) {
 	t.Run("darwin", func(t *testing.T) {
 		t.Helper()
 		f := newEndpointFixture(t)
-		hostOS = "darwin"
+		cli.HostOS = "darwin"
 
 		o := f.migrate(t, f.rendering(endpointB))
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonPlatform)

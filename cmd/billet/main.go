@@ -17,6 +17,8 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	opsimages "github.com/junioryono/billet/internal/ops/images"
@@ -30,14 +32,6 @@ import (
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
-
-// errNotImplemented marks a role that is scaffolded but cannot serve yet.
-//
-// It is returned immediately and non-zero rather than blocking. A process that
-// idles until signalled looks healthy to systemd, Docker, and every uptime
-// check, so a half-built control plane would be reported as running while no
-// job is ever picked up. Failing loudly is the honest behaviour for pre-alpha.
-var errNotImplemented = errors.New("not implemented yet")
 
 // commands takes the lifecycle so the two long-running roles can close over it.
 //
@@ -69,7 +63,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "check", Summary: "validate the config and state directory, then exit",
 			Run: cmdCheck},
 		{Name: "init", Summary: "generate a billet.yaml interactively",
-			Run: cmdInit},
+			Run: setup.Init},
 		{Name: "ami", Summary: "build and verify the machine image the ec2 backend launches",
 			Run: opsimages.AMI},
 		{Name: "runner", Summary: "report how close the pinned actions/runner is to being refused",
@@ -79,7 +73,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "fleet", Summary: "converge a fleet from this machine with the collection of this billet's release",
 			Run: cmdFleet},
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
-			Run: cmdGitHubApp},
+			Run: setup.GitHubApp},
 		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",
 			Run: fleetops.Teardown},
 		{Name: "decommission", Summary: "remove the ec2 instances and cache billet made outside Terraform",
@@ -373,9 +367,9 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	// for a probe, which is not the node a stop is asking.
 	stopDrainRequests := lc.HandleDrainRequests()
 	defer stopDrainRequests()
-	publishNodeDrainReport(hostOS)
+	publishNodeDrainReport(cli.HostOS)
 
-	return n.Run(ctx, nodeHost(env, lc, hostOS))
+	return n.Run(ctx, nodeHost(env, lc, cli.HostOS))
 }
 
 // nodeHost is what the node takes from this process and machine: the service
