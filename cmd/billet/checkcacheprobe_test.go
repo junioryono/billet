@@ -21,9 +21,9 @@ import (
 func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	fset := token.NewFileSet()
 
-	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	file, err := parser.ParseFile(fset, "preflight.go", nil, 0)
 	if err != nil {
-		t.Fatalf("parse main.go: %v", err)
+		t.Fatalf("parse preflight.go: %v", err)
 	}
 
 	var preflight *ast.FuncDecl
@@ -38,7 +38,7 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	// A WALK THAT FOUND NOTHING PASSES FOR THE WRONG REASON, which is the failure
 	// every structural test in this repository is arranged against.
 	if preflight == nil {
-		t.Fatal("ec2Preflight is gone from main.go; this guard is checking nothing")
+		t.Fatal("ec2Preflight is gone from preflight.go; this guard is checking nothing")
 	}
 
 	// THE CALL MUST BE THE SWITCH'S SUBJECT, not merely present. `_ =

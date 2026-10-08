@@ -51,3 +51,4 @@ e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase
 59b7c7997fe6 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
 6bab26a6c007 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
 990e182c6d23 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
+597beb0531fb The node cache service moved into internal/app with the node role (#418); the sentence names internal/app/nodecache.go.
