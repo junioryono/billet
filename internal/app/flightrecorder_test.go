@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/flightrecorder"
+	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
@@ -126,15 +128,14 @@ func TestAControllerRecordsAnOverrunAndALostClaim(t *testing.T) {
 	}
 }
 
-// A LOST CLAIM THE FENCE'S WATCHER MISSED IS RECORDED BY CLOSE: the watcher
-// can see the plane's context end first and record nothing, and Close asks the
-// ledger's latched fact once the loops are joined.
+// A LOST CLAIM THE FENCE'S WATCHER MISSED IS RECORDED AS THE RECORDER IS
+// SETTLED: the watcher can see the plane's context end first and record
+// nothing, and Close settles the recorder with the ledger's latched fact once
+// the loops are joined.
 //
 // NOT PARALLEL, for the reason the test above gives.
-func TestALostClaimTheWatcherMissedIsRecordedOnClose(t *testing.T) {
+func TestALostClaimTheWatcherMissedIsRecordedWhenSettled(t *testing.T) {
 	ctl, dir := becomeTestController(t, true)
-
-	ctl.claimLost = func() bool { return true }
 
 	ended, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -143,28 +144,69 @@ func TestALostClaimTheWatcherMissedIsRecordedOnClose(t *testing.T) {
 		t.Error("a watcher whose context ended stopped the process")
 	}, ctl.recorder, slog.New(slog.DiscardHandler))
 
+	settleRecorder(ctl.recorder, true)
 	ctl.Close()
+
+	requireOnlySnapshot(t, dir, flightrecorder.LeadershipLost)
+}
+
+// A REAL LOST CLAIM IS RECORDED BY CLOSE, through the ledger this controller
+// writes, when the fence's watcher is gone: the loops are joined first, which
+// ends the watcher with nothing to see; then a successor's claim is staged from
+// a second handle on the same ledger and the controller's next write is
+// refused. Only Close's settling can have written the snapshot.
+//
+// NOT PARALLEL, for the reason the test above gives.
+func TestALostClaimIsRecordedByCloseOnceTheWatcherIsGone(t *testing.T) {
+	ctl, dir := becomeTestController(t, true)
+
+	// Wait is idempotent, so Close's own Wait returns what this one did.
+	if errs := ctl.loops.Wait(); len(errs) != 0 {
+		t.Fatalf("the controller's loops: %v", errs)
+	}
+
+	successor, err := state.OpenAdmin(t.Context(), filepath.Dir(dir))
+	if err != nil {
+		t.Fatalf("open a second handle on the ledger: %v", err)
+	}
+
+	t.Cleanup(func() { _ = successor.Close() })
+
+	ledgertest.StageSuccessor(t, successor, "successor")
+
+	if _, err := ctl.ForgetFleet(t.Context()); !errors.Is(err, state.ErrLeadershipLost) {
+		t.Fatalf("the replaced controller's write returned %v, want ErrLeadershipLost", err)
+	}
+
+	ctl.Close()
+
+	requireOnlySnapshot(t, dir, flightrecorder.LeadershipLost)
+}
+
+// requireOnlySnapshot fails unless dir holds exactly one snapshot, for reason.
+func requireOnlySnapshot(t *testing.T, dir string, reason flightrecorder.Reason) {
+	t.Helper()
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), "-"+string(flightrecorder.LeadershipLost)+".trace") {
+	if len(entries) != 1 || !strings.HasSuffix(entries[0].Name(), "-"+string(reason)+".trace") {
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
 
-		t.Errorf("Close left %q, want one leadership-lost snapshot", names)
+		t.Errorf("the recorder left %q, want one %s snapshot", names, reason)
 	}
 }
 
 // THE RECORDER IS WIRED WHERE IT IS ASKED: Schedule hands the listeners this
 // controller's heartbeatOverrun, and BecomeController hands the fence this
-// controller's recorder and Close the ledger's LeadershipLost. A structural
-// test, because the tests above call both directly and neither would notice
-// the wire being cut; the control plane that would is one polling GitHub.
+// controller's recorder. A structural test, because the tests above call both
+// directly and neither would notice the wire being cut; the control plane that
+// would is one polling GitHub.
 func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 	t.Parallel()
 
@@ -175,7 +217,7 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var overrun, fence, lost, overwritten bool
+	var overrun, fence bool
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -184,24 +226,6 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		}
 
 		ast.Inspect(fn, func(n ast.Node) bool {
-			// THE CONTROLLER'S claimLost IS ITS OWN LEDGER'S LeadershipLost,
-			// which Close asks: set in the `ctl := &Controller{...}` that
-			// BecomeController returns, cp being its receiver, and never
-			// assigned again.
-			if assign, ok := n.(*ast.AssignStmt); ok && isMethod(fn, "ControlPlane", "BecomeController") &&
-				bindsItsControlPlane(fn) {
-				for i, lhs := range assign.Lhs {
-					if isSelector(lhs, "ctl", "claimLost") {
-						overwritten = true
-					}
-
-					if id, ok := lhs.(*ast.Ident); ok && id.Name == "ctl" && i < len(assign.Rhs) &&
-						setsClaimLost(assign.Rhs[i]) {
-						lost = true
-					}
-				}
-			}
-
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -226,47 +250,6 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 	if !fence {
 		t.Error("BecomeController does not hand stopWhenReplaced ctl.recorder: a lost claim would leave no trace")
 	}
-
-	if !lost || overwritten {
-		t.Error("BecomeController does not make ctl with claimLost: cp.db.LeadershipLost, or assigns it " +
-			"again: a lost claim the fence's watcher missed would leave no trace")
-	}
-}
-
-// setsClaimLost reports whether e is `&Controller{..., claimLost:
-// cp.db.LeadershipLost, ...}`.
-func setsClaimLost(e ast.Expr) bool {
-	addr, ok := e.(*ast.UnaryExpr)
-	if !ok || addr.Op != token.AND {
-		return false
-	}
-
-	lit, ok := addr.X.(*ast.CompositeLit)
-	if !ok {
-		return false
-	}
-
-	if typ, ok := lit.Type.(*ast.Ident); !ok || typ.Name != "Controller" {
-		return false
-	}
-
-	for _, elt := range lit.Elts {
-		kv, ok := elt.(*ast.KeyValueExpr)
-		if !ok {
-			continue
-		}
-
-		key, ok := kv.Key.(*ast.Ident)
-		if !ok || key.Name != "claimLost" {
-			continue
-		}
-
-		sel, ok := kv.Value.(*ast.SelectorExpr)
-
-		return ok && sel.Sel.Name == "LeadershipLost" && isTheControlPlanesLedger(sel.X)
-	}
-
-	return false
 }
 
 func isSelectorCall(call *ast.CallExpr, pkg, name string) bool {

@@ -227,7 +227,7 @@ func (cp *ControlPlane) BecomeController(ctx context.Context, stop func()) (*Con
 		return nil, err
 	}
 
-	ctl := &Controller{cp: cp, claim: claim, claimLost: cp.db.LeadershipLost}
+	ctl := &Controller{cp: cp, claim: claim}
 	ctl.self = ctl
 
 	// ONLY ONCE THE CLAIM IS HELD: a standby has no heartbeats to overrun and no
@@ -264,9 +264,6 @@ type Controller struct {
 	// recorder is the flight recorder, or nil when server.flight_recorder is
 	// off; a nil one records nothing.
 	recorder *flightrecorder.Recorder
-	// claimLost is the ledger's LeadershipLost, which Close asks once the loops
-	// are joined.
-	claimLost func() bool
 
 	// self is the address BecomeController made this Controller at. The proofs
 	// name their controller by address, so a copy, or a Controller overwritten
@@ -285,14 +282,19 @@ type Controller struct {
 // it to one snapshot when the watcher did record it.
 func (c *Controller) Close() []error {
 	errs := c.loops.Wait()
-
-	if c.claimLost != nil && c.claimLost() {
-		c.recorder.Snapshot(flightrecorder.LeadershipLost)
-	}
-
-	c.recorder.Stop()
+	settleRecorder(c.recorder, c.cp.db.LeadershipLost())
 
 	return errs
+}
+
+// settleRecorder records a lost claim, which the rate limit makes one snapshot
+// if the fence's watcher recorded it too, and then stops the recorder.
+func settleRecorder(recorder *flightrecorder.Recorder, claimLost bool) {
+	if claimLost {
+		recorder.Snapshot(flightrecorder.LeadershipLost)
+	}
+
+	recorder.Stop()
 }
 
 // heartbeatOverrun is what a listener tells when a heartbeat pass overruns.

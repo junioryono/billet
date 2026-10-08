@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -363,54 +364,106 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 	}
 }
 
-// AND A RUNTIME RECORDER THAT WILL NOT STOP holds Stop for the same bound and
-// no longer, with nothing being written.
-func TestStopDoesNotWaitForeverForTheRecorderToStop(t *testing.T) {
+// A RUNTIME RECORDER THAT WILL NOT STOP holds each Stop for its bound and no
+// longer, and however many Stops wait, the runtime's is entered once and every
+// Stop that has not timed out returns when it does. In a bubble, so "parked"
+// and "the bound passed" are established rather than slept for.
+func TestEveryStopWaitsOnTheOneShutdown(t *testing.T) {
 	t.Parallel()
 
-	w := &fakeWindow{stopGate: make(chan struct{})}
+	synctest.Test(t, func(t *testing.T) {
+		w := &fakeWindow{stopGate: make(chan struct{})}
 
-	r, _ := startFake(t, t.TempDir(), w)
-	r.stopWait = 50 * time.Millisecond
+		r, err := start(t.TempDir(), slog.New(slog.DiscardHandler), w, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	var opened atomic.Bool
+		r.stopWait = time.Minute
 
-	t.Cleanup(func() {
-		if opened.CompareAndSwap(false, true) {
-			close(w.stopGate)
+		var first, second atomic.Bool
+
+		go func() {
+			r.Stop()
+			first.Store(true)
+		}()
+
+		go func() {
+			r.Stop()
+			second.Store(true)
+		}()
+
+		synctest.Wait()
+
+		w.mu.Lock()
+		entered := w.stops
+		w.mu.Unlock()
+
+		if entered != 1 {
+			t.Errorf("two Stops entered the runtime's Stop %d times, want once", entered)
+		}
+
+		if first.Load() || second.Load() {
+			t.Error("a Stop returned while the runtime's Stop had not")
+		}
+
+		close(w.stopGate)
+		synctest.Wait()
+
+		if !first.Load() || !second.Load() {
+			t.Error("a Stop still waited once the runtime's Stop had returned")
+		}
+
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		if w.stops != 1 {
+			t.Errorf("the runtime's Stop was entered %d times, want once", w.stops)
 		}
 	})
+}
 
-	stopped := make(chan struct{})
+// AND EACH STOP'S BOUND HOLDS: with the runtime's Stop never returning, a Stop
+// returns once its bound has passed, not before.
+func TestStopReturnsAtItsBoundWhenTheRecorderWillNotStop(t *testing.T) {
+	t.Parallel()
 
-	go func() {
-		r.Stop()
-		close(stopped)
-	}()
+	synctest.Test(t, func(t *testing.T) {
+		w := &fakeWindow{stopGate: make(chan struct{})}
 
-	select {
-	case <-stopped:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop waited past its bound for a recorder that would not stop")
-	}
+		r, err := start(t.TempDir(), slog.New(slog.DiscardHandler), w, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	// A SECOND STOP STARTS NO SECOND STOP OF THE RUNTIME'S, which is not safe
-	// to run twice at once: once the recorder lets go, it was stopped once.
-	r.Stop()
+		r.stopWait = time.Minute
 
-	if opened.CompareAndSwap(false, true) {
+		var returned atomic.Bool
+
+		begun := time.Now()
+
+		go func() {
+			r.Stop()
+			returned.Store(true)
+		}()
+
+		time.Sleep(r.stopWait - time.Nanosecond)
+		synctest.Wait()
+
+		if returned.Load() {
+			t.Error("Stop returned before its bound")
+		}
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+
+		if !returned.Load() {
+			t.Errorf("Stop had not returned %v after it began, its bound", time.Since(begun))
+		}
+
+		// The bubble ends only when the shutdown worker has.
 		close(w.stopGate)
-	}
-
-	r.stopWait = 5 * time.Second
-	r.Stop()
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.stops != 1 {
-		t.Errorf("three Stops stopped the runtime's recorder %d times, want once", w.stops)
-	}
+	})
 }
 
 // A SNAPSHOT THAT CANNOT BE WRITTEN LEAVES NOTHING, not even a staging file.
