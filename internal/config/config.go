@@ -4096,6 +4096,12 @@ func socketOf(addr string) (string, int, bool) {
 
 // isWildcardHost reports whether a canonical listen host accepts on every
 // interface: an empty host, or an unspecified address however it was written.
+//
+// AN IPv6 WILDCARD COVERS IPv4 TOO, the one place this check goes past what it
+// can prove: Go listens on [::] dual-stack by default, so it takes the IPv4
+// addresses on its port, and a configuration that also named one would fail at
+// startup on the hosts billet runs on. A host that refuses dual-stack would bind
+// both, and is refused anyway.
 func isWildcardHost(host string) bool {
 	if host == "" {
 		return true

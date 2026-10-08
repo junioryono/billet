@@ -182,16 +182,37 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 	// THE ENDPOINT IS CLOSED ONCE, by whichever of the test and the cleanup
 	// gets there first: Close consumes the serving result, so a second call
 	// would wait forever.
+	started := false
+
+	// The close runs once, in its own goroutine, with the context the caller
+	// gave it, and every caller waits for it against a bound of the test's own,
+	// never that context: a close that never finished would otherwise hold the
+	// cleanup inside the Once forever.
 	var (
-		started  bool
 		stopOnce sync.Once
 		stopErr  error
 	)
 
-	stopEndpoint := func(ctx context.Context) error {
-		stopOnce.Do(func() { stopErr = srv.Close(ctx) })
+	stopDone := make(chan struct{})
 
-		return stopErr
+	stopEndpoint := func(ctx context.Context) error {
+		stopOnce.Do(func() {
+			go func() {
+				defer close(stopDone)
+
+				stopErr = srv.Close(ctx)
+			}()
+		})
+
+		wait := time.NewTimer(10 * time.Second)
+		defer wait.Stop()
+
+		select {
+		case <-stopDone:
+			return stopErr
+		case <-wait.C:
+			return errors.New("the endpoint's close never finished")
+		}
 	}
 
 	clientDone := make(chan struct{})

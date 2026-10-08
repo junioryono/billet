@@ -146,15 +146,35 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 	// THE ENDPOINT IS CLOSED ONCE, by whichever of Close and the cleanup gets
 	// there first: metrics.Server.Close consumes its serving result, so a
 	// second call would wait forever.
+	// The close runs once, in its own goroutine, with the context the caller
+	// gave it, and every caller waits for it against a bound of the test's own,
+	// never that context: a close that never finished would otherwise hold the
+	// cleanup inside the Once forever.
 	var (
 		stopOnce sync.Once
 		stopErr  error
 	)
 
-	stopEndpoint := func(ctx context.Context) error {
-		stopOnce.Do(func() { stopErr = srv.Close(ctx) })
+	stopDone := make(chan struct{})
 
-		return stopErr
+	stopEndpoint := func(ctx context.Context) error {
+		stopOnce.Do(func() {
+			go func() {
+				defer close(stopDone)
+
+				stopErr = srv.Close(ctx)
+			}()
+		})
+
+		wait := time.NewTimer(metricsTestWait)
+		defer wait.Stop()
+
+		select {
+		case <-stopDone:
+			return stopErr
+		case <-wait.C:
+			return errors.New("the endpoint's close never finished")
+		}
 	}
 
 	m := &Metrics{srv: srv, stop: stopEndpoint}
@@ -184,7 +204,7 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		answered <- resp.StatusCode
 	}()
 
-	var released, started bool
+	var released, started, closing bool
 
 	closed := make(chan struct{})
 
@@ -211,7 +231,13 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		joins := []struct {
 			what string
 			done <-chan struct{}
-		}{{"the client", clientDone}, {"Close", closed}}
+		}{{"the client", clientDone}}
+		if closing {
+			joins = append(joins, struct {
+				what string
+				done <-chan struct{}
+			}{"Close", closed})
+		}
 		if started {
 			joins = append(joins, struct {
 				what string
@@ -239,6 +265,8 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 
 	stopping, stop := context.WithCancel(t.Context())
 	stop()
+
+	closing = true
 
 	go func() {
 		defer close(closed)
