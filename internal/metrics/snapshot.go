@@ -85,6 +85,12 @@ type snapshotCollector struct {
 	current *snapshotFlight
 }
 
+// onJoin runs when a scrape waits for a read another scrape started. A TEST
+// HOOK, nil in production: a scrape joining a flight is otherwise not
+// observable, and a test that only hoped two scrapes overlapped would pass
+// whether or not they shared one read.
+var onJoin func()
+
 // snapshotFlight is one read and, once done is closed, what it returned.
 type snapshotFlight struct {
 	done chan struct{}
@@ -102,6 +108,10 @@ func (c *snapshotCollector) collect() (Snapshot, error) {
 	c.mu.Lock()
 
 	f := c.current
+	if f != nil && onJoin != nil {
+		onJoin()
+	}
+
 	if f == nil {
 		f = &snapshotFlight{done: make(chan struct{})}
 		c.current = f

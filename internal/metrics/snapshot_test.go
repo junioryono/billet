@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -96,33 +97,30 @@ func TestAFailedReadServesAGapNotZeros(t *testing.T) {
 }
 
 // getWithin is get with a deadline of the request's own, so a collector that
-// stopped bounding its reads fails the test rather than hangs it.
-func getWithin(t *testing.T, srv *Server, path string) (string, time.Duration) {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+// stopped bounding its reads fails the test rather than hangs it. It returns
+// its error rather than failing the test, so a caller on another goroutine can
+// hand the error back.
+func getWithin(ctx context.Context, srv *Server, path string) (string, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+srv.Addr().String()+path, http.NoBody)
 	if err != nil {
-		t.Fatal(err)
+		return "", 0, err
 	}
 
 	begun := time.Now()
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("the scrape did not answer within its own deadline: %v", err)
+		return "", time.Since(begun), fmt.Errorf("the scrape did not answer within its own deadline: %w", err)
 	}
 
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	return string(body), time.Since(begun)
+	return string(body), time.Since(begun), err
 }
 
 // THE COLLECTOR BOUNDS THE READ ITSELF. A read that ignores its deadline holds
@@ -162,7 +160,10 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	})
 
 	for scrape := range 2 {
-		body, took := getWithin(t, srv, "/metrics")
+		body, took, err := getWithin(t.Context(), srv, "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if took > 2*time.Second {
 			t.Errorf("scrape %d took %v against a 50ms bound", scrape, took)
@@ -193,7 +194,11 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	until := time.Now().Add(5 * time.Second)
 
 	for {
-		body, _ := getWithin(t, srv, "/metrics")
+		body, _, err := getWithin(t.Context(), srv, "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		if strings.Contains(body, `billet_scrape_up{source="ledger"} 1`) && strings.Contains(body, "billet_test_nodes 2") {
 			break
 		}
@@ -204,40 +209,94 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	}
 }
 
-// TWO SCRAPES AT ONCE BOTH GET AN ANSWER from a read that is slow but within
-// its bound: the second waits for the first's read rather than being turned
-// away.
-func TestConcurrentScrapesShareAHealthyRead(t *testing.T) {
-	t.Parallel()
+// TWO SCRAPES AT ONCE SHARE ONE READ. The read is held until the second
+// scrape has joined it, so the two provably overlap; then both are answered
+// from that one read, and no second read was started.
+//
+// NOT PARALLEL: onJoin is the package's.
+func TestConcurrentScrapesShareOneRead(t *testing.T) {
+	release, joined := make(chan struct{}), make(chan struct{}, 1)
 
 	var reads atomic.Int32
 
-	srv := serveSnapshot(t, 2*time.Second, func(context.Context) (Snapshot, error) {
+	onJoin = func() {
+		select {
+		case joined <- struct{}{}:
+		default:
+		}
+	}
+	t.Cleanup(func() { onJoin = nil })
+
+	srv := serveSnapshot(t, 10*time.Second, func(context.Context) (Snapshot, error) {
 		reads.Add(1)
-		time.Sleep(200 * time.Millisecond) // a slow read, which is the scenario
+		<-release
 
 		return Snapshot{"billet_test_nodes": {{Value: 3}}}, nil
 	})
 
-	bodies := make(chan string, 2)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+	})
 
-	for range 2 {
-		go func() {
-			body, _ := getWithin(t, srv, "/metrics")
-			bodies <- body
-		}()
+	type answer struct {
+		body string
+		err  error
 	}
 
-	for range 2 {
-		body := <-bodies
+	answers := make(chan answer, 2)
+	scrape := func() {
+		body, _, err := getWithin(t.Context(), srv, "/metrics")
+		answers <- answer{body, err}
+	}
 
-		if !strings.Contains(body, `billet_scrape_up{source="ledger"} 1`) || !strings.Contains(body, "billet_test_nodes 3") {
-			t.Errorf("a concurrent scrape was not answered:\n%s", body)
+	bound := time.NewTimer(5 * time.Second)
+	defer bound.Stop()
+
+	go scrape()
+
+	for reads.Load() == 0 {
+		select {
+		case a := <-answers:
+			t.Fatalf("the first scrape ended (%v) before its read began", a.err)
+		case <-bound.C:
+			t.Fatal("the first scrape never started its read")
+		case <-time.After(5 * time.Millisecond):
 		}
 	}
 
-	if n := reads.Load(); n < 1 || n > 2 {
-		t.Errorf("%d reads for two scrapes", n)
+	go scrape()
+
+	select {
+	case <-joined:
+	case a := <-answers:
+		t.Fatalf("a scrape ended (%v) before the second joined the read", a.err)
+	case <-bound.C:
+		t.Fatal("the second scrape never joined the first one's read")
+	}
+
+	released = true
+	close(release)
+
+	for range 2 {
+		select {
+		case a := <-answers:
+			if a.err != nil {
+				t.Fatal(a.err)
+			}
+
+			if !strings.Contains(a.body, `billet_scrape_up{source="ledger"} 1`) || !strings.Contains(a.body, "billet_test_nodes 3") {
+				t.Errorf("a scrape sharing the read was not answered from it:\n%s", a.body)
+			}
+		case <-bound.C:
+			t.Fatal("a scrape sharing the read never answered")
+		}
+	}
+
+	if n := reads.Load(); n != 1 {
+		t.Errorf("%d reads for two overlapping scrapes, want 1", n)
 	}
 }
 
@@ -255,7 +314,16 @@ func TestASampleThatDoesNotFitItsFamilyIsLeftOut(t *testing.T) {
 
 	_, body := get(t, srv, "/metrics")
 
-	if strings.Contains(body, " 9\n") || strings.Contains(body, "billet_test_unknown") {
+	// THE MISFIT'S OWN LINES, not the whole scrape: a runtime gauge can be 9.
+	misfit := strings.Contains(body, "billet_test_unknown")
+
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "billet_test_leases") && strings.HasSuffix(line, " 9") {
+			misfit = true
+		}
+	}
+
+	if misfit {
 		t.Errorf("a sample that does not fit its family was served:\n%s", body)
 	}
 
