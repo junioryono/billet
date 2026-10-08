@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/cli"
 )
 
@@ -201,7 +203,7 @@ func runAcceptance(ctx context.Context, env cli.Env, ws acceptanceWorkspace, opt
 func proveAcceptanceComputeClear(
 	ctx context.Context, env cli.Env, ws acceptanceWorkspace, wait time.Duration,
 ) (bool, error) {
-	db, cfg, err := openLedgerForAdmission(ctx, ws.ConfigPath)
+	db, cfg, err := fleetops.OpenLedgerForAdmission(ctx, ws.ConfigPath)
 	if err != nil {
 		return false, fmt.Errorf("open this run's ledger: %w", err)
 	}
@@ -213,12 +215,12 @@ func proveAcceptanceComputeClear(
 		return false, fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, env, db, current, "billet acceptance run")
+	sealed, err := fleetops.TakeTheSeal(ctx, env, db, current, "billet acceptance run")
 	if err != nil {
 		return false, fmt.Errorf("seal this run: %w", err)
 	}
 
-	if err := waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{timeout: wait}); err != nil {
+	if err := fleetops.WaitForQuiet(ctx, env, db, cfg, sealed.Generation, fleetops.WaitOptions{Timeout: wait}); err != nil {
 		return false, err
 	}
 

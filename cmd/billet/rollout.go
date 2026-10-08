@@ -7,6 +7,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -198,7 +200,7 @@ func cmdRolloutStart(ctx context.Context, env cli.Env, args []string) error {
 			FailureBudget:  *failureBudget,
 			AllowDowngrade: *allowDowngrade,
 		},
-		CreatedBy: actor(env),
+		CreatedBy: fleetops.Actor(env),
 		Nodes:     names,
 	})
 	if err != nil {
@@ -417,7 +419,7 @@ func cmdRolloutStatus(ctx context.Context, env cli.Env, args []string) error {
 // not part of this rollout.
 func forgetHost(ctx context.Context, env cli.Env, a *alloc.Allocator, node string, force bool) error {
 	proven, err := a.Decommission(ctx, alloc.DecommissionRequest{
-		Node: node, Actor: actor(env), Force: force,
+		Node: node, Actor: fleetops.Actor(env), Force: force,
 	})
 
 	switch {

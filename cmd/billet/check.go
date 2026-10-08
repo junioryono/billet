@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	opsimages "github.com/junioryono/billet/internal/ops/images"
 
 	"github.com/junioryono/billet/deploy"
@@ -537,7 +539,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		}
 
 		fmt.Fprintf(env.Stdout, "  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
-			tierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
+			fleetops.TierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
 
 		// THE SERVER REFUSES ON THIS AND CHECK USED TO PASS OVER IT.

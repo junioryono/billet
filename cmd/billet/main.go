@@ -17,6 +17,8 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	opsimages "github.com/junioryono/billet/internal/ops/images"
 
 	"github.com/junioryono/billet/internal/ops/cache"
@@ -55,13 +57,13 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "node", Summary: "run a compute host that dials a control plane",
 			Run: func(ctx context.Context, env cli.Env, args []string) error { return cmdNode(ctx, env, lc, args) }},
 		{Name: "nodes", Summary: "approve the machines asking to join this deployment",
-			Run: cmdNodes},
+			Run: fleetops.Nodes},
 		{Name: "ca", Summary: "issue the certificates nodes authenticate with",
-			Run: cmdCA},
+			Run: fleetops.CA},
 		{Name: "leases", Summary: "show capacity held for compute nobody has accounted for",
-			Run: cmdLeases},
+			Run: fleetops.Leases},
 		{Name: "jobs", Summary: "show which GitHub job a lease ran and what it did to the host",
-			Run: cmdJobs},
+			Run: fleetops.Jobs},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
 			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",
@@ -79,18 +81,18 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
 			Run: cmdGitHubApp},
 		{Name: "teardown", Summary: "delete the scale sets billet created on GitHub",
-			Run: cmdTeardown},
+			Run: fleetops.Teardown},
 		{Name: "decommission", Summary: "remove the ec2 instances and cache billet made outside Terraform",
-			Run: cmdDecommission},
+			Run: fleetops.Decommission},
 		{Name: "local", Summary: "run the billet services on this machine, and back up or restore what makes " +
 			"them this deployment",
 			Run: cmdLocal},
 		{Name: "drain", Summary: "stop admitting new work and let what is running finish",
-			Run: cmdDrain},
+			Run: fleetops.Drain},
 		{Name: "resume", Summary: "start admitting work again after a drain",
-			Run: cmdResume},
+			Run: fleetops.Resume},
 		{Name: "force-destroy", Summary: "DESTROY compute that is still running a job, failing those builds",
-			Run: cmdForceDestroy},
+			Run: fleetops.ForceDestroy},
 		{Name: "rollout", Summary: "move this whole deployment to one release, and watch it converge",
 			Run: cmdRollout},
 		{Name: "host-upgrade", Summary: "replace billet on THIS machine transactionally, with rollback",
@@ -275,7 +277,7 @@ func runServer(
 func serverHost(env cli.Env) app.Host {
 	return app.Host{
 		ServerAccess:  hostauthority.ServerWireAccess,
-		AuthorityLock: authorityLockAccess,
+		AuthorityLock: fleetops.AuthorityLockAccess,
 		Ready:         func() error { return notifyReady(env) },
 		Status:        func(text string) error { return notifyStatus(env, text) },
 		Out:           env.Stdout,
@@ -338,7 +340,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
 	// everything below reads.
 	if *enroll {
-		return enrollNode(ctx, env, cfg, bootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
+		return fleetops.EnrollNode(ctx, env, cfg, fleetops.BootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
 	}
 
 	upgrader, err := nodeUpgrader(cfg, *cfgPath)

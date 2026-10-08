@@ -1,6 +1,9 @@
 package cli
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // ShortDuration renders a duration the way an operator typed it, so a report
 // names the window it actually looked at.
@@ -19,4 +22,22 @@ func ShortDuration(d time.Duration) string {
 	}
 
 	return rounded.String()
+}
+
+// humanBytes renders a size the way an operator reads one.
+func HumanBytes(n int64) string {
+	const unit = 1024
+
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+
+	div, exp := int64(unit), 0
+
+	for size := n / unit; size >= unit; size /= unit {
+		div *= unit
+		exp++
+	}
+
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

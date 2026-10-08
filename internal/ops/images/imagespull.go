@@ -574,7 +574,7 @@ func stageImage(
 	// only thing that produces a usable root filesystem path -- and which checks
 	// the digest of the assembled file, not merely of the pieces.
 	for _, asset := range manifest.Downloads() {
-		fmt.Fprintf(env.Stdout, "downloading %s (%s)\n", asset.Name, HumanBytes(asset.Size))
+		fmt.Fprintf(env.Stdout, "downloading %s (%s)\n", asset.Name, cli.HumanBytes(asset.Size))
 
 		if _, err := client.Download(ctx, asset, dir); err != nil {
 			cleanup()
@@ -755,24 +755,6 @@ func hostArch() string {
 	default:
 		return runtime.GOARCH
 	}
-}
-
-// humanBytes renders a size the way an operator reads one.
-func HumanBytes(n int64) string {
-	const unit = 1024
-
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-
-	div, exp := int64(unit), 0
-
-	for size := n / unit; size >= unit; size /= unit {
-		div *= unit
-		exp++
-	}
-
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // installKernel copies the pulled kernel somewhere it will outlive the pull.

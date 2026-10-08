@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 // should delete a scale set: an operator restarting billet, or running it on a
 // second host, would find their tiers dismantled underneath them. Teardown is a
 // thing an operator asks for, once, on purpose.
-func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
+func Teardown(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet teardown", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
@@ -77,7 +77,7 @@ func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
 	// does; unscoped, the name matches the live set and the leftover stays.
 	candidates := cfg.Tiers
 	if *targetName != "" {
-		if candidates, err = tiersOnTarget(cfg, *targetName); err != nil {
+		if candidates, err = TiersOnTarget(cfg, *targetName); err != nil {
 			return err
 		}
 	}

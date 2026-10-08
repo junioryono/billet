@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -64,7 +66,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	a, db, closeDB, err := controlPlaneStores(ctx, *cfgPath)
+	a, db, closeDB, err := fleetops.ControlPlaneStores(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -82,7 +84,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// SECOND, AND FOR THE SAME REASON. A force-destroy is the one thing in billet
 	// that ends running work, so an operator who finds builds failing needs to see
 	// it before the capacity numbers that will look perfectly healthy underneath.
-	printForceDestroy(ctx, env, a, admission)
+	fleetops.PrintForceDestroy(ctx, env, a, admission)
 
 	// AND A ROLLOUT IN ONE LINE, because it explains the other half of what an
 	// operator is looking at: hosts on two versions, capacity down by one machine,
@@ -145,7 +147,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(env.Stdout, tierDisplay(t), report, time.Now())
+			printTierCapacity(env.Stdout, fleetops.TierDisplay(t), report, time.Now())
 		}
 	}
 
@@ -170,7 +172,7 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 
 	// A RUNNING LEASE WHOSE HOLDER WAS REPLACED IS NOT HELD, and is exactly the
 	// slot an operator finds taken with nothing below saying why.
-	printReplacedHolders(ctx, env, a)
+	fleetops.PrintReplacedHolders(ctx, env, a)
 
 	if len(held) == 0 {
 		fmt.Fprintln(env.Stdout, "held      none")
@@ -179,8 +181,8 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	fmt.Fprintf(env.Stdout, "held      %d lease(s) waiting for compute to be confirmed gone\n", len(held))
-	printHeld(env, held)
-	printHolderNote(env.Stdout, held)
+	fleetops.PrintHeld(env, held)
+	fleetops.PrintHolderNote(env.Stdout, held)
 
 	return nil
 }

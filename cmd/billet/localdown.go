@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/app"
 
 	"github.com/junioryono/billet/deploy"
@@ -292,7 +294,7 @@ func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.
 			Expect:       current.Generation,
 			Provenance:   state.ProvenanceLocalDown,
 			Reason:       reason,
-			Actor:        actor(env),
+			Actor:        fleetops.Actor(env),
 			KeepExisting: true,
 		})
 		if err != nil {
@@ -324,9 +326,9 @@ func sealForShutdown(ctx context.Context, env cli.Env, c converger, cfg *config.
 		withoutProof = true
 	}
 
-	if err := waitForQuiet(ctx, env, db, cfg, current.Generation, waitOptions{
-		timeout:      o.timeout,
-		withoutProof: withoutProof,
+	if err := fleetops.WaitForQuiet(ctx, env, db, cfg, current.Generation, fleetops.WaitOptions{
+		Timeout:      o.timeout,
+		WithoutProof: withoutProof,
 	}); err != nil {
 		return 0, false, err
 	}

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/app"
 
 	"gopkg.in/yaml.v3"
@@ -353,7 +355,7 @@ func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	onPersonal, err := tiersOnTarget(cfg, "personal")
+	onPersonal, err := fleetops.TiersOnTarget(cfg, "personal")
 	if err != nil {
 		t.Fatalf("tiersOnTarget: %v", err)
 	}
@@ -362,14 +364,14 @@ func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
 		t.Fatalf("tiers on personal = %v, want only personal-4vcpu", onPersonal)
 	}
 
-	err = cmdTeardown(t.Context(), processEnv(), []string{
+	err = fleetops.Teardown(t.Context(), processEnv(), []string{
 		"--config", cfgPath, "--tier", "billet-4vcpu", "--target", "personal", "--yes",
 	})
 	if err == nil || !strings.Contains(err.Error(), "is not a tier in the config") {
 		t.Fatalf("a name only default declares, scoped to personal: %v", err)
 	}
 
-	err = cmdTeardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--target", "personal", "--yes"})
+	err = fleetops.Teardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--target", "personal", "--yes"})
 	if err == nil || !strings.Contains(err.Error(), "--all walks every target") {
 		t.Fatalf("--all with --target: %v", err)
 	}

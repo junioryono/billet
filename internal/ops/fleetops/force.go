@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -35,7 +35,7 @@ var errForceRefused = &cli.ExitError{
 // documents is for a job never acquired in time — so each of these is a build
 // that fails and stays failed. Naming the run ids is what lets an operator
 // recognise whose work they are about to end; "7 leases" tells them nothing.
-func cmdForceDestroy(ctx context.Context, env cli.Env, args []string) error {
+func ForceDestroy(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet force-destroy", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "",
@@ -49,7 +49,7 @@ func cmdForceDestroy(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	db, cfg, err := openLedgerForAdmission(ctx, *cfgPath)
+	db, cfg, err := OpenLedgerForAdmission(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
@@ -152,7 +152,7 @@ func cmdForceDestroy(ctx context.Context, env cli.Env, args []string) error {
 	recorded, err := allocator.RequestForceDestroy(ctx, state.ForceDestroyRequest{
 		ExpectAdmission: admission.Generation,
 		Reason:          *reason,
-		Actor:           actor(env),
+		Actor:           Actor(env),
 		Targets:         targets,
 	})
 	if err != nil {
@@ -224,7 +224,7 @@ func reportHeldElsewhere(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 	fmt.Fprintf(env.Stdout, "\n%d lease(s) are held by a node rather than by a listener, and this\n",
 		len(held))
 	fmt.Fprintf(env.Stdout, "command does not touch them:\n\n")
-	printHeld(env, held)
+	PrintHeld(env, held)
 	fmt.Fprintf(env.Stdout, "\nEach is a proof obligation its holder is still working on. When you know\n")
 	fmt.Fprintf(env.Stdout, "that compute is gone:\n\n  billet leases release <lease> --force\n")
 
@@ -239,7 +239,7 @@ func reportHeldElsewhere(ctx context.Context, env cli.Env, a *alloc.Allocator) e
 // finished, and an operator arriving afterwards has no other way to learn it
 // happened — the listener logs scroll away, and every other line in that report
 // reads perfectly normally.
-func printForceDestroy(ctx context.Context, env cli.Env, a *alloc.Allocator, admission state.Admission) {
+func PrintForceDestroy(ctx context.Context, env cli.Env, a *alloc.Allocator, admission state.Admission) {
 	last, found, err := a.LatestForceDestroy(ctx)
 	if err != nil {
 		fmt.Fprintf(env.Stdout, "force     unavailable: %v\n", err)

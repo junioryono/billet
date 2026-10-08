@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // authorityLockAccess is the identity access the authority lock takes, in the
 // shape app.WithAuthorityLock wants: the whole exclusion, non-blocking, creating
 // nothing, as an operator command wants.
-func authorityLockAccess(ctx context.Context, dir string) (func() error, error) {
+func AuthorityLockAccess(ctx context.Context, dir string) (func() error, error) {
 	acc, err := hostauthority.Open(ctx, dir, hostauthority.Intent{})
 	if err != nil {
 		return nil, err
@@ -44,7 +44,7 @@ func publishRotatedAuthority(ctx context.Context, env cli.Env, cfg *config.Confi
 
 	log := slog.Default()
 
-	err := app.WithAuthorityLock(ctx, cfg, authorityLockAccess, log, func(dir string) error {
+	err := app.WithAuthorityLock(ctx, cfg, AuthorityLockAccess, log, func(dir string) error {
 		return wireshare.Publish(ctx, store, dir, deployment)
 	})
 	if err == nil {

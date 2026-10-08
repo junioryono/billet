@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/app"
 
 	"github.com/junioryono/billet/deploy"
@@ -456,7 +458,7 @@ func clearShutdownSeal(ctx context.Context, env cli.Env, cfg *config.Config, req
 	resumed, err := db.Resume(ctx, state.ResumeRequest{
 		Expect: current.Generation,
 		Clears: state.ProvenanceLocalDown,
-		Actor:  actor(env),
+		Actor:  fleetops.Actor(env),
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrAdmissionProvenance) {

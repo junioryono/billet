@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/state"
@@ -427,7 +429,7 @@ func TestCheckResolvesASpotNodesCertificateIdentity(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), processEnv(), []string{
+	if err := fleetops.CAIssue(t.Context(), processEnv(), []string{
 		"aws-1", "--config", serverCfg, "--out", bundleDir,
 	}); err != nil {
 		t.Fatalf("ca issue: %v", err)
@@ -1086,7 +1088,7 @@ func TestPreflightAuthorizeUsesCertificateIdentity(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), processEnv(), []string{
+	if err := fleetops.CAIssue(t.Context(), processEnv(), []string{
 		"aws-1", "--config", serverCfg, "--out", bundleDir,
 	}); err != nil {
 		t.Fatalf("ca issue: %v", err)

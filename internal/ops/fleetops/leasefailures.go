@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -43,7 +43,7 @@ func cmdLeasesFailures(ctx context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("--limit must be positive, got %d", *limit)
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}

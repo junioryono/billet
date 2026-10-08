@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/fleetops"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -17,7 +19,7 @@ func registerWireNodes(t *testing.T, regs ...alloc.NodeRegistration) string {
 	stateDir := t.TempDir()
 	cfg := writeCAConfig(t, stateDir)
 
-	a, closeDB, err := controlPlaneAllocator(t.Context(), cfg)
+	a, closeDB, err := fleetops.ControlPlaneAllocator(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
 	}

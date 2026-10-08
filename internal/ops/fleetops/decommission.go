@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -23,7 +23,7 @@ import (
 // only reports what it found. Live compute blocks the cache purge: a running
 // instance may still be serving a job, so the cache it depends on must not be
 // pulled out from under it.
-func cmdDecommission(ctx context.Context, env cli.Env, args []string) error {
+func Decommission(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet decommission", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")

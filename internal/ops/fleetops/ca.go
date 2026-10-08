@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
@@ -26,7 +27,7 @@ import (
 // is and where it stays. The bundle it writes is copied to the node — the key
 // travels once, by an operator, rather than over a wire that does not yet trust
 // anybody.
-func cmdCA(ctx context.Context, env cli.Env, args []string) error {
+func CA(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca token | " +
 			"billet ca rotate | billet ca retire | billet ca revoke <node> | " +
@@ -35,13 +36,13 @@ func cmdCA(ctx context.Context, env cli.Env, args []string) error {
 
 	switch args[0] {
 	case "issue":
-		return cmdCAIssue(ctx, env, args[1:])
+		return CAIssue(ctx, env, args[1:])
 	case "revoke":
-		return cmdCARevoke(ctx, env, args[1:])
+		return CARevoke(ctx, env, args[1:])
 	case "revocations":
-		return cmdCARevocations(ctx, env, args[1:])
+		return CARevocations(ctx, env, args[1:])
 	case "token":
-		return cmdCAToken(ctx, env, args[1:])
+		return CAToken(ctx, env, args[1:])
 	case "rotate":
 		return cmdCARotate(ctx, env, args[1:])
 	case "retire":
@@ -66,7 +67,7 @@ func cmdCA(ctx context.Context, env cli.Env, args []string) error {
 //
 // WRITES TO THE LEDGER, so it takes effect on the next request the revoked host
 // makes rather than at the next restart of anything.
-func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
+func CARevoke(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revoke", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
@@ -98,7 +99,7 @@ func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 
 	// Revoking matters most while the control plane is UP, so it must not need
 	// the directory lock that plane is holding. See state.OpenAdmin.
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -127,7 +128,7 @@ func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 }
 
 // cmdCARevocations lists what has been withdrawn.
-func cmdCARevocations(ctx context.Context, env cli.Env, args []string) error {
+func CARevocations(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revocations", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 
@@ -144,7 +145,7 @@ func cmdCARevocations(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("the revocation list lives on the control plane, and this config has no server section")
 	}
 
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -205,7 +206,7 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
+func CAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 	fs := cli.NewFlagSet("billet ca issue", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
@@ -391,7 +392,7 @@ func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle
 		return fmt.Errorf("read back the certificate just issued to %s: %w", name, err)
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, cfgPath)
+	a, closeDB, err := ControlPlaneAllocator(ctx, cfgPath)
 	if err != nil {
 		return err
 	}

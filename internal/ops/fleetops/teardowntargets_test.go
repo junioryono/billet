@@ -1,4 +1,4 @@
-package main
+package fleetops
 
 import (
 	"net/http"
@@ -78,7 +78,7 @@ targets:
 	var err error
 
 	out := capture(t, func() {
-		err = cmdTeardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--yes"})
+		err = Teardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--yes"})
 	})
 	if err != nil {
 		t.Fatalf("teardown --all: %v\n%s", err, out)
