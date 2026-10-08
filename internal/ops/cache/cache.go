@@ -1,4 +1,7 @@
-package main
+// Package cache is `billet cache`: the central kill switch for the transparent
+// caches, the report of what they did, the orphan report, the conformance gate a
+// site installs, and the credential and GOCACHEPROG helpers a guest runs.
+package cache
 
 import (
 	"context"
@@ -6,12 +9,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
 
-func cmdCache(ctx context.Context, env cli.Env, args []string) error {
+// Run is `billet cache`: the kill switch, its status, the orphan report, the
+// conformance gate, and the helpers a guest runs.
+func Run(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "conformance" {
 		return cmdCacheConformance(ctx, env, args[1:])
 	}
@@ -67,7 +73,7 @@ func cmdCache(ctx context.Context, env cli.Env, args []string) error {
 	if cfg.Server == nil {
 		return fmt.Errorf("%s has no server section, so it names no central cache policy", *cfgPath)
 	}
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return err
 	}

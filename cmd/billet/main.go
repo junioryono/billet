@@ -25,6 +25,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/cache"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
@@ -79,7 +81,7 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "jobs", Summary: "show which GitHub job a lease ran and what it did to the host",
 			Run: cmdJobs},
 		{Name: "cache", Summary: "manage transparent Actions caching and install its conformance gate",
-			Run: cmdCache},
+			Run: cache.Run},
 		{Name: "check", Summary: "validate the config and state directory, then exit",
 			Run: cmdCheck},
 		{Name: "init", Summary: "generate a billet.yaml interactively",
@@ -1636,8 +1638,8 @@ func ec2Preflight(
 			// THE VERDICT IS judgeCacheProbe's, not this switch's. What each
 			// answer means is in cacheprobe.go, where a test can reach it.
 			probeErr := store.CheckAccess(ctx)
-			switch judgeCacheProbe(probeErr) {
-			case cacheProbeAnswered:
+			switch cache.JudgeProbe(probeErr) {
+			case cache.ProbeAnswered:
 				// A BUCKET THAT ANSWERS IS NOT A CACHE. Without a node.cache
 				// listener nothing on this host ever reads or writes that prefix,
 				// and this line read as though the cache were working — which is
@@ -1651,12 +1653,12 @@ func ec2Preflight(
 
 				fmt.Fprintf(env.Stdout, "cache    bucket %s answers under this deployment's prefix%s\n",
 					cfg.Node.EBSS3.Bucket, reachable)
-			case cacheProbeInconclusive:
+			case cache.ProbeInconclusive:
 				fmt.Fprintf(env.Stdout, "cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
 				fmt.Fprintf(env.Stdout, "         (a 403 here is EITHER a refused identity OR a healthy miss "+
 					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot "+
 					"match a GetObject; a real job read will settle it)\n")
-			case cacheProbeFailed:
+			case cache.ProbeFailed:
 				return fmt.Errorf("node.ebs_s3: %w", probeErr)
 			}
 		}

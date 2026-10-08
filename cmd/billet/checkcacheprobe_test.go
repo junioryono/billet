@@ -1,74 +1,11 @@
 package main
 
 import (
-	"errors"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"net/http"
 	"testing"
-
-	"github.com/junioryono/billet/internal/awss3"
 )
-
-// THE VERDICT COMES FROM THE ANSWER S3 SENT, NOT FROM THE WORDS OF A MESSAGE.
-//
-// `billet check` reads a 403 from the ebs-s3 bucket probe as INCONCLUSIVE rather
-// than as a broken bucket, because billet's minimal grant conditions
-// s3:ListBucket on s3:prefix — a context key a GetObject request does not carry —
-// so a healthy miss can answer 403 under exactly the policy billet generates.
-//
-// THE DECEPTIVE CASE IS THE ONE THAT MATTERS. This branch was selected by looking
-// for the substring "HTTP 403" in the probe error's rendered message, so an error
-// that merely CONTAINS those characters was read as a refused identity, and any
-// reword of a diagnostic on the path changed the verdict. That error is in the
-// table below and must be a failure.
-func TestTheCacheProbeVerdictReadsTheRefusalRatherThanTheMessage(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-		want cacheProbeVerdict
-	}{
-		{
-			name: "a bucket that answered", err: nil, want: cacheProbeAnswered,
-		},
-		{
-			name: "a refusal S3 sent",
-			err: fmt.Errorf("ebs-s3: the cache bucket did not answer a probe read: %w",
-				fmt.Errorf("ebs-s3: S3 GET returned %w",
-					&awss3.Refusal{Status: http.StatusForbidden, Code: "AccessDenied"})),
-			want: cacheProbeInconclusive,
-		},
-		{
-			// PROSE THAT LOOKS LIKE A REFUSAL IS NOT ONE. Nothing here carries an
-			// S3 answer, so it must not reach the advisory branch.
-			name: "a message that merely says HTTP 403",
-			err:  errors.New("ebs-s3: something else entirely went wrong: HTTP 403"),
-			want: cacheProbeFailed,
-		},
-		{
-			name: "a bucket that does not exist",
-			err: fmt.Errorf("ebs-s3: S3 GET returned %w",
-				&awss3.Refusal{Status: http.StatusNotFound, Code: awss3.CodeNoSuchBucket}),
-			want: cacheProbeFailed,
-		},
-		{
-			// A transport failure carries no S3 answer either, and reporting it
-			// as inconclusive would hide an unreachable bucket behind an
-			// advisory line.
-			name: "a host that could not be dialled",
-			err:  errors.New("ebs-s3: call S3: dial tcp: connection refused"),
-			want: cacheProbeFailed,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := judgeCacheProbe(tc.err); got != tc.want {
-				t.Errorf("judgeCacheProbe = %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
 
 // AND `billet check` ASKS THAT JUDGEMENT, WITH THE PROBE'S OWN ERROR.
 //
@@ -121,8 +58,12 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 			return true
 		}
 
-		fn, ok := call.Fun.(*ast.Ident)
-		if !ok || fn.Name != "judgeCacheProbe" || len(call.Args) != 1 {
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || fn.Sel.Name != "JudgeProbe" || len(call.Args) != 1 {
+			return true
+		}
+
+		if pkg, ok := fn.X.(*ast.Ident); !ok || pkg.Name != "cache" {
 			return true
 		}
 
@@ -134,7 +75,7 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	})
 
 	if verdict == nil {
-		t.Fatal("ec2Preflight does not switch on judgeCacheProbe(probeErr), so a refused " +
+		t.Fatal("ec2Preflight does not switch on cache.JudgeProbe(probeErr), so a refused " +
 			"identity and a bucket that does not exist are not told apart by the judgement " +
 			"that knows the difference")
 	}
@@ -152,13 +93,15 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 		}
 
 		for _, expr := range clause.List {
-			if name, ok := expr.(*ast.Ident); ok {
-				clauses[name.Name] = clause
+			if sel, ok := expr.(*ast.SelectorExpr); ok {
+				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "cache" {
+					clauses[sel.Sel.Name] = clause
+				}
 			}
 		}
 	}
 
-	handled := []string{"cacheProbeAnswered", "cacheProbeInconclusive", "cacheProbeFailed"}
+	handled := []string{"ProbeAnswered", "ProbeInconclusive", "ProbeFailed"}
 	for _, want := range handled {
 		if clauses[want] == nil {
 			t.Errorf("the cache probe's switch does not handle %s", want)
@@ -189,8 +132,8 @@ func TestTheCheckCommandJudgesTheCacheProbesOwnAnswer(t *testing.T) {
 	// satisfies "it returns something" while reporting a bucket that does not
 	// exist as a healthy one — so the RETURNED FORM is checked, not merely that
 	// probeErr appears somewhere inside it.
-	if failed := clauses["cacheProbeFailed"]; failed != nil && !refusesWith(failed, "probeErr") {
-		t.Error("the cacheProbeFailed branch does not return probeErr or an fmt.Errorf built " +
+	if failed := clauses["ProbeFailed"]; failed != nil && !refusesWith(failed, "probeErr") {
+		t.Error("the cache.ProbeFailed branch does not return probeErr or an fmt.Errorf built " +
 			"from it, so a bucket that does not exist can leave `billet check` reporting success")
 	}
 

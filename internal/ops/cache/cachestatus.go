@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -39,7 +40,7 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 
 		return nil
 	}
-	db, err := openStateAdmin(ctx, cfg)
+	db, err := app.OpenLedger(ctx, cfg, app.LedgerOperator)
 	if err != nil {
 		return err
 	}
@@ -53,7 +54,7 @@ func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	a, _, closeDB, err := app.OpenOperator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}

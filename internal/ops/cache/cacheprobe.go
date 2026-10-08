@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"net/http"
@@ -6,19 +6,19 @@ import (
 	"github.com/junioryono/billet/internal/awss3"
 )
 
-// cacheProbeVerdict is what `billet check` should say about the ebs-s3 bucket
+// ProbeVerdict is what `billet check` should say about the ebs-s3 bucket
 // probe, and it is three-valued because the probe's answer is.
-type cacheProbeVerdict int
+type ProbeVerdict int
 
 const (
 	// cacheProbeFailed is the zero value on purpose: an answer nothing has
 	// classified is a fault, never a pass and never an advisory line.
-	cacheProbeFailed cacheProbeVerdict = iota
+	ProbeFailed ProbeVerdict = iota
 	// cacheProbeAnswered is the bucket reading back under this deployment's own
 	// prefix.
-	cacheProbeAnswered
+	ProbeAnswered
 	// cacheProbeInconclusive is a refusal that says nothing about the bucket.
-	cacheProbeInconclusive
+	ProbeInconclusive
 )
 
 // judgeCacheProbe classifies what the cache bucket answered.
@@ -38,13 +38,13 @@ const (
 // A FUNCTION RATHER THAN A SWITCH IN main.go, because nothing carrying real
 // semantics may live in that file: it is the one file coverage ignores, and a
 // verdict there is a verdict no test can reach.
-func judgeCacheProbe(err error) cacheProbeVerdict {
+func JudgeProbe(err error) ProbeVerdict {
 	switch {
 	case err == nil:
-		return cacheProbeAnswered
+		return ProbeAnswered
 	case awss3.StatusOf(err) == http.StatusForbidden:
-		return cacheProbeInconclusive
+		return ProbeInconclusive
 	default:
-		return cacheProbeFailed
+		return ProbeFailed
 	}
 }

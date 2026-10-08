@@ -1,4 +1,4 @@
-package main
+package cache
 
 import (
 	"bytes"
@@ -387,7 +387,7 @@ func TestCacheConformanceDefaultRefUsesOnlyAnImmutableBuildIdentity(t *testing.T
 
 func readCanonicalCacheConformance(t *testing.T) []byte {
 	t.Helper()
-	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cache-conformance.yml"))
+	body, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "cache-conformance.yml"))
 	if err != nil {
 		t.Fatalf("read canonical cache conformance workflow: %v", err)
 	}
