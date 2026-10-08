@@ -24,6 +24,22 @@ The endpoint serves `/metrics` in the Prometheus text format. It binds when the 
 | `go_*` | the Go runtime: goroutines, heap, garbage collection |
 | `process_*` | the process: CPU seconds, resident memory, open file descriptors (Linux) |
 
+The control plane also reads its ledger at every scrape, through the same reports `billet status` prints. No lease or job id is ever a label.
+
+| Metric | What it is |
+|---|---|
+| `billet_tier_leases{tier,state}` | open leases by what they are doing: `discovery` and `pending` (capacity bought, no runner yet), `launching`, `idle` and `running` runners, `cleanup`, or `unknown` (a capacity lease the listener's report does not classify) |
+| `billet_tier_floor{tier}` | the tier's configured floor |
+| `billet_tier_headroom{tier}` | how many more of the tier's runners the allocator would grant right now |
+| `billet_tier_advertised{tier}` | the capacity the tier's listener last told GitHub, from its last completed exchange; absent until it has completed one |
+| `billet_tier_waiting{tier}` | how much of GitHub's assigned work the tier could not buy capacity for |
+| `billet_tier_waiting_seconds{tier}` | how long the tier has been waiting, while it is |
+| `billet_tier_report_age_seconds{tier}` | how old the listener's last published report is; a listener that has stopped leaves a report that only ages |
+| `billet_nodes{state}` | registered hosts: `live`, `offline` or `decommissioned` |
+| `billet_scrape_up{source}` | 1 when the ledger was read for this scrape; 0 when it could not be, in which case the gauges above are left out rather than reported as zero |
+
+A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
+
 ## Reaching it from another host
 
 The endpoint has no authentication, and what it reports is the deployment's own business. So `listen` must be a literal loopback address, `127.0.0.1` or `[::1]`, unless `allow_remote: true` is set beside it. A name such as `localhost` is not accepted on its own, because the bind would resolve it again and a resolver could map it to another interface:

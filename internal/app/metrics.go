@@ -23,12 +23,12 @@ type Metrics struct {
 }
 
 // ServeMetrics starts role's metrics endpoint when the configuration has one,
-// and returns nil, with nothing bound, when it has none: there is no default
-// address. The bind happens before it returns, so a port already taken stops
+// serving sources beside the runtime's, and returns nil, with nothing bound,
+// when it has none: there is no default address. The bind happens before it returns, so a port already taken stops
 // the process at startup.
 //
 // NOT FOR AN UPGRADE PROBE: the service the probe stands beside holds the port.
-func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig) (*Metrics, error) {
+func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig, sources ...MetricsSource) (*Metrics, error) {
 	if m == nil {
 		return nil, nil //nolint:nilnil // no block, no endpoint: the nil *Metrics closes to nothing
 	}
@@ -36,6 +36,12 @@ func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig) (*M
 	reg, err := metrics.New(role)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, s := range sources {
+		if err := reg.RegisterSnapshot(ctx, s.name, s.families, ledgerScrapeTimeout, s.read); err != nil {
+			return nil, err
+		}
 	}
 
 	srv, err := metrics.Listen(ctx, m.Listen, reg.Handler(m.Pprof))

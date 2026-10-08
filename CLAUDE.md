@@ -97,6 +97,7 @@ A task skill is a checklist for one kind of change; it links to the area skills 
 | `billet-add-migration` | adding a ledger migration or a query |
 | `billet-add-wire-change` | adding a route, a command kind or a wire field, or bumping `nodeapi.Version` |
 | `billet-add-provider` | adding a compute backend under `internal/provider` |
+| `billet-add-metric` | adding a Prometheus metric: a gauge read at scrape time, or an event counted where it happens |
 
 `.claude/agents/` holds read-only reviewers for the three questions a diff most often gets wrong: `billet-layering-reviewer` (imports across layers), `billet-test-vacuity-reviewer` (tests that cannot fail) and `billet-wire-compat-reviewer` (the node wire across versions). They are a second reader for a change, not a substitute for the Codex review.
 
