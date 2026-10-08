@@ -28,15 +28,15 @@ The control plane also reads its ledger at every scrape, through the same report
 
 | Metric | What it is |
 |---|---|
-| `billet_tier_leases{tier,state}` | open leases by what they are doing: `discovery` and `pending` (capacity bought, no runner yet), `launching`, `idle` and `running` runners, `cleanup`, or `unknown` (a capacity lease the listener's report does not classify) |
+| `billet_tier_leases{tier,state}` | open leases by what they are doing: `discovery` and `pending` (capacity bought, no runner yet), `launching`, `idle` and `running` runners, `cleanup`, or `unknown` (a lease whose state could not be established: capacity the listener's report does not classify, or a runner whose record names another tier or a status billet does not know) |
 | `billet_tier_floor{tier}` | the tier's configured floor |
 | `billet_tier_headroom{tier}` | how many more of the tier's runners the allocator would grant right now |
 | `billet_tier_advertised{tier}` | the capacity the tier's listener last told GitHub, from its last completed exchange; absent until it has completed one |
-| `billet_tier_waiting{tier}` | how much of GitHub's assigned work the tier could not buy capacity for |
+| `billet_tier_waiting{tier}` | how much of GitHub's assigned work the tier could not buy capacity for, as its listener last reported; absent until the listener has published a report |
 | `billet_tier_waiting_seconds{tier}` | how long the tier has been waiting, while it is |
-| `billet_tier_report_age_seconds{tier}` | how old the listener's last published report is; a listener that has stopped leaves a report that only ages |
+| `billet_tier_report_age_seconds{tier}` | how old the listener's last published report is; a listener that has stopped leaves a report that only ages. A report from a clock ahead of this one is age zero |
 | `billet_nodes{state}` | registered hosts: `live`, `offline` or `decommissioned` |
-| `billet_scrape_up{source}` | 1 when the ledger was read for this scrape; 0 when it could not be, in which case the gauges above are left out rather than reported as zero |
+| `billet_scrape_up{source}` | 1 when the ledger was read for this scrape; 0 when it could not be, in which case the gauges above are left out rather than reported as zero. A read is bounded at five seconds, and while one that overran is still running no other starts; a listener report that cannot be decoded fails the read too |
 | `billet_ledger_write_wait_seconds` | how long each write waited for the ledger's single writer slot (a histogram); a rising tail is scheduling queueing behind other writers |
 | `billet_ledger_write_held_seconds{outcome}` | how long each write held the slot, `committed` or `rolled_back` (a histogram) |
 | `billet_ledger_write_busy_retries_total` | each time a write found the slot taken and tried again |

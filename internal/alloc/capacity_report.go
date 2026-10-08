@@ -71,62 +71,106 @@ type TierCapacity struct {
 
 // CapacityReport reads ownership and charged phases in one ledger snapshot.
 func (a *Allocator) CapacityReport(ctx context.Context, tier string) (TierCapacity, error) {
-	t, ok := a.tiers[tier]
-	if !ok {
+	if _, ok := a.tiers[tier]; !ok {
 		return TierCapacity{}, fmt.Errorf("%w: %s", ErrUnknownTier, tier)
 	}
-	out := TierCapacity{Floor: t.Reserved}
+
+	reports, err := a.capacityReports(ctx, []string{tier})
+
+	return reports[tier], err
+}
+
+// CapacityReports is CapacityReport for every tier in the catalogue, from one
+// ledger snapshot that reads the outstanding leases once rather than once per
+// tier: what a scrape asks for, at a cost that grows with the fleet and not
+// with the fleet times the tiers.
+func (a *Allocator) CapacityReports(ctx context.Context) (map[string]TierCapacity, error) {
+	labels := make([]string, 0, len(a.tiers))
+	for label := range a.tiers {
+		labels = append(labels, label)
+	}
+
+	slices.Sort(labels)
+
+	return a.capacityReports(ctx, labels)
+}
+
+func (a *Allocator) capacityReports(ctx context.Context, labels []string) (map[string]TierCapacity, error) {
+	out := make(map[string]*TierCapacity, len(labels))
+	for _, label := range labels {
+		out[label] = &TierCapacity{Floor: a.tiers[label].Reserved}
+	}
+
 	err := a.db.View(ctx, func(tx querier) error {
-		row, err := state.ReadQueries(tx).ReadListenerCapacity(ctx, tier)
-		// A FAILED READ IS NOT AN ABSENT OBSERVATION. A malformed snapshot can
-		// leave ownership unknown, but a failed transaction cannot report phases.
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("alloc: read listener capacity: %w", err)
-		}
-		if err == nil {
-			if err := json.Unmarshal([]byte(row.Snapshot), &out.Listener); err != nil {
-				out.ObservationError = err.Error()
-				out.Listener = ListenerCapacity{}
-			} else {
-				out.ObservedAt = row.ObservedAt
+		for _, label := range labels {
+			report := out[label]
+
+			row, err := state.ReadQueries(tx).ReadListenerCapacity(ctx, label)
+			// A FAILED READ IS NOT AN ABSENT OBSERVATION. A malformed snapshot can
+			// leave ownership unknown, but a failed transaction cannot report phases.
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("alloc: read listener capacity: %w", err)
+			}
+			if err == nil {
+				if err := json.Unmarshal([]byte(row.Snapshot), &report.Listener); err != nil {
+					report.ObservationError = err.Error()
+					report.Listener = ListenerCapacity{}
+				} else {
+					report.ObservedAt = row.ObservedAt
+				}
 			}
 		}
+
 		rows, err := state.ReadQueries(tx).ListOutstandingLeases(ctx)
 		if err != nil {
 			return err
 		}
 		for _, lease := range rows {
-			if lease.Tier != tier {
+			report, ok := out[lease.Tier]
+			if !ok {
 				continue
 			}
 			switch Phase(lease.Phase) {
 			case PhaseCapacity:
 				switch {
-				case slices.Contains(out.Listener.Pending, lease.ID):
-					out.Pending++
-				case slices.Contains(out.Listener.Discovery, lease.ID):
-					out.Discovery++
+				case slices.Contains(report.Listener.Pending, lease.ID):
+					report.Pending++
+				case slices.Contains(report.Listener.Discovery, lease.ID):
+					report.Discovery++
 				default:
-					out.Unknown++
+					report.Unknown++
 				}
 			case PhaseAssigned:
-				out.Pending++
+				report.Pending++
 			case PhaseLaunching, PhaseOnline, PhaseBusy:
 				member, found, err := poolRunnerByLease(ctx, state.ReadQueries(tx), lease.ID)
 				if err != nil {
 					return fmt.Errorf("alloc: read the pool runner of lease %s: %w", lease.ID, err)
 				}
-				out.countLaunched(Phase(lease.Phase), member, found, tier)
+				report.countLaunched(Phase(lease.Phase), member, found, lease.Tier)
 			case PhaseCustody, PhaseTeardown, PhaseQuarantine:
-				out.Cleanup++
+				report.Cleanup++
 			}
 		}
-		out.Headroom, err = a.headroom(ctx, tx, t)
 
-		return err
+		for _, label := range labels {
+			if out[label].Headroom, err = a.headroom(ctx, tx, a.tiers[label]); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return out, err
+	reports := make(map[string]TierCapacity, len(out))
+	for label, report := range out {
+		reports[label] = *report
+	}
+
+	return reports, nil
 }
 
 // countLaunched classifies a lease of tier that has entered launch.
