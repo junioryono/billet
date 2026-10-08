@@ -157,9 +157,10 @@ server:
   # drain_timeout: 6h
 
   # Prometheus metrics for this control plane, at http://<listen>/metrics.
-  # Absent, nothing is served. Loopback only unless allow_remote is true: the
-  # endpoint has no authentication. pprof also serves Go's profiler under
-  # /debug/pprof/, on loopback only, because a profile carries memory.
+  # Absent, nothing is served. A literal loopback address (127.0.0.1 or [::1],
+  # not localhost) unless allow_remote is true: the endpoint has no
+  # authentication. pprof also serves Go's profiler under /debug/pprof/, on a
+  # loopback address only, because a profile carries memory.
   #
   # metrics:
   #   listen: 127.0.0.1:9180

@@ -670,8 +670,9 @@ type NodeCacheConfig struct {
 // MetricsConfig is one role's Prometheus endpoint: /metrics, and the Go
 // profiler under /debug/pprof/ when Pprof is set.
 type MetricsConfig struct {
-	// Listen is the address the endpoint binds. It must be loopback unless
-	// AllowRemote is set: the endpoint has no authentication, and what it
+	// Listen is the address the endpoint binds. It must be a literal loopback
+	// address (127.0.0.1 or [::1], never a name the bind would resolve again)
+	// unless AllowRemote is set: the endpoint has no authentication, and what it
 	// reports (tier names, node names, how much of the fleet is in use) is the
 	// deployment's own business.
 	Listen string `yaml:"listen"`
@@ -679,7 +680,8 @@ type MetricsConfig struct {
 	AllowRemote bool `yaml:"allow_remote,omitempty"`
 	// Pprof also serves the Go profiler. A heap or goroutine profile carries
 	// whatever memory held when it was taken, a credential included, so it is
-	// refused beside AllowRemote.
+	// refused on any Listen that is not a literal loopback address, AllowRemote
+	// or not.
 	Pprof bool `yaml:"pprof,omitempty"`
 }
 
@@ -3924,7 +3926,9 @@ func (c *Config) validateMetrics() []error {
 
 	for i, end := range ends {
 		m := metricsOf(end.key)
-		addr := strings.TrimSpace(m.Listen)
+		// AS WRITTEN, NOT TRIMMED: the bind uses this string, and a padded
+		// address that validated here would fail at startup instead.
+		addr := m.Listen
 
 		if err := validateHostPort(end.key+".listen", addr); err != nil {
 			errs = append(errs, err)
@@ -3932,19 +3936,25 @@ func (c *Config) validateMetrics() []error {
 			continue
 		}
 
-		loopback := LoopbackAddr(addr)
+		// A LITERAL LOOPBACK ADDRESS, NOT A NAME. `localhost` is what
+		// LoopbackAddr accepts elsewhere, but the bind resolves it again, and a
+		// resolver that maps it to another interface would serve an
+		// unauthenticated endpoint, the profiler included, off this machine.
+		loopback := literalLoopback(addr)
 
 		if !loopback && !m.AllowRemote {
-			errs = append(errs, fmt.Errorf("%s.listen is %q, which is not loopback. The endpoint has "+
-				"no authentication, so it binds loopback unless %s.allow_remote is true; set it "+
-				"only on a network where whoever can reach the port may read the fleet's state",
-				end.key, addr, end.key))
+			errs = append(errs, fmt.Errorf("%s.listen is %q, which is not a loopback address "+
+				"(127.0.0.1 or [::1]; a name such as localhost is not accepted, because the bind "+
+				"resolves it again). The endpoint has no authentication, so it binds loopback "+
+				"unless %s.allow_remote is true; set it only on a network where whoever can "+
+				"reach the port may read the fleet's state", end.key, addr, end.key))
 		}
 
 		if m.Pprof && !loopback {
-			errs = append(errs, fmt.Errorf("%s.pprof is set on %q, which is not loopback. A heap or "+
-				"goroutine profile carries whatever memory held when it was taken, a credential "+
-				"included, so the profiler is served on loopback only", end.key, addr))
+			errs = append(errs, fmt.Errorf("%s.pprof is set on %q, which is not a loopback address. "+
+				"A heap or goroutine profile carries whatever memory held when it was taken, a "+
+				"credential included, so the profiler is served on 127.0.0.1 or [::1] only, "+
+				"allow_remote or not", end.key, addr))
 		}
 
 		for _, o := range append(others, ends[:i]...) {
@@ -4001,6 +4011,19 @@ func (c *Config) validateBootstrapListen() []error {
 	return errs
 }
 
+// literalLoopback reports whether a listen address names a loopback IP
+// literally, so that what was validated is what is bound.
+func literalLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	ip, err := netip.ParseAddr(host)
+
+	return err == nil && ip.Unmap().IsLoopback()
+}
+
 // addressesOverlap reports whether two listen addresses would contend for one
 // socket.
 //
@@ -4013,10 +4036,10 @@ func (c *Config) validateBootstrapListen() []error {
 // is validateHostPort's question, and reporting one malformed address as two
 // problems helps nobody.
 func addressesOverlap(a, b string) bool {
-	aHost, aPort, aErr := net.SplitHostPort(a)
-	bHost, bPort, bErr := net.SplitHostPort(b)
+	aHost, aPort, aOK := socketOf(a)
+	bHost, bPort, bOK := socketOf(b)
 
-	if aErr != nil || bErr != nil || aPort != bPort {
+	if !aOK || !bOK || aPort != bPort {
 		return false
 	}
 
@@ -4027,9 +4050,39 @@ func addressesOverlap(a, b string) bool {
 	return aHost == bHost
 }
 
-// isWildcardHost reports whether a listen host accepts on every interface.
+// socketOf is a listen address as the socket sees it: the port as a number, so
+// 09180 is 9180, and the host as a canonical address, so an IPv4-mapped IPv6
+// address is its IPv4 one and an IPv6 address has one spelling. A name stays a
+// name, lower-cased: whether it resolves to another listener's address is not
+// something a config file can be checked for.
+func socketOf(addr string) (string, int, bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, false
+	}
+
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return "", 0, false
+	}
+
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().String(), n, true
+	}
+
+	return strings.ToLower(host), n, true
+}
+
+// isWildcardHost reports whether a canonical listen host accepts on every
+// interface: an empty host, or an unspecified address however it was written.
 func isWildcardHost(host string) bool {
-	return host == "" || host == "0.0.0.0" || host == "::"
+	if host == "" {
+		return true
+	}
+
+	ip, err := netip.ParseAddr(host)
+
+	return err == nil && ip.IsUnspecified()
 }
 
 func (c *Config) validateNode() []error {

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/version"
 )
@@ -26,7 +28,11 @@ func serve(t *testing.T, role string, pprofOn bool) *Server {
 	}
 
 	t.Cleanup(func() {
-		if err := srv.Close(t.Context()); err != nil {
+		// t.Context() is already done when cleanups run.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Close(ctx); err != nil {
 			t.Errorf("close: %v", err)
 		}
 	})
@@ -152,5 +158,53 @@ func TestCloseStopsServing(t *testing.T) {
 
 	if !errors.Is(err, syscall.ECONNREFUSED) {
 		t.Errorf("dialling a closed endpoint failed for another reason: %v", err)
+	}
+}
+
+// A SCRAPE SHUTDOWN CANNOT FINISH IS CUT OFF: past Close's context the
+// connections are closed, and Close returns once the serving goroutine has.
+func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
+	t.Parallel()
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	srv, err := Listen(t.Context(), "127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	answered := make(chan error, 1)
+
+	go func() {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
+		if err != nil {
+			answered <- err
+
+			return
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+
+		answered <- err
+	}()
+
+	<-entered
+
+	expired, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := srv.Close(expired); !errors.Is(err, context.Canceled) {
+		t.Errorf("Close past its context returned %v, want the context's error", err)
+	}
+
+	if err := <-answered; err == nil {
+		t.Error("the scrape in flight was answered, not cut off")
 	}
 }
