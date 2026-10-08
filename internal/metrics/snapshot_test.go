@@ -178,12 +178,20 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 		}
 	}
 
+	// FATAL, AND THE RECEIVE BOUNDED: a collector that reported failure
+	// without reading would otherwise leave the test waiting on a read that
+	// never began.
 	if n := reads.Load(); n != 1 {
-		t.Errorf("%d reads started while the first was stuck, want 1", n)
+		t.Fatalf("%d reads started while the first was stuck, want 1", n)
 	}
 
-	if !<-deadlines {
-		t.Error("the read was given no deadline")
+	select {
+	case ok := <-deadlines:
+		if !ok {
+			t.Error("the read was given no deadline")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read never reported its deadline")
 	}
 
 	released.Store(true)
