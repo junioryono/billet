@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -142,13 +143,29 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := &Metrics{srv: srv, stop: srv.Close}
-	answered := make(chan int, 1)
+	// THE ENDPOINT IS CLOSED ONCE, by whichever of Close and the cleanup gets
+	// there first: metrics.Server.Close consumes its serving result, so a
+	// second call would wait forever.
+	var (
+		stopOnce sync.Once
+		stopErr  error
+	)
+
+	stopEndpoint := func(ctx context.Context) error {
+		stopOnce.Do(func() { stopErr = srv.Close(ctx) })
+
+		return stopErr
+	}
+
+	m := &Metrics{srv: srv, stop: stopEndpoint}
+	answered, clientDone := make(chan int, 1), make(chan struct{})
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), metricsTestWait)
 	defer cancel()
 
 	go func() {
+		defer close(clientDone)
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
 		if err != nil {
 			answered <- -1
@@ -167,7 +184,9 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		answered <- resp.StatusCode
 	}()
 
-	var released, started, stopped bool
+	var released, started bool
+
+	closed := make(chan struct{})
 
 	releaseOnce := func() {
 		if !released {
@@ -177,23 +196,34 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 	}
 
 	// ONE OWNER FOR WHAT THE TEST STARTED, whatever it concluded: the handler
-	// is released, the endpoint closed if the test did not get that far, and a
-	// handler that began is joined, each wait bounded.
+	// is released, the endpoint closed (or its close joined), and the handler,
+	// the client and Close's goroutine joined, each wait bounded.
 	t.Cleanup(func() {
 		releaseOnce()
 
-		if !stopped {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), metricsTestWait)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), metricsTestWait)
+		defer cancel()
 
-			_ = srv.Close(ctx)
+		if err := stopEndpoint(ctx); err != nil {
+			t.Logf("the endpoint closed with %v", err)
 		}
 
+		joins := []struct {
+			what string
+			done <-chan struct{}
+		}{{"the client", clientDone}, {"Close", closed}}
 		if started {
+			joins = append(joins, struct {
+				what string
+				done <-chan struct{}
+			}{"the handler", handled})
+		}
+
+		for _, j := range joins {
 			select {
-			case <-handled:
-			case <-time.After(metricsTestWait):
-				t.Error("the handler never returned")
+			case <-j.done:
+			case <-ctx.Done():
+				t.Errorf("%s never returned", j.what)
 			}
 		}
 	})
@@ -209,10 +239,6 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 
 	stopping, stop := context.WithCancel(t.Context())
 	stop()
-
-	closed := make(chan struct{})
-
-	stopped = true
 
 	go func() {
 		defer close(closed)

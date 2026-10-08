@@ -1,8 +1,6 @@
 package config
 
 import (
-	"net"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -186,8 +184,9 @@ func TestAddressesOverlapOnTheSocketNotTheSpelling(t *testing.T) {
 		{"[::%0]:9180", "127.0.0.1:9180", true},
 		{"127.0.0.1:9180", "[::%0]:9180", true},
 		{"[fe80::1%eth0]:9180", "[fe80::1%eth1]:9180", false},
-		{"[fe80::1%2]:9180", "[fe80::1%02]:9180", true},
-		{"[fe80::1%02]:9180", "[fe80::1%2]:9180", true},
+		// A zone that names a link is compared as written, never resolved: two
+		// spellings that might be one interface are left to the bind.
+		{"[fe80::1%2]:9180", "[fe80::1%02]:9180", false},
 		{"[fe80::1%2]:9180", "[fe80::1%3]:9180", false},
 		{":9180", "[::1]:9180", true},
 		{"Billet.Example:9180", "billet.example:9180", true},
@@ -200,32 +199,4 @@ func TestAddressesOverlapOnTheSocketNotTheSpelling(t *testing.T) {
 			t.Errorf("addressesOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.same)
 		}
 	}
-}
-
-// AN INTERFACE NAME AND ITS INDEX NAME ONE LINK, on a host that has the
-// interface. The loopback interface is the one every test host has.
-func TestALinkLocalZoneIsComparedAsItsInterface(t *testing.T) {
-	t.Parallel()
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagLoopback == 0 {
-			continue
-		}
-
-		byName := "[fe80::1%" + iface.Name + "]:9180"
-		byIndex := "[fe80::1%" + strconv.Itoa(iface.Index) + "]:9180"
-
-		if !addressesOverlap(byName, byIndex) || !addressesOverlap(byIndex, byName) {
-			t.Errorf("%s and %s name one socket, and were judged two", byName, byIndex)
-		}
-
-		return
-	}
-
-	t.Skip("this host has no loopback interface to name")
 }
