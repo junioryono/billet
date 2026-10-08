@@ -315,6 +315,12 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 			}
 
 			time.Sleep(ceiling + 200*time.Millisecond) // the callback's own time, which is the scenario
+
+			// A BOUND OF THEIR OWN for what follows the release: the sleep grows
+			// with a slow machine and can outlast the one the writes run under.
+			after, done := context.WithTimeout(t.Context(), 10*time.Second)
+			defer done()
+
 			release()
 
 			select {
@@ -322,7 +328,7 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 				if commit != (err == nil) {
 					t.Fatalf("the first write returned %v", err)
 				}
-			case <-bound.Done():
+			case <-after.Done():
 				t.Fatal("the first write never returned once its observer was released")
 			}
 
@@ -332,7 +338,7 @@ func TestTheObserverRunsAfterTheWriterSlotIsReleased(t *testing.T) {
 					t.Errorf("the first write was told a hold of %v, more than the %v it can have taken: "+
 						"it counts the observer's own time", d, ceiling)
 				}
-			case <-bound.Done():
+			case <-after.Done():
 				t.Fatal("the first write's hold was never told")
 			}
 		})
