@@ -1334,31 +1334,35 @@ func TestAPostAppFailureNeverAsksToBeRerun(t *testing.T) {
 	// AND BOTH STREAMS BREAK ONCE THE APP EXISTS, which is the case that used to
 	// return an error. They are broken from INSIDE the stub, because breaking
 	// them earlier would refuse at the notice instead — correctly, and before an
-	// App exists, which is a different rule and a different test.
-	savedOut, savedErr := os.Stdout, os.Stderr
-
-	t.Cleanup(func() { os.Stdout, os.Stderr = savedOut, savedErr })
+	// App exists, which is a different rule and a different test. The streams
+	// broken are the command's own: the env it was handed.
+	stdout, stderr := &switchWriter{w: io.Discard}, &switchWriter{w: io.Discard}
+	env := processEnv()
+	env.Stdout, env.Stderr = stdout, stderr
 
 	inner := onboard
 	onboard = func(ctx context.Context, opts github.OnboardOptions) (*github.Onboarding, error) {
 		result, err := inner(ctx, opts)
 
-		os.Stdout = brokenPipe(t)
-		os.Stderr = brokenPipe(t)
+		stdout.w, stderr.w = brokenPipe(t), brokenPipe(t)
 
 		return result, err
 	}
 
-	err := githubAppCreate(t.Context(), processEnv(), []string{
+	err := githubAppCreate(t.Context(), env, []string{
 		"--org", "acme", "--config", cfgPath,
 		"--key-path", filepath.Join(dir, "app-private-key.pem"), "--no-browser",
 	})
-
-	os.Stdout, os.Stderr = savedOut, savedErr
-
 	if err != nil {
 		t.Errorf("a run that created an App and could not report it returned an error, which "+
 			"reads as `run me again`: %v", err)
+	}
+
+	// BOTH WERE TRIED, AND BOTH FAILED, so the run above is the one the rule is
+	// about and not one that never reached a broken stream.
+	if stdout.failed == 0 || stderr.failed == 0 {
+		t.Errorf("the run did not meet both broken streams (stdout failed %d writes, stderr %d)",
+			stdout.failed, stderr.failed)
 	}
 }
 
@@ -1440,7 +1444,18 @@ func TestTheRecoveryBlockFallsBackToTheOtherStream(t *testing.T) {
 	}
 }
 
-// switchWriter is a stream a test can break part-way through a command.
-type switchWriter struct{ w io.Writer }
+// switchWriter is a stream a test can break part-way through a command, counting
+// the writes that failed once it was.
+type switchWriter struct {
+	w      io.Writer
+	failed int
+}
 
-func (s *switchWriter) Write(p []byte) (int, error) { return s.w.Write(p) }
+func (s *switchWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if err != nil {
+		s.failed++
+	}
+
+	return n, err
+}
