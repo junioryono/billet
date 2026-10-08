@@ -107,9 +107,32 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 	calls := 0
 
 	for _, f := range files {
+		called := map[*ast.Ident]bool{}
+
 		ast.Inspect(f, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok && calleeName(call) == "NewFlagSet" {
-				calls++
+			call, ok := n.(*ast.CallExpr)
+			if !ok || calleeName(call) != "NewFlagSet" {
+				return true
+			}
+
+			calls++
+
+			switch fun := call.Fun.(type) {
+			case *ast.Ident:
+				called[fun] = true
+			case *ast.SelectorExpr:
+				called[fun.Sel] = true
+			}
+
+			return true
+		})
+
+		// A REFERENCE THAT IS NOT A DIRECT CALL (a parenthesised callee, a
+		// function value) makes flag sets the census cannot count.
+		ast.Inspect(f, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id.Name == "NewFlagSet" && !called[id] {
+				t.Error("NewFlagSet is referred to without being called directly; call it as " +
+					"`fs := cli.NewFlagSet(...)`")
 			}
 
 			return true
@@ -150,6 +173,15 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 		var out []string
 
 		ast.Inspect(body, func(n ast.Node) bool {
+			if assign, ok := n.(*ast.AssignStmt); ok {
+				for _, rhs := range assign.Rhs {
+					if id, ok := ast.Unparen(rhs).(*ast.Ident); ok && id.Name == set {
+						t.Errorf("the flag set %s is copied into another variable, so the flags defined "+
+							"through it cannot be attributed to its command", set)
+					}
+				}
+			}
+
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -287,7 +319,17 @@ func flagSetNames(t *testing.T, fn *ast.FuncDecl, expr ast.Expr) []string {
 
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			assign, ok := n.(*ast.AssignStmt)
-			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			if !ok {
+				return true
+			}
+
+			if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+				for _, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == x.Name {
+						other = true
+					}
+				}
+
 				return true
 			}
 
@@ -396,27 +438,35 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 		var cells []string
 		if strings.HasPrefix(line, "|") {
 			cells = tableCells(line)
+			if len(cells) > 0 {
+				cells[0] = strings.Trim(cells[0], "*_ ")
+			}
 		}
 
 		switch {
 		case strings.HasPrefix(line, "#") && strings.Contains(line, "`billet "):
-			m := referenceCommand.FindStringSubmatch(line)
-			heading, applies = commandPaths(m[1]), false
-			add(heading, m[1])
+			m := referenceCommand.FindStringSubmatchIndex(line)
+			heading, applies = commandPaths(line[m[2]:m[3]]), false
+			add(heading, line[m[2]:m[3]])
+			mentioned(n, line[m[1]:])
 		case strings.HasPrefix(line, "#"):
 			heading, applies = nil, false
 		case len(cells) > 1 && cells[0] == "Flag" && cells[1] == "Applies to":
 			applies = true
 		case len(cells) > 0 && strings.HasPrefix(cells[0], "`billet "):
-			m := referenceCommand.FindStringSubmatch(cells[0])
+			m := referenceCommand.FindStringSubmatchIndex(cells[0])
 			if m == nil {
 				t.Errorf("the reference's command cell on line %d is not one backticked command", n)
 
 				continue
 			}
 
-			add(commandPaths(m[1]), cells[0])
-			mentioned(n, strings.Join(cells[1:], " | "))
+			// The cell's other spans are this command's flags, except a further
+			// `billet ...`, which is another command and checked as one.
+			rest := cells[0][m[1]:]
+			others := strings.Join(referenceCommand.FindAllString(rest, -1), " ")
+			add(commandPaths(cells[0][m[2]:m[3]]), cells[0][:m[1]]+referenceCommand.ReplaceAllString(rest, ""))
+			mentioned(n, others+" | "+strings.Join(cells[1:], " | "))
 		case len(cells) > 0 && strings.HasPrefix(cells[0], "`-"):
 			if heading == nil {
 				t.Errorf("the reference's flag row on line %d is under no command's heading", n)
