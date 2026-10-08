@@ -48,7 +48,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 - `internal/deployarchive/*_test.go` (planning, execute, finish, abandon, supersede ordering, journal schema, containment, external ledger).
 - `cmd/billet/localbackup_test.go`, `localrestore_test.go`, `localrecover_test.go`, `localoffsite_test.go`, `restoreownership_test.go`, `restoreprofile_test.go`, `preservedpaths_test.go`.
-- `cmd/billet/imagespulldurable_test.go` (`TestAPullDoesNotPublishAGenerationBeforeTheKernelIsDurable`), `imagespulllock_test.go`, `kernellock_test.go`, `kernelreap_test.go`, `internal/durablefile/*_test.go`.
+- `internal/ops/images/imagespulldurable_test.go` (`TestAPullDoesNotPublishAGenerationBeforeTheKernelIsDurable`), `imagespulllock_test.go`, `kernellock_test.go`, `kernelreap_test.go`, `internal/durablefile/*_test.go`.
 - `internal/e2e/restore_test.go` (`TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne`); `scripts/restore-rehearsal.sh` and `postgres-restore-rehearsal.sh` are the halves that need a real package.
 
 ## Related skills

@@ -25,6 +25,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	opsimages "github.com/junioryono/billet/internal/ops/images"
+
+	"github.com/junioryono/billet/internal/deploymentid"
 	"github.com/junioryono/billet/internal/ops/cache"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -87,11 +90,11 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 		{Name: "init", Summary: "generate a billet.yaml interactively",
 			Run: cmdInit},
 		{Name: "ami", Summary: "build and verify the machine image the ec2 backend launches",
-			Run: cmdAMI},
+			Run: opsimages.AMI},
 		{Name: "runner", Summary: "report how close the pinned actions/runner is to being refused",
-			Run: cmdRunner},
+			Run: opsimages.Runner},
 		{Name: "images", Summary: "verify the golden image a microVM guest boots from",
-			Run: cmdImages},
+			Run: opsimages.Run},
 		{Name: "fleet", Summary: "converge a fleet from this machine with the collection of this billet's release",
 			Run: cmdFleet},
 		{Name: "github-app", Summary: "create and install the GitHub App billet uses",
@@ -914,7 +917,7 @@ func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 				"previous reissue, which stays VALID until revoked, and overwriting it would "+
 				"destroy the only copy the revoke command reads. Revoke it first (`billet ca "+
 				"revoke %s --cert %s`), then remove the directory and re-run",
-				dir, shellArg(name), shellArg(filepath.Join(dir+".replaced", "node.crt")))
+				dir, cli.ShellArg(name), cli.ShellArg(filepath.Join(dir+".replaced", "node.crt")))
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("check %s.replaced: %w", dir, err)
 		}
@@ -961,7 +964,7 @@ func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 			"using its old key until this new bundle is installed and the node restarts, and "+
 			"the OLD certificate stays valid until you revoke it:\n\n"+
 			"  billet ca revoke %s --cert %s --reason reissued\n\n",
-			dir, shellArg(name), shellArg(filepath.Join(dir+".replaced", "node.crt")))
+			dir, cli.ShellArg(name), cli.ShellArg(filepath.Join(dir+".replaced", "node.crt")))
 	}
 
 	abs, err := filepath.Abs(dir)
@@ -1418,7 +1421,7 @@ func checkEC2Credentials(
 	// THE ACCOUNT'S OWN CEILING, once the credentials are known to work. It is
 	// read with the SAME credentials that were just proved, so what it reports is
 	// what this node will run as. Advisory; see reportQuotas.
-	if p, err := ec2.New(deploymentForCheck, ec2cfg,
+	if p, err := ec2.New(deploymentid.Preflight, ec2cfg,
 		ec2.WithCredentials(awscreds.Static(creds))); err == nil {
 		reportQuotas(ctx, env, cfg, p)
 	}
@@ -1693,7 +1696,7 @@ func authorizeOwner(cfg *config.Config, bundle *wirecert.Bundle) (string, error)
 		return bundle.Deployment()
 	}
 
-	for _, dir := range deploymentStateDirs(cfg) {
+	for _, dir := range cfg.DeploymentStateDirs() {
 		id, found, err := state.PeekDeploymentID(dir)
 		if err != nil {
 			return "", err
@@ -1952,7 +1955,7 @@ func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config) 
 	//
 	// The storage is not consulted here; checkCephCluster does that on its own, and
 	// a nil disk would make this refuse for the wrong reason.
-	p, err := firecracker.New(deploymentForCheck, *cfg.Node.Firecracker, noRootDisk{})
+	p, err := firecracker.New(deploymentid.Preflight, *cfg.Node.Firecracker, noRootDisk{})
 	if err != nil {
 		return err
 	}
@@ -2015,7 +2018,7 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	// keeps the report honest for one built any other way.
 	tartCfg.Normalize()
 
-	p, err := tart.New(deploymentForCheck, tart.WithConfig(tartCfg))
+	p, err := tart.New(deploymentid.Preflight, tart.WithConfig(tartCfg))
 	if err != nil {
 		return err
 	}
@@ -2108,7 +2111,7 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	// The SAME selection `billet images pull` makes, identity resolution
 	// included — a check that listed different images from the command that
 	// fetches them would send an operator in a circle.
-	tierImages, err := tartTierImages(cfg)
+	tierImages, err := opsimages.TartTierImages(cfg)
 	if err != nil {
 		return err
 	}
@@ -2138,11 +2141,6 @@ func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 
 	return nil
 }
-
-// deploymentForCheck identifies nothing. The provider requires a deployment because
-// it marks the jails it creates with one, and this constructs a provider only to
-// ask it questions about the host.
-const deploymentForCheck = "00000000000000000000000000000000"
 
 // noRootDisk stands in for the storage a preflight does not use.
 //

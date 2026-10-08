@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -111,7 +111,7 @@ func cmdImagesRefresh(ctx context.Context, env cli.Env, args []string) error {
 			return nil
 		}
 
-		return pullTartImages(ctx, env, cfg, "")
+		return PullTartImages(ctx, env, cfg, "")
 
 	case config.ProviderFirecracker:
 		return refreshFirecrackerImages(ctx, env, cfg, *cfgPath, *keep, *dryRun)
@@ -134,7 +134,7 @@ func refreshFirecrackerImages(ctx context.Context, env cli.Env, cfg *config.Conf
 			"there is nowhere to import an image to")
 	}
 
-	configured, err := firecrackerTierImages(cfg)
+	configured, err := FirecrackerTierImages(cfg)
 	if err != nil {
 		return err
 	}

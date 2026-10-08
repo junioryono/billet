@@ -851,7 +851,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 			return
 		}
 
-		installCmd := fmt.Sprintf("install -m 0600 %s %s", shellArg(keyMovedFrom), shellArg(keyMovedTo))
+		installCmd := fmt.Sprintf("install -m 0600 %s %s", cli.ShellArg(keyMovedFrom), cli.ShellArg(keyMovedTo))
 
 		// AN ACCOUNT ONLY WHERE THERE IS ONE. macOS has no service account — the
 		// launch agents run as the operator — so `-o billet -g billet` names a
@@ -861,7 +861,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		if account := initconfig.ServiceAccountFor(targetOS); account != "" &&
 			params.Profile == initconfig.ProfileLocalService {
 			installCmd = fmt.Sprintf("install -o %s -g %s -m 0600 %s %s",
-				account, account, shellArg(keyMovedFrom), shellArg(keyMovedTo))
+				account, account, cli.ShellArg(keyMovedFrom), cli.ShellArg(keyMovedTo))
 		}
 		where := "on the host that will run billet"
 		if emitValue == emitAnsible {
@@ -1052,7 +1052,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "\nThe existing file carries content this command will not merge for you "+
 			"(edited values, sites, extra tiers, or a different billet version's shape). "+
 			"Compare and merge deliberately:\n\n  diff -u %s %s\n\nThen move the merged "+
-			"result into place yourself.\n", shellArg(*cfgPath), shellArg(writePath))
+			"result into place yourself.\n", cli.ShellArg(*cfgPath), cli.ShellArg(writePath))
 
 		// A joined node has no App to create; the rest of its guidance is the
 		// same once the merged file is in place.
@@ -1068,7 +1068,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		if params.Profile == initconfig.ProfileLocalService {
 			if account := initconfig.ServiceAccountFor(hostOS); account != "" {
 				fmt.Fprintf(env.Stdout, "After moving it into place: chown root:%s %s && chmod 0640 %s\n",
-					account, shellArg(*cfgPath), shellArg(*cfgPath))
+					account, cli.ShellArg(*cfgPath), cli.ShellArg(*cfgPath))
 			}
 
 			// AND THEN SAY WHAT MAKES IT LIVE. This branch ended at "move the
@@ -1086,7 +1086,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// that init leaves their config alone — so it is where the difference
 		// belongs, along with which of the two files the next command wants.
 		fmt.Fprintf(env.Stdout, "\n%s So when you create the App, point it at %s — the file the deployment "+
-			"reads — rather than at %s.\n", configEditRule, shellArg(*cfgPath), shellArg(writePath))
+			"reads — rather than at %s.\n", configEditRule, cli.ShellArg(*cfgPath), cli.ShellArg(writePath))
 
 		return nil
 	}
@@ -1121,7 +1121,7 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 ) {
 	printJoinControlPlane(env, joined)
 
-	pathArg := shellArg(cfgPath)
+	pathArg := cli.ShellArg(cfgPath)
 	step := 3
 
 	fmt.Fprintf(env.Stdout, "Then on this machine:\n\n")
@@ -1155,10 +1155,10 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 		}
 
 		fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
-		fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, shellArg(service))
+		fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, cli.ShellArg(service))
 		if account := initconfig.ServiceAccountFor(hostOS); account != "" {
 			fmt.Fprintf(env.Stdout, "       chown root:%s %s && chmod 0640 %s\n",
-				account, shellArg(service), shellArg(service))
+				account, cli.ShellArg(service), cli.ShellArg(service))
 		}
 		step = 4
 	}
@@ -1436,7 +1436,7 @@ func printInitNextFor(env cli.Env, cfgPath string, p initconfig.Params, trusted,
 
 	printStateNext(env, p)
 
-	pathArg := shellArg(cfgPath)
+	pathArg := cli.ShellArg(cfgPath)
 
 	fmt.Fprintf(env.Stdout, "\nNext (the GitHub App identity was carried over — do not create it again):\n\n")
 	fmt.Fprintf(env.Stdout, "  1. Confirm the config, its host prerequisites and any runner-group policy:\n")
@@ -1488,7 +1488,7 @@ func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted boo
 	// shellArg single-quotes it so the shell does not read its `<` as input
 	// redirection. An ordinary path or org name is left untouched.
 	orgFlag := scopeFlag(p.Org, p.Repository)
-	pathArg := shellArg(cfgPath)
+	pathArg := cli.ShellArg(cfgPath)
 
 	if kind == config.ProviderFirecracker {
 		fmt.Fprintf(env.Stdout, "\nBefore this config can launch a guest, the host must provide what billet "+
@@ -1534,14 +1534,14 @@ func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted boo
 
 		if cfgPath != service {
 			fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
-			fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, shellArg(service))
+			fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, cli.ShellArg(service))
 
 			// ONLY WHERE THERE IS AN ACCOUNT TO HAND IT TO. On macOS the services
 			// run as the operator, so a chown to a group that does not exist is
 			// an instruction that fails and explains nothing.
 			if account != "" {
 				fmt.Fprintf(env.Stdout, "       chown root:%s %s && chmod 0640 %s\n",
-					account, shellArg(service), shellArg(service))
+					account, cli.ShellArg(service), cli.ShellArg(service))
 			}
 
 			step = 4
@@ -1607,38 +1607,6 @@ func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted boo
 		"repositories your runner group permits, reach them. Launch authority is the tier's "+
 		"static trust, not the job's event, so an allowlisted workflow must never check out or "+
 		"run code you do not control — a fork's pull request included.\n")
-}
-
-// shellArg renders s so it survives being pasted into a POSIX shell as one word.
-//
-// A value that is already a single shell word — the common case, an ordinary
-// path or org name — is returned unchanged so the printed command reads
-// naturally. Anything else is wrapped in single quotes, with each embedded
-// single quote written as the four-character break-out quote-backslash-quote-quote,
-// because inside single quotes the shell treats every other byte literally. An
-// empty string becomes an empty single-quoted pair so it stays a visible, valid
-// argument rather than vanishing.
-func shellArg(s string) string {
-	if s == "" {
-		return "''"
-	}
-
-	for _, r := range s {
-		if !shellSafeRune(r) {
-			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-		}
-	}
-
-	return s
-}
-
-// shellSafeRune reports whether r can stand unquoted in a POSIX shell word. The
-// set is deliberately conservative — alphanumerics and the punctuation a path,
-// org or flag value ordinarily carries — so anything outside it is quoted rather
-// than reasoned about.
-func shellSafeRune(r rune) bool {
-	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-		strings.ContainsRune("_-./@:", r)
 }
 
 // commitConfig replaces (or creates) a config file atomically: the bytes are
@@ -1901,16 +1869,6 @@ func wantsAnsibleEmission(args []string) bool {
 	return false
 }
 
-// shellArgs quotes a whole argument list for pasting into a shell.
-func shellArgs(args []string) string {
-	quoted := make([]string, 0, len(args))
-	for _, a := range args {
-		quoted = append(quoted, shellArg(a))
-	}
-
-	return strings.Join(quoted, " ")
-}
-
 // generationInputs are the parsed flag values that DESCRIBE a deployment, as
 // opposed to the ones that say where the generation goes.
 type generationInputs struct {
@@ -2016,11 +1974,11 @@ func checkCarried(final []byte) error {
 func scopeFlag(org, repository string) string {
 	switch {
 	case repository != "":
-		return "--repository " + shellArg(repository)
+		return "--repository " + cli.ShellArg(repository)
 	case org != "":
-		return "--org " + shellArg(org)
+		return "--org " + cli.ShellArg(org)
 	default:
-		return "--org " + shellArg("<your-org>")
+		return "--org " + cli.ShellArg("<your-org>")
 	}
 }
 
@@ -2074,7 +2032,7 @@ const bootstrapSeed = "github: {}"
 // and a plain `>` truncated it before reserveKeyFile noticed the key already
 // existed and refused — the key survived, the identity record did not.
 func noIdentityGuidance(cfgPath, org, repository string, flags []string) string {
-	rest := shellArgs(flags)
+	rest := cli.ShellArgs(flags)
 	if rest != "" {
 		rest = " " + rest
 	}
@@ -2105,7 +2063,7 @@ func noIdentityGuidance(cfgPath, org, repository string, flags []string) string 
 		"destination's own refusal comes too late to save it. If you already have an "+
 		"App, point --config at the file holding it instead of running these; to mint "+
 		"a second, use a fresh path and a fresh --key-path.\n",
-		cfgPath, shellArg(bootstrapSeed), bootstrapIdentity,
+		cfgPath, cli.ShellArg(bootstrapSeed), bootstrapIdentity,
 		orgFlag, bootstrapIdentity, bootstrapIdentity, rest, bootstrapIdentity)
 }
 
@@ -2133,7 +2091,7 @@ func chownAdvice(dir string) string {
 	// command run as root, where being wrong costs whatever the command does.
 	// Do not unify them.
 	if uid := effectiveUID(); uid != 0 {
-		return fmt.Sprintf("  sudo mkdir -p %s && sudo chown %d %s", shellArg(dir), uid, shellArg(dir))
+		return fmt.Sprintf("  sudo mkdir -p %s && sudo chown %d %s", cli.ShellArg(dir), uid, cli.ShellArg(dir))
 	}
 
 	// AS ROOT THERE IS NOBODY TO NAME, and the command must not be pasted where
@@ -2142,7 +2100,7 @@ func chownAdvice(dir string) string {
 	// which is the whole content of this branch, and why it is prose rather than
 	// a bare command line.
 	return fmt.Sprintf("Leave the root shell, then as the account that will run the agents:\n"+
-		"  sudo mkdir -p %s && sudo chown \"$(id -un)\" %s", shellArg(dir), shellArg(dir))
+		"  sudo mkdir -p %s && sudo chown \"$(id -un)\" %s", cli.ShellArg(dir), cli.ShellArg(dir))
 }
 
 // effectiveUID is os.Geteuid behind a seam, so the root refusal can be tested.

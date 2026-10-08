@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -50,7 +50,7 @@ func TestRunnerCheckReportsEachStateWithItsOwnExitCode(t *testing.T) {
 				FirstNewer:          "2.337.0",
 				FirstNewerPublished: opened.Add(-(runnerrelease.Warn + time.Hour)),
 			},
-			wantErr: errRunnerDue,
+			wantErr: ErrRunnerDue,
 			// THE RELEASE THAT STARTED THE CLOCK AND THE ONE TO TAKE UP ARE BOTH
 			// NAMED. They are different questions, and an operator reading only the
 			// newest release beside a deadline cannot see where the clock began.
@@ -64,7 +64,7 @@ func TestRunnerCheckReportsEachStateWithItsOwnExitCode(t *testing.T) {
 				FirstNewer:          "2.337.0",
 				FirstNewerPublished: opened.Add(-(runnerrelease.Grace + time.Hour)),
 			},
-			wantErr:  errExpiredRunner,
+			wantErr:  ErrExpiredRunner,
 			contains: []string{"stopped queueing jobs", "pinned.txt", "2.339.0"},
 		},
 		{
@@ -77,7 +77,7 @@ func TestRunnerCheckReportsEachStateWithItsOwnExitCode(t *testing.T) {
 				FirstNewer:          "2.337.0",
 				FirstNewerPublished: opened.Add(-(runnerrelease.Grace + time.Hour)),
 			},
-			wantErr:  errExpiredRunner,
+			wantErr:  ErrExpiredRunner,
 			contains: []string{"older than the history", "the latest it could have been"},
 		},
 	} {
@@ -87,7 +87,7 @@ func TestRunnerCheckReportsEachStateWithItsOwnExitCode(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+			out := capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("cmdRunner returned %v, want %v", err, tc.wantErr)
@@ -142,13 +142,13 @@ func TestRunnerCheckWillNotGuessAboutAVersionItCannotPlace(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+			out := capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
 			if err == nil {
 				t.Fatalf("a version billet could not place was reported as fine:\n%s", out)
 			}
 
-			if errors.Is(err, errRunnerDue) || errors.Is(err, errExpiredRunner) {
+			if errors.Is(err, ErrRunnerDue) || errors.Is(err, ErrExpiredRunner) {
 				t.Fatalf("an unplaceable version was reported as a verdict: %v", err)
 			}
 
@@ -183,7 +183,7 @@ func TestRunnerCheckReportsTheVersionTheAnswerIsAbout(t *testing.T) {
 	})
 
 	out := capture(t, func() {
-		if err := cmdRunner(t.Context(), processEnv(), []string{"check"}); err != nil {
+		if err := Runner(t.Context(), processEnv(), []string{"check"}); err != nil {
 			t.Errorf("cmdRunner: %v", err)
 		}
 	})
@@ -228,7 +228,7 @@ func TestRunnerCheckWillNotGuessFromAnIncompleteHistory(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+			out := capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
 			if err == nil {
 				t.Fatalf("an incomplete scan was reported as nothing to do:\n%s", out)
@@ -254,9 +254,9 @@ func TestRunnerCheckStillProvesAnExpiryFromAnIncompleteHistory(t *testing.T) {
 
 	var err error
 
-	_ = capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+	_ = capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
-	if !errors.Is(err, errExpiredRunner) {
+	if !errors.Is(err, ErrExpiredRunner) {
 		t.Fatalf("cmdRunner returned %v; an expiry an incomplete scan can see is still "+
 			"an expiry", err)
 	}
@@ -277,9 +277,9 @@ func TestRunnerCheckReportsBeingBehindWithNoWindowToCount(t *testing.T) {
 
 	var err error
 
-	out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+	out := capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
-	if !errors.Is(err, errRunnerDue) {
+	if !errors.Is(err, ErrRunnerDue) {
 		t.Fatalf("cmdRunner returned %v; a fleet behind with no window is a rebuild to "+
 			"schedule", err)
 	}
@@ -308,13 +308,13 @@ func TestRunnerCheckSeparatesNotKnowingFromBeingOutOfDate(t *testing.T) {
 
 	var err error
 
-	_ = capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
+	_ = capture(t, func() { err = Runner(t.Context(), processEnv(), []string{"check"}) })
 
 	if err == nil {
 		t.Fatal("a failed lookup was reported as nothing to do")
 	}
 
-	if errors.Is(err, errRunnerDue) || errors.Is(err, errExpiredRunner) {
+	if errors.Is(err, ErrRunnerDue) || errors.Is(err, ErrExpiredRunner) {
 		t.Fatalf("a failed lookup was reported as a verdict about the fleet: %v", err)
 	}
 
@@ -341,7 +341,7 @@ func TestRunnerCheckAsksAboutTheVersionItReports(t *testing.T) {
 	})
 
 	out := capture(t, func() {
-		if err := cmdRunner(t.Context(), processEnv(), []string{"check"}); err != nil {
+		if err := Runner(t.Context(), processEnv(), []string{"check"}); err != nil {
 			t.Errorf("cmdRunner: %v", err)
 		}
 	})

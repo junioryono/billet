@@ -47,3 +47,7 @@ b328ae11a010 The fresh branch of the identity access moved to internal/hostautho
 e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase 4); the sentence names it and the test that exempts it.
 1793c3990d6e The cache commands moved to internal/ops/cache (#356 Phase 4); the sentence names the file there.
 781836ce56c7 The cache commands moved to internal/ops/cache (#356 Phase 4); the list names their tests there.
+09c3bf35ef98 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
+59b7c7997fe6 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
+6bab26a6c007 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.
+990e182c6d23 The image, kernel and AMI commands moved to internal/ops/images (#356 Phase 4); the sentence names their files there.

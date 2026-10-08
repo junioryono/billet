@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 )
@@ -491,8 +492,8 @@ func TestShellArgQuotesForPaste(t *testing.T) {
 		{"a'b", `'a'\''b'`},
 		{"o#rg", "'o#rg'"},
 	} {
-		if got := shellArg(tc.in); got != tc.want {
-			t.Errorf("shellArg(%q) = %q, want %q", tc.in, got, tc.want)
+		if got := cli.ShellArg(tc.in); got != tc.want {
+			t.Errorf("cli.ShellArg(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

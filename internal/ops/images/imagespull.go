@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -131,7 +131,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	// before the Ceph requirement below — a tart node has no cluster, so without
 	// this it was told to configure storage it must not have.
 	if cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
-		return pullTartImages(ctx, env, cfg, rest)
+		return PullTartImages(ctx, env, cfg, rest)
 	}
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
@@ -154,7 +154,7 @@ func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 
 	image := rest
 	if image == "" {
-		configured, err := firecrackerTierImages(cfg)
+		configured, err := FirecrackerTierImages(cfg)
 		if err != nil {
 			return err
 		}
@@ -574,7 +574,7 @@ func stageImage(
 	// only thing that produces a usable root filesystem path -- and which checks
 	// the digest of the assembled file, not merely of the pieces.
 	for _, asset := range manifest.Downloads() {
-		fmt.Fprintf(env.Stdout, "downloading %s (%s)\n", asset.Name, humanBytes(asset.Size))
+		fmt.Fprintf(env.Stdout, "downloading %s (%s)\n", asset.Name, HumanBytes(asset.Size))
 
 		if _, err := client.Download(ctx, asset, dir); err != nil {
 			cleanup()
@@ -758,7 +758,7 @@ func hostArch() string {
 }
 
 // humanBytes renders a size the way an operator reads one.
-func humanBytes(n int64) string {
+func HumanBytes(n int64) string {
 	const unit = 1024
 
 	if n < unit {

@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"bytes"
@@ -349,7 +349,7 @@ func TestHumanBytesReadsTheWayAnOperatorReadsIt(t *testing.T) {
 		{397_000_000, "378.6 MiB"},
 		{4 << 30, "4.0 GiB"},
 	} {
-		if got := humanBytes(tc.in); got != tc.want {
+		if got := HumanBytes(tc.in); got != tc.want {
 			t.Errorf("humanBytes(%d) = %q, want %q", tc.in, got, tc.want)
 		}
 	}

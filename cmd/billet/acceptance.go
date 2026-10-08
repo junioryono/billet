@@ -481,7 +481,7 @@ func checkLabelPrefix(prefix string) error {
 // refuseWorkspaceInsideTheDeployment keeps an acceptance run out of the state
 // directory of the deployment it was derived from.
 func refuseWorkspaceInsideTheDeployment(dir string, cfg *config.Config) error {
-	for _, occupied := range deploymentStateDirs(cfg) {
+	for _, occupied := range cfg.DeploymentStateDirs() {
 		if occupied == "" {
 			continue
 		}

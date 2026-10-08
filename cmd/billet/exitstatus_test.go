@@ -6,6 +6,8 @@ import (
 	"go/types"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/images"
+
 	"github.com/junioryono/billet/internal/cli"
 )
 
@@ -15,11 +17,11 @@ import (
 func TestTheRunnerCheckAnswersWithItsDocumentedStatuses(t *testing.T) {
 	t.Parallel()
 
-	if got := cli.ExitStatus(errRunnerDue); got != 2 {
+	if got := cli.ExitStatus(images.ErrRunnerDue); got != 2 {
 		t.Errorf("a due rebuild exits %d, want 2", got)
 	}
 
-	if got := cli.ExitStatus(errExpiredRunner); got != 3 {
+	if got := cli.ExitStatus(images.ErrExpiredRunner); got != 3 {
 		t.Errorf("a runner GitHub refuses exits %d, want 3", got)
 	}
 }

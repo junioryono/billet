@@ -8,6 +8,11 @@ import "fmt"
 // bytes.
 const Length = 32
 
+// Preflight identifies no deployment. A provider requires one because it marks
+// what it creates with it, and a preflight constructs a provider only to ask it
+// questions about the host.
+const Preflight = "00000000000000000000000000000000"
+
 // Validate refuses anything billet would not have minted.
 //
 // The identity is interpolated into filenames, Docker labels and cloud tags.

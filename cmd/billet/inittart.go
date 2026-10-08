@@ -322,7 +322,7 @@ var errTartAnsible = errors.New(
 // is a number they can check and find false. The same applies to naming a guest
 // kind this generation does not have.
 func printTartNext(env cli.Env, cfgPath string, trusted bool, tart *initconfig.TartParams) {
-	pathArg := shellArg(cfgPath)
+	pathArg := cli.ShellArg(cfgPath)
 
 	fmt.Fprintf(env.Stdout, "\nEvery tier's image must already be IN TART'S STORE before the first job — a "+
 		"launch refuses one that is not there rather than fetching it, because a guest image "+

@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -39,7 +39,7 @@ import (
 // THE EXIT CODE IS THE POINT. A cron entry or a monitor reads it: 0 while there is
 // nothing to do, 2 once a rebuild is due, and 3 once GitHub is already refusing.
 // They are distinct because the second is a task and the third is an outage.
-func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
+func Runner(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 || args[0] != "check" {
 		return errors.New("usage: billet runner check")
 	}
@@ -141,7 +141,7 @@ func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintln(env.Stdout, "  2. sudo scripts/build-guest-image.sh   (microVM guests)")
 		fmt.Fprintln(env.Stdout, "  3. billet ami build                    (ec2 nodes)")
 
-		return errExpiredRunner
+		return ErrExpiredRunner
 
 	// BEHIND WITH NO WINDOW TO COUNT. A higher version published EARLIER than the
 	// installed release is evidence the fleet is behind and is not an opener, so
@@ -158,7 +158,7 @@ func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "Rebuild: put %s in internal/runnerrelease/pinned.txt, then rebuild the "+
 			"images.\n", fresh.Latest)
 
-		return errRunnerDue
+		return ErrRunnerDue
 
 	// NEITHER OF THE NEXT TWO IS A VERDICT, and they are the same shape: billet read
 	// less of the history than the answer would need. `Expired` above is sound under
@@ -208,7 +208,7 @@ func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
 		fmt.Fprintf(env.Stdout, "Rebuild while there is time: put %s in internal/runnerrelease/pinned.txt, "+
 			"then rebuild the images.\n", fresh.Latest)
 
-		return errRunnerDue
+		return ErrRunnerDue
 
 	default:
 		if !*quiet {
@@ -233,8 +233,8 @@ var resolveRunnerFreshness = runnerrelease.Resolve
 // is a task to schedule and the other is an outage to page for, and a monitor that
 // cannot tell them apart will treat both like whichever it saw first.
 var (
-	errRunnerDue     = &cli.ExitError{Code: 2, Msg: "the runner image is due to be rebuilt"}
-	errExpiredRunner = &cli.ExitError{Code: 3, Msg: "github is no longer queueing jobs to this runner"}
+	ErrRunnerDue     = &cli.ExitError{Code: 2, Msg: "the runner image is due to be rebuilt"}
+	ErrExpiredRunner = &cli.ExitError{Code: 3, Msg: "github is no longer queueing jobs to this runner"}
 )
 
 // fleetRunnerVersion reports the OLDEST runner any tier's image boots.

@@ -1470,8 +1470,8 @@ func planConfigEdit(cfgPath string, identity githubBlock) (configEdit, error) {
 			// from a command billet handed the operator.
 			remedy = fmt.Sprintf("\n\nThere is no document in it yet, so either generate a "+
 				"config with `billet init --config %s` or add the seed to it:\n  "+
-				"printf '\\n%%s\\n' %s >> %s", shellArg(cfgPath), shellArg(bootstrapSeed),
-				shellArg(cfgPath))
+				"printf '\\n%%s\\n' %s >> %s", cli.ShellArg(cfgPath), cli.ShellArg(bootstrapSeed),
+				cli.ShellArg(cfgPath))
 		}
 
 		return configEdit{}, fmt.Errorf("%s cannot take the App identity: %w%s\n\n"+
@@ -1702,7 +1702,7 @@ func missingConfigError(cfgPath string) error {
 		"`billet init --config %s`, or — if all you want is the identity — seed a file that "+
 		"holds nothing else:\n  (set -C; printf '%%s\\n' %s > %s)\n\n`set -C` is why that "+
 		"refuses an existing file rather than truncating it",
-		cfgPath, shellArg(cfgPath), shellArg(bootstrapSeed), shellArg(cfgPath))
+		cfgPath, cli.ShellArg(cfgPath), cli.ShellArg(bootstrapSeed), cli.ShellArg(cfgPath))
 }
 
 // sayConfigEdit states what this run will do to the operator's own file, before

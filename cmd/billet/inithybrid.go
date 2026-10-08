@@ -229,7 +229,7 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 				"generation is %q in %s: every id in that file names another deployment's "+
 				"resources, so either re-render with --name %s --region %s or point "+
 				"--terraform-output at this generation's own outputs",
-				f.Name, f.Region, *name, *region, shellArg(f.Name), shellArg(f.Region))
+				f.Name, f.Region, *name, *region, cli.ShellArg(f.Name), cli.ShellArg(f.Region))
 		}
 
 		facts = &f
@@ -596,11 +596,11 @@ func hybridNext(in hybridInputs, p initconfig.HybridParams, carried bool) string
 	tf := filepath.Join(in.out, "terraform")
 	outputs := filepath.Join(in.out, "outputs.json")
 	b.WriteString("Next: apply the Terraform root, save its outputs, and render the prepare phase:\n")
-	fmt.Fprintf(&b, "  terraform -chdir=%s init && terraform -chdir=%s apply\n", shellArg(tf), shellArg(tf))
-	fmt.Fprintf(&b, "  terraform -chdir=%s output -json > %s\n", shellArg(tf), shellArg(outputs))
+	fmt.Fprintf(&b, "  terraform -chdir=%s init && terraform -chdir=%s apply\n", cli.ShellArg(tf), cli.ShellArg(tf))
+	fmt.Fprintf(&b, "  terraform -chdir=%s output -json > %s\n", cli.ShellArg(tf), cli.ShellArg(outputs))
 	fmt.Fprintf(&b, "  billet init hybrid --out %s %s --terraform-output %s\n",
-		shellArg(in.out), shellArgs(hybridFlags(in)), shellArg(outputs))
-	fmt.Fprintf(&b, "%s has the whole order.", shellArg(filepath.Join(in.out, HybridRunbookFile)))
+		cli.ShellArg(in.out), cli.ShellArgs(hybridFlags(in)), cli.ShellArg(outputs))
+	fmt.Fprintf(&b, "%s has the whole order.", cli.ShellArg(filepath.Join(in.out, HybridRunbookFile)))
 
 	return b.String()
 }
@@ -621,7 +621,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	// the generation.
 	dir := "."
 	tf := "terraform"
-	flags := shellArgs(hybridFlags(in))
+	flags := cli.ShellArgs(hybridFlags(in))
 	// THE ADDRESS A GUEST DIALS, named here because the cache's certificate has
 	// to be valid for it and an operator reading the runbook needs the string
 	// rather than a description of it.
@@ -655,7 +655,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	} else {
 		b.WriteString("The App ids in the inventory are zero, and the role refuses a config that carries a zero `app_id` before anything reaches GitHub. Mint one into a file that holds nothing else, then generate again against it:\n\n")
 		fmt.Fprintf(&b, "```bash\n(set -C; printf '%%s\\n' %s > %s)\nbillet github-app create --org %s --config %s\nbillet init hybrid --out %s %s --config %s\n```\n\n",
-			shellArg(bootstrapSeed), bootstrapIdentity, orgFlag, bootstrapIdentity, shellArg(dir), flags, bootstrapIdentity)
+			cli.ShellArg(bootstrapSeed), bootstrapIdentity, orgFlag, bootstrapIdentity, cli.ShellArg(dir), flags, bootstrapIdentity)
 		b.WriteString("`set -C` is why the first command refuses an existing file rather than truncating it: after a successful run it is the only local record of the App id, installation id and key path.\n\n")
 	}
 
@@ -668,22 +668,22 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 	b.WriteString(". Read the plan: the ledger volume carries `prevent_destroy`, and `go run ./scripts/tfclassify` says what a later change costs a running deployment.\n\n")
 
 	b.WriteString("## 3. Render the prepare phase\n\n")
-	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json\n```\n\n", shellArg(dir), flags)
+	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json\n```\n\n", cli.ShellArg(dir), flags)
 	b.WriteString("Every `<terraform output …>` placeholder in `inventory.yml` is filled. The controller entry stays `billet_server_prepare_only: true` and server-only: its ec2 node's certificate does not exist yet.\n\n")
 
 	b.WriteString("## 4. Prepare the controller, with the App key\n\n")
 	if p.SSHKeyName != "" {
-		fmt.Fprintf(&b, "The controller launched with the %s key pair, so Ansible's ordinary SSH works as `ubuntu` once port 22 is reachable over the route you chose (docs/deploying/reaching-hosts.md).\n\n", shellArg(p.SSHKeyName))
+		fmt.Fprintf(&b, "The controller launched with the %s key pair, so Ansible's ordinary SSH works as `ubuntu` once port 22 is reachable over the route you chose (docs/deploying/reaching-hosts.md).\n\n", cli.ShellArg(p.SSHKeyName))
 	} else {
 		b.WriteString("The controller launched with NO key pair, so a fresh image carries no operator key. Push one for sixty seconds with EC2 Instance Connect before each converge, over the route you chose (docs/deploying/reaching-hosts.md); or generate again with `--key-name` for ordinary SSH:\n\n")
-		fmt.Fprintf(&b, "```bash\naws ec2-instance-connect send-ssh-public-key --region %s \\\n  --instance-id \"$(terraform -chdir=%s output -raw control_plane_instance_id)\" \\\n  --instance-os-user ubuntu --ssh-public-key file://~/.ssh/id_ed25519.pub\n```\n\n", shellArg(p.Region), tf)
+		fmt.Fprintf(&b, "```bash\naws ec2-instance-connect send-ssh-public-key --region %s \\\n  --instance-id \"$(terraform -chdir=%s output -raw control_plane_instance_id)\" \\\n  --instance-os-user ubuntu --ssh-public-key file://~/.ssh/id_ed25519.pub\n```\n\n", cli.ShellArg(p.Region), tf)
 	}
-	fmt.Fprintf(&b, "```bash\nansible-galaxy collection install -r requirements.yml\nBILLET_GITHUB_PRIVATE_KEY_PATH=<the key github-app create wrote> \\\n  ansible-playbook -i inventory.yml site.yml -l %s\n```\n\n", shellArg(p.ControllerName))
+	fmt.Fprintf(&b, "```bash\nansible-galaxy collection install -r requirements.yml\nBILLET_GITHUB_PRIVATE_KEY_PATH=<the key github-app create wrote> \\\n  ansible-playbook -i inventory.yml site.yml -l %s\n```\n\n", cli.ShellArg(p.ControllerName))
 	b.WriteString("The role demands the key because the config names it, and `billet_server_prepare_only` does not gate that refusal. Prepare-only mounts and proves the ledger volume, installs the binary and the units, and HOLDS both services, so nothing can mint a deployment identity yet.\n\n")
 
 	b.WriteString("## 5. Issue both certificates on the controller\n\n")
 	fmt.Fprintf(&b, "As the service user, so the identity and CA this mints on the ledger volume are owned by the account that will serve them:\n\n```bash\nsudo -u billet billet ca issue %s --config /etc/billet/billet.yaml --out /var/lib/billet/%s-tls\nsudo -u billet billet ca issue %s --config /etc/billet/billet.yaml --out /var/lib/billet/%s-tls\n```\n\n",
-		shellArg(p.ControllerName), shellArg(p.ControllerName), shellArg(p.LocalName), shellArg(p.LocalName))
+		cli.ShellArg(p.ControllerName), cli.ShellArg(p.ControllerName), cli.ShellArg(p.LocalName), cli.ShellArg(p.LocalName))
 	fmt.Fprintf(&b, "Install the controller's own bundle root-owned at `/etc/billet/tls` (`node.crt`, `ca.crt` 0644, `node.key` 0600): `billet-node.service` runs as root and rewrites the bundle at renewal. Stream the local host's bundle host-to-host to its `/etc/billet/tls`, so the key never lands on a laptop. Both configs name exactly these paths, and dial %s.\n\n", wire)
 
 	b.WriteString("## 6. Build the AMI\n\n")
@@ -725,10 +725,10 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 
 		b.WriteString(":\n\n")
 		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet %s \\\n  --security-group %s \\\n  --payload-bucket %s%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
-			shellArg(p.Region),
-			shellArg(p.Facts.SubnetID),
-			shellArg(p.Facts.RunnerSecurityGroupID),
-			shellArg(p.Facts.AMIPayloadBucket),
+			cli.ShellArg(p.Region),
+			cli.ShellArg(p.Facts.SubnetID),
+			cli.ShellArg(p.Facts.RunnerSecurityGroupID),
+			cli.ShellArg(p.Facts.AMIPayloadBucket),
 			caCert,
 			p.Region)
 	} else {
@@ -738,7 +738,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 			b.WriteString("From a workstation with your own AWS credentials: the node role carries no builder grant. Generate with `--builder` to move this onto the controller instead.\n\n")
 		}
 		fmt.Fprintf(&b, "```bash\nbillet ami build --region %s \\\n  --subnet \"$(terraform -chdir=%s output -raw subnet_id)\" \\\n  --security-group \"$(terraform -chdir=%s output -raw runner_security_group_id)\" \\\n  --payload-bucket \"$(terraform -chdir=%s output -raw ami_payload_bucket)\"%s \\\n  --public-ip --base-image ami-<an EBS-backed Ubuntu 24.04 image in %s>\n```\n\n",
-			shellArg(p.Region), tf, tf, tf, caCert, p.Region)
+			cli.ShellArg(p.Region), tf, tf, tf, caCert, p.Region)
 	}
 	b.WriteString("Pass `--public-ip`: the created subnet's only route is an internet gateway, which is unusable without an address. The command boots the image it made and stamps it only after it proved itself.\n\n")
 
@@ -751,7 +751,7 @@ func renderHybridRunbook(in hybridInputs, p initconfig.HybridParams, trusted, ca
 			cacheAddress)
 	}
 	fmt.Fprintf(&b, "```bash\nbillet init hybrid --out %s %s --terraform-output outputs.json --commission --ami ami-<from step 6>\nansible-playbook -i inventory.yml site.yml -l %s\nansible-playbook -i inventory.yml site.yml -l %s\n```\n\n",
-		shellArg(dir), flags, shellArg(p.ControllerName), shellArg(p.LocalName))
+		cli.ShellArg(dir), flags, cli.ShellArg(p.ControllerName), cli.ShellArg(p.LocalName))
 	b.WriteString("No key this time: the protected copy on the controller is enough. The commission render lifts the hold, adds the ec2 orchestrator beside the server, and writes the AMI into every tier's `launch.ec2.image`. The local host converges last, alone, once its bundle from step 5 is in place. Then `billet check --config /etc/billet/billet.yaml` on each.\n\n")
 
 	b.WriteString("## 8. Prove the fallback\n\n")
