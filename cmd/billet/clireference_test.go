@@ -683,14 +683,16 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 	return docs, mentions
 }
 
-// flagSpans are the flags written as their own backticked span, `--name` or
-// `--name VALUE`, never a flag inside a backticked command, which is that
-// command's.
+// flagSpans are the flags in every backticked span that begins with one
+// (`--name`, `--name VALUE --other`), never a flag inside a backticked
+// command, which is that command's.
 func flagSpans(text string) []string {
 	var out []string
 
-	for _, m := range regexp.MustCompile("`--([a-z][a-z0-9-]*)[^`]*`").FindAllStringSubmatch(text, -1) {
-		out = append(out, m[1])
+	for _, span := range regexp.MustCompile("`--[^`]*`").FindAllString(text, -1) {
+		for _, m := range regexp.MustCompile(`(?:^|[^a-z0-9-])--([a-z][a-z0-9-]*)`).FindAllStringSubmatch(span, -1) {
+			out = append(out, m[1])
+		}
 	}
 
 	return out
