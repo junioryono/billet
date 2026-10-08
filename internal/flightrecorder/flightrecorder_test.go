@@ -461,6 +461,37 @@ func TestStopReturnsAtItsBoundWhenTheRecorderWillNotStop(t *testing.T) {
 			t.Errorf("Stop had not returned %v after it began, its bound", time.Since(begun))
 		}
 
+		// AND A LATER STOP HAS A BOUND OF ITS OWN, with the runtime's Stop still
+		// held: it waits on the same shutdown, not forever.
+		var again atomic.Bool
+
+		go func() {
+			r.Stop()
+			again.Store(true)
+		}()
+
+		time.Sleep(r.stopWait - time.Nanosecond)
+		synctest.Wait()
+
+		if again.Load() {
+			t.Error("a later Stop returned before its bound")
+		}
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+
+		if !again.Load() {
+			t.Error("a later Stop had not returned at its bound")
+		}
+
+		w.mu.Lock()
+		entered := w.stops
+		w.mu.Unlock()
+
+		if entered != 1 {
+			t.Errorf("two Stops entered the runtime's Stop %d times, want once", entered)
+		}
+
 		// The bubble ends only when the shutdown worker has.
 		close(w.stopGate)
 	})
