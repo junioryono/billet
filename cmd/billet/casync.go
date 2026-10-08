@@ -31,7 +31,7 @@ import (
 // what is being set aside is a private key and an operator who chose the wrong
 // direction has to be able to put it back.
 func cmdCASync(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("ca sync", os.Stdout)
+	fs := cli.NewFlagSet("billet ca sync", os.Stdout)
 	cfgPath := fs.String("config", "", "path to billet.yaml")
 	push := fs.Bool("push", false,
 		"publish this host's authority to the identity store instead of adopting from it")

@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"flag"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // THE CLI REFERENCE SAYS WHAT THE BINARY TAKES, BOTH WAYS. docs/reference/cli.md
@@ -75,6 +82,53 @@ func TestTheCLIReferenceMatchesTheCommands(t *testing.T) {
 					t.Errorf("the reference names --%s for %s (line %d), which defines no such flag", flag, path, m.line)
 				}
 			}
+		}
+	}
+}
+
+// THE BINARY DISPATCHES EVERY DOCUMENTED COMMAND TO THAT COMMAND'S FLAG SET.
+// The test above reads names; this asks the command tree itself. `billet
+// <command> -h` must answer with that command's own usage and nothing else,
+// so a command registered under another name, or a subcommand dispatched to
+// another command's flag set, fails here; and every command commands()
+// registers must be one the reference documents.
+func TestEveryDocumentedCommandDispatchesToItsFlagSet(t *testing.T) {
+	docs, _ := documentedCommands(t)
+
+	for _, c := range commands(cli.NewLifecycle(func() {}, io.Discard)) {
+		found := false
+
+		for path := range docs {
+			found = found || path == "billet "+c.Name || strings.HasPrefix(path, "billet "+c.Name+" ")
+		}
+
+		if !found {
+			t.Errorf("commands() registers %q, which the reference does not document", c.Name)
+		}
+	}
+
+	for _, path := range sortedKeys(docs) {
+		args := slices.Concat(strings.Fields(path)[1:], []string{"-h"})
+
+		var (
+			stderr bytes.Buffer
+			err    error
+		)
+
+		out := capture(t, func() {
+			err = cli.Run(args, cli.Env{Stdout: os.Stdout, Stderr: &stderr, Stdin: strings.NewReader(""),
+				Getenv: func(string) string { return "" }}, commands, func(int) {})
+		})
+
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("%s -h answered %v, not a request for help (stderr: %q)", path, err, stderr.String())
+
+			continue
+		}
+
+		if usage := regexp.MustCompile(`Usage of ([^:]*):`).FindAllStringSubmatch(out, -1); len(usage) != 1 ||
+			usage[0][1] != path {
+			t.Errorf("%s -h printed the usage of %v, want %q's alone", path, usage, path)
 		}
 	}
 }
@@ -167,18 +221,50 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 		}
 	}
 
+	// methodValues reports a flag set's method taken as a value (define :=
+	// fs.Bool), through which a flag could be defined unseen.
+	methodValues := func(body ast.Node, set string) {
+		called := map[ast.Node]bool{}
+
+		ast.Inspect(body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				called[ast.Unparen(call.Fun)] = true
+			}
+
+			return true
+		})
+
+		ast.Inspect(body, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && !called[sel] {
+				if id, ok := ast.Unparen(sel.X).(*ast.Ident); ok && id.Name == set {
+					t.Errorf("%s.%s is taken as a value, so a flag defined through it cannot be "+
+						"attributed to its command", set, sel.Sel.Name)
+				}
+			}
+
+			return true
+		})
+	}
+
 	var flagsOn func(body ast.Node, set string, via map[string]bool) []string
 
 	flagsOn = func(body ast.Node, set string, via map[string]bool) []string {
 		var out []string
 
 		ast.Inspect(body, func(n ast.Node) bool {
-			if assign, ok := n.(*ast.AssignStmt); ok {
-				for _, rhs := range assign.Rhs {
-					if id, ok := ast.Unparen(rhs).(*ast.Ident); ok && id.Name == set {
-						t.Errorf("the flag set %s is copied into another variable, so the flags defined "+
-							"through it cannot be attributed to its command", set)
-					}
+			var values []ast.Expr
+
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				values = x.Rhs
+			case *ast.ValueSpec:
+				values = x.Values
+			}
+
+			for _, value := range values {
+				if id, ok := ast.Unparen(value).(*ast.Ident); ok && id.Name == set {
+					t.Errorf("the flag set %s is copied into another variable, so the flags defined "+
+						"through it cannot be attributed to its command", set)
 				}
 			}
 
@@ -255,6 +341,8 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 				}
 
 				read++
+
+				methodValues(fn.Body, set.Name)
 
 				flags := map[string]bool{}
 				for _, name := range flagsOn(fn.Body, set.Name, map[string]bool{}) {
@@ -335,7 +423,7 @@ func flagSetNames(t *testing.T, fn *ast.FuncDecl, expr ast.Expr) []string {
 
 			if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name == x.Name {
 				lit, ok := assign.Rhs[0].(*ast.BasicLit)
-				if !ok {
+				if !ok || (assign.Tok != token.DEFINE && assign.Tok != token.ASSIGN) {
 					other = true
 
 					return true
@@ -407,7 +495,7 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 	)
 
 	// mentioned records every backticked command in text the switch below did
-	// not read as a declaration.
+	// not read as a declaration, with the flags in its own span.
 	mentioned := func(n int, text string) {
 		for _, m := range referenceCommand.FindAllStringSubmatch(text, -1) {
 			var flags []string
@@ -417,6 +505,24 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 
 			mentions = append(mentions, mention{line: n, paths: commandPaths(m[1]), flags: flags})
 		}
+	}
+
+	// spans splits a command cell at each backticked command: each piece is
+	// one command and the flag spans written after it, up to the next.
+	spans := func(cell string) []string {
+		var out []string
+
+		at := referenceCommand.FindAllStringIndex(cell, -1)
+		for i, m := range at {
+			end := len(cell)
+			if i+1 < len(at) {
+				end = at[i+1][0]
+			}
+
+			out = append(out, cell[m[0]:end])
+		}
+
+		return out
 	}
 
 	n := 0
@@ -461,12 +567,27 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 				continue
 			}
 
-			// The cell's other spans are this command's flags, except a further
-			// `billet ...`, which is another command and checked as one.
-			rest := cells[0][m[1]:]
-			others := strings.Join(referenceCommand.FindAllString(rest, -1), " ")
-			add(commandPaths(cells[0][m[2]:m[3]]), cells[0][:m[1]]+referenceCommand.ReplaceAllString(rest, ""))
-			mentioned(n, others+" | "+strings.Join(cells[1:], " | "))
+			// EACH COMMAND IN THE CELL OWNS THE FLAG SPANS WRITTEN AFTER IT, up to
+			// the next: the first is declared, a further one is checked as a
+			// mention with its flags.
+			for i, piece := range spans(cells[0]) {
+				own := referenceCommand.FindStringSubmatch(piece)
+
+				if i == 0 {
+					add(commandPaths(own[1]), piece)
+
+					continue
+				}
+
+				var flags []string
+				for _, f := range referenceFlag.FindAllStringSubmatch(piece, -1) {
+					flags = append(flags, f[1])
+				}
+
+				mentions = append(mentions, mention{line: n, paths: commandPaths(own[1]), flags: flags})
+			}
+
+			mentioned(n, strings.Join(cells[1:], " | "))
 		case len(cells) > 0 && strings.HasPrefix(cells[0], "`-"):
 			if heading == nil {
 				t.Errorf("the reference's flag row on line %d is under no command's heading", n)
@@ -499,8 +620,8 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 				}
 			}
 
-			add(paths, cells[0])
-			mentioned(n, strings.Join(cells[1:], " | "))
+			add(paths, referenceCommand.ReplaceAllString(cells[0], ""))
+			mentioned(n, strings.Join(cells, " | "))
 		default:
 			mentioned(n, line)
 		}
