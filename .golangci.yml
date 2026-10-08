@@ -355,7 +355,9 @@ linters:
             - "$all"
             - "!**/cmd/billet/**"
           deny:
-            - pkg: "github.com/junioryono/billet/internal/ops"
+            - pkg: "github.com/junioryono/billet/internal/ops$"
+              desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
+            - pkg: "github.com/junioryono/billet/internal/ops/"
               desc: "internal/ops/<family> is an operator command family; only cmd/billet dispatches to one (#356 Phase 4)."
 
         # THE NODE RUNTIME DIRECTLY IMPORTS NEITHER THE SCHEDULER, THE LEDGER NOR THE
