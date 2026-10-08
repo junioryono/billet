@@ -3927,8 +3927,16 @@ func (c *Config) validateMetrics() []error {
 	for i, end := range ends {
 		m := metricsOf(end.key)
 		// AS WRITTEN, NOT TRIMMED: the bind uses this string, and a padded
-		// address that validated here would fail at startup instead.
+		// address that validated here would fail at startup instead, whether or
+		// not allow_remote waves the loopback rule aside.
 		addr := m.Listen
+
+		if addr != strings.TrimSpace(addr) {
+			errs = append(errs, fmt.Errorf("%s.listen %q has whitespace around it, which the bind "+
+				"would not accept; write the address alone", end.key, addr))
+
+			continue
+		}
 
 		if err := validateHostPort(end.key+".listen", addr); err != nil {
 			errs = append(errs, err)
@@ -4067,7 +4075,16 @@ func socketOf(addr string) (string, int, bool) {
 	}
 
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return ip.Unmap().String(), n, true
+		ip = ip.Unmap()
+
+		// A ZONE NAMES A LINK, which a loopback or an unspecified address has no
+		// use for: [::1%0] binds the socket [::1] does. A link-local address
+		// keeps its zone, because there it names which link.
+		if ip.WithZone("").IsLoopback() || ip.WithZone("").IsUnspecified() {
+			ip = ip.WithZone("")
+		}
+
+		return ip.String(), n, true
 	}
 
 	return strings.ToLower(host), n, true
@@ -4082,7 +4099,7 @@ func isWildcardHost(host string) bool {
 
 	ip, err := netip.ParseAddr(host)
 
-	return err == nil && ip.IsUnspecified()
+	return err == nil && ip.WithZone("").IsUnspecified()
 }
 
 func (c *Config) validateNode() []error {

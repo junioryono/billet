@@ -166,10 +166,11 @@ func TestCloseStopsServing(t *testing.T) {
 func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 	t.Parallel()
 
-	entered, release := make(chan struct{}), make(chan struct{})
-	t.Cleanup(func() { close(release) })
+	entered, release, handled := make(chan struct{}), make(chan struct{}), make(chan struct{})
 
 	srv, err := Listen(t.Context(), "127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		defer close(handled)
+
 		close(entered)
 		<-release
 	}))
@@ -177,10 +178,19 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The handler is released and joined whatever the test concluded.
+	t.Cleanup(func() {
+		close(release)
+		<-handled
+	})
+
+	bound, cancelBound := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+	defer cancelBound()
+
 	answered := make(chan error, 1)
 
 	go func() {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
+		req, err := http.NewRequestWithContext(bound, http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
 		if err != nil {
 			answered <- err
 
@@ -195,16 +205,42 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 		answered <- err
 	}()
 
-	<-entered
+	select {
+	case <-entered:
+	case err := <-answered:
+		t.Fatalf("the scrape ended (%v) before its handler began", err)
+	case <-bound.Done():
+		t.Fatal("the scrape never reached its handler")
+	}
 
 	expired, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := srv.Close(expired); !errors.Is(err, context.Canceled) {
-		t.Errorf("Close past its context returned %v, want the context's error", err)
+	closed := make(chan error, 1)
+
+	go func() { closed <- srv.Close(expired) }()
+
+	select {
+	case err := <-closed:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Close past its context returned %v, want the context's error", err)
+		}
+	case <-bound.Done():
+		t.Fatal("Close did not return while a scrape held its connection")
 	}
 
-	if err := <-answered; err == nil {
-		t.Error("the scrape in flight was answered, not cut off")
+	// THE REQUEST'S OWN BOUND IS LONGER THAN THIS WAIT CAN TAKE, so an answer
+	// here is the forced close, not the client giving up.
+	select {
+	case err := <-answered:
+		if err == nil {
+			t.Error("the scrape in flight was answered, not cut off")
+		}
+
+		if bound.Err() != nil {
+			t.Error("the scrape ended only when its own bound did, not when Close cut it off")
+		}
+	case <-bound.Done():
+		t.Fatal("the scrape in flight was never cut off")
 	}
 }

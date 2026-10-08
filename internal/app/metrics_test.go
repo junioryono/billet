@@ -2,16 +2,22 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/metrics"
 )
+
+// metricsTestWait bounds every wait these tests make, so a regression fails
+// rather than hangs.
+const metricsTestWait = 10 * time.Second
 
 // NO BLOCK, NOTHING SERVED, and closing that nothing is safe.
 func TestNoMetricsBlockServesNothing(t *testing.T) {
@@ -40,7 +46,10 @@ func TestAMetricsBlockServesTheRole(t *testing.T) {
 
 	url := "http://" + m.srv.Addr().String() + "/metrics"
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +72,7 @@ func TestAMetricsBlockServesTheRole(t *testing.T) {
 
 	m.Close(t.Context())
 
-	req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,14 +84,54 @@ func TestAMetricsBlockServesTheRole(t *testing.T) {
 	}
 }
 
-// A STOPPING PROCESS'S CONTEXT IS USUALLY DONE ALREADY, and a scrape in flight
-// still gets Close's own bounded window rather than being cut off by it.
-func TestCloseGivesAScrapeInFlightItsOwnWindow(t *testing.T) {
+// CLOSE WAITS ON A CONTEXT OF ITS OWN: a stopping process's context is usually
+// done already, and the endpoint is handed a live one bounded at
+// metricsCloseWait instead.
+func TestCloseHandsTheEndpointALiveBoundedContext(t *testing.T) {
 	t.Parallel()
 
-	entered, release := make(chan struct{}), make(chan struct{})
+	var (
+		called   bool
+		deadline time.Time
+		live     error
+	)
+
+	m := &Metrics{stop: func(ctx context.Context) error {
+		called = true
+		deadline, _ = ctx.Deadline()
+		live = ctx.Err()
+
+		return nil
+	}}
+
+	stopping, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	before := time.Now()
+	m.Close(stopping)
+
+	if !called {
+		t.Fatal("Close did not stop the endpoint")
+	}
+
+	if live != nil {
+		t.Errorf("Close handed the endpoint a context already done (%v): the parent's cancellation reached it", live)
+	}
+
+	if deadline.IsZero() || deadline.Before(before) || deadline.After(before.Add(metricsCloseWait+time.Second)) {
+		t.Errorf("Close's context has deadline %v, want about %v after %v", deadline, metricsCloseWait, before)
+	}
+}
+
+// AND THE WINDOW IS USED: a scrape in flight when Close begins is answered.
+func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
+	t.Parallel()
+
+	entered, release, handled := make(chan struct{}), make(chan struct{}), make(chan struct{})
 
 	srv, err := metrics.Listen(t.Context(), "127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		defer close(handled)
+
 		close(entered)
 		<-release
 		w.WriteHeader(http.StatusNoContent)
@@ -91,21 +140,23 @@ func TestCloseGivesAScrapeInFlightItsOwnWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := &Metrics{srv: srv}
+	m := &Metrics{srv: srv, stop: srv.Close}
 	answered := make(chan int, 1)
 
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), metricsTestWait)
+	defer cancel()
+
 	go func() {
-		req, err := http.NewRequestWithContext(context.WithoutCancel(t.Context()), http.MethodGet,
-			"http://"+srv.Addr().String()+"/", http.NoBody)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
 		if err != nil {
-			answered <- 0
+			answered <- -1
 
 			return
 		}
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			answered <- 0
+			answered <- -1
 
 			return
 		}
@@ -114,37 +165,70 @@ func TestCloseGivesAScrapeInFlightItsOwnWindow(t *testing.T) {
 		answered <- resp.StatusCode
 	}()
 
-	<-entered
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
 
-	stopping, cancel := context.WithCancel(t.Context())
-	cancel()
+	t.Cleanup(func() {
+		releaseOnce()
+		<-handled
+	})
+
+	select {
+	case <-entered:
+	case code := <-answered:
+		t.Fatalf("the scrape ended (%d) before its handler began", code)
+	case <-ctx.Done():
+		t.Fatal("the scrape never reached its handler")
+	}
+
+	stopping, stop := context.WithCancel(t.Context())
+	stop()
 
 	closed := make(chan struct{})
 
 	go func() {
+		defer close(closed)
 		m.Close(stopping)
-		close(closed)
 	}()
 
 	// THE SCRAPE FINISHES AFTER CLOSE HAS BEGUN, which is when the listener
-	// stops accepting: only a window of Close's own lets it finish.
-	for {
+	// refuses new connections.
+	for refused := false; !refused; {
 		var d net.Dialer
 
-		conn, err := d.DialContext(t.Context(), "tcp", srv.Addr().String())
-		if err != nil {
-			break
+		conn, err := d.DialContext(ctx, "tcp", srv.Addr().String())
+
+		switch {
+		case err == nil:
+			conn.Close()
+		case errors.Is(err, syscall.ECONNREFUSED):
+			refused = true
+		case ctx.Err() != nil:
+			t.Fatal("the listener never closed")
+		default:
+			t.Fatalf("dialling the endpoint failed for another reason: %v", err)
 		}
-
-		conn.Close()
-		time.Sleep(5 * time.Millisecond)
 	}
 
-	close(release)
+	releaseOnce()
 
-	if code := <-answered; code != http.StatusNoContent {
-		t.Errorf("the scrape in flight answered %d, want 204: Close cut it off", code)
+	select {
+	case code := <-answered:
+		if code != http.StatusNoContent {
+			t.Errorf("the scrape in flight answered %d, want 204: Close cut it off", code)
+		}
+	case <-ctx.Done():
+		t.Fatal("the scrape in flight was never answered")
 	}
 
-	<-closed
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("Close did not return")
+	}
 }

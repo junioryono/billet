@@ -18,6 +18,8 @@ const metricsCloseWait = 5 * time.Second
 // nothing.
 type Metrics struct {
 	srv *metrics.Server
+	// stop is srv.Close, a field so a test can see the context Close hands it.
+	stop func(context.Context) error
 }
 
 // ServeMetrics starts role's metrics endpoint when the configuration has one,
@@ -43,7 +45,7 @@ func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig) (*M
 
 	slog.Default().Info("serving metrics", "role", role, "address", srv.Addr().String(), "pprof", m.Pprof)
 
-	return &Metrics{srv: srv}, nil
+	return &Metrics{srv: srv, stop: srv.Close}, nil
 }
 
 // Close stops the endpoint, waiting briefly for scrapes in flight. It is
@@ -57,7 +59,7 @@ func (m *Metrics) Close(ctx context.Context) {
 	wait, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsCloseWait)
 	defer cancel()
 
-	if err := m.srv.Close(wait); err != nil {
+	if err := m.stop(wait); err != nil {
 		slog.Default().Warn("could not stop the metrics endpoint cleanly", "error", err)
 	}
 }

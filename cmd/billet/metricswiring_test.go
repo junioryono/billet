@@ -42,12 +42,12 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 						return true
 					}
 
-					if isServeMetrics(call, c.role, c.block) {
+					if isAppCall(call, "ServeMetrics") {
 						serves++
+					}
 
-						if serve < 0 {
-							serve = i
-						}
+					if isServeMetrics(call, c.role, c.block) && serve < 0 {
+						serve = i
 					}
 
 					if calleeName(call) == c.before && after < 0 {
@@ -72,7 +72,7 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 			}
 
 			if serves != 1 {
-				t.Errorf("%s calls app.ServeMetrics %d times, want once", c.fn, serves)
+				t.Errorf("%s calls app.ServeMetrics %d times, with any arguments, want once", c.fn, serves)
 			}
 
 			// AND WHAT IT STARTED IS CHECKED AND CLOSED: an error stops the
@@ -131,8 +131,10 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 		return false
 	}
 
+	// NO INIT, so the err tested is the one the call returned and not one
+	// declared in the if statement itself.
 	ifs, ok := check.(*ast.IfStmt)
-	if !ok || len(ifs.Body.List) != 1 {
+	if !ok || ifs.Init != nil || ifs.Else != nil || len(ifs.Body.List) != 1 {
 		return false
 	}
 
@@ -142,6 +144,10 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 	}
 
 	if x, ok := cond.X.(*ast.Ident); !ok || x.Name != "err" {
+		return false
+	}
+
+	if y, ok := cond.Y.(*ast.Ident); !ok || y.Name != "nil" {
 		return false
 	}
 
@@ -160,11 +166,27 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 	}
 
 	sel, ok := def.Call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Close" {
+	if !ok || sel.Sel.Name != "Close" || len(def.Call.Args) != 1 {
+		return false
+	}
+
+	if arg, ok := def.Call.Args[0].(*ast.Ident); !ok || arg.Name != "ctx" {
 		return false
 	}
 
 	recv, ok := sel.X.(*ast.Ident)
 
 	return ok && recv.Name == served.Name
+}
+
+// isAppCall recognises app.<name>(...), whatever its arguments.
+func isAppCall(call *ast.CallExpr, name string) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
+		return false
+	}
+
+	pkg, ok := sel.X.(*ast.Ident)
+
+	return ok && pkg.Name == "app"
 }
