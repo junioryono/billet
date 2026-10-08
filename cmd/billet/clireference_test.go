@@ -91,7 +91,10 @@ func TestTheCLIReferenceMatchesTheCommands(t *testing.T) {
 // <command> -h` must answer with that command's own usage and nothing else,
 // so a command registered under another name, or a subcommand dispatched to
 // another command's flag set, fails here; and every command commands()
-// registers must be one the reference documents.
+// registers must be one the reference documents. The usage lists the flags the
+// command REGISTERED, however it registered them, so they are held to the
+// reference here too: the static reading above cannot see a flag registered
+// on one branch of a shared handler or through a helper's method value.
 func TestEveryDocumentedCommandDispatchesToItsFlagSet(t *testing.T) {
 	docs, _ := documentedCommands(t)
 
@@ -125,8 +128,38 @@ func TestEveryDocumentedCommandDispatchesToItsFlagSet(t *testing.T) {
 		if usage := regexp.MustCompile(`Usage of ([^:]*):`).FindAllStringSubmatch(out, -1); len(usage) != 1 ||
 			usage[0][1] != path {
 			t.Errorf("%s -h printed the usage of %v, want %q's alone", path, usage, path)
+
+			continue
+		}
+
+		registered := map[string]bool{}
+		for _, m := range usageFlag.FindAllStringSubmatch(out, -1) {
+			registered[m[1]] = true
+		}
+
+		for _, f := range sortedKeys(registered) {
+			if f != "config" && !docs[path][f] {
+				t.Errorf("%s registers -%s, which the reference does not document for it", path, f)
+			}
+		}
+
+		for _, f := range sortedKeys(docs[path]) {
+			if !registered[f] {
+				t.Errorf("the reference documents --%s for %s, which does not register it", f, path)
+			}
 		}
 	}
+}
+
+// usageFlag is a flag line of flag.PrintDefaults: two spaces, a dash, a name.
+var usageFlag = regexp.MustCompile(`(?m)^ {2}-([a-z0-9][a-z0-9-]*)`)
+
+// described is the backticked flags a row's description names, held to the
+// commands the row is about.
+type described struct {
+	line  int
+	paths []string
+	flags []string
 }
 
 // mention is a backticked command in the reference's prose.
@@ -484,10 +517,11 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 	}
 
 	var (
-		heading  []string
-		applies  bool
-		mentions []mention
-		fenced   bool
+		heading      []string
+		applies      bool
+		mentions     []mention
+		descriptions []described
+		fenced       bool
 	)
 
 	// mentioned records every backticked command in text the switch below did
@@ -571,6 +605,8 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 
 				if i == 0 {
 					add(commandPaths(own[1]), piece)
+					descriptions = append(descriptions, described{line: n, paths: commandPaths(own[1]),
+						flags: flagSpans(strings.Join(cells[1:], " | "))})
 
 					continue
 				}
@@ -618,12 +654,44 @@ func documentedCommands(t *testing.T) (map[string]map[string]bool, []mention) {
 
 			add(paths, referenceCommand.ReplaceAllString(cells[0], ""))
 			mentioned(n, strings.Join(cells, " | "))
+			descriptions = append(descriptions, described{line: n, paths: paths,
+				flags: flagSpans(referenceCommand.ReplaceAllString(strings.Join(cells[1:], " | "), ""))})
 		default:
 			mentioned(n, line)
 		}
 	}
 
+	// A FLAG A ROW'S DESCRIPTION NAMES IS ONE ITS COMMAND DOCUMENTS, so a
+	// description cannot tell an operator to pass a flag the command lacks.
+	for _, d := range descriptions {
+		for _, f := range d.flags {
+			found := f == "config" || f == "h"
+			for _, path := range d.paths {
+				found = found || docs[path][f]
+			}
+
+			if !found {
+				t.Errorf("the reference's row on line %d describes --%s, which %v does not document", d.line, f, d.paths)
+			}
+		}
+	}
+
 	return docs, mentions
+}
+
+// flagSpans are the flags in every backticked span that begins with one
+// (`--name`, `--name VALUE --other`), never a flag inside a backticked
+// command, which is that command's.
+func flagSpans(text string) []string {
+	var out []string
+
+	for _, span := range regexp.MustCompile("`--[^`]*`").FindAllString(text, -1) {
+		for _, m := range regexp.MustCompile(`(?:^|[^a-z0-9-])--([a-z][a-z0-9-]*)`).FindAllStringSubmatch(span, -1) {
+			out = append(out, m[1])
+		}
+	}
+
+	return out
 }
 
 // tableCells splits a table row on its unescaped pipes; an escaped one (\|)
