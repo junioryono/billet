@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -178,25 +179,67 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var started, stopped bool
+	// THE ENDPOINT IS CLOSED ONCE, by whichever of the test and the cleanup
+	// gets there first: Close consumes the serving result, so a second call
+	// would wait forever.
+	started := false
+
+	// The close runs once, in its own goroutine, with the context the caller
+	// gave it, and every caller waits for it against a bound of the test's own,
+	// never that context: a close that never finished would otherwise hold the
+	// cleanup inside the Once forever.
+	var (
+		stopOnce sync.Once
+		stopErr  error
+	)
+
+	stopDone := make(chan struct{})
+
+	stopEndpoint := func(ctx context.Context) error {
+		stopOnce.Do(func() {
+			go func() {
+				defer close(stopDone)
+
+				stopErr = srv.Close(ctx)
+			}()
+		})
+
+		wait := time.NewTimer(10 * time.Second)
+		defer wait.Stop()
+
+		select {
+		case <-stopDone:
+			return stopErr
+		case <-wait.C:
+			return errors.New("the endpoint's close never finished")
+		}
+	}
+
+	clientDone := make(chan struct{})
 
 	// ONE OWNER FOR WHAT THE TEST STARTED, whatever it concluded: the handler
-	// is released, the endpoint closed if the test did not get that far, and a
-	// handler that began is joined, each wait bounded.
+	// is released, the endpoint closed (or its close joined), and the handler
+	// and the client joined, each wait bounded.
 	t.Cleanup(func() {
 		close(release)
 
-		if !stopped {
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
-			defer cancel()
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer cancel()
 
-			_ = srv.Close(ctx)
+		if err := stopEndpoint(ctx); err != nil {
+			t.Logf("the endpoint closed with %v", err)
+		}
+
+		select {
+		case <-clientDone:
+		case <-ctx.Done():
+			t.Error("the client never returned")
 		}
 
 		if started {
 			select {
 			case <-handled:
-			case <-time.After(10 * time.Second):
+			case <-ctx.Done():
 				t.Error("the handler never returned")
 			}
 		}
@@ -208,6 +251,8 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 	answered := make(chan error, 1)
 
 	go func() {
+		defer close(clientDone)
+
 		req, err := http.NewRequestWithContext(bound, http.MethodGet, "http://"+srv.Addr().String()+"/", http.NoBody)
 		if err != nil {
 			answered <- err
@@ -236,9 +281,8 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 	cancel()
 
 	closed := make(chan error, 1)
-	stopped = true
 
-	go func() { closed <- srv.Close(expired) }()
+	go func() { closed <- stopEndpoint(expired) }()
 
 	select {
 	case err := <-closed:

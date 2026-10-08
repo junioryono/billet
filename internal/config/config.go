@@ -4078,13 +4078,14 @@ func socketOf(addr string) (string, int, bool) {
 		ip = ip.Unmap()
 
 		// A ZONE NAMES A LINK, which a loopback or an unspecified address has no
-		// use for: [::1%0] binds the socket [::1] does. A link-local address
-		// keeps its zone, because there it names which link, compared as the
-		// interface index the bind resolves it to.
+		// use for: [::1%0] binds the socket [::1] does. Any other zone is kept
+		// AS WRITTEN and never resolved: which interface a zone names, and
+		// whether the kernel uses it at all, is the bind's to decide, and a
+		// resolution here that merged two sockets would refuse a configuration
+		// that works. So this check refuses only what is provably one socket;
+		// one it cannot prove, the bind refuses at startup, naming the address.
 		if ip.WithZone("").IsLoopback() || ip.WithZone("").IsUnspecified() {
 			ip = ip.WithZone("")
-		} else if zone := ip.Zone(); zone != "" {
-			ip = ip.WithZone(zoneIndex(zone))
 		}
 
 		return ip.String(), n, true
@@ -4093,24 +4094,14 @@ func socketOf(addr string) (string, int, bool) {
 	return strings.ToLower(host), n, true
 }
 
-// zoneIndex is the scope a zone names, as the bind resolves it: a number is an
-// interface index, so %2 and %02 are one; a name is the index of the interface
-// this host has by that name, or the name itself when it has none, so an
-// unknown name is compared as written.
-func zoneIndex(zone string) string {
-	if n, err := strconv.ParseUint(zone, 10, 32); err == nil {
-		return strconv.FormatUint(n, 10)
-	}
-
-	if iface, err := net.InterfaceByName(zone); err == nil {
-		return strconv.Itoa(iface.Index)
-	}
-
-	return zone
-}
-
 // isWildcardHost reports whether a canonical listen host accepts on every
 // interface: an empty host, or an unspecified address however it was written.
+//
+// AN IPv6 WILDCARD COVERS IPv4 TOO, the one place this check goes past what it
+// can prove: Go listens on [::] dual-stack by default, so it takes the IPv4
+// addresses on its port, and a configuration that also named one would fail at
+// startup on the hosts billet runs on. A host that refuses dual-stack would bind
+// both, and is refused anyway.
 func isWildcardHost(host string) bool {
 	if host == "" {
 		return true
