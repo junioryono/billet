@@ -118,17 +118,18 @@ FUZZTIME ?= 1m
 
 .PHONY: fuzz
 fuzz: ## Search past every fuzz target's seeds for FUZZTIME each; `test` already runs the seeds
-	@# ONE TARGET A RUN, because `go test -fuzz` takes exactly one. Every Fuzz
-	@# function lives in a fuzz_test.go, and the nightly workflow lists the same
-	@# set (TestEveryFuzzTargetIsSearchedNightly). A finding is written under
-	@# the package's testdata/fuzz/, and committed beside its fix it becomes a seed.
+	@# THE NIGHTLY WORKFLOW'S LIST, which TestEveryFuzzTargetIsSearchedNightly
+	@# holds equal to the Fuzz functions in the tree, so there is one list. ONE
+	@# TARGET A RUN, because `go test -fuzz` takes exactly one. The list is read
+	@# into a variable first, so a failed read stops here rather than iterating
+	@# over nothing; an empty list is refused. A finding is written under the
+	@# package's testdata/fuzz/, and committed beside its fix it becomes a seed.
 	@set -eu; \
-	for file in $$(find . -name fuzz_test.go -not -path './tools/*' | sort); do \
-		pkg=$$(dirname "$$file"); \
-		for fn in $$(sed -n 's/^func \(Fuzz[A-Za-z0-9_]*\)(f \*testing\.F) {$$/\1/p' "$$file"); do \
-			echo "== $$pkg $$fn"; \
-			$(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME); \
-		done; \
+	targets=$$(sed -n 's/^ *- { package: \(\.\/[^,]*\), fuzz: \(Fuzz[A-Za-z0-9_]*\) }$$/\1 \2/p' .github/workflows/fuzz.yml); \
+	if [ -z "$$targets" ]; then echo "fuzz: .github/workflows/fuzz.yml lists no targets" >&2; exit 1; fi; \
+	printf '%s\n' "$$targets" | while read -r pkg fn; do \
+		echo "== $$pkg $$fn"; \
+		$(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) || exit 1; \
 	done
 
 .PHONY: no-mutants

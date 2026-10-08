@@ -1,6 +1,9 @@
 package scripts_test
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -10,20 +13,20 @@ import (
 	"testing"
 )
 
-var (
-	fuzzFunc  = regexp.MustCompile(`(?m)^func (Fuzz\w+)\(f \*testing\.F\) \{$`)
-	fuzzEntry = regexp.MustCompile(`(?m)^\s+- \{ package: (\./\S+), fuzz: (Fuzz\w+) \}$`)
-)
+var fuzzEntry = regexp.MustCompile(`(?m)^\s+- \{ package: (\./\S+), fuzz: (Fuzz\w+) \}$`)
 
 // EVERY FUZZ TARGET IS SEARCHED NIGHTLY, AND NOTHING ELSE IS. The seeds of a
 // Fuzz function run with every `go test`, but the search past them runs only
-// for the targets .github/workflows/fuzz.yml lists, so a target added without a
-// row there is one nobody ever fuzzes. And each lives in a file named
-// fuzz_test.go, which is where `make fuzz` looks for them.
+// for the targets .github/workflows/fuzz.yml lists, which is also the list
+// `make fuzz` reads, so a target added without a row there is one nobody ever
+// fuzzes. Found by parsing every test file of this module, whatever the
+// testing.F parameter is called.
 func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	t.Parallel()
 
-	root := ".."
+	const root = ".."
+
+	fset := token.NewFileSet()
 
 	var found []string
 
@@ -33,9 +36,17 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 		}
 
 		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "tools", "node_modules", "_venv", "testdata":
-				return filepath.SkipDir
+			// ANOTHER MODULE'S TESTS ARE ITS OWN, and Go never reads testdata
+			// or a hidden or underscored directory as a package.
+			if path != root {
+				name := d.Name()
+				if name == "testdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+					return filepath.SkipDir
+				}
+
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return filepath.SkipDir
+				}
 			}
 
 			return nil
@@ -45,14 +56,15 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 			return nil
 		}
 
-		data, err := os.ReadFile(path)
+		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			return err
 		}
 
-		for _, m := range fuzzFunc.FindAllSubmatch(data, -1) {
-			if filepath.Base(path) != "fuzz_test.go" {
-				t.Errorf("%s declares %s outside a fuzz_test.go, where `make fuzz` does not look", path, m[1])
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn) {
+				continue
 			}
 
 			rel, err := filepath.Rel(root, filepath.Dir(path))
@@ -60,7 +72,7 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 				return err
 			}
 
-			found = append(found, "./"+filepath.ToSlash(rel)+" "+string(m[1]))
+			found = append(found, "./"+filepath.ToSlash(rel)+" "+fn.Name.Name)
 		}
 
 		return nil
@@ -91,4 +103,26 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 		t.Errorf("the fuzz targets in the tree and the nightly workflow's matrix differ:\ntree:     %q\nworkflow: %q",
 			found, listed)
 	}
+}
+
+// takesTestingF reports whether fn's one parameter is a *testing.F.
+func takesTestingF(fn *ast.FuncDecl) bool {
+	params := fn.Type.Params.List
+	if len(params) != 1 || len(params[0].Names) > 1 {
+		return false
+	}
+
+	star, ok := params[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+
+	sel, ok := star.X.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "F" {
+		return false
+	}
+
+	pkg, ok := sel.X.(*ast.Ident)
+
+	return ok && pkg.Name == "testing"
 }

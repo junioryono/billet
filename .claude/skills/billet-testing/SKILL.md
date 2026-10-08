@@ -41,7 +41,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Real and live tests skip without their resource and never spend money by accident.**
 - **PostgreSQL is tested against a real server or not at all.**
 - **Coverage is a signal, not a goal.**
-- **A fuzz target states a property, seeds from what billet really reads, lives in a fuzz_test.go, and is searched nightly.**
+- **A fuzz target states a property a broken parser would violate, seeds from what billet really reads, and is searched nightly.**
 - **The host rehearsals run the real commands on packaged hosts under real systemd, and each needs a real App.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).

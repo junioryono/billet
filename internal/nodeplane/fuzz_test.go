@@ -48,11 +48,15 @@ func strictly(ctx context.Context, body []byte, into any, limit int64) bool {
 	return decodeLimited(httptest.NewRecorder(), req, into, limit)
 }
 
-// WHAT THE PLANE ACCEPTS, IT CAN SAY AGAIN. Any body a route's strict decoder
-// accepts is a value whose encoding the same decoder accepts, and encoding that
-// second value gives the same bytes: no input decodes to a value the wire
-// cannot carry, and nothing is lost or invented on the way through. Seeded with
-// every golden wire fixture of every request type.
+// WHAT THE PLANE ACCEPTS, IT READ IN FULL AND CAN SAY AGAIN. For any body a
+// route's strict decoder accepts: an ordinary decode of the same bytes gives
+// the same value, so the strict decoder neither lost nor invented anything; the
+// value's encoding is accepted by the same decoder and encodes identically
+// again, so nothing decodes to a value the wire cannot carry; and that
+// encoding with an unknown field added, or read under a limit one byte short,
+// is refused, so the decoder is still the strict one. Seeded with every golden
+// wire fixture of every request type, and with bodies that carry something
+// after their value.
 func FuzzPlaneDecode(f *testing.F) {
 	versions, err := filepath.Glob(filepath.Join("..", "nodeapi", "testdata", "wire", "v*"))
 	if err != nil || len(versions) == 0 {
@@ -83,6 +87,10 @@ func FuzzPlaneDecode(f *testing.F) {
 		if seeded == 0 {
 			f.Fatalf("no golden fixture seeds %s", r.name)
 		}
+
+		f.Add(uint8(i), []byte("{}\n"))
+		f.Add(uint8(i), []byte("{}{}"))
+		f.Add(uint8(i), []byte("{} x"))
 	}
 
 	f.Fuzz(func(t *testing.T, kind uint8, body []byte) {
@@ -96,6 +104,32 @@ func FuzzPlaneDecode(f *testing.F) {
 		once, err := json.Marshal(first)
 		if err != nil {
 			t.Fatalf("%s accepted %q and could not encode the value: %v", r.name, body, err)
+		}
+
+		// AN ORDINARY DECODE OF THE SAME BYTES, the reference: it refuses
+		// anything after the value, and keeps every field it knows.
+		reference := r.fresh()
+		if err := json.Unmarshal(body, reference); err != nil {
+			t.Fatalf("%s accepted %q, which an ordinary decode refuses: %v", r.name, body, err)
+		}
+
+		if want, err := json.Marshal(reference); err != nil || !bytes.Equal(once, want) {
+			t.Fatalf("%s read %q as %s, and an ordinary decode as %s (%v)", r.name, body, once, want, err)
+		}
+
+		// STILL THE STRICT DECODER: an unknown field, and a limit one byte
+		// short of the body, are each refused.
+		unknown := []byte(`{"billetFuzzUnknown":0}`)
+		if len(once) > 2 {
+			unknown = append([]byte(`{"billetFuzzUnknown":0,`), once[1:]...)
+		}
+
+		if strictly(t.Context(), unknown, r.fresh(), int64(len(unknown))+1) {
+			t.Fatalf("%s accepted an unknown field: %s", r.name, unknown)
+		}
+
+		if strictly(t.Context(), once, r.fresh(), int64(len(once))-1) {
+			t.Fatalf("%s accepted %s under a limit one byte short of it", r.name, once)
 		}
 
 		// THE DECODER'S RULES WITHOUT THE ROUTE'S LIMIT: an encoding may be
