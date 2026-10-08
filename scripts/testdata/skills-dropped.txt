@@ -43,3 +43,5 @@ a2d34264e894 Operator output no longer belongs to cmd/billet as a package: a com
 953c8384c5d7 The ledger hand-back moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.HandBackLedger.
 b216b3a2a0f5 The identity access moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Open as the one entry.
 b328ae11a010 The fresh branch of the identity access moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Open.
+4c9719ee3eda The operator and report opens moved into internal/app with the control plane's (#356 Phase 4); the sentence names internal/app/ledger.go and its structural test.
+e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase 4); the sentence names it and the test that exempts it.

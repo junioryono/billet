@@ -43,18 +43,27 @@ func (e *ExitError) ExitCode() int { return e.Code }
 // replicated the decision instead of exercising it, and passed against the very bug
 // it described.
 //
-// AND ONE REFUSAL BY ITS TYPE: a host whose authority a retirement has closed
-// answers retirement.ExitRetiring, which the retirement reads back from a timer
-// unit's status, wherever in the command the refusal was met.
+// AND ONE REFUSAL BY ITS TYPE, BEFORE ANY OTHER STATUS: a host whose authority a
+// retirement has closed answers retirement.ExitRetiring, which the retirement
+// reads back from a timer unit's status, wherever in the command the refusal was
+// met and whatever it was joined with. Another status found first would hide it,
+// and the one failure the transition admits would read as any other.
 func ExitStatus(err error) int {
+	if retiring(err) {
+		return retirement.ExitRetiring
+	}
+
 	if coded, ok := errors.AsType[*ExitError](err); ok {
 		return coded.Code
 	}
 
-	//nolint:errcheck // the match is the answer: the refusal is err itself, classified, not a second error
-	if _, ok := errors.AsType[retirement.ErrRetiring](err); ok {
-		return retirement.ExitRetiring
-	}
-
 	return 1
+}
+
+// retiring reports whether err's chain holds a retiring host's refusal.
+func retiring(err error) bool {
+	//nolint:errcheck // the match is the answer: the refusal is err itself, classified, not a second error
+	_, ok := errors.AsType[retirement.ErrRetiring](err)
+
+	return ok
 }
