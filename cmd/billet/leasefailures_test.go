@@ -89,7 +89,7 @@ func TestLeaseFailuresReportsBothFactsAndDisclaimsAnyRerun(t *testing.T) {
 	lease := seedAttributedFailure(t, stateDir, "failed", 77)
 
 	out := capture(t, func() {
-		if err := cmdLeases(t.Context(), []string{"failures", "--config", cfg}); err != nil {
+		if err := cmdLeases(t.Context(), processEnv(), []string{"failures", "--config", cfg}); err != nil {
 			t.Errorf("billet leases failures: %v", err)
 		}
 	})
@@ -132,7 +132,7 @@ func TestLeaseFailuresDoesNotPrintAPooledLeasesInternalRequestID(t *testing.T) {
 	seedAttributedFailure(t, stateDir, "failed", -3)
 
 	out := capture(t, func() {
-		if err := cmdLeases(t.Context(), []string{"failures", "--config", cfg}); err != nil {
+		if err := cmdLeases(t.Context(), processEnv(), []string{"failures", "--config", cfg}); err != nil {
 			t.Errorf("billet leases failures: %v", err)
 		}
 	})
@@ -156,7 +156,7 @@ func TestLeaseFailuresOmitsASucceededJob(t *testing.T) {
 	seedAttributedFailure(t, stateDir, "succeeded", 77)
 
 	out := capture(t, func() {
-		if err := cmdLeases(t.Context(), []string{"failures", "--config", cfg}); err != nil {
+		if err := cmdLeases(t.Context(), processEnv(), []string{"failures", "--config", cfg}); err != nil {
 			t.Errorf("billet leases failures: %v", err)
 		}
 	})
@@ -174,7 +174,7 @@ func TestLeaseFailuresHonoursItsWindow(t *testing.T) {
 	seedAttributedFailure(t, stateDir, "failed", 77)
 
 	inside := capture(t, func() {
-		if err := cmdLeases(t.Context(), []string{"failures", "--config", cfg,
+		if err := cmdLeases(t.Context(), processEnv(), []string{"failures", "--config", cfg,
 			"--since", "1h"}); err != nil {
 			t.Errorf("billet leases failures --since 1h: %v", err)
 		}
@@ -188,7 +188,7 @@ func TestLeaseFailuresHonoursItsWindow(t *testing.T) {
 	// A nanosecond is shorter than the time between seeding and reading, so the
 	// job is genuinely outside it.
 	outside := capture(t, func() {
-		if err := cmdLeases(t.Context(), []string{"failures", "--config", cfg,
+		if err := cmdLeases(t.Context(), processEnv(), []string{"failures", "--config", cfg,
 			"--since", "1ns"}); err != nil {
 			t.Errorf("billet leases failures --since 1ns: %v", err)
 		}
@@ -217,7 +217,7 @@ func TestLeaseFailuresRefusesAnImpossibleWindow(t *testing.T) {
 		{"failures", "--config", cfg, "--since", "0"},
 		{"failures", "--config", cfg, "--limit", "0"},
 	} {
-		err := cmdLeases(t.Context(), args)
+		err := cmdLeases(t.Context(), processEnv(), args)
 		if err == nil || !strings.Contains(err.Error(), "must be positive") {
 			t.Errorf("cmdLeases %v = %v, want a refusal", args, err)
 		}

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -124,7 +126,7 @@ type kernelLock struct{ file *os.File }
 // IT FAILS CLOSED. A kernel directory billet cannot place a lock in is one it can
 // neither install into nor delete from, so there is no legitimate operation this
 // refuses and no degraded mode to offer.
-func takeKernelDirLock(ctx context.Context, dir, why string) (*kernelLock, error) {
+func takeKernelDirLock(ctx context.Context, env cli.Env, dir, why string) (*kernelLock, error) {
 	// CHECKED NEXT TO THE INTERPOLATION, the rule state.LockDeployment and
 	// takeProbeLock both follow: this builds a path out of the value, and an empty
 	// directory puts the lock at ./.billet-kernels.lock in whatever directory the
@@ -247,7 +249,7 @@ func takeKernelDirLock(ctx context.Context, dir, why string) (*kernelLock, error
 		// retrying them until the window expires reports "somebody else held it"
 		// about a host that can never take this lock at all.
 		if !errors.Is(flockErr, unix.EWOULDBLOCK) {
-			closeKernelLock(file, path)
+			closeKernelLock(env, file, path)
 
 			return nil, fmt.Errorf("billet images: lock the kernel directory at %s (to %s): %w",
 				path, why, flockErr)
@@ -264,7 +266,7 @@ func takeKernelDirLock(ctx context.Context, dir, why string) (*kernelLock, error
 		if !announced {
 			announced = true
 
-			fmt.Printf("waiting up to %s for the kernel directory lock at %s; another billet "+
+			fmt.Fprintf(env.Stdout, "waiting up to %s for the kernel directory lock at %s; another billet "+
 				"is installing or collecting kernels there, and this must not %s from a "+
 				"generation set that is still being written\n", kernelLockWindow, path, why)
 
@@ -286,7 +288,7 @@ func takeKernelDirLock(ctx context.Context, dir, why string) (*kernelLock, error
 
 		select {
 		case <-waitCtx.Done():
-			closeKernelLock(file, path)
+			closeKernelLock(env, file, path)
 
 			return nil, expired(contended)
 		case <-retry.C:
@@ -339,8 +341,8 @@ func (l *kernelLock) release() error {
 // A FAILURE HERE IS REPORTED RATHER THAN RETURNED, because it happens on the way out
 // of a path that is already returning the reason it could not lock, and replacing
 // that reason would send an operator after the consequence instead of the cause.
-func closeKernelLock(file *os.File, path string) {
+func closeKernelLock(env cli.Env, file *os.File, path string) {
 	if err := file.Close(); err != nil {
-		fmt.Printf("warning: could not close the kernel directory lock at %s: %v\n", path, err)
+		fmt.Fprintf(env.Stdout, "warning: could not close the kernel directory lock at %s: %v\n", path, err)
 	}
 }

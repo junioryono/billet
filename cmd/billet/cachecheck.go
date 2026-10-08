@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 )
 
@@ -154,13 +156,13 @@ func servedFrom(n *config.NodeConfig) string {
 // THE LABEL IS WRITTEN ONCE and the continuations are indented under it, because
 // a finding that repeats its label on every line reads as several findings —
 // which is how the surrounding report already treats a multi-sentence verdict.
-func printNodeCache(lines []string) {
+func printNodeCache(env cli.Env, lines []string) {
 	for i, line := range lines {
 		label := ""
 		if i == 0 {
 			label = "cache"
 		}
 
-		fmt.Printf("%-8s %s\n", label, line)
+		fmt.Fprintf(env.Stdout, "%-8s %s\n", label, line)
 	}
 }

@@ -70,7 +70,7 @@ func TestStatusReportsEveryRecordedCredentialSweep(t *testing.T) {
 		}
 	}
 
-	out := capture(t, func() { printCredentialSweeps(t.Context(), a, db) })
+	out := capture(t, func() { printCredentialSweeps(t.Context(), processEnv(), a, db) })
 
 	for _, want := range []string{
 		"/billet/a/jit (us-west-2): 1 registration(s) removed in total",

@@ -65,7 +65,7 @@ node:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdDecommission(t.Context(), []string{"--config", configPath})
+	err := cmdDecommission(t.Context(), processEnv(), []string{"--config", configPath})
 	if err == nil || !strings.Contains(err.Error(), "no ec2 node") {
 		t.Fatalf("decommission did not refuse a non-ec2 config: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestDecommissionRefusesWithoutIdentity(t *testing.T) {
 	endpoint := fakeEC2With(t, fakeEC2Topology{accept: "AKIDEXAMPLE"})
 	configPath := decommissionConfig(t, endpoint, false) // no minted id
 
-	err := cmdDecommission(t.Context(), []string{"--config", configPath})
+	err := cmdDecommission(t.Context(), processEnv(), []string{"--config", configPath})
 	if err == nil || !strings.Contains(err.Error(), "cannot resolve this deployment's identity") {
 		t.Fatalf("decommission did not refuse without an identity: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestDecommissionRefusesLiveInstancesWithoutForce(t *testing.T) {
 	configPath := decommissionConfig(t, endpoint, true)
 
 	var err error
-	out := capture(t, func() { err = cmdDecommission(t.Context(), []string{"--config", configPath, "--yes"}) })
+	out := capture(t, func() { err = cmdDecommission(t.Context(), processEnv(), []string{"--config", configPath, "--yes"}) })
 	if err == nil || !strings.Contains(err.Error(), "still live") {
 		t.Fatalf("decommission did not refuse live instances: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestDecommissionReportsWithoutYes(t *testing.T) {
 	configPath := decommissionConfig(t, endpoint, true)
 
 	var err error
-	out := capture(t, func() { err = cmdDecommission(t.Context(), []string{"--config", configPath}) })
+	out := capture(t, func() { err = cmdDecommission(t.Context(), processEnv(), []string{"--config", configPath}) })
 	if err != nil {
 		t.Fatalf("decommission report: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestDecommissionTerminatesWithForceAndYes(t *testing.T) {
 
 	var err error
 	out := capture(t, func() {
-		err = cmdDecommission(t.Context(), []string{
+		err = cmdDecommission(t.Context(), processEnv(), []string{
 			"--config", configPath, "--terminate-instances", "--yes",
 		})
 	})
@@ -179,7 +179,7 @@ func TestDecommissionTerminateNeedsYes(t *testing.T) {
 
 	var err error
 	capture(t, func() {
-		err = cmdDecommission(t.Context(), []string{"--config", configPath, "--terminate-instances"})
+		err = cmdDecommission(t.Context(), processEnv(), []string{"--config", configPath, "--terminate-instances"})
 	})
 	if err == nil || !strings.Contains(err.Error(), "needs --yes") {
 		t.Fatalf("--terminate-instances without --yes was not refused: %v", err)
@@ -214,7 +214,7 @@ func TestDecommissionCacheYesGate(t *testing.T) {
 	reached := false
 	var err error
 	out := capture(t, func() {
-		err = decommissionCache(t.Context(), cfg, "deployment", sentinelCreds{&reached}, false)
+		err = decommissionCache(t.Context(), processEnv(), cfg, "deployment", sentinelCreds{&reached}, false)
 	})
 	if err != nil {
 		t.Fatalf("decommissionCache without --yes errored: %v", err)

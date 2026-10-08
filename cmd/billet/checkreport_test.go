@@ -129,7 +129,7 @@ func TestRunCheckReportsWhatTheGitHubProbeEstablished(t *testing.T) {
 			)
 
 			out := capture(t, func() {
-				report, err = runCheck(t.Context(), checkOptions{configPath: cfgPath})
+				report, err = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath})
 			})
 
 			if tc.wantErr && err == nil {
@@ -172,7 +172,7 @@ func TestAMaintenanceSkipIsNotAPass(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		report, err = runCheck(t.Context(), checkOptions{configPath: cfgPath})
+		report, err = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath})
 	})
 	if err != nil {
 		t.Fatalf("a maintenance run failed: %v\n%s", err, out)
@@ -214,7 +214,7 @@ func TestANodeOnlyHostHasNoGitHubVerdict(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		report, err = runCheck(t.Context(), checkOptions{configPath: cfgPath})
+		report, err = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath})
 	})
 	if err != nil {
 		t.Fatalf("a node-only check failed: %v\n%s", err, out)

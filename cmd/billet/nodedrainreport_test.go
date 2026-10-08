@@ -259,12 +259,22 @@ func TestTheNodeHoldsItsLockUntilTheCommandReturns(t *testing.T) {
 // gives it: the drain-request file, the second signal, the service manager's
 // notification, stdout and the one record path. Without the first, a node set
 // to hand over would leave guests behind under an operation that must not.
-// The callbacks are compared by the function they are, which is what the
-// loop will call.
+// The drain callback is compared by the function it is, which is what the
+// loop will call; the readiness one is called, and must notify the socket the
+// env it was built over names.
 func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 	lc := cli.NewLifecycle(func() {}, os.Stderr)
+	socket, listener := notifySocket(t)
+	env := processEnv()
+	env.Getenv = func(name string) string {
+		if name == "NOTIFY_SOCKET" {
+			return socket
+		}
+
+		return ""
+	}
 	// LINUX'S SPELLING, where a record is published; a Mac publishes none.
-	host := nodeHost(lc, "linux")
+	host := nodeHost(env, lc, "linux")
 
 	same := func(a, b any) bool { return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() }
 
@@ -272,8 +282,16 @@ func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 		t.Error("nodeHost does not give the node nodeDrainRequested")
 	}
 
-	if host.Ready == nil || !same(host.Ready, notifyReady) {
-		t.Error("nodeHost does not give the node notifyReady")
+	if host.Ready == nil {
+		t.Fatal("nodeHost gives the node no readiness notification")
+	}
+
+	if err := host.Ready(); err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+
+	if got := readNotification(t, listener); got != "READY=1" {
+		t.Errorf("the node's Ready sent %q to the env's NOTIFY_SOCKET, want READY=1", got)
 	}
 
 	hurry := lc.Hurry()

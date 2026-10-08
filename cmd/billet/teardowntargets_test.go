@@ -76,7 +76,7 @@ targets:
 	var err error
 
 	out := capture(t, func() {
-		err = cmdTeardown(t.Context(), []string{"--config", cfgPath, "--all", "--yes"})
+		err = cmdTeardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--yes"})
 	})
 	if err != nil {
 		t.Fatalf("teardown --all: %v\n%s", err, out)

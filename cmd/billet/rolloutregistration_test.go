@@ -356,7 +356,7 @@ func TestRegistrationOpensNothingAndPreservesTheChildsExit(t *testing.T) {
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutRegistration(t.Context(), []string{"--json", "--config", cfgPath, "--node", "node-a",
+			runErr = cmdRolloutRegistration(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--node", "node-a",
 				"--incarnation", regIncarnationNew})
 		})
 
@@ -384,7 +384,7 @@ func TestRegistrationOpensNothingAndPreservesTheChildsExit(t *testing.T) {
 
 			var calls [][]string
 
-			statusReexec = func(_ context.Context, _, _ uint32, args []string) (int, error) {
+			statusReexec = func(_ context.Context, _ cli.Env, _, _ uint32, args []string) (int, error) {
 				calls = append(calls, args)
 
 				return c.code, nil
@@ -393,7 +393,7 @@ func TestRegistrationOpensNothingAndPreservesTheChildsExit(t *testing.T) {
 			var runErr error
 
 			out := capture(t, func() {
-				runErr = cmdRolloutRegistration(t.Context(), []string{"--json", "--config", l.cfgPath, "--node", "node-a",
+				runErr = cmdRolloutRegistration(t.Context(), processEnv(), []string{"--json", "--config", l.cfgPath, "--node", "node-a",
 					"--incarnation", regIncarnationNew})
 			})
 
@@ -440,7 +440,7 @@ func TestRegistrationRefusesItsInputsBeforeTheOpen(t *testing.T) {
 	}
 
 	t.Run("without --json", func(t *testing.T) {
-		err := cmdRolloutRegistration(t.Context(), []string{"--config", cfgPath, "--node", "node-a", "--incarnation",
+		err := cmdRolloutRegistration(t.Context(), processEnv(), []string{"--config", cfgPath, "--node", "node-a", "--incarnation",
 			regIncarnationNew})
 		if err == nil || !strings.Contains(err.Error(), "--json") {
 			t.Errorf("err %v", err)

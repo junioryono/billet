@@ -520,7 +520,18 @@ linters:
       exclude-godoc-examples: true
       forbid:
         - pattern: '^fmt\.Print(ln|f)?$'
-          msg: "Use log/slog in library code. cmd/billet is allow-listed for operator output."
+          msg: "Use log/slog in library code, and write a command's output to the cli.Env it is handed."
+        # ONLY main NAMES THE PROCESS'S STREAMS. A command writes to the cli.Env
+        # it is handed, so a test captures what it prints without swapping a
+        # global and runs beside other tests (#356 Phase 4); cmd/billet's main
+        # builds that env from the process's own, and is the one exemption.
+        - pattern: '^os\.(Stdout|Stderr|Stdin)$'
+          msg: "Write to the cli.Env a command is handed; only cmd/billet's main names the process's own streams."
+        # AND ITS ENVIRONMENT, for a command. A library reading a variable of its
+        # own (the AWS credential chain, systemd's INVOCATION_ID) is excluded
+        # below by path.
+        - pattern: '^os\.Getenv$'
+          msg: "A command reads its environment through the cli.Env it is handed; only cmd/billet's main hands it os.Getenv."
         - pattern: "^panic$"
           msg: "Return errors instead of panicking. A control plane that panics drops every in-flight lease."
         - pattern: '^os\.Exit$'
@@ -776,10 +787,27 @@ linters:
       # exemption exists for, so the ban on building the control plane or the
       # node outside internal/app (ADR-015) reaches cmd/billet too: the binary
       # is exactly where a second assembly would be written.
+      #
+      # NOT OUTPUT OR THE ENVIRONMENT. A command writes to the cli.Env it is
+      # handed and reads its environment through it; only main, below, names
+      # the process's own.
       - path: (^|/)cmd/billet/
         linters:
           - forbidigo
-        text: 'forbidden because "(Use log/slog|Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
+        text: 'forbidden because "(Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
+      - path: (^|/)cmd/billet/main\.go$
+        linters:
+          - forbidigo
+        text: 'forbidden because "(Write to the cli\.Env|A command reads its environment)'
+
+      # A LIBRARY READS THE VARIABLES THAT ARE ITS OWN: the AWS credential
+      # chain, systemd's INVOCATION_ID and NOTIFY_SOCKET-style facts about the
+      # process, a tool's home directory. What the os.Getenv ban is for is a
+      # command's environment, which travels in its cli.Env.
+      - path: (^|/)internal/
+        linters:
+          - forbidigo
+        text: 'forbidden because "A command reads its environment'
 
       # THE STANDALONE TOOLS UNDER scripts/ ARE OPERATOR OUTPUT TOO, and are not
       # part of the billet binary. Each is its own `package main` that runs once —
@@ -803,7 +831,7 @@ linters:
       - path: (^|/)scripts/[a-z]+/
         linters:
           - forbidigo
-        text: 'forbidden because "(Use log/slog|Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
+        text: 'forbidden because "(Use log/slog|Write to the cli\.Env|A command reads its environment|Return errors|Use http\.NewRequestWithContext|Thread the context|time\.After leaks|Use errors\.AsType|Bind the generated queries)'
 
 issues:
   max-issues-per-linter: 0

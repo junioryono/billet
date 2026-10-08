@@ -63,7 +63,7 @@ func runInitHybrid(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 
 	var err error
-	out := capture(t, func() { err = cmdInit(t.Context(), append([]string{"hybrid"}, args...)) })
+	out := capture(t, func() { err = cmdInit(t.Context(), processEnv(), append([]string{"hybrid"}, args...)) })
 
 	return out, err
 }

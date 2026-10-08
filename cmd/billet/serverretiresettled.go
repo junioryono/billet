@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 )
@@ -17,15 +19,15 @@ func retireSettledPurpose(m retireMode) string {
 	return retirement.PurposeSettledEntry
 }
 
-func answerRetireModeRefusal(m retireMode, r *retireRefusal) error {
+func answerRetireModeRefusal(env cli.Env, m retireMode, r *retireRefusal) error {
 	if !m.checkSettledEntry && !m.checkSettledClosing {
-		return answerRetireRefusal(r)
+		return answerRetireRefusal(env, r)
 	}
 	code := exitRefused
 	if r.Outcome == retireOutcomeUnknown {
 		code = exitUnknown
 	}
-	return answerJSON(retirement.SettledRefusal{Schema: retirement.SettledSchema, Purpose: retireSettledPurpose(m), Outcome: r.Outcome,
+	return answerJSON(env, retirement.SettledRefusal{Schema: retirement.SettledSchema, Purpose: retireSettledPurpose(m), Outcome: r.Outcome,
 		Reason: r.Reason, Why: r.Why, State: stateNothingRetire}, code, r.Why)
 }
 

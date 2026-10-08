@@ -168,7 +168,7 @@ func TestCheckReportsNeedrestartOnLinux(t *testing.T) {
 				return true
 			}
 			expr, ok := stmt.Body.List[0].(*ast.ExprStmt)
-			if ok && types.ExprString(expr.X) == `reportNeedrestart(os.Stdout, "/")` {
+			if ok && types.ExprString(expr.X) == `reportNeedrestart(env.Stdout, "/")` {
 				found = true
 			}
 
@@ -177,6 +177,6 @@ func TestCheckReportsNeedrestartOnLinux(t *testing.T) {
 	}
 
 	if !found {
-		t.Error(`runCheck does not call reportNeedrestart(os.Stdout, "/") under runtime.GOOS == "linux"`)
+		t.Error(`runCheck does not call reportNeedrestart(env.Stdout, "/") under runtime.GOOS == "linux"`)
 	}
 }

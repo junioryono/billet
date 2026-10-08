@@ -55,8 +55,8 @@ type restoreOptions struct {
 // deployarchive.Execute for what the three local mechanisms prove; what none of
 // them reaches is another MACHINE, which is why --old-controller-fenced exists
 // and why it is required rather than defaulted.
-func cmdLocalRestore(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local restore", os.Stdout)
+func cmdLocalRestore(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local restore", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	from := fs.String("from", "", "the backup directory written by `billet local backup`")
 	fromBackup := fs.String("from-backup", "",
@@ -102,14 +102,14 @@ func cmdLocalRestore(ctx context.Context, args []string) error {
 			"used")
 	}
 
-	return runLocalRestore(ctx, restoreOptions{
+	return runLocalRestore(ctx, env, restoreOptions{
 		configPath: *cfgPath, from: *from, dryRun: *dryRun,
 		fenced: *fenced, abandon: *abandon, ledgerAttached: *ledgerAttached,
 		fromBackup: *fromBackup, deployment: *deployment, into: *into,
 	})
 }
 
-func runLocalRestore(ctx context.Context, o restoreOptions) error {
+func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 	cfg, err := config.Load(o.configPath)
 	if err != nil {
 		return err
@@ -126,7 +126,7 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 	// archive arrived on a USB stick or out of a bucket.
 	from := o.from
 	if o.fromBackup != "" {
-		if from, err = fetchFromBackup(ctx, cfg, o); err != nil {
+		if from, err = fetchFromBackup(ctx, env, cfg, o); err != nil {
 			return err
 		}
 	}
@@ -149,7 +149,7 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 	archiveTargets(cfg, &target)
 
 	if o.abandon {
-		return runRestoreAbandon(ctx, archive, target)
+		return runRestoreAbandon(ctx, env, archive, target)
 	}
 
 	// THE PLANNER IS PURE AND RUNS FIRST, WHATEVER HAPPENS NEXT. --dry-run and a
@@ -161,15 +161,15 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 		return err
 	}
 
-	printArchive(archive)
-	printRestorePlan(plan)
+	printArchive(env, archive)
+	printRestorePlan(env, plan)
 
 	if len(plan.Refusals) > 0 {
 		return refusedRestore(plan.Refusals)
 	}
 
 	if o.dryRun {
-		fmt.Println("\nNothing was changed (--dry-run).")
+		fmt.Fprintln(env.Stdout, "\nNothing was changed (--dry-run).")
 
 		return nil
 	}
@@ -186,8 +186,8 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 	// publication — every piece in place, the ledger still fenced, and no control
 	// plane able to start.
 	if plan.Nothing() {
-		fmt.Printf("\nEverything in this backup looks to be in place already; confirming that\n")
-		fmt.Printf("under the lock rather than on a plan taken without one.\n")
+		fmt.Fprintf(env.Stdout, "\nEverything in this backup looks to be in place already; confirming that\n")
+		fmt.Fprintf(env.Stdout, "under the lock rather than on a plan taken without one.\n")
 	}
 
 	if !o.fenced {
@@ -205,11 +205,11 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	// AUTHORITY BEFORE DIRECTORY, the order every command takes them in now; a
 	// bare target is initialised under the lock beside it, borrowing the
@@ -223,23 +223,23 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 	res, err := deployarchive.Execute(ctx, deployarchive.RestoreRequest{
 		Authority:     acc.Lock(),
 		Plan:          plan,
-		InstallAppKey: installAppKey,
+		InstallAppKey: func(path string, pem []byte) error { return installAppKey(env, path, pem) },
 		Now:           time.Now,
-		Actor:         actor(),
+		Actor:         actor(env),
 	})
 	if rerr := acc.Release(); rerr != nil {
 		err = errors.Join(err, rerr)
 	}
 
-	printRestoreResult(res)
+	printRestoreResult(env, res)
 
 	if err != nil {
-		return partialRestore(target, err)
+		return partialRestore(env, target, err)
 	}
 
-	repairRestoredOwnership(plan)
+	repairRestoredOwnership(env, plan)
 
-	printRestored(archive, target, res)
+	printRestored(env, archive, target, res)
 
 	return nil
 }
@@ -266,7 +266,7 @@ func runLocalRestore(ctx context.Context, o restoreOptions) error {
 // Returning an error would read as "the restore failed" on the worst day of a
 // deployment's life, and the next thing an operator reaches for is --abandon,
 // which DELETES what this run installed. So it says exactly what is left to do.
-func repairRestoredOwnership(plan deployarchive.Plan) {
+func repairRestoredOwnership(env cli.Env, plan deployarchive.Plan) {
 	// NOT ON macOS: the launch agent runs as the operator, so a restore they ran
 	// already wrote files that account owns.
 	if hostOS != "linux" {
@@ -290,20 +290,20 @@ func repairRestoredOwnership(plan deployarchive.Plan) {
 		// NOT A PROBLEM, AND SAID RATHER THAN SKIPPED. A host with no service
 		// account is one where billet runs as whoever invoked it, and that
 		// account already owns what was just written.
-		fmt.Printf("\nown      left as root: there is no %s service account here, so nothing "+
+		fmt.Fprintf(env.Stdout, "\nown      left as root: there is no %s service account here, so nothing "+
 			"else\n", initconfig.ServiceGroup)
-		fmt.Printf("         needs to be able to read this (%v)\n", err)
+		fmt.Fprintf(env.Stdout, "         needs to be able to read this (%v)\n", err)
 
 		return
 	}
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	repaired, repairErr := c.RepairPaths(plan.Target.StateDir,
 		restoredStateTargets(plan), uid, gid)
 
 	for _, path := range repaired {
-		fmt.Printf("own      %s given to %s (this restore ran as root)\n",
+		fmt.Fprintf(env.Stdout, "own      %s given to %s (this restore ran as root)\n",
 			path, initconfig.ServiceGroup)
 	}
 
@@ -324,18 +324,18 @@ func repairRestoredOwnership(plan deployarchive.Plan) {
 	keyErr := c.ApplyOwnership(keyChanges, uid, gid)
 
 	if err := errors.Join(repairErr, keyErr); err != nil {
-		fmt.Println()
-		fmt.Printf("warn     the restore is COMPLETE and correct, but billet could not give all\n")
-		fmt.Printf("         of it to the %s account: %v\n", initconfig.ServiceGroup, err)
-		fmt.Printf("         Do NOT run --abandon; that would remove what this run installed.\n")
-		fmt.Printf("         Fix the ownership by hand, then `billet local up`.\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "warn     the restore is COMPLETE and correct, but billet could not give all\n")
+		fmt.Fprintf(env.Stdout, "         of it to the %s account: %v\n", initconfig.ServiceGroup, err)
+		fmt.Fprintf(env.Stdout, "         Do NOT run --abandon; that would remove what this run installed.\n")
+		fmt.Fprintf(env.Stdout, "         Fix the ownership by hand, then `billet local up`.\n")
 
 		return
 	}
 
 	if len(repaired) > 0 {
 		for _, path := range restoredKeyPaths(plan) {
-			fmt.Printf("own      %s given to %s\n", path, initconfig.ServiceGroup)
+			fmt.Fprintf(env.Stdout, "own      %s given to %s\n", path, initconfig.ServiceGroup)
 		}
 	}
 }
@@ -477,13 +477,13 @@ func restoreUnfinished(stateDir string) (bool, error) {
 // it is still in memory. GitHub issues this key exactly once, and four review
 // rounds went into those rules; a restore installs the same kind of file and
 // must use the same code.
-func installAppKey(path string, pem []byte) error {
+func installAppKey(env cli.Env, path string, pem []byte) error {
 	reserved, err := reserveKeyFile(path)
 	if err != nil {
 		return err
 	}
 
-	return writeKeyAtomically(reserved, path, pem, func() {})
+	return writeKeyAtomically(env, reserved, path, pem, func() {})
 }
 
 // errFleetNotFenced is the refusal that no lock on this machine can substitute
@@ -523,76 +523,76 @@ func refusedRestore(refusals []lifeops.Refusal) error {
 
 // printArchive reports what the backup holds before anything is decided about
 // it.
-func printArchive(a *deployarchive.Archive) {
+func printArchive(env cli.Env, a *deployarchive.Archive) {
 	m := a.Manifest
 
-	fmt.Printf("backup   %s\n", a.Dir)
-	fmt.Printf("         taken %s by billet %s\n", m.CreatedAt, m.BilletVersion)
-	fmt.Printf("         deployment %s\n", m.DeploymentID)
-	fmt.Printf("         app        %s\n", m.GitHub)
-	fmt.Printf("         ca         %s, expires %s\n", m.Authority.Fingerprint, m.Authority.NotAfter)
+	fmt.Fprintf(env.Stdout, "backup   %s\n", a.Dir)
+	fmt.Fprintf(env.Stdout, "         taken %s by billet %s\n", m.CreatedAt, m.BilletVersion)
+	fmt.Fprintf(env.Stdout, "         deployment %s\n", m.DeploymentID)
+	fmt.Fprintf(env.Stdout, "         app        %s\n", m.GitHub)
+	fmt.Fprintf(env.Stdout, "         ca         %s, expires %s\n", m.Authority.Fingerprint, m.Authority.NotAfter)
 
 	if m.Authority.Rotating {
-		fmt.Printf("         ROTATING:  the previous authority %s is in this backup\n",
+		fmt.Fprintf(env.Stdout, "         ROTATING:  the previous authority %s is in this backup\n",
 			m.Authority.PreviousFingerprint)
 	}
 
-	fmt.Printf("         ledger     schema %d (%d migrations)\n",
+	fmt.Fprintf(env.Stdout, "         ledger     schema %d (%d migrations)\n",
 		m.Ledger.HighestVersion(), len(m.Ledger.Migrations))
 
 	if m.Source.Host != "" {
-		fmt.Printf("         from       %s:%s\n", m.Source.Host, m.Source.StateDir)
+		fmt.Fprintf(env.Stdout, "         from       %s:%s\n", m.Source.Host, m.Source.StateDir)
 	}
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 }
 
 // printRestorePlan reports what would happen, item by item.
-func printRestorePlan(p deployarchive.Plan) {
+func printRestorePlan(env cli.Env, p deployarchive.Plan) {
 	for _, a := range p.Actions {
 		switch a.Disposition {
 		case deployarchive.AlreadyPresent:
-			fmt.Printf("plan     %s is already in place at %s\n", a.What, a.Path)
+			fmt.Fprintf(env.Stdout, "plan     %s is already in place at %s\n", a.What, a.Path)
 		case deployarchive.ReplaceEmptyLedger:
-			fmt.Printf("plan     replace the empty preflight ledger at %s\n", a.Path)
-			fmt.Printf("         (it has no deployment data in it; `billet check` creates one)\n")
+			fmt.Fprintf(env.Stdout, "plan     replace the empty preflight ledger at %s\n", a.Path)
+			fmt.Fprintf(env.Stdout, "         (it has no deployment data in it; `billet check` creates one)\n")
 		case deployarchive.Install:
-			fmt.Printf("plan     install %s at %s\n", a.What, a.Path)
+			fmt.Fprintf(env.Stdout, "plan     install %s at %s\n", a.What, a.Path)
 		}
 	}
 
 	for _, path := range p.LedgerSidecars {
-		fmt.Printf("plan     remove %s with it (a stray write-ahead log is replayed into the\n", path)
-		fmt.Printf("         restored ledger, which is corruption rather than a stale file)\n")
+		fmt.Fprintf(env.Stdout, "plan     remove %s with it (a stray write-ahead log is replayed into the\n", path)
+		fmt.Fprintf(env.Stdout, "         restored ledger, which is corruption rather than a stale file)\n")
 	}
 }
 
 // printRestoreResult says what actually happened, whether or not it finished.
-func printRestoreResult(res deployarchive.Result) {
+func printRestoreResult(env cli.Env, res deployarchive.Result) {
 	if res.Resumed {
-		fmt.Printf("resume   an interrupted restore was already in progress here; continuing it\n\n")
+		fmt.Fprintf(env.Stdout, "resume   an interrupted restore was already in progress here; continuing it\n\n")
 	}
 
 	for _, path := range res.Removed {
-		fmt.Printf("remove   %s\n", path)
+		fmt.Fprintf(env.Stdout, "remove   %s\n", path)
 	}
 
 	for _, a := range res.Skipped {
-		fmt.Printf("skip     %s was already in place\n", a.What)
+		fmt.Fprintf(env.Stdout, "skip     %s was already in place\n", a.What)
 	}
 
 	for _, a := range res.Installed {
-		fmt.Printf("install  %s -> %s\n", a.What, a.Path)
+		fmt.Fprintf(env.Stdout, "install  %s -> %s\n", a.What, a.Path)
 	}
 
 	// NEVER SWALLOWED. Publication links a staged file into place and then drops
 	// the staging name; one that could not be dropped is a second copy of a
 	// restored ledger, and nothing else would ever mention it.
 	for _, path := range res.Strays {
-		fmt.Printf("warn     %s is a second copy of a file this restore installed and could\n",
+		fmt.Fprintf(env.Stdout, "warn     %s is a second copy of a file this restore installed and could\n",
 			path)
-		fmt.Printf("         not be removed. The restore itself is fine; delete it once you\n")
-		fmt.Printf("         have checked it.\n")
+		fmt.Fprintf(env.Stdout, "         not be removed. The restore itself is fine; delete it once you\n")
+		fmt.Fprintf(env.Stdout, "         have checked it.\n")
 	}
 }
 
@@ -603,8 +603,8 @@ func printRestoreResult(res deployarchive.Result) {
 // and not the others, so a control plane starting on it would mint whatever is
 // missing — a fresh identity, a fresh authority — and that is exactly the
 // failure this whole command exists to prevent.
-func partialRestore(t deployarchive.Target, cause error) error {
-	fmt.Println()
+func partialRestore(env cli.Env, t deployarchive.Target, cause error) error {
+	fmt.Fprintln(env.Stdout)
 
 	// READ, NOT ASSUMED — the same rule `billet local down`'s partial report
 	// follows. A refusal BEFORE anything was published takes its own fence back
@@ -614,34 +614,34 @@ func partialRestore(t deployarchive.Target, cause error) error {
 	// moment it matters most.
 	switch _, err := os.Lstat(state.MaintenanceFencePath(t.StateDir)); {
 	case err == nil:
-		fmt.Printf("state    this restore did NOT finish, and %s is still fenced against every\n",
+		fmt.Fprintf(env.Stdout, "state    this restore did NOT finish, and %s is still fenced against every\n",
 			t.StateDir)
-		fmt.Printf("         billet: nothing can start a control plane on a half-restored\n")
-		fmt.Printf("         deployment. The fence is %s\n", state.MaintenanceFencePath(t.StateDir))
+		fmt.Fprintf(env.Stdout, "         billet: nothing can start a control plane on a half-restored\n")
+		fmt.Fprintf(env.Stdout, "         deployment. The fence is %s\n", state.MaintenanceFencePath(t.StateDir))
 	case errors.Is(err, os.ErrNotExist):
-		fmt.Printf("state    this restore did NOT run, and %s is NOT fenced — it is exactly\n",
+		fmt.Fprintf(env.Stdout, "state    this restore did NOT run, and %s is NOT fenced — it is exactly\n",
 			t.StateDir)
-		fmt.Printf("         as it was before this command started.\n")
+		fmt.Fprintf(env.Stdout, "         as it was before this command started.\n")
 	default:
-		fmt.Printf("state    this restore did NOT finish, and billet could not tell whether\n")
-		fmt.Printf("         %s is fenced (%v). Check that path before starting a\n",
+		fmt.Fprintf(env.Stdout, "state    this restore did NOT finish, and billet could not tell whether\n")
+		fmt.Fprintf(env.Stdout, "         %s is fenced (%v). Check that path before starting a\n",
 			state.MaintenanceFencePath(t.StateDir), err)
-		fmt.Printf("         control plane on this directory.\n")
+		fmt.Fprintf(env.Stdout, "         control plane on this directory.\n")
 	}
 	// NAMED ONLY IF IT IS THERE. A restore can fail BEFORE the journal exists —
 	// the writer barrier can time out, the re-derived plan can disagree with the
 	// printed one — and pointing an operator at a file that does not exist, on
 	// the day they are recovering a deployment, is its own small cruelty.
 	if _, err := os.Lstat(deployarchive.JournalPath(t.StateDir)); err == nil {
-		fmt.Printf("state    %s records what was published\n",
+		fmt.Fprintf(env.Stdout, "state    %s records what was published\n",
 			deployarchive.JournalPath(t.StateDir))
-		fmt.Println()
-		fmt.Printf("         run the same command again to continue from where it stopped, or\n")
-		fmt.Printf("         add --abandon to remove only the files this run created\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "         run the same command again to continue from where it stopped, or\n")
+		fmt.Fprintf(env.Stdout, "         add --abandon to remove only the files this run created\n")
 	} else {
-		fmt.Printf("state    nothing was published — this stopped before it began writing\n")
-		fmt.Println()
-		fmt.Printf("         resolve the above and run the same command again\n")
+		fmt.Fprintf(env.Stdout, "state    nothing was published — this stopped before it began writing\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "         resolve the above and run the same command again\n")
 	}
 
 	return cause
@@ -649,17 +649,17 @@ func partialRestore(t deployarchive.Target, cause error) error {
 
 // printRestored reports a finished restore, and the two things it does not
 // settle.
-func printRestored(a *deployarchive.Archive, t deployarchive.Target, res deployarchive.Result) {
-	fmt.Println()
+func printRestored(env cli.Env, a *deployarchive.Archive, t deployarchive.Target, res deployarchive.Result) {
+	fmt.Fprintln(env.Stdout)
 
 	// SAID DIFFERENTLY WHEN NOTHING MOVED, because "restored" over a run that
 	// installed nothing reads as though work was done.
 	if len(res.Installed) == 0 && len(res.Removed) == 0 {
-		fmt.Printf("Deployment %s was already in place in %s, and that is now confirmed\n",
+		fmt.Fprintf(env.Stdout, "Deployment %s was already in place in %s, and that is now confirmed\n",
 			a.Manifest.DeploymentID, t.StateDir)
-		fmt.Printf("under the lock: every piece matches this backup byte for byte.\n\n")
+		fmt.Fprintf(env.Stdout, "under the lock: every piece matches this backup byte for byte.\n\n")
 	} else {
-		fmt.Printf("Restored deployment %s into %s.\n\n", a.Manifest.DeploymentID, t.StateDir)
+		fmt.Fprintf(env.Stdout, "Restored deployment %s into %s.\n\n", a.Manifest.DeploymentID, t.StateDir)
 	}
 
 	// THE LEDGER MAY BE OLDER THAN THIS BINARY, and that is ordinary rather than
@@ -673,14 +673,14 @@ func printRestored(a *deployarchive.Archive, t deployarchive.Target, res deploya
 	// Printing it as the state of the thing they are about to start reinforces
 	// confidence in exactly the half billet asked THEM to vouch for.
 	if a.Manifest.Ledger.IsExternal() {
-		fmt.Printf("  this backup recorded the external ledger at schema %d when it was taken;\n",
+		fmt.Fprintf(env.Stdout, "  this backup recorded the external ledger at schema %d when it was taken;\n",
 			a.Manifest.Ledger.HighestVersion())
-		fmt.Printf("  billet did not inspect the database you restored, and a newer\n")
-		fmt.Printf("  `billet server` migrates whatever it finds there on its first start\n\n")
+		fmt.Fprintf(env.Stdout, "  billet did not inspect the database you restored, and a newer\n")
+		fmt.Fprintf(env.Stdout, "  `billet server` migrates whatever it finds there on its first start\n\n")
 	} else {
-		fmt.Printf("  the ledger is at schema %d; a newer `billet server` migrates it forward on\n",
+		fmt.Fprintf(env.Stdout, "  the ledger is at schema %d; a newer `billet server` migrates it forward on\n",
 			a.Manifest.Ledger.HighestVersion())
-		fmt.Printf("  its first start, exactly as it would any older ledger\n\n")
+		fmt.Fprintf(env.Stdout, "  its first start, exactly as it would any older ledger\n\n")
 	}
 
 	// OWNERSHIP IS THIS COMMAND'S JOB NOW, and the lines above say what it did.
@@ -688,17 +688,17 @@ func printRestored(a *deployarchive.Archive, t deployarchive.Target, res deploya
 	// files a preflight creates and no part of the authority — so a restored ca/
 	// stayed root-owned however many times it ran, and the control plane could
 	// not start.
-	fmt.Printf("  `billet local up` starts the services — it is what to run next\n\n")
+	fmt.Fprintf(env.Stdout, "  `billet local up` starts the services — it is what to run next\n\n")
 
-	fmt.Printf("BEFORE you reconnect nodes: this ledger has no lease for compute created after\n")
-	fmt.Printf("%s. Node recovery treats an instance with no lease as an orphan and destroys\n",
+	fmt.Fprintf(env.Stdout, "BEFORE you reconnect nodes: this ledger has no lease for compute created after\n")
+	fmt.Fprintf(env.Stdout, "%s. Node recovery treats an instance with no lease as an orphan and destroys\n",
 		a.Manifest.CreatedAt)
-	fmt.Printf("it, and GitHub does not requeue a job that already started. Inventory that\n")
-	fmt.Printf("compute and prove it gone first.\n")
+	fmt.Fprintf(env.Stdout, "it, and GitHub does not requeue a job that already started. Inventory that\n")
+	fmt.Fprintf(env.Stdout, "compute and prove it gone first.\n")
 }
 
 // runRestoreAbandon undoes an interrupted restore.
-func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
+func runRestoreAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archive,
 	t deployarchive.Target,
 ) error {
 	// THE FENCE COUNTS EVEN WITH NO JOURNAL. The journal is written just after
@@ -711,7 +711,7 @@ func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
 	}
 
 	if !pending {
-		fmt.Printf("No restore is in progress in %s; there is nothing to abandon.\n", t.StateDir)
+		fmt.Fprintf(env.Stdout, "No restore is in progress in %s; there is nothing to abandon.\n", t.StateDir)
 
 		return nil
 	}
@@ -722,11 +722,11 @@ func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
 	}
 
 	if prog.Present {
-		fmt.Printf("abandon  an interrupted restore from %s\n\n", prog.ArchiveDir)
+		fmt.Fprintf(env.Stdout, "abandon  an interrupted restore from %s\n\n", prog.ArchiveDir)
 	} else {
-		fmt.Printf("abandon  %s is fenced by a restore that did not get as far as recording\n",
+		fmt.Fprintf(env.Stdout, "abandon  %s is fenced by a restore that did not get as far as recording\n",
 			t.StateDir)
-		fmt.Printf("         anything; nothing was published, so only the fence comes down\n\n")
+		fmt.Fprintf(env.Stdout, "         anything; nothing was published, so only the fence comes down\n\n")
 	}
 
 	lock, err := lifecycleLock()
@@ -736,14 +736,14 @@ func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
 	res, err := deployarchive.Abandon(ctx, a, t, deployarchive.RestoreFresh)
 
 	for _, path := range res.Removed {
-		fmt.Printf("remove   %s\n", path)
+		fmt.Fprintf(env.Stdout, "remove   %s\n", path)
 	}
 
 	// KEPT IS THE INTERESTING HALF. A recorded path that no longer holds what
@@ -751,7 +751,7 @@ func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
 	// command must never do is delete a credential it cannot prove is a
 	// duplicate of one the backup still holds.
 	for _, path := range res.Kept {
-		fmt.Printf("keep     %s is no longer the file this restore wrote, so it was left alone\n",
+		fmt.Fprintf(env.Stdout, "keep     %s is no longer the file this restore wrote, so it was left alone\n",
 			path)
 	}
 
@@ -759,13 +759,13 @@ func runRestoreAbandon(ctx context.Context, a *deployarchive.Archive,
 		return err
 	}
 
-	fmt.Println()
-	fmt.Printf("Abandoned. %s is no longer fenced.\n", t.StateDir)
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "Abandoned. %s is no longer fenced.\n", t.StateDir)
 
 	if len(res.Kept) > 0 {
-		fmt.Println()
-		fmt.Println("Look at the files above before restoring again: billet keeps anything it")
-		fmt.Println("cannot prove it wrote, and one of them may be a credential.")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintln(env.Stdout, "Look at the files above before restoring again: billet keeps anything it")
+		fmt.Fprintln(env.Stdout, "cannot prove it wrote, and one of them may be a credential.")
 	}
 
 	return nil

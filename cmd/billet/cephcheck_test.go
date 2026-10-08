@@ -35,7 +35,7 @@ func TestAHostWithNoRBDFailsTheCheck(t *testing.T) {
 	// refuses to touch in a parallel test for exactly that reason.
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
 
-	err := checkCephCluster(t.Context(), &config.CephConfig{
+	err := checkCephCluster(t.Context(), processEnv(), &config.CephConfig{
 		User:      config.DefaultCephUser,
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",
@@ -75,7 +75,7 @@ func TestAHostWithNoRBDFailsTheCheck(t *testing.T) {
 func TestTheCheckRefusesAnAdministratorBeforeItLooksForRBD(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
 
-	err := checkCephCluster(t.Context(), &config.CephConfig{
+	err := checkCephCluster(t.Context(), processEnv(), &config.CephConfig{
 		User:      "admin",
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",
@@ -152,7 +152,7 @@ tiers:
 	}
 
 	stubGitHubUnverifiable(t)
-	err = cmdCheck(t.Context(), []string{"--config", cfgPath})
+	err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath})
 	if err == nil {
 		t.Fatal("billet check passed a firecracker host with no rbd command")
 	}
@@ -186,7 +186,7 @@ func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
 
 	t.Setenv("PATH", dir)
 
-	err := checkCephCluster(t.Context(), &config.CephConfig{
+	err := checkCephCluster(t.Context(), processEnv(), &config.CephConfig{
 		User:      config.DefaultCephUser,
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",
@@ -247,7 +247,7 @@ func stubCluster(t *testing.T, minCompat string) {
 func TestACloneV1ClusterFailsTheCheck(t *testing.T) {
 	stubCluster(t, "luminous")
 
-	err := checkCephCluster(t.Context(), &config.CephConfig{
+	err := checkCephCluster(t.Context(), processEnv(), &config.CephConfig{
 		User:      config.DefaultCephUser,
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",
@@ -271,7 +271,7 @@ func TestACloneV1ClusterFailsTheCheck(t *testing.T) {
 func TestACloneV2ClusterPassesTheCheck(t *testing.T) {
 	stubCluster(t, "mimic")
 
-	if err := checkCephCluster(t.Context(), &config.CephConfig{
+	if err := checkCephCluster(t.Context(), processEnv(), &config.CephConfig{
 		User:      config.DefaultCephUser,
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",

@@ -110,8 +110,8 @@ var (
 // each service is started, proved to have held its process, and only then
 // enabled. `enable --now` would commit a unit to every future boot before
 // anything established it can run at all.
-func cmdLocalUp(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local up", os.Stdout)
+func cmdLocalUp(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local up", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"report what would change and refuse nothing — no service is started, enabled "+
@@ -120,7 +120,7 @@ func cmdLocalUp(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return runLocalUp(ctx, upOptions{configPath: *cfgPath, dryRun: *dryRun})
+	return runLocalUp(ctx, env, upOptions{configPath: *cfgPath, dryRun: *dryRun})
 }
 
 // upOptions is what runLocalUp acts on.
@@ -134,7 +134,7 @@ type upOptions struct {
 	dryRun      bool
 }
 
-func runLocalUp(ctx context.Context, o upOptions) error {
+func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 	if o.servicePath == "" {
 		o.servicePath = initconfig.ServiceConfigPathFor(hostOS)
 	}
@@ -192,10 +192,10 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		return refused(refusals)
 	}
 
-	printPlan(plan)
+	printPlan(env, plan)
 
 	if o.dryRun {
-		fmt.Println("\nNothing was changed (--dry-run).")
+		fmt.Fprintln(env.Stdout, "\nNothing was changed (--dry-run).")
 
 		return nil
 	}
@@ -216,7 +216,7 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
@@ -233,7 +233,7 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 	// HERE, under the same lock, before anything is owned, checked or started: a
 	// closed authority is a retired controller, and nothing in this command
 	// starts one; restoring its record is all the bootstrap did.
-	if err := prepareHostForUp(ctx, req, cfg, uid, gid); err != nil {
+	if err := prepareHostForUp(ctx, env, req, cfg, uid, gid); err != nil {
 		return err
 	}
 
@@ -252,8 +252,8 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 	// PROVEN, NOT MERELY UNREFUTED. `billet check` reports an unreachable GitHub
 	// as advisory and exits 0, which is right for a diagnostic and wrong as a
 	// precondition for starting a control plane on somebody's organization.
-	fmt.Println()
-	report, err := check(ctx, checkOptions{configPath: o.configPath})
+	fmt.Fprintln(env.Stdout)
+	report, err := check(ctx, env, checkOptions{configPath: o.configPath})
 	if err != nil {
 		return err
 	}
@@ -280,11 +280,11 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 		return err
 	}
 	for _, path := range repaired {
-		fmt.Printf("own      %s given back to %s (the preflight opened the ledger as this user)\n",
+		fmt.Fprintf(env.Stdout, "own      %s given back to %s (the preflight opened the ledger as this user)\n",
 			path, initconfig.ServiceGroup)
 	}
 
-	if err := startUnits(ctx, c, req, plan); err != nil {
+	if err := startUnits(ctx, env, c, req, plan); err != nil {
 		return err
 	}
 
@@ -295,13 +295,13 @@ func runLocalUp(ctx context.Context, o upOptions) error {
 	// the two oneshot agents that act on rollouts and refresh images are
 	// installed here, and a schedule that could not be installed is an exit
 	// status, because a Mac that never updates is what it would otherwise be.
-	enableTimers(ctx, c, cfg, req)
+	enableTimers(ctx, env, c, cfg, req)
 
-	if err := enableScheduledAgents(ctx, c); err != nil {
+	if err := enableScheduledAgents(ctx, env, c); err != nil {
 		return err
 	}
 
-	return clearShutdownSeal(ctx, cfg, req)
+	return clearShutdownSeal(ctx, env, cfg, req)
 }
 
 // scheduledInstaller is the manager that can install a oneshot agent and load
@@ -320,7 +320,7 @@ type scheduledInstaller interface {
 // is reported as what it is — the services are up, the schedule is not — with
 // the same exit status a sealed deployment gets, because a script that brings a
 // host up and moves on would otherwise move on from a Mac that never updates.
-func enableScheduledAgents(ctx context.Context, c converger) error {
+func enableScheduledAgents(ctx context.Context, env cli.Env, c converger) error {
 	s, ok := c.(scheduledInstaller)
 	if !ok {
 		return nil
@@ -328,11 +328,11 @@ func enableScheduledAgents(ctx context.Context, c converger) error {
 
 	upgrade, images := s.Scheduled()
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	for _, label := range []string{upgrade, images} {
 		if err := s.EnableScheduled(ctx, label); err != nil {
-			fmt.Printf("schedule %s could not be installed: %v\n", label, err)
+			fmt.Fprintf(env.Stdout, "schedule %s could not be installed: %v\n", label, err)
 
 			return &cli.ExitError{
 				Code: 2,
@@ -342,7 +342,7 @@ func enableScheduledAgents(ctx context.Context, c converger) error {
 			}
 		}
 
-		fmt.Printf("schedule %s is installed and loaded\n", label)
+		fmt.Fprintf(env.Stdout, "schedule %s is installed and loaded\n", label)
 	}
 
 	return nil
@@ -364,7 +364,7 @@ func enableScheduledAgents(ctx context.Context, c converger) error {
 //
 // SYSTEMD ONLY, by the manager's name: launchd has no timers, and the Mac's
 // scheduled agents are enableScheduledAgents' job.
-func enableTimers(ctx context.Context, c converger, cfg *config.Config, req lifeops.UpRequest) {
+func enableTimers(ctx context.Context, env cli.Env, c converger, cfg *config.Config, req lifeops.UpRequest) {
 	if c.ManagerName() != "systemd" {
 		return
 	}
@@ -382,7 +382,7 @@ func enableTimers(ctx context.Context, c converger, cfg *config.Config, req life
 	for _, timer := range timers {
 		enablement, err := c.EnabledNow(ctx, timer)
 		if err != nil {
-			fmt.Printf("timer    %s: could not read its enablement (%v); run: systemctl enable --now %s\n",
+			fmt.Fprintf(env.Stdout, "timer    %s: could not read its enablement (%v); run: systemctl enable --now %s\n",
 				timer, err, timer)
 
 			continue
@@ -390,7 +390,7 @@ func enableTimers(ctx context.Context, c converger, cfg *config.Config, req life
 
 		if enablement.Enabled != lifeops.Yes {
 			if err := c.Enable(ctx, timer); err != nil {
-				fmt.Printf("timer    %s: could not be enabled (%v); run: systemctl enable --now %s\n",
+				fmt.Fprintf(env.Stdout, "timer    %s: could not be enabled (%v); run: systemctl enable --now %s\n",
 					timer, err, timer)
 
 				continue
@@ -398,13 +398,13 @@ func enableTimers(ctx context.Context, c converger, cfg *config.Config, req life
 		}
 
 		if err := c.StartTimer(ctx, timer); err != nil {
-			fmt.Printf("timer    %s: enabled but could not be started (%v); run: systemctl start %s\n",
+			fmt.Fprintf(env.Stdout, "timer    %s: enabled but could not be started (%v); run: systemctl start %s\n",
 				timer, err, timer)
 
 			continue
 		}
 
-		fmt.Printf("timer    %s enabled and armed\n", timer)
+		fmt.Fprintf(env.Stdout, "timer    %s enabled and armed\n", timer)
 	}
 }
 
@@ -429,21 +429,21 @@ func enableTimers(ctx context.Context, c converger, cfg *config.Config, req life
 //
 // AN OPERATOR'S SEAL IS THE EXCEPTION, and it is a real success: leaving it is
 // the correct outcome, decided deliberately, and nothing is left half done.
-func clearShutdownSeal(ctx context.Context, cfg *config.Config, req lifeops.UpRequest) error {
+func clearShutdownSeal(ctx context.Context, env cli.Env, cfg *config.Config, req lifeops.UpRequest) error {
 	if !req.WantServer {
 		return nil
 	}
 
 	db, err := openStateAdmin(ctx, cfg)
 	if err != nil {
-		return upButSealed(fmt.Errorf("open the ledger to reopen admission: %w", err))
+		return upButSealed(env, fmt.Errorf("open the ledger to reopen admission: %w", err))
 	}
 
 	defer db.Close()
 
 	current, err := db.Admission(ctx)
 	if err != nil {
-		return upButSealed(fmt.Errorf("read admission: %w", err))
+		return upButSealed(env, fmt.Errorf("read admission: %w", err))
 	}
 
 	if current.Mode == state.AdmissionOpen {
@@ -453,24 +453,24 @@ func clearShutdownSeal(ctx context.Context, cfg *config.Config, req lifeops.UpRe
 	resumed, err := db.Resume(ctx, state.ResumeRequest{
 		Expect: current.Generation,
 		Clears: state.ProvenanceLocalDown,
-		Actor:  actor(),
+		Actor:  actor(env),
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrAdmissionProvenance) {
-			fmt.Printf("\nseal     this deployment is still sealed, and NOT by a shutdown%s, so\n",
+			fmt.Fprintf(env.Stdout, "\nseal     this deployment is still sealed, and NOT by a shutdown%s, so\n",
 				byWhom(current))
-			fmt.Printf("         `billet local up` has left it alone. It takes no work until\n")
-			fmt.Printf("         somebody runs `billet resume`.\n")
+			fmt.Fprintf(env.Stdout, "         `billet local up` has left it alone. It takes no work until\n")
+			fmt.Fprintf(env.Stdout, "         somebody runs `billet resume`.\n")
 
 			return nil
 		}
 
-		return upButSealed(err)
+		return upButSealed(env, err)
 	}
 
-	fmt.Printf("\nseal     the shutdown seal is cleared at generation %d; this deployment is\n",
+	fmt.Fprintf(env.Stdout, "\nseal     the shutdown seal is cleared at generation %d; this deployment is\n",
 		resumed.Generation)
-	fmt.Printf("         taking work again\n")
+	fmt.Fprintf(env.Stdout, "         taking work again\n")
 
 	return nil
 }
@@ -479,9 +479,9 @@ func clearShutdownSeal(ctx context.Context, cfg *config.Config, req lifeops.UpRe
 //
 // Its own status because a caller acts on it differently from both outcomes it
 // sits between: the host is not broken, and it is not finished either.
-func upButSealed(cause error) error {
-	fmt.Printf("\nseal     the services are up, but admission could not be reopened: %v\n", cause)
-	fmt.Printf("         this deployment takes no work until `billet resume` runs\n")
+func upButSealed(env cli.Env, cause error) error {
+	fmt.Fprintf(env.Stdout, "\nseal     the services are up, but admission could not be reopened: %v\n", cause)
+	fmt.Fprintf(env.Stdout, "         this deployment takes no work until `billet resume` runs\n")
 
 	return &cli.ExitError{
 		Code: 2,
@@ -492,7 +492,7 @@ func upButSealed(cause error) error {
 
 // startUnits starts, proves and enables each unit in order, and unwinds the
 // enablement this run performed if a later one fails.
-func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
+func startUnits(ctx context.Context, env cli.Env, c converger, req lifeops.UpRequest,
 	plan lifeops.UpPlan,
 ) error {
 	var enabled []string
@@ -508,10 +508,10 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 		return err
 	}
 
-	rollback := func(cause error) error { return unwind(ctx, c, enabled, asFound, cause) }
+	rollback := func(cause error) error { return unwind(ctx, env, c, enabled, asFound, cause) }
 
 	for _, unit := range plan.Units {
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		// THE PLAN IS OLD BY NOW. `billet check` spent as long on the network as
 		// the network took, and in that time a unit can be edited and
@@ -533,9 +533,9 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 				return rollback(err)
 			}
 
-			fmt.Printf("enable   %s %s\n", unit.Name, orDefaultDetail(unit))
-			fmt.Printf("         (this manager cannot start a service that is not enabled, so " +
-				"this had to happen BEFORE the start below rather than after it; if the start " +
+			fmt.Fprintf(env.Stdout, "enable   %s %s\n", unit.Name, orDefaultDetail(unit))
+			fmt.Fprintf(env.Stdout, "         (this manager cannot start a service that is not enabled, so "+
+				"this had to happen BEFORE the start below rather than after it; if the start "+
 				"fails, this is undone)\n")
 		}
 
@@ -551,7 +551,7 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 				return rollback(err)
 			}
 
-			fmt.Printf("start    %s\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "start    %s\n", unit.Name)
 
 			// WHAT WAS PROVED IS THE BACKEND'S SENTENCE, because the two managers
 			// prove different things and the difference matters. systemd's units
@@ -574,9 +574,9 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 			if err := proveOthersUndisturbed(ctx, c, bystanders, unit.Name); err != nil {
 				return rollback(err)
 			}
-			fmt.Printf("         %s\n", proof)
+			fmt.Fprintf(env.Stdout, "         %s\n", proof)
 		} else {
-			fmt.Printf("start    %s is already running; left alone (a restart is a drain)\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "start    %s is already running; left alone (a restart is a drain)\n", unit.Name)
 
 			// THE PLAN'S SAMPLE IS OLD BY NOW: `billet check` talked to GitHub in
 			// between. Enabling on it would commit a service that has since begun
@@ -590,7 +590,7 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 
 		switch {
 		case !unit.Enable:
-			fmt.Printf("enable   %s is already enabled\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "enable   %s is already enabled\n", unit.Name)
 
 			continue
 
@@ -603,10 +603,10 @@ func startUnits(ctx context.Context, c converger, req lifeops.UpRequest,
 			return rollback(err)
 		}
 
-		fmt.Printf("enable   %s %s\n", unit.Name, orDefaultDetail(unit))
+		fmt.Fprintf(env.Stdout, "enable   %s %s\n", unit.Name, orDefaultDetail(unit))
 	}
 
-	fmt.Println("\nUp. `billet local status` reports what this machine is running.")
+	fmt.Fprintln(env.Stdout, "\nUp. `billet local status` reports what this machine is running.")
 
 	return nil
 }
@@ -745,7 +745,7 @@ func liveFor(ctx context.Context) (context.Context, context.CancelFunc) {
 }
 
 // unwind undoes the enablement one run performed, newest first.
-func unwind(ctx context.Context, c converger, enabled []string,
+func unwind(ctx context.Context, env cli.Env, c converger, enabled []string,
 	found map[string]lifeops.Enablement, cause error,
 ) error {
 	if len(enabled) == 0 {
@@ -763,7 +763,7 @@ func unwind(ctx context.Context, c converger, enabled []string,
 
 			continue
 		}
-		fmt.Printf("         (undid enabling %s)\n", unit)
+		fmt.Fprintf(env.Stdout, "         (undid enabling %s)\n", unit)
 	}
 
 	// AND WHAT THE UNDOING ITSELF DID. `systemctl disable` follows `[Install]
@@ -973,27 +973,27 @@ func refused(refusals []lifeops.Refusal) error {
 }
 
 // printPlan reports what will change before anything does.
-func printPlan(plan lifeops.UpPlan) {
+func printPlan(env cli.Env, plan lifeops.UpPlan) {
 	if len(plan.Ownership) == 0 && len(plan.Units) == 0 {
-		fmt.Println("plan     nothing to change")
+		fmt.Fprintln(env.Stdout, "plan     nothing to change")
 
 		return
 	}
 
 	for _, change := range plan.Ownership {
-		fmt.Printf("plan     %s -> %s:%s %04o\n", change.Path, change.Owner, change.Group, change.Mode.Perm())
-		fmt.Printf("         %s\n", change.Why)
+		fmt.Fprintf(env.Stdout, "plan     %s -> %s:%s %04o\n", change.Path, change.Owner, change.Group, change.Mode.Perm())
+		fmt.Fprintf(env.Stdout, "         %s\n", change.Why)
 	}
 	for _, unit := range plan.Units {
 		switch {
 		case unit.Start && unit.Enable:
-			fmt.Printf("plan     start and enable %s\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "plan     start and enable %s\n", unit.Name)
 		case unit.Start:
-			fmt.Printf("plan     start %s (already enabled)\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "plan     start %s (already enabled)\n", unit.Name)
 		case unit.Enable:
-			fmt.Printf("plan     enable %s (already running)\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "plan     enable %s (already running)\n", unit.Name)
 		default:
-			fmt.Printf("plan     %s is already running and enabled\n", unit.Name)
+			fmt.Fprintf(env.Stdout, "plan     %s is already running and enabled\n", unit.Name)
 		}
 	}
 }
@@ -1001,7 +1001,7 @@ func printPlan(plan lifeops.UpPlan) {
 // prepareHostForUp runs the privileged bootstrap for a Linux controller host
 // and refuses a closed authority. A node-only host, a darwin host or an
 // unprivileged run has nothing to prepare and nothing to refuse.
-func prepareHostForUp(ctx context.Context, req lifeops.UpRequest, cfg *config.Config, uid, gid int) error {
+func prepareHostForUp(ctx context.Context, env cli.Env, req lifeops.UpRequest, cfg *config.Config, uid, gid int) error {
 	if !req.WantServer || !retirement.Supported(hostOS) || os.Geteuid() != 0 || cfg.Server == nil {
 		return nil
 	}
@@ -1017,7 +1017,7 @@ func prepareHostForUp(ctx context.Context, req lifeops.UpRequest, cfg *config.Co
 	}
 
 	for _, path := range res.Repaired {
-		fmt.Printf("own      %s given back to %s (a privileged billet created it)\n", path, req.ServiceUser)
+		fmt.Fprintf(env.Stdout, "own      %s given back to %s (a privileged billet created it)\n", path, req.ServiceUser)
 	}
 
 	if res.Presence == retirement.StatusPresent && res.Status.Phase.Closed() {

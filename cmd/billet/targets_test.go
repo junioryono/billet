@@ -127,7 +127,7 @@ func TestCheckAtRepositoryScopeSkipsTheRunnerGroupProbeAndSaysSo(t *testing.T) {
 
 	var checkErr error
 
-	out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr != nil {
 		t.Fatalf("check at repository scope failed: %v\n%s", checkErr, out)
 	}
@@ -183,7 +183,7 @@ targets:
 
 	var checkErr error
 
-	out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr == nil {
 		t.Fatalf("a deployment with one uninstalled target passed the check:\n%s", out)
 	}
@@ -220,7 +220,7 @@ func TestGitHubAppCreateWritesANamedRepositoryTarget(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), []string{
+		err = githubAppCreate(t.Context(), processEnv(), []string{
 			"--repository", "someone/widgets", "--target", "personal", "--config", cfgPath, "--no-browser",
 		})
 	})
@@ -310,7 +310,7 @@ func TestGitHubAppCreateRefusesTwoScopesAndNone(t *testing.T) {
 		"a bad tgt":    {"--org", "acme", "--target", "has space"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := githubAppCreate(t.Context(), append(args, "--no-browser")); err == nil {
+			if err := githubAppCreate(t.Context(), processEnv(), append(args, "--no-browser")); err == nil {
 				t.Errorf("githubAppCreate accepted %s", name)
 			}
 		})
@@ -360,14 +360,14 @@ func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
 		t.Fatalf("tiers on personal = %v, want only personal-4vcpu", onPersonal)
 	}
 
-	err = cmdTeardown(t.Context(), []string{
+	err = cmdTeardown(t.Context(), processEnv(), []string{
 		"--config", cfgPath, "--tier", "billet-4vcpu", "--target", "personal", "--yes",
 	})
 	if err == nil || !strings.Contains(err.Error(), "is not a tier in the config") {
 		t.Fatalf("a name only default declares, scoped to personal: %v", err)
 	}
 
-	err = cmdTeardown(t.Context(), []string{"--config", cfgPath, "--all", "--target", "personal", "--yes"})
+	err = cmdTeardown(t.Context(), processEnv(), []string{"--config", cfgPath, "--all", "--target", "personal", "--yes"})
 	if err == nil || !strings.Contains(err.Error(), "--all walks every target") {
 		t.Fatalf("--all with --target: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
 func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", path, "--repository", "someone/widgets", "--provider", "firecracker",
 	}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -395,7 +395,7 @@ func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 
 	// Filled in the way `github-app create --config` fills them for THIS scope,
 	// so what is under test is everything init decided.
-	if err := writeGitHubBlock(path, githubBlock{
+	if err := writeGitHubBlock(processEnv(), path, githubBlock{
 		Repository: "someone/widgets", AppID: 1, InstallationID: 2,
 		PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
 	}); err != nil {
@@ -418,14 +418,14 @@ func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 		}
 	}
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--repository", "someone/widgets", "--provider", "firecracker",
 	}); err == nil {
 		t.Error("init accepted --org and --repository together")
 	}
 
-	if err := cmdInit(t.Context(), []string{
+	if err := cmdInit(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--repository", "widgets", "--provider", "firecracker",
 	}); err == nil || !strings.Contains(err.Error(), "--repository") {
@@ -458,7 +458,7 @@ targets:
 	}
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfgPath}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfgPath}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})

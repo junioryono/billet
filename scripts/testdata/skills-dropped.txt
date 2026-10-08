@@ -37,3 +37,4 @@ deedfda57b81 The two runServer order tests were replaced by TestOnlyTheProvingSt
 130e22663053 The end-to-end suite assembles through internal/app (#356 Phase 3c, ADR-015); the clock is steered through app.Steering, and the sentence says so.
 5678b07cd1a1 The signal lifecycle moved to internal/cli as cli.Lifecycle (#356 Phase 4); the sentence names its methods there.
 e49331495156 The exit-status type moved to internal/cli as cli.ExitError (#356 Phase 4); the sentence names it there.
+a2d34264e894 Operator output no longer belongs to cmd/billet as a package: a command writes to the cli.Env it is handed and only main names the process streams (#356 Phase 4); the sentence states the stream and environment bans that replaced it.

@@ -70,7 +70,7 @@ func TestStatusNamesTheHostsStillOnAnOlderProtocol(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -132,7 +132,7 @@ func TestStatusSaysWhenEveryHostHasConverged(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -164,7 +164,7 @@ func TestStatusDoesNotCallUnknownOrNewerHostsOlder(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})
@@ -236,7 +236,7 @@ func TestStatusTellsAnOldBuildFromOneThatOwesItsRelease(t *testing.T) {
 	)
 
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("status: %v", err)
 		}
 	})

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/config"
@@ -76,8 +78,8 @@ type retireIntentReport struct {
 // retireRequest is the request and, once its intent is recorded, the
 // transition; every answer it gives passes through ONE EXIT that says what the
 // host holds, so a path added later cannot forget to.
-func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
-	answer, r := retireRequestUnder(ctx, m)
+func retireRequest(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
+	answer, r := retireRequestUnder(ctx, env, m)
 	if r == nil {
 		// A SUCCESS SAYS WHAT THE HOST HOLDS TOO, READ WHEN IT ANSWERS. A
 		// preview takes no lock, so a mutating run can publish `intent` while
@@ -108,12 +110,12 @@ func retireRequest(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	return nil, annotateRetireState(r, stateNothingRetire)
 }
 
-func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal) {
+func retireRequestUnder(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
 	// A REFUSAL BEFORE ANYTHING IS READ ESTABLISHES NOTHING ABOUT THE HOST, and
 	// `nothing` is a statement (no retirement is under way here) this run has
 	// no business making: the input never arrived, or the lock and the guard
 	// are another run's, and the journal was never looked at.
-	raw, r := readRetireDocument(maxRetireInputBytes)
+	raw, r := readRetireDocument(env, maxRetireInputBytes)
 	if r != nil {
 		return nil, unexaminedRetireState(r)
 	}
@@ -191,7 +193,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 	// node, no configuration at all. This is every later converge of a retired
 	// host, and the run that finishes a tail another holder left.
 	if journalFact == retirement.JournalFactDone {
-		return retireDone(ctx, m, root, dir, shape, j)
+		return retireDone(ctx, env, m, root, dir, shape, j)
 	}
 
 	// AND A TRANSITION PAST THE ARCHIVE IS RESUMED FROM THE JOURNAL TOO. The
@@ -204,7 +206,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 	}
 
 	if past {
-		return retireResumeArchived(ctx, m, root, dir, shape, j)
+		return retireResumeArchived(ctx, env, m, root, dir, shape, j)
 	}
 
 	// THE CONFIGURATION IS OBSERVED UNDER THE LOCK, because everything below
@@ -326,7 +328,7 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 		return nil, retireUnknown(retireReasonJournal, "the intent answered no journal to drive", "")
 	}
 
-	return runRetireTransition(ctx, m, root, dir, obs, recorded)
+	return runRetireTransition(ctx, env, m, root, dir, obs, recorded)
 }
 
 // runRetireTransition drives the phases and, at `done`, finishes the tail.
@@ -334,10 +336,10 @@ func retireRequestUnder(ctx context.Context, m retireMode) (any, *retireRefusal)
 // A FAILURE INSIDE THE TRANSITION IS A REFUSAL whose `state` the exit reads
 // from the host: the phase this run last knew is not what the host holds. The
 // tail's own refusals are the same, and its success is the request's answer.
-func runRetireTransition(ctx context.Context, m retireMode, root *txLock, dir *os.File,
+func runRetireTransition(ctx context.Context, env cli.Env, m retireMode, root *txLock, dir *os.File,
 	obs *installedConfigObservation, j retirement.Journal,
 ) (any, *retireRefusal) {
-	j, steps, r := retireTransition(ctx, m, obs, j)
+	j, steps, r := retireTransition(ctx, env, m, obs, j)
 	if r != nil {
 		return nil, r
 	}
@@ -347,7 +349,7 @@ func runRetireTransition(ctx context.Context, m retireMode, root *txLock, dir *o
 			j.Phase, describeRetireSteps(steps)), "the runbook in docs/operating/upgrades.md")
 	}
 
-	return retireTail(ctx, m, root, dir, j, steps)
+	return retireTail(ctx, env, m, root, dir, j, steps)
 }
 
 // describeRetireSteps renders what this run did, for the answer.

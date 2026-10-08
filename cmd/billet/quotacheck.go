@@ -6,6 +6,8 @@ import (
 	"math"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -32,7 +34,7 @@ import (
 // number can move without billet hearing. Refusing a working deployment over a
 // stale or unreadable answer is the failure ADR-005 names, after which the next
 // thing anybody does is delete the check.
-func reportQuotas(ctx context.Context, cfg *config.Config, p provider.Provider) {
+func reportQuotas(ctx context.Context, env cli.Env, cfg *config.Config, p provider.Provider) {
 	reporter, ok := p.(provider.QuotaReporter)
 	if !ok {
 		return
@@ -44,12 +46,12 @@ func reportQuotas(ctx context.Context, cfg *config.Config, p provider.Provider) 
 	// failed must not discard the ones that answered — so the findings print
 	// first and the failures follow, rather than an error replacing a report.
 	for i := range quotas {
-		printQuota(cfg, quotas[i])
+		printQuota(env, cfg, quotas[i])
 	}
 
 	if err != nil {
-		fmt.Printf("  quota    NOT READ: %v\n", err)
-		fmt.Printf("           (this says billet could not ask, which is not the same as the " +
+		fmt.Fprintf(env.Stdout, "  quota    NOT READ: %v\n", err)
+		fmt.Fprintf(env.Stdout, "           (this says billet could not ask, which is not the same as the "+
 			"account having no limit)\n")
 
 		// THE NODE'S OWN ROLE DELIBERATELY LACKS THIS PERMISSION, so an access
@@ -60,9 +62,9 @@ func reportQuotas(ctx context.Context, cfg *config.Config, p provider.Provider) 
 		// permission granted for a diagnostic is a permission the machine holding
 		// the GitHub App key carries forever.
 		if strings.Contains(err.Error(), "AccessDenied") {
-			fmt.Printf("           A node's own role does not grant servicequotas on purpose: " +
-				"billet reads a quota only in this diagnostic, never at runtime. Run " +
-				"`billet check` under credentials that have servicequotas:GetServiceQuota " +
+			fmt.Fprintf(env.Stdout, "           A node's own role does not grant servicequotas on purpose: "+
+				"billet reads a quota only in this diagnostic, never at runtime. Run "+
+				"`billet check` under credentials that have servicequotas:GetServiceQuota "+
 				"and servicequotas:ListServiceQuotas, or read the limits in the console\n")
 		}
 	}
@@ -70,8 +72,8 @@ func reportQuotas(ctx context.Context, cfg *config.Config, p provider.Provider) 
 
 // printQuota renders one ceiling, and compares it to the configured number where
 // the two are about the same thing.
-func printQuota(cfg *config.Config, q provider.Quota) {
-	fmt.Printf("  quota    %s: %s (%s)\n", q.Scope, limitText(q.Limit, q.Unit), q.Code)
+func printQuota(env cli.Env, cfg *config.Config, q provider.Quota) {
+	fmt.Fprintf(env.Stdout, "  quota    %s: %s (%s)\n", q.Scope, limitText(q.Limit, q.Unit), q.Code)
 
 	want, matched := configuredAgainst(cfg, q)
 	if !matched {
@@ -79,7 +81,7 @@ func printQuota(cfg *config.Config, q provider.Quota) {
 	}
 
 	if float64(want) <= q.Limit {
-		fmt.Printf("           this deployment is configured for at most %d, which fits\n", want)
+		fmt.Fprintf(env.Stdout, "           this deployment is configured for at most %d, which fits\n", want)
 
 		return
 	}
@@ -88,10 +90,10 @@ func printQuota(cfg *config.Config, q provider.Quota) {
 	// raise the quota or lower the budget, and billet cannot tell which they
 	// meant — but meeting it as a queued build that failed hours later is the
 	// outcome this exists to prevent.
-	fmt.Printf("           OVER: this deployment is configured for up to %d, which the "+
+	fmt.Fprintf(env.Stdout, "           OVER: this deployment is configured for up to %d, which the "+
 		"account will not run\n", want)
-	fmt.Printf("           Raise it in Service Quotas, or lower node.max_vcpu / " +
-		"node.max_memory. Work past the limit does not queue politely: it is REFUSED, and " +
+	fmt.Fprintf(env.Stdout, "           Raise it in Service Quotas, or lower node.max_vcpu / "+
+		"node.max_memory. Work past the limit does not queue politely: it is REFUSED, and "+
 		"GitHub requeues a job at most three times\n")
 }
 

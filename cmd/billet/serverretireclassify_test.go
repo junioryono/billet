@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
@@ -663,7 +664,7 @@ func TestTheDryRunReportsTheJournalsHostsRatherThanTheInvocations(t *testing.T) 
 	f := newRetireFixture(t)
 	f.journalAt(t, retirement.PhaseIntent, "ci-1")
 
-	answer, refusal := retireDryRun(t.Context(), retireMode{configPath: f.cfg,
+	answer, refusal := retireDryRun(t.Context(), processEnv(), retireMode{configPath: f.cfg,
 		retiringHost: "inventory-retiring", survivorHost: "inventory-survivor"})
 	if refusal != nil {
 		t.Fatalf("the classifier refused the journal: %+v", refusal)
@@ -791,9 +792,9 @@ func TestTheDryRunReportsTheJournalWhenTheRowObservationBoundEnds(t *testing.T) 
 
 					return db, nil
 				}
-				retireReportOpenByLocator = func(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
+				retireReportOpenByLocator = func(ctx context.Context, env cli.Env, j retirement.Journal) (*state.DB, ledgerProblem) {
 					opens++
-					db, problem := savedLocator(ctx, j)
+					db, problem := savedLocator(ctx, env, j)
 					if problem.refusal != nil || problem.pending != "" || problem.cause != nil || db == nil {
 						t.Fatalf("the locator did not open and verify the ledger: %+v", problem)
 					}
@@ -935,7 +936,7 @@ func TestTheDryRunBoundsTheOwnersRunningReport(t *testing.T) {
 			statusOwnerOf = func(string) (uint32, uint32, error) { return 990, 991, nil }
 			calls := 0
 
-			retireReexecCapture = func(ctx context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
+			retireReexecCapture = func(ctx context.Context, _ cli.Env, uid, gid uint32, args []string) ([]byte, int, error) {
 				calls++
 				entered(ctx)
 				if uid != 990 || gid != 991 || strings.Join(args, " ") != "rollout status --json --config "+f.cfg {
@@ -1103,7 +1104,7 @@ func TestTheDryRunDistinguishesTheCallersCancellationFromItsRowBound(t *testing.
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	answer, refusal := retireDryRun(ctx, retireMode{configPath: f.cfg, retiringHost: "control-a"})
+	answer, refusal := retireDryRun(ctx, processEnv(), retireMode{configPath: f.cfg, retiringHost: "control-a"})
 	if refusal != nil {
 		t.Fatalf("the row's cancellation refused the local report: %+v", refusal)
 	}
@@ -1961,7 +1962,7 @@ func TestTheDryRunKeepsOwnerAndDirectLedgerPreconditionsInOrder(t *testing.T) {
 					}
 					return 0, 0, nil
 				}
-				retireReexecCapture = func(context.Context, uint32, uint32, []string) ([]byte, int, error) {
+				retireReexecCapture = func(context.Context, cli.Env, uint32, uint32, []string) ([]byte, int, error) {
 					t.Fatal("the ledger precondition or fence did not refuse before re-execution")
 					return nil, 0, errors.New("unexpected re-execution")
 				}
@@ -2024,7 +2025,7 @@ func TestTheDryRunAdmitsBinaryRecoveryBeforeTheOwnersReport(t *testing.T) {
 	})
 	statusEUID = func() int { return 0 }
 	statusOwnerOf = func(string) (uint32, uint32, error) { return 990, 991, nil }
-	retireReexecCapture = func(context.Context, uint32, uint32, []string) ([]byte, int, error) {
+	retireReexecCapture = func(context.Context, cli.Env, uint32, uint32, []string) ([]byte, int, error) {
 		t.Fatal("the maintenance fence did not refuse the owner's report before re-execution")
 		return nil, 0, errors.New("unexpected re-execution")
 	}

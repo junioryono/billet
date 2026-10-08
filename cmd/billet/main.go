@@ -67,9 +67,9 @@ func main() {
 func commands(lc *cli.Lifecycle) []cli.Command {
 	return []cli.Command{
 		{Name: "server", Summary: "run the control plane (run `billet node` alongside it to run jobs here)",
-			Run: func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
+			Run: func(ctx context.Context, env cli.Env, args []string) error { return cmdServer(ctx, env, lc, args) }},
 		{Name: "node", Summary: "run a compute host that dials a control plane",
-			Run: func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
+			Run: func(ctx context.Context, env cli.Env, args []string) error { return cmdNode(ctx, env, lc, args) }},
 		{Name: "nodes", Summary: "approve the machines asking to join this deployment",
 			Run: cmdNodes},
 		{Name: "ca", Summary: "issue the certificates nodes authenticate with",
@@ -144,14 +144,14 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
 }
 
-func cmdServer(ctx context.Context, lc *cli.Lifecycle, args []string) error {
+func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string) error {
 	// `billet server retire` is a controller's retirement, an operator command
 	// that runs under a converge guard; it never starts the plane.
 	if len(args) > 0 && args[0] == "retire" {
-		return cmdServerRetire(ctx, args[1:])
+		return cmdServerRetire(ctx, env, args[1:])
 	}
 
-	fs := cli.NewFlagSet("billet server", os.Stdout)
+	fs := cli.NewFlagSet("billet server", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
@@ -189,7 +189,7 @@ func cmdServer(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe, *holdProbeFlag)
+	return runServer(ctx, env, lc, cfg, *dryRun, *upgradeProbe, *holdProbeFlag)
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
@@ -201,7 +201,7 @@ func cmdServer(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 // scale-set clients, the probe's hold, the signals, and what exit status a stop
 // earns.
 func runServer(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	lc *cli.Lifecycle,
 	cfg *config.Config,
 	dryRun, upgradeProbe, holdProbeFlag bool,
@@ -214,7 +214,7 @@ func runServer(
 		return err
 	}
 
-	cp, err := app.OpenControlPlane(ctx, cfg, serverHost(), targets,
+	cp, err := app.OpenControlPlane(ctx, cfg, serverHost(env), targets,
 		app.ControlPlaneOptions{Probe: upgradeProbe})
 	if err != nil {
 		return err
@@ -223,10 +223,10 @@ func runServer(
 	defer cp.Close()
 
 	if upgradeProbe {
-		if err := notifyReady(); err != nil {
+		if err := notifyReady(env); err != nil {
 			return fmt.Errorf("server upgrade-probe readiness: %w", err)
 		}
-		holdProbe(ctx, holdProbeFlag, serverProbeReadyLine)
+		holdProbe(ctx, env, holdProbeFlag, serverProbeReadyLine)
 
 		return nil
 	}
@@ -250,7 +250,7 @@ func runServer(
 	if err != nil {
 		// THE FENCE IS READ AFTER THE ATTEMPT, not beside it: the claim's own
 		// write is one a successor can refuse.
-		return stoppedBeforeTheClaim(ctx, cp.LeadershipLost(), err)
+		return stoppedBeforeTheClaim(ctx, env, cp.LeadershipLost(), err)
 	}
 
 	// THE LOOPS ARE JOINED BEFORE THE LEDGER CLOSES: this runs ahead of cp.Close.
@@ -298,7 +298,7 @@ func runServer(
 		return explainGitHubAccess(ctx, cfg, err)
 	}
 
-	fmt.Println("billet server: stopped")
+	fmt.Fprintln(env.Stdout, "billet server: stopped")
 
 	return nil
 }
@@ -306,30 +306,30 @@ func runServer(
 // serverHost is what the control plane takes from this process and machine:
 // the identity exclusions the host authority provides, the service manager's
 // notifications, and stdout for the lines an operator reads.
-func serverHost() app.Host {
+func serverHost(env cli.Env) app.Host {
 	return app.Host{
 		ServerAccess:  serverWireAccess,
 		AuthorityLock: authorityLockAccess,
-		Ready:         notifyReady,
-		Status:        notifyStatus,
-		Out:           os.Stdout,
+		Ready:         func() error { return notifyReady(env) },
+		Status:        func(text string) error { return notifyStatus(env, text) },
+		Out:           env.Stdout,
 	}
 }
 
-func cmdNode(ctx context.Context, lc *cli.Lifecycle, args []string) error {
+func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string) error {
 	// THE NODE'S OWN SUBCOMMANDS, before the role's flags: the endpoint
 	// migration and the receipt are commands about the node this host runs,
 	// invoked by the role and never by the service.
 	if len(args) > 0 {
 		switch args[0] {
 		case "migrate-endpoint":
-			return cmdNodeMigrate(ctx, args[1:])
+			return cmdNodeMigrate(ctx, env, args[1:])
 		case "receipt":
-			return cmdNodeReceipt(ctx, args[1:])
+			return cmdNodeReceipt(ctx, env, args[1:])
 		}
 	}
 
-	fs := cli.NewFlagSet("billet node", os.Stdout)
+	fs := cli.NewFlagSet("billet node", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
 		"ask the control plane to admit this machine, then wait for an operator to approve it")
@@ -372,7 +372,7 @@ func cmdNode(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
 	// everything below reads.
 	if *enroll {
-		return enrollNode(ctx, cfg, bootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
+		return enrollNode(ctx, env, cfg, bootstrapBase(cfg, *bootstrapAddr), *caFingerprint, *joinToken)
 	}
 
 	upgrader, err := nodeUpgrader(cfg, *cfgPath)
@@ -393,10 +393,10 @@ func cmdNode(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	}()
 
 	if *upgradeProbe {
-		if err := notifyReady(); err != nil {
+		if err := notifyReady(env); err != nil {
 			return fmt.Errorf("node upgrade-probe readiness: %w", err)
 		}
-		holdProbe(ctx, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, n.Name()))
+		holdProbe(ctx, env, *holdProbeFlag, fmt.Sprintf(nodeProbeReadyFormat, n.Name()))
 
 		return nil
 	}
@@ -407,18 +407,18 @@ func cmdNode(ctx context.Context, lc *cli.Lifecycle, args []string) error {
 	defer stopDrainRequests()
 	publishNodeDrainReport(hostOS)
 
-	return n.Run(ctx, nodeHost(lc, hostOS))
+	return n.Run(ctx, nodeHost(env, lc, hostOS))
 }
 
 // nodeHost is what the node takes from this process and machine: the service
 // manager's notification, the drain request a stop may carry, the second
 // signal, stdout, and where the registration record is published on platform.
-func nodeHost(lc *cli.Lifecycle, platform string) app.NodeHost {
+func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 	return app.NodeHost{
-		Ready:                  notifyReady,
+		Ready:                  func() error { return notifyReady(env) },
 		DrainRequested:         nodeDrainRequested,
 		Hurry:                  lc.Hurry(),
-		Out:                    os.Stdout,
+		Out:                    env.Stdout,
 		RegistrationRecordPath: nodeRegistrationRecordPath(platform),
 	}
 }
@@ -435,8 +435,8 @@ func nodeHost(lc *cli.Lifecycle, platform string) app.NodeHost {
 // should delete a scale set: an operator restarting billet, or running it on a
 // second host, would find their tiers dismantled underneath them. Teardown is a
 // thing an operator asks for, once, on purpose.
-func cmdTeardown(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet teardown", os.Stdout)
+func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet teardown", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
@@ -502,7 +502,7 @@ func cmdTeardown(ctx context.Context, args []string) error {
 	// config does not describe. The operator is deleting by name in a group they
 	// named, and nothing was cross-checked against a tier definition.
 	if undeclared {
-		fmt.Printf("%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
+		fmt.Fprintf(env.Stdout, "%q is not a tier in %s. Deleting it by name from runner group %q.\n\n",
 			*tier, *cfgPath, groupOrDefault(*group))
 	}
 
@@ -539,19 +539,19 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			continue
 		}
 
-		if err := teardownOnTarget(ctx, cfg, target, mine, *force, *yes); err != nil {
+		if err := teardownOnTarget(ctx, env, cfg, target, mine, *force, *yes); err != nil {
 			return err
 		}
 	}
 
-	fmt.Println("Done.")
+	fmt.Fprintln(env.Stdout, "Done.")
 
 	return nil
 }
 
 // teardownOnTarget removes the wanted scale sets from one target.
 func teardownOnTarget(
-	ctx context.Context, cfg *config.Config, target config.GitHubTarget,
+	ctx context.Context, env cli.Env, cfg *config.Config, target config.GitHubTarget,
 	wanted []config.Tier, force, yes bool,
 ) error {
 	client, err := newScaleSetClientFor(ctx, cfg, target)
@@ -564,7 +564,7 @@ func teardownOnTarget(
 	// The ACTUAL objects, fetched before anything is destroyed. An operator
 	// confirming a destructive act should be shown what is on GitHub, not the
 	// names they typed into their own config.
-	fmt.Printf("This deletes the following from %s (target %s):\n\n", describeGitHubTarget(target), target.Name)
+	fmt.Fprintf(env.Stdout, "This deletes the following from %s (target %s):\n\n", describeGitHubTarget(target), target.Name)
 
 	present := make([]config.Tier, 0, len(wanted))
 
@@ -577,10 +577,10 @@ func teardownOnTarget(
 		}
 
 		if set == nil {
-			fmt.Printf("  %-32s not present\n", t.ScaleSetName())
+			fmt.Fprintf(env.Stdout, "  %-32s not present\n", t.ScaleSetName())
 
 			if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
-				fmt.Printf("  %-32s billet could not forget it (%v); the control plane "+
+				fmt.Fprintf(env.Stdout, "  %-32s billet could not forget it (%v); the control plane "+
 					"will keep reporting it\n", t.ScaleSetName(), err)
 			}
 
@@ -589,19 +589,19 @@ func teardownOnTarget(
 
 		present = append(present, *t)
 
-		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.ScaleSetName(), set.ID, set.Group, labels)
+		fmt.Fprintf(env.Stdout, "  %-32s id %d, group %s, labels %v\n", t.ScaleSetName(), set.ID, set.Group, labels)
 	}
 
 	if len(present) == 0 {
-		fmt.Println("\nNothing to do here.")
+		fmt.Fprintln(env.Stdout, "\nNothing to do here.")
 
 		return nil
 	}
 
-	fmt.Println("\nRunners already registered to them are removed by GitHub.")
+	fmt.Fprintln(env.Stdout, "\nRunners already registered to them are removed by GitHub.")
 
 	if !yes {
-		if err := confirmTarget(ctx, path); err != nil {
+		if err := confirmTarget(ctx, env, path); err != nil {
 			return err
 		}
 	}
@@ -619,14 +619,14 @@ func teardownOnTarget(
 		// here while the original survives — and an operator who reads that as
 		// "deleted" walks away from an object that is still there.
 		if !deleted {
-			fmt.Printf("%s: nothing in runner group %q; if it was created under a different "+
+			fmt.Fprintf(env.Stdout, "%s: nothing in runner group %q; if it was created under a different "+
 				"group it is still there\n", t.ScaleSetName(), groupOrDefault(t.RunnerGroup))
 
 			continue
 		}
 
 		if err := forgetScaleSet(ctx, cfg, path, groupOrDefault(t.RunnerGroup), t.ScaleSetName()); err != nil {
-			fmt.Printf("%s: deleted, but billet could not forget it had created it (%v); "+
+			fmt.Fprintf(env.Stdout, "%s: deleted, but billet could not forget it had created it (%v); "+
 				"the control plane will keep reporting it until this is cleared\n", t.ScaleSetName(), err)
 		}
 	}
@@ -649,7 +649,7 @@ func groupOrDefault(group string) string {
 // is and where it stays. The bundle it writes is copied to the node — the key
 // travels once, by an operator, rather than over a wire that does not yet trust
 // anybody.
-func cmdCA(ctx context.Context, args []string) error {
+func cmdCA(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca token | " +
 			"billet ca rotate | billet ca retire | billet ca revoke <node> | " +
@@ -658,21 +658,21 @@ func cmdCA(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "issue":
-		return cmdCAIssue(ctx, args[1:])
+		return cmdCAIssue(ctx, env, args[1:])
 	case "revoke":
-		return cmdCARevoke(ctx, args[1:])
+		return cmdCARevoke(ctx, env, args[1:])
 	case "revocations":
-		return cmdCARevocations(ctx, args[1:])
+		return cmdCARevocations(ctx, env, args[1:])
 	case "token":
-		return cmdCAToken(ctx, args[1:])
+		return cmdCAToken(ctx, env, args[1:])
 	case "rotate":
-		return cmdCARotate(ctx, args[1:])
+		return cmdCARotate(ctx, env, args[1:])
 	case "retire":
-		return cmdCARetire(ctx, args[1:])
+		return cmdCARetire(ctx, env, args[1:])
 	case "show":
-		return cmdCAShow(ctx, args[1:])
+		return cmdCAShow(ctx, env, args[1:])
 	case "sync":
-		return cmdCASync(ctx, args[1:])
+		return cmdCASync(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf(
@@ -689,8 +689,8 @@ func cmdCA(ctx context.Context, args []string) error {
 //
 // WRITES TO THE LEDGER, so it takes effect on the next request the revoked host
 // makes rather than at the next restart of anything.
-func cmdCARevoke(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca revoke", os.Stdout)
+func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca revoke", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
 	reason := fs.String("reason", "", "why, recorded alongside it")
@@ -742,16 +742,16 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Revoked %s (node %s)\n", serial, name)
-	fmt.Printf("\nIt is refused on the next request that certificate makes. Issue a replacement\n")
-	fmt.Printf("with `billet ca issue %s` if the machine is coming back.\n", name)
+	fmt.Fprintf(env.Stdout, "Revoked %s (node %s)\n", serial, name)
+	fmt.Fprintf(env.Stdout, "\nIt is refused on the next request that certificate makes. Issue a replacement\n")
+	fmt.Fprintf(env.Stdout, "with `billet ca issue %s` if the machine is coming back.\n", name)
 
 	return nil
 }
 
 // cmdCARevocations lists what has been withdrawn.
-func cmdCARevocations(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca revocations", os.Stdout)
+func cmdCARevocations(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca revocations", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -790,12 +790,12 @@ func cmdCARevocations(ctx context.Context, args []string) error {
 	}
 
 	if len(revoked) == 0 {
-		fmt.Println("No certificates have been revoked.")
+		fmt.Fprintln(env.Stdout, "No certificates have been revoked.")
 
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "SERIAL\tNODE\tREVOKED\tREASON")
 
 	for _, r := range revoked {
@@ -828,8 +828,8 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-func cmdCAIssue(ctx context.Context, args []string) (err error) {
-	fs := cli.NewFlagSet("billet ca issue", os.Stdout)
+func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
+	fs := cli.NewFlagSet("billet ca issue", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
 	reissue := fs.Bool("reissue", false,
@@ -949,7 +949,7 @@ func cmdCAIssue(ctx context.Context, args []string) (err error) {
 	// without which this credential can never be revoked. Handing an operator a
 	// bundle billet cannot take back is worse than handing them an error, and the
 	// error is recoverable — nothing has been written yet, so re-running is safe.
-	if err := recordIssued(ctx, *cfgPath, name, bundle); err != nil {
+	if err := recordIssued(ctx, env, *cfgPath, name, bundle); err != nil {
 		return err
 	}
 
@@ -973,7 +973,7 @@ func cmdCAIssue(ctx context.Context, args []string) (err error) {
 	}
 
 	if replaced {
-		fmt.Printf("billet ca: the previous bundle was moved to %s.replaced. The node keeps "+
+		fmt.Fprintf(env.Stdout, "billet ca: the previous bundle was moved to %s.replaced. The node keeps "+
 			"using its old key until this new bundle is installed and the node restarts, and "+
 			"the OLD certificate stays valid until you revoke it:\n\n"+
 			"  billet ca revoke %s --cert %s --reason reissued\n\n",
@@ -985,13 +985,13 @@ func cmdCAIssue(ctx context.Context, args []string) (err error) {
 		abs = dir
 	}
 
-	fmt.Printf("billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
-	fmt.Printf("  fingerprint  %s\n\n", wirecert.Fingerprint(mustSPKI(bundle)))
-	fmt.Print("Copy that directory to the node, then point its config at the files:\n\n")
-	fmt.Printf("  node:\n    tls:\n      cert: /etc/billet/tls/node.crt\n" +
+	fmt.Fprintf(env.Stdout, "billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
+	fmt.Fprintf(env.Stdout, "  fingerprint  %s\n\n", wirecert.Fingerprint(mustSPKI(bundle)))
+	fmt.Fprint(env.Stdout, "Copy that directory to the node, then point its config at the files:\n\n")
+	fmt.Fprintf(env.Stdout, "  node:\n    tls:\n      cert: /etc/billet/tls/node.crt\n"+
 		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n")
-	fmt.Print("node.name comes from the certificate, so it does not have to be written.\n")
-	fmt.Print("node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
+	fmt.Fprint(env.Stdout, "node.name comes from the certificate, so it does not have to be written.\n")
+	fmt.Fprint(env.Stdout, "node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
 
 	return nil
 }
@@ -1008,7 +1008,7 @@ func mustSPKI(b wirecert.Bundle) []byte {
 }
 
 // recordIssued writes a directly-issued certificate into the admission trail.
-func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bundle) error {
+func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle wirecert.Bundle) error {
 	leaf, err := wirecert.LeafOf(bundle)
 	if err != nil {
 		return fmt.Errorf("read back the certificate just issued to %s: %w", name, err)
@@ -1033,7 +1033,7 @@ func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bun
 	// SAID OUT LOUD, because this is the one path that can quietly retire a
 	// fingerprint an operator has already compared and trusted.
 	if displaced != "" {
-		fmt.Printf("\nNOTE: %s was already admitted as %s.\nThat key can no longer be used "+
+		fmt.Fprintf(env.Stdout, "\nNOTE: %s was already admitted as %s.\nThat key can no longer be used "+
 			"under this name; revoke its certificate if the machine still holds it.\n",
 			name, displaced)
 	}
@@ -1041,8 +1041,8 @@ func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bun
 	return nil
 }
 
-func cmdCAShow(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ca show", os.Stdout)
+func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ca show", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -1074,30 +1074,30 @@ func cmdCAShow(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("deployment  %s\nauthority   %s\nexpires     %s\nfingerprint %s\n",
+	fmt.Fprintf(env.Stdout, "deployment  %s\nauthority   %s\nexpires     %s\nfingerprint %s\n",
 		deployment, wirecert.CADir(cfg.Server.IdentityDir), ca.NotAfter().Format(time.RFC3339),
 		ca.Fingerprint())
 
 	if left, capping := ca.Capping(); capping {
-		fmt.Printf("\nWARNING: this authority expires in %s, which is less than a certificate's\n",
+		fmt.Fprintf(env.Stdout, "\nWARNING: this authority expires in %s, which is less than a certificate's\n",
 			left.Round(24*time.Hour))
-		fmt.Printf("full life, so every certificate it issues from now on is SHORTER than the\n")
-		fmt.Printf("last — and when it expires, every node stops at once. Nothing will error\n")
-		fmt.Printf("before that. Plan a rotation: issue a new authority, let nodes pick it up\n")
-		fmt.Printf("through renewal while both are trusted, then retire the old one.\n")
+		fmt.Fprintf(env.Stdout, "full life, so every certificate it issues from now on is SHORTER than the\n")
+		fmt.Fprintf(env.Stdout, "last — and when it expires, every node stops at once. Nothing will error\n")
+		fmt.Fprintf(env.Stdout, "before that. Plan a rotation: issue a new authority, let nodes pick it up\n")
+		fmt.Fprintf(env.Stdout, "through renewal while both are trusted, then retire the old one.\n")
 	}
 
-	fmt.Printf("\nGive the fingerprint to a node that is enrolling, so it can tell this control\n")
-	fmt.Printf("plane from anything else that answers:\n\n")
-	fmt.Printf("  billet node --enroll --ca-fingerprint %s%s\n",
+	fmt.Fprintf(env.Stdout, "\nGive the fingerprint to a node that is enrolling, so it can tell this control\n")
+	fmt.Fprintf(env.Stdout, "plane from anything else that answers:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet node --enroll --ca-fingerprint %s%s\n",
 		ca.Fingerprint(), enrollAddrFlag(cfg))
 
 	if cfg.Server.BootstrapListen == "" && !nodeplane.LoopbackOnly(cfg.Server.Listen) {
-		fmt.Printf("\nThis control plane serves no enrollment address, so that command has\n")
-		fmt.Printf("nowhere to ask: its node wire requires a certificate an enrolling machine\n")
-		fmt.Printf("does not have yet. Either issue the bundle here and copy it out of band:\n\n")
-		fmt.Printf("  billet ca issue <node>\n\n")
-		fmt.Printf("or set server.bootstrap_listen and restart.\n")
+		fmt.Fprintf(env.Stdout, "\nThis control plane serves no enrollment address, so that command has\n")
+		fmt.Fprintf(env.Stdout, "nowhere to ask: its node wire requires a certificate an enrolling machine\n")
+		fmt.Fprintf(env.Stdout, "does not have yet. Either issue the bundle here and copy it out of band:\n\n")
+		fmt.Fprintf(env.Stdout, "  billet ca issue <node>\n\n")
+		fmt.Fprintf(env.Stdout, "or set server.bootstrap_listen and restart.\n")
 	}
 
 	return nil
@@ -1124,7 +1124,7 @@ var iamEndpointOverride = ""
 // different things: an ec2 shape is an instance-hour, a codebuild compute type is a
 // build-minute rate expressed per hour, and an operator comparing the two numbers
 // needs to know which they are looking at.
-func printRemoteCost(cfg *config.Config) error {
+func printRemoteCost(env cli.Env, cfg *config.Config) error {
 	shapes := app.RemoteShapes(cfg)
 	if len(shapes) == 0 {
 		return nil
@@ -1142,14 +1142,14 @@ func printRemoteCost(cfg *config.Config) error {
 		return err
 	}
 
-	fmt.Printf("%-8s <= %s compute (%s/month at 730h), from declared shape prices\n",
+	fmt.Fprintf(env.Stdout, "%-8s <= %s compute (%s/month at 730h), from declared shape prices\n",
 		string(cfg.Node.Provider)+" max", &peak, peak.ForHours(730))
 
 	return nil
 }
 
-func cmdStatus(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet status", os.Stdout)
+func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet status", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -1173,36 +1173,36 @@ func cmdStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	printAdmission(admission)
+	printAdmission(env, admission)
 
 	// SECOND, AND FOR THE SAME REASON. A force-destroy is the one thing in billet
 	// that ends running work, so an operator who finds builds failing needs to see
 	// it before the capacity numbers that will look perfectly healthy underneath.
-	printForceDestroy(ctx, a, admission)
+	printForceDestroy(ctx, env, a, admission)
 
 	// AND A ROLLOUT IN ONE LINE, because it explains the other half of what an
 	// operator is looking at: hosts on two versions, capacity down by one machine,
 	// a node reporting nothing. `billet rollout status` is the full picture; this
 	// is what says to go and look at it.
-	printRollout(ctx, db)
+	printRollout(ctx, env, db)
 
 	// AND THE HOST'S OWN GUARD, read from this host's upgrade root and never
 	// from the ledger: a converge holding this host is why a rollout is refusing
 	// to move it.
-	printGuard()
+	printGuard(env)
 
 	// AND WHO THE DEPLOYMENT'S CONTROLLER IS, because the epoch beside it is a
 	// fence rather than a note. Every write is refused once that number moves, so
 	// an operator looking at a control plane that has gone quiet needs to be able
 	// to see whether something else took it over — and, on PostgreSQL, which
 	// machine to go and look at.
-	printController(ctx, db)
+	printController(ctx, env, db)
 
 	usage, err := a.Usage(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("capacity  %d of %d vCPU, %s of %s, %d open leases\n",
+	fmt.Fprintf(env.Stdout, "capacity  %d of %d vCPU, %s of %s, %d open leases\n",
 		usage.VCPU, cfg.Server.MaxVCPU, usage.Memory, cfg.Server.MaxMemory, usage.Leases)
 
 	// A CEILING BELOW THE HOSTS IS SILENT OTHERWISE. The deployment ceiling caps
@@ -1214,7 +1214,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	}
 
 	if hostVCPU > cfg.Server.MaxVCPU || hostMemory > cfg.Server.MaxMemory {
-		fmt.Printf("ceiling   BELOW THE HOSTS: the %d live hosts contribute %d vCPU and %s, "+
+		fmt.Fprintf(env.Stdout, "ceiling   BELOW THE HOSTS: the %d live hosts contribute %d vCPU and %s, "+
 			"and server.max_vcpu / max_memory allow %d and %s, so the ceiling, not the hosts, "+
 			"decides what runs; raise the ceiling to the hosts' sum, or cap a host with "+
 			"node.max_vcpu / max_memory\n",
@@ -1228,7 +1228,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	for _, target := range targets {
 		if len(targets) > 1 {
-			fmt.Printf("target    %s (%s)\n", target.Name, describeGitHubTarget(target))
+			fmt.Fprintf(env.Stdout, "target    %s (%s)\n", target.Name, describeGitHubTarget(target))
 		}
 
 		for i := range cfg.Tiers {
@@ -1241,23 +1241,23 @@ func cmdStatus(ctx context.Context, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(os.Stdout, tierDisplay(t), report, time.Now())
+			printTierCapacity(env.Stdout, tierDisplay(t), report, time.Now())
 		}
 	}
 
-	if err := printRemoteFleetCost(ctx, a, cfg); err != nil {
+	if err := printRemoteFleetCost(ctx, env, a, cfg); err != nil {
 		return err
 	}
 
 	// WHAT THE CONTROL PLANE HAS SWEPT out of Parameter Store, and which codebuild
 	// hosts it cannot sweep after. A leaked registration is one nobody sees, which
 	// is why the count is durable and printed rather than logged.
-	printCredentialSweeps(ctx, a, db)
+	printCredentialSweeps(ctx, env, a, db)
 
-	printReportedInventory(ctx, a)
-	printComputeBarrier(ctx, a)
-	printWireWindow(ctx, a)
-	printCacheAwareWaits(ctx, a, cfg.Tiers)
+	printReportedInventory(ctx, env, a)
+	printComputeBarrier(ctx, env, a)
+	printWireWindow(ctx, env, a)
+	printCacheAwareWaits(ctx, env, a, cfg.Tiers)
 
 	held, err := a.Held(ctx)
 	if err != nil {
@@ -1266,17 +1266,17 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	// A RUNNING LEASE WHOSE HOLDER WAS REPLACED IS NOT HELD, and is exactly the
 	// slot an operator finds taken with nothing below saying why.
-	printReplacedHolders(ctx, a)
+	printReplacedHolders(ctx, env, a)
 
 	if len(held) == 0 {
-		fmt.Println("held      none")
+		fmt.Fprintln(env.Stdout, "held      none")
 
 		return nil
 	}
 
-	fmt.Printf("held      %d lease(s) waiting for compute to be confirmed gone\n", len(held))
-	printHeld(held)
-	printHolderNote(os.Stdout, held)
+	fmt.Fprintf(env.Stdout, "held      %d lease(s) waiting for compute to be confirmed gone\n", len(held))
+	printHeld(env, held)
+	printHolderNote(env.Stdout, held)
 
 	return nil
 }
@@ -1299,21 +1299,21 @@ func cmdStatus(ctx context.Context, args []string) error {
 // column is ten characters wide — `admission`, `protocol`, `barrier`, `force`,
 // `capacity`, `tier`, `rollout`, `held` — and `controller` fills all ten, so the
 // value would start one column right of every other line.
-func printController(ctx context.Context, db *state.DB) {
+func printController(ctx context.Context, env cli.Env, db *state.DB) {
 	claim, err := db.ControllerHolder(ctx)
 	if err != nil {
-		fmt.Printf("claim     unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "claim     unavailable: %v\n", err)
 
 		return
 	}
 
 	if claim.Holder == "" {
-		fmt.Println("claim     nothing has ever claimed this deployment's controller")
+		fmt.Fprintln(env.Stdout, "claim     nothing has ever claimed this deployment's controller")
 
 		return
 	}
 
-	fmt.Printf("claim     %s holds this deployment's controller, at epoch %d\n",
+	fmt.Fprintf(env.Stdout, "claim     %s holds this deployment's controller, at epoch %d\n",
 		claim.Holder, claim.Epoch)
 }
 
@@ -1323,10 +1323,10 @@ func printController(ctx context.Context, db *state.DB) {
 // it was scoped to `provider = 'ec2'`, so a deployment whose cloud capacity was
 // codebuild printed nothing here — and the absence of a cost line is exactly what a
 // free fleet looks like. See alloc.RemoteCostNodes.
-func printRemoteFleetCost(ctx context.Context, a *alloc.Allocator, cfg *config.Config) error {
+func printRemoteFleetCost(ctx context.Context, env cli.Env, a *alloc.Allocator, cfg *config.Config) error {
 	nodes, err := a.RemoteCostNodes(ctx)
 	if errors.Is(err, alloc.ErrRemoteCostUnavailable) {
-		fmt.Printf("cloud peak  unavailable (%v)\n", err)
+		fmt.Fprintf(env.Stdout, "cloud peak  unavailable (%v)\n", err)
 
 		return nil
 	}
@@ -1342,14 +1342,14 @@ func printRemoteFleetCost(ctx context.Context, a *alloc.Allocator, cfg *config.C
 	if err != nil {
 		return err
 	}
-	fmt.Printf("cloud peak <= %s compute (%s/month at 730h), across %d registered remote node(s) from declared shape prices\n",
+	fmt.Fprintf(env.Stdout, "cloud peak <= %s compute (%s/month at 730h), across %d registered remote node(s) from declared shape prices\n",
 		&peak, peak.ForHours(730), len(nodes))
 
 	return nil
 }
 
-func cmdVersion(_ context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet version", os.Stdout)
+func cmdVersion(_ context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet version", env.Stdout)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -1357,10 +1357,10 @@ func cmdVersion(_ context.Context, args []string) error {
 	// The release version, not just the revision. This printed a bare commit sha,
 	// which is true and unhelpful: an operator comparing what is installed against
 	// what was released has to go and look the sha up.
-	fmt.Printf("billet %s\n", version.String())
+	fmt.Fprintf(env.Stdout, "billet %s\n", version.String())
 
 	if info, ok := debug.ReadBuildInfo(); ok {
-		fmt.Printf("  go %s\n", info.GoVersion)
+		fmt.Fprintf(env.Stdout, "  go %s\n", info.GoVersion)
 	}
 
 	return nil
@@ -1379,7 +1379,7 @@ func cmdVersion(_ context.Context, args []string) error {
 // bounded by the metadata client's own short timeout, because the common failure
 // is that this is not an EC2 instance at all.
 func checkEC2Credentials(
-	ctx context.Context, cfg *config.Config, bundle *wirecert.Bundle,
+	ctx context.Context, env cli.Env, cfg *config.Config, bundle *wirecert.Bundle,
 	authorize, maintenanceProbe bool,
 ) error {
 	// FIRST, before credentials resolve or anything dials AWS: during the
@@ -1388,7 +1388,7 @@ func checkEC2Credentials(
 	// call used to survive the skip; it is a network call like the rest, and
 	// the probe's job is the ledger and the config, not the cloud.
 	if maintenanceProbe {
-		fmt.Printf("aws      (all AWS checks skipped during maintenance)\n")
+		fmt.Fprintf(env.Stdout, "aws      (all AWS checks skipped during maintenance)\n")
 
 		return nil
 	}
@@ -1436,21 +1436,21 @@ func checkEC2Credentials(
 	// what this node will run as. Advisory; see reportQuotas.
 	if p, err := ec2.New(deploymentForCheck, ec2cfg,
 		ec2.WithCredentials(awscreds.Static(creds))); err == nil {
-		reportQuotas(ctx, cfg, p)
+		reportQuotas(ctx, env, cfg, p)
 	}
 
-	fmt.Printf("aws      %s in %s, subnet %s, %d instance shape(s), credentials %s (can describe)\n",
+	fmt.Fprintf(env.Stdout, "aws      %s in %s, subnet %s, %d instance shape(s), credentials %s (can describe)\n",
 		spotLabel(ec2cfg.Spot), ec2cfg.Region, ec2cfg.SubnetID, len(ec2cfg.InstanceTypes),
 		creds.AccessKeyID)
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. A read-only call says
 	// nothing about permission to LAUNCH, and an operator who reads "ok" and then
 	// watches every job fail on an IAM denial has been misled by this line.
-	fmt.Printf("         (describe only — launching also needs at least ec2:RunInstances, " +
-		"ec2:TerminateInstances, ec2:CreateTags and ec2:DescribeImages, plus iam:PassRole " +
+	fmt.Fprintf(env.Stdout, "         (describe only — launching also needs at least ec2:RunInstances, "+
+		"ec2:TerminateInstances, ec2:CreateTags and ec2:DescribeImages, plus iam:PassRole "+
 		"if node.ec2.instance_profile is set)\n")
 	if ec2cfg.Spot {
-		fmt.Printf("         spot warnings are consumed from interruption_queue_url; the role also " +
+		fmt.Fprintf(env.Stdout, "         spot warnings are consumed from interruption_queue_url; the role also "+
 			"needs sqs:ReceiveMessage, sqs:DeleteMessage and sqs:GetQueueAttributes on that queue\n")
 	}
 
@@ -1458,10 +1458,10 @@ func checkEC2Credentials(
 	// expected to run fork pull requests on rented machines and finds them queuing
 	// forever has no other way to see why.
 	if len(ec2cfg.UntrustedSecurityGroupIDs) == 0 {
-		fmt.Printf("         untrusted work will be refused: no untrusted_security_group_ids\n")
+		fmt.Fprintf(env.Stdout, "         untrusted work will be refused: no untrusted_security_group_ids\n")
 	}
 
-	return ec2Preflight(ctx, cfg, ec2cfg, awscreds.Static(creds), bundle, authorize)
+	return ec2Preflight(ctx, env, cfg, ec2cfg, awscreds.Static(creds), bundle, authorize)
 }
 
 // ec2Preflight proves the subnet, security groups and tier AMIs a launch depends
@@ -1475,7 +1475,7 @@ func checkEC2Credentials(
 // writes a placeholder for `billet ami build` to replace, so a not-yet-built image
 // is an expected intermediate state rather than a broken config.
 func ec2Preflight(
-	ctx context.Context, cfg *config.Config, ec2cfg config.EC2Config, creds awscreds.Source,
+	ctx context.Context, env cli.Env, cfg *config.Config, ec2cfg config.EC2Config, creds awscreds.Source,
 	bundle *wirecert.Bundle, authorize bool,
 ) error {
 	region, endpoint := ec2cfg.Region, ec2cfg.Endpoint
@@ -1485,7 +1485,7 @@ func ec2Preflight(
 		return fmt.Errorf("node.ec2: %w", err)
 	}
 
-	fmt.Printf("subnet   %s in vpc %s, zone %s (%s)\n",
+	fmt.Fprintf(env.Stdout, "subnet   %s in vpc %s, zone %s (%s)\n",
 		subnet.SubnetID, subnet.VPCID, subnet.AvailabilityZone, subnet.State)
 
 	// AN EBS CACHE VOLUME CANNOT ATTACH ACROSS ZONES, so the cache's zone must be
@@ -1511,7 +1511,7 @@ func ec2Preflight(
 		}
 	}
 
-	fmt.Printf("groups   %d security group(s), all in vpc %s\n", len(groups), subnet.VPCID)
+	fmt.Fprintf(env.Stdout, "groups   %d security group(s), all in vpc %s\n", len(groups), subnet.VPCID)
 
 	amis := distinctEC2TierAMIs(cfg)
 
@@ -1521,7 +1521,7 @@ func ec2Preflight(
 		// is no AMI to resolve here. Said, rather than passing silently as if the
 		// images had been checked. The authorization dry-runs below still run: a
 		// fleet node launches and tears down compute too.
-		fmt.Printf("images   no tiers in this file, so no AMI to check " +
+		fmt.Fprintf(env.Stdout, "images   no tiers in this file, so no AMI to check "+
 			"(a fleet node's tiers live on the control plane)\n")
 	} else {
 		resolved, err := ec2.DescribeImageStates(ctx, region, endpoint, creds, amis)
@@ -1538,10 +1538,10 @@ func ec2Preflight(
 			if reason == "" {
 				reason = "not found in this account or region"
 			}
-			fmt.Printf("image    %s is not resolvable yet (%s) — build it with `billet ami build` "+
+			fmt.Fprintf(env.Stdout, "image    %s is not resolvable yet (%s) — build it with `billet ami build` "+
 				"and paste the id\n", img.ImageID, reason)
 		case img.State != "available":
-			fmt.Printf("image    %s is %s, not yet available\n", img.ImageID, img.State)
+			fmt.Fprintf(env.Stdout, "image    %s is %s, not yet available\n", img.ImageID, img.State)
 		case img.Contract < ec2.AMIContract:
 			// A WARNING, NOT A REFUSAL. An image below the contract still runs jobs
 			// correctly; what it loses is the Docker cache, silently — every job
@@ -1580,11 +1580,11 @@ func ec2Preflight(
 			}
 			missing := strings.Join(gaps, "; ")
 
-			fmt.Printf("image    %s meets AMI contract %d and this billet wants %d (built by "+
+			fmt.Fprintf(env.Stdout, "image    %s meets AMI contract %d and this billet wants %d (built by "+
 				"%s) — %s; rebuild with `billet ami build`\n",
 				img.ImageID, img.Contract, ec2.AMIContract, built, missing)
 		default:
-			fmt.Printf("image    %s available (AMI contract %d)\n", img.ImageID, img.Contract)
+			fmt.Fprintf(env.Stdout, "image    %s available (AMI contract %d)\n", img.ImageID, img.Contract)
 		}
 	}
 
@@ -1596,14 +1596,14 @@ func ec2Preflight(
 		arn, err := ec2.CheckInterruptionQueue(ctx, region, creds, ec2cfg.InterruptionQueueURL)
 		switch {
 		case err == nil:
-			fmt.Printf("spot     interruption queue answers (%s)\n", arn)
+			fmt.Fprintf(env.Stdout, "spot     interruption queue answers (%s)\n", arn)
 		case ec2.QueueProbeInconclusive(err):
 			// A fact about the CHECKING identity: a role provisioned before
 			// sqs:GetQueueAttributes joined the generated grant refuses this
 			// probe while consuming warnings perfectly well.
-			fmt.Printf("spot     queue probe INCONCLUSIVE: %v\n", err)
-			fmt.Printf("         (this identity may not read queue attributes — a role from " +
-				"before the probe existed lacks sqs:GetQueueAttributes; regenerate it with " +
+			fmt.Fprintf(env.Stdout, "spot     queue probe INCONCLUSIVE: %v\n", err)
+			fmt.Fprintf(env.Stdout, "         (this identity may not read queue attributes — a role from "+
+				"before the probe existed lacks sqs:GetQueueAttributes; regenerate it with "+
 				"`billet init iam`)\n")
 		default:
 			return fmt.Errorf("node.ec2: %w", err)
@@ -1619,14 +1619,14 @@ func ec2Preflight(
 			ec2cfg.InstanceProfile)
 		switch {
 		case err != nil:
-			fmt.Printf("profile  %s UNVERIFIED: %v\n", ec2cfg.InstanceProfile, err)
+			fmt.Fprintf(env.Stdout, "profile  %s UNVERIFIED: %v\n", ec2cfg.InstanceProfile, err)
 		case verdict == ec2.ProfileFound:
-			fmt.Printf("profile  %s exists\n", ec2cfg.InstanceProfile)
+			fmt.Fprintf(env.Stdout, "profile  %s exists\n", ec2cfg.InstanceProfile)
 		case verdict == ec2.ProfileMissing:
 			return fmt.Errorf("node.ec2.instance_profile %q does not exist in this account (%s); "+
 				"a trusted job's launch will fail on it", ec2cfg.InstanceProfile, reason)
 		default:
-			fmt.Printf("profile  %s could not be checked (%s) — this says the CHECKING identity "+
+			fmt.Fprintf(env.Stdout, "profile  %s could not be checked (%s) — this says the CHECKING identity "+
 				"may not read IAM, not that the profile is wrong. billet's own generated node "+
 				"policy deliberately grants no iam:GetInstanceProfile; run check with operator "+
 				"credentials to verify the profile\n", ec2cfg.InstanceProfile, reason)
@@ -1642,7 +1642,7 @@ func ec2Preflight(
 		case err != nil:
 			return fmt.Errorf("node.ebs_s3: resolve the deployment identity: %w", err)
 		case owner == "":
-			fmt.Printf("cache    bucket probe skipped: no deployment identity minted yet " +
+			fmt.Fprintf(env.Stdout, "cache    bucket probe skipped: no deployment identity minted yet "+
 				"(it is minted on the server's first start)\n")
 		default:
 			// The SAME namespace the runtime and decommission use, or the probe
@@ -1667,12 +1667,12 @@ func ec2Preflight(
 						"line above)"
 				}
 
-				fmt.Printf("cache    bucket %s answers under this deployment's prefix%s\n",
+				fmt.Fprintf(env.Stdout, "cache    bucket %s answers under this deployment's prefix%s\n",
 					cfg.Node.EBSS3.Bucket, reachable)
 			case cacheProbeInconclusive:
-				fmt.Printf("cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
-				fmt.Printf("         (a 403 here is EITHER a refused identity OR a healthy miss " +
-					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot " +
+				fmt.Fprintf(env.Stdout, "cache    bucket probe INCONCLUSIVE: %v\n", probeErr)
+				fmt.Fprintf(env.Stdout, "         (a 403 here is EITHER a refused identity OR a healthy miss "+
+					"under billet's minimal grant, whose prefix-conditioned ListBucket cannot "+
 					"match a GetObject; a real job read will settle it)\n")
 			case cacheProbeFailed:
 				return fmt.Errorf("node.ebs_s3: %w", probeErr)
@@ -1681,13 +1681,13 @@ func ec2Preflight(
 	}
 
 	if !authorize {
-		fmt.Printf("         (launch authority not checked — pass --authorize to dry-run " +
+		fmt.Fprintf(env.Stdout, "         (launch authority not checked — pass --authorize to dry-run "+
 			"RunInstances; a DryRun has no side effect)\n")
 
 		return nil
 	}
 
-	return ec2Authorize(ctx, cfg, ec2cfg, creds, bundle, images)
+	return ec2Authorize(ctx, env, cfg, ec2cfg, creds, bundle, images)
 }
 
 // ec2Authorize dry-runs the launch a job needs, to prove the role may RunInstances
@@ -1735,7 +1735,7 @@ func hasEC2Tier(cfg *config.Config) bool {
 }
 
 func ec2Authorize(
-	ctx context.Context, cfg *config.Config, ec2cfg config.EC2Config, creds awscreds.Source,
+	ctx context.Context, env cli.Env, cfg *config.Config, ec2cfg config.EC2Config, creds awscreds.Source,
 	bundle *wirecert.Bundle, images []ec2.ImageInfo,
 ) error {
 	// THE PROBE MUST TAG AS THIS DEPLOYMENT, or a per-deployment IAM policy — which
@@ -1750,9 +1750,9 @@ func ec2Authorize(
 	}
 
 	if owner == "" {
-		fmt.Printf("         (launch authority not checked — this deployment's identity is not " +
-			"known here yet, so a dry-run cannot tag as a per-deployment IAM policy requires; " +
-			"enroll this node, or run `billet server` once to mint it, then re-run with " +
+		fmt.Fprintf(env.Stdout, "         (launch authority not checked — this deployment's identity is not "+
+			"known here yet, so a dry-run cannot tag as a per-deployment IAM policy requires; "+
+			"enroll this node, or run `billet server` once to mint it, then re-run with "+
 			"--authorize)\n")
 
 		return nil
@@ -1808,7 +1808,7 @@ func ec2Authorize(
 		netBad := trust == provider.TrustUntrusted && len(ec2cfg.UntrustedSecurityGroupIDs) == 0
 
 		if netBad {
-			fmt.Printf("authz    %s runs untrusted work but node.ec2.untrusted_security_group_ids "+
+			fmt.Fprintf(env.Stdout, "authz    %s runs untrusted work but node.ec2.untrusted_security_group_ids "+
 				"is empty — the node refuses it, so its launch is not probed\n", t.Label)
 			skipped++
 		}
@@ -1840,7 +1840,7 @@ func ec2Authorize(
 				return fmt.Errorf("node.ec2: dry-run launch %s on %s: %w", t.Label, shape.Type, err)
 			}
 
-			hard, verdict := reportAuthz(
+			hard, verdict := reportAuthz(env,
 				fmt.Sprintf("launch %s on %s (%s)", t.Label, shape.Type, trustName(trust)), res)
 			fatal = hard || fatal
 			if verdict {
@@ -1854,32 +1854,32 @@ func ec2Authorize(
 		// A fleet node file: its tiers and AMIs live on the control plane, so there
 		// is nothing here to dry-run. Launch authority is genuinely unproven — said,
 		// not misdirected to `billet ami build`.
-		fmt.Printf("         (launch authority not checked — this file declares no ec2 tiers, so " +
+		fmt.Fprintf(env.Stdout, "         (launch authority not checked — this file declares no ec2 tiers, so "+
 			"there is no launch to dry-run; a fleet node's tiers live on the control plane)\n")
 	case probed == 0 && skipped > 0 && unresolvable == 0:
 		// EVERY ec2 tier was SKIPPED (untrusted with no untrusted network), none
 		// blocked by an AMI — the skip lines above already said why, so do not
 		// misdirect to `billet ami build`.
-		fmt.Printf("         (launch authority not checked — every ec2 tier was skipped above; " +
+		fmt.Fprintf(env.Stdout, "         (launch authority not checked — every ec2 tier was skipped above; "+
 			"give them an untrusted network to probe)\n")
 	case probed == 0 && skipped > 0:
 		// A MIX: some tiers skipped for a missing network, some for an unresolvable
 		// AMI. Name BOTH remedies rather than misattributing one cause to all.
-		fmt.Printf("         (launch authority not checked — no ec2 tier could be dry-run: build " +
+		fmt.Fprintf(env.Stdout, "         (launch authority not checked — no ec2 tier could be dry-run: build "+
 			"the AMIs named above (`billet ami build`) and give untrusted tiers a network)\n")
 	case probed == 0:
-		fmt.Printf("authz    no ec2 tier has a resolvable AMI to dry-run a launch with; build one " +
+		fmt.Fprintf(env.Stdout, "authz    no ec2 tier has a resolvable AMI to dry-run a launch with; build one "+
 			"with `billet ami build`\n")
 	case verdicts == 0:
 		// Every dry-run was refused before AWS reached a permission answer (a shape
 		// not offered in the zone, say), so launch authority is still unproven — said
 		// rather than passing silently as if it had been checked.
-		fmt.Printf("         (launch authority still unproven — every dry-run was refused for a " +
+		fmt.Fprintf(env.Stdout, "         (launch authority still unproven — every dry-run was refused for a "+
 			"non-permission reason before AWS reached an authorization verdict)\n")
 	}
 
-	fmt.Printf("         (ec2:TerminateInstances cannot be dry-run — it validates the instance id " +
-		"before the permission verdict, so it needs a real instance; grant it alongside " +
+	fmt.Fprintf(env.Stdout, "         (ec2:TerminateInstances cannot be dry-run — it validates the instance id "+
+		"before the permission verdict, so it needs a real instance; grant it alongside "+
 		"RunInstances)\n")
 
 	if fatal {
@@ -1903,14 +1903,14 @@ func trustName(trust provider.TrustClass) string {
 // reportAuthz prints one dry-run outcome and returns (hard, verdict): whether it is
 // a hard failure, and whether it reached a permission verdict at all (authorized or
 // not).
-func reportAuthz(what string, res ec2.DryRunResult) (bool, bool) {
+func reportAuthz(env cli.Env, what string, res ec2.DryRunResult) (bool, bool) {
 	switch res.Outcome {
 	case ec2.DryRunUnauthorized:
-		fmt.Printf("authz    %s: NOT AUTHORIZED (%s)\n", what, res.Code)
+		fmt.Fprintf(env.Stdout, "authz    %s: NOT AUTHORIZED (%s)\n", what, res.Code)
 
 		return true, true
 	case ec2.DryRunAuthorized:
-		fmt.Printf("authz    %s: authorized\n", what)
+		fmt.Fprintf(env.Stdout, "authz    %s: authorized\n", what)
 
 		return false, true
 	default:
@@ -1918,7 +1918,7 @@ func reportAuthz(what string, res ec2.DryRunResult) (bool, bool) {
 		// a shape not offered in the zone, an invalid parameter. NOT a permission
 		// verdict, so it is neither a pass nor a fail, and the caller reports that
 		// nothing was proved if every probe landed here.
-		fmt.Printf("authz    %s: inconclusive (%s — refused before a permission verdict)\n",
+		fmt.Fprintf(env.Stdout, "authz    %s: inconclusive (%s — refused before a permission verdict)\n",
 			what, res.Code)
 
 		return false, false
@@ -1960,7 +1960,7 @@ func distinctEC2TierAMIs(cfg *config.Config) []string {
 // FATAL, because only a firecracker node reaches here, so this file describes a
 // machine that is meant to run jobs and cannot. Reporting it and exiting zero would
 // make `billet check` say a host is fine when nothing on it can launch.
-func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
+func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	// A PROVIDER BUILT PURELY TO ASK, so the preflight exercises the constructor an
 	// operator's node will use — including the two rules that are easiest to get
 	// wrong and invisible afterwards: which directory the jailer will name after
@@ -1978,8 +1978,8 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	fmt.Printf("microvm  %s, %s\n", report.Firecracker, report.Jailer)
-	fmt.Printf("         jails in %s, one uid per guest from %d (%d available)\n",
+	fmt.Fprintf(env.Stdout, "microvm  %s, %s\n", report.Firecracker, report.Jailer)
+	fmt.Fprintf(env.Stdout, "         jails in %s, one uid per guest from %d (%d available)\n",
 		report.JailDir, report.JailUIDMin, report.JailUIDCount)
 
 	untrusted := "untrusted work will be refused: no untrusted_bridge"
@@ -1987,14 +1987,14 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 		untrusted = "untrusted work runs on " + report.UntrustedBridge
 	}
 
-	fmt.Printf("         guests on %s; %s\n", report.Bridge, untrusted)
-	fmt.Printf("         %s\n", report.Accounting.Summary())
+	fmt.Fprintf(env.Stdout, "         guests on %s; %s\n", report.Bridge, untrusted)
+	fmt.Fprintf(env.Stdout, "         %s\n", report.Accounting.Summary())
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Opening /dev/kvm says
 	// nothing about the jailer's ability to chroot, mknod or place a cgroup, all of
 	// which need root — and an operator who reads "ok" and then watches every
 	// launch fail has been misled by this line.
-	fmt.Printf("         (read only — launching also needs root, to chroot, to create the root " +
+	fmt.Fprintf(env.Stdout, "         (read only — launching also needs root, to chroot, to create the root "+
 		"disk's device node inside the jail, and to attach a tap to the bridge)\n")
 
 	return nil
@@ -2020,7 +2020,7 @@ func needsFirecrackerRootResize(cfg *config.Config) bool {
 // so a failure describes a machine that is meant to run jobs and cannot, and
 // reporting it while exiting zero would make `billet check` say a host is fine
 // when nothing on it can launch.
-func checkTartHost(ctx context.Context, cfg *config.Config) error {
+func checkTartHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	var tartCfg config.TartConfig
 	if cfg.Node.Tart != nil {
 		tartCfg = *cfg.Node.Tart
@@ -2041,7 +2041,7 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	fmt.Printf("tart     %s, %d local VMs\n", report.Version, report.VMs)
+	fmt.Fprintf(env.Stdout, "tart     %s, %d local VMs\n", report.Version, report.VMs)
 
 	// SAID EVERY TIME, like softnet's grant. Which billets serialize against each
 	// other is decided by TART_HOME, so two processes that disagree about the
@@ -2052,10 +2052,10 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 	// busy node looks like and also what a wedged store looks like, so the line
 	// says which of the two billet established.
 	if report.StoreLockProved {
-		fmt.Printf("         store    %s serializes every lease-name rename and delete\n",
+		fmt.Fprintf(env.Stdout, "         store    %s serializes every lease-name rename and delete\n",
 			report.StoreLock)
 	} else {
-		fmt.Printf("         store    %s NOT PROVED: %s\n",
+		fmt.Fprintf(env.Stdout, "         store    %s NOT PROVED: %s\n",
 			report.StoreLock, report.StoreLockWhy)
 	}
 
@@ -2069,18 +2069,18 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 		// NOT "isolation available": the check proves a setuid bit and an owner,
 		// which says softnet could start and nothing about what its policy then
 		// permits. Only a probe from inside a guest can say that.
-		fmt.Printf("         softnet  %s: setuid-root grant configured\n", report.Softnet.Path)
+		fmt.Fprintf(env.Stdout, "         softnet  %s: setuid-root grant configured\n", report.Softnet.Path)
 	case report.Softnet.GrantConfigured:
-		fmt.Printf("         softnet  %s: grant configured, but it %s\n",
+		fmt.Fprintf(env.Stdout, "         softnet  %s: grant configured, but it %s\n",
 			report.Softnet.Path, report.Softnet.Why)
 	case report.Softnet.Path != "":
-		fmt.Printf("         softnet  %s %s\n", report.Softnet.Path, report.Softnet.Why)
+		fmt.Fprintf(env.Stdout, "         softnet  %s %s\n", report.Softnet.Path, report.Softnet.Why)
 	default:
-		fmt.Printf("         softnet  %s\n", report.Softnet.Why)
+		fmt.Fprintf(env.Stdout, "         softnet  %s\n", report.Softnet.Why)
 	}
 
 	if report.Softnet.Path != "" && !report.Softnet.HostBlockSupported {
-		fmt.Printf("         softnet  %s\n", report.Softnet.HostBlockWhy)
+		fmt.Fprintf(env.Stdout, "         softnet  %s\n", report.Softnet.HostBlockWhy)
 	}
 
 	// WHAT THIS NODE WILL DO WITH A FORK'S PULL REQUEST, in one line, because the
@@ -2089,7 +2089,7 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 	// would look exactly like one that refused it.
 	switch {
 	case tartCfg.UntrustedIsolation == "":
-		fmt.Printf("         untrusted work will be refused: node.tart.untrusted_isolation " +
+		fmt.Fprintf(env.Stdout, "         untrusted work will be refused: node.tart.untrusted_isolation "+
 			"is not set, and tart's default NAT reaches the host\n")
 
 	case !report.Softnet.GrantConfigured:
@@ -2110,7 +2110,7 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 			tartCfg.UntrustedIsolation, report.Softnet.HostBlockWhy)
 
 	default:
-		fmt.Printf("         untrusted work runs under %s, resolving through %s\n",
+		fmt.Fprintf(env.Stdout, "         untrusted work runs under %s, resolving through %s\n",
 			tartCfg.UntrustedIsolation, strings.Join(tartCfg.UntrustedDNS, ", "))
 	}
 
@@ -2131,25 +2131,25 @@ func checkTartHost(ctx context.Context, cfg *config.Config) error {
 
 	for _, image := range tierImages {
 		if p.Pulled(ctx, image) {
-			fmt.Printf("image    %-56s pulled\n", image)
+			fmt.Fprintf(env.Stdout, "image    %-56s pulled\n", image)
 
 			continue
 		}
 
 		missing = append(missing, image)
 
-		fmt.Printf("image    %-56s NOT pulled; every job on its tier will fail to launch\n", image)
+		fmt.Fprintf(env.Stdout, "image    %-56s NOT pulled; every job on its tier will fail to launch\n", image)
 	}
 
 	if len(missing) > 0 {
-		fmt.Printf("         fetch them with `billet images pull` (each is tens of GB)\n")
+		fmt.Fprintf(env.Stdout, "         fetch them with `billet images pull` (each is tens of GB)\n")
 	}
 
 	// SAID, BECAUSE THE CHECK IS STILL NARROWER THAN IT LOOKS: a pulled image is
 	// not proof that its guest carries the tart guest agent the registration
 	// delivery needs, nor that a macOS guest slot is free under Apple's two-guest
 	// licence. Both surface at launch, not here.
-	fmt.Printf("         (read only — launching also needs the tart guest agent inside the " +
+	fmt.Fprintf(env.Stdout, "         (read only — launching also needs the tart guest agent inside the "+
 		"image and a free macOS guest slot under Apple's two-VM licence)\n")
 
 	return nil
@@ -2203,7 +2203,7 @@ func (noRootDisk) GenerationGone(error) bool { return false }
 // volume. A control plane is not affected: with no node section there is nothing
 // to check. Reporting it and exiting zero would make `billet check` say a host is
 // fine when nothing on it can launch.
-func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
+func checkCephCluster(ctx context.Context, env cli.Env, cfg *config.CephConfig) error {
 	client, err := ceph.New(*cfg)
 	if err != nil {
 		// WHAT THE CONFIG NAMES, and nothing the sentinel already says. Every
@@ -2223,7 +2223,7 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 	// question answered badly makes the diagnostic harder to act on, not easier.
 	report, err := client.CheckReachable(ctx)
 	if report.User != "" {
-		printCephReport(cfg, report)
+		printCephReport(env, cfg, report)
 	}
 
 	if err != nil {
@@ -2245,8 +2245,8 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 }
 
 // printCephReport puts what the cluster said on the operator's terminal.
-func printCephReport(cfg *config.CephConfig, report ceph.Report) {
-	fmt.Printf("ceph     client.%s -> %s\n", report.User, cfg.ConfPathOrDefault())
+func printCephReport(env cli.Env, cfg *config.CephConfig, report ceph.Report) {
+	fmt.Fprintf(env.Stdout, "ceph     client.%s -> %s\n", report.User, cfg.ConfPathOrDefault())
 
 	for _, p := range report.Pools {
 		// THE REPLICATION IS SHOWN RATHER THAN JUDGED, with one exception below.
@@ -2267,13 +2267,13 @@ func printCephReport(cfg *config.CephConfig, report ceph.Report) {
 			override = fmt.Sprintf("  clone format forced to %s", p.CloneFormat)
 		}
 
-		fmt.Printf("         %-16s %3d image(s)  %-24s %s%s\n",
+		fmt.Fprintf(env.Stdout, "         %-16s %3d image(s)  %-24s %s%s\n",
 			p.Name, p.Images, replication, p.Purpose, override)
 	}
 
 	for _, p := range report.Pools {
 		if p.Size == 1 {
-			fmt.Printf("         %s keeps ONE copy: a single drive failure loses everything in "+
+			fmt.Fprintf(env.Stdout, "         %s keeps ONE copy: a single drive failure loses everything in "+
 				"it\n", p.Name)
 		}
 	}
@@ -2283,15 +2283,15 @@ func printCephReport(cfg *config.CephConfig, report ceph.Report) {
 		// luminous with rbd_default_clone_format forced to 2 clones the new way, and
 		// printing only the release would have an operator reading "luminous" beside
 		// "clone v2" with no way to see why they agree.
-		fmt.Printf("         clone v2 (require-min-compat-client %s), so a cache generation can "+
+		fmt.Fprintf(env.Stdout, "         clone v2 (require-min-compat-client %s), so a cache generation can "+
 			"be reclaimed while a job still holds a clone of it\n", report.MinCompatClient)
 	}
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the
 	// monitors answered and the keyring authenticated; it proves nothing about
 	// permission to create, clone or remove an image, which is what a launch does.
-	fmt.Printf("         (read only — launching also needs create, clone, snapshot and remove in " +
-		"both pools; `ceph auth get-or-create client.<user> mon 'profile rbd' osd 'profile rbd " +
+	fmt.Fprintf(env.Stdout, "         (read only — launching also needs create, clone, snapshot and remove in "+
+		"both pools; `ceph auth get-or-create client.<user> mon 'profile rbd' osd 'profile rbd "+
 		"pool=<images>, profile rbd pool=<cache>'` grants exactly that)\n")
 }
 
@@ -2325,10 +2325,10 @@ func spotLabel(spot bool) string {
 // printing. An earlier version returned the error, which made a telemetry read
 // decide the command's exit status: the exact thing the rest of this comment
 // says it must never do.
-func printReportedInventory(ctx context.Context, a *alloc.Allocator) {
+func printReportedInventory(ctx context.Context, env cli.Env, a *alloc.Allocator) {
 	fleet, err := a.NodeInventories(ctx)
 	if err != nil {
-		fmt.Printf("reported  unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "reported  unavailable: %v\n", err)
 
 		return
 	}
@@ -2337,36 +2337,36 @@ func printReportedInventory(ctx context.Context, a *alloc.Allocator) {
 		return
 	}
 
-	fmt.Printf("reported  what each host last said it was running. This is the HOST'S OWN\n")
-	fmt.Printf("          last word, not a check billet made, and a snapshot it took before\n")
-	fmt.Printf("          it sent it — work can have started on that host since.\n")
+	fmt.Fprintf(env.Stdout, "reported  what each host last said it was running. This is the HOST'S OWN\n")
+	fmt.Fprintf(env.Stdout, "          last word, not a check billet made, and a snapshot it took before\n")
+	fmt.Fprintf(env.Stdout, "          it sent it — work can have started on that host since.\n")
 
 	for _, inv := range fleet {
-		fmt.Printf("          %-24s ", inv.Node)
+		fmt.Fprintf(env.Stdout, "          %-24s ", inv.Node)
 
 		switch {
 		case inv.Report == nil:
 			// NOT THE SAME AS REPORTING NOTHING, and the distinction is the whole
 			// reason the epoch is stored beside the count.
-			fmt.Printf("has not reported since it last reconnected")
+			fmt.Fprintf(env.Stdout, "has not reported since it last reconnected")
 		case inv.Report.ReportedRunning > 0:
 			// THE ONE ANSWER HERE THAT IS WORTH ACTING ON. A host that says it is
 			// running something is telling you a fact; a host that says it is
 			// running nothing is telling you about a moment that has passed.
-			fmt.Printf("SAYS IT IS RUNNING %d", inv.Report.ReportedRunning)
+			fmt.Fprintf(env.Stdout, "SAYS IT IS RUNNING %d", inv.Report.ReportedRunning)
 		default:
-			fmt.Printf("saw 0 billet instances when it last looked")
+			fmt.Fprintf(env.Stdout, "saw 0 billet instances when it last looked")
 		}
 
 		if !inv.Live {
-			fmt.Printf(" (this deployment cannot reach it)")
+			fmt.Fprintf(env.Stdout, " (this deployment cannot reach it)")
 		}
 
 		if inv.Report != nil && inv.Report.ReceivedAt != "" {
-			fmt.Printf(", received %s", inv.Report.ReceivedAt)
+			fmt.Fprintf(env.Stdout, ", received %s", inv.Report.ReceivedAt)
 		}
 
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 	}
 }
 
@@ -2381,36 +2381,36 @@ func printReportedInventory(ctx context.Context, a *alloc.Allocator) {
 // IT RETURNS NOTHING, for the reason printReportedInventory gives above: this
 // must not decide what `billet status` exits with, and must not stop the
 // authoritative sections below it from printing.
-func printComputeBarrier(ctx context.Context, a *alloc.Allocator) {
+func printComputeBarrier(ctx context.Context, env cli.Env, a *alloc.Allocator) {
 	clearance, err := a.ComputeClear(ctx)
 	if err != nil {
-		fmt.Printf("barrier   unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "barrier   unavailable: %v\n", err)
 
 		return
 	}
 
 	if len(clearance.Excluded) > 0 {
-		fmt.Printf("excluded  %d host(s) billet no longer expects an answer from\n",
+		fmt.Fprintf(env.Stdout, "excluded  %d host(s) billet no longer expects an answer from\n",
 			len(clearance.Excluded))
 
 		for _, e := range clearance.Excluded {
-			fmt.Printf("          %-24s ", e.Node)
+			fmt.Fprintf(env.Stdout, "          %-24s ", e.Node)
 
 			if e.Proven {
-				fmt.Printf("proved idle before it was removed")
+				fmt.Fprintf(env.Stdout, "proved idle before it was removed")
 			} else {
 				// THE LINE THIS SECTION EXISTS FOR. A forced exclusion is billet
 				// saying it does not know what is on that machine, and a report that
 				// rendered it the same as a proven one would launder exactly the
 				// uncertainty membership is allowed to skip past.
-				fmt.Printf("REMOVED WITHOUT PROOF — nothing knows what it is running")
+				fmt.Fprintf(env.Stdout, "REMOVED WITHOUT PROOF — nothing knows what it is running")
 			}
 
 			if e.Actor != "" {
-				fmt.Printf(" (%s)", e.Actor)
+				fmt.Fprintf(env.Stdout, " (%s)", e.Actor)
 			}
 
-			fmt.Println()
+			fmt.Fprintln(env.Stdout)
 		}
 	}
 
@@ -2419,47 +2419,47 @@ func printComputeBarrier(ctx context.Context, a *alloc.Allocator) {
 	}
 
 	if clearance.Clear() {
-		fmt.Printf("barrier   every host billet expects an answer from says it is running no\n")
-		fmt.Printf("          compute, and has said so continuously\n")
+		fmt.Fprintf(env.Stdout, "barrier   every host billet expects an answer from says it is running no\n")
+		fmt.Fprintf(env.Stdout, "          compute, and has said so continuously\n")
 
 		return
 	}
 
 	blocking := clearance.Blocking()
 
-	fmt.Printf("barrier   a drain is asking the fleet what it is running; %d host(s) have not\n",
+	fmt.Fprintf(env.Stdout, "barrier   a drain is asking the fleet what it is running; %d host(s) have not\n",
 		len(blocking))
-	fmt.Printf("          been proved idle\n")
+	fmt.Fprintf(env.Stdout, "          been proved idle\n")
 
 	for _, n := range blocking {
-		fmt.Printf("          %-24s %s", n.Node, n.State)
+		fmt.Fprintf(env.Stdout, "          %-24s %s", n.Node, n.State)
 
 		switch n.State {
 		case alloc.ClearanceSettling:
 			// See clearanceSummary: the timestamp is when another empty answer
 			// would prove the run, not a moment at which it clears itself.
-			fmt.Printf(" (needs another empty answer at or after %s)", n.ClearAt)
+			fmt.Fprintf(env.Stdout, " (needs another empty answer at or after %s)", n.ClearAt)
 		case alloc.ClearanceBelowProtocol:
-			fmt.Printf(" (wire %d)", n.WireVersion)
+			fmt.Fprintf(env.Stdout, " (wire %d)", n.WireVersion)
 		case alloc.ClearanceUnknown, alloc.ClearanceProved, alloc.ClearanceRunning,
 			alloc.ClearanceWaiting, alloc.ClearanceUnreachable:
 		}
 
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 	}
 }
 
 // printCacheAwareWaits names every tier that waits for a host new enough to
 // read its cache block, so a rollout's wait reads as a wait and not a stall.
-func printCacheAwareWaits(ctx context.Context, a *alloc.Allocator, tiers []config.Tier) {
+func printCacheAwareWaits(ctx context.Context, env cli.Env, a *alloc.Allocator, tiers []config.Tier) {
 	lines, err := cacheAwareWaits(tiers, func(t config.Tier) (bool, error) {
 		return a.WaitsForCacheAwareHost(ctx, t)
 	})
 	if err != nil {
-		fmt.Printf("cache     unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "cache     unavailable: %v\n", err)
 	}
 	for _, line := range lines {
-		fmt.Println(line)
+		fmt.Fprintln(env.Stdout, line)
 	}
 }
 
@@ -2500,10 +2500,10 @@ func cacheAwareWaits(tiers []config.Tier, waits func(config.Tier) (bool, error))
 // A HOST THIS DEPLOYMENT CANNOT REACH STILL COUNTS. It is not gone: its compute
 // may be running and it will come back speaking whatever it spoke before, so
 // writing it off would retire a protocol a live machine still needs.
-func printWireWindow(ctx context.Context, a *alloc.Allocator) {
+func printWireWindow(ctx context.Context, env cli.Env, a *alloc.Allocator) {
 	fleet, err := a.NodeWireVersions(ctx)
 	if err != nil {
-		fmt.Printf("protocol  unavailable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "protocol  unavailable: %v\n", err)
 
 		return
 	}
@@ -2512,7 +2512,7 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 		return
 	}
 
-	fmt.Printf("protocol  this control plane speaks %s\n", nodeapi.Self())
+	fmt.Fprintf(env.Stdout, "protocol  this control plane speaks %s\n", nodeapi.Self())
 
 	var unrecorded, older, newer int
 
@@ -2522,7 +2522,7 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 			spoken = fmt.Sprintf("protocol %d", n.Negotiated)
 		}
 
-		fmt.Printf("          %-24s %-12s %-28s %s", n.Name, spoken, describeRelease(n),
+		fmt.Fprintf(env.Stdout, "          %-24s %-12s %-28s %s", n.Name, spoken, describeRelease(n),
 			describeInstalled(n))
 
 		// FOUR STATES, NOT TWO, because three of them are not "older". A row
@@ -2535,37 +2535,37 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 		case n.Negotiated == 0:
 			unrecorded++
 
-			fmt.Printf("  <- NOT RECORDED, SO IT STILL BLOCKS RETIREMENT")
+			fmt.Fprintf(env.Stdout, "  <- NOT RECORDED, SO IT STILL BLOCKS RETIREMENT")
 		case n.Negotiated > nodeapi.Version:
 			newer++
 
-			fmt.Printf("  <- NEWER THAN THIS CONTROL PLANE, which cannot serve it")
+			fmt.Fprintf(env.Stdout, "  <- NEWER THAN THIS CONTROL PLANE, which cannot serve it")
 		case n.Negotiated < nodeapi.Version:
 			older++
 
-			fmt.Printf("  <- OLDER THAN THIS CONTROL PLANE")
+			fmt.Fprintf(env.Stdout, "  <- OLDER THAN THIS CONTROL PLANE")
 		}
 
 		if !n.Live {
-			fmt.Printf(" (this deployment cannot reach it)")
+			fmt.Fprintf(env.Stdout, " (this deployment cannot reach it)")
 		}
 
 		if note := describeDowngrade(n); note != "" {
-			fmt.Printf("  <- %s", note)
+			fmt.Fprintf(env.Stdout, "  <- %s", note)
 		}
 
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 	}
 
 	behind := unrecorded + older + newer
 	if behind == 0 {
-		fmt.Printf("          every host speaks %d; the older protocols in that range are free "+
+		fmt.Fprintf(env.Stdout, "          every host speaks %d; the older protocols in that range are free "+
 			"to drop in a later release\n", nodeapi.Version)
 
 		return
 	}
 
-	fmt.Printf("          %d host(s) are not known to be on %d, so nothing below it may be "+
+	fmt.Fprintf(env.Stdout, "          %d host(s) are not known to be on %d, so nothing below it may be "+
 		"dropped.\n", behind, nodeapi.Version)
 
 	// THE REMEDY IS PER STATE, BECAUSE ONE OF THEM POINTS THE OTHER WAY. A host
@@ -2574,17 +2574,17 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 	// is the half that is behind. A blanket "upgrade them" contradicted the row it
 	// was summarising.
 	if older > 0 {
-		fmt.Printf("          %d of them speak an older protocol: upgrade those hosts.\n", older)
+		fmt.Fprintf(env.Stdout, "          %d of them speak an older protocol: upgrade those hosts.\n", older)
 	}
 
 	if newer > 0 {
-		fmt.Printf("          %d speak a protocol NEWER than this control plane, which cannot "+
+		fmt.Fprintf(env.Stdout, "          %d speak a protocol NEWER than this control plane, which cannot "+
 			"serve it. Upgrade or restore the control plane; upgrading those hosts "+
 			"cannot help.\n", newer)
 	}
 
 	if unrecorded > 0 {
-		fmt.Printf("          %d have said nothing since this binary began recording it; they "+
+		fmt.Fprintf(env.Stdout, "          %d have said nothing since this binary began recording it; they "+
 			"report their protocol on their next registration.\n", unrecorded)
 	}
 
@@ -2595,8 +2595,8 @@ func printWireWindow(ctx context.Context, a *alloc.Allocator) {
 	// command; it refuses while the host is reachable or holds any lease, because
 	// forgetting a row is only safe once nothing says its compute may still be
 	// running.
-	fmt.Printf("          A host that is gone for good still counts. Once it is stopped and " +
-		"holds no lease,\n          `billet nodes decommission <node>` forgets it and closes " +
+	fmt.Fprintf(env.Stdout, "          A host that is gone for good still counts. Once it is stopped and "+
+		"holds no lease,\n          `billet nodes decommission <node>` forgets it and closes "+
 		"this window.\n")
 }
 
@@ -2682,34 +2682,34 @@ func describeInstalled(n alloc.NodeWire) string {
 // A SEALED DEPLOYMENT SAYS SO WITH ITS ATTRIBUTION, because the operator reading
 // it is usually not the one who sealed it, and the question they actually have
 // is "may I clear this" — which needs to know who took it and why.
-func printAdmission(a state.Admission) {
+func printAdmission(env cli.Env, a state.Admission) {
 	if a.Mode == state.AdmissionOpen {
-		fmt.Printf("admission open\n")
+		fmt.Fprintf(env.Stdout, "admission open\n")
 
 		return
 	}
 
-	fmt.Printf("admission %s — this deployment is not taking new work\n", a.Mode)
+	fmt.Fprintf(env.Stdout, "admission %s — this deployment is not taking new work\n", a.Mode)
 
 	switch {
 	case a.Actor != "" && a.Reason != "":
-		fmt.Printf("          sealed by %s: %s\n", a.Actor, a.Reason)
+		fmt.Fprintf(env.Stdout, "          sealed by %s: %s\n", a.Actor, a.Reason)
 	case a.Actor != "":
-		fmt.Printf("          sealed by %s\n", a.Actor)
+		fmt.Fprintf(env.Stdout, "          sealed by %s\n", a.Actor)
 	case a.Reason != "":
-		fmt.Printf("          %s\n", a.Reason)
+		fmt.Fprintf(env.Stdout, "          %s\n", a.Reason)
 	}
 
 	if a.ChangedAt != "" {
-		fmt.Printf("          since %s\n", a.ChangedAt)
+		fmt.Fprintf(env.Stdout, "          since %s\n", a.ChangedAt)
 	}
 
 	// WHICH SEAL THIS IS decides who may clear it, and an operator staring at a
 	// quiet fleet needs to know whether restarting the services will reopen it.
 	switch a.Provenance {
 	case state.ProvenanceLocalDown:
-		fmt.Printf("          held by a shutdown; `billet local up` clears it\n")
+		fmt.Fprintf(env.Stdout, "          held by a shutdown; `billet local up` clears it\n")
 	case state.ProvenanceOperator:
-		fmt.Printf("          held deliberately; it survives a restart\n")
+		fmt.Fprintf(env.Stdout, "          held deliberately; it survives a restart\n")
 	}
 }

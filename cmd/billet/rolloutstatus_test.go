@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
@@ -126,7 +127,7 @@ func statusJSON(t *testing.T, cfgPath string, extra ...string) (rolloutStatusRep
 	var runErr error
 
 	out := capture(t, func() {
-		runErr = cmdRolloutStatus(t.Context(), append([]string{"--json", "--config", cfgPath}, extra...))
+		runErr = cmdRolloutStatus(t.Context(), processEnv(), append([]string{"--json", "--config", cfgPath}, extra...))
 	})
 
 	if runErr != nil {
@@ -488,7 +489,7 @@ func TestRolloutStatusReportsTheRetirementRow(t *testing.T) {
 	var runErr error
 
 	text := capture(t, func() {
-		runErr = cmdRolloutStatus(t.Context(), []string{"--config", cfgPath})
+		runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--config", cfgPath})
 	})
 	if runErr != nil {
 		t.Fatalf("rollout status: %v\n%s", runErr, text)
@@ -583,7 +584,7 @@ func TestRolloutStatusReportsTheLedgersBindingAndNeverMintsOne(t *testing.T) {
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		})
 
 		if !errors.Is(runErr, state.ErrForeignLedger) {
@@ -745,7 +746,7 @@ func TestRolloutStatusRefusesALedgerBehindItsBinaryWithoutMigrating(t *testing.T
 	var runErr error
 
 	out := capture(t, func() {
-		runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 	})
 
 	if !errors.Is(runErr, state.ErrSchemaBehind) {
@@ -817,7 +818,7 @@ func TestRolloutStatusFailsRatherThanReportingAnEmptyFleet(t *testing.T) {
 			var runErr error
 
 			out := capture(t, func() {
-				runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+				runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 			})
 
 			if when == "after" && !raised {
@@ -867,7 +868,7 @@ func TestRolloutStatusReadsOneSnapshotAndRefusesABindingThatMovedUnderIt(t *test
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		})
 
 		if !bound {
@@ -1002,7 +1003,7 @@ func TestRolloutStatusReadsTheDSNFromTheEnvironmentFile(t *testing.T) {
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath, "--environment-file", bad})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--environment-file", bad})
 		})
 
 		if runErr == nil || !strings.Contains(runErr.Error(), "read "+bad) {
@@ -1027,7 +1028,7 @@ func TestRolloutStatusReadsTheDSNFromTheEnvironmentFile(t *testing.T) {
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath, "--environment-file", file})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--environment-file", file})
 		})
 
 		if runErr == nil {
@@ -1051,7 +1052,7 @@ func TestRolloutStatusReadsTheDSNFromTheEnvironmentFile(t *testing.T) {
 		file = writeEnvFile(t, "BILLET_STATE_DSN=postgres://u:FILESENTINEL@[bad/db\n")
 
 		out = capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath, "--environment-file", file})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--environment-file", file})
 		})
 
 		if runErr == nil || !strings.Contains(runErr.Error(), "parse") {
@@ -1076,7 +1077,7 @@ func TestRolloutStatusReadsTheDSNFromTheEnvironmentFile(t *testing.T) {
 			var runErr error
 
 			out := capture(t, func() {
-				runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath, "--environment-file", file})
+				runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--environment-file", file})
 			})
 
 			if runErr == nil || !strings.Contains(runErr.Error(), "BILLET_STATE_DSN") ||
@@ -1119,7 +1120,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 
 		var calls [][]string
 
-		statusReexec = func(_ context.Context, u, g uint32, args []string) (int, error) {
+		statusReexec = func(_ context.Context, _ cli.Env, u, g uint32, args []string) (int, error) {
 			if u != uid || g != gid {
 				t.Errorf("re-executed as %d:%d, want %d:%d", u, g, uid, gid)
 			}
@@ -1138,7 +1139,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 		var runErr error
 
 		out := capture(t, func() {
-			runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath, "--environment-file", "/nonexistent"})
+			runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath, "--environment-file", "/nonexistent"})
 		})
 
 		if runErr != nil {
@@ -1160,14 +1161,14 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 	t.Run("a child that failed is the command's failure", func(t *testing.T) {
 		seams(t, 0, 1001, 1001, nil, 3, nil)
 
-		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		if !errors.Is(err, errStatusChildFailed) || !strings.Contains(err.Error(), "exit status 3") {
 			t.Errorf("err = %v", err)
 		}
 
 		seams(t, 0, 1001, 1001, nil, 0, errors.New("fork refused"))
 
-		if err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath}); err == nil ||
+		if err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath}); err == nil ||
 			!strings.Contains(err.Error(), "fork refused") {
 			t.Errorf("err = %v", err)
 		}
@@ -1188,7 +1189,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 			var runErr error
 
 			out := capture(t, func() {
-				runErr = cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+				runErr = cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 			})
 
 			if len(*calls) != 0 {
@@ -1216,7 +1217,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 
 		t.Cleanup(func() { statusAfterOpen = savedAfterOpen })
 
-		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		if err == nil || !strings.Contains(err.Error(), "owned by uid 1001") || !strings.Contains(err.Error(), "uid 501") {
 			t.Errorf("err = %v", err)
 		}
@@ -1233,7 +1234,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 	t.Run("another account, owner unreadable, refuses", func(t *testing.T) {
 		calls := seams(t, 501, 0, 0, syscall.EACCES, 0, nil)
 
-		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		if err == nil || !strings.Contains(err.Error(), "read who owns") || !errors.Is(err, syscall.EACCES) {
 			t.Errorf("err = %v", err)
 		}
@@ -1246,7 +1247,7 @@ func TestRolloutStatusRunsAsTheLedgersOwner(t *testing.T) {
 	t.Run("root, owner unreadable, refuses", func(t *testing.T) {
 		calls := seams(t, 0, 0, 0, syscall.EACCES, 0, nil)
 
-		err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+		err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 		if err == nil || !strings.Contains(err.Error(), "read who owns") || !errors.Is(err, syscall.EACCES) {
 			t.Errorf("err = %v", err)
 		}
@@ -1270,7 +1271,7 @@ func TestRolloutStatusJSONReportsAFailedWrite(t *testing.T) {
 
 	t.Cleanup(func() { statusOut = savedOut })
 
-	err := cmdRolloutStatus(t.Context(), []string{"--json", "--config", cfgPath})
+	err := cmdRolloutStatus(t.Context(), processEnv(), []string{"--json", "--config", cfgPath})
 	if err == nil || !strings.Contains(err.Error(), "write the report") || !errors.Is(err, errDiskFull) {
 		t.Errorf("err = %v, want the write's failure", err)
 	}
@@ -1291,7 +1292,7 @@ func TestRolloutStatusTextEscapesTheRefusal(t *testing.T) {
 		{Node: "quiet", Phase: rollout.PhasePending},
 	}
 
-	out := capture(t, func() { printRolloutNodes(nodes) })
+	out := capture(t, func() { printRolloutNodes(processEnv(), nodes) })
 
 	line := lineFor(t, out, "refused")
 	if want := `last dispatch refused: line one\nline two\ttabbed\x1b[31mred\r\u2028\u202eb\u0085`; !strings.Contains(line, want) {
@@ -1329,7 +1330,7 @@ func TestRolloutStatusTextShowsTheRefusalLast(t *testing.T) {
 		{Node: "quiet", Phase: rollout.PhasePending},
 	}
 
-	out := capture(t, func() { printRolloutNodes(nodes) })
+	out := capture(t, func() { printRolloutNodes(processEnv(), nodes) })
 
 	for _, want := range []struct{ node, detail string }{
 		{"blocked", "an older wire"},

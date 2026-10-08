@@ -50,7 +50,7 @@ func TestStatusShowsDiscoverySeparatelyFromHeadroom(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := capture(t, func() {
-		if err := cmdStatus(t.Context(), []string{"--config", path}); err != nil {
+		if err := cmdStatus(t.Context(), processEnv(), []string{"--config", path}); err != nil {
 			t.Error(err)
 		}
 	})

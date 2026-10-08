@@ -90,12 +90,12 @@ func TestOperatorCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"nodes pending", func() error { return cmdNodesPending(ctx, []string{"--config", cfg}) }},
-		{"ca token", func() error { return cmdCAToken(ctx, []string{"--config", cfg}) }},
-		{"ca revocations", func() error { return cmdCARevocations(ctx, []string{"--config", cfg}) }},
-		{"status", func() error { return cmdStatus(ctx, []string{"--config", cfg}) }},
-		{"leases", func() error { return cmdLeases(ctx, []string{"held", "--config", cfg}) }},
-		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, []string{"--config", cfg}) }},
+		{"nodes pending", func() error { return cmdNodesPending(ctx, processEnv(), []string{"--config", cfg}) }},
+		{"ca token", func() error { return cmdCAToken(ctx, processEnv(), []string{"--config", cfg}) }},
+		{"ca revocations", func() error { return cmdCARevocations(ctx, processEnv(), []string{"--config", cfg}) }},
+		{"status", func() error { return cmdStatus(ctx, processEnv(), []string{"--config", cfg}) }},
+		{"leases", func() error { return cmdLeases(ctx, processEnv(), []string{"held", "--config", cfg}) }},
+		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, processEnv(), []string{"--config", cfg}) }},
 	} {
 		if err := tc.run(); err != nil {
 			t.Errorf("billet %s against a running control plane: %v", tc.name, err)
@@ -159,11 +159,11 @@ func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 	t.Cleanup(func() { _ = server.Close() })
 
 	stubGitHubUnverifiable(t)
-	if err := cmdCheck(ctx, []string{"--config", cfg}); err != nil {
+	if err := cmdCheck(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 		t.Errorf("billet check against a running control plane: %v", err)
 	}
 
-	if err := cmdCARevoke(ctx, []string{
+	if err := cmdCARevoke(ctx, processEnv(), []string{
 		"epyc-1", "--config", cfg, "--cert", filepath.Join(bundleDir, "node.crt"),
 	}); err != nil {
 		t.Errorf("billet ca revoke against a running control plane: %v", err)
@@ -231,8 +231,8 @@ func TestAReadOnlyCommandRunsWhileTheServerHoldsTheWriteLock(t *testing.T) {
 		name string
 		run  func() error
 	}{
-		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, []string{"--config", cfg}) }},
-		{"ca revocations", func() error { return cmdCARevocations(ctx, []string{"--config", cfg}) }},
+		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, processEnv(), []string{"--config", cfg}) }},
+		{"ca revocations", func() error { return cmdCARevocations(ctx, processEnv(), []string{"--config", cfg}) }},
 	} {
 		if err := tc.run(); err != nil {
 			t.Errorf("billet %s while the server holds the write lock: %v", tc.name, err)

@@ -389,7 +389,7 @@ func TestLocalPrepareRefusesTheCallersItIsNotFor(t *testing.T) {
 
 	hostOS = "darwin"
 
-	if err := cmdLocalPrepare(t.Context(), []string{"--json"}); err == nil ||
+	if err := cmdLocalPrepare(t.Context(), processEnv(), []string{"--json"}); err == nil ||
 		!strings.Contains(err.Error(), "Linux") {
 		t.Fatalf("darwin must refuse naming the platform, got %v", err)
 	}
@@ -400,7 +400,7 @@ func TestLocalPrepareRefusesTheCallersItIsNotFor(t *testing.T) {
 
 	hostOS = "linux"
 
-	if err := cmdLocalPrepare(t.Context(), []string{"--json"}); err == nil ||
+	if err := cmdLocalPrepare(t.Context(), processEnv(), []string{"--json"}); err == nil ||
 		!strings.Contains(err.Error(), "only root") {
 		t.Fatalf("a non-root caller must be refused, got %v", err)
 	}

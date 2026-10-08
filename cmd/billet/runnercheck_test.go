@@ -87,7 +87,7 @@ func TestRunnerCheckReportsEachStateWithItsOwnExitCode(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("cmdRunner returned %v, want %v", err, tc.wantErr)
@@ -142,7 +142,7 @@ func TestRunnerCheckWillNotGuessAboutAVersionItCannotPlace(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 			if err == nil {
 				t.Fatalf("a version billet could not place was reported as fine:\n%s", out)
@@ -183,7 +183,7 @@ func TestRunnerCheckReportsTheVersionTheAnswerIsAbout(t *testing.T) {
 	})
 
 	out := capture(t, func() {
-		if err := cmdRunner(t.Context(), []string{"check"}); err != nil {
+		if err := cmdRunner(t.Context(), processEnv(), []string{"check"}); err != nil {
 			t.Errorf("cmdRunner: %v", err)
 		}
 	})
@@ -228,7 +228,7 @@ func TestRunnerCheckWillNotGuessFromAnIncompleteHistory(t *testing.T) {
 
 			var err error
 
-			out := capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+			out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 			if err == nil {
 				t.Fatalf("an incomplete scan was reported as nothing to do:\n%s", out)
@@ -254,7 +254,7 @@ func TestRunnerCheckStillProvesAnExpiryFromAnIncompleteHistory(t *testing.T) {
 
 	var err error
 
-	_ = capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+	_ = capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 	if !errors.Is(err, errExpiredRunner) {
 		t.Fatalf("cmdRunner returned %v; an expiry an incomplete scan can see is still "+
@@ -277,7 +277,7 @@ func TestRunnerCheckReportsBeingBehindWithNoWindowToCount(t *testing.T) {
 
 	var err error
 
-	out := capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+	out := capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 	if !errors.Is(err, errRunnerDue) {
 		t.Fatalf("cmdRunner returned %v; a fleet behind with no window is a rebuild to "+
@@ -308,7 +308,7 @@ func TestRunnerCheckSeparatesNotKnowingFromBeingOutOfDate(t *testing.T) {
 
 	var err error
 
-	_ = capture(t, func() { err = cmdRunner(t.Context(), []string{"check"}) })
+	_ = capture(t, func() { err = cmdRunner(t.Context(), processEnv(), []string{"check"}) })
 
 	if err == nil {
 		t.Fatal("a failed lookup was reported as nothing to do")
@@ -341,7 +341,7 @@ func TestRunnerCheckAsksAboutTheVersionItReports(t *testing.T) {
 	})
 
 	out := capture(t, func() {
-		if err := cmdRunner(t.Context(), []string{"check"}); err != nil {
+		if err := cmdRunner(t.Context(), processEnv(), []string{"check"}); err != nil {
 			t.Errorf("cmdRunner: %v", err)
 		}
 	})

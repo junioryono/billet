@@ -127,13 +127,13 @@ func retireFromEndpointFor(reason string, r *endpointRefusal) *retireRefusal {
 	return retireRefuse(reason, r.Why, r.Next)
 }
 
-func answerRetireRefusal(r *retireRefusal) error {
+func answerRetireRefusal(env cli.Env, r *retireRefusal) error {
 	code := exitRefused
 	if r.Outcome == retireOutcomeUnknown {
 		code = exitUnknown
 	}
 
-	return answerJSON(r, code, r.Why)
+	return answerJSON(env, r, code, r.Why)
 }
 
 // retireReservationAnswer is `--reserve`'s answer: the row as the ledger
@@ -265,10 +265,9 @@ type retireMode struct {
 // The seams: the clock, stdin, the transition id's minting, and the re-exec
 // that reads a SQLite row as the ledger's owner.
 var (
-	retireNow                     = time.Now
-	retireStdin         io.Reader = os.Stdin
-	retireTransitionID            = newGuardID
-	retireReexecCapture           = reexecCapture
+	retireNow           = time.Now
+	retireTransitionID  = newGuardID
+	retireReexecCapture = reexecCapture
 )
 
 // retireReportLedgerBound supplies the context for the open, the deployment
@@ -296,8 +295,8 @@ var retireReportSnapshot = func(ctx context.Context, db *state.DB) (rollout.Stat
 
 var retireReportClose = (*state.DB).Close
 
-func cmdServerRetire(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet server retire", os.Stdout)
+func cmdServerRetire(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet server retire", env.Stdout)
 	m := retireMode{}
 
 	flags.StringVar(&m.configPath, "config", defaultConfigPath(), "the installed configuration")
@@ -353,11 +352,11 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	})
 
 	if r := checkRetireCombination(m); r != nil {
-		return answerRetireModeRefusal(m, retireUnexaminedFor(m, drainedBefore(m, r)))
+		return answerRetireModeRefusal(env, m, retireUnexaminedFor(m, drainedBefore(env, m, r)))
 	}
 
 	if hostOS == "darwin" {
-		return answerRetireModeRefusal(m, retireUnexaminedFor(m, drainedBefore(m, retireRefuse(retireReasonPlatform,
+		return answerRetireModeRefusal(env, m, retireUnexaminedFor(m, drainedBefore(env, m, retireRefuse(retireReasonPlatform,
 			"a controller's retirement needs systemd and the global authority exclusion, and this platform has neither", ""))))
 	}
 
@@ -370,26 +369,26 @@ func cmdServerRetire(ctx context.Context, args []string) error {
 	case m.checkSettledEntry || m.checkSettledClosing:
 		answer, r = retireCheckSettled(ctx, m)
 	case m.checkNodeConfig:
-		answer, r = retireCheckNodeConfig(ctx, m)
+		answer, r = retireCheckNodeConfig(ctx, env, m)
 	case m.input != "":
-		answer, r = retireRequest(ctx, m)
+		answer, r = retireRequest(ctx, env, m)
 	case m.dryRun:
-		answer, r = retireDryRun(ctx, m)
+		answer, r = retireDryRun(ctx, env, m)
 	case m.reserve:
 		answer, r = retireReserve(ctx, m)
 	case m.abandon:
 		answer, r = retireAbandon(ctx, m)
 	case m.completeRow:
-		answer, r = retireCompleteRow(ctx, m)
+		answer, r = retireCompleteRow(ctx, env, m)
 	case m.acknowledge:
-		answer, r = retireAcknowledge(ctx, m)
+		answer, r = retireAcknowledge(ctx, env, m)
 	}
 
 	if r != nil {
-		return answerRetireModeRefusal(m, r)
+		return answerRetireModeRefusal(env, m, r)
 	}
 
-	return answerJSON(answer, 0, "")
+	return answerJSON(env, answer, 0, "")
 }
 
 // retireUnexaminedFor marks a refusal made before the flags were even agreed
@@ -495,12 +494,12 @@ func checkRetireCombination(m retireMode) *retireRefusal {
 // large document unread would meet a writer on a closed pipe and be reported
 // as a broken pipe with no answer at all. A mode that takes nothing on stdin
 // drains nothing.
-func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
+func drainedBefore(env cli.Env, m retireMode, r *retireRefusal) *retireRefusal {
 	if m.input != "-" && m.completion != "-" && m.answer != "-" {
 		return r
 	}
 
-	if why := drainStdin(); why != "" {
+	if why := drainStdin(env); why != "" {
 		r.Why += "; " + why
 	}
 
@@ -522,13 +521,13 @@ func drainedBefore(m retireMode, r *retireRefusal) *retireRefusal {
 // relied on to interrupt the read itself. The goroutine may be left blocked;
 // the process is about to exit with its answer, and holding the answer is the
 // failure that matters.
-func drainStdin() string {
+func drainStdin(env cli.Env) string {
 	done := make(chan error, 1)
 
 	// EVALUATED HERE, not in the goroutine: a child the deadline leaves
 	// behind reads the input this call was given, whatever the process (or a
 	// test) puts in the seam afterwards.
-	from := retireStdin
+	from := env.Stdin
 
 	go func() {
 		_, err := io.Copy(io.Discard, from)
@@ -563,8 +562,8 @@ var drainDeadline = 2 * time.Minute
 // refused: the collector writes stdin before it reads stdout, and a writer
 // that meets a closed pipe reports a failure with empty output, which would
 // hide the typed refusal.
-func readRetireDocument(limit int64) ([]byte, *retireRefusal) {
-	body, err := io.ReadAll(io.LimitReader(retireStdin, limit+1))
+func readRetireDocument(env cli.Env, limit int64) ([]byte, *retireRefusal) {
+	body, err := io.ReadAll(io.LimitReader(env.Stdin, limit+1))
 	if err != nil {
 		return nil, retireUnknown(retireReasonInput, "read the document on stdin: "+err.Error(), "")
 	}
@@ -572,7 +571,7 @@ func readRetireDocument(limit int64) ([]byte, *retireRefusal) {
 	if int64(len(body)) > limit {
 		why := fmt.Sprintf("the document on stdin is longer than %d bytes", limit)
 
-		if drained := drainStdin(); drained != "" {
+		if drained := drainStdin(env); drained != "" {
 			why += "; " + drained
 		}
 
@@ -1078,8 +1077,8 @@ func retireAbandon(ctx context.Context, m retireMode) (any, *retireRefusal) {
 // The row records historically proved retirement bound to the completion
 // document. The survivor cannot prove current health in the retiring host's
 // namespace; that host freshly proves its own done publication and settlement.
-func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) {
-	raw, r := readRetireDocument(retirement.MaxDocumentBytes)
+func retireCompleteRow(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
+	raw, r := readRetireDocument(env, retirement.MaxDocumentBytes)
 	if r != nil {
 		return nil, r
 	}
@@ -1170,8 +1169,8 @@ func retireCompleteRow(ctx context.Context, m retireMode) (any, *retireRefusal) 
 // `server retire` run on this host.
 // Acknowledgement records the historical row even if the retained node has since
 // failed. That failure prevents settlement, not acknowledgement of valid history.
-func retireAcknowledge(ctx context.Context, m retireMode) (any, *retireRefusal) {
-	raw, r := readRetireDocument(retirement.MaxDocumentBytes)
+func retireAcknowledge(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
+	raw, r := readRetireDocument(env, retirement.MaxDocumentBytes)
 	if r != nil {
 		return nil, r
 	}
@@ -1281,7 +1280,7 @@ func retireAcknowledge(ctx context.Context, m retireMode) (any, *retireRefusal) 
 // it has to translate back into one.
 //
 //nolint:unparam // the shape is the dispatch's; see above
-func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
+func retireDryRun(ctx context.Context, env cli.Env, m retireMode) (any, *retireRefusal) {
 	report := &retireReport{Schema: retireSchema, Outcome: retireOutcomeReported, State: stateNothingRetire,
 		Identity: "unreadable", Authority: "unreadable", Route: "hold"}
 
@@ -1432,13 +1431,13 @@ func retireDryRun(ctx context.Context, m retireMode) (any, *retireRefusal) {
 	case configPresence == "present" && cfg.Server != nil && report.Identity != "minted":
 		report.RowFact, report.Why = retirement.RowUnreadable, identityWhy
 	case configPresence == "present" && cfg.Server != nil:
-		report.Row, report.RowFact, report.Why, maintenance = readRetireRow(ctx, cfg, identity, m)
+		report.Row, report.RowFact, report.Why, maintenance = readRetireRow(ctx, env, cfg, identity, m)
 	case presence == retirement.JournalPresent:
 		// THE LOCATOR IS HOW A HOST PAST THE ARCHIVE NAMES ITS LEDGER: the
 		// installed configuration has no `server:` any more, or none at all,
 		// and the journal recorded the backend, the variable and the archive
 		// before the transition took them away.
-		report.Row, report.RowFact, report.Why = readRetireRowByLocator(ctx, j)
+		report.Row, report.RowFact, report.Why = readRetireRowByLocator(ctx, env, j)
 	default:
 		report.RowFact = retirement.RowUnreadable
 		report.Why = "the configuration names no ledger (" + configPresence + ") and no journal names one, so the row " +
@@ -1946,13 +1945,13 @@ func retireConfigLocator(body []byte) *config.Config {
 // creates no directory, takes no billet lock, claims nothing, migrates nothing
 // and refuses every write. SQLite's driver sidecars belong to the configured
 // ledger's read, not this PostgreSQL locator.
-func retireInspectLedgerByLocator(ctx context.Context, j retirement.Journal) (*state.DB, ledgerProblem) {
-	return retireOpenByLocator(ctx, j, func(ctx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
+func retireInspectLedgerByLocator(ctx context.Context, env cli.Env, j retirement.Journal) (*state.DB, ledgerProblem) {
+	return retireOpenByLocator(ctx, env, j, func(ctx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
 		return state.OpenPostgresInspect(ctx, dir, dsn, state.WithRunningRelease(version.Version()))
 	})
 }
 
-func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
+func readRetireRowByLocator(ctx context.Context, env cli.Env, j retirement.Journal) (*retireReportRow, retirement.RowFact, string) {
 	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
 
@@ -1962,7 +1961,7 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 
 	// THE LOCATOR READ CREATES NO ARCHIVE AND TAKES NO BILLET LOCK. The
 	// tail's own open may do both before writing, so it cannot serve a report.
-	db, problem := retireReportOpenByLocator(bounded, j)
+	db, problem := retireReportOpenByLocator(bounded, env, j)
 
 	switch {
 	case problem.refusal != nil:
@@ -1987,7 +1986,7 @@ func readRetireRowByLocator(ctx context.Context, j retirement.Journal) (*retireR
 // sidecars owned by whoever opened it, and root-owned sidecars keep the service
 // from reopening it. The last result proves that maintenance alone refused
 // this read; a false value grants no recovery admission.
-func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m retireMode,
+func readRetireRow(ctx context.Context, env cli.Env, cfg *config.Config, identity string, m retireMode,
 ) (*retireReportRow, retirement.RowFact, string, bool) {
 	bounded, cancel := retireReportTimeout(ctx, retireReportLedgerBound)
 	defer cancel()
@@ -2024,7 +2023,7 @@ func readRetireRow(ctx context.Context, cfg *config.Config, identity string, m r
 						"the ledger read is refused before running the owner's report"),
 					bounded.Err() == nil && state.OnlyCause(err, state.ErrMaintenance)
 			}
-			row, fact, why := readRetireRowAsOwner(ctx, bounded, uid, gid, identity, m)
+			row, fact, why := readRetireRowAsOwner(ctx, bounded, env, uid, gid, identity, m)
 
 			return row, fact, why, false
 		}
@@ -2113,7 +2112,7 @@ func rowFromSnapshot(binding string, row *state.Retirement, identity, host strin
 
 // readRetireRowAsOwner reads the row through `billet rollout status --json`
 // run as the ledger's owner, whose report carries the deployment's row.
-func readRetireRowAsOwner(outer, bounded context.Context, uid, gid uint32, identity string,
+func readRetireRowAsOwner(outer, bounded context.Context, env cli.Env, uid, gid uint32, identity string,
 	m retireMode,
 ) (*retireReportRow, retirement.RowFact, string) {
 	args := []string{"rollout", "status", "--json", "--config", m.configPath}
@@ -2121,7 +2120,7 @@ func readRetireRowAsOwner(outer, bounded context.Context, uid, gid uint32, ident
 		args = append(args, "--environment-file", m.environmentFile)
 	}
 
-	out, code, err := retireReexecCapture(bounded, uid, gid, args)
+	out, code, err := retireReexecCapture(bounded, env, uid, gid, args)
 
 	switch {
 	case err != nil:
@@ -2210,7 +2209,7 @@ const maxOwnerReportBytes = 4 << 20
 // through a BOUNDED writer (the excess discarded as it arrives, so a report
 // past the bound costs no memory and is refused), its stderr passed through,
 // and answers the output and the exit status.
-func reexecCapture(ctx context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
+func reexecCapture(ctx context.Context, env cli.Env, uid, gid uint32, args []string) ([]byte, int, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, 0, fmt.Errorf("find this billet to read the row as the ledger's owner: %w", err)
@@ -2219,7 +2218,7 @@ func reexecCapture(ctx context.Context, uid, gid uint32, args []string) ([]byte,
 	out := &limitedWriter{w: &bytes.Buffer{}, n: maxOwnerReportBytes}
 
 	cmd := exec.CommandContext(ctx, self, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, out, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, out, env.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{gid}},
 	}

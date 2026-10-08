@@ -41,7 +41,7 @@ func TestUpStartsEachUnitUnderItsOwnStartBound(t *testing.T) {
 	cfg := serviceConfig(t)
 	f := stageUp(t, &fakeConverger{plan: bothUnits()}, githubVerified)
 
-	if err := runLocalUp(t.Context(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
+	if err := runLocalUp(t.Context(), processEnv(), upOptions{configPath: cfg, servicePath: cfg}); err != nil {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
@@ -59,7 +59,7 @@ func TestDownStopsEachUnitUnderItsOwnStopBound(t *testing.T) {
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
 
 	capture(t, func() {
-		if err := runLocalDown(t.Context(), downOptions{configPath: cfgPath}); err != nil {
+		if err := runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}); err != nil {
 			t.Errorf("an idle host was refused: %v", err)
 		}
 	})
@@ -91,7 +91,7 @@ func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testi
 	t.Cleanup(func() { newHostInspector = prev })
 
 	cfg := &config.Config{Node: &config.NodeConfig{}}
-	h := newSystemdHost(cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
+	h := newSystemdHost(processEnv(), cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
 
 	// The starts: /usr/bin/false fails them, which is fine; the deadline was
 	// observed before the failure.

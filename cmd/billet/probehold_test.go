@@ -25,7 +25,7 @@ func TestAProbeNotToldToHoldNeitherSpeaksNorWaits(t *testing.T) {
 	var printed string
 
 	go func() {
-		printed = capture(t, func() { holdProbe(ctx, false, serverProbeReadyLine) })
+		printed = capture(t, func() { holdProbe(ctx, processEnv(), false, serverProbeReadyLine) })
 		close(returned)
 	}()
 
@@ -57,7 +57,7 @@ func TestAProbeToldToHoldSpeaksAndWaitsToBeStopped(t *testing.T) {
 	var printed string
 
 	go func() {
-		printed = capture(t, func() { holdProbe(ctx, true, serverProbeReadyLine) })
+		printed = capture(t, func() { holdProbe(ctx, processEnv(), true, serverProbeReadyLine) })
 		close(returned)
 	}()
 

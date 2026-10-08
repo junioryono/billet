@@ -360,7 +360,7 @@ func TestTheCloudPreflightNamesTheIdentityAndNotTheSecret(t *testing.T) {
 
 	var err error
 
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 	if err != nil {
 		t.Fatalf("a host with credentials in its environment failed the pre-flight: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 
 	var err error
 
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 	if err != nil {
 		t.Fatalf("pre-flight: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestCheckResolvesASpotNodesCertificateIdentity(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), []string{
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{
 		"aws-1", "--config", serverCfg, "--out", bundleDir,
 	}); err != nil {
 		t.Fatalf("ca issue: %v", err)
@@ -465,7 +465,7 @@ node:
 
 	var err error
 	stubGitHubUnverifiable(t)
-	out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+	out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", configPath}) })
 	if err != nil {
 		t.Fatalf("billet check: %v", err)
 	}
@@ -494,7 +494,7 @@ func TestTheCloudPreflightFailsWhenTheCredentialsCannotBeUsed(t *testing.T) {
 
 	var err error
 
-	capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 
 	if err == nil {
 		t.Fatal("credentials that the api refuses were reported as usable")
@@ -521,7 +521,7 @@ func TestPreflightRefusesASecurityGroupInAnotherVPC(t *testing.T) {
 	}
 
 	var err error
-	capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 	if err == nil || !strings.Contains(err.Error(), "vpc") {
 		t.Fatalf("a group in another vpc was not refused: %v", err)
 	}
@@ -554,7 +554,7 @@ func TestPreflightRefusesACacheZoneMismatch(t *testing.T) {
 	}
 
 	var err error
-	capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, false, false) })
+	capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, false, false) })
 	if err == nil || !strings.Contains(err.Error(), "zone") {
 		t.Fatalf("a cache-zone mismatch was not refused: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestPreflightReportsTierImages(t *testing.T) {
 	// Available image.
 	ec2cfg.Endpoint = fakeEC2With(t, fakeEC2Topology{accept: "AKIDEXAMPLE", imageState: "available"})
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg, tier), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg, tier), nil, false, false) })
 	if err != nil {
 		t.Fatalf("preflight with an available image failed: %v", err)
 	}
@@ -588,7 +588,7 @@ func TestPreflightReportsTierImages(t *testing.T) {
 
 	// A not-built AMI is a warning, not an error.
 	ec2cfg.Endpoint = fakeEC2With(t, fakeEC2Topology{accept: "AKIDEXAMPLE", imageState: "missing"})
-	out = capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg, tier), nil, false, false) })
+	out = capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg, tier), nil, false, false) })
 	if err != nil {
 		t.Fatalf("a not-yet-built AMI was treated as fatal: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestPreflightSkippedDuringMaintenance(t *testing.T) {
 	}
 
 	var checkErr error
-	out := capture(t, func() { checkErr = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg), nil, false, true) })
+	out := capture(t, func() { checkErr = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg), nil, false, true) })
 	if checkErr != nil {
 		t.Fatalf("the maintenance probe depended on AWS: %v", checkErr)
 	}
@@ -695,7 +695,7 @@ func TestPreflightSaysWhenThereAreNoTiers(t *testing.T) {
 	}
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg), nil, false, false) })
 	if err != nil {
 		t.Fatalf("preflight failed: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestPreflightAuthorizeReportsAuthorized(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tier)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("authorize preflight failed unexpectedly: %v", err)
 	}
@@ -773,7 +773,7 @@ func TestPreflightAuthorizeTagsAsTheDeployment(t *testing.T) {
 	tier := config.Tier{Label: "cloud", Provider: config.ProviderEC2, Trust: config.WorkloadTrusted, VCPU: 8, Memory: 16 * config.GiB, Image: "ami-good"}
 	cfg, id := authorizeConfig(t, ec2cfg, tier)
 
-	if err := checkEC2Credentials(t.Context(), cfg, nil, true, false); err != nil {
+	if err := checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false); err != nil {
 		t.Fatalf("authorize preflight: %v", err)
 	}
 
@@ -818,7 +818,7 @@ func TestPreflightAuthorizeSkipsWithoutIdentity(t *testing.T) {
 	cfg.Node.StateDir = dir
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -852,7 +852,7 @@ func TestPreflightAuthorizeFailsOnUnauthorized(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tier)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err == nil || !strings.Contains(err.Error(), "NOT authorized") {
 		t.Fatalf("an unauthorized launch was not fatal: %v", err)
 	}
@@ -878,7 +878,7 @@ func TestPreflightAuthorizeInconclusiveIsNotFatal(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tier)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("an inconclusive launch was fatal: %v", err)
 	}
@@ -903,7 +903,7 @@ func TestPreflightWithoutAuthorizeSaysSo(t *testing.T) {
 	}
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg), nil, false, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -928,7 +928,7 @@ func TestReportAuthzOutcomes(t *testing.T) {
 		{"zero-value", ec2.DryRunResult{}, false, false},
 	}
 	for _, c := range cases {
-		hard, verdict := reportAuthz("launch x", c.res)
+		hard, verdict := reportAuthz(processEnv(), "launch x", c.res)
 		if hard != c.hard || verdict != c.verdict {
 			t.Errorf("%s: got (hard=%v, verdict=%v), want (%v, %v)", c.name, hard, verdict, c.hard, c.verdict)
 		}
@@ -954,7 +954,7 @@ func TestPreflightAuthorizeSkipsUntrustedWithoutGroups(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tier)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestPreflightAuthorizeEnumeratesEveryLaunchableCombination(t *testing.T) {
 	}
 	cfg, _ := authorizeConfig(t, ec2cfg, tiers...)
 
-	if err := checkEC2Credentials(t.Context(), cfg, nil, true, false); err != nil {
+	if err := checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false); err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
 
@@ -1086,7 +1086,7 @@ func TestPreflightAuthorizeUsesCertificateIdentity(t *testing.T) {
 
 	serverCfg := writeCAConfig(t, t.TempDir())
 	bundleDir := filepath.Join(t.TempDir(), "bundle")
-	if err := cmdCAIssue(t.Context(), []string{
+	if err := cmdCAIssue(t.Context(), processEnv(), []string{
 		"aws-1", "--config", serverCfg, "--out", bundleDir,
 	}); err != nil {
 		t.Fatalf("ca issue: %v", err)
@@ -1155,7 +1155,7 @@ tiers:
 	}
 
 	stubGitHubUnverifiable(t)
-	if err := cmdCheck(t.Context(), []string{"--config", configPath, "--authorize"}); err != nil {
+	if err := cmdCheck(t.Context(), processEnv(), []string{"--config", configPath, "--authorize"}); err != nil {
 		t.Fatalf("billet check --authorize: %v", err)
 	}
 
@@ -1191,7 +1191,7 @@ func TestPreflightAuthorizeFleetNodeSaysUnproven(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg) // no tiers
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -1232,7 +1232,7 @@ func TestPreflightAuthorizeMixedSkipAndUnresolvableAMI(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tiers...)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -1271,7 +1271,7 @@ func TestPreflightAuthorizeOneTierBothBlockers(t *testing.T) {
 	cfg, _ := authorizeConfig(t, ec2cfg, tier)
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), cfg, nil, true, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), cfg, nil, true, false) })
 	if err != nil {
 		t.Fatalf("preflight: %v", err)
 	}
@@ -1317,7 +1317,7 @@ func TestPreflightChecksTheInstanceProfile(t *testing.T) {
 	}
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(build("")), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(build("")), nil, false, false) })
 	if err != nil {
 		t.Fatalf("a present profile failed the preflight: %v", err)
 	}
@@ -1325,7 +1325,9 @@ func TestPreflightChecksTheInstanceProfile(t *testing.T) {
 		t.Errorf("a present profile is not reported:\n%s", out)
 	}
 
-	out = capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(build("denied")), nil, false, false) })
+	out = capture(t, func() {
+		err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(build("denied")), nil, false, false)
+	})
 	if err != nil {
 		t.Fatalf("an IAM-denied CHECK failed the preflight; it says nothing about the profile: %v", err)
 	}
@@ -1333,7 +1335,9 @@ func TestPreflightChecksTheInstanceProfile(t *testing.T) {
 		t.Errorf("the denied band is not reported as unknown:\n%s", out)
 	}
 
-	capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(build("missing")), nil, false, false) })
+	capture(t, func() {
+		err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(build("missing")), nil, false, false)
+	})
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("a missing profile was not fatal by name: %v", err)
 	}
@@ -1362,7 +1366,7 @@ func TestPreflightQueueDenialStaysAdvisory(t *testing.T) {
 	}
 
 	var err error
-	out := capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	out := capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 	if err != nil {
 		t.Fatalf("an access-denied queue probe failed the preflight: %v", err)
 	}
@@ -1389,7 +1393,7 @@ func TestReachabilityFailureNamesTheRegionTrap(t *testing.T) {
 	}
 
 	var err error
-	capture(t, func() { err = checkEC2Credentials(t.Context(), wrapEC2(cfg), nil, false, false) })
+	capture(t, func() { err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(cfg), nil, false, false) })
 	if err == nil {
 		t.Fatal("an unreachable region passed the preflight")
 	}
@@ -1429,7 +1433,7 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 
 	var err error
 	out := capture(t, func() {
-		err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg, tier), nil, false, false)
+		err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg, tier), nil, false, false)
 	})
 
 	// NOT FATAL. A wrong image store loses the cache and runs jobs correctly, so
@@ -1463,7 +1467,7 @@ func TestAnImageBelowTheContractIsReported(t *testing.T) {
 	})
 
 	current := capture(t, func() {
-		err = checkEC2Credentials(t.Context(), wrapEC2(ec2cfg, tier), nil, false, false)
+		err = checkEC2Credentials(t.Context(), processEnv(), wrapEC2(ec2cfg, tier), nil, false, false)
 	})
 	if err != nil {
 		t.Fatalf("preflight with a current image failed: %v", err)

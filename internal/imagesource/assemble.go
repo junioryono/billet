@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -94,8 +95,8 @@ func AssembleRootfs(dir string, img Multipart) (string, error) {
 			// SAID OUT LOUD RATHER THAN RETURNED. On a parity-sized image the
 			// leftovers are tens of gigabytes, so silence would be a disk filling
 			// with nothing to explain it.
-			fmt.Fprintf(os.Stderr, "imagesource: the assembled root filesystem is in place and "+
-				"the staged part %s could not be removed: %v\n", part.Name, err)
+			slog.Warn("the assembled root filesystem is in place and a staged part could not be removed",
+				"part", part.Name, "err", err)
 		}
 	}
 

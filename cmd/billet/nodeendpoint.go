@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -110,7 +112,7 @@ func endpointUnknown(reason, why, next, state string) *endpointRefusal {
 }
 
 // answerEndpointRefusal prints the refusal and returns the exit it carries.
-func answerEndpointRefusal(r *endpointRefusal) error {
+func answerEndpointRefusal(env cli.Env, r *endpointRefusal) error {
 	code := exitRefused
 	if r.Outcome == outcomeUnknown {
 		code = exitUnknown
@@ -121,7 +123,7 @@ func answerEndpointRefusal(r *endpointRefusal) error {
 		msg += ". Next: " + r.Next
 	}
 
-	return answerJSON(r, code, msg)
+	return answerJSON(env, r, code, msg)
 }
 
 // installedConfigObservation is the installed configuration read ONCE: its bytes
@@ -272,14 +274,14 @@ func parseConfiguration(name string, body []byte, strict bool) (*config.Config, 
 // readRendering reads the rendering the role passes: "-" is stdin, anything
 // else a file; bounded, and parsed under the configuration's own rules (the
 // whole of them when strict, the node section's alone for a dry run).
-func readRendering(source string, strict bool) ([]byte, *config.Config, *endpointRefusal) {
+func readRendering(env cli.Env, source string, strict bool) ([]byte, *config.Config, *endpointRefusal) {
 	var (
 		body []byte
 		err  error
 	)
 
 	if source == "-" {
-		body, err = io.ReadAll(io.LimitReader(renderingStdin, maxRenderingBytes+1))
+		body, err = io.ReadAll(io.LimitReader(env.Stdin, maxRenderingBytes+1))
 		if err == nil && len(body) > maxRenderingBytes {
 			err = fmt.Errorf("%w: more than %d bytes", regularfile.ErrTooLarge, maxRenderingBytes)
 		}
@@ -305,9 +307,6 @@ func readRendering(source string, strict bool) ([]byte, *config.Config, *endpoin
 
 	return body, cfg, nil
 }
-
-// renderingStdin is where "-" reads from; a variable so a test can supply it.
-var renderingStdin io.Reader = os.Stdin
 
 // nodeEndpointOf is a configuration's node endpoint as the one
 // representation, and whether the configuration has a node section at all.
@@ -646,8 +645,8 @@ func preRProcess(ctx context.Context, pid int) (bool, string) {
 }
 
 // answerObject prints one successful answer as JSON with exit 0.
-func answerObject(v any) error {
-	return answerJSON(v, 0, "")
+func answerObject(env cli.Env, v any) error {
+	return answerJSON(env, v, 0, "")
 }
 
 // canonicalOrNull is an endpoint's canonical text, or nil for none.

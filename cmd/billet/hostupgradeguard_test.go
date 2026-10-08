@@ -81,7 +81,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 	f := newGuardedFixture(t)
 	mustHold(t, "ci-1")
 
-	err := startHostUpgrade(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
+	err := startHostUpgrade(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
 	if err == nil || !strings.Contains(err.Error(), "guarded by ci-1 since 2026-09-09T12:00:00Z") {
 		t.Fatalf("a guarded host: err = %v", err)
 	}
@@ -97,7 +97,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 	// THE ACK, through the production command and the real socket.
 	ack, answer := ackReader(t)
 
-	err = cmdHostUpgrade(t.Context(), []string{"--config", f.cfgPath, "--version", "v0.9.4", "--ack-path", ack.path})
+	err = cmdHostUpgrade(t.Context(), processEnv(), []string{"--config", f.cfgPath, "--version", "v0.9.4", "--ack-path", ack.path})
 	if err == nil || !strings.Contains(err.Error(), "guarded by ci-1") {
 		t.Fatalf("the command on a guarded host: err = %v", err)
 	}
@@ -109,7 +109,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 	// A HELD LOCK REFUSES FIRST, whatever the claim says.
 	end := startLockHolder(t)
 
-	err = startHostUpgrade(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
+	err = startHostUpgrade(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
 	if !errors.Is(err, ErrUpgradeInProgress) {
 		t.Errorf("under a held lock: err = %v, want ErrUpgradeInProgress", err)
 	}
@@ -121,7 +121,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = startHostUpgrade(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
+	err = startHostUpgrade(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
 	if err == nil || !strings.Contains(err.Error(), "the resolver was reached") {
 		t.Fatalf("an unguarded host did not reach the resolver: err = %v", err)
 	}
@@ -131,7 +131,7 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = startHostUpgrade(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
+	err = startHostUpgrade(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""))
 	if !errors.Is(err, errGuardUnpublished) {
 		t.Errorf("an unpublished guard: err = %v", err)
 	}
@@ -151,7 +151,7 @@ func TestAnUpgradeOnDarwinClassifiesBeforeThePlatformCheck(t *testing.T) {
 
 	tx := mustLock(t)
 
-	err := startHostUpgradeHolding(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""),
+	err := startHostUpgradeHolding(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""),
 		releasesource.Policy{}, tx)
 	if err == nil || !strings.Contains(err.Error(), "guarded by ci-1") {
 		t.Fatalf("a guarded darwin host: err = %v", err)
@@ -169,7 +169,7 @@ func TestAnUpgradeOnDarwinClassifiesBeforeThePlatformCheck(t *testing.T) {
 
 	tx = mustLock(t)
 
-	err = startHostUpgradeHolding(t.Context(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""),
+	err = startHostUpgradeHolding(t.Context(), processEnv(), f.cfg, f.cfgPath, hostUpgradeTarget{pin: "v0.9.4"}, newUpgradeAck(""),
 		releasesource.Policy{}, tx)
 	if err == nil || !strings.Contains(err.Error(), "platform check was reached") {
 		t.Errorf("an unguarded darwin host did not reach the platform check first: err = %v", err)
@@ -199,7 +199,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	end := startLockHolder(t)
 
-	if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, ErrUpgradeInProgress) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, ErrUpgradeInProgress) {
 		t.Errorf("resume under a held lock: err = %v", err)
 	}
 
@@ -207,7 +207,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	mustHold(t, "ci-1")
 
-	if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errGuardHeld) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errGuardHeld) {
 		t.Errorf("resume over a guard: err = %v", err)
 	}
 
@@ -219,7 +219,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := resumeHostUpgrade(t.Context(), f.cfg); !errors.Is(err, errGuardUnpublished) {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); !errors.Is(err, errGuardUnpublished) {
 		t.Errorf("resume over an unpublished guard: err = %v", err)
 	}
 
@@ -228,7 +228,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := resumeHostUpgrade(t.Context(), f.cfg); err != nil {
+		if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err != nil {
 			t.Errorf("resume with no claim: %v", err)
 		}
 	})
@@ -247,7 +247,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 
 	end = startLockHolder(t)
 
-	err := resumeHostUpgrade(t.Context(), f.cfg)
+	err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg)
 
 	end()
 
@@ -256,7 +256,7 @@ func TestAResumeClassifiesAfterTheLockAndBeforeAnyJournal(t *testing.T) {
 	}
 
 	// And without the lock held, the classifier's answer is the resume's.
-	if err := resumeHostUpgrade(t.Context(), f.cfg); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), f.cfg); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Errorf("resume over a guard whose record is a FIFO: err = %v, want the classifier's refusal", err)
 	}
 
@@ -299,7 +299,7 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false); err != nil {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
 			t.Errorf("the timer: %v", err)
 		}
 	})
@@ -325,7 +325,7 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 	timerBarrier = func(string) { read = true }
 
 	out = capture(t, func() {
-		if err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false); err != nil {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
 			t.Errorf("the timer on a guarded host: %v", err)
 		}
 	})
@@ -352,7 +352,7 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 	timerBarrier = func(string) { read = true }
 
 	out = capture(t, func() {
-		if err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false); err != nil {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
 			t.Errorf("the timer on a host with an unpublished guard: %v", err)
 		}
 	})
@@ -370,7 +370,7 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 
 	timerBarrier = func(string) { read = true }
 
-	err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false)
+	err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false)
 
 	timerBarrier = nil
 
@@ -389,7 +389,7 @@ func TestTheTimerHoldsOneLockFromClassificationThroughSettlement(t *testing.T) {
 	timerBarrier = func(string) { read = true }
 
 	out = capture(t, func() {
-		if err := hostUpgradeFromRollout(t.Context(), cfg, cfgPath, false); err != nil {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
 			t.Errorf("the timer under a held lock: %v", err)
 		}
 	})
@@ -432,7 +432,7 @@ func TestUpgradeStatusNamesEveryClaimShape(t *testing.T) {
 		_ = os.RemoveAll(f.active())
 		plant()
 
-		out := capture(t, func() { reportUpgradeStatus() })
+		out := capture(t, func() { reportUpgradeStatus(processEnv()) })
 
 		if want == "none" {
 			if !strings.Contains(out, "no upgrade has claimed this machine") {
@@ -451,7 +451,7 @@ func TestUpgradeStatusNamesEveryClaimShape(t *testing.T) {
 	mustHold(t, "ci-1")
 
 	before := fileIdentityOf(t, filepath.Join(f.active(), guardRecordName))
-	_ = capture(t, func() { reportUpgradeStatus() })
+	_ = capture(t, func() { reportUpgradeStatus(processEnv()) })
 
 	if fileIdentityOf(t, filepath.Join(f.active(), guardRecordName)) != before {
 		t.Error("--status changed the guard")

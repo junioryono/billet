@@ -62,7 +62,7 @@ func TestAStaleRolloutBehindTheRunningReleaseIsNotFollowed(t *testing.T) {
 
 		cfg := ledgerWithForwardRollout(t, "v0.9.0")
 
-		target, act, err := rolloutInstruction(t.Context(), cfg)
+		target, act, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 		if err != nil {
 			t.Fatalf("rolloutInstruction with %s running: %v", running, err)
 		}
@@ -80,7 +80,7 @@ func TestARolloutToTheRunningReleaseInTheOtherSpellingSettles(t *testing.T) {
 
 	cfg := ledgerWithForwardRollout(t, "v0.9.1")
 
-	if _, act, err := rolloutInstruction(t.Context(), cfg); err != nil || act {
+	if _, act, err := rolloutInstruction(t.Context(), processEnv(), cfg); err != nil || act {
 		t.Fatalf("a host on 0.9.1 was asked to move to v0.9.1 (act=%v, err=%v)", act, err)
 	}
 
@@ -101,7 +101,7 @@ func TestAForwardRolloutIsFollowedFromTheBareForm(t *testing.T) {
 
 	cfg := ledgerWithForwardRollout(t, "v0.9.2")
 
-	target, act, err := rolloutInstruction(t.Context(), cfg)
+	target, act, err := rolloutInstruction(t.Context(), processEnv(), cfg)
 	if err != nil {
 		t.Fatalf("rolloutInstruction: %v", err)
 	}

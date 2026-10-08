@@ -25,7 +25,7 @@ func TestEarlyHostUpgradeRefusalsReachTheAcknowledgement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ack, answer := ackReader(t)
 			args := append([]string{"--ack-path", ack.path}, tc.args...)
-			err := cmdHostUpgrade(t.Context(), args)
+			err := cmdHostUpgrade(t.Context(), processEnv(), args)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("the intended early refusal was not reached: %v", err)
 			}

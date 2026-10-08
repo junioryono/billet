@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/retirement"
 )
 
@@ -27,7 +29,7 @@ import (
 // directory, and every action left — the rewrite, the node's restart, `done`
 // and the tail — touches none of it. The archive step is the one that needs the
 // exclusion, and it takes it for itself.
-func retireResumeArchived(ctx context.Context, m retireMode, root *txLock, dir *os.File, shape claimShape,
+func retireResumeArchived(ctx context.Context, env cli.Env, m retireMode, root *txLock, dir *os.File, shape claimShape,
 	j retirement.Journal,
 ) (any, *retireRefusal) {
 	// THE IDENTITY IS READ WHERE THE JOURNAL PUT IT. It is what says this
@@ -68,7 +70,7 @@ func retireResumeArchived(ctx context.Context, m retireMode, root *txLock, dir *
 	// to take. The rewrite installs the bytes the stage holds and holds them to
 	// the digest intent recorded, and the observation it would otherwise update
 	// belongs to a request this run is not making.
-	return runRetireTransition(ctx, m, root, dir, nil, j)
+	return runRetireTransition(ctx, env, m, root, dir, nil, j)
 }
 
 // requireRetireMarker holds a resume to the marker on this converge's guard.

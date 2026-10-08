@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // stoppedBeforeTheClaim answers what this process should return when taking the
@@ -58,14 +60,14 @@ import (
 // cancellation — the claim releases the exclusion through errors.Join, so a
 // connection that would not close arrives here attached to a cancellation — and
 // an exit status that drops it would be the only record of it.
-func stoppedBeforeTheClaim(ctx context.Context, fenced bool, err error) error {
+func stoppedBeforeTheClaim(ctx context.Context, env cli.Env, fenced bool, err error) error {
 	if err == nil || fenced || ctx.Err() == nil || !errors.Is(err, context.Canceled) {
 		return err
 	}
 
 	slog.Default().Info("stopped while taking this deployment's controller claim; "+
 		"the deployment is as this host found it", "detail", err.Error())
-	fmt.Println("billet server: stopped")
+	fmt.Fprintln(env.Stdout, "billet server: stopped")
 
 	return nil
 }

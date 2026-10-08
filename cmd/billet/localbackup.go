@@ -39,8 +39,8 @@ type backupOptions struct {
 // WHAT IT DELIBERATELY DOES NOT CAPTURE is said out loud at the end: node-local
 // custody state, which must never be restored blindly while compute may still
 // exist, and cache data, which repopulates.
-func cmdLocalBackup(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local backup", os.Stdout)
+func cmdLocalBackup(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local backup", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	out := fs.String("out", "", "the directory to write the backup to (created, must be empty)")
 	noUpload := fs.Bool("no-upload", false,
@@ -55,12 +55,12 @@ func cmdLocalBackup(ctx context.Context, args []string) error {
 			"backup to")
 	}
 
-	return runLocalBackup(ctx, backupOptions{
+	return runLocalBackup(ctx, env, backupOptions{
 		configPath: *cfgPath, out: *out, noUpload: *noUpload,
 	})
 }
 
-func runLocalBackup(ctx context.Context, o backupOptions) error {
+func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 	cfg, err := config.Load(o.configPath)
 	if err != nil {
 		return err
@@ -152,7 +152,7 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 
 	defer func() {
 		if err := acc.Release(); err != nil {
-			fmt.Printf("warn     could not release the authority exclusion: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the authority exclusion: %v\n", err)
 		}
 	}()
 
@@ -168,10 +168,10 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 		host = ""
 	}
 
-	fmt.Printf("backup   %s\n", dest)
-	fmt.Printf("         deployment %s\n", deployment)
+	fmt.Fprintf(env.Stdout, "backup   %s\n", dest)
+	fmt.Fprintf(env.Stdout, "         deployment %s\n", deployment)
 	if cfg.Server.LedgerBackend() != config.StatePostgres {
-		fmt.Printf("         the ledger snapshot holds the single writer slot while it runs\n\n")
+		fmt.Fprintf(env.Stdout, "         the ledger snapshot holds the single writer slot while it runs\n\n")
 	}
 
 	// THE LEDGER IS BILLET'S TO COPY ONLY WHEN BILLET HOLDS IT.
@@ -193,9 +193,9 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 	}
 
 	if external != nil {
-		fmt.Printf("         the ledger is %s and is NOT in this archive; your database's own\n",
+		fmt.Fprintf(env.Stdout, "         the ledger is %s and is NOT in this archive; your database's own\n",
 			external.Backend)
-		fmt.Printf("         backup is the other half\n\n")
+		fmt.Fprintf(env.Stdout, "         backup is the other half\n\n")
 	}
 
 	m, err := deployarchive.Write(ctx, deployarchive.BackupRequest{
@@ -217,20 +217,20 @@ func runLocalBackup(ctx context.Context, o backupOptions) error {
 		return err
 	}
 
-	printBackup(m, dest)
+	printBackup(env, m, dest)
 
 	// AFTER THE LOCAL ARCHIVE IS WRITTEN AND VERIFIED, and never instead of it.
 	// A backup nobody can see is not one, so the directory is always there before
 	// anything is asked of a network.
 	if o.noUpload {
-		fmt.Println()
-		fmt.Printf("note     --no-upload: this archive was NOT copied to backup.s3, so it is on\n")
-		fmt.Printf("         the same disk as the deployment it protects\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "note     --no-upload: this archive was NOT copied to backup.s3, so it is on\n")
+		fmt.Fprintf(env.Stdout, "         the same disk as the deployment it protects\n")
 
 		return nil
 	}
 
-	return uploadArchive(ctx, cfg, dest, deployment)
+	return uploadArchive(ctx, env, cfg, dest, deployment)
 }
 
 // ledgerSource decides whether this deployment's ledger travels in the archive.
@@ -271,22 +271,22 @@ func ledgerSource(
 }
 
 // printBackup reports what was captured, and what an archive is not.
-func printBackup(m deployarchive.Manifest, dest string) {
+func printBackup(env cli.Env, m deployarchive.Manifest, dest string) {
 	for _, f := range m.Files {
-		fmt.Printf("wrote    %s (%d bytes)\n", filepath.Join(dest, f.Path), f.Size)
+		fmt.Fprintf(env.Stdout, "wrote    %s (%d bytes)\n", filepath.Join(dest, f.Path), f.Size)
 	}
 
-	fmt.Println()
-	fmt.Printf("ledger   schema %d (%d migrations applied)\n",
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "ledger   schema %d (%d migrations applied)\n",
 		m.Ledger.HighestVersion(), len(m.Ledger.Migrations))
-	fmt.Printf("app      %s\n", m.GitHub)
-	fmt.Printf("ca       %s, expires %s\n", m.Authority.Fingerprint, m.Authority.NotAfter)
+	fmt.Fprintf(env.Stdout, "app      %s\n", m.GitHub)
+	fmt.Fprintf(env.Stdout, "ca       %s, expires %s\n", m.Authority.Fingerprint, m.Authority.NotAfter)
 
 	if m.Authority.Rotating {
-		fmt.Printf("         A ROTATION IS RUNNING: the previous authority (%s) is in this backup\n",
+		fmt.Fprintf(env.Stdout, "         A ROTATION IS RUNNING: the previous authority (%s) is in this backup\n",
 			m.Authority.PreviousFingerprint)
-		fmt.Printf("         too, because its key signs what the control plane presents until\n")
-		fmt.Printf("         every node has renewed.\n")
+		fmt.Fprintf(env.Stdout, "         too, because its key signs what the control plane presents until\n")
+		fmt.Fprintf(env.Stdout, "         every node has renewed.\n")
 	}
 
 	// NAMED RATHER THAN SUMMARISED. A leftover from an interrupted rotation is
@@ -294,23 +294,23 @@ func printBackup(m deployarchive.Manifest, dest string) {
 	// who has one needs to hear about it here rather than wonder later why it did
 	// not travel.
 	if leftovers := wirecert.RotationLeftovers(m.Authority.UnexpectedFilesPresent); len(leftovers) > 0 {
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		for _, path := range leftovers {
-			fmt.Printf("note     %s looks like an interrupted `billet ca rotate`. It is NOT in\n", path)
-			fmt.Printf("         this backup — it is not authority state — and is worth looking at.\n")
+			fmt.Fprintf(env.Stdout, "note     %s looks like an interrupted `billet ca rotate`. It is NOT in\n", path)
+			fmt.Fprintf(env.Stdout, "         this backup — it is not authority state — and is worth looking at.\n")
 		}
 	} else {
 		for _, path := range m.Authority.UnexpectedFilesPresent {
-			fmt.Printf("note     %s is not part of the authority and was not captured\n", path)
+			fmt.Fprintf(env.Stdout, "note     %s is not part of the authority and was not captured\n", path)
 		}
 	}
 
-	fmt.Println()
-	fmt.Println("Restore it with:")
-	fmt.Printf("\n  billet local restore --from %s --dry-run\n\n", dest)
-	fmt.Println("NOT in this backup, deliberately:")
-	fmt.Println("         node custody state, which must never be restored blindly while compute")
-	fmt.Println("         from after the backup may still be running")
-	fmt.Println("         cache data, which repopulates, and guest images, which are pulled again")
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintln(env.Stdout, "Restore it with:")
+	fmt.Fprintf(env.Stdout, "\n  billet local restore --from %s --dry-run\n\n", dest)
+	fmt.Fprintln(env.Stdout, "NOT in this backup, deliberately:")
+	fmt.Fprintln(env.Stdout, "         node custody state, which must never be restored blindly while compute")
+	fmt.Fprintln(env.Stdout, "         from after the backup may still be running")
+	fmt.Fprintln(env.Stdout, "         cache data, which repopulates, and guest images, which are pulled again")
 }

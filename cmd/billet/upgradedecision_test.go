@@ -200,7 +200,7 @@ func TestAResumeRecoversAClaimThatNeverWroteAJournal(t *testing.T) {
 	}
 
 	// No journal is written, which is the state under test.
-	if err := resumeHostUpgrade(t.Context(), nil); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), nil); err != nil {
 		t.Fatalf("resuming a claim with no journal: %v", err)
 	}
 

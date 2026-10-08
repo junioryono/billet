@@ -256,7 +256,7 @@ func TestCheckRefusesAnEBSStoreWithNoCacheListener(t *testing.T) {
 	configPath := writeCacheCheckConfig(t, endpoint, "")
 
 	var err error
-	out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+	out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", configPath}) })
 
 	if err == nil {
 		t.Fatalf("a cache store nothing can reach passed the check:\n%s", out)
@@ -284,7 +284,7 @@ func TestCheckRefusesAnEBSStoreWithNoCacheListener(t *testing.T) {
     tls_key: /etc/billet/cache/tls.key`
 	configPath = writeCacheCheckConfig(t, endpoint, served)
 
-	out = capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+	out = capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", configPath}) })
 
 	if err != nil {
 		t.Fatalf("a node with a cache listener failed the check: %v\n%s", err, out)
@@ -315,7 +315,7 @@ func TestCheckCarriesTheCacheVerdictPastAnEarlierFailure(t *testing.T) {
 		configPath := writeCacheCheckConfig(t, fakeEC2(t, "SOME-OTHER-KEY"), "")
 
 		var err error
-		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", configPath}) })
 
 		if err == nil {
 			t.Fatalf("credentials the api refuses passed the check:\n%s", out)
@@ -344,7 +344,7 @@ func TestCheckCarriesTheCacheVerdictPastAnEarlierFailure(t *testing.T) {
 		configPath := writeCacheCheckConfig(t, fakeEC2(t, "AKIDEXAMPLE"), "", tls)
 
 		var err error
-		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", configPath}) })
 
 		if err == nil {
 			t.Fatalf("an unreadable node certificate passed the check:\n%s", out)
@@ -369,7 +369,7 @@ func TestCheckCarriesTheCacheVerdictPastAnEarlierFailure(t *testing.T) {
 // could acquire its own label and every one of them would stay green.
 func TestPrintNodeCacheLabelsTheFindingOnce(t *testing.T) {
 	out := capture(t, func() {
-		printNodeCache([]string{"the finding", "what it means", "the remedy"})
+		printNodeCache(processEnv(), []string{"the finding", "what it means", "the remedy"})
 	})
 
 	const want = "cache    the finding\n" +
@@ -382,7 +382,7 @@ func TestPrintNodeCacheLabelsTheFindingOnce(t *testing.T) {
 	}
 
 	// A NODE WITH NOTHING TO SAY SAYS NOTHING, and prints no bare label either.
-	if empty := capture(t, func() { printNodeCache(nil) }); empty != "" {
+	if empty := capture(t, func() { printNodeCache(processEnv(), nil) }); empty != "" {
 		t.Errorf("an empty verdict printed %q", empty)
 	}
 }

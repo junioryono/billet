@@ -57,7 +57,7 @@ func TestCheckReportsTheGitHubVerdictBands(t *testing.T) {
 	t.Cleanup(func() { githubAPIBase = prev })
 
 	var checkErr error
-	out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr != nil {
 		t.Fatalf("check with an exact installation failed: %v\n%s", checkErr, out)
 	}
@@ -67,7 +67,7 @@ func TestCheckReportsTheGitHubVerdictBands(t *testing.T) {
 
 	// Band 2: unverifiable, still exit 0, said by name.
 	stubGitHubUnverifiable(t)
-	out = capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out = capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr != nil {
 		t.Fatalf("an unverifiable App failed the check: %v\n%s", checkErr, out)
 	}
@@ -83,7 +83,7 @@ func TestCheckReportsTheGitHubVerdictBands(t *testing.T) {
 	t.Cleanup(wrong.Close)
 	githubAPIBase = wrong.URL
 
-	out = capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out = capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr == nil {
 		t.Fatal("a mismatched installation id passed the check")
 	}
@@ -157,7 +157,7 @@ tiers:
 
 	// Without the flag: refused at the fence, remedy named.
 	var checkErr error
-	capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 	if checkErr == nil {
 		t.Fatal("a fenced ledger was opened without the probe flag")
 	}
@@ -167,7 +167,7 @@ tiers:
 
 	// With the flag: crosses, and the network probes are skipped by name.
 	out := capture(t, func() {
-		checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath, "--maintenance-probe"})
+		checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath, "--maintenance-probe"})
 	})
 	if checkErr != nil {
 		t.Fatalf("the typed probe could not cross the fence: %v\n%s", checkErr, out)
@@ -249,7 +249,7 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		t.Cleanup(func() { githubAPIBase = prev })
 
 		var checkErr error
-		out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+		out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 		if checkErr == nil {
 			t.Fatalf("a missing runner group passed the check:\n%s", out)
@@ -315,7 +315,7 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 				checkErr error
 			)
 			out := capture(t, func() {
-				report, checkErr = runCheck(t.Context(), checkOptions{configPath: cfgPath})
+				report, checkErr = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath})
 			})
 
 			if !strings.Contains(out, "github   verified") {
@@ -378,7 +378,7 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		t.Cleanup(func() { githubAPIBase = prev })
 
 		var checkErr error
-		out := capture(t, func() { _, checkErr = runCheck(t.Context(), checkOptions{configPath: cfgPath}) })
+		out := capture(t, func() { _, checkErr = runCheck(t.Context(), processEnv(), checkOptions{configPath: cfgPath}) })
 
 		if checkErr != nil {
 			t.Fatalf("GitHub failing to answer failed the check: %v\n%s", checkErr, out)
@@ -396,7 +396,7 @@ func TestCheckValidatesATrustedTiersRunnerGroup(t *testing.T) {
 		stubGitHubUnverifiable(t)
 
 		var checkErr error
-		out := capture(t, func() { checkErr = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+		out := capture(t, func() { checkErr = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 		if checkErr != nil {
 			t.Fatalf("an unreachable GitHub failed the check: %v\n%s", checkErr, out)
@@ -574,7 +574,7 @@ func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
 		t.Cleanup(func() { githubAPIBase = prev })
 
 		var err error
-		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 		if err == nil {
 			t.Fatalf("a default group that routes nothing passed the check:\n%s", out)
@@ -599,7 +599,7 @@ func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
 		t.Cleanup(func() { githubAPIBase = prev })
 
 		var err error
-		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 		if err != nil {
 			t.Fatalf("a default group that routes jobs failed the check: %v\n%s", err, out)
@@ -615,7 +615,7 @@ func TestCheckValidatesAnUntrustedTiersDefaultGroup(t *testing.T) {
 		stubGitHubUnverifiable(t)
 
 		var err error
-		out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+		out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 		if err != nil {
 			t.Fatalf("an unreachable GitHub failed the check: %v\n%s", err, out)
@@ -644,7 +644,7 @@ func TestCheckAsksAboutTheDefaultGroupOncePerCheck(t *testing.T) {
 	t.Cleanup(func() { githubAPIBase = prev })
 
 	var err error
-	out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", cfgPath}) })
+	out := capture(t, func() { err = cmdCheck(t.Context(), processEnv(), []string{"--config", cfgPath}) })
 
 	if err != nil {
 		t.Fatalf("three untrusted tiers in a routable default group failed: %v\n%s", err, out)

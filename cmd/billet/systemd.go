@@ -4,14 +4,15 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"strings"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // notifyReady tells systemd initialization completed when this process has a
 // notification socket. Other service managers and interactive runs are no-ops.
-func notifyReady() error {
-	return notifySystemd("READY=1", "readiness")
+func notifyReady(env cli.Env) error {
+	return notifySystemd(env, "READY=1", "readiness")
 }
 
 // upgradeProbeReady is the sentence a HOLDING probe prints once it has opened
@@ -49,12 +50,12 @@ const (
 // exit on my own; stop me". A probe that exits once ready says nothing, and its
 // exit status is its whole answer. Keeping those two shapes disjoint is what lets
 // the parent stop a holder without ever mistaking a stop for a verdict.
-func holdProbe(ctx context.Context, hold bool, line string) {
+func holdProbe(ctx context.Context, env cli.Env, hold bool, line string) {
 	if !hold {
 		return
 	}
 
-	fmt.Println(line)
+	fmt.Fprintln(env.Stdout, line)
 
 	<-ctx.Done()
 }
@@ -68,13 +69,13 @@ func holdProbe(ctx context.Context, hold bool, line string) {
 // Type=notify with TimeoutStartSec=120 and withholding readiness would have
 // systemd kill a standby at two minutes forever — so the readiness line cannot
 // carry this and a second message has to.
-func notifyStatus(text string) error {
+func notifyStatus(env cli.Env, text string) error {
 	// NEWLINES ARE STRIPPED RATHER THAN REFUSED. The protocol is newline-separated
 	// key=value, so an embedded one would inject a second assignment; the only
 	// thing that reaches here is billet's own sentence about a claim holder, and
 	// the holder is a string an operator chose. Truncating the status is a worse
 	// answer than flattening it.
-	return notifySystemd("STATUS="+strings.ReplaceAll(text, "\n", " "), "status")
+	return notifySystemd(env, "STATUS="+strings.ReplaceAll(text, "\n", " "), "status")
 }
 
 // notifySystemd sends one datagram to the service manager, or does nothing.
@@ -82,8 +83,8 @@ func notifyStatus(text string) error {
 // ONE IMPLEMENTATION FOR BOTH MESSAGES, because the socket handling is the part
 // that is easy to get wrong — an abstract socket's leading '@' has to become a
 // NUL, and every service manager other than systemd sets no NOTIFY_SOCKET at all.
-func notifySystemd(message, what string) error {
-	path := os.Getenv("NOTIFY_SOCKET")
+func notifySystemd(env cli.Env, message, what string) error {
+	path := env.Getenv("NOTIFY_SOCKET")
 	if path == "" {
 		return nil
 	}

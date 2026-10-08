@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 )
@@ -319,10 +321,10 @@ var errTartAnsible = errors.New(
 // --macos-image has an image billet has never seen, and telling them it is 87GB
 // is a number they can check and find false. The same applies to naming a guest
 // kind this generation does not have.
-func printTartNext(cfgPath string, trusted bool, tart *initconfig.TartParams) {
+func printTartNext(env cli.Env, cfgPath string, trusted bool, tart *initconfig.TartParams) {
 	pathArg := shellArg(cfgPath)
 
-	fmt.Printf("\nEvery tier's image must already be IN TART'S STORE before the first job — a "+
+	fmt.Fprintf(env.Stdout, "\nEvery tier's image must already be IN TART'S STORE before the first job — a "+
 		"launch refuses one that is not there rather than fetching it, because a guest image "+
 		"is tens of gigabytes and a node runs one command at a time. For a registry "+
 		"reference, which is what the defaults are:\n\n"+
@@ -331,7 +333,7 @@ func printTartNext(cfgPath string, trusted bool, tart *initconfig.TartParams) {
 		"whichever of this node's tier images are missing either way.\n", pathArg)
 
 	if sizes := defaultTartImageSizes(tart); sizes != "" {
-		fmt.Printf("\nIn tart's local store that is about %s.\n", sizes)
+		fmt.Fprintf(env.Stdout, "\nIn tart's local store that is about %s.\n", sizes)
 	}
 
 	if !trusted {
@@ -339,10 +341,10 @@ func printTartNext(cfgPath string, trusted bool, tart *initconfig.TartParams) {
 		// generated config whose preflight FAILS on a host that has done nothing
 		// wrong: the tiers are untrusted, so the node offers to confine a fork's
 		// job, and softnet cannot confine anything until it is setuid-root.
-		fmt.Printf("\nThe tiers are untrusted, so this host must be able to CONFINE a guest: " +
-			"softnet ships with tart and needs a one-time setuid-root grant. `billet check` " +
-			"resolves the real binary — Homebrew's symlink is not the file whose ownership " +
-			"decides — and prints the exact command; until it is granted, check fails rather " +
+		fmt.Fprintf(env.Stdout, "\nThe tiers are untrusted, so this host must be able to CONFINE a guest: "+
+			"softnet ships with tart and needs a one-time setuid-root grant. `billet check` "+
+			"resolves the real binary — Homebrew's symlink is not the file whose ownership "+
+			"decides — and prints the exact command; until it is granted, check fails rather "+
 			"than letting this node promise isolation it does not have.\n")
 	}
 }

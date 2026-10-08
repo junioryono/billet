@@ -38,23 +38,23 @@ import (
 // failure mode is the quiet one this project keeps running into: the instance
 // boots, RunInstances reports success, billet logs a started runner, and the job
 // sits queued forever because nothing consumed the registration.
-func cmdAMI(ctx context.Context, args []string) error {
+func cmdAMI(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet ami <build|verify> [flags]")
 	}
 
 	switch args[0] {
 	case "build":
-		return cmdAMIBuild(ctx, args)
+		return cmdAMIBuild(ctx, env, args)
 	case "verify":
-		return cmdAMIVerify(ctx, args[1:])
+		return cmdAMIVerify(ctx, env, args[1:])
 	default:
 		return errors.New("usage: billet ami <build|verify> [flags]")
 	}
 }
 
-func cmdAMIBuild(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ami build", os.Stdout)
+func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ami build", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed Ubuntu 24.04 image)")
 	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
@@ -158,7 +158,7 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 		caCertPEM = string(data)
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log := slog.New(slog.NewTextHandler(env.Stderr, nil))
 
 	// AN OWNER PER BUILD, AND PER DEPLOYMENT. The owner tag is what separates one
 	// deployment's compute from another's in a shared account, and a fixed string
@@ -168,7 +168,7 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 	// the deployment id in front of it is what makes a value-scoped policy admit
 	// this build and refuse another deployment's, which it could not do while the
 	// builder's value carried no id at all (issue #56).
-	owner, err := builderOwner(*cfgPath, *deployment, *name)
+	owner, err := builderOwner(env, *cfgPath, *deployment, *name)
 	if err != nil {
 		return err
 	}
@@ -181,7 +181,7 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 	build, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 
-	fmt.Printf("Building %s in %s from %s\n\n", *name, cfg.Region, *base)
+	fmt.Fprintf(env.Stdout, "Building %s in %s from %s\n\n", *name, cfg.Region, *base)
 
 	image, err := p.BuildImage(build, ec2.BuildSpec{
 		BaseImage:          *base,
@@ -199,24 +199,24 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\n%s\n\n", image)
+	fmt.Fprintf(env.Stdout, "\n%s\n\n", image)
 
 	if !*verify {
 		// SAID HERE RATHER THAN LEFT TO `billet check`. An unstamped image runs jobs
 		// perfectly well; what it loses is the one fact that says billet has looked
 		// at it, and an operator who is not told will read the check's "needs a
 		// rebuild" as a broken build.
-		fmt.Printf("It was NOT verified, so it carries no AMI contract tag and `billet check`\n")
-		fmt.Printf("will report it as needing a rebuild. To boot it and stamp it:\n\n")
+		fmt.Fprintf(env.Stdout, "It was NOT verified, so it carries no AMI contract tag and `billet check`\n")
+		fmt.Fprintf(env.Stdout, "will report it as needing a rebuild. To boot it and stamp it:\n\n")
 
-		fmt.Printf("  %s\n\n", verifyCommandFor(image, *deployment))
+		fmt.Fprintf(env.Stdout, "  %s\n\n", verifyCommandFor(image, *deployment))
 	}
-	fmt.Printf("Put it in a tier:\n\n")
-	fmt.Printf("  - label: your-label\n")
-	fmt.Printf("    provider: ec2\n")
-	fmt.Printf("    image: %s\n", image)
-	fmt.Printf("    command: [/usr/local/bin/billet-runner]\n\n")
-	fmt.Printf("An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
+	fmt.Fprintf(env.Stdout, "Put it in a tier:\n\n")
+	fmt.Fprintf(env.Stdout, "  - label: your-label\n")
+	fmt.Fprintf(env.Stdout, "    provider: ec2\n")
+	fmt.Fprintf(env.Stdout, "    image: %s\n", image)
+	fmt.Fprintf(env.Stdout, "    command: [/usr/local/bin/billet-runner]\n\n")
+	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
 
 	return nil
 }
@@ -228,8 +228,8 @@ func cmdAMIBuild(ctx context.Context, args []string) error {
 // leaves that image behind; without this the only way to retry is to buy another
 // builder and run the whole thing again. It is also the answer for an image built
 // before verification existed, and for one built with --verify=false.
-func cmdAMIVerify(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet ami verify", os.Stdout)
+func cmdAMIVerify(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet ami verify", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	shape := fs.String("instance-type", "",
 		"shape the verifier runs on (default: a small Nitro shape for the image's arch)")
@@ -271,14 +271,14 @@ func cmdAMIVerify(ctx context.Context, args []string) error {
 		cfg.AssignPublicIP = true
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	log := slog.New(slog.NewTextHandler(env.Stderr, nil))
 
 	// AN OWNER PER IMAGE, AND PER DEPLOYMENT, for the same reason a build takes
 	// one per name: the owner tag separates this verification's compute from any
 	// deployment's, a fixed string would put every verification anyone ever runs
 	// under one identity, and the deployment id is what lets a value-scoped
 	// policy tell this one from another deployment's.
-	owner, err := builderOwner(*cfgPath, *deployment, image)
+	owner, err := builderOwner(env, *cfgPath, *deployment, image)
 	if err != nil {
 		return err
 	}
@@ -291,13 +291,13 @@ func cmdAMIVerify(ctx context.Context, args []string) error {
 	run, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 
-	fmt.Printf("Booting %s in %s and asking it to prove itself\n\n", image, cfg.Region)
+	fmt.Fprintf(env.Stdout, "Booting %s in %s and asking it to prove itself\n\n", image, cfg.Region)
 
 	if err := p.VerifyImage(run, ec2.VerifySpec{Image: image, InstanceType: *shape}); err != nil {
 		return err
 	}
 
-	fmt.Printf("\n%s is verified and stamped with the AMI contract it proved.\n", image)
+	fmt.Fprintf(env.Stdout, "\n%s is verified and stamped with the AMI contract it proved.\n", image)
 
 	return nil
 }
@@ -360,7 +360,7 @@ func ec2ConfigFor(path, region, subnet, group string) (config.EC2Config, error) 
 // --builder` renders a policy that admits only that deployment's builders, and a
 // build run from a laptop with no config stamps the account-wide value and is
 // denied at RunInstances with nothing naming the reason.
-func builderOwner(cfgPath, deployment, name string) (string, error) {
+func builderOwner(env cli.Env, cfgPath, deployment, name string) (string, error) {
 	if deployment != "" {
 		if err := deploymentid.Validate(deployment); err != nil {
 			return "", fmt.Errorf("--deployment: %w", err)
@@ -393,7 +393,7 @@ func builderOwner(cfgPath, deployment, name string) (string, error) {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "NOTE: no deployment identity found, so this build is tagged %s. "+
+	fmt.Fprintf(env.Stderr, "NOTE: no deployment identity found, so this build is tagged %s. "+
 		"A policy from `billet init iam --deployment <id> --builder` will NOT admit it; "+
 		"pass --deployment, or point --config at a deployment that has one.\n\n",
 		ec2.BuilderOwner("", name))

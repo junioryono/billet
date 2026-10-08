@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -46,7 +48,7 @@ type hostPrepareAnswer struct {
 // directory is the configuration's server directory when a configuration
 // exists, else the packaged default, so a fresh package install prepares the
 // directory the server will use before any metadata exists beside it.
-func cmdLocalPrepare(ctx context.Context, args []string) error {
+func cmdLocalPrepare(ctx context.Context, env cli.Env, args []string) error {
 	flags := flag.NewFlagSet("billet local prepare", flag.ContinueOnError)
 	cfgPath := addServiceConfigFlag(flags)
 	account := flags.String("account", initconfig.ServiceGroup, "the service account the units run as")
@@ -100,28 +102,28 @@ func cmdLocalPrepare(ctx context.Context, args []string) error {
 	}
 
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(env.Stdout)
 
 		return enc.Encode(ans)
 	}
 
-	fmt.Printf("prepared %s for %s\n", identityDir, ans.Account)
+	fmt.Fprintf(env.Stdout, "prepared %s for %s\n", identityDir, ans.Account)
 
 	if res.Created {
-		fmt.Printf("created  %s\n", identityDir)
+		fmt.Fprintf(env.Stdout, "created  %s\n", identityDir)
 	}
 
 	if res.IdentityDirAbsent {
-		fmt.Printf("absent   %s is absent beside existing authority metadata and was left so; a retirement "+
+		fmt.Fprintf(env.Stdout, "absent   %s is absent beside existing authority metadata and was left so; a retirement "+
 			"moved it or the host is damaged, and nothing here recreates it\n", identityDir)
 	}
 
 	for _, path := range res.Repaired {
-		fmt.Printf("own      %s\n", path)
+		fmt.Fprintf(env.Stdout, "own      %s\n", path)
 	}
 
 	if ans.Closed {
-		fmt.Printf("closed   this controller's authority is closed (retirement at %s); nothing here starts it\n", ans.Status)
+		fmt.Fprintf(env.Stdout, "closed   this controller's authority is closed (retirement at %s); nothing here starts it\n", ans.Status)
 	}
 
 	return nil

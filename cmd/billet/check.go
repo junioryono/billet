@@ -105,8 +105,8 @@ type checkReport struct {
 // opening exclusively made it useless. It still migrates when nothing holds the
 // directory, so a first run sets the schema up; against a live plane it verifies
 // and refuses rather than upgrading a schema that plane is using.
-func cmdCheck(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet check", os.Stdout)
+func cmdCheck(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet check", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	authorize := fs.Bool("authorize", false,
 		"also DRY-RUN a launch against AWS to prove the ec2 role may RunInstances "+
@@ -120,7 +120,7 @@ func cmdCheck(ctx context.Context, args []string) error {
 		return err
 	}
 
-	_, err := runCheck(ctx, checkOptions{
+	_, err := runCheck(ctx, env, checkOptions{
 		configPath:       *cfgPath,
 		authorize:        *authorize,
 		maintenanceProbe: *maintenanceProbe,
@@ -132,22 +132,22 @@ func cmdCheck(ctx context.Context, args []string) error {
 // runCheck performs a check and reports what it established. It prints as it
 // goes, because the report IS the product for an operator; the return value
 // exists for a caller that has to make a decision on the outcome.
-func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
+func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport, error) {
 	var report checkReport
 
 	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		return report, err
 	}
-	fmt.Printf("config   %s\n", opts.configPath)
+	fmt.Fprintf(env.Stdout, "config   %s\n", opts.configPath)
 
 	// THE HOST'S GUARD, before anything that could take long: a converge holding
 	// this host is the answer to why a rollout is refusing it, and a guard older
 	// than a day is one somebody has forgotten.
-	checkGuard()
+	checkGuard(env)
 
 	if runtime.GOOS == "linux" {
-		reportNeedrestart(os.Stdout, "/")
+		reportNeedrestart(env.Stdout, "/")
 	}
 
 	// The probe flag skips the network; so does the BILLET_MAINTENANCE
@@ -157,7 +157,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	// its fence bypass and its preflight skip on it, while in this billet it
 	// can only make the check quieter — skipping probes cannot authorize a
 	// write, which is why it is safe where the fence bypass was not.
-	skipNetworkProbes := opts.maintenanceProbe || os.Getenv("BILLET_MAINTENANCE") == "1"
+	skipNetworkProbes := opts.maintenanceProbe || env.Getenv("BILLET_MAINTENANCE") == "1"
 
 	// A fatal GitHub verdict is returned at the END, after every local section
 	// has reported: check is the command an operator reaches for when something
@@ -173,13 +173,13 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	for _, target := range targets {
 		switch {
 		case len(targets) > 1:
-			fmt.Printf("target   %s: %s (app %d, installation %d)\n",
+			fmt.Fprintf(env.Stdout, "target   %s: %s (app %d, installation %d)\n",
 				target.Name, describeGitHubTarget(target), target.AppID, target.InstallationID)
 		case target.IsRepository():
-			fmt.Printf("repo     %s (app %d, installation %d)\n",
+			fmt.Fprintf(env.Stdout, "repo     %s (app %d, installation %d)\n",
 				target.Repository, target.AppID, target.InstallationID)
 		default:
-			fmt.Printf("org      %s (app %d, installation %d)\n",
+			fmt.Fprintf(env.Stdout, "org      %s (app %d, installation %d)\n",
 				target.Org, target.AppID, target.InstallationID)
 		}
 
@@ -187,7 +187,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// FACT DEPENDING ON WHICH. An operator debugging a failover has to know
 		// whether this host read a file of its own or the deployment's shared
 		// store, and the two look identical in every other line of this report.
-		fmt.Printf("app key  %s\n", appKeyLocation(cfg, target))
+		fmt.Fprintf(env.Stdout, "app key  %s\n", appKeyLocation(cfg, target))
 
 		key, err := resolveAppKey(ctx, cfg, target)
 		if err != nil {
@@ -206,23 +206,23 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		switch {
 		case skipNetworkProbes:
 			verdict = githubSkipped
-			fmt.Printf("github   (verification skipped during maintenance)\n")
+			fmt.Fprintf(env.Stdout, "github   (verification skipped during maintenance)\n")
 		default:
 			inst, err := github.VerifyAppAt(ctx, nil, githubAPIBase, target.AppID, key,
 				githubTarget(target), target.InstallationID, cfg.TargetNeedsRunEvidence(target.Name))
 			switch {
 			case errors.Is(err, github.ErrAppUnverifiable):
 				verdict = githubUnverifiable
-				fmt.Printf("github   UNVERIFIED: %v\n", err)
-				fmt.Printf("         (the App may still be fine — this says the check could not " +
+				fmt.Fprintf(env.Stdout, "github   UNVERIFIED: %v\n", err)
+				fmt.Fprintf(env.Stdout, "         (the App may still be fine — this says the check could not "+
 					"reach a verdict, and nothing may treat it as one)\n")
 			case err != nil:
 				verdict = githubFailed
-				fmt.Printf("github   FAILED: %v\n", err)
+				fmt.Fprintf(env.Stdout, "github   FAILED: %v\n", err)
 				githubFailure = errors.Join(githubFailure, err)
 			default:
 				verdict = githubVerified
-				fmt.Printf("github   verified: installation %d on %s, permissions exactly as "+
+				fmt.Fprintf(env.Stdout, "github   verified: installation %d on %s, permissions exactly as "+
 					"requested for a %s\n", inst.ID, target.Path(), target.Scope())
 			}
 		}
@@ -233,18 +233,18 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 	}
 
 	if cfg.Server != nil {
-		fmt.Printf("listen   %s\n", cfg.Server.Listen)
+		fmt.Fprintf(env.Stdout, "listen   %s\n", cfg.Server.Listen)
 
 		// SAID OUT LOUD BECAUSE ITS ABSENCE IS A DECISION. A control plane with no
 		// enrollment address does not admit machines over the network at all, and
 		// an operator meets that as a handshake failure on the far side of the
 		// deployment unless something here says so first.
 		if cfg.Server.BootstrapListen != "" {
-			fmt.Printf("enroll   %s\n", cfg.Server.BootstrapListen)
+			fmt.Fprintf(env.Stdout, "enroll   %s\n", cfg.Server.BootstrapListen)
 		} else {
-			fmt.Printf("enroll   none; issue bundles with `billet ca issue <node>`\n")
+			fmt.Fprintf(env.Stdout, "enroll   none; issue bundles with `billet ca issue <node>`\n")
 		}
-		fmt.Printf("ceiling  %d vCPU, %s\n", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+		fmt.Fprintf(env.Stdout, "ceiling  %d vCPU, %s\n", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
 
 		// `billet check` is the command an operator reaches for WHEN SOMETHING IS
 		// WRONG, which is exactly when the server is running. Opening the ledger
@@ -290,16 +290,16 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			}
 		}
 
-		fmt.Printf("state    %s (ok, integrity verified)\n", cfg.Server.IdentityDir)
+		fmt.Fprintf(env.Stdout, "state    %s (ok, integrity verified)\n", cfg.Server.IdentityDir)
 
 		// AN UNWATCHED BACKUP IS NOT ONE EITHER, which is the sibling of the rule
 		// this whole area is built on. A timer that stopped firing looks exactly
 		// like one that is working, and the day an operator finds out is the day
 		// the archive was needed. ADVISORY throughout: this reports, and nothing
 		// here decides whether the deployment may run.
-		reportLocalBackupAge(ctx)
-		reportBackupAge(ctx, cfg, skipNetworkProbes)
-		reportTimer(ctx, "updates", deploy.UpgradeTimerName,
+		reportLocalBackupAge(ctx, env)
+		reportBackupAge(ctx, env, cfg, skipNetworkProbes)
+		reportTimer(ctx, env, "updates", deploy.UpgradeTimerName,
 			"a recorded rollout waits on this host until somebody runs "+
 				"billet host-upgrade --from-rollout")
 
@@ -317,7 +317,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			return report, err
 		}
 		if len(registered) == 0 {
-			fmt.Println("fleet    no registered nodes")
+			fmt.Fprintln(env.Stdout, "fleet    no registered nodes")
 		}
 		for _, member := range registered {
 			site := member.Site
@@ -328,7 +328,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			if member.Live {
 				liveness = "live"
 			}
-			fmt.Printf("fleet    %-24s at %s via %s (%s)\n", member.Name, site,
+			fmt.Fprintf(env.Stdout, "fleet    %-24s at %s via %s (%s)\n", member.Name, site,
 				member.Provider, liveness)
 		}
 	}
@@ -359,7 +359,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 				// NO HEADER HERE: this is the one path where the node's name was
 				// never established. The verdict is printed anyway, because it
 				// never depended on the name.
-				printNodeCache(cacheLines)
+				printNodeCache(env, cacheLines)
 
 				return report, errors.Join(cacheFailure, fmt.Errorf("node identity: %w", err))
 			}
@@ -370,9 +370,9 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		if site == "" {
 			site = "local (implicit)"
 		}
-		fmt.Printf("node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
+		fmt.Fprintf(env.Stdout, "node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
 			cfg.Node.Provider, cfg.Node.ServerAddr)
-		printNodeCache(cacheLines)
+		printNodeCache(env, cacheLines)
 
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this
 		// machine can act on it, and the difference is a deployment that validates
@@ -384,13 +384,13 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// being configured commonly cannot reach AWS at all, and that is exactly
 		// the host whose operator has to be told the cache is unreachable too.
 		if !cfg.Node.Provider.RunsOnHost() {
-			if err := printRemoteCost(cfg); err != nil {
+			if err := printRemoteCost(env, cfg); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}
 
 		if cfg.Node.Provider == config.ProviderEC2 && cfg.Node.EC2 != nil {
-			if err := checkEC2Credentials(ctx, cfg, bundle, opts.authorize, skipNetworkProbes); err != nil {
+			if err := checkEC2Credentials(ctx, env, cfg, bundle, opts.authorize, skipNetworkProbes); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}
@@ -402,17 +402,17 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// machine where somebody is still writing the config — which is the one
 		// moment the sentence is useful.
 		if cfg.Node.Provider == config.ProviderCodeBuild && cfg.Node.CodeBuild != nil {
-			printCodeBuildCeilings(cfg)
+			printCodeBuildCeilings(env, cfg)
 
 			if !skipNetworkProbes {
-				if err := checkCodeBuildLive(ctx, cfg, bundle); err != nil {
+				if err := checkCodeBuildLive(ctx, env, cfg, bundle); err != nil {
 					return report, errors.Join(cacheFailure, err)
 				}
 			}
 		}
 
 		if cfg.Node.Ceph != nil {
-			if err := checkCephCluster(ctx, cfg.Node.Ceph); err != nil {
+			if err := checkCephCluster(ctx, env, cfg.Node.Ceph); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}
@@ -423,24 +423,24 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// of output acts on the first thing it names, and the shared fault is the more
 		// useful one to name first.
 		if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Firecracker != nil {
-			if err := checkFirecrackerHost(ctx, cfg); err != nil {
+			if err := checkFirecrackerHost(ctx, env, cfg); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 			// REPORTED, NEVER FATAL: a stale image is maintenance information, and
 			// the failure this line exists to catch is a refresh timer that stopped
 			// firing, which looks exactly like one that is working.
-			reportGuestImageFreshness(ctx, cfg)
+			reportGuestImageFreshness(ctx, env, cfg)
 		}
 
 		if cfg.Node.Provider == config.ProviderTart {
-			if err := checkTartHost(ctx, cfg); err != nil {
+			if err := checkTartHost(ctx, env, cfg); err != nil {
 				return report, errors.Join(cacheFailure, err)
 			}
 		}
 	}
 
 	for i := range cfg.Sites {
-		fmt.Printf("site     %-24s %s\n", cfg.Sites[i].Name, cfg.Sites[i].Store)
+		fmt.Fprintf(env.Stdout, "site     %-24s %s\n", cfg.Sites[i].Name, cfg.Sites[i].Store)
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -492,10 +492,10 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			macOS = fmt.Sprintf("max %d macOS", p.MacOSLimit())
 		}
 
-		fmt.Printf("  policy %-14s %-12s %-24s %s\n", p.Name, backend, guests, macOS)
+		fmt.Fprintf(env.Stdout, "  policy %-14s %-12s %-24s %s\n", p.Name, backend, guests, macOS)
 	}
 
-	fmt.Printf("tiers    %d\n", len(cfg.Tiers))
+	fmt.Fprintf(env.Stdout, "tiers    %d\n", len(cfg.Tiers))
 
 	// ONE VERDICT PER RUNNER GROUP PER TARGET, shared across the tiers that name
 	// it. Every untrusted tier lands in the default group, so without this a
@@ -533,7 +533,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			onTarget = "  target:" + t.Target
 		}
 
-		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
+		fmt.Fprintf(env.Stdout, "  %-34s %2d vCPU  %8s  %s/%s%s%s%s\n",
 			tierDisplay(t), t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
 			reserved, intercept, onTarget)
 
@@ -567,12 +567,12 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 			case err != nil && ctx.Err() == nil && github.Undecided(err):
 				groupsUndecided = true
 				report.github = worseGitHubVerdict(report.github, githubUnverifiable)
-				fmt.Printf("           runner group UNVERIFIED: %v\n", err)
-				fmt.Printf("           (GitHub could not answer; this says nothing about the " +
+				fmt.Fprintf(env.Stdout, "           runner group UNVERIFIED: %v\n", err)
+				fmt.Fprintf(env.Stdout, "           (GitHub could not answer; this says nothing about the "+
 					"group, and nothing may treat it as a verdict)\n")
 			case err != nil:
 				report.github = githubFailed
-				fmt.Printf("           runner group FAILED: %v\n", err)
+				fmt.Fprintf(env.Stdout, "           runner group FAILED: %v\n", err)
 
 				if githubFailure == nil {
 					githubFailure = err
@@ -581,13 +581,13 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 				// SAID, NOT SILENT. A repository has no runner groups, so there
 				// is nothing to probe; an operator reading the tier lines must
 				// see that the probe was not run rather than infer it passed.
-				fmt.Printf("           runner group not probed: a repository target has no runner " +
+				fmt.Fprintf(env.Stdout, "           runner group not probed: a repository target has no runner "+
 					"groups, so the tier is untrusted and lands in the repository's own pool\n")
 			default:
-				fmt.Printf("           runner group %q verified\n", t.RunnerGroup)
+				fmt.Fprintf(env.Stdout, "           runner group %q verified\n", t.RunnerGroup)
 			}
 		} else if groupsUndecided {
-			fmt.Printf("           runner group not probed: GitHub could not answer an earlier " +
+			fmt.Fprintf(env.Stdout, "           runner group not probed: GitHub could not answer an earlier "+
 				"lookup, so nothing was asked about this tier's group\n")
 		}
 	}
@@ -617,7 +617,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// when something is.
 		share := float64(reservedVCPU) * 100 / float64(cfg.Server.MaxVCPU)
 
-		fmt.Printf("reserved %d of %d vCPU (%.1f%%) and %s of %s, held back from other tiers "+
+		fmt.Fprintf(env.Stdout, "reserved %d of %d vCPU (%.1f%%) and %s of %s, held back from other tiers "+
 			"whether or not they are used\n",
 			reservedVCPU, cfg.Server.MaxVCPU, share, reservedMemory, cfg.Server.MaxMemory)
 	}
@@ -738,7 +738,7 @@ func worseGitHubVerdict(a, b githubVerdict) githubVerdict {
 // reportGuestImageFreshness names the newest generation of each image this
 // host's microVM tiers boot, how old it is, and whether the packaged refresh
 // timer is what will replace it.
-func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
+func reportGuestImageFreshness(ctx context.Context, env cli.Env, cfg *config.Config) {
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
 		return
 	}
@@ -750,7 +750,7 @@ func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
 
 	store, err := openGenerationDater(cfg)
 	if err != nil {
-		fmt.Printf("images   could not read the cluster's generations: %v\n", err)
+		fmt.Fprintf(env.Stdout, "images   could not read the cluster's generations: %v\n", err)
 
 		return
 	}
@@ -760,27 +760,27 @@ func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
 
 		_, why, err := generationDue(ctx, store, name, imagesRefreshAge)
 		if err != nil {
-			fmt.Printf("images   %s: could not tell: %v\n", name, err)
+			fmt.Fprintf(env.Stdout, "images   %s: could not tell: %v\n", name, err)
 
 			continue
 		}
 
-		fmt.Printf("images   %s: %s\n", name, why)
+		fmt.Fprintf(env.Stdout, "images   %s: %s\n", name, why)
 	}
 
-	reportTimer(ctx, "refresh", deploy.ImagesRefreshTimerName,
+	reportTimer(ctx, env, "refresh", deploy.ImagesRefreshTimerName,
 		"nothing will replace an image that ages out of GitHub's runner window")
 }
 
 // reportTimer says whether a packaged timer is enabled, or that it could not ask.
-func reportTimer(ctx context.Context, label, timer, consequence string) {
+func reportTimer(ctx context.Context, env cli.Env, label, timer, consequence string) {
 	switch enabled, err := timerEnabled(ctx, timer); {
 	case err != nil:
-		fmt.Printf("%-8s could not tell whether %s is enabled: %v\n", label, timer, err)
+		fmt.Fprintf(env.Stdout, "%-8s could not tell whether %s is enabled: %v\n", label, timer, err)
 	case enabled:
-		fmt.Printf("%-8s %s is enabled\n", label, timer)
+		fmt.Fprintf(env.Stdout, "%-8s %s is enabled\n", label, timer)
 	default:
-		fmt.Printf("%-8s %s is NOT enabled; %s (billet local up enables it, or: "+
+		fmt.Fprintf(env.Stdout, "%-8s %s is NOT enabled; %s (billet local up enables it, or: "+
 			"systemctl enable --now %s)\n", label, timer, consequence, timer)
 	}
 }
@@ -796,13 +796,13 @@ const localBackupStale = 48 * time.Hour
 // whether the timer that writes them is enabled. A timer that stopped firing
 // looks exactly like one that is working, and the day an operator finds out is
 // the day the archive was needed. ADVISORY: reports, decides nothing.
-func reportLocalBackupAge(ctx context.Context) {
+func reportLocalBackupAge(ctx context.Context, env cli.Env) {
 	entries, err := os.ReadDir(localBackupDir)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+		fmt.Fprintf(env.Stdout, "backup   no local archive yet under %s\n", localBackupDir)
 	case err != nil:
-		fmt.Printf("backup   UNCHECKED: %s: %v\n", localBackupDir, err)
+		fmt.Fprintf(env.Stdout, "backup   UNCHECKED: %s: %v\n", localBackupDir, err)
 	default:
 		var newest string
 		var newestAt time.Time
@@ -820,17 +820,17 @@ func reportLocalBackupAge(ctx context.Context) {
 		}
 		switch {
 		case newest == "":
-			fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+			fmt.Fprintf(env.Stdout, "backup   no local archive yet under %s\n", localBackupDir)
 		case time.Since(newestAt) > localBackupStale:
-			fmt.Printf("backup   newest local archive %s is %s old, past two daily runs; the timer "+
+			fmt.Fprintf(env.Stdout, "backup   newest local archive %s is %s old, past two daily runs; the timer "+
 				"may have stopped firing\n", newest, time.Since(newestAt).Round(time.Hour))
 		default:
-			fmt.Printf("backup   newest local archive %s, %s old\n", newest,
+			fmt.Fprintf(env.Stdout, "backup   newest local archive %s, %s old\n", newest,
 				time.Since(newestAt).Round(time.Minute))
 		}
 	}
 
-	reportTimer(ctx, "backup", deploy.BackupTimerName,
+	reportTimer(ctx, env, "backup", deploy.BackupTimerName,
 		"nothing writes an archive of this deployment")
 }
 

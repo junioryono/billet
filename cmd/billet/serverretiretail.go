@@ -7,6 +7,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -110,7 +112,7 @@ var retireLedgerBound = 2 * time.Minute
 // retireTail finishes everything the retirement owes after `done` and answers
 // what it left. The journal it is given has already been validated as this
 // host's, this guard's and this transition's.
-func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j retirement.Journal,
+func retireTail(ctx context.Context, env cli.Env, m retireMode, root *txLock, dir *os.File, j retirement.Journal,
 	steps []retireStep,
 ) (any, *retireRefusal) {
 	answer := &retireTailAnswer{Schema: retireSchema, Outcome: retireOutcomeRetired, Phase: j.Phase,
@@ -121,7 +123,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 		return nil, r
 	}
 
-	receipt, r := retireTailReceipt(ctx, m, j)
+	receipt, r := retireTailReceipt(ctx, env, m, j)
 	if r != nil {
 		return nil, r
 	}
@@ -134,7 +136,7 @@ func retireTail(ctx context.Context, m retireMode, root *txLock, dir *os.File, j
 	completion := retirement.CompletionOf(j)
 	answer.Completion = &completion
 
-	j, r = retireTailRow(ctx, m, j, answer)
+	j, r = retireTailRow(ctx, env, m, j, answer)
 	if r != nil {
 		return nil, r
 	}
@@ -192,13 +194,13 @@ func retireTailStatus(ctx context.Context, m retireMode, j retirement.Journal) *
 // changed, and the fleet's next check refuses on it. The refresh is the same
 // one every ordinary converge ends with, run here because a converge that
 // retires this host ends at the retirement and never reaches that task.
-func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) (string, *retireRefusal) {
+func retireTailReceipt(ctx context.Context, env cli.Env, m retireMode, j retirement.Journal) (string, *retireRefusal) {
 	if j.Variant != retirement.VariantRetainedNode {
 		return retireReceiptNone, nil
 	}
 
 	noteRetireMutation("wait", "receipt registration")
-	answer, r := refreshReceipt(ctx, receiptMode{configPath: m.configPath, run: m.run, refresh: true,
+	answer, r := refreshReceipt(ctx, env, receiptMode{configPath: m.configPath, run: m.run, refresh: true,
 		wait: retireReceiptWait, beforeMutation: func() *endpointRefusal {
 			if r := admitRetireDoneProtection(ctx, m, j); r != nil {
 				return endpointUnknown(retireReasonEffects, r.Why, r.Next, "")
@@ -235,7 +237,7 @@ func retireTailReceipt(ctx context.Context, m retireMode, j retirement.Journal) 
 // this host and the ledger has not heard yet — and everything else is a
 // refusal, because a ledger that disagrees with this journal is not a thing to
 // wait out.
-func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answer *retireTailAnswer,
+func retireTailRow(ctx context.Context, env cli.Env, m retireMode, j retirement.Journal, answer *retireTailAnswer,
 ) (retirement.Journal, *retireRefusal) {
 	if j.RowDone {
 		answer.Row = retireRowAlready
@@ -247,7 +249,7 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 	bounded, cancel := context.WithTimeout(ctx, retireLedgerBound)
 	defer cancel()
 
-	db, problem := retireOpenByLocator(bounded, j, func(openCtx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
+	db, problem := retireOpenByLocator(bounded, env, j, func(openCtx context.Context, dir string, dsn state.DSN) (*state.DB, error) {
 		if err := openCtx.Err(); err != nil {
 			return nil, err
 		}
@@ -342,7 +344,7 @@ func retireTailRow(ctx context.Context, m retireMode, j retirement.Journal, answ
 // IT ANSWERS THREE WAYS. A handle; nil with a reason, which is a PENDING row
 // and not a failure of this converge; or a refusal, which is everything this
 // command cannot classify.
-func retireOpenByLocator(ctx context.Context, j retirement.Journal,
+func retireOpenByLocator(ctx context.Context, env cli.Env, j retirement.Journal,
 	open func(ctx context.Context, dir string, dsn state.DSN) (*state.DB, error),
 ) (*state.DB, ledgerProblem) {
 	if j.Locator.Backend != string(config.StatePostgres) {
@@ -350,7 +352,7 @@ func retireOpenByLocator(ctx context.Context, j retirement.Journal,
 			"the backend %q, and a retirement is defined for PostgreSQL", j.Locator.Backend), "")}
 	}
 
-	dsn, why, r := retireLocatorDSN(j.Locator)
+	dsn, why, r := retireLocatorDSN(env, j.Locator)
 
 	switch {
 	case r != nil:
@@ -415,14 +417,14 @@ type ledgerProblem struct {
 // environment file when it names one and from this process's environment
 // otherwise. A file that is gone or unreadable is a PENDING row: the rewrite
 // took the server's environment away and the survivor completes instead.
-func retireLocatorDSN(loc retirement.JournalLocator) (state.DSN, string, *retireRefusal) {
+func retireLocatorDSN(env cli.Env, loc retirement.JournalLocator) (state.DSN, string, *retireRefusal) {
 	if loc.DSNEnv == "" {
 		return "", "", retireUnknown(retireReasonLedger, "the journal's locator names no DSN variable, so this host "+
 			"cannot reach the ledger it retired from", "the runbook in docs/operating/upgrades.md")
 	}
 
 	if loc.EnvironmentFile == "" {
-		value := os.Getenv(loc.DSNEnv)
+		value := env.Getenv(loc.DSNEnv)
 		if value == "" {
 			return "", fmt.Sprintf("%s is not set in this process's environment", loc.DSNEnv), nil
 		}

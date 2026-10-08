@@ -1,7 +1,7 @@
 // Package lifeops answers what a local billet deployment is actually doing.
 //
-// IT PRINTS NOTHING. Operator output belongs to cmd/billet, the one package
-// allowed to write to stdout; lifeops returns facts and lets the command render
+// IT PRINTS NOTHING. Operator output belongs to the command, which writes it
+// to the cli.Env it is handed; lifeops returns facts and lets the command render
 // them. That split is what lets every judgment here be asserted by value rather
 // than by scraping text out of a terminal.
 //

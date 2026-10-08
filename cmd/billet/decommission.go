@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/awscreds"
@@ -24,8 +23,8 @@ import (
 // only reports what it found. Live compute blocks the cache purge: a running
 // instance may still be serving a job, so the cache it depends on must not be
 // pulled out from under it.
-func cmdDecommission(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet decommission", os.Stdout)
+func cmdDecommission(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet decommission", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	yes := fs.Bool("yes", false, "actually delete (without this, only report what would be removed)")
 	terminateInstances := fs.Bool("terminate-instances", false,
@@ -67,19 +66,19 @@ func cmdDecommission(ctx context.Context, args []string) error {
 
 	creds := awscreds.Default()
 
-	if err := decommissionInstances(ctx, cfg, owner, creds, *yes, *terminateInstances); err != nil {
+	if err := decommissionInstances(ctx, env, cfg, owner, creds, *yes, *terminateInstances); err != nil {
 		return err
 	}
 
-	if err := decommissionCache(ctx, cfg, owner, creds, *yes); err != nil {
+	if err := decommissionCache(ctx, env, cfg, owner, creds, *yes); err != nil {
 		return err
 	}
 
 	if *yes {
-		fmt.Printf("decommission complete — `terraform destroy` can now remove the module's " +
+		fmt.Fprintf(env.Stdout, "decommission complete — `terraform destroy` can now remove the module's "+
 			"VPC, IAM role, bucket and queue without leaving billet resources behind\n")
 	} else {
-		fmt.Printf("(nothing was deleted — re-run with --yes to remove the above)\n")
+		fmt.Fprintf(env.Stdout, "(nothing was deleted — re-run with --yes to remove the above)\n")
 	}
 
 	return nil
@@ -90,7 +89,7 @@ func cmdDecommission(ctx context.Context, args []string) error {
 // are FATAL: they may be running jobs, and the cache purge below must not proceed
 // while compute that depends on it is alive.
 func decommissionInstances(
-	ctx context.Context, cfg *config.Config, owner string, creds awscreds.Source,
+	ctx context.Context, env cli.Env, cfg *config.Config, owner string, creds awscreds.Source,
 	yes, terminateInstances bool,
 ) error {
 	p, err := ec2.New(owner, *cfg.Node.EC2, ec2.WithCredentials(creds))
@@ -104,13 +103,13 @@ func decommissionInstances(
 	}
 
 	if len(instances) == 0 {
-		fmt.Printf("instances none running for this deployment\n")
+		fmt.Fprintf(env.Stdout, "instances none running for this deployment\n")
 
 		return nil
 	}
 
 	for _, instance := range instances {
-		fmt.Printf("instance %s (%s)\n", instance.ID, instance.Name)
+		fmt.Fprintf(env.Stdout, "instance %s (%s)\n", instance.ID, instance.Name)
 	}
 
 	if !terminateInstances {
@@ -126,7 +125,7 @@ func decommissionInstances(
 		if _, err := p.Destroy(ctx, instance.ID); err != nil {
 			return fmt.Errorf("node.ec2: terminate %s: %w", instance.ID, err)
 		}
-		fmt.Printf("instance %s terminated\n", instance.ID)
+		fmt.Fprintf(env.Stdout, "instance %s terminated\n", instance.ID)
 	}
 
 	return nil
@@ -134,14 +133,14 @@ func decommissionInstances(
 
 // decommissionCache purges the deployment's EBS+S3 cache once compute is gone.
 func decommissionCache(
-	ctx context.Context, cfg *config.Config, owner string, creds awscreds.Source, yes bool,
+	ctx context.Context, env cli.Env, cfg *config.Config, owner string, creds awscreds.Source, yes bool,
 ) error {
 	if cfg.Node.EBSS3 == nil {
 		return nil // a compute-only ec2 node has no cache to purge
 	}
 
 	if !yes {
-		fmt.Printf("cache    would purge the ebs-s3 cache (owned snapshots, volumes and S3 state)\n")
+		fmt.Fprintf(env.Stdout, "cache    would purge the ebs-s3 cache (owned snapshots, volumes and S3 state)\n")
 
 		return nil
 	}
@@ -156,12 +155,12 @@ func decommissionCache(
 		return fmt.Errorf("node.ebs_s3: %w", err)
 	}
 
-	fmt.Printf("cache    purged %d snapshot(s), %d volume(s), %d state object(s)",
+	fmt.Fprintf(env.Stdout, "cache    purged %d snapshot(s), %d volume(s), %d state object(s)",
 		report.Snapshots, report.Volumes, report.StateObjects)
 	if report.SkippedForeign > 0 {
-		fmt.Printf("; skipped %d resource(s) owned by another deployment", report.SkippedForeign)
+		fmt.Fprintf(env.Stdout, "; skipped %d resource(s) owned by another deployment", report.SkippedForeign)
 	}
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	return nil
 }

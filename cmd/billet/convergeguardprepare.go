@@ -244,13 +244,13 @@ func couldNotTell(why string) *prepareRefusal {
 }
 
 // answer prints a JSON object and returns the exit the outcome carries.
-func answerJSON(v any, code int, msg string) error {
+func answerJSON(env cli.Env, v any, code int, msg string) error {
 	body, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	fmt.Println(string(body))
+	fmt.Fprintln(env.Stdout, string(body))
 
 	if code == 0 {
 		return nil
@@ -259,17 +259,17 @@ func answerJSON(v any, code int, msg string) error {
 	return &cli.ExitError{Code: code, Msg: msg}
 }
 
-func answerRefusal(r *prepareRefusal) error {
+func answerRefusal(env cli.Env, r *prepareRefusal) error {
 	code := exitRefused
 	if r.Outcome == prepareUnknown {
 		code = exitUnknown
 	}
 
-	return answerJSON(r, code, r.Why)
+	return answerJSON(env, r, code, r.Why)
 }
 
-func cmdGuardPrepare(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard prepare", os.Stdout)
+func cmdGuardPrepare(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard prepare", env.Stdout)
 	holder := flags.String("holder", "", "who holds the guard: the converge's run id, or an operator's handle")
 	validate := flags.Bool("validate", false, "the first call: acquire a guard when there is none, or validate this holder's")
 	candidate := flags.String("candidate", "", "the staged candidate this converge intends to install; with --validate, "+
@@ -300,52 +300,52 @@ func cmdGuardPrepare(ctx context.Context, args []string) error {
 		allowDowngrade: *allowDowngrade, token: *token, note: *note}
 
 	if r := checkPrepareCombination(mode); r != nil {
-		return answerRefusal(r)
+		return answerRefusal(env, r)
 	}
 
 	if !mode.dryRun {
 		if err := checkHolder(*holder); err != nil {
-			return answerRefusal(refuse(reasonCombination, "", err.Error(), ""))
+			return answerRefusal(env, refuse(reasonCombination, "", err.Error(), ""))
 		}
 	} else if *holder != "" {
 		if err := checkHolder(*holder); err != nil {
-			return answerRefusal(refuse(reasonCombination, "", err.Error(), ""))
+			return answerRefusal(env, refuse(reasonCombination, "", err.Error(), ""))
 		}
 	}
 
 	if mode.expectID != "" && !guardHex32.MatchString(mode.expectID) {
-		return answerRefusal(refuse(reasonCombination, "", "--expect-id is not a 32-hex id", ""))
+		return answerRefusal(env, refuse(reasonCombination, "", "--expect-id is not a 32-hex id", ""))
 	}
 
 	if mode.token != "" && !guardHex32.MatchString(mode.token) {
-		return answerRefusal(refuse(reasonCombination, "", "--token is not a 32-hex token", ""))
+		return answerRefusal(env, refuse(reasonCombination, "", "--token is not a 32-hex token", ""))
 	}
 
 	if err := checkNote(mode.note); err != nil {
-		return answerRefusal(refuse(reasonCombination, "", err.Error(), ""))
+		return answerRefusal(env, refuse(reasonCombination, "", err.Error(), ""))
 	}
 
 	if mode.dryRun {
-		return prepareDryRun(ctx)
+		return prepareDryRun(ctx, env)
 	}
 
 	root, err := prepareUpgradeRoot()
 	if err != nil {
 		if errors.Is(err, errTrustBoundary) {
-			return answerRefusal(refuse(reasonTrust, "", err.Error(), ""))
+			return answerRefusal(env, refuse(reasonTrust, "", err.Error(), ""))
 		}
 
-		return answerRefusal(couldNotTell(err.Error()))
+		return answerRefusal(env, couldNotTell(err.Error()))
 	}
 
 	defer root.close()
 
 	answer, refusal := prepareUnderLock(ctx, root, *holder, mode)
 	if refusal != nil {
-		return answerRefusal(refusal)
+		return answerRefusal(env, refusal)
 	}
 
-	return answerJSON(answer, 0, "")
+	return answerJSON(env, answer, 0, "")
 }
 
 // checkPrepareCombination is the flag table, judged before anything is read.
@@ -1175,8 +1175,8 @@ func refuseShapeJSON(shape claimShape) *prepareRefusal {
 }
 
 // cmdGuardSettle closes the acquirer's preparation window.
-func cmdGuardSettle(args []string) error {
-	flags := cli.NewFlagSet("billet converge-guard settle", os.Stdout)
+func cmdGuardSettle(env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet converge-guard settle", env.Stdout)
 	holder := flags.String("holder", "", "the holder whose guard is settled")
 	token := flags.String("token", "", "the acquiring invocation's token")
 	asJSON := flags.Bool("json", false, "print the answer as JSON")
@@ -1254,10 +1254,10 @@ func cmdGuardSettle(args []string) error {
 	}
 
 	if *asJSON {
-		return answerJSON(map[string]any{"outcome": "settled", "id": record.ID, "holder": record.Holder}, 0, "")
+		return answerJSON(env, map[string]any{"outcome": "settled", "id": record.ID, "holder": record.Holder}, 0, "")
 	}
 
-	fmt.Printf("settled: %s\n", record.ID)
+	fmt.Fprintf(env.Stdout, "settled: %s\n", record.ID)
 
 	return nil
 }
@@ -1306,17 +1306,17 @@ func cleanupRelease(root *txLock, dir *os.File, shape claimShape, holder, token 
 }
 
 // prepareDryRun reports every shape, lock-free, writing nothing.
-func prepareDryRun(ctx context.Context) error {
+func prepareDryRun(ctx context.Context, env cli.Env) error {
 	shape, err := classifyClaim()
 	if err != nil {
-		return answerRefusal(couldNotTell(err.Error()))
+		return answerRefusal(env, couldNotTell(err.Error()))
 	}
 
 	report := prepareReport{Outcome: prepareReported, Shape: string(shape.Kind), Why: shape.Why,
 		Managed: describeManaged(ctx)}
 
 	if shape.Kind != claimGuard {
-		return answerJSON(report, 0, "")
+		return answerJSON(env, report, 0, "")
 	}
 
 	g := &prepareDryGuard{
@@ -1377,7 +1377,7 @@ func prepareDryRun(ctx context.Context) error {
 
 	report.Guard = g
 
-	return answerJSON(report, 0, "")
+	return answerJSON(env, report, 0, "")
 }
 
 // judgeAnswerEnvelope reads one answer of the guard's protocol as far as its

@@ -37,8 +37,8 @@ type uninstallOptions struct {
 // and services and preserves operator data by default; this names every path
 // it left, so an operator who does want it gone can act on a list rather than
 // on a memory.
-func cmdLocalUninstall(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local uninstall", os.Stdout)
+func cmdLocalUninstall(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local uninstall", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this host is being uninstalled, recorded on the seal for whoever finds it sealed")
@@ -59,13 +59,13 @@ func cmdLocalUninstall(ctx context.Context, args []string) error {
 			"wait for as long as the jobs take", *timeout)
 	}
 
-	return runLocalUninstall(ctx, uninstallOptions{
+	return runLocalUninstall(ctx, env, uninstallOptions{
 		configPath: *cfgPath, reason: *reason, timeout: *timeout,
 		dryRun: *dryRun, force: *force,
 	})
 }
 
-func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
+func runLocalUninstall(ctx context.Context, env cli.Env, o uninstallOptions) error {
 	if hostOS != "darwin" {
 		return fmt.Errorf("billet local uninstall removes the launch agents billet installs on "+
 			"macOS, and this host is %s. On Linux the services come from the package: remove it "+
@@ -78,9 +78,9 @@ func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
 	}
 
 	if o.dryRun {
-		printUninstallPlan(cfg, o)
+		printUninstallPlan(env, cfg, o)
 
-		fmt.Println("\nNothing was changed (--dry-run).")
+		fmt.Fprintln(env.Stdout, "\nNothing was changed (--dry-run).")
 
 		return nil
 	}
@@ -97,7 +97,7 @@ func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
@@ -106,10 +106,10 @@ func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
 	// process holding guests with nothing on the machine that describes it, and
 	// stopping the server before the node has settled tears down leases whose
 	// compute is still running.
-	fmt.Println("Taking this host down before removing anything.")
-	fmt.Println()
+	fmt.Fprintln(env.Stdout, "Taking this host down before removing anything.")
+	fmt.Fprintln(env.Stdout)
 
-	if err := runLocalDown(ctx, downOptions{
+	if err := runLocalDown(ctx, env, downOptions{
 		configPath: o.configPath, reason: o.reason, timeout: o.timeout, force: o.force,
 		locked: true,
 	}); err != nil {
@@ -117,13 +117,13 @@ func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
 			"first: %w", err)
 	}
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
-	return removeAgents(ctx, cfg, o)
+	return removeAgents(ctx, env, cfg, o)
 }
 
 // removeAgents takes away the launch agents and leaves everything else.
-func removeAgents(ctx context.Context, cfg *config.Config, o uninstallOptions) error {
+func removeAgents(ctx context.Context, env cli.Env, cfg *config.Config, o uninstallOptions) error {
 	c := launchd.New()
 	server, node := c.Services()
 	upgrade, images := c.Scheduled()
@@ -152,10 +152,10 @@ func removeAgents(ctx context.Context, cfg *config.Config, o uninstallOptions) e
 			return fmt.Errorf("this host is down and PARTLY uninstalled: %w", err)
 		}
 
-		fmt.Printf("remove   %s is gone, and its disabled override with it\n", s.label)
+		fmt.Fprintf(env.Stdout, "remove   %s is gone, and its disabled override with it\n", s.label)
 	}
 
-	printPreserved(cfg, o.configPath)
+	printPreserved(env, cfg, o.configPath)
 
 	return nil
 }
@@ -167,23 +167,23 @@ func removeAgents(ctx context.Context, cfg *config.Config, o uninstallOptions) e
 // the deployment gone can delete it deliberately, and somebody who does not can
 // see that the irreplaceable parts are still there. The App key is the sharpest
 // of them — GitHub issues it exactly once and will not reissue it.
-func printPreserved(cfg *config.Config, cfgPath string) {
-	fmt.Println()
-	fmt.Println("Left alone, because this is what makes it THIS deployment rather than a new one:")
-	fmt.Printf("         config    %s\n", cfgPath)
+func printPreserved(env cli.Env, cfg *config.Config, cfgPath string) {
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintln(env.Stdout, "Left alone, because this is what makes it THIS deployment rather than a new one:")
+	fmt.Fprintf(env.Stdout, "         config    %s\n", cfgPath)
 
 	for _, keyPath := range appKeyFilePaths(cfg) {
-		fmt.Printf("         app key   %s  (GitHub issues this ONCE and will not reissue it)\n",
+		fmt.Fprintf(env.Stdout, "         app key   %s  (GitHub issues this ONCE and will not reissue it)\n",
 			keyPath)
 	}
 
 	if cfg.Server != nil && cfg.Server.IdentityDir != "" {
-		fmt.Printf("         ledger    %s  (also the deployment identity and the node-wire CA)\n",
+		fmt.Fprintf(env.Stdout, "         ledger    %s  (also the deployment identity and the node-wire CA)\n",
 			cfg.Server.IdentityDir)
 	}
 
 	if cfg.Node != nil && cfg.Node.StateDir != "" {
-		fmt.Printf("         node      %s\n", cfg.Node.StateDir)
+		fmt.Fprintf(env.Stdout, "         node      %s\n", cfg.Node.StateDir)
 	}
 
 	// THE BINARY NEEDS ROOT, WHICH THIS COMMAND HAS REFUSED. A launch agent
@@ -191,24 +191,24 @@ func printPreserved(cfg *config.Config, cfgPath string) {
 	// cannot remove something from /usr/local/bin. Naming the command is honest;
 	// asking for a password to finish a job that is already done is not.
 	if self, err := os.Executable(); err == nil {
-		fmt.Println()
-		fmt.Printf("The binary is still installed. It needs root, which this command does not "+
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "The binary is still installed. It needs root, which this command does not "+
 			"take:\n\n  sudo rm %s\n", self)
 	}
 }
 
 // printUninstallPlan reports what would happen.
-func printUninstallPlan(cfg *config.Config, o uninstallOptions) {
-	fmt.Printf("plan     what `billet local uninstall` would do on this host:\n")
-	fmt.Printf("         1. take it down (seal admission, wait for running work, stop node then " +
+func printUninstallPlan(env cli.Env, cfg *config.Config, o uninstallOptions) {
+	fmt.Fprintf(env.Stdout, "plan     what `billet local uninstall` would do on this host:\n")
+	fmt.Fprintf(env.Stdout, "         1. take it down (seal admission, wait for running work, stop node then "+
 		"server)\n")
 
 	if o.timeout > 0 {
-		fmt.Printf("            giving up on the wait after %s\n", o.timeout)
+		fmt.Fprintf(env.Stdout, "            giving up on the wait after %s\n", o.timeout)
 	}
 
-	fmt.Printf("         2. remove each launch agent, and clear its disabled override\n")
-	fmt.Printf("         3. leave the config, App key, ledger, identity and CA where they are\n")
+	fmt.Fprintf(env.Stdout, "         2. remove each launch agent, and clear its disabled override\n")
+	fmt.Fprintf(env.Stdout, "         3. leave the config, App key, ledger, identity and CA where they are\n")
 
-	printPreserved(cfg, o.configPath)
+	printPreserved(env, cfg, o.configPath)
 }

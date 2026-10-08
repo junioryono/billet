@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/gocacheprog"
 )
 
@@ -26,11 +28,11 @@ const (
 
 // cmdCacheGoCacheProg is the GOCACHEPROG a guest image names: it speaks the go
 // command's protocol on stdin and stdout until the go command closes it.
-func cmdCacheGoCacheProg(ctx context.Context, args []string) error {
+func cmdCacheGoCacheProg(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) != 0 {
 		return errors.New("usage: billet cache gocacheprog (run by the go command as GOCACHEPROG)")
 	}
-	dir := os.Getenv(envGoCacheDir)
+	dir := env.Getenv(envGoCacheDir)
 	if dir == "" {
 		base, err := os.UserCacheDir()
 		if err != nil {
@@ -41,10 +43,10 @@ func cmdCacheGoCacheProg(ctx context.Context, args []string) error {
 
 	return gocacheprog.Run(ctx, gocacheprog.Config{
 		Dir:      dir,
-		Endpoint: os.Getenv(envCacheEndpoint),
-		Token:    os.Getenv(envCacheToken),
-		Log:      os.Stderr,
-	}, os.Stdin, os.Stdout)
+		Endpoint: env.Getenv(envCacheEndpoint),
+		Token:    env.Getenv(envCacheToken),
+		Log:      env.Stderr,
+	}, env.Stdin, env.Stdout)
 }
 
 // credentialRequest and credentialResponse are Bazel's credential helper
@@ -60,23 +62,23 @@ type credentialResponse struct {
 // cmdCacheCredentialHelper is the credential helper the guest's bazelrc names
 // for the node, so the bearer lives in the runner's environment and never in
 // a file a job can read after the fact or a build can log.
-func cmdCacheCredentialHelper(_ context.Context, args []string) error {
+func cmdCacheCredentialHelper(_ context.Context, env cli.Env, args []string) error {
 	if len(args) != 1 || args[0] != "get" {
 		return errors.New("usage: billet cache credential-helper get (run by bazel)")
 	}
-	answer, err := cacheCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken))
+	answer, err := cacheCredential(env.Stdin, env.Getenv(envCacheEndpoint), env.Getenv(envCacheToken))
 	if err != nil {
 		return err
 	}
 
-	return json.NewEncoder(os.Stdout).Encode(answer)
+	return json.NewEncoder(env.Stdout).Encode(answer)
 }
 
 // cmdCacheGitCredential is the git credential helper the guest's gitconfig
 // names for the node, which a github.com fetch reaches through url.insteadOf.
 // The rewrite drops the header actions/checkout scopes to github.com, so this
 // hands it to the node as the password, beside the session bearer.
-func cmdCacheGitCredential(ctx context.Context, args []string) error {
+func cmdCacheGitCredential(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: billet cache git-credential get (run by git)")
 	}
@@ -87,11 +89,11 @@ func cmdCacheGitCredential(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	answer, err := gitCredential(os.Stdin, os.Getenv(envCacheEndpoint), os.Getenv(envCacheToken), headers)
+	answer, err := gitCredential(env.Stdin, env.Getenv(envCacheEndpoint), env.Getenv(envCacheToken), headers)
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.WriteString(answer)
+	_, err = io.WriteString(env.Stdout, answer)
 
 	return err
 }

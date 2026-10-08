@@ -13,12 +13,29 @@ import (
 func TestNotifyReadyIsOptional(t *testing.T) {
 	t.Setenv("NOTIFY_SOCKET", "")
 
-	if err := notifyReady(); err != nil {
+	if err := notifyReady(processEnv()); err != nil {
 		t.Fatalf("notify without systemd: %v", err)
 	}
 }
 
 func TestNotifyReadySignalsSystemdSocket(t *testing.T) {
+	path, listener := notifySocket(t)
+	t.Setenv("NOTIFY_SOCKET", path)
+
+	if err := notifyReady(processEnv()); err != nil {
+		t.Fatalf("notify readiness: %v", err)
+	}
+
+	if got, want := readNotification(t, listener), "READY=1"; got != want {
+		t.Fatalf("readiness message = %q, want %q", got, want)
+	}
+}
+
+// notifySocket is a datagram socket standing in for systemd's, at a path short
+// enough for a Unix address.
+func notifySocket(t *testing.T) (string, *net.UnixConn) {
+	t.Helper()
+
 	dir := t.TempDir()
 	digest := sha256.Sum256([]byte(dir))
 	shortDir := "/tmp/bn-" + hex.EncodeToString(digest[:6])
@@ -32,11 +49,14 @@ func TestNotifyReadySignalsSystemdSocket(t *testing.T) {
 		t.Fatalf("listen for readiness: %v", err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	t.Setenv("NOTIFY_SOCKET", path)
 
-	if err := notifyReady(); err != nil {
-		t.Fatalf("notify readiness: %v", err)
-	}
+	return path, listener
+}
+
+// readNotification is the one message the socket received.
+func readNotification(t *testing.T, listener *net.UnixConn) string {
+	t.Helper()
+
 	if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatalf("set readiness deadline: %v", err)
 	}
@@ -46,7 +66,6 @@ func TestNotifyReadySignalsSystemdSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read readiness: %v", err)
 	}
-	if got, want := string(message[:n]), "READY=1"; got != want {
-		t.Fatalf("readiness message = %q, want %q", got, want)
-	}
+
+	return string(message[:n])
 }

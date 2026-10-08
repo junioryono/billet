@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
 	"github.com/junioryono/billet/internal/store/ceph"
@@ -92,15 +93,15 @@ func stageRefresh(t *testing.T, store fakeRefreshStore, builtAt time.Time) *refr
 	})
 
 	openRefreshStore = func(*config.Config) (refreshStore, error) { return store, nil }
-	fetchImageManifest = func(context.Context, *config.Config) (*imagesource.Manifest, error) {
+	fetchImageManifest = func(context.Context, cli.Env, *config.Config) (*imagesource.Manifest, error) {
 		return &imagesource.Manifest{BuiltAt: builtAt}, nil
 	}
-	refreshPull = func(_ context.Context, _, image string) error {
+	refreshPull = func(_ context.Context, _ cli.Env, _, image string) error {
 		run.pulled = append(run.pulled, image)
 
 		return run.pullErr
 	}
-	refreshReap = func(_ context.Context, _, image string, keep int) error {
+	refreshReap = func(_ context.Context, _ cli.Env, _, image string, keep int) error {
 		run.reaped = append(run.reaped, image)
 
 		if keep != 3 {
@@ -125,7 +126,7 @@ var (
 func TestARefreshPullsWhenTheChannelIsNewerThanWhatIsImported(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", firecrackerRefreshConfig(t, "")})
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
@@ -144,7 +145,7 @@ func TestARefreshPullsWhenTheChannelIsNewerThanWhatIsImported(t *testing.T) {
 func TestARefreshDoesNothingWhenTheImportedGenerationIsNewer(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: newer, found: true}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", firecrackerRefreshConfig(t, "")})
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestARefreshDoesNothingWhenTheImportedGenerationIsNewer(t *testing.T) {
 func TestARefreshPullsWhenNothingIsImported(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", firecrackerRefreshConfig(t, "")})
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestAFailedPullIsReportedAndReapsNothing(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
 	run.pullErr = errors.New("the channel expired")
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, "")})
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", firecrackerRefreshConfig(t, "")})
 	if err == nil || !strings.Contains(err.Error(), "the channel expired") {
 		t.Fatalf("a failed pull was not reported: %v", err)
 	}
@@ -192,7 +193,7 @@ func TestAFailedPullIsReportedAndReapsNothing(t *testing.T) {
 func TestARefreshDoesNothingWhenAutomaticUpdatesAreOff(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config",
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config",
 		firecrackerRefreshConfig(t, "release:\n  automatic: false\n")})
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
@@ -207,7 +208,7 @@ func TestARefreshDoesNothingWhenAutomaticUpdatesAreOff(t *testing.T) {
 func TestARefreshDryRunPullsNothing(t *testing.T) {
 	run := stageRefresh(t, fakeRefreshStore{newest: older, found: true}, channelBuilt)
 
-	err := cmdImagesRefresh(t.Context(), []string{"--config", firecrackerRefreshConfig(t, ""),
+	err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", firecrackerRefreshConfig(t, ""),
 		"--dry-run"})
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
@@ -232,7 +233,7 @@ func TestARefreshOnAHostWithNoNodeHasNothingToDo(t *testing.T) {
 		t.Fatalf("write config: %v", err)
 	}
 
-	if err := cmdImagesRefresh(t.Context(), []string{"--config", path}); err != nil {
+	if err := cmdImagesRefresh(t.Context(), processEnv(), []string{"--config", path}); err != nil {
 		t.Fatalf("a control-plane-only host was refused: %v", err)
 	}
 }

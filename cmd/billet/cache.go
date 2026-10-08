@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -12,28 +11,28 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
-func cmdCache(ctx context.Context, args []string) error {
+func cmdCache(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) > 0 && args[0] == "conformance" {
-		return cmdCacheConformance(ctx, args[1:])
+		return cmdCacheConformance(ctx, env, args[1:])
 	}
 
 	if len(args) > 0 && args[0] == "status" {
-		return cmdCacheStatus(ctx, args[1:])
+		return cmdCacheStatus(ctx, env, args[1:])
 	}
 
 	if len(args) > 0 && args[0] == "orphans" {
-		return cmdCacheOrphans(ctx, args[1:])
+		return cmdCacheOrphans(ctx, env, args[1:])
 	}
 
 	// Run inside a guest by the go command, bazel and git, never by a person.
 	if len(args) > 0 && args[0] == "gocacheprog" {
-		return cmdCacheGoCacheProg(ctx, args[1:])
+		return cmdCacheGoCacheProg(ctx, env, args[1:])
 	}
 	if len(args) > 0 && args[0] == "credential-helper" {
-		return cmdCacheCredentialHelper(ctx, args[1:])
+		return cmdCacheCredentialHelper(ctx, env, args[1:])
 	}
 	if len(args) > 0 && args[0] == "git-credential" {
-		return cmdCacheGitCredential(ctx, args[1:])
+		return cmdCacheGitCredential(ctx, env, args[1:])
 	}
 
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
@@ -44,7 +43,7 @@ func cmdCache(ctx context.Context, args []string) error {
 	if action == "enable" {
 		name = "billet cache enable"
 	}
-	fs := cli.NewFlagSet(name, os.Stdout)
+	fs := cli.NewFlagSet(name, env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	organisation := fs.String("org", "", "GitHub organisation whose repositories this policy covers")
 	repository := fs.String("repository", "", "GitHub owner/repository this policy covers")
@@ -81,9 +80,9 @@ func cmdCache(ctx context.Context, args []string) error {
 	if enabled {
 		status = "enabled"
 	}
-	fmt.Printf("%s %s for %s\n", what, status, label)
+	fmt.Fprintf(env.Stdout, "%s %s for %s\n", what, status, label)
 	if enabled && kind != state.AllCaches {
-		fmt.Printf("(a block for every cache on the same scope, if there is one, still stands; " +
+		fmt.Fprintf(env.Stdout, "(a block for every cache on the same scope, if there is one, still stands; "+
 			"remove it with --kind all)\n")
 	}
 

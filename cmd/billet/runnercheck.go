@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -40,12 +39,12 @@ import (
 // THE EXIT CODE IS THE POINT. A cron entry or a monitor reads it: 0 while there is
 // nothing to do, 2 once a rebuild is due, and 3 once GitHub is already refusing.
 // They are distinct because the second is a task and the third is an outage.
-func cmdRunner(ctx context.Context, args []string) error {
+func cmdRunner(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 || args[0] != "check" {
 		return errors.New("usage: billet runner check")
 	}
 
-	fs := cli.NewFlagSet("billet runner check", os.Stdout)
+	fs := cli.NewFlagSet("billet runner check", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	quiet := fs.Bool("quiet", false, "print nothing unless something needs doing")
 
@@ -76,7 +75,7 @@ func cmdRunner(ctx context.Context, args []string) error {
 		// and on stderr, because it is not a verdict. Swallowing it is how a broken
 		// lookup came to look exactly like an image with no metadata recorded — which
 		// is what happened when this asked rbd for json output it does not accept.
-		fmt.Fprintf(os.Stderr, "note: could not read what the published image carries, so this "+
+		fmt.Fprintf(env.Stderr, "note: could not read what the published image carries, so this "+
 			"is about the version billet would build: %v\n", why)
 	}
 
@@ -123,24 +122,24 @@ func cmdRunner(ctx context.Context, args []string) error {
 	// exists to remove.
 	switch {
 	case fresh.Expired(now):
-		fmt.Printf("runner  %s (%s), and GitHub stopped queueing jobs to it on %s\n",
+		fmt.Fprintf(env.Stdout, "runner  %s (%s), and GitHub stopped queueing jobs to it on %s\n",
 			installed, source, fresh.Deadline().Format(time.DateOnly))
-		fmt.Println(started())
+		fmt.Fprintln(env.Stdout, started())
 
 		if !fresh.InstalledKnown {
 			// THE DEADLINE IS AN UPPER BOUND HERE, so "already past it" is still a
 			// proof — the real one was earlier — and saying so keeps the report from
 			// claiming a precision it does not have.
-			fmt.Printf("        %s is older than the history billet reads, so that date is "+
+			fmt.Fprintf(env.Stdout, "        %s is older than the history billet reads, so that date is "+
 				"the latest it could have been\n", installed)
 		}
 
-		fmt.Println()
-		fmt.Println("Rebuild and republish the image, then point the tiers at the new generation:")
-		fmt.Println()
-		fmt.Printf("  1. put %s in internal/runnerrelease/pinned.txt\n", fresh.Latest)
-		fmt.Println("  2. sudo scripts/build-guest-image.sh   (microVM guests)")
-		fmt.Println("  3. billet ami build                    (ec2 nodes)")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintln(env.Stdout, "Rebuild and republish the image, then point the tiers at the new generation:")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "  1. put %s in internal/runnerrelease/pinned.txt\n", fresh.Latest)
+		fmt.Fprintln(env.Stdout, "  2. sudo scripts/build-guest-image.sh   (microVM guests)")
+		fmt.Fprintln(env.Stdout, "  3. billet ami build                    (ec2 nodes)")
 
 		return errExpiredRunner
 
@@ -151,12 +150,12 @@ func cmdRunner(ctx context.Context, args []string) error {
 	// 0. It is a rebuild to schedule rather than an outage, so it takes the same exit
 	// code as an ordinary due.
 	case fresh.BehindWithoutAWindow():
-		fmt.Printf("runner  %s (%s), and %s is newer\n", installed, source, fresh.Latest)
-		fmt.Printf("        %s was published before %s, so it was already available when "+
+		fmt.Fprintf(env.Stdout, "runner  %s (%s), and %s is newer\n", installed, source, fresh.Latest)
+		fmt.Fprintf(env.Stdout, "        %s was published before %s, so it was already available when "+
 			"this runner shipped and github's ordinary window has no start to count from\n",
 			fresh.Latest, installed)
-		fmt.Println()
-		fmt.Printf("Rebuild: put %s in internal/runnerrelease/pinned.txt, then rebuild the "+
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "Rebuild: put %s in internal/runnerrelease/pinned.txt, then rebuild the "+
 			"images.\n", fresh.Latest)
 
 		return errRunnerDue
@@ -195,25 +194,25 @@ func cmdRunner(ctx context.Context, args []string) error {
 
 	case fresh.Current():
 		if !*quiet {
-			fmt.Printf("runner  %s, which is the current release (%s)\n", installed, source)
+			fmt.Fprintf(env.Stdout, "runner  %s, which is the current release (%s)\n", installed, source)
 		}
 
 		return nil
 
 	case fresh.Due(now):
-		fmt.Printf("runner  %s (%s), and GitHub stops queueing jobs to it on %s (%d days)\n",
+		fmt.Fprintf(env.Stdout, "runner  %s (%s), and GitHub stops queueing jobs to it on %s (%d days)\n",
 			installed, source, fresh.Deadline().Format(time.DateOnly),
 			int(fresh.Remaining(now).Hours()/24))
-		fmt.Println(started())
-		fmt.Println()
-		fmt.Printf("Rebuild while there is time: put %s in internal/runnerrelease/pinned.txt, "+
+		fmt.Fprintln(env.Stdout, started())
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "Rebuild while there is time: put %s in internal/runnerrelease/pinned.txt, "+
 			"then rebuild the images.\n", fresh.Latest)
 
 		return errRunnerDue
 
 	default:
 		if !*quiet {
-			fmt.Printf("runner  %s; %s was published %s, and there are %d days to take it up\n",
+			fmt.Fprintf(env.Stdout, "runner  %s; %s was published %s, and there are %d days to take it up\n",
 				installed, fresh.FirstNewer, fresh.FirstNewerPublished.Format(time.DateOnly),
 				int(fresh.Remaining(now).Hours()/24))
 		}

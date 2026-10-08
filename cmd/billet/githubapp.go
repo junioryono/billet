@@ -30,19 +30,19 @@ import (
 // credential GitHub issues exactly once.
 var onboard = github.Onboard
 
-func cmdGitHubApp(ctx context.Context, args []string) error {
+func cmdGitHubApp(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet github-app create --org <org>")
 	}
 
 	switch args[0] {
 	case "create":
-		return githubAppCreate(ctx, args[1:])
+		return githubAppCreate(ctx, env, args[1:])
 	case "store-key":
-		return githubAppStoreKey(ctx, args[1:])
+		return githubAppStoreKey(ctx, env, args[1:])
 	case "-h", "--help":
-		fmt.Println("usage: billet github-app create --org <org> [--name <name>] [--key-path <path>]")
-		fmt.Println("       billet github-app store-key --from <path>   " +
+		fmt.Fprintln(env.Stdout, "usage: billet github-app create --org <org> [--name <name>] [--key-path <path>]")
+		fmt.Fprintln(env.Stdout, "       billet github-app store-key --from <path>   "+
 			"(publish an existing key to a store-backed deployment)")
 		return nil
 	default:
@@ -68,8 +68,8 @@ func cmdGitHubApp(ctx context.Context, args []string) error {
 // its private key is spent: planConfigEdit proves the file can take the block
 // and reserveKeyFile proves the key has somewhere to go, and only then does
 // anything reach GitHub.
-func githubAppCreate(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet github-app create", os.Stdout)
+func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet github-app create", env.Stdout)
 	org := fs.String("org", "", "GitHub organization to create the App for (exactly one of --org and --repository)")
 	repository := fs.String("repository", "", "GitHub repository, as owner/name, to create the App for")
 	targetName := fs.String("target", config.DefaultTargetName,
@@ -145,7 +145,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	// probe to check the config's owner and removes it again, refusing if it
 	// cannot — so stopping here is free, which is the opposite of the write
 	// below, where the App already exists and a failure must not be fatal.
-	if err := sayConfigEdit(os.Stdout, plan); err != nil {
+	if err := sayConfigEdit(env.Stdout, plan); err != nil {
 		return err
 	}
 
@@ -187,7 +187,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	target := identity.target()
 
-	fmt.Printf("billet requests exactly these permissions for a %s:\n", target.Scope())
+	fmt.Fprintf(env.Stdout, "billet requests exactly these permissions for a %s:\n", target.Scope())
 
 	perms := github.Permissions(target.Scope(), *actionsRead)
 
@@ -199,22 +199,22 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	sort.Strings(names)
 
 	for _, name := range names {
-		fmt.Printf("  %-32s %s\n", name, perms[name])
+		fmt.Fprintf(env.Stdout, "  %-32s %s\n", name, perms[name])
 	}
 
-	fmt.Printf("\nNo repository Contents permission — billet cannot read your code.\n")
+	fmt.Fprintf(env.Stdout, "\nNo repository Contents permission — billet cannot read your code.\n")
 
 	if target.Scope() == github.ScopeRepository {
 		// THE WIDER GRANT IS SAID OUT LOUD. It is the only permission GitHub
 		// offers for registering a repository's runners, and it also covers the
 		// repository's settings, collaborators and branch protection; billet uses
 		// it for the registration endpoints and nothing else (ADR-011).
-		fmt.Printf("Repository administration is the ONLY permission GitHub offers for registering\n" +
-			"a repository's runners. billet uses it for that and nothing else: never the\n" +
+		fmt.Fprintf(env.Stdout, "Repository administration is the ONLY permission GitHub offers for registering\n"+
+			"a repository's runners. billet uses it for that and nothing else: never the\n"+
 			"repository's settings, collaborators or branch protection.\n")
 	}
 
-	fmt.Printf("GitHub allows one hour to finish; if it lapses, just run this again.\n\n")
+	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")
 
 	result, err := onboard(ctx, github.OnboardOptions{
 		Target:      target,
@@ -222,7 +222,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		Name:        *name,
 		Port:        *port,
 		OpenBrowser: open,
-		Log:         func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+		Log:         func(format string, a ...any) { fmt.Fprintf(env.Stdout, format+"\n", a...) },
 		// Called the instant the credentials exist, before installation. See the
 		// OnAppCreated doc comment: this ordering is what stops a failed install
 		// from orphaning a real app whose key GitHub will never re-issue.
@@ -230,10 +230,10 @@ func githubAppCreate(ctx context.Context, args []string) error {
 			// keyWritten is set from inside, the moment the key reaches its
 			// final path — not after this returns. A durability error AFTER a
 			// successful rename must not report the write as having failed.
-			err := writeKeyAtomically(keyFile, *keyPath, []byte(app.PEM), func() {
+			err := writeKeyAtomically(env, keyFile, *keyPath, []byte(app.PEM), func() {
 				keyWritten = true
 
-				fmt.Printf("Saved the private key to %s\n", *keyPath)
+				fmt.Fprintf(env.Stdout, "Saved the private key to %s\n", *keyPath)
 			})
 			if err != nil {
 				return err
@@ -246,7 +246,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		if keyWritten {
 			// The app exists and its key is on disk, so this is recoverable rather
 			// than a dead end — say so, and say how.
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(env.Stderr,
 				"\nThe App was created and its key saved to %s.\n"+
 					"Fix the problem above, then finish by installing it on %s and running `billet check`.\n",
 				*keyPath, target)
@@ -255,8 +255,8 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\nDone.\n\n")
-	fmt.Printf("  private key      %s\n", *keyPath)
+	fmt.Fprintf(env.Stdout, "\nDone.\n\n")
+	fmt.Fprintf(env.Stdout, "  private key      %s\n", *keyPath)
 
 	block := githubBlock{
 		Target:         *targetName,
@@ -285,11 +285,11 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	// writing through the link would replace the link itself with a regular file
 	// while leaving the file it pointed at untouched.
 	if plan.path != "" {
-		if err := writeGitHubBlock(plan.path, block); err != nil {
+		if err := writeGitHubBlock(env, plan.path, block); err != nil {
 			// NOT FATAL, because the App exists by now and the credential it
 			// issued cannot be re-created. Printing the block is the fallback that
 			// keeps this run recoverable.
-			fmt.Fprintf(os.Stderr, "\ncould not update %s: %v\n", plan.path, err)
+			fmt.Fprintf(env.Stderr, "\ncould not update %s: %v\n", plan.path, err)
 
 			// ON STDERR, WITH THE DIAGNOSTIC, AND ON STDOUT IF THAT FAILS. This
 			// is the ONLY record of an App that now exists, and the run that
@@ -310,12 +310,12 @@ func githubAppCreate(ctx context.Context, args []string) error {
 			// Stderr first, beside the diagnostic; then stdout, because a run
 			// whose config write failed may well be one whose stderr is the
 			// reason.
-			reportIdentity(block, os.Stderr, os.Stdout)
+			reportIdentity(block, env.Stderr, env.Stdout)
 
 			return nil
 		}
 
-		fmt.Printf("  config           %s (updated)\n", plan.path)
+		fmt.Fprintf(env.Stdout, "  config           %s (updated)\n", plan.path)
 
 		// AND INTO THE IDENTITY STORE, AFTER THE CONFIG AND NOT BEFORE IT.
 		//
@@ -330,24 +330,24 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		// `billet github-app store-key` can publish, where a publication straight
 		// from memory would have exactly one failure mode with no way back.
 		if storeBacked {
-			storeAppKeyDuringOnboarding(ctx, plan.path, *targetName, *keyPath, []byte(result.App.PEM))
+			storeAppKeyDuringOnboarding(ctx, env, plan.path, *targetName, *keyPath, []byte(result.App.PEM))
 		}
 
-		fmt.Printf("\nThen run: billet check --config %s\n", plan.path)
+		fmt.Fprintf(env.Stdout, "\nThen run: billet check --config %s\n", plan.path)
 
 		return nil
 	}
 
-	fmt.Printf("\nAdd this to your billet.yaml:\n\n")
+	fmt.Fprintf(env.Stdout, "\nAdd this to your billet.yaml:\n\n")
 
 	// Stdout here: this is the ordinary output of a run that was asked to print
 	// the block rather than write it, and it is meant to be piped or copied. On
 	// failure it falls to stderr and the run still exits 0, for the reason the
 	// config path gives: the App exists, and a non-zero exit is an instruction
 	// to re-run that mints a second one.
-	reportIdentity(block, os.Stdout, os.Stderr)
+	reportIdentity(block, env.Stdout, env.Stderr)
 
-	fmt.Printf("\nOr re-run with --config <path> and billet will write it for you.\n")
+	fmt.Fprintf(env.Stdout, "\nOr re-run with --config <path> and billet will write it for you.\n")
 
 	return nil
 }
@@ -569,7 +569,7 @@ func stagedKeyFoundError(path, staged string) error {
 // onInstalled fires the instant the key is at its final path, BEFORE durability is
 // confirmed. Everything after is best-effort reporting: the credential exists and
 // must never be deleted, whatever else fails.
-func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled func()) error {
+func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte, onInstalled func()) error {
 	dir := filepath.Dir(path)
 	staging := stagingPath(path)
 
@@ -609,12 +609,12 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 				return
 			}
 
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(env.Stderr,
 				"\nWarning: %s is not this run's file, so it was left in place.\n", staging)
 
 			return
 		case identityUnknown:
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(env.Stderr,
 				"\nWarning: the key is installed at %s, but billet could not confirm what %s is, so it "+
 					"was left alone. Check whether it is a second copy of the key.\n", path, staging)
 
@@ -622,7 +622,7 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		}
 
 		if err := os.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(env.Stderr,
 				"\nWarning: the key is installed at %s, but %s is a second copy of it that could not be "+
 					"removed (%v). Delete it once `billet check` passes.\n",
 				path, staging, err)
@@ -635,7 +635,7 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		// otherwise resurrect the staging entry — leaving two durable names for
 		// one private key, with the process that would have warned about it gone.
 		if err := syncDir(dir); err != nil {
-			fmt.Fprintf(os.Stderr,
+			fmt.Fprintf(env.Stderr,
 				"\nWarning: the key is installed at %s and the extra copy at %s was removed, but that "+
 					"removal could not be flushed (%v). Check after a reboot that %s is gone.\n",
 				path, staging, err, staging)
@@ -1777,7 +1777,7 @@ func sayFailed(err error) error {
 // ATOMIC, because this file is the only record of where the state directory and
 // the App key live. A partial write during a crash would leave a config that
 // does not parse and a deployment that cannot start.
-func writeGitHubBlock(path string, b githubBlock) error {
+func writeGitHubBlock(env cli.Env, path string, b githubBlock) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -1889,7 +1889,7 @@ func writeGitHubBlock(path string, b githubBlock) error {
 	// power-loss risk to say out loud, not a reason to tell the caller the write
 	// failed — which would print the block as though nothing had been recorded.
 	if err := syncDir(filepath.Dir(path)); err != nil {
-		fmt.Fprintf(os.Stderr, "\nWarning: %s was updated, but that could not be flushed to "+
+		fmt.Fprintf(env.Stderr, "\nWarning: %s was updated, but that could not be flushed to "+
 			"disk (%v). Confirm it still names the App after a reboot.\n", path, err)
 	}
 

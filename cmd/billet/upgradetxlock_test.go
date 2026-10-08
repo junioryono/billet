@@ -31,7 +31,7 @@ func TestAResumeRefusesWhileAnUpgradeIsRunning(t *testing.T) {
 
 	defer tx.release()
 
-	err = resumeHostUpgrade(t.Context(), &config.Config{})
+	err = resumeHostUpgrade(t.Context(), processEnv(), &config.Config{})
 	if !errors.Is(err, ErrUpgradeInProgress) {
 		t.Fatalf("a resume beside a live upgrade returned %v, want ErrUpgradeInProgress", err)
 	}
@@ -46,7 +46,7 @@ func TestAResumeRefusesWhileAnUpgradeIsRunning(t *testing.T) {
 	// signal; nothing durable is left behind by releasing it.
 	tx.release()
 
-	if err := resumeHostUpgrade(t.Context(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
 		t.Errorf("a resume after the upgrade ended: %v", err)
 	}
 }
@@ -72,7 +72,7 @@ func TestAResumedTransactionRecordsTheDecisionItWasActingOn(t *testing.T) {
 	// real transaction against a machine that has no billet units — so the
 	// assertion would be riding on how a systemctl call fails, which is neither the
 	// property nor a thing this test should be pinned to.
-	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
+	abandoned, err := settleResumedDecision(processEnv(), openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a resumed transaction: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestASupersededTransactionThatTouchedNothingIsAbandoned(t *testing.T) {
 		Step: hostupgrade.StepClaimed,
 	})
 
-	if err := resumeHostUpgrade(t.Context(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
 		t.Fatalf("abandoning a superseded transaction: %v", err)
 	}
 
@@ -151,7 +151,7 @@ func TestASupersededTransactionThatStoppedServicesIsNotAbandoned(t *testing.T) {
 		Step: hostupgrade.StepStopped,
 	})
 
-	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
+	abandoned, err := settleResumedDecision(processEnv(), openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a half-applied transaction: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestASupersededTransactionThatHadStagedIsNotAbandoned(t *testing.T) {
 		Step: hostupgrade.StepStaged,
 	})
 
-	abandoned, err := settleResumedDecision(openRootForTest(t), journal)
+	abandoned, err := settleResumedDecision(processEnv(), openRootForTest(t), journal)
 	if err != nil {
 		t.Fatalf("settling the fence for a staged transaction: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestASecondStartIsRefusedBeforeItResolvesAnything(t *testing.T) {
 
 	// A channel that does not exist. Reaching the network at all would fail with
 	// something about resolving it; being refused for the lock proves the order.
-	err = startHostUpgrade(t.Context(), &config.Config{}, "", hostUpgradeTarget{
+	err = startHostUpgrade(t.Context(), processEnv(), &config.Config{}, "", hostUpgradeTarget{
 		channel: "no-such-channel-should-never-be-fetched",
 	}, ack)
 
@@ -324,7 +324,7 @@ func TestAResumeUsesTheDirectoryItFoundRatherThanTheOneRecorded(t *testing.T) {
 
 	// Superseded and untouched, so this abandons — using the directory the claim
 	// pointed at, which is the only one it has any evidence about.
-	if err := resumeHostUpgrade(t.Context(), &config.Config{}); err != nil {
+	if err := resumeHostUpgrade(t.Context(), processEnv(), &config.Config{}); err != nil {
 		t.Fatalf("resuming a journal that names the wrong directory: %v", err)
 	}
 

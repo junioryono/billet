@@ -65,8 +65,8 @@ var (
 	receiptMkdir     = os.Mkdir
 )
 
-func cmdNodeReceipt(ctx context.Context, args []string) error {
-	flags := cli.NewFlagSet("billet node receipt", os.Stdout)
+func cmdNodeReceipt(ctx context.Context, env cli.Env, args []string) error {
+	flags := cli.NewFlagSet("billet node receipt", env.Stdout)
 	evidence := flags.String("evidence", "", "the migration's answer, as a file (evidence mode)")
 	confirmation := flags.String("confirmation", "", "the controller's `rollout registration` answer, as a file (evidence mode)")
 	configPath := flags.String("config", "", "the installed configuration (required in both modes)")
@@ -89,11 +89,11 @@ func cmdNodeReceipt(ctx context.Context, args []string) error {
 		run: *run, refresh: *refresh, dryRun: *dryRun, wait: *wait}
 
 	if r := checkReceiptCombination(m); r != nil {
-		return answerEndpointRefusal(r)
+		return answerEndpointRefusal(env, r)
 	}
 
 	if hostOS == "darwin" || receiptPath == "" {
-		return answerEndpointRefusal(endpointRefuse(endpointReasonPlatform,
+		return answerEndpointRefusal(env, endpointRefuse(endpointReasonPlatform,
 			"an endpoint receipt needs systemd and the node's runtime record, and this platform has neither", "", ""))
 	}
 
@@ -103,16 +103,16 @@ func cmdNodeReceipt(ctx context.Context, args []string) error {
 	)
 
 	if m.refresh {
-		answer, r = refreshReceipt(ctx, m)
+		answer, r = refreshReceipt(ctx, env, m)
 	} else {
 		answer, r = writeReceiptFromEvidence(ctx, m)
 	}
 
 	if r != nil {
-		return answerEndpointRefusal(r)
+		return answerEndpointRefusal(env, r)
 	}
 
-	return answerObject(answer)
+	return answerObject(env, answer)
 }
 
 func checkReceiptCombination(m receiptMode) *endpointRefusal {
@@ -259,7 +259,7 @@ func writeReceiptFromEvidence(ctx context.Context, m receiptMode) (any, *endpoin
 }
 
 // refreshReceipt is refresh mode.
-func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) {
+func refreshReceipt(ctx context.Context, env cli.Env, m receiptMode) (any, *endpointRefusal) {
 	installed, r := observeInstalledConfig(m.configPath, !m.dryRun)
 	if r != nil {
 		return nil, r
@@ -295,7 +295,7 @@ func refreshReceipt(ctx context.Context, m receiptMode) (any, *endpointRefusal) 
 	)
 
 	if m.desired != "" {
-		_, cfg, r := readRendering(m.desired, !m.dryRun)
+		_, cfg, r := readRendering(env, m.desired, !m.dryRun)
 		if r != nil {
 			return nil, r
 		}

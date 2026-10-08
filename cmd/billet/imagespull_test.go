@@ -193,7 +193,7 @@ func TestGuestReportAcceptsPackagedAndUpstreamBuildxVersions(t *testing.T) {
 			"compose=2.40.3",
 			"container=1",
 		}, "\n")
-		if err := checkGuestReport(body, "probe-secret", 0); err != nil {
+		if err := checkGuestReport(processEnv(), body, "probe-secret", 0); err != nil {
 			t.Errorf("checkGuestReport with %q: %v", buildx, err)
 		}
 	}
@@ -210,7 +210,7 @@ func TestGuestReportRejectsTheContainerdImageStore(t *testing.T) {
 		"container=1",
 	}, "\n")
 
-	err := checkGuestReport(body, "probe-secret", 0)
+	err := checkGuestReport(processEnv(), body, "probe-secret", 0)
 	if err == nil {
 		t.Fatal("an image whose pulled content bypasses /var/lib/docker was accepted")
 	}

@@ -762,19 +762,19 @@ func TestAServiceThatExitsImmediatelyIsCaughtAndOneThatDoesNotIsNot(t *testing.T
 	// A SERVICE THAT STAYS UP IS NOT REPORTED AS GONE. This is the half the
 	// Signal(nil) defect broke, and it is the half that makes the command usable at
 	// all.
-	alive, err := startAcceptanceService(t.Context(), self, "server", "billet.yaml", dir)
+	alive, err := startAcceptanceService(t.Context(), processEnv(), self, "server", "billet.yaml", dir)
 	if err != nil {
 		t.Fatalf("a service that stayed up was reported as having exited: %v", err)
 	}
 
-	t.Cleanup(func() { stopAcceptanceService(alive) })
+	t.Cleanup(func() { stopAcceptanceService(processEnv(), alive) })
 
 	// AND ONE THAT DIES IS. This is the half Signal(0) would have broken: the child
 	// is dead but unreaped when the settle window ends, and a kill(pid, 0) against a
 	// zombie succeeds.
-	dead, err := startAcceptanceService(t.Context(), self, "node", "billet.yaml", dir)
+	dead, err := startAcceptanceService(t.Context(), processEnv(), self, "node", "billet.yaml", dir)
 	if err == nil {
-		stopAcceptanceService(dead)
+		stopAcceptanceService(processEnv(), dead)
 		t.Fatal("a service that exited immediately was reported as started")
 	}
 
@@ -803,7 +803,7 @@ func TestStoppingAServiceIsSafeHoweverManyTimesItHappens(t *testing.T) {
 		t.Fatalf("write the stand-in: %v", err)
 	}
 
-	svc, err := startAcceptanceService(t.Context(), self, "server", "billet.yaml", dir)
+	svc, err := startAcceptanceService(t.Context(), processEnv(), self, "server", "billet.yaml", dir)
 	if err != nil {
 		t.Fatalf("startAcceptanceService: %v", err)
 	}
@@ -811,9 +811,9 @@ func TestStoppingAServiceIsSafeHoweverManyTimesItHappens(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		stopAcceptanceService(svc)
-		stopAcceptanceService(svc)
-		stopAcceptanceService(nil)
+		stopAcceptanceService(processEnv(), svc)
+		stopAcceptanceService(processEnv(), svc)
+		stopAcceptanceService(processEnv(), nil)
 		close(done)
 	}()
 
@@ -1162,7 +1162,7 @@ func TestABackendTheSweepCannotAskIsNotReportedAsClean(t *testing.T) {
 
 	// The fixture is a DOCKER deployment, which is exactly the case: decommission
 	// refuses it, and that refusal is not evidence of anything.
-	err := sweepAcceptance(t.Context(), ws, false)
+	err := sweepAcceptance(t.Context(), processEnv(), ws, false)
 	if err == nil {
 		t.Fatal("a backend the sweep cannot ask was reported as clean")
 	}
@@ -1175,7 +1175,7 @@ func TestABackendTheSweepCannotAskIsNotReportedAsClean(t *testing.T) {
 	// through its own provider, which covers every backend — so a run that got a
 	// clearance while its control plane was up has been swept by something
 	// stronger than the ec2 inventory.
-	if err := sweepAcceptance(t.Context(), ws, true); err != nil {
+	if err := sweepAcceptance(t.Context(), processEnv(), ws, true); err != nil {
 		t.Errorf("a run whose compute barrier proved every host clear was still reported "+
 			"unswept: %v", err)
 	}

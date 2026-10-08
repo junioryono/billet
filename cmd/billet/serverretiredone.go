@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -79,7 +81,7 @@ var retireDoneProperties = []string{"LoadState", "ActiveState", "UnitFileState",
 var retirePostconditionInspector = endpointInspector
 
 // retireDone answers a converge that found a `done` journal on this host.
-func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, shape claimShape,
+func retireDone(ctx context.Context, env cli.Env, m retireMode, root *txLock, dir *os.File, shape claimShape,
 	j retirement.Journal,
 ) (any, *retireRefusal) {
 	// THE IDENTITY IS AT THE ARCHIVE, and it is what says this journal
@@ -139,7 +141,7 @@ func retireDone(ctx context.Context, m retireMode, root *txLock, dir *os.File, s
 		// THE TAIL, FINISHED BY WHOEVER HOLDS THE GUARD NOW. Everything it
 		// needs is in the journal, and the run that recorded the intent may be
 		// long gone.
-		return retireTail(ctx, m, root, dir, j, nil)
+		return retireTail(ctx, env, m, root, dir, j, nil)
 	}
 
 	// THE PUBLISHED STATUS IS THE ONE POSTCONDITION THAT IS NOT A RECORD: it

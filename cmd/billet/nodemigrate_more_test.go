@@ -466,7 +466,7 @@ func TestMigrateInputsContinued(t *testing.T) {
 		t.Helper()
 		f := newEndpointFixture(t)
 
-		err := cmdNodeMigrate(t.Context(), []string{"--config", f.configPath, "--dry-run"})
+		err := cmdNodeMigrate(t.Context(), processEnv(), []string{"--config", f.configPath, "--dry-run"})
 		if err == nil || !strings.Contains(err.Error(), "--json") {
 			t.Errorf("err %v", err)
 		}

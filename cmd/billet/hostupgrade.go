@@ -66,8 +66,8 @@ const activePointer = "active"
 // it continues or unwinds the transaction that is already there — which is what
 // makes an interrupted upgrade a thing that recovers rather than a thing somebody
 // reconstructs by hand.
-func cmdHostUpgrade(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet host-upgrade", os.Stdout)
+func cmdHostUpgrade(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet host-upgrade", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve when no --version is given")
@@ -119,7 +119,7 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 	}
 
 	if *status {
-		reportUpgradeStatus()
+		reportUpgradeStatus(env)
 
 		return nil
 	}
@@ -139,11 +139,11 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 			return err
 		}
 
-		return hostUpgradeFromRollout(ctx, cfg, *cfgPath, *skipVerify)
+		return hostUpgradeFromRollout(ctx, env, cfg, *cfgPath, *skipVerify)
 	}
 
 	if *resume {
-		err := resumeHostUpgrade(ctx, cfg)
+		err := resumeHostUpgrade(ctx, env, cfg)
 		if err != nil {
 			ack.refuse(err)
 		} else {
@@ -153,7 +153,7 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 		return err
 	}
 
-	err = startHostUpgrade(ctx, cfg, *cfgPath, hostUpgradeTarget{
+	err = startHostUpgrade(ctx, env, cfg, *cfgPath, hostUpgradeTarget{
 		channel:        *channel,
 		pin:            *pin,
 		digest:         *digest,
@@ -184,10 +184,10 @@ func cmdHostUpgrade(ctx context.Context, args []string) error {
 // same fences. Nothing here consults
 // the channel; a channel that advanced after the decision changes nothing, which
 // is the rule every other reader of a rollout already keeps.
-func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath string,
+func hostUpgradeFromRollout(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string,
 	skipVerify bool,
 ) error {
-	if !rolloutTimerApplies(cfg) {
+	if !rolloutTimerApplies(env, cfg) {
 		return nil
 	}
 
@@ -200,7 +200,7 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 	tx, err := takeTxLock()
 	if err != nil {
 		if errors.Is(err, ErrUpgradeInProgress) {
-			fmt.Printf("An upgrade transaction holds this host; nothing to decide until it finishes.\n")
+			fmt.Fprintf(env.Stdout, "An upgrade transaction holds this host; nothing to decide until it finishes.\n")
 
 			return nil
 		}
@@ -220,12 +220,12 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 			return err
 		}
 
-		fmt.Printf("%v; nothing to do.\n", err)
+		fmt.Fprintf(env.Stdout, "%v; nothing to do.\n", err)
 
 		return nil
 	}
 
-	target, ok, err := rolloutInstructionHolding(ctx, cfg, tx)
+	target, ok, err := rolloutInstructionHolding(ctx, env, cfg, tx)
 	if err != nil || !ok {
 		return err
 	}
@@ -237,28 +237,28 @@ func hostUpgradeFromRollout(ctx context.Context, cfg *config.Config, cfgPath str
 		return err
 	}
 
-	if _, err := newHostFor(cfg, cfgPath, "", nil); err != nil {
+	if _, err := newHostFor(env, cfg, cfgPath, "", nil); err != nil {
 		return err
 	}
 
 	// NO ACK SOCKET. There is no node waiting for an answer; the timer
 	// reads the exit status and the journal, and `billet host-upgrade --status`
 	// reads the rest.
-	return startHostUpgradeHolding(ctx, cfg, cfgPath, target, newUpgradeAck(""), policy, tx)
+	return startHostUpgradeHolding(ctx, env, cfg, cfgPath, target, newUpgradeAck(""), policy, tx)
 }
 
 // rolloutTimerApplies is the two answers the timer gives from the configuration
 // alone, before any lock: no control plane here, or automatic updates off.
-func rolloutTimerApplies(cfg *config.Config) bool {
+func rolloutTimerApplies(env cli.Env, cfg *config.Config) bool {
 	if cfg.Server == nil {
-		fmt.Printf("This host runs no control plane, so no rollout is recorded here; " +
+		fmt.Fprintf(env.Stdout, "This host runs no control plane, so no rollout is recorded here; "+
 			"nothing to do.\n")
 
 		return false
 	}
 
 	if !cfg.Release.AutomaticUpdates() {
-		fmt.Printf("release.automatic is false on this host, so the recorded rollout is left " +
+		fmt.Fprintf(env.Stdout, "release.automatic is false on this host, so the recorded rollout is left "+
 			"to an operator; nothing to do.\n")
 
 		return false
@@ -294,15 +294,15 @@ var runningRelease = version.Version
 // that follows fences the ledger and waits for every handle opened before the
 // fence to finish; one this same process left open would be one it waited on
 // forever.
-func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTarget, bool, error) {
-	if !rolloutTimerApplies(cfg) {
+func rolloutInstruction(ctx context.Context, env cli.Env, cfg *config.Config) (hostUpgradeTarget, bool, error) {
+	if !rolloutTimerApplies(env, cfg) {
 		return hostUpgradeTarget{}, false, nil
 	}
 
 	tx, err := takeTxLock()
 	if err != nil {
 		if errors.Is(err, ErrUpgradeInProgress) {
-			fmt.Printf("An upgrade transaction holds this host; nothing to decide until it finishes.\n")
+			fmt.Fprintf(env.Stdout, "An upgrade transaction holds this host; nothing to decide until it finishes.\n")
 
 			return hostUpgradeTarget{}, false, nil
 		}
@@ -312,30 +312,30 @@ func rolloutInstruction(ctx context.Context, cfg *config.Config) (hostUpgradeTar
 
 	defer tx.release()
 
-	return rolloutInstructionHolding(ctx, cfg, tx)
+	return rolloutInstructionHolding(ctx, env, cfg, tx)
 }
 
 // rolloutInstructionHolding reads the instruction under a lock the caller
 // holds and keeps holding: what it settles, it settles under that lock.
-func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLock,
+func rolloutInstructionHolding(ctx context.Context, env cli.Env, cfg *config.Config, tx *txLock,
 ) (hostUpgradeTarget, bool, error) {
 	if timerBarrier != nil {
 		timerBarrier("instruction")
 	}
 
-	current, found, err := readFleetDecision(ctx, cfg)
+	current, found, err := readFleetDecision(ctx, env, cfg)
 	if err != nil {
 		return hostUpgradeTarget{}, false, err
 	}
 
 	switch {
 	case !found:
-		fmt.Printf("No rollout is running and none has completed; nothing to do.\n")
+		fmt.Fprintf(env.Stdout, "No rollout is running and none has completed; nothing to do.\n")
 
 		return hostUpgradeTarget{}, false, nil
 
 	case current.State == rollout.StateAborted:
-		fmt.Printf("Rollout %s to %s was aborted (%s), and nothing automatic restarts it; "+
+		fmt.Fprintf(env.Stdout, "Rollout %s to %s was aborted (%s), and nothing automatic restarts it; "+
 			"nothing to do.\n", current.ID, current.TargetVersion, current.TerminalReason)
 
 		return hostUpgradeTarget{}, false, nil
@@ -367,7 +367,7 @@ func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLo
 		}
 
 		if current.Generation <= settled {
-			fmt.Printf("Rollout %s (decision %d) completed and this host settled on decision "+
+			fmt.Fprintf(env.Stdout, "Rollout %s (decision %d) completed and this host settled on decision "+
 				"%d; nothing to do.\n", current.ID, current.Generation, settled)
 
 			return hostUpgradeTarget{}, false, nil
@@ -380,14 +380,14 @@ func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLo
 	// Only a POSITIVE disagreement reinstalls; a host with no record is on it.
 	if version.Same(current.TargetVersion, runningRelease()) {
 		if !installedDisagrees(current.TargetDigest) {
-			if err := settleOnTarget(current, target, tx); err != nil {
+			if err := settleOnTarget(env, current, target, tx); err != nil {
 				return hostUpgradeTarget{}, false, err
 			}
 
 			return hostUpgradeTarget{}, false, nil
 		}
 
-		fmt.Printf("This host runs %s from a manifest other than rollout %s's (%s); "+
+		fmt.Fprintf(env.Stdout, "This host runs %s from a manifest other than rollout %s's (%s); "+
 			"reinstalling it.\n", current.TargetVersion, current.ID, current.TargetDigest)
 	}
 
@@ -396,7 +396,7 @@ func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLo
 	// later, by checkDowngrade, with the same permission.
 	if order, ok := version.Compare(current.TargetVersion, runningRelease()); ok && order < 0 &&
 		!current.Policy.AllowDowngrade {
-		fmt.Printf("Rollout %s's target %s is older than the %s running here and the rollout "+
+		fmt.Fprintf(env.Stdout, "Rollout %s's target %s is older than the %s running here and the rollout "+
 			"did not allow a downgrade; nothing to do.\n", current.ID, current.TargetVersion,
 			runningRelease())
 
@@ -407,15 +407,15 @@ func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLo
 	case version.Same(current.TargetVersion, runningRelease()):
 		// Said above.
 	case current.State == rollout.StateCompleted:
-		fmt.Printf("Rollout %s completed at %s while this host stayed on %s; moving it "+
+		fmt.Fprintf(env.Stdout, "Rollout %s completed at %s while this host stayed on %s; moving it "+
 			"(manifest %s, decision %d).\n", current.ID, current.TargetVersion,
 			runningRelease(), current.TargetDigest, current.Generation)
 	case current.ControllerPhase.Converged():
-		fmt.Printf("Rollout %s has converged a control plane on %s, and this host runs %s; "+
+		fmt.Fprintf(env.Stdout, "Rollout %s has converged a control plane on %s, and this host runs %s; "+
 			"moving it (manifest %s, decision %d).\n", current.ID, current.TargetVersion,
 			runningRelease(), current.TargetDigest, current.Generation)
 	default:
-		fmt.Printf("Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
+		fmt.Fprintf(env.Stdout, "Rollout %s asks this host to move from %s to %s (manifest %s, decision %d).\n",
 			current.ID, runningRelease(), current.TargetVersion, current.TargetDigest,
 			current.Generation)
 	}
@@ -439,7 +439,7 @@ func rolloutInstructionHolding(ctx context.Context, cfg *config.Config, tx *txLo
 // would settle on a decision that transaction may still roll back. The lock is
 // the caller's, taken before the instruction was read, so nothing between the
 // read and the settlement can be another process's.
-func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget, tx *txLock) error {
+func settleOnTarget(env cli.Env, current *rollout.Rollout, target hostUpgradeTarget, tx *txLock) error {
 	if tx == nil || tx.f == nil {
 		return errors.New("settleOnTarget needs the held transaction lock")
 	}
@@ -450,7 +450,7 @@ func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget, tx *txLo
 
 	if err := checkAndRecordDecision(target); err != nil {
 		if errors.Is(err, ErrSuperseded) {
-			fmt.Printf("This host already runs %s and has acted on a later decision than "+
+			fmt.Fprintf(env.Stdout, "This host already runs %s and has acted on a later decision than "+
 				"rollout %s's; nothing to do.\n", current.TargetVersion, current.ID)
 
 			return nil
@@ -463,7 +463,7 @@ func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget, tx *txLo
 		return err
 	}
 
-	fmt.Printf("This host already runs %s, rollout %s's target; nothing to do.\n",
+	fmt.Fprintf(env.Stdout, "This host already runs %s, rollout %s's target; nothing to do.\n",
 		current.TargetVersion, current.ID)
 
 	return nil
@@ -482,14 +482,14 @@ func settleOnTarget(current *rollout.Rollout, target hostUpgradeTarget, tx *txLo
 // settled through: its instruction is still to come, fenced by the other mark.
 // A ledger that cannot be read here is said and settles nothing; the timer will
 // not be able to read it either.
-func settlesThrough(ctx context.Context, cfg *config.Config, target hostUpgradeTarget) int64 {
+func settlesThrough(ctx context.Context, env cli.Env, cfg *config.Config, target hostUpgradeTarget) int64 {
 	if target.fromRollout || target.generation != 0 || cfg.Server == nil {
 		return 0
 	}
 
-	current, found, err := readFleetDecision(ctx, cfg)
+	current, found, err := readFleetDecision(ctx, env, cfg)
 	if err != nil {
-		fmt.Printf("NOTE: the fleet's last decision could not be read (%v), so this run settles "+
+		fmt.Fprintf(env.Stdout, "NOTE: the fleet's last decision could not be read (%v), so this run settles "+
 			"on none; a rollout completed before it may move this host again.\n", err)
 
 		return 0
@@ -513,11 +513,11 @@ func settlesThrough(ctx context.Context, cfg *config.Config, target hostUpgradeT
 // handle still verifies the schema is one this binary knows (an older binary
 // never reads a newer schema, so a standby whose leader migrated first is
 // upgraded by hand) and the deployment identity, and it writes nothing.
-func readFleetDecision(ctx context.Context, cfg *config.Config) (*rollout.Rollout, bool, error) {
+func readFleetDecision(ctx context.Context, env cli.Env, cfg *config.Config) (*rollout.Rollout, bool, error) {
 	db, err := openStateForDecision(ctx, cfg)
 	if err != nil {
 		if errors.Is(err, errNoLedgerYet) {
-			fmt.Printf("This host's control plane has not run yet, so there is no ledger to read " +
+			fmt.Fprintf(env.Stdout, "This host's control plane has not run yet, so there is no ledger to read "+
 				"a rollout from; nothing to do.\n")
 
 			return nil, false, nil
@@ -562,8 +562,8 @@ func readFleetDecision(ctx context.Context, cfg *config.Config) (*rollout.Rollou
 // is confirmed; anything else is superseded and nothing is installed. A read
 // cannot close the window to zero, and what lies past it is what the decision
 // fence and the digest fence already refuse.
-func confirmFleetDecision(ctx context.Context, cfg *config.Config, target hostUpgradeTarget) error {
-	current, found, err := readFleetDecision(ctx, cfg)
+func confirmFleetDecision(ctx context.Context, env cli.Env, cfg *config.Config, target hostUpgradeTarget) error {
+	current, found, err := readFleetDecision(ctx, env, cfg)
 	if err != nil {
 		return err
 	}
@@ -630,7 +630,7 @@ type hostUpgradeTarget struct {
 // asking whether this release may replace this one are all things that go wrong,
 // and every one of them goes wrong here — while the deployment is still running
 // normally and the recovery is to do nothing at all.
-func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
+func startHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck,
 ) error {
 	policy, err := app.ReleasePolicyFor(cfg, target.skipVerify)
@@ -641,7 +641,7 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 	// A PLATFORM WITH NO HOST IMPLEMENTATION REFUSES BEFORE THE ACK, so a
 	// dispatching node reports the refusal and the rollout backs off rather than
 	// recording a host as draining that could never move.
-	if _, err := newHostFor(cfg, cfgPath, "", nil); err != nil {
+	if _, err := newHostFor(env, cfg, cfgPath, "", nil); err != nil {
 		return err
 	}
 
@@ -662,7 +662,7 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 
 	defer tx.release()
 
-	return startHostUpgradeHolding(ctx, cfg, cfgPath, target, ack, policy, tx)
+	return startHostUpgradeHolding(ctx, env, cfg, cfgPath, target, ack, policy, tx)
 }
 
 // startHostUpgradeHolding is the transaction's entry once the lock is held.
@@ -672,7 +672,7 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 // words a node's acknowledgement carries to the coordinator ("guarded by H
 // since T"), and a hold that never returned from its publication refuses naming
 // its recovery. Nothing below the classification runs on a guarded host.
-func startHostUpgradeHolding(ctx context.Context, cfg *config.Config, cfgPath string,
+func startHostUpgradeHolding(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, policy releasesource.Policy, tx *txLock,
 ) error {
 	if err := refuseGuardedHost(tx); err != nil {
@@ -697,7 +697,7 @@ func startHostUpgradeHolding(ctx context.Context, cfg *config.Config, cfgPath st
 		return err
 	}
 
-	return actOnResolved(ctx, cfg, cfgPath, target, ack, client, manifest, digest, tx)
+	return actOnResolved(ctx, env, cfg, cfgPath, target, ack, client, manifest, digest, tx)
 }
 
 // The transaction's two seams after the lock: the platform check and the
@@ -749,7 +749,7 @@ func refuseClaimed(root *os.File, dir string, err error) error {
 // exactly as another process would, and the probe that tried it refused every
 // ordinary upgrade against its own caller's lock. Naming it in the signature is
 // how a caller is told, since nothing else can enforce it.
-func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
+func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath string,
 	target hostUpgradeTarget, ack *upgradeAck, client *releasesource.Client,
 	manifest *releasesource.Manifest, digest string, tx *txLock,
 ) error {
@@ -765,7 +765,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// and both services are down.
 	warnings, err := releasesource.Compatibility(manifest, current)
 	for _, w := range warnings {
-		fmt.Printf("NOTE: %v\n\n", w)
+		fmt.Fprintf(env.Stdout, "NOTE: %v\n\n", w)
 	}
 
 	// A REFUSAL IS A REFUSAL WHATEVER ELSE CAME BACK. The warnings are printed
@@ -828,7 +828,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 				return err
 			}
 
-			fmt.Printf("Another transaction has already installed %s from manifest %s on this "+
+			fmt.Fprintf(env.Stdout, "Another transaction has already installed %s from manifest %s on this "+
 				"host; nothing to do.\n", manifest.Version, digest)
 
 			ack.accept()
@@ -838,7 +838,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	}
 
 	if version.Same(manifest.Version, runningRelease()) && !target.reinstall && !installedDisagrees(digest) {
-		fmt.Printf("This machine is already running %s.\n", manifest.Version)
+		fmt.Fprintf(env.Stdout, "This machine is already running %s.\n", manifest.Version)
 
 		// THE MARK IS RAISED EVEN THOUGH NOTHING IS INSTALLED, because what it
 		// records is which decision this machine has ACTED ON, and concluding "there
@@ -873,7 +873,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		TargetDigest:   digest,
 		RolloutID:      target.rolloutID,
 		Generation:     target.generation,
-		SettlesThrough: settlesThrough(ctx, cfg, target),
+		SettlesThrough: settlesThrough(ctx, env, cfg, target),
 		AllowDowngrade: target.allowDowngrade,
 		Ledger:         ledgerKindFor(cfg),
 		PID:            os.Getpid(),
@@ -914,7 +914,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	// replaced; a node is told about that by its coordinator, and a timer has to
 	// ask.
 	if target.fromRollout {
-		if err := confirmFleetDecision(ctx, cfg, target); err != nil {
+		if err := confirmFleetDecision(ctx, env, cfg, target); err != nil {
 			return refuseClaimed(tx.dir, dir, err)
 		}
 	}
@@ -940,18 +940,18 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
-	fmt.Printf("Upgrading %s -> %s\n", journal.FromVersion, journal.ToVersion)
-	fmt.Printf("  recovery journal %s\n", dir)
-	fmt.Printf("  candidate %s\n\n", staged)
-	fmt.Printf("The node stops first so its compute drains, and that wait is unbounded:\n")
-	fmt.Printf("a job may run for days and nothing here ends one.\n\n")
+	fmt.Fprintf(env.Stdout, "Upgrading %s -> %s\n", journal.FromVersion, journal.ToVersion)
+	fmt.Fprintf(env.Stdout, "  recovery journal %s\n", dir)
+	fmt.Fprintf(env.Stdout, "  candidate %s\n\n", staged)
+	fmt.Fprintf(env.Stdout, "The node stops first so its compute drains, and that wait is unbounded:\n")
+	fmt.Fprintf(env.Stdout, "a job may run for days and nothing here ends one.\n\n")
 
-	host, err := newHostFor(cfg, cfgPath, staged, journal)
+	host, err := newHostFor(env, cfg, cfgPath, staged, journal)
 	if err != nil {
 		return err
 	}
 
-	return finishHostUpgrade(ctx, tx.dir, journal, host)
+	return finishHostUpgrade(ctx, env, tx.dir, journal, host)
 }
 
 // ledgerKindFor says which shape of transaction a host's ledger needs.
@@ -968,7 +968,7 @@ func ledgerKindFor(cfg *config.Config) string {
 }
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
-func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
+func resumeHostUpgrade(ctx context.Context, env cli.Env, cfg *config.Config) error {
 	// A LIVE UPDATER IS NOT AN ABANDONED ONE, and nothing here could tell the
 	// difference before this lock existed. The claim survives a crash on purpose,
 	// so its presence proves a transaction was STARTED and says nothing about
@@ -991,7 +991,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 
 	switch shape.Kind {
 	case claimNone:
-		fmt.Printf("No upgrade is in progress on this machine.\n")
+		fmt.Fprintf(env.Stdout, "No upgrade is in progress on this machine.\n")
 
 		return nil
 	case claimHostUpgrade:
@@ -1025,9 +1025,9 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 		// and `--resume` has nothing to continue — so a machine that lost power in
 		// that window, or hit a full disk, would need a person to delete a symlink
 		// before any rollout could move it again.
-		fmt.Printf("An upgrade claimed %s and never wrote its journal, so nothing on this\n",
+		fmt.Fprintf(env.Stdout, "An upgrade claimed %s and never wrote its journal, so nothing on this\n",
 			dir)
-		fmt.Printf("machine was touched. Releasing the claim; nothing else is needed.\n")
+		fmt.Fprintf(env.Stdout, "machine was touched. Releasing the claim; nothing else is needed.\n")
 
 		return releaseClaim(tx.dir, dir)
 	}
@@ -1047,7 +1047,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 	// makes a removal act somewhere nobody intended.
 	journal.Dir = dir
 
-	fmt.Printf("Resuming the upgrade %s -> %s, which reached %s.\n",
+	fmt.Fprintf(env.Stdout, "Resuming the upgrade %s -> %s, which reached %s.\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
 
 	if resumeBarrier != nil {
@@ -1056,16 +1056,16 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	if done, err := settleResumedDecision(tx.dir, journal); err != nil || done {
+	if done, err := settleResumedDecision(env, tx.dir, journal); err != nil || done {
 		return err
 	}
 
-	host, err := newHostFor(cfg, "", filepath.Join(dir, "billet"), journal)
+	host, err := newHostFor(env, cfg, "", filepath.Join(dir, "billet"), journal)
 	if err != nil {
 		return err
 	}
 
-	return finishHostUpgrade(ctx, tx.dir, journal, host)
+	return finishHostUpgrade(ctx, env, tx.dir, journal, host)
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the
@@ -1082,7 +1082,7 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 // cordon, a committed upgrade whose services did not come back, a failure this
 // build cannot classify — keeps it, because keeping it is what makes `--resume`
 // find the transaction and what stops a rollout starting a second one on top.
-func finishHostUpgrade(ctx context.Context, root *os.File, journal *hostupgrade.Journal,
+func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal *hostupgrade.Journal,
 	host hostupgrade.Host,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
@@ -1101,20 +1101,20 @@ func finishHostUpgrade(ctx context.Context, root *os.File, journal *hostupgrade.
 	}
 
 	if errors.Is(err, hostupgrade.ErrCordoned) {
-		fmt.Printf("\nThis machine is CORDONED. Its recovery journal is %s and is left in\n",
+		fmt.Fprintf(env.Stdout, "\nThis machine is CORDONED. Its recovery journal is %s and is left in\n",
 			journal.Dir)
-		fmt.Printf("place; nothing about which release it is on, which schema its ledger\n")
-		fmt.Printf("carries, or whether its compute exists is known. Look at it before\n")
-		fmt.Printf("starting anything else here.\n")
+		fmt.Fprintf(env.Stdout, "place; nothing about which release it is on, which schema its ledger\n")
+		fmt.Fprintf(env.Stdout, "carries, or whether its compute exists is known. Look at it before\n")
+		fmt.Fprintf(env.Stdout, "starting anything else here.\n")
 
 		return err
 	}
 
 	if err != nil && !errors.Is(err, hostupgrade.ErrRolledBack) {
-		fmt.Printf("\nThis upgrade did not finish. Its recovery journal is %s and the claim\n",
+		fmt.Fprintf(env.Stdout, "\nThis upgrade did not finish. Its recovery journal is %s and the claim\n",
 			journal.Dir)
-		fmt.Printf("is kept, so `billet host-upgrade --resume` continues it; the machine may\n")
-		fmt.Printf("still be fenced or have its services stopped.\n")
+		fmt.Fprintf(env.Stdout, "is kept, so `billet host-upgrade --resume` continues it; the machine may\n")
+		fmt.Fprintf(env.Stdout, "still be fenced or have its services stopped.\n")
 
 		return err
 	}
@@ -1199,8 +1199,8 @@ func checkFleetInstruction(rolloutID string, generation int64) error {
 // that one: it may already be past its claim and installing, and a machine with a
 // half-replaced binary and no process finishing the job is the worst state this
 // area can produce. So this puts what is knowable in front of a person and stops.
-func reportUpgradeStatus() {
-	fmt.Printf("upgrade root  %s\n", upgradeRoot)
+func reportUpgradeStatus(env cli.Env) {
+	fmt.Fprintf(env.Stdout, "upgrade root  %s\n", upgradeRoot)
 
 	// THE LOCK IS THE LIVENESS SIGNAL. The claim is durable and survives a crash on
 	// purpose, so its presence proves a transaction was STARTED and says nothing
@@ -1209,43 +1209,43 @@ func reportUpgradeStatus() {
 	if tx, err := takeTxLock(); err == nil {
 		tx.release()
 
-		fmt.Printf("transaction   none is running\n")
+		fmt.Fprintf(env.Stdout, "transaction   none is running\n")
 	} else if errors.Is(err, ErrUpgradeInProgress) {
-		fmt.Printf("transaction   ONE IS RUNNING NOW\n")
+		fmt.Fprintf(env.Stdout, "transaction   ONE IS RUNNING NOW\n")
 	} else {
-		fmt.Printf("transaction   could not be determined: %v\n", err)
+		fmt.Fprintf(env.Stdout, "transaction   could not be determined: %v\n", err)
 	}
 
-	reportUpgradeJournal()
+	reportUpgradeJournal(env)
 
 	if acted, err := readDecision(); err != nil {
-		fmt.Printf("decision      unreadable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "decision      unreadable: %v\n", err)
 	} else if acted == 0 {
-		fmt.Printf("decision      this machine has acted on no fleet decision\n")
+		fmt.Fprintf(env.Stdout, "decision      this machine has acted on no fleet decision\n")
 	} else {
-		fmt.Printf("decision      %d is the newest fleet decision acted on here\n", acted)
+		fmt.Fprintf(env.Stdout, "decision      %d is the newest fleet decision acted on here\n", acted)
 	}
 
-	reportProvenance()
+	reportProvenance(env)
 }
 
 // reportUpgradeJournal describes the transaction on this machine, if there is one.
-func reportUpgradeJournal() {
+func reportUpgradeJournal(env cli.Env) {
 	shape, err := classifyClaim()
 	if err != nil {
-		fmt.Printf("journal       the claim could not be read: %v\n", err)
+		fmt.Fprintf(env.Stdout, "journal       the claim could not be read: %v\n", err)
 
 		return
 	}
 
 	switch {
 	case shape.Kind == claimNone:
-		fmt.Printf("journal       no upgrade has claimed this machine\n")
+		fmt.Fprintf(env.Stdout, "journal       no upgrade has claimed this machine\n")
 
 		return
 	case shape.Kind == claimHostUpgrade && !shape.Dangling:
 	default:
-		fmt.Printf("claim         %s\n", shape)
+		fmt.Fprintf(env.Stdout, "claim         %s\n", shape)
 
 		return
 	}
@@ -1254,49 +1254,49 @@ func reportUpgradeJournal() {
 
 	journal, err := hostupgrade.ReadJournal(dir)
 	if err != nil {
-		fmt.Printf("journal       %s holds a claim billet cannot read: %v\n", dir, err)
+		fmt.Fprintf(env.Stdout, "journal       %s holds a claim billet cannot read: %v\n", dir, err)
 
 		return
 	}
 
-	fmt.Printf("journal       %s -> %s, reached %s\n",
+	fmt.Fprintf(env.Stdout, "journal       %s -> %s, reached %s\n",
 		journal.FromVersion, journal.ToVersion, journal.Step)
-	fmt.Printf("              started %s in %s\n", journal.StartedAt, dir)
+	fmt.Fprintf(env.Stdout, "              started %s in %s\n", journal.StartedAt, dir)
 
 	if journal.PID > 0 {
 		// NAMED, NOT ACTED ON. A pid is a number the kernel reuses, so this is
 		// something for a person to look at rather than something to signal.
-		fmt.Printf("              claimed by pid %d\n", journal.PID)
+		fmt.Fprintf(env.Stdout, "              claimed by pid %d\n", journal.PID)
 	}
 
 	if journal.RolloutID != "" {
-		fmt.Printf("              for rollout %s, decision %d\n",
+		fmt.Fprintf(env.Stdout, "              for rollout %s, decision %d\n",
 			journal.RolloutID, journal.Generation)
 	}
 
 	if journal.Failure != "" {
-		fmt.Printf("              FAILED: %s\n", journal.Failure)
+		fmt.Fprintf(env.Stdout, "              FAILED: %s\n", journal.Failure)
 	}
 }
 
 // reportProvenance says which release manifest produced the binary here.
-func reportProvenance() {
+func reportProvenance(env cli.Env) {
 	record, err := provenance.Read()
 
 	switch {
 	case errors.Is(err, provenance.ErrNoRecord):
-		fmt.Printf("installed     nothing here records which release manifest produced " +
+		fmt.Fprintf(env.Stdout, "installed     nothing here records which release manifest produced "+
 			"this binary\n")
 	case err != nil:
-		fmt.Printf("installed     the record is unreadable: %v\n", err)
+		fmt.Fprintf(env.Stdout, "installed     the record is unreadable: %v\n", err)
 	default:
-		fmt.Printf("installed     %s from manifest %s\n", record.Version, record.ManifestDigest)
+		fmt.Fprintf(env.Stdout, "installed     %s from manifest %s\n", record.Version, record.ManifestDigest)
 
 		// WHETHER IT STILL DESCRIBES THIS BINARY IS A SEPARATE QUESTION, and the
 		// answer an operator needs: a record left behind by a hand-replaced binary
 		// looks identical to a good one until the hashes are compared.
 		if _, err := provenance.Installed(); err != nil {
-			fmt.Printf("              BUT IT NO LONGER DESCRIBES THE BINARY HERE: %v\n", err)
+			fmt.Fprintf(env.Stdout, "              BUT IT NO LONGER DESCRIBES THE BINARY HERE: %v\n", err)
 		}
 	}
 }
@@ -1357,7 +1357,7 @@ func describeTarget(target hostUpgradeTarget) string {
 // ambiguous, and the ambiguity is resolved toward FINISHING: a superseded release
 // installed on one host is a rollout that dispatches again, while a host left
 // stopped is one a person has to go and find.
-func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, error) {
+func settleResumedDecision(env cli.Env, root *os.File, journal *hostupgrade.Journal) (bool, error) {
 	if journal.Generation <= 0 {
 		return false, nil
 	}
@@ -1368,11 +1368,11 @@ func settleResumedDecision(root *os.File, journal *hostupgrade.Journal) (bool, e
 	}
 
 	if journal.Generation < acted && journal.Step == hostupgrade.StepClaimed {
-		fmt.Printf("\nThis machine has since acted on fleet decision %d and this "+
+		fmt.Fprintf(env.Stdout, "\nThis machine has since acted on fleet decision %d and this "+
 			"transaction is %d, so finishing it would install a release the deployment\n",
 			acted, journal.Generation)
-		fmt.Printf("has left behind. It never got past claiming, so nothing here was\n")
-		fmt.Printf("touched. Abandoning it.\n")
+		fmt.Fprintf(env.Stdout, "has left behind. It never got past claiming, so nothing here was\n")
+		fmt.Fprintf(env.Stdout, "touched. Abandoning it.\n")
 
 		return true, abandonClaim(root, journal.Dir)
 	}
@@ -1799,6 +1799,8 @@ type systemdHost struct {
 // ledger and the binary, and a second copy for the second manager is how the two
 // platforms would come to snapshot, migrate or record differently.
 type ledgerHost struct {
+	// env is where the transaction's steps report, as the command's own output.
+	env     cli.Env
 	cfg     *config.Config
 	cfgPath string
 	// downgradeTo is the release the ledger's watermark is lowered to before the
@@ -1810,8 +1812,8 @@ type ledgerHost struct {
 	external bool
 }
 
-func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
-	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
+func newLedgerHost(env cli.Env, cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
+	h := ledgerHost{env: env, cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
 
 	// THE PERMISSION ALONE MOVES NOTHING; ONLY A PROVED DOWNGRADE LOWERS THE MARK.
 	// `--allow-downgrade` on an upgrade is harmless to every other check, and
@@ -1833,13 +1835,13 @@ func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Jour
 // operation is given.
 var newHostInspector = func() *lifeops.Inspector { return lifeops.NewInspector() }
 
-func newSystemdHost(cfg *config.Config, cfgPath, staged string,
+func newSystemdHost(env cli.Env, cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) *systemdHost {
 	inspector := newHostInspector()
 
 	return &systemdHost{
-		ledgerHost: newLedgerHost(cfg, cfgPath, journal),
+		ledgerHost: newLedgerHost(env, cfg, cfgPath, journal),
 		staged:     staged,
 		inspect:    inspector,
 		converge:   lifeops.NewConverger(inspector),
@@ -1853,14 +1855,14 @@ func newSystemdHost(cfg *config.Config, cfgPath, staged string,
 // launch agents in the operator's session; both run the same journal through
 // the same order, and only the vocabulary — stop, start, prove, which files are
 // preserved — differs. Anything else is refused here, before a claim is taken.
-func newHostFor(cfg *config.Config, cfgPath, staged string,
+func newHostFor(env cli.Env, cfg *config.Config, cfgPath, staged string,
 	journal *hostupgrade.Journal,
 ) (hostupgrade.Host, error) {
 	switch hostOS {
 	case "linux":
-		return newSystemdHost(cfg, cfgPath, staged, journal), nil
+		return newSystemdHost(env, cfg, cfgPath, staged, journal), nil
 	case "darwin":
-		return newLaunchdHost(cfg, cfgPath, staged, journal), nil
+		return newLaunchdHost(env, cfg, cfgPath, staged, journal), nil
 	default:
 		return nil, fmt.Errorf("billet host-upgrade replaces billet under systemd or launchd, "+
 			"and this host is %s; upgrade it the way it was installed", hostOS)
@@ -1949,7 +1951,7 @@ func (h *systemdHost) stop(ctx context.Context, unit string) error {
 		return fmt.Errorf("stopping %s: %w", unit, err)
 	}
 
-	fmt.Printf("  stopped %s (%s: %s)\n", unit, how.Gone, how.How)
+	fmt.Fprintf(h.env.Stdout, "  stopped %s (%s: %s)\n", unit, how.Gone, how.How)
 
 	return nil
 }
@@ -2184,7 +2186,7 @@ func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Printf("  lowered the ledger's release watermark to %s, as asked\n", h.downgradeTo)
+	fmt.Fprintf(h.env.Stdout, "  lowered the ledger's release watermark to %s, as asked\n", h.downgradeTo)
 
 	return nil
 }
@@ -2249,7 +2251,7 @@ func (h *systemdHost) PrepareImages(ctx context.Context) error {
 	err := h.runStaged(ctx, "images", "compatible", "--config", h.configPath(),
 		"--result-file", result)
 	if err == nil {
-		fmt.Printf("  every configured guest image speaks the candidate's contract\n")
+		fmt.Fprintf(h.env.Stdout, "  every configured guest image speaks the candidate's contract\n")
 
 		return nil
 	}
@@ -2265,7 +2267,7 @@ func (h *systemdHost) PrepareImages(ctx context.Context) error {
 	}
 
 	for _, name := range names {
-		fmt.Printf("  pulling and verifying a generation of %s the candidate can boot\n", name)
+		fmt.Fprintf(h.env.Stdout, "  pulling and verifying a generation of %s the candidate can boot\n", name)
 
 		if err := h.runStaged(ctx, "images", "pull", "--verify", "--config", h.configPath(),
 			name); err != nil {

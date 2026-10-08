@@ -83,8 +83,8 @@ var kernelInstaller = durablefile.Installer{}
 // bytes into shared storage, where undoing it is a cluster operation rather than
 // deleting a file. Staging costs one disk write and makes every failure before
 // the import a no-op.
-func cmdImagesPull(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet images pull", os.Stdout)
+func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet images pull", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	from := fs.String("from", "",
@@ -131,7 +131,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// before the Ceph requirement below — a tart node has no cluster, so without
 	// this it was told to configure storage it must not have.
 	if cfg.Node != nil && cfg.Node.Provider == config.ProviderTart {
-		return pullTartImages(ctx, cfg, rest)
+		return pullTartImages(ctx, env, cfg, rest)
 	}
 
 	if cfg.Node == nil || cfg.Node.Ceph == nil {
@@ -187,7 +187,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 			"own; give the image name alone", image)
 	}
 
-	manifest, dir, cleanup, err := stageImage(ctx, cfg, stageOptions{
+	manifest, dir, cleanup, err := stageImage(ctx, env, cfg, stageOptions{
 		from:     *from,
 		source:   *source,
 		staging:  *staging,
@@ -220,18 +220,18 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// else shipped, and one built yesterday around a runner three releases behind is
 	// already refused. It rejected images that worked and accepted images that could
 	// not.
-	if err := refuseExpiredRunner(ctx, manifest.RunnerVersion, *allowStale); err != nil {
+	if err := refuseExpiredRunner(ctx, env, manifest.RunnerVersion, *allowStale); err != nil {
 		return err
 	}
 
 	// AGE IS MAINTENANCE INFORMATION AND SAYS SO. It is a fact about the artifact and
 	// about billet's weekly build, not about whether github will queue to it.
 	if manifest.Aging(time.Now()) {
-		fmt.Printf("note: this image was built %d days ago; a newer one is probably "+
+		fmt.Fprintf(env.Stdout, "note: this image was built %d days ago; a newer one is probably "+
 			"published\n\n", int(manifest.Age(time.Now()).Hours()/24))
 	}
 
-	raw, err := unpackRootfs(ctx, manifest, dir)
+	raw, err := unpackRootfs(ctx, env, manifest, dir)
 	if err != nil {
 		return err
 	}
@@ -257,7 +257,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// directory, not a mistake -- and the ansible host role runs this command as a
 	// required step of a transactional upgrade, where a refusal rolls the upgrade
 	// back.
-	kernelLock, err := takeKernelDirLock(ctx, *kernelDir,
+	kernelLock, err := takeKernelDirLock(ctx, env, *kernelDir,
 		"install the kernel this generation will name")
 	if err != nil {
 		return err
@@ -272,7 +272,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// either way, so nothing is left held.
 	release := func() {
 		if err := kernelLock.release(); err != nil {
-			fmt.Printf("warning: the kernel directory lock was not released: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warning: the kernel directory lock was not released: %v\n", err)
 		}
 	}
 
@@ -293,7 +293,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		return fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 	}
 
-	fmt.Printf("importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
+	fmt.Fprintf(env.Stdout, "importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
 	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion,
 		kernelFileName(manifest), manifest.GuestContract, time.Now())
@@ -308,21 +308,21 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// across.
 	release()
 
-	fmt.Printf("\npublished %s@%s (runner %s, kernel %s)\n",
+	fmt.Fprintf(env.Stdout, "\npublished %s@%s (runner %s, kernel %s)\n",
 		image, generation, manifest.RunnerVersion, manifest.Kernel.Version)
 	exact := image + "@" + generation
 
 	if *verify {
-		fmt.Printf("\nboot-verifying %s before promotion\n", exact)
+		fmt.Fprintf(env.Stdout, "\nboot-verifying %s before promotion\n", exact)
 
-		if err := cmdImagesVerify(ctx, []string{"--config", *cfgPath, exact}); err != nil {
+		if err := cmdImagesVerify(ctx, env, []string{"--config", *cfgPath, exact}); err != nil {
 			return err
 		}
 	} else {
-		fmt.Println()
-		fmt.Println("Nothing boots it yet. Verify it, which marks it so `@verified` resolves to it:")
-		fmt.Println()
-		fmt.Printf("    billet images verify %s\n", exact)
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintln(env.Stdout, "Nothing boots it yet. Verify it, which marks it so `@verified` resolves to it:")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "    billet images verify %s\n", exact)
 	}
 
 	if *resultFile != "" {
@@ -331,10 +331,10 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		}
 	}
 
-	fmt.Println()
-	fmt.Printf("The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
-	fmt.Println("Point node.firecracker.kernel_image at that path. The two are a matched pair,")
-	fmt.Println("and a guest booted with a different kernel fails in the middle of somebody's job.")
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
+	fmt.Fprintln(env.Stdout, "Point node.firecracker.kernel_image at that path. The two are a matched pair,")
+	fmt.Fprintln(env.Stdout, "and a guest booted with a different kernel fails in the middle of somebody's job.")
 
 	return nil
 }
@@ -351,20 +351,20 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 //
 // AND IT IS THE ORDINARY WINDOW. GitHub may enforce a critical security release at
 // once, so a pass here is the best mechanical estimate rather than a promise.
-func refuseExpiredRunner(ctx context.Context, version string, allowStale bool) error {
+func refuseExpiredRunner(ctx context.Context, env cli.Env, version string, allowStale bool) error {
 	if allowStale {
 		// NOT ASKED AT ALL. The answer could not change anything, and an air-gapped
 		// host should not pay a timeout to be told what it already said it accepts.
-		fmt.Println("note: --allow-stale, so this did not ask github whether the baked " +
+		fmt.Fprintln(env.Stdout, "note: --allow-stale, so this did not ask github whether the baked "+
 			"runner is still accepted")
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		return nil
 	}
 
 	fresh, err := resolveRunnerFreshness(ctx, nil, version)
 	if err != nil {
-		fmt.Printf("note: cannot determine whether runner %s is still accepted by github, "+
+		fmt.Fprintf(env.Stdout, "note: cannot determine whether runner %s is still accepted by github, "+
 			"so this import is not judging it: %v\n\n", version, err)
 
 		return nil
@@ -397,7 +397,7 @@ func refuseExpiredRunner(ctx context.Context, version string, allowStale bool) e
 	// BEHIND WITH NO WINDOW TO COUNT, which is not a refusal: nothing says github has
 	// stopped queueing to it, only that a higher release exists and predates it.
 	case fresh.BehindWithoutAWindow():
-		fmt.Printf("note: runner %s is behind %s, which was published before it — so it "+
+		fmt.Fprintf(env.Stdout, "note: runner %s is behind %s, which was published before it — so it "+
 			"was already available when this runner shipped and there is no ordinary "+
 			"window to count\n\n", version, fresh.Latest)
 
@@ -405,23 +405,23 @@ func refuseExpiredRunner(ctx context.Context, version string, allowStale bool) e
 	// refusal: the expiry above is the only thing this proves, and an import must not
 	// be refused by a question billet could not finish asking.
 	case !fresh.InstalledKnown:
-		fmt.Printf("note: cannot determine whether runner %s is still accepted: github's "+
+		fmt.Fprintf(env.Stdout, "note: cannot determine whether runner %s is still accepted: github's "+
 			"release history does not name it. The newest release is %s\n\n",
 			version, fresh.Latest)
 
 	case !fresh.HistoryComplete:
-		fmt.Printf("note: cannot determine whether runner %s is still accepted: billet "+
+		fmt.Fprintf(env.Stdout, "note: cannot determine whether runner %s is still accepted: billet "+
 			"reached the end of the history it reads before the end of github's. The "+
 			"newest release is %s\n\n", version, fresh.Latest)
 
 	case fresh.Due(now):
-		fmt.Printf("warning: runner %s is inside github's ordinary window until %s (%d days); "+
+		fmt.Fprintf(env.Stdout, "warning: runner %s is inside github's ordinary window until %s (%d days); "+
 			"%s is the newest release\n\n",
 			version, fresh.Deadline().Format(time.DateOnly),
 			int(fresh.Remaining(now).Hours()/24), fresh.Latest)
 
 	case !fresh.Current():
-		fmt.Printf("runner %s; %s was published %s, and there are %d days to take it up\n\n",
+		fmt.Fprintf(env.Stdout, "runner %s; %s was published %s, and there are %d days to take it up\n\n",
 			version, fresh.FirstNewer, fresh.FirstNewerPublished.Format(time.DateOnly),
 			int(fresh.Remaining(now).Hours()/24))
 	}
@@ -482,7 +482,7 @@ type stageOptions struct {
 }
 
 func stageImage(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	cfg *config.Config,
 	opts stageOptions,
 ) (*imagesource.Manifest, string, func(), error) {
@@ -557,7 +557,7 @@ func stageImage(
 		return manifest, staged, cleanup, nil
 	}
 
-	manifest, client, err := resolveImageManifest(ctx, cfg, opts)
+	manifest, client, err := resolveImageManifest(ctx, env, cfg, opts)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -574,7 +574,7 @@ func stageImage(
 	// only thing that produces a usable root filesystem path -- and which checks
 	// the digest of the assembled file, not merely of the pieces.
 	for _, asset := range manifest.Downloads() {
-		fmt.Printf("downloading %s (%s)\n", asset.Name, humanBytes(asset.Size))
+		fmt.Fprintf(env.Stdout, "downloading %s (%s)\n", asset.Name, humanBytes(asset.Size))
 
 		if _, err := client.Download(ctx, asset, dir); err != nil {
 			cleanup()
@@ -594,7 +594,7 @@ func stageImage(
 // second copy of the source, policy and signature steps is a second place for
 // them to disagree. Everything a pull verifies about a manifest is verified here.
 func resolveImageManifest(
-	ctx context.Context,
+	ctx context.Context, env cli.Env,
 	cfg *config.Config,
 	opts stageOptions,
 ) (*imagesource.Manifest, *imagesource.Client, error) {
@@ -627,12 +627,12 @@ func resolveImageManifest(
 		return nil, nil, err
 	}
 
-	fmt.Printf("fetching %s\n", src.ManifestURL())
+	fmt.Fprintf(env.Stdout, "fetching %s\n", src.ManifestURL())
 
 	if policy.Required {
-		fmt.Printf("requiring a signature from %s\n", policy.Identity)
+		fmt.Fprintf(env.Stdout, "requiring a signature from %s\n", policy.Identity)
 	} else {
-		fmt.Println("WARNING: importing without verifying who published this manifest")
+		fmt.Fprintln(env.Stdout, "WARNING: importing without verifying who published this manifest")
 	}
 
 	manifest, err := client.Manifest(ctx, policy)
@@ -694,11 +694,11 @@ func resolveSource(cfg *config.Config, flagValue string) (imagesource.Source, er
 // goes through the same call, which verifies it in place -- so the whole-file
 // check runs for both layouts and there is no path here that decompresses bytes
 // nothing has vouched for as a complete image.
-func unpackRootfs(ctx context.Context, manifest *imagesource.Manifest, dir string) (string, error) {
+func unpackRootfs(ctx context.Context, env cli.Env, manifest *imagesource.Manifest, dir string) (string, error) {
 	img := manifest.RootfsImage()
 
 	if img.Assembled() {
-		fmt.Printf("assembling %s from %d parts\n", img.Name, len(img.Parts))
+		fmt.Fprintf(env.Stdout, "assembling %s from %d parts\n", img.Name, len(img.Parts))
 	}
 
 	packed, err := imagesource.AssembleRootfs(dir, img)
@@ -725,13 +725,13 @@ func unpackRootfs(ctx context.Context, manifest *imagesource.Manifest, dir strin
 		raw = packed + ".raw"
 	}
 
-	fmt.Printf("decompressing %s\n", img.Name)
+	fmt.Fprintf(env.Stdout, "decompressing %s\n", img.Name)
 
 	// -f BECAUSE A RETRY MUST NOT PROMPT. An interrupted pull leaves a partial
 	// output, and zstd would otherwise stop to ask about it on a machine nobody is
 	// watching.
 	cmd := exec.CommandContext(ctx, "zstd", "-d", "-f", "-o", raw, packed)
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = env.Stderr
 
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("billet images pull: could not decompress %s: %w",

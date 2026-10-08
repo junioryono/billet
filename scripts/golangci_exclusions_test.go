@@ -27,6 +27,7 @@ type golangciExclusionRule struct {
 	Path       string   `yaml:"path"`
 	PathExcept string   `yaml:"path-except"`
 	Linters    []string `yaml:"linters"`
+	Text       string   `yaml:"text"`
 }
 
 type golangciExclusions struct {
@@ -145,60 +146,93 @@ func TestGolangciPathExclusionsFollowTheFileRatherThanTheWorkingDirectory(t *tes
 // The forbidigo exclusion is the one that broke, so it is asserted in both
 // directions rather than left to the sweep above.
 //
-// cmd/billet prints to stdout by design; every other package must go through
-// log/slog. An exclusion that stopped matching cmd/billet would fail the gate on
-// correct code, and one that matched too much would silently drop the rule for a
-// package that needs it -- and neither shows up as anything but a green run.
+// cmd/billet creates the root context and decides the exit status by design;
+// every other package returns errors and threads its context. Only main names
+// the process's streams and environment: a command writes to the cli.Env it is
+// handed, and a library logs through log/slog. An exclusion that stopped
+// matching where it should would fail the gate on correct code, and one that
+// matched too much would silently drop a rule for code that needs it -- and
+// neither shows up as anything but a green run.
 func TestForbidigoIsExcludedForCmdBilletInAnyCheckout(t *testing.T) {
 	t.Parallel()
 
 	// ASKED OF EVERY RULE THAT NAMES forbidigo, rather than of one picked out by
 	// its pattern. Choosing the rule by what it matches and then asserting what it
-	// matches proves nothing; the question is whether the CONFIG excludes these
-	// paths and not those, however many rules it takes to say so.
-	var expressions []*regexp.Regexp
+	// matches proves nothing; the question is whether the CONFIG excludes a
+	// finding with this message at this path, however many rules it takes to
+	// say so. A rule with no text excludes every message.
+	type exclusion struct{ path, text *regexp.Regexp }
+
+	var rules []exclusion
 
 	for _, rule := range readGolangciConfig(t).Linters.Exclusions.Rules {
 		if !slices.Contains(rule.Linters, "forbidigo") || rule.Path == "" {
 			continue
 		}
 
-		expression, err := regexp.Compile(rule.Path)
+		path, err := regexp.Compile(rule.Path)
 		if err != nil {
 			t.Fatalf("the forbidigo exclusion %q is not a valid regexp: %v", rule.Path, err)
 		}
 
-		expressions = append(expressions, expression)
+		var text *regexp.Regexp
+		if rule.Text != "" {
+			if text, err = regexp.Compile(rule.Text); err != nil {
+				t.Fatalf("the forbidigo exclusion's text %q is not a valid regexp: %v", rule.Text, err)
+			}
+		}
+
+		rules = append(rules, exclusion{path, text})
 	}
 
-	if len(expressions) == 0 {
+	if len(rules) == 0 {
 		t.Fatal("no exclusion names forbidigo; either the cmd/billet allowance was removed, in " +
-			"which case its operator output now fails the gate, or the config shape moved")
+			"which case its root context and exit status now fail the gate, or the config shape moved")
 	}
 
-	excluded := func(path string) bool {
-		return slices.ContainsFunc(expressions, func(e *regexp.Regexp) bool {
-			return e.MatchString(path)
+	// The findings as forbidigo words them, one per ban the exclusions name.
+	const (
+		exit    = `use of ` + "`os.Exit`" + ` forbidden because "Return errors and let main decide; don't os.Exit from library code." (forbidigo)`
+		printed = `use of ` + "`fmt.Printf`" + ` forbidden because "Use log/slog in library code, and write a command's output to the cli.Env it is handed." (forbidigo)`
+		stream  = `use of ` + "`os.Stdout`" + ` forbidden because "Write to the cli.Env a command is handed; only cmd/billet's main names the process's own streams." (forbidigo)`
+		getenv  = `use of ` + "`os.Getenv`" + ` forbidden because "A command reads its environment through the cli.Env it is handed; only cmd/billet's main hands it os.Getenv." (forbidigo)`
+	)
+
+	excluded := func(path, finding string) bool {
+		return slices.ContainsFunc(rules, func(r exclusion) bool {
+			return r.path.MatchString(path) && (r.text == nil || r.text.MatchString(finding))
 		})
 	}
 
 	for _, tc := range []struct {
-		path string
-		want bool
+		path, finding string
+		want          bool
 	}{
-		{"cmd/billet/ami.go", true},
-		{"./cmd/billet/ami.go", true},
-		{otherCheckout + "cmd/billet/ami.go", true},
-		{"/Users/someone/checkout/cmd/billet/ami.go", true},
-		{"internal/version/version.go", false},
-		{"internal/store/ceph/importer.go", false},
+		{"cmd/billet/ami.go", exit, true},
+		{"./cmd/billet/ami.go", exit, true},
+		{otherCheckout + "cmd/billet/ami.go", exit, true},
+		{"/Users/someone/checkout/cmd/billet/ami.go", exit, true},
+		{"internal/version/version.go", exit, false},
+		{"internal/store/ceph/importer.go", exit, false},
 		// A directory whose name merely ENDS in cmd is not cmd/, which is the
 		// component boundary `^` was there for and the reason the replacement is
 		// (^|/) rather than a bare substring.
-		{"internal/somecmd/billet/main.go", false},
+		{"internal/somecmd/billet/main.go", exit, false},
+		// ONLY main NAMES THE PROCESS'S STREAMS AND ENVIRONMENT.
+		{"cmd/billet/main.go", stream, true},
+		{otherCheckout + "cmd/billet/main.go", getenv, true},
+		{"cmd/billet/ami.go", printed, false},
+		{"cmd/billet/ami.go", stream, false},
+		{"cmd/billet/ami.go", getenv, false},
+		// A LIBRARY READS ITS OWN VARIABLES, and nothing else of the process.
+		{"internal/awscreds/awscreds.go", getenv, true},
+		{"internal/awscreds/awscreds.go", stream, false},
+		{"internal/awscreds/awscreds.go", printed, false},
+		// THE STANDALONE TOOLS are operator output.
+		{"scripts/tfclassify/main.go", stream, true},
 	} {
-		if got := excluded(tc.path); got != tc.want {
-			t.Errorf("forbidigo excluded for %q = %t, want %t", tc.path, got, tc.want)
+		if got := excluded(tc.path, tc.finding); got != tc.want {
+			t.Errorf("forbidigo excluded at %q for\n  %s\n= %t, want %t", tc.path, tc.finding, got, tc.want)
 		}
 	}
 }

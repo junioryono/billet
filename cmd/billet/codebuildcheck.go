@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/codebuild"
@@ -26,7 +28,7 @@ import (
 // checkCodeBuildLive asks about. The concurrency QUOTA is not reported by either:
 // reading Service Quotas is the general cloud preflight's job, and this backend
 // consumes that rather than growing a CodeBuild-specific probe beside it.
-func printCodeBuildCeilings(cfg *config.Config) {
+func printCodeBuildCeilings(env cli.Env, cfg *config.Config) {
 	c := codebuild.CeilingsFor(*cfg.Node.CodeBuild)
 
 	shape := "on-demand compute"
@@ -34,25 +36,25 @@ func printCodeBuildCeilings(cfg *config.Config) {
 		shape = "a reserved-capacity fleet"
 	}
 
-	fmt.Printf("codebuild %s in %s, %s\n",
+	fmt.Fprintf(env.Stdout, "codebuild %s in %s, %s\n",
 		cfg.Node.CodeBuild.EnvironmentType, cfg.Node.CodeBuild.Region, shape)
 
 	// BOTH CEILINGS, AND WHOSE THEY ARE. Saying "36 hours" without saying it is
 	// CodeBuild's reads as billet imposing a limit, which is the opposite of true.
-	fmt.Printf("  ceiling  a build is capped at %s and a queued build FAILS after %s — "+
+	fmt.Fprintf(env.Stdout, "  ceiling  a build is capped at %s and a queued build FAILS after %s — "+
 		"both are CodeBuild's own limits, which billet cannot lift\n",
 		minutesText(c.BuildMinutes), minutesText(c.QueuedMinutes))
 
 	// THE THIRD CEILING IS THE ACCOUNT'S, not this node's, and it is the one that
 	// turns a burst into failed jobs: past it StartBuild is refused outright, billet
 	// reports a conclusive launch failure, and GitHub requeues at most three times.
-	fmt.Printf("  ceiling  the account queues at most %d builds across every project — a "+
+	fmt.Fprintf(env.Stdout, "  ceiling  the account queues at most %d builds across every project — a "+
 		"burst beyond the concurrency quota plus %d is refused at launch, so size "+
 		"node.max_vcpu so this node cannot escrow more than that\n",
 		config.CodeBuildAccountQueuedBuilds, config.CodeBuildAccountQueuedBuilds)
 
 	if c.BuildMinutes >= c.ServiceBuildMinutes {
-		fmt.Printf("  ceiling  that is the service maximum; work that can exceed %s belongs on "+
+		fmt.Fprintf(env.Stdout, "  ceiling  that is the service maximum; work that can exceed %s belongs on "+
 			"owned EC2 or Mac capacity, where billet imposes no job limit\n",
 			minutesText(c.ServiceBuildMinutes))
 	}
@@ -61,19 +63,19 @@ func printCodeBuildCeilings(cfg *config.Config) {
 	// reporting because it is the one thing a shorter ceiling buys: CodeBuild cannot
 	// list only active builds, so reconciliation walks recent history and stops once
 	// every build it sees is older than the service could still be running.
-	fmt.Printf("  inventory reconciliation walks %s of build history per sweep, which is what "+
+	fmt.Fprintf(env.Stdout, "  inventory reconciliation walks %s of build history per sweep, which is what "+
 		"the declared ceilings above imply; a tighter build_timeout_minutes makes it cheaper\n",
 		minutesText(c.InventoryWindowMinutes))
 
 	// UNTRUSTED WORK IS REFUSED, and it is said here rather than discovered at the
 	// first fork pull request.
-	fmt.Println("  trust    untrusted tiers are REFUSED on this backend: AWS documents a " +
-		"reserved-capacity instance as staying alive between builds and sharing cached data " +
+	fmt.Fprintln(env.Stdout, "  trust    untrusted tiers are REFUSED on this backend: AWS documents a "+
+		"reserved-capacity instance as staying alive between builds and sharing cached data "+
 		"with other projects in the account. Run untrusted tiers on firecracker or ec2")
 
 	if c.MacOS {
-		fmt.Println("  macos    reserved capacity carries an initial per-instance charge and " +
-			"bills while provisioned, whether or not anything is building; delete a fleet you " +
+		fmt.Fprintln(env.Stdout, "  macos    reserved capacity carries an initial per-instance charge and "+
+			"bills while provisioned, whether or not anything is building; delete a fleet you "+
 			"are not using")
 	}
 }
@@ -155,7 +157,7 @@ func checkDeployment(bundle *wirecert.Bundle) (string, bool) {
 // misbehaving rather than as a configuration mistake. Everything else is reported,
 // because billet overrides it on every launch and refusing a working deployment over
 // a mismatch billet already corrects is the failure ADR-005 names.
-func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecert.Bundle) error {
+func checkCodeBuildLive(ctx context.Context, env cli.Env, cfg *config.Config, bundle *wirecert.Bundle) error {
 	deployment, known := checkDeployment(bundle)
 
 	// THE PROVIDER STILL NEEDS A NON-EMPTY IDENTITY — New refuses an empty one,
@@ -178,14 +180,14 @@ func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecer
 	// concurrency limit defaults to ONE per compute type — so an operator reading
 	// this output top to bottom meets the binding constraint first. Advisory
 	// throughout; see reportQuotas.
-	reportQuotas(ctx, cfg, p)
+	reportQuotas(ctx, env, cfg, p)
 
 	project, err := p.DescribeProject(ctx)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("  project  %s (%s), source %s\n",
+	fmt.Fprintf(env.Stdout, "  project  %s (%s), source %s\n",
 		project.Name, project.EnvironmentType, project.SourceType)
 
 	var (
@@ -201,7 +203,7 @@ func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecer
 		// owner tag is right — and asserting either way would be inventing an
 		// answer. The webhook finding does not depend on the identity, so it is
 		// still made.
-		fmt.Println("  note     this host has no node certificate, so billet cannot tell which " +
+		fmt.Fprintln(env.Stdout, "  note     this host has no node certificate, so billet cannot tell which "+
 			"deployment it belongs to and did not check the project's owner tag")
 
 		if project.RunnerWebhook {
@@ -217,7 +219,7 @@ func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecer
 	}
 
 	if hasFleet {
-		fmt.Printf("  fleet    %s (%s, %s), capacity %d\n",
+		fmt.Fprintf(env.Stdout, "  fleet    %s (%s, %s), capacity %d\n",
 			fleet.Name, fleet.EnvironmentType, fleet.ComputeType, fleet.BaseCapacity)
 
 		fleetFatal, fleetWarnings := fleet.Problems(*cfg.Node.CodeBuild)
@@ -230,7 +232,7 @@ func checkCodeBuildLive(ctx context.Context, cfg *config.Config, bundle *wirecer
 	}
 
 	for _, w := range warnings {
-		fmt.Printf("  warning  %s\n", w)
+		fmt.Fprintf(env.Stdout, "  warning  %s\n", w)
 	}
 
 	if len(fatal) > 0 {

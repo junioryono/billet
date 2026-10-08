@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -63,8 +62,8 @@ var registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.
 	return store.StatusSnapshot(ctx)
 }
 
-func cmdRolloutRegistration(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet rollout registration", os.Stdout)
+func cmdRolloutRegistration(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet rollout registration", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	node := fs.String("node", "", "the node whose registration is asked about")
 	incarnation := fs.String("incarnation", "", "the incarnation the migrated node presents (32 hex characters)")
@@ -82,7 +81,7 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 	}
 
 	bad := func(why string) error {
-		return answerEndpointRefusal(endpointRefuse(endpointReasonCombination, why,
+		return answerEndpointRefusal(env, endpointRefuse(endpointReasonCombination, why,
 			"rollout registration --node N --incarnation I [--wait D] [--environment-file PATH] --json", ""))
 	}
 
@@ -110,7 +109,7 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 
 	// THE RE-EXECUTION AS THE LEDGER'S OWNER, the child's exit preserved: an
 	// answer of timeout or refused is the child's to give.
-	done, code, err := runAsLedgerOwnerCode(ctx, cfg, append([]string{"rollout", "registration"}, args...))
+	done, code, err := runAsLedgerOwnerCode(ctx, env, cfg, append([]string{"rollout", "registration"}, args...))
 	if err != nil {
 		return err
 	}
@@ -137,15 +136,15 @@ func cmdRolloutRegistration(ctx context.Context, args []string) error {
 
 	answer, timeout, r := awaitRegistration(ctx, rollout.New(db), cfg, *node, *incarnation, *wait)
 	if r != nil {
-		return answerEndpointRefusal(r)
+		return answerEndpointRefusal(env, r)
 	}
 
 	if timeout != nil {
-		return answerJSON(timeout, exitUnknown, "the ledger did not show "+*node+" registered as incarnation "+
+		return answerJSON(env, timeout, exitUnknown, "the ledger did not show "+*node+" registered as incarnation "+
 			*incarnation+" within "+wait.String())
 	}
 
-	return answerObject(answer)
+	return answerObject(env, answer)
 }
 
 // awaitRegistration polls until the node's row carries the incarnation and
@@ -263,8 +262,8 @@ func awaitRegistration(ctx context.Context, store *rollout.Store, cfg *config.Co
 // runAsLedgerOwnerCode is runAsLedgerOwner with the child's exit status
 // preserved for the caller to exit with, for a command whose non-zero exits
 // are answers (2 a refusal, 3 could-not-tell) and not failures.
-func runAsLedgerOwnerCode(ctx context.Context, cfg *config.Config, args []string) (bool, int, error) {
-	done, err := runAsLedgerOwner(ctx, cfg, args)
+func runAsLedgerOwnerCode(ctx context.Context, env cli.Env, cfg *config.Config, args []string) (bool, int, error) {
+	done, err := runAsLedgerOwner(ctx, env, cfg, args)
 
 	var coded *ledgerChildExit
 	if errors.As(err, &coded) {

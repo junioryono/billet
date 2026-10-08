@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
+
 	"github.com/junioryono/billet/internal/archivestore"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
@@ -58,20 +60,20 @@ var openArchiveStore = func(cfg *config.Config) (archiveStore, bool, error) {
 // seeing the local facts they came for. It is here because the failure it makes
 // visible is silent by construction — a timer that stopped firing looks exactly
 // like one that is working, and nothing else in billet ever looks.
-func reportBackupAge(ctx context.Context, cfg *config.Config, skipNetwork bool) {
+func reportBackupAge(ctx context.Context, env cli.Env, cfg *config.Config, skipNetwork bool) {
 	if cfg.Backup == nil || cfg.Backup.S3 == nil {
 		return
 	}
 
 	if skipNetwork {
-		fmt.Printf("backup   %s (age not checked during maintenance)\n", cfg.Backup.S3.Bucket)
+		fmt.Fprintf(env.Stdout, "backup   %s (age not checked during maintenance)\n", cfg.Backup.S3.Bucket)
 
 		return
 	}
 
 	store, _, err := openArchiveStore(cfg)
 	if err != nil {
-		fmt.Printf("backup   UNCHECKED: %v\n", err)
+		fmt.Fprintf(env.Stdout, "backup   UNCHECKED: %v\n", err)
 
 		return
 	}
@@ -85,27 +87,27 @@ func reportBackupAge(ctx context.Context, cfg *config.Config, skipNetwork bool) 
 	// host whose identity is already in trouble.
 	deployment, _, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
 	if err != nil {
-		fmt.Printf("backup   UNCHECKED: this host's deployment identity could not be read (%v),\n",
+		fmt.Fprintf(env.Stdout, "backup   UNCHECKED: this host's deployment identity could not be read (%v),\n",
 			err)
-		fmt.Printf("         so billet cannot tell which archives are its own\n")
+		fmt.Fprintf(env.Stdout, "         so billet cannot tell which archives are its own\n")
 
 		return
 	}
 
 	archives, err := store.List(ctx, deployment)
 	if err != nil {
-		fmt.Printf("backup   UNCHECKED: %v\n", err)
-		fmt.Printf("         (this says the age could not be established, not that the bucket " +
+		fmt.Fprintf(env.Stdout, "backup   UNCHECKED: %v\n", err)
+		fmt.Fprintf(env.Stdout, "         (this says the age could not be established, not that the bucket "+
 			"is empty)\n")
 
 		return
 	}
 
 	if len(archives) == 0 {
-		fmt.Printf("backup   %s holds NO archive for this deployment. An upload that was\n",
+		fmt.Fprintf(env.Stdout, "backup   %s holds NO archive for this deployment. An upload that was\n",
 			cfg.Backup.S3.Bucket)
-		fmt.Printf("         interrupted leaves no manifest, and billet will not offer such a\n")
-		fmt.Printf("         prefix as a backup — run `billet local backup --out <dir>`\n")
+		fmt.Fprintf(env.Stdout, "         interrupted leaves no manifest, and billet will not offer such a\n")
+		fmt.Fprintf(env.Stdout, "         prefix as a backup — run `billet local backup --out <dir>`\n")
 
 		return
 	}
@@ -117,7 +119,7 @@ func reportBackupAge(ctx context.Context, cfg *config.Config, skipNetwork bool) 
 		}
 	}
 
-	fmt.Printf("backup   %s, newest %s (%s old)\n", cfg.Backup.S3.Bucket, newest.Name,
+	fmt.Fprintf(env.Stdout, "backup   %s, newest %s (%s old)\n", cfg.Backup.S3.Bucket, newest.Name,
 		time.Since(newest.Modified).Round(time.Minute))
 }
 
@@ -127,19 +129,19 @@ func reportBackupAge(ctx context.Context, cfg *config.Config, skipNetwork bool) 
 // it is what an operator's own tooling picks up, what --dry-run reports on, and
 // what stays behind when the network is down. Uploading first, or uploading
 // instead, would make a backup somebody cannot see the normal case.
-func uploadArchive(ctx context.Context, cfg *config.Config, dir, deployment string) error {
+func uploadArchive(ctx context.Context, env cli.Env, cfg *config.Config, dir, deployment string) error {
 	store, configured, err := openArchiveStore(cfg)
 	if err != nil {
 		return err
 	}
 
 	if !configured {
-		fmt.Println()
-		fmt.Printf("note     this archive is on the same disk as the deployment it protects, and\n")
-		fmt.Printf("         a disk that fails takes both. Copy it off this machine — the\n")
-		fmt.Printf("         manifest's digests are there so your own tooling can verify what it\n")
-		fmt.Printf("         carried — or set backup.s3 in the config, after which billet\n")
-		fmt.Printf("         uploads what it writes and restores straight back from it.\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "note     this archive is on the same disk as the deployment it protects, and\n")
+		fmt.Fprintf(env.Stdout, "         a disk that fails takes both. Copy it off this machine — the\n")
+		fmt.Fprintf(env.Stdout, "         manifest's digests are there so your own tooling can verify what it\n")
+		fmt.Fprintf(env.Stdout, "         carried — or set backup.s3 in the config, after which billet\n")
+		fmt.Fprintf(env.Stdout, "         uploads what it writes and restores straight back from it.\n")
 
 		return nil
 	}
@@ -152,13 +154,13 @@ func uploadArchive(ctx context.Context, cfg *config.Config, dir, deployment stri
 	name := a.Name()
 	prefix := store.Prefix(deployment) + name
 
-	fmt.Println()
-	fmt.Printf("upload   %s\n", prefix)
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "upload   %s\n", prefix)
 
 	keys, err := deployarchive.Upload(ctx, a, store, prefix)
 
 	for _, key := range keys {
-		fmt.Printf("         %s\n", key)
+		fmt.Fprintf(env.Stdout, "         %s\n", key)
 	}
 
 	if err != nil {
@@ -166,18 +168,18 @@ func uploadArchive(ctx context.Context, cfg *config.Config, dir, deployment stri
 		// an operator who has a backup and one who thinks they have none. What
 		// landed in the bucket is not an archive — the manifest goes last — so
 		// nothing there can be mistaken for one either.
-		fmt.Println()
-		fmt.Printf("warn     the upload did not finish: %v\n", err)
-		fmt.Printf("         The archive in %s is COMPLETE and verified; what reached the\n", dir)
-		fmt.Printf("         bucket has no manifest, so nothing will offer it as a backup.\n")
-		fmt.Printf("         Copy it off this machine another way, or run this again.\n")
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "warn     the upload did not finish: %v\n", err)
+		fmt.Fprintf(env.Stdout, "         The archive in %s is COMPLETE and verified; what reached the\n", dir)
+		fmt.Fprintf(env.Stdout, "         bucket has no manifest, so nothing will offer it as a backup.\n")
+		fmt.Fprintf(env.Stdout, "         Copy it off this machine another way, or run this again.\n")
 
 		return err
 	}
 
-	fmt.Println()
-	fmt.Printf("Restore it on another machine with:\n")
-	fmt.Printf("\n  billet local restore --from-backup %s --dry-run\n", name)
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "Restore it on another machine with:\n")
+	fmt.Fprintf(env.Stdout, "\n  billet local restore --from-backup %s --dry-run\n", name)
 
 	return nil
 }
@@ -283,7 +285,7 @@ const backupsListed = 20
 // IT RUNS BEFORE ANYTHING TOUCHES THE TARGET, so a bucket that cannot be
 // reached, an archive that is not there, or a name two deployments both answer
 // to all fail with the host exactly as it was — no lock, no fence, no journal.
-func fetchFromBackup(ctx context.Context, cfg *config.Config, o restoreOptions) (string, error) {
+func fetchFromBackup(ctx context.Context, env cli.Env, cfg *config.Config, o restoreOptions) (string, error) {
 	store, configured, err := openArchiveStore(cfg)
 	if err != nil {
 		return "", err
@@ -300,14 +302,14 @@ func fetchFromBackup(ctx context.Context, cfg *config.Config, o restoreOptions) 
 		return "", err
 	}
 
-	dir, err := fetchBackup(ctx, store, chosen, o.into, cfg.Server.IdentityDir)
+	dir, err := fetchBackup(ctx, env, store, chosen, o.into, cfg.Server.IdentityDir)
 	if err != nil {
 		return "", err
 	}
 
-	fmt.Printf("fetched  deployment %s, uploaded %s\n", chosen.Deployment,
+	fmt.Fprintf(env.Stdout, "fetched  deployment %s, uploaded %s\n", chosen.Deployment,
 		chosen.Modified.UTC().Format("2006-01-02 15:04:05Z"))
-	fmt.Printf("         this copy is KEPT at %s\n\n", dir)
+	fmt.Fprintf(env.Stdout, "         this copy is KEPT at %s\n\n", dir)
 
 	return dir, nil
 }
@@ -319,7 +321,7 @@ func fetchFromBackup(ctx context.Context, cfg *config.Config, o restoreOptions) 
 // from it would take away the only one they have, and the restore is the moment
 // they are least able to fetch it again.
 func fetchBackup(
-	ctx context.Context, store archiveStore, chosen archivestore.Archive, dest, stateDir string,
+	ctx context.Context, env cli.Env, store archiveStore, chosen archivestore.Archive, dest, stateDir string,
 ) (string, error) {
 	if dest == "" {
 		// A SIBLING OF THE STATE DIRECTORY, not a temporary: this holds two
@@ -372,7 +374,7 @@ func fetchBackup(
 			return "", err
 		}
 
-		fmt.Printf("have     %s is already this archive; it is not fetched again\n\n", abs)
+		fmt.Fprintf(env.Stdout, "have     %s is already this archive; it is not fetched again\n\n", abs)
 
 		return abs, nil
 	}
@@ -384,8 +386,8 @@ func fetchBackup(
 		return "", err
 	}
 
-	fmt.Printf("fetch    %s\n", prefix)
-	fmt.Printf("         into %s\n\n", abs)
+	fmt.Fprintf(env.Stdout, "fetch    %s\n", prefix)
+	fmt.Fprintf(env.Stdout, "         into %s\n\n", abs)
 
 	if _, err := deployarchive.Fetch(ctx, store, prefix, abs); err != nil {
 		return "", err

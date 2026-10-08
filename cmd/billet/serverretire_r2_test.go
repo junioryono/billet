@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -27,10 +28,10 @@ func TestServerRetireDrainsAnOversizedDocumentBeforeRefusing(t *testing.T) {
 	r, w, err := os.Pipe()
 	mustOK(t, err)
 
-	saved := retireStdin
-	retireStdin = r
+	saved := testStdin
+	testStdin = r
 
-	t.Cleanup(func() { retireStdin = saved })
+	t.Cleanup(func() { testStdin = saved })
 
 	written := make(chan error, 1)
 
@@ -57,7 +58,7 @@ func TestServerRetireDrainsAnOversizedDocumentBeforeRefusing(t *testing.T) {
 	var runErr error
 
 	out := capture(t, func() {
-		runErr = cmdServer(t.Context(), nil, []string{"retire", "--json", "--config", f.cfg, "--complete-row", "--run", "ci-b",
+		runErr = cmdServer(t.Context(), processEnv(), nil, []string{"retire", "--json", "--config", f.cfg, "--complete-row", "--run", "ci-b",
 			"--as-host", "control-b", "--completion", "-"})
 	})
 
@@ -80,10 +81,10 @@ func TestServerRetireDrainsStdinBeforeAnEarlyRefusal(t *testing.T) {
 	r, w, err := os.Pipe()
 	mustOK(t, err)
 
-	saved := retireStdin
-	retireStdin = r
+	saved := testStdin
+	testStdin = r
 
-	t.Cleanup(func() { retireStdin = saved })
+	t.Cleanup(func() { testStdin = saved })
 
 	written := make(chan error, 1)
 
@@ -111,7 +112,7 @@ func TestServerRetireDrainsStdinBeforeAnEarlyRefusal(t *testing.T) {
 	var runErr error
 
 	out := capture(t, func() {
-		runErr = cmdServer(t.Context(), nil, []string{"retire", "--json", "--config", f.cfg, "--input", "-", "--run", "ci-1",
+		runErr = cmdServer(t.Context(), processEnv(), nil, []string{"retire", "--json", "--config", f.cfg, "--input", "-", "--run", "ci-1",
 			"--retiring-host", "control-a"})
 	})
 
@@ -253,7 +254,7 @@ func TestServerRetireDryRunReadsTheRowAsTheLedgersOwner(t *testing.T) {
 
 	var seen []string
 
-	retireReexecCapture = func(_ context.Context, uid, gid uint32, args []string) ([]byte, int, error) {
+	retireReexecCapture = func(_ context.Context, _ cli.Env, uid, gid uint32, args []string) ([]byte, int, error) {
 		if uid != 990 || gid != 991 {
 			t.Errorf("re-executed as %d:%d, want 990:991", uid, gid)
 		}
@@ -281,7 +282,7 @@ func TestServerRetireDryRunReadsTheRowAsTheLedgersOwner(t *testing.T) {
 
 	// The owner's report bound to another deployment is unreadable, never a
 	// row of this host.
-	retireReexecCapture = func(context.Context, uint32, uint32, []string) ([]byte, int, error) {
+	retireReexecCapture = func(context.Context, cli.Env, uint32, uint32, []string) ([]byte, int, error) {
 		report := rolloutStatusReport{Schema: rolloutStatusSchema, Deployment: rolloutStatusDeployment{Bound: true,
 			ID: strings.Repeat("e", 32)}, Nodes: []rolloutStatusNode{}, Registrations: []rolloutStatusRegistration{}}
 
@@ -410,11 +411,11 @@ func TestServerRetireDryRunReadsAnUnboundLedgerAsUnreadable(t *testing.T) {
 	// Opened once so the ledger exists, never claimed: unbound.
 	statusPlane(t, f.stateDir, func(*state.DB) {})
 
-	savedNow, savedID, savedStdin := retireNow, retireTransitionID, retireStdin
+	savedNow, savedID, savedStdin := retireNow, retireTransitionID, testStdin
 	retireNow = func() time.Time { return time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC) }
 	retireTransitionID = func() (string, error) { return retireTestID, nil }
 
-	t.Cleanup(func() { retireNow, retireTransitionID, retireStdin = savedNow, savedID, savedStdin })
+	t.Cleanup(func() { retireNow, retireTransitionID, testStdin = savedNow, savedID, savedStdin })
 
 	out, _ := f.run(t, "", "--dry-run", "--retiring-host", "control-a")
 	if m := retireAnswer(t, out); m["row_fact"] != string(retirement.RowUnreadable) ||
@@ -532,8 +533,8 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			reader := newBlockingReader(c.prefix)
 
-			savedStdin := retireStdin
-			retireStdin = reader
+			savedStdin := testStdin
+			testStdin = reader
 
 			// RELEASED AND JOINED BEFORE THE SEAM IS RESTORED, so no child of
 			// this case is still reading when the next one installs its own.
@@ -541,7 +542,7 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 				reader.releaseOnce()
 				reader.wait(t)
 
-				retireStdin = savedStdin
+				testStdin = savedStdin
 			})
 
 			var (
@@ -555,7 +556,7 @@ func TestServerRetireDrainsUnderADeadline(t *testing.T) {
 			// its answer into another test's pipe.
 			out = capture(t, func() {
 				go func() {
-					answered <- cmdServer(t.Context(), nil, append([]string{"retire", "--json", "--config", f.cfg}, c.args...))
+					answered <- cmdServer(t.Context(), processEnv(), nil, append([]string{"retire", "--json", "--config", f.cfg}, c.args...))
 				}()
 
 				select {

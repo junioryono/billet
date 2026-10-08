@@ -76,7 +76,7 @@ func TestARootRestoreHandsTheWholeDeploymentToTheServiceAccount(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local restore: %v", err)
@@ -143,7 +143,7 @@ func TestARestoreThatIsNotRootChangesNoOwnership(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("billet local restore: %v", err)
@@ -173,7 +173,7 @@ func TestAFailedOwnershipRepairDoesNotFailTheRestore(t *testing.T) {
 
 	clearAppKey(t, tgt)
 
-	if err := cmdLocalRestore(t.Context(), []string{
+	if err := cmdLocalRestore(t.Context(), processEnv(), []string{
 		"--config", tgt.configPath, "--from", archive, "--old-controller-fenced",
 	}); err != nil {
 		t.Fatalf("a restore that published everything reported failure over ownership: %v", err)

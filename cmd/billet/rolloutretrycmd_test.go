@@ -87,7 +87,7 @@ func TestRolloutRetryReturnsABlockedHostToTheRollout(t *testing.T) {
 	}
 
 	capture(t, func() {
-		if err := cmdRollout(t.Context(), []string{"retry", "--config", cfgPath, node}); err != nil {
+		if err := cmdRollout(t.Context(), processEnv(), []string{"retry", "--config", cfgPath, node}); err != nil {
 			t.Fatalf("billet rollout retry: %v", err)
 		}
 	})
@@ -112,7 +112,7 @@ func TestRolloutExemptIsNotTheSameDecisionAsRetry(t *testing.T) {
 	store, cfgPath, rolloutID := blockedRollout(t, node)
 
 	capture(t, func() {
-		if err := cmdRollout(t.Context(), []string{
+		if err := cmdRollout(t.Context(), processEnv(), []string{
 			"exempt", "--config", cfgPath, "--reason", "being replaced", node,
 		}); err != nil {
 			t.Fatalf("billet rollout exempt: %v", err)

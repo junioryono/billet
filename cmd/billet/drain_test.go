@@ -53,7 +53,7 @@ func TestDrainSealsTheDeploymentWithAnOperatorProvenance(t *testing.T) {
 	db, cfg := drainFixture(t)
 
 	out := capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg, "--reason", "replacing a disk"}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg, "--reason", "replacing a disk"}); err != nil {
 			t.Errorf("drain: %v", err)
 		}
 	})
@@ -93,7 +93,7 @@ func TestASecondDrainDoesNotMoveTheGeneration(t *testing.T) {
 	db, cfg := drainFixture(t)
 
 	capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg, "--reason", "first"}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg, "--reason", "first"}); err != nil {
 			t.Errorf("first drain: %v", err)
 		}
 	})
@@ -101,7 +101,7 @@ func TestASecondDrainDoesNotMoveTheGeneration(t *testing.T) {
 	first := admissionNow(t, db)
 
 	out := capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("second drain: %v", err)
 		}
 	})
@@ -128,13 +128,13 @@ func TestADrainThatKeepsAnExistingSealSaysTheReasonWasNotRecorded(t *testing.T) 
 	db, cfg := drainFixture(t)
 
 	capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg, "--reason", "first"}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg, "--reason", "first"}); err != nil {
 			t.Errorf("first drain: %v", err)
 		}
 	})
 
 	out := capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg, "--reason", "second"}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg, "--reason", "second"}); err != nil {
 			t.Errorf("second drain: %v", err)
 		}
 	})
@@ -162,7 +162,7 @@ func TestDrainEscalatesAShutdownSealSoARestartWillNotReopenIt(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("drain: %v", err)
 		}
 	})
@@ -191,7 +191,7 @@ func TestResumeRefusesAShutdownSealAndLeavesItInPlace(t *testing.T) {
 
 	before := admissionNow(t, db)
 
-	err := cmdResume(t.Context(), []string{"--config", cfg})
+	err := cmdResume(t.Context(), processEnv(), []string{"--config", cfg})
 	if err == nil {
 		t.Fatal("resume cleared a shutdown's seal, reopening admission onto services that " +
 			"are stopping")
@@ -219,13 +219,13 @@ func TestResumeClearsAnOperatorSeal(t *testing.T) {
 	db, cfg := drainFixture(t)
 
 	capture(t, func() {
-		if err := cmdDrain(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdDrain(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("drain: %v", err)
 		}
 	})
 
 	capture(t, func() {
-		if err := cmdResume(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdResume(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("resume: %v", err)
 		}
 	})
@@ -243,7 +243,7 @@ func TestResumingAnOpenDeploymentDoesNotMoveTheGeneration(t *testing.T) {
 	before := admissionNow(t, db)
 
 	capture(t, func() {
-		if err := cmdResume(t.Context(), []string{"--config", cfg}); err != nil {
+		if err := cmdResume(t.Context(), processEnv(), []string{"--config", cfg}); err != nil {
 			t.Errorf("resume: %v", err)
 		}
 	})
@@ -306,7 +306,7 @@ func TestDrainWaitReturnsWhenTheDeploymentHoldsNothing(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		if err := cmdDrain(ctx, []string{"--config", cfg, "--wait"}); err != nil {
+		if err := cmdDrain(ctx, processEnv(), []string{"--config", cfg, "--wait"}); err != nil {
 			t.Errorf("drain --wait: %v", err)
 		}
 	})
@@ -337,7 +337,7 @@ func TestDrainWaitTimesOutWithItsOwnStatusAndKeepsTheSeal(t *testing.T) {
 	defer cancel()
 
 	out := capture(t, func() {
-		err := cmdDrain(ctx, []string{"--config", cfgPath, "--wait", "--timeout", "1s"})
+		err := cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait", "--timeout", "1s"})
 		if err == nil {
 			t.Error("a drain with a job still running reported success")
 
@@ -413,7 +413,7 @@ func TestDrainWaitReturnsOnceTheRunningWorkIsReleased(t *testing.T) {
 	// that here would be waiting for a process this test never starts, and the
 	// second stage has tests of its own.
 	out := capture(t, func() {
-		if err := cmdDrain(ctx, []string{
+		if err := cmdDrain(ctx, processEnv(), []string{
 			"--config", cfgPath, "--wait", "--without-compute-proof",
 		}); err != nil {
 			t.Errorf("drain --wait: %v", err)
@@ -466,7 +466,7 @@ func TestDrainWaitStopsIfSomebodyReopensAdmission(t *testing.T) {
 
 	var got error
 
-	out := capture(t, func() { got = cmdDrain(ctx, []string{"--config", cfgPath, "--wait"}) })
+	out := capture(t, func() { got = cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"}) })
 
 	<-reopened
 
@@ -518,7 +518,7 @@ func waitUntilSealed(t *testing.T, db *state.DB, budget time.Duration) state.Adm
 func TestTheSealIsAttributedToTheInvokingPersonRatherThanRoot(t *testing.T) {
 	t.Setenv("SUDO_USER", "aisha")
 
-	if got := actor(); !strings.HasPrefix(got, "aisha") {
+	if got := actor(processEnv()); !strings.HasPrefix(got, "aisha") {
 		t.Errorf("actor() is %q, want the invoking person; a seal attributed to root gives "+
 			"the next operator nobody to ask", got)
 	}
@@ -551,7 +551,7 @@ func TestInterruptingAWaitDoesNotReportTheDeploymentDrained(t *testing.T) {
 
 	var got error
 
-	capture(t, func() { got = cmdDrain(ctx, []string{"--config", cfgPath, "--wait"}) })
+	capture(t, func() { got = cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"}) })
 
 	<-stop
 
@@ -593,7 +593,7 @@ func TestResumeOnAnUnreadableRowAsksForItToBeRepaired(t *testing.T) {
 		t.Skipf("the fixture did not reach the case: mode is %v", got.Mode)
 	}
 
-	err := cmdResume(t.Context(), []string{"--config", cfgPath})
+	err := cmdResume(t.Context(), processEnv(), []string{"--config", cfgPath})
 	if err == nil {
 		t.Fatal("resume opened an admission row billet cannot read")
 	}
@@ -629,7 +629,7 @@ func TestDrainRefusesATimeoutThatWouldNotBound(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := cmdDrain(t.Context(), append([]string{"--config", cfgPath}, tc.args...))
+			err := cmdDrain(t.Context(), processEnv(), append([]string{"--config", cfgPath}, tc.args...))
 			if err == nil {
 				t.Fatalf("a %s timeout was accepted", tc.name)
 			}
@@ -710,7 +710,7 @@ func TestDrainWaitAbortsWhenAdmissionIsResealedBySomebodyElse(t *testing.T) {
 
 	var got error
 
-	capture(t, func() { got = cmdDrain(ctx, []string{"--config", cfgPath, "--wait"}) })
+	capture(t, func() { got = cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait"}) })
 
 	<-moved
 
@@ -762,7 +762,7 @@ func TestAWaitThatCannotReadTheLedgerFailsRatherThanReportingATimeout(t *testing
 	var got error
 
 	capture(t, func() {
-		got = cmdDrain(ctx, []string{"--config", cfgPath, "--wait", "--timeout", "25s"})
+		got = cmdDrain(ctx, processEnv(), []string{"--config", cfgPath, "--wait", "--timeout", "25s"})
 	})
 
 	<-broken

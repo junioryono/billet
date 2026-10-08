@@ -99,7 +99,7 @@ func (f recordFixture) args() []string {
 func TestReleaseRecordWritesWhatTheManifestNames(t *testing.T) {
 	f := buildRecordFixture(t)
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err != nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err != nil {
 		t.Fatalf("recording an install the manifest names: %v", err)
 	}
 
@@ -168,7 +168,7 @@ func TestReleaseRecordRefusesAnArchiveTheManifestDoesNotName(t *testing.T) {
 		t.Fatalf("substitute the archive: %v", err)
 	}
 
-	err = cmdReleaseRecord(t.Context(), f.args())
+	err = cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive the manifest does not name was recorded as its product")
 	}
@@ -194,7 +194,7 @@ func TestReleaseRecordRefusesADocumentItCannotRead(t *testing.T) {
 		t.Fatalf("damage the manifest: %v", err)
 	}
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err == nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err == nil {
 		t.Fatal("a document that is not a usable manifest was accepted")
 	}
 
@@ -220,7 +220,7 @@ func TestReleaseRecordRefusesAManifestForAnotherPlatform(t *testing.T) {
 		t.Fatalf("rewrite the manifest: %v", err)
 	}
 
-	if err := cmdReleaseRecord(t.Context(), f.args()); err == nil {
+	if err := cmdReleaseRecord(t.Context(), processEnv(), f.args()); err == nil {
 		t.Fatal("a manifest publishing nothing for this machine was accepted as what " +
 			"produced its binary")
 	}
@@ -287,7 +287,7 @@ func TestReleaseRecordRefusesABinaryTheArchiveDoesNotCarry(t *testing.T) {
 		t.Fatalf("substitute the binary: %v", err)
 	}
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("a binary the archive does not carry was recorded as its product")
 	}
@@ -316,7 +316,7 @@ func TestReleaseRecordRefusesAnArchiveWithNoBillet(t *testing.T) {
 
 	repointManifest(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive carrying no billet was accepted as what produced one")
 	}
@@ -409,7 +409,7 @@ func TestReleaseRecordRefusesAnArchiveWhoseBilletIsALink(t *testing.T) {
 
 	repointManifest(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an archive whose billet is a link was accepted as carrying one")
 	}
@@ -471,7 +471,7 @@ func TestReleaseRecordRefusesAnEmptyBinary(t *testing.T) {
 		t.Fatalf("empty the binary: %v", err)
 	}
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("an empty billet was recorded as what a manifest produced")
 	}
@@ -502,7 +502,7 @@ func TestReleaseRecordRefusesAMemberLargerThanItWillRead(t *testing.T) {
 
 	repointManifest(t, f)
 
-	err := cmdReleaseRecord(t.Context(), f.args())
+	err := cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("a member larger than billet will read was accepted")
 	}
@@ -571,7 +571,7 @@ func TestReleaseRecordRefusesAManifestThatContradictsItself(t *testing.T) {
 		t.Fatalf("write the manifest: %v", err)
 	}
 
-	err = cmdReleaseRecord(t.Context(), f.args())
+	err = cmdReleaseRecord(t.Context(), processEnv(), f.args())
 	if err == nil {
 		t.Fatal("a manifest whose size and hash describe different files was accepted")
 	}
@@ -612,7 +612,7 @@ func TestReleaseRecordRefusesAPathThatWouldMakeItWait(t *testing.T) {
 			// and a test that hangs is the failure being described.
 			done := make(chan error, 1)
 
-			go func() { done <- cmdReleaseRecord(t.Context(), tc.args) }()
+			go func() { done <- cmdReleaseRecord(t.Context(), processEnv(), tc.args) }()
 
 			select {
 			case err := <-done:

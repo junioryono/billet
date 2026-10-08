@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"text/tabwriter"
 	"time"
 
@@ -29,29 +28,29 @@ import (
 // version edit. Everything under this command either creates that decision,
 // reports where it has got to, or records an operator's judgement about a
 // component the rollout cannot resolve by itself.
-func cmdRollout(ctx context.Context, args []string) error {
+func cmdRollout(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 || args[0] == "status" {
 		rest := args
 		if len(args) > 0 {
 			rest = args[1:]
 		}
 
-		return cmdRolloutStatus(ctx, rest)
+		return cmdRolloutStatus(ctx, env, rest)
 	}
 
 	switch args[0] {
 	case "start":
-		return cmdRolloutStart(ctx, args[1:])
+		return cmdRolloutStart(ctx, env, args[1:])
 	case "abort":
-		return cmdRolloutAbort(ctx, args[1:])
+		return cmdRolloutAbort(ctx, env, args[1:])
 	case "retry":
-		return cmdRolloutNodePhase(ctx, args[1:], rollout.PhasePending, "retry")
+		return cmdRolloutNodePhase(ctx, env, args[1:], rollout.PhasePending, "retry")
 	case "exempt":
-		return cmdRolloutNodePhase(ctx, args[1:], rollout.PhaseExempt, "exempt")
+		return cmdRolloutNodePhase(ctx, env, args[1:], rollout.PhaseExempt, "exempt")
 	case "decommission":
-		return cmdRolloutNodePhase(ctx, args[1:], rollout.PhaseDecommissioned, "decommission")
+		return cmdRolloutNodePhase(ctx, env, args[1:], rollout.PhaseDecommissioned, "decommission")
 	case "registration":
-		return cmdRolloutRegistration(ctx, args[1:])
+		return cmdRolloutRegistration(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown rollout command %q; try status, start, abort, retry, exempt, "+
@@ -98,8 +97,8 @@ func rolloutStore(ctx context.Context, cfgPath string,
 // channel that advances later must not retarget a rollout already underway —
 // which is why nothing downstream ever consults the channel again, and why the
 // record carries the manifest's digest rather than only its tag.
-func cmdRolloutStart(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet rollout start", os.Stdout)
+func cmdRolloutStart(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet rollout start", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve, e.g. stable or candidate")
@@ -169,7 +168,7 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 	// problem rather than the one refusal that explains all of it.
 	warnings, err := releasesource.Compatibility(target, current)
 	for _, w := range warnings {
-		fmt.Printf("NOTE: %v\n\n", w)
+		fmt.Fprintf(env.Stdout, "NOTE: %v\n\n", w)
 	}
 
 	// A REFUSAL IS A REFUSAL WHATEVER ELSE CAME BACK. See the comment in
@@ -199,7 +198,7 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 			FailureBudget:  *failureBudget,
 			AllowDowngrade: *allowDowngrade,
 		},
-		CreatedBy: actor(),
+		CreatedBy: actor(env),
 		Nodes:     names,
 	})
 	if err != nil {
@@ -210,14 +209,14 @@ func cmdRolloutStart(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Rollout %s: %s -> %s\n", recorded.ID, recorded.PriorVersion,
+	fmt.Fprintf(env.Stdout, "Rollout %s: %s -> %s\n", recorded.ID, recorded.PriorVersion,
 		recorded.TargetVersion)
-	fmt.Printf("  manifest %s\n", recorded.TargetDigest)
-	fmt.Printf("  %d host(s), %d at a time\n", len(names), recorded.Policy.Cohort)
-	fmt.Printf("\nThe control plane picks this up and converges the fleet. Nothing here\n")
-	fmt.Printf("drains or installs: a rollout waits for the work already running on a host\n")
-	fmt.Printf("for as long as it takes, and no elapsed time ever ends a job.\n")
-	fmt.Printf("\nWatch it with `billet rollout status`.\n")
+	fmt.Fprintf(env.Stdout, "  manifest %s\n", recorded.TargetDigest)
+	fmt.Fprintf(env.Stdout, "  %d host(s), %d at a time\n", len(names), recorded.Policy.Cohort)
+	fmt.Fprintf(env.Stdout, "\nThe control plane picks this up and converges the fleet. Nothing here\n")
+	fmt.Fprintf(env.Stdout, "drains or installs: a rollout waits for the work already running on a host\n")
+	fmt.Fprintf(env.Stdout, "for as long as it takes, and no elapsed time ever ends a job.\n")
+	fmt.Fprintf(env.Stdout, "\nWatch it with `billet rollout status`.\n")
 
 	return nil
 }
@@ -291,8 +290,8 @@ func channelOrPin(channel, pin string) string {
 // owner when run as root: a status read is what a converge's check job runs
 // on every controller, and one that migrated, locked, minted or left a
 // root-owned file behind would hand the converge a host the check changed.
-func cmdRolloutStatus(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet rollout status", os.Stdout)
+func cmdRolloutStatus(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet rollout status", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	asJSON := fs.Bool("json", false, "print the report as JSON: the rollout, its hosts with the "+
 		"reason their last dispatch was refused, every host's current registration, and the "+
@@ -318,7 +317,7 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 	// A REFUSAL TO DECIDE IS A REFUSAL: an owner that could not be read is not
 	// "run in place", or root would run the report over a directory it could
 	// not judge and leave its sidecars there.
-	done, err := runAsLedgerOwner(ctx, cfg, append([]string{"rollout", "status"}, args...))
+	done, err := runAsLedgerOwner(ctx, env, cfg, append([]string{"rollout", "status"}, args...))
 	if err != nil || done {
 		return err
 	}
@@ -354,10 +353,10 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 			return err
 		}
 
-		return printRolloutStatusJSON(report)
+		return printRolloutStatusJSON(env, report)
 	}
 
-	if err := printRetirementRow(ctx, db); err != nil {
+	if err := printRetirementRow(ctx, env, db); err != nil {
 		return err
 	}
 
@@ -367,29 +366,29 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 			return err
 		}
 
-		return reportLastRollout(ctx, store)
+		return reportLastRollout(ctx, env, store)
 	}
 
-	fmt.Printf("rollout   %s  %s -> %s\n", current.ID, current.PriorVersion,
+	fmt.Fprintf(env.Stdout, "rollout   %s  %s -> %s\n", current.ID, current.PriorVersion,
 		current.TargetVersion)
 
 	if current.Channel != "" {
-		fmt.Printf("          following the %s channel; the target is pinned to the manifest "+
+		fmt.Fprintf(env.Stdout, "          following the %s channel; the target is pinned to the manifest "+
 			"below and does not move if the channel does\n", current.Channel)
 	} else {
-		fmt.Printf("          started from an exact version pin\n")
+		fmt.Fprintf(env.Stdout, "          started from an exact version pin\n")
 	}
 
-	fmt.Printf("          manifest %s\n", current.TargetDigest)
-	fmt.Printf("          started by %s at %s\n", current.CreatedBy, current.CreatedAt)
-	fmt.Printf("controller %s\n", current.ControllerPhase)
+	fmt.Fprintf(env.Stdout, "          manifest %s\n", current.TargetDigest)
+	fmt.Fprintf(env.Stdout, "          started by %s at %s\n", current.CreatedBy, current.CreatedAt)
+	fmt.Fprintf(env.Stdout, "controller %s\n", current.ControllerPhase)
 
 	nodes, err := store.Nodes(ctx, current.ID)
 	if err != nil {
 		return err
 	}
 
-	printRolloutNodes(nodes)
+	printRolloutNodes(env, nodes)
 
 	return nil
 }
@@ -416,15 +415,15 @@ func cmdRolloutStatus(ctx context.Context, args []string) error {
 // written is a decision an operator made to stop expecting that host, not a claim
 // that billet proved anything, and `store.Advance` still refuses a name that is
 // not part of this rollout.
-func forgetHost(ctx context.Context, a *alloc.Allocator, node string, force bool) error {
+func forgetHost(ctx context.Context, env cli.Env, a *alloc.Allocator, node string, force bool) error {
 	proven, err := a.Decommission(ctx, alloc.DecommissionRequest{
-		Node: node, Actor: actor(), Force: force,
+		Node: node, Actor: actor(env), Force: force,
 	})
 
 	switch {
 	case err == nil:
 		if !proven {
-			fmt.Printf("Nothing proved %s is running no compute, so the exclusion is "+
+			fmt.Fprintf(env.Stdout, "Nothing proved %s is running no compute, so the exclusion is "+
 				"recorded as UNPROVEN\nand every later drain will say so.\n\n", node)
 		}
 
@@ -440,7 +439,7 @@ func forgetHost(ctx context.Context, a *alloc.Allocator, node string, force bool
 			return err
 		}
 
-		fmt.Printf("This deployment already has no row for %q; recording the decision so "+
+		fmt.Fprintf(env.Stdout, "This deployment already has no row for %q; recording the decision so "+
 			"the rollout can complete.\n\n", node)
 
 		return nil
@@ -472,7 +471,7 @@ func hostIsRegistered(ctx context.Context, a *alloc.Allocator, node string) (boo
 // operator reading the rollout should see that first. Nothing is printed when
 // the ledger is unbound or holds no row; a read that fails is the command's
 // error, never a silent omission.
-func printRetirementRow(ctx context.Context, db *state.DB) error {
+func printRetirementRow(ctx context.Context, env cli.Env, db *state.DB) error {
 	binding, err := db.DeploymentBinding(ctx)
 	if err != nil || binding == "" {
 		return err
@@ -483,23 +482,23 @@ func printRetirementRow(ctx context.Context, db *state.DB) error {
 		return err
 	}
 
-	fmt.Printf("retirement %s -> %s is %s (transition %s, reserved %s by run %s)\n",
+	fmt.Fprintf(env.Stdout, "retirement %s -> %s is %s (transition %s, reserved %s by run %s)\n",
 		row.Retiring, row.Survivor, row.State, row.TransitionID, row.ReservedAt, row.Run)
 
 	if row.State == state.RetirementDone {
-		fmt.Printf("           completed by %s at %s; this deployment has no survivor for a second retirement\n",
+		fmt.Fprintf(env.Stdout, "           completed by %s at %s; this deployment has no survivor for a second retirement\n",
 			row.CompletedBy, row.CompletedAt)
 	}
 
 	return nil
 }
 
-func printRolloutNodes(nodes []rollout.Node) {
+func printRolloutNodes(env cli.Env, nodes []rollout.Node) {
 	if len(nodes) == 0 {
 		return
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	w := tabwriter.NewWriter(env.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "NODE\tPHASE\tPROVED BY\tATTEMPTS\tNEXT TRY\tDETAIL")
 
 	var converged, decided, unproved int
@@ -545,14 +544,14 @@ func printRolloutNodes(nodes []rollout.Node) {
 
 	_ = w.Flush()
 
-	fmt.Printf("\n%d of %d host(s) converged", converged, len(nodes))
+	fmt.Fprintf(env.Stdout, "\n%d of %d host(s) converged", converged, len(nodes))
 
 	if unproved > 0 {
 		// SAID SEPARATELY, BECAUSE IT IS A WEAKER CLAIM THAN THE LINE ABOVE. Those
 		// hosts reached the target VERSION and could not say which bytes they
 		// installed — which is every host in the field until one billet-driven
 		// upgrade has run, and is exactly the thing that used to be invisible.
-		fmt.Printf("; %d on their version alone, having named no release manifest", unproved)
+		fmt.Fprintf(env.Stdout, "; %d on their version alone, having named no release manifest", unproved)
 	}
 
 	if decided > 0 {
@@ -560,10 +559,10 @@ func printRolloutNodes(nodes []rollout.Node) {
 		// decommissioned host lets the rollout complete and is still running the
 		// old release; folding it into "converged" is how a protocol gets retired
 		// while a live machine still needs it.
-		fmt.Printf("; %d decided by an operator and still on the old release", decided)
+		fmt.Fprintf(env.Stdout, "; %d decided by an operator and still on the old release", decided)
 	}
 
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 }
 
 // describeProof says what a rollout accepted as evidence for one host.
@@ -584,26 +583,26 @@ func describeProof(n *rollout.Node) string {
 	}
 }
 
-func reportLastRollout(ctx context.Context, store *rollout.Store) error {
+func reportLastRollout(ctx context.Context, env cli.Env, store *rollout.Store) error {
 	history, err := store.History(ctx, 1)
 	if err != nil {
 		return err
 	}
 
 	if len(history) == 0 {
-		fmt.Printf("No rollout has ever run on this deployment.\n")
-		fmt.Printf("\n`billet rollout start` resolves the stable channel to one immutable\n")
-		fmt.Printf("release and records it as the fleet's target.\n")
+		fmt.Fprintf(env.Stdout, "No rollout has ever run on this deployment.\n")
+		fmt.Fprintf(env.Stdout, "\n`billet rollout start` resolves the stable channel to one immutable\n")
+		fmt.Fprintf(env.Stdout, "release and records it as the fleet's target.\n")
 
 		return nil
 	}
 
 	last := history[0]
-	fmt.Printf("No rollout is running. The last one was %s: %s -> %s, %s at %s\n",
+	fmt.Fprintf(env.Stdout, "No rollout is running. The last one was %s: %s -> %s, %s at %s\n",
 		last.ID, last.PriorVersion, last.TargetVersion, last.State, last.FinishedAt)
 
 	if last.TerminalReason != "" {
-		fmt.Printf("  %s\n", last.TerminalReason)
+		fmt.Fprintf(env.Stdout, "  %s\n", last.TerminalReason)
 	}
 
 	return nil
@@ -619,13 +618,13 @@ func reportLastRollout(ctx context.Context, store *rollout.Store) error {
 // IT NEVER FAILS THE COMMAND. `billet status` is what somebody runs when
 // something is already wrong, and a ledger read that failed must not take the
 // rest of the report with it.
-func printRollout(ctx context.Context, db *state.DB) {
+func printRollout(ctx context.Context, env cli.Env, db *state.DB) {
 	store := rollout.New(db)
 
 	current, err := store.Open(ctx)
 	if err != nil {
 		if !errors.Is(err, rollout.ErrNoRollout) {
-			fmt.Printf("rollout   unavailable: %v\n", err)
+			fmt.Fprintf(env.Stdout, "rollout   unavailable: %v\n", err)
 		}
 
 		return
@@ -633,7 +632,7 @@ func printRollout(ctx context.Context, db *state.DB) {
 
 	nodes, err := store.Nodes(ctx, current.ID)
 	if err != nil {
-		fmt.Printf("rollout   %s -> %s (could not read its hosts: %v)\n",
+		fmt.Fprintf(env.Stdout, "rollout   %s -> %s (could not read its hosts: %v)\n",
 			current.PriorVersion, current.TargetVersion, err)
 
 		return
@@ -652,7 +651,7 @@ func printRollout(ctx context.Context, db *state.DB) {
 		}
 	}
 
-	fmt.Printf("rollout   %s IN PROGRESS: %s -> %s, %d of %d host(s) converged\n",
+	fmt.Fprintf(env.Stdout, "rollout   %s IN PROGRESS: %s -> %s, %d of %d host(s) converged\n",
 		current.ID, current.PriorVersion, current.TargetVersion, converged, len(nodes))
 
 	// THE TWO NUMBERS THAT CHANGE WHAT AN OPERATOR DOES NEXT. A blocked host needs
@@ -660,17 +659,17 @@ func printRollout(ctx context.Context, db *state.DB) {
 	// old release, which is why the fleet is mixed and why a protocol is still
 	// open.
 	if blocked > 0 {
-		fmt.Printf("          %d host(s) BLOCKED and advertising nothing; "+
+		fmt.Fprintf(env.Stdout, "          %d host(s) BLOCKED and advertising nothing; "+
 			"`billet rollout status` says why\n", blocked)
 	}
 
 	if decided > 0 {
-		fmt.Printf("          %d exempted or decommissioned by an operator and staying on "+
+		fmt.Fprintf(env.Stdout, "          %d exempted or decommissioned by an operator and staying on "+
 			"the old release\n", decided)
 	}
 
 	if current.ControllerPhase != rollout.PhaseCommitted {
-		fmt.Printf("          the control plane itself is %s\n", current.ControllerPhase)
+		fmt.Fprintf(env.Stdout, "          the control plane itself is %s\n", current.ControllerPhase)
 	}
 }
 
@@ -680,8 +679,8 @@ func printRollout(ctx context.Context, db *state.DB) {
 // converged and components midway through an install finish or roll back on their
 // own; what ends is billet's intent to move anything else. A command that also
 // reverted hosts would be a second, undeclared rollout in the opposite direction.
-func cmdRolloutAbort(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet rollout abort", os.Stdout)
+func cmdRolloutAbort(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet rollout abort", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "why this rollout is being abandoned")
 
@@ -710,18 +709,18 @@ func cmdRolloutAbort(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("Abandoned rollout %s.\n\n", current.ID)
-	fmt.Printf("Hosts that already converged are on %s and stay there; the rest are on\n",
+	fmt.Fprintf(env.Stdout, "Abandoned rollout %s.\n\n", current.ID)
+	fmt.Fprintf(env.Stdout, "Hosts that already converged are on %s and stay there; the rest are on\n",
 		current.TargetVersion)
-	fmt.Printf("%s. `billet status` under `protocol` says which is which. Nothing was\n",
+	fmt.Fprintf(env.Stdout, "%s. `billet status` under `protocol` says which is which. Nothing was\n",
 		current.PriorVersion)
-	fmt.Printf("reverted: an abort ends the decision, not the machines.\n")
+	fmt.Fprintf(env.Stdout, "reverted: an abort ends the decision, not the machines.\n")
 
 	return nil
 }
 
 // cmdRolloutNodePhase records an operator's judgement about one host.
-func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, verb string,
+func cmdRolloutNodePhase(ctx context.Context, env cli.Env, args []string, to rollout.Phase, verb string,
 ) error {
 	name := "billet rollout retry"
 	switch verb {
@@ -731,7 +730,7 @@ func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, v
 		name = "billet rollout decommission"
 	}
 
-	fs := cli.NewFlagSet(name, os.Stdout)
+	fs := cli.NewFlagSet(name, env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "", "the operator's reason, recorded against this host")
 
@@ -785,7 +784,7 @@ func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, v
 	// it. What `--force` buys is a DURABLE note that nothing proved the machine
 	// idle, which every later drain and `billet status` repeat.
 	if to == rollout.PhaseDecommissioned {
-		if err := forgetHost(ctx, a, node, *force); err != nil {
+		if err := forgetHost(ctx, env, a, node, *force); err != nil {
 			return err
 		}
 	}
@@ -799,7 +798,7 @@ func cmdRolloutNodePhase(ctx context.Context, args []string, to rollout.Phase, v
 		return err
 	}
 
-	fmt.Printf("Recorded %s as %s in rollout %s.\n", node, to, current.ID)
+	fmt.Fprintf(env.Stdout, "Recorded %s as %s in rollout %s.\n", node, to, current.ID)
 
 	return nil
 }

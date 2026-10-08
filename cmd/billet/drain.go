@@ -56,8 +56,8 @@ var errWaitInterrupted = &cli.ExitError{
 // It is a LABEL, not an identity: nothing authenticates it, and the ledger
 // treats it as text. It exists so a person can be found, not so a permission can
 // be granted.
-func actor() string {
-	name := os.Getenv("SUDO_USER")
+func actor(env cli.Env) string {
+	name := env.Getenv("SUDO_USER")
 
 	if name == "" {
 		if u, err := user.Current(); err == nil {
@@ -107,8 +107,8 @@ func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *co
 // and every job already running finishes. Killing compute is `billet local down`
 // and the node's own shutdown, and conflating the two is how a maintenance
 // window fails somebody's build.
-func cmdDrain(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet drain", os.Stdout)
+func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet drain", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this deployment is not taking work, for whoever finds it sealed")
@@ -158,19 +158,19 @@ func cmdDrain(ctx context.Context, args []string) error {
 		return fmt.Errorf("read admission: %w", err)
 	}
 
-	sealed, err := takeTheSeal(ctx, db, current, *reason)
+	sealed, err := takeTheSeal(ctx, env, db, current, *reason)
 	if err != nil {
 		return err
 	}
 
 	if !*wait {
-		fmt.Printf("\nJobs already running are unaffected and will finish. Watch what is left\n")
-		fmt.Printf("with `billet status`, or re-run this with --wait. Reopen with `billet resume`.\n")
+		fmt.Fprintf(env.Stdout, "\nJobs already running are unaffected and will finish. Watch what is left\n")
+		fmt.Fprintf(env.Stdout, "with `billet status`, or re-run this with --wait. Reopen with `billet resume`.\n")
 
 		return nil
 	}
 
-	return waitForQuiet(ctx, db, cfg, sealed.Generation, waitOptions{
+	return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
 		timeout:      *timeout,
 		withoutProof: *withoutProof,
 	})
@@ -195,7 +195,7 @@ type waitOptions struct {
 // and exit 0 against a deployment that is now OPEN — after which somebody starts
 // maintenance while work is being admitted. state.Seal makes the same-provenance
 // no-op inside the write transaction, so the answer here is the ledger's.
-func takeTheSeal(ctx context.Context, db *state.DB, current state.Admission,
+func takeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.Admission,
 	reason string,
 ) (state.Admission, error) {
 	// A SHUTDOWN'S SEAL IS ESCALATED, and that is a real change rather than a
@@ -210,7 +210,7 @@ func takeTheSeal(ctx context.Context, db *state.DB, current state.Admission,
 		Expect:     current.Generation,
 		Provenance: state.ProvenanceOperator,
 		Reason:     reason,
-		Actor:      actor(),
+		Actor:      actor(env),
 		// `billet drain` is "make sure this is sealed", so running it twice must
 		// leave the first operator's attribution and fence alone.
 		KeepExisting: true,
@@ -224,22 +224,22 @@ func takeTheSeal(ctx context.Context, db *state.DB, current state.Admission,
 	// generation, so a generation that did not move is the ledger saying it
 	// already held this.
 	if sealed.Generation == current.Generation && current.Mode == state.AdmissionSealed {
-		fmt.Printf("Already sealed")
+		fmt.Fprintf(env.Stdout, "Already sealed")
 
 		switch {
 		case sealed.Actor != "" && sealed.Reason != "":
-			fmt.Printf(" by %s: %s", sealed.Actor, sealed.Reason)
+			fmt.Fprintf(env.Stdout, " by %s: %s", sealed.Actor, sealed.Reason)
 		case sealed.Actor != "":
-			fmt.Printf(" by %s", sealed.Actor)
+			fmt.Fprintf(env.Stdout, " by %s", sealed.Actor)
 		}
 
-		fmt.Printf(".\n")
+		fmt.Fprintf(env.Stdout, ".\n")
 
 		// SAID OUT LOUD, because silently discarding it would leave the operator
 		// believing the ledger records their reason.
 		if reason != "" && reason != sealed.Reason {
-			fmt.Printf("\nThe --reason you gave was NOT recorded; the existing seal is unchanged.\n")
-			fmt.Printf("Run `billet resume` first if you mean to replace it.\n")
+			fmt.Fprintf(env.Stdout, "\nThe --reason you gave was NOT recorded; the existing seal is unchanged.\n")
+			fmt.Fprintf(env.Stdout, "Run `billet resume` first if you mean to replace it.\n")
 		}
 
 		return sealed, nil
@@ -247,32 +247,32 @@ func takeTheSeal(ctx context.Context, db *state.DB, current state.Admission,
 
 	switch {
 	case escalating:
-		fmt.Printf("A shutdown was already holding this deployment sealed. It is now held\n")
-		fmt.Printf("deliberately instead, so `billet local up` will NOT reopen it.\n")
+		fmt.Fprintf(env.Stdout, "A shutdown was already holding this deployment sealed. It is now held\n")
+		fmt.Fprintf(env.Stdout, "deliberately instead, so `billet local up` will NOT reopen it.\n")
 	case current.Mode == state.AdmissionUnknown:
 		// Fail-closed, and named: billet could not read the previous value, so it
 		// is not reporting a transition it cannot vouch for.
-		fmt.Printf("Admission read as %s before this, which billet does not recognise.\n",
+		fmt.Fprintf(env.Stdout, "Admission read as %s before this, which billet does not recognise.\n",
 			current.Mode)
-		fmt.Printf("It is now definitively sealed.\n")
+		fmt.Fprintf(env.Stdout, "It is now definitively sealed.\n")
 	default:
-		fmt.Printf("Sealed. This deployment is no longer taking new work.\n")
+		fmt.Fprintf(env.Stdout, "Sealed. This deployment is no longer taking new work.\n")
 	}
 
-	fmt.Printf("\nsealed by %s", sealed.Actor)
+	fmt.Fprintf(env.Stdout, "\nsealed by %s", sealed.Actor)
 
 	if sealed.Reason != "" {
-		fmt.Printf(": %s", sealed.Reason)
+		fmt.Fprintf(env.Stdout, ": %s", sealed.Reason)
 	}
 
-	fmt.Printf("\ngeneration %d, and it survives a control-plane restart\n", sealed.Generation)
+	fmt.Fprintf(env.Stdout, "\ngeneration %d, and it survives a control-plane restart\n", sealed.Generation)
 
 	return sealed, nil
 }
 
 // cmdResume lets the deployment admit work again.
-func cmdResume(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet resume", os.Stdout)
+func cmdResume(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet resume", env.Stdout)
 	cfgPath := addConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -311,7 +311,7 @@ func cmdResume(ctx context.Context, args []string) error {
 	resumed, err := db.Resume(ctx, state.ResumeRequest{
 		Expect: current.Generation,
 		Clears: state.ProvenanceOperator,
-		Actor:  actor(),
+		Actor:  actor(env),
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrAdmissionProvenance) {
@@ -328,14 +328,14 @@ func cmdResume(ctx context.Context, args []string) error {
 	// sealed.
 	if resumed.Generation == current.Generation && resumed.Mode == state.AdmissionOpen &&
 		current.Mode == state.AdmissionOpen {
-		fmt.Printf("Already taking work; nothing to do.\n")
+		fmt.Fprintf(env.Stdout, "Already taking work; nothing to do.\n")
 
 		return nil
 	}
 
-	fmt.Printf("Taking work again, at generation %d.\n", resumed.Generation)
-	fmt.Printf("\nListeners pick this up on their next poll rather than instantly, so the first\n")
-	fmt.Printf("job may take a poll to arrive.\n")
+	fmt.Fprintf(env.Stdout, "Taking work again, at generation %d.\n", resumed.Generation)
+	fmt.Fprintf(env.Stdout, "\nListeners pick this up on their next poll rather than instantly, so the first\n")
+	fmt.Fprintf(env.Stdout, "job may take a poll to arrive.\n")
 
 	return nil
 }
@@ -348,7 +348,7 @@ func cmdResume(ctx context.Context, args []string) error {
 // and an offer accepted just before that is real work with real compute behind
 // it. So the question "is it safe to stop this now" is answered by asking what
 // the deployment is still holding, never by the fact that a seal was taken.
-func waitForQuiet(ctx context.Context, db *state.DB, cfg *config.Config, generation int64,
+func waitForQuiet(ctx context.Context, env cli.Env, db *state.DB, cfg *config.Config, generation int64,
 	opts waitOptions,
 ) error {
 	allocator, err := alloc.New(db, alloc.Limits{
@@ -368,8 +368,8 @@ func waitForQuiet(ctx context.Context, db *state.DB, cfg *config.Config, generat
 		defer cancel()
 	}
 
-	fmt.Printf("\nWaiting for what is already running to finish. Ctrl-C stops waiting; it does\n")
-	fmt.Printf("not stop the drain, and nothing running is harmed either way.\n\n")
+	fmt.Fprintf(env.Stdout, "\nWaiting for what is already running to finish. Ctrl-C stops waiting; it does\n")
+	fmt.Fprintf(env.Stdout, "not stop the drain, and nothing running is harmed either way.\n\n")
 
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
@@ -395,7 +395,7 @@ func waitForQuiet(ctx context.Context, db *state.DB, cfg *config.Config, generat
 			// It is kept because it is the correct question to ask, not because
 			// something proves it.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return stillDraining(err)
+				return stillDraining(env, err)
 			}
 
 			return err
@@ -421,28 +421,28 @@ func waitForQuiet(ctx context.Context, db *state.DB, cfg *config.Config, generat
 			// asks each host what its provider is actually running. The order is
 			// load-bearing: while a lease is open a launch may still be dispatched,
 			// which moves a host's fence and discards whatever it had proved.
-			fmt.Printf("Drained: this deployment is sealed and the ledger records no\n")
-			fmt.Printf("outstanding lease.\n\n")
+			fmt.Fprintf(env.Stdout, "Drained: this deployment is sealed and the ledger records no\n")
+			fmt.Fprintf(env.Stdout, "outstanding lease.\n\n")
 
 			if opts.withoutProof {
-				fmt.Printf("No host was asked what it is running (--without-compute-proof).\n")
-				fmt.Printf("Compute whose lease has already gone is not visible to the ledger, so\n")
-				fmt.Printf("this does NOT establish that the machines are idle.\n")
+				fmt.Fprintf(env.Stdout, "No host was asked what it is running (--without-compute-proof).\n")
+				fmt.Fprintf(env.Stdout, "Compute whose lease has already gone is not visible to the ledger, so\n")
+				fmt.Fprintf(env.Stdout, "this does NOT establish that the machines are idle.\n")
 
 				return nil
 			}
 
-			return proveComputeClear(ctx, allocator, generation, ticker)
+			return proveComputeClear(ctx, env, allocator, generation, ticker)
 		}
 
 		if summary := outstandingSummary(q); summary != last {
-			fmt.Printf("%s\n", summary)
+			fmt.Fprintf(env.Stdout, "%s\n", summary)
 			last = summary
 		}
 
 		select {
 		case <-ctx.Done():
-			return stillDraining(ctx.Err())
+			return stillDraining(env, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -472,15 +472,15 @@ const barrierSilentAfter = 4 * drainPollInterval
 // dispatched, and its answer is recorded against a fence captured before it was
 // sent. This only asks, and reports what came back.
 func proveComputeClear(
-	ctx context.Context, allocator *alloc.Allocator, generation int64, ticker *time.Ticker,
+	ctx context.Context, env cli.Env, allocator *alloc.Allocator, generation int64, ticker *time.Ticker,
 ) error {
-	barrier, err := allocator.RequestComputeBarrier(ctx, generation, actor())
+	barrier, err := allocator.RequestComputeBarrier(ctx, generation, actor(env))
 	if err != nil {
 		return fmt.Errorf("ask the fleet what it is running: %w", err)
 	}
 
-	fmt.Printf("Now asking each host what it is actually running. This is what the ledger\n")
-	fmt.Printf("cannot see: compute whose lease has already gone.\n\n")
+	fmt.Fprintf(env.Stdout, "Now asking each host what it is actually running. This is what the ledger\n")
+	fmt.Fprintf(env.Stdout, "cannot see: compute whose lease has already gone.\n\n")
 
 	var (
 		last    string
@@ -492,7 +492,7 @@ func proveComputeClear(
 		clearance, err := allocator.ComputeClear(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return stillDraining(err)
+				return stillDraining(env, err)
 			}
 
 			return err
@@ -524,7 +524,7 @@ func proveComputeClear(
 		}
 
 		if clearance.Clear() {
-			reportProved(clearance)
+			reportProved(env, clearance)
 
 			return nil
 		}
@@ -532,21 +532,21 @@ func proveComputeClear(
 		heard = heard || anyoneAnswered(clearance)
 
 		if summary := clearanceSummary(clearance); summary != last {
-			fmt.Printf("%s\n", summary)
+			fmt.Fprintf(env.Stdout, "%s\n", summary)
 			last = summary
 		}
 
 		if !heard && time.Since(started) > barrierSilentAfter {
-			fmt.Printf("\n  Nothing has answered yet. A running control plane is what puts this\n")
-			fmt.Printf("  question to each host — check that `billet server` is up, or re-run\n")
-			fmt.Printf("  with --without-compute-proof to stop at what the ledger knows.\n\n")
+			fmt.Fprintf(env.Stdout, "\n  Nothing has answered yet. A running control plane is what puts this\n")
+			fmt.Fprintf(env.Stdout, "  question to each host — check that `billet server` is up, or re-run\n")
+			fmt.Fprintf(env.Stdout, "  with --without-compute-proof to stop at what the ledger knows.\n\n")
 
 			heard = true // said once; the per-host lines carry it from here.
 		}
 
 		select {
 		case <-ctx.Done():
-			return stillDraining(ctx.Err())
+			return stillDraining(env, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -584,13 +584,13 @@ func anyoneAnswered(c alloc.ComputeClearance) bool {
 // from the expected set without proof is billet admitting it does not know what
 // is on that machine, and a report that renders it the same as a host that
 // answered is the laundering this whole mechanism exists to prevent.
-func reportProved(c alloc.ComputeClearance) {
-	fmt.Printf("\nEvery host billet expects an answer from says it is running no compute,\n")
-	fmt.Printf("and has said so continuously since before this drain finished.\n")
+func reportProved(env cli.Env, c alloc.ComputeClearance) {
+	fmt.Fprintf(env.Stdout, "\nEvery host billet expects an answer from says it is running no compute,\n")
+	fmt.Fprintf(env.Stdout, "and has said so continuously since before this drain finished.\n")
 
 	if len(c.Nodes) == 0 {
-		fmt.Printf("\n  (this deployment has no host in its expected set, so that claim is\n")
-		fmt.Printf("  about nothing — `billet status` lists the fleet)\n")
+		fmt.Fprintf(env.Stdout, "\n  (this deployment has no host in its expected set, so that claim is\n")
+		fmt.Fprintf(env.Stdout, "  about nothing — `billet status` lists the fleet)\n")
 	}
 
 	unproven := c.Unproven()
@@ -598,15 +598,15 @@ func reportProved(c alloc.ComputeClearance) {
 		return
 	}
 
-	fmt.Printf("\nBut %d host(s) were EXCLUDED from that set without proof, and nothing here\n",
+	fmt.Fprintf(env.Stdout, "\nBut %d host(s) were EXCLUDED from that set without proof, and nothing here\n",
 		len(unproven))
-	fmt.Printf("says whether they are running anything:\n")
+	fmt.Fprintf(env.Stdout, "says whether they are running anything:\n")
 
 	for _, name := range unproven {
-		fmt.Printf("  %s\n", name)
+		fmt.Fprintf(env.Stdout, "  %s\n", name)
 	}
 
-	fmt.Printf("\nA forced `billet nodes decommission` records that, and it stays recorded.\n")
+	fmt.Fprintf(env.Stdout, "\nA forced `billet nodes decommission` records that, and it stays recorded.\n")
 }
 
 // clearanceSummary is one block naming what is still holding this up.
@@ -657,12 +657,12 @@ func clearanceSummary(c alloc.ComputeClearance) string {
 // and proceeds on success would proceed while jobs were still running, and the
 // process-wide signal handler cancels this context, so a SIGTERM in a pipeline
 // reaches it without anybody pressing anything.
-func stillDraining(err error) error {
+func stillDraining(env cli.Env, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return errStillDraining
 	}
 
-	fmt.Printf("\nStopped waiting. The deployment is still sealed; `billet resume` reopens it.\n")
+	fmt.Fprintf(env.Stdout, "\nStopped waiting. The deployment is still sealed; `billet resume` reopens it.\n")
 
 	return errWaitInterrupted
 }

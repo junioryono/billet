@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -52,8 +51,8 @@ type recoverOptions struct {
 // manifest — exactly the check a restore makes, unchanged. Everything else about
 // this deployment (the authority, the App key) is byte-identical or the whole
 // operation is refused, again by the same code.
-func cmdLocalRecover(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local recover", os.Stdout)
+func cmdLocalRecover(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local recover", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	from := fs.String("from", "", "the backup directory written by `billet local backup`")
 	fromBackup := fs.String("from-backup", "",
@@ -99,14 +98,14 @@ func cmdLocalRecover(ctx context.Context, args []string) error {
 			"wait for as long as the jobs take", *timeout)
 	}
 
-	return runLocalRecover(ctx, recoverOptions{
+	return runLocalRecover(ctx, env, recoverOptions{
 		configPath: *cfgPath, from: *from, fromBackup: *fromBackup, deployment: *deployment,
 		into: *into, dryRun: *dryRun, fenced: *fenced, abandon: *abandon,
 		acceptJobs: *acceptJobs, reason: *reason, timeout: *timeout,
 	})
 }
 
-func runLocalRecover(ctx context.Context, o recoverOptions) error {
+func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	cfg, err := config.Load(o.configPath)
 	if err != nil {
 		return err
@@ -119,7 +118,7 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 
 	from := o.from
 	if o.fromBackup != "" {
-		if from, err = fetchFromBackup(ctx, cfg, restoreOptions{
+		if from, err = fetchFromBackup(ctx, env, cfg, restoreOptions{
 			configPath: o.configPath, fromBackup: o.fromBackup,
 			deployment: o.deployment, into: o.into,
 		}); err != nil {
@@ -146,7 +145,7 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 	archiveTargets(cfg, &target)
 
 	if o.abandon {
-		return runRecoverAbandon(ctx, archive, target)
+		return runRecoverAbandon(ctx, env, archive, target)
 	}
 
 	plan, err := deployarchive.PlanRecover(ctx, archive, target)
@@ -154,15 +153,15 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 		return err
 	}
 
-	printArchive(archive)
-	printRecoverPlan(plan)
+	printArchive(env, archive)
+	printRecoverPlan(env, plan)
 
 	if len(plan.Refusals) > 0 {
 		return refusedRestore(plan.Refusals)
 	}
 
 	if o.dryRun {
-		fmt.Println("\nNothing was changed (--dry-run).")
+		fmt.Fprintln(env.Stdout, "\nNothing was changed (--dry-run).")
 
 		return nil
 	}
@@ -205,15 +204,15 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 
 	switch stage {
 	case recoverPublished:
-		fmt.Printf("\nresume   an interrupted run of this recovery already published every file\n")
-		fmt.Printf("         and moved the old ledger aside — the plan above is what it DID, and\n")
-		fmt.Printf("         none of it happens twice. Sealing the restored ledger and lifting\n")
-		fmt.Printf("         the fence are all that is left\n")
+		fmt.Fprintf(env.Stdout, "\nresume   an interrupted run of this recovery already published every file\n")
+		fmt.Fprintf(env.Stdout, "         and moved the old ledger aside — the plan above is what it DID, and\n")
+		fmt.Fprintf(env.Stdout, "         none of it happens twice. Sealing the restored ledger and lifting\n")
+		fmt.Fprintf(env.Stdout, "         the fence are all that is left\n")
 	case recoverResume:
-		fmt.Printf("\nresume   an interrupted recovery is already fenced here; its seal and its\n")
-		fmt.Printf("         quiescence still hold, so this continues from where it stopped\n")
+		fmt.Fprintf(env.Stdout, "\nresume   an interrupted recovery is already fenced here; its seal and its\n")
+		fmt.Fprintf(env.Stdout, "         quiescence still hold, so this continues from where it stopped\n")
 	case recoverFresh:
-		if err := quiesceForRecovery(ctx, cfg, o); err != nil {
+		if err := quiesceForRecovery(ctx, env, cfg, o); err != nil {
 			return err
 		}
 	}
@@ -225,7 +224,7 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
@@ -237,7 +236,7 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 	// find the first one's destination occupied and refuse — a recovery with no
 	// way forward, reached by re-running the command its own diagnostic asks for.
 	if stage != recoverPublished {
-		fmt.Println()
+		fmt.Fprintln(env.Stdout)
 
 		acc, aerr := openIdentityAccess(ctx, plan.Target.StateDir,
 			identityIntent{wait: identityAccessWait, lifecycleHeld: true})
@@ -248,26 +247,26 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 		res, err = deployarchive.Execute(ctx, deployarchive.RestoreRequest{
 			Authority:     acc.Lock(),
 			Plan:          plan,
-			InstallAppKey: installAppKey,
+			InstallAppKey: func(path string, pem []byte) error { return installAppKey(env, path, pem) },
 			Now:           time.Now,
-			Actor:         actor(),
+			Actor:         actor(env),
 		})
 		if rerr := acc.Release(); rerr != nil {
 			err = errors.Join(err, rerr)
 		}
 
-		printRestoreResult(res)
+		printRestoreResult(env, res)
 
 		for _, path := range res.Superseded {
-			fmt.Printf("aside    %s\n", path)
+			fmt.Fprintf(env.Stdout, "aside    %s\n", path)
 		}
 
 		if err != nil {
-			return partialRestore(target, err)
+			return partialRestore(env, target, err)
 		}
 	}
 
-	repairRestoredOwnership(plan)
+	repairRestoredOwnership(env, plan)
 
 	// SEALED AGAIN, BEHIND THE FENCE THE EXECUTOR DELIBERATELY LEFT UP — and both
 	// halves of that matter.
@@ -283,21 +282,21 @@ func runLocalRecover(ctx context.Context, o recoverOptions) error {
 	// and sealing afterwards leaves an interval in which a control plane can start
 	// on an open ledger; the fence is the only thing that refuses one, so it stays
 	// up until the seal is durable and Finish takes it down.
-	if err := sealRecoveredDeployment(ctx, cfg, o); err != nil {
+	if err := sealRecoveredDeployment(ctx, env, cfg, o); err != nil {
 		return err
 	}
 
 	if err := deployarchive.Finish(ctx, plan); err != nil {
-		fmt.Println()
-		fmt.Printf("warn     this deployment is recovered and SEALED, and %s is still fenced:\n",
+		fmt.Fprintln(env.Stdout)
+		fmt.Fprintf(env.Stdout, "warn     this deployment is recovered and SEALED, and %s is still fenced:\n",
 			target.StateDir)
-		fmt.Printf("         %v\n", err)
-		fmt.Printf("         Nothing can start on it until that is cleared. Re-run this command.\n")
+		fmt.Fprintf(env.Stdout, "         %v\n", err)
+		fmt.Fprintf(env.Stdout, "         Nothing can start on it until that is cleared. Re-run this command.\n")
 
 		return err
 	}
 
-	printRecovered(archive, target, res)
+	printRecovered(env, archive, target, res)
 
 	return nil
 }
@@ -387,7 +386,7 @@ func recoveryStageOf(stateDir string, a *deployarchive.Archive) (recoveryStage, 
 // happened. The deployment IS recovered — every credential is in place — and it
 // is also open for business, which is the one state this command must not leave
 // behind silently.
-func sealRecoveredDeployment(ctx context.Context, cfg *config.Config, o recoverOptions) error {
+func sealRecoveredDeployment(ctx context.Context, env cli.Env, cfg *config.Config, o recoverOptions) error {
 	// THE ONE HANDLE THAT CROSSES A FENCE, and this process is the one that
 	// raised it. OpenAdmin honours the fence — correctly, since its whole job is
 	// keeping other commands out — so it cannot be used here; OpenMaintenance is
@@ -396,14 +395,14 @@ func sealRecoveredDeployment(ctx context.Context, cfg *config.Config, o recoverO
 	// start would do to an older archive's ledger anyway.
 	db, err := app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
 	if err != nil {
-		return recoveredButOpen(fmt.Errorf("open the restored ledger to seal it: %w", err))
+		return recoveredButOpen(env, fmt.Errorf("open the restored ledger to seal it: %w", err))
 	}
 
 	defer db.Close()
 
 	current, err := db.Admission(ctx)
 	if err != nil {
-		return recoveredButOpen(fmt.Errorf("read the restored ledger's admission: %w", err))
+		return recoveredButOpen(env, fmt.Errorf("read the restored ledger's admission: %w", err))
 	}
 
 	reason := o.reason
@@ -411,8 +410,8 @@ func sealRecoveredDeployment(ctx context.Context, cfg *config.Config, o recoverO
 		reason = "billet local recover"
 	}
 
-	if _, err := takeTheSeal(ctx, db, current, reason); err != nil {
-		return recoveredButOpen(err)
+	if _, err := takeTheSeal(ctx, env, db, current, reason); err != nil {
+		return recoveredButOpen(env, err)
 	}
 
 	return nil
@@ -425,14 +424,14 @@ func sealRecoveredDeployment(ctx context.Context, cfg *config.Config, o recoverO
 // its admission row is the archive's — open — but nothing can start on a fenced
 // directory, so no work can be admitted against it. Re-running the command
 // resumes, seals, and clears the fence.
-func recoveredButOpen(cause error) error {
-	fmt.Println()
-	fmt.Printf("warn     this deployment IS recovered, and it is NOT yet sealed: %v\n", cause)
-	fmt.Printf("         The restored ledger carries the admission it had when the backup was\n")
-	fmt.Printf("         taken, which is open — so a control plane starting on it would take\n")
-	fmt.Printf("         new work while its nodes still hold compute it has never heard of.\n")
-	fmt.Printf("         The state directory is STILL FENCED, so nothing can start on it.\n")
-	fmt.Printf("         Run this command again; it resumes, seals, and lifts the fence.\n")
+func recoveredButOpen(env cli.Env, cause error) error {
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "warn     this deployment IS recovered, and it is NOT yet sealed: %v\n", cause)
+	fmt.Fprintf(env.Stdout, "         The restored ledger carries the admission it had when the backup was\n")
+	fmt.Fprintf(env.Stdout, "         taken, which is open — so a control plane starting on it would take\n")
+	fmt.Fprintf(env.Stdout, "         new work while its nodes still hold compute it has never heard of.\n")
+	fmt.Fprintf(env.Stdout, "         The state directory is STILL FENCED, so nothing can start on it.\n")
+	fmt.Fprintf(env.Stdout, "         Run this command again; it resumes, seals, and lifts the fence.\n")
 
 	return &cli.ExitError{Code: 1, Msg: "recovered and fenced, but the deployment could not be sealed"}
 }
@@ -451,7 +450,7 @@ func recoveredButOpen(cause error) error {
 // not start taking work the moment this returns: its nodes still hold compute
 // the restored ledger has never heard of, and that compute has to be proved gone
 // first. `billet resume` is the operator saying they have done that.
-func quiesceForRecovery(ctx context.Context, cfg *config.Config, o recoverOptions) error {
+func quiesceForRecovery(ctx context.Context, env cli.Env, cfg *config.Config, o recoverOptions) error {
 	db, err := openStateAdmin(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
@@ -469,7 +468,7 @@ func quiesceForRecovery(ctx context.Context, cfg *config.Config, o recoverOption
 		reason = "billet local recover"
 	}
 
-	sealed, err := takeTheSeal(ctx, db, current, reason)
+	sealed, err := takeTheSeal(ctx, env, db, current, reason)
 	if err != nil {
 		return err
 	}
@@ -490,7 +489,7 @@ func quiesceForRecovery(ctx context.Context, cfg *config.Config, o recoverOption
 	}
 
 	if q.Quiet() {
-		fmt.Printf("\nThis deployment is sealed and the ledger records no outstanding lease.\n")
+		fmt.Fprintf(env.Stdout, "\nThis deployment is sealed and the ledger records no outstanding lease.\n")
 
 		return nil
 	}
@@ -498,7 +497,7 @@ func quiesceForRecovery(ctx context.Context, cfg *config.Config, o recoverOption
 	// STILL HOLDING WORK, and there are exactly two ways forward: wait for it, or
 	// accept losing it BY NAME. Neither is chosen for the operator.
 	if !o.acceptJobs {
-		fmt.Printf("\n%s\n", outstandingSummary(q))
+		fmt.Fprintf(env.Stdout, "\n%s\n", outstandingSummary(q))
 
 		// THE LEDGER BARRIER ONLY, DELIBERATELY. `drain --wait` and `local down`
 		// take the compute proof as a second stage; this command is the disaster
@@ -507,76 +506,76 @@ func quiesceForRecovery(ctx context.Context, cfg *config.Config, o recoverOption
 		// exists for. What protects an operator here is the same thing it always
 		// was: every job this would strand is NAMED, and losing them has to be
 		// accepted by name.
-		return waitForQuiet(ctx, db, cfg, sealed.Generation, waitOptions{
+		return waitForQuiet(ctx, env, db, cfg, sealed.Generation, waitOptions{
 			timeout: o.timeout, withoutProof: true,
 		})
 	}
 
-	fmt.Printf("\n--accept-failing-jobs: this recovery will strand the following, and GitHub\n")
-	fmt.Printf("does not requeue a job that has already started:\n\n")
+	fmt.Fprintf(env.Stdout, "\n--accept-failing-jobs: this recovery will strand the following, and GitHub\n")
+	fmt.Fprintf(env.Stdout, "does not requeue a job that has already started:\n\n")
 
 	for _, held := range q.Outstanding {
-		fmt.Printf("  %s  tier %s", held.ID, held.Tier)
+		fmt.Fprintf(env.Stdout, "  %s  tier %s", held.ID, held.Tier)
 
 		if held.Node != "" {
-			fmt.Printf("  node %s", held.Node)
+			fmt.Fprintf(env.Stdout, "  node %s", held.Node)
 		}
 
 		if held.RunID != "" {
-			fmt.Printf("  run %s", held.RunID)
+			fmt.Fprintf(env.Stdout, "  run %s", held.RunID)
 		}
 
-		fmt.Printf("  (%s since %s)\n", held.Phase, held.Since)
+		fmt.Fprintf(env.Stdout, "  (%s since %s)\n", held.Phase, held.Since)
 	}
 
 	// WHAT THE BARRIER CANNOT SEE, said here because this is the moment somebody
 	// acts on it. A lease that has already gone leaves compute nothing in the
 	// ledger accounts for, and the list above cannot include it.
-	fmt.Printf("\nCompute whose lease has already gone is NOT in that list — the ledger cannot\n")
-	fmt.Printf("see it. `billet leases` and each node's own inventory are what confirm a host\n")
-	fmt.Printf("is idle.\n")
+	fmt.Fprintf(env.Stdout, "\nCompute whose lease has already gone is NOT in that list — the ledger cannot\n")
+	fmt.Fprintf(env.Stdout, "see it. `billet leases` and each node's own inventory are what confirm a host\n")
+	fmt.Fprintf(env.Stdout, "is idle.\n")
 
 	return nil
 }
 
 // printRecoverPlan reports what would happen, item by item.
-func printRecoverPlan(p deployarchive.Plan) {
+func printRecoverPlan(env cli.Env, p deployarchive.Plan) {
 	for _, a := range p.Actions {
 		switch a.Disposition {
 		case deployarchive.AlreadyPresent:
-			fmt.Printf("plan     %s is already in place at %s\n", a.What, a.Path)
+			fmt.Fprintf(env.Stdout, "plan     %s is already in place at %s\n", a.What, a.Path)
 		case deployarchive.SupersedeLedger:
-			fmt.Printf("plan     REPLACE the ledger at %s\n", a.Path)
-			fmt.Printf("         the one there now moves to %s and is never deleted — it is the\n",
+			fmt.Fprintf(env.Stdout, "plan     REPLACE the ledger at %s\n", a.Path)
+			fmt.Fprintf(env.Stdout, "         the one there now moves to %s and is never deleted — it is the\n",
 				p.Superseded)
-			fmt.Printf("         only record of the work this recovery fails\n")
+			fmt.Fprintf(env.Stdout, "         only record of the work this recovery fails\n")
 		case deployarchive.ReplaceEmptyLedger:
-			fmt.Printf("plan     replace the empty preflight ledger at %s\n", a.Path)
+			fmt.Fprintf(env.Stdout, "plan     replace the empty preflight ledger at %s\n", a.Path)
 		case deployarchive.Install:
-			fmt.Printf("plan     install %s at %s\n", a.What, a.Path)
+			fmt.Fprintf(env.Stdout, "plan     install %s at %s\n", a.What, a.Path)
 		}
 	}
 }
 
 // printRecovered reports a finished recovery, and the two things it does not
 // settle.
-func printRecovered(a *deployarchive.Archive, t deployarchive.Target,
+func printRecovered(env cli.Env, a *deployarchive.Archive, t deployarchive.Target,
 	res deployarchive.Result,
 ) {
-	fmt.Println()
-	fmt.Printf("Recovered deployment %s in %s from the backup taken %s.\n\n",
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "Recovered deployment %s in %s from the backup taken %s.\n\n",
 		a.Manifest.DeploymentID, t.StateDir, a.Manifest.CreatedAt)
 
 	for _, path := range res.Superseded {
-		fmt.Printf("  the ledger that was there is at %s\n", path)
+		fmt.Fprintf(env.Stdout, "  the ledger that was there is at %s\n", path)
 	}
 
-	fmt.Printf("\nTHIS DEPLOYMENT IS STILL SEALED, and that is deliberate. Its nodes hold\n")
-	fmt.Printf("compute the restored ledger has never heard of, and node recovery destroys an\n")
-	fmt.Printf("instance with no lease as an orphan. Prove that compute gone, then:\n\n")
-	fmt.Printf("  billet resume\n\n")
-	fmt.Printf("`billet local up` starts the services; admission stays closed until you\n")
-	fmt.Printf("reopen it, because this seal is an operator's and `up` does not clear one.\n")
+	fmt.Fprintf(env.Stdout, "\nTHIS DEPLOYMENT IS STILL SEALED, and that is deliberate. Its nodes hold\n")
+	fmt.Fprintf(env.Stdout, "compute the restored ledger has never heard of, and node recovery destroys an\n")
+	fmt.Fprintf(env.Stdout, "instance with no lease as an orphan. Prove that compute gone, then:\n\n")
+	fmt.Fprintf(env.Stdout, "  billet resume\n\n")
+	fmt.Fprintf(env.Stdout, "`billet local up` starts the services; admission stays closed until you\n")
+	fmt.Fprintf(env.Stdout, "reopen it, because this seal is an operator's and `up` does not clear one.\n")
 }
 
 // runRecoverAbandon undoes an interrupted recovery.
@@ -585,7 +584,7 @@ func printRecovered(a *deployarchive.Archive, t deployarchive.Target,
 // run created would take away the ledger it installed and leave the operator's
 // own under a name nothing looks at, in a directory whose fence is about to come
 // down — a deployment with no capacity record at all.
-func runRecoverAbandon(ctx context.Context, a *deployarchive.Archive,
+func runRecoverAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archive,
 	t deployarchive.Target,
 ) error {
 	pending, err := restoreUnfinished(t.StateDir)
@@ -594,7 +593,7 @@ func runRecoverAbandon(ctx context.Context, a *deployarchive.Archive,
 	}
 
 	if !pending {
-		fmt.Printf("No recovery is in progress in %s; there is nothing to abandon.\n", t.StateDir)
+		fmt.Fprintf(env.Stdout, "No recovery is in progress in %s; there is nothing to abandon.\n", t.StateDir)
 
 		return nil
 	}
@@ -606,32 +605,32 @@ func runRecoverAbandon(ctx context.Context, a *deployarchive.Archive,
 
 	defer func() {
 		if err := lock.release(); err != nil {
-			fmt.Printf("warn     could not release the lifecycle lock: %v\n", err)
+			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
 
 	res, err := deployarchive.Abandon(ctx, a, t, deployarchive.ReplaceLedger)
 
 	for _, path := range res.Removed {
-		fmt.Printf("remove   %s\n", path)
+		fmt.Fprintf(env.Stdout, "remove   %s\n", path)
 	}
 
 	for _, path := range res.Restored {
-		fmt.Printf("restore  %s put back\n", path)
+		fmt.Fprintf(env.Stdout, "restore  %s put back\n", path)
 	}
 
 	for _, path := range res.Kept {
-		fmt.Printf("keep     %s was left alone; billet could not prove it is one of its own\n", path)
+		fmt.Fprintf(env.Stdout, "keep     %s was left alone; billet could not prove it is one of its own\n", path)
 	}
 
 	if err != nil {
 		return err
 	}
 
-	fmt.Println()
-	fmt.Printf("Abandoned. %s is no longer fenced, and this deployment is still SEALED —\n",
+	fmt.Fprintln(env.Stdout)
+	fmt.Fprintf(env.Stdout, "Abandoned. %s is no longer fenced, and this deployment is still SEALED —\n",
 		t.StateDir)
-	fmt.Printf("`billet resume` is what reopens it.\n")
+	fmt.Fprintf(env.Stdout, "`billet resume` is what reopens it.\n")
 
 	return nil
 }

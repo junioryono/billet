@@ -86,7 +86,7 @@ sites:
 	var checkErr error
 	out := capture(t, func() {
 		stubGitHubUnverifiable(t)
-		checkErr = cmdCheck(checkCtx, []string{"--config", configPath})
+		checkErr = cmdCheck(checkCtx, processEnv(), []string{"--config", configPath})
 	})
 	close(release)
 	if err := <-held; err != nil {

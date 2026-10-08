@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -22,7 +21,7 @@ import (
 // The two are deliberately different questions — a control plane can be serving
 // a perfectly healthy ledger from a unit that runs a binary the operator
 // replaced an hour ago, and only one of these commands can say so.
-func cmdLocal(ctx context.Context, args []string) error {
+func cmdLocal(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New(
 			"usage: billet local <up|down|status|backup|restore|recover|uninstall|prepare>")
@@ -42,21 +41,21 @@ func cmdLocal(ctx context.Context, args []string) error {
 
 	switch args[0] {
 	case "status":
-		return cmdLocalStatus(ctx, args[1:])
+		return cmdLocalStatus(ctx, env, args[1:])
 	case "up":
-		return cmdLocalUp(ctx, args[1:])
+		return cmdLocalUp(ctx, env, args[1:])
 	case "down":
-		return cmdLocalDown(ctx, args[1:])
+		return cmdLocalDown(ctx, env, args[1:])
 	case "backup":
-		return cmdLocalBackup(ctx, args[1:])
+		return cmdLocalBackup(ctx, env, args[1:])
 	case "restore":
-		return cmdLocalRestore(ctx, args[1:])
+		return cmdLocalRestore(ctx, env, args[1:])
 	case "recover":
-		return cmdLocalRecover(ctx, args[1:])
+		return cmdLocalRecover(ctx, env, args[1:])
 	case "uninstall":
-		return cmdLocalUninstall(ctx, args[1:])
+		return cmdLocalUninstall(ctx, env, args[1:])
 	case "prepare":
-		return cmdLocalPrepare(ctx, args[1:])
+		return cmdLocalPrepare(ctx, env, args[1:])
 	}
 
 	return fmt.Errorf("unknown local command %q; try up, down, status, backup, restore, "+
@@ -93,8 +92,8 @@ var inspect = func(ctx context.Context, cfgPath string, keyPaths []string) (life
 // that will not load, a unit that is not installed and a binary it cannot
 // resolve are all things to REPORT rather than reasons to fail. The one thing
 // it will not do is invent an answer — every uncertain fact says so by name.
-func cmdLocalStatus(ctx context.Context, args []string) error {
-	fs := cli.NewFlagSet("billet local status", os.Stdout)
+func cmdLocalStatus(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet local status", env.Stdout)
 	cfgPath := addServiceConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -103,10 +102,10 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 	// EACH MANAGER REPORTS ITS OWN FACTS. See macStatus for why this is a second
 	// renderer rather than the same one with different words.
 	if hostOS == "darwin" {
-		return macStatus(ctx, *cfgPath)
+		return macStatus(ctx, env, *cfgPath)
 	}
 
-	fmt.Printf("config   %s\n", *cfgPath)
+	fmt.Fprintf(env.Stdout, "config   %s\n", *cfgPath)
 
 	// The config is READ FOR ITS PATHS, and a config that will not load is
 	// reported rather than fatal: the units and the binary are still worth
@@ -114,7 +113,7 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 	var keyPaths []string
 	cfg, cfgErr := config.Load(*cfgPath)
 	if cfgErr != nil {
-		fmt.Printf("         UNREADABLE: %v\n", cfgErr)
+		fmt.Fprintf(env.Stdout, "         UNREADABLE: %v\n", cfgErr)
 	} else {
 		keyPaths = appKeyFilePaths(cfg)
 	}
@@ -124,21 +123,21 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	printFileFacts("config", report.Config)
+	printFileFacts(env, "config", report.Config)
 	for _, key := range report.AppKeys {
-		printFileFacts("key", key)
+		printFileFacts(env, "key", key)
 	}
 
 	switch {
 	case report.BinaryErr != nil:
-		fmt.Printf("binary   UNKNOWN: %v\n", report.BinaryErr)
+		fmt.Fprintf(env.Stdout, "binary   UNKNOWN: %v\n", report.BinaryErr)
 	default:
-		fmt.Printf("binary   %s\n", report.Binary)
+		fmt.Fprintf(env.Stdout, "binary   %s\n", report.Binary)
 	}
 
-	printService("server", report.Server)
-	printService("node", report.Node)
-	printTimers(ctx)
+	printService(env, "server", report.Server)
+	printService(env, "node", report.Node)
+	printTimers(ctx, env)
 
 	return nil
 }
@@ -151,7 +150,7 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 // which stopped acting on rollouts is one whose timer somebody disabled — the
 // package enables both, and a disabled one looks exactly like a working one
 // from every other angle.
-func printTimers(ctx context.Context) {
+func printTimers(ctx context.Context, env cli.Env) {
 	for _, timer := range []string{deploy.UpgradeTimerName, deploy.ImagesRefreshTimerName} {
 		out, err := exec.CommandContext(ctx, "systemctl", "is-enabled", "--", timer).Output()
 
@@ -168,24 +167,24 @@ func printTimers(ctx context.Context) {
 			state = "not installed; the package ships it"
 		}
 
-		fmt.Printf("%-8s %s %s\n", "updates", timer, state)
+		fmt.Fprintf(env.Stdout, "%-8s %s %s\n", "updates", timer, state)
 	}
 }
 
 // printFileFacts reports one path's ownership and mode, which is the pair that
 // decides whether the service can read it at all.
-func printFileFacts(label string, f lifeops.FileFacts) {
+func printFileFacts(env cli.Env, label string, f lifeops.FileFacts) {
 	switch f.Exists {
 	case lifeops.Yes:
 		owner := f.Owner
 		if f.Group != "" {
 			owner += ":" + f.Group
 		}
-		fmt.Printf("         %-6s %s (%s %04o)\n", label, f.Path, owner, f.Mode.Perm())
+		fmt.Fprintf(env.Stdout, "         %-6s %s (%s %04o)\n", label, f.Path, owner, f.Mode.Perm())
 	case lifeops.No:
-		fmt.Printf("         %-6s %s (MISSING)\n", label, f.Path)
+		fmt.Fprintf(env.Stdout, "         %-6s %s (MISSING)\n", label, f.Path)
 	case lifeops.Unknown:
-		fmt.Printf("         %-6s %s (UNREADABLE: %v)\n", label, f.Path, f.Err)
+		fmt.Fprintf(env.Stdout, "         %-6s %s (UNREADABLE: %v)\n", label, f.Path, f.Err)
 	}
 }
 
@@ -202,10 +201,10 @@ func sortedProps(m map[string]string) []string {
 
 // printService reports one unit: what systemd will run, and the two ways that
 // can silently differ from what the operator thinks is installed.
-func printService(label string, s lifeops.ServiceFacts) {
+func printService(env cli.Env, label string, s lifeops.ServiceFacts) {
 	if !s.Installed() {
-		fmt.Printf("%-8s not installed (%s)\n", label, s.Name)
-		fmt.Printf("         install the billet package, which ships the units\n")
+		fmt.Fprintf(env.Stdout, "%-8s not installed (%s)\n", label, s.Name)
+		fmt.Fprintf(env.Stdout, "         install the billet package, which ships the units\n")
 
 		return
 	}
@@ -215,26 +214,26 @@ func printService(label string, s lifeops.ServiceFacts) {
 		enabled = "enablement unknown"
 	}
 
-	fmt.Printf("%-8s %s (%s)", label, s.ActiveState, enabled)
+	fmt.Fprintf(env.Stdout, "%-8s %s (%s)", label, s.ActiveState, enabled)
 	if s.MainPID > 0 {
-		fmt.Printf(", pid %d", s.MainPID)
+		fmt.Fprintf(env.Stdout, ", pid %d", s.MainPID)
 	}
 	if s.NRestarts > 0 {
-		fmt.Printf(", %d restart(s)", s.NRestarts)
+		fmt.Fprintf(env.Stdout, ", %d restart(s)", s.NRestarts)
 	}
-	fmt.Println()
+	fmt.Fprintln(env.Stdout)
 
 	// A MASKED OR LINKED UNIT IS NOT THE UNIT ITS FILE SAYS IT IS, and neither
 	// state is visible from the file on disk.
 	switch s.LoadState {
 	case "masked":
-		fmt.Printf("         MASKED: systemd will refuse to start this unit\n")
+		fmt.Fprintf(env.Stdout, "         MASKED: systemd will refuse to start this unit\n")
 	case "loaded":
 	default:
-		fmt.Printf("         LOAD STATE %s\n", s.LoadState)
+		fmt.Fprintf(env.Stdout, "         LOAD STATE %s\n", s.LoadState)
 	}
 	if s.UnitFileState == "linked" {
-		fmt.Printf("         LINKED: the unit is a symlink to a file outside the unit directories\n")
+		fmt.Fprintf(env.Stdout, "         LINKED: the unit is a symlink to a file outside the unit directories\n")
 	}
 
 	// NAMED FOR WHAT IT COMPARES, not for a verdict about who edited what: the
@@ -250,16 +249,16 @@ func printService(label string, s lifeops.ServiceFacts) {
 	case lifeops.Unknown:
 		provenance = " (could not be compared with the packaged unit)"
 	}
-	fmt.Printf("         unit %s%s\n", s.FragmentPath, provenance)
+	fmt.Fprintf(env.Stdout, "         unit %s%s\n", s.FragmentPath, provenance)
 
 	if s.ReloadPending == lifeops.Yes {
-		fmt.Printf("         PENDING RELOAD: the unit file changed since systemd read it, so " +
+		fmt.Fprintf(env.Stdout, "         PENDING RELOAD: the unit file changed since systemd read it, so "+
 			"what is on disk is not what would run. Run `systemctl daemon-reload`\n")
 	}
 
 	if len(s.DropInPaths) > 0 {
-		fmt.Printf("         DROP-INS: %s\n", strings.Join(s.DropInPaths, " "))
-		fmt.Printf("         (these override the unit above; billet did not write them)\n")
+		fmt.Fprintf(env.Stdout, "         DROP-INS: %s\n", strings.Join(s.DropInPaths, " "))
+		fmt.Fprintf(env.Stdout, "         (these override the unit above; billet did not write them)\n")
 	}
 
 	// WHAT `up` WOULD REFUSE, REPORTED HERE. These are the things that make a
@@ -276,12 +275,12 @@ func printService(label string, s lifeops.ServiceFacts) {
 		{"WIDENS ITS IDENTITY", s.Elevation},
 	} {
 		for _, name := range sortedProps(group.facts) {
-			fmt.Printf("         %s: %s=%s\n", group.label, name, group.facts[name])
+			fmt.Fprintf(env.Stdout, "         %s: %s=%s\n", group.label, name, group.facts[name])
 		}
 	}
 
 	if s.ExecStartCount > 1 {
-		fmt.Printf("         AMBIGUOUS: the unit carries %d ExecStart directives\n", s.ExecStartCount)
+		fmt.Fprintf(env.Stdout, "         AMBIGUOUS: the unit carries %d ExecStart directives\n", s.ExecStartCount)
 	}
 
 	// TWO DIFFERENT QUESTIONS, and the second is the one nothing else answers.
@@ -292,9 +291,9 @@ func printService(label string, s lifeops.ServiceFacts) {
 	switch s.ExecStartIsThisBuild {
 	case lifeops.Yes:
 	case lifeops.No:
-		fmt.Printf("         BINARY MISMATCH: this unit would run %s, %s\n", s.ExecStart, s.ExecStartWhy)
+		fmt.Fprintf(env.Stdout, "         BINARY MISMATCH: this unit would run %s, %s\n", s.ExecStart, s.ExecStartWhy)
 	case lifeops.Unknown:
-		fmt.Printf("         BINARY UNCONFIRMED: %s\n", s.ExecStartWhy)
+		fmt.Fprintf(env.Stdout, "         BINARY UNCONFIRMED: %s\n", s.ExecStartWhy)
 	}
 
 	// What it IS running matters once it is up: replacing the binary without a
@@ -304,10 +303,10 @@ func printService(label string, s lifeops.ServiceFacts) {
 		switch s.RunningIsThisBuild {
 		case lifeops.Yes:
 		case lifeops.No:
-			fmt.Printf("         RUNNING AN OLDER BINARY: %s\n", s.RunningWhy)
-			fmt.Printf("         (restart the service to pick up the installed one)\n")
+			fmt.Fprintf(env.Stdout, "         RUNNING AN OLDER BINARY: %s\n", s.RunningWhy)
+			fmt.Fprintf(env.Stdout, "         (restart the service to pick up the installed one)\n")
 		case lifeops.Unknown:
-			fmt.Printf("         RUNNING BINARY UNCONFIRMED: %s\n", s.RunningWhy)
+			fmt.Fprintf(env.Stdout, "         RUNNING BINARY UNCONFIRMED: %s\n", s.RunningWhy)
 		}
 	}
 }
