@@ -119,8 +119,19 @@ func isServeMetrics(call *ast.CallExpr, role, block string) bool {
 // servesThenChecksThenCloses recognises `v, err := app.ServeMetrics(...)`,
 // `if err != nil { return err }` and `defer v.Close(ctx)`, in that order.
 func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
+	// THE CALL ITSELF ON THE RIGHT, with the command's ctx: a wrapper that
+	// called it and returned a nil error would pass every check below.
 	as, ok := assign.(*ast.AssignStmt)
-	if !ok || len(as.Lhs) != 2 {
+	if !ok || len(as.Lhs) != 2 || len(as.Rhs) != 1 {
+		return false
+	}
+
+	call, ok := as.Rhs[0].(*ast.CallExpr)
+	if !ok || !isAppCall(call, "ServeMetrics") || len(call.Args) == 0 {
+		return false
+	}
+
+	if arg, ok := call.Args[0].(*ast.Ident); !ok || arg.Name != "ctx" {
 		return false
 	}
 

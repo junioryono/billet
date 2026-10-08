@@ -178,10 +178,28 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The handler is released and joined whatever the test concluded.
+	var started, stopped bool
+
+	// ONE OWNER FOR WHAT THE TEST STARTED, whatever it concluded: the handler
+	// is released, the endpoint closed if the test did not get that far, and a
+	// handler that began is joined, each wait bounded.
 	t.Cleanup(func() {
 		close(release)
-		<-handled
+
+		if !stopped {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+			defer cancel()
+
+			_ = srv.Close(ctx)
+		}
+
+		if started {
+			select {
+			case <-handled:
+			case <-time.After(10 * time.Second):
+				t.Error("the handler never returned")
+			}
+		}
 	})
 
 	bound, cancelBound := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
@@ -207,6 +225,7 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 
 	select {
 	case <-entered:
+		started = true
 	case err := <-answered:
 		t.Fatalf("the scrape ended (%v) before its handler began", err)
 	case <-bound.Done():
@@ -217,6 +236,7 @@ func TestCloseForcesWhatShutdownCannotFinish(t *testing.T) {
 	cancel()
 
 	closed := make(chan error, 1)
+	stopped = true
 
 	go func() { closed <- srv.Close(expired) }()
 

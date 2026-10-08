@@ -109,6 +109,7 @@ func TestCloseHandsTheEndpointALiveBoundedContext(t *testing.T) {
 
 	before := time.Now()
 	m.Close(stopping)
+	after := time.Now()
 
 	if !called {
 		t.Fatal("Close did not stop the endpoint")
@@ -118,8 +119,9 @@ func TestCloseHandsTheEndpointALiveBoundedContext(t *testing.T) {
 		t.Errorf("Close handed the endpoint a context already done (%v): the parent's cancellation reached it", live)
 	}
 
-	if deadline.IsZero() || deadline.Before(before) || deadline.After(before.Add(metricsCloseWait+time.Second)) {
-		t.Errorf("Close's context has deadline %v, want about %v after %v", deadline, metricsCloseWait, before)
+	if deadline.Before(before.Add(metricsCloseWait)) || deadline.After(after.Add(metricsCloseWait)) {
+		t.Errorf("Close's context has deadline %v, want %v after the call, between %v and %v",
+			deadline, metricsCloseWait, before.Add(metricsCloseWait), after.Add(metricsCloseWait))
 	}
 }
 
@@ -165,7 +167,8 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		answered <- resp.StatusCode
 	}()
 
-	released := false
+	var released, started, stopped bool
+
 	releaseOnce := func() {
 		if !released {
 			released = true
@@ -173,13 +176,31 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		}
 	}
 
+	// ONE OWNER FOR WHAT THE TEST STARTED, whatever it concluded: the handler
+	// is released, the endpoint closed if the test did not get that far, and a
+	// handler that began is joined, each wait bounded.
 	t.Cleanup(func() {
 		releaseOnce()
-		<-handled
+
+		if !stopped {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), metricsTestWait)
+			defer cancel()
+
+			_ = srv.Close(ctx)
+		}
+
+		if started {
+			select {
+			case <-handled:
+			case <-time.After(metricsTestWait):
+				t.Error("the handler never returned")
+			}
+		}
 	})
 
 	select {
 	case <-entered:
+		started = true
 	case code := <-answered:
 		t.Fatalf("the scrape ended (%d) before its handler began", code)
 	case <-ctx.Done():
@@ -191,13 +212,16 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 
 	closed := make(chan struct{})
 
+	stopped = true
+
 	go func() {
 		defer close(closed)
 		m.Close(stopping)
 	}()
 
 	// THE SCRAPE FINISHES AFTER CLOSE HAS BEGUN, which is when the listener
-	// refuses new connections.
+	// turns new connections away: refused, or, for one the kernel had already
+	// queued when the listener closed, reset (measured on darwin, 2026-10-08).
 	for refused := false; !refused; {
 		var d net.Dialer
 
@@ -206,7 +230,7 @@ func TestCloseLetsAScrapeInFlightFinish(t *testing.T) {
 		switch {
 		case err == nil:
 			conn.Close()
-		case errors.Is(err, syscall.ECONNREFUSED):
+		case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, syscall.ECONNRESET):
 			refused = true
 		case ctx.Err() != nil:
 			t.Fatal("the listener never closed")

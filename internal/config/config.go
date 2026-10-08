@@ -4079,15 +4079,34 @@ func socketOf(addr string) (string, int, bool) {
 
 		// A ZONE NAMES A LINK, which a loopback or an unspecified address has no
 		// use for: [::1%0] binds the socket [::1] does. A link-local address
-		// keeps its zone, because there it names which link.
+		// keeps its zone, because there it names which link, compared as the
+		// interface index the bind resolves it to.
 		if ip.WithZone("").IsLoopback() || ip.WithZone("").IsUnspecified() {
 			ip = ip.WithZone("")
+		} else if zone := ip.Zone(); zone != "" {
+			ip = ip.WithZone(zoneIndex(zone))
 		}
 
 		return ip.String(), n, true
 	}
 
 	return strings.ToLower(host), n, true
+}
+
+// zoneIndex is the scope a zone names, as the bind resolves it: a number is an
+// interface index, so %2 and %02 are one; a name is the index of the interface
+// this host has by that name, or the name itself when it has none, so an
+// unknown name is compared as written.
+func zoneIndex(zone string) string {
+	if n, err := strconv.ParseUint(zone, 10, 32); err == nil {
+		return strconv.FormatUint(n, 10)
+	}
+
+	if iface, err := net.InterfaceByName(zone); err == nil {
+		return strconv.Itoa(iface.Index)
+	}
+
+	return zone
 }
 
 // isWildcardHost reports whether a canonical listen host accepts on every
