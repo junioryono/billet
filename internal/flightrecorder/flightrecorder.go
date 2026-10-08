@@ -86,6 +86,12 @@ type Recorder struct {
 	// while one runs, and two reasons close together should both be written.
 	writing sync.Mutex
 	writes  sync.WaitGroup
+
+	// stopOnce starts the one worker that stops the runtime's recorder, and
+	// stopDone closes when it has: the runtime's Stop is not safe to run twice
+	// at once, and a Stop that timed out leaves its worker running.
+	stopOnce sync.Once
+	stopDone chan struct{}
 }
 
 // Start makes dir, a directory of its own, and starts recording.
@@ -119,6 +125,7 @@ func start(dir string, log *slog.Logger, w window, now func() time.Time) (*Recor
 
 	return &Recorder{
 		dir: dir, log: log, window: w, now: now, stopWait: stopWait, last: map[Reason]time.Time{},
+		stopDone: make(chan struct{}),
 	}, nil
 }
 
@@ -258,19 +265,20 @@ func (r *Recorder) Stop() {
 	r.stopped = true
 	r.mu.Unlock()
 
-	stopped := make(chan struct{})
-
-	go func() {
-		r.writes.Wait()
-		r.window.Stop()
-		close(stopped)
-	}()
+	// ONE WORKER, whichever Stop starts it; every Stop waits on it.
+	r.stopOnce.Do(func() {
+		go func() {
+			r.writes.Wait()
+			r.window.Stop()
+			close(r.stopDone)
+		}()
+	})
 
 	bound := time.NewTimer(r.stopWait)
 	defer bound.Stop()
 
 	select {
-	case <-stopped:
+	case <-r.stopDone:
 	case <-bound.C:
 		r.log.Error("flight recorder: still writing a snapshot or stopping the recorder when the "+
 			"process stopped; it is left unfinished", "dir", r.dir, "waited", r.stopWait)

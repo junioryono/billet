@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,6 +26,7 @@ type fakeWindow struct {
 	writeErr error
 	// stopGate, when set, holds Stop until it is closed.
 	stopGate chan struct{}
+	stops    int
 }
 
 func (w *fakeWindow) Start() error {
@@ -37,6 +39,11 @@ func (w *fakeWindow) Start() error {
 }
 
 func (w *fakeWindow) Stop() {
+	// COUNTED ON ENTRY, so two stops at once are two even while both wait.
+	w.mu.Lock()
+	w.stops++
+	w.mu.Unlock()
+
 	if w.stopGate != nil {
 		<-w.stopGate
 	}
@@ -366,7 +373,13 @@ func TestStopDoesNotWaitForeverForTheRecorderToStop(t *testing.T) {
 	r, _ := startFake(t, t.TempDir(), w)
 	r.stopWait = 50 * time.Millisecond
 
-	t.Cleanup(func() { close(w.stopGate) })
+	var opened atomic.Bool
+
+	t.Cleanup(func() {
+		if opened.CompareAndSwap(false, true) {
+			close(w.stopGate)
+		}
+	})
 
 	stopped := make(chan struct{})
 
@@ -379,6 +392,24 @@ func TestStopDoesNotWaitForeverForTheRecorderToStop(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop waited past its bound for a recorder that would not stop")
+	}
+
+	// A SECOND STOP STARTS NO SECOND STOP OF THE RUNTIME'S, which is not safe
+	// to run twice at once: once the recorder lets go, it was stopped once.
+	r.Stop()
+
+	if opened.CompareAndSwap(false, true) {
+		close(w.stopGate)
+	}
+
+	r.stopWait = 5 * time.Second
+	r.Stop()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.stops != 1 {
+		t.Errorf("three Stops stopped the runtime's recorder %d times, want once", w.stops)
 	}
 }
 

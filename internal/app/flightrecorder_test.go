@@ -162,9 +162,9 @@ func TestALostClaimTheWatcherMissedIsRecordedOnClose(t *testing.T) {
 
 // THE RECORDER IS WIRED WHERE IT IS ASKED: Schedule hands the listeners this
 // controller's heartbeatOverrun, and BecomeController hands the fence this
-// controller's recorder and Close the ledger's LeadershipLost. A structural test, because the tests above call both
-// directly and neither would notice the wire being cut; the control plane
-// that would is one polling GitHub.
+// controller's recorder and Close the ledger's LeadershipLost. A structural
+// test, because the tests above call both directly and neither would notice
+// the wire being cut; the control plane that would is one polling GitHub.
 func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 	t.Parallel()
 
@@ -175,7 +175,7 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var overrun, fence, lost bool
+	var overrun, fence, lost, overwritten bool
 
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -184,22 +184,19 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		}
 
 		ast.Inspect(fn, func(n ast.Node) bool {
-			// THE CONTROLLER'S claimLost IS THE LEDGER'S LeadershipLost, which
-			// Close asks: set where BecomeController makes the Controller.
-			if lit, ok := n.(*ast.CompositeLit); ok && isMethod(fn, "ControlPlane", "BecomeController") {
-				for _, elt := range lit.Elts {
-					kv, ok := elt.(*ast.KeyValueExpr)
-					if !ok {
-						continue
+			// THE CONTROLLER'S claimLost IS ITS OWN LEDGER'S LeadershipLost,
+			// which Close asks: set in the `ctl := &Controller{...}` that
+			// BecomeController returns, cp being its receiver, and never
+			// assigned again.
+			if assign, ok := n.(*ast.AssignStmt); ok && isMethod(fn, "ControlPlane", "BecomeController") &&
+				bindsItsControlPlane(fn) {
+				for i, lhs := range assign.Lhs {
+					if isSelector(lhs, "ctl", "claimLost") {
+						overwritten = true
 					}
 
-					key, ok := kv.Key.(*ast.Ident)
-					if !ok || key.Name != "claimLost" {
-						continue
-					}
-
-					if sel, ok := kv.Value.(*ast.SelectorExpr); ok && sel.Sel.Name == "LeadershipLost" &&
-						isSelector(sel.X, "cp", "db") {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name == "ctl" && i < len(assign.Rhs) &&
+						setsClaimLost(assign.Rhs[i]) {
 						lost = true
 					}
 				}
@@ -230,10 +227,46 @@ func TestTheFlightRecorderIsWiredToItsTwoReasons(t *testing.T) {
 		t.Error("BecomeController does not hand stopWhenReplaced ctl.recorder: a lost claim would leave no trace")
 	}
 
-	if !lost {
-		t.Error("BecomeController does not set the Controller's claimLost to cp.db.LeadershipLost: " +
-			"a lost claim the fence's watcher missed would leave no trace")
+	if !lost || overwritten {
+		t.Error("BecomeController does not make ctl with claimLost: cp.db.LeadershipLost, or assigns it " +
+			"again: a lost claim the fence's watcher missed would leave no trace")
 	}
+}
+
+// setsClaimLost reports whether e is `&Controller{..., claimLost:
+// cp.db.LeadershipLost, ...}`.
+func setsClaimLost(e ast.Expr) bool {
+	addr, ok := e.(*ast.UnaryExpr)
+	if !ok || addr.Op != token.AND {
+		return false
+	}
+
+	lit, ok := addr.X.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+
+	if typ, ok := lit.Type.(*ast.Ident); !ok || typ.Name != "Controller" {
+		return false
+	}
+
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != "claimLost" {
+			continue
+		}
+
+		sel, ok := kv.Value.(*ast.SelectorExpr)
+
+		return ok && sel.Sel.Name == "LeadershipLost" && isTheControlPlanesLedger(sel.X)
+	}
+
+	return false
 }
 
 func isSelectorCall(call *ast.CallExpr, pkg, name string) bool {
