@@ -31,6 +31,7 @@ import (
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
@@ -308,7 +309,7 @@ func runServer(
 // notifications, and stdout for the lines an operator reads.
 func serverHost(env cli.Env) app.Host {
 	return app.Host{
-		ServerAccess:  serverWireAccess,
+		ServerAccess:  hostauthority.ServerWireAccess,
 		AuthorityLock: authorityLockAccess,
 		Ready:         func() error { return notifyReady(env) },
 		Status:        func(text string) error { return notifyStatus(env, text) },
@@ -881,7 +882,7 @@ func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 	// load: `recordIssued` opens the ledger, which creates the directory and its
 	// lock on first use, and an issue interrupted by a closure between the load
 	// and the record would otherwise open a directory a retirement had moved.
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Create: true, Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}
@@ -1059,7 +1060,7 @@ func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
 			"authority", *cfgPath)
 	}
 
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Create: true, Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}

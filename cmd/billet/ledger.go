@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -59,7 +60,7 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 	// this open now waits for rather than racing. THE HAND-BACK BELONGS TO THE
 	// ATTEMPT, not to the handle: the opener creates the directory lock before
 	// it connects, so a failed open leaves a root-owned file too.
-	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+	err = hostauthority.Under(ctx, cfg.Server.IdentityDir, func() error {
 		var openErr error
 
 		if cfg.Server.LedgerBackend() == config.StatePostgres {
@@ -68,7 +69,7 @@ func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, e
 			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
 		}
 
-		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+		return errors.Join(openErr, hostauthority.HandBackLedger(cfg.Server.IdentityDir))
 	})
 	if err != nil {
 		return nil, errors.Join(err, closeIfOpen(db))
@@ -104,7 +105,7 @@ func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn state.DSN) 
 
 	// Under the identity exclusion and with the hand-back on the attempt, as in
 	// openStateForDecision.
-	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
+	err = hostauthority.Under(ctx, cfg.Server.IdentityDir, func() error {
 		var openErr error
 
 		if cfg.Server.LedgerBackend() == config.StatePostgres {
@@ -115,7 +116,7 @@ func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn state.DSN) 
 				state.WithRunningRelease(version.Version()))
 		}
 
-		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
+		return errors.Join(openErr, hostauthority.HandBackLedger(cfg.Server.IdentityDir))
 	})
 	if err != nil {
 		return nil, errors.Join(err, closeIfOpen(db))

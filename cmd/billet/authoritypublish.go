@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/hostauthority"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
@@ -16,7 +17,7 @@ import (
 // shape app.WithAuthorityLock wants: the whole exclusion, non-blocking, creating
 // nothing, as an operator command wants.
 func authorityLockAccess(ctx context.Context, dir string) (func() error, error) {
-	acc, err := openIdentityAccess(ctx, dir, identityIntent{})
+	acc, err := hostauthority.Open(ctx, dir, hostauthority.Intent{})
 	if err != nil {
 		return nil, err
 	}

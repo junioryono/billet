@@ -1,4 +1,4 @@
-package main
+package hostauthority
 
 import (
 	"errors"
@@ -6,11 +6,12 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
 
-// hostLockDir is where the lifecycle lock lives. A variable so a test can put it
+// LockDir is where the lifecycle lock lives. A variable so a test can put it
 // somewhere writable; nothing else changes it.
 //
 // macOS HAS NO /var/lock AT ALL, so the Linux path is not merely unconventional
@@ -18,13 +19,11 @@ import (
 // doing anything else. And these commands refuse to run as root on macOS,
 // because a launch agent lives in a logged-in user's domain, so the lock belongs
 // somewhere that account owns rather than in a root-owned system directory.
-var hostLockDir = defaultHostLockDir()
+var LockDir = DefaultLockDir(runtime.GOOS)
 
-func defaultHostLockDir() string {
-	// THE SAME SEAM EVERY OTHER PLATFORM DECISION IN THIS PACKAGE USES, so a
-	// test pinning hostOS gets the lock path that goes with it rather than the
-	// one belonging to the machine running the test.
-	if hostOS != "darwin" {
+// DefaultLockDir is the lifecycle lock's directory on platform.
+func DefaultLockDir(platform string) string {
+	if platform != "darwin" {
 		return "/var/lock"
 	}
 
@@ -38,7 +37,7 @@ func defaultHostLockDir() string {
 	return filepath.Join(os.TempDir(), "billet")
 }
 
-// hostLock keeps two lifecycle commands from interleaving on one machine.
+// LifecycleLock keeps two lifecycle commands from interleaving on one machine.
 //
 // WHAT IT PREVENTS is a pair that each behave correctly alone: `billet local up`
 // starting the services that `billet local down` has just proved idle and is
@@ -55,19 +54,20 @@ func defaultHostLockDir() string {
 // It is NOT the state directory lock. That one excludes a second control plane;
 // this one excludes a second lifecycle command, and a host with no server has no
 // state directory to lock at all.
-type hostLock struct{ file *os.File }
+type LifecycleLock struct{ file *os.File }
 
-// takeHostLock acquires it, or says who has it in terms an operator can act on.
+// TakeLifecycleLock acquires it, or says who has it in terms an operator can act
+// on.
 //
 // It takes no configuration: the exclusion is between COMMANDS on this machine,
 // not between deployments, and a host with no server section has no state
 // directory to key it off anyway.
-func takeHostLock() (*hostLock, error) {
-	if err := os.MkdirAll(hostLockDir, 0o755); err != nil {
-		return nil, fmt.Errorf("billet local: make the lock directory %s: %w", hostLockDir, err)
+func TakeLifecycleLock() (*LifecycleLock, error) {
+	if err := os.MkdirAll(LockDir, 0o755); err != nil {
+		return nil, fmt.Errorf("billet local: make the lock directory %s: %w", LockDir, err)
 	}
 
-	path := filepath.Join(hostLockDir, "billet-lifecycle.lock")
+	path := filepath.Join(LockDir, "billet-lifecycle.lock")
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -90,13 +90,13 @@ func takeHostLock() (*hostLock, error) {
 		return nil, fmt.Errorf("billet local: lock %s: %w", path, err)
 	}
 
-	return &hostLock{file: file}, nil
+	return &LifecycleLock{file: file}, nil
 }
 
-// release drops the lock, unlocking before it closes for probeLock.release's
-// reason: a child forked meanwhile shares the open file description until it
-// execs, and closing only this descriptor would leave the lock held.
-func (l *hostLock) release() error {
+// Release drops the lock, unlocking before it closes: a child forked meanwhile
+// shares the open file description until it execs, and closing only this
+// descriptor would leave the lock held.
+func (l *LifecycleLock) Release() error {
 	if l == nil || l.file == nil {
 		return nil
 	}
@@ -105,3 +105,7 @@ func (l *hostLock) release() error {
 
 	return errors.Join(unlockErr, l.file.Close())
 }
+
+// takeLifecycleLock is the take a fresh root initialisation makes, a variable
+// so a test can stand in for a lock only root can create.
+var takeLifecycleLock = TakeLifecycleLock

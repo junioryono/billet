@@ -11,6 +11,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -145,7 +146,7 @@ func runLocalBackup(ctx context.Context, env cli.Env, o backupOptions) error {
 
 	// THE EXCLUSION BEFORE THE LEDGER OPEN, which creates on a fresh directory,
 	// and lent to the archive's write below so it does not take it again.
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}

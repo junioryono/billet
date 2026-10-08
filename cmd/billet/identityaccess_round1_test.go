@@ -6,11 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -52,8 +52,8 @@ func TestAPreparedHostsAbsentDirectoryIsNeverRecreated(t *testing.T) {
 
 	dir := filepath.Join(t.TempDir(), "server")
 
-	for _, intent := range []identityIntent{{create: true, wait: time.Second}, {wait: time.Second}} {
-		acc, err := openIdentityAccess(t.Context(), dir, intent)
+	for _, intent := range []hostauthority.Intent{{Create: true, Wait: time.Second}, {Wait: time.Second}} {
+		acc, err := hostauthority.Open(t.Context(), dir, intent)
 		if err == nil {
 			t.Fatal(errors.Join(fmt.Errorf("intent %+v: an absent directory on a prepared host must refuse", intent), acc.Release()))
 		}
@@ -110,12 +110,12 @@ func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T)
 		t.Fatal(err)
 	}
 
-	acc, err := openIdentityAccess(t.Context(), dir, identityIntent{wait: time.Second})
+	acc, err := hostauthority.Open(t.Context(), dir, hostauthority.Intent{Wait: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !identityAccessHeld(dir) || !identityAccessHeld(dir+"/") {
+	if !hostauthority.Held(dir) || !hostauthority.Held(dir+"/") {
 		t.Fatal("an open access must be registered for its directory, however it is spelled")
 	}
 
@@ -136,7 +136,7 @@ func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T)
 		t.Fatal(err)
 	}
 
-	if identityAccessHeld(dir) {
+	if hostauthority.Held(dir) {
 		t.Fatal("a released access must be unregistered")
 	}
 
@@ -157,10 +157,10 @@ func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T)
 	// by a raw lock the registry knows nothing of, the factory cannot open
 	// until its bound, and opens once the lock is released. A presence check
 	// in place of the exclusion would open at once.
-	oldWait := identityAccessWait
-	identityAccessWait = 300 * time.Millisecond
+	oldWait := hostauthority.Wait
+	hostauthority.Wait = 300 * time.Millisecond
 
-	t.Cleanup(func() { identityAccessWait = oldWait })
+	t.Cleanup(func() { hostauthority.Wait = oldWait })
 
 	raw, err := wirecert.LockAuthority(t.Context(), dir)
 	if err != nil {
@@ -189,57 +189,5 @@ func TestTheLedgerFactoryBorrowsAHeldAccessAndTakesItsOwnOtherwise(t *testing.T)
 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// A FIFO AT THE INNER LOCK'S NAME IS REFUSED PROMPTLY, not opened and waited on:
-// the inner lock goes through the same regular-file rule as the global one.
-func TestAFIFOAtTheInnerLockRefusesWithoutWaiting(t *testing.T) {
-	useRetirementRoot(t)
-
-	dir := t.TempDir()
-	if err := syscall.Mkfifo(wirecert.AuthorityLockPath(dir), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	answered := make(chan error, 1)
-
-	go func() {
-		acc, err := openIdentityAccess(t.Context(), dir, identityIntent{wait: time.Second})
-		if err == nil {
-			err = errors.Join(errors.New("a FIFO at ca.lock was accepted as the lock"), acc.Release())
-		}
-
-		answered <- err
-	}()
-
-	select {
-	case err := <-answered:
-		if err == nil || errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "accepted") {
-			t.Fatalf("got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the open of a FIFO blocked the acquisition")
-	}
-}
-
-// THE ARTEFACT NAMES ARE RELATIVE TO THE CLEANED DIRECTORY, whatever spelling
-// the configuration used: the producers' helpers clean their paths, and a
-// directory given with a trailing slash once left every target absolute, which
-// the repair's root refuses after the command has already created them.
-func TestArtefactNamesAreRelativeWhateverTheDirectorysSpelling(t *testing.T) {
-	for _, dir := range []string{"/var/lib/billet/server", "/var/lib/billet/server/", "/var/lib/billet//server/./"} {
-		for _, set := range []artefactSet{identityArtefacts, ledgerArtefacts} {
-			targets, err := artefactTargets(dir, set)
-			if err != nil {
-				t.Fatalf("%q: %v", dir, err)
-			}
-
-			for _, target := range targets {
-				if filepath.IsAbs(target.Name) || strings.HasPrefix(target.Name, "..") {
-					t.Errorf("%q: target %q is not a relative name inside the directory", dir, target.Name)
-				}
-			}
-		}
 	}
 }

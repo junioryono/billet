@@ -11,6 +11,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -223,7 +224,7 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	}
 
 	defer func() {
-		if err := lock.release(); err != nil {
+		if err := lock.Release(); err != nil {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
@@ -238,8 +239,8 @@ func runLocalRecover(ctx context.Context, env cli.Env, o recoverOptions) error {
 	if stage != recoverPublished {
 		fmt.Fprintln(env.Stdout)
 
-		acc, aerr := openIdentityAccess(ctx, plan.Target.StateDir,
-			identityIntent{wait: identityAccessWait, lifecycleHeld: true})
+		acc, aerr := hostauthority.Open(ctx, plan.Target.StateDir,
+			hostauthority.Intent{Wait: hostauthority.Wait, LifecycleHeld: true})
 		if aerr != nil {
 			return aerr
 		}
@@ -604,7 +605,7 @@ func runRecoverAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archiv
 	}
 
 	defer func() {
-		if err := lock.release(); err != nil {
+		if err := lock.Release(); err != nil {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()

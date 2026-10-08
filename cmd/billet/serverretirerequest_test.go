@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
@@ -1004,11 +1005,11 @@ func installRetireHostManager(t *testing.T, f *requestFixture) {
 	savedConverge := converge
 	converge = func(...lifeops.ConvergeOption) converger { return f.manager }
 
-	savedLockDir := hostLockDir
-	hostLockDir = t.TempDir()
+	savedLockDir := hostauthority.LockDir
+	hostauthority.LockDir = t.TempDir()
 
 	t.Cleanup(func() {
 		converge = savedConverge
-		hostLockDir = savedLockDir
+		hostauthority.LockDir = savedLockDir
 	})
 }

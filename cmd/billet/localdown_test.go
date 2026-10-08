@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -85,10 +86,10 @@ func stageDown(t *testing.T, f *fakeConverger, running ...string) *fakeConverger
 	t.Cleanup(func() { converge, inspect, lifecycleLock = realConverge, realInspect, realLock })
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }
-	lifecycleLock = func() (*hostLock, error) {
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
 		f.record("lock")
 
-		return &hostLock{}, nil
+		return &hostauthority.LifecycleLock{}, nil
 	}
 
 	facts := func(name string) lifeops.ServiceFacts {

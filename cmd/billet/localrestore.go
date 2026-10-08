@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deployarchive"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/state"
@@ -204,7 +205,7 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 	}
 
 	defer func() {
-		if err := lock.release(); err != nil {
+		if err := lock.Release(); err != nil {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
@@ -214,8 +215,8 @@ func runLocalRestore(ctx context.Context, env cli.Env, o restoreOptions) error {
 	// AUTHORITY BEFORE DIRECTORY, the order every command takes them in now; a
 	// bare target is initialised under the lock beside it, borrowing the
 	// lifecycle lock this command already holds rather than refusing itself.
-	acc, err := openIdentityAccess(ctx, plan.Target.StateDir,
-		identityIntent{create: true, wait: identityAccessWait, lifecycleHeld: true})
+	acc, err := hostauthority.Open(ctx, plan.Target.StateDir,
+		hostauthority.Intent{Create: true, Wait: hostauthority.Wait, LifecycleHeld: true})
 	if err != nil {
 		return err
 	}
@@ -735,7 +736,7 @@ func runRestoreAbandon(ctx context.Context, env cli.Env, a *deployarchive.Archiv
 	}
 
 	defer func() {
-		if err := lock.release(); err != nil {
+		if err := lock.Release(); err != nil {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()

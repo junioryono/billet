@@ -1,6 +1,10 @@
 package cli
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/junioryono/billet/internal/retirement"
+)
 
 // ExitError is a failure that names the status the process exits with.
 //
@@ -38,9 +42,18 @@ func (e *ExitError) ExitCode() int { return e.Code }
 // A FUNCTION RATHER THAN FOUR LINES IN main, because the first test written for this
 // replicated the decision instead of exercising it, and passed against the very bug
 // it described.
+//
+// AND ONE REFUSAL BY ITS TYPE: a host whose authority a retirement has closed
+// answers retirement.ExitRetiring, which the retirement reads back from a timer
+// unit's status, wherever in the command the refusal was met.
 func ExitStatus(err error) int {
 	if coded, ok := errors.AsType[*ExitError](err); ok {
 		return coded.Code
+	}
+
+	//nolint:errcheck // the match is the answer: the refusal is err itself, classified, not a second error
+	if _, ok := errors.AsType[retirement.ErrRetiring](err); ok {
+		return retirement.ExitRetiring
 	}
 
 	return 1

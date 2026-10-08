@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/state"
 )
@@ -630,14 +631,14 @@ func TestTheLifecycleLockCoversTheStopToArchiveWindow(t *testing.T) {
 	held := map[string]bool{}
 
 	note := func(when string) {
-		l, err := takeHostLock()
+		l, err := hostauthority.TakeLifecycleLock()
 		if err != nil {
 			held[when] = true
 
 			return
 		}
 
-		mustOK(t, l.release())
+		mustOK(t, l.Release())
 	}
 
 	f.svc.onStop = func(unit string) {
