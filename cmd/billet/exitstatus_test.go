@@ -89,8 +89,19 @@ func TestMainHandsCommandsTheProcessStreams(t *testing.T) {
 					}
 				}
 			case *ast.UnaryExpr:
-				if r, isID := x.X.(*ast.Ident); isID && r.Name == id.Name && x.Op == token.AND {
-					t.Error("main takes the env's address, so something could change it before cli.Main")
+				root := ast.Unparen(x.X)
+				for {
+					sel, isSel := root.(*ast.SelectorExpr)
+					if !isSel {
+						break
+					}
+
+					root = ast.Unparen(sel.X)
+				}
+
+				if r, isID := root.(*ast.Ident); isID && r.Name == id.Name && x.Op == token.AND {
+					t.Errorf("main takes the address of %s, so something could change the env before cli.Main",
+						types.ExprString(x.X))
 				}
 			}
 
