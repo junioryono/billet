@@ -638,6 +638,21 @@ func (s *stub) argv(t *testing.T) string {
 	return string(b)
 }
 
+// sampledApart is newProvider for a test whose runner must be found dead: the
+// two samples a proof needs are taken a second apart, as in production. At the
+// stub's millisecond a runner that exits at once can still be running for both
+// on a loaded machine, and the launch is then proved; CI's test job saw exactly
+// that once (2026-10-08). A dead runner still fails at the first sample, so
+// the second is paid only when the first happened to find it alive.
+func sampledApart(t *testing.T, s *stub) *Provider {
+	t.Helper()
+
+	p := newProvider(t, s)
+	p.proveRetry = time.Second
+
+	return p
+}
+
 func newProvider(t *testing.T, s *stub) *Provider {
 	t.Helper()
 
@@ -1654,7 +1669,7 @@ func TestTheClaimIsTakenEvenWhenTheSpawnNeverAnnounces(t *testing.T) {
 // report a runner for a job that will sit queued.
 func TestALaunchWhoseRunnerDiesImmediatelyIsAFailure(t *testing.T) {
 	s := newStub(t)
-	p := newProvider(t, s)
+	p := sampledApart(t, s)
 
 	spec := validSpec("billet-lease1")
 	spec.Command = []string{"/bin/sh", "-c", "exit 0"}
@@ -1731,7 +1746,7 @@ func TestAMissingTierCommandIsReportedAsMissing(t *testing.T) {
 // error under any circumstances.
 func TestNothingTheGuestWroteReachesTheLaunchError(t *testing.T) {
 	s := newStub(t)
-	p := newProvider(t, s)
+	p := sampledApart(t, s)
 
 	const canary = "ghp-CANARY-THIS-IS-A-JOB-SECRET"
 
