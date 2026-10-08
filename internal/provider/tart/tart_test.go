@@ -1,6 +1,7 @@
 package tart
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -1454,12 +1455,9 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 				// Long enough for the first sample to have finished, and well
 				// inside the two-second gap before the second one.
 				time.Sleep(300 * time.Millisecond)
-				// REAPED, not merely killed. A killed child stays a zombie
-				// until its parent waits, and `kill -0` on a zombie SUCCEEDS —
-				// so without the wait the second sample still reads the corpse
-				// as a living runner. In a real guest the runner is reparented
-				// to init, which reaps it promptly; here the parent is this
-				// test process.
+				// Killed and reaped, as a guest's init would reap it. A zombie
+				// reads as dead too (TestAZombieRunnerIsNotProved), so this
+				// test does not depend on the wait.
 				stopStandIn(t, victim)
 
 				return
@@ -1480,6 +1478,74 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "not running") && !strings.Contains(err.Error(), "never stayed") {
 		t.Errorf("Launch = %v, want an error naming the dead runner", err)
+	}
+}
+
+// A ZOMBIE IS NOT A RUNNING RUNNER. A runner that exited and was not yet
+// reaped still answers `kill -0` and still carries its start time, so its
+// identity matches; without billet_zombie the proof called it alive on both
+// platforms (measured 2026-10-08). Here a real zombie is the announced runner:
+// a child whose parent never waits for it.
+func TestAZombieRunnerIsNotProved(t *testing.T) {
+	s := newStub(t)
+
+	parent := exec.CommandContext(t.Context(), "/bin/sh", "-c", `sleep 0 & echo "$!"; exec sleep 120`)
+
+	out, err := parent.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := parent.Start(); err != nil {
+		t.Fatalf("start the zombie's parent: %v", err)
+	}
+
+	// Killing the parent hands the zombie to init, which reaps it.
+	t.Cleanup(func() { stopStandIn(t, parent) })
+
+	line, err := bufio.NewReader(out).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read the zombie's pid: %v", err)
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("the zombie's pid %q: %v", line, err)
+	}
+
+	// A ZOMBIE BEFORE IT IS ANNOUNCED, established rather than assumed.
+	until := time.Now().Add(10 * time.Second)
+
+	for {
+		state, err := exec.CommandContext(t.Context(), "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		if err == nil && strings.Contains(string(state), "Z") {
+			break
+		}
+
+		if time.Now().After(until) {
+			t.Fatalf("process %d never became a zombie (state %q, ps: %v)", pid, state, err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for name, body := range map[string]string{
+		launchClaim:     "",
+		runnerBirthFile: birthToken(t, pid),
+		runnerPIDFile:   strconv.Itoa(pid) + "\n",
+	} {
+		if err := os.WriteFile(filepath.Join(s.guestHome, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("plant %s: %v", name, err)
+		}
+	}
+
+	_, err = newProvider(t, s).Launch(t.Context(), validSpec("billet-lease1"))
+	if err == nil {
+		t.Fatal("Launch proved a runner that had exited and was not yet reaped")
+	}
+
+	if !strings.Contains(err.Error(), "the guest says dead") {
+		t.Errorf("Launch = %v, want the zombie reported dead", err)
 	}
 }
 

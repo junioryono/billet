@@ -1654,6 +1654,24 @@ const birthFunc = `billet_birth() {
 }
 `
 
+// zombieFunc defines billet_zombie, which succeeds when a pid names a process
+// that has exited and not been reaped. Such a process still answers `kill -0`
+// and still carries its start time, so billet_birth matches it: measured on
+// macOS and on Ubuntu 24.04 (2026-10-08), a dead runner whose parent had not
+// yet waited for it was proved alive. It fails, and so decides nothing, where
+// neither /proc nor ps can say.
+const zombieFunc = `billet_zombie() {
+  if [ -r "/proc/$1/stat" ]; then
+    _z=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    _z=${_z##*') '}
+    case "$_z" in Z*) return 0 ;; esac
+    return 1
+  fi
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) return 0 ;; esac
+  return 1
+}
+`
+
 // proveRunning asks the guest whether the runner it was told to start is still
 // alive, and fails the launch when it is not.
 //
@@ -1680,11 +1698,12 @@ func (p *Provider) proveRunning(ctx context.Context, name string) error {
 	// billet older than this one leaves — read as `alive` on nothing more than a
 	// pid being in use, and a recycled number then adopted a stranger. Absent,
 	// unreadable and mismatched are all "cannot prove this is our runner".
-	script := birthFunc + `p=$(cat "$HOME/` + runnerPIDFile + `" 2>/dev/null || true)
+	script := birthFunc + zombieFunc + `p=$(cat "$HOME/` + runnerPIDFile + `" 2>/dev/null || true)
 b=$(cat "$HOME/` + runnerBirthFile + `" 2>/dev/null || true)
 if [ -z "$p" ]; then echo no-pid; exit 0; fi
 if [ -z "$b" ]; then echo no-identity; exit 0; fi
 if ! kill -0 "$p" 2>/dev/null; then echo dead; exit 0; fi
+if billet_zombie "$p"; then echo dead; exit 0; fi
 now=$(billet_birth "$p" || true)
 if [ -z "$now" ]; then echo unreadable; exit 0; fi
 if [ "$now" != "$b" ]; then echo recycled; exit 0; fi
