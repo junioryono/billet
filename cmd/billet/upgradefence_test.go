@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -36,8 +37,8 @@ func installedManifest(t *testing.T) *releasesource.Manifest {
 		Wire:         releasesource.Range{Min: nodeapi.MinVersion, Max: nodeapi.Version},
 		LedgerSchema: state.LatestSchemaVersion(),
 		Artifacts: []releasesource.Artifact{{
-			Name:   "billet_" + hostOS + "_" + runtime.GOARCH + ".tar.gz",
-			OS:     hostOS,
+			Name:   "billet_" + cli.HostOS + "_" + runtime.GOARCH + ".tar.gz",
+			OS:     cli.HostOS,
 			Arch:   runtime.GOARCH,
 			Kind:   releasesource.KindArchive,
 			SHA256: strings.Repeat("a", 64),

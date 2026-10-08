@@ -34,7 +34,7 @@ ignore:
   # Anything carrying real semantics must not live in this file, precisely
   # because the exclusion hides it. The App key handling — reserving it, writing
   # it atomically, validating what `billet check` will accept — sits in
-  # githubapp.go for that reason, where its coverage counts.
+  # internal/ops/setup/githubapp.go for that reason, where its coverage counts.
   - "cmd/billet/main.go"
 
 comment:

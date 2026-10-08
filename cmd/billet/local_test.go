@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops"
 )
 
@@ -88,9 +89,9 @@ func writeLocalConfig(t *testing.T) string {
 // asserted here for EVERY subcommand rather than for the one that happens to be
 // convenient.
 func TestLocalRefusesAHostWithNeitherServiceManager(t *testing.T) {
-	prev := hostOS
-	hostOS = "plan9"
-	t.Cleanup(func() { hostOS = prev })
+	prev := cli.HostOS
+	cli.HostOS = "plan9"
+	t.Cleanup(func() { cli.HostOS = prev })
 
 	cfg := writeLocalConfig(t)
 
@@ -115,9 +116,9 @@ func TestLocalRefusesAHostWithNeitherServiceManager(t *testing.T) {
 // used to name darwin was the whole of the macOS lifecycle for a while, and its
 // absence is the thing worth asserting.
 func TestLocalAdmitsAMac(t *testing.T) {
-	prev := hostOS
-	hostOS = "darwin"
-	t.Cleanup(func() { hostOS = prev })
+	prev := cli.HostOS
+	cli.HostOS = "darwin"
+	t.Cleanup(func() { cli.HostOS = prev })
 
 	err := cmdLocal(t.Context(), processEnv(), []string{"nonsense", "--config", writeLocalConfig(t)})
 	if err == nil {

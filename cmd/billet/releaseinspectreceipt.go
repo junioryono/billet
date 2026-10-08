@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/regularfile"
 )
@@ -38,7 +39,7 @@ func endpointReceiptPathFor(platform string) string {
 
 // receiptPath is the receipt's path for this host, a variable so a fixture
 // can point both readers at a temporary one.
-var receiptPath = endpointReceiptPathFor(hostOS)
+var receiptPath = endpointReceiptPathFor(cli.HostOS)
 
 // maxReceiptBytes bounds the receipt: a longer file is not one billet wrote.
 const maxReceiptBytes = 4096
@@ -409,7 +410,7 @@ type receiptReport struct {
 // for a failed examination, and otherwise the typed presence, judged whether
 // or not the node runs.
 func hostEndpointReceipt() maybe {
-	if hostOS == "darwin" || receiptPath == "" {
+	if cli.HostOS == "darwin" || receiptPath == "" {
 		return unknown("no endpoint receipt on this platform")
 	}
 

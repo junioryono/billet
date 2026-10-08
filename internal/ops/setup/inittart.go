@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"errors"
@@ -31,7 +31,7 @@ var hostGOARCH = runtime.GOARCH
 // command. Refused here rather than written and then refused at startup, which is
 // the rule the whole provider switch follows.
 func refuseTartOffAppleSilicon(profile initconfig.Profile, namedHost bool) error {
-	if hostOS == "darwin" && hostGOARCH == "arm64" {
+	if cli.HostOS == "darwin" && hostGOARCH == "arm64" {
 		return nil
 	}
 
@@ -64,7 +64,7 @@ func refuseTartOffAppleSilicon(profile initconfig.Profile, namedHost bool) error
 	// under this account's config directory and it configures no lock at all — so
 	// naming /usr/local there describes a shape the file does not have.
 	switch {
-	case hostOS == "darwin":
+	case cli.HostOS == "darwin":
 	case profile == initconfig.ProfileLocalService:
 		derived = append(derived, "the state, key and lock paths are this platform's rather "+
 			"than the ones a Mac's launch agents read under /usr/local")
@@ -79,7 +79,7 @@ func refuseTartOffAppleSilicon(profile initconfig.Profile, namedHost bool) error
 		"Not merely a platform check: what billet fills in for this backend is read from the "+
 		"machine running the command — %s. There is no `--emit` path for a Mac either, "+
 		"because the junioryono.billet.host role is Linux-only",
-		hostOS, hostGOARCH, strings.Join(derived, ", and "))
+		cli.HostOS, hostGOARCH, strings.Join(derived, ", and "))
 }
 
 // detectHostCapacity is config.DetectHostCapacity behind a seam, so a generation

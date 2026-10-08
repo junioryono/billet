@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
@@ -167,9 +169,9 @@ func TestLocalRestorePutsTheDeploymentBack(t *testing.T) {
 	// THE STAGING FILE MUST BE GONE. os.Link leaves two names for one private
 	// key, and an unreported second copy of an App key is what nobody finds
 	// until it matters.
-	if _, err := os.Lstat(stagingPath(tgt.keyPath)); !os.IsNotExist(err) {
+	if _, err := os.Lstat(setup.StagingPath(tgt.keyPath)); !os.IsNotExist(err) {
 		t.Errorf("a second copy of the App key was left at %s (%v)",
-			stagingPath(tgt.keyPath), err)
+			setup.StagingPath(tgt.keyPath), err)
 	}
 
 	if _, err := os.Lstat(state.MaintenanceFencePath(tgt.stateDir)); !os.IsNotExist(err) {

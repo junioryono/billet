@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"bytes"
@@ -21,23 +21,26 @@ import (
 	"github.com/junioryono/billet/internal/regularfile"
 )
 
-// onboard is github.Onboard behind a seam, so the refusals in front of it are
+// Onboard is github.Onboard behind a seam, so the refusals in front of it are
 // reachable from a test.
 //
 // Without one they are not reachable at all: the only way past github.Onboard is
 // an operator with a browser and the hour GitHub allows, so deleting the whole
 // preflight left every assertion green — and what the preflight protects is a
 // credential GitHub issues exactly once.
-var onboard = github.Onboard
+//
+// EXPORTED FOR THAT ONLY: a test in cmd/billet that drives `github-app create`
+// end to end sets it too. Production never assigns it.
+var Onboard = github.Onboard
 
-func cmdGitHubApp(ctx context.Context, env cli.Env, args []string) error {
+func GitHubApp(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet github-app create --org <org>")
 	}
 
 	switch args[0] {
 	case "create":
-		return githubAppCreate(ctx, env, args[1:])
+		return GitHubAppCreate(ctx, env, args[1:])
 	case "store-key":
 		return githubAppStoreKey(ctx, env, args[1:])
 	case "-h", "--help":
@@ -68,7 +71,7 @@ func cmdGitHubApp(ctx context.Context, env cli.Env, args []string) error {
 // its private key is spent: planConfigEdit proves the file can take the block
 // and reserveKeyFile proves the key has somewhere to go, and only then does
 // anything reach GitHub.
-func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
+func GitHubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet github-app create", env.Stdout)
 	org := fs.String("org", "", "GitHub organization to create the App for (exactly one of --org and --repository)")
 	repository := fs.String("repository", "", "GitHub repository, as owner/name, to create the App for")
@@ -116,7 +119,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 		return fmt.Errorf("--target: %w", err)
 	}
 
-	identity := githubBlock{Target: *targetName, Org: *org, Repository: *repository}
+	identity := GitHubBlock{Target: *targetName, Org: *org, Repository: *repository}
 
 	// FIRST, so the config's own refusals are the ones an operator sees.
 	//
@@ -155,7 +158,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 	// hold a registered app whose one-time private key had been thrown away.
 	// Creating the file with O_EXCL reduces the remaining failure surface to a
 	// write on a descriptor this process already owns.
-	keyFile, err := reserveKeyFile(*keyPath)
+	keyFile, err := ReserveKeyFile(*keyPath)
 	if err != nil {
 		return err
 	}
@@ -216,7 +219,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 
 	fmt.Fprintf(env.Stdout, "GitHub allows one hour to finish; if it lapses, just run this again.\n\n")
 
-	result, err := onboard(ctx, github.OnboardOptions{
+	result, err := Onboard(ctx, github.OnboardOptions{
 		Target:      target,
 		RunEvidence: *actionsRead,
 		Name:        *name,
@@ -230,7 +233,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 			// keyWritten is set from inside, the moment the key reaches its
 			// final path — not after this returns. A durability error AFTER a
 			// successful rename must not report the write as having failed.
-			err := writeKeyAtomically(env, keyFile, *keyPath, []byte(app.PEM), func() {
+			err := WriteKeyAtomically(env, keyFile, *keyPath, []byte(app.PEM), func() {
 				keyWritten = true
 
 				fmt.Fprintf(env.Stdout, "Saved the private key to %s\n", *keyPath)
@@ -258,7 +261,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "\nDone.\n\n")
 	fmt.Fprintf(env.Stdout, "  private key      %s\n", *keyPath)
 
-	block := githubBlock{
+	block := GitHubBlock{
 		Target:         *targetName,
 		Org:            *org,
 		Repository:     *repository,
@@ -285,7 +288,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 	// writing through the link would replace the link itself with a regular file
 	// while leaving the file it pointed at untouched.
 	if plan.path != "" {
-		if err := writeGitHubBlock(env, plan.path, block); err != nil {
+		if err := WriteGitHubBlock(env, plan.path, block); err != nil {
 			// NOT FATAL, because the App exists by now and the credential it
 			// issued cannot be re-created. Printing the block is the fallback that
 			// keeps this run recoverable.
@@ -353,7 +356,7 @@ func githubAppCreate(ctx context.Context, env cli.Env, args []string) error {
 }
 
 // githubBlock is the App identity a config needs, for one target.
-type githubBlock struct {
+type GitHubBlock struct {
 	// Target names where the block goes: config.DefaultTargetName (or empty)
 	// is the github block, any other name a targets entry.
 	Target string
@@ -375,7 +378,7 @@ type githubBlock struct {
 // neither stream takes the block there is nothing left to try and nothing worth
 // returning — so the streams are tried in order and each result is checked to
 // decide whether to try the next.
-func reportIdentity(b githubBlock, streams ...io.Writer) {
+func reportIdentity(b GitHubBlock, streams ...io.Writer) {
 	for _, w := range streams {
 		if err := printGitHubBlock(w, b); err == nil {
 			return
@@ -398,7 +401,7 @@ func reportIdentity(b githubBlock, streams ...io.Writer) {
 // quoting included. Its errors are RETURNED, because this is the only record of
 // an App that already exists and a stream that silently dropped it is the whole
 // reason the caller is here.
-func printGitHubBlock(w io.Writer, b githubBlock) error {
+func printGitHubBlock(w io.Writer, b GitHubBlock) error {
 	rendered, err := renderIdentity([]byte(seedFor(b)), b)
 	if err != nil {
 		return fmt.Errorf("render the App identity: %w", err)
@@ -420,7 +423,7 @@ func printGitHubBlock(w io.Writer, b githubBlock) error {
 // the app, and a create that fails then has thrown away a credential that cannot
 // be re-issued. Holding the descriptor reduces the later failure surface to a
 // write on a file we already own.
-func reserveKeyFile(path string) (*os.File, error) {
+func ReserveKeyFile(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create key directory: %w", err)
 	}
@@ -433,7 +436,7 @@ func reserveKeyFile(path string) (*os.File, error) {
 	// for the staged key only after O_EXCL failed meant that run's key was never
 	// mentioned: this call succeeded, onboarding went on to create a SECOND App,
 	// and the first one's unrepeatable key sat there unreported.
-	staging := stagingPath(path)
+	staging := StagingPath(path)
 
 	switch inspectKey(staging) {
 	case keyPresent:
@@ -569,9 +572,9 @@ func stagedKeyFoundError(path, staged string) error {
 // onInstalled fires the instant the key is at its final path, BEFORE durability is
 // confirmed. Everything after is best-effort reporting: the credential exists and
 // must never be deleted, whatever else fails.
-func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte, onInstalled func()) error {
+func WriteKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte, onInstalled func()) error {
 	dir := filepath.Dir(path)
-	staging := stagingPath(path)
+	staging := StagingPath(path)
 
 	installed := false
 
@@ -634,7 +637,7 @@ func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte,
 		// names existed, so a power loss after this function returns could
 		// otherwise resurrect the staging entry — leaving two durable names for
 		// one private key, with the process that would have warned about it gone.
-		if err := syncDir(dir); err != nil {
+		if err := SyncDir(dir); err != nil {
 			fmt.Fprintf(env.Stderr,
 				"\nWarning: the key is installed at %s and the extra copy at %s was removed, but that "+
 					"removal could not be flushed (%v). Check after a reboot that %s is gone.\n",
@@ -700,7 +703,7 @@ func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte,
 	// between them otherwise leaves the only copy of the key behind a directory
 	// entry the filesystem has not committed — losing not just the location but
 	// the file. Best-effort: linking anyway beats stopping here.
-	_ = syncDir(dir) //nolint:errcheck // Durability in a window the link closes; not worth failing over.
+	_ = SyncDir(dir) //nolint:errcheck // Durability in a window the link closes; not worth failing over.
 
 	// os.Link takes a NAME, and what this run owns is a descriptor.
 	//
@@ -759,7 +762,7 @@ func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte,
 			// Routed through the same durability step as the ordinary install: the
 			// earlier sync made the STAGING name durable, and it is the rename to
 			// the destination that now has to survive a crash.
-			if err := syncDir(dir); err != nil {
+			if err := SyncDir(dir); err != nil {
 				return preservedAt(path, fmt.Errorf(
 					"the key is at %s but its directory entry could not be flushed: %w\n"+
 						"It is present now; verify with `billet check` after a reboot", path, err))
@@ -845,7 +848,7 @@ func writeKeyAtomically(env cli.Env, reserved *os.File, path string, pem []byte,
 	// key that was successfully installed.
 	onInstalled()
 
-	if err := syncDir(dir); err != nil {
+	if err := SyncDir(dir); err != nil {
 		return preservedAt(path, fmt.Errorf(
 			"the key is installed at %s but its directory entry could not be flushed: %w\n"+
 				"It is present now; a power loss before the filesystem flushes could still lose it, "+
@@ -974,7 +977,7 @@ func recoverKeyAttempt(dir, destination string, pem []byte, cause error, attempt
 		// The NAME is made durable too. f.Sync persists contents, not the new
 		// directory entry, so a crash could otherwise lose a path billet has
 		// already told the operator to go to.
-		if err := syncDir(dir); err != nil {
+		if err := SyncDir(dir); err != nil {
 			return uncertainAt(name, destination, fmt.Errorf(
 				"%w\nThe key was written to %s, but that name could not be flushed (%w) — confirm it "+
 					"exists after a reboot", cause, name, err))
@@ -1133,7 +1136,7 @@ var errCredentialPreserved = github.ErrCredentialPreserved
 // reported and nothing could predict. A derived name is one the next run can
 // look for and the operator can be told about, and deriving it from the
 // destination keeps two runs onto different key paths out of each other's way.
-func stagingPath(path string) string {
+func StagingPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".billet-partial")
 }
 
@@ -1199,7 +1202,7 @@ func inspectKey(path string) keyState {
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not
 // guarantee its NAME survives a power cut.
-func syncDir(dir string) error {
+func SyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return fmt.Errorf("open %s to sync it: %w", dir, err)
@@ -1324,7 +1327,7 @@ func configuredKeyPath(cfgPath, target string) (string, error) {
 }
 
 // target is the block's identity as the github package sees it.
-func (b githubBlock) target() github.Target {
+func (b GitHubBlock) target() github.Target {
 	if b.Repository != "" {
 		owner, name, _ := config.SplitRepository(b.Repository)
 
@@ -1335,13 +1338,13 @@ func (b githubBlock) target() github.Target {
 }
 
 // isDefault reports whether the block goes under `github:`.
-func (b githubBlock) isDefault() bool {
+func (b GitHubBlock) isDefault() bool {
 	return b.Target == "" || b.Target == config.DefaultTargetName
 }
 
 // seedFor is the smallest document the block can be rendered into, for the
 // printed form.
-func seedFor(b githubBlock) string {
+func seedFor(b GitHubBlock) string {
 	if b.isDefault() {
 		return "github: {}\n"
 	}
@@ -1382,7 +1385,7 @@ type configEdit struct {
 	// given is what the operator typed, so the notice can say when the two differ.
 	given string
 	// existing is the App identity the file already records, when it records one.
-	existing githubBlock
+	existing GitHubBlock
 	hasApp   bool
 	// body is the file's bytes, kept so the run can answer ONE question about a
 	// config that is not valid yet: where this deployment keeps its App key. It is
@@ -1407,7 +1410,7 @@ type configEdit struct {
 // second opinion about acceptable YAML. A separate reading of what `github:` may
 // hold is a rule that agrees with renderGitHubBlock today and drifts from it on
 // the next field — the same two-sources-of-truth mistake, one layer up.
-func planConfigEdit(cfgPath string, identity githubBlock) (configEdit, error) {
+func planConfigEdit(cfgPath string, identity GitHubBlock) (configEdit, error) {
 	if cfgPath == "" {
 		return configEdit{}, nil
 	}
@@ -1544,8 +1547,8 @@ func planConfigEdit(cfgPath string, identity githubBlock) (configEdit, error) {
 //
 // The ORG is the run's own in both, because that is the field the verification
 // compares against a caller-supplied value.
-func probeConfig(raw []byte, identity githubBlock) error {
-	base := githubBlock{
+func probeConfig(raw []byte, identity GitHubBlock) error {
+	base := GitHubBlock{
 		Target:         identity.Target,
 		Org:            identity.Org,
 		Repository:     identity.Repository,
@@ -1557,7 +1560,7 @@ func probeConfig(raw []byte, identity githubBlock) error {
 	withClientID := base
 	withClientID.ClientID = "probe"
 
-	for _, probe := range []githubBlock{withClientID, base} {
+	for _, probe := range []GitHubBlock{withClientID, base} {
 		if _, err := renderIdentity(raw, probe); err != nil {
 			return err
 		}
@@ -1777,7 +1780,7 @@ func sayFailed(err error) error {
 // ATOMIC, because this file is the only record of where the state directory and
 // the App key live. A partial write during a crash would leave a config that
 // does not parse and a deployment that cannot start.
-func writeGitHubBlock(env cli.Env, path string, b githubBlock) error {
+func WriteGitHubBlock(env cli.Env, path string, b GitHubBlock) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
@@ -1888,7 +1891,7 @@ func writeGitHubBlock(env cli.Env, path string, b githubBlock) error {
 	// config is in place; a directory entry that has not reached the disk is a
 	// power-loss risk to say out loud, not a reason to tell the caller the write
 	// failed — which would print the block as though nothing had been recorded.
-	if err := syncDir(filepath.Dir(path)); err != nil {
+	if err := SyncDir(filepath.Dir(path)); err != nil {
 		fmt.Fprintf(env.Stderr, "\nWarning: %s was updated, but that could not be flushed to "+
 			"disk (%v). Confirm it still names the App after a reboot.\n", path, err)
 	}
@@ -1956,7 +1959,7 @@ func preserveOwner(staged *os.File, uid, gid int) error {
 // wrote no block returned nil, and by then the App exists and its one-time
 // private key is spent, so "run it again" is not a recovery — it mints a second
 // App. It is kept for whatever field is added to the block next.
-func renderIdentity(raw []byte, b githubBlock) ([]byte, error) {
+func renderIdentity(raw []byte, b GitHubBlock) ([]byte, error) {
 	rendered, err := renderGitHubBlock(raw, b)
 	if err != nil {
 		return nil, err
@@ -1994,7 +1997,7 @@ var errIdentityLost = errors.New("the App identity does not survive being writte
 // was. Split out so `init`'s convergence can build the complete final file in
 // memory and commit it in one atomic replace, with no window where the file on
 // disk lacks the identity.
-func renderGitHubBlock(raw []byte, b githubBlock) ([]byte, error) {
+func renderGitHubBlock(raw []byte, b GitHubBlock) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
@@ -2031,16 +2034,16 @@ func renderGitHubBlock(raw []byte, b githubBlock) ([]byte, error) {
 	// repository would be a target config refuses at load, so the other
 	// spelling goes.
 	if b.Repository != "" {
-		setScalar(gh, "repository", b.Repository)
-		removeScalar(gh, "org")
+		SetScalar(gh, "repository", b.Repository)
+		RemoveScalar(gh, "org")
 	} else {
-		setScalar(gh, "org", b.Org)
-		removeScalar(gh, "repository")
+		SetScalar(gh, "org", b.Org)
+		RemoveScalar(gh, "repository")
 	}
 
-	setScalar(gh, "app_id", strconv.FormatInt(b.AppID, 10))
-	setScalar(gh, "installation_id", strconv.FormatInt(b.InstallationID, 10))
-	setScalar(gh, "private_key_path", b.PrivateKeyPath)
+	SetScalar(gh, "app_id", strconv.FormatInt(b.AppID, 10))
+	SetScalar(gh, "installation_id", strconv.FormatInt(b.InstallationID, 10))
+	SetScalar(gh, "private_key_path", b.PrivateKeyPath)
 
 	// SET WHEN GITHUB RETURNED ONE, AND REMOVED WHEN IT DID NOT.
 	//
@@ -2052,9 +2055,9 @@ func renderGitHubBlock(raw []byte, b githubBlock) ([]byte, error) {
 	// Writing an empty one instead would be a key the operator has to wonder
 	// about, so the key goes.
 	if b.ClientID != "" {
-		setScalar(gh, "client_id", b.ClientID)
+		SetScalar(gh, "client_id", b.ClientID)
 	} else {
-		removeScalar(gh, "client_id")
+		RemoveScalar(gh, "client_id")
 	}
 
 	var out bytes.Buffer
@@ -2094,7 +2097,7 @@ func targetEntryFor(root *yaml.Node, name string) (*yaml.Node, error) {
 	var list *yaml.Node
 
 	for i := 0; i+1 < len(root.Content); i += 2 {
-		if !isKey(root.Content[i], "targets") {
+		if !IsKey(root.Content[i], "targets") {
 			continue
 		}
 
@@ -2130,7 +2133,7 @@ func targetEntryFor(root *yaml.Node, name string) (*yaml.Node, error) {
 		}
 
 		for i := 0; i+1 < len(entry.Content); i += 2 {
-			if isKey(entry.Content[i], "name") {
+			if IsKey(entry.Content[i], "name") {
 				var decoded string
 				if err := entry.Content[i+1].Decode(&decoded); err == nil && decoded == name {
 					return entry, nil
@@ -2140,7 +2143,7 @@ func targetEntryFor(root *yaml.Node, name string) (*yaml.Node, error) {
 	}
 
 	entry := &yaml.Node{Kind: yaml.MappingNode}
-	setScalar(entry, "name", name)
+	SetScalar(entry, "name", name)
 	list.Content = append(list.Content, entry)
 
 	return entry, nil
@@ -2149,7 +2152,7 @@ func targetEntryFor(root *yaml.Node, name string) (*yaml.Node, error) {
 // mappingFor returns the mapping at a top-level key, creating it if absent.
 func mappingFor(root *yaml.Node, key string) (*yaml.Node, error) {
 	for i := 0; i+1 < len(root.Content); i += 2 {
-		if !isKey(root.Content[i], key) {
+		if !IsKey(root.Content[i], key) {
 			continue
 		}
 
@@ -2232,7 +2235,7 @@ func nodeKind(n *yaml.Node) string {
 // One definition for all three callers, because a rule about what a key IS that
 // three functions each spell for themselves is the two-sources-of-truth mistake
 // this file has already made twice.
-func isKey(n *yaml.Node, key string) bool {
+func IsKey(n *yaml.Node, key string) bool {
 	var decoded string
 	if err := n.Decode(&decoded); err != nil {
 		return false
@@ -2242,9 +2245,9 @@ func isKey(n *yaml.Node, key string) bool {
 }
 
 // removeScalar drops a key and its value from a mapping, if it is there.
-func removeScalar(m *yaml.Node, key string) {
+func RemoveScalar(m *yaml.Node, key string) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if IsKey(m.Content[i], key) {
 			m.Content = append(m.Content[:i], m.Content[i+2:]...)
 
 			return
@@ -2254,9 +2257,9 @@ func removeScalar(m *yaml.Node, key string) {
 
 // setScalar sets a key in a mapping, replacing the value and keeping the key's
 // comments.
-func setScalar(m *yaml.Node, key, value string) {
+func SetScalar(m *yaml.Node, key, value string) {
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if isKey(m.Content[i], key) {
+		if IsKey(m.Content[i], key) {
 			m.Content[i+1].Value = value
 			m.Content[i+1].Tag = ""
 			m.Content[i+1].Style = 0

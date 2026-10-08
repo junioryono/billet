@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -1011,7 +1012,7 @@ func TestReleaseInspectRegistrationEndpoints(t *testing.T) {
 func TestReleaseInspectRegistrationOnDarwin(t *testing.T) {
 	f := nodeTLSFixture(t, true)
 	f.writeRecord(t, f.record(nil))
-	hostOS = "darwin"
+	cli.HostOS = "darwin"
 
 	r := f.report(t)
 	mustUnknown(t, "host.registration", r.Host.Registration, "no runtime record on this platform")

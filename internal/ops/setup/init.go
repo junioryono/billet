@@ -1,4 +1,4 @@
-package main
+package setup
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -22,11 +21,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
-
-// hostOS is runtime.GOOS behind a seam, so the service shape a generation
-// writes — systemd's on Linux, the launch agents' on macOS — and the refusal for
-// every other platform are testable from either machine.
-var hostOS = runtime.GOOS
 
 // repeatedString collects a flag given more than once into a slice, in order.
 type repeatedString []string
@@ -87,7 +81,7 @@ func checkEmit(e emitMode) error {
 // the thing no generator can merge for an operator. Both are right for what they
 // do, and for a while nothing said which was about to happen — so configEditRule
 // is the sentence both of them print.
-func cmdInit(ctx context.Context, env cli.Env, args []string) error {
+func Init(ctx context.Context, env cli.Env, args []string) error {
 	// `billet init iam` is a sub-command: it does not write a config, it prints the
 	// IAM policy the written config's node needs. Peeled before flag parsing so its
 	// flags are its own.
@@ -368,7 +362,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 	//
 	// A file write is the opposite: it lands on THIS machine, for the services
 	// this machine has.
-	targetOS := hostOS
+	targetOS := cli.HostOS
 	if emitValue == emitAnsible {
 		targetOS = "linux"
 	}
@@ -410,15 +404,15 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 	// advertises a fraction of the fleet. Declaring the numbers removes that tie,
 	// and only that one.
 	if emitValue == emitAnsible {
-		if !declaredCapacity && hostOS != "linux" {
+		if !declaredCapacity && cli.HostOS != "linux" {
 			return fmt.Errorf("--emit ansible measures THIS machine, and this is %s — the block "+
 				"would carry this host's capacity under the target's name. Either run it on "+
 				"the target:\n  ssh <host> billet init --emit ansible …\nor say what the "+
 				"target has:\n  billet init --emit ansible --max-vcpu 8 --max-memory 32GiB …",
-				hostOS)
+				cli.HostOS)
 		}
 	} else if profileValue == initconfig.ProfileLocalService &&
-		hostOS != "linux" && hostOS != "darwin" {
+		cli.HostOS != "linux" && cli.HostOS != "darwin" {
 		// BOTH PLATFORMS billet SHIPS SERVICES FOR. The refusal used to name
 		// systemd and so covered macOS too — which closed a loop: `billet local
 		// up` refuses a config that is not at the service path and tells the
@@ -427,7 +421,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// macOS path ended at two commands each pointing at the other.
 		return fmt.Errorf("--profile local-service writes for the services billet ships — "+
 			"systemd units on Linux, launch agents on macOS — and this host is %s; use "+
-			"--profile local here, or run this on the host that will run them", hostOS)
+			"--profile local here, or run this on the host that will run them", cli.HostOS)
 	}
 
 	// REFUSED RATHER THAN WRITTEN AND THEN REFUSED AT STARTUP. A generated file
@@ -448,11 +442,11 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// `--emit ansible` formalises), and a wrong refusal strands somebody
 		// doing it by hand. It is on stderr, so an emission's stdout stays the
 		// block alone.
-		if hostOS != "linux" && emitValue == emitFile {
+		if cli.HostOS != "linux" && emitValue == emitFile {
 			fmt.Fprintf(notes, "NOTE: this config describes a Linux microVM host — KVM, the two "+
 				"bridges node.firecracker names, and a Ceph client — and this machine is %s, so "+
 				"it is for somewhere else. A Mac runs the tart backend instead; see the tart "+
-				"section of billet.example.yaml.\n\n", hostOS)
+				"section of billet.example.yaml.\n\n", cli.HostOS)
 		}
 
 	case config.ProviderEC2:
@@ -508,7 +502,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 	// so an unspecified --config follows the profile rather than the per-user
 	// default the units can never read (ProtectHome=true).
 	if initconfig.Profile(*profile) == initconfig.ProfileLocalService && !setFlags["config"] {
-		*cfgPath = initconfig.ServiceConfigPathFor(hostOS)
+		*cfgPath = initconfig.ServiceConfigPathFor(cli.HostOS)
 	}
 
 	// AN EXISTING FILE IS NEVER SILENTLY REPLACED. What happens instead is
@@ -756,7 +750,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// Refused BEFORE the mkdir rather than after, so the root run does not
 		// first create a root-owned directory the operator then has to undo.
 		if params.Profile == initconfig.ProfileLocalService &&
-			initconfig.ServiceAccountFor(hostOS) == "" && effectiveUID() == 0 {
+			initconfig.ServiceAccountFor(cli.HostOS) == "" && effectiveUID() == 0 {
 			return fmt.Errorf("refusing to write a %s config as root: the launch agents run as "+
 				"the operator who installed them, so a root-owned config is one they cannot "+
 				"read, and `billet local up` refuses to run as root. Run this as yourself. If "+
@@ -900,7 +894,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// The role always renders to the service path; --config only says where
 		// an existing App identity was read FROM. Naming --config as the
 		// destination sent an operator who passed one looking for a file the
-		// role never writes, and then told them to onboard an App that already
+		// role never writes, and then told them to Onboard an App that already
 		// existed somewhere else.
 		fmt.Fprintf(notes, "\nPut it under this host in the inventory the "+
 			"junioryono.billet.host role reads; the role renders it to %s on the target. "+
@@ -993,7 +987,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 	// whichever group the file happened to inherit and buys nothing.
 	mode := os.FileMode(0o600)
 	if params.Profile == initconfig.ProfileLocalService &&
-		initconfig.ServiceAccountFor(hostOS) != "" {
+		initconfig.ServiceAccountFor(cli.HostOS) != "" {
 		mode = 0o640
 	}
 
@@ -1066,7 +1060,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		// make it work leaves a root-owned config that the agents, which run as
 		// them, cannot read.
 		if params.Profile == initconfig.ProfileLocalService {
-			if account := initconfig.ServiceAccountFor(hostOS); account != "" {
+			if account := initconfig.ServiceAccountFor(cli.HostOS); account != "" {
 				fmt.Fprintf(env.Stdout, "After moving it into place: chown root:%s %s && chmod 0640 %s\n",
 					account, cli.ShellArg(*cfgPath), cli.ShellArg(*cfgPath))
 			}
@@ -1136,7 +1130,7 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 
 	// The agents read exactly one path, so a config written anywhere else
 	// is installed there first or `local up` starts whatever that path holds.
-	if service := initconfig.ServiceConfigPathFor(hostOS); cfgPath != service {
+	if service := initconfig.ServiceConfigPathFor(cli.HostOS); cfgPath != service {
 		// THE SAME GUARD AS WRITING IT HERE: the copy below replaces the
 		// service path's config, which may be this machine's control plane.
 		raw, err := os.ReadFile(service)
@@ -1156,7 +1150,7 @@ func printJoinNext(env cli.Env, cfgPath string, profile initconfig.Profile, join
 
 		fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
 		fmt.Fprintf(env.Stdout, "       cp %s %s\n", pathArg, cli.ShellArg(service))
-		if account := initconfig.ServiceAccountFor(hostOS); account != "" {
+		if account := initconfig.ServiceAccountFor(cli.HostOS); account != "" {
 			fmt.Fprintf(env.Stdout, "       chown root:%s %s && chmod 0640 %s\n",
 				account, cli.ShellArg(service), cli.ShellArg(service))
 		}
@@ -1178,7 +1172,7 @@ func printJoinControlPlane(env cli.Env, joined initconfig.JoinResult) {
 // existingGitHubBlock reads the App identity out of the file being replaced —
 // leniently, because the whole point is surviving a file the strict parser may
 // not love. ok is false when there is no filled identity to carry.
-func existingGitHubBlock(raw []byte) (githubBlock, string, bool) {
+func existingGitHubBlock(raw []byte) (GitHubBlock, string, bool) {
 	return existingIdentity(raw, config.DefaultTargetName)
 }
 
@@ -1194,7 +1188,7 @@ type identityDoc struct {
 
 // existingIdentity reads one target's App identity out of a config: the github
 // block for the default target, the named targets entry for any other.
-func existingIdentity(raw []byte, target string) (githubBlock, string, bool) {
+func existingIdentity(raw []byte, target string) (GitHubBlock, string, bool) {
 	var doc struct {
 		GitHub  identityDoc `yaml:"github"`
 		Targets []struct {
@@ -1203,7 +1197,7 @@ func existingIdentity(raw []byte, target string) (githubBlock, string, bool) {
 		} `yaml:"targets"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return githubBlock{}, "", false
+		return GitHubBlock{}, "", false
 	}
 
 	found := doc.GitHub
@@ -1223,10 +1217,10 @@ func existingIdentity(raw []byte, target string) (githubBlock, string, bool) {
 	}
 
 	if found.AppID == 0 {
-		return githubBlock{}, "", false
+		return GitHubBlock{}, "", false
 	}
 
-	return githubBlock{
+	return GitHubBlock{
 		Target:         name,
 		Org:            found.Org,
 		Repository:     found.Repository,
@@ -1237,7 +1231,7 @@ func existingIdentity(raw []byte, target string) (githubBlock, string, bool) {
 }
 
 // targetName is the block's target name, spelled out for the default.
-func (b githubBlock) targetName() string {
+func (b GitHubBlock) targetName() string {
 	if b.isDefault() {
 		return config.DefaultTargetName
 	}
@@ -1246,7 +1240,7 @@ func (b githubBlock) targetName() string {
 }
 
 // describe names the block's scope the way an operator reads it, quoted.
-func (b githubBlock) describe() string {
+func (b GitHubBlock) describe() string {
 	if b.Repository != "" {
 		return fmt.Sprintf("repository %q", b.Repository)
 	}
@@ -1255,7 +1249,7 @@ func (b githubBlock) describe() string {
 }
 
 // scopePath is the block's GitHub path, whichever scope it names.
-func (b githubBlock) scopePath() string {
+func (b GitHubBlock) scopePath() string {
 	if b.Repository != "" {
 		return b.Repository
 	}
@@ -1309,7 +1303,7 @@ func serviceOwnership(env cli.Env, path string) {
 	// who installed it, so the file they just wrote is already the one the
 	// service reads — and telling them to chown it to a `billet` group that does
 	// not exist is a first instruction that cannot be followed.
-	if initconfig.ServiceAccountFor(hostOS) == "" {
+	if initconfig.ServiceAccountFor(cli.HostOS) == "" {
 		return
 	}
 
@@ -1529,8 +1523,8 @@ func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted boo
 		// anywhere else must be installed there, or systemctl starts whatever
 		// stale file that path holds — so the guidance says so instead of
 		// pretending the staged file is live.
-		service := initconfig.ServiceConfigPathFor(hostOS)
-		account := initconfig.ServiceAccountFor(hostOS)
+		service := initconfig.ServiceConfigPathFor(cli.HostOS)
+		account := initconfig.ServiceAccountFor(cli.HostOS)
 
 		if cfgPath != service {
 			fmt.Fprintf(env.Stdout, "  3. Install the file where the services billet ships read it:\n")
@@ -1560,7 +1554,7 @@ func printInitNext(env cli.Env, cfgPath string, p initconfig.Params, trusted boo
 		// rather than rebuilt here. It used to be a literal
 		// /etc/billet/app-private-key.pem, which on a Mac is neither where the
 		// config points nor a directory that exists.
-		key := initconfig.ServiceKeyPathFor(hostOS)
+		key := initconfig.ServiceKeyPathFor(cli.HostOS)
 
 		if account != "" {
 			fmt.Fprintf(env.Stdout, "\nThe App key at %s must be readable by the service alone: "+
@@ -1697,7 +1691,7 @@ func commitConfig(env cli.Env, path string, body []byte, mode os.FileMode) error
 	// A FAILURE HERE IS NOT THIS CALL'S FAILURE. The config is in place; telling
 	// the caller the replace failed would be false, and would send an operator
 	// looking for a file that is already there.
-	if err := syncDir(filepath.Dir(path)); err != nil {
+	if err := SyncDir(filepath.Dir(path)); err != nil {
 		fmt.Fprintf(env.Stderr, "\nWarning: %s was written, but that could not be flushed to "+
 			"disk (%v). Confirm it is still there after a reboot.\n", path, err)
 	}
@@ -1845,7 +1839,7 @@ func sameDir(a, b string) bool {
 // values with incomplete ones — and it happens AFTER Generate has run its
 // config.Parse round trip, so nothing revalidates the result and the command
 // reports success over a config that will not load.
-func (b githubBlock) usable() bool {
+func (b GitHubBlock) usable() bool {
 	return strings.TrimSpace(b.scopePath()) != "" && b.AppID > 0 && b.InstallationID > 0
 }
 
@@ -2116,7 +2110,7 @@ var effectiveUID = os.Geteuid
 // without this, deleting either call left every assertion green while restoring
 // the exact bare-permission-error regression they were added for.
 var serviceConfigDir = func() string {
-	return filepath.Dir(initconfig.ServiceConfigPathFor(hostOS))
+	return filepath.Dir(initconfig.ServiceConfigPathFor(cli.HostOS))
 }
 
 // dirWritable answers whether this process may create a file in dir.
@@ -2144,7 +2138,7 @@ var dirWritable = func(dir string) bool { return unix.Access(dir, unix.W_OK) == 
 // because a chown does not fix any of them.
 func macServiceDirRemedy(path string, profile initconfig.Profile, cause error) error {
 	if profile != initconfig.ProfileLocalService ||
-		initconfig.ServiceAccountFor(hostOS) != "" ||
+		initconfig.ServiceAccountFor(cli.HostOS) != "" ||
 		!errors.Is(cause, os.ErrPermission) {
 		return nil
 	}
@@ -2175,3 +2169,11 @@ func macServiceDirRemedy(path string, profile initconfig.Profile, cause error) e
 		"while `billet local up` refuses to run as root. Make the directory yours instead:\n%s",
 		path, cause, dir, chownAdvice(dir))
 }
+
+// errNotImplemented marks a role that is scaffolded but cannot serve yet.
+//
+// It is returned immediately and non-zero rather than blocking. A process that
+// idles until signalled looks healthy to systemd, Docker, and every uptime
+// check, so a half-built control plane would be reported as running while no
+// job is ever picked up. Failing loudly is the honest behaviour for pre-alpha.
+var errNotImplemented = errors.New("not implemented yet")

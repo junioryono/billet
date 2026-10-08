@@ -49,7 +49,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 - `internal/config/*_test.go`: build cases by `strings.Replace` on a known-good config; both directions of every guard (the macOS cap has one test proving a tier whose label omits `macos` is capped and one proving `builds-macos-artifacts` is not).
 - `internal/integration/configboundary_test.go`, `generatedtier_test.go`, `releaseboundary_test.go`.
-- `cmd/billet/configedit_test.go`, `init_test.go`, `init_rerun_test.go`, `initansible_test.go`, `inittart.go`'s tests, `internal/initconfig/*_test.go`, `internal/initconfig/hybrid_test.go`, `cmd/billet/inithybrid_test.go`.
+- `internal/ops/setup/configedit_test.go`, `init_test.go`, `init_rerun_test.go`, `initansible_test.go`, `inittart.go`'s tests, `inithybrid_test.go`; `internal/initconfig/*_test.go`, `internal/initconfig/hybrid_test.go`.
 
 ## Related skills
 

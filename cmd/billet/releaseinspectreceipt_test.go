@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/regularfile"
 )
 
@@ -39,13 +40,13 @@ func newReceiptFixture(t *testing.T) *receiptFixture {
 		open     func(string) (*os.File, os.FileInfo, error)
 		read     func(*os.File, string, int64) ([]byte, error)
 		owner    func(os.FileInfo) (uint32, bool)
-	}{hostOS, receiptPath, receiptLstat, receiptOpen, receiptRead, receiptOwnerOf}
+	}{cli.HostOS, receiptPath, receiptLstat, receiptOpen, receiptRead, receiptOwnerOf}
 	t.Cleanup(func() {
-		hostOS, receiptPath, receiptLstat, receiptOpen, receiptRead, receiptOwnerOf = saved.os, saved.path, saved.lstat,
+		cli.HostOS, receiptPath, receiptLstat, receiptOpen, receiptRead, receiptOwnerOf = saved.os, saved.path, saved.lstat,
 			saved.open, saved.read, saved.owner
 	})
 
-	hostOS = "linux"
+	cli.HostOS = "linux"
 	receiptPath = f.path
 	receiptLstat = os.Lstat
 	receiptOpen = func(path string) (*os.File, os.FileInfo, error) {
@@ -192,7 +193,7 @@ func TestTheReceiptReaderTypesPresenceAndAbsence(t *testing.T) {
 
 	t.Run("darwin", func(t *testing.T) {
 		t.Helper()
-		hostOS = "darwin"
+		cli.HostOS = "darwin"
 
 		if host := hostEndpointReceipt(); host.known {
 			t.Errorf("a Mac reported a receipt: %+v", host.value)

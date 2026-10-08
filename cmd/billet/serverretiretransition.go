@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/hostauthority"
 
@@ -49,7 +51,7 @@ var (
 	retireResetFailedFn = retireResetFailed
 	// retireSyncDir flushes a directory entry; a test fails it between a
 	// namespace change and the phase that would certify it.
-	retireSyncDir = syncDir
+	retireSyncDir = setup.SyncDir
 )
 
 // cldExited is the si_code systemd reports in ExecMainCode for a process that

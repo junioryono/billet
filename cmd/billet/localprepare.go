@@ -59,9 +59,9 @@ func cmdLocalPrepare(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if !retirement.Supported(hostOS) {
+	if !retirement.Supported(cli.HostOS) {
 		return fmt.Errorf("billet local prepare: the global authority exclusion is Linux's; a %s host keeps "+
-			"the identity directory's own lock and needs no preparation", hostOS)
+			"the identity directory's own lock and needs no preparation", cli.HostOS)
 	}
 
 	if os.Geteuid() != 0 {

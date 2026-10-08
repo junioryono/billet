@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/setup"
+
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/app"
@@ -224,7 +226,7 @@ func TestGitHubAppCreateWritesANamedRepositoryTarget(t *testing.T) {
 	var err error
 
 	out := capture(t, func() {
-		err = githubAppCreate(t.Context(), processEnv(), []string{
+		err = setup.GitHubAppCreate(t.Context(), processEnv(), []string{
 			"--repository", "someone/widgets", "--target", "personal", "--config", cfgPath, "--no-browser",
 		})
 	})
@@ -314,7 +316,7 @@ func TestGitHubAppCreateRefusesTwoScopesAndNone(t *testing.T) {
 		"a bad tgt":    {"--org", "acme", "--target", "has space"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := githubAppCreate(t.Context(), processEnv(), append(args, "--no-browser")); err == nil {
+			if err := setup.GitHubAppCreate(t.Context(), processEnv(), append(args, "--no-browser")); err == nil {
 				t.Errorf("githubAppCreate accepted %s", name)
 			}
 		})
@@ -382,7 +384,7 @@ func TestTeardownTargetScopesTheNameToOneTarget(t *testing.T) {
 func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "billet.yaml")
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := setup.Init(t.Context(), processEnv(), []string{
 		"--config", path, "--repository", "someone/widgets", "--provider", "firecracker",
 	}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -399,7 +401,7 @@ func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 
 	// Filled in the way `github-app create --config` fills them for THIS scope,
 	// so what is under test is everything init decided.
-	if err := writeGitHubBlock(processEnv(), path, githubBlock{
+	if err := setup.WriteGitHubBlock(processEnv(), path, setup.GitHubBlock{
 		Repository: "someone/widgets", AppID: 1, InstallationID: 2,
 		PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
 	}); err != nil {
@@ -422,14 +424,14 @@ func TestInitWritesARepositoryScopedConfig(t *testing.T) {
 		}
 	}
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := setup.Init(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--org", "acme", "--repository", "someone/widgets", "--provider", "firecracker",
 	}); err == nil {
 		t.Error("init accepted --org and --repository together")
 	}
 
-	if err := cmdInit(t.Context(), processEnv(), []string{
+	if err := setup.Init(t.Context(), processEnv(), []string{
 		"--config", filepath.Join(t.TempDir(), "billet.yaml"),
 		"--repository", "widgets", "--provider", "firecracker",
 	}); err == nil || !strings.Contains(err.Error(), "--repository") {

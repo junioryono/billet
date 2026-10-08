@@ -665,17 +665,22 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 		}
 
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Run" {
-			// nodeHost(env, lc, hostOS): THIS COMMAND'S env, THIS PROCESS'S
+			// nodeHost(env, lc, cli.HostOS): THIS COMMAND'S env, THIS PROCESS'S
 			// signals and THIS HOST'S platform, which decides whether a record is
 			// published at all.
 			if host, ok := call.Args[1].(*ast.CallExpr); ok && len(host.Args) == 3 {
 				fn, fnOK := host.Fun.(*ast.Ident)
 				env, envOK := host.Args[0].(*ast.Ident)
 				lc, lcOK := host.Args[1].(*ast.Ident)
-				platform, platformOK := host.Args[2].(*ast.Ident)
+				platform, platformOK := host.Args[2].(*ast.SelectorExpr)
+
+				var pkg *ast.Ident
+				if platformOK {
+					pkg, platformOK = platform.X.(*ast.Ident)
+				}
 
 				if fnOK && envOK && lcOK && platformOK && fn.Name == "nodeHost" && env.Name == "env" &&
-					lc.Name == "lc" && platform.Name == "hostOS" {
+					lc.Name == "lc" && pkg.Name == "cli" && platform.Sel.Name == "HostOS" {
 					handed++
 				}
 			}
@@ -683,7 +688,7 @@ func TestTheNodeCommandAndTheRecordWriterUseOneConstructionEach(t *testing.T) {
 	}
 
 	if handed != 1 {
-		t.Errorf("cmdNode returns n.Run(ctx, nodeHost(env, lc, hostOS)) %d times, want once", handed)
+		t.Errorf("cmdNode returns n.Run(ctx, nodeHost(env, lc, cli.HostOS)) %d times, want once", handed)
 	}
 
 	// THE FIELD IS THE RETURNED HOST'S: nodeHost is one return of one literal,

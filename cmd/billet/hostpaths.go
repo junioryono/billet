@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // hostPaths is where a host keeps the binary the services run and the
@@ -75,6 +77,6 @@ func checkBinaryDirWritable(paths hostPaths) error {
 // installedBinary is the executable the services on this host run.
 //
 // A VAR RATHER THAN A CONST, for the reason upgradeRoot is: a test owns what it
-// replaces. Both are read from hostPathsFor(hostOS) so the two cannot name
+// replaces. Both are read from hostPathsFor(cli.HostOS) so the two cannot name
 // different platforms.
-var installedBinary = hostPathsFor(hostOS).binary
+var installedBinary = hostPathsFor(cli.HostOS).binary

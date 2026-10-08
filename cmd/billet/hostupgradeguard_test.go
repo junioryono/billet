@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -47,8 +48,8 @@ func newGuardedFixture(t *testing.T) *guardedFixture {
 
 	// A Linux host unless a fixture says otherwise: the platform check sits
 	// between the lock and the resolver only on darwin.
-	savedOS := hostOS
-	hostOS = "linux"
+	savedOS := cli.HostOS
+	cli.HostOS = "linux"
 
 	savedResolve, savedCheck, savedBarrier := resolveRelease, checkBinaryDir, timerBarrier
 	resolveRelease = func(context.Context, *releasesource.Client, releasesource.Policy, string, string,
@@ -66,7 +67,7 @@ func newGuardedFixture(t *testing.T) *guardedFixture {
 
 	t.Cleanup(func() {
 		resolveRelease, checkBinaryDir, timerBarrier = savedResolve, savedCheck, savedBarrier
-		hostOS = savedOS
+		cli.HostOS = savedOS
 	})
 
 	return f
@@ -142,10 +143,10 @@ func TestAnUpgradeRefusesAGuardedHostBeforeAnythingElse(t *testing.T) {
 func TestAnUpgradeOnDarwinClassifiesBeforeThePlatformCheck(t *testing.T) {
 	f := newGuardedFixture(t)
 
-	saved := hostOS
-	hostOS = "darwin"
+	saved := cli.HostOS
+	cli.HostOS = "darwin"
 
-	t.Cleanup(func() { hostOS = saved })
+	t.Cleanup(func() { cli.HostOS = saved })
 
 	mustHold(t, "ci-1")
 

@@ -55,7 +55,7 @@ Measured facts for both service managers, dated: [references/measured-facts.md](
 
 - `internal/lifeops/*_test.go`: the systemctl fake answers only the properties it was asked for (a whole-reply fake makes deleting a property from the production query invisible); fixtures start healthy and break one thing; a healthy host is asserted not refused. `os.SameFile` type-asserts the concrete `FileInfo`, so a fixture varies link counts with a real hard link; `syscall.Stat_t` widths differ per platform, so stats go through a converting helper; `OnFailureJobMode` belongs in `[Unit]` or the fixture proves nothing.
 - `internal/lifeops/launchd/*_test.go` and `reallaunchd_test.go` (each test derives its own label).
-- `cmd/billet/local_test.go`, `localup_test.go`, `localdown_test.go`, `lifecycle_test.go`, `drain_test.go`, `admission_test.go`, `systemd_test.go`, and `internal/hostauthority/lifecyclelock_test.go`; `deploy/units_test.go` (pins `ExitTimeOut` to the unit's 88200).
+- `cmd/billet/local_test.go`, `localup_test.go`, `localdown_test.go`, `admission_test.go`, `systemd_test.go`; `internal/cli/lifecycle_test.go`, `internal/ops/fleetops/drain_test.go` and `internal/hostauthority/lifecyclelock_test.go`; `deploy/units_test.go` (pins `ExitTimeOut` to the unit's 88200).
 - `scripts/test-systemd-lifecycle.sh`, `scripts/test-package-lifecycle.sh`.
 
 ## Related skills

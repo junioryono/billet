@@ -68,10 +68,10 @@ func cmdLocalUninstall(ctx context.Context, env cli.Env, args []string) error {
 }
 
 func runLocalUninstall(ctx context.Context, env cli.Env, o uninstallOptions) error {
-	if hostOS != "darwin" {
+	if cli.HostOS != "darwin" {
 		return fmt.Errorf("billet local uninstall removes the launch agents billet installs on "+
 			"macOS, and this host is %s. On Linux the services come from the package: remove it "+
-			"with your package manager, which leaves /var/lib/billet alone", hostOS)
+			"with your package manager, which leaves /var/lib/billet alone", cli.HostOS)
 	}
 
 	cfg, err := config.Load(o.configPath)

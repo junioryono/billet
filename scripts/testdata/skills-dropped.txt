@@ -54,3 +54,7 @@ e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase
 597beb0531fb The node cache service moved into internal/app with the node role (#418); the sentence names internal/app/nodecache.go.
 4193ba46e521 The fleet operation commands moved to internal/ops/fleetops (#356 Phase 4); the sentence names their tests there.
 97fea8831e53 The fleet operation commands moved to internal/ops/fleetops (#356 Phase 4); the sentence names their tests there.
+232af023037c The setup and fleet operation commands moved to internal/ops/setup and internal/ops/fleetops (#356 Phase 4); the sentence names their tests there.
+2e3c8f314c96 The init commands moved to internal/ops/setup (#356 Phase 4); the sentence names internal/ops/setup/inithybrid.go.
+6f2cbb86bd3b The github-app and init commands moved to internal/ops/setup (#356 Phase 4); the sentence names their tests there.
+89c314c4a2a4 The init commands moved to internal/ops/setup (#356 Phase 4); the sentence names their tests there.

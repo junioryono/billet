@@ -302,10 +302,10 @@ func TestServerRetireRefusesEachCombinationBeforeOpeningAnything(t *testing.T) {
 func TestServerRetireIsRefusedOffLinux(t *testing.T) {
 	f := newRetireFixture(t)
 
-	saved := hostOS
-	hostOS = "darwin"
+	saved := cli.HostOS
+	cli.HostOS = "darwin"
 
-	t.Cleanup(func() { hostOS = saved })
+	t.Cleanup(func() { cli.HostOS = saved })
 
 	out, code := f.run(t, "", "--dry-run", "--retiring-host", "control-a", "--config", filepath.Join(t.TempDir(), "absent.yaml"))
 	expectRetire(t, out, code, "refused-platform", retireOutcomeRefused, retireReasonPlatform)

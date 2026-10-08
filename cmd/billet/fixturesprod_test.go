@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -275,7 +276,7 @@ func TestTheReleaseInspectFixturesAreTheCommandsOwn(t *testing.T) {
 		"darwin": func(t *testing.T) planted {
 			t.Helper()
 			f := newInspectFixture(t)
-			hostOS = "darwin"
+			cli.HostOS = "darwin"
 
 			return planted{f.configPath, map[string]string{f.configPath: "/usr/local/etc/billet/billet.yaml",
 				f.stateDir: "/usr/local/var/lib/billet/server", f.binPath: "/usr/local/bin/billet", f.dir: "/var/lib/billet-fixture"}}
