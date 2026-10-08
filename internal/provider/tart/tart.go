@@ -1667,9 +1667,15 @@ const birthFunc = `billet_birth() {
 // /proc must say Z with one thread, and ps a single Z token without the
 // multi-threaded flag; macOS shows such a leader as S. Anything else, a failed
 // ps included, decides nothing.
-const zombieFunc = `billet_zombie() {
-  if [ -r "/proc/$1/stat" ]; then
-    _z=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+//
+// billet_procstat is the one read of /proc, a function of its own so a test can
+// answer for it with the records a kernel writes.
+const zombieFunc = `billet_procstat() {
+  [ -r "/proc/$1/stat" ] || return 1
+  cat "/proc/$1/stat" 2>/dev/null
+}
+billet_zombie() {
+  if _z=$(billet_procstat "$1"); then
     _z=${_z##*') '}
     # shellcheck disable=SC2086
     set -- $_z

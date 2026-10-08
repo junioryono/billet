@@ -1538,12 +1538,14 @@ func TestAZombieRunnerIsNotProved(t *testing.T) {
 	}
 }
 
-// billetZombie runs billet's own billet_zombie on pid with PATH set to path,
-// and reports whether it said zombie.
-func billetZombie(t *testing.T, pid int, path string) bool {
+// billetZombie runs billet's own billet_zombie on pid, with PATH set to path
+// and override defined after billet's functions, and reports whether it said
+// zombie.
+func billetZombie(t *testing.T, pid int, path, override string) bool {
 	t.Helper()
 
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", zombieFunc+`billet_zombie "$1"`, "sh", strconv.Itoa(pid))
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", zombieFunc+override+"\n"+`billet_zombie "$1"`,
+		"sh", strconv.Itoa(pid))
 	cmd.Env = append(os.Environ(), "PATH="+path)
 
 	err := cmd.Run()
@@ -1569,18 +1571,43 @@ func TestOnlyEvidenceMakesAZombie(t *testing.T) {
 
 	t.Cleanup(func() { stopStandIn(t, live) })
 
-	if billetZombie(t, live.Process.Pid, os.Getenv("PATH")) {
+	if billetZombie(t, live.Process.Pid, os.Getenv("PATH"), "") {
 		t.Error("a live process was called a zombie")
 	}
 
-	// THE ps BRANCH, which a guest without /proc takes.
-	if _, err := os.Stat("/proc/self/stat"); err == nil {
-		t.Skip("this host has /proc, so billet_zombie never asks ps here")
+	// THE /proc BRANCH, answered with the records a kernel writes: only state Z
+	// with a thread group of one is a zombie. Z with two is a leader that
+	// called pthread_exit while its other threads run (measured on Ubuntu
+	// 24.04). The command name is cut at its last ") ", which it may contain.
+	stat := func(comm, state, threads string) string {
+		return "42 (" + comm + ") " + state + " 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 " + threads + " 0 99"
 	}
 
-	// Each a ps answering for the live process. Only a single Z token, from a
-	// ps that succeeded, is a zombie: "Zl" is a leader whose other threads
-	// still run (Linux procps; measured on Ubuntu 24.04).
+	for _, c := range []struct {
+		record string
+		zombie bool
+	}{
+		{stat("runner", "Z", "1"), true},
+		{stat("a) Z b", "Z", "1"), true},
+		{stat("runner", "Z", "2"), false},
+		{stat("runner", "Z", "0"), false},
+		{"42 (runner) Z 1 2", false},
+		{stat("runner", "S", "1"), false},
+		{stat("a) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 1", "S", "1"), false},
+	} {
+		override := "billet_procstat() { printf '%s\\n' " + shellQuote(c.record) + "; }"
+
+		if got := billetZombie(t, live.Process.Pid, os.Getenv("PATH"), override); got != c.zombie {
+			t.Errorf("/proc says %q: zombie = %v, want %v", c.record, got, c.zombie)
+		}
+	}
+
+	// THE ps BRANCH, which a guest without /proc takes, on every host: /proc
+	// answers nothing here. Only a single Z token, from a ps that succeeded,
+	// is a zombie: "Zl" is a leader whose other threads still run (Linux
+	// procps; measured on Ubuntu 24.04).
+	noProc := "billet_procstat() { return 1; }"
+
 	for _, c := range []struct {
 		answer string
 		exit   int
@@ -1591,6 +1618,7 @@ func TestOnlyEvidenceMakesAZombie(t *testing.T) {
 		{"Z", 1, false},
 		{"Zl", 0, false},
 		{"Zsl", 0, false},
+		{"SZ", 0, false},
 		{"Z extra", 0, false},
 		{"S", 0, false},
 		{"", 0, false},
@@ -1602,7 +1630,7 @@ func TestOnlyEvidenceMakesAZombie(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got := billetZombie(t, live.Process.Pid, fake+":"+os.Getenv("PATH")); got != c.zombie {
+		if got := billetZombie(t, live.Process.Pid, fake+":"+os.Getenv("PATH"), noProc); got != c.zombie {
 			t.Errorf("ps answering %q and exiting %d: zombie = %v, want %v", c.answer, c.exit, got, c.zombie)
 		}
 	}
