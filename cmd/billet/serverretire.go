@@ -300,7 +300,7 @@ func cmdServerRetire(ctx context.Context, env cli.Env, args []string) error {
 	flags := cli.NewFlagSet("billet server retire", env.Stdout)
 	m := retireMode{}
 
-	flags.StringVar(&m.configPath, "config", defaultConfigPath(), "the installed configuration")
+	flags.StringVar(&m.configPath, "config", cli.DefaultConfigPath(), "the installed configuration")
 	flags.StringVar(&m.run, "run", "", "the holder of this converge's guard (required)")
 	flags.StringVar(&m.retiringHost, "retiring-host", "", "this host's inventory name (required)")
 	flags.StringVar(&m.survivorHost, "survivor-host", "", "the surviving controller's inventory name (with --reserve)")

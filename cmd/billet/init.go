@@ -114,7 +114,7 @@ func cmdInit(ctx context.Context, env cli.Env, args []string) error {
 		fs.SetOutput(env.Stderr)
 	}
 
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	profile := fs.String("profile", string(initconfig.ProfileLocal),
 		"path shape: local (user-session, two terminals) or local-service (the services billet "+
 			"ships — systemd units on Linux, launch agents on macOS)")

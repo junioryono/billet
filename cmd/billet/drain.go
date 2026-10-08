@@ -109,7 +109,7 @@ func openLedgerForAdmission(ctx context.Context, cfgPath string) (*state.DB, *co
 // window fails somebody's build.
 func cmdDrain(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet drain", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "",
 		"why this deployment is not taking work, for whoever finds it sealed")
 	wait := fs.Bool("wait", false,
@@ -273,7 +273,7 @@ func takeTheSeal(ctx context.Context, env cli.Env, db *state.DB, current state.A
 // cmdResume lets the deployment admit work again.
 func cmdResume(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet resume", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err

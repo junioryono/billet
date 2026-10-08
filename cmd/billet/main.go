@@ -12,7 +12,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -127,24 +126,6 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 	}
 }
 
-// defaultConfigPath deliberately does NOT look in the working directory.
-//
-// A server started from an attacker-writable directory would otherwise silently
-// adopt that directory's billet.yaml — which chooses the state directory, the
-// GitHub App key path, and every tier's resources. For a process that is often
-// run as root by a unit file, that is privileged config injection. Use --config
-// to point anywhere else.
-func defaultConfigPath() string {
-	if dir, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(dir, "billet", "billet.yaml")
-	}
-	return "/etc/billet/billet.yaml"
-}
-
-func addConfigFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
-}
-
 func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string) error {
 	// `billet server retire` is a controller's retirement, an operator command
 	// that runs under a converge guard; it never starts the plane.
@@ -153,7 +134,7 @@ func cmdServer(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []strin
 	}
 
 	fs := cli.NewFlagSet("billet server", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	upgradeProbe := fs.Bool("upgrade-probe", false,
@@ -331,7 +312,7 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	fs := cli.NewFlagSet("billet node", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	enroll := fs.Bool("enroll", false,
 		"ask the control plane to admit this machine, then wait for an operator to approve it")
 	caFingerprint := fs.String("ca-fingerprint", "",
@@ -438,7 +419,7 @@ func nodeHost(env cli.Env, lc *cli.Lifecycle, platform string) app.NodeHost {
 // thing an operator asks for, once, on purpose.
 func cmdTeardown(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet teardown", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	tier := fs.String("tier", "", "delete the scale set with this name (a tier's runs_on, which defaults to its label)")
 	all := fs.Bool("all", false, "delete every tier's scale set")
 	force := fs.Bool("force", false,
@@ -692,7 +673,7 @@ func cmdCA(ctx context.Context, env cli.Env, args []string) error {
 // makes rather than at the next restart of anything.
 func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revoke", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
@@ -753,7 +734,7 @@ func cmdCARevoke(ctx context.Context, env cli.Env, args []string) error {
 // cmdCARevocations lists what has been withdrawn.
 func cmdCARevocations(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca revocations", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -831,7 +812,7 @@ func serialFromCert(path string) (string, error) {
 
 func cmdCAIssue(ctx context.Context, env cli.Env, args []string) (err error) {
 	fs := cli.NewFlagSet("billet ca issue", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
 	reissue := fs.Bool("reissue", false,
 		"deliberately replace an existing bundle directory (the old one is moved to "+
@@ -1044,7 +1025,7 @@ func recordIssued(ctx context.Context, env cli.Env, cfgPath, name string, bundle
 
 func cmdCAShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca show", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -1151,7 +1132,7 @@ func printRemoteCost(env cli.Env, cfg *config.Config) error {
 
 func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet status", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}

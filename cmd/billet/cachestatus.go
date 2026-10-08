@@ -19,7 +19,7 @@ import (
 // each cache did for the jobs assigned recently.
 func cmdCacheStatus(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet cache status", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	since := fs.Duration("since", 24*time.Hour, "how far back to count what the caches did")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -80,7 +80,7 @@ func printCacheOutcomes(w io.Writer, counts map[string]map[string]map[string]int
 	since time.Duration,
 ) {
 	fmt.Fprintf(w, "\nwhat the caches did for the %d job(s) assigned in the last %s:\n", jobs,
-		shortDuration(since))
+		cli.ShortDuration(since))
 	if jobs == 0 {
 		return
 	}

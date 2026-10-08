@@ -407,7 +407,7 @@ type inspectPreparation struct {
 
 func cmdReleaseInspect(ctx context.Context, env cli.Env, args []string) error {
 	flags := cli.NewFlagSet("billet release inspect", env.Stdout)
-	configPath := flags.String("config", defaultConfigPath(), "path to billet.yaml")
+	configPath := flags.String("config", cli.DefaultConfigPath(), "path to billet.yaml")
 	asJSON := flags.Bool("json", false, "print the report as JSON")
 	if err := cli.Parse(flags, args); err != nil {
 		return err

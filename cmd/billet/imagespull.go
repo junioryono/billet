@@ -85,7 +85,7 @@ var kernelInstaller = durablefile.Installer{}
 // the import a no-op.
 func cmdImagesPull(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images pull", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	from := fs.String("from", "",
 		"pull from a directory holding manifest.json and its assets, instead of over the network")

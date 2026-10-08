@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostauthority"
@@ -67,7 +68,7 @@ func cmdNodes(ctx context.Context, env cli.Env, args []string) error {
 // idle and an operator asserting it.
 func cmdNodesDecommission(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet nodes decommission", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	force := fs.Bool("force", false,
 		"exclude the host even though nothing has proved it is running no compute; "+
 			"the exclusion is recorded as UNPROVEN and every later drain says so")
@@ -131,7 +132,7 @@ func cmdNodesDecommission(ctx context.Context, env cli.Env, args []string) error
 // certificate issued afterwards is not one of them.
 func cmdNodesRevoke(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet nodes revoke", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "", "why, recorded alongside it")
 
 	name, err := cli.ParseWithName(fs, args)
@@ -185,7 +186,7 @@ func cmdNodesRevoke(ctx context.Context, env cli.Env, args []string) error {
 // cmdNodesPending lists machines waiting to be let in.
 func cmdNodesPending(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet nodes pending", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	all := fs.Bool("all", false, "include decided requests")
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -246,7 +247,7 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 	}
 
 	fs := cli.NewFlagSet(command, env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	fingerprint := fs.String("fingerprint", "",
 		"the fingerprint you compared against the node's console (required)")
 
@@ -434,57 +435,20 @@ func recordIssuedCert(
 	})
 }
 
-// controlPlaneAllocator opens the ledger for a command that runs on the server.
-//
-// OpenAdmin RATHER THAN Open, because these commands run WHILE the control plane
-// is running — which is the only time most of them are any use. Open takes the
-// exclusive directory lock the server holds for its whole life, so every command
-// reaching the ledger through here failed against a live deployment with
-// "another billet process holds this state directory".
+// controlPlaneAllocator is app.OpenOperator's allocator, for a command that
+// runs on the server and needs nothing else.
 func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
 	a, _, closeDB, err := controlPlaneStores(ctx, cfgPath)
 
 	return a, closeDB, err
 }
 
-// controlPlaneStores is the same open, for a command that also needs the ledger
-// directly.
-//
-// ONE IMPLEMENTATION, TWO SHAPES. Most commands want only the allocator, and
-// making all thirteen of them carry a handle they never use is noise; `billet
-// status` reports the rollout as well, and a second copy of this open is how two
-// commands end up disagreeing about which pragmas or limits a deployment has.
+// controlPlaneStores is app.OpenOperator: the allocator and the ledger, for a
+// command that also needs the ledger directly.
 func controlPlaneStores(
 	ctx context.Context, cfgPath string,
 ) (*alloc.Allocator, *state.DB, func(), error) {
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	if cfg.Server == nil {
-		return nil, nil, nil, errors.New("this command runs on the control plane, and this " +
-			"config has no server section")
-	}
-
-	db, err := openStateAdmin(ctx, cfg)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("server state: %w", err)
-	}
-
-	a, err := alloc.New(db, alloc.Limits{
-		MaxVCPU:   cfg.Server.MaxVCPU,
-		MaxMemory: cfg.Server.MaxMemory,
-		Nodes:     cfg.NodePolicies(),
-		Shares:    cfg.TargetShares(),
-	}, cfg.Tiers)
-	if err != nil {
-		db.Close()
-
-		return nil, nil, nil, fmt.Errorf("capacity allocator: %w", err)
-	}
-
-	return a, db, func() { db.Close() }, nil
+	return app.OpenOperator(ctx, cfgPath)
 }
 
 // bootstrapBase is the URL `billet node --enroll` asks to join at.
@@ -753,7 +717,7 @@ func writeBundle(env cli.Env, tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte
 // the pending list, or taking a name before the machine that should have it.
 func cmdCAToken(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca token", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
 	uses := fs.Int("uses", 1, "how many machines may enroll with it")
 	note := fs.String("note", "", "what it is for, recorded alongside it")
@@ -831,7 +795,7 @@ func enrollAddrFlag(cfg *config.Config) string {
 // would cut a node off.
 func cmdCARotate(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca rotate", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -889,7 +853,7 @@ func cmdCARotate(ctx context.Context, env cli.Env, args []string) error {
 // cmdCARetire finishes a rotation by dropping the old authority.
 func cmdCARetire(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet ca retire", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	force := fs.Bool("force", false, "retire even though a node may not have renewed")
 
 	if err := cli.Parse(fs, args); err != nil {

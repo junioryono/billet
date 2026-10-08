@@ -69,7 +69,7 @@ func cmdInitHybrid(ctx context.Context, env cli.Env, args []string) error {
 		"the GitHub runner group a trusted tier belongs to (omit both policy flags for untrusted tiers)")
 	var workflows repeatedString
 	fs.Var(&workflows, "workflow", "a workflow ref a trusted tier may run (repeatable)")
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	controlPlaneIP := fs.String("control-plane-private-ip", "",
 		"the controller's private address, DECLARED so an instance replacement cannot change it; "+

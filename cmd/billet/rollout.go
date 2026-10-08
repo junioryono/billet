@@ -99,7 +99,7 @@ func rolloutStore(ctx context.Context, cfgPath string,
 // record carries the manifest's digest rather than only its tag.
 func cmdRolloutStart(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet rollout start", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	channel := fs.String("channel", releasesource.ChannelStable,
 		"the signed channel to resolve, e.g. stable or candidate")
 	pin := fs.String("version", "",
@@ -292,7 +292,7 @@ func channelOrPin(channel, pin string) string {
 // root-owned file behind would hand the converge a host the check changed.
 func cmdRolloutStatus(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet rollout status", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	asJSON := fs.Bool("json", false, "print the report as JSON: the rollout, its hosts with the "+
 		"reason their last dispatch was refused, every host's current registration, and the "+
 		"ledger's deployment binding")
@@ -681,7 +681,7 @@ func printRollout(ctx context.Context, env cli.Env, db *state.DB) {
 // reverted hosts would be a second, undeclared rollout in the opposite direction.
 func cmdRolloutAbort(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet rollout abort", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "", "why this rollout is being abandoned")
 
 	if err := cli.Parse(fs, args); err != nil {
@@ -731,7 +731,7 @@ func cmdRolloutNodePhase(ctx context.Context, env cli.Env, args []string, to rol
 	}
 
 	fs := cli.NewFlagSet(name, env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	reason := fs.String("reason", "", "the operator's reason, recorded against this host")
 
 	// ONLY MEANINGFUL FOR A DECOMMISSION, and offered on both so the flag set does

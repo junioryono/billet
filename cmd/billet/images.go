@@ -74,7 +74,7 @@ func cmdImages(ctx context.Context, env cli.Env, args []string) error {
 // after that every ordinary host converge is a metadata read.
 func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images compatible", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
 	resultFile := fs.String("result-file", "",
 		"write the bare names of floating images that need replacement here")
@@ -305,7 +305,7 @@ func incompatibleGuest(image, reason string) error {
 // every machine but one teaches an operator to ignore it.
 func cmdImagesDue(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images due", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	maxAge := fs.Duration("max-age", 6*24*time.Hour,
 		"rebuild when the newest generation is older than this")
 
@@ -573,7 +573,7 @@ func plural(n int, one, many string) string {
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
 func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images verify", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
 	record := fs.Bool("record", true,
 		"on success, mark this generation verified so `@verified` resolves to it")
@@ -1292,7 +1292,7 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 	}
 
 	fs := cli.NewFlagSet(name, env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {
@@ -1364,7 +1364,7 @@ func cmdImagesPromote(ctx context.Context, env cli.Env, args []string, verified 
 // for an irreversible command against a cluster is the property most worth having.
 func cmdImagesReap(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images reap", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	keep := fs.Int("keep", 3,
 		"how many VERIFIED generations to leave per guest contract, newest first")
 	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
@@ -1699,7 +1699,7 @@ func configuredKernelName(cfg *config.Config, kernelDir string) string {
 // A TIER SAYING `@verified` IS NOT AN ANSWER to what it boots, so this resolves it.
 func cmdImagesList(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet images list", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	rest, err := cli.ParseWithName(fs, args)
 	if err != nil {

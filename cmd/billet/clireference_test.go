@@ -178,6 +178,10 @@ var flagDefiners = map[string]int{
 	"DurationVar": 1, "Float64Var": 1, "Var": 1, "TextVar": 1,
 }
 
+// cliFlagHelpers are internal/cli's functions that define a flag on the set
+// they are handed, by the flag each defines.
+var cliFlagHelpers = map[string]string{"AddConfigFlag": "config"}
+
 // declaredFlagSets reads this package's sources for every NewFlagSet and the
 // flags defined on it, through any function the flag set is handed to. Every
 // NewFlagSet call must be one this reads: a flag set made any other way (a
@@ -318,6 +322,17 @@ func declaredFlagSets(t *testing.T) map[string]map[string]bool {
 						}
 
 						out = append(out, name)
+					}
+				}
+			}
+
+			// internal/cli's flag helpers, which take the set and define on it.
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "cli" {
+					if flag, known := cliFlagHelpers[sel.Sel.Name]; known && len(call.Args) > 0 {
+						if a, ok := call.Args[0].(*ast.Ident); ok && a.Name == set {
+							out = append(out, flag)
+						}
 					}
 				}
 			}

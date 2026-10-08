@@ -40,7 +40,7 @@ func cmdLeases(ctx context.Context, env cli.Env, args []string) error {
 // including proof obligations a healthy node is actively tending.
 func cmdLeasesHeld(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet leases held", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -232,7 +232,7 @@ func heldFor(since string) string {
 // the number is simply smaller than it was, with nothing to read.
 func cmdLeasesQuarantined(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet leases quarantined", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 
 	if err := cli.Parse(fs, args); err != nil {
 		return err
@@ -284,7 +284,7 @@ func cmdLeasesQuarantined(ctx context.Context, env cli.Env, args []string) error
 // still running on it.
 func cmdLeasesRelease(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet leases release", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	force := fs.Bool("force", false, "release it even though nothing has confirmed the compute is gone")
 
 	leaseID, err := cli.ParseWithName(fs, args)

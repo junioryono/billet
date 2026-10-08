@@ -64,7 +64,7 @@ var registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.
 
 func cmdRolloutRegistration(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet rollout registration", env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	node := fs.String("node", "", "the node whose registration is asked about")
 	incarnation := fs.String("incarnation", "", "the incarnation the migrated node presents (32 hex characters)")
 	wait := fs.Duration("wait", 5*time.Minute, "how long to poll the ledger for that incarnation")

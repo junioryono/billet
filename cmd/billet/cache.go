@@ -44,7 +44,7 @@ func cmdCache(ctx context.Context, env cli.Env, args []string) error {
 		name = "billet cache enable"
 	}
 	fs := cli.NewFlagSet(name, env.Stdout)
-	cfgPath := addConfigFlag(fs)
+	cfgPath := cli.AddConfigFlag(fs)
 	organisation := fs.String("org", "", "GitHub organisation whose repositories this policy covers")
 	repository := fs.String("repository", "", "GitHub owner/repository this policy covers")
 	kindFlag := fs.String("kind", "all", "the cache this policy covers: "+
