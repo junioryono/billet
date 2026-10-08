@@ -64,17 +64,14 @@ func OpenLedger(ctx context.Context, cfg *config.Config, mode LedgerMode) (*stat
 }
 
 // OpenLedgerWith opens the ledger in mode with the caller's connection string,
-// for a command handed the environment file the unit names rather than the
-// process environment. Only the operator and inspect modes take one.
+// for a report handed the environment file the unit names rather than the
+// process environment. Only the report (LedgerInspect) takes one.
 func OpenLedgerWith(ctx context.Context, cfg *config.Config, mode LedgerMode, dsn state.DSN) (*state.DB, error) {
-	switch mode {
-	case LedgerOperator:
-		return openOperatorLedgerWith(ctx, cfg, dsn)
-	case LedgerInspect:
-		return openInspectLedger(ctx, cfg, dsn)
-	default:
+	if mode != LedgerInspect {
 		return nil, fmt.Errorf("app: ledger mode %d takes no connection string of the caller's", mode)
 	}
+
+	return openInspectLedger(ctx, cfg, dsn)
 }
 
 // openControlPlaneLedger opens the ledger as the CONTROL PLANE, taking the exclusive
