@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,35 +94,55 @@ func TestAFailedReadServesAGapNotZeros(t *testing.T) {
 	}
 }
 
-// THE READ IS BOUNDED: a source that never answers ends at its timeout and is
-// reported as failed.
-func TestASlowReadEndsAtItsTimeout(t *testing.T) {
+// THE COLLECTOR BOUNDS THE READ ITSELF. A read that ignores its deadline holds
+// neither this scrape nor the next past the bound, is reported failed, and no
+// second read starts while it still runs.
+func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	t.Parallel()
 
+	release := make(chan struct{})
+	deadlines := make(chan bool, 4)
+
+	var reads atomic.Int32
+
 	srv := serveSnapshot(t, 50*time.Millisecond, func(ctx context.Context) (Snapshot, error) {
-		if _, ok := ctx.Deadline(); !ok {
-			return nil, errors.New("the read was given no deadline")
-		}
+		reads.Add(1)
 
-		<-ctx.Done()
+		_, ok := ctx.Deadline()
+		deadlines <- ok
 
-		return nil, ctx.Err()
+		<-release // deaf to its context, on purpose
+
+		return Snapshot{"billet_test_nodes": {{Value: 1}}}, nil
 	})
 
-	done := make(chan string, 1)
+	// Registered after serveSnapshot's, so it runs first: the read is let go
+	// before the endpoint closes.
+	t.Cleanup(func() { close(release) })
 
-	go func() {
+	for scrape := range 2 {
+		begun := time.Now()
 		_, body := get(t, srv, "/metrics")
-		done <- body
-	}()
 
-	select {
-	case body := <-done:
-		if !strings.Contains(body, `billet_scrape_up{source="ledger"} 0`) {
-			t.Error("a read that timed out is not reported as failed")
+		if took := time.Since(begun); took > 2*time.Second {
+			t.Errorf("scrape %d took %v against a 50ms bound", scrape, took)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the scrape did not end at the read's timeout")
+
+		if !strings.Contains(body, `billet_scrape_up{source="ledger"} 0`) {
+			t.Errorf("scrape %d did not report the unanswered read as failed", scrape)
+		}
+
+		if strings.Contains(body, "billet_test_nodes ") {
+			t.Errorf("scrape %d served a family the read never returned", scrape)
+		}
+	}
+
+	if n := reads.Load(); n != 1 {
+		t.Errorf("%d reads started, want 1: a second began while the first was still running", n)
+	}
+
+	if !<-deadlines {
+		t.Error("the read was given no deadline")
 	}
 }
 

@@ -57,15 +57,27 @@ func TestTheLedgerGaugesReadTheCapacityReportAndTheHosts(t *testing.T) {
 
 	tier := metricsTestTier()
 
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier})
+	// THE LEDGER RECORDS AT recorded; THE SCRAPE LOOKS 30s LATER.
+	recorded := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	now := recorded.Add(30 * time.Second)
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier},
+		alloc.WithClock(func() time.Time { return recorded }))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
-		Name: "docker-1", Provider: config.ProviderDocker, VCPU: 16, Memory: 64 * config.GiB,
-	}); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"docker-1", "docker-2"} {
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+			Name: name, Provider: config.ProviderDocker, VCPU: 16, Memory: 64 * config.GiB,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// LIVE AND DECOMMISSIONED: the decommission is what it is counted as.
+	if _, err := a.Decommission(t.Context(), alloc.DecommissionRequest{Node: "docker-2", Actor: "test", Force: true}); err != nil {
+		t.Fatalf("Decommission: %v", err)
 	}
 
 	leases, err := a.Escrow(t.Context(), tier.Label, 2)
@@ -73,12 +85,11 @@ func TestTheLedgerGaugesReadTheCapacityReportAndTheHosts(t *testing.T) {
 		t.Fatalf("Escrow: %d leases, %v", len(leases), err)
 	}
 
-	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	confirmed := 3
 
 	if err := a.RecordListenerCapacity(t.Context(), tier.Label, alloc.ListenerCapacity{
 		Discovery: []string{leases[0].ID}, Confirmed: &confirmed,
-		Waiting: 2, WaitingSince: now.Add(-90 * time.Second).Format(time.RFC3339Nano),
+		Waiting: 2, WaitingSince: recorded.Add(-90 * time.Second).Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +108,16 @@ func TestTheLedgerGaugesReadTheCapacityReportAndTheHosts(t *testing.T) {
 		{familyTierLeases, []string{tier.Label, "unknown"}, 1},
 		{familyTierLeases, []string{tier.Label, "running"}, 0},
 		{familyTierFloor, []string{tier.Label}, 1},
+		// 16 vCPU and 64GiB, less the two escrowed 2-vCPU, 8GiB leases, is
+		// room for six more.
+		{familyTierHeadroom, []string{tier.Label}, 6},
 		{familyTierAdvertised, []string{tier.Label}, 3},
 		{familyTierWaiting, []string{tier.Label}, 2},
-		{familyTierWaitingFor, []string{tier.Label}, 90},
+		{familyTierWaitingFor, []string{tier.Label}, 120},
+		{familyTierReportAge, []string{tier.Label}, 30},
 		{familyNodes, []string{"live"}, 1},
 		{familyNodes, []string{"offline"}, 0},
+		{familyNodes, []string{"decommissioned"}, 1},
 	} {
 		got, ok := value(t, snap, c.family, c.labels...)
 		if !ok {
@@ -113,10 +129,6 @@ func TestTheLedgerGaugesReadTheCapacityReportAndTheHosts(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s%v = %v, want %v", c.family, c.labels, got, c.want)
 		}
-	}
-
-	if _, ok := value(t, snap, familyTierHeadroom, tier.Label); !ok {
-		t.Errorf("%s is missing", familyTierHeadroom)
 	}
 
 	// Every sample names a family the source declares, with its label count,
@@ -164,10 +176,30 @@ func TestATierWithNoListenerReportHasNoAdvertisement(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, family := range []string{familyTierAdvertised, familyTierWaitingFor, familyTierReportAge} {
+	for _, family := range []string{familyTierAdvertised, familyTierWaiting, familyTierWaitingFor, familyTierReportAge} {
 		if v, ok := value(t, snap, family, tier.Label); ok {
 			t.Errorf("%s = %v for a tier whose listener never reported", family, v)
 		}
+	}
+
+	// A WAIT THAT HAS ENDED HAS NO DURATION, whatever WaitingSince still says.
+	if err := a.RecordListenerCapacity(t.Context(), tier.Label, alloc.ListenerCapacity{
+		Waiting: 0, WaitingSince: time.Now().Add(-time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err = ledgerSnapshot(a, []config.Tier{tier}, time.Now)(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if v, ok := value(t, snap, familyTierWaiting, tier.Label); !ok || v != 0 {
+		t.Errorf("a report recording no wait gives %s = %v, %v; want 0, present", familyTierWaiting, v, ok)
+	}
+
+	if v, ok := value(t, snap, familyTierWaitingFor, tier.Label); ok {
+		t.Errorf("a wait that has ended reports %s = %v", familyTierWaitingFor, v)
 	}
 }
 
@@ -203,5 +235,43 @@ func TestAnUnreadableLedgerIsAnErrorNotZeros(t *testing.T) {
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("the read failed for the wrong reason: %v", err)
+	}
+}
+
+// A REPORT FROM A CLOCK AHEAD OF THIS ONE IS AGE ZERO, never negative.
+func TestAReportFromAheadIsAgeZero(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := metricsTestTier()
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier},
+		alloc.WithClock(func() time.Time { return now.Add(time.Minute) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.RecordListenerCapacity(t.Context(), tier.Label, alloc.ListenerCapacity{
+		Waiting: 1, WaitingSince: now.Add(time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := ledgerSnapshot(a, []config.Tier{tier}, func() time.Time { return now })(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, family := range []string{familyTierReportAge, familyTierWaitingFor} {
+		if v, ok := value(t, snap, family, tier.Label); !ok || v != 0 {
+			t.Errorf("%s = %v, %v for a report a minute ahead; want 0, present", family, v, ok)
+		}
 	}
 }

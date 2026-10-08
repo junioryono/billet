@@ -36,7 +36,9 @@ const (
 var ledgerFamilies = []metrics.Family{
 	{Name: familyTierLeases, Labels: []string{"tier", "state"},
 		Help: "Open leases by tier and what they are doing: discovery and pending capacity, launching, " +
-			"idle and running runners, cleanup, or unknown (a capacity lease the listener's report does not classify)."},
+			"idle and running runners, cleanup, or unknown (a lease whose state could not be established: " +
+			"capacity the listener's report does not classify, or a runner whose record names another tier " +
+			"or a status this does not know)."},
 	{Name: familyTierFloor, Labels: []string{"tier"},
 		Help: "The tier's configured floor: capacity held for it whatever else is running."},
 	{Name: familyTierHeadroom, Labels: []string{"tier"},
@@ -44,7 +46,7 @@ var ledgerFamilies = []metrics.Family{
 	{Name: familyTierAdvertised, Labels: []string{"tier"},
 		Help: "The capacity the tier's listener last told GitHub, as its last completed exchange recorded it."},
 	{Name: familyTierWaiting, Labels: []string{"tier"},
-		Help: "How much of GitHub's assigned work the tier could not buy capacity for."},
+		Help: "How much of GitHub's assigned work the tier could not buy capacity for, as its listener last reported."},
 	{Name: familyTierWaitingFor, Labels: []string{"tier"},
 		Help: "How long the tier has been waiting for capacity, while it is."},
 	{Name: familyTierReportAge, Labels: []string{"tier"},
@@ -68,18 +70,37 @@ func ledgerSnapshot(a *alloc.Allocator, tiers []config.Tier, now func() time.Tim
 ) func(context.Context) (metrics.Snapshot, error) {
 	return func(ctx context.Context) (metrics.Snapshot, error) {
 		snap := metrics.Snapshot{}
-		at := now()
 
 		add := func(family string, value float64, labels ...string) {
 			snap[family] = append(snap[family], metrics.Sample{Labels: labels, Value: value})
 		}
 
+		// ONE SNAPSHOT FOR EVERY TIER, reading the fleet's leases once rather
+		// than once per tier.
+		reports, err := a.CapacityReports(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// AFTER THE READ, so a report a listener published while it ran is not
+		// younger than the clock it is compared with; one from a clock ahead of
+		// this one is age zero, never negative.
+		at := now()
+
+		age := func(since time.Time) float64 { return max(at.Sub(since).Seconds(), 0) }
+
 		for i := range tiers {
 			label := tiers[i].Label
 
-			report, err := a.CapacityReport(ctx, label)
-			if err != nil {
-				return nil, fmt.Errorf("tier %s: %w", label, err)
+			report, ok := reports[label]
+			if !ok {
+				return nil, fmt.Errorf("tier %s has no capacity report", label)
+			}
+
+			// AN OBSERVATION THAT COULD NOT BE READ IS NOT ONE THAT SAYS NOTHING:
+			// the source fails rather than report its tier idle.
+			if report.ObservationError != "" {
+				return nil, fmt.Errorf("tier %s: the listener's report could not be read: %s", label, report.ObservationError)
 			}
 
 			for state, n := range map[string]int{
@@ -91,21 +112,25 @@ func ledgerSnapshot(a *alloc.Allocator, tiers []config.Tier, now func() time.Tim
 
 			add(familyTierFloor, float64(report.Floor), label)
 			add(familyTierHeadroom, float64(report.Headroom), label)
-			add(familyTierWaiting, float64(report.Listener.Waiting), label)
 
 			// WHAT WAS NEVER RECORDED IS LEFT OUT, NOT REPORTED AS ZERO: a
-			// listener that has completed no exchange has told GitHub nothing
-			// billet knows of.
+			// listener that has published no report has said nothing about a
+			// wait, and one that has completed no exchange has told GitHub
+			// nothing billet knows of.
+			observed, reported := parseLedgerTime(report.ObservedAt)
+			if !reported {
+				continue
+			}
+
+			add(familyTierReportAge, age(observed), label)
+			add(familyTierWaiting, float64(report.Listener.Waiting), label)
+
 			if report.Listener.Confirmed != nil {
 				add(familyTierAdvertised, float64(*report.Listener.Confirmed), label)
 			}
 
 			if since, ok := parseLedgerTime(report.Listener.WaitingSince); ok && report.Listener.Waiting > 0 {
-				add(familyTierWaitingFor, at.Sub(since).Seconds(), label)
-			}
-
-			if observed, ok := parseLedgerTime(report.ObservedAt); ok {
-				add(familyTierReportAge, at.Sub(observed).Seconds(), label)
+				add(familyTierWaitingFor, age(since), label)
 			}
 		}
 
