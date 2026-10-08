@@ -147,7 +147,7 @@ func runLocalDown(ctx context.Context, env cli.Env, o downOptions) error {
 		}
 
 		defer func() {
-			if err := lock.release(); err != nil {
+			if err := lock.Release(); err != nil {
 				fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 			}
 		}()

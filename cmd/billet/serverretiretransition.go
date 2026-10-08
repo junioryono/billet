@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/hostauthority"
 
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -90,7 +91,7 @@ func retireTransition(ctx context.Context, env cli.Env, m retireMode, obs *insta
 ) (retirement.Journal, []retireStep, *retireRefusal) {
 	var (
 		steps []retireStep
-		host  *hostLock
+		host  *hostauthority.LifecycleLock
 	)
 
 	defer func() {
@@ -98,7 +99,7 @@ func retireTransition(ctx context.Context, env cli.Env, m retireMode, obs *insta
 			return
 		}
 
-		if err := host.release(); err != nil {
+		if err := host.Release(); err != nil {
 			fmt.Fprintln(env.Stderr, "billet: release the lifecycle lock: "+err.Error())
 		}
 	}()
@@ -161,7 +162,7 @@ func retireTransition(ctx context.Context, env cli.Env, m retireMode, obs *insta
 
 // retireHoldLifecycle takes the lifecycle lock for the actions inside the
 // stop-to-archive window and drops it for every action past it.
-func retireHoldLifecycle(host **hostLock, action retirement.Action) *retireRefusal {
+func retireHoldLifecycle(host **hostauthority.LifecycleLock, action retirement.Action) *retireRefusal {
 	switch action {
 	case retirement.ActionAwaitBackup, retirement.ActionStop, retirement.ActionArchive, retirement.ActionAdvanceArchived:
 		if *host != nil {
@@ -183,7 +184,7 @@ func retireHoldLifecycle(host **hostLock, action retirement.Action) *retireRefus
 			return nil
 		}
 
-		err := (*host).release()
+		err := (*host).Release()
 		*host = nil
 
 		if err != nil {
@@ -485,7 +486,7 @@ func retireBackupRefusedHere(props map[string][]string, j retirement.Journal) bo
 	if firstProp(props, "ActiveState") != "failed" ||
 		firstProp(props, "Result") != "exit-code" ||
 		firstProp(props, "ExecMainCode") != strconv.Itoa(cldExited) ||
-		firstProp(props, "ExecMainStatus") != strconv.Itoa(exitRetiring) ||
+		firstProp(props, "ExecMainStatus") != strconv.Itoa(retirement.ExitRetiring) ||
 		firstProp(props, "MainPID") != "0" {
 		return false
 	}
@@ -812,7 +813,7 @@ func retireArchive(ctx context.Context, j retirement.Journal) (retirement.Journa
 	j, moved, r := archiveUnderExclusion(ctx, j)
 
 	if moved {
-		acc.moved()
+		acc.Moved()
 	}
 
 	if released := releaseRetireIdentity(acc, admit); released != nil {

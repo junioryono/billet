@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -598,7 +599,7 @@ func TestTheNodeWireMintsItsAuthorityForTheDeployment(t *testing.T) {
 		Listen: ":0", IdentityDir: stateDir, NodeTLSHosts: []string{"billet.example"},
 	}}
 
-	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, hostauthority.ServerWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {
@@ -635,7 +636,7 @@ func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
 		Listen: ":0", IdentityDir: stateDir, NodeTLSHosts: []string{"billet.example"},
 	}}
 
-	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, hostauthority.ServerWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {

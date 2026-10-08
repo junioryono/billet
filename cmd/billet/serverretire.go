@@ -19,6 +19,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/regularfile"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
@@ -760,7 +761,7 @@ func retireOpenLedger(ctx context.Context, cfg *config.Config, environmentFile s
 		return nil, r
 	}
 	noteRetireMutation("ledger-handback", cfg.Server.IdentityDir)
-	err = errors.Join(err, handBackLedger(cfg.Server.IdentityDir))
+	err = errors.Join(err, hostauthority.HandBackLedger(cfg.Server.IdentityDir))
 	if err != nil {
 		return nil, retireUnknown(retireReasonLedger, "open the ledger: "+errors.Join(err, closeIfOpen(db)).Error(), "")
 	}

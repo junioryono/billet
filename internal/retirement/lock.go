@@ -22,6 +22,13 @@ var ErrNoGlobalLock = errors.New("retirement: no global authority lock exists on
 // is closed: the status names a phase from `stopped` on.
 type ErrRetiring struct{ Phase Phase }
 
+// ExitRetiring is the status a command exits with when this host's authority is
+// closed by a retirement (ErrRetiring). It is its own code because the
+// retirement itself reads it: a backup the timer started in the window between
+// the timers' stop and the status's closing fails with it, and the transition's
+// reconciliation admits that one failure and no other.
+const ExitRetiring = 6
+
 func (e ErrRetiring) Error() string {
 	return fmt.Sprintf("retirement: this controller's authority is closed (its retirement is at %q); "+
 		"finish or repair the retirement before touching its identity", e.Phase)

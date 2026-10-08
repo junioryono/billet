@@ -17,6 +17,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/github"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -259,7 +260,7 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		// THE EXCLUSION AROUND THE OPEN, which creates the ledger and the identity
 		// on a fresh host (`billet check` is the documented first step), released
 		// once the handle exists: what follows is a diagnostic over that handle.
-		acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+		acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Create: true, Wait: hostauthority.Wait})
 		if err != nil {
 			return report, err
 		}

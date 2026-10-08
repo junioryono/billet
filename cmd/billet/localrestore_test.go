@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/deployarchive"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -339,7 +340,7 @@ func TestASecondRestoreConfirmsUnderTheLockRatherThanReportingFromAStalePlan(t *
 	prev := lifecycleLock
 	swapped := false
 
-	lifecycleLock = func() (*hostLock, error) {
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
 		// The plan is built and printed by now; Execute has not run.
 		if !swapped {
 			if err := os.Remove(tgt.keyPath); err != nil {
@@ -414,7 +415,7 @@ func TestANoOpRestoreThatRefusesLeavesTheDeploymentUnfenced(t *testing.T) {
 	// and the lock so the locked recheck refuses.
 	prev := lifecycleLock
 
-	lifecycleLock = func() (*hostLock, error) {
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
 		if err := os.Remove(filepath.Join(tgt.stateDir, "deployment-id")); err != nil &&
 			!os.IsNotExist(err) {
 			return nil, err

@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 	"github.com/junioryono/billet/internal/rollout"
@@ -2531,9 +2532,9 @@ func TestTheDryRunObservesTheIdentityUnderHeldWriterLocks(t *testing.T) {
 		t.Cleanup(func() { mustOK(t, lock.Close()) })
 	}
 
-	savedWait, savedOpen, savedConverge := identityAccessWait, retireReportOpen, converge
-	identityAccessWait = time.Nanosecond
-	t.Cleanup(func() { identityAccessWait, retireReportOpen, converge = savedWait, savedOpen, savedConverge })
+	savedWait, savedOpen, savedConverge := hostauthority.Wait, retireReportOpen, converge
+	hostauthority.Wait = time.Nanosecond
+	t.Cleanup(func() { hostauthority.Wait, retireReportOpen, converge = savedWait, savedOpen, savedConverge })
 	opens := 0
 	retireReportOpen = func(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
 		opens++

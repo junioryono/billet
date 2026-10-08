@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/deployarchive"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -114,10 +115,10 @@ tiers:
 func stubLifecycleLock(t *testing.T) {
 	t.Helper()
 
-	prev := hostLockDir
-	hostLockDir = t.TempDir()
+	prev := hostauthority.LockDir
+	hostauthority.LockDir = t.TempDir()
 
-	t.Cleanup(func() { hostLockDir = prev })
+	t.Cleanup(func() { hostauthority.LockDir = prev })
 }
 
 // TestLocalBackupCapturesTheWholeDeployment drives the COMMAND rather than the

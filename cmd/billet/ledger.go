@@ -2,186 +2,38 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
-	"github.com/junioryono/billet/internal/version"
 )
+
+// The ledger opens are internal/app's modes; these name them for the commands
+// that choose an opener as a value and for the tests that hold which one a
+// command uses.
 
 // errNoLedgerYet means the state directory holds no ledger to read a decision
 // from, which on a host the package just installed is the ordinary state.
-var errNoLedgerYet = errors.New("no ledger here yet")
+var errNoLedgerYet = app.ErrNoLedgerYet
 
-// openStateForDecision opens the ledger for the one read that must not be
-// refused by the release watermark: the host's own instruction.
-//
-// NAMES NO RELEASE, ON PURPOSE, AND THIS IS THE ONLY OPEN THAT MAY. Every other
-// open in this file names the running binary so a proved older one is refused;
-// this one exists because `host-upgrade --from-rollout` on a standby is that
-// older binary, reading what it should become from a ledger whose leader has
-// already recorded the newer release. It is an operator handle otherwise: it
-// verifies the schema is one this binary knows, verifies the deployment
-// identity, and the caller reads and closes. The structural test on this file
-// exempts it by name.
-//
-// AND IT CREATES NOTHING. The package enables the timer that runs this on every
-// host, including one whose server has never run, and an operator open of an
-// empty state directory would mint a root-owned ledger there five minutes after
-// the install, which the service account then cannot open. A directory with no
-// ledger is nothing to decide about. What it still does, like every operator
-// open, is migrate an unheld ledger that is behind this binary; that is the
-// same act `billet rollout status` performs on such a host.
 func openStateForDecision(ctx context.Context, cfg *config.Config) (*state.DB, error) {
-	dsn, err := app.LedgerDSN(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	if cfg.Server.LedgerBackend() != config.StatePostgres {
-		if _, err := os.Lstat(state.LedgerPath(cfg.Server.IdentityDir)); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("%w: %s", errNoLedgerYet, cfg.Server.IdentityDir)
-			}
-
-			return nil, fmt.Errorf("look for the ledger: %w", err)
-		}
-	}
-
-	var db *state.DB
-
-	// UNDER THE IDENTITY EXCLUSION, borrowed from a command that holds it or
-	// taken for the open: the opener creates the directory and its lock on
-	// first use, and a retirement renames the directory under a global lock
-	// this open now waits for rather than racing. THE HAND-BACK BELONGS TO THE
-	// ATTEMPT, not to the handle: the opener creates the directory lock before
-	// it connects, so a failed open leaves a root-owned file too.
-	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
-		var openErr error
-
-		if cfg.Server.LedgerBackend() == config.StatePostgres {
-			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn)
-		} else {
-			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir)
-		}
-
-		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
-	})
-	if err != nil {
-		return nil, errors.Join(err, closeIfOpen(db))
-	}
-
-	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-
-	return db, nil
+	return app.OpenLedger(ctx, cfg, app.LedgerDecision)
 }
 
-// openStateAdmin opens the ledger for a ONE-SHOT OPERATOR COMMAND: it proceeds
-// without the directory lock when a control plane holds it, and then verifies
-// the schema rather than migrating it. See state.OpenAdmin.
 func openStateAdmin(ctx context.Context, cfg *config.Config) (*state.DB, error) {
-	dsn, err := app.LedgerDSN(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	return openStateAdminWith(ctx, cfg, dsn)
+	return app.OpenLedger(ctx, cfg, app.LedgerOperator)
 }
 
-// openStateAdminWith is openStateAdmin with the caller's connection string,
-// for a command handed the environment file the unit names rather than the
-// process environment.
-func openStateAdminWith(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
-	var (
-		db  *state.DB
-		err error
-	)
-
-	// Under the identity exclusion and with the hand-back on the attempt, as in
-	// openStateForDecision.
-	err = underIdentityExclusion(ctx, cfg.Server.IdentityDir, func() error {
-		var openErr error
-
-		if cfg.Server.LedgerBackend() == config.StatePostgres {
-			db, openErr = state.OpenPostgresAdmin(ctx, cfg.Server.IdentityDir, dsn,
-				state.WithRunningRelease(version.Version()))
-		} else {
-			db, openErr = state.OpenAdmin(ctx, cfg.Server.IdentityDir,
-				state.WithRunningRelease(version.Version()))
-		}
-
-		return errors.Join(openErr, handBackLedger(cfg.Server.IdentityDir))
-	})
-	if err != nil {
-		return nil, errors.Join(err, closeIfOpen(db))
-	}
-
-	// AND IT IS THIS DEPLOYMENT'S LEDGER, ASKED ONCE FOR EVERY OPERATOR COMMAND.
-	//
-	// A command binds nothing — it is not the authority for what these rows are —
-	// but pointing one at another deployment's ledger is exactly as wrong as
-	// pointing a control plane at them, and one wrong DSN reaches it. `billet ca
-	// issue` would record an admission in a fleet it has never met.
-	//
-	// PEEKED RATHER THAN READ, because state.DeploymentID MINTS one when the
-	// directory has none: a status command that created an identity as a side
-	// effect of looking would be the thing that makes the next start read a
-	// deployment as day one.
-	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-
-	return db, nil
-}
-
-// verifyLedgerIdentity refuses a ledger that says it belongs to somebody else.
-//
-// AN ABSENT IDENTITY IS NOT A MISMATCH. A host being prepared has no identity
-// file yet — `billet check` is documented as the way to create one — and a
-// ledger migrated before the binding existed carries no binding either. Both are
-// ordinary and both answer yes; what is refused is two answers that disagree.
-func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB) error {
-	deployment, ok, err := state.PeekDeploymentID(cfg.Server.IdentityDir)
-	if err != nil || !ok {
-		return err
-	}
-
-	return db.VerifyDeploymentBinding(ctx, deployment)
-}
-
-// openStateInspect opens the ledger for a REPORT, through state.OpenInspect: an
-// existing ledger only, nothing created, locked, claimed, migrated or recorded,
-// the schema exactly this binary's and the identity verified. The DSN is the
-// caller's, because a report may be handed the environment file the unit
-// names rather than the process environment.
 func openStateInspect(ctx context.Context, cfg *config.Config, dsn state.DSN) (*state.DB, error) {
-	var (
-		db  *state.DB
-		err error
-	)
+	return app.OpenLedgerWith(ctx, cfg, app.LedgerInspect, dsn)
+}
 
-	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		db, err = state.OpenPostgresInspect(ctx, cfg.Server.IdentityDir, dsn,
-			state.WithRunningRelease(version.Version()))
-	} else {
-		db, err = state.OpenInspect(ctx, cfg.Server.IdentityDir,
-			state.WithRunningRelease(version.Version()))
-	}
+func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
+	return app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
+}
 
-	if err != nil {
-		return nil, err
-	}
-
-	if err := verifyLedgerIdentity(ctx, cfg, db); err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-
-	return db, nil
+func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB) error {
+	return app.VerifyLedgerIdentity(ctx, cfg, db)
 }
 
 // closeIfOpen closes a handle an open may or may not have produced, so an error
@@ -192,11 +44,4 @@ func closeIfOpen(db *state.DB) error {
 	}
 
 	return db.Close()
-}
-
-// openStateMaintenance is app's maintenance mode in the shape of the commands
-// that choose their opener as a value (the host-upgrade probe's lowering, the
-// check's quiescent probe).
-func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
-	return app.OpenLedger(ctx, cfg, app.LedgerMaintenance)
 }

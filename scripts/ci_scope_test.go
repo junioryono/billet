@@ -451,7 +451,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"internal/store/embedded/schema.json", families(append([]string{"replay"}, application...)...)},
 		{"tools/lint/go.work", "all"},
 		{"internal/state/migrations/0099_x.sql", families(append([]string{"postgres", "replay"}, application...)...)},
-		{"internal/lifeops/unit.go", families(append([]string{"postgres"}, application...)...)},
+		{"internal/lifeops/unit.go", families(append([]string{"postgres", "replay"}, application...)...)},
 		{"deploy/billet-server.service", families(application...)},
 		// The collection and the retirement shard checker.
 		{"ansible_collections/junioryono/billet/roles/host/tasks/main.yml",

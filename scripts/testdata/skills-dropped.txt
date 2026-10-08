@@ -38,3 +38,10 @@ deedfda57b81 The two runServer order tests were replaced by TestOnlyTheProvingSt
 5678b07cd1a1 The signal lifecycle moved to internal/cli as cli.Lifecycle (#356 Phase 4); the sentence names its methods there.
 e49331495156 The exit-status type moved to internal/cli as cli.ExitError (#356 Phase 4); the sentence names it there.
 a2d34264e894 Operator output no longer belongs to cmd/billet as a package: a command writes to the cli.Env it is handed and only main names the process streams (#356 Phase 4); the sentence states the stream and environment bans that replaced it.
+1b8e4b794955 The identity exclusion moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Under, which the ledger opens run under.
+8091ccf9fabf The lifecycle lock moved to internal/hostauthority (#356 Phase 4); the list names its test there.
+953c8384c5d7 The ledger hand-back moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.HandBackLedger.
+b216b3a2a0f5 The identity access moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Open as the one entry.
+b328ae11a010 The fresh branch of the identity access moved to internal/hostauthority (#356 Phase 4); the sentence names hostauthority.Open.
+4c9719ee3eda The operator and report opens moved into internal/app with the control plane's (#356 Phase 4); the sentence names internal/app/ledger.go and its structural test.
+e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase 4); the sentence names it and the test that exempts it.

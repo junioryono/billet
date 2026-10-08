@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 )
@@ -486,10 +487,10 @@ func stageUp(t *testing.T, f *fakeConverger, verdict githubVerdict) *fakeConverg
 	// can create, and these tests are about the ORDER `up` does things in, which
 	// is entirely on the far side of taking it. hostlock_test.go covers the lock
 	// against a real directory.
-	lifecycleLock = func() (*hostLock, error) {
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
 		f.record("lock")
 
-		return &hostLock{}, nil
+		return &hostauthority.LifecycleLock{}, nil
 	}
 
 	converge = func(...lifeops.ConvergeOption) converger { return f }

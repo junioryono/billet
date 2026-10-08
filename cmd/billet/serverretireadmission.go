@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/retirement"
 )
@@ -210,7 +211,7 @@ func retireOperationProtection(j retirement.Journal) lifeops.OperationProtection
 		Units:      []string{serverUnit, nodeUnit, backupServiceUnit, "billet-upgrade.service", upgradeTimerUnit, backupTimerUnit},
 		QuietUnits: retireQuietServices,
 		Paths: []string{j.Archive, retirement.RetiredDir(), retirement.GlobalLockPath(), retirement.StatusPath(),
-			retirement.ServiceAccountPath(), retirement.InitLockPath(j.IdentityDir), filepath.Join(hostLockDir, "billet-lifecycle.lock"), upgradeRoot},
+			retirement.ServiceAccountPath(), retirement.InitLockPath(j.IdentityDir), filepath.Join(hostauthority.LockDir, "billet-lifecycle.lock"), upgradeRoot},
 		UnitPaths:          map[string][]string{serverUnit: {j.IdentityDir}},
 		RequiredInputs:     make(map[string][]string),
 		ArchivedInputRoots: []string{j.IdentityDir},

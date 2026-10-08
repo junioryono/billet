@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -58,7 +59,7 @@ func TestAGeneratedLocalConfigServesPlainLoopbackWithoutACA(t *testing.T) {
 	cfg.Server.IdentityDir = stateDir
 
 	deploymentID := "0123456789abcdef0123456789abcdef"
-	stop, err := app.ServeNodeWire(t.Context(), cfg, serverWireAccess,
+	stop, err := app.ServeNodeWire(t.Context(), cfg, hostauthority.ServerWireAccess,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
 		nil, nil, nil, nil, nil)
 	if err != nil {

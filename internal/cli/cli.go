@@ -52,8 +52,9 @@ func Main(args []string, env Env, tree Tree, exit func(int)) int {
 	}
 
 	// A QUIET EXIT carries a child's status whose output was already passed
-	// through: nothing more is printed.
-	if coded, ok := errors.AsType[*ExitError](err); ok && coded.Msg == "" {
+	// through: nothing more is printed. A retiring host's refusal is never quiet,
+	// and its status is ExitStatus's.
+	if coded, ok := errors.AsType[*ExitError](err); ok && coded.Msg == "" && !retiring(err) {
 		return coded.Code
 	}
 

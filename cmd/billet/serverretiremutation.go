@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -28,7 +29,7 @@ func (e *retireStepError) Error() string { return e.refusal.Why }
 
 // Retirement composes the existing exclusions so each lock wait ends a step.
 // No shared lock or ownership primitive takes a retirement-specific callback.
-func openRetireIdentity(ctx context.Context, dir string, retiring bool, admit func() *retireRefusal) (*identityAccess, *retireRefusal) {
+func openRetireIdentity(ctx context.Context, dir string, retiring bool, admit func() *retireRefusal) (*hostauthority.Access, *retireRefusal) {
 	if r := admit(); r != nil {
 		return nil, r
 	}
@@ -37,7 +38,7 @@ func openRetireIdentity(ctx context.Context, dir string, retiring bool, admit fu
 	if retiring {
 		resolve = wirecert.ResolveRetiringExclusion
 	}
-	ex, err := resolve(ctx, dir, identityAccessWait)
+	ex, err := resolve(ctx, dir, hostauthority.Wait)
 	noteRetireMutation("wait", "global lock")
 	if err != nil {
 		return nil, retireUnknown(retireReasonIdentity, err.Error(), "")
@@ -48,33 +49,29 @@ func openRetireIdentity(ctx context.Context, dir string, retiring bool, admit fu
 		}
 		return nil, r
 	}
-	acc := &identityAccess{dir: dir, exclusion: ex, account: ex.Account}
 	noteRetireMutation("identity-lock", dir)
-	err = acc.lockInner(ctx, ex)
+	acc, err := hostauthority.Adopt(ctx, dir, ex)
 	noteRetireMutation("wait", "identity lock")
 	if err != nil {
 		return nil, retireUnknown(retireReasonIdentity, errors.Join(err, ex.Release()).Error(), "")
 	}
-	return acc.registered(), nil
+	return acc, nil
 }
 
 // A refused hand-back still releases both exclusions, without ownership repair.
 // These accesses never initialise an identity or acquire a lifecycle hold.
-func releaseRetireIdentity(acc *identityAccess, admit func() *retireRefusal) *retireRefusal {
+func releaseRetireIdentity(acc *hostauthority.Access, admit func() *retireRefusal) *retireRefusal {
 	var r *retireRefusal
-	if !acc.dirMoved {
+	if !acc.WasMoved() {
 		r = admit()
 		if r == nil {
-			noteRetireMutation("identity-handback", acc.dir)
-			if err := acc.handBack(); err != nil {
+			noteRetireMutation("identity-handback", acc.Dir())
+			if err := acc.HandBack(); err != nil {
 				r = retireUnknown(retireReasonIdentity, err.Error(), "")
 			}
 		}
 	}
-	lock := acc.lock
-	acc.lock = nil
-	heldAccesses.CompareAndDelete(accessKey(acc.dir), acc)
-	if err := errors.Join(lock.Release(), acc.Release()); err != nil {
+	if err := acc.ReleaseWithoutHandBack(); err != nil {
 		if r == nil {
 			r = retireUnknown(retireReasonIdentity, err.Error(), "")
 		} else {

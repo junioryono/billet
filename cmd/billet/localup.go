@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
@@ -96,7 +97,7 @@ var (
 	// lives in a directory only root can create, and every ordering these
 	// commands are responsible for is on the far side of taking it. The lock
 	// itself is exercised against a real directory in hostlock_test.go.
-	lifecycleLock = takeHostLock
+	lifecycleLock = hostauthority.TakeLifecycleLock
 )
 
 // cmdLocalUp brings this machine's billet services up.
@@ -215,7 +216,7 @@ func runLocalUp(ctx context.Context, env cli.Env, o upOptions) error {
 	}
 
 	defer func() {
-		if err := lock.release(); err != nil {
+		if err := lock.Release(); err != nil {
 			fmt.Fprintf(env.Stdout, "warn     could not release the lifecycle lock: %v\n", err)
 		}
 	}()
@@ -1010,7 +1011,7 @@ func prepareHostForUp(ctx context.Context, env cli.Env, req lifeops.UpRequest, c
 		Account:     retirement.ServiceAccount{User: req.ServiceUser, UID: uid, Group: req.ServiceGroup, GID: gid},
 		IdentityDir: cfg.Server.IdentityDir,
 		InnerLock:   wirecert.AuthorityLockPath(cfg.Server.IdentityDir),
-		Wait:        identityAccessWait,
+		Wait:        hostauthority.Wait,
 	})
 	if err != nil {
 		return fmt.Errorf("prepare this host's authority exclusion: %w", err)

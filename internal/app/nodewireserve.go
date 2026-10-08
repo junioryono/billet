@@ -19,8 +19,8 @@ import (
 
 // IdentityAccess takes the exclusion a process holds while it reads, and on
 // first use creates, the identity directory's authority, and returns its
-// release. It is the host's, not the assembly's: cmd/billet supplies it until
-// the host authority moves out of cmd/billet (#356 Phase 4b).
+// release. It is the host's, not the assembly's: cmd/billet hands it
+// internal/hostauthority's, and a test hands it one that holds nothing.
 type IdentityAccess func(ctx context.Context, dir string) (release func() error, err error)
 
 // nodeTLSHosts is what a node will type to reach this control plane.

@@ -7,150 +7,81 @@ import (
 	"testing"
 )
 
-// EVERY OPEN OF THE LEDGER NAMES THE RUNNING RELEASE.
-//
-// The release watermark refuses a proved downgrade and lets the control plane
-// record a proved upgrade, and both depend on the opener saying which billet it
-// is — an open that names nothing gets neither. That is right for a test opening
-// a throwaway ledger and wrong for every command in this program, and nothing
-// at run time would notice the omission: the ledger opens, the schema verifies,
-// and an older binary quietly serves rows a newer one wrote.
-//
-// A STRUCTURAL TEST BECAUSE ledger.go IS THE ONE PLACE THAT OPENS. Every command
-// reaches the store through it, so proving each state.Open* call there carries
-// state.WithRunningRelease is proving it for the program — and the day somebody
-// adds a seventh open helper without the option, this names the line.
-func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
+// EACH OF cmd/billet's LEDGER OPENERS IS THE MODE ITS NAME SAYS. The opens are
+// internal/app's, held there to the release rules; these names are what the
+// commands choose between, so one naming the wrong mode would open, say, the
+// inspection handle where a command writes, and nothing would say so until it
+// failed to.
+func TestEachLedgerOpenerIsTheModeItsNameSays(t *testing.T) {
 	t.Parallel()
 
-	fset := token.NewFileSet()
-
-	file, err := parser.ParseFile(fset, "ledger.go", nil, 0)
+	file, err := parser.ParseFile(token.NewFileSet(), "ledger.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse ledger.go: %v", err)
 	}
 
-	var opens int
+	want := map[string][2]string{
+		"openStateForDecision": {"OpenLedger", "LedgerDecision"},
+		"openStateAdmin":       {"OpenLedger", "LedgerOperator"},
+		"openStateInspect":     {"OpenLedgerWith", "LedgerInspect"},
+		"openStateMaintenance": {"OpenLedger", "LedgerMaintenance"},
+	}
 
-	// THE TWO INSPECTION OPENERS ARE REQUIRED BY NAME: the report's open is the
-	// one an older binary could quietly serve through, and a count alone would
-	// be satisfied by any eight opens.
-	seen := map[string]int{}
-
-	// THE ONE EXEMPTION, BY NAME: the instruction reader. A standby's timer is an
-	// older binary reading what it should become, and the watermark the newer
-	// leader recorded would refuse it. Its opens are asserted the other way
-	// round below: they must NOT name a release.
-	var exempt *ast.FuncDecl
+	found := map[string]bool{}
 
 	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "openStateForDecision" {
-			exempt = fn
-		}
-	}
-
-	if exempt == nil {
-		t.Fatal("ledger.go has no openStateForDecision; the timer's instruction read moved")
-	}
-
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
-			return true
+			continue
 		}
 
-		if call.Pos() >= exempt.Pos() && call.End() <= exempt.End() {
-			if pkg, name, ok := selector(call.Fun); ok && pkg == "state" && len(name) >= 4 &&
-				name[:4] == "Open" {
-				// AND THE OPERATOR OPENERS, on both backends: a probe or a
-				// maintenance open there would read past the fence or refuse to
-				// migrate an unheld ledger, neither of which is what an operator's
-				// read does.
-				if name != "OpenAdmin" && name != "OpenPostgresAdmin" {
-					t.Errorf("%s: openStateForDecision opens through state.%s, want the operator "+
-						"open of its backend", fset.Position(call.Pos()), name)
-				}
-
-				for _, arg := range call.Args {
-					if inner, ok := arg.(*ast.CallExpr); ok {
-						if p, fn, ok := selector(inner.Fun); ok && p == "state" &&
-							fn == "WithRunningRelease" {
-							t.Errorf("%s: openStateForDecision names the running release, so a "+
-								"standby behind its leader cannot read its own instruction",
-								fset.Position(call.Pos()))
-						}
-					}
-				}
-			}
-
-			return true
+		w, ok := want[fn.Name.Name]
+		if !ok {
+			continue
 		}
 
-		pkg, name, ok := selector(call.Fun)
-		if !ok || pkg != "state" || len(name) < 4 || name[:4] != "Open" {
-			return true
+		found[fn.Name.Name] = true
+
+		if len(fn.Body.List) != 1 {
+			t.Errorf("%s is %d statements, want the one return of its mode's open", fn.Name.Name, len(fn.Body.List))
+
+			continue
 		}
 
-		opens++
-		seen[name]++
+		ret, ok := fn.Body.List[0].(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			t.Errorf("%s does not return its mode's open", fn.Name.Name)
 
-		for _, arg := range call.Args {
-			inner, ok := arg.(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-
-			if p, fn, ok := selector(inner.Fun); ok && p == "state" && fn == "WithRunningRelease" {
-				// AND THE ARGUMENT IS THE RUNNING RELEASE ITSELF: WithRunningRelease("")
-				// names nothing and would satisfy the call's presence.
-				if len(inner.Args) != 1 {
-					t.Errorf("%s: state.WithRunningRelease takes one argument, got %d",
-						fset.Position(inner.Pos()), len(inner.Args))
-
-					return true
-				}
-
-				vcall, ok := inner.Args[0].(*ast.CallExpr)
-				if !ok {
-					t.Errorf("%s: state.WithRunningRelease's argument is not version.Version()",
-						fset.Position(inner.Pos()))
-
-					return true
-				}
-
-				if vp, vf, ok := selector(vcall.Fun); !ok || vp != "version" || vf != "Version" || len(vcall.Args) != 0 {
-					t.Errorf("%s: state.WithRunningRelease's argument is not version.Version()",
-						fset.Position(inner.Pos()))
-				}
-
-				return true
-			}
+			continue
 		}
 
-		t.Errorf("%s: state.%s is called without state.WithRunningRelease, so this open "+
-			"neither refuses a downgrade nor records an upgrade", fset.Position(call.Pos()), name)
+		call, ok := ret.Results[0].(*ast.CallExpr)
+		if !ok {
+			t.Errorf("%s does not return a call", fn.Name.Name)
 
-		return true
-	})
+			continue
+		}
 
-	for _, opener := range []string{"OpenInspect", "OpenPostgresInspect"} {
-		if seen[opener] != 1 {
-			t.Errorf("ledger.go calls state.%s %d times, want exactly once, in the report's open",
-				opener, seen[opener])
+		pkg, name, _ := selector(call.Fun)
+		if pkg != "app" || name != w[0] || len(call.Args) < 3 {
+			t.Errorf("%s returns %s.%s, want app.%s", fn.Name.Name, pkg, name, w[0])
+
+			continue
+		}
+
+		if p, mode, ok := selector(call.Args[2]); !ok || p != "app" || mode != w[1] {
+			t.Errorf("%s opens in mode %v, want app.%s", fn.Name.Name, call.Args[2], w[1])
 		}
 	}
 
-	// THE COUNT IS ASSERTED, or a refactor that moved every open out of this
-	// file would leave a test that inspects nothing and passes.
-	// The control plane's own opens are internal/app's, held there by the same
-	// test; these are the operator and report ones.
-	if opens < 4 {
-		t.Fatalf("found %d state.Open* calls in ledger.go, want the four operator and report "+
-			"opens; if they moved, move this test with them", opens)
+	for name := range want {
+		if !found[name] {
+			t.Errorf("ledger.go has no %s", name)
+		}
 	}
 }
 
-// selector reads `pkg.Name` out of a call's function expression.
+// selector reads `pkg.Name` out of an expression.
 func selector(expr ast.Expr) (string, string, bool) {
 	sel, ok := expr.(*ast.SelectorExpr)
 	if !ok {

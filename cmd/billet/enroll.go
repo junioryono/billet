@@ -14,6 +14,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -274,7 +275,7 @@ func cmdNodesDecide(ctx context.Context, env cli.Env, args []string, decision st
 	// what they would create into. Held for the whole decision, so nothing here
 	// opens or writes after a closure that arrived mid-way, and released last,
 	// handing back what root created.
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{create: true, wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Create: true, Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}
@@ -845,7 +846,7 @@ func cmdCARotate(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("rotating is done on the control plane, and this config has no server section")
 	}
 
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}
@@ -936,7 +937,7 @@ func cmdCARetire(ctx context.Context, env cli.Env, args []string) error {
 	// THIS deployment's — a coherent authority belonging to somebody else is one
 	// LoadOrCreateCA will not start on, so the previous pair beside it is the
 	// only authority here that means anything.
-	acc, err := openIdentityAccess(ctx, cfg.Server.IdentityDir, identityIntent{wait: identityAccessWait})
+	acc, err := hostauthority.Open(ctx, cfg.Server.IdentityDir, hostauthority.Intent{Wait: hostauthority.Wait})
 	if err != nil {
 		return err
 	}

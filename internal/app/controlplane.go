@@ -25,8 +25,9 @@ import (
 )
 
 // Host is what a role needs from the process and the machine it runs on that
-// the assembly cannot build from a config. cmd/billet provides it until the
-// host authority moves out of cmd/billet (#356 Phase 4b).
+// the assembly cannot build from a config. cmd/billet provides it: the
+// identity accesses from internal/hostauthority, the service manager's
+// notifications, and the command's stdout.
 type Host struct {
 	// ServerAccess is the exclusion around the identity read, the ledger open
 	// and the node wire's authority read.
