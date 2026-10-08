@@ -37,6 +37,9 @@ The control plane also reads its ledger at every scrape, through the same report
 | `billet_tier_report_age_seconds{tier}` | how old the listener's last published report is; a listener that has stopped leaves a report that only ages |
 | `billet_nodes{state}` | registered hosts: `live`, `offline` or `decommissioned` |
 | `billet_scrape_up{source}` | 1 when the ledger was read for this scrape; 0 when it could not be, in which case the gauges above are left out rather than reported as zero |
+| `billet_ledger_write_wait_seconds` | how long each write waited for the ledger's single writer slot (a histogram); a rising tail is scheduling queueing behind other writers |
+| `billet_ledger_write_held_seconds{outcome}` | how long each write held the slot, `committed` or `rolled_back` (a histogram) |
+| `billet_ledger_write_busy_retries_total` | each time a write found the slot taken and tried again |
 
 A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
 

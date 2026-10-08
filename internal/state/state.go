@@ -166,6 +166,10 @@ type DB struct {
 	// behind itself for no benefit.
 	claimedEpoch atomic.Int64
 
+	// observer is told how writes went; see Observe. Atomic, because it is set
+	// once the metrics endpoint starts, while writers already run.
+	observer atomic.Pointer[Observer]
+
 	// fenced latches once a write has been refused because a successor claimed.
 	// See LeadershipLost for why it never clears and what reads it.
 	fenced atomic.Bool
@@ -1195,10 +1199,26 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return ErrInspect
 	}
 
+	obs := db.observing()
+	began := time.Now()
+
 	tx, err := db.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
+
+	committed := false
+
+	// REGISTERED BEFORE THE ROLLBACK, so it runs after it: the hold ends when
+	// the transaction does, not when fn returns.
+	if obs != nil {
+		obs.WriteWaited(time.Since(began))
+
+		held := time.Now()
+
+		defer func() { obs.WriteHeld(time.Since(held), committed) }()
+	}
+
 	defer func() {
 		// Rollback after a successful Commit is a documented no-op returning
 		// sql.ErrTxDone; this only does real work on the error and panic paths,
@@ -1247,6 +1267,9 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit write tx: %w", db.asCancellation(ctx, err))
 	}
+
+	committed = true
+
 	return nil
 }
 
@@ -1758,6 +1781,10 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 		// is indistinguishable from a test that does not exercise it at all.
 		if onBusyRetry != nil {
 			onBusyRetry()
+		}
+
+		if obs := db.observing(); obs != nil {
+			obs.WriteRetried()
 		}
 
 		// time.After would leak its timer until it fired, and forbidigo bans it

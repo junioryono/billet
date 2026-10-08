@@ -3,6 +3,9 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,5 +206,80 @@ func TestAnUnreadableLedgerIsAnErrorNotZeros(t *testing.T) {
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("the read failed for the wrong reason: %v", err)
+	}
+}
+
+// THE SERVED ENDPOINT CARRIES BOTH HALVES: the ledger's gauges, read at the
+// scrape, and its writes, told by the ledger as they happened.
+func TestTheLedgerSourceServesGaugesAndWrites(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := metricsTestTier()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := ServeMetrics(t.Context(), "server", &config.MetricsConfig{Listen: "127.0.0.1:0"},
+		ledgerSource(a, db, []config.Tier{tier}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { m.Close(t.Context()) })
+
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "docker-1", Provider: config.ProviderDocker, VCPU: 16, Memory: 64 * config.GiB,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if leases, err := a.Escrow(t.Context(), tier.Label, 1); err != nil || len(leases) != 1 {
+		t.Fatalf("Escrow: %d leases, %v", len(leases), err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+m.srv.Addr().String()+"/metrics", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		`billet_tier_leases{state="unknown",tier="billet-2vcpu"} 1`,
+		`billet_scrape_up{source="ledger"} 1`,
+		`billet_ledger_write_held_seconds_count{outcome="committed"}`,
+		`billet_ledger_write_held_seconds_count{outcome="rolled_back"} 0`,
+		"billet_ledger_write_wait_seconds_count ",
+		"billet_ledger_write_busy_retries_total 0",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics does not carry %q", want)
+		}
+	}
+
+	if strings.Contains(string(body), "billet_ledger_write_wait_seconds_count 0\n") {
+		t.Error("the escrow's write was not told to the endpoint")
 	}
 }

@@ -8,14 +8,23 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/metrics"
+	"github.com/junioryono/billet/internal/state"
 )
 
-// MetricsSource is a set of gauges a role reads afresh at every scrape.
+// MetricsSource is what a role serves beside the runtime's metrics: gauges it
+// reads afresh at every scrape, and observers it attaches to what it runs.
 type MetricsSource struct {
 	name     string
 	families []metrics.Family
 	read     func(context.Context) (metrics.Snapshot, error)
+	// attach registers the source's event metrics and hands them to what
+	// reports them, once the endpoint is serving.
+	attach func(*metrics.Registry) error
 }
+
+// The ledger's write metrics report through state.Observer, which the ledger
+// declares and internal/metrics satisfies without either importing the other.
+var _ state.Observer = (*metrics.LedgerObserver)(nil)
 
 // ledgerScrapeTimeout bounds one scrape's reads of the ledger.
 const ledgerScrapeTimeout = 5 * time.Second
@@ -53,14 +62,29 @@ var ledgerFamilies = []metrics.Family{
 		Help: "Registered hosts by state: live, offline, or decommissioned."},
 }
 
-// LedgerMetrics is the control plane's gauges, read from its ledger at every
-// scrape: each tier's capacity report and the registered hosts. The reads go
-// through the reader pool, never the writer slot scheduling uses.
+// LedgerMetrics is the control plane's ledger as metrics: each tier's capacity
+// report and the registered hosts, read at every scrape through the reader
+// pool, never the writer slot scheduling uses; and how the writes themselves
+// went, told by the ledger as they happen.
 func (cp *ControlPlane) LedgerMetrics() MetricsSource {
+	return ledgerSource(cp.allocator, cp.db, cp.cfg.Tiers)
+}
+
+func ledgerSource(a *alloc.Allocator, db *state.DB, tiers []config.Tier) MetricsSource {
 	return MetricsSource{
 		name:     "ledger",
 		families: ledgerFamilies,
-		read:     ledgerSnapshot(cp.allocator, cp.cfg.Tiers, time.Now),
+		read:     ledgerSnapshot(a, tiers, time.Now),
+		attach: func(reg *metrics.Registry) error {
+			o, err := reg.LedgerObserver()
+			if err != nil {
+				return err
+			}
+
+			db.Observe(o)
+
+			return nil
+		},
 	}
 }
 

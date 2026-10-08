@@ -49,6 +49,20 @@ func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig, sou
 		return nil, err
 	}
 
+	// ATTACHED ONCE THE ENDPOINT IS SERVING, so nothing reports into a
+	// registry that a failed bind left unserved.
+	for _, s := range sources {
+		if s.attach == nil {
+			continue
+		}
+
+		if err := s.attach(reg); err != nil {
+			(&Metrics{srv: srv, stop: srv.Close}).Close(ctx)
+
+			return nil, err
+		}
+	}
+
 	slog.Default().Info("serving metrics", "role", role, "address", srv.Addr().String(), "pprof", m.Pprof)
 
 	return &Metrics{srv: srv, stop: srv.Close}, nil
