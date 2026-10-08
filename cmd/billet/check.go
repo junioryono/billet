@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	opsimages "github.com/junioryono/billet/internal/ops/images"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/app"
@@ -744,12 +746,12 @@ func reportGuestImageFreshness(ctx context.Context, env cli.Env, cfg *config.Con
 		return
 	}
 
-	images, err := firecrackerTierImages(cfg)
+	images, err := opsimages.FirecrackerTierImages(cfg)
 	if err != nil || len(images) == 0 {
 		return
 	}
 
-	store, err := openGenerationDater(cfg)
+	store, err := opsimages.OpenGenerationDater(cfg)
 	if err != nil {
 		fmt.Fprintf(env.Stdout, "images   could not read the cluster's generations: %v\n", err)
 
@@ -759,7 +761,7 @@ func reportGuestImageFreshness(ctx context.Context, env cli.Env, cfg *config.Con
 	for _, image := range images {
 		name, _, _ := strings.Cut(image, "@")
 
-		_, why, err := generationDue(ctx, store, name, imagesRefreshAge)
+		_, why, err := opsimages.GenerationDue(ctx, store, name, imagesRefreshAge)
 		if err != nil {
 			fmt.Fprintf(env.Stdout, "images   %s: could not tell: %v\n", name, err)
 

@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"bytes"
@@ -153,7 +153,7 @@ func hostAddrOnBridge(bridge string, port int) (string, error) {
 // nothing else reaps.
 //
 // So the identity is CONSTRUCTED inside that grammar rather than the grammar being
-// widened to admit it — the same answer deploymentForCheck gives to the same
+// widened to admit it — the same answer deploymentid.Preflight gives to the same
 // question. The hash is domain-separated and COVERS THE DEPLOYMENT, which is not a
 // uniqueness guarantee — a truncated hash cannot give one — but it is the difference
 // between two billets on one machine colliding with CERTAINTY and colliding only on

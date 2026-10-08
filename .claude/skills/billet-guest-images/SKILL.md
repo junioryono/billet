@@ -50,7 +50,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/runnerimages/*_test.go`, `internal/imagesource/*_test.go` (policy, multipart, trust root), `internal/runnerrelease/*_test.go` (the window rules), `internal/provenance/*_test.go`.
-- `cmd/billet/images*_test.go`, `imageprobe_test.go`, `imagescompatible_test.go`, `imagesreap_test.go`, `runnercheck_test.go`, `verifypair_test.go`, `tartimages_test.go`, `ami_test.go`.
+- `internal/ops/images/images*_test.go`, `imageprobe_test.go`, `imagescompatible_test.go`, `imagesreap_test.go`, `runnercheck_test.go`, `verifypair_test.go`, `tartimages_test.go`, `ami_test.go`; `cmd/billet/nodename_images_test.go` (the node name a certificate gives, through `billet ca issue`).
 - `scripts/kernel_gate_test.go`, `scripts/image_manifest_test.go`, `scripts/movingmajor_test.go`, `scripts/guest_image_*_test.go`.
 
 ## Related skills

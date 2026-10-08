@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -39,7 +39,7 @@ import (
 // the jailer exited 0, the API accepted every call, the VMM answered, the DHCP lease
 // appeared. The only thing that knew otherwise was the guest, and the only way to ask
 // it is to give it something to say and a place to say it.
-func cmdImages(ctx context.Context, env cli.Env, args []string) error {
+func Run(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet images <pull|refresh|compatible|verify|due|list|reap|promote|unpromote>")
 	}
@@ -101,7 +101,7 @@ func cmdImagesCompatible(ctx context.Context, env cli.Env, args []string) error 
 
 	images := []string{rest}
 	if rest == "" {
-		images, err = firecrackerTierImages(cfg)
+		images, err = FirecrackerTierImages(cfg)
 		if err != nil {
 			return err
 		}
@@ -336,12 +336,12 @@ func cmdImagesDue(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("billet images due: no image given and no firecracker tier names one")
 	}
 
-	store, err := openGenerationDater(cfg)
+	store, err := OpenGenerationDater(cfg)
 	if err != nil {
 		return err
 	}
 
-	due, why, err := generationDue(ctx, store, image, *maxAge)
+	due, why, err := GenerationDue(ctx, store, image, *maxAge)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ type generationDater interface {
 }
 
 // openGenerationDater is a variable so a test can answer for the cluster.
-var openGenerationDater = func(cfg *config.Config) (generationDater, error) {
+var OpenGenerationDater = func(cfg *config.Config) (generationDater, error) {
 	return ceph.New(*cfg.Node.Ceph)
 }
 
@@ -370,7 +370,7 @@ var openGenerationDater = func(cfg *config.Config) (generationDater, error) {
 // build cadence, over the newest generation's age read from its name. It is
 // maintenance information for `images due` and `billet check`; what decides a
 // pull is `images refresh`, which compares against the channel.
-func generationDue(
+func GenerationDue(
 	ctx context.Context, store generationDater, image string, maxAge time.Duration,
 ) (bool, string, error) {
 	newest, found, err := store.NewestGeneration(ctx, image)
@@ -398,7 +398,7 @@ var errNothingToBuild = &cli.ExitError{Code: 2, Msg: "a recent generation alread
 
 // firecrackerTierImage is the first image this deployment's microVM tiers boot.
 func firecrackerTierImage(cfg *config.Config) (string, error) {
-	images, err := firecrackerTierImages(cfg)
+	images, err := FirecrackerTierImages(cfg)
 	if err != nil {
 		return "", err
 	}
@@ -410,7 +410,7 @@ func firecrackerTierImage(cfg *config.Config) (string, error) {
 }
 
 // firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
-func firecrackerTierImages(cfg *config.Config) ([]string, error) {
+func FirecrackerTierImages(cfg *config.Config) ([]string, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
 		return nil, nil
 	}
@@ -445,7 +445,7 @@ func firecrackerTierImages(cfg *config.Config) ([]string, error) {
 // The same selection firecrackerTierImages makes, and it has to be: an operator
 // asking billet to fetch what this host needs must get what this host would
 // actually launch, not every image in the deployment.
-func tartTierImages(cfg *config.Config) ([]string, error) {
+func TartTierImages(cfg *config.Config) ([]string, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderTart {
 		return nil, nil
 	}
@@ -492,17 +492,17 @@ func tartTierImages(cfg *config.Config) ([]string, error) {
 // OCI reference tart pulls into its own store, with the registry's own
 // provenance. Sharing the operator's command while not sharing the pipeline is
 // the honest arrangement: "fetch what my tiers need" is one question.
-func pullTartImages(ctx context.Context, env cli.Env, cfg *config.Config, only string) error {
+func PullTartImages(ctx context.Context, env cli.Env, cfg *config.Config, only string) error {
 	// A PULL OWNS NOTHING. The deployment identity exists so a VM billet creates
 	// carries a marker saying whose it is; a pull writes into tart's shared OCI
 	// cache, which every deployment on this Mac reads and none owns. So this is
 	// the same placeholder `billet check` uses, for the same reason.
-	p, err := tart.New(deploymentForCheck, tart.WithLogger(slog.Default()))
+	p, err := tart.New(deploymentid.Preflight, tart.WithLogger(slog.Default()))
 	if err != nil {
 		return err
 	}
 
-	images, err := tartTierImages(cfg)
+	images, err := TartTierImages(cfg)
 	if err != nil {
 		return err
 	}

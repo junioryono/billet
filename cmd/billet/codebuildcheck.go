@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/deploymentid"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/config"
@@ -126,7 +127,7 @@ func minutesText(minutes int) string {
 // comparison cannot be made.
 //
 // SAYING "I COULD NOT TELL" IS THE POINT, and it is why this does not fall back to
-// the placeholder `deploymentForCheck` the firecracker and tart preflights use.
+// the placeholder `deploymentid.Preflight` the firecracker and tart preflights use.
 // Those construct a provider only to ask it about the HOST, where the identity marks
 // nothing; here the identity is the thing being compared, and a placeholder would
 // report a project as belonging to a deployment whose name billet invented. The
@@ -166,7 +167,7 @@ func checkCodeBuildLive(ctx context.Context, env cli.Env, cfg *config.Config, bu
 	// than made against it.
 	owner := deployment
 	if !known {
-		owner = deploymentForCheck
+		owner = deploymentid.Preflight
 	}
 
 	p, err := codebuild.New(owner, *cfg.Node.CodeBuild,

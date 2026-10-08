@@ -3326,6 +3326,22 @@ func (s *ServerConfig) LedgerPath() string {
 	return filepath.Join(s.IdentityDir, "billet.db")
 }
 
+// DeploymentStateDirs are the directories that may hold this deployment's id,
+// most authoritative first: the control plane mints it under server.state_dir, a
+// node adopts it under node.state_dir.
+func (c *Config) DeploymentStateDirs() []string {
+	var dirs []string
+	if c.Server != nil && c.Server.IdentityDir != "" {
+		dirs = append(dirs, c.Server.IdentityDir)
+	}
+
+	if c.Node != nil && c.Node.StateDir != "" {
+		dirs = append(dirs, c.Node.StateDir)
+	}
+
+	return dirs
+}
+
 // LedgerDSNEnv names the environment variable holding the PostgreSQL DSN, and is
 // empty for any other backend.
 func (s *ServerConfig) LedgerDSNEnv() string {

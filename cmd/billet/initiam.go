@@ -173,7 +173,7 @@ func resolveDeploymentOwner(cfg *config.Config, flag string, accountWide bool) (
 		return flag, nil
 	}
 
-	for _, dir := range deploymentStateDirs(cfg) {
+	for _, dir := range cfg.DeploymentStateDirs() {
 		id, found, err := state.PeekDeploymentID(dir)
 		if err != nil {
 			return "", err
@@ -188,21 +188,6 @@ func resolveDeploymentOwner(cfg *config.Config, flag string, accountWide bool) (
 		"mint it (or `billet ca issue`/enroll a node), then re-run; or pass --deployment <id>. To " +
 		"scope the policy by tag presence instead — only safe if this is the single billet " +
 		"deployment in the account — pass --account-wide")
-}
-
-// deploymentStateDirs are the directories that may hold this deployment's id,
-// most authoritative first: the control plane mints it under server.state_dir, a
-// node adopts it under node.state_dir.
-func deploymentStateDirs(cfg *config.Config) []string {
-	var dirs []string
-	if cfg.Server != nil && cfg.Server.IdentityDir != "" {
-		dirs = append(dirs, cfg.Server.IdentityDir)
-	}
-	if cfg.Node != nil && cfg.Node.StateDir != "" {
-		dirs = append(dirs, cfg.Node.StateDir)
-	}
-
-	return dirs
 }
 
 // iamInputsFromConfig reads the deployment's shape out of the loaded config,

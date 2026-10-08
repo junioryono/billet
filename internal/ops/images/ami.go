@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"context"
@@ -38,7 +38,7 @@ import (
 // failure mode is the quiet one this project keeps running into: the instance
 // boots, RunInstances reports success, billet logs a started runner, and the job
 // sits queued forever because nothing consumed the registration.
-func cmdAMI(ctx context.Context, env cli.Env, args []string) error {
+func AMI(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet ami <build|verify> [flags]")
 	}
@@ -381,7 +381,7 @@ func builderOwner(env cli.Env, cfgPath, deployment, name string) (string, error)
 	}
 
 	if err == nil {
-		for _, dir := range deploymentStateDirs(cfg) {
+		for _, dir := range cfg.DeploymentStateDirs() {
 			id, found, err := state.PeekDeploymentID(dir)
 			if err != nil {
 				return "", err
@@ -417,5 +417,5 @@ func verifyCommandFor(image, deployment string) string {
 		return "billet ami verify " + image
 	}
 
-	return "billet ami verify " + image + " --deployment " + shellArg(deployment)
+	return "billet ami verify " + image + " --deployment " + cli.ShellArg(deployment)
 }

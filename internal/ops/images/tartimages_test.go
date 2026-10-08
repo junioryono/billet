@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"path/filepath"
@@ -34,7 +34,7 @@ func TestTartTierImagesAreTheOnesThisHostWouldLaunch(t *testing.T) {
 		},
 	}
 
-	got, err := tartTierImages(cfg)
+	got, err := TartTierImages(cfg)
 	if err != nil {
 		t.Fatalf("tartTierImages: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestTartTierImagesAreEmptyOnAnotherProvider(t *testing.T) {
 		Tiers: []config.Tier{{Label: "a", Provider: config.ProviderTart, Image: "macos-xcode"}},
 	}
 
-	got, err := tartTierImages(cfg)
+	got, err := TartTierImages(cfg)
 	if err != nil {
 		t.Fatalf("tartTierImages: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestTartTierImagesResolvesIdentityBeforeSelecting(t *testing.T) {
 		},
 	}
 
-	images, err := tartTierImages(cfg)
+	images, err := TartTierImages(cfg)
 	if err == nil {
 		t.Fatalf("tartTierImages = %v with no readable certificate; it cannot know which "+
 			"tiers are pinned to this node, and returning a subset silently is how an "+

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/images"
+
 	"github.com/junioryono/billet/internal/cli"
 
 	"github.com/junioryono/billet/internal/config"
@@ -57,7 +59,7 @@ func newLaunchdHost(env cli.Env, cfg *config.Config, cfgPath, staged string,
 		ledgerHost: newLedgerHost(env, cfg, cfgPath, journal),
 		staged:     staged,
 		agents:     launchd.New(),
-		tartImages: func(ctx context.Context) error { return pullTartImages(ctx, env, cfg, "") },
+		tartImages: func(ctx context.Context) error { return images.PullTartImages(ctx, env, cfg, "") },
 	}
 }
 

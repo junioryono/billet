@@ -1,4 +1,4 @@
-package main
+package images
 
 import (
 	"os"
@@ -54,7 +54,7 @@ func TestAMIDispatchesToTheSubcommandThatWasTyped(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := cmdAMI(t.Context(), processEnv(), tc.args)
+			err := AMI(t.Context(), processEnv(), tc.args)
 			if err == nil {
 				t.Fatalf("billet ami %v returned success; it should have refused before "+
 					"launching anything", tc.args)
