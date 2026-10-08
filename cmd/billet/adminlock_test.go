@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/ops/fleetops"
 
 	"github.com/junioryono/billet/internal/state"
@@ -161,7 +163,7 @@ func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 	t.Cleanup(func() { _ = server.Close() })
 
 	stubGitHubUnverifiable(t)
-	if err := cmdCheck(ctx, processEnv(), []string{"--config", cfg}); err != nil {
+	if err := host.Check(ctx, processEnv(), []string{"--config", cfg}); err != nil {
 		t.Errorf("billet check against a running control plane: %v", err)
 	}
 

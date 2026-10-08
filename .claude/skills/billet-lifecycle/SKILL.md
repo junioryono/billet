@@ -1,13 +1,13 @@
 ---
 name: billet-lifecycle
-description: "Load when touching `billet local up|status|down|uninstall`, `billet drain|resume`, cmd/billet/local*.go or drain.go, internal/lifeops (systemd) or internal/lifeops/launchd (macOS launch agents), deploy/ (the units, plists and package scripts), or anything that decides from what systemctl or launchctl reports; and when a host looks correct from every angle billet checks and is still running something else."
+description: "Load when touching `billet local up|status|down|uninstall`, `billet drain|resume`, internal/ops/host/local*.go or internal/ops/fleetops/drain.go, internal/lifeops (systemd) or internal/lifeops/launchd (macOS launch agents), deploy/ (the units, plists and package scripts), or anything that decides from what systemctl or launchctl reports; and when a host looks correct from every angle billet checks and is still running something else."
 ---
 
 # The local service lifecycle
 
 ## What this area is
 
-`internal/lifeops` inspects a Linux host (units, files, running processes; it prints nothing) and converges it; `internal/lifeops/launchd` is its sibling for macOS launch agents, deliberately not one abstraction because the vocabularies are not shared. `cmd/billet/local*.go` hold the order the commands act in, which is the whole safety content: `up` is check, server, node, each started, proved, then enabled; `down` is seal, wait, stop node, stop server, disable both; `uninstall` is down plus forgetting the services; `backup`, `restore` and `recover` are in `billet-backup-restore`. `deploy/` holds `billet-server.service`, `billet-node.service`, `billet-backup.service` and `.timer`, `billet-rbd.conf`, the two `sh.billet.*.plist` agents, the packaged `billet.yaml` template and the package scripts; `deploy/units.go` exposes the names as constants.
+`internal/lifeops` inspects a Linux host (units, files, running processes; it prints nothing) and converges it; `internal/lifeops/launchd` is its sibling for macOS launch agents, deliberately not one abstraction because the vocabularies are not shared. `internal/ops/host/local*.go` hold the order the commands act in, which is the whole safety content: `up` is check, server, node, each started, proved, then enabled; `down` is seal, wait, stop node, stop server, disable both; `uninstall` is down plus forgetting the services; `backup`, `restore` and `recover` are in `billet-backup-restore`. `deploy/` holds `billet-server.service`, `billet-node.service`, `billet-backup.service` and `.timer`, `billet-rbd.conf`, the two `sh.billet.*.plist` agents, the packaged `billet.yaml` template and the package scripts; `deploy/units.go` exposes the names as constants.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers. What a controller retirement may do to these services is in `billet-controller-retirement`.
 
@@ -55,7 +55,7 @@ Measured facts for both service managers, dated: [references/measured-facts.md](
 
 - `internal/lifeops/*_test.go`: the systemctl fake answers only the properties it was asked for (a whole-reply fake makes deleting a property from the production query invisible); fixtures start healthy and break one thing; a healthy host is asserted not refused. `os.SameFile` type-asserts the concrete `FileInfo`, so a fixture varies link counts with a real hard link; `syscall.Stat_t` widths differ per platform, so stats go through a converting helper; `OnFailureJobMode` belongs in `[Unit]` or the fixture proves nothing.
 - `internal/lifeops/launchd/*_test.go` and `reallaunchd_test.go` (each test derives its own label).
-- `cmd/billet/local_test.go`, `localup_test.go`, `localdown_test.go`, `admission_test.go`, `systemd_test.go`; `internal/cli/lifecycle_test.go`, `internal/ops/fleetops/drain_test.go` and `internal/hostauthority/lifecyclelock_test.go`; `deploy/units_test.go` (pins `ExitTimeOut` to the unit's 88200).
+- `internal/ops/host/local_test.go`, `localup_test.go`, `localdown_test.go`, `systemd_test.go`; `cmd/billet/admission_test.go`; `internal/cli/lifecycle_test.go`, `internal/ops/fleetops/drain_test.go` and `internal/hostauthority/lifecyclelock_test.go`; `deploy/units_test.go` (pins `ExitTimeOut` to the unit's 88200).
 - `scripts/test-systemd-lifecycle.sh`, `scripts/test-package-lifecycle.sh`.
 
 ## Related skills

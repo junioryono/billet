@@ -263,12 +263,12 @@ jobs:
         env:
           BILLET_TEST_LEDGER: postgres
 
-  # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet that
-  # needs a real PostgreSQL -- the backup's end-to-end gate, and every test of a
-  # controller's retirement, which is defined for a PostgreSQL pair and has no
-  # SQLite form -- SKIPS in the SQLite job. A named list runs whatever somebody
-  # remembered to add to it, and leaves everything else unrun in both jobs while
-  # the run reports success.
+  # THE WHOLE COMMAND SUITE, NOT A LIST OF NAMES. Everything in cmd/billet and its
+  # command families (internal/ops) that needs a real PostgreSQL -- the backup's
+  # end-to-end gate, and every test of a controller's retirement, which is defined
+  # for a PostgreSQL pair and has no SQLite form -- SKIPS in the SQLite job. A
+  # named list runs whatever somebody remembered to add to it, and leaves
+  # everything else unrun in both jobs while the run reports success.
   #
   # UNDER -race, because the SQLite job cannot buy it for the tests it skips:
   # these are the only run those tests get, and a data race in one of them would
@@ -328,7 +328,7 @@ jobs:
       - name: Test the command suite against PostgreSQL
         run: |
           set -o pipefail
-          go test -race -count=1 -timeout 40m -vet=off -run '${{ matrix.run }}' -skip '^TestRetirement' -json ./cmd/billet/ \
+          go test -race -count=1 -timeout 40m -vet=off -run '${{ matrix.run }}' -skip '^TestRetirement' -json ./cmd/billet/ ./internal/ops/... \
             | tee command-output.json \
             | jq -R -j 'fromjson? | select(.Output != null) | .Output'
 
@@ -917,7 +917,7 @@ jobs:
           fi
           sudo /usr/bin/python3 -c 'import jinja2'
           go test -c -o "$RUNNER_TEMP/lifeops.test" ./internal/lifeops
-          go test -c -o "$RUNNER_TEMP/billet-command.test" ./cmd/billet
+          go test -c -o "$RUNNER_TEMP/billet-command.test" ./internal/ops/host
           retirement_postgres=$(docker run -d --rm -p 127.0.0.1::5432 -e POSTGRES_USER=billet -e POSTGRES_PASSWORD=billet -e POSTGRES_DB=billet postgres:18-alpine)
           trap 'docker stop "$retirement_postgres" >/dev/null' EXIT
           retirement_postgres_ready=false
@@ -935,7 +935,7 @@ jobs:
           retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
           cd internal/lifeops
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
-          cd ../../cmd/billet
+          cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
 
   # Both legs here need the real Debian package, so they share a job: `dist` is

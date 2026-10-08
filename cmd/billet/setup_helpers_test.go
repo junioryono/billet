@@ -75,19 +75,6 @@ func stubOnboard(t *testing.T, key []byte, fail error) *int {
 	return &calls
 }
 
-// asLinux pins the generation to the systemd shape — /etc/billet, /var/lib, the
-// billet group, mode 0640 — on the darwin machines billet is developed on. Not
-// parallel-safe; none of these tests are parallel.
-// asLinux says this host is Linux to EVERY seam that asks, not only to the
-// command layer's own: the retirement's platform decides whether the global
-// authority exclusion exists at all, and a test that pinned one and not the
-// other proved its ordering against a host no fleet runs (found by CI, which
-// runs where both are Linux for real, 2026-09-12).
-func asLinux(t *testing.T) {
-	t.Helper()
-	useRetirementRoot(t)
-}
-
 // The App the stub mints. Distinctive values, so an assertion cannot be
 // satisfied by a zero left behind from somewhere else.
 const (

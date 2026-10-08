@@ -58,3 +58,34 @@ e1e1692f470d The decision read is internal/app's LedgerDecision mode (#356 Phase
 2e3c8f314c96 The init commands moved to internal/ops/setup (#356 Phase 4); the sentence names internal/ops/setup/inithybrid.go.
 6f2cbb86bd3b The github-app and init commands moved to internal/ops/setup (#356 Phase 4); the sentence names their tests there.
 89c314c4a2a4 The init commands moved to internal/ops/setup (#356 Phase 4); the sentence names their tests there.
+0132b99a936c The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+0682d7bd22d7 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+0806f046605b The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+0e80bc65baf1 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+13f01bd103d1 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+2fad4bbe1072 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+3dd6ab6ed5a5 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+4f526a9b76f0 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+520436a74c0a The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+5a510fc35889 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+5e005ae782d2 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+67c64e2adcee The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+6d8a86d107fd The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+712c9ad25da7 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+7794f87b3a5c The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+8781dd4e5c2f The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+8ac05f5b7cf2 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+909903bcacf6 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+9c83b0f64264 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+b8206209b3ed The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+ba680036d160 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+bc433c3bc293 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+c6036975673e The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+cd8608a73fd1 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+d6bd853f25e1 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+defc3de17872 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+e0660674482b The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+f72734823215 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+f8fba994cf0d The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+f93deda7255f The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
+fec09aac0cb7 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.

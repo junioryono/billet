@@ -52,7 +52,7 @@ def require_partition(expected, groups):
 def partition():
     groups = {name: [] for name in COMMAND_SHARDS}
     seen = set()
-    for path in sorted((ROOT / 'cmd/billet').glob('*_test.go')):
+    for path in sorted((ROOT / 'internal/ops/host').glob('*_test.go')):
         for name in re.findall(r'^func (TestRetirement\w*)\(t \*testing\.T\)', path.read_text(), re.M):
             if name in seen:
                 raise ValueError('duplicate test declaration: ' + name)
@@ -201,14 +201,14 @@ def main():
     if args.run:
         # The compiled inventory catches declarations the source scan missed;
         # neither a changed function signature nor a parser false positive skips.
-        listing = subprocess.run(['go', 'test', '-list', '^TestRetirement', './cmd/billet/'],
+        listing = subprocess.run(['go', 'test', '-list', '^TestRetirement', './internal/ops/host/'],
                                  cwd=ROOT, text=True, stdout=subprocess.PIPE, check=True)
         discovered = set(re.findall(r'^TestRetirement\w*$', listing.stdout, re.M))
         require_partition(discovered, groups)
         pattern = '^(' + '|'.join(groups[args.run]) + ')$'
         start = time.monotonic()
         result = subprocess.run(['go', 'test', '-race', '-count=1', '-timeout', '60m', '-vet=off',
-                                 '-run', pattern, '-json', './cmd/billet/'], cwd=ROOT, check=False)
+                                 '-run', pattern, '-json', './internal/ops/host/'], cwd=ROOT, check=False)
         print(f'{args.run}: {len(groups[args.run])} tests; elapsed={time.monotonic() - start:.1f}s; exit={result.returncode}', file=sys.stderr)
         return result.returncode
     return 0

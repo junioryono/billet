@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/lifeops/launchd"
@@ -72,24 +74,24 @@ func TestTheDrainSignalReachesTheDrain(t *testing.T) {
 
 // THE REPORT IS PUBLISHED ON A MAC ONLY, for the node's own label.
 func TestTheNodeDrainReportIsPublishedOnlyOnAMac(t *testing.T) {
-	restore := publishDrainReport
-	t.Cleanup(func() { publishDrainReport = restore })
+	restore := host.PublishDrainReport
+	t.Cleanup(func() { host.PublishDrainReport = restore })
 
 	var labels []string
 
-	publishDrainReport = func(label, _ string) error {
+	host.PublishDrainReport = func(label, _ string) error {
 		labels = append(labels, label)
 
 		return nil
 	}
 
-	publishNodeDrainReport("linux")
+	host.PublishNodeDrainReport("linux")
 
 	if len(labels) != 0 {
 		t.Fatalf("a Linux node published a drain report: %v", labels)
 	}
 
-	publishNodeDrainReport("darwin")
+	host.PublishNodeDrainReport("darwin")
 
 	if len(labels) != 1 || labels[0] != deploy.NodeAgentLabel {
 		t.Errorf("published for %v, want exactly %s", labels, deploy.NodeAgentLabel)
@@ -151,7 +153,7 @@ func TestTheNodeHandlesTheDrainRequestBeforeReportingIt(t *testing.T) {
 			}
 
 		case *ast.ExprStmt:
-			if call, ok := s.X.(*ast.CallExpr); ok && calleeName(call) == "publishNodeDrainReport" {
+			if call, ok := s.X.(*ast.CallExpr); ok && calleeName(call) == "PublishNodeDrainReport" {
 				report = i
 			}
 
@@ -274,19 +276,19 @@ func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 		return ""
 	}
 	// LINUX'S SPELLING, where a record is published; a Mac publishes none.
-	host := nodeHost(env, lc, "linux")
+	nh := nodeHost(env, lc, "linux")
 
 	same := func(a, b any) bool { return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() }
 
-	if host.DrainRequested == nil || !same(host.DrainRequested, nodeDrainRequested) {
+	if nh.DrainRequested == nil || !same(nh.DrainRequested, host.NodeDrainRequested) {
 		t.Error("nodeHost does not give the node nodeDrainRequested")
 	}
 
-	if host.Ready == nil {
+	if nh.Ready == nil {
 		t.Fatal("nodeHost gives the node no readiness notification")
 	}
 
-	if err := host.Ready(); err != nil {
+	if err := nh.Ready(); err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
 
@@ -296,16 +298,16 @@ func TestTheNodeHostCarriesTheDrainRequest(t *testing.T) {
 
 	hurry := lc.Hurry()
 
-	if host.Hurry == nil || host.Hurry != hurry {
+	if nh.Hurry == nil || nh.Hurry != hurry {
 		t.Error("nodeHost does not give the node this process's second signal")
 	}
 
-	if host.Out != os.Stdout {
+	if nh.Out != os.Stdout {
 		t.Error("nodeHost does not give the node stdout")
 	}
 
-	if want := nodeRegistrationRecordPath("linux"); want == "" || host.RegistrationRecordPath != want {
-		t.Errorf("nodeHost gives a Linux node the record path %q, want %q", host.RegistrationRecordPath, want)
+	if want := host.NodeRegistrationRecordPath("linux"); want == "" || nh.RegistrationRecordPath != want {
+		t.Errorf("nodeHost gives a Linux node the record path %q, want %q", nh.RegistrationRecordPath, want)
 	}
 }
 

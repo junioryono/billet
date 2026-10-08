@@ -7,7 +7,7 @@ description: "Load when touching internal/deploymentid, internal/wirecert (rotat
 
 ## What this area is
 
-A deployment is named by a 32-hex identity (`internal/deploymentid`, `deploymentid.Validate`) minted once per state directory and recorded in the ledger's binding. The control plane is its own certificate authority: `internal/wirecert` mints one CA per deployment (`CALifetime` 10 years, `LeafLifetime` 1 year, `ClockSkew` 1 hour, `ExpiryWarning` 30 days), issues node bundles, rotates and retires authorities and serves the TLS configs. `internal/wireshare` carries an authority between controllers through an `awsssm` store. `internal/github` creates the App through the manifest flow, signs App JWTs, resolves the installation and verifies the App. The commands are in `internal/ops/fleetops` (`ca.go`'s `ca` dispatch, `enroll.go`, `casync.go`, `authoritypublish.go`) and `internal/ops/setup` (`githubapp.go`, `appkeypublish.go`), with `githubaccess.go` in `cmd/billet` and the App key's resolver and the target lookups in `internal/app` (`appkey.go`, `targets.go`) beside `identitystore.go`.
+A deployment is named by a 32-hex identity (`internal/deploymentid`, `deploymentid.Validate`) minted once per state directory and recorded in the ledger's binding. The control plane is its own certificate authority: `internal/wirecert` mints one CA per deployment (`CALifetime` 10 years, `LeafLifetime` 1 year, `ClockSkew` 1 hour, `ExpiryWarning` 30 days), issues node bundles, rotates and retires authorities and serves the TLS configs. `internal/wireshare` carries an authority between controllers through an `awsssm` store. `internal/github` creates the App through the manifest flow, signs App JWTs, resolves the installation and verifies the App. The commands are in `internal/ops/fleetops` (`ca.go`'s `ca` dispatch, `enroll.go`, `casync.go`, `authoritypublish.go`) and `internal/ops/setup` (`githubapp.go`, `appkeypublish.go`), with `githubaccess.go` in `internal/ops/host` and the App key's resolver and the target lookups in `internal/app` (`appkey.go`, `targets.go`) beside `identitystore.go`.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 
@@ -48,7 +48,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 - `internal/wirecert/*_test.go`: rotation ordering, `LoadServing` tears and re-reads, retire refusals, the `billet-replaces:` claim, one-block PEM proof.
 - `internal/wireshare/*_test.go`; `internal/app/proofs_test.go` (the adopt-before-serve order is `app.Controller.ServeWire`'s signature), `casync` tests, `identitystore` tests.
-- `internal/github/*_test.go` (manifest permissions, redaction, code handling), `internal/ops/setup/githubapp_test.go`, `configedit_test.go`, `cmd/billet/githubaccess_test.go` (`TestAnUnreachableGitHubIsNotReportedAsABadCredential`, `TestAStartupFailureNamesAnUninstalledApp`).
+- `internal/github/*_test.go` (manifest permissions, redaction, code handling), `internal/ops/setup/githubapp_test.go`, `configedit_test.go`, `internal/ops/host/githubaccess_test.go` (`TestAnUnreachableGitHubIsNotReportedAsABadCredential`, `TestAStartupFailureNamesAnUninstalledApp`).
 - `internal/ops/fleetops/ca_test.go` (`TestCAIssueDuringARotationWritesABundleThatCanVerifyTheServer`, `TestCAIssueWillNotOverwriteABundle`), `internal/e2e/enroll_test.go`, `revocation_test.go`, `restore_test.go`.
 
 ## Related skills

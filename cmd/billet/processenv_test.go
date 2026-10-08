@@ -21,9 +21,3 @@ func processEnv() cli.Env {
 
 	return cli.Env{Stdout: os.Stdout, Stderr: os.Stderr, Stdin: in, Getenv: os.Getenv}
 }
-
-// installAppKeyHere is installAppKey reporting to the process env, the shape
-// a restore request takes it in.
-func installAppKeyHere(path string, pem []byte) error {
-	return installAppKey(processEnv(), path, pem)
-}

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/ops/host"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
@@ -25,7 +27,7 @@ func TestEC2CostStatesItsBoundAndSource(t *testing.T) {
 	}
 
 	out := capture(t, func() {
-		if err := printRemoteCost(processEnv(), cfg); err != nil {
+		if err := host.PrintRemoteCost(processEnv(), cfg); err != nil {
 			t.Fatalf("printRemoteCost: %v", err)
 		}
 	})

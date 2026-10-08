@@ -96,7 +96,7 @@
     billet_retire_sha: '^[0-9a-f]{64}\Z'
     billet_retire_phases: [intent, stopped, archived, config-rewritten, node-restarted, done]
     billet_retire_variants: [server-only, retained-node]
-    # retireReason* in cmd/billet/serverretire.go and serverretireinput.go.
+    # retireReason* in internal/ops/host/serverretire.go and serverretireinput.go.
     billet_retire_reasons: [combination, platform, config, backend, controllers, identity, lock, guard, journal, reserved, retired, ledger, input, self, deployment, mismatch, conflict, stage-stale, status, marker, reservation, report-host, report-stale, survivor, survivor-binding, survivor-flagged, survivor-retiring, authority, variant, desired, state-dir, unbound, trust, node-missing, node-duplicate, node-unknown, node, receipt, endpoint, node-changed, policy, unit, mount, nested, node-path, backup, phase, lifecycle, stop, archive, rewrite, restart, postcondition]
     # Required and permitted are separate: omitempty never means nullable.
     # Each member's type and vocabulary are judged below, without coercion.
@@ -104,35 +104,35 @@
     # identifiers and digests keep their hexadecimal grammar. Only the
     # report's pointer fields/installed_roles and the two slices may be null.
     billet_retire_tables:
-      # cmd/billet/serverretire.go: retireRefusal.
+      # internal/ops/host/serverretire.go: retireRefusal.
       refusal:
         required: [schema, outcome, reason, why, state]
         permitted: [schema, outcome, reason, why, state, next, reservation]
-      # cmd/billet/serverretire.go: retireReport.
+      # internal/ops/host/serverretire.go: retireReport.
       classify:
         required: [schema, outcome, journal, status, stage, guard, marker, row, row_fact, dispatch, status_presence, config, installed_roles, identity, authority, route, state]
         permitted: [schema, outcome, journal, status, stage, guard, marker, row, row_fact, dispatch, status_presence, config, installed_roles, identity, authority, route, state, status_why, route_why, why]
-      # cmd/billet/serverretire.go: retireReservationAnswer.
+      # internal/ops/host/serverretire.go: retireReservationAnswer.
       reserve:
         required: [schema, outcome, deployment, retiring, survivor, run, transition_id, reserved_at, state]
         permitted: [schema, outcome, deployment, retiring, survivor, run, transition_id, reserved_at, state]
-      # cmd/billet/serverretire.go: retireAbandonedAnswer.
+      # internal/ops/host/serverretire.go: retireAbandonedAnswer.
       abandon:
         required: [schema, outcome, transition_id, marker, state]
         permitted: [schema, outcome, transition_id, marker, state]
-      # cmd/billet/serverretire.go: retireAcknowledgedAnswer.
+      # internal/ops/host/serverretire.go: retireAcknowledgedAnswer.
       acknowledge:
         required: [schema, outcome, transition_id, completed_by, state]
         permitted: [schema, outcome, transition_id, completed_by, state]
-      # cmd/billet/serverretirerequest.go: retireIntentReport.
+      # internal/ops/host/serverretirerequest.go: retireIntentReport.
       preview:
         required: [schema, outcome, would, variant, survivor, nodes, endpoint_failover_verified, transition_id, state, unlocked]
         permitted: [schema, outcome, would, variant, survivor, nodes, endpoint_failover_verified, transition_id, state, unlocked]
-      # cmd/billet/serverretiretail.go: retireTailAnswer.
+      # internal/ops/host/serverretiretail.go: retireTailAnswer.
       tail:
         required: [schema, outcome, phase, variant, transition_id, steps, status, receipt, row, completed_by, completion, marker, settled, state]
         permitted: [schema, outcome, phase, variant, transition_id, steps, status, receipt, row, completed_by, completion, marker, settled, state, row_why]
-      # cmd/billet/serverretiredone.go: retireDoneAnswer.
+      # internal/ops/host/serverretiredone.go: retireDoneAnswer.
       done:
         required: [schema, outcome, phase, variant, transition_id, settled, row_done, completed_by, postconditions, state]
         permitted: [schema, outcome, phase, variant, transition_id, settled, row_done, completed_by, postconditions, state]
@@ -280,7 +280,7 @@
       loop_control:
         label: "{{ item }}"
 
-    # cmd/billet/serverretire.go: retireReportJournal.
+    # internal/ops/host/serverretire.go: retireReportJournal.
     # Every listed member is required and permitted; the object may be null.
     - name: Judge the retirement's journal object
       vars:
@@ -342,7 +342,7 @@
         - billet_retire_shape in ['classify']
         - billet_retire_a.status is not none
 
-    # cmd/billet/convergeguard.go: guardTransition.
+    # internal/ops/host/convergeguard.go: guardTransition.
     # Every listed member is required and permitted; the object may be null.
     - name: Judge the retirement's marker object
       vars:
@@ -366,7 +366,7 @@
         - billet_retire_shape in ['classify']
         - billet_retire_a.marker is not none
 
-    # cmd/billet/serverretire.go: retireReportRow.
+    # internal/ops/host/serverretire.go: retireReportRow.
     # Every listed member is required and permitted; the object may be null.
     - name: Judge the retirement's row object
       vars:
@@ -456,7 +456,7 @@
       when:
         - billet_retire_shape in ['tail']
 
-    # cmd/billet/serverretiredone.go: retirePostconditions.
+    # internal/ops/host/serverretiredone.go: retirePostconditions.
     # Every listed member is required and permitted; no member and no object may be null.
     - name: Judge the retirement's postconditions object
       vars:
@@ -510,7 +510,7 @@
         index_var: billet_retire_element_index
         label: "nodes[{{ billet_retire_element_index }}]"
 
-    # cmd/billet/serverretiretransition.go: retireStep, appended by retireTransition.
+    # internal/ops/host/serverretiretransition.go: retireStep, appended by retireTransition.
     # Postconditions and refusal return before a step is recorded.
     # The slice may be null; each element has exactly these non-null members.
     - name: Judge the retirement's steps elements

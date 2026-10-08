@@ -1,6 +1,6 @@
 ---
 name: billet-backup-restore
-description: "Load when touching `billet local backup`, `local restore`, `local recover` or the off-site S3 hop (internal/deployarchive, internal/archivestore, cmd/billet/local{backup,restore,recover,offsite}.go), internal/durablefile, the kernel installer in images pull, the restore and recover rehearsals, or anything that writes a file a remote record will name."
+description: "Load when touching `billet local backup`, `local restore`, `local recover` or the off-site S3 hop (internal/deployarchive, internal/archivestore, internal/ops/host/local{backup,restore,recover,offsite}.go), internal/durablefile, the kernel installer in images pull, the restore and recover rehearsals, or anything that writes a file a remote record will name."
 ---
 
 # Backup, restore, recover, and durable files
@@ -47,7 +47,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 ## Where the tests are
 
 - `internal/deployarchive/*_test.go` (planning, execute, finish, abandon, supersede ordering, journal schema, containment, external ledger).
-- `cmd/billet/localbackup_test.go`, `localrestore_test.go`, `localrecover_test.go`, `localoffsite_test.go`, `restoreownership_test.go`, `restoreprofile_test.go`, `preservedpaths_test.go`.
+- `internal/ops/host/localbackup_test.go`, `localrestore_test.go`, `localrecover_test.go`, `localoffsite_test.go`, `restoreownership_test.go`, `restoreprofile_test.go`, `preservedpaths_test.go`.
 - `internal/ops/images/imagespulldurable_test.go` (`TestAPullDoesNotPublishAGenerationBeforeTheKernelIsDurable`), `imagespulllock_test.go`, `kernellock_test.go`, `kernelreap_test.go`, `internal/durablefile/*_test.go`.
 - `internal/e2e/restore_test.go` (`TestARestoredDeploymentServesTheFleetThatTrustedTheOldOne`); `scripts/restore-rehearsal.sh` and `postgres-restore-rehearsal.sh` are the halves that need a real package.
 

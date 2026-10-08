@@ -211,7 +211,7 @@ func TestCIScopeSelectsTheFamiliesAChangeReaches(t *testing.T) {
 			event: "pull_request", want: "none", reason: "all 4 paths are documentation",
 		},
 		{
-			// ONLY THE NINE PATHS CHECKED ONE BY ONE ARE DOCUMENTATION; a nested
+			// ONLY THE TEN PATHS CHECKED ONE BY ONE ARE DOCUMENTATION; a nested
 			// CLAUDE.md anywhere else keeps its directory's classification.
 			name: "each verified nested CLAUDE.md is documentation",
 			change: func(t *testing.T, dir string) {
@@ -219,12 +219,13 @@ func TestCIScopeSelectsTheFamiliesAChangeReaches(t *testing.T) {
 
 				for _, d := range []string{
 					"internal/state", "internal/alloc", "internal/server", "internal/nodeplane",
-					"internal/node", "internal/provider", "cmd/billet", "deploy", "terraform",
+					"internal/node", "internal/provider", "cmd/billet", "internal/ops/host", "deploy",
+					"terraform",
 				} {
 					mustWrite(t, dir, d+"/CLAUDE.md", "# "+d+"\n")
 				}
 			},
-			event: "pull_request", want: "none", reason: "all 9 paths are documentation",
+			event: "pull_request", want: "none", reason: "all 10 paths are documentation",
 		},
 		{
 			// THE COLLECTION'S BUILD PACKS AND HASHES EVERY FILE IN IT, so its
