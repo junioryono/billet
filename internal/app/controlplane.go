@@ -501,15 +501,15 @@ func (c *Controller) Schedule(
 	//
 	// AND A STOP WHILE ADMISSION IS OPEN IS A RESTART, handed over rather than
 	// drained (#365): `billet drain` and `local down` seal first and still drain.
+	//
+	// AND AN OVERRUNNING HEARTBEAT PASS, REACHING THE FLIGHT RECORDER, whether or
+	// not there is one, which a nil one makes a no-op: one timer a pass is nothing
+	// beside the pass, and wiring that depends on a branch is wiring a reversed
+	// branch removes.
 	serverOpts := append([]server.ControlPlaneOption{}, cp.serverOpts...)
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
-		server.WithStopHandoff())
-
-	// WHETHER OR NOT THERE IS A RECORDER, which a nil one makes a no-op: one
-	// timer a pass is nothing beside the pass, and wiring that depends on a
-	// branch is wiring a reversed branch removes.
-	serverOpts = append(serverOpts, server.WithHeartbeatOverrun(c.heartbeatOverrun))
+		server.WithStopHandoff(), server.WithHeartbeatOverrun(c.heartbeatOverrun))
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())

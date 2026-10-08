@@ -2695,8 +2695,9 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 }
 
 // armOverrun starts the timer that reports this pass as overrun, counting it in
-// told until it is either stopped before it fired or has finished telling.
-func (l *Listener) armOverrun(told *sync.WaitGroup) (disarm func()) {
+// told until it is either stopped before it fired or has finished telling. It
+// returns the disarm, which the loop calls once the pass has ended.
+func (l *Listener) armOverrun(told *sync.WaitGroup) func() {
 	if l.heartbeatOverrun == nil {
 		return func() {}
 	}
