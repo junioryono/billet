@@ -151,12 +151,18 @@ docs: ## Build the Sphinx documentation with warnings as errors, as Read the Doc
 
 .PHONY: lint
 .PHONY: lint-path
+# ONE SPELLING OF THE CHECKOUT for the guard and the linter. A shell's `pwd` and
+# Go's os.Getwd both prefer an inherited $$PWD, which can name the checkout
+# through a symlink, while make's CURDIR is the physical path; exported here,
+# the guard checks the path golangci-lint will substitute.
+lint lint-fix lint-path: export PWD := $(CURDIR)
 lint-path:
 	@# A CHECKOUT PATH WITH GLOB SYNTAX IN IT IS REFUSED, before any golangci-lint
 	@# run. depguard's file globs start at $${config-path}, which golangci-lint
-	@# substitutes unescaped (2.12.2), so under a directory named `billet[2]` a rule
-	@# that selects files under the root selects none, and one that exempts them
-	@# exempts none. The path is read by the shell, never pasted into it.
+	@# substitutes unescaped (2.12.2), so glob syntax in the path changes which
+	@# files a rule selects or exempts: under `billet[2]`, a rule that selects files
+	@# under the root selects none, and one that exempts them exempts none. The
+	@# path is read by the shell, never pasted into it.
 	@dir=$$(pwd); case "$$dir" in *[][*?{}]*) printf 'make: %s contains glob syntax ([ ] * ? { }), which depguard would read as a pattern: a rule could check no file, or exempt none. Lint from a checkout whose path has none.\n' "$$dir" >&2; exit 1;; esac
 
 lint: lint-path ## golangci-lint (pinned version), for this platform AND linux
