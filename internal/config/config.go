@@ -496,6 +496,10 @@ type ServerConfig struct {
 	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
 	// served: there is no default address.
 	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
+	// FlightRecorder keeps the last two minutes of the controller's execution
+	// trace in memory and writes them under identity_dir/flight-recorder when a
+	// heartbeat pass overruns or the controller claim is lost. Off by default.
+	FlightRecorder bool `yaml:"flight_recorder,omitempty"`
 }
 
 // NodeTLS points at the three files `billet ca issue` produced.

@@ -92,7 +92,7 @@ is_replay_input() {
 	internal/alloc/* | internal/app/* | internal/awscreds/* | internal/awsjson/* | \
 		internal/awsquota/* | internal/awss3/* | internal/awssig/* | internal/awsssm/* | internal/config/* | \
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
-		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/guestassets/* | \
+		internal/endpoint/* | internal/fakeactions/* | internal/flightrecorder/* | internal/github/* | internal/guestassets/* | \
 		internal/hostauthority/* | internal/lifeops/* | \
 		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \

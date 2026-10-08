@@ -410,6 +410,11 @@ type Listener struct {
 	// WithLeadershipLost.
 	leadershipLost func() bool
 
+	// heartbeatOverrun is told when a heartbeat pass is still running as the
+	// next falls due. Nil unless the flight recorder is on; see
+	// WithHeartbeatOverrunReport.
+	heartbeatOverrun func()
+
 	// reopen opens a replacement session after a poll failed past the client's
 	// own retries. Nil for a standalone listener, whose Run returns that failure
 	// instead; see WithSessionReopen.
@@ -773,6 +778,13 @@ const handoffAdmissionRead = 5 * time.Second
 // NIL EVERYWHERE BUT THE CONTROL PLANE. Nothing else has a claim to lose.
 func WithLeadershipLostCheck(fn func() bool) Option {
 	return func(l *Listener) { l.leadershipLost = fn }
+}
+
+// WithHeartbeatOverrunReport tells fn when a heartbeat pass is still running as
+// the next falls due. It is told WHILE the pass runs, from a goroutine of its
+// own, so what it captures is the stall itself; fn must return at once.
+func WithHeartbeatOverrunReport(fn func()) Option {
+	return func(l *Listener) { l.heartbeatOverrun = fn }
 }
 
 // WithSessionReopen lets the listener replace a session whose poll failed after
@@ -2656,7 +2668,19 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticks:
+			// ARMED BEFORE THE PASS AND STOPPED AFTER IT, so an overrun is told
+			// while the pass is still stuck, lock wait included, rather than once
+			// it has ended and the evidence with it.
+			var overrun *time.Timer
+			if l.heartbeatOverrun != nil {
+				overrun = time.AfterFunc(l.heartbeatInterval(), l.heartbeatOverrun)
+			}
+
 			l.heartbeatPass(ctx)
+
+			if overrun != nil {
+				overrun.Stop()
+			}
 
 			if l.heartbeatPassed != nil {
 				l.heartbeatPassed()

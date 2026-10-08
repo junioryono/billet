@@ -7,12 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/awscreds"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
+	"github.com/junioryono/billet/internal/flightrecorder"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider/firecracker"
@@ -228,6 +230,17 @@ func (cp *ControlPlane) BecomeController(ctx context.Context, stop func()) (*Con
 	ctl := &Controller{cp: cp, claim: claim}
 	ctl.self = ctl
 
+	// ONLY ONCE THE CLAIM IS HELD: a standby has no heartbeats to overrun and no
+	// claim to lose, and may wait for days.
+	if cp.cfg.Server.FlightRecorder {
+		dir := filepath.Join(cp.cfg.Server.IdentityDir, flightrecorder.DirName)
+
+		ctl.recorder, err = flightrecorder.Start(dir, slog.Default())
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// THE LOOPS BESIDE THE PLANE ARE JOINED BEFORE THE LEDGER THEY WRITE CLOSES:
 	// Close the Controller before the ControlPlane.
 	ctl.loops = supervise.New(ctx, slog.Default())
@@ -235,7 +248,7 @@ func (cp *ControlPlane) BecomeController(ctx context.Context, stop func()) (*Con
 	// AND A LOST CLAIM STOPS THE PROCESS, WHICH IS THE HALF THAT REFUSING A WRITE
 	// DOES NOT DO. See stopWhenReplaced.
 	ctl.loops.Background("controller fence", func(ctx context.Context) {
-		stopWhenReplaced(ctx, cp.db.LeadershipLostSignal(), stop, slog.Default())
+		stopWhenReplaced(ctx, cp.db.LeadershipLostSignal(), stop, ctl.recorder, slog.Default())
 	})
 
 	return ctl, nil
@@ -248,6 +261,9 @@ type Controller struct {
 	cp    *ControlPlane
 	claim state.ControllerClaim
 	loops *supervise.Group
+	// recorder is the flight recorder, or nil when server.flight_recorder is
+	// off; a nil one records nothing.
+	recorder *flightrecorder.Recorder
 
 	// self is the address BecomeController made this Controller at. The proofs
 	// name their controller by address, so a copy, or a Controller overwritten
@@ -256,8 +272,17 @@ type Controller struct {
 	self *Controller
 }
 
-// Close joins every loop the controller started.
-func (c *Controller) Close() []error { return c.loops.Wait() }
+// Close joins every loop the controller started, then the flight recorder's
+// snapshots, so one taken as the process stopped is on disk before it exits.
+func (c *Controller) Close() []error {
+	errs := c.loops.Wait()
+	c.recorder.Stop()
+
+	return errs
+}
+
+// heartbeatOverrun is what a listener tells when a heartbeat pass overruns.
+func (c *Controller) heartbeatOverrun() { c.recorder.Snapshot(flightrecorder.HeartbeatOverrun) }
 
 // Allocator is the capacity allocator this controller schedules with.
 func (c *Controller) Allocator() *alloc.Allocator { return c.cp.allocator }
@@ -466,6 +491,12 @@ func (c *Controller) Schedule(
 	serverOpts = append(serverOpts, server.WithHurry(opts.Hurry), server.WithLeadershipLost(cp.db.LeadershipLost),
 		server.WithCompletionLedger(cp.db), server.WithTargets(cp.targets...),
 		server.WithStopHandoff())
+
+	// ONLY WITH A RECORDER: without one, a timer armed around every pass would
+	// tell nobody.
+	if c.recorder != nil {
+		serverOpts = append(serverOpts, server.WithHeartbeatOverrun(c.heartbeatOverrun))
+	}
 
 	if opts.DryRun {
 		serverOpts = append(serverOpts, server.AdvertiseNothing())
@@ -744,8 +775,12 @@ const standbyLogInterval = 5 * time.Minute
 //
 // IT RETURNS ON THE CONTEXT TOO, so an ordinary shutdown does not leave it
 // blocked on a channel that will never close.
+//
+// THE FLIGHT RECORDER IS ASKED BEFORE THE STOP, so the window it writes ends
+// where the claim was lost rather than in the teardown after it.
 func stopWhenReplaced(
-	ctx context.Context, replaced <-chan struct{}, stop func(), log *slog.Logger,
+	ctx context.Context, replaced <-chan struct{}, stop func(), recorder *flightrecorder.Recorder,
+	log *slog.Logger,
 ) {
 	select {
 	case <-ctx.Done():
@@ -753,6 +788,7 @@ func stopWhenReplaced(
 		log.Error("this process is no longer this deployment's controller; stopping. " +
 			"Nothing running here is destroyed and no capacity is handed back — the " +
 			"controller that replaced this one adopts both")
+		recorder.Snapshot(flightrecorder.LeadershipLost)
 		stop()
 	}
 }
