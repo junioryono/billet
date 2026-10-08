@@ -94,7 +94,7 @@ is_replay_input() {
 		internal/deploymentid/* | internal/dispatch/* | internal/durablefile/* | \
 		internal/endpoint/* | internal/fakeactions/* | internal/github/* | internal/guestassets/* | \
 		internal/hostauthority/* | internal/lifeops/* | \
-		internal/importcheck/* | internal/lease/* | \
+		internal/importcheck/* | internal/lease/* | internal/metrics/* | \
 		internal/node/* | internal/nodeapi/* | internal/nodeclient/* | internal/nodeplane/* | \
 		internal/imagesource/* | internal/provenance/* | internal/regularfile/* | internal/releasesource/* | \
 		internal/replay/* | internal/retirement/* | internal/runnerimages/* | internal/runnerrelease/* | \

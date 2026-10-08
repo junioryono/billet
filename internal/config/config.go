@@ -493,6 +493,9 @@ type ServerConfig struct {
 	// expiry arrives first as a SIGKILL — skipping the teardown and stranding exactly
 	// the compute the drain was protecting.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
+	// Metrics serves the control plane's Prometheus metrics. Absent, nothing is
+	// served: there is no default address.
+	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
 }
 
 // NodeTLS points at the three files `billet ca issue` produced.
@@ -641,6 +644,9 @@ type NodeConfig struct {
 	// Separate from the control plane's key: the two are restarted for different
 	// reasons and need not wait the same amount of time.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
+	// Metrics serves the node's Prometheus metrics. Absent, nothing is served:
+	// there is no default address.
+	Metrics *MetricsConfig `yaml:"metrics,omitempty"`
 	// Stop is what a SIGTERM does while this node holds compute: "drain" (the
 	// default) waits for it, "handoff" leaves it running for the next node process
 	// to adopt. See NodeConfig.HandsOverOnStop.
@@ -659,6 +665,22 @@ type NodeCacheConfig struct {
 	// the VPC. Firecracker's isolated bridge uses HTTP and refuses these fields.
 	TLSCert string `yaml:"tls_cert,omitempty"`
 	TLSKey  string `yaml:"tls_key,omitempty"`
+}
+
+// MetricsConfig is one role's Prometheus endpoint: /metrics, and the Go
+// profiler under /debug/pprof/ when Pprof is set.
+type MetricsConfig struct {
+	// Listen is the address the endpoint binds. It must be loopback unless
+	// AllowRemote is set: the endpoint has no authentication, and what it
+	// reports (tier names, node names, how much of the fleet is in use) is the
+	// deployment's own business.
+	Listen string `yaml:"listen"`
+	// AllowRemote admits a non-loopback Listen, for a scraper on another host.
+	AllowRemote bool `yaml:"allow_remote,omitempty"`
+	// Pprof also serves the Go profiler. A heap or goroutine profile carries
+	// whatever memory held when it was taken, a credential included, so it is
+	// refused beside AllowRemote.
+	Pprof bool `yaml:"pprof,omitempty"`
 }
 
 // RegistryMirrors names the independent public-registry caches visible at a site.
@@ -3478,6 +3500,7 @@ func (c *Config) Validate() error {
 			c.Server.MaxVCPU, c.Server.MaxMemory)...)
 	}
 	errs = append(errs, c.validateNode()...)
+	errs = append(errs, c.validateMetrics()...)
 	errs = append(errs, c.validateNoTestOnlyBackend()...)
 	errs = append(errs, c.validateNodes()...)
 	errs = append(errs, c.validateSites()...)
@@ -3858,6 +3881,81 @@ func (c *Config) validateServer() []error {
 	if _, err := c.Server.DrainTimeoutDuration(); err != nil {
 		errs = append(errs, err)
 	}
+	return errs
+}
+
+// validateMetrics checks each role's metrics endpoint: loopback unless remote
+// scraping was asked for, the profiler only on loopback, and never the socket of
+// another listener in the file. The two roles share one file on a single host,
+// so the server's and the node's endpoints are checked against each other too.
+func (c *Config) validateMetrics() []error {
+	type listener struct{ key, addr string }
+
+	var (
+		errs   []error
+		others []listener
+		ends   []listener
+	)
+
+	if c.Server != nil {
+		others = append(others, listener{"server.listen", c.Server.Listen},
+			listener{"server.bootstrap_listen", c.Server.BootstrapListen})
+		if c.Server.Metrics != nil {
+			ends = append(ends, listener{"server.metrics", c.Server.Metrics.Listen})
+		}
+	}
+
+	if c.Node != nil {
+		if c.Node.Cache != nil {
+			others = append(others, listener{"node.cache.listen", c.Node.Cache.Listen})
+		}
+		if c.Node.Metrics != nil {
+			ends = append(ends, listener{"node.metrics", c.Node.Metrics.Listen})
+		}
+	}
+
+	metricsOf := func(key string) *MetricsConfig {
+		if key == "server.metrics" {
+			return c.Server.Metrics
+		}
+
+		return c.Node.Metrics
+	}
+
+	for i, end := range ends {
+		m := metricsOf(end.key)
+		addr := strings.TrimSpace(m.Listen)
+
+		if err := validateHostPort(end.key+".listen", addr); err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+
+		loopback := LoopbackAddr(addr)
+
+		if !loopback && !m.AllowRemote {
+			errs = append(errs, fmt.Errorf("%s.listen is %q, which is not loopback. The endpoint has "+
+				"no authentication, so it binds loopback unless %s.allow_remote is true; set it "+
+				"only on a network where whoever can reach the port may read the fleet's state",
+				end.key, addr, end.key))
+		}
+
+		if m.Pprof && !loopback {
+			errs = append(errs, fmt.Errorf("%s.pprof is set on %q, which is not loopback. A heap or "+
+				"goroutine profile carries whatever memory held when it was taken, a credential "+
+				"included, so the profiler is served on loopback only", end.key, addr))
+		}
+
+		for _, o := range append(others, ends[:i]...) {
+			other := strings.TrimSpace(o.addr)
+			if other != "" && addressesOverlap(addr, other) {
+				errs = append(errs, fmt.Errorf("%s.listen is %q and %s is %q, which are the same "+
+					"socket; give the metrics endpoint a port of its own", end.key, addr, o.key, other))
+			}
+		}
+	}
+
 	return errs
 }
 
