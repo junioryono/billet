@@ -292,8 +292,8 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	// wantPolls at a gap of 8/15 of the TTL spans four TTLs: a listener that did
-	// not heartbeat would lose its escrow several times over.
+	// wantPolls recorded means seven gaps of 8/15 of the TTL, about 3.7 TTLs: a
+	// listener that did not heartbeat would lose its escrow more than once.
 	const wantPolls = 8
 
 	var (
