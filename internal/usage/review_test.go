@@ -269,8 +269,15 @@ func TestAStuckSamplerHoldsUpNoTeardownPastTheLimit(t *testing.T) {
 		t.Fatal("the stuck job's own Final never answered")
 	}
 
-	if s := finalWithin(t, m, "vm"); s.Latest.CPUUsage != 62_338_613 {
+	s := finalWithin(t, m, "vm")
+	if s.Latest.CPUUsage != 62_338_613 {
 		t.Errorf("Final(vm) answered cpu %d, want the reading Start took", s.Latest.CPUUsage)
+	}
+	// THE FINAL POINT WAS NOT READ, so the interval it ends is marked unseen
+	// rather than split as if the job did nothing in it.
+	if len(s.Points) == 0 || !s.Points[len(s.Points)-1].AfterGap {
+		t.Errorf("Final(vm) answered from what was known and did not mark its last interval unseen: %+v",
+			s.Points)
 	}
 
 	// Released, the sampler finishes the read it was stuck in and serves again.

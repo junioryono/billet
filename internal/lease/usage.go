@@ -49,8 +49,14 @@ const (
 	EnergyProcess = "process"
 )
 
-// UsageSeriesCodec is the one series encoding this build writes and reads.
+// UsageSeriesCodec is the series encoding with no clock: its points are
+// offsets from a first sample whose wall time it does not record.
 const UsageSeriesCodec = 1
+
+// UsageSeriesCodecClocked is the series encoding that records its first
+// sample's wall time on the host's clock and which intervals the sampler did
+// not see. A node sends it only on a wire that knows it.
+const UsageSeriesCodecClocked = 2
 
 // MaxUsageSeriesBytes bounds one lease's encoded series. It is below the node
 // wire's 1 MiB body limit once base64 is applied, so a report is always one
@@ -200,7 +206,7 @@ func (u JobUsage) groupFields() map[string][]int64 {
 // Validate refuses a series this build cannot read back or the wire could not
 // carry.
 func (s UsageSeries) Validate() error {
-	if s.Codec != UsageSeriesCodec {
+	if s.Codec != UsageSeriesCodec && s.Codec != UsageSeriesCodecClocked {
 		return fmt.Errorf("alloc: usage series codec %d is not one this control plane records", s.Codec)
 	}
 	if len(s.Data) == 0 || len(s.Data) > MaxUsageSeriesBytes {

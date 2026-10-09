@@ -33,6 +33,7 @@ import (
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provenance"
+	"github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -637,18 +638,38 @@ func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) err
 // plane answers the route with a bare 404, and what the pairing loses is the
 // measurement, never a job, so the report is dropped as success.
 func (c *Client) RecordLeaseUsage(
-	ctx context.Context, leaseID string, epoch int64, usage alloc.JobUsage, series *alloc.UsageSeries,
+	ctx context.Context, leaseID string, epoch int64, measured alloc.JobUsage, series *alloc.UsageSeries,
 ) error {
 	wire := c.WireVersion()
 	if wire < nodeapi.VersionJobUsage {
 		return nil
 	}
 	if wire < nodeapi.VersionProcessUsage {
-		usage = beforeProcessUsage(usage)
+		measured = beforeProcessUsage(measured)
+	}
+	if wire < nodeapi.VersionSeriesClock {
+		series = beforeSeriesClock(series)
 	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
-		nodeapi.UsageRequest{Epoch: epoch, Usage: usage, Series: series}, nil)
+		nodeapi.UsageRequest{Epoch: epoch, Usage: measured, Series: series}, nil)
+}
+
+// beforeSeriesClock is the series a plane older than VersionSeriesClock can
+// keep: a clocked one re-encoded without its clock and gap marks, which that
+// plane's validation refuses by codec and would take the whole report down
+// with it. A series that cannot be re-encoded is not sent; the summary still
+// is. The caller's series is not changed.
+func beforeSeriesClock(series *alloc.UsageSeries) *alloc.UsageSeries {
+	if series == nil || series.Codec != usage.SeriesCodecClocked {
+		return series
+	}
+	data, err := usage.WithoutClock(series.Data, alloc.MaxUsageSeriesBytes)
+	if err != nil {
+		return nil
+	}
+
+	return &alloc.UsageSeries{Codec: usage.SeriesCodec, Data: data}
 }
 
 // beforeProcessUsage says what a report can say to a plane older than

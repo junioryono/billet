@@ -142,6 +142,15 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 	if len(sum.Points) == 0 {
 		return u, nil
 	}
+	// CLOCKED WHENEVER THE SAMPLER SAYS WHEN IT BEGAN, which is what lets an
+	// operator place a step's window on the series; the node client re-encodes
+	// it without the clock for a plane too old to keep one.
+	if !sum.First.IsZero() {
+		data, _, err := usage.EncodeSeriesAt(sum.Points, sum.First, alloc.MaxUsageSeriesBytes)
+		if err == nil {
+			return u, &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
+		}
+	}
 	data, _, err := usage.EncodeSeries(sum.Points, alloc.MaxUsageSeriesBytes)
 	if err != nil {
 		return u, nil

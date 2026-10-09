@@ -70,6 +70,7 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	id := "instance-" + name // the fake's instance id for that name
 	p.writeCPU(t, id, "1000")
 
+	launched := time.Now().Truncate(time.Millisecond)
 	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -78,6 +79,7 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	if err := r.Destroy(t.Context(), lease.RequestID); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
+	destroyed := time.Now()
 
 	got, err := a.LeaseUsage(t.Context(), lease.ID)
 	if err != nil {
@@ -89,8 +91,21 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	if !got.Measured(alloc.UsageCPU) || got.Measured(alloc.UsageMemory) || got.Measured(alloc.UsageEnergy) {
 		t.Errorf("unmeasured = %v, want cpu measured and memory and energy not", got.Unmeasured)
 	}
-	if _, err := a.LeaseUsageSeries(t.Context(), lease.ID); err != nil {
-		t.Errorf("no series was kept: %v", err)
+	// THE SERIES IS KEPT WITH ITS CLOCK, which is what places a step on it: the
+	// first sample's wall time lies between the launch and the destroy.
+	series, err := a.LeaseUsageSeries(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("no series was kept: %v", err)
+	}
+	if series.Codec != alloc.UsageSeriesCodecClocked {
+		t.Errorf("the series was kept as codec %d, want the clocked %d", series.Codec, alloc.UsageSeriesCodecClocked)
+	}
+	tl, err := usage.TimelineOf(series.Codec, series.Data)
+	if err != nil {
+		t.Fatalf("the kept series does not read back: %v", err)
+	}
+	if tl.First.Before(launched) || tl.First.After(destroyed) {
+		t.Errorf("the series began at %s, outside the job's %s to %s", tl.First, launched, destroyed)
 	}
 	if _, ok := monitor.Final(name); ok {
 		t.Error("the monitor still holds a job whose compute is gone")
@@ -123,6 +138,10 @@ func TestAJobThatCannotBeMeasuredStillRunsAndStops(t *testing.T) {
 func TestTheSeriesCodecsAgree(t *testing.T) {
 	if usage.SeriesCodec != alloc.UsageSeriesCodec {
 		t.Fatalf("usage writes codec %d and the ledger accepts %d", usage.SeriesCodec, alloc.UsageSeriesCodec)
+	}
+	if usage.SeriesCodecClocked != alloc.UsageSeriesCodecClocked {
+		t.Fatalf("usage writes the clocked codec as %d and the ledger accepts %d", usage.SeriesCodecClocked,
+			alloc.UsageSeriesCodecClocked)
 	}
 }
 

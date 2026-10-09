@@ -423,3 +423,57 @@ func TestRenderStepsSaysWhenNoAttemptWasGiven(t *testing.T) {
 		t.Errorf("a missing attempt was printed as a number:\n%s", missing.String())
 	}
 }
+
+// clockedSeries is a series of the codec that records its start, 12:00:00 on
+// the host's clock: 0.1s of CPU a second for ten seconds.
+func clockedSeries(t *testing.T) *alloc.UsageSeries {
+	t.Helper()
+
+	var points []usage.Point
+	for s := range int64(11) {
+		points = append(points, usage.Point{OffsetMillis: s * 1000, CPUUsage: s * 100_000})
+	}
+	data, _, err := usage.EncodeSeriesAt(points, time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC),
+		alloc.MaxUsageSeriesBytes)
+	if err != nil {
+		t.Fatalf("EncodeSeriesAt: %v", err)
+	}
+
+	return &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
+}
+
+// A SERIES THAT RECORDS ITS START GIVES EACH STEP ITS USAGE, read from the
+// ledger and from GitHub as the CLI assembles them: a step inside the series
+// gets what its window used, and one that runs past the series' end says how
+// much of it is covered.
+func TestJobsShowGivesEachStepItsUsage(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeJobsConfig(t, stateDir)
+	usageReport := measuredUsage
+	lease := seedJob(t, stateDir, jobSeed{requestID: 77, job: &forgedJob, usage: &usageReport,
+		series: clockedSeries(t)})
+	fakeJobsGitHub(t, stepsOn(lease, `{"number":1,"name":"build","status":"completed",
+		"conclusion":"success","started_at":"2026-10-09T12:00:02Z","completed_at":"2026-10-09T12:00:05Z"},
+		{"number":2,"name":"post","status":"completed","conclusion":"success",
+		"started_at":"2026-10-09T12:00:08Z","completed_at":"2026-10-09T12:00:14Z"}`))
+
+	out := capture(t, func() {
+		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
+			t.Errorf("billet jobs show: %v", err)
+		}
+	})
+
+	for _, want := range []string{
+		"aligned to the second on two clocks",
+		`step 1     "build" "success", started 2026-10-09T12:00:02Z, took 3s` + "\n           cpu 0.3s,",
+		`step 2     "post" "success", started 2026-10-09T12:00:08Z, took 6s` +
+			"\n           partial: the series covers 2s of the step's 6s, and over that part: cpu 0.2s,",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report does not say %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "could not tell") {
+		t.Errorf("a clocked series was not placed on the steps:\n%s", out)
+	}
+}

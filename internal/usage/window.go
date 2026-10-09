@@ -172,10 +172,14 @@ func distinct(points []Point) ([]Point, []bool) {
 // time can be placed on them.
 var ErrNoClock = errors.New("usage: the series records no start on the host's clock")
 
-// TimelineOf reads a stored series as a timeline. A series of SeriesCodec is
+// TimelineOf reads a stored series as a timeline. A series of SeriesCodec,
+// which a node or a control plane older than SeriesCodecClocked writes, is
 // ErrNoClock.
 func TimelineOf(codec int, data []byte) (Timeline, error) {
-	if codec == SeriesCodec {
+	switch codec {
+	case SeriesCodecClocked:
+		return DecodeSeriesAt(data)
+	case SeriesCodec:
 		if _, err := DecodeSeries(data); err != nil {
 			return Timeline{}, err
 		}
