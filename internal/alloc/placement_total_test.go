@@ -91,7 +91,11 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 				macOS++
 			}
 
-			if c, ok := firstCost(p); ok && p.deploymentVCPU/c.vcpu <= want {
+			// BOUND BY THE CEILING when lifting it would place more.
+			lifted := p.clone()
+			lifted.deploymentVCPU, lifted.deploymentMemory = int(^uint(0)>>1), config.ByteSize(1<<63-1)
+
+			if lifted.greedyTotal(tier) > want {
 				ceilingBound++
 			}
 
@@ -113,17 +117,6 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 		t.Fatalf("of 20000 cases %d were counted in one pass, %d on macOS and %d bound by the ceiling",
 			uniformChecked, macOS, ceilingBound)
 	}
-}
-
-// firstCost is the cost the placer's first costed candidate charges.
-func firstCost(p *placer) (placementCost, bool) {
-	for _, n := range p.order {
-		if c, ok := p.cost[n.name]; ok {
-			return c, true
-		}
-	}
-
-	return placementCost{}, false
 }
 
 // A FLEET TOO LARGE TO SUM: two hosts whose rooms each fill an int, under a
