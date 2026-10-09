@@ -167,8 +167,11 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 		t.Fatalf("sync after the probe: %v", err)
 	}
 
+	r, _ := acct.Final("probe", nil, time.Now())
+
 	// A GAP IN THE LISTENER WHILE THE PROBE WAS WATCHED would mark it too, so
-	// a probe watched across one proves nothing either way.
+	// a probe watched across one proves nothing either way. Read after Final,
+	// so a gap that opened just before it is seen.
 	acct.mu.Lock()
 	gap := acct.down || !acct.lossEnded.Before(probeSince)
 	acct.mu.Unlock()
@@ -177,7 +180,6 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 		t.Fatal("the listener lost events while the probe was watched; the delivery check is inconclusive")
 	}
 
-	r, _ := acct.Final("probe", nil, time.Now())
 	if !r.Incomplete && len(r.Destinations) == 0 {
 		t.Fatal("a destruction before the barrier had not reached the accountant when Sync returned")
 	}
