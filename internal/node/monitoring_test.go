@@ -117,9 +117,12 @@ func (m *startedMonitor) Forget(string)                      {}
 // is a group silently never measured (a container's network namespace, say).
 // Every field is set to a value distinct from its zero and its neighbours',
 // and each must arrive under the same name with the same value; the boolean
-// fields are set one at a time, so one copied from another is seen too.
+// fields are set one at a time, so one copied from another is seen too. The
+// fields the flow watcher reads instead are named here, and
+// TestTheRunnerFollowsAGuestsFlowsFromLaunchToDestroy holds them to it.
 func TestEveryFieldOfAUsageTargetReachesTheSampler(t *testing.T) {
 	typ := reflect.TypeFor[provider.UsageTarget]()
+	forFlows := map[string]bool{"GuestMAC": true, "Bridge": true}
 
 	var bools []int
 	for i := range typ.NumField() {
@@ -163,11 +166,15 @@ func TestEveryFieldOfAUsageTargetReachesTheSampler(t *testing.T) {
 		}
 
 		got := reflect.ValueOf(monitor.targets[0])
-		if got.NumField() != from.NumField() {
-			t.Errorf("usage.Target has %d fields and provider.UsageTarget %d", got.NumField(), from.NumField())
+		if got.NumField() != from.NumField()-len(forFlows) {
+			t.Errorf("usage.Target has %d fields and provider.UsageTarget %d, %d of them the flow watcher's",
+				got.NumField(), from.NumField(), len(forFlows))
 		}
 		for i := range from.NumField() {
 			name := typ.Field(i).Name
+			if forFlows[name] {
+				continue
+			}
 			field := got.FieldByName(name)
 			if !field.IsValid() {
 				t.Errorf("usage.Target has no %s", name)

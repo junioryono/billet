@@ -7,6 +7,7 @@ package ledgerdb
 
 import (
 	"context"
+	"database/sql"
 )
 
 const readJobSeries = `-- name: ReadJobSeries :one
@@ -32,7 +33,9 @@ SELECT lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
        memory_peak_bytes, oom_kills, disk_read_bytes, disk_write_bytes,
        net_rx_bytes, net_tx_bytes, net_rx_packets, net_tx_packets,
        cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
-       io_full_us, energy_active_uj, energy_idle_uj, energy_source
+       io_full_us, energy_active_uj, energy_idle_uj, energy_source, cycles,
+       instructions, cache_references, cache_misses, branch_misses,
+       frontend_stall_cycles
   FROM job_usage WHERE lease_id = $1
 `
 
@@ -71,6 +74,12 @@ func (q *Queries) ReadJobUsage(ctx context.Context, leaseID string) (JobUsage, e
 		&i.EnergyActiveUj,
 		&i.EnergyIdleUj,
 		&i.EnergySource,
+		&i.Cycles,
+		&i.Instructions,
+		&i.CacheReferences,
+		&i.CacheMisses,
+		&i.BranchMisses,
+		&i.FrontendStallCycles,
 	)
 	return i, err
 }
@@ -102,47 +111,57 @@ INSERT INTO job_usage
       memory_peak_bytes, oom_kills, disk_read_bytes, disk_write_bytes,
       net_rx_bytes, net_tx_bytes, net_rx_packets, net_tx_packets,
       cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
-      io_full_us, energy_active_uj, energy_idle_uj, energy_source)
+      io_full_us, energy_active_uj, energy_idle_uj, energy_source,
+      cycles, instructions, cache_references, cache_misses, branch_misses,
+      frontend_stall_cycles)
 VALUES ($1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10, $11,
         $12, $13, $14, $15,
         $16, $17, $18, $19,
         $20, $21, $22, $23,
         $24, $25, $26, $27,
-        $28, $29)
+        $28, $29, $30, $31,
+        $32, $33, $34,
+        $35)
 ON CONFLICT (lease_id) DO NOTHING
 `
 
 type RecordJobUsageParams struct {
-	LeaseID         string
-	Node            string
-	RecordedAt      string
-	Source          string
-	Unmeasured      string
-	Samples         int64
-	IntervalMs      int64
-	WindowMs        int64
-	CpuUserUs       int64
-	CpuSystemUs     int64
-	GuestCpuUs      int64
-	VmmCpuUs        int64
-	MemoryPeakBytes int64
-	OomKills        int64
-	DiskReadBytes   int64
-	DiskWriteBytes  int64
-	NetRxBytes      int64
-	NetTxBytes      int64
-	NetRxPackets    int64
-	NetTxPackets    int64
-	CpuSomeUs       int64
-	CpuFullUs       int64
-	MemorySomeUs    int64
-	MemoryFullUs    int64
-	IoSomeUs        int64
-	IoFullUs        int64
-	EnergyActiveUj  int64
-	EnergyIdleUj    int64
-	EnergySource    string
+	LeaseID             string
+	Node                string
+	RecordedAt          string
+	Source              string
+	Unmeasured          string
+	Samples             int64
+	IntervalMs          int64
+	WindowMs            int64
+	CpuUserUs           int64
+	CpuSystemUs         int64
+	GuestCpuUs          int64
+	VmmCpuUs            int64
+	MemoryPeakBytes     int64
+	OomKills            int64
+	DiskReadBytes       int64
+	DiskWriteBytes      int64
+	NetRxBytes          int64
+	NetTxBytes          int64
+	NetRxPackets        int64
+	NetTxPackets        int64
+	CpuSomeUs           int64
+	CpuFullUs           int64
+	MemorySomeUs        int64
+	MemoryFullUs        int64
+	IoSomeUs            int64
+	IoFullUs            int64
+	EnergyActiveUj      int64
+	EnergyIdleUj        int64
+	EnergySource        string
+	Cycles              sql.NullInt64
+	Instructions        sql.NullInt64
+	CacheReferences     sql.NullInt64
+	CacheMisses         sql.NullInt64
+	BranchMisses        sql.NullInt64
+	FrontendStallCycles sql.NullInt64
 }
 
 // Job usage: what a job did to the host, measured by the host (migration 57).
@@ -155,6 +174,8 @@ type RecordJobUsageParams struct {
 // THE ROW COUNT SAYS WHETHER THIS REPORT WON, and only the report that won may
 // write the series: otherwise a first report without a series and a second
 // with one would be stored as a pair neither request sent.
+//
+// A hardware counter is NULL where it was not counted (migration 58).
 func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, recordJobUsage,
 		arg.LeaseID,
@@ -186,6 +207,12 @@ func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) 
 		arg.EnergyActiveUj,
 		arg.EnergyIdleUj,
 		arg.EnergySource,
+		arg.Cycles,
+		arg.Instructions,
+		arg.CacheReferences,
+		arg.CacheMisses,
+		arg.BranchMisses,
+		arg.FrontendStallCycles,
 	)
 	if err != nil {
 		return 0, err

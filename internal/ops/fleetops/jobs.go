@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -152,6 +153,63 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		return fmt.Sprintf("%s (package RAPL with no idle baseline, so idle is inside it; source %s)",
 			joules(u.EnergyActiveMicrojoules), strconv.Quote(u.EnergySource))
 	})
+	renderCounters(line, u.Counters)
+}
+
+// renderCounters writes what the hardware counters saw and the ratios a reader
+// wants from them. An event that was not counted says so, and so does every
+// ratio that needs it: a ratio of a count and a missing count is not a number.
+func renderCounters(line func(label, format string, args ...any), c *alloc.JobCounters) {
+	if c == nil {
+		line("counters", "not measured")
+		return
+	}
+	count := func(v *int64) string {
+		if v == nil {
+			return "not measured"
+		}
+		return groupDigits(*v)
+	}
+	line("counters", "cycles %s, instructions %s (the vCPU threads, guest and host mode)",
+		count(c.Cycles), count(c.Instructions))
+	line("", "cache references %s, cache misses %s", count(c.CacheReferences), count(c.CacheMisses))
+	line("", "branch misses %s, frontend stall cycles %s", count(c.BranchMisses),
+		count(c.FrontendStallCycles))
+
+	ratio := func(num, den *int64, scale float64, format, per string) string {
+		switch {
+		case num == nil || den == nil:
+			return "not measured"
+		case *den == 0:
+			return "undefined (no " + per + " counted)"
+		}
+		return fmt.Sprintf(format, float64(*num)*scale/float64(*den))
+	}
+	line("ipc", "%s", ratio(c.Instructions, c.Cycles, 1, "%.2f instructions per cycle", "cycles"))
+	line("cache", "%s", ratio(c.CacheMisses, c.Instructions, 1000,
+		"%.1f misses per 1,000 instructions", "instructions"))
+	line("branches", "%s", ratio(c.BranchMisses, c.Instructions, 1000,
+		"%.1f mispredicted per 1,000 instructions", "instructions"))
+	line("frontend", "%s", ratio(c.FrontendStallCycles, c.Cycles, 100,
+		"stalled %.1f%% of cycles", "cycles"))
+}
+
+// groupDigits writes a count with its thousands separated, as perf stat does.
+func groupDigits(n int64) string {
+	digits := strconv.FormatInt(n, 10)
+	sign := ""
+	if n < 0 {
+		sign, digits = "-", digits[1:]
+	}
+	var b strings.Builder
+	for i, d := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(d)
+	}
+
+	return sign + b.String()
 }
 
 func seconds(micros int64) string { return fmt.Sprintf("%.1fs", float64(micros)/1e6) }

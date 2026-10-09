@@ -132,6 +132,10 @@ type Runner struct {
 	registryMirrors config.RegistryMirrors
 	// monitor measures each running job from the host; nil measures nothing.
 	monitor JobMonitor
+	// flows totals each job's traffic by destination, and leaseDir is where it
+	// learns a guest's address; nil measures none.
+	flows    FlowWatcher
+	leaseDir string
 	// upgrader replaces this node's own billet. Nil means it cannot, which the
 	// upgrade command reports rather than silently ignoring.
 	upgrader Upgrader
@@ -490,6 +494,11 @@ func (r *Runner) Launch(
 		}
 	}
 
+	// TAKEN BEFORE THE LAUNCH, because a guest opens connections while it
+	// boots: what separates its flows from the previous holder of its address
+	// is that they started after this.
+	launchedAt := time.Now()
+
 	inst, err := r.provider.Launch(ctx, provider.Spec{
 		// BILLET's name, not GitHub's. reg.RunnerName() is what GitHub called the
 		// runner, and using it here would have left the instance carrying a name
@@ -614,7 +623,7 @@ func (r *Runner) Launch(
 	r.runningLease[job.RequestID] = lease
 	r.mu.Unlock()
 
-	r.startMonitoring(ctx, lease, inst)
+	r.startMonitoring(ctx, lease, inst, launchedAt)
 
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
@@ -815,6 +824,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// VMM's threads it reads go with the compute.
 	measured, hasUsage := r.finalUsage(inst.Name)
 
+	// A FLOW THAT STARTS AFTER THIS IS NOT THE JOB'S: the destroy below releases
+	// the guest's tap, and with it the MAC and address, to the next launch.
+	destroyAt := time.Now()
+
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
@@ -843,6 +856,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	}
 	// AND SO IS WHAT THE JOB DID TO THE HOST, for the same reason: the report is
 	// fenced on the lease, which the plane releases only after this returns.
+	// THE FLOWS ARE READ AFTER THE DESTROY, when the guest can open no more and
+	// every counter it left is final.
+	r.finalFlows(ctx, inst.Name, destroyAt, measured, hasUsage)
+
 	if hasUsage && holdable {
 		r.reportUsage(ctx, lease, inst.Name, measured)
 	}

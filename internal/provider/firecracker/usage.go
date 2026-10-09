@@ -3,7 +3,9 @@ package firecracker
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
@@ -11,6 +13,24 @@ import (
 
 // hostProcessStart reads a pid's start time from the real /proc.
 func hostProcessStart(pid int) (uint64, error) { return usage.Reader{Root: "/"}.ProcessStart(pid) }
+
+// sysClassNet is where the host lists its network devices.
+const sysClassNet = "/sys/class/net"
+
+// tapBridge is the bridge a tap is enslaved to, from its master link under
+// root (/sys/class/net on a host), or empty when it has none or cannot be read.
+func tapBridge(root, tap string) string {
+	if tap == "" || strings.ContainsAny(tap, "/.") {
+		return ""
+	}
+
+	target, err := os.Readlink(filepath.Join(root, tap, "master"))
+	if err != nil {
+		return ""
+	}
+
+	return filepath.Base(target)
+}
 
 // vcpuThreadPrefix is how Firecracker names the threads that run guest code:
 // "fc_vcpu 0" through "fc_vcpu N". The event loop is "firecracker-v1." (the
@@ -55,7 +75,20 @@ func (p *Provider) UsageTarget(_ context.Context, instanceID string) (provider.U
 		return provider.UsageTarget{}, err
 	}
 
+	// THE MAC THE LAUNCH GAVE THE GUEST, derived the same way, and THE BRIDGE
+	// ITS TAP IS ON, read from the host rather than re-derived: an address
+	// learned for any other MAC or bridge would be another guest's. Either
+	// unknown leaves the guest's flows unmeasured and nothing else.
+	mac, err := guestMAC(res.Tap)
+	if err != nil {
+		mac = ""
+	}
+
+	bridge := tapBridge(sysClassNet, res.Tap)
+
 	return provider.UsageTarget{
+		GuestMAC:         mac,
+		Bridge:           bridge,
 		CgroupDir:        filepath.Join(root, j.execName, j.id),
 		PID:              pid,
 		PIDStart:         start,

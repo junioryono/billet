@@ -204,6 +204,18 @@ linters:
             - pkg: "github.com/actions/scaleset"
               desc: "Consume GitHub's scale-set API through internal/scaleset, which adapts it to server.Session. The upstream module is a public preview."
 
+        # One hardware-counter reader, imported in one place. internal/usage
+        # opens, reads and closes every perf descriptor on the sampler's one
+        # goroutine, and a second import site is a descriptor nothing closes.
+        perfevents:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!${config-path}/internal/usage/**"
+          deny:
+            - pkg: "github.com/elastic/go-perf"
+              desc: "Count hardware events through internal/usage's CounterSource, whose descriptors live on the sampler's goroutine."
+
         # One gRPC server, for the Bazel and Buck2 remote caches, in one place.
         # The Remote Execution API's generated code and gRPC's server are large
         # and serve one listener route; internal/node/reapi adapts them to a

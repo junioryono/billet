@@ -68,14 +68,20 @@ func reachesTheWire(t *testing.T, client *http.Client, addr string) bool {
 		return false
 	}
 
+	// WHY IT DID NOT, said: a caller expecting an answer otherwise fails with a
+	// sentence about the budget and nothing about the request (#188).
 	res, err := client.Do(req)
 	if err != nil {
+		t.Logf("the request did not reach the wire: %v", err)
+
 		return false
 	}
 
 	defer res.Body.Close()
 
 	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		t.Logf("the answer was cut off: %v", err)
+
 		return false
 	}
 
@@ -126,8 +132,14 @@ func TestSilentConnectionsCannotKeepANodeOffTheWire(t *testing.T) {
 
 	const budget = 4
 
+	// A BOUND OF ITS OWN, ten times the package's. The node gets half of it, for
+	// a mutual-TLS handshake and a request under -race; at half of 300ms a
+	// loaded runner spent it and correct code failed (#188, 2026-10-08). Nothing
+	// here waits the bound out, so it costs nothing when the code is right.
+	const handshake = 10 * testHandshakeTimeout
+
 	wire, _, ca := splitWire(t, "", withConnectionLimits(budget, budget),
-		withHandshakeTimeout(testHandshakeTimeout))
+		withHandshakeTimeout(handshake))
 
 	silentConnections(t, wire, budget*2)
 
@@ -136,7 +148,7 @@ func TestSilentConnectionsCannotKeepANodeOffTheWire(t *testing.T) {
 	// connections — they age out after the handshake bound — and then be served,
 	// which passes while proving the opposite of what the name claims. The
 	// question is whether a node gets in WHILE they are there.
-	const patience = testHandshakeTimeout / 2
+	const patience = handshake / 2
 
 	start := time.Now()
 
@@ -145,7 +157,7 @@ func TestSilentConnectionsCannotKeepANodeOffTheWire(t *testing.T) {
 			"open against it, which is the failure this acceptor exists to prevent")
 	}
 
-	if waited := time.Since(start); waited >= testHandshakeTimeout {
+	if waited := time.Since(start); waited >= handshake {
 		t.Errorf("the node was served only after %s, which is past the point where the silent "+
 			"sockets expire — it waited them out rather than being unaffected by them", waited)
 	}

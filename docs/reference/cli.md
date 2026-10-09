@@ -171,7 +171,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet leases held` | every lease whose compute is not confirmed gone |
 | `billet leases quarantined` | capacity held for compute nobody has accounted for |
 | `billet leases failures [--since 24h] [--limit 50]` | jobs GitHub did not report as succeeded on leases billet's infrastructure disrupted; billet re-runs nothing |
-| `billet jobs show <lease>` | which GitHub job the lease ran (repository, workflow ref, job name, event, GitHub's job id) and, with `node.monitoring`, what the host measured it do: CPU with the guest and VMM split, peak memory, disk and network bytes, pressure stalls and package energy (on tart, macOS's own estimate for the VM's process). A group the host could not read says `not measured`, and so does an OOM count a host keeps none of |
+| `billet jobs show <lease>` | which GitHub job the lease ran (repository, workflow ref, job name, event, GitHub's job id) and, with `node.monitoring`, what the host measured it do: CPU with the guest and VMM split, peak memory, disk and network bytes, pressure stalls and package energy (on tart, macOS's own estimate for the VM's process), and, with `node.monitoring.perf`, the vCPU threads' hardware counters and what they imply: instructions per cycle, cache misses and branch misses per 1,000 instructions, and the share of cycles the frontend stalled. A group the host could not read says `not measured`, and so does an OOM count a host keeps none of, an event the CPU did not count, and every ratio that needs one |
 | `billet leases release <lease> --force` | hand capacity back on your assertion that its compute is gone (`--force` required) |
 | `billet drain [--reason] [--wait] [--timeout] [--without-compute-proof]` | seal admission and, with `--wait`, wait for the ledger and then every host to prove nothing is running. Exit 2: still draining or interrupted; the seal remains |
 | `billet resume` | open admission again |
@@ -265,6 +265,20 @@ The Ansible collection's host role runs these as steps of a converge; each answe
 | `billet node receipt --config PATH --evidence FILE --confirmation FILE --run ID --json` | record the receipt that proves a migration took, from the migration's answer and the controller's `rollout registration` answer |
 | `billet node receipt --config PATH --refresh [--desired PATH\|-] [--wait 1m] [--run ID] [--dry-run] --json` | keep the receipt current at the end of an ordinary converge; `--run` is required unless `--dry-run`, which reports what would be written and writes nothing |
 | `billet rollout registration --node NAME --incarnation ID [--wait 5m] [--environment-file PATH] --json` | ask the ledger whether the node registered under the incarnation a migration presented |
+
+## Sharing the uplink
+
+### `billet uplink shape [--interface NAME] [--reflectors A,B,...]`
+
+Keep this host's own traffic, its guests' included, from filling the queue of the internet line it shares with the rest of its site. It runs until stopped, as root, on Linux: CAKE on the interface (the default route's unless `--interface` names one) in both directions, starting at the interface's own speed, which holds nothing back. Twice a second it pings the reflectors (by default 1.1.1.1, 8.8.8.8 and 9.9.9.9, three operators, a delay counting only when most of them see it) and reads what the interface moved. When 3 of the last 6 rounds came back more than 15 ms above each reflector's idle baseline and a direction is busy, that direction is cut to below what it was moving, more deeply the higher the delay; while a direction runs at its rate with no queue, its rate rises 4% a step. Nothing about the line's speed is configured. Stopping it removes the shaping, and so does the installed billet being replaced by an upgrade, after which it exits with an error so the unit starts it again on the new binary. The host role runs it as `billet-uplink.service`; [the shared-uplink record](records/shared-uplink.md) has the measurements behind it.
+
+### `billet uplink check [--interface NAME]`
+
+Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's. Only qdiscs the kernel assigned (handle `0:`) may be replaced; CAKE, an ingress qdisc and an `ifb-` device count as billet's only when the record a run of the shaper keeps under `/run/billet-uplink/` names the interface, and a `clsact` qdisc never does. The shaper refuses anything else rather than replace it. The host role enables `billet-uplink.service` only where this passes.
+
+### `billet uplink clear`
+
+Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` installed, and only that. The record names the interface by its kernel index as well as its name, so the shaping is found on an interface renamed since, a device that has taken the old name is left alone, and an interface that is gone leaves only its IFB device to remove. With no record it removes nothing, because nothing else proves what is on an interface is billet's. It refuses while a shaper runs, and exits non-zero when a removal failed. The unit runs it as `ExecStopPost`, so a crash is cleared too.
 
 ## Removal
 

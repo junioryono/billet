@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1554,6 +1555,14 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// COUNTERS ONLY FROM A WIRE THAT CARRIES THEM: a pairing that negotiated
+	// below VersionJobCounters has its report kept without them, as the node
+	// would have sent it.
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionJobCounters {
+		req.Usage.Counters = nil
+	}
+
 	if err := req.Usage.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
 
@@ -2405,6 +2414,16 @@ func decodeLimited(w http.ResponseWriter, r *http.Request, into any, limit int64
 
 	if err := dec.Decode(into); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return false
+	}
+
+	// ONE VALUE AND NOTHING AFTER IT. The decoder stops at the end of the first
+	// value, so a body carrying a second, or anything else after the first, was
+	// accepted with the rest unread (found by fuzzing, 2026-10-08). A node
+	// encodes one value and at most a newline, which is whitespace here.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, "the body carries more than one JSON value")
 
 		return false
 	}

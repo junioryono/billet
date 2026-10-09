@@ -17,6 +17,7 @@ type (
 	Disruption       = lease.Disruption
 	JobUsage         = lease.JobUsage
 	UsageSeries      = lease.UsageSeries
+	JobCounters      = lease.JobCounters
 )
 
 const (
