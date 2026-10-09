@@ -2124,6 +2124,25 @@
       "sources": [
         "parity:read-only systemd/IP observation with exact argv bound"
       ]
+    },
+    "tasks/upgrade-rollback.yml / Stop the uplink shaper before recovering the ledger": {
+      "task": "{\"ansible.builtin.systemd_service\":{\"name\":\"billet-uplink.service\",\"state\":\"stopped\"},\"become\":true,\"failed_when\":false,\"name\":\"Stop the uplink shaper before recovering the ledger\"}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"upgrade-recover.yml\",\"name\":\"Recover an interrupted billet upgrade before converging anything else\",\"when\":[\"billet_interrupted_upgrade | bool\",\"not ansible_check_mode\"]}},{\"file\":\"tasks/upgrade-recover.yml\",\"task\":{\"ansible.builtin.include_tasks\":\"upgrade-rollback.yml\",\"name\":\"Roll back an uncommitted host transaction\",\"when\":\"not billet_upgrade_commit_state.stat.exists\"}}]",
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"services.yml\",\"name\":\"Configure billet services\"}},{\"branch\":\"rescue\",\"file\":\"tasks/services.yml\",\"task\":{\"become\":true,\"name\":\"Upgrade billet as one recoverable host transaction\",\"when\":[\"billet_binary_upgrade | default(false)\",\"not ansible_check_mode\"]}},{\"file\":\"tasks/services.yml\",\"task\":{\"ansible.builtin.include_tasks\":\"upgrade-recover.yml\",\"name\":\"Restore the durable pre-upgrade host state\"}},{\"file\":\"tasks/upgrade-recover.yml\",\"task\":{\"ansible.builtin.include_tasks\":\"upgrade-rollback.yml\",\"name\":\"Roll back an uncommitted host transaction\",\"when\":\"not billet_upgrade_commit_state.stat.exists\"}}]"
+      ],
+      "sources": [
+        "parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work"
+      ]
+    },
+    "tasks/services.yml / Stop the uplink shaper for the transaction": {
+      "task": "{\"ansible.builtin.systemd_service\":{\"name\":\"billet-uplink.service\",\"state\":\"stopped\"},\"failed_when\":false,\"name\":\"Stop the uplink shaper for the transaction\"}",
+      "contexts": [
+        "[{\"branch\":\"block\",\"file\":\"tasks/main.yml\",\"task\":{\"name\":\"Converge the ordinary host only after retirement admits it\",\"when\":\"not billet_retirement_bypass | bool\"}},{\"file\":\"tasks/main.yml\",\"task\":{\"ansible.builtin.import_tasks\":\"services.yml\",\"name\":\"Configure billet services\"}},{\"branch\":\"block\",\"file\":\"tasks/services.yml\",\"task\":{\"become\":true,\"name\":\"Upgrade billet as one recoverable host transaction\",\"when\":[\"billet_binary_upgrade | default(false)\",\"not ansible_check_mode\"]}}]"
+      ],
+      "sources": [
+        "parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work"
+      ]
     }
   },
   "definitions": {

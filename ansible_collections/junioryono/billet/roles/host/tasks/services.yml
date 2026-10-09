@@ -361,6 +361,17 @@
         state: stopped
       when: billet_service_state_before_upgrade.results[1].rc != 4
 
+    # THE UPLINK SHAPER IS A BILLET PROCESS TOO, and the transaction waits for
+    # every one to end before it hides the executable. Stopped here, while its
+    # ExecStopPost can still run the binary that clears its qdiscs; uplink.yml
+    # starts it again, on the new binary, after the transaction. Absent on a
+    # host that never ran it, which is not a failure.
+    - name: Stop the uplink shaper for the transaction
+      ansible.builtin.systemd_service:
+        name: billet-uplink.service
+        state: stopped
+      failed_when: false
+
     - name: Pull, boot-verify, and promote every compatible guest needed
       ansible.builtin.command:
         argv:
