@@ -66,7 +66,7 @@ jobs:
       disk_bytes: 2147483648
 ```
 
-`cpu_workers` must not exceed the tier's vCPUs (the job refuses, since more workers than vCPUs share them and cannot run N×T seconds), and `memory_bytes` must sit well inside the tier's memory. `network_url` is any public URL whose body is exactly `network_bytes`; with `network_bytes` given, a body of any other size fails the job rather than recording the wrong answer. The Cloudflare endpoint above is one such URL; it has not been measured from this host.
+`runner_label` must name a tier only the node under test serves: each loaded job is compared with its run's idle job, which must have run on the same host, and a pair from two hosts is UNMEASURED. `cpu_workers` must not exceed the tier's vCPUs (the job refuses, since more workers than vCPUs share them and cannot run N×T seconds), and `memory_bytes` must sit well inside the tier's memory. `network_url` is any public URL whose body is exactly `network_bytes`; with `network_bytes` given, a body of any other size fails the job rather than recording the wrong answer. The Cloudflare endpoint above is one such URL; it has not been measured from this host.
 
 ## The checks, in order
 
@@ -145,7 +145,7 @@ The energy check needs the whole window accounted for: every microVM the log saw
 
 **PASS** means billet's figure is inside the stated range of the known answer in that run. Across runs, read the summary: the mean and its 95% confidence interval say where billet sits, and the CV how repeatable it is.
 
-**UNMEASURED** means the comparison could not be made, and the line under it says why: billet did not measure the group (`billet check` on the node says which accounting the jailer was given), no usage report was recorded (the job ran on a node without monitoring, or the report has not arrived), no idle or baseline job in that run to subtract, a job that left no expectation (it failed before uploading, was skipped after an earlier failure, or its artifact was not downloaded), a record that does not carry the counter compared, or no record was collected.
+**UNMEASURED** means the comparison could not be made, and the line under it says why: billet did not measure the group (`billet check` on the node says which accounting the jailer was given), no usage report was recorded (the job ran on a node without monitoring, or the report has not arrived), no idle or baseline job in that run to subtract, a job that left no expectation (it failed before uploading, was skipped after an earlier failure, or its artifact was not downloaded), a record that does not carry the counter compared, a reference job that ran on another host, or no record was collected.
 
 **FAIL**, by job:
 

@@ -41,7 +41,8 @@ func fixtureRun(runID int64) ([]expectation, map[string]record) {
 	idle := usage{Measured: allGroups(), present: allFields(), CPUUserMicros: 20_500_000, CPUSystemMicros: 1_000_000,
 		MemoryPeakBytes: 700 * mib, NetRxBytes: 60 * mib, DiskWriteBytes: 90 * mib}
 	rec := func(kind string, u usage) record {
-		return record{Lease: lease(kind), RunID: runID, GitHubJobID: "7" + lease(kind)[6:], Usage: &u}
+		return record{Lease: lease(kind), RunID: runID, GitHubJobID: "7" + lease(kind)[6:], Node: "ubuntu-01",
+			Provider: "firecracker", Usage: &u}
 	}
 	with := func(f func(*usage)) usage {
 		u := idle
@@ -212,6 +213,12 @@ func TestAComparisonWithoutItsInputIsUnmeasured(t *testing.T) {
 		{"no baseline to subtract", kindIdle, func(e []expectation, _ map[string]record) []expectation {
 			return dropKind(e, kindBaseline)
 		}, "no baseline job"},
+		{"a reference from another host", kindMemory, func(e []expectation, recs map[string]record) []expectation {
+			r := recs["lease-100-idle"]
+			r.Node = "ubuntu-02"
+			recs["lease-100-idle"] = r
+			return e
+		}, `the idle job ran on "ubuntu-02" (firecracker) and this one on "ubuntu-01"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exps, recs := fixtureRun(100)
@@ -345,7 +352,8 @@ func writeRun(t *testing.T, expDir, recDir string, exps []expectation, recs map[
 // recordJSON spells a record the way billet jobs show --json does, which the
 // decoding test proves against the command's own fixtures.
 func recordJSON(r record) map[string]any {
-	out := map[string]any{"lease": r.Lease, "run_id": r.RunID, "github_job_id": r.GitHubJobID, "usage": nil}
+	out := map[string]any{"lease": r.Lease, "run_id": r.RunID, "github_job_id": r.GitHubJobID, "node": r.Node,
+		"provider": r.Provider, "usage": nil}
 	if r.Usage != nil {
 		u := r.Usage
 		out["usage"] = map[string]any{"measured": u.Measured, "samples": u.Samples,

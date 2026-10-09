@@ -249,6 +249,10 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			j.problem = "billet did not measure its energy"
 		case rec.Usage.missing(energyFields...) != "":
 			j.problem = "billet's record carries no " + rec.Usage.missing(energyFields...)
+		case rec.Usage.IntervalMillis <= 0:
+			// THE TICK IS WHAT THE COARSE-ROW GUARD HOLDS EVERY ROW TO: a job with
+			// none would leave the guard nothing to compare.
+			j.problem = fmt.Sprintf("billet's record says the monitor ticked every %d ms", rec.Usage.IntervalMillis)
 		case rec.Usage.EnergySource != "rapl":
 			j.problem = fmt.Sprintf("its energy source is %q, not rapl split by an idle baseline",
 				rec.Usage.EnergySource)

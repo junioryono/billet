@@ -132,6 +132,7 @@ func TestAWindowThatCannotBeAccountedForIsUnmeasured(t *testing.T) {
 			r[16].uptime = r[15].uptime
 			return r
 		}, "row 17 (epoch 1791540016) does not come after the row before it"},
+		{"no monitor tick in the record", leaseA(950, 0, func(u *usage) { u.IntervalMillis = 0 }), nil, "without lease-a"},
 		{"no energy counters in the record", leaseA(950, 0, func(u *usage) {
 			u.present = allFields()
 			delete(u.present, "energy_active_uj")
