@@ -57,18 +57,28 @@ func (a *Allocator) RecordLeaseUsage(
 			EnergyActiveUj: usage.EnergyActiveMicrojoules, EnergyIdleUj: usage.EnergyIdleMicrojoules,
 			EnergySource: usage.EnergySource,
 			Cycles:       nullCount(counters.Cycles), Instructions: nullCount(counters.Instructions),
-			CacheReferences:     nullCount(counters.CacheReferences),
-			CacheMisses:         nullCount(counters.CacheMisses),
-			BranchMisses:        nullCount(counters.BranchMisses),
-			FrontendStallCycles: nullCount(counters.FrontendStallCycles),
+			CacheReferences:        nullCount(counters.CacheReferences),
+			CacheMisses:            nullCount(counters.CacheMisses),
+			BranchMisses:           nullCount(counters.BranchMisses),
+			FrontendStallCycles:    nullCount(counters.FrontendStallCycles),
+			DestinationsIncomplete: destinationsVerdict(usage.Destinations),
+			TapSentBytes:           tapTotal(usage.Destinations, func(t *TapTotals) int64 { return t.SentBytes }),
+			TapReceivedBytes: tapTotal(usage.Destinations,
+				func(t *TapTotals) int64 { return t.ReceivedBytes }),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: record the usage of lease %s: %w", leaseID, err)
 		}
 
-		// ONLY THE REPORT THAT WON WRITES A SERIES, so the stored pair is always
-		// one request's.
-		if series == nil || won == 0 {
+		// ONLY THE REPORT THAT WON WRITES A SERIES OR DESTINATIONS, so what is
+		// stored beside the summary is always one request's.
+		if won == 0 {
+			return nil
+		}
+		if err := recordDestinations(ctx, q, lease.ID, usage.Destinations); err != nil {
+			return err
+		}
+		if series == nil {
 			return nil
 		}
 		if err := q.RecordJobSeries(ctx, ledgerdb.RecordJobSeriesParams{
@@ -122,6 +132,15 @@ func (a *Allocator) LeaseUsage(ctx context.Context, leaseID string) (RecordedUsa
 			Counters: countersOf(row.Cycles, row.Instructions, row.CacheReferences, row.CacheMisses,
 				row.BranchMisses, row.FrontendStallCycles),
 		}}
+		// NOT TOTALLED IS NO DESTINATIONS, never an empty set of them.
+		if !row.DestinationsIncomplete.Valid {
+			return nil
+		}
+		dests, err := readDestinations(ctx, q, leaseID, row)
+		if err != nil {
+			return err
+		}
+		out.Destinations = dests
 		return nil
 	})
 	return out, err

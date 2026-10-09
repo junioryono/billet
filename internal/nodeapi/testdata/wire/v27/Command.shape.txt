@@ -1,0 +1,133 @@
+Command.id string
+Command.kind string
+Command.lease tag omitempty
+Command.lease pointer
+Command.lease.ID string
+Command.lease.Tier string
+Command.lease.Node string
+Command.lease.TargetNode string
+Command.lease.MacOSSlot bool
+Command.lease.GuestOS string
+Command.lease.Provider string
+Command.lease.Providers slice
+Command.lease.Providers[] string
+Command.lease.Phase string
+Command.lease.VCPU int
+Command.lease.Memory int64
+Command.lease.RequestedVCPU int
+Command.lease.RequestedMemory int64
+Command.lease.InstanceType string
+Command.lease.Site string
+Command.lease.PriceUSDPerHour int64
+Command.lease.ImageCache string
+Command.lease.CacheGeneration string
+Command.lease.ActionsCache string
+Command.lease.sticky_cache tag omitempty
+Command.lease.sticky_cache string
+Command.lease.git_cache tag omitempty
+Command.lease.git_cache string
+Command.lease.bazel_cache tag omitempty
+Command.lease.bazel_cache string
+Command.lease.go_cache tag omitempty
+Command.lease.go_cache string
+Command.lease.PreferenceRank int
+Command.lease.HeldSince string
+Command.lease.HolderIncarnation string
+Command.lease.ForceRelease bool
+Command.lease.FailureReason string
+Command.lease.Disruption string
+Command.lease.DisruptedAt string
+Command.lease.Epoch int64
+Command.lease.RunID int64
+Command.lease.RequestID int64
+Command.job tag omitempty
+Command.job pointer
+Command.job.request_id int64
+Command.job.run_id int64
+Command.job.event string
+Command.job.owner string
+Command.job.repository string
+Command.job.workflow_ref string
+Command.job.job_id tag omitempty
+Command.job.job_id string
+Command.tier tag omitempty
+Command.tier pointer
+Command.tier.label string
+Command.tier.image string
+Command.tier.trust string
+Command.tier.command tag omitempty
+Command.tier.command slice
+Command.tier.command[] string
+Command.tier.disk tag omitempty
+Command.tier.disk int64
+Command.tier.shm tag omitempty
+Command.tier.shm int64
+Command.tier.runner_group tag omitempty
+Command.tier.runner_group string
+Command.tier.workflows tag omitempty
+Command.tier.workflows slice
+Command.tier.workflows[] string
+Command.tier.buildkit_cache_mount_limit int64
+Command.tier.intercept tag omitempty
+Command.tier.intercept bool
+Command.tier.cache_scope tag omitempty
+Command.tier.cache_scope pointer
+Command.tier.cache_scope.Owner string
+Command.tier.cache_scope.Repository string
+Command.tier.cache_scope.WorkflowRef string
+Command.tier.cache tag omitempty
+Command.tier.cache pointer
+Command.tier.cache.publish string
+Command.tier.cache.owner tag omitempty
+Command.tier.cache.owner string
+Command.tier.cache.repository tag omitempty
+Command.tier.cache.repository string
+Command.tier.cache.docker.enabled bool
+Command.tier.cache.docker.max_size tag omitempty
+Command.tier.cache.docker.max_size int64
+Command.tier.cache.sticky_disks.enabled bool
+Command.tier.cache.sticky_disks.max_size tag omitempty
+Command.tier.cache.sticky_disks.max_size int64
+Command.tier.cache.actions.enabled bool
+Command.tier.cache.actions.max_size tag omitempty
+Command.tier.cache.actions.max_size int64
+Command.tier.cache.git.enabled bool
+Command.tier.cache.git.max_size tag omitempty
+Command.tier.cache.git.max_size int64
+Command.tier.cache.bazel.enabled bool
+Command.tier.cache.bazel.max_size tag omitempty
+Command.tier.cache.bazel.max_size int64
+Command.tier.cache.go.enabled bool
+Command.tier.cache.go.max_size tag omitempty
+Command.tier.cache.go.max_size int64
+Command.tier.cache.go_test_results tag omitempty
+Command.tier.cache.go_test_results bool
+Command.barrier_id tag omitempty
+Command.barrier_id string
+Command.request_id tag omitempty
+Command.request_id int64
+Command.job_result tag omitempty
+Command.job_result string
+Command.cache_authority tag omitempty
+Command.cache_authority pointer
+Command.cache_authority.lease_id string
+Command.cache_authority.job_id string
+Command.cache_authority.run_id int64
+Command.cache_authority.owner string
+Command.cache_authority.repository string
+Command.cache_authority.event string
+Command.cache_authority.ref tag omitempty
+Command.cache_authority.ref string
+Command.cache_authority.base_ref tag omitempty
+Command.cache_authority.base_ref string
+Command.cache_authority.default_ref tag omitempty
+Command.cache_authority.default_ref string
+Command.cache_authority.proven bool
+Command.cache_authority.write_own_ref bool
+Command.cache_authority.publish_default bool
+Command.upgrade tag omitempty
+Command.upgrade pointer
+Command.upgrade.version string
+Command.upgrade.manifest_sha256 string
+Command.upgrade.rollout_id string
+Command.upgrade.generation int64

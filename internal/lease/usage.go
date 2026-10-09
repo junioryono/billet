@@ -107,6 +107,12 @@ type JobUsage struct {
 	// do; nil when the host counted nothing (node.monitoring.perf off, a backend
 	// with no vCPU threads, or a plane below the wire that carries them).
 	Counters *JobCounters `json:"counters,omitempty"`
+
+	// Destinations is the job's traffic by destination; nil when the host did
+	// not total it (node.monitoring.flows off, a backend other than firecracker,
+	// a job whose flows could not be followed, or a plane below the wire that
+	// carries them), which is not a job that sent nothing.
+	Destinations *JobDestinations `json:"destinations,omitempty"`
 }
 
 // JobCounters is what the CPU's hardware counters saw a job's vCPU threads do,
@@ -235,7 +241,17 @@ func (u JobUsage) Validate() error {
 		return fmt.Errorf("alloc: energy source %q is not one this control plane records", u.EnergySource)
 	}
 	if u.Counters != nil {
-		return u.Counters.Validate()
+		if err := u.Counters.Validate(); err != nil {
+			return err
+		}
+	}
+	if u.Destinations != nil {
+		if err := u.Destinations.Validate(); err != nil {
+			return err
+		}
+		if u.Destinations.Tap != nil && !u.Measured(UsageNet) {
+			return errTapWithoutNet
+		}
 	}
 
 	return nil

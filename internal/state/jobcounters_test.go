@@ -16,6 +16,13 @@ func TestAUsageRowWrittenAtVersion57ReadsBackUncounted(t *testing.T) {
 	}
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			// MIGRATION 59 FIRST, which builds on this table: a ledger at 57 has
+			// neither.
+			`DROP TABLE job_destinations`,
+			`ALTER TABLE job_usage DROP COLUMN destinations_incomplete`,
+			`ALTER TABLE job_usage DROP COLUMN tap_sent_bytes`,
+			`ALTER TABLE job_usage DROP COLUMN tap_received_bytes`,
+			`DELETE FROM schema_migrations WHERE version = 59`,
 			`ALTER TABLE job_usage DROP COLUMN cycles`,
 			`ALTER TABLE job_usage DROP COLUMN instructions`,
 			`ALTER TABLE job_usage DROP COLUMN cache_references`,

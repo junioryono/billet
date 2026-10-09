@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -24,6 +25,10 @@ type recordingFlows struct {
 	finalAt   time.Time
 	until     time.Time
 	forgotten []string
+	// result is what Final answers, and unmeasured makes it answer that the
+	// job's flows were not totalled.
+	result     flows.Result
+	unmeasured bool
 }
 
 func newRecordingFlows() *recordingFlows {
@@ -44,7 +49,11 @@ func (f *recordingFlows) Final(_ context.Context, key string, until time.Time) (
 	f.finals = append(f.finals, key)
 	f.finalAt, f.until = time.Now(), until
 
-	return flows.Result{}, true, nil
+	if f.unmeasured {
+		return flows.Result{}, false, errors.New("never followed")
+	}
+
+	return f.result, true, nil
 }
 
 func (f *recordingFlows) Forget(key string) {
