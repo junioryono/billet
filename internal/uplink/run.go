@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -76,32 +75,24 @@ func Run(ctx context.Context, opts Options) error {
 
 	ctl := &Controller{Params: opts.Params, Up: NewDirection(speed), Down: NewDirection(speed)}
 
-	// WHAT AN EARLIER RUN LEFT IS BILLET'S ONLY IF ITS RECORD SAYS SO, and this
-	// run's record is written only once the interface is known to carry nothing
-	// of anybody else's: a record written first would make an operator's CAKE
-	// look like billet's to the cleanup after a refusal.
-	//
-	// A RECORD NAMING ANOTHER INTERFACE IS CLEARED FIRST: the default route moved
-	// since that run, and overwriting its record would strand its shaping where
-	// no cleanup could find it.
-	if prior := RecordedInterface(); prior != "" && prior != iface {
-		if err := (&Shaper{Iface: prior, Owned: true}).Clear(ctx); err != nil {
-			return fmt.Errorf("clear the shaping an earlier run left on %s before shaping %s: %w", prior, iface, err)
-		}
-
-		if err := Forget(prior); err != nil {
-			return err
-		}
+	// WHAT AN EARLIER RUN LEFT IS CLEARED FIRST, wherever its record says it is
+	// now, so every run starts from an interface carrying nothing of billet's: a
+	// crash's leftovers, and those on an interface the default route has since
+	// left, which overwriting the record would strand.
+	if err := clearRecorded(ctx, nil); err != nil {
+		return fmt.Errorf("clear what an earlier run left before shaping %s: %w", iface, err)
 	}
 
-	shaper := &Shaper{Iface: iface, Owned: RecordedInterface() == iface}
+	// THIS RUN'S RECORD IS WRITTEN ONLY ONCE THE INTERFACE IS KNOWN TO CARRY
+	// NOTHING OF ANYBODY ELSE'S: a record written first would make an operator's
+	// CAKE look like billet's to the cleanup after a refusal. And BEFORE
+	// anything is installed, so the cleanup after a crash finds it.
+	shaper := &Shaper{Iface: iface}
 	if err := shaper.Check(ctx); err != nil {
 		return fmt.Errorf("shape %s: %w", iface, err)
 	}
 
-	// RECORDED BEFORE ANYTHING IS INSTALLED, so the cleanup after a crash clears
-	// this interface even if the default route has moved since.
-	if err := recordInterface(iface); err != nil {
+	if err := writeRecord(Record{Iface: iface, Index: ifindex(iface), IFB: shaper.IFB()}); err != nil {
 		return err
 	}
 
@@ -115,49 +106,10 @@ func Run(ctx context.Context, opts Options) error {
 
 	err = loop(ctx, opts.Log, iface, pinger, ctl, shaper)
 
-	// REMOVED ON EVERY WAY OUT, and a removal that failed is an error: the unit's
-	// ExecStopPost tries again from the recorded interface.
-	if clearErr := shaper.Clear(context.WithoutCancel(ctx)); clearErr != nil {
-		return errors.Join(err, fmt.Errorf("remove the shaping from %s: %w", iface, clearErr))
-	}
-
-	return errors.Join(err, Forget(iface))
-}
-
-// StateFile records which interface a running shaper shapes. It lives under
-// the unit's RuntimeDirectory, which a reboot empties along with everything the
-// shaper installed.
-var StateFile = "/run/billet-uplink/interface"
-
-// recordInterface publishes the record. One already naming the interface is
-// left alone, and a new one replaces the old by rename: truncating the only
-// proof that what is on an interface is billet's, and failing before writing
-// it again, would leave shaping no cleanup could claim.
-func recordInterface(iface string) error {
-	if RecordedInterface() == iface {
-		return nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(StateFile), 0o755); err != nil {
-		return fmt.Errorf("record the shaped interface: %w", err)
-	}
-
-	next := StateFile + ".next"
-
-	// THE INDEX BESIDE THE NAME, so a cleanup still finds an interface that was
-	// renamed after it was shaped.
-	line := strings.TrimSpace(iface + " " + ifindex(iface))
-
-	//nolint:gosec // G306: an interface name for root's own cleanup, which any user may read
-	if err := os.WriteFile(next, []byte(line+"\n"), 0o644); err != nil {
-		return fmt.Errorf("record the shaped interface: %w", err)
-	}
-
-	if err := os.Rename(next, StateFile); err != nil {
-		return fmt.Errorf("record the shaped interface: %w", err)
-	}
-
-	return nil
+	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
+	// ran is still cleared; a removal that failed is an error, and the unit's
+	// ExecStopPost tries again.
+	return errors.Join(err, clearRecorded(context.WithoutCancel(ctx), nil))
 }
 
 // Lock takes the one claim on this host's shaping, held by a shaper for its
@@ -184,48 +136,6 @@ func Lock() (release func(), err error) {
 	}
 
 	return func() { f.Close() }, nil //nolint:errcheck // closing releases the lock; nothing is left to say
-}
-
-// RecordedInterface is the interface the last shaper recorded, or empty.
-//
-// The name as it is now: one that no longer exists is looked up by the index
-// recorded beside it, and one found nowhere is returned as recorded, which is an
-// interface gone along with every qdisc it carried.
-func RecordedInterface() string {
-	body, err := os.ReadFile(StateFile)
-	if err != nil {
-		return ""
-	}
-
-	fields := strings.Fields(string(body))
-	if len(fields) == 0 {
-		return ""
-	}
-
-	name := fields[0]
-	if _, err := os.Stat(filepath.Join(sysNet, name)); err == nil || len(fields) < 2 {
-		return name
-	}
-
-	if renamed := nameForIndex(fields[1]); renamed != "" {
-		return renamed
-	}
-
-	return name
-}
-
-// Forget removes the record once its interface is clear, and only a record of
-// that interface: forgetting another would strand that one's shaping.
-func Forget(iface string) error {
-	if RecordedInterface() != iface {
-		return nil
-	}
-
-	if err := os.Remove(StateFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("forget the shaped interface: %w", err)
-	}
-
-	return nil
 }
 
 func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, ctl *Controller, shaper *Shaper) error {

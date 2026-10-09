@@ -24,6 +24,10 @@ type Shaper struct {
 	// Owned is whether billet's record names this interface, so the CAKE, the
 	// ingress qdisc and the device on it are billet's to replace and remove.
 	Owned bool
+	// IFBName is the ingress device's name when the record says what it was;
+	// empty derives it from Iface. An interface renamed since keeps the device
+	// it was given under its old name.
+	IFBName string
 	// Run runs one command and returns its combined output; nil runs it. A test
 	// records instead.
 	Run func(ctx context.Context, argv ...string) (string, error)
@@ -35,6 +39,10 @@ var tools = []string{"tc", "ip", "modprobe"}
 // IFB is the ingress device's name: "ifb-" and at most eleven characters of the
 // interface, inside Linux's fifteen.
 func (s *Shaper) IFB() string {
+	if s.IFBName != "" {
+		return s.IFBName
+	}
+
 	name := s.Iface
 	if len(name) > 11 {
 		name = name[:11]
@@ -249,6 +257,23 @@ func (s *Shaper) Clear(ctx context.Context) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// clearDevice removes the ingress device alone, for an interface that is gone
+// along with its qdiscs and the redirect that pointed at the device.
+func (s *Shaper) clearDevice(ctx context.Context) error {
+	out, err := s.run(ctx, "ip", "-o", "link", "show", "dev", s.IFB())
+	if err != nil {
+		if strings.Contains(out, "does not exist") {
+			return nil
+		}
+
+		return err
+	}
+
+	_, err = s.run(ctx, "ip", "link", "del", s.IFB())
+
+	return err
 }
 
 // cake is the qdisc's arguments at a rate. The rate is in kbit so a cut below

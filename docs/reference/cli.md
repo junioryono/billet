@@ -276,9 +276,9 @@ Keep this host's own traffic, its guests' included, from filling the queue of th
 
 Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's. Only qdiscs the kernel assigned (handle `0:`) may be replaced; CAKE, an ingress qdisc and an `ifb-` device count as billet's only when the record a run of the shaper keeps under `/run/billet-uplink/` names the interface, and a `clsact` qdisc never does. The shaper refuses anything else rather than replace it. The host role enables `billet-uplink.service` only where this passes.
 
-### `billet uplink clear [--interface NAME]`
+### `billet uplink clear`
 
-Remove what a `billet uplink shape` left on the interface, and only that: by default the interface the last run recorded under `/run/billet-uplink/`, so a crash is cleared even after the default route moved. Nothing is removed from an interface the record does not name, whichever `--interface` says. It exits non-zero when a removal failed.
+Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` installed, and only that. The record names the interface by its kernel index as well as its name, so the shaping is found on an interface renamed since, a device that has taken the old name is left alone, and an interface that is gone leaves only its IFB device to remove. With no record it removes nothing, because nothing else proves what is on an interface is billet's. It refuses while a shaper runs, and exits non-zero when a removal failed. The unit runs it as `ExecStopPost`, so a crash is cleared too.
 
 ## Removal
 

@@ -75,12 +75,26 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	name, err := pickInterface(*iface, "")
-	if err != nil {
-		return err
+	name := *iface
+	if name == "" {
+		found, err := uplink.DefaultInterface()
+		if err != nil {
+			return err
+		}
+
+		name = found
 	}
 
-	if err := (&uplink.Shaper{Iface: name, Owned: uplink.RecordedInterface() == name}).Check(ctx); err != nil {
+	// WHAT A RUNNING SHAPER INSTALLED IS ITS OWN AND PASSES, which is the state a
+	// converge finds; the record decides that, by the interface's index.
+	shaper := &uplink.Shaper{Iface: name}
+	if r, ok := uplink.ReadRecord(); ok {
+		if current, gone := r.Resolve(); !gone && current == name && r.IFB == shaper.IFB() {
+			shaper.Owned = true
+		}
+	}
+
+	if err := shaper.Check(ctx); err != nil {
 		return err
 	}
 
@@ -91,8 +105,6 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 
 func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet uplink clear", env.Stdout)
-	iface := fs.String("interface", "", "the interface to clear; empty clears the one the last run recorded, "+
-		"or else the default route's")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -110,36 +122,21 @@ func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 	}
 	defer release()
 
-	// THE RECORDED INTERFACE FIRST: after a crash the default route may have
-	// moved, and the shaping is on the interface the shaper chose.
-	name, err := pickInterface(*iface, uplink.RecordedInterface())
+	// BY THE RECORD AND NOTHING ELSE: wherever the recorded interface is now, and
+	// nothing at all without a record, because nothing else proves what is on an
+	// interface is billet's.
+	r, err := uplink.ClearRecorded(ctx)
 	if err != nil {
 		return err
 	}
 
-	// BILLET'S ONLY BY ITS RECORD, whichever interface is named: without it the
-	// cleanup touches nothing, because nothing proves what is there is billet's.
-	owned := uplink.RecordedInterface() == name
-	if err := (&uplink.Shaper{Iface: name, Owned: owned}).Clear(ctx); err != nil {
-		return fmt.Errorf("remove the shaping from %s: %w", name, err)
+	if r.Iface == "" {
+		fmt.Fprintln(env.Stdout, "billet uplink: no record of shaping on this host; nothing to clear")
+
+		return nil
 	}
 
-	if err := uplink.Forget(name); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(env.Stdout, "billet uplink: no shaping of billet's on %s\n", name)
+	fmt.Fprintf(env.Stdout, "billet uplink: cleared what was recorded on %s\n", r.Iface)
 
 	return nil
-}
-
-func pickInterface(named, recorded string) (string, error) {
-	switch {
-	case named != "":
-		return named, nil
-	case recorded != "":
-		return recorded, nil
-	}
-
-	return uplink.DefaultInterface()
 }
