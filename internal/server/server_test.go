@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -96,103 +97,115 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 // splitting a budget with a tier that will never take work, and the operator
 // sees a half-configured control plane reported as healthy.
 func TestNoListenerStartsUntilEveryScaleSetExists(t *testing.T) {
-	tiers := []config.Tier{
-		tier("billet-4vcpu-a"),
-		tier("billet-4vcpu-b"),
-		tier("billet-4vcpu-c"),
-	}
+	// IN A BUBBLE, so a listener started early has polled before the next
+	// reconciliation ends, whatever the machine's load: fake time moves past
+	// each slow ensure only once every goroutine, an early listener's included,
+	// is waiting. Its session long-polls, as GitHub's does, so a listener that
+	// has polled waits rather than keeping the bubble busy.
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{
+			tier("billet-4vcpu-a"),
+			tier("billet-4vcpu-b"),
+			tier("billet-4vcpu-c"),
+		}
 
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
 
-	var (
-		mu         sync.Mutex
-		reconciled int
-		polled     bool
-		early      bool
-	)
+		var (
+			mu         sync.Mutex
+			reconciled int
+			polled     bool
+			early      bool
+		)
 
-	prov := &fakeProvisioner{
-		onEnsure: func(string) error {
-			// SLOW on purpose. With an instant fake the whole reconcile loop
-			// finishes before the Go scheduler runs any listener goroutine, so a
-			// build that starts listeners early is never observed doing it — the
-			// test passes and discriminates nothing. Mutation testing is what
-			// surfaced that; the test looked fine.
-			time.Sleep(40 * time.Millisecond)
+		prov := &fakeProvisioner{
+			onEnsure: func(string) error {
+				// SLOW on purpose. With an instant fake the whole reconcile loop
+				// finishes before the Go scheduler runs any listener goroutine, so a
+				// build that starts listeners early is never observed doing it — the
+				// test passes and discriminates nothing. Mutation testing is what
+				// surfaced that; the test looked fine.
+				time.Sleep(40 * time.Millisecond)
 
-			mu.Lock()
-			defer mu.Unlock()
-
-			reconciled++
-
-			return nil
-		},
-		newSession: func(string) Session {
-			return &fakeSession{onPoll: func(int) {
 				mu.Lock()
+				defer mu.Unlock()
 
-				if reconciled < len(tiers) {
-					early = true
-				}
+				reconciled++
 
-				polled = true
+				return nil
+			},
+			newSession: func(string) Session {
+				return &fakeSession{longPoll: time.Minute, onPoll: func(int) {
+					mu.Lock()
 
-				mu.Unlock()
-			}}
-		},
-	}
+					if reconciled < len(tiers) {
+						early = true
+					}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+					polled = true
 
-	// CANCELLED ON THE CONDITION, NOT ON A CLOCK, and that is what makes this test
-	// deterministic rather than usually-true.
-	//
-	// It used to sleep 200ms and then cancel. Reconciliation deliberately takes
-	// 40ms per tier — three tiers, 120ms — so a listener had roughly 80ms to be
-	// scheduled and poll once. Under the full suite with -race and
-	// -covermode=atomic on a loaded machine that margin disappears, `polled` stays
-	// false, and the test fails with "no listener ever polled; this test proves
-	// nothing" — a red that names the test's own guard rather than anything about
-	// the code. Observed on CI; it is the transient that had been appearing
-	// unattributed.
-	//
-	// Waiting for the poll instead keeps every property: `early` is still recorded
-	// by onPoll the moment it happens, and the deadline below is a WATCHDOG on a
-	// stall rather than a budget for the work, so a genuine failure to poll still
-	// fails — just later.
-	go func() {
+					mu.Unlock()
+				}}
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 		defer cancel()
 
-		deadline := time.Now().Add(20 * time.Second)
+		// CANCELLED ON THE CONDITION, NOT ON A CLOCK, and that is what makes this test
+		// deterministic rather than usually-true.
+		//
+		// It used to sleep 200ms and then cancel. Reconciliation deliberately takes
+		// 40ms per tier — three tiers, 120ms — so a listener had roughly 80ms to be
+		// scheduled and poll once. Under the full suite with -race and
+		// -covermode=atomic on a loaded machine that margin disappears, `polled` stays
+		// false, and the test fails with "no listener ever polled; this test proves
+		// nothing" — a red that names the test's own guard rather than anything about
+		// the code. Observed on CI; it is the transient that had been appearing
+		// unattributed.
+		//
+		// Waiting for the poll instead keeps every property: `early` is still recorded
+		// by onPoll the moment it happens, and the deadline below is a WATCHDOG on a
+		// stall rather than a budget for the work, so a genuine failure to poll still
+		// fails — just later.
+		go func() {
+			defer cancel()
 
-		for {
-			mu.Lock()
-			done := polled
-			mu.Unlock()
+			deadline := time.Now().Add(20 * time.Second)
 
-			if done || time.Now().After(deadline) {
-				return
+			for {
+				mu.Lock()
+				done := polled
+				mu.Unlock()
+
+				if done || time.Now().After(deadline) {
+					return
+				}
+
+				time.Sleep(time.Millisecond)
 			}
+		}()
 
-			time.Sleep(time.Millisecond)
+		runErr := New(a, prov, tiers, "test-owner", nil).Run(ctx)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if !polled {
+			t.Fatal("no listener ever polled; this test proves nothing")
 		}
-	}()
 
-	if err := New(a, prov, tiers, "test-owner", nil).Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
+		// BEFORE Run's own error: a listener started early ends the run before
+		// the reconciliation does, and that error would otherwise be all this
+		// test said about it.
+		if early {
+			t.Error("a listener polled before every tier's scale set had been reconciled")
+		}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	if !polled {
-		t.Fatal("no listener ever polled; this test proves nothing")
-	}
-
-	if early {
-		t.Error("a listener polled before every tier's scale set had been reconciled")
-	}
+		if runErr != nil {
+			t.Errorf("Run: %v", runErr)
+		}
+	})
 }
 
 func TestTrustedTierRefusesRunnerGroupPolicyDriftBeforeReconciliation(t *testing.T) {
@@ -214,44 +227,54 @@ func TestTrustedTierRefusesRunnerGroupPolicyDriftBeforeReconciliation(t *testing
 
 // A tier that cannot be reconciled stops the whole start-up, and says which one.
 func TestReconciliationFailureStopsStartup(t *testing.T) {
-	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
+	// IN A BUBBLE, so "no listener polled" is judged once every goroutine has
+	// had its turn rather than after a guessed interval.
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
 
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
 
-	var polled atomic.Bool
+		var polled atomic.Bool
 
-	prov := &fakeProvisioner{
-		onEnsure: func(label string) error {
-			// Same reason as above: the failing tier must come far enough after the
-			// first that a listener started early has a chance to poll.
-			time.Sleep(40 * time.Millisecond)
+		prov := &fakeProvisioner{
+			onEnsure: func(label string) error {
+				// Same reason as above: the failing tier must come far enough after the
+				// first that a listener started early has a chance to poll.
+				time.Sleep(40 * time.Millisecond)
 
-			if label == "billet-4vcpu-b" {
-				return errors.New("github said no")
-			}
+				if label == "billet-4vcpu-b" {
+					return errors.New("github said no")
+				}
 
-			return nil
-		},
-		newSession: func(string) Session {
-			return &fakeSession{onPoll: func(int) { polled.Store(true) }}
-		},
-	}
+				return nil
+			},
+			newSession: func(string) Session {
+				return &fakeSession{longPoll: time.Minute, onPoll: func(int) { polled.Store(true) }}
+			},
+		}
 
-	err := New(a, prov, tiers, "test-owner", nil).Run(t.Context())
-	if err == nil {
-		t.Fatal("Run succeeded with a tier that could not be reconciled")
-	}
+		// BOUNDED IN FAKE TIME, so a listener wrongly started before the failure
+		// cannot hold Run open forever: it is stopped an hour in, and judged.
+		ctx, cancel := context.WithTimeout(t.Context(), time.Hour)
+		defer cancel()
 
-	// Give any wrongly-started listener time to poll before concluding none did.
-	time.Sleep(50 * time.Millisecond)
+		err := New(a, prov, tiers, "test-owner", nil).Run(ctx)
+		if err == nil {
+			t.Fatal("Run succeeded with a tier that could not be reconciled")
+		}
 
-	if !strings.Contains(err.Error(), "billet-4vcpu-b") {
-		t.Errorf("the error does not name the tier that failed: %v", err)
-	}
+		// Every wrongly-started listener has had its turn before concluding none
+		// polled.
+		synctest.Wait()
 
-	if polled.Load() {
-		t.Error("a listener started despite a tier failing to reconcile")
-	}
+		if !strings.Contains(err.Error(), "billet-4vcpu-b") {
+			t.Errorf("the error does not name the tier that failed: %v", err)
+		}
+
+		if polled.Load() {
+			t.Error("a listener started despite a tier failing to reconcile")
+		}
+	})
 }
 
 // The reaper must never reclaim capacity a live listener is still advertising.
@@ -270,164 +293,167 @@ func TestReconciliationFailureStopsStartup(t *testing.T) {
 // jobs, the pool launches two runners, and the ledger has to go on holding both
 // for as long as the listener renews them.
 func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	synctest.Test(t, func(t *testing.T) {
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	// THE RATIOS ARE THE TEST; THE ABSOLUTE VALUES ARE SLACK. What has to hold is
-	// that a poll cadence outruns the TTL (so a listener that did not heartbeat
-	// would lose its escrow) while the heartbeat, at TTL/3, comfortably keeps it.
-	// Everything below is scaled together from this one number.
-	//
-	// 150ms WAS THE VALUE A SIBLING IN THIS FILE ALREADY RAISED FOR A MEASURED
-	// FLAKE. TestEscrowSurvivesAPollLongerThanTheLeaseTTL records that at 150ms
-	// the heartbeat fired every 50ms and failed twice under full `-race` runs;
-	// this test was not part of that fix and kept the number. A scheduler stall
-	// longer than one TTL expires the lease, the reaper takes it, and an
-	// advertisement drops to zero — which reads as the double-admission bug this
-	// test exists to catch, from a machine that was merely busy.
-	const leaseTTL = 600 * time.Millisecond
-
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(leaseTTL))
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-
-	// wantPolls recorded means seven gaps of 8/15 of the TTL, about 3.7 TTLs: a
-	// listener that did not heartbeat would lose its escrow more than once.
-	const wantPolls = 8
-
-	var (
-		mu         sync.Mutex
-		advertised []int
-		// backed is the vCPU the LEDGER still holds at the instant of each
-		// advertisement, and usageErr is the first failure to read it.
+		// THE RATIOS ARE THE TEST. What has to hold is that a poll cadence outruns
+		// the TTL (so a listener that did not heartbeat would lose its escrow) while
+		// the heartbeat, at TTL/3, keeps it. Everything below is scaled together
+		// from this one number.
 		//
-		// WITHOUT THIS THE TEST COULD NOT SEE ITS OWN SUBJECT. Every assertion it
-		// made was about the number the listener ADVERTISED, and a listener whose
-		// escrow has been reaped out from under it does not know: its in-memory
-		// escrow still says it holds N, so it goes on advertising N — under
-		// budget, never zero, and completely unbacked. MEASURED by mutation:
-		// making heartbeatPass a no-op, so nothing renews and the reaper takes
-		// every lease, left every assertion below green. The one thing that
-		// separates "still escrowed" from "reclaimed while still advertised" is
-		// the ledger, and nothing was asking it.
-		backed   []int
-		usageErr error
-	)
+		// IN A BUBBLE, because on the wall clock the absolute values were slack the
+		// machine could spend: at 150ms, and again at 600ms, a scheduler stall
+		// longer than one TTL expired the lease, the reaper took it, and an
+		// advertisement dropped to zero, which reads as the double-admission bug this
+		// test exists to catch from a machine that was merely busy (#188). In fake
+		// time the listener, the reaper and the allocator share one clock that moves
+		// only when all of them are waiting, so the TTL is a realistic one.
+		const leaseTTL = 30 * time.Second
 
-	prov := &fakeProvisioner{
-		newSession: func(string) Session {
-			return &fakeSession{stats: &Statistics{TotalAssignedJobs: 2}, onPoll: func(capacity int) {
-				// READ AT THE INSTANT OF THE ADVERTISEMENT, inside the poll, so the
-				// two describe one moment. Read afterwards it would describe a
-				// listener that has already released everything on the way out.
-				//
-				// ON THE TEST'S CONTEXT, NOT THE RUN'S. The goroutine below cancels
-				// ctx to end the run, and a poll landing at that instant read with
-				// a cancelled context and failed the test on "context canceled"
-				// (CI run 37196761416, 2026-10-04): a fact about the shutdown, not
-				// the ledger.
-				u, err := a.Usage(t.Context())
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(leaseTTL))
 
-				mu.Lock()
-				advertised = append(advertised, capacity)
-				backed = append(backed, u.VCPU)
+		// A hang guard in fake time, far beyond the eight polls the run ends on.
+		ctx, cancel := context.WithTimeout(t.Context(), time.Hour)
+		defer cancel()
 
-				// THE RUN ENDS ON A COUNT OF POLLS, NOT A WALL TIME: what has to be
-				// outlived is the TTL, which enough polls at this cadence are, and a
-				// loaded runner that polls slowly still gets them all (CI run
-				// 37720122315, 2026-10-08, ended a fixed 8×TTL after three).
-				if len(advertised) == wantPolls {
-					cancel()
-				}
+		// wantPolls recorded means seven gaps of 8/15 of the TTL, about 3.7 TTLs: a
+		// listener that did not heartbeat would lose its escrow more than once.
+		const wantPolls = 8
 
-				// THE ERROR IS KEPT, NOT DISCARDED. Usage returns the zero value
-				// beside its error, and a zero would otherwise read as "the ledger
-				// holds nothing" — which is the exact failure this test exists to
-				// report, manufactured out of a read that never happened.
-				if err != nil && usageErr == nil {
-					usageErr = err
-				}
+		var (
+			mu         sync.Mutex
+			advertised []int
+			// backed is the vCPU the LEDGER still holds at the instant of each
+			// advertisement, and usageErr is the first failure to read it.
+			//
+			// WITHOUT THIS THE TEST COULD NOT SEE ITS OWN SUBJECT. Every assertion it
+			// made was about the number the listener ADVERTISED, and a listener whose
+			// escrow has been reaped out from under it does not know: its in-memory
+			// escrow still says it holds N, so it goes on advertising N — under
+			// budget, never zero, and completely unbacked. MEASURED by mutation:
+			// making heartbeatPass a no-op, so nothing renews and the reaper takes
+			// every lease, left every assertion below green. The one thing that
+			// separates "still escrowed" from "reclaimed while still advertised" is
+			// the ledger, and nothing was asking it.
+			backed   []int
+			usageErr error
+		)
 
-				mu.Unlock()
+		prov := &fakeProvisioner{
+			newSession: func(string) Session {
+				return &fakeSession{stats: &Statistics{TotalAssignedJobs: 2}, onPoll: func(capacity int) {
+					// READ AT THE INSTANT OF THE ADVERTISEMENT, inside the poll, so the
+					// two describe one moment. Read afterwards it would describe a
+					// listener that has already released everything on the way out.
+					//
+					// ON THE TEST'S CONTEXT, NOT THE RUN'S. The goroutine below cancels
+					// ctx to end the run, and a poll landing at that instant read with
+					// a cancelled context and failed the test on "context canceled"
+					// (CI run 37196761416, 2026-10-04): a fact about the shutdown, not
+					// the ledger.
+					u, err := a.Usage(t.Context())
 
-				// SCALED WITH THE TTL, not a number of its own. Two poll gaps
-				// outrun one TTL, so a listener that does not heartbeat loses its
-				// escrow between polls — which is the property, and it survives
-				// the whole set being made slower.
-				time.Sleep(leaseTTL * 8 / 15)
-			}}
-		},
-	}
+					mu.Lock()
+					advertised = append(advertised, capacity)
+					backed = append(backed, u.VCPU)
 
-	// The reaper must actually FIRE inside this test, or it proves nothing about
-	// the interaction it is named for.
-	var reaps atomic.Int32
+					// THE RUN ENDS ON A COUNT OF POLLS, NOT A WALL TIME: what has to be
+					// outlived is the TTL, which enough polls at this cadence are, and a
+					// loaded runner that polls slowly still gets them all (CI run
+					// 37720122315, 2026-10-08, ended a fixed 8×TTL after three).
+					if len(advertised) == wantPolls {
+						cancel()
+					}
 
-	observeReaps := ControlPlaneOption(func(s *Server) {
-		s.onReap = func(int) { reaps.Add(1) }
+					// THE ERROR IS KEPT, NOT DISCARDED. Usage returns the zero value
+					// beside its error, and a zero would otherwise read as "the ledger
+					// holds nothing" — which is the exact failure this test exists to
+					// report, manufactured out of a read that never happened.
+					if err != nil && usageErr == nil {
+						usageErr = err
+					}
+
+					mu.Unlock()
+
+					// SCALED WITH THE TTL, not a number of its own. Two poll gaps
+					// outrun one TTL, so a listener that does not heartbeat loses its
+					// escrow between polls — which is the property, and it survives
+					// the whole set being made slower.
+					time.Sleep(leaseTTL * 8 / 15)
+				}}
+			},
+		}
+
+		// The reaper must actually FIRE inside this test, or it proves nothing about
+		// the interaction it is named for.
+		var reaps atomic.Int32
+
+		observeReaps := ControlPlaneOption(func(s *Server) {
+			s.onReap = func(int) { reaps.Add(1) }
+		})
+
+		// A SECOND SIGNAL ALREADY GIVEN, so the shutdown does not wait on the two
+		// runners, which these fakes never finish.
+		hurry := make(chan struct{})
+		close(hurry)
+
+		srv := New(a, prov, tiers, "test-owner", nil,
+			WithReapInterval(leaseTTL/5), observeReaps, WithNodeRunner(&fakeRunner{}),
+			WithHurry(hurry))
+		if err := srv.Run(ctx); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		// Deleting the periodic reaper entirely used to pass every assertion below —
+		// nothing reclaims, so nothing is over-advertised. A test named for what the
+		// reaper must not do has to first establish that a reaper ran.
+		if reaps.Load() == 0 {
+			t.Fatal("the reaper never ran; this proves nothing about what it does or does not reclaim")
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if len(advertised) < wantPolls {
+			t.Fatalf("only %d polls; not enough to outlive the TTL and prove anything", len(advertised))
+		}
+
+		// Every advertisement after the first must still be backed. A listener whose
+		// escrow was reaped re-escrows and the number climbs above what the budget
+		// allows, or collapses to zero because the capacity went elsewhere.
+		for i, capacity := range advertised {
+			if capacity*tierVCPU > 8 {
+				t.Errorf("poll %d advertised %d runners (%d vCPU) against an 8 vCPU budget",
+					i, capacity, capacity*tierVCPU)
+			}
+		}
+
+		// And the steady state is nonzero: a tier advertises its ceiling whatever it
+		// holds, so this listener keeps advertising rather than flapping to nothing.
+		if advertised[len(advertised)-1] == 0 {
+			t.Errorf("the listener ended up advertising nothing: %v", advertised)
+		}
+
+		if usageErr != nil {
+			t.Fatalf("the ledger could not be read while the listener was advertising, so "+
+				"nothing below is evidence about what backed those numbers: %v", usageErr)
+		}
+
+		// THE ASSERTION THIS TEST IS NAMED FOR. Everything above is about the number
+		// the listener said; this is about whether the ledger still stood behind it.
+		// A reaper that reclaims a live listener's escrow shows up here and nowhere
+		// else: the listener goes on advertising from an in-memory escrow it does not
+		// know it has lost, while the vCPU charged in the ledger falls to zero.
+		for i := range advertised {
+			if advertised[i] > 0 && backed[i] < advertised[i]*tierVCPU {
+				t.Errorf("poll %d advertised %d runners (%d vCPU) while the ledger held only "+
+					"%d vCPU, so the reaper took capacity this listener was still offering "+
+					"GitHub: advertised=%v backed=%v",
+					i, advertised[i], advertised[i]*tierVCPU, backed[i], advertised, backed)
+			}
+		}
 	})
-
-	// A SECOND SIGNAL ALREADY GIVEN, so the shutdown does not wait on the two
-	// runners, which these fakes never finish.
-	hurry := make(chan struct{})
-	close(hurry)
-
-	srv := New(a, prov, tiers, "test-owner", nil,
-		WithReapInterval(leaseTTL/5), observeReaps, WithNodeRunner(&fakeRunner{}),
-		WithHurry(hurry))
-	if err := srv.Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-
-	// Deleting the periodic reaper entirely used to pass every assertion below —
-	// nothing reclaims, so nothing is over-advertised. A test named for what the
-	// reaper must not do has to first establish that a reaper ran.
-	if reaps.Load() == 0 {
-		t.Fatal("the reaper never ran; this proves nothing about what it does or does not reclaim")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if len(advertised) < wantPolls {
-		t.Fatalf("only %d polls; not enough to outlive the TTL and prove anything", len(advertised))
-	}
-
-	// Every advertisement after the first must still be backed. A listener whose
-	// escrow was reaped re-escrows and the number climbs above what the budget
-	// allows, or collapses to zero because the capacity went elsewhere.
-	for i, capacity := range advertised {
-		if capacity*tierVCPU > 8 {
-			t.Errorf("poll %d advertised %d runners (%d vCPU) against an 8 vCPU budget",
-				i, capacity, capacity*tierVCPU)
-		}
-	}
-
-	// And the steady state is nonzero: a tier advertises its ceiling whatever it
-	// holds, so this listener keeps advertising rather than flapping to nothing.
-	if advertised[len(advertised)-1] == 0 {
-		t.Errorf("the listener ended up advertising nothing: %v", advertised)
-	}
-
-	if usageErr != nil {
-		t.Fatalf("the ledger could not be read while the listener was advertising, so "+
-			"nothing below is evidence about what backed those numbers: %v", usageErr)
-	}
-
-	// THE ASSERTION THIS TEST IS NAMED FOR. Everything above is about the number
-	// the listener said; this is about whether the ledger still stood behind it.
-	// A reaper that reclaims a live listener's escrow shows up here and nowhere
-	// else: the listener goes on advertising from an in-memory escrow it does not
-	// know it has lost, while the vCPU charged in the ledger falls to zero.
-	for i := range advertised {
-		if advertised[i] > 0 && backed[i] < advertised[i]*tierVCPU {
-			t.Errorf("poll %d advertised %d runners (%d vCPU) while the ledger held only "+
-				"%d vCPU, so the reaper took capacity this listener was still offering "+
-				"GitHub: advertised=%v backed=%v",
-				i, advertised[i], advertised[i]*tierVCPU, backed[i], advertised, backed)
-		}
-	}
 }
 
 // The allocator remains first-come: it knows only hard resource accounting, not

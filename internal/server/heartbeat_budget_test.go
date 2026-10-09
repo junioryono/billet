@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -41,78 +42,75 @@ import (
 func TestAHeartbeatPassIsNotSpentWaitingForBilletsOwnLock(t *testing.T) {
 	t.Parallel()
 
-	// The interval is a third of this, and that interval is the budget one real
-	// SQLite renewal has to complete in after the stall — so it is sized to be
-	// generous under `-race` on a loaded machine rather than as small as the
-	// mechanism allows. A tighter TTL makes the CORRECT implementation fail here
-	// for reasons that have nothing to do with the ordering under test.
-	const ttl = 900 * time.Millisecond
+	// IN A BUBBLE, because the pass's budget is the thing under test and on the
+	// wall clock it was also the thing that failed: at a 900ms TTL the one real
+	// SQLite renewal after the stall had 300ms, and a loaded runner spent it
+	// (#188). In fake time the renewal takes no time at all, so the only way the
+	// pass runs out of budget is the ordering this test exists for.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 30 * time.Second
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
 
-	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+		lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
-	// One good pass, so there is a confirmed renewal for the staleness clock to
-	// measure from — exactly as a launched job has.
-	l.mu.Lock()
-	l.heartbeatHeld(t.Context())
-	l.mu.Unlock()
+		// One good pass, so there is a confirmed renewal for the staleness clock
+		// to measure from, exactly as a launched job has.
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		l.mu.Unlock()
 
-	// The gate IS the lock, for one pass. Reaching it proves the pass is at the
-	// lock boundary; holding it there is the stall.
-	var (
-		reached = make(chan struct{}, 1)
-		open    = make(chan struct{})
-		once    sync.Once
-	)
+		// The gate IS the lock, for one pass. Reaching it proves the pass is at
+		// the lock boundary; holding it there is the stall.
+		var (
+			reached = make(chan struct{}, 1)
+			open    = make(chan struct{})
+			once    sync.Once
+		)
 
-	l.heartbeatLock = func() {
-		once.Do(func() {
-			reached <- struct{}{}
-			<-open
+		l.heartbeatLock = func() {
+			once.Do(func() {
+				reached <- struct{}{}
+				<-open
+			})
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+
+		var loop sync.WaitGroup
+
+		loop.Go(func() { l.heartbeatLoop(ctx) })
+
+		// A goroutine outliving its test is on this project's own list of ways
+		// a test lies, so the loop is joined rather than abandoned.
+		t.Cleanup(func() {
+			cancel()
+			loop.Wait()
 		})
-	}
 
-	ctx, cancel := context.WithCancel(t.Context())
+		// The loop's first tick, and the pass it starts standing in the lock.
+		time.Sleep(ttl / 3)
+		synctest.Wait()
 
-	var loop sync.WaitGroup
+		select {
+		case <-reached:
+		default:
+			close(open)
+			t.Fatal("no heartbeat pass ever reached the lock")
+		}
 
-	loop.Add(1)
-
-	go func() {
-		defer loop.Done()
-
-		l.heartbeatLoop(ctx)
-	}()
-
-	// A goroutine outliving its test is on this project's own list of ways a
-	// test lies, so the loop is joined rather than abandoned.
-	t.Cleanup(func() {
-		cancel()
-		loop.Wait()
-	})
-
-	select {
-	case <-reached:
-	case <-time.After(30 * time.Second):
+		// THE STALL. The pass is held at the lock boundary for longer than the
+		// TTL, so that when it proceeds, the last confirmation is old enough for
+		// the stale branch to be reachable, and, under the wrong ordering, its
+		// deadline has already been spent.
+		time.Sleep(2 * ttl)
 		close(open)
-		t.Fatal("no heartbeat pass ever reached the lock")
-	}
+		synctest.Wait()
 
-	// THE STALL. The pass is held at the lock boundary for longer than the TTL,
-	// so that when it proceeds, the last confirmation is old enough for the stale
-	// branch to be reachable — and, under the wrong ordering, its deadline has
-	// already been spent.
-	time.Sleep(2 * ttl)
-	close(open)
-
-	deadline := time.Now().Add(30 * time.Second)
-
-	for {
 		l.mu.Lock()
 		_, running := l.running[7]
 		confirmed, seen := l.confirmed[lease.ID]
@@ -126,16 +124,12 @@ func TestAHeartbeatPassIsNotSpentWaitingForBilletsOwnLock(t *testing.T) {
 		}
 
 		// A pass that ASKED updates the confirmation, and only a successful
-		// Heartbeat writes it. That is the positive signal: without it, "still
-		// running" would also be satisfied by a loop that never ran at all.
-		if seen && confirmed.After(time.Now().Add(-ttl)) {
-			return
+		// Heartbeat writes it, at the instant the stall ended. That is the
+		// positive signal: without it, "still running" would also be satisfied
+		// by a loop that never ran at all.
+		if !seen || !confirmed.Equal(time.Now()) {
+			t.Fatalf("the pass released from the stall did not confirm the lease (seen=%v, "+
+				"confirmed %v before now)", seen, time.Since(confirmed))
 		}
-
-		if time.Now().After(deadline) {
-			t.Fatal("no heartbeat pass confirmed the lease after the stall ended")
-		}
-
-		time.Sleep(5 * time.Millisecond)
-	}
+	})
 }
