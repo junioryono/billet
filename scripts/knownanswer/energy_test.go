@@ -307,6 +307,37 @@ func TestOneTraceSampledByTwoClocksReconciles(t *testing.T) {
 	}
 }
 
+// ENERGY ABOVE THE BASELINE THAT CLIPPING COULD ACCOUNT FOR IS NO SIGNAL: busy
+// seconds alternating 70 and 77 W measure 70 J above the baseline and clip 70
+// J, so the lower bound would fall to zero and an attribution of nothing pass.
+func TestEnergyWithinTheClippingIsUnmeasured(t *testing.T) {
+	var rows []powerRow
+	for i := range 64 {
+		row := powerRow{epoch: int64(i), uptime: float64(i), uptimeOK: true, inventoryOK: true}
+		if i > 0 {
+			row.delta, row.deltaOK = 73_500_000, true
+			if i-1 >= 11 && i-1 < 51 {
+				row.delta = 70_000_000
+				if (i-1)%2 == 1 {
+					row.delta = 77_000_000
+				}
+			}
+		}
+		if i >= 11 && i < 51 {
+			row.instances = []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	for _, attributed := range []float64{0, 70} {
+		res := reconcile(rows, 73.5, 10, fromMap(leaseA(attributed, 0, nil)))
+		if res.activeMeasured != 70_000_000 || res.clipped != 70_000_000 || res.verdict != unmeasured ||
+			!strings.Contains(res.reason, "within what two clocks clipping at the baseline can disagree on") {
+			t.Errorf("%v J attributed: above idle %.0f µJ, clipped %.0f µJ, %s (%q)", attributed,
+				res.activeMeasured, res.clipped, res.verdict, res.reason)
+		}
+	}
+}
+
 func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) string {

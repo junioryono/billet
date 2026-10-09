@@ -304,9 +304,13 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 		res.reason = "no billet microVM ran in the window"
 	case res.coarse != "":
 		res.reason = res.coarse
-	case res.activeMeasured <= minActiveShare*float64(res.rapl):
-		res.reason = fmt.Sprintf("the package drew %.1f kJ above the idle baseline, too little of the window's "+
-			"%.1f kJ to compare", res.activeMeasured/1e9, float64(res.rapl)/1e9)
+	// THE SIGNAL IS WHAT SURVIVES THE CLIPPING: the lower bound gives way by it,
+	// so energy above the baseline that clipping could account for is a range
+	// that holds an attribution of nothing.
+	case res.activeMeasured-res.clipped <= minActiveShare*float64(res.rapl):
+		res.reason = fmt.Sprintf("the package drew %.2f kJ above the idle baseline, %.2f kJ of it within what "+
+			"two clocks clipping at the baseline can disagree on, too little of the window's %.1f kJ to compare",
+			res.activeMeasured/1e9, res.clipped/1e9, float64(res.rapl)/1e9)
 	default:
 		res.ratio = float64(res.attributed) / res.activeMeasured
 		res.high = attributedHigh + res.allowance/res.activeMeasured
