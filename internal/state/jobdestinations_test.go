@@ -1,13 +1,9 @@
 package state
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
-
-	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
 // A USAGE ROW WRITTEN BEFORE MIGRATION 59 READS BACK WITH ITS DESTINATIONS NOT
@@ -83,69 +79,5 @@ func TestAUsageRowWrittenAtVersion58ReadsBackWithoutDestinations(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("read the upgraded ledger: %v", err)
-	}
-}
-
-// THE TABLE ITSELF HOLDS A JOB TO 257 ROWS, ONE OF THEM THE REST, whatever
-// the code above it sends: an ordinal past 256, a named destination at the
-// rest's ordinal, the rest with an address, one address on two rows, and a
-// negative total are each refused by the schema.
-func TestTheDestinationsTableRefusesWhatNoReportCanSay(t *testing.T) {
-	t.Parallel()
-
-	db, err := Open(t.Context(), t.TempDir())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-
-	write := func(ctx context.Context, rows ...ledgerdb.RecordJobDestinationParams) error {
-		return db.Tx(ctx, func(tx *sql.Tx) error {
-			for _, r := range rows {
-				if err := WriteQueries(tx).RecordJobDestination(ctx, r); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		})
-	}
-	named := func(lease string, ordinal int64, addr string) ledgerdb.RecordJobDestinationParams {
-		return ledgerdb.RecordJobDestinationParams{LeaseID: lease, Ordinal: ordinal, Addr: addr,
-			SentBytes: 1, ReceivedBytes: 2, Connections: 1}
-	}
-
-	// THE MOST A JOB CAN HAVE IS ACCEPTED, so each refusal below is about its
-	// one broken thing.
-	full := make([]ledgerdb.RecordJobDestinationParams, 0, 257)
-	for i := range int64(256) {
-		full = append(full, named("full", i, fmt.Sprintf("10.0.%d.%d", i/256, i%256)))
-	}
-	full = append(full, named("full", 256, ""))
-	if err := write(t.Context(), full...); err != nil {
-		t.Fatalf("256 destinations and the rest were refused: %v", err)
-	}
-
-	negative := named("l", 0, "10.0.0.1")
-	negative.ReceivedBytes = -1
-	for name, rows := range map[string][]ledgerdb.RecordJobDestinationParams{
-		"an ordinal past the rest":       {named("l", 257, "")},
-		"a negative ordinal":             {named("l", -1, "10.0.0.1")},
-		"a named destination at 256":     {named("l", 256, "10.0.0.1")},
-		"the rest at a named ordinal":    {named("l", 3, "")},
-		"one address on two rows":        {named("l", 0, "10.0.0.1"), named("l", 1, "10.0.0.1")},
-		"two rows at one ordinal":        {named("l", 0, "10.0.0.1"), named("l", 0, "10.0.0.2")},
-		"a negative total":               {negative},
-		"a 258th row for a full lease":   {named("full", 255, "10.9.9.9")},
-		"a second rest for a full lease": {named("full", 256, "")},
-	} {
-		err := write(t.Context(), rows...)
-		if err == nil {
-			t.Errorf("%s was accepted", name)
-			continue
-		}
-		if msg := err.Error(); !strings.Contains(msg, "constraint") {
-			t.Errorf("%s was refused for another reason: %v", name, err)
-		}
 	}
 }

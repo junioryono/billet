@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 
 	"modernc.org/sqlite"
@@ -290,7 +291,12 @@ func readOnlyQueryNames(t *testing.T) map[string]bool {
 				body += nl + 1
 			}
 
-			out[name] = classify(t, name, firstKeyword(string(src[body:end])))
+			stmt := string(src[body:end])
+			keyword := firstKeyword(stmt)
+			if keyword == "with" {
+				keyword = withBody(stmt)
+			}
+			out[name] = classify(t, name, keyword)
 		}
 	}
 
@@ -326,6 +332,30 @@ func classify(t *testing.T, name, keyword string) bool {
 
 		return false
 	}
+}
+
+// withBody is what a statement that opens with WITH does: "insert", "update",
+// "delete" or "replace" when that word appears anywhere in it outside a
+// comment, since a CTE can wrap a mutation and a mutation can sit inside a
+// CTE, and "select" only when none does. Erring toward a mutation fails
+// closed: a read misjudged here is refused from ReadOps, never a write let in.
+func withBody(block string) string {
+	for _, line := range strings.Split(block, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		for _, word := range strings.FieldsFunc(strings.ToLower(trimmed), func(r rune) bool {
+			return !unicode.IsLetter(r) && r != '_'
+		}) {
+			switch word {
+			case "insert", "update", "delete", "replace":
+				return word
+			}
+		}
+	}
+
+	return "select"
 }
 
 func firstKeyword(block string) string {

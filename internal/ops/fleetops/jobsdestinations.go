@@ -1,10 +1,10 @@
 package fleetops
 
 import (
-	"cmp"
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"slices"
 	"strings"
 
@@ -32,7 +32,7 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 
 	sorted := slices.Clone(d.Destinations)
 	slices.SortStableFunc(sorted, func(x, y alloc.JobDestination) int {
-		return cmp.Compare(total(y.SentBytes, y.ReceivedBytes), total(x.SentBytes, x.ReceivedBytes))
+		return exact(y.SentBytes, y.ReceivedBytes).Cmp(exact(x.SentBytes, x.ReceivedBytes))
 	})
 	shown := sorted[:min(len(sorted), shownDestinations)]
 
@@ -50,17 +50,13 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 		}
 	}
 	if rest := sorted[len(shown):]; len(rest) > 0 {
-		var sum alloc.JobDestination
-		for _, dest := range rest {
-			sum = plus(sum, dest)
-		}
-		fmt.Fprintf(w, "%sand %d more: %s\n", pad, len(rest), traffic(sum))
+		fmt.Fprintf(w, "%sand %d more: %s\n", pad, len(rest), sumOf(rest...))
 	}
 
 	line := func(label, format string, args ...any) {
 		fmt.Fprintf(w, "%-11s%s\n", label, fmt.Sprintf(format, args...))
 	}
-	line("other", "%s (beyond the %d destinations the node keeps by name)", traffic(d.Other),
+	line("other", "%s (beyond the %d destinations the node keeps by name)", sumOf(d.Other),
 		alloc.MaxJobDestinations)
 	if d.Incomplete {
 		line("complete", "no: flows may have been missed, so every total here is a lower bound")
@@ -72,47 +68,61 @@ func renderDestinations(w io.Writer, d *alloc.JobDestinations) {
 		line("tap", "not read, so there is nothing to compare the destinations with")
 		return
 	}
-	attributed := d.Other
-	for _, dest := range d.Destinations {
-		attributed = plus(attributed, dest)
-	}
+	attributed := sumOf(append(slices.Clone(d.Destinations), d.Other)...)
 	line("tap", "sent %s, received %s; tap minus attributed: sent %s, received %s",
 		cli.HumanBytes(d.Tap.SentBytes), cli.HumanBytes(d.Tap.ReceivedBytes),
-		signedBytes(d.Tap.SentBytes-attributed.SentBytes),
-		signedBytes(d.Tap.ReceivedBytes-attributed.ReceivedBytes))
+		signedBytes(new(big.Int).Sub(big.NewInt(d.Tap.SentBytes), attributed.sent)),
+		signedBytes(new(big.Int).Sub(big.NewInt(d.Tap.ReceivedBytes), attributed.received)))
 	fmt.Fprintf(w, "%s(a comparison of two counters read a moment apart, not a measurement of what "+
 		"was missed)\n", pad)
 }
 
-// traffic is one total of sent and received bytes and connections.
-func traffic(d alloc.JobDestination) string {
-	return fmt.Sprintf("sent %s, received %s, %s connections", cli.HumanBytes(d.SentBytes),
-		cli.HumanBytes(d.ReceivedBytes), groupDigits(d.Connections))
-}
+// traffic is destinations' totals summed exactly: up to 257 counts that each
+// fit an int64 need not fit one together, and a sum held at the largest int64
+// would print a total, and a difference from the tap, that are simply wrong.
+type traffic struct{ sent, received, connections *big.Int }
 
-// plus adds two destinations' totals, each held at the largest int64 rather
-// than wrapping to a negative number a reader would take for a count.
-func plus(a, b alloc.JobDestination) alloc.JobDestination {
-	return alloc.JobDestination{
-		SentBytes: total(a.SentBytes, b.SentBytes), ReceivedBytes: total(a.ReceivedBytes, b.ReceivedBytes),
-		Connections: total(a.Connections, b.Connections),
-	}
-}
-
-// total adds two counts the ledger holds non-negative, saturating.
-func total(a, b int64) int64 {
-	if a > math.MaxInt64-b {
-		return math.MaxInt64
+func sumOf(dests ...alloc.JobDestination) traffic {
+	t := traffic{sent: new(big.Int), received: new(big.Int), connections: new(big.Int)}
+	for _, d := range dests {
+		t.sent.Add(t.sent, big.NewInt(d.SentBytes))
+		t.received.Add(t.received, big.NewInt(d.ReceivedBytes))
+		t.connections.Add(t.connections, big.NewInt(d.Connections))
 	}
 
-	return a + b
+	return t
+}
+
+func (t traffic) String() string {
+	connections := "more than " + groupDigits(math.MaxInt64)
+	if t.connections.IsInt64() {
+		connections = groupDigits(t.connections.Int64())
+	}
+
+	return fmt.Sprintf("sent %s, received %s, %s connections", bigBytes(t.sent), bigBytes(t.received),
+		connections)
+}
+
+// exact is a destination's total bytes, which can pass the largest int64.
+func exact(sent, received int64) *big.Int {
+	return new(big.Int).Add(big.NewInt(sent), big.NewInt(received))
+}
+
+// bigBytes writes a byte count that may not fit an int64, saying so where it
+// does not rather than printing a smaller number.
+func bigBytes(n *big.Int) string {
+	if n.IsInt64() {
+		return cli.HumanBytes(n.Int64())
+	}
+
+	return "more than " + cli.HumanBytes(math.MaxInt64)
 }
 
 // signedBytes writes a difference of byte counts with its sign.
-func signedBytes(n int64) string {
-	if n < 0 {
-		return "-" + cli.HumanBytes(-n)
+func signedBytes(n *big.Int) string {
+	if n.Sign() < 0 {
+		return "-" + bigBytes(new(big.Int).Neg(n))
 	}
 
-	return "+" + cli.HumanBytes(n)
+	return "+" + bigBytes(n)
 }

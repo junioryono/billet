@@ -43,6 +43,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The PostgreSQL timeline is derived.**
 - **One query set serves both engines, generated once with the PostgreSQL engine.**
 - **`ReadOps` and `WriteOps` are hand-written on purpose.**
+- **A bounded list is written in one statement, packed, never one INSERT a row.**
 - **The gate that proves the set still fits the schema is `TestEveryGeneratedQueryPreparesAgainstTheMigratedSchema`.**
 - **Raw SQL is banned mechanically.**
 - **Migrations 53 to 55 carry #226's cache evidence and outcomes.**

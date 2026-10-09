@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,7 +25,11 @@ func fullDestinations() *JobDestinations {
 			SentBytes: int64(1000 - i), ReceivedBytes: int64(2 * i), Connections: int64(i % 5),
 		})
 	}
-	d.Destinations[0].Addr = "2001:db8::1"
+	// THE WIDEST ROW THE LEDGER'S RECORD HOLDS: the longest canonical address
+	// and the largest counts.
+	d.Destinations[0] = JobDestination{Addr: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe",
+		SentBytes: math.MaxInt64, ReceivedBytes: math.MaxInt64, Connections: math.MaxInt64}
+	d.Destinations[1].Addr = "2001:db8::1"
 
 	return d
 }

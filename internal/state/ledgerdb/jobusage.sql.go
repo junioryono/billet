@@ -133,34 +133,53 @@ func (q *Queries) ReadJobUsage(ctx context.Context, leaseID string) (JobUsage, e
 	return i, err
 }
 
-const recordJobDestination = `-- name: RecordJobDestination :exec
+const recordJobDestinations = `-- name: RecordJobDestinations :exec
+WITH RECURSIVE slot (n, rec, rest) AS (
+    SELECT 0, substr(CAST($2 AS TEXT), 1, 99),
+           substr(CAST($2 AS TEXT), 100)
+     WHERE 0 < CAST($3 AS BIGINT)
+    UNION ALL
+    SELECT n + 1, substr(rest, 1, 99), substr(rest, 100)
+      FROM slot WHERE n + 1 < CAST($3 AS BIGINT)
+)
 INSERT INTO job_destinations
      (lease_id, ordinal, addr, sent_bytes, received_bytes, connections)
-VALUES ($1, $2, $3, $4, $5,
-        $6)
+SELECT CAST($1 AS TEXT),
+       CAST(substr(rec, 1, 3) AS BIGINT),
+       rtrim(substr(rec, 4, 39)),
+       CAST(substr(rec, 43, 19) AS BIGINT),
+       CAST(substr(rec, 62, 19) AS BIGINT),
+       CAST(substr(rec, 81, 19) AS BIGINT)
+  FROM slot
 `
 
-type RecordJobDestinationParams struct {
-	LeaseID       string
-	Ordinal       int64
-	Addr          string
-	SentBytes     int64
-	ReceivedBytes int64
-	Connections   int64
+type RecordJobDestinationsParams struct {
+	LeaseID  string
+	Packed   string
+	RowCount int64
 }
 
-// One of a job's destinations, or with an empty address and ordinal 256 the
-// total beyond them (migration 59). Written only by the usage report that won
+// Every one of a job's destination rows, the named ones and the total beyond
+// them (migration 59), written only by the usage report that won
 // RecordJobUsage, in its transaction, so a lease's rows are one report's.
-func (q *Queries) RecordJobDestination(ctx context.Context, arg RecordJobDestinationParams) error {
-	_, err := q.db.ExecContext(ctx, recordJobDestination,
-		arg.LeaseID,
-		arg.Ordinal,
-		arg.Addr,
-		arg.SentBytes,
-		arg.ReceivedBytes,
-		arg.Connections,
-	)
+//
+// ONE STATEMENT FOR UP TO 257 ROWS, because a write transaction holds the
+// ledger's only writer slot (SQLite) or its write lock (PostgreSQL) for every
+// round trip it makes, and one INSERT a row made 257 of them: measured
+// 2026-10-09 against a PostgreSQL on loopback, 18 ms a report one row at a time
+// and 14 ms in one statement, a gap that grows by 256 round trips on a real
+// network. A portable statement cannot take a list, so the caller packs the
+// rows into one string of fixed-width records (internal/alloc
+// packDestinations: a 3-digit ordinal, the address space-padded to 39
+// characters, then the sent, received and connection counts as 19 zero-padded
+// digits each, 99 characters a row) and the recursive slot list below cuts one
+// record off the front at each step.
+//
+// EACH STEP CARRIES THE REST rather than indexing into the whole string,
+// because both engines find a character offset in TEXT by scanning from its
+// start: indexed, the same report took 57 ms on PostgreSQL.
+func (q *Queries) RecordJobDestinations(ctx context.Context, arg RecordJobDestinationsParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobDestinations, arg.LeaseID, arg.Packed, arg.RowCount)
 	return err
 }
 

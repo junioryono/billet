@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -39,28 +40,65 @@ func tapTotal(d *JobDestinations, total func(*TapTotals) int64) sql.NullInt64 {
 
 // recordDestinations writes a report's destinations, and the row for the
 // traffic beyond them even when it is empty, so every job whose flows were
-// totalled has that row.
+// totalled has that row. One statement writes them all
+// (RecordJobDestinations says why).
 func recordDestinations(ctx context.Context, q state.WriteOps, leaseID string, d *JobDestinations) error {
 	if d == nil {
 		return nil
 	}
-	write := func(ordinal int, dest JobDestination) error {
-		if err := q.RecordJobDestination(ctx, ledgerdb.RecordJobDestinationParams{
-			LeaseID: leaseID, Ordinal: int64(ordinal), Addr: dest.Addr,
-			SentBytes: dest.SentBytes, ReceivedBytes: dest.ReceivedBytes, Connections: dest.Connections,
-		}); err != nil {
-			return fmt.Errorf("alloc: record the destinations of lease %s: %w", leaseID, err)
+	packed, rows, err := packDestinations(d)
+	if err != nil {
+		return fmt.Errorf("alloc: record the destinations of lease %s: %w", leaseID, err)
+	}
+	if err := q.RecordJobDestinations(ctx, ledgerdb.RecordJobDestinationsParams{
+		LeaseID: leaseID, Packed: packed, RowCount: int64(rows),
+	}); err != nil {
+		return fmt.Errorf("alloc: record the destinations of lease %s: %w", leaseID, err)
+	}
+
+	return nil
+}
+
+// The fixed-width record RecordJobDestinations cuts apart; the widths there
+// are these, and a change to one is a change to both.
+const (
+	packedOrdinalWidth = 3
+	// packedAddrWidth is the longest canonical IPv6 address with no zone.
+	packedAddrWidth  = 39
+	packedCountWidth = 19 // the digits of the largest int64
+	packedRowWidth   = packedOrdinalWidth + packedAddrWidth + 3*packedCountWidth
+)
+
+// packDestinations is a report's rows as RecordJobDestinations reads them, and
+// how many there are: the named destinations at their ordinals, then the rest
+// at otherOrdinal. It refuses a row the record cannot hold whole, which a
+// report that validated never has.
+func packDestinations(d *JobDestinations) (string, int, error) {
+	var b strings.Builder
+	b.Grow((len(d.Destinations) + 1) * packedRowWidth)
+	row := func(ordinal int, dest JobDestination) error {
+		if len(dest.Addr) > packedAddrWidth || strings.ContainsAny(dest.Addr, " \t\r\n") {
+			return fmt.Errorf("destination %q does not fit the ledger's record", dest.Addr)
 		}
+		if dest.SentBytes < 0 || dest.ReceivedBytes < 0 || dest.Connections < 0 {
+			return fmt.Errorf("destination %q has a negative total", dest.Addr)
+		}
+		fmt.Fprintf(&b, "%0*d%-*s%0*d%0*d%0*d", packedOrdinalWidth, ordinal, packedAddrWidth, dest.Addr,
+			packedCountWidth, dest.SentBytes, packedCountWidth, dest.ReceivedBytes,
+			packedCountWidth, dest.Connections)
 
 		return nil
 	}
 	for i, dest := range d.Destinations {
-		if err := write(i, dest); err != nil {
-			return err
+		if err := row(i, dest); err != nil {
+			return "", 0, err
 		}
 	}
+	if err := row(otherOrdinal, d.Other); err != nil {
+		return "", 0, err
+	}
 
-	return write(otherOrdinal, d.Other)
+	return b.String(), len(d.Destinations) + 1, nil
 }
 
 // readDestinations reads back the destinations of a lease whose report
