@@ -7,7 +7,99 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+// THE WORKFLOW RUNS EACH KIND ONCE, IN ORDER, FROM THE CALLED REVISION. Its
+// jobs are what the checker's run accounting assumes: one job per kind, one
+// after another so no two share the host, each on the one tier label, each
+// running this repository's script at the ref the caller named (never the
+// caller's checkout), and each uploading its expectation under a name that
+// carries the run, the attempt and the kind.
+func TestTheKnownAnswerWorkflowRunsEachKindOnceInOrder(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "known-answer.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf struct {
+		On struct {
+			Call struct {
+				Inputs map[string]struct {
+					Type     string `yaml:"type"`
+					Required bool   `yaml:"required"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_call"`
+		} `yaml:"on"`
+		Jobs map[string]struct {
+			RunsOn string `yaml:"runs-on"`
+			Needs  string `yaml:"needs"`
+			Steps  []struct {
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(body, &wf); err != nil {
+		t.Fatal(err)
+	}
+	order := []string{kindBaseline, kindIdle, kindCPU, kindMemory, kindNetwork, kindDisk}
+	if len(wf.Jobs) != len(order) {
+		t.Fatalf("%d jobs, want one per kind: %v", len(wf.Jobs), order)
+	}
+	for i, kind := range order {
+		job, ok := wf.Jobs[kind]
+		if !ok {
+			t.Fatalf("no %s job", kind)
+		}
+		want := ""
+		if i > 0 {
+			want = order[i-1]
+		}
+		if job.Needs != want || job.RunsOn != "${{ inputs.runner_label }}" || len(job.Steps) != 3 {
+			t.Errorf("%s: needs %q, runs-on %q, %d steps", kind, job.Needs, job.RunsOn, len(job.Steps))
+			continue
+		}
+		fetch, load, upload := job.Steps[0], job.Steps[1], job.Steps[2]
+		if fetch.Uses != "actions/checkout@v6" || fetch.With["repository"] != "${{ inputs.billet_repository }}" ||
+			fetch.With["ref"] != "${{ inputs.billet_ref }}" || fetch.With["sparse-checkout"] != "scripts/known-answer-job.sh" ||
+			fetch.With["sparse-checkout-cone-mode"] != "false" || fetch.With["persist-credentials"] != "false" ||
+			fetch.With["path"] != ".billet-known-answer" {
+			t.Errorf("%s fetches %+v", kind, fetch.With)
+		}
+		if load.Run != `bash .billet-known-answer/scripts/known-answer-job.sh `+kind+` "$RUNNER_TEMP/known-answer"` ||
+			load.Env["KA_GITHUB_JOB_ID"] != "${{ job.check_run_id }}" {
+			t.Errorf("%s runs %q with %v", kind, load.Run, load.Env)
+		}
+		if upload.Uses != "actions/upload-artifact@v7" ||
+			upload.With["name"] != "known-answer-${{ github.run_id }}-${{ github.run_attempt }}-"+kind ||
+			upload.With["path"] != "${{ runner.temp }}/known-answer/expectation.json" ||
+			upload.With["if-no-files-found"] != "error" {
+			t.Errorf("%s uploads %+v", kind, upload.With)
+		}
+	}
+	// ONLY ZERO OPTS OUT OF THE SIZE CHECK: any other number reaches the script,
+	// which refuses one that is not a positive integer.
+	if got := wf.Jobs[kindNetwork].Steps[1].Env["KA_NETWORK_BYTES"]; got !=
+		"${{ inputs.network_bytes != 0 && inputs.network_bytes || '' }}" {
+		t.Errorf("KA_NETWORK_BYTES = %q", got)
+	}
+	for name, env := range map[string]string{
+		"KA_SECONDS": "seconds", "KA_CPU_WORKERS": "cpu_workers", "KA_MEMORY_BYTES": "memory_bytes",
+		"KA_NETWORK_URL": "network_url", "KA_DISK_BYTES": "disk_bytes",
+	} {
+		found := false
+		for _, job := range wf.Jobs {
+			found = found || job.Steps[1].Env[name] == "${{ inputs."+env+" }}"
+		}
+		if _, declared := wf.On.Call.Inputs[env]; !found || !declared {
+			t.Errorf("%s is not passed from the declared input %s", name, env)
+		}
+	}
+}
 
 // THE KNOWN-ANSWER JOB IS EXECUTED, NOT PATTERN-MATCHED. What it writes is the
 // expectation the checker holds billet's measurement to, so every rule in it is

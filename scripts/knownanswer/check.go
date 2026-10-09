@@ -188,6 +188,15 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 
 	r.value = m.value(job.Usage, ref.Usage)
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), ref.Usage)
+	// A LOAD THE TOLERANCE CANNOT TELL FROM NO LOAD PROVES NOTHING: one worker
+	// for one second accepts zero CPU-seconds, as a 1 MiB download accepts zero
+	// bytes, and a job that did nothing would pass.
+	if m.kind != kindIdle && r.low <= 0 {
+		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds a job "+
+			"that did nothing; run a larger one", m.rule, formatValue(r.low, m.unit), formatValue(r.high, m.unit))
+
+		return r
+	}
 	r.compared = true
 	r.verdict = fail
 	if r.value >= r.low && r.value <= r.high {
@@ -257,6 +266,16 @@ func discardRuns(exps []expectation, n int) ([]expectation, []runKey) {
 	})
 
 	return kept, dropped
+}
+
+// countRuns is how many distinct runs the expectations come from.
+func countRuns(exps []expectation) int {
+	seen := map[runKey]bool{}
+	for i := range exps {
+		seen[exps[i].run()] = true
+	}
+
+	return len(seen)
 }
 
 // overall is the worst verdict: any FAIL fails, and otherwise anything

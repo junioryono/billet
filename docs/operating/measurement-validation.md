@@ -78,15 +78,15 @@ Every step names the host it runs on. `$REPO` is the repository with the caller.
    sudo ./power-log.sh --out power.csv --require-bmc
    ```
 
-2. **Anywhere with `gh`: run the workflow six times, one after another.** The first is the warmup and is discarded; the other five are measured. A run's jobs already run one at a time; waiting for each run keeps two runs from sharing the host.
+2. **Anywhere with `gh`: run the workflow six times, one after another.** The first is the warmup and is discarded; the other five are measured. A run's jobs already run one at a time; waiting for each run keeps two runs from sharing the host. The loop stops at the first run that fails or whose artifacts do not download, so a failure is looked at rather than averaged away.
 
    ```bash
    for i in 1 2 3 4 5 6; do
-     gh workflow run known-answer.yml -R "$REPO"
+     gh workflow run known-answer.yml -R "$REPO" || break
      sleep 10
-     id=$(gh run list -R "$REPO" -w known-answer.yml -L 1 --json databaseId -q '.[0].databaseId')
-     gh run watch "$id" -R "$REPO" --exit-status
-     gh run download "$id" -R "$REPO" -p 'known-answer-*' -D "expectations/$id"
+     id=$(gh run list -R "$REPO" -w known-answer.yml -L 1 --json databaseId -q '.[0].databaseId') || break
+     gh run watch "$id" -R "$REPO" --exit-status || { echo "run $id failed"; break; }
+     gh run download "$id" -R "$REPO" -p 'known-answer-*' -D "expectations/$id" || { echo "run $id did not download"; break; }
    done
    ```
 
@@ -103,8 +103,10 @@ Every step names the host it runs on. `$REPO` is the repository with the caller.
 5. **Control plane: the known-answer check.**
 
    ```bash
-   ./knownanswer check --expectations expectations --records records --discard 1
+   ./knownanswer check --expectations expectations --records records --discard 1 --runs 5
    ```
+
+   `--runs` is required: a run whose baseline failed before uploading left no expectation at all, so only the count asked for can notice it is missing, and fewer measured runs than asked for is UNMEASURED.
 
 6. **Control plane: the energy check.**
 
@@ -125,7 +127,7 @@ Exit statuses are the verdict, three ways, for every check: 0 PASS, 1 FAIL, 3 co
 
 ## Tolerances, and why each is what it is
 
-Every loaded job is compared net of the same run's idle job, and the idle job net of the baseline. The host measures the microVM's whole life (boot, runner, checkout, package install, upload), so only what differs between two jobs that did everything else identically is the load. The idle job sleeps for the same T as the CPU and memory loads, so the runner's own per-second cost cancels too.
+Every loaded job is compared net of the same run's idle job, and the idle job net of the baseline. The host measures the microVM's whole life (boot, runner, checkout, package install, upload), so only what differs between two jobs that did everything else identically is the load. The idle job sleeps for the same T as the CPU and memory loads, so the runner's own per-second cost cancels too. A load the tolerance cannot tell from no load at all, such as one worker for one second or a 1 MiB download, whose accepted range holds zero, is UNMEASURED rather than compared.
 
 | Job | Compared | Accepted | Why |
 |---|---|---|---|
@@ -134,7 +136,7 @@ Every loaded job is compared net of the same run's idle job, and the idle job ne
 | memory | the raw peak | [X, idle peak + 1.05 X + 64 MiB] | Compared raw because a peak is a maximum, not a sum: the stress allocation can reuse guest pages the preparation freed, which the host had already counted. The guest held X resident at once, so the peak cannot be below X; it can hardly exceed what the idle job reached plus X, plus 5% and 64 MiB for stress-ng's own pages and the VMM. |
 | network | received minus the idle job's | [S − 4 MiB, 1.06 S + 4 MiB] | The guest's view of its tap. Fewer bytes than the body cannot have delivered it; headers add up to about 4.6% (66 bytes on a 1,448-byte segment) when the tap carries MTU-sized frames and about 0.1% with 64 KiB offloaded ones, and TLS framing about 0.1%. ±4 MiB covers the run-to-run spread of the preparation's downloads and the runner's own traffic. |
 | disk | written minus the idle job's | [X − 64 MiB, 1.10 X + 64 MiB] | `fio --direct=1` writes X bytes past the guest's page cache; the guest filesystem's metadata and journal add a few percent. ±64 MiB covers the preparation's writes, which the guest flushes on its own schedule, so the idle and disk jobs can differ by what one guest had not yet written when it was destroyed. |
-| energy | jobs' attributed active energy over the package's energy above `idle_package_watts` in the window, taken interval by interval and never below zero, as the node's monitor takes it | [0.85, 1.02] | billet shares the energy above `idle_package_watts` by each job's share of the host's busy CPU time, so the host's own work (billet, kernel networking, Ceph's OSDs serving the jobs' disks) stays unattributed by design; 15% is the most that should be on a host running only the kit. Attribution never hands out more than was measured, so above 1.02 is double counting. |
+| energy | jobs' attributed active energy over the package's energy above `idle_package_watts` in the intervals a microVM was alive for (seen at the interval's start or end, which takes in its start and its tail), taken interval by interval and never below zero, as the node's monitor takes it; the monitor shares out nothing while no job runs, so quiet intervals are left out | [0.85, 1.02] | billet shares the energy above `idle_package_watts` by each job's share of the host's busy CPU time, so the host's own work (billet, kernel networking, Ceph's OSDs serving the jobs' disks) stays unattributed by design; 15% is the most that should be on a host running only the kit. Attribution never hands out more than was measured, so above 1.02 is double counting. |
 | idle baseline | each quiet end's measured package power | `idle_package_watts` ± 5% | turbostat and the package counter agreed within 0.5% on this host's idle (73.1 W and 73.5 W, 2026-09-25); 5% leaves room for temperature. |
 
 The energy check needs the whole window accounted for: every microVM the log saw must have a record with RAPL energy split by an idle baseline (`rapl`, not `rapl-unsplit`), the first and last ten rows must hold no microVM (a job crossing the window's edge has energy on both sides of it), every interval must have a RAPL reading on a clock that only moves forward, and every row must have read which microVMs were running. Otherwise it is UNMEASURED and says which.
@@ -155,7 +157,7 @@ The energy check needs the whole window accounted for: every microVM the log saw
 - **energy below 0.85**: more of the host's own work than expected sat outside the jobs, or intervals broke for some job; the `unattributed` line gives it in watts. **energy above 1.02**: energy was attributed twice. **idle baseline FAIL**: `idle_package_watts` is stale; measure it again in a quiet window and correct the node's configuration.
 - **A record naming another run**: the lease ran something else, so the job's runner name and billet's record disagree about which job a lease served.
 
-**The BMC comparison** has no PASS: the BMC measures the whole server at the wall (fans, memory, disks, NICs and the power supply's loss) and RAPL the CPU package alone. The offset is roughly the platform's draw beyond the package, the slope how the wall follows the package (above 1 for the supply's loss and the loads that track the CPU), and r² how closely. A BMC reading is often an average over its own sampling period and lags RAPL by a sample or two, so read the fit over steady stretches with `--from` and `--to`. turbostat reads the same package counter, so its PkgWatt should agree with RAPL within a percent or two; more than that means one of the two is reading another zone.
+**The BMC comparison** has no PASS: the BMC measures the whole server at the wall (fans, memory, disks, NICs and the power supply's loss) and RAPL the CPU package alone. The offset is roughly the platform's draw beyond the package, the slope how the wall follows the package (above 1 for the supply's loss and the loads that track the CPU), and r² how closely. A BMC reading is often an average over its own sampling period and lags RAPL by a sample or two, so read the fit over steady stretches with `--from` and `--to`. turbostat reads the same package counter, so its PkgWatt should agree with RAPL within a percent or two over the whole log; more than that means one of the two is reading another zone. Row by row the two are approximate: turbostat samples on its own clock, and each row carries the reading it printed since the row before, read beside the RAPL counter.
 
 ## Methodology
 

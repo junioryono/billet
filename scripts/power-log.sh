@@ -18,8 +18,8 @@
 # modules), and turbostat_pkg_watts turbostat's latest PkgWatt when it runs.
 # instances is every billet microVM with a live cgroup, `;`-separated, which is
 # how `knownanswer energy` knows which jobs a window must account for, or `?`
-# when the cgroup tree could not be read. The clock, the counter and the
-# microVMs are read together, before the BMC is asked.
+# when the cgroup tree could not be read. The clock, the counter, the microVMs
+# and turbostat are read together, before the BMC is asked.
 #
 # AN EMPTY CELL IS A READING THAT COULD NOT BE TAKEN, never a zero. A failed
 # RAPL read, the first row, and a gap long enough for the counter to have
@@ -165,14 +165,18 @@ read_turbostat() {
 	ts_w=
 	[ -n "$ts_pid" ] || return 0
 	kill -0 "$ts_pid" 2>/dev/null || return 0
-	local lines last
-	lines=$(wc -l <"$work/turbostat" 2>/dev/null) || return 0
-	lines=${lines//[!0-9]/}
-	if [ -z "$lines" ] || [ "$lines" -le "$ts_lines" ]; then
+	local seen lines last
+	# ONE READ GIVES THE COUNT AND THE LINE TOGETHER: a count and a tail taken
+	# separately can straddle a line turbostat appended between them, and the
+	# next sample would read that line again as new.
+	seen=$(awk '{ l = $0 } END { print NR " " l }' "$work/turbostat" 2>/dev/null) || return 0
+	lines=${seen%% *}
+	last=${seen#* }
+	case "$lines" in '' | *[!0-9]*) return 0 ;; esac
+	if [ "$lines" -le "$ts_lines" ]; then
 		return 0
 	fi
 	ts_lines=$lines
-	last=$(tail -n 1 "$work/turbostat" 2>/dev/null) || return 0
 	case "$last" in
 	'' | *[!0-9.]* | .* | *. | *.*.*) ;;
 	*) ts_w=$last ;;
@@ -197,16 +201,22 @@ read_instances() {
 		fi
 		for d in "$parent"/billet-*; do
 			[ -d "$d" ] || continue
-			if [ ! -r "$d/cgroup.procs" ]; then
+			# cgroupfs files report a size of zero, so `-s` says nothing: read a
+			# line. `read` answers 1 for an empty file and for one it could not
+			# open alike, so the open is proved by the group having run at all.
+			first=
+			opened=0
+			{
+				opened=1
+				IFS= read -r first || true
+			} 2>/dev/null <"$d/cgroup.procs" || true
+			if [ "$opened" -eq 0 ]; then
 				# A CGROUP REMOVED SINCE THE GLOB is a microVM that is gone, not
 				# one that could not be read.
 				[ -d "$d" ] || continue
 				vms='?'
 				return 0
 			fi
-			first=
-			# cgroupfs files report a size of zero, so `-s` says nothing: read a line.
-			IFS= read -r first <"$d/cgroup.procs" 2>/dev/null || true
 			[ -n "$first" ] || continue
 			vms=${vms:+$vms;}${d##*/}
 		done
@@ -220,18 +230,18 @@ prev_uj=
 prev_cs=
 n=0
 while [ "$stop" -eq 0 ]; do
-	# THE CLOCK, THE COUNTER AND THE INVENTORY ARE READ TOGETHER, before the BMC:
-	# a BMC call can take seconds, and a microVM that exited during it would
-	# otherwise be missing from a row whose energy it drew.
+	# THE CLOCK, THE COUNTER, THE INVENTORY AND TURBOSTAT ARE READ TOGETHER,
+	# before the BMC: a BMC call can take seconds, and a microVM that exited
+	# during it would otherwise be missing from a row whose energy it drew.
 	read_uptime_cs
 	cur_uj=
 	if IFS= read -r cur_uj <"$powercap/energy_uj" 2>/dev/null; then
 		case "$cur_uj" in '' | *[!0-9]*) cur_uj= ;; esac
 	fi
 	read_instances
+	read_turbostat
 	epoch=$(date +%s)
 	read_bmc
-	read_turbostat
 
 	delta=
 	if [ -n "$cur_uj" ] && [ -n "$prev_uj" ] && [ -n "$up_cs" ] && [ -n "$prev_cs" ] &&

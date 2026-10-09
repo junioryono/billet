@@ -187,7 +187,7 @@ jobs:
         env:
           KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
           KA_NETWORK_URL: ${{ inputs.network_url }}
-          KA_NETWORK_BYTES: ${{ inputs.network_bytes > 0 && inputs.network_bytes || '' }}
+          KA_NETWORK_BYTES: ${{ inputs.network_bytes != 0 && inputs.network_bytes || '' }}
         run: bash .billet-known-answer/scripts/known-answer-job.sh network "$RUNNER_TEMP/known-answer"
       - name: Upload the expectation
         uses: actions/upload-artifact@v7

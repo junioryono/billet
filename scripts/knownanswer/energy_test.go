@@ -52,8 +52,8 @@ func TestTheJobsEnergyReconcilesWithThePackage(t *testing.T) {
 	for _, line := range []string{
 		"package RAPL: 3.55 kJ, mean 104.4 W",
 		"idle before: 73.5 W against idle_package_watts 73.5 W (+0.0%)",
-		"above idle: measured 1.05 kJ, attributed to jobs 1.00 kJ (ratio 0.952, accepted [0.85, 1.02])",
-		"unattributed: 0.05 kJ, 1.5 W over the window",
+		"above idle over the 11 s a microVM was alive: measured 1.05 kJ, attributed to jobs 1.00 kJ (ratio 0.952",
+		"unattributed: 0.05 kJ, 4.5 W while a microVM was alive",
 		"overall PASS",
 	} {
 		if !strings.Contains(out.String(), line) {
@@ -177,6 +177,33 @@ func TestTheIdleBaselineIsTakenPerInterval(t *testing.T) {
 	}
 }
 
+// A QUIET INTERVAL'S NOISE IS NOT THE JOBS': quiet minutes alternating 70 and
+// 77 W average the 73.5 W baseline, and taken interval by interval their 77 W
+// halves would add 3.5 J a second the monitor never shares out. Only the
+// intervals a microVM was alive for are reconciled.
+func TestQuietNoiseIsNotCountedAgainstTheJobs(t *testing.T) {
+	var rows []powerRow
+	for i := range 64 {
+		row := powerRow{epoch: int64(i), uptime: float64(i), uptimeOK: true, inventoryOK: true}
+		if i > 0 {
+			row.delta, row.deltaOK = 70_000_000, true
+			if i%2 == 1 {
+				row.delta = 77_000_000
+			}
+		}
+		if i >= 27 && i < 37 {
+			row.delta, row.instances = 173_500_000, []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	res := reconcile(rows, 73.5, 10, fromMap(leaseA(1000, 0, nil)))
+	// Ten busy intervals and the one after the last busy row (77 W, the tail).
+	if res.verdict != pass || res.busySeconds != 11 || res.activeMeasured != 1_003_500_000 {
+		t.Errorf("verdict %s (ratio %.3f), %v s busy, above idle %.0f µJ: %s", res.verdict, res.ratio,
+			res.busySeconds, res.activeMeasured, res.reason)
+	}
+}
+
 func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) string {
@@ -243,5 +270,13 @@ func TestEnergyExitsWithItsVerdict(t *testing.T) {
 	if code := run(t.Context(), []string{"energy", "--power-log", referenceLog, "--records", t.TempDir()},
 		&stdout, &stderr); code != exitUsage {
 		t.Errorf("energy without --idle-watts exited %d, want %d", code, exitUsage)
+	}
+	// NaN COMPARES FALSE WITH EVERYTHING, so a NaN baseline would pass both idle
+	// ends; it and infinity are refused as flags.
+	for _, w := range []string{"NaN", "+Inf", "-1"} {
+		if code := run(t.Context(), []string{"energy", "--power-log", referenceLog, "--records", t.TempDir(),
+			"--idle-watts", w}, &stdout, &stderr); code != exitUsage {
+			t.Errorf("--idle-watts %s exited %d, want %d", w, code, exitUsage)
+		}
 	}
 }

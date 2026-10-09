@@ -2,7 +2,7 @@
 // answer is known, and the jobs' attributed energy with the package's.
 //
 //	knownanswer collect --out DIR [--expectations DIR] [--power-log CSV] [--billet PATH] [--config PATH]
-//	knownanswer check   --expectations DIR --records DIR [--discard N]
+//	knownanswer check   --expectations DIR --records DIR --runs N [--discard N]
 //	knownanswer energy  --power-log CSV --records DIR --idle-watts W [--quiet-rows N]
 //
 // The expectations are what .github/workflows/known-answer.yml's jobs upload
@@ -27,6 +27,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -99,11 +100,12 @@ func runCheck(args []string, stdout, stderr io.Writer) (int, error) {
 	expDir := fs.String("expectations", "", "the directory `gh run download` wrote the expectations into")
 	recDir := fs.String("records", "", "the directory collect wrote billet's records into")
 	discard := fs.Int("discard", 0, "drop this many of the earliest runs (the warmup)")
+	want := fs.Int("runs", 0, "how many measured runs there must be after the discarded ones")
 	if err := fs.Parse(args); err != nil {
 		return 0, err
 	}
-	if *expDir == "" || *recDir == "" || fs.NArg() != 0 || *discard < 0 {
-		return 0, errors.New("usage: knownanswer check --expectations DIR --records DIR [--discard N]")
+	if *expDir == "" || *recDir == "" || fs.NArg() != 0 || *discard < 0 || *want < 1 {
+		return 0, errors.New("usage: knownanswer check --expectations DIR --records DIR --runs N [--discard N]")
 	}
 	exps, err := loadExpectations(*expDir)
 	if err != nil {
@@ -118,8 +120,17 @@ func runCheck(args []string, stdout, stderr io.Writer) (int, error) {
 		return 0, errors.New("no loaded job to check: only baselines were found")
 	}
 	report(stdout, results, dropped)
+	// A RUN THAT LEFT NO EXPECTATION AT ALL IS INVISIBLE ABOVE: its baseline
+	// failed and every job after it was skipped. The count the operator asked
+	// for is what finds it.
+	v := overall(results)
+	if got := countRuns(kept); got < *want {
+		fmt.Fprintf(stdout, "only %d of the %d measured runs asked for left expectations, so the rest are "+
+			"UNMEASURED\n", got, *want)
+		v = worst(v, unmeasured)
+	}
 
-	return verdictCode(overall(results)), nil
+	return verdictCode(v), nil
 }
 
 func runEnergy(args []string, stdout, stderr io.Writer) (int, error) {
@@ -132,7 +143,9 @@ func runEnergy(args []string, stdout, stderr io.Writer) (int, error) {
 	if err := fs.Parse(args); err != nil {
 		return 0, err
 	}
-	if *logPath == "" || *recDir == "" || *idleWatts <= 0 || *quiet < 1 || fs.NArg() != 0 {
+	// NOT `<= 0`: NaN compares false with everything, and would pass both idle ends.
+	finite := *idleWatts > 0 && !math.IsInf(*idleWatts, 0)
+	if *logPath == "" || *recDir == "" || !finite || *quiet < 1 || fs.NArg() != 0 {
 		return 0, errors.New("usage: knownanswer energy --power-log CSV --records DIR --idle-watts W [--quiet-rows N]")
 	}
 	rows, err := readPowerLog(*logPath)

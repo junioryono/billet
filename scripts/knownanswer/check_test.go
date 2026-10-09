@@ -384,7 +384,7 @@ func TestCheckExitsWithItsVerdict(t *testing.T) {
 				writeRun(t, expDir, recDir, exps, recs)
 			}
 			var stdout, stderr bytes.Buffer
-			code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir},
+			code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--runs", "2"},
 				&stdout, &stderr)
 			if code != tc.code || !strings.Contains(stdout.String(), tc.says) {
 				t.Errorf("exit %d, want %d saying %q:\n%s%s", code, tc.code, tc.says, stdout.String(), stderr.String())
@@ -402,7 +402,7 @@ func TestCheckExitsWithItsVerdict(t *testing.T) {
 	if code := run(t.Context(), []string{"check", "--records", t.TempDir()}, &stdout, &stderr); code != exitUsage {
 		t.Errorf("a check with no expectations exited %d, want %d", code, exitUsage)
 	}
-	if code := run(t.Context(), []string{"check", "--expectations", t.TempDir(), "--records", t.TempDir()},
+	if code := run(t.Context(), []string{"check", "--expectations", t.TempDir(), "--records", t.TempDir(), "--runs", "1"},
 		&stdout, &stderr); code != exitUsage || !strings.Contains(stderr.String(), "no expectation.json") {
 		t.Errorf("an empty expectations directory exited %d: %s", code, stderr.String())
 	}
@@ -418,7 +418,8 @@ func TestCheckDiscardsTheWarmupItIsTold(t *testing.T) {
 		writeRun(t, expDir, recDir, exps, recs)
 	}
 	var stdout, stderr bytes.Buffer
-	code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--discard", "1"},
+	code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--discard", "1",
+		"--runs", "1"},
 		&stdout, &stderr)
 	if code != exitPass || !strings.Contains(stdout.String(), "discarded run 100 attempt 1 (warmup)") ||
 		strings.Contains(stdout.String(), "\nrun 100 attempt 1\n") {
@@ -501,5 +502,41 @@ func TestTheStatisticsCountOnlyComparisonsMade(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("the report does not say %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// A RUN THAT LEFT NOTHING AT ALL IS FOUND BY THE COUNT ASKED FOR: its baseline
+// failed before uploading and every job after it was skipped, so no
+// expectation says it existed.
+func TestARunThatLeftNothingIsFoundByTheCountAskedFor(t *testing.T) {
+	expDir, recDir := t.TempDir(), t.TempDir()
+	for _, id := range []int64{100, 200} {
+		exps, recs := fixtureRun(id)
+		writeRun(t, expDir, recDir, exps, recs)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--runs", "3"},
+		&stdout, &stderr)
+	if code != exitUnmeasured || !strings.Contains(stdout.String(), "only 2 of the 3 measured runs asked for") {
+		t.Errorf("exit %d, want %d:\n%s%s", code, exitUnmeasured, stdout.String(), stderr.String())
+	}
+	if code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir},
+		&stdout, &stderr); code != exitUsage {
+		t.Errorf("a check that names no run count exited %d, want %d", code, exitUsage)
+	}
+}
+
+// A LOAD THE TOLERANCE CANNOT TELL FROM NO LOAD IS UNMEASURED: a 1 MiB
+// download accepts zero bytes, so a job that received nothing would pass.
+func TestALoadTooSmallToTellFromNothingIsUnmeasured(t *testing.T) {
+	exps, recs := fixtureRun(100)
+	for i := range exps {
+		if exps[i].Kind == kindNetwork {
+			exps[i].Expected["net_rx_bytes"] = 1 * mib
+		}
+	}
+	got := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork)
+	if got.verdict != unmeasured || !strings.Contains(got.reason, "the load is too small to compare") {
+		t.Errorf("a 1 MiB download: %s (%q), want UNMEASURED", got.verdict, got.reason)
 	}
 }

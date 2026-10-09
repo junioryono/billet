@@ -129,6 +129,7 @@ type energyResult struct {
 	idleVerdict                verdict
 	activeMeasured             float64
 	idlePool                   float64
+	busySeconds                float64
 	attributed, attributedIdle int64
 	ratio                      float64
 	jobs                       []energyJob
@@ -184,7 +185,15 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 		// contributes no active energy rather than a negative amount.
 		idle := min(idleWatts*dt*1e6, float64(row.delta))
 		res.idlePool += idle
-		res.activeMeasured += float64(row.delta) - idle
+		// ONLY AN INTERVAL A MICROVM WAS ALIVE FOR IS RECONCILED: it was seen at
+		// its start or its end, which takes in the interval it started in and
+		// the one its tail fell in. The monitor shares out nothing while no job
+		// runs, so a quiet interval's noise above the baseline would count
+		// against the jobs without being theirs.
+		if len(row.instances) > 0 || len(rows[i-1].instances) > 0 {
+			res.activeMeasured += float64(row.delta) - idle
+			res.busySeconds += dt
+		}
 	}
 	res.seconds = rows[len(rows)-1].uptime - rows[0].uptime
 	if res.seconds <= 0 {
@@ -351,11 +360,12 @@ func (res energyResult) write(w io.Writer) {
 			j.window, kj(float64(j.active)), kj(float64(j.idle)))
 	}
 	if res.verdict != unmeasured {
-		fmt.Fprintf(w, "above idle: measured %s, attributed to jobs %s (ratio %.3f, accepted [%.2f, %.2f])\n",
-			kj(res.activeMeasured), kj(float64(res.attributed)), res.ratio, attributedLow, attributedHigh)
-		fmt.Fprintf(w, "unattributed: %s, %.1f W over the window (the host's own work above idle)\n",
+		fmt.Fprintf(w, "above idle over the %.0f s a microVM was alive: measured %s, attributed to jobs %s "+
+			"(ratio %.3f, accepted [%.2f, %.2f])\n", res.busySeconds, kj(res.activeMeasured),
+			kj(float64(res.attributed)), res.ratio, attributedLow, attributedHigh)
+		fmt.Fprintf(w, "unattributed: %s, %.1f W while a microVM was alive (the host's own work above idle)\n",
 			kj(res.activeMeasured-float64(res.attributed)),
-			(res.activeMeasured-float64(res.attributed))/1e6/res.seconds)
+			(res.activeMeasured-float64(res.attributed))/1e6/res.busySeconds)
 		fmt.Fprintf(w, "jobs' idle shares: %s of the window's %s idle baseline\n", kj(float64(res.attributedIdle)),
 			kj(res.idlePool))
 	} else {
