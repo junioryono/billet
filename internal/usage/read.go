@@ -3,6 +3,7 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -170,16 +171,88 @@ func (s *Sample) readMemory(r Reader, t Target) {
 	s.MemoryCurrent, s.MemoryPeak, s.OOMKills, s.MemoryOK, s.OOMOK = cur, peak, ev["oom_kill"], true, true
 }
 
+// readIO reads the bytes the job's cgroup read and wrote.
+//
+// WRITTEN INCLUDES WHAT IS STILL DIRTY IN THE HOST'S PAGE CACHE. A microVM's
+// disk writes, O_DIRECT in the guest included, land in the host's page cache
+// and reach io.stat only when the host writes them back, about 30 s later;
+// a job whose VM stops sooner had its last writes charged to no cgroup at all
+// (#457: a 2 GiB fio write recorded as 475 MiB). A dirty page leaves file_dirty
+// when its writeback is submitted, which is when io.stat counts it, so the sum
+// counts each byte once: measured on ubuntu-01 on 2026-10-09, a 512 MiB
+// buffered write to a krbd device read 512 MiB in the sum at every point,
+// 28 s in file_dirty and then in io.stat. Without memory.stat the written
+// figure would be a lower bound, so the group is not measured.
+//
+// EXACT TO WITHIN ONE WRITEBACK BATCH, not exact: the kernel clears a page's
+// dirty flag a moment before it submits the page's IO, so a read that lands in
+// between misses what is in flight. The job's running maximum takes it back at
+// the next sample; only a last sample that lands there keeps the gap.
+// Firecracker's own per-drive write counter would be exact.
 func (s *Sample) readIO(r Reader, t Target) {
-	raw, err := r.read(filepath.Join(t.CgroupDir, "io.stat"))
-	if err != nil {
-		return
+	rb, written, ok := coherentWritten(
+		func() (int64, int64, error) {
+			raw, err := r.read(filepath.Join(t.CgroupDir, "io.stat"))
+			if err != nil {
+				return 0, 0, err
+			}
+
+			return parseIOStat(raw)
+		},
+		func() (int64, error) {
+			raw, err := r.read(filepath.Join(t.CgroupDir, "memory.stat"))
+			if err != nil {
+				return 0, err
+			}
+			mem, err := parseFlatKeyed(raw)
+			if err != nil {
+				return 0, err
+			}
+			dirty, found := mem["file_dirty"]
+			if !found {
+				return 0, errors.New("usage: memory.stat has no file_dirty")
+			}
+
+			return dirty, nil
+		})
+	if ok {
+		s.DiskRead, s.DiskWrite, s.IOOK = rb, written, true
 	}
-	rb, wb, err := parseIOStat(raw)
-	if err != nil {
-		return
+}
+
+// coherentWritten reads io, then the dirty bytes, then io again, and answers
+// the second read's bytes plus the dirty ones only when nothing was written
+// back in between. Writeback moving a batch from dirty to io.stat between two
+// separate reads would otherwise leave it in neither. It tries three times and
+// then answers that it could not tell.
+//
+// It answers the bytes read, the bytes written, and whether it could tell.
+func coherentWritten(readIO func() (int64, int64, error), readDirty func() (int64, error),
+) (int64, int64, bool) {
+	for range 3 {
+		_, before, err := readIO()
+		if err != nil {
+			return 0, 0, false
+		}
+		dirty, err := readDirty()
+		if err != nil || dirty < 0 {
+			return 0, 0, false
+		}
+		rb, after, err := readIO()
+		if err != nil {
+			return 0, 0, false
+		}
+		if after != before {
+			continue
+		}
+		if after > math.MaxInt64-dirty {
+			return 0, 0, false
+		}
+
+		return rb, after + dirty, true
 	}
-	s.DiskRead, s.DiskWrite, s.IOOK = rb, wb, true
+
+	return 0, 0, false
 }
 
 func (s *Sample) readPressure(r Reader, t Target) {

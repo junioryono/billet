@@ -1,8 +1,10 @@
 package usage
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +97,8 @@ func referenceVM(t *testing.T) (tree, Target) {
 	tr.write(refCgroup+"/memory.events", "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\noom_group_kill 0\n")
 	tr.write(refCgroup+"/io.stat", "251:16 rbytes=1048576 wbytes=4194304 rios=10 wios=40 dbytes=0 dios=0\n"+
 		"251:32 rbytes=2097152 wbytes=0 rios=5 wios=0 dbytes=0 dios=0\n")
+	// 2 MiB written by the guest and not yet written back by the host.
+	tr.write(refCgroup+"/memory.stat", "anon 4096\nfile 8388608\nfile_dirty 2097152\nfile_writeback 0\n")
 	for tid, stat := range refThreads {
 		tr.write("/proc/315359/task/"+tid+"/stat", stat+"\n")
 	}
@@ -137,8 +141,114 @@ func TestTheReferenceVMReadsAsItWasMeasured(t *testing.T) {
 	if !s.MemoryOK || s.MemoryCurrent != 8<<30 || s.MemoryPeak != 9<<30 || s.OOMKills != 1 {
 		t.Errorf("memory = current %d peak %d oom %d", s.MemoryCurrent, s.MemoryPeak, s.OOMKills)
 	}
-	if !s.IOOK || s.DiskRead != 3<<20 || s.DiskWrite != 4<<20 {
-		t.Errorf("io = read %d write %d, want the sum over both devices", s.DiskRead, s.DiskWrite)
+	if !s.IOOK || s.DiskRead != 3<<20 || s.DiskWrite != 6<<20 {
+		t.Errorf("io = read %d write %d, want the sum over both devices plus the 2 MiB still dirty",
+			s.DiskRead, s.DiskWrite)
+	}
+}
+
+// WRITEBACK BETWEEN THE TWO READS IS SEEN AND READ AGAIN, never answered as a
+// batch counted twice or in neither file. The first pass reads io.stat 0, 512
+// MiB dirty, then io.stat 512 MiB (the batch moved): it is discarded, and the
+// second pass reads dirty afresh (0), so the answer is 512 MiB, once. Reusing
+// the first pass's dirty read would answer 1 GiB. Each pass reads io, dirty,
+// io, in that order. Three passes that keep moving are could-not-tell.
+func TestWrittenIsReadCoherentlyAcrossWriteback(t *testing.T) {
+	t.Parallel()
+
+	ios := []int64{0, 512 << 20, 512 << 20, 512 << 20}
+	dirties := []int64{512 << 20, 0}
+	var calls []string
+	ioCalls, dirtyCalls := 0, 0
+	readIO := func() (int64, int64, error) {
+		calls = append(calls, "io")
+		if ioCalls >= len(ios) {
+			t.Fatalf("io read %d times; the test stages %d", ioCalls+1, len(ios))
+		}
+		ioCalls++
+		return 7, ios[ioCalls-1], nil
+	}
+	readDirty := func() (int64, error) {
+		calls = append(calls, "dirty")
+		if dirtyCalls >= len(dirties) {
+			t.Fatalf("dirty read %d times; the test stages %d", dirtyCalls+1, len(dirties))
+		}
+		dirtyCalls++
+		return dirties[dirtyCalls-1], nil
+	}
+	rb, written, ok := coherentWritten(readIO, readDirty)
+	if !ok || written != 512<<20 || rb != 7 {
+		t.Fatalf("written %d (ok %v); want 512 MiB from the second, coherent pass", written, ok)
+	}
+	if want := []string{"io", "dirty", "io", "io", "dirty", "io"}; !slices.Equal(calls, want) {
+		t.Fatalf("reads were %v, want %v", calls, want)
+	}
+
+	moving := int64(0)
+	alwaysMoving := func() (int64, int64, error) { moving += 1 << 20; return 0, moving, nil }
+	if _, w, ok := coherentWritten(alwaysMoving, func() (int64, error) { return 0, nil }); ok {
+		t.Errorf("io.stat that moved on every pass answered %d written; want could-not-tell", w)
+	}
+	if _, w, ok := coherentWritten(func() (int64, int64, error) { return 0, 1 << 20, nil },
+		func() (int64, error) { return -4096, nil }); ok {
+		t.Errorf("a negative dirty count answered %d written", w)
+	}
+	if _, w, ok := coherentWritten(func() (int64, int64, error) { return 0, math.MaxInt64, nil },
+		func() (int64, error) { return 1, nil }); ok {
+		t.Errorf("a sum past an int64 answered %d", w)
+	}
+	if _, _, err := parseIOStat("8:0 rbytes=0 wbytes=9223372036854775807\n8:16 rbytes=0 wbytes=1\n"); err == nil {
+		t.Error("io.stat devices summing past an int64 parsed")
+	}
+}
+
+// WHAT A JOB WROTE NEVER FALLS between samples: a page dirtied and discarded
+// before the host wrote it back leaves the dirty gauge without reaching
+// io.stat, and the most the job was seen to have written stands.
+func TestWrittenNeverFallsAcrossSamples(t *testing.T) {
+	t.Parallel()
+
+	j := &job{}
+	j.absorb(Sample{IOOK: true, DiskRead: 1, DiskWrite: 300 << 20}, time.Now())
+	j.absorb(Sample{IOOK: true, DiskRead: 2, DiskWrite: 100 << 20}, time.Now())
+	if j.latest.DiskWrite != 300<<20 || j.latest.DiskRead != 2 {
+		t.Errorf("written %d read %d after a fall; want written held at 300 MiB and read the latest",
+			j.latest.DiskWrite, j.latest.DiskRead)
+	}
+	j.absorb(Sample{IOOK: true, DiskWrite: 400 << 20}, time.Now())
+	if j.latest.DiskWrite != 400<<20 {
+		t.Errorf("written %d after a rise; want 400 MiB", j.latest.DiskWrite)
+	}
+}
+
+// WHAT A JOB WROTE IS WHAT THE HOST WROTE BACK PLUS WHAT IS STILL DIRTY (#457):
+// a write the host has not flushed yet counts once, and the same byte counts
+// once after the flush. Without memory.stat, or without its file_dirty key,
+// the written figure would be a lower bound, so io is unmeasured, while memory
+// is still read from its own files.
+func TestWrittenCountsWhatTheHostHasNotFlushedYet(t *testing.T) {
+	tr, target := referenceVM(t)
+	read := func() Sample { return Reader{Root: tr.root}.Read(target) }
+
+	tr.write(refCgroup+"/io.stat", "251:16 rbytes=0 wbytes=0 rios=0 wios=0 dbytes=0 dios=0\n")
+	tr.write(refCgroup+"/memory.stat", "file_dirty 536870912\nfile_writeback 0\n")
+	before := read()
+	tr.write(refCgroup+"/io.stat", "251:16 rbytes=0 wbytes=536870912 rios=0 wios=128 dbytes=0 dios=0\n")
+	tr.write(refCgroup+"/memory.stat", "file_dirty 0\nfile_writeback 0\n")
+	after := read()
+	if !before.IOOK || !after.IOOK || before.DiskWrite != 512<<20 || after.DiskWrite != 512<<20 {
+		t.Fatalf("written before the flush %d (ok %v), after %d (ok %v); want 512 MiB both times",
+			before.DiskWrite, before.IOOK, after.DiskWrite, after.IOOK)
+	}
+
+	tr.write(refCgroup+"/memory.stat", "file 4096\n")
+	if s := read(); s.IOOK {
+		t.Errorf("a memory.stat with no file_dirty measured io as %d written", s.DiskWrite)
+	}
+	tr.remove(refCgroup + "/memory.stat")
+	if s := read(); s.IOOK || !s.MemoryOK {
+		t.Errorf("without memory.stat: io ok %v (want unmeasured), memory ok %v (want measured)",
+			s.IOOK, s.MemoryOK)
 	}
 }
 
