@@ -42,12 +42,16 @@ type Params struct {
 	// blamed for a full queue: a delay that rises while the host is quiet is
 	// somebody else's traffic, and cutting the host's rate would help nobody.
 	Busy float64
-	// Share is the part of the host's busier direction a direction must be
-	// moving to be blamed. A round trip cannot say which direction's queue rose,
-	// and a download filling the line drags its own acknowledgements upstream: an
-	// upload of a few Mbit/s beside a download of hundreds did not fill anything,
-	// and cutting it would slow the download's acknowledgements as well.
-	Share float64
+	// MinBlame is the least a direction must be moving, in Mbit/s, to be blamed
+	// at all. A host carrying a trickle beside somebody else's stream is its own
+	// recent peak, and without a floor on the blame it would be cut for a queue
+	// it did not fill; nothing is cut below Floor anyway, so a direction moving
+	// less than twice that could gain nothing from a cut.
+	MinBlame float64
+	// Futile is how many cuts in a row may leave the delay no lower before a
+	// direction stops being cut until the queue clears: a cut that does not
+	// shorten the queue says the queue is not this host's.
+	Futile int
 	// Cooldown is the least time between two cuts in one direction, so the
 	// queue a cut is meant to drain has the chance to drain before the next.
 	Cooldown time.Duration
@@ -63,8 +67,9 @@ type Params struct {
 
 // DefaultParams are cake-autorate's defaults where they carry over (a window
 // of 6 with 3 delayed, cuts from 0.99 to 0.75 reaching the deepest at 60 ms, a
-// high-load share of 0.75, a raise of 1.04), with the threshold and cooldown
-// this host's tick and a residential line call for.
+// high-load share of 0.75, a raise of 1.04), with the threshold a residential
+// line calls for. The cooldown is longer than the two seconds throughput is
+// measured over, so a cut is never judged on traffic from before it.
 func DefaultParams() Params {
 	return Params{
 		Bloat:      15 * time.Millisecond,
@@ -74,8 +79,9 @@ func DefaultParams() Params {
 		GentleCut:  0.99,
 		DeepCut:    0.75,
 		Busy:       0.5,
-		Share:      0.3,
-		Cooldown:   time.Second,
+		MinBlame:   2 * Floor,
+		Futile:     2,
+		Cooldown:   3 * time.Second,
 		Full:       0.75,
 		Raise:      1.04,
 		PeakWindow: time.Minute,
@@ -98,6 +104,8 @@ type Direction struct {
 	peakAt   time.Time
 	lastCut  time.Time
 	cutSince bool
+	cutDelay time.Duration
+	futile   int
 }
 
 // NewDirection starts a direction unshaped, at the interface's own speed.
@@ -156,14 +164,17 @@ func (c *Controller) Step(o Observation) bool {
 	cut := c.cutFactor(o.Delay)
 
 	seconds := o.Interval.Seconds()
-	sent := float64(o.SentBits) / seconds / 1e6
-	received := float64(o.ReceivedBits) / seconds / 1e6
-	busier := max(sent, received)
+	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, full, cut, o)
+	downChanged, downCut := c.step(&c.Down, float64(o.ReceivedBits)/seconds/1e6, full, cut, o)
 
-	up := c.step(&c.Up, sent, busier, full, cut, o)
-	down := c.step(&c.Down, received, busier, full, cut, o)
+	// A CUT IS JUDGED ON FRESH EVIDENCE: the samples that caused it are
+	// forgotten, so the next cut needs the window to fill with delays seen after
+	// it.
+	if upCut || downCut {
+		c.recent = nil
+	}
 
-	return up || down
+	return upChanged || downChanged
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
@@ -181,7 +192,9 @@ func (c *Controller) cutFactor(delay time.Duration) float64 {
 	return p.GentleCut - (p.GentleCut-p.DeepCut)*share
 }
 
-func (c *Controller) step(d *Direction, moving, busier float64, full bool, cut float64, o Observation) bool {
+// step moves one direction's rate, and reports whether it changed and whether
+// that was a cut.
+func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, o Observation) (bool, bool) {
 	p := c.Params
 
 	if moving >= d.peak || o.At.Sub(d.peakAt) > p.PeakWindow {
@@ -193,29 +206,52 @@ func (c *Controller) step(d *Direction, moving, busier float64, full bool, cut f
 	switch {
 	case full:
 		// BLAMED ONLY WHEN BUSY. The queue is the line's, and a direction carrying
-		// little of its recent peak, or little beside the other direction, is not
-		// what filled it.
-		if d.peak <= 0 || moving < p.Busy*d.peak || moving < p.Share*busier {
-			return false
+		// a trickle, or little of its own recent peak, is not what filled it.
+		if moving < p.MinBlame || moving < p.Busy*d.peak {
+			return false, false
 		}
 
 		if d.cutSince && o.At.Sub(d.lastCut) < p.Cooldown {
-			return false
+			return false, false
+		}
+
+		// A CUT THAT DID NOT SHORTEN THE QUEUE IS NOT REPEATED FOREVER: the queue
+		// is somebody else's, and cutting on would only take this host to the
+		// floor.
+		if d.cutSince && o.Delay >= d.cutDelay {
+			d.futile++
+		} else {
+			d.futile = 0
+		}
+
+		if d.futile >= p.Futile {
+			return false, false
 		}
 
 		// CUT BELOW WHAT IS FLOWING, not below the old rate: an unshaped direction
 		// starts at the interface's speed, far above anything the line carries,
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*cut, d.Max)
-		d.lastCut, d.cutSince = o.At, true
-	case moving >= p.Full*d.Rate:
-		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and the
-		// line shows no queue, so a rate climbs back toward the line's speed as
-		// fast as the line allows and no faster.
+		d.lastCut, d.cutSince, d.cutDelay = o.At, true, o.Delay
+
+		return d.Rate != before, true
+	case moving >= p.Full*d.Rate && !(o.DelayKnown && o.Delay > p.Bloat) &&
+		(!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
+		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and this
+		// sample shows no queue, so a rate climbs back toward the line's speed as
+		// fast as the line allows and no faster. NOT WITHIN THE COOLDOWN OF A CUT:
+		// the throughput window still holds the traffic from before it, which runs
+		// above any rate just cut and would undo the cut at once.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
+		d.futile = 0
+	case !(o.DelayKnown && o.Delay > p.Bloat):
+		// THE QUEUE CLEARED: a later one starts a new episode, and cuts are judged
+		// afresh. Not merely "not full": the window refills after every cut, and
+		// forgetting futility while it does would let cuts ratchet on regardless.
+		d.futile = 0
 	}
 
-	return d.Rate != before
+	return d.Rate != before, false
 }
 
 func clamp(rate, maxMbit float64) float64 {

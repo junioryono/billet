@@ -272,9 +272,13 @@ The Ansible collection's host role runs these as steps of a converge; each answe
 
 Keep this host's own traffic, its guests' included, from filling the queue of the internet line it shares with the rest of its site. It runs until stopped, as root, on Linux: CAKE on the interface (the default route's unless `--interface` names one) in both directions, starting at the interface's own speed, which holds nothing back. Twice a second it pings the reflectors (by default 1.1.1.1, 1.0.0.1, 8.8.8.8 and 9.9.9.9) and reads what the interface moved. When 3 of the last 6 rounds came back more than 15 ms above each reflector's idle baseline and a direction is busy, that direction is cut to below what it was moving, more deeply the higher the delay; while a direction runs at its rate with no queue, its rate rises 4% a step. Nothing about the line's speed is configured. Stopping it removes the shaping. The host role runs it as `billet-uplink.service`; [the shared-uplink record](records/shared-uplink.md) has the measurements behind it.
 
+### `billet uplink check [--interface NAME]`
+
+Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's (a root qdisc other than the kernel's default or CAKE, or an ingress qdisc without billet's `ifb-` device). The shaper refuses such an interface rather than replace it. The host role enables `billet-uplink.service` only where this passes.
+
 ### `billet uplink clear [--interface NAME]`
 
-Remove what a `billet uplink shape` that did not stop cleanly left on the interface.
+Remove what a `billet uplink shape` left on the interface, and only that: by default the interface the last run recorded under `/run/billet-uplink/`, so a crash is cleared even after the default route moved. It exits non-zero when a removal failed.
 
 ## Removal
 

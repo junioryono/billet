@@ -13,27 +13,34 @@ import (
 )
 
 // Uplink keeps this host's own traffic from filling its site's shared internet
-// line: `shape` runs until stopped, `clear` removes what a run left behind.
+// line: `shape` runs until stopped, `check` says whether this host can be
+// shaped, `clear` removes what a run left behind.
 func Uplink(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet uplink shape [--interface NAME] [--reflectors A,B,...], " +
-			"or billet uplink clear [--interface NAME]")
-	}
-
-	// LINUX ONLY: the shaper is tc and CAKE. A Mac has neither, and refusing
-	// here says so rather than failing on the first command it cannot find.
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("billet uplink shapes with Linux's tc and CAKE, which %s does not have", runtime.GOOS)
+			"billet uplink check [--interface NAME], or billet uplink clear [--interface NAME]")
 	}
 
 	switch args[0] {
 	case "shape":
 		return uplinkShape(ctx, env, args[1:])
+	case "check":
+		return uplinkCheck(ctx, env, args[1:])
 	case "clear":
 		return uplinkClear(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown uplink command %q; try shape or clear", args[0])
+	return fmt.Errorf("unknown uplink command %q; try shape, check or clear", args[0])
+}
+
+// linuxOnly is checked after a command's flags are parsed, so `-h` answers on
+// every platform: the shaper is tc and CAKE, which only Linux has.
+func linuxOnly() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("billet uplink shapes with Linux's tc and CAKE, which %s does not have", runtime.GOOS)
+	}
+
+	return nil
 }
 
 func uplinkShape(ctx context.Context, env cli.Env, args []string) error {
@@ -45,6 +52,10 @@ func uplinkShape(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if err := linuxOnly(); err != nil {
+		return err
+	}
+
 	return uplink.Run(ctx, uplink.Options{
 		Iface:      *iface,
 		Reflectors: strings.Split(*reflectors, ","),
@@ -53,25 +64,70 @@ func uplinkShape(ctx context.Context, env cli.Env, args []string) error {
 	})
 }
 
-func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
-	fs := cli.NewFlagSet("billet uplink clear", env.Stdout)
-	iface := fs.String("interface", "", "the interface to clear; empty clears the one the default route leaves by")
+func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet uplink check", env.Stdout)
+	iface := fs.String("interface", "", "the interface to check; empty checks the one the default route leaves by")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
 
-	name := *iface
-	if name == "" {
-		found, err := uplink.DefaultInterface()
-		if err != nil {
-			return err
-		}
-
-		name = found
+	if err := linuxOnly(); err != nil {
+		return err
 	}
 
-	(&uplink.Shaper{Iface: name}).Clear(ctx)
-	fmt.Fprintf(env.Stdout, "billet uplink: no shaping on %s\n", name)
+	name, err := pickInterface(*iface, "")
+	if err != nil {
+		return err
+	}
+
+	if err := (&uplink.Shaper{Iface: name}).Check(ctx); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(env.Stdout, "billet uplink: %s can be shaped\n", name)
 
 	return nil
+}
+
+func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
+	fs := cli.NewFlagSet("billet uplink clear", env.Stdout)
+	iface := fs.String("interface", "", "the interface to clear; empty clears the one the last run recorded, "+
+		"or else the default route's")
+	if err := cli.Parse(fs, args); err != nil {
+		return err
+	}
+
+	if err := linuxOnly(); err != nil {
+		return err
+	}
+
+	// THE RECORDED INTERFACE FIRST: after a crash the default route may have
+	// moved, and the shaping is on the interface the shaper chose.
+	name, err := pickInterface(*iface, uplink.RecordedInterface())
+	if err != nil {
+		return err
+	}
+
+	if err := (&uplink.Shaper{Iface: name}).Clear(ctx); err != nil {
+		return fmt.Errorf("remove the shaping from %s: %w", name, err)
+	}
+
+	if err := uplink.Forget(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(env.Stdout, "billet uplink: no shaping of billet's on %s\n", name)
+
+	return nil
+}
+
+func pickInterface(named, recorded string) (string, error) {
+	switch {
+	case named != "":
+		return named, nil
+	case recorded != "":
+		return recorded, nil
+	}
+
+	return uplink.DefaultInterface()
 }

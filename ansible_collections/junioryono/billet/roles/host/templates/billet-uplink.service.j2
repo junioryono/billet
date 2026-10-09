@@ -8,8 +8,12 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/billet uplink shape
 ExecStopPost=/usr/bin/billet uplink clear
-Restart=always
-RestartSec=10
+# The interface the shaper chose, kept past a stop so the cleanup above finds
+# it; a reboot empties it along with the shaping.
+RuntimeDirectory=billet-uplink
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target

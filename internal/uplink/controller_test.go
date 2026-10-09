@@ -52,19 +52,54 @@ func TestAFullQueueUnderTheHostsDownloadCutsItBelowWhatFlowed(t *testing.T) {
 }
 
 // A QUEUE THE HOST DID NOT FILL IS NOT THE HOST'S TO EMPTY. Somebody else at the
-// site streaming raises the delay while this host is quiet, and cutting it then
-// slows the fleet and helps nobody.
-func TestADelayWhileTheHostIsQuietCutsNothing(t *testing.T) {
+// site streaming raises the delay while this host carries a trickle, which is
+// its own recent peak; cutting it then slows the fleet and helps nobody. From
+// the first step, with no larger peak to compare against.
+func TestADelayWhileTheHostCarriesATrickleCutsNothing(t *testing.T) {
 	t.Parallel()
 
 	c := newController()
-	c.Step(moving(0, 50, 400, 0))
 
-	for n := 1; n < 8; n++ {
-		if c.Step(moving(n, 1, 2, 40*time.Millisecond)) {
-			t.Fatalf("step %d: a delay with the host moving 2 of a 400 Mbit/s peak cut its rate to %.1f",
-				n, c.Down.Rate)
+	for n := range 12 {
+		if c.Step(moving(n, 1, 8, 40*time.Millisecond)) {
+			t.Fatalf("step %d: a delay with the host moving 8 Mbit/s cut it to %.1f/%.1f",
+				n, c.Up.Rate, c.Down.Rate)
 		}
+	}
+}
+
+// A SATURATED UPLOAD ON AN ASYMMETRIC LINE IS BLAMED, though the download beside
+// it is ten times larger: a 20 Mbit/s upload can fill a 500/20 line on its own.
+func TestASaturatedUploadIsBlamedBesideALargerDownload(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+
+	for n := range 3 {
+		c.Step(moving(n, 25, 250, 30*time.Millisecond))
+	}
+
+	if c.Up.Rate >= 25 {
+		t.Fatalf("a 25 Mbit/s upload under a full queue was left at %.1f", c.Up.Rate)
+	}
+}
+
+// CUTS THAT DO NOT SHORTEN THE QUEUE STOP: a delay that stays where it was
+// through two cuts is not this host's, and cutting on would take it to the floor.
+func TestCutsThatLeaveTheDelayAloneStop(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	delay := 40 * time.Millisecond
+	f := c.cutFactor(delay)
+
+	for n := range 60 {
+		c.Step(moving(n, 0, 300, delay))
+	}
+
+	if want := 300 * f * f; c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
+		t.Fatalf("after thirty seconds of a delay no cut moved, the download is at %.1f; want two cuts, %.1f",
+			c.Down.Rate, want)
 	}
 }
 
@@ -130,17 +165,18 @@ func TestARateRisesOnlyWhileItIsTheLimitAndCutsKeepTheirDistance(t *testing.T) {
 	}
 }
 
-// NO RATE IS EVER CUT BELOW THE FLOOR, however little was moving.
-func TestNoCutGoesBelowTheFloor(t *testing.T) {
+// CUTS THAT DO SHORTEN THE QUEUE GO ON TO THE FLOOR AND NOT PAST IT: a line far
+// slower than the host is followed all the way down.
+func TestCutsThatHelpReachTheFloorAndNoFurther(t *testing.T) {
 	t.Parallel()
 
 	c := newController()
 
-	for n := range 6 {
-		c.Step(moving(n, 0, 3, time.Second))
+	for n := range 60 {
+		c.Step(moving(n, 0, 25, 2*time.Second-time.Duration(n)*10*time.Millisecond))
 	}
 
-	if c.Down.Rate < Floor {
-		t.Fatalf("the download was cut to %.1f Mbit/s, under the %.0f floor", c.Down.Rate, Floor)
+	if c.Down.Rate != Floor {
+		t.Fatalf("the download ended at %.2f Mbit/s; want exactly the %.0f floor", c.Down.Rate, Floor)
 	}
 }

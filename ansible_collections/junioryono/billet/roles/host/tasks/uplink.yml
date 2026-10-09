@@ -11,8 +11,35 @@
   register: billet_uplink_unit
   become: true
 
+# ENABLED ONLY WHERE IT CAN WORK: a kernel with CAKE and IFB, an interface with
+# no traffic policy of somebody else's, and a billet that has the command. A
+# unit that could not start would only restart into the same refusal.
+- name: Ask whether this host can be shaped
+  ansible.builtin.command:
+    argv: [/usr/bin/billet, uplink, check]
+  register: billet_uplink_check
+  changed_when: false
+  failed_when: false
+  when:
+    - billet_uplink_shaping | bool
+    - not ansible_check_mode
+  become: true
+
+- name: Say why this host is not shaped
+  ansible.builtin.debug:
+    msg: >-
+      billet_uplink_shaping is on, but this host cannot be shaped, so its traffic
+      is not held back from the site's line: {{ (billet_uplink_check.stderr | default('')
+      ~ ' ' ~ billet_uplink_check.stdout | default('')) | trim }}
+  when:
+    - billet_uplink_shaping | bool
+    - not ansible_check_mode
+    - billet_uplink_check.rc != 0
+
 - name: Shape this host's share of the uplink
-  when: billet_uplink_shaping | bool
+  when:
+    - billet_uplink_shaping | bool
+    - ansible_check_mode or billet_uplink_check.rc == 0
   block:
     - name: Install the uplink shaping unit
       ansible.builtin.template:
@@ -40,17 +67,17 @@
       when: not ansible_check_mode
       become: true
 
-- name: Remove uplink shaping that is no longer asked for
+- name: Remove uplink shaping that is not asked for or cannot run
   when:
-    - not (billet_uplink_shaping | bool)
     - billet_uplink_unit.stat.exists
+    - not ansible_check_mode
+    - not (billet_uplink_shaping | bool) or billet_uplink_check.rc != 0
   block:
     - name: Stop the uplink shaper
       ansible.builtin.systemd_service:
         name: billet-uplink.service
         enabled: false
         state: stopped
-      when: not ansible_check_mode
       become: true
 
     - name: Remove the uplink shaping unit
