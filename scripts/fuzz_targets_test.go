@@ -2,6 +2,7 @@ package scripts_test
 
 import (
 	"go/ast"
+	gobuild "go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -9,8 +10,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 var fuzzEntry = regexp.MustCompile(`(?m)^\s+- \{ package: (\./\S+), fuzz: (Fuzz\w+) \}$`)
@@ -19,8 +23,9 @@ var fuzzEntry = regexp.MustCompile(`(?m)^\s+- \{ package: (\./\S+), fuzz: (Fuzz\
 // Fuzz function run with every `go test`, but the search past them runs only
 // for the targets .github/workflows/fuzz.yml lists, which is also the list
 // `make fuzz` reads, so a target added without a row there is one nobody ever
-// fuzzes. Found by parsing every test file of this module, whatever the
-// testing.F parameter is called.
+// fuzzes. Found by parsing every test file of this module the nightly
+// platform builds, by Go's own rule for what a fuzz target is, whatever the
+// testing package is imported as.
 func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	t.Parallel()
 
@@ -56,6 +61,17 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 			return nil
 		}
 
+		// WHAT THE NIGHTLY RUN BUILDS: a file its build constraints exclude
+		// there holds no target that run can search.
+		built, err := nightly.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if err != nil {
+			return err
+		}
+
+		if !built {
+			return nil
+		}
+
 		file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			return err
@@ -68,7 +84,8 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn, names, dot) {
+			if !ok || fn.Recv != nil || !isFuzzName(fn.Name.Name) || fn.Type.TypeParams != nil ||
+				fn.Type.Results != nil || !takesTestingF(fn, names, dot) {
 				continue
 			}
 
@@ -110,6 +127,27 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	}
 }
 
+// nightly is the platform the nightly fuzz workflow runs on.
+var nightly = func() gobuild.Context {
+	ctx := gobuild.Default
+	ctx.GOOS, ctx.GOARCH = "linux", "amd64"
+
+	return ctx
+}()
+
+// isFuzzName is go test's rule for a fuzz target's name: Fuzz, then nothing or
+// anything that does not begin with a lower-case letter.
+func isFuzzName(name string) bool {
+	rest, ok := strings.CutPrefix(name, "Fuzz")
+	if !ok {
+		return false
+	}
+
+	r, _ := utf8.DecodeRuneInString(rest)
+
+	return rest == "" || !unicode.IsLower(r)
+}
+
 // importNames is every name file refers to the package at path by, and
 // whether it is also dot-imported, so its names are in the file's own scope.
 func importNames(file *ast.File, path string) ([]string, bool) {
@@ -119,7 +157,8 @@ func importNames(file *ast.File, path string) ([]string, bool) {
 	)
 
 	for _, spec := range file.Imports {
-		if strings.Trim(spec.Path.Value, `"`) != path {
+		// A PATH IS A STRING LITERAL, raw or escaped, so it is read as one.
+		if imported, err := strconv.Unquote(spec.Path.Value); err != nil || imported != path {
 			continue
 		}
 
