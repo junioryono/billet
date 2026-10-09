@@ -40,14 +40,19 @@ The contended renewal is the slot's throughput: about 7,700 renewals a second on
 
 ## The decision: no heartbeat batching
 
-At 500 concurrent leases the steady-state renewals are 16.7 transactions a second. That is 0.22% of the slot on SQLite and 3.1% on PostgreSQL, taking the slowest contended run. Renewals would take a quarter of the slot at about 57,000 concurrent leases on SQLite and about 4,000 on PostgreSQL.
+At 500 concurrent leases the steady-state renewals are 16.7 transactions a second. Two ways to put that against the slot:
+
+- **Throughput**, at the slowest contended time per renewal: 0.22% of what the slot can do on SQLite and 3.1% on PostgreSQL.
+- **Occupancy**, at the slowest measured hold per renewal (what `billet_ledger_write_held_seconds` reports): 0.20% and 2.2%.
+
+The throughput fractions are the larger, and the thresholds below use them. On that measure renewals would take a quarter of the slot at about 57,000 concurrent leases on SQLite and about 4,000 on PostgreSQL.
 
 Steady state is the floor, not the whole of it:
 
 - While a lease is launching the node renews it too, so it briefly has two renewers.
 - Tending a lease the node holds in custody adds a renewal per tend pass.
 
-Counting every lease twice still leaves PostgreSQL at 6.2% at 500 leases, and halves the threshold to about 2,000.
+Counting every lease twice still leaves PostgreSQL at 6.2% of the slot's throughput (4.4% of its occupancy) at 500 leases, and halves the threshold to about 2,000.
 
 A `HeartbeatMany` would cost:
 
@@ -64,4 +69,4 @@ It is to be reopened when either of two things happens:
 
 ## What it found instead: placement grows with the fleet squared
 
-A purchase over 128 hosts holds the writer slot for about 30 ms on either engine, against 0.3 ms (SQLite) over 4. A CPU profile of the 128-host case puts 72% of the time in `placer.next`, called from `placer.total` inside `headroomWithPlacer`. Headroom is counted by placing the tier's jobs one at a time until none fits, and each placement scans every host, so the count costs the free slots times the hosts, which grows with the square of the fleet. Every purchase on a fleet that size holds the slot for that long, and every other write waits behind it. That, not renewal, is the write-budget problem to fix first. The fix counts headroom without placing each job; it has its own pull request, and is held to the greedy count it replaces.
+A purchase over 128 hosts holds the writer slot for about 30 ms on either engine on this hardware, against 0.3 ms (SQLite) over 4. That fixture has 1,024 jobs placed and 3,072 two-vCPU slots free across its 128 hosts. A CPU profile of the 128-host case puts 72% of the time in `placer.next`, called from `placer.total` inside `headroomWithPlacer`. Headroom is counted by placing the tier's jobs one at a time until none fits, and each placement scans every host. So the count costs the hosts times the placeable free slots, which grows with the square of a fleet that has room to spare. A fleet that is nearly full scans less, and every other write waits behind the purchase for however long it takes. That, not renewal, is the write-budget problem to fix first. The fix counts headroom without placing each job; it has its own pull request, and is held to the greedy count it replaces.
