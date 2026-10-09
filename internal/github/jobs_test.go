@@ -262,19 +262,40 @@ func TestAJobListGitHubDidNotGiveIsAnError(t *testing.T) {
 	}
 }
 
-// A BODY THAT IS NOT JSON IS REDACTED BEFORE IT IS CUT: apiError keeps 200
-// bytes of it, and a token straddling the cut would otherwise leave its prefix
-// where the whole token no longer matches.
-func TestATokenAtTheCutOfAPlainBodyIsRedacted(t *testing.T) {
+// ONLY A DECODED MESSAGE IS SHOWN, so no encoding of an echoed token reaches
+// the output: a body that is not GitHub's error shape is described and not
+// shown, and an error object with an odd field still has its message decoded
+// and redacted.
+func TestOnlyADecodedMessageIsShown(t *testing.T) {
 	t.Parallel()
 
-	c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprint(w, strings.Repeat("x", 190)+" "+r.Header.Get("Authorization"))
-	})
-	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
-	if err == nil || strings.Contains(err.Error(), "Bearer ins") || !strings.Contains(err.Error(), "Bearer [") {
-		t.Errorf("a token at the cut = %v, want it redacted before the cut", err)
+	escape := echoes["escaped"]
+	for name, tc := range map[string]struct {
+		body func(authorization string) string
+		want string
+	}{
+		"a plain body cut through the token": {func(a string) string {
+			return strings.Repeat("x", 190) + " " + a
+		}, "not GitHub's error shape"},
+		"a plain body with the token escaped": {func(a string) string {
+			return "denied: " + escape(a)
+		}, "not GitHub's error shape"},
+		"an error object with an odd field": {func(a string) string {
+			return `{"message":"denied ` + escape(a) + `","documentation_url":42}`
+		}, "denied Bearer [redacted]"},
+		"a message that is not a string": {func(a string) string {
+			return `{"message":["` + escape(a) + `"]}`
+		}, "not GitHub's error shape"},
+	} {
+		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, tc.body(r.Header.Get("Authorization")))
+		})
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "ins") ||
+			strings.Contains(err.Error(), `\u`) {
+			t.Errorf("%s = %v, want it to say %q and nothing of the token", name, err, tc.want)
+		}
 	}
 }
 

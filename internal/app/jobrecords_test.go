@@ -1,6 +1,13 @@
 package app
 
 import (
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -64,15 +71,73 @@ func TestAJobIsReadWithTheAppThatServedIt(t *testing.T) {
 	}
 }
 
+// appJWT checks a token exchange's App JWT as GitHub would: signed by the
+// App's key, and issued by the App, for the installation it asks for. It
+// returns what is wrong, or "".
+func appJWT(r *http.Request, apps map[string]struct {
+	issuer string
+	key    *rsa.PublicKey
+},
+) string {
+	installation := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/app/installations/"), "/access_tokens")
+	app, ok := apps[installation]
+	if !ok {
+		return "an exchange for installation " + installation + ", which no App has"
+	}
+	parts := strings.Split(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), ".")
+	if len(parts) != 3 {
+		return "a bearer that is not a JWT"
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return "an unreadable signature"
+	}
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if rsa.VerifyPKCS1v15(app.key, crypto.SHA256, digest[:], signature) != nil {
+		return "installation " + installation + " asked with another App's key"
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "an unreadable payload"
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Iss != app.issuer {
+		return "installation " + installation + " asked by issuer " + claims.Iss + ", not " + app.issuer
+	}
+
+	return ""
+}
+
 // THE APP THAT READS A JOB IS THE ONE OF THE TARGET THAT SERVED IT, all the way
 // to the request: with two targets, each tier's job is read with its own
-// target's installation, and the other's is never asked.
+// target's installation, issuer and key, and the other's is never asked.
 func TestOpenJobRecordsAuthenticatesAsTheJobsTarget(t *testing.T) {
 	dir := t.TempDir()
 	keys := map[string]string{}
-	for _, name := range []string{"acme", "beta"} {
+	apps := map[string]struct {
+		issuer string
+		key    *rsa.PublicKey
+	}{}
+	for name, app := range map[string]struct{ installation, issuer string }{
+		"acme": {"2", "1"}, "beta": {"3", "5"},
+	} {
+		pemKey := testPrivateKey(t)
+		block, _ := pem.Decode([]byte(pemKey))
+		if block == nil {
+			t.Fatalf("the %s key is not PEM", name)
+		}
+		private, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			t.Fatalf("parse the %s key: %v", name, err)
+		}
+		apps[app.installation] = struct {
+			issuer string
+			key    *rsa.PublicKey
+		}{app.issuer, &private.PublicKey}
 		keys[name] = filepath.Join(dir, name+".pem")
-		if err := os.WriteFile(keys[name], []byte(testPrivateKey(t)), 0o600); err != nil {
+		if err := os.WriteFile(keys[name], []byte(pemKey), 0o600); err != nil {
 			t.Fatalf("write the %s key: %v", name, err)
 		}
 	}
@@ -119,6 +184,11 @@ tiers:
 			mu.Lock()
 			exchanged = append(exchanged, r.URL.Path)
 			mu.Unlock()
+			if wrong := appJWT(r, apps); wrong != "" {
+				t.Errorf("the token exchange was refused as GitHub would refuse it: %s", wrong)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
 			w.WriteHeader(http.StatusCreated)
 			fmt.Fprintf(w, `{"token":"t","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 			return

@@ -206,25 +206,35 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	return body, nil
 }
 
-// apiErrorWithout is apiError with the credential its request carried
-// replaced in what it keeps of the body, because apiError keeps GitHub's
+// apiErrorWithout is apiError for a request that carried bearer, keeping of
+// the body only what can be shown without it, because apiError keeps GitHub's
 // message and an operator command prints it: a server that echoed the
-// Authorization header would otherwise put the token in the output.
+// Authorization header would otherwise put the credential in the output.
 //
-// REPLACED TWICE: in the raw body, before apiError cuts a body that is not
-// JSON to 200 bytes and could cut the credential in half, and in the decoded
-// message, where a JSON escape (`\u0069`) has turned an echo the raw
-// replacement could not see back into the credential.
+// ONLY A DECODED JSON STRING IS KEPT. GitHub answers an error with a JSON
+// object whose `message` is a string; that string, decoded and with the bearer
+// replaced, is the message. Any other body (not a JSON object, or one with no
+// string message) is described by its length and not shown, since text that
+// was never decoded can hold the bearer in an escape (`i`) that no
+// replacement sees, and a cut through it leaves a prefix none matches.
 func apiErrorWithout(status int, body []byte, bearer string) error {
-	if bearer == "" {
-		return apiError(status, body)
+	message := fmt.Sprintf("an answer that is not GitHub's error shape (%d bytes, not shown)", len(body))
+	var fields map[string]any
+	if json.Unmarshal(body, &fields) == nil {
+		if decoded, ok := fields["message"].(string); ok && decoded != "" {
+			message = decoded
+		}
 	}
-	err := apiError(status, bytes.ReplaceAll(body, []byte(bearer), []byte("[redacted]")))
-	if api, ok := errors.AsType[*APIError](err); ok {
-		api.Message = strings.ReplaceAll(api.Message, bearer, "[redacted]")
+	if bearer != "" {
+		message = strings.ReplaceAll(message, bearer, "[redacted]")
+	}
+	// THROUGH apiError, so a throttle is still read from the message.
+	shown, err := json.Marshal(map[string]string{"message": message})
+	if err != nil {
+		return &APIError{Status: status, Message: message}
 	}
 
-	return err
+	return apiError(status, shown)
 }
 
 // configured reports whether this client can authenticate at all.
