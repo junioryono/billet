@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -92,11 +93,13 @@ func TestAWindowPastEitherEndIsPartial(t *testing.T) {
 	}
 }
 
-// A GAP IS UNCOVERED, NOT SPLIT: the sampler saw nothing between 5s and 15s.
+// A GAP IS UNCOVERED, NOT SPLIT: the sampler marked the point at 15s as
+// ending an interval it did not see, so 5s to 15s is known only as a total.
 func TestAGapInTheSeriesIsUncovered(t *testing.T) {
 	t.Parallel()
 
 	tl := steadySeries(append(secondsTo(0, 5), secondsTo(15, 20)...)...)
+	tl.Points[6].AfterGap = true
 	w := tl.Window(at(3000), at(17_000))
 	if w.Complete() || w.Span != 14*time.Second || w.Covered != 4*time.Second {
 		t.Errorf("across a gap: span %s covered %s, want 4s of 14s", w.Span, w.Covered)
@@ -107,25 +110,114 @@ func TestAGapInTheSeriesIsUncovered(t *testing.T) {
 	if inside.Covered != 0 {
 		t.Errorf("a window inside the gap covered %s", inside.Covered)
 	}
+
+	// ONE MARKED TICK IS A GAP however close its neighbours are.
+	short := steadySeries(secondsTo(0, 5)...)
+	short.Points[3].AfterGap = true
+	if w := short.Window(at(1000), at(4000)); w.Covered != 2*time.Second {
+		t.Errorf("a marked one-second interval: covered %s of %s, want 2s", w.Covered, w.Span)
+	}
 }
 
-// A DOWNSAMPLED SERIES IS NOT A SERIES OF GAPS: its usual spacing is its
-// stride, and the shorter last interval downsampling keeps is not a gap either.
+// A SERIES THE SAMPLER HALVED MORE THAN ONCE IS NOT A SERIES OF GAPS: wide old
+// intervals beside narrow new ones are what halving leaves, and only the
+// sampler's mark makes an interval a gap.
 func TestADownsampledSeriesHasNoGaps(t *testing.T) {
 	t.Parallel()
 
-	tl := steadySeries(0, 4, 8, 12, 16, 18)
-	w := tl.Window(at(2000), at(17_000))
+	// Eight-second intervals, then four, then two, then one: four halvings'
+	// worth of strides, each older run coarser than the next.
+	tl := steadySeries(0, 8, 16, 24, 28, 32, 34, 36, 37, 38, 39, 40)
+	w := tl.Window(at(1000), at(39_500))
 	if !w.Complete() {
-		t.Errorf("a stride-4 series: covered %s of %s", w.Covered, w.Span)
+		t.Errorf("a series of mixed strides: covered %s of %s", w.Covered, w.Span)
 	}
-	sameIncrements(t, "stride 4", w, usedPerSecond(15))
+	sameIncrements(t, "mixed strides", w, usedPerSecond(38.5))
 
-	// A LATE TICK IS NOT A GAP EITHER: 1.8s against a usual 1s is within twice it.
+	// A LATE TICK IS NOT A GAP EITHER.
 	jittered := steadySeries(0, 1, 2, 3, 4, 5)
 	jittered.Points[3].OffsetMillis = 3800
 	if w := jittered.Window(at(1000), at(5000)); !w.Complete() {
 		t.Errorf("a late tick: covered %s of %s", w.Covered, w.Span)
+	}
+}
+
+// EACH INTERVAL IS SPLIT BY ITS OWN RATE, not the job's average: a burst
+// between 2s and 3s belongs to the windows that hold it.
+func TestEachIntervalIsSplitAtItsOwnRate(t *testing.T) {
+	t.Parallel()
+
+	tl := steadySeries(secondsTo(0, 6)...)
+	for i := 3; i < len(tl.Points); i++ {
+		tl.Points[i].CPUUsage += 5_000_000
+	}
+	for name, tc := range map[string]struct {
+		from, to int64
+		want     int64
+	}{
+		"before the burst":     {0, 2000, 200_000},
+		"half of the burst":    {2000, 2500, 50_000 + 2_500_000},
+		"across the burst":     {1500, 3500, 200_000 + 5_000_000},
+		"after the burst":      {3000, 6000, 300_000},
+		"a third of the burst": {2000, 2333, 33_300 + 1_665_000},
+	} {
+		if got := tl.Window(at(tc.from), at(tc.to)).CPUMicros; got != tc.want {
+			t.Errorf("%s: cpu %dµs, want %dµs", name, got, tc.want)
+		}
+	}
+}
+
+// TWO SAMPLES AT ONE OFFSET LOSE NOTHING: what the second adds belongs to the
+// interval before it, and the window covering both gets it all.
+func TestSamplesAtOneOffsetLoseNothing(t *testing.T) {
+	t.Parallel()
+
+	tl := Timeline{First: first, Points: []Point{
+		{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 100}, {OffsetMillis: 1000, CPUUsage: 200},
+		{OffsetMillis: 2000, CPUUsage: 300},
+	}}
+	if w := tl.Window(at(0), at(2000)); !w.Complete() || w.CPUMicros != 300 || w.Samples != 4 {
+		t.Errorf("a duplicated offset = %+v, want all 300µs over four samples", w)
+	}
+	if w := tl.Window(at(0), at(1000)); w.CPUMicros != 200 {
+		t.Errorf("the interval ending at the duplicate got %dµs, want both samples' 200", w.CPUMicros)
+	}
+
+	tl.Points[1].AfterGap = true
+	if w := tl.Window(at(0), at(1000)); w.Covered != 0 {
+		t.Errorf("a gap mark on the earlier duplicate was lost: covered %s", w.Covered)
+	}
+}
+
+// A COUNTER THAT FALLS IS NOT USAGE: the interval it falls across is uncovered
+// rather than read as a negative or a wrapped amount.
+func TestACounterThatFallsIsUncovered(t *testing.T) {
+	t.Parallel()
+
+	tl := steadySeries(secondsTo(0, 4)...)
+	tl.Points[2].NetRx = 0
+	w := tl.Window(at(0), at(4000))
+	if w.Covered != 2*time.Second || w.NetRx < 0 {
+		t.Errorf("a falling counter: covered %s, received %d; want 2s covered and nothing negative",
+			w.Covered, w.NetRx)
+	}
+}
+
+// EVERY INT64 SPLITS EXACTLY: no float rounds a large counter, and none
+// overflows.
+func TestLargeCountersSplitExactly(t *testing.T) {
+	t.Parallel()
+
+	const odd = 1<<53 + 1
+	tl := Timeline{First: first, Points: []Point{{OffsetMillis: 0},
+		{OffsetMillis: 1000, CPUUsage: odd, DiskRead: math.MaxInt64}}}
+	whole := tl.Window(at(0), at(1000))
+	if whole.CPUMicros != odd || whole.DiskRead != math.MaxInt64 {
+		t.Errorf("a whole interval = cpu %d read %d, want %d and %d", whole.CPUMicros, whole.DiskRead,
+			int64(odd), int64(math.MaxInt64))
+	}
+	if half := tl.Window(at(0), at(500)); half.DiskRead != math.MaxInt64/2+1 {
+		t.Errorf("half of MaxInt64 = %d, want it rounded to %d", half.DiskRead, int64(math.MaxInt64/2+1))
 	}
 }
 

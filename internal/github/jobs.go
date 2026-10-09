@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -82,12 +83,13 @@ func NewJobRecordsAt(base string, target Target, appID, installationID int64,
 }
 
 // jobRecord is one entry of GitHub's job list, every field a pointer so an
-// absent one is told from an empty one.
+// absent one is told from an empty one. RunnerName is raw so that an absent
+// field (could not tell) is told from null (no runner yet).
 type jobRecord struct {
-	ID         *int64  `json:"id"`
-	Name       *string `json:"name"`
-	RunAttempt *int64  `json:"run_attempt"`
-	RunnerName *string `json:"runner_name"`
+	ID         *int64          `json:"id"`
+	Name       *string         `json:"name"`
+	RunAttempt *int64          `json:"run_attempt"`
+	RunnerName json.RawMessage `json:"runner_name"`
 	Steps      *[]struct {
 		Number      *int64  `json:"number"`
 		Name        *string `json:"name"`
@@ -161,7 +163,11 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 			return WorkflowJob{}, fmt.Errorf("github: run %d listed more jobs than the %d it counts", runID, total)
 		}
 		for _, record := range *body.Jobs {
-			if record.RunnerName == nil || *record.RunnerName != runnerName {
+			name, err := record.runner()
+			if err != nil {
+				return WorkflowJob{}, fmt.Errorf("github: run %d: %w", runID, err)
+			}
+			if name != runnerName {
 				continue
 			}
 			job, err := workflowJobOf(record)
@@ -181,6 +187,24 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 		return WorkflowJob{}, fmt.Errorf("github: run %d lists %d jobs on runner %q; refusing to guess",
 			runID, len(matches), runnerName)
 	}
+}
+
+// runner is the name of the runner a listed job ran on, empty for a job GitHub
+// gave none (null). A job whose record leaves the field out, or gives it as
+// something other than a string, is refused: it could be the one asked for.
+func (r jobRecord) runner() (string, error) {
+	if len(r.RunnerName) == 0 {
+		return "", errors.New("a job in the list does not say which runner it ran on")
+	}
+	var name *string
+	if err := json.Unmarshal(r.RunnerName, &name); err != nil {
+		return "", fmt.Errorf("a job in the list names its runner unreadably: %w", err)
+	}
+	if name == nil {
+		return "", nil
+	}
+
+	return *name, nil
 }
 
 // workflowJobOf reads one matched job. Its id, name and step list are

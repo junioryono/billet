@@ -3,8 +3,7 @@ package usage
 import (
 	"errors"
 	"fmt"
-	"math"
-	"slices"
+	"math/bits"
 	"time"
 )
 
@@ -26,7 +25,7 @@ type Timeline struct {
 // than the job used.
 type WindowUsage struct {
 	// Span is the window's length, and Covered how much of it lies inside the
-	// series and outside every gap.
+	// series and in no uncovered interval.
 	Span, Covered time.Duration
 	// Samples counts the samples taken inside the window. With none, every
 	// quantity is a share of the one interval around the window, split by time.
@@ -46,21 +45,21 @@ type WindowUsage struct {
 // length.
 func (w WindowUsage) Complete() bool { return w.Span > 0 && w.Covered == w.Span }
 
-// GapFactor is how many times the series' usual spacing two consecutive
-// samples may lie apart before the interval between them is a gap: time the
-// sampler did not see, whose increment is known only as a total. The usual
-// spacing is the median, because a downsampled series spaces its points by the
-// stride it kept and a stalled sampler is the exception.
-const GapFactor = 2
-
 // Window integrates the timeline over [from, to]. A window that ends before it
 // begins has no length and reports nothing.
 //
 // THE RULE INSIDE ONE SAMPLE INTERVAL IS PROPORTIONAL SPLITTING AND NOTHING
 // MORE: a cumulative column's increment between two samples is shared by time,
-// so a window covering a third of an interval is given a third of what that
-// interval used. Nothing is interpolated across a gap, which is uncovered
-// instead, and the memory level is never interpolated at all.
+// rounded to the nearest unit, so a window covering a third of an interval is
+// given a third of what that interval used. An interval is uncovered, never
+// split, when the sampler marked the point that ends it AfterGap, or when a
+// cumulative column falls across it or across the interval before it: a fall
+// is a counter that was reset or misread, and the rise after a misread is its
+// catch-up rather than usage. The memory level is never interpolated.
+//
+// GAPS ARE THE SAMPLER'S WORD, NEVER INFERRED FROM SPACING: a series the
+// sampler has halved more than once holds wide old intervals beside narrow new
+// ones, and any rule read from the spacing alone would call the old ones gaps.
 func (tl Timeline) Window(from, to time.Time) WindowUsage {
 	out := WindowUsage{Span: max(to.Sub(from), 0)}
 	if out.Span == 0 || len(tl.Points) == 0 {
@@ -68,59 +67,74 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 	}
 	a := from.Sub(tl.First).Milliseconds()
 	b := to.Sub(tl.First).Milliseconds()
-	limit := GapFactor * tl.usualSpacing()
 
-	var covered int64
-	var cpu, read, write, rx, tx, energy float64
-	for i, p := range tl.Points {
+	for _, p := range tl.Points {
 		if p.OffsetMillis >= a && p.OffsetMillis <= b {
 			out.Samples++
 			out.MemoryPeak = max(out.MemoryPeak, p.MemoryCurrent)
 		}
-		if i == len(tl.Points)-1 {
-			break
-		}
-		next := tl.Points[i+1]
+	}
+	points := distinct(tl.Points)
+	var covered int64
+	for i := 1; i < len(points); i++ {
+		p, next := points[i-1], points[i]
 		length := next.OffsetMillis - p.OffsetMillis
-		if length <= 0 || length > limit {
-			continue
-		}
 		overlap := min(b, next.OffsetMillis) - max(a, p.OffsetMillis)
-		if overlap <= 0 {
+		if overlap <= 0 || next.AfterGap || falls(p, next) || i > 1 && falls(points[i-2], p) {
 			continue
 		}
 		covered += overlap
-		share := float64(overlap) / float64(length)
-		cpu += share * float64(next.CPUUsage-p.CPUUsage)
-		read += share * float64(next.DiskRead-p.DiskRead)
-		write += share * float64(next.DiskWrite-p.DiskWrite)
-		rx += share * float64(next.NetRx-p.NetRx)
-		tx += share * float64(next.NetTx-p.NetTx)
-		energy += share * float64(next.EnergyActive-p.EnergyActive)
+		out.CPUMicros += shareOf(next.CPUUsage-p.CPUUsage, overlap, length)
+		out.DiskRead += shareOf(next.DiskRead-p.DiskRead, overlap, length)
+		out.DiskWrite += shareOf(next.DiskWrite-p.DiskWrite, overlap, length)
+		out.NetRx += shareOf(next.NetRx-p.NetRx, overlap, length)
+		out.NetTx += shareOf(next.NetTx-p.NetTx, overlap, length)
+		out.EnergyActive += shareOf(next.EnergyActive-p.EnergyActive, overlap, length)
 	}
 	out.Covered = min(time.Duration(covered)*time.Millisecond, out.Span)
-	round := func(v float64) int64 { return int64(math.Round(v)) }
-	out.CPUMicros, out.DiskRead, out.DiskWrite = round(cpu), round(read), round(write)
-	out.NetRx, out.NetTx, out.EnergyActive = round(rx), round(tx), round(energy)
 
 	return out
 }
 
-// usualSpacing is the median distance between consecutive samples, ignoring
-// two taken at the same offset.
-func (tl Timeline) usualSpacing() int64 {
-	var spacings []int64
-	for i := 1; i < len(tl.Points); i++ {
-		if d := tl.Points[i].OffsetMillis - tl.Points[i-1].OffsetMillis; d > 0 {
-			spacings = append(spacings, d)
-		}
-	}
-	if len(spacings) == 0 {
-		return 0
-	}
-	slices.Sort(spacings)
+// falls reports whether a cumulative column Window reads is lower at next
+// than at p.
+func falls(p, next Point) bool {
+	return next.CPUUsage < p.CPUUsage || next.DiskRead < p.DiskRead || next.DiskWrite < p.DiskWrite ||
+		next.NetRx < p.NetRx || next.NetTx < p.NetTx || next.EnergyActive < p.EnergyActive
+}
 
-	return spacings[len(spacings)/2]
+// shareOf is delta*part/whole rounded to the nearest unit, exact for every
+// int64: the product is formed in 128 bits, and the quotient is at most delta
+// because part is at most whole. delta is not negative and whole is positive.
+//
+// NO SUM OF SHARES OVERFLOWS EITHER: each is at most its interval's increment,
+// and the increments of one column telescope to its last value less its first.
+func shareOf(delta, part, whole int64) int64 {
+	hi, lo := bits.Mul64(uint64(delta), uint64(part))
+	q, r := bits.Div64(hi, lo, uint64(whole))
+	if r >= uint64(whole)-r {
+		q++
+	}
+
+	return int64(q)
+}
+
+// distinct is the points with each run sharing one offset collapsed to its
+// last, marked AfterGap if any of the run was. Two samples a sampler took
+// within one millisecond have no interval between them to split, so what the
+// later one adds belongs to the interval before it.
+func distinct(points []Point) []Point {
+	out := make([]Point, 0, len(points))
+	for _, p := range points {
+		if n := len(out); n > 0 && out[n-1].OffsetMillis == p.OffsetMillis {
+			p.AfterGap = p.AfterGap || out[n-1].AfterGap
+			out[n-1] = p
+			continue
+		}
+		out = append(out, p)
+	}
+
+	return out
 }
 
 // ErrNoClock says a stored series records no wall time for its first sample,

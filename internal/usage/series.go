@@ -23,6 +23,10 @@ type Point struct {
 	GuestCPU      int64 // µs
 	VMMCPU        int64
 	EnergyActive  int64 // µJ attributed so far
+	// AfterGap says the sampler did not see the interval that ends at this
+	// point, so what it holds is known only as that interval's total. It is not
+	// one of SeriesColumns: a SeriesCodec series never marks one.
+	AfterGap bool
 }
 
 // SeriesColumns names Point's columns in the order the codec writes them.

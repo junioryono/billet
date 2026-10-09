@@ -134,8 +134,10 @@ func TestAStepsMissingTimeIsZeroAndAMalformedOneIsRefused(t *testing.T) {
 func TestARunnerWithNoJobOrTwoIsNotAnAnswer(t *testing.T) {
 	t.Parallel()
 
+	// A JOB NO RUNNER HAS TAKEN YET IS NAMED null, which is no runner, not ours.
 	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
-		fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`, jobJSON(7001, "billet-lease-2", twoSteps))
+		fmt.Fprintf(w, `{"total_count":2,"jobs":[%s,{"id":7002,"name":"queued","runner_name":null,"steps":[]}]}`,
+			jobJSON(7001, "billet-lease-2", twoSteps))
 	})
 	if _, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1"); !errors.Is(err, ErrNoRunnerJob) {
 		t.Errorf("no job on the runner = %v, want ErrNoRunnerJob", err)
@@ -187,6 +189,12 @@ func TestAJobListThatDoesNotAddUpIsRefused(t *testing.T) {
 		"a step with no name": {func(int) string {
 			return fmt.Sprintf(`{"total_count":1,"jobs":[%s]}`, jobJSON(1, "billet-lease-1", `{"number":1}`))
 		}, "incomplete step"},
+		"a job that names no runner field": {func(int) string {
+			return `{"total_count":1,"jobs":[{"id":1,"name":"j","steps":[]}]}`
+		}, "does not say which runner"},
+		"a runner that is not a name": {func(int) string {
+			return `{"total_count":1,"jobs":[{"id":1,"name":"j","runner_name":7,"steps":[]}]}`
+		}, "names its runner unreadably"},
 		"a job with no steps": {func(int) string {
 			return `{"total_count":1,"jobs":[{"id":1,"name":"j","runner_name":"billet-lease-1"}]}`
 		}, "job record was incomplete"},
