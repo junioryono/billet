@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,6 +133,8 @@ func TestAWindowThatCannotBeAccountedForIsUnmeasured(t *testing.T) {
 			r[16].uptime = r[15].uptime
 			return r
 		}, "row 17 (epoch 1791540016) does not come after the row before it"},
+		{"an energy counter past any measurement", leaseA(950, 0, func(u *usage) { u.EnergyActiveUJ = math.MaxInt64 }), nil,
+			"without lease-a"},
 		{"a negative energy counter", leaseA(950, 0, func(u *usage) { u.EnergyIdleUJ = -1 }), nil, "without lease-a"},
 		{"no monitor tick in the record", leaseA(950, 0, func(u *usage) { u.IntervalMillis = 0 }), nil, "without lease-a"},
 		{"no energy counters in the record", leaseA(950, 0, func(u *usage) {
@@ -360,11 +363,12 @@ func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 		t.Errorf("rows = %+v", rows)
 	}
 	for name, body := range map[string]string{
-		"no instances column": "epoch_s,uptime_s,rapl_delta_uj\n1,1.00,5\n",
-		"a negative delta":    "epoch_s,uptime_s,rapl_delta_uj,instances\n1,1.00,-5,\n",
-		"a word for an epoch": "epoch_s,uptime_s,rapl_delta_uj,instances\nnow,1.00,5,\n",
-		"a NaN uptime":        "epoch_s,uptime_s,rapl_delta_uj,instances\n1,NaN,5,\n",
-		"an infinite uptime":  "epoch_s,uptime_s,rapl_delta_uj,instances\n1,+Inf,5,\n",
+		"no instances column":    "epoch_s,uptime_s,rapl_delta_uj\n1,1.00,5\n",
+		"a negative delta":       "epoch_s,uptime_s,rapl_delta_uj,instances\n1,1.00,-5,\n",
+		"a word for an epoch":    "epoch_s,uptime_s,rapl_delta_uj,instances\nnow,1.00,5,\n",
+		"a row past a megajoule": "epoch_s,uptime_s,rapl_delta_uj,instances\n1,1.00,1099511627777,\n",
+		"a NaN uptime":           "epoch_s,uptime_s,rapl_delta_uj,instances\n1,NaN,5,\n",
+		"an infinite uptime":     "epoch_s,uptime_s,rapl_delta_uj,instances\n1,+Inf,5,\n",
 	} {
 		if _, err := readPowerLog(write(strings.ReplaceAll(name, " ", "-")+".csv", body)); err == nil {
 			t.Errorf("%s was read", name)

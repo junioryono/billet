@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,6 +233,11 @@ func TestAComparisonWithoutItsInputIsUnmeasured(t *testing.T) {
 			recs["lease-100-network"].Usage.NetRxBytes = 0
 			return e
 		}, "the idle job lease-100-idle: billet's record says net_rx_bytes is -104857600"},
+		{"a counter whose sum would wrap", kindCPU, func(e []expectation, recs map[string]record) []expectation {
+			recs["lease-100-idle"].Usage.CPUUserMicros = math.MaxInt64
+			recs["lease-100-idle"].Usage.CPUSystemMicros = math.MaxInt64
+			return e
+		}, "says cpu_user_us is 9223372036854775807"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exps, recs := fixtureRun(100)

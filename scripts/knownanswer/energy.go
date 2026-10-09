@@ -70,7 +70,9 @@ func readPowerLog(path string) ([]powerRow, error) {
 			row.uptimeOK = true
 		}
 		if s := rec[col["rapl_delta_uj"]]; s != "" {
-			if row.delta, err = strconv.ParseInt(s, 10, 64); err != nil || row.delta < 0 {
+			// BOUNDED, so no sum of a log's rows can wrap: a megajoule in one row is
+			// ten thousand seconds at a kilowatt, past any interval the logger keeps.
+			if row.delta, err = strconv.ParseInt(s, 10, 64); err != nil || row.delta < 0 || row.delta > maxRowDelta {
 				return nil, fmt.Errorf("%s line %d: rapl_delta_uj %q is not an energy", path, line, s)
 			}
 			row.deltaOK = true
@@ -139,9 +141,11 @@ type energyResult struct {
 	high      float64
 	// clipped is how far this log's busy intervals fell below the baseline,
 	// which it counted as no active energy; low is the lower bound with it.
-	clipped                    float64
-	low                        float64
-	attributed, attributedIdle int64
+	clipped float64
+	low     float64
+	// attributed and attributedIdle are summed in float64, which saturates
+	// rather than wrapping as an int64 sum of malformed counters would.
+	attributed, attributedIdle float64
 	ratio                      float64
 	jobs                       []energyJob
 }
@@ -264,8 +268,8 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 				res.tick = t
 			}
 			j.active, j.idle = rec.Usage.EnergyActiveUJ, rec.Usage.EnergyIdleUJ
-			res.attributed += j.active
-			res.attributedIdle += j.idle
+			res.attributed += float64(j.active)
+			res.attributedIdle += float64(j.idle)
 		}
 		if j.problem != "" {
 			missing = append(missing, j.lease)
@@ -316,7 +320,7 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			"two clocks clipping at the baseline can disagree on, too little of the window's %.1f kJ to compare",
 			res.activeMeasured/1e9, res.clipped/1e9, float64(res.rapl)/1e9)
 	default:
-		res.ratio = float64(res.attributed) / res.activeMeasured
+		res.ratio = res.attributed / res.activeMeasured
 		res.high = attributedHigh + res.allowance/res.activeMeasured
 		res.low = attributedLow * (res.activeMeasured - res.clipped) / res.activeMeasured
 		res.verdict = fail
@@ -327,6 +331,9 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 
 	return res
 }
+
+// maxRowDelta bounds one row's energy, in µJ.
+const maxRowDelta = 1 << 40
 
 // energyFields are the counters the reconciliation reads from each record.
 var energyFields = []string{"energy_active_uj", "energy_idle_uj", "interval_ms"}
@@ -437,14 +444,14 @@ func (res energyResult) write(w io.Writer) {
 	if res.verdict != unmeasured {
 		fmt.Fprintf(w, "above idle over the %.0f s a microVM was alive: measured %s, attributed to jobs %s "+
 			"(ratio %.3f, accepted [%.3f, %.3f])\n", res.busySeconds, kj(res.activeMeasured),
-			kj(float64(res.attributed)), res.ratio, res.low, res.high)
+			kj(res.attributed), res.ratio, res.low, res.high)
 		fmt.Fprintf(w, "allowance: %s for the monitor's ticks falling between this log's rows (the quiet ends' "+
 			"dips below the baseline per busy second, or this log's own clipping, whichever is larger); "+
 			"clipped %s\n", kj(res.allowance), kj(res.clipped))
 		fmt.Fprintf(w, "unattributed: %s, %.1f W while a microVM was alive (the host's own work above idle)\n",
-			kj(res.activeMeasured-float64(res.attributed)),
-			(res.activeMeasured-float64(res.attributed))/1e6/res.busySeconds)
-		fmt.Fprintf(w, "jobs' idle shares: %s of the window's %s idle baseline\n", kj(float64(res.attributedIdle)),
+			kj(res.activeMeasured-res.attributed),
+			(res.activeMeasured-res.attributed)/1e6/res.busySeconds)
+		fmt.Fprintf(w, "jobs' idle shares: %s of the window's %s idle baseline\n", kj(res.attributedIdle),
 			kj(res.idlePool))
 	} else {
 		fmt.Fprintf(w, "reconciliation: %s\n", res.reason)

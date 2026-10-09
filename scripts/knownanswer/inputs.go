@@ -238,20 +238,26 @@ func (u *usage) UnmarshalJSON(b []byte) error {
 }
 
 // unusable says why the first of fields cannot be compared, or "": a counter
-// the record did not carry, and a negative one, which no counter can be and
-// which subtracted from another would manufacture a figure.
+// the record did not carry, a negative one, which no counter can be and which
+// subtracted from another would manufacture a figure, and one past any
+// measurement, whose sum with another would wrap.
 func (u *usage) unusable(fields ...string) string {
 	for _, f := range fields {
 		if !u.present[f] {
 			return "carries no " + f
 		}
-		if v := u.counter(f); v < 0 {
+		if v := u.counter(f); v < 0 || v > maxCounter {
 			return fmt.Sprintf("says %s is %d", f, v)
 		}
 	}
 
 	return ""
 }
+
+// maxCounter bounds every counter a comparison reads: 2^53 µs is 285 years of
+// CPU and 2^53 bytes 8 PiB, past anything one job measures, and below it a sum
+// of a few counters can neither wrap an int64 nor lose a unit in a float64.
+const maxCounter = 1 << 53
 
 // counter is the value of the named counter.
 func (u *usage) counter(name string) int64 {
