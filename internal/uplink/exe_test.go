@@ -54,3 +54,20 @@ func TestAReplacedExecutableIsNoticedAndAMissingOneIsNot(t *testing.T) {
 		t.Fatal("an executable that could not be read at start read as replaced")
 	}
 }
+
+// THE IDENTITY IS THE RUNNING FILE'S. A shaper started after its path already
+// holds a newer file, or none, must still know which file it runs; on Linux that
+// is /proc/self/exe, and the test binary is as good a running file as any.
+func TestTheRecordedIdentityIsTheRunningFile(t *testing.T) {
+	t.Parallel()
+
+	running, err := os.Stat("/proc/self/exe")
+	if err != nil {
+		t.Skip("no /proc/self/exe on this platform")
+	}
+
+	exe := currentExecutable()
+	if exe.info == nil || !os.SameFile(exe.info, running) {
+		t.Fatalf("the recorded identity is not the running file's (path %q)", exe.path)
+	}
+}

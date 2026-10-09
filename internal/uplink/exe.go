@@ -15,17 +15,27 @@ type executable struct {
 	info os.FileInfo
 }
 
-// currentExecutable records the executable this process runs from, or nothing
-// when it cannot say, in which case it is never thought replaced.
+// currentExecutable records the file this process runs and the path it was
+// installed at, or nothing when it cannot say, in which case it is never
+// thought replaced.
+//
+// THE RUNNING FILE FROM /proc/self/exe, NOT FROM THE PATH. A shaper that starts
+// while an upgrade has the path empty, or after the new file is already there,
+// would otherwise record the wrong file, or none, and never notice it runs the
+// old release (internal/lifeops/exe_linux.go has the same distinction). The link
+// resolves to the running inode whether or not its name still exists; where
+// there is no /proc, the path is all there is.
 func currentExecutable() executable {
 	path, err := os.Executable()
 	if err != nil {
 		return executable{}
 	}
 
-	info, err := os.Stat(path)
+	info, err := os.Stat("/proc/self/exe")
 	if err != nil {
-		return executable{}
+		if info, err = os.Stat(path); err != nil {
+			return executable{}
+		}
 	}
 
 	return executable{path: path, info: info}
