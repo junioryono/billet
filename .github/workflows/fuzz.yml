@@ -43,10 +43,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # WITHOUT CGO, as billet builds everywhere, and as the check that holds
+      # this matrix to the tree (TestEveryFuzzTargetIsSearchedNightly) judges
+      # which files this run builds.
       - name: Fuzz ${{ matrix.target.fuzz }}
         env:
           PACKAGE: ${{ matrix.target.package }}
           FUZZ: ${{ matrix.target.fuzz }}
+          CGO_ENABLED: "0"
         run: go test "$PACKAGE" -run '^$' -fuzz "^${FUZZ}\$" -fuzztime 10m
 
       - name: Keep what it found

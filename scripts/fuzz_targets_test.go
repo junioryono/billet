@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -31,6 +32,7 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 
 	const root = ".."
 
+	nightly := nightlyContext(t)
 	fset := token.NewFileSet()
 
 	var found []string
@@ -127,18 +129,35 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	}
 }
 
-// nightly is the build the nightly fuzz workflow makes: linux/amd64 at the
-// default GOAMD64 level, without cgo (billet builds with CGO_ENABLED=0
-// everywhere). The release tags stay this toolchain's, which go.mod pins for
-// both.
-var nightly = func() gobuild.Context {
+// nightlyContext is the build the nightly fuzz workflow makes: linux/amd64
+// without cgo, as the workflow sets it. ITS TAGS ARE ASKED OF THE go COMMAND
+// for that target rather than written here: the tool tags carry the
+// toolchain's default experiments, which differ by platform and release, and
+// the release tags are the pinned toolchain's.
+func nightlyContext(t *testing.T) gobuild.Context {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-f",
+		`{{join context.ToolTags ","}}|{{join context.ReleaseTags ","}}`, "runtime")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOFLAGS=")
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ask go for the nightly build's tags: %v", err)
+	}
+
+	tools, releases, ok := strings.Cut(strings.TrimSpace(string(out)), "|")
+	if !ok || tools == "" || releases == "" {
+		t.Fatalf("go answered %q for the nightly build's tags", out)
+	}
+
 	ctx := gobuild.Default
-	ctx.GOOS, ctx.GOARCH = "linux", "amd64"
-	ctx.ToolTags = []string{"amd64.v1"}
-	ctx.CgoEnabled = false
+	ctx.GOOS, ctx.GOARCH, ctx.CgoEnabled = "linux", "amd64", false
+	ctx.ToolTags = strings.Split(tools, ",")
+	ctx.ReleaseTags = strings.Split(releases, ",")
 
 	return ctx
-}()
+}
 
 // isFuzzName is go test's rule for a fuzz target's name: Fuzz, then nothing or
 // anything that does not begin with a lower-case letter.

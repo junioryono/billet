@@ -129,7 +129,7 @@ fuzz: ## Search past every fuzz target's seeds for FUZZTIME each; `test` already
 	if [ -z "$$targets" ]; then echo "fuzz: .github/workflows/fuzz.yml lists no targets" >&2; exit 1; fi; \
 	printf '%s\n' "$$targets" | while read -r pkg fn; do \
 		echo "== $$pkg $$fn"; \
-		$(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) || exit 1; \
+		CGO_ENABLED=0 $(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) || exit 1; \
 	done
 
 .PHONY: no-mutants
