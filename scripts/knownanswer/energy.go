@@ -247,8 +247,8 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			j.problem = "billet recorded no usage report"
 		case !rec.Usage.Measured["energy"]:
 			j.problem = "billet did not measure its energy"
-		case rec.Usage.missing(energyFields...) != "":
-			j.problem = "billet's record carries no " + rec.Usage.missing(energyFields...)
+		case rec.Usage.unusable(energyFields...) != "":
+			j.problem = "billet's record " + rec.Usage.unusable(energyFields...)
 		case rec.Usage.IntervalMillis <= 0:
 			// THE TICK IS WHAT THE COARSE-ROW GUARD HOLDS EVERY ROW TO: a job with
 			// none would leave the guard nothing to compare.

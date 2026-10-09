@@ -234,10 +234,14 @@ while [ "$stop" -eq 0 ]; do
 	# before the BMC: a BMC call can take seconds, and a microVM that exited
 	# during it would otherwise be missing from a row whose energy it drew.
 	read_uptime_cs
+	# A READ THAT FAILED IS NO READING, whatever it assigned: `read` hands back
+	# the text it got before an end of file with no newline, and a counter cut
+	# short would otherwise read as a wrap.
 	cur_uj=
-	if IFS= read -r cur_uj <"$powercap/energy_uj" 2>/dev/null; then
-		case "$cur_uj" in '' | *[!0-9]*) cur_uj= ;; esac
+	if ! IFS= read -r cur_uj <"$powercap/energy_uj" 2>/dev/null; then
+		cur_uj=
 	fi
+	case "$cur_uj" in '' | *[!0-9]*) cur_uj= ;; esac
 	read_instances
 	read_turbostat
 	epoch=$(date +%s)

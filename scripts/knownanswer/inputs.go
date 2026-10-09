@@ -237,15 +237,47 @@ func (u *usage) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// missing is the first of fields the record did not carry, or "".
-func (u *usage) missing(fields ...string) string {
+// unusable says why the first of fields cannot be compared, or "": a counter
+// the record did not carry, and a negative one, which no counter can be and
+// which subtracted from another would manufacture a figure.
+func (u *usage) unusable(fields ...string) string {
 	for _, f := range fields {
 		if !u.present[f] {
-			return f
+			return "carries no " + f
+		}
+		if v := u.counter(f); v < 0 {
+			return fmt.Sprintf("says %s is %d", f, v)
 		}
 	}
 
 	return ""
+}
+
+// counter is the value of the named counter.
+func (u *usage) counter(name string) int64 {
+	switch name {
+	case "samples":
+		return u.Samples
+	case "interval_ms":
+		return u.IntervalMillis
+	case "window_ms":
+		return u.WindowMillis
+	case "cpu_user_us":
+		return u.CPUUserMicros
+	case "cpu_system_us":
+		return u.CPUSystemMicros
+	case "memory_peak_bytes":
+		return u.MemoryPeakBytes
+	case "disk_write_bytes":
+		return u.DiskWriteBytes
+	case "net_rx_bytes":
+		return u.NetRxBytes
+	case "energy_active_uj":
+		return u.EnergyActiveUJ
+	case "energy_idle_uj":
+		return u.EnergyIdleUJ
+	}
+	panic("knownanswer: no counter named " + name)
 }
 
 // errNoRecord is a lease with no record file: billet's answer was never

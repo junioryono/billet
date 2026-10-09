@@ -188,7 +188,7 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 	// A REFERENCE IS ONLY WHAT THIS JOB DID BESIDE ITS LOAD ON THE SAME HOST:
 	// another node's idle job prepared on other disks, through another uplink,
 	// from another page cache, and subtracting it compares two machines.
-	if job.Node == "" || job.Node != ref.Node || job.Provider != ref.Provider {
+	if job.Node == "" || job.Provider == "" || job.Node != ref.Node || job.Provider != ref.Provider {
 		r.reason = fmt.Sprintf("the %s job ran on %q (%s) and this one on %q (%s); a reference must come from "+
 			"the same host, so run the workflow on a tier only that host serves",
 			m.against, ref.Node, ref.Provider, job.Node, job.Provider)
@@ -238,9 +238,8 @@ func measuredRecord(e *expectation, m *metric, records recordSource) (record, ve
 		return record{}, unmeasured, "billet recorded no usage report for this lease"
 	case !rec.Usage.Measured[m.group]:
 		return record{}, unmeasured, fmt.Sprintf("billet did not measure %s for this lease", m.group)
-	case rec.Usage.missing(m.fields...) != "":
-		return record{}, unmeasured, fmt.Sprintf("billet's record carries no %s for this lease",
-			rec.Usage.missing(m.fields...))
+	case rec.Usage.unusable(m.fields...) != "":
+		return record{}, unmeasured, fmt.Sprintf("billet's record %s for this lease", rec.Usage.unusable(m.fields...))
 	}
 
 	return rec, "", ""

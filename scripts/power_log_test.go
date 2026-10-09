@@ -38,7 +38,10 @@ mv "$s/steps.next" "$s/steps"
 read -r epoch uptime energy bmc vms <<<"$step"
 printf '%s\n' "$epoch" >"$s/epoch"
 printf '%s 0.00\n' "$uptime" >"$s/proc/uptime"
-printf '%s\n' "$energy" >"$s/powercap/energy_uj"
+case "$energy" in
+cut:*) printf '%s' "${energy#cut:}" >"$s/powercap/energy_uj" ;;
+*) printf '%s\n' "$energy" >"$s/powercap/energy_uj" ;;
+esac
 printf '%s\n' "$bmc" >"$s/bmc"
 for d in "$s"/cgroup/firecracker-v1.16.1/billet-*; do
 	if [ -d "$d" ]; then : >"$d/cgroup.procs" 2>/dev/null || true; fi
@@ -150,6 +153,8 @@ type step struct {
 	energy   int64
 	bmc      string
 	vms      []string
+	// cut writes the counter with no newline, as a read cut short leaves it.
+	cut bool
 }
 
 func (s step) line() string {
@@ -157,8 +162,12 @@ func (s step) line() string {
 	if len(s.vms) > 0 {
 		vms = strings.Join(s.vms, ",")
 	}
+	energy := strconv.FormatInt(s.energy, 10)
+	if s.cut {
+		energy = "cut:" + energy
+	}
 
-	return fmt.Sprintf("%d %d.%02d %d %s %s", s.epoch, s.uptimeCS/100, s.uptimeCS%100, s.energy, s.bmc, vms)
+	return fmt.Sprintf("%d %d.%02d %s %s %s", s.epoch, s.uptimeCS/100, s.uptimeCS%100, energy, s.bmc, vms)
 }
 
 // plant writes the reference zone's range and the first step as the state before the
@@ -357,6 +366,28 @@ func TestAGapThatCouldHideAWrapLeavesTheDeltaEmpty(t *testing.T) {
 	if rows[1][3] != "" || rows[2][3] != "73500000" || rows[3][3] != "" || rows[4][3] != "73500000" {
 		t.Errorf("deltas %q %q %q %q, want empty, 73500000, empty (the gap), 73500000",
 			rows[1][3], rows[2][3], rows[3][3], rows[4][3])
+	}
+}
+
+// A COUNTER READ CUT SHORT IS NO READING: `read` hands back what it got before
+// an end of file with no newline, and "123" after 65 kJ would be a wrap.
+func TestACounterReadCutShortIsNoReading(t *testing.T) {
+	t.Parallel()
+	h := newPowerHarness(t, "sleep", "date", "timeout")
+	h.plant(t, []step{
+		{epoch: 10, uptimeCS: 1000, energy: 65_000_000_000, bmc: "fail"},
+		{epoch: 11, uptimeCS: 1100, energy: 123, bmc: "fail", cut: true},
+		{epoch: 12, uptimeCS: 1200, energy: 65_147_000_000, bmc: "fail"},
+		{epoch: 13, uptimeCS: 1300, energy: 65_220_500_000, bmc: "fail"},
+	})
+	out := filepath.Join(t.TempDir(), "power.csv")
+	if summary, err := h.run(t, "--out", out, "--seconds", "4", "--ipmitool", "none", "--turbostat", "none"); err != nil {
+		t.Fatalf("%v\n%s", err, summary)
+	}
+	rows := csvRows(t, out)
+	if rows[2][2] != "" || rows[2][3] != "" || rows[3][3] != "" || rows[4][3] != "73500000" {
+		t.Errorf("counter %q delta %q, then deltas %q %q; want the cut reading empty, no delta across it, "+
+			"then 73500000", rows[2][2], rows[2][3], rows[3][3], rows[4][3])
 	}
 }
 

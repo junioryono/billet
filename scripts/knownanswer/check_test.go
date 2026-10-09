@@ -219,6 +219,19 @@ func TestAComparisonWithoutItsInputIsUnmeasured(t *testing.T) {
 			recs["lease-100-idle"] = r
 			return e
 		}, `the idle job ran on "ubuntu-02" (firecracker) and this one on "ubuntu-01"`},
+		{"no provider on either side", kindCPU, func(e []expectation, recs map[string]record) []expectation {
+			for _, lease := range []string{"lease-100-idle", "lease-100-cpu"} {
+				r := recs[lease]
+				r.Provider = ""
+				recs[lease] = r
+			}
+			return e
+		}, "a reference must come from the same host"},
+		{"a negative counter in the reference", kindNetwork, func(e []expectation, recs map[string]record) []expectation {
+			recs["lease-100-idle"].Usage.NetRxBytes = -100 * mib
+			recs["lease-100-network"].Usage.NetRxBytes = 0
+			return e
+		}, "the idle job lease-100-idle: billet's record says net_rx_bytes is -104857600"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exps, recs := fixtureRun(100)
