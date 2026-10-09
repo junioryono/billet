@@ -176,38 +176,33 @@ func TestANodeWithMonitoringRefusesAHostThatCannotAccountForAJob(t *testing.T) {
 }
 
 // THE NODE REFUSES BEFORE IT ACCEPTS ITS PROVIDER: Node.open calls
-// requireJobAccounting on the provider NewProvider built, tests its error, and
-// only then keeps it. Asserted on the source because OpenNode cannot build a
-// Firecracker provider without a Ceph cluster.
+// requireJobAccounting once, on the provider NewProvider built, as
+// `if err := requireJobAccounting(p); err != nil { return err }`, and only then
+// keeps it; and NewProvider builds the Firecracker provider with
+// FirecrackerOptions(cfg), the options the table above is built with.
+// Asserted on the source because OpenNode cannot build a Firecracker provider
+// without a Ceph cluster.
 func TestTheNodeRefusesUnprovedAccountingBeforeKeepingItsProvider(t *testing.T) {
 	t.Parallel()
 
 	open := nodeFunc(t, "node.go", "open")
 
-	var built, required, kept token.Pos
+	var built, guarded, kept token.Pos
+
+	calls := 0
 
 	ast.Inspect(open.Body, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.CallExpr:
-			id, ok := x.Fun.(*ast.Ident)
-			switch {
-			case ok && id.Name == "NewProvider" && !built.IsValid():
+			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "NewProvider" && !built.IsValid() {
 				built = x.Pos()
-			case ok && id.Name == "requireJobAccounting" && len(x.Args) == 1:
-				if arg, ok := x.Args[0].(*ast.Ident); ok && arg.Name == "p" {
-					required = x.Pos()
-				}
+			}
+			if calleeName(x) == "requireJobAccounting" {
+				calls++
 			}
 		case *ast.IfStmt:
-			// The call must be the if's own initialiser whose error returns.
-			if assign, ok := x.Init.(*ast.AssignStmt); ok && len(assign.Rhs) == 1 {
-				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok && calleeName(call) == "requireJobAccounting" {
-					if len(x.Body.List) == 0 {
-						t.Error("Node.open ignores requireJobAccounting's error")
-					} else if _, ok := x.Body.List[0].(*ast.ReturnStmt); !ok {
-						t.Error("Node.open does not return requireJobAccounting's error")
-					}
-				}
+			if refusesWith(x, "requireJobAccounting", "p") {
+				guarded = x.Pos()
 			}
 		case *ast.AssignStmt:
 			for _, lhs := range x.Lhs {
@@ -220,9 +215,69 @@ func TestTheNodeRefusesUnprovedAccountingBeforeKeepingItsProvider(t *testing.T) 
 		return true
 	})
 
-	if !built.IsValid() || !required.IsValid() || !kept.IsValid() || required < built || required > kept {
-		t.Errorf("Node.open must call requireJobAccounting(p) after NewProvider and before keeping "+
-			"the provider (NewProvider %v, requireJobAccounting %v, n.provider %v)",
-			built.IsValid(), required.IsValid(), kept.IsValid())
+	if calls != 1 || !built.IsValid() || !guarded.IsValid() || !kept.IsValid() ||
+		guarded < built || guarded > kept {
+		t.Errorf("Node.open must call requireJobAccounting once, as `if err := "+
+			"requireJobAccounting(p); err != nil { return err }` after NewProvider and before "+
+			"keeping the provider (calls %d, NewProvider %v, guarded %v, n.provider %v)",
+			calls, built.IsValid(), guarded.IsValid(), kept.IsValid())
 	}
+
+	optioned := false
+
+	ast.Inspect(nodeFunc(t, "node.go", "NewProvider").Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !namesSelector(call.Fun, "firecracker", "New") || !call.Ellipsis.IsValid() {
+			return true
+		}
+		last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
+		if ok && calleeName(last) == "FirecrackerOptions" && len(last.Args) == 1 {
+			if arg, ok := last.Args[0].(*ast.Ident); ok && arg.Name == "cfg" {
+				optioned = true
+			}
+		}
+
+		return true
+	})
+
+	if !optioned {
+		t.Error("NewProvider does not build the Firecracker provider with FirecrackerOptions(cfg)...")
+	}
+}
+
+// refusesWith reports whether stmt is exactly `if err := fn(arg); err != nil {
+// return err }`: the call's error bound, tested, and returned first.
+func refusesWith(stmt *ast.IfStmt, fn, arg string) bool {
+	assign, ok := stmt.Init.(*ast.AssignStmt)
+	if !ok || assign.Tok != token.DEFINE || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+		return false
+	}
+	bound, ok := assign.Lhs[0].(*ast.Ident)
+	call, isCall := assign.Rhs[0].(*ast.CallExpr)
+	if !ok || !isCall || calleeName(call) != fn || len(call.Args) != 1 {
+		return false
+	}
+	if a, ok := call.Args[0].(*ast.Ident); !ok || a.Name != arg {
+		return false
+	}
+	cond, ok := stmt.Cond.(*ast.BinaryExpr)
+	if !ok || cond.Op != token.NEQ {
+		return false
+	}
+	if x, ok := cond.X.(*ast.Ident); !ok || x.Name != bound.Name {
+		return false
+	}
+	if y, ok := cond.Y.(*ast.Ident); !ok || y.Name != "nil" {
+		return false
+	}
+	if len(stmt.Body.List) == 0 {
+		return false
+	}
+	ret, ok := stmt.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return false
+	}
+	result, ok := ret.Results[0].(*ast.Ident)
+
+	return ok && result.Name == bound.Name
 }

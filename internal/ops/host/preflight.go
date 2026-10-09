@@ -607,8 +607,11 @@ func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config, 
 
 	// BEFORE THE HOST'S OWN CHECKS, because New has already read the answer and
 	// nothing below changes it: a node with node.monitoring refuses to start on
-	// this host whatever else is true of it.
+	// this host whatever else is true of it. The line it would have printed
+	// below is printed here, so both controllers' states are still read out.
 	if err := p.RequireJobAccounting(); err != nil {
+		fmt.Fprintf(env.Stdout, "microvm  %s\n", p.Accounting().Summary())
+
 		return err
 	}
 

@@ -97,14 +97,24 @@ func TestCheckRefusesAFirecrackerHostMonitoringCannotMeasure(t *testing.T) {
 
 			err := checkFirecrackerHost(t.Context(), env, cfg, firecracker.WithMountTable(mounts))
 			if tc.says == nil {
-				if errors.Is(err, firecracker.ErrJobAccountingUnproved) {
-					t.Fatalf("the check refused for accounting: %v", err)
+				// PAST THE GATE AND INTO CheckHost, whose first two checks this
+				// staged host fails: /dev/kvm where this account cannot open it,
+				// and otherwise the staged binary, which is empty and will not
+				// report a version.
+				reachedCheckHost := err != nil && (errors.Is(err, firecracker.ErrNoKVM) ||
+					strings.Contains(err.Error(), "would not report its version"))
+				if !reachedCheckHost || errors.Is(err, firecracker.ErrJobAccountingUnproved) {
+					t.Fatalf("checkFirecrackerHost = %v, want it to pass the accounting gate and fail "+
+						"on /dev/kvm or the staged binary", err)
 				}
 
 				return
 			}
 			if !errors.Is(err, firecracker.ErrJobAccountingUnproved) {
 				t.Fatalf("checkFirecrackerHost = %v, want the accounting refusal", err)
+			}
+			if !strings.Contains(out.String(), "per-job accounting: memory ") {
+				t.Errorf("the refused check did not print both controllers' states:\n%s", out.String())
 			}
 			for _, want := range append(tc.says, filepath.Join(root, "firecracker-v1.16.1"),
 				"CONFIG_BLK_CGROUP_IOCOST") {

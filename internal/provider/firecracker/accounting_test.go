@@ -79,6 +79,21 @@ func TestAccountingIsProvedPerController(t *testing.T) {
 			memory: ControllerMissing, io: ControllerMissing, reason: "memory controller is not in",
 		},
 		{
+			name: "a cgroup named io.weight is not the kernel's file",
+			root: func(t *testing.T) string {
+				t.Helper()
+
+				root := cgroupTree(t, "cpu io memory", "cpu io memory",
+					map[string][]string{"system.slice": nil})
+				if err := os.Mkdir(filepath.Join(root, "system.slice", "io.weight"), 0o700); err != nil {
+					t.Fatalf("stage: %v", err)
+				}
+
+				return root
+			},
+			memory: ControllerPresent, io: ControllerUnknown, reason: "not the kernel's io.weight file",
+		},
+		{
 			name: "io enabled nowhere below the root cannot be read",
 			root: func(t *testing.T) string {
 				t.Helper()

@@ -97,8 +97,9 @@ func (a Accounting) Require() error {
 		"host proves it supports. Enable memory and io for %s: both must be listed in "+
 		"%s/cgroup.controllers (a kernel booted with cgroup_disable=memory, or holding a "+
 		"controller in a cgroup-v1 hierarchy, does not list it); `echo '+memory +io' > "+
-		"%s/cgroup.subtree_control` enables them for every cgroup below the root, the jailer's "+
-		"parent among them; and io needs the kernel's weight-based io policy "+
+		"%s/cgroup.subtree_control` enables them for the cgroups directly below the root, the "+
+		"jailer's parent among them, and the jailer enables them below that for each microVM; "+
+		"and io needs the kernel's weight-based io policy "+
 		"(CONFIG_BLK_CGROUP_IOCOST), which an io-enabled cgroup shows as io.weight. Then run "+
 		"billet check again, or remove node.monitoring to run this node unmeasured",
 		ErrJobAccountingUnproved, strings.Join(unproved, " and "), reason, parent, root, root)
@@ -204,10 +205,15 @@ func probeIOWeight(root string) (Controller, string) {
 			continue
 		}
 		sawChild = true
-		_, err := os.Stat(filepath.Join(root, entry.Name(), "io.weight"))
+		weight := filepath.Join(root, entry.Name(), "io.weight")
+		info, err := os.Stat(weight)
 		switch {
-		case err == nil:
+		case err == nil && info.Mode().IsRegular():
 			return ControllerPresent, ""
+		case err == nil:
+			// A CGROUP NAMED io.weight is a directory, not the kernel's file, and
+			// says nothing either way about this kernel's io policy.
+			return ControllerUnknown, weight + " is not the kernel's io.weight file"
 		case errors.Is(err, fs.ErrNotExist):
 			continue
 		default:
