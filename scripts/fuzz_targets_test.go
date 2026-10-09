@@ -139,7 +139,11 @@ func nightlyContext(t *testing.T) gobuild.Context {
 
 	cmd := exec.CommandContext(t.Context(), "go", "list", "-f",
 		`{{join context.ToolTags ","}}|{{join context.ReleaseTags ","}}`, "runtime")
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0", "GOFLAGS=")
+	// NOTHING OF THIS MACHINE'S: no persisted `go env -w` settings, no flags,
+	// and the amd64 level and experiments at the toolchain's defaults, which
+	// the nightly runner sets none of.
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
+		"GOENV=off", "GOFLAGS=", "GOAMD64=v1", "GOEXPERIMENT=")
 
 	out, err := cmd.Output()
 	if err != nil {
