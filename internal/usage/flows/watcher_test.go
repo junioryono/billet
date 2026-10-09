@@ -500,7 +500,7 @@ func TestAnOldFinalCannotFinishItsReplacement(t *testing.T) {
 		}
 	}
 
-	w, _ := newTestWatcher(table, l)
+	w, acct := newTestWatcher(table, l)
 	w.Watch("job", guestMACAddr, "leases", launched)
 
 	done := make(chan struct{})
@@ -524,8 +524,12 @@ func TestAnOldFinalCannotFinishItsReplacement(t *testing.T) {
 	<-done
 
 	w.Resolve()
+	acct.Observe(flow(9, other, npm, 3, 33)) // the replacement's guest's own flow
 
-	if _, measured, err := w.Final(t.Context(), "job", ended); !measured {
-		t.Errorf("the old Final finished the replacement's watch: %v", err)
+	r, measured, err := w.Final(t.Context(), "job", ended)
+	if !measured || err != nil {
+		t.Fatalf("the old Final finished the replacement's watch: %v, %v", measured, err)
 	}
+
+	only(t, r, Destination{Addr: npm, Sent: 3, Received: 33, Connections: 1})
 }

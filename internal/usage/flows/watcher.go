@@ -73,21 +73,20 @@ func NewWatcher(acct *Accountant, table Table, leaseTime time.Duration, log *slo
 
 // Watch starts following the job named key, whose guest has hardware address
 // mac and is leased its address in leaseFile, and which was launched at
-// launched. A key already followed is replaced in the same step, and the
-// replaced watch finished without a result.
+// launched. A key already followed is replaced: the old watch is finished,
+// freeing its address, before the new one can be seen by anything else.
 func (w *Watcher) Watch(key string, mac net.HardwareAddr, leaseFile string, launched time.Time) {
 	w.mu.Lock()
+
+	if old := w.pending[key]; old != nil && old.addr.IsValid() {
+		w.acct.Final(old.acctKey, nil, time.Now())
+	}
+
 	w.generation++
 	p := &pending{acctKey: fmt.Sprintf("%s#%d", key, w.generation), mac: mac, leaseFile: leaseFile,
 		launched: launched}
-	old := w.pending[key]
 	w.pending[key] = p
-	replaced := old != nil && old.addr.IsValid()
 	w.mu.Unlock()
-
-	if replaced {
-		w.acct.Final(old.acctKey, nil, time.Now())
-	}
 
 	w.resolve(key, p)
 }

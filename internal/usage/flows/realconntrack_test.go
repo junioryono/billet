@@ -139,7 +139,8 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 	// WATCHED FROM NOW, after the listener's startup gap has closed, so the
 	// only thing that can mark the probe is its own destruction.
 	probe, peer := netip.MustParseAddr("127.66.1.1"), netip.MustParseAddr("127.66.1.2")
-	if !acct.Watch("probe", probe, time.Now(), nil) {
+	probeSince := time.Now()
+	if !acct.Watch("probe", probe, probeSince, nil) {
 		t.Fatal("the probe address could not be watched")
 	}
 
@@ -164,6 +165,16 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 
 	if err := tracker.Sync(syncCtx); err != nil {
 		t.Fatalf("sync after the probe: %v", err)
+	}
+
+	// A GAP IN THE LISTENER WHILE THE PROBE WAS WATCHED would mark it too, so
+	// a probe watched across one proves nothing either way.
+	acct.mu.Lock()
+	gap := acct.down || !acct.lossEnded.Before(probeSince)
+	acct.mu.Unlock()
+
+	if gap {
+		t.Fatal("the listener lost events while the probe was watched; the delivery check is inconclusive")
 	}
 
 	r, _ := acct.Final("probe", nil, time.Now())
