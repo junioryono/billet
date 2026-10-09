@@ -54,7 +54,9 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	renderJob(env.Stdout, rec, measured)
+	renderSteps(env.Stdout, steps)
 
 	return nil
 }

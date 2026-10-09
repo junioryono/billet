@@ -16,6 +16,32 @@ import (
 func seedMeasuredJob(t *testing.T, stateDir string, requestID int64, usage *alloc.JobUsage) string {
 	t.Helper()
 
+	return seedJob(t, stateDir, jobSeed{requestID: requestID, usage: usage, job: &forgedJob})
+}
+
+// forgedJob is the job seedMeasuredJob records: every string GitHub or a
+// workflow chose carries a character that would forge a line unquoted.
+var forgedJob = alloc.HistoryJob{
+	// GITHUB'S JOB ID IS A STRING GITHUB CHOSE, quoted like the rest.
+	JobID: "51001\rjob        forged", Owner: "acme", Repository: "api", Event: "push",
+	WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	// A WORKFLOW CHOOSES ITS JOB'S NAME, newlines included.
+	Name: "test\nlease      forged",
+}
+
+// jobSeed is what seedJob stages: the job GitHub named (nil names none), the
+// host's usage report and its series.
+type jobSeed struct {
+	requestID int64
+	job       *alloc.HistoryJob
+	usage     *alloc.JobUsage
+	series    *alloc.UsageSeries
+}
+
+// seedJob stages a job through the real allocator and returns its lease.
+func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
+	t.Helper()
+
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
@@ -43,23 +69,19 @@ func seedMeasuredJob(t *testing.T, stateDir string, requestID int64, usage *allo
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
-	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, requestID); err != nil {
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 4242, seed.requestID); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{
-		// GITHUB'S JOB ID IS A STRING GITHUB CHOSE, quoted like the rest.
-		JobID: "51001\rjob        forged", Owner: "acme", Repository: "api", Event: "push",
-		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
-		// A WORKFLOW CHOOSES ITS JOB'S NAME, newlines included.
-		Name: "test\nlease      forged",
-	}); err != nil {
-		t.Fatalf("RecordJobIdentity: %v", err)
+	if seed.job != nil {
+		if err := a.RecordJobIdentity(t.Context(), lease.ID, *seed.job); err != nil {
+			t.Fatalf("RecordJobIdentity: %v", err)
+		}
 	}
-	if usage != nil {
-		if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, *usage, nil); err != nil {
+	if seed.usage != nil {
+		if err := a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, *seed.usage, seed.series); err != nil {
 			t.Fatalf("RecordLeaseUsage: %v", err)
 		}
 	}
@@ -69,7 +91,8 @@ func seedMeasuredJob(t *testing.T, stateDir string, requestID int64, usage *allo
 
 func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 	stateDir := t.TempDir()
-	cfg := writeCAConfig(t, stateDir)
+	cfg := writeJobsConfig(t, stateDir)
+	fakeJobsGitHub(t, noJobs)
 	lease := seedMeasuredJob(t, stateDir, 77, &alloc.JobUsage{
 		Source: alloc.UsageSourceHost, Unmeasured: []string{alloc.UsageMemory, alloc.UsageIO},
 		Samples: 1200, IntervalMillis: 1000, WindowMillis: 1_200_000,
@@ -110,7 +133,8 @@ func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 
 func TestJobsShowSaysWhenNothingWasMeasured(t *testing.T) {
 	stateDir := t.TempDir()
-	cfg := writeCAConfig(t, stateDir)
+	cfg := writeJobsConfig(t, stateDir)
+	fakeJobsGitHub(t, noJobs)
 	lease := seedMeasuredJob(t, stateDir, -3, nil)
 
 	out := capture(t, func() {
