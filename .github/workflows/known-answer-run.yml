@@ -13,6 +13,10 @@ name: Known-answer run
 # THE NETWORK LOAD IS ONE OF BILLET'S OWN RELEASE ASSETS, whose size GitHub
 # publishes exactly: the Cloudflare speed endpoint answered a guest with 403
 # (measured 2026-10-09).
+#
+# THE MEMORY LOAD IS 8 GiB, because a microVM's host-side peak is all the guest
+# RAM it touched, setup's page cache included: an idle job on this tier peaked
+# at 4.8 GiB, and a 2 GiB load could not be told apart from it (2026-10-09).
 on: workflow_dispatch
 
 permissions:
@@ -26,7 +30,7 @@ jobs:
       billet_ref: ${{ github.sha }}
       seconds: 60
       cpu_workers: 4
-      memory_bytes: 2147483648
+      memory_bytes: 8589934592
       network_url: https://github.com/junioryono/billet/releases/download/guest-20261005-070030/rootfs.img.zst.part010
       network_bytes: 169258759
       disk_bytes: 2147483648
