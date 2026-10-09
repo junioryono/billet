@@ -70,7 +70,7 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 
 	r := rand.New(rand.NewPCG(2026, 1008))
 
-	uniformChecked := 0
+	var uniformChecked, ceilingBound, macOS int
 
 	for i := range 20000 {
 		uniform := r.IntN(4) != 0
@@ -87,6 +87,14 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 		if got, ok := p.uniformTotal(tier); ok {
 			uniformChecked++
 
+			if tier.GuestOS == config.GuestMacOS {
+				macOS++
+			}
+
+			if c, ok := firstCost(p); ok && p.deploymentVCPU/c.vcpu <= want {
+				ceilingBound++
+			}
+
 			if got != want {
 				t.Fatalf("case %d: counted %d, placed %d, on %+v", i, got, want, *p)
 			}
@@ -99,8 +107,49 @@ func TestCountingHeadroomGivesTheGreedyCount(t *testing.T) {
 		}
 	}
 
-	if uniformChecked < 10000 {
-		t.Fatalf("only %d of 20000 cases were counted in one pass", uniformChecked)
+	// THE CASES THAT MATTER WERE MADE, not only possible: counted in one pass,
+	// on macOS, and with the deployment's ceiling the binding bound.
+	if uniformChecked < 10000 || macOS < 2000 || ceilingBound < 2000 {
+		t.Fatalf("of 20000 cases %d were counted in one pass, %d on macOS and %d bound by the ceiling",
+			uniformChecked, macOS, ceilingBound)
+	}
+}
+
+// firstCost is the cost the placer's first costed candidate charges.
+func firstCost(p *placer) (placementCost, bool) {
+	for _, n := range p.order {
+		if c, ok := p.cost[n.name]; ok {
+			return c, true
+		}
+	}
+
+	return placementCost{}, false
+}
+
+// A FLEET TOO LARGE TO SUM: two hosts whose rooms each fill an int, under a
+// ceiling of one. Placing stops after one; adding the rooms first wrapped and
+// answered none.
+func TestCountingHeadroomDoesNotOverflow(t *testing.T) {
+	t.Parallel()
+
+	const huge = int(^uint(0) >> 1)
+
+	p := &placer{
+		order:            []nodeRow{{name: "a"}, {name: "b"}},
+		freeVCPU:         map[string]int{"a": huge, "b": huge},
+		freeMemory:       map[string]config.ByteSize{"a": 1<<63 - 1, "b": 1<<63 - 1},
+		freeMacOS:        map[string]int{},
+		cost:             map[string]placementCost{"a": {vcpu: 1, memory: 1}, "b": {vcpu: 1, memory: 1}},
+		rank:             map[string]int{},
+		deploymentVCPU:   1,
+		deploymentMemory: 1,
+		policy:           config.PlacementPack,
+	}
+
+	tier := config.Tier{Label: "t", GuestOS: config.GuestLinux}
+
+	if got, want := p.total(tier), p.greedyTotal(tier); got != want || want != 1 {
+		t.Fatalf("counted %d, placed %d, want 1", got, want)
 	}
 }
 

@@ -301,7 +301,8 @@ func (p *placer) greedyTotal(t config.Tier) int {
 }
 
 // uniformTotal is greedyTotal's answer in one pass, when every candidate with
-// a cost charges the same one, and false when they do not.
+// a cost charges the same one, and false when they do not. order holds each
+// host once, as eligibleNodes reads it: one row per registered name.
 func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 	var (
 		cost placementCost
@@ -333,9 +334,13 @@ func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 		return 0, false
 	}
 
+	deployment := max(min(p.deploymentVCPU/cost.vcpu, int(p.deploymentMemory/cost.memory)), 0)
+
 	// EACH HOST'S OWN ROOM, which roomFor computes before the deployment's
 	// ceiling: one placement takes exactly one off it, since every term of the
-	// minimum falls by one.
+	// minimum falls by one. CAPPED AS IT IS ADDED, at the deployment's room,
+	// which is the most the sum can contribute and keeps hosts large enough to
+	// overflow an int from summing past it.
 	hosts := 0
 
 	for _, n := range p.order {
@@ -348,12 +353,10 @@ func (p *placer) uniformTotal(t config.Tier) (int, bool) {
 			room = min(room, p.freeMacOS[n.name])
 		}
 
-		hosts += max(room, 0)
+		hosts += min(max(room, 0), deployment-hosts)
 	}
 
-	deployment := min(p.deploymentVCPU/cost.vcpu, int(p.deploymentMemory/cost.memory))
-
-	return max(min(hosts, deployment), 0), true
+	return hosts, true
 }
 
 // next picks the machine a reservation should be aimed at, and spends it.
