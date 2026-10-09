@@ -66,22 +66,24 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 	if out.Span == 0 || len(tl.Points) == 0 {
 		return out
 	}
-	a := from.Sub(tl.First).Milliseconds()
-	b := to.Sub(tl.First).Milliseconds()
+	// IN NANOSECONDS, NOT MILLISECONDS: truncating the window's ends to the
+	// series' unit would let a sample taken just before a step count as inside
+	// it, and call a window complete that ends just past the last sample.
+	a, b := from.Sub(tl.First), to.Sub(tl.First)
 
 	for _, p := range tl.Points {
-		if p.OffsetMillis >= a && p.OffsetMillis <= b {
+		if at := p.offset(); at >= a && at <= b {
 			out.Samples++
 			out.MemoryPeak = max(out.MemoryPeak, p.MemoryCurrent)
 		}
 	}
 	points, fell := distinct(tl.Points)
-	var covered int64
+	var covered time.Duration
 	var sums [6]int64
 	for i := 1; i < len(points); i++ {
 		p, next := points[i-1], points[i]
-		length := next.OffsetMillis - p.OffsetMillis
-		overlap := min(b, next.OffsetMillis) - max(a, p.OffsetMillis)
+		length := next.offset() - p.offset()
+		overlap := min(b, next.offset()) - max(a, p.offset())
 		if overlap <= 0 || next.AfterGap || fell[i] || fell[i-1] {
 			continue
 		}
@@ -89,7 +91,7 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 		var shares [6]int64
 		fits := true
 		for c := range shares {
-			shares[c] = shareOf(after[c]-before[c], overlap, length)
+			shares[c] = shareOf(after[c]-before[c], int64(overlap), int64(length))
 			fits = fits && shares[c] <= math.MaxInt64-sums[c]
 		}
 		// A TOTAL THAT WOULD NOT FIT IS UNCOVERED, never wrapped: the increments
@@ -103,12 +105,15 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 			sums[c] += shares[c]
 		}
 	}
-	out.Covered = min(time.Duration(covered)*time.Millisecond, out.Span)
+	out.Covered = min(covered, out.Span)
 	out.CPUMicros, out.DiskRead, out.DiskWrite = sums[0], sums[1], sums[2]
 	out.NetRx, out.NetTx, out.EnergyActive = sums[3], sums[4], sums[5]
 
 	return out
 }
+
+// offset is the point's offset from the first as a duration.
+func (p Point) offset() time.Duration { return time.Duration(p.OffsetMillis) * time.Millisecond }
 
 // cumulative is the point's cumulative columns Window reads, in the order it
 // sums them.

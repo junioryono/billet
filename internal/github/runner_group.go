@@ -174,7 +174,7 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, nil, err //nolint:wrapcheck // callers wrap with the operation name; *url.Error is what Undecided reads.
+		return 0, nil, withoutBearerText(err, bearer)
 	}
 	defer resp.Body.Close()
 
@@ -206,8 +206,8 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	// can reach an operator's output, as a job's name or inside an error about a
 	// field that did not parse, and no redaction of one path covers the next.
 	if carries(body, token) {
-		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, so it is not read",
-			operation)
+		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, or could not "+
+			"be checked for it, so it is not read", operation)
 	}
 
 	return body, nil
@@ -222,9 +222,15 @@ func carries(body []byte, bearer string) bool {
 	if bytes.Contains(body, []byte(bearer)) {
 		return true
 	}
+	// A BODY THAT CANNOT BE SCANNED IS TREATED AS CARRYING IT: a typed decode
+	// after this ignores what it does not know, so failing open here would let
+	// an escaped bearer through in a field the scan never reached. Numbers are
+	// kept as text, so one too large for a float64 is not a failure.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var decoded any
-	if json.Unmarshal(body, &decoded) != nil {
-		return false
+	if dec.Decode(&decoded) != nil {
+		return true
 	}
 
 	return holds(decoded, bearer)
@@ -247,6 +253,28 @@ func holds(v any, s string) bool {
 	}
 
 	return false
+}
+
+// bearerScrubbed is a transport error whose text named the bearer, rendered
+// without it. It unwraps to the original, so Undecided still reads the
+// *url.Error, and its own text is what any wrapper prints.
+type bearerScrubbed struct {
+	err  error
+	text string
+}
+
+func (e *bearerScrubbed) Error() string { return e.text }
+func (e *bearerScrubbed) Unwrap() error { return e.err }
+
+// withoutBearerText is err with the bearer replaced in its text: a redirect's
+// Location the client could not follow is quoted in the client's error, and a
+// server that put the bearer there would otherwise put it in the output.
+func withoutBearerText(err error, bearer string) error {
+	if bearer == "" || !strings.Contains(err.Error(), bearer) {
+		return err //nolint:wrapcheck // callers wrap with the operation name; *url.Error is what Undecided reads.
+	}
+
+	return &bearerScrubbed{err: err, text: strings.ReplaceAll(err.Error(), bearer, "[redacted]")}
 }
 
 // apiErrorWithout is apiError for a request that carried bearer, keeping of
@@ -555,17 +583,25 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return "", fmt.Errorf("github: create installation token: %w",
 			apiErrorWithout(status, body, jwt))
 	}
+	// THE ANSWER CARRIES THE NEW TOKEN, and must not carry the JWT that asked.
+	if carries(body, jwt) {
+		return "", errors.New("github: create installation token: the answer carried the App's JWT, " +
+			"or could not be checked for it, so it is not read")
+	}
 	var out struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return "", fmt.Errorf("github: decode installation token: %w", err)
 	}
-	if out.Token == "" || out.ExpiresAt.IsZero() {
+	// PARSED HERE RATHER THAN BY time.Time's decoder, whose error quotes the
+	// value it could not read.
+	expiresAt, err := time.Parse(time.RFC3339, out.ExpiresAt)
+	if out.Token == "" || out.ExpiresAt == "" || err != nil {
 		return "", fmt.Errorf("github: installation-token response was incomplete")
 	}
-	c.token, c.expiresAt = out.Token, out.ExpiresAt
+	c.token, c.expiresAt = out.Token, expiresAt
 	return c.token, nil
 }
 

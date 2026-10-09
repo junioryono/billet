@@ -313,3 +313,25 @@ func TestStepsInAnyOrderGetTheSameWindows(t *testing.T) {
 		t.Errorf("three windows tiling the series used %dµs, want the series' 3s", total)
 	}
 }
+
+// A WINDOW'S ENDS ARE NOT CUT TO THE SERIES' MILLISECOND: with the series
+// beginning half a millisecond past the second, a sample at 999ms is half a
+// millisecond before a step starting on the next second, and a last sample at
+// 1999ms ends the series half a millisecond before the step does.
+func TestAWindowKeepsItsEndsToTheNanosecond(t *testing.T) {
+	t.Parallel()
+
+	start := first.Add(500 * time.Microsecond)
+	tl := Timeline{First: start, Points: []Point{
+		{OffsetMillis: 0}, {OffsetMillis: 999, MemoryCurrent: 9 << 30}, {OffsetMillis: 1500, MemoryCurrent: 1 << 20},
+		{OffsetMillis: 1999, MemoryCurrent: 2 << 20},
+	}}
+	w := tl.Window(first.Add(time.Second), first.Add(2*time.Second))
+	if w.Samples != 2 || w.MemoryPeak != 2<<20 {
+		t.Errorf("samples %d peak %d, want the two inside and not the one half a millisecond before",
+			w.Samples, w.MemoryPeak)
+	}
+	if w.Complete() || w.Covered != 999500*time.Microsecond {
+		t.Errorf("covered %s of %s, want the 999.5ms the series reaches", w.Covered, w.Span)
+	}
+}

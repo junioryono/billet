@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -327,6 +328,95 @@ func TestASuccessfulAnswerCarryingTheTokenIsNotRead(t *testing.T) {
 				t.Errorf("%s in %s = %v, want the answer refused unread", echo, field, err)
 			}
 		}
+	}
+}
+
+// AN ANSWER THE SCAN CANNOT READ IS NOT READ EITHER: a number too large for a
+// float64 beside an escaped token is still scanned, and a body that is not JSON
+// at all is refused rather than passed on unscanned.
+func TestAnAnswerTheScanCannotReadIsNotRead(t *testing.T) {
+	t.Parallel()
+
+	escape := echoes["escaped"]
+	for name, body := range map[string]func(token string) string{
+		"a huge number beside the token": func(token string) string {
+			return `{"total_count":1,"unused":1e1000,"jobs":[` +
+				jobJSON(1, "billet-lease-1", `{"number":1,"name":"`+escape(token)+`"}`) + `]}`
+		},
+		"not JSON": func(string) string { return `{"total_count":1,"jobs":[` },
+	} {
+		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+			fmt.Fprint(w, body(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+		})
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		if err == nil || !strings.Contains(err.Error(), "could not be checked for it") ||
+			strings.Contains(err.Error(), "installation-secret") {
+			t.Errorf("%s = %v, want the answer refused unread", name, err)
+		}
+	}
+
+	// AND A HUGE NUMBER ALONE IS NOT A REASON TO REFUSE: the scan reads it as
+	// text, so an answer that carries no token is read.
+	c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		fmt.Fprintf(w, `{"total_count":1,"unused":1e1000,"jobs":[%s]}`, jobJSON(1, "billet-lease-1", twoSteps))
+	})
+	if job, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1"); err != nil || job.ID != 1 {
+		t.Errorf("an answer with a huge number and no token = %+v, %v, want it read", job, err)
+	}
+}
+
+// A TOKEN EXCHANGE THAT SUCCEEDS STILL MAY NOT CARRY THE JWT, and an expiry it
+// cannot read is not quoted.
+func TestASuccessfulTokenExchangeCarriesNoJWT(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	for name, tc := range map[string]struct {
+		expires func(jwt string) string
+		want    string
+	}{
+		"the JWT as the expiry": {func(jwt string) string { return jwt }, "carried the App's JWT"},
+		"the JWT escaped":       {func(jwt string) string { return echoes["escaped"](jwt) }, "carried the App's JWT"},
+		"an unreadable expiry":  {func(string) string { return "tomorrow-ish" }, "response was incomplete"},
+	} {
+		var sent atomic.Value
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			jwt := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			sent.Store(jwt)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"ghs_issued","expires_at":"%s"}`, tc.expires(jwt))
+		}))
+		t.Cleanup(srv.Close)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		jwt, ok := sent.Load().(string)
+		if !ok || jwt == "" {
+			t.Fatalf("%s: no token exchange was attempted: %v", name, err)
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), jwt) ||
+			strings.Contains(err.Error(), "tomorrow") {
+			t.Errorf("%s = %v, want it refused saying %q and quoting nothing", name, err, tc.want)
+		}
+	}
+}
+
+// A REDIRECT THAT NAMES THE TOKEN IN A LOCATION THE CLIENT CANNOT FOLLOW
+// DOES NOT PUT IT IN THE ERROR, which is still the client's transport error.
+func TestARedirectNamingTheTokenIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Location", "http://example.invalid:"+token+"/")
+		w.WriteHeader(http.StatusFound)
+	})
+	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+	if err == nil || strings.Contains(err.Error(), "installation-secret") || !strings.Contains(err.Error(), "[redacted]") {
+		t.Errorf("a redirect naming the token = %v, want it redacted", err)
+	}
+	if transport, ok := errors.AsType[*url.Error](err); !ok || transport == nil || !Undecided(err) {
+		t.Errorf("the redacted error lost its class: %T %v", err, err)
 	}
 }
 
