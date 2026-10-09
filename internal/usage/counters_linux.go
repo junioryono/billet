@@ -5,6 +5,13 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"math/bits"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/elastic/go-perf"
 	"golang.org/x/sys/unix"
@@ -31,6 +38,106 @@ type perfSource struct{}
 // which a node running as root has.
 func HardwareCounters() (CounterSource, error) { return perfSource{}, nil }
 
+// ProveCounting proves src's group of every event counts on this host, on
+// every CPU the node may run on, before a node promises counts it would record
+// as unmeasured on every job.
+//
+// ON A THREAD OF ITS OWN THAT IS NEVER UNLOCKED: the proof changes the
+// thread's affinity, and a goroutine that exits locked ends its thread rather
+// than handing the scheduler a thread pinned to one CPU. The affinity is put
+// back as well, because the runtime parks rather than ends the process's main
+// thread, and a parked main thread is what /proc/self reports.
+func ProveCounting(src CounterSource) error {
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		cpus, original, err := allowedCPUs()
+		if err != nil {
+			done <- fmt.Errorf("usage: read the CPUs this node may run on: %w", err)
+			return
+		}
+		enough := proofBudget(muxInterval("/sys/bus/event_source/devices"))
+		tid := unix.Gettid()
+		proof := proveOnEveryCPU(cpus,
+			func(cpu int) error {
+				one := unix.NewCPUSet(cpu + 1)
+				one.Set(cpu)
+				return unix.SchedSetaffinityDynamic(0, one)
+			},
+			func() error {
+				return proveCounting(src, tid, func() { spin(5 * time.Millisecond) }, enough, 400)
+			})
+		if err := unix.SchedSetaffinityDynamic(0, original); err != nil {
+			proof = errors.Join(proof, fmt.Errorf("usage: put back the proving thread's CPUs: %w", err))
+		}
+		done <- proof
+	}()
+
+	return <-done
+}
+
+// muxInterval is the longest interval at which the kernel rotates the groups
+// waiting for a PMU's counters, read from each PMU under dir, or 100 ms where
+// none can be read: a longer guess costs only time where a group never counts.
+// Measured on the reference host on 2026-10-09: 1 ms on every PMU.
+func muxInterval(dir string) time.Duration {
+	const unread = 100 * time.Millisecond
+	paths, err := filepath.Glob(filepath.Join(dir, "*", "perf_event_mux_interval_ms"))
+	if err != nil {
+		return unread
+	}
+	longest := time.Duration(0)
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		ms, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil || ms <= 0 {
+			continue
+		}
+		longest = max(longest, time.Duration(ms)*time.Millisecond)
+	}
+	if longest == 0 {
+		return unread
+	}
+
+	return longest
+}
+
+// allowedCPUs is the calling thread's affinity, in a mask grown until the
+// kernel's fits: the fixed unix.CPUSet holds 1,024 CPUs, and the kernel answers
+// EINVAL to a mask smaller than its own, however few CPUs are allowed.
+func allowedCPUs() ([]int, unix.CPUSetDynamic, error) {
+	for n := 1024; ; n *= 2 {
+		set := unix.NewCPUSet(n)
+		err := unix.SchedGetaffinityDynamic(0, set)
+		if errors.Is(err, unix.EINVAL) && n < 1<<22 {
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		var cpus []int
+		for cpu := range len(set) * bits.UintSize {
+			if set.IsSet(cpu) {
+				cpus = append(cpus, cpu)
+			}
+		}
+
+		return cpus, set, nil
+	}
+}
+
+// spin keeps the calling thread on a CPU for d.
+func spin(d time.Duration) {
+	x := uint64(1)
+	for deadline := time.Now().Add(d); time.Now().Before(deadline); {
+		x = x*6364136223846793005 + 1442695040888963407
+	}
+	runtime.KeepAlive(x)
+}
+
 // Open opens one group of every event on tid, on whichever CPU it runs.
 //
 // GUEST MODE IS COUNTED. A vCPU thread spends most of its time inside KVM_RUN
@@ -38,8 +145,12 @@ func HardwareCounters() (CounterSource, error) { return perfSource{}, nil }
 // CLI sets it by default, which is why a hand check names the events with :HG.
 // Kernel mode is counted too, since the exits are the virtualization's cost.
 //
-// AN EVENT THAT WILL NOT OPEN IS LEFT OUT, never the whole group: the first
-// event that opens leads, and Opened says which the rest are.
+// AN EVENT THE CPU DOES NOT HAVE IS LEFT OUT, never the whole group: the first
+// event that opens leads, and Opened says which the rest are. The kernel says
+// so with ENOENT (measured on the reference host on 2026-10-09 for
+// stalled-cycles-backend and ref-cycles). Any other refusal fails the thread,
+// because a group that lost an event to it would not be the group the startup
+// proof ran, and a smaller group can count where the whole one never does.
 func (perfSource) Open(tid int) (CounterGroup, error) {
 	g := &perfGroup{}
 	for e, hw := range hardwareEvents {
@@ -56,12 +167,15 @@ func (perfSource) Open(tid int) (CounterGroup, error) {
 			continue
 		}
 		ev, err := perf.Open(attr, tid, perf.AnyCPU, g.leader)
-		if errors.Is(err, unix.ESRCH) {
+		switch {
+		case errors.Is(err, unix.ESRCH):
 			_ = g.Close()
 			return nil, ErrThreadGone
-		}
-		if err != nil {
+		case errors.Is(err, unix.ENOENT):
 			continue
+		case err != nil:
+			_ = g.Close()
+			return nil, fmt.Errorf("usage: open hardware event %d on thread %d: %w", e, tid, err)
 		}
 		if g.leader == nil {
 			g.leader = ev

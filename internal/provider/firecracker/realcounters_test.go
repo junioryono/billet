@@ -26,8 +26,11 @@ import (
 func TestRealVCPUThreadsCountTheGuestsInstructions(t *testing.T) {
 	env := requireRealHost(t)
 	counters, err := usage.HardwareCounters()
+	if err == nil {
+		err = usage.ProveCounting(counters)
+	}
 	if err != nil {
-		t.Skipf("this platform cannot count: %v", err)
+		t.Skipf("this host cannot count, and a node here refuses perf: %v", err)
 	}
 
 	p, err := New(selftestDeployment, env.cfg, env.disk, WithBootWait(20*time.Second))

@@ -12,3 +12,8 @@ const CountersSupported = false
 func HardwareCounters() (CounterSource, error) {
 	return nil, errors.New("usage: hardware counters are read through perf_event_open, which only Linux has")
 }
+
+// ProveCounting has nothing to prove where nothing can be opened.
+func ProveCounting(CounterSource) error {
+	return errors.New("usage: hardware counters are read through perf_event_open, which only Linux has")
+}

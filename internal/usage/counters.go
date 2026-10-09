@@ -18,7 +18,9 @@ type Event int
 // SIX, BECAUSE SIX FIT. The reference host (AMD EPYC 7763, Zen 3) has six core
 // counters and no stalled-cycles-backend or ref-cycles; perf stat with these
 // six events on one live VM's fc_vcpu thread read IPC 1.21 and 7.4 cache misses
-// per 1,000 instructions with all six counting at once (2026-09-25).
+// per 1,000 instructions (2026-09-25). That read named them as separate events;
+// as one group they count only while nothing else holds a counter, which
+// proveCounting checks at startup.
 const (
 	Cycles Event = iota
 	Instructions
@@ -326,4 +328,85 @@ func decodeGroupRead(buf []byte, events []Event) (CounterReading, error) {
 	}
 
 	return r, nil
+}
+
+// proveCounting opens every event on tid and runs work on it, reading after
+// each round, until the group has counted or has been enabled for enough
+// without counting; it gives up after rounds, and refuses unless the group
+// counted.
+//
+// ENOUGH IS THE GROUP'S OWN ENABLED TIME, which for a thread's event grows only
+// while the thread is on a CPU, so a descheduled thread is not judged on time it
+// did not run; and it spans several of the kernel's rotation intervals, because
+// a group waiting behind other flexible groups counts only once the kernel has
+// rotated each of them past it. A group that ran out of rounds first was never
+// given that chance, which is could-not-tell rather than a held counter, and
+// even a group that had it is refused without the claim that a counter is
+// certainly held.
+//
+// A GROUP IS SCHEDULED WHOLE OR NOT AT ALL, so one counter held elsewhere (the
+// NMI watchdog takes one of Zen 3's six) leaves a group of six enabled and
+// never counting, on every vCPU thread of every job. Measured on the reference
+// host on 2026-10-09 with nmi_watchdog at 1: perf stat with the six events as
+// one group on a live fc_vcpu thread read <not counted> for all six, and the
+// same group without stalled-cycles-frontend counted 100% of the time.
+func proveCounting(src CounterSource, tid int, work func(), enough time.Duration, rounds int) error {
+	g, err := src.Open(tid)
+	if err != nil {
+		return err
+	}
+	var r CounterReading
+	var readErr error
+	for range rounds {
+		work()
+		if r, readErr = g.Read(); readErr != nil || r.Running > 0 || r.Enabled >= enough {
+			break
+		}
+	}
+	if err := errors.Join(readErr, g.Close()); err != nil {
+		return fmt.Errorf("usage: read the counters of the proving thread: %w", err)
+	}
+	if r.Running <= 0 && r.Enabled < enough {
+		return fmt.Errorf("usage: the proving thread's counters were enabled for %s of the %s that "+
+			"would show whether they count, so whether they can count is unknown", r.Enabled, enough)
+	}
+	if r.Running <= 0 {
+		return errors.New("usage: the counter group was enabled and never counted: another user " +
+			"of the CPU's counters holds one (most often the NMI watchdog; sysctl " +
+			"kernel.nmi_watchdog=0 frees it), or other groups kept it off the counters for all " +
+			"of that time")
+	}
+
+	return nil
+}
+
+// proveOnEveryCPU runs prove with the proving thread pinned to each of cpus in
+// turn, and refuses at the first CPU it fails on or cannot be pinned to.
+//
+// EVERY CPU, because a counter can be held on some CPUs and not others (a
+// pinned perf session, say), and a vCPU thread's group never counts on a CPU
+// that has one too few: a proof on whichever CPU the node happened to run on
+// says nothing about the rest.
+func proveOnEveryCPU(cpus []int, pin func(cpu int) error, prove func() error) error {
+	if len(cpus) == 0 {
+		return errors.New("usage: no CPU to prove the counters on")
+	}
+	for _, cpu := range cpus {
+		if err := pin(cpu); err != nil {
+			return fmt.Errorf("usage: pin the proving thread to CPU %d: %w", cpu, err)
+		}
+		if err := prove(); err != nil {
+			return fmt.Errorf("%w (on CPU %d)", err, cpu)
+		}
+	}
+
+	return nil
+}
+
+// proofBudget is how long a group must be enabled without counting before the
+// proof refuses it, given the kernel's rotation interval: ten intervals, so ten
+// groups queued ahead of it have each been rotated past, and never less than
+// 15 ms.
+func proofBudget(rotation time.Duration) time.Duration {
+	return max(10*rotation, 15*time.Millisecond)
 }
