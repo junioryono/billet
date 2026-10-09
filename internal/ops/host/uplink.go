@@ -101,6 +101,15 @@ func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// NOT WHILE A SHAPER RUNS: clearing under it would take its qdiscs away while
+	// it goes on adjusting them. The unit's ExecStopPost runs after the shaper
+	// has exited, when the claim is free.
+	release, err := uplink.Lock()
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	// THE RECORDED INTERFACE FIRST: after a crash the default route may have
 	// moved, and the shaping is on the interface the shaper chose.
 	name, err := pickInterface(*iface, uplink.RecordedInterface())

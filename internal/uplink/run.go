@@ -39,6 +39,15 @@ type Options struct {
 
 // Run shapes the uplink until ctx ends, and removes the shaping as it returns.
 func Run(ctx context.Context, opts Options) error {
+	// THE CLAIM IS HELD FOR THE WHOLE RUN, cleanup included: a second shaper
+	// would clear and reinstall this one's qdiscs, and either one stopping would
+	// remove the other's.
+	release, err := Lock()
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	iface := opts.Iface
 	if iface == "" {
 		found, err := DefaultInterface()
@@ -120,17 +129,57 @@ func Run(ctx context.Context, opts Options) error {
 // shaper installed.
 var StateFile = "/run/billet-uplink/interface"
 
+// recordInterface publishes the record. One already naming the interface is
+// left alone, and a new one replaces the old by rename: truncating the only
+// proof that what is on an interface is billet's, and failing before writing
+// it again, would leave shaping no cleanup could claim.
 func recordInterface(iface string) error {
+	if RecordedInterface() == iface {
+		return nil
+	}
+
 	if err := os.MkdirAll(filepath.Dir(StateFile), 0o755); err != nil {
 		return fmt.Errorf("record the shaped interface: %w", err)
 	}
 
+	next := StateFile + ".next"
+
 	//nolint:gosec // G306: an interface name for root's own cleanup, which any user may read
-	if err := os.WriteFile(StateFile, []byte(iface+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(next, []byte(iface+"\n"), 0o644); err != nil {
+		return fmt.Errorf("record the shaped interface: %w", err)
+	}
+
+	if err := os.Rename(next, StateFile); err != nil {
 		return fmt.Errorf("record the shaped interface: %w", err)
 	}
 
 	return nil
+}
+
+// Lock takes the one claim on this host's shaping, held by a shaper for its
+// whole run and by a cleanup while it clears: two of them at once would each
+// remove what the other installed. It fails at once, naming the holder's
+// claim, rather than wait. The claim ends with the process.
+func Lock() (release func(), err error) {
+	if err := os.MkdirAll(filepath.Dir(StateFile), 0o755); err != nil {
+		return nil, fmt.Errorf("claim the uplink's shaping: %w", err)
+	}
+
+	path := filepath.Join(filepath.Dir(StateFile), "lock")
+
+	//nolint:gosec // G304: a fixed path under billet's own runtime directory
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("claim the uplink's shaping: %w", err)
+	}
+
+	if err := flock(f); err != nil {
+		f.Close() //nolint:errcheck // the lock was not taken; its error is the one to report
+
+		return nil, fmt.Errorf("another billet uplink is shaping or clearing this host (%s): %w", path, err)
+	}
+
+	return func() { f.Close() }, nil //nolint:errcheck // closing releases the lock; nothing is left to say
 }
 
 // RecordedInterface is the interface the last shaper recorded, or empty.
