@@ -41,7 +41,7 @@ func WithMonitor(m JobMonitor) Option {
 // the real one.
 type FlowWatcher interface {
 	Watch(key string, mac net.HardwareAddr, leaseFile string, since time.Time)
-	Final(key string) (flows.Result, bool, error)
+	Final(ctx context.Context, key string, until time.Time) (flows.Result, bool, error)
 	Forget(key string)
 }
 
@@ -101,14 +101,15 @@ func (r *Runner) startFlows(name string, target provider.UsageTarget, launchedAt
 	r.flows.Watch(name, mac, filepath.Join(r.leaseDir, target.Bridge, "dnsmasq.leases"), launchedAt)
 }
 
-// finalFlows takes what a job's connections came to. Until the ledger stores
+// finalFlows takes what a job's connections came to, counting none that
+// started after until, when the job's destroy began. Until the ledger stores
 // them, they are said in the node's log.
-func (r *Runner) finalFlows(name string) {
+func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time) {
 	if r.flows == nil {
 		return
 	}
 
-	res, measured, err := r.flows.Final(name)
+	res, measured, err := r.flows.Final(context.WithoutCancel(ctx), name, until)
 	if !measured {
 		r.log.Warn("a job's traffic was not totalled by destination", "runner", name, "error", err)
 

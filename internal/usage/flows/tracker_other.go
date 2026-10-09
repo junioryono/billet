@@ -19,8 +19,11 @@ type Tracker struct{}
 // NewTracker returns a Tracker that reads nothing.
 func NewTracker(*slog.Logger) *Tracker { return &Tracker{} }
 
-// Run returns at once: there is nothing to listen to.
-func (*Tracker) Run(context.Context, *Accountant) {}
+// Run marks the events down and returns: there is nothing to listen to.
+func (*Tracker) Run(_ context.Context, a *Accountant) { a.Down() }
 
 // Flows reports that it could not read any.
 func (*Tracker) Flows(netip.Addr) ([]Flow, error) { return nil, errNoTracker }
+
+// Sync reports that it could not prove anything.
+func (*Tracker) Sync(context.Context) error { return errNoTracker }

@@ -1,6 +1,7 @@
 package flows
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,11 +13,13 @@ import (
 	"time"
 )
 
-// fakeTable answers Flows from a map, or with err.
+// fakeTable answers Flows from a map, or with err, and Sync with syncErr.
 type fakeTable struct {
-	mu   sync.Mutex
-	open map[netip.Addr][]Flow
-	err  error
+	mu      sync.Mutex
+	open    map[netip.Addr][]Flow
+	err     error
+	syncErr error
+	synced  int
 }
 
 func (t *fakeTable) Flows(addr netip.Addr) ([]Flow, error) {
@@ -28,6 +31,26 @@ func (t *fakeTable) Flows(addr netip.Addr) ([]Flow, error) {
 	}
 
 	return t.open[addr], nil
+}
+
+func (t *fakeTable) Sync(context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.synced++
+
+	return t.syncErr
+}
+
+func (t *fakeTable) set(addr netip.Addr, open ...Flow) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.open == nil {
+		t.open = map[netip.Addr][]Flow{}
+	}
+
+	t.open[addr] = open
 }
 
 // leases is a lease file whose content the test sets.
@@ -55,72 +78,102 @@ var guestMACAddr = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x17}
 
 const leaseTime = time.Hour
 
+// launched is when the job was launched, a moment before the guest asked.
+var launched = began.Add(-2 * time.Second)
+
 // leaseLine is a dnsmasq lease for the guest's MAC granted at granted.
 func leaseLine(granted time.Time, addr netip.Addr) string {
 	return fmt.Sprintf("%d 02:00:00:00:00:17 %s * *\n", granted.Add(leaseTime).Unix(), addr)
 }
 
-func newTestWatcher(table Table, l *leases) *Watcher {
-	w := NewWatcher(NewAccountant(), table, leaseTime, slog.New(slog.DiscardHandler))
+func newTestWatcher(table Table, l *leases) (*Watcher, *Accountant) {
+	acct := NewAccountant()
+	acct.Up(launched.Add(-time.Hour))
+
+	w := NewWatcher(acct, table, leaseTime, slog.New(slog.DiscardHandler))
 	w.read = l.read
 
-	return w
+	return w, acct
 }
 
-// THE ADDRESS IS LEARNED AFTER THE GUEST HAS OPENED FLOWS, and those flows are
-// still the job's: attribution is by when the tracker says each flow started,
-// not by when the node learned where to look.
+// THE ADDRESS IS LEARNED AFTER THE GUEST HAS OPENED AND CLOSED A FLOW, and
+// that flow is still the job's: the guest could open none before its grant,
+// and the tracker's report of its end is replayed when the address is learned.
 func TestFlowsBeforeTheAddressIsLearnedStillCount(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{}
-	acct := NewAccountant()
-	w := NewWatcher(acct, &fakeTable{}, leaseTime, slog.New(slog.DiscardHandler))
-	w.read = l.read
+	table := &fakeTable{}
+	w, acct := newTestWatcher(table, l)
 
-	w.Watch("lease-1", guestMACAddr, "leases", began)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
 
-	// The guest's first flow opens and closes before the node learns its
-	// address; the tracker reports its end once, now.
-	acct.Observe(flow(1, guest, github, 10, 100))
+	acct.Observe(flow(1, guest, github, 10, 100)) // opened and closed before the lease was read
 
-	l.set(leaseLine(began.Add(2*time.Second), guest))
+	l.set(leaseLine(began, guest))
 	w.Resolve()
 
 	acct.Observe(flow(2, guest, npm, 1, 2))
 
-	r, measured, err := w.Final("lease-1")
+	r, measured, err := w.Final(t.Context(), "lease-1", ended)
 	if !measured || err != nil {
 		t.Fatalf("Final = measured %v, %v", measured, err)
 	}
 
-	if len(r.Destinations) != 2 {
-		t.Errorf("destinations = %+v, want both flows the guest opened", r.Destinations)
+	if len(r.Destinations) != 2 || r.Incomplete {
+		t.Errorf("result = %+v, want both flows the guest opened, complete", r)
+	}
+
+	if table.synced != 1 {
+		t.Errorf("Final synced the tracker %d times, want once before taking the result", table.synced)
 	}
 }
 
-// A LEASE FROM BEFORE THE JOB IS THE PREVIOUS GUEST'S. The MAC comes from the
-// tap, which a later job reuses, so the file can name the old guest's lease
-// until the new guest asks; it is not used until a lease granted since appears.
-func TestALeaseGrantedBeforeTheJobIsNotItsAddress(t *testing.T) {
+// THE GRANT, NOT THE LAUNCH, BOUNDS A JOB'S FLOWS: the guest has no address
+// before the grant, so a flow from that address that started between the
+// launch and the grant is the previous holder's.
+func TestTheGrantBoundsTheJobsFlows(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{}
-	l.set(leaseLine(began.Add(-10*time.Minute), other))
+	l.set(leaseLine(began, guest))
 
-	w := newTestWatcher(&fakeTable{}, l)
-	w.Watch("lease-1", guestMACAddr, "leases", began)
+	table := &fakeTable{}
+	w, acct := newTestWatcher(table, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
 
-	if _, measured, err := w.Final("lease-1"); measured || !errors.Is(err, ErrNoAddress) {
+	acct.Observe(startedAt(flow(1, guest, github, 7, 7), launched.Add(time.Second))) // between launch and grant
+	acct.Observe(flow(2, guest, npm, 1, 1))
+
+	r, _, err := w.Final(t.Context(), "lease-1", ended)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	only(t, r, Destination{Addr: npm, Sent: 1, Received: 1, Connections: 1})
+}
+
+// A LEASE FROM BEFORE THE LAUNCH IS THE PREVIOUS GUEST'S. The MAC comes from
+// the tap, which a later job reuses, so the file can name the old guest's lease
+// until the new guest asks; it is not used until a lease granted since appears.
+func TestALeaseGrantedBeforeTheLaunchIsNotItsAddress(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(launched.Add(-10*time.Minute), other))
+
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+
+	if _, measured, err := w.Final(t.Context(), "lease-1", ended); measured || !errors.Is(err, ErrNoAddress) {
 		t.Fatalf("a job whose only lease predates it was measured (%v, %v); its address is the previous guest's", measured, err)
 	}
 
-	// Renewed by the new guest: granted after the job began, and now used.
-	w.Watch("lease-2", guestMACAddr, "leases", began)
-	l.set(leaseLine(began.Add(5*time.Second), guest))
+	w.Watch("lease-2", guestMACAddr, "leases", launched)
+	l.set(leaseLine(began, guest))
 
-	if _, measured, err := w.Final("lease-2"); !measured || err != nil {
-		t.Errorf("a lease granted since the job began was not used: %v, %v", measured, err)
+	if _, measured, err := w.Final(t.Context(), "lease-2", ended); !measured || err != nil {
+		t.Errorf("a lease granted since the launch was not used: %v, %v", measured, err)
 	}
 }
 
@@ -130,10 +183,10 @@ func TestAnUnlearnedAddressIsUnmeasured(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{err: os.ErrPermission}
-	w := newTestWatcher(&fakeTable{}, l)
-	w.Watch("lease-1", guestMACAddr, "leases", began)
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
 
-	r, measured, err := w.Final("lease-1")
+	r, measured, err := w.Final(t.Context(), "lease-1", ended)
 	if measured || len(r.Destinations) != 0 {
 		t.Errorf("an unresolved job was reported as measured: %+v", r)
 	}
@@ -142,71 +195,142 @@ func TestAnUnlearnedAddressIsUnmeasured(t *testing.T) {
 		t.Errorf("Final's error = %v, want the lease file's", err)
 	}
 
-	if _, measured, err := w.Final("never"); measured || err == nil {
+	if _, measured, err := w.Final(t.Context(), "never", ended); measured || err == nil {
 		t.Error("a job never watched produced a result")
 	}
 }
 
-// THE FLOWS STILL OPEN AT THE END ARE COUNTED, and if they cannot be read the
-// result is a lower bound and says so.
+// THE FLOWS STILL OPEN AT THE END ARE COUNTED, and an end that cannot be
+// proved read (the tracker could not be synced, or the table read) makes the
+// result a lower bound that says so.
 func TestFinalCountsOpenFlowsOrSaysItCouldNot(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{}
 	l.set(leaseLine(began, guest))
 
-	table := &fakeTable{open: map[netip.Addr][]Flow{guest: {flow(3, guest, npm, 5, 50)}}}
-	w := newTestWatcher(table, l)
-	w.Watch("lease-1", guestMACAddr, "leases", began)
+	table := &fakeTable{}
+	w, _ := newTestWatcher(table, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+	table.set(guest, flow(3, guest, npm, 5, 50))
 
-	r, measured, err := w.Final("lease-1")
-	if !measured || err != nil || len(r.Destinations) != 1 || r.Destinations[0].Received != 50 {
-		t.Fatalf("Final = %+v, %v, %v; want the open flow counted", r, measured, err)
+	r, measured, err := w.Final(t.Context(), "lease-1", ended)
+	if !measured || err != nil || r.Incomplete {
+		t.Fatalf("Final = %+v, %v, %v; want a complete result", r, measured, err)
 	}
+
+	only(t, r, Destination{Addr: npm, Sent: 5, Received: 50, Connections: 1})
+
+	table.syncErr = errors.New("the listener is not reading")
+
+	w.Watch("lease-2", guestMACAddr, "leases", launched)
+
+	if r, measured, err = w.Final(t.Context(), "lease-2", ended); !measured || err == nil || !r.Incomplete {
+		t.Errorf("an unproved sync gave %+v, measured %v, %v; want a measured, incomplete result and the error", r, measured, err)
+	}
+
+	table.syncErr = nil
+
+	w.Watch("lease-3", guestMACAddr, "leases", launched)
 
 	table.err = errors.New("netlink: permission denied")
 
-	w.Watch("lease-2", guestMACAddr, "leases", began)
-
-	r, measured, err = w.Final("lease-2")
-	if !measured || err == nil || !r.Incomplete {
+	if r, measured, err = w.Final(t.Context(), "lease-3", ended); !measured || err == nil || !r.Incomplete {
 		t.Errorf("an unreadable table gave %+v, measured %v, %v; want a measured, incomplete result and the error", r, measured, err)
 	}
 }
 
-// FORGETTING A JOB FREES ITS ADDRESS for the next guest to hold it.
-func TestForgetFreesTheAddress(t *testing.T) {
+// AN ADDRESS THAT CHANGES MID-JOB marks the job incomplete: its new address's
+// traffic was never followed.
+func TestAnAddressThatChangesMarksTheJobIncomplete(t *testing.T) {
 	t.Parallel()
 
 	l := &leases{}
 	l.set(leaseLine(began, guest))
 
-	w := newTestWatcher(&fakeTable{}, l)
-	w.Watch("lease-1", guestMACAddr, "leases", began)
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
 
-	w.Watch("lease-2", guestMACAddr, "leases", began)
-	if _, measured, err := w.Final("lease-2"); measured || err == nil {
+	l.set(leaseLine(began.Add(30*time.Minute), other))
+	w.Resolve()
+
+	if r, _, err := w.Final(t.Context(), "lease-1", ended); !r.Incomplete || err != nil {
+		t.Errorf("a job whose address changed gave %+v, %v; want incomplete", r, err)
+	}
+
+	// A renewal of the same address is not a change.
+	l.set(leaseLine(began, guest))
+	w.Watch("lease-2", guestMACAddr, "leases", launched)
+	l.set(leaseLine(began.Add(30*time.Minute), guest))
+	w.Resolve()
+
+	if r, _, err := w.Final(t.Context(), "lease-2", ended); r.Incomplete || err != nil {
+		t.Errorf("a renewal of the same address gave %+v, %v; want complete", r, err)
+	}
+}
+
+// A FIRST GRANT LONG AFTER THE LAUNCH MAY BE A RENEWAL, which hides the flows
+// before it: the job is marked incomplete.
+func TestAFirstGrantLongAfterTheLaunchIsIncomplete(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(launched.Add(leaseTime/2+time.Minute), guest))
+
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+		t.Errorf("a first grant half a lease after the launch gave %+v, measured %v, %v; want incomplete", r, measured, err)
+	}
+}
+
+// THE PREVIOUS HOLDER'S ENTRIES ARE READ WHEN THE ADDRESS IS LEARNED, so the
+// guest's traffic on one of them is noticed.
+func TestTheInheritedEntriesAreReadWhenTheAddressIsLearned(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	inherited := startedAt(flow(5, guest, github, 100, 100), began.Add(-time.Minute))
+	table := &fakeTable{}
+	table.set(guest, inherited)
+
+	w, acct := newTestWatcher(table, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+
+	sentOn := inherited
+	sentOn.OrigBytes, sentOn.OrigPackets = 200, 200
+	acct.Observe(sentOn)
+
+	table.set(guest)
+
+	if r, _, err := w.Final(t.Context(), "lease-1", ended); !r.Incomplete || err != nil {
+		t.Errorf("traffic on an entry the previous holder left gave %+v, %v; want incomplete", r, err)
+	}
+}
+
+// TWO JOBS ARE NEVER GIVEN ONE ADDRESS, and forgetting a job frees its
+// address for the next guest to hold it.
+func TestOneAddressOneJobAndForgetFreesIt(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+	w.Watch("lease-2", guestMACAddr, "leases", launched)
+
+	if _, measured, err := w.Final(t.Context(), "lease-2", ended); measured || err == nil {
 		t.Fatalf("two jobs were given one address at once (measured %v, %v)", measured, err)
 	}
 
 	w.Forget("lease-1")
-	w.Watch("lease-3", guestMACAddr, "leases", began)
+	w.Watch("lease-3", guestMACAddr, "leases", launched)
 
-	if _, measured, err := w.Final("lease-3"); !measured {
+	if _, measured, err := w.Final(t.Context(), "lease-3", ended); !measured {
 		t.Errorf("the address stayed held after its job was forgotten: %v", err)
-	}
-}
-
-func TestAnInfiniteOrGarbledExpiryIsNotAGrantTime(t *testing.T) {
-	t.Parallel()
-
-	for _, line := range []string{
-		"0 02:00:00:00:00:17 192.168.100.23 * *\n",
-		"soon 02:00:00:00:00:17 192.168.100.23 * *\n",
-	} {
-		_, err := AddressFor([]byte(line), guestMACAddr)
-		if err == nil || errors.Is(err, ErrNoAddress) {
-			t.Errorf("%q answered %v, want an error that is not ErrNoAddress", line, err)
-		}
 	}
 }

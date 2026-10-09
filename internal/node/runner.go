@@ -824,6 +824,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// VMM's threads it reads go with the compute.
 	measured, hasUsage := r.finalUsage(inst.Name)
 
+	// A FLOW THAT STARTS AFTER THIS IS NOT THE JOB'S: the destroy below releases
+	// the guest's tap, and with it the MAC and address, to the next launch.
+	destroyAt := time.Now()
+
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
@@ -854,7 +858,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// fenced on the lease, which the plane releases only after this returns.
 	// THE FLOWS ARE READ AFTER THE DESTROY, when the guest can open no more and
 	// every counter it left is final.
-	r.finalFlows(inst.Name)
+	r.finalFlows(ctx, inst.Name, destroyAt)
 
 	if hasUsage && holdable {
 		r.reportUsage(ctx, lease, inst.Name, measured)

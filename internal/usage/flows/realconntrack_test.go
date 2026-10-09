@@ -3,19 +3,24 @@
 package flows
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
-// AGAINST THE REAL CONNECTION TRACKER, read only: every guest with a lease on
-// a billet bridge has its flows found by the tracker's own dump, from the
-// guest's address, with a destination outside the guest's subnet among them.
-// Gated: it needs root (CAP_NET_ADMIN), a node host with live guests, and
-// BILLET_TEST_REAL_CONNTRACK=1. It changes nothing on the host.
+// AGAINST THE REAL CONNECTION TRACKER: every guest with a lease on a billet
+// bridge has its flows found by the tracker's own dump, from the guest's
+// address and no other, and the listener proves it has read every destruction
+// up to a moment by creating and deleting a sentinel entry on loopback, the
+// one change this makes to the host. Gated: it needs root (CAP_NET_ADMIN), a
+// node host with live guests, and BILLET_TEST_REAL_CONNTRACK=1, and opting in
+// on a host with no guests fails rather than skips.
 func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 	if os.Getenv("BILLET_TEST_REAL_CONNTRACK") != "1" {
 		t.Skip("set BILLET_TEST_REAL_CONNTRACK=1 on a node host with live guests, as root")
@@ -32,7 +37,7 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 	}
 
 	tracker := NewTracker(slog.Default())
-	checked := 0
+	guests, withFlows := 0, 0
 
 	for _, file := range files {
 		data, err := os.ReadFile(file)
@@ -63,30 +68,60 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 				t.Fatalf("dump the tracker: %v", err)
 			}
 
-			var sent, received uint64
+			guests++
 
-			outside := 0
+			if len(got) > 0 {
+				withFlows++
+			}
+
+			var sent, received uint64
 
 			for _, f := range got {
 				if f.Source != addr {
 					t.Errorf("Flows(%s) returned a flow from %s", addr, f.Source)
 				}
 
-				if !f.Dest.IsPrivate() {
-					outside++
-				}
-
 				sent, received = sent+f.OrigBytes, received+f.ReplyBytes
 			}
 
-			t.Logf("%s %s: %d flows open, %d to public addresses, %d bytes sent and %d received so far",
-				filepath.Base(filepath.Dir(file)), addr, len(got), outside, sent, received)
-
-			checked++
+			t.Logf("%s %s: %d flows open, %d bytes sent and %d received so far",
+				filepath.Base(filepath.Dir(file)), addr, len(got), sent, received)
 		}
 	}
 
-	if checked == 0 {
-		t.Skip("no guest holds a lease now; nothing to check")
+	if guests == 0 || withFlows == 0 {
+		t.Fatalf("%d leased guests, %d with flows; a node host with live guests has both", guests, withFlows)
+	}
+
+	// THE BARRIER, against the live listener.
+	acct := NewAccountant()
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var run sync.WaitGroup
+
+	run.Go(func() { tracker.Run(ctx, acct) })
+
+	t.Cleanup(func() {
+		cancel()
+		run.Wait()
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		syncCtx, done := context.WithTimeout(t.Context(), 2*time.Second)
+		err := tracker.Sync(syncCtx)
+
+		done()
+
+		if err == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("the listener never proved it had read the sentinel's destruction: %v", err)
+		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
 }
