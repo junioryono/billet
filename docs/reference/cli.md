@@ -239,6 +239,20 @@ Retirement's completion document and completed ledger row are historical facts b
 
 The upgrade root's trust boundary is proved before any of these takes the lock, through descriptors and never by pathname: every directory on the way to `/var/lib/billet` (or `/usr/local/var/lib/billet` on a Mac) is reached by a walk from the filesystem root, one component relative to the descriptor of the one above it, and must be owned by root or by the account running the command and writable by nobody else unless the sticky bit is set; the parent must be owned by that account; the root a directory owned by it and not writable by group or others; `active` 0700 and owned by it; `transaction.lock` a regular file; none of them a symlink; the root is opened relative to the parent's descriptor and the lock relative to the root's, each `O_NOFOLLOW`, and once the lock is held the root's name must still hold the directory the lock was taken inside, so a name replaced between the check and the use is not the thing used. Every name a mutator then touches under the root is resolved relative to that root descriptor, and the guard directory a release, a recovery or a takeover acts on is validated (0700, owned) before its record is believed.
 
+## Sharing the uplink
+
+### `billet uplink shape [--interface NAME] [--reflectors A,B,...]`
+
+Keep this host's own traffic, its guests' included, from filling the queue of the internet line it shares with the rest of its site. It runs until stopped, as root, on Linux: CAKE on the interface (the default route's unless `--interface` names one) in both directions, starting at the interface's own speed, which holds nothing back. Twice a second it pings the reflectors (by default 1.1.1.1, 8.8.8.8 and 9.9.9.9, three operators, a delay counting only when most of them see it) and reads what the interface moved. When 3 of the last 6 rounds came back more than 15 ms above each reflector's idle baseline and a direction is busy, that direction is cut to below what it was moving, more deeply the higher the delay; while a direction runs at its rate with no queue, its rate rises 4% a step. Nothing about the line's speed is configured. Stopping it removes the shaping, and so does the installed billet being replaced by an upgrade, after which it exits with an error so the unit starts it again on the new binary. The host role runs it as `billet-uplink.service`; [the shared-uplink record](records/shared-uplink.md) has the measurements behind it.
+
+### `billet uplink check [--interface NAME]`
+
+Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's. Only qdiscs the kernel assigned (handle `0:`) may be replaced; CAKE, an ingress qdisc and an `ifb-` device count as billet's only when the record a run of the shaper keeps under `/run/billet-uplink/` names the interface, and a `clsact` qdisc never does. The shaper refuses anything else rather than replace it. The host role enables `billet-uplink.service` only where this passes.
+
+### `billet uplink clear`
+
+Remove what the record under `/run/billet-uplink/` says a `billet uplink shape` installed, and only that. The record names the interface by its kernel index as well as its name, so the shaping is found on an interface renamed since, a device that has taken the old name is left alone, and an interface that is gone leaves only its IFB device to remove. With no record it removes nothing, because nothing else proves what is on an interface is billet's. It refuses while a shaper runs, and exits non-zero when a removal failed. The unit runs it as `ExecStopPost`, so a crash is cleared too.
+
 ## Removal
 
 | Command | Meaning |
