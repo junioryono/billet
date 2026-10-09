@@ -3,6 +3,7 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"time"
 )
@@ -76,6 +77,7 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 	}
 	points := distinct(tl.Points)
 	var covered int64
+	var sums [6]int64
 	for i := 1; i < len(points); i++ {
 		p, next := points[i-1], points[i]
 		length := next.OffsetMillis - p.OffsetMillis
@@ -83,32 +85,53 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 		if overlap <= 0 || next.AfterGap || falls(p, next) || i > 1 && falls(points[i-2], p) {
 			continue
 		}
+		before, after := p.cumulative(), next.cumulative()
+		var shares [6]int64
+		fits := true
+		for c := range shares {
+			shares[c] = shareOf(after[c]-before[c], overlap, length)
+			fits = fits && shares[c] <= math.MaxInt64-sums[c]
+		}
+		// A TOTAL THAT WOULD NOT FIT IS UNCOVERED, never wrapped: the increments
+		// telescope only between resets, and the fall rule leaves counters on
+		// both sides of a reset in the window.
+		if !fits {
+			continue
+		}
 		covered += overlap
-		out.CPUMicros += shareOf(next.CPUUsage-p.CPUUsage, overlap, length)
-		out.DiskRead += shareOf(next.DiskRead-p.DiskRead, overlap, length)
-		out.DiskWrite += shareOf(next.DiskWrite-p.DiskWrite, overlap, length)
-		out.NetRx += shareOf(next.NetRx-p.NetRx, overlap, length)
-		out.NetTx += shareOf(next.NetTx-p.NetTx, overlap, length)
-		out.EnergyActive += shareOf(next.EnergyActive-p.EnergyActive, overlap, length)
+		for c := range shares {
+			sums[c] += shares[c]
+		}
 	}
 	out.Covered = min(time.Duration(covered)*time.Millisecond, out.Span)
+	out.CPUMicros, out.DiskRead, out.DiskWrite = sums[0], sums[1], sums[2]
+	out.NetRx, out.NetTx, out.EnergyActive = sums[3], sums[4], sums[5]
 
 	return out
+}
+
+// cumulative is the point's cumulative columns Window reads, in the order it
+// sums them.
+func (p Point) cumulative() [6]int64 {
+	return [6]int64{p.CPUUsage, p.DiskRead, p.DiskWrite, p.NetRx, p.NetTx, p.EnergyActive}
 }
 
 // falls reports whether a cumulative column Window reads is lower at next
 // than at p.
 func falls(p, next Point) bool {
-	return next.CPUUsage < p.CPUUsage || next.DiskRead < p.DiskRead || next.DiskWrite < p.DiskWrite ||
-		next.NetRx < p.NetRx || next.NetTx < p.NetTx || next.EnergyActive < p.EnergyActive
+	before, after := p.cumulative(), next.cumulative()
+	for c := range before {
+		if after[c] < before[c] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // shareOf is delta*part/whole rounded to the nearest unit, exact for every
 // int64: the product is formed in 128 bits, and the quotient is at most delta
 // because part is at most whole. delta is not negative and whole is positive.
-//
-// NO SUM OF SHARES OVERFLOWS EITHER: each is at most its interval's increment,
-// and the increments of one column telescope to its last value less its first.
 func shareOf(delta, part, whole int64) int64 {
 	hi, lo := bits.Mul64(uint64(delta), uint64(part))
 	q, r := bits.Div64(hi, lo, uint64(whole))

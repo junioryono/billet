@@ -200,10 +200,22 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	}
 
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("github: %s: %w", operation, apiError(status, body))
+		return nil, fmt.Errorf("github: %s: %w", operation, apiError(status, withoutBearer(body, token)))
 	}
 
 	return body, nil
+}
+
+// withoutBearer is an error body with the credential its request carried
+// replaced, because apiError keeps GitHub's message and an operator command
+// prints it: a server that echoed the Authorization header would otherwise put
+// the token in the output.
+func withoutBearer(body []byte, bearer string) []byte {
+	if bearer == "" {
+		return body
+	}
+
+	return bytes.ReplaceAll(body, []byte(bearer), []byte("[redacted]"))
 }
 
 // configured reports whether this client can authenticate at all.
@@ -478,7 +490,8 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 	if status != http.StatusCreated {
 		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
 		// GitHub being unable to answer (5xx, a throttle) through Undecided.
-		return "", fmt.Errorf("github: create installation token: %w", apiError(status, body))
+		return "", fmt.Errorf("github: create installation token: %w",
+			apiError(status, withoutBearer(body, jwt)))
 	}
 	var out struct {
 		Token     string    `json:"token"`

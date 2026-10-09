@@ -189,6 +189,12 @@ func TestAJobListThatDoesNotAddUpIsRefused(t *testing.T) {
 		"a step with no name": {func(int) string {
 			return fmt.Sprintf(`{"total_count":1,"jobs":[%s]}`, jobJSON(1, "billet-lease-1", `{"number":1}`))
 		}, "incomplete step"},
+		"one job on two pages": {func(int) string {
+			return fmt.Sprintf(`{"total_count":2,"jobs":[%s]}`, jobJSON(5, "x", ""))
+		}, "listed job 5 twice"},
+		"a job with no id": {func(int) string {
+			return `{"total_count":1,"jobs":[{"name":"j","runner_name":"x","steps":[]}]}`
+		}, "a job with no id"},
 		"a job that names no runner field": {func(int) string {
 			return `{"total_count":1,"jobs":[{"id":1,"name":"j","steps":[]}]}`
 		}, "does not say which runner"},
@@ -210,22 +216,25 @@ func TestAJobListThatDoesNotAddUpIsRefused(t *testing.T) {
 }
 
 // GITHUB'S REFUSALS COME BACK TYPED, an oversized answer is no answer, and the
-// token is in none of them.
+// token is in none of them, even from a server that echoes the request's
+// Authorization header back in its message.
 func TestAJobListGitHubDidNotGiveIsAnError(t *testing.T) {
 	t.Parallel()
 
 	for _, status := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusBadGateway} {
-		c, _ := jobsServer(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
 			w.WriteHeader(status)
-			fmt.Fprint(w, `{"message":"Resource not accessible by integration"}`)
+			fmt.Fprintf(w, `{"message":"Resource not accessible by integration: %s"}`,
+				r.Header.Get("Authorization"))
 		})
 		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
 		api, ok := errors.AsType[*APIError](err)
 		if !ok || api.Status != status {
 			t.Errorf("HTTP %d = %v, want an APIError with that status", status, err)
 		}
-		if err != nil && strings.Contains(err.Error(), "installation-secret") {
-			t.Errorf("HTTP %d: the error carries the token: %v", status, err)
+		if err == nil || strings.Contains(err.Error(), "installation-secret") ||
+			!strings.Contains(err.Error(), "Bearer [redacted]") {
+			t.Errorf("HTTP %d: the error does not redact the echoed token: %v", status, err)
 		}
 	}
 
@@ -234,6 +243,32 @@ func TestAJobListGitHubDidNotGiveIsAnError(t *testing.T) {
 	})
 	if _, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1"); !errors.Is(err, errNoAnswer) {
 		t.Errorf("an oversized page = %v, want errNoAnswer", err)
+	}
+}
+
+// A REFUSED TOKEN EXCHANGE DOES NOT CARRY THE APP'S JWT, even when GitHub's
+// message echoes it.
+func TestARefusedTokenExchangeDoesNotEchoTheJWT(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	var sent atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jwt := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		sent.Store(jwt)
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, `{"message":"bad credentials %s"}`, jwt)
+	}))
+	t.Cleanup(srv.Close)
+	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+
+	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+	jwt, ok := sent.Load().(string)
+	if !ok || jwt == "" {
+		t.Fatalf("no token exchange was attempted: %v", err)
+	}
+	if err == nil || strings.Contains(err.Error(), jwt) || !strings.Contains(err.Error(), "[redacted]") {
+		t.Errorf("a refused exchange = %v, want an error without the JWT", err)
 	}
 }
 

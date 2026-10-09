@@ -125,6 +125,7 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 	endpoint += "/actions/runs/" + strconv.FormatInt(runID, 10) + "/jobs"
 
 	var matches []WorkflowJob
+	listed := map[int64]bool{}
 	total, read := -1, 0
 	for page := 1; total < 0 || read < total; page++ {
 		if page > maxRunJobPages {
@@ -163,6 +164,17 @@ func (c *runnerGroupPolicyClient) RunnerJob(
 			return WorkflowJob{}, fmt.Errorf("github: run %d listed more jobs than the %d it counts", runID, total)
 		}
 		for _, record := range *body.Jobs {
+			// COUNTED BY ID, NOT BY ENTRY: a list that shifted between pages can
+			// hand one job back twice, and two copies of one job would stand in for
+			// a job never read.
+			if record.ID == nil || *record.ID <= 0 {
+				return WorkflowJob{}, fmt.Errorf("github: run %d lists a job with no id", runID)
+			}
+			if listed[*record.ID] {
+				return WorkflowJob{}, fmt.Errorf("github: run %d listed job %d twice while it was read",
+					runID, *record.ID)
+			}
+			listed[*record.ID] = true
 			name, err := record.runner()
 			if err != nil {
 				return WorkflowJob{}, fmt.Errorf("github: run %d: %w", runID, err)

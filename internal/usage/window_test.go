@@ -189,17 +189,46 @@ func TestSamplesAtOneOffsetLoseNothing(t *testing.T) {
 	}
 }
 
-// A COUNTER THAT FALLS IS NOT USAGE: the interval it falls across is uncovered
-// rather than read as a negative or a wrapped amount.
+// A COUNTER THAT FALLS IS NOT USAGE, AND NEITHER IS ITS CATCH-UP: in every
+// cumulative column, the interval it falls across (1s to 2s) and the one after
+// it (2s to 3s) are uncovered, and the intervals either side are counted
+// exactly.
 func TestACounterThatFallsIsUncovered(t *testing.T) {
 	t.Parallel()
 
-	tl := steadySeries(secondsTo(0, 4)...)
-	tl.Points[2].NetRx = 0
+	for name, misread := range map[string]func(*Point){
+		"cpu":        func(p *Point) { p.CPUUsage = 0 },
+		"disk read":  func(p *Point) { p.DiskRead = 0 },
+		"disk write": func(p *Point) { p.DiskWrite = 0 },
+		"received":   func(p *Point) { p.NetRx = 0 },
+		"sent":       func(p *Point) { p.NetTx = 0 },
+		"energy":     func(p *Point) { p.EnergyActive = 0 },
+	} {
+		tl := steadySeries(secondsTo(0, 4)...)
+		misread(&tl.Points[2])
+		w := tl.Window(at(0), at(4000))
+		if w.Covered != 2*time.Second {
+			t.Errorf("%s falling: covered %s, want the 2s either side", name, w.Covered)
+		}
+		sameIncrements(t, name+" falling", w, usedPerSecond(2))
+		if got := tl.Window(at(2000), at(3000)); got.Covered != 0 {
+			t.Errorf("%s falling: the catch-up interval covered %s", name, got.Covered)
+		}
+	}
+}
+
+// A TOTAL THAT WOULD NOT FIT IS UNCOVERED, NEVER WRAPPED: increments either
+// side of a reset do not telescope, so two that each fit can sum past MaxInt64.
+func TestATotalPastMaxInt64IsUncovered(t *testing.T) {
+	t.Parallel()
+
+	tl := Timeline{First: first, Points: []Point{{OffsetMillis: 0},
+		{OffsetMillis: 1000, DiskRead: math.MaxInt64}, {OffsetMillis: 2000},
+		{OffsetMillis: 3000}, {OffsetMillis: 4000, DiskRead: math.MaxInt64}}}
 	w := tl.Window(at(0), at(4000))
-	if w.Covered != 2*time.Second || w.NetRx < 0 {
-		t.Errorf("a falling counter: covered %s, received %d; want 2s covered and nothing negative",
-			w.Covered, w.NetRx)
+	if w.DiskRead != math.MaxInt64 || w.Covered != time.Second {
+		t.Errorf("two MaxInt64 increments across a reset = read %d over %s, want one of them over 1s",
+			w.DiskRead, w.Covered)
 	}
 }
 
