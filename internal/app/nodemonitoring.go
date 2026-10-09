@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	jobusage "github.com/junioryono/billet/internal/usage"
+	"github.com/junioryono/billet/internal/usage/flows"
 )
 
 // firecrackerOptions are the provider options node configuration implies
@@ -53,16 +55,52 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 			"idle_package_watts", m.IdlePackageWatts)
 	}
 
-	opts := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}
+	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}
 	if m.Perf {
-		if opts.Counters, err = counterSource(); err != nil {
+		if sampling.Counters, err = counterSource(); err != nil {
 			return nil, err
 		}
 	}
-	monitor := jobusage.NewMonitor("/", opts)
+	monitor := jobusage.NewMonitor("/", sampling)
 	go monitor.Run(ctx)
 
-	return []node.Option{node.WithMonitor(monitor)}, nil
+	opts := []node.Option{node.WithMonitor(monitor)}
+
+	if m.Flows {
+		watcher, err := startFlows(ctx, "/", interval)
+		if err != nil {
+			return nil, err
+		}
+
+		opts = append(opts, node.WithFlows(watcher, config.DHCPLeaseDir))
+	}
+
+	return opts, nil
+}
+
+// startFlows starts following guests' connections from the host's connection
+// tracker, refusing a host (its /proc under root) that does not count and stamp
+// them: asked for flows
+// and unable to measure them, a node that started anyway would report every
+// job's destinations as unmeasured with nobody told why.
+func startFlows(ctx context.Context, root string, interval time.Duration) (*flows.Watcher, error) {
+	if err := flows.Ready(root); err != nil {
+		return nil, fmt.Errorf("node.monitoring.flows is set, but %w; set both with "+
+			"`sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1` "+
+			"(and persist them under /etc/sysctl.d), or remove flows", err)
+	}
+
+	acct := flows.NewAccountant()
+	tracker := flows.NewTracker(slog.Default())
+	watcher := flows.NewWatcher(acct, tracker, config.DHCPLeaseTime, slog.Default())
+
+	go tracker.Run(ctx, acct)
+	go watcher.Run(ctx, interval)
+
+	slog.Info("totalling each job's traffic by destination from the connection tracker",
+		"leases", config.DHCPLeaseDir)
+
+	return watcher, nil
 }
 
 // counterSource is the hardware counter reader node.monitoring.perf asks for.
