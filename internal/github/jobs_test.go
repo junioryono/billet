@@ -215,26 +215,42 @@ func TestAJobListThatDoesNotAddUpIsRefused(t *testing.T) {
 	}
 }
 
+// echoes are the ways a server may give a credential back in a JSON string:
+// as it is, or with every character escaped, which reads back as the same
+// string once decoded.
+var echoes = map[string]func(string) string{
+	"verbatim": func(s string) string { return s },
+	"escaped": func(s string) string {
+		var b strings.Builder
+		for _, c := range []byte(s) {
+			fmt.Fprintf(&b, `\u%04x`, c)
+		}
+		return b.String()
+	},
+}
+
 // GITHUB'S REFUSALS COME BACK TYPED, an oversized answer is no answer, and the
 // token is in none of them, even from a server that echoes the request's
-// Authorization header back in its message.
+// Authorization header back in its message, escaped or not.
 func TestAJobListGitHubDidNotGiveIsAnError(t *testing.T) {
 	t.Parallel()
 
-	for _, status := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusBadGateway} {
-		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
-			w.WriteHeader(status)
-			fmt.Fprintf(w, `{"message":"Resource not accessible by integration: %s"}`,
-				r.Header.Get("Authorization"))
-		})
-		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
-		api, ok := errors.AsType[*APIError](err)
-		if !ok || api.Status != status {
-			t.Errorf("HTTP %d = %v, want an APIError with that status", status, err)
-		}
-		if err == nil || strings.Contains(err.Error(), "installation-secret") ||
-			!strings.Contains(err.Error(), "Bearer [redacted]") {
-			t.Errorf("HTTP %d: the error does not redact the echoed token: %v", status, err)
+	for echo, encode := range echoes {
+		for _, status := range []int{http.StatusForbidden, http.StatusNotFound, http.StatusBadGateway} {
+			c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+				w.WriteHeader(status)
+				fmt.Fprintf(w, `{"message":"Resource not accessible by integration: %s"}`,
+					encode(r.Header.Get("Authorization")))
+			})
+			_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+			api, ok := errors.AsType[*APIError](err)
+			if !ok || api.Status != status {
+				t.Errorf("HTTP %d = %v, want an APIError with that status", status, err)
+			}
+			if err == nil || strings.Contains(err.Error(), "installation-secret") ||
+				!strings.Contains(err.Error(), "Bearer [redacted]") {
+				t.Errorf("HTTP %d, %s: the error does not redact the echoed token: %v", status, echo, err)
+			}
 		}
 	}
 
@@ -246,29 +262,47 @@ func TestAJobListGitHubDidNotGiveIsAnError(t *testing.T) {
 	}
 }
 
+// A BODY THAT IS NOT JSON IS REDACTED BEFORE IT IS CUT: apiError keeps 200
+// bytes of it, and a token straddling the cut would otherwise leave its prefix
+// where the whole token no longer matches.
+func TestATokenAtTheCutOfAPlainBodyIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, strings.Repeat("x", 190)+" "+r.Header.Get("Authorization"))
+	})
+	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+	if err == nil || strings.Contains(err.Error(), "Bearer ins") || !strings.Contains(err.Error(), "Bearer [") {
+		t.Errorf("a token at the cut = %v, want it redacted before the cut", err)
+	}
+}
+
 // A REFUSED TOKEN EXCHANGE DOES NOT CARRY THE APP'S JWT, even when GitHub's
-// message echoes it.
+// message echoes it, escaped or not.
 func TestARefusedTokenExchangeDoesNotEchoTheJWT(t *testing.T) {
 	t.Parallel()
 
 	key, _ := testKeyPKCS1(t)
-	var sent atomic.Value
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		jwt := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		sent.Store(jwt)
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintf(w, `{"message":"bad credentials %s"}`, jwt)
-	}))
-	t.Cleanup(srv.Close)
-	c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+	for echo, encode := range echoes {
+		var sent atomic.Value
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			jwt := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			sent.Store(jwt)
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintf(w, `{"message":"bad credentials %s"}`, encode(jwt))
+		}))
+		t.Cleanup(srv.Close)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
 
-	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
-	jwt, ok := sent.Load().(string)
-	if !ok || jwt == "" {
-		t.Fatalf("no token exchange was attempted: %v", err)
-	}
-	if err == nil || strings.Contains(err.Error(), jwt) || !strings.Contains(err.Error(), "[redacted]") {
-		t.Errorf("a refused exchange = %v, want an error without the JWT", err)
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		jwt, ok := sent.Load().(string)
+		if !ok || jwt == "" {
+			t.Fatalf("%s: no token exchange was attempted: %v", echo, err)
+		}
+		if err == nil || strings.Contains(err.Error(), jwt) || !strings.Contains(err.Error(), "[redacted]") {
+			t.Errorf("%s: a refused exchange = %v, want an error without the JWT", echo, err)
+		}
 	}
 }
 

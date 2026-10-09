@@ -379,3 +379,23 @@ func TestRenderStepsQuotesWhatGitHubChose(t *testing.T) {
 		}
 	}
 }
+
+// AN ATTEMPT GITHUB DID NOT GIVE IS NOT ATTEMPT 0.
+func TestRenderStepsSaysWhenNoAttemptWasGiven(t *testing.T) {
+	t.Parallel()
+
+	steps := timedSteps()
+	var given bytes.Buffer
+	renderSteps(&given, steps)
+	steps.job.RunAttempt = 0
+	var missing bytes.Buffer
+	renderSteps(&missing, steps)
+
+	if !strings.Contains(given.String(), `"j", attempt 1, on runner`) {
+		t.Errorf("a given attempt was not printed:\n%s", given.String())
+	}
+	if !strings.Contains(missing.String(), `"j", attempt not given, on runner`) ||
+		strings.Contains(missing.String(), "attempt 0") {
+		t.Errorf("a missing attempt was printed as a number:\n%s", missing.String())
+	}
+}

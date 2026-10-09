@@ -200,22 +200,31 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	}
 
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("github: %s: %w", operation, apiError(status, withoutBearer(body, token)))
+		return nil, fmt.Errorf("github: %s: %w", operation, apiErrorWithout(status, body, token))
 	}
 
 	return body, nil
 }
 
-// withoutBearer is an error body with the credential its request carried
-// replaced, because apiError keeps GitHub's message and an operator command
-// prints it: a server that echoed the Authorization header would otherwise put
-// the token in the output.
-func withoutBearer(body []byte, bearer string) []byte {
+// apiErrorWithout is apiError with the credential its request carried
+// replaced in what it keeps of the body, because apiError keeps GitHub's
+// message and an operator command prints it: a server that echoed the
+// Authorization header would otherwise put the token in the output.
+//
+// REPLACED TWICE: in the raw body, before apiError cuts a body that is not
+// JSON to 200 bytes and could cut the credential in half, and in the decoded
+// message, where a JSON escape (`\u0069`) has turned an echo the raw
+// replacement could not see back into the credential.
+func apiErrorWithout(status int, body []byte, bearer string) error {
 	if bearer == "" {
-		return body
+		return apiError(status, body)
+	}
+	err := apiError(status, bytes.ReplaceAll(body, []byte(bearer), []byte("[redacted]")))
+	if api, ok := errors.AsType[*APIError](err); ok {
+		api.Message = strings.ReplaceAll(api.Message, bearer, "[redacted]")
 	}
 
-	return bytes.ReplaceAll(body, []byte(bearer), []byte("[redacted]"))
+	return err
 }
 
 // configured reports whether this client can authenticate at all.
@@ -491,7 +500,7 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
 		// GitHub being unable to answer (5xx, a throttle) through Undecided.
 		return "", fmt.Errorf("github: create installation token: %w",
-			apiError(status, withoutBearer(body, jwt)))
+			apiErrorWithout(status, body, jwt))
 	}
 	var out struct {
 		Token     string    `json:"token"`

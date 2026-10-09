@@ -126,8 +126,13 @@ func renderSteps(w io.Writer, s jobSteps) {
 		return
 	}
 
-	line("steps", "github job %d %s, attempt %d, on runner %s, steps listed: %d", s.job.ID,
-		strconv.Quote(s.job.Name), s.job.RunAttempt, s.runner, len(s.job.Steps))
+	// AN ATTEMPT GITHUB DID NOT GIVE IS SAID TO BE, never printed as attempt 0.
+	attempt := "attempt not given"
+	if s.job.RunAttempt > 0 {
+		attempt = fmt.Sprintf("attempt %d", s.job.RunAttempt)
+	}
+	line("steps", "github job %d %s, %s, on runner %s, steps listed: %d", s.job.ID,
+		strconv.Quote(s.job.Name), attempt, s.runner, len(s.job.Steps))
 	if s.timeline == nil {
 		line("", "usage per step: could not tell, because %s", s.unaligned)
 	} else {

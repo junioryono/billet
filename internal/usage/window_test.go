@@ -187,6 +187,17 @@ func TestSamplesAtOneOffsetLoseNothing(t *testing.T) {
 	if w := tl.Window(at(0), at(1000)); w.Covered != 0 {
 		t.Errorf("a gap mark on the earlier duplicate was lost: covered %s", w.Covered)
 	}
+
+	// A FALL BETWEEN TWO SAMPLES AT ONE OFFSET IS STILL A FALL: the interval
+	// into it and the catch-up after it are uncovered, never read as no usage.
+	fallen := Timeline{First: first, Points: []Point{
+		{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 100}, {OffsetMillis: 1000, CPUUsage: 0},
+		{OffsetMillis: 2000, CPUUsage: 200}, {OffsetMillis: 3000, CPUUsage: 300},
+	}}
+	if w := fallen.Window(at(0), at(3000)); w.Covered != time.Second || w.CPUMicros != 100 {
+		t.Errorf("a fall inside a duplicated offset = covered %s, cpu %dµs; want 1s and 100µs",
+			w.Covered, w.CPUMicros)
+	}
 }
 
 // A COUNTER THAT FALLS IS NOT USAGE, AND NEITHER IS ITS CATCH-UP: in every
