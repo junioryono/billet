@@ -1,0 +1,15 @@
+CacheAuthorityResponse.authority.lease_id string
+CacheAuthorityResponse.authority.job_id string
+CacheAuthorityResponse.authority.run_id int64
+CacheAuthorityResponse.authority.owner string
+CacheAuthorityResponse.authority.repository string
+CacheAuthorityResponse.authority.event string
+CacheAuthorityResponse.authority.ref tag omitempty
+CacheAuthorityResponse.authority.ref string
+CacheAuthorityResponse.authority.base_ref tag omitempty
+CacheAuthorityResponse.authority.base_ref string
+CacheAuthorityResponse.authority.default_ref tag omitempty
+CacheAuthorityResponse.authority.default_ref string
+CacheAuthorityResponse.authority.proven bool
+CacheAuthorityResponse.authority.write_own_ref bool
+CacheAuthorityResponse.authority.publish_default bool

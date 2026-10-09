@@ -139,6 +139,7 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 			u.EnergySource = alloc.EnergyRAPLUnsplit
 		}
 	}
+	u.Counters = jobCountersOf(sum.Counters)
 	if len(sum.Points) == 0 {
 		return u, nil
 	}
@@ -148,4 +149,30 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 	}
 
 	return u, &alloc.UsageSeries{Codec: usage.SeriesCodec, Data: data}
+}
+
+// jobCountersOf is the report's hardware counters: each event the sampler
+// counted, and none at all when it counted no event, since the ledger reads a
+// block of nothing as no block.
+func jobCountersOf(c *usage.Counters) *alloc.JobCounters {
+	if c == nil {
+		return nil
+	}
+	value := func(e usage.Event) *int64 {
+		if !c.Measured[e] {
+			return nil
+		}
+		v := c.Values[e]
+		return &v
+	}
+	out := alloc.JobCounters{
+		Cycles: value(usage.Cycles), Instructions: value(usage.Instructions),
+		CacheReferences: value(usage.CacheReferences), CacheMisses: value(usage.CacheMisses),
+		BranchMisses: value(usage.BranchMisses), FrontendStallCycles: value(usage.FrontendStalls),
+	}
+	if out == (alloc.JobCounters{}) {
+		return nil
+	}
+
+	return &out
 }

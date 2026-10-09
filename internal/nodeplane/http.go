@@ -1555,6 +1555,14 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// COUNTERS ONLY FROM A WIRE THAT CARRIES THEM: a pairing that negotiated
+	// below VersionJobCounters has its report kept without them, as the node
+	// would have sent it.
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionJobCounters {
+		req.Usage.Counters = nil
+	}
+
 	if err := req.Usage.Validate(); err != nil {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
 
