@@ -66,6 +66,7 @@
              else 'started' }}
       when: not ansible_check_mode
       become: true
+      notify: billet unit files changed
 
 - name: Remove uplink shaping that is not asked for or cannot run
   when:
@@ -79,6 +80,7 @@
         enabled: false
         state: stopped
       become: true
+      notify: billet unit files changed
 
     - name: Remove the uplink shaping unit
       ansible.builtin.file:
