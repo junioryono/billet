@@ -15,11 +15,12 @@ import (
 // name and its steps.
 //
 // FOUND BY THE RUNNER'S NAME IN THE RUN'S JOB LIST, NOT BY THE SCALE-SET
-// MESSAGE'S jobId. That jobId is the Actions service's own identifier, a GUID
-// (`1f4eedc2-3509-5c36-aac9-928a6a01b883` in the JobAssigned, JobStarted and
-// JobCompleted messages published in actions/scaleset#75, read 2026-10-09), and
-// the REST route for one job takes the numeric id, which no scale-set message
-// carries. A billet runner is named after its lease, which is unique by
+// MESSAGE'S jobId. That jobId is the Actions service's own identifier, a GUID,
+// and the REST route for one job takes the numeric id, which no scale-set
+// message carries. Measured on billet's own fleet on 2026-10-09: a job billet
+// recorded as `a76c6c09-3f59-5d30-8b85-bbf62c047a17` saw `job.check_run_id`
+// 113969514448 inside the job, while its run id, 37972852385, is recorded and
+// numeric. A billet runner is named after its lease, which is unique by
 // construction, and GitHub records that name on the job the runner ran.
 //
 // Needs the App's `actions: read`, which billet requests by default.
