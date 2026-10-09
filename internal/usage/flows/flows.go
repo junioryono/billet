@@ -104,11 +104,17 @@ type Accountant struct {
 	unclaimed    []Flow
 	next         int
 	evictedStart time.Time
+	// evictedUnstamped is when the ring last dropped a flow with no start
+	// time: whose it was cannot be told, so every job granted before then may
+	// have lost it.
+	evictedUnstamped time.Time
 	// down says the tracker's events are not being read now, and lossEnded
 	// when the latest such gap closed: a job whose time overlaps either may be
 	// missing flows.
 	down      bool
 	lossEnded time.Time
+	// now is the clock an unstamped flow's eviction is dated by.
+	now func() time.Time
 }
 
 type watch struct {
@@ -130,7 +136,7 @@ type watch struct {
 
 // NewAccountant returns an Accountant watching nothing.
 func NewAccountant() *Accountant {
-	return &Accountant{byKey: map[string]*watch{}, byAddr: map[netip.Addr]*watch{}}
+	return &Accountant{byKey: map[string]*watch{}, byAddr: map[netip.Addr]*watch{}, now: time.Now}
 }
 
 // Watch starts attributing flows from addr to the job named key, counting only
@@ -161,7 +167,8 @@ func (a *Accountant) Watch(key string, addr netip.Addr, since time.Time, open []
 
 	// A GAP IN THE EVENTS, OR A FLOW THE RING DROPPED, SINCE THE GRANT: either
 	// may have been this guest's.
-	if a.down || !a.lossEnded.Before(since) || !a.evictedStart.Before(since) {
+	if a.down || !a.lossEnded.Before(since) || !a.evictedStart.Before(since) ||
+		!a.evictedUnstamped.Before(since) {
 		w.incomplete = true
 	}
 
@@ -261,7 +268,10 @@ func (a *Accountant) keepUnclaimed(f Flow) {
 		return
 	}
 
-	if dropped := a.unclaimed[a.next].Start; dropped.After(a.evictedStart) {
+	switch dropped := a.unclaimed[a.next].Start; {
+	case dropped.IsZero():
+		a.evictedUnstamped = a.now()
+	case dropped.After(a.evictedStart):
 		a.evictedStart = dropped
 	}
 
@@ -322,6 +332,14 @@ func (a *Accountant) Final(key string, open []Flow, until time.Time) (Result, bo
 
 	for i := range open {
 		a.observe(open[i])
+	}
+
+	// THE BOUND APPLIES TO WHAT WAS ALREADY COUNTED TOO: a destruction reported
+	// while the compute was being destroyed can be the next holder's.
+	for key := range w.counted {
+		if f := w.counted[key]; f.Start.After(until) {
+			delete(w.counted, key)
+		}
 	}
 
 	delete(a.byKey, key)

@@ -32,9 +32,17 @@ var (
 )
 
 const (
-	sentinelMark    = 0xb111e7
-	sentinelTimeout = 30 // seconds; the entry is deleted at once
+	sentinelMark     = 0xb111e7
+	sentinelProtocol = 17 // udp
+	sentinelTimeout  = 30 // seconds; the entry is deleted at once
+	// closeLimit bounds the wait for a netlink call to return once its
+	// connection was closed under it.
+	closeLimit = time.Second
 )
+
+// sentinelID is one Sync's sentinel: a 32-bit nonce carried in its two ports,
+// so a destruction from an earlier Sync is never taken for a later one's.
+type sentinelID struct{ sport, dport uint16 }
 
 // Tracker reads the kernel's connection tracker: destructions as they happen,
 // and the whole table on demand.
@@ -43,13 +51,13 @@ type Tracker struct {
 
 	mu        sync.Mutex
 	listening bool
-	nextPort  uint16
-	waiters   map[uint16]chan struct{}
+	nonce     uint32
+	waiters   map[sentinelID]chan struct{}
 }
 
 // NewTracker returns a Tracker that logs to log.
 func NewTracker(log *slog.Logger) *Tracker {
-	return &Tracker{log: log, waiters: map[uint16]chan struct{}{}, nextPort: 1}
+	return &Tracker{log: log, waiters: map[sentinelID]chan struct{}{}}
 }
 
 // Run reports every destroyed flow to a until ctx ends. The kernel drops
@@ -162,18 +170,24 @@ func closeDraining(conn *conntrack.Conn, events <-chan conntrack.Event, errs <-c
 	}
 }
 
-// sentinel reports whether f is a Sync's sentinel, waking its waiter.
+// sentinel reports whether f is a Sync's sentinel, waking its waiter. The
+// whole identity is checked: the mark, both addresses, the protocol and the
+// nonce in the ports.
 func (t *Tracker) sentinel(f *conntrack.Flow) bool {
-	if f.Mark != sentinelMark || f.TupleOrig.IP.SourceAddress.Unmap() != sentinelSource {
+	orig := f.TupleOrig
+	if f.Mark != sentinelMark || orig.IP.SourceAddress.Unmap() != sentinelSource ||
+		orig.IP.DestinationAddress.Unmap() != sentinelDest || orig.Proto.Protocol != sentinelProtocol {
 		return false
 	}
+
+	id := sentinelID{sport: orig.Proto.SourcePort, dport: orig.Proto.DestinationPort}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if w, ok := t.waiters[f.TupleOrig.Proto.SourcePort]; ok {
+	if w, ok := t.waiters[id]; ok {
 		close(w)
-		delete(t.waiters, f.TupleOrig.Proto.SourcePort)
+		delete(t.waiters, id)
 	}
 
 	return true
@@ -181,7 +195,8 @@ func (t *Tracker) sentinel(f *conntrack.Flow) bool {
 
 // Sync returns once the listener has read every destruction the kernel
 // reported before the call, proved by a sentinel entry of its own, or with an
-// error saying it could not prove it.
+// error saying it could not prove it. Cancelling ctx ends it, the netlink calls
+// included.
 func (t *Tracker) Sync(ctx context.Context) error {
 	t.mu.Lock()
 
@@ -191,20 +206,26 @@ func (t *Tracker) Sync(ctx context.Context) error {
 		return errors.New("flows: the connection-tracking listener is not reading")
 	}
 
-	port := t.nextPort
+	var id sentinelID
 
-	t.nextPort++
-	if t.nextPort == 0 {
-		t.nextPort = 1
+	for {
+		t.nonce++
+		id = sentinelID{sport: uint16(t.nonce >> 16), dport: uint16(t.nonce)}
+
+		if _, taken := t.waiters[id]; !taken {
+			break
+		}
 	}
 
 	seen := make(chan struct{})
-	t.waiters[port] = seen
+	t.waiters[id] = seen
 	t.mu.Unlock()
 
 	defer func() {
 		t.mu.Lock()
-		delete(t.waiters, port)
+		if t.waiters[id] == seen {
+			delete(t.waiters, id)
+		}
 		t.mu.Unlock()
 	}()
 
@@ -213,15 +234,49 @@ func (t *Tracker) Sync(ctx context.Context) error {
 		return fmt.Errorf("flows: open the connection tracker: %w", err)
 	}
 
-	defer conn.Close()
+	f := conntrack.NewFlow(sentinelProtocol, 0, sentinelSource, sentinelDest, id.sport, id.dport,
+		sentinelTimeout, sentinelMark)
 
-	f := conntrack.NewFlow(17, 0, sentinelSource, sentinelDest, port, port, sentinelTimeout, sentinelMark)
-	if err := conn.Create(f); err != nil {
-		return fmt.Errorf("flows: create the sentinel entry: %w", err)
-	}
+	placed := make(chan error, 1)
 
-	if err := conn.Delete(f); err != nil {
-		return fmt.Errorf("flows: delete the sentinel entry: %w", err)
+	go func() {
+		if err := conn.Create(f); err != nil {
+			placed <- fmt.Errorf("flows: create the sentinel entry: %w", err)
+
+			return
+		}
+
+		if err := conn.Delete(f); err != nil {
+			placed <- fmt.Errorf("flows: delete the sentinel entry: %w", err)
+
+			return
+		}
+
+		placed <- nil
+	}()
+
+	// CLOSED ON EVERY PATH, and on cancellation while a call is still in the
+	// kernel, which is what makes that call return.
+	select {
+	case err := <-placed:
+		_ = conn.Close()
+
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		_ = conn.Close()
+
+		wait := time.NewTimer(closeLimit)
+
+		select {
+		case <-placed:
+		case <-wait.C:
+		}
+
+		wait.Stop()
+
+		return fmt.Errorf("flows: place the sentinel entry: %w", ctx.Err())
 	}
 
 	select {

@@ -105,6 +105,20 @@ func TestOnlyFlowsInsideTheJobsTimeAreItsOwn(t *testing.T) {
 	}
 }
 
+// THE DESTROY BOUND APPLIES HOWEVER A FLOW ARRIVED: a next holder's flow
+// reported destroyed before Final is no more this job's than one in the dump.
+func TestTheDestroyBoundAppliesToFlowsAlreadyCounted(t *testing.T) {
+	t.Parallel()
+
+	a := NewAccountant()
+	a.Watch("lease-1", guest, began, nil)
+	a.Observe(startedAt(flow(1, guest, npm, 500, 500), ended.Add(time.Second)))
+	a.Observe(flow(2, guest, npm, 1, 1))
+
+	r, _ := a.Final("lease-1", nil, ended)
+	only(t, r, Destination{Addr: npm, Sent: 1, Received: 1, Connections: 1})
+}
+
 // A FLOW WITHOUT A START TIME HAS NO OWNER: it is not counted, and the job is
 // marked incomplete rather than silently short.
 func TestAFlowWithoutAStartTimeIsNotGuessedAt(t *testing.T) {
@@ -416,6 +430,28 @@ func TestTheReplayBufferIsBoundedAndSaysWhatItDropped(t *testing.T) {
 
 	if r, _ := a.Final("newer-dropped", nil, ended); !r.Incomplete {
 		t.Error("a dropped flow the job may have owned did not mark it incomplete")
+	}
+}
+
+// AN UNSTAMPED FLOW THE RING DROPPED could have been any job's: every job
+// granted before the drop is marked incomplete.
+func TestDroppingAnUnstampedFlowMarksTheJobsItCouldHaveBeen(t *testing.T) {
+	t.Parallel()
+
+	a := NewAccountant()
+	a.now = func() time.Time { return began.Add(time.Minute) }
+	a.Up(began.Add(-time.Hour))
+
+	a.Observe(startedAt(flow(1, guest, github, 1, 1), time.Time{}))
+
+	for i := range MaxUnclaimed {
+		a.Observe(startedAt(flow(uint32(i+2), other, npm, 1, 1), began.Add(-time.Minute)))
+	}
+
+	a.Watch("lease-1", guest, began, nil)
+
+	if r, _ := a.Final("lease-1", nil, ended); !r.Incomplete {
+		t.Error("a dropped unstamped flow did not mark a job granted before the drop incomplete")
 	}
 }
 

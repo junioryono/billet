@@ -6,12 +6,15 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ti-mo/conntrack"
 )
 
 // AGAINST THE REAL CONNECTION TRACKER: every guest with a lease on a billet
@@ -123,5 +126,44 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 		}
 
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// AND AN ORDINARY DESTRUCTION REACHES THE ACCOUNTANT: an entry from a
+	// watched probe address, created and deleted just before Sync, has been
+	// read by the time Final runs. On a host without timestamps it arrives
+	// unstamped and marks the probe incomplete; with them it is counted. This
+	// checks delivery through the real listener, not that Sync is what waited
+	// for it: measured on the reference host (2026-10-09), the kernel delivers
+	// the event within the Delete call's round trip, so a Sync that returned at
+	// once passed five runs of five. The ordering is held by the unit tests.
+	probe, peer := netip.MustParseAddr("127.66.1.1"), netip.MustParseAddr("127.66.1.2")
+	acct.Watch("probe", probe, time.Now().Add(-time.Minute), nil)
+
+	conn, err := conntrack.Dial(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer conn.Close()
+
+	f := conntrack.NewFlow(17, 0, probe, peer, 4242, 4242, 30, 0)
+	if err := conn.Create(f); err != nil {
+		t.Fatalf("create the probe entry: %v", err)
+	}
+
+	if err := conn.Delete(f); err != nil {
+		t.Fatalf("delete the probe entry: %v", err)
+	}
+
+	syncCtx, done := context.WithTimeout(t.Context(), 2*time.Second)
+	defer done()
+
+	if err := tracker.Sync(syncCtx); err != nil {
+		t.Fatalf("sync after the probe: %v", err)
+	}
+
+	r, _ := acct.Final("probe", nil, time.Now())
+	if !r.Incomplete && len(r.Destinations) == 0 {
+		t.Fatal("a destruction before the barrier had not reached the accountant when Sync returned")
 	}
 }

@@ -13,18 +13,22 @@ import (
 	"time"
 )
 
-// fakeTable answers Flows from a map, or with err, and Sync with syncErr.
+// fakeTable answers Flows from a map, or with err, and Sync with syncErr,
+// recording the order it was asked in.
 type fakeTable struct {
 	mu      sync.Mutex
 	open    map[netip.Addr][]Flow
 	err     error
 	syncErr error
 	synced  int
+	calls   []string
 }
 
 func (t *fakeTable) Flows(addr netip.Addr) ([]Flow, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	t.calls = append(t.calls, "flows")
 
 	if t.err != nil {
 		return nil, t.err
@@ -38,6 +42,7 @@ func (t *fakeTable) Sync(context.Context) error {
 	defer t.mu.Unlock()
 
 	t.synced++
+	t.calls = append(t.calls, "sync")
 
 	return t.syncErr
 }
@@ -126,6 +131,110 @@ func TestFlowsBeforeTheAddressIsLearnedStillCount(t *testing.T) {
 
 	if table.synced != 1 {
 		t.Errorf("Final synced the tracker %d times, want once before taking the result", table.synced)
+	}
+
+	// THE DUMP BEFORE THE BARRIER: the barrier is what proves the destructions
+	// reported during the dump were read.
+	if n := len(table.calls); n < 2 || table.calls[n-2] != "flows" || table.calls[n-1] != "sync" {
+		t.Errorf("Final asked the table %v; want the open flows read and then the barrier", table.calls)
+	}
+}
+
+// A GRANT IN THE LAUNCH'S OWN SECOND could be the previous guest's renewal:
+// it is used, and the job marked incomplete.
+func TestAGrantInTheLaunchsOwnSecondIsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	launchedMid := began.Add(800 * time.Millisecond)
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launchedMid)
+
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+		t.Errorf("a grant in the launch's second gave %+v, measured %v, %v; want measured and incomplete", r, measured, err)
+	}
+}
+
+// A LEASE THAT CANNOT BE READ AFTER THE ADDRESS IS KNOWN means its continued
+// ownership cannot be checked: the job is marked incomplete.
+func TestALeaseUnreadableAfterTheAddressIsKnownMarksTheJob(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	w, _ := newTestWatcher(&fakeTable{}, l)
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+
+	l.mu.Lock()
+	l.err = os.ErrPermission
+	l.mu.Unlock()
+
+	w.Resolve()
+
+	if r, measured, err := w.Final(t.Context(), "lease-1", ended); !measured || !r.Incomplete || err != nil {
+		t.Errorf("a lease unreadable after resolution gave %+v, measured %v, %v; want incomplete", r, measured, err)
+	}
+}
+
+// A RESOLUTION STILL READING WHEN ITS JOB FINISHES NEVER WATCHES IT: the job is
+// gone, and an orphan watch would hold its address from every later guest.
+func TestAResolutionCannotOutliveItsJob(t *testing.T) {
+	t.Parallel()
+
+	reading, release := make(chan struct{}), make(chan struct{})
+
+	var calls sync.Mutex
+
+	n := 0
+
+	w, _ := newTestWatcher(&fakeTable{}, &leases{})
+	w.read = func(string) ([]byte, error) {
+		calls.Lock()
+		n++
+		call := n
+		calls.Unlock()
+
+		switch call {
+		case 2: // the Resolve tick, which stalls until the job has finished
+			close(reading)
+			<-release
+
+			return []byte(leaseLine(began, guest)), nil
+		case 1, 3: // Watch's own read, and Final's: no address yet
+			return nil, nil
+		default:
+			return []byte(leaseLine(began, guest)), nil
+		}
+	}
+
+	w.Watch("lease-1", guestMACAddr, "leases", launched)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		w.Resolve()
+	}()
+
+	<-reading
+
+	if _, measured, err := w.Final(t.Context(), "lease-1", ended); measured || err == nil {
+		t.Fatalf("a job with no address yet was measured (%v, %v)", measured, err)
+	}
+
+	close(release)
+	<-done
+
+	// The address is free: a later guest is watched at it.
+	w.Watch("lease-2", guestMACAddr, "leases", launched)
+
+	if _, measured, err := w.Final(t.Context(), "lease-2", ended); !measured {
+		t.Errorf("a finished job's late resolution held the address: %v", err)
 	}
 }
 

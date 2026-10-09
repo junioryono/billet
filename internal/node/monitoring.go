@@ -104,7 +104,15 @@ func (r *Runner) startFlows(name string, target provider.UsageTarget, launchedAt
 // finalFlows takes what a job's connections came to, counting none that
 // started after until, when the job's destroy began. Until the ledger stores
 // them, they are said in the node's log.
-func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time) {
+//
+// WITH THE REMAINDER THE TAP SAYS WAS NOT ATTRIBUTED. The tap's counters are
+// the job's whole traffic, read before the destroy; what no destination
+// accounts for (a flow missed, merged into an entry an earlier guest left, or
+// traffic conntrack does not track, such as DHCP and ARP) is that difference,
+// a measured number rather than a claim that nothing was missed. The tap
+// counts Ethernet frames and conntrack IP packets, so the tap's side is taken
+// less 14 bytes a frame.
+func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, sum usage.Summary, sampled bool) {
 	if r.flows == nil {
 		return
 	}
@@ -116,15 +124,26 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time) {
 		return
 	}
 
-	var sent, received uint64
+	sent, received := res.Other.Sent, res.Other.Received
 	for _, d := range res.Destinations {
 		sent, received = sent+d.Sent, received+d.Received
 	}
 
-	r.log.Info("a job's traffic by destination", "runner", name, "destinations", len(res.Destinations),
-		"sent", sent+res.Other.Sent, "received", received+res.Other.Received,
-		"incomplete", res.Incomplete, "error", err)
+	attrs := []any{"runner", name, "destinations", len(res.Destinations), "sent", sent,
+		"received", received, "incomplete", res.Incomplete, "error", err}
+
+	if tap := sum.Latest; sampled && sum.Measured.Net {
+		attrs = append(attrs,
+			"unattributed_sent", (tap.NetTx-ethernetHeader*tap.NetTxPackets)-int64(sent),
+			"unattributed_received", (tap.NetRx-ethernetHeader*tap.NetRxPackets)-int64(received))
+	}
+
+	r.log.Info("a job's traffic by destination", attrs...)
 }
+
+// ethernetHeader is what a tap counts for each frame beyond the IP packet
+// conntrack counts.
+const ethernetHeader = 14
 
 // finalUsage takes a job's last sample. It is called before the compute is
 // destroyed, because its cgroup and threads go with it.

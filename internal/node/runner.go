@@ -858,7 +858,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// fenced on the lease, which the plane releases only after this returns.
 	// THE FLOWS ARE READ AFTER THE DESTROY, when the guest can open no more and
 	// every counter it left is final.
-	r.finalFlows(ctx, inst.Name, destroyAt)
+	r.finalFlows(ctx, inst.Name, destroyAt, measured, hasUsage)
 
 	if hasUsage && holdable {
 		r.reportUsage(ctx, lease, inst.Name, measured)

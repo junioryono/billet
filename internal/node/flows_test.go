@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/usage/flows"
 )
 
@@ -57,7 +58,16 @@ func (f *recordingFlows) Forget(key string) {
 type guestProvider struct {
 	*measuredProvider
 	mu          sync.Mutex
+	launchedAt  time.Time
 	destroyedAt time.Time
+}
+
+func (p *guestProvider) Launch(ctx context.Context, spec provider.Spec) (*provider.Instance, error) {
+	p.mu.Lock()
+	p.launchedAt = time.Now()
+	p.mu.Unlock()
+
+	return p.measuredProvider.Launch(ctx, spec)
 }
 
 func (p *guestProvider) UsageTarget(ctx context.Context, id string) (provider.UsageTarget, error) {
@@ -104,8 +114,14 @@ func TestTheRunnerFollowsAGuestsFlowsFromLaunchToDestroy(t *testing.T) {
 		t.Fatalf("followed %q, want the guest's bridge's lease file", leaseFile)
 	}
 
-	if launched.Before(beforeLaunch) || launched.After(time.Now()) {
-		t.Errorf("followed from %v, want a moment inside the launch call", launched)
+	p.mu.Lock()
+	enteredLaunch := p.launchedAt
+	p.mu.Unlock()
+
+	// BEFORE THE BACKEND'S LAUNCH IS ENTERED, since the guest can open flows
+	// while it is still inside it.
+	if launched.Before(beforeLaunch) || launched.After(enteredLaunch) {
+		t.Errorf("followed from %v, want a moment before the backend's launch began (%v)", launched, enteredLaunch)
 	}
 
 	beforeDestroy := time.Now()
@@ -181,7 +197,7 @@ func TestFlowsAreOptionalAndForgottenWithTheJob(t *testing.T) {
 
 	r := &Runner{log: slog.New(slog.DiscardHandler)}
 	r.startFlows("billet-1", provider.UsageTarget{GuestMAC: "02:00:00:00:00:17", Bridge: "billet1"}, time.Now())
-	r.finalFlows(t.Context(), "billet-1", time.Now())
+	r.finalFlows(t.Context(), "billet-1", time.Now(), usage.Summary{}, false)
 	r.forgetMonitoring("billet-1")
 
 	rec := newRecordingFlows()

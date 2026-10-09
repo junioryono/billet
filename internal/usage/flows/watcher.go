@@ -67,8 +67,10 @@ func NewWatcher(acct *Accountant, table Table, leaseTime time.Duration, log *slo
 
 // Watch starts following the job named key, whose guest has hardware address
 // mac and is leased its address in leaseFile, and which was launched at
-// launched.
+// launched. A key already followed is forgotten first.
 func (w *Watcher) Watch(key string, mac net.HardwareAddr, leaseFile string, launched time.Time) {
+	w.Forget(key)
+
 	p := &pending{mac: mac, leaseFile: leaseFile, launched: launched}
 
 	w.mu.Lock()
@@ -110,27 +112,25 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// resolve reads p's lease outside the lock and records what it found under it,
-// unless the job has finished meanwhile.
+// resolve reads p's lease, and on first learning the address the tracker's
+// flows for it, outside the lock, and commits what it found under the lock
+// only if p is still key's: a job finished or replaced meanwhile is never
+// watched again.
 func (w *Watcher) resolve(key string, p *pending) {
-	data, err := w.read(p.leaseFile)
-
-	var (
-		addr  netip.Addr
-		grant time.Time
-	)
-
-	if err == nil {
-		addr, grant, err = leaseGrantedSince(data, p.mac, p.launched, w.leaseTime)
-	}
-
 	w.mu.Lock()
-	current := w.pending[key] == p
 	known := p.addr
 	w.mu.Unlock()
 
-	if !current {
-		return
+	data, err := w.read(p.leaseFile)
+
+	var (
+		addr      netip.Addr
+		grant     time.Time
+		ambiguous bool
+	)
+
+	if err == nil {
+		addr, grant, ambiguous, err = leaseGrantedSince(data, p.mac, p.launched, w.leaseTime)
 	}
 
 	if err != nil {
@@ -139,7 +139,24 @@ func (w *Watcher) resolve(key string, p *pending) {
 		} else {
 			err = fmt.Errorf("read the DHCP leases: %w", err)
 		}
+	}
 
+	if known.IsValid() {
+		// AN ADDRESS THAT CHANGED MID-JOB, OR ONE THAT COULD NOT BE CHECKED: the
+		// old one may now be another guest's and the new one's traffic was
+		// never followed.
+		if err != nil || addr != known {
+			w.mu.Lock()
+			if w.pending[key] == p {
+				w.acct.MarkIncomplete(key)
+			}
+			w.mu.Unlock()
+		}
+
+		return
+	}
+
+	if err != nil {
 		w.mu.Lock()
 		p.failure = err
 		w.mu.Unlock()
@@ -147,43 +164,31 @@ func (w *Watcher) resolve(key string, p *pending) {
 		return
 	}
 
-	if known.IsValid() {
-		// AN ADDRESS THAT CHANGED MID-JOB: the old one may now be another
-		// guest's and the new one's traffic was never followed.
-		if addr != known {
-			w.acct.MarkIncomplete(key)
-		}
-
-		return
-	}
-
 	open, dumpErr := w.table.Flows(addr)
 
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pending[key] != p || p.addr.IsValid() {
+		return
+	}
+
 	if !w.acct.Watch(key, addr, grant, open) {
-		w.mu.Lock()
 		p.failure = fmt.Errorf("address %s is already another job's", addr)
-		w.mu.Unlock()
 
 		return
 	}
 
-	if dumpErr != nil {
-		// The previous holder's entries could not be read, so traffic the guest
-		// adds to one of them would go unnoticed.
-		w.acct.MarkIncomplete(key)
-	}
-
-	// A GRANT THIS LONG AFTER THE LAUNCH MAY BE A RENEWAL, which dnsmasq records
-	// the same way, and the flows before it would then be dropped as an older
-	// holder's. A guest asks within seconds of booting, so this is a lease file
-	// that could not be read for half a lease.
-	if grant.Sub(p.launched) > w.leaseTime/2 {
-		w.acct.MarkIncomplete(key)
-	}
-
-	w.mu.Lock()
 	p.addr, p.failure = addr, nil
-	w.mu.Unlock()
+
+	// THE PREVIOUS HOLDER'S ENTRIES COULD NOT BE READ, so traffic the guest
+	// adds to one of them would go unnoticed; A GRANT IN THE LAUNCH'S OWN
+	// SECOND could be the previous guest's renewal; A GRANT HALF A LEASE AFTER
+	// THE LAUNCH may be a renewal hiding earlier flows. Each is a job whose
+	// flows cannot all be told apart.
+	if dumpErr != nil || ambiguous || grant.Sub(p.launched) > w.leaseTime/2 {
+		w.acct.MarkIncomplete(key)
+	}
 }
 
 // Final stops following key and returns what its flows came to, whether they
@@ -202,7 +207,9 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 	w.resolve(key, p)
 
 	w.mu.Lock()
-	delete(w.pending, key)
+	if w.pending[key] == p {
+		delete(w.pending, key)
+	}
 	addr, failure := p.addr, p.failure
 	w.mu.Unlock()
 
@@ -210,8 +217,16 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 		return Result{}, false, failure
 	}
 
-	// EVERY FLOW THAT ENDED BEFORE NOW IS READ BEFORE THE RESULT IS TAKEN, or
-	// the result says it could not be proved.
+	// THE OPEN FLOWS FIRST, THEN THE BARRIER: an entry that expires while the
+	// table is read is skipped by the dump and reported destroyed, and the
+	// barrier, created after the dump, is what proves that report was read.
+	open, readErr := w.table.Flows(addr)
+	if readErr != nil {
+		// The flows still open could not be read, so the ones already counted
+		// are a lower bound.
+		w.acct.MarkIncomplete(key)
+	}
+
 	syncCtx, cancel := context.WithTimeout(ctx, syncLimit)
 	syncErr := w.table.Sync(syncCtx)
 
@@ -221,16 +236,9 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 		w.acct.MarkIncomplete(key)
 	}
 
-	open, readErr := w.table.Flows(addr)
-	if readErr != nil {
-		// The flows still open could not be read, so the ones already counted
-		// are a lower bound.
-		w.acct.MarkIncomplete(key)
-	}
-
 	r, _ := w.acct.Final(key, open, until)
 
-	return r, true, errors.Join(syncErr, readErr)
+	return r, true, errors.Join(readErr, syncErr)
 }
 
 // Forget stops following key without a result.
@@ -238,9 +246,11 @@ func (w *Watcher) Forget(key string) {
 	w.mu.Lock()
 	p, ok := w.pending[key]
 	delete(w.pending, key)
+
+	resolved := ok && p.addr.IsValid()
 	w.mu.Unlock()
 
-	if ok && p.addr.IsValid() {
+	if resolved {
 		w.acct.Final(key, nil, time.Now())
 	}
 }
@@ -251,19 +261,23 @@ func (w *Watcher) Forget(key string) {
 // guest's lease for the same MAC until the new guest asks for its own.
 //
 // THE GRANT IS READ IN WHOLE SECONDS, the precision dnsmasq writes, and
-// compared with the launch's own whole second: a grant the launch's second
-// cannot be told from is accepted, since the previous guest's VM is destroyed
-// before its tap, and so its MAC, can be claimed again.
-func leaseGrantedSince(data []byte, mac net.HardwareAddr, launched time.Time, leaseTime time.Duration) (netip.Addr, time.Time, error) {
+// compared with the launch's own whole second: a grant in that very second is
+// accepted but reported ambiguous, since it could be the previous guest's
+// renewal in the moment before its VM was destroyed.
+func leaseGrantedSince(data []byte, mac net.HardwareAddr, launched time.Time,
+	leaseTime time.Duration,
+) (netip.Addr, time.Time, bool, error) {
 	addr, expiry, err := leaseFor(data, mac)
 	if err != nil {
-		return netip.Addr{}, time.Time{}, err
+		return netip.Addr{}, time.Time{}, false, err
 	}
 
 	grant := expiry.Add(-leaseTime)
-	if grant.Before(launched.Truncate(time.Second)) {
-		return netip.Addr{}, time.Time{}, ErrNoAddress
+	second := launched.Truncate(time.Second)
+
+	if grant.Before(second) {
+		return netip.Addr{}, time.Time{}, false, ErrNoAddress
 	}
 
-	return addr, grant, nil
+	return addr, grant, grant.Equal(second), nil
 }
