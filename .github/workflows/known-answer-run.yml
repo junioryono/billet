@@ -9,6 +9,10 @@ name: Known-answer run
 # THE LOADS RUN 60 SECONDS, written here rather than as a dispatch input: a
 # dispatch input reaches a reusable workflow as a string, and the kit's number
 # input refuses it (measured 2026-10-09, "Unexpected value '60'").
+#
+# THE NETWORK LOAD IS ONE OF BILLET'S OWN RELEASE ASSETS, whose size GitHub
+# publishes exactly: the Cloudflare speed endpoint answered a guest with 403
+# (measured 2026-10-09).
 on: workflow_dispatch
 
 permissions:
@@ -23,6 +27,6 @@ jobs:
       seconds: 60
       cpu_workers: 4
       memory_bytes: 2147483648
-      network_url: https://speed.cloudflare.com/__down?bytes=104857600
-      network_bytes: 104857600
+      network_url: https://github.com/junioryono/billet/releases/download/guest-20261005-070030/rootfs.img.zst.part010
+      network_bytes: 169258759
       disk_bytes: 2147483648
