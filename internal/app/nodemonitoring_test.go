@@ -238,6 +238,8 @@ func TestTheRefusalCheckersCatchTheirBypasses(t *testing.T) {
 			optioned + "\n\t}\n}", true},
 		{"options built and not returned", "func NewProvider() {\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderFirecracker:\n\t\t_ = func() { " +
 			optioned + " }\n\t\treturn firecracker.New(deployment, *cfg.Node.Firecracker, store)\n\t}\n}", false},
+		{"a decoy switch in an unused closure", "func NewProvider() {\n\t_ = func() {\n\t\tswitch cfg.Node.Provider {\n\t\tcase config.ProviderFirecracker:\n\t\t\treturn " +
+			optioned + "\n\t\t}\n\t}\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderFirecracker:\n\t\treturn firecracker.New(deployment, *cfg.Node.Firecracker, store)\n\t}\n}", false},
 		{"options returned for another backend", "func NewProvider() {\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderDocker:\n\t\treturn " +
 			optioned + "\n\tcase config.ProviderFirecracker:\n\t\treturn firecracker.New(deployment, *cfg.Node.Firecracker, store)\n\t}\n}", false},
 	} {
@@ -315,43 +317,61 @@ func refusesBeforeKeeping(body *ast.BlockStmt) error {
 	return nil
 }
 
-// returnsOptionedFirecracker is nil when the switch case naming
-// config.ProviderFirecracker returns firecracker.New(..., FirecrackerOptions(cfg)...)
-// as a statement of its own body.
+// returnsOptionedFirecracker is nil when the switch on cfg.Node.Provider that
+// is a statement of body itself (not one in a closure or a branch) has a case
+// naming config.ProviderFirecracker whose own statements return
+// firecracker.New(..., FirecrackerOptions(cfg)...).
 func returnsOptionedFirecracker(body *ast.BlockStmt) error {
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		clause, ok := n.(*ast.CaseClause)
-		if !ok || !slices.ContainsFunc(clause.List, func(e ast.Expr) bool {
-			return namesSelector(e, "config", "ProviderFirecracker")
-		}) {
-			return true
+	for _, stmt := range body.List {
+		sw, ok := stmt.(*ast.SwitchStmt)
+		if !ok || !isProviderTag(sw.Tag) {
+			continue
 		}
-		for _, stmt := range clause.Body {
-			ret, ok := stmt.(*ast.ReturnStmt)
-			if !ok || len(ret.Results) == 0 {
+		for _, c := range sw.Body.List {
+			clause, ok := c.(*ast.CaseClause)
+			if !ok || !slices.ContainsFunc(clause.List, func(e ast.Expr) bool {
+				return namesSelector(e, "config", "ProviderFirecracker")
+			}) {
 				continue
 			}
-			call, ok := ret.Results[0].(*ast.CallExpr)
-			if !ok || !namesSelector(call.Fun, "firecracker", "New") || !call.Ellipsis.IsValid() {
-				continue
-			}
-			last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
-			if !ok || calleeName(last) != "FirecrackerOptions" || len(last.Args) != 1 {
-				continue
-			}
-			if arg, ok := last.Args[0].(*ast.Ident); ok && arg.Name == "cfg" {
-				found = true
+			if slices.ContainsFunc(clause.Body, returnsOptionedNew) {
+				return nil
 			}
 		}
-
-		return true
-	})
-	if !found {
-		return errors.New("the Firecracker case does not return firecracker.New(..., FirecrackerOptions(cfg)...)")
 	}
 
-	return nil
+	return errors.New("the Firecracker case of the switch on cfg.Node.Provider does not return " +
+		"firecracker.New(..., FirecrackerOptions(cfg)...)")
+}
+
+// isProviderTag reports whether expr is cfg.Node.Provider.
+func isProviderTag(expr ast.Expr) bool {
+	outer, ok := expr.(*ast.SelectorExpr)
+	if !ok || outer.Sel.Name != "Provider" {
+		return false
+	}
+
+	return namesSelector(outer.X, "cfg", "Node")
+}
+
+// returnsOptionedNew reports whether stmt is
+// `return firecracker.New(..., FirecrackerOptions(cfg)...)`.
+func returnsOptionedNew(stmt ast.Stmt) bool {
+	ret, ok := stmt.(*ast.ReturnStmt)
+	if !ok || len(ret.Results) == 0 {
+		return false
+	}
+	call, ok := ret.Results[0].(*ast.CallExpr)
+	if !ok || !namesSelector(call.Fun, "firecracker", "New") || !call.Ellipsis.IsValid() {
+		return false
+	}
+	last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
+	if !ok || calleeName(last) != "FirecrackerOptions" || len(last.Args) != 1 {
+		return false
+	}
+	arg, ok := last.Args[0].(*ast.Ident)
+
+	return ok && arg.Name == "cfg"
 }
 
 // refusesWith reports whether stmt is exactly `if err := fn(arg); err != nil {

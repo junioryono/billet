@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // refNetDev is /proc/<pid>/net/dev of a busybox container on Docker 29.4.3
@@ -138,15 +139,19 @@ func TestAPidReusedDuringTheNetworkReadIsNotTheContainers(t *testing.T) {
 		t.Fatalf("make the table a pipe: %v", err)
 	}
 
+	// opened is closed once the writer's open returns, which a FIFO allows only
+	// when a reader has opened the other end; the read cannot reach its EOF
+	// before the writer closes, which comes after.
+	opened := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		// Blocks until the reader opens the table.
 		f, err := os.OpenFile(table, os.O_WRONLY, 0)
 		if err != nil {
 			done <- err
 
 			return
 		}
+		close(opened)
 		reused := strings.Replace(refContainerStat, " 186542363 ", " 186599999 ", 1) + "\n"
 		werr := os.WriteFile(filepath.Join(tr.root, "proc", "4159321", "stat"), []byte(reused), 0o600)
 		_, err = f.WriteString(refNetDev)
@@ -155,13 +160,25 @@ func TestAPidReusedDuringTheNetworkReadIsNotTheContainers(t *testing.T) {
 
 	s := Reader{Root: tr.root}.Read(target)
 
-	// A reader that never opened the table leaves the writer waiting; opening it
-	// here lets the writer finish either way.
-	if f, err := os.OpenFile(table, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
-		_ = f.Close()
+	select {
+	case <-opened:
+	default:
+		// THE READER NEVER OPENED THE TABLE. A read end held open until the
+		// writer is done lets its open return whenever it gets there.
+		t.Error("the reader returned without opening the namespace's table")
+		release, err := os.OpenFile(table, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatalf("open the table to release the writer: %v", err)
+		}
+		defer func() { _ = release.Close() }()
 	}
-	if err := <-done; err != nil && !errors.Is(err, syscall.EPIPE) {
-		t.Fatalf("stage the reuse: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stage the reuse: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the writer never finished")
 	}
 	if s.NetOK || s.NetRx != 0 {
 		t.Errorf("net = ok %v rx %d after the pid changed hands during the read, want unmeasured", s.NetOK, s.NetRx)
