@@ -92,3 +92,5 @@ fec09aac0cb7 The host commands moved to internal/ops/host (#356 Phase 4); the se
 621723967adb The row gained the role's metrics block (#356 Phase 6, ADR-016); the rest of it is unchanged.
 b12455d20da8 The row gained the role's metrics block (#356 Phase 6, ADR-016); the rest of it is unchanged.
 d1410b1ea27d The wire's newest version moved to 26 (VersionJobCounters); the sentence is otherwise unchanged.
+7213c487ff95 The listener's renewal tests moved into a synctest bubble (#356 Phase 7) and the six seams this sentence named were deleted; conventions-and-concurrency.md states the bubble rule.
+baa6f9daf23c In a synctest bubble a pass's budget is on the fake clock and cannot run out while the pass works, so the TTL no longer has to be long for that reason.
