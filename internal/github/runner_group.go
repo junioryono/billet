@@ -202,8 +202,51 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("github: %s: %w", operation, apiErrorWithout(status, body, token))
 	}
+	// AN ANSWER THAT CARRIES THE TOKEN IS NOT READ AT ALL: every string in it
+	// can reach an operator's output, as a job's name or inside an error about a
+	// field that did not parse, and no redaction of one path covers the next.
+	if carries(body, token) {
+		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, so it is not read",
+			operation)
+	}
 
 	return body, nil
+}
+
+// carries reports whether a body holds bearer, as it was sent or in any JSON
+// string once decoded, where an escape can hide it from a byte search.
+func carries(body []byte, bearer string) bool {
+	if bearer == "" {
+		return false
+	}
+	if bytes.Contains(body, []byte(bearer)) {
+		return true
+	}
+	var decoded any
+	if json.Unmarshal(body, &decoded) != nil {
+		return false
+	}
+
+	return holds(decoded, bearer)
+}
+
+// holds reports whether any string in a decoded JSON value, keys included,
+// contains s.
+func holds(v any, s string) bool {
+	switch v := v.(type) {
+	case string:
+		return strings.Contains(v, s)
+	case []any:
+		return slices.ContainsFunc(v, func(e any) bool { return holds(e, s) })
+	case map[string]any:
+		for k, e := range v {
+			if strings.Contains(k, s) || holds(e, s) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // apiErrorWithout is apiError for a request that carried bearer, keeping of

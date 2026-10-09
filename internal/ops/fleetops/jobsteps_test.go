@@ -363,6 +363,30 @@ func TestRenderStepsSaysNotMeasuredForAGroupNeverRead(t *testing.T) {
 	if !strings.Contains(out.String(), want) {
 		t.Errorf("unmeasured groups were not said to be:\n%s", out.String())
 	}
+
+	// EACH GROUP ALONE: only its own text says so, and every other group shows
+	// what its window used.
+	measured := map[string]string{
+		"cpu": "cpu 0.2s", "peak memory": "peak memory 100.0 MiB", "disk": "disk read 2.0 KiB",
+		"network": "network received 2.0 KiB", "energy": "energy 2.0 J",
+	}
+	for group, label := range map[string]string{
+		alloc.UsageCPU: "cpu", alloc.UsageMemory: "peak memory", alloc.UsageIO: "disk",
+		alloc.UsageNet: "network", alloc.UsageEnergy: "energy",
+	} {
+		steps.measured = &alloc.RecordedUsage{JobUsage: alloc.JobUsage{Unmeasured: []string{group}}}
+		var one bytes.Buffer
+		renderSteps(&one, steps)
+		for other, text := range measured {
+			unmeasured := strings.Contains(one.String(), other+" not measured")
+			if unmeasured != (other == label) {
+				t.Errorf("with %s unmeasured, %q says not measured = %v:\n%s", group, other, unmeasured, one.String())
+			}
+			if other != label && !strings.Contains(one.String(), text) {
+				t.Errorf("with %s unmeasured, %q does not show %q:\n%s", group, other, text, one.String())
+			}
+		}
+	}
 }
 
 // A STEP NAME OR A GITHUB ERROR CANNOT FORGE A LINE.

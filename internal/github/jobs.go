@@ -265,9 +265,11 @@ func stepTime(raw *string) (time.Time, error) {
 	if raw == nil || *raw == "" {
 		return time.Time{}, nil
 	}
+	// THE VALUE IS NOT QUOTED in the error: it is text GitHub chose, and the
+	// error reaches an operator's output.
 	t, err := time.Parse(time.RFC3339, *raw)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("not an RFC 3339 time: %w", err)
+		return time.Time{}, errors.New("not an RFC 3339 time")
 	}
 
 	return t, nil

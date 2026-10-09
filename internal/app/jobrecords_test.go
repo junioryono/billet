@@ -190,7 +190,7 @@ tiers:
 				return
 			}
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"token":"t","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+			fmt.Fprintf(w, `{"token":"ghs_jobrecordstesttoken","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
 			return
 		}
 		fmt.Fprint(w, `{"total_count":0,"jobs":[]}`)

@@ -125,8 +125,8 @@ func TestAStepsMissingTimeIsZeroAndAMalformedOneIsRefused(t *testing.T) {
 		fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`, jobJSON(7001, "billet-lease-1", malformed))
 	})
 	if _, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1"); err == nil ||
-		!strings.Contains(err.Error(), "step 2: started_at") {
-		t.Errorf("a malformed step time = %v, want refused naming the step", err)
+		!strings.Contains(err.Error(), "step 2: started_at") || strings.Contains(err.Error(), "yesterday") {
+		t.Errorf("a malformed step time = %v, want refused naming the step and not quoting the value", err)
 	}
 }
 
@@ -295,6 +295,37 @@ func TestOnlyADecodedMessageIsShown(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "ins") ||
 			strings.Contains(err.Error(), `\u`) {
 			t.Errorf("%s = %v, want it to say %q and nothing of the token", name, err, tc.want)
+		}
+	}
+}
+
+// AN ANSWER THAT CARRIES THE TOKEN IS NOT READ, whichever field it hides in and
+// however it is encoded: a step's time that will not parse, a step's name that
+// would be printed, or a key.
+func TestASuccessfulAnswerCarryingTheTokenIsNotRead(t *testing.T) {
+	t.Parallel()
+
+	for echo, encode := range echoes {
+		for field, job := range map[string]func(token string) string{
+			"a step's time": func(token string) string {
+				return jobJSON(1, "billet-lease-1", `{"number":1,"name":"s","started_at":"`+token+`"}`)
+			},
+			"a step's name": func(token string) string {
+				return jobJSON(1, "billet-lease-1", `{"number":1,"name":"`+token+`"}`)
+			},
+			"a key": func(token string) string {
+				return `{"id":1,"name":"j","runner_name":"billet-lease-1","steps":[],"` + token + `":1}`
+			},
+		} {
+			c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+				token := encode(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+				fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`, job(token))
+			})
+			_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+			if err == nil || !strings.Contains(err.Error(), "carried the request's credential") ||
+				strings.Contains(err.Error(), "installation-secret") {
+				t.Errorf("%s in %s = %v, want the answer refused unread", echo, field, err)
+			}
 		}
 	}
 }
