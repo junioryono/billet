@@ -100,9 +100,11 @@ func (a Accounting) Require() error {
 		"%s/cgroup.subtree_control` enables them for the cgroups directly below the root, the "+
 		"jailer's parent among them, and the jailer enables them below that for each microVM; "+
 		"and io needs the kernel's weight-based io policy "+
-		"(CONFIG_BLK_CGROUP_IOCOST), which an io-enabled cgroup shows as io.weight. Then run "+
-		"billet check again, or remove node.monitoring to run this node unmeasured",
-		ErrJobAccountingUnproved, strings.Join(unproved, " and "), reason, parent, root, root)
+		"(CONFIG_BLK_CGROUP_IOCOST), which an io-enabled cgroup shows as io.weight; where no "+
+		"cgroup exists below the root yet, `mkdir %s` after enabling them gives the check one "+
+		"to read. Then run billet check again, or remove node.monitoring to run this node "+
+		"unmeasured",
+		ErrJobAccountingUnproved, strings.Join(unproved, " and "), reason, parent, root, root, parent)
 }
 
 // Summary is one line for billet check.
@@ -199,35 +201,76 @@ func probeIOWeight(root string) (Controller, string) {
 		return ControllerUnknown, fmt.Sprintf("list %s: %v", root, err)
 	}
 
-	sawChild := false
+	// MISSING ONLY FROM AN AFFIRMATIVE ABSENCE: a domain child that is still
+	// there and has no io.weight proves this kernel has no weight-based io
+	// policy, because io is enabled for every child of the root. A child that
+	// could not be read leaves doubt, and one that is gone or threaded says
+	// nothing; either way another child can still prove io present.
+	absent := false
+	doubt := ""
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		sawChild = true
-		weight := filepath.Join(root, entry.Name(), "io.weight")
-		info, err := os.Stat(weight)
-		switch {
-		case err == nil && info.Mode().IsRegular():
+		switch verdict, why := probeChildIOWeight(filepath.Join(root, entry.Name())); verdict {
+		case ControllerPresent:
 			return ControllerPresent, ""
-		case err == nil:
-			// A CGROUP NAMED io.weight is a directory, not the kernel's file, and
-			// says nothing either way about this kernel's io policy.
-			return ControllerUnknown, weight + " is not the kernel's io.weight file"
-		case errors.Is(err, fs.ErrNotExist):
-			continue
+		case ControllerMissing:
+			absent = true
 		default:
-			return ControllerUnknown, fmt.Sprintf("stat %s: %v",
-				filepath.Join(root, entry.Name(), "io.weight"), err)
+			if doubt == "" {
+				doubt = why
+			}
 		}
 	}
-	if !sawChild {
-		return ControllerUnknown, "no cgroup below " + root + " to read io.weight from"
+	switch {
+	case absent:
+		return ControllerMissing, "the io controller is enabled below " + root +
+			" and a cgroup there has no io.weight, so this kernel has no weight-based io " +
+			"policy (CONFIG_BLK_CGROUP_IOCOST) and the jailer could not enable io"
+	case doubt != "":
+		return ControllerUnknown, doubt
+	default:
+		return ControllerUnknown, "no domain cgroup below " + root + " to read io.weight from"
+	}
+}
+
+// probeChildIOWeight reads whether one child of the root shows io.weight.
+// Unknown with no reason is a child that says nothing either way: gone since
+// the listing, or threaded, which has no io files of its own.
+func probeChildIOWeight(child string) (Controller, string) {
+	typ := filepath.Join(child, "cgroup.type")
+	raw, err := os.ReadFile(typ)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return ControllerUnknown, ""
+	case err != nil:
+		return ControllerUnknown, fmt.Sprintf("read %s: %v", typ, err)
+	}
+	if kind := strings.TrimSpace(string(raw)); kind != "domain" && kind != "domain threaded" {
+		return ControllerUnknown, ""
 	}
 
-	return ControllerMissing, "the io controller is enabled below " + root +
-		" and no cgroup there has io.weight, so this kernel has no weight-based io " +
-		"policy (CONFIG_BLK_CGROUP_IOCOST) and the jailer could not enable io"
+	weight := filepath.Join(child, "io.weight")
+	info, err := os.Stat(weight)
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		return ControllerPresent, ""
+	case err == nil:
+		// A CGROUP NAMED io.weight is a directory, not the kernel's file, and
+		// says nothing either way about this kernel's io policy.
+		return ControllerUnknown, weight + " is not the kernel's io.weight file"
+	case !errors.Is(err, fs.ErrNotExist):
+		return ControllerUnknown, fmt.Sprintf("stat %s: %v", weight, err)
+	}
+
+	// AND THE CHILD IS STILL THERE: one removed between the reads has no files
+	// at all, which is not an absence of io.weight.
+	if _, err := os.Stat(typ); err != nil {
+		return ControllerUnknown, ""
+	}
+
+	return ControllerMissing, ""
 }
 
 // WithJobAccounting asks the jailer to enable the memory and io controllers

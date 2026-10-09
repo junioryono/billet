@@ -10,7 +10,8 @@ import (
 )
 
 // cgroupTree writes a stub cgroup-v2 root: its controllers, its
-// subtree_control, and child directories holding the named files.
+// subtree_control, and child cgroups holding the named files, each a domain
+// cgroup (cgroup.type "domain", as every non-root cgroup has a type).
 func cgroupTree(t *testing.T, controllers, subtree string, children map[string][]string) string {
 	t.Helper()
 
@@ -27,6 +28,7 @@ func cgroupTree(t *testing.T, controllers, subtree string, children map[string][
 		if err := os.Mkdir(filepath.Join(root, child), 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", child, err)
 		}
+		write(filepath.Join(root, child, "cgroup.type"), "domain\n")
 		for _, file := range files {
 			write(filepath.Join(root, child, file), "")
 		}
@@ -92,6 +94,55 @@ func TestAccountingIsProvedPerController(t *testing.T) {
 				return root
 			},
 			memory: ControllerPresent, io: ControllerUnknown, reason: "not the kernel's io.weight file",
+		},
+		{
+			name: "a directory named io.weight does not hide a later child's file",
+			root: func(t *testing.T) string {
+				t.Helper()
+
+				root := cgroupTree(t, "cpu io memory", "cpu io memory",
+					map[string][]string{"a.slice": nil, "system.slice": {"io.weight"}})
+				if err := os.Mkdir(filepath.Join(root, "a.slice", "io.weight"), 0o700); err != nil {
+					t.Fatalf("stage: %v", err)
+				}
+
+				return root
+			},
+			memory: ControllerPresent, io: ControllerPresent,
+		},
+		{
+			name: "a threaded cgroup has no io files and proves nothing",
+			root: func(t *testing.T) string {
+				t.Helper()
+
+				root := cgroupTree(t, "cpu io memory", "cpu io memory",
+					map[string][]string{"worker": nil})
+				if err := os.WriteFile(filepath.Join(root, "worker", "cgroup.type"), []byte("threaded\n"), 0o600); err != nil {
+					t.Fatalf("stage: %v", err)
+				}
+
+				return root
+			},
+			memory: ControllerPresent, io: ControllerUnknown, reason: "no domain cgroup",
+		},
+		{
+			name: "a directory that is no longer a cgroup proves nothing",
+			root: func(t *testing.T) string {
+				t.Helper()
+
+				// Not a cgroup, even with a file named io.weight in it: only a
+				// child with a type is read.
+				root := cgroupTree(t, "cpu io memory", "cpu io memory", nil)
+				if err := os.Mkdir(filepath.Join(root, "gone.scope"), 0o700); err != nil {
+					t.Fatalf("stage: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "gone.scope", "io.weight"), nil, 0o600); err != nil {
+					t.Fatalf("stage: %v", err)
+				}
+
+				return root
+			},
+			memory: ControllerPresent, io: ControllerUnknown, reason: "no domain cgroup",
 		},
 		{
 			name: "io enabled nowhere below the root cannot be read",
@@ -228,5 +279,15 @@ func TestRequireRefusesWhatWasNotProved(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not say %q: %v", want, err)
 		}
+	}
+
+	// A HIERARCHY WITH NOTHING BELOW ITS ROOT cannot show io.weight however its
+	// controllers are set, so the remedy says to create the jailer's parent.
+	empty := cgroupTree(t, "cpu io memory", "cpu io memory", nil)
+	err = newHarness(t, withMounts(t, empty), WithJobAccounting()).p.RequireJobAccounting()
+	if !errors.Is(err, ErrJobAccountingUnproved) ||
+		!strings.Contains(err.Error(), "could not tell whether io") ||
+		!strings.Contains(err.Error(), "`mkdir "+filepath.Join(empty, "firecracker-v1.16.1")+"`") {
+		t.Errorf("an empty hierarchy = %v, want a could-not-tell refusal saying to create the jailer's parent", err)
 	}
 }

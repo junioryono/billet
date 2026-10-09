@@ -40,6 +40,7 @@ func stageCgroupHost(t *testing.T, controllers []string) (string, string) {
 		list := strings.Join(controllers, " ") + "\n"
 		write(filepath.Join(root, "cgroup.controllers"), list)
 		write(filepath.Join(root, "cgroup.subtree_control"), list)
+		write(filepath.Join(root, "system.slice", "cgroup.type"), "domain\n")
 		write(filepath.Join(root, "system.slice", "io.weight"), "default 100\n")
 	}
 

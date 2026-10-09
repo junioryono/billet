@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -39,6 +42,7 @@ var (
 		t.Helper()
 		writeStaged(t, root, "cgroup.controllers", "cpuset cpu io memory pids\n")
 		writeStaged(t, root, "cgroup.subtree_control", "cpu io memory pids\n")
+		writeStaged(t, root, "system.slice/cgroup.type", "domain\n")
 		writeStaged(t, root, "system.slice/io.weight", "default 100\n")
 	}
 	// A root that offers neither controller.
@@ -176,73 +180,178 @@ func TestANodeWithMonitoringRefusesAHostThatCannotAccountForAJob(t *testing.T) {
 }
 
 // THE NODE REFUSES BEFORE IT ACCEPTS ITS PROVIDER: Node.open calls
-// requireJobAccounting once, on the provider NewProvider built, as
-// `if err := requireJobAccounting(p); err != nil { return err }`, and only then
-// keeps it; and NewProvider builds the Firecracker provider with
-// FirecrackerOptions(cfg), the options the table above is built with.
+// requireJobAccounting once, as a statement of its own body (not inside a
+// condition or a closure), in the shape
+// `if err := requireJobAccounting(p); err != nil { return err }`, after the
+// statement that calls NewProvider and before the one that keeps the
+// provider; and NewProvider's Firecracker case returns firecracker.New with
+// FirecrackerOptions(cfg)..., the options the table above is built with.
 // Asserted on the source because OpenNode cannot build a Firecracker provider
-// without a Ceph cluster.
+// without a Ceph cluster; the checkers are themselves tested against the
+// bypasses below.
 func TestTheNodeRefusesUnprovedAccountingBeforeKeepingItsProvider(t *testing.T) {
 	t.Parallel()
 
-	open := nodeFunc(t, "node.go", "open")
+	if err := refusesBeforeKeeping(nodeFunc(t, "node.go", "open").Body); err != nil {
+		t.Errorf("Node.open: %v", err)
+	}
+	if err := returnsOptionedFirecracker(nodeFunc(t, "node.go", "NewProvider").Body); err != nil {
+		t.Errorf("NewProvider: %v", err)
+	}
+}
 
-	var built, guarded, kept token.Pos
+// AND THE CHECKERS CATCH THE BYPASSES: a refusal inside a condition or a
+// closure, a discarded error, and options built where nothing returns them.
+func TestTheRefusalCheckersCatchTheirBypasses(t *testing.T) {
+	t.Parallel()
 
-	calls := 0
+	const keep = "\tn.client, n.provider = client, p\n\treturn nil\n}"
+	const build = "func open() error {\n\tp, err := NewProvider(cfg, n.deployment)\n\tif err != nil {\n\t\treturn err\n\t}\n"
+	const guard = "\tif err := requireJobAccounting(p); err != nil {\n\t\treturn err\n\t}\n"
 
-	ast.Inspect(open.Body, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.CallExpr:
-			if id, ok := x.Fun.(*ast.Ident); ok && id.Name == "NewProvider" && !built.IsValid() {
-				built = x.Pos()
+	for _, tc := range []struct {
+		name, src string
+		ok        bool
+	}{
+		{"the production shape", build + guard + keep, true},
+		{"inside a condition", build + "\tif cfg.Node.Monitoring == nil {\n" + guard + "\t}\n" + keep, false},
+		{"inside a closure", build + "\t_ = func() error {\n" + guard + "\t\treturn nil\n\t}\n" + keep, false},
+		{"the error discarded", build + "\t_ = requireJobAccounting(p)\n" + keep, false},
+		{"after the provider is kept", build + "\tn.client, n.provider = client, p\n" + guard + "\treturn nil\n}", false},
+		{"twice, once ignored", build + guard + "\t_ = requireJobAccounting(p)\n" + keep, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := refusesBeforeKeeping(parsedFunc(t, tc.src).Body); (err == nil) != tc.ok {
+				t.Errorf("refusesBeforeKeeping = %v, want ok %v", err, tc.ok)
 			}
-			if calleeName(x) == "requireJobAccounting" {
-				calls++
+		})
+	}
+
+	const optioned = "firecracker.New(deployment, *cfg.Node.Firecracker, store, FirecrackerOptions(cfg)...)"
+	for _, tc := range []struct {
+		name, src string
+		ok        bool
+	}{
+		{"the production shape", "func NewProvider() {\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderFirecracker:\n\t\treturn " +
+			optioned + "\n\t}\n}", true},
+		{"options built and not returned", "func NewProvider() {\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderFirecracker:\n\t\t_ = func() { " +
+			optioned + " }\n\t\treturn firecracker.New(deployment, *cfg.Node.Firecracker, store)\n\t}\n}", false},
+		{"options returned for another backend", "func NewProvider() {\n\tswitch cfg.Node.Provider {\n\tcase config.ProviderDocker:\n\t\treturn " +
+			optioned + "\n\tcase config.ProviderFirecracker:\n\t\treturn firecracker.New(deployment, *cfg.Node.Firecracker, store)\n\t}\n}", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := returnsOptionedFirecracker(parsedFunc(t, tc.src).Body); (err == nil) != tc.ok {
+				t.Errorf("returnsOptionedFirecracker = %v, want ok %v", err, tc.ok)
+			}
+		})
+	}
+}
+
+// parsedFunc parses one function's source.
+func parsedFunc(t *testing.T, src string) *ast.FuncDecl {
+	t.Helper()
+
+	file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", "package app\n\n"+src+"\n", 0)
+	if err != nil {
+		t.Fatalf("parse the fixture: %v\n%s", err, src)
+	}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			return fn
+		}
+	}
+	t.Fatalf("the fixture declares no function:\n%s", src)
+
+	return nil
+}
+
+// refusesBeforeKeeping is nil when body calls requireJobAccounting exactly
+// once, as a top-level `if err := requireJobAccounting(p); err != nil { return
+// err }` between the top-level statement that calls NewProvider and the one
+// that assigns the provider.
+func refusesBeforeKeeping(body *ast.BlockStmt) error {
+	calls := 0
+	ast.Inspect(body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && calleeName(call) == "requireJobAccounting" {
+			calls++
+		}
+
+		return true
+	})
+	if calls != 1 {
+		return fmt.Errorf("requireJobAccounting is called %d times, want once", calls)
+	}
+
+	built, guarded, kept := -1, -1, -1
+	for i, stmt := range body.List {
+		switch x := stmt.(type) {
+		case *ast.AssignStmt:
+			for _, rhs := range x.Rhs {
+				if call, ok := rhs.(*ast.CallExpr); ok && calleeName(call) == "NewProvider" && built < 0 {
+					built = i
+				}
+			}
+			for _, lhs := range x.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "provider" && kept < 0 {
+					kept = i
+				}
 			}
 		case *ast.IfStmt:
 			if refusesWith(x, "requireJobAccounting", "p") {
-				guarded = x.Pos()
-			}
-		case *ast.AssignStmt:
-			for _, lhs := range x.Lhs {
-				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "provider" {
-					kept = x.Pos()
-				}
+				guarded = i
 			}
 		}
-
-		return true
-	})
-
-	if calls != 1 || !built.IsValid() || !guarded.IsValid() || !kept.IsValid() ||
-		guarded < built || guarded > kept {
-		t.Errorf("Node.open must call requireJobAccounting once, as `if err := "+
-			"requireJobAccounting(p); err != nil { return err }` after NewProvider and before "+
-			"keeping the provider (calls %d, NewProvider %v, guarded %v, n.provider %v)",
-			calls, built.IsValid(), guarded.IsValid(), kept.IsValid())
+	}
+	if built < 0 || guarded < 0 || kept < 0 || guarded < built || guarded > kept {
+		return fmt.Errorf("want NewProvider, then `if err := requireJobAccounting(p); err != nil { "+
+			"return err }`, then the provider kept, each a statement of the body (at %d, %d, %d)",
+			built, guarded, kept)
 	}
 
-	optioned := false
+	return nil
+}
 
-	ast.Inspect(nodeFunc(t, "node.go", "NewProvider").Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || !namesSelector(call.Fun, "firecracker", "New") || !call.Ellipsis.IsValid() {
+// returnsOptionedFirecracker is nil when the switch case naming
+// config.ProviderFirecracker returns firecracker.New(..., FirecrackerOptions(cfg)...)
+// as a statement of its own body.
+func returnsOptionedFirecracker(body *ast.BlockStmt) error {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		clause, ok := n.(*ast.CaseClause)
+		if !ok || !slices.ContainsFunc(clause.List, func(e ast.Expr) bool {
+			return namesSelector(e, "config", "ProviderFirecracker")
+		}) {
 			return true
 		}
-		last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
-		if ok && calleeName(last) == "FirecrackerOptions" && len(last.Args) == 1 {
+		for _, stmt := range clause.Body {
+			ret, ok := stmt.(*ast.ReturnStmt)
+			if !ok || len(ret.Results) == 0 {
+				continue
+			}
+			call, ok := ret.Results[0].(*ast.CallExpr)
+			if !ok || !namesSelector(call.Fun, "firecracker", "New") || !call.Ellipsis.IsValid() {
+				continue
+			}
+			last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
+			if !ok || calleeName(last) != "FirecrackerOptions" || len(last.Args) != 1 {
+				continue
+			}
 			if arg, ok := last.Args[0].(*ast.Ident); ok && arg.Name == "cfg" {
-				optioned = true
+				found = true
 			}
 		}
 
 		return true
 	})
-
-	if !optioned {
-		t.Error("NewProvider does not build the Firecracker provider with FirecrackerOptions(cfg)...")
+	if !found {
+		return errors.New("the Firecracker case does not return firecracker.New(..., FirecrackerOptions(cfg)...)")
 	}
+
+	return nil
 }
 
 // refusesWith reports whether stmt is exactly `if err := fn(arg); err != nil {
