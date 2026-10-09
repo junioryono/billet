@@ -85,7 +85,7 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Recv != nil || !isFuzzName(fn.Name.Name) || fn.Type.TypeParams != nil ||
-				fn.Type.Results != nil || !takesTestingF(fn, names, dot) {
+				fn.Type.Results.NumFields() > 0 || !takesTestingF(fn, names, dot) {
 				continue
 			}
 
@@ -127,10 +127,15 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	}
 }
 
-// nightly is the platform the nightly fuzz workflow runs on.
+// nightly is the build the nightly fuzz workflow makes: linux/amd64 at the
+// default GOAMD64 level, without cgo (billet builds with CGO_ENABLED=0
+// everywhere). The release tags stay this toolchain's, which go.mod pins for
+// both.
 var nightly = func() gobuild.Context {
 	ctx := gobuild.Default
 	ctx.GOOS, ctx.GOARCH = "linux", "amd64"
+	ctx.ToolTags = []string{"amd64.v1"}
+	ctx.CgoEnabled = false
 
 	return ctx
 }()
