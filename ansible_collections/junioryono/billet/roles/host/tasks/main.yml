@@ -547,9 +547,6 @@
     - name: Configure or remove Ceph health alerts
       ansible.builtin.import_tasks: alerts.yml
 
-    - name: Configure or remove uplink shaping
-      ansible.builtin.import_tasks: uplink-shaping.yml
-
     - name: Configure or remove the guest image refresh timer
       ansible.builtin.import_tasks: images-refresh.yml
 
@@ -559,6 +556,13 @@
 
     - name: Configure billet services
       ansible.builtin.import_tasks: services.yml
+
+    # AFTER THE SERVICES, so a restart runs the billet this converge installed;
+    # and not on a retiring node's retained converge, whose writes are admitted
+    # one by one and which has no need of it.
+    - name: Configure or remove uplink shaping
+      ansible.builtin.import_tasks: uplink.yml
+      when: not billet_retirement_node_ordinary | bool
 
     # THE ROLE RELOADED THE MANAGER WHEN IT STARTED (account.yml); every enable,
     # disable or mask of this run notifies the closing reload (handlers/main.yml),

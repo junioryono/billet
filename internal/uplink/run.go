@@ -1,0 +1,170 @@
+package uplink
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+)
+
+// DefaultReflectors answer ICMP from anywhere and are run by three different
+// operators, so the median of their delays is the line's and not one network's.
+var DefaultReflectors = []string{"1.1.1.1", "1.0.0.1", "8.8.8.8", "9.9.9.9"}
+
+// Tick is how often the loop measures and adjusts.
+const Tick = 500 * time.Millisecond
+
+// rateWindow is how far back what an interface moved is measured. Drivers
+// update their byte counters on their own schedule, and on the reference node a
+// half-second difference read 1478 Mbit/s on a 1 Gbit/s link: two updates' worth
+// in one tick. Over two seconds the lumps average out.
+const rateWindow = 2 * time.Second
+
+// fallbackSpeed is the starting rate for an interface whose speed the kernel
+// does not report, in Mbit/s: high enough to hold nothing back on any line.
+const fallbackSpeed = 10000
+
+// Options are what Run shapes and how.
+type Options struct {
+	// Iface is the interface to shape; empty means the default route's.
+	Iface      string
+	Reflectors []string
+	Params     Params
+	Log        *slog.Logger
+}
+
+// Run shapes the uplink until ctx ends, and removes the shaping as it returns.
+func Run(ctx context.Context, opts Options) error {
+	iface := opts.Iface
+	if iface == "" {
+		found, err := DefaultInterface()
+		if err != nil {
+			return err
+		}
+
+		iface = found
+	}
+
+	reflectors := opts.Reflectors
+	if len(reflectors) == 0 {
+		reflectors = DefaultReflectors
+	}
+
+	pinger, err := NewPinger(reflectors)
+	if err != nil {
+		return err
+	}
+	defer pinger.Close() //nolint:errcheck // a socket closed on the way out has nothing left to say
+
+	speed := Speed(iface)
+	if speed == 0 {
+		speed = fallbackSpeed
+	}
+
+	ctl := &Controller{Params: opts.Params, Up: NewDirection(speed), Down: NewDirection(speed)}
+	shaper := &Shaper{Iface: iface}
+
+	if err := shaper.Install(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
+		return fmt.Errorf("install CAKE on %s: %w", iface, err)
+	}
+	defer shaper.Clear(context.WithoutCancel(ctx))
+
+	opts.Log.Info("shaping the uplink; each direction starts at the interface's speed and is cut "+
+		"only when its own traffic raises the latency to the reflectors",
+		"interface", iface, "start_mbit", speed, "reflectors", reflectors, "bloat", opts.Params.Bloat)
+
+	return loop(ctx, opts.Log, iface, pinger, ctl, shaper)
+}
+
+func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, ctl *Controller, shaper *Shaper) error {
+	var delays Delays
+
+	first, err := ReadCounters(iface)
+	if err != nil {
+		return err
+	}
+
+	history := []reading{{at: time.Now(), counters: first}}
+	applied := [2]float64{ctl.Up.Rate, ctl.Down.Rate}
+	ticker := time.NewTicker(Tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+
+		answered, err := pinger.Round(ctx, Tick*8/10)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+
+			return err
+		}
+
+		delay, known := delays.Observe(pinger.Reflectors(), answered)
+
+		now, err := ReadCounters(iface)
+		if err != nil {
+			return err
+		}
+
+		at := time.Now()
+		history = append(history, reading{at: at, counters: now})
+
+		// THE OLDEST READING STILL INSIDE THE WINDOW, keeping one at its edge so
+		// the span is never shorter than the window once it has filled.
+		for len(history) > 2 && at.Sub(history[1].at) >= rateWindow {
+			history = history[1:]
+		}
+
+		oldest := history[0]
+		interval := at.Sub(oldest.at)
+		sent, received := now.Since(oldest.counters)
+
+		if !ctl.Step(Observation{At: at, Interval: interval, SentBits: sent,
+			ReceivedBits: received, Delay: delay, DelayKnown: known}) {
+			continue
+		}
+
+		if !worthApplying(applied, ctl) {
+			continue
+		}
+
+		if err := shaper.Set(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
+			return fmt.Errorf("change CAKE's rate on %s: %w", iface, err)
+		}
+
+		if ctl.Up.Rate < applied[0] || ctl.Down.Rate < applied[1] {
+			log.Info("the line's queue rose under this host's traffic; cut",
+				"up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
+				"moving_up_mbit", round(float64(sent)/interval.Seconds()/1e6),
+				"moving_down_mbit", round(float64(received)/interval.Seconds()/1e6), "delay", delay)
+		}
+
+		applied = [2]float64{ctl.Up.Rate, ctl.Down.Rate}
+	}
+}
+
+// reading is an interface's counters at a moment.
+type reading struct {
+	at       time.Time
+	counters Counters
+}
+
+// worthApplying is whether the rates moved enough to tell tc: every cut, and a
+// rise only once it is two percent, so probing upward is not a command a tick.
+func worthApplying(applied [2]float64, ctl *Controller) bool {
+	for i, rate := range []float64{ctl.Up.Rate, ctl.Down.Rate} {
+		if rate < applied[i] || rate > applied[i]*1.02 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func round(mbit float64) float64 { return float64(int64(mbit*10)) / 10 }

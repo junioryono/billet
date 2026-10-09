@@ -102,10 +102,6 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/network.yml / Predict the billet network service change | const:/etc/systemd/system/billet-network.service |
 | tasks/network.yml / Inspect whether the billet node unit exists | parity:read-only systemd/IP observation with exact argv bound |
 | tasks/network.yml / Drain billet compute before changing guest networking | parity:shared node stop or node-owned networking service lifecycle (R7.3) |
-| tasks/uplink-shaping.yml / Install the uplink shaping unit | const:/etc/systemd/system/billet-uplink-shaping.service |
-| tasks/uplink-shaping.yml / Apply the uplink shaping | parity:host-owned uplink shaping lifecycle; the interface and both rates are validated in validate-interpreted-inputs.yml |
-| tasks/uplink-shaping.yml / Stop the uplink shaping | parity:host-owned uplink shaping lifecycle; the interface and both rates are validated in validate-interpreted-inputs.yml |
-| tasks/uplink-shaping.yml / Remove the uplink shaping unit | const:/etc/systemd/system/billet-uplink-shaping.service |
 | tasks/request-node-drain.yml / Ask every billet node process that stops during this operation to drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
 | tasks/release-node-drain.yml / Withdraw the request that billet node stops drain | parity:node drain request before a node stop that must drain; held for the whole operation in /var/run/billet-node-drain, which every stopping node process reads (#374) |
 | tasks/services.yml / Inspect the billet node a host that may not run one still has | parity:read-only systemd/IP observation with exact argv bound |

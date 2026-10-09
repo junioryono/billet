@@ -1,0 +1,61 @@
+---
+# A HOST THAT SHARES ITS SITE'S INTERNET LINE KEEPS ITS OWN TRAFFIC FROM FILLING
+# IT (shared-uplink record, 2026-10-08). `billet uplink shape` shapes the default
+# route's interface with CAKE, starting at the interface's own speed, and cuts a
+# direction only when its own traffic raises the latency to public reflectors,
+# so on a line nothing fills it changes nothing. On by default for that reason;
+# billet_uplink_shaping: false removes it.
+- name: Inspect the uplink shaping unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/billet-uplink.service
+  register: billet_uplink_unit
+  become: true
+
+- name: Shape this host's share of the uplink
+  when: billet_uplink_shaping | bool
+  block:
+    - name: Install the uplink shaping unit
+      ansible.builtin.template:
+        src: billet-uplink.service.j2
+        dest: /etc/systemd/system/billet-uplink.service
+        owner: root
+        group: root
+        mode: "0644"
+      register: billet_uplink_install
+      become: true
+      notify: Reload systemd
+
+    - name: Apply the uplink shaping unit change
+      ansible.builtin.meta: flush_handlers
+
+    # RESTARTED WHEN THE UNIT OR THE BINARY CHANGED, so the shaper runs the
+    # billet this converge installed; its stop clears the old shaping first.
+    - name: Run the uplink shaper
+      ansible.builtin.systemd_service:
+        name: billet-uplink.service
+        enabled: true
+        state: >-
+          {{ 'restarted' if (billet_uplink_install.changed or (billet_binary_upgrade | default(false)))
+             else 'started' }}
+      when: not ansible_check_mode
+      become: true
+
+- name: Remove uplink shaping that is no longer asked for
+  when:
+    - not (billet_uplink_shaping | bool)
+    - billet_uplink_unit.stat.exists
+  block:
+    - name: Stop the uplink shaper
+      ansible.builtin.systemd_service:
+        name: billet-uplink.service
+        enabled: false
+        state: stopped
+      when: not ansible_check_mode
+      become: true
+
+    - name: Remove the uplink shaping unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/billet-uplink.service
+        state: absent
+      become: true
+      notify: Reload systemd

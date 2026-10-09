@@ -22,7 +22,7 @@ You supply what it cannot safely guess:
 | `billet_config` | the whole `billet.yaml`, which `billet init --provider firecracker --emit ansible` prints for you |
 | `billet_github_private_key_src` | the App key created by `billet github-app create` |
 | `billet_networks`, `billet_guest_dns_servers`, `billet_guest_dns_cache_size`, `billet_guest_dns_forward_max` | the bridges, what guests may reach, and how much the bridge's resolver holds and forwards; the defaults suit a compute host behind one shared uplink (see [the shared-uplink record](../reference/records/shared-uplink.md)) |
-| `billet_uplink_shaping` | off by default; on a site where the fleet shares its internet line with people, the uplink interface and a rate each way below the line's own, so the host's bursts never fill the gateway's queue (see below) |
+| `billet_uplink_shaping` | on by default: keeps the host's traffic from filling its site's internet line, adjusting itself with no rate to configure; `false` turns it off (see below) |
 | `billet_ceph_*` | client credentials, or the explicit bootstrap facts |
 | `billet_ledger_volume_id` | on AWS, the module's ledger volume, mounted fail-closed |
 | `billet_firecracker_version` and checksums | the Firecracker release to install |
@@ -88,18 +88,9 @@ A second Linux host at the same site maps the same pools, reuses the generations
 
 ## Sharing a site's internet line
 
-A node shares its site's internet line with whoever else is there. A fleet of guests pulls images and caches in bursts at whatever the line carries, and a residential or office gateway holds one queue for everybody: while it is full, a call stutters and a game lags. Measured at the reference deployment on a 500 Mbit/s line, the node moving 378 Mbit/s down and 180 up gave 2.5% loss and latency from 7 to 29 ms to every device at the site, and no loss once the node was held to 400 each way.
+A node shares its site's internet line with whoever else is there. A fleet of guests pulls images and caches in bursts at whatever the line carries, and a residential or office gateway holds one queue for everybody: while it is full, a call stutters and a game lags. Measured at the reference deployment on a 500 Mbit/s line, the node moving 378 Mbit/s down and 180 up gave 2.5% loss and latency from 7 to 29 ms to every device at the site.
 
-Set `billet_uplink_shaping` and the role installs `billet-uplink-shaping.service`, which shapes the host's own traffic, guests included, with CAKE in both directions:
-
-```yaml
-billet_uplink_shaping:
-  interface: eno1      # the interface the default route leaves by
-  egress_mbit: 400     # somewhat below the line's upload
-  ingress_mbit: 400    # somewhat below the line's download
-```
-
-Choose rates below the line's own so the queue stays on this host, where CAKE keeps it short and shares it fairly between guests, and leave the rest of the site its share. Anything else the interface carries, LAN traffic included, is held to the same rates. Removing the variable removes the unit and the shaping. [The shared-uplink record](../reference/records/shared-uplink.md) has the measurements.
+The role runs [`billet uplink shape`](../reference/cli.md) as `billet-uplink.service` on every host unless `billet_uplink_shaping: false`. It shapes the default route's interface with CAKE in both directions, starting at the interface's own speed, which holds nothing back. Twice a second it measures the round trip to public reflectors and what the host is moving each way. When the round trip rises well above its idle baseline while one direction is busy, that direction is cut to just below what it was moving, and while a direction runs at its rate with no queue the rate climbs back. There is no line speed to look up and nothing to retune when the line changes: on a line the host never fills it never cuts. Its decisions are in the unit's journal (`journalctl -u billet-uplink`). [The shared-uplink record](../reference/records/shared-uplink.md) has the measurements.
 
 ## What a node costs the host
 
