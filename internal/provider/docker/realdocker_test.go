@@ -257,9 +257,12 @@ func TestRealDockerListSeesStoppedContainers(t *testing.T) {
 
 // A REAL CONTAINER'S OWN eth0 IS READ FROM THE HOST, through the target the
 // provider makes and the reader the sampler uses, without entering its
-// namespace; and it is that container's: what the container itself reads on
-// eth0 a moment later is never less. Linux only, since the host's /proc is
-// what is read.
+// namespace; and it is that container's eth0, counted from inside. The
+// container pings its gateway with 1000-byte payloads first, so its eth0 has
+// sent and received bytes no idle interface (and no loopback) has, and the
+// host's reading must fall between two the container takes of its own eth0,
+// one just before and one just after, on all four counters. Linux only, since
+// the host's /proc is what is read.
 func TestRealDockerContainerNetworkIsMeasured(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker is not installed")
@@ -284,32 +287,62 @@ func TestRealDockerContainerNetworkIsMeasured(t *testing.T) {
 		t.Fatalf("Launch against real docker: %v", err)
 	}
 
+	gateway, err := exec.CommandContext(t.Context(), "docker", "inspect", "--format",
+		"{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", inst.ID).Output()
+	if err != nil || strings.TrimSpace(string(gateway)) == "" {
+		t.Fatalf("the container's gateway: %q, %v", gateway, err)
+	}
+	if out, err := exec.CommandContext(t.Context(), "docker", "exec", inst.ID, "ping", "-c", "5", "-s", "1000",
+		strings.TrimSpace(string(gateway))).CombinedOutput(); err != nil {
+		t.Fatalf("ping the gateway from the container: %v\n%s", err, out)
+	}
+
+	inside := func() [4]int64 {
+		t.Helper()
+
+		out, err := exec.CommandContext(t.Context(), "docker", "exec", inst.ID, "cat", "/proc/net/dev").Output()
+		if err != nil {
+			t.Fatalf("read eth0 inside the container: %v", err)
+		}
+		for line := range strings.SplitSeq(string(out), "\n") {
+			iface, counters, ok := strings.Cut(line, ":")
+			if !ok || strings.TrimSpace(iface) != "eth0" {
+				continue
+			}
+			fields := strings.Fields(counters)
+			var v [4]int64
+			for i, field := range []int{0, 8, 1, 9} {
+				if v[i], err = strconv.ParseInt(fields[field], 10, 64); err != nil {
+					t.Fatalf("eth0 inside the container: %v", err)
+				}
+			}
+
+			return v
+		}
+		t.Fatalf("the container has no eth0:\n%s", out)
+
+		return [4]int64{}
+	}
+
+	before := inside()
 	target, err := p.UsageTarget(t.Context(), inst.ID)
 	if err != nil {
 		t.Fatalf("UsageTarget: %v", err)
 	}
 	s := usage.Reader{Root: "/"}.Read(usage.Target{CgroupDir: target.CgroupDir, PID: target.PID,
 		PIDStart: target.PIDStart, NetDevice: target.NetDevice, NetNamespace: target.NetNamespace})
+	after := inside()
+
 	if !s.NetOK || !s.CPUOK {
 		t.Fatalf("a live container read net %v cpu %v, want both measured (target %+v)", s.NetOK, s.CPUOK, target)
 	}
-
-	out, err := exec.CommandContext(t.Context(), "docker", "exec", inst.ID, "cat", "/proc/net/dev").Output()
-	if err != nil {
-		t.Fatalf("read eth0 inside the container: %v", err)
-	}
-	for line := range strings.SplitSeq(string(out), "\n") {
-		name, counters, ok := strings.Cut(line, ":")
-		if !ok || strings.TrimSpace(name) != "eth0" {
-			continue
+	host := [4]int64{s.NetRx, s.NetTx, s.NetRxPackets, s.NetTxPackets}
+	for i, counter := range []string{"rx bytes", "tx bytes", "rx packets", "tx packets"} {
+		if host[i] < before[i] || host[i] > after[i] {
+			t.Errorf("%s read %d from the host, outside the container's own %d..%d", counter, host[i], before[i], after[i])
 		}
-		fields := strings.Fields(counters)
-		inside, err := strconv.ParseInt(fields[0], 10, 64)
-		if err != nil || inside < s.NetRx {
-			t.Errorf("the container read eth0 rx %v (%v) after the host read %d; not its eth0", inside, err, s.NetRx)
-		}
-
-		return
 	}
-	t.Errorf("the container has no eth0:\n%s", out)
+	if s.NetTx < 5*1000 || s.NetRx < 5*1000 {
+		t.Errorf("rx %d tx %d after five 1000-byte pings each way; not the interface that carried them", s.NetRx, s.NetTx)
+	}
 }

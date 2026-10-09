@@ -24,21 +24,38 @@ const containerInterface = "eth0"
 // UsageTarget says where a running container's counters are: the cgroup its
 // init process is in, read from /proc, so the answer is the same under
 // Docker's systemd driver (system.slice/docker-<id>.scope) and its cgroupfs
-// driver (docker/<id>); and its eth0, read through that process's
-// /proc/<pid>/net/dev, which is the table of the container's own network
-// namespace, so the host never enters it and never has to guess which veth
-// is the container's.
+// driver (docker/<id>); and, for a container with a network namespace of its
+// own, its eth0, read through that process's /proc/<pid>/net/dev, which is
+// the namespace's own table, so the host never enters it and never has to
+// guess which veth is the container's.
 func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider.UsageTarget, error) {
-	out, err := p.run(ctx, "inspect", "--format", "{{.State.Pid}}", instanceID)
+	out, err := p.run(ctx, "inspect", "--format", "{{.State.Pid}} {{.HostConfig.NetworkMode}}", instanceID)
 	if err != nil {
 		return provider.UsageTarget{}, err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil || pid <= 0 {
+	fields := strings.Fields(out)
+	pid := 0
+	if len(fields) > 0 {
+		pid, err = strconv.Atoi(fields[0])
+	}
+	if len(fields) == 0 || err != nil || pid <= 0 {
 		return provider.UsageTarget{}, fmt.Errorf("docker: container %s has no running process to measure", instanceID)
 	}
+	mode := ""
+	if len(fields) == 2 {
+		mode = fields[1]
+	}
 
-	return p.usageTargetOf(instanceID, pid)
+	return p.usageTargetOf(instanceID, pid, mode)
+}
+
+// ownsNetwork reports whether a container in network mode mode has a network
+// namespace of its own: the default bridge or a named network. host and
+// another container's namespace (container:<id>, or a path, ns:<path>) carry
+// traffic that is not this job's, none has nothing to count, and a mode that
+// could not be read is not proved to be either.
+func ownsNetwork(mode string) bool {
+	return mode != "" && mode != "host" && mode != "none" && !strings.Contains(mode, ":")
 }
 
 // usageTargetOf proves pid is container instanceID's init and says where its
@@ -49,7 +66,11 @@ func (p *Provider) UsageTarget(ctx context.Context, instanceID string) (provider
 // point, and a start read from a process that took the pid would let every
 // later sample prove that process is the container. Both proofs naming the
 // same cgroup is what makes the start the container's.
-func (p *Provider) usageTargetOf(instanceID string, pid int) (provider.UsageTarget, error) {
+//
+// THE NETWORK IS COUNTED ONLY IN A NAMESPACE OF THE CONTAINER'S OWN
+// (ownsNetwork): a container started in the host's or another container's
+// namespace passes every pid proof, and its eth0 is someone else's traffic.
+func (p *Provider) usageTargetOf(instanceID string, pid int, networkMode string) (provider.UsageTarget, error) {
 	rel, err := p.containerCgroup(instanceID, pid)
 	if err != nil {
 		return provider.UsageTarget{}, err
@@ -64,13 +85,12 @@ func (p *Provider) usageTargetOf(instanceID string, pid int) (provider.UsageTarg
 			"was being read", instanceID, pid)
 	}
 
-	return provider.UsageTarget{
-		CgroupDir:    filepath.Join(cgroupMount, rel),
-		PID:          pid,
-		PIDStart:     start,
-		NetDevice:    containerInterface,
-		NetNamespace: true,
-	}, nil
+	target := provider.UsageTarget{CgroupDir: filepath.Join(cgroupMount, rel), PID: pid, PIDStart: start}
+	if ownsNetwork(networkMode) {
+		target.NetDevice, target.NetNamespace = containerInterface, true
+	}
+
+	return target, nil
 }
 
 // containerCgroup is pid's cgroup-v2 path, refused unless it names the

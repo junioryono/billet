@@ -115,52 +115,68 @@ func (m *startedMonitor) Forget(string)                      {}
 // EVERY FIELD A BACKEND SAYS REACHES THE SAMPLER. The provider's target and the
 // sampler's are two structs with the same fields, and one the conversion drops
 // is a group silently never measured (a container's network namespace, say).
-// Every field is set to a value distinct from its zero, and each must arrive
-// under the same name with the same value.
+// Every field is set to a value distinct from its zero and its neighbours',
+// and each must arrive under the same name with the same value; the boolean
+// fields are set one at a time, so one copied from another is seen too.
 func TestEveryFieldOfAUsageTargetReachesTheSampler(t *testing.T) {
-	var want provider.UsageTarget
-	from := reflect.ValueOf(&want).Elem()
-	for i := range from.NumField() {
-		switch f := from.Field(i); f.Kind() {
-		case reflect.String:
-			f.SetString("value-" + from.Type().Field(i).Name)
-		case reflect.Int:
-			f.SetInt(int64(1000 + i))
-		case reflect.Uint64:
-			f.SetUint(uint64(2000 + i))
-		case reflect.Bool:
-			f.SetBool(true)
-		default:
-			t.Fatalf("provider.UsageTarget.%s is a %s this test cannot fill", from.Type().Field(i).Name, f.Kind())
+	typ := reflect.TypeFor[provider.UsageTarget]()
+
+	var bools []int
+	for i := range typ.NumField() {
+		if typ.Field(i).Type.Kind() == reflect.Bool {
+			bools = append(bools, i)
 		}
 	}
-
-	p := &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, target: &want}
-	a, host := newAllocatorWithHost(t)
-	monitor := &startedMonitor{}
-	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithMonitor(monitor))
-
-	lease := assignedLease(t, a)
-	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-	if len(monitor.targets) != 1 {
-		t.Fatalf("the monitor was started %d times, want once", len(monitor.targets))
+	if len(bools) == 0 {
+		bools = []int{-1}
 	}
 
-	got := reflect.ValueOf(monitor.targets[0])
-	if got.NumField() != from.NumField() {
-		t.Errorf("usage.Target has %d fields and provider.UsageTarget %d", got.NumField(), from.NumField())
-	}
-	for i := range from.NumField() {
-		name := from.Type().Field(i).Name
-		field := got.FieldByName(name)
-		if !field.IsValid() {
-			t.Errorf("usage.Target has no %s", name)
-			continue
+	for _, only := range bools {
+		var want provider.UsageTarget
+		from := reflect.ValueOf(&want).Elem()
+		for i := range from.NumField() {
+			switch f := from.Field(i); f.Kind() {
+			case reflect.String:
+				f.SetString("value-" + typ.Field(i).Name)
+			case reflect.Int:
+				f.SetInt(int64(1000 + i))
+			case reflect.Uint64:
+				f.SetUint(uint64(2000 + i))
+			case reflect.Bool:
+				f.SetBool(i == only)
+			default:
+				t.Fatalf("provider.UsageTarget.%s is a %s this test cannot fill", typ.Field(i).Name, f.Kind())
+			}
 		}
-		if !reflect.DeepEqual(field.Interface(), from.Field(i).Interface()) {
-			t.Errorf("%s reached the sampler as %v, want %v", name, field.Interface(), from.Field(i).Interface())
+
+		p := &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, target: &want}
+		a, host := newAllocatorWithHost(t)
+		monitor := &startedMonitor{}
+		r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithMonitor(monitor))
+
+		lease := assignedLease(t, a)
+		if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		if len(monitor.targets) != 1 {
+			t.Fatalf("the monitor was started %d times, want once", len(monitor.targets))
+		}
+
+		got := reflect.ValueOf(monitor.targets[0])
+		if got.NumField() != from.NumField() {
+			t.Errorf("usage.Target has %d fields and provider.UsageTarget %d", got.NumField(), from.NumField())
+		}
+		for i := range from.NumField() {
+			name := typ.Field(i).Name
+			field := got.FieldByName(name)
+			if !field.IsValid() {
+				t.Errorf("usage.Target has no %s", name)
+
+				continue
+			}
+			if !reflect.DeepEqual(field.Interface(), from.Field(i).Interface()) {
+				t.Errorf("%s reached the sampler as %v, want %v", name, field.Interface(), from.Field(i).Interface())
+			}
 		}
 	}
 }

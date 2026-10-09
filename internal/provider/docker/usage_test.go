@@ -90,7 +90,7 @@ func TestAContainersTargetNamesItsNetworkThroughItsInit(t *testing.T) {
 	p := containerProc(t, pid, "0::/system.slice/docker-3a8a1ae66dc2.scope\n",
 		func() (uint64, error) { return 186542363, nil })
 
-	got, err := p.usageTargetOf(id, pid)
+	got, err := p.usageTargetOf(id, pid, "bridge")
 	if err != nil {
 		t.Fatalf("usageTargetOf: %v", err)
 	}
@@ -100,6 +100,34 @@ func TestAContainersTargetNamesItsNetworkThroughItsInit(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("usageTargetOf = %+v, want %+v", got, want)
+	}
+}
+
+// ONLY A NAMESPACE OF ITS OWN IS COUNTED: a container in the host's network,
+// another container's, a named one or none passes every pid proof, and its
+// eth0 is not this job's traffic, so its network is left unmeasured while its
+// cgroup is still read.
+func TestAContainerSharingANetworkNamespaceHasItsNetworkUnmeasured(t *testing.T) {
+	const id, pid = "3a8a1ae66dc2", 4159321
+	for mode, owns := range map[string]bool{
+		"default": true, "bridge": true, "billet-builds": true,
+		"host": false, "none": false, "container:4f1c0ffee": false, "ns:/proc/1/ns/net": false, "": false,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			p := containerProc(t, pid, "0::/docker/3a8a1ae66dc2\n", func() (uint64, error) { return 186542363, nil })
+
+			got, err := p.usageTargetOf(id, pid, mode)
+			if err != nil {
+				t.Fatalf("usageTargetOf: %v", err)
+			}
+			if got.CgroupDir != "/sys/fs/cgroup/docker/3a8a1ae66dc2" {
+				t.Errorf("the cgroup is %q, want the container's whatever its network", got.CgroupDir)
+			}
+			if measured := got.NetNamespace || got.NetDevice != ""; measured != owns {
+				t.Errorf("network mode %q: net device %q namespace %v, want measured %v",
+					mode, got.NetDevice, got.NetNamespace, owns)
+			}
+		})
 	}
 }
 
@@ -141,7 +169,7 @@ func TestAContainersTargetIsRefusedForAPidItCannotProve(t *testing.T) {
 				return start, err
 			})
 
-			got, err := p.usageTargetOf(id, pid)
+			got, err := p.usageTargetOf(id, pid, "bridge")
 			if err == nil || !strings.Contains(err.Error(), tc.says) {
 				t.Fatalf("usageTargetOf = %+v, %v; want a refusal saying %q", got, err, tc.says)
 			}

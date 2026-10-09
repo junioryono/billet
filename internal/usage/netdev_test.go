@@ -1,7 +1,11 @@
 package usage
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -101,6 +105,10 @@ func TestAContainersNetworkIsNotReadThroughAPidItCannotProve(t *testing.T) {
 		}},
 		{"a start that cannot be read", func(tr tree, _ *Target) { tr.remove("/proc/4159321/stat") }},
 		{"a target with no start", func(_ tree, target *Target) { target.PIDStart = 0 }},
+		{"a zero start on both sides", func(tr tree, target *Target) {
+			tr.write("/proc/4159321/stat", strings.Replace(refContainerStat, " 186542363 ", " 0 ", 1)+"\n")
+			target.PIDStart = 0
+		}},
 		{"a target with no pid", func(_ tree, target *Target) { target.PID = 0 }},
 		{"eth0 absent", func(tr tree, _ *Target) {
 			tr.write("/proc/4159321/net/dev", strings.ReplaceAll(refNetDev, "eth0", "eth9"))
@@ -115,5 +123,47 @@ func TestAContainersNetworkIsNotReadThroughAPidItCannotProve(t *testing.T) {
 				t.Errorf("net = ok %v rx %d tx %d, want unmeasured", s.NetOK, s.NetRx, s.NetTx)
 			}
 		})
+	}
+}
+
+// AND THE CHECK COMES AFTER THE READ: a pid that changes hands while its table
+// is being read is caught. The table is a pipe whose writer replaces the
+// stat's start before it lets the read finish, so a start checked before the
+// read would still match.
+func TestAPidReusedDuringTheNetworkReadIsNotTheContainers(t *testing.T) {
+	tr, target := referenceContainer(t)
+	table := filepath.Join(tr.root, "proc", "4159321", "net", "dev")
+	tr.remove("/proc/4159321/net/dev")
+	if err := syscall.Mkfifo(table, 0o600); err != nil {
+		t.Fatalf("make the table a pipe: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		// Blocks until the reader opens the table.
+		f, err := os.OpenFile(table, os.O_WRONLY, 0)
+		if err != nil {
+			done <- err
+
+			return
+		}
+		reused := strings.Replace(refContainerStat, " 186542363 ", " 186599999 ", 1) + "\n"
+		werr := os.WriteFile(filepath.Join(tr.root, "proc", "4159321", "stat"), []byte(reused), 0o600)
+		_, err = f.WriteString(refNetDev)
+		done <- errors.Join(werr, err, f.Close())
+	}()
+
+	s := Reader{Root: tr.root}.Read(target)
+
+	// A reader that never opened the table leaves the writer waiting; opening it
+	// here lets the writer finish either way.
+	if f, err := os.OpenFile(table, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+		_ = f.Close()
+	}
+	if err := <-done; err != nil && !errors.Is(err, syscall.EPIPE) {
+		t.Fatalf("stage the reuse: %v", err)
+	}
+	if s.NetOK || s.NetRx != 0 {
+		t.Errorf("net = ok %v rx %d after the pid changed hands during the read, want unmeasured", s.NetOK, s.NetRx)
 	}
 }
