@@ -167,6 +167,14 @@ server:
   #   allow_remote: false
   #   pprof: false
 
+  # Keep the last two minutes of the controller's execution trace in memory,
+  # and write them under <identity_dir>/flight-recorder when a heartbeat pass is
+  # still running as the next falls due, or when another controller takes the
+  # claim. At most one file per reason every ten minutes, and the four newest
+  # are kept. Read one with `go tool trace`. Off by default.
+  #
+  # flight_recorder: false
+
   # Hard ceiling on what the allocator will hand out across every tier combined.
   # Capacity is escrowed before each scale-set listener advertises to GitHub, so
   # this is what stops concurrent tiers from collectively overcommitting the box.

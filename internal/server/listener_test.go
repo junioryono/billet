@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -2313,227 +2314,127 @@ func newBareAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 // as one lasts, the reaper terminalises the leases, and the poll returns an
 // assignment backed by a lease this listener no longer holds.
 func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
-	// THE CLOCK IS THE TEST'S, NOT THE MACHINE'S. An earlier version slept for
-	// five TTLs and let the listener's heartbeat ticker race a real-time reaper;
-	// it passed alone and failed under a loaded CI runner (#35), because the
-	// property is arithmetic on a clock and a wall-clock sleep only measures how
-	// busy the machine was. Both sides of the property read the allocator's
-	// clock: the reaper expires against it and a renewal stamps with it, so
-	// moving it is what a long poll IS as far as the ledger is concerned.
-	//
-	// AND LONG, because one thing here is still on the wall clock: each pass's
-	// budget is a third of the TTL. At 600ms that was 200ms for a SQLite write
-	// under -race on a loaded runner, and a pass that ran out renewed nothing
-	// while the test went on moving the clock (#188).
-	const ttl = 30 * time.Second
+	// IN A BUBBLE, SO THE CLOCK IS THE TEST'S AND NOT THE MACHINE'S. An earlier
+	// version slept for five TTLs and let the listener's heartbeat ticker race a
+	// real-time reaper; it passed alone and failed under a loaded CI runner
+	// (#35). The one after it fed the loop its ticks by hand and moved the
+	// allocator's clock, and still lost a pass to its wall-clock budget, a third
+	// of the TTL, when a SQLite write under -race outran it (#188). In a bubble
+	// the ticker, each pass's budget and the allocator's clock all read the same
+	// fake time, which moves only once every goroutine is blocked: a pass has
+	// finished before the reaper looks, and its budget cannot run out while it
+	// works.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 30 * time.Second
 
-	clock := newTestClock()
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	// A hang guard only, longer than fifteen steps can take at their bounds'
-	// pace on a loaded host; the third poll is what ends the run.
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
-	defer cancel()
+		var (
+			polls    atomic.Int32
+			resultMu sync.Mutex
+			checked  []*alloc.Lease
+			failures []error
+		)
 
-	// THE REAL LOOP, FED BY HAND. The ticks go to the goroutine Run starts, not
-	// to a pass this test calls itself: a test that renewed the leases from
-	// inside the poll would pass against a listener whose heartbeats stopped
-	// for the length of a poll, which is the regression this test exists for.
-	// Each send is followed by a wait for the pass it caused, bounded so that a
-	// loop that is not running fails the test instead of hanging it. The bounds
-	// exceed a pass's own deadline, and passed holds one acknowledgement, so a
-	// pass that outlives a bound cannot block the loop and with it the shutdown.
-	ticks := make(chan time.Time)
-	passed := make(chan struct{}, 1)
+		l := NewListener(a, "billet-4vcpu-a", nil)
 
-	var (
-		polls    atomic.Int32
-		resultMu sync.Mutex
-		checked  []*alloc.Lease
-		failures []error
-	)
+		l.session = &fakeSession{onPoll: func(int) {
+			switch polls.Add(1) {
+			case 1:
+				// The test staged escrow before Run, so what is held now is what
+				// has to survive the stall: FIVE TIMES the TTL inside a single
+				// GetMessage. Every one of these leases expires during this call
+				// unless something renews them on a clock of its own.
+				held := l.Held()
 
-	l := NewListener(a, "billet-4vcpu-a", nil)
-	l.heartbeatTicks = ticks
-	l.heartbeatPassed = func() { passed <- struct{}{} }
+				// The stall, a heartbeat interval at a time: fake time moves only
+				// while this poll sleeps, THE REAL LOOP takes the tick its own
+				// ticker delivers, and the reaper looks once every goroutine is
+				// quiet again. A test that renewed the leases from inside the poll
+				// would pass against a listener whose heartbeats stopped for the
+				// length of a poll, which is the regression this test exists for.
+				// Two mutations were checked against this: WITH THE RENEWAL
+				// REMOVED from heartbeatHeld, and WITH THE LOOP NOT STARTED by Run,
+				// the third Reap reclaims every lease and the assertion below goes
+				// red.
+				for range 15 {
+					time.Sleep(ttl / 3)
+					synctest.Wait()
 
-	l.session = &fakeSession{onPoll: func(int) {
-		switch polls.Add(1) {
-		case 1:
-			// The test staged escrow before Run, so what is held now is what has
-			// to survive the stall — FIVE TIMES the TTL inside a single
-			// GetMessage. Every one of these leases expires during this call
-			// unless something renews them on a clock of its own.
-			held := l.Held()
-
-			// The stall, step by step: the clock moves a heartbeat interval,
-			// the loop is handed the tick it would have seen and the pass it
-			// makes is waited for, then the reaper looks. Fifteen steps of
-			// ttl/3 are five TTLs. Two mutations were checked against this:
-			// WITH THE RENEWAL REMOVED from heartbeatHeld the third Reap
-			// reclaims every lease and the assertion below goes red; WITH THE
-			// LOOP NOT STARTED by Run, or its pass moved to after the poll,
-			// nothing takes the tick and the wait below fails the test.
-			for range 15 {
-				clock.advance(ttl / 3)
-
-				select {
-				case ticks <- clock.Now():
-				case <-time.After(30 * time.Second):
-					t.Error("the heartbeat loop took no tick while the poll was blocked; " +
-						"heartbeats are bounded by the poll again")
-
-					return
+					if _, err := a.Reap(ctx); err != nil {
+						t.Errorf("Reap: %v", err)
+					}
 				}
 
-				select {
-				case <-passed:
-				case <-time.After(30 * time.Second):
-					t.Error("the heartbeat loop took a tick and made no pass")
+				// Checked HERE, not after Run returns: the listener releases escrow
+				// it holds beyond its committed work once the poll returns, and
+				// shutdown releases the rest, so by then every lease is
+				// legitimately terminal.
+				//
+				// Identity, not count: a listener that loses its escrow re-escrows
+				// and holds the same NUMBER of leases. Renewability of these
+				// specific leases is the property.
+				var errs []error
 
-					return
+				for _, lease := range held {
+					if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+						errs = append(errs, fmt.Errorf("lease %s: %w", lease.ID, err))
+					}
 				}
 
-				if _, err := a.Reap(ctx); err != nil {
-					t.Errorf("Reap: %v", err)
-				}
+				resultMu.Lock()
+				checked, failures = held, errs
+				resultMu.Unlock()
+			case 3:
+				cancel()
 			}
+		}}
 
-			// Checked HERE, not after Run returns: the listener releases escrow it
-			// holds beyond its committed work once the poll returns, and shutdown
-			// releases the rest, so by then every lease is legitimately terminal.
-			//
-			// Identity, not count: a listener that loses its escrow re-escrows and holds the
-			// same NUMBER of leases. Renewability of these specific leases is the property.
-			var errs []error
-
-			for _, lease := range held {
-				if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
-					errs = append(errs, fmt.Errorf("lease %s: %w", lease.ID, err))
-				}
-			}
-
-			resultMu.Lock()
-			checked, failures = held, errs
-			resultMu.Unlock()
-		case 3:
-			cancel()
+		// ESCROW HELD ACROSS A POLL, as an offer's purchase is while its
+		// assignment is outstanding. Nothing is held in advance any more (#140),
+		// so the test stages it; the listener releases it only after the poll
+		// returns.
+		if err := l.refillEscrow(t.Context()); err != nil {
+			t.Fatalf("stage escrow across the poll: %v", err)
 		}
-	}}
 
-	// ESCROW HELD ACROSS A POLL, as an offer's purchase is while its assignment
-	// is outstanding. Nothing is held in advance any more (#140), so the test
-	// stages it; the listener releases it only after the poll returns.
-	if err := l.refillEscrow(t.Context()); err != nil {
-		t.Fatalf("stage escrow across the poll: %v", err)
-	}
+		// Cancellation is how this listener is stopped, and Run reports the
+		// context error rather than nil; Server.Run is what turns that into a
+		// clean exit.
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run: %v", err)
+		}
 
-	// Cancellation is how this listener is stopped, and Run reports the context
-	// error rather than nil — Server.Run is what turns that into a clean exit.
-	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run: %v", err)
-	}
+		resultMu.Lock()
+		defer resultMu.Unlock()
 
-	resultMu.Lock()
-	defer resultMu.Unlock()
+		if len(checked) == 0 {
+			t.Fatal("the listener escrowed nothing before the long poll; the test proves nothing")
+		}
 
-	if len(checked) == 0 {
-		t.Fatal("the listener escrowed nothing before the long poll; the test proves nothing")
-	}
-
-	for _, err := range failures {
-		t.Errorf("could not renew an escrowed lease after a poll longer than the TTL (%v); "+
-			"it was reaped mid-poll, so heartbeats are still bounded by the poll cadence", err)
-	}
+		for _, err := range failures {
+			t.Errorf("could not renew an escrowed lease after a poll longer than the TTL (%v); "+
+				"it was reaped mid-poll, so heartbeats are still bounded by the poll cadence", err)
+		}
+	})
 }
 
-// testClock is a clock a test moves by hand, for the allocator's WithClock.
-type testClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func newTestClock() *testClock {
-	return &testClock{now: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)}
-}
-
-func (c *testClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.now
-}
-
-func (c *testClock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.now = c.now.Add(d)
-}
-
-// renewalDriver hands a listener's own heartbeat loop its ticks and moves the
-// allocator's clock between them. Whether a lease outlives a stall is then
-// arithmetic on that clock, not a race between a wall-clock sleep and a real
-// ticker whose passes a loaded machine can starve past the TTL (#188). Install
-// it before Run starts the loop.
-type renewalDriver struct {
-	clock  *testClock
-	ticks  chan time.Time
-	passed chan struct{}
-}
-
-func driveRenewal(l *Listener, clock *testClock) *renewalDriver {
-	d := &renewalDriver{clock: clock, ticks: make(chan time.Time), passed: make(chan struct{}, 1)}
-
-	l.heartbeatTicks = d.ticks
-	l.heartbeatPassed = func() { d.passed <- struct{}{} }
-
-	return d
-}
-
-// beat moves the allocator's clock by step, hands the loop one tick and waits
-// for the pass it caused. It reports false when the loop took no tick, which is
-// what a stopped renewal looks like; the bound is there so such a run fails
-// rather than hangs, and is far beyond any pass a live loop makes.
-func (d *renewalDriver) beat(t *testing.T, step time.Duration) bool {
-	t.Helper()
-
-	d.clock.advance(step)
-
-	select {
-	case d.ticks <- d.clock.Now():
-	case <-time.After(30 * time.Second):
-		return false
-	}
-
-	select {
-	case <-d.passed:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the heartbeat loop took a tick and made no pass")
-	}
-
-	return true
-}
-
-// renewalTestTTL is the lease TTL of every test driven by a renewalDriver: long
-// enough that the TTL/3 wall-clock pass budget never decides the outcome.
-const renewalTestTTL = 30 * time.Second
-
-// throughTwoTTLs moves the allocator's clock two renewalTestTTLs forward one
-// heartbeat interval at a time, delivering each tick to the loop and reaping
-// after every pass, so expiry is enforced at each step rather than once at the
-// end. stopped is the failure when the loop refuses a tick.
-func (d *renewalDriver) throughTwoTTLs(t *testing.T, a *alloc.Allocator, stopped string) {
+// throughTwoTTLs lets two TTLs of a synctest bubble's fake time pass a
+// heartbeat interval at a time, and reaps once every goroutine has gone quiet
+// after each step, so expiry is enforced at every step rather than once at the
+// end and each interval's renewal pass has finished before the reaper looks.
+func throughTwoTTLs(t *testing.T, a *alloc.Allocator, ttl time.Duration) {
 	t.Helper()
 
 	for range 6 {
-		if !d.beat(t, renewalTestTTL/3) {
-			t.Fatal(stopped)
-		}
+		time.Sleep(ttl / 3)
+		synctest.Wait()
 
 		if _, err := a.Reap(t.Context()); err != nil {
 			t.Fatalf("reap: %v", err)
@@ -3990,7 +3891,12 @@ func (f *fakeRunner) DestroyCompleted(_ context.Context, requestID int64, result
 // so the listener does nothing but escrow, advertise, and release — which is the
 // whole of what this test is about.
 type fakeSession struct {
-	onPoll func(maxCapacity int)
+	// longPoll, when set, makes an empty poll wait this long before reporting
+	// no message, as GitHub's does, rather than returning at once. In a
+	// synctest bubble that is what lets fake time advance: a poll loop that
+	// never blocks keeps the bubble busy forever.
+	longPoll time.Duration
+	onPoll   func(maxCapacity int)
 	// onPollCtx receives the context the loop is polling with, so a test can act
 	// on the DRAIN's context specifically. Returning an error fails the poll.
 	onPollCtx func(ctx context.Context) error
@@ -4059,6 +3965,17 @@ func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) 
 
 	if f.onGet != nil {
 		return f.onGet()
+	}
+
+	if f.longPoll > 0 {
+		wait := time.NewTimer(f.longPoll)
+		defer wait.Stop()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-wait.C:
+		}
 	}
 
 	// A real long poll reports a timeout; the listener polls again.
@@ -5049,113 +4966,101 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// Run starts, and the detector has to be the consequence rather than the
 	// mechanism: a lease that stops being renewed is reaped.
 	//
-	// BOTH LOOPS ARE DRIVEN BY HAND, against the allocator's clock. A wall-clock
-	// sleep past the TTL against the real tickers measures how busy the machine
-	// was: a pass starved past its budget renews nothing, and correct code is
-	// reported as starved renewal (#188).
-	const ttl = 30 * time.Second
+	// IN A BUBBLE, so both loops run on their own tickers against fake time: a
+	// wall-clock sleep past the TTL against real tickers measures how busy the
+	// machine was, and a pass starved past its budget would renew nothing and
+	// report correct code as starved renewal (#188). Here time moves only when
+	// every goroutine is blocked, so each interval's pass has run before the
+	// reaper looks.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 30 * time.Second
 
-	clock := newTestClock()
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+		// A destroy that blocks the way an unreachable node does.
+		blocked := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(blocked) })
 
-	// A destroy that blocks the way an unreachable node does.
-	blocked := make(chan struct{})
-	unblock := sync.OnceFunc(func() { close(blocked) })
+		t.Cleanup(unblock)
 
-	t.Cleanup(unblock)
-	entered := make(chan struct{}, 1)
+		var entered atomic.Bool
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		select {
-		case entered <- struct{}{}:
-		default:
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			entered.Store(true)
+			<-blocked
+
+			return nil
+		}}
+
+		l := NewListener(a, tiers[0].Label, &fakeSession{longPoll: time.Minute}, WithRunner(runner))
+
+		lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+		// A completion whose destroy already failed, so the loop has something to
+		// retry on its first tick.
+		l.mu.Lock()
+		l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
+		l.mu.Unlock()
+
+		runDone := make(chan struct{})
+
+		go func() {
+			defer close(runDone)
+
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		// The cleanup loop's first tick, one interval in, taken only by a loop
+		// Run started: with the retry moved onto the heartbeat's tick there is
+		// no cleanup loop to take it. Nothing below proves anything until the
+		// retry is genuinely stuck inside the provider.
+		time.Sleep(ttl / 3)
+		synctest.Wait()
+
+		if !entered.Load() {
+			t.Fatal("the retry never reached the runner, so no cleanup loop is running")
 		}
 
-		<-blocked
+		// AND RENEWAL OUTLIVES THE STUCK DESTROY, through two TTLs a heartbeat
+		// interval at a time. Each step is REAPED SYNCHRONOUSLY rather than by a
+		// background reaper, whose own scheduling once let an
+		// expired-but-unreaped lease be renewed by the assertion's Heartbeat, so a
+		// listener whose renewal had stalled the whole time passed.
+		for range 6 {
+			time.Sleep(ttl / 3)
+			synctest.Wait()
 
-		return nil
-	}}
-
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
-	renewal := driveRenewal(l, clock)
-
-	sweeps := make(chan time.Time)
-	l.cleanupTicks = sweeps
-
-	lease := holdRunning(t, l, a, tiers[0].Label, 7)
-
-	// A completion whose destroy already failed, so the loop has something to
-	// retry on its first tick.
-	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: dispatch.Job{RequestID: 7}}}
-	l.mu.Unlock()
-
-	runDone := make(chan struct{})
-
-	go func() {
-		defer close(runDone)
-
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+			if _, err := a.Reap(ctx); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
 		}
-	}()
 
-	// The cleanup loop's tick, taken only by a loop Run started: with the retry
-	// moved onto the heartbeat's tick there is no cleanup loop to take it.
-	select {
-	case sweeps <- clock.Now():
-	case <-runDone:
-		t.Fatal("the listener stopped before its cleanup loop took a tick")
-	case <-time.After(30 * time.Second):
-		t.Fatal("no cleanup loop took a tick, so nothing started it")
-	}
-
-	// Nothing below proves anything until the retry is genuinely stuck inside the
-	// provider, which is the state the whole test is about.
-	select {
-	case <-entered:
-	case <-runDone:
-		t.Fatal("the listener stopped before its cleanup loop reached the runner")
-	case <-time.After(30 * time.Second):
-		t.Fatal("the retry never reached the runner")
-	}
-
-	// AND RENEWAL OUTLIVES THE STUCK DESTROY. Each step is REAPED SYNCHRONOUSLY
-	// rather than by a background reaper, whose own scheduling once let an
-	// expired-but-unreaped lease be renewed by the assertion's Heartbeat, so a
-	// listener whose renewal had stalled the whole time passed.
-	renewal.throughTwoTTLs(t, a, "the heartbeat loop took no tick while a cleanup "+
-		"retry was stuck in the provider; one unreachable host delays every renewal on "+
-		"this listener")
-
-	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
-		t.Fatalf("a running lease was lost while a cleanup retry was stuck in the provider "+
-			"(%v); one unreachable host delays every renewal on this listener and expires "+
-			"the leases it was protecting", err)
-	}
-
-	// Let the destroy finish, and WAIT FOR THE RETRY TO DRAIN before returning.
-	// The blocked goroutine belongs to Run, so nothing else joins it — and if it
-	// resumed after the test closed the database, its release would race that
-	// close.
-	unblock()
-
-	for cleanupCount(l) > 0 {
-		select {
-		case <-time.After(20 * time.Millisecond):
-		case <-ctx.Done():
-			t.Fatal("the retry never drained after the node started answering")
+		if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+			t.Fatalf("a running lease was lost while a cleanup retry was stuck in the provider "+
+				"(%v); one unreachable host delays every renewal on this listener and expires "+
+				"the leases it was protecting", err)
 		}
-	}
 
-	cancel()
-	<-runDone
+		// Let the destroy finish, and WAIT FOR THE RETRY TO DRAIN before
+		// returning: the blocked goroutine belongs to Run, and if it resumed
+		// after the database closed, its release would race that close.
+		unblock()
+		synctest.Wait()
+
+		if n := cleanupCount(l); n > 0 {
+			t.Fatalf("%d cleanup obligations remained after the node started answering", n)
+		}
+
+		cancel()
+		<-runDone
+	})
 }
 
 // RUN DOES NOT RETURN WHILE A CLEANUP RETRY IS STILL IN THE PROVIDER.
@@ -5293,91 +5198,88 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	t.Parallel()
 
-	// THE ALLOCATOR'S CLOCK AND THE LOOP'S TICKS ARE THE TEST'S. The first
-	// version slept two 900ms TTLs against the real ticker and failed on a loaded
-	// CI runner (2026-10-02, the test taking 21s): a pass whose SQLite write
-	// outran its 300ms budget renewed nothing, and the reap took a lease the
-	// listener was still renewing correctly. The TTL is long so a pass's
-	// wall-clock budget, a third of it, is never what decides the outcome.
-	const ttl = 30 * time.Second
+	// IN A BUBBLE. The first version slept two 900ms TTLs against the real
+	// ticker and failed on a loaded CI runner (2026-10-02, the test taking 21s):
+	// a pass whose SQLite write outran its 300ms budget renewed nothing, and the
+	// reap took a lease the listener was still renewing correctly. In fake time
+	// a pass's budget cannot run out while it works, and the destroy phase's
+	// default grace is far beyond the two TTLs the test waits inside it.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 30 * time.Second
 
-	clock := newTestClock()
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
+		blocked := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(blocked) })
 
-	blocked := make(chan struct{})
-	unblock := sync.OnceFunc(func() { close(blocked) })
+		t.Cleanup(unblock)
+		entered := make(chan struct{}, 1)
 
-	t.Cleanup(unblock)
-	entered := make(chan struct{}, 1)
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
+			<-blocked
+
+			return nil
+		}}
+
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+
+		lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		runDone := make(chan struct{})
+
+		go func() {
+			defer close(runDone)
+
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		// Stop it almost immediately: the state under test is the shutdown
+		// release, not anything the listener does while running.
+		cancel()
+
 		select {
-		case entered <- struct{}{}:
-		default:
+		case <-entered:
+		case <-runDone:
+			t.Fatal("the listener returned without destroying the job it was running")
+		case <-time.After(time.Minute):
+			t.Fatal("the shutdown release never reached the runner")
 		}
 
-		<-blocked
+		// The teardown is stuck in the provider. Two TTLs pass, each step reaped
+		// once the listener's own loop has made its pass. Stopping renewal before
+		// the release, or dropping the running lease from the pass, lets the
+		// third reap take it.
+		//
+		// t.Context() rather than ctx, which is cancelled: the allocator would
+		// refuse every call and the test would fail without proving anything.
+		throughTwoTTLs(t, a, ttl)
 
-		return nil
-	}}
-
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner), WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
-	renewal := driveRenewal(l, clock)
-
-	lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	runDone := make(chan struct{})
-
-	go func() {
-		defer close(runDone)
-
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+		if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
+			t.Fatalf("a lease was lost while the shutdown release was still destroying its "+
+				"compute (%v); the reaper freed capacity for a container that is still on "+
+				"the host, so another tier can escrow it", err)
 		}
-	}()
 
-	// Stop it almost immediately: the state under test is the shutdown release,
-	// not anything the listener does while running.
-	cancel()
+		unblock()
 
-	select {
-	case <-entered:
-	case <-runDone:
-		t.Fatal("the listener returned without destroying the job it was running")
-	case <-time.After(30 * time.Second):
-		t.Fatal("the shutdown release never reached the runner")
-	}
-
-	// The teardown is stuck in the provider. Two TTLs pass on the allocator's
-	// clock, each step delivered to the listener's own loop and reaped. Stopping
-	// renewal before the release makes the loop refuse the first tick; dropping
-	// the running lease from the pass lets the third reap take it.
-	//
-	// t.Context() rather than ctx, which is cancelled: the allocator would refuse
-	// every call and the test would fail without proving anything.
-	renewal.throughTwoTTLs(t, a, "renewal stopped while the shutdown release was "+
-		"still destroying compute; every lease the release has not reached yet expires "+
-		"under it and the reaper frees capacity for a container still on the host")
-
-	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
-		t.Fatalf("a lease was lost while the shutdown release was still destroying its "+
-			"compute (%v); the reaper freed capacity for a container that is still on "+
-			"the host, so another tier can escrow it", err)
-	}
-
-	unblock()
-
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned after the node answered")
-	}
+		select {
+		case <-runDone:
+		case <-time.After(time.Hour):
+			t.Fatal("Run never returned after the node answered")
+		}
+	})
 }
 
 // THE SHUTDOWN DESTROYS EACH REQUEST ONCE, NOT ONCE PER SET IT APPEARS IN.
@@ -5678,120 +5580,124 @@ func TestTheBudgetSumSaturatesRatherThanWrapping(t *testing.T) {
 func TestAnOverrunningPhaseCannotPushTheNextPastTheBudget(t *testing.T) {
 	t.Parallel()
 
-	const (
-		destroying = 300 * time.Millisecond
-		overrun    = 2 * time.Second
-		closing    = 10 * time.Second
-		releasing  = 300 * time.Millisecond
-	)
+	// IN A BUBBLE, so the deadline the close was handed is compared exactly:
+	// fake time does not move between the cancel and the teardown, and the
+	// overrun costs no wall-clock time.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			destroying = 300 * time.Millisecond
+			overrun    = 2 * time.Second
+			closing    = 10 * time.Second
+			releasing  = 300 * time.Millisecond
+		)
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	// A destroy that ignores its context and overruns the destroy budget, which
-	// nothing in the Runner contract forbids.
-	//
-	// COUNTED, because this test spent a while passing without ever calling it:
-	// the fixture held only `running` work, which a shutdown deliberately skips,
-	// so nothing overran anything and the assertion below was measuring an
-	// ordinary fast teardown.
-	var overran atomic.Bool
+		// A destroy that ignores its context and overruns the destroy budget, which
+		// nothing in the Runner contract forbids.
+		//
+		// COUNTED, because this test spent a while passing without ever calling it:
+		// the fixture held only `running` work, which a shutdown deliberately skips,
+		// so nothing overran anything and the assertion below was measuring an
+		// ordinary fast teardown.
+		var overran atomic.Bool
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		overran.Store(true)
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			overran.Store(true)
 
-		time.Sleep(overrun)
+			time.Sleep(overrun)
 
-		return nil
-	}}
+			return nil
+		}}
 
-	deadlines := make(chan time.Time, 1)
+		deadlines := make(chan time.Time, 1)
 
-	session := &fakeSession{onClose: func(ctx context.Context) error {
-		d, ok := ctx.Deadline()
-		if !ok {
-			d = time.Time{}
-		}
+		session := &fakeSession{onClose: func(ctx context.Context) error {
+			d, ok := ctx.Deadline()
+			if !ok {
+				d = time.Time{}
+			}
+
+			select {
+			case deadlines <- d:
+			default:
+			}
+
+			return nil
+		}}
+
+		l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+			WithShutdownGrace(destroying), WithFinishGraces(closing, releasing),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+
+		// OWED A DESTROY, or the slow onDestroy below is never called and no phase
+		// overruns anything. A shutdown skips `running`, so a fixture holding only
+		// that gives the teardown nothing to be slow about — and this test would pass
+		// against a regression handing every phase a fresh deadline.
+		holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
+
+		runDone := make(chan struct{})
+
+		go func() {
+			defer close(runDone)
+
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		// The budget starts when the TEARDOWN does, not when Run does. Measuring from
+		// before the run makes the bound tighter than the code ever promised, and
+		// fails it by the microseconds between the two.
+		cancel()
+
+		teardown := time.Now()
 
 		select {
-		case deadlines <- d:
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run never returned")
+		}
+
+		var closeDeadline time.Time
+
+		select {
+		case closeDeadline = <-deadlines:
 		default:
+			t.Fatal("the shutdown never closed the session")
 		}
 
-		return nil
-	}}
-
-	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
-		WithShutdownGrace(destroying), WithFinishGraces(closing, releasing),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
-
-	// OWED A DESTROY, or the slow onDestroy below is never called and no phase
-	// overruns anything. A shutdown skips `running`, so a fixture holding only
-	// that gives the teardown nothing to be slow about — and this test would pass
-	// against a regression handing every phase a fresh deadline.
-	holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	runDone := make(chan struct{})
-
-	go func() {
-		defer close(runDone)
-
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+		if closeDeadline.IsZero() {
+			t.Fatal("the session close was handed a context with no deadline at all")
 		}
-	}()
 
-	// The budget starts when the TEARDOWN does, not when Run does. Measuring from
-	// before the run makes the bound tighter than the code ever promised, and
-	// fails it by the microseconds between the two.
-	cancel()
+		// THE DESTROY ACTUALLY RAN AND ACTUALLY OVERRAN. Without this the assertion
+		// below measures an ordinary fast teardown, which fits inside the budget for
+		// reasons that have nothing to do with the phases sharing one deadline — and
+		// this test passed exactly that way once, when its fixture stopped reaching
+		// the runner at all.
+		if !overran.Load() {
+			t.Fatal("the shutdown never called the slow destroy, so no phase overran and " +
+				"this proves nothing about the phases sharing one budget")
+		}
 
-	teardown := time.Now()
+		// EXACTLY THE END OF THE WHOLE BUDGET, computed from the fixture rather than
+		// asked of teardownBudget, which would agree with itself if it dropped a
+		// phase. Without the overall deadline the close gets a fresh ten seconds
+		// starting after the overrun, and ends well past it.
+		budget := 2*destroying + closing + releasing
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
-
-	var closeDeadline time.Time
-
-	select {
-	case closeDeadline = <-deadlines:
-	default:
-		t.Fatal("the shutdown never closed the session")
-	}
-
-	if closeDeadline.IsZero() {
-		t.Fatal("the session close was handed a context with no deadline at all")
-	}
-
-	// THE DESTROY ACTUALLY RAN AND ACTUALLY OVERRAN. Without this the assertion
-	// below measures an ordinary fast teardown, which fits inside the budget for
-	// reasons that have nothing to do with the phases sharing one deadline — and
-	// this test passed exactly that way once, when its fixture stopped reaching
-	// the runner at all.
-	if !overran.Load() {
-		t.Fatal("the shutdown never called the slow destroy, so no phase overran and " +
-			"this proves nothing about the phases sharing one budget")
-	}
-
-	// Slack for the gap between cancelling and the teardown actually beginning.
-	// Small next to what this is distinguishing: without the overall deadline the
-	// close gets a fresh ten seconds against roughly eight that remain, so the
-	// overshoot to catch is well over a second.
-	const slack = 500 * time.Millisecond
-
-	budget := l.teardownBudget()
-
-	if over := closeDeadline.Sub(teardown.Add(budget)); over > slack {
-		t.Errorf("the session close was given until %v past the whole shutdown budget; "+
-			"renewal stops at that budget, so the close and the release run with "+
-			"nothing renewing and leases expire while the session is still open", over)
-	}
+		if got := closeDeadline.Sub(teardown); got != budget {
+			t.Errorf("the session close was given until %v into the teardown, want the end of "+
+				"the whole shutdown budget at %v; renewal stops at that budget, so a close given "+
+				"longer runs with nothing renewing and leases expire while the session is "+
+				"still open", got, budget)
+		}
+	})
 }
 
 // A BLOCKED REQUEST IS REPORTED ONCE, NOT ON EVERY OFFER.
@@ -6110,73 +6016,77 @@ func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
 func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
 	t.Parallel()
 
-	const (
-		destroying = 200 * time.Millisecond
-		finishing  = 200 * time.Millisecond
-	)
+	// IN A BUBBLE, so the destroy that outlasts the whole budget costs no
+	// wall-clock time and the elapsed time below is exact.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			destroying = 200 * time.Millisecond
+			finishing  = 200 * time.Millisecond
+		)
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	var destroys atomic.Int32
+		var destroys atomic.Int32
 
-	// Ignores its context and outlasts join + destroy + close + release together.
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		destroys.Add(1)
+		// Ignores its context and outlasts join + destroy + close + release together.
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			destroys.Add(1)
 
-		time.Sleep(2 * (2*destroying + 2*finishing))
+			time.Sleep(2 * (2*destroying + 2*finishing))
 
-		return nil
-	}}
+			return nil
+		}}
 
-	session := &fakeSession{}
+		session := &fakeSession{}
 
-	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
-		WithShutdownGrace(destroying), WithFinishGraces(finishing, finishing),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+		l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+			WithShutdownGrace(destroying), WithFinishGraces(finishing, finishing),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+		holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
 
-	runDone := make(chan struct{})
-	started := time.Now()
+		runDone := make(chan struct{})
+		started := time.Now()
 
-	go func() {
-		defer close(runDone)
+		go func() {
+			defer close(runDone)
 
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		cancel()
+
+		select {
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run never returned")
 		}
-	}()
 
-	cancel()
+		// THE PREMISE FIRST. A negative assertion passes for any reason the teardown
+		// ended early, including the session close being removed entirely — so the
+		// destroy has to be shown to have run and outlasted the budget.
+		if destroys.Load() != 1 {
+			t.Fatalf("the destroy ran %d times; this test means nothing unless it ran once "+
+				"and outlasted the budget", destroys.Load())
+		}
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
+		if elapsed := time.Since(started); elapsed <= l.teardownBudget() {
+			t.Fatalf("the teardown finished in %v, inside its %v budget; nothing overran, so "+
+				"the check being tested was never reached", elapsed, l.teardownBudget())
+		}
 
-	// THE PREMISE FIRST. A negative assertion passes for any reason the teardown
-	// ended early, including the session close being removed entirely — so the
-	// destroy has to be shown to have run and outlasted the budget.
-	if destroys.Load() != 1 {
-		t.Fatalf("the destroy ran %d times; this test means nothing unless it ran once "+
-			"and outlasted the budget", destroys.Load())
-	}
-
-	if elapsed := time.Since(started); elapsed <= l.teardownBudget() {
-		t.Fatalf("the teardown finished in %v, inside its %v budget; nothing overran, so "+
-			"the check being tested was never reached", elapsed, l.teardownBudget())
-	}
-
-	if session.closes() != 0 {
-		t.Errorf("the session was closed %d times after the whole shutdown budget had "+
-			"already gone; a phase billet has just declared hopeless must not be started, "+
-			"because nothing promises it will return", session.closes())
-	}
+		if session.closes() != 0 {
+			t.Errorf("the session was closed %d times after the whole shutdown budget had "+
+				"already gone; a phase billet has just declared hopeless must not be started, "+
+				"because nothing promises it will return", session.closes())
+		}
+	})
 }
 
 // A SEALED CLEANUP LOOP STARTS NOTHING NEW, even mid-snapshot.
@@ -6247,125 +6157,123 @@ func TestASealedCleanupLoopStartsNothingNew(t *testing.T) {
 func TestRunSealsTheCleanupLoop(t *testing.T) {
 	t.Parallel()
 
-	const (
-		// Roomy, because the teardown must get through its own destroy pass inside
-		// this budget. At 200ms a scheduling hiccup after the join expired left
-		// nothing for the destroy, and the test failed on correct code.
-		grace = time.Second
-		// The cleanup loop ticks at TTL/3, so the DEFAULT 90 second TTL means its
-		// first pass is 30 seconds away. This test waited 30 seconds for that pass
-		// and passed in isolation by about three seconds — then failed under the
-		// full suite, which is the definition of a test that will flake in CI.
-		ttl = 300 * time.Millisecond
-	)
+	// IN A BUBBLE. The cleanup loop ticks at TTL/3 on the bubble's clock, the
+	// join gives up after its grace without the machine's scheduler having a say,
+	// and the end of the test waits for the bubble to go quiet rather than for a
+	// guessed interval.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			grace = time.Second
+			ttl   = 30 * time.Second
+		)
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	blocked := make(chan struct{})
-	unblock := sync.OnceFunc(func() { close(blocked) })
+		blocked := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(blocked) })
 
-	t.Cleanup(unblock)
+		t.Cleanup(unblock)
 
-	entered := make(chan struct{}, 1)
+		entered := make(chan struct{}, 1)
 
-	var (
-		destroys  atomic.Int32
-		announced atomic.Bool
-	)
+		var (
+			destroys  atomic.Int32
+			announced atomic.Bool
+		)
 
-	// resumed says the loop's blocked destroy has actually returned, which is the
-	// causal anchor the final assertion needs.
-	resumed := make(chan struct{})
+		// resumed says the loop's blocked destroy has actually returned, which is the
+		// causal anchor the final assertion needs.
+		resumed := make(chan struct{})
 
-	// Only the loop's FIRST destroy blocks; everything else returns at once, so
-	// what distinguishes the behaviours is a count rather than a hang.
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		destroys.Add(1)
+		// Only the loop's FIRST destroy blocks; everything else returns at once, so
+		// what distinguishes the behaviours is a count rather than a hang.
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			destroys.Add(1)
 
-		if announced.CompareAndSwap(false, true) {
-			entered <- struct{}{}
+			if announced.CompareAndSwap(false, true) {
+				entered <- struct{}{}
 
-			<-blocked
-			close(resumed)
+				<-blocked
+				close(resumed)
+			}
+
+			return errors.New("the node is not answering")
+		}}
+
+		l := NewListener(a, tiers[0].Label, &fakeSession{longPoll: time.Minute}, WithRunner(runner),
+			WithShutdownGrace(grace), WithFinishGraces(grace, grace),
+			WithCleanupRetryPacing(0, 0))
+
+		// Two obligations, so the loop's snapshot has somewhere to advance to.
+		l.mu.Lock()
+		l.cleanup = map[int64]*pendingCleanup{
+			7: {job: dispatch.Job{RequestID: 7}},
+			9: {job: dispatch.Job{RequestID: 9}},
+		}
+		l.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
+
+		runDone := make(chan struct{})
+
+		go func() {
+			defer close(runDone)
+
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		select {
+		case <-entered:
+		case <-runDone:
+			t.Fatal("the listener stopped before its cleanup loop reached the runner")
+		case <-time.After(30 * time.Second):
+			t.Fatal("the cleanup retry never reached the runner")
 		}
 
-		return errors.New("the node is not answering")
-	}}
+		cancel()
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace), WithFinishGraces(grace, grace),
-		WithCleanupRetryPacing(0, 0))
-
-	// Two obligations, so the loop's snapshot has somewhere to advance to.
-	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{
-		7: {job: dispatch.Job{RequestID: 7}},
-		9: {job: dispatch.Job{RequestID: 9}},
-	}
-	l.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	runDone := make(chan struct{})
-
-	go func() {
-		defer close(runDone)
-
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+		select {
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run never returned")
 		}
-	}()
 
-	select {
-	case <-entered:
-	case <-runDone:
-		t.Fatal("the listener stopped before its cleanup loop reached the runner")
-	case <-time.After(30 * time.Second):
-		t.Fatal("the cleanup retry never reached the runner")
-	}
+		// The loop's first destroy is still blocked and the teardown has been and
+		// gone: its own call, plus the teardown's for the other request.
+		afterRun := destroys.Load()
+		if afterRun != 2 {
+			t.Fatalf("%d destroys before releasing the stuck one, want 2 (the loop's and the "+
+				"teardown's); the setup is not what this test describes", afterRun)
+		}
 
-	cancel()
+		unblock()
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
+		// WAIT FOR THE LOOP TO BE RUNNING AGAIN before judging what it does next.
+		// Without this anchor, "no further destroys after a fixed sleep" also passes
+		// when the orphaned goroutine simply never got scheduled — and the no-seal
+		// mutation survives on that.
+		select {
+		case <-resumed:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the blocked destroy never returned")
+		}
 
-	// The loop's first destroy is still blocked and the teardown has been and
-	// gone: its own call, plus the teardown's for the other request.
-	afterRun := destroys.Load()
-	if afterRun != 2 {
-		t.Fatalf("%d destroys before releasing the stuck one, want 2 (the loop's and the "+
-			"teardown's); the setup is not what this test describes", afterRun)
-	}
+		// From here an unsealed loop has one map lookup and a Destroy left, and the
+		// bubble going quiet is everything it would do having been done.
+		synctest.Wait()
 
-	unblock()
-
-	// WAIT FOR THE LOOP TO BE RUNNING AGAIN before judging what it does next.
-	// Without this anchor, "no further destroys after a fixed sleep" also passes
-	// when the orphaned goroutine simply never got scheduled — and the no-seal
-	// mutation survives on that.
-	select {
-	case <-resumed:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the blocked destroy never returned")
-	}
-
-	// From here an unsealed loop has one map lookup and a Destroy left, so this
-	// waits for something that would happen immediately rather than guessing how
-	// long a goroutine might take to be scheduled at all.
-	time.Sleep(grace)
-
-	if got := destroys.Load(); got != afterRun {
-		t.Errorf("the cleanup loop issued %d more destroy(s) after Run returned; nothing "+
-			"sealed it, so it walked on through a snapshot the teardown had already "+
-			"claimed — outside the single slot, with no process left to own it",
-			got-afterRun)
-	}
+		if got := destroys.Load(); got != afterRun {
+			t.Errorf("the cleanup loop issued %d more destroy(s) after Run returned; nothing "+
+				"sealed it, so it walked on through a snapshot the teardown had already "+
+				"claimed — outside the single slot, with no process left to own it",
+				got-afterRun)
+		}
+	})
 }
 
 // A LISTENER IS SINGLE USE, and says so rather than misbehaving quietly.
@@ -6477,60 +6385,64 @@ func TestAPanickingRetryStillReleasesItsMark(t *testing.T) {
 func TestASlowDestroyDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	t.Parallel()
 
-	const grace = 200 * time.Millisecond
+	// IN A BUBBLE, so the overrun costs no wall-clock time and the phase that
+	// follows it is not racing the machine's scheduler for its budget.
+	synctest.Test(t, func(t *testing.T) {
+		const grace = 200 * time.Millisecond
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	// Slower than the grace, and it IGNORES the context — nothing in the Runner
-	// contract says it must not, and that is precisely when the grace matters.
-	// It succeeds, so its lease is owed a release.
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		time.Sleep(2 * grace)
+		// Slower than the grace, and it IGNORES the context — nothing in the Runner
+		// contract says it must not, and that is precisely when the grace matters.
+		// It succeeds, so its lease is owed a release.
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			time.Sleep(2 * grace)
 
-		return nil
-	}}
+			return nil
+		}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+			WithShutdownGrace(grace),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+		holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
 
-	runDone := make(chan struct{})
+		runDone := make(chan struct{})
 
-	go func() {
-		defer close(runDone)
+		go func() {
+			defer close(runDone)
 
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		cancel()
+
+		select {
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run never returned")
 		}
-	}()
 
-	cancel()
+		// EVERY LEASE BACK. The escrowed ones and the running one whose destroy
+		// succeeded: headroom returning to its full two is the allocator agreeing
+		// nothing is still held.
+		room, err := a.Headroom(t.Context(), tiers[0].Label)
+		if err != nil {
+			t.Fatalf("headroom: %v", err)
+		}
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
-
-	// EVERY LEASE BACK. The escrowed ones and the running one whose destroy
-	// succeeded: headroom returning to its full two is the allocator agreeing
-	// nothing is still held.
-	room, err := a.Headroom(t.Context(), tiers[0].Label)
-	if err != nil {
-		t.Fatalf("headroom: %v", err)
-	}
-
-	if room != 2 {
-		t.Errorf("%d of 2 slots came back after shutdown; a destroy that outlasted the "+
-			"grace left the session close and the release with an expired context, so "+
-			"capacity billet had already freed stays held until the reaper", room)
-	}
+		if room != 2 {
+			t.Errorf("%d of 2 slots came back after shutdown; a destroy that outlasted the "+
+				"grace left the session close and the release with an expired context, so "+
+				"capacity billet had already freed stays held until the reaper", room)
+		}
+	})
 }
 
 // SHUTDOWN DOES NOT RELEASE A LEASE THE RUNNER HAS TAKEN INTO CUSTODY.
@@ -6635,57 +6547,61 @@ func TestShutdownDoesNotReleaseALeaseTheRunnerIsHolding(t *testing.T) {
 func TestASlowCloseDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	t.Parallel()
 
-	const closing = 200 * time.Millisecond
+	// IN A BUBBLE, so the overrun costs no wall-clock time and the phase that
+	// follows it is not racing the machine's scheduler for its budget.
+	synctest.Test(t, func(t *testing.T) {
+		const closing = 200 * time.Millisecond
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	// A close that overruns its budget and then succeeds anyway — nothing in the
-	// Session contract says it must honour the deadline, and that is exactly when
-	// a shared budget hurts.
-	session := &fakeSession{onClose: func(context.Context) error {
-		time.Sleep(2 * closing)
+		// A close that overruns its budget and then succeeds anyway — nothing in the
+		// Session contract says it must honour the deadline, and that is exactly when
+		// a shared budget hurts.
+		session := &fakeSession{onClose: func(context.Context) error {
+			time.Sleep(2 * closing)
 
-		return nil
-	}}
+			return nil
+		}}
 
-	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
-		WithFinishGraces(closing, 10*time.Second),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+		l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+			WithFinishGraces(closing, 10*time.Second),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+		holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
 
-	runDone := make(chan struct{})
+		runDone := make(chan struct{})
 
-	go func() {
-		defer close(runDone)
+		go func() {
+			defer close(runDone)
 
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		cancel()
+
+		select {
+		case <-runDone:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Run never returned")
 		}
-	}()
 
-	cancel()
+		room, err := a.Headroom(t.Context(), tiers[0].Label)
+		if err != nil {
+			t.Fatalf("headroom: %v", err)
+		}
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
-
-	room, err := a.Headroom(t.Context(), tiers[0].Label)
-	if err != nil {
-		t.Fatalf("headroom: %v", err)
-	}
-
-	if room != 2 {
-		t.Errorf("%d of 2 slots came back after a slow session close; the releases were "+
-			"left with what the close had not spent, so an otherwise clean shutdown "+
-			"withholds capacity until the reaper", room)
-	}
+		if room != 2 {
+			t.Errorf("%d of 2 slots came back after a slow session close; the releases were "+
+				"left with what the close had not spent, so an otherwise clean shutdown "+
+				"withholds capacity until the reaper", room)
+		}
+	})
 }
 
 // A REQUEST WHOSE LAST CONTAINER IS STILL OWED IS NOT TAKEN AGAIN.
@@ -6756,90 +6672,94 @@ func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
 func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
 	t.Parallel()
 
-	const ttl = 300 * time.Millisecond
+	// IN A BUBBLE, so waiting past the TTL is the allocator's and the listener's
+	// clock moving, not the machine's.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 300 * time.Millisecond
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
 
-	holdRunning(t, l, a, tiers[0].Label, 7)
+		holdRunning(t, l, a, tiers[0].Label, 7)
 
-	// Reaped, so the heartbeat sees the fence a real reap produces.
-	time.Sleep(2 * ttl)
+		// Reaped, so the heartbeat sees the fence a real reap produces.
+		time.Sleep(2 * ttl)
 
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
+		if _, err := a.Reap(t.Context()); err != nil {
+			t.Fatalf("reap: %v", err)
+		}
 
-	l.mu.Lock()
-	l.heartbeatHeld(t.Context())
-	_, stillRunning := l.running[7]
-	l.mu.Unlock()
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		_, stillRunning := l.running[7]
+		l.mu.Unlock()
 
-	if stillRunning {
-		t.Fatal("the listener kept a lease the reaper had taken, so this proves nothing")
-	}
+		if stillRunning {
+			t.Fatal("the listener kept a lease the reaper had taken, so this proves nothing")
+		}
 
-	if cleanupCount(l) != 1 {
-		t.Fatalf("a running job whose lease was reaped left no cleanup obligation (%d "+
-			"pending); its container is still on a host, GitHub will not redeliver the "+
-			"completion, and only an optional Sweeper would ever notice", cleanupCount(l))
-	}
+		if cleanupCount(l) != 1 {
+			t.Fatalf("a running job whose lease was reaped left no cleanup obligation (%d "+
+				"pending); its container is still on a host, GitHub will not redeliver the "+
+				"completion, and only an optional Sweeper would ever notice", cleanupCount(l))
+		}
 
-	// THE RIGHT REQUEST. Counting the map only proves something was recorded: an
-	// empty pendingCleanup{} satisfies a count and then destroys request 0, which
-	// is nobody's container.
-	l.mu.Lock()
-	entry, recorded := l.cleanup[7]
-	l.mu.Unlock()
+		// THE RIGHT REQUEST. Counting the map only proves something was recorded: an
+		// empty pendingCleanup{} satisfies a count and then destroys request 0, which
+		// is nobody's container.
+		l.mu.Lock()
+		entry, recorded := l.cleanup[7]
+		l.mu.Unlock()
 
-	if !recorded {
-		t.Fatal("a cleanup obligation was recorded under some other request id")
-	}
+		if !recorded {
+			t.Fatal("a cleanup obligation was recorded under some other request id")
+		}
 
-	if entry.job.RequestID != 7 {
-		t.Errorf("the obligation names request %d, want 7; a destroy addressed to the "+
-			"wrong id leaves the real container running", entry.job.RequestID)
-	}
+		if entry.job.RequestID != 7 {
+			t.Errorf("the obligation names request %d, want 7; a destroy addressed to the "+
+				"wrong id leaves the real container running", entry.job.RequestID)
+		}
 
-	// AND THE SAME FOR A STALE LEASE, which is a different branch: `lost` is the
-	// allocator saying the lease is not ours, `stale` is the allocator saying
-	// nothing for longer than the lease could survive. Both end the claim; neither
-	// ends the obligation.
-	second := holdRunning(t, l, a, tiers[0].Label, 9)
+		// AND THE SAME FOR A STALE LEASE, which is a different branch: `lost` is the
+		// allocator saying the lease is not ours, `stale` is the allocator saying
+		// nothing for longer than the lease could survive. Both end the claim; neither
+		// ends the obligation.
+		second := holdRunning(t, l, a, tiers[0].Label, 9)
 
-	l.mu.Lock()
-	l.confirmed[second.ID] = time.Now().Add(-2 * ttl)
-	l.mu.Unlock()
+		l.mu.Lock()
+		l.confirmed[second.ID] = time.Now().Add(-2 * ttl)
+		l.mu.Unlock()
 
-	unreachable, cancel := context.WithCancel(t.Context())
-	cancel()
+		unreachable, cancel := context.WithCancel(t.Context())
+		cancel()
 
-	l.mu.Lock()
-	l.heartbeatHeld(unreachable)
-	_, stillRunningStale := l.running[9]
-	staleEntry, owed := l.cleanup[9]
-	l.mu.Unlock()
+		l.mu.Lock()
+		l.heartbeatHeld(unreachable)
+		_, stillRunningStale := l.running[9]
+		staleEntry, owed := l.cleanup[9]
+		l.mu.Unlock()
 
-	if stillRunningStale {
-		t.Fatal("a lease unconfirmed for longer than its TTL was still being advertised")
-	}
+		if stillRunningStale {
+			t.Fatal("a lease unconfirmed for longer than its TTL was still being advertised")
+		}
 
-	if !owed {
-		t.Fatal("a running job dropped for staleness left no cleanup obligation; the " +
-			"allocator never said the lease was lost, so there is even less reason to " +
-			"assume the container is gone")
-	}
+		if !owed {
+			t.Fatal("a running job dropped for staleness left no cleanup obligation; the " +
+				"allocator never said the lease was lost, so there is even less reason to " +
+				"assume the container is gone")
+		}
 
-	// The same payload check as the lost branch. Asserting only that the key
-	// exists let an empty pendingCleanup{} through, whose retry then destroys
-	// request 0 and leaves the real container running.
-	if staleEntry.job.RequestID != 9 {
-		t.Errorf("the stale branch's obligation names request %d, want 9",
-			staleEntry.job.RequestID)
-	}
+		// The same payload check as the lost branch. Asserting only that the key
+		// exists let an empty pendingCleanup{} through, whose retry then destroys
+		// request 0 and leaves the real container running.
+		if staleEntry.job.RequestID != 9 {
+			t.Errorf("the stale branch's obligation names request %d, want 9",
+				staleEntry.job.RequestID)
+		}
+	})
 }
 
 // UNCERTAINTY IS NOT ALLOWED TO OUTLAST THE LEASE.
@@ -6851,52 +6771,56 @@ func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
 func TestALeaseUnconfirmedForLongerThanItsTTLIsDropped(t *testing.T) {
 	t.Parallel()
 
-	const ttl = 200 * time.Millisecond
+	// IN A BUBBLE, so waiting past the TTL is the allocator's and the listener's
+	// clock moving, not the machine's.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 200 * time.Millisecond
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
 
-	holdRunning(t, l, a, tiers[0].Label, 7)
+		holdRunning(t, l, a, tiers[0].Label, 7)
 
-	// One good pass, so there is a confirmed renewal to measure from.
-	l.mu.Lock()
-	l.heartbeatHeld(t.Context())
-	l.mu.Unlock()
+		// One good pass, so there is a confirmed renewal to measure from.
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		l.mu.Unlock()
 
-	if _, ok := l.running[7]; !ok {
-		t.Fatal("a healthy renewal dropped the lease")
-	}
+		if _, ok := l.running[7]; !ok {
+			t.Fatal("a healthy renewal dropped the lease")
+		}
 
-	// Now nothing gets through. A cancelled context is the cheapest stand-in for
-	// an allocator that cannot be reached.
-	unreachable, cancel := context.WithCancel(t.Context())
-	cancel()
+		// Now nothing gets through. A cancelled context is the cheapest stand-in for
+		// an allocator that cannot be reached.
+		unreachable, cancel := context.WithCancel(t.Context())
+		cancel()
 
-	l.mu.Lock()
-	l.heartbeatHeld(unreachable)
-	_, keptAtOnce := l.running[7]
-	l.mu.Unlock()
+		l.mu.Lock()
+		l.heartbeatHeld(unreachable)
+		_, keptAtOnce := l.running[7]
+		l.mu.Unlock()
 
-	if !keptAtOnce {
-		t.Fatal("a single unreachable renewal dropped the lease; a failure to ask is not " +
-			"an answer, and dropping it removes the lease from the release path too")
-	}
+		if !keptAtOnce {
+			t.Fatal("a single unreachable renewal dropped the lease; a failure to ask is not " +
+				"an answer, and dropping it removes the lease from the release path too")
+		}
 
-	time.Sleep(2 * ttl)
+		time.Sleep(2 * ttl)
 
-	l.mu.Lock()
-	l.heartbeatHeld(unreachable)
-	_, keptTooLong := l.running[7]
-	l.mu.Unlock()
+		l.mu.Lock()
+		l.heartbeatHeld(unreachable)
+		_, keptTooLong := l.running[7]
+		l.mu.Unlock()
 
-	if keptTooLong {
-		t.Error("a lease went unconfirmed for longer than its TTL and was still being " +
-			"advertised; the reaper can have reclaimed it by now, so the capacity may " +
-			"already belong to another tier")
-	}
+		if keptTooLong {
+			t.Error("a lease went unconfirmed for longer than its TTL and was still being " +
+				"advertised; the reaper can have reclaimed it by now, so the capacity may " +
+				"already belong to another tier")
+		}
+	})
 }
 
 // THE UNCERTAINTY CLOCK STARTS AT ESCROW, NOT AT THE FIRST FAILED RENEWAL.
@@ -7302,109 +7226,104 @@ func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
 func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	t.Parallel()
 
-	// THE LEASE'S TIME IS THE ALLOCATOR'S CLOCK AND THE LOOP'S TICKS ARE THE
-	// TEST'S. At 300ms, and again at 2s, the TTL was a wall-clock race between
-	// the real ticker and a sleep: a loaded CI runner starved renewal past it, the
-	// reaper took the lease, and correct code was reported as a renewal failure
-	// (#188). The grace stays on the wall clock because it is the listener's own
-	// timer and the thing this test outlives.
-	const (
-		ttl   = 30 * time.Second
-		grace = 1 * time.Second
-		// LONGER THAN THE WAIT BELOW. The close blocks until the test has checked,
-		// so a finish grace shorter than that wait would abandon the close and the
-		// assertion would race the teardown it is meant to happen inside.
-		closing = 60 * time.Second
-	)
+	// IN A BUBBLE. At 300ms, and again at 2s, the TTL was a wall-clock race
+	// between the real ticker and a sleep: a loaded CI runner starved renewal
+	// past it, the reaper took the lease, and correct code was reported as a
+	// renewal failure (#188). In fake time the destroy grace, the close's own
+	// budget, the ticker and the allocator's clock all move together, and only
+	// when everything in the bubble is waiting.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ttl   = 30 * time.Second
+			grace = 1 * time.Second
+			// LONGER THAN THE GRACE AND THE TWO TTLS THE TEST WAITS INSIDE THE
+			// CLOSE: a finish grace shorter than that would abandon the close on a
+			// timer of the listener's own, and the assertion would race the
+			// teardown it is meant to happen inside.
+			closing = 5 * time.Minute
+		)
 
-	clock := newTestClock()
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
+		// A close that BLOCKS UNTIL THE TEST SAYS SO, rather than sleeping for a
+		// guessed interval, so the release cannot remove the lease before the
+		// check.
+		closing0 := make(chan struct{})
+		checked := make(chan struct{})
 
-	// A close that BLOCKS UNTIL THE TEST SAYS SO, rather than sleeping for a
-	// guessed interval. Sleeping meant the assertion raced the close: if the test
-	// goroutine lost 300ms to the scheduler, or the reap took it, the close
-	// finished and releaseAll removed the lease before the check — and correct
-	// code was reported as a renewal failure. Under t.Parallel on a loaded machine
-	// that is not a remote possibility.
-	closing0 := make(chan struct{})
-	checked := make(chan struct{})
+		// Released on every path out, including a failure before the check, or
+		// the close stays blocked and Run with it.
+		var releasing sync.Once
 
-	// Released on every path out, including a failure before the check, or the
-	// close stays blocked and Run with it.
-	var releasing sync.Once
+		release := func() { releasing.Do(func() { close(checked) }) }
+		t.Cleanup(release)
 
-	release := func() { releasing.Do(func() { close(checked) }) }
-	t.Cleanup(release)
+		var once sync.Once
 
-	var once sync.Once
+		session := &fakeSession{onClose: func(context.Context) error {
+			once.Do(func() { close(closing0) })
 
-	session := &fakeSession{onClose: func(context.Context) error {
-		once.Do(func() { close(closing0) })
+			<-checked
 
-		<-checked
+			return nil
+		}}
 
-		return nil
-	}}
+		l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+			WithShutdownGrace(grace), WithFinishGraces(closing, closing),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
 
-	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
-		WithShutdownGrace(grace), WithFinishGraces(closing, closing),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
-	renewal := driveRenewal(l, clock)
+		lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
-	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+		runDone := make(chan struct{})
 
-	runDone := make(chan struct{})
+		go func() {
+			defer close(runDone)
 
-	go func() {
-		defer close(runDone)
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
 
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
+		cancel()
+
+		select {
+		case <-closing0:
+		case <-runDone:
+			t.Fatal("the listener returned without closing its session")
+		case <-time.After(time.Minute):
+			t.Fatal("the shutdown never reached the session close")
 		}
-	}()
 
-	cancel()
+		// INSIDE THE CLOSE, and past the destroy budget: the grace is a timer
+		// started before the close was entered, so after this sleep it has
+		// expired, and renewal tied to it would have stopped. Then two TTLs,
+		// each reaped. The close cannot finish until this is done, so the only
+		// thing that can have kept the lease alive is renewal.
+		time.Sleep(grace)
 
-	select {
-	case <-closing0:
-	case <-runDone:
-		t.Fatal("the listener returned without closing its session")
-	case <-time.After(30 * time.Second):
-		t.Fatal("the shutdown never reached the session close")
-	}
+		throughTwoTTLs(t, a, ttl)
 
-	// INSIDE THE CLOSE, and past the destroy budget: the grace is a wall-clock
-	// timer started before the close was entered, so after this sleep it has
-	// expired whatever the scheduler did, and renewal tied to it would have
-	// stopped. Then two TTLs on the allocator's clock, each tick delivered to the
-	// listener's own loop and reaped. The close cannot finish until this is done,
-	// so the only thing that can have kept the lease alive is renewal.
-	time.Sleep(grace)
+		beat := a.Heartbeat(t.Context(), lease.ID, lease.Epoch)
 
-	renewal.throughTwoTTLs(t, a, "renewal stopped while the shutdown was still "+
-		"closing its session; the old maxCapacity is still live at that moment")
+		release()
 
-	beat := a.Heartbeat(t.Context(), lease.ID, lease.Epoch)
+		if beat != nil {
+			t.Fatalf("a lease expired while the shutdown was still closing its session (%v); "+
+				"the old maxCapacity is still live at that moment, so another tier can "+
+				"escrow capacity GitHub may still assign against", beat)
+		}
 
-	release()
-
-	if beat != nil {
-		t.Fatalf("a lease expired while the shutdown was still closing its session (%v); "+
-			"the old maxCapacity is still live at that moment, so another tier can "+
-			"escrow capacity GitHub may still assign against", beat)
-	}
-
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned")
-	}
+		select {
+		case <-runDone:
+		case <-time.After(time.Hour):
+			t.Fatal("Run never returned")
+		}
+	})
 }
 
 // A WEDGED TEARDOWN STOPS RENEWING, so the reaper can reclaim what it holds.
@@ -7418,148 +7337,132 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	t.Parallel()
 
-	// NOTHING HERE RACES THE WALL CLOCK. The "still alive" check once slept two
-	// TTLs against the real ticker and had to finish before the watchdog's real
-	// timer fired, and it fired its own FIXTURE GUARD in CI -- "the lease was
-	// already gone before the shutdown grace expired" -- because a stall spent
-	// the margin (#188). Renewal is now driven against the allocator's clock and
-	// the test ends the teardown budget itself, after checking the listener asked
-	// for the right one, so the grace only has to be longer than the test.
-	const (
-		ttl   = 30 * time.Second
-		grace = time.Minute
-	)
+	// IN A BUBBLE, AND JUDGED BY WHAT THE REAPER CAN TAKE. The "still alive"
+	// check once slept two TTLs against the real ticker and had to finish before
+	// the watchdog's real timer fired, and it fired its own fixture guard in CI
+	// because a stall spent the margin (#188); the version after it held the
+	// budget through a test-only deadline and waited on a hook in the loop. In
+	// fake time the listener's own budget runs out at an instant the test can
+	// compute, so it asks the ledger a step before that instant and two TTLs
+	// after it whether anyone is still renewing the lease.
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			ttl   = 30 * time.Second
+			grace = 2 * time.Minute
+			// THE WHOLE BUDGET, not a phase of it: the cleanup join and the
+			// destroys get a grace each, the close and the release a finish grace
+			// each. Computed from the fixture rather than asked of teardownBudget,
+			// which would agree with itself if it dropped a phase.
+			budget = 2*grace + 2*(grace/3)
+		)
 
-	clock := newTestClock()
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl), alloc.WithClock(clock.Now))
+		// A destroy that ignores its context entirely. Registered for cleanup at
+		// the moment it is created, so a t.Fatal below cannot strand the
+		// goroutine.
+		blocked := make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(blocked) })
 
-	// A destroy that ignores its context entirely. Registered for cleanup at the
-	// moment it is created, so a t.Fatal below cannot strand the goroutine.
-	blocked := make(chan struct{})
-	unblock := sync.OnceFunc(func() { close(blocked) })
+		t.Cleanup(unblock)
 
-	t.Cleanup(unblock)
+		entered := make(chan struct{}, 1)
 
-	entered := make(chan struct{}, 1)
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
+			<-blocked
+
+			return nil
+		}}
+
+		// The finish phases are bounded too, and renewal has to outlast ALL of
+		// them.
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+			WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3),
+			WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
+
+		lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		runDone := make(chan struct{})
+
+		go func() {
+			defer close(runDone)
+
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("Run: %v", err)
+			}
+		}()
+
+		// The budget is set as the shutdown begins, and the drain this listener
+		// skips is the only wait before it.
+		began := time.Now()
+
+		cancel()
+
 		select {
-		case entered <- struct{}{}:
-		default:
+		case <-entered:
+		case <-runDone:
+			t.Fatal("the listener returned without destroying the job it was running")
+		case <-time.After(time.Minute):
+			t.Fatal("the shutdown release never reached the runner")
 		}
 
-		<-blocked
+		// STILL RENEWED A STEP BEFORE THE BUDGET IS SPENT, after more than a TTL
+		// in which only the listener could have renewed it. Without this the test
+		// passes against a listener whose heartbeat never started, stopped the
+		// instant the caller cancelled, or stopped with the destroy phase's own
+		// grace while the close and the release still had time to run: it would
+		// prove only that an unrenewed lease dies, which needs no watchdog.
+		for time.Since(began) < budget-ttl/3 {
+			time.Sleep(ttl / 3)
+			synctest.Wait()
 
-		return nil
-	}}
-
-	// The finish phases are bounded too, and renewal has to outlast ALL of them.
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3),
-		WithDrainGrace(notDrainingHere), stopsWithoutWaiting())
-	renewal := driveRenewal(l, clock)
-
-	stopped := make(chan struct{})
-	l.heartbeatStopped = sync.OnceFunc(func() { close(stopped) })
-
-	// THE OVERALL BUDGET, held by the test: the listener's number is recorded
-	// and the deadline is a cancellation only this test triggers.
-	var (
-		asked     = make(chan time.Duration, 1)
-		endBudget = make(chan context.CancelFunc, 1)
-	)
-
-	l.teardownDeadline = func(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
-		budgeted, end := context.WithCancel(parent)
-
-		asked <- budget
-		endBudget <- end
-
-		return budgeted, end
-	}
-
-	lease := holdRunningOwedDestroy(t, l, a, tiers[0].Label, 7)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-
-	runDone := make(chan struct{})
-
-	go func() {
-		defer close(runDone)
-
-		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Run: %v", err)
-		}
-	}()
-
-	cancel()
-
-	select {
-	case <-entered:
-	case <-runDone:
-		t.Fatal("the listener returned without destroying the job it was running")
-	case <-time.After(30 * time.Second):
-		t.Fatal("the shutdown release never reached the runner")
-	}
-
-	// ALIVE FIRST. Without this the test passes against a listener whose
-	// heartbeat never started, or stopped the instant the caller cancelled — it
-	// would be proving only that an unrenewed lease dies, which needs no
-	// watchdog. Past a TTL into the teardown, still renewable, is what says
-	// renewal was running when the grace began.
-	renewal.throughTwoTTLs(t, a, "the heartbeat loop took no tick early in the "+
-		"teardown; renewal was not running, so this proves nothing about the watchdog")
-
-	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
-		t.Fatalf("the lease was already gone before the shutdown grace expired (%v); "+
-			"renewal was not running during the teardown, so this proves nothing about "+
-			"the watchdog", err)
-	}
-
-	// THE WHOLE BUDGET, not a phase of it: the cleanup join and the destroys get
-	// a grace each, the close and the release a finish grace each. Computed from
-	// the fixture rather than asked of teardownBudget, which would agree with
-	// itself if it dropped a phase. The deadline was created before the destroy
-	// began, so it is already here.
-	var end context.CancelFunc
-
-	select {
-	case budget := <-asked:
-		if want := 2*grace + 2*(grace/3); budget != want {
-			t.Errorf("the teardown asked for a budget of %v, want the whole %v; renewal "+
-				"would stop while a phase still had time to run", budget, want)
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
 		}
 
-		end = <-endBudget
-	default:
-		t.Fatal("the destroy began before the teardown set its overall budget")
-	}
+		if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
+			t.Fatalf("the lease was lost %v into a teardown whose budget is %v (%v); renewal "+
+				"stopped while a phase still had time to run", time.Since(began), budget, err)
+		}
 
-	// AND STOPPED ONCE IT IS SPENT, which is an event the loop reports rather
-	// than an interval this test sleeps through: with the ticks in the test's
-	// hands, a loop still running and one stopped look alike until something
-	// asks.
-	end()
+		// AND NOT RENEWED ONCE IT IS SPENT. The test's own heartbeat above is the
+		// last one anybody but the listener made, so two TTLs on, reaped at
+		// every step, the lease is gone unless the listener is still renewing
+		// it.
+		for time.Since(began) < budget+2*ttl {
+			time.Sleep(ttl / 3)
+			synctest.Wait()
 
-	select {
-	case <-stopped:
-	case <-time.After(30 * time.Second):
-		t.Fatal("a listener wedged in its teardown was still renewing after the shutdown " +
-			"budget was spent; the reaper can never reclaim that capacity, so one stuck " +
-			"destroy costs the deployment those vCPUs until the process is killed")
-	}
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
+		}
 
-	unblock()
+		if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err == nil {
+			t.Fatal("a listener wedged in its teardown was still renewing after the shutdown " +
+				"budget was spent; the reaper can never reclaim that capacity, so one stuck " +
+				"destroy costs the deployment those vCPUs until the process is killed")
+		}
 
-	select {
-	case <-runDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Run never returned after the node answered")
-	}
+		unblock()
+
+		select {
+		case <-runDone:
+		case <-time.After(time.Hour):
+			t.Fatal("Run never returned after the node answered")
+		}
+	})
 }
 
 // cleanupCount reports how many completions are waiting to be retried.
@@ -7668,120 +7571,124 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 	t.Parallel()
 
-	const ttl = 300 * time.Millisecond
+	// IN A BUBBLE, so waiting past the TTL is the allocator's and the listener's
+	// clock moving, not the machine's.
+	synctest.Test(t, func(t *testing.T) {
+		const ttl = 300 * time.Millisecond
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(ttl))
+		tiers := []config.Tier{tier("billet-4vcpu-a")}
+		a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+			alloc.WithLeaseTTL(ttl))
 
-	var answering atomic.Bool
+		var answering atomic.Bool
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
-		if answering.Load() {
-			return nil
+		runner := &fakeRunner{onDestroy: func(int64) error {
+			if answering.Load() {
+				return nil
+			}
+
+			return errors.New("the node is not answering")
+		}}
+
+		l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+			WithCleanupRetryPacing(0, 0))
+
+		holdRunning(t, l, a, tiers[0].Label, 7)
+
+		l.complete(t.Context(), dispatch.Job{RequestID: 7})
+
+		if cleanupCount(l) != 1 {
+			t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
 		}
 
-		return errors.New("the node is not answering")
-	}}
+		// REAPED, not released. A direct release leaves the lease terminal at the same
+		// epoch and the heartbeat sees ErrLeaseNotFound; a real reap bumps the epoch
+		// and it sees ErrFenced. Production collapses the two, and a test that only
+		// ever produces one cannot notice if that stops being true.
+		time.Sleep(2 * ttl)
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithCleanupRetryPacing(0, 0))
+		if _, err := a.Reap(t.Context()); err != nil {
+			t.Fatalf("reap: %v", err)
+		}
 
-	holdRunning(t, l, a, tiers[0].Label, 7)
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		_, stillRunning := l.running[7]
+		l.mu.Unlock()
 
-	l.complete(t.Context(), dispatch.Job{RequestID: 7})
+		if stillRunning {
+			t.Fatal("the listener kept a lease the reaper had taken, so nothing below this " +
+				"point is exercising a lost lease")
+		}
 
-	if cleanupCount(l) != 1 {
-		t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
-	}
+		if cleanupCount(l) != 1 {
+			t.Errorf("the retry record was dropped when the lease was reaped (%d pending); the "+
+				"container is still running on a host, GitHub will not redeliver the "+
+				"completion, and with a runner that cannot sweep nothing else would ever "+
+				"ask again", cleanupCount(l))
+		}
 
-	// REAPED, not released. A direct release leaves the lease terminal at the same
-	// epoch and the heartbeat sees ErrLeaseNotFound; a real reap bumps the epoch
-	// and it sees ErrFenced. Production collapses the two, and a test that only
-	// ever produces one cannot notice if that stops being true.
-	time.Sleep(2 * ttl)
+		// AND A RETRY THAT REDISCOVERS THE LOSS KEEPS IT TOO. The heartbeat is not the
+		// only route to this state: a retry can be the thing that finds the lease
+		// gone, and that path drops the record separately from the one above.
+		l.retryCleanup(t.Context())
 
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap: %v", err)
-	}
+		if cleanupCount(l) != 1 {
+			t.Errorf("a retry that found its lease gone dropped the record (%d pending); the "+
+				"destroy had still not succeeded, so the container is still there",
+				cleanupCount(l))
+		}
 
-	l.mu.Lock()
-	l.heartbeatHeld(t.Context())
-	_, stillRunning := l.running[7]
-	l.mu.Unlock()
+		// AND THE DESTROY IS WHAT ENDS IT. There is no lease left to release, so a
+		// retry that insisted on releasing would never finish; the obligation was to
+		// the compute and it is discharged the moment the node answers.
+		answering.Store(true)
 
-	if stillRunning {
-		t.Fatal("the listener kept a lease the reaper had taken, so nothing below this " +
-			"point is exercising a lost lease")
-	}
+		l.retryCleanup(t.Context())
 
-	if cleanupCount(l) != 1 {
-		t.Errorf("the retry record was dropped when the lease was reaped (%d pending); the "+
-			"container is still running on a host, GitHub will not redeliver the "+
-			"completion, and with a runner that cannot sweep nothing else would ever "+
-			"ask again", cleanupCount(l))
-	}
+		if cleanupCount(l) != 0 {
+			t.Errorf("a retry whose destroy finally succeeded is still pending (%d); it would "+
+				"be attempted on every pass for the life of the process", cleanupCount(l))
+		}
 
-	// AND A RETRY THAT REDISCOVERS THE LOSS KEEPS IT TOO. The heartbeat is not the
-	// only route to this state: a retry can be the thing that finds the lease
-	// gone, and that path drops the record separately from the one above.
-	l.retryCleanup(t.Context())
+		// AND THE PROMISED HALF, which is its own branch in the heartbeat. Without
+		// this, restoring the deletion there alone would pass every assertion above.
+		promised, err := a.Reserve(t.Context(), tiers[0].Label)
+		if err != nil {
+			t.Fatalf("reserve: %v", err)
+		}
 
-	if cleanupCount(l) != 1 {
-		t.Errorf("a retry that found its lease gone dropped the record (%d pending); the "+
-			"destroy had still not succeeded, so the container is still there",
-			cleanupCount(l))
-	}
+		l.mu.Lock()
+		l.acquiring[9] = &promise{lease: promised, at: time.Now()}
+		l.heldOrder[promised.ID] = 99
+		l.cleanup = map[int64]*pendingCleanup{9: {job: dispatch.Job{RequestID: 9}}}
+		l.mu.Unlock()
 
-	// AND THE DESTROY IS WHAT ENDS IT. There is no lease left to release, so a
-	// retry that insisted on releasing would never finish; the obligation was to
-	// the compute and it is discharged the moment the node answers.
-	answering.Store(true)
+		time.Sleep(2 * ttl)
 
-	l.retryCleanup(t.Context())
+		if _, err := a.Reap(t.Context()); err != nil {
+			t.Fatalf("reap the promised lease: %v", err)
+		}
 
-	if cleanupCount(l) != 0 {
-		t.Errorf("a retry whose destroy finally succeeded is still pending (%d); it would "+
-			"be attempted on every pass for the life of the process", cleanupCount(l))
-	}
+		l.mu.Lock()
+		l.heartbeatHeld(t.Context())
+		_, stillPromised := l.acquiring[9]
+		_, stillOrdered := l.heldOrder[promised.ID]
+		l.mu.Unlock()
 
-	// AND THE PROMISED HALF, which is its own branch in the heartbeat. Without
-	// this, restoring the deletion there alone would pass every assertion above.
-	promised, err := a.Reserve(t.Context(), tiers[0].Label)
-	if err != nil {
-		t.Fatalf("reserve: %v", err)
-	}
+		if stillPromised {
+			t.Fatal("the listener kept a promise the reaper had taken, so this proves nothing")
+		}
+		if stillOrdered {
+			t.Error("the lost promise retained issuance-order metadata for the life of the listener")
+		}
 
-	l.mu.Lock()
-	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
-	l.heldOrder[promised.ID] = 99
-	l.cleanup = map[int64]*pendingCleanup{9: {job: dispatch.Job{RequestID: 9}}}
-	l.mu.Unlock()
-
-	time.Sleep(2 * ttl)
-
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap the promised lease: %v", err)
-	}
-
-	l.mu.Lock()
-	l.heartbeatHeld(t.Context())
-	_, stillPromised := l.acquiring[9]
-	_, stillOrdered := l.heldOrder[promised.ID]
-	l.mu.Unlock()
-
-	if stillPromised {
-		t.Fatal("the listener kept a promise the reaper had taken, so this proves nothing")
-	}
-	if stillOrdered {
-		t.Error("the lost promise retained issuance-order metadata for the life of the listener")
-	}
-
-	if cleanupCount(l) != 1 {
-		t.Errorf("the retry record was dropped when a PROMISED lease was reaped (%d "+
-			"pending); a job billet acquired and launched leaves compute behind exactly "+
-			"like an assigned one", cleanupCount(l))
-	}
+		if cleanupCount(l) != 1 {
+			t.Errorf("the retry record was dropped when a PROMISED lease was reaped (%d "+
+				"pending); a job billet acquired and launched leaves compute behind exactly "+
+				"like an assigned one", cleanupCount(l))
+		}
+	})
 }
 
 // A COMPLETION THIS LISTENER DOES NOT HOLD IS NOT RECORDED FOR RETRY.
