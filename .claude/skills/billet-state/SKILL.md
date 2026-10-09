@@ -7,7 +7,7 @@ description: "Load when adding a migration or a query, touching internal/state, 
 
 ## What this area is
 
-`internal/state` owns the durable control-plane store: `DB`, the open modes, transactions, the migrator, the locks and fences, the controller claim, admission, pending completions, force-destroy records and the cache kill switch. SQL lives only in `internal/state/queries/*.sql` (including `internal/alloc`'s and `internal/rollout`'s), compiled by sqlc (pinned, `SQLC_VERSION`) into `internal/state/ledgerdb` and bound by `internal/state/queryset.go`. Migrations are files in `internal/state/migrations` (SQLite) and `internal/state/pgmigrations` (PostgreSQL), 57 of each, discovered by `go:embed`. `docs/reference/decisions/adr-008-state-backends.md` and `adr-009-controller-election.md` record the decisions.
+`internal/state` owns the durable control-plane store: `DB`, the open modes, transactions, the migrator, the locks and fences, the controller claim, admission, pending completions, force-destroy records and the cache kill switch. SQL lives only in `internal/state/queries/*.sql` (including `internal/alloc`'s and `internal/rollout`'s), compiled by sqlc (pinned, `SQLC_VERSION`) into `internal/state/ledgerdb` and bound by `internal/state/queryset.go`. Migrations are files in `internal/state/migrations` (SQLite) and `internal/state/pgmigrations` (PostgreSQL), 59 of each, discovered by `go:embed`. `docs/reference/decisions/adr-008-state-backends.md` and `adr-009-controller-election.md` record the decisions.
 
 Each invariant below is one line here and stated in full, with the incident or measurement behind it, in the reference file its group names. Read the reference before changing anything the invariant covers.
 

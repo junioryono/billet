@@ -154,6 +154,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 			joules(u.EnergyActiveMicrojoules), strconv.Quote(u.EnergySource))
 	})
 	renderCounters(line, u.Counters)
+	renderDestinations(w, u.Destinations)
 }
 
 // renderCounters writes what the hardware counters saw and the ratios a reader

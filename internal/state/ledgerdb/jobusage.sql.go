@@ -10,6 +10,51 @@ import (
 	"database/sql"
 )
 
+const readJobDestinations = `-- name: ReadJobDestinations :many
+SELECT ordinal, addr, sent_bytes, received_bytes, connections
+  FROM job_destinations WHERE lease_id = $1
+ ORDER BY ordinal
+`
+
+type ReadJobDestinationsRow struct {
+	Ordinal       int64
+	Addr          string
+	SentBytes     int64
+	ReceivedBytes int64
+	Connections   int64
+}
+
+// One lease's destinations in the order the node gave them, the total beyond
+// them last.
+func (q *Queries) ReadJobDestinations(ctx context.Context, leaseID string) ([]ReadJobDestinationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, readJobDestinations, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReadJobDestinationsRow
+	for rows.Next() {
+		var i ReadJobDestinationsRow
+		if err := rows.Scan(
+			&i.Ordinal,
+			&i.Addr,
+			&i.SentBytes,
+			&i.ReceivedBytes,
+			&i.Connections,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const readJobSeries = `-- name: ReadJobSeries :one
 SELECT codec, series FROM job_series WHERE lease_id = $1
 `
@@ -35,7 +80,8 @@ SELECT lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
        cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
        io_full_us, energy_active_uj, energy_idle_uj, energy_source, cycles,
        instructions, cache_references, cache_misses, branch_misses,
-       frontend_stall_cycles
+       frontend_stall_cycles, destinations_incomplete, tap_sent_bytes,
+       tap_received_bytes
   FROM job_usage WHERE lease_id = $1
 `
 
@@ -80,8 +126,42 @@ func (q *Queries) ReadJobUsage(ctx context.Context, leaseID string) (JobUsage, e
 		&i.CacheMisses,
 		&i.BranchMisses,
 		&i.FrontendStallCycles,
+		&i.DestinationsIncomplete,
+		&i.TapSentBytes,
+		&i.TapReceivedBytes,
 	)
 	return i, err
+}
+
+const recordJobDestination = `-- name: RecordJobDestination :exec
+INSERT INTO job_destinations
+     (lease_id, ordinal, addr, sent_bytes, received_bytes, connections)
+VALUES ($1, $2, $3, $4, $5,
+        $6)
+`
+
+type RecordJobDestinationParams struct {
+	LeaseID       string
+	Ordinal       int64
+	Addr          string
+	SentBytes     int64
+	ReceivedBytes int64
+	Connections   int64
+}
+
+// One of a job's destinations, or with an empty address and ordinal 256 the
+// total beyond them (migration 59). Written only by the usage report that won
+// RecordJobUsage, in its transaction, so a lease's rows are one report's.
+func (q *Queries) RecordJobDestination(ctx context.Context, arg RecordJobDestinationParams) error {
+	_, err := q.db.ExecContext(ctx, recordJobDestination,
+		arg.LeaseID,
+		arg.Ordinal,
+		arg.Addr,
+		arg.SentBytes,
+		arg.ReceivedBytes,
+		arg.Connections,
+	)
+	return err
 }
 
 const recordJobSeries = `-- name: RecordJobSeries :exec
@@ -113,7 +193,8 @@ INSERT INTO job_usage
       cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
       io_full_us, energy_active_uj, energy_idle_uj, energy_source,
       cycles, instructions, cache_references, cache_misses, branch_misses,
-      frontend_stall_cycles)
+      frontend_stall_cycles, destinations_incomplete, tap_sent_bytes,
+      tap_received_bytes)
 VALUES ($1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10, $11,
         $12, $13, $14, $15,
@@ -122,46 +203,50 @@ VALUES ($1, $2, $3, $4, $5, $6,
         $24, $25, $26, $27,
         $28, $29, $30, $31,
         $32, $33, $34,
-        $35)
+        $35, $36, $37,
+        $38)
 ON CONFLICT (lease_id) DO NOTHING
 `
 
 type RecordJobUsageParams struct {
-	LeaseID             string
-	Node                string
-	RecordedAt          string
-	Source              string
-	Unmeasured          string
-	Samples             int64
-	IntervalMs          int64
-	WindowMs            int64
-	CpuUserUs           int64
-	CpuSystemUs         int64
-	GuestCpuUs          int64
-	VmmCpuUs            int64
-	MemoryPeakBytes     int64
-	OomKills            int64
-	DiskReadBytes       int64
-	DiskWriteBytes      int64
-	NetRxBytes          int64
-	NetTxBytes          int64
-	NetRxPackets        int64
-	NetTxPackets        int64
-	CpuSomeUs           int64
-	CpuFullUs           int64
-	MemorySomeUs        int64
-	MemoryFullUs        int64
-	IoSomeUs            int64
-	IoFullUs            int64
-	EnergyActiveUj      int64
-	EnergyIdleUj        int64
-	EnergySource        string
-	Cycles              sql.NullInt64
-	Instructions        sql.NullInt64
-	CacheReferences     sql.NullInt64
-	CacheMisses         sql.NullInt64
-	BranchMisses        sql.NullInt64
-	FrontendStallCycles sql.NullInt64
+	LeaseID                string
+	Node                   string
+	RecordedAt             string
+	Source                 string
+	Unmeasured             string
+	Samples                int64
+	IntervalMs             int64
+	WindowMs               int64
+	CpuUserUs              int64
+	CpuSystemUs            int64
+	GuestCpuUs             int64
+	VmmCpuUs               int64
+	MemoryPeakBytes        int64
+	OomKills               int64
+	DiskReadBytes          int64
+	DiskWriteBytes         int64
+	NetRxBytes             int64
+	NetTxBytes             int64
+	NetRxPackets           int64
+	NetTxPackets           int64
+	CpuSomeUs              int64
+	CpuFullUs              int64
+	MemorySomeUs           int64
+	MemoryFullUs           int64
+	IoSomeUs               int64
+	IoFullUs               int64
+	EnergyActiveUj         int64
+	EnergyIdleUj           int64
+	EnergySource           string
+	Cycles                 sql.NullInt64
+	Instructions           sql.NullInt64
+	CacheReferences        sql.NullInt64
+	CacheMisses            sql.NullInt64
+	BranchMisses           sql.NullInt64
+	FrontendStallCycles    sql.NullInt64
+	DestinationsIncomplete sql.NullInt64
+	TapSentBytes           sql.NullInt64
+	TapReceivedBytes       sql.NullInt64
 }
 
 // Job usage: what a job did to the host, measured by the host (migration 57).
@@ -175,7 +260,9 @@ type RecordJobUsageParams struct {
 // write the series: otherwise a first report without a series and a second
 // with one would be stored as a pair neither request sent.
 //
-// A hardware counter is NULL where it was not counted (migration 58).
+// A hardware counter is NULL where it was not counted (migration 58), and
+// destinations_incomplete is NULL where the flows were not totalled, the tap's
+// totals NULL where the tap was not read (migration 59).
 func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, recordJobUsage,
 		arg.LeaseID,
@@ -213,6 +300,9 @@ func (q *Queries) RecordJobUsage(ctx context.Context, arg RecordJobUsageParams) 
 		arg.CacheMisses,
 		arg.BranchMisses,
 		arg.FrontendStallCycles,
+		arg.DestinationsIncomplete,
+		arg.TapSentBytes,
+		arg.TapReceivedBytes,
 	)
 	if err != nil {
 		return 0, err

@@ -18,6 +18,9 @@ type (
 	JobUsage         = lease.JobUsage
 	UsageSeries      = lease.UsageSeries
 	JobCounters      = lease.JobCounters
+	JobDestinations  = lease.JobDestinations
+	JobDestination   = lease.JobDestination
+	TapTotals        = lease.TapTotals
 )
 
 const (
@@ -64,6 +67,7 @@ const (
 	UsageSourceHost         = lease.UsageSourceHost
 	UsageSeriesCodec        = lease.UsageSeriesCodec
 	MaxUsageSeriesBytes     = lease.MaxUsageSeriesBytes
+	MaxJobDestinations      = lease.MaxJobDestinations
 )
 
 // ErrLeaseNotFound means the lease does not exist, or is already terminal.

@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"math"
 	"net"
 	"path/filepath"
 	"slices"
@@ -103,18 +104,22 @@ func (r *Runner) startFlows(name string, target provider.UsageTarget, launchedAt
 }
 
 // finalFlows takes what a job's connections came to, counting none that
-// started after until, when the job's destroy began. Until the ledger stores
-// them, they are said in the node's log, beside the tap's own totals.
-func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, sum usage.Summary, sampled bool) {
+// started after until, when the job's destroy began, and says it in the node's
+// log beside the tap's own totals. It returns what the usage report carries:
+// nil when the flows were not totalled, which the ledger keeps as not totalled
+// rather than as a job that sent nothing.
+func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, sum usage.Summary,
+	sampled bool,
+) *alloc.JobDestinations {
 	if r.flows == nil {
-		return
+		return nil
 	}
 
 	res, measured, err := r.flows.Final(context.WithoutCancel(ctx), name, until)
 	if !measured {
 		r.log.Warn("a job's traffic was not totalled by destination", "runner", name, "error", err)
 
-		return
+		return nil
 	}
 
 	c := compareWithTap(res, sum, sampled)
@@ -129,6 +134,54 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, s
 	}
 
 	r.log.Info("a job's traffic by destination", attrs...)
+
+	return jobDestinationsOf(res, c)
+}
+
+// jobDestinationsOf is the report's destinations: each one as the tracker
+// totalled it, largest first, the rest under Other, and the tap's totals when
+// they were read and are not negative.
+//
+// A TOTAL TOO LARGE FOR THE LEDGER IS KEPT AT ITS LARGEST AND THE RESULT MARKED
+// INCOMPLETE, so it reads as the lower bound it then is; and traffic to an
+// address that is not one (which the tracker never reports) is counted under
+// Other rather than lost.
+func jobDestinationsOf(res flows.Result, c tapComparison) *alloc.JobDestinations {
+	out := &alloc.JobDestinations{Incomplete: res.Incomplete}
+	clamp := func(v uint64) int64 {
+		if v > math.MaxInt64 {
+			out.Incomplete = true
+			return math.MaxInt64
+		}
+		return int64(v)
+	}
+	add := func(a, b int64) int64 {
+		if a > math.MaxInt64-b {
+			out.Incomplete = true
+			return math.MaxInt64
+		}
+		return a + b
+	}
+	other := alloc.JobDestination{SentBytes: clamp(res.Other.Sent), ReceivedBytes: clamp(res.Other.Received),
+		Connections: clamp(res.Other.Connections)}
+	for _, d := range res.Destinations {
+		dest := alloc.JobDestination{Addr: d.Addr.String(), SentBytes: clamp(d.Sent),
+			ReceivedBytes: clamp(d.Received), Connections: clamp(d.Connections)}
+		if !d.Addr.IsValid() || len(out.Destinations) == alloc.MaxJobDestinations {
+			other.SentBytes = add(other.SentBytes, dest.SentBytes)
+			other.ReceivedBytes = add(other.ReceivedBytes, dest.ReceivedBytes)
+			other.Connections = add(other.Connections, dest.Connections)
+
+			continue
+		}
+		out.Destinations = append(out.Destinations, dest)
+	}
+	out.Other = other
+	if c.tapKnown && c.tapSent >= 0 && c.tapReceived >= 0 {
+		out.Tap = &alloc.TapTotals{SentBytes: c.tapSent, ReceivedBytes: c.tapReceived}
+	}
+
+	return out
 }
 
 // tapComparison is what a job's destinations attributed, beside its tap's own
@@ -193,12 +246,15 @@ func (r *Runner) forgetMonitoring(name string) {
 // reportUsage sends a job's usage to the ledger, fenced on the lease's epoch.
 // The lease must still be live: the plane releases it only after the destroy
 // this runs inside of returns.
-func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name string, sum usage.Summary) {
+func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name string, sum usage.Summary,
+	destinations *alloc.JobDestinations,
+) {
 	rec, ok := r.alloc.(UsageRecorder)
 	if !ok || lease == nil {
 		return
 	}
 	report, series := jobUsageOf(sum)
+	report.Destinations = destinations
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
 	defer cancel()
 
