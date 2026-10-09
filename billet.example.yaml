@@ -461,9 +461,10 @@ node:
   # with the CPU's hardware counters, guest mode included: cycles, instructions,
   # cache references and misses, branch misses and frontend stall cycles, from
   # which `billet jobs show` derives IPC and misses per 1,000 instructions. An
-  # event the CPU cannot count is reported unmeasured, never as zero. If the
-  # NMI watchdog holds a counter (kernel.nmi_watchdog=1), the six events cannot
-  # be scheduled together and every one reads unmeasured.
+  # event the CPU cannot count is reported unmeasured, never as zero. The six
+  # are scheduled together or not at all, so the node proves at startup that
+  # they count on every CPU and refuses perf where they do not; the NMI
+  # watchdog holding a counter is the usual reason (kernel.nmi_watchdog=0).
   #
   # monitoring:
   #   interval: 1s
