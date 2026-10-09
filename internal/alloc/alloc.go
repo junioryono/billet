@@ -361,6 +361,10 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		case len(t.PoolPolicyErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.PoolPolicyErrors(fmt.Sprintf("tier %q", t.Label))...))
+		case len(t.ImageOptionErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			// A docker launch would read "--network=host" as a flag (#449).
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.ImageOptionErrors(fmt.Sprintf("tier %q", t.Label))...))
 
 		case len(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",

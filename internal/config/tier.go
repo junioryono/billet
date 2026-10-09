@@ -543,6 +543,8 @@ func (t Tier) LaunchErrors(where string) []error {
 
 		if t.Image == "" {
 			errs = append(errs, fmt.Errorf("%s: image is required", where))
+		} else if err := imageNotAnOption(t.Image); err != nil {
+			errs = append(errs, fmt.Errorf("%s: image %w", where, err))
 		}
 
 		return errs
@@ -568,6 +570,8 @@ func (t Tier) LaunchErrors(where string) []error {
 				where, provider, provider))
 		} else if launch.Image == "" {
 			errs = append(errs, fmt.Errorf("%s: launch.%s.image is required", where, provider))
+		} else if err := imageNotAnOption(launch.Image); err != nil {
+			errs = append(errs, fmt.Errorf("%s: launch.%s.image %w", where, provider, err))
 		}
 	}
 
@@ -585,6 +589,46 @@ func (t Tier) LaunchErrors(where string) []error {
 	}
 
 	return errs
+}
+
+// ImageOptionErrors refuses every image of the tier, top-level or in launch,
+// that a backend's command line would read as an option. alloc.New applies it to
+// a catalogue built in code, which never passed through Load.
+func (t Tier) ImageOptionErrors(where string) []error {
+	var errs []error
+	if t.Image != "" {
+		if err := imageNotAnOption(t.Image); err != nil {
+			errs = append(errs, fmt.Errorf("%s: image %w", where, err))
+		}
+	}
+	providers := make([]string, 0, len(t.Launch))
+	for provider := range t.Launch {
+		providers = append(providers, string(provider))
+	}
+	slices.Sort(providers)
+	for _, provider := range providers {
+		if err := imageNotAnOption(t.Launch[ProviderKind(provider)].Image); err != nil {
+			errs = append(errs, fmt.Errorf("%s: launch.%s.image %w", where, provider, err))
+		}
+	}
+
+	return errs
+}
+
+// imageNotAnOption refuses an image a backend's command line would read as an
+// option: docker run reads "--network=host" as a flag and then takes the next
+// argument as the image. No docker image, tart VM, guest image generation or
+// AMI is named with a leading dash, so the refusal costs no real name.
+//
+// LEADING SPACE IS LOOKED THROUGH, because the ceph store trims an image before
+// it names it to rbd: " --help@verified" reaches rbd as "--help".
+func imageNotAnOption(image string) error {
+	if strings.HasPrefix(strings.TrimSpace(image), "-") {
+		return fmt.Errorf("%q begins with \"-\", which a backend's command line reads as an "+
+			"option rather than a name; no image is named so", image)
+	}
+
+	return nil
 }
 
 // ImageFor returns the image name understood by a selected provider.

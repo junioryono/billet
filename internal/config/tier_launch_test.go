@@ -107,3 +107,38 @@ func TestLaunchMapRefusesAmbiguousTopLevelBootFields(t *testing.T) {
 		}
 	}
 }
+
+// AN IMAGE THAT BEGINS WITH A DASH IS REFUSED, top-level or in launch, because
+// a backend's command line would read it as an option (docker run takes
+// "--network=host" as a flag and the next argument as the image); a dash
+// anywhere else is an ordinary name.
+func TestAnImageThatReadsAsAnOptionIsRefused(t *testing.T) {
+	t.Parallel()
+
+	top := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n", "    image: --network=host\n", 1)
+	if _, err := Load(writeConfig(t, top)); err == nil || !strings.Contains(err.Error(), `image "--network=host" begins with "-"`) {
+		t.Fatalf("Load with a top-level image beginning with a dash = %v, want a refusal naming it", err)
+	}
+
+	launch := strings.Replace(validConfig, "    provider: firecracker\n", "    providers: [firecracker, ec2]\n", 1)
+	launch = strings.Replace(launch, "    image: ubuntu-2404-x64\n", `    launch:
+      firecracker:
+        image: ubuntu-2404-x64@verified
+      ec2:
+        image: -ami-0123456789abcdef0
+`, 1)
+	if _, err := Load(writeConfig(t, launch)); err == nil ||
+		!strings.Contains(err.Error(), `launch.ec2.image "-ami-0123456789abcdef0" begins with "-"`) {
+		t.Fatalf("Load with a launch image beginning with a dash = %v, want a refusal naming it", err)
+	}
+
+	spaced := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n", "    image: \" --help@verified\"\n", 1)
+	if _, err := Load(writeConfig(t, spaced)); err == nil || !strings.Contains(err.Error(), `begins with "-"`) {
+		t.Fatalf("Load with a dash behind a space = %v, want a refusal naming it", err)
+	}
+
+	inner := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n", "    image: ubuntu-2404-x64-minimal\n", 1)
+	if _, err := Load(writeConfig(t, inner)); err != nil {
+		t.Fatalf("Load with a dash inside the image name = %v, want accepted", err)
+	}
+}

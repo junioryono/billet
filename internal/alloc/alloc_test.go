@@ -379,6 +379,39 @@ func TestAllocatorReappliesInterceptionProviderSafety(t *testing.T) {
 	}
 }
 
+// AN IMAGE A LAUNCH WOULD READ AS AN OPTION IS REFUSED OUTSIDE config.Load TOO
+// (#449), top-level or in launch, and an ordinary image name is not.
+func TestAllocatorReappliesTheImageOptionRule(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*config.Tier){
+		"top-level":      func(tier *config.Tier) { tier.Image = "--network=host" },
+		"behind a space": func(tier *config.Tier) { tier.Image = " --help@verified" },
+		"launch": func(tier *config.Tier) {
+			tier.Launch = map[config.ProviderKind]config.TierLaunch{
+				config.ProviderDocker: {Image: "--privileged"},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			unsafe := tier("dash-image", 2, 4*config.GiB)
+			mutate(&unsafe)
+			_, err := New(openTestLedger(t), Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{unsafe})
+			if err == nil || !strings.Contains(err.Error(), `begins with "-"`) {
+				t.Fatalf("New with an image beginning with a dash = %v, want a refusal naming it", err)
+			}
+		})
+	}
+
+	ordinary := tier("ordinary-image", 2, 4*config.GiB)
+	ordinary.Image = "ghcr.io/actions/runner:latest"
+	if _, err := New(openTestLedger(t), Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{ordinary}); err != nil {
+		t.Fatalf("New with an ordinary image = %v, want accepted", err)
+	}
+}
+
 func TestAllocatorReappliesPoolAuthoritySafety(t *testing.T) {
 	t.Parallel()
 
