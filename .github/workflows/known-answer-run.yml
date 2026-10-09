@@ -6,14 +6,10 @@ name: Known-answer run
 # serves, so every loaded job's idle reference ran on the same host. The kit's
 # scripts are fetched from this run's own commit.
 
-on:
-  workflow_dispatch:
-    inputs:
-      seconds:
-        description: How long the idle, cpu and memory loads run
-        required: false
-        default: 60
-        type: number
+# THE LOADS RUN 60 SECONDS, written here rather than as a dispatch input: a
+# dispatch input reaches a reusable workflow as a string, and the kit's number
+# input refuses it (measured 2026-10-09, "Unexpected value '60'").
+on: workflow_dispatch
 
 permissions:
   contents: read
@@ -24,7 +20,7 @@ jobs:
     with:
       runner_label: billet-8vcpu-ubuntu-2404
       billet_ref: ${{ github.sha }}
-      seconds: ${{ inputs.seconds }}
+      seconds: 60
       cpu_workers: 4
       memory_bytes: 2147483648
       network_url: https://speed.cloudflare.com/__down?bytes=104857600
