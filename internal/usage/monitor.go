@@ -602,9 +602,9 @@ func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 
 // count reads a job's hardware counters against the vCPU thread listing taken
 // with s. Only Run calls it.
-func (m *Monitor) count(j *job, c *jobCounters, s Sample, vcpus []int) {
-	c.update(m.opts.Counters, vcpus, s.ThreadsOK, func(tid int) (bool, error) {
-		return m.reader.isVCPUThread(j.target, tid)
+func (m *Monitor) count(j *job, c *jobCounters, s Sample, vcpus []vcpuThread) {
+	c.update(m.opts.Counters, vcpus, s.ThreadsOK, func(v vcpuThread) (bool, error) {
+		return m.reader.isVCPUThread(j.target, v)
 	})
 }
 

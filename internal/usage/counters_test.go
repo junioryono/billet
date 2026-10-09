@@ -289,6 +289,14 @@ func TestAThreadThatWasNeverReadIsNotCountedAsZero(t *testing.T) {
 	src.set(refVCPUs, reading(time.Second, time.Second, 10, 12, 3, 1, 1, 2))
 	m.Tick()
 
+	// WHILE THE GROUP IS OPEN, as a tick publishes the job's totals and a Final
+	// that cannot reach Run answers them.
+	m.mu.Lock()
+	live := m.jobs["vm"].counters
+	m.mu.Unlock()
+	if live == nil || live.Measured != [NumEvents]bool{} {
+		t.Errorf("the live counters are %+v, want every event unmeasured", live)
+	}
 	if c := finalCounters(t, m); c.Measured != [NumEvents]bool{} {
 		t.Errorf("counters = %+v, want every event unmeasured", c)
 	}
@@ -337,6 +345,7 @@ func TestAThreadWhoseIdentityCannotBeCheckedLeavesNoTotal(t *testing.T) {
 	}
 	src.set(refVCPUs, reading(time.Second, time.Second, 70, 70, 70, 70, 70, 70))
 	m.Start("vm", target, 8)
+	m.Tick() // the barrier, as above
 	if writeErr != nil {
 		t.Fatalf("the thread's stat could not be spoiled: %v", writeErr)
 	}
@@ -432,6 +441,9 @@ func TestATidThatIsNoLongerTheVMMsIsNotCounted(t *testing.T) {
 	}
 	src.set(refVCPUs, reading(time.Second, time.Second, 70, 70, 70, 70, 70, 70))
 	m.Start("vm", target, 8)
+	// TICK IS THE BARRIER: it waits for Run without a limit, so whatever Run did
+	// for Start, the callback included, has happened, even if Start gave up.
+	m.Tick()
 	if removeErr != nil {
 		t.Fatalf("the tid could not be taken from the VMM: %v", removeErr)
 	}
@@ -470,6 +482,7 @@ func TestCounterGroupsLiveAndDieOnTheSamplersGoroutine(t *testing.T) {
 	other.CgroupDir = "/sys/fs/cgroup/other"
 	tr.write(other.CgroupDir+"/cpu.stat", "usage_usec 5\nuser_usec 5\nsystem_usec 0\n")
 	m.Start("other", other, 8)
+	m.Tick() // the barrier: Start may give up before Run has opened anything
 	if len(src.open()) == 0 {
 		t.Fatal("the second job opened no groups, so this proves nothing about Forget")
 	}
@@ -503,6 +516,7 @@ func TestAStoppedSamplerClosesItsGroups(t *testing.T) {
 		m.Run(runCtx)
 	}()
 	m.Start("vm", target, 8)
+	m.Tick() // the barrier: Start may give up before Run has opened anything
 	if len(src.open()) != 8 {
 		t.Fatalf("Start opened %d threads' groups, want 8", len(src.open()))
 	}
@@ -595,5 +609,69 @@ func TestAGroupReadIsDecodedOnlyWhole(t *testing.T) {
 		if _, err := decodeGroupRead(tc.buf, events); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: decoded with %v, want a refusal saying %q", name, err, tc.want)
 		}
+	}
+}
+
+// A TID GIVEN TO ANOTHER vCPU THREAD BETWEEN TWO SAMPLES IS ANOTHER THREAD:
+// the departed thread's group is retired with its last reading, and the new
+// thread gets a group of its own, rather than the old descriptor's final count
+// standing in for it.
+func TestATidGivenToAnotherThreadIsCountedAsAnotherThread(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	tr, target, m := countedVM(t, src)
+	m.Start("vm", target, 8)
+	src.set(refVCPUs, reading(time.Second, time.Second, 100, 100, 100, 100, 100, 100))
+	m.Tick()
+
+	reborn := strings.Replace(refThreads["315378"], " 298947566 ", " 298999999 ", 1)
+	if reborn == refThreads["315378"] {
+		t.Fatal("the fixture's start time moved, so this restarts nothing")
+	}
+	tr.write("/proc/315359/task/315378/stat", reborn+"\n")
+	src.set([]int{315378}, reading(time.Second, time.Second, 40, 40, 40, 40, 40, 40))
+	m.Tick()
+
+	src.mu.Lock()
+	opens := src.opens[315378]
+	src.mu.Unlock()
+	if opens != 2 || src.open()[315378] != 1 {
+		t.Errorf("the reused tid was opened %d times with %d groups open, want twice and one",
+			opens, src.open()[315378])
+	}
+	if got := finalCounters(t, m).Values[Cycles]; got != 7*100+100+40 {
+		t.Errorf("cycles = %d, want %d: seven threads at 100, the departed one's last 100, and "+
+			"its successor's 40", got, 7*100+100+40)
+	}
+}
+
+// A TID THAT NAMES ANOTHER THREAD BY THE TIME IT IS OPENED is closed unread:
+// the group counts the newcomer, which the next listing names and opens as
+// itself, and the departed thread is not counted twice.
+func TestATidReusedBetweenTheListingAndTheOpenIsNotCountedTwice(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	tr, target, m := countedVM(t, src)
+	reborn := strings.Replace(refThreads["315378"], " 298947566 ", " 298999999 ", 1)
+	var writeErr error
+	src.onOpen = func(tid int) {
+		if tid == 315378 && writeErr == nil && reborn != "" {
+			writeErr = os.WriteFile(filepath.Join(tr.root, "proc", "315359", "task", "315378", "stat"),
+				[]byte(reborn+"\n"), 0o600)
+			reborn = ""
+		}
+	}
+	src.set(refVCPUs, reading(time.Second, time.Second, 70, 70, 70, 70, 70, 70))
+	m.Start("vm", target, 8)
+	m.Tick() // the barrier, and the sample that lists the newcomer
+	if writeErr != nil || reborn != "" {
+		t.Fatalf("the tid was not given to another thread during the open (%v)", writeErr)
+	}
+
+	if got := finalCounters(t, m).Values[Cycles]; got != 8*70 {
+		t.Errorf("cycles = %d, want %d: the first open counted the newcomer and was closed unread",
+			got, 8*70)
 	}
 }

@@ -75,7 +75,7 @@ type jobCounters struct {
 	// failed holds the threads that could not be counted, which are not opened
 	// again: the job's totals are already could-not-tell, and a retry every
 	// sample would open a descriptor every sample.
-	failed map[int]bool
+	failed map[vcpuThread]bool
 	// exited is the last scaled reading of every thread that has gone.
 	exited [NumEvents]uint64
 	// counted marks an event some thread's group opened, and broken one some
@@ -88,6 +88,9 @@ type jobCounters struct {
 }
 
 type threadCounters struct {
+	// start is the thread's start time: with its tid, which thread the group
+	// counts.
+	start  uint64
 	group  CounterGroup
 	opened [NumEvents]bool
 	// last is the most recent scaled reading, and raw the reading it was scaled
@@ -133,18 +136,23 @@ func scale(value uint64, enabled, running time.Duration) (uint64, bool) {
 // already open are read and nothing is opened or retired. alive says whether a
 // thread just opened is still one of the job's vCPU threads, or that it could
 // not tell.
-func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool,
-	alive func(tid int) (bool, error),
+//
+// A THREAD IS ITS TID AND ITS START TIME, so a tid freed by one vCPU thread and
+// given to another between two listings retires the first thread's group and
+// opens one for the second, rather than reading the departed thread's final
+// count as the new one's.
+func (c *jobCounters) update(src CounterSource, vcpus []vcpuThread, listed bool,
+	alive func(vcpuThread) (bool, error),
 ) {
 	if c.finished {
 		return
 	}
 	if c.threads == nil {
-		c.threads, c.failed = map[int]*threadCounters{}, map[int]bool{}
+		c.threads, c.failed = map[int]*threadCounters{}, map[vcpuThread]bool{}
 	}
 	if listed {
 		for tid, th := range c.threads {
-			if !slices.Contains(vcpus, tid) {
+			if !slices.Contains(vcpus, vcpuThread{tid: tid, start: th.start}) {
 				// A THREAD THAT EXITED KEEPS ITS LAST READING: the descriptor of an
 				// exited task still answers its final count, and if it does not,
 				// the reading before it stands.
@@ -152,9 +160,9 @@ func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool,
 				c.retire(tid, th)
 			}
 		}
-		for _, tid := range vcpus {
-			if _, ok := c.threads[tid]; !ok && !c.failed[tid] {
-				c.open(src, tid, alive)
+		for _, v := range vcpus {
+			if _, ok := c.threads[v.tid]; !ok && !c.failed[v] {
+				c.open(src, v, alive)
 			}
 		}
 	}
@@ -170,25 +178,25 @@ func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool,
 // threads, and a group that counted it is closed unread. A check that cannot
 // tell closes it too, and makes the job's counts could-not-tell, since the
 // thread may be one of the job's and is no longer counted.
-func (c *jobCounters) open(src CounterSource, tid int, alive func(int) (bool, error)) {
-	g, err := src.Open(tid)
+func (c *jobCounters) open(src CounterSource, v vcpuThread, alive func(vcpuThread) (bool, error)) {
+	g, err := src.Open(v.tid)
 	if errors.Is(err, ErrThreadGone) {
 		return
 	}
 	if err != nil {
-		c.fail(tid)
+		c.fail(v)
 		return
 	}
-	switch ok, err := alive(tid); {
+	switch ok, err := alive(v); {
 	case err != nil:
 		_ = g.Close()
-		c.fail(tid)
+		c.fail(v)
 		return
 	case !ok:
 		_ = g.Close()
 		return
 	}
-	th := &threadCounters{group: g, opened: g.Opened()}
+	th := &threadCounters{start: v.start, group: g, opened: g.Opened()}
 	for e := range NumEvents {
 		if th.opened[e] {
 			c.counted[e] = true
@@ -196,13 +204,13 @@ func (c *jobCounters) open(src CounterSource, tid int, alive func(int) (bool, er
 			c.broken[e] = true
 		}
 	}
-	c.threads[tid] = th
+	c.threads[v.tid] = th
 }
 
 // fail records a vCPU thread that could not be counted: every event is then
 // could-not-tell for the job, and the thread is not tried again.
-func (c *jobCounters) fail(tid int) {
-	c.failed[tid] = true
+func (c *jobCounters) fail(v vcpuThread) {
+	c.failed[v] = true
 	for e := range NumEvents {
 		c.broken[e] = true
 	}

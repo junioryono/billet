@@ -91,9 +91,16 @@ func (r Reader) Read(t Target) Sample {
 	return s
 }
 
-// readListing is Read, and the tids of the VMM's vCPU threads the sample's
-// thread split was read from: nil unless ThreadsOK.
-func (r Reader) readListing(t Target) (Sample, []int) {
+// vcpuThread names one vCPU thread: its tid, and the start time that with the
+// tid names one thread, since a tid the kernel frees can be given to another.
+type vcpuThread struct {
+	tid   int
+	start uint64
+}
+
+// readListing is Read, and the VMM's vCPU threads the sample's thread split was
+// read from: nil unless ThreadsOK.
+func (r Reader) readListing(t Target) (Sample, []vcpuThread) {
 	var s Sample
 	if t.Process {
 		s.readProcess(r, t)
@@ -208,7 +215,7 @@ func (s *Sample) readNet(r Reader, t Target) {
 
 // readThreads splits a VMM's CPU time into its vCPU threads (guest code) and
 // everything else (the event loop, the API thread: emulation and IO).
-func (s *Sample) readThreads(r Reader, t Target) []int {
+func (s *Sample) readThreads(r Reader, t Target) []vcpuThread {
 	if t.PID <= 0 || t.VCPUThreadPrefix == "" || t.PIDStart == 0 {
 		return nil
 	}
@@ -227,13 +234,13 @@ func (s *Sample) readThreads(r Reader, t Target) []int {
 	return vcpus
 }
 
-// isVCPUThread reports whether tid is still one of the target VMM's vCPU
-// threads: listed under the VMM, named as one, and the VMM still the process
-// the target recorded. A thread or a VMM that is gone is a no; a read that
-// fails otherwise, or a stat it cannot parse, is an error, because it cannot
-// tell.
-func (r Reader) isVCPUThread(t Target, tid int) (bool, error) {
-	raw, err := r.read(fmt.Sprintf("/proc/%d/task/%d/stat", t.PID, tid))
+// isVCPUThread reports whether v is still one of the target VMM's vCPU
+// threads: listed under the VMM with the start time it was listed with, named
+// as one, and the VMM still the process the target recorded. A thread or a VMM
+// that is gone, or a tid now naming another thread, is a no; a read that fails
+// otherwise, or a stat it cannot parse, is an error, because it cannot tell.
+func (r Reader) isVCPUThread(t Target, v vcpuThread) (bool, error) {
+	raw, err := r.read(fmt.Sprintf("/proc/%d/task/%d/stat", t.PID, v.tid))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -244,7 +251,11 @@ func (r Reader) isVCPUThread(t Target, tid int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !strings.HasPrefix(comm, t.VCPUThreadPrefix) {
+	threadStart, err := parseStartTime(raw)
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasPrefix(comm, t.VCPUThreadPrefix) || threadStart != v.start {
 		return false, nil
 	}
 	start, err := r.ProcessStart(t.PID)
@@ -268,14 +279,14 @@ func (r Reader) ProcessStart(pid int) (uint64, error) {
 	return parseStartTime(raw)
 }
 
-func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []int, error) {
+func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []vcpuThread, error) {
 	dir := fmt.Sprintf("/proc/%d/task", pid)
 	entries, err := os.ReadDir(r.path(dir))
 	if err != nil {
 		return 0, 0, nil, err
 	}
 	var guest, vmm int64
-	var vcpus []int
+	var vcpus []vcpuThread
 	for _, entry := range entries {
 		raw, err := r.read(filepath.Join(dir, entry.Name(), "stat"))
 		if errors.Is(err, os.ErrNotExist) {
@@ -298,8 +309,12 @@ func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []int, er
 		if err != nil {
 			return 0, 0, nil, fmt.Errorf("usage: task %q is not a thread id", entry.Name())
 		}
+		start, err := parseStartTime(raw)
+		if err != nil {
+			return 0, 0, nil, err
+		}
 		guest += ticks
-		vcpus = append(vcpus, tid)
+		vcpus = append(vcpus, vcpuThread{tid: tid, start: start})
 	}
 	if len(vcpus) == 0 {
 		return 0, 0, nil, fmt.Errorf("usage: pid %d has no %q thread, so it is not the VMM", pid, vcpuPrefix)
