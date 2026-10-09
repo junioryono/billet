@@ -137,13 +137,20 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 func nightlyContext(t *testing.T) gobuild.Context {
 	t.Helper()
 
+	// THE BUILD CACHE THIS MACHINE USES, resolved first: it may be set only in
+	// the go env file the query below turns off, and the query needs one.
+	cache, err := exec.CommandContext(t.Context(), "go", "env", "GOCACHE").Output()
+	if err != nil {
+		t.Fatalf("ask go for its build cache: %v", err)
+	}
+
 	cmd := exec.CommandContext(t.Context(), "go", "list", "-f",
 		`{{join context.ToolTags ","}}|{{join context.ReleaseTags ","}}`, "runtime")
-	// NOTHING OF THIS MACHINE'S: no persisted `go env -w` settings, no flags,
-	// and the amd64 level and experiments at the toolchain's defaults, which
-	// the nightly runner sets none of.
+	// NOTHING ELSE OF THIS MACHINE'S: no persisted `go env -w` settings, no
+	// flags, and the amd64 level and experiments at the toolchain's defaults,
+	// which the nightly runner sets none of.
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0",
-		"GOENV=off", "GOFLAGS=", "GOAMD64=v1", "GOEXPERIMENT=")
+		"GOENV=off", "GOFLAGS=", "GOAMD64=v1", "GOEXPERIMENT=", "GOCACHE="+strings.TrimSpace(string(cache)))
 
 	out, err := cmd.Output()
 	if err != nil {
