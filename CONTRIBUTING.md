@@ -6,7 +6,7 @@ billet is pre-alpha and the architecture is still moving, so an issue before a l
 
 Requirements:
 
-- Go 1.26.6 or later, as `go.mod` says. Everything builds with `CGO_ENABLED=0`, because a node is deployed by copying one static file, and a cgo dependency is refused by the linter.
+- Go 1.26.9 or later, as `go.mod` says. Everything builds with `CGO_ENABLED=0`, because a node is deployed by copying one static file, and a cgo dependency is refused by the linter.
 - Python 3.13 for the documentation build and the repository's Python gates.
 - GNU Make, a POSIX shell, and Docker for the end-to-end suite (it skips without one).
 
