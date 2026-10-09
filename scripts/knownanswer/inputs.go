@@ -1,0 +1,233 @@
+package main
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+)
+
+// The kinds scripts/known-answer-job.sh runs, and the one figure each expects.
+const (
+	kindBaseline = "baseline"
+	kindIdle     = "idle"
+	kindCPU      = "cpu"
+	kindMemory   = "memory"
+	kindNetwork  = "network"
+	kindDisk     = "disk"
+)
+
+// expectedKey is the key a kind's expectation carries; the baseline expects
+// nothing of its own and is only ever subtracted.
+var expectedKey = map[string]string{
+	kindIdle: "cpu_seconds", kindCPU: "cpu_seconds", kindMemory: "memory_peak_bytes",
+	kindNetwork: "net_rx_bytes", kindDisk: "disk_write_bytes",
+}
+
+// expectation is what one known-answer job recorded about itself.
+type expectation struct {
+	Schema         int              `json:"schema"`
+	Kind           string           `json:"kind"`
+	Lease          string           `json:"lease"`
+	Repository     string           `json:"repository"`
+	RunID          int64            `json:"run_id"`
+	RunAttempt     int64            `json:"run_attempt"`
+	GitHubJobID    string           `json:"github_job_id"`
+	Seconds        int64            `json:"seconds"`
+	LoadStartedAt  string           `json:"load_started_at"`
+	LoadFinishedAt string           `json:"load_finished_at"`
+	Expected       map[string]int64 `json:"expected"`
+
+	path string
+}
+
+// runKey is one attempt of one workflow run: the jobs that are compared with
+// each other.
+type runKey struct{ ID, Attempt int64 }
+
+func (k runKey) String() string { return fmt.Sprintf("run %d attempt %d", k.ID, k.Attempt) }
+
+func (e expectation) run() runKey { return runKey{e.RunID, e.RunAttempt} }
+
+// leasePattern is what billet's lease ids are made of, and what a file name
+// built from one may hold.
+var leasePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// validate refuses an expectation the checker could misread: the comparison is
+// only as good as the record it starts from.
+func (e expectation) validate() error {
+	if e.Schema != 1 {
+		return fmt.Errorf("schema %d is not one this checker reads", e.Schema)
+	}
+	if e.Kind != kindBaseline && expectedKey[e.Kind] == "" {
+		return fmt.Errorf("kind %q is not a known answer", e.Kind)
+	}
+	if !leasePattern.MatchString(e.Lease) || e.Lease == "." || e.Lease == ".." {
+		return fmt.Errorf("lease %q is not a lease id", e.Lease)
+	}
+	if e.RunID <= 0 || e.RunAttempt <= 0 {
+		return fmt.Errorf("run %d attempt %d is not a workflow run", e.RunID, e.RunAttempt)
+	}
+	if e.Seconds < 0 {
+		return fmt.Errorf("seconds %d is negative", e.Seconds)
+	}
+	want := expectedKey[e.Kind]
+	for k, v := range e.Expected {
+		if k != want {
+			return fmt.Errorf("a %s job expects %q, which is not its figure", e.Kind, k)
+		}
+		if v < 0 {
+			return fmt.Errorf("expected %s is negative", k)
+		}
+	}
+	if _, ok := e.Expected[want]; want != "" && !ok {
+		return fmt.Errorf("a %s job must expect %s", e.Kind, want)
+	}
+
+	return nil
+}
+
+// loadExpectations reads every expectation.json under dir, which is how
+// `gh run download` lays out one directory per artifact.
+//
+// THROUGH os.Root, so a symlink among the downloaded artifacts cannot lead the
+// walk to a file outside the directory it was given.
+func loadExpectations(dir string) ([]expectation, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	var out []expectation
+	err = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "expectation.json" {
+			return nil
+		}
+		path := filepath.Join(dir, rel)
+		body, err := root.ReadFile(rel)
+		if err != nil {
+			return err
+		}
+		var e expectation
+		if err := json.Unmarshal(body, &e); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if err := e.validate(); err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		e.path = path
+		out = append(out, e)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no expectation.json under %s", dir)
+	}
+	// ONE JOB PER KIND PER RUN, AND ONE JOB PER LEASE: two of either would make
+	// the subtraction pick one of them silently.
+	kinds := map[runKey]map[string]string{}
+	leases := map[string]string{}
+	for i := range out {
+		e := &out[i]
+		if prev, ok := leases[e.Lease]; ok {
+			return nil, fmt.Errorf("lease %s is claimed by %s and %s", e.Lease, prev, e.path)
+		}
+		leases[e.Lease] = e.path
+		if kinds[e.run()] == nil {
+			kinds[e.run()] = map[string]string{}
+		}
+		if prev, ok := kinds[e.run()][e.Kind]; ok {
+			return nil, fmt.Errorf("%s has two %s jobs: %s and %s", e.run(), e.Kind, prev, e.path)
+		}
+		kinds[e.run()][e.Kind] = e.path
+	}
+	slices.SortFunc(out, func(a, b expectation) int {
+		if c := compareRuns(a.run(), b.run()); c != 0 {
+			return c
+		}
+
+		return compareKinds(a.Kind, b.Kind)
+	})
+
+	return out, nil
+}
+
+func compareRuns(a, b runKey) int {
+	return cmp.Or(cmp.Compare(a.ID, b.ID), cmp.Compare(a.Attempt, b.Attempt))
+}
+
+var kindOrder = []string{kindBaseline, kindIdle, kindCPU, kindMemory, kindNetwork, kindDisk}
+
+func compareKinds(a, b string) int {
+	return cmp.Compare(slices.Index(kindOrder, a), slices.Index(kindOrder, b))
+}
+
+// record is the part of `billet jobs show --json` the checker reads.
+type record struct {
+	Lease       string `json:"lease"`
+	Node        string `json:"node"`
+	Provider    string `json:"provider"`
+	VCPU        int64  `json:"vcpu"`
+	GitHubJobID string `json:"github_job_id"`
+	RunID       int64  `json:"run_id"`
+	Result      string `json:"result"`
+	StartedAt   string `json:"started_at"`
+	FinishedAt  string `json:"finished_at"`
+	Usage       *usage `json:"usage"`
+}
+
+// usage is the host's report. Measured is the command's own answer per group;
+// a group it does not name is one this checker treats as unmeasured.
+type usage struct {
+	Measured        map[string]bool `json:"measured"`
+	Samples         int64           `json:"samples"`
+	IntervalMillis  int64           `json:"interval_ms"`
+	WindowMillis    int64           `json:"window_ms"`
+	CPUUserMicros   int64           `json:"cpu_user_us"`
+	CPUSystemMicros int64           `json:"cpu_system_us"`
+	MemoryPeakBytes int64           `json:"memory_peak_bytes"`
+	DiskWriteBytes  int64           `json:"disk_write_bytes"`
+	NetRxBytes      int64           `json:"net_rx_bytes"`
+	EnergyActiveUJ  int64           `json:"energy_active_uj"`
+	EnergyIdleUJ    int64           `json:"energy_idle_uj"`
+	EnergySource    string          `json:"energy_source"`
+}
+
+// errNoRecord is a lease with no record file: billet's answer was never
+// collected, which is not the same as billet having measured nothing.
+var errNoRecord = errors.New("no record was collected")
+
+// loadRecord reads <dir>/<lease>.json.
+func loadRecord(dir, lease string) (record, error) {
+	if !leasePattern.MatchString(lease) || lease == "." || lease == ".." {
+		return record{}, fmt.Errorf("lease %q is not a lease id", lease)
+	}
+	path := filepath.Join(dir, lease+".json")
+	body, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return record{}, fmt.Errorf("%w for lease %s (%s)", errNoRecord, lease, path)
+	}
+	if err != nil {
+		return record{}, err
+	}
+	var r record
+	if err := json.Unmarshal(body, &r); err != nil {
+		return record{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if r.Lease != lease {
+		return record{}, fmt.Errorf("%s holds lease %q", path, r.Lease)
+	}
+
+	return r, nil
+}

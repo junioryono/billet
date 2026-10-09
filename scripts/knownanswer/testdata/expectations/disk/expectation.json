@@ -1,0 +1,1 @@
+{"schema":1,"kind":"disk","lease":"lease-disk","repository":"acme/bench","run_id":18000000001,"run_attempt":2,"github_job_id":"52000000077","seconds":0,"load_started_at":"2026-10-09T10:00:00Z","load_finished_at":"2026-10-09T10:00:00Z","expected":{"disk_write_bytes":2147483648}}

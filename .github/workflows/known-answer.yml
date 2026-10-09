@@ -1,0 +1,223 @@
+name: Known-answer measurement jobs
+
+# CALLED FROM THE REPOSITORY WHOSE RUNNERS ARE UNDER TEST, never run here. A
+# reusable workflow has to live under .github/workflows to be callable as
+# junioryono/billet/.github/workflows/known-answer.yml@<ref>, which is why this
+# is not under actions/ (those are composite actions, one step each, and cannot
+# fan out into jobs on a tier). Every job fetches scripts/known-answer-job.sh
+# from the billet revision the caller named, so the load and the expectation it
+# records are the ones that revision's checker was written against.
+#
+# THE JOBS RUN ONE AFTER ANOTHER, so no known answer shares the host with
+# another one, and the idle job the checker subtracts ran under the conditions
+# the loaded jobs did rather than beside them.
+#
+# docs/operating/measurement-validation.md is the runbook: how to call this,
+# collect what it uploads, and compare it with `billet jobs show --json`.
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: The billet tier label every job runs on
+        required: true
+        type: string
+      billet_repository:
+        description: Billet repository containing the known-answer script
+        required: false
+        default: junioryono/billet
+        type: string
+      billet_ref:
+        description: Exact Billet tag or commit containing this reusable workflow
+        required: true
+        type: string
+      seconds:
+        description: How long the idle, cpu and memory loads run
+        required: false
+        default: 60
+        type: number
+      cpu_workers:
+        description: stress-ng CPU workers, at most the tier's vCPUs
+        required: false
+        default: 4
+        type: number
+      memory_bytes:
+        description: Bytes the memory job keeps resident, well inside the tier's memory
+        required: false
+        default: 2147483648
+        type: number
+      network_url:
+        description: A public URL whose body is the network job's known size
+        required: true
+        type: string
+      network_bytes:
+        description: The body's exact size; 0 accepts whatever size arrives
+        required: false
+        default: 0
+        type: number
+      disk_bytes:
+        description: Bytes fio writes with O_DIRECT
+        required: false
+        default: 2147483648
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and stop (the baseline)
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh baseline "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-baseline
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
+
+  idle:
+    needs: baseline
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and sleep
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+          KA_SECONDS: ${{ inputs.seconds }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh idle "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-idle
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
+
+  cpu:
+    needs: idle
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and run stress-ng's CPU workers
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+          KA_SECONDS: ${{ inputs.seconds }}
+          KA_CPU_WORKERS: ${{ inputs.cpu_workers }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh cpu "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-cpu
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
+
+  memory:
+    needs: cpu
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and keep memory resident
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+          KA_SECONDS: ${{ inputs.seconds }}
+          KA_MEMORY_BYTES: ${{ inputs.memory_bytes }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh memory "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-memory
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
+
+  network:
+    needs: memory
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and download the known object
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+          KA_NETWORK_URL: ${{ inputs.network_url }}
+          KA_NETWORK_BYTES: ${{ inputs.network_bytes > 0 && inputs.network_bytes || '' }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh network "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-network
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
+
+  disk:
+    needs: network
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Fetch the known-answer script from the called billet revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-known-answer
+          sparse-checkout: scripts/known-answer-job.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Prepare and write with fio
+        env:
+          KA_GITHUB_JOB_ID: ${{ job.check_run_id }}
+          KA_DISK_BYTES: ${{ inputs.disk_bytes }}
+        run: bash .billet-known-answer/scripts/known-answer-job.sh disk "$RUNNER_TEMP/known-answer"
+      - name: Upload the expectation
+        uses: actions/upload-artifact@v7
+        with:
+          name: known-answer-${{ github.run_id }}-${{ github.run_attempt }}-disk
+          path: ${{ runner.temp }}/known-answer/expectation.json
+          if-no-files-found: error
