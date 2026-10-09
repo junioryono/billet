@@ -13,7 +13,7 @@ import (
 
 // DefaultReflectors answer ICMP from anywhere and are run by three different
 // operators, so the median of their delays is the line's and not one network's.
-var DefaultReflectors = []string{"1.1.1.1", "1.0.0.1", "8.8.8.8", "9.9.9.9"}
+var DefaultReflectors = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 
 // Tick is how often the loop measures and adjusts.
 const Tick = 500 * time.Millisecond
@@ -71,6 +71,20 @@ func Run(ctx context.Context, opts Options) error {
 	// run's record is written only once the interface is known to carry nothing
 	// of anybody else's: a record written first would make an operator's CAKE
 	// look like billet's to the cleanup after a refusal.
+	//
+	// A RECORD NAMING ANOTHER INTERFACE IS CLEARED FIRST: the default route moved
+	// since that run, and overwriting its record would strand its shaping where
+	// no cleanup could find it.
+	if prior := RecordedInterface(); prior != "" && prior != iface {
+		if err := (&Shaper{Iface: prior, Owned: true}).Clear(ctx); err != nil {
+			return fmt.Errorf("clear the shaping an earlier run left on %s before shaping %s: %w", prior, iface, err)
+		}
+
+		if err := Forget(prior); err != nil {
+			return err
+		}
+	}
+
 	shaper := &Shaper{Iface: iface, Owned: RecordedInterface() == iface}
 	if err := shaper.Check(ctx); err != nil {
 		return fmt.Errorf("shape %s: %w", iface, err)
@@ -98,7 +112,7 @@ func Run(ctx context.Context, opts Options) error {
 		return errors.Join(err, fmt.Errorf("remove the shaping from %s: %w", iface, clearErr))
 	}
 
-	return errors.Join(err, Forget())
+	return errors.Join(err, Forget(iface))
 }
 
 // StateFile records which interface a running shaper shapes. It lives under
@@ -129,8 +143,13 @@ func RecordedInterface() string {
 	return strings.TrimSpace(string(body))
 }
 
-// Forget removes the record once its interface is clear.
-func Forget() error {
+// Forget removes the record once its interface is clear, and only a record of
+// that interface: forgetting another would strand that one's shaping.
+func Forget(iface string) error {
+	if RecordedInterface() != iface {
+		return nil
+	}
+
 	if err := os.Remove(StateFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("forget the shaped interface: %w", err)
 	}

@@ -108,14 +108,14 @@ func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	// BILLET'S BY ITS RECORD, OR BY THE OPERATOR NAMING THE INTERFACE: without
-	// either the cleanup touches nothing, because nothing proves it is billet's.
-	owned := *iface != "" || uplink.RecordedInterface() == name
+	// BILLET'S ONLY BY ITS RECORD, whichever interface is named: without it the
+	// cleanup touches nothing, because nothing proves what is there is billet's.
+	owned := uplink.RecordedInterface() == name
 	if err := (&uplink.Shaper{Iface: name, Owned: owned}).Clear(ctx); err != nil {
 		return fmt.Errorf("remove the shaping from %s: %w", name, err)
 	}
 
-	if err := uplink.Forget(); err != nil {
+	if err := uplink.Forget(name); err != nil {
 		return err
 	}
 

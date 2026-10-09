@@ -62,5 +62,8 @@ func (d *Delays) Observe(asked []string, answered map[string]time.Duration) (tim
 
 	slices.Sort(risen)
 
-	return risen[len(risen)/2], true
+	// THE LOWER MEDIAN, so a delay is declared only when a strict majority of
+	// reflectors see it: with an even count, half of them unreachable is not a
+	// full queue.
+	return risen[(len(risen)-1)/2], true
 }

@@ -230,7 +230,12 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 		// is somebody else's, and cutting on would only take this host to the
 		// floor. Shorter means by a margin, because each reflector's baseline
 		// creeps toward a round trip held above it, so an unchanged queue reads a
-		// little lower every sample.
+		// little lower every sample. And once futile, LATCHED until a clear sample
+		// ends the episode: over a minute the creep alone crosses any margin.
+		if d.futile >= p.Futile {
+			return false, false
+		}
+
 		if d.cutSince && o.Delay > d.cutDelay-max(improvement, d.cutDelay/10) {
 			d.futile++
 		} else {

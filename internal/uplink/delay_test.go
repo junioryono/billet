@@ -41,6 +41,24 @@ func TestTheDelayIsTheMedianRiseOverEachReflectorsBaseline(t *testing.T) {
 	}
 }
 
+// HALF THE REFLECTORS UNREACHABLE IS NOT A FULL QUEUE: one operator's two
+// addresses failing together must not read as the line's queue overflowing.
+func TestHalfTheReflectorsLostIsNotAQueue(t *testing.T) {
+	t.Parallel()
+
+	var d Delays
+
+	asked := []string{"a1", "a2", "b", "c"}
+	idle := map[string]time.Duration{"a1": 7 * time.Millisecond, "a2": 8 * time.Millisecond,
+		"b": 12 * time.Millisecond, "c": 20 * time.Millisecond}
+	d.Observe(asked, idle)
+
+	delay, known := d.Observe(asked, map[string]time.Duration{"b": 12 * time.Millisecond, "c": 20 * time.Millisecond})
+	if !known || delay > time.Millisecond {
+		t.Fatalf("two of four lost with the others at baseline read as %v (known %v)", delay, known)
+	}
+}
+
 // A BASELINE FOLLOWS A LONGER ROUTE SLOWLY AND A SHORTER ONE AT ONCE.
 func TestABaselineRisesSlowlyAndFallsAtOnce(t *testing.T) {
 	t.Parallel()
