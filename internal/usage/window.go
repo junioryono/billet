@@ -83,10 +83,15 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 	for i := 1; i < len(points); i++ {
 		p, next := points[i-1], points[i]
 		length := next.offset() - p.offset()
-		overlap := min(b, next.offset()) - max(a, p.offset())
-		if overlap <= 0 || next.AfterGap || fell[i] || fell[i-1] {
+		// COMPARED BEFORE SUBTRACTED: a window ends a Duration saturated (a
+		// series that began centuries away) would wrap the difference into a
+		// plausible overlap. Both ends lie within the interval once it is
+		// non-empty, so the difference cannot overflow.
+		lo, hi := max(a, p.offset()), min(b, next.offset())
+		if hi <= lo || next.AfterGap || fell[i] || fell[i-1] {
 			continue
 		}
+		overlap := hi - lo
 		before, after := p.cumulative(), next.cumulative()
 		var shares [6]int64
 		fits := true

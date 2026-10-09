@@ -3,8 +3,10 @@ package usage
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -373,5 +375,98 @@ func TestAGroupFirstReadAtTheEndLeavesNothingBeforeItSeen(t *testing.T) {
 	}
 	if want := []bool{false, true, true}; !slices.Equal(marks, want) {
 		t.Errorf("marks = %v, want %v", marks, want)
+	}
+}
+
+// A READ THAT STALLS FOR AN INTERVAL KEEPS NO POINT, and its counters are not
+// backdated to the tick's start: the interval before the stall keeps only what
+// was read before it, and the one through it is unseen.
+func TestAStalledReadIsNotBackdated(t *testing.T) {
+	tr, target := referenceVM(t)
+	var mu sync.Mutex
+	clock := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	var queue []time.Time
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(queue) > 0 {
+			clock, queue = queue[0], queue[1:]
+		}
+		return clock
+	}
+	then := func(times ...time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, d := range times {
+			queue = append(queue, clock.Add(d))
+		}
+	}
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: now})
+	m.Start("vm", target, 8)
+	// An ordinary tick at 1s: its start, the job's read beginning and ending.
+	then(time.Second, time.Second, time.Second)
+	m.Tick()
+	// A tick at 2s whose read of the job stalls until 4s.
+	then(time.Second, time.Second, 3*time.Second)
+	m.Tick()
+	then(time.Second, time.Second, time.Second)
+	m.Tick()
+	// A read that takes half an interval holds the time it ended.
+	then(time.Second, time.Second, 1500*time.Millisecond)
+	m.Tick()
+
+	s, ok := m.Final("vm")
+	if !ok {
+		t.Fatal("no summary")
+	}
+	type mark struct {
+		offset int64
+		gap    bool
+	}
+	var got []mark
+	for _, p := range s.Points {
+		got = append(got, mark{p.OffsetMillis, p.AfterGap})
+	}
+	if want := []mark{{0, false}, {1000, false}, {5000, true}, {6500, false}, {6500, false}}; !slices.Equal(got, want) {
+		t.Errorf("points = %v,\nwant %v", got, want)
+	}
+}
+
+// WITH ENERGY SHARED FROM THE PACKAGE, THE FINAL INTERVAL IS UNSEEN: the final
+// read takes no package reading, so its point repeats the last tick's energy.
+func TestTheFinalIntervalIsUnseenWhenEnergyComesFromThePackage(t *testing.T) {
+	for _, rapl := range []bool{false, true} {
+		tr, target := referenceVM(t)
+		now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+		m := runMonitor(t, tr.root, Options{Interval: time.Second, RAPL: rapl, Now: func() time.Time { return now }})
+		m.Start("vm", target, 8)
+		now = now.Add(time.Second)
+		m.Tick()
+		now = now.Add(time.Second)
+
+		s, ok := m.Final("vm")
+		if !ok || len(s.Points) != 3 {
+			t.Fatalf("rapl %v: summary %v with %d points", rapl, ok, len(s.Points))
+		}
+		if got := s.Points[2].AfterGap; got != rapl {
+			t.Errorf("rapl %v: the final interval unseen = %v", rapl, got)
+		}
+	}
+}
+
+// A SERIES THAT BEGAN CENTURIES FROM THE WINDOW COVERS NONE OF IT: the window's
+// ends saturate, and nothing wraps into a plausible overlap.
+func TestASeriesFarFromTheWindowCoversNoneOfIt(t *testing.T) {
+	t.Parallel()
+
+	for _, start := range []time.Time{
+		time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		tl := Timeline{First: start, Points: []Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: math.MaxInt64},
+			{OffsetMillis: 2000, CPUUsage: math.MaxInt64}}}
+		w := tl.Window(first, first.Add(time.Second))
+		if w.Covered != 0 || w.CPUMicros != 0 || w.Samples != 0 {
+			t.Errorf("a series beginning %s = %+v, want nothing covered", start, w)
+		}
 	}
 }

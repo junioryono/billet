@@ -424,6 +424,34 @@ func TestARedirectNamingTheTokenIsRedacted(t *testing.T) {
 	}
 }
 
+// A BODY THAT BREAKS OFF ON A TRAILER NAMING THE TOKEN DOES NOT PUT IT IN THE
+// ERROR, which is still could-not-tell.
+func TestABrokenBodyNamingTheTokenIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n"+
+			"2\r\n{}\r\n0\r\n%s\r\n\r\n", token)
+		if err := buf.Flush(); err != nil {
+			t.Errorf("flush: %v", err)
+		}
+	})
+	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+	if err == nil || strings.Contains(err.Error(), "installation-secret") || !strings.Contains(err.Error(), "[redacted]") {
+		t.Errorf("a trailer naming the token = %v, want it redacted", err)
+	}
+	if !errors.Is(err, errNoAnswer) {
+		t.Errorf("a broken body = %v, want could-not-tell", err)
+	}
+}
+
 // A REFUSED TOKEN EXCHANGE DOES NOT CARRY THE APP'S JWT, even when GitHub's
 // message echoes it, escaped or not.
 func TestARefusedTokenExchangeDoesNotEchoTheJWT(t *testing.T) {

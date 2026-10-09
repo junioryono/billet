@@ -274,9 +274,17 @@ func (m *Monitor) tick() {
 		energy, energyErr = m.reader.ReadEnergy()
 	}
 	samples := make(map[string]*Sample, len(snapshot))
+	// WHEN EACH JOB'S READ ENDED, which is the time its point holds: a read that
+	// stalls must not have its counters backdated to the tick's start, where
+	// they would land in the interval before the stall.
+	readAt := make(map[string]time.Time, len(snapshot))
+	stalled := make(map[string]bool, len(snapshot))
 	for key, j := range snapshot {
+		began := m.opts.Now()
 		s := m.reader.Read(j.target)
 		samples[key] = &s
+		readAt[key] = m.opts.Now()
+		stalled[key] = readAt[key].Sub(began) >= m.opts.Interval
 	}
 	if m.afterTickRead != nil {
 		m.afterTickRead()
@@ -362,7 +370,9 @@ func (m *Monitor) tick() {
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 		j.lateRead(firstRead(*s, before, j.target.Process))
-		j.keepPoint(unread(*s, before, j.target.Process), now, m.opts.Interval)
+		// A READ THAT TOOK A WHOLE INTERVAL IS UNSEEN: which of its counters were
+		// read when is not known.
+		j.keepPoint(unread(*s, before, j.target.Process) || stalled[key], readAt[key], m.opts.Interval)
 	}
 
 	m.host, m.hostOK = host, hostErr == nil
@@ -602,6 +612,11 @@ func (m *Monitor) final(key string) (Summary, bool) {
 // not all read at now. Called with mu held. It keeps no point, so a Final that
 // is asked again summarises the same series.
 func (m *Monitor) summaryOf(j *job, now time.Time, unseen bool) Summary {
+	// THE FINAL INTERVAL'S PACKAGE ENERGY IS NEVER ATTRIBUTED: the final read
+	// takes no package reading, so the last point repeats the last tick's
+	// energy. With energy shared from the package, that interval is unseen
+	// rather than shown using none.
+	unseen = unseen || m.opts.RAPL && !j.target.Process
 	points := append(append([]Point(nil), j.points...), j.nextPoint(now, unseen, m.opts.Interval))
 	sum := Summary{
 		First: j.first, Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),

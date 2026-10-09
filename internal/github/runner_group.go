@@ -180,7 +180,10 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponse+1))
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer, err)
+		// A TRAILER THE CLIENT COULD NOT PARSE is quoted in its error, so the
+		// bearer is replaced here as in a transport error.
+		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
+			withoutBearerText(err, bearer))
 	}
 
 	if len(body) > maxPolicyResponse {
