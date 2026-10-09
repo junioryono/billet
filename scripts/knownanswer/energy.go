@@ -118,12 +118,14 @@ type energyJob struct {
 
 // energyResult is the reconciliation of one window.
 type energyResult struct {
-	verdict               verdict
-	reason                string
-	rows                  int
-	from, to              int64
-	seconds               float64
-	rapl                  int64
+	verdict  verdict
+	reason   string
+	rows     int
+	from, to int64
+	seconds  float64
+	// rapl, like every sum here, is a float64: it loses precision where an int64 sum of
+	// enough rows would wrap.
+	rapl                  float64
 	idleWatts             float64
 	idleBefore, idleAfter float64
 	idleBeforeOK          bool
@@ -143,7 +145,7 @@ type energyResult struct {
 	// which it counted as no active energy; low is the lower bound with it.
 	clipped float64
 	low     float64
-	// attributed and attributedIdle are summed in float64, which saturates
+	// attributed and attributedIdle are summed in float64, which rounds
 	// rather than wrapping as an int64 sum of malformed counters would.
 	attributed, attributedIdle float64
 	ratio                      float64
@@ -194,7 +196,7 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 
 			return res
 		}
-		res.rapl += row.delta
+		res.rapl += float64(row.delta)
 		// THE IDLE BASELINE IS TAKEN PER INTERVAL AND NEVER EXCEEDS WHAT WAS
 		// DRAWN, as the node's monitor takes it: an interval below the baseline
 		// contributes no active energy rather than a negative amount.
@@ -315,10 +317,10 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 	// THE SIGNAL IS WHAT SURVIVES THE CLIPPING: the lower bound gives way by it,
 	// so energy above the baseline that clipping could account for is a range
 	// that holds an attribution of nothing.
-	case res.activeMeasured-res.clipped <= minActiveShare*float64(res.rapl):
+	case res.activeMeasured-res.clipped <= minActiveShare*res.rapl:
 		res.reason = fmt.Sprintf("the package drew %.2f kJ above the idle baseline, %.2f kJ of it within what "+
 			"two clocks clipping at the baseline can disagree on, too little of the window's %.1f kJ to compare",
-			res.activeMeasured/1e9, res.clipped/1e9, float64(res.rapl)/1e9)
+			res.activeMeasured/1e9, res.clipped/1e9, res.rapl/1e9)
 	default:
 		res.ratio = res.attributed / res.activeMeasured
 		res.high = attributedHigh + res.allowance/res.activeMeasured
@@ -378,16 +380,16 @@ func quietPower(rows []powerRow, from, to int) (float64, bool) {
 	if to-from < 1 {
 		return 0, false
 	}
-	var uj int64
+	var uj float64
 	for _, r := range rows[from:to] {
-		uj += r.delta
+		uj += float64(r.delta)
 	}
 	seconds := rows[to-1].uptime - rows[from-1].uptime
 	if seconds <= 0 {
 		return 0, false
 	}
 
-	return float64(uj) / 1e6 / seconds, true
+	return uj / 1e6 / seconds, true
 }
 
 // jobsSeen is every microVM in the log, by lease, with how long it was seen.
@@ -418,7 +420,7 @@ func kj(uj float64) string { return fmt.Sprintf("%.2f kJ", uj/1e9) }
 func (res energyResult) write(w io.Writer) {
 	fmt.Fprintf(w, "window: %d rows, epoch %d to %d, %.1f s\n", res.rows, res.from, res.to, res.seconds)
 	if res.seconds > 0 {
-		fmt.Fprintf(w, "package RAPL: %s, mean %.1f W\n", kj(float64(res.rapl)), float64(res.rapl)/1e6/res.seconds)
+		fmt.Fprintf(w, "package RAPL: %s, mean %.1f W\n", kj(res.rapl), res.rapl/1e6/res.seconds)
 	}
 	idle := func(label string, v float64, ok bool) {
 		if !ok {

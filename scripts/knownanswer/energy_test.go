@@ -42,7 +42,7 @@ func TestTheJobsEnergyReconcilesWithThePackage(t *testing.T) {
 	// tail; the quiet end after the microVM starts past the tail.
 	if res.rapl != 3_549_000_000 || res.seconds != 34 || res.activeMeasured != 1_050_000_000 ||
 		res.idleBefore != 73.5 || res.idleAfter != 73.5 {
-		t.Errorf("rapl %d µJ over %v s, above idle %.0f, idle %v and %v", res.rapl, res.seconds,
+		t.Errorf("rapl %.0f µJ over %v s, above idle %.0f, idle %v and %v", res.rapl, res.seconds,
 			res.activeMeasured, res.idleBefore, res.idleAfter)
 	}
 	if len(res.jobs) != 1 || res.jobs[0].lease != "lease-a" || res.jobs[0].seen != 9 {
