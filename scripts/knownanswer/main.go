@@ -112,23 +112,22 @@ func runCheck(args []string, stdout, stderr io.Writer) (int, error) {
 		return 0, err
 	}
 	kept, dropped := discardRuns(exps, *discard)
-	if len(kept) == 0 {
-		return 0, fmt.Errorf("--discard %d leaves no run to check", *discard)
-	}
 	results := evaluate(kept, records(*recDir))
-	if len(results) == 0 {
-		return 0, errors.New("no loaded job to check: only baselines were found")
+	// A RUN THAT LEFT NO EXPECTATION AT ALL IS INVISIBLE TO evaluate: its
+	// baseline failed and every job after it was skipped. The count the
+	// operator asked for is what finds it, down to none at all, and the verdict
+	// printed is the one the exit status carries.
+	v := pass
+	if len(results) > 0 {
+		v = overall(results)
 	}
-	report(stdout, results, dropped)
-	// A RUN THAT LEFT NO EXPECTATION AT ALL IS INVISIBLE ABOVE: its baseline
-	// failed and every job after it was skipped. The count the operator asked
-	// for is what finds it.
-	v := overall(results)
+	note := ""
 	if got := countRuns(kept); got < *want {
-		fmt.Fprintf(stdout, "only %d of the %d measured runs asked for left expectations, so the rest are "+
-			"UNMEASURED\n", got, *want)
+		note = fmt.Sprintf("only %d of the %d measured runs asked for left expectations, so the rest are "+
+			"UNMEASURED", got, *want)
 		v = worst(v, unmeasured)
 	}
+	report(stdout, results, dropped, note, v)
 
 	return verdictCode(v), nil
 }

@@ -20,7 +20,7 @@ var referenceLog = filepath.Join("testdata", "power-log", "power.csv")
 // leaseA is billet's record of the one microVM in the reference log.
 func leaseA(activeJ, idleJ float64, f func(*usage)) map[string]record {
 	u := usage{Measured: allGroups(), present: allFields(), EnergyActiveUJ: int64(activeJ * 1e6), EnergyIdleUJ: int64(idleJ * 1e6),
-		EnergySource: "rapl", WindowMillis: 10_000}
+		EnergySource: "rapl", WindowMillis: 10_000, IntervalMillis: 1000}
 	if f != nil {
 		f(&u)
 	}
@@ -177,10 +177,10 @@ func TestTheIdleBaselineIsTakenPerInterval(t *testing.T) {
 	}
 }
 
-// A QUIET INTERVAL'S NOISE IS NOT THE JOBS': quiet minutes alternating 70 and
-// 77 W average the 73.5 W baseline, and taken interval by interval their 77 W
-// halves would add 3.5 J a second the monitor never shares out. Only the
-// intervals a microVM was alive for are reconciled.
+// A QUIET INTERVAL'S NOISE IS NOT THE JOBS': quiet seconds alternating 70 and
+// 77 W before the job average the 73.5 W baseline, and taken interval by
+// interval their 77 W halves would add 3.5 J each the monitor never shares
+// out. Only the intervals a microVM was alive for are reconciled.
 func TestQuietNoiseIsNotCountedAgainstTheJobs(t *testing.T) {
 	var rows []powerRow
 	for i := range 64 {
@@ -194,6 +194,11 @@ func TestQuietNoiseIsNotCountedAgainstTheJobs(t *testing.T) {
 		if i >= 27 && i < 37 {
 			row.delta, row.instances = 173_500_000, []string{"billet-lease-a"}
 		}
+		// The quiet end after the job is steady at the baseline: only the one
+		// before it dips.
+		if i > 37 {
+			row.delta = 73_500_000
+		}
 		rows = append(rows, row)
 	}
 	res := reconcile(rows, 73.5, 10, fromMap(leaseA(1000, 0, nil)))
@@ -201,6 +206,41 @@ func TestQuietNoiseIsNotCountedAgainstTheJobs(t *testing.T) {
 	if res.verdict != pass || res.busySeconds != 11 || res.activeMeasured != 1_003_500_000 {
 		t.Errorf("verdict %s (ratio %.3f), %v s busy, above idle %.0f µJ: %s", res.verdict, res.ratio,
 			res.busySeconds, res.activeMeasured, res.reason)
+	}
+
+	// THE MONITOR'S TICKS FALL BETWEEN THIS LOG'S ROWS, so it may have seen
+	// dips this log averaged away: the quiet ends dip 0.875 W below the baseline
+	// on average (1.75 W before the job, none after), which over 11 busy seconds
+	// allows 9.625 J more than the 1.02 bound, and no more.
+	for _, tc := range []struct {
+		activeJ float64
+		want    verdict
+	}{{1032, pass}, {1035, fail}} {
+		got := reconcile(rows, 73.5, 10, fromMap(leaseA(tc.activeJ, 0, nil)))
+		if got.allowance != 9_625_000 || got.verdict != tc.want {
+			t.Errorf("%v J attributed: allowance %.0f µJ, %s (ratio %.4f, bound %.4f), want %s", tc.activeJ,
+				got.allowance, got.verdict, got.ratio, got.high, tc.want)
+		}
+	}
+}
+
+// A LOG COARSER THAN THE MONITOR CANNOT REPRODUCE ITS BASELINE: two-second rows
+// average a dip and an excess the monitor's one-second ticks counted apart.
+func TestALogCoarserThanTheMonitorIsUnmeasured(t *testing.T) {
+	var rows []powerRow
+	for i := range 34 {
+		row := powerRow{epoch: int64(2 * i), uptime: float64(2 * i), uptimeOK: true, inventoryOK: true}
+		if i > 0 {
+			row.delta, row.deltaOK = 147_000_000, true
+		}
+		if i >= 12 && i < 22 {
+			row.delta, row.instances = 347_000_000, []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	res := reconcile(rows, 73.5, 10, fromMap(leaseA(2000, 0, nil)))
+	if res.verdict != unmeasured || !strings.Contains(res.reason, "coarser than the monitor's 1.00 s tick") {
+		t.Errorf("verdict %s (%q), want UNMEASURED", res.verdict, res.reason)
 	}
 }
 

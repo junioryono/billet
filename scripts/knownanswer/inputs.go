@@ -143,9 +143,6 @@ func loadExpectations(dir string) ([]expectation, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no expectation.json under %s", dir)
-	}
 	// ONE JOB PER KIND PER RUN, AND ONE JOB PER LEASE: two of either would make
 	// the subtraction pick one of them silently.
 	kinds := map[runKey]map[string]string{}

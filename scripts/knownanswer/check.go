@@ -189,11 +189,14 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 	r.value = m.value(job.Usage, ref.Usage)
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), ref.Usage)
 	// A LOAD THE TOLERANCE CANNOT TELL FROM NO LOAD PROVES NOTHING: one worker
-	// for one second accepts zero CPU-seconds, as a 1 MiB download accepts zero
-	// bytes, and a job that did nothing would pass.
-	if m.kind != kindIdle && r.low <= 0 {
-		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds a job "+
-			"that did nothing; run a larger one", m.rule, formatValue(r.low, m.unit), formatValue(r.high, m.unit))
+	// for one second accepts zero CPU-seconds, a 1 MiB download zero bytes, and
+	// a memory load no larger than the idle job's peak the idle job's peak. What
+	// a job that did nothing would measure is the reference compared with
+	// itself.
+	if noLoad := m.value(ref.Usage, ref.Usage); m.kind != kindIdle && r.low <= noLoad {
+		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds %s, what "+
+			"a job that did nothing measures; run a larger one", m.rule, formatValue(r.low, m.unit),
+			formatValue(r.high, m.unit), formatValue(noLoad, m.unit))
 
 		return r
 	}
@@ -305,7 +308,7 @@ func formatValue(v float64, unit string) string {
 
 // report writes each run's results and then, per metric, the spread across
 // runs.
-func report(w io.Writer, results []result, dropped []runKey) {
+func report(w io.Writer, results []result, dropped []runKey, note string, v verdict) {
 	for _, k := range dropped {
 		fmt.Fprintf(w, "discarded %s (warmup)\n", k)
 	}
@@ -368,5 +371,8 @@ func report(w io.Writer, results []result, dropped []runKey) {
 				s.ciText(func(v float64) string { return fmt.Sprintf("%.4f", v) }), s.cvText())
 		}
 	}
-	fmt.Fprintf(w, "\noverall %s\n", overall(results))
+	if note != "" {
+		fmt.Fprintf(w, "\n%s\n", note)
+	}
+	fmt.Fprintf(w, "\noverall %s\n", v)
 }

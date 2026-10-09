@@ -116,20 +116,27 @@ type energyJob struct {
 
 // energyResult is the reconciliation of one window.
 type energyResult struct {
-	verdict                    verdict
-	reason                     string
-	rows                       int
-	from, to                   int64
-	seconds                    float64
-	rapl                       int64
-	idleWatts                  float64
-	idleBefore, idleAfter      float64
-	idleBeforeOK               bool
-	idleAfterOK                bool
-	idleVerdict                verdict
-	activeMeasured             float64
-	idlePool                   float64
-	busySeconds                float64
+	verdict               verdict
+	reason                string
+	rows                  int
+	from, to              int64
+	seconds               float64
+	rapl                  int64
+	idleWatts             float64
+	idleBefore, idleAfter float64
+	idleBeforeOK          bool
+	idleAfterOK           bool
+	idleVerdict           verdict
+	activeMeasured        float64
+	idlePool              float64
+	busySeconds           float64
+	// tick is the monitor's sampling interval, from the records; coarse says why
+	// the log is too coarse to reproduce it; allowance is what clocks falling at
+	// different moments can add to the jobs' share, and high the bound with it.
+	tick                       float64
+	coarse                     string
+	allowance                  float64
+	high                       float64
 	attributed, attributedIdle int64
 	ratio                      float64
 	jobs                       []energyJob
@@ -235,13 +242,14 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			j.problem = "billet recorded no usage report"
 		case !rec.Usage.Measured["energy"]:
 			j.problem = "billet did not measure its energy"
-		case rec.Usage.missing("energy_active_uj", "energy_idle_uj") != "":
-			j.problem = "billet's record carries no " + rec.Usage.missing("energy_active_uj", "energy_idle_uj")
+		case rec.Usage.missing(energyFields...) != "":
+			j.problem = "billet's record carries no " + rec.Usage.missing(energyFields...)
 		case rec.Usage.EnergySource != "rapl":
 			j.problem = fmt.Sprintf("its energy source is %q, not rapl split by an idle baseline",
 				rec.Usage.EnergySource)
 		default:
 			j.window = float64(rec.Usage.WindowMillis) / 1000
+			res.tick = max(res.tick, float64(rec.Usage.IntervalMillis)/1000)
 			j.active, j.idle = rec.Usage.EnergyActiveUJ, rec.Usage.EnergyIdleUJ
 			res.attributed += j.active
 			res.attributedIdle += j.idle
@@ -250,23 +258,63 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			missing = append(missing, j.lease)
 		}
 	}
+	// THE MONITOR TAKES THE BASELINE PER TICK, so an interval that dips below it
+	// adds nothing and one above adds the excess. A log coarser than the tick
+	// averages dips into excesses the monitor counted, and cannot reproduce its
+	// figure; and at the same resolution the two clocks still fall at different
+	// moments, so the jobs may be attributed up to what the quiet ends show the
+	// package dipping below the baseline per second, over every busy second.
+	for i := 1; res.tick > 0 && i < len(rows); i++ {
+		busy := len(rows[i].instances) > 0 || len(rows[i-1].instances) > 0
+		if dt := rows[i].uptime - rows[i-1].uptime; busy && dt > 1.5*res.tick {
+			res.coarse = fmt.Sprintf("row %d's interval is %.2f s, coarser than the monitor's %.2f s tick, so the "+
+				"baseline cannot be taken as the monitor took it; log the energy check with --ipmitool none, "+
+				"which keeps the interval at a second", i+1, dt, res.tick)
+
+			break
+		}
+	}
+	shortBefore, quietBefore := shortfall(rows, 1, firstBusy(rows), idleWatts)
+	shortAfter, quietAfter := shortfall(rows, lastBusy(rows)+2, len(rows), idleWatts)
+	if quiet := quietBefore + quietAfter; quiet > 0 {
+		res.allowance = (shortBefore + shortAfter) / quiet * res.busySeconds
+	}
 	switch {
 	case len(missing) > 0:
 		res.reason = "the window's energy cannot be accounted for without " + strings.Join(missing, ", ")
 	case len(res.jobs) == 0:
 		res.reason = "no billet microVM ran in the window"
+	case res.coarse != "":
+		res.reason = res.coarse
 	case res.activeMeasured <= minActiveShare*float64(res.rapl):
 		res.reason = fmt.Sprintf("the package drew %.1f kJ above the idle baseline, too little of the window's "+
 			"%.1f kJ to compare", res.activeMeasured/1e9, float64(res.rapl)/1e9)
 	default:
 		res.ratio = float64(res.attributed) / res.activeMeasured
+		res.high = attributedHigh + res.allowance/res.activeMeasured
 		res.verdict = fail
-		if res.ratio >= attributedLow && res.ratio <= attributedHigh {
+		if res.ratio >= attributedLow && res.ratio <= res.high {
 			res.verdict = pass
 		}
 	}
 
 	return res
+}
+
+// energyFields are the counters the reconciliation reads from each record.
+var energyFields = []string{"energy_active_uj", "energy_idle_uj", "interval_ms"}
+
+// shortfall is how far the intervals ending at rows [from, to) fell below the
+// baseline, in µJ, and how long they lasted.
+func shortfall(rows []powerRow, from, to int, idleWatts float64) (float64, float64) {
+	var uj, seconds float64
+	for i := max(from, 1); i < to; i++ {
+		dt := rows[i].uptime - rows[i-1].uptime
+		uj += max(idleWatts*dt*1e6-float64(rows[i].delta), 0)
+		seconds += dt
+	}
+
+	return uj, seconds
 }
 
 func firstBusy(rows []powerRow) int {
@@ -361,8 +409,10 @@ func (res energyResult) write(w io.Writer) {
 	}
 	if res.verdict != unmeasured {
 		fmt.Fprintf(w, "above idle over the %.0f s a microVM was alive: measured %s, attributed to jobs %s "+
-			"(ratio %.3f, accepted [%.2f, %.2f])\n", res.busySeconds, kj(res.activeMeasured),
-			kj(float64(res.attributed)), res.ratio, attributedLow, attributedHigh)
+			"(ratio %.3f, accepted [%.2f, %.3f])\n", res.busySeconds, kj(res.activeMeasured),
+			kj(float64(res.attributed)), res.ratio, attributedLow, res.high)
+		fmt.Fprintf(w, "allowance: %s for the monitor's ticks falling between this log's rows (the quiet ends' "+
+			"dips below the baseline, per busy second)\n", kj(res.allowance))
 		fmt.Fprintf(w, "unattributed: %s, %.1f W while a microVM was alive (the host's own work above idle)\n",
 			kj(res.activeMeasured-float64(res.attributed)),
 			(res.activeMeasured-float64(res.attributed))/1e6/res.busySeconds)

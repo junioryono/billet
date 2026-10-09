@@ -21,7 +21,7 @@ func allGroups() map[string]bool {
 func allFields() map[string]bool {
 	out := map[string]bool{}
 	for _, f := range []string{"cpu_user_us", "cpu_system_us", "memory_peak_bytes", "disk_write_bytes",
-		"net_rx_bytes", "energy_active_uj", "energy_idle_uj", "window_ms", "samples"} {
+		"net_rx_bytes", "energy_active_uj", "energy_idle_uj", "window_ms", "samples", "interval_ms"} {
 		out[f] = true
 	}
 
@@ -352,7 +352,8 @@ func recordJSON(r record) map[string]any {
 			"cpu_user_us": u.CPUUserMicros, "cpu_system_us": u.CPUSystemMicros,
 			"memory_peak_bytes": u.MemoryPeakBytes, "disk_write_bytes": u.DiskWriteBytes,
 			"net_rx_bytes": u.NetRxBytes, "energy_active_uj": u.EnergyActiveUJ,
-			"energy_idle_uj": u.EnergyIdleUJ, "energy_source": u.EnergySource, "window_ms": u.WindowMillis}
+			"energy_idle_uj": u.EnergyIdleUJ, "energy_source": u.EnergySource, "window_ms": u.WindowMillis,
+			"interval_ms": u.IntervalMillis}
 	}
 	return out
 }
@@ -402,9 +403,11 @@ func TestCheckExitsWithItsVerdict(t *testing.T) {
 	if code := run(t.Context(), []string{"check", "--records", t.TempDir()}, &stdout, &stderr); code != exitUsage {
 		t.Errorf("a check with no expectations exited %d, want %d", code, exitUsage)
 	}
+	stdout.Reset()
 	if code := run(t.Context(), []string{"check", "--expectations", t.TempDir(), "--records", t.TempDir(), "--runs", "1"},
-		&stdout, &stderr); code != exitUsage || !strings.Contains(stderr.String(), "no expectation.json") {
-		t.Errorf("an empty expectations directory exited %d: %s", code, stderr.String())
+		&stdout, &stderr); code != exitUnmeasured || !strings.Contains(stdout.String(), "only 0 of the 1 measured runs") ||
+		!strings.Contains(stdout.String(), "overall UNMEASURED") {
+		t.Errorf("an empty expectations directory exited %d: %s%s", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -493,7 +496,7 @@ func TestTheStatisticsCountOnlyComparisonsMade(t *testing.T) {
 		all = append(all, evaluate(exps, fromMap(recs))...)
 	}
 	var out bytes.Buffer
-	report(&out, all, nil)
+	report(&out, all, nil, "", overall(all))
 	for _, want := range []string{
 		"cpu      2 run(s): 1 PASS, 1 FAIL, 0 UNMEASURED",
 		"cpu_seconds: mean 240.0 s, 95% CI n/a (one run), CV n/a (one run), n 1",
@@ -517,12 +520,22 @@ func TestARunThatLeftNothingIsFoundByTheCountAskedFor(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--runs", "3"},
 		&stdout, &stderr)
-	if code != exitUnmeasured || !strings.Contains(stdout.String(), "only 2 of the 3 measured runs asked for") {
+	if code != exitUnmeasured || !strings.Contains(stdout.String(), "only 2 of the 3 measured runs asked for") ||
+		strings.Contains(stdout.String(), "overall PASS") || !strings.Contains(stdout.String(), "overall UNMEASURED") {
 		t.Errorf("exit %d, want %d:\n%s%s", code, exitUnmeasured, stdout.String(), stderr.String())
 	}
 	if code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir},
 		&stdout, &stderr); code != exitUsage {
 		t.Errorf("a check that names no run count exited %d, want %d", code, exitUsage)
+	}
+
+	// THE WARMUP ALONE LEFT EXPECTATIONS: discarding it leaves no measured run,
+	// which is could-not-tell, not a broken command.
+	stdout.Reset()
+	if code := run(t.Context(), []string{"check", "--expectations", expDir, "--records", recDir, "--discard", "2",
+		"--runs", "5"}, &stdout, &stderr); code != exitUnmeasured ||
+		!strings.Contains(stdout.String(), "only 0 of the 5 measured runs") {
+		t.Errorf("every run discarded exited %d, want %d:\n%s", code, exitUnmeasured, stdout.String())
 	}
 }
 
@@ -534,9 +547,17 @@ func TestALoadTooSmallToTellFromNothingIsUnmeasured(t *testing.T) {
 		if exps[i].Kind == kindNetwork {
 			exps[i].Expected["net_rx_bytes"] = 1 * mib
 		}
+		if exps[i].Kind == kindMemory {
+			exps[i].Expected["memory_peak_bytes"] = 1 * mib
+		}
 	}
 	got := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork)
 	if got.verdict != unmeasured || !strings.Contains(got.reason, "the load is too small to compare") {
 		t.Errorf("a 1 MiB download: %s (%q), want UNMEASURED", got.verdict, got.reason)
+	}
+	// A PEAK IS COMPARED RAW, so its no-load value is the idle job's peak, not zero.
+	got = resultFor(t, evaluate(exps, fromMap(recs)), kindMemory)
+	if got.verdict != unmeasured || !strings.Contains(got.reason, "which holds 700.0 MiB") {
+		t.Errorf("a 1 MiB memory load: %s (%q), want UNMEASURED", got.verdict, got.reason)
 	}
 }
