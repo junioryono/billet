@@ -24,6 +24,8 @@ Between 08:30 and 09:00 UTC every CI job that reached the internet beyond GitHub
 - The host role sizes the bridge's resolver for a compute host (`billet_guest_dns_cache_size: 10000`, `billet_guest_dns_forward_max: 1000`), so the fleet's repeated lookups are answered on the node and are not sessions on the uplink.
 - The bridge's dnsmasq runs with `all-servers` (2026-10-06): every forwarded query goes to every upstream in `billet_guest_dns_servers` and the first answer wins, so one lost packet no longer stalls a guest's lookup for a resolver retry. With two upstreams it doubles the uplink's DNS packets, which the cache already keeps few.
 
+- The host role can shape a host's own share of the line (`billet_uplink_shaping`, 2026-10-08). On the same site with a 500 Mbit/s line, the node moving 378 Mbit/s down and 180 up gave 2.5% loss and latency from 7 to 29 ms to the node and to a laptop beside it, felt there as lag in an online game; with CAKE holding the node to 400 Mbit/s each way, 80 pings each from both machines lost none, while the node still pulled 342 Mbit/s.
+
 ## What was not done, and what the operator can still do
 
 - The gateway's session count was not read (its access code is printed on the device). If it approaches its cap during a full CI run, the fixes are on the operator's side: a firmware that raises the cap, or the node behind a router of its own whose connection table is sized for it, with the gateway in passthrough (which does not by itself stop the gateway tracking every session).

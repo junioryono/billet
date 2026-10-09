@@ -245,6 +245,20 @@ billet_networks:
     netmask: 255.255.255.0
     dhcp_start: 172.31.1.10
     dhcp_end: 172.31.1.250
+# SHAPING THIS HOST'S SHARE OF A SHARED UPLINK, off until stated. A site where
+# the fleet shares one residential or office line with people fills the
+# gateway's queue in bursts, which reads as lag to everyone else there. Set the
+# uplink interface and a rate for each direction somewhat below the line's own
+# (400 on a 500 Mbit/s line leaves the rest of the site its share), and the role
+# installs billet-uplink-shaping.service, CAKE in both directions:
+#   billet_uplink_shaping:
+#     interface: eno1
+#     egress_mbit: 400
+#     ingress_mbit: 400
+billet_uplink_shaping: {}
+# The intermediate device that carries ingress shaping, named from the interface
+# and bounded at Linux's fifteen characters.
+billet_uplink_shaping_ifb: "{{ 'ifb-' ~ (billet_uplink_shaping.interface | default(''))[:11] }}"
 billet_guest_dns_servers:
   - 1.1.1.1
   - 1.0.0.1

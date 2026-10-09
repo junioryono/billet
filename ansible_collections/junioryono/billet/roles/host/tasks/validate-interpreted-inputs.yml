@@ -9,6 +9,22 @@
 # THE COPIES ARE WHOLE NUMBERS, AT LEAST ONE, and a pool never needs more copies
 # to serve IO than it keeps; checked before anything changes, for the same reason
 # as the profile below.
+# THE SHAPING RATE IS THE OPERATOR'S, and a typo in it is refused before anything
+# changes: an interface name the kernel accepts, and whole megabits a second in
+# each direction. Nothing here can know the line's own speed.
+- name: Validate uplink shaping
+  ansible.builtin.assert:
+    that:
+      - billet_uplink_shaping is mapping
+      - billet_uplink_shaping | length == 0 or (billet_uplink_shaping.keys() | sort) == ['egress_mbit', 'ingress_mbit', 'interface']
+      - billet_uplink_shaping | length == 0 or billet_uplink_shaping.interface | string is match('^[A-Za-z0-9_.-]{1,15}$')
+      - billet_uplink_shaping | length == 0 or billet_uplink_shaping.egress_mbit | string is match('^[1-9][0-9]{0,5}$')
+      - billet_uplink_shaping | length == 0 or billet_uplink_shaping.ingress_mbit | string is match('^[1-9][0-9]{0,5}$')
+    fail_msg: >-
+      billet_uplink_shaping is either empty or exactly interface, egress_mbit and
+      ingress_mbit: an interface name of at most 15 characters, and whole megabits a
+      second from 1 to 999999 in each direction.
+
 - name: Validate the billet Ceph pools' copies
   ansible.builtin.assert:
     that:
