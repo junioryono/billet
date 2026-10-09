@@ -44,6 +44,9 @@ type fakeGroup struct {
 	tid    int
 	opened [NumEvents]bool
 	closed bool
+	// own is what this group alone reads, when a test gives it a reading of its
+	// own rather than its thread's.
+	own *CounterReading
 }
 
 func newFakeCounters() *fakeCounters {
@@ -105,6 +108,9 @@ func (g *fakeGroup) Read() (CounterReading, error) {
 	if err := g.src.readErr[g.tid]; err != nil {
 		return CounterReading{}, err
 	}
+	if g.own != nil {
+		return *g.own, nil
+	}
 
 	return g.src.reading[g.tid], nil
 }
@@ -150,12 +156,18 @@ func reading(enabled, running time.Duration, values ...uint64) CounterReading {
 	return r
 }
 
+// counterTestLimit is how long Start and Final wait for the sampler in the
+// counter tests: a watchdog, not a timeout under test, so every Start and Final
+// here is answered by Run and none is a fallback that left Run mid-request.
+const counterTestLimit = time.Minute
+
 // countedVM is the reference VM sampled by a monitor counting it with src.
 func countedVM(t *testing.T, src CounterSource) (tree, Target, *Monitor) {
 	t.Helper()
 
 	tr, target := referenceVM(t)
 	m := runMonitor(t, tr.root, Options{Interval: time.Second, Counters: src})
+	m.limit = counterTestLimit
 
 	return tr, target, m
 }
@@ -507,7 +519,7 @@ func TestAStoppedSamplerClosesItsGroups(t *testing.T) {
 	src := newFakeCounters()
 	tr, target := referenceVM(t)
 	m := NewMonitor(tr.root, Options{Interval: time.Second, Counters: src})
-	m.ticker, m.limit = false, testLimit
+	m.ticker, m.limit = false, counterTestLimit
 	runCtx, stop := context.WithCancel(t.Context())
 	defer stop()
 	done := make(chan struct{})
@@ -533,6 +545,7 @@ func TestOnlyAVMMIsCountedAndOnlyWithASource(t *testing.T) {
 
 	tr, target := referenceVM(t)
 	m := runMonitor(t, tr.root, Options{Interval: time.Second})
+	m.limit = counterTestLimit
 	m.Start("vm", target, 8)
 	if s, _ := m.Final("vm"); s.Counters != nil {
 		t.Errorf("a monitor with no counter source counted %+v", s.Counters)
@@ -629,6 +642,16 @@ func TestATidGivenToAnotherThreadIsCountedAsAnotherThread(t *testing.T) {
 	if reborn == refThreads["315378"] {
 		t.Fatal("the fixture's start time moved, so this restarts nothing")
 	}
+	// THE DEPARTED GROUP GOES ON ANSWERING ITS OWN FINAL COUNT, which moved past
+	// the last sample before the thread went, and the successor counts from zero.
+	src.mu.Lock()
+	for _, g := range src.groups {
+		if g.tid == 315378 && !g.closed {
+			final := reading(2*time.Second, 2*time.Second, 130, 130, 130, 130, 130, 130)
+			g.own = &final
+		}
+	}
+	src.mu.Unlock()
 	tr.write("/proc/315359/task/315378/stat", reborn+"\n")
 	src.set([]int{315378}, reading(time.Second, time.Second, 40, 40, 40, 40, 40, 40))
 	m.Tick()
@@ -640,9 +663,9 @@ func TestATidGivenToAnotherThreadIsCountedAsAnotherThread(t *testing.T) {
 		t.Errorf("the reused tid was opened %d times with %d groups open, want twice and one",
 			opens, src.open()[315378])
 	}
-	if got := finalCounters(t, m).Values[Cycles]; got != 7*100+100+40 {
-		t.Errorf("cycles = %d, want %d: seven threads at 100, the departed one's last 100, and "+
-			"its successor's 40", got, 7*100+100+40)
+	if got := finalCounters(t, m).Values[Cycles]; got != 7*100+130+40 {
+		t.Errorf("cycles = %d, want %d: seven threads at 100, the departed one's final 130, and "+
+			"its successor's 40", got, 7*100+130+40)
 	}
 }
 
