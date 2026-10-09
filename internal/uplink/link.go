@@ -135,18 +135,30 @@ func ifindex(iface string) string {
 	return strings.TrimSpace(string(body))
 }
 
-// nameForIndex is the interface that now has this index, or empty.
-func nameForIndex(index string) string {
+// errUndecided is an interface lookup that could not tell: never read as
+// absence, because absence permits removing a device a redirect may still use.
+var errUndecided = errors.New("could not tell which interface has the recorded index")
+
+// nameForIndex is the interface that now has this index. found is false only
+// when every interface was read and none has it; anything less is an error.
+func nameForIndex(index string) (name string, found bool, err error) {
 	entries, err := os.ReadDir(sysNet)
 	if err != nil {
-		return ""
+		return "", false, fmt.Errorf("%w: %w", errUndecided, err)
 	}
 
 	for _, entry := range entries {
-		if ifindex(entry.Name()) == index {
-			return entry.Name()
+		got := ifindex(entry.Name())
+		if got == "" {
+			// AN ENTRY WHOSE INDEX COULD NOT BE READ may be the interface itself,
+			// renamed between the listing and the read.
+			return "", false, fmt.Errorf("%w: %s's index could not be read", errUndecided, entry.Name())
+		}
+
+		if got == index {
+			return entry.Name(), true, nil
 		}
 	}
 
-	return ""
+	return "", false, nil
 }

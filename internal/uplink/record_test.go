@@ -36,12 +36,48 @@ func fakeSys(t *testing.T, interfaces map[string]string) {
 func TestTheRecordedInterfaceIsFoundByItsIndex(t *testing.T) {
 	fakeSys(t, map[string]string{"eth0": "9", "wan0": "5"})
 
-	if current, gone := (Record{Iface: "eth0", Index: "5", IFB: "ifb-eth0"}).Resolve(); gone || current != "wan0" {
-		t.Fatalf("index 5, renamed to wan0 and its old name taken by index 9, resolved to %q (gone %v)", current, gone)
+	current, gone, err := (Record{Iface: "eth0", Index: "5", IFB: "ifb-eth0"}).Resolve()
+	if err != nil || gone || current != "wan0" {
+		t.Fatalf("index 5, renamed to wan0 and its old name taken by index 9, resolved to %q (gone %v, %v)",
+			current, gone, err)
 	}
 
-	if _, gone := (Record{Iface: "eth0", Index: "7"}).Resolve(); !gone {
-		t.Fatal("an index no interface has resolved to an interface")
+	if _, gone, err := (Record{Iface: "eth0", Index: "7"}).Resolve(); err != nil || !gone {
+		t.Fatalf("an index no interface has resolved as gone %v (%v)", gone, err)
+	}
+}
+
+// A LOOKUP THAT COULD NOT TELL IS NOT ABSENCE: an interface whose index cannot
+// be read may be the recorded one, renamed mid-read, and treating it as gone
+// would remove the device its redirect still uses. Everything is kept.
+func TestAnUndecidedLookupKeepsTheDeviceAndTheRecord(t *testing.T) {
+	fakeSys(t, map[string]string{"eth0": "9"})
+
+	if err := os.Remove(filepath.Join(sysNet, "eth0", "ifindex")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := (Record{Iface: "wan0", Index: "5"}).Resolve(); err == nil {
+		t.Fatal("an interface whose index could not be read was ruled out")
+	}
+
+	if err := writeRecord(Record{Iface: "wan0", Index: "5", IFB: "ifb-wan0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFakeLink("wan0", "cake")
+	f.ifb = true
+
+	if err := clearRecorded(t.Context(), f.run); err == nil {
+		t.Fatal("a clear that could not find the interface reported success")
+	}
+
+	if !f.ifb || len(f.changed()) != 0 {
+		t.Fatalf("an undecided clear changed something:\n%s", strings.Join(f.ran, "\n"))
+	}
+
+	if _, ok := ReadRecord(); !ok {
+		t.Fatal("an undecided clear forgot the record")
 	}
 }
 

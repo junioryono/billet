@@ -78,21 +78,28 @@ func forgetRecord() error {
 // that has taken the recorded name since is somebody else's, and one renamed
 // since is still this one. gone means no interface has the index any more, and
 // its qdiscs went with it. A record with no index (written before indexes were)
-// is taken by name.
-func (r Record) Resolve() (current string, gone bool) {
+// is taken by name. AN ERROR IS A LOOKUP THAT COULD NOT TELL, never gone:
+// gone permits removing the device a redirect on the interface may still use.
+func (r Record) Resolve() (current string, gone bool, err error) {
 	if r.Index == "" {
-		if _, err := os.Stat(filepath.Join(sysNet, r.Iface)); err != nil {
-			return "", true
+		_, err := os.Stat(filepath.Join(sysNet, r.Iface))
+
+		switch {
+		case err == nil:
+			return r.Iface, false, nil
+		case errors.Is(err, os.ErrNotExist):
+			return "", true, nil
 		}
 
-		return r.Iface, false
+		return "", false, fmt.Errorf("%w: %w", errUndecided, err)
 	}
 
-	if name := nameForIndex(r.Index); name != "" {
-		return name, false
+	name, found, err := nameForIndex(r.Index)
+	if err != nil {
+		return "", false, err
 	}
 
-	return "", true
+	return name, !found, nil
 }
 
 // clearRecorded removes everything the record says a run installed, wherever it
@@ -104,9 +111,11 @@ func clearRecorded(ctx context.Context, run func(ctx context.Context, argv ...st
 		return nil
 	}
 
-	current, gone := r.Resolve()
-
-	var err error
+	// UNDECIDED KEEPS EVERYTHING, the record included, for a later try.
+	current, gone, err := r.Resolve()
+	if err != nil {
+		return fmt.Errorf("find the interface recorded as %s: %w", r.Iface, err)
+	}
 
 	if gone {
 		// ONLY THE DEVICE IS LEFT: the interface took its qdiscs, and with them

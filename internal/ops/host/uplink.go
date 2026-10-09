@@ -89,7 +89,7 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 	// converge finds; the record decides that, by the interface's index.
 	shaper := &uplink.Shaper{Iface: name}
 	if r, ok := uplink.ReadRecord(); ok {
-		if current, gone := r.Resolve(); !gone && current == name && r.IFB == shaper.IFB() {
+		if current, gone, err := r.Resolve(); err == nil && !gone && current == name && r.IFB == shaper.IFB() {
 			shaper.Owned = true
 		}
 	}

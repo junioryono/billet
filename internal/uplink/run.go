@@ -92,7 +92,8 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("shape %s: %w", iface, err)
 	}
 
-	if err := writeRecord(Record{Iface: iface, Index: ifindex(iface), IFB: shaper.IFB()}); err != nil {
+	index := ifindex(iface)
+	if err := writeRecord(Record{Iface: iface, Index: index, IFB: shaper.IFB()}); err != nil {
 		return err
 	}
 
@@ -104,7 +105,7 @@ func Run(ctx context.Context, opts Options) error {
 		"only when its own traffic raises the latency to the reflectors",
 		"interface", iface, "start_mbit", speed, "reflectors", reflectors, "bloat", opts.Params.Bloat)
 
-	err = loop(ctx, opts.Log, iface, pinger, ctl, shaper)
+	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper)
 
 	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
 	// ran is still cleared; a removal that failed is an error, and the unit's
@@ -138,7 +139,9 @@ func Lock() (release func(), err error) {
 	return func() { f.Close() }, nil //nolint:errcheck // closing releases the lock; nothing is left to say
 }
 
-func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, ctl *Controller, shaper *Shaper) error {
+func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pinger, ctl *Controller,
+	shaper *Shaper,
+) error {
 	var delays Delays
 
 	first, err := ReadCounters(iface)
@@ -158,6 +161,15 @@ func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, c
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+		}
+
+		// THE NAME STILL MEANS THE INTERFACE THIS RUN SHAPED, checked before every
+		// read and every change: renamed, with another device under the old name,
+		// the next `tc qdisc change` would retune somebody else's CAKE. Stopping
+		// leaves the cleanup to the record, which follows the index.
+		if index != "" && ifindex(iface) != index {
+			return fmt.Errorf("%s no longer has the index %s it was shaped under; stopping, and clearing "+
+				"by the record", iface, index)
 		}
 
 		if time.Since(exeCheckedAt) >= time.Minute {
