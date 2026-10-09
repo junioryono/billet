@@ -45,6 +45,7 @@
 
    operating/status-and-leases
    operating/metrics
+   operating/measurement-validation
    operating/nodes
    operating/guest-images
    operating/build-caches

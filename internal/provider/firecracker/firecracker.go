@@ -345,12 +345,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	// kernel does not provide fails every launch, so a controller the host did
 	// not prove is left off rather than attempted.
 	if p.wantAccounting {
-		root, err := cgroup2Mount(p.procMountsPath)
-		if err != nil {
-			p.accounting = Accounting{Reason: err.Error()}
-		} else {
-			p.accounting = probeAccounting(root)
-		}
+		p.accounting = p.hostAccounting()
 	}
 
 	return p, nil

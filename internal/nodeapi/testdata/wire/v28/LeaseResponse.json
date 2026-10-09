@@ -1,0 +1,39 @@
+{
+  "lease": {
+    "ID": "LeaseResponse.lease.ID",
+    "Tier": "LeaseResponse.lease.Tier",
+    "Node": "LeaseResponse.lease.Node",
+    "TargetNode": "LeaseResponse.lease.TargetNode",
+    "MacOSSlot": true,
+    "GuestOS": "LeaseResponse.lease.GuestOS",
+    "Provider": "LeaseResponse.lease.Provider",
+    "Providers": [
+      "LeaseResponse.lease.Providers[0]"
+    ],
+    "Phase": "LeaseResponse.lease.Phase",
+    "VCPU": 2112899914,
+    "Memory": 375951400,
+    "RequestedVCPU": 18384906,
+    "RequestedMemory": 502292456,
+    "InstanceType": "LeaseResponse.lease.InstanceType",
+    "Site": "LeaseResponse.lease.Site",
+    "PriceUSDPerHour": 377916553,
+    "ImageCache": "LeaseResponse.lease.ImageCache",
+    "CacheGeneration": "LeaseResponse.lease.CacheGeneration",
+    "ActionsCache": "LeaseResponse.lease.ActionsCache",
+    "sticky_cache": "LeaseResponse.lease.sticky_cache",
+    "git_cache": "LeaseResponse.lease.git_cache",
+    "bazel_cache": "LeaseResponse.lease.bazel_cache",
+    "go_cache": "LeaseResponse.lease.go_cache",
+    "PreferenceRank": 488596509,
+    "HeldSince": "LeaseResponse.lease.HeldSince",
+    "HolderIncarnation": "LeaseResponse.lease.HolderIncarnation",
+    "ForceRelease": true,
+    "FailureReason": "LeaseResponse.lease.FailureReason",
+    "Disruption": "LeaseResponse.lease.Disruption",
+    "DisruptedAt": "LeaseResponse.lease.DisruptedAt",
+    "Epoch": 1513958403,
+    "RunID": 964714198,
+    "RequestID": 315591882
+  }
+}

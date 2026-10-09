@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 26
+	Version = 28
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -347,6 +347,30 @@ const (
 	// measured memory group as a measured count.
 	VersionProcessUsage = 25
 
+	// VersionJobCounters is the version from which a usage report may carry what
+	// the CPU's hardware counters saw the job's vCPU threads do
+	// (JobUsage.Counters).
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT,
+	// because an older plane decodes the report strictly and would refuse the
+	// whole of it for one unknown field: below it the node strips the counters
+	// and reports the rest. CHECKED WHERE IT IS READ too, so a report from a
+	// pairing that negotiated below it is kept without them rather than
+	// recorded as something that wire does not carry.
+	VersionJobCounters = 26
+
+	// VersionJobDestinations is the version from which a usage report may carry
+	// the job's traffic by destination, from the host's connection tracker, and
+	// the tap's totals beside it (JobUsage.Destinations).
+	//
+	// A DIAGNOSTIC, reported rather than refused, checked at both ends as
+	// VersionJobCounters is: below it the node strips the destinations and
+	// reports the rest, which an older plane's strict decoder would otherwise
+	// refuse whole, and the plane drops them from a pairing that negotiated
+	// below it. A report without them reads as destinations not totalled, never
+	// as a job that sent nothing.
+	VersionJobDestinations = 27
+
 	// VersionSeriesClock is the version from which a usage report's series may
 	// be the clocked codec (lease.UsageSeriesCodecClocked): the wall time of its
 	// first sample on the host's clock and the sampler's marks for intervals it
@@ -357,7 +381,7 @@ const (
 	// strictly and would refuse the whole report over it. Below it the node
 	// re-encodes the series without the clock, which says less and never
 	// something else: that plane stores what it always stored.
-	VersionSeriesClock = 26
+	VersionSeriesClock = 28
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

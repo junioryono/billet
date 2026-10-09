@@ -3,10 +3,12 @@ package nodeclient_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +62,7 @@ type usageRecordingPlane struct {
 	version int
 	mu      sync.Mutex
 	got     *nodeapi.UsageRequest
+	raw     string
 }
 
 func (p *usageRecordingPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,13 +76,18 @@ func (p *usageRecordingPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 		return
 	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	var req nodeapi.UsageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	p.mu.Lock()
-	p.got = &req
+	p.got, p.raw = &req, string(body)
 	p.mu.Unlock()
 	if _, err := w.Write([]byte("{}")); err != nil {
 		return
@@ -143,6 +151,60 @@ func TestAProcessUsageReportSaysOnlyWhatAnOlderPlaneCanKeep(t *testing.T) {
 	}
 	if !slices.Equal(report.Unmeasured, want.Unmeasured) || report.MemoryPeakBytes == 0 {
 		t.Error("the downgrade changed the caller's report")
+	}
+}
+
+// A PLANE TOO OLD FOR HARDWARE COUNTERS IS SENT THE REST OF THE REPORT: its
+// strict decoder would refuse the whole body for the one key it does not know,
+// so below the version the key is not in the body at all. A plane at the
+// version is sent the counters as they were measured.
+func TestHardwareCountersReachOnlyAPlaneThatKnowsThem(t *testing.T) {
+	t.Parallel()
+
+	cycles, instructions := int64(4_000_000), int64(4_840_000)
+	report := alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Samples: 10, IntervalMillis: 1000, WindowMillis: 10_000,
+		Unmeasured: []string{alloc.UsageEnergy},
+		Counters:   &alloc.JobCounters{Cycles: &cycles, Instructions: &instructions},
+	}
+	for _, tc := range []struct {
+		version  int
+		counters bool
+	}{
+		{nodeapi.VersionJobCounters - 1, false},
+		{nodeapi.VersionJobCounters, true},
+	} {
+		plane := &usageRecordingPlane{version: tc.version}
+		srv := httptest.NewServer(plane)
+		t.Cleanup(srv.Close)
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		if err := c.Register(t.Context(), testRegistration()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if err := c.RecordLeaseUsage(t.Context(), "l1", 1, report, nil); err != nil {
+			t.Fatalf("RecordLeaseUsage on wire %d: %v", tc.version, err)
+		}
+		plane.mu.Lock()
+		got, raw := plane.got, plane.raw
+		plane.mu.Unlock()
+		if got == nil {
+			t.Fatalf("nothing reached the wire-%d plane", tc.version)
+		}
+		if sent := strings.Contains(raw, `"counters"`); sent != tc.counters {
+			t.Errorf("a wire-%d plane was sent counters %v, want %v: %s", tc.version, sent, tc.counters, raw)
+		}
+		if tc.counters && !reflect.DeepEqual(got.Usage, report) {
+			t.Errorf("a wire-%d plane was told %+v, want %+v", tc.version, got.Usage, report)
+		}
+		if !tc.counters && got.Usage.Samples != report.Samples {
+			t.Errorf("a wire-%d plane lost the rest of the report: %+v", tc.version, got.Usage)
+		}
+	}
+	if report.Counters == nil {
+		t.Error("stripping the counters for an older plane took them from the caller's report")
 	}
 }
 

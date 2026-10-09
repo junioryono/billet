@@ -1,0 +1,1 @@
+{"schema":1,"kind":"cpu","lease":"lease-cpu","repository":"acme/bench","run_id":18000000001,"run_attempt":2,"github_job_id":"52000000077","seconds":60,"load_started_at":"2026-10-09T10:00:00Z","load_finished_at":"2026-10-09T10:00:00Z","expected":{"cpu_seconds":240}}

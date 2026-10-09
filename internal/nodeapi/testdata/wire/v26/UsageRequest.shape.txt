@@ -28,6 +28,26 @@ UsageRequest.usage.energy_active_uj int64
 UsageRequest.usage.energy_idle_uj int64
 UsageRequest.usage.energy_source tag omitempty
 UsageRequest.usage.energy_source string
+UsageRequest.usage.counters tag omitempty
+UsageRequest.usage.counters pointer
+UsageRequest.usage.counters.cycles tag omitempty
+UsageRequest.usage.counters.cycles pointer
+UsageRequest.usage.counters.cycles int64
+UsageRequest.usage.counters.instructions tag omitempty
+UsageRequest.usage.counters.instructions pointer
+UsageRequest.usage.counters.instructions int64
+UsageRequest.usage.counters.cache_references tag omitempty
+UsageRequest.usage.counters.cache_references pointer
+UsageRequest.usage.counters.cache_references int64
+UsageRequest.usage.counters.cache_misses tag omitempty
+UsageRequest.usage.counters.cache_misses pointer
+UsageRequest.usage.counters.cache_misses int64
+UsageRequest.usage.counters.branch_misses tag omitempty
+UsageRequest.usage.counters.branch_misses pointer
+UsageRequest.usage.counters.branch_misses int64
+UsageRequest.usage.counters.frontend_stall_cycles tag omitempty
+UsageRequest.usage.counters.frontend_stall_cycles pointer
+UsageRequest.usage.counters.frontend_stall_cycles int64
 UsageRequest.series tag omitempty
 UsageRequest.series pointer
 UsageRequest.series.codec int

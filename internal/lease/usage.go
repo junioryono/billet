@@ -108,6 +108,69 @@ type JobUsage struct {
 	EnergyActiveMicrojoules int64  `json:"energy_active_uj"`
 	EnergyIdleMicrojoules   int64  `json:"energy_idle_uj"`
 	EnergySource            string `json:"energy_source,omitempty"`
+
+	// Counters is what the CPU's hardware counters saw the job's vCPU threads
+	// do; nil when the host counted nothing (node.monitoring.perf off, a backend
+	// with no vCPU threads, or a plane below the wire that carries them).
+	Counters *JobCounters `json:"counters,omitempty"`
+
+	// Destinations is the job's traffic by destination; nil when the host did
+	// not total it (node.monitoring.flows off, a backend other than firecracker,
+	// a job whose flows could not be followed, or a plane below the wire that
+	// carries them), which is not a job that sent nothing.
+	Destinations *JobDestinations `json:"destinations,omitempty"`
+}
+
+// JobCounters is what the CPU's hardware counters saw a job's vCPU threads do,
+// guest and host mode both, from when the node first saw each thread. A nil
+// field is an event the host could not count on every vCPU thread for all of
+// that time, never zero: a CPU without the event, a group the kernel never
+// scheduled, a thread that could not be opened.
+type JobCounters struct {
+	Cycles          *int64 `json:"cycles,omitempty"`
+	Instructions    *int64 `json:"instructions,omitempty"`
+	CacheReferences *int64 `json:"cache_references,omitempty"`
+	CacheMisses     *int64 `json:"cache_misses,omitempty"`
+	BranchMisses    *int64 `json:"branch_misses,omitempty"`
+	// FrontendStallCycles are cycles the frontend issued nothing.
+	FrontendStallCycles *int64 `json:"frontend_stall_cycles,omitempty"`
+}
+
+// events names each counter, in the order a reader prints them.
+func (c JobCounters) events() []struct {
+	name  string
+	value *int64
+} {
+	return []struct {
+		name  string
+		value *int64
+	}{
+		{"cycles", c.Cycles}, {"instructions", c.Instructions},
+		{"cache_references", c.CacheReferences}, {"cache_misses", c.CacheMisses},
+		{"branch_misses", c.BranchMisses}, {"frontend_stall_cycles", c.FrontendStallCycles},
+	}
+}
+
+// Validate refuses counters the ledger could not keep faithfully: a negative
+// count, or a block that counts nothing, which the ledger would read back as no
+// block at all.
+func (c JobCounters) Validate() error {
+	counted := false
+	for _, e := range c.events() {
+		if e.value == nil {
+			continue
+		}
+		if *e.value < 0 {
+			return fmt.Errorf("alloc: hardware counter %s is negative (%d)", e.name, *e.value)
+		}
+		counted = true
+	}
+	if !counted {
+		return errors.New("alloc: a usage report carries hardware counters that count nothing; " +
+			"it sends none instead")
+	}
+
+	return nil
 }
 
 // UsageSeries is one lease's per-sample series, opaque to the ledger.
@@ -182,6 +245,19 @@ func (u JobUsage) Validate() error {
 		}
 	case u.EnergySource != EnergyRAPL:
 		return fmt.Errorf("alloc: energy source %q is not one this control plane records", u.EnergySource)
+	}
+	if u.Counters != nil {
+		if err := u.Counters.Validate(); err != nil {
+			return err
+		}
+	}
+	if u.Destinations != nil {
+		if err := u.Destinations.Validate(); err != nil {
+			return err
+		}
+		if u.Destinations.Tap != nil && !u.Measured(UsageNet) {
+			return errTapWithoutNet
+		}
 	}
 
 	return nil

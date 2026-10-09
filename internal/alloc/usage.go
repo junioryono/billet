@@ -37,6 +37,10 @@ func (a *Allocator) RecordLeaseUsage(
 		}
 
 		q := state.WriteQueries(tx)
+		var counters JobCounters
+		if usage.Counters != nil {
+			counters = *usage.Counters
+		}
 		won, err := q.RecordJobUsage(ctx, ledgerdb.RecordJobUsageParams{
 			LeaseID: lease.ID, Node: lease.Node, RecordedAt: nowStamp(),
 			Source: usage.Source, Unmeasured: strings.Join(usage.Unmeasured, ","),
@@ -52,14 +56,29 @@ func (a *Allocator) RecordLeaseUsage(
 			IoSomeUs: usage.IOSomeMicros, IoFullUs: usage.IOFullMicros,
 			EnergyActiveUj: usage.EnergyActiveMicrojoules, EnergyIdleUj: usage.EnergyIdleMicrojoules,
 			EnergySource: usage.EnergySource,
+			Cycles:       nullCount(counters.Cycles), Instructions: nullCount(counters.Instructions),
+			CacheReferences:        nullCount(counters.CacheReferences),
+			CacheMisses:            nullCount(counters.CacheMisses),
+			BranchMisses:           nullCount(counters.BranchMisses),
+			FrontendStallCycles:    nullCount(counters.FrontendStallCycles),
+			DestinationsIncomplete: destinationsVerdict(usage.Destinations),
+			TapSentBytes:           tapTotal(usage.Destinations, func(t *TapTotals) int64 { return t.SentBytes }),
+			TapReceivedBytes: tapTotal(usage.Destinations,
+				func(t *TapTotals) int64 { return t.ReceivedBytes }),
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: record the usage of lease %s: %w", leaseID, err)
 		}
 
-		// ONLY THE REPORT THAT WON WRITES A SERIES, so the stored pair is always
-		// one request's.
-		if series == nil || won == 0 {
+		// ONLY THE REPORT THAT WON WRITES A SERIES OR DESTINATIONS, so what is
+		// stored beside the summary is always one request's.
+		if won == 0 {
+			return nil
+		}
+		if err := recordDestinations(ctx, q, lease.ID, usage.Destinations); err != nil {
+			return err
+		}
+		if series == nil {
 			return nil
 		}
 		if err := q.RecordJobSeries(ctx, ledgerdb.RecordJobSeriesParams{
@@ -110,10 +129,52 @@ func (a *Allocator) LeaseUsage(ctx context.Context, leaseID string) (RecordedUsa
 			IOSomeMicros: row.IoSomeUs, IOFullMicros: row.IoFullUs,
 			EnergyActiveMicrojoules: row.EnergyActiveUj, EnergyIdleMicrojoules: row.EnergyIdleUj,
 			EnergySource: row.EnergySource,
+			Counters: countersOf(row.Cycles, row.Instructions, row.CacheReferences, row.CacheMisses,
+				row.BranchMisses, row.FrontendStallCycles),
 		}}
+		// NOT TOTALLED IS NO DESTINATIONS, never an empty set of them.
+		if !row.DestinationsIncomplete.Valid {
+			return nil
+		}
+		dests, err := readDestinations(ctx, q, leaseID, row)
+		if err != nil {
+			return err
+		}
+		out.Destinations = dests
 		return nil
 	})
 	return out, err
+}
+
+// nullCount is a hardware counter as its column holds it: NULL where it was
+// not counted.
+func nullCount(v *int64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+
+	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
+// countersOf reads a row's hardware counters back: nil when none was counted,
+// which is every row from before migration 58 and every job not counted since.
+func countersOf(cycles, instructions, refs, misses, branchMisses, stalls sql.NullInt64) *JobCounters {
+	count := func(v sql.NullInt64) *int64 {
+		if !v.Valid {
+			return nil
+		}
+		n := v.Int64
+		return &n
+	}
+	c := JobCounters{
+		Cycles: count(cycles), Instructions: count(instructions), CacheReferences: count(refs),
+		CacheMisses: count(misses), BranchMisses: count(branchMisses), FrontendStallCycles: count(stalls),
+	}
+	if c == (JobCounters{}) {
+		return nil
+	}
+
+	return &c
 }
 
 // LeaseUsageSeries reads a lease's encoded series. A lease with none is

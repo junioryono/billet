@@ -1,0 +1,51 @@
+{
+  "label": "TierSpec.label",
+  "image": "TierSpec.image",
+  "trust": "TierSpec.trust",
+  "command": [
+    "TierSpec.command[0]"
+  ],
+  "disk": 281143490,
+  "shm": 1465007639,
+  "runner_group": "TierSpec.runner_group",
+  "workflows": [
+    "TierSpec.workflows[0]"
+  ],
+  "buildkit_cache_mount_limit": 134121501,
+  "intercept": true,
+  "cache_scope": {
+    "Owner": "TierSpec.cache_scope.Owner",
+    "Repository": "TierSpec.cache_scope.Repository",
+    "WorkflowRef": "TierSpec.cache_scope.WorkflowRef"
+  },
+  "cache": {
+    "publish": "TierSpec.cache.publish",
+    "owner": "TierSpec.cache.owner",
+    "repository": "TierSpec.cache.repository",
+    "docker": {
+      "enabled": true,
+      "max_size": 320761374
+    },
+    "sticky_disks": {
+      "enabled": true,
+      "max_size": 1193702915
+    },
+    "actions": {
+      "enabled": true,
+      "max_size": 773765874
+    },
+    "git": {
+      "enabled": true,
+      "max_size": 1825603201
+    },
+    "bazel": {
+      "enabled": true,
+      "max_size": 1481783525
+    },
+    "go": {
+      "enabled": true,
+      "max_size": 2065315820
+    },
+    "go_test_results": true
+  }
+}

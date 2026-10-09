@@ -1,0 +1,50 @@
+{
+  "CacheAuthorityResponse.authority.proven": {
+    "authority": {
+      "lease_id": "CacheAuthorityResponse.authority.lease_id",
+      "job_id": "CacheAuthorityResponse.authority.job_id",
+      "run_id": 982299405,
+      "owner": "CacheAuthorityResponse.authority.owner",
+      "repository": "CacheAuthorityResponse.authority.repository",
+      "event": "CacheAuthorityResponse.authority.event",
+      "ref": "CacheAuthorityResponse.authority.ref",
+      "base_ref": "CacheAuthorityResponse.authority.base_ref",
+      "default_ref": "CacheAuthorityResponse.authority.default_ref",
+      "proven": true,
+      "write_own_ref": false,
+      "publish_default": false
+    }
+  },
+  "CacheAuthorityResponse.authority.publish_default": {
+    "authority": {
+      "lease_id": "CacheAuthorityResponse.authority.lease_id",
+      "job_id": "CacheAuthorityResponse.authority.job_id",
+      "run_id": 982299405,
+      "owner": "CacheAuthorityResponse.authority.owner",
+      "repository": "CacheAuthorityResponse.authority.repository",
+      "event": "CacheAuthorityResponse.authority.event",
+      "ref": "CacheAuthorityResponse.authority.ref",
+      "base_ref": "CacheAuthorityResponse.authority.base_ref",
+      "default_ref": "CacheAuthorityResponse.authority.default_ref",
+      "proven": false,
+      "write_own_ref": false,
+      "publish_default": true
+    }
+  },
+  "CacheAuthorityResponse.authority.write_own_ref": {
+    "authority": {
+      "lease_id": "CacheAuthorityResponse.authority.lease_id",
+      "job_id": "CacheAuthorityResponse.authority.job_id",
+      "run_id": 982299405,
+      "owner": "CacheAuthorityResponse.authority.owner",
+      "repository": "CacheAuthorityResponse.authority.repository",
+      "event": "CacheAuthorityResponse.authority.event",
+      "ref": "CacheAuthorityResponse.authority.ref",
+      "base_ref": "CacheAuthorityResponse.authority.base_ref",
+      "default_ref": "CacheAuthorityResponse.authority.default_ref",
+      "proven": false,
+      "write_own_ref": true,
+      "publish_default": false
+    }
+  }
+}

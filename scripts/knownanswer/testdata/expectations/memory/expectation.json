@@ -1,0 +1,1 @@
+{"schema":1,"kind":"memory","lease":"lease-memory","repository":"acme/bench","run_id":18000000001,"run_attempt":2,"github_job_id":"52000000077","seconds":60,"load_started_at":"2026-10-09T10:00:00Z","load_finished_at":"2026-10-09T10:00:00Z","expected":{"memory_peak_bytes":2147483648}}

@@ -314,18 +314,18 @@ func TestMarkDeregisteredSurvivesAReapAndIsIdempotent(t *testing.T) {
 //
 // A test that wants the FLEET to be the constraint uses newBareAllocator and
 // says which machines exist.
-func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
-	t.Helper()
+func newAllocator(tb testing.TB, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
+	tb.Helper()
 
-	a := newBareAllocator(t, limits, tiers, opts...)
+	a := newBareAllocator(tb, limits, tiers, opts...)
 
 	// ONE HOST PER BACKEND, so a tier naming any of them has somewhere to go.
 	for _, provider := range []config.ProviderKind{
 		config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart,
 	} {
-		if _, err := a.RegisterNode(t.Context(), testRegistration(
+		if _, err := a.RegisterNode(tb.Context(), testRegistration(
 			"test-host-"+string(provider), provider)); err != nil {
-			t.Fatalf("registering the default host: %v", err)
+			tb.Fatalf("registering the default host: %v", err)
 		}
 	}
 
@@ -343,8 +343,8 @@ func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Opti
 			provider = tiers[i].Providers[0]
 		}
 
-		if _, err := a.RegisterNode(t.Context(), testRegistration(tiers[i].Node, provider)); err != nil {
-			t.Fatalf("registering pinned host %s: %v", tiers[i].Node, err)
+		if _, err := a.RegisterNode(tb.Context(), testRegistration(tiers[i].Node, provider)); err != nil {
+			tb.Fatalf("registering pinned host %s: %v", tiers[i].Node, err)
 		}
 	}
 
@@ -352,14 +352,14 @@ func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Opti
 }
 
 // newBareAllocator is an allocator with NO hosts, for tests about the fleet.
-func newBareAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
-	t.Helper()
+func newBareAllocator(tb testing.TB, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
+	tb.Helper()
 
-	db := openTestLedger(t)
+	db := openTestLedger(tb)
 
 	a, err := New(db, limits, tiers, opts...)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		tb.Fatalf("New: %v", err)
 	}
 
 	return a
@@ -376,6 +376,39 @@ func TestAllocatorReappliesInterceptionProviderSafety(t *testing.T) {
 	_, err := New(db, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{unsafe})
 	if err == nil || !strings.Contains(err.Error(), "only the firecracker provider") {
 		t.Fatalf("New accepted unsafe interception outside config.Load: %v", err)
+	}
+}
+
+// AN IMAGE A LAUNCH WOULD READ AS AN OPTION IS REFUSED OUTSIDE config.Load TOO
+// (#449), top-level or in launch, and an ordinary image name is not.
+func TestAllocatorReappliesTheImageOptionRule(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*config.Tier){
+		"top-level":      func(tier *config.Tier) { tier.Image = "--network=host" },
+		"behind a space": func(tier *config.Tier) { tier.Image = " --help@verified" },
+		"launch": func(tier *config.Tier) {
+			tier.Launch = map[config.ProviderKind]config.TierLaunch{
+				config.ProviderDocker: {Image: "--privileged"},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			unsafe := tier("dash-image", 2, 4*config.GiB)
+			mutate(&unsafe)
+			_, err := New(openTestLedger(t), Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{unsafe})
+			if err == nil || !strings.Contains(err.Error(), `begins with "-"`) {
+				t.Fatalf("New with an image beginning with a dash = %v, want a refusal naming it", err)
+			}
+		})
+	}
+
+	ordinary := tier("ordinary-image", 2, 4*config.GiB)
+	ordinary.Image = "ghcr.io/actions/runner:latest"
+	if _, err := New(openTestLedger(t), Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{ordinary}); err != nil {
+		t.Fatalf("New with an ordinary image = %v, want accepted", err)
 	}
 }
 

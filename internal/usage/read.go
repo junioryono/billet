@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -13,8 +14,10 @@ type Target struct {
 	// CgroupDir is the job's own cgroup-v2 directory, created for this job, so
 	// its counters start at zero when the job does.
 	CgroupDir string
-	// PID is the VMM's process, whose threads split guest time from the VMM's
-	// own. Zero means there is no such split to make (a container).
+	// PID is the job's process: the VMM, whose threads split guest time from
+	// its own (VCPUThreadPrefix); a container's init, whose network namespace
+	// is the job's (NetNamespace); or, with Process, the whole job. Zero means
+	// none of these is read.
 	PID int
 	// PIDStart is the start time PID had when the target was made
 	// (ProcessStart). Every read checks it, so a pid the kernel has since given
@@ -30,6 +33,12 @@ type Target struct {
 	// NetHostView says the device's counters are the host's view, so received
 	// is what the guest sent. True for a tap, whose rx is the guest's tx.
 	NetHostView bool
+	// NetNamespace says NetDevice is read from /proc/<PID>/net/dev, the
+	// interface table of the network namespace PID is in, rather than from the
+	// host's /sys/class/net: a container's eth0, counted from inside, so
+	// received is what the container received. The reading is kept only if PID
+	// still started at PIDStart after it.
+	NetNamespace bool
 	// Process says the job is PID alone, with no cgroup: it is measured by the
 	// process's own accounting (ProcessCounters), checked against PIDStart on
 	// every read, and CgroupDir is not read.
@@ -85,19 +94,34 @@ func (r Reader) read(p string) (string, error) {
 // group reports its own verdict, because a host without the memory controller
 // still has CPU time worth reporting.
 func (r Reader) Read(t Target) Sample {
+	s, _ := r.readListing(t)
+
+	return s
+}
+
+// vcpuThread names one vCPU thread: its tid, and the start time that with the
+// tid names one thread, since a tid the kernel frees can be given to another.
+type vcpuThread struct {
+	tid   int
+	start uint64
+}
+
+// readListing is Read, and the VMM's vCPU threads the sample's thread split was
+// read from: nil unless ThreadsOK.
+func (r Reader) readListing(t Target) (Sample, []vcpuThread) {
 	var s Sample
 	if t.Process {
 		s.readProcess(r, t)
-		return s
+		return s, nil
 	}
 	s.readCPU(r, t)
 	s.readMemory(r, t)
 	s.readIO(r, t)
 	s.readPressure(r, t)
 	s.readNet(r, t)
-	s.readThreads(r, t)
+	vcpus := s.readThreads(r, t)
 
-	return s
+	return s, vcpus
 }
 
 func (s *Sample) readCPU(r Reader, t Target) {
@@ -179,15 +203,13 @@ func (s *Sample) readNet(r Reader, t Target) {
 	if t.NetDevice == "" || strings.ContainsAny(t.NetDevice, "/.") {
 		return
 	}
-	var v [4]int64
-	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
-		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
-		if err != nil {
-			return
-		}
-		if v[i], err = parseSingle(raw); err != nil {
-			return
-		}
+	read := r.hostNet
+	if t.NetNamespace {
+		read = r.namespaceNet
+	}
+	v, ok := read(t)
+	if !ok {
+		return
 	}
 	// A TAP COUNTS FROM THE HOST'S SIDE: what the host transmitted on it is
 	// what the guest received.
@@ -197,23 +219,100 @@ func (s *Sample) readNet(r Reader, t Target) {
 	s.NetRx, s.NetTx, s.NetRxPackets, s.NetTxPackets, s.NetOK = v[0], v[1], v[2], v[3], true
 }
 
+// hostNet reads a device's rx and tx bytes and packets from the host's
+// /sys/class/net.
+func (r Reader) hostNet(t Target) ([4]int64, bool) {
+	var v [4]int64
+	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
+		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
+		if err != nil {
+			return v, false
+		}
+		if v[i], err = parseSingle(raw); err != nil {
+			return v, false
+		}
+	}
+
+	return v, true
+}
+
+// namespaceNet reads a device's rx and tx bytes and packets from the interface
+// table of PID's network namespace, without entering it.
+func (r Reader) namespaceNet(t Target) ([4]int64, bool) {
+	if t.PID <= 0 || t.PIDStart == 0 {
+		return [4]int64{}, false
+	}
+	raw, err := r.read(fmt.Sprintf("/proc/%d/net/dev", t.PID))
+	if err != nil {
+		return [4]int64{}, false
+	}
+	v, err := parseNetDev(raw, t.NetDevice)
+	if err != nil {
+		return [4]int64{}, false
+	}
+	// CHECKED AFTER THE READ, as the threads are: a pid reused before or during
+	// it names another process, whose namespace is not the job's.
+	if start, err := r.ProcessStart(t.PID); err != nil || start != t.PIDStart {
+		return [4]int64{}, false
+	}
+
+	return v, true
+}
+
 // readThreads splits a VMM's CPU time into its vCPU threads (guest code) and
 // everything else (the event loop, the API thread: emulation and IO).
-func (s *Sample) readThreads(r Reader, t Target) {
+func (s *Sample) readThreads(r Reader, t Target) []vcpuThread {
 	if t.PID <= 0 || t.VCPUThreadPrefix == "" || t.PIDStart == 0 {
-		return
+		return nil
 	}
-	guest, vmm, err := r.threadTimes(t.PID, t.VCPUThreadPrefix)
+	guest, vmm, vcpus, err := r.threadTimes(t.PID, t.VCPUThreadPrefix)
 	if err != nil {
-		return
+		return nil
 	}
 	// CHECKED AFTER THE READ, which covers a pid reused before it and during it:
 	// either way the process holding the pid now is not the one recorded, and
 	// what was read is discarded.
 	if start, err := r.ProcessStart(t.PID); err != nil || start != t.PIDStart {
-		return
+		return nil
 	}
 	s.GuestCPU, s.VMMCPU, s.ThreadsOK = guest, vmm, true
+
+	return vcpus
+}
+
+// isVCPUThread reports whether v is still one of the target VMM's vCPU
+// threads: listed under the VMM with the start time it was listed with, named
+// as one, and the VMM still the process the target recorded. A thread or a VMM
+// that is gone, or a tid now naming another thread, is a no; a read that fails
+// otherwise, or a stat it cannot parse, is an error, because it cannot tell.
+func (r Reader) isVCPUThread(t Target, v vcpuThread) (bool, error) {
+	raw, err := r.read(fmt.Sprintf("/proc/%d/task/%d/stat", t.PID, v.tid))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	comm, _, _, err := parseTaskStat(raw)
+	if err != nil {
+		return false, err
+	}
+	threadStart, err := parseStartTime(raw)
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasPrefix(comm, t.VCPUThreadPrefix) || threadStart != v.start {
+		return false, nil
+	}
+	start, err := r.ProcessStart(t.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return start == t.PIDStart, nil
 }
 
 // ProcessStart is the start time of pid, which with the pid names one process.
@@ -226,14 +325,14 @@ func (r Reader) ProcessStart(pid int) (uint64, error) {
 	return parseStartTime(raw)
 }
 
-func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
+func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []vcpuThread, error) {
 	dir := fmt.Sprintf("/proc/%d/task", pid)
 	entries, err := os.ReadDir(r.path(dir))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	var guest, vmm int64
-	sawVCPU := false
+	var vcpus []vcpuThread
 	for _, entry := range entries {
 		raw, err := r.read(filepath.Join(dir, entry.Name(), "stat"))
 		if errors.Is(err, os.ErrNotExist) {
@@ -241,25 +340,33 @@ func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
 			continue
 		}
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		comm, utime, stime, err := parseTaskStat(raw)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		ticks := utime + stime
-		if strings.HasPrefix(comm, vcpuPrefix) {
-			guest += ticks
-			sawVCPU = true
-		} else {
+		if !strings.HasPrefix(comm, vcpuPrefix) {
 			vmm += ticks
+			continue
 		}
+		tid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("usage: task %q is not a thread id", entry.Name())
+		}
+		start, err := parseStartTime(raw)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		guest += ticks
+		vcpus = append(vcpus, vcpuThread{tid: tid, start: start})
 	}
-	if !sawVCPU {
-		return 0, 0, fmt.Errorf("usage: pid %d has no %q thread, so it is not the VMM", pid, vcpuPrefix)
+	if len(vcpus) == 0 {
+		return 0, 0, nil, fmt.Errorf("usage: pid %d has no %q thread, so it is not the VMM", pid, vcpuPrefix)
 	}
 
-	return ticksToMicros(guest), ticksToMicros(vmm), nil
+	return ticksToMicros(guest), ticksToMicros(vmm), vcpus, nil
 }
 
 // HostCPU is the host's aggregate CPU counters from /proc/stat, in µs.

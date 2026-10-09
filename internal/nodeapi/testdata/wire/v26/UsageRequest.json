@@ -28,7 +28,15 @@
     "io_full_us": 1465580281,
     "energy_active_uj": 1019140487,
     "energy_idle_uj": 805580667,
-    "energy_source": "UsageRequest.usage.energy_source"
+    "energy_source": "UsageRequest.usage.energy_source",
+    "counters": {
+      "cycles": 1525179277,
+      "instructions": 1086809459,
+      "cache_references": 1789822056,
+      "cache_misses": 508672714,
+      "branch_misses": 171018709,
+      "frontend_stall_cycles": 1344685146
+    }
   },
   "series": {
     "codec": 1489049453,

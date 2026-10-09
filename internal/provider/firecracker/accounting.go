@@ -48,6 +48,63 @@ type Accounting struct {
 	IO Controller
 	// Reason says why either one is not present, for billet check.
 	Reason string
+	// Root is the cgroup-v2 hierarchy's mount point and Parent the cgroup the
+	// jailer creates each microVM's under, both empty when the mount table could
+	// not be read. They are what a refusal tells an operator to change.
+	Root, Parent string
+}
+
+// ErrJobAccountingUnproved is a node.monitoring the host cannot honour: the
+// jailer is asked only for a controller the host proved, so a controller left
+// unproved would be recorded as unmeasured on every job.
+var ErrJobAccountingUnproved = errors.New("node.monitoring is set and this host could not " +
+	"prove the jailer can account each microVM's memory and io")
+
+// Require is nil when both memory and io are proved present, and otherwise
+// the refusal naming each controller that is not, whether it is missing or
+// could not be told, and how to enable both for the jailer's parent cgroup.
+func (a Accounting) Require() error {
+	var unproved []string
+	for _, c := range []struct {
+		name  string
+		state Controller
+	}{{"memory", a.Memory}, {"io", a.IO}} {
+		switch c.state {
+		case ControllerPresent:
+		case ControllerMissing:
+			unproved = append(unproved, c.name+" is missing")
+		default:
+			unproved = append(unproved, "billet could not tell whether "+c.name+" is available")
+		}
+	}
+	if len(unproved) == 0 {
+		return nil
+	}
+
+	// A HOST WHOSE MOUNT TABLE NAMED NO HIERARCHY still gets the remedy, with
+	// the paths it could not read written as placeholders.
+	root, parent := a.Root, a.Parent
+	if root == "" {
+		root, parent = "<cgroup-v2 root>", "<cgroup-v2 root>/<firecracker binary name>"
+	}
+	reason := ""
+	if a.Reason != "" {
+		reason = " (" + a.Reason + ")"
+	}
+
+	return fmt.Errorf("firecracker: %w: %s%s. What is not proved would be recorded as "+
+		"unmeasured on every job, because the jailer is asked only for the controllers this "+
+		"host proves it supports. Enable memory and io for %s: both must be listed in "+
+		"%s/cgroup.controllers (a kernel booted with cgroup_disable=memory, or holding a "+
+		"controller in a cgroup-v1 hierarchy, does not list it); `echo '+memory +io' > "+
+		"%s/cgroup.subtree_control` enables them for the cgroups directly below the root, the "+
+		"jailer's parent among them, and the jailer enables them below that for each microVM; "+
+		"and io needs the kernel's weight-based io policy "+
+		"(CONFIG_BLK_CGROUP_IOCOST), which an io-enabled cgroup shows as io.weight; where no "+
+		"cgroup exists below the root yet, `mkdir %s` after enabling them gives the check one "+
+		"to read. Then run billet check again, or remove node.monitoring to run this node "+
+		"unmeasured",
+		ErrJobAccountingUnproved, strings.Join(unproved, " and "), reason, parent, root, root, parent)
 }
 
 // Summary is one line for billet check.
@@ -144,30 +201,76 @@ func probeIOWeight(root string) (Controller, string) {
 		return ControllerUnknown, fmt.Sprintf("list %s: %v", root, err)
 	}
 
-	sawChild := false
+	// MISSING ONLY FROM AN AFFIRMATIVE ABSENCE: a domain child that is still
+	// there and has no io.weight proves this kernel has no weight-based io
+	// policy, because io is enabled for every child of the root. A child that
+	// could not be read leaves doubt, and one that is gone or threaded says
+	// nothing; either way another child can still prove io present.
+	absent := false
+	doubt := ""
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		sawChild = true
-		_, err := os.Stat(filepath.Join(root, entry.Name(), "io.weight"))
-		switch {
-		case err == nil:
+		switch verdict, why := probeChildIOWeight(filepath.Join(root, entry.Name())); verdict {
+		case ControllerPresent:
 			return ControllerPresent, ""
-		case errors.Is(err, fs.ErrNotExist):
-			continue
+		case ControllerMissing:
+			absent = true
 		default:
-			return ControllerUnknown, fmt.Sprintf("stat %s: %v",
-				filepath.Join(root, entry.Name(), "io.weight"), err)
+			if doubt == "" {
+				doubt = why
+			}
 		}
 	}
-	if !sawChild {
-		return ControllerUnknown, "no cgroup below " + root + " to read io.weight from"
+	switch {
+	case absent:
+		return ControllerMissing, "the io controller is enabled below " + root +
+			" and a cgroup there has no io.weight, so this kernel has no weight-based io " +
+			"policy (CONFIG_BLK_CGROUP_IOCOST) and the jailer could not enable io"
+	case doubt != "":
+		return ControllerUnknown, doubt
+	default:
+		return ControllerUnknown, "no domain cgroup below " + root + " to read io.weight from"
+	}
+}
+
+// probeChildIOWeight reads whether one child of the root shows io.weight.
+// Unknown with no reason is a child that says nothing either way: gone since
+// the listing, or threaded, which has no io files of its own.
+func probeChildIOWeight(child string) (Controller, string) {
+	typ := filepath.Join(child, "cgroup.type")
+	raw, err := os.ReadFile(typ)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return ControllerUnknown, ""
+	case err != nil:
+		return ControllerUnknown, fmt.Sprintf("read %s: %v", typ, err)
+	}
+	if kind := strings.TrimSpace(string(raw)); kind != "domain" && kind != "domain threaded" {
+		return ControllerUnknown, ""
 	}
 
-	return ControllerMissing, "the io controller is enabled below " + root +
-		" and no cgroup there has io.weight, so this kernel has no weight-based io " +
-		"policy (CONFIG_BLK_CGROUP_IOCOST) and the jailer could not enable io"
+	weight := filepath.Join(child, "io.weight")
+	info, err := os.Stat(weight)
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		return ControllerPresent, ""
+	case err == nil:
+		// A CGROUP NAMED io.weight is a directory, not the kernel's file, and
+		// says nothing either way about this kernel's io policy.
+		return ControllerUnknown, weight + " is not the kernel's io.weight file"
+	case !errors.Is(err, fs.ErrNotExist):
+		return ControllerUnknown, fmt.Sprintf("stat %s: %v", weight, err)
+	}
+
+	// AND THE CHILD IS STILL THERE: one removed between the reads has no files
+	// at all, which is not an absence of io.weight.
+	if _, err := os.Stat(typ); err != nil {
+		return ControllerUnknown, ""
+	}
+
+	return ControllerMissing, ""
 }
 
 // WithJobAccounting asks the jailer to enable the memory and io controllers
@@ -181,3 +284,39 @@ func WithJobAccounting() Option {
 // Accounting reports what the provider asks the jailer to account for. It is
 // the zero value unless WithJobAccounting was given.
 func (p *Provider) Accounting() Accounting { return p.accounting }
+
+// RequireJobAccounting refuses a provider built WithJobAccounting on a host
+// that did not prove both memory and io (Accounting.Require). A provider built
+// without it refuses nothing, and launches with the cpu-only cgroup it always
+// did.
+func (p *Provider) RequireJobAccounting() error {
+	if !p.wantAccounting {
+		return nil
+	}
+
+	return p.accounting.Require()
+}
+
+// hostAccounting reads what this host can account for each microVM, under the
+// cgroup-v2 hierarchy the mount table names.
+func (p *Provider) hostAccounting() Accounting {
+	root, err := cgroup2Mount(p.procMountsPath)
+	if err != nil {
+		return Accounting{Reason: err.Error()}
+	}
+	acct := probeAccounting(root)
+	acct.Root, acct.Parent = root, filepath.Join(root, p.execName)
+
+	return acct
+}
+
+// WithMountTable reads where the cgroup-v2 hierarchy is mounted from path
+// rather than /proc/mounts, so a check can be run against a staged hierarchy.
+// An empty path keeps the default.
+func WithMountTable(path string) Option {
+	return func(p *Provider) {
+		if path != "" {
+			p.procMountsPath = path
+		}
+	}
+}

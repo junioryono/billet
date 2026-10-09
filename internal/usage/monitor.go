@@ -17,6 +17,10 @@ type Options struct {
 	IdleWatts float64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Counters counts each job's vCPU threads with the CPU's hardware counters;
+	// nil counts nothing. Only a job with a VMM and a vCPU thread prefix is
+	// counted.
+	Counters CounterSource
 }
 
 // maxPackageWatts bounds how fast a package can advance its energy counter, to
@@ -76,6 +80,11 @@ type Monitor struct {
 	energy       Energy
 	energyOK     bool
 	energyReadAt time.Time
+
+	// counting holds each counted job's open groups. ONLY RUN TOUCHES IT, so
+	// every descriptor is opened, read and closed on one goroutine; a job
+	// Forget removed is closed by Run's next sweep.
+	counting map[*job]*jobCounters
 }
 
 type requestKind int
@@ -121,6 +130,9 @@ type job struct {
 	// processEnergyAt is when the process's energy was last read: a lifetime
 	// total is the job's whole energy only if it is recent.
 	processEnergyAt time.Time
+	// counters is the latest total of the job's hardware counters, nil when it
+	// is not counted.
+	counters *Counters
 	// energyBroken is set when any interval of the job's life could not be
 	// attributed, which makes its energy could-not-tell rather than too low.
 	energyBroken bool
@@ -140,12 +152,14 @@ func NewMonitor(root string, opts Options) *Monitor {
 	}
 
 	return &Monitor{reader: Reader{Root: root}, opts: opts, jobs: map[string]*job{},
-		requests: make(chan request), ticker: true, limit: lifecycleLimit}
+		requests: make(chan request), ticker: true, limit: lifecycleLimit,
+		counting: map[*job]*jobCounters{}}
 }
 
 // Run samples every job each interval, and serves Start and Final, until ctx
 // ends.
 func (m *Monitor) Run(ctx context.Context) {
+	defer m.closeCounters(func(*job) bool { return true })
 	var tick <-chan time.Time
 	if m.ticker {
 		m.tick()
@@ -220,8 +234,16 @@ func (m *Monitor) Start(key string, target Target, vcpus int) {
 }
 
 func (m *Monitor) start(key string, j *job) {
+	m.sweepCounters()
 	now := m.opts.Now()
-	s := m.reader.Read(j.target)
+	s, vcpus := m.reader.readListing(j.target)
+	var counters *Counters
+	if m.opts.Counters != nil && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" && !j.target.Process {
+		c := &jobCounters{}
+		m.counting[j] = c
+		m.count(j, c, s, vcpus)
+		counters = c.totals()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -230,6 +252,7 @@ func (m *Monitor) start(key string, j *job) {
 	}
 	j.first, j.pending, j.points = now, false, nil
 	j.absorb(s, now)
+	j.counters = counters
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
 }
@@ -257,6 +280,7 @@ func (m *Monitor) Tick() {
 // checked against the job it was read for, because Forget does not wait for
 // Run.
 func (m *Monitor) tick() {
+	m.sweepCounters()
 	m.mu.Lock()
 	snapshot := make(map[string]*job, len(m.jobs))
 	for key, j := range m.jobs {
@@ -274,6 +298,7 @@ func (m *Monitor) tick() {
 		energy, energyErr = m.reader.ReadEnergy()
 	}
 	samples := make(map[string]*Sample, len(snapshot))
+	counted := make(map[string]*Counters, len(snapshot))
 	// WHEN EACH JOB'S READ ENDED, which is the time its point holds: a read that
 	// stalls must not have its counters backdated to the tick's start, where
 	// they would land in the interval before the stall.
@@ -281,10 +306,14 @@ func (m *Monitor) tick() {
 	stalled := make(map[string]bool, len(snapshot))
 	for key, j := range snapshot {
 		began := m.opts.Now()
-		s := m.reader.Read(j.target)
+		s, vcpus := m.reader.readListing(j.target)
 		samples[key] = &s
 		readAt[key] = m.opts.Now()
 		stalled[key] = readAt[key].Sub(began) >= m.opts.Interval
+		if c, ok := m.counting[j]; ok {
+			m.count(j, c, s, vcpus)
+			counted[key] = c.totals()
+		}
 	}
 	if m.afterTickRead != nil {
 		m.afterTickRead()
@@ -350,6 +379,9 @@ func (m *Monitor) tick() {
 		}
 		before := j.seen
 		j.absorb(*s, now)
+		if c, ok := counted[key]; ok {
+			j.counters = c
+		}
 		if m.opts.RAPL {
 			d, measured := deltas[key]
 			// A GAP BREAKS A JOB THAT WENT UNSAMPLED FOR IT: the time since the later
@@ -555,7 +587,10 @@ type Summary struct {
 	// process (Target.Process), not a share of the package counter.
 	EnergyProcess            bool
 	EnergyActive, EnergyIdle int64 // µJ
-	Points                   []Point
+	// Counters is what the hardware counters saw the job's vCPU threads do; nil
+	// when the job was not counted.
+	Counters *Counters
+	Points   []Point
 }
 
 // Measured says which groups were read at least once, and whether energy was
@@ -593,7 +628,16 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	}
 
 	now := m.opts.Now()
-	s := m.reader.Read(j.target)
+	s, vcpus := m.reader.readListing(j.target)
+	// THE GROUPS CLOSE AT FINAL, which precedes the destroy: what they counted
+	// is kept, and a Final asked again answers the same totals.
+	var counters *Counters
+	c, counting := m.counting[j]
+	if counting {
+		m.count(j, c, s, vcpus)
+		c.finish()
+		counters = c.totals()
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -602,6 +646,9 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	}
 	before := j.seen
 	j.absorb(s, now)
+	if counting {
+		j.counters = counters
+	}
 
 	j.lateRead(firstRead(s, before, j.target.Process))
 
@@ -625,6 +672,10 @@ func (m *Monitor) summaryOf(j *job, now time.Time, unseen bool) Summary {
 			Net: j.seen.net, Threads: j.seen.threads, Pressure: j.seen.pressure},
 		Points: points,
 	}
+	if j.counters != nil {
+		c := *j.counters
+		sum.Counters = &c
+	}
 	// A PROCESS'S ENERGY IS A LIFETIME TOTAL the kernel keeps, so no gap in
 	// sampling loses any of it, but only a recent reading is the whole job's: one
 	// from the final read, or from a tick the job did not outlive by
@@ -642,4 +693,37 @@ func (m *Monitor) summaryOf(j *job, now time.Time, unseen bool) Summary {
 	sum.EnergyActive, sum.EnergyIdle = int64(j.energyActive), int64(j.energyIdle)
 
 	return sum
+}
+
+// count reads a job's hardware counters against the vCPU thread listing taken
+// with s. Only Run calls it.
+func (m *Monitor) count(j *job, c *jobCounters, s Sample, vcpus []vcpuThread) {
+	c.update(m.opts.Counters, vcpus, s.ThreadsOK, func(v vcpuThread) (bool, error) {
+		return m.reader.isVCPUThread(j.target, v)
+	})
+}
+
+// sweepCounters closes the groups of every job Forget has removed, or a
+// successor has replaced. Only Run calls it.
+func (m *Monitor) sweepCounters() {
+	if len(m.counting) == 0 {
+		return
+	}
+	m.mu.Lock()
+	live := make(map[*job]bool, len(m.jobs))
+	for _, j := range m.jobs {
+		live[j] = true
+	}
+	m.mu.Unlock()
+	m.closeCounters(func(j *job) bool { return !live[j] })
+}
+
+// closeCounters closes and drops the groups of every job gone says is gone.
+func (m *Monitor) closeCounters(gone func(*job) bool) {
+	for j, c := range m.counting {
+		if gone(j) {
+			c.finish()
+			delete(m.counting, j)
+		}
+	}
 }
