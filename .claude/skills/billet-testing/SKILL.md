@@ -30,6 +30,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`t.Parallel()` turns on the sharing, not the disk.**
 - **A parallel test that writes an executable and then execs it can exec something else.**
 - **Concurrency tests use the scheduler under test.**
+- **A test about time runs in a `testing/synctest` bubble, and nothing in the bubble waits on a real socket.**
 - **A stand-in must stay alive and be observable.**
 - **Structural tests assert order and call graphs where a unit test cannot reach the call site.**
 
@@ -49,7 +50,7 @@ Measured facts for this area, dated: [references/measured-facts.md](references/m
 
 **Before submitting a test.** Break the production line it names once and watch it go red, then restore it ([references/discipline.md](references/discipline.md)). Assert the sentinel, the status or the diagnostic clause, never only that an error came back. Discard no error an assertion depends on. Drive the caller, not only the helper, or assert the call site structurally. Use `t.Context()`, `t.TempDir()` and `t.Cleanup`, and make a test parallel only if it shares no process-global state.
 
-**A test that waits.** Steer the clock under test rather than sleeping past a wall-clock bound, and count a wait from a baseline taken before the thing under test exists ([references/conventions-and-concurrency.md](references/conventions-and-concurrency.md)).
+**A test that waits.** Steer the clock under test rather than sleeping past a wall-clock bound, and count a wait from a baseline taken before the thing under test exists ([references/conventions-and-concurrency.md](references/conventions-and-concurrency.md)). A loop on a ticker is tested in a `synctest` bubble, through the ticker it really runs on.
 
 ## Where the tests are
 
