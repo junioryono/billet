@@ -174,6 +174,8 @@ func commands(lc *lifecycle) []command {
 			"moves this host under it", cmdConvergeGuard},
 		{"release", "record which signed manifest produced the billet installed here",
 			cmdRelease},
+		{"uplink", "keep this host's traffic from filling its site's shared internet line",
+			cmdUplink},
 		{"acceptance", "stand an ISOLATED deployment up beside this one, run a real job on " +
 			"it, and destroy exactly what it made", cmdAcceptance},
 		{"status", "show cluster status", cmdStatus},
