@@ -479,6 +479,11 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/runner-images/upstream/images/ubuntu/scripts/build/install-git.sh", "none"},
 		{"scripts/ci_scope_test.go", "lint"},
 		{"scripts/testdata/skills-corpus.txt", "none"},
+		{"scripts/known-answer-job.sh", "none"},
+		{"scripts/power-log.sh", "none"},
+		{"scripts/power-summary.sh", "none"},
+		{"scripts/knownanswer/testdata/power-log/power.csv", "none"},
+		{"scripts/knownanswer/check.go", families("lint", "postgres")},
 		{".claude/settings.json", "none"},
 		{".claude/hooks/guard.py", "none"},
 		// What drives the jobs, and the module graph: everything.

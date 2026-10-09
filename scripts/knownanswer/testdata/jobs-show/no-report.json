@@ -1,0 +1,22 @@
+{
+  "lease": "lease-cpu",
+  "tier": "billet-8vcpu",
+  "node": "ubuntu-01",
+  "provider": "firecracker",
+  "vcpu": 8,
+  "memory_bytes": 17179869184,
+  "github_job_id": "52000000001",
+  "run_id": 18000000001,
+  "request_id": 9001,
+  "job_name": "cpu",
+  "repository": "acme/bench",
+  "workflow_ref": "acme/bench/.github/workflows/known-answer.yml@refs/heads/main",
+  "event": "workflow_dispatch",
+  "result": "succeeded",
+  "conclusion": "succeeded",
+  "queued_at": "2026-10-09T10:00:00Z",
+  "assigned_at": "2026-10-09T10:00:01Z",
+  "started_at": "2026-10-09T10:00:05Z",
+  "finished_at": "2026-10-09T10:01:40Z",
+  "usage": null
+}

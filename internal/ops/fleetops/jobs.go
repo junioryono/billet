@@ -2,6 +2,7 @@ package fleetops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,11 +30,12 @@ func Jobs(ctx context.Context, env cli.Env, args []string) error {
 func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet jobs show", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
+	asJSON := fs.Bool("json", false, "print the record as one JSON object")
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: billet jobs show [--config PATH] <lease>")
+		return errors.New("usage: billet jobs show [--config PATH] [--json] <lease>")
 	}
 	leaseID := fs.Arg(0)
 
@@ -55,7 +57,80 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	if *asJSON {
+		return renderJobJSON(env.Stdout, rec, measured)
+	}
 	renderJob(env.Stdout, rec, measured)
+
+	return nil
+}
+
+// jobJSON is `billet jobs show --json`: the record renderJob prints, for a
+// program. An empty string is a field the ledger has no value for.
+type jobJSON struct {
+	Lease       string `json:"lease"`
+	Tier        string `json:"tier"`
+	Node        string `json:"node"`
+	Provider    string `json:"provider"`
+	VCPU        int64  `json:"vcpu"`
+	MemoryBytes int64  `json:"memory_bytes"`
+	GitHubJobID string `json:"github_job_id"`
+	RunID       int64  `json:"run_id"`
+	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
+	// negative id is billet's own scheduler identity and nothing GitHub shows.
+	RequestID   int64      `json:"request_id"`
+	JobName     string     `json:"job_name"`
+	Repository  string     `json:"repository"`
+	WorkflowRef string     `json:"workflow_ref"`
+	Event       string     `json:"event"`
+	Result      string     `json:"result"`
+	Conclusion  string     `json:"conclusion"`
+	QueuedAt    string     `json:"queued_at"`
+	AssignedAt  string     `json:"assigned_at"`
+	StartedAt   string     `json:"started_at"`
+	FinishedAt  string     `json:"finished_at"`
+	Usage       *usageJSON `json:"usage"`
+}
+
+// usageJSON is what the host measured. Groups answers for every group, with
+// the OOM count unmeasured whenever memory is, so a reader never re-derives
+// which zeros were read.
+type usageJSON struct {
+	Node       string          `json:"node"`
+	RecordedAt string          `json:"recorded_at"`
+	Groups     map[string]bool `json:"measured"`
+	alloc.JobUsage
+}
+
+// usageGroups is every group a usage report answers for.
+var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory, alloc.UsageOOM,
+	alloc.UsageIO, alloc.UsageNet, alloc.UsagePressure, alloc.UsageEnergy}
+
+// renderJobJSON writes one job's record as an indented JSON object. A job with
+// no usage report has a null usage, never a report of zeros.
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) error {
+	out := jobJSON{
+		Lease: rec.LeaseID, Tier: rec.Tier, Node: rec.Node, Provider: rec.ChosenProvider,
+		VCPU: rec.VCPU, MemoryBytes: rec.Memory, GitHubJobID: rec.Job.JobID, RunID: rec.RunID,
+		RequestID: max(rec.RequestID, 0), JobName: rec.Job.Name, Repository: rec.Repo,
+		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
+		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
+		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt,
+	}
+	if u != nil {
+		groups := make(map[string]bool, len(usageGroups))
+		for _, g := range usageGroups {
+			groups[g] = u.Measured(g)
+		}
+		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, JobUsage: u.JobUsage}
+	}
+	body, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode the job record: %w", err)
+	}
+	if _, err := fmt.Fprintf(w, "%s\n", body); err != nil {
+		return fmt.Errorf("write the job record: %w", err)
+	}
 
 	return nil
 }
