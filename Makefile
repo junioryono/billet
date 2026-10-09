@@ -114,6 +114,15 @@ cover: ## Coverage profile + HTML report
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
+BENCHTIME ?= 2s
+
+.PHONY: bench
+bench: ## The allocator's and the node wire's benchmarks, three runs each; compare two with benchstat
+	@# SQLite unless BILLET_TEST_LEDGER=postgres and BILLET_TEST_POSTGRES_DSN say
+	@# otherwise, as the tests are. What they measure, and the decision made on
+	@# them, is docs/reference/records/ledger-write-budget.md.
+	$(NICE) go test -run '^$$' -bench . -benchtime $(BENCHTIME) -count 3 ./internal/alloc/ ./internal/nodeplane/
+
 FUZZTIME ?= 1m
 
 .PHONY: fuzz

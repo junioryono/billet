@@ -42,6 +42,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Real and live tests skip without their resource and never spend money by accident.**
 - **PostgreSQL is tested against a real server or not at all.**
 - **Coverage is a signal, not a goal.**
+- **A benchmark measures the ledger the run exercises, and a change to the hot paths shows its numbers before and after.**
 - **A fuzz target states a property a broken parser would violate, seeds from what billet really reads, and is searched nightly.**
 - **The host rehearsals run the real commands on packaged hosts under real systemd, and each needs a real App.**
 

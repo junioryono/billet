@@ -8,4 +8,4 @@ The capacity allocator: escrow, leases and their state machine, placement, floor
 - Every lease write presents its epoch, and a stale one is refused with `ErrFenced`.
 - This package's SQL lives in `internal/state/queries`, and its production files reach no network, run no subprocess and import no upper layer (`ledgerwriters`, which exempts tests).
 
-Gates: `make check`; `BILLET_TEST_LEDGER=postgres go test ./internal/alloc` with `BILLET_TEST_POSTGRES_DSN` runs the same tests against PostgreSQL.
+Gates: `make check`; `BILLET_TEST_LEDGER=postgres go test ./internal/alloc` with `BILLET_TEST_POSTGRES_DSN` runs the same tests against PostgreSQL. A change to escrow, placement, headroom or renewal runs `make bench` before and after and puts the benchstat comparison in its pull request; `docs/reference/records/ledger-write-budget.md` holds what they measured on 2026-10-08.
