@@ -2,6 +2,8 @@ package version
 
 import (
 	"cmp"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -47,6 +49,21 @@ func FuzzVersionCompare(f *testing.F) {
 			t.Fatalf("Canonical(%q) says release %v; Compare says it orders %v", a, isRelease, okSelf)
 		}
 
+		// WHAT IS A RELEASE, judged by a reader of its own before anything
+		// returns: a parse that refused everything agrees with every property
+		// above and below.
+		left, okLeft := release(a)
+		right, okRight := release(b)
+
+		if okLeft != isRelease {
+			t.Fatalf("%q is a release by the grammar %v, but Canonical says %v", a, okLeft, isRelease)
+		}
+
+		if okAB != (okLeft && okRight) {
+			t.Fatalf("Compare(%q, %q) could tell %v; by the grammar they are releases %v and %v",
+				a, b, okAB, okLeft, okRight)
+		}
+
 		if !isRelease {
 			return
 		}
@@ -61,30 +78,23 @@ func FuzzVersionCompare(f *testing.F) {
 			t.Fatalf("Canonical(%q) = %q, which is not a release tag", a, canonical)
 		}
 
-		// AND THE ORDER IS THE NUMBERS' ORDER, read from the inputs by a reader
-		// of its own: a Compare that answered backwards, zero for every pair, or
+		// AND THE ORDER IS THE NUMBERS' ORDER, read from the inputs by that
+		// reader: a Compare that answered backwards, zero for every pair, or
 		// that dropped a component, agrees with every property above.
-		left, okLeft := release(a)
-		right, okRight := release(b)
-
-		if okLeft != isRelease {
-			t.Fatalf("%q is a release by the grammar %v, but Canonical says %v", a, okLeft, isRelease)
-		}
-
 		if !okRight {
 			return
 		}
 
-		if want := compareRelease(left, right); !okLeft || ab != want {
+		if want := compareRelease(left, right); ab != want {
 			t.Fatalf("Compare(%q, %q) = %d, but their numbers order %d", a, b, ab, want)
 		}
 	})
 }
 
 // release reads vX.Y.Z or X.Y.Z by the grammar alone: three decimal numbers,
-// no leading zero, each small enough for an int on a 64-bit machine, which is
-// what Compare can order. The numbers stay digit strings, so reading them
-// shares nothing with parse.
+// no leading zero, each no larger than this platform's int, which is what
+// Compare can order. The numbers stay digit strings, so reading them shares
+// nothing with parse.
 func release(v string) ([3]string, bool) {
 	var out [3]string
 
@@ -98,7 +108,7 @@ func release(v string) ([3]string, bool) {
 			return out, false
 		}
 
-		if len(part) > 19 || (len(part) == 19 && part > "9223372036854775807") {
+		if len(part) > len(maxInt) || (len(part) == len(maxInt) && part > maxInt) {
 			return out, false
 		}
 
@@ -107,6 +117,9 @@ func release(v string) ([3]string, bool) {
 
 	return out, true
 }
+
+// maxInt is the largest int on this platform, as digits.
+var maxInt = strconv.Itoa(math.MaxInt)
 
 // compareRelease orders two releases' digit strings: a longer number is the
 // larger, and two of one length order as text.

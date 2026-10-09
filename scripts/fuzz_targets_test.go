@@ -61,14 +61,14 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 			return err
 		}
 
-		testingName := importName(file, "testing")
-		if testingName == "" {
+		names, dot := importNames(file, "testing")
+		if len(names) == 0 && !dot {
 			return nil
 		}
 
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn, testingName) {
+			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn, names, dot) {
 				continue
 			}
 
@@ -110,31 +110,36 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	}
 }
 
-// importName is the name file refers to the package at path by, or "" when it
-// does not import it (or imports it only for effect, or into its own scope).
-func importName(file *ast.File, path string) string {
+// importNames is every name file refers to the package at path by, and
+// whether it is also dot-imported, so its names are in the file's own scope.
+func importNames(file *ast.File, path string) ([]string, bool) {
+	var (
+		names []string
+		dot   bool
+	)
+
 	for _, spec := range file.Imports {
 		if strings.Trim(spec.Path.Value, `"`) != path {
 			continue
 		}
 
-		if spec.Name == nil {
-			return filepath.Base(path)
+		switch {
+		case spec.Name == nil:
+			names = append(names, filepath.Base(path))
+		case spec.Name.Name == ".":
+			dot = true
+		case spec.Name.Name != "_":
+			names = append(names, spec.Name.Name)
 		}
-
-		if spec.Name.Name == "_" || spec.Name.Name == "." {
-			return ""
-		}
-
-		return spec.Name.Name
 	}
 
-	return ""
+	return names, dot
 }
 
-// takesTestingF reports whether fn's one parameter is a *testing.F, with the
-// testing package imported as testingName.
-func takesTestingF(fn *ast.FuncDecl, testingName string) bool {
+// takesTestingF reports whether fn's one parameter is a *testing.F: a selector
+// on one of the names testing is imported under, or F itself where testing is
+// dot-imported.
+func takesTestingF(fn *ast.FuncDecl, names []string, dot bool) bool {
 	params := fn.Type.Params.List
 	if len(params) != 1 || len(params[0].Names) > 1 {
 		return false
@@ -145,12 +150,14 @@ func takesTestingF(fn *ast.FuncDecl, testingName string) bool {
 		return false
 	}
 
-	sel, ok := star.X.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "F" {
+	switch typ := star.X.(type) {
+	case *ast.Ident:
+		return dot && typ.Name == "F"
+	case *ast.SelectorExpr:
+		pkg, ok := typ.X.(*ast.Ident)
+
+		return ok && typ.Sel.Name == "F" && slices.Contains(names, pkg.Name)
+	default:
 		return false
 	}
-
-	pkg, ok := sel.X.(*ast.Ident)
-
-	return ok && pkg.Name == testingName
 }
