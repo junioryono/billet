@@ -1,0 +1,32 @@
+name: Known-answer run
+
+# THE REFERENCE HOST'S CALLER for the known-answer kit
+# (docs/operating/measurement-validation.md). Dispatched by hand: it runs six
+# jobs one after another on billet-8vcpu-ubuntu-2404, a tier only ubuntu-01
+# serves, so every loaded job's idle reference ran on the same host. The kit's
+# scripts are fetched from this run's own commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: How long the idle, cpu and memory loads run
+        required: false
+        default: 60
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  known-answer:
+    uses: ./.github/workflows/known-answer.yml
+    with:
+      runner_label: billet-8vcpu-ubuntu-2404
+      billet_ref: ${{ github.sha }}
+      seconds: ${{ inputs.seconds }}
+      cpu_workers: 4
+      memory_bytes: 2147483648
+      network_url: https://speed.cloudflare.com/__down?bytes=104857600
+      network_bytes: 104857600
+      disk_bytes: 2147483648
