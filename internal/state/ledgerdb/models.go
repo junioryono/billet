@@ -4,6 +4,10 @@
 
 package ledgerdb
 
+import (
+	"database/sql"
+)
+
 type Admission struct {
 	ID         int64
 	Mode       string
@@ -66,35 +70,44 @@ type IssuedCert struct {
 }
 
 type JobUsage struct {
-	LeaseID         string
-	Node            string
-	RecordedAt      string
-	Source          string
-	Unmeasured      string
-	Samples         int64
-	IntervalMs      int64
-	WindowMs        int64
-	CpuUserUs       int64
-	CpuSystemUs     int64
-	GuestCpuUs      int64
-	VmmCpuUs        int64
-	MemoryPeakBytes int64
-	OomKills        int64
-	DiskReadBytes   int64
-	DiskWriteBytes  int64
-	NetRxBytes      int64
-	NetTxBytes      int64
-	NetRxPackets    int64
-	NetTxPackets    int64
-	CpuSomeUs       int64
-	CpuFullUs       int64
-	MemorySomeUs    int64
-	MemoryFullUs    int64
-	IoSomeUs        int64
-	IoFullUs        int64
-	EnergyActiveUj  int64
-	EnergyIdleUj    int64
-	EnergySource    string
+	LeaseID                string
+	Node                   string
+	RecordedAt             string
+	Source                 string
+	Unmeasured             string
+	Samples                int64
+	IntervalMs             int64
+	WindowMs               int64
+	CpuUserUs              int64
+	CpuSystemUs            int64
+	GuestCpuUs             int64
+	VmmCpuUs               int64
+	MemoryPeakBytes        int64
+	OomKills               int64
+	DiskReadBytes          int64
+	DiskWriteBytes         int64
+	NetRxBytes             int64
+	NetTxBytes             int64
+	NetRxPackets           int64
+	NetTxPackets           int64
+	CpuSomeUs              int64
+	CpuFullUs              int64
+	MemorySomeUs           int64
+	MemoryFullUs           int64
+	IoSomeUs               int64
+	IoFullUs               int64
+	EnergyActiveUj         int64
+	EnergyIdleUj           int64
+	EnergySource           string
+	Cycles                 sql.NullInt64
+	Instructions           sql.NullInt64
+	CacheReferences        sql.NullInt64
+	CacheMisses            sql.NullInt64
+	BranchMisses           sql.NullInt64
+	FrontendStallCycles    sql.NullInt64
+	DestinationsIncomplete sql.NullInt64
+	TapSentBytes           sql.NullInt64
+	TapReceivedBytes       sql.NullInt64
 }
 
 type ListenerCapacity struct {

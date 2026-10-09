@@ -87,3 +87,57 @@ func TestATartNodeIsMonitoredWithoutRAPL(t *testing.T) {
 		})
 	}
 }
+
+// FLOWS ARE A FIRECRACKER GUEST'S: only its address is leased on a billet
+// bridge the host can read. Asked for on another backend, they are refused.
+func TestFlowsAreRefusedWhereTheGuestsAddressIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(writeConfig(t, withMonitoring(t, "  monitoring:\n    flows: true\n")))
+	if err != nil {
+		t.Fatalf("flows on a firecracker node were refused: %v", err)
+	}
+
+	if !cfg.Node.Monitoring.Flows {
+		t.Error("flows: true was not read")
+	}
+
+	for _, provider := range []ProviderKind{ProviderDocker, ProviderTart} {
+		c := &Config{Node: &NodeConfig{Provider: provider, Monitoring: &NodeMonitoringConfig{Flows: true}}}
+
+		got := errors.Join(c.validateMonitoringNode()...)
+		if got == nil || !strings.Contains(got.Error(), "node.monitoring.flows") {
+			t.Errorf("%s: flows answered %v, want a refusal naming node.monitoring.flows", provider, got)
+		}
+	}
+}
+
+// PERF COUNTS A MICROVM'S vCPU THREADS, so only a firecracker node may ask for
+// it, and absent is off.
+func TestPerfIsFirecrackersAlone(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(writeConfig(t, withMonitoring(t, "  monitoring:\n    perf: true\n")))
+	if err != nil {
+		t.Fatalf("perf on a firecracker node was refused: %v", err)
+	}
+	if !cfg.Node.Monitoring.Perf {
+		t.Fatal("perf: true was read as off")
+	}
+	cfg, err = Load(writeConfig(t, withMonitoring(t, "  monitoring:\n    rapl: true\n")))
+	if err != nil || cfg.Node.Monitoring.Perf {
+		t.Fatalf("a block that does not name perf has perf %v, %v; want off", cfg.Node.Monitoring.Perf, err)
+	}
+
+	for _, provider := range []ProviderKind{ProviderDocker, ProviderTart} {
+		c := &Config{Node: &NodeConfig{Provider: provider, Monitoring: &NodeMonitoringConfig{Perf: true}}}
+		got := errors.Join(c.validateMonitoringNode()...)
+		if got == nil || !strings.Contains(got.Error(), "only firecracker can be counted") {
+			t.Errorf("perf on a %s node answered %v, want a refusal", provider, got)
+		}
+		c.Node.Monitoring.Perf = false
+		if got := errors.Join(c.validateMonitoringNode()...); got != nil {
+			t.Errorf("the same %s node without perf was refused: %v", provider, got)
+		}
+	}
+}

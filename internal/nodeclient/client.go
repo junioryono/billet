@@ -646,6 +646,14 @@ func (c *Client) RecordLeaseUsage(
 	if wire < nodeapi.VersionProcessUsage {
 		usage = beforeProcessUsage(usage)
 	}
+	// AN OLDER PLANE GETS THE REST OF THE REPORT, whose strict decoder would
+	// refuse all of it for the counters or the destinations alone.
+	if wire < nodeapi.VersionJobCounters {
+		usage.Counters = nil
+	}
+	if wire < nodeapi.VersionJobDestinations {
+		usage.Destinations = nil
+	}
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
 		nodeapi.UsageRequest{Epoch: epoch, Usage: usage, Series: series}, nil)

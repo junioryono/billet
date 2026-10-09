@@ -134,6 +134,13 @@ func (n *Node) open(bundle *wirecert.Bundle) error {
 		return err
 	}
 
+	// REFUSED HERE, NOT IN NewProvider: `billet images` builds a provider too,
+	// and a probe launch measures nothing, so only a node is held to what its
+	// node.monitoring asks.
+	if err := requireJobAccounting(p); err != nil {
+		return err
+	}
+
 	n.client, n.provider = client, p
 
 	return nil
@@ -537,7 +544,7 @@ func NewProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			return nil, err
 		}
 
-		return firecracker.New(deployment, *cfg.Node.Firecracker, store, firecrackerOptions(cfg)...)
+		return firecracker.New(deployment, *cfg.Node.Firecracker, store, FirecrackerOptions(cfg)...)
 
 	case config.ProviderTart:
 		// Labelled with the DEPLOYMENT id for the docker backend's reason: two

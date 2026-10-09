@@ -55,6 +55,46 @@ func parseSingle(data string) (int64, error) {
 	return v, nil
 }
 
+// parseNetDev reads one interface's rx bytes, tx bytes, rx packets and tx
+// packets from a /proc/<pid>/net/dev table: two header lines, then
+// "<name>: rx_bytes rx_packets errs drop fifo frame compressed multicast
+// tx_bytes tx_packets errs drop fifo colls carrier compressed" per interface.
+//
+// THE NAME IS CUT AT ITS COLON, never split on spaces: the kernel pads names
+// to six columns, so a longer one ("gretap0:", measured 2026-10-08) or a large
+// counter has no space before its first number. An interface that is absent,
+// or listed twice, is an error, never another interface's counters.
+func parseNetDev(data, device string) ([4]int64, error) {
+	var out [4]int64
+	found := false
+	for line := range strings.SplitSeq(data, "\n") {
+		name, counters, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) != device {
+			continue
+		}
+		if found {
+			return [4]int64{}, fmt.Errorf("usage: %s is listed twice in net/dev", device)
+		}
+		found = true
+		fields := strings.Fields(counters)
+		if len(fields) != 16 {
+			return [4]int64{}, fmt.Errorf("usage: %s has %d counters in net/dev, not 16", device, len(fields))
+		}
+		for i, field := range []int{0, 8, 1, 9} {
+			v, err := strconv.ParseInt(fields[field], 10, 64)
+			if err != nil {
+				return [4]int64{}, fmt.Errorf("usage: %s: %w", device, err)
+			}
+			out[i] = v
+		}
+	}
+	if !found {
+		return [4]int64{}, fmt.Errorf("usage: no %s in net/dev", device)
+	}
+
+	return out, nil
+}
+
 // parseIOStat sums rbytes and wbytes over every device in a cgroup's io.stat
 // ("MAJ:MIN rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N" per line).
 func parseIOStat(data string) (int64, int64, error) {

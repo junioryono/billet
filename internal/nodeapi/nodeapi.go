@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 25
+	Version = 27
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -346,6 +346,30 @@ const (
 	// OOM count is reported unmeasured whole, since an older plane reads a
 	// measured memory group as a measured count.
 	VersionProcessUsage = 25
+
+	// VersionJobCounters is the version from which a usage report may carry what
+	// the CPU's hardware counters saw the job's vCPU threads do
+	// (JobUsage.Counters).
+	//
+	// A DIAGNOSTIC, reported rather than refused. CHECKED WHERE IT IS SENT,
+	// because an older plane decodes the report strictly and would refuse the
+	// whole of it for one unknown field: below it the node strips the counters
+	// and reports the rest. CHECKED WHERE IT IS READ too, so a report from a
+	// pairing that negotiated below it is kept without them rather than
+	// recorded as something that wire does not carry.
+	VersionJobCounters = 26
+
+	// VersionJobDestinations is the version from which a usage report may carry
+	// the job's traffic by destination, from the host's connection tracker, and
+	// the tap's totals beside it (JobUsage.Destinations).
+	//
+	// A DIAGNOSTIC, reported rather than refused, checked at both ends as
+	// VersionJobCounters is: below it the node strips the destinations and
+	// reports the rest, which an older plane's strict decoder would otherwise
+	// refuse whole, and the plane drops them from a pairing that negotiated
+	// below it. A report without them reads as destinations not totalled, never
+	// as a job that sent nothing.
+	VersionJobDestinations = 27
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

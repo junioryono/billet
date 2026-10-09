@@ -28,6 +28,18 @@ type NodeMonitoringConfig struct {
 	// CPU time and the baseline by reserved vCPUs; without it the whole package
 	// is shared by CPU time and reported as unsplit. Requires rapl.
 	IdlePackageWatts float64 `yaml:"idle_package_watts,omitempty"`
+	// Flows totals each job's traffic by destination from the host's
+	// connection tracker, which needs net.netfilter.nf_conntrack_acct and
+	// nf_conntrack_timestamp set to 1; a node asked for flows on a host
+	// without them refuses to start. Firecracker only: the guest's address is
+	// learned from the DHCP lease its bridge's dnsmasq granted it.
+	Flows bool `yaml:"flows,omitempty"`
+	// Perf counts each microVM's vCPU threads with the CPU's hardware counters
+	// (perf_event_open, guest mode included): cycles, instructions, cache
+	// references and misses, branch misses and frontend stall cycles. Off
+	// unless true; firecracker only, and Linux only, which a node checks at
+	// startup since this file may be validated elsewhere.
+	Perf bool `yaml:"perf,omitempty"`
 }
 
 const (
@@ -39,6 +51,11 @@ const (
 	// wrap to know how many times it wrapped.
 	MinMonitoringInterval = 250 * time.Millisecond
 	MaxMonitoringInterval = 30 * time.Second
+	// DHCPLeaseDir is where the host role's dnsmasq keeps each guest bridge's
+	// leases, one directory per bridge (billet-dnsmasq@<bridge>), and
+	// DHCPLeaseTime the lease length its dhcp-range grants.
+	DHCPLeaseDir  = "/var/lib/billet-dnsmasq"
+	DHCPLeaseTime = time.Hour
 	// maxIdlePackageWatts is far above any socket's idle draw; it exists to
 	// refuse a unit mistake (milliwatts) rather than to model hardware.
 	maxIdlePackageWatts = 2000
@@ -77,6 +94,12 @@ func (c *Config) validateMonitoringNode() []error {
 	}
 
 	var errs []error
+	// ONLY A VMM HAS vCPU THREADS TO COUNT. A docker job's threads are the
+	// workload's own, and a tart VM runs on a host without perf_event_open.
+	if m.Perf && c.Node.Provider != ProviderFirecracker {
+		errs = append(errs, fmt.Errorf("node.monitoring.perf counts a microVM's vCPU threads, and "+
+			"this node's provider is %s; only firecracker can be counted", c.Node.Provider))
+	}
 	switch c.Node.Provider {
 	case ProviderFirecracker, ProviderDocker:
 	case ProviderTart:
@@ -87,6 +110,11 @@ func (c *Config) validateMonitoringNode() []error {
 	default:
 		errs = append(errs, fmt.Errorf("node.monitoring is set but this node's provider is %s, "+
 			"and only firecracker, docker and tart jobs can be measured from the host", c.Node.Provider))
+	}
+	if m.Flows && c.Node.Provider != ProviderFirecracker {
+		errs = append(errs, fmt.Errorf("node.monitoring.flows is set but this node's provider is %s, "+
+			"and only a firecracker guest's address is known to the host (from its bridge's DHCP lease)",
+			c.Node.Provider))
 	}
 	if _, err := m.IntervalDuration(); err != nil {
 		errs = append(errs, err)

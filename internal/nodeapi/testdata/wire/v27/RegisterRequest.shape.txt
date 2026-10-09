@@ -1,0 +1,33 @@
+RegisterRequest.version int
+RegisterRequest.min_version int
+RegisterRequest.release string
+RegisterRequest.installed_digest tag omitempty
+RegisterRequest.installed_digest string
+RegisterRequest.node string
+RegisterRequest.provider string
+RegisterRequest.guest_os tag omitempty
+RegisterRequest.guest_os slice
+RegisterRequest.guest_os[] string
+RegisterRequest.site tag omitempty
+RegisterRequest.site string
+RegisterRequest.vcpu int
+RegisterRequest.memory int64
+RegisterRequest.ec2_shapes tag omitempty
+RegisterRequest.ec2_shapes slice
+RegisterRequest.ec2_shapes[].type string
+RegisterRequest.ec2_shapes[].vcpu int
+RegisterRequest.ec2_shapes[].memory int64
+RegisterRequest.ec2_shapes[].price_usd_per_hour int64
+RegisterRequest.codebuild_fleet tag omitempty
+RegisterRequest.codebuild_fleet string
+RegisterRequest.codebuild_jit_parameter_path tag omitempty
+RegisterRequest.codebuild_jit_parameter_path string
+RegisterRequest.codebuild_region tag omitempty
+RegisterRequest.codebuild_region string
+RegisterRequest.instances tag omitempty
+RegisterRequest.instances slice
+RegisterRequest.instances[] string
+RegisterRequest.inventory_known tag omitempty
+RegisterRequest.inventory_known bool
+RegisterRequest.deployment string
+RegisterRequest.incarnation string

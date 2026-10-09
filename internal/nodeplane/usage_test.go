@@ -1,18 +1,24 @@
 package nodeplane_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 )
 
 func aUsage() alloc.JobUsage {
+	cycles, instructions, stalls := int64(4_000_000_000), int64(4_840_000_000), int64(0)
 	return alloc.JobUsage{
+		Counters: &alloc.JobCounters{Cycles: &cycles, Instructions: &instructions,
+			FrontendStallCycles: &stalls},
 		Source: alloc.UsageSourceHost, Unmeasured: []string{alloc.UsageIO},
 		Samples: 1200, IntervalMillis: 1000, WindowMillis: 1_200_000,
 		CPUUserMicros: 3_600_000_000, CPUSystemMicros: 400_000_000,
@@ -74,6 +80,10 @@ func TestAnUnkeepableUsageReportIsRefusedAtTheWire(t *testing.T) {
 			`"gpu" is not a usage group`},
 		"energy claimed and none": {strings.Replace(accepted, `"window_ms":0`, `"window_ms":0,"energy_active_uj":5`, 1),
 			"names energy unmeasured"},
+		"counters that count nothing": {strings.Replace(accepted, `"window_ms":0`, `"window_ms":0,"counters":{}`, 1),
+			"count nothing"},
+		"a negative counter": {strings.Replace(accepted, `"window_ms":0`,
+			`"window_ms":0,"counters":{"cycles":5,"cache_misses":-2}`, 1), "cache_misses is negative"},
 	} {
 		body := tc.body
 		t.Run(name, func(t *testing.T) {
@@ -128,5 +138,71 @@ func TestTheBaseUsageReportIsAccepted(t *testing.T) {
 	if err := c.RecordLeaseUsage(t.Context(), "l1", 7, usage,
 		&alloc.UsageSeries{Codec: alloc.UsageSeriesCodec, Data: []byte{1}}); err != nil {
 		t.Fatalf("the base report was refused: %v", err)
+	}
+}
+
+// A REPORT FROM A PAIRING THAT NEGOTIATED BELOW THE COUNTERS' VERSION IS KEPT
+// WITHOUT THEM: that wire does not carry them, so the plane records what it
+// does carry rather than refusing the report or keeping what it should not
+// have been sent.
+func TestCountersFromAWireThatDoesNotCarryThemAreDropped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		version  int
+		counters bool
+	}{
+		{nodeapi.VersionJobCounters - 1, false},
+		{nodeapi.VersionJobCounters, true},
+	} {
+		store := &fakeStore{}
+		_, base := serve(t, store)
+		incarnation := fmt.Sprintf("wire-%d", tc.version)
+		post := func(path string, body any) int {
+			t.Helper()
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+path, bytes.NewReader(raw))
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			req.Header.Set(nodeapi.HeaderIncarnation, incarnation)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post %s: %v", path, err)
+			}
+			defer resp.Body.Close()
+
+			return resp.StatusCode
+		}
+
+		if status := post("/v1/register", nodeapi.RegisterRequest{
+			MinVersion: nodeapi.MinVersion, Version: tc.version, Incarnation: incarnation,
+			Node: "n1", Provider: config.ProviderDocker, GuestOS: []config.GuestOS{config.GuestLinux},
+			Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory,
+		}); status != http.StatusOK {
+			t.Fatalf("register at wire %d answered %d", tc.version, status)
+		}
+		usage := aUsage()
+		if status := post("/v1/nodes/n1/leases/l1/usage",
+			nodeapi.UsageRequest{Epoch: 7, Usage: usage}); status != http.StatusNoContent {
+			t.Fatalf("a usage report at wire %d answered %d", tc.version, status)
+		}
+
+		store.mu.Lock()
+		got := store.usages
+		store.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("at wire %d the ledger was asked to record %d reports, want 1", tc.version, len(got))
+		}
+		if kept := got[0].usage.Counters != nil; kept != tc.counters {
+			t.Errorf("at wire %d the ledger kept counters %v, want %v", tc.version, kept, tc.counters)
+		}
+		usage.Counters = got[0].usage.Counters
+		if !reflect.DeepEqual(got[0].usage, usage) {
+			t.Errorf("at wire %d the rest of the report changed: %+v", tc.version, got[0].usage)
+		}
 	}
 }

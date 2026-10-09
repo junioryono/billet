@@ -461,8 +461,10 @@ type QuotaReporter interface {
 type UsageTarget struct {
 	// CgroupDir is the instance's own cgroup-v2 directory, absolute.
 	CgroupDir string
-	// PID is the VMM process whose threads split guest time from its own, zero
-	// for an instance with no VMM.
+	// PID is the instance's process: the VMM whose threads split guest time
+	// from its own, a container's init whose network namespace is the
+	// instance's (NetNamespace), or with Process the whole instance; zero for
+	// none of these.
 	PID int
 	// PIDStart is PID's start time when the target was made, checked on every
 	// read so a reused pid is never charged to this instance.
@@ -475,9 +477,18 @@ type UsageTarget struct {
 	// NetHostView says NetDevice counts from the host's side (a tap), so its
 	// received bytes are what the guest sent.
 	NetHostView bool
+	// NetNamespace says NetDevice is the interface of that name inside PID's
+	// network namespace, read through /proc/<PID>/net/dev while PID still
+	// started at PIDStart (a container's eth0, counted from inside it).
+	NetNamespace bool
 	// Process says the instance is PID alone, with no cgroup of its own, and is
 	// measured by that process's own accounting (a Virtualization.framework VM).
 	Process bool
+	// GuestMAC and Bridge say which DHCP lease holds the guest's address: the
+	// hardware address billet gave it, on the bridge whose dnsmasq leased it.
+	// Empty when the backend has no such address to learn.
+	GuestMAC string
+	Bridge   string
 }
 
 // UsageSource is a backend whose instances can be measured from the host.

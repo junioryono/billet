@@ -1,0 +1,3 @@
+CAResponse.ca_pem string
+CAResponse.fingerprint string
+CAResponse.deployment string

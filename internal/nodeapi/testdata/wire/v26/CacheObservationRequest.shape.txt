@@ -1,0 +1,15 @@
+CacheObservationRequest.epoch int64
+CacheObservationRequest.image_cache tag omitempty
+CacheObservationRequest.image_cache string
+CacheObservationRequest.cache_generation tag omitempty
+CacheObservationRequest.cache_generation string
+CacheObservationRequest.actions_cache tag omitempty
+CacheObservationRequest.actions_cache string
+CacheObservationRequest.sticky_cache tag omitempty
+CacheObservationRequest.sticky_cache string
+CacheObservationRequest.git_cache tag omitempty
+CacheObservationRequest.git_cache string
+CacheObservationRequest.bazel_cache tag omitempty
+CacheObservationRequest.bazel_cache string
+CacheObservationRequest.go_cache tag omitempty
+CacheObservationRequest.go_cache string

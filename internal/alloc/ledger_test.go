@@ -45,10 +45,10 @@ func testingPostgres() bool {
 // than skipping: the variable is an explicit request, and answering it with a
 // quiet SQLite run would report a conformance pass for an engine nothing
 // touched.
-func openTestLedger(t *testing.T) *state.DB {
-	t.Helper()
+func openTestLedger(tb testing.TB) *state.DB {
+	tb.Helper()
 
-	db, _ := openTestLedgerPair(t, false)
+	db, _ := openTestLedgerPair(tb, false)
 
 	return db
 }
@@ -61,26 +61,26 @@ func openTestLedger(t *testing.T) *state.DB {
 // this is here rather than at the call sites: on SQLite it is the same DIRECTORY
 // opened without the exclusive lock, and on PostgreSQL it is the same DSN, from
 // a different directory, potentially from a different machine.
-func openTestLedgerPair(t *testing.T, wantSecond bool) (*state.DB, *state.DB) {
-	t.Helper()
+func openTestLedgerPair(tb testing.TB, wantSecond bool) (*state.DB, *state.DB) {
+	tb.Helper()
 
 	if !testingPostgres() {
-		dir := ledgertest.Dir(t)
+		dir := ledgertest.Dir(tb)
 
-		first := mustOpen(t, func() (*state.DB, error) { return state.Open(t.Context(), dir) })
+		first := mustOpen(tb, func() (*state.DB, error) { return state.Open(tb.Context(), dir) })
 		if !wantSecond {
 			return first, nil
 		}
 
-		second := mustOpen(t, func() (*state.DB, error) { return state.OpenAdmin(t.Context(), dir) })
+		second := mustOpen(tb, func() (*state.DB, error) { return state.OpenAdmin(tb.Context(), dir) })
 
 		return first, second
 	}
 
-	dsn := requireTestSchema(t)
+	dsn := requireTestSchema(tb)
 
-	first := mustOpen(t, func() (*state.DB, error) {
-		return state.OpenPostgres(t.Context(), t.TempDir(), dsn)
+	first := mustOpen(tb, func() (*state.DB, error) {
+		return state.OpenPostgres(tb.Context(), tb.TempDir(), dsn)
 	})
 
 	if !wantSecond {
@@ -89,22 +89,22 @@ func openTestLedgerPair(t *testing.T, wantSecond bool) (*state.DB, *state.DB) {
 
 	// A DIFFERENT STATE DIRECTORY, because the two handles stand for two
 	// processes: the directory lock is per host and is not what is under test.
-	second := mustOpen(t, func() (*state.DB, error) {
-		return state.OpenPostgresAdmin(t.Context(), t.TempDir(), dsn)
+	second := mustOpen(tb, func() (*state.DB, error) {
+		return state.OpenPostgresAdmin(tb.Context(), tb.TempDir(), dsn)
 	})
 
 	return first, second
 }
 
-func mustOpen(t *testing.T, open func() (*state.DB, error)) *state.DB {
-	t.Helper()
+func mustOpen(tb testing.TB, open func() (*state.DB, error)) *state.DB {
+	tb.Helper()
 
 	db, err := open()
 	if err != nil {
-		t.Fatalf("open the test ledger: %v", err)
+		tb.Fatalf("open the test ledger: %v", err)
 	}
 
-	t.Cleanup(func() { _ = db.Close() })
+	tb.Cleanup(func() { _ = db.Close() })
 
 	return db
 }
@@ -119,12 +119,12 @@ var testSchemaSeq atomic.Int64
 // which is what a deployment gets, and what two of them sharing one schema would
 // not. It also exercises the scoping the backend depends on: every catalogue
 // question it asks is scoped to current_schema().
-func requireTestSchema(t *testing.T) state.DSN {
-	t.Helper()
+func requireTestSchema(tb testing.TB) state.DSN {
+	tb.Helper()
 
 	dsn := os.Getenv(postgresDSNEnv)
 	if dsn == "" {
-		t.Fatalf("%s asks for the PostgreSQL backend and %s is unset, so this run would have "+
+		tb.Fatalf("%s asks for the PostgreSQL backend and %s is unset, so this run would have "+
 			"quietly exercised SQLite and reported a PostgreSQL pass", ledgerEnv, postgresDSNEnv)
 	}
 
@@ -146,15 +146,15 @@ func requireTestSchema(t *testing.T) state.DSN {
 	// on isolation; on PostgreSQL it is also two control planes on one ledger,
 	// which the controller exclusion now correctly refuses.
 	seq := testSchemaSeq.Add(1)
-	name := strings.ToLower(strings.ReplaceAll(t.Name(), "/", "_"))
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s#%d", t.Name(), seq))
+	name := strings.ToLower(strings.ReplaceAll(tb.Name(), "/", "_"))
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s#%d", tb.Name(), seq))
 	schema := fmt.Sprintf("billet_%.32s_%x", name, sum[:4])
 
 	quoted := `"` + strings.ReplaceAll(schema, `"`, `""`) + `"`
 
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {
-		t.Fatalf("open %s: %v", postgresDSNEnv, err)
+		tb.Fatalf("open %s: %v", postgresDSNEnv, err)
 	}
 
 	defer func() { _ = admin.Close() }()
@@ -163,12 +163,12 @@ func requireTestSchema(t *testing.T) state.DSN {
 		`DROP SCHEMA IF EXISTS ` + quoted + ` CASCADE`,
 		`CREATE SCHEMA ` + quoted,
 	} {
-		if _, err := admin.ExecContext(t.Context(), stmt); err != nil {
-			t.Fatalf("prepare the test schema: %v", err)
+		if _, err := admin.ExecContext(tb.Context(), stmt); err != nil {
+			tb.Fatalf("prepare the test schema: %v", err)
 		}
 	}
 
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		cleanup, err := sql.Open("pgx", dsn)
 		if err != nil {
 			return
@@ -182,7 +182,7 @@ func requireTestSchema(t *testing.T) state.DSN {
 
 	u, err := url.Parse(dsn)
 	if err != nil {
-		t.Fatalf("parse %s: %v", postgresDSNEnv, err)
+		tb.Fatalf("parse %s: %v", postgresDSNEnv, err)
 	}
 
 	q := u.Query()

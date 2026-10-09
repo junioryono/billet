@@ -83,6 +83,7 @@ func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 		NetRxBytes: 202_408_832, NetTxBytes: 941_790,
 		EnergyActiveMicrojoules: 90_000_000_000, EnergyIdleMicrojoules: 4_000_000_000,
 		EnergySource: alloc.EnergyRAPL,
+		Counters:     &alloc.JobCounters{Cycles: count(4_000_000_000), Instructions: count(4_840_000_000)},
 	})
 
 	out := capture(t, func() {
@@ -98,6 +99,7 @@ func TestJobsShowPrintsWhoTheJobWasAndWhatTheHostMeasured(t *testing.T) {
 		"user 3600.0s, system 400.0s", "guest vCPUs 3900.0s, VMM 100.0s",
 		"received 193.0 MiB, sent 919.7 KiB",
 		"90.0 kJ active, 4.0 kJ idle",
+		"cycles 4,000,000,000, instructions 4,840,000,000", "1.21 instructions per cycle",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report does not say %q:\n%s", want, out)
@@ -350,5 +352,83 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 	if len(entries) != len(shapes) {
 		t.Errorf("%s holds %d files and this test writes %d: a file no producer writes is stale",
 			knownAnswerFixtures, len(entries), len(shapes))
+	}
+}
+
+func count(n int64) *int64 { return &n }
+
+// countedJob renders a measured job carrying counters.
+func countedJob(t *testing.T, counters *alloc.JobCounters) string {
+	t.Helper()
+
+	usage := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: alloc.JobUsage{
+		Source: alloc.UsageSourceHost, Samples: 1, IntervalMillis: 1000,
+		Unmeasured: []string{alloc.UsageEnergy}, Counters: counters,
+	}}
+	var out bytes.Buffer
+	renderJob(&out, alloc.JobRecord{LeaseID: "l1", Tier: "t"}, usage)
+
+	return out.String()
+}
+
+// THE COUNTERS AND WHAT THEY IMPLY ARE PRINTED AS COUNTED: IPC, cache and
+// branch misses per 1,000 instructions, and the frontend's stalled share, each
+// from the counts it needs.
+func TestJobsShowPrintsTheCountersAndTheirRatios(t *testing.T) {
+	t.Parallel()
+
+	out := countedJob(t, &alloc.JobCounters{
+		Cycles: count(4_000_000_000), Instructions: count(4_840_000_000),
+		CacheReferences: count(120_000_000), CacheMisses: count(35_816_000),
+		BranchMisses: count(9_680_000), FrontendStallCycles: count(1_000_000_000),
+	})
+	for label, want := range map[string]string{
+		"counters": "cycles 4,000,000,000, instructions 4,840,000,000",
+		"ipc":      "1.21 instructions per cycle",
+		"cache":    "7.4 misses per 1,000 instructions",
+		"branches": "2.0 mispredicted per 1,000 instructions",
+		"frontend": "stalled 25.0% of cycles",
+	} {
+		if line := lineStarting(t, out, label); !strings.Contains(line, want) {
+			t.Errorf("the %s line reads %q, want it to say %q", label, line, want)
+		}
+	}
+	for _, want := range []string{"cache references 120,000,000, cache misses 35,816,000",
+		"branch misses 9,680,000, frontend stall cycles 1,000,000,000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report does not say %q:\n%s", want, out)
+		}
+	}
+}
+
+// AN EVENT THAT WAS NOT COUNTED SAYS SO, AND SO DOES EVERY RATIO THAT NEEDS
+// IT, while a ratio of counted events is still printed; a job with no counters
+// says that once. A ratio over a counted zero is undefined, not infinite.
+func TestJobsShowSaysWhichCountersWereNotMeasured(t *testing.T) {
+	t.Parallel()
+
+	out := countedJob(t, &alloc.JobCounters{
+		Cycles: count(4_000_000_000), Instructions: count(4_840_000_000), BranchMisses: count(9_680_000),
+	})
+	for label, want := range map[string]string{
+		"ipc":      "1.21 instructions per cycle",
+		"cache":    "not measured",
+		"branches": "2.0 mispredicted per 1,000 instructions",
+		"frontend": "not measured",
+	} {
+		if line := lineStarting(t, out, label); !strings.Contains(line, want) {
+			t.Errorf("the %s line reads %q, want it to say %q", label, line, want)
+		}
+	}
+	if !strings.Contains(out, "cache references not measured, cache misses not measured") {
+		t.Errorf("uncounted cache events were not named:\n%s", out)
+	}
+
+	if line := lineStarting(t, countedJob(t, nil), "counters"); !strings.HasSuffix(line, "not measured") {
+		t.Errorf("a job with no counters reads %q", line)
+	}
+	idle := countedJob(t, &alloc.JobCounters{Cycles: count(0), Instructions: count(0)})
+	if line := lineStarting(t, idle, "ipc"); !strings.Contains(line, "undefined (no cycles counted)") {
+		t.Errorf("IPC over zero cycles reads %q", line)
 	}
 }

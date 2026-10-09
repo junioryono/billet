@@ -1,6 +1,6 @@
 ---
 name: billet-capacity
-description: "Load when touching internal/alloc, internal/server/listener.go, internal/nodeplane, internal/node or internal/nodeclient/loop.go; when changing what a tier advertises; when adding a lease phase, a placement rule or a teardown path; and when a bug looks like double-booked capacity, a job that never launched, capacity that never came back, or a container nobody destroyed."
+description: "Load when touching internal/alloc, internal/server/listener*.go, internal/nodeplane, internal/node or internal/nodeclient/loop.go; when changing what a tier advertises; when adding a lease phase, a placement rule or a teardown path; and when a bug looks like double-booked capacity, a job that never launched, capacity that never came back, or a container nobody destroyed."
 ---
 
 # Capacity, leases and custody

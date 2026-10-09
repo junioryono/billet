@@ -63,6 +63,11 @@ type Provider struct {
 	docker string
 	// owner tags containers so `docker ps` and orphan cleanup can find them.
 	owner string
+	// procRoot is where /proc is read from, "/" but for a test's fixture tree.
+	procRoot string
+	// processStart reads a pid's start time; a seam so a test can stage a pid
+	// that changes hands while it is being read.
+	processStart func(pid int) (uint64, error)
 }
 
 // Option configures a Provider.
@@ -81,7 +86,8 @@ func WithBinary(path string) Option {
 // New builds a docker provider. owner names this billet deployment and is
 // written onto every container it starts.
 func New(owner string, opts ...Option) *Provider {
-	p := &Provider{log: slog.Default(), docker: "docker", owner: owner}
+	p := &Provider{log: slog.Default(), docker: "docker", owner: owner, procRoot: "/",
+		processStart: hostProcessStart}
 
 	for _, opt := range opts {
 		opt(p)
