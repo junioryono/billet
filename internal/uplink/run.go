@@ -62,11 +62,11 @@ func Run(ctx context.Context, opts Options) error {
 		reflectors = DefaultReflectors
 	}
 
-	pinger, err := NewPinger(reflectors)
+	pinger, err := NewPinger(ctx, reflectors)
 	if err != nil {
 		return err
 	}
-	defer pinger.Close() //nolint:errcheck // a socket closed on the way out has nothing left to say
+	defer pinger.Close()
 
 	speed := Speed(iface)
 	if speed == 0 {
@@ -117,26 +117,25 @@ func Run(ctx context.Context, opts Options) error {
 // whole run and by a cleanup while it clears: two of them at once would each
 // remove what the other installed. It fails at once, naming the holder's
 // claim, rather than wait. The claim ends with the process.
-func Lock() (release func(), err error) {
+func Lock() (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(StateFile), 0o755); err != nil {
 		return nil, fmt.Errorf("claim the uplink's shaping: %w", err)
 	}
 
 	path := filepath.Join(filepath.Dir(StateFile), "lock")
 
-	//nolint:gosec // G304: a fixed path under billet's own runtime directory
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("claim the uplink's shaping: %w", err)
 	}
 
 	if err := flock(f); err != nil {
-		f.Close() //nolint:errcheck // the lock was not taken; its error is the one to report
+		f.Close()
 
 		return nil, fmt.Errorf("another billet uplink is shaping or clearing this host (%s): %w", path, err)
 	}
 
-	return func() { f.Close() }, nil //nolint:errcheck // closing releases the lock; nothing is left to say
+	return func() { f.Close() }, nil
 }
 
 func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pinger, ctl *Controller,

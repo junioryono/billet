@@ -80,7 +80,10 @@ func forgetRecord() error {
 // its qdiscs went with it. A record with no index (written before indexes were)
 // is taken by name. AN ERROR IS A LOOKUP THAT COULD NOT TELL, never gone:
 // gone permits removing the device a redirect on the interface may still use.
-func (r Record) Resolve() (current string, gone bool, err error) {
+//
+// It returns the interface's current name, whether it is gone, and an error
+// when the lookup could not tell.
+func (r Record) Resolve() (string, bool, error) {
 	if r.Index == "" {
 		_, err := os.Stat(filepath.Join(sysNet, r.Iface))
 

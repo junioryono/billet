@@ -113,7 +113,9 @@ func readCounter(iface, name string) (uint64, error) {
 
 // Since is what moved between two readings, in bits. A counter that went
 // backwards (the interface was recreated) moved nothing that can be counted.
-func (c Counters) Since(before Counters) (sent, received uint64) {
+func (c Counters) Since(before Counters) (uint64, uint64) {
+	var sent, received uint64
+
 	if c.Sent >= before.Sent {
 		sent = (c.Sent - before.Sent) * 8
 	}
@@ -139,9 +141,10 @@ func ifindex(iface string) string {
 // absence, because absence permits removing a device a redirect may still use.
 var errUndecided = errors.New("could not tell which interface has the recorded index")
 
-// nameForIndex is the interface that now has this index. found is false only
-// when every interface was read and none has it; anything less is an error.
-func nameForIndex(index string) (name string, found bool, err error) {
+// nameForIndex is the interface that now has this index, and whether one has
+// it: not found only when every interface was read and none has it; anything
+// less is an error.
+func nameForIndex(index string) (string, bool, error) {
 	entries, err := os.ReadDir(sysNet)
 	if err != nil {
 		return "", false, fmt.Errorf("%w: %w", errUndecided, err)

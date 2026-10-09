@@ -22,14 +22,14 @@ type Pinger struct {
 
 // NewPinger opens the socket. Every reflector must be a literal IPv4 address,
 // so a round never waits on a resolver that the full queue is also delaying.
-func NewPinger(reflectors []string) (*Pinger, error) {
+func NewPinger(ctx context.Context, reflectors []string) (*Pinger, error) {
 	for _, reflector := range reflectors {
 		if ip := net.ParseIP(reflector); ip == nil || ip.To4() == nil {
 			return nil, fmt.Errorf("reflector %q is not an IPv4 address", reflector)
 		}
 	}
 
-	conn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+	conn, err := (&net.ListenConfig{}).ListenPacket(ctx, "ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return nil, fmt.Errorf("open an ICMP socket (the shaper runs as root): %w", err)
 	}
@@ -38,7 +38,7 @@ func NewPinger(reflectors []string) (*Pinger, error) {
 	// never take each other's answers.
 	var id [2]byte
 	if _, err := cryptorand.Read(id[:]); err != nil {
-		conn.Close() //nolint:errcheck // the socket was never used; the read's error is the one to report
+		conn.Close()
 
 		return nil, fmt.Errorf("choose an echo id: %w", err)
 	}

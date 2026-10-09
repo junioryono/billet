@@ -145,7 +145,7 @@ func (s *Shaper) foreign(st state) error {
 		return refuse("CAKE")
 	case st.root != "cake" && !st.kernel:
 		return refuse("a " + st.root + " root qdisc somebody configured")
-	case st.ingress && !(s.Owned && st.ifb):
+	case st.ingress && (!s.Owned || !st.ifb):
 		return refuse("an ingress qdisc")
 	case st.ifb && !s.Owned:
 		return refuse("a device named " + s.IFB())

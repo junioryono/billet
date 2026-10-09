@@ -25,6 +25,15 @@ func TestAReplacedExecutableIsNoticedAndAMissingOneIsNot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// HELD OPEN, AS A RUNNING SHAPER HOLDS ITS OWN BINARY: a file nothing holds
+	// has its inode freed on removal, and the filesystem may give that same
+	// inode to the new file, which then reads as the old one. Measured in CI.
+	held, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
 	exe := executable{path: path, info: info}
 
 	if exe.replaced() {
@@ -70,7 +79,7 @@ func TestTheRecordedIdentityIsTheRunningFileWithItsPathGone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer self.Close() //nolint:errcheck // a read-only handle
+	defer self.Close()
 
 	path := filepath.Join(t.TempDir(), "billet")
 

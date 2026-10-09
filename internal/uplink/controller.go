@@ -207,6 +207,7 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 	}
 
 	before := d.Rate
+	delayedNow := o.DelayKnown && o.Delay > p.Bloat
 
 	switch {
 	case full:
@@ -218,7 +219,7 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 
 		// CUT ONLY ON A QUEUE THAT IS THERE NOW: a window full of delays the queue
 		// has since drained says nothing about the next second.
-		if !(o.DelayKnown && o.Delay > p.Bloat) {
+		if !delayedNow {
 			return false, false
 		}
 
@@ -253,7 +254,7 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 		d.lastCut, d.cutSince, d.cutDelay = o.At, true, o.Delay
 
 		return d.Rate != before, true
-	case moving >= p.Full*d.Rate && !(o.DelayKnown && o.Delay > p.Bloat) &&
+	case moving >= p.Full*d.Rate && !delayedNow &&
 		(!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
 		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and this
 		// sample shows no queue, so a rate climbs back toward the line's speed as
@@ -262,7 +263,7 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 		// above any rate just cut and would undo the cut at once.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
 		d.futile = 0
-	case !(o.DelayKnown && o.Delay > p.Bloat):
+	case !delayedNow:
 		// THE QUEUE CLEARED: a later one starts a new episode, and cuts are judged
 		// afresh. Not merely "not full": the window refills after every cut, and
 		// forgetting futility while it does would let cuts ratchet on regardless.
