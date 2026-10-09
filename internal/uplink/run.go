@@ -216,6 +216,8 @@ func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, c
 
 	history := []reading{{at: time.Now(), counters: first}}
 	applied := [2]float64{ctl.Up.Rate, ctl.Down.Rate}
+	exe := currentExecutable()
+	exeCheckedAt := time.Now()
 	ticker := time.NewTicker(Tick)
 	defer ticker.Stop()
 
@@ -224,6 +226,16 @@ func loop(ctx context.Context, log *slog.Logger, iface string, pinger *Pinger, c
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+		}
+
+		if time.Since(exeCheckedAt) >= time.Minute {
+			exeCheckedAt = time.Now()
+
+			if exe.replaced() {
+				log.Info("the installed billet was replaced; stopping so the unit restarts onto it")
+
+				return ErrReplaced
+			}
 		}
 
 		answered, err := pinger.Round(ctx, Tick*8/10)
