@@ -1,0 +1,19 @@
+[Unit]
+Description=billet keeps this host's traffic from filling its site's shared internet line
+Documentation=https://billet.readthedocs.io/en/latest/reference/cli.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/billet uplink shape
+ExecStopPost=/usr/bin/billet uplink clear
+# The interface the shaper chose, kept past a stop so the cleanup above finds
+# it; a reboot empties it along with the shaping.
+RuntimeDirectory=billet-uplink
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

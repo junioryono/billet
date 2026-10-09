@@ -638,6 +638,21 @@ func (s *stub) argv(t *testing.T) string {
 	return string(b)
 }
 
+// sampledApart is newProvider for a test whose runner must be found dead: the
+// two samples a proof needs are taken a second apart, as in production. At the
+// stub's millisecond a runner that exits at once can still be running for both
+// on a loaded machine, and the launch is then proved; CI's test job saw exactly
+// that once (2026-10-08). A dead runner still fails at the first sample, so
+// the second is paid only when the first happened to find it alive.
+func sampledApart(t *testing.T, s *stub) *Provider {
+	t.Helper()
+
+	p := newProvider(t, s)
+	p.proveRetry = time.Second
+
+	return p
+}
+
 func newProvider(t *testing.T, s *stub) *Provider {
 	t.Helper()
 
@@ -1439,12 +1454,9 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 				// Long enough for the first sample to have finished, and well
 				// inside the two-second gap before the second one.
 				time.Sleep(300 * time.Millisecond)
-				// REAPED, not merely killed. A killed child stays a zombie
-				// until its parent waits, and `kill -0` on a zombie SUCCEEDS —
-				// so without the wait the second sample still reads the corpse
-				// as a living runner. In a real guest the runner is reparented
-				// to init, which reaps it promptly; here the parent is this
-				// test process.
+				// Killed and reaped, as a guest's init would reap it. A zombie
+				// reads as dead too (TestAZombieRunnerIsNotProved), so this
+				// test does not depend on the wait.
 				stopStandIn(t, victim)
 
 				return
@@ -1465,6 +1477,162 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "not running") && !strings.Contains(err.Error(), "never stayed") {
 		t.Errorf("Launch = %v, want an error naming the dead runner", err)
+	}
+}
+
+// A ZOMBIE IS NOT A RUNNING RUNNER. A runner that exited and was not yet
+// reaped still answers `kill -0` and still carries its start time, so its
+// identity matches; without billet_zombie the proof called it alive on both
+// platforms (measured 2026-10-08). Here a real zombie is the announced runner:
+// a child of this test, which does not wait for it until the test ends.
+func TestAZombieRunnerIsNotProved(t *testing.T) {
+	s := newStub(t)
+
+	// THE TEST OWNS IT, so nothing reaps it early and it is reaped at the end.
+	zombie := exec.CommandContext(t.Context(), "sleep", "0")
+	if err := zombie.Start(); err != nil {
+		t.Fatalf("start the runner that will exit: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := zombie.Wait(); err != nil {
+			t.Logf("the runner that exited: %v", err)
+		}
+	})
+
+	pid := zombie.Process.Pid
+
+	// A ZOMBIE BEFORE IT IS ANNOUNCED, established rather than assumed.
+	until := time.Now().Add(10 * time.Second)
+
+	for {
+		state, err := exec.CommandContext(t.Context(), "ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		if err == nil && strings.Contains(string(state), "Z") {
+			break
+		}
+
+		if time.Now().After(until) {
+			t.Fatalf("process %d never became a zombie (state %q, ps: %v)", pid, state, err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	for name, body := range map[string]string{
+		launchClaim:     "",
+		runnerBirthFile: birthToken(t, pid),
+		runnerPIDFile:   strconv.Itoa(pid) + "\n",
+	} {
+		if err := os.WriteFile(filepath.Join(s.guestHome, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("plant %s: %v", name, err)
+		}
+	}
+
+	_, err := newProvider(t, s).Launch(t.Context(), validSpec("billet-lease1"))
+	if err == nil {
+		t.Fatal("Launch proved a runner that had exited and was not yet reaped")
+	}
+
+	if !strings.Contains(err.Error(), "the guest says dead") {
+		t.Errorf("Launch = %v, want the zombie reported dead", err)
+	}
+}
+
+// billetZombie runs billet's own billet_zombie on pid, with PATH set to path
+// and override defined after billet's functions, and reports whether it said
+// zombie.
+func billetZombie(t *testing.T, pid int, path, override string) bool {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", zombieFunc+override+"\n"+`billet_zombie "$1"`,
+		"sh", strconv.Itoa(pid))
+	cmd.Env = append(os.Environ(), "PATH="+path)
+
+	err := cmd.Run()
+	if err == nil {
+		return true
+	}
+
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != 1 {
+		t.Fatalf("billet_zombie(%d): %v", pid, err)
+	}
+
+	return false
+}
+
+// A LIVE PROCESS IS NEVER A ZOMBIE, and a ps that fails decides nothing
+// whatever it printed. A false "dead" fails a healthy launch and destroys the
+// VM, so the check answers only on evidence.
+func TestOnlyEvidenceMakesAZombie(t *testing.T) {
+	live := exec.CommandContext(t.Context(), "sleep", "120")
+	if err := live.Start(); err != nil {
+		t.Fatalf("start a live process: %v", err)
+	}
+
+	t.Cleanup(func() { stopStandIn(t, live) })
+
+	if billetZombie(t, live.Process.Pid, os.Getenv("PATH"), "") {
+		t.Error("a live process was called a zombie")
+	}
+
+	// THE /proc BRANCH, answered with the records a kernel writes: only state Z
+	// with a thread group of one is a zombie. Z with two is a leader that
+	// called pthread_exit while its other threads run (measured on Ubuntu
+	// 24.04). The command name is cut at its last ") ", which it may contain.
+	stat := func(comm, state, threads string) string {
+		return "42 (" + comm + ") " + state + " 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 " + threads + " 0 99"
+	}
+
+	for _, c := range []struct {
+		record string
+		zombie bool
+	}{
+		{stat("runner", "Z", "1"), true},
+		{stat("a) Z b", "Z", "1"), true},
+		{stat("runner", "Z", "2"), false},
+		{stat("runner", "Z", "0"), false},
+		{"42 (runner) Z 1 2", false},
+		{stat("runner", "S", "1"), false},
+		{stat("a) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 1", "S", "1"), false},
+	} {
+		override := "billet_procstat() { printf '%s\\n' " + shellQuote(c.record) + "; }"
+
+		if got := billetZombie(t, live.Process.Pid, os.Getenv("PATH"), override); got != c.zombie {
+			t.Errorf("/proc says %q: zombie = %v, want %v", c.record, got, c.zombie)
+		}
+	}
+
+	// THE ps BRANCH, which a guest without /proc takes, on every host: /proc
+	// answers nothing here. Only a single Z token, from a ps that succeeded,
+	// is a zombie: "Zl" is a leader whose other threads still run (Linux
+	// procps; measured on Ubuntu 24.04).
+	noProc := "billet_procstat() { return 1; }"
+
+	for _, c := range []struct {
+		answer string
+		exit   int
+		zombie bool
+	}{
+		{"Z", 0, true},
+		{"Zs", 0, true},
+		{"Z", 1, false},
+		{"Zl", 0, false},
+		{"Zsl", 0, false},
+		{"SZ", 0, false},
+		{"Z extra", 0, false},
+		{"S", 0, false},
+		{"", 0, false},
+	} {
+		fake := t.TempDir()
+
+		script := "#!/bin/sh\necho '" + c.answer + "'\nexit " + strconv.Itoa(c.exit) + "\n"
+		if err := os.WriteFile(filepath.Join(fake, "ps"), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := billetZombie(t, live.Process.Pid, fake+":"+os.Getenv("PATH"), noProc); got != c.zombie {
+			t.Errorf("ps answering %q and exiting %d: zombie = %v, want %v", c.answer, c.exit, got, c.zombie)
+		}
 	}
 }
 
@@ -1654,7 +1822,7 @@ func TestTheClaimIsTakenEvenWhenTheSpawnNeverAnnounces(t *testing.T) {
 // report a runner for a job that will sit queued.
 func TestALaunchWhoseRunnerDiesImmediatelyIsAFailure(t *testing.T) {
 	s := newStub(t)
-	p := newProvider(t, s)
+	p := sampledApart(t, s)
 
 	spec := validSpec("billet-lease1")
 	spec.Command = []string{"/bin/sh", "-c", "exit 0"}
@@ -1731,7 +1899,7 @@ func TestAMissingTierCommandIsReportedAsMissing(t *testing.T) {
 // error under any circumstances.
 func TestNothingTheGuestWroteReachesTheLaunchError(t *testing.T) {
 	s := newStub(t)
-	p := newProvider(t, s)
+	p := sampledApart(t, s)
 
 	const canary = "ghp-CANARY-THIS-IS-A-JOB-SECRET"
 

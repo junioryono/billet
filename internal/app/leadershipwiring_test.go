@@ -24,7 +24,7 @@ func TestAReplacedControllerStopsItself(t *testing.T) {
 	replaced := make(chan struct{})
 	stopped := make(chan struct{})
 
-	go stopWhenReplaced(t.Context(), replaced, func() { close(stopped) },
+	go stopWhenReplaced(t.Context(), replaced, func() { close(stopped) }, nil,
 		slog.New(slog.DiscardHandler))
 
 	close(replaced)
@@ -51,7 +51,7 @@ func TestTheLeadershipWatcherReturnsOnAnOrdinaryShutdown(t *testing.T) {
 
 		stopWhenReplaced(ctx, make(chan struct{}), func() {
 			t.Error("an ordinary shutdown must not report this process as replaced")
-		}, slog.New(slog.DiscardHandler))
+		}, nil, slog.New(slog.DiscardHandler))
 	}()
 
 	cancel()

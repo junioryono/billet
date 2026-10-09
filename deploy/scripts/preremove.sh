@@ -64,6 +64,21 @@ if [ -d /run/systemd/system ]; then
             fi
         fi
     done
+
+    # THE UPLINK SHAPER, where the host role installed it, stops while the binary
+    # its ExecStopPost clears with is still here: afterwards nothing could remove
+    # the CAKE it left on the uplink. Its record is forgotten only once that
+    # cleanup succeeded, so a record still present is a cleanup that did not, and
+    # the removal is refused rather than leave the shaping behind.
+    if [ -e /etc/systemd/system/billet-uplink.service ]; then
+        systemctl disable --now billet-uplink.service >/dev/null 2>&1 || true
+        if [ -e /run/billet-uplink/interface ]; then
+            echo "billet: billet-uplink did not clear its shaping (/run/billet-uplink/interface" >&2
+            echo "        remains). Refusing to remove the package, which would take the binary" >&2
+            echo "        that clears it; run 'billet uplink clear' and remove again." >&2
+            exit 1
+        fi
+    fi
 fi
 
 exit 0

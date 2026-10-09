@@ -213,32 +213,6 @@ type Listener struct {
 	// wrong ordering fail causally rather than usually.
 	heartbeatLock func()
 
-	// heartbeatTicks replaces the heartbeat loop's ticker when non-nil, and
-	// heartbeatPassed runs after each pass the LOOP made. TEST-ONLY and nil in
-	// every deployment. Together they let a test deliver a tick to the real loop
-	// while the poll is blocked and know when that pass has finished, which is
-	// the only way to prove heartbeats run independently of the poll: a test
-	// that called heartbeatPass itself would prove a pass renews leases and
-	// nothing about who runs it, or when.
-	heartbeatTicks  <-chan time.Time
-	heartbeatPassed func()
-
-	// heartbeatStopped runs when the heartbeat loop returns, and cleanupTicks
-	// replaces the cleanup loop's ticker when non-nil. TEST-ONLY and nil in every
-	// deployment. With the two above they let a test drive both loops against
-	// the allocator's clock instead of racing the machine's: when renewal ends is
-	// an event the test waits for rather than a wall-clock interval it sleeps
-	// through, and a slow pass on a loaded host costs time, not the lease.
-	heartbeatStopped func()
-	cleanupTicks     <-chan time.Time
-
-	// teardownDeadline replaces context.WithTimeout for the shutdown's overall
-	// budget when non-nil. TEST-ONLY and nil in every deployment: it is handed
-	// the budget the listener computed, so a test can check that number and
-	// then end the budget itself, instead of racing the watchdog's wall-clock
-	// timer to establish that renewal was running before it fired.
-	teardownDeadline func(context.Context, time.Duration) (context.Context, context.CancelFunc)
-
 	// TEST-ONLY boundaries for losing backing after admission captures its turn
 	// or refill target. Nil in every deployment; neither replaces the operation.
 	beforePoolReconcile func()
@@ -409,6 +383,11 @@ type Listener struct {
 	// deployment's controller. Nil outside the control plane; see
 	// WithLeadershipLost.
 	leadershipLost func() bool
+
+	// heartbeatOverrun is told when a heartbeat pass is still running as the
+	// next falls due. Nil outside the control plane; see
+	// WithHeartbeatOverrunReport.
+	heartbeatOverrun func()
 
 	// reopen opens a replacement session after a poll failed past the client's
 	// own retries. Nil for a standalone listener, whose Run returns that failure
@@ -775,6 +754,13 @@ func WithLeadershipLostCheck(fn func() bool) Option {
 	return func(l *Listener) { l.leadershipLost = fn }
 }
 
+// WithHeartbeatOverrunReport tells fn when a heartbeat pass is still running as
+// the next falls due. It is told WHILE the pass runs, from a goroutine of its
+// own, so what it captures is the stall itself; fn must return at once.
+func WithHeartbeatOverrunReport(fn func()) Option {
+	return func(l *Listener) { l.heartbeatOverrun = fn }
+}
+
 // WithSessionReopen lets the listener replace a session whose poll failed after
 // the client's own retries rather than return, because a listener returning
 // stops every listener of the control plane, on every target (#207). open must
@@ -1060,12 +1046,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		// ONE DEADLINE THAT EVERY PHASE INHERITS, not a sum they can outlive: renewal has
 		// to outlast the whole teardown, and each phase is min(its own budget, what is
 		// left).
-		budgeted := context.WithTimeout
-		if l.teardownDeadline != nil {
-			budgeted = l.teardownDeadline
-		}
-
-		overall, endOverall := budgeted(context.WithoutCancel(ctx), l.teardownBudget())
+		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx), l.teardownBudget())
 		defer endOverall()
 
 		renewCtx := overall
@@ -2639,28 +2620,50 @@ func stopping(ctx context.Context, err error) error {
 // The interval is a fraction of the TTL so a single missed beat — a busy
 // database, a slow write — does not expire anything.
 func (l *Listener) heartbeatLoop(ctx context.Context) {
-	if l.heartbeatStopped != nil {
-		defer l.heartbeatStopped()
-	}
+	// AN OVERRUN THAT FIRED IS JOINED BEFORE THE LOOP RETURNS, so a report under
+	// way as the plane stops reaches whoever it tells before they stop too.
+	var overruns sync.WaitGroup
+	defer overruns.Wait()
 
-	ticks := l.heartbeatTicks
-	if ticks == nil {
-		ticker := time.NewTicker(l.heartbeatInterval())
-		defer ticker.Stop()
-
-		ticks = ticker.C
-	}
+	ticker := time.NewTicker(l.heartbeatInterval())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticks:
+		case <-ticker.C:
+			// ARMED BEFORE THE PASS AND STOPPED AFTER IT, so an overrun is told
+			// while the pass is still stuck, lock wait included, rather than once
+			// it has ended and the evidence with it.
+			disarm := l.armOverrun(&overruns)
+
 			l.heartbeatPass(ctx)
 
-			if l.heartbeatPassed != nil {
-				l.heartbeatPassed()
-			}
+			disarm()
+		}
+	}
+}
+
+// armOverrun starts the timer that reports this pass as overrun, counting it in
+// told until it is either stopped before it fired or has finished telling. It
+// returns the disarm, which the loop calls once the pass has ended.
+func (l *Listener) armOverrun(told *sync.WaitGroup) func() {
+	if l.heartbeatOverrun == nil {
+		return func() {}
+	}
+
+	told.Add(1)
+
+	timer := time.AfterFunc(l.heartbeatInterval(), func() {
+		defer told.Done()
+
+		l.heartbeatOverrun()
+	})
+
+	return func() {
+		if timer.Stop() {
+			told.Done()
 		}
 	}
 }
@@ -2717,19 +2720,14 @@ func (l *Listener) lockForHeartbeat() {
 
 // cleanupLoop retries cleanup obligations on its own clock.
 func (l *Listener) cleanupLoop(ctx context.Context) {
-	ticks := l.cleanupTicks
-	if ticks == nil {
-		ticker := time.NewTicker(l.heartbeatInterval())
-		defer ticker.Stop()
-
-		ticks = ticker.C
-	}
+	ticker := time.NewTicker(l.heartbeatInterval())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticks:
+		case <-ticker.C:
 			l.retryCleanup(ctx)
 		}
 	}

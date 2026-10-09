@@ -25,6 +25,7 @@ Byte sizes are written as `32GiB`, `512MiB` and parsed exactly; durations as Go 
 | `metrics.listen` | with `metrics` | the control plane's Prometheus endpoint (`/metrics`); absent block, no endpoint. A literal loopback address (`127.0.0.1` or `[::1]`, not `localhost`) unless `metrics.allow_remote`; may not share a socket with any other listener in the file, however it is spelled. See [Metrics](../operating/metrics.md) |
 | `metrics.allow_remote` | no | admits a non-loopback `metrics.listen`; the endpoint has no authentication |
 | `metrics.pprof` | no | also serves Go's profiler under `/debug/pprof/`; refused on any `listen` that is not a literal loopback address, `allow_remote` or not, because a profile carries memory |
+| `flight_recorder` | no | `true` keeps the last two minutes of the controller's execution trace in memory and writes them under `identity_dir/flight-recorder` when a heartbeat pass overruns or the claim is lost; off by default. See [Metrics](../operating/metrics.md#the-flight-recorder) |
 
 ## `github`
 

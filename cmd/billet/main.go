@@ -98,6 +98,8 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: host.ConvergeGuard},
 		{Name: "release", Summary: "record which signed manifest produced the billet installed here",
 			Run: host.Release},
+		{Name: "uplink", Summary: "keep this host's traffic from filling its site's shared internet line",
+			Run: host.Uplink},
 		{Name: "acceptance", Summary: "stand an ISOLATED deployment up beside this one, run a real job on " +
 			"it, and destroy exactly what it made",
 			Run: cmdAcceptance},
