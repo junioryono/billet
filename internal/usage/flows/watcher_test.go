@@ -22,9 +22,22 @@ type fakeTable struct {
 	syncErr error
 	synced  int
 	calls   []string
+	// onFlows, when set, runs before the nth read of the table answers,
+	// outside the lock.
+	onFlows func(n int)
+	flows   int
 }
 
 func (t *fakeTable) Flows(addr netip.Addr) ([]Flow, error) {
+	t.mu.Lock()
+	t.flows++
+	n, hook := t.flows, t.onFlows
+	t.mu.Unlock()
+
+	if hook != nil {
+		hook(n)
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -441,5 +454,78 @@ func TestOneAddressOneJobAndForgetFreesIt(t *testing.T) {
 
 	if _, measured, err := w.Final(t.Context(), "lease-3", ended); !measured {
 		t.Errorf("the address stayed held after its job was forgotten: %v", err)
+	}
+}
+
+// FOLLOWING A JOB AGAIN REPLACES ITS WATCH: the old one is finished and its
+// address freed for the new one, which is measured on its own.
+func TestFollowingAJobAgainReplacesItsWatch(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	w, acct := newTestWatcher(&fakeTable{}, l)
+	w.Watch("job", guestMACAddr, "leases", launched)
+	acct.Observe(flow(1, guest, github, 9, 9))
+
+	w.Watch("job", guestMACAddr, "leases", launched)
+
+	r, measured, err := w.Final(t.Context(), "job", ended)
+	if !measured || err != nil {
+		t.Fatalf("the replacement watch was not measured: %v, %v", measured, err)
+	}
+
+	if len(r.Destinations) != 0 {
+		t.Errorf("the replacement counted the replaced watch's flows: %+v", r.Destinations)
+	}
+}
+
+// AN OLD FINAL CAN ONLY FINISH ITS OWN WATCH: one still reading the table when
+// the job is followed again does not finish the replacement, which is measured
+// on its own.
+func TestAnOldFinalCannotFinishItsReplacement(t *testing.T) {
+	t.Parallel()
+
+	l := &leases{}
+	l.set(leaseLine(began, guest))
+
+	reading, release := make(chan struct{}), make(chan struct{})
+
+	table := &fakeTable{}
+	table.onFlows = func(n int) {
+		if n == 2 { // the first Final's read of the open flows
+			close(reading)
+			<-release
+		}
+	}
+
+	w, _ := newTestWatcher(table, l)
+	w.Watch("job", guestMACAddr, "leases", launched)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		if _, _, err := w.Final(t.Context(), "job", ended); err != nil {
+			t.Logf("the old Final: %v", err)
+		}
+	}()
+
+	<-reading
+
+	// The replacement's guest is leased another address, so it is watched at
+	// once, while the old Final still holds its own.
+	l.set(leaseLine(began, other))
+	w.Watch("job", guestMACAddr, "leases", launched)
+
+	close(release)
+	<-done
+
+	w.Resolve()
+
+	if _, measured, err := w.Final(t.Context(), "job", ended); !measured {
+		t.Errorf("the old Final finished the replacement's watch: %v", err)
 	}
 }

@@ -47,9 +47,15 @@ type Watcher struct {
 
 	mu      sync.Mutex
 	pending map[string]*pending
+	// generation numbers each Watch, so a job followed again under the same
+	// key is a different watch to the accountant.
+	generation uint64
 }
 
 type pending struct {
+	// acctKey is this generation's key with the accountant: an old Final or
+	// Forget for the same job name can only ever finish its own watch.
+	acctKey   string
 	mac       net.HardwareAddr
 	leaseFile string
 	launched  time.Time
@@ -67,15 +73,21 @@ func NewWatcher(acct *Accountant, table Table, leaseTime time.Duration, log *slo
 
 // Watch starts following the job named key, whose guest has hardware address
 // mac and is leased its address in leaseFile, and which was launched at
-// launched. A key already followed is forgotten first.
+// launched. A key already followed is replaced in the same step, and the
+// replaced watch finished without a result.
 func (w *Watcher) Watch(key string, mac net.HardwareAddr, leaseFile string, launched time.Time) {
-	w.Forget(key)
-
-	p := &pending{mac: mac, leaseFile: leaseFile, launched: launched}
-
 	w.mu.Lock()
+	w.generation++
+	p := &pending{acctKey: fmt.Sprintf("%s#%d", key, w.generation), mac: mac, leaseFile: leaseFile,
+		launched: launched}
+	old := w.pending[key]
 	w.pending[key] = p
+	replaced := old != nil && old.addr.IsValid()
 	w.mu.Unlock()
+
+	if replaced {
+		w.acct.Final(old.acctKey, nil, time.Now())
+	}
 
 	w.resolve(key, p)
 }
@@ -148,7 +160,7 @@ func (w *Watcher) resolve(key string, p *pending) {
 		if err != nil || addr != known {
 			w.mu.Lock()
 			if w.pending[key] == p {
-				w.acct.MarkIncomplete(key)
+				w.acct.MarkIncomplete(p.acctKey)
 			}
 			w.mu.Unlock()
 		}
@@ -173,7 +185,7 @@ func (w *Watcher) resolve(key string, p *pending) {
 		return
 	}
 
-	if !w.acct.Watch(key, addr, grant, open) {
+	if !w.acct.Watch(p.acctKey, addr, grant, open) {
 		p.failure = fmt.Errorf("address %s is already another job's", addr)
 
 		return
@@ -187,7 +199,7 @@ func (w *Watcher) resolve(key string, p *pending) {
 	// THE LAUNCH may be a renewal hiding earlier flows. Each is a job whose
 	// flows cannot all be told apart.
 	if dumpErr != nil || ambiguous || grant.Sub(p.launched) > w.leaseTime/2 {
-		w.acct.MarkIncomplete(key)
+		w.acct.MarkIncomplete(p.acctKey)
 	}
 }
 
@@ -224,7 +236,7 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 	if readErr != nil {
 		// The flows still open could not be read, so the ones already counted
 		// are a lower bound.
-		w.acct.MarkIncomplete(key)
+		w.acct.MarkIncomplete(p.acctKey)
 	}
 
 	syncCtx, cancel := context.WithTimeout(ctx, syncLimit)
@@ -233,10 +245,15 @@ func (w *Watcher) Final(ctx context.Context, key string, until time.Time) (Resul
 	cancel()
 
 	if syncErr != nil {
-		w.acct.MarkIncomplete(key)
+		w.acct.MarkIncomplete(p.acctKey)
 	}
 
-	r, _ := w.acct.Final(key, open, until)
+	r, ok := w.acct.Final(p.acctKey, open, until)
+	if !ok {
+		// A watch the accountant no longer holds counted nothing that can be
+		// read back: unmeasured, never a measured zero.
+		return Result{}, false, errors.Join(errors.New("the job's watch was finished elsewhere"), readErr, syncErr)
+	}
 
 	return r, true, errors.Join(readErr, syncErr)
 }
@@ -251,7 +268,7 @@ func (w *Watcher) Forget(key string) {
 	w.mu.Unlock()
 
 	if resolved {
-		w.acct.Final(key, nil, time.Now())
+		w.acct.Final(p.acctKey, nil, time.Now())
 	}
 }
 

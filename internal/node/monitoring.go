@@ -103,15 +103,7 @@ func (r *Runner) startFlows(name string, target provider.UsageTarget, launchedAt
 
 // finalFlows takes what a job's connections came to, counting none that
 // started after until, when the job's destroy began. Until the ledger stores
-// them, they are said in the node's log.
-//
-// WITH THE REMAINDER THE TAP SAYS WAS NOT ATTRIBUTED. The tap's counters are
-// the job's whole traffic, read before the destroy; what no destination
-// accounts for (a flow missed, merged into an entry an earlier guest left, or
-// traffic conntrack does not track, such as DHCP and ARP) is that difference,
-// a measured number rather than a claim that nothing was missed. The tap
-// counts Ethernet frames and conntrack IP packets, so the tap's side is taken
-// less 14 bytes a frame.
+// them, they are said in the node's log, beside the tap's own totals.
 func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, sum usage.Summary, sampled bool) {
 	if r.flows == nil {
 		return
@@ -124,24 +116,54 @@ func (r *Runner) finalFlows(ctx context.Context, name string, until time.Time, s
 		return
 	}
 
-	sent, received := res.Other.Sent, res.Other.Received
-	for _, d := range res.Destinations {
-		sent, received = sent+d.Sent, received+d.Received
-	}
+	c := compareWithTap(res, sum, sampled)
 
-	attrs := []any{"runner", name, "destinations", len(res.Destinations), "sent", sent,
-		"received", received, "incomplete", res.Incomplete, "error", err}
+	attrs := []any{"runner", name, "destinations", len(res.Destinations), "sent", c.sent,
+		"received", c.received, "incomplete", res.Incomplete, "error", err}
 
-	if tap := sum.Latest; sampled && sum.Measured.Net {
-		attrs = append(attrs,
-			"unattributed_sent", (tap.NetTx-ethernetHeader*tap.NetTxPackets)-int64(sent),
-			"unattributed_received", (tap.NetRx-ethernetHeader*tap.NetRxPackets)-int64(received))
+	if c.tapKnown {
+		attrs = append(attrs, "tap_sent", c.tapSent, "tap_received", c.tapReceived,
+			"tap_minus_attributed_sent", c.tapSent-int64(c.sent),
+			"tap_minus_attributed_received", c.tapReceived-int64(c.received))
 	}
 
 	r.log.Info("a job's traffic by destination", attrs...)
 }
 
-// ethernetHeader is what a tap counts for each frame beyond the IP packet
+// tapComparison is what a job's destinations attributed, beside its tap's own
+// totals.
+//
+// A COMPARISON OF TWO COUNTERS, NOT A MEASUREMENT OF WHAT WAS MISSED. The tap
+// sees every byte the guest sent or received and cannot be forged by it, so a
+// large positive difference says traffic no destination accounts for: a flow
+// missed, merged into an entry an earlier guest left, or never tracked (ARP,
+// and DHCP before the guest has its address). But the tap is read before the
+// destroy and the flows after it, so replies that arrive in between are
+// attributed without reaching the tap, and its last reading can be an older
+// one when the final read failed. The tap counts each skb with its 14-byte
+// Ethernet header, which is taken off; a VLAN tag or a non-IP payload is not.
+type tapComparison struct {
+	sent, received       uint64
+	tapKnown             bool
+	tapSent, tapReceived int64
+}
+
+func compareWithTap(res flows.Result, sum usage.Summary, sampled bool) tapComparison {
+	c := tapComparison{sent: res.Other.Sent, received: res.Other.Received}
+	for _, d := range res.Destinations {
+		c.sent, c.received = c.sent+d.Sent, c.received+d.Received
+	}
+
+	if tap := sum.Latest; sampled && sum.Measured.Net {
+		c.tapKnown = true
+		c.tapSent = tap.NetTx - ethernetHeader*tap.NetTxPackets
+		c.tapReceived = tap.NetRx - ethernetHeader*tap.NetRxPackets
+	}
+
+	return c
+}
+
+// ethernetHeader is what a tap counts for each packet beyond the IP packet
 // conntrack counts.
 const ethernetHeader = 14
 

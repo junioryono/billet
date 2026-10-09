@@ -208,3 +208,40 @@ func TestFlowsAreOptionalAndForgottenWithTheJob(t *testing.T) {
 		t.Errorf("forgotten = %v, want billet-2", rec.forgotten)
 	}
 }
+
+// THE TAP'S TOTALS ARE SET BESIDE THE ATTRIBUTED ONES, direction by direction,
+// with Other counted and the Ethernet header taken off each tap packet; with
+// no tap reading there is nothing to compare.
+func TestTheTapIsComparedWithWhatWasAttributed(t *testing.T) {
+	t.Parallel()
+
+	res := flows.Result{
+		Destinations: []flows.Destination{{Sent: 100, Received: 1000}, {Sent: 10, Received: 20}},
+		Other:        flows.Destination{Sent: 5, Received: 7},
+	}
+
+	var sum usage.Summary
+
+	sum.Measured.Net = true
+	sum.Latest.NetTx, sum.Latest.NetTxPackets = 1_000, 10
+	sum.Latest.NetRx, sum.Latest.NetRxPackets = 5_000, 20
+
+	c := compareWithTap(res, sum, true)
+	if c.sent != 115 || c.received != 1027 {
+		t.Errorf("attributed %d sent and %d received, want 115 and 1027 with Other counted", c.sent, c.received)
+	}
+
+	if !c.tapKnown || c.tapSent != 1_000-140 || c.tapReceived != 5_000-280 {
+		t.Errorf("tap = %+v, want 860 sent and 4720 received, the header taken off each packet", c)
+	}
+
+	if c := compareWithTap(res, sum, false); c.tapKnown {
+		t.Error("a job never sampled was compared with a tap reading")
+	}
+
+	sum.Measured.Net = false
+
+	if c := compareWithTap(res, sum, true); c.tapKnown {
+		t.Error("a job whose tap was never read was compared with a tap reading")
+	}
+}

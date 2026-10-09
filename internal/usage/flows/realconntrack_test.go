@@ -136,8 +136,12 @@ func TestTheRealTrackerFindsEachGuestsFlows(t *testing.T) {
 	// for it: measured on the reference host (2026-10-09), the kernel delivers
 	// the event within the Delete call's round trip, so a Sync that returned at
 	// once passed five runs of five. The ordering is held by the unit tests.
+	// WATCHED FROM NOW, after the listener's startup gap has closed, so the
+	// only thing that can mark the probe is its own destruction.
 	probe, peer := netip.MustParseAddr("127.66.1.1"), netip.MustParseAddr("127.66.1.2")
-	acct.Watch("probe", probe, time.Now().Add(-time.Minute), nil)
+	if !acct.Watch("probe", probe, time.Now(), nil) {
+		t.Fatal("the probe address could not be watched")
+	}
 
 	conn, err := conntrack.Dial(nil)
 	if err != nil {
