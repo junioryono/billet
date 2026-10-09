@@ -344,6 +344,10 @@ func TestAnAnswerTheScanCannotReadIsNotRead(t *testing.T) {
 				jobJSON(1, "billet-lease-1", `{"number":1,"name":"`+escape(token)+`"}`) + `]}`
 		},
 		"not JSON": func(string) string { return `{"total_count":1,"jobs":[` },
+		"a key given twice, the token in the first": func(token string) string {
+			return `{"total_count":1,"jobs":[` +
+				jobJSON(1, "billet-lease-1", `{"number":1,"name":"`+escape(token)+`"}`) + `],"jobs":[{}]}`
+		},
 	} {
 		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
 			fmt.Fprint(w, body(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))

@@ -86,19 +86,29 @@ func encodeWithin(points []Point, limit int, enc func([]Point) ([]byte, error)) 
 // downsample keeps every stride-th point and the last. A point dropped with
 // its AfterGap mark passes the mark to the point kept after it, whose interval
 // now holds the one the sampler did not see.
+//
+// SO DOES A FALL, which dropping the points around it would hide: a counter
+// that fell between two points is marked on the point kept at or after the
+// fall, and when the fall lands on a kept point, on the next kept point too,
+// since the catch-up after it now lies in that point's interval.
 func downsample(points []Point, stride int) []Point {
 	if stride == 1 {
 		return points
 	}
 	var out []Point
-	gap := false
+	gap, carry := false, false
 	for i, p := range points {
+		kept := i%stride == 0 || i == len(points)-1
 		gap = gap || p.AfterGap
-		if i%stride != 0 && i != len(points)-1 {
+		if i > 0 && falls(points[i-1], p) {
+			gap = true
+			carry = carry || kept
+		}
+		if !kept {
 			continue
 		}
 		p.AfterGap = gap
-		gap = false
+		gap, carry = carry, false
 		out = append(out, p)
 	}
 
@@ -159,6 +169,9 @@ func (p Point) column(col int) int64 {
 const (
 	maxDecodedSeries = 64 << 20
 	maxDecodedPoints = 2 * maxPoints
+	// maxOffsetMillis is the largest offset a time.Duration holds, some 292
+	// years.
+	maxOffsetMillis = math.MaxInt64 / int64(time.Millisecond)
 )
 
 // DecodeSeries reverses EncodeSeries.
@@ -240,6 +253,11 @@ func decode(r *bytes.Reader, clocked bool) ([]Point, error) {
 		}
 		if i > 0 && points[i].OffsetMillis < points[i-1].OffsetMillis {
 			return nil, errors.New("usage: the series goes back in time")
+		}
+		// AN OFFSET A DURATION CANNOT HOLD would wrap when a window converts it,
+		// into a plausible time it never was.
+		if points[i].OffsetMillis > maxOffsetMillis {
+			return nil, errors.New("usage: the series runs past any offset a duration holds")
 		}
 	}
 

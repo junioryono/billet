@@ -13,10 +13,13 @@ import (
 // compress, with the gap marks given.
 func markedPoints(n int, marked ...int) []Point {
 	points := make([]Point, n)
+	var total int64
 	for i := range points {
-		v := int64(i)*7919 + int64(i*i)%104729
-		points[i] = Point{OffsetMillis: int64(i) * 1000, CPUUsage: int64(i)*100_000 + v%1000,
-			MemoryCurrent: 1<<30 + v, DiskRead: v * 3, NetRx: v * 5, EnergyActive: v * 11,
+		// AN IRREGULAR INCREMENT, so the series does not compress, and never a
+		// negative one, so no counter falls.
+		total += 1 + (int64(i)*7919+int64(i*i))%104729
+		points[i] = Point{OffsetMillis: int64(i) * 1000, CPUUsage: total, MemoryCurrent: 1<<30 + total%4096,
+			DiskRead: total * 3, NetRx: total * 5, EnergyActive: total * 11,
 			AfterGap: slices.Contains(marked, i)}
 	}
 
@@ -73,8 +76,54 @@ func TestDownsamplingKeepsEveryGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeSeriesAt: %v", err)
 	}
-	if w := tl.Window(tl.First, tl.First.Add(4000*time.Second)); w.Complete() {
-		t.Errorf("the mark at 1001s was lost in a stride-%d cut", stride)
+	marks = nil
+	for _, p := range tl.Points {
+		if p.AfterGap {
+			marks = append(marks, p.OffsetMillis)
+		}
+	}
+	// THE POINT KEPT AT OR AFTER 1001s CARRIES THE MARK, and no other does.
+	want := (1001000/(int64(stride)*1000) + 1) * int64(stride) * 1000
+	if !slices.Equal(marks, []int64{want}) {
+		t.Errorf("marked offsets after a stride-%d cut = %v, want only %d", stride, marks, want)
+	}
+}
+
+// A FALL SURVIVES DOWNSAMPLING: the point kept at or after it is marked, and
+// when it lands on a kept point, so is the next kept point, whose interval now
+// holds the catch-up.
+func TestDownsamplingKeepsEveryFall(t *testing.T) {
+	t.Parallel()
+
+	cpu := func(values ...int64) []Point {
+		points := make([]Point, len(values))
+		for i, v := range values {
+			points[i] = Point{OffsetMillis: int64(i) * 1000, CPUUsage: v}
+		}
+		return points
+	}
+	marks := func(points []Point) []int64 {
+		var out []int64
+		for _, p := range points {
+			if p.AfterGap {
+				out = append(out, p.OffsetMillis)
+			}
+		}
+		return out
+	}
+
+	// Falling into a dropped point (index 2 of stride 4): only the kept 4.
+	if got := marks(downsample(cpu(0, 100, 50, 200, 300, 400, 500, 600, 700), 4)); !slices.Equal(got, []int64{4000}) {
+		t.Errorf("a fall into a dropped point marked %v, want [4000]", got)
+	}
+	// Falling into a kept point (index 2 of stride 2): it and the next kept.
+	if got := marks(downsample(cpu(0, 100, 50, 200, 300, 400, 500), 2)); !slices.Equal(got, []int64{2000, 4000}) {
+		t.Errorf("a fall into a kept point marked %v, want [2000 4000]", got)
+	}
+	// AND THE WINDOW OVER THE CUT SERIES DOES NOT CALL IT COVERED.
+	cut := Timeline{First: first, Points: downsample(cpu(0, 100, 50, 200, 300, 400, 500, 600, 700), 4)}
+	if w := cut.Window(at(0), at(4000)); w.Covered != 0 {
+		t.Errorf("an interval holding a fall covered %s", w.Covered)
 	}
 }
 
@@ -245,5 +294,84 @@ func TestAFailedFinalReadMarksTheLastInterval(t *testing.T) {
 	if s.Points[1].AfterGap || !s.Points[2].AfterGap {
 		t.Errorf("marks = %v, %v; want only the final point's interval unseen", s.Points[1].AfterGap,
 			s.Points[2].AfterGap)
+	}
+}
+
+// A GROUP READ FOR THE FIRST TIME LATE MAKES EVERYTHING BEFORE IT UNSEEN:
+// every earlier point held the group's zero, so an earlier step would show it
+// doing nothing and the interval that reads it first would be given all it did
+// before.
+func TestAGroupReadLateLeavesNothingBeforeItSeen(t *testing.T) {
+	tr, target := referenceVM(t)
+	tr.remove(refCgroup + "/cpu.stat")
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
+	m.Start("vm", target, 8)
+	for range 2 {
+		now = now.Add(time.Second)
+		m.Tick()
+	}
+	tr.write(refCgroup+"/cpu.stat", refCPUStat)
+	now = now.Add(time.Second)
+	m.Tick()
+	now = now.Add(time.Second)
+	m.Tick()
+
+	s, ok := m.Final("vm")
+	if !ok || !s.Measured.CPU {
+		t.Fatalf("summary %v, cpu measured %v", ok, s.Measured.CPU)
+	}
+	var marks []bool
+	for _, p := range s.Points {
+		marks = append(marks, p.AfterGap)
+	}
+	if want := []bool{false, true, true, true, false, false}; !slices.Equal(marks, want) {
+		t.Errorf("marks = %v, want every interval to the first cpu read unseen and none after: %v", marks, want)
+	}
+}
+
+// AN OFFSET NO DURATION HOLDS IS REFUSED, never wrapped into a time it was not.
+func TestAnOffsetPastADurationIsRefused(t *testing.T) {
+	t.Parallel()
+
+	points := []Point{{OffsetMillis: 0}, {OffsetMillis: maxOffsetMillis + 1}}
+	data, _, err := EncodeSeries(points, 1<<20)
+	if err != nil {
+		t.Fatalf("EncodeSeries: %v", err)
+	}
+	if _, err := DecodeSeries(data); err == nil || !strings.Contains(err.Error(), "past any offset") {
+		t.Errorf("an offset past a duration = %v, want it refused", err)
+	}
+	points[1].OffsetMillis = maxOffsetMillis
+	if data, _, err = EncodeSeries(points, 1<<20); err != nil {
+		t.Fatalf("EncodeSeries: %v", err)
+	}
+	if _, err := DecodeSeries(data); err != nil {
+		t.Errorf("the largest offset a duration holds was refused: %v", err)
+	}
+}
+
+// AND A GROUP FIRST READ BY THE FINAL SAMPLE DOES THE SAME.
+func TestAGroupFirstReadAtTheEndLeavesNothingBeforeItSeen(t *testing.T) {
+	tr, target := referenceVM(t)
+	tr.remove(refCgroup + "/cpu.stat")
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
+	m.Start("vm", target, 8)
+	now = now.Add(time.Second)
+	m.Tick()
+	tr.write(refCgroup+"/cpu.stat", refCPUStat)
+	now = now.Add(time.Second)
+
+	s, ok := m.Final("vm")
+	if !ok || !s.Measured.CPU {
+		t.Fatalf("summary %v, cpu measured %v", ok, s.Measured.CPU)
+	}
+	var marks []bool
+	for _, p := range s.Points {
+		marks = append(marks, p.AfterGap)
+	}
+	if want := []bool{false, true, true}; !slices.Equal(marks, want) {
+		t.Errorf("marks = %v, want %v", marks, want)
 	}
 }

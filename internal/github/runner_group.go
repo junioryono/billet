@@ -222,37 +222,41 @@ func carries(body []byte, bearer string) bool {
 	if bytes.Contains(body, []byte(bearer)) {
 		return true
 	}
-	// A BODY THAT CANNOT BE SCANNED IS TREATED AS CARRYING IT: a typed decode
-	// after this ignores what it does not know, so failing open here would let
-	// an escaped bearer through in a field the scan never reached. Numbers are
-	// kept as text, so one too large for a float64 is not a failure.
+	// EVERY STRING TOKEN IS SCANNED AS THE DECODER MEETS IT, keys included, never
+	// a decoded value: decoding into a map keeps only the last of two equal keys,
+	// while a typed decode after this keeps what the first one set. A body that
+	// cannot be scanned to its end is treated as carrying the bearer, since the
+	// typed decode ignores what it does not know and failing open would let an
+	// escaped bearer through. Numbers stay text, so a huge one is not a failure.
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
-	var decoded any
-	if dec.Decode(&decoded) != nil {
-		return true
-	}
-
-	return holds(decoded, bearer)
-}
-
-// holds reports whether any string in a decoded JSON value, keys included,
-// contains s.
-func holds(v any, s string) bool {
-	switch v := v.(type) {
-	case string:
-		return strings.Contains(v, s)
-	case []any:
-		return slices.ContainsFunc(v, func(e any) bool { return holds(e, s) })
-	case map[string]any:
-		for k, e := range v {
-			if strings.Contains(k, s) || holds(e, s) {
+	depth, values := 0, 0
+	for {
+		tok, err := dec.Token()
+		// THE END IS THE END ONLY OUTSIDE EVERY VALUE, and only after one: the
+		// decoder answers io.EOF inside an object cut short as well.
+		if errors.Is(err, io.EOF) {
+			return depth != 0 || values == 0
+		}
+		if err != nil {
+			return true
+		}
+		switch tok := tok.(type) {
+		case json.Delim:
+			if tok == '{' || tok == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		case string:
+			if strings.Contains(tok, bearer) {
 				return true
 			}
 		}
+		if depth == 0 {
+			values++
+		}
 	}
-
-	return false
 }
 
 // bearerScrubbed is a transport error whose text named the bearer, rendered

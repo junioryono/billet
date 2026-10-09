@@ -361,6 +361,7 @@ func (m *Monitor) tick() {
 			}
 		}
 		j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
+		j.lateRead(firstRead(*s, before, j.target.Process))
 		j.keepPoint(unread(*s, before, j.target.Process), now, m.opts.Interval)
 	}
 
@@ -491,6 +492,29 @@ func (j *job) keepPoint(unreadNow bool, now time.Time, interval time.Duration) {
 	}
 }
 
+// firstRead reports whether a sample read a group of the series that the job
+// had never read (before), which every point kept so far holds as zero.
+func firstRead(s Sample, before seen, process bool) bool {
+	return !before.cpu && s.CPUOK || !before.memory && s.MemoryOK || !before.io && s.IOOK ||
+		!before.net && s.NetOK || !before.threads && s.ThreadsOK ||
+		process && !before.processEnergy && s.ProcessEnergyOK
+}
+
+// lateRead marks, when a group is read for the first time after the job's
+// first point, every interval up to now unseen: each point before held that
+// group's zero, so an earlier interval would show it doing nothing and the
+// interval that reads it first would be given everything it did before. The
+// first point ends no interval and keeps no mark.
+func (j *job) lateRead(first bool) {
+	if !first || len(j.points) == 0 {
+		return
+	}
+	for i := 1; i < len(j.points); i++ {
+		j.points[i].AfterGap = true
+	}
+	j.unseen = true
+}
+
 // unread reports whether a sample failed to read a group of the series that
 // the job had read before (before), which a point would then hold stale.
 func unread(s Sample, before seen, process bool) bool {
@@ -568,6 +592,8 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	}
 	before := j.seen
 	j.absorb(s, now)
+
+	j.lateRead(firstRead(s, before, j.target.Process))
 
 	return m.summaryOf(j, now, unread(s, before, j.target.Process)), true
 }
