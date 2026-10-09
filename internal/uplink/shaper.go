@@ -74,6 +74,14 @@ type state struct {
 
 func (s *Shaper) inspect(ctx context.Context) (state, error) {
 	out, err := s.run(ctx, "tc", "qdisc", "show", "dev", s.Iface)
+
+	// AN INTERFACE THAT IS GONE TOOK ITS QDISCS WITH IT, and is not a failure to
+	// inspect: only the IFB device can be left, and it is still found below.
+	// Measured on the reference node: tc answers `Cannot find device "NAME"`.
+	if err != nil && strings.Contains(out, "Cannot find device") {
+		out, err = "", nil
+	}
+
 	if err != nil {
 		return state{}, err
 	}

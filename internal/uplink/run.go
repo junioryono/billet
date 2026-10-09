@@ -144,8 +144,12 @@ func recordInterface(iface string) error {
 
 	next := StateFile + ".next"
 
+	// THE INDEX BESIDE THE NAME, so a cleanup still finds an interface that was
+	// renamed after it was shaped.
+	line := strings.TrimSpace(iface + " " + ifindex(iface))
+
 	//nolint:gosec // G306: an interface name for root's own cleanup, which any user may read
-	if err := os.WriteFile(next, []byte(iface+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(next, []byte(line+"\n"), 0o644); err != nil {
 		return fmt.Errorf("record the shaped interface: %w", err)
 	}
 
@@ -183,13 +187,31 @@ func Lock() (release func(), err error) {
 }
 
 // RecordedInterface is the interface the last shaper recorded, or empty.
+//
+// The name as it is now: one that no longer exists is looked up by the index
+// recorded beside it, and one found nowhere is returned as recorded, which is an
+// interface gone along with every qdisc it carried.
 func RecordedInterface() string {
 	body, err := os.ReadFile(StateFile)
 	if err != nil {
 		return ""
 	}
 
-	return strings.TrimSpace(string(body))
+	fields := strings.Fields(string(body))
+	if len(fields) == 0 {
+		return ""
+	}
+
+	name := fields[0]
+	if _, err := os.Stat(filepath.Join(sysNet, name)); err == nil || len(fields) < 2 {
+		return name
+	}
+
+	if renamed := nameForIndex(fields[1]); renamed != "" {
+		return renamed
+	}
+
+	return name
 }
 
 // Forget removes the record once its interface is clear, and only a record of

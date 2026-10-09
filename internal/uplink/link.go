@@ -124,3 +124,29 @@ func (c Counters) Since(before Counters) (sent, received uint64) {
 
 	return sent, received
 }
+
+// ifindex is the kernel's index for an interface, or empty when it cannot say.
+func ifindex(iface string) string {
+	body, err := os.ReadFile(filepath.Join(sysNet, iface, "ifindex"))
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(body))
+}
+
+// nameForIndex is the interface that now has this index, or empty.
+func nameForIndex(index string) string {
+	entries, err := os.ReadDir(sysNet)
+	if err != nil {
+		return ""
+	}
+
+	for _, entry := range entries {
+		if ifindex(entry.Name()) == index {
+			return entry.Name()
+		}
+	}
+
+	return ""
+}

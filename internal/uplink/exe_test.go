@@ -1,7 +1,9 @@
 package uplink
 
 import (
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -37,14 +39,7 @@ func TestAReplacedExecutableIsNoticedAndAMissingOneIsNot(t *testing.T) {
 		t.Fatal("a path with nothing at it read as replaced; that is a transaction mid-swap")
 	}
 
-	next := path + ".next"
-	if err := os.WriteFile(next, []byte("new"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.Rename(next, path); err != nil {
-		t.Fatal(err)
-	}
+	replaceAt(t, path)
 
 	if !exe.replaced() {
 		t.Fatal("a new file at the executable's path was not noticed")
@@ -55,19 +50,84 @@ func TestAReplacedExecutableIsNoticedAndAMissingOneIsNot(t *testing.T) {
 	}
 }
 
-// THE IDENTITY IS THE RUNNING FILE'S. A shaper started after its path already
-// holds a newer file, or none, must still know which file it runs; on Linux that
-// is /proc/self/exe, and the test binary is as good a running file as any.
-func TestTheRecordedIdentityIsTheRunningFile(t *testing.T) {
-	t.Parallel()
+// helperEnv names the path a copy of this test binary runs from, when the copy
+// is the helper below.
+const helperEnv = "BILLET_UPLINK_EXE_HELPER"
 
-	running, err := os.Stat("/proc/self/exe")
-	if err != nil {
+// THE IDENTITY IS THE RUNNING FILE'S, EVEN WITH ITS PATH GONE. A copy of this
+// test binary unlinks the path it runs from before it records its identity,
+// which is a shaper starting while an upgrade has the path empty, and then sees
+// a new file appear there. Reading the identity from the path records nothing in
+// that window and never notices the new file; /proc/self/exe still names the
+// running file. NOT PARALLEL: it writes an executable and runs it, and a fork
+// from a parallel test holding the write open makes that exec fail.
+func TestTheRecordedIdentityIsTheRunningFileWithItsPathGone(t *testing.T) {
+	if _, err := os.Stat("/proc/self/exe"); err != nil {
 		t.Skip("no /proc/self/exe on this platform")
 	}
 
+	self, err := os.Open("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer self.Close() //nolint:errcheck // a read-only handle
+
+	path := filepath.Join(t.TempDir(), "billet")
+
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.Copy(out, self); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), path, "-test.run=^TestExecutableHelper$")
+	cmd.Env = append(os.Environ(), helperEnv+"="+path)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the helper running from a path it unlinked: %v\n%s", err, output)
+	}
+}
+
+// TestExecutableHelper is the helper above, and does nothing in an ordinary run.
+func TestExecutableHelper(t *testing.T) {
+	path := os.Getenv(helperEnv)
+	if path == "" {
+		t.Skip("run only as the helper of TestTheRecordedIdentityIsTheRunningFileWithItsPathGone")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
 	exe := currentExecutable()
-	if exe.info == nil || !os.SameFile(exe.info, running) {
-		t.Fatalf("the recorded identity is not the running file's (path %q)", exe.path)
+	if exe.info == nil {
+		t.Fatal("with its path gone, the running file recorded no identity")
+	}
+
+	replaceAt(t, path)
+
+	if !exe.replaced() {
+		t.Fatal("a new file at the path of the running file was not noticed")
+	}
+}
+
+// replaceAt puts a new file at path, by rename as an upgrade does.
+func replaceAt(t *testing.T, path string) {
+	t.Helper()
+
+	next := path + ".next"
+	if err := os.WriteFile(next, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Rename(next, path); err != nil {
+		t.Fatal(err)
 	}
 }
