@@ -80,7 +80,7 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if err := (&uplink.Shaper{Iface: name}).Check(ctx); err != nil {
+	if err := (&uplink.Shaper{Iface: name, Owned: uplink.RecordedInterface() == name}).Check(ctx); err != nil {
 		return err
 	}
 
@@ -108,7 +108,10 @@ func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if err := (&uplink.Shaper{Iface: name}).Clear(ctx); err != nil {
+	// BILLET'S BY ITS RECORD, OR BY THE OPERATOR NAMING THE INTERFACE: without
+	// either the cleanup touches nothing, because nothing proves it is billet's.
+	owned := *iface != "" || uplink.RecordedInterface() == name
+	if err := (&uplink.Shaper{Iface: name, Owned: owned}).Clear(ctx); err != nil {
 		return fmt.Errorf("remove the shaping from %s: %w", name, err)
 	}
 

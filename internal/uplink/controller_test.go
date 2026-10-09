@@ -69,18 +69,80 @@ func TestADelayWhileTheHostCarriesATrickleCutsNothing(t *testing.T) {
 }
 
 // A SATURATED UPLOAD ON AN ASYMMETRIC LINE IS BLAMED, though the download beside
-// it is ten times larger: a 20 Mbit/s upload can fill a 500/20 line on its own.
+// it is far larger and the upload is under 20 Mbit/s: a 15 Mbit/s upload fills a
+// 500/15 line on its own, and can still be cut above the floor.
 func TestASaturatedUploadIsBlamedBesideALargerDownload(t *testing.T) {
 	t.Parallel()
 
 	c := newController()
 
 	for n := range 3 {
-		c.Step(moving(n, 25, 250, 30*time.Millisecond))
+		c.Step(moving(n, 15, 250, 30*time.Millisecond))
 	}
 
-	if c.Up.Rate >= 25 {
-		t.Fatalf("a 25 Mbit/s upload under a full queue was left at %.1f", c.Up.Rate)
+	if c.Up.Rate >= 15 || c.Up.Rate < Floor {
+		t.Fatalf("a 15 Mbit/s upload under a full queue was left at %.1f", c.Up.Rate)
+	}
+}
+
+// AN UNCHANGED QUEUE READ THROUGH THE BASELINES IS STILL UNCHANGED. Each
+// reflector's baseline creeps toward a round trip held above it, so somebody
+// else's queue holding the round trip at 47 ms reads a little lower every
+// sample; that drift is not a cut helping, and the cuts still stop after two.
+func TestBaselineDriftDoesNotReadAsACutHelping(t *testing.T) {
+	t.Parallel()
+
+	var d Delays
+
+	c := newController()
+	asked := []string{"r"}
+
+	d.Observe(asked, map[string]time.Duration{"r": 7 * time.Millisecond})
+
+	cuts := 0
+
+	for n := range 120 {
+		delay, known := d.Observe(asked, map[string]time.Duration{"r": 47 * time.Millisecond})
+		before := c.Down.Rate
+
+		o := moving(n, 0, 300, delay)
+		o.DelayKnown = known
+		c.Step(o)
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a queue that never moved drew %d cuts over a minute; want %d before they stop", cuts, c.Params.Futile)
+	}
+}
+
+// A QUEUE THAT DRAINED BEFORE THE COOLDOWN ENDED IS NOT CUT FOR. Three delayed
+// rounds after a cut and then three clear ones leave the window full when the
+// cooldown expires, but the queue is gone.
+func TestAQueueThatDrainedIsNotCutForWhenTheCooldownEnds(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+
+	for n := range 3 {
+		c.Step(moving(n, 0, 300, 30*time.Millisecond))
+	}
+
+	cut := c.Down.Rate
+
+	for n := 3; n < 6; n++ {
+		c.Step(moving(n, 0, 250, 30*time.Millisecond))
+	}
+
+	for n := 6; n < 12; n++ {
+		c.Step(moving(n, 0, 250, 0))
+	}
+
+	if c.Down.Rate < cut {
+		t.Fatalf("the download was cut again, to %.1f from %.1f, with the queue already drained", c.Down.Rate, cut)
 	}
 }
 
@@ -172,8 +234,9 @@ func TestCutsThatHelpReachTheFloorAndNoFurther(t *testing.T) {
 
 	c := newController()
 
+	// The delay falls by a third or more between cuts, every cut helping.
 	for n := range 60 {
-		c.Step(moving(n, 0, 25, 2*time.Second-time.Duration(n)*10*time.Millisecond))
+		c.Step(moving(n, 0, 25, 2*time.Second*6/time.Duration(6+n)))
 	}
 
 	if c.Down.Rate != Floor {

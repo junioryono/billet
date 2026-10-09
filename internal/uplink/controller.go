@@ -45,8 +45,9 @@ type Params struct {
 	// MinBlame is the least a direction must be moving, in Mbit/s, to be blamed
 	// at all. A host carrying a trickle beside somebody else's stream is its own
 	// recent peak, and without a floor on the blame it would be cut for a queue
-	// it did not fill; nothing is cut below Floor anyway, so a direction moving
-	// less than twice that could gain nothing from a cut.
+	// it did not fill; nothing is cut below Floor, so a direction moving less
+	// than that could gain nothing from a cut, while one just above it, a
+	// saturated upload on a slow line, still can.
 	MinBlame float64
 	// Futile is how many cuts in a row may leave the delay no lower before a
 	// direction stops being cut until the queue clears: a cut that does not
@@ -79,7 +80,7 @@ func DefaultParams() Params {
 		GentleCut:  0.99,
 		DeepCut:    0.75,
 		Busy:       0.5,
-		MinBlame:   2 * Floor,
+		MinBlame:   Floor,
 		Futile:     2,
 		Cooldown:   3 * time.Second,
 		Full:       0.75,
@@ -91,6 +92,10 @@ func DefaultParams() Params {
 // Floor is the lowest rate either direction is ever cut to, in Mbit/s, so a
 // misread delay can slow the host but never cut it off.
 const Floor = 10.0
+
+// improvement is the least a cut must shorten the queue by to count as having
+// helped, when a tenth of the delay is less.
+const improvement = 2 * time.Millisecond
 
 // Direction is one direction's shaper.
 type Direction struct {
@@ -211,14 +216,22 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 			return false, false
 		}
 
+		// CUT ONLY ON A QUEUE THAT IS THERE NOW: a window full of delays the queue
+		// has since drained says nothing about the next second.
+		if !(o.DelayKnown && o.Delay > p.Bloat) {
+			return false, false
+		}
+
 		if d.cutSince && o.At.Sub(d.lastCut) < p.Cooldown {
 			return false, false
 		}
 
 		// A CUT THAT DID NOT SHORTEN THE QUEUE IS NOT REPEATED FOREVER: the queue
 		// is somebody else's, and cutting on would only take this host to the
-		// floor.
-		if d.cutSince && o.Delay >= d.cutDelay {
+		// floor. Shorter means by a margin, because each reflector's baseline
+		// creeps toward a round trip held above it, so an unchanged queue reads a
+		// little lower every sample.
+		if d.cutSince && o.Delay > d.cutDelay-max(improvement, d.cutDelay/10) {
 			d.futile++
 		} else {
 			d.futile = 0

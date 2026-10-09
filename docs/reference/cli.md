@@ -274,7 +274,7 @@ Keep this host's own traffic, its guests' included, from filling the queue of th
 
 ### `billet uplink check [--interface NAME]`
 
-Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's (a root qdisc other than the kernel's default or CAKE, or an ingress qdisc without billet's `ifb-` device). The shaper refuses such an interface rather than replace it. The host role enables `billet-uplink.service` only where this passes.
+Say whether this host can be shaped, changing nothing but loading the `sch_cake` and `ifb` modules: the kernel has CAKE and IFB, and the interface carries no traffic policy of somebody else's. Only qdiscs the kernel assigned (handle `0:`) may be replaced; CAKE, an ingress qdisc and an `ifb-` device count as billet's only when the record a run of the shaper keeps under `/run/billet-uplink/` names the interface, and a `clsact` qdisc never does. The shaper refuses anything else rather than replace it. The host role enables `billet-uplink.service` only where this passes.
 
 ### `billet uplink clear [--interface NAME]`
 

@@ -66,7 +66,15 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	ctl := &Controller{Params: opts.Params, Up: NewDirection(speed), Down: NewDirection(speed)}
-	shaper := &Shaper{Iface: iface}
+
+	// WHAT AN EARLIER RUN LEFT IS BILLET'S ONLY IF ITS RECORD SAYS SO, and this
+	// run's record is written only once the interface is known to carry nothing
+	// of anybody else's: a record written first would make an operator's CAKE
+	// look like billet's to the cleanup after a refusal.
+	shaper := &Shaper{Iface: iface, Owned: RecordedInterface() == iface}
+	if err := shaper.Check(ctx); err != nil {
+		return fmt.Errorf("shape %s: %w", iface, err)
+	}
 
 	// RECORDED BEFORE ANYTHING IS INSTALLED, so the cleanup after a crash clears
 	// this interface even if the default route has moved since.

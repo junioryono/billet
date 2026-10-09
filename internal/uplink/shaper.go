@@ -13,20 +13,21 @@ import (
 // Shaper drives CAKE on an interface through tc: egress on the interface's
 // root, ingress on an IFB device its ingress is redirected to.
 //
-// IT TOUCHES ONLY WHAT IT CAN CALL ITS OWN: a root qdisc that is the kernel's
-// default or CAKE, and an ingress qdisc only beside the IFB device it names.
-// Anything else on the interface is an operator's traffic policy, and the
-// shaper refuses rather than replace it.
+// IT TOUCHES ONLY WHAT IT CAN CALL ITS OWN. A qdisc the kernel assigned has
+// handle 0:, root and children alike, and may be replaced; CAKE, an ingress
+// qdisc and the ifb- device are billet's only when Owned says a run of the
+// shaper recorded this interface (the record under /run/billet-uplink/, which a
+// reboot empties along with them). Anything else is an operator's traffic
+// policy, and the shaper refuses rather than replace it.
 type Shaper struct {
 	Iface string
+	// Owned is whether billet's record names this interface, so the CAKE, the
+	// ingress qdisc and the device on it are billet's to replace and remove.
+	Owned bool
 	// Run runs one command and returns its combined output; nil runs it. A test
 	// records instead.
 	Run func(ctx context.Context, argv ...string) (string, error)
 }
-
-// defaultRoots are the root qdiscs a Linux interface has when nobody chose
-// one, which the shaper may replace.
-var defaultRoots = []string{"mq", "pfifo_fast", "fq_codel", "fq", "noqueue", "pfifo"}
 
 // tools are the only executables the shaper runs.
 var tools = []string{"tc", "ip", "modprobe"}
@@ -62,9 +63,13 @@ func (s *Shaper) run(ctx context.Context, argv ...string) (string, error) {
 
 // state is what is on the interface now.
 type state struct {
-	root    string
-	ingress bool
-	ifb     bool
+	// root is the root qdisc's kind, and kernel whether every egress qdisc on
+	// the interface is one the kernel assigned (handle 0:).
+	root   string
+	kernel bool
+	// ingress is an ingress qdisc, clsact one of the kind that also carries
+	// ingress filters, and ifb whether the shaper's device exists.
+	ingress, clsact, ifb bool
 }
 
 func (s *Shaper) inspect(ctx context.Context) (state, error) {
@@ -73,7 +78,7 @@ func (s *Shaper) inspect(ctx context.Context) (state, error) {
 		return state{}, err
 	}
 
-	var st state
+	st := state{kernel: true}
 
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
@@ -81,11 +86,23 @@ func (s *Shaper) inspect(ctx context.Context) (state, error) {
 			continue
 		}
 
-		switch {
-		case slices.Contains(fields, "root"):
-			st.root = fields[1]
-		case fields[1] == "ingress":
+		switch fields[1] {
+		case "ingress":
 			st.ingress = true
+
+			continue
+		case "clsact":
+			st.clsact = true
+
+			continue
+		}
+
+		if fields[2] != "0:" {
+			st.kernel = false
+		}
+
+		if slices.Contains(fields, "root") {
+			st.root = fields[1]
 		}
 	}
 
@@ -98,16 +115,24 @@ func (s *Shaper) inspect(ctx context.Context) (state, error) {
 	return st, nil
 }
 
-// owned refuses an interface carrying traffic policy the shaper did not make.
-func (st state) owned(iface, ifb string) error {
-	if st.root != "" && st.root != "cake" && !slices.Contains(defaultRoots, st.root) {
-		return fmt.Errorf("%s's root qdisc is %s, which billet did not install; not shaping over an "+
-			"operator's traffic policy", iface, st.root)
+// foreign refuses an interface carrying traffic policy the shaper did not make.
+func (s *Shaper) foreign(st state) error {
+	refuse := func(what string) error {
+		return fmt.Errorf("%s carries %s, which billet did not install; not shaping over an operator's "+
+			"traffic policy", s.Iface, what)
 	}
 
-	if st.ingress && !st.ifb {
-		return fmt.Errorf("%s has an ingress qdisc and no %s device, so it is not billet's; not shaping "+
-			"over an operator's traffic policy", iface, ifb)
+	switch {
+	case st.clsact:
+		return refuse("a clsact qdisc")
+	case st.root == "cake" && !s.Owned:
+		return refuse("CAKE")
+	case st.root != "cake" && !st.kernel:
+		return refuse("a " + st.root + " root qdisc somebody configured")
+	case st.ingress && !(s.Owned && st.ifb):
+		return refuse("an ingress qdisc")
+	case st.ifb && !s.Owned:
+		return refuse("a device named " + s.IFB())
 	}
 
 	return nil
@@ -128,7 +153,7 @@ func (s *Shaper) Check(ctx context.Context) error {
 		return err
 	}
 
-	return st.owned(s.Iface, s.IFB())
+	return s.foreign(st)
 }
 
 // Install sets both directions up, after Check and after clearing what a
@@ -142,6 +167,10 @@ func (s *Shaper) Install(ctx context.Context, upMbit, downMbit float64) error {
 	if err := s.Clear(ctx); err != nil {
 		return err
 	}
+
+	// FROM HERE WHAT IS ON THE INTERFACE IS BILLET'S, so a failure below clears
+	// what this install made.
+	s.Owned = true
 
 	for _, argv := range [][]string{
 		append([]string{"tc", "qdisc", "replace", "dev", s.Iface, "root"}, cake(upMbit, "dual-srchost")...),
@@ -178,8 +207,12 @@ func (s *Shaper) Set(ctx context.Context, upMbit, downMbit float64) error {
 
 // Clear removes what the shaper installed and nothing else, and reports every
 // removal that failed: an answer of success is a promise the interface carries
-// no shaping of billet's.
+// no shaping of billet's. Without the record it removes nothing.
 func (s *Shaper) Clear(ctx context.Context) error {
+	if !s.Owned {
+		return nil
+	}
+
 	st, err := s.inspect(ctx)
 	if err != nil {
 		return err
@@ -187,9 +220,14 @@ func (s *Shaper) Clear(ctx context.Context) error {
 
 	var errs []error
 
-	if st.ingress && st.ifb {
+	// THE REDIRECT GOES FIRST, AND THE DEVICE ONLY ONCE IT HAS GONE: a redirect
+	// left pointing at no device drops everything the interface receives, and a
+	// retry still finds the redirect because the device is still there.
+	redirected := st.ingress
+	if st.ingress {
 		_, err := s.run(ctx, "tc", "qdisc", "del", "dev", s.Iface, "handle", "ffff:", "ingress")
 		errs = append(errs, err)
+		redirected = err != nil
 	}
 
 	if st.root == "cake" {
@@ -197,7 +235,7 @@ func (s *Shaper) Clear(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 
-	if st.ifb {
+	if st.ifb && !redirected {
 		_, err := s.run(ctx, "ip", "link", "del", s.IFB())
 		errs = append(errs, err)
 	}
