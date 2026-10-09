@@ -15,7 +15,7 @@ Outputs are the non-secret facts your `billet.yaml` needs: `control_plane_privat
 
 ```hcl
 module "billet" {
-  source = "github.com/junioryono/billet//terraform/modules/billet?ref=v0.12.44"
+  source = "github.com/junioryono/billet//terraform/modules/billet?ref=v0.12.45"
   # see the module README for inputs
 }
 ```
