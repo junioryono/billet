@@ -3,6 +3,7 @@ package nodeplane
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +39,12 @@ func BenchmarkPlaneDispatch(b *testing.B) {
 			p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
 				WithRegistrar(a), WithTierCatalog([]config.Tier{tier}))
 
+			// JOINED BEFORE THE LEDGER CLOSES: the benchmark's context ends just
+			// before its cleanups run, which wakes every host's long poll.
+			var answering sync.WaitGroup
+
+			b.Cleanup(answering.Wait)
+
 			for i := range hosts {
 				name := fmt.Sprintf("n%d", i)
 				incarnation := name + "-1"
@@ -49,7 +56,7 @@ func BenchmarkPlaneDispatch(b *testing.B) {
 					b.Fatalf("register %s: %v", name, err)
 				}
 
-				go answerEvery(b, p, name, incarnation)
+				answering.Go(func() { answerEvery(b, p, name, incarnation) })
 			}
 
 			runner := p.NewRunner()
