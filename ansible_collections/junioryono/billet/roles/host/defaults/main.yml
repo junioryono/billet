@@ -245,6 +245,12 @@ billet_networks:
     netmask: 255.255.255.0
     dhcp_start: 172.31.1.10
     dhcp_end: 172.31.1.250
+# KEEPING THIS HOST'S TRAFFIC FROM FILLING ITS SITE'S INTERNET LINE. The shaper
+# (billet uplink shape) starts each direction at the interface's own speed and
+# cuts one only when its own traffic raises the latency to public reflectors, so
+# a host on a line it does not fill is never slowed, and nothing about the line
+# is configured. false stops it and removes its unit.
+billet_uplink_shaping: true
 billet_guest_dns_servers:
   - 1.1.1.1
   - 1.0.0.1
