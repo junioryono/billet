@@ -83,32 +83,27 @@ func encodeWithin(points []Point, limit int, enc func([]Point) ([]byte, error)) 
 	}
 }
 
-// downsample keeps every stride-th point and the last. A point dropped with
-// its AfterGap mark passes the mark to the point kept after it, whose interval
-// now holds the one the sampler did not see.
+// downsample keeps every stride-th point of the settled series and its last.
+// A point dropped with its AfterGap mark passes the mark to the point kept
+// after it, whose interval now holds the one the sampler did not see.
 //
-// SO DOES A FALL, which dropping the points around it would hide: a counter
-// that fell between two points is marked on the point kept at or after the
-// fall, and when the fall lands on a kept point, on the next kept point too,
-// since the catch-up after it now lies in that point's interval.
+// SETTLED FIRST, so a counter fall, a fall between two samples at one offset
+// included, is already a mark on the point it fell into and on the one after
+// (settle), and dropping the points around it cannot hide it.
 func downsample(points []Point, stride int) []Point {
 	if stride == 1 {
 		return points
 	}
+	points = settle(points)
 	var out []Point
-	gap, carry := false, false
+	gap := false
 	for i, p := range points {
-		kept := i%stride == 0 || i == len(points)-1
 		gap = gap || p.AfterGap
-		if i > 0 && falls(points[i-1], p) {
-			gap = true
-			carry = carry || kept
-		}
-		if !kept {
+		if i%stride != 0 && i != len(points)-1 {
 			continue
 		}
 		p.AfterGap = gap
-		gap, carry = carry, false
+		gap = false
 		out = append(out, p)
 	}
 

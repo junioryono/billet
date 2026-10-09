@@ -406,21 +406,26 @@ func TestASuccessfulTokenExchangeCarriesNoJWT(t *testing.T) {
 }
 
 // A REDIRECT THAT NAMES THE TOKEN IN A LOCATION THE CLIENT CANNOT FOLLOW
-// DOES NOT PUT IT IN THE ERROR, which is still the client's transport error.
+// DOES NOT PUT IT IN THE ERROR in any encoding: the transport error's text is
+// not shown at all, and the error is still the client's transport error.
 func TestARedirectNamingTheTokenIsRedacted(t *testing.T) {
 	t.Parallel()
 
-	c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		w.Header().Set("Location", "http://example.invalid:"+token+"/")
-		w.WriteHeader(http.StatusFound)
-	})
-	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
-	if err == nil || strings.Contains(err.Error(), "installation-secret") || !strings.Contains(err.Error(), "[redacted]") {
-		t.Errorf("a redirect naming the token = %v, want it redacted", err)
-	}
-	if transport, ok := errors.AsType[*url.Error](err); !ok || transport == nil || !Undecided(err) {
-		t.Errorf("the redacted error lost its class: %T %v", err, err)
+	for name, location := range map[string]func(token string) string{
+		"verbatim":        func(token string) string { return "http://example.invalid:" + token + "/" },
+		"percent-encoded": func(token string) string { return "/%" + fmt.Sprintf("%x", token[0]) + token[1:] + "%zz" },
+	} {
+		c, _ := jobsServer(t, func(w http.ResponseWriter, r *http.Request, _ int) {
+			w.Header().Set("Location", location(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")))
+			w.WriteHeader(http.StatusFound)
+		})
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		if err == nil || strings.Contains(err.Error(), "nstallation-secret") || !strings.Contains(err.Error(), "is not shown") {
+			t.Errorf("%s: a redirect naming the token = %v, want its text not shown", name, err)
+		}
+		if transport, ok := errors.AsType[*url.Error](err); !ok || transport == nil || !Undecided(err) {
+			t.Errorf("%s: the redacted error lost its class: %T %v", name, err, err)
+		}
 	}
 }
 
@@ -444,7 +449,7 @@ func TestABrokenBodyNamingTheTokenIsRedacted(t *testing.T) {
 		}
 	})
 	_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
-	if err == nil || strings.Contains(err.Error(), "installation-secret") || !strings.Contains(err.Error(), "[redacted]") {
+	if err == nil || strings.Contains(err.Error(), "installation-secret") || !strings.Contains(err.Error(), "is not shown") {
 		t.Errorf("a trailer naming the token = %v, want it redacted", err)
 	}
 	if !errors.Is(err, errNoAnswer) {

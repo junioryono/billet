@@ -235,8 +235,11 @@ func (m *Monitor) Start(key string, target Target, vcpus int) {
 
 func (m *Monitor) start(key string, j *job) {
 	m.sweepCounters()
-	now := m.opts.Now()
+	// THE BASELINE HOLDS THE TIME ITS READ ENDED, as every point does, and a
+	// read that took a whole interval leaves the first interval unseen.
+	began := m.opts.Now()
 	s, vcpus := m.reader.readListing(j.target)
+	now := m.opts.Now()
 	var counters *Counters
 	if m.opts.Counters != nil && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" && !j.target.Process {
 		c := &jobCounters{}
@@ -255,6 +258,7 @@ func (m *Monitor) start(key string, j *job) {
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
 	j.points = append(j.points, j.point(now))
+	j.unseen = now.Sub(began) >= m.opts.Interval
 }
 
 // Forget stops measuring a job without reporting it.
@@ -615,8 +619,11 @@ func (m *Monitor) Final(key string) (Summary, bool) {
 	}
 
 	// THE FINAL POINT IS UNSEEN: the sampler did not answer, so it holds the
-	// last values read, at a time they were not read.
-	return m.summaryOf(j, m.opts.Now(), true), true
+	// last values read, at a time they were not read. Kept on the job, so a
+	// Final asked again after a failed destroy still says so.
+	j.unseen = true
+
+	return m.summaryOf(j, m.opts.Now()), true
 }
 
 func (m *Monitor) final(key string) (Summary, bool) {
@@ -627,8 +634,9 @@ func (m *Monitor) final(key string) (Summary, bool) {
 		return Summary{}, false
 	}
 
-	now := m.opts.Now()
+	began := m.opts.Now()
 	s, vcpus := m.reader.readListing(j.target)
+	now := m.opts.Now()
 	// THE GROUPS CLOSE AT FINAL, which precedes the destroy: what they counted
 	// is kept, and a Final asked again answers the same totals.
 	var counters *Counters
@@ -649,21 +657,27 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if counting {
 		j.counters = counters
 	}
-
 	j.lateRead(firstRead(s, before, j.target.Process))
+	// WHAT THIS READ COULD NOT SEE IS KEPT ON THE JOB, not only in the summary:
+	// a destroy that fails discards the summary, and the Final its retry asks
+	// for must still mark the interval. A read that failed, one that took a
+	// whole interval, and one that saw a counter fall all leave it unseen.
+	if unread(s, before, j.target.Process) || now.Sub(began) >= m.opts.Interval ||
+		len(j.points) > 0 && falls(j.points[len(j.points)-1], j.point(now)) {
+		j.unseen = true
+	}
 
-	return m.summaryOf(j, now, unread(s, before, j.target.Process)), true
+	return m.summaryOf(j, now), true
 }
 
-// summaryOf summarises a job at now, unseen saying the values it holds were
-// not all read at now. Called with mu held. It keeps no point, so a Final that
-// is asked again summarises the same series.
-func (m *Monitor) summaryOf(j *job, now time.Time, unseen bool) Summary {
+// summaryOf summarises a job at now. Called with mu held. It keeps no point,
+// so a Final that is asked again summarises the same series.
+func (m *Monitor) summaryOf(j *job, now time.Time) Summary {
 	// THE FINAL INTERVAL'S PACKAGE ENERGY IS NEVER ATTRIBUTED: the final read
 	// takes no package reading, so the last point repeats the last tick's
 	// energy. With energy shared from the package, that interval is unseen
 	// rather than shown using none.
-	unseen = unseen || m.opts.RAPL && !j.target.Process
+	unseen := m.opts.RAPL && !j.target.Process
 	points := append(append([]Point(nil), j.points...), j.nextPoint(now, unseen, m.opts.Interval))
 	sum := Summary{
 		First: j.first, Samples: j.samples, Interval: m.opts.Interval, Window: now.Sub(j.first),

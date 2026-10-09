@@ -470,3 +470,122 @@ func TestASeriesFarFromTheWindowCoversNoneOfIt(t *testing.T) {
 		}
 	}
 }
+
+// HALVING KEEPS A FALL BETWEEN TWO SAMPLES AT ONE OFFSET: the interval into
+// it and the catch-up after it stay uncovered once the point that fell is
+// dropped.
+func TestHalvingKeepsAFallInsideOneOffset(t *testing.T) {
+	t.Parallel()
+
+	points := []Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 100}, {OffsetMillis: 2000, CPUUsage: 200},
+		{OffsetMillis: 2000, CPUUsage: 0}, {OffsetMillis: 3000, CPUUsage: 300}}
+	whole := Timeline{First: first, Points: points}
+	cut := Timeline{First: first, Points: downsample(points, 2)}
+	for name, tl := range map[string]Timeline{"whole": whole, "halved": cut} {
+		if w := tl.Window(at(1000), at(3000)); w.Covered != 0 {
+			t.Errorf("%s: the fall and its catch-up covered %s with %dµs", name, w.Covered, w.CPUMicros)
+		}
+	}
+}
+
+// queueClock answers each call with the next queued time, and the last one
+// once the queue is empty.
+type queueClock struct {
+	mu    sync.Mutex
+	now   time.Time
+	queue []time.Time
+}
+
+func (c *queueClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.queue) > 0 {
+		c.now, c.queue = c.queue[0], c.queue[1:]
+	}
+
+	return c.now
+}
+
+// then queues times this far after the clock's current one.
+func (c *queueClock) then(after ...time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, d := range after {
+		c.queue = append(c.queue, c.now.Add(d))
+	}
+}
+
+// lastMark is whether the final point of a summary is marked unseen.
+func lastMark(t *testing.T, m *Monitor) bool {
+	t.Helper()
+
+	s, ok := m.Final("vm")
+	if !ok || len(s.Points) == 0 {
+		t.Fatalf("summary %v with %d points", ok, len(s.Points))
+	}
+
+	return s.Points[len(s.Points)-1].AfterGap
+}
+
+// THE START AND THE FINAL READ ARE DATED BY THEIR END, and one that takes a
+// whole interval leaves its interval unseen.
+func TestALifecycleReadThatStallsIsUnseen(t *testing.T) {
+	tr, target := referenceVM(t)
+	clock := &queueClock{now: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: clock.Now})
+	// Start's placeholder, then the baseline read beginning and ending 2s later.
+	clock.then(0, 0, 2*time.Second)
+	m.Start("vm", target, 8)
+	clock.then(time.Second, time.Second, time.Second)
+	m.Tick()
+	s, ok := m.Final("vm")
+	if !ok || !s.First.Equal(time.Date(2026, 10, 9, 12, 0, 2, 0, time.UTC)) || !s.Points[1].AfterGap {
+		t.Errorf("a stalled baseline: first %s, marks %v; want the read's end and the first interval unseen",
+			s.First, s.Points)
+	}
+
+	tr2, target2 := referenceVM(t)
+	clock2 := &queueClock{now: time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)}
+	m2 := runMonitor(t, tr2.root, Options{Interval: time.Second, Now: clock2.Now})
+	m2.Start("vm", target2, 8)
+	clock2.then(time.Second, time.Second, time.Second)
+	m2.Tick()
+	// The read takes 1.2s, ending 1.7s after the last point: within the gap
+	// rule, so only the stall can mark it.
+	clock2.then(500*time.Millisecond, 1700*time.Millisecond)
+	if !lastMark(t, m2) {
+		t.Error("a final read that stalled for two intervals was not marked")
+	}
+	if !lastMark(t, m2) {
+		t.Error("the stalled final read was forgotten by the Final a failed destroy's retry asks for")
+	}
+}
+
+// A FINAL READ THAT FAILED OR SAW A COUNTER FALL IS REMEMBERED: the Final a
+// failed destroy's retry asks for still marks the interval, though that read
+// succeeds.
+func TestAFinalReadsEvidenceOutlivesItsSummary(t *testing.T) {
+	for name, spoil := range map[string]func(tree){
+		"a failed read": func(tr tree) { tr.remove(refCgroup + "/cpu.stat") },
+		"a counter fall": func(tr tree) {
+			tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 1", 1))
+		},
+	} {
+		tr, target := referenceVM(t)
+		now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+		m := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return now }})
+		m.Start("vm", target, 8)
+		now = now.Add(time.Second)
+		m.Tick()
+		spoil(tr)
+		now = now.Add(time.Second)
+		if !lastMark(t, m) {
+			t.Errorf("%s: the final interval was not marked", name)
+		}
+		tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 99999999", 1))
+		now = now.Add(time.Second)
+		if !lastMark(t, m) {
+			t.Errorf("%s: a retry's Final forgot the interval the first one could not see", name)
+		}
+	}
+}

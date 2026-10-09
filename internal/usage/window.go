@@ -77,7 +77,7 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 			out.MemoryPeak = max(out.MemoryPeak, p.MemoryCurrent)
 		}
 	}
-	points, fell := distinct(tl.Points)
+	points := settle(tl.Points)
 	var covered time.Duration
 	var sums [6]int64
 	for i := 1; i < len(points); i++ {
@@ -88,7 +88,7 @@ func (tl Timeline) Window(from, to time.Time) WindowUsage {
 		// plausible overlap. Both ends lie within the interval once it is
 		// non-empty, so the difference cannot overflow.
 		lo, hi := max(a, p.offset()), min(b, next.offset())
-		if hi <= lo || next.AfterGap || fell[i] || fell[i-1] {
+		if hi <= lo || next.AfterGap {
 			continue
 		}
 		overlap := hi - lo
@@ -152,29 +152,34 @@ func shareOf(delta, part, whole int64) int64 {
 	return int64(q)
 }
 
-// distinct is the points with each run sharing one offset collapsed to its
-// last, marked AfterGap if any of the run was, and for each the fall
-// evidence of the interval that ends at it: whether a counter fell between any
-// two consecutive samples from the one before that interval to the end of the
-// run. Two samples a sampler took within one millisecond have no interval
-// between them to split, so what the later one adds belongs to the interval
-// before it, and so does a fall between them, which collapsing would hide.
-func distinct(points []Point) ([]Point, []bool) {
+// settle is the points with each run sharing one offset collapsed to its
+// last, and every counter fall turned into marks: a point some counter fell
+// into (from the sample before it, collapsed or not) is marked AfterGap, and
+// so is the point after it, whose interval holds the catch-up. Two samples
+// taken within one millisecond have no interval between them to split, so
+// what the later one adds belongs to the interval before it, and so does a
+// fall between them, which collapsing alone would hide.
+//
+// EVERY READER OF A SERIES SETTLES IT FIRST, the window and the halving alike,
+// so a fall is evidence no later step can drop.
+func settle(points []Point) []Point {
 	out := make([]Point, 0, len(points))
-	fell := make([]bool, 0, len(points))
+	fell := false
 	for i, p := range points {
 		dropped := i > 0 && falls(points[i-1], p)
 		if n := len(out); n > 0 && out[n-1].OffsetMillis == p.OffsetMillis {
-			p.AfterGap = p.AfterGap || out[n-1].AfterGap
+			p.AfterGap = p.AfterGap || out[n-1].AfterGap || dropped
 			out[n-1] = p
-			fell[n-1] = fell[n-1] || dropped
+			fell = fell || dropped
 			continue
 		}
+		// THE CATCH-UP: the interval after a point a counter fell into.
+		p.AfterGap = p.AfterGap || dropped || fell
+		fell = dropped
 		out = append(out, p)
-		fell = append(fell, dropped)
 	}
 
-	return out, fell
+	return out
 }
 
 // ErrNoClock says a stored series records no wall time for its first sample,

@@ -273,15 +273,59 @@ type bearerScrubbed struct {
 func (e *bearerScrubbed) Error() string { return e.text }
 func (e *bearerScrubbed) Unwrap() error { return e.err }
 
-// withoutBearerText is err with the bearer replaced in its text: a redirect's
-// Location the client could not follow is quoted in the client's error, and a
-// server that put the bearer there would otherwise put it in the output.
-func withoutBearerText(err error, bearer string) error {
-	if bearer == "" || !strings.Contains(err.Error(), bearer) {
-		return err //nolint:wrapcheck // callers wrap with the operation name; *url.Error is what Undecided reads.
+// withoutBearerText is a transport or body-read error described by its class
+// rather than its text, because its text can carry what the server sent: a
+// redirect's Location the client could not follow, a trailer it could not
+// parse, a host name a redirect chose, a certificate's names. A server can
+// put the bearer there in any encoding, so no replacement of the bearer is
+// enough; the text is not shown at all. What is shown is the class, from
+// billet's own words and the error's Go type, and the error unwraps to the
+// original, so Undecided and errors.Is still read it.
+func withoutBearerText(err error, _ string) error {
+	return &bearerScrubbed{err: err, text: "the request failed: " + transportClass(err)}
+}
+
+// fixedTransportTexts are net/http's own words for the bounds it enforces,
+// which no server chooses any part of, and which say which bound ended a
+// request.
+var fixedTransportTexts = []string{
+	"net/http: timeout awaiting response headers",
+	"net/http: TLS handshake timeout",
+	"net/http: request canceled",
+	"net/http: request canceled while waiting for connection",
+}
+
+// transportClass names what kind of failure err is, in words no server chose.
+func transportClass(err error) string {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if slices.Contains(fixedTransportTexts, e.Error()) {
+			return e.Error()
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context deadline exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context canceled"
+	}
+	if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+		return "timed out"
+	}
+	if dns, ok := errors.AsType[*net.DNSError](err); ok && dns != nil {
+		return "a host name did not resolve"
+	}
+	if op, ok := errors.AsType[*net.OpError](err); ok {
+		return "the connection failed (" + op.Op + ")"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return "the answer broke off"
+	}
+	inner := err
+	if u, ok := errors.AsType[*url.Error](err); ok && u.Err != nil {
+		inner = u.Err
 	}
 
-	return &bearerScrubbed{err: err, text: strings.ReplaceAll(err.Error(), bearer, "[redacted]")}
+	return fmt.Sprintf("%T, whose detail is not shown because it can carry the server's text", inner)
 }
 
 // apiErrorWithout is apiError for a request that carried bearer, keeping of
