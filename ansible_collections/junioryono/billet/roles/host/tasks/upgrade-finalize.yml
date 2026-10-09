@@ -301,6 +301,26 @@
     label: "{{ item.1.item.name }}"
   when: not (item.1.skipped | default(false))
 
+# THE UPLINK SHAPER COMES BACK WITH THE SERVICES, on whichever release the
+# transaction left: the transaction and its rollback stopped it so its cleanup
+# could run while the executable was there, and a rollback or a recovery ends
+# this converge before uplink.yml would start it. Started only where it was
+# enabled, because the role enables it only where it can shape.
+- name: Ask whether the uplink shaper is enabled here
+  ansible.builtin.command:
+    argv: [systemctl, is-enabled, --quiet, billet-uplink.service]
+  register: billet_uplink_enabled_after_upgrade
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Start the uplink shaper again after the transaction
+  ansible.builtin.systemd_service:
+    name: billet-uplink.service
+    state: started
+  when: billet_uplink_enabled_after_upgrade.rc == 0
+  become: true
+
 # THE CLOSE, BY SHAPE. Under the guard the transaction's pointer is removed
 # ALONE and the guard stays held (the converge releases nothing; the operator
 # releases with the holder they exported), and the shape goes back to `guard`

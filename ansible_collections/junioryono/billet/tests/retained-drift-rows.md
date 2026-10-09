@@ -23,8 +23,11 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/upgrade-finalize.yml / Inspect committed service stability after the restart interval | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-finalize.yml / Close the durable host-upgrade transaction after stable service startup | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-finalize.yml / Durably close the host-upgrade transaction | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
+| tasks/upgrade-finalize.yml / Ask whether the uplink shaper is enabled here | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
+| tasks/upgrade-finalize.yml / Start the uplink shaper again after the transaction | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Stop compute before recovering the authoritative ledger | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Stop the control plane before recovering its authoritative ledger | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
+| tasks/upgrade-rollback.yml / Stop the uplink shaper before recovering the ledger | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Hide the installed executable while recovery owns the ledger | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Fence the ledger throughout recovery | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/upgrade-rollback.yml / Wait for every billet process started before executable removal to finish | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
@@ -173,6 +176,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/services.yml / Durably publish the active host-upgrade pointer before live mutation | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Read back the transaction pointer before live mutation | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Gracefully stop the billet node before changing its guest contract | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
+| tasks/services.yml / Stop the uplink shaper for the transaction | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Pull, boot-verify, and promote every compatible guest needed | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Gracefully stop the billet server after compute has drained | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Hide the old executable before establishing the maintenance fence | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
