@@ -73,16 +73,28 @@ func (e expectation) validate() error {
 	if e.RunID <= 0 || e.RunAttempt <= 0 {
 		return fmt.Errorf("run %d attempt %d is not a workflow run", e.RunID, e.RunAttempt)
 	}
-	if e.Seconds < 0 {
-		return fmt.Errorf("seconds %d is negative", e.Seconds)
+	// THE TIMED LOADS RAN FOR SOME TIME: the idle tolerance grows with it, and
+	// a zero would make a sleep of any length expected to cost nothing extra.
+	switch timed := e.Kind == kindIdle || e.Kind == kindCPU || e.Kind == kindMemory; {
+	case timed && (e.Seconds <= 0 || e.Seconds > 21600):
+		return fmt.Errorf("a %s job ran %d seconds, which no job does", e.Kind, e.Seconds)
+	case !timed && e.Seconds != 0:
+		return fmt.Errorf("a %s job is not timed and says it ran %d seconds", e.Kind, e.Seconds)
 	}
 	want := expectedKey[e.Kind]
 	for k, v := range e.Expected {
 		if k != want {
 			return fmt.Errorf("a %s job expects %q, which is not its figure", e.Kind, k)
 		}
-		if v < 0 {
-			return fmt.Errorf("expected %s is negative", k)
+		// A LOADED JOB EXPECTS SOMETHING: an expected zero would compare a job
+		// that did nothing with its idle reference and pass. Only the idle job
+		// expects zero, and a JSON null decodes as zero, so it is refused the
+		// same way.
+		switch {
+		case e.Kind == kindIdle && v != 0:
+			return fmt.Errorf("an idle job expects %s 0, not %d", k, v)
+		case e.Kind != kindIdle && v <= 0:
+			return fmt.Errorf("a %s job's expected %s is %d; a load expects more than nothing", e.Kind, k, v)
 		}
 	}
 	if _, ok := e.Expected[want]; want != "" && !ok {
@@ -202,6 +214,41 @@ type usage struct {
 	EnergyActiveUJ  int64           `json:"energy_active_uj"`
 	EnergyIdleUJ    int64           `json:"energy_idle_uj"`
 	EnergySource    string          `json:"energy_source"`
+
+	// present names the fields the record carried with a value. A counter that
+	// was absent or null decodes as zero, and zero is also a measurement, so a
+	// comparison reads only the counters that were there.
+	present map[string]bool
+}
+
+func (u *usage) UnmarshalJSON(b []byte) error {
+	type plain usage
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*u = usage(p)
+	u.present = map[string]bool{}
+	for k, v := range raw {
+		u.present[k] = string(v) != "null"
+	}
+
+	return nil
+}
+
+// missing is the first of fields the record did not carry, or "".
+func (u *usage) missing(fields ...string) string {
+	for _, f := range fields {
+		if !u.present[f] {
+			return f
+		}
+	}
+
+	return ""
 }
 
 // errNoRecord is a lease with no record file: billet's answer was never

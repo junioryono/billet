@@ -27,6 +27,9 @@ type metric struct {
 	name  string // the expectation's key
 	unit  string // "s" or "B"
 	group string // the usage group billet must have measured
+	// fields are the counters the comparison reads, from this job and its
+	// reference alike.
+	fields []string
 	// against is the kind of the same run whose record is the reference: the
 	// job that did everything this one did except its load.
 	against string
@@ -40,7 +43,8 @@ func cpuSeconds(u *usage) float64 { return float64(u.CPUUserMicros+u.CPUSystemMi
 var metrics = []metric{
 	{
 		kind: kindIdle, name: "cpu_seconds", unit: "s", group: "cpu", against: kindBaseline,
-		value: func(job, ref *usage) float64 { return cpuSeconds(job) - cpuSeconds(ref) },
+		fields: []string{"cpu_user_us", "cpu_system_us"},
+		value:  func(job, ref *usage) float64 { return cpuSeconds(job) - cpuSeconds(ref) },
 		bounds: func(_, seconds float64, _ *usage) (float64, float64) {
 			return -3, 0.02*seconds + 3
 		},
@@ -48,7 +52,8 @@ var metrics = []metric{
 	},
 	{
 		kind: kindCPU, name: "cpu_seconds", unit: "s", group: "cpu", against: kindIdle,
-		value: func(job, ref *usage) float64 { return cpuSeconds(job) - cpuSeconds(ref) },
+		fields: []string{"cpu_user_us", "cpu_system_us"},
+		value:  func(job, ref *usage) float64 { return cpuSeconds(job) - cpuSeconds(ref) },
 		bounds: func(e, _ float64, _ *usage) (float64, float64) {
 			return 0.95*e - 2, 1.05*e + 2
 		},
@@ -56,7 +61,8 @@ var metrics = []metric{
 	},
 	{
 		kind: kindMemory, name: "memory_peak_bytes", unit: "B", group: "memory", against: kindIdle,
-		value: func(job, _ *usage) float64 { return float64(job.MemoryPeakBytes) },
+		fields: []string{"memory_peak_bytes"},
+		value:  func(job, _ *usage) float64 { return float64(job.MemoryPeakBytes) },
 		bounds: func(e, _ float64, ref *usage) (float64, float64) {
 			return e, float64(ref.MemoryPeakBytes) + 1.05*e + 64*mib
 		},
@@ -64,7 +70,8 @@ var metrics = []metric{
 	},
 	{
 		kind: kindNetwork, name: "net_rx_bytes", unit: "B", group: "net", against: kindIdle,
-		value: func(job, ref *usage) float64 { return float64(job.NetRxBytes - ref.NetRxBytes) },
+		fields: []string{"net_rx_bytes"},
+		value:  func(job, ref *usage) float64 { return float64(job.NetRxBytes - ref.NetRxBytes) },
 		bounds: func(e, _ float64, _ *usage) (float64, float64) {
 			return e - 4*mib, 1.06*e + 4*mib
 		},
@@ -72,7 +79,8 @@ var metrics = []metric{
 	},
 	{
 		kind: kindDisk, name: "disk_write_bytes", unit: "B", group: "io", against: kindIdle,
-		value: func(job, ref *usage) float64 { return float64(job.DiskWriteBytes - ref.DiskWriteBytes) },
+		fields: []string{"disk_write_bytes"},
+		value:  func(job, ref *usage) float64 { return float64(job.DiskWriteBytes - ref.DiskWriteBytes) },
 		bounds: func(e, _ float64, _ *usage) (float64, float64) {
 			return e - 64*mib, 1.10*e + 64*mib
 		},
@@ -103,6 +111,9 @@ type result struct {
 	against  string
 	reason   string
 	jobID    string
+	// compared is whether value was measured against bounds; a result that
+	// stopped before the comparison has no value to put in a statistic.
+	compared bool
 }
 
 // recordSource answers billet's record for a lease.
@@ -110,23 +121,38 @@ type recordSource func(lease string) (record, error)
 
 // evaluate compares every loaded job of every run with its expectation. The
 // baseline is only ever a reference, so it yields no result of its own.
+//
+// EVERY RUN ANSWERS FOR EVERY LOADED KIND. A job that failed before it
+// uploaded, one skipped because an earlier one failed, or an artifact that was
+// not downloaded leaves no expectation, and a check that compared only what
+// was there would pass a run it never measured; the missing kind is
+// UNMEASURED instead.
 func evaluate(exps []expectation, records recordSource) []result {
 	byRun := map[runKey]map[string]*expectation{}
+	var runs []runKey
 	for i := range exps {
 		e := &exps[i]
 		if byRun[e.run()] == nil {
 			byRun[e.run()] = map[string]*expectation{}
+			runs = append(runs, e.run())
 		}
 		byRun[e.run()][e.Kind] = e
 	}
+	slices.SortFunc(runs, compareRuns)
 	var out []result
-	for i := range exps {
-		e := &exps[i]
-		m, ok := metricFor(e.Kind)
-		if !ok {
-			continue
+	for _, k := range runs {
+		for i := range metrics {
+			m := &metrics[i]
+			e, ok := byRun[k][m.kind]
+			if !ok {
+				out = append(out, result{run: k, kind: m.kind, lease: "(none)", metric: *m, verdict: unmeasured,
+					reason: fmt.Sprintf("no %s expectation in %s: the job failed, was skipped or its artifact "+
+						"was not downloaded", m.kind, k)})
+
+				continue
+			}
+			out = append(out, evaluateOne(e, *m, byRun[k], records))
 		}
-		out = append(out, evaluateOne(e, m, byRun[e.run()], records))
 	}
 
 	return out
@@ -136,7 +162,7 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 	r := result{run: e.run(), kind: e.Kind, lease: e.Lease, metric: m,
 		expected: float64(e.Expected[m.name]), verdict: unmeasured}
 
-	job, v, why := measuredRecord(e, m.group, records)
+	job, v, why := measuredRecord(e, &m, records)
 	if v != "" {
 		r.verdict, r.reason = v, why
 
@@ -151,7 +177,7 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 		return r
 	}
 	r.against = refExp.Lease
-	ref, v, why := measuredRecord(refExp, m.group, records)
+	ref, v, why := measuredRecord(refExp, &m, records)
 	if v != "" {
 		// A REFERENCE THAT FAILS ITS IDENTITY FAILS THIS ONE TOO: what would be
 		// subtracted is another job's.
@@ -162,6 +188,7 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 
 	r.value = m.value(job.Usage, ref.Usage)
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), ref.Usage)
+	r.compared = true
 	r.verdict = fail
 	if r.value >= r.low && r.value <= r.high {
 		r.verdict = pass
@@ -174,7 +201,7 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 // what that makes the result and why. A record naming another run is a FAIL:
 // the lease is not the job the expectation describes, which is a finding
 // rather than a gap. Everything else that stops a comparison is UNMEASURED.
-func measuredRecord(e *expectation, group string, records recordSource) (record, verdict, string) {
+func measuredRecord(e *expectation, m *metric, records recordSource) (record, verdict, string) {
 	rec, err := records(e.Lease)
 	if err != nil {
 		return record{}, unmeasured, err.Error()
@@ -187,8 +214,11 @@ func measuredRecord(e *expectation, group string, records recordSource) (record,
 			e.Lease, rec.RunID, e.RunID)
 	case rec.Usage == nil:
 		return record{}, unmeasured, "billet recorded no usage report for this lease"
-	case !rec.Usage.Measured[group]:
-		return record{}, unmeasured, fmt.Sprintf("billet did not measure %s for this lease", group)
+	case !rec.Usage.Measured[m.group]:
+		return record{}, unmeasured, fmt.Sprintf("billet did not measure %s for this lease", m.group)
+	case rec.Usage.missing(m.fields...) != "":
+		return record{}, unmeasured, fmt.Sprintf("billet's record carries no %s for this lease",
+			rec.Usage.missing(m.fields...))
 	}
 
 	return rec, "", ""
@@ -268,7 +298,7 @@ func report(w io.Writer, results []result, dropped []runKey) {
 			fmt.Fprintf(w, "\n%s\n", r.run)
 		}
 		fmt.Fprintf(w, "  %-8s %-17s %-10s lease %s\n", r.kind, r.metric.name, r.verdict, r.lease)
-		if r.verdict == unmeasured || (r.verdict == fail && r.reason != "") {
+		if !r.compared {
 			fmt.Fprintf(w, "           %s\n", r.reason)
 		} else {
 			fmt.Fprintf(w, "           measured %s, expected %s, accepted [%s, %s] (%s; reference %s)\n",
@@ -281,16 +311,19 @@ func report(w io.Writer, results []result, dropped []runKey) {
 	}
 
 	fmt.Fprintf(w, "\nsummary\n")
-	for _, m := range metrics {
+	for i := range metrics {
+		m := &metrics[i]
 		var values, ratios []float64
 		counts := map[verdict]int{}
-		for i := range results {
-			r := &results[i]
+		for j := range results {
+			r := &results[j]
 			if r.kind != m.kind {
 				continue
 			}
 			counts[r.verdict]++
-			if r.verdict == unmeasured {
+			// ONLY A COMPARISON THAT WAS MADE HAS A VALUE: a FAIL for a record of
+			// another run stopped before any, and its zero is not a measurement.
+			if !r.compared {
 				continue
 			}
 			values = append(values, r.value)

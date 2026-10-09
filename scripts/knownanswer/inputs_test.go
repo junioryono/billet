@@ -121,7 +121,12 @@ func TestAnExpectationTheCheckerCouldMisreadIsRefused(t *testing.T) {
 		{"no run", `"run_id":5`, `"run_id":0`, "not a workflow run"},
 		{"another kind's figure", `{"cpu_seconds":240}`, `{"net_rx_bytes":240}`, "not its figure"},
 		{"no figure", `{"cpu_seconds":240}`, `{}`, "must expect cpu_seconds"},
-		{"a negative figure", `{"cpu_seconds":240}`, `{"cpu_seconds":-1}`, "negative"},
+		{"a negative figure", `{"cpu_seconds":240}`, `{"cpu_seconds":-1}`, "is -1; a load expects more than nothing"},
+		{"a load expecting nothing", `{"cpu_seconds":240}`, `{"cpu_seconds":0}`, "is 0; a load expects more"},
+		{"a null figure", `{"cpu_seconds":240}`, `{"cpu_seconds":null}`, "is 0; a load expects more"},
+		{"an idle job expecting work", `"kind":"cpu"`, `"kind":"idle"`, "an idle job expects cpu_seconds 0"},
+		{"a timed load that ran no time", `"seconds":60`, `"seconds":0`, "ran 0 seconds, which no job does"},
+		{"a timed load past a job's life", `"seconds":60`, `"seconds":21601`, "ran 21601 seconds"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if !strings.Contains(good, tc.from) {
@@ -135,10 +140,32 @@ func TestAnExpectationTheCheckerCouldMisreadIsRefused(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "expectation.json"), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := loadExpectations(filepath.Dir(dir)); err == nil || !strings.Contains(err.Error(), tc.says) {
+			_, err := loadExpectations(filepath.Dir(dir))
+			if err == nil {
+				t.Fatalf("the expectation was accepted")
+			}
+			// THE PATH IS CUT OFF FIRST: it holds the subtest's name, which
+			// would otherwise satisfy the assertion by itself.
+			msg := strings.TrimPrefix(err.Error(), filepath.Join(dir, "expectation.json")+": ")
+			if msg == err.Error() || !strings.Contains(msg, tc.says) {
 				t.Errorf("err = %v, want one saying %q", err, tc.says)
 			}
 		})
+	}
+
+	// AN UNTIMED LOAD DOES NOT CLAIM A DURATION.
+	untimed := `{"schema":1,"kind":"network","lease":"l1","repository":"a/b","run_id":5,"run_attempt":1,` +
+		`"github_job_id":"","seconds":60,"expected":{"net_rx_bytes":100}}`
+	dir := filepath.Join(t.TempDir(), "a")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "expectation.json"), []byte(untimed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadExpectations(filepath.Dir(dir)); err == nil ||
+		!strings.Contains(err.Error(), "is not timed and says it ran 60 seconds") {
+		t.Errorf("err = %v", err)
 	}
 
 	// TWO OF A KIND IN ONE RUN, OR ONE LEASE TWICE, would make a subtraction pick

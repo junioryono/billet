@@ -19,7 +19,7 @@ var referenceLog = filepath.Join("testdata", "power-log", "power.csv")
 
 // leaseA is billet's record of the one microVM in the reference log.
 func leaseA(activeJ, idleJ float64, f func(*usage)) map[string]record {
-	u := usage{Measured: allGroups(), EnergyActiveUJ: int64(activeJ * 1e6), EnergyIdleUJ: int64(idleJ * 1e6),
+	u := usage{Measured: allGroups(), present: allFields(), EnergyActiveUJ: int64(activeJ * 1e6), EnergyIdleUJ: int64(idleJ * 1e6),
 		EnergySource: "rapl", WindowMillis: 10_000}
 	if f != nil {
 		f(&u)
@@ -124,6 +124,18 @@ func TestAWindowThatCannotBeAccountedForIsUnmeasured(t *testing.T) {
 			return r
 		}, "no billet microVM ran"},
 		{"too short", leaseA(950, 0, nil), func(r []powerRow) []powerRow { return r[:15] }, "cannot hold 10 quiet rows"},
+		{"an inventory that could not be read", leaseA(950, 0, nil), func(r []powerRow) []powerRow {
+			r[16].inventoryOK, r[16].instances = false, nil
+			return r
+		}, "row 17 (epoch 1791540016) could not read which microVMs were running"},
+		{"a clock that went back", leaseA(950, 0, nil), func(r []powerRow) []powerRow {
+			r[16].uptime = r[15].uptime
+			return r
+		}, "row 17 (epoch 1791540016) does not come after the row before it"},
+		{"no energy counters in the record", leaseA(950, 0, func(u *usage) {
+			u.present = allFields()
+			delete(u.present, "energy_active_uj")
+		}), nil, "without lease-a"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := append([]powerRow(nil), rows...)
@@ -138,6 +150,33 @@ func TestAWindowThatCannotBeAccountedForIsUnmeasured(t *testing.T) {
 	}
 }
 
+// THE IDLE BASELINE IS TAKEN PER INTERVAL, AS THE MONITOR TAKES IT: an
+// interval drawing less than the baseline adds no active energy, rather than a
+// negative amount that shrinks the window's. Quiet ends at 70 W are inside 5%
+// of a 73.5 W baseline; ten busy seconds at 173.5 W are 1000 J above it, and
+// subtracting the baseline from the whole window instead would leave 919.5 J
+// and fail a correct attribution as over-attribution.
+func TestTheIdleBaselineIsTakenPerInterval(t *testing.T) {
+	var rows []powerRow
+	for i := range 34 {
+		row := powerRow{epoch: int64(i), uptime: float64(i), uptimeOK: true, inventoryOK: true}
+		if i > 0 {
+			row.delta, row.deltaOK = 70_000_000, true
+		}
+		if i >= 12 && i < 22 {
+			row.delta, row.instances = 173_500_000, []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	// The interval after the last busy row is the microVM's tail.
+	rows[22].delta = 173_500_000
+	res := reconcile(rows, 73.5, 10, fromMap(leaseA(1080, 0, nil)))
+	if res.activeMeasured != 1_100_000_000 || res.verdict != pass || res.idleVerdict != pass {
+		t.Errorf("above idle %.0f µJ, verdict %s (ratio %.3f), idle %s at %.2f and %.2f W", res.activeMeasured,
+			res.verdict, res.ratio, res.idleVerdict, res.idleBefore, res.idleAfter)
+	}
+}
+
 func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, body string) string {
@@ -148,18 +187,21 @@ func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 		return path
 	}
 	rows, err := readPowerLog(write("reordered.csv",
-		"instances,rapl_delta_uj,uptime_s,epoch_s,extra\nbillet-a;billet-b,5,10.50,7,x\n,,10.75,8,y\n"))
+		"instances,rapl_delta_uj,uptime_s,epoch_s,extra\nbillet-a;billet-b,5,10.50,7,x\n,,10.75,8,y\n?,5,11.00,9,z\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 || rows[0].epoch != 7 || rows[0].uptime != 10.5 || !rows[0].deltaOK || rows[0].delta != 5 ||
-		strings.Join(rows[0].instances, ",") != "billet-a,billet-b" || rows[1].deltaOK || len(rows[1].instances) != 0 {
+	if len(rows) != 3 || rows[0].epoch != 7 || rows[0].uptime != 10.5 || !rows[0].deltaOK || rows[0].delta != 5 ||
+		strings.Join(rows[0].instances, ",") != "billet-a,billet-b" || !rows[0].inventoryOK || rows[1].deltaOK ||
+		len(rows[1].instances) != 0 || !rows[1].inventoryOK || rows[2].inventoryOK || len(rows[2].instances) != 0 {
 		t.Errorf("rows = %+v", rows)
 	}
 	for name, body := range map[string]string{
 		"no instances column": "epoch_s,uptime_s,rapl_delta_uj\n1,1.00,5\n",
 		"a negative delta":    "epoch_s,uptime_s,rapl_delta_uj,instances\n1,1.00,-5,\n",
 		"a word for an epoch": "epoch_s,uptime_s,rapl_delta_uj,instances\nnow,1.00,5,\n",
+		"a NaN uptime":        "epoch_s,uptime_s,rapl_delta_uj,instances\n1,NaN,5,\n",
+		"an infinite uptime":  "epoch_s,uptime_s,rapl_delta_uj,instances\n1,+Inf,5,\n",
 	} {
 		if _, err := readPowerLog(write(strings.ReplaceAll(name, " ", "-")+".csv", body)); err == nil {
 			t.Errorf("%s was read", name)

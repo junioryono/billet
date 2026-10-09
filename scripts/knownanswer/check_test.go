@@ -16,6 +16,18 @@ func allGroups() map[string]bool {
 		"net": true, "pressure": true, "energy": true}
 }
 
+// allFields is every counter a record carries, as billet jobs show --json writes
+// them all.
+func allFields() map[string]bool {
+	out := map[string]bool{}
+	for _, f := range []string{"cpu_user_us", "cpu_system_us", "memory_peak_bytes", "disk_write_bytes",
+		"net_rx_bytes", "energy_active_uj", "energy_idle_uj", "window_ms", "samples"} {
+		out[f] = true
+	}
+
+	return out
+}
+
 // fixtureRun is one run's expectations and billet's records for them: a
 // baseline that spent 20 CPU-seconds preparing, an idle job that slept 60 s
 // on top of it, and each loaded job measured exactly at its known answer over
@@ -26,14 +38,14 @@ func fixtureRun(runID int64) ([]expectation, map[string]record) {
 		return expectation{Schema: 1, Kind: kind, Lease: lease(kind), Repository: "acme/bench", RunID: runID,
 			RunAttempt: 1, GitHubJobID: "7" + lease(kind)[6:], Seconds: seconds, Expected: expected}
 	}
-	idle := usage{Measured: allGroups(), CPUUserMicros: 20_500_000, CPUSystemMicros: 1_000_000,
+	idle := usage{Measured: allGroups(), present: allFields(), CPUUserMicros: 20_500_000, CPUSystemMicros: 1_000_000,
 		MemoryPeakBytes: 700 * mib, NetRxBytes: 60 * mib, DiskWriteBytes: 90 * mib}
 	rec := func(kind string, u usage) record {
 		return record{Lease: lease(kind), RunID: runID, GitHubJobID: "7" + lease(kind)[6:], Usage: &u}
 	}
 	with := func(f func(*usage)) usage {
 		u := idle
-		u.Measured = allGroups()
+		u.Measured, u.present = allGroups(), allFields()
 		f(&u)
 		return u
 	}
@@ -411,5 +423,83 @@ func TestCheckDiscardsTheWarmupItIsTold(t *testing.T) {
 	if code != exitPass || !strings.Contains(stdout.String(), "discarded run 100 attempt 1 (warmup)") ||
 		strings.Contains(stdout.String(), "\nrun 100 attempt 1\n") {
 		t.Errorf("exit %d:\n%s%s", code, stdout.String(), stderr.String())
+	}
+}
+
+// A JOB THAT LEFT NO EXPECTATION IS UNMEASURED, NOT SKIPPED: a cpu job that
+// failed before it uploaded, and the jobs after it that never ran, would
+// otherwise leave a run whose idle job alone passed reading as a PASS.
+func TestAJobThatLeftNoExpectationIsUnmeasured(t *testing.T) {
+	exps, recs := fixtureRun(100)
+	exps = dropKind(dropKind(dropKind(dropKind(exps, kindCPU), kindMemory), kindNetwork), kindDisk)
+	results := evaluate(exps, fromMap(recs))
+	if len(results) != len(metrics) {
+		t.Fatalf("%d results, want one per loaded kind", len(results))
+	}
+	if got := resultFor(t, results, kindIdle); got.verdict != pass {
+		t.Errorf("idle: %s (%s)", got.verdict, got.reason)
+	}
+	for _, kind := range []string{kindCPU, kindMemory, kindNetwork, kindDisk} {
+		got := resultFor(t, results, kind)
+		if got.verdict != unmeasured || !strings.Contains(got.reason, "no "+kind+" expectation in run 100 attempt 1") {
+			t.Errorf("%s: %s (%q), want UNMEASURED", kind, got.verdict, got.reason)
+		}
+	}
+	if overall(results) != unmeasured {
+		t.Errorf("overall %s, want UNMEASURED", overall(results))
+	}
+}
+
+// A COUNTER THE RECORD DID NOT CARRY IS NOT A ZERO: a usage report that names
+// cpu measured and carries no CPU counters, or null ones, decodes as zeros,
+// and zero minus zero is inside the idle job's range.
+func TestACounterTheRecordDidNotCarryIsUnmeasured(t *testing.T) {
+	exps, recs := fixtureRun(100)
+	delete(recs["lease-100-cpu"].Usage.present, "cpu_system_us")
+	if got := resultFor(t, evaluate(exps, fromMap(recs)), kindCPU); got.verdict != unmeasured ||
+		!strings.Contains(got.reason, "carries no cpu_system_us") {
+		t.Errorf("cpu: %s (%q)", got.verdict, got.reason)
+	}
+
+	dir := t.TempDir()
+	for lease, body := range map[string]string{
+		"lease-100-baseline": `{"lease":"lease-100-baseline","run_id":100,"usage":{"measured":{"cpu":true},` +
+			`"cpu_user_us":1,"cpu_system_us":1}}`,
+		"lease-100-idle": `{"lease":"lease-100-idle","run_id":100,"usage":{"measured":{"cpu":true},` +
+			`"cpu_user_us":null,"cpu_system_us":null}}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, lease+".json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := resultFor(t, evaluate(exps, records(dir)), kindIdle)
+	if got.verdict != unmeasured || got.reason != "billet's record carries no cpu_user_us for this lease" {
+		t.Errorf("idle from a record with null counters: %s (%q), want UNMEASURED", got.verdict, got.reason)
+	}
+}
+
+// ONLY A COMPARISON THAT WAS MADE ENTERS THE STATISTICS: a FAIL for a record of
+// another run has no value, and its zero would drag the mean.
+func TestTheStatisticsCountOnlyComparisonsMade(t *testing.T) {
+	var all []result
+	for _, id := range []int64{100, 200} {
+		exps, recs := fixtureRun(id)
+		if id == 200 {
+			r := recs["lease-200-cpu"]
+			r.RunID = 1
+			recs["lease-200-cpu"] = r
+		}
+		all = append(all, evaluate(exps, fromMap(recs))...)
+	}
+	var out bytes.Buffer
+	report(&out, all, nil)
+	for _, want := range []string{
+		"cpu      2 run(s): 1 PASS, 1 FAIL, 0 UNMEASURED",
+		"cpu_seconds: mean 240.0 s, 95% CI n/a (one run), CV n/a (one run), n 1",
+		"billet says lease lease-200-cpu ran run 1",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the report does not say %q:\n%s", want, out.String())
+		}
 	}
 }

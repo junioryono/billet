@@ -41,7 +41,7 @@ printf '%s 0.00\n' "$uptime" >"$s/proc/uptime"
 printf '%s\n' "$energy" >"$s/powercap/energy_uj"
 printf '%s\n' "$bmc" >"$s/bmc"
 for d in "$s"/cgroup/firecracker-v1.16.1/billet-*; do
-	[ -d "$d" ] && : >"$d/cgroup.procs"
+	if [ -d "$d" ]; then : >"$d/cgroup.procs" 2>/dev/null || true; fi
 done
 if [ "$vms" != - ]; then
 	IFS=, read -r -a names <<<"$vms"
@@ -50,9 +50,13 @@ if [ "$vms" != - ]; then
 		printf '4242\n' >"$s/cgroup/firecracker-v1.16.1/$n/cgroup.procs"
 	done
 fi
-# A RUNNING turbostat HAS PRINTED BEFORE THE NEXT SAMPLE IS TAKEN.
-if [ -e "$s/ts-expected" ]; then
-	for _ in $(seq 1 500); do [ -e "$s/ts-ready" ] && break; /bin/sleep 0.01; done
+# THE Nth SLEEP LETS turbostat PRINT ITS Nth READING, and returns once it has,
+# so the sample after it is the first to see that reading.
+c=$(( $(cat "$s/sleeps" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$c" >"$s/sleeps"
+if [ -e "$s/ts-readings" ] && [ "$c" -le "$(cat "$s/ts-readings")" ]; then
+	: >"$s/ts-tick-$c"
+	for _ in $(seq 1 500); do [ -e "$s/ts-done-$c" ] && break; /bin/sleep 0.01; done
 fi
 `,
 	"date": `#!/bin/bash
@@ -89,10 +93,20 @@ cat <<EOF
 
 EOF
 `,
+	// turbostat prints its header, then one reading per sleep the logger takes
+	// (7k.50 for the kth), as many as $FAKE_STATE/ts-readings says, and then
+	// nothing more while it stays alive: a turbostat that stopped reporting.
 	"turbostat": `#!/bin/bash
-printf '%s\n' "$$" >"$FAKE_STATE/ts-pid"
-printf 'PkgWatt\n73.50\n'
-: >"$FAKE_STATE/ts-ready"
+s=$FAKE_STATE
+printf '%s\n' "$$" >"$s/ts-pid"
+printf 'PkgWatt\n'
+k=1
+while [ "$k" -le "$(cat "$s/ts-readings")" ]; do
+	until [ -e "$s/ts-tick-$k" ]; do /bin/sleep 0.01; done
+	printf '7%d.50\n' "$k"
+	: >"$s/ts-done-$k"
+	k=$((k + 1))
+done
 exec /bin/sleep 600
 `,
 }
@@ -109,7 +123,7 @@ func newPowerHarness(t *testing.T, fakes ...string) powerHarness {
 			t.Fatal(err)
 		}
 	}
-	for _, tool := range []string{"bash", "cat", "mkdir", "mktemp", "mv", "rm", "tail", "dirname", "awk", "seq", "kill"} {
+	for _, tool := range []string{"bash", "cat", "mkdir", "mktemp", "mv", "rm", "tail", "dirname", "awk", "seq", "kill", "wc"} {
 		resolved, err := exec.LookPath(tool)
 		if err != nil {
 			t.Fatalf("this test needs %s on PATH: %v", tool, err)
@@ -346,6 +360,54 @@ func TestAGapThatCouldHideAWrapLeavesTheDeltaEmpty(t *testing.T) {
 	}
 }
 
+// AN INVENTORY THAT COULD NOT BE TAKEN IS `?`, NOT EMPTY: an empty cell is what
+// makes a row quiet, and a cgroup the logger cannot read may hold a microVM.
+// Two that can be read are both listed.
+func TestAnUnreadableInventoryIsNotAnEmptyOne(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a file whatever its mode")
+	}
+	h := newPowerHarness(t, "sleep", "date", "timeout")
+	h.plant(t, []step{
+		{epoch: 10, uptimeCS: 1000, energy: 1_000_000, bmc: "fail", vms: []string{"billet-a", "billet-b"}},
+		{epoch: 11, uptimeCS: 1100, energy: 74_500_000, bmc: "fail", vms: []string{"billet-a"}},
+		{epoch: 12, uptimeCS: 1200, energy: 148_000_000, bmc: "fail"},
+	})
+	locked := filepath.Join(h.state, "cgroup", "firecracker-v1.16.1", "billet-c")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "cgroup.procs"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "power.csv")
+	if summary, err := h.run(t, "--out", out, "--seconds", "2", "--ipmitool", "none", "--turbostat", "none"); err != nil {
+		t.Fatalf("%v\n%s", err, summary)
+	}
+	if err := os.Chmod(filepath.Join(locked, "cgroup.procs"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(filepath.Join(locked, "cgroup.procs"), 0o644); err != nil {
+			t.Logf("restore the mode: %v", err)
+		}
+	})
+	rows := csvRows(t, out)
+	if rows[1][6] != "billet-a;billet-b" || rows[2][6] != "billet-a" {
+		t.Errorf("inventories %q and %q, want billet-a;billet-b and billet-a", rows[1][6], rows[2][6])
+	}
+	out2 := filepath.Join(t.TempDir(), "power.csv")
+	if summary, err := h.run(t, "--out", out2, "--seconds", "2", "--ipmitool", "none", "--turbostat", "none"); err != nil {
+		t.Fatalf("%v\n%s", err, summary)
+	}
+	for _, row := range csvRows(t, out2)[1:] {
+		if row[6] != "?" {
+			t.Errorf("an unreadable cgroup.procs gave the inventory %q, want ?", row[6])
+		}
+	}
+}
+
 func csvRows(t *testing.T, path string) [][]string {
 	t.Helper()
 	body, err := os.ReadFile(path)
@@ -360,27 +422,32 @@ func csvRows(t *testing.T, path string) [][]string {
 	return rows
 }
 
-// TURBOSTAT RUNS BESIDE THE LOG AND DIES WITH IT: its PkgWatt reaches the
-// rows, and no turbostat outlives the script that started it.
+// TURBOSTAT RUNS BESIDE THE LOG AND DIES WITH IT: each new PkgWatt reaches the
+// row after it, a turbostat that has stopped printing is not read again as if
+// it had, and no turbostat outlives the script that started it.
 func TestTurbostatRunsBesideTheLogAndDiesWithIt(t *testing.T) {
 	t.Parallel()
 	h := newPowerHarness(t, "sleep", "date", "timeout", "turbostat")
-	steps := referenceLog()[:5]
+	steps := referenceLog()[:6]
 	h.plant(t, steps)
-	if err := os.WriteFile(filepath.Join(h.state, "ts-expected"), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(h.state, "ts-readings"), []byte("2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "power.csv")
-	summary, err := h.run(t, "--out", out, "--seconds", "5", "--ipmitool", "none", "--turbostat", "turbostat")
+	summary, err := h.run(t, "--out", out, "--seconds", "6", "--ipmitool", "none", "--turbostat", "turbostat")
 	if err != nil {
 		t.Fatalf("%v\n%s", err, summary)
 	}
-	for i, row := range csvRows(t, out)[2:] {
-		if row[5] != "73.50" {
-			t.Errorf("row %d's turbostat cell is %q, want 73.50", i+2, row[5])
-		}
+	// Row 1 precedes any reading; rows 2 and 3 each follow one; rows 4 to 6
+	// follow none, so their cells are empty rather than the last reading again.
+	var cells []string
+	for _, row := range csvRows(t, out)[1:] {
+		cells = append(cells, row[5])
 	}
-	if !strings.Contains(summary, "turbostat: 4 paired readings, mean PkgWatt 73.5 W") {
+	if got := strings.Join(cells, ","); got != ",71.50,72.50,,," {
+		t.Errorf("turbostat cells %q, want \",71.50,72.50,,,\"", got)
+	}
+	if !strings.Contains(summary, "turbostat: 2 paired readings, mean PkgWatt 72.0 W") {
 		t.Errorf("the summary:\n%s", summary)
 	}
 	body, err := os.ReadFile(filepath.Join(h.state, "ts-pid"))

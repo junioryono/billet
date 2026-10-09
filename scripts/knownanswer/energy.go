@@ -21,6 +21,9 @@ type powerRow struct {
 	delta     int64
 	deltaOK   bool
 	instances []string
+	// inventoryOK is false where the logger could not read the cgroups, which
+	// is not the same as finding no microVM.
+	inventoryOK bool
 }
 
 // readPowerLog reads the CSV by its header's names, so a column added later
@@ -59,8 +62,10 @@ func readPowerLog(path string) ([]powerRow, error) {
 			return nil, fmt.Errorf("%s line %d: epoch_s: %w", path, line, err)
 		}
 		if s := rec[col["uptime_s"]]; s != "" {
-			if row.uptime, err = strconv.ParseFloat(s, 64); err != nil {
-				return nil, fmt.Errorf("%s line %d: uptime_s: %w", path, line, err)
+			// ParseFloat ACCEPTS NaN AND Inf, which compare false with everything and
+			// would let an interval through every bound.
+			if row.uptime, err = strconv.ParseFloat(s, 64); err != nil || math.IsNaN(row.uptime) || math.IsInf(row.uptime, 0) {
+				return nil, fmt.Errorf("%s line %d: uptime_s %q is not a time", path, line, s)
 			}
 			row.uptimeOK = true
 		}
@@ -70,7 +75,12 @@ func readPowerLog(path string) ([]powerRow, error) {
 			}
 			row.deltaOK = true
 		}
-		if s := rec[col["instances"]]; s != "" {
+		switch s := rec[col["instances"]]; s {
+		case "?":
+		case "":
+			row.inventoryOK = true
+		default:
+			row.inventoryOK = true
 			row.instances = strings.Split(s, ";")
 		}
 		rows = append(rows, row)
@@ -118,6 +128,7 @@ type energyResult struct {
 	idleAfterOK                bool
 	idleVerdict                verdict
 	activeMeasured             float64
+	idlePool                   float64
 	attributed, attributedIdle int64
 	ratio                      float64
 	jobs                       []energyJob
@@ -153,9 +164,27 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 
 			return res
 		}
-		if i > 0 {
-			res.rapl += row.delta
+		if !row.inventoryOK {
+			res.reason = fmt.Sprintf("row %d (epoch %d) could not read which microVMs were running", i+1, row.epoch)
+
+			return res
 		}
+		if i == 0 {
+			continue
+		}
+		dt := row.uptime - rows[i-1].uptime
+		if dt <= 0 {
+			res.reason = fmt.Sprintf("row %d (epoch %d) does not come after the row before it", i+1, row.epoch)
+
+			return res
+		}
+		res.rapl += row.delta
+		// THE IDLE BASELINE IS TAKEN PER INTERVAL AND NEVER EXCEEDS WHAT WAS
+		// DRAWN, as the node's monitor takes it: an interval below the baseline
+		// contributes no active energy rather than a negative amount.
+		idle := min(idleWatts*dt*1e6, float64(row.delta))
+		res.idlePool += idle
+		res.activeMeasured += float64(row.delta) - idle
 	}
 	res.seconds = rows[len(rows)-1].uptime - rows[0].uptime
 	if res.seconds <= 0 {
@@ -197,6 +226,8 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			j.problem = "billet recorded no usage report"
 		case !rec.Usage.Measured["energy"]:
 			j.problem = "billet did not measure its energy"
+		case rec.Usage.missing("energy_active_uj", "energy_idle_uj") != "":
+			j.problem = "billet's record carries no " + rec.Usage.missing("energy_active_uj", "energy_idle_uj")
 		case rec.Usage.EnergySource != "rapl":
 			j.problem = fmt.Sprintf("its energy source is %q, not rapl split by an idle baseline",
 				rec.Usage.EnergySource)
@@ -210,7 +241,6 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 			missing = append(missing, j.lease)
 		}
 	}
-	res.activeMeasured = float64(res.rapl) - idleWatts*res.seconds*1e6
 	switch {
 	case len(missing) > 0:
 		res.reason = "the window's energy cannot be accounted for without " + strings.Join(missing, ", ")
@@ -327,7 +357,7 @@ func (res energyResult) write(w io.Writer) {
 			kj(res.activeMeasured-float64(res.attributed)),
 			(res.activeMeasured-float64(res.attributed))/1e6/res.seconds)
 		fmt.Fprintf(w, "jobs' idle shares: %s of the window's %s idle baseline\n", kj(float64(res.attributedIdle)),
-			kj(res.idleWatts*res.seconds*1e6))
+			kj(res.idlePool))
 	} else {
 		fmt.Fprintf(w, "reconciliation: %s\n", res.reason)
 	}

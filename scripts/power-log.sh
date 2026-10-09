@@ -17,13 +17,16 @@
 # instantaneous reading, through /dev/ipmi0 (the ipmi_si and ipmi_devintf
 # modules), and turbostat_pkg_watts turbostat's latest PkgWatt when it runs.
 # instances is every billet microVM with a live cgroup, `;`-separated, which is
-# how `knownanswer energy` knows which jobs a window must account for.
+# how `knownanswer energy` knows which jobs a window must account for, or `?`
+# when the cgroup tree could not be read. The clock, the counter and the
+# microVMs are read together, before the BMC is asked.
 #
 # AN EMPTY CELL IS A READING THAT COULD NOT BE TAKEN, never a zero. A failed
 # RAPL read, the first row, and a gap long enough for the counter to have
 # wrapped unseen (max_energy_range_uj at 1 kW, billet's own bound) all leave
 # rapl_delta_uj empty; a BMC that did not answer, answered nonsense, or reports
-# its power reading deactivated leaves bmc_watts empty.
+# its power reading deactivated leaves bmc_watts empty; a sample turbostat
+# printed nothing new for leaves turbostat_pkg_watts empty.
 #
 # It stops after --seconds samples, or on SIGINT or SIGTERM, and then prints
 # scripts/power-summary.sh's comparison of the whole log.
@@ -79,6 +82,7 @@ case "$probe" in '' | *[!0-9]*) die "energy_uj is '$probe'" ;; esac
 # A WRAP IS SEEN ONLY IF THE COUNTER CANNOT GO ROUND BETWEEN TWO READINGS: at
 # 1 kW, max_energy_range_uj lasts max/1e9 seconds, which is max/1e7 centiseconds.
 wrap_cs=$((max_range / 10000000))
+[ -d "$cgroup" ] || die "$cgroup is not a directory; --cgroup names the cgroup2 mount"
 
 bmc=1
 if [ "$ipmitool" = none ]; then
@@ -152,11 +156,22 @@ read_bmc() {
 	fi
 }
 
-# read_turbostat sets ts_w to turbostat's latest PkgWatt, or empty.
+# read_turbostat sets ts_w to the PkgWatt turbostat printed since the last
+# sample, or empty. A REPEATED READING IS NOT A NEW ONE: a turbostat that exited
+# or stopped printing leaves its last line in the file, and counting it every
+# second would pair one old number with every later RAPL interval.
+ts_lines=0
 read_turbostat() {
 	ts_w=
 	[ -n "$ts_pid" ] || return 0
-	local last
+	kill -0 "$ts_pid" 2>/dev/null || return 0
+	local lines last
+	lines=$(wc -l <"$work/turbostat" 2>/dev/null) || return 0
+	lines=${lines//[!0-9]/}
+	if [ -z "$lines" ] || [ "$lines" -le "$ts_lines" ]; then
+		return 0
+	fi
+	ts_lines=$lines
 	last=$(tail -n 1 "$work/turbostat" 2>/dev/null) || return 0
 	case "$last" in
 	'' | *[!0-9.]* | .* | *. | *.*.*) ;;
@@ -164,17 +179,37 @@ read_turbostat() {
 	esac
 }
 
-# read_instances sets vms to the billet microVMs whose cgroup holds a process.
+# read_instances sets vms to the billet microVMs whose cgroup holds a process,
+# or to `?` when the tree could not be read: an inventory that could not be
+# taken is not an empty one, and an empty one is what makes a row quiet.
 read_instances() {
 	vms=
-	local d first
-	for d in "$cgroup"/firecracker*/billet-*; do
-		[ -d "$d" ] || continue
-		first=
-		# cgroupfs files report a size of zero, so `-s` says nothing: read a line.
-		IFS= read -r first <"$d/cgroup.procs" 2>/dev/null || true
-		[ -n "$first" ] || continue
-		vms=${vms:+$vms;}${d##*/}
+	local parent d first
+	if [ ! -d "$cgroup" ] || [ ! -r "$cgroup" ] || [ ! -x "$cgroup" ]; then
+		vms='?'
+		return 0
+	fi
+	for parent in "$cgroup"/firecracker*; do
+		[ -d "$parent" ] || continue
+		if [ ! -r "$parent" ] || [ ! -x "$parent" ]; then
+			vms='?'
+			return 0
+		fi
+		for d in "$parent"/billet-*; do
+			[ -d "$d" ] || continue
+			if [ ! -r "$d/cgroup.procs" ]; then
+				# A CGROUP REMOVED SINCE THE GLOB is a microVM that is gone, not
+				# one that could not be read.
+				[ -d "$d" ] || continue
+				vms='?'
+				return 0
+			fi
+			first=
+			# cgroupfs files report a size of zero, so `-s` says nothing: read a line.
+			IFS= read -r first <"$d/cgroup.procs" 2>/dev/null || true
+			[ -n "$first" ] || continue
+			vms=${vms:+$vms;}${d##*/}
+		done
 	done
 }
 
@@ -185,15 +220,18 @@ prev_uj=
 prev_cs=
 n=0
 while [ "$stop" -eq 0 ]; do
+	# THE CLOCK, THE COUNTER AND THE INVENTORY ARE READ TOGETHER, before the BMC:
+	# a BMC call can take seconds, and a microVM that exited during it would
+	# otherwise be missing from a row whose energy it drew.
 	read_uptime_cs
 	cur_uj=
 	if IFS= read -r cur_uj <"$powercap/energy_uj" 2>/dev/null; then
 		case "$cur_uj" in '' | *[!0-9]*) cur_uj= ;; esac
 	fi
+	read_instances
 	epoch=$(date +%s)
 	read_bmc
 	read_turbostat
-	read_instances
 
 	delta=
 	if [ -n "$cur_uj" ] && [ -n "$prev_uj" ] && [ -n "$up_cs" ] && [ -n "$prev_cs" ] &&
