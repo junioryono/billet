@@ -698,3 +698,24 @@ func TestATidReusedBetweenTheListingAndTheOpenIsNotCountedTwice(t *testing.T) {
 			got, 8*70)
 	}
 }
+
+// FINAL TAKES A LAST READING before it closes the groups: what the vCPU threads
+// counted since the last tick is the job's too, and the destroy that follows
+// takes the threads with it.
+func TestFinalCountsWhatHappenedSinceTheLastSample(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	_, target, m := countedVM(t, src)
+	m.Start("vm", target, 8)
+	src.set(refVCPUs, reading(time.Second, time.Second, 100, 100, 100, 100, 100, 100))
+	m.Tick()
+	src.set(refVCPUs, reading(2*time.Second, 2*time.Second, 250, 250, 250, 250, 250, 250))
+
+	if got := finalCounters(t, m).Values[Instructions]; got != 8*250 {
+		t.Errorf("instructions = %d, want %d: Final's own reading, not the last tick's", got, 8*250)
+	}
+	if open := src.open(); len(open) != 0 {
+		t.Errorf("Final left groups open: %v", open)
+	}
+}
