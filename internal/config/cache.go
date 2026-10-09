@@ -432,13 +432,19 @@ func (t Tier) cachePolicyErrors(where string) []error {
 			errs = append(errs, fmt.Errorf("%s: intercept and cache.actions both configure the "+
 				"Actions cache; intercept is the deprecated spelling, so keep cache.actions only", where))
 		}
-		for name, size := range map[string]ByteSize{
-			"docker": sizeOf(c.Docker), "sticky_disks": sizeOf(c.StickyDisks),
-			"git": sizeOf(c.Git), "bazel": sizeOf(c.Bazel),
+		// IN A FIXED ORDER, so the same file is refused with the same words every
+		// time: a map here once made the order of two refusals a coin toss (found
+		// by fuzzing, 2026-10-08).
+		for _, volume := range []struct {
+			name string
+			size ByteSize
+		}{
+			{"docker", sizeOf(c.Docker)}, {"sticky_disks", sizeOf(c.StickyDisks)},
+			{"git", sizeOf(c.Git)}, {"bazel", sizeOf(c.Bazel)},
 		} {
-			if size < 0 || size > CacheVolumeLimit {
+			if volume.size < 0 || volume.size > CacheVolumeLimit {
 				errs = append(errs, fmt.Errorf("%s: cache.%s.max_size %s is outside (0, %s]",
-					where, name, size, CacheVolumeLimit))
+					where, volume.name, volume.size, CacheVolumeLimit))
 			}
 		}
 		if c.Go != nil && (c.Go.MaxSize < 0 || c.Go.MaxSize > CacheVolumeLimit) {
