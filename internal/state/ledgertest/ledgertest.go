@@ -18,20 +18,27 @@
 // what state.Open in this binary produces, at the cost of one migration per test
 // binary.
 //
+// StageSuccessor is the other thing a test outside internal/state cannot do
+// for itself: write a successor's controller claim, so the controller holding
+// the ledger has its next write refused as a replaced one's is.
+//
 // NOTHING OUTSIDE A TEST IMPORTS IT (boundary in ledgertest_test.go). The
 // PostgreSQL ledgers tests open are untouched: a schema there is a server's, not
 // a file to copy.
 package ledgertest
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgerdb"
 )
 
 // builder builds a template once and hands every caller the same answer.
@@ -150,4 +157,22 @@ func writeNew(path string, body []byte) error {
 	}
 
 	return out.Close()
+}
+
+// StageSuccessor writes holder's claim as the deployment's controller through
+// db, an operator handle on a ledger a controller holds, which bumps the claim's
+// epoch: that controller's next write is then refused, and its leadership lost.
+func StageSuccessor(tb testing.TB, db *state.DB, holder string) {
+	tb.Helper()
+
+	if err := db.Tx(tb.Context(), func(tx *sql.Tx) error {
+		_, err := state.WriteQueries(tx).ClaimController(tb.Context(), ledgerdb.ClaimControllerParams{
+			Holder:    holder,
+			ClaimedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+
+		return err
+	}); err != nil {
+		tb.Fatalf("ledgertest: stage %s's claim: %v", holder, err)
+	}
 }
