@@ -13,12 +13,13 @@ import (
 // A REAL MICROVM'S vCPU THREADS, COUNTED THROUGH perf_event_open.
 //
 // The fake counter source in internal/usage asserts what the sampler does with
-// a reading; this asserts that the readings exist: that a vCPU thread opened by
-// tid, with guest mode included, counts the guest's instructions at all, and that
-// their ratio to cycles is an IPC a CPU can have. A guest spinning in a shell
-// loop retires instructions on every cycle it runs, so excluding guest mode, or
-// counting the wrong thread, reads as no instructions or as a ratio outside any
-// CPU's range.
+// a reading; this asserts that the readings are the guest's. A guest spinning in
+// a shell loop keeps one vCPU thread on a core in guest mode, so the cycles
+// counted, divided by the time the vCPU threads ran (from /proc, independently
+// of perf), is the core's clock. Counting without guest mode, or the wrong
+// thread, leaves only the exits: a small fraction of those cycles, and a clock
+// far below any CPU billet runs on. The IPC is then checked against a broad
+// band a core can have.
 //
 // It skips unless the machine can run a real microVM (requireRealHost) and the
 // node could count on this platform.
@@ -80,6 +81,15 @@ func TestRealVCPUThreadsCountTheGuestsInstructions(t *testing.T) {
 		t.Fatalf("Final = %+v, %v; want a counted job", sum.Counters, ok)
 	}
 	c := sum.Counters
+	if !sum.Measured.Threads || len(sum.Points) == 0 {
+		t.Fatalf("the vCPU threads' CPU time was not measured (%+v), so the counts cannot be checked "+
+			"against it", sum.Measured)
+	}
+	// THE LOOP RAN: of ten seconds, the vCPU threads spent at least five on a core.
+	ran := time.Duration(sum.Latest.GuestCPU-sum.Points[0].GuestCPU) * time.Microsecond
+	if ran < 5*time.Second {
+		t.Fatalf("the vCPU threads ran %s while the guest was meant to spin; the loop did not start", ran)
+	}
 	t.Logf("cycles %d, instructions %d, cache references %d, cache misses %d, branch misses %d, "+
 		"frontend stalls %d; measured %v", c.Values[usage.Cycles], c.Values[usage.Instructions],
 		c.Values[usage.CacheReferences], c.Values[usage.CacheMisses], c.Values[usage.BranchMisses],
@@ -92,6 +102,11 @@ func TestRealVCPUThreadsCountTheGuestsInstructions(t *testing.T) {
 	if c.Values[usage.Instructions] <= 0 || c.Values[usage.Cycles] <= 0 {
 		t.Fatalf("a spinning guest counted %d instructions in %d cycles", c.Values[usage.Instructions],
 			c.Values[usage.Cycles])
+	}
+	// THE CYCLES ARE THE GUEST'S: per second the vCPU threads ran, a core's clock.
+	if ghz := float64(c.Values[usage.Cycles]) / ran.Seconds() / 1e9; ghz < 0.5 || ghz > 6 {
+		t.Errorf("%.2f GHz of cycles counted over the %s the vCPU threads ran, want 0.5 to 6: "+
+			"guest mode is not being counted", ghz, ran)
 	}
 	// A BROAD BAND, because it is a property of the CPU and the loop rather than
 	// of billet: below it the count is mostly not the guest's, above it no core

@@ -229,19 +229,33 @@ func (s *Sample) readThreads(r Reader, t Target) []int {
 
 // isVCPUThread reports whether tid is still one of the target VMM's vCPU
 // threads: listed under the VMM, named as one, and the VMM still the process
-// the target recorded.
-func (r Reader) isVCPUThread(t Target, tid int) bool {
+// the target recorded. A thread or a VMM that is gone is a no; a read that
+// fails otherwise, or a stat it cannot parse, is an error, because it cannot
+// tell.
+func (r Reader) isVCPUThread(t Target, tid int) (bool, error) {
 	raw, err := r.read(fmt.Sprintf("/proc/%d/task/%d/stat", t.PID, tid))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
-		return false
+		return false, err
 	}
 	comm, _, _, err := parseTaskStat(raw)
-	if err != nil || !strings.HasPrefix(comm, t.VCPUThreadPrefix) {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasPrefix(comm, t.VCPUThreadPrefix) {
+		return false, nil
 	}
 	start, err := r.ProcessStart(t.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
 
-	return err == nil && start == t.PIDStart
+	return start == t.PIDStart, nil
 }
 
 // ProcessStart is the start time of pid, which with the pid names one process.

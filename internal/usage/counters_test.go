@@ -35,6 +35,8 @@ type fakeCounters struct {
 	onOpen func(tid int)
 	groups []*fakeGroup
 	calls  map[uint64]bool
+	// opens counts the opens asked of each thread.
+	opens map[int]int
 }
 
 type fakeGroup struct {
@@ -47,7 +49,7 @@ type fakeGroup struct {
 func newFakeCounters() *fakeCounters {
 	return &fakeCounters{reading: map[int]CounterReading{}, readErr: map[int]error{},
 		refuse: map[Event]bool{}, refuseOn: map[int]Event{}, openErr: map[int]error{},
-		calls: map[uint64]bool{}}
+		calls: map[uint64]bool{}, opens: map[int]int{}}
 }
 
 // goroutineID is the calling goroutine's number, from its stack header.
@@ -66,6 +68,7 @@ func goroutineID() uint64 {
 func (f *fakeCounters) Open(tid int) (CounterGroup, error) {
 	f.mu.Lock()
 	f.calls[goroutineID()] = true
+	f.opens[tid]++
 	onOpen := f.onOpen
 	err := f.openErr[tid]
 	g := &fakeGroup{src: f, tid: tid}
@@ -259,7 +262,88 @@ func TestAThreadThatCannotBeCountedLeavesNoTotal(t *testing.T) {
 	m.Start("vm", target, 8)
 	src.set(refVCPUs, reading(time.Second, time.Second, 10, 12, 3, 1, 1, 2))
 	m.Tick()
+	m.Tick()
 
+	if c := finalCounters(t, m); c.Measured != [NumEvents]bool{} {
+		t.Errorf("counters = %+v, want every event unmeasured", c)
+	}
+	// AND IT IS NOT TRIED AGAIN EVERY SAMPLE, which would open a descriptor
+	// every sample on a host where opening one can leak it.
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	if n := src.opens[315374]; n != 1 {
+		t.Errorf("a thread that could not be opened was asked %d times, want once", n)
+	}
+}
+
+// A THREAD WITH NO READING IS NOT A THREAD THAT COUNTED ZERO: a group whose
+// every read failed leaves the job's counts could-not-tell, while it is open
+// and after it is closed.
+func TestAThreadThatWasNeverReadIsNotCountedAsZero(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	src.readErr[315372] = errors.New("read failed")
+	_, target, m := countedVM(t, src)
+	m.Start("vm", target, 8)
+	src.set(refVCPUs, reading(time.Second, time.Second, 10, 12, 3, 1, 1, 2))
+	m.Tick()
+
+	if c := finalCounters(t, m); c.Measured != [NumEvents]bool{} {
+		t.Errorf("counters = %+v, want every event unmeasured", c)
+	}
+}
+
+// A SCALED ESTIMATE MAY FALL BETWEEN TWO HONEST READINGS as the group's share
+// of the PMU changes, and the latest is the one reported; a raw count that
+// runs backwards is not this group's, and the reading before it stands.
+func TestTheLatestEstimateIsReportedAndABackwardsCountIsNot(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	_, target, m := countedVM(t, src)
+	m.Start("vm", target, 8)
+	src.set(refVCPUs, reading(10, 1, 1000, 1000, 1000, 1000, 1000, 1000))
+	m.Tick()
+	src.set(refVCPUs, reading(20, 11, 1100, 1100, 1100, 1100, 1100, 1100))
+	m.Tick()
+	src.set(refVCPUs, reading(30, 21, 900, 1200, 1200, 1200, 1200, 1200))
+	m.Tick()
+
+	c := finalCounters(t, m)
+	if got := c.Values[Instructions]; got != 8*2000 {
+		t.Errorf("instructions = %d, want %d: 1100 counted in 11 of 20 ns is 2000, and a "+
+			"reading with a count that ran backwards is not taken", got, 8*2000)
+	}
+	if !c.Measured[Instructions] {
+		t.Error("instructions were not measured")
+	}
+}
+
+// A THREAD WHOSE IDENTITY CANNOT BE CHECKED AFTER THE OPEN IS CLOSED, and the
+// job's counts are could-not-tell: it may be one of the job's vCPU threads,
+// and nothing counts it now.
+func TestAThreadWhoseIdentityCannotBeCheckedLeavesNoTotal(t *testing.T) {
+	t.Parallel()
+
+	src := newFakeCounters()
+	tr, target, m := countedVM(t, src)
+	var writeErr error
+	src.onOpen = func(tid int) {
+		if tid == 315376 {
+			writeErr = os.WriteFile(filepath.Join(tr.root, "proc", "315359", "task", "315376", "stat"),
+				[]byte("unparseable\n"), 0o600)
+		}
+	}
+	src.set(refVCPUs, reading(time.Second, time.Second, 70, 70, 70, 70, 70, 70))
+	m.Start("vm", target, 8)
+	if writeErr != nil {
+		t.Fatalf("the thread's stat could not be spoiled: %v", writeErr)
+	}
+
+	if n := src.open()[315376]; n != 0 {
+		t.Errorf("a group whose thread could not be checked is still open (%d)", n)
+	}
 	if c := finalCounters(t, m); c.Measured != [NumEvents]bool{} {
 		t.Errorf("counters = %+v, want every event unmeasured", c)
 	}

@@ -43,9 +43,14 @@ func HardwareCounters() (CounterSource, error) { return perfSource{}, nil }
 func (perfSource) Open(tid int) (CounterGroup, error) {
 	g := &perfGroup{}
 	for e, hw := range hardwareEvents {
+		// THE LEADER OPENS DISABLED and the group is enabled whole below, so no
+		// event counts in a group that is not yet the one read: the group's
+		// times are the leader's, and a partial group that ran before the full
+		// one proved unschedulable would scale its first instants over the job.
 		attr := &perf.Attr{
 			CountFormat: perf.CountFormat{Enabled: true, Running: true, Group: g.leader == nil},
-			Options:     perf.Options{ExcludeGuest: false, ExcludeHost: false, ExcludeKernel: false},
+			Options: perf.Options{Disabled: g.leader == nil,
+				ExcludeGuest: false, ExcludeHost: false, ExcludeKernel: false},
 		}
 		if err := hw.Configure(attr); err != nil {
 			continue
@@ -68,6 +73,13 @@ func (perfSource) Open(tid int) (CounterGroup, error) {
 	}
 	if g.leader == nil {
 		return nil, fmt.Errorf("usage: no hardware event could be counted on thread %d", tid)
+	}
+	if err := g.leader.Enable(); err != nil {
+		_ = g.Close()
+		if errors.Is(err, unix.ESRCH) {
+			return nil, ErrThreadGone
+		}
+		return nil, fmt.Errorf("usage: enable the counters of thread %d: %w", tid, err)
 	}
 
 	return g, nil

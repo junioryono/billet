@@ -72,6 +72,10 @@ type Counters struct {
 // touches it, so every descriptor is opened, read and closed on one goroutine.
 type jobCounters struct {
 	threads map[int]*threadCounters
+	// failed holds the threads that could not be counted, which are not opened
+	// again: the job's totals are already could-not-tell, and a retry every
+	// sample would open a descriptor every sample.
+	failed map[int]bool
 	// exited is the last scaled reading of every thread that has gone.
 	exited [NumEvents]uint64
 	// counted marks an event some thread's group opened, and broken one some
@@ -86,14 +90,22 @@ type jobCounters struct {
 type threadCounters struct {
 	group  CounterGroup
 	opened [NumEvents]bool
-	// last is the most recent scaled reading. A read that fails keeps it, as a
-	// failed read of any other counter keeps the one before.
-	last    [NumEvents]uint64
-	enabled time.Duration
+	// last is the most recent scaled reading, and raw the reading it was scaled
+	// from. A read that fails keeps them, as a failed read of any other counter
+	// keeps the one before.
+	last [NumEvents]uint64
+	raw  CounterReading
+	// read says some reading has been taken and scaled; until one has, the
+	// thread's counts are could-not-tell, not zero.
+	read bool
 	// unscaled says the latest read could not be scaled (the group was enabled
 	// and never ran), so the thread's counts are could-not-tell until one can.
 	unscaled bool
 }
+
+// known says the thread's latest reading is a count: one was taken and it
+// could be scaled.
+func (th *threadCounters) known() bool { return th.read && !th.unscaled }
 
 // scale extrapolates a count over the time its group was enabled from the time
 // it ran. Equal times need no scaling and stay exact; a group that was enabled
@@ -118,14 +130,17 @@ func scale(value uint64, enabled, running time.Duration) (uint64, bool) {
 
 // update brings a job's groups up to date with its vCPU thread listing and
 // reads every one. listed says vcpus is a listing; without one, the groups
-// already open are read and nothing is opened or retired. alive proves a thread
-// just opened is still one of the job's vCPU threads.
-func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool, alive func(tid int) bool) {
+// already open are read and nothing is opened or retired. alive says whether a
+// thread just opened is still one of the job's vCPU threads, or that it could
+// not tell.
+func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool,
+	alive func(tid int) (bool, error),
+) {
 	if c.finished {
 		return
 	}
 	if c.threads == nil {
-		c.threads = map[int]*threadCounters{}
+		c.threads, c.failed = map[int]*threadCounters{}, map[int]bool{}
 	}
 	if listed {
 		for tid, th := range c.threads {
@@ -138,7 +153,7 @@ func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool, alive 
 			}
 		}
 		for _, tid := range vcpus {
-			if _, ok := c.threads[tid]; !ok {
+			if _, ok := c.threads[tid]; !ok && !c.failed[tid] {
 				c.open(src, tid, alive)
 			}
 		}
@@ -152,19 +167,24 @@ func (c *jobCounters) update(src CounterSource, vcpus []int, listed bool, alive 
 //
 // CHECKED AFTER THE OPEN, like readThreads: a tid the kernel gave to another
 // process between the listing and the open is no longer one of this VMM's
-// threads, and a group that counted it is closed unread.
-func (c *jobCounters) open(src CounterSource, tid int, alive func(int) bool) {
+// threads, and a group that counted it is closed unread. A check that cannot
+// tell closes it too, and makes the job's counts could-not-tell, since the
+// thread may be one of the job's and is no longer counted.
+func (c *jobCounters) open(src CounterSource, tid int, alive func(int) (bool, error)) {
 	g, err := src.Open(tid)
 	if errors.Is(err, ErrThreadGone) {
 		return
 	}
 	if err != nil {
-		for e := range NumEvents {
-			c.broken[e] = true
-		}
+		c.fail(tid)
 		return
 	}
-	if !alive(tid) {
+	switch ok, err := alive(tid); {
+	case err != nil:
+		_ = g.Close()
+		c.fail(tid)
+		return
+	case !ok:
 		_ = g.Close()
 		return
 	}
@@ -179,11 +199,25 @@ func (c *jobCounters) open(src CounterSource, tid int, alive func(int) bool) {
 	c.threads[tid] = th
 }
 
+// fail records a vCPU thread that could not be counted: every event is then
+// could-not-tell for the job, and the thread is not tried again.
+func (c *jobCounters) fail(tid int) {
+	c.failed[tid] = true
+	for e := range NumEvents {
+		c.broken[e] = true
+	}
+}
+
 func (c *jobCounters) read(th *threadCounters) {
 	r, err := th.group.Read()
-	// A COUNT NEVER RUNS BACKWARDS, and neither does its enabled time: a reading
-	// that does is not of this group's counters, and the one before stands.
-	if err != nil || r.Enabled < th.enabled {
+	if err != nil {
+		return
+	}
+	// A COUNT NEVER RUNS BACKWARDS, and neither do its times: a reading that does
+	// is not of this group's counters, and the one before stands. Checked on the
+	// raw counts, because a scaled estimate may fall between two honest
+	// readings as the group's share of the PMU changes.
+	if r.Enabled < th.raw.Enabled || r.Running < th.raw.Running {
 		return
 	}
 	var scaled [NumEvents]uint64
@@ -191,24 +225,27 @@ func (c *jobCounters) read(th *threadCounters) {
 		if !th.opened[e] {
 			continue
 		}
+		if r.Values[e] < th.raw.Values[e] {
+			return
+		}
 		v, ok := scale(r.Values[e], r.Enabled, r.Running)
 		if !ok {
 			th.unscaled = true
 			return
 		}
-		scaled[e] = max(v, th.last[e])
+		scaled[e] = v
 	}
-	th.last, th.enabled, th.unscaled = scaled, r.Enabled, false
+	th.last, th.raw, th.read, th.unscaled = scaled, r, true, false
 }
 
 // retire closes a thread's group and keeps what it counted. A thread whose
-// last reading could not be scaled leaves its counts unknown for good.
+// latest reading is not a count leaves the job's counts unknown for good.
 func (c *jobCounters) retire(tid int, th *threadCounters) {
 	_ = th.group.Close()
 	delete(c.threads, tid)
 	for e := range NumEvents {
 		c.exited[e] = addCapped(c.exited[e], th.last[e])
-		if th.unscaled {
+		if !th.known() {
 			c.broken[e] = true
 		}
 	}
@@ -234,8 +271,8 @@ func addCapped(a, b uint64) uint64 {
 }
 
 // totals sums every thread's latest reading. An event is measured only if some
-// thread counted it, no vCPU thread failed to, every thread's latest reading
-// could be scaled, and the sum fits.
+// thread counted it, no vCPU thread failed to, every thread has a latest
+// reading and it could be scaled, and the sum fits.
 func (c *jobCounters) totals() *Counters {
 	if c == nil {
 		return nil
@@ -247,7 +284,7 @@ func (c *jobCounters) totals() *Counters {
 		}
 		sum, ok := c.exited[e], true
 		for _, th := range c.threads {
-			if th.unscaled {
+			if !th.known() {
 				ok = false
 				break
 			}
