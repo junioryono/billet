@@ -2,12 +2,15 @@ package node
 
 import (
 	"context"
+	"net"
+	"path/filepath"
 	"slices"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
+	"github.com/junioryono/billet/internal/usage/flows"
 )
 
 // JobMonitor samples running jobs. *usage.Monitor is the real one.
@@ -34,10 +37,26 @@ func WithMonitor(m JobMonitor) Option {
 	return func(r *Runner) { r.monitor = m }
 }
 
+// FlowWatcher follows a guest's connections by destination. *flows.Watcher is
+// the real one.
+type FlowWatcher interface {
+	Watch(key string, mac net.HardwareAddr, leaseFile string, since time.Time)
+	Final(key string) (flows.Result, bool, error)
+	Forget(key string)
+}
+
+// WithFlows totals every job's traffic by destination, learning each guest's
+// address from the DHCP leases under leaseDir (one directory per bridge).
+func WithFlows(w FlowWatcher, leaseDir string) Option {
+	return func(r *Runner) { r.flows, r.leaseDir = w, leaseDir }
+}
+
 // startMonitoring begins measuring a job that has just launched. Everything
 // here is off the job's path: a backend that cannot say where the counters are
 // costs the measurement and nothing else.
-func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) {
+func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *provider.Instance,
+	launchedAt time.Time,
+) {
 	if r.monitor == nil {
 		return
 	}
@@ -60,6 +79,50 @@ func (r *Runner) startMonitoring(ctx context.Context, lease *alloc.Lease, inst *
 		NetDevice:        target.NetDevice, NetHostView: target.NetHostView,
 		Process: target.Process,
 	}, lease.VCPU)
+
+	r.startFlows(inst.Name, target, launchedAt)
+}
+
+// startFlows begins following a guest's connections, when flows are measured
+// and the backend said which DHCP lease holds the guest's address.
+func (r *Runner) startFlows(name string, target provider.UsageTarget, launchedAt time.Time) {
+	if r.flows == nil {
+		return
+	}
+
+	mac, err := net.ParseMAC(target.GuestMAC)
+	if err != nil || target.Bridge == "" || filepath.Base(target.Bridge) != target.Bridge {
+		r.log.Warn("could not tell which DHCP lease holds a job's address; its traffic will not be "+
+			"totalled by destination", "runner", name, "mac", target.GuestMAC, "bridge", target.Bridge)
+
+		return
+	}
+
+	r.flows.Watch(name, mac, filepath.Join(r.leaseDir, target.Bridge, "dnsmasq.leases"), launchedAt)
+}
+
+// finalFlows takes what a job's connections came to. Until the ledger stores
+// them, they are said in the node's log.
+func (r *Runner) finalFlows(name string) {
+	if r.flows == nil {
+		return
+	}
+
+	res, measured, err := r.flows.Final(name)
+	if !measured {
+		r.log.Warn("a job's traffic was not totalled by destination", "runner", name, "error", err)
+
+		return
+	}
+
+	var sent, received uint64
+	for _, d := range res.Destinations {
+		sent, received = sent+d.Sent, received+d.Received
+	}
+
+	r.log.Info("a job's traffic by destination", "runner", name, "destinations", len(res.Destinations),
+		"sent", sent+res.Other.Sent, "received", received+res.Other.Received,
+		"incomplete", res.Incomplete, "error", err)
 }
 
 // finalUsage takes a job's last sample. It is called before the compute is
@@ -77,6 +140,10 @@ func (r *Runner) finalUsage(name string) (usage.Summary, bool) {
 func (r *Runner) forgetMonitoring(name string) {
 	if r.monitor != nil {
 		r.monitor.Forget(name)
+	}
+
+	if r.flows != nil {
+		r.flows.Forget(name)
 	}
 }
 

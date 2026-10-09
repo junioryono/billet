@@ -478,6 +478,11 @@ type UsageTarget struct {
 	// Process says the instance is PID alone, with no cgroup of its own, and is
 	// measured by that process's own accounting (a Virtualization.framework VM).
 	Process bool
+	// GuestMAC and Bridge say which DHCP lease holds the guest's address: the
+	// hardware address billet gave it, on the bridge whose dnsmasq leased it.
+	// Empty when the backend has no such address to learn.
+	GuestMAC string
+	Bridge   string
 }
 
 // UsageSource is a backend whose instances can be measured from the host.

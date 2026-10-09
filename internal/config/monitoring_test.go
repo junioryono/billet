@@ -87,3 +87,27 @@ func TestATartNodeIsMonitoredWithoutRAPL(t *testing.T) {
 		})
 	}
 }
+
+// FLOWS ARE A FIRECRACKER GUEST'S: only its address is leased on a billet
+// bridge the host can read. Asked for on another backend, they are refused.
+func TestFlowsAreRefusedWhereTheGuestsAddressIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(writeConfig(t, withMonitoring(t, "  monitoring:\n    flows: true\n")))
+	if err != nil {
+		t.Fatalf("flows on a firecracker node were refused: %v", err)
+	}
+
+	if !cfg.Node.Monitoring.Flows {
+		t.Error("flows: true was not read")
+	}
+
+	for _, provider := range []ProviderKind{ProviderDocker, ProviderTart} {
+		c := &Config{Node: &NodeConfig{Provider: provider, Monitoring: &NodeMonitoringConfig{Flows: true}}}
+
+		got := errors.Join(c.validateMonitoringNode()...)
+		if got == nil || !strings.Contains(got.Error(), "node.monitoring.flows") {
+			t.Errorf("%s: flows answered %v, want a refusal naming node.monitoring.flows", provider, got)
+		}
+	}
+}

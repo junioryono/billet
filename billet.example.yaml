@@ -457,10 +457,15 @@ node:
   # above the baseline is shared by CPU time and the baseline by reserved vCPUs;
   # without it the whole package is shared by CPU time and marked unsplit.
   #
+  # flows (firecracker only) totals each job's traffic by destination from
+  # the connection tracker, and needs net.netfilter.nf_conntrack_acct and
+  # nf_conntrack_timestamp set to 1; without them the node refuses to start.
+  #
   # monitoring:
   #   interval: 1s
   #   rapl: true
   #   idle_package_watts: 73.5
+  #   flows: true
 
   firecracker:
     # The guest kernel must include everything Docker needs, or service
