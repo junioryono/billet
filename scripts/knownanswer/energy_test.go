@@ -234,13 +234,76 @@ func TestALogCoarserThanTheMonitorIsUnmeasured(t *testing.T) {
 			row.delta, row.deltaOK = 147_000_000, true
 		}
 		if i >= 12 && i < 22 {
-			row.delta, row.instances = 347_000_000, []string{"billet-lease-a"}
+			row.delta, row.instances = 347_000_000, []string{"billet-lease-a", "billet-lease-b"}
 		}
 		rows = append(rows, row)
 	}
-	res := reconcile(rows, 73.5, 10, fromMap(leaseA(2000, 0, nil)))
+	// TWO JOBS, ONE TICKING EVERY SECOND AND ONE EVERY TWO: the two-second rows
+	// are coarse for the first whatever the second ticked at.
+	recs := leaseA(1000, 0, nil)
+	slow := leaseA(1000, 0, func(u *usage) { u.IntervalMillis = 2000 })["lease-a"]
+	slow.Lease = "lease-b"
+	recs["lease-b"] = slow
+	res := reconcile(rows, 73.5, 10, fromMap(recs))
 	if res.verdict != unmeasured || !strings.Contains(res.reason, "coarser than the monitor's 1.00 s tick") {
 		t.Errorf("verdict %s (%q), want UNMEASURED", res.verdict, res.reason)
+	}
+}
+
+// ONE TRACE, TWO CLOCKS: the package alternates 70 and 80 W second by second
+// while a microVM is alive. This log's rows fall on the seconds and see 70 and
+// 80, clipping the 70s; the monitor's ticks fall half a second later and see
+// 75 every time. Its attribution is what that trace gives at its ticks, and the
+// reconciliation must accept it although the two disagree by half: each bound
+// gives way by the clipping that could have moved it.
+func TestOneTraceSampledByTwoClocksReconciles(t *testing.T) {
+	const idle = 73.5
+	busy := func(k int) bool { return k >= 11 && k < 51 }
+	power := func(k int) float64 { // the package's power over second [k, k+1)
+		switch {
+		case !busy(k):
+			return idle
+		case k%2 == 0:
+			return 70
+		default:
+			return 80
+		}
+	}
+	var rows []powerRow
+	for i := range 64 {
+		row := powerRow{epoch: int64(i), uptime: float64(i), uptimeOK: true, inventoryOK: true}
+		if i > 0 {
+			row.delta, row.deltaOK = int64(power(i-1)*1e6), true
+		}
+		if busy(i) {
+			row.instances = []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	// The monitor's tick [k+0.5, k+1.5) is half of second k and half of k+1,
+	// clipped at the baseline as the monitor clips it, over the microVM's life.
+	var monitor float64
+	for k := 10; k < 52; k++ {
+		monitor += max((power(k)+power(k+1))/2-idle, 0)
+	}
+	res := reconcile(rows, idle, 10, fromMap(leaseA(monitor, 0, nil)))
+	if res.verdict != pass {
+		t.Errorf("the monitor's %.1f J against this log's %.1f J (clipped %.1f J): %s, ratio %.3f in [%.3f, %.3f]: %s",
+			monitor, res.activeMeasured/1e6, res.clipped/1e6, res.verdict, res.ratio, res.low, res.high, res.reason)
+	}
+	if res.clipped != 70_000_000 || res.ratio > attributedLow {
+		t.Errorf("clipped %.0f µJ, ratio %.3f: the trace does not exercise the lower bound", res.clipped, res.ratio)
+	}
+
+	// THE OTHER WAY, with quiet ends that never dip: noise the monitor clipped
+	// where this log saw an excess is as large, in expectation, as what this log
+	// clipped, so the upper bound gives way by this log's own 70 J of clipping
+	// when the quiet ends offer less. 190 J against this log's 130 J passes only
+	// with it (1.462 against 1.02 + 70/130 = 1.558).
+	over := reconcile(rows, idle, 10, fromMap(leaseA(190, 0, nil)))
+	if over.allowance != 70_000_000 || over.verdict != pass {
+		t.Errorf("allowance %.0f µJ, %s (ratio %.3f in [%.3f, %.3f])", over.allowance, over.verdict, over.ratio,
+			over.low, over.high)
 	}
 }
 

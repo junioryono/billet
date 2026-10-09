@@ -133,10 +133,14 @@ type energyResult struct {
 	// tick is the monitor's sampling interval, from the records; coarse says why
 	// the log is too coarse to reproduce it; allowance is what clocks falling at
 	// different moments can add to the jobs' share, and high the bound with it.
-	tick                       float64
-	coarse                     string
-	allowance                  float64
-	high                       float64
+	tick      float64
+	coarse    string
+	allowance float64
+	high      float64
+	// clipped is how far this log's busy intervals fell below the baseline,
+	// which it counted as no active energy; low is the lower bound with it.
+	clipped                    float64
+	low                        float64
 	attributed, attributedIdle int64
 	ratio                      float64
 	jobs                       []energyJob
@@ -200,6 +204,7 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 		if len(row.instances) > 0 || len(rows[i-1].instances) > 0 {
 			res.activeMeasured += float64(row.delta) - idle
 			res.busySeconds += dt
+			res.clipped += idleWatts*dt*1e6 - idle
 		}
 	}
 	res.seconds = rows[len(rows)-1].uptime - rows[0].uptime
@@ -249,7 +254,11 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 				rec.Usage.EnergySource)
 		default:
 			j.window = float64(rec.Usage.WindowMillis) / 1000
-			res.tick = max(res.tick, float64(rec.Usage.IntervalMillis)/1000)
+			// THE FINEST TICK IN THE WINDOW is the one a coarse row must be held to:
+			// a 2 s row during a 1 s job is too coarse whatever another job ticked at.
+			if t := float64(rec.Usage.IntervalMillis) / 1000; t > 0 && (res.tick == 0 || t < res.tick) {
+				res.tick = t
+			}
 			j.active, j.idle = rec.Usage.EnergyActiveUJ, rec.Usage.EnergyIdleUJ
 			res.attributed += j.active
 			res.attributedIdle += j.idle
@@ -279,6 +288,15 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 	if quiet := quietBefore + quietAfter; quiet > 0 {
 		res.allowance = (shortBefore + shortAfter) / quiet * res.busySeconds
 	}
+	// AND THE OTHER WAY: an interval this log clipped at the baseline may have
+	// been an excess and a dip to the monitor, which counted the excess and
+	// nothing for the dip, or the reverse. Neither log can see the other's
+	// clipping, so each bound gives way by what could have moved it: the
+	// upper by the larger of the quiet ends' estimate and this log's own
+	// clipping, the lower by this log's own clipping.
+	if res.clipped > res.allowance {
+		res.allowance = res.clipped
+	}
 	switch {
 	case len(missing) > 0:
 		res.reason = "the window's energy cannot be accounted for without " + strings.Join(missing, ", ")
@@ -292,8 +310,9 @@ func reconcile(rows []powerRow, idleWatts float64, quiet int, records recordSour
 	default:
 		res.ratio = float64(res.attributed) / res.activeMeasured
 		res.high = attributedHigh + res.allowance/res.activeMeasured
+		res.low = attributedLow * (res.activeMeasured - res.clipped) / res.activeMeasured
 		res.verdict = fail
-		if res.ratio >= attributedLow && res.ratio <= res.high {
+		if res.ratio >= res.low && res.ratio <= res.high {
 			res.verdict = pass
 		}
 	}
@@ -409,10 +428,11 @@ func (res energyResult) write(w io.Writer) {
 	}
 	if res.verdict != unmeasured {
 		fmt.Fprintf(w, "above idle over the %.0f s a microVM was alive: measured %s, attributed to jobs %s "+
-			"(ratio %.3f, accepted [%.2f, %.3f])\n", res.busySeconds, kj(res.activeMeasured),
-			kj(float64(res.attributed)), res.ratio, attributedLow, res.high)
+			"(ratio %.3f, accepted [%.3f, %.3f])\n", res.busySeconds, kj(res.activeMeasured),
+			kj(float64(res.attributed)), res.ratio, res.low, res.high)
 		fmt.Fprintf(w, "allowance: %s for the monitor's ticks falling between this log's rows (the quiet ends' "+
-			"dips below the baseline, per busy second)\n", kj(res.allowance))
+			"dips below the baseline per busy second, or this log's own clipping, whichever is larger); "+
+			"clipped %s\n", kj(res.allowance), kj(res.clipped))
 		fmt.Fprintf(w, "unattributed: %s, %.1f W while a microVM was alive (the host's own work above idle)\n",
 			kj(res.activeMeasured-float64(res.attributed)),
 			(res.activeMeasured-float64(res.attributed))/1e6/res.busySeconds)
