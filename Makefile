@@ -114,6 +114,33 @@ cover: ## Coverage profile + HTML report
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
+BENCHTIME ?= 2s
+
+.PHONY: bench
+bench: ## The allocator's and the node wire's benchmarks, three runs each; compare two with benchstat
+	@# SQLite unless BILLET_TEST_LEDGER=postgres and BILLET_TEST_POSTGRES_DSN say
+	@# otherwise, as the tests are. What they measure, and the decision made on
+	@# them, is docs/reference/records/ledger-write-budget.md.
+	$(NICE) go test -run '^$$' -bench . -benchtime $(BENCHTIME) -count 3 ./internal/alloc/ ./internal/nodeplane/
+
+FUZZTIME ?= 1m
+
+.PHONY: fuzz
+fuzz: ## Search past every fuzz target's seeds for FUZZTIME each; `test` already runs the seeds
+	@# THE NIGHTLY WORKFLOW'S LIST, which TestEveryFuzzTargetIsSearchedNightly
+	@# holds equal to the Fuzz functions in the tree, so there is one list. ONE
+	@# TARGET A RUN, because `go test -fuzz` takes exactly one. The list is read
+	@# into a variable first, so a failed read stops here rather than iterating
+	@# over nothing; an empty list is refused. A finding is written under the
+	@# package's testdata/fuzz/, and committed beside its fix it becomes a seed.
+	@set -eu; \
+	targets=$$(sed -n 's/^ *- { package: \(\.\/[^,]*\), fuzz: \(Fuzz[A-Za-z0-9_]*\) }$$/\1 \2/p' .github/workflows/fuzz.yml); \
+	if [ -z "$$targets" ]; then echo "fuzz: .github/workflows/fuzz.yml lists no targets" >&2; exit 1; fi; \
+	printf '%s\n' "$$targets" | while read -r pkg fn; do \
+		echo "== $$pkg $$fn"; \
+		CGO_ENABLED=0 $(NICE) go test "$$pkg" -run '^$$' -fuzz "^$$fn\$$" -fuzztime $(FUZZTIME) || exit 1; \
+	done
+
 .PHONY: no-mutants
 no-mutants: ## Refuse to proceed while a killed mutation run has left a mutant on disk
 	@# FIRST in `check`, unlike tests-kept, because this one cannot be a false

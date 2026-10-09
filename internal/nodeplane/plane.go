@@ -2032,6 +2032,22 @@ func (p *Plane) Seen(name, incarnation string) {
 	n.lastSeen = p.now()
 }
 
+// NegotiatedWire is the version the process currently registered as node
+// settled on. False means this plane does not know: no registration, one that
+// predates the negotiated wire, or a request from a process that is not the
+// current one (a superseded process draining its custody).
+func (p *Plane) NegotiatedWire(node, incarnation string) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok || !currentLocked(n, incarnation) || n.wireVersion <= 0 {
+		return 0, false
+	}
+
+	return n.wireVersion, true
+}
+
 // Nodes reports the registered node names, for diagnostics.
 func (p *Plane) Nodes() []string {
 	p.mu.Lock()

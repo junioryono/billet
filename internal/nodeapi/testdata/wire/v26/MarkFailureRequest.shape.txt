@@ -1,0 +1,2 @@
+MarkFailureRequest.epoch int64
+MarkFailureRequest.reason string

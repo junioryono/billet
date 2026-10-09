@@ -5,6 +5,7 @@ go 1.26.9
 require (
 	github.com/actions/scaleset v0.4.0
 	github.com/bazelbuild/remote-apis v0.0.0-20260922155111-adbf4a27c86f
+	github.com/elastic/go-perf v0.0.0-20260224073651-af0ee0c731b7
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/jackc/pgx/v5 v5.10.0

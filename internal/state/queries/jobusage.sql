@@ -10,20 +10,26 @@
 -- THE ROW COUNT SAYS WHETHER THIS REPORT WON, and only the report that won may
 -- write the series: otherwise a first report without a series and a second
 -- with one would be stored as a pair neither request sent.
+--
+-- A hardware counter is NULL where it was not counted (migration 58).
 INSERT INTO job_usage
      (lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
       window_ms, cpu_user_us, cpu_system_us, guest_cpu_us, vmm_cpu_us,
       memory_peak_bytes, oom_kills, disk_read_bytes, disk_write_bytes,
       net_rx_bytes, net_tx_bytes, net_rx_packets, net_tx_packets,
       cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
-      io_full_us, energy_active_uj, energy_idle_uj, energy_source)
+      io_full_us, energy_active_uj, energy_idle_uj, energy_source,
+      cycles, instructions, cache_references, cache_misses, branch_misses,
+      frontend_stall_cycles)
 VALUES (@lease_id, @node, @recorded_at, @source, @unmeasured, @samples,
         @interval_ms, @window_ms, @cpu_user_us, @cpu_system_us, @guest_cpu_us,
         @vmm_cpu_us, @memory_peak_bytes, @oom_kills, @disk_read_bytes,
         @disk_write_bytes, @net_rx_bytes, @net_tx_bytes, @net_rx_packets,
         @net_tx_packets, @cpu_some_us, @cpu_full_us, @memory_some_us,
         @memory_full_us, @io_some_us, @io_full_us, @energy_active_uj,
-        @energy_idle_uj, @energy_source)
+        @energy_idle_uj, @energy_source, @cycles, @instructions,
+        @cache_references, @cache_misses, @branch_misses,
+        @frontend_stall_cycles)
 ON CONFLICT (lease_id) DO NOTHING;
 
 -- name: RecordJobSeries :exec
@@ -41,7 +47,9 @@ SELECT lease_id, node, recorded_at, source, unmeasured, samples, interval_ms,
        memory_peak_bytes, oom_kills, disk_read_bytes, disk_write_bytes,
        net_rx_bytes, net_tx_bytes, net_rx_packets, net_tx_packets,
        cpu_some_us, cpu_full_us, memory_some_us, memory_full_us, io_some_us,
-       io_full_us, energy_active_uj, energy_idle_uj, energy_source
+       io_full_us, energy_active_uj, energy_idle_uj, energy_source, cycles,
+       instructions, cache_references, cache_misses, branch_misses,
+       frontend_stall_cycles
   FROM job_usage WHERE lease_id = @lease_id;
 
 -- name: ReadJobSeries :one

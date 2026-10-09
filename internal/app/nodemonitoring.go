@@ -55,8 +55,13 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 			"idle_package_watts", m.IdlePackageWatts)
 	}
 
-	monitor := jobusage.NewMonitor("/", jobusage.Options{Interval: interval, RAPL: m.RAPL,
-		IdleWatts: m.IdlePackageWatts})
+	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}
+	if m.Perf {
+		if sampling.Counters, err = counterSource(); err != nil {
+			return nil, err
+		}
+	}
+	monitor := jobusage.NewMonitor("/", sampling)
 	go monitor.Run(ctx)
 
 	opts := []node.Option{node.WithMonitor(monitor)}
@@ -96,4 +101,30 @@ func startFlows(ctx context.Context, root string, interval time.Duration) (*flow
 		"leases", config.DHCPLeaseDir)
 
 	return watcher, nil
+}
+
+// counterSource is the hardware counter reader node.monitoring.perf asks for.
+//
+// REFUSED HERE RATHER THAN IN CONFIG, on a platform that has no
+// perf_event_open or a host whose group of events never counts, because a
+// config is also validated on a machine that will not run it.
+func counterSource() (jobusage.CounterSource, error) {
+	counters, err := jobusage.HardwareCounters()
+	if err != nil {
+		return nil, fmt.Errorf("node.monitoring.perf is set, but this node cannot count: %w", err)
+	}
+
+	return provenCounters(counters)
+}
+
+// provenCounters is counters once they have proved they count on this host.
+func provenCounters(counters jobusage.CounterSource) (jobusage.CounterSource, error) {
+	if err := jobusage.ProveCounting(counters); err != nil {
+		return nil, fmt.Errorf("node.monitoring.perf is set, but this node cannot count: %w", err)
+	}
+	slog.Info("counting each microVM's vCPU threads with the CPU's hardware counters",
+		"events", "cycles, instructions, cache-references, cache-misses, branch-misses, "+
+			"stalled-cycles-frontend")
+
+	return counters, nil
 }

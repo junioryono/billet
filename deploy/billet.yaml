@@ -117,6 +117,7 @@ github:
 #   #   interval: 1s
 #   #   rapl: true
 #   #   flows: true
+#   #   perf: true
 
 # Tiers are yours to define. The label is what users put in `runs-on`.
 tiers:

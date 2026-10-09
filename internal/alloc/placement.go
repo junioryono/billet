@@ -268,7 +268,28 @@ func (p *placer) roomFor(node string, t config.Tier) int {
 }
 
 // total is how many of a tier the candidate set can hold between them.
+//
+// COUNTED, NOT PLACED, WHEN EVERY CANDIDATE CHARGES THE SAME. Placing the jobs
+// one at a time costs the hosts times the free slots, and it runs inside the
+// purchase's write transaction: 30 ms of the ledger's one writer slot per
+// purchase over 128 hosts (docs/reference/records/ledger-write-budget.md).
+// With one cost for every candidate, each placement takes exactly one off its
+// host's room and one off the deployment's, so the greedy count is the smaller
+// of the two sums and the order it would have chosen does not matter.
+// Candidates that charge differently (remote shapes, a tier spanning
+// backends) spend the deployment's room unevenly, so the order does matter,
+// and they are placed one at a time as before.
 func (p *placer) total(t config.Tier) int {
+	if n, ok := p.uniformTotal(t); ok {
+		return n
+	}
+
+	return p.greedyTotal(t)
+}
+
+// greedyTotal counts by placing the tier's jobs one at a time, as next would,
+// on a copy of the placer.
+func (p *placer) greedyTotal(t config.Tier) int {
 	clone := p.clone()
 	sum := 0
 	for {
@@ -277,6 +298,65 @@ func (p *placer) total(t config.Tier) int {
 		}
 		sum++
 	}
+}
+
+// uniformTotal is greedyTotal's answer in one pass, when every candidate with
+// a cost charges the same one, and false when they do not. order holds each
+// host once, as eligibleNodes reads it: one row per registered name.
+func (p *placer) uniformTotal(t config.Tier) (int, bool) {
+	var (
+		cost placementCost
+		seen bool
+	)
+
+	for _, n := range p.order {
+		c, ok := p.cost[n.name]
+		if !ok {
+			continue
+		}
+
+		if !seen {
+			cost, seen = c, true
+
+			continue
+		}
+
+		if c.vcpu != cost.vcpu || c.memory != cost.memory {
+			return 0, false
+		}
+	}
+
+	if !seen {
+		return 0, true
+	}
+
+	if cost.vcpu <= 0 || cost.memory <= 0 {
+		return 0, false
+	}
+
+	deployment := max(min(p.deploymentVCPU/cost.vcpu, int(p.deploymentMemory/cost.memory)), 0)
+
+	// EACH HOST'S OWN ROOM, which roomFor computes before the deployment's
+	// ceiling: one placement takes exactly one off it, since every term of the
+	// minimum falls by one. CAPPED AS IT IS ADDED, at the deployment's room,
+	// which is the most the sum can contribute and keeps hosts large enough to
+	// overflow an int from summing past it.
+	hosts := 0
+
+	for _, n := range p.order {
+		if _, ok := p.cost[n.name]; !ok {
+			continue
+		}
+
+		room := min(p.freeVCPU[n.name]/cost.vcpu, int(p.freeMemory[n.name]/cost.memory))
+		if t.GuestOS == config.GuestMacOS {
+			room = min(room, p.freeMacOS[n.name])
+		}
+
+		hosts += min(max(room, 0), deployment-hosts)
+	}
+
+	return hosts, true
 }
 
 // next picks the machine a reservation should be aimed at, and spends it.
