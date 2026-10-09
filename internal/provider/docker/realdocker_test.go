@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // A real container, launched and destroyed through real docker.
@@ -250,4 +253,63 @@ func TestRealDockerListSeesStoppedContainers(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("List returned %d containers, want the 1 stopped one: %v", len(all), all)
 	}
+}
+
+// A REAL CONTAINER'S OWN eth0 IS READ FROM THE HOST, through the target the
+// provider makes and the reader the sampler uses, without entering its
+// namespace; and it is that container's: what the container itself reads on
+// eth0 a moment later is never less. Linux only, since the host's /proc is
+// what is read.
+func TestRealDockerContainerNetworkIsMeasured(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("docker is not installed")
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("the host's /proc is read, and only Linux has one with the container in it")
+	}
+
+	p := New("billet-selftest")
+	name := fmt.Sprintf("billet-nettest-%d", os.Getpid())
+	t.Cleanup(func() {
+		//nolint:errcheck // best-effort sweep of a leftover from an earlier crash
+		_ = exec.CommandContext(context.WithoutCancel(t.Context()), "docker", "rm", "-f", name).Run()
+	})
+
+	inst, err := p.Launch(t.Context(), provider.Spec{
+		Name: name, Image: "busybox:latest", Command: []string{"sleep", "300"},
+		VCPU: 1, Memory: 256 * config.MiB, Trust: provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	})
+	if err != nil {
+		t.Fatalf("Launch against real docker: %v", err)
+	}
+
+	target, err := p.UsageTarget(t.Context(), inst.ID)
+	if err != nil {
+		t.Fatalf("UsageTarget: %v", err)
+	}
+	s := usage.Reader{Root: "/"}.Read(usage.Target{CgroupDir: target.CgroupDir, PID: target.PID,
+		PIDStart: target.PIDStart, NetDevice: target.NetDevice, NetNamespace: target.NetNamespace})
+	if !s.NetOK || !s.CPUOK {
+		t.Fatalf("a live container read net %v cpu %v, want both measured (target %+v)", s.NetOK, s.CPUOK, target)
+	}
+
+	out, err := exec.CommandContext(t.Context(), "docker", "exec", inst.ID, "cat", "/proc/net/dev").Output()
+	if err != nil {
+		t.Fatalf("read eth0 inside the container: %v", err)
+	}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		name, counters, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(name) != "eth0" {
+			continue
+		}
+		fields := strings.Fields(counters)
+		inside, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil || inside < s.NetRx {
+			t.Errorf("the container read eth0 rx %v (%v) after the host read %d; not its eth0", inside, err, s.NetRx)
+		}
+
+		return
+	}
+	t.Errorf("the container has no eth0:\n%s", out)
 }

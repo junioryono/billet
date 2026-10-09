@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ type measuredProvider struct {
 	*fakeProvider
 	root      string
 	targetErr error
+	// target, when set, is the answer to every UsageTarget.
+	target *provider.UsageTarget
 }
 
 func (p *measuredProvider) cgroupFor(id string) string { return "/cg/" + id }
@@ -28,6 +31,9 @@ func (p *measuredProvider) cgroupFor(id string) string { return "/cg/" + id }
 func (p *measuredProvider) UsageTarget(_ context.Context, id string) (provider.UsageTarget, error) {
 	if p.targetErr != nil {
 		return provider.UsageTarget{}, p.targetErr
+	}
+	if p.target != nil {
+		return *p.target, nil
 	}
 
 	return provider.UsageTarget{CgroupDir: p.cgroupFor(id)}, nil
@@ -94,6 +100,68 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	}
 	if _, ok := monitor.Final(name); ok {
 		t.Error("the monitor still holds a job whose compute is gone")
+	}
+}
+
+// startedMonitor records the target each job is started with.
+type startedMonitor struct{ targets []usage.Target }
+
+func (m *startedMonitor) Start(_ string, target usage.Target, _ int) {
+	m.targets = append(m.targets, target)
+}
+func (m *startedMonitor) Final(string) (usage.Summary, bool) { return usage.Summary{}, false }
+func (m *startedMonitor) Forget(string)                      {}
+
+// EVERY FIELD A BACKEND SAYS REACHES THE SAMPLER. The provider's target and the
+// sampler's are two structs with the same fields, and one the conversion drops
+// is a group silently never measured (a container's network namespace, say).
+// Every field is set to a value distinct from its zero, and each must arrive
+// under the same name with the same value.
+func TestEveryFieldOfAUsageTargetReachesTheSampler(t *testing.T) {
+	var want provider.UsageTarget
+	from := reflect.ValueOf(&want).Elem()
+	for i := range from.NumField() {
+		switch f := from.Field(i); f.Kind() {
+		case reflect.String:
+			f.SetString("value-" + from.Type().Field(i).Name)
+		case reflect.Int:
+			f.SetInt(int64(1000 + i))
+		case reflect.Uint64:
+			f.SetUint(uint64(2000 + i))
+		case reflect.Bool:
+			f.SetBool(true)
+		default:
+			t.Fatalf("provider.UsageTarget.%s is a %s this test cannot fill", from.Type().Field(i).Name, f.Kind())
+		}
+	}
+
+	p := &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, target: &want}
+	a, host := newAllocatorWithHost(t)
+	monitor := &startedMonitor{}
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil, WithMonitor(monitor))
+
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if len(monitor.targets) != 1 {
+		t.Fatalf("the monitor was started %d times, want once", len(monitor.targets))
+	}
+
+	got := reflect.ValueOf(monitor.targets[0])
+	if got.NumField() != from.NumField() {
+		t.Errorf("usage.Target has %d fields and provider.UsageTarget %d", got.NumField(), from.NumField())
+	}
+	for i := range from.NumField() {
+		name := from.Type().Field(i).Name
+		field := got.FieldByName(name)
+		if !field.IsValid() {
+			t.Errorf("usage.Target has no %s", name)
+			continue
+		}
+		if !reflect.DeepEqual(field.Interface(), from.Field(i).Interface()) {
+			t.Errorf("%s reached the sampler as %v, want %v", name, field.Interface(), from.Field(i).Interface())
+		}
 	}
 }
 

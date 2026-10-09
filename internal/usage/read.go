@@ -13,8 +13,10 @@ type Target struct {
 	// CgroupDir is the job's own cgroup-v2 directory, created for this job, so
 	// its counters start at zero when the job does.
 	CgroupDir string
-	// PID is the VMM's process, whose threads split guest time from the VMM's
-	// own. Zero means there is no such split to make (a container).
+	// PID is the job's process: the VMM, whose threads split guest time from
+	// its own (VCPUThreadPrefix); a container's init, whose network namespace
+	// is the job's (NetNamespace); or, with Process, the whole job. Zero means
+	// none of these is read.
 	PID int
 	// PIDStart is the start time PID had when the target was made
 	// (ProcessStart). Every read checks it, so a pid the kernel has since given
@@ -30,6 +32,12 @@ type Target struct {
 	// NetHostView says the device's counters are the host's view, so received
 	// is what the guest sent. True for a tap, whose rx is the guest's tx.
 	NetHostView bool
+	// NetNamespace says NetDevice is read from /proc/<PID>/net/dev, the
+	// interface table of the network namespace PID is in, rather than from the
+	// host's /sys/class/net: a container's eth0, counted from inside, so
+	// received is what the container received. The reading is kept only if PID
+	// still started at PIDStart after it.
+	NetNamespace bool
 	// Process says the job is PID alone, with no cgroup: it is measured by the
 	// process's own accounting (ProcessCounters), checked against PIDStart on
 	// every read, and CgroupDir is not read.
@@ -179,15 +187,13 @@ func (s *Sample) readNet(r Reader, t Target) {
 	if t.NetDevice == "" || strings.ContainsAny(t.NetDevice, "/.") {
 		return
 	}
-	var v [4]int64
-	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
-		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
-		if err != nil {
-			return
-		}
-		if v[i], err = parseSingle(raw); err != nil {
-			return
-		}
+	read := r.hostNet
+	if t.NetNamespace {
+		read = r.namespaceNet
+	}
+	v, ok := read(t)
+	if !ok {
+		return
 	}
 	// A TAP COUNTS FROM THE HOST'S SIDE: what the host transmitted on it is
 	// what the guest received.
@@ -195,6 +201,46 @@ func (s *Sample) readNet(r Reader, t Target) {
 		v[0], v[1], v[2], v[3] = v[1], v[0], v[3], v[2]
 	}
 	s.NetRx, s.NetTx, s.NetRxPackets, s.NetTxPackets, s.NetOK = v[0], v[1], v[2], v[3], true
+}
+
+// hostNet reads a device's rx and tx bytes and packets from the host's
+// /sys/class/net.
+func (r Reader) hostNet(t Target) ([4]int64, bool) {
+	var v [4]int64
+	for i, name := range []string{"rx_bytes", "tx_bytes", "rx_packets", "tx_packets"} {
+		raw, err := r.read("/sys/class/net/" + t.NetDevice + "/statistics/" + name)
+		if err != nil {
+			return v, false
+		}
+		if v[i], err = parseSingle(raw); err != nil {
+			return v, false
+		}
+	}
+
+	return v, true
+}
+
+// namespaceNet reads a device's rx and tx bytes and packets from the interface
+// table of PID's network namespace, without entering it.
+func (r Reader) namespaceNet(t Target) ([4]int64, bool) {
+	if t.PID <= 0 || t.PIDStart == 0 {
+		return [4]int64{}, false
+	}
+	raw, err := r.read(fmt.Sprintf("/proc/%d/net/dev", t.PID))
+	if err != nil {
+		return [4]int64{}, false
+	}
+	v, err := parseNetDev(raw, t.NetDevice)
+	if err != nil {
+		return [4]int64{}, false
+	}
+	// CHECKED AFTER THE READ, as the threads are: a pid reused before or during
+	// it names another process, whose namespace is not the job's.
+	if start, err := r.ProcessStart(t.PID); err != nil || start != t.PIDStart {
+		return [4]int64{}, false
+	}
+
+	return v, true
 }
 
 // readThreads splits a VMM's CPU time into its vCPU threads (guest code) and
