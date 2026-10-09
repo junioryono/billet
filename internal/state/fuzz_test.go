@@ -99,7 +99,23 @@ func asBodies(t *testing.T, bodies []string) {
 	}
 
 	stmts, err := parseMigrationStatements("fuzz.sql", []byte(render(bodies)))
+
+	// BODIES A MIGRATION MAY HOLD MUST BE READ, judged here without the parser:
+	// not empty, no whitespace at either end, no carriage return. A parser that
+	// refused them all would otherwise pass by refusing.
+	clean := true
+
+	for _, body := range bodies {
+		if body == "" || strings.TrimSpace(body) != body || strings.ContainsRune(body, '\r') {
+			clean = false
+		}
+	}
+
 	if err != nil {
+		if clean {
+			t.Fatalf("%d statements a migration may hold were refused: %v\n%q", len(bodies), err, bodies)
+		}
+
 		return
 	}
 

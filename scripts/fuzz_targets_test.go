@@ -61,9 +61,14 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 			return err
 		}
 
+		testingName := importName(file, "testing")
+		if testingName == "" {
+			return nil
+		}
+
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn) {
+			if !ok || fn.Recv != nil || !strings.HasPrefix(fn.Name.Name, "Fuzz") || !takesTestingF(fn, testingName) {
 				continue
 			}
 
@@ -105,8 +110,31 @@ func TestEveryFuzzTargetIsSearchedNightly(t *testing.T) {
 	}
 }
 
-// takesTestingF reports whether fn's one parameter is a *testing.F.
-func takesTestingF(fn *ast.FuncDecl) bool {
+// importName is the name file refers to the package at path by, or "" when it
+// does not import it (or imports it only for effect, or into its own scope).
+func importName(file *ast.File, path string) string {
+	for _, spec := range file.Imports {
+		if strings.Trim(spec.Path.Value, `"`) != path {
+			continue
+		}
+
+		if spec.Name == nil {
+			return filepath.Base(path)
+		}
+
+		if spec.Name.Name == "_" || spec.Name.Name == "." {
+			return ""
+		}
+
+		return spec.Name.Name
+	}
+
+	return ""
+}
+
+// takesTestingF reports whether fn's one parameter is a *testing.F, with the
+// testing package imported as testingName.
+func takesTestingF(fn *ast.FuncDecl, testingName string) bool {
 	params := fn.Type.Params.List
 	if len(params) != 1 || len(params[0].Names) > 1 {
 		return false
@@ -124,5 +152,5 @@ func takesTestingF(fn *ast.FuncDecl) bool {
 
 	pkg, ok := sel.X.(*ast.Ident)
 
-	return ok && pkg.Name == "testing"
+	return ok && pkg.Name == testingName
 }

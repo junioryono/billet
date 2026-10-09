@@ -1,7 +1,7 @@
 package version
 
 import (
-	"slices"
+	"cmp"
 	"strings"
 	"testing"
 )
@@ -61,39 +61,65 @@ func FuzzVersionCompare(f *testing.F) {
 			t.Fatalf("Canonical(%q) = %q, which is not a release tag", a, canonical)
 		}
 
-		// AND THE ORDER IS THE NUMBERS' ORDER, read independently of parse: a
-		// Compare that answered backwards, or zero for every pair, agrees with
-		// every property above.
-		other, isOther := Canonical(b)
-		if !isOther {
+		// AND THE ORDER IS THE NUMBERS' ORDER, read from the inputs by a reader
+		// of its own: a Compare that answered backwards, zero for every pair, or
+		// that dropped a component, agrees with every property above.
+		left, okLeft := release(a)
+		right, okRight := release(b)
+
+		if okLeft != isRelease {
+			t.Fatalf("%q is a release by the grammar %v, but Canonical says %v", a, okLeft, isRelease)
+		}
+
+		if !okRight {
 			return
 		}
 
-		if want := slices.Compare(numbers(t, canonical), numbers(t, other)); ab != want {
+		if want := compareRelease(left, right); !okLeft || ab != want {
 			t.Fatalf("Compare(%q, %q) = %d, but their numbers order %d", a, b, ab, want)
 		}
 	})
 }
 
-// numbers reads the three numbers of a canonical vX.Y.Z by hand.
-func numbers(t *testing.T, canonical string) []int {
-	t.Helper()
+// release reads vX.Y.Z or X.Y.Z by the grammar alone: three decimal numbers,
+// no leading zero, each small enough for an int on a 64-bit machine, which is
+// what Compare can order. The numbers stay digit strings, so reading them
+// shares nothing with parse.
+func release(v string) ([3]string, bool) {
+	var out [3]string
 
-	var out []int
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) != len(out) {
+		return out, false
+	}
 
-	for part := range strings.SplitSeq(strings.TrimPrefix(canonical, "v"), ".") {
-		n := 0
-
-		for _, r := range part {
-			n = n*10 + int(r-'0')
+	for i, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') || strings.Trim(part, "0123456789") != "" {
+			return out, false
 		}
 
-		out = append(out, n)
+		if len(part) > 19 || (len(part) == 19 && part > "9223372036854775807") {
+			return out, false
+		}
+
+		out[i] = part
 	}
 
-	if len(out) != 3 {
-		t.Fatalf("%q is not three numbers", canonical)
+	return out, true
+}
+
+// compareRelease orders two releases' digit strings: a longer number is the
+// larger, and two of one length order as text.
+func compareRelease(a, b [3]string) int {
+	for i := range a {
+		if c := cmp.Compare(len(a[i]), len(b[i])); c != 0 {
+			return c
+		}
+
+		if c := strings.Compare(a[i], b[i]); c != 0 {
+			return c
+		}
 	}
 
-	return out
+	return 0
 }

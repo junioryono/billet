@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +22,9 @@ func FuzzConfigParse(f *testing.F) {
 	}
 
 	f.Add([]byte(validConfig))
+	f.Add([]byte(strings.Replace(validConfig, "    image: ubuntu-2404-x64\n  - label: billet-8vcpu",
+		"    image: ubuntu-2404-x64\n    cache:\n      docker: {max_size: 9999TiB}\n"+
+			"      git: {max_size: 9999TiB}\n  - label: billet-8vcpu", 1)))
 
 	for _, path := range []string{
 		filepath.Join("..", "..", "billet.example.yaml"),
