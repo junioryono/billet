@@ -130,7 +130,7 @@ On tart there is no cgroup: each VM runs in its own Virtualization.framework pro
 | `vcpu`, `memory` | the request; or `sizes` with `memory_per_vcpu` to expand a template into several tiers |
 | `disk` | usable root capacity on Firecracker and EC2; ignored by Docker |
 | `shm`, `buildkit_cache_mount_limit` | the shared-memory size and the per-mount BuildKit ceiling |
-| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference |
+| `image` | a Firecracker image `name@generation` or `name@verified` (a bare name is refused), an AMI id, a container image, or a tart OCI reference; never one beginning with `-`, which a backend's command line would read as an option |
 | `command` | the guest command; `command-missing` is a conclusive launch failure |
 | `cache` | the tier's caches and how they publish; see [`tiers[].cache`](#tierscache). Every cache the tier can have is on without it |
 | `cache_scope` | the static repository (`owner`, `repository`) a tier's caches are scoped to, and for a trusted Actions cache the `workflow_ref` its runner group admits; a repository target supplies it |
