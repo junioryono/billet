@@ -18,6 +18,7 @@ import (
 type recordingFlows struct {
 	mu        sync.Mutex
 	watched   map[string]string // key -> lease file
+	macs      map[string]string // key -> the guest MAC it was watched by
 	launched  map[string]time.Time
 	finals    []string
 	finalAt   time.Time
@@ -26,14 +27,14 @@ type recordingFlows struct {
 }
 
 func newRecordingFlows() *recordingFlows {
-	return &recordingFlows{watched: map[string]string{}, launched: map[string]time.Time{}}
+	return &recordingFlows{watched: map[string]string{}, macs: map[string]string{}, launched: map[string]time.Time{}}
 }
 
-func (f *recordingFlows) Watch(key string, _ net.HardwareAddr, leaseFile string, launched time.Time) {
+func (f *recordingFlows) Watch(key string, mac net.HardwareAddr, leaseFile string, launched time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.watched[key], f.launched[key] = leaseFile, launched
+	f.watched[key], f.macs[key], f.launched[key] = leaseFile, mac.String(), launched
 }
 
 func (f *recordingFlows) Final(_ context.Context, key string, until time.Time) (flows.Result, bool, error) {
@@ -107,11 +108,14 @@ func TestTheRunnerFollowsAGuestsFlowsFromLaunchToDestroy(t *testing.T) {
 	}
 
 	rec.mu.Lock()
-	leaseFile, launched := rec.watched[name], rec.launched[name]
+	leaseFile, mac, launched := rec.watched[name], rec.macs[name], rec.launched[name]
 	rec.mu.Unlock()
 
 	if leaseFile != "/leases/billet1/dnsmasq.leases" {
 		t.Fatalf("followed %q, want the guest's bridge's lease file", leaseFile)
+	}
+	if mac != "02:00:00:00:00:17" {
+		t.Fatalf("followed the guest by MAC %q, want the target's 02:00:00:00:00:17", mac)
 	}
 
 	p.mu.Lock()

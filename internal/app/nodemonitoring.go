@@ -14,16 +14,31 @@ import (
 	"github.com/junioryono/billet/internal/usage/flows"
 )
 
-// firecrackerOptions are the provider options node configuration implies
+// FirecrackerOptions are the provider options node configuration implies
 // beyond the logger: with node.monitoring, the jailer is asked to account for
-// memory and io where the host proves it can.
-func firecrackerOptions(cfg *config.Config) []firecracker.Option {
+// memory and io where the host proves it can. billet check builds its provider
+// with them too, so it refuses what the node would.
+func FirecrackerOptions(cfg *config.Config) []firecracker.Option {
 	opts := []firecracker.Option{firecracker.WithLogger(slog.Default())}
 	if cfg.Node.Monitoring != nil {
 		opts = append(opts, firecracker.WithJobAccounting())
 	}
 
 	return opts
+}
+
+// requireJobAccounting refuses a Firecracker node whose node.monitoring the
+// host cannot honour: a controller the host did not prove is never asked of
+// the jailer, so its group would be recorded as unmeasured on every job. A
+// provider built without node.monitoring, and every other backend, refuses
+// nothing.
+func requireJobAccounting(p provider.Provider) error {
+	fc, ok := p.(*firecracker.Provider)
+	if !ok {
+		return nil
+	}
+
+	return fc.RequireJobAccounting()
 }
 
 // nodeMonitorOptions starts the sampler node.monitoring asks for and returns
@@ -39,8 +54,8 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 		return nil, err
 	}
 
-	// SAID AT STARTUP, because a host that cannot account for memory or io
-	// reports those groups unmeasured on every job, and the reason is here.
+	// SAID AT STARTUP, so the log names what each job's cgroup accounts for;
+	// requireJobAccounting has already refused a host that proved less.
 	switch fc, ok := p.(*firecracker.Provider); {
 	case ok:
 		acct := fc.Accounting()

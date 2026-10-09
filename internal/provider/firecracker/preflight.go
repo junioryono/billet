@@ -88,13 +88,10 @@ func (p *Provider) CheckHost(ctx context.Context, needsRootResize bool) (HostRep
 		return report, err
 	}
 
-	// REPORTED, NEVER FATAL: accounting is monitoring's, and a host without it
-	// launches exactly as it always has.
-	if root, err := cgroup2Mount(p.procMountsPath); err != nil {
-		report.Accounting = Accounting{Reason: err.Error()}
-	} else {
-		report.Accounting = probeAccounting(root)
-	}
+	// REPORTED HERE, NEVER FATAL HERE: accounting is monitoring's, and a host
+	// without it launches exactly as it always has. A node with node.monitoring
+	// is refused by RequireJobAccounting instead.
+	report.Accounting = p.hostAccounting()
 
 	return report, nil
 }
