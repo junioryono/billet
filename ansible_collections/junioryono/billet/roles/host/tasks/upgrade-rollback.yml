@@ -57,6 +57,16 @@
   failed_when: false
   become: true
 
+# A BILLET PROCESS RECOVERY WOULD OTHERWISE WAIT ON: stopped before the
+# executable is hidden, so its ExecStopPost can clear its qdiscs. uplink.yml
+# starts it again once the converge reaches it.
+- name: Stop the uplink shaper before recovering the ledger
+  ansible.builtin.systemd_service:
+    name: billet-uplink.service
+    state: stopped
+  failed_when: false
+  become: true
+
 - name: Hide the installed executable while recovery owns the ledger
   ansible.builtin.file:
     path: /usr/bin/billet

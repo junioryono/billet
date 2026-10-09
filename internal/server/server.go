@@ -77,6 +77,8 @@ type Server struct {
 	// deployment's controller, so no listener may act on what it holds. Nil
 	// outside the control plane; see WithLeadershipLost.
 	leadershipLost func() bool
+	// heartbeatOverrun is handed to every listener; see WithHeartbeatOverrun.
+	heartbeatOverrun func()
 	// drainTimeout is when every listener starts REPORTING that it is still
 	// waiting for its running jobs. It bounds nothing.
 	//
@@ -276,6 +278,12 @@ func WithStopHandoff() ControlPlaneOption {
 // tearing down as if nothing had happened.
 func WithLeadershipLost(fn func() bool) ControlPlaneOption {
 	return func(s *Server) { s.leadershipLost = fn }
+}
+
+// WithHeartbeatOverrun tells fn whenever one of the listeners' heartbeat passes
+// is still running as its next falls due, while it runs. fn must return at once.
+func WithHeartbeatOverrun(fn func()) ControlPlaneOption {
+	return func(s *Server) { s.heartbeatOverrun = fn }
 }
 
 // OptionsFromConfig is the control-plane configuration implied by billet.yaml.
@@ -722,6 +730,10 @@ func (s *Server) listenerOpts(prov Provisioner) []Option {
 
 	if s.leadershipLost != nil {
 		opts = append(opts, WithLeadershipLostCheck(s.leadershipLost))
+	}
+
+	if s.heartbeatOverrun != nil {
+		opts = append(opts, WithHeartbeatOverrunReport(s.heartbeatOverrun))
 	}
 
 	if s.drainTimeout != nil {

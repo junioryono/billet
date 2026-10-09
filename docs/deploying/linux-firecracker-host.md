@@ -22,6 +22,7 @@ You supply what it cannot safely guess:
 | `billet_config` | the whole `billet.yaml`, which `billet init --provider firecracker --emit ansible` prints for you |
 | `billet_github_private_key_src` | the App key created by `billet github-app create` |
 | `billet_networks`, `billet_guest_dns_servers`, `billet_guest_dns_cache_size`, `billet_guest_dns_forward_max` | the bridges, what guests may reach, and how much the bridge's resolver holds and forwards; the defaults suit a compute host behind one shared uplink (see [the shared-uplink record](../reference/records/shared-uplink.md)) |
+| `billet_uplink_shaping` | on by default: keeps the host's traffic from filling its site's internet line, adjusting itself with no rate to configure; `false` turns it off (see below) |
 | `billet_ceph_*` | client credentials, or the explicit bootstrap facts |
 | `billet_ledger_volume_id` | on AWS, the module's ledger volume, mounted fail-closed |
 | `billet_firecracker_version` and checksums | the Firecracker release to install |
@@ -84,6 +85,12 @@ A pull verifies the manifest's Sigstore signature against billet's publication w
 ## Two nodes at one site
 
 A second Linux host at the same site maps the same pools, reuses the generations the first one published, and takes overflow under the same label. That sharing is the whole reason Ceph replaced ZFS, and it was proved on real hosts: two nodes at one site reuse one generation, a second site starts cold, and the same label falls back across sites ([Site acceptance](../reference/records/site-acceptance.md)). Give each host its own node name and its own certificate ([Adding and removing nodes](../operating/nodes.md)).
+
+## Sharing a site's internet line
+
+A node shares its site's internet line with whoever else is there. A fleet of guests pulls images and caches in bursts at whatever the line carries, and a residential or office gateway holds one queue for everybody: while it is full, a call stutters and a game lags. Measured at the reference deployment on a 500 Mbit/s line, the node moving 378 Mbit/s down and 180 up gave 2.5% loss and latency from 7 to 29 ms to every device at the site.
+
+The role runs [`billet uplink shape`](../reference/cli.md) as `billet-uplink.service` on every host unless `billet_uplink_shaping: false`. It shapes the default route's interface with CAKE in both directions, starting at the interface's own speed, which holds nothing back. Twice a second it measures the round trip to public reflectors and what the host is moving each way. When the round trip rises well above its idle baseline while one direction is busy, that direction is cut to just below what it was moving, and while a direction runs at its rate with no queue the rate climbs back. There is no line speed to look up and nothing to retune when the line changes: on a line the host never fills it never cuts. It never replaces traffic policy it did not install: the role enables the unit only where `billet uplink check` passes (a kernel with CAKE and IFB, and no root or ingress qdisc of somebody else's on the interface), and says why when it does not. Its decisions are in the unit's journal (`journalctl -u billet-uplink`). [The shared-uplink record](../reference/records/shared-uplink.md) has the measurements.
 
 ## What a node costs the host
 
