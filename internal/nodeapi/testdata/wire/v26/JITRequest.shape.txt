@@ -1,0 +1,3 @@
+JITRequest.scale_set_id int
+JITRequest.runner_name string
+JITRequest.work_folder string

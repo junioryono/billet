@@ -91,3 +91,4 @@ f93deda7255f The host commands moved to internal/ops/host (#356 Phase 4); the se
 fec09aac0cb7 The host commands moved to internal/ops/host (#356 Phase 4); the sentence names their files there.
 621723967adb The row gained the role's metrics block (#356 Phase 6, ADR-016); the rest of it is unchanged.
 b12455d20da8 The row gained the role's metrics block (#356 Phase 6, ADR-016); the rest of it is unchanged.
+d1410b1ea27d The wire's newest version moved to 26 (VersionJobCounters); the sentence is otherwise unchanged.

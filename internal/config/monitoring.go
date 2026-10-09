@@ -28,6 +28,12 @@ type NodeMonitoringConfig struct {
 	// CPU time and the baseline by reserved vCPUs; without it the whole package
 	// is shared by CPU time and reported as unsplit. Requires rapl.
 	IdlePackageWatts float64 `yaml:"idle_package_watts,omitempty"`
+	// Perf counts each microVM's vCPU threads with the CPU's hardware counters
+	// (perf_event_open, guest mode included): cycles, instructions, cache
+	// references and misses, branch misses and frontend stall cycles. Off
+	// unless true; firecracker only, and Linux only, which a node checks at
+	// startup since this file may be validated elsewhere.
+	Perf bool `yaml:"perf,omitempty"`
 }
 
 const (
@@ -77,6 +83,12 @@ func (c *Config) validateMonitoringNode() []error {
 	}
 
 	var errs []error
+	// ONLY A VMM HAS vCPU THREADS TO COUNT. A docker job's threads are the
+	// workload's own, and a tart VM runs on a host without perf_event_open.
+	if m.Perf && c.Node.Provider != ProviderFirecracker {
+		errs = append(errs, fmt.Errorf("node.monitoring.perf counts a microVM's vCPU threads, and "+
+			"this node's provider is %s; only firecracker can be counted", c.Node.Provider))
+	}
 	switch c.Node.Provider {
 	case ProviderFirecracker, ProviderDocker:
 	case ProviderTart:

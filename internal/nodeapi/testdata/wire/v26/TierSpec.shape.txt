@@ -1,0 +1,50 @@
+TierSpec.label string
+TierSpec.image string
+TierSpec.trust string
+TierSpec.command tag omitempty
+TierSpec.command slice
+TierSpec.command[] string
+TierSpec.disk tag omitempty
+TierSpec.disk int64
+TierSpec.shm tag omitempty
+TierSpec.shm int64
+TierSpec.runner_group tag omitempty
+TierSpec.runner_group string
+TierSpec.workflows tag omitempty
+TierSpec.workflows slice
+TierSpec.workflows[] string
+TierSpec.buildkit_cache_mount_limit int64
+TierSpec.intercept tag omitempty
+TierSpec.intercept bool
+TierSpec.cache_scope tag omitempty
+TierSpec.cache_scope pointer
+TierSpec.cache_scope.Owner string
+TierSpec.cache_scope.Repository string
+TierSpec.cache_scope.WorkflowRef string
+TierSpec.cache tag omitempty
+TierSpec.cache pointer
+TierSpec.cache.publish string
+TierSpec.cache.owner tag omitempty
+TierSpec.cache.owner string
+TierSpec.cache.repository tag omitempty
+TierSpec.cache.repository string
+TierSpec.cache.docker.enabled bool
+TierSpec.cache.docker.max_size tag omitempty
+TierSpec.cache.docker.max_size int64
+TierSpec.cache.sticky_disks.enabled bool
+TierSpec.cache.sticky_disks.max_size tag omitempty
+TierSpec.cache.sticky_disks.max_size int64
+TierSpec.cache.actions.enabled bool
+TierSpec.cache.actions.max_size tag omitempty
+TierSpec.cache.actions.max_size int64
+TierSpec.cache.git.enabled bool
+TierSpec.cache.git.max_size tag omitempty
+TierSpec.cache.git.max_size int64
+TierSpec.cache.bazel.enabled bool
+TierSpec.cache.bazel.max_size tag omitempty
+TierSpec.cache.bazel.max_size int64
+TierSpec.cache.go.enabled bool
+TierSpec.cache.go.max_size tag omitempty
+TierSpec.cache.go.max_size int64
+TierSpec.cache.go_test_results tag omitempty
+TierSpec.cache.go_test_results bool

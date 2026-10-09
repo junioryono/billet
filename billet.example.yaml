@@ -457,10 +457,19 @@ node:
   # above the baseline is shared by CPU time and the baseline by reserved vCPUs;
   # without it the whole package is shared by CPU time and marked unsplit.
   #
+  # perf (firecracker only, off unless true) counts each microVM's vCPU threads
+  # with the CPU's hardware counters, guest mode included: cycles, instructions,
+  # cache references and misses, branch misses and frontend stall cycles, from
+  # which `billet jobs show` derives IPC and misses per 1,000 instructions. An
+  # event the CPU cannot count is reported unmeasured, never as zero. If the
+  # NMI watchdog holds a counter (kernel.nmi_watchdog=1), the six events cannot
+  # be scheduled together and every one reads unmeasured.
+  #
   # monitoring:
   #   interval: 1s
   #   rapl: true
   #   idle_package_watts: 73.5
+  #   perf: true
 
   firecracker:
     # The guest kernel must include everything Docker needs, or service

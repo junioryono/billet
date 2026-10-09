@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -85,19 +86,27 @@ func (r Reader) read(p string) (string, error) {
 // group reports its own verdict, because a host without the memory controller
 // still has CPU time worth reporting.
 func (r Reader) Read(t Target) Sample {
+	s, _ := r.readListing(t)
+
+	return s
+}
+
+// readListing is Read, and the tids of the VMM's vCPU threads the sample's
+// thread split was read from: nil unless ThreadsOK.
+func (r Reader) readListing(t Target) (Sample, []int) {
 	var s Sample
 	if t.Process {
 		s.readProcess(r, t)
-		return s
+		return s, nil
 	}
 	s.readCPU(r, t)
 	s.readMemory(r, t)
 	s.readIO(r, t)
 	s.readPressure(r, t)
 	s.readNet(r, t)
-	s.readThreads(r, t)
+	vcpus := s.readThreads(r, t)
 
-	return s
+	return s, vcpus
 }
 
 func (s *Sample) readCPU(r Reader, t Target) {
@@ -199,21 +208,40 @@ func (s *Sample) readNet(r Reader, t Target) {
 
 // readThreads splits a VMM's CPU time into its vCPU threads (guest code) and
 // everything else (the event loop, the API thread: emulation and IO).
-func (s *Sample) readThreads(r Reader, t Target) {
+func (s *Sample) readThreads(r Reader, t Target) []int {
 	if t.PID <= 0 || t.VCPUThreadPrefix == "" || t.PIDStart == 0 {
-		return
+		return nil
 	}
-	guest, vmm, err := r.threadTimes(t.PID, t.VCPUThreadPrefix)
+	guest, vmm, vcpus, err := r.threadTimes(t.PID, t.VCPUThreadPrefix)
 	if err != nil {
-		return
+		return nil
 	}
 	// CHECKED AFTER THE READ, which covers a pid reused before it and during it:
 	// either way the process holding the pid now is not the one recorded, and
 	// what was read is discarded.
 	if start, err := r.ProcessStart(t.PID); err != nil || start != t.PIDStart {
-		return
+		return nil
 	}
 	s.GuestCPU, s.VMMCPU, s.ThreadsOK = guest, vmm, true
+
+	return vcpus
+}
+
+// isVCPUThread reports whether tid is still one of the target VMM's vCPU
+// threads: listed under the VMM, named as one, and the VMM still the process
+// the target recorded.
+func (r Reader) isVCPUThread(t Target, tid int) bool {
+	raw, err := r.read(fmt.Sprintf("/proc/%d/task/%d/stat", t.PID, tid))
+	if err != nil {
+		return false
+	}
+	comm, _, _, err := parseTaskStat(raw)
+	if err != nil || !strings.HasPrefix(comm, t.VCPUThreadPrefix) {
+		return false
+	}
+	start, err := r.ProcessStart(t.PID)
+
+	return err == nil && start == t.PIDStart
 }
 
 // ProcessStart is the start time of pid, which with the pid names one process.
@@ -226,14 +254,14 @@ func (r Reader) ProcessStart(pid int) (uint64, error) {
 	return parseStartTime(raw)
 }
 
-func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
+func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, []int, error) {
 	dir := fmt.Sprintf("/proc/%d/task", pid)
 	entries, err := os.ReadDir(r.path(dir))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	var guest, vmm int64
-	sawVCPU := false
+	var vcpus []int
 	for _, entry := range entries {
 		raw, err := r.read(filepath.Join(dir, entry.Name(), "stat"))
 		if errors.Is(err, os.ErrNotExist) {
@@ -241,25 +269,29 @@ func (r Reader) threadTimes(pid int, vcpuPrefix string) (int64, int64, error) {
 			continue
 		}
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		comm, utime, stime, err := parseTaskStat(raw)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		ticks := utime + stime
-		if strings.HasPrefix(comm, vcpuPrefix) {
-			guest += ticks
-			sawVCPU = true
-		} else {
+		if !strings.HasPrefix(comm, vcpuPrefix) {
 			vmm += ticks
+			continue
 		}
+		tid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("usage: task %q is not a thread id", entry.Name())
+		}
+		guest += ticks
+		vcpus = append(vcpus, tid)
 	}
-	if !sawVCPU {
-		return 0, 0, fmt.Errorf("usage: pid %d has no %q thread, so it is not the VMM", pid, vcpuPrefix)
+	if len(vcpus) == 0 {
+		return 0, 0, nil, fmt.Errorf("usage: pid %d has no %q thread, so it is not the VMM", pid, vcpuPrefix)
 	}
 
-	return ticksToMicros(guest), ticksToMicros(vmm), nil
+	return ticksToMicros(guest), ticksToMicros(vmm), vcpus, nil
 }
 
 // HostCPU is the host's aggregate CPU counters from /proc/stat, in µs.

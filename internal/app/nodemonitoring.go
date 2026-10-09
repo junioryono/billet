@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/junioryono/billet/internal/config"
@@ -52,9 +53,31 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 			"idle_package_watts", m.IdlePackageWatts)
 	}
 
-	monitor := jobusage.NewMonitor("/", jobusage.Options{Interval: interval, RAPL: m.RAPL,
-		IdleWatts: m.IdlePackageWatts})
+	opts := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}
+	if m.Perf {
+		if opts.Counters, err = counterSource(); err != nil {
+			return nil, err
+		}
+	}
+	monitor := jobusage.NewMonitor("/", opts)
 	go monitor.Run(ctx)
 
 	return []node.Option{node.WithMonitor(monitor)}, nil
+}
+
+// counterSource is the hardware counter reader node.monitoring.perf asks for.
+//
+// REFUSED HERE RATHER THAN IN CONFIG, on a platform that has no
+// perf_event_open, because a config is also validated on a machine that will
+// not run it.
+func counterSource() (jobusage.CounterSource, error) {
+	counters, err := jobusage.HardwareCounters()
+	if err != nil {
+		return nil, fmt.Errorf("node.monitoring.perf is set, but this node cannot count: %w", err)
+	}
+	slog.Info("counting each microVM's vCPU threads with the CPU's hardware counters",
+		"events", "cycles, instructions, cache-references, cache-misses, branch-misses, "+
+			"stalled-cycles-frontend")
+
+	return counters, nil
 }
