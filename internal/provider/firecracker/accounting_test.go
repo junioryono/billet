@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -179,5 +180,38 @@ func TestAccountingIsAskedOnlyWhenWantedAndProved(t *testing.T) {
 	want := []string{"cpu.weight=100", "memory.max=max"}
 	if got := cgroupKeys(jailerArgv(t, h)); !slices.Equal(got, want) {
 		t.Errorf("without io.weight the keys are %q, want %q", got, want)
+	}
+}
+
+// THE ZERO VALUE REFUSES, as could not tell, and a provider that was not asked
+// for accounting refuses nothing on a host that could prove none of it.
+func TestRequireRefusesWhatWasNotProved(t *testing.T) {
+	err := Accounting{}.Require()
+	if !errors.Is(err, ErrJobAccountingUnproved) ||
+		!strings.Contains(err.Error(), "could not tell whether memory") ||
+		!strings.Contains(err.Error(), "could not tell whether io") {
+		t.Errorf("the zero Accounting = %v, want a could-not-tell refusal for both", err)
+	}
+	if err := (Accounting{Memory: ControllerPresent, IO: ControllerPresent}).Require(); err != nil {
+		t.Errorf("both present refused: %v", err)
+	}
+
+	noHierarchy := filepath.Join(t.TempDir(), "mounts")
+	if err := os.WriteFile(noHierarchy, []byte("proc /proc proc rw 0 0\n"), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if err := newHarness(t, WithMountTable(noHierarchy)).p.RequireJobAccounting(); err != nil {
+		t.Errorf("a provider not asked for accounting refused: %v", err)
+	}
+
+	err = newHarness(t, WithMountTable(noHierarchy), WithJobAccounting()).p.RequireJobAccounting()
+	if !errors.Is(err, ErrJobAccountingUnproved) {
+		t.Fatalf("a mount table naming no cgroup-v2 hierarchy = %v, want the refusal", err)
+	}
+	for _, want := range []string{"could not tell whether memory", "no cgroup-v2 hierarchy",
+		"<cgroup-v2 root>/cgroup.subtree_control"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
 	}
 }

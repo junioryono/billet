@@ -587,7 +587,11 @@ func distinctEC2TierAMIs(cfg *config.Config) []string {
 // FATAL, because only a firecracker node reaches here, so this file describes a
 // machine that is meant to run jobs and cannot. Reporting it and exiting zero would
 // make `billet check` say a host is fine when nothing on it can launch.
-func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config) error {
+//
+// AND WITH node.monitoring, a host that cannot prove the jailer can account each
+// microVM's memory and io is refused, as the node itself refuses to start on it.
+// opts are added after the node's own, for a check of a staged host.
+func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config, opts ...firecracker.Option) error {
 	// A PROVIDER BUILT PURELY TO ASK, so the preflight exercises the constructor an
 	// operator's node will use — including the two rules that are easiest to get
 	// wrong and invisible afterwards: which directory the jailer will name after
@@ -595,8 +599,16 @@ func checkFirecrackerHost(ctx context.Context, env cli.Env, cfg *config.Config) 
 	//
 	// The storage is not consulted here; checkCephCluster does that on its own, and
 	// a nil disk would make this refuse for the wrong reason.
-	p, err := firecracker.New(deploymentid.Preflight, *cfg.Node.Firecracker, noRootDisk{})
+	p, err := firecracker.New(deploymentid.Preflight, *cfg.Node.Firecracker, noRootDisk{},
+		append(app.FirecrackerOptions(cfg), opts...)...)
 	if err != nil {
+		return err
+	}
+
+	// BEFORE THE HOST'S OWN CHECKS, because New has already read the answer and
+	// nothing below changes it: a node with node.monitoring refuses to start on
+	// this host whatever else is true of it.
+	if err := p.RequireJobAccounting(); err != nil {
 		return err
 	}
 

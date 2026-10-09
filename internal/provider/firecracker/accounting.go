@@ -48,6 +48,60 @@ type Accounting struct {
 	IO Controller
 	// Reason says why either one is not present, for billet check.
 	Reason string
+	// Root is the cgroup-v2 hierarchy's mount point and Parent the cgroup the
+	// jailer creates each microVM's under, both empty when the mount table could
+	// not be read. They are what a refusal tells an operator to change.
+	Root, Parent string
+}
+
+// ErrJobAccountingUnproved is a node.monitoring the host cannot honour: the
+// jailer is asked only for a controller the host proved, so a controller left
+// unproved would be recorded as unmeasured on every job.
+var ErrJobAccountingUnproved = errors.New("node.monitoring is set and this host could not " +
+	"prove the jailer can account each microVM's memory and io")
+
+// Require is nil when both memory and io are proved present, and otherwise
+// the refusal naming each controller that is not, whether it is missing or
+// could not be told, and how to enable both for the jailer's parent cgroup.
+func (a Accounting) Require() error {
+	var unproved []string
+	for _, c := range []struct {
+		name  string
+		state Controller
+	}{{"memory", a.Memory}, {"io", a.IO}} {
+		switch c.state {
+		case ControllerPresent:
+		case ControllerMissing:
+			unproved = append(unproved, c.name+" is missing")
+		default:
+			unproved = append(unproved, "billet could not tell whether "+c.name+" is available")
+		}
+	}
+	if len(unproved) == 0 {
+		return nil
+	}
+
+	// A HOST WHOSE MOUNT TABLE NAMED NO HIERARCHY still gets the remedy, with
+	// the paths it could not read written as placeholders.
+	root, parent := a.Root, a.Parent
+	if root == "" {
+		root, parent = "<cgroup-v2 root>", "<cgroup-v2 root>/<firecracker binary name>"
+	}
+	reason := ""
+	if a.Reason != "" {
+		reason = " (" + a.Reason + ")"
+	}
+
+	return fmt.Errorf("firecracker: %w: %s%s. What is not proved would be recorded as "+
+		"unmeasured on every job, because the jailer is asked only for the controllers this "+
+		"host proves it supports. Enable memory and io for %s: both must be listed in "+
+		"%s/cgroup.controllers (a kernel booted with cgroup_disable=memory, or holding a "+
+		"controller in a cgroup-v1 hierarchy, does not list it); `echo '+memory +io' > "+
+		"%s/cgroup.subtree_control` enables them for every cgroup below the root, the jailer's "+
+		"parent among them; and io needs the kernel's weight-based io policy "+
+		"(CONFIG_BLK_CGROUP_IOCOST), which an io-enabled cgroup shows as io.weight. Then run "+
+		"billet check again, or remove node.monitoring to run this node unmeasured",
+		ErrJobAccountingUnproved, strings.Join(unproved, " and "), reason, parent, root, root)
 }
 
 // Summary is one line for billet check.
@@ -181,3 +235,39 @@ func WithJobAccounting() Option {
 // Accounting reports what the provider asks the jailer to account for. It is
 // the zero value unless WithJobAccounting was given.
 func (p *Provider) Accounting() Accounting { return p.accounting }
+
+// RequireJobAccounting refuses a provider built WithJobAccounting on a host
+// that did not prove both memory and io (Accounting.Require). A provider built
+// without it refuses nothing, and launches with the cpu-only cgroup it always
+// did.
+func (p *Provider) RequireJobAccounting() error {
+	if !p.wantAccounting {
+		return nil
+	}
+
+	return p.accounting.Require()
+}
+
+// hostAccounting reads what this host can account for each microVM, under the
+// cgroup-v2 hierarchy the mount table names.
+func (p *Provider) hostAccounting() Accounting {
+	root, err := cgroup2Mount(p.procMountsPath)
+	if err != nil {
+		return Accounting{Reason: err.Error()}
+	}
+	acct := probeAccounting(root)
+	acct.Root, acct.Parent = root, filepath.Join(root, p.execName)
+
+	return acct
+}
+
+// WithMountTable reads where the cgroup-v2 hierarchy is mounted from path
+// rather than /proc/mounts, so a check can be run against a staged hierarchy.
+// An empty path keeps the default.
+func WithMountTable(path string) Option {
+	return func(p *Provider) {
+		if path != "" {
+			p.procMountsPath = path
+		}
+	}
+}
