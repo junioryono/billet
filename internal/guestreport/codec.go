@@ -25,7 +25,7 @@ func EncodeBatch(b Batch) ([]byte, error) {
 func DecodeBatch(data []byte) (Batch, error) {
 	var b Batch
 
-	raw, err := decode(data, &b, MaxBatchBytes, MaxBatchInflatedBytes)
+	raw, err := decode(data, &b, MaxBatchBytes, MaxBatchInflatedBytes, batchShape)
 	if err != nil {
 		return Batch{}, err
 	}
@@ -55,7 +55,7 @@ func Encode(r Report) ([]byte, error) {
 func Decode(data []byte) (Report, error) {
 	var r Report
 
-	raw, err := decode(data, &r, MaxReportBytes, MaxReportInflatedBytes)
+	raw, err := decode(data, &r, MaxReportBytes, MaxReportInflatedBytes, reportShape)
 	if err != nil {
 		return Report{}, err
 	}
@@ -104,8 +104,8 @@ func encode(v any, limit, inflatedLimit int) ([]byte, error) {
 }
 
 // decode inflates data and decodes the one JSON value in it into v, with no field v
-// does not have, and returns the JSON.
-func decode(data []byte, v any, limit, inflatedLimit int) ([]byte, error) {
+// does not have and no list longer than s admits, and returns the JSON.
+func decode(data []byte, v any, limit, inflatedLimit int, s shape) ([]byte, error) {
 	raw, err := inflate(data, limit, inflatedLimit)
 	if err != nil {
 		return nil, err
@@ -114,6 +114,10 @@ func decode(data []byte, v any, limit, inflatedLimit int) ([]byte, error) {
 	// encoding/json replaces an invalid byte with U+FFFD rather than refuse it.
 	if !utf8.Valid(raw) {
 		return nil, refuse(ErrInvalidUTF8, "")
+	}
+
+	if err := checkShape(raw, s); err != nil {
+		return nil, err
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(raw))

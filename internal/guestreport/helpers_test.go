@@ -34,7 +34,7 @@ func batchAt(seq uint64) Batch {
 
 	for i := range int64(5) {
 		k := n/2 + i + 1
-		rows, other := Fold([]ProcessRow{
+		rows, other := mustFold([]ProcessRow{
 			{Name: "go", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: 120 + k%7, RSSBytes: 900 << 20, ReadBytes: k * 10, WriteBytes: k}},
 			{Name: "node", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: 30, RSSBytes: 200 << 20}},
 			{Name: "node", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: 12, RSSBytes: 150 << 20, WriteBytes: 512}},
@@ -52,6 +52,16 @@ func batchAt(seq uint64) Batch {
 	}
 
 	return b
+}
+
+// mustFold is Fold for rows a test built to be valid.
+func mustFold(rows []ProcessRow) ([]ProcessRow, ProcessUsage) {
+	kept, other, err := Fold(rows)
+	if err != nil {
+		panic(fmt.Sprintf("the test's rows do not fold: %v", err))
+	}
+
+	return kept, other
 }
 
 func batchesThrough(last uint64) []Batch {

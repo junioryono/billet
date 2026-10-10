@@ -33,10 +33,6 @@ var sentinels = []error{ErrMalformed, ErrTooLarge, ErrUnknownField, ErrInvalidUT
 	ErrNotCanonical, ErrNameTooLong, ErrControlCharacter, ErrEmpty, ErrTooMany,
 	ErrNotMonotonic, ErrOutOfRange, ErrDuplicateName, ErrInconsistent}
 
-// where is the shape of a refusal's location: the schema's own field names and
-// indices, which nothing the guest wrote can extend.
-var where = regexp.MustCompile(`^([a-z_]+(\[\d+\])?(\.[a-z_]+(\[\d+\])?)*)?$`)
-
 // FuzzDecode holds both decoders to what a decoder of guest bytes must be. A
 // refusal is an *Error with one of this package's reasons and a location built only
 // from field names, so its text can quote nothing the guest wrote. An acceptance is
@@ -126,7 +122,7 @@ func FuzzDecode(f *testing.F) {
 
 		switch v := value.(type) {
 		case Batch:
-			byHand(t, v.Samples, v.Processes, v.Steps, v.Tests, batchBounds)
+			byHand(t, v, v.Samples, v.Processes, v.Steps, v.Tests, batchLimits)
 
 			again, err := EncodeBatch(v)
 			if err != nil {
@@ -146,7 +142,31 @@ func FuzzDecode(f *testing.F) {
 				t.Fatalf("a decoded batch merged into a report that cannot be encoded: %v", err)
 			}
 		case Report:
-			byHand(t, v.Samples, v.Processes, v.Steps, v.Tests, reportBounds)
+			byHand(t, v, v.Samples, v.Processes, v.Steps, v.Tests, reportLimits)
+
+			// THE ACCOUNT, by arithmetic: every number from first to last kept,
+			// refused or missed, and the runs named in order, apart, inside, and no
+			// more than are missing.
+			var named uint64
+
+			if v.FirstSeq < 1 || v.LastSeq < v.FirstSeq || v.Batches < 1 ||
+				uint64(v.Batches)+uint64(v.Refused)+uint64(v.Missing) != v.LastSeq-v.FirstSeq+1 || len(v.Gaps) > MaxReportGaps {
+				t.Fatalf("accepted the account %d..%d: %d kept, %d refused, %d missing, %d gaps",
+					v.FirstSeq, v.LastSeq, v.Batches, v.Refused, v.Missing, len(v.Gaps))
+			}
+
+			for i, g := range v.Gaps {
+				if g.FirstSeq <= v.FirstSeq || g.LastSeq >= v.LastSeq || g.LastSeq < g.FirstSeq ||
+					i > 0 && g.FirstSeq <= v.Gaps[i-1].LastSeq+1 {
+					t.Fatalf("accepted gap %d: %+v", i, g)
+				}
+
+				named += g.LastSeq - g.FirstSeq + 1
+			}
+
+			if named > uint64(v.Missing) || named < uint64(v.Missing) && len(v.Gaps) < MaxReportGaps {
+				t.Fatalf("accepted %d missing with %d named", v.Missing, named)
+			}
 
 			again, err := Encode(v)
 			if err != nil {
@@ -210,7 +230,7 @@ func refusedAsDesigned(t *testing.T, err error) {
 		t.Fatalf("refused with %T, not an *Error: %v", err, err)
 	}
 
-	if !slices.Contains(sentinels, e.Err) || !where.MatchString(e.Where) {
+	if !slices.Contains(sentinels, e.Err) || !inVocabulary(e.Where) {
 		t.Fatalf("refused with a reason or location outside the closed set: %q", err.Error())
 	}
 }
@@ -226,46 +246,69 @@ func plainInflate(t *testing.T, data []byte) []byte {
 	return raw
 }
 
-// byHand walks an accepted value's sections without the validator: each bound,
-// each order, each text rule.
-func byHand(t *testing.T, samples []Sample, processes []ProcessSample, steps []StepMark, tests []SuiteResult, b bounds) {
+// limitsOf is what an accepted value of each kind may hold, from the exported
+// constants that state the schema rather than the validator's own tables.
+type limitsOf struct {
+	samples, processes, rows, steps, suites, failed int
+}
+
+var (
+	batchLimits  = limitsOf{MaxBatchSamples, MaxBatchProcessSamples, MaxBatchProcessSamples * MaxProcessRows, MaxBatchSteps, MaxBatchSuites, MaxBatchSuites * MaxFailedNames}
+	reportLimits = limitsOf{MaxReportSamples, MaxReportProcessSamples, MaxReportRows, MaxReportSteps, MaxReportSuites, MaxReportFailedNames}
+)
+
+// byHand checks an accepted value without the validator: every number and every
+// text by reflection, each list's bound, each time's order, each counter's.
+func byHand(t *testing.T, v any, samples []Sample, processes []ProcessSample, steps []StepMark, tests []SuiteResult, l limitsOf) {
 	t.Helper()
 
-	text := func(s string, limit int) {
-		t.Helper()
+	everyField(t, reflect.ValueOf(v), "")
 
-		if s == "" || len(s) > limit || strings.IndexFunc(s, unicode.IsControl) >= 0 {
-			t.Fatalf("accepted the text %q", s)
+	rows, failed := 0, 0
+	for _, p := range processes {
+		rows += len(p.Rows)
+	}
+
+	for _, s := range tests {
+		failed += len(s.Failed)
+	}
+
+	if len(samples) > l.samples || len(processes) > l.processes || rows > l.rows || len(steps) > l.steps ||
+		len(tests) > l.suites || failed > l.failed {
+		t.Fatalf("accepted %d samples, %d process samples, %d rows, %d steps, %d suites, %d failed names",
+			len(samples), len(processes), rows, len(steps), len(tests), failed)
+	}
+
+	for i, s := range samples {
+		if s.AtMillis <= 0 || s.CPUBusyTicks > s.CPUTotalTicks {
+			t.Fatalf("accepted sample %d: %+v", i, s)
 		}
-	}
 
-	if len(samples) > b.samples || len(processes) > b.processes || len(steps) > b.steps || len(tests) > b.suites {
-		t.Fatalf("accepted %d samples, %d process samples, %d steps, %d suites",
-			len(samples), len(processes), len(steps), len(tests))
-	}
+		if i == 0 {
+			continue
+		}
 
-	for i := 1; i < len(samples); i++ {
-		if samples[i].AtMillis <= samples[i-1].AtMillis || samples[i].CPUTotalTicks < samples[i-1].CPUTotalTicks ||
-			samples[i].NetRxBytes < samples[i-1].NetRxBytes {
-			t.Fatalf("accepted sample %d going back", i)
+		p := samples[i-1]
+		if s.AtMillis <= p.AtMillis || s.CPUBusyTicks < p.CPUBusyTicks || s.CPUTotalTicks < p.CPUTotalTicks ||
+			s.DiskReadBytes < p.DiskReadBytes || s.DiskWriteBytes < p.DiskWriteBytes ||
+			s.NetRxBytes < p.NetRxBytes || s.NetTxBytes < p.NetTxBytes {
+			t.Fatalf("accepted sample %d going back from %+v to %+v", i, p, s)
 		}
 	}
 
 	for i, p := range processes {
-		if i > 0 && p.AtMillis <= processes[i-1].AtMillis {
-			t.Fatalf("accepted process sample %d going back", i)
+		if p.AtMillis <= 0 || i > 0 && p.AtMillis <= processes[i-1].AtMillis {
+			t.Fatalf("accepted process sample %d at %d", i, p.AtMillis)
 		}
 
-		if len(p.Rows) > MaxProcessRows {
-			t.Fatalf("accepted %d rows", len(p.Rows))
+		if len(p.Rows) > MaxProcessRows || p.Other.Procs == 0 && p.Other != (ProcessUsage{}) {
+			t.Fatalf("accepted process sample %d: %+v", i, p)
 		}
 
 		names := map[string]bool{}
 		for _, row := range p.Rows {
-			text(row.Name, MaxNameBytes)
-
-			if names[row.Name] {
-				t.Fatalf("accepted %q twice in one sample", row.Name)
+			if len(row.Name) > MaxNameBytes || names[row.Name] || row.Procs < 1 {
+				t.Fatalf("accepted the row %+v", row)
 			}
 
 			names[row.Name] = true
@@ -273,32 +316,97 @@ func byHand(t *testing.T, samples []Sample, processes []ProcessSample, steps []S
 	}
 
 	for i, m := range steps {
-		text(m.Name, MaxNameBytes)
-
-		if m.AtSeconds <= 0 || i > 0 && m.AtSeconds < steps[i-1].AtSeconds {
-			t.Fatalf("accepted step %d at %d", i, m.AtSeconds)
+		if len(m.Name) > MaxNameBytes || m.AtSeconds <= 0 || i > 0 && m.AtSeconds < steps[i-1].AtSeconds {
+			t.Fatalf("accepted step %d: %+v", i, m)
 		}
 	}
-
-	failed := 0
 
 	for _, s := range tests {
-		text(s.Name, MaxNameBytes)
-
-		if len(s.Failed) > MaxFailedNames {
-			t.Fatalf("accepted %d failed names in a suite", len(s.Failed))
+		if len(s.Name) > MaxNameBytes || len(s.Failed) > MaxFailedNames {
+			t.Fatalf("accepted the suite %q with %d failed names", s.Name, len(s.Failed))
 		}
+	}
+}
 
-		failed += len(s.Failed)
+// everyField holds every number of an accepted value to [0, MaxValue] and every text
+// to being set, UTF-8, free of control characters and within the longest bound.
+func everyField(t *testing.T, v reflect.Value, path string) {
+	t.Helper()
 
-		for _, name := range s.Failed {
-			text(name, MaxFailedNameBytes)
+	switch v.Kind() {
+	case reflect.Struct:
+		for i := range v.NumField() {
+			everyField(t, v.Field(i), path+"."+v.Type().Field(i).Name)
+		}
+	case reflect.Slice:
+		for i := range v.Len() {
+			everyField(t, v.Index(i), path+"[]")
+		}
+	case reflect.Int64:
+		if n := v.Int(); n < 0 || n > MaxValue {
+			t.Fatalf("accepted %s = %d", path, n)
+		}
+	case reflect.Uint64:
+		if n := v.Uint(); n > MaxValue {
+			t.Fatalf("accepted %s = %d", path, n)
+		}
+	case reflect.String:
+		s := v.String()
+		if s == "" || len(s) > MaxFailedNameBytes || !utf8.ValidString(s) || strings.IndexFunc(s, unicode.IsControl) >= 0 {
+			t.Fatalf("accepted %s = %q", path, s)
+		}
+	default:
+		t.Fatalf("%s is a %s, which this walk does not check", path, v.Kind())
+	}
+}
+
+// vocabulary is every name a refusal's location may use: the schema's own JSON
+// names, read from its types.
+var vocabulary = func() map[string]bool {
+	names := map[string]bool{}
+
+	var walk func(reflect.Type)
+
+	walk = func(typ reflect.Type) {
+		switch typ.Kind() {
+		case reflect.Slice:
+			walk(typ.Elem())
+		case reflect.Struct:
+			for i := range typ.NumField() {
+				f := typ.Field(i)
+				if name, _, _ := strings.Cut(f.Tag.Get("json"), ","); name != "" {
+					names[name] = true
+				}
+
+				walk(f.Type)
+			}
+		default:
 		}
 	}
 
-	if failed > b.failedNames {
-		t.Fatalf("accepted %d failed names", failed)
+	walk(reflect.TypeFor[Batch]())
+	walk(reflect.TypeFor[Report]())
+
+	return names
+}()
+
+// component is one step of a refusal's location: a name and perhaps an index.
+var component = regexp.MustCompile(`^([a-z_]+)(\[\d+\])?$`)
+
+// inVocabulary reports whether where is built only from the schema's names.
+func inVocabulary(where string) bool {
+	if where == "" {
+		return true
 	}
+
+	for _, part := range strings.Split(where, ".") {
+		m := component.FindStringSubmatch(part)
+		if len(m) < 2 || !vocabulary[m[1]] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // THE COMMITTED SEEDS ARE WHAT THEY SAY: a batch and a report the decoders accept,

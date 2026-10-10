@@ -21,7 +21,7 @@ const (
 	MaxBatchBytes          = 64 << 10
 	MaxReportBytes         = 256 << 10
 	MaxBatchInflatedBytes  = 1 << 20
-	MaxReportInflatedBytes = 16 << 20
+	MaxReportInflatedBytes = 8 << 20
 )
 
 // The text bounds, in bytes of UTF-8. A process is named by its comm (never its
@@ -65,6 +65,11 @@ const (
 	MaxReportFailedNames    = 256
 	MaxReportGaps           = 64
 )
+
+// MaxReportRows bounds a Report's process rows in all, which is what a decoder
+// allocates most of: a Report Downsample writes holds at most KeepProcessesByName
+// rows a sample, and well under this many before it fits MaxReportBytes.
+const MaxReportRows = 1 << 17
 
 // MaxValue bounds every count, counter, level, time and sequence number: 2^53, the
 // largest integer a JSON reader holding numbers as doubles reads exactly.

@@ -11,8 +11,9 @@ import (
 // usage series is halved, keeping every second, fourth, ... sample and the last;
 // every sample but the memory levels is a counter, so no total changes. The process
 // samples are halved by merging each run of them into one, which keeps every CPU
-// and IO figure's sum. The steps, the suites, the account of the batches and the
-// agent's own CPU are kept whole.
+// and IO figure's sum, unless a sum would pass MaxValue: it is held there and
+// counted in Saturated, so a total that is not exact says so. The steps, the
+// suites, the account of the batches and the agent's own CPU are kept whole.
 func Downsample(r Report, maxBytes int) (Report, []byte, error) {
 	if maxBytes <= 0 || maxBytes > MaxReportBytes {
 		return Report{}, nil, refuse(ErrOutOfRange, "max_bytes")
@@ -21,7 +22,8 @@ func Downsample(r Report, maxBytes int) (Report, []byte, error) {
 	for stride := 1; ; stride *= 2 {
 		kept := halve(r, stride)
 
-		if len(kept.Samples) <= MaxReportSamples && len(kept.Processes) <= MaxReportProcessSamples {
+		if len(kept.Samples) <= MaxReportSamples && len(kept.Processes) <= MaxReportProcessSamples &&
+			rowCount(kept.Processes) <= MaxReportRows {
 			data, err := Encode(kept)
 			if err == nil && len(data) <= maxBytes {
 				return kept, data, nil
@@ -38,6 +40,15 @@ func Downsample(r Report, maxBytes int) (Report, []byte, error) {
 	}
 }
 
+func rowCount(ps []ProcessSample) int {
+	n := 0
+	for _, p := range ps {
+		n += len(p.Rows)
+	}
+
+	return n
+}
+
 // halve is r with one sample kept for every stride of them.
 func halve(r Report, stride int) Report {
 	if stride == 1 {
@@ -52,21 +63,42 @@ func halve(r Report, stride int) Report {
 		}
 	}
 
-	var processes []ProcessSample
-	for group := range slices.Chunk(r.Processes, stride) {
-		processes = append(processes, mergeRun(group))
+	var (
+		processes []ProcessSample
+		sums      summer
+	)
+
+	for run := range slices.Chunk(r.Processes, stride) {
+		processes = append(processes, sums.mergeRun(run))
 	}
 
 	r.Samples, r.Processes = samples, processes
 	r.Stride = min(r.Stride*int64(stride), MaxStride+1)
+	r.Saturated = min(r.Saturated+sums.saturated, MaxValue)
 
 	return r
+}
+
+// summer adds figures within MaxValue and counts the sums it had to hold there.
+type summer struct {
+	saturated int64
+}
+
+// add is a+b, for a and b within [0, MaxValue], held at MaxValue.
+func (s *summer) add(a, b int64) int64 {
+	if a > MaxValue-b {
+		s.saturated++
+
+		return MaxValue
+	}
+
+	return a + b
 }
 
 // mergeRun is a run of process samples as one ending where the run ends: the CPU
 // and IO each name added, summed, and its processes and RSS, the largest of them.
 // The names past KeepProcessesByName are summed into Other.
-func mergeRun(run []ProcessSample) ProcessSample {
+func (s *summer) mergeRun(run []ProcessSample) ProcessSample {
 	out := ProcessSample{AtMillis: run[len(run)-1].AtMillis}
 
 	var rows []ProcessRow
@@ -83,14 +115,14 @@ func mergeRun(run []ProcessSample) ProcessSample {
 				continue
 			}
 
-			rows[i].ProcessUsage = overTime(rows[i].ProcessUsage, row.ProcessUsage)
+			rows[i].ProcessUsage = s.overTime(rows[i].ProcessUsage, row.ProcessUsage)
 		}
 
-		out.Other = overTime(out.Other, p.Other)
-		out.ResidualCPUTicks = add(out.ResidualCPUTicks, p.ResidualCPUTicks)
+		out.Other = s.overTime(out.Other, p.Other)
+		out.ResidualCPUTicks = s.add(out.ResidualCPUTicks, p.ResidualCPUTicks)
 	}
 
-	out.Rows, out.Other = cut(rows, out.Other)
+	out.Rows, out.Other = s.cut(rows, out.Other)
 
 	return out
 }
@@ -98,14 +130,32 @@ func mergeRun(run []ProcessSample) ProcessSample {
 // Fold is one instant's processes as a ProcessSample carries them: the processes of
 // a name summed into one row, the busiest KeepProcessesByName names kept (by CPU,
 // then by name), and every other one summed into the returned Other row. Each row
-// names one process, or several of one name; its Procs is how many.
-func Fold(rows []ProcessRow) ([]ProcessRow, ProcessUsage) {
-	var named []ProcessRow
+// names one process, or several of one name, and Procs says how many. A row the
+// decoder would refuse is refused here, with where it is, and so is a sum past
+// MaxValue.
+func Fold(rows []ProcessRow) ([]ProcessRow, ProcessUsage, error) {
+	var (
+		named []ProcessRow
+		sums  summer
+	)
 
 	index := map[string]int{}
 
-	for _, row := range rows {
-		i, ok := index[row.Name]
+	for i, row := range rows {
+		where := at("rows", i)
+		if err := checkText(row.Name, MaxNameBytes, where+".name"); err != nil {
+			return nil, ProcessUsage{}, err
+		}
+
+		if row.Procs < 1 {
+			return nil, ProcessUsage{}, refuse(ErrEmpty, where+".procs")
+		}
+
+		if err := checkUsage(&row.ProcessUsage, where); err != nil {
+			return nil, ProcessUsage{}, err
+		}
+
+		j, ok := index[row.Name]
 		if !ok {
 			index[row.Name] = len(named)
 			named = append(named, row)
@@ -113,15 +163,20 @@ func Fold(rows []ProcessRow) ([]ProcessRow, ProcessUsage) {
 			continue
 		}
 
-		named[i].ProcessUsage = together(named[i].ProcessUsage, row.ProcessUsage)
+		named[j].ProcessUsage = sums.together(named[j].ProcessUsage, row.ProcessUsage)
 	}
 
-	return cut(named, ProcessUsage{})
+	kept, other := sums.cut(named, ProcessUsage{})
+	if sums.saturated > 0 {
+		return nil, ProcessUsage{}, refuse(ErrOutOfRange, "rows")
+	}
+
+	return kept, other, nil
 }
 
 // cut keeps the busiest KeepProcessesByName rows, sorted, and sums the rest into
 // other. rows name each process once.
-func cut(rows []ProcessRow, other ProcessUsage) ([]ProcessRow, ProcessUsage) {
+func (s *summer) cut(rows []ProcessRow, other ProcessUsage) ([]ProcessRow, ProcessUsage) {
 	slices.SortFunc(rows, func(a, b ProcessRow) int {
 		return cmp.Or(cmp.Compare(b.CPUTicks, a.CPUTicks), cmp.Compare(a.Name, b.Name))
 	})
@@ -131,37 +186,31 @@ func cut(rows []ProcessRow, other ProcessUsage) ([]ProcessRow, ProcessUsage) {
 	}
 
 	for _, row := range rows[KeepProcessesByName:] {
-		other = together(other, row.ProcessUsage)
+		other = s.together(other, row.ProcessUsage)
 	}
 
 	return slices.Clip(rows[:KeepProcessesByName]), other
 }
 
 // together is two sets of processes at one instant: everything summed.
-func together(a, b ProcessUsage) ProcessUsage {
+func (s *summer) together(a, b ProcessUsage) ProcessUsage {
 	return ProcessUsage{
-		Procs:      add(a.Procs, b.Procs),
-		CPUTicks:   add(a.CPUTicks, b.CPUTicks),
-		RSSBytes:   add(a.RSSBytes, b.RSSBytes),
-		ReadBytes:  add(a.ReadBytes, b.ReadBytes),
-		WriteBytes: add(a.WriteBytes, b.WriteBytes),
+		Procs:      s.add(a.Procs, b.Procs),
+		CPUTicks:   s.add(a.CPUTicks, b.CPUTicks),
+		RSSBytes:   s.add(a.RSSBytes, b.RSSBytes),
+		ReadBytes:  s.add(a.ReadBytes, b.ReadBytes),
+		WriteBytes: s.add(a.WriteBytes, b.WriteBytes),
 	}
 }
 
 // overTime is one set of processes over two intervals: what each added, summed, and
 // the levels, the larger.
-func overTime(a, b ProcessUsage) ProcessUsage {
+func (s *summer) overTime(a, b ProcessUsage) ProcessUsage {
 	return ProcessUsage{
 		Procs:      max(a.Procs, b.Procs),
-		CPUTicks:   add(a.CPUTicks, b.CPUTicks),
+		CPUTicks:   s.add(a.CPUTicks, b.CPUTicks),
 		RSSBytes:   max(a.RSSBytes, b.RSSBytes),
-		ReadBytes:  add(a.ReadBytes, b.ReadBytes),
-		WriteBytes: add(a.WriteBytes, b.WriteBytes),
+		ReadBytes:  s.add(a.ReadBytes, b.ReadBytes),
+		WriteBytes: s.add(a.WriteBytes, b.WriteBytes),
 	}
-}
-
-// add is a+b, held at MaxValue: two values each within it cannot overflow, and a sum
-// past it is one the guest's own figures made absurd.
-func add(a, b int64) int64 {
-	return min(a+b, MaxValue)
 }

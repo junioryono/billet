@@ -153,6 +153,41 @@ func TestMergeRefusesABatchThatGoesBack(t *testing.T) {
 }
 
 // A STEP AT THE SECOND THE LAST ONE STARTED continues it: the log has whole seconds.
+// A STEP DROPPED PAST THE BOUND STILL SETS THE TIME A LATER BATCH MUST NOT GO BACK
+// BEFORE: eight batches fill the steps to second 512, the ninth's step at second
+// 1000 is dropped, and the tenth, at second 900, goes back.
+func TestMergeRefusesAStepBeforeOneItDropped(t *testing.T) {
+	t.Parallel()
+
+	var in []Batch
+
+	for seq := uint64(1); seq <= 10; seq++ {
+		b := Batch{Seq: seq, AgentVersion: "v1", TicksPerSecond: 100, AgentCPUTicks: int64(seq)}
+
+		switch {
+		case seq <= 8:
+			for i := range int64(MaxBatchSteps) {
+				b.Steps = append(b.Steps, StepMark{Name: "s", AtSeconds: int64(seq-1)*MaxBatchSteps + i + 1})
+			}
+		case seq == 9:
+			b.Steps = []StepMark{{Name: "dropped", AtSeconds: 1000}}
+		default:
+			b.Steps = []StepMark{{Name: "earlier", AtSeconds: 900}}
+		}
+
+		in = append(in, b)
+	}
+
+	r := mustMerge(t, in)
+	if len(r.Steps) != MaxReportSteps || r.Dropped.Steps != 1 || r.Refused != 1 || r.Batches != 9 {
+		t.Fatalf("kept %d steps, dropped %d, refused %d batches, kept %d", len(r.Steps), r.Dropped.Steps, r.Refused, r.Batches)
+	}
+
+	if r.AgentCPUTicks != 9 {
+		t.Fatalf("the agent's CPU is the refused batch's: %d", r.AgentCPUTicks)
+	}
+}
+
 func TestMergeKeepsAStepInTheSameSecond(t *testing.T) {
 	t.Parallel()
 

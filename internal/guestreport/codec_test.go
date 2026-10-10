@@ -3,6 +3,7 @@ package guestreport
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -311,9 +312,20 @@ func TestAReportsAccountIsChecked(t *testing.T) {
 		{"gaps naming more than is missing", func(r *Report) { r.Gaps[1].LastSeq = 8; r.Missing = 3; r.Batches = 6 },
 			ErrInconsistent, "gaps"},
 		{"gaps naming less than is missing", func(r *Report) { r.Gaps = r.Gaps[:1] }, ErrInconsistent, "gaps"},
+		// A FULL LIST LEAVES THE UNNAMED NUMBERS AFTER ITS LAST RUN: every even
+		// number from 2 to 128 named, so 129 is received, and one more missing
+		// number needs room between 129 and LastSeq.
+		{"an unnamed missing number with no room for it", func(r *Report) { fullGaps(r, 129) }, ErrInconsistent, "gaps"},
+		{"an unnamed missing number with room for it", func(r *Report) { fullGaps(r, 131) }, nil, ""},
+		{"two unnamed missing numbers with room for one", func(r *Report) {
+			fullGaps(r, 131)
+			r.Missing++
+			r.Batches--
+		}, ErrInconsistent, "gaps"},
 		{"too many gaps", func(r *Report) {
 			r.Gaps = make([]Gap, MaxReportGaps+1)
 		}, ErrTooMany, "gaps"},
+		{"negative saturated", func(r *Report) { r.Saturated = -1 }, ErrOutOfRange, "saturated"},
 		{"stride zero", func(r *Report) { r.Stride = 0 }, ErrOutOfRange, "stride"},
 		{"stride past its bound", func(r *Report) { r.Stride = MaxStride + 1 }, ErrOutOfRange, "stride"},
 		{"negative drops", func(r *Report) { r.Dropped.FailedNames = -1 }, ErrOutOfRange, "dropped.failed_names"},
@@ -355,6 +367,68 @@ func TestAReportsAccountIsChecked(t *testing.T) {
 			check(t, err, c.err, c.where)
 		})
 	}
+}
+
+// fullGaps gives r the account of numbers 1 to last with every even number from 2 to
+// 2*MaxReportGaps missing and named, and one more missing number the list leaves
+// unnamed.
+func fullGaps(r *Report, last uint64) {
+	r.FirstSeq, r.LastSeq, r.Refused, r.Gaps = 1, last, 0, nil
+	for i := range uint64(MaxReportGaps) {
+		r.Gaps = append(r.Gaps, Gap{2 * (i + 1), 2 * (i + 1)})
+	}
+
+	r.Missing = MaxReportGaps + 1
+	r.Batches = int64(last) - r.Missing
+}
+
+// A REPORT PAST MaxReportRows IS REFUSED BY THE ENCODER, every sample within its own
+// bound; its JSON is past the inflated bound too, so the decoder never sees one.
+func TestEncodeRefusesTooManyRowsInAll(t *testing.T) {
+	t.Parallel()
+
+	r := Report{AgentVersion: "v1", TicksPerSecond: 100, FirstSeq: 1, LastSeq: 1, Batches: 1, Stride: 1}
+
+	var rows []ProcessRow
+	for i := range MaxProcessRows {
+		rows = append(rows, ProcessRow{Name: fmt.Sprintf("p%d", i), ProcessUsage: ProcessUsage{Procs: 1}})
+	}
+
+	for i := range MaxReportRows/MaxProcessRows + 1 {
+		r.Processes = append(r.Processes, ProcessSample{AtMillis: start + int64(i), Rows: rows})
+	}
+
+	_, err := Encode(r)
+	check(t, err, ErrTooMany, "processes")
+
+	// DOWNSAMPLE HALVES IT UNDER THE BOUND rather than hand back the refusal.
+	got, _, err := Downsample(r, MaxReportBytes)
+	if err != nil || got.Stride < 2 {
+		t.Fatalf("downsampled to stride %d: %v", got.Stride, err)
+	}
+
+	r.Processes = r.Processes[:MaxReportRows/MaxProcessRows]
+	if err := validateReport(&r); err != nil {
+		t.Fatalf("a report at the bound: %v", err)
+	}
+}
+
+// TEXT THAT IS NOT UTF-8 IS REFUSED BY THE ENCODER, which would otherwise write it
+// as U+FFFD and hand its decoder other text than it was given.
+func TestTheEncodersRefuseTextThatIsNotUTF8(t *testing.T) {
+	t.Parallel()
+
+	b := batchAt(3)
+	b.AgentVersion = "v\xff"
+
+	_, err := EncodeBatch(b)
+	check(t, err, ErrInvalidUTF8, "agent_version")
+
+	r := mustMerge(t, batchesThrough(3))
+	r.Tests[0].Failed[0] = "Test\xc3"
+
+	_, err = Encode(r)
+	check(t, err, ErrInvalidUTF8, "tests[0].failed[0]")
 }
 
 // THE ENCODERS REFUSE WHAT THEIR DECODERS WOULD: a batch at its bounds that does not

@@ -1,14 +1,15 @@
 package guestreport
 
-// bounds is how many entries each section of a Batch or a Report may hold.
+// bounds is how many entries each section of a Batch or a Report may hold, and how
+// many process rows and failed names it may hold in all.
 type bounds struct {
-	samples, processes, steps, suites, failedNames int
+	samples, processes, rows, steps, suites, failedNames int
 }
 
 var (
-	batchBounds = bounds{MaxBatchSamples, MaxBatchProcessSamples, MaxBatchSteps,
-		MaxBatchSuites, MaxBatchSuites * MaxFailedNames}
-	reportBounds = bounds{MaxReportSamples, MaxReportProcessSamples, MaxReportSteps,
+	batchBounds = bounds{MaxBatchSamples, MaxBatchProcessSamples, MaxBatchProcessSamples * MaxProcessRows,
+		MaxBatchSteps, MaxBatchSuites, MaxBatchSuites * MaxFailedNames}
+	reportBounds = bounds{MaxReportSamples, MaxReportProcessSamples, MaxReportRows, MaxReportSteps,
 		MaxReportSuites, MaxReportFailedNames}
 )
 
@@ -56,6 +57,7 @@ func validateReport(r *Report) error {
 		{r.Dropped.Steps, "dropped.steps"},
 		{r.Dropped.Suites, "dropped.suites"},
 		{r.Dropped.FailedNames, "dropped.failed_names"},
+		{r.Saturated, "saturated"},
 	} {
 		if err := checkValue(d.n, d.where); err != nil {
 			return err
@@ -132,10 +134,17 @@ func validateAccount(r *Report) error {
 		next = g.LastSeq + 2
 	}
 
+	// THE MISSING NUMBERS THE LIST DOES NOT NAME come after its last run and a
+	// number received after it, and before LastSeq: from next to LastSeq-1. The
+	// runs lie apart inside FirstSeq..LastSeq, so named is at most 2^53.
+	unnamed := r.Missing - int64(named)
+
 	switch {
-	case named > uint64(r.Missing):
+	case unnamed < 0:
 		return refuse(ErrInconsistent, "gaps")
-	case named < uint64(r.Missing) && len(r.Gaps) < MaxReportGaps:
+	case unnamed > 0 && len(r.Gaps) < MaxReportGaps:
+		return refuse(ErrInconsistent, "gaps")
+	case unnamed > 0 && (r.LastSeq < next || uint64(unnamed) > r.LastSeq-next):
 		return refuse(ErrInconsistent, "gaps")
 	}
 
@@ -159,6 +168,15 @@ func validateSections(s sections, b bounds) error {
 	}
 
 	if len(s.processes) > b.processes {
+		return refuse(ErrTooMany, "processes")
+	}
+
+	rows := 0
+	for _, p := range s.processes {
+		rows += len(p.Rows)
+	}
+
+	if rows > b.rows {
 		return refuse(ErrTooMany, "processes")
 	}
 

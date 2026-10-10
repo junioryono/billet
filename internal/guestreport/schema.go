@@ -117,6 +117,9 @@ type Report struct {
 	Stride int64 `json:"stride"`
 	// Dropped counts what Merge left out past the report's bounds.
 	Dropped Dropped `json:"dropped"`
+	// Saturated counts the sums Downsample held at MaxValue because the guest's
+	// figures added past it; a process total is exact only while it is zero.
+	Saturated int64 `json:"saturated"`
 
 	Samples   []Sample        `json:"samples,omitempty"`
 	Processes []ProcessSample `json:"processes,omitempty"`

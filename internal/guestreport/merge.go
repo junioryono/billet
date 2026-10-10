@@ -1,6 +1,7 @@
 package guestreport
 
 import (
+	"cmp"
 	"reflect"
 	"slices"
 )
@@ -22,7 +23,7 @@ func Merge(batches []Batch) (Report, error) {
 		return Report{}, refuse(ErrNoBatches, "")
 	}
 
-	var r Report
+	var m merger
 
 	index := make(map[uint64]int, len(batches))
 	distinct := make([]*Batch, 0, len(batches))
@@ -39,60 +40,61 @@ func Merge(batches []Batch) (Report, error) {
 			index[b.Seq] = len(distinct)
 			distinct = append(distinct, b)
 		case reflect.DeepEqual(distinct[j], b):
-			r.Duplicates++
+			m.r.Duplicates++
 		default:
-			r.Conflicts++
+			m.r.Conflicts++
 		}
 	}
 
-	slices.SortFunc(distinct, func(a, b *Batch) int {
-		switch {
-		case a.Seq < b.Seq:
-			return -1
-		case a.Seq > b.Seq:
-			return 1
-		default:
-			return 0
-		}
-	})
+	slices.SortFunc(distinct, func(a, b *Batch) int { return cmp.Compare(a.Seq, b.Seq) })
 
 	first := distinct[0]
-	r.AgentVersion, r.TicksPerSecond = first.AgentVersion, first.TicksPerSecond
-	r.FirstSeq, r.LastSeq = first.Seq, distinct[len(distinct)-1].Seq
-	r.Stride = 1
+	m.r.AgentVersion, m.r.TicksPerSecond = first.AgentVersion, first.TicksPerSecond
+	m.r.FirstSeq, m.r.LastSeq = first.Seq, distinct[len(distinct)-1].Seq
+	m.r.Stride = 1
 
 	for i, b := range distinct {
 		if i > 0 {
-			r.account(distinct[i-1].Seq, b.Seq)
+			m.account(distinct[i-1].Seq, b.Seq)
 		}
 
-		if !r.follows(b) {
-			r.Refused++
+		if !m.follows(b) {
+			m.r.Refused++
 
 			continue
 		}
 
-		r.keep(b)
+		m.keep(b)
 	}
 
-	return r, nil
+	return m.r, nil
+}
+
+// merger is a Report being merged, and what it has seen that the report may not
+// keep: the last step's time, which a step dropped past the bound still sets, and
+// how many failed names the kept suites hold.
+type merger struct {
+	r        Report
+	lastStep int64
+	names    int
 }
 
 // account counts the numbers between two received ones as missing.
-func (r *Report) account(prev, next uint64) {
+func (m *merger) account(prev, next uint64) {
 	if next == prev+1 {
 		return
 	}
 
-	r.Missing += int64(next - prev - 1)
-	if len(r.Gaps) < MaxReportGaps {
-		r.Gaps = append(r.Gaps, Gap{FirstSeq: prev + 1, LastSeq: next - 1})
+	m.r.Missing += int64(next - prev - 1)
+	if len(m.r.Gaps) < MaxReportGaps {
+		m.r.Gaps = append(m.r.Gaps, Gap{FirstSeq: prev + 1, LastSeq: next - 1})
 	}
 }
 
-// follows reports whether b continues what r has kept: the same agent, and no time
-// or counter going back.
-func (r *Report) follows(b *Batch) bool {
+// follows reports whether b continues what was kept: the same agent, and no time
+// or counter going back, a step dropped past the bound included.
+func (m *merger) follows(b *Batch) bool {
+	r := &m.r
 	if b.AgentVersion != r.AgentVersion || b.TicksPerSecond != r.TicksPerSecond ||
 		b.AgentCPUTicks < r.AgentCPUTicks {
 		return false
@@ -108,12 +110,12 @@ func (r *Report) follows(b *Batch) bool {
 		return false
 	}
 
-	return len(r.Steps) == 0 || len(b.Steps) == 0 ||
-		b.Steps[0].AtSeconds >= r.Steps[len(r.Steps)-1].AtSeconds
+	return len(b.Steps) == 0 || b.Steps[0].AtSeconds >= m.lastStep
 }
 
-// keep appends b to r, within the report's bounds for what is kept whole.
-func (r *Report) keep(b *Batch) {
+// keep appends b to the report, within its bounds for what is kept whole.
+func (m *merger) keep(b *Batch) {
+	r := &m.r
 	r.Batches++
 	r.AgentCPUTicks = b.AgentCPUTicks
 	r.Samples = append(r.Samples, b.Samples...)
@@ -123,19 +125,16 @@ func (r *Report) keep(b *Batch) {
 		r.Processes = append(r.Processes, p)
 	}
 
-	for _, m := range b.Steps {
+	for _, s := range b.Steps {
+		m.lastStep = s.AtSeconds
+
 		if len(r.Steps) == MaxReportSteps {
 			r.Dropped.Steps++
 
 			continue
 		}
 
-		r.Steps = append(r.Steps, m)
-	}
-
-	names := 0
-	for _, t := range r.Tests {
-		names += len(t.Failed)
+		r.Steps = append(r.Steps, s)
 	}
 
 	for _, t := range b.Tests {
@@ -145,7 +144,7 @@ func (r *Report) keep(b *Batch) {
 			continue
 		}
 
-		room := MaxReportFailedNames - names
+		room := MaxReportFailedNames - m.names
 		if len(t.Failed) > room {
 			r.Dropped.FailedNames += int64(len(t.Failed) - room)
 			t.Failed = t.Failed[:room]
@@ -156,7 +155,7 @@ func (r *Report) keep(b *Batch) {
 			t.Failed = nil
 		}
 
-		names += len(t.Failed)
+		m.names += len(t.Failed)
 		r.Tests = append(r.Tests, t)
 	}
 }

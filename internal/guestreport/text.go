@@ -27,8 +27,8 @@ func Clean(s string, limit int) string {
 	return b.String()
 }
 
-// checkText refuses s if it is empty, over limit bytes, or holds a control
-// character. It is never quoted: the guest wrote it.
+// checkText refuses s if it is empty, over limit bytes, not UTF-8, or holds a
+// control character. It is never quoted: the guest wrote it.
 func checkText(s string, limit int, where string) error {
 	if s == "" {
 		return refuse(ErrEmpty, where)
@@ -36,6 +36,12 @@ func checkText(s string, limit int, where string) error {
 
 	if len(s) > limit {
 		return refuse(ErrNameTooLong, where)
+	}
+
+	// json.Marshal writes an invalid byte as U+FFFD, so text that is not UTF-8
+	// encodes to something that decodes as other text.
+	if !utf8.ValidString(s) {
+		return refuse(ErrInvalidUTF8, where)
 	}
 
 	if strings.ContainsFunc(s, unicode.IsControl) {

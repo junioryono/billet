@@ -3,6 +3,7 @@ package guestreport
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"slices"
@@ -49,7 +50,7 @@ func busyBatches(n uint64) []Batch {
 				}})
 			}
 
-			b.Processes[i].Rows, b.Processes[i].Other = Fold(rows)
+			b.Processes[i].Rows, b.Processes[i].Other = mustFold(rows)
 		}
 
 		out = append(out, b)
@@ -231,6 +232,71 @@ func TestTheWholeSectionsFitAtTheirBounds(t *testing.T) {
 	t.Logf("%d bytes at stride %d", len(data), got.Stride)
 }
 
+// A SUM PAST MaxValue IS HELD THERE AND COUNTED, never wrapped and never silent: two
+// process samples that each report MaxValue of CPU and of residual, merged by the
+// halving that a report one sample past the bound forces.
+func TestDownsampleCountsASumItCannotHold(t *testing.T) {
+	t.Parallel()
+
+	r := Report{AgentVersion: "v1", TicksPerSecond: 100, FirstSeq: 1, LastSeq: 1, Batches: 1, Stride: 1}
+
+	for i := range MaxReportProcessSamples + 1 {
+		p := ProcessSample{AtMillis: start + int64(i)*2000}
+		if i < 2 {
+			p.Rows = []ProcessRow{{Name: "spin", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: MaxValue}}}
+			p.ResidualCPUTicks = MaxValue
+		}
+
+		r.Processes = append(r.Processes, p)
+	}
+
+	got, _, err := Downsample(r, MaxReportBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := got.Processes[0]
+	if got.Saturated != 2 || first.Rows[0].CPUTicks != MaxValue || first.ResidualCPUTicks != MaxValue {
+		t.Fatalf("saturated %d, CPU %d, residual %d", got.Saturated, first.Rows[0].CPUTicks, first.ResidualCPUTicks)
+	}
+
+	// A report that saturates nothing says so.
+	if got, _, err := Downsample(mustMerge(t, busyBatches(120)), 24<<10); err != nil || got.Saturated != 0 {
+		t.Fatalf("saturated %d (%v)", got.Saturated, err)
+	}
+}
+
+// FOLD REFUSES WHAT THE DECODER WOULD, with where it is, and a sum it cannot hold.
+func TestFoldRefusesRowsTheDecoderWould(t *testing.T) {
+	t.Parallel()
+
+	ok := ProcessRow{Name: "go", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: 5}}
+
+	for _, c := range []struct {
+		name  string
+		row   ProcessRow
+		err   error
+		where string
+	}{
+		{"an empty name", ProcessRow{ProcessUsage: ok.ProcessUsage}, ErrEmpty, "rows[1].name"},
+		{"a long name", ProcessRow{Name: strings.Repeat("n", MaxNameBytes+1), ProcessUsage: ok.ProcessUsage},
+			ErrNameTooLong, "rows[1].name"},
+		{"no processes", ProcessRow{Name: "x"}, ErrEmpty, "rows[1].procs"},
+		{"a negative figure", ProcessRow{Name: "x", ProcessUsage: ProcessUsage{Procs: 1, ReadBytes: -1}},
+			ErrOutOfRange, "rows[1].read_bytes"},
+		{"a figure past MaxValue", ProcessRow{Name: "x", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: math.MaxInt64}},
+			ErrOutOfRange, "rows[1].cpu_ticks"},
+		{"a sum past MaxValue", ProcessRow{Name: "go", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: MaxValue}},
+			ErrOutOfRange, "rows"},
+	} {
+		_, _, err := Fold([]ProcessRow{ok, c.row})
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			check(t, err, c.err, c.where)
+		})
+	}
+}
+
 func TestFoldKeepsTheBusiestNamesAndSumsTheRest(t *testing.T) {
 	t.Parallel()
 
@@ -248,7 +314,7 @@ func TestFoldKeepsTheBusiestNamesAndSumsTheRest(t *testing.T) {
 		ProcessRow{Name: "a-tie", ProcessUsage: ProcessUsage{Procs: 1, CPUTicks: 11}})
 	slices.Reverse(rows)
 
-	kept, other := Fold(rows)
+	kept, other := mustFold(rows)
 
 	if len(kept) != KeepProcessesByName {
 		t.Fatalf("kept %d names", len(kept))
@@ -280,7 +346,7 @@ func TestFoldKeepsTheBusiestNamesAndSumsTheRest(t *testing.T) {
 		t.Fatalf("other is %+v", other)
 	}
 
-	if few, none := Fold(rows[:3]); len(few) != 3 || none != (ProcessUsage{}) {
+	if few, none := mustFold(rows[:3]); len(few) != 3 || none != (ProcessUsage{}) {
 		t.Fatalf("three rows folded into %d and %+v", len(few), none)
 	}
 
@@ -290,7 +356,7 @@ func TestFoldKeepsTheBusiestNamesAndSumsTheRest(t *testing.T) {
 		shuffled := slices.Clone(rows)
 		rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 
-		again, againOther := Fold(shuffled)
+		again, againOther := mustFold(shuffled)
 		if !slices.Equal(again, kept) || againOther != other {
 			t.Fatalf("a shuffle folded into %v and %+v", again, againOther)
 		}
