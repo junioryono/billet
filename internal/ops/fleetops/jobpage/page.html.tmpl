@@ -31,7 +31,7 @@
 <ol class="timeline">
 {{- range .Steps.Rows}}
 <li class="{{.Class}}">
-{{- if .Focus}}<button type="button" data-from="{{.From}}" data-to="{{.To}}" data-step="{{.Number}}" aria-pressed="false">
+{{- if .Focus}}<button type="button" data-from="{{.From}}" data-to="{{.To}}" data-key="{{.Key}}" data-step="{{.Number}}" aria-pressed="false">
 {{- else}}<button type="button" disabled>{{end -}}
 <span class="n">{{.Number}}</span> <span class="name">{{.Name}}</span></button>
 <span class="outcome">{{.Outcome}}</span>
@@ -66,7 +66,7 @@
 <span class="top">{{.Top}}</span>
 <svg data-chart="" viewBox="{{$c.Origin}} 0 {{$c.Width}} 100" preserveAspectRatio="none" role="img" aria-label="{{.Title}}">
 {{- range $c.Bands}}
-<rect class="{{.Class}}" data-step="{{.Step}}" x="{{.X}}" y="0" width="{{.W}}" height="100"></rect>
+<rect class="{{.Class}}" data-key="{{.Key}}" x="{{.X}}" y="0" width="{{.W}}" height="100"></rect>
 {{- end}}
 {{- with .Limit}}
 <line class="limit" x1="{{$c.Origin}}" x2="{{$c.SpanMillis}}" y1="{{.Y}}" y2="{{.Y}}"></line>
@@ -99,14 +99,14 @@
 {{- else}}
 <div class="scroll">
 <table>
-<thead><tr><th>Step</th><th>Took</th><th>CPU</th><th>Peak memory</th><th>Disk read</th><th>Disk written</th><th>Received</th><th>Sent</th><th>Energy</th></tr></thead>
+<thead><tr><th>Step</th><th>Started (GitHub)</th><th>Took</th><th>CPU</th><th>Peak memory</th><th>Disk read</th><th>Disk written</th><th>Received</th><th>Sent</th><th>Energy</th></tr></thead>
 <tbody>
 {{- range .Steps.Rows}}
-<tr><th scope="row">{{.Number}} {{.Name}}</th><td>{{.Took}}</td>
+<tr><th scope="row">{{.Number}} {{.Name}}</th><td>{{with .Started}}{{.}}{{else}}not given{{end}}</td><td>{{.Took}}</td>
 {{- if .Usage}}{{range .Usage}}<td{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</td>{{end}}
 {{- else}}<td colspan="7" class="none">{{.Note}}</td>{{end}}</tr>
 {{- if and .Usage .Note}}
-<tr class="qualifier"><td></td><td colspan="8">{{.Note}}</td></tr>
+<tr class="qualifier"><td></td><td colspan="9">{{.Note}}</td></tr>
 {{- end}}
 {{- end}}
 </tbody>

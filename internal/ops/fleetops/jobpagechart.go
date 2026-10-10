@@ -68,11 +68,12 @@ type chartLimit struct {
 	Label string
 }
 
-// chartBand is one step's window on the charts' x axis.
+// chartBand is one step's window on the charts' x axis. Key is the step's
+// place in GitHub's list, which a step number need not be unique enough for.
 type chartBand struct {
 	X, W  int64
 	Class string
-	Step  int64
+	Key   int
 }
 
 // chartWindow is one window of wall time a chart's point stands for.
@@ -146,7 +147,7 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 			"so it can pass the guest's memory."
 	}
 
-	perSecond := func(f float64) string { return cli.HumanBytes(int64(math.Round(f))) + "/s" }
+	perSecond := func(f float64) string { return floatBytes(f) + "/s" }
 	disk := pageChart{Title: "Disk (bytes a second, host IO)"}
 	if !m.Measured(alloc.UsageIO) {
 		disk.Unmeasured = "not measured"
@@ -172,8 +173,7 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 		if !ok {
 			continue
 		}
-		out.Bands = append(out.Bands, chartBand{X: from, W: to - from, Class: "band" + strconv.Itoa(i%2),
-			Step: step.Number})
+		out.Bands = append(out.Bands, chartBand{X: from, W: to - from, Class: "band" + strconv.Itoa(i%2), Key: i})
 	}
 
 	return out
@@ -312,9 +312,13 @@ func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time
 	return label(top), lines, lim
 }
 
-// memoryChart draws the memory level: every sample when every sample is drawn,
-// and otherwise the highest level sampled in each window, with a break for a
-// window that holds no sample. A level is never interpolated.
+// memoryChart draws the memory level: the highest level sampled at each
+// offset when every sample is drawn, and otherwise the highest level sampled in
+// each window, with a break for a window that holds no sample.
+//
+// A LEVEL IS NEVER DRAWN ACROSS TIME THE SAMPLER DID NOT SEE: the line breaks
+// before a sample marked AfterGap, and a sample with breaks on both sides is a
+// dot.
 func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUsage, x func(time.Time) int64,
 	sampled bool, limitBytes int64,
 ) (string, []chartLine, *chartLimit) {
@@ -325,8 +329,21 @@ func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUs
 	top := chartTop(highest)
 	var p svgPath
 	if sampled {
-		for _, pt := range tl.Points {
-			p.to(pt.OffsetMillis, chartY(float64(pt.MemoryCurrent), top))
+		// ONE POINT AN OFFSET, so samples sharing one cannot grow the path past
+		// what chartWindows bounded.
+		for i := 0; i < len(tl.Points); {
+			at, level, gap := tl.Points[i].OffsetMillis, tl.Points[i].MemoryCurrent, false
+			for ; i < len(tl.Points) && tl.Points[i].OffsetMillis == at; i++ {
+				level = max(level, tl.Points[i].MemoryCurrent)
+				gap = gap || tl.Points[i].AfterGap
+			}
+			y := chartY(float64(level), top)
+			if gap || !p.down {
+				p.lift()
+				p.level(at, at, y)
+				continue
+			}
+			p.to(at, y)
 		}
 	} else {
 		for i, w := range windows {
@@ -342,7 +359,18 @@ func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUs
 		lim = &chartLimit{Y: chartY(float64(limitBytes), top)}
 	}
 
-	return cli.HumanBytes(int64(math.Round(top))), []chartLine{{Class: "a", Label: "memory", D: p.String()}}, lim
+	return floatBytes(top), []chartLine{{Class: "a", Label: "memory", D: p.String()}}, lim
+}
+
+// floatBytes writes a byte count held as a float, as cli.HumanBytes does for
+// one that fits an int64, without converting one that does not: a chart's top
+// is padded above the highest value, and a rate can pass the largest int64.
+func floatBytes(f float64) string {
+	if f < math.MaxInt64/2 {
+		return cli.HumanBytes(int64(math.Round(f)))
+	}
+
+	return fmt.Sprintf("%.1f EiB", f/(1<<60))
 }
 
 // chartTop is the value at the top of a chart: a little above the highest, so

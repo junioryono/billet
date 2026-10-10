@@ -278,12 +278,13 @@ func TestJobsShowHTMLIsTheCommittedExample(t *testing.T) {
 	for _, want := range []string{
 		"<h1>build (ubuntu, go 1.26)</h1>",
 		"Every one of the series&#39; 169 samples is drawn",
-		`<button type="button" data-from="19000" data-to="91000" data-step="3" aria-pressed="false">`,
+		`<button type="button" data-from="19000" data-to="91000" data-key="2" data-step="3" aria-pressed="false">`,
+		`<th scope="row">3 Build</th><td>2026-10-09T12:00:19Z</td><td>1m12s</td>`,
 		"partial: the series covers 1m11s of the step&#39;s 1m12s",
 		"partial: the series covers 500ms of the step&#39;s 1s",
 		"start and end in the same second, so no usage can be placed in it",
 		"1.20 instructions per cycle", "3.2 misses per 1,000 instructions",
-		`<rect class="band0" data-step="3" x="19000" y="0" width="72000" height="100"></rect>`,
+		`<rect class="band0" data-key="2" x="19000" y="0" width="72000" height="100"></rect>`,
 		"140.82.112.4", "Dashed: tier memory 8.0 GiB.", "Dashed: the lease&#39;s 2 vCPU.",
 		"GitHub succeeded; billet done",
 	} {
@@ -533,11 +534,11 @@ func stepCells(t *testing.T, table string) []string {
 		t.Fatalf("no step row in:\n%s", table)
 	}
 	cells := regexp.MustCompile(`<td[^>]*>[^<]*</td>`).FindAllString(row, -1)
-	if len(cells) != 8 {
-		t.Fatalf("the step row has %d cells, want the time and 7 groups:\n%s", len(cells), row)
+	if len(cells) != 9 {
+		t.Fatalf("the step row has %d cells, want its start, its time and 7 groups:\n%s", len(cells), row)
 	}
 
-	return cells[1:]
+	return cells[2:]
 }
 
 // A JOB THE HOST COUNTED AND TOTALLED NOTHING FOR SAYS SO: no counters and no
@@ -671,7 +672,8 @@ func TestJobsShowRefusesJSONAndHTMLTogether(t *testing.T) {
 }
 
 // maxSeriesPageBytes is the most a page of a series at the ledger's bound and
-// no steps may take, and maxStepPageBytes what each step may add to it.
+// no steps may take, and maxStepPageBytes what each step may add to it beyond
+// the text GitHub and the workflow chose for it, which the page shows whole.
 const (
 	maxSeriesPageBytes = 96 << 10
 	maxStepPageBytes   = 1536
@@ -747,6 +749,93 @@ func TestAPageOfTheLargestSeriesIsBounded(t *testing.T) {
 	}
 	t.Logf("largest series: %d points; page %d bytes, with %d steps %d bytes", len(tl.Points), len(bare),
 		stepCount, len(full))
+}
+
+// SAMPLES SHARING AN OFFSET DO NOT GROW A CHART: a series of thousands of
+// samples at one instant and one a second later, which compresses to almost
+// nothing, draws memory as one point an offset and stays within the bound.
+func TestRepeatedOffsetsDoNotGrowTheMemoryChart(t *testing.T) {
+	t.Parallel()
+
+	tl := usage.Timeline{First: pageStart, Points: make([]usage.Point, 1<<14)}
+	tl.Points[len(tl.Points)-1].OffsetMillis = 1000
+	tl.Points[100].MemoryCurrent = 5 << 30
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
+	page := renderPage(t, alloc.JobRecord{LeaseID: "l1"}, measured, jobSteps{none: "no GitHub job"}, &tl, "")
+
+	memory := figure(t, page, "Memory")
+	d := regexp.MustCompile(`<path class="line a" d="([^"]*)"`).FindStringSubmatch(memory)
+	if d == nil {
+		t.Fatalf("the memory chart draws no line:\n%s", memory)
+	}
+	if n := strings.Count(d[1], "M") + strings.Count(d[1], "L"); n != 2 {
+		t.Errorf("the memory line of two offsets draws %d points, want 2: %s", n, d[1])
+	}
+	if !strings.Contains(memory, "<span class=\"top\">5.4 GiB</span>") {
+		t.Errorf("the highest level at an offset was not the one drawn:\n%s", memory)
+	}
+}
+
+// A MEMORY LEVEL IS NOT DRAWN ACROSS TIME THE SAMPLER DID NOT SEE: the line
+// breaks before the sample that ends a gap, as the rate lines do.
+func TestTheMemoryLineBreaksAtAGap(t *testing.T) {
+	t.Parallel()
+
+	points := exampleSeries()
+	tl := usage.Timeline{First: pageStart, Points: points}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(points)}
+	charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
+	memory := charts.Charts[1].Lines[0].D
+	if !strings.Contains(memory, "M60000 ") || strings.Contains(memory, "L60000 ") {
+		t.Errorf("the memory line is not broken before the sample at 60s, which ends a gap:\n%s", memory)
+	}
+	if strings.Count(memory, "M") != 2 {
+		t.Errorf("the memory line breaks %d times, want once:\n%s", strings.Count(memory, "M")-1, memory)
+	}
+}
+
+// A RATE OR A LEVEL PAST THE LARGEST INT64 IS LABELLED AS ONE, never wrapped
+// negative by a conversion.
+func TestAChartLabelPastTheLargestInt64(t *testing.T) {
+	t.Parallel()
+
+	for f, want := range map[float64]string{1e19: "8.7 EiB", 1024: "1.0 KiB", math.MaxInt64 * 1.08: "8.6 EiB"} {
+		if got := floatBytes(f); got != want {
+			t.Errorf("floatBytes(%g) = %q, want %q", f, got, want)
+		}
+	}
+	tl := usage.Timeline{First: pageStart, Points: []usage.Point{
+		{OffsetMillis: 0}, {OffsetMillis: 1, DiskWrite: 1e16, MemoryCurrent: math.MaxInt64},
+	}}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
+	page := renderPage(t, alloc.JobRecord{LeaseID: "l1"}, measured, jobSteps{none: "no GitHub job"}, &tl, "")
+	for title, want := range map[string]string{"Disk": "9.4 EiB/s", "Memory": "8.6 EiB"} {
+		if chart := figure(t, page, title); !strings.Contains(chart, `<span class="top">`+want+`</span>`) {
+			t.Errorf("the %s chart's top is not %s:\n%s", title, want, chart)
+		}
+	}
+}
+
+// TWO STEPS GITHUB GIVES ONE NUMBER ARE STILL TWO STEPS to choose between:
+// each has its own key, and so does its band.
+func TestStepsSharingANumberAreChosenApart(t *testing.T) {
+	t.Parallel()
+
+	points := exampleSeries()
+	tl := usage.Timeline{First: pageStart, Points: points}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(points)}
+	page := renderPage(t, alloc.JobRecord{LeaseID: "l1"}, measured, jobSteps{runner: "billet-l1",
+		measured: measured, timeline: &tl, job: github.WorkflowJob{ID: 1, Name: "j", Steps: []github.JobStep{
+			{Number: 1, Name: "a", StartedAt: pageSecond(1), CompletedAt: pageSecond(5)},
+			{Number: 1, Name: "b", StartedAt: pageSecond(5), CompletedAt: pageSecond(9)},
+		}}}, &tl, "")
+
+	for _, want := range []string{`data-key="0" data-step="1"`, `data-key="1" data-step="1"`,
+		`<rect class="band0" data-key="0"`, `<rect class="band1" data-key="1"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page does not carry %q", want)
+		}
+	}
 }
 
 // windowOfCases is how many random series and windows TestWindowOfIsWindow

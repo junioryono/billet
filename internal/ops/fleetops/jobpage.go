@@ -90,6 +90,9 @@ type pageSteps struct {
 // pageStep is one step as GitHub records it, where it sits among the job's
 // steps on GitHub's clock, and what the series says about its window.
 type pageStep struct {
+	// Key is the step's place in GitHub's list, the same as its band's on the
+	// charts; Number is GitHub's, which two steps can share.
+	Key                  int
 	Number               int64
 	Name, Outcome, Class string
 	Started, Took        string
@@ -281,8 +284,9 @@ func stepsSection(s jobSteps, tl *usage.Timeline, unaligned string, measured *al
 			hi = step.CompletedAt
 		}
 	}
-	for _, step := range s.job.Steps {
+	for i, step := range s.job.Steps {
 		row := stepRow(step, tl, measured)
+		row.Key = i
 		if !lo.IsZero() && step.CompletedAt.After(step.StartedAt) && !step.StartedAt.IsZero() {
 			whole := float64(hi.Sub(lo))
 			row.HasBar = true
