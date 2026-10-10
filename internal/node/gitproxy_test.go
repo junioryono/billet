@@ -392,22 +392,74 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	spec.Git.MaxSize = 1
 	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
 	service.git.upstream, service.git.fullFraction = upstream.URL, 1
+	// A MIRROR ATTEMPT IS COUNTED AT THE NODE'S git, BY ITS init: the watchdog
+	// stops a fetch past a one-byte ceiling at its first tick, which under load
+	// comes before that fetch has asked GitHub for anything or even started,
+	// but the init runs before the watchdog does, and a mirror removed as too
+	// large has to be made again.
+	record := filepath.Join(t.TempDir(), "subcommands")
+	wrapper := filepath.Join(t.TempDir(), "git")
+	if err := forkSafeWriteFile(wrapper, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >>"+record+"\nexec git \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service.git.binary = wrapper
+	mirrorsMade := func() int {
+		subcommands, err := os.ReadFile(record)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal(err)
+		}
+		n := 0
+		for line := range strings.Lines(string(subcommands)) {
+			if strings.TrimSpace(line) == "init" {
+				n++
+			}
+		}
+		return n
+	}
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 	git := gitClient(t, node, token, githubBasic)
 
-	for _, dir := range []string{"first", "second"} {
-		if output, err := git("clone", "-q", "https://github.com/acme/api.git", dir); err != nil {
-			t.Fatalf("clone %s: %v\n%s", dir, err, output)
+	// A clone whose fetch slot was not admitted within gitFetchWait is GitHub's
+	// and makes no mirror, which a stalled machine can cause; so clone until
+	// one has, a bounded number of times.
+	for attempt := 0; mirrorsMade() == 0; attempt++ {
+		if attempt == 3 {
+			t.Fatal("no clone made a mirror in three attempts")
 		}
+		if output, err := git("clone", "-q", "https://github.com/acme/api.git", fmt.Sprintf("first%d", attempt)); err != nil {
+			t.Fatalf("clone first: %v\n%s", err, output)
+		}
+	}
+	if got := mirrorsMade(); got != 1 {
+		t.Fatalf("the first clone made %d mirrors, want 1", got)
+	}
+	// THE MIRROR IS GONE AND THE REPOSITORY MARKED, before the second clone:
+	// a mirror left behind by a fetch that failed for another reason would let
+	// the second clone fetch into it without making it again.
+	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the mirror above the tier's ceiling was not removed: %v", err)
+	}
+	service.git.mu.Lock()
+	marked := service.git.tooLarge["untrusted/acme/api"]
+	service.git.mu.Unlock()
+	if !marked.After(time.Now()) {
+		t.Fatalf("the repository is not marked too large (until %v)", marked)
+	}
+	before := upstream.fetches.Load()
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "second"); err != nil {
+		t.Fatalf("clone second: %v\n%s", err, output)
 	}
 	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
 		t.Fatal("a mirror above the tier's ceiling was kept")
 	}
-	// The first clone's mirror fetch and the client's own, then the second
-	// client's own: no second mirror fetch.
-	if got := upstream.fetches.Load(); got != 3 {
-		t.Fatalf("github.com served %d fetches, want 3", got)
+	if got := mirrorsMade(); got != 1 {
+		t.Fatalf("the second clone made a mirror again (%d in all), want it forwarded", got)
+	}
+	// AT LEAST the second client's own fetch: the first mirror fetch, stopped,
+	// can still be counted late by a handler the kill did not join.
+	if got := upstream.fetches.Load() - before; got < 1 {
+		t.Fatalf("github.com served the second clone %d fetches, want its own", got)
 	}
 }
 
