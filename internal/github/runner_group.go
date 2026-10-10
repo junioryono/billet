@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -59,6 +60,13 @@ type runnerGroupPolicyClient struct {
 	tokenSlot chan struct{}
 	token     string
 	expiresAt time.Time
+
+	// sentJWTs are the App JWTs this client has sent, newest last, so an
+	// answer that echoes one back is refused like one echoing the token: a
+	// server that saw a JWT at the token exchange could return it in any later
+	// answer. Guarded by sentMu, since reads run beside the exchange.
+	sentMu   sync.Mutex
+	sentJWTs []string
 }
 
 // policyBounds limits every request the policy client makes. The policy is read
@@ -174,13 +182,16 @@ func (c *runnerGroupPolicyClient) exchange(ctx context.Context, method, endpoint
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, nil, err //nolint:wrapcheck // callers wrap with the operation name; *url.Error is what Undecided reads.
+		return 0, nil, withoutBearerText(err, bearer)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicyResponse+1))
 	if err != nil {
-		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer, err)
+		// A TRAILER THE CLIENT COULD NOT PARSE is quoted in its error, so the
+		// bearer is replaced here as in a transport error.
+		return 0, nil, fmt.Errorf("%w: the response broke off: %w", errNoAnswer,
+			withoutBearerText(err, bearer))
 	}
 
 	if len(body) > maxPolicyResponse {
@@ -200,10 +211,184 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	}
 
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("github: %s: %w", operation, apiError(status, body))
+		return nil, fmt.Errorf("github: %s: %w", operation, apiErrorWithout(status, body, token))
+	}
+	// AN ANSWER THAT CARRIES THE TOKEN IS NOT READ AT ALL: every string in it
+	// can reach an operator's output, as a job's name or inside an error about a
+	// field that did not parse, and no redaction of one path covers the next.
+	if carries(body, token) || c.carriesJWT(body) {
+		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, or could not "+
+			"be checked for it, so it is not read", operation)
 	}
 
 	return body, nil
+}
+
+// maxSentJWTs bounds the JWTs a client remembers. One is signed per token
+// exchange, so this spans far longer than any answer a server could still be
+// holding one for.
+const maxSentJWTs = 16
+
+// rememberJWT keeps a JWT this client is about to send.
+func (c *runnerGroupPolicyClient) rememberJWT(jwt string) {
+	c.sentMu.Lock()
+	defer c.sentMu.Unlock()
+	c.sentJWTs = append(c.sentJWTs, jwt)
+	if len(c.sentJWTs) > maxSentJWTs {
+		c.sentJWTs = c.sentJWTs[len(c.sentJWTs)-maxSentJWTs:]
+	}
+}
+
+// carriesJWT reports whether a body holds any JWT this client has sent.
+func (c *runnerGroupPolicyClient) carriesJWT(body []byte) bool {
+	c.sentMu.Lock()
+	sent := slices.Clone(c.sentJWTs)
+	c.sentMu.Unlock()
+
+	return slices.ContainsFunc(sent, func(jwt string) bool { return carries(body, jwt) })
+}
+
+// carries reports whether a body holds bearer, as it was sent or in any JSON
+// string once decoded, where an escape can hide it from a byte search.
+func carries(body []byte, bearer string) bool {
+	if bearer == "" {
+		return false
+	}
+	if bytes.Contains(body, []byte(bearer)) {
+		return true
+	}
+	// EVERY STRING TOKEN IS SCANNED AS THE DECODER MEETS IT, keys included, never
+	// a decoded value: decoding into a map keeps only the last of two equal keys,
+	// while a typed decode after this keeps what the first one set. A body that
+	// cannot be scanned to its end is treated as carrying the bearer, since the
+	// typed decode ignores what it does not know and failing open would let an
+	// escaped bearer through. Numbers stay text, so a huge one is not a failure.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	depth, values := 0, 0
+	for {
+		tok, err := dec.Token()
+		// THE END IS THE END ONLY OUTSIDE EVERY VALUE, and only after one: the
+		// decoder answers io.EOF inside an object cut short as well.
+		if errors.Is(err, io.EOF) {
+			return depth != 0 || values == 0
+		}
+		if err != nil {
+			return true
+		}
+		switch tok := tok.(type) {
+		case json.Delim:
+			if tok == '{' || tok == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		case string:
+			if strings.Contains(tok, bearer) {
+				return true
+			}
+		}
+		if depth == 0 {
+			values++
+		}
+	}
+}
+
+// bearerScrubbed is a transport error whose text named the bearer, rendered
+// without it. It unwraps to the original, so Undecided still reads the
+// *url.Error, and its own text is what any wrapper prints.
+type bearerScrubbed struct {
+	err  error
+	text string
+}
+
+func (e *bearerScrubbed) Error() string { return e.text }
+func (e *bearerScrubbed) Unwrap() error { return e.err }
+
+// withoutBearerText is a transport or body-read error described by its class
+// rather than its text, because its text can carry what the server sent: a
+// redirect's Location the client could not follow, a trailer it could not
+// parse, a host name a redirect chose, a certificate's names. A server can
+// put the bearer there in any encoding, so no replacement of the bearer is
+// enough; the text is not shown at all. What is shown is the class, from
+// billet's own words and the error's Go type, and the error unwraps to the
+// original, so Undecided and errors.Is still read it.
+func withoutBearerText(err error, _ string) error {
+	return &bearerScrubbed{err: err, text: "the request failed: " + transportClass(err)}
+}
+
+// fixedTransportTexts are net/http's own words for the bounds it enforces,
+// which no server chooses any part of, and which say which bound ended a
+// request.
+var fixedTransportTexts = []string{
+	"net/http: timeout awaiting response headers",
+	"net/http: TLS handshake timeout",
+	"net/http: request canceled",
+	"net/http: request canceled while waiting for connection",
+}
+
+// transportClass names what kind of failure err is, in words no server chose.
+func transportClass(err error) string {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if slices.Contains(fixedTransportTexts, e.Error()) {
+			return e.Error()
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context deadline exceeded"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context canceled"
+	}
+	if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+		return "timed out"
+	}
+	if dns, ok := errors.AsType[*net.DNSError](err); ok && dns != nil {
+		return "a host name did not resolve"
+	}
+	if op, ok := errors.AsType[*net.OpError](err); ok {
+		return "the connection failed (" + op.Op + ")"
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return "the answer broke off"
+	}
+	inner := err
+	if u, ok := errors.AsType[*url.Error](err); ok && u.Err != nil {
+		inner = u.Err
+	}
+
+	return fmt.Sprintf("%T, whose detail is not shown because it can carry the server's text", inner)
+}
+
+// apiErrorWithout is apiError for a request that carried bearer, keeping of
+// the body only what can be shown without it, because apiError keeps GitHub's
+// message and an operator command prints it: a server that echoed the
+// Authorization header would otherwise put the credential in the output.
+//
+// ONLY A DECODED JSON STRING IS KEPT. GitHub answers an error with a JSON
+// object whose `message` is a string; that string, decoded and with the bearer
+// replaced, is the message. Any other body (not a JSON object, or one with no
+// string message) is described by its length and not shown, since text that
+// was never decoded can hold the bearer in an escape (`i`) that no
+// replacement sees, and a cut through it leaves a prefix none matches.
+func apiErrorWithout(status int, body []byte, bearer string) error {
+	message := fmt.Sprintf("an answer that is not GitHub's error shape (%d bytes, not shown)", len(body))
+	var fields map[string]any
+	if json.Unmarshal(body, &fields) == nil {
+		if decoded, ok := fields["message"].(string); ok && decoded != "" {
+			message = decoded
+		}
+	}
+	if bearer != "" {
+		message = strings.ReplaceAll(message, bearer, "[redacted]")
+	}
+	// THROUGH apiError, so a throttle is still read from the message.
+	shown, err := json.Marshal(map[string]string{"message": message})
+	if err != nil {
+		return &APIError{Status: status, Message: message}
+	}
+
+	return apiError(status, shown)
 }
 
 // configured reports whether this client can authenticate at all.
@@ -467,6 +652,9 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return c.token, nil
 	}
 	jwt, err := SignAppJWT(c.appID, c.privateKey, time.Now())
+	if err == nil {
+		c.rememberJWT(jwt)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -478,19 +666,28 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 	if status != http.StatusCreated {
 		// TYPED, so a caller can tell GitHub refusing the App (401, 403) from
 		// GitHub being unable to answer (5xx, a throttle) through Undecided.
-		return "", fmt.Errorf("github: create installation token: %w", apiError(status, body))
+		return "", fmt.Errorf("github: create installation token: %w",
+			apiErrorWithout(status, body, jwt))
+	}
+	// THE ANSWER CARRIES THE NEW TOKEN, and must not carry the JWT that asked.
+	if carries(body, jwt) {
+		return "", errors.New("github: create installation token: the answer carried the App's JWT, " +
+			"or could not be checked for it, so it is not read")
 	}
 	var out struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return "", fmt.Errorf("github: decode installation token: %w", err)
 	}
-	if out.Token == "" || out.ExpiresAt.IsZero() {
+	// PARSED HERE RATHER THAN BY time.Time's decoder, whose error quotes the
+	// value it could not read.
+	expiresAt, err := time.Parse(time.RFC3339, out.ExpiresAt)
+	if out.Token == "" || out.ExpiresAt == "" || err != nil {
 		return "", fmt.Errorf("github: installation-token response was incomplete")
 	}
-	c.token, c.expiresAt = out.Token, out.ExpiresAt
+	c.token, c.expiresAt = out.Token, expiresAt
 	return c.token, nil
 }
 

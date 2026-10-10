@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 27
+	Version = 28
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -370,6 +370,18 @@ const (
 	// below it. A report without them reads as destinations not totalled, never
 	// as a job that sent nothing.
 	VersionJobDestinations = 27
+
+	// VersionSeriesClock is the version from which a usage report's series may
+	// be the clocked codec (lease.UsageSeriesCodecClocked): the wall time of its
+	// first sample on the host's clock and the sampler's marks for intervals it
+	// did not see, which is what lets `billet jobs show` place a step's window
+	// on the series.
+	//
+	// CHECKED WHERE IT IS SENT, because an older plane validates the codec
+	// strictly and would refuse the whole report over it. Below it the node
+	// re-encodes the series without the clock, which says less and never
+	// something else: that plane stores what it always stored.
+	VersionSeriesClock = 28
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

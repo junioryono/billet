@@ -1,6 +1,7 @@
 package nodeclient_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -10,10 +11,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // A NODE NEGOTIATED BELOW THE USAGE VERSION SENDS NOTHING, and the call is
@@ -202,5 +205,61 @@ func TestHardwareCountersReachOnlyAPlaneThatKnowsThem(t *testing.T) {
 	}
 	if report.Counters == nil {
 		t.Error("stripping the counters for an older plane took them from the caller's report")
+	}
+}
+
+// A PLANE TOO OLD FOR THE CLOCKED SERIES IS SENT THE SAME POINTS WITHOUT THE
+// CLOCK, in the codec it keeps, rather than a series its validation refuses
+// and takes the report down with; a plane at the version gets the clocked
+// series as it was. The caller's series is not changed either way.
+func TestAClockedSeriesReachesOnlyAPlaneThatKeepsIt(t *testing.T) {
+	t.Parallel()
+
+	points := []usage.Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 5, AfterGap: true}}
+	data, _, err := usage.EncodeSeriesAt(points, time.Now(), alloc.MaxUsageSeriesBytes)
+	if err != nil {
+		t.Fatalf("EncodeSeriesAt: %v", err)
+	}
+	clocked := &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: slices.Clone(data)}
+	report := alloc.JobUsage{Source: alloc.UsageSourceHost, Samples: 2, IntervalMillis: 1000}
+
+	for _, version := range []int{nodeapi.VersionSeriesClock - 1, nodeapi.VersionSeriesClock} {
+		plane := &usageRecordingPlane{version: version}
+		srv := httptest.NewServer(plane)
+		t.Cleanup(srv.Close)
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		if err := c.Register(t.Context(), testRegistration()); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if err := c.RecordLeaseUsage(t.Context(), "l1", 1, report, clocked); err != nil {
+			t.Fatalf("RecordLeaseUsage on wire %d: %v", version, err)
+		}
+		plane.mu.Lock()
+		got := plane.got
+		plane.mu.Unlock()
+		if got == nil || got.Series == nil {
+			t.Fatalf("no series reached the wire-%d plane", version)
+		}
+		if version == nodeapi.VersionSeriesClock {
+			if got.Series.Codec != usage.SeriesCodecClocked || !bytes.Equal(got.Series.Data, data) {
+				t.Errorf("a wire-%d plane was sent codec %d, not the clocked series", version, got.Series.Codec)
+			}
+			continue
+		}
+		if got.Series.Codec != usage.SeriesCodec {
+			t.Fatalf("a wire-%d plane was sent codec %d, want %d", version, got.Series.Codec, usage.SeriesCodec)
+		}
+		decoded, err := usage.DecodeSeries(got.Series.Data)
+		want := []usage.Point{{OffsetMillis: 0}, {OffsetMillis: 1000, CPUUsage: 5}}
+		if err != nil || !slices.Equal(decoded, want) {
+			t.Errorf("a wire-%d plane was sent %v (%v), want the same points without the clock", version,
+				decoded, err)
+		}
+	}
+	if clocked.Codec != usage.SeriesCodecClocked || !bytes.Equal(clocked.Data, data) {
+		t.Error("the downgrade changed the caller's series")
 	}
 }

@@ -66,6 +66,7 @@ const (
 	EnergyProcess           = lease.EnergyProcess
 	UsageSourceHost         = lease.UsageSourceHost
 	UsageSeriesCodec        = lease.UsageSeriesCodec
+	UsageSeriesCodecClocked = lease.UsageSeriesCodecClocked
 	MaxUsageSeriesBytes     = lease.MaxUsageSeriesBytes
 	MaxJobDestinations      = lease.MaxJobDestinations
 )

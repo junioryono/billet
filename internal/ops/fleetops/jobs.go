@@ -57,10 +57,13 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
 		return renderJobJSON(env.Stdout, rec, measured)
 	}
+	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	renderJob(env.Stdout, rec, measured)
+	renderSteps(env.Stdout, steps)
 
 	return nil
 }
