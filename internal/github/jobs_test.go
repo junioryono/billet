@@ -457,6 +457,43 @@ func TestABrokenBodyNamingTheTokenIsRedacted(t *testing.T) {
 	}
 }
 
+// AN ANSWER THAT ECHOES THE APP'S JWT IS NOT READ EITHER: a server that saw the
+// JWT at the token exchange can return it in any later answer, verbatim or
+// escaped, as a job's name.
+func TestALaterAnswerEchoingTheJWTIsNotRead(t *testing.T) {
+	t.Parallel()
+
+	key, _ := testKeyPKCS1(t)
+	for echo, encode := range echoes {
+		var jwt atomic.Value
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /app/installations/22/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+			jwt.Store(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprintf(w, `{"token":"installation-secret","expires_at":%q}`,
+				time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		})
+		mux.HandleFunc("GET /repos/acme/api/actions/runs/31/jobs", func(w http.ResponseWriter, _ *http.Request) {
+			sent, _ := jwt.Load().(string) //nolint:errcheck // a missing JWT fails the assertion below
+			fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`,
+				jobJSON(1, "billet-lease-1", `{"number":1,"name":"`+encode(sent)+`"}`))
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		c := newRunnerGroupPolicyClient(defaultPolicyBounds, srv.URL, OrganizationTarget("acme"), 11, 22, key)
+
+		_, err := c.RunnerJob(t.Context(), "acme", "api", 31, "billet-lease-1")
+		sent, ok := jwt.Load().(string)
+		if !ok || sent == "" {
+			t.Fatalf("%s: no token exchange was attempted: %v", echo, err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "carried the request's credential") ||
+			strings.Contains(err.Error(), sent) {
+			t.Errorf("%s: an answer echoing the JWT = %v, want it refused unread", echo, err)
+		}
+	}
+}
+
 // A REFUSED TOKEN EXCHANGE DOES NOT CARRY THE APP'S JWT, even when GitHub's
 // message echoes it, escaped or not.
 func TestARefusedTokenExchangeDoesNotEchoTheJWT(t *testing.T) {

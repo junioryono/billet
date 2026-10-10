@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -59,6 +60,13 @@ type runnerGroupPolicyClient struct {
 	tokenSlot chan struct{}
 	token     string
 	expiresAt time.Time
+
+	// sentJWTs are the App JWTs this client has sent, newest last, so an
+	// answer that echoes one back is refused like one echoing the token: a
+	// server that saw a JWT at the token exchange could return it in any later
+	// answer. Guarded by sentMu, since reads run beside the exchange.
+	sentMu   sync.Mutex
+	sentJWTs []string
 }
 
 // policyBounds limits every request the policy client makes. The policy is read
@@ -208,12 +216,36 @@ func (c *runnerGroupPolicyClient) get(ctx context.Context, token, endpoint, oper
 	// AN ANSWER THAT CARRIES THE TOKEN IS NOT READ AT ALL: every string in it
 	// can reach an operator's output, as a job's name or inside an error about a
 	// field that did not parse, and no redaction of one path covers the next.
-	if carries(body, token) {
+	if carries(body, token) || c.carriesJWT(body) {
 		return nil, fmt.Errorf("github: %s: the answer carried the request's credential, or could not "+
 			"be checked for it, so it is not read", operation)
 	}
 
 	return body, nil
+}
+
+// maxSentJWTs bounds the JWTs a client remembers. One is signed per token
+// exchange, so this spans far longer than any answer a server could still be
+// holding one for.
+const maxSentJWTs = 16
+
+// rememberJWT keeps a JWT this client is about to send.
+func (c *runnerGroupPolicyClient) rememberJWT(jwt string) {
+	c.sentMu.Lock()
+	defer c.sentMu.Unlock()
+	c.sentJWTs = append(c.sentJWTs, jwt)
+	if len(c.sentJWTs) > maxSentJWTs {
+		c.sentJWTs = c.sentJWTs[len(c.sentJWTs)-maxSentJWTs:]
+	}
+}
+
+// carriesJWT reports whether a body holds any JWT this client has sent.
+func (c *runnerGroupPolicyClient) carriesJWT(body []byte) bool {
+	c.sentMu.Lock()
+	sent := slices.Clone(c.sentJWTs)
+	c.sentMu.Unlock()
+
+	return slices.ContainsFunc(sent, func(jwt string) bool { return carries(body, jwt) })
 }
 
 // carries reports whether a body holds bearer, as it was sent or in any JSON
@@ -620,6 +652,9 @@ func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string
 		return c.token, nil
 	}
 	jwt, err := SignAppJWT(c.appID, c.privateKey, time.Now())
+	if err == nil {
+		c.rememberJWT(jwt)
+	}
 	if err != nil {
 		return "", err
 	}
