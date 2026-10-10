@@ -519,6 +519,38 @@ linters:
             - pkg: "github.com/junioryono/billet/internal"
               desc: "usage is a leaf package — it must not import other billet packages."
 
+        # THE GUEST'S NUMBERS ARE SHOWN, NEVER DECIDED ON. internal/guestreport is
+        # what the in-VM agent reports, and the job is root in its VM, so every
+        # number in it is the guest's own unverified view. The agent writes it, the
+        # node accepts and merges it, and the two operator families render it; the
+        # ledger and the plane carry the encoded report as opaque bytes and never
+        # decode a guest number, so nothing they decide can rest on one. Tests may
+        # decode it anywhere. Measured at zero violations when it went in, with a
+        # denied import from internal/nodeplane and internal/state shown reported.
+        guestview:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!$test"
+            - "!${config-path}/internal/guestreport/**"
+            - "!${config-path}/internal/guestagent/**"
+            - "!${config-path}/internal/node/**"
+            - "!${config-path}/internal/ops/guest/**"
+            - "!${config-path}/internal/ops/fleetops/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/guestreport$"
+              desc: "A guest report is the guest's own unverified view: only the agent, the node and the operator families that render it decode one; the ledger and the plane carry its bytes opaque."
+
+        # THE GUEST REPORT IS A LEAF. The agent in the guest, the node and the
+        # operator commands all import it, so it imports nothing of billet's that
+        # one of them should not have: the standard library only.
+        guestreport:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/guestreport/**"
+          allow:
+            - $gostd
+
         # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
         #
         # The writer pool is ONE connection and DB.Tx begins IMMEDIATE, so a
