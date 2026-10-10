@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"slices"
@@ -33,9 +34,20 @@ type metric struct {
 	// against is the kind of the same run whose record is the reference: the
 	// job that did everything this one did except its load.
 	against string
-	value   func(job, ref *usage) float64
-	bounds  func(expected, seconds float64, ref *usage) (low, high float64)
-	rule    string
+	// medianOf, when set, are the kinds of the same run that carry no load for
+	// this group; the reference is then the one among them whose value for the
+	// group is the median, and against is only the fallback when fewer than
+	// three of them can be read on this host.
+	//
+	// ONE ODD JOB MUST NOT DECIDE A VERDICT. Run 6 (2026-10-10) failed network
+	// because its idle job's setup downloaded 57.3 MiB where the run's other
+	// four unloaded jobs downloaded 97.1 to 97.2 MiB (#461).
+	medianOf []string
+	// level reads the group's level from a record, for choosing the median.
+	level  func(u *usage) float64
+	value  func(job, ref *usage) float64
+	bounds func(expected, seconds float64, ref *usage) (low, high float64)
+	rule   string
 }
 
 func cpuSeconds(u *usage) float64 { return float64(u.CPUUserMicros+u.CPUSystemMicros) / 1e6 }
@@ -70,21 +82,25 @@ var metrics = []metric{
 	},
 	{
 		kind: kindNetwork, name: "net_rx_bytes", unit: "B", group: "net", against: kindIdle,
-		fields: []string{"net_rx_bytes"},
-		value:  func(job, ref *usage) float64 { return float64(job.NetRxBytes - ref.NetRxBytes) },
+		medianOf: []string{kindBaseline, kindIdle, kindCPU, kindMemory, kindDisk},
+		level:    func(u *usage) float64 { return float64(u.NetRxBytes) },
+		fields:   []string{"net_rx_bytes"},
+		value:    func(job, ref *usage) float64 { return float64(job.NetRxBytes - ref.NetRxBytes) },
 		bounds: func(e, _ float64, _ *usage) (float64, float64) {
 			return e - 4*mib, 1.06*e + 4*mib
 		},
-		rule: "received minus idle within [S - 4 MiB, 1.06 S + 4 MiB]",
+		rule: "received minus the median unloaded job within [S - 4 MiB, 1.06 S + 4 MiB]",
 	},
 	{
 		kind: kindDisk, name: "disk_write_bytes", unit: "B", group: "io", against: kindIdle,
-		fields: []string{"disk_write_bytes"},
-		value:  func(job, ref *usage) float64 { return float64(job.DiskWriteBytes - ref.DiskWriteBytes) },
+		medianOf: []string{kindBaseline, kindIdle, kindCPU, kindNetwork},
+		level:    func(u *usage) float64 { return float64(u.DiskWriteBytes) },
+		fields:   []string{"disk_write_bytes"},
+		value:    func(job, ref *usage) float64 { return float64(job.DiskWriteBytes - ref.DiskWriteBytes) },
 		bounds: func(e, _ float64, _ *usage) (float64, float64) {
 			return e - 64*mib, 1.10*e + 64*mib
 		},
-		rule: "written minus idle within [X - 64 MiB, 1.10 X + 64 MiB]",
+		rule: "written minus the median unloaded job within [X - 64 MiB, 1.10 X + 64 MiB]",
 	},
 }
 
@@ -170,6 +186,17 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 	}
 	r.jobID = jobIDNote(e.GitHubJobID, job.GitHubJobID)
 
+	if pick, ok := medianReference(&m, run, records, job); ok {
+		if pick.failed != "" {
+			r.verdict, r.reason = fail, pick.failed
+
+			return r
+		}
+		r.against = fmt.Sprintf("%s (the median of %d unloaded jobs)", pick.exp.Lease, pick.from)
+
+		return compare(r, e, &m, job, pick.rec)
+	}
+
 	refExp, ok := run[m.against]
 	if !ok {
 		r.reason = fmt.Sprintf("no %s job in %s to subtract", m.against, e.run())
@@ -196,6 +223,60 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 		return r
 	}
 
+	return compare(r, e, &m, job, ref)
+}
+
+// medianPick is the reference a metric took from several unloaded jobs.
+type medianPick struct {
+	exp  *expectation
+	rec  record
+	from int
+	// failed names an unloaded job whose record is another run's: what would
+	// be chosen among holds another job's figures, which is a finding.
+	failed string
+}
+
+// medianReference answers, for a metric that takes its reference from several
+// unloaded jobs, the one whose level is the median among those measured on
+// this job's host, and whether there were at least three to choose among.
+// With fewer, or with no host to compare, the metric falls back to its single
+// reference kind and that path's diagnostics. With an even count the lower of
+// the middle two is chosen, so the reference is always a job that ran.
+func medianReference(m *metric, run map[string]*expectation, records recordSource, job record,
+) (medianPick, bool) {
+	if len(m.medianOf) == 0 || job.Node == "" || job.Provider == "" {
+		return medianPick{}, false
+	}
+	var cands []medianPick
+	for _, kind := range m.medianOf {
+		exp, ok := run[kind]
+		if !ok {
+			continue
+		}
+		rec, v, why := measuredRecord(exp, m, records)
+		if v == fail {
+			return medianPick{failed: fmt.Sprintf("the %s job %s: %s", kind, exp.Lease, why)}, true
+		}
+		if v != "" || rec.Node != job.Node || rec.Provider != job.Provider {
+			continue
+		}
+		cands = append(cands, medianPick{exp: exp, rec: rec})
+	}
+	if len(cands) < 3 {
+		return medianPick{}, false
+	}
+	slices.SortStableFunc(cands, func(a, b medianPick) int {
+		return cmp.Compare(m.level(a.rec.Usage), m.level(b.rec.Usage))
+	})
+	mid := cands[(len(cands)-1)/2]
+	mid.from = len(cands)
+
+	return mid, true
+}
+
+// compare finishes a result against a reference already proved to be on this
+// job's host.
+func compare(r result, e *expectation, m *metric, job, ref record) result {
 	r.value = m.value(job.Usage, ref.Usage)
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), ref.Usage)
 	// A LOAD THE TOLERANCE CANNOT TELL FROM NO LOAD PROVES NOTHING: one worker
