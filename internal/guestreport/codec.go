@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/json"
-	"errors"
 	"io"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -103,9 +101,9 @@ func encode(v any, limit, inflatedLimit int) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// decode inflates data and decodes the one JSON value in it into v, with no field v
-// does not have and no list longer than s admits, and returns the JSON.
-func decode(data []byte, v any, limit, inflatedLimit int, s shape) ([]byte, error) {
+// decode inflates data and decodes the one JSON value in it into v, refusing first
+// anything s does not admit, and returns the JSON.
+func decode(data []byte, v any, limit, inflatedLimit int, s *shape) ([]byte, error) {
 	raw, err := inflate(data, limit, inflatedLimit)
 	if err != nil {
 		return nil, err
@@ -120,21 +118,10 @@ func decode(data []byte, v any, limit, inflatedLimit int, s shape) ([]byte, erro
 		return nil, err
 	}
 
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(v); err != nil {
-		// THE ONE REFUSAL encoding/json gives no type, recognised by its text
-		// (Go 1.26, TestEachRefusalIsTyped). Every message of its quotes the
-		// guest's bytes, so none is passed on.
-		if strings.HasPrefix(err.Error(), "json: unknown field ") {
-			return nil, refuse(ErrUnknownField, "")
-		}
-
-		return nil, refuse(ErrMalformed, "")
-	}
-
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+	// checkShape has judged every key, every kind of value and that there is one
+	// value; what is left to refuse here is a number or a string the fields cannot
+	// hold. encoding/json's messages quote the guest's bytes, so none is passed on.
+	if err := json.Unmarshal(raw, v); err != nil {
 		return nil, refuse(ErrMalformed, "")
 	}
 
