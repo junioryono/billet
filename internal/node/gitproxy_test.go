@@ -392,23 +392,25 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	spec.Git.MaxSize = 1
 	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
 	service.git.upstream, service.git.fullFraction = upstream.URL, 1
-	// THE NODE'S OWN FETCHES ARE COUNTED AT ITS git, not at GitHub: the
-	// watchdog stops a mirror past a one-byte ceiling at its first tick, which
-	// under load comes before that fetch has asked GitHub for anything.
+	// A MIRROR ATTEMPT IS COUNTED AT THE NODE'S git, BY ITS init: the watchdog
+	// stops a fetch past a one-byte ceiling at its first tick, which under load
+	// comes before that fetch has asked GitHub for anything or even started,
+	// but the init runs before the watchdog does, and a mirror removed as too
+	// large has to be made again.
 	record := filepath.Join(t.TempDir(), "subcommands")
 	wrapper := filepath.Join(t.TempDir(), "git")
 	if err := forkSafeWriteFile(wrapper, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >>"+record+"\nexec git \"$@\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	service.git.binary = wrapper
-	mirrorFetches := func() int {
+	mirrorsMade := func() int {
 		subcommands, err := os.ReadFile(record)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			t.Fatal(err)
 		}
 		n := 0
 		for line := range strings.Lines(string(subcommands)) {
-			if strings.TrimSpace(line) == "fetch" {
+			if strings.TrimSpace(line) == "init" {
 				n++
 			}
 		}
@@ -421,8 +423,8 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "first"); err != nil {
 		t.Fatalf("clone first: %v\n%s", err, output)
 	}
-	if got := mirrorFetches(); got != 1 {
-		t.Fatalf("the first clone ran %d mirror fetches, want 1", got)
+	if got := mirrorsMade(); got != 1 {
+		t.Fatalf("the first clone made %d mirrors, want 1", got)
 	}
 	before := upstream.fetches.Load()
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "second"); err != nil {
@@ -431,12 +433,13 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
 		t.Fatal("a mirror above the tier's ceiling was kept")
 	}
-	if got := mirrorFetches(); got != 1 {
-		t.Fatalf("the second clone ran a mirror fetch (%d in all), want it forwarded", got)
+	if got := mirrorsMade(); got != 1 {
+		t.Fatalf("the second clone made a mirror again (%d in all), want it forwarded", got)
 	}
-	// The second client's own fetch, and nothing else.
-	if got := upstream.fetches.Load() - before; got != 1 {
-		t.Fatalf("github.com served the second clone %d fetches, want 1", got)
+	// AT LEAST the second client's own fetch: the first mirror fetch, stopped,
+	// can still be counted late by a handler the kill did not join.
+	if got := upstream.fetches.Load() - before; got < 1 {
+		t.Fatalf("github.com served the second clone %d fetches, want its own", got)
 	}
 }
 
