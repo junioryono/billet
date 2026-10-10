@@ -228,11 +228,10 @@ func TestAComparisonWithoutItsInputIsUnmeasured(t *testing.T) {
 			}
 			return e
 		}, "a reference must come from the same host"},
-		{"a negative counter in the reference", kindNetwork, func(e []expectation, recs map[string]record) []expectation {
-			recs["lease-100-idle"].Usage.NetRxBytes = -100 * mib
-			recs["lease-100-network"].Usage.NetRxBytes = 0
+		{"a negative counter in the reference", kindMemory, func(e []expectation, recs map[string]record) []expectation {
+			recs["lease-100-idle"].Usage.MemoryPeakBytes = -100 * mib
 			return e
-		}, "the idle job lease-100-idle: billet's record says net_rx_bytes is -104857600"},
+		}, "the idle job lease-100-idle: billet's record says memory_peak_bytes is -104857600"},
 		{"a counter whose sum would wrap", kindCPU, func(e []expectation, recs map[string]record) []expectation {
 			recs["lease-100-idle"].Usage.CPUUserMicros = math.MaxInt64
 			recs["lease-100-idle"].Usage.CPUSystemMicros = math.MaxInt64
@@ -275,8 +274,14 @@ func TestARecordOfAnotherRunFails(t *testing.T) {
 	if got := resultFor(t, results, kindIdle); got.verdict != fail || !strings.Contains(got.reason, "ran run 99") {
 		t.Errorf("idle: %s (%q), want FAIL naming run 99", got.verdict, got.reason)
 	}
-	if got := resultFor(t, results, kindCPU); got.verdict != fail || !strings.Contains(got.reason, "the idle job") {
-		t.Errorf("cpu against a foreign idle: %s (%q), want FAIL", got.verdict, got.reason)
+	// Network and disk choose among several unloaded jobs, and one of them
+	// being another run's fails them too rather than leaving it out.
+	for _, kind := range []string{kindCPU, kindNetwork, kindDisk} {
+		if got := resultFor(t, results, kind); got.verdict != fail || got.compared ||
+			!strings.Contains(got.reason, "the idle job lease-100-idle") {
+			t.Errorf("%s against a foreign idle: %s compared=%v (%q), want an uncompared FAIL naming it",
+				kind, got.verdict, got.compared, got.reason)
+		}
 	}
 	if overall(results) != fail {
 		t.Errorf("overall %s, want FAIL", overall(results))
@@ -586,5 +591,137 @@ func TestALoadTooSmallToTellFromNothingIsUnmeasured(t *testing.T) {
 	got = resultFor(t, evaluate(exps, fromMap(recs)), kindMemory)
 	if got.verdict != unmeasured || !strings.Contains(got.reason, "which holds 700.0 MiB") {
 		t.Errorf("a 1 MiB memory load: %s (%q), want UNMEASURED", got.verdict, got.reason)
+	}
+}
+
+// ONE ODD UNLOADED JOB DOES NOT DECIDE NETWORK OR DISK (#461): run 6's idle job
+// downloaded 57.3 MiB in setup where the run's other unloaded jobs downloaded
+// 97.1 MiB, and failed a network job measured exactly at its answer. The
+// reference is the median of the unloaded jobs, so the odd one is outvoted and
+// named nowhere; an unreadable one is left out; and with fewer than three to
+// choose among, the single idle reference stands.
+func TestOneOddUnloadedJobDoesNotDecideTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	// Every candidate's level differs, so the reference chosen is named by
+	// its value: the network job received 163 MiB and the disk job wrote
+	// 2,148 MiB.
+	levels := func(runID int64, net, disk map[string]int64) ([]expectation, map[string]record) {
+		exps, recs := fixtureRun(runID)
+		for kind, v := range net {
+			recs[fmt.Sprintf("lease-%d-%s", runID, kind)].Usage.NetRxBytes = v * mib
+		}
+		for kind, v := range disk {
+			recs[fmt.Sprintf("lease-%d-%s", runID, kind)].Usage.DiskWriteBytes = v * mib
+		}
+		return exps, recs
+	}
+	net := map[string]int64{kindBaseline: 58, kindIdle: 20, kindCPU: 61, kindMemory: 62, kindDisk: 63}
+	disk := map[string]int64{kindBaseline: 80, kindIdle: 10, kindCPU: 95, kindNetwork: 100}
+	for _, tc := range []struct {
+		name    string
+		drop    []string
+		net     map[string]int64
+		kind    string
+		against string
+		value   float64
+	}{
+		// Five: 20 58 61 62 63, the middle one (not the second smallest).
+		{"network of five", nil, net, kindNetwork, "lease-100-cpu (the median of 5 unloaded jobs)", 102 * mib},
+		// Four: 20 58 61 62, the lower of the middle two.
+		{"network of four", []string{kindDisk}, net, kindNetwork,
+			"lease-100-baseline (the median of 4 unloaded jobs)", 105 * mib},
+		// Three: 20 58 61.
+		{"network of three", []string{kindDisk, kindMemory}, net, kindNetwork,
+			"lease-100-baseline (the median of 3 unloaded jobs)", 105 * mib},
+		// An odd job that measured MORE is outvoted too: 58 61 62 63 300.
+		{"network with a high odd job", nil,
+			map[string]int64{kindBaseline: 58, kindIdle: 300, kindCPU: 61, kindMemory: 62, kindDisk: 63},
+			kindNetwork, "lease-100-memory (the median of 5 unloaded jobs)", 101 * mib},
+		// Disk's four: 10 80 95 100, the lower of the middle two.
+		{"disk of four", nil, net, kindDisk, "lease-100-baseline (the median of 4 unloaded jobs)", 2068 * mib},
+	} {
+		exps, recs := levels(100, tc.net, disk)
+		for _, k := range tc.drop {
+			exps = dropKind(exps, k)
+		}
+		got := resultFor(t, evaluate(exps, fromMap(recs)), tc.kind)
+		if got.verdict != pass || got.against != tc.against || got.value != tc.value {
+			t.Errorf("%s: %s against %q measuring %.0f (%s), want PASS against %q measuring %.0f",
+				tc.name, got.verdict, got.against, got.value, got.reason, tc.against, tc.value)
+		}
+	}
+
+	// An unreadable candidate is left out, and the median is of the rest: 20
+	// 61 62 63.
+	exps, recs := levels(101, net, disk)
+	recs["lease-101-baseline"].Usage.NetRxBytes = -1
+	if got := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork); got.verdict != pass ||
+		got.against != "lease-101-cpu (the median of 4 unloaded jobs)" {
+		t.Errorf("network with an unreadable baseline: %s against %q, want PASS against the cpu job of 4",
+			got.verdict, got.against)
+	}
+
+	exps, recs = fixtureRun(102)
+	exps = dropKind(dropKind(dropKind(exps, kindCPU), kindMemory), kindDisk)
+	if got := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork); got.against != "lease-102-idle" {
+		t.Errorf("network with two unloaded jobs took its reference from %q, want the idle job alone", got.against)
+	}
+}
+
+// A CANDIDATE THAT CANNOT BE COMPARED IS NOT ONE TO CHOOSE AMONG: three
+// unloaded jobs that did not measure net, or ran on another host, but carry a
+// large stale counter would be the median if counted; left out, fewer than
+// three remain and the idle job alone is the reference.
+func TestAMedianCountsOnlyComparableJobs(t *testing.T) {
+	t.Parallel()
+
+	for _, spoil := range []struct {
+		name string
+		f    func(r *record)
+	}{
+		{"not measured", func(r *record) { r.Usage.Measured["net"] = false }},
+		{"another host", func(r *record) { r.Node = "ubuntu-02" }},
+	} {
+		t.Run(spoil.name, func(t *testing.T) {
+			t.Parallel()
+
+			exps, recs := fixtureRun(103)
+			for _, kind := range []string{kindBaseline, kindCPU, kindMemory} {
+				r := recs["lease-103-"+kind]
+				u := *r.Usage
+				u.Measured = allGroups()
+				u.NetRxBytes = 500 * mib
+				r.Usage = &u
+				spoil.f(&r)
+				recs["lease-103-"+kind] = r
+			}
+			got := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork)
+			if got.verdict != pass || got.against != "lease-103-idle" {
+				t.Errorf("network with three spoiled candidates: %s against %q (%s), want PASS against the idle job",
+					got.verdict, got.against, got.reason)
+			}
+		})
+	}
+
+	// Records that name no host agree with each other and prove nothing about
+	// being on one: the single reference's host check answers instead.
+	for _, field := range []string{"node", "provider"} {
+		exps, recs := fixtureRun(105)
+		for lease, r := range recs {
+			if field == "node" {
+				r.Node = ""
+			} else {
+				r.Provider = ""
+			}
+			recs[lease] = r
+		}
+		for _, kind := range []string{kindNetwork, kindDisk} {
+			if got := resultFor(t, evaluate(exps, fromMap(recs)), kind); got.verdict != unmeasured ||
+				!strings.Contains(got.reason, "same host") {
+				t.Errorf("%s with no %s recorded: %s (%q), want UNMEASURED for want of a host", kind, field,
+					got.verdict, got.reason)
+			}
+		}
 	}
 }
