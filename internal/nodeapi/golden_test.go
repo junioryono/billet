@@ -48,6 +48,7 @@ var wireTypes = map[string]any{
 	"EnrollRequest":             EnrollRequest{},
 	"EnrollResponse":            EnrollResponse{},
 	"ErrorResponse":             ErrorResponse{},
+	"GuestReportRequest":        GuestReportRequest{},
 	"HeartbeatRequest":          HeartbeatRequest{},
 	"JITRequest":                JITRequest{},
 	"JITResponse":               JITResponse{},

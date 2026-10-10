@@ -36,6 +36,7 @@ jobs:
           - { package: ./internal/version, fuzz: FuzzVersionCompare }
           - { package: ./internal/endpoint, fuzz: FuzzEndpointParse }
           - { package: ./internal/cli, fuzz: FuzzParseWithName }
+          - { package: ./internal/guestreport, fuzz: FuzzDecode }
     steps:
       - uses: actions/checkout@v6
 

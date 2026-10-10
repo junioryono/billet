@@ -1,0 +1,13 @@
+GuestReportRequest.epoch int64
+GuestReportRequest.report.agent_version string
+GuestReportRequest.report.schema int
+GuestReportRequest.report.codec int
+GuestReportRequest.report.data bytes
+GuestReportRequest.report.accepted int64
+GuestReportRequest.report.refused int64
+GuestReportRequest.report.dropped_bytes int64
+GuestReportRequest.report.hello bool
+GuestReportRequest.report.final_seen bool
+GuestReportRequest.report.node_restarted bool
+GuestReportRequest.report.first_received time
+GuestReportRequest.report.last_received time
