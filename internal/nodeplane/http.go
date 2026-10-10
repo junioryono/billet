@@ -103,6 +103,20 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
+// GuestReportStore keeps what the agent inside a lease's guest told the node:
+// the guest's own unverified view, fenced on the epoch, the first report kept.
+//
+// ASKED OF THE LEASE STORE rather than added to LeaseStore, so a store that
+// keeps none refuses the route instead of every LeaseStore having to grow it;
+// the allocator the control plane serves the wire with keeps them.
+type GuestReportStore interface {
+	RecordGuestReport(ctx context.Context, leaseID string, epoch int64, report alloc.GuestReport) error
+}
+
+// The allocator is the store the control plane serves the wire with, and it
+// keeps guest reports; this fails the build if it ever stops.
+var _ GuestReportStore = (*alloc.Allocator)(nil)
+
 // CachePolicy answers the kill switch for one cache of one repository.
 type CachePolicy interface {
 	CacheAllowed(ctx context.Context, kind, owner, repository string) (bool, error)
@@ -267,6 +281,9 @@ func WithTargetJIT(sources map[string]JITSource) HandlerOption {
 // check buried in a handler nobody re-reads.
 func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts ...HandlerOption) http.Handler {
 	h := &handler{log: log, plane: p, store: store, jit: jit}
+	if guests, ok := store.(GuestReportStore); ok {
+		h.guests = guests
+	}
 
 	for _, opt := range opts {
 		opt(h)
@@ -304,6 +321,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/resize", h.forOwnLease(h.resize))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/cache", h.forOwnLease(h.cacheObservation))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/usage", h.forOwnLease(h.leaseUsage))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/guest", h.forOwnLease(h.guestReport))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}/cache-authority", h.forOwnLease(h.cacheAuthority))
@@ -379,6 +397,9 @@ type handler struct {
 	trust       []byte
 	enrollments Enrollments
 	cachePolicy CachePolicy
+	// guests keeps guest reports; nil when the lease store keeps none, and the
+	// route then refuses.
+	guests GuestReportStore
 	// authorities remembers what GitHub's record said about a running job, so a
 	// job whose cache calls cannot be proved does not ask GitHub on every call.
 	authorities authorityMemory
@@ -1583,6 +1604,48 @@ func (h *handler) leaseUsage(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.RecordLeaseUsage(r.Context(), r.PathValue("lease"), req.Epoch,
 		req.Usage, req.Series); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// guestReport keeps what the agent inside a lease's guest told the node, the
+// guest's own unverified view, which nothing on the control plane decides from.
+//
+// REFUSED FROM A PAIRING THAT NEGOTIATED BELOW VersionGuestReport, whose wire
+// does not carry it, and VALIDATED AT THE BOUNDARY, like a usage report, so a
+// report this control plane cannot keep is refused as such rather than
+// surfacing from the ledger as an error the node would read as transient.
+func (h *handler) guestReport(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.GuestReportRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if wire, known := h.plane.NegotiatedWire(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation)); known && wire < nodeapi.VersionGuestReport {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, fmt.Sprintf(
+			"a guest report needs wire %d and this node negotiated %d", nodeapi.VersionGuestReport, wire))
+
+		return
+	}
+
+	if err := req.Report.Validate(); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	if h.guests == nil {
+		writeErr(w, http.StatusNotImplemented, nodeapi.CodeRefused, "this control plane keeps no guest reports")
+
+		return
+	}
+
+	if err := h.guests.RecordGuestReport(r.Context(), r.PathValue("lease"), req.Epoch, req.Report); err != nil {
 		writeStoreErr(w, err)
 
 		return
