@@ -420,11 +420,31 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	t.Cleanup(node.Close)
 	git := gitClient(t, node, token, githubBasic)
 
-	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "first"); err != nil {
-		t.Fatalf("clone first: %v\n%s", err, output)
+	// A clone whose fetch slot was not admitted within gitFetchWait is GitHub's
+	// and makes no mirror, which a stalled machine can cause; so clone until
+	// one has, a bounded number of times.
+	for attempt := 0; mirrorsMade() == 0; attempt++ {
+		if attempt == 3 {
+			t.Fatal("no clone made a mirror in three attempts")
+		}
+		if output, err := git("clone", "-q", "https://github.com/acme/api.git", fmt.Sprintf("first%d", attempt)); err != nil {
+			t.Fatalf("clone first: %v\n%s", err, output)
+		}
 	}
 	if got := mirrorsMade(); got != 1 {
 		t.Fatalf("the first clone made %d mirrors, want 1", got)
+	}
+	// THE MIRROR IS GONE AND THE REPOSITORY MARKED, before the second clone:
+	// a mirror left behind by a fetch that failed for another reason would let
+	// the second clone fetch into it without making it again.
+	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the mirror above the tier's ceiling was not removed: %v", err)
+	}
+	service.git.mu.Lock()
+	marked := service.git.tooLarge["untrusted/acme/api"]
+	service.git.mu.Unlock()
+	if !marked.After(time.Now()) {
+		t.Fatalf("the repository is not marked too large (until %v)", marked)
 	}
 	before := upstream.fetches.Load()
 	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "second"); err != nil {
