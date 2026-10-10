@@ -28,7 +28,7 @@ func aGuestReport() alloc.GuestReport {
 	return alloc.GuestReport{
 		AgentVersion: "billet-agent/0.1.0", Schema: 1, Codec: alloc.GuestReportCodec,
 		Data: []byte{0, 1, 2, 255}, Accepted: 12, Refused: 1, DroppedBytes: 3,
-		Hello: true, FinalSeen: true, FirstReceived: first, LastReceived: first.Add(time.Minute),
+		Hello: true, FinalSeen: true, NodeRestarted: true, FirstReceived: first, LastReceived: first.Add(time.Minute),
 	}
 }
 

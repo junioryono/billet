@@ -89,7 +89,8 @@ func (g GuestReport) Validate() error {
 		}
 	}
 	if g.Schema < 0 || g.Schema > MaxGuestSchema {
-		return fmt.Errorf("alloc: guest report schema %d is outside 0 to %d", g.Schema, MaxGuestSchema)
+		// THE RANGE, NOT THE VALUE: the guest chose it.
+		return fmt.Errorf("alloc: a guest report's schema is outside 0 to %d", MaxGuestSchema)
 	}
 	if g.Accepted < 0 || g.Refused < 0 || g.DroppedBytes < 0 {
 		return fmt.Errorf("alloc: a guest report has a negative count (accepted %d, refused %d, "+

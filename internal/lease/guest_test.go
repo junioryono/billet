@@ -41,8 +41,10 @@ func TestAGuestReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 		{"a version with a space", func(g *GuestReport) { g.AgentVersion = "1.0 forged" }, "not printable ASCII"},
 		{"a version with DEL", func(g *GuestReport) { g.AgentVersion = "1.0\x7f" }, "not printable ASCII"},
 		{"a version that is not ASCII", func(g *GuestReport) { g.AgentVersion = "1.0é" }, "not printable ASCII"},
-		{"a negative schema", func(g *GuestReport) { g.Schema = -1 }, "schema -1 is outside"},
-		{"a schema over its bound", func(g *GuestReport) { g.Schema = MaxGuestSchema + 1 }, "schema 65536 is outside"},
+		{"a negative schema", func(g *GuestReport) { g.Schema = -1 }, "schema is outside 0 to 65535"},
+		{"a schema over its bound", func(g *GuestReport) { g.Schema = 123456789 }, "schema is outside 0 to 65535"},
+		{"a schema one over its bound", func(g *GuestReport) { g.Schema = MaxGuestSchema + 1 },
+			"schema is outside 0 to 65535"},
 		{"a negative accepted count", func(g *GuestReport) { g.Accepted = -1 }, "negative count"},
 		{"a negative refused count", func(g *GuestReport) { g.Refused = -1 }, "negative count"},
 		{"negative dropped bytes", func(g *GuestReport) { g.DroppedBytes = -1 }, "negative count"},
@@ -71,6 +73,12 @@ func TestAGuestReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 
 	if err := aGuestReport().Validate(); err != nil {
 		t.Fatalf("a report at every bound was refused: %v", err)
+	}
+	// NOR THE SCHEMA THE GUEST CHOSE.
+	schema := aGuestReport()
+	schema.Schema = 123456789
+	if err := schema.Validate(); err == nil || strings.Contains(err.Error(), "123456789") {
+		t.Fatalf("Validate = %v, want a refusal that does not quote the schema", err)
 	}
 	// THE REFUSAL NAMES WHERE, NEVER WHAT: the guest wrote the version.
 	g := aGuestReport()

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +65,7 @@ func aGuestReport() alloc.GuestReport {
 	return alloc.GuestReport{
 		AgentVersion: "billet-agent/0.1.0", Schema: 1, Codec: alloc.GuestReportCodec,
 		Data: []byte{0, 1, 2, 255}, Accepted: 12, Refused: 1, DroppedBytes: 3,
-		Hello: true, FinalSeen: true, FirstReceived: first, LastReceived: first.Add(time.Minute),
+		Hello: true, FinalSeen: true, NodeRestarted: true, FirstReceived: first, LastReceived: first.Add(time.Minute),
 	}
 }
 
@@ -104,11 +105,16 @@ func TestAGuestReportIsSentToAPlaneAtItsVersion(t *testing.T) {
 	if len(plane.got) != 1 || plane.paths[0] != "POST /v1/nodes/n1/leases/l1/guest" {
 		t.Fatalf("the plane was sent %v, want one POST to /v1/nodes/n1/leases/l1/guest", plane.paths)
 	}
+	// EVERY FIELD, the arrivals as the instants they name.
 	got := plane.got[0]
-	if got.Epoch != 7 || got.Report.AgentVersion != report.AgentVersion ||
-		!bytes.Equal(got.Report.Data, report.Data) || got.Report.Accepted != report.Accepted ||
-		!got.Report.LastReceived.Equal(report.LastReceived) {
-		t.Fatalf("the plane was sent %+v, want %+v at epoch 7", got, report)
+	sent := got.Report
+	if !sent.FirstReceived.Equal(report.FirstReceived) || !sent.LastReceived.Equal(report.LastReceived) {
+		t.Fatalf("the plane was sent arrivals %s to %s, want %s to %s", sent.FirstReceived, sent.LastReceived,
+			report.FirstReceived, report.LastReceived)
+	}
+	sent.FirstReceived, sent.LastReceived = report.FirstReceived, report.LastReceived
+	if got.Epoch != 7 || !reflect.DeepEqual(sent, report) {
+		t.Fatalf("the plane was sent %+v at epoch %d, want %+v at epoch 7", sent, got.Epoch, report)
 	}
 }
 
