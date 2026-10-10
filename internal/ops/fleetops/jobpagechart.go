@@ -20,20 +20,26 @@ import (
 // bounds a chart's size whatever the series holds.
 const maxChartWindows = 720
 
-// chartHeight is the height of every chart's coordinate system. Its x axis is
-// milliseconds from the series' first sample, so a step's window on GitHub's
-// clock is placed on it by subtraction.
-const chartHeight = 100
+// chartHeight and chartWidth are every chart's coordinate system: the series'
+// first sample is at x 0 and its last at chartWidth, whatever its length, so a
+// coordinate is never longer than chartWidth's digits and a chart's size is
+// bounded by its windows alone.
+const (
+	chartHeight = 100
+	chartWidth  = 100_000
+)
 
 // pageCharts is the charts section of the job page.
 type pageCharts struct {
 	// Why says why nothing is drawn; every other field is empty when it is set.
 	Why string
-	// Origin and SpanMillis are the offsets of the series' first and last
-	// samples, the x extent of every chart, and Width the distance between
-	// them; X0 and X1 label them.
-	Origin, SpanMillis, Width int64
-	X0, X1                    string
+	// Origin and Width are the offset of the series' first sample and the
+	// milliseconds to its last, which the x axis maps onto 0 to Units; X0 and
+	// X1 label them.
+	Origin, Width, Units int64
+	X0, X1               string
+	// Focusable says some chart was drawn, so a step can be focused on it.
+	Focusable bool
 	// Start and End are the series' ends on the host's clock, Length its
 	// duration, and Drawn how it was cut into windows to draw.
 	Start, End, Length, Drawn string
@@ -97,7 +103,7 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	first := tl.Points[0].OffsetMillis
 	span := tl.Points[len(tl.Points)-1].OffsetMillis
 	out := pageCharts{
-		Origin: first, SpanMillis: span, Width: span - first, X0: offsetLabel(first), X1: offsetLabel(span),
+		Origin: first, Width: span - first, Units: chartWidth, X0: offsetLabel(first), X1: offsetLabel(span),
 		Start:  stamp(tl.First.Add(time.Duration(first) * time.Millisecond)),
 		End:    stamp(tl.First.Add(time.Duration(span) * time.Millisecond)),
 		Length: (time.Duration(span-first) * time.Millisecond).String(),
@@ -115,7 +121,7 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	for i, w := range windows {
 		used[i] = windowOf(*tl, w.from, w.to)
 	}
-	x := func(t time.Time) int64 { return t.Sub(tl.First).Milliseconds() }
+	x := func(t time.Time) int64 { return out.at(t.Sub(tl.First).Milliseconds()) }
 
 	cpu := pageChart{Title: "CPU (cores busy)"}
 	if !m.Measured(alloc.UsageCPU) {
@@ -167,9 +173,12 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 			rateSeries{"b", "sent", bytesPerSecond(func(u usage.WindowUsage) int64 { return u.NetTx })})
 	}
 	out.Charts = []pageChart{cpu, memory, disk, network}
+	for _, c := range out.Charts {
+		out.Focusable = out.Focusable || c.Unmeasured == ""
+	}
 
 	for i, step := range steps {
-		from, to, ok := stepOnSeries(step, tl, span)
+		from, to, ok := out.stepWindow(step, tl)
 		if !ok {
 			continue
 		}
@@ -177,6 +186,11 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	}
 
 	return out
+}
+
+// at is an offset from the series' first sample on the charts' x axis.
+func (c pageCharts) at(ms int64) int64 {
+	return int64(math.Round(float64(ms-c.Origin) / float64(c.Width) * chartWidth))
 }
 
 // offsetLabel writes an offset from the series' first sample as the page's
@@ -337,13 +351,13 @@ func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUs
 				level = max(level, tl.Points[i].MemoryCurrent)
 				gap = gap || tl.Points[i].AfterGap
 			}
-			y := chartY(float64(level), top)
+			px, y := x(tl.First.Add(time.Duration(at)*time.Millisecond)), chartY(float64(level), top)
 			if gap || !p.down {
 				p.lift()
-				p.level(at, at, y)
+				p.level(px, px, y)
 				continue
 			}
-			p.to(at, y)
+			p.to(px, y)
 		}
 	} else {
 		for i, w := range windows {
@@ -423,16 +437,19 @@ func (p *svgPath) level(x0, x1 int64, y string) {
 
 func (p *svgPath) String() string { return p.b.String() }
 
-// stepOnSeries is a step's window on the charts' x axis, clipped to the
-// series, and whether any of it lies there. A step without both times, or with
-// no length, has none. It is asked only of a series the charts were drawn
-// from, which has an interval.
-func stepOnSeries(step github.JobStep, tl *usage.Timeline, span int64) (int64, int64, bool) {
-	if tl == nil || step.StartedAt.IsZero() || step.CompletedAt.IsZero() || !step.CompletedAt.After(step.StartedAt) {
+// stepWindow is a step's window on the charts' x axis, clipped to the series,
+// and whether any of it lies there. A step without both times, or with no
+// length, has none, and so has every step when no chart was drawn.
+func (c pageCharts) stepWindow(step github.JobStep, tl *usage.Timeline) (int64, int64, bool) {
+	if !c.Focusable || tl == nil || step.StartedAt.IsZero() || step.CompletedAt.IsZero() ||
+		!step.CompletedAt.After(step.StartedAt) {
 		return 0, 0, false
 	}
-	from := max(step.StartedAt.Sub(tl.First).Milliseconds(), tl.Points[0].OffsetMillis)
-	to := min(step.CompletedAt.Sub(tl.First).Milliseconds(), span)
+	from := max(step.StartedAt.Sub(tl.First).Milliseconds(), c.Origin)
+	to := min(step.CompletedAt.Sub(tl.First).Milliseconds(), c.Origin+c.Width)
+	if to <= from {
+		return 0, 0, false
+	}
 
-	return from, to, to > from
+	return c.at(from), c.at(to), true
 }

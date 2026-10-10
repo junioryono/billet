@@ -51,8 +51,8 @@
 {{- if .Why}}
 <p class="why">{{.Why}}</p>
 {{- else}}
-<p>The host's series from {{.Start}} to {{.End}} on its own clock ({{.Length}}). <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="{{.Origin}}" data-to="{{.SpanMillis}}">Show the whole series</button></p>
-<p class="note">{{.Drawn}} Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.</p>
+<p>The host's series from {{.Start}} to {{.End}} on its own clock ({{.Length}}). {{- if .Focusable}} <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="0" data-to="{{.Units}}" data-origin="{{.Origin}}" data-width="{{.Width}}">Show the whole series</button>{{end}}</p>
+<p class="note">{{.Drawn}}{{if .Focusable}} Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.{{end}}</p>
 {{- $c := .}}
 {{- range .Charts}}
 <figure class="chart">
@@ -64,12 +64,12 @@
 {{- else}}
 <div class="plot">
 <span class="top">{{.Top}}</span>
-<svg data-chart="" viewBox="{{$c.Origin}} 0 {{$c.Width}} 100" preserveAspectRatio="none" role="img" aria-label="{{.Title}}">
+<svg data-chart="" viewBox="0 0 {{$c.Units}} 100" preserveAspectRatio="none" role="img" aria-label="{{.Title}}">
 {{- range $c.Bands}}
 <rect class="{{.Class}}" data-key="{{.Key}}" x="{{.X}}" y="0" width="{{.W}}" height="100"></rect>
 {{- end}}
 {{- with .Limit}}
-<line class="limit" x1="{{$c.Origin}}" x2="{{$c.SpanMillis}}" y1="{{.Y}}" y2="{{.Y}}"></line>
+<line class="limit" x1="0" x2="{{$c.Units}}" y1="{{.Y}}" y2="{{.Y}}"></line>
 {{- end}}
 {{- range .Lines}}
 <path class="line {{.Class}}" d="{{.D}}"></path>

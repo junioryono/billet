@@ -278,13 +278,13 @@ func TestJobsShowHTMLIsTheCommittedExample(t *testing.T) {
 	for _, want := range []string{
 		"<h1>build (ubuntu, go 1.26)</h1>",
 		"Every one of the series&#39; 169 samples is drawn",
-		`<button type="button" data-from="19000" data-to="91000" data-key="2" data-step="3" aria-pressed="false">`,
+		`<button type="button" data-from="11343" data-to="54328" data-key="2" data-step="3" aria-pressed="false">`,
 		`<th scope="row">3 Build</th><td>2026-10-09T12:00:19Z</td><td>1m12s</td>`,
 		"partial: the series covers 1m11s of the step&#39;s 1m12s",
 		"partial: the series covers 500ms of the step&#39;s 1s",
 		"start and end in the same second, so no usage can be placed in it",
 		"1.20 instructions per cycle", "3.2 misses per 1,000 instructions",
-		`<rect class="band0" data-key="2" x="19000" y="0" width="72000" height="100"></rect>`,
+		`<rect class="band0" data-key="2" x="11343" y="0" width="42985" height="100"></rect>`,
 		"140.82.112.4", "Dashed: tier memory 8.0 GiB.", "Dashed: the lease&#39;s 2 vCPU.",
 		"GitHub succeeded; billet done",
 	} {
@@ -620,7 +620,7 @@ func TestTheJobPageOfAJobWithNoSteps(t *testing.T) {
 			if !strings.Contains(section(t, page, "step-usage"), tc.want) {
 				t.Errorf("the step table does not say %q:\n%s", tc.want, section(t, page, "step-usage"))
 			}
-			if strings.Contains(page, "data-from=\"19000\"") || strings.Contains(page, "<rect class=\"band") {
+			if strings.Contains(page, "data-key=") || strings.Contains(page, "<rect class=\"band") {
 				t.Errorf("a job with no steps shows a step")
 			}
 			if strings.Count(page, "<svg data-chart") != 4 {
@@ -771,8 +771,55 @@ func TestRepeatedOffsetsDoNotGrowTheMemoryChart(t *testing.T) {
 	if n := strings.Count(d[1], "M") + strings.Count(d[1], "L"); n != 2 {
 		t.Errorf("the memory line of two offsets draws %d points, want 2: %s", n, d[1])
 	}
-	if !strings.Contains(memory, "<span class=\"top\">5.4 GiB</span>") {
-		t.Errorf("the highest level at an offset was not the one drawn:\n%s", memory)
+	// The 5 GiB sample among the zeros at offset 0, under a top 8% above it.
+	if !strings.HasPrefix(d[1], "M0 7.41H0") {
+		t.Errorf("the level drawn at offset 0 is not its highest: %s", d[1])
+	}
+}
+
+// A SERIES OF THE LONGEST OFFSETS THE DECODER ACCEPTS IS NO LARGER A PAGE: the
+// charts' coordinates are the series mapped onto a fixed width, so 720
+// intervals of months each draw as small as 720 of a second.
+func TestLongOffsetsDoNotGrowTheCharts(t *testing.T) {
+	t.Parallel()
+
+	tl := usage.Timeline{First: pageStart}
+	for i := range int64(maxChartWindows + 1) {
+		tl.Points = append(tl.Points, usage.Point{OffsetMillis: i * 12_800_000_000})
+	}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
+	page := renderPage(t, alloc.JobRecord{LeaseID: "l1", VCPU: 2, Memory: 8 << 30}, measured,
+		jobSteps{none: "no GitHub job"}, &tl, "")
+
+	if len(page) > maxSeriesPageBytes {
+		t.Errorf("a page of %d intervals of %s is %d bytes, over the %d bound", maxChartWindows,
+			12_800_000_000*time.Millisecond, len(page), maxSeriesPageBytes)
+	}
+	if !strings.Contains(page, "Every one of the series&#39; 721 samples is drawn") {
+		t.Errorf("the series was not drawn sample by sample, so the case above proves nothing")
+	}
+}
+
+// WITH NO CHART DRAWN THERE IS NOTHING TO FOCUS: every group unmeasured leaves
+// each step's button disabled and no control for the whole series.
+func TestNoStepIsFocusableWhenNoChartIsDrawn(t *testing.T) {
+	t.Parallel()
+
+	points := exampleSeries()
+	tl := usage.Timeline{First: pageStart, Points: points}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(points)}
+	measured.Unmeasured = []string{alloc.UsageCPU, alloc.UsageMemory, alloc.UsageIO, alloc.UsageNet}
+	page := renderPage(t, alloc.JobRecord{LeaseID: "l1"}, measured, jobSteps{runner: "billet-l1",
+		measured: measured, timeline: &tl, job: github.WorkflowJob{ID: 1, Name: "j", Steps: []github.JobStep{
+			{Number: 1, Name: "a", StartedAt: pageSecond(1), CompletedAt: pageSecond(5)},
+		}}}, &tl, "")
+
+	if strings.Contains(page, "data-key=") || strings.Contains(page, `id="whole"`) ||
+		!strings.Contains(page, `<button type="button" disabled>`) {
+		t.Errorf("a page with no chart offers a focus:\n%s", section(t, page, "steps"))
+	}
+	if strings.Count(page, `<p class="unmeasured">not measured</p>`) != 4 {
+		t.Errorf("the four charts do not each say not measured")
 	}
 }
 
@@ -786,7 +833,8 @@ func TestTheMemoryLineBreaksAtAGap(t *testing.T) {
 	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(points)}
 	charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
 	memory := charts.Charts[1].Lines[0].D
-	if !strings.Contains(memory, "M60000 ") || strings.Contains(memory, "L60000 ") {
+	// 60s of the series' 167.5s on the charts' 100,000 units.
+	if !strings.Contains(memory, "M35821 ") || strings.Contains(memory, "L35821 ") {
 		t.Errorf("the memory line is not broken before the sample at 60s, which ends a gap:\n%s", memory)
 	}
 	if strings.Count(memory, "M") != 2 {
@@ -901,7 +949,7 @@ func TestTheJobPageOfASeriesWithNoInterval(t *testing.T) {
 			if !strings.Contains(section(t, page, "charts"), "the series holds no interval to draw") {
 				t.Errorf("a series with no interval did not say why nothing is drawn")
 			}
-			if strings.Contains(page, "data-from=") || strings.Contains(page, "<svg data-chart") {
+			if strings.Contains(page, "data-key=") || strings.Contains(page, "id=\"whole\"") || strings.Contains(page, "<svg data-chart") {
 				t.Errorf("a series with no interval drew a chart or offered a focus")
 			}
 		})

@@ -1,12 +1,14 @@
 (function () {
   "use strict";
   var charts = document.querySelectorAll("svg[data-chart]");
-  var steps = document.querySelectorAll("button[data-from]");
+  var steps = document.querySelectorAll("button[data-key]");
   var whole = document.getElementById("whole");
   var label = document.getElementById("focus");
   if (!whole || !label || charts.length === 0) {
     return;
   }
+  var origin = Number(whole.getAttribute("data-origin"));
+  var scale = Number(whole.getAttribute("data-width")) / Number(whole.getAttribute("data-to"));
   function pad(n) {
     return n < 10 ? "0" + n : String(n);
   }
@@ -21,8 +23,8 @@
     for (var i = 0; i < charts.length; i++) {
       var svg = charts[i];
       svg.setAttribute("viewBox", from + " 0 " + Math.max(to - from, 1) + " 100");
-      svg.parentNode.querySelector(".x0").textContent = offset(from);
-      svg.parentNode.querySelector(".x1").textContent = offset(to);
+      svg.parentNode.querySelector(".x0").textContent = offset(origin + from * scale);
+      svg.parentNode.querySelector(".x1").textContent = offset(origin + to * scale);
       var bands = svg.querySelectorAll("rect[data-key]");
       for (var j = 0; j < bands.length; j++) {
         bands[j].classList.toggle("on", bands[j].getAttribute("data-key") === key);

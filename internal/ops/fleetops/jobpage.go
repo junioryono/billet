@@ -293,9 +293,8 @@ func stepsSection(s jobSteps, tl *usage.Timeline, unaligned string, measured *al
 			row.BarX = int64(float64(step.StartedAt.Sub(lo)) / whole * 1000)
 			row.BarW = max(int64(float64(step.CompletedAt.Sub(step.StartedAt))/whole*1000), 3)
 		}
-		// A STEP IS FOCUSED ONLY ON CHARTS THAT WERE DRAWN.
-		if out.Aligned && charts.Why == "" {
-			row.From, row.To, row.Focus = stepOnSeries(step, tl, charts.SpanMillis)
+		if out.Aligned {
+			row.From, row.To, row.Focus = charts.stepWindow(step, tl)
 		}
 		out.Rows = append(out.Rows, row)
 	}
