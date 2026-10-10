@@ -166,38 +166,56 @@ func TestAGuestReportBeforeRegistrationIsUnregisteredNotDropped(t *testing.T) {
 	}
 }
 
-// THE ARRIVAL TIMES CROSS THE WIRE IN UTC, as the same instants: JSON spells a
-// time in its own zone, so a zone that carries an instant past the year 9999
-// would not encode, and an offset with seconds in it would lose them.
+// THE ARRIVAL TIMES CROSS THE WIRE IN UTC, as the same instants, each case on
+// its own: JSON spells a time in its own zone, so a zone that carries an
+// instant past the year 9999 would not encode, an offset with seconds in it
+// would lose them, and a zero time in another zone would arrive as a time.
 func TestAGuestReportsArrivalsCrossTheWireInUTC(t *testing.T) {
 	t.Parallel()
 
-	plane := &guestPlane{version: 29}
-	c := registeredAt(t, plane)
-
-	report := aGuestReport()
 	ahead := time.FixedZone("ahead", 60*60)
 	odd := time.FixedZone("odd", 5*60*60+30*60+17)
-	report.FirstReceived = time.Date(9999, 12, 31, 22, 0, 0, 0, time.UTC).In(odd)
-	report.LastReceived = time.Date(9999, 12, 31, 23, 30, 0, 5, time.UTC).In(ahead)
-	if err := report.Validate(); err != nil {
-		t.Fatalf("the report under test does not validate: %v", err)
-	}
-	if err := c.RecordGuestReport(t.Context(), "l1", 7, report); err != nil {
-		t.Fatalf("RecordGuestReport: %v", err)
-	}
-	if report.FirstReceived.Location() != odd || report.LastReceived.Location() != ahead {
-		t.Error("RecordGuestReport changed the caller's report")
-	}
+	for _, tc := range []struct {
+		name        string
+		first, last time.Time
+	}{
+		{"a zone that carries them past the year 9999",
+			time.Date(9999, 12, 31, 22, 0, 0, 0, time.UTC).In(ahead),
+			time.Date(9999, 12, 31, 23, 30, 0, 5, time.UTC).In(ahead)},
+		{"an offset with seconds in it",
+			time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC).In(odd),
+			time.Date(2026, 10, 9, 12, 1, 0, 0, time.UTC).In(odd)},
+		{"no arrival, in a zone", time.Time{}.In(odd), time.Time{}.In(odd)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	plane.mu.Lock()
-	defer plane.mu.Unlock()
-	if len(plane.got) != 1 {
-		t.Fatalf("the plane was sent %d reports, want 1", len(plane.got))
-	}
-	got := plane.got[0].Report
-	if !got.FirstReceived.Equal(report.FirstReceived) || !got.LastReceived.Equal(report.LastReceived) {
-		t.Fatalf("the plane was sent arrivals %s to %s, want the instants %s to %s",
-			got.FirstReceived, got.LastReceived, report.FirstReceived, report.LastReceived)
+			plane := &guestPlane{version: 29}
+			c := registeredAt(t, plane)
+			report := aGuestReport()
+			report.FirstReceived, report.LastReceived = tc.first, tc.last
+			if err := report.Validate(); err != nil {
+				t.Fatalf("the report under test does not validate: %v", err)
+			}
+			if err := c.RecordGuestReport(t.Context(), "l1", 7, report); err != nil {
+				t.Fatalf("RecordGuestReport: %v", err)
+			}
+			if report.FirstReceived.Location() != tc.first.Location() ||
+				report.LastReceived.Location() != tc.last.Location() {
+				t.Error("RecordGuestReport changed the caller's report")
+			}
+
+			plane.mu.Lock()
+			defer plane.mu.Unlock()
+			if len(plane.got) != 1 {
+				t.Fatalf("the plane was sent %d reports, want 1", len(plane.got))
+			}
+			got := plane.got[0].Report
+			if !got.FirstReceived.Equal(tc.first) || !got.LastReceived.Equal(tc.last) ||
+				got.FirstReceived.IsZero() != tc.first.IsZero() || got.LastReceived.IsZero() != tc.last.IsZero() {
+				t.Fatalf("the plane was sent arrivals %s to %s, want the instants %s to %s",
+					got.FirstReceived, got.LastReceived, tc.first, tc.last)
+			}
+		})
 	}
 }

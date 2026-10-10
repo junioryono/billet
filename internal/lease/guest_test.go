@@ -72,12 +72,19 @@ func TestAGuestReportTheLedgerCannotKeepIsRefused(t *testing.T) {
 	if err := aGuestReport().Validate(); err != nil {
 		t.Fatalf("a report at every bound was refused: %v", err)
 	}
+	// THE REFUSAL NAMES WHERE, NEVER WHAT: the guest wrote the version.
+	g := aGuestReport()
+	g.AgentVersion = "s3cret-token\t"
+	if err := g.Validate(); err == nil || strings.Contains(err.Error(), "s3cret") ||
+		!strings.Contains(err.Error(), "at byte 12") {
+		t.Fatalf("Validate = %v, want a refusal naming byte 12 and not the version", err)
+	}
 	// AN AGENT THAT NEVER SPOKE is a report too: the node says so.
 	if err := (GuestReport{Codec: GuestReportCodec}).Validate(); err != nil {
 		t.Fatalf("a report of nothing was refused: %v", err)
 	}
 	// ONE INSTANT IS ORDERED: a single batch arrives first and last at once.
-	g := aGuestReport()
+	g = aGuestReport()
 	g.LastReceived = g.FirstReceived
 	if err := g.Validate(); err != nil {
 		t.Fatalf("a report whose one batch arrived once was refused: %v", err)

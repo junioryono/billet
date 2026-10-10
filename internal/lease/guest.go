@@ -76,14 +76,16 @@ func (g GuestReport) Validate() error {
 			len(g.Data), MaxGuestReportBytes)
 	}
 	// NO SPACE AND NO CONTROL CHARACTER, because a reader prints it on one line
-	// beside fields the guest does not control.
+	// beside fields the guest does not control. The refusal names where, never
+	// what: the guest wrote it, and a refusal travels back to the node and into
+	// its log.
 	if len(g.AgentVersion) > MaxGuestAgentVersion {
 		return fmt.Errorf("alloc: a guest agent version of %d bytes is over the %d byte bound",
 			len(g.AgentVersion), MaxGuestAgentVersion)
 	}
 	for i := range len(g.AgentVersion) {
 		if c := g.AgentVersion[i]; c <= ' ' || c > '~' {
-			return fmt.Errorf("alloc: the guest agent version %q is not printable ASCII", g.AgentVersion)
+			return fmt.Errorf("alloc: the guest agent version is not printable ASCII at byte %d", i)
 		}
 	}
 	if g.Schema < 0 || g.Schema > MaxGuestSchema {
