@@ -91,6 +91,14 @@ type UsageRequest struct {
 	Series *lease.UsageSeries `json:"series,omitempty"`
 }
 
+// GuestReportRequest carries what the agent inside a lease's guest told the
+// node, once, before the compute is destroyed (VersionGuestReport). The report
+// is the guest's own unverified view; Data is opaque to the control plane.
+type GuestReportRequest struct {
+	Epoch  int64             `json:"epoch"`
+	Report lease.GuestReport `json:"report"`
+}
+
 // ReleaseRequest ends a lease with a terminal outcome.
 type ReleaseRequest struct {
 	Epoch   int64  `json:"epoch"`

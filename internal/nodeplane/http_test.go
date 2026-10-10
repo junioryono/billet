@@ -267,6 +267,8 @@ type fakeStore struct {
 	usages  []reportedUsage
 	pool    map[string]alloc.PoolRunner
 	retired []string
+	// guests are the guest reports recorded, with the epoch each arrived under.
+	guests []reportedGuest
 }
 
 type cachePolicyFunc func(ctx context.Context, kind, owner, repository string) (bool, error)
@@ -345,6 +347,24 @@ func (f *fakeStore) RecordLeaseUsage(
 	defer f.mu.Unlock()
 
 	f.usages = append(f.usages, reportedUsage{lease: leaseID, epoch: epoch, usage: usage, series: series})
+
+	return nil
+}
+
+// reportedGuest is one guest report the fake was asked to record.
+type reportedGuest struct {
+	lease  string
+	epoch  int64
+	report alloc.GuestReport
+}
+
+func (f *fakeStore) RecordGuestReport(
+	_ context.Context, leaseID string, epoch int64, report alloc.GuestReport,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.guests = append(f.guests, reportedGuest{lease: leaseID, epoch: epoch, report: report})
 
 	return nil
 }

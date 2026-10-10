@@ -1,0 +1,25 @@
+{
+  "version": 0,
+  "min_version": 0,
+  "release": "",
+  "node": "",
+  "provider": "",
+  "guest_os": [
+    ""
+  ],
+  "vcpu": 0,
+  "memory": 0,
+  "ec2_shapes": [
+    {
+      "type": "",
+      "vcpu": 0,
+      "memory": 0,
+      "price_usd_per_hour": 0
+    }
+  ],
+  "instances": [
+    ""
+  ],
+  "deployment": "",
+  "incarnation": ""
+}
