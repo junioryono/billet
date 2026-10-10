@@ -1,0 +1,62 @@
+name: Guest probe
+
+# A ONE-OFF MEASUREMENT for the in-VM agent's design, run only by a push to its
+# own branch and never merged: what the runner's step lines look like in its
+# diagnostic logs, what a /proc walk costs under load, the guest clock against
+# the host's, and which guest-facing variables a job can see (names only).
+
+on:
+  push:
+    branches: [junior-oct10-guest-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - name: Mark one
+        run: date -u +%s.%N
+      - name: Runner diagnostics
+        run: |
+          set -u
+          date -u +%s.%N
+          root=$(dirname "$(dirname "$(readlink -f "$(command -v Runner.Listener 2>/dev/null || echo /home/runner/runner/bin/Runner.Listener)")")")
+          echo "runner root guess: $root"
+          ls -la /home/runner/runner/_diag 2>&1 | head -20
+          cat /home/runner/runner/.runner 2>/dev/null | head -5 || true
+          ls /home/runner/runner/bin 2>/dev/null | grep -i -E "Runner\.(Listener|Worker)" | head
+          for f in /home/runner/runner/_diag/Worker_*.log; do
+            echo "== $f"
+            grep -n -E "Processing step|Starting step|Finishing step|StepsRunner|step:|Step " "$f" | head -40 | cut -c1-240
+          done
+      - name: Mark two
+        run: date -u +%s.%N
+      - name: Guest variables (names only)
+        run: |
+          env | cut -d= -f1 | grep -E "^(BILLET|ACTIONS_RUNNER_HOOK|RUNNER_)" | sort
+          echo "cache endpoint set: ${BILLET_CACHE_ENDPOINT:+yes}"
+          echo "cache token set: ${BILLET_CACHE_TOKEN:+yes}"
+          uname -r; nproc; grep -E "MemTotal|MemAvailable|^Cached" /proc/meminfo
+          ls /proc | grep -c "^[0-9]"
+      - name: proc walk cost under load
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng > /dev/null 2>&1 || true
+          stress-ng --cpu 8 --timeout 30s > /dev/null 2>&1 &
+          sleep 2
+          echo "processes: $(ls -d /proc/[0-9]* | wc -l)"
+          for i in 1 2 3 4 5; do
+            s=$(date +%s%N)
+            for p in /proc/[0-9]*; do cat "$p/stat" "$p/status" > /dev/null 2>&1; sudo cat "$p/io" > /dev/null 2>&1; done
+            e=$(date +%s%N)
+            echo "walk $i: $(( (e - s) / 1000000 )) ms"
+          done
+          s=$(date +%s%N)
+          for p in /proc/[0-9]*; do cat "$p/stat" "$p/status" > /dev/null 2>&1; done
+          e=$(date +%s%N)
+          echo "walk without io (no sudo): $(( (e - s) / 1000000 )) ms"
+          wait
+      - name: Mark three
+        run: date -u +%s.%N
