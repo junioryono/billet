@@ -25,22 +25,18 @@ const (
 const FlushWait = 2 * time.Second
 
 // listenFlush listens at path, mode 0666 so the runner's user can ask, in a
-// directory that is this process's, mode 0755 at most: a directory another user
-// could write to is one they could put a socket of their own in.
+// directory that is this process's and mode 0755: one another user could write to
+// is one they could put a socket of their own in, and one they cannot search is
+// one whose socket they cannot reach. The directory is judged and set through the
+// descriptor that names it, never by its name again, and a link there is refused.
 func listenFlush(path string) (*net.UnixListener, error) {
 	dir := filepath.Dir(path)
 	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, fmt.Errorf("create its directory: %w", err)
 	}
 
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return nil, fmt.Errorf("examine its directory: %w", err)
-	}
-
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || !ok || int(st.Uid) != os.Geteuid() || info.Mode().Perm()&0o022 != 0 {
-		return nil, fmt.Errorf("%s is not a directory of this user's that only it can write to", dir)
+	if err := settleSocketDir(dir); err != nil {
+		return nil, err
 	}
 
 	// A socket an earlier agent left; anything else there is not this agent's.
@@ -66,6 +62,34 @@ func listenFlush(path string) (*net.UnixListener, error) {
 	}
 
 	return l, nil
+}
+
+// settleSocketDir holds dir to being this user's directory, writable by it alone,
+// and makes it searchable by everyone, whatever the umask made of it.
+func settleSocketDir(dir string) error {
+	d, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("open its directory: %w", err)
+	}
+	defer d.Close()
+
+	info, err := d.Stat()
+	if err != nil {
+		return fmt.Errorf("examine its directory: %w", err)
+	}
+
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !info.IsDir() || !ok || int(st.Uid) != os.Geteuid() || info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is not a directory of this user's that only it can write to", dir)
+	}
+
+	if info.Mode().Perm() != 0o755 {
+		if err := d.Chmod(0o755); err != nil {
+			return fmt.Errorf("open its directory to the runner's user: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // serveFlush answers connections until l is closed. Each asks for the final flush

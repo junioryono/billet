@@ -122,14 +122,15 @@ func (n *node) hello(ctx context.Context) (limits, verdict) {
 		return limits{}, unknown
 	}
 
+	// The limits are the body, so a body not read is could-not-tell.
 	status, body, _, err := n.do(req)
-	if err != nil {
+	if err != nil || body.err != nil {
 		return limits{}, unknown
 	}
 
 	switch status {
 	case http.StatusOK:
-		return readLimits(body)
+		return readLimits(body.data)
 	case http.StatusNotFound, http.StatusUnauthorized:
 		return limits{}, stop
 	default:
@@ -174,6 +175,8 @@ func (n *node) report(ctx context.Context, body []byte, final bool) (verdict, ti
 
 	req.Header.Set("Content-Type", batchContentType)
 
+	// A report's answer is its status and headers: a body cut short does not
+	// turn a 413 or a 429 into an answer nobody can tell.
 	status, _, header, err := n.do(req)
 	if err != nil {
 		return unknown, 0
@@ -204,20 +207,25 @@ func retryAfter(v string) time.Duration {
 	return min(time.Duration(min(seconds, int64(maxRetryAfter/time.Second)))*time.Second, maxRetryAfter)
 }
 
-// do sends req with the bearer and reads at most answerLimit bytes of the answer.
-func (n *node) do(req *http.Request) (int, []byte, http.Header, error) {
+// answerBody is at most answerLimit bytes of an answer's body, and why the rest
+// was not read.
+type answerBody struct {
+	data []byte
+	err  error
+}
+
+// do sends req with the bearer and answers the node's status and headers, and its
+// body read as far as answerLimit; an error is no answer at all.
+func (n *node) do(req *http.Request) (int, answerBody, http.Header, error) {
 	req.Header.Set("Authorization", "Bearer "+n.token)
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("the node did not answer: %w", err)
+		return 0, answerBody{}, nil, fmt.Errorf("the node did not answer: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, answerLimit))
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("the node's answer was not read: %w", err)
-	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, answerLimit))
 
-	return resp.StatusCode, body, resp.Header, nil
+	return resp.StatusCode, answerBody{data: data, err: err}, resp.Header, nil
 }

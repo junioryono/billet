@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -31,6 +33,41 @@ var errCouldNotTell = errors.New("could not tell")
 
 // errGone is a process that exited while the agent read it.
 var errGone = errors.New("the process exited")
+
+// ProcFS is the /proc tree at root, read without waiting on anything the job put
+// there: every name is opened non-blocking, so a FIFO answers at once rather than
+// waiting for a writer, and only a regular file or a directory is handed back.
+func ProcFS(root string) fs.FS { return procDir(root) }
+
+type procDir string
+
+func (d procDir) Open(name string) (fs.File, error) {
+	if !fs.ValidPath(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrInvalid}
+	}
+
+	f, err := os.OpenFile(filepath.Join(string(d), name), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	info, err := f.Stat()
+	if err == nil && !info.Mode().IsRegular() && !info.IsDir() {
+		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegular}
+	}
+
+	if err != nil {
+		_ = f.Close()
+
+		return nil, err
+	}
+
+	return f, nil
+}
+
+// errNotRegular is something at a /proc name that is neither a file nor a
+// directory.
+var errNotRegular = errors.New("neither a regular file nor a directory")
 
 // readProc is one /proc file, at most limit bytes. A file longer than that is
 // could-not-tell, never cut.
@@ -274,9 +311,7 @@ func residentBytes(status []byte, st pidStat) (int64, error) {
 // ioBytes is /proc/<pid>/io's read_bytes and write_bytes: what the process caused
 // to be read from and written to storage, not what it passed through read(2).
 func ioBytes(data []byte) (int64, int64, error) {
-	var read, written int64
-
-	found := 0
+	values := map[string]int64{}
 
 	for line := range strings.Lines(string(data)) {
 		key, rest, ok := strings.Cut(line, ":")
@@ -284,21 +319,22 @@ func ioBytes(data []byte) (int64, int64, error) {
 			continue
 		}
 
+		if _, twice := values[key]; twice {
+			return 0, 0, fmt.Errorf("%w: a process's io names %s twice", errCouldNotTell, key)
+		}
+
 		v, err := counter(strings.TrimSpace(rest))
 		if err != nil {
 			return 0, 0, err
 		}
 
-		if key == "read_bytes" {
-			read = v
-		} else {
-			written = v
-		}
-
-		found++
+		values[key] = v
 	}
 
-	if found != 2 {
+	read, okRead := values["read_bytes"]
+	written, okWritten := values["write_bytes"]
+
+	if !okRead || !okWritten {
 		return 0, 0, fmt.Errorf("%w: a process's io lacks read_bytes or write_bytes", errCouldNotTell)
 	}
 

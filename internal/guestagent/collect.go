@@ -38,7 +38,8 @@ type procCounters struct {
 // what it read until the sender cuts a batch. What it holds is bounded by one
 // batch: a reading that would pass a batch's bound is not taken, and the next one
 // taken covers the time since the last, because every figure but a level is a
-// counter.
+// counter. The last place of each kind is the final reading's alone, so a job that
+// ends while the node is not taking batches still has its end read.
 type collector struct {
 	proc fs.FS
 
@@ -53,9 +54,21 @@ type collector struct {
 	baseBusy int64
 	haveBase bool
 
-	agentCPU int64
+	// agentCPU is the agent's own CPU, once haveAgentCPU says it was read.
+	agentCPU     int64
+	haveAgentCPU bool
 
 	log *limitedLog
+}
+
+// room is how many readings of a kind the collector holds: one fewer than a batch
+// takes, unless this is the final reading.
+func room(bound int, final bool) int {
+	if final {
+		return bound
+	}
+
+	return bound - 1
 }
 
 func newCollector(proc fs.FS, log *limitedLog) *collector {
@@ -63,11 +76,11 @@ func newCollector(proc fs.FS, log *limitedLog) *collector {
 }
 
 // sample reads the guest's totals at now and keeps them, unless the pending
-// samples are at a batch's bound or the reading goes back on the one kept before
-// it (a clock stepped back, a counter the kernel moved back), which the node would
-// refuse in a merge.
-func (c *collector) sample(now time.Time) {
-	if len(c.samples) >= guestreport.MaxBatchSamples {
+// samples have no room or the reading goes back on the one kept before it (a clock
+// stepped back, a counter the kernel moved back), which the node would refuse in a
+// merge.
+func (c *collector) sample(now time.Time, final bool) {
+	if len(c.samples) >= room(guestreport.MaxBatchSamples, final) {
 		return
 	}
 
@@ -147,8 +160,8 @@ func (c *collector) readSample(now time.Time) (guestreport.Sample, error) {
 // not read every live process, or that the pending process samples have no room
 // for, keeps nothing and leaves the base where it was, so the next kept walk
 // covers the time since it.
-func (c *collector) walkProcesses(now time.Time) {
-	if len(c.processes) >= guestreport.MaxBatchProcessSamples {
+func (c *collector) walkProcesses(now time.Time, final bool) {
+	if len(c.processes) >= room(guestreport.MaxBatchProcessSamples, final) {
 		return
 	}
 
@@ -338,14 +351,15 @@ func (c *collector) pids() ([]int, error) {
 
 // readAgentCPU is the CPU the agent has used since it started, from its own stat.
 // The figure only rises; a failed read keeps the last one read, which is still a
-// true figure for the time it was read.
+// true figure for the time it was read, and before any was read the figure is
+// unknown, which haveAgentCPU says.
 func (c *collector) readAgentCPU() {
 	data, err := readProc(c.proc, "self/stat", processFileLimit)
 	if err == nil {
 		var st pidStat
 
 		if st, err = parsePIDStat(data); err == nil {
-			c.agentCPU = max(c.agentCPU, st.cpu)
+			c.agentCPU, c.haveAgentCPU = max(c.agentCPU, st.cpu), true
 
 			return
 		}

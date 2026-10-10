@@ -9,6 +9,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/guestreport"
@@ -56,7 +57,7 @@ func collectJUnit(roots []string, now func() time.Time, log *limitedLog) []guest
 			break
 		}
 
-		r, err := os.OpenRoot(root)
+		r, err := openRoot(root)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -74,6 +75,20 @@ func collectJUnit(roots []string, now func() time.Time, log *limitedLog) []guest
 	return w.suites
 }
 
+// openRoot is os.OpenRoot of a directory. os.OpenRoot opens the root itself
+// without O_DIRECTORY, so a FIFO the job put at the name would hold it: the
+// directory is proved first, without waiting.
+func openRoot(dir string) (*os.Root, error) {
+	d, err := openDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	_ = d.Close()
+
+	return os.OpenRoot(dir)
+}
+
 // spent reports whether the search has used one of its bounds, and stops it if so.
 func (w *junitWalk) spent() bool {
 	if !w.stopped && (w.files >= junitMaxFiles || w.entries >= junitMaxEntries || !w.now().Before(w.deadline)) {
@@ -85,7 +100,7 @@ func (w *junitWalk) spent() bool {
 
 // walk reads the directory dir of r, at depth below the root.
 func (w *junitWalk) walk(r *os.Root, dir string, depth int) {
-	d, err := r.Open(dir)
+	d, err := r.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return
 	}
@@ -140,7 +155,7 @@ func (w *junitWalk) read(dir *os.File, name string) {
 	}
 
 	for _, s := range suites {
-		w.keep(s)
+		w.suites = keep(w.suites, s)
 	}
 }
 
@@ -150,8 +165,10 @@ type parsedCase struct {
 	failed, errored, skipped bool
 }
 
-// parse reads one file's suites with a streaming decoder. A testcase belongs to
-// the innermost suite around it; a suite with no testcase of its own is not kept.
+// parse reads one file's suites with a streaming decoder, keeping a batch's worth
+// of them as it goes, so a file of many small suites costs no more to hold than a
+// file of a few. A testcase belongs to the innermost suite around it; a suite with
+// no testcase of its own is not kept.
 func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, bool) {
 	dec := xml.NewDecoder(r)
 
@@ -222,7 +239,7 @@ func (w *junitWalk) parse(r io.Reader, file string) ([]guestreport.SuiteResult, 
 				open = open[:len(open)-1]
 
 				if done.Tests > 0 {
-					out = append(out, done)
+					out = keep(out, done)
 				}
 			}
 		}
@@ -247,10 +264,11 @@ func countCase(s *guestreport.SuiteResult, c *parsedCase) {
 	}
 }
 
-// keep adds s to the suites kept, holding only the batch's worth that rank first.
-func (w *junitWalk) keep(s guestreport.SuiteResult) {
-	w.suites = append(w.suites, s)
-	slices.SortStableFunc(w.suites, func(a, b guestreport.SuiteResult) int {
+// keep adds s to suites, holding only the batch's worth that rank first: the
+// failing ones, then the ones with the most tests.
+func keep(suites []guestreport.SuiteResult, s guestreport.SuiteResult) []guestreport.SuiteResult {
+	suites = append(suites, s)
+	slices.SortStableFunc(suites, func(a, b guestreport.SuiteResult) int {
 		return cmp.Or(
 			cmp.Compare(b.Failures+b.Errors, a.Failures+a.Errors),
 			cmp.Compare(b.Tests, a.Tests),
@@ -258,9 +276,11 @@ func (w *junitWalk) keep(s guestreport.SuiteResult) {
 		)
 	})
 
-	if len(w.suites) > guestreport.MaxBatchSuites {
-		w.suites = slices.Clip(w.suites[:guestreport.MaxBatchSuites])
+	if len(suites) > guestreport.MaxBatchSuites {
+		suites = slices.Clip(suites[:guestreport.MaxBatchSuites])
 	}
+
+	return suites
 }
 
 // suiteName is a suite's name as a report carries it, the file's when the suite

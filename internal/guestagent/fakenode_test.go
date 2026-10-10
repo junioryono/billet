@@ -15,13 +15,15 @@ import (
 
 const testToken = "guest-bearer-0123456789abcdef"
 
-// reply is one scripted answer of the fake node. drop answers nothing at all.
+// reply is one scripted answer of the fake node. drop answers nothing at all, and
+// hold answers nothing until the request's context ends, never serving it.
 type reply struct {
 	status     int
 	retryAfter string
 	location   string
 	body       string
 	drop       bool
+	hold       bool
 }
 
 // post is a batch the fake node received.
@@ -48,11 +50,15 @@ type fakeNode struct {
 	intervalMS  int64
 	maxBody     int64
 
-	hellos   []time.Time
-	posts    []post
-	tokens   float64
-	refilled time.Time
-	spent    int
+	hellos []time.Time
+	posts  []post
+	// held counts the posts held and never served, and heldEnded is when each
+	// one's context ended.
+	held      int
+	heldEnded []time.Time
+	tokens    float64
+	refilled  time.Time
+	spent     int
 }
 
 func newFakeNode(t *testing.T) *fakeNode {
@@ -70,7 +76,7 @@ func (f *fakeNode) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	f.mu.Lock()
-	drop := false
+	drop, hold := false, false
 
 	switch req.URL.Path {
 	case limitsPath:
@@ -78,12 +84,26 @@ func (f *fakeNode) RoundTrip(req *http.Request) (*http.Response, error) {
 			drop = f.helloScript[n].drop
 		}
 	case reportsPath:
-		if n := len(f.posts); n < len(f.postScript) {
-			drop = f.postScript[n].drop
+		if n := len(f.posts) + f.held; n < len(f.postScript) {
+			drop, hold = f.postScript[n].drop, f.postScript[n].hold
 		}
 	}
 
+	if hold {
+		f.held++
+	}
+
 	f.mu.Unlock()
+
+	if hold {
+		<-req.Context().Done()
+
+		f.mu.Lock()
+		f.heldEnded = append(f.heldEnded, time.Now())
+		f.mu.Unlock()
+
+		return nil, req.Context().Err()
+	}
 
 	if drop {
 		f.record(req)
@@ -198,7 +218,7 @@ func (f *fakeNode) report(w http.ResponseWriter, req *http.Request) {
 	}
 
 	p := post{at: time.Now(), final: final, body: body, batch: batch}
-	n := len(f.posts)
+	n := len(f.posts) + f.held
 
 	switch {
 	case n < len(f.postScript):

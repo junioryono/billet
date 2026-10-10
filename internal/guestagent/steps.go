@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/guestreport"
@@ -226,7 +227,7 @@ func parseStepLine(line string) (guestreport.StepMark, bool) {
 // is none yet. The runner names each by its UTC start, so the greatest name is the
 // newest.
 func newestWorkerLog(dir string) (string, error) {
-	d, err := os.Open(dir)
+	d, err := openDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
@@ -261,6 +262,12 @@ func newestWorkerLog(dir string) (string, error) {
 			return "", fmt.Errorf("more than %d entries", diagEntriesLimit)
 		}
 	}
+}
+
+// openDir opens dir for listing only if it is a directory, and without waiting:
+// a FIFO the job put at its name answers at once.
+func openDir(dir string) (*os.File, error) {
+	return os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
 }
 
 // withoutPath is err without the path an *os.PathError names: a name in a

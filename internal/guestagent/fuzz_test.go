@@ -104,11 +104,11 @@ func FuzzJUnitParse(f *testing.F) {
 			return
 		}
 
-		for _, s := range suites {
-			w.keep(s)
+		if len(suites) > guestreport.MaxBatchSuites {
+			t.Fatalf("a parse kept %d suites, past a batch's %d", len(suites), guestreport.MaxBatchSuites)
 		}
 
-		b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Tests: w.suites}
+		b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Tests: suites}
 		if _, err := guestreport.EncodeBatch(b); err != nil {
 			t.Fatalf("the suites of %q do not encode: %v", data, err)
 		}

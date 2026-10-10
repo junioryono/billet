@@ -382,9 +382,9 @@ func TestAnAnswerNobodyCanTellResendsTheSameBatch(t *testing.T) {
 		}
 
 		// Batch 2 carries the minute the agent held while batch 1 went unanswered,
-		// up to a batch's bound.
-		if n := len(posts[7].batch.Samples); n != guestreport.MaxBatchSamples {
-			t.Errorf("batch 2 carries %d samples, want the %d the collector held", n, guestreport.MaxBatchSamples)
+		// up to a batch's bound less the place kept for the final reading.
+		if n := len(posts[7].batch.Samples); n != guestreport.MaxBatchSamples-1 {
+			t.Errorf("batch 2 carries %d samples, want the %d the collector held", n, guestreport.MaxBatchSamples-1)
 		}
 	})
 }

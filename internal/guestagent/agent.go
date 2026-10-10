@@ -29,9 +29,15 @@ import (
 // The final flush: from the request for it (SIGTERM or a connection to the
 // socket) until the agent is done with it, inside the contract's 3 s; and how long
 // a connection waits for the final batch's answer before it is answered anyway.
+//
+// exitBudget bounds the agent's return after SIGTERM whatever it is doing, a read
+// that never returns included, and settleWait is how long the final flush waits
+// for the answer to a request it cancelled.
 const (
 	finalBudget     = 2750 * time.Millisecond
 	flushAnswerWait = 2 * time.Second
+	exitBudget      = 2900 * time.Millisecond
+	settleWait      = 250 * time.Millisecond
 )
 
 // Config is what one agent reads and where it reports.
@@ -79,16 +85,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 
-	a := &agent{
-		node:       n,
-		col:        newCollector(cfg.Proc, log),
-		steps:      newTailer(cfg.DiagDir, log),
-		junitRoots: cfg.JUnitRoots,
-		version:    textOrMark(guestreport.Clean(cfg.Version, guestreport.MaxNameBytes)),
-		log:        log,
-		results:    make(chan result, 1),
-		flushed:    make(chan struct{}),
-	}
+	a := newAgent(n, cfg, log)
 
 	if cfg.Socket != "" {
 		l, err := listenFlush(cfg.Socket)
@@ -112,11 +109,46 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	a.run(ctx)
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		a.run(ctx)
+	}()
+
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		// SIGTERM is answered within the contract's 3 s even when a read the job
+		// made never return holds the loop; the process ends with the command.
+		wait := time.NewTimer(exitBudget)
+		select {
+		case <-finished:
+		case <-wait.C:
+			log.always("the final flush did not finish in time; exiting without it")
+		}
+
+		wait.Stop()
+	}
+
 	// An agent that stopped without a final flush answers whoever is waiting.
 	a.flushDone()
 
 	return nil
+}
+
+func newAgent(n *node, cfg Config, log *limitedLog) *agent {
+	return &agent{
+		node:       n,
+		col:        newCollector(cfg.Proc, log),
+		steps:      newTailer(cfg.DiagDir, log),
+		junitRoots: cfg.JUnitRoots,
+		version:    textOrMark(guestreport.Clean(cfg.Version, guestreport.MaxNameBytes)),
+		log:        log,
+		results:    make(chan result, 1),
+		flushed:    make(chan struct{}),
+	}
 }
 
 // agent is one run's state. Only run's goroutine touches it; a request to the
@@ -137,7 +169,10 @@ type agent struct {
 	// what has not been cut waits, bounded, in the collector.
 	head     *outgoing
 	inflight bool
-	results  chan result
+	// cancelInflight cancels the request in flight, which the final flush does
+	// so that nothing it started is sent after the final batch.
+	cancelInflight context.CancelFunc
+	results        chan result
 
 	started  time.Time
 	lastSend time.Time
@@ -159,7 +194,7 @@ type outgoing struct {
 	body []byte
 }
 
-// result is an answer from the node: to a hello, or to the batch numbered seq.
+// result is an answer from the node: to a hello, or to the batch in flight.
 type result struct {
 	hello   bool
 	limits  limits
@@ -170,8 +205,9 @@ type result struct {
 // run is the agent's loop. It returns when the agent has stopped.
 func (a *agent) run(ctx context.Context) {
 	a.started = time.Now()
-	a.col.sample(a.started)
-	a.col.walkProcesses(a.started)
+	a.col.sample(a.started, false)
+	a.col.walkProcesses(a.started, false)
+	a.col.readAgentCPU()
 	a.steps.poll()
 
 	samples := time.NewTicker(guestreport.SampleInterval)
@@ -198,12 +234,12 @@ func (a *agent) run(ctx context.Context) {
 
 			return
 		case now := <-samples.C:
-			a.col.sample(now)
+			a.col.sample(now, false)
 			a.steps.poll()
 		case now := <-walks.C:
-			a.col.walkProcesses(now)
-		case now := <-next.C:
-			if at, again := a.contact(ctx, now); again {
+			a.col.walkProcesses(now, false)
+		case <-next.C:
+			if at, again := a.contact(ctx); again {
 				next.Reset(time.Until(at))
 			}
 		case r := <-a.results:
@@ -219,17 +255,20 @@ func (a *agent) run(ctx context.Context) {
 
 // contact sends the node what is due: a hello until one is answered, then the
 // unsent batch, or a new one. Its answer sets when to contact the node next; when
-// nothing was sent, contact says when instead.
-func (a *agent) contact(ctx context.Context, now time.Time) (time.Time, bool) {
+// nothing was sent, contact says when instead. The interval is counted from when a
+// batch is really sent, not from when it fell due, so a loop held up past a due
+// time never sends two batches closer than the interval.
+func (a *agent) contact(ctx context.Context) (time.Time, bool) {
 	if a.inflight {
 		return time.Time{}, false
 	}
 
+	rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+
 	if a.lim == nil {
-		a.inflight = true
+		a.inflight, a.cancelInflight = true, cancel
 
 		go func() {
-			rctx, cancel := context.WithTimeout(ctx, requestTimeout)
 			defer cancel()
 
 			lim, v := a.node.hello(rctx)
@@ -242,20 +281,21 @@ func (a *agent) contact(ctx context.Context, now time.Time) (time.Time, bool) {
 	if a.head == nil {
 		b, ok := a.cut(nil)
 		if !ok {
-			a.lastSend = now
+			cancel()
 
-			return now.Add(a.period()), true
+			a.lastSend = time.Now()
+
+			return a.lastSend.Add(a.period()), true
 		}
 
 		a.head = &b
 	}
 
-	a.inflight = true
-	a.lastSend = now
+	a.inflight, a.cancelInflight = true, cancel
+	a.lastSend = time.Now()
 	body := a.head.body
 
 	go func() {
-		rctx, cancel := context.WithTimeout(ctx, requestTimeout)
 		defer cancel()
 
 		v, wait := a.node.report(rctx, body, false)
@@ -268,7 +308,7 @@ func (a *agent) contact(ctx context.Context, now time.Time) (time.Time, bool) {
 // answer acts on the node's answer and says when to contact it next, or false when
 // the agent stops.
 func (a *agent) answer(r result, now time.Time) (time.Time, bool) {
-	a.inflight = false
+	a.inflight, a.cancelInflight = false, nil
 
 	if r.hello {
 		switch r.verdict {
@@ -318,10 +358,19 @@ func (a *agent) period() time.Duration {
 
 // cut is a new batch of everything the agent holds, with tests when it is the
 // final one, numbered next and encoded to fit what the node takes. A batch that
-// cannot be encoded is dropped and its number spent, so the node sees the gap.
+// cannot be encoded is dropped and its number spent, so the node sees the gap. No
+// batch is cut while the agent's own CPU has never been read, because a batch must
+// carry it and a zero would be a claim: what is held waits for the next try.
 func (a *agent) cut(tests []guestreport.SuiteResult) (outgoing, bool) {
-	a.seq++
 	a.col.readAgentCPU()
+
+	if !a.col.haveAgentCPU {
+		a.log.printf("self-unknown", "the agent's own CPU has never been read, so no batch is sent yet")
+
+		return outgoing{}, false
+	}
+
+	a.seq++
 
 	samples, processes := a.col.take()
 	b := guestreport.Batch{
@@ -346,8 +395,10 @@ func (a *agent) cut(tests []guestreport.SuiteResult) (outgoing, bool) {
 }
 
 // final takes a last reading, searches for test results, and sends the final
-// batch, once, whatever asked for it. A batch still unsent is left: the final one
-// carries what came after it, and the node sees its number missing.
+// batch, once, whatever asked for it. A request still in flight is cancelled first
+// and its answer awaited a little, so nothing the agent started is sent after the
+// final batch and a stop it brings is honoured. A batch still unsent is left: the
+// final one carries what came after it, and the node sees its number missing.
 func (a *agent) final(ctx context.Context) {
 	defer a.flushDone()
 
@@ -356,8 +407,12 @@ func (a *agent) final(ctx context.Context) {
 	fctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), start.Add(finalBudget))
 	defer cancel()
 
-	a.col.sample(start)
-	a.col.walkProcesses(start)
+	if !a.settle() {
+		return
+	}
+
+	a.col.sample(start, true)
+	a.col.walkProcesses(start, true)
 	a.steps.poll()
 
 	tests := collectJUnit(a.junitRoots, time.Now, a.log)
@@ -380,6 +435,28 @@ func (a *agent) final(ctx context.Context) {
 
 	if v, _ := a.node.report(fctx, b.body, true); v != accepted {
 		a.log.always("the node did not accept the final batch")
+	}
+}
+
+// settle cancels the request in flight, if there is one, and acts on its answer
+// if it comes within settleWait. It reports false when that answer is a stop.
+func (a *agent) settle() bool {
+	if !a.inflight {
+		return true
+	}
+
+	a.cancelInflight()
+
+	wait := time.NewTimer(settleWait)
+	defer wait.Stop()
+
+	select {
+	case r := <-a.results:
+		_, ok := a.answer(r, time.Now())
+
+		return ok
+	case <-wait.C:
+		return true
 	}
 }
 
