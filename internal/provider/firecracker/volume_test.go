@@ -58,6 +58,48 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 	}
 }
 
+// THE GUEST IS TOLD TO START ITS MONITOR BY ONE OPTIONAL STRING LEAF, present only
+// when the node asks for it. Optional, so the guest contract does not move: an agent
+// that predates the key reads none and starts nothing.
+func TestTheGuestIsToldToStartItsMonitorOnlyWhenAsked(t *testing.T) {
+	t.Parallel()
+
+	const key = "/latest/meta-data/billet/guest-monitor"
+
+	for _, asked := range []bool{true, false} {
+		h := newHarness(t)
+		var vmm *fakeVMM
+		h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+
+		spec := aSpec()
+		spec.CacheEndpoint = "http://172.20.0.1:7718"
+		spec.CacheToken = strings.Repeat("c", 64)
+		spec.BuildKitCacheMountLimit = 4 << 30
+		spec.GuestMonitor = asked
+
+		if _, err := h.p.Launch(t.Context(), spec); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+
+		body, ok := vmm.bodyPut("/mmds")
+		if !ok {
+			t.Fatal("metadata was not configured")
+		}
+
+		value, present := metadataLeaves(t, "", body)[key]
+		switch {
+		case asked && (!present || value != "1"):
+			t.Errorf("a guest asked to monitor has %s = %q (present %t), want \"1\"", key, value, present)
+		case !asked && present:
+			t.Errorf("a guest not asked to monitor carries %s = %q", key, value)
+		}
+	}
+
+	if GuestContract != "10" {
+		t.Errorf("the guest contract is %q; an optional key is not a contract change", GuestContract)
+	}
+}
+
 func TestAReservedDriveCanBeReplacedAndDetachedAfterBoot(t *testing.T) {
 	t.Parallel()
 

@@ -796,6 +796,10 @@ func checkSpec(spec provider.Spec) error {
 	if len(spec.GuestCaches) > 0 && spec.CacheEndpoint == "" {
 		return fmt.Errorf("firecracker: %s has guest build caches but no cache session", spec.Name)
 	}
+	if spec.GuestMonitor && spec.CacheEndpoint == "" {
+		return fmt.Errorf("firecracker: %s asks for the guest's monitor but has no cache session "+
+			"for it to report to", spec.Name)
+	}
 	for i, cache := range spec.GuestCaches {
 		if !cache.Valid() || slices.Contains(spec.GuestCaches[:i], cache) {
 			return fmt.Errorf("firecracker: %s names guest build cache %q, which is unknown or "+
@@ -987,6 +991,11 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 			names[i] = string(cache)
 		}
 		billet["guest-caches"] = strings.Join(names, ",")
+	}
+	// AN OPTIONAL KEY, so not a contract change: an agent that predates it reads
+	// no such key and starts no monitor.
+	if spec.GuestMonitor {
+		billet["guest-monitor"] = "1"
 	}
 	if spec.ActionsProxy != "" {
 		billet["actions-proxy"] = spec.ActionsProxy

@@ -32,6 +32,17 @@ type UsageRecorder interface {
 // slow control plane costs a measurement, never a teardown.
 const usageReportLimit = 2 * time.Second
 
+// GuestRecorder is where what a job's guest told the node is reported: the
+// allocator in process, the node client over the wire. It is the guest's own,
+// unverified view, kept beside the host's measurement and never in it.
+type GuestRecorder interface {
+	RecordGuestReport(ctx context.Context, leaseID string, epoch int64, report alloc.GuestReport) error
+}
+
+// The runner finds its recorder by asserting its lease store, so this fails the
+// build if the in-process one stops being one.
+var _ GuestRecorder = (*alloc.Allocator)(nil)
+
 // WithMonitor measures every job this runner launches, on a backend that can
 // say where its counters are (provider.UsageSource).
 func WithMonitor(m JobMonitor) Option {
@@ -260,6 +271,34 @@ func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name strin
 
 	if err := rec.RecordLeaseUsage(ctx, lease.ID, lease.Epoch, report, series); err != nil {
 		r.log.Warn("could not report what a job did to the host; the job is unaffected",
+			"runner", name, "lease", lease.ID, "error", err)
+	}
+}
+
+// reportGuest sends what a job's guest told the node to the ledger, fenced on the
+// lease's epoch, while the lease is still held. The lease is the runner's own for
+// the instance, and the report is the one the instance's session kept, found by
+// the bearer the guest sent; nothing the guest wrote names either.
+//
+// BOUNDED AND NEVER FATAL, as the usage report is: a control plane that cannot
+// take it costs the guest's view, never the teardown. One whose wire predates
+// guest reports takes none, and the client drops it as sent.
+func (r *Runner) reportGuest(ctx context.Context, lease *alloc.Lease, name string) {
+	rec, ok := r.alloc.(GuestRecorder)
+	if !ok || r.cache == nil || lease == nil {
+		return
+	}
+
+	report, ok := r.cache.TakeGuestReport(name)
+	if !ok {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), guestReportLimit)
+	defer cancel()
+
+	if err := rec.RecordGuestReport(ctx, lease.ID, lease.Epoch, report); err != nil {
+		r.log.Warn("could not report what a job's guest said; the job is unaffected",
 			"runner", name, "lease", lease.ID, "error", err)
 	}
 }

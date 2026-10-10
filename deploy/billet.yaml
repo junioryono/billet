@@ -118,6 +118,7 @@ github:
 #   #   rapl: true
 #   #   flows: true
 #   #   perf: true
+#   #   guest: true
 
 # Tiers are yours to define. The label is what users put in `runs-on`.
 tiers:

@@ -151,6 +151,11 @@ type Spec struct {
 	// CacheEndpoint. Meaningful only with it; a backend that cannot carry them
 	// refuses them rather than launching a guest that silently builds cold.
 	GuestCaches []GuestCache
+	// GuestMonitor asks the guest to start billet's in-VM agent, which reports
+	// to CacheEndpoint with CacheToken. Meaningful only with them; a backend whose
+	// guest is never told ignores it, and the node's record then says the guest
+	// never reported.
+	GuestMonitor bool
 	// ActionsProxy and ActionsCAPEM opt this guest into the authenticated results
 	// proxy. Both must be present or absent together.
 	ActionsProxy string

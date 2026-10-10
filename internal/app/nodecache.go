@@ -26,12 +26,38 @@ const cacheEvictionAge = 7 * 24 * time.Hour
 
 const cacheConnectionLimit = 128
 
-// nodeCacheControl is what the node's cache service asks the control plane:
+// NodeCacheControl is what the node's cache service asks the control plane:
 // the kill switch, and what a job may publish. The node client is both.
-type nodeCacheControl interface {
+type NodeCacheControl interface {
 	node.ActionsPolicy
 	node.CachePolicy
 	node.CacheAuthorityReader
+}
+
+// NewNodeCacheService is the guest cache service a node.cache block describes,
+// over the site's store: what it asks the control plane, and whether it takes
+// its guests' own reports (node.monitoring.guest). startNodeCache builds it so,
+// and a harness builds it over a store of its own.
+func NewNodeCacheService(
+	cfg *config.Config,
+	deployment string,
+	storage storecontract.Store,
+	attacher provider.VolumeAttacher,
+	control NodeCacheControl,
+) (*node.CacheService, error) {
+	service, err := node.NewCacheService(cfg.Node.Cache.GuestEndpoint,
+		CacheNamespace(deployment, cfg.Node.Site), cfg.Node.StateDir, storage, attacher, slog.Default())
+	if err != nil {
+		return nil, err
+	}
+	service.SetActionsPolicy(control)
+	service.SetCachePolicy(control)
+	service.SetAuthorityReader(control)
+	if guestMonitoring(cfg) {
+		service.MonitorGuests()
+	}
+
+	return service, nil
 }
 
 // startNodeCache exposes the site's clone store to its managed guests.
@@ -40,7 +66,7 @@ func startNodeCache(
 	cfg *config.Config,
 	p provider.Provider,
 	deployment string,
-	cachePolicy nodeCacheControl,
+	cachePolicy NodeCacheControl,
 	stopGrace time.Duration,
 ) (*node.CacheService, func(), func(), error) {
 	if cfg.Node.Cache == nil {
@@ -77,14 +103,10 @@ func startNodeCache(
 		return nil, nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
 	}
 
-	service, err := node.NewCacheService(cfg.Node.Cache.GuestEndpoint,
-		CacheNamespace(deployment, cfg.Node.Site), cfg.Node.StateDir, storage, attacher, slog.Default())
+	service, err := NewNodeCacheService(cfg, deployment, storage, attacher, cachePolicy)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	service.SetActionsPolicy(cachePolicy)
-	service.SetCachePolicy(cachePolicy)
-	service.SetAuthorityReader(cachePolicy)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)

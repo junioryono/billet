@@ -545,10 +545,12 @@ func (r *Runner) Launch(
 		// zero value is unknown and backends refuse it.
 		Trust: trust,
 
-		JITConfig:               reg.Config(),
-		CacheEndpoint:           cacheEndpoint,
-		CacheToken:              cacheToken,
-		GuestCaches:             guestCaches,
+		JITConfig:     reg.Config(),
+		CacheEndpoint: cacheEndpoint,
+		CacheToken:    cacheToken,
+		GuestCaches:   guestCaches,
+		// ONLY WITH A SESSION TO REPORT TO, whose bearer is the agent's.
+		GuestMonitor:            cacheToken != "" && r.cache.GuestMonitoring(),
 		ActionsProxy:            actionsProxy,
 		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
@@ -862,6 +864,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 
 	if hasUsage && holdable {
 		r.reportUsage(ctx, lease, inst.Name, measured, destinations)
+	}
+	// AND WHAT ITS GUEST SAID, once the destroy above has ended the guest; a
+	// batch still in flight is refused once the report is taken.
+	if holdable {
+		r.reportGuest(ctx, lease, inst.Name)
 	}
 
 	if state != provider.TeardownStopped && !holdable {
