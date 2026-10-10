@@ -10,6 +10,7 @@ package usage
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -116,11 +117,17 @@ func parseIOStat(data string) (int64, int64, error) {
 			if err != nil {
 				return 0, 0, fmt.Errorf("usage: io.stat %s: %w", key, err)
 			}
-			if key == "rbytes" {
-				readBytes += n
-			} else {
-				writeBytes += n
+			if n < 0 {
+				return 0, 0, fmt.Errorf("usage: io.stat %s is negative", key)
 			}
+			total := &writeBytes
+			if key == "rbytes" {
+				total = &readBytes
+			}
+			if *total > math.MaxInt64-n {
+				return 0, 0, fmt.Errorf("usage: io.stat %s sums past an int64", key)
+			}
+			*total += n
 		}
 	}
 

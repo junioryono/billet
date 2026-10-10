@@ -463,7 +463,11 @@ func (j *job) absorb(s Sample, now time.Time) {
 		j.seen.oom = true
 	}
 	if s.IOOK {
-		j.latest.DiskRead, j.latest.DiskWrite = s.DiskRead, s.DiskWrite
+		// WRITTEN NEVER FALLS: its dirty part is a gauge, and a page the job
+		// dirtied and then discarded before the host wrote it back leaves it
+		// without reaching io.stat. The job did write it, so the most the job
+		// was ever seen to have written stands.
+		j.latest.DiskRead, j.latest.DiskWrite = s.DiskRead, max(j.latest.DiskWrite, s.DiskWrite)
 		j.seen.io = true
 	}
 	if s.NetOK {
