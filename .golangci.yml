@@ -551,6 +551,20 @@ linters:
           allow:
             - $gostd
 
+        # THE IN-VM AGENT RUNS IN THE JOB'S GUEST, beside the job, so it carries
+        # nothing of the node's, the plane's or the command line's: the schema it
+        # speaks, the one open of a file the job could have put anything at, and
+        # the standard library. Measured at zero violations when it went in.
+        guestagent:
+          list-mode: strict
+          files:
+            - "${config-path}/internal/guestagent/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/junioryono/billet/internal/guestreport$
+            - github.com/junioryono/billet/internal/regularfile$
+
         # A LEDGER WRITER MAY NOT REACH THE NETWORK, AND THE BLAST RADIUS IS WHY.
         #
         # The writer pool is ONE connection and DB.Tx begins IMMEDIATE, so a

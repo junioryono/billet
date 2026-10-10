@@ -27,6 +27,8 @@ import (
 
 	"github.com/junioryono/billet/internal/ops/cache"
 
+	"github.com/junioryono/billet/internal/ops/guest"
+
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -100,6 +102,9 @@ func commands(lc *cli.Lifecycle) []cli.Command {
 			Run: host.Release},
 		{Name: "uplink", Summary: "keep this host's traffic from filling its site's shared internet line",
 			Run: host.Uplink},
+		{Name: "guest", Summary: "run inside a job's VM: report what the job did there to its node, as the " +
+			"guest's own unverified view",
+			Run: guest.Run},
 		{Name: "acceptance", Summary: "stand an ISOLATED deployment up beside this one, run a real job on " +
 			"it, and destroy exactly what it made",
 			Run: cmdAcceptance},

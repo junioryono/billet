@@ -1,0 +1,486 @@
+// Package guestagent is billet's in-VM agent, `billet guest monitor`: it reads the
+// guest's totals and processes from /proc, the steps the runner's log marks and,
+// at the end, the job's JUnit results, and reports them to the node's guest-facing
+// service in guestreport batches.
+//
+// WHAT IT REPORTS IS THE GUEST'S OWN, UNVERIFIED VIEW (guestreport says why), and
+// it NEVER MAKES THE JOB FAIL: every path the node's contract calls a stop ends the
+// agent with no error, a figure it could not read is not sent rather than sent as
+// zero, its own errors go to its log without the guest's text, and everything it
+// holds is bounded by one batch.
+//
+// It reads a process's stat, status and io, never its cmdline or environ, which can
+// hold a secret.
+package guestagent
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/junioryono/billet/internal/guestreport"
+)
+
+// The final flush: from the request for it (SIGTERM or a connection to the
+// socket) until the agent is done with it, inside the contract's 3 s; and how long
+// a connection waits for the final batch's answer before it is answered anyway.
+const (
+	finalBudget     = 2750 * time.Millisecond
+	flushAnswerWait = 2 * time.Second
+)
+
+// Config is what one agent reads and where it reports.
+type Config struct {
+	// Endpoint and Token are the node's guest-facing service and this guest's
+	// bearer, from the environment.
+	Endpoint string
+	Token    string
+	// Proc is the /proc tree the guest's totals and processes are read from.
+	Proc fs.FS
+	// DiagDir is the runner's diagnostics directory, whose Worker log marks the
+	// steps; empty marks none.
+	DiagDir string
+	// JUnitRoots are searched for test results at the final flush.
+	JUnitRoots []string
+	// Socket is where a connection asks for the final flush; empty listens
+	// nowhere.
+	Socket string
+	// Transport carries the requests to the node; nil is a direct connection.
+	Transport http.RoundTripper
+	// Log receives the agent's own errors.
+	Log io.Writer
+	// Version is the agent's, as each batch names it.
+	Version string
+}
+
+// Run reports to the node until the job ends: a SIGTERM (ctx's cancellation) or a
+// connection to the socket asks for the final flush, which sends one last batch.
+// After a flush through the socket it sends nothing more and waits for ctx.
+//
+// It returns nil on every path, a node that is off, gone or full included.
+func Run(ctx context.Context, cfg Config) error {
+	log := newLimitedLog(cfg.Log)
+
+	n, err := newNode(cfg.Endpoint, cfg.Token, cfg.Transport)
+	if err != nil {
+		log.always("%v; nothing is reported", err)
+
+		return nil
+	}
+
+	if cfg.Proc == nil {
+		log.always("no /proc tree to read; nothing is reported")
+
+		return nil
+	}
+
+	a := &agent{
+		node:       n,
+		col:        newCollector(cfg.Proc, log),
+		steps:      newTailer(cfg.DiagDir, log),
+		junitRoots: cfg.JUnitRoots,
+		version:    textOrMark(guestreport.Clean(cfg.Version, guestreport.MaxNameBytes)),
+		log:        log,
+		results:    make(chan result, 1),
+		flushed:    make(chan struct{}),
+	}
+
+	if cfg.Socket != "" {
+		l, err := listenFlush(cfg.Socket)
+		if err != nil {
+			log.always("the flush socket was not opened, so only SIGTERM flushes: %v", err)
+		} else {
+			flushes := make(chan struct{}, 1)
+			a.flushes = flushes
+			done := make(chan struct{})
+
+			go func() {
+				defer close(done)
+
+				serveFlush(l, flushes, a.flushed, log)
+			}()
+
+			defer func() {
+				_ = l.Close()
+				<-done
+			}()
+		}
+	}
+
+	a.run(ctx)
+	// An agent that stopped without a final flush answers whoever is waiting.
+	a.flushDone()
+
+	return nil
+}
+
+// agent is one run's state. Only run's goroutine touches it; a request to the
+// node runs on its own and hands its answer back through results.
+type agent struct {
+	node       *node
+	col        *collector
+	steps      *tailer
+	junitRoots []string
+	version    string
+	log        *limitedLog
+
+	seq uint64
+	// lim is the node's limits, nil until a hello was answered.
+	lim *limits
+	// head is the batch cut and not yet accepted, resent as it is. A new batch
+	// is cut only when there is none, so at most one batch is ever unsent and
+	// what has not been cut waits, bounded, in the collector.
+	head     *outgoing
+	inflight bool
+	results  chan result
+
+	started  time.Time
+	lastSend time.Time
+	backoff  time.Duration
+
+	flushes <-chan struct{}
+	// flushed is closed once the final flush is done, which answers every
+	// connection waiting for it.
+	flushed   chan struct{}
+	closeOnce sync.Once
+}
+
+// flushDone answers every connection waiting for the final flush.
+func (a *agent) flushDone() { a.closeOnce.Do(func() { close(a.flushed) }) }
+
+// outgoing is a batch as it is sent.
+type outgoing struct {
+	seq  uint64
+	body []byte
+}
+
+// result is an answer from the node: to a hello, or to the batch numbered seq.
+type result struct {
+	hello   bool
+	limits  limits
+	verdict verdict
+	wait    time.Duration
+}
+
+// run is the agent's loop. It returns when the agent has stopped.
+func (a *agent) run(ctx context.Context) {
+	a.started = time.Now()
+	a.col.sample(a.started)
+	a.col.walkProcesses(a.started)
+	a.steps.poll()
+
+	samples := time.NewTicker(guestreport.SampleInterval)
+	defer samples.Stop()
+
+	walks := time.NewTicker(guestreport.ProcessInterval)
+	defer walks.Stop()
+
+	next := time.NewTimer(0)
+	defer next.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			a.final(ctx)
+
+			return
+		case <-a.flushes:
+			samples.Stop()
+			walks.Stop()
+			next.Stop()
+			a.final(ctx)
+			<-ctx.Done()
+
+			return
+		case now := <-samples.C:
+			a.col.sample(now)
+			a.steps.poll()
+		case now := <-walks.C:
+			a.col.walkProcesses(now)
+		case now := <-next.C:
+			if at, again := a.contact(ctx, now); again {
+				next.Reset(time.Until(at))
+			}
+		case r := <-a.results:
+			at, ok := a.answer(r, time.Now())
+			if !ok {
+				return
+			}
+
+			next.Reset(time.Until(at))
+		}
+	}
+}
+
+// contact sends the node what is due: a hello until one is answered, then the
+// unsent batch, or a new one. Its answer sets when to contact the node next; when
+// nothing was sent, contact says when instead.
+func (a *agent) contact(ctx context.Context, now time.Time) (time.Time, bool) {
+	if a.inflight {
+		return time.Time{}, false
+	}
+
+	if a.lim == nil {
+		a.inflight = true
+
+		go func() {
+			rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+			defer cancel()
+
+			lim, v := a.node.hello(rctx)
+			a.results <- result{hello: true, limits: lim, verdict: v}
+		}()
+
+		return time.Time{}, false
+	}
+
+	if a.head == nil {
+		b, ok := a.cut(nil)
+		if !ok {
+			a.lastSend = now
+
+			return now.Add(a.period()), true
+		}
+
+		a.head = &b
+	}
+
+	a.inflight = true
+	a.lastSend = now
+	body := a.head.body
+
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, requestTimeout)
+		defer cancel()
+
+		v, wait := a.node.report(rctx, body, false)
+		a.results <- result{verdict: v, wait: wait}
+	}()
+
+	return time.Time{}, false
+}
+
+// answer acts on the node's answer and says when to contact it next, or false when
+// the agent stops.
+func (a *agent) answer(r result, now time.Time) (time.Time, bool) {
+	a.inflight = false
+
+	if r.hello {
+		switch r.verdict {
+		case accepted:
+			a.lim, a.backoff = &r.limits, 0
+			// The first batch carries an interval of samples.
+			return later(now, a.started.Add(a.period())), true
+		case stop:
+			a.log.always("the node does not take guest reports from this guest; nothing is reported")
+
+			return time.Time{}, false
+		default:
+			a.backoff = min(max(2*a.backoff, firstBackoff), maxLimitBackoff)
+			a.log.printf("hello", "the node's limits could not be read; asking again")
+
+			return now.Add(a.backoff), true
+		}
+	}
+
+	due := a.lastSend.Add(a.period())
+
+	switch r.verdict {
+	case accepted:
+		a.head = nil
+	case rateLimited:
+		// The same batch, unchanged, after the node's wait and never sooner than
+		// the interval.
+		due = later(due, now.Add(r.wait))
+	case refused:
+		a.head = nil
+	case stop:
+		a.log.always("the node stopped taking this guest's reports; nothing more is sent")
+
+		return time.Time{}, false
+	default:
+		a.log.printf("report", "the node's answer to a batch could not be told; it is sent again")
+	}
+
+	return due, true
+}
+
+// period is how often the agent sends: the node's interval, and never more often
+// than guestreport.BatchInterval.
+func (a *agent) period() time.Duration {
+	return max(a.lim.interval, guestreport.BatchInterval)
+}
+
+// cut is a new batch of everything the agent holds, with tests when it is the
+// final one, numbered next and encoded to fit what the node takes. A batch that
+// cannot be encoded is dropped and its number spent, so the node sees the gap.
+func (a *agent) cut(tests []guestreport.SuiteResult) (outgoing, bool) {
+	a.seq++
+	a.col.readAgentCPU()
+
+	samples, processes := a.col.take()
+	b := guestreport.Batch{
+		Seq:            a.seq,
+		AgentVersion:   a.version,
+		TicksPerSecond: userHZ,
+		AgentCPUTicks:  a.col.agentCPU,
+		Samples:        samples,
+		Processes:      processes,
+		Steps:          a.steps.take(),
+		Tests:          tests,
+	}
+
+	body, err := fit(&b, a.lim.maxBody)
+	if err != nil {
+		a.log.always("batch %d was dropped, as it could not be encoded within %d bytes: %v", a.seq, a.lim.maxBody, err)
+
+		return outgoing{}, false
+	}
+
+	return outgoing{seq: a.seq, body: body}, true
+}
+
+// final takes a last reading, searches for test results, and sends the final
+// batch, once, whatever asked for it. A batch still unsent is left: the final one
+// carries what came after it, and the node sees its number missing.
+func (a *agent) final(ctx context.Context) {
+	defer a.flushDone()
+
+	start := time.Now()
+
+	fctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), start.Add(finalBudget))
+	defer cancel()
+
+	a.col.sample(start)
+	a.col.walkProcesses(start)
+	a.steps.poll()
+
+	tests := collectJUnit(a.junitRoots, time.Now, a.log)
+
+	if a.lim == nil {
+		lim, v := a.node.hello(fctx)
+		if v != accepted {
+			a.log.always("the node's limits were not read in time; the final batch is not sent")
+
+			return
+		}
+
+		a.lim = &lim
+	}
+
+	b, ok := a.cut(tests)
+	if !ok {
+		return
+	}
+
+	if v, _ := a.node.report(fctx, b.body, true); v != accepted {
+		a.log.always("the node did not accept the final batch")
+	}
+}
+
+// fit encodes b within limit bytes. Only test results give way: the failed names
+// are halved, then the lowest-ranked suites dropped, until it fits.
+func fit(b *guestreport.Batch, limit int) ([]byte, error) {
+	for {
+		data, err := guestreport.EncodeBatch(*b)
+		if err == nil && len(data) <= limit {
+			return data, nil
+		}
+
+		if err != nil && !errors.Is(err, guestreport.ErrTooLarge) {
+			return nil, err
+		}
+
+		if !shrinkTests(b) {
+			return nil, errors.New("larger than the node takes")
+		}
+	}
+}
+
+// shrinkTests halves every suite's failed names, or, when there are none, drops
+// the last suite. It reports false when there is nothing left to drop.
+func shrinkTests(b *guestreport.Batch) bool {
+	halved := false
+
+	for i := range b.Tests {
+		if n := len(b.Tests[i].Failed); n > 0 {
+			b.Tests[i].Failed = b.Tests[i].Failed[:n/2]
+			if n/2 == 0 {
+				b.Tests[i].Failed = nil
+			}
+
+			halved = true
+		}
+	}
+
+	if halved {
+		return true
+	}
+
+	if len(b.Tests) == 0 {
+		return false
+	}
+
+	b.Tests = b.Tests[:len(b.Tests)-1]
+	if len(b.Tests) == 0 {
+		b.Tests = nil
+	}
+
+	return true
+}
+
+// later is the later of two times.
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+
+	return b
+}
+
+// logEvery is how often one kind of recurring trouble is logged.
+const logEvery = 5 * time.Minute
+
+// limitedLog is the agent's own log: one line per event, a recurring kind of
+// trouble at most once per logEvery. No line carries the guest's text.
+type limitedLog struct {
+	mu   sync.Mutex
+	w    io.Writer
+	last map[string]time.Time
+}
+
+func newLimitedLog(w io.Writer) *limitedLog {
+	if w == nil {
+		w = io.Discard
+	}
+
+	return &limitedLog{w: w, last: map[string]time.Time{}}
+}
+
+// printf logs one line of a recurring kind, unless that kind was logged within
+// logEvery.
+func (l *limitedLog) printf(kind, format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now()
+	if at, ok := l.last[kind]; ok && now.Sub(at) < logEvery {
+		return
+	}
+
+	l.last[kind] = now
+	fmt.Fprintf(l.w, "billet guest monitor: "+format+"\n", args...)
+}
+
+// always logs one line.
+func (l *limitedLog) always(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	fmt.Fprintf(l.w, "billet guest monitor: "+format+"\n", args...)
+}

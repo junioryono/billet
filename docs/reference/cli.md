@@ -220,6 +220,15 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 | `billet cache orphans [--older-than 144h] [--limit 200] [--reclaim]` | on a Ceph node, list the intact writable cache volumes (`cache-v-*`) nothing needs, and why every other one is kept; with `--reclaim`, move those to the cache pool's trash, where the node's purge deletes them. A volume qualifies only when its name is exactly one billet gives, it was named and created by the cluster at least `--older-than` ago (default six days, never under 24 hours), no cache session on this node and no record in the cache index names it, it has no snapshot in any namespace, it is not mapped on this host, `rbd status` shows no watcher, and no publication marked it used within `--older-than`. Generations are never touched, a pass moves (or lists as reclaimable) at most `--limit` volumes, oldest first, and what it keeps does not count against that, and any answer rbd could not give keeps the volume and exits 1, as does a move rbd did not confirm |
 | `billet cache conformance install --repository <owner/repo> --runner-label <label> [--billet-ref] [--billet-repository] [--expected-runner-version] [--expected-guest-contract] [--workflow-ref] [--output] [--force]` | write the consumer-owned conformance workflow, pinning the resolved billet commit, runner version, guest contract and one label |
 
+## Inside a job's VM
+
+These run in the guest, never on a host. What `billet guest monitor` reports is the guest's own view: the job is root in its VM and can change any of it, so billet labels it as unverified wherever it shows it and acts on none of it.
+
+| Command | Meaning |
+|---|---|
+| `billet guest monitor [--proc /proc] [--diag /home/runner/runner/_diag] [--junit-root /home/runner/work]... [--socket /run/billet/guest-monitor.sock] [--nice 10]` | the in-VM agent, started as root by the guest's own agent: reads the node's guest-facing service and this guest's bearer from `BILLET_CACHE_ENDPOINT` and `BILLET_CACHE_TOKEN`, never from an argument, and sends the node a batch about every ten seconds: the guest's totals each second (`/proc/stat`, `/proc/meminfo`, `vda` in `/proc/diskstats`, `eth0` in `/proc/net/dev`), its processes by name every two seconds (each process's `stat`, `status` and `io`, never its `cmdline` or `environ`), the steps the runner's newest `Worker_*.log` marks, and its own CPU. A figure it cannot read is not sent rather than sent as zero. On SIGTERM, or a connection to `--socket`, it takes a last reading, searches each `--junit-root` for JUnit XML (6 levels deep, 200 files of at most 4 MiB, 2 s, no symlink followed out of a root), sends one final batch and, on SIGTERM, exits within 3 s. It exits 0 whatever the node answers, and when the node has guest monitoring off it sends nothing. Linux only |
+| `billet guest flush [--socket /run/billet/guest-monitor.sock]` | ask the monitor for its final batch, as the runner's job-completed hook does: wait at most 2 s for its answer and exit 0 either way, saying nothing |
+
 ## Fleet
 
 | Command | Meaning |
