@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; style-src &#39;unsafe-inline&#39;; script-src &#39;sha256-QYPIiRCAWTJh4Pu8Uo1aJENyAtVkNBkpgCOp56JSQL4=&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>billet job 6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64</title>
+<style>:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --rule: #d1d9e0;
+  --panel: #f6f8fa;
+  --band0: #eef1f4;
+  --band1: #e3e8ee;
+  --focus: #fff1c2;
+  --a: #1f6feb;
+  --b: #bf6c00;
+  --limit: #cf222e;
+  --ok: #1a7f37;
+  --bad: #cf222e;
+  --other: #59636e;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --rule: #3d444d;
+    --panel: #151b23;
+    --band0: #1b222c;
+    --band1: #232b36;
+    --focus: #4a3b07;
+    --a: #4493f8;
+    --b: #e3a13b;
+    --limit: #f85149;
+    --ok: #3fb950;
+    --bad: #f85149;
+    --other: #9198a1;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  max-width: 72rem;
+  padding: 1.5rem 1rem 3rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 1.6rem; margin: 0 0 .25rem; overflow-wrap: anywhere; }
+h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; padding-bottom: .25rem; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1rem; margin: 1.25rem 0 .25rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+.kicker { margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-size: .75rem; }
+.result { display: inline-block; margin: .25rem 0 1rem; padding: .1rem .6rem; border-radius: 1rem; font-weight: 600; border: 1px solid currentColor; }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
+.other { color: var(--other); }
+.fields { display: grid; grid-template-columns: max-content 1fr; gap: .15rem 1rem; margin: 0; }
+.fields dt { color: var(--muted); }
+.fields dd { margin: 0; overflow-wrap: anywhere; }
+.note { color: var(--muted); font-size: .9em; }
+.why { padding: .5rem .75rem; background: var(--panel); border-left: 3px solid var(--rule); overflow-wrap: anywhere; }
+.unmeasured { color: var(--muted); font-style: italic; }
+.timeline { list-style: none; padding: 0; margin: 0; }
+.timeline li { display: grid; grid-template-columns: minmax(10rem, 22rem) 6rem 5rem 1fr; gap: .5rem; align-items: center; padding: .1rem 0; }
+.timeline button { text-align: left; font: inherit; color: var(--fg); background: none; border: 1px solid transparent; border-radius: 4px; padding: .1rem .35rem; cursor: pointer; overflow-wrap: anywhere; }
+.timeline button:hover:not([disabled]), .timeline button[aria-pressed="true"] { border-color: var(--rule); background: var(--focus); }
+.timeline button[disabled] { cursor: default; }
+.timeline .n { color: var(--muted); display: inline-block; min-width: 1.5rem; }
+.timeline .outcome { font-size: .85em; }
+.timeline .took { color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar { width: 100%; height: .7rem; background: var(--panel); }
+.bar rect { fill: currentColor; }
+.chart { margin: 1rem 0; }
+.chart figcaption { font-weight: 600; }
+.key { font-weight: 400; font-size: .85em; margin-left: .5rem; }
+.key::before { content: ""; display: inline-block; width: .9rem; height: 3px; margin-right: .3rem; vertical-align: middle; background: currentColor; }
+.key.a { color: var(--a); }
+.key.b { color: var(--b); }
+.plot { position: relative; padding: 1.1rem 0 1.2rem; }
+.plot svg { display: block; width: 100%; height: 9rem; background: var(--panel); border: 1px solid var(--rule); }
+.plot .top, .plot .x0, .plot .x1 { position: absolute; font-size: .75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.plot .top { top: 0; left: 0; }
+.plot .x0 { bottom: 0; left: 0; }
+.plot .x1 { bottom: 0; right: 0; }
+.band0 { fill: var(--band0); }
+.band1 { fill: var(--band1); }
+rect.on { fill: var(--focus); }
+.line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.line.a { stroke: var(--a); }
+.line.b { stroke: var(--b); }
+.limit { stroke: var(--limit); stroke-width: 1; stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+#whole { font: inherit; font-size: .85em; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+thead th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+tbody th { font-weight: 400; overflow-wrap: anywhere; }
+td.none, tr.qualifier td { color: var(--muted); font-size: .9em; }
+footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
+</style>
+</head>
+<body>
+<header>
+<p class="kicker">billet job</p>
+<h1>build (ubuntu, go 1.26)</h1>
+<p class="result ok">succeeded</p>
+<dl class="fields">
+<dt>repository</dt><dd>acme/api</dd>
+<dt>workflow</dt><dd>acme/api/.github/workflows/ci.yml@refs/heads/main</dd>
+<dt>job</dt><dd>build (ubuntu, go 1.26)</dd>
+<dt>event</dt><dd>push</dd>
+<dt>github job</dt><dd>51000000007</dd>
+<dt>run</dt><dd>4242</dd>
+<dt>request</dt><dd>77</dd>
+<dt>result</dt><dd>GitHub succeeded; billet done</dd>
+<dt>queued</dt><dd>2026-10-09T11:59:57.000000000Z</dd>
+<dt>assigned</dt><dd>2026-10-09T11:59:57.000000000Z</dd>
+<dt>started</dt><dd>2026-10-09T12:00:00.000000000Z</dd>
+<dt>finished</dt><dd>2026-10-09T12:02:51.000000000Z</dd>
+<dt>tier</dt><dd>billet-2vcpu</dd>
+<dt>node</dt><dd>epyc-1</dd>
+<dt>provider</dt><dd>docker</dd>
+<dt>shape</dt><dd>2 vCPU, 8.0 GiB</dd>
+<dt>lease</dt><dd>6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64</dd>
+</dl>
+</header>
+
+<section id="steps">
+<h2>Steps</h2>
+<p>GitHub job 7001 &#34;test&#34;, attempt 2, on runner billet-6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64, steps listed: 6</p>
+<p class="note">Aligned to the second on two clocks, GitHub&#39;s for the steps and the host&#39;s for its samples, with no correction for skew between them; within one sample interval, usage is split by time.</p>
+<ol class="timeline">
+<li class="ok"><button type="button" data-from="0" data-to="4000" data-step="1" aria-pressed="false"><span class="n">1</span> <span class="name">Set up job</span></button>
+<span class="outcome">success</span>
+<span class="took">4s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"><rect x="0" y="0" width="23" height="10"></rect></svg>
+</li>
+<li class="ok"><button type="button" data-from="4000" data-to="19000" data-step="2" aria-pressed="false"><span class="n">2</span> <span class="name">Run actions/checkout@v5</span></button>
+<span class="outcome">success</span>
+<span class="took">15s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"><rect x="23" y="0" width="89" height="10"></rect></svg>
+</li>
+<li class="ok"><button type="button" data-from="19000" data-to="91000" data-step="3" aria-pressed="false"><span class="n">3</span> <span class="name">Build</span></button>
+<span class="outcome">success</span>
+<span class="took">1m12s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"><rect x="113" y="0" width="428" height="10"></rect></svg>
+</li>
+<li class="ok"><button type="button" data-from="91000" data-to="167000" data-step="4" aria-pressed="false"><span class="n">4</span> <span class="name">Test</span></button>
+<span class="outcome">success</span>
+<span class="took">1m16s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"><rect x="541" y="0" width="452" height="10"></rect></svg>
+</li>
+<li class="ok"><button type="button" data-from="167000" data-to="167500" data-step="5" aria-pressed="false"><span class="n">5</span> <span class="name">Post Run actions/checkout@v5</span></button>
+<span class="outcome">success</span>
+<span class="took">1s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"><rect x="994" y="0" width="5" height="10"></rect></svg>
+</li>
+<li class="ok"><button type="button" disabled><span class="n">6</span> <span class="name">Complete job</span></button>
+<span class="outcome">success</span>
+<span class="took">0s</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true"></svg>
+</li>
+</ol>
+</section>
+
+<section id="charts">
+<h2>Usage over the job</h2>
+<p>The host's series from 2026-10-09T12:00:00Z to 2026-10-09T12:02:47Z on its own clock (2m47.5s). <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="0" data-to="167500">Show the whole series</button></p>
+<p class="note">Every one of the series&#39; 169 samples is drawn: a rate is the average over each sample interval. Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.</p>
+<figure class="chart">
+<figcaption>CPU (cores busy) <span class="key a">cpu</span></figcaption>
+<div class="plot">
+<span class="top">2.16 cores</span>
+<svg data-chart="" viewBox="0 0 167500 100" preserveAspectRatio="none" role="img" aria-label="CPU (cores busy)">
+<rect class="band0" data-step="1" x="0" y="0" width="4000" height="100"></rect>
+<rect class="band1" data-step="2" x="4000" y="0" width="15000" height="100"></rect>
+<rect class="band0" data-step="3" x="19000" y="0" width="72000" height="100"></rect>
+<rect class="band1" data-step="4" x="91000" y="0" width="76000" height="100"></rect>
+<rect class="band0" data-step="5" x="167000" y="0" width="500" height="100"></rect>
+<line class="limit" x1="0" x2="167500" y1="7.41" y2="7.41"></line>
+<path class="line a" d="M0 86.11H1000V85.43H2000V84.82H3000V84.36H4000V76.13H5000V76.06H6000V76.33H7000V76.91H8000V77.74H9000V78.73H10000V79.76H11000V80.73H12000V81.53H13000V82.07H14000V82.29H15000V82.16H16000V81.71H17000V80.97H18000V80.04H19000V25.37H20000V21.77H21000V18.63H22000V16.29H23000V15.01H24000V14.93H25000V16.07H26000V18.29H27000V21.35H28000V24.91H29000V28.59H30000V31.97H31000V34.69H32000V36.44H33000V37.04H34000V36.41H35000V34.63H36000V31.89H37000V28.49H38000V24.81H39000V21.26H40000V18.22H41000V16.02H42000V14.92H43000V15.03H44000V16.34H45000V18.70H46000V21.86H47000V25.47H48000V29.12H49000V32.43H50000V35.02H51000V36.61H52000V37.02H53000V36.21H54000V34.27H55000V31.41H56000V27.95H57000V24.26H58000V20.76H59000M60000 15.78H61000V14.86H62000V15.15H63000V16.63H64000V19.13H65000V22.38H66000V26.02H67000V29.65H68000V32.87H69000V35.33H70000V36.75H71000V36.98H72000V35.99H73000V33.89H74000V30.92H75000V27.40H76000V23.71H77000V20.27H78000V17.45H79000V15.57H80000V14.82H81000V15.30H82000V16.95H83000V19.58H84000V22.92H85000V26.58H86000V30.17H87000V33.30H88000V35.61H89000V36.86H90000V36.90H91000V51.80H92000V50.12H93000V47.81H94000V45.13H95000V42.38H96000V39.85H97000V37.83H98000V36.53H99000V36.11H100000V36.61H101000V37.96H102000V40.04H103000V42.59H104000V45.35H105000V48.01H106000V50.28H107000V51.91H108000V52.71H109000V52.60H110000V51.60H111000V49.81H112000V47.43H113000V44.71H114000V41.97H115000V39.51H116000V37.58H117000V36.41H118000V36.13H119000V36.76H120000V38.24H121000V40.40H122000V43.00H123000V45.77H124000V48.39H125000V50.57H126000V52.08H127000V52.75H128000V52.51H129000V51.38H130000V49.48H131000V47.03H132000V44.30H133000V41.58H134000V39.18H135000V37.35H136000V36.31H137000V36.16H138000V36.93H139000V38.52H140000V40.77H141000V43.41H142000V46.18H143000V48.75H144000V50.85H145000V52.24H146000V52.77H147000V52.39H148000V51.14H149000V49.14H150000V46.63H151000V43.88H152000V41.19H153000V38.86H154000V37.14H155000V36.23H156000V36.22H157000V37.12H158000V38.82H159000V41.15H160000V43.83H161000V46.58H162000V49.10H163000V51.11H164000V52.38H165000V52.78H166000V52.26H167000V95.91H167500"></path>
+</svg>
+<span class="x0">&#43;0m00s</span><span class="x1">&#43;2m48s</span>
+</div>
+<p class="note">Dashed: the lease&#39;s 2 vCPU.</p>
+</figure>
+<figure class="chart">
+<figcaption>Memory (the cgroup&#39;s level) <span class="key a">memory</span></figcaption>
+<div class="plot">
+<span class="top">8.6 GiB</span>
+<svg data-chart="" viewBox="0 0 167500 100" preserveAspectRatio="none" role="img" aria-label="Memory (the cgroup&#39;s level)">
+<rect class="band0" data-step="1" x="0" y="0" width="4000" height="100"></rect>
+<rect class="band1" data-step="2" x="4000" y="0" width="15000" height="100"></rect>
+<rect class="band0" data-step="3" x="19000" y="0" width="72000" height="100"></rect>
+<rect class="band1" data-step="4" x="91000" y="0" width="76000" height="100"></rect>
+<rect class="band0" data-step="5" x="167000" y="0" width="500" height="100"></rect>
+<line class="limit" x1="0" x2="167500" y1="7.41" y2="7.41"></line>
+<path class="line a" d="M0 96.61L1000 96.59L2000 96.56L3000 96.54L4000 91.87L5000 91.83L6000 91.79L7000 91.76L8000 91.73L9000 91.71L10000 91.70L11000 91.69L12000 91.70L13000 91.71L14000 91.73L15000 91.76L16000 91.79L17000 91.83L18000 91.87L19000 61.93L20000 62.18L21000 62.44L22000 62.70L23000 62.97L24000 63.23L25000 63.48L26000 63.71L27000 63.92L28000 64.11L29000 64.27L30000 64.40L31000 64.49L32000 64.55L33000 64.57L34000 64.55L35000 64.49L36000 64.40L37000 64.27L38000 64.11L39000 63.92L40000 63.71L41000 63.47L42000 63.22L43000 62.96L44000 62.70L45000 62.43L46000 62.17L47000 61.92L48000 61.69L49000 61.48L50000 61.29L51000 61.13L52000 61.00L53000 60.91L54000 60.85L55000 60.84L56000 60.86L57000 60.91L58000 61.01L59000 61.14L60000 61.30L61000 61.48L62000 61.70L63000 61.93L64000 62.18L65000 62.44L66000 62.71L67000 62.97L68000 63.23L69000 63.48L70000 63.72L71000 63.93L72000 64.12L73000 64.27L74000 64.40L75000 64.49L76000 64.55L77000 64.57L78000 64.55L79000 64.49L80000 64.39L81000 64.26L82000 64.10L83000 63.92L84000 63.70L85000 63.47L86000 63.22L87000 62.96L88000 62.69L89000 62.43L90000 62.17L91000 75.77L92000 75.62L93000 75.48L94000 75.36L95000 75.26L96000 75.18L97000 75.12L98000 75.09L99000 75.08L100000 75.09L101000 75.13L102000 75.19L103000 75.27L104000 75.37L105000 75.49L106000 75.63L107000 75.78L108000 75.94L109000 76.10L110000 76.27L111000 76.44L112000 76.61L113000 76.76L114000 76.91L115000 77.05L116000 77.17L117000 77.27L118000 77.35L119000 77.41L120000 77.44L121000 77.45L122000 77.44L123000 77.40L124000 77.34L125000 77.26L126000 77.16L127000 77.03L128000 76.90L129000 76.75L130000 76.59L131000 76.42L132000 76.26L133000 76.09L134000 75.92L135000 75.76L136000 75.61L137000 75.48L138000 75.36L139000 75.26L140000 75.18L141000 75.12L142000 75.09L143000 75.08L144000 75.09L145000 75.13L146000 75.19L147000 75.27L148000 75.37L149000 75.49L150000 75.63L151000 75.78L152000 75.94L153000 76.11L154000 76.27L155000 76.44L156000 76.61L157000 76.77L158000 76.91L159000 77.05L160000 77.17L161000 77.27L162000 77.35L163000 77.41L164000 77.44L165000 77.45L166000 77.44L167000 95.70L167500 95.69"></path>
+</svg>
+<span class="x0">&#43;0m00s</span><span class="x1">&#43;2m48s</span>
+</div>
+<p class="note">Dashed: tier memory 8.0 GiB.</p>
+<p class="note">For a microVM the level counts the VMM and the host&#39;s page cache for its disk, so it can pass the guest&#39;s memory.</p>
+</figure>
+<figure class="chart">
+<figcaption>Disk (bytes a second, host IO) <span class="key a">read</span> <span class="key b">written</span></figcaption>
+<div class="plot">
+<span class="top">49.7 MiB/s</span>
+<svg data-chart="" viewBox="0 0 167500 100" preserveAspectRatio="none" role="img" aria-label="Disk (bytes a second, host IO)">
+<rect class="band0" data-step="1" x="0" y="0" width="4000" height="100"></rect>
+<rect class="band1" data-step="2" x="4000" y="0" width="15000" height="100"></rect>
+<rect class="band0" data-step="3" x="19000" y="0" width="72000" height="100"></rect>
+<rect class="band1" data-step="4" x="91000" y="0" width="76000" height="100"></rect>
+<rect class="band0" data-step="5" x="167000" y="0" width="500" height="100"></rect>
+<path class="line a" d="M0 100.00H1000V100.00H2000V100.00H3000V100.00H4000V100.00H5000V100.00H6000V100.00H7000V100.00H8000V100.00H9000V100.00H10000V100.00H11000V100.00H12000V100.00H13000V100.00H14000V100.00H15000V100.00H16000V100.00H17000V100.00H18000V100.00H19000V89.86H20000V89.37H21000V88.94H22000V88.62H23000V88.45H24000V88.44H25000V88.60H26000V88.90H27000V89.31H28000V89.80H29000V90.30H30000V90.76H31000V91.13H32000V91.36H33000V91.44H34000V91.36H35000V91.12H36000V90.74H37000V90.28H38000V89.78H39000V89.30H40000V88.89H41000V88.59H42000V88.44H43000V88.45H44000V88.63H45000V88.95H46000V89.38H47000V89.87H48000V90.37H49000V90.82H50000V91.17H51000V91.39H52000V91.44H53000V91.33H54000V91.07H55000V90.68H56000V90.21H57000V89.71H58000V89.23H59000M60000 88.56H61000V88.43H62000V88.47H63000V88.67H64000V89.01H65000V89.45H66000V89.95H67000V90.44H68000V90.88H69000V91.21H70000V91.41H71000V91.44H72000V91.30H73000V91.02H74000V90.61H75000V90.13H76000V89.63H77000V89.17H78000V88.78H79000V88.53H80000V88.43H81000V88.49H82000V88.71H83000V89.07H84000V89.53H85000V90.02H86000V90.51H87000V90.94H88000V91.25H89000V91.42H90000V91.43H91000V96.51H92000V96.39H93000V96.22H94000V96.02H95000V95.82H96000V95.64H97000V95.49H98000V95.40H99000V95.37H100000V95.41H101000V95.50H102000V95.65H103000V95.84H104000V96.04H105000V96.23H106000V96.40H107000V96.51H108000V96.57H109000V96.57H110000V96.49H111000V96.36H112000V96.19H113000V95.99H114000V95.79H115000V95.62H116000V95.48H117000V95.39H118000V95.37H119000V95.42H120000V95.52H121000V95.68H122000V95.87H123000V96.07H124000V96.26H125000V96.42H126000V96.53H127000V96.58H128000V96.56H129000V96.48H130000V96.34H131000V96.16H132000V95.96H133000V95.77H134000V95.59H135000V95.46H136000V95.38H137000V95.37H138000V95.43H139000V95.54H140000V95.71H141000V95.90H142000V96.10H143000V96.29H144000V96.44H145000V96.54H146000V96.58H147000V96.55H148000V96.46H149000V96.31H150000V96.13H151000V95.93H152000V95.74H153000V95.57H154000V95.44H155000V95.38H156000V95.38H157000V95.44H158000V95.57H159000V95.73H160000V95.93H161000V96.13H162000V96.31H163000V96.46H164000V96.55H165000V96.58H166000V96.54H167000V100.00H167500"></path>
+<path class="line b" d="M0 100.00H1000V100.00H2000V100.00H3000V100.00H4000V30.80H5000V30.59H6000V31.37H7000V33.06H8000V35.47H9000V38.33H10000V41.33H11000V44.15H12000V46.46H13000V48.02H14000V48.66H15000V48.29H16000V46.98H17000V44.85H18000V42.14H19000V18.87H20000V14.96H21000V11.54H22000V9.00H23000V7.61H24000V7.53H25000V8.76H26000V11.17H27000V14.50H28000V18.37H29000V22.37H30000V26.05H31000V29.00H32000V30.91H33000V31.56H34000V30.87H35000V28.94H36000V25.96H37000V22.27H38000V18.27H39000V14.40H40000V11.10H41000V8.71H42000V7.51H43000V7.63H44000V9.05H45000V11.62H46000V15.06H47000V18.98H48000V22.95H49000V26.55H50000V29.36H51000V31.09H52000V31.54H53000V30.66H54000V28.55H55000V25.44H56000V21.67H57000V17.67H58000V13.86H59000M60000 8.45H61000V7.44H62000V7.76H63000V9.37H64000V12.09H65000V15.63H66000V19.58H67000V23.53H68000V27.03H69000V29.70H70000V31.24H71000V31.49H72000V30.42H73000V28.14H74000V24.91H75000V21.08H76000V17.07H77000V13.33H78000V10.27H79000V8.22H80000V7.41H81000V7.93H82000V9.72H83000V12.58H84000V16.21H85000V20.19H86000V24.10H87000V27.49H88000V30.01H89000V31.36H90000V31.41H91000V89.52H92000V89.16H93000V88.65H94000V88.07H95000V87.47H96000V86.92H97000V86.48H98000V86.20H99000V86.11H100000V86.22H101000V86.51H102000V86.96H103000V87.52H104000V88.12H105000V88.70H106000V89.19H107000V89.54H108000V89.72H109000V89.70H110000V89.48H111000V89.09H112000V88.57H113000V87.98H114000V87.38H115000V86.85H116000V86.43H117000V86.18H118000V86.11H119000V86.25H120000V86.57H121000V87.04H122000V87.61H123000V88.21H124000V88.78H125000V89.25H126000V89.58H127000V89.73H128000V89.67H129000V89.43H130000V89.02H131000V88.48H132000V87.89H133000V87.30H134000V86.78H135000V86.38H136000V86.15H137000V86.12H138000V86.29H139000V86.63H140000V87.12H141000V87.70H142000V88.30H143000V88.86H144000V89.31H145000V89.62H146000V89.73H147000V89.65H148000V89.38H149000V88.94H150000V88.40H151000V87.80H152000V87.21H153000V86.71H154000V86.33H155000V86.14H156000V86.13H157000V86.33H158000V86.70H159000V87.20H160000V87.79H161000V88.39H162000V88.93H163000V89.37H164000V89.65H165000V89.73H166000V89.62H167000V100.00H167500"></path>
+</svg>
+<span class="x0">&#43;0m00s</span><span class="x1">&#43;2m48s</span>
+</div>
+<p class="note">IO that missed the host&#39;s page cache, plus writeback: not what the guest asked for.</p>
+</figure>
+<figure class="chart">
+<figcaption>Network (bytes a second, the guest&#39;s view) <span class="key a">received</span> <span class="key b">sent</span></figcaption>
+<div class="plot">
+<span class="top">27.3 MiB/s</span>
+<svg data-chart="" viewBox="0 0 167500 100" preserveAspectRatio="none" role="img" aria-label="Network (bytes a second, the guest&#39;s view)">
+<rect class="band0" data-step="1" x="0" y="0" width="4000" height="100"></rect>
+<rect class="band1" data-step="2" x="4000" y="0" width="15000" height="100"></rect>
+<rect class="band0" data-step="3" x="19000" y="0" width="72000" height="100"></rect>
+<rect class="band1" data-step="4" x="91000" y="0" width="76000" height="100"></rect>
+<rect class="band0" data-step="5" x="167000" y="0" width="500" height="100"></rect>
+<path class="line a" d="M0 100.00H1000V100.00H2000V100.00H3000V100.00H4000V7.69H5000V7.41H6000V8.45H7000V10.70H8000V13.91H9000V17.73H10000V21.74H11000V25.49H12000V28.58H13000V30.66H14000V31.51H15000V31.02H16000V29.27H17000V26.42H18000V22.81H19000V96.31H20000V96.13H21000V95.98H22000V95.86H23000V95.80H24000V95.79H25000V95.85H26000V95.96H27000V96.11H28000V96.29H29000V96.47H30000V96.64H31000V96.77H32000V96.86H33000V96.89H34000V96.86H35000V96.77H36000V96.63H37000V96.46H38000V96.28H39000V96.11H40000V95.96H41000V95.85H42000V95.79H43000V95.80H44000V95.86H45000V95.98H46000V96.14H47000V96.32H48000V96.50H49000V96.66H50000V96.79H51000V96.87H52000V96.89H53000V96.85H54000V96.75H55000V96.61H56000V96.44H57000V96.26H58000V96.08H59000M60000 95.84H61000V95.79H62000V95.81H63000V95.88H64000V96.00H65000V96.16H66000V96.34H67000V96.52H68000V96.68H69000V96.80H70000V96.87H71000V96.88H72000V96.84H73000V96.73H74000V96.58H75000V96.41H76000V96.23H77000V96.06H78000V95.92H79000V95.83H80000V95.79H81000V95.81H82000V95.89H83000V96.02H84000V96.19H85000V96.37H86000V96.55H87000V96.70H88000V96.82H89000V96.88H90000V96.88H91000V90.47H92000V90.14H93000V89.68H94000V89.15H95000V88.61H96000V88.11H97000V87.71H98000V87.45H99000V87.37H100000V87.46H101000V87.73H102000V88.14H103000V88.65H104000V89.19H105000V89.72H106000V90.17H107000V90.49H108000V90.65H109000V90.63H110000V90.43H111000V90.07H112000V89.60H113000V89.07H114000V88.53H115000V88.04H116000V87.66H117000V87.43H118000V87.37H119000V87.49H120000V87.79H121000V88.21H122000V88.73H123000V89.28H124000V89.79H125000V90.23H126000V90.52H127000V90.66H128000V90.61H129000V90.38H130000V90.01H131000V89.53H132000V88.98H133000V88.45H134000V87.97H135000V87.61H136000V87.41H137000V87.38H138000V87.53H139000V87.84H140000V88.29H141000V88.81H142000V89.36H143000V89.87H144000V90.28H145000V90.56H146000V90.66H147000V90.59H148000V90.34H149000V89.94H150000V89.45H151000V88.90H152000V88.37H153000V87.91H154000V87.57H155000V87.39H156000V87.39H157000V87.57H158000V87.90H159000V88.36H160000V88.89H161000V89.44H162000V89.93H163000V90.33H164000V90.58H165000V90.66H166000V90.56H167000V100.00H167500"></path>
+<path class="line b" d="M0 100.00H1000V100.00H2000V100.00H3000V100.00H4000V99.18H5000V99.18H6000V99.19H7000V99.21H8000V99.24H9000V99.27H10000V99.31H11000V99.34H12000V99.37H13000V99.38H14000V99.39H15000V99.39H16000V99.37H17000V99.35H18000V99.31H19000V99.77H20000V99.76H21000V99.75H22000V99.74H23000V99.74H24000V99.74H25000V99.74H26000V99.75H27000V99.76H28000V99.77H29000V99.78H30000V99.79H31000V99.80H32000V99.80H33000V99.81H34000V99.80H35000V99.80H36000V99.79H37000V99.78H38000V99.77H39000V99.76H40000V99.75H41000V99.74H42000V99.74H43000V99.74H44000V99.74H45000V99.75H46000V99.76H47000V99.77H48000V99.78H49000V99.79H50000V99.80H51000V99.80H52000V99.81H53000V99.80H54000V99.80H55000V99.79H56000V99.78H57000V99.77H58000V99.76H59000M60000 99.74H61000V99.74H62000V99.74H63000V99.74H64000V99.75H65000V99.76H66000V99.77H67000V99.78H68000V99.79H69000V99.80H70000V99.80H71000V99.81H72000V99.80H73000V99.80H74000V99.79H75000V99.78H76000V99.76H77000V99.75H78000V99.74H79000V99.74H80000V99.74H81000V99.74H82000V99.74H83000V99.75H84000V99.76H85000V99.77H86000V99.78H87000V99.79H88000V99.80H89000V99.80H90000V99.81H91000V96.82H92000V96.71H93000V96.56H94000V96.38H95000V96.20H96000V96.04H97000V95.90H98000V95.82H99000V95.79H100000V95.82H101000V95.91H102000V96.05H103000V96.22H104000V96.40H105000V96.57H106000V96.72H107000V96.83H108000V96.88H109000V96.88H110000V96.81H111000V96.69H112000V96.53H113000V96.36H114000V96.18H115000V96.01H116000V95.89H117000V95.81H118000V95.79H119000V95.83H120000V95.93H121000V96.07H122000V96.24H123000V96.43H124000V96.60H125000V96.74H126000V96.84H127000V96.89H128000V96.87H129000V96.79H130000V96.67H131000V96.51H132000V96.33H133000V96.15H134000V95.99H135000V95.87H136000V95.80H137000V95.79H138000V95.84H139000V95.95H140000V96.10H141000V96.27H142000V96.45H143000V96.62H144000V96.76H145000V96.85H146000V96.89H147000V96.86H148000V96.78H149000V96.65H150000V96.48H151000V96.30H152000V96.12H153000V95.97H154000V95.86H155000V95.80H156000V95.80H157000V95.86H158000V95.97H159000V96.12H160000V96.30H161000V96.48H162000V96.64H163000V96.78H164000V96.86H165000V96.89H166000V96.85H167000V100.00H167500"></path>
+</svg>
+<span class="x0">&#43;0m00s</span><span class="x1">&#43;2m48s</span>
+</div>
+</figure>
+</section>
+
+<section id="step-usage">
+<h2>Usage by step</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Step</th><th>Took</th><th>CPU</th><th>Peak memory</th><th>Disk read</th><th>Disk written</th><th>Received</th><th>Sent</th><th>Energy</th></tr></thead>
+<tbody>
+<tr><th scope="row">1 Set up job</th><td>4s</td><td>1.3s</td><td>718.9 MiB</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0 B</td><td>14.1 J active</td></tr>
+<tr><th scope="row">2 Run actions/checkout@v5</th><td>15s</td><td>6.6s</td><td>3.3 GiB</td><td>0 B</td><td>441.9 MiB</td><td>324.0 MiB</td><td>2.9 MiB</td><td>72.9 J active</td></tr>
+<tr><th scope="row">3 Build</th><td>1m12s</td><td>113.9s</td><td>3.4 GiB</td><td>356.0 MiB</td><td>2.8 GiB</td><td>71.2 MiB</td><td>4.4 MiB</td><td>1.3 kJ active</td></tr>
+<tr class="qualifier"><td></td><td colspan="8">partial: the series covers 1m11s of the step&#39;s 1m12s, and these are over that part</td></tr>
+<tr><th scope="row">4 Test</th><td>1m16s</td><td>91.1s</td><td>2.2 GiB</td><td>151.8 MiB</td><td>455.5 MiB</td><td>227.8 MiB</td><td>75.9 MiB</td><td>1.0 kJ active</td></tr>
+<tr><th scope="row">5 Post Run actions/checkout@v5</th><td>1s</td><td>0.0s</td><td>381.3 MiB</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0.5 J active</td></tr>
+<tr class="qualifier"><td></td><td colspan="8">partial: the series covers 500ms of the step&#39;s 1s, and these are over that part</td></tr>
+<tr><th scope="row">6 Complete job</th><td>0s</td><td colspan="7" class="none">start and end in the same second, so no usage can be placed in it</td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">Network columns are the guest's own view. Disk is host IO that missed the host's page cache, plus writeback.</p>
+</section>
+
+<section id="usage">
+<h2>What the host measured</h2>
+<p>measured by the host epyc-1, 169 samples every 1s over 2m47.5s</p>
+<dl class="fields">
+<dt>cpu</dt><dd>user 193.3s, system 21.5s</dd>
+<dt>vmm split</dt><dd>guest vCPUs 208.3s, VMM 6.4s</dd>
+<dt>memory</dt><dd>peak 3.4 GiB, oom kills 0</dd>
+<dt>disk</dt><dd>read 513.4 MiB, written 3.7 GiB (host io, not the guest&#39;s page cache)</dd>
+<dt>network</dt><dd>received 624.1 MiB, sent 83.3 MiB (the guest&#39;s view)</dd>
+<dt>stalled</dt><dd>cpu 2.3s, memory 0.0s (full 0.0s), io 1.9s (full 0.7s)</dd>
+<dt>energy</dt><dd>2.4 kJ active, 1.6 kJ idle (package RAPL, a model rather than a meter)</dd>
+</dl>
+<h3>Hardware counters</h3>
+<dl class="fields">
+<dt>counters</dt><dd>cycles 612,000,000,000, instructions 734,400,000,000 (the vCPU threads, guest and host mode)</dd>
+<dt></dt><dd>cache references 9,100,000,000, cache misses 2,350,000,000</dd>
+<dt></dt><dd>branch misses 3,120,000,000, frontend stall cycles 171,000,000,000</dd>
+<dt>ipc</dt><dd>1.20 instructions per cycle</dd>
+<dt>cache</dt><dd>3.2 misses per 1,000 instructions</dd>
+<dt>branches</dt><dd>4.2 mispredicted per 1,000 instructions</dd>
+<dt>frontend</dt><dd>stalled 27.9% of cycles</dd>
+</dl>
+</section>
+
+<section id="destinations">
+<h2>Destinations</h2>
+<p>3 destinations by total bytes, from the host&#39;s connection tracker (attributed by the guest&#39;s source address)</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th></tr></thead>
+<tbody>
+<tr><th scope="row">140.82.112.4</th><td>3.0 MiB</td><td>335.7 MiB</td><td>4</td></tr>
+<tr><th scope="row">185.199.108.133</th><td>400.4 KiB</td><td>58.2 MiB</td><td>12</td></tr>
+<tr><th scope="row">10.0.0.2</th><td>23.4 KiB</td><td>59.6 KiB</td><td>310</td></tr>
+</tbody>
+</table>
+</div>
+<dl class="fields">
+<dt>other</dt><dd>sent 8.8 KiB, received 117.2 KiB, 3 connections (beyond the 256 destinations the node keeps by name)</dd>
+<dt>complete</dt><dd>yes</dd>
+<dt>tap</dt><dd>sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent &#43;16.6 KiB, received &#43;213.9 KiB</dd>
+</dl>
+<p class="note">A comparison of two counters read a moment apart, not a measurement of what was missed.</p>
+</section>
+
+<footer>Rendered by <code>billet jobs show --html</code> from the ledger and GitHub's record of the run. Read-only: the page fetches nothing.</footer>
+<script>(function () {
+  "use strict";
+  var charts = document.querySelectorAll("svg[data-chart]");
+  var steps = document.querySelectorAll("button[data-from]");
+  var whole = document.getElementById("whole");
+  var label = document.getElementById("focus");
+  if (!whole || !label || charts.length === 0) {
+    return;
+  }
+  function pad(n) {
+    return n < 10 ? "0" + n : String(n);
+  }
+  function offset(ms) {
+    var s = Math.round(ms / 1000);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor(s / 60) % 60;
+    s %= 60;
+    return "+" + (h > 0 ? h + "h" + pad(m) + "m" : m + "m") + pad(s) + "s";
+  }
+  function focus(from, to, text, step) {
+    for (var i = 0; i < charts.length; i++) {
+      var svg = charts[i];
+      svg.setAttribute("viewBox", from + " 0 " + Math.max(to - from, 1) + " 100");
+      svg.parentNode.querySelector(".x0").textContent = offset(from);
+      svg.parentNode.querySelector(".x1").textContent = offset(to);
+      var bands = svg.querySelectorAll("rect[data-step]");
+      for (var j = 0; j < bands.length; j++) {
+        bands[j].classList.toggle("on", bands[j].getAttribute("data-step") === step);
+      }
+    }
+    for (var k = 0; k < steps.length; k++) {
+      steps[k].setAttribute("aria-pressed", String(steps[k].getAttribute("data-step") === step));
+    }
+    label.textContent = text;
+  }
+  function choose(event) {
+    var b = event.currentTarget;
+    var step = b.getAttribute("data-step");
+    focus(Number(b.getAttribute("data-from")), Number(b.getAttribute("data-to")), "Showing step " + step + ".", step);
+  }
+  for (var i = 0; i < steps.length; i++) {
+    steps[i].addEventListener("click", choose);
+  }
+  whole.addEventListener("click", function () {
+    focus(Number(whole.getAttribute("data-from")), Number(whole.getAttribute("data-to")), "Showing the whole series.", null);
+  });
+})();
+</script>
+</body>
+</html>
