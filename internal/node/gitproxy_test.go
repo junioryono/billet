@@ -392,22 +392,51 @@ func TestARepositoryAboveTheCeilingIsForwarded(t *testing.T) {
 	spec.Git.MaxSize = 1
 	service, _, token, _ := casService(t, provider.TrustUntrusted, spec, &fakeCacheStore{})
 	service.git.upstream, service.git.fullFraction = upstream.URL, 1
+	// THE NODE'S OWN FETCHES ARE COUNTED AT ITS git, not at GitHub: the
+	// watchdog stops a mirror past a one-byte ceiling at its first tick, which
+	// under load comes before that fetch has asked GitHub for anything.
+	record := filepath.Join(t.TempDir(), "subcommands")
+	wrapper := filepath.Join(t.TempDir(), "git")
+	if err := forkSafeWriteFile(wrapper, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" >>"+record+"\nexec git \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service.git.binary = wrapper
+	mirrorFetches := func() int {
+		subcommands, err := os.ReadFile(record)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal(err)
+		}
+		n := 0
+		for line := range strings.Lines(string(subcommands)) {
+			if strings.TrimSpace(line) == "fetch" {
+				n++
+			}
+		}
+		return n
+	}
 	node := httptest.NewServer(service)
 	t.Cleanup(node.Close)
 	git := gitClient(t, node, token, githubBasic)
 
-	for _, dir := range []string{"first", "second"} {
-		if output, err := git("clone", "-q", "https://github.com/acme/api.git", dir); err != nil {
-			t.Fatalf("clone %s: %v\n%s", dir, err, output)
-		}
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "first"); err != nil {
+		t.Fatalf("clone first: %v\n%s", err, output)
+	}
+	if got := mirrorFetches(); got != 1 {
+		t.Fatalf("the first clone ran %d mirror fetches, want 1", got)
+	}
+	before := upstream.fetches.Load()
+	if output, err := git("clone", "-q", "https://github.com/acme/api.git", "second"); err != nil {
+		t.Fatalf("clone second: %v\n%s", err, output)
 	}
 	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
 		t.Fatal("a mirror above the tier's ceiling was kept")
 	}
-	// The first clone's mirror fetch and the client's own, then the second
-	// client's own: no second mirror fetch.
-	if got := upstream.fetches.Load(); got != 3 {
-		t.Fatalf("github.com served %d fetches, want 3", got)
+	if got := mirrorFetches(); got != 1 {
+		t.Fatalf("the second clone ran a mirror fetch (%d in all), want it forwarded", got)
+	}
+	// The second client's own fetch, and nothing else.
+	if got := upstream.fetches.Load() - before; got != 1 {
+		t.Fatalf("github.com served the second clone %d fetches, want 1", got)
 	}
 }
 
