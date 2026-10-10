@@ -98,7 +98,11 @@ func (g GuestReport) Validate() error {
 }
 
 func (g GuestReport) validateTimes() error {
-	first, last := g.FirstReceived, g.LastReceived
+	// THE WALL CLOCK IN UTC, which is all the wire and the ledger keep: a
+	// monotonic reading would order two times a clock step had reversed, and
+	// the report would then be kept in-process and refused once it crossed the
+	// wire.
+	first, last := g.FirstReceived.UTC().Round(0), g.LastReceived.UTC().Round(0)
 	if first.IsZero() && last.IsZero() {
 		return nil
 	}
@@ -109,7 +113,7 @@ func (g GuestReport) validateTimes() error {
 	// A YEAR RFC 3339 CAN SPELL, or the wire refuses to encode it and the
 	// ledger to read it back.
 	for _, t := range []time.Time{first, last} {
-		if y := t.UTC().Year(); y < 1 || y > 9999 {
+		if y := t.Year(); y < 1 || y > 9999 {
 			return fmt.Errorf("alloc: a guest report's arrival time is in the year %d", y)
 		}
 	}

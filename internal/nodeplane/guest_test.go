@@ -128,8 +128,10 @@ func TestAGuestReportFromAWireThatDoesNotCarryItIsRefused(t *testing.T) {
 		status  int
 		kept    int
 	}{
-		{nodeapi.VersionGuestReport - 1, http.StatusBadRequest, 0},
-		{nodeapi.VersionGuestReport, http.StatusNoContent, 1},
+		// LITERAL VERSIONS, so moving the constant cannot move the boundary
+		// the fleet already runs: 28 is the last wire without the route.
+		{28, http.StatusBadRequest, 0},
+		{29, http.StatusNoContent, 1},
 	} {
 		store := &fakeStore{}
 		_, base := serve(t, store)
@@ -141,7 +143,7 @@ func TestAGuestReportFromAWireThatDoesNotCarryItIsRefused(t *testing.T) {
 			t.Fatalf("a guest report at wire %d answered %d %+v, want %d", tc.version, status, refusal, tc.status)
 		}
 		if tc.status != http.StatusNoContent {
-			want := fmt.Sprintf("needs wire %d and this node negotiated %d", nodeapi.VersionGuestReport, tc.version)
+			want := fmt.Sprintf("needs wire 29 and this node negotiated %d", tc.version)
 			if refusal.Code != nodeapi.CodeRefused || !strings.Contains(refusal.Message, want) {
 				t.Errorf("at wire %d the refusal is %+v, want %q saying %q", tc.version, refusal,
 					nodeapi.CodeRefused, want)

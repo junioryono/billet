@@ -142,6 +142,21 @@ func TestAGuestReportTheLedgerCannotKeepIsRefusedBeforeItIsWritten(t *testing.T)
 	if _, err := a.LeaseGuestReport(t.Context(), lease.ID); !errors.Is(err, ErrLeaseNotFound) {
 		t.Fatalf("after a refused report, LeaseGuestReport = %v, want ErrLeaseNotFound", err)
 	}
+	// AND REFUSED WITHOUT TOUCHING IT: an allocator with no ledger at all
+	// refuses the same report by its bound, where a refusal from inside the
+	// transaction would first have taken the writer slot.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("refusing an unkeepable report reached the ledger: %v", r)
+			}
+		}()
+		var none Allocator
+		if err := none.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, bad); err == nil ||
+			!strings.Contains(err.Error(), "over the 262144 byte bound") {
+			t.Fatalf("with no ledger, an oversized report = %v, want it refused by its bound", err)
+		}
+	}()
 }
 
 // A ROW THE LEDGER CANNOT READ BACK IS AN ERROR, never a report of nothing and

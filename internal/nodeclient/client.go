@@ -694,6 +694,16 @@ func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch in
 		return nil
 	}
 
+	// IN UTC ON THE WIRE: JSON spells a time in its own zone, so an instant a
+	// zone carries past the year 9999 would not encode, and an offset with
+	// seconds in it would lose them. The caller's report is not changed.
+	if !report.FirstReceived.IsZero() {
+		report.FirstReceived = report.FirstReceived.UTC()
+	}
+	if !report.LastReceived.IsZero() {
+		report.LastReceived = report.LastReceived.UTC()
+	}
+
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
 		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
 }
