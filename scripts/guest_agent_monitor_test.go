@@ -39,6 +39,17 @@ const (
 func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 	t.Parallel()
 
+	// THE GUEST'S BASH IS 5.2, whose EPOCHREALTIME both the stop block's deadline
+	// and this test's clock read. An older bash on PATH (macOS ships 3.2) runs the
+	// block's poll-count backstop instead, which these bounds do not describe.
+	clock, err := exec.CommandContext(t.Context(), "bash", "-c", `printf '%s' "${EPOCHREALTIME:-}"`).Output()
+	if err != nil {
+		t.Fatalf("ask bash for its clock: %v", err)
+	}
+	if len(clock) == 0 {
+		t.Skip("the bash on PATH has no EPOCHREALTIME; the guest's bash 5.2 does")
+	}
+
 	startBlock := agentBlock(t, "BILLET_GUEST_MONITOR_START")
 	hookBlock := agentBlock(t, "BILLET_GUEST_MONITOR_HOOK")
 	tail := monitorStopTail(t)
@@ -59,15 +70,16 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 	)
 
 	for _, tc := range []struct {
-		name      string
-		key       string // the fetch stub's answer for guest-monitor: a value, "absent" or "unreadable"
-		endpoint  string
-		token     string
-		mode      monitorMode
-		notExec   bool // the guest's billet is not executable
-		noHook    bool // the image carries no hook script
-		jobStatus int
-		started   bool
+		name       string
+		key        string // the fetch stub's answer for guest-monitor: a value, "absent" or "unreadable"
+		endpoint   string
+		token      string
+		mode       monitorMode
+		notExec    bool // the guest's billet is not executable
+		noHook     bool // the image carries no hook script
+		sleepFails bool // the agent's sleep fails while it waits
+		jobStatus  int
+		started    bool
 		// The seconds the agent spends in its stop block.
 		atLeast, atMost float64
 		flushed         bool // the monitor's final batch was finished before the helper ran
@@ -83,6 +95,10 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 		{name: "asked, but the image carries no hook", key: "1", endpoint: endpoint, token: token,
 			mode: monitorFlushes, noHook: true, jobStatus: 0, started: true, atLeast: 0.9, atMost: 2.5,
 			flushed: true},
+		// A FAILED SLEEP UNDER set -e would otherwise end the agent before the image
+		// store is settled; it ends the wait instead, and the monitor is killed.
+		{name: "asked, and the agent's sleep fails", key: "1", endpoint: endpoint, token: token,
+			mode: monitorFlushes, sleepFails: true, jobStatus: 3, started: true, atMost: 1},
 		{name: "not asked", key: "absent", endpoint: endpoint, token: token, jobStatus: 0, atMost: 1},
 		{name: "the key could not be read", key: "unreadable", endpoint: endpoint, token: token,
 			jobStatus: 3, atMost: 1},
@@ -124,6 +140,18 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 			}
 
 			fakes := writeFakeServiceManagers(t)
+			if tc.sleepFails {
+				sleep := filepath.Join(fakes, "sleep")
+				if err := forkSafeWriteFile(sleep, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				// RUN ONCE BEFORE IT IS TIMED: the first exec of a freshly written file
+				// can take seconds on a Mac, which would read as the agent waiting.
+				var exit *exec.ExitError
+				if err := exec.CommandContext(t.Context(), sleep).Run(); !errors.As(err, &exit) {
+					t.Fatalf("the failing sleep did not fail: %v", err)
+				}
+			}
 			// EVERY ARGUMENT THE START BLOCK'S `env` RECEIVES, before the real one
 			// runs, so a value put on its command line is seen.
 			if err := forkSafeWriteFile(filepath.Join(fakes, "env"), []byte("#!/bin/sh\n"+
@@ -171,7 +199,7 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 				`for entry in ${runner_env[@]+"${runner_env[@]}"}; do printf 'env=%s\n' "$entry"; done`,
 				// THE RUNNER RAN FOR A WHILE: the monitor is up before it is stopped.
 				`if [ -n "$guest_monitor_pid" ]; then`,
-				`  for _ in $(seq 1 1500); do if [ -e ` + shellQuote(at("monitor.ready")) + ` ]; then break; fi; sleep 0.01; done`,
+				`  for _ in $(seq 1 1500); do if [ -e ` + shellQuote(at("monitor.ready")) + ` ]; then break; fi; /bin/sleep 0.01; done`,
 				"fi",
 				"job_status=" + strconv.Itoa(tc.jobStatus),
 				`printf 'stop_begin=%s\n' "$EPOCHREALTIME"`,
@@ -272,7 +300,12 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 					t.Error("a monitor that ignored SIGTERM is still running after the agent's tail")
 				}
 			case monitorFlushes:
-				if _, err := os.Stat(at("monitor.terminated")); err != nil {
+				// A wait cut short by a failed sleep kills the monitor before its trap runs.
+				if tc.sleepFails {
+					if !monitorGone(at("monitor.pid")) {
+						t.Error("a monitor the agent stopped waiting for is still running after its tail")
+					}
+				} else if _, err := os.Stat(at("monitor.terminated")); err != nil {
 					t.Errorf("the monitor was never sent SIGTERM: %v", err)
 				}
 			case monitorFails:
@@ -337,10 +370,10 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 		{name: "the monitor answers", body: "exit 0\n"},
 		{name: "no monitor answers", body: "echo 'no monitor answered' >&2\nexit 1\n"},
 		{name: "the binary talks", body: "echo out\necho err >&2\nexit 0\n"},
-		// timeout -k 1 3 ends it at 4 s; the margin is the first exec of two freshly
-		// written files, which a loaded Mac can take seconds over.
+		// timeout -k 1 3 ends it at 4 s. The stand-in is run once before it is timed,
+		// because the first exec of a freshly written file can take seconds on a Mac.
 		{name: "the binary hangs through SIGTERM",
-			body: "trap '' TERM\nwhile :; do /bin/sleep 0.05; done\n", atMost: 7 * time.Second},
+			body: "trap '' TERM\nwhile :; do /bin/sleep 0.05; done\n", atMost: 5 * time.Second},
 		{name: "there is no binary"},
 	} {
 		for _, shell := range [][]string{{"sh"}, {"bash", "-e"}} {
@@ -351,9 +384,13 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 				billet := filepath.Join(dir, "billet")
 				argv := filepath.Join(dir, "argv")
 				if tc.body != "" {
-					body := "#!/bin/sh\nprintf '%s\\n' \"$@\" >" + shellQuote(argv) + "\n" + tc.body
+					body := "#!/bin/sh\nif [ \"${1-}\" = warm ]; then exit 0; fi\n" +
+						"printf '%s\\n' \"$@\" >" + shellQuote(argv) + "\n" + tc.body
 					if err := forkSafeWriteFile(billet, []byte(body), 0o755); err != nil {
 						t.Fatal(err)
+					}
+					if err := exec.CommandContext(t.Context(), billet, "warm").Run(); err != nil {
+						t.Fatalf("run the stand-in once before timing it: %v", err)
 					}
 				}
 				hook := filepath.Join(dir, "job-completed-hook.sh")
@@ -441,17 +478,24 @@ func TestThePublicationGateRefusesAJobCompletedHookThatIsNotThisTrees(t *testing
 				}
 			}
 
-			script := "set -euo pipefail\n" +
-				"pass() { echo \"PASS $*\"; }\nfail() { echo \"FAIL $*\"; }\n" +
-				"MNT=" + shellQuote(mnt) + "\n" + block + "\nfi\n"
+			// THE GATE'S OWN VERDICT: fail() sets FAILED, as the real one does, and
+			// the run says which it was, so a block that said nothing is no verdict.
+			script := "set -euo pipefail\nFAILED=0\n" +
+				"pass() { echo \"PASS $*\"; }\nfail() { echo \"FAIL $*\"; FAILED=1; }\n" +
+				"MNT=" + shellQuote(mnt) + "\n" + block + "\nfi\n" + `echo "FAILED=$FAILED"` + "\n"
 			cmd := exec.CommandContext(t.Context(), "bash", "-c", script)
 			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "JOB_COMPLETED_HOOK_SOURCE=" + source}
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("the gate block did not run: %v\n%s", err, out)
 			}
-			if got := strings.HasPrefix(string(out), "PASS "); got != tc.pass {
-				t.Errorf("the gate said %q, want pass=%v", out, tc.pass)
+			want := "FAIL no executable /usr/local/lib/billet/job-completed-hook.sh identical to"
+			verdict := "FAILED=1\n"
+			if tc.pass {
+				want, verdict = "PASS the job-completed hook asks the guest monitor", "FAILED=0\n"
+			}
+			if !strings.HasPrefix(string(out), want) || !strings.HasSuffix(string(out), verdict) {
+				t.Errorf("the gate said %q, want it to begin %q and end %q", out, want, verdict)
 			}
 		})
 	}

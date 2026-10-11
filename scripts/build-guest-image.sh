@@ -1894,7 +1894,8 @@ if [ -n "$guest_monitor_pid" ] && guest_monitor_running; then
 		if [ "${guest_monitor_now//[!0-9]/}" -ge "$guest_monitor_deadline" ]; then
 			break
 		fi
-		sleep 0.05
+		# A SLEEP THAT FAILED ENDS THE WAIT, not the agent: set -e is back on here.
+		sleep 0.05 || break
 		guest_monitor_polls=$((guest_monitor_polls + 1))
 	done
 	if guest_monitor_running; then
