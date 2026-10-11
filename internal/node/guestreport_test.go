@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -755,9 +756,50 @@ func TestAKeptBatchHoldsAboutWhatItIsCharged(t *testing.T) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if len(g.batches) != 1 || cap(g.batches[0]) >= 2*len(data) {
+	if len(g.batches) != 1 || cap(g.batches[0]) != len(data) {
 		t.Fatalf("the session keeps %d batches, the first holding %d bytes for %d charged",
 			len(g.batches), cap(g.batches[0]), len(data))
+	}
+}
+
+// WHAT A DECODED BATCH IS CHARGED IS NEVER LESS THAN WHAT ITS TYPES TAKE, as the
+// compiler lays them out: the batch itself (twice, for the array it is kept in),
+// each sample, process sample, row, step mark, suite and failed name, besides
+// their text. Measured here rather than restated, so a field added to the schema
+// that the charge forgets fails this.
+func TestADecodedBatchIsChargedAtLeastWhatItsTypesTake(t *testing.T) {
+	t.Parallel()
+
+	size := func(v any) int { return int(reflect.TypeOf(v).Size()) }
+
+	for name, tc := range map[string]struct{ charged, measured int }{
+		"batch":          {batchBytes, 2 * size(guestreport.Batch{})},
+		"sample":         {sampleBytes, size(guestreport.Sample{})},
+		"process sample": {processSampleBytes, size(guestreport.ProcessSample{})},
+		"process row":    {processRowBytes, size(guestreport.ProcessRow{})},
+		"step mark":      {stepBytes, size(guestreport.StepMark{})},
+		"suite":          {suiteBytes, size(guestreport.SuiteResult{})},
+		"failed name":    {failedNameBytes, size("")},
+	} {
+		if tc.charged < tc.measured {
+			t.Errorf("a %s is charged %d bytes and takes %d", name, tc.charged, tc.measured)
+		}
+	}
+
+	b := guestreport.Batch{
+		AgentVersion: "v1",
+		Samples:      make([]guestreport.Sample, 3),
+		Processes:    []guestreport.ProcessSample{{Rows: []guestreport.ProcessRow{{Name: "go"}, {Name: "node"}}}},
+		Steps:        []guestreport.StepMark{{Name: "Build"}},
+		Tests:        []guestreport.SuiteResult{{Name: "unit", Failed: []string{"TestA", "TestBB"}}},
+	}
+
+	want := 2*size(guestreport.Batch{}) + len("v1") + 3*size(guestreport.Sample{}) +
+		size(guestreport.ProcessSample{}) + 2*size(guestreport.ProcessRow{}) + len("go") + len("node") +
+		size(guestreport.StepMark{}) + len("Build") +
+		size(guestreport.SuiteResult{}) + len("unit") + 2*size("") + len("TestA") + len("TestBB")
+	if got := decodedSize(&b); got < want {
+		t.Errorf("a batch is charged %d bytes decoded and takes at least %d", got, want)
 	}
 }
 

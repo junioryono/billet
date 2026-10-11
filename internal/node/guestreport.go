@@ -1,7 +1,6 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -291,8 +290,12 @@ func (s *CacheService) acceptGuestBatch(w http.ResponseWriter, r *http.Request, 
 
 	// A COPY OF ITS OWN LENGTH: the read's buffer is at least 512 bytes whatever
 	// arrived, so many small batches would hold several times what the budget
-	// counts.
-	g.batches = append(g.batches, bytes.Clone(body))
+	// counts. What is left is the allocator's rounding to its next size, a few
+	// bytes a batch for a small one and at most an eighth for a large one, and
+	// the bucket admits one batch every five seconds.
+	kept := make([]byte, len(body))
+	copy(kept, body)
+	g.batches = append(g.batches, kept)
 	g.kept += int64(len(body))
 	g.accepted++
 
@@ -408,7 +411,11 @@ func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.Gues
 		return fmt.Errorf("node: no decode slot came free for the guest's report: %w", ctx.Err())
 	}
 
-	decoded := make([]guestreport.Batch, 0, len(batches))
+	// GROWN AS THE BATCHES ARE KEPT, never sized for every encoding: the batches
+	// past the bound are never decoded, and an array allocated for them would hold
+	// what the bound left out.
+	var decoded []guestreport.Batch
+
 	held := 0
 
 	var past int64
@@ -456,8 +463,10 @@ func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.Gues
 
 // The bytes one decoded element holds at least: its fixed fields (eight bytes a
 // number, sixteen a string's header, twenty-four a slice's), its text counted
-// apart.
+// apart. A batch is charged twice its own, for its place in an array that grows
+// by doubling.
 const (
+	batchBytes         = 2 * (8 + 16 + 8 + 8 + 4*24)
 	sampleBytes        = 10 * 8
 	processSampleBytes = 8 + 24 + 5*8 + 8
 	processRowBytes    = 16 + 5*8
@@ -469,7 +478,7 @@ const (
 // decodedSize is about what b holds in memory once decoded: its fixed fields and
 // its text, without the allocator's own overhead.
 func decodedSize(b *guestreport.Batch) int {
-	n := len(b.AgentVersion) + len(b.Samples)*sampleBytes
+	n := batchBytes + len(b.AgentVersion) + len(b.Samples)*sampleBytes
 
 	for _, p := range b.Processes {
 		n += processSampleBytes + len(p.Rows)*processRowBytes
