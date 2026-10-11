@@ -48,13 +48,13 @@ step 5     "Post Run actions/checkout@v5" "success", started 2026-10-09T12:02:47
            partial: the series covers 500ms of the step's 1s; cpu, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 0.0s, peak memory 381.3 MiB, disk read 0 B, written 0 B, network received 0 B, sent 0 B, energy 0.5 J active
 step 6     "Complete job" "success", started 2026-10-09T12:02:48Z, took 0s (start and end in the same second), so no usage can be placed in it
 
-guest      partial: the agent's last batch did not arrive, so the report ends before the job did; 1 of the agent's batches between its first and last never arrived
+guest      partial: the node has no record of accepting the agent's last batch, so the report may end before the job did; 1 of the agent's batches between its first and last never arrived
            Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.
 node       epyc-1
 agent      "0.15.1", schema 1
 hello      seen
 batches    13 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)
-final      did not arrive
+final      no record of accepting it
 restart    none while the job ran
 received   first 2026-10-09T12:00:10.600Z, last 2026-10-09T12:02:20.600Z, on the node's clock
 encoded    6.7 KiB, codec 1
@@ -74,7 +74,7 @@ marks      Each mark is the runner's log line for a step's start, stamped by the
 mark 1     "Run actions/checkout@v5" at 2026-10-09T12:00:03Z on the guest's clock, step 2, GitHub's start 2026-10-09T12:00:04Z, mark minus GitHub's start -1s
 mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3, GitHub's start 2026-10-09T12:00:19Z, mark minus GitHub's start -1s
 mark 3     "Test" at 2026-10-09T12:01:30Z on the guest's clock, step 4, GitHub's start 2026-10-09T12:01:31Z, mark minus GitHub's start -1s
-processes  Each process sample covers the 2s before it and is placed in the step it ended in, so a step's edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch between the agent's first and last is in the report (1 never arrived, 0 refused by the merge), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.
+processes  Each process sample covers the 2s before it and is placed in the step it ended in, so a step's edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch is in the report (1 never arrived between its first and last, and 0 the node accepted are not in it), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.
 before     the first mark, 1 process sample, ending 2026-10-09T12:00:01.750Z to 2026-10-09T12:00:01.750Z on the guest's clock
              "Runner.Worker" x1: cpu 0.4s, peak rss 180.0 MiB, read 0 B, written 1.0 MiB
              "bash" x1: cpu 0.1s, peak rss 4.0 MiB, read 0 B, written 0 B
@@ -104,19 +104,19 @@ step 4     "Test", 25 process samples, ending 2026-10-09T12:01:31.750Z to 2026-1
              "billet" x1: cpu 0.2s, peak rss 14.0 MiB, read 0 B, written 0 B
              every other process (0 more names, and those past the agent's own cut): cpu 0.5s, read 0 B, written 0 B
              cpu no live process was charged with (processes that exited inside an interval): 0.8s
-tests      could not tell: the agent sends its test results in its last batch, which did not arrive
+tests      could not tell: the agent sends its test results in its last batch, and the node has no record of accepting it
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>
 <p class="unverified">Reported by the job&#39;s own VM. The job runs as root there and can change any of it; billet does not act on it.</p>
-<p class="why">partial: the agent&#39;s last batch did not arrive, so the report ends before the job did; 1 of the agent&#39;s batches between its first and last never arrived</p>
+<p class="why">partial: the node has no record of accepting the agent&#39;s last batch, so the report may end before the job did; 1 of the agent&#39;s batches between its first and last never arrived</p>
 <h3>The channel, as the node counted it</h3>
 <dl class="fields">
 <dt>node</dt><dd>epyc-1</dd>
 <dt>agent</dt><dd>&#34;0.15.1&#34;, schema 1</dd>
 <dt>hello</dt><dd>seen</dd>
 <dt>batches</dt><dd>13 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)</dd>
-<dt>final</dt><dd>did not arrive</dd>
+<dt>final</dt><dd>no record of accepting it</dd>
 <dt>restart</dt><dd>none while the job ran</dd>
 <dt>received</dt><dd>first 2026-10-09T12:00:10.600Z, last 2026-10-09T12:02:20.600Z, on the node&#39;s clock</dd>
 <dt>encoded</dt><dd>6.7 KiB, codec 1</dd>
@@ -175,7 +175,7 @@ tests      could not tell: the agent sends its test results in its last batch, w
 </table>
 </div>
 <h3>Processes by step</h3>
-<p class="note">Each process sample covers the 2s before it and is placed in the step it ended in, so a step&#39;s edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch between the agent&#39;s first and last is in the report (1 never arrived, 0 refused by the merge), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.</p>
+<p class="note">Each process sample covers the 2s before it and is placed in the step it ended in, so a step&#39;s edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch is in the report (1 never arrived between its first and last, and 0 the node accepted are not in it), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.</p>
 <div class="scroll">
 <table>
 <thead><tr><th>Process</th><th>Most at once</th><th>CPU</th><th>Peak RSS</th><th>Read</th><th>Written</th></tr></thead>
@@ -219,5 +219,5 @@ tests      could not tell: the agent sends its test results in its last batch, w
 </table>
 </div>
 <h3>Test results</h3>
-<p class="why">could not tell: the agent sends its test results in its last batch, which did not arrive</p>
+<p class="why">could not tell: the agent sends its test results in its last batch, and the node has no record of accepting it</p>
 

@@ -135,6 +135,9 @@ func judgeGuest(row alloc.RecordedGuestReport) *jobGuest {
 	if r.Missing > 0 {
 		missing = fmt.Sprintf("; %d of the agent's batches between its first and last never arrived", r.Missing)
 	}
+	// WHAT THE NODE RECORDED, NEVER WHAT THE AGENT DID: a last batch the node
+	// refused, or accepted before a restart, leaves no record of it, so its
+	// absence says the node did not accept it, not that it never arrived.
 	switch {
 	case row.NodeRestarted:
 		g.verdict = guestNodeRestarted
@@ -142,20 +145,22 @@ func judgeGuest(row alloc.RecordedGuestReport) *jobGuest {
 			"were lost and the report starts after the restart"
 		switch {
 		case !row.FinalSeen:
-			g.why += "; the agent's last batch did not arrive either, so it ends before the job did"
+			g.why += "; the node has no record of accepting the agent's last batch either, so the report may " +
+				"end before the job did"
 		case !whole:
 			g.why += "; and " + notKept
 		}
 	case !row.FinalSeen:
 		g.verdict = guestPartial
-		g.why = "partial: the agent's last batch did not arrive, so the report ends before the job did"
+		g.why = "partial: the node has no record of accepting the agent's last batch, so the report may end " +
+			"before the job did"
 	case !whole:
 		g.verdict = guestPartial
-		g.why = "partial: the agent's last batch arrived, but " + notKept
+		g.why = "partial: the node accepted the agent's last batch, but " + notKept
 	default:
 		g.verdict = guestComplete
-		g.why = "complete: the agent's last batch arrived, the report holds every batch the node accepted, " +
-			"and the node did not restart while the job ran"
+		g.why = "complete: the node accepted the agent's last batch, the report holds every batch the node " +
+			"accepted, and the node did not restart while the job ran"
 	}
 	g.why += missing
 
@@ -252,7 +257,7 @@ func guestViewOf(g *jobGuest, measured *alloc.RecordedUsage, steps jobSteps) gue
 	if steps.none == "" && steps.err == nil {
 		listed = steps.job.Steps
 	}
-	v.Steps = guestSteps(r, listed)
+	v.Steps = guestSteps(r, listed, lostBatches(g.row, r))
 	v.Tests = guestTests(r, g.row.FinalSeen, g.finalKept)
 
 	return v
@@ -269,9 +274,9 @@ func guestChannel(row alloc.RecordedGuestReport) []pageField {
 	if row.Hello {
 		hello = "seen"
 	}
-	final := "did not arrive"
+	final := "no record of accepting it"
 	if row.FinalSeen {
-		final = "arrived"
+		final = "accepted"
 	}
 	restart := "none while the job ran"
 	if row.NodeRestarted {
@@ -459,8 +464,9 @@ func guestAgent(row alloc.RecordedGuestReport, r *guestreport.Report) []pageFiel
 }
 
 // guestSteps is the guest's step marks matched to GitHub's steps, and its
-// processes placed in the steps the marks begin.
-func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
+// processes placed in the steps the marks begin. lost names the batches the
+// report lacks, which may have taken marks with them.
+func guestSteps(r *guestreport.Report, listed []github.JobStep, lost string) guestStepsView {
 	var out guestStepsView
 	matched := matchMarks(r.Steps, listed)
 
@@ -502,10 +508,9 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 		"the busiest %d names of each are shown and the rest summed.", interval, guestTopProcesses)
 	// A MARK IS LOST WITH ITS BATCH, and the processes after it then fall to the
 	// mark before: no group can then be said to hold one step's alone.
-	if len(r.Steps) > 0 && (r.Missing > 0 || r.Refused > 0) {
-		out.ProcsNote += fmt.Sprintf(" Not every batch between the agent's first and last is in the report "+
-			"(%d never arrived, %d refused by the merge), and a step mark in one of them is lost with it, so a "+
-			"group may also hold processes of steps that came after its own.", r.Missing, r.Refused)
+	if len(r.Steps) > 0 && lost != "" {
+		out.ProcsNote += " Not every batch is in the report (" + lost + "), and a step mark in one of them " +
+			"is lost with it, so a group may also hold processes of steps that came after its own."
 	}
 
 	buckets := make([][]guestreport.ProcessSample, len(r.Steps)+1)
@@ -543,6 +548,24 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 	}
 
 	return out
+}
+
+// lostBatches says which of the agent's batches the report lacks, or "" when it
+// lacks none it can count: those between its first and last that never arrived,
+// and those the node accepted and the report does not hold (refused by the
+// merge, or dropped past what the node assembles, before the merge saw them).
+func lostBatches(row alloc.RecordedGuestReport, r *guestreport.Report) string {
+	notIn := row.Accepted - r.Batches - r.Duplicates
+	switch {
+	case notIn < 0:
+		return fmt.Sprintf("%d never arrived between its first and last, and the node's count of the batches "+
+			"it accepted is below the report's", r.Missing)
+	case r.Missing > 0 || notIn > 0:
+		return fmt.Sprintf("%d never arrived between its first and last, and %d the node accepted are not in "+
+			"it", r.Missing, notIn)
+	}
+
+	return ""
 }
 
 // matchMarks is, for each mark, the index of the GitHub step it names, or -1:
@@ -631,16 +654,17 @@ func fillProcs(group *guestStepProcs, samples []guestreport.ProcessSample, ticks
 }
 
 // guestTests is the test results the agent found. They come in its last batch:
-// finalSeen says the node saw it arrive, and finalKept that the report is shown
-// to hold it.
+// finalSeen says the node accepted it, and finalKept that the report is shown to
+// hold it.
 func guestTests(r *guestreport.Report, finalSeen, finalKept bool) guestTestsView {
 	var out guestTestsView
 	switch {
 	case len(r.Tests) == 0 && !finalSeen:
-		out.Why = "could not tell: the agent sends its test results in its last batch, which did not arrive"
+		out.Why = "could not tell: the agent sends its test results in its last batch, and the node has no " +
+			"record of accepting it"
 	case len(r.Tests) == 0 && !finalKept:
-		out.Why = "could not tell: the agent sends its test results in its last batch, which arrived, and the " +
-			"report cannot show that it holds that batch"
+		out.Why = "could not tell: the agent sends its test results in its last batch, which the node accepted, " +
+			"and the report cannot show that it holds that batch"
 	case len(r.Tests) == 0:
 		out.Why = "the agent found no test results (it reads the JUnit XML files it finds when the job ends)"
 	}

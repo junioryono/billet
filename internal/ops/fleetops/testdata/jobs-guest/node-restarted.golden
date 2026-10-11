@@ -54,7 +54,7 @@ node       epyc-1
 agent      "0.15.1", schema 1
 hello      not seen
 batches    11 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)
-final      arrived
+final      accepted
 restart    the node restarted while the job ran; what it held before then was lost
 received   first 2026-10-09T12:01:10.600Z, last 2026-10-09T12:02:47.600Z, on the node's clock
 encoded    5.8 KiB, codec 1
@@ -104,7 +104,7 @@ suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
 <dt>agent</dt><dd>&#34;0.15.1&#34;, schema 1</dd>
 <dt>hello</dt><dd>not seen</dd>
 <dt>batches</dt><dd>11 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)</dd>
-<dt>final</dt><dd>arrived</dd>
+<dt>final</dt><dd>accepted</dd>
 <dt>restart</dt><dd>the node restarted while the job ran; what it held before then was lost</dd>
 <dt>received</dt><dd>first 2026-10-09T12:01:10.600Z, last 2026-10-09T12:02:47.600Z, on the node&#39;s clock</dd>
 <dt>encoded</dt><dd>5.8 KiB, codec 1</dd>

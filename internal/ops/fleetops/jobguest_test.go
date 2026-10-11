@@ -227,11 +227,14 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 			"batches    0 accepted, 0 refused",
 		}, absent: []string{guestBanner, "\nskew ", "0 B (MemTotal"}},
 		{name: "partial", guest: partialGuest, verdict: "partial", want: []string{
-			"guest      partial: the agent's last batch did not arrive, so the report ends before the job " +
-				"did; 1 of the agent's batches between its first and last never arrived",
+			"guest      partial: the node has no record of accepting the agent's last batch, so the report may " +
+				"end before the job did; 1 of the agent's batches between its first and last never arrived",
 			"sequence   batches 1 to 14: 13 kept, 0 refused by the merge, 1 never arrived (9)",
-			"tests      could not tell: the agent sends its test results in its last batch, which did not arrive",
-			"final      did not arrive", guestBanner,
+			"tests      could not tell: the agent sends its test results in its last batch, and the node has no " +
+				"record of accepting it",
+			"final      no record of accepting it", guestBanner,
+			"Not every batch is in the report (1 never arrived between its first and last, and 0 the node " +
+				"accepted are not in it)",
 		}},
 		{name: "node-restarted", guest: restartedGuest, verdict: "node_restarted", want: []string{
 			"guest      node restarted: the node restarted while the job ran, so the batches it held before " +
@@ -239,8 +242,8 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 			"sequence   batches 7 to 17: 11 kept", "hello      not seen", guestBanner,
 		}},
 		{name: "complete", guest: exampleGuest, verdict: "complete", want: []string{
-			"guest      complete: the agent's last batch arrived, the report holds every batch the node " +
-				"accepted, and the node did not restart while the job ran",
+			"guest      complete: the node accepted the agent's last batch, the report holds every batch the " +
+				"node accepted, and the node did not restart while the job ran",
 			guestBanner,
 			"skew       the node received the last batch 850ms after the guest stamped its last sample",
 			`mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3, GitHub's ` +
@@ -407,14 +410,14 @@ func TestEachGuestRowHasItsVerdict(t *testing.T) {
 		finalKept bool
 	}{
 		{"final dropped in assembly", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 18, Data: data,
-			FinalSeen: true}, guestPartial, "partial: the agent's last batch arrived, but not every batch the " +
+			FinalSeen: true}, guestPartial, "partial: the node accepted the agent's last batch, but not every batch the " +
 			"node accepted is in the report (18 accepted, 17 kept, 0 refused by the merge)", true, false},
-		{"final refused by the merge", *refused, guestPartial, "partial: the agent's last batch arrived, but not " +
+		{"final refused by the merge", *refused, guestPartial, "partial: the node accepted the agent's last batch, but not " +
 			"every batch the node accepted is in the report (17 accepted, 16 kept, 1 refused by the merge)", true,
 			false},
-		{"a middle batch refused by the merge", *middleRefused, guestPartial, "partial: the agent's last batch " +
-			"arrived, but not every batch the node accepted is in the report (17 accepted, 16 kept, 1 refused by " +
-			"the merge)", true, false},
+		{"a middle batch refused by the merge", *middleRefused, guestPartial, "partial: the node accepted the " +
+			"agent's last batch, but not every batch the node accepted is in the report (17 accepted, 16 kept, 1 " +
+			"refused by the merge)", true, false},
 		{"restarted, final arrived, not all kept", alloc.GuestReport{Codec: 1, Accepted: 18, Data: data,
 			FinalSeen: true, NodeRestarted: true}, guestNodeRestarted, "the report starts after the restart; and " +
 			"not every batch the node accepted is in the report", true, false},
@@ -431,16 +434,16 @@ func TestEachGuestRowHasItsVerdict(t *testing.T) {
 		{"garbage", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 4, Data: []byte("not deflate")},
 			guestUndecodable, "the report could not be decoded (guestreport: ", false, false},
 		{"restarted and partial", alloc.GuestReport{Codec: 1, Accepted: 17, Data: data, NodeRestarted: true},
-			guestNodeRestarted, "the report starts after the restart; the agent's last batch did not arrive " +
-				"either", true, false},
+			guestNodeRestarted, "the report starts after the restart; the node has no record of accepting the " +
+				"agent's last batch either", true, false},
 		{"partial", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 17, Data: data}, guestPartial,
-			"partial: the agent's last batch did not arrive", true, false},
+			"partial: the node has no record of accepting the agent's last batch", true, false},
 		{"no hello", alloc.GuestReport{Codec: 1, Accepted: 17, Data: data, FinalSeen: true}, guestComplete,
 			"complete: ", true, true},
 		{"a batch received twice", alloc.GuestReport{Codec: 1, Accepted: 17, Data: duplicated(t), FinalSeen: true},
 			guestComplete, "complete: ", true, true},
-		{"complete", *whole, guestComplete, "complete: the agent's last batch arrived, the report holds every " +
-			"batch the node accepted, and the node did not restart while the job ran", true, true},
+		{"complete", *whole, guestComplete, "complete: the node accepted the agent's last batch, the report " +
+			"holds every batch the node accepted, and the node did not restart while the job ran", true, true},
 	} {
 		g := judgeGuest(recorded(&tc.row))
 		if g.verdict != tc.verdict || !strings.Contains(g.why, tc.why) || (g.report != nil) != tc.report ||
@@ -462,7 +465,8 @@ func TestEachGuestRowHasItsVerdict(t *testing.T) {
 			t.Errorf("%s: the tests of a report without its last batch say %q", tc.name, v.Tests.Why)
 		}
 		if tc.report && tc.row.FinalSeen && !tc.finalKept && len(g.report.Tests) == 0 &&
-			!strings.Contains(v.Tests.Why, "which arrived, and the report cannot show that it holds that batch") {
+			!strings.Contains(v.Tests.Why, "which the node accepted, and the report cannot show that it holds "+
+				"that batch") {
 			t.Errorf("%s: the tests of a report without its last batch say %q", tc.name, v.Tests.Why)
 		}
 	}
@@ -570,9 +574,9 @@ func TestGuestStringsAreEscapedAndQuoted(t *testing.T) {
 }
 
 // THE TEST RESULTS SAY WHICH SILENCE THEY ARE: none found when the report holds
-// the last batch, which carries them; could not tell when it did not arrive, and
-// could not tell, saying so, when it arrived and the report cannot show it holds
-// it.
+// the last batch, which carries them; could not tell when the node has no record
+// of accepting it, and could not tell, saying so, when it accepted it and the
+// report cannot show it holds it.
 func TestGuestTestResultsSayWhichSilenceTheyAre(t *testing.T) {
 	t.Parallel()
 
@@ -580,11 +584,12 @@ func TestGuestTestResultsSayWhichSilenceTheyAre(t *testing.T) {
 	if got := guestTests(r, true, true).Why; !strings.HasPrefix(got, "the agent found no test results") {
 		t.Errorf("final kept, no suites: %q", got)
 	}
-	if got := guestTests(r, false, false).Why; !strings.HasSuffix(got, "in its last batch, which did not arrive") {
+	if got := guestTests(r, false, false).Why; !strings.HasSuffix(got, "in its last batch, and the node has no "+
+		"record of accepting it") {
 		t.Errorf("final not seen, no suites: %q", got)
 	}
-	if got := guestTests(r, true, false).Why; !strings.HasSuffix(got, "which arrived, and the report cannot "+
-		"show that it holds that batch") {
+	if got := guestTests(r, true, false).Why; !strings.HasSuffix(got, "which the node accepted, and the report "+
+		"cannot show that it holds that batch") {
 		t.Errorf("final seen and not shown kept, no suites: %q", got)
 	}
 	r.Tests = []guestreport.SuiteResult{{Name: "s", Tests: 1}}
@@ -674,7 +679,7 @@ func TestGuestProcessesArePlacedInTheStepTheyEndedIn(t *testing.T) {
 			sample(9_000, "early"), sample(10_000, "p1", "p2", "p3", "p4", "p5", "p6", "p7"),
 			sample(19_999, "p1"), sample(20_000, "late"),
 		}}
-	got := guestSteps(r, []github.JobStep{{Number: 4, Name: "a"}})
+	got := guestSteps(r, []github.JobStep{{Number: 4, Name: "a"}}, "")
 	if len(got.Procs) != 3 {
 		t.Fatalf("groups = %+v", got.Procs)
 	}
@@ -699,23 +704,23 @@ func TestGuestProcessesArePlacedInTheStepTheyEndedIn(t *testing.T) {
 	// MARKS DROPPED PAST THE BOUND leave the last group's end open: its processes
 	// may belong to the steps those marks began.
 	r.Dropped.Steps = 3
-	if last := guestSteps(r, nil).Procs[2]; !strings.HasSuffix(last.Name, ", and whatever came after it: 3 "+
+	if last := guestSteps(r, nil, "").Procs[2]; !strings.HasSuffix(last.Name, ", and whatever came after it: 3 "+
 		"later marks were left out past the report's bound") {
 		t.Errorf("the last group after dropped marks is named %q", last.Name)
 	}
-	if first := guestSteps(r, nil).Procs[1]; strings.Contains(first.Name, "whatever came after") {
+	if first := guestSteps(r, nil, "").Procs[1]; strings.Contains(first.Name, "whatever came after") {
 		t.Errorf("a group before the last is named %q", first.Name)
 	}
 	r.Dropped.Steps = 0
 
 	r.Steps = nil
-	whole := guestSteps(r, nil)
+	whole := guestSteps(r, nil, "")
 	if whole.MarksWhy == "" || len(whole.Procs) != 1 || whole.Procs[0].Label != "whole" {
 		t.Errorf("with no marks: %+v", whole)
 	}
 	r.Steps = []guestreport.StepMark{{Name: "a", AtSeconds: 10}, {Name: "b", AtSeconds: 10}}
 	r.Processes = nil
-	if got := guestSteps(r, nil); got.ProcsWhy == "" || len(got.Procs) != 0 {
+	if got := guestSteps(r, nil, ""); got.ProcsWhy == "" || len(got.Procs) != 0 {
 		t.Errorf("with no process samples: %+v", got)
 	}
 }
@@ -727,7 +732,7 @@ func TestAMarkWithNoProcessSampleSaysSo(t *testing.T) {
 	r := &guestreport.Report{TicksPerSecond: 100, Stride: 1,
 		Steps:     []guestreport.StepMark{{Name: "a", AtSeconds: 10}, {Name: "b", AtSeconds: 10}},
 		Processes: []guestreport.ProcessSample{{AtMillis: 11_000}}}
-	got := guestSteps(r, nil).Procs
+	got := guestSteps(r, nil, "").Procs
 	if len(got) != 2 || got[0].Samples != "no process sample ended inside it" || got[0].Rest != "" {
 		t.Errorf("groups = %+v", got)
 	}
@@ -1020,9 +1025,29 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	}
 	listed := []github.JobStep{{Number: 3, Name: "Build"}, {Number: 4, Name: "Test"}}
 	v := guestViewOf(g, nil, jobSteps{job: github.WorkflowJob{Steps: listed}}).Steps
-	if !strings.Contains(v.ProcsNote, "(0 never arrived, 1 refused by the merge), and a step mark in one of "+
-		"them is lost with it, so a group may also hold processes of steps that came after its own") {
+	if !strings.Contains(v.ProcsNote, "Not every batch is in the report (0 never arrived between its first and "+
+		"last, and 1 the node accepted are not in it), and a step mark in one of them is lost with it, so a "+
+		"group may also hold processes of steps that came after its own") {
 		t.Errorf("the section does not qualify where processes are placed: %q", v.ProcsNote)
+	}
+
+	// AN ACCEPTED BATCH THE NODE DROPPED BEFORE THE MERGE leaves the merge's
+	// counts at zero and still qualifies the placement: the report holds 17
+	// batches of the 18 the node accepted.
+	dropped := *exampleGuest(t)
+	dropped.Accepted = 18
+	note := guestViewOf(judgeGuest(recorded(&dropped)), nil, jobSteps{none: "none"}).Steps.ProcsNote
+	if !strings.Contains(note, "(0 never arrived between its first and last, and 1 the node accepted are not "+
+		"in it)") {
+		t.Errorf("a batch dropped before the merge does not qualify where processes are placed: %q", note)
+	}
+	// A NODE THAT COUNTS FEWER THAN THE REPORT HOLDS is said to disagree, never a
+	// negative count.
+	under := *exampleGuest(t)
+	under.Accepted = 16
+	if note := guestViewOf(judgeGuest(recorded(&under)), nil, jobSteps{none: "none"}).Steps.ProcsNote; !strings.Contains(note,
+		"the node's count of the batches it accepted is below the report's") || strings.Contains(note, "-1") {
+		t.Errorf("a node count below the report's: %q", note)
 	}
 	var build *guestStepProcs
 	for i := range v.Procs {

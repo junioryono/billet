@@ -48,13 +48,13 @@ step 5     "Post Run actions/checkout@v5" "success", started 2026-10-09T12:02:47
            partial: the series covers 500ms of the step's 1s; cpu, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 0.0s, peak memory 381.3 MiB, disk read 0 B, written 0 B, network received 0 B, sent 0 B, energy 0.5 J active
 step 6     "Complete job" "success", started 2026-10-09T12:02:48Z, took 0s (start and end in the same second), so no usage can be placed in it
 
-guest      complete: the agent's last batch arrived, the report holds every batch the node accepted, and the node did not restart while the job ran
+guest      complete: the node accepted the agent's last batch, the report holds every batch the node accepted, and the node did not restart while the job ran
            Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.
 node       epyc-1
 agent      "0.15.1", schema 1
 hello      seen
 batches    17 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)
-final      arrived
+final      accepted
 restart    none while the job ran
 received   first 2026-10-09T12:00:10.600Z, last 2026-10-09T12:02:47.600Z, on the node's clock
 encoded    8.6 KiB, codec 1
@@ -112,14 +112,14 @@ suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
 <section id="guest">
 <h2>What the job's own VM reported</h2>
 <p class="unverified">Reported by the job&#39;s own VM. The job runs as root there and can change any of it; billet does not act on it.</p>
-<p class="why">complete: the agent&#39;s last batch arrived, the report holds every batch the node accepted, and the node did not restart while the job ran</p>
+<p class="why">complete: the node accepted the agent&#39;s last batch, the report holds every batch the node accepted, and the node did not restart while the job ran</p>
 <h3>The channel, as the node counted it</h3>
 <dl class="fields">
 <dt>node</dt><dd>epyc-1</dd>
 <dt>agent</dt><dd>&#34;0.15.1&#34;, schema 1</dd>
 <dt>hello</dt><dd>seen</dd>
 <dt>batches</dt><dd>17 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)</dd>
-<dt>final</dt><dd>arrived</dd>
+<dt>final</dt><dd>accepted</dd>
 <dt>restart</dt><dd>none while the job ran</dd>
 <dt>received</dt><dd>first 2026-10-09T12:00:10.600Z, last 2026-10-09T12:02:47.600Z, on the node&#39;s clock</dd>
 <dt>encoded</dt><dd>8.6 KiB, codec 1</dd>
