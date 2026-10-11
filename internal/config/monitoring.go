@@ -40,6 +40,11 @@ type NodeMonitoringConfig struct {
 	// unless true; firecracker only, and Linux only, which a node checks at
 	// startup since this file may be validated elsewhere.
 	Perf bool `yaml:"perf,omitempty"`
+	// Guest asks each firecracker guest to start billet's in-VM agent and
+	// accepts what it reports on the guest-facing cache service, keeping it with
+	// the job as the guest's own unverified view. Off unless true; it needs
+	// node.cache, whose listener and per-guest bearer the agent reports through.
+	Guest bool `yaml:"guest,omitempty"`
 }
 
 const (
@@ -115,6 +120,17 @@ func (c *Config) validateMonitoringNode() []error {
 		errs = append(errs, fmt.Errorf("node.monitoring.flows is set but this node's provider is %s, "+
 			"and only a firecracker guest's address is known to the host (from its bridge's DHCP lease)",
 			c.Node.Provider))
+	}
+	// THE AGENT REPORTS THROUGH THE GUEST CACHE SERVICE, with the bearer it mints
+	// per guest, and only a firecracker guest is told to start it; anywhere else
+	// the switch would promise reports that never arrive.
+	if m.Guest && c.Node.Provider != ProviderFirecracker {
+		errs = append(errs, fmt.Errorf("node.monitoring.guest is set but this node's provider is %s, "+
+			"and only a firecracker guest is told to start billet's in-VM agent", c.Node.Provider))
+	}
+	if m.Guest && c.Node.Cache == nil {
+		errs = append(errs, errors.New("node.monitoring.guest is set but node.cache is not, and the "+
+			"in-VM agent reports through the guest cache service node.cache starts"))
 	}
 	if _, err := m.IntervalDuration(); err != nil {
 		errs = append(errs, err)

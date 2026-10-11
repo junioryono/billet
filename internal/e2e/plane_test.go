@@ -374,6 +374,9 @@ type stack struct {
 	// wireAddr is where the node wire is listening, so a test can be a node the
 	// nodeclient in this build cannot be — one that negotiates an older wire.
 	wireAddr string
+	// guestCache is the node's guest cache service, present only on a wire stack
+	// built withGuestReports, so a test can be the guest's agent.
+	guestCache *node.CacheService
 
 	// hurry is the operator's second signal, and the only thing that ends a drain
 	// holding work that never completes — which is what most of these scenarios
@@ -529,6 +532,10 @@ type stackConfig struct {
 	// on it. Only the wire stack carries it, because that is the shape in
 	// which the plane's per-target routing exists.
 	second *secondTarget
+	// guestReports gives the wire stack's node a guest cache service that takes
+	// its guests' own reports (node.monitoring.guest), built as the node command
+	// builds it over a store that holds no volumes.
+	guestReports bool
 }
 
 // secondTarget is a repository target beside the harness's organization.
@@ -842,14 +849,15 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		stopNode   = func() {}
 		wireAddr   string
 		nodeRunner dispatch.Runner
+		guestCache *node.CacheService
 	)
 
 	if sc.wire {
 		first := startFirstNode(t, log, c, nodeProcess{
 			host: host, deployment: deployment, provider: prov, kind: kind,
-			hurry: hurry, drainTimeout: sc.nodeDrainTimeout,
+			hurry: hurry, drainTimeout: sc.nodeDrainTimeout, guestReports: sc.guestReports,
 		})
-		runner, stopNode = first.runner, first.stop
+		runner, stopNode, guestCache = first.runner, first.stop, first.guestCache
 		wire, wireAddr = c.wire.Plane(), c.wire.Addr
 	} else {
 		// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK, and after the fleet was
@@ -877,7 +885,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		dir:   dir, closeDB: c.close, plane: p, second: secondPlane, alloc: a, db: c.ctl.Ledger(),
 		runner: runner, scheduler: scheduler, provider: prov, kind: kind, backend: sc.backend,
 		node: host, tiers: tiers,
-		wire: wire, stopNode: stopNode, wireAddr: wireAddr,
+		wire: wire, stopNode: stopNode, wireAddr: wireAddr, guestCache: guestCache,
 	}
 }
 
@@ -910,16 +918,20 @@ type nodeProcess struct {
 	// hours — fine for every scenario that never reaches it, and useless to one
 	// whose subject is that the number no longer ENDS anything.
 	drainTimeout time.Duration
+	// guestReports gives the node a guest cache service that takes its guests'
+	// own reports; see stackConfig.guestReports.
+	guestReports bool
 }
 
 // nodeLoop is one running node process: its runner, the incarnation it minted,
-// the function that stops it, and a channel closed when its loop has ended —
-// on its own or because it was stopped.
+// the function that stops it, a channel closed when its loop has ended — on its
+// own or because it was stopped — and its guest cache service, if it has one.
 type nodeLoop struct {
 	runner      *node.Runner
 	incarnation string
 	stop        func()
 	done        <-chan struct{}
+	guestCache  *node.CacheService
 }
 
 // startNodeLoop runs one node process against the wire at addr.
@@ -942,7 +954,17 @@ func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) 
 
 	// THE CLIENT IS BOTH LEDGER AND MINT, exactly as `billet node` wires it. The
 	// runner has no idea it became remote.
-	runner := app.NewNodeRunner(nc, np.host, np.provider, log)
+	var (
+		runnerOpts []node.Option
+		guestCache *node.CacheService
+	)
+
+	if np.guestReports {
+		guestCache = guestCacheService(t, np.host, np.deployment, nc)
+		runnerOpts = append(runnerOpts, node.WithCacheService(guestCache))
+	}
+
+	runner := app.NewNodeRunner(nc, np.host, np.provider, log, runnerOpts...)
 
 	loopCtx, cancel := context.WithCancel(t.Context())
 	ctx := loopCtx
@@ -991,7 +1013,8 @@ func startNodeLoop(t *testing.T, log *slog.Logger, addr string, np nodeProcess) 
 
 	t.Cleanup(stopNode)
 
-	return &nodeLoop{runner: runner, incarnation: nc.Incarnation(), stop: stopNode, done: done}
+	return &nodeLoop{runner: runner, incarnation: nc.Incarnation(), stop: stopNode, done: done,
+		guestCache: guestCache}
 }
 
 // run starts the control plane and returns a stop function.

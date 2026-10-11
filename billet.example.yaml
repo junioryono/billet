@@ -468,6 +468,12 @@ node:
   # are scheduled together or not at all, so the node proves at startup that
   # they count on every CPU and refuses perf where they do not; the NMI
   # watchdog holding a counter is the usual reason (kernel.nmi_watchdog=0).
+  # guest (firecracker only, off unless true, and only with node.cache) tells
+  # each guest to start billet's in-VM agent, which reports what it sees from
+  # inside the VM to the guest cache service with the guest's own bearer. The
+  # node keeps at most 2 MiB of it per job, refuses floods, and records it with
+  # the job when the compute is destroyed. It is the guest's own, unverified
+  # view (the job is root there), shown labelled as such and never acted on.
   #
   # monitoring:
   #   interval: 1s
@@ -475,6 +481,7 @@ node:
   #   idle_package_watts: 73.5
   #   flows: true
   #   perf: true
+  #   guest: true
 
   firecracker:
     # The guest kernel must include everything Docker needs, or service

@@ -91,6 +91,10 @@ type CacheService struct {
 	// closed wakes whatever runs RetryClosed when a session is closed with its
 	// volumes still to discard.
 	closed chan struct{}
+	// guestMonitoring serves the guest agent's routes and tells each guest to
+	// start it; guestDecode bounds the batches the node decodes at once.
+	guestMonitoring bool
+	guestDecode     chan struct{}
 }
 
 type cacheSession struct {
@@ -156,9 +160,12 @@ type cacheSession struct {
 	// creating it, so it did not witness the session's whole life and cannot
 	// say what the guest never asked for.
 	recovered bool
-	slots     [provider.MaxVolumes]*cacheAttachment
-	actions   map[string]*actionsArchive
-	receipts  map[string]*actionsReceipt
+	// guest is what the session's guest agent reported, in memory only: a
+	// restart loses it, and recovered says so.
+	guest    guestChannel
+	slots    [provider.MaxVolumes]*cacheAttachment
+	actions  map[string]*actionsArchive
+	receipts map[string]*actionsReceipt
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -300,6 +307,8 @@ func NewCacheService(
 		wait:       sleepFor,
 		now:        time.Now,
 		closed:     make(chan struct{}, 1),
+
+		guestDecode: make(chan struct{}, guestDecodeSlots),
 	}
 	service.remoteAPI = reapi.New(service.openRemoteAPIVolume)
 	service.git = newGitProxy(filepath.Join(stateDir, "git-mirrors"))
@@ -1067,6 +1076,14 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// an origin it was rewritten to.
 	if strings.HasPrefix(r.URL.Path, gitPathPrefix) {
 		s.serveGit(r.Context(), w, r)
+
+		return
+	}
+	// THE GUEST AGENT'S ROUTES ARE NOT ADMITTED ONE AT A TIME with the volume
+	// API, whose Docker store attach holds the slot for minutes; they carry
+	// limits of their own (guestreport.go).
+	if strings.HasPrefix(r.URL.Path, guestPathPrefix) {
+		s.serveGuest(w, r)
 
 		return
 	}
