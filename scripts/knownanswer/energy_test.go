@@ -472,6 +472,10 @@ func TestTheEnergyReportWithoutAMeterIsUnchanged(t *testing.T) {
 			if !bytes.Equal(stdout.Bytes(), want) {
 				t.Errorf("the report:\n%s\nwant %s:\n%s", stdout.String(), golden, want)
 			}
+			// main's energy check writes to stderr only when it cannot run.
+			if stderr.Len() != 0 {
+				t.Errorf("stderr %q, want nothing, as main writes", stderr.String())
+			}
 		})
 	}
 }

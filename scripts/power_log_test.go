@@ -537,22 +537,24 @@ func TestThePowerLogRefusesWhatItCannotMeasure(t *testing.T) {
 		plant bool
 		args  []string
 		says  string
+		// whole is the entire output, where the message must be all it says.
+		whole bool
 	}{
-		{"an unreadable zone", []string{"sleep", "date", "timeout"}, false, nil, "cannot read"},
-		{"a log that exists", []string{"sleep", "date", "timeout"}, true, []string{"--exists"}, "is never appended to"},
+		{"an unreadable zone", []string{"sleep", "date", "timeout"}, false, nil, "cannot read", false},
+		{"a log that exists", []string{"sleep", "date", "timeout"}, true, []string{"--exists"}, "is never appended to", false},
 		{"--require-bmc with no BMC", []string{"sleep", "date", "timeout"}, true,
-			[]string{"--require-bmc", "--ipmitool", "none"}, "--require-bmc and no ipmitool"},
+			[]string{"--require-bmc", "--ipmitool", "none"}, "--require-bmc and no ipmitool", false},
 		{"no timeout to bound ipmitool", []string{"sleep", "date"}, true, nil,
-			"power-log: timeout(1) is required to bound ipmitool\n"},
+			"power-log: timeout(1) is required to bound ipmitool\n", true},
 		{"no timeout to bound the meter", []string{"sleep", "date"}, true, []string{"--meter", "true"},
-			"power-log: timeout(1) is required to bound ipmitool and the meter\n"},
+			"power-log: timeout(1) is required to bound ipmitool and the meter\n", true},
 		{"a fractional interval", []string{"sleep", "date", "timeout"}, true, []string{"--interval", "0.5"},
-			"--interval must be a positive whole number"},
+			"--interval must be a positive whole number", false},
 		// GNU timeout reads a duration of zero as no bound at all.
 		{"a meter bound of zero", []string{"sleep", "date", "timeout"}, true,
-			[]string{"--meter", "true", "--meter-timeout", "0.0"}, "--meter-timeout must be a positive number"},
+			[]string{"--meter", "true", "--meter-timeout", "0.0"}, "--meter-timeout must be a positive number", false},
 		{"a meter bound with a unit", []string{"sleep", "date", "timeout"}, true,
-			[]string{"--meter", "true", "--meter-timeout", "1s"}, "--meter-timeout must be a positive number"},
+			[]string{"--meter", "true", "--meter-timeout", "1s"}, "--meter-timeout must be a positive number", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -576,8 +578,12 @@ func TestThePowerLogRefusesWhatItCannotMeasure(t *testing.T) {
 			}
 			text, err := h.run(t, args...)
 			exit, ok := errors.AsType[*exec.ExitError](err)
-			if !ok || exit.ExitCode() != 2 || !strings.Contains(text, tc.says) {
-				t.Errorf("err %v, want exit 2 saying %q:\n%s", err, tc.says, text)
+			said := strings.Contains(text, tc.says)
+			if tc.whole {
+				said = text == tc.says
+			}
+			if !ok || exit.ExitCode() != 2 || !said {
+				t.Errorf("err %v, want exit 2 saying %q (whole output %v):\n%q", err, tc.says, tc.whole, text)
 			}
 			if tc.name != "a log that exists" {
 				if _, err := os.Stat(out); !os.IsNotExist(err) {
