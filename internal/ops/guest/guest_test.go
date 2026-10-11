@@ -250,7 +250,55 @@ func TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero(t *testing.T) {
 	}
 }
 
-// TestMonitorChild is the monitor's process for the test above, run through the
+// A log whose reader has gone is a write that fails, not a SIGPIPE that ends the
+// monitor: a node with monitoring off is still a stop the monitor answers with 0
+// after logging it to a closed stderr.
+func TestAClosedLogDoesNotEndTheMonitorBySignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the monitor runs on Linux alone")
+	}
+
+	t.Parallel()
+
+	off := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(off.Close)
+
+	dir, err := os.MkdirTemp("/tmp", "billet-guest-") //nolint:usetesting // t.TempDir exceeds the unix socket address limit
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	args, err := json.Marshal([]string{"guest", "monitor", "--socket", filepath.Join(dir, "m.sock"), "--nice", "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMonitorChild$")
+	cmd.Env = append(os.Environ(), childEnv+"="+string(args),
+		"BILLET_CACHE_ENDPOINT="+off.URL, "BILLET_CACHE_TOKEN=child-bearer")
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reader goes away before the monitor writes a line.
+	if err := stderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("with its log closed the monitor exited %v, want 0", err)
+	}
+}
+
+// TestMonitorChild is the monitor's process for the tests above, run through the
 // command line as the binary runs it.
 func TestMonitorChild(t *testing.T) {
 	raw := os.Getenv(childEnv)

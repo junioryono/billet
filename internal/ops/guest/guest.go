@@ -11,7 +11,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/guestagent"
@@ -84,6 +86,11 @@ func monitor(ctx context.Context, env cli.Env, args []string) error {
 	if err := guestagent.Supported(); err != nil {
 		return err
 	}
+
+	// A Go process that does not handle SIGPIPE is killed by it on a write to a
+	// closed pipe at stderr, so a log whose reader went away would end the agent
+	// by a signal, not with the 0 every stop owes. Ignored, the write just fails.
+	signal.Ignore(syscall.SIGPIPE)
 
 	return guestagent.Run(ctx, monitorConfig(env, *proc, *diag, roots, *socket, *nice))
 }
