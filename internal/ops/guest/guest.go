@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/junioryono/billet/internal/cli"
@@ -86,26 +85,32 @@ func monitor(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if len(roots) == 0 {
-		roots = []string{defaultJUnitRoot}
-	}
-
 	if *nice != 0 {
 		if err := guestagent.LowerPriority(*nice); err != nil {
 			fmt.Fprintf(env.Stderr, "billet guest monitor: running at the priority it started with: %v\n", err)
 		}
 	}
 
-	return guestagent.Run(ctx, guestagent.Config{
+	return guestagent.Run(ctx, monitorConfig(env, *proc, *diag, roots, *socket))
+}
+
+// monitorConfig is the agent the flags and the environment describe. /proc is
+// read through guestagent.ProcFS, which never waits on what the job put there.
+func monitorConfig(env cli.Env, proc, diag string, roots []string, socket string) guestagent.Config {
+	if len(roots) == 0 {
+		roots = []string{defaultJUnitRoot}
+	}
+
+	return guestagent.Config{
 		Endpoint:   strings.TrimSpace(env.Getenv(envEndpoint)),
 		Token:      env.Getenv(envToken),
-		Proc:       os.DirFS(*proc),
-		DiagDir:    *diag,
+		Proc:       guestagent.ProcFS(proc),
+		DiagDir:    diag,
 		JUnitRoots: roots,
-		Socket:     *socket,
+		Socket:     socket,
 		Log:        env.Stderr,
 		Version:    version.Version(),
-	})
+	}
 }
 
 // flush is `billet guest flush`: it exits 0 whether or not a monitor answered.

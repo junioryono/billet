@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/guestagent"
 	"github.com/junioryono/billet/internal/guestreport"
 )
 
@@ -289,5 +290,26 @@ func assertNice(t *testing.T, pid, nice int) {
 		if len(fields) < 17 || fields[16] != strconv.Itoa(nice) {
 			t.Errorf("thread %s runs at nice %v, want %d", task.Name(), fields[16:17], nice)
 		}
+	}
+}
+
+// The monitor reads /proc through guestagent.ProcFS, which never waits on a FIFO
+// the job put there, the endpoint and the bearer from the environment alone, and
+// every JUnit root it is given, or the runner's work directory.
+func TestTheMonitorIsTheAgentItsFlagsAndEnvironmentDescribe(t *testing.T) {
+	t.Parallel()
+
+	vars := map[string]string{"BILLET_CACHE_ENDPOINT": " http://172.31.0.1:7718 ", "BILLET_CACHE_TOKEN": "t"}
+	env := cli.Env{Stderr: io.Discard, Getenv: func(k string) string { return vars[k] }}
+
+	cfg := monitorConfig(env, "/guest/proc", "/d", nil, "/s.sock")
+	if cfg.Proc != guestagent.ProcFS("/guest/proc") || cfg.Endpoint != "http://172.31.0.1:7718" ||
+		cfg.Token != "t" || cfg.DiagDir != "/d" || cfg.Socket != "/s.sock" || len(cfg.JUnitRoots) != 1 ||
+		cfg.JUnitRoots[0] != defaultJUnitRoot {
+		t.Fatalf("the monitor's agent is %+v", cfg)
+	}
+
+	if cfg := monitorConfig(env, "/proc", "", []string{"/a", "/b"}, ""); len(cfg.JUnitRoots) != 2 {
+		t.Fatalf("the roots given became %v", cfg.JUnitRoots)
 	}
 }
