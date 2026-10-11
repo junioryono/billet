@@ -1,0 +1,8 @@
+DescribeResponse.found bool
+DescribeResponse.id tag omitempty
+DescribeResponse.id int
+DescribeResponse.name tag omitempty
+DescribeResponse.name string
+DescribeResponse.names tag omitempty
+DescribeResponse.names slice
+DescribeResponse.names[] string

@@ -185,7 +185,7 @@ const (
 	MinVersion = 12
 
 	// Version is the newest wire this build speaks, and the one it prefers.
-	Version = 28
+	Version = 29
 
 	// VersionNodeRelease is the version from which a registration names the
 	// node's release.
@@ -382,6 +382,20 @@ const (
 	// re-encodes the series without the clock, which says less and never
 	// something else: that plane stores what it always stored.
 	VersionSeriesClock = 28
+
+	// VersionGuestReport is the version from which a node can carry what the
+	// agent inside a job's guest told it, once, before the compute is destroyed
+	// (POST /v1/nodes/{node}/leases/{lease}/guest, a lease.GuestReport).
+	//
+	// THE GUEST'S OWN, UNVERIFIED VIEW, and a diagnostic: it decides nothing
+	// about capacity, fencing, identity, custody or destruction, so an older
+	// peer is reported to rather than refused. CHECKED WHERE IT IS SENT, like
+	// VersionJobUsage: an older plane answers the route with a bare 404, so a
+	// node negotiated below it sends nothing and the report is lost, never a
+	// job. CHECKED WHERE IT IS READ too, so a pairing that negotiated below it
+	// and sends anyway is refused rather than recorded as something its wire
+	// does not carry.
+	VersionGuestReport = 29
 )
 
 // Range is the span of wire versions a build speaks, inclusive at both ends.

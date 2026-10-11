@@ -1131,6 +1131,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 	// data. The declarations themselves are checked structurally elsewhere.
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
+			`DROP TABLE job_guest_reports`,
 			`DROP TABLE job_destinations`,
 			`DROP TABLE job_usage`,
 			`DROP TABLE job_series`,
@@ -1237,11 +1238,13 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 
 	defer upgraded.Close()
 
-	// THE INDEXES THE REWIND DROPPED ARE BACK. Both had to be dropped ahead of the
-	// columns they reference, so a reopen that skipped their migrations would
-	// leave this database without them and every assertion below would still pass.
+	// THE INDEXES THE REWIND DROPPED ARE BACK. The first two had to be dropped
+	// ahead of the columns they reference, and the third went with its table, so
+	// a reopen that skipped their migrations would leave this database without
+	// them and every assertion below would still pass.
 	requireIndex(t, upgraded, "job_history_disrupted_idx")
 	requireIndex(t, upgraded, "pending_completions_lease_idx")
+	requireIndex(t, upgraded, "job_guest_reports_recorded_at")
 
 	// THE SINGLETON EXISTS AFTER AN UPGRADE, and is open. A deployment that
 	// upgraded into a sealed or absent admission row would stop taking work with

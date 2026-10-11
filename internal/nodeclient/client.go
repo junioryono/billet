@@ -119,6 +119,11 @@ type Client struct {
 	// on it would erase the one that does.
 	regMu      sync.Mutex
 	generation int64
+
+	// guestUnsent is set the first time a guest report is not sent because the
+	// negotiated wire does not carry one, so that is said once and not once a
+	// job.
+	guestUnsent atomic.Bool
 }
 
 // Options configures a Client.
@@ -661,6 +666,43 @@ func (c *Client) RecordLeaseUsage(
 
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/usage"),
 		nodeapi.UsageRequest{Epoch: epoch, Usage: measured, Series: series}, nil)
+}
+
+// RecordGuestReport tells the control plane what the agent inside a lease's
+// guest told this node, the guest's own unverified view.
+//
+// CHECKED WHERE IT IS EMITTED, for RecordLeaseUsage's reason: below
+// VersionGuestReport the plane has no route for it and answers a bare 404, and
+// what the pairing loses is the report, never a job, so it is dropped as
+// success and said once in the node's log. With no wire negotiated at all the
+// version cannot be told, so that is ErrUnregistered for the caller to retry
+// after registering, never a drop.
+func (c *Client) RecordGuestReport(ctx context.Context, leaseID string, epoch int64,
+	report alloc.GuestReport,
+) error {
+	wire := c.WireVersion()
+	if wire == 0 {
+		return fmt.Errorf("%w: no wire is negotiated, so whether it carries a guest report "+
+			"cannot be told", ErrUnregistered)
+	}
+	if wire < nodeapi.VersionGuestReport {
+		if !c.guestUnsent.Swap(true) {
+			slog.Default().Info("the control plane's wire does not carry guest reports, so none is sent",
+				"negotiated", wire, "needs", nodeapi.VersionGuestReport)
+		}
+
+		return nil
+	}
+
+	// IN UTC ON THE WIRE: JSON spells a time in its own zone, so an instant a
+	// zone carries past the year 9999 would not encode, and an offset with
+	// seconds in it would lose them. A zero time in another zone is spelled
+	// as a time that is not zero, so a zero is normalised too, and stays zero.
+	// The caller's report is not changed.
+	report.FirstReceived, report.LastReceived = report.FirstReceived.UTC(), report.LastReceived.UTC()
+
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/guest"),
+		nodeapi.GuestReportRequest{Epoch: epoch, Report: report}, nil)
 }
 
 // beforeSeriesClock is the series a plane older than VersionSeriesClock can

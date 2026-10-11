@@ -1,0 +1,73 @@
+UsageRequest.epoch int64
+UsageRequest.usage.source string
+UsageRequest.usage.unmeasured tag omitempty
+UsageRequest.usage.unmeasured slice
+UsageRequest.usage.unmeasured[] string
+UsageRequest.usage.samples int64
+UsageRequest.usage.interval_ms int64
+UsageRequest.usage.window_ms int64
+UsageRequest.usage.cpu_user_us int64
+UsageRequest.usage.cpu_system_us int64
+UsageRequest.usage.guest_cpu_us int64
+UsageRequest.usage.vmm_cpu_us int64
+UsageRequest.usage.memory_peak_bytes int64
+UsageRequest.usage.oom_kills int64
+UsageRequest.usage.disk_read_bytes int64
+UsageRequest.usage.disk_write_bytes int64
+UsageRequest.usage.net_rx_bytes int64
+UsageRequest.usage.net_tx_bytes int64
+UsageRequest.usage.net_rx_packets int64
+UsageRequest.usage.net_tx_packets int64
+UsageRequest.usage.cpu_some_us int64
+UsageRequest.usage.cpu_full_us int64
+UsageRequest.usage.memory_some_us int64
+UsageRequest.usage.memory_full_us int64
+UsageRequest.usage.io_some_us int64
+UsageRequest.usage.io_full_us int64
+UsageRequest.usage.energy_active_uj int64
+UsageRequest.usage.energy_idle_uj int64
+UsageRequest.usage.energy_source tag omitempty
+UsageRequest.usage.energy_source string
+UsageRequest.usage.counters tag omitempty
+UsageRequest.usage.counters pointer
+UsageRequest.usage.counters.cycles tag omitempty
+UsageRequest.usage.counters.cycles pointer
+UsageRequest.usage.counters.cycles int64
+UsageRequest.usage.counters.instructions tag omitempty
+UsageRequest.usage.counters.instructions pointer
+UsageRequest.usage.counters.instructions int64
+UsageRequest.usage.counters.cache_references tag omitempty
+UsageRequest.usage.counters.cache_references pointer
+UsageRequest.usage.counters.cache_references int64
+UsageRequest.usage.counters.cache_misses tag omitempty
+UsageRequest.usage.counters.cache_misses pointer
+UsageRequest.usage.counters.cache_misses int64
+UsageRequest.usage.counters.branch_misses tag omitempty
+UsageRequest.usage.counters.branch_misses pointer
+UsageRequest.usage.counters.branch_misses int64
+UsageRequest.usage.counters.frontend_stall_cycles tag omitempty
+UsageRequest.usage.counters.frontend_stall_cycles pointer
+UsageRequest.usage.counters.frontend_stall_cycles int64
+UsageRequest.usage.destinations tag omitempty
+UsageRequest.usage.destinations pointer
+UsageRequest.usage.destinations.destinations tag omitempty
+UsageRequest.usage.destinations.destinations slice
+UsageRequest.usage.destinations.destinations[].addr tag omitempty
+UsageRequest.usage.destinations.destinations[].addr string
+UsageRequest.usage.destinations.destinations[].sent_bytes int64
+UsageRequest.usage.destinations.destinations[].received_bytes int64
+UsageRequest.usage.destinations.destinations[].connections int64
+UsageRequest.usage.destinations.other.addr tag omitempty
+UsageRequest.usage.destinations.other.addr string
+UsageRequest.usage.destinations.other.sent_bytes int64
+UsageRequest.usage.destinations.other.received_bytes int64
+UsageRequest.usage.destinations.other.connections int64
+UsageRequest.usage.destinations.incomplete bool
+UsageRequest.usage.destinations.tap tag omitempty
+UsageRequest.usage.destinations.tap pointer
+UsageRequest.usage.destinations.tap.sent_bytes int64
+UsageRequest.usage.destinations.tap.received_bytes int64
+UsageRequest.series tag omitempty
+UsageRequest.series pointer
+UsageRequest.series.codec int
+UsageRequest.series.data bytes

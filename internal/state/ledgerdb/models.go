@@ -69,6 +69,24 @@ type IssuedCert struct {
 	IssuedAt string
 }
 
+type JobGuestReport struct {
+	LeaseID         string
+	Node            string
+	RecordedAt      string
+	AgentVersion    string
+	AgentSchema     int64
+	Codec           int64
+	Data            string
+	Accepted        int64
+	Refused         int64
+	DroppedBytes    int64
+	Hello           int64
+	FinalSeen       int64
+	NodeRestarted   int64
+	FirstReceivedAt sql.NullString
+	LastReceivedAt  sql.NullString
+}
+
 type JobUsage struct {
 	LeaseID                string
 	Node                   string
