@@ -1,0 +1,70 @@
+name: Guest agent probe
+
+# A ONE-OFF MEASUREMENT, run only by a push to its own branch and never merged:
+# the in-VM agent from main (#468), started by hand as the image will start it
+# (as root, the endpoint and bearer in its environment), against a node serving
+# the guest routes (#466, v0.15.0 with node.monitoring.guest on). The node logs
+# what it counted at destroy; the agent's own log is printed here.
+
+on:
+  push:
+    branches: [junior-oct11-guest-agent-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: billet-8vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build billet
+        run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/billet" ./cmd/billet && "$RUNNER_TEMP/billet" version
+      - name: Start the agent
+        run: |
+          set -eu
+          echo "endpoint set: ${BILLET_CACHE_ENDPOINT:+yes}, token set: ${BILLET_CACHE_TOKEN:+yes}"
+          # The bearer stays in the environment: sudo preserves exactly these two.
+          sudo --preserve-env=BILLET_CACHE_ENDPOINT,BILLET_CACHE_TOKEN \
+            nohup "$RUNNER_TEMP/billet" guest monitor > "$RUNNER_TEMP/monitor.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/monitor.pid"
+          sleep 3
+          sudo cat "$RUNNER_TEMP/monitor.log" || true
+          ps -o pid,ni,comm -p "$(cat "$RUNNER_TEMP/monitor.pid")" || true
+      - name: Probe CPU
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng > /dev/null 2>&1
+          stress-ng --cpu 8 --timeout 60s --metrics-brief
+      - name: Probe disk
+        run: |
+          dd if=/dev/zero of="$RUNNER_TEMP/blob" bs=1M count=1024 oflag=direct status=none
+          rm -f "$RUNNER_TEMP/blob"
+      - name: Probe JUnit
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/probe-results"
+          cat > "$GITHUB_WORKSPACE/probe-results/junit.xml" <<'XML'
+          <testsuites>
+            <testsuite name="probe" tests="3" failures="1" errors="0" skipped="1">
+              <testcase name="passes"/>
+              <testcase name="fails"><failure message="expected"/></testcase>
+              <testcase name="skipped"><skipped/></testcase>
+            </testsuite>
+          </testsuites>
+          XML
+      - name: Probe idle
+        run: sleep 30
+      - name: Stop the agent
+        if: always()
+        run: |
+          set -u
+          pid=$(cat "$RUNNER_TEMP/monitor.pid")
+          start=$(date +%s%N)
+          sudo kill -TERM "$pid" || true
+          for i in $(seq 1 50); do sudo kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+          echo "agent exited after $(( ($(date +%s%N) - start) / 1000000 )) ms"
+          sudo cat "$RUNNER_TEMP/monitor.log" | tail -40
