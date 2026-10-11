@@ -95,6 +95,11 @@ func (c *clock) advance(d time.Duration) {
 
 var epoch = time.Date(2026, 10, 8, 15, 4, 5, 123_000_000, time.UTC)
 
+// liveness is how long a test waits for something that happens at once before
+// it says it never did. Only a failure waits it out, so it is long: a loaded
+// runner starves a whole package's tests for seconds at a time.
+const liveness = time.Minute
+
 func startFake(t *testing.T, dir string, w *fakeWindow) (*Recorder, *clock) {
 	t.Helper()
 
@@ -104,6 +109,12 @@ func startFake(t *testing.T, dir string, w *fakeWindow) (*Recorder, *clock) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// STOP WAITS UP TO liveness FOR THE WRITE, past the production bound: these
+	// tests ask what a snapshot leaves, and a durable install on a loaded runner
+	// outlasts that bound (seen at 17 s on CI). The tests of the bound set their
+	// own.
+	r.stopWait = liveness
 
 	t.Cleanup(r.Stop)
 
@@ -284,13 +295,13 @@ func TestASnapshotNeverHoldsItsCaller(t *testing.T) {
 
 	select {
 	case <-returned:
-	case <-time.After(5 * time.Second):
+	case <-time.After(liveness):
 		t.Fatal("Snapshot waited for the window to be written")
 	}
 
 	select {
 	case <-w.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(liveness):
 		t.Fatal("no snapshot began writing")
 	}
 
@@ -312,7 +323,7 @@ func TestASnapshotNeverHoldsItsCaller(t *testing.T) {
 
 	select {
 	case <-stopped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(liveness):
 		t.Fatal("Stop never returned once the snapshots were written")
 	}
 
@@ -339,7 +350,7 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 
 	select {
 	case <-w.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(liveness):
 		t.Fatal("no snapshot began writing")
 	}
 
@@ -352,7 +363,7 @@ func TestStopDoesNotWaitForeverForAWrite(t *testing.T) {
 
 	select {
 	case <-stopped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(liveness):
 		t.Fatal("Stop waited past its bound for a write that never finishes")
 	}
 
@@ -576,6 +587,8 @@ func TestTheRuntimesRecorderWritesATrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	r.stopWait = liveness
 
 	r.Snapshot(LeadershipLost)
 	r.Stop()
