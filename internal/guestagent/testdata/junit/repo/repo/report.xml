@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="7" failures="2" errors="0" skipped="1">
+	<testsuite name="github.com/acme/widget/internal/parse" tests="4" failures="1" errors="0" id="0" hostname="runner" time="0.412" timestamp="2026-10-10T02:04:30Z">
+		<properties>
+			<property name="go.version" value="go1.26.9 linux/amd64"></property>
+		</properties>
+		<testcase name="TestParseEmpty" classname="github.com/acme/widget/internal/parse" time="0.000"></testcase>
+		<testcase name="TestParseQuoted/it&apos;s_&quot;quoted&quot;" classname="github.com/acme/widget/internal/parse" time="0.010">
+			<failure message="Failed" type="">parse_test.go:41: got &lt;nil&gt;, want an error</failure>
+		</testcase>
+		<testcase name="TestParseLong" classname="github.com/acme/widget/internal/parse" time="0.400"></testcase>
+		<testcase name="TestParseSkipped" classname="github.com/acme/widget/internal/parse" time="0.000">
+			<skipped message="needs a network"></skipped>
+		</testcase>
+	</testsuite>
+	<testsuite name="github.com/acme/widget/internal/render" tests="3" failures="1" errors="0" id="1" hostname="runner" time="1.100" timestamp="2026-10-10T02:04:31Z">
+		<testcase name="TestRenderTable" classname="github.com/acme/widget/internal/render" time="0.100"></testcase>
+		<testcase name="TestRenderWide" classname="github.com/acme/widget/internal/render" time="1.000">
+			<failure message="Failed" type="">render_test.go:12: width 81</failure>
+		</testcase>
+		<testcase name="TestRenderNarrow" classname="github.com/acme/widget/internal/render" time="0.000"></testcase>
+	</testsuite>
+</testsuites>

@@ -1,0 +1,459 @@
+package guest
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/guestagent"
+	"github.com/junioryono/billet/internal/guestreport"
+)
+
+const childEnv = "BILLET_GUEST_MONITOR_CHILD"
+
+func testEnv() (cli.Env, *bytes.Buffer, *bytes.Buffer) {
+	var stdout, stderr bytes.Buffer
+
+	return cli.Env{Stdout: &stdout, Stderr: &stderr, Stdin: strings.NewReader(""),
+		Getenv: func(string) string { return "" }}, &stdout, &stderr
+}
+
+func TestGuestNamesItsTwoCommands(t *testing.T) {
+	t.Parallel()
+
+	for _, args := range [][]string{nil, {"watch"}} {
+		env, _, _ := testEnv()
+		if err := Run(t.Context(), env, args); err == nil || !strings.Contains(err.Error(), "monitor|flush") {
+			t.Errorf("billet guest %v answered %v, want its usage", args, err)
+		}
+	}
+
+	env, _, _ := testEnv()
+	if err := Run(t.Context(), env, []string{"monitor", "--nice", "40"}); err == nil ||
+		!strings.Contains(err.Error(), "not a nice value") {
+		t.Errorf("--nice 40 answered %v, want it refused", err)
+	}
+
+	env, _, _ = testEnv()
+	if err := Run(t.Context(), env, []string{"monitor", "extra"}); err == nil ||
+		!strings.Contains(err.Error(), "unexpected argument") {
+		t.Errorf("an argument answered %v, want it refused: the environment carries everything", err)
+	}
+}
+
+// Where the agent cannot run, it says so; where it can, a guest without the
+// node's endpoint and bearer has nothing to report to, and the agent exits 0.
+func TestMonitorWithoutItsEnvironmentReportsNothingAndExitsZero(t *testing.T) {
+	t.Parallel()
+
+	env, _, stderr := testEnv()
+	err := Run(t.Context(), env, []string{"monitor", "--socket", "", "--nice", "0"})
+
+	if runtime.GOOS != "linux" {
+		if err == nil || !strings.Contains(err.Error(), "Linux") {
+			t.Fatalf("off Linux the monitor answered %v, want a refusal naming Linux", err)
+		}
+
+		return
+	}
+
+	if err != nil || !strings.Contains(stderr.String(), "BILLET_CACHE_ENDPOINT") {
+		t.Fatalf("answered %v, logged %q; want nil and the reason", err, stderr.String())
+	}
+}
+
+// The hook's client exits 0, quietly, with nobody to ask.
+func TestFlushExitsZeroQuietlyWithNoMonitor(t *testing.T) {
+	t.Parallel()
+
+	env, stdout, stderr := testEnv()
+
+	began := time.Now()
+	err := Run(t.Context(), env, []string{"flush", "--socket", filepath.Join(t.TempDir(), "absent.sock")})
+
+	if err != nil || stdout.Len() != 0 || stderr.Len() != 0 || time.Since(began) > time.Second {
+		t.Fatalf("answered %v after %v, printed %q %q", err, time.Since(began), stdout.String(), stderr.String())
+	}
+}
+
+// node is the guest-facing service, recording what it is sent.
+type node struct {
+	mu     sync.Mutex
+	hellos int
+	posts  []sent
+	err    error
+}
+
+type sent struct {
+	final bool
+	batch guestreport.Batch
+	err   error
+}
+
+func (n *node) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if r.Header.Get("Authorization") != "Bearer child-bearer" {
+		w.WriteHeader(http.StatusUnauthorized)
+
+		return
+	}
+
+	if r.URL.Path == "/v1/guest/limits" {
+		n.hellos++
+
+		if _, err := io.WriteString(w, `{"schemas":[1],"interval_ms":10000,"max_body":65536}`); err != nil {
+			n.err = err
+		}
+
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, guestreport.MaxBatchBytes))
+	if err != nil {
+		n.err = err
+	}
+
+	b, err := guestreport.DecodeBatch(body)
+	n.posts = append(n.posts, sent{final: r.URL.RawQuery == "final=1", batch: b, err: err})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (n *node) helloed() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.hellos
+}
+
+func (n *node) snapshot() (int, []sent, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.hellos, append([]sent(nil), n.posts...), n.err
+}
+
+// THE WHOLE PATH A SIGTERM TAKES, in a process of its own on Linux: the command
+// line's signal handling cancels the agent, which reads the real /proc, sends one
+// final batch and exits 0 within 3 s; the endpoint and the bearer travel in the
+// environment alone; and every thread of the agent runs at the nice it set.
+func TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the monitor runs on Linux alone")
+	}
+
+	t.Parallel()
+
+	n := &node{}
+	server := httptest.NewServer(n)
+	t.Cleanup(server.Close)
+
+	dir, err := os.MkdirTemp("/tmp", "billet-guest-") //nolint:usetesting // t.TempDir exceeds the unix socket address limit
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	args, err := json.Marshal([]string{"guest", "monitor", "--socket", filepath.Join(dir, "m.sock"),
+		"--diag", filepath.Join(dir, "_diag"), "--junit-root", dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMonitorChild$")
+	cmd.Env = append(os.Environ(), childEnv+"="+string(args),
+		"BILLET_CACHE_ENDPOINT="+server.URL, "BILLET_CACHE_TOKEN=child-bearer")
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for n.helloed() == 0 {
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill() //nolint:errcheck // the test fails either way
+			t.Fatalf("the monitor never said hello; its log: %s", stderr.String())
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	assertNice(t, cmd.Process.Pid, defaultNice)
+
+	cmdline, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/cmdline")
+	if err != nil || bytes.Contains(cmdline, []byte("child-bearer")) || bytes.Contains(cmdline, []byte(server.URL)) {
+		t.Fatalf("the monitor's argv (%v) carries the endpoint or the bearer: %q", err, cmdline)
+	}
+
+	stopped := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	err = cmd.Wait()
+	took := time.Since(stopped)
+
+	if err != nil {
+		t.Fatalf("the monitor exited %v; its log: %s", err, stderr.String())
+	}
+
+	if took > 3*time.Second {
+		t.Errorf("the monitor took %v to exit after SIGTERM, past 3s", took)
+	}
+
+	t.Logf("the monitor's log: %s", stderr.String())
+
+	_, posts, err := n.snapshot()
+	if err != nil {
+		t.Fatalf("the node failed to serve the monitor: %v", err)
+	}
+
+	finals := 0
+	for _, p := range posts {
+		if p.err != nil {
+			t.Errorf("a batch did not decode: %v", p.err)
+		}
+
+		if p.final {
+			finals++
+		}
+	}
+
+	if finals != 1 || !posts[len(posts)-1].final {
+		t.Fatalf("%d posts, %d final; want exactly one final, the last", len(posts), finals)
+	}
+
+	assertReadTheRealProc(t, posts, stderr.String())
+}
+
+// assertReadTheRealProc holds what the monitor sent to what this host's own /proc
+// allows. Its totals are sent where /proc names the guest's disk and interface,
+// and otherwise the log names the one it lacks. Its processes are sent when it
+// runs as root; otherwise another user's io is refused to it, which is
+// could-not-tell, so none is sent and the log says why. The agent's own CPU can
+// round to no tick in a second's run, so it proves nothing here.
+func assertReadTheRealProc(t *testing.T, posts []sent, log string) {
+	t.Helper()
+
+	var samples, processes, rows int
+
+	for i := range posts {
+		b := &posts[i].batch
+		if b.TicksPerSecond != 100 {
+			t.Errorf("a batch counts %d ticks a second, want /proc's 100", b.TicksPerSecond)
+		}
+
+		samples += len(b.Samples)
+		processes += len(b.Processes)
+
+		for _, ps := range b.Processes {
+			rows += len(ps.Rows)
+		}
+	}
+
+	switch lacks := hostLacks(t); {
+	case lacks == "" && samples == 0:
+		t.Errorf("this host's /proc has vda and eth0, and the monitor sent no sample of it; its log: %s", log)
+	case lacks != "" && !strings.Contains(log, "has no "+lacks):
+		t.Errorf("this host's /proc has no %s, and the monitor's log does not say so: %s", lacks, log)
+	}
+
+	if !someIORefused(t) {
+		if processes != 1 || rows == 0 {
+			t.Errorf("with every process's io readable the monitor sent %d process samples with %d rows, "+
+				"want one with rows; its log: %s", processes, rows, log)
+		}
+
+		return
+	}
+
+	if processes != 0 || !strings.Contains(log, "no process sample is sent") ||
+		!strings.Contains(log, "could not tell") || !strings.Contains(log, "permission denied") {
+		t.Errorf("with another user's io refused to it the monitor sent %d process samples, and its log does "+
+			"not say why: %s", processes, log)
+	}
+}
+
+// someIORefused reports whether this host's /proc refuses this process some
+// process's io, as it does to anyone but root while another user's process is
+// there. Whether this process is root does not settle it: in a container run as
+// one user, every process the container sees can be that user's.
+func someIORefused(t *testing.T) bool {
+	t.Helper()
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("list this host's /proc: %v", err)
+	}
+
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+
+		if _, err := os.ReadFile("/proc/" + e.Name() + "/io"); errors.Is(err, fs.ErrPermission) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hostLacks is the guest device this host's /proc does not name, vda's disk or
+// eth0's interface, or "" when it names both.
+func hostLacks(t *testing.T) string {
+	t.Helper()
+
+	diskstats, err := os.ReadFile("/proc/diskstats")
+	if err != nil {
+		t.Fatalf("read this host's /proc/diskstats: %v", err)
+	}
+
+	if !regexp.MustCompile(`(?m)^\s*\d+\s+\d+\s+vda\s`).Match(diskstats) {
+		return "vda"
+	}
+
+	dev, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		t.Fatalf("read this host's /proc/net/dev: %v", err)
+	}
+
+	if !regexp.MustCompile(`(?m)^\s*eth0:`).Match(dev) {
+		return "eth0"
+	}
+
+	return ""
+}
+
+// A log whose reader has gone is a write that fails, not a SIGPIPE that ends the
+// monitor: a node with monitoring off is still a stop the monitor answers with 0
+// after logging it to a closed stderr.
+func TestAClosedLogDoesNotEndTheMonitorBySignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the monitor runs on Linux alone")
+	}
+
+	t.Parallel()
+
+	off := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(off.Close)
+
+	dir, err := os.MkdirTemp("/tmp", "billet-guest-") //nolint:usetesting // t.TempDir exceeds the unix socket address limit
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	args, err := json.Marshal([]string{"guest", "monitor", "--socket", filepath.Join(dir, "m.sock"), "--nice", "0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMonitorChild$")
+	cmd.Env = append(os.Environ(), childEnv+"="+string(args),
+		"BILLET_CACHE_ENDPOINT="+off.URL, "BILLET_CACHE_TOKEN=child-bearer")
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reader goes away before the monitor writes a line.
+	if err := stderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("with its log closed the monitor exited %v, want 0", err)
+	}
+}
+
+// TestMonitorChild is the monitor's process for the tests above, run through the
+// command line as the binary runs it.
+func TestMonitorChild(t *testing.T) {
+	raw := os.Getenv(childEnv)
+	if raw == "" {
+		t.Skip("run by TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero alone")
+	}
+
+	var args []string
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		t.Fatal(err)
+	}
+
+	env := cli.Env{Stdout: os.Stdout, Stderr: os.Stderr, Stdin: os.Stdin, Getenv: os.Getenv}
+	tree := func(*cli.Lifecycle) []cli.Command {
+		return []cli.Command{{Name: "guest", Run: Run}}
+	}
+
+	os.Exit(cli.Main(args, env, tree, os.Exit))
+}
+
+// assertNice checks every thread of pid runs at nice.
+func assertNice(t *testing.T, pid, nice int) {
+	t.Helper()
+
+	tasks, err := os.ReadDir("/proc/" + strconv.Itoa(pid) + "/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, task := range tasks {
+		stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/task/" + task.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+
+		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+		if len(fields) < 17 || fields[16] != strconv.Itoa(nice) {
+			t.Errorf("thread %s runs at nice %v, want %d", task.Name(), fields[16:17], nice)
+		}
+	}
+}
+
+// The monitor reads /proc through guestagent.ProcFS, which never waits on a FIFO
+// the job put there, the endpoint and the bearer from the environment alone, and
+// every JUnit root it is given, or the runner's work directory.
+func TestTheMonitorIsTheAgentItsFlagsAndEnvironmentDescribe(t *testing.T) {
+	t.Parallel()
+
+	vars := map[string]string{"BILLET_CACHE_ENDPOINT": " http://172.31.0.1:7718 ", "BILLET_CACHE_TOKEN": "t"}
+	env := cli.Env{Stderr: io.Discard, Getenv: func(k string) string { return vars[k] }}
+
+	cfg := monitorConfig(env, "/guest/proc", "/d", nil, "/s.sock", 10)
+	if cfg.Proc != guestagent.ProcFS("/guest/proc") || cfg.Endpoint != "http://172.31.0.1:7718" || cfg.Nice != 10 ||
+		cfg.Token != "t" || cfg.DiagDir != "/d" || cfg.Socket != "/s.sock" || len(cfg.JUnitRoots) != 1 ||
+		cfg.JUnitRoots[0] != defaultJUnitRoot {
+		t.Fatalf("the monitor's agent is %+v", cfg)
+	}
+
+	if cfg := monitorConfig(env, "/proc", "", []string{"/a", "/b"}, "", 0); len(cfg.JUnitRoots) != 2 {
+		t.Fatalf("the roots given became %v", cfg.JUnitRoots)
+	}
+}

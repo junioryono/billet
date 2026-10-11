@@ -1,0 +1,20 @@
+[2026-10-10 02:04:15Z INFO HostContext] Well known directory 'Bin': '/home/runner/runner/bin'
+[2026-10-10 02:04:15Z INFO Worker] Version: 2.329.0
+[2026-10-10 02:04:16Z INFO JobRunner] Starting the job execution context.
+[2026-10-10 02:04:17Z INFO StepsRunner] Processing step: DisplayName='Set up runner'
+[2026-10-10 02:04:17Z INFO StepsRunner] Evaluating: success()
+[2026-10-10 02:04:17Z INFO StepsRunner] Result: true
+[2026-10-10 02:04:17Z INFO StepsRunner] Starting the step.
+[2026-10-10 02:04:19Z INFO StepsRunner] Step result:
+[2026-10-10 02:04:19Z INFO StepsRunner] No need for updating job result with current step result 'Succeeded'.
+[2026-10-10 02:04:20Z INFO StepsRunner] Processing step: DisplayName='Mark one'
+[2026-10-10 02:04:20Z INFO StepsRunner] Evaluating: success()
+[2026-10-10 02:04:20Z INFO StepsRunner] Result: true
+[2026-10-10 02:04:20Z INFO StepsRunner] Starting the step.
+[2026-10-10 02:04:21Z INFO StepsRunner] Step result:
+[2026-10-10 02:04:21Z INFO StepsRunner] No need for updating job result with current step result 'Succeeded'.
+[2026-10-10 02:04:21Z INFO StepsRunner] Processing step: DisplayName='Run it's "quoted" ('twice')'
+[2026-10-10 02:04:21Z INFO StepsRunner] Evaluating: success()
+[2026-10-10 02:04:33Z INFO StepsRunner] Step result:
+[2026-10-10 02:04:33Z INFO StepsRunner] No need for updating job result with current step result 'Succeeded'.
+[2026-10-10 02:04:34Z INFO StepsRunner] Processing step: DisplayName='Post Run actions/checkout@v5'
