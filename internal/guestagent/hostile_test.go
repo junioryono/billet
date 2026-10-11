@@ -79,6 +79,9 @@ func TestSIGTERMIsAnsweredWithinThreeSecondsWhateverHoldsTheLoop(t *testing.T) {
 			t.Fatalf("SIGTERM with the loop held returned %v after %v, want nil within 3s", err, took)
 		}
 
+		// The line is written from a goroutine of its own, so nothing waits on it.
+		synctest.Wait()
+
 		if !strings.Contains(log.String(), "did not finish in time") {
 			t.Errorf("the log does not say the flush was given up: %q", log.String())
 		}

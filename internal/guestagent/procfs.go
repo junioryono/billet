@@ -277,6 +277,10 @@ func parsePIDStat(data []byte) (pidStat, error) {
 		return pidStat{}, err
 	}
 
+	if utime > guestreport.MaxValue-stime {
+		return pidStat{}, fmt.Errorf("%w: a process's CPU past what a report carries", errCouldNotTell)
+	}
+
 	start, err := strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {
 		return pidStat{}, fmt.Errorf("%w: a stat line's start time", errCouldNotTell)

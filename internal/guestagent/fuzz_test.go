@@ -2,6 +2,8 @@ package guestagent
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -50,6 +52,9 @@ func FuzzPIDStat(f *testing.F) {
 		f.Add(data)
 	}
 
+	// utime and stime each at their bound, together past it.
+	f.Add([]byte("1033 (billet) S 1 2 2 0 -1 4194560 10 0 0 0 9007199254740992 1 0 0 20 0 1 0 4100 1000 10 0"))
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		st, err := parsePIDStat(data)
 		if err != nil {
@@ -77,8 +82,8 @@ func FuzzPIDStat(f *testing.F) {
 	})
 }
 
-// Whatever a result file holds, the suites a parse keeps encode in a batch, and a
-// parse that fails keeps none.
+// Whatever a result file holds, a parse keeps at most a batch's worth of suites,
+// which fit makes a batch the node takes, and a parse that fails keeps none.
 func FuzzJUnitParse(f *testing.F) {
 	for _, name := range []string{
 		"testdata/junit/repo/repo/report.xml", "testdata/junit/repo/repo/py/results.xml",
@@ -91,6 +96,27 @@ func FuzzJUnitParse(f *testing.F) {
 
 		f.Add(data)
 	}
+
+	// A batch's worth of suites whose failed names do not compress: within every
+	// bound of the parse, and past what one batch carries until fit shrinks it.
+	var many bytes.Buffer
+
+	many.WriteString("<testsuites>")
+
+	for i := range guestreport.MaxBatchSuites {
+		fmt.Fprintf(&many, `<testsuite name="s%d">`, i)
+
+		for j := range guestreport.MaxFailedNames {
+			a, b, c := sha256.Sum256([]byte{byte(i), byte(j), 0}), sha256.Sum256([]byte{byte(i), byte(j), 1}),
+				sha256.Sum256([]byte{byte(i), byte(j), 2})
+			fmt.Fprintf(&many, `<testcase name="%x%x%x"><failure/></testcase>`, a, b, c)
+		}
+
+		many.WriteString("</testsuite>")
+	}
+
+	many.WriteString("</testsuites>")
+	f.Add(many.Bytes())
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		w := &junitWalk{deadline: time.Now().Add(time.Minute), now: time.Now}
@@ -109,8 +135,14 @@ func FuzzJUnitParse(f *testing.F) {
 		}
 
 		b := guestreport.Batch{Seq: 1, AgentVersion: "v", TicksPerSecond: 100, Tests: suites}
-		if _, err := guestreport.EncodeBatch(b); err != nil {
-			t.Fatalf("the suites of %q do not encode: %v", data, err)
+
+		body, err := fit(&b, guestreport.MaxBatchBytes)
+		if err != nil {
+			t.Fatalf("the suites of %q do not fit a batch: %v", data, err)
+		}
+
+		if _, err := guestreport.DecodeBatch(body); err != nil {
+			t.Fatalf("the batch fit made of %q does not decode: %v", data, err)
 		}
 	})
 }

@@ -122,14 +122,19 @@ func (n *node) hello(ctx context.Context) (limits, verdict) {
 		return limits{}, unknown
 	}
 
-	// The limits are the body, so a body not read is could-not-tell.
 	status, body, _, err := n.do(req)
-	if err != nil || body.err != nil {
+	if err != nil {
 		return limits{}, unknown
 	}
 
 	switch status {
 	case http.StatusOK:
+		// The limits are the body, so a body not read to its end is
+		// could-not-tell; a stop is its status alone.
+		if body.err != nil {
+			return limits{}, unknown
+		}
+
 		return readLimits(body.data)
 	case http.StatusNotFound, http.StatusUnauthorized:
 		return limits{}, stop

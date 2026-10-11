@@ -86,54 +86,30 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	a := newAgent(n, cfg, log)
-
-	if cfg.Socket != "" {
-		l, err := listenFlush(cfg.Socket)
-		if err != nil {
-			log.always("the flush socket was not opened, so only SIGTERM flushes: %v", err)
-		} else {
-			flushes := make(chan struct{}, 1)
-			a.flushes = flushes
-			done := make(chan struct{})
-
-			go func() {
-				defer close(done)
-
-				serveFlush(l, flushes, a.flushed, log)
-			}()
-
-			defer func() {
-				_ = l.Close()
-				<-done
-			}()
-		}
-	}
-
 	finished := make(chan struct{})
 
 	go func() {
 		defer close(finished)
 
-		a.run(ctx)
+		a.supervised(ctx, cfg.Socket)
 	}()
 
 	select {
 	case <-finished:
 	case <-ctx.Done():
-		// SIGTERM is answered within the contract's 3 s even when a read the job
-		// made never return holds the loop; the process ends with the command.
+		// SIGTERM is answered within the contract's 3 s whatever holds the agent: a
+		// read the job made never return, a socket that will not close, a log
+		// nobody drains. The process ends with the command, and nothing here waits
+		// on any of them, its own line included.
 		wait := time.NewTimer(exitBudget)
 		select {
 		case <-finished:
 		case <-wait.C:
-			log.always("the final flush did not finish in time; exiting without it")
+			go log.always("the final flush did not finish in time; exiting without it")
 		}
 
 		wait.Stop()
 	}
-
-	// An agent that stopped without a final flush answers whoever is waiting.
-	a.flushDone()
 
 	return nil
 }
@@ -187,6 +163,36 @@ type agent struct {
 
 // flushDone answers every connection waiting for the final flush.
 func (a *agent) flushDone() { a.closeOnce.Do(func() { close(a.flushed) }) }
+
+// supervised is everything the agent does, its flush socket included, so that Run
+// can bound all of it by one deadline.
+func (a *agent) supervised(ctx context.Context, socket string) {
+	if socket != "" {
+		l, err := listenFlush(socket)
+		if err != nil {
+			a.log.always("the flush socket was not opened, so only SIGTERM flushes: %v", err)
+		} else {
+			flushes := make(chan struct{}, 1)
+			a.flushes = flushes
+			done := make(chan struct{})
+
+			go func() {
+				defer close(done)
+
+				serveFlush(l, flushes, a.flushed, a.log)
+			}()
+
+			defer func() {
+				_ = l.Close()
+				<-done
+			}()
+		}
+	}
+
+	a.run(ctx)
+	// An agent that stopped without a final flush answers whoever is waiting.
+	a.flushDone()
+}
 
 // outgoing is a batch as it is sent.
 type outgoing struct {
@@ -524,7 +530,9 @@ func later(a, b time.Time) time.Time {
 const logEvery = 5 * time.Minute
 
 // limitedLog is the agent's own log: one line per event, a recurring kind of
-// trouble at most once per logEvery. No line carries the guest's text.
+// trouble at most once per logEvery. No line carries the guest's text. Its lock
+// guards the record of what was logged and is never held across a write, which a
+// log nobody drains can hold for good.
 type limitedLog struct {
 	mu   sync.Mutex
 	w    io.Writer
@@ -543,21 +551,21 @@ func newLimitedLog(w io.Writer) *limitedLog {
 // logEvery.
 func (l *limitedLog) printf(kind, format string, args ...any) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	now := time.Now()
 	if at, ok := l.last[kind]; ok && now.Sub(at) < logEvery {
+		l.mu.Unlock()
+
 		return
 	}
 
 	l.last[kind] = now
-	fmt.Fprintf(l.w, "billet guest monitor: "+format+"\n", args...)
+	l.mu.Unlock()
+
+	l.always(format, args...)
 }
 
-// always logs one line.
+// always logs one line, in one write.
 func (l *limitedLog) always(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	fmt.Fprintf(l.w, "billet guest monitor: "+format+"\n", args...)
 }
