@@ -32,7 +32,7 @@ func TestASampleIsTheGuestTotalsAsProcReportsThem(t *testing.T) {
 
 	log, _ := discardLog()
 	c := newCollector(watch(t, os.DirFS("testdata/proc")), log)
-	c.sample(at(0), false)
+	sampleAt(c, at(0), false)
 
 	if len(c.samples) != 1 || c.samples[0] != fixtureSample {
 		t.Fatalf("samples = %+v, want [%+v]", c.samples, fixtureSample)
@@ -85,7 +85,7 @@ func TestAFigureTheAgentCannotReadSendsNoSample(t *testing.T) {
 
 			log, logged := discardLog()
 			c := newCollector(w, log)
-			c.sample(at(0), false)
+			sampleAt(c, at(0), false)
 
 			if len(c.samples) != tc.kept {
 				t.Fatalf("kept %d samples (%+v), want %d", len(c.samples), c.samples, tc.kept)
@@ -107,19 +107,19 @@ func TestASampleThatGoesBackIsNotSent(t *testing.T) {
 	log, _ := discardLog()
 	c := newCollector(proc, log)
 
-	c.sample(at(time.Second), false)
-	c.sample(at(time.Second), false) // the same instant
-	c.sample(at(0), false)           // a clock stepped back
+	sampleAt(c, at(time.Second), false)
+	sampleAt(c, at(time.Second), false) // the same instant
+	sampleAt(c, at(0), false)           // a clock stepped back
 
 	set(t, proc, "stat", "cpu ", 1, "52309") // user went back by a tick
-	c.sample(at(2*time.Second), false)
+	sampleAt(c, at(2*time.Second), false)
 
 	set(t, proc, "diskstats", " 254       0 vda", 9, "6623103")
 	set(t, proc, "stat", "cpu ", 1, "52310")
-	c.sample(at(3*time.Second), false)
+	sampleAt(c, at(3*time.Second), false)
 
 	set(t, proc, "diskstats", "254 0 vda", 9, "6623105") // set wrote the line back unpadded
-	c.sample(at(4*time.Second), false)
+	sampleAt(c, at(4*time.Second), false)
 
 	if len(c.samples) != 2 || c.samples[1].AtMillis != at(4*time.Second).UnixMilli() {
 		t.Fatalf("kept %+v, want the first and the one at 4s", c.samples)
@@ -136,11 +136,11 @@ func TestPendingReadingsStopAtABatchsBound(t *testing.T) {
 	c := newCollector(fixtureProc(t), log)
 
 	for i := range guestreport.MaxBatchSamples + 6 {
-		c.sample(at(time.Duration(i)*time.Second), false)
+		sampleAt(c, at(time.Duration(i)*time.Second), false)
 	}
 
 	for i := range guestreport.MaxBatchProcessSamples + 6 {
-		c.walkProcesses(at(time.Duration(i)*2*time.Second), false)
+		walkAt(c, at(time.Duration(i)*2*time.Second), false)
 	}
 
 	if len(c.samples) != guestreport.MaxBatchSamples-1 || len(c.processes) != guestreport.MaxBatchProcessSamples-1 {
@@ -149,9 +149,9 @@ func TestPendingReadingsStopAtABatchsBound(t *testing.T) {
 	}
 
 	end := at(10 * time.Minute)
-	c.sample(end, true)
-	c.walkProcesses(end, true)
-	c.sample(end.Add(time.Second), true)
+	sampleAt(c, end, true)
+	walkAt(c, end, true)
+	sampleAt(c, end.Add(time.Second), true)
 
 	if len(c.samples) != guestreport.MaxBatchSamples || len(c.processes) != guestreport.MaxBatchProcessSamples ||
 		c.samples[len(c.samples)-1].AtMillis != end.UnixMilli() ||
@@ -167,8 +167,8 @@ func TestPendingReadingsStopAtABatchsBound(t *testing.T) {
 			len(c.samples), len(c.processes))
 	}
 
-	c.sample(at(time.Hour), false)
-	c.walkProcesses(at(time.Hour), false)
+	sampleAt(c, at(time.Hour), false)
+	walkAt(c, at(time.Hour), false)
 
 	if len(c.samples) != 1 || len(c.processes) != 1 {
 		t.Fatalf("after a take, held %d samples and %d process samples, want one each", len(c.samples),
@@ -224,8 +224,8 @@ func TestTheWalkNeverOpensACmdlineOrAnEnviron(t *testing.T) {
 	log, _ := discardLog()
 	c := newCollector(w, log)
 
-	c.walkProcesses(at(0), false)
-	c.walkProcesses(at(2*time.Second), false)
+	walkAt(c, at(0), false)
+	walkAt(c, at(2*time.Second), false)
 	c.readAgentCPU()
 
 	if len(c.processes) != 1 {
@@ -250,7 +250,7 @@ func TestAProcessSampleIsWhatEachNameDidSinceTheLastWalk(t *testing.T) {
 	proc := fixtureProc(t)
 	log, _ := discardLog()
 	c := newCollector(proc, log)
-	c.walkProcesses(at(0), false)
+	walkAt(c, at(0), false)
 
 	if len(c.processes) != 0 {
 		t.Fatalf("the first walk kept %d process samples, want none: it only sets the base", len(c.processes))
@@ -265,7 +265,7 @@ func TestAProcessSampleIsWhatEachNameDidSinceTheLastWalk(t *testing.T) {
 	proc["1500/io"] = &fstest.MapFile{Data: []byte("read_bytes: 0\nwrite_bytes: 512\n")}
 	set(t, proc, "stat", "cpu ", 1, strconv.Itoa(52310+1000)) // busy +1000
 
-	c.walkProcesses(at(2*time.Second), false)
+	walkAt(c, at(2*time.Second), false)
 
 	if len(c.processes) != 1 {
 		t.Fatalf("kept %d process samples, want 1", len(c.processes))
@@ -313,12 +313,12 @@ func TestAnExitedProcessIsResidualAndARefusedOneIsCouldNotTell(t *testing.T) {
 	w := watch(t, proc)
 	log, logged := discardLog()
 	c := newCollector(w, log)
-	c.walkProcesses(at(0), false)
+	walkAt(c, at(0), false)
 
 	set(t, proc, "812/stat", "812 ", 13, "1930") // +100
 	set(t, proc, "stat", "cpu ", 1, "52710")     // busy +400
 	w.fail["812/io"] = eacces
-	c.walkProcesses(at(2*time.Second), false)
+	walkAt(c, at(2*time.Second), false)
 
 	if len(c.processes) != 0 || !strings.Contains(logged.String(), "no process sample is sent") {
 		t.Fatalf("a refused io kept %+v and logged %q; want nothing kept, and said", c.processes, logged.String())
@@ -327,7 +327,7 @@ func TestAnExitedProcessIsResidualAndARefusedOneIsCouldNotTell(t *testing.T) {
 	delete(w.fail, "812/io")
 	set(t, proc, "812/stat", "812 ", 13, "1980") // +50 more
 	w.fail["900/io"] = fs.ErrNotExist            // 900 exited mid-walk
-	c.walkProcesses(at(4*time.Second), false)
+	walkAt(c, at(4*time.Second), false)
 
 	if len(c.processes) != 1 {
 		t.Fatalf("kept %d process samples, want 1", len(c.processes))
@@ -357,15 +357,15 @@ func TestOnlyAKernelThreadGoesWithoutVmRSS(t *testing.T) {
 	proc := fixtureProc(t)
 	log, _ := discardLog()
 	c := newCollector(proc, log)
-	c.walkProcesses(at(0), false)
-	c.walkProcesses(at(2*time.Second), false)
+	walkAt(c, at(0), false)
+	walkAt(c, at(2*time.Second), false)
 
 	if len(c.processes) != 1 {
 		t.Fatalf("with kthreadd's status lacking VmRSS, kept %d process samples, want 1", len(c.processes))
 	}
 
 	proc["812/status"] = &fstest.MapFile{Data: []byte("Name:\tRunner.Worker\nThreads:\t9\n")}
-	c.walkProcesses(at(4*time.Second), false)
+	walkAt(c, at(4*time.Second), false)
 
 	if len(c.processes) != 1 {
 		t.Fatalf("with a user process lacking VmRSS, kept %d process samples, want still 1", len(c.processes))
@@ -387,7 +387,7 @@ func TestMoreProcessesThanTheBoundAreCouldNotTell(t *testing.T) {
 		t.Fatalf("listing %d processes answered %v, want could-not-tell", maxProcesses+5, err)
 	}
 
-	c.walkProcesses(at(0), false)
+	walkAt(c, at(0), false)
 
 	if c.haveBase || !strings.Contains(logged.String(), "more than") {
 		t.Errorf("a walk past the bound set a base (%v) or was not logged (%q)", c.haveBase, logged.String())

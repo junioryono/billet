@@ -117,7 +117,7 @@ func TestTheProcTreeRefusesWhatIsNotAFileOrADirectory(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		c.sample(at(0), false)
+		sampleAt(c, at(0), false)
 	}()
 
 	timer := time.NewTimer(10 * time.Second)
@@ -142,9 +142,9 @@ func TestTheProcTreeRefusesWhatIsNotAFileOrADirectory(t *testing.T) {
 	}
 
 	c = newCollector(ProcFS(filepath.Join(root, "again")), log)
-	c.sample(at(0), false)
-	c.walkProcesses(at(0), false)
-	c.walkProcesses(at(2*time.Second), false)
+	sampleAt(c, at(0), false)
+	walkAt(c, at(0), false)
+	walkAt(c, at(2*time.Second), false)
 
 	if len(c.samples) != 1 || c.samples[0] != fixtureSample || len(c.processes) != 1 {
 		t.Fatalf("the fixture through ProcFS gave %d samples and %d process samples", len(c.samples),

@@ -150,6 +150,17 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
+// sampleAt and walkAt take a reading as though the clock read t.
+func sampleAt(c *collector, t time.Time, final bool) {
+	c.clock = func() time.Time { return t }
+	c.sample(final)
+}
+
+func walkAt(c *collector, t time.Time, final bool) {
+	c.clock = func() time.Time { return t }
+	c.walkProcesses(final)
+}
+
 // at is a guest clock reading, 2026-10-10T02:04:20Z plus offset.
 func at(offset time.Duration) time.Time {
 	return time.Date(2026, 10, 10, 2, 4, 20, 0, time.UTC).Add(offset)

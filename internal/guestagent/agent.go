@@ -56,6 +56,8 @@ type Config struct {
 	// Socket is where a connection asks for the final flush; empty listens
 	// nowhere.
 	Socket string
+	// Nice is the nice value the agent sets itself to; 0 leaves it as started.
+	Nice int
 	// Transport carries the requests to the node; nil is a direct connection.
 	Transport http.RoundTripper
 	// Log receives the agent's own errors.
@@ -71,27 +73,12 @@ type Config struct {
 // It returns nil on every path, a node that is off, gone or full included.
 func Run(ctx context.Context, cfg Config) error {
 	log := newLimitedLog(cfg.Log)
-
-	n, err := newNode(cfg.Endpoint, cfg.Token, cfg.Transport)
-	if err != nil {
-		log.always("%v; nothing is reported", err)
-
-		return nil
-	}
-
-	if cfg.Proc == nil {
-		log.always("no /proc tree to read; nothing is reported")
-
-		return nil
-	}
-
-	a := newAgent(n, cfg, log)
 	finished := make(chan struct{})
 
 	go func() {
 		defer close(finished)
 
-		a.supervised(ctx, cfg.Socket)
+		supervised(ctx, cfg, log)
 	}()
 
 	select {
@@ -164,9 +151,34 @@ type agent struct {
 // flushDone answers every connection waiting for the final flush.
 func (a *agent) flushDone() { a.closeOnce.Do(func() { close(a.flushed) }) }
 
-// supervised is everything the agent does, its flush socket included, so that Run
-// can bound all of it by one deadline.
-func (a *agent) supervised(ctx context.Context, socket string) {
+// supervised is everything the agent does, from its first check of its
+// configuration to its flush socket's teardown, so that Run can bound all of it
+// by one deadline.
+func supervised(ctx context.Context, cfg Config, log *limitedLog) {
+	n, err := newNode(cfg.Endpoint, cfg.Token, cfg.Transport)
+	if err != nil {
+		log.always("%v; nothing is reported", err)
+
+		return
+	}
+
+	if cfg.Proc == nil {
+		log.always("no /proc tree to read; nothing is reported")
+
+		return
+	}
+
+	if cfg.Nice != 0 {
+		if err := LowerPriority(cfg.Nice); err != nil {
+			log.always("running at the priority it started with: %v", err)
+		}
+	}
+
+	newAgent(n, cfg, log).serve(ctx, cfg.Socket)
+}
+
+// serve runs the agent, and its flush socket when there is one.
+func (a *agent) serve(ctx context.Context, socket string) {
 	if socket != "" {
 		l, err := listenFlush(socket)
 		if err != nil {
@@ -211,8 +223,8 @@ type result struct {
 // run is the agent's loop. It returns when the agent has stopped.
 func (a *agent) run(ctx context.Context) {
 	a.started = time.Now()
-	a.col.sample(a.started, false)
-	a.col.walkProcesses(a.started, false)
+	a.col.sample(false)
+	a.col.walkProcesses(false)
 	a.col.readAgentCPU()
 	a.steps.poll()
 
@@ -239,11 +251,11 @@ func (a *agent) run(ctx context.Context) {
 			<-ctx.Done()
 
 			return
-		case now := <-samples.C:
-			a.col.sample(now, false)
+		case <-samples.C:
+			a.col.sample(false)
 			a.steps.poll()
-		case now := <-walks.C:
-			a.col.walkProcesses(now, false)
+		case <-walks.C:
+			a.col.walkProcesses(false)
 		case <-next.C:
 			if at, again := a.contact(ctx); again {
 				next.Reset(time.Until(at))
@@ -417,8 +429,8 @@ func (a *agent) final(ctx context.Context) {
 		return
 	}
 
-	a.col.sample(start, true)
-	a.col.walkProcesses(start, true)
+	a.col.sample(true)
+	a.col.walkProcesses(true)
 	a.steps.poll()
 
 	tests := collectJUnit(a.junitRoots, time.Now, a.log)

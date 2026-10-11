@@ -302,14 +302,14 @@ func TestTheMonitorIsTheAgentItsFlagsAndEnvironmentDescribe(t *testing.T) {
 	vars := map[string]string{"BILLET_CACHE_ENDPOINT": " http://172.31.0.1:7718 ", "BILLET_CACHE_TOKEN": "t"}
 	env := cli.Env{Stderr: io.Discard, Getenv: func(k string) string { return vars[k] }}
 
-	cfg := monitorConfig(env, "/guest/proc", "/d", nil, "/s.sock")
-	if cfg.Proc != guestagent.ProcFS("/guest/proc") || cfg.Endpoint != "http://172.31.0.1:7718" ||
+	cfg := monitorConfig(env, "/guest/proc", "/d", nil, "/s.sock", 10)
+	if cfg.Proc != guestagent.ProcFS("/guest/proc") || cfg.Endpoint != "http://172.31.0.1:7718" || cfg.Nice != 10 ||
 		cfg.Token != "t" || cfg.DiagDir != "/d" || cfg.Socket != "/s.sock" || len(cfg.JUnitRoots) != 1 ||
 		cfg.JUnitRoots[0] != defaultJUnitRoot {
 		t.Fatalf("the monitor's agent is %+v", cfg)
 	}
 
-	if cfg := monitorConfig(env, "/proc", "", []string{"/a", "/b"}, ""); len(cfg.JUnitRoots) != 2 {
+	if cfg := monitorConfig(env, "/proc", "", []string{"/a", "/b"}, "", 0); len(cfg.JUnitRoots) != 2 {
 		t.Fatalf("the roots given became %v", cfg.JUnitRoots)
 	}
 }

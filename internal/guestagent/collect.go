@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"slices"
 	"strconv"
 	"time"
 
@@ -42,6 +43,9 @@ type procCounters struct {
 // ends while the node is not taking batches still has its end read.
 type collector struct {
 	proc fs.FS
+	// clock stamps each reading when it is read, never when it fell due, so a
+	// loop held past a tick does not date counters read late as read on time.
+	clock func() time.Time
 
 	samples    []guestreport.Sample
 	lastSample *guestreport.Sample
@@ -72,19 +76,19 @@ func room(bound int, final bool) int {
 }
 
 func newCollector(proc fs.FS, log *limitedLog) *collector {
-	return &collector{proc: proc, log: log}
+	return &collector{proc: proc, log: log, clock: time.Now}
 }
 
 // sample reads the guest's totals at now and keeps them, unless the pending
 // samples have no room or the reading goes back on the one kept before it (a clock
 // stepped back, a counter the kernel moved back), which the node would refuse in a
 // merge.
-func (c *collector) sample(now time.Time, final bool) {
+func (c *collector) sample(final bool) {
 	if len(c.samples) >= room(guestreport.MaxBatchSamples, final) {
 		return
 	}
 
-	s, err := c.readSample(now)
+	s, err := c.readSample()
 	if err != nil {
 		c.log.printf("totals", "the guest's totals were not read, so no sample is sent for now: %v", err)
 
@@ -109,13 +113,16 @@ func follows(s, prev *guestreport.Sample) bool {
 		s.NetRxBytes >= prev.NetRxBytes && s.NetTxBytes >= prev.NetTxBytes
 }
 
-func (c *collector) readSample(now time.Time) (guestreport.Sample, error) {
-	s := guestreport.Sample{AtMillis: now.UnixMilli()}
+func (c *collector) readSample() (guestreport.Sample, error) {
+	var s guestreport.Sample
 
 	stat, err := readProc(c.proc, "stat", totalsFileLimit)
 	if err != nil {
 		return s, fmt.Errorf("stat: %w", err)
 	}
+
+	// The instant of a sample is when its CPU counters were read.
+	s.AtMillis = c.clock().UnixMilli()
 
 	if s.CPUBusyTicks, s.CPUTotalTicks, err = cpuTicks(stat); err != nil {
 		return s, err
@@ -160,15 +167,8 @@ func (c *collector) readSample(now time.Time) (guestreport.Sample, error) {
 // not read every live process, or that the pending process samples have no room
 // for, keeps nothing and leaves the base where it was, so the next kept walk
 // covers the time since it.
-func (c *collector) walkProcesses(now time.Time, final bool) {
+func (c *collector) walkProcesses(final bool) {
 	if len(c.processes) >= room(guestreport.MaxBatchProcessSamples, final) {
-		return
-	}
-
-	at := now.UnixMilli()
-	if c.haveBase && at <= c.lastProcAt {
-		c.log.printf("processes-back", "the guest's clock went back; no process sample is sent for now")
-
 		return
 	}
 
@@ -195,6 +195,14 @@ func (c *collector) walkProcesses(now time.Time, final bool) {
 		return
 	}
 
+	// The walk ends when the busy CPU it is measured against was read.
+	at := c.clock().UnixMilli()
+	if c.haveBase && at <= c.lastProcAt {
+		c.log.printf("processes-back", "the guest's clock went back; no process sample is sent for now")
+
+		return
+	}
+
 	if !c.haveBase {
 		c.base, c.baseBusy, c.haveBase, c.lastProcAt = current, busy, true, at
 
@@ -214,8 +222,10 @@ func (c *collector) walkProcesses(now time.Time, final bool) {
 	// out a little below zero, which is no CPU.
 	residual := max(busy-c.baseBusy-sum, 0)
 
+	// Fold's rows share an array with every name it folded away; a sample held
+	// for long keeps only its own.
 	c.processes = append(c.processes, guestreport.ProcessSample{
-		AtMillis: at, Rows: kept, Other: other, ResidualCPUTicks: residual,
+		AtMillis: at, Rows: slices.Clone(kept), Other: other, ResidualCPUTicks: residual,
 	})
 	c.base, c.baseBusy, c.lastProcAt = current, busy, at
 }

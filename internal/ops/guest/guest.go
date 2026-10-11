@@ -85,18 +85,12 @@ func monitor(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	if *nice != 0 {
-		if err := guestagent.LowerPriority(*nice); err != nil {
-			fmt.Fprintf(env.Stderr, "billet guest monitor: running at the priority it started with: %v\n", err)
-		}
-	}
-
-	return guestagent.Run(ctx, monitorConfig(env, *proc, *diag, roots, *socket))
+	return guestagent.Run(ctx, monitorConfig(env, *proc, *diag, roots, *socket, *nice))
 }
 
 // monitorConfig is the agent the flags and the environment describe. /proc is
 // read through guestagent.ProcFS, which never waits on what the job put there.
-func monitorConfig(env cli.Env, proc, diag string, roots []string, socket string) guestagent.Config {
+func monitorConfig(env cli.Env, proc, diag string, roots []string, socket string, nice int) guestagent.Config {
 	if len(roots) == 0 {
 		roots = []string{defaultJUnitRoot}
 	}
@@ -108,6 +102,7 @@ func monitorConfig(env cli.Env, proc, diag string, roots []string, socket string
 		DiagDir:    diag,
 		JUnitRoots: roots,
 		Socket:     socket,
+		Nice:       nice,
 		Log:        env.Stderr,
 		Version:    version.Version(),
 	}
