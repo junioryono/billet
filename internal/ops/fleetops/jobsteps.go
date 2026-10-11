@@ -194,7 +194,10 @@ func renderStep(line func(label, format string, args ...any), step github.JobSte
 	case used.Covered == 0:
 		line("", "the series covers none of this step, so no usage")
 	case !used.Complete():
-		line("", "partial: the series covers %s of the step's %s, and over that part: %s",
+		// THE PEAK IS NOT THE COVERED PART'S, as the page says: it is the
+		// highest level sampled anywhere inside the step.
+		line("", "partial: the series covers %s of the step's %s; cpu, disk, network and energy are over "+
+			"that part, and the peak memory is the highest level sampled anywhere in the step: %s",
 			used.Covered, used.Span, text)
 	case used.Samples == 0:
 		line("", "%s (no sample inside the step: its share of the interval around it, split by time)", text)

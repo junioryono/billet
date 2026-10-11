@@ -61,16 +61,19 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	guest := readJobGuest(ctx, a, leaseID)
+
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
-		return renderJobJSON(env.Stdout, rec, measured)
+		return renderJobJSON(env.Stdout, rec, measured, guest)
 	}
 	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	if *asHTML {
-		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps))
+		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
 	renderJob(env.Stdout, rec, measured)
 	renderSteps(env.Stdout, steps)
+	renderGuest(env.Stdout, guestViewOf(guest, measured, steps))
 
 	return nil
 }
@@ -100,6 +103,8 @@ type jobJSON struct {
 	StartedAt   string     `json:"started_at"`
 	FinishedAt  string     `json:"finished_at"`
 	Usage       *usageJSON `json:"usage"`
+	// Guest is what the job's own VM reported, null when no row was recorded.
+	Guest *guestJSON `json:"guest"`
 }
 
 // usageJSON is what the host measured. Groups answers for every group, with
@@ -117,15 +122,16 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 	alloc.UsageIO, alloc.UsageNet, alloc.UsagePressure, alloc.UsageEnergy}
 
 // renderJobJSON writes one job's record as an indented JSON object. A job with
-// no usage report has a null usage, never a report of zeros.
-func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) error {
+// no usage report has a null usage, and one with no guest report a null guest,
+// never a report of zeros.
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *jobGuest) error {
 	out := jobJSON{
 		Lease: rec.LeaseID, Tier: rec.Tier, Node: rec.Node, Provider: rec.ChosenProvider,
 		VCPU: rec.VCPU, MemoryBytes: rec.Memory, GitHubJobID: rec.Job.JobID, RunID: rec.RunID,
 		RequestID: max(rec.RequestID, 0), JobName: rec.Job.Name, Repository: rec.Repo,
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
-		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt,
+		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g),
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))

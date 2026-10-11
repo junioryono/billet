@@ -46,6 +46,13 @@ type pageCharts struct {
 	Charts                    []pageChart
 	// Bands are the steps on the charts' x axis, the same on every chart.
 	Bands []chartBand
+
+	// The series and the windows it was drawn from, so another chart can be
+	// drawn on the same axis.
+	tl      *usage.Timeline
+	windows []chartWindow
+	used    []usage.WindowUsage
+	sampled bool
 }
 
 // pageChart is one chart: its lines, or why it is not drawn.
@@ -121,7 +128,8 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	for i, w := range windows {
 		used[i] = windowOf(*tl, w.from, w.to)
 	}
-	x := func(t time.Time) int64 { return out.at(t.Sub(tl.First).Milliseconds()) }
+	out.tl, out.windows, out.used, out.sampled = tl, windows, used, sampled
+	x := out.x
 
 	cpu := pageChart{Title: "CPU (cores busy)"}
 	if !m.Measured(alloc.UsageCPU) {
@@ -145,7 +153,9 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 	if !m.Measured(alloc.UsageMemory) {
 		memory.Unmeasured = "not measured"
 	} else {
-		memory.Top, memory.Lines, memory.Limit = memoryChart(*tl, windows, used, x, sampled, rec.Memory)
+		top := chartTop(max(float64(max(rec.Memory, 0)), float64(peakLevel(*tl))))
+		memory.Top = floatBytes(top)
+		memory.Lines, memory.Limit = memoryChart(*tl, windows, used, x, sampled, rec.Memory, top)
 		if memory.Limit != nil {
 			memory.Limit.Label = "tier memory " + cli.HumanBytes(rec.Memory)
 		}
@@ -187,6 +197,9 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 
 	return out
 }
+
+// x is a wall time on the charts' x axis.
+func (c pageCharts) x(t time.Time) int64 { return c.at(t.Sub(c.tl.First).Milliseconds()) }
 
 // at is an offset from the series' first sample on the charts' x axis.
 func (c pageCharts) at(ms int64) int64 {
@@ -330,7 +343,7 @@ func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time
 	return label(top), lines, lim
 }
 
-// memoryChart draws the memory level: the highest level sampled at each
+// memoryChart draws the memory level against top: the highest level sampled at each
 // offset when every sample is drawn, and otherwise the highest level sampled in
 // each window, with a break for a window that holds no sample.
 //
@@ -339,13 +352,8 @@ func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time
 // line breaks wherever the rate lines do (a gap the sampler marked, a counter
 // that fell and its catch-up), and a sample with breaks on both sides is a dot.
 func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUsage, x func(time.Time) int64,
-	sampled bool, limitBytes int64,
-) (string, []chartLine, *chartLimit) {
-	highest := float64(max(limitBytes, 0))
-	for _, p := range tl.Points {
-		highest = max(highest, float64(p.MemoryCurrent))
-	}
-	top := chartTop(highest)
+	sampled bool, limitBytes int64, top float64,
+) ([]chartLine, *chartLimit) {
 	var p svgPath
 	if sampled {
 		// ONE POINT AN OFFSET, so samples sharing one cannot grow the path past
@@ -378,7 +386,17 @@ func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUs
 		lim = &chartLimit{Y: chartY(float64(limitBytes), top)}
 	}
 
-	return floatBytes(top), []chartLine{{Class: "a", Label: "memory", D: p.String()}}, lim
+	return []chartLine{{Class: "a", Label: "memory", D: p.String()}}, lim
+}
+
+// peakLevel is the highest memory level a series sampled.
+func peakLevel(tl usage.Timeline) int64 {
+	var highest int64
+	for _, p := range tl.Points {
+		highest = max(highest, p.MemoryCurrent)
+	}
+
+	return highest
 }
 
 // floatBytes writes a byte count held as a float, as cli.HumanBytes does for
