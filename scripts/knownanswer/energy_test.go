@@ -420,3 +420,49 @@ func TestEnergyExitsWithItsVerdict(t *testing.T) {
 		}
 	}
 }
+
+// A LOG WITHOUT A METER IS REPORTED AS IT ALWAYS WAS. These goldens were
+// written by the energy check before it read a meter column, and are compared
+// byte for byte, exit status included, through the command a runbook runs.
+func TestTheEnergyReportWithoutAMeterIsUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		activeJ float64
+		alter   func(*usage)
+		code    int
+	}{
+		{"pass", 1000, nil, exitPass},
+		{"fail", 1100, nil, exitFail},
+		{"unmeasured", 1000, func(u *usage) { u.EnergySource = "rapl-unsplit" }, exitUnmeasured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recDir := t.TempDir()
+			body, err := json.Marshal(recordJSON(leaseA(tc.activeJ, 40, tc.alter)["lease-a"]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(recDir, "lease-a.json"), body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			code := run(t.Context(), []string{"energy", "--power-log", referenceLog, "--records", recDir,
+				"--idle-watts", "73.5"}, &stdout, &stderr)
+			if code != tc.code {
+				t.Errorf("exit %d, want %d:\n%s%s", code, tc.code, stdout.String(), stderr.String())
+			}
+			golden := filepath.Join("testdata", "power-log", "energy-"+tc.name+".txt")
+			if os.Getenv("BILLET_UPDATE_FIXTURES") == "1" {
+				if err := os.WriteFile(golden, stdout.Bytes(), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want, err := os.ReadFile(golden)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(stdout.Bytes(), want) {
+				t.Errorf("the report:\n%s\nwant %s:\n%s", stdout.String(), golden, want)
+			}
+		})
+	}
+}
