@@ -734,6 +734,33 @@ func TestTheSessionBucketAnswers429WithRetryAfter(t *testing.T) {
 	}
 }
 
+// A KEPT BATCH HOLDS ABOUT WHAT THE BUDGET CHARGES IT, not the read's buffer,
+// which is 512 bytes however small the batch; otherwise a guest sending small
+// batches would hold several times its budget.
+func TestAKeptBatchHoldsAboutWhatItIsCharged(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := guestService(t)
+	data := guestBatch(t, 1, "")
+
+	if len(data) >= 256 {
+		t.Fatalf("the batch is %d bytes, which does not show the read's 512-byte buffer", len(data))
+	}
+
+	if got := postBatch(t, service, token, "", data).Code; got != http.StatusNoContent {
+		t.Fatalf("a batch answered %d, want 204", got)
+	}
+
+	g := &service.sessionOf("billet-one").guest
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if len(g.batches) != 1 || cap(g.batches[0]) >= 2*len(data) {
+		t.Fatalf("the session keeps %d batches, the first holding %d bytes for %d charged",
+			len(g.batches), cap(g.batches[0]), len(data))
+	}
+}
+
 // A BODY OVER max_body IS 413, read no further than the bound, counted as refused
 // with the bytes read; one exactly at the bound is read whole and judged.
 func TestABatchOverItsBoundIs413(t *testing.T) {

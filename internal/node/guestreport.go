@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -288,7 +289,10 @@ func (s *CacheService) acceptGuestBatch(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	g.batches = append(g.batches, body)
+	// A COPY OF ITS OWN LENGTH: the read's buffer is at least 512 bytes whatever
+	// arrived, so many small batches would hold several times what the budget
+	// counts.
+	g.batches = append(g.batches, bytes.Clone(body))
 	g.kept += int64(len(body))
 	g.accepted++
 
