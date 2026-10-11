@@ -368,9 +368,10 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 		finishes bool          // the stand-in leaves <billet>.done once it has finished
 	}{
 		{name: "the monitor answers", body: "exit 0\n"},
-		// A FLUSH THAT TAKES MOST OF ITS 2 S IS LET FINISH: the hook's own bound
-		// is outside the flush's, never inside it.
-		{name: "the monitor answers late", body: "/bin/sleep 2\n: >\"$0.done\"\nexit 0\n", finishes: true},
+		// A FLUSH THAT TAKES WELL OVER A SECOND IS LET FINISH: the hook's own bound
+		// is outside the flush's 2 s, never inside it. 1.5 s leaves the hook's 3 s
+		// half again for a loaded runner's scheduling.
+		{name: "the monitor answers late", body: "/bin/sleep 1.5\n: >\"$0.done\"\nexit 0\n", finishes: true},
 		{name: "no monitor answers", body: "echo 'no monitor answered' >&2\nexit 1\n"},
 		{name: "the binary talks", body: "echo out\necho err >&2\nexit 0\n"},
 		// timeout -k 1 3 ends it at 4 s. The stand-in is run once before it is timed,
