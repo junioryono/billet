@@ -955,3 +955,44 @@ func TestTheJobPageOfASeriesWithNoInterval(t *testing.T) {
 		})
 	}
 }
+
+// A STEP SHORTER THAN ONE UNIT OF A LONG SERIES FOCUSES ON ONE UNIT INSIDE THE
+// CHARTS, at either end: never a window that starts at the last unit and runs
+// past it.
+func TestAShortStepFocusesInsideTheCharts(t *testing.T) {
+	t.Parallel()
+
+	days := 5 * 24 * time.Hour
+	tl := usage.Timeline{First: pageStart, Points: []usage.Point{
+		{OffsetMillis: 0}, {OffsetMillis: days.Milliseconds(), CPUUsage: 1},
+	}}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
+	charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
+
+	for name, tc := range map[string]struct {
+		step     github.JobStep
+		from, to int64
+	}{
+		"last second":  {github.JobStep{StartedAt: pageStart.Add(days - time.Second), CompletedAt: pageStart.Add(days)}, chartWidth - 1, chartWidth},
+		"first second": {github.JobStep{StartedAt: pageStart, CompletedAt: pageSecond(1)}, 0, 1},
+	} {
+		from, to, ok := charts.stepWindow(tc.step, &tl)
+		if !ok || from != tc.from || to != tc.to {
+			t.Errorf("%s: focus %d to %d (%v), want %d to %d", name, from, to, ok, tc.from, tc.to)
+		}
+	}
+}
+
+// THE SCRIPT IS HASHED AS A BROWSER HASHES IT: the HTML parser makes every line
+// end LF before the policy is checked, so a checkout with CRLF line ends must
+// still name the hash a browser computes.
+func TestTheInlineScriptHasTheLineEndsABrowserHashes(t *testing.T) {
+	t.Parallel()
+
+	if got := inlineScript("a\r\nb\rc\nd"); got != "a\nb\nc\nd" {
+		t.Errorf("inlineScript = %q, want every line end LF", got)
+	}
+	if strings.Contains(jobPageScript, "\r") {
+		t.Errorf("the page's script carries a CR")
+	}
+}

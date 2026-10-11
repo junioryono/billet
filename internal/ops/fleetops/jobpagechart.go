@@ -450,6 +450,16 @@ func (c pageCharts) stepWindow(step github.JobStep, tl *usage.Timeline) (int64, 
 	if to <= from {
 		return 0, 0, false
 	}
+	// A STEP SHORTER THAN ONE UNIT STILL FOCUSES ON ONE, inside the charts: a
+	// focus past either end would show nothing the series recorded.
+	x0, x1 := c.at(from), c.at(to)
+	if x1 == x0 {
+		if x1 < chartWidth {
+			x1++
+		} else {
+			x0--
+		}
+	}
 
-	return c.at(from), c.at(to), true
+	return x0, x1, true
 }

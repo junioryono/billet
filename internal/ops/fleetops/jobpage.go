@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -28,10 +29,18 @@ var (
 	//go:embed jobpage/page.css
 	jobPageStyle string
 	//go:embed jobpage/page.js
-	jobPageScript string
+	jobPageScriptFile string
 
+	jobPageScript   = inlineScript(jobPageScriptFile)
 	jobPageTemplate = template.Must(template.New("page").Parse(jobPageSource))
 )
+
+// inlineScript is a script as a browser hashes it once inline: the HTML parser
+// turns every CRLF and lone CR into LF before the policy sees the text, so a
+// checkout with CRLF line ends would otherwise name a hash no browser computes.
+func inlineScript(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
 
 // jobPagePolicy is the page's Content-Security-Policy: nothing may be fetched,
 // inline style is allowed, and the one script runs only because its hash is
