@@ -31,11 +31,15 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet jobs show", env.Stdout)
 	cfgPath := cli.AddConfigFlag(fs)
 	asJSON := fs.Bool("json", false, "print the record as one JSON object")
+	asHTML := fs.Bool("html", false, "print the job as one self-contained HTML page")
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: billet jobs show [--config PATH] [--json] <lease>")
+		return errors.New("usage: billet jobs show [--config PATH] [--json | --html] <lease>")
+	}
+	if *asJSON && *asHTML {
+		return errors.New("billet jobs show: --json and --html each print the whole record; choose one")
 	}
 	leaseID := fs.Arg(0)
 
@@ -62,6 +66,9 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 		return renderJobJSON(env.Stdout, rec, measured)
 	}
 	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
+	if *asHTML {
+		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps))
+	}
 	renderJob(env.Stdout, rec, measured)
 	renderSteps(env.Stdout, steps)
 
@@ -179,14 +186,30 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	if u == nil {
 		// NOT A REASON: a job still running has no report either, since the node
 		// sends one as its compute is destroyed.
-		fmt.Fprintln(w, "usage      no report recorded (one arrives as the job's compute is destroyed, "+
-			"from a node with node.monitoring)")
+		line("usage", "%s", noUsageReport)
 		return
 	}
-	line("usage", "measured by the host %s, %d samples every %s over %s",
+	line("usage", "%s", measuredBy(u))
+	renderUsageGroups(line, u)
+	renderCounters(line, u.Counters)
+	renderDestinations(w, u.Destinations)
+}
+
+// noUsageReport is what a job with no usage report says in place of one.
+const noUsageReport = "no report recorded (one arrives as the job's compute is destroyed, " +
+	"from a node with node.monitoring)"
+
+// measuredBy says which host measured a job, and how often over how long.
+func measuredBy(u *alloc.RecordedUsage) string {
+	return fmt.Sprintf("measured by the host %s, %d samples every %s over %s",
 		orUnknown(u.Node), u.Samples, time.Duration(u.IntervalMillis)*time.Millisecond,
 		time.Duration(u.WindowMillis)*time.Millisecond)
+}
 
+// renderUsageGroups writes one line for each group a usage report answers for,
+// "not measured" for a group the host could not read. The text report and the
+// job page both word a group through here.
+func renderUsageGroups(line func(label, format string, args ...any), u *alloc.RecordedUsage) {
 	group := func(name, label string, render func() string) {
 		if !u.Measured(name) {
 			line(label, "not measured")
@@ -231,8 +254,6 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 		return fmt.Sprintf("%s (package RAPL with no idle baseline, so idle is inside it; source %s)",
 			joules(u.EnergyActiveMicrojoules), strconv.Quote(u.EnergySource))
 	})
-	renderCounters(line, u.Counters)
-	renderDestinations(w, u.Destinations)
 }
 
 // renderCounters writes what the hardware counters saw and the ratios a reader

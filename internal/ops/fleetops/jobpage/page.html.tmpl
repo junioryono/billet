@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{{.Policy}}">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Page.Title}}</title>
+<style>{{.Style}}</style>
+</head>
+<body>
+{{- with .Page}}
+<header>
+<p class="kicker">billet job</p>
+<h1>{{.Heading}}</h1>
+<p class="result {{.ResultClass}}">{{.Result}}</p>
+<dl class="fields">
+{{- range .Identity}}
+<dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+{{- end}}
+</dl>
+</header>
+
+<section id="steps">
+<h2>Steps</h2>
+{{- if .Steps.Why}}
+<p class="why">{{.Steps.Why}}</p>
+{{- else}}
+<p>{{.Steps.Head}}</p>
+<p class="note">{{.Steps.Alignment}}</p>
+<ol class="timeline">
+{{- range .Steps.Rows}}
+<li class="{{.Class}}">
+{{- if .Focus}}<button type="button" data-from="{{.From}}" data-to="{{.To}}" data-key="{{.Key}}" data-step="{{.Number}}" aria-pressed="false">
+{{- else}}<button type="button" disabled>{{end -}}
+<span class="n">{{.Number}}</span> <span class="name">{{.Name}}</span></button>
+<span class="outcome">{{.Outcome}}</span>
+<span class="took">{{.Took}}</span>
+<svg class="bar" viewBox="0 0 1000 10" preserveAspectRatio="none" aria-hidden="true">
+{{- if .HasBar}}<rect x="{{.BarX}}" y="0" width="{{.BarW}}" height="10"></rect>{{end -}}
+</svg>
+</li>
+{{- end}}
+</ol>
+{{- end}}
+</section>
+
+<section id="charts">
+<h2>Usage over the job</h2>
+{{- with .Charts}}
+{{- if .Why}}
+<p class="why">{{.Why}}</p>
+{{- else}}
+<p>The host's series from {{.Start}} to {{.End}} on its own clock ({{.Length}}). {{- if .Focusable}} <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="0" data-to="{{.Units}}" data-origin="{{.Origin}}" data-width="{{.Width}}">Show the whole series</button>{{end}}</p>
+<p class="note">{{.Drawn}}{{if .Focusable}} Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.{{end}}</p>
+{{- $c := .}}
+{{- range .Charts}}
+<figure class="chart">
+<figcaption>{{.Title}}
+{{- if not .Unmeasured}}{{range .Lines}} <span class="key {{.Class}}">{{.Label}}</span>{{end}}{{end -}}
+</figcaption>
+{{- if .Unmeasured}}
+<p class="unmeasured">{{.Unmeasured}}</p>
+{{- else}}
+<div class="plot">
+<span class="top">{{.Top}}</span>
+<svg data-chart="" viewBox="0 0 {{$c.Units}} 100" preserveAspectRatio="none" role="img" aria-label="{{.Title}}">
+{{- range $c.Bands}}
+<rect class="{{.Class}}" data-key="{{.Key}}" x="{{.X}}" y="0" width="{{.W}}" height="100"></rect>
+{{- end}}
+{{- with .Limit}}
+<line class="limit" x1="0" x2="{{$c.Units}}" y1="{{.Y}}" y2="{{.Y}}"></line>
+{{- end}}
+{{- range .Lines}}
+<path class="line {{.Class}}" d="{{.D}}"></path>
+{{- end}}
+</svg>
+<span class="x0">{{$c.X0}}</span><span class="x1">{{$c.X1}}</span>
+</div>
+{{- with .Limit}}
+<p class="note">Dashed: {{.Label}}.</p>
+{{- end}}
+{{- with .Note}}
+<p class="note">{{.}}</p>
+{{- end}}
+{{- end}}
+</figure>
+{{- end}}
+{{- end}}
+{{- end}}
+</section>
+
+<section id="step-usage">
+<h2>Usage by step</h2>
+{{- if .Steps.Why}}
+<p class="why">{{.Steps.Why}}</p>
+{{- else if not .Steps.Rows}}
+<p class="why">GitHub lists no steps for this job.</p>
+{{- else}}
+<div class="scroll">
+<table>
+<thead><tr><th>Step</th><th>Started (GitHub)</th><th>Took</th><th>CPU</th><th>Peak memory</th><th>Disk read</th><th>Disk written</th><th>Received</th><th>Sent</th><th>Energy</th></tr></thead>
+<tbody>
+{{- range .Steps.Rows}}
+<tr><th scope="row">{{.Number}} {{.Name}}</th><td>{{with .Started}}{{.}}{{else}}not given{{end}}</td><td>{{.Took}}</td>
+{{- if .Usage}}{{range .Usage}}<td{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</td>{{end}}
+{{- else}}<td colspan="7" class="none">{{.Note}}</td>{{end}}</tr>
+{{- if and .Usage .Note}}
+<tr class="qualifier"><td></td><td colspan="9">{{.Note}}</td></tr>
+{{- end}}
+{{- end}}
+</tbody>
+</table>
+</div>
+<p class="note">Network columns are the guest's own view. Disk is host IO that missed the host's page cache, plus writeback.</p>
+{{- end}}
+</section>
+
+<section id="usage">
+<h2>What the host measured</h2>
+<p>{{.Usage.Report}}</p>
+{{- if .Usage.Groups}}
+<dl class="fields">
+{{- range .Usage.Groups}}
+<dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
+{{- end}}
+</dl>
+<h3>Hardware counters</h3>
+<dl class="fields">
+{{- range .Usage.Counters}}
+<dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
+{{- end}}
+</dl>
+{{- end}}
+</section>
+
+<section id="destinations">
+<h2>Destinations</h2>
+{{- with .Destinations}}
+{{- if .Why}}
+<p class="why">{{.Why}}</p>
+{{- else}}
+<p>{{.Summary}}</p>
+{{- if .Rows}}
+<div class="scroll">
+<table>
+<thead><tr><th>Address</th><th>Sent</th><th>Received</th><th>Connections</th></tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr><th scope="row">{{.Addr}}</th><td>{{.Sent}}</td><td>{{.Received}}</td><td>{{.Connections}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{- end}}
+{{- with .More}}
+<p>{{.}}</p>
+{{- end}}
+<dl class="fields">
+<dt>other</dt><dd>{{.Other}}</dd>
+<dt>complete</dt><dd>{{.Complete}}</dd>
+<dt>tap</dt><dd>{{.Tap}}</dd>
+</dl>
+{{- with .TapNote}}
+<p class="note">{{.}}</p>
+{{- end}}
+{{- end}}
+{{- end}}
+</section>
+
+<footer>Rendered by <code>billet jobs show --html</code> from the ledger and GitHub's record of the run. Read-only: the page fetches nothing.</footer>
+{{- end}}
+<script>{{.Script}}</script>
+</body>
+</html>
