@@ -114,8 +114,8 @@ func buildCharts(tl *usage.Timeline, unaligned string, rec alloc.JobRecord, m *a
 			"each sample interval.", groupDigits(int64(len(tl.Points))))
 	} else {
 		out.Drawn = fmt.Sprintf("Downsampled for drawing: the series' %s samples are drawn as %d windows "+
-			"of %s each, a rate as the average over its window and memory as the highest level sampled "+
-			"in it.", groupDigits(int64(len(tl.Points))), len(windows), windows[0].to.Sub(windows[0].from))
+			"of %s each, a rate as the average over a window the series covers whole (any other is a "+
+			"break) and memory as the highest level sampled in it.", groupDigits(int64(len(tl.Points))), len(windows), windows[0].to.Sub(windows[0].from))
 	}
 	used := make([]usage.WindowUsage, len(windows))
 	for i, w := range windows {
@@ -286,8 +286,12 @@ func bytesPerSecond(count func(usage.WindowUsage) int64) func(usage.WindowUsage)
 }
 
 // rateChart draws each series as a step line, one level for each window the
-// series covered and a break for each it did not, scaled so the highest value
-// or the limit, whichever is larger, sits near the top.
+// series covers whole and a break for each it does not, scaled so the highest
+// value or the limit, whichever is larger, sits near the top.
+//
+// A WINDOW COVERED IN PART IS A BREAK, not its covered part's rate drawn
+// across the whole of it: a level across the uncovered part would be a rate
+// for time the series cannot tell about.
 func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time) int64, limit float64,
 	label func(float64) string, series ...rateSeries,
 ) (string, []chartLine, *chartLimit) {
@@ -297,7 +301,7 @@ func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time
 		rates[s] = make([]float64, len(windows))
 		for i, u := range used {
 			rates[s][i] = math.NaN()
-			if u.Covered <= 0 {
+			if !u.Complete() {
 				continue
 			}
 			rate := line.rate(u)

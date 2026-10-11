@@ -251,10 +251,10 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <tr><th scope="row">1 Set up job</th><td>2026-10-09T12:00:00Z</td><td>4s</td><td>1.3s</td><td>718.9 MiB</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0 B</td><td>14.1 J active</td></tr>
 <tr><th scope="row">2 Run actions/checkout@v5</th><td>2026-10-09T12:00:04Z</td><td>15s</td><td>6.6s</td><td>3.3 GiB</td><td>0 B</td><td>441.9 MiB</td><td>324.0 MiB</td><td>2.9 MiB</td><td>72.9 J active</td></tr>
 <tr><th scope="row">3 Build</th><td>2026-10-09T12:00:19Z</td><td>1m12s</td><td>113.9s</td><td>3.4 GiB</td><td>356.0 MiB</td><td>2.8 GiB</td><td>71.2 MiB</td><td>4.4 MiB</td><td>1.3 kJ active</td></tr>
-<tr class="qualifier"><td></td><td colspan="9">partial: the series covers 1m11s of the step&#39;s 1m12s, and these are over that part</td></tr>
+<tr class="qualifier"><td></td><td colspan="9">partial: the series covers 1m11s of the step&#39;s 1m12s; CPU, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step</td></tr>
 <tr><th scope="row">4 Test</th><td>2026-10-09T12:01:31Z</td><td>1m16s</td><td>91.1s</td><td>2.2 GiB</td><td>151.8 MiB</td><td>455.5 MiB</td><td>227.8 MiB</td><td>75.9 MiB</td><td>1.0 kJ active</td></tr>
 <tr><th scope="row">5 Post Run actions/checkout@v5</th><td>2026-10-09T12:02:47Z</td><td>1s</td><td>0.0s</td><td>381.3 MiB</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0 B</td><td>0.5 J active</td></tr>
-<tr class="qualifier"><td></td><td colspan="9">partial: the series covers 500ms of the step&#39;s 1s, and these are over that part</td></tr>
+<tr class="qualifier"><td></td><td colspan="9">partial: the series covers 500ms of the step&#39;s 1s; CPU, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step</td></tr>
 <tr><th scope="row">6 Complete job</th><td>2026-10-09T12:02:48Z</td><td>0s</td><td colspan="7" class="none">start and end in the same second, so no usage can be placed in it</td></tr>
 </tbody>
 </table>

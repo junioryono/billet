@@ -363,7 +363,10 @@ func stepRow(step github.JobStep, tl *usage.Timeline, measured *alloc.RecordedUs
 		row.Note = "the series covers none of this step, so no usage"
 		return row
 	case !used.Complete():
-		row.Note = fmt.Sprintf("partial: the series covers %s of the step's %s, and these are over that part",
+		// THE PEAK IS NOT THE COVERED PART'S: it is the highest level sampled
+		// anywhere inside the step, which a sample next to unseen time can set.
+		row.Note = fmt.Sprintf("partial: the series covers %s of the step's %s; CPU, disk, network and "+
+			"energy are over that part, and the peak memory is the highest level sampled anywhere in the step",
 			used.Covered, used.Span)
 	case used.Samples == 0:
 		row.Note = "no sample inside the step: its share of the interval around it, split by time"

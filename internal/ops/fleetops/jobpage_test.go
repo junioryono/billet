@@ -281,7 +281,8 @@ func TestJobsShowHTMLIsTheCommittedExample(t *testing.T) {
 		`<button type="button" data-from="11343" data-to="54328" data-key="2" data-step="3" aria-pressed="false">`,
 		`<th scope="row">3 Build</th><td>2026-10-09T12:00:19Z</td><td>1m12s</td>`,
 		"partial: the series covers 1m11s of the step&#39;s 1m12s",
-		"partial: the series covers 500ms of the step&#39;s 1s",
+		"partial: the series covers 500ms of the step&#39;s 1s; CPU, disk, network and energy are over that " +
+			"part, and the peak memory is the highest level sampled anywhere in the step",
 		"start and end in the same second, so no usage can be placed in it",
 		"1.20 instructions per cycle", "3.2 misses per 1,000 instructions",
 		`<rect class="band0" data-key="2" x="11343" y="0" width="42985" height="100"></rect>`,
@@ -883,6 +884,42 @@ func TestTheMemoryLineBreaksWhereACounterFell(t *testing.T) {
 				t.Errorf("the CPU line is not broken before 2s, so the series is not the one meant: %s", cpu)
 			}
 		})
+	}
+}
+
+// A DOWNSAMPLED WINDOW THE SERIES COVERS ONLY IN PART IS A BREAK IN EVERY RATE
+// LINE, never the covered part's rate drawn across the whole window: 722
+// samples a second apart are drawn as 720 windows a little over a second
+// wide, and the sampler's gap before 1s leaves the first covered for a few
+// milliseconds only.
+func TestARateIsNotDrawnAcrossAWindowCoveredInPart(t *testing.T) {
+	t.Parallel()
+
+	tl := usage.Timeline{First: pageStart}
+	for s := range int64(maxChartWindows + 2) {
+		tl.Points = append(tl.Points, usage.Point{OffsetMillis: s * 1000, CPUUsage: s * 500_000,
+			DiskRead: s << 20, DiskWrite: s << 20, NetRx: s << 20, NetTx: s << 20, AfterGap: s == 1})
+	}
+	measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
+	charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
+
+	// THE PREMISE: the first window is downsampled and covered only in part.
+	windows, sampled := chartWindows(tl)
+	if first := windowOf(tl, windows[0].from, windows[0].to); sampled || first.Covered == 0 || first.Complete() {
+		t.Fatalf("the first window is not one covered in part (sampled %v, covered %s of %s)", sampled,
+			first.Covered, first.Span)
+	}
+	for _, chart := range []int{0, 2, 3} {
+		for _, line := range charts.Charts[chart].Lines {
+			if strings.HasPrefix(line.D, "M0 ") {
+				t.Errorf("%s %s is drawn across the first window, covered in part: %.40s",
+					charts.Charts[chart].Title, line.Label, line.D)
+			}
+			if !strings.HasPrefix(line.D, "M139 ") {
+				t.Errorf("%s %s does not start at the second window: %.40s", charts.Charts[chart].Title,
+					line.Label, line.D)
+			}
+		}
 	}
 }
 
