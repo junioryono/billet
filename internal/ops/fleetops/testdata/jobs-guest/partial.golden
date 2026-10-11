@@ -69,7 +69,7 @@ host level peak 3.4 GiB (the cgroup's level, which for a microVM counts the VMM 
 cpu check  the guest counted 185.8s busy since it booted, to its last sample; the host counted 208.3s on its vCPU threads over the whole lease (guest minus host -22.5s)
 net check  the guest's eth0 counted received 554.0 MiB, sent 57.6 MiB since it booted, to its last sample; the host counted received 624.1 MiB, sent 83.3 MiB on the tap over the whole lease (guest minus host: received -70.1 MiB, sent -25.7 MiB)
 agent cpu  0.6s, 0.3% of the guest's busy CPU since it booted (its own count)
-agent sent 13 batches accepted, so at most 832.0 KiB of batch bodies on the tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and 0 B of refused ones it read
+agent sent 13 batches accepted, so at most 832.0 KiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)
 marks      Each mark is the runner's log line for a step's start, stamped by the guest's clock to the second, matched by name, in order, to GitHub's steps, whose numbers and names are the authority.
 mark 1     "Run actions/checkout@v5" at 2026-10-09T12:00:03Z on the guest's clock, step 2 "Run actions/checkout@v5", GitHub's start 2026-10-09T12:00:04Z, mark minus GitHub's start -1s
 mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3 "Build", GitHub's start 2026-10-09T12:00:19Z, mark minus GitHub's start -1s
@@ -104,7 +104,7 @@ step 4     "Test", 25 process samples, ending 2026-10-09T12:01:31.750Z to 2026-1
              "billet" x1: cpu 0.2s, peak rss 14.0 MiB, read 0 B, written 0 B
              every other process (0 more names, and those past the agent's own cut): cpu 0.5s, read 0 B, written 0 B
              cpu no live process was charged with (processes that exited inside an interval): 0.8s
-tests      could not tell: the agent sends its test results in its last batch, which did not arrive
+tests      could not tell: the agent sends its test results in its last batch, and the report does not hold it
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>
@@ -160,7 +160,7 @@ tests      could not tell: the agent sends its test results in its last batch, w
 <dt>cpu check</dt><dd>the guest counted 185.8s busy since it booted, to its last sample; the host counted 208.3s on its vCPU threads over the whole lease (guest minus host -22.5s)</dd>
 <dt>net check</dt><dd>the guest&#39;s eth0 counted received 554.0 MiB, sent 57.6 MiB since it booted, to its last sample; the host counted received 624.1 MiB, sent 83.3 MiB on the tap over the whole lease (guest minus host: received -70.1 MiB, sent -25.7 MiB)</dd>
 <dt>agent cpu</dt><dd>0.6s, 0.3% of the guest&#39;s busy CPU since it booted (its own count)</dd>
-<dt>agent sent</dt><dd>13 batches accepted, so at most 832.0 KiB of batch bodies on the tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and 0 B of refused ones it read</dd>
+<dt>agent sent</dt><dd>13 batches accepted, so at most 832.0 KiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)</dd>
 </dl>
 <h3>Step marks</h3>
 <p class="note">Each mark is the runner&#39;s log line for a step&#39;s start, stamped by the guest&#39;s clock to the second, matched by name, in order, to GitHub&#39;s steps, whose numbers and names are the authority.</p>
@@ -219,5 +219,5 @@ tests      could not tell: the agent sends its test results in its last batch, w
 </table>
 </div>
 <h3>Test results</h3>
-<p class="why">could not tell: the agent sends its test results in its last batch, which did not arrive</p>
+<p class="why">could not tell: the agent sends its test results in its last batch, and the report does not hold it</p>
 

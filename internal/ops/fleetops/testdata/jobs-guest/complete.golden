@@ -48,7 +48,7 @@ step 5     "Post Run actions/checkout@v5" "success", started 2026-10-09T12:02:47
            partial: the series covers 500ms of the step's 1s; cpu, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 0.0s, peak memory 381.3 MiB, disk read 0 B, written 0 B, network received 0 B, sent 0 B, energy 0.5 J active
 step 6     "Complete job" "success", started 2026-10-09T12:02:48Z, took 0s (start and end in the same second), so no usage can be placed in it
 
-guest      complete: the agent's last batch arrived and the node did not restart while the job ran
+guest      complete: the agent's last batch arrived, the report holds every batch the node accepted, and the node did not restart while the job ran
            Reported by the job's own VM. The job runs as root there and can change any of it; billet does not act on it.
 node       epyc-1
 agent      "0.15.1", schema 1
@@ -69,7 +69,7 @@ host level peak 3.4 GiB (the cgroup's level, which for a microVM counts the VMM 
 cpu check  the guest counted 217.2s busy since it booted, to its last sample; the host counted 208.3s on its vCPU threads over the whole lease (guest minus host +8.8s)
 net check  the guest's eth0 counted received 632.0 MiB, sent 83.6 MiB since it booted, to its last sample; the host counted received 624.1 MiB, sent 83.3 MiB on the tap over the whole lease (guest minus host: received +7.9 MiB, sent +319.3 KiB)
 agent cpu  0.7s, 0.3% of the guest's busy CPU since it booted (its own count)
-agent sent 17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and 0 B of refused ones it read
+agent sent 17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)
 marks      Each mark is the runner's log line for a step's start, stamped by the guest's clock to the second, matched by name, in order, to GitHub's steps, whose numbers and names are the authority.
 mark 1     "Run actions/checkout@v5" at 2026-10-09T12:00:03Z on the guest's clock, step 2 "Run actions/checkout@v5", GitHub's start 2026-10-09T12:00:04Z, mark minus GitHub's start -1s
 mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3 "Build", GitHub's start 2026-10-09T12:00:19Z, mark minus GitHub's start -1s
@@ -112,7 +112,7 @@ suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
 <section id="guest">
 <h2>What the job's own VM reported</h2>
 <p class="unverified">Reported by the job&#39;s own VM. The job runs as root there and can change any of it; billet does not act on it.</p>
-<p class="why">complete: the agent&#39;s last batch arrived and the node did not restart while the job ran</p>
+<p class="why">complete: the agent&#39;s last batch arrived, the report holds every batch the node accepted, and the node did not restart while the job ran</p>
 <h3>The channel, as the node counted it</h3>
 <dl class="fields">
 <dt>node</dt><dd>epyc-1</dd>
@@ -163,7 +163,7 @@ suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
 <dt>cpu check</dt><dd>the guest counted 217.2s busy since it booted, to its last sample; the host counted 208.3s on its vCPU threads over the whole lease (guest minus host &#43;8.8s)</dd>
 <dt>net check</dt><dd>the guest&#39;s eth0 counted received 632.0 MiB, sent 83.6 MiB since it booted, to its last sample; the host counted received 624.1 MiB, sent 83.3 MiB on the tap over the whole lease (guest minus host: received &#43;7.9 MiB, sent &#43;319.3 KiB)</dd>
 <dt>agent cpu</dt><dd>0.7s, 0.3% of the guest&#39;s busy CPU since it booted (its own count)</dd>
-<dt>agent sent</dt><dd>17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and 0 B of refused ones it read</dd>
+<dt>agent sent</dt><dd>17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)</dd>
 </dl>
 <h3>Step marks</h3>
 <p class="note">Each mark is the runner&#39;s log line for a step&#39;s start, stamped by the guest&#39;s clock to the second, matched by name, in order, to GitHub&#39;s steps, whose numbers and names are the authority.</p>

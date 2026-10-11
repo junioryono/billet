@@ -316,7 +316,7 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <section id="guest">
 <h2>What the job's own VM reported</h2>
 <p class="unverified">Reported by the job&#39;s own VM. The job runs as root there and can change any of it; billet does not act on it.</p>
-<p class="why">complete: the agent&#39;s last batch arrived and the node did not restart while the job ran</p>
+<p class="why">complete: the agent&#39;s last batch arrived, the report holds every batch the node accepted, and the node did not restart while the job ran</p>
 <h3>The channel, as the node counted it</h3>
 <dl class="fields">
 <dt>node</dt><dd>epyc-1</dd>
@@ -367,7 +367,7 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <dt>cpu check</dt><dd>the guest counted 217.2s busy since it booted, to its last sample; the host counted 208.3s on its vCPU threads over the whole lease (guest minus host &#43;8.8s)</dd>
 <dt>net check</dt><dd>the guest&#39;s eth0 counted received 632.0 MiB, sent 83.6 MiB since it booted, to its last sample; the host counted received 624.1 MiB, sent 83.3 MiB on the tap over the whole lease (guest minus host: received &#43;7.9 MiB, sent &#43;319.3 KiB)</dd>
 <dt>agent cpu</dt><dd>0.7s, 0.3% of the guest&#39;s busy CPU since it booted (its own count)</dd>
-<dt>agent sent</dt><dd>17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and 0 B of refused ones it read</dd>
+<dt>agent sent</dt><dd>17 batches accepted, so at most 1.1 MiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)</dd>
 </dl>
 <h3>Step marks</h3>
 <p class="note">Each mark is the runner&#39;s log line for a step&#39;s start, stamped by the guest&#39;s clock to the second, matched by name, in order, to GitHub&#39;s steps, whose numbers and names are the authority.</p>

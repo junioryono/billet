@@ -64,6 +64,9 @@ type jobGuest struct {
 	// report is the guest's decoded report, nil unless the verdict is
 	// guestNodeRestarted, guestPartial or guestComplete.
 	report *guestreport.Report
+	// finalKept says the agent's last batch is in the report, so what only it
+	// carries (the test results) can be told.
+	finalKept bool
 }
 
 // readJobGuest reads and judges what a lease's guest reported. Nil is no row;
@@ -118,6 +121,16 @@ func judgeGuest(row alloc.RecordedGuestReport) *jobGuest {
 	}
 	g.report = &r
 
+	// THE LAST BATCH ARRIVING IS NOT ITS BEING KEPT: the node counts it final as
+	// it accepts it, and then can drop it past what it assembles, or the merge can
+	// refuse it. It is in the report only when every batch the node accepted is:
+	// the kept and the repeated account for all of them, since a batch the merge
+	// refused, a resend with other content and one dropped past the assembly each
+	// leave one unaccounted for.
+	whole := r.Batches+r.Duplicates == row.Accepted
+	g.finalKept = row.FinalSeen && whole
+	notKept := fmt.Sprintf("not every batch the node accepted is in the report (%d accepted, %d kept, %d "+
+		"refused by the merge), so it may end before the job did", row.Accepted, r.Batches, r.Refused)
 	missing := ""
 	if r.Missing > 0 {
 		missing = fmt.Sprintf("; %d of the agent's batches between its first and last never arrived", r.Missing)
@@ -127,15 +140,22 @@ func judgeGuest(row alloc.RecordedGuestReport) *jobGuest {
 		g.verdict = guestNodeRestarted
 		g.why = "node restarted: the node restarted while the job ran, so the batches it held before then " +
 			"were lost and the report starts after the restart"
-		if !row.FinalSeen {
+		switch {
+		case !row.FinalSeen:
 			g.why += "; the agent's last batch did not arrive either, so it ends before the job did"
+		case !whole:
+			g.why += "; and " + notKept
 		}
 	case !row.FinalSeen:
 		g.verdict = guestPartial
 		g.why = "partial: the agent's last batch did not arrive, so the report ends before the job did"
+	case !whole:
+		g.verdict = guestPartial
+		g.why = "partial: the agent's last batch arrived, but " + notKept
 	default:
 		g.verdict = guestComplete
-		g.why = "complete: the agent's last batch arrived and the node did not restart while the job ran"
+		g.why = "complete: the agent's last batch arrived, the report holds every batch the node accepted, " +
+			"and the node did not restart while the job ran"
 	}
 	g.why += missing
 
@@ -233,7 +253,7 @@ func guestViewOf(g *jobGuest, measured *alloc.RecordedUsage, steps jobSteps) gue
 		listed = steps.job.Steps
 	}
 	v.Steps = guestSteps(r, listed)
-	v.Tests = guestTests(r, g.row.FinalSeen)
+	v.Tests = guestTests(r, g.finalKept)
 
 	return v
 }
@@ -432,10 +452,9 @@ func guestAgent(row alloc.RecordedGuestReport, r *guestreport.Report) []pageFiel
 	return []pageField{
 		{Label: "agent cpu", Value: fmt.Sprintf("%s, %s (its own count)", floatSeconds(agentCPU), share)},
 		{Label: "agent sent", Value: fmt.Sprintf("%d batches accepted, so at most %s of batch bodies on the "+
-			"tap, plus HTTP and TCP framing (the node counts the batches it accepted, not their bytes), and "+
-			"%s of refused ones it read", row.Accepted,
-			bigBytes(new(big.Int).Mul(big.NewInt(row.Accepted), big.NewInt(guestreport.MaxBatchBytes))),
-			cli.HumanBytes(row.DroppedBytes))},
+			"tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it "+
+			"accepted, not their bytes)", row.Accepted,
+			bigBytes(new(big.Int).Mul(big.NewInt(row.Accepted), big.NewInt(guestreport.MaxBatchBytes))))},
 	}
 }
 
@@ -501,6 +520,12 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 		default:
 			group.Label = "mark " + strconv.Itoa(k)
 			group.Name = strconv.Quote(r.Steps[k-1].Name) + " (the guest's name, matched to no GitHub step)"
+		}
+		// MARKS PAST THE REPORT'S BOUND WERE DROPPED, so the processes after the
+		// last mark kept may belong to the steps those marks began.
+		if k == len(r.Steps) && k > 0 && r.Dropped.Steps > 0 {
+			group.Name += fmt.Sprintf(", and whatever came after it: %d later marks were left out past the "+
+				"report's bound", r.Dropped.Steps)
 		}
 		fillProcs(&group, samples, r.TicksPerSecond)
 		out.Procs = append(out.Procs, group)
@@ -594,12 +619,14 @@ func fillProcs(group *guestStepProcs, samples []guestreport.ProcessSample, ticks
 		cpu(exited)
 }
 
-// guestTests is the test results the agent found.
-func guestTests(r *guestreport.Report, final bool) guestTestsView {
+// guestTests is the test results the agent found. finalKept says the report
+// holds the agent's last batch, which carries them.
+func guestTests(r *guestreport.Report, finalKept bool) guestTestsView {
 	var out guestTestsView
 	switch {
-	case len(r.Tests) == 0 && !final:
-		out.Why = "could not tell: the agent sends its test results in its last batch, which did not arrive"
+	case len(r.Tests) == 0 && !finalKept:
+		out.Why = "could not tell: the agent sends its test results in its last batch, and the report does not " +
+			"hold it"
 	case len(r.Tests) == 0:
 		out.Why = "the agent found no test results (it reads the JUnit XML files it finds when the job ends)"
 	}

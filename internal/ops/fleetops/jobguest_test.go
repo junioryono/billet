@@ -3,13 +3,14 @@ package fleetops
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/github"
@@ -228,7 +229,8 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 			"guest      partial: the agent's last batch did not arrive, so the report ends before the job " +
 				"did; 1 of the agent's batches between its first and last never arrived",
 			"sequence   batches 1 to 14: 13 kept, 0 refused by the merge, 1 never arrived (9)",
-			"tests      could not tell: the agent sends its test results in its last batch, which did not arrive",
+			"tests      could not tell: the agent sends its test results in its last batch, and the report does " +
+				"not hold it",
 			"final      did not arrive", guestBanner,
 		}},
 		{name: "node-restarted", guest: restartedGuest, verdict: "node_restarted", want: []string{
@@ -237,7 +239,8 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 			"sequence   batches 7 to 17: 11 kept", "hello      not seen", guestBanner,
 		}},
 		{name: "complete", guest: exampleGuest, verdict: "complete", want: []string{
-			"guest      complete: the agent's last batch arrived and the node did not restart while the job ran",
+			"guest      complete: the agent's last batch arrived, the report holds every batch the node " +
+				"accepted, and the node did not restart while the job ran",
 			guestBanner,
 			"skew       the node received the last batch 850ms after the guest stamped its last sample",
 			`mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3 "Build", GitHub's ` +
@@ -374,42 +377,66 @@ func recorded(row *alloc.GuestReport) alloc.RecordedGuestReport {
 // SAYS WHY rather than showing zeros: nothing contacted, a hello and nothing
 // accepted, batches accepted and not kept, data in another codec or that does
 // not decode. A restart outranks a lost last batch and says both; a hello the
-// node did not see does not hide batches it accepted.
+// node did not see does not hide batches it accepted. A last batch that arrived
+// is complete only when every batch the node accepted is in the report: one the
+// node dropped past what it assembles, or one the merge refused, may be the last,
+// and then the test results it carried cannot be told either.
 func TestEachGuestRowHasItsVerdict(t *testing.T) {
 	t.Parallel()
 
 	whole := exampleGuest(t)
 	data := whole.Data
+	batches := exampleGuestBatches()
+	// THE LAST BATCH'S OWN CPU GOES BACK, so the merge refuses it, tests and all.
+	batches[len(batches)-1].AgentCPUTicks = 0
+	refused := guestRow(t, batches, alloc.GuestReport{Accepted: int64(len(batches)), Hello: true, FinalSeen: true,
+		FirstReceived: pageSecond(10.6), LastReceived: pageSecond(167.6)})
 	for _, tc := range []struct {
-		name    string
-		row     alloc.GuestReport
-		verdict guestVerdict
-		why     string
-		report  bool
+		name      string
+		row       alloc.GuestReport
+		verdict   guestVerdict
+		why       string
+		report    bool
+		finalKept bool
 	}{
-		{"silent", alloc.GuestReport{Codec: 1}, guestSilent, guestNeverContacted, false},
-		{"silent with data", alloc.GuestReport{Codec: 1, Data: data}, guestSilent, guestNeverContacted, false},
+		{"final dropped in assembly", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 18, Data: data,
+			FinalSeen: true}, guestPartial, "partial: the agent's last batch arrived, but not every batch the " +
+			"node accepted is in the report (18 accepted, 17 kept, 0 refused by the merge)", true, false},
+		{"final refused by the merge", *refused, guestPartial, "partial: the agent's last batch arrived, but not " +
+			"every batch the node accepted is in the report (17 accepted, 16 kept, 1 refused by the merge)", true,
+			false},
+		{"restarted, final arrived, not all kept", alloc.GuestReport{Codec: 1, Accepted: 18, Data: data,
+			FinalSeen: true, NodeRestarted: true}, guestNodeRestarted, "the report starts after the restart; and " +
+			"not every batch the node accepted is in the report", true, false},
+		{"silent", alloc.GuestReport{Codec: 1}, guestSilent, guestNeverContacted, false, false},
+		{"silent with data", alloc.GuestReport{Codec: 1, Data: data}, guestSilent, guestNeverContacted, false,
+			false},
 		{"hello only", alloc.GuestReport{Codec: 1, Hello: true, Refused: 3}, guestNothingAccepted,
-			"the agent asked the node for its limits, and the node accepted none of its batches (3 refused)", false},
+			"the agent asked the node for its limits, and the node accepted none of its batches (3 refused)", false,
+			false},
 		{"not kept", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 4, DroppedBytes: 4096}, guestNotKept,
-			"the node accepted 4 batches and could not keep them (4.0 KiB dropped)", false},
+			"the node accepted 4 batches and could not keep them (4.0 KiB dropped)", false, false},
 		{"other codec", alloc.GuestReport{Codec: 2, Hello: true, Accepted: 4, Data: data}, guestUndecodable,
-			"the report is in codec 2, which this billet does not read", false},
+			"the report is in codec 2, which this billet does not read", false, false},
 		{"garbage", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 4, Data: []byte("not deflate")},
-			guestUndecodable, "the report could not be decoded (guestreport: ", false},
-		{"restarted and partial", alloc.GuestReport{Codec: 1, Accepted: 4, Data: data, NodeRestarted: true},
+			guestUndecodable, "the report could not be decoded (guestreport: ", false, false},
+		{"restarted and partial", alloc.GuestReport{Codec: 1, Accepted: 17, Data: data, NodeRestarted: true},
 			guestNodeRestarted, "the report starts after the restart; the agent's last batch did not arrive " +
-				"either", true},
-		{"partial", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 4, Data: data}, guestPartial,
-			"partial: the agent's last batch did not arrive", true},
-		{"no hello", alloc.GuestReport{Codec: 1, Accepted: 4, Data: data, FinalSeen: true}, guestComplete,
-			"complete: ", true},
-		{"complete", *whole, guestComplete, "complete: the agent's last batch arrived and the node did not " +
-			"restart while the job ran", true},
+				"either", true, false},
+		{"partial", alloc.GuestReport{Codec: 1, Hello: true, Accepted: 17, Data: data}, guestPartial,
+			"partial: the agent's last batch did not arrive", true, false},
+		{"no hello", alloc.GuestReport{Codec: 1, Accepted: 17, Data: data, FinalSeen: true}, guestComplete,
+			"complete: ", true, true},
+		{"a batch received twice", alloc.GuestReport{Codec: 1, Accepted: 17, Data: duplicated(t), FinalSeen: true},
+			guestComplete, "complete: ", true, true},
+		{"complete", *whole, guestComplete, "complete: the agent's last batch arrived, the report holds every " +
+			"batch the node accepted, and the node did not restart while the job ran", true, true},
 	} {
 		g := judgeGuest(recorded(&tc.row))
-		if g.verdict != tc.verdict || !strings.Contains(g.why, tc.why) || (g.report != nil) != tc.report {
-			t.Errorf("%s: verdict %s, why %q, report %v", tc.name, g.verdict, g.why, g.report != nil)
+		if g.verdict != tc.verdict || !strings.Contains(g.why, tc.why) || (g.report != nil) != tc.report ||
+			g.finalKept != tc.finalKept {
+			t.Errorf("%s: verdict %s, why %q, report %v, final kept %v", tc.name, g.verdict, g.why, g.report != nil,
+				g.finalKept)
 		}
 		if strings.Contains(g.why, "never arrived") {
 			t.Errorf("%s: a report with every batch says some never arrived: %q", tc.name, g.why)
@@ -418,7 +445,24 @@ func TestEachGuestRowHasItsVerdict(t *testing.T) {
 		if v.HasReport != tc.report || (v.Banner != "") != tc.report {
 			t.Errorf("%s: the view has a report %v and a banner %q", tc.name, v.HasReport, v.Banner)
 		}
+		// NO SUITES IN A REPORT WITHOUT ITS LAST BATCH is could-not-tell, never
+		// "none found" (the merge-refused case has none).
+		if tc.report && !tc.finalKept && len(g.report.Tests) == 0 &&
+			!strings.HasPrefix(v.Tests.Why, "could not tell") {
+			t.Errorf("%s: the tests of a report without its last batch say %q", tc.name, v.Tests.Why)
+		}
 	}
+}
+
+// duplicated is the example's report with its third batch received twice: 16
+// distinct batches and a duplicate, 17 accepted.
+func duplicated(t *testing.T) []byte {
+	t.Helper()
+
+	b := exampleGuestBatches()[:16]
+	b = append(b, b[2])
+
+	return guestRow(t, b, alloc.GuestReport{Accepted: 17}).Data
 }
 
 // AN UNDECODABLE ROW READ THROUGH THE LEDGER is its own verdict, never no row and
@@ -632,6 +676,18 @@ func TestGuestProcessesArePlacedInTheStepTheyEndedIn(t *testing.T) {
 		t.Errorf("mark 2: %+v", b)
 	}
 
+	// MARKS DROPPED PAST THE BOUND leave the last group's end open: its processes
+	// may belong to the steps those marks began.
+	r.Dropped.Steps = 3
+	if last := guestSteps(r, nil).Procs[2]; !strings.HasSuffix(last.Name, ", and whatever came after it: 3 "+
+		"later marks were left out past the report's bound") {
+		t.Errorf("the last group after dropped marks is named %q", last.Name)
+	}
+	if first := guestSteps(r, nil).Procs[1]; strings.Contains(first.Name, "whatever came after") {
+		t.Errorf("a group before the last is named %q", first.Name)
+	}
+	r.Dropped.Steps = 0
+
 	r.Steps = nil
 	whole := guestSteps(r, nil)
 	if whole.MarksWhy == "" || len(whole.Procs) != 1 || whole.Procs[0].Label != "whole" {
@@ -754,29 +810,22 @@ func TestTheGuestMemoryChart(t *testing.T) {
 	}
 }
 
-// maxGuestPageBytes is the most a guest report at the ledger's bound adds to a
-// page, its guest-written text, which the page shows whole, included: 512 marks
-// and 513 groups of five processes, 128 suites and 256 failed names, each name
-// at its bound and each byte of it at most six once quoted and escaped.
-const maxGuestPageBytes = 2560 << 10
+// maxGuestPageBytes is the most a guest report the ledger can keep adds to a page
+// beside the same page without it. renderLargestGuest holds every section the page
+// shows at its bound, each name at its bound in the character that grows most once
+// quoted and escaped (a double quote: six bytes) and each number at its widest.
+const maxGuestPageBytes = 3 << 20
 
-// largestGuest is a report with every section the page shows at its bound: 512
-// step marks, one process sample with twenty names between each two of them, and
-// the suites and failed names. Incompressible, its text is random and it encodes
-// to near the ledger's bound, its process samples halved to fit; escaped, every
-// name is double quotes, which compress to nothing and grow sixfold on the page,
-// and every process sample is kept.
-func largestGuest(t *testing.T, escaped bool) []byte {
+// incompressibleGuest is a report whose text is random, so it encodes to near
+// the ledger's bound with its process samples halved to fit: 512 step marks, one
+// process sample with twenty names between each two of them, and the suites and
+// failed names at their bounds.
+func incompressibleGuest(t *testing.T) []byte {
 	t.Helper()
 
 	rng := rand.New(rand.NewPCG(3, 4))
 	const alphabet = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<>&"'_-./`
-	serial := 0
 	text := func(n int) string {
-		if escaped {
-			serial++
-			return strings.Repeat(`"`, n-6) + fmt.Sprintf("%06d", serial)
-		}
 		b := make([]byte, n)
 		for i := range b {
 			b[i] = alphabet[rng.IntN(len(alphabet))]
@@ -808,52 +857,129 @@ func largestGuest(t *testing.T, escaped bool) []byte {
 		}
 		r.Tests = append(r.Tests, s)
 	}
-	kept, data, err := guestreport.Downsample(r, alloc.MaxGuestReportBytes)
+	_, data, err := guestreport.Downsample(r, alloc.MaxGuestReportBytes)
 	if err != nil {
 		t.Fatalf("Downsample: %v", err)
 	}
-	switch {
-	case !escaped && len(data) < alloc.MaxGuestReportBytes*3/4:
+	if len(data) < alloc.MaxGuestReportBytes*3/4 {
 		t.Fatalf("the report encodes to %d bytes, not near the %d bound", len(data), alloc.MaxGuestReportBytes)
-	case escaped && len(kept.Processes) != len(r.Processes):
-		t.Fatalf("the escaped report kept %d of its %d process samples", len(kept.Processes), len(r.Processes))
 	}
 
 	return data
 }
 
-// A GUEST REPORT AT THE LEDGER'S BOUND RENDERS WITHIN A STATED SIZE beside the
-// largest series, whether its text is incompressible or grows most when escaped,
-// and the page keeps its policy.
+// renderLargestGuest is the report that renders largest, and GitHub's steps for it:
+// every mark matched to a step of the same name, a process group before the
+// first mark and after each, each with twenty names of which the page shows five,
+// 64 gaps in the account, the suites and failed names at their bounds, every
+// name made of double quotes and every number at its widest, at one tick a
+// second. It compresses to well under the ledger's bound, so nothing is halved.
+func renderLargestGuest(t *testing.T) ([]byte, []github.JobStep) {
+	t.Helper()
+
+	const top = guestreport.MaxValue
+	quotes := func(n int) string { return strings.Repeat(`"`, n) }
+	widest := guestreport.ProcessUsage{Procs: top, CPUTicks: top, RSSBytes: top, ReadBytes: top, WriteBytes: top}
+	base := pageStart.Unix()
+	r := guestreport.Report{AgentVersion: quotes(guestreport.MaxNameBytes), TicksPerSecond: 1,
+		AgentCPUTicks: top, FirstSeq: top - 1000, LastSeq: top, Batches: 1001 - guestreport.MaxReportGaps,
+		Missing: guestreport.MaxReportGaps, Duplicates: top, Conflicts: top, Stride: 1, Saturated: top,
+		Dropped: guestreport.Dropped{Steps: top, Suites: top, FailedNames: top}}
+	for i := range guestreport.MaxReportGaps {
+		seq := uint64(top - 999 + 2*i)
+		r.Gaps = append(r.Gaps, guestreport.Gap{FirstSeq: seq, LastSeq: seq})
+	}
+	process := func(atMillis int64) guestreport.ProcessSample {
+		p := guestreport.ProcessSample{AtMillis: atMillis, Other: widest, ResidualCPUTicks: top}
+		for k := range guestreport.KeepProcessesByName {
+			p.Rows = append(p.Rows, guestreport.ProcessRow{Name: quotes(guestreport.MaxNameBytes-1) +
+				string(rune('a'+k)), ProcessUsage: widest})
+		}
+		return p
+	}
+	var steps []github.JobStep
+	r.Processes = append(r.Processes, process((base-1)*1000))
+	for i := range guestreport.MaxReportSteps {
+		at := base + int64(i)*2
+		name := quotes(guestreport.MaxNameBytes)
+		r.Steps = append(r.Steps, guestreport.StepMark{Name: name, AtSeconds: at})
+		steps = append(steps, github.JobStep{Number: math.MaxInt64, Name: name, Conclusion: "success",
+			StartedAt: time.Unix(at, 0), CompletedAt: time.Unix(at+2, 0)})
+		r.Processes = append(r.Processes, process((at+1)*1000))
+		r.Samples = append(r.Samples, guestreport.Sample{AtMillis: (at + 1) * 1000, CPUBusyTicks: top,
+			CPUTotalTicks: top, MemUsedBytes: top, MemAvailableBytes: top, MemCachedBytes: top,
+			DiskReadBytes: top, DiskWriteBytes: top, NetRxBytes: top, NetTxBytes: top})
+	}
+	names := 0
+	for range guestreport.MaxReportSuites {
+		s := guestreport.SuiteResult{Name: quotes(guestreport.MaxNameBytes), Tests: top, Failures: top,
+			Errors: top, Skipped: top}
+		for range min(2, guestreport.MaxReportFailedNames-names) {
+			s.Failed = append(s.Failed, quotes(guestreport.MaxFailedNameBytes))
+			names++
+		}
+		r.Tests = append(r.Tests, s)
+	}
+	data, err := guestreport.Encode(r)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	return data, steps
+}
+
+// A GUEST REPORT THE LEDGER CAN KEEP ADDS A STATED SIZE TO A PAGE, measured
+// against the same page without it beside the largest series: one whose text
+// does not compress, and the one that renders largest. The page keeps its policy.
 func TestAPageWithTheLargestGuestReportIsBounded(t *testing.T) {
 	t.Parallel()
 
 	tl := largestSeries(t)
-	for _, escaped := range []bool{false, true} {
-		data := largestGuest(t, escaped)
-		g := judgeGuest(alloc.RecordedGuestReport{GuestReport: alloc.GuestReport{Codec: 1, Data: data,
-			Accepted: 30, Hello: true, FinalSeen: true, FirstReceived: pageSecond(1), LastReceived: pageSecond(2000)}})
+	hostile, hostileSteps := renderLargestGuest(t)
+	for _, tc := range []struct {
+		name   string
+		data   []byte
+		listed []github.JobStep
+	}{
+		{"incompressible", incompressibleGuest(t), nil},
+		{"hostile", hostile, hostileSteps},
+	} {
+		g := judgeGuest(alloc.RecordedGuestReport{GuestReport: alloc.GuestReport{Codec: 1, Data: tc.data,
+			Accepted: math.MaxInt64, Refused: math.MaxInt64, DroppedBytes: math.MaxInt64, Hello: true,
+			FinalSeen: true, FirstReceived: pageSecond(1), LastReceived: pageSecond(2000)}})
 		if g.report == nil {
-			t.Fatalf("the largest report did not decode: %s", g.why)
+			t.Fatalf("%s: the report did not decode: %s", tc.name, g.why)
 		}
 		measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(tl.Points)}
 		rec := alloc.JobRecord{LeaseID: "l1", VCPU: 2, Memory: 8 << 30}
 		steps := jobSteps{none: "no GitHub job"}
+		if tc.listed != nil {
+			steps = jobSteps{runner: "billet-l1", measured: measured, timeline: tl,
+				job: github.WorkflowJob{ID: 1, Name: "j", Steps: tc.listed}}
+		}
 		page := jobPageOf(rec, measured, steps, tl, "")
-		page.Guest = guestSection(g, rec, measured, steps, page.Charts)
-		var out bytes.Buffer
-		if err := renderJobPage(&out, page); err != nil {
+		var without bytes.Buffer
+		if err := renderJobPage(&without, page); err != nil {
 			t.Fatalf("renderJobPage: %v", err)
 		}
-		if limit := maxSeriesPageBytes + maxGuestPageBytes; out.Len() > limit {
-			t.Errorf("escaped %v: a page of the largest series and guest report is %d bytes, over the %d bound",
-				escaped, out.Len(), limit)
+		page.Guest = guestSection(g, rec, measured, steps, page.Charts)
+		var with bytes.Buffer
+		if err := renderJobPage(&with, page); err != nil {
+			t.Fatalf("renderJobPage: %v", err)
 		}
-		assertPolicyHolds(t, out.String())
-		if !strings.Contains(out.String(), "<figcaption>Guest memory") {
-			t.Errorf("the guest's memory was not drawn, so the bound proves nothing about its chart")
+		if added := with.Len() - without.Len(); added > maxGuestPageBytes {
+			t.Errorf("%s: the guest report adds %d bytes to the page, over the %d bound", tc.name, added,
+				maxGuestPageBytes)
 		}
-		t.Logf("largest guest report, escaped %v: %d bytes encoded, %d marks, %d process samples; page %d bytes",
-			escaped, len(data), len(g.report.Steps), len(g.report.Processes), out.Len())
+		assertPolicyHolds(t, with.String())
+		if !strings.Contains(with.String(), "<figcaption>Guest memory") {
+			t.Errorf("%s: the guest's memory was not drawn, so the bound proves nothing about its chart", tc.name)
+		}
+		if tc.listed != nil && strings.Count(with.String(), "matched to no GitHub step") != 0 {
+			t.Errorf("%s: a mark was not matched, so the bound misses the GitHub step it would show", tc.name)
+		}
+		t.Logf("%s guest report: %d bytes encoded, %d marks, %d process samples; it adds %d bytes to a page "+
+			"of %d", tc.name, len(tc.data), len(g.report.Steps), len(g.report.Processes), with.Len()-without.Len(),
+			with.Len())
 	}
 }
