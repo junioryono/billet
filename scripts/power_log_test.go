@@ -597,3 +597,60 @@ func TestThePowerSummaryAnswersThreeWays(t *testing.T) {
 		})
 	}
 }
+
+// runSummary runs power-summary.sh and answers its output and exit status.
+func runSummary(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{"power-summary.sh"}, args...)...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+		return out.String(), exit.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	return out.String(), 0
+}
+
+// A LOG WITHOUT A METER IS SUMMARIZED AS IT ALWAYS WAS. These goldens were
+// written by power-summary.sh before it read a meter column, and are compared
+// byte for byte with the exit status.
+func TestThePowerSummaryWithoutAMeterIsUnchanged(t *testing.T) {
+	t.Parallel()
+	turbostat := filepath.Join(t.TempDir(), "turbostat.csv")
+	if err := os.WriteFile(turbostat, []byte("epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances\n"+
+		"1,10.00,0,,,,\n2,11.00,73500000,73500000,140,73.10,\n3,12.00,,,141,,\n4,13.50,300000000,226500000,,150.25,billet-a\n"+
+		"5,14.50,400000000,100000000,160,99.5,billet-a\n6,15.50,500000000,100000000,161,100.5,\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		golden string
+		args   []string
+		code   int
+	}{
+		{"reference.txt", []string{"--require-bmc", powerLogFixture}, 0},
+		{"reference-window.txt", []string{"--from", "1791540010", "--to", "1791540025", powerLogFixture}, 0},
+		{"turbostat.txt", []string{turbostat}, 0},
+		{"one-bmc-reading.txt", []string{"--require-bmc", "--to", "3", turbostat}, 0},
+	} {
+		out, code := runSummary(t, tc.args...)
+		if code != tc.code {
+			t.Errorf("%s: exit %d, want %d:\n%s", tc.golden, code, tc.code, out)
+		}
+		golden := filepath.Join("testdata", "power-summary", tc.golden)
+		if os.Getenv("BILLET_UPDATE_FIXTURES") == "1" {
+			if err := os.WriteFile(golden, []byte(out), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want, err := os.ReadFile(golden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != string(want) {
+			t.Errorf("the summary:\n%s\nwant %s:\n%s", out, golden, want)
+		}
+	}
+}
