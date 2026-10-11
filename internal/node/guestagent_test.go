@@ -5,14 +5,16 @@
 package node_test
 
 import (
+	"bytes"
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/junioryono/billet/internal/guestagent"
@@ -23,17 +25,18 @@ import (
 )
 
 // guestTransport carries the agent's requests to a cache service in-process, as
-// the node's guest listener would. It counts the hellos it answered and notes, for
-// each final batch, whether the agent's run had been cancelled (its SIGTERM) when
-// the batch arrived.
+// the node's guest listener would. It counts the hellos, and for each final batch
+// notes the node's answer and whether the agent's run had been cancelled (its
+// SIGTERM) when the batch arrived.
 type guestTransport struct {
 	service *node.CacheService
 	run     context.Context
 
-	mu               sync.Mutex
-	hellos           int
-	finals           int
-	finalBeforeSTERM int
+	mu            sync.Mutex
+	hellos        int
+	finals        []int
+	finalsEarly   int
+	reportsBefore int
 }
 
 func (g *guestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -41,32 +44,52 @@ func (g *guestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	if req.URL.Path == "/v1/guest/reports" && req.URL.RawQuery == "final=1" {
-		g.mu.Lock()
-		g.finals++
-		if g.run.Err() == nil {
-			g.finalBeforeSTERM++
-		}
-		g.mu.Unlock()
-	}
-
 	rec := httptest.NewRecorder()
 	g.service.ServeHTTP(rec, req)
 
-	if req.URL.Path == "/v1/guest/limits" {
-		g.mu.Lock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	switch {
+	case req.URL.Path == "/v1/guest/limits":
 		g.hellos++
-		g.mu.Unlock()
+	case req.URL.Path == "/v1/guest/reports" && req.URL.RawQuery == "final=1":
+		g.finals = append(g.finals, rec.Code)
+		if g.run.Err() == nil {
+			g.finalsEarly++
+		}
+	case req.URL.Path == "/v1/guest/reports" && g.run.Err() == nil:
+		g.reportsBefore++
 	}
 
 	return rec.Result(), nil
 }
 
-func (g *guestTransport) counts() (hellos, finals, early int) {
+func (g *guestTransport) counts() (hellos int, finals []int, early, before int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	return g.hellos, g.finals, g.finalBeforeSTERM
+	return g.hellos, slices.Clone(g.finals), g.finalsEarly, g.reportsBefore
+}
+
+// lockedBuffer is the agent's log, which its goroutines write.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.b.String()
 }
 
 // The marks and the suites the agent reads from internal/guestagent's fixtures,
@@ -97,139 +120,128 @@ func fixtureSuites() []guestreport.SuiteResult {
 
 // THE IN-VM AGENT SPEAKS THIS NODE'S GUEST ROUTES, not only a stand-in for them:
 // billet guest monitor's agent says hello with the bearer the node minted, sends
-// nothing more until its SIGTERM, then sends one final batch, which the node keeps
-// and hands over at the destroy as the guest's own report: the hello seen, one
-// batch accepted and none refused, the final one among them, and the steps and
-// test results the agent read from the fixtures it was pointed at, every field.
-// The guest routes reach no volume, so the service's store and attacher are empty,
-// and any call to one fails the test.
+// nothing more before its interval or its SIGTERM, then sends one final batch the
+// node accepts with 204, which the node keeps and hands over at the destroy as the
+// guest's own report: the hello seen, one batch accepted and none refused, the
+// final one among them, and the steps and test results the agent read from the
+// fixtures it was pointed at, every field. The guest routes reach no volume, so
+// the service's store and attacher are empty, and any call to one fails the test.
+//
+// IN A SYNCTEST BUBBLE, because the transport is in-process: synctest.Wait is the
+// barrier that says the agent has done all it will do before its SIGTERM, the
+// agent's 3 s is fake time, and the bubble ends only when every goroutine the
+// agent started has, so a worker left running fails the test (measured
+// 2026-10-11: a cache service starts no goroutine that outlives its bubble).
 func TestTheInVMAgentSpeaksTheGuestRoutes(t *testing.T) {
-	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		service, err := node.NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+			struct{ storecontract.Store }{}, struct{ provider.VolumeAttacher }{}, nil)
+		if err != nil {
+			t.Fatalf("NewCacheService: %v", err)
+		}
 
-	service, err := node.NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
-		struct{ storecontract.Store }{}, struct{ provider.VolumeAttacher }{}, nil)
-	if err != nil {
-		t.Fatalf("NewCacheService: %v", err)
-	}
+		service.MonitorGuests()
 
-	service.MonitorGuests()
+		credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
 
-	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
-	if err != nil {
-		t.Fatalf("Prepare: %v", err)
-	}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	ctx, cancel := context.WithCancel(t.Context())
-	transport := &guestTransport{service: service, run: ctx}
+		transport := &guestTransport{service: service, run: ctx}
 
-	// done is closed when the agent returns, and runErr is what it returned. The
-	// cleanup cancels and joins it on every path, a t.Fatal included, and never
-	// waits past its bound.
-	done := make(chan struct{})
+		var log lockedBuffer
 
-	var runErr error
+		done := make(chan struct{})
 
-	go func() {
-		defer close(done)
+		var runErr error
 
-		runErr = guestagent.Run(ctx, guestagent.Config{
-			Endpoint:   "http://172.20.0.1:7718",
-			Token:      credentials.Token,
-			Proc:       os.DirFS("../guestagent/testdata/proc"),
-			DiagDir:    "../guestagent/testdata/diag",
-			JUnitRoots: []string{"../guestagent/testdata/junit"},
-			Transport:  transport,
-			Log:        io.Discard,
-			Version:    "v0.15.0",
-		})
-	}()
+		go func() {
+			defer close(done)
 
-	t.Cleanup(func() {
-		cancel()
+			runErr = guestagent.Run(ctx, guestagent.Config{
+				Endpoint:   "http://172.20.0.1:7718",
+				Token:      credentials.Token,
+				Proc:       os.DirFS("../guestagent/testdata/proc"),
+				DiagDir:    "../guestagent/testdata/diag",
+				JUnitRoots: []string{"../guestagent/testdata/junit"},
+				Transport:  transport,
+				Log:        &log,
+				Version:    "v0.15.0",
+			})
+		}()
 
-		bound := time.NewTimer(5 * time.Second)
-		defer bound.Stop()
+		// Short of its ten-second interval, an agent that has said hello has
+		// nothing to send until its SIGTERM.
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
 
 		select {
 		case <-done:
-		case <-bound.C:
-			t.Error("the agent had not returned 5s after its run was cancelled")
+			t.Fatalf("the agent returned %v before its SIGTERM", runErr)
+		default:
+		}
+
+		if hellos, finals, _, before := transport.counts(); hellos != 1 || len(finals) != 0 || before != 0 {
+			t.Fatalf("before its SIGTERM the agent said hello %d times and sent %d final and %d other batches; "+
+				"want 1, 0, 0", hellos, len(finals), before)
+		}
+
+		stopped := time.Now()
+		cancel()
+		<-done
+
+		if took := time.Since(stopped); runErr != nil || took > 3*time.Second {
+			t.Fatalf("the agent returned %v %v after its SIGTERM, want nil within 3s", runErr, took)
+		}
+
+		if hellos, finals, early, _ := transport.counts(); hellos != 1 || len(finals) != 1 ||
+			finals[0] != http.StatusNoContent || early != 0 {
+			t.Fatalf("the agent said hello %d times and sent final batches answered %v, %d before its SIGTERM; "+
+				"want 1, one answered 204, 0", hellos, finals, early)
+		}
+
+		if strings.Contains(log.String(), "did not accept") || strings.Contains(log.String(), "dropped") {
+			t.Errorf("the agent's log reports a batch gone wrong: %q", log.String())
+		}
+
+		report, ok := service.TakeGuestReport(t.Context(), "billet-one")
+		if !ok {
+			t.Fatal("the node had no report of the agent's guest to take")
+		}
+
+		if err := report.Validate(); err != nil {
+			t.Fatalf("the report is one the ledger refuses: %v", err)
+		}
+
+		if !report.Hello || report.Accepted != 1 || report.Refused != 0 || !report.FinalSeen ||
+			report.AgentVersion != "v0.15.0" {
+			t.Fatalf("the node kept hello %t, accepted %d, refused %d, final %t, agent %q; "+
+				"want true, 1, 0, true, v0.15.0", report.Hello, report.Accepted, report.Refused, report.FinalSeen,
+				report.AgentVersion)
+		}
+
+		merged, err := guestreport.Decode(report.Data)
+		if err != nil {
+			t.Fatalf("the node's report of the agent's batch does not decode: %v", err)
+		}
+
+		if merged.Batches != 1 || merged.FirstSeq != 1 || len(merged.Samples) == 0 {
+			t.Errorf("the report holds %d batches from %d and %d samples; want 1 from 1 and the agent's samples",
+				merged.Batches, merged.FirstSeq, len(merged.Samples))
+		}
+
+		if !slices.Equal(merged.Steps, fixtureMarks()) {
+			t.Errorf("the report's steps are %+v, want the fixture log's %+v", merged.Steps, fixtureMarks())
+		}
+
+		if want := fixtureSuites(); !slices.EqualFunc(merged.Tests, want, func(a, b guestreport.SuiteResult) bool {
+			return a.Name == b.Name && a.Tests == b.Tests && a.Failures == b.Failures && a.Errors == b.Errors &&
+				a.Skipped == b.Skipped && slices.Equal(a.Failed, b.Failed)
+		}) {
+			t.Errorf("the report's suites are %+v, want the fixtures' %+v", merged.Tests, want)
 		}
 	})
-
-	deadline := time.Now().Add(5 * time.Second)
-	for hellos, _, _ := transport.counts(); hellos == 0; hellos, _, _ = transport.counts() {
-		if time.Now().After(deadline) {
-			t.Fatal("the agent never said hello to the node")
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	// After its hello the agent waits for its interval or its SIGTERM; one that
-	// returns now, or sends a final batch now, is not the agent the contract asks for.
-	settle := time.NewTimer(200 * time.Millisecond)
-	select {
-	case <-done:
-		settle.Stop()
-		t.Fatalf("the agent returned %v before its SIGTERM", runErr)
-	case <-settle.C:
-	}
-
-	stopped := time.Now()
-	cancel()
-
-	bound := time.NewTimer(3 * time.Second)
-	select {
-	case <-done:
-		bound.Stop()
-	case <-bound.C:
-		t.Fatal("the agent did not return within 3s of its SIGTERM")
-	}
-
-	if runErr != nil {
-		t.Fatalf("the agent returned %v after %v, want nil", runErr, time.Since(stopped))
-	}
-
-	if hellos, finals, early := transport.counts(); hellos != 1 || finals != 1 || early != 0 {
-		t.Fatalf("the agent said hello %d times and sent %d final batches, %d before its SIGTERM; want 1, 1, 0",
-			hellos, finals, early)
-	}
-
-	report, ok := service.TakeGuestReport(t.Context(), "billet-one")
-	if !ok {
-		t.Fatal("the node had no report of the agent's guest to take")
-	}
-
-	if err := report.Validate(); err != nil {
-		t.Fatalf("the report is one the ledger refuses: %v", err)
-	}
-
-	if !report.Hello || report.Accepted != 1 || report.Refused != 0 || !report.FinalSeen ||
-		report.AgentVersion != "v0.15.0" {
-		t.Fatalf("the node kept hello %t, accepted %d, refused %d, final %t, agent %q; "+
-			"want true, 1, 0, true, v0.15.0", report.Hello, report.Accepted, report.Refused, report.FinalSeen,
-			report.AgentVersion)
-	}
-
-	merged, err := guestreport.Decode(report.Data)
-	if err != nil {
-		t.Fatalf("the node's report of the agent's batch does not decode: %v", err)
-	}
-
-	if merged.Batches != 1 || merged.FirstSeq != 1 || len(merged.Samples) == 0 {
-		t.Errorf("the report holds %d batches from %d and %d samples; want 1 from 1 and the agent's samples",
-			merged.Batches, merged.FirstSeq, len(merged.Samples))
-	}
-
-	if !slices.Equal(merged.Steps, fixtureMarks()) {
-		t.Errorf("the report's steps are %+v, want the fixture log's %+v", merged.Steps, fixtureMarks())
-	}
-
-	if want := fixtureSuites(); !slices.EqualFunc(merged.Tests, want, func(a, b guestreport.SuiteResult) bool {
-		return a.Name == b.Name && a.Tests == b.Tests && a.Failures == b.Failures && a.Errors == b.Errors &&
-			a.Skipped == b.Skipped && slices.Equal(a.Failed, b.Failed)
-	}) {
-		t.Errorf("the report's suites are %+v, want the fixtures' %+v", merged.Tests, want)
-	}
 }
