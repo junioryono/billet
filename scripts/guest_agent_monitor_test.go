@@ -98,7 +98,7 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 		// A FAILED SLEEP UNDER set -e would otherwise end the agent before the image
 		// store is settled; it ends the wait instead, and the monitor is killed.
 		{name: "asked, and the agent's sleep fails", key: "1", endpoint: endpoint, token: token,
-			mode: monitorFlushes, sleepFails: true, jobStatus: 3, started: true, atMost: 1},
+			mode: monitorHangs, sleepFails: true, jobStatus: 3, started: true, atMost: 1},
 		{name: "not asked", key: "absent", endpoint: endpoint, token: token, jobStatus: 0, atMost: 1},
 		{name: "the key could not be read", key: "unreadable", endpoint: endpoint, token: token,
 			jobStatus: 3, atMost: 1},
@@ -300,12 +300,7 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 					t.Error("a monitor that ignored SIGTERM is still running after the agent's tail")
 				}
 			case monitorFlushes:
-				// A wait cut short by a failed sleep kills the monitor before its trap runs.
-				if tc.sleepFails {
-					if !monitorGone(at("monitor.pid")) {
-						t.Error("a monitor the agent stopped waiting for is still running after its tail")
-					}
-				} else if _, err := os.Stat(at("monitor.terminated")); err != nil {
+				if _, err := os.Stat(at("monitor.terminated")); err != nil {
 					t.Errorf("the monitor was never sent SIGTERM: %v", err)
 				}
 			case monitorFails:
