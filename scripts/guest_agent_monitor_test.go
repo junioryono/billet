@@ -200,6 +200,7 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 				// THE RUNNER RAN FOR A WHILE: the monitor is up before it is stopped.
 				`if [ -n "$guest_monitor_pid" ]; then`,
 				`  for _ in $(seq 1 1500); do if [ -e ` + shellQuote(at("monitor.ready")) + ` ]; then break; fi; /bin/sleep 0.01; done`,
+				`  if [ ! -e ` + shellQuote(at("monitor.ready")) + ` ]; then echo "FIXTURE: the monitor never became ready" >&2; exit 97; fi`,
 				"fi",
 				"job_status=" + strconv.Itoa(tc.jobStatus),
 				`printf 'stop_begin=%s\n' "$EPOCHREALTIME"`,
@@ -213,6 +214,9 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 			// A monitor left running holds the output pipes open after bash exits.
 			run.WaitDelay = 2 * time.Second
 			output, err := run.CombinedOutput()
+			if strings.Contains(string(output), "FIXTURE:") {
+				t.Fatalf("the stand-in monitor never set itself up, so nothing was proved:\n%s", output)
+			}
 
 			// THE AGENT'S EXIT STATUS IS THE JOB'S, through the image-store helper.
 			status := 0
@@ -358,11 +362,15 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name   string
-		body   string        // the stand-in billet; empty means there is none
-		atMost time.Duration // 0 leaves the time unchecked
+		name     string
+		body     string        // the stand-in billet; empty means there is none
+		atMost   time.Duration // 0 leaves the time unchecked
+		finishes bool          // the stand-in leaves <billet>.done once it has finished
 	}{
 		{name: "the monitor answers", body: "exit 0\n"},
+		// A FLUSH THAT TAKES MOST OF ITS 2 S IS LET FINISH: the hook's own bound
+		// is outside the flush's, never inside it.
+		{name: "the monitor answers late", body: "/bin/sleep 2\n: >\"$0.done\"\nexit 0\n", finishes: true},
 		{name: "no monitor answers", body: "echo 'no monitor answered' >&2\nexit 1\n"},
 		{name: "the binary talks", body: "echo out\necho err >&2\nexit 0\n"},
 		// timeout -k 1 3 ends it at 4 s. The stand-in is run once before it is timed,
@@ -415,6 +423,11 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 				if tc.body != "" {
 					if got := readArgv(t, argv); !slices.Equal(got, []string{"guest", "flush"}) {
 						t.Errorf("the hook ran billet %q, want guest flush", got)
+					}
+				}
+				if tc.finishes {
+					if _, err := os.Stat(billet + ".done"); err != nil {
+						t.Errorf("the hook returned before the flush finished: %v", err)
 					}
 				}
 			})
