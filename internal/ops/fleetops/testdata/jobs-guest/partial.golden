@@ -71,10 +71,10 @@ net check  the guest's eth0 counted received 554.0 MiB, sent 57.6 MiB since it b
 agent cpu  0.6s, 0.3% of the guest's busy CPU since it booted (its own count)
 agent sent 13 batches accepted, so at most 832.0 KiB of batch bodies on the tap, plus HTTP and TCP framing and any batches the node refused (it counts the batches it accepted, not their bytes)
 marks      Each mark is the runner's log line for a step's start, stamped by the guest's clock to the second, matched by name, in order, to GitHub's steps, whose numbers and names are the authority.
-mark 1     "Run actions/checkout@v5" at 2026-10-09T12:00:03Z on the guest's clock, step 2 "Run actions/checkout@v5", GitHub's start 2026-10-09T12:00:04Z, mark minus GitHub's start -1s
-mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3 "Build", GitHub's start 2026-10-09T12:00:19Z, mark minus GitHub's start -1s
-mark 3     "Test" at 2026-10-09T12:01:30Z on the guest's clock, step 4 "Test", GitHub's start 2026-10-09T12:01:31Z, mark minus GitHub's start -1s
-processes  Each process sample covers the 2s before it and is placed in the step it ended in, so a step's edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed.
+mark 1     "Run actions/checkout@v5" at 2026-10-09T12:00:03Z on the guest's clock, step 2, GitHub's start 2026-10-09T12:00:04Z, mark minus GitHub's start -1s
+mark 2     "Build" at 2026-10-09T12:00:18Z on the guest's clock, step 3, GitHub's start 2026-10-09T12:00:19Z, mark minus GitHub's start -1s
+mark 3     "Test" at 2026-10-09T12:01:30Z on the guest's clock, step 4, GitHub's start 2026-10-09T12:01:31Z, mark minus GitHub's start -1s
+processes  Each process sample covers the 2s before it and is placed in the step it ended in, so a step's edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch between the agent's first and last is in the report (1 never arrived, 0 refused by the merge), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.
 before     the first mark, 1 process sample, ending 2026-10-09T12:00:01.750Z to 2026-10-09T12:00:01.750Z on the guest's clock
              "Runner.Worker" x1: cpu 0.4s, peak rss 180.0 MiB, read 0 B, written 1.0 MiB
              "bash" x1: cpu 0.1s, peak rss 4.0 MiB, read 0 B, written 0 B
@@ -104,7 +104,7 @@ step 4     "Test", 25 process samples, ending 2026-10-09T12:01:31.750Z to 2026-1
              "billet" x1: cpu 0.2s, peak rss 14.0 MiB, read 0 B, written 0 B
              every other process (0 more names, and those past the agent's own cut): cpu 0.5s, read 0 B, written 0 B
              cpu no live process was charged with (processes that exited inside an interval): 0.8s
-tests      could not tell: the agent sends its test results in its last batch, and the report does not hold it
+tests      could not tell: the agent sends its test results in its last batch, which did not arrive
 == billet jobs show --html, the guest section ==
 <section id="guest">
 <h2>What the job's own VM reported</h2>
@@ -168,14 +168,14 @@ tests      could not tell: the agent sends its test results in its last batch, a
 <table>
 <thead><tr><th>Mark</th><th>The guest's name</th><th>At (guest)</th><th>GitHub step</th><th>Started (GitHub)</th><th>Mark minus GitHub</th></tr></thead>
 <tbody>
-<tr><th scope="row">1</th><td>&#34;Run actions/checkout@v5&#34;</td><td>2026-10-09T12:00:03Z</td><td>step 2 &#34;Run actions/checkout@v5&#34;</td><td>2026-10-09T12:00:04Z</td><td>-1s</td></tr>
-<tr><th scope="row">2</th><td>&#34;Build&#34;</td><td>2026-10-09T12:00:18Z</td><td>step 3 &#34;Build&#34;</td><td>2026-10-09T12:00:19Z</td><td>-1s</td></tr>
-<tr><th scope="row">3</th><td>&#34;Test&#34;</td><td>2026-10-09T12:01:30Z</td><td>step 4 &#34;Test&#34;</td><td>2026-10-09T12:01:31Z</td><td>-1s</td></tr>
+<tr><th scope="row">1</th><td>&#34;Run actions/checkout@v5&#34;</td><td>2026-10-09T12:00:03Z</td><td>step 2</td><td>2026-10-09T12:00:04Z</td><td>-1s</td></tr>
+<tr><th scope="row">2</th><td>&#34;Build&#34;</td><td>2026-10-09T12:00:18Z</td><td>step 3</td><td>2026-10-09T12:00:19Z</td><td>-1s</td></tr>
+<tr><th scope="row">3</th><td>&#34;Test&#34;</td><td>2026-10-09T12:01:30Z</td><td>step 4</td><td>2026-10-09T12:01:31Z</td><td>-1s</td></tr>
 </tbody>
 </table>
 </div>
 <h3>Processes by step</h3>
-<p class="note">Each process sample covers the 2s before it and is placed in the step it ended in, so a step&#39;s edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed.</p>
+<p class="note">Each process sample covers the 2s before it and is placed in the step it ended in, so a step&#39;s edges blur by that much. A process is named by its comm, never its arguments; the busiest 5 names of each are shown and the rest summed. Not every batch between the agent&#39;s first and last is in the report (1 never arrived, 0 refused by the merge), and a step mark in one of them is lost with it, so a group may also hold processes of steps that came after its own.</p>
 <div class="scroll">
 <table>
 <thead><tr><th>Process</th><th>Most at once</th><th>CPU</th><th>Peak RSS</th><th>Read</th><th>Written</th></tr></thead>
@@ -219,5 +219,5 @@ tests      could not tell: the agent sends its test results in its last batch, a
 </table>
 </div>
 <h3>Test results</h3>
-<p class="why">could not tell: the agent sends its test results in its last batch, and the report does not hold it</p>
+<p class="why">could not tell: the agent sends its test results in its last batch, which did not arrive</p>
 

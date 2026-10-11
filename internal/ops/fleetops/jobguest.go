@@ -253,7 +253,7 @@ func guestViewOf(g *jobGuest, measured *alloc.RecordedUsage, steps jobSteps) gue
 		listed = steps.job.Steps
 	}
 	v.Steps = guestSteps(r, listed)
-	v.Tests = guestTests(r, g.finalKept)
+	v.Tests = guestTests(r, g.row.FinalSeen, g.finalKept)
 
 	return v
 }
@@ -478,8 +478,10 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 			row := guestMarkRow{Mark: strconv.Itoa(i + 1), Name: strconv.Quote(mark.Name),
 				At: stamp(time.Unix(mark.AtSeconds, 0)), Step: "matched to no GitHub step"}
 			if j := matched[i]; j >= 0 {
+				// BY NUMBER ALONE: the step's name, as the agent cut it, is the
+				// mark's, and GitHub's whole name is the Steps section's to show.
 				step := listed[j]
-				row.Step = fmt.Sprintf("step %d %s", step.Number, strconv.Quote(step.Name))
+				row.Step = fmt.Sprintf("step %d", step.Number)
 				row.GitHub = "not given"
 				if !step.StartedAt.IsZero() {
 					row.GitHub = stamp(step.StartedAt)
@@ -498,6 +500,13 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 	out.ProcsNote = fmt.Sprintf("Each process sample covers the %s before it and is placed in the step it "+
 		"ended in, so a step's edges blur by that much. A process is named by its comm, never its arguments; "+
 		"the busiest %d names of each are shown and the rest summed.", interval, guestTopProcesses)
+	// A MARK IS LOST WITH ITS BATCH, and the processes after it then fall to the
+	// mark before: no group can then be said to hold one step's alone.
+	if len(r.Steps) > 0 && (r.Missing > 0 || r.Refused > 0) {
+		out.ProcsNote += fmt.Sprintf(" Not every batch between the agent's first and last is in the report "+
+			"(%d never arrived, %d refused by the merge), and a step mark in one of them is lost with it, so a "+
+			"group may also hold processes of steps that came after its own.", r.Missing, r.Refused)
+	}
 
 	buckets := make([][]guestreport.ProcessSample, len(r.Steps)+1)
 	for _, p := range r.Processes {
@@ -515,8 +524,10 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep) guestStepsView {
 			}
 			group.Label, group.Name = "before", "the first mark"
 		case matched[k-1] >= 0:
+			// GITHUB'S NAME AS THE AGENT CUT IT, which is what matched.
 			step := listed[matched[k-1]]
-			group.Label, group.Name = "step "+strconv.FormatInt(step.Number, 10), strconv.Quote(step.Name)
+			group.Label = "step " + strconv.FormatInt(step.Number, 10)
+			group.Name = strconv.Quote(guestreport.Clean(step.Name, guestreport.MaxNameBytes))
 		default:
 			group.Label = "mark " + strconv.Itoa(k)
 			group.Name = strconv.Quote(r.Steps[k-1].Name) + " (the guest's name, matched to no GitHub step)"
@@ -619,14 +630,17 @@ func fillProcs(group *guestStepProcs, samples []guestreport.ProcessSample, ticks
 		cpu(exited)
 }
 
-// guestTests is the test results the agent found. finalKept says the report
-// holds the agent's last batch, which carries them.
-func guestTests(r *guestreport.Report, finalKept bool) guestTestsView {
+// guestTests is the test results the agent found. They come in its last batch:
+// finalSeen says the node saw it arrive, and finalKept that the report is shown
+// to hold it.
+func guestTests(r *guestreport.Report, finalSeen, finalKept bool) guestTestsView {
 	var out guestTestsView
 	switch {
+	case len(r.Tests) == 0 && !finalSeen:
+		out.Why = "could not tell: the agent sends its test results in its last batch, which did not arrive"
 	case len(r.Tests) == 0 && !finalKept:
-		out.Why = "could not tell: the agent sends its test results in its last batch, and the report does not " +
-			"hold it"
+		out.Why = "could not tell: the agent sends its test results in its last batch, which arrived, and the " +
+			"report cannot show that it holds that batch"
 	case len(r.Tests) == 0:
 		out.Why = "the agent found no test results (it reads the JUnit XML files it finds when the job ends)"
 	}
