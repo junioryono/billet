@@ -842,6 +842,50 @@ func TestTheMemoryLineBreaksAtAGap(t *testing.T) {
 	}
 }
 
+// A COUNTER THAT FELL BREAKS THE MEMORY LINE TOO: Window counts neither the
+// interval a counter fell across nor the catch-up after it, so the memory
+// samples on either side are not joined across them, whether the fall is
+// between two offsets or between two samples at one. Only the last interval,
+// which Window covers, is a line.
+func TestTheMemoryLineBreaksWhereACounterFell(t *testing.T) {
+	t.Parallel()
+
+	for name, points := range map[string][]usage.Point{
+		"between offsets": {
+			{OffsetMillis: 0, CPUUsage: 100, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 1000, CPUUsage: 50, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 2000, CPUUsage: 150, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 3000, CPUUsage: 250, MemoryCurrent: 1 << 30},
+		},
+		"at one offset": {
+			{OffsetMillis: 0, CPUUsage: 100, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 1000, CPUUsage: 200, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 1000, CPUUsage: 150, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 2000, CPUUsage: 250, MemoryCurrent: 1 << 30},
+			{OffsetMillis: 3000, CPUUsage: 350, MemoryCurrent: 1 << 30},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			tl := usage.Timeline{First: pageStart, Points: points}
+			measured := &alloc.RecordedUsage{Node: "epyc-1", JobUsage: exampleUsage(points)}
+			charts := buildCharts(&tl, "", alloc.JobRecord{}, measured, nil)
+			memory := charts.Charts[1].Lines[0].D
+
+			// Dots at 0 and 1s, and a line from 2s to 3s.
+			if strings.Count(memory, "M") != 3 || strings.Count(memory, "L") != 1 ||
+				!strings.Contains(memory, "L100000 ") {
+				t.Errorf("the memory line is joined across an interval a counter fell across: %s", memory)
+			}
+			// THE PREMISE: the rate line breaks there too, or the case proves nothing.
+			if cpu := charts.Charts[0].Lines[0].D; !strings.HasPrefix(cpu, "M66667 ") {
+				t.Errorf("the CPU line is not broken before 2s, so the series is not the one meant: %s", cpu)
+			}
+		})
+	}
+}
+
 // A RATE OR A LEVEL PAST THE LARGEST INT64 IS LABELLED AS ONE, never wrapped
 // negative by a conversion.
 func TestAChartLabelPastTheLargestInt64(t *testing.T) {

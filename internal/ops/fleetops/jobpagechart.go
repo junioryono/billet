@@ -330,9 +330,10 @@ func rateChart(windows []chartWindow, used []usage.WindowUsage, x func(time.Time
 // offset when every sample is drawn, and otherwise the highest level sampled in
 // each window, with a break for a window that holds no sample.
 //
-// A LEVEL IS NEVER DRAWN ACROSS TIME THE SAMPLER DID NOT SEE: the line breaks
-// before a sample marked AfterGap, and a sample with breaks on both sides is a
-// dot.
+// A LEVEL IS NEVER DRAWN ACROSS TIME THE SERIES CANNOT TELL ABOUT: two samples
+// are joined only when Window covers the whole interval between them, so the
+// line breaks wherever the rate lines do (a gap the sampler marked, a counter
+// that fell and its catch-up), and a sample with breaks on both sides is a dot.
 func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUsage, x func(time.Time) int64,
 	sampled bool, limitBytes int64,
 ) (string, []chartLine, *chartLimit) {
@@ -344,15 +345,15 @@ func memoryChart(tl usage.Timeline, windows []chartWindow, used []usage.WindowUs
 	var p svgPath
 	if sampled {
 		// ONE POINT AN OFFSET, so samples sharing one cannot grow the path past
-		// what chartWindows bounded.
-		for i := 0; i < len(tl.Points); {
-			at, level, gap := tl.Points[i].OffsetMillis, tl.Points[i].MemoryCurrent, false
+		// what chartWindows bounded. Sampled, windows[k] is the interval between
+		// the k-th distinct offset and the next.
+		for i, run := 0, 0; i < len(tl.Points); run++ {
+			at, level := tl.Points[i].OffsetMillis, tl.Points[i].MemoryCurrent
 			for ; i < len(tl.Points) && tl.Points[i].OffsetMillis == at; i++ {
 				level = max(level, tl.Points[i].MemoryCurrent)
-				gap = gap || tl.Points[i].AfterGap
 			}
 			px, y := x(tl.First.Add(time.Duration(at)*time.Millisecond)), chartY(float64(level), top)
-			if gap || !p.down {
+			if run == 0 || !used[run-1].Complete() || !p.down {
 				p.lift()
 				p.level(px, px, y)
 				continue
