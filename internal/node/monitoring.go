@@ -289,7 +289,10 @@ func (r *Runner) reportGuest(ctx context.Context, lease *alloc.Lease, name strin
 		return
 	}
 
-	report, ok := r.cache.TakeGuestReport(name)
+	takeCtx, cancelTake := context.WithTimeout(context.WithoutCancel(ctx), guestReportLimit)
+	report, ok := r.cache.TakeGuestReport(takeCtx, name)
+	cancelTake()
+
 	if !ok {
 		return
 	}

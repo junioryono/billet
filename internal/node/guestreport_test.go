@@ -183,7 +183,7 @@ func guestHello(t *testing.T, service *CacheService, token string) *httptest.Res
 func takeGuest(t *testing.T, service *CacheService, instance string) alloc.GuestReport {
 	t.Helper()
 
-	report, ok := service.TakeGuestReport(instance)
+	report, ok := service.TakeGuestReport(t.Context(), instance)
 	if !ok {
 		t.Fatalf("no guest report was taken for %s", instance)
 	}
@@ -213,7 +213,7 @@ func TestTheGuestRoutesAreNotFoundWithMonitoringOff(t *testing.T) {
 		}
 	}
 
-	if _, ok := service.TakeGuestReport("billet-one"); ok {
+	if _, ok := service.TakeGuestReport(t.Context(), "billet-one"); ok {
 		t.Error("a node that takes no guest reports took one")
 	}
 }
@@ -306,7 +306,7 @@ func TestAGuestBatchIsKeptAndTakenOnce(t *testing.T) {
 	if got := guestHello(t, service, token).Code; got != http.StatusUnauthorized {
 		t.Errorf("limits after the report was taken answered %d, want 401", got)
 	}
-	if _, ok := service.TakeGuestReport("billet-one"); ok {
+	if _, ok := service.TakeGuestReport(t.Context(), "billet-one"); ok {
 		t.Error("a report was taken twice")
 	}
 }
@@ -341,8 +341,12 @@ func TestAClosedSessionTakesNoMoreBatches(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if got := postBatch(t, service, token, "", guestBatch(t, 1, "")).Code; got != http.StatusUnauthorized {
-		t.Errorf("a batch to a closed session answered %d, want 401", got)
+	data := guestBatch(t, 1, "")
+	body := &countingBody{r: bytes.NewReader(data)}
+
+	if got := guestPost(t, service, token, "", body, int64(len(data))).Code; got != http.StatusUnauthorized ||
+		body.read {
+		t.Errorf("a batch to a closed session answered %d, read %t; want 401 unread", got, body.read)
 	}
 	if got := guestHello(t, service, token).Code; got != http.StatusUnauthorized {
 		t.Errorf("limits from a closed session answered %d, want 401", got)
@@ -374,7 +378,7 @@ func TestABatchThatArrivesAsTheReportIsTakenIsNotAccepted(t *testing.T) {
 
 	data := guestBatch(t, 1, "")
 	body := &takingBody{r: bytes.NewReader(data), take: func() {
-		taken, _ = service.TakeGuestReport("billet-one")
+		taken, _ = service.TakeGuestReport(t.Context(), "billet-one")
 	}}
 
 	if got := guestPost(t, service, token, "", body, int64(len(data))).Code; got != http.StatusUnauthorized {
@@ -382,6 +386,217 @@ func TestABatchThatArrivesAsTheReportIsTakenIsNotAccepted(t *testing.T) {
 	}
 	if taken.Codec != alloc.GuestReportCodec || taken.Accepted != 0 {
 		t.Errorf("the report taken mid-batch is %+v, want one with nothing accepted", taken)
+	}
+}
+
+// AND ONE STILL ARRIVING WHEN THE COMPUTE STOPS: the session closed under it, so
+// it is answered 401, not kept for a report that may never be taken.
+func TestABatchThatArrivesAsTheSessionClosesIsNotAccepted(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := guestService(t)
+
+	data := guestBatch(t, 1, "")
+	body := &takingBody{r: bytes.NewReader(data), take: func() {
+		if err := service.Close(context.WithoutCancel(t.Context()), "billet-one"); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}}
+
+	if got := guestPost(t, service, token, "", body, int64(len(data))).Code; got != http.StatusUnauthorized {
+		t.Errorf("a batch whose body arrived as the session closed answered %d, want 401", got)
+	}
+	if report := takeGuest(t, service, "billet-one"); report.Accepted != 0 {
+		t.Errorf("the report counts %d accepted after the session closed under it, want 0", report.Accepted)
+	}
+}
+
+// cutBody is a body that ends before its stated length.
+type cutBody struct{ sent bool }
+
+func (c *cutBody) Read(p []byte) (int, error) {
+	if c.sent {
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	c.sent = true
+
+	return copy(p, "GUEST"), nil
+}
+
+// A BODY CUT SHORT IS REFUSED AND COUNTED like one that did not decode: a client
+// that stopped sending can still read the answer.
+func TestABodyCutShortIsRefusedAndCounted(t *testing.T) {
+	t.Parallel()
+
+	service, _, token, _ := guestService(t)
+
+	if got := guestPost(t, service, token, "", &cutBody{}, 100).Code; got != http.StatusBadRequest {
+		t.Errorf("a body cut short answered %d, want 400", got)
+	}
+
+	if report := takeGuest(t, service, "billet-one"); report.Refused != 1 || report.DroppedBytes != 5 {
+		t.Errorf("the report counts %d refused and %d bytes dropped, want 1 and 5",
+			report.Refused, report.DroppedBytes)
+	}
+}
+
+// THE NODE'S CLOCK STEPPED BACK BETWEEN TWO BATCHES DOES NOT PUT THE LAST ARRIVAL
+// BEFORE THE FIRST, which the ledger would refuse, costing the job its row.
+func TestAClockSteppedBackKeepsTheArrivalsInOrder(t *testing.T) {
+	t.Parallel()
+
+	service, clock, token, _ := guestService(t)
+	first := clock.now()
+
+	if got := postBatch(t, service, token, "", guestBatch(t, 1, "")).Code; got != http.StatusNoContent {
+		t.Fatalf("a batch answered %d, want 204", got)
+	}
+
+	clock.advance(-time.Minute)
+
+	if got := postBatch(t, service, token, "", guestBatch(t, 2, "")).Code; got != http.StatusNoContent {
+		t.Fatalf("a batch after the clock stepped back answered %d, want 204", got)
+	}
+
+	report := takeGuest(t, service, "billet-one")
+	if !report.FirstReceived.Equal(first) || !report.LastReceived.Equal(first) || report.Accepted != 2 {
+		t.Errorf("the arrivals are %s to %s with %d accepted, want both %s and 2",
+			report.FirstReceived, report.LastReceived, report.Accepted, first)
+	}
+}
+
+// repeatedBatch is a batch of one failed test name repeated: almost nothing
+// encoded, about 170 KiB decoded.
+func repeatedBatch(t *testing.T, seq uint64) []byte {
+	t.Helper()
+
+	name := strings.Repeat("x", guestreport.MaxFailedNameBytes)
+	b := guestreport.Batch{Seq: seq, AgentVersion: "v0.15.0", TicksPerSecond: 100}
+
+	for s := range guestreport.MaxBatchSuites {
+		suite := guestreport.SuiteResult{Name: fmt.Sprintf("suite-%d", s), Tests: 50, Failures: 50}
+		for range guestreport.MaxFailedNames {
+			suite.Failed = append(suite.Failed, name)
+		}
+		b.Tests = append(b.Tests, suite)
+	}
+
+	data, err := guestreport.EncodeBatch(b)
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
+
+	return data
+}
+
+// WHAT THE KEPT BATCHES DECODE TO AT THE DESTROY IS BOUNDED, not only what they
+// take encoded. Batches that decode past 16 MiB are left out of the merge and
+// their bytes counted as dropped; the earlier ones are kept.
+func TestTheMergeAtTheDestroyHoldsABoundedAmount(t *testing.T) {
+	t.Parallel()
+
+	// THE BOUND'S NUMBER, not the constant, so the constant cannot move alone.
+	const bound = 16 << 20
+
+	service, clock, token, _ := guestService(t)
+
+	var (
+		sent  [][]byte
+		total int
+	)
+
+	for seq := uint64(1); total <= bound+(4<<20); seq++ {
+		data := repeatedBatch(t, seq)
+		decoded, err := guestreport.DecodeBatch(data)
+		if err != nil {
+			t.Fatalf("DecodeBatch: %v", err)
+		}
+
+		clock.advance(guestRefill)
+
+		if got := postBatch(t, service, token, "", data).Code; got != http.StatusNoContent {
+			t.Fatalf("batch %d answered %d, want 204", seq, got)
+		}
+
+		sent = append(sent, data)
+		total += decodedSize(&decoded)
+	}
+
+	report := takeGuest(t, service, "billet-one")
+
+	merged, err := guestreport.Decode(report.Data)
+	if err != nil {
+		t.Fatalf("the report's data does not decode: %v", err)
+	}
+
+	kept := int(merged.LastSeq)
+	if kept == 0 || kept >= len(sent) || report.Accepted != int64(len(sent)) {
+		t.Fatalf("the merge kept batches 1 to %d of %d accepted (%d), want some and not all",
+			kept, len(sent), report.Accepted)
+	}
+
+	held, dropped := 0, int64(0)
+	for i, data := range sent {
+		decoded, err := guestreport.DecodeBatch(data)
+		if err != nil {
+			t.Fatalf("DecodeBatch: %v", err)
+		}
+
+		if i < kept {
+			held += decodedSize(&decoded)
+		} else {
+			dropped += int64(len(data))
+		}
+	}
+
+	if held > bound || report.DroppedBytes != dropped {
+		t.Errorf("the merge held %d bytes decoded and dropped %d, want at most %d and %d",
+			held, report.DroppedBytes, bound, dropped)
+	}
+}
+
+// THE MERGE AT THE DESTROY TAKES ONE OF THE NODE'S DECODE SLOTS. With all eight
+// held past the wait the report goes without its batches, which are counted as
+// dropped; with one free it carries them.
+func TestTheMergeAtTheDestroyWaitsForADecodeSlot(t *testing.T) {
+	t.Parallel()
+
+	for _, free := range []bool{false, true} {
+		service, _, token, _ := guestService(t)
+		data := guestBatch(t, 1, "")
+
+		if got := postBatch(t, service, token, "", data).Code; got != http.StatusNoContent {
+			t.Fatalf("a batch answered %d, want 204", got)
+		}
+
+		held := 8
+		if free {
+			held = 7
+		}
+
+		for range held {
+			service.guestDecode <- struct{}{}
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		report, ok := service.TakeGuestReport(ctx, "billet-one")
+		cancel()
+
+		switch {
+		case !ok || report.Accepted != 1:
+			t.Errorf("free %t: took %t with %d accepted, want a report of 1", free, ok, report.Accepted)
+		case free && (len(report.Data) == 0 || report.DroppedBytes != 0):
+			t.Errorf("with a slot free the report carries %d bytes and drops %d, want the batch",
+				len(report.Data), report.DroppedBytes)
+		case !free && (report.Data != nil || report.DroppedBytes != int64(len(data))):
+			t.Errorf("with no slot free the report carries %d bytes and drops %d, want none and %d",
+				len(report.Data), report.DroppedBytes, len(data))
+		}
+
+		if got := len(service.guestDecode); got != held {
+			t.Errorf("free %t: %d slots are held after the merge, want the %d the test holds", free, got, held)
+		}
 	}
 }
 
@@ -423,7 +638,7 @@ func TestAGuestThatNeverReportedStillHasARow(t *testing.T) {
 			report, alloc.GuestReportCodec)
 	}
 
-	if _, ok := service.TakeGuestReport("billet-nobody"); ok {
+	if _, ok := service.TakeGuestReport(t.Context(), "billet-nobody"); ok {
 		t.Error("a report was taken for an instance with no session")
 	}
 }
@@ -877,22 +1092,108 @@ func TestAGuestReportThatCannotBeSentNeverHoldsTheDestroy(t *testing.T) {
 	runner, p := guestRunner(t, store, a, host, true)
 	lease, _ := launchGuest(t, runner, p, a)
 
-	done := make(chan error, 1)
-	go func() { done <- runner.Destroy(t.Context(), lease.RequestID) }()
+	// THE CONTRACT'S BOUND, not the constant, so the constant cannot move alone.
+	const bound = 2 * time.Second
 
-	timer := time.NewTimer(guestReportLimit + 10*time.Second)
-	defer timer.Stop()
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		done <- runner.Destroy(context.WithoutCancel(t.Context()), lease.RequestID)
+	}()
+	t.Cleanup(func() {
+		join := time.NewTimer(time.Minute)
+		defer join.Stop()
+
+		select {
+		case <-finished:
+		case <-join.C:
+		}
+	})
+
+	// THE LEDGER WAS ASKED, or the destroy below would pass by never sending.
+	asked := time.NewTimer(30 * time.Second)
+	defer asked.Stop()
+
+	select {
+	case got := <-store.deadline:
+		if got > bound {
+			t.Errorf("the report was given %s to be taken, want at most %s", got, bound)
+		}
+	case <-asked.C:
+		t.Fatal("the destroy never offered the ledger the guest's report")
+	}
+
+	held := time.NewTimer(bound + 10*time.Second)
+	defer held.Stop()
 
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Errorf("a report the ledger never took failed the destroy: %v", err)
 		}
-	case <-timer.C:
+	case <-held.C:
 		t.Fatal("a report the ledger never took held the destroy")
 	}
+}
 
-	if got := <-store.deadline; got > guestReportLimit {
-		t.Errorf("the report was given %s to be taken, want at most %s", got, guestReportLimit)
+// A NODE WHOSE DECODE SLOTS ARE ALL HELD COSTS A DESTROY AT MOST THE WAIT FOR ONE:
+// the row is recorded with the counts, and the batches it could not merge are
+// counted as dropped.
+func TestADestroyWaitsABoundedTimeForADecodeSlot(t *testing.T) {
+	t.Parallel()
+
+	const bound = 2 * time.Second
+
+	a, host := newAllocatorWithHost(t)
+	runner, p := guestRunner(t, nil, a, host, true)
+	lease, spec := launchGuest(t, runner, p, a)
+
+	data := guestBatch(t, 1, "")
+	if got := postBatch(t, runner.cache, spec.CacheToken, "", data).Code; got != http.StatusNoContent {
+		t.Fatalf("the guest's batch answered %d, want 204", got)
+	}
+
+	for range 8 {
+		runner.cache.guestDecode <- struct{}{}
+	}
+
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		done <- runner.Destroy(context.WithoutCancel(t.Context()), lease.RequestID)
+	}()
+	t.Cleanup(func() {
+		join := time.NewTimer(time.Minute)
+		defer join.Stop()
+
+		select {
+		case <-finished:
+		case <-join.C:
+		}
+	})
+
+	held := time.NewTimer(bound + 10*time.Second)
+	defer held.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Destroy: %v", err)
+		}
+	case <-held.C:
+		t.Fatal("a destroy waited past its bound for a decode slot")
+	}
+
+	recorded, err := a.LeaseGuestReport(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("LeaseGuestReport: %v", err)
+	}
+	if recorded.Accepted != 1 || len(recorded.Data) != 0 || recorded.DroppedBytes != int64(len(data)) {
+		t.Errorf("the ledger keeps accepted %d, %d bytes, %d dropped; want 1, none and %d",
+			recorded.Accepted, len(recorded.Data), recorded.DroppedBytes, len(data))
 	}
 }

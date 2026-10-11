@@ -1,7 +1,9 @@
 package node
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -40,8 +42,13 @@ const (
 	// guestDecodeSlots bounds the batches the whole node decodes at once.
 	guestDecodeSlots = 8
 	// guestReportLimit bounds sending a job's report, which sits on the destroy
-	// path as the usage report does.
+	// path as the usage report does, and separately the wait for a decode slot
+	// to merge it in.
 	guestReportLimit = 2 * time.Second
+	// guestAssemblyBound is what a job's kept batches may decode to when they are
+	// merged, as decodedSize counts it. A sampling agent's 2 MiB of batches
+	// decodes to well under it.
+	guestAssemblyBound = 16 << 20
 )
 
 // guestChannel is what one session's agent has told the node, kept in memory
@@ -229,8 +236,9 @@ func (s *CacheService) acceptGuestBatch(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 
-		// A BODY THAT NEVER ARRIVED WHOLE is not a batch the node refused; the
-		// agent did not hear an answer and sends it again.
+		// A BODY THAT NEVER ARRIVED WHOLE is refused like one that did not
+		// decode: a client that cut its body short can still read the answer.
+		s.refuseGuestBatch(g, len(body))
 		http.Error(w, "the guest batch could not be read", http.StatusBadRequest)
 
 		return
@@ -258,12 +266,13 @@ func (s *CacheService) acceptGuestBatch(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	now := s.now()
-
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.taken {
+	// AGAIN, because the session may have closed or its report been taken while
+	// the body was arriving, and a 204 would tell the agent the node kept a batch
+	// nobody will record.
+	if g.taken || session.closing.Load() {
 		http.Error(w, "the cache session has ended", http.StatusUnauthorized)
 
 		return
@@ -282,10 +291,19 @@ func (s *CacheService) acceptGuestBatch(w http.ResponseWriter, r *http.Request, 
 	g.batches = append(g.batches, body)
 	g.kept += int64(len(body))
 	g.accepted++
+
+	// THE WALL CLOCK, READ UNDER THE LOCK AND NEVER MOVED BACK: the ledger
+	// refuses a first arrival after the last, so two batches committed in the
+	// other order from their reads, or a clock stepped back, would cost the job
+	// its whole row. Without its monotonic reading, so the two compare as the
+	// ledger will.
+	now := s.now().Round(0)
 	if g.first.IsZero() {
 		g.first = now
 	}
-	g.last = now
+	if now.After(g.last) {
+		g.last = now
+	}
 	if final {
 		g.final = true
 	}
@@ -315,7 +333,12 @@ func retryAfter(w http.ResponseWriter, wait time.Duration) {
 //
 // A ROW EVEN WHEN THE GUEST SAID NOTHING, with no hello and nothing accepted, so a
 // reader can say the guest never contacted the node rather than show nothing.
-func (s *CacheService) TakeGuestReport(instance string) (alloc.GuestReport, bool) {
+//
+// THE MERGE TAKES ONE OF THE NODE'S DECODE SLOTS, waited for until ctx ends, so
+// the node decodes no more at once at a destroy than it does for its guests; a
+// slot not had in time sends the counts without the batches, whose bytes are
+// then counted as dropped.
+func (s *CacheService) TakeGuestReport(ctx context.Context, instance string) (alloc.GuestReport, bool) {
 	if !s.guestMonitoring {
 		return alloc.GuestReport{}, false
 	}
@@ -350,7 +373,7 @@ func (s *CacheService) TakeGuestReport(instance string) (alloc.GuestReport, bool
 	g.mu.Unlock()
 
 	if len(batches) > 0 {
-		if err := encodeGuestReport(&report, batches); err != nil {
+		if err := s.encodeGuestReport(ctx, &report, batches); err != nil {
 			report.DroppedBytes += kept
 			s.log.Warn("could not keep what a job's guest reported; its counts are kept without it",
 				"instance", instance, "error", err)
@@ -367,12 +390,38 @@ func (s *CacheService) TakeGuestReport(instance string) (alloc.GuestReport, bool
 
 // encodeGuestReport merges batches into report's Data, with the agent's version
 // where the ledger can keep it.
-func encodeGuestReport(report *alloc.GuestReport, batches [][]byte) error {
+//
+// WHAT THE BATCHES DECODE TO IS BOUNDED, not only what they take encoded: a batch
+// of one name repeated compresses to almost nothing and decodes to a megabyte, so
+// the budget's 2 MiB could otherwise hold hundreds of megabytes at the destroy.
+// The batches are decoded in the order they arrived until guestAssemblyBound, and
+// the bytes of the rest are counted as dropped.
+func (s *CacheService) encodeGuestReport(ctx context.Context, report *alloc.GuestReport, batches [][]byte) error {
+	select {
+	case s.guestDecode <- struct{}{}:
+		defer func() { <-s.guestDecode }()
+	case <-ctx.Done():
+		return fmt.Errorf("node: no decode slot came free for the guest's report: %w", ctx.Err())
+	}
+
 	decoded := make([]guestreport.Batch, 0, len(batches))
-	for _, data := range batches {
+	held := 0
+
+	var past int64
+
+	for i, data := range batches {
 		b, err := guestreport.DecodeBatch(data)
 		if err != nil {
 			return err
+		}
+
+		held += decodedSize(&b)
+		if held > guestAssemblyBound {
+			for _, rest := range batches[i:] {
+				past += int64(len(rest))
+			}
+
+			break
 		}
 
 		decoded = append(decoded, b)
@@ -389,6 +438,7 @@ func encodeGuestReport(report *alloc.GuestReport, batches [][]byte) error {
 	}
 
 	report.Data, report.Schema = data, guestSchema
+	report.DroppedBytes += past
 
 	// THE LEDGER'S OWN RULE FOR A VERSION, asked of the version alone: one the
 	// guest spelled in a way the ledger cannot keep is left out, never sent to
@@ -398,4 +448,42 @@ func encodeGuestReport(report *alloc.GuestReport, batches [][]byte) error {
 	}
 
 	return nil
+}
+
+// The bytes one decoded element holds at least: its fixed fields (eight bytes a
+// number, sixteen a string's header, twenty-four a slice's), its text counted
+// apart.
+const (
+	sampleBytes        = 10 * 8
+	processSampleBytes = 8 + 24 + 5*8 + 8
+	processRowBytes    = 16 + 5*8
+	stepBytes          = 16 + 8
+	suiteBytes         = 16 + 4*8 + 24
+	failedNameBytes    = 16
+)
+
+// decodedSize is about what b holds in memory once decoded: its fixed fields and
+// its text, without the allocator's own overhead.
+func decodedSize(b *guestreport.Batch) int {
+	n := len(b.AgentVersion) + len(b.Samples)*sampleBytes
+
+	for _, p := range b.Processes {
+		n += processSampleBytes + len(p.Rows)*processRowBytes
+		for _, row := range p.Rows {
+			n += len(row.Name)
+		}
+	}
+
+	for _, m := range b.Steps {
+		n += stepBytes + len(m.Name)
+	}
+
+	for _, t := range b.Tests {
+		n += suiteBytes + len(t.Name)
+		for _, name := range t.Failed {
+			n += failedNameBytes + len(name)
+		}
+	}
+
+	return n
 }
