@@ -3,12 +3,15 @@ package guest
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -241,13 +244,106 @@ func TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero(t *testing.T) {
 		t.Fatalf("%d posts, %d final; want exactly one final, the last", len(posts), finals)
 	}
 
-	final := posts[len(posts)-1].batch
-	// The agent's own CPU can round to no tick in a second's run; its processes
-	// cannot be none.
-	if final.TicksPerSecond != 100 || len(final.Processes) != 1 || len(final.Processes[0].Rows) == 0 {
-		t.Errorf("the final batch read nothing real from /proc: %d ticks/s, %d process samples; its log: %s",
-			final.TicksPerSecond, len(final.Processes), stderr.String())
+	assertReadTheRealProc(t, posts, stderr.String())
+}
+
+// assertReadTheRealProc holds what the monitor sent to what this host's own /proc
+// allows. Its totals are sent where /proc names the guest's disk and interface,
+// and otherwise the log names the one it lacks. Its processes are sent when it
+// runs as root; otherwise another user's io is refused to it, which is
+// could-not-tell, so none is sent and the log says why. The agent's own CPU can
+// round to no tick in a second's run, so it proves nothing here.
+func assertReadTheRealProc(t *testing.T, posts []sent, log string) {
+	t.Helper()
+
+	var samples, processes, rows int
+
+	for i := range posts {
+		b := &posts[i].batch
+		if b.TicksPerSecond != 100 {
+			t.Errorf("a batch counts %d ticks a second, want /proc's 100", b.TicksPerSecond)
+		}
+
+		samples += len(b.Samples)
+		processes += len(b.Processes)
+
+		for _, ps := range b.Processes {
+			rows += len(ps.Rows)
+		}
 	}
+
+	switch lacks := hostLacks(t); {
+	case lacks == "" && samples == 0:
+		t.Errorf("this host's /proc has vda and eth0, and the monitor sent no sample of it; its log: %s", log)
+	case lacks != "" && !strings.Contains(log, "has no "+lacks):
+		t.Errorf("this host's /proc has no %s, and the monitor's log does not say so: %s", lacks, log)
+	}
+
+	if !someIORefused(t) {
+		if processes != 1 || rows == 0 {
+			t.Errorf("with every process's io readable the monitor sent %d process samples with %d rows, "+
+				"want one with rows; its log: %s", processes, rows, log)
+		}
+
+		return
+	}
+
+	if processes != 0 || !strings.Contains(log, "no process sample is sent") ||
+		!strings.Contains(log, "could not tell") || !strings.Contains(log, "permission denied") {
+		t.Errorf("with another user's io refused to it the monitor sent %d process samples, and its log does "+
+			"not say why: %s", processes, log)
+	}
+}
+
+// someIORefused reports whether this host's /proc refuses this process some
+// process's io, as it does to anyone but root while another user's process is
+// there. Whether this process is root does not settle it: in a container run as
+// one user, every process the container sees can be that user's.
+func someIORefused(t *testing.T) bool {
+	t.Helper()
+
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatalf("list this host's /proc: %v", err)
+	}
+
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+
+		if _, err := os.ReadFile("/proc/" + e.Name() + "/io"); errors.Is(err, fs.ErrPermission) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hostLacks is the guest device this host's /proc does not name, vda's disk or
+// eth0's interface, or "" when it names both.
+func hostLacks(t *testing.T) string {
+	t.Helper()
+
+	diskstats, err := os.ReadFile("/proc/diskstats")
+	if err != nil {
+		t.Fatalf("read this host's /proc/diskstats: %v", err)
+	}
+
+	if !regexp.MustCompile(`(?m)^\s*\d+\s+\d+\s+vda\s`).Match(diskstats) {
+		return "vda"
+	}
+
+	dev, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		t.Fatalf("read this host's /proc/net/dev: %v", err)
+	}
+
+	if !regexp.MustCompile(`(?m)^\s*eth0:`).Match(dev) {
+		return "eth0"
+	}
+
+	return ""
 }
 
 // A log whose reader has gone is a write that fails, not a SIGPIPE that ends the
