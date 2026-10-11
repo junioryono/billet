@@ -379,6 +379,9 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 			s.ActionsProxy = "http://billet:session@172.20.0.1:7719"
 			s.ActionsCAPEM = "certificate"
 		}, "no cache session"},
+		{"the guest's monitor without a cache session", func(s *provider.Spec) {
+			s.GuestMonitor = true
+		}, "no cache session for it to report to"},
 		{"a NUL in the Actions proxy", func(s *provider.Spec) {
 			s.CacheEndpoint = "http://172.20.0.1:7718"
 			s.CacheToken = strings.Repeat("a", 64)

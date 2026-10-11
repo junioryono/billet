@@ -8,6 +8,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 	jobusage "github.com/junioryono/billet/internal/usage"
@@ -26,6 +27,18 @@ func FirecrackerOptions(cfg *config.Config) []firecracker.Option {
 
 	return opts
 }
+
+// guestMonitoring reports whether this node takes its guests' own reports
+// (node.monitoring.guest), which its guest cache service then serves and its
+// guests are told to send.
+func guestMonitoring(cfg *config.Config) bool {
+	return cfg.Node.Monitoring != nil && cfg.Node.Monitoring.Guest
+}
+
+// THE RUNNER FINDS WHERE A GUEST'S REPORT GOES BY ASSERTING ITS LEASE STORE, so
+// a signature that drifted would compile and drop every report: the node client
+// NewNodeRunner gives it is one.
+var _ node.GuestRecorder = (*nodeclient.Client)(nil)
 
 // requireJobAccounting refuses a Firecracker node whose node.monitoring the
 // host cannot honour: a controller the host did not prove is never asked of
@@ -68,6 +81,11 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 	default:
 		slog.Info("measuring each job from the host", "interval", interval, "rapl", m.RAPL,
 			"idle_package_watts", m.IdlePackageWatts)
+	}
+
+	if m.Guest {
+		slog.Info("asking each guest's agent for its own view of the job, through the guest cache " +
+			"service; it is kept as the guest's and never acted on")
 	}
 
 	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}

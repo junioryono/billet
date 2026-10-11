@@ -141,3 +141,42 @@ func TestPerfIsFirecrackersAlone(t *testing.T) {
 		}
 	}
 }
+
+// THE GUEST'S AGENT REPORTS THROUGH THE GUEST CACHE SERVICE, so
+// node.monitoring.guest is read on a firecracker node that has node.cache, absent
+// is off, and it is refused without node.cache or on any other backend, whose
+// guest is never told to start the agent.
+func TestGuestMonitoringNeedsTheGuestCacheServiceOnFirecracker(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(writeConfig(t, withMonitoring(t, nodeCacheBlock+"  monitoring:\n    guest: true\n")))
+	if err != nil {
+		t.Fatalf("guest monitoring on a firecracker node with node.cache was refused: %v", err)
+	}
+	if !cfg.Node.Monitoring.Guest {
+		t.Fatal("guest: true was read as off")
+	}
+
+	cfg, err = Load(writeConfig(t, withMonitoring(t, nodeCacheBlock+"  monitoring:\n    rapl: true\n")))
+	if err != nil || cfg.Node.Monitoring.Guest {
+		t.Fatalf("a block that does not name guest has guest %v, %v; want off", cfg.Node.Monitoring.Guest, err)
+	}
+
+	if got := loadErr(t, withMonitoring(t, "  monitoring:\n    guest: true\n")); !strings.Contains(got,
+		"node.monitoring.guest is set but node.cache is not") {
+		t.Errorf("guest monitoring without node.cache answered %q, want a refusal naming node.cache", got)
+	}
+
+	for _, provider := range []ProviderKind{ProviderDocker, ProviderTart} {
+		c := &Config{Node: &NodeConfig{Provider: provider, Cache: &NodeCacheConfig{},
+			Monitoring: &NodeMonitoringConfig{Guest: true}}}
+		got := errors.Join(c.validateMonitoringNode()...)
+		if got == nil || !strings.Contains(got.Error(), "only a firecracker guest is told") {
+			t.Errorf("guest monitoring on a %s node answered %v, want a refusal", provider, got)
+		}
+		c.Node.Monitoring.Guest = false
+		if got := errors.Join(c.validateMonitoringNode()...); got != nil {
+			t.Errorf("the same %s node without guest monitoring was refused: %v", provider, got)
+		}
+	}
+}
