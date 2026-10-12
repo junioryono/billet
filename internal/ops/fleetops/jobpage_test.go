@@ -152,9 +152,10 @@ var exampleJob = alloc.HistoryJob{
 
 // seedPageJob stages the example job through the real allocator on a clock
 // that matches its series: queued and assigned just before the first sample,
-// started with it, measured, succeeded and released. It returns the lease.
+// started with it, measured, its guest's report kept when one is given,
+// succeeded and released. It returns the lease.
 func seedPageJob(t *testing.T, stateDir string, job alloc.HistoryJob, measured *alloc.JobUsage,
-	series *alloc.UsageSeries,
+	series *alloc.UsageSeries, guest *alloc.GuestReport,
 ) string {
 	t.Helper()
 
@@ -204,6 +205,9 @@ func seedPageJob(t *testing.T, stateDir string, job alloc.HistoryJob, measured *
 	if measured != nil {
 		must("RecordLeaseUsage", a.RecordLeaseUsage(t.Context(), lease.ID, lease.Epoch, *measured, series))
 	}
+	if guest != nil {
+		must("RecordGuestReport", a.RecordGuestReport(t.Context(), lease.ID, lease.Epoch, *guest))
+	}
 	must("RecordJobResult", a.RecordJobResult(t.Context(), lease.ID, "succeeded", 4242))
 	now = pageSecond(171)
 	must("Release", a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone))
@@ -251,7 +255,7 @@ func TestJobsShowHTMLIsTheCommittedExample(t *testing.T) {
 	cfg := writeJobsConfig(t, stateDir)
 	points := exampleSeries()
 	measured := exampleUsage(points)
-	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points))
+	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points), exampleGuest(t))
 	fakeJobsGitHub(t, stepsOn(lease, pageStepsJSON))
 
 	page := strings.ReplaceAll(showHTML(t, cfg, lease), lease, exampleLease)
@@ -310,7 +314,7 @@ func TestTheJobPageRunsOnlyItsOwnScriptAndFetchesNothing(t *testing.T) {
 	cfg := writeJobsConfig(t, stateDir)
 	points := exampleSeries()
 	measured := exampleUsage(points)
-	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points))
+	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points), exampleGuest(t))
 	fakeJobsGitHub(t, stepsOn(lease, pageStepsJSON))
 	page := showHTML(t, cfg, lease)
 
@@ -573,7 +577,7 @@ func TestTheJobPageSaysWhenCountersAndDestinationsWereNotMeasured(t *testing.T) 
 func TestTheJobPageOfAJobWithNoUsage(t *testing.T) {
 	stateDir := t.TempDir()
 	cfg := writeJobsConfig(t, stateDir)
-	lease := seedPageJob(t, stateDir, exampleJob, nil, nil)
+	lease := seedPageJob(t, stateDir, exampleJob, nil, nil, nil)
 	fakeJobsGitHub(t, stepsOn(lease, pageStepsJSON))
 	page := showHTML(t, cfg, lease)
 
@@ -614,7 +618,7 @@ func TestTheJobPageOfAJobWithNoSteps(t *testing.T) {
 			cfg := writeJobsConfig(t, stateDir)
 			points := exampleSeries()
 			measured := exampleUsage(points)
-			lease := seedPageJob(t, stateDir, tc.job, &measured, clockedSeriesOf(t, points))
+			lease := seedPageJob(t, stateDir, tc.job, &measured, clockedSeriesOf(t, points), nil)
 			fakeJobsGitHub(t, stepsOn(lease, tc.steps))
 			page := showHTML(t, cfg, lease)
 
@@ -639,7 +643,7 @@ func TestTheJobPageSaysWhyTheStepsCouldNotBeRead(t *testing.T) {
 	cfg := writeJobsConfig(t, stateDir)
 	points := exampleSeries()
 	measured := exampleUsage(points)
-	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points))
+	lease := seedPageJob(t, stateDir, exampleJob, &measured, clockedSeriesOf(t, points), nil)
 	fakeJobsGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprint(w, `{"message":"Resource not accessible by integration"}`)

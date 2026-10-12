@@ -309,6 +309,10 @@ func TestJobsShowJSONSaysWhenNothingWasMeasured(t *testing.T) {
 	if string(got["usage"]) != "null" {
 		t.Errorf("usage = %s, want null", got["usage"])
 	}
+	// NO GUEST ROW IS A NULL GUEST, present and null, never absent or zeros.
+	if guest, ok := got["guest"]; !ok || string(guest) != "null" {
+		t.Errorf("guest = %s (present %v), want null", guest, ok)
+	}
 	if string(got["request_id"]) != "0" {
 		t.Errorf("request_id = %s, want 0 for a pooled lease", got["request_id"])
 	}
@@ -348,7 +352,7 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 	shapes := map[string]*alloc.RecordedUsage{"measured": measured, "partial": &partial, "no-report": nil}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name]); err != nil {
+		if err := renderJobJSON(&out, record, shapes[name], nil); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

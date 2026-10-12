@@ -18,5 +18,6 @@
   "assigned_at": "2026-10-09T10:00:01Z",
   "started_at": "2026-10-09T10:00:05Z",
   "finished_at": "2026-10-09T10:01:40Z",
-  "usage": null
+  "usage": null,
+  "guest": null
 }

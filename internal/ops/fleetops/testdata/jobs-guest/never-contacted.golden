@@ -1,0 +1,75 @@
+== billet jobs show ==
+lease      6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64
+tier       billet-2vcpu on epyc-1 (docker, 2 vCPU, 8.0 GiB)
+job        "build (ubuntu, go 1.26)" (github job "51000000007", run 4242, request 77)
+repository "acme/api"
+workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
+event      "push"
+result     github "succeeded"; billet done
+times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
+
+usage      measured by the host epyc-1, 169 samples every 1s over 2m47.5s
+cpu        user 193.3s, system 21.5s
+vmm split  guest vCPUs 208.3s, VMM 6.4s
+memory     peak 3.4 GiB, oom kills 0
+disk       read 513.4 MiB, written 3.7 GiB (host io, not the guest's page cache)
+network    received 624.1 MiB, sent 83.3 MiB (the guest's view)
+stalled    cpu 2.3s, memory 0.0s (full 0.0s), io 1.9s (full 0.7s)
+energy     2.4 kJ active, 1.6 kJ idle (package RAPL, a model rather than a meter)
+counters   cycles 612,000,000,000, instructions 734,400,000,000 (the vCPU threads, guest and host mode)
+           cache references 9,100,000,000, cache misses 2,350,000,000
+           branch misses 3,120,000,000, frontend stall cycles 171,000,000,000
+ipc        1.20 instructions per cycle
+cache      3.2 misses per 1,000 instructions
+branches   4.2 mispredicted per 1,000 instructions
+frontend   stalled 27.9% of cycles
+
+destinations 3 by total bytes, from the host's connection tracker (attributed by the guest's source address)
+           address                sent    received  connections
+           140.82.112.4        3.0 MiB   335.7 MiB            4
+           185.199.108.133   400.4 KiB    58.2 MiB           12
+           10.0.0.2           23.4 KiB    59.6 KiB          310
+other      sent 8.8 KiB, received 117.2 KiB, 3 connections (beyond the 256 destinations the node keeps by name)
+complete   yes
+tap        sent 3.4 MiB, received 394.2 MiB; tap minus attributed: sent +16.6 KiB, received +213.9 KiB
+           (a comparison of two counters read a moment apart, not a measurement of what was missed)
+
+steps      github job 7001 "test", attempt 2, on runner billet-6f1c2a9e0b7d4c3e8a5f9d2b1c0e7a64, steps listed: 6
+           aligned to the second on two clocks, GitHub's for the steps and the host's for its samples, with no correction for skew between them; within one sample interval, usage is split by time
+step 1     "Set up job" "success", started 2026-10-09T12:00:00Z, took 4s
+           cpu 1.3s, peak memory 718.9 MiB, disk read 0 B, written 0 B, network received 0 B, sent 0 B, energy 14.1 J active
+step 2     "Run actions/checkout@v5" "success", started 2026-10-09T12:00:04Z, took 15s
+           cpu 6.6s, peak memory 3.3 GiB, disk read 0 B, written 441.9 MiB, network received 324.0 MiB, sent 2.9 MiB, energy 72.9 J active
+step 3     "Build" "success", started 2026-10-09T12:00:19Z, took 1m12s
+           partial: the series covers 1m11s of the step's 1m12s; cpu, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 113.9s, peak memory 3.4 GiB, disk read 356.0 MiB, written 2.8 GiB, network received 71.2 MiB, sent 4.4 MiB, energy 1.3 kJ active
+step 4     "Test" "success", started 2026-10-09T12:01:31Z, took 1m16s
+           cpu 91.1s, peak memory 2.2 GiB, disk read 151.8 MiB, written 455.5 MiB, network received 227.8 MiB, sent 75.9 MiB, energy 1.0 kJ active
+step 5     "Post Run actions/checkout@v5" "success", started 2026-10-09T12:02:47Z, took 1s
+           partial: the series covers 500ms of the step's 1s; cpu, disk, network and energy are over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 0.0s, peak memory 381.3 MiB, disk read 0 B, written 0 B, network received 0 B, sent 0 B, energy 0.5 J active
+step 6     "Complete job" "success", started 2026-10-09T12:02:48Z, took 0s (start and end in the same second), so no usage can be placed in it
+
+guest      the guest never contacted the node (an image older than the agent, or an agent that did not start)
+node       epyc-1
+agent      not recorded
+hello      not seen
+batches    0 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)
+final      no record of accepting it
+restart    none while the job ran
+received   no arrival recorded (the node stamps only the batches it accepts)
+encoded    0 B, codec 1
+== billet jobs show --html, the guest section ==
+<section id="guest">
+<h2>What the job's own VM reported</h2>
+<p class="why">the guest never contacted the node (an image older than the agent, or an agent that did not start)</p>
+<h3>The channel, as the node counted it</h3>
+<dl class="fields">
+<dt>node</dt><dd>epyc-1</dd>
+<dt>agent</dt><dd>not recorded</dd>
+<dt>hello</dt><dd>not seen</dd>
+<dt>batches</dt><dd>0 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)</dd>
+<dt>final</dt><dd>no record of accepting it</dd>
+<dt>restart</dt><dd>none while the job ran</dd>
+<dt>received</dt><dd>no arrival recorded (the node stamps only the batches it accepts)</dd>
+<dt>encoded</dt><dd>0 B, codec 1</dd>
+</dl>
+

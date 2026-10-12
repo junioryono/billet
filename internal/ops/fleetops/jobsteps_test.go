@@ -330,7 +330,8 @@ func TestRenderStepsSaysWhatEachWindowUsed(t *testing.T) {
 		`step 1     "covered" "success", started 2026-10-09T12:00:02Z, took 3s` + "\n" +
 			"           cpu 0.3s, peak memory 100.0 MiB, disk read 3.0 KiB, written 3.0 KiB, " +
 			"network received 3.0 KiB, sent 3.0 KiB, energy 3.0 J active\n",
-		"partial: the series covers 2s of the step's 6s, and over that part: cpu 0.2s",
+		"partial: the series covers 2s of the step's 6s; cpu, disk, network and energy are over that part, " +
+			"and the peak memory is the highest level sampled anywhere in the step: cpu 0.2s",
 		"cpu 0.1s, peak memory not sampled inside the step",
 		"(no sample inside the step: its share of the interval around it, split by time)",
 		`step 4     "pending" "queued", no start or end time from GitHub, so no usage`,
@@ -467,7 +468,8 @@ func TestJobsShowGivesEachStepItsUsage(t *testing.T) {
 		"aligned to the second on two clocks",
 		`step 1     "build" "success", started 2026-10-09T12:00:02Z, took 3s` + "\n           cpu 0.3s,",
 		`step 2     "post" "success", started 2026-10-09T12:00:08Z, took 6s` +
-			"\n           partial: the series covers 2s of the step's 6s, and over that part: cpu 0.2s,",
+			"\n           partial: the series covers 2s of the step's 6s; cpu, disk, network and energy are " +
+			"over that part, and the peak memory is the highest level sampled anywhere in the step: cpu 0.2s,",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report does not say %q:\n%s", want, out)

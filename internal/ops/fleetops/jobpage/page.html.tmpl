@@ -168,6 +168,143 @@
 {{- end}}
 </section>
 
+<section id="guest">
+<h2>What the job's own VM reported</h2>
+{{- $charts := .Charts}}
+{{- with .Guest}}
+{{- with .Banner}}
+<p class="unverified">{{.}}</p>
+{{- end}}
+<p class="why">{{.Why}}</p>
+{{- if .Channel}}
+<h3>The channel, as the node counted it</h3>
+<dl class="fields">
+{{- range .Channel}}
+<dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+{{- end}}
+</dl>
+{{- end}}
+{{- if .HasReport}}
+<h3>The report</h3>
+<dl class="fields">
+{{- range .Account}}
+<dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+{{- end}}
+<dt>skew</dt><dd>{{.Skew}}</dd>
+</dl>
+<h3>Memory</h3>
+<dl class="fields">
+{{- range .Memory}}
+<dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
+{{- end}}
+</dl>
+{{- with .Chart}}
+{{- if .Why}}
+<p class="why">{{.Why}}</p>
+{{- else}}
+{{- with .Chart}}
+<figure class="chart">
+<figcaption>{{.Title}}{{range .Lines}} <span class="key {{.Class}}">{{.Label}}</span>{{end}}</figcaption>
+<div class="plot">
+<span class="top">{{.Top}}</span>
+<svg data-chart="" viewBox="0 0 {{$charts.Units}} 100" preserveAspectRatio="none" role="img" aria-label="{{.Title}}">
+{{- range $charts.Bands}}
+<rect class="{{.Class}}" data-key="{{.Key}}" x="{{.X}}" y="0" width="{{.W}}" height="100"></rect>
+{{- end}}
+{{- with .Limit}}
+<line class="limit" x1="0" x2="{{$charts.Units}}" y1="{{.Y}}" y2="{{.Y}}"></line>
+{{- end}}
+{{- range .Lines}}
+<path class="line {{.Class}}" d="{{.D}}"></path>
+{{- end}}
+</svg>
+<span class="x0">{{$charts.X0}}</span><span class="x1">{{$charts.X1}}</span>
+</div>
+{{- with .Limit}}
+<p class="note">Dashed: {{.Label}}.</p>
+{{- end}}
+<p class="note">{{.Note}}</p>
+</figure>
+{{- end}}
+{{- end}}
+{{- end}}
+<h3>Cross-checks against the host</h3>
+<dl class="fields">
+{{- range .Checks}}
+<dt>{{.Label}}</dt><dd{{if .Unmeasured}} class="unmeasured"{{end}}>{{.Value}}</dd>
+{{- end}}
+{{- range .Agent}}
+<dt>{{.Label}}</dt><dd>{{.Value}}</dd>
+{{- end}}
+</dl>
+<h3>Step marks</h3>
+{{- with .Steps}}
+{{- if .MarksWhy}}
+<p class="why">{{.MarksWhy}}</p>
+{{- else}}
+<p class="note">{{.MarksNote}}</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Mark</th><th>The guest's name</th><th>At (guest)</th><th>GitHub step</th><th>Started (GitHub)</th><th>Mark minus GitHub</th></tr></thead>
+<tbody>
+{{- range .Marks}}
+<tr><th scope="row">{{.Mark}}</th><td>{{.Name}}</td><td>{{.At}}</td><td>{{.Step}}</td><td>{{.GitHub}}</td><td>{{.Offset}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{- end}}
+<h3>Processes by step</h3>
+{{- if .ProcsWhy}}
+<p class="why">{{.ProcsWhy}}</p>
+{{- else}}
+<p class="note">{{.ProcsNote}}</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Process</th><th>Most at once</th><th>CPU</th><th>Peak RSS</th><th>Read</th><th>Written</th></tr></thead>
+{{- range .Procs}}
+<tbody>
+<tr class="group"><th scope="rowgroup" colspan="6">{{.Label}}{{with .Name}} {{.}}{{end}}: {{.Samples}}</th></tr>
+{{- range .Rows}}
+<tr><th scope="row">{{.Name}}</th><td>{{.Procs}}</td><td>{{.CPU}}</td><td>{{.RSS}}</td><td>{{.Read}}</td><td>{{.Written}}</td></tr>
+{{- end}}
+{{- with .Rest}}
+<tr class="qualifier"><td colspan="6">{{.}}</td></tr>
+{{- end}}
+{{- with .Exited}}
+<tr class="qualifier"><td colspan="6">{{.}}</td></tr>
+{{- end}}
+</tbody>
+{{- end}}
+</table>
+</div>
+{{- end}}
+{{- end}}
+<h3>Test results</h3>
+{{- with .Tests}}
+{{- with .Why}}
+<p class="why">{{.}}</p>
+{{- end}}
+{{- if .Suites}}
+<div class="scroll">
+<table>
+<thead><tr><th>Suite</th><th>Tests</th><th>Failures</th><th>Errors</th><th>Skipped</th><th>Failed</th></tr></thead>
+<tbody>
+{{- range .Suites}}
+<tr><th scope="row">{{.Name}}</th><td>{{.Tests}}</td><td>{{.Failures}}</td><td>{{.Errors}}</td><td>{{.Skipped}}</td><td>{{range $i, $n := .Failed}}{{if $i}}, {{end}}{{$n}}{{end}}</td></tr>
+{{- end}}
+</tbody>
+</table>
+</div>
+{{- end}}
+{{- with .Dropped}}
+<p class="note">{{.}}</p>
+{{- end}}
+{{- end}}
+{{- end}}
+{{- end}}
+</section>
+
 <footer>Rendered by <code>billet jobs show --html</code> from the ledger and GitHub's record of the run. Read-only: the page fetches nothing.</footer>
 {{- end}}
 <script>{{.Script}}</script>

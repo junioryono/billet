@@ -60,5 +60,6 @@
     "io_full_us": 0,
     "energy_active_uj": 0,
     "energy_idle_uj": 0
-  }
+  },
+  "guest": null
 }

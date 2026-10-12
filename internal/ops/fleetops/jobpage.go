@@ -66,6 +66,7 @@ type jobPage struct {
 	Steps               pageSteps
 	Charts              pageCharts
 	Destinations        pageDestinations
+	Guest               guestView
 }
 
 // pageField is one labelled value. Unmeasured marks a value that is "not
@@ -140,14 +141,29 @@ type pageDestination struct {
 // steps readJobSteps learned. The series is the one the steps were placed on;
 // when no step was asked about, it is read here for the charts.
 func buildJobPage(ctx context.Context, a *alloc.Allocator, rec alloc.JobRecord, measured *alloc.RecordedUsage,
-	steps jobSteps,
+	steps jobSteps, guest *jobGuest,
 ) jobPage {
 	tl, unaligned := steps.timeline, steps.unaligned
 	if steps.none != "" {
 		tl, unaligned = jobTimeline(ctx, a, rec.LeaseID, measured)
 	}
+	page := jobPageOf(rec, measured, steps, tl, unaligned)
+	page.Guest = guestSection(guest, rec, measured, steps, page.Charts)
 
-	return jobPageOf(rec, measured, steps, tl, unaligned)
+	return page
+}
+
+// guestSection is the page's guest section: the text report's, and the guest's
+// memory drawn on the host's charts' axis.
+func guestSection(guest *jobGuest, rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobSteps,
+	charts pageCharts,
+) guestView {
+	v := guestViewOf(guest, measured, steps)
+	if v.HasReport {
+		v.Chart = guestMemoryChart(charts, rec, measured, guest.report)
+	}
+
+	return v
 }
 
 // jobPageOf is buildJobPage once the series is read.
@@ -180,6 +196,7 @@ func jobPageOf(rec alloc.JobRecord, measured *alloc.RecordedUsage, steps jobStep
 	page.Charts = buildCharts(tl, unaligned, rec, measured, listed)
 	page.Steps = stepsSection(steps, tl, unaligned, measured, page.Charts)
 	page.Destinations = destinationsSection(measured)
+	page.Guest = guestViewOf(nil, measured, steps)
 
 	return page
 }

@@ -56,5 +56,6 @@
     "energy_active_uj": 9500000000,
     "energy_idle_uj": 600000000,
     "energy_source": "rapl"
-  }
+  },
+  "guest": null
 }
