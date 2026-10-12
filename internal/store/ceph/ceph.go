@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -78,6 +79,16 @@ type Client struct {
 	// halfRemovedBudget reached, so the next pass begins after it. Under
 	// halfRemovedMu.
 	halfRemovedResume string
+	// openable remembers when finishHalfRemoved last found each cache image
+	// openable, so the next `rbd info` waits openableRecheck. Under halfRemovedMu.
+	openable map[string]time.Time
+	// trashHeld remembers each trash entry a deletion found still read by a
+	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
+	trashHeldMu sync.Mutex
+	trashHeld   map[string]trashHold
+	// cacheRemovals counts the cache images this client removed with `rbd rm`, the
+	// event that can free a trash entry a child held.
+	cacheRemovals atomic.Uint64
 	// purgeWorkers is how many trash deletions PurgeTrash runs at once.
 	purgeWorkers int
 	// ioPressure reads how starved the host is for IO, which each purge deletion
