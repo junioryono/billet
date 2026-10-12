@@ -226,10 +226,30 @@ func TestAHelloNobodyAnswersIsAskedAgainWithBackoff(t *testing.T) {
 		}
 
 		// The first batch goes as soon as the hello is answered, the interval
-		// since the agent started having passed, and carries what it held.
+		// since the agent started having passed, and carries what it held. The
+		// answer and the 31 s sample fall due at one instant and the loop takes
+		// them in either order, so that sample is in batch 1 or the final, and
+		// together the two carry each of the 41 exactly once.
 		if len(posts) != 2 || posts[0].at.Sub(began) != 31*time.Second || posts[0].batch.Seq != 1 ||
-			len(posts[0].batch.Samples) != 32 || !posts[1].final || posts[1].batch.Seq != 2 {
-			t.Fatalf("%d posts, want batch 1 at 31s with its 32 samples, then the final", len(posts))
+			!posts[1].final || posts[1].batch.Seq != 2 {
+			t.Fatalf("%d posts, want batch 1 at 31s, then the final", len(posts))
+		}
+
+		var stamps []time.Duration
+		for _, p := range posts {
+			for _, s := range p.batch.Samples {
+				stamps = append(stamps, time.UnixMilli(s.AtMillis).Sub(began))
+			}
+		}
+
+		var every []time.Duration
+		for s := range 41 {
+			every = append(every, time.Duration(s)*time.Second)
+		}
+
+		if first := len(posts[0].batch.Samples); (first != 31 && first != 32) || fmt.Sprint(stamps) != fmt.Sprint(every) {
+			t.Fatalf("batch 1 carries %d samples, and the two carry them at %v, want 31 or 32 in batch 1 and one each second from 0 to 40 s",
+				first, stamps)
 		}
 	})
 }
