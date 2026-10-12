@@ -1238,8 +1238,10 @@ const halfRemovedBudget = 10 * time.Minute
 // openableRecheck is how long finishHalfRemoved waits before asking `rbd info`
 // again about a cache image it found openable. Each ask is an rbd process, and on
 // the reference deployment on 2026-10-12 a pass asked about each of 1,395 live
-// generations every ninety seconds. Waiting halfRemovedRecheck delays the first
-// sighting of a removal cut short by at most that, before an hour's wait anyway.
+// generations every ninety seconds. An image whose removal is cut short after an
+// openable sighting becomes eligible for its first unopenable sighting this much
+// later, then waits for the pass that reaches it, then for the second sighting
+// halfRemovedRecheck after the first.
 const openableRecheck = halfRemovedRecheck
 
 // trashHeldRecheck is how long PurgeTrash leaves a trash entry a copy-on-write
@@ -1289,6 +1291,11 @@ func (c *Client) trashHeldDue(hold trashHold, now time.Time) bool {
 // as done, and one that fails for any other reason does not stop the rest: each
 // failure is reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
+	// ONE PASS AT A TIME, so a pass never reads the held entries another has
+	// taken out to rebuild.
+	c.purgeMu.Lock()
+	defer c.purgeMu.Unlock()
+
 	// ONE YIELDING BUDGET FOR THE WHOLE PASS, both of its deletion phases.
 	budget := newYieldBudget(purgePassYieldMax)
 
@@ -1450,6 +1457,25 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 
 	var failures []error
 
+	// A PASS CUT SHORT, by its budget or its context, leaves the rest for the next
+	// pass with what this one knew of them, so a second sighting is not lost to
+	// the cut and an image found openable is not asked about again early.
+	keepFrom := func(i int) {
+		for _, rest := range names[i:] {
+			if first, ok := seen[rest]; ok {
+				c.halfRemoved[rest] = first
+			}
+
+			if at, ok := opened[rest]; ok {
+				c.openable[rest] = at
+			}
+		}
+
+		if i > 0 {
+			c.halfRemovedResume = names[i-1]
+		}
+	}
+
 	for i, name := range names {
 		_, named, ok := cacheImageName(name)
 		if !ok || c.now().Sub(named) < halfRemovedAfter {
@@ -1457,25 +1483,13 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 		}
 
 		if err := ctx.Err(); err != nil {
+			keepFrom(i)
+
 			return finished, append(failures, err)
 		}
 
-		// OUT OF BUDGET: the rest wait for the next pass, keeping the sightings
-		// they had, so a second sighting is not lost to the cut.
 		if c.now().Sub(started) >= halfRemovedBudget {
-			for _, rest := range names[i:] {
-				if first, ok := seen[rest]; ok {
-					c.halfRemoved[rest] = first
-				}
-
-				if at, ok := opened[rest]; ok {
-					c.openable[rest] = at
-				}
-			}
-
-			if i > 0 {
-				c.halfRemovedResume = names[i-1]
-			}
+			keepFrom(i)
 
 			return finished, failures
 		}
@@ -1492,6 +1506,11 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 			c.openable[name] = c.now()
 
 			continue
+		} else if ctx.Err() != nil {
+			// CUT SHORT, NOT COULD-NOT-TELL: this image keeps what it had too.
+			keepFrom(i)
+
+			return finished, append(failures, ctx.Err())
 		} else if !isNoSuchFile(err) {
 			failures = append(failures, fmt.Errorf("ceph: could not tell whether %s is half-removed: %w",
 				handle, err))

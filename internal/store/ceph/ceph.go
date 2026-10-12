@@ -82,6 +82,8 @@ type Client struct {
 	// openable remembers when finishHalfRemoved last found each cache image
 	// openable, so the next `rbd info` waits openableRecheck. Under halfRemovedMu.
 	openable map[string]time.Time
+	// purgeMu serialises PurgeTrash passes.
+	purgeMu sync.Mutex
 	// trashHeld remembers each trash entry a deletion found still read by a
 	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
 	trashHeldMu sync.Mutex

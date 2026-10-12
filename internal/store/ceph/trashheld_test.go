@@ -1,6 +1,7 @@
 package ceph
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"testing"
@@ -48,7 +49,8 @@ func TestAHeldTrashEntryIsAskedAboutAgainOnlyWhenItCanHaveChanged(t *testing.T) 
 		t.Fatalf("the first pass asked %d and %d times, want once each", asks("id-held"), asks("id-timed"))
 	}
 
-	clock = clock.Add(trashHeldRecheck - time.Second)
+	// FORWARD ONLY, by a step well inside the recheck, so a recheck of zero fails.
+	clock = clock.Add(10 * time.Minute)
 
 	if n, err := c.PurgeTrash(t.Context()); n != 0 || err != nil {
 		t.Fatalf("second pass: PurgeTrash = %d, %v", n, err)
@@ -77,7 +79,7 @@ func TestAHeldTrashEntryIsAskedAboutAgainOnlyWhenItCanHaveChanged(t *testing.T) 
 
 	// AND WITH NOTHING REMOVED, THE RECHECK MAKES IT DUE, for a child another node
 	// removed.
-	clock = clock.Add(trashHeldRecheck - time.Second)
+	clock = clock.Add(10 * time.Minute)
 
 	if _, err := c.PurgeTrash(t.Context()); err != nil {
 		t.Fatalf("PurgeTrash: %v", err)
@@ -87,7 +89,7 @@ func TestAHeldTrashEntryIsAskedAboutAgainOnlyWhenItCanHaveChanged(t *testing.T) 
 		t.Fatal("a held entry was asked about again inside the recheck")
 	}
 
-	clock = clock.Add(time.Second)
+	clock = clock.Add(trashHeldRecheck)
 
 	if _, err := c.PurgeTrash(t.Context()); err != nil {
 		t.Fatalf("PurgeTrash: %v", err)
@@ -157,7 +159,8 @@ func TestAnOpenableImageIsAskedAboutAgainOnlyAfterTheRecheck(t *testing.T) {
 		t.Fatalf("first pass: %v, %d infos, want 1", err, infos())
 	}
 
-	clock = clock.Add(openableRecheck - time.Second)
+	// FORWARD ONLY, by a step well inside the recheck, so a recheck of zero fails.
+	clock = clock.Add(openableRecheck / 2)
 
 	if _, err := c.PurgeTrash(t.Context()); err != nil || infos() != 1 {
 		t.Fatalf("inside the recheck: %v, %d infos, want still 1", err, infos())
@@ -167,7 +170,7 @@ func TestAnOpenableImageIsAskedAboutAgainOnlyAfterTheRecheck(t *testing.T) {
 	delete(f.images, image)
 	f.halfRemoved[image] = true
 
-	clock = clock.Add(time.Second)
+	clock = clock.Add(openableRecheck / 2)
 
 	if n, err := c.PurgeTrash(t.Context()); n != 0 || err != nil || infos() != 2 {
 		t.Fatalf("at the recheck: PurgeTrash = %d, %v, %d infos; want a first sighting and nothing removed",
@@ -184,5 +187,173 @@ func TestAnOpenableImageIsAskedAboutAgainOnlyAfterTheRecheck(t *testing.T) {
 	// removal and makes held trash entries due.
 	if got := c.cacheRemovals.Load(); got != 1 {
 		t.Errorf("a finished half-removed image counted %d removals, want 1", got)
+	}
+}
+
+// THE REMOVAL COUNT IS READ BEFORE THE ASK, so a generation removed while a
+// `trash rm` is in flight makes the entry due on the next pass rather than an hour
+// later.
+func TestARemovalDuringTheAskMakesTheHeldEntryDue(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+
+	var c *Client
+
+	run := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "trash") && slices.Contains(args, "rm") {
+			c.cacheRemovals.Add(1)
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	clock := time.Now()
+	c.clock = func() time.Time { return clock }
+
+	f.trash["id-held"] = "billet-held"
+	f.parents["billet-cache/child"] = "billet-cache/billet-held@g1"
+
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := c.PurgeTrash(t.Context()); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+
+		if got := f.countCalls("trash", "rm", "billet-cache/id-held"); got != pass {
+			t.Fatalf("after pass %d the entry was asked about %d times, want %d: a removal during the "+
+				"ask did not make it due", pass, got, pass)
+		}
+	}
+}
+
+// halfRemovedFixture is a client whose clock the test steers, three old cache
+// images named in order, and the fake behind them.
+func halfRemovedFixture(t *testing.T, run func(f *cacheFake) runner) (*Client, *cacheFake, *time.Time, []string) {
+	t.Helper()
+
+	f := newCacheFake()
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(run(f)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	clock := time.Now()
+	c.clock = func() time.Time { return clock }
+
+	old := clock.Add(-2 * time.Hour).Unix()
+
+	var images []string
+	for i := range 3 {
+		images = append(images, fmt.Sprintf("billet-cache/cache-v-%d-%024d", old, i))
+	}
+
+	return c, f, &clock, images
+}
+
+// A PASS CUT BY ITS BUDGET KEEPS WHAT IT KNEW OF THE IMAGES IT DID NOT REACH:
+// one found openable is not asked about again before the recheck.
+func TestABudgetCutKeepsTheOpenableSightings(t *testing.T) {
+	t.Parallel()
+
+	var clock *time.Time
+
+	spend := false
+
+	c, f, clockp, images := halfRemovedFixture(t, func(f *cacheFake) runner {
+		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if spend && slices.Contains(args, "info") {
+				*clock = clock.Add(halfRemovedBudget)
+			}
+
+			return f.run(ctx, bin, args)
+		}
+	})
+	clock = clockp
+
+	for _, image := range images[1:] {
+		f.images[image] = true
+	}
+
+	f.halfRemoved[images[0]] = true
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// THE SECOND PASS SPENDS ITS BUDGET ON THE FIRST IMAGE and stops before the
+	// two it found openable.
+	spend = true
+	*clock = clock.Add(time.Minute)
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	spend = false
+	*clock = clock.Add(time.Minute)
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+
+	for _, image := range images[1:] {
+		if got := f.countCalls("info", image); got != 1 {
+			t.Errorf("%s was asked about %d times, want once: the budget cut forgot it was openable", image, got)
+		}
+	}
+}
+
+// A PASS CANCELLED AFTER ITS LISTING KEEPS WHAT IT KNEW TOO.
+func TestACancelledPassKeepsTheOpenableSightings(t *testing.T) {
+	t.Parallel()
+
+	var cancel context.CancelFunc
+
+	c, f, clock, images := halfRemovedFixture(t, func(f *cacheFake) runner {
+		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			out, err := f.run(ctx, bin, args)
+			if cancel != nil && slices.Contains(args, "ls") {
+				cancel()
+			}
+
+			return out, err
+		}
+	})
+
+	for _, image := range images {
+		f.images[image] = true
+	}
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	cancel = stop
+	*clock = clock.Add(time.Minute)
+
+	if _, err := c.PurgeTrash(ctx); err == nil {
+		t.Fatal("a cancelled pass reported nothing")
+	}
+
+	cancel = nil
+	*clock = clock.Add(time.Minute)
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+
+	for _, image := range images {
+		if got := f.countCalls("info", image); got != 1 {
+			t.Errorf("%s was asked about %d times, want once: the cancelled pass forgot it was openable", image, got)
+		}
 	}
 }
