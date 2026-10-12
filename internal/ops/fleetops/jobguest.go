@@ -560,27 +560,40 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep, caveat string) g
 // whole as refused, and the agent sends the same batch again, so a refused
 // attempt may since have been accepted, and the counts cannot tell.
 func placementCaveat(row alloc.RecordedGuestReport, r *guestreport.Report) string {
-	const mixed = "so a group may also hold processes of steps that came after its own."
 	notIn := row.Accepted - r.Batches - r.Duplicates
+	// A NODE COUNT BELOW THE REPORT'S proves no number of accepted batches
+	// missing, zero included.
+	const undercount = "the node's count of the batches it accepted is below the report's"
 
-	var out []string
-	if r.Missing > 0 || notIn > 0 {
-		out = append(out, fmt.Sprintf("Not every batch is in the report (%d of the numbers between its first "+
-			"and last are carried by no batch the node merged, and %d the node accepted are not in it), and a "+
-			"step mark in one of them is lost with it, "+mixed, r.Missing, max(notIn, 0)))
-	}
-	if notIn < 0 {
-		out = append(out, "The node's count of the batches it accepted is below the report's, so which "+
-			"batches the report lacks cannot be told, "+mixed)
+	var reasons []string
+	switch {
+	case r.Missing > 0 || notIn > 0:
+		accepted := fmt.Sprintf("and %d the node accepted are not in it", notIn)
+		if notIn < 0 {
+			accepted = "and how many the node accepted are not in it cannot be told, since " + undercount
+		}
+		reasons = append(reasons, fmt.Sprintf("Not every batch is in the report (%d of the numbers between "+
+			"its first and last are carried by no batch the node merged, %s), and a step mark in one of them "+
+			"is lost with it.", r.Missing, accepted))
+	case notIn < 0:
+		reasons = append(reasons, "The node's count of the batches it accepted is below the report's, so "+
+			"which batches the report lacks cannot be told.")
 	}
 	if row.Refused > 0 {
-		out = append(out, fmt.Sprintf("The node refused %d attempts to send a batch; a refused attempt may "+
-			"have carried a step mark the report does not hold, and the counts cannot tell whether a retry "+
-			"later delivered it, "+mixed, row.Refused))
+		reasons = append(reasons, fmt.Sprintf("The node refused %d attempts to send a batch; a refused attempt "+
+			"may have carried a step mark the report does not hold, and the counts cannot tell whether a retry "+
+			"later delivered it.", row.Refused))
+	}
+	if len(reasons) == 0 {
+		return ""
 	}
 
-	return strings.Join(out, " ")
+	return strings.Join(reasons, " ") + " " + placementConclusion
 }
+
+// placementConclusion is what every reason placementCaveat gives implies, said
+// once after them.
+const placementConclusion = "So a group may also hold processes of steps that came after its own."
 
 // matchMarks is, for each mark, the index of the GitHub step it names, or -1:
 // matched by name, in order, each step at most once. A step's name is compared

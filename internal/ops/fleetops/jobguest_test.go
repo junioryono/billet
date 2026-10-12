@@ -1029,8 +1029,8 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	v := guestViewOf(g, nil, jobSteps{job: github.WorkflowJob{Steps: listed}}).Steps
 	if !strings.Contains(v.ProcsNote, "Not every batch is in the report (0 of the numbers between its first "+
 		"and last are carried by no batch the node merged, and 1 the node accepted are not in it), and a step "+
-		"mark in one of them is lost with it, so a group may also hold processes of steps that came after its "+
-		"own") {
+		"mark in one of them is lost with it. So a group may also hold processes of steps that came after its "+
+		"own.") {
 		t.Errorf("the section does not qualify where processes are placed: %q", v.ProcsNote)
 	}
 
@@ -1039,8 +1039,8 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	}
 	const proven = "is lost with it"
 	refusal := "a refused attempt may have carried a step mark the report does not hold, and the counts " +
-		"cannot tell whether a retry later delivered it, so a group may also hold processes of steps that came " +
-		"after its own"
+		"cannot tell whether a retry later delivered it. So a group may also hold processes of steps that came " +
+		"after its own."
 
 	// AN ACCEPTED BATCH THE NODE DROPPED BEFORE THE MERGE leaves the merge's
 	// counts at zero and still qualifies the placement: the report holds 17
@@ -1085,6 +1085,32 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 		"report's, so which batches the report lacks cannot be told") || strings.Contains(got, "-1") ||
 		strings.Contains(got, proven) {
 		t.Errorf("a node count below the report's: %q", got)
+	}
+
+	// A GAP AND A NODE COUNT BELOW THE REPORT'S: the gap is still a proven loss,
+	// and how many accepted batches are not in the report cannot be told, never
+	// zero. Batch 9 never merged; the node says it accepted 12 of the 13 kept.
+	gapUnder := *partialGuest(t)
+	gapUnder.Accepted = 12
+	if got := note(gapUnder); !strings.Contains(got, "(1 of the numbers between its first and last are "+
+		"carried by no batch the node merged, and how many the node accepted are not in it cannot be told, "+
+		"since the node's count of the batches it accepted is below the report's), and a step mark in one of "+
+		"them is lost with it.") || strings.Contains(got, "0 the node accepted") || strings.Contains(got, "-1") {
+		t.Errorf("a gap with a node count below the report's: %q", got)
+	}
+
+	// EVERY REASON AT ONCE, and what they imply said once after them.
+	gapUnder.Refused = 2
+	got := note(gapUnder)
+	for _, reason := range []string{"Not every batch is in the report (1 of the numbers", "The node refused 2 " +
+		"attempts to send a batch;"} {
+		if !strings.Contains(got, reason) {
+			t.Errorf("every reason at once does not give %q: %q", reason, got)
+		}
+	}
+	if n := strings.Count(got, "a group may also hold processes of steps that came after its own"); n != 1 ||
+		!strings.HasSuffix(got, " "+placementConclusion) {
+		t.Errorf("every reason at once says what they imply %d times, want once at the end: %q", n, got)
 	}
 	var build *guestStepProcs
 	for i := range v.Procs {
