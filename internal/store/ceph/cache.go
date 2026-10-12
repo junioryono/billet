@@ -1246,8 +1246,9 @@ const openableRecheck = halfRemovedRecheck
 
 // trashHeldRecheck is how long PurgeTrash leaves a trash entry a copy-on-write
 // child held before asking again when this client has removed no cache image
-// since. A child is a generation, and generations leave by `rbd rm`; one another
-// node removed is noticed within this. On the reference deployment on 2026-10-12
+// since. A child is a generation, and generations leave by `rbd rm`; once one
+// another node removed has been gone this long, its writer is asked about by the
+// next pass that reaches it. On the reference deployment on 2026-10-12
 // the trash held 1,364 retired writers whose generations were live, and asking
 // about every one every ninety seconds forked about 1,400 processes a second and
 // held the idle package at 94.8 W against 76.9 W between passes.
@@ -1292,9 +1293,13 @@ func (c *Client) trashHeldDue(hold trashHold, now time.Time) bool {
 // failure is reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
 	// ONE PASS AT A TIME, so a pass never reads the held entries another has
-	// taken out to rebuild.
-	c.purgeMu.Lock()
-	defer c.purgeMu.Unlock()
+	// taken out to rebuild, and a caller waiting behind a long pass can give up.
+	select {
+	case c.purgeSlot <- struct{}{}:
+		defer func() { <-c.purgeSlot }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
 
 	// ONE YIELDING BUDGET FOR THE WHOLE PASS, both of its deletion phases.
 	budget := newYieldBudget(purgePassYieldMax)
@@ -1450,6 +1455,7 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 	if i := slices.IndexFunc(names, func(name string) bool { return name > c.halfRemovedResume }); i > 0 {
 		names = slices.Concat(names[i:], names[:i])
 	}
+	resume := c.halfRemovedResume
 	c.halfRemovedResume = ""
 
 	started := c.now()
@@ -1473,6 +1479,8 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 
 		if i > 0 {
 			c.halfRemovedResume = names[i-1]
+		} else {
+			c.halfRemovedResume = resume
 		}
 	}
 

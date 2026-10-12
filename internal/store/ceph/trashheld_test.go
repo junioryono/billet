@@ -2,6 +2,7 @@ package ceph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -78,18 +79,23 @@ func TestAHeldTrashEntryIsAskedAboutAgainOnlyWhenItCanHaveChanged(t *testing.T) 
 	}
 
 	// AND WITH NOTHING REMOVED, THE RECHECK MAKES IT DUE, for a child another node
-	// removed.
-	clock = clock.Add(10 * time.Minute)
+	// removed. The hold dates from the refusal, not from the passes that skipped
+	// it, or passes a few minutes apart would postpone it for ever.
+	refused := clock
 
-	if _, err := c.PurgeTrash(t.Context()); err != nil {
-		t.Fatalf("PurgeTrash: %v", err)
+	for range 3 {
+		clock = clock.Add(trashHeldRecheck / 4)
+
+		if _, err := c.PurgeTrash(t.Context()); err != nil {
+			t.Fatalf("PurgeTrash: %v", err)
+		}
+
+		if asks("id-timed") != 2 {
+			t.Fatal("a held entry was asked about again inside the recheck")
+		}
 	}
 
-	if asks("id-timed") != 2 {
-		t.Fatal("a held entry was asked about again inside the recheck")
-	}
-
-	clock = clock.Add(trashHeldRecheck)
+	clock = refused.Add(trashHeldRecheck)
 
 	if _, err := c.PurgeTrash(t.Context()); err != nil {
 		t.Fatalf("PurgeTrash: %v", err)
@@ -139,8 +145,9 @@ func TestATrashFailureThatIsNotAHoldIsAskedAboutEveryPass(t *testing.T) {
 }
 
 // AN IMAGE FOUND OPENABLE IS ASKED ABOUT AGAIN ONLY AFTER openableRecheck, and
-// one whose removal was cut short meanwhile is still finished: its first
-// unopenable sighting is at most that late, and the proof still needs two.
+// one whose removal was cut short meanwhile is still finished: it is eligible
+// for its first unopenable sighting after the recheck, and the proof still needs
+// two.
 func TestAnOpenableImageIsAskedAboutAgainOnlyAfterTheRecheck(t *testing.T) {
 	t.Parallel()
 
@@ -355,5 +362,160 @@ func TestACancelledPassKeepsTheOpenableSightings(t *testing.T) {
 		if got := f.countCalls("info", image); got != 1 {
 			t.Errorf("%s was asked about %d times, want once: the cancelled pass forgot it was openable", image, got)
 		}
+	}
+}
+
+// A PASS CANCELLED DURING AN IMAGE'S `rbd info` KEEPS THAT IMAGE'S SIGHTING, so
+// the next pass can finish the removal without waiting a second recheck.
+func TestAPassCancelledDuringInfoKeepsTheSighting(t *testing.T) {
+	t.Parallel()
+
+	cancelInfo := false
+
+	var cancel context.CancelFunc
+
+	c, f, clock, images := halfRemovedFixture(t, func(f *cacheFake) runner {
+		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if cancelInfo && slices.Contains(args, "info") {
+				cancel()
+
+				return nil, ctx.Err()
+			}
+
+			return f.run(ctx, bin, args)
+		}
+	})
+
+	f.halfRemoved[images[0]] = true
+
+	if n, err := c.PurgeTrash(t.Context()); n != 0 || err != nil {
+		t.Fatalf("first sighting: %d, %v", n, err)
+	}
+
+	*clock = clock.Add(2 * halfRemovedRecheck)
+
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	cancel, cancelInfo = stop, true
+
+	if _, err := c.PurgeTrash(ctx); err == nil {
+		t.Fatal("a pass cancelled during info reported nothing")
+	}
+
+	cancelInfo = false
+
+	if n, err := c.PurgeTrash(t.Context()); n != 1 || err != nil || f.halfRemoved[images[0]] {
+		t.Fatalf("after the cancelled info: PurgeTrash = %d, %v; want the removal finished on the kept sighting",
+			n, err)
+	}
+}
+
+// A PASS CANCELLED BEFORE IT REACHES ANY IMAGE KEEPS WHERE THE LAST ONE STOPPED,
+// so a cancellation between budget-cut passes does not send the next back to the
+// front, where images that keep failing would spend its budget again.
+func TestACancelledPassKeepsTheResumePoint(t *testing.T) {
+	t.Parallel()
+
+	var cancel context.CancelFunc
+
+	c, f, _, images := halfRemovedFixture(t, func(f *cacheFake) runner {
+		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			out, err := f.run(ctx, bin, args)
+			if cancel != nil && slices.Contains(args, "ls") {
+				cancel()
+			}
+
+			return out, err
+		}
+	})
+
+	for _, image := range images {
+		f.images[image] = true
+	}
+
+	c.halfRemovedMu.Lock()
+	c.halfRemovedResume = images[1]
+	c.halfRemovedMu.Unlock()
+
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	cancel = stop
+
+	if _, err := c.PurgeTrash(ctx); err == nil {
+		t.Fatal("a cancelled pass reported nothing")
+	}
+
+	c.halfRemovedMu.Lock()
+	defer c.halfRemovedMu.Unlock()
+
+	if c.halfRemovedResume != images[1] {
+		t.Errorf("the resume point is %q after a pass cancelled before any image, want %q",
+			c.halfRemovedResume, images[1])
+	}
+}
+
+// A CALLER WAITING BEHIND A PASS CAN GIVE UP: passes run one at a time, and a
+// cancelled wait returns at once rather than when the running pass ends.
+func TestAWaitForTheRunningPassCanBeCancelled(t *testing.T) {
+	t.Parallel()
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+
+	c, _, _, _ := halfRemovedFixture(t, func(f *cacheFake) runner {
+		var once bool
+
+		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if !once && slices.Contains(args, "trash") && slices.Contains(args, "list") {
+				once = true
+				close(inside)
+				<-release
+			}
+
+			return f.run(ctx, bin, args)
+		}
+	})
+
+	first := make(chan error, 1)
+
+	go func() {
+		_, err := c.PurgeTrash(t.Context())
+		first <- err
+	}()
+
+	<-inside
+
+	ctx, stop := context.WithCancel(t.Context())
+	stop()
+
+	second := make(chan error, 1)
+
+	go func() {
+		_, err := c.PurgeTrash(ctx)
+		second <- err
+	}()
+
+	select {
+	case err := <-second:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("a cancelled wait behind a running pass answered %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("a cancelled wait behind a running pass did not return until the pass ended")
+	}
+
+	select {
+	case err := <-first:
+		t.Fatalf("the running pass ended before it was released (%v): the second call did not wait behind it", err)
+	default:
+	}
+
+	close(release)
+
+	if err := <-first; err != nil {
+		t.Fatalf("the running pass: %v", err)
 	}
 }

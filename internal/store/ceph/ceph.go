@@ -82,8 +82,9 @@ type Client struct {
 	// openable remembers when finishHalfRemoved last found each cache image
 	// openable, so the next `rbd info` waits openableRecheck. Under halfRemovedMu.
 	openable map[string]time.Time
-	// purgeMu serialises PurgeTrash passes.
-	purgeMu sync.Mutex
+	// purgeSlot serialises PurgeTrash passes: a pass holds its one token, and a
+	// caller waiting for it can still be cancelled.
+	purgeSlot chan struct{}
 	// trashHeld remembers each trash entry a deletion found still read by a
 	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
 	trashHeldMu sync.Mutex
@@ -237,7 +238,8 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 	}
 
 	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
-		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor}
+		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
+		purgeSlot: make(chan struct{}, 1)}
 	for _, opt := range opts {
 		opt(c)
 	}
