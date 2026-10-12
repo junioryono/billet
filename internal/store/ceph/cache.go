@@ -1514,12 +1514,16 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 			c.openable[name] = c.now()
 
 			continue
-		} else if ctx.Err() != nil {
-			// CUT SHORT, NOT COULD-NOT-TELL: this image keeps what it had too.
-			keepFrom(i)
-
-			return finished, append(failures, ctx.Err())
 		} else if !isNoSuchFile(err) {
+			// CUT SHORT, NOT COULD-NOT-TELL: this image keeps what it had too. An
+			// ENOENT that raced the cancellation is still rbd's answer, and is
+			// recorded below.
+			if ctx.Err() != nil {
+				keepFrom(i)
+
+				return finished, append(failures, ctx.Err())
+			}
+
 			failures = append(failures, fmt.Errorf("ceph: could not tell whether %s is half-removed: %w",
 				handle, err))
 

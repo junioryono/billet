@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -417,10 +419,17 @@ func TestAPassCancelledDuringInfoKeepsTheSighting(t *testing.T) {
 func TestACancelledPassKeepsTheResumePoint(t *testing.T) {
 	t.Parallel()
 
-	var cancel context.CancelFunc
+	var (
+		cancel context.CancelFunc
+		asked  []string
+	)
 
 	c, f, _, images := halfRemovedFixture(t, func(f *cacheFake) runner {
 		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			if slices.Contains(args, "info") {
+				asked = append(asked, args[len(args)-1])
+			}
+
 			out, err := f.run(ctx, bin, args)
 			if cancel != nil && slices.Contains(args, "ls") {
 				cancel()
@@ -434,8 +443,9 @@ func TestACancelledPassKeepsTheResumePoint(t *testing.T) {
 		f.images[image] = true
 	}
 
+	// THE BOOKMARK IS A NAME, as a budget-cut pass leaves it: the second image.
 	c.halfRemovedMu.Lock()
-	c.halfRemovedResume = images[1]
+	c.halfRemovedResume = strings.TrimPrefix(images[1], "billet-cache/")
 	c.halfRemovedMu.Unlock()
 
 	ctx, stop := context.WithCancel(t.Context())
@@ -447,75 +457,141 @@ func TestACancelledPassKeepsTheResumePoint(t *testing.T) {
 		t.Fatal("a cancelled pass reported nothing")
 	}
 
-	c.halfRemovedMu.Lock()
-	defer c.halfRemovedMu.Unlock()
+	if len(asked) != 0 {
+		t.Fatalf("the cancelled pass asked about %v, want nothing", asked)
+	}
 
-	if c.halfRemovedResume != images[1] {
-		t.Errorf("the resume point is %q after a pass cancelled before any image, want %q",
-			c.halfRemovedResume, images[1])
+	cancel = nil
+
+	if _, err := c.PurgeTrash(t.Context()); err != nil {
+		t.Fatalf("PurgeTrash: %v", err)
+	}
+
+	if len(asked) == 0 || asked[0] != images[2] {
+		t.Errorf("the pass after the cancelled one asked first about %v, want the image after the bookmark, %s",
+			asked, images[2])
 	}
 }
 
-// A CALLER WAITING BEHIND A PASS CAN GIVE UP: passes run one at a time, and a
-// cancelled wait returns at once rather than when the running pass ends.
-func TestAWaitForTheRunningPassCanBeCancelled(t *testing.T) {
+// AN ENOENT THAT RACES A CANCELLATION IS STILL RBD'S ANSWER: the sighting is
+// recorded, so the removal is finished one recheck later rather than two.
+func TestAnENOENTThatRacesACancellationIsStillASighting(t *testing.T) {
 	t.Parallel()
 
-	inside := make(chan struct{})
-	release := make(chan struct{})
+	var cancel context.CancelFunc
 
-	c, _, _, _ := halfRemovedFixture(t, func(f *cacheFake) runner {
-		var once bool
-
+	c, f, clock, images := halfRemovedFixture(t, func(f *cacheFake) runner {
 		return func(ctx context.Context, bin string, args []string) ([]byte, error) {
-			if !once && slices.Contains(args, "trash") && slices.Contains(args, "list") {
-				once = true
-				close(inside)
-				<-release
+			out, err := f.run(ctx, bin, args)
+			if cancel != nil && slices.Contains(args, "info") {
+				cancel()
 			}
 
-			return f.run(ctx, bin, args)
+			return out, err
 		}
 	})
 
-	first := make(chan error, 1)
-
-	go func() {
-		_, err := c.PurgeTrash(t.Context())
-		first <- err
-	}()
-
-	<-inside
+	f.halfRemoved[images[0]] = true
 
 	ctx, stop := context.WithCancel(t.Context())
-	stop()
+	defer stop()
 
-	second := make(chan error, 1)
+	cancel = stop
 
-	go func() {
-		_, err := c.PurgeTrash(ctx)
-		second <- err
-	}()
+	// The pass reaches no later image, so it may end without noticing; what
+	// matters is that the cancellation landed with rbd's answer.
+	if _, err := c.PurgeTrash(ctx); err != nil {
+		t.Logf("the cancelled pass answered %v", err)
+	}
 
-	select {
-	case err := <-second:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("a cancelled wait behind a running pass answered %v, want context.Canceled", err)
+	if ctx.Err() == nil {
+		t.Fatal("the pass never asked rbd info, so nothing was cancelled with its answer")
+	}
+
+	cancel = nil
+	*clock = clock.Add(2 * halfRemovedRecheck)
+
+	if n, err := c.PurgeTrash(t.Context()); n != 1 || err != nil || f.halfRemoved[images[0]] {
+		t.Fatalf("PurgeTrash = %d, %v; want the removal finished on the sighting the cancelled pass made", n, err)
+	}
+}
+
+// A CALLER WAITING BEHIND A PASS CAN GIVE UP: passes run one at a time, a wait
+// cancelled while the running pass holds the slot returns at once, and a live
+// waiter runs only once that pass ends.
+func TestAWaitForTheRunningPassCanBeCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		lists := 0
+
+		c, _, _, _ := halfRemovedFixture(t, func(f *cacheFake) runner {
+			return func(ctx context.Context, bin string, args []string) ([]byte, error) {
+				if slices.Contains(args, "trash") && slices.Contains(args, "list") {
+					lists++
+					if lists == 1 {
+						<-release
+					}
+				}
+
+				return f.run(ctx, bin, args)
+			}
+		})
+
+		run := func(ctx context.Context) chan error {
+			done := make(chan error, 1)
+
+			go func() {
+				_, err := c.PurgeTrash(ctx)
+				done <- err
+			}()
+
+			return done
 		}
-	case <-time.After(10 * time.Second):
+
+		first := run(t.Context())
+		synctest.Wait()
+
+		ctx, stop := context.WithCancel(t.Context())
+		defer stop()
+
+		cancelled := run(ctx)
+		queued := run(t.Context())
+		synctest.Wait()
+
+		if lists != 1 {
+			t.Fatalf("%d passes listed the trash while the first held the slot, want 1", lists)
+		}
+
+		stop()
+		synctest.Wait()
+
+		select {
+		case err := <-cancelled:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("a wait cancelled behind a running pass answered %v, want context.Canceled", err)
+			}
+		default:
+			t.Fatal("a wait cancelled behind a running pass did not return while the pass ran")
+		}
+
+		select {
+		case err := <-queued:
+			t.Fatalf("a queued pass ran before the running one ended (%v)", err)
+		default:
+		}
+
 		close(release)
-		t.Fatal("a cancelled wait behind a running pass did not return until the pass ended")
-	}
 
-	select {
-	case err := <-first:
-		t.Fatalf("the running pass ended before it was released (%v): the second call did not wait behind it", err)
-	default:
-	}
+		if err := <-first; err != nil {
+			t.Fatalf("the running pass: %v", err)
+		}
 
-	close(release)
+		if err := <-queued; err != nil {
+			t.Fatalf("the queued pass: %v", err)
+		}
 
-	if err := <-first; err != nil {
-		t.Fatalf("the running pass: %v", err)
-	}
+		if lists != 2 {
+			t.Errorf("the queued pass did not run once the slot was free: %d listings, want 2", lists)
+		}
+	})
 }
