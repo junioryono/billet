@@ -58,7 +58,7 @@ final      accepted
 restart    the node restarted while the job ran; what it held before then was lost
 received   first 2026-10-09T12:01:10.600Z, last 2026-10-09T12:02:47.600Z, on the node's clock
 encoded    5.8 KiB, codec 1
-sequence   batches 7 to 17: 11 kept, 0 refused by the merge, 0 never arrived
+sequence   batches 7 to 17: 11 kept, 0 refused by the merge, 0 carried by no batch the node merged
 repeats    0 received twice, 0 received twice with other content (the first received is kept)
 resolution a sample every 1s, processes every 2s (1 of the agent's samples to each kept)
 skew       the node received the last batch 850ms after the guest stamped its last sample: the guest's clock is at most that far behind the node's, and how far ahead it may be, nothing here says. No time on this page is corrected for it.
@@ -111,7 +111,7 @@ suite      "api/cmd/server": 12 tests, 0 failures, 0 errors, 0 skipped
 </dl>
 <h3>The report</h3>
 <dl class="fields">
-<dt>sequence</dt><dd>batches 7 to 17: 11 kept, 0 refused by the merge, 0 never arrived</dd>
+<dt>sequence</dt><dd>batches 7 to 17: 11 kept, 0 refused by the merge, 0 carried by no batch the node merged</dd>
 <dt>repeats</dt><dd>0 received twice, 0 received twice with other content (the first received is kept)</dd>
 <dt>resolution</dt><dd>a sample every 1s, processes every 2s (1 of the agent&#39;s samples to each kept)</dd>
 <dt>skew</dt><dd>the node received the last batch 850ms after the guest stamped its last sample: the guest&#39;s clock is at most that far behind the node&#39;s, and how far ahead it may be, nothing here says. No time on this page is corrected for it.</dd>

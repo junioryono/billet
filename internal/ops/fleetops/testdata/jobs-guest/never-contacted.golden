@@ -55,7 +55,7 @@ hello      not seen
 batches    0 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)
 final      no record of accepting it
 restart    none while the job ran
-received   no batch arrived
+received   no arrival recorded (the node stamps only the batches it accepts)
 encoded    0 B, codec 1
 == billet jobs show --html, the guest section ==
 <section id="guest">
@@ -69,7 +69,7 @@ encoded    0 B, codec 1
 <dt>batches</dt><dd>0 accepted, 0 refused; 0 B dropped (the refused batches the node read, and any it accepted and could not keep)</dd>
 <dt>final</dt><dd>no record of accepting it</dd>
 <dt>restart</dt><dd>none while the job ran</dd>
-<dt>received</dt><dd>no batch arrived</dd>
+<dt>received</dt><dd>no arrival recorded (the node stamps only the batches it accepts)</dd>
 <dt>encoded</dt><dd>0 B, codec 1</dd>
 </dl>
 

@@ -228,13 +228,14 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 		}, absent: []string{guestBanner, "\nskew ", "0 B (MemTotal"}},
 		{name: "partial", guest: partialGuest, verdict: "partial", want: []string{
 			"guest      partial: the node has no record of accepting the agent's last batch, so the report may " +
-				"end before the job did; 1 of the agent's batches between its first and last never arrived",
-			"sequence   batches 1 to 14: 13 kept, 0 refused by the merge, 1 never arrived (9)",
+				"end before the job did; 1 of the agent's batch numbers between its first and last are carried by " +
+				"no batch the node merged",
+			"sequence   batches 1 to 14: 13 kept, 0 refused by the merge, 1 carried by no batch the node merged (9)",
 			"tests      could not tell: the agent sends its test results in its last batch, and the node has no " +
 				"record of accepting it",
 			"final      no record of accepting it", guestBanner,
-			"Not every batch is in the report (1 never arrived between its first and last, and 0 the node " +
-				"accepted are not in it)",
+			"Not every batch is in the report (1 of the numbers between its first and last are carried by no " +
+				"batch the node merged, 0 the node accepted are not in it, and the node refused 0)",
 		}},
 		{name: "node-restarted", guest: restartedGuest, verdict: "node_restarted", want: []string{
 			"guest      node restarted: the node restarted while the job ran, so the batches it held before " +
@@ -451,8 +452,8 @@ func TestEachGuestRowHasItsVerdict(t *testing.T) {
 			t.Errorf("%s: verdict %s, why %q, report %v, final kept %v", tc.name, g.verdict, g.why, g.report != nil,
 				g.finalKept)
 		}
-		if strings.Contains(g.why, "never arrived") {
-			t.Errorf("%s: a report with every batch says some never arrived: %q", tc.name, g.why)
+		if strings.Contains(g.why, "carried by no batch") {
+			t.Errorf("%s: a report with every batch says some are missing: %q", tc.name, g.why)
 		}
 		v := guestViewOf(g, nil, jobSteps{none: "none"})
 		if v.HasReport != tc.report || (v.Banner != "") != tc.report {
@@ -1025,9 +1026,10 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	}
 	listed := []github.JobStep{{Number: 3, Name: "Build"}, {Number: 4, Name: "Test"}}
 	v := guestViewOf(g, nil, jobSteps{job: github.WorkflowJob{Steps: listed}}).Steps
-	if !strings.Contains(v.ProcsNote, "Not every batch is in the report (0 never arrived between its first and "+
-		"last, and 1 the node accepted are not in it), and a step mark in one of them is lost with it, so a "+
-		"group may also hold processes of steps that came after its own") {
+	if !strings.Contains(v.ProcsNote, "Not every batch is in the report (0 of the numbers between its first "+
+		"and last are carried by no batch the node merged, 1 the node accepted are not in it, and the node "+
+		"refused 0), and a step mark in one of them is lost with it, so a group may also hold processes of "+
+		"steps that came after its own") {
 		t.Errorf("the section does not qualify where processes are placed: %q", v.ProcsNote)
 	}
 
@@ -1037,9 +1039,17 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	dropped := *exampleGuest(t)
 	dropped.Accepted = 18
 	note := guestViewOf(judgeGuest(recorded(&dropped)), nil, jobSteps{none: "none"}).Steps.ProcsNote
-	if !strings.Contains(note, "(0 never arrived between its first and last, and 1 the node accepted are not "+
-		"in it)") {
+	if !strings.Contains(note, "(0 of the numbers between its first and last are carried by no batch the node "+
+		"merged, 1 the node accepted are not in it, and the node refused 0)") {
 		t.Errorf("a batch dropped before the merge does not qualify where processes are placed: %q", note)
+	}
+	// A BATCH THE NODE REFUSED, with no gap and every accepted batch kept, can
+	// still have carried a mark: the last batch, refused, here.
+	refusedLast := *exampleGuest(t)
+	refusedLast.Refused = 1
+	if note := guestViewOf(judgeGuest(recorded(&refusedLast)), nil, jobSteps{none: "none"}).Steps.ProcsNote; !strings.Contains(note,
+		"0 the node accepted are not in it, and the node refused 1)") {
+		t.Errorf("a batch the node refused does not qualify where processes are placed: %q", note)
 	}
 	// A NODE THAT COUNTS FEWER THAN THE REPORT HOLDS is said to disagree, never a
 	// negative count.

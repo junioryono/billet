@@ -133,7 +133,8 @@ func judgeGuest(row alloc.RecordedGuestReport) *jobGuest {
 		"refused by the merge), so it may end before the job did", row.Accepted, r.Batches, r.Refused)
 	missing := ""
 	if r.Missing > 0 {
-		missing = fmt.Sprintf("; %d of the agent's batches between its first and last never arrived", r.Missing)
+		missing = fmt.Sprintf("; %d of the agent's batch numbers between its first and last are carried by "+
+			"no batch the node merged", r.Missing)
 	}
 	// WHAT THE NODE RECORDED, NEVER WHAT THE AGENT DID: a last batch the node
 	// refused, or accepted before a restart, leaves no record of it, so its
@@ -282,7 +283,7 @@ func guestChannel(row alloc.RecordedGuestReport) []pageField {
 	if row.NodeRestarted {
 		restart = "the node restarted while the job ran; what it held before then was lost"
 	}
-	received := "no batch arrived"
+	received := "no arrival recorded (the node stamps only the batches it accepts)"
 	if !row.FirstReceived.IsZero() {
 		received = fmt.Sprintf("first %s, last %s, on the node's clock", stampMillis(row.FirstReceived),
 			stampMillis(row.LastReceived))
@@ -323,7 +324,8 @@ func guestAccount(r *guestreport.Report) []pageField {
 	}
 	out := []pageField{
 		{Label: "sequence", Value: fmt.Sprintf("batches %d to %d: %d kept, %d refused by the merge, "+
-			"%d never arrived%s", r.FirstSeq, r.LastSeq, r.Batches, r.Refused, r.Missing, gaps)},
+			"%d carried by no batch the node merged%s", r.FirstSeq, r.LastSeq, r.Batches, r.Refused, r.Missing,
+			gaps)},
 		{Label: "repeats", Value: fmt.Sprintf("%d received twice, %d received twice with other content "+
 			"(the first received is kept)", r.Duplicates, r.Conflicts)},
 		{Label: "resolution", Value: fmt.Sprintf("a sample every %s, processes every %s (%d of the agent's "+
@@ -551,21 +553,23 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep, lost string) gue
 }
 
 // lostBatches says which of the agent's batches the report lacks, or "" when it
-// lacks none it can count: those between its first and last that never arrived,
-// and those the node accepted and the report does not hold (refused by the
-// merge, or dropped past what the node assembles, before the merge saw them).
+// lacks none it can count: the numbers between its first and last that no
+// merged batch carries, those the node accepted and the report does not hold
+// (refused by the merge, or dropped past what the node assembles, before the
+// merge saw them), and those the node refused. The three can overlap: a batch the
+// node refused is also a number no merged batch carries.
 func lostBatches(row alloc.RecordedGuestReport, r *guestreport.Report) string {
 	notIn := row.Accepted - r.Batches - r.Duplicates
-	switch {
-	case notIn < 0:
-		return fmt.Sprintf("%d never arrived between its first and last, and the node's count of the batches "+
-			"it accepted is below the report's", r.Missing)
-	case r.Missing > 0 || notIn > 0:
-		return fmt.Sprintf("%d never arrived between its first and last, and %d the node accepted are not in "+
-			"it", r.Missing, notIn)
+	accepted := fmt.Sprintf("%d the node accepted are not in it", notIn)
+	if notIn < 0 {
+		accepted = "the node's count of the batches it accepted is below the report's"
+	}
+	if r.Missing == 0 && notIn == 0 && row.Refused == 0 {
+		return ""
 	}
 
-	return ""
+	return fmt.Sprintf("%d of the numbers between its first and last are carried by no batch the node merged, "+
+		"%s, and the node refused %d", r.Missing, accepted, row.Refused)
 }
 
 // matchMarks is, for each mark, the index of the GitHub step it names, or -1:
