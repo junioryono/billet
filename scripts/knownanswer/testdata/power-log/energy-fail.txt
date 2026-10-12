@@ -1,0 +1,12 @@
+window: 34 rows, epoch 1791540000 to 1791540034, 34.0 s
+package RAPL: 3.55 kJ, mean 104.4 W
+idle before: 73.5 W against idle_package_watts 73.5 W (+0.0%)
+idle after: 73.5 W against idle_package_watts 73.5 W (+0.0%)
+idle baseline PASS (each quiet end within ±5%)
+  lease-a: seen 9 s, billet's window 10 s, active 1.10 kJ, idle share 0.04 kJ
+above idle over the 11 s a microVM was alive: measured 1.05 kJ, attributed to jobs 1.10 kJ (ratio 1.048, accepted [0.850, 1.020])
+allowance: 0.00 kJ for the monitor's ticks falling between this log's rows (the quiet ends' dips below the baseline per busy second, or this log's own clipping, whichever is larger); clipped 0.00 kJ
+unattributed: -0.05 kJ, -4.5 W while a microVM was alive (the host's own work above idle)
+jobs' idle shares: 0.04 kJ of the window's 2.50 kJ idle baseline
+
+overall FAIL

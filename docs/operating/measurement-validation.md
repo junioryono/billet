@@ -11,8 +11,8 @@ The commands are written for the reference host (`ubuntu-01`, an AMD EPYC 7763 r
 | `.github/workflows/known-answer.yml` | A reusable workflow a repository calls with one of its billet tier labels. Six jobs run one after another on that tier: `baseline` (prepare and stop), `idle` (prepare, then sleep T), `cpu` (`stress-ng --cpu N --cpu-method matrixprod --timeout T`), `memory` (`stress-ng --vm 1 --vm-bytes X --vm-keep --timeout T`), `network` (download a body of known size to `/dev/null`) and `disk` (`fio`, `direct=1`, X bytes written). Each uploads an artifact `known-answer-<run>-<attempt>-<kind>` holding its `expectation.json`. It lives under `.github/workflows` because GitHub resolves a reusable workflow only from there; `actions/` holds composite actions, which are single steps and cannot fan out into jobs. |
 | `scripts/known-answer-job.sh` | What each job runs, fetched from the billet revision the caller names. It reads the lease from the runner's name (billet names every runner `billet-<lease>`), does the same preparation for every kind (`apt-get update`, install `stress-ng fio curl`), runs the load, and prints and records the expected figure with the lease, the run id, the attempt and GitHub's job id (`job.check_run_id`). |
 | `scripts/knownanswer` | The checker, a Go program: `collect` asks `billet jobs show --json` for every lease the expectations and the power log name; `check` compares each job with its expectation; `energy` reconciles the jobs' attributed energy with the package's RAPL over a window. |
-| `scripts/power-log.sh` | Run on the node as root: once a second it logs the package zone's `energy_uj` with the wrap at `max_energy_range_uj` undone, `ipmitool dcmi power reading` through `/dev/ipmi0`, turbostat's PkgWatt when turbostat is installed, and which billet microVMs hold a process (`?` when the cgroup tree could not be read, which is not an empty inventory), to a CSV. The clock, the counter and the inventory are read together before the BMC is asked, since a BMC call can take seconds. When it stops it prints `power-summary.sh`'s comparison. |
-| `scripts/power-summary.sh` | RAPL against the BMC and turbostat over a log, or a window of one: means, ratio, offset and a least-squares fit. |
+| `scripts/power-log.sh` | Run on the node as root: once a second it logs the package zone's `energy_uj` with the wrap at `max_energy_range_uj` undone, `ipmitool dcmi power reading` through `/dev/ipmi0`, turbostat's PkgWatt when turbostat is installed, and which billet microVMs hold a process (`?` when the cgroup tree could not be read, which is not an empty inventory), to a CSV. The clock, the counter and the inventory are read together before the BMC is asked, since a BMC call can take seconds. With `--meter CMD` it also logs a wall meter's watts and cumulative watt-hours (below). When it stops it prints `power-summary.sh`'s comparison. |
+| `scripts/power-summary.sh` | RAPL against the BMC, the wall meter and turbostat over a log, or a window of one: means, ratio, offset and a least-squares fit, and the meter's own energy over the window. |
 
 ## How a job is matched to billet's record
 
@@ -121,7 +121,7 @@ Every step names the host it runs on. `$REPO` is the repository with the caller.
    ./power-summary.sh --require-bmc --from 1791540000 --to 1791540600 power.csv
    ```
 
-   To give the BMC fit a range wider than CI jobs reach, drain the node, run `sudo ./power-log.sh --out calibration.csv --require-bmc` and, beside it, `stress-ng --cpu 32 --timeout 120s`, then `--cpu 64`, then `--cpu 128`, with a quiet minute between each, and resume the node afterwards.
+   To give the BMC fit a range wider than CI jobs reach, drain the node, run `sudo ./power-log.sh --out calibration.csv --require-bmc` and, beside it, `stress-ng --cpu 32 --timeout 120s`, then `--cpu 64`, then `--cpu 128`, with a quiet minute between each, and resume the node afterwards. On a host whose BMC reports no power reading, as the reference host's does, the [wall meter](#checking-rapl-at-the-wall) takes its place.
 
 Exit statuses are the verdict, three ways, for every check: 0 PASS, 1 FAIL, 3 could not tell (UNMEASURED, or a BMC that never answered under `--require-bmc`), and 2 for a command that could not run (bad flags, unreadable inputs, a log that already exists).
 
@@ -160,6 +160,87 @@ The energy check needs the whole window accounted for: every microVM the log saw
 - **A record naming another run**: the lease ran something else, so the job's runner name and billet's record disagree about which job a lease served.
 
 **The BMC comparison** has no PASS: the BMC measures the whole server at the wall (fans, memory, disks, NICs and the power supply's loss) and RAPL the CPU package alone. The offset is roughly the platform's draw beyond the package, the slope how the wall follows the package (above 1 for the supply's loss and the loads that track the CPU), and r² how closely. A BMC reading is often an average over its own sampling period and lags RAPL by a sample or two, so read the fit over steady stretches with `--from` and `--to`. turbostat reads the same package counter, so its PkgWatt should agree with RAPL within a percent or two over the whole log; more than that means one of the two is reading another zone. Row by row the two are approximate: turbostat samples on its own clock, and each row carries the reading it printed since the row before, read beside the RAPL counter.
+
+## Checking RAPL at the wall
+
+The energy check proves that billet shares out what RAPL reports, not that RAPL is right: RAPL is the package's own model of its energy, and on the reference host it is the only figure there is, since its BMC reports no power reading (measured 2026-10-09). A meter at the wall is the independent check. It measures the whole server (the package, memory, fans, disks, NICs and the power supply's loss), so it is not expected to equal RAPL; what is checked is that the wall follows the package along a straight line, and how steeply.
+
+### What to buy
+
+A plug-in or inline meter that the node can read on the LAN with no cloud service in the path, which reports both the instantaneous watts and a cumulative energy counter. Before buying, check four things against its datasheet rather than its listing:
+
+- **Stated accuracy** across the range this host draws, from idle to all threads busy. A percentage of reading is what matters; a percentage of full scale on a meter rated far above the server is much worse at idle.
+- **Update rate**: a new reading at least once a second. A meter that refreshes every few seconds answers the same number for several rows, which flattens the fit; check whether its API says when the reading was taken.
+- **Counter resolution**: watt-hours or finer. A counter in hundredths of a kilowatt-hour moves once every 10 Wh, a large fraction of a twenty-minute run's energy.
+- **Every power cord of the chassis.** Check whether the server has a redundant pair of power supplies (look at the back, or `sudo dmidecode -t 39`, which lists each supply the firmware knows). A redundant pair shares the load, so a meter on one cord sees about half of it: both cords must be metered, by two meters whose readings the meter command adds, or by one meter feeding a strip that carries both cords. The meter must also be rated for the current the supplies can draw.
+
+### The meter command
+
+`power-log.sh --meter CMD` runs CMD with `bash -c` once a sample, after reading RAPL and before the BMC, bounded by `--meter-timeout` (default 1 second, and a second more for a command that ignores SIGTERM), so a meter that hangs never holds the log. CMD prints one line: the watts, and the counter in watt-hours after a space, as plain decimals of at most six places, up to 999999 W and 999999999 Wh (`152.4 8812.031`, or `152.4` for a meter with no counter). An answer that exits non-zero, arrives after the bound, or is anything else (two lines, a unit, a comma, an exponent, a carriage return) leaves both `meter_watts` and `meter_wh` empty, never zero. No file the command or anything it starts writes can grow past 64 KiB, so a command that writes a large response to a file instead of a pipe fails rather than fills the disk. A meter whose API gives kilowatt-hours must be converted to watt-hours in the command. With two meters, the command prints the sum and must fail if either fails, since half the server is not a reading of it.
+
+Write the command for the meter you have and try it by hand first; it should print one line, and its number should match the meter's own display. For a meter with an HTTP JSON API the shape is:
+
+```bash
+METER='set -o pipefail; curl -fsS --max-time 0.8 http://<meter-address>/<status-path> | jq -er "\"\(.<watts-field>) \(.<watt-hours-field>)\""'
+bash -c "$METER"
+```
+
+`set -o pipefail` and `jq -e` make a failed request a failed command rather than an empty line, and `--max-time` keeps curl inside the bound.
+
+### The run
+
+It takes about twenty minutes, during which the node runs no jobs. A drain is deployment-wide, so every tier's jobs queue until the resume.
+
+1. **Control plane: drain**, and wait until nothing runs.
+
+   ```bash
+   billet drain --reason "wall meter calibration" --wait --timeout 30m
+   ```
+
+2. **Node: start the log** with the BMC off, since it has no reading here and each call would stretch the rows past a second.
+
+   ```bash
+   sudo ./power-log.sh --out wall.csv --ipmitool none --meter "$METER"
+   ```
+
+3. **Node, a second shell: the step load**, two minutes at each of 0, 16, 32, 64 and 128 threads (the EPYC 7763 has 64 cores and 128 threads), recording when each step starts:
+
+   ```bash
+   for n in 0 16 32 64 128; do
+     echo "$n $(date +%s)" >>steps.txt
+     if [ "$n" -eq 0 ]; then sleep 120; else stress-ng --cpu "$n" --cpu-method matrixprod --timeout 120s; fi
+   done
+   echo "end $(date +%s)" >>steps.txt
+   sleep 120
+   ```
+
+   The last two minutes are quiet again, to see the host return to the idle it started at.
+
+4. **Node: stop the log** with Ctrl-C. It prints the summary of the whole log.
+
+5. **Control plane: resume.**
+
+   ```bash
+   billet resume
+   ```
+
+6. **Node: each step on its own**, leaving out the first and last 15 seconds of each, where the meter and RAPL can disagree about when the step began:
+
+   ```bash
+   awk 'NR > 1 { print n, start, $2 } { n = $1; start = $2 }' steps.txt | while read -r n from to; do
+     echo "== $n threads"; ./power-summary.sh --from $((from + 15)) --to $((to - 15)) wall.csv
+   done
+   ```
+
+### What each result means
+
+- **`fit: meter = a W + b x RAPL, r^2`** over the whole log is the result. `a` is the wall's draw with the package at zero, extrapolated: the platform beyond the package. `b` is how many watts the wall rises per watt the package rises; it should be above 1, for the supply's loss and the regulators, fans and memory that rise with the CPU. `r^2` says how closely the wall follows RAPL along that line across the steps.
+- **The steps on their own**: each step's `meter: ... mean X W against RAPL Y W` is a point on that line. If the wall's rise over the 0-thread step, divided by RAPL's, is about `b` at every step, the wall and RAPL keep one relationship across the load, and billet's figures scale to the wall by `b` for a load like stress-ng's on this host as configured. If the ratio changes with the load, the relationship is not one line, and the run alone does not say why: RAPL's model may drift at that load, or the supply's efficiency, the fans or the memory may change with it while RAPL is right. Record which step departs and by how much, and treat a conversion by `b` as holding only for the loads and conditions it was measured under.
+- **`meter fit: N rows used, M skipped for an empty meter cell, K for no RAPL interval`**: rows the meter did not answer are left out, never counted as zero. More than a few skipped means the meter answered late or malformed: try the command by hand, and raise `--meter-timeout` if it is slow but sound, since each row then stretches to the time it takes.
+- **`meter energy`** is the meter's own energy over the window, from its counter when the counter has two readings and never goes backwards (a meter that restarted resets it), and otherwise each row's watts over the interval ending at it, summed over the intervals that have a reading; the line says which, and why the counter was not used. The counter is the meter's own integration at its own rate, so it is the better figure when it can be used; the integrated watts see only the instants the log asked.
+- **Exit 3** means the meter never answered alongside a RAPL reading, or RAPL measured no interval: there is nothing to compare. The meter's own lines are still printed.
+
+A known-answer run logged with `--meter` also gets the wall in the energy check: `knownanswer energy` reports the wall's idle at each quiet end, its energy above that idle over the intervals a microVM was alive for, and what share of it the package's RAPL and the jobs' attributed energy are. Those lines have no verdict and never change the check's: no tolerance between the package and the whole server has been measured yet. A busy interval the meter did not answer makes the wall's line could-not-tell rather than a smaller number, and a microVM whose record could not be used makes the jobs' share could-not-tell while the package's share is still given. With the step load's `b` in hand, a RAPL/wall share far from `1/b` while jobs ran says the jobs' load related the wall to the package differently from stress-ng's: power drawn outside the package (memory, disks, the network) is one explanation, and a supply or fans at another operating point are others.
 
 ## Methodology
 

@@ -1,0 +1,9 @@
+window: 34 rows, epoch 1791540000 to 1791540034, 34.0 s
+package RAPL: 3.55 kJ, mean 104.4 W
+idle before: 73.5 W against idle_package_watts 73.5 W (+0.0%)
+idle after: 73.5 W against idle_package_watts 73.5 W (+0.0%)
+idle baseline PASS (each quiet end within ±5%)
+  lease-a: seen 9 s; its energy source is "rapl-unsplit", not rapl split by an idle baseline
+reconciliation: the window's energy cannot be accounted for without lease-a
+
+overall UNMEASURED
