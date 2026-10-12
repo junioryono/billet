@@ -258,7 +258,7 @@ func guestViewOf(g *jobGuest, measured *alloc.RecordedUsage, steps jobSteps) gue
 	if steps.none == "" && steps.err == nil {
 		listed = steps.job.Steps
 	}
-	v.Steps = guestSteps(r, listed, lostBatches(g.row, r))
+	v.Steps = guestSteps(r, listed, placementCaveat(g.row, r))
 	v.Tests = guestTests(r, g.row.FinalSeen, g.finalKept)
 
 	return v
@@ -466,9 +466,9 @@ func guestAgent(row alloc.RecordedGuestReport, r *guestreport.Report) []pageFiel
 }
 
 // guestSteps is the guest's step marks matched to GitHub's steps, and its
-// processes placed in the steps the marks begin. lost names the batches the
-// report lacks, which may have taken marks with them.
-func guestSteps(r *guestreport.Report, listed []github.JobStep, lost string) guestStepsView {
+// processes placed in the steps the marks begin. caveat qualifies the placement
+// when a batch the report lacks may have taken a mark with it.
+func guestSteps(r *guestreport.Report, listed []github.JobStep, caveat string) guestStepsView {
 	var out guestStepsView
 	matched := matchMarks(r.Steps, listed)
 
@@ -510,9 +510,8 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep, lost string) gue
 		"the busiest %d names of each are shown and the rest summed.", interval, guestTopProcesses)
 	// A MARK IS LOST WITH ITS BATCH, and the processes after it then fall to the
 	// mark before: no group can then be said to hold one step's alone.
-	if len(r.Steps) > 0 && lost != "" {
-		out.ProcsNote += " Not every batch is in the report (" + lost + "), and a step mark in one of them " +
-			"is lost with it, so a group may also hold processes of steps that came after its own."
+	if len(r.Steps) > 0 && caveat != "" {
+		out.ProcsNote += " " + caveat
 	}
 
 	buckets := make([][]guestreport.ProcessSample, len(r.Steps)+1)
@@ -552,24 +551,35 @@ func guestSteps(r *guestreport.Report, listed []github.JobStep, lost string) gue
 	return out
 }
 
-// lostBatches says which of the agent's batches the report lacks, or "" when it
-// lacks none it can count: the numbers between its first and last that no
-// merged batch carries, those the node accepted and the report does not hold
-// (refused by the merge, or dropped past what the node assembles, before the
-// merge saw them), and those the node refused. The three can overlap: a batch the
-// node refused is also a number no merged batch carries.
-func lostBatches(row alloc.RecordedGuestReport, r *guestreport.Report) string {
+// placementCaveat is what qualifies where processes are placed, or "" when the
+// counts leave no batch that could have taken a mark with it.
+//
+// A LOSS IS SAID ONLY WHERE THE COUNTS PROVE ONE: a number between the first and
+// last that no merged batch carries, or a batch the node accepted that the report
+// does not hold. A refusal proves none: the node counts a body it could not read
+// whole as refused, and the agent sends the same batch again, so a refused
+// attempt may since have been accepted, and the counts cannot tell.
+func placementCaveat(row alloc.RecordedGuestReport, r *guestreport.Report) string {
+	const mixed = "so a group may also hold processes of steps that came after its own."
 	notIn := row.Accepted - r.Batches - r.Duplicates
-	accepted := fmt.Sprintf("%d the node accepted are not in it", notIn)
-	if notIn < 0 {
-		accepted = "the node's count of the batches it accepted is below the report's"
+
+	var out []string
+	if r.Missing > 0 || notIn > 0 {
+		out = append(out, fmt.Sprintf("Not every batch is in the report (%d of the numbers between its first "+
+			"and last are carried by no batch the node merged, and %d the node accepted are not in it), and a "+
+			"step mark in one of them is lost with it, "+mixed, r.Missing, max(notIn, 0)))
 	}
-	if r.Missing == 0 && notIn == 0 && row.Refused == 0 {
-		return ""
+	if notIn < 0 {
+		out = append(out, "The node's count of the batches it accepted is below the report's, so which "+
+			"batches the report lacks cannot be told, "+mixed)
+	}
+	if row.Refused > 0 {
+		out = append(out, fmt.Sprintf("The node refused %d attempts to send a batch; a refused attempt may "+
+			"have carried a step mark the report does not hold, and the counts cannot tell whether a retry "+
+			"later delivered it, "+mixed, row.Refused))
 	}
 
-	return fmt.Sprintf("%d of the numbers between its first and last are carried by no batch the node merged, "+
-		"%s, and the node refused %d", r.Missing, accepted, row.Refused)
+	return strings.Join(out, " ")
 }
 
 // matchMarks is, for each mark, the index of the GitHub step it names, or -1:

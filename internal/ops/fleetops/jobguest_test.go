@@ -235,7 +235,8 @@ func TestJobsShowGuestVerdictsAreTheCommittedGoldens(t *testing.T) {
 				"record of accepting it",
 			"final      no record of accepting it", guestBanner,
 			"Not every batch is in the report (1 of the numbers between its first and last are carried by no " +
-				"batch the node merged, 0 the node accepted are not in it, and the node refused 0)",
+				"batch the node merged, and 0 the node accepted are not in it), and a step mark in one of them is " +
+				"lost with it",
 		}},
 		{name: "node-restarted", guest: restartedGuest, verdict: "node_restarted", want: []string{
 			"guest      node restarted: the node restarted while the job ran, so the batches it held before " +
@@ -1027,37 +1028,63 @@ func TestALostMarkQualifiesWhereProcessesArePlaced(t *testing.T) {
 	listed := []github.JobStep{{Number: 3, Name: "Build"}, {Number: 4, Name: "Test"}}
 	v := guestViewOf(g, nil, jobSteps{job: github.WorkflowJob{Steps: listed}}).Steps
 	if !strings.Contains(v.ProcsNote, "Not every batch is in the report (0 of the numbers between its first "+
-		"and last are carried by no batch the node merged, 1 the node accepted are not in it, and the node "+
-		"refused 0), and a step mark in one of them is lost with it, so a group may also hold processes of "+
-		"steps that came after its own") {
+		"and last are carried by no batch the node merged, and 1 the node accepted are not in it), and a step "+
+		"mark in one of them is lost with it, so a group may also hold processes of steps that came after its "+
+		"own") {
 		t.Errorf("the section does not qualify where processes are placed: %q", v.ProcsNote)
 	}
+
+	note := func(row alloc.GuestReport) string {
+		return guestViewOf(judgeGuest(recorded(&row)), nil, jobSteps{none: "none"}).Steps.ProcsNote
+	}
+	const proven = "is lost with it"
+	refusal := "a refused attempt may have carried a step mark the report does not hold, and the counts " +
+		"cannot tell whether a retry later delivered it, so a group may also hold processes of steps that came " +
+		"after its own"
 
 	// AN ACCEPTED BATCH THE NODE DROPPED BEFORE THE MERGE leaves the merge's
 	// counts at zero and still qualifies the placement: the report holds 17
 	// batches of the 18 the node accepted.
 	dropped := *exampleGuest(t)
 	dropped.Accepted = 18
-	note := guestViewOf(judgeGuest(recorded(&dropped)), nil, jobSteps{none: "none"}).Steps.ProcsNote
-	if !strings.Contains(note, "(0 of the numbers between its first and last are carried by no batch the node "+
-		"merged, 1 the node accepted are not in it, and the node refused 0)") {
-		t.Errorf("a batch dropped before the merge does not qualify where processes are placed: %q", note)
+	if got := note(dropped); !strings.Contains(got, "(0 of the numbers between its first and last are carried "+
+		"by no batch the node merged, and 1 the node accepted are not in it), and a step mark") {
+		t.Errorf("a batch dropped before the merge does not qualify where processes are placed: %q", got)
 	}
-	// A BATCH THE NODE REFUSED, with no gap and every accepted batch kept, can
-	// still have carried a mark: the last batch, refused, here.
-	refusedLast := *exampleGuest(t)
-	refusedLast.Refused = 1
-	if note := guestViewOf(judgeGuest(recorded(&refusedLast)), nil, jobSteps{none: "none"}).Steps.ProcsNote; !strings.Contains(note,
-		"0 the node accepted are not in it, and the node refused 1)") {
-		t.Errorf("a batch the node refused does not qualify where processes are placed: %q", note)
+
+	// A REFUSED ATTEMPT IS NO PROVEN LOSS: the agent resends a batch it had no
+	// answer for, so with every number merged and every accepted batch kept, a
+	// refusal is said to be uncertain, never a lost mark. The last batch accepted,
+	// after an attempt refused.
+	refusedThenAccepted := *exampleGuest(t)
+	refusedThenAccepted.Refused = 1
+	if got := note(refusedThenAccepted); !strings.Contains(got, "The node refused 1 attempts to send a batch; "+
+		refusal) || strings.Contains(got, proven) {
+		t.Errorf("a refusal with every batch kept: %q", got)
 	}
+
+	// THE LAST BATCH REFUSED: the node accepted the sixteen before it and never
+	// recorded the last, so no count proves it lost, and the refusal alone still
+	// qualifies the placement.
+	before := exampleGuestBatches()[:16]
+	refusedLast := *guestRow(t, before, alloc.GuestReport{Accepted: int64(len(before)), Refused: 1, Hello: true,
+		FirstReceived: pageSecond(10.6), LastReceived: pageSecond(160.6)})
+	if refusedLast.FinalSeen {
+		t.Fatalf("the refused last batch was recorded as accepted")
+	}
+	if got := note(refusedLast); !strings.Contains(got, "The node refused 1 attempts to send a batch; "+refusal) ||
+		strings.Contains(got, proven) {
+		t.Errorf("the last batch refused: %q", got)
+	}
+
 	// A NODE THAT COUNTS FEWER THAN THE REPORT HOLDS is said to disagree, never a
 	// negative count.
 	under := *exampleGuest(t)
 	under.Accepted = 16
-	if note := guestViewOf(judgeGuest(recorded(&under)), nil, jobSteps{none: "none"}).Steps.ProcsNote; !strings.Contains(note,
-		"the node's count of the batches it accepted is below the report's") || strings.Contains(note, "-1") {
-		t.Errorf("a node count below the report's: %q", note)
+	if got := note(under); !strings.Contains(got, "The node's count of the batches it accepted is below the "+
+		"report's, so which batches the report lacks cannot be told") || strings.Contains(got, "-1") ||
+		strings.Contains(got, proven) {
+		t.Errorf("a node count below the report's: %q", got)
 	}
 	var build *guestStepProcs
 	for i := range v.Procs {
