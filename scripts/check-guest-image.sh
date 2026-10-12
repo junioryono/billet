@@ -628,6 +628,20 @@ else
 fi
 rm -f "$agent_expected"
 
+# THE JOB-COMPLETED HOOK the agent names wherever it started the guest monitor.
+# The runner runs it inside the job, so it is this tree's, byte for byte: only the
+# exact file proves it prints nothing into the job's log and always exits 0.
+JOB_COMPLETED_HOOK_SOURCE="${JOB_COMPLETED_HOOK_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)/internal/guestassets/job-completed-hook.sh}"
+JOB_COMPLETED_HOOK="$MNT/usr/local/lib/billet/job-completed-hook.sh"
+if [ -f "$JOB_COMPLETED_HOOK" ] && [ -x "$JOB_COMPLETED_HOOK" ] &&
+	cmp -s "$JOB_COMPLETED_HOOK_SOURCE" "$JOB_COMPLETED_HOOK"; then
+	pass "the job-completed hook asks the guest monitor for its final batch"
+else
+	fail "no executable /usr/local/lib/billet/job-completed-hook.sh identical to
+        internal/guestassets/job-completed-hook.sh; a monitored job's final batch
+        would reach the node only on SIGTERM, after GitHub recorded the job"
+fi
+
 DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
 if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
 	grep -Fq '/v1/docker-store' "$DOCKER_CACHE" &&

@@ -2,11 +2,13 @@ package scripts_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -95,6 +97,24 @@ cat <<EOF
     Power reading state is:                   $state
 
 EOF
+`,
+	// meter runs the Nth line of $FAKE_STATE/meter-answers on its Nth call: a
+	// line of shell, so an answer can be any bytes, any exit status, or late.
+	// No mapfile: /bin/bash is 3.2 on macOS.
+	"meter": `#!/bin/bash
+s=$FAKE_STATE
+n=$(( $(cat "$s/meter-calls" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$s/meter-calls"
+i=0
+while IFS= read -r line; do
+	i=$((i + 1))
+	if [ "$i" -eq "$n" ]; then
+		eval "$line"
+		exit
+	fi
+done <"$s/meter-answers"
+echo "fake meter: no answer $n" >&2
+exit 90
 `,
 	// turbostat prints its header, then one reading per sleep the logger takes
 	// (7k.50 for the kth), as many as $FAKE_STATE/ts-readings says, and then
@@ -266,6 +286,30 @@ func referenceLog() []step {
 	return steps
 }
 
+// wantLog is the log the script must write for steps without a meter, header
+// first, built independently of the script; bmc says whether the BMC was asked.
+func wantLog(steps []step, bmc bool) []string {
+	want := []string{"epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances"}
+	for i, s := range steps {
+		delta := ""
+		if i > 0 {
+			d := s.energy - steps[i-1].energy
+			if d < 0 {
+				d += referenceMaxRange
+			}
+			delta = strconv.FormatInt(d, 10)
+		}
+		watts := s.bmc
+		if !bmc || watts == "fail" || watts == "off" {
+			watts = ""
+		}
+		want = append(want, fmt.Sprintf("%d,%d.%02d,%d,%s,%s,,%s", s.epoch, s.uptimeCS/100, s.uptimeCS%100,
+			s.energy, delta, watts, strings.Join(s.vms, ";")))
+	}
+
+	return want
+}
+
 // powerLogFixture is where scripts/knownanswer reads a log this script wrote;
 // it is compared here and rewritten with BILLET_UPDATE_FIXTURES=1.
 var powerLogFixture = filepath.Join("knownanswer", "testdata", "power-log", "power.csv")
@@ -286,24 +330,7 @@ func TestThePowerLogUndoesTheWrapAndLeavesWhatItCouldNotReadEmpty(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	// THE ROWS, BUILT INDEPENDENTLY OF THE SCRIPT from the steps it was fed.
-	want := []string{"epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances"}
-	for i, s := range steps {
-		delta := ""
-		if i > 0 {
-			d := s.energy - steps[i-1].energy
-			if d < 0 {
-				d += referenceMaxRange
-			}
-			delta = strconv.FormatInt(d, 10)
-		}
-		bmc := s.bmc
-		if bmc == "fail" || bmc == "off" {
-			bmc = ""
-		}
-		want = append(want, fmt.Sprintf("%d,%d.%02d,%d,%s,%s,,%s", s.epoch, s.uptimeCS/100, s.uptimeCS%100,
-			s.energy, delta, bmc, strings.Join(s.vms, ";")))
-	}
+	want := wantLog(steps, true)
 	if got := strings.TrimSuffix(string(written), "\n"); got != strings.Join(want, "\n") {
 		t.Errorf("the log:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
 	}
@@ -510,14 +537,24 @@ func TestThePowerLogRefusesWhatItCannotMeasure(t *testing.T) {
 		plant bool
 		args  []string
 		says  string
+		// whole is the entire output, where the message must be all it says.
+		whole bool
 	}{
-		{"an unreadable zone", []string{"sleep", "date", "timeout"}, false, nil, "cannot read"},
-		{"a log that exists", []string{"sleep", "date", "timeout"}, true, []string{"--exists"}, "is never appended to"},
+		{"an unreadable zone", []string{"sleep", "date", "timeout"}, false, nil, "cannot read", false},
+		{"a log that exists", []string{"sleep", "date", "timeout"}, true, []string{"--exists"}, "is never appended to", false},
 		{"--require-bmc with no BMC", []string{"sleep", "date", "timeout"}, true,
-			[]string{"--require-bmc", "--ipmitool", "none"}, "--require-bmc and no ipmitool"},
-		{"no timeout to bound ipmitool", []string{"sleep", "date"}, true, nil, "timeout(1) is required"},
+			[]string{"--require-bmc", "--ipmitool", "none"}, "--require-bmc and no ipmitool", false},
+		{"no timeout to bound ipmitool", []string{"sleep", "date"}, true, nil,
+			"power-log: timeout(1) is required to bound ipmitool\n", true},
+		{"no timeout to bound the meter", []string{"sleep", "date"}, true, []string{"--meter", "true"},
+			"power-log: timeout(1) is required to bound ipmitool and the meter\n", true},
 		{"a fractional interval", []string{"sleep", "date", "timeout"}, true, []string{"--interval", "0.5"},
-			"--interval must be a positive whole number"},
+			"--interval must be a positive whole number", false},
+		// GNU timeout reads a duration of zero as no bound at all.
+		{"a meter bound of zero", []string{"sleep", "date", "timeout"}, true,
+			[]string{"--meter", "true", "--meter-timeout", "0.0"}, "--meter-timeout must be a positive number", false},
+		{"a meter bound with a unit", []string{"sleep", "date", "timeout"}, true,
+			[]string{"--meter", "true", "--meter-timeout", "1s"}, "--meter-timeout must be a positive number", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -541,8 +578,12 @@ func TestThePowerLogRefusesWhatItCannotMeasure(t *testing.T) {
 			}
 			text, err := h.run(t, args...)
 			exit, ok := errors.AsType[*exec.ExitError](err)
-			if !ok || exit.ExitCode() != 2 || !strings.Contains(text, tc.says) {
-				t.Errorf("err %v, want exit 2 saying %q:\n%s", err, tc.says, text)
+			said := strings.Contains(text, tc.says)
+			if tc.whole {
+				said = text == tc.says
+			}
+			if !ok || exit.ExitCode() != 2 || !said {
+				t.Errorf("err %v, want exit 2 saying %q (whole output %v):\n%q", err, tc.says, tc.whole, text)
 			}
 			if tc.name != "a log that exists" {
 				if _, err := os.Stat(out); !os.IsNotExist(err) {
@@ -593,6 +634,394 @@ func TestThePowerSummaryAnswersThreeWays(t *testing.T) {
 			}
 			if code != tc.code || !strings.Contains(out.String(), tc.says) {
 				t.Errorf("exit %d, want %d saying %q:\n%s", code, tc.code, tc.says, out.String())
+			}
+		})
+	}
+}
+
+// runSummary runs power-summary.sh and answers its output and exit status.
+func runSummary(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{"power-summary.sh"}, args...)...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if exit, ok := errors.AsType[*exec.ExitError](err); ok {
+		return out.String(), exit.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	return out.String(), 0
+}
+
+// A LOG WITHOUT A METER IS SUMMARIZED AS IT ALWAYS WAS. These goldens were
+// written by power-summary.sh before it read a meter column, and are compared
+// byte for byte with the exit status.
+func TestThePowerSummaryWithoutAMeterIsUnchanged(t *testing.T) {
+	t.Parallel()
+	turbostat := filepath.Join(t.TempDir(), "turbostat.csv")
+	if err := os.WriteFile(turbostat, []byte("epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances\n"+
+		"1,10.00,0,,,,\n2,11.00,73500000,73500000,140,73.10,\n3,12.00,,,141,,\n4,13.50,300000000,226500000,,150.25,billet-a\n"+
+		"5,14.50,400000000,100000000,160,99.5,billet-a\n6,15.50,500000000,100000000,161,100.5,\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A package that drew nothing over the BMC's rows: main prints its ratio as
+	// 0.000, and so does this.
+	zero := filepath.Join(t.TempDir(), "zero.csv")
+	if err := os.WriteFile(zero, []byte("epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances\n"+
+		"1,10.00,0,,150,,\n2,11.00,0,0,151,,\n3,12.00,0,0,152,,\n4,13.00,0,0,153,,\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		golden string
+		args   []string
+		code   int
+	}{
+		{"zero-rapl.txt", []string{zero}, 0},
+		{"reference.txt", []string{"--require-bmc", powerLogFixture}, 0},
+		{"reference-window.txt", []string{"--from", "1791540010", "--to", "1791540025", powerLogFixture}, 0},
+		{"turbostat.txt", []string{turbostat}, 0},
+		{"one-bmc-reading.txt", []string{"--require-bmc", "--to", "3", turbostat}, 0},
+	} {
+		out, code := runSummary(t, tc.args...)
+		if code != tc.code {
+			t.Errorf("%s: exit %d, want %d:\n%s", tc.golden, code, tc.code, out)
+		}
+		golden := filepath.Join("testdata", "power-summary", tc.golden)
+		if os.Getenv("BILLET_UPDATE_FIXTURES") == "1" {
+			if err := os.WriteFile(golden, []byte(out), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		want, err := os.ReadFile(golden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != string(want) {
+			t.Errorf("the summary:\n%s\nwant %s:\n%s", out, golden, want)
+		}
+	}
+}
+
+// meterAnswer is what the fake meter does on one sample, and the two cells the
+// log must hold for it.
+type meterAnswer struct{ shell, watts, wh string }
+
+func (h powerHarness) plantMeter(t *testing.T, answers []meterAnswer) {
+	t.Helper()
+	var b strings.Builder
+	for _, a := range answers {
+		b.WriteString(a.shell + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(h.state, "meter-answers"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// THE METER IS A READING OR AN EMPTY CELL, NEVER A GUESS: an answer is one line
+// of a decimal watts and an optional decimal watt-hour counter, and anything
+// else the command does leaves both cells empty. The seven columns before them
+// are what the log holds without a meter.
+func TestTheMeterIsAReadingOrAnEmptyCell(t *testing.T) {
+	t.Parallel()
+	answers := []meterAnswer{
+		{`echo 133.5 1000.000`, "133.5", "1000.000"},
+		{`echo 134`, "134", ""},
+		{`echo 135.25 1000.100; exit 1`, "", ""},
+		{`echo 0`, "0", ""},
+		{`echo abc`, "", ""},
+		{`echo -5`, "", ""},
+		{`printf '136\n137\n'`, "", ""},
+		{`echo 136 1000.2 extra`, "", ""},
+		{`printf '136\0'`, "", ""},
+		{`echo 1e3`, "", ""},
+		{`echo 1.1234567`, "", ""},
+		{`echo 136 1e3`, "", ""},
+		{`printf '136\r\n'`, "", ""},
+		{`:`, "", ""},
+		{`printf '%120s137\n' ''`, "137", ""},
+		{`printf '%130s137\n' ''`, "", ""},
+		{`printf '137.5'`, "137.5", ""},
+		{`printf ' 138\t1000.5 \n'`, "138", "1000.5"},
+		{`echo 999999.999999 1000.75`, "999999.999999", "1000.75"},
+		{`echo 1000000`, "", ""},
+		{`echo 139 1000.1234567`, "", ""},
+		{`echo 139 .5`, "", ""},
+		{`echo 139.`, "", ""},
+		{`echo 139 1000000000`, "", ""},
+		{`echo 139 999999999.999999`, "139", "999999999.999999"},
+		// THE LOG'S DESCRIPTOR IS NOT THE METER'S to write rows into.
+		{`echo 0,0,0 >&3; echo 141`, "141", ""},
+		// NO FILE THE METER WRITES GROWS PAST 64 KiB: the subshell writing
+		// 100000 bytes is stopped there, and the meter still answers. It ignores
+		// SIGXFSZ, which macOS's crash reporter takes seconds over, and sees the
+		// write fail instead.
+		{`(trap '' XFSZ; printf '%100000s' '' >"$FAKE_STATE/big") 2>/dev/null; echo 150`, "150", ""},
+		{`echo 140 1000.9`, "140", "1000.9"},
+	}
+	h := newPowerHarness(t, "sleep", "date", "timeout", "meter")
+	steps := referenceLog()[:len(answers)]
+	h.plant(t, steps)
+	h.plantMeter(t, answers)
+	out := filepath.Join(t.TempDir(), "power.csv")
+	summary, err := h.run(t, "--out", out, "--seconds", strconv.Itoa(len(steps)), "--ipmitool", "none",
+		"--turbostat", "none", "--meter", "meter")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, summary)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := wantLog(steps, false)
+	want[0] += ",meter_watts,meter_wh"
+	used, skipped := 0, 0
+	for i, a := range answers {
+		want[i+1] += "," + a.watts + "," + a.wh
+		switch {
+		case i == 0:
+		case a.watts == "":
+			skipped++
+		default:
+			used++
+		}
+	}
+	if got := strings.TrimSuffix(string(written), "\n"); got != strings.Join(want, "\n") {
+		t.Errorf("the log:\n%s\nwant:\n%s", got, strings.Join(want, "\n"))
+	}
+	if big, err := os.Stat(filepath.Join(h.state, "big")); err != nil || big.Size() != 64<<10 {
+		t.Errorf("the meter's 100000-byte file: %v, want it stopped at 64 KiB (stat: %v)", big, err)
+	}
+	// THE LOGGER'S OWN SUMMARY READS THE METER, and the counter's reset on the
+	// last row sends the energy to the integrated watts.
+	for _, line := range []string{
+		fmt.Sprintf("meter fit: %d rows used, %d skipped for an empty meter cell, 0 for no RAPL interval", used, skipped),
+		fmt.Sprintf("its counter went backwards at epoch %d, a reset", steps[len(steps)-1].epoch),
+	} {
+		if !strings.Contains(summary, line) {
+			t.Errorf("the summary does not say %q:\n%s", line, summary)
+		}
+	}
+}
+
+// A METER THAT DOES NOT ANSWER IN TIME NEVER HOLDS THE LOG: one that sleeps,
+// one that ignores SIGTERM, and one whose child keeps its stdout open each
+// leave the log moving, and the late ones leave empty cells. The child writes
+// once the next sample's meter has started, and that meter answers once it has,
+// so the write lands in the next answer were it the same file.
+func TestASlowMeterNeverHoldsTheLog(t *testing.T) {
+	t.Parallel()
+	// GNU TIMEOUT IS THE BOUND, and macOS's coreutils timeout has disagreed with
+	// itself about exit statuses inside a script (guest_image_psmodule_test.go),
+	// so this runs where the logger runs.
+	if runtime.GOOS != "linux" {
+		t.Skip("this asserts GNU timeout's bound under Linux process behaviour")
+	}
+	gnuTimeout, err := exec.LookPath("timeout")
+	if err != nil {
+		t.Skip("no timeout on PATH")
+	}
+	if version, err := exec.CommandContext(t.Context(), gnuTimeout, "--version").Output(); err != nil ||
+		!strings.Contains(string(version), "GNU coreutils") {
+		t.Skip("no GNU timeout on PATH")
+	}
+	h := newPowerHarness(t, "sleep", "date", "meter")
+	if err := os.Symlink(gnuTimeout, filepath.Join(h.bin, "timeout")); err != nil {
+		t.Fatal(err)
+	}
+	// NOTHING A METER STARTS OUTLIVES THE TEST, whether the run passed or a broken
+	// bound left a meter running. A process is this test's when its environment
+	// names this test's own FAKE_STATE, which no other process can, so a reused
+	// pid or group is never signalled. The logger's own group is killed at the
+	// deadline below.
+	t.Cleanup(func() {
+		mine := []byte("\x00FAKE_STATE=" + h.state + "\x00")
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			t.Logf("read /proc: %v", err)
+			return
+		}
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil {
+				continue
+			}
+			env, err := os.ReadFile("/proc/" + e.Name() + "/environ")
+			if err != nil || !bytes.Contains(append([]byte{0}, env...), mine) {
+				continue
+			}
+			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				t.Logf("kill %d: %v", pid, err)
+			}
+		}
+	})
+	answers := []meterAnswer{
+		{`/bin/sleep 30; echo 140`, "", ""},
+		{`trap '' TERM; /bin/sleep 30; echo 141`, "", ""},
+		{`(until [ -e "$FAKE_STATE/fourth" ]; do /bin/sleep 0.05; done; ` +
+			`echo a late answer; : >"$FAKE_STATE/written"; exec /bin/sleep 30) & echo 142`, "142", ""},
+		{`: >"$FAKE_STATE/fourth"; until [ -e "$FAKE_STATE/written" ]; do /bin/sleep 0.05; done; echo 143 2000`,
+			"143", "2000"},
+	}
+	steps := referenceLog()[:len(answers)]
+	h.plant(t, steps)
+	h.plantMeter(t, answers)
+	out := filepath.Join(t.TempDir(), "power.csv")
+	// THE DEADLINE IS PAST WHAT A BOUNDED RUN TAKES (2 s, 3 s and two quick samples)
+	// and short of what any one unbounded meter holds it for (30 s).
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(h.bin, "bash"), "power-log.sh", "--powercap",
+		filepath.Join(h.state, "powercap"), "--proc", filepath.Join(h.state, "proc"), "--cgroup",
+		filepath.Join(h.state, "cgroup"), "--out", out, "--seconds", strconv.Itoa(len(steps)), "--ipmitool", "none",
+		"--turbostat", "none", "--meter", "meter", "--meter-timeout", "2")
+	cmd.Env = []string{"PATH=" + h.bin, "HOME=" + t.TempDir(), "TMPDIR=" + t.TempDir(), "FAKE_STATE=" + h.state}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
+	var text bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &text, &text
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("the log did not finish inside 20 s (%v; context %v):\n%s", err, ctx.Err(), text.String())
+	}
+	var cells []string
+	for _, row := range csvRows(t, out)[1:] {
+		cells = append(cells, row[7]+"/"+row[8])
+	}
+	var wantCells []string
+	for _, a := range answers {
+		wantCells = append(wantCells, a.watts+"/"+a.wh)
+	}
+	if got, want := strings.Join(cells, " "), strings.Join(wantCells, " "); got != want {
+		t.Errorf("meter cells %q, want %q", got, want)
+	}
+}
+
+// THE SUMMARY FITS THE WALL AS IT FITS THE BMC, says what the fit used, and
+// takes the meter's energy from its counter when the counter can be trusted.
+func TestThePowerSummaryFitsTheWall(t *testing.T) {
+	t.Parallel()
+	// The wall is 60 W + 1.1 x RAPL on every row holding both; row 4 has no RAPL
+	// interval, row 5 no meter reading, and row 6's interval is two seconds.
+	rows := [][3]string{
+		{"1,10.00,0,", "150.0", "1000.000"},
+		{"2,11.00,0,100000000", "170", "1000.050"},
+		{"3,12.00,0,200000000", "280", "1000.100"},
+		{"4,13.00,,", "250", ""},
+		{"5,14.00,0,150000000", "", "1000.200"},
+		{"6,16.00,0,300000000", "225", "1000.300"},
+		{"7,17.00,0,50000000", "115", "1000.350"},
+	}
+	write := func(name string, cell func(i int, r [3]string) [3]string, meterWH bool) string {
+		var b strings.Builder
+		b.WriteString("epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances,meter_watts")
+		if meterWH {
+			b.WriteString(",meter_wh")
+		}
+		b.WriteString("\n")
+		for i, r := range rows {
+			if cell != nil {
+				r = cell(i, r)
+			}
+			b.WriteString(r[0] + ",,,," + r[1])
+			if meterWH {
+				b.WriteString("," + r[2])
+			}
+			b.WriteString("\n")
+		}
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	const fit = "meter: 4 paired readings, mean 197.5 W against RAPL 125.0 W over the same rows\n" +
+		"meter/RAPL ratio 1.580, offset 72.5 W\n" +
+		"fit: meter = 60.0 W + 1.100 x RAPL, r^2 1.000\n" +
+		"meter fit: 4 rows used, 1 skipped for an empty meter cell, 1 for no RAPL interval\n"
+	// Integrated: 170 + 280 + 250 + 225 x 2 + 115 J over the six intervals but row 5's.
+	const integrated = "meter energy: 1.3 kJ over 6.0 s of the 7.0 s of intervals in the window, integrated from " +
+		"its watts (5 of 6 intervals had a reading); "
+	for _, tc := range []struct {
+		name    string
+		cell    func(int, [3]string) [3]string
+		meterWH bool
+		args    []string
+		code    int
+		says    []string
+	}{
+		{"a counter", nil, true, nil, 0, []string{fit,
+			"meter energy: 1.3 kJ (0.350 Wh) over 7.0 s, from its cumulative counter (epoch 1 to 7)\n"}},
+		{"no counter column", nil, false, nil, 0, []string{fit, integrated + "it gave no cumulative counter\n"}},
+		{"no counter reading", func(_ int, r [3]string) [3]string { r[2] = ""; return r }, true, nil, 0,
+			[]string{integrated + "it gave no cumulative counter\n"}},
+		{"a reset counter", func(i int, r [3]string) [3]string {
+			if i == 5 {
+				r[2] = "0.100"
+			}
+			return r
+		}, true, nil, 0, []string{integrated + "its counter went backwards at epoch 6, a reset\n"}},
+		{"one counter reading", func(i int, r [3]string) [3]string {
+			if i != 2 {
+				r[2] = ""
+			}
+			return r
+		}, true, nil, 0, []string{integrated + "its counter has no two readings an interval apart\n"}},
+		// A RESET IS SEEN ON A ROW WITH NO UPTIME, which can be no end of a span
+		// but is still a reading lower than the one before it.
+		{"a reset on a row with no uptime", func(i int, r [3]string) [3]string {
+			if i == 3 {
+				r[0], r[2] = "4,,,", "0.050"
+			}
+			return r
+		}, true, nil, 0, []string{"its counter went backwards at epoch 4, a reset\n"}},
+		// A RATIO OVER NO RAPL POWER IS NO RATIO, not zero.
+		{"RAPL that drew nothing", func(_ int, r [3]string) [3]string {
+			f := strings.Split(r[0], ",")
+			if f[3] != "" {
+				f[3] = "0"
+			}
+			r[0] = strings.Join(f, ",")
+			return r
+		}, true, nil, 0, []string{"meter/RAPL ratio n/a (RAPL drew nothing), offset 197.5 W\n"}},
+		// THE METER'S OWN FIGURES DO NOT NEED RAPL: a log with no RAPL interval
+		// still says what the meter answered, and is could-not-tell.
+		{"no RAPL at all", func(_ int, r [3]string) [3]string {
+			f := strings.Split(r[0], ",")
+			f[3] = ""
+			r[0] = strings.Join(f, ",")
+			return r
+		}, true, nil, 3, []string{"RAPL: no interval could be measured (could not tell)\n" +
+			"meter: no reading paired with RAPL (could not tell)\n" +
+			"meter fit: 0 rows used, 0 skipped for an empty meter cell, 6 for no RAPL interval\n" +
+			"meter energy: 1.3 kJ (0.350 Wh) over 7.0 s, from its cumulative counter (epoch 1 to 7)\n"}},
+		// A COUNTER READING ON A ROW WITH NO UPTIME has no time to span.
+		{"a counter reading with no uptime", func(i int, r [3]string) [3]string {
+			if i == 6 {
+				r[0] = "7,,0,50000000"
+			}
+			return r
+		}, true, nil, 0, []string{"meter energy: 1.1 kJ (0.300 Wh) over 6.0 s, from its cumulative counter (epoch 1 to 6)\n"}},
+		{"a window", nil, true, []string{"--from", "3", "--to", "6"}, 0, []string{
+			"fit: n/a (fewer than three readings, or no variation)\n" +
+				"meter fit: 2 rows used, 1 skipped for an empty meter cell, 1 for no RAPL interval\n",
+			"meter energy: 0.7 kJ (0.200 Wh) over 4.0 s, from its cumulative counter (epoch 3 to 6)\n"}},
+		{"a meter that never answered", func(_ int, r [3]string) [3]string { r[1], r[2] = "", ""; return r }, true,
+			nil, 3, []string{"meter: no reading paired with RAPL (could not tell)\n" +
+				"meter fit: 0 rows used, 5 skipped for an empty meter cell, 1 for no RAPL interval\n" +
+				"meter energy: could not tell; no interval has a meter reading, and it gave no cumulative counter\n"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out, code := runSummary(t, append(tc.args, write("power.csv", tc.cell, tc.meterWH))...)
+			if code != tc.code {
+				t.Errorf("exit %d, want %d:\n%s", code, tc.code, out)
+			}
+			for _, s := range tc.says {
+				if !strings.Contains(out, s) {
+					t.Errorf("the summary does not say %q:\n%s", s, out)
+				}
 			}
 		})
 	}

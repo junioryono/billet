@@ -854,6 +854,10 @@ IMAGEINFO
 		"$rootfs/usr/local/bin/billet-dns-upstreams"
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/exec-env.sh" \
 		"$rootfs/usr/local/bin/billet-exec-env"
+	# THE RUNNER'S JOB-COMPLETED HOOK, named only where the agent started the guest
+	# monitor: it asks the monitor for its final batch before the job is recorded.
+	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/job-completed-hook.sh" \
+		"$rootfs/usr/local/lib/billet/job-completed-hook.sh"
 	# THE DOCKER SHIM SITS AHEAD OF THE REAL CLIENT on the job's PATH and points a
 	# build's BuildKit cache client at the adapter, which is what lets a workflow
 	# that changed only `runs-on` export `type=gha` from a container-driver
@@ -1091,6 +1095,42 @@ else
 	cache_token=""
 	buildkit_cache_mount_limit_bytes=""
 fi
+
+# BILLET IN THE GUEST AND THE HELPER THAT LAUNCHES WITH AN ENVIRONMENT FROM
+# DESCRIPTOR 3. Defaulted variables, so a test executes the blocks that use them
+# against fixtures.
+GUEST_BILLET="${GUEST_BILLET:-/opt/billet/bin/billet}"
+EXEC_ENV="${EXEC_ENV:-/usr/local/bin/billet-exec-env}"
+
+# THE GUEST MONITOR, `billet guest monitor`, only when the node asks for it with
+# the optional key guest-monitor and gave this guest a cache session to report
+# over. It runs as root, from here until the runner has exited, and reports the
+# guest's own view to the node, which acts on none of it. The endpoint and the
+# bearer reach it as its whole environment on descriptor 3, never in an argument
+# list (#352), and it is started before the registration is exported, which it
+# never needs. Its output goes where this agent's does, the guest's journal and
+# never the job's log. Nothing it does reaches the job's result: the agent never
+# reads its status, and a monitor that does not start is a job with no report.
+# The endpoint is the node's own address; the relay below is the runner's.
+# BILLET_GUEST_MONITOR_START_BEGIN
+guest_monitor_pid=""
+if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -x "$GUEST_BILLET" ] &&
+	guest_monitor=$(fetch guest-monitor 2>/dev/null) && [ "$guest_monitor" = 1 ]; then
+	# A NEWLINE WOULD MAKE A SECOND VARIABLE of what follows it in the stream.
+	if [[ "$cache_endpoint$cache_token" == *$'\n'* ]]; then
+		log "the cache endpoint or bearer holds a newline, so the guest monitor is not started"
+	else
+		env -i "$EXEC_ENV" "$GUEST_BILLET" guest monitor --junit-root /home/runner/runner/_work \
+			</dev/null 3<<BILLET_MONITOR_ENV &
+BILLET_CACHE_ENDPOINT=$cache_endpoint
+BILLET_CACHE_TOKEN=$cache_token
+end
+BILLET_MONITOR_ENV
+		guest_monitor_pid=$!
+		log "started the guest monitor"
+	fi
+fi
+# BILLET_GUEST_MONITOR_START_END
 
 # THE BUILD CACHES THE TIER ENABLES, a comma-separated list the node derives from
 # the tier's cache block. Absent on an older node, and meaningless without a cache
@@ -1679,7 +1719,6 @@ fi
 # carries billet to serve it; an image without the binary builds cold rather than
 # naming a GOCACHEPROG the go command cannot start, which fails every build. The
 # seams are defaulted variables so a test executes this block against fixtures.
-GUEST_BILLET="${GUEST_BILLET:-/opt/billet/bin/billet}"
 BAZELRC_FILE="${BAZELRC_FILE:-/etc/bazel.bazelrc}"
 GITCONFIG_FILE="${GITCONFIG_FILE:-/etc/gitconfig}"
 # BILLET_GUEST_CACHES_BEGIN
@@ -1776,6 +1815,17 @@ if { [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actio
 	[ -n "$guest_go" ]; then
 	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
 fi
+# THE JOB-COMPLETED HOOK ASKS THE GUEST MONITOR FOR ITS FINAL BATCH, only where
+# one was started. The runner runs it after the job's last step and before GitHub
+# records the job complete, so the batch reaches the node before the destroy is
+# sent; SIGTERM after the runner exits is the second path. The hook waits a
+# bounded time and always exits 0, and an image without it names no hook.
+# BILLET_GUEST_MONITOR_HOOK_BEGIN
+GUEST_MONITOR_HOOK="${GUEST_MONITOR_HOOK:-/usr/local/lib/billet/job-completed-hook.sh}"
+if [ -n "$guest_monitor_pid" ] && [ -x "$GUEST_MONITOR_HOOK" ]; then
+	runner_env+=("ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$GUEST_MONITOR_HOOK")
+fi
+# BILLET_GUEST_MONITOR_HOOK_END
 
 # THE ENVIRONMENT CROSSES ON DESCRIPTOR 3, NEVER IN AN ARGUMENT LIST (#352). It
 # carries the registration and the cache bearer, and setpriv's and env's argv are
@@ -1784,9 +1834,8 @@ fi
 # is a builtin, so no process on the way to the runner carries a value in argv.
 # A value holding a newline cannot travel one line per variable, so it refuses
 # the launch, naming the variable and never the value, and the steps below run
-# as for a failed job. The path is a defaulted variable so a test executes this
-# stanza against the real helper.
-EXEC_ENV="${EXEC_ENV:-/usr/local/bin/billet-exec-env}"
+# as for a failed job. EXEC_ENV is a defaulted variable, set above, so a test
+# executes this stanza against the real helper.
 set +e
 # BILLET_AGENT_LAUNCH_BEGIN
 launch_refused=""
@@ -1814,6 +1863,47 @@ BILLET_RUNNER_ENV
 fi
 # BILLET_AGENT_LAUNCH_END
 set -e
+
+# THE MONITOR IS STOPPED ONCE THE RUNNER HAS EXITED, before the image store is
+# settled: SIGTERM asks for its final batch (a no-op if the hook already took
+# it), and it owes an exit within 3 s (measured 2026-10-11 in a real job: 141 ms).
+# It is waited for that long and no longer, then killed, and nothing here touches
+# job_status or can end the agent.
+#
+# SIGNALLED ONLY WHILE THIS SHELL STILL HOLDS IT AS A RUNNING JOB. bash reaps an
+# exited child as soon as it exits, and from then on its pid is the kernel's to
+# give to another process, which this agent, running as root, would kill. A
+# child bash has not reaped is alive or a zombie, and either way the pid is still
+# its own. A listing that could not be read is not proof, and signals nothing.
+# BILLET_GUEST_MONITOR_STOP_BEGIN
+guest_monitor_running() {
+	local running
+	running=$(jobs -rp) || return 1
+	[[ $'\n'"$running"$'\n' == *$'\n'"$guest_monitor_pid"$'\n'* ]]
+}
+if [ -n "$guest_monitor_pid" ] && guest_monitor_running; then
+	kill -s TERM "$guest_monitor_pid" 2>/dev/null || true
+	# MICROSECONDS, so the wait is 3 s and not "until the clock's second turns".
+	# The count, about five seconds of polls, bounds it on a shell with no
+	# EPOCHREALTIME, where the clock reads 0.
+	guest_monitor_now=${EPOCHREALTIME:-0}
+	guest_monitor_deadline=$((${guest_monitor_now//[!0-9]/} + 3000000))
+	guest_monitor_polls=0
+	while [ "$guest_monitor_polls" -lt 100 ] && guest_monitor_running; do
+		guest_monitor_now=${EPOCHREALTIME:-0}
+		if [ "${guest_monitor_now//[!0-9]/}" -ge "$guest_monitor_deadline" ]; then
+			break
+		fi
+		# A SLEEP THAT FAILED ENDS THE WAIT, not the agent: set -e is back on here.
+		sleep 0.05 || break
+		guest_monitor_polls=$((guest_monitor_polls + 1))
+	done
+	if guest_monitor_running; then
+		log "the guest monitor did not exit within 3 s of SIGTERM; killing it"
+		kill -s KILL "$guest_monitor_pid" 2>/dev/null || true
+	fi
+fi
+# BILLET_GUEST_MONITOR_STOP_END
 
 # Stop the socket too, or a late connection would re-activate the service.
 systemctl stop billet-actions-proxy.socket billet-actions-proxy.service 2>/dev/null || true

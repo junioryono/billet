@@ -147,11 +147,16 @@ func runEnergy(args []string, stdout, stderr io.Writer) (int, error) {
 	if *logPath == "" || *recDir == "" || !finite || *quiet < 1 || fs.NArg() != 0 {
 		return 0, errors.New("usage: knownanswer energy --power-log CSV --records DIR --idle-watts W [--quiet-rows N]")
 	}
-	rows, err := readPowerLog(*logPath)
+	log, err := readPowerLog(*logPath)
 	if err != nil {
 		return 0, err
 	}
-	res := reconcile(rows, *idleWatts, *quiet, records(*recDir))
+	res := reconcile(log.rows, *idleWatts, *quiet, records(*recDir))
+	// THE WALL IS REPORTED BESIDE THE VERDICT, NEVER IN IT: no tolerance between
+	// the package and the whole server has been measured.
+	if log.meter {
+		res.wall = wallReference(log.rows, res)
+	}
 	res.write(stdout)
 
 	return verdictCode(worst(res.verdict, res.idleVerdict)), nil
@@ -181,9 +186,11 @@ func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) (i
 		}
 	}
 	if *logPath != "" {
-		if rows, err = readPowerLog(*logPath); err != nil {
+		log, err := readPowerLog(*logPath)
+		if err != nil {
 			return 0, err
 		}
+		rows = log.rows
 	}
 	leases := collectLeases(exps, rows)
 	if len(leases) == 0 {

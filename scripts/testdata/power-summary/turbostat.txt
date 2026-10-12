@@ -1,0 +1,6 @@
+rows 6 (epoch 1 to 6), RAPL intervals 4, gaps 1
+RAPL package: 0.5 kJ over 4.5 s, mean 111.1 W
+BMC: 3 paired readings, mean 153.7 W against RAPL 91.2 W over the same rows
+BMC/RAPL ratio 1.686, offset 62.5 W
+fit: BMC = 83.1 W + 0.774 x RAPL, r^2 0.998
+turbostat: 4 paired readings, mean PkgWatt 105.8 W against RAPL 106.1 W, ratio 0.997

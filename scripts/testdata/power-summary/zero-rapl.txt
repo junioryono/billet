@@ -1,0 +1,6 @@
+rows 4 (epoch 1 to 4), RAPL intervals 3, gaps 0
+RAPL package: 0.0 kJ over 3.0 s, mean 0.0 W
+BMC: 3 paired readings, mean 152.0 W against RAPL 0.0 W over the same rows
+BMC/RAPL ratio 0.000, offset 152.0 W
+fit: n/a (fewer than three readings, or no variation)
+turbostat: no reading paired with RAPL

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,20 +25,36 @@ type powerRow struct {
 	// inventoryOK is false where the logger could not read the cgroups, which
 	// is not the same as finding no microVM.
 	inventoryOK bool
+	// meterW is the wall meter's watts on this row, standing for the interval
+	// ending at it as a RAPL delta does; meterOK is false where the cell is
+	// empty.
+	meterW  float64
+	meterOK bool
 }
+
+// powerLog is a power log's rows, and whether it was written with a wall meter.
+type powerLog struct {
+	rows  []powerRow
+	meter bool
+}
+
+// meterWatts is the one spelling power-log.sh logs a wall reading in. ParseFloat
+// alone would also read 1e3, +100, .5, 0x1p3 and NaN, which the logger never
+// writes and the summary does not read as a reading.
+var meterWatts = regexp.MustCompile(`^\d{1,6}(\.\d{1,6})?$`)
 
 // readPowerLog reads the CSV by its header's names, so a column added later
 // does not move the ones read here.
-func readPowerLog(path string) ([]powerRow, error) {
+func readPowerLog(path string) (powerLog, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return powerLog{}, err
 	}
 	defer f.Close()
 	r := csv.NewReader(f)
 	header, err := r.Read()
 	if err != nil {
-		return nil, fmt.Errorf("%s: read the header: %w", path, err)
+		return powerLog{}, fmt.Errorf("%s: read the header: %w", path, err)
 	}
 	col := map[string]int{}
 	for i, name := range header {
@@ -45,9 +62,10 @@ func readPowerLog(path string) ([]powerRow, error) {
 	}
 	for _, name := range []string{"epoch_s", "uptime_s", "rapl_delta_uj", "instances"} {
 		if _, ok := col[name]; !ok {
-			return nil, fmt.Errorf("%s: no %s column", path, name)
+			return powerLog{}, fmt.Errorf("%s: no %s column", path, name)
 		}
 	}
+	meterCol, meter := col["meter_watts"]
 	var rows []powerRow
 	for line := 2; ; line++ {
 		rec, err := r.Read()
@@ -55,17 +73,17 @@ func readPowerLog(path string) ([]powerRow, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			return powerLog{}, fmt.Errorf("%s: %w", path, err)
 		}
 		var row powerRow
 		if row.epoch, err = strconv.ParseInt(rec[col["epoch_s"]], 10, 64); err != nil {
-			return nil, fmt.Errorf("%s line %d: epoch_s: %w", path, line, err)
+			return powerLog{}, fmt.Errorf("%s line %d: epoch_s: %w", path, line, err)
 		}
 		if s := rec[col["uptime_s"]]; s != "" {
 			// ParseFloat ACCEPTS NaN AND Inf, which compare false with everything and
 			// would let an interval through every bound.
 			if row.uptime, err = strconv.ParseFloat(s, 64); err != nil || math.IsNaN(row.uptime) || math.IsInf(row.uptime, 0) {
-				return nil, fmt.Errorf("%s line %d: uptime_s %q is not a time", path, line, s)
+				return powerLog{}, fmt.Errorf("%s line %d: uptime_s %q is not a time", path, line, s)
 			}
 			row.uptimeOK = true
 		}
@@ -73,9 +91,19 @@ func readPowerLog(path string) ([]powerRow, error) {
 			// BOUNDED, so no sum of a log's rows can wrap: a megajoule in one row is
 			// ten thousand seconds at a kilowatt, past any interval the logger keeps.
 			if row.delta, err = strconv.ParseInt(s, 10, 64); err != nil || row.delta < 0 || row.delta > maxRowDelta {
-				return nil, fmt.Errorf("%s line %d: rapl_delta_uj %q is not an energy", path, line, s)
+				return powerLog{}, fmt.Errorf("%s line %d: rapl_delta_uj %q is not an energy", path, line, s)
 			}
 			row.deltaOK = true
+		}
+		if meter && rec[meterCol] != "" {
+			s := rec[meterCol]
+			if !meterWatts.MatchString(s) {
+				return powerLog{}, fmt.Errorf("%s line %d: meter_watts %q is not a power", path, line, s)
+			}
+			if row.meterW, err = strconv.ParseFloat(s, 64); err != nil {
+				return powerLog{}, fmt.Errorf("%s line %d: meter_watts %q is not a power", path, line, s)
+			}
+			row.meterOK = true
 		}
 		switch s := rec[col["instances"]]; s {
 		case "?":
@@ -88,7 +116,7 @@ func readPowerLog(path string) ([]powerRow, error) {
 		rows = append(rows, row)
 	}
 
-	return rows, nil
+	return powerLog{rows: rows, meter: meter}, nil
 }
 
 // energyLimits are the reconciliation's stated tolerances
@@ -150,6 +178,119 @@ type energyResult struct {
 	attributed, attributedIdle float64
 	ratio                      float64
 	jobs                       []energyJob
+	// wall is the wall meter's view of the window, nil for a log without one.
+	wall *wallResult
+}
+
+// wallResult relates the package's energy above its baseline to a wall
+// meter's above the wall's own idle. It has no verdict: the wall measures the
+// whole server, and no tolerance between the two has been measured.
+type wallResult struct {
+	// reason says why the wall could not be compared; empty when it was.
+	reason string
+	// idleBefore and idleAfter are the quiet ends' mean wall power, and idle the
+	// mean over both, each over the quiet intervals that have a reading.
+	idleBefore, idleAfter     float64
+	idleBeforeOK, idleAfterOK bool
+	idle                      float64
+	quietRead, quietIntervals int
+	// above is the wall's energy above idle over the intervals a microVM was
+	// alive for, in µJ; rapl is the package's over the same intervals above
+	// idle_package_watts, unclipped because the wall is not clipped either.
+	above, rapl float64
+}
+
+// wallReference reads the wall meter over the window reconcile measured, or
+// says why it cannot.
+func wallReference(rows []powerRow, res energyResult) *wallResult {
+	w := &wallResult{}
+	if res.seconds <= 0 || res.busySeconds <= 0 {
+		w.reason = "the window has no interval a microVM was alive for to compare"
+
+		return w
+	}
+	// THE WALL HAS NO CONFIGURED IDLE, so its idle is what the quiet ends drew.
+	quiet := func(from, to int) (float64, float64) {
+		var uj, seconds float64
+		for i := max(from, 1); i < to; i++ {
+			w.quietIntervals++
+			if !rows[i].meterOK {
+				continue
+			}
+			w.quietRead++
+			dt := rows[i].uptime - rows[i-1].uptime
+			uj += rows[i].meterW * dt * 1e6
+			seconds += dt
+		}
+
+		return uj, seconds
+	}
+	beforeUJ, beforeS := quiet(1, firstBusy(rows))
+	afterUJ, afterS := quiet(lastBusy(rows)+2, len(rows))
+	if beforeS > 0 {
+		w.idleBefore, w.idleBeforeOK = beforeUJ/1e6/beforeS, true
+	}
+	if afterS > 0 {
+		w.idleAfter, w.idleAfterOK = afterUJ/1e6/afterS, true
+	}
+	if beforeS+afterS <= 0 {
+		w.reason = "no quiet interval has a meter reading, so the wall's idle is not known"
+
+		return w
+	}
+	w.idle = (beforeUJ + afterUJ) / 1e6 / (beforeS + afterS)
+	// EVERY INTERVAL A MICROVM WAS ALIVE FOR NEEDS A READING: the wall's energy
+	// over one it missed is not known, and is not its idle.
+	for i := 1; i < len(rows); i++ {
+		if len(rows[i].instances) == 0 && len(rows[i-1].instances) == 0 {
+			continue
+		}
+		if !rows[i].meterOK {
+			w.reason = fmt.Sprintf("row %d (epoch %d) ends an interval a microVM was alive for and has no meter "+
+				"reading, so the wall's energy over it is not known", i+1, rows[i].epoch)
+
+			return w
+		}
+		dt := rows[i].uptime - rows[i-1].uptime
+		w.above += (rows[i].meterW - w.idle) * dt * 1e6
+	}
+	w.rapl = res.activeMeasured - res.clipped
+
+	return w
+}
+
+// write reports the wall. attributedOK is false where some microVM's record
+// could not be used, so the jobs' attributed sum is not the window's.
+func (w *wallResult) write(out io.Writer, attributed float64, attributedOK bool) {
+	idle := func(v float64, ok bool) string {
+		if !ok {
+			return "not measured"
+		}
+		return fmt.Sprintf("%.1f W", v)
+	}
+	fmt.Fprintf(out, "wall meter: idle %s before, %s after (%d of %d quiet intervals read)\n",
+		idle(w.idleBefore, w.idleBeforeOK), idle(w.idleAfter, w.idleAfterOK), w.quietRead, w.quietIntervals)
+	if w.reason != "" {
+		fmt.Fprintf(out, "wall meter: could not tell; %s\n", w.reason)
+		return
+	}
+	jobs := "could not tell, a microVM's record could not be used"
+	if attributedOK {
+		jobs = kj(attributed)
+	}
+	fmt.Fprintf(out, "wall meter above its idle of %.1f W while a microVM was alive: %s; the package's RAPL above "+
+		"idle_package_watts over the same intervals, unclipped: %s; attributed to jobs: %s\n", w.idle, kj(w.above),
+		kj(w.rapl), jobs)
+	if w.above <= 0 {
+		fmt.Fprintln(out, "wall meter: no ratio; the wall drew nothing above its idle while a microVM was alive")
+		return
+	}
+	share := "could not tell"
+	if attributedOK {
+		share = fmt.Sprintf("%.3f", attributed/w.above)
+	}
+	fmt.Fprintf(out, "wall meter: RAPL/wall %.3f, attributed/wall %s (no verdict: the wall measures the whole "+
+		"server, and these say how much of its rise the package and the jobs account for)\n", w.rapl/w.above, share)
 }
 
 // reconcile compares the jobs' attributed energy with the package's energy
@@ -457,6 +598,13 @@ func (res energyResult) write(w io.Writer) {
 			kj(res.idlePool))
 	} else {
 		fmt.Fprintf(w, "reconciliation: %s\n", res.reason)
+	}
+	if res.wall != nil {
+		complete := true
+		for _, j := range res.jobs {
+			complete = complete && j.problem == ""
+		}
+		res.wall.write(w, res.attributed, complete)
 	}
 	fmt.Fprintf(w, "\noverall %s\n", worst(res.verdict, res.idleVerdict))
 }

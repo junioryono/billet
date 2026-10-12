@@ -3,6 +3,7 @@
 #
 #   sudo scripts/power-log.sh --out power.csv [--seconds N] [--interval S]
 #        [--ipmitool PATH|none] [--turbostat PATH|none] [--require-bmc]
+#        [--meter CMD] [--meter-timeout S]
 #        [--powercap DIR] [--proc DIR] [--cgroup DIR]
 #
 # WHAT IT WRITES. A CSV with one row per sample:
@@ -28,6 +29,21 @@
 # its power reading deactivated leaves bmc_watts empty; a sample turbostat
 # printed nothing new for leaves turbostat_pkg_watts empty.
 #
+# A WALL METER, with --meter CMD: each sample runs CMD with `bash -c`, bounded
+# by --meter-timeout seconds (default 1) and a second more for a meter that
+# ignores SIGTERM, and two columns follow instances:
+#
+#   ...,instances,meter_watts,meter_wh
+#
+# CMD prints one line: the watts at the wall, and optionally the meter's
+# cumulative energy counter in watt-hours after a space ("152.4" or
+# "152.4 8812.031"), plain decimals, at most 999999 W and 999999999 Wh. A
+# meter that exits non-zero, does not answer inside the bound, or prints anything
+# else leaves both cells empty, never zero; one with no counter leaves meter_wh
+# empty. The meter is asked after the RAPL counter and before the BMC, and no
+# file it or its children write can grow past 64 KiB. Without --meter the
+# columns are the seven above and nothing else.
+#
 # It stops after --seconds samples, or on SIGINT or SIGTERM, and then prints
 # scripts/power-summary.sh's comparison of the whole log.
 set -euo pipefail
@@ -46,6 +62,8 @@ require_bmc=0
 powercap=/sys/class/powercap/intel-rapl:0
 proc=/proc
 cgroup=/sys/fs/cgroup
+meter=
+meter_timeout=1
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--out) out=${2:?--out needs a path}; shift 2 ;;
@@ -57,12 +75,19 @@ while [ "$#" -gt 0 ]; do
 	--powercap) powercap=${2:?--powercap needs a directory}; shift 2 ;;
 	--proc) proc=${2:?--proc needs a directory}; shift 2 ;;
 	--cgroup) cgroup=${2:?--cgroup needs a directory}; shift 2 ;;
+	--meter) meter=${2:?--meter needs a command}; shift 2 ;;
+	--meter-timeout) meter_timeout=${2:?--meter-timeout needs seconds}; shift 2 ;;
 	*) die "unknown argument '$1'" ;;
 	esac
 done
 [ -n "$out" ] || die "--out is required"
 case "$samples" in '' | *[!0-9]*) die "--seconds must be a whole number, not '$samples'" ;; esac
 case "$interval" in '' | 0 | *[!0-9]*) die "--interval must be a positive whole number of seconds" ;; esac
+# timeout(1) reads a fraction, and a bound of zero is no bound at all: GNU
+# timeout runs the command without one.
+if ! [[ "$meter_timeout" =~ ^[0-9]{1,4}(\.[0-9]{1,3})?$ ]] || ! [[ "$meter_timeout" =~ [1-9] ]]; then
+	die "--meter-timeout must be a positive number of seconds, not '$meter_timeout'"
+fi
 # A LOG IS NEVER APPENDED TO: rows from an earlier session would read as one
 # window with an hour missing from its middle.
 [ ! -e "$out" ] || die "$out exists; a log is never appended to"
@@ -94,7 +119,12 @@ fi
 if [ "$require_bmc" -eq 1 ] && [ "$bmc" -eq 0 ]; then
 	die "--require-bmc and no ipmitool to ask"
 fi
-command -v timeout >/dev/null 2>&1 || die "timeout(1) is required to bound ipmitool"
+if ! command -v timeout >/dev/null 2>&1; then
+	if [ -n "$meter" ]; then
+		die "timeout(1) is required to bound ipmitool and the meter"
+	fi
+	die "timeout(1) is required to bound ipmitool"
+fi
 
 work=$(mktemp -d)
 ts_pid=
@@ -154,6 +184,47 @@ read_bmc() {
 	if [ "$active" -eq 1 ] && [ -n "$watts" ]; then
 		bmc_w=$watts
 	fi
+}
+
+# read_meter sets meter_w and meter_wh to what the meter command answered, or
+# empty.
+read_meter() {
+	meter_w=
+	meter_wh=
+	[ -n "$meter" ] || return 0
+	local answer= w= wh= rest=
+	# THE ANSWER GOES TO A FRESH FILE, NOT A PIPE: a command substitution waits
+	# for every writer to close it, so a meter that left a child holding its
+	# stdout would hold the log however the meter itself was bounded, and a child
+	# still writing after the bound writes to a file no later sample reads. The
+	# log's own descriptor is closed to it, and no one file it or a child left
+	# behind writes can grow past 64 KiB, so a child that never stops writing its
+	# answer cannot fill the disk.
+	rm -f "$work/meter"
+	if ! (
+		ulimit -f 64
+		exec timeout -k 1 "$meter_timeout" bash -c "$meter"
+	) >"$work/meter" 2>/dev/null </dev/null 3>&-; then
+		return 0
+	fi
+	# read SUCCEEDS ONLY ON WHAT IS NOT AN ANSWER: it stops with status 0 at a
+	# NUL, which a variable cannot hold and would cut the line short at, or at
+	# its 129th character; an answer read whole ends at the end of the file.
+	if IFS= read -r -d '' -n 129 answer <"$work/meter"; then
+		return 0
+	fi
+	answer=${answer%$'\n'}
+	case "$answer" in *$'\n'*) return 0 ;; esac
+	read -r w wh rest <<<"$answer"
+	[ -z "$rest" ] || return 0
+	[[ "$w" =~ ^[0-9]{1,6}(\.[0-9]{1,6})?$ ]] || return 0
+	# AT MOST FIFTEEN DIGITS, so two counter readings that differ are two
+	# different numbers to the summary's awk, and a reset is seen.
+	if [ -n "$wh" ] && ! [[ "$wh" =~ ^[0-9]{1,9}(\.[0-9]{1,6})?$ ]]; then
+		return 0
+	fi
+	meter_w=$w
+	meter_wh=$wh
 }
 
 # read_turbostat sets ts_w to the PkgWatt turbostat printed since the last
@@ -224,7 +295,11 @@ read_instances() {
 }
 
 exec 3>"$out"
-printf 'epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances\n' >&3
+header=epoch_s,uptime_s,rapl_uj,rapl_delta_uj,bmc_watts,turbostat_pkg_watts,instances
+if [ -n "$meter" ]; then
+	header+=,meter_watts,meter_wh
+fi
+printf '%s\n' "$header" >&3
 
 prev_uj=
 prev_cs=
@@ -245,6 +320,7 @@ while [ "$stop" -eq 0 ]; do
 	read_instances
 	read_turbostat
 	epoch=$(date +%s)
+	read_meter
 	read_bmc
 
 	delta=
@@ -260,7 +336,11 @@ while [ "$stop" -eq 0 ]; do
 	if [ -n "$up_cs" ]; then
 		uptime_text=$((up_cs / 100)).$(printf '%02d' $((up_cs % 100)))
 	fi
-	printf '%s,%s,%s,%s,%s,%s,%s\n' "$epoch" "$uptime_text" "$cur_uj" "$delta" "$bmc_w" "$ts_w" "$vms" >&3
+	row="$epoch,$uptime_text,$cur_uj,$delta,$bmc_w,$ts_w,$vms"
+	if [ -n "$meter" ]; then
+		row+=",$meter_w,$meter_wh"
+	fi
+	printf '%s\n' "$row" >&3
 
 	prev_uj=$cur_uj
 	prev_cs=$up_cs

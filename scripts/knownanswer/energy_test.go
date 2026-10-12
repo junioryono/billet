@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -30,10 +32,11 @@ func leaseA(activeJ, idleJ float64, f func(*usage)) map[string]record {
 }
 
 func TestTheJobsEnergyReconcilesWithThePackage(t *testing.T) {
-	rows, err := readPowerLog(referenceLog)
+	log, err := readPowerLog(referenceLog)
 	if err != nil {
 		t.Fatal(err)
 	}
+	rows := log.rows
 	res := reconcile(rows, 73.5, 10, fromMap(leaseA(1000, 40, nil)))
 	if res.verdict != pass || res.idleVerdict != pass {
 		t.Fatalf("verdict %s, idle %s: %s", res.verdict, res.idleVerdict, res.reason)
@@ -64,10 +67,11 @@ func TestTheJobsEnergyReconcilesWithThePackage(t *testing.T) {
 }
 
 func TestTheReconciliationHoldsItsBounds(t *testing.T) {
-	rows, err := readPowerLog(referenceLog)
+	log, err := readPowerLog(referenceLog)
 	if err != nil {
 		t.Fatal(err)
 	}
+	rows := log.rows
 	for _, tc := range []struct {
 		activeJ float64
 		want    verdict
@@ -90,10 +94,11 @@ func TestTheReconciliationHoldsItsBounds(t *testing.T) {
 // EVERY WAY THE WINDOW'S ENERGY CANNOT BE ACCOUNTED FOR IS UNMEASURED, never a
 // PASS on what happened to be there.
 func TestAWindowThatCannotBeAccountedForIsUnmeasured(t *testing.T) {
-	rows, err := readPowerLog(referenceLog)
+	log, err := readPowerLog(referenceLog)
 	if err != nil {
 		t.Fatal(err)
 	}
+	rows := log.rows
 	for _, tc := range []struct {
 		name    string
 		records map[string]record
@@ -352,10 +357,14 @@ func TestThePowerLogIsReadByItsHeader(t *testing.T) {
 		}
 		return path
 	}
-	rows, err := readPowerLog(write("reordered.csv",
+	log, err := readPowerLog(write("reordered.csv",
 		"instances,rapl_delta_uj,uptime_s,epoch_s,extra\nbillet-a;billet-b,5,10.50,7,x\n,,10.75,8,y\n?,5,11.00,9,z\n"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	rows := log.rows
+	if log.meter {
+		t.Error("a log with no meter_watts column was read as one with a meter")
 	}
 	if len(rows) != 3 || rows[0].epoch != 7 || rows[0].uptime != 10.5 || !rows[0].deltaOK || rows[0].delta != 5 ||
 		strings.Join(rows[0].instances, ",") != "billet-a,billet-b" || !rows[0].inventoryOK || rows[1].deltaOK ||
@@ -418,5 +427,339 @@ func TestEnergyExitsWithItsVerdict(t *testing.T) {
 			"--idle-watts", w}, &stdout, &stderr); code != exitUsage {
 			t.Errorf("--idle-watts %s exited %d, want %d", w, code, exitUsage)
 		}
+	}
+}
+
+// A LOG WITHOUT A METER IS REPORTED AS IT ALWAYS WAS. These goldens were
+// written by the energy check before it read a meter column, and are compared
+// byte for byte, exit status included, through the command a runbook runs.
+func TestTheEnergyReportWithoutAMeterIsUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		activeJ float64
+		alter   func(*usage)
+		code    int
+	}{
+		{"pass", 1000, nil, exitPass},
+		{"fail", 1100, nil, exitFail},
+		{"unmeasured", 1000, func(u *usage) { u.EnergySource = "rapl-unsplit" }, exitUnmeasured},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recDir := t.TempDir()
+			body, err := json.Marshal(recordJSON(leaseA(tc.activeJ, 40, tc.alter)["lease-a"]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(recDir, "lease-a.json"), body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			code := run(t.Context(), []string{"energy", "--power-log", referenceLog, "--records", recDir,
+				"--idle-watts", "73.5"}, &stdout, &stderr)
+			if code != tc.code {
+				t.Errorf("exit %d, want %d:\n%s%s", code, tc.code, stdout.String(), stderr.String())
+			}
+			golden := filepath.Join("testdata", "power-log", "energy-"+tc.name+".txt")
+			if os.Getenv("BILLET_UPDATE_FIXTURES") == "1" {
+				if err := os.WriteFile(golden, stdout.Bytes(), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want, err := os.ReadFile(golden)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(stdout.Bytes(), want) {
+				t.Errorf("the report:\n%s\nwant %s:\n%s", stdout.String(), golden, want)
+			}
+			// main's energy check writes to stderr only when it cannot run.
+			if stderr.Len() != 0 {
+				t.Errorf("stderr %q, want nothing, as main writes", stderr.String())
+			}
+		})
+	}
+}
+
+// meterLog writes the reference log with a meter_watts column: the wall reads
+// 50 W plus 1.2 times each interval's RAPL power (138.2 W at the 73.5 W idle,
+// 258.2 W busy, 198.2 W over the tail), and 138.2 W on the first row. cell
+// may replace a row's reading; "" leaves it empty.
+func meterLog(t *testing.T, cell func(i int, w string) string) string {
+	t.Helper()
+	log, err := readPowerLog(referenceLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	b.WriteString("epoch_s,uptime_s,rapl_delta_uj,instances,meter_watts\n")
+	for i, r := range log.rows {
+		delta, w := "", "138.2"
+		if r.deltaOK {
+			delta = strconv.FormatInt(r.delta, 10)
+			w = strconv.FormatFloat(50+1.2*float64(r.delta)/1e6/(r.uptime-log.rows[i-1].uptime), 'f', 1, 64)
+		}
+		if cell != nil {
+			w = cell(i, w)
+		}
+		fmt.Fprintf(&b, "%d,%.2f,%s,%s,%s\n", r.epoch, r.uptime, delta, strings.Join(r.instances, ";"), w)
+	}
+	path := filepath.Join(t.TempDir(), "power.csv")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	return path
+}
+
+// energyRun runs the energy check over a log with lease-a's record at 1000 J.
+func energyRun(t *testing.T, logPath string, extra ...string) (string, int) {
+	t.Helper()
+	recDir := t.TempDir()
+	body, err := json.Marshal(recordJSON(leaseA(1000, 40, nil)["lease-a"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(recDir, "lease-a.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := run(t.Context(), append([]string{"energy", "--power-log", logPath, "--records", recDir,
+		"--idle-watts", "73.5"}, extra...), &stdout, &stderr)
+	if stderr.Len() > 0 {
+		t.Errorf("stderr: %s", stderr.String())
+	}
+
+	return stdout.String(), code
+}
+
+// THE WALL IS REPORTED BESIDE THE VERDICT AND NEVER MOVES IT: the package's
+// reconciliation reads exactly as it does without a meter, and the wall's
+// lines follow it.
+func TestTheEnergyCheckReadsTheWallBesideRAPL(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("testdata", "power-log", "energy-pass.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rapl := strings.TrimSuffix(string(golden), "\noverall PASS\n")
+	for _, tc := range []struct {
+		name  string
+		cell  func(int, string) string
+		extra []string
+		says  []string
+	}{
+		{"every interval read", nil, nil, []string{
+			"wall meter: idle 138.2 W before, 138.2 W after (22 of 22 quiet intervals read)\n",
+			"wall meter above its idle of 138.2 W while a microVM was alive: 1.26 kJ; the package's RAPL above " +
+				"idle_package_watts over the same intervals, unclipped: 1.05 kJ; attributed to jobs: 1.00 kJ\n",
+			"wall meter: RAPL/wall 0.833, attributed/wall 0.794 (no verdict",
+		}},
+		// A QUIET INTERVAL WITHOUT A READING leaves the idle to the rest: the
+		// fourth row's would have been 20 W above it.
+		{"a quiet interval missed", func(i int, w string) string {
+			if i == 3 {
+				return ""
+			}
+			return w
+		}, nil, []string{"(21 of 22 quiet intervals read)", "RAPL/wall 0.833"}},
+		{"the idle from the quiet ends", func(i int, w string) string {
+			if i == 3 {
+				return "158.2"
+			}
+			return w
+		}, nil, []string{"idle 140.0 W before, 138.2 W after (22 of 22 quiet intervals read)",
+			// The idle is the mean over both ends' 22 seconds, 139.1 W.
+			"wall meter above its idle of 139.1 W while a microVM was alive: 1.25 kJ;"}},
+		{"a busy interval missed", func(i int, w string) string {
+			if i == 15 {
+				return ""
+			}
+			return w
+		}, nil, []string{"wall meter: could not tell; row 16 (epoch 1791540015) ends an interval a microVM was " +
+			"alive for and has no meter reading"}},
+		// THE TAIL IS A BUSY INTERVAL: it began while the microVM was alive.
+		{"the tail missed", func(i int, w string) string {
+			if i == 22 {
+				return ""
+			}
+			return w
+		}, nil, []string{"wall meter: could not tell; row 23 (epoch 1791540022)"}},
+		{"no quiet reading", func(i int, w string) string {
+			if i < 12 || i > 22 {
+				return ""
+			}
+			return w
+		}, nil, []string{"wall meter: idle not measured before, not measured after (0 of 22 quiet intervals read)\n" +
+			"wall meter: could not tell; no quiet interval has a meter reading"}},
+		{"a wall that never rose", func(int, string) string { return "138.2" }, nil,
+			[]string{"while a microVM was alive: 0.00 kJ", "wall meter: no ratio"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := energyRun(t, meterLog(t, tc.cell), tc.extra...)
+			if code != exitPass {
+				t.Errorf("exit %d, want %d: the wall moved the verdict", code, exitPass)
+			}
+			if !strings.HasPrefix(out, rapl) || !strings.HasSuffix(out, "\noverall PASS\n") {
+				t.Errorf("the package's reconciliation changed with a meter:\n%s\nwant it to begin:\n%s", out, rapl)
+			}
+			for _, line := range tc.says {
+				if !strings.Contains(out, line) {
+					t.Errorf("the report does not say %q:\n%s", line, out)
+				}
+			}
+		})
+	}
+
+	// A MICROVM WITH NO RECORD leaves the jobs' sum short of the window's, so it
+	// is no share of the wall, while the wall and the package still are; here
+	// lease-b, seen first, has none, and lease-a, seen last, has one.
+	path := meterLog(t, nil)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two := strings.Replace(string(body), ",billet-lease-a,", ",billet-lease-b;billet-lease-a,", 1)
+	if two == string(body) {
+		t.Fatal("the log holds no row to add lease-b to")
+	}
+	if err := os.WriteFile(path, []byte(two), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := energyRun(t, path)
+	for _, line := range []string{
+		"unclipped: 1.05 kJ; attributed to jobs: could not tell, a microVM's record could not be used\n",
+		"wall meter: RAPL/wall 0.833, attributed/wall could not tell (no verdict",
+	} {
+		if code != exitUnmeasured || !strings.Contains(out, line) {
+			t.Errorf("exit %d; the report does not say %q:\n%s", code, line, out)
+		}
+	}
+
+	// A WINDOW THE PACKAGE COULD NOT BE RECONCILED OVER has no busy interval
+	// to read the wall over, and says so rather than printing zeros.
+	out, code = energyRun(t, meterLog(t, nil), "--quiet-rows", "20")
+	if code != exitUnmeasured || !strings.Contains(out, "wall meter: could not tell; the window has no interval a "+
+		"microVM was alive for to compare") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+	// A RAPL GAP PART WAY THROUGH THE JOB stops the reconciliation after it has
+	// counted busy seconds but before it has the window's length, and the wall
+	// is not read over the part before the gap.
+	gap := meterLog(t, nil)
+	body, err = os.ReadFile(gap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(body), "\n")
+	f := strings.Split(lines[16], ",")
+	f[2] = ""
+	lines[16] = strings.Join(f, ",")
+	if err := os.WriteFile(gap, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code = energyRun(t, gap)
+	if code != exitUnmeasured || !strings.Contains(out, "reconciliation: row 16 (epoch 1791540015) has no RAPL delta, "+
+		"so the window's energy is not known\nwall meter: idle not measured before, not measured after "+
+		"(0 of 0 quiet intervals read)\nwall meter: could not tell; the window has no interval a microVM was alive "+
+		"for to compare\n") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+
+	// AND A WINDOW THAT WAS READ WHOLE BUT HELD NO MICROVM has none either (its
+	// quiet ends, at the busy power, fail the idle baseline, which the wall
+	// leaves alone).
+	quiet := meterLog(t, nil)
+	body, err = os.ReadFile(quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(quiet, []byte(strings.ReplaceAll(string(body), "billet-lease-a", "")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code = energyRun(t, quiet)
+	if code != exitFail || !strings.Contains(out, "reconciliation: no billet microVM ran in the window\n"+
+		"wall meter: idle not measured before, not measured after (0 of 0 quiet intervals read)\n"+
+		"wall meter: could not tell; the window has no interval a microVM was alive for to compare\n") {
+		t.Errorf("exit %d:\n%s", code, out)
+	}
+}
+
+// THE PACKAGE'S RISE IS SET AGAINST THE WALL'S UNCLIPPED: the wall is not
+// clipped at its idle, so neither is the package here, whatever the
+// reconciliation clipped. Busy seconds alternate 70 and 80 W against a 73.5 W
+// baseline, and the wall reads 50 W plus 1.2 times the package throughout. The
+// interval ending at row 21 is two seconds long, so a reading taken as energy
+// rather than power would be seen.
+func TestTheWallIsSetAgainstThePackageUnclipped(t *testing.T) {
+	const idle = 73.5
+	var rows []powerRow
+	for i := range 64 {
+		row := powerRow{epoch: int64(i), uptime: float64(i), uptimeOK: true, inventoryOK: true, meterW: 50 + 1.2*idle,
+			meterOK: true}
+		dt := 1.0
+		if i >= 20 {
+			row.uptime++
+			if i == 20 {
+				dt = 2
+			}
+		}
+		if i > 0 {
+			p := idle
+			if i-1 >= 11 && i-1 < 51 {
+				p = 70 + 10*float64((i-1)%2)
+			}
+			row.delta, row.deltaOK, row.meterW = int64(p*dt*1e6), true, 50+1.2*p
+		}
+		if i >= 11 && i < 51 {
+			row.instances = []string{"billet-lease-a"}
+		}
+		rows = append(rows, row)
+	}
+	res := reconcile(rows, idle, 10, fromMap(leaseA(60, 0, nil)))
+	if res.clipped == 0 {
+		t.Fatal("the trace clips nothing, so it cannot tell clipped from unclipped")
+	}
+	var rapl float64
+	for i := 1; i < len(rows); i++ {
+		if len(rows[i].instances) > 0 || len(rows[i-1].instances) > 0 {
+			rapl += float64(rows[i].delta) - idle*1e6*(rows[i].uptime-rows[i-1].uptime)
+		}
+	}
+	w := wallReference(rows, res)
+	if w.reason != "" || math.Abs(w.rapl-rapl) > 1 || math.Abs(w.above-1.2*rapl) > 1 {
+		t.Errorf("wall above %.0f µJ, package %.0f µJ (%q), want the package %.0f µJ and the wall 1.2 times it",
+			w.above, w.rapl, w.reason, rapl)
+	}
+}
+
+// A METER CELL THE LOGGER COULD NOT HAVE WRITTEN IS A LOG THAT IS NOT ONE, and
+// is refused rather than read as a reading or as an empty cell.
+func TestAMeterCellIsAPowerOrEmpty(t *testing.T) {
+	for _, cell := range []string{"-1", "NaN", "+Inf", "lots", "1000000", "1e3", "+100", ".5", "0x1p3", "1.1234567", "12."} {
+		path := meterLog(t, func(i int, w string) string {
+			if i == 5 {
+				return cell
+			}
+			return w
+		})
+		_, err := readPowerLog(path)
+		if err == nil || !strings.Contains(err.Error(), "line 7: meter_watts \""+cell+"\" is not a power") {
+			t.Errorf("meter_watts %q: %v", cell, err)
+		}
+	}
+	log, err := readPowerLog(meterLog(t, func(i int, w string) string {
+		switch i {
+		case 4:
+			return ""
+		case 5:
+			return "0"
+		}
+		return w
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !log.meter || log.rows[4].meterOK || !log.rows[5].meterOK || log.rows[5].meterW != 0 ||
+		!log.rows[6].meterOK || log.rows[6].meterW != 138.2 {
+		t.Errorf("meter %v, rows 5 to 7: %+v %+v %+v", log.meter, log.rows[4], log.rows[5], log.rows[6])
 	}
 }
