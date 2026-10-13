@@ -196,12 +196,29 @@ func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) (i
 	if len(leases) == 0 {
 		return 0, errors.New("the inputs name no lease to collect")
 	}
-	failed, err := collect(ctx, stdout, *billet, *config, *out, leases)
+	windows := map[string]string{}
+	unreadable := 0
+	for i := range exps {
+		e := &exps[i]
+		if w := windowArg(e); w != "" {
+			windows[e.Lease] = w
+		} else {
+			// COLLECTED ANYWAY AND COUNTED: the record is still worth having, and
+			// check says UNMEASURED for the window nobody can read.
+			fmt.Fprintf(stdout, "%s: the expectation's load window %q to %q cannot be read\n", e.Lease,
+				e.LoadStartedAt, e.LoadFinishedAt)
+			unreadable++
+		}
+	}
+	failed, err := collect(ctx, stdout, *billet, *config, *out, leases, windows)
 	if err != nil {
 		return 0, err
 	}
 	fmt.Fprintf(stdout, "collected %d of %d\n", len(leases)-failed, len(leases))
-	if failed > 0 {
+	if unreadable > 0 {
+		fmt.Fprintf(stdout, "%d expectations give a load window that cannot be read\n", unreadable)
+	}
+	if failed > 0 || unreadable > 0 {
 		return exitFail, nil
 	}
 

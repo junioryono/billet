@@ -37,7 +37,8 @@ func fixtureRun(runID int64) ([]expectation, map[string]record) {
 	lease := func(kind string) string { return fmt.Sprintf("lease-%d-%s", runID, kind) }
 	exp := func(kind string, seconds int64, expected map[string]int64) expectation {
 		return expectation{Schema: 1, Kind: kind, Lease: lease(kind), Repository: "acme/bench", RunID: runID,
-			RunAttempt: 1, GitHubJobID: "7" + lease(kind)[6:], Seconds: seconds, Expected: expected}
+			RunAttempt: 1, GitHubJobID: "7" + lease(kind)[6:], Seconds: seconds, Expected: expected,
+			LoadStartedAt: "2026-10-09T10:00:30Z", LoadFinishedAt: "2026-10-09T10:01:30Z"}
 	}
 	idle := usage{Measured: allGroups(), present: allFields(), CPUUserMicros: 20_500_000, CPUSystemMicros: 1_000_000,
 		MemoryPeakBytes: 700 * mib, NetRxBytes: 60 * mib, DiskWriteBytes: 90 * mib}
@@ -386,6 +387,11 @@ func recordJSON(r record) map[string]any {
 			"net_rx_bytes": u.NetRxBytes, "energy_active_uj": u.EnergyActiveUJ,
 			"energy_idle_uj": u.EnergyIdleUJ, "energy_source": u.EnergySource, "window_ms": u.WindowMillis,
 			"interval_ms": u.IntervalMillis}
+	}
+	// THE WINDOW AS billet jobs show WRITES IT: recordWindow carries the same
+	// json names, so encoding it is the producer's shape.
+	if r.Window != nil {
+		out["window"] = r.Window
 	}
 	return out
 }
