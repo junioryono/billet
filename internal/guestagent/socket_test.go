@@ -2,6 +2,7 @@ package guestagent
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"net"
@@ -214,14 +215,21 @@ func TestTheFlushSocketListensOnlyWhereItIsSafeTo(t *testing.T) {
 }
 
 // With no monitor listening, `billet guest flush` has nothing to wait for.
+//
+// THE BOUND IS A FRACTION OF A LONG WAIT, not a second: a failed dial took 1.87 s
+// on a loaded CI runner (2026-10-12), and what this holds is that the flush does
+// not wait out its wait, which here is a minute.
 func TestAFlushWithNoMonitorReturnsAtOnce(t *testing.T) {
 	t.Parallel()
 
+	const wait = time.Minute
+
+	socket := filepath.Join(socketDir(t), "absent.sock")
 	began := time.Now()
 
-	if err := Flush(t.Context(), filepath.Join(t.TempDir(), "absent.sock"), FlushWait); err == nil ||
-		time.Since(began) > time.Second {
-		t.Fatalf("answered %v after %v, want an error at once", err, time.Since(began))
+	err := Flush(t.Context(), socket, wait)
+	if took := time.Since(began); !errors.Is(err, fs.ErrNotExist) || took > wait/4 {
+		t.Fatalf("answered %v after %v, want no such socket well inside the %v wait", err, took, wait)
 	}
 }
 
