@@ -1,0 +1,21 @@
+---
+# CEPHADM.LOG HAS ONE ROTATION RULE, ceph-common's. ceph-common rotates
+# /var/log/ceph/*.log, cephadm.log among them, and cephadm writes a stanza of its
+# own for the same file to /etc/logrotate.d/cephadm; logrotate then refuses
+# ceph-common's whole file as a duplicate and the nightly logrotate.service
+# fails (measured on the reference deployment's Linux node, Ceph 20.2.3,
+# 2026-10-13). cephadm writes that file only when it is absent
+# (cephadmlib/logging.py, write_cephadm_logrotate_config), so it is kept here,
+# holding no stanza, and written before cephadm's bootstrap can write its own.
+
+- name: Keep cephadm's logrotate file from duplicating ceph-common's rule
+  ansible.builtin.copy:
+    content: |
+      # Managed by billet. ceph-common rotates /var/log/ceph/*.log, cephadm.log
+      # among them, and a second stanza for the same file fails every logrotate
+      # run. cephadm writes its own stanza here only when this file is absent.
+    dest: /etc/logrotate.d/cephadm
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
