@@ -170,6 +170,12 @@ func TestTheGenerationMapLockExcludesAnotherProcess(t *testing.T) {
 			t.Fatalf("hold once the lock was free: %v", err)
 		}
 		again()
+
+		// GROUP-WRITABLE WHATEVER THE UMASK, for a lock_dir two accounts share.
+		info, err := os.Stat(lock)
+		if err != nil || info.Mode().Perm() != 0o660 {
+			t.Fatalf("the lock file is %v (%v), want 0660", info.Mode().Perm(), err)
+		}
 	})
 }
 
@@ -284,4 +290,28 @@ func mappedSpecs(f *cacheFake) []string {
 	}
 
 	return specs
+}
+
+// Damage the check proved stands when the unmap after it fails: GenerationDamaged
+// answers true with the unmap's error, and the mapping is left to the sweep.
+func TestDamageProvedBeforeAFailedUnmapIsStillProof(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	v := &verifiedSpecs{f: f, verdict: clean}
+	c := verifyingClient(t, f, v)
+	generation := publishedGeneration(t, c)
+	c.damaged = func(context.Context, string) (bool, error) { return true, nil }
+	c.run = func(ctx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "unmap") {
+			return nil, errors.New("exit status 5: rbd: sysfs write failed: (5) Input/output error")
+		}
+
+		return f.run(ctx, bin, args)
+	}
+
+	damaged, err := c.GenerationDamaged(t.Context(), "acme/api/go", generation.Generation)
+	if !damaged || err == nil {
+		t.Fatalf("GenerationDamaged = %v, %v; want the proof with the unmap's failure", damaged, err)
+	}
 }

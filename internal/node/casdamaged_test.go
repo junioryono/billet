@@ -18,7 +18,23 @@ import (
 func TestADamagedGenerationStartsOverAndIsReplaced(t *testing.T) {
 	t.Parallel()
 
-	storage := &fakeCacheStore{current: "damaged", damagedGenerations: map[string]bool{"damaged": true}}
+	for name, damageErr := range map[string]error{
+		"proved":                        nil,
+		"proved, then the unmap failed": errors.New("unmap /dev/rbd3: (5) Input/output error"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testADamagedGenerationStartsOver(t, damageErr)
+		})
+	}
+}
+
+func testADamagedGenerationStartsOver(t *testing.T, damageErr error) {
+	t.Helper()
+
+	storage := &fakeCacheStore{
+		current: "damaged", damagedGenerations: map[string]bool{"damaged": true}, damageErr: damageErr,
+	}
 	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
 	volumes.damaged = map[string]bool{"/dev/rbd8": true}
 	session := service.sessionOf(instance)
@@ -115,7 +131,21 @@ func TestAGenerationIsKeptUnlessTheStoreProvesItDamaged(t *testing.T) {
 func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing.T) {
 	t.Parallel()
 
-	storage := &fakeCacheStore{}
+	for name, damageErr := range map[string]error{
+		"proved":                        nil,
+		"proved, then the unmap failed": errors.New("unmap /dev/rbd3: (5) Input/output error"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testAMergeIntoADamagedGeneration(t, damageErr)
+		})
+	}
+}
+
+func testAMergeIntoADamagedGeneration(t *testing.T, damageErr error) {
+	t.Helper()
+
+	storage := &fakeCacheStore{damageErr: damageErr}
 	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
 	if code := putObject(t, service, token, "ours"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)

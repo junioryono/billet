@@ -332,11 +332,8 @@ func (f *fakeCacheStore) Evict(context.Context, time.Duration) error { return ni
 func (f *fakeCacheStore) GenerationDamaged(_ context.Context, key, generation string) (bool, error) {
 	f.damageChecks = append(f.damageChecks, generation)
 	f.damageKeys = append(f.damageKeys, key)
-	if f.damageErr != nil {
-		return false, f.damageErr
-	}
 
-	return f.damagedGenerations[generation], nil
+	return f.damagedGenerations[generation], f.damageErr
 }
 
 type fakeVolumeAttacher struct {

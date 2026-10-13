@@ -193,7 +193,7 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		return leaveSlot, nil
 	}
 
-	f, err := os.OpenFile(c.mapLock, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	f, err := openGenerationMapLock(c.mapLock)
 	if err != nil {
 		leaveSlot()
 
@@ -230,6 +230,28 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 		_ = f.Close()
 		leaveSlot()
 	}, nil
+}
+
+// openGenerationMapLock opens the lock file, creating it 0660 when it is absent.
+//
+// GROUP-WRITABLE, because node.lock_dir may be a SETGID directory two accounts
+// share, and a file only its creator could open would stop every check the
+// other account makes. The mode is set on the descriptor of a file this call
+// created, so the process's umask cannot narrow it; a file that already exists
+// is opened as it is.
+func openGenerationMapLock(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o660)
+	if errors.Is(err, os.ErrExist) {
+		return os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0o660); err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+
+	return f, nil
 }
 
 // checkDamage runs `e2fsck -f -n` on device: damaged, clean, or could-not-tell.
