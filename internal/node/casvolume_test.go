@@ -36,6 +36,9 @@ type deviceVolumes struct {
 	// target ends with it.
 	targets    []string
 	failSuffix string
+	// damaged are the devices that refuse every mount the way the kernel
+	// refuses a corrupt ext4.
+	damaged map[string]bool
 }
 
 func newDeviceVolumes(t *testing.T) *deviceVolumes {
@@ -63,9 +66,13 @@ func (d *deviceVolumes) mount(device, target string) error {
 	d.mu.Lock()
 	d.targets = append(d.targets, target)
 	fail := d.failSuffix != "" && strings.HasSuffix(target, d.failSuffix)
+	damaged := d.damaged[device]
 	d.mu.Unlock()
 	if fail {
 		return errors.New("the mount failed")
+	}
+	if damaged {
+		return errors.New("exit status 32: mount: cannot mount; probably corrupted filesystem on " + device)
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return err

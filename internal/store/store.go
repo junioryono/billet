@@ -54,6 +54,11 @@ type Filesystem struct {
 	Type  string
 	UUID  string
 	Clean bool
+	// CheckedAsPublished says the candidate's own bytes, as a clone of it reads
+	// them, were checked too, not only the volume it was made from. A candidate
+	// recorded before stores set it decodes false, and a store that sets it
+	// checks such a candidate before publishing it.
+	CheckedAsPublished bool
 }
 
 // Valid refuses metadata that cannot identify a checked filesystem.
@@ -178,4 +183,12 @@ type VolumeSizer interface {
 // implement it; ordinary sticky disks need only Store.
 type KeyMatcher interface {
 	Match(ctx context.Context, exact string, restorePrefixes []string) (key, generation string, err error)
+}
+
+// GenerationChecker checks a published generation's own filesystem, read-only.
+// true is proof the generation is damaged, whatever error comes with it; false
+// with an error is could-not-tell, never "clean". Optional: a store that cannot
+// check leaves a generation that will not mount in place.
+type GenerationChecker interface {
+	GenerationDamaged(ctx context.Context, key, generation string) (bool, error)
 }

@@ -398,6 +398,9 @@ type mappedDevice struct {
 	Pool   string `json:"pool"`
 	Name   string `json:"name"`
 	Device string `json:"device"`
+	// Snap is the mapped snapshot's name, and `-` for an image's head
+	// (measured against 20.2.3 on 2026-10-13).
+	Snap string `json:"snap"`
 }
 
 // mappedDevices lists the host devices a cache-pool image is mapped to.

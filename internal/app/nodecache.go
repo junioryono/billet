@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -25,6 +26,10 @@ import (
 const cacheEvictionAge = 7 * 24 * time.Hour
 
 const cacheConnectionLimit = 128
+
+// generationMapLockName is the file in node.lock_dir whose flock keeps two
+// processes on a host from unmapping each other's read-only generation maps.
+const generationMapLockName = "ceph-generation-maps.lock"
 
 // NodeCacheControl is what the node's cache service asks the control plane:
 // the kill switch, and what a job may publish. The node client is both.
@@ -60,6 +65,37 @@ func NewNodeCacheService(
 	return service, nil
 }
 
+// nodeCacheStore is the site store a node.cache block's provider reads and
+// writes: the value the node's cache service is handed, so what it offers
+// beyond the contract (the generation check among it) is proved on it.
+func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store, error) {
+	switch cfg.Node.Provider {
+	case config.ProviderFirecracker:
+		if cfg.Node.Ceph == nil {
+			return nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
+		}
+
+		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg))}
+		// THE NODE'S LOCK DIRECTORY, because only billet's account can write it:
+		// a lock file another account could create could be held to stop every
+		// generation check on the host.
+		if cfg.Node.LockDir != "" {
+			options = append(options,
+				ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName)))
+		}
+
+		return ceph.New(*cfg.Node.Ceph, options...)
+	case config.ProviderEC2:
+		if cfg.Node.EBSS3 == nil {
+			return nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
+		}
+
+		return ebss3.New(*cfg.Node.EBSS3, CacheNamespace(deployment, cfg.Node.Site), awscreds.Default())
+	default:
+		return nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
+	}
+}
+
 // startNodeCache exposes the site's clone store to its managed guests.
 func startNodeCache(
 	ctx context.Context,
@@ -78,29 +114,9 @@ func startNodeCache(
 		return nil, nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
 			cfg.Node.Provider)
 	}
-	var storage storecontract.Store
-	switch cfg.Node.Provider {
-	case config.ProviderFirecracker:
-		if cfg.Node.Ceph == nil {
-			return nil, nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
-		}
-		var err error
-		storage, err = ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(CacheSessionNames(cfg)))
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	case config.ProviderEC2:
-		if cfg.Node.EBSS3 == nil {
-			return nil, nil, nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
-		}
-		var err error
-		storage, err = ebss3.New(*cfg.Node.EBSS3,
-			CacheNamespace(deployment, cfg.Node.Site), awscreds.Default())
-		if err != nil {
-			return nil, nil, nil, err
-		}
-	default:
-		return nil, nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
+	storage, err := nodeCacheStore(cfg, deployment)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	service, err := NewNodeCacheService(cfg, deployment, storage, attacher, cachePolicy)
