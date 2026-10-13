@@ -65,6 +65,15 @@ type fakeCacheStore struct {
 	releaseDeadlines []bool
 	// createErr makes a fresh volume unobtainable, the way a read-only pool would.
 	createErr error
+	// damagedGenerations are the generations GenerationDamaged proves damaged,
+	// damageErr what it answers when it could not tell, and damageChecks every
+	// generation it was asked about.
+	damagedGenerations map[string]bool
+	damageErr          error
+	damageChecks       []string
+	damageKeys         []string
+	// discardedVolumes are the volumes Discard was handed, in order.
+	discardedVolumes []storecontract.Volume
 }
 
 func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
@@ -306,8 +315,9 @@ func (f *fakeCacheStore) ReleaseWriter(
 	return nil
 }
 
-func (f *fakeCacheStore) Discard(context.Context, storecontract.Volume) error {
+func (f *fakeCacheStore) Discard(_ context.Context, volume storecontract.Volume) error {
 	f.discarded++
+	f.discardedVolumes = append(f.discardedVolumes, volume)
 	if f.discardFailures > 0 {
 		f.discardFailures--
 
@@ -318,6 +328,13 @@ func (f *fakeCacheStore) Discard(context.Context, storecontract.Volume) error {
 }
 
 func (f *fakeCacheStore) Evict(context.Context, time.Duration) error { return nil }
+
+func (f *fakeCacheStore) GenerationDamaged(_ context.Context, key, generation string) (bool, error) {
+	f.damageChecks = append(f.damageChecks, generation)
+	f.damageKeys = append(f.damageKeys, key)
+
+	return f.damagedGenerations[generation], f.damageErr
+}
 
 type fakeVolumeAttacher struct {
 	attached  []int

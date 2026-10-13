@@ -631,6 +631,11 @@ func (c *Client) snapshotAt(
 		}
 	}
 
+	if err := c.verifyCandidate(ctx, handle, generation, filesystem); err != nil {
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle, err)
+	}
+	filesystem.CheckedAsPublished = true
+
 	for key, value := range map[string]string{
 		cacheMetaPrefix + "key":        cacheDigest(volume.Key),
 		cacheMetaPrefix + "generation": generation,
@@ -728,6 +733,33 @@ func (c *Client) copyCacheCandidate(
 	return nil
 }
 
+// verifyCandidate checks the filesystem a clone of a frozen candidate will hold,
+// read from the cluster through a read-only device of its own, and requires it
+// to be the filesystem verified before the candidate was made.
+//
+// THE SOURCE'S CHECK DOES NOT PROVE THE CANDIDATE. It reads through the kernel
+// device that wrote the volume, and a compacted candidate is a copy made after
+// it. On 2026-10-05, while the cluster was timing out, a compaction published a
+// Go cache generation holding 4 MiB of data, whose journal superblock e2fsck
+// calls corrupt (exit 12, measured 2026-10-13). Every clone of it failed to
+// mount for eight days, and every merge into it failed, so nothing replaced it.
+func (c *Client) verifyCandidate(
+	ctx context.Context, handle, generation string, source storecontract.Filesystem,
+) error {
+	return c.withGenerationMap(ctx, handle, generation, func(device string) error {
+		filesystem, err := c.verify(ctx, device)
+		if err != nil {
+			return fmt.Errorf("ceph: verify candidate %s@%s as published: %w", handle, generation, err)
+		}
+		if filesystem.UUID != source.UUID {
+			return fmt.Errorf("ceph: candidate %s@%s holds filesystem %s, not the %s verified before "+
+				"it was made", handle, generation, bounded(filesystem.UUID), bounded(source.UUID))
+		}
+
+		return nil
+	})
+}
+
 func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {
 	copyCtx, cancelCopy := context.WithTimeout(ctx, cacheCompactionLimit)
 	defer cancelCopy()
@@ -818,6 +850,21 @@ func (c *Client) publishCASAt(
 
 	if fence == 0 {
 		return fmt.Errorf("%w: fencing token zero authorises nothing", storecontract.ErrConflict)
+	}
+
+	// A CANDIDATE MADE BEFORE ITS BYTES WERE CHECKED AS PUBLISHED is checked here,
+	// outside the index lock: a publication journaled by an older release
+	// resumes after an upgrade without another Snapshot, and a restart in the
+	// middle of a publication is how the damaged generation of 2026-10-05 came
+	// to be.
+	if !candidate.Filesystem.CheckedAsPublished {
+		started := time.Now()
+		if err := c.verifyCandidate(ctx, candidate.Handle, candidate.Generation, candidate.Filesystem); err != nil {
+			return err
+		}
+		// THE CHECK'S TIME COUNTS AGAINST THE WRITER LEASE: it can wait on another
+		// check's slot, and a lease that expired meanwhile authorises nothing.
+		now = now.Add(time.Since(started))
 	}
 
 	return c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
@@ -1613,11 +1660,14 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ceph: cache eviction needs a positive inactivity age")
 	}
 
+	// A GENERATION MAPPING A CRASH LEFT BEHIND GOES FIRST, because eviction
+	// keeps every image this host maps.
+	sweep := c.sweepGenerationMaps(ctx)
 	generations := c.withCacheLock(ctx, time.Now(), func(now time.Time) error {
 		return c.evictGenerations(ctx, olderThan, now)
 	})
 
-	return errors.Join(generations, c.evictVolumes(ctx, olderThan))
+	return errors.Join(sweep, generations, c.evictVolumes(ctx, olderThan))
 }
 
 func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, now time.Time) error {
