@@ -1124,6 +1124,8 @@ func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 		return fmt.Errorf("ceph: remove cache image %s: %w", handle, err)
 	}
 
+	c.cacheRemovals.Add(1)
+
 	return nil
 }
 
@@ -1233,6 +1235,50 @@ const trashPurgeWorkers = 4
 // grew from 808 entries to 999 and the cache pool reached Ceph's nearfull ratio.
 const halfRemovedBudget = 10 * time.Minute
 
+// openableRecheck is how long finishHalfRemoved waits before asking `rbd info`
+// again about a cache image it found openable. Each ask is an rbd process, and on
+// the reference deployment on 2026-10-12 a pass asked about each of 1,395 live
+// generations every ninety seconds. An image whose removal is cut short after an
+// openable sighting becomes eligible for its first unopenable sighting this much
+// later, then waits for the pass that reaches it, then for the second sighting
+// halfRemovedRecheck after the first.
+const openableRecheck = halfRemovedRecheck
+
+// trashHeldRecheck is how long PurgeTrash leaves a trash entry a copy-on-write
+// child held before asking again when this client has removed no cache image
+// since. A child is a generation, and generations leave by `rbd rm`; once one
+// another node removed has been gone this long, its writer is asked about by the
+// next pass that reaches it. On the reference deployment on 2026-10-12
+// the trash held 1,364 retired writers whose generations were live, and asking
+// about every one every ninety seconds forked about 1,400 processes a second and
+// held the idle package at 94.8 W against 76.9 W between passes.
+const trashHeldRecheck = time.Hour
+
+// trashHold is when a deletion found a trash entry held by a child, and how many
+// cache images this client had removed before that deletion was asked.
+type trashHold struct {
+	at       time.Time
+	removals uint64
+}
+
+// holdTrash remembers that a child holds a trash entry.
+func (c *Client) holdTrash(handle string, hold trashHold) {
+	c.trashHeldMu.Lock()
+	defer c.trashHeldMu.Unlock()
+
+	if c.trashHeld == nil {
+		c.trashHeld = map[string]trashHold{}
+	}
+
+	c.trashHeld[handle] = hold
+}
+
+// trashHeldDue reports whether a held entry is worth asking about again: a cache
+// image has been removed since, or trashHeldRecheck has passed.
+func (c *Client) trashHeldDue(hold trashHold, now time.Time) bool {
+	return c.cacheRemovals.Load() != hold.removals || now.Sub(hold.at) >= trashHeldRecheck
+}
+
 // PurgeTrash deletes the per-job root disks and writable cache volumes discards
 // moved to the cache pool's trash, finishes the cache images an `rbd rm` left
 // half-removed, and reports how many it deleted.
@@ -1246,6 +1292,15 @@ const halfRemovedBudget = 10 * time.Minute
 // as done, and one that fails for any other reason does not stop the rest: each
 // failure is reported together at the end.
 func (c *Client) PurgeTrash(ctx context.Context) (int, error) {
+	// ONE PASS AT A TIME, so a pass never reads the held entries another has
+	// taken out to rebuild, and a caller waiting behind a long pass can give up.
+	select {
+	case c.purgeSlot <- struct{}{}:
+		defer func() { <-c.purgeSlot }()
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
 	// ONE YIELDING BUDGET FOR THE WHOLE PASS, both of its deletion phases.
 	budget := newYieldBudget(purgePassYieldMax)
 
@@ -1274,6 +1329,15 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 		failures  []error
 	)
 
+	// HELD ENTRIES ARE ASKED ABOUT AGAIN ONLY WHEN DUE, and an entry the trash no
+	// longer lists is forgotten.
+	c.trashHeldMu.Lock()
+	held := c.trashHeld
+	c.trashHeld = map[string]trashHold{}
+	c.trashHeldMu.Unlock()
+
+	now := c.now()
+
 	for _, image := range images {
 		if kind, _, ok := cacheImageName(image.Name); !strings.HasPrefix(image.Name, "billet-") &&
 			(!ok || kind != "v") {
@@ -1288,7 +1352,15 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 			continue
 		}
 
-		deletions = append(deletions, deletion{name: image.Name, handle: c.cfg.CachePool + "/" + image.ID})
+		handle := c.cfg.CachePool + "/" + image.ID
+
+		if hold, ok := held[handle]; ok && !c.trashHeldDue(hold, now) {
+			c.holdTrash(handle, hold)
+
+			continue
+		}
+
+		deletions = append(deletions, deletion{name: image.Name, handle: handle})
 	}
 
 	// SEVERAL AT ONCE, each under its own PurgeTimeout: the deletions are of
@@ -1307,13 +1379,18 @@ func (c *Client) purgeTrashEntries(ctx context.Context, budget *yieldBudget) (in
 			for d := range next {
 				c.waitForQuietIO(ctx, budget)
 
+				// READ BEFORE THE ASK, so a removal racing it makes the entry due.
+				removals := c.cacheRemovals.Load()
+
 				err := c.rbdCmdWithin(ctx, PurgeTimeout, keepKernelClient("trash", "rm", d.handle)...)
 
 				mu.Lock()
 				switch {
 				case err == nil || isNoSuchFile(err):
 					purged++
-				case !isImageNotEmpty(err):
+				case isImageNotEmpty(err):
+					c.holdTrash(d.handle, trashHold{at: c.now(), removals: removals})
+				default:
 					failures = append(failures, fmt.Errorf("ceph: delete %s (%s) from the trash: %w",
 						d.name, d.handle, err))
 				}
@@ -1369,18 +1446,43 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 	seen := c.halfRemoved
 	c.halfRemoved = map[string]time.Time{}
 
+	opened := c.openable
+	c.openable = map[string]time.Time{}
+
 	// RESUMED AFTER WHERE THE LAST PASS STOPPED, in name order, so images that
 	// keep failing at the front cannot spend every pass's budget ahead of the rest.
 	slices.Sort(names)
 	if i := slices.IndexFunc(names, func(name string) bool { return name > c.halfRemovedResume }); i > 0 {
 		names = slices.Concat(names[i:], names[:i])
 	}
+	resume := c.halfRemovedResume
 	c.halfRemovedResume = ""
 
 	started := c.now()
 	finished := 0
 
 	var failures []error
+
+	// A PASS CUT SHORT, by its budget or its context, leaves the rest for the next
+	// pass with what this one knew of them, so a second sighting is not lost to
+	// the cut and an image found openable is not asked about again early.
+	keepFrom := func(i int) {
+		for _, rest := range names[i:] {
+			if first, ok := seen[rest]; ok {
+				c.halfRemoved[rest] = first
+			}
+
+			if at, ok := opened[rest]; ok {
+				c.openable[rest] = at
+			}
+		}
+
+		if i > 0 {
+			c.halfRemovedResume = names[i-1]
+		} else {
+			c.halfRemovedResume = resume
+		}
+	}
 
 	for i, name := range names {
 		_, named, ok := cacheImageName(name)
@@ -1389,30 +1491,39 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 		}
 
 		if err := ctx.Err(); err != nil {
+			keepFrom(i)
+
 			return finished, append(failures, err)
 		}
 
-		// OUT OF BUDGET: the rest wait for the next pass, keeping the sightings
-		// they had, so a second sighting is not lost to the cut.
 		if c.now().Sub(started) >= halfRemovedBudget {
-			for _, rest := range names[i:] {
-				if first, ok := seen[rest]; ok {
-					c.halfRemoved[rest] = first
-				}
-			}
-
-			if i > 0 {
-				c.halfRemovedResume = names[i-1]
-			}
+			keepFrom(i)
 
 			return finished, failures
+		}
+
+		if at, ok := opened[name]; ok && c.now().Sub(at) < openableRecheck {
+			c.openable[name] = at
+
+			continue
 		}
 
 		handle := c.cfg.CachePool + "/" + name
 
 		if _, err := c.rbdCmd(ctx, true, "info", handle); err == nil {
+			c.openable[name] = c.now()
+
 			continue
 		} else if !isNoSuchFile(err) {
+			// CUT SHORT, NOT COULD-NOT-TELL: this image keeps what it had too. An
+			// ENOENT that raced the cancellation is still rbd's answer, and is
+			// recorded below.
+			if ctx.Err() != nil {
+				keepFrom(i)
+
+				return finished, append(failures, ctx.Err())
+			}
+
 			failures = append(failures, fmt.Errorf("ceph: could not tell whether %s is half-removed: %w",
 				handle, err))
 
@@ -1449,6 +1560,8 @@ func (c *Client) finishHalfRemoved(ctx context.Context, budget *yieldBudget) (in
 
 			continue
 		}
+
+		c.cacheRemovals.Add(1)
 
 		finished++
 	}
