@@ -48,6 +48,11 @@ type metric struct {
 	value  func(job, ref *usage) float64
 	bounds func(expected, seconds float64, ref *usage) (low, high float64)
 	rule   string
+	// windowed, when set, reads the value from the job's own load window when
+	// its record carries one, and windowRule is then the rule reported. The
+	// window needs no reference: no other job's setup is subtracted.
+	windowed   func(w *windowUsage) float64
+	windowRule string
 }
 
 func cpuSeconds(u *usage) float64 { return float64(u.CPUUserMicros+u.CPUSystemMicros) / 1e6 }
@@ -101,6 +106,12 @@ var metrics = []metric{
 			return e - 64*mib, 1.10*e + 64*mib
 		},
 		rule: "written minus the median unloaded job within [X - 64 MiB, 1.10 X + 64 MiB]",
+		// THE WINDOW, WHEN THE RECORD HAS ONE. Every job installs the same
+		// packages, and that setup wrote 1,360 to 1,915 MiB a job across runs 8
+		// and 9 (2026-10-12 and 13), against a tolerance of 64 MiB: run 9's disk
+		// job failed at 1,287.5 MiB while its own fio step wrote 2.4 GiB.
+		windowed:   func(w *windowUsage) float64 { return float64(*w.DiskWriteBytes) },
+		windowRule: "written in the job's own load window within [X - 64 MiB, 1.10 X + 64 MiB]",
 	},
 }
 
@@ -185,6 +196,19 @@ func evaluateOne(e *expectation, m metric, run map[string]*expectation, records 
 		return r
 	}
 	r.jobID = jobIDNote(e.GitHubJobID, job.GitHubJobID)
+
+	if m.windowed != nil && job.Window != nil {
+		return compareWindow(r, e, &m, job)
+	}
+
+	// A LOAD WINDOW NOBODY CAN READ, OR NONE, IS A FINDING about the job, never
+	// a reason to fall back to the median rule: the job script stamps both.
+	if _, _, ok := loadWindow(e); m.windowed != nil && !ok {
+		r.reason = fmt.Sprintf("the expectation's load window %q to %q cannot be read", e.LoadStartedAt,
+			e.LoadFinishedAt)
+
+		return r
+	}
 
 	if pick, ok := medianReference(&m, run, records, job); ok {
 		if pick.failed != "" {

@@ -148,7 +148,11 @@ printf '%s' "$FAKE_CURL_SIZE"
 printf '%s\n' "$FAKE_NPROC"
 `,
 	"date": `#!/bin/bash
+printf 'date\n' >>"$FAKE_LOG"
 printf '2026-10-09T10:00:00Z\n'
+`,
+	"sync": `#!/bin/bash
+printf 'sync\n' >>"$FAKE_LOG"
 `,
 }
 
@@ -225,23 +229,28 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 		"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng fio curl",
 		"apt-get DEBIAN_FRONTEND=noninteractive install -y -qq stress-ng fio curl",
 	}
+	// EACH LOAD RUNS BETWEEN ITS TWO STAMPS, and before and after are what
+	// runs outside them: the disk job flushes and waits before its first
+	// stamp and waits after its second, so its window holds neither setup
+	// nor what follows.
 	for _, tc := range []struct {
-		kind  string
-		load  []string
-		print string
+		kind          string
+		load          []string
+		print         string
+		before, after []string
 	}{
-		{kindBaseline, nil, "expected {}"},
-		{kindIdle, []string{"sleep 60"}, `expected {"cpu_seconds":0}`},
+		{kindBaseline, nil, "expected {}", nil, nil},
+		{kindIdle, []string{"sleep 60"}, `expected {"cpu_seconds":0}`, nil, nil},
 		{kindCPU, []string{"stress-ng --cpu 4 --cpu-method matrixprod --timeout 60s --metrics-brief"},
-			`expected {"cpu_seconds":240}`},
+			`expected {"cpu_seconds":240}`, nil, nil},
 		{kindMemory, []string{"stress-ng --vm 1 --vm-bytes 2147483648 --vm-keep --timeout 60s --metrics-brief"},
-			`expected {"memory_peak_bytes":2147483648}`},
+			`expected {"memory_peak_bytes":2147483648}`, nil, nil},
 		{kindNetwork, []string{"curl --fail --silent --show-error --location --output /dev/null " +
 			"--write-out %{size_download} https://objects.example/known?bytes=104857600"},
-			`expected {"net_rx_bytes":104857600}`},
-		{kindDisk, []string{"fio --name=known-answer --filename=RUNNER_TEMP/known-answer-work/fio.dat " +
-			"--rw=write --bs=1M --size=2147483648 --direct=1 --ioengine=libaio --iodepth=16 --end_fsync=1"},
-			`expected {"disk_write_bytes":2147483648}`},
+			`expected {"net_rx_bytes":104857600}`, nil, nil},
+		{kindDisk, []string{"sleep 2", "fio --name=known-answer --filename=RUNNER_TEMP/known-answer-work/fio.dat " +
+			"--rw=write --bs=1M --size=2147483648 --direct=1 --ioengine=libaio --iodepth=16 --end_fsync=1", "sleep 2"},
+			`expected {"disk_write_bytes":2147483648}`, []string{"sync", "sleep 2"}, []string{"sleep 2"}},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			t.Parallel()
@@ -250,7 +259,9 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v\n%s", err, out)
 			}
-			want := append(append([]string{}, prepare...), tc.load...)
+			want := append(append([]string{}, prepare...), tc.before...)
+			want = append(append(append(want, "date"), tc.load...), "date")
+			want = append(want, tc.after...)
 			got := h.calls(t)
 			for i := range got {
 				got[i] = strings.ReplaceAll(got[i], h.temp, "RUNNER_TEMP")

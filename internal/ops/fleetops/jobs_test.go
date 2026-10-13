@@ -349,10 +349,25 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 	partial.MemoryPeakBytes, partial.DiskReadBytes, partial.DiskWriteBytes = 0, 0, 0
 	partial.EnergyActiveMicrojoules, partial.EnergyIdleMicrojoules, partial.EnergySource = 0, 0, ""
 
-	shapes := map[string]*alloc.RecordedUsage{"measured": measured, "partial": &partial, "no-report": nil}
+	// THE LOAD WINDOW the checker asks for with --window: fio's 2 GiB, covered whole.
+	window := &windowJSON{From: "2026-10-09T10:00:30Z", To: "2026-10-09T10:01:31Z", Usage: &windowUsageJSON{
+		SpanMillis: 61_000, CoveredMillis: 61_000, Complete: true, Samples: 61, CPUMicros: 4_000_000,
+		DiskWriteBytes: 2_150_000_000, NetRxBytes: 10_000, EnergyActiveUJ: 120_000_000, MemoryPeakBytes: 900_000_000,
+	}}
+	window.Inner = &windowSpanJSON{From: "2026-10-09T10:00:30.4Z", To: "2026-10-09T10:01:30.4Z", Usage: windowUsageJSON{
+		SpanMillis: 60_000, CoveredMillis: 60_000, Complete: true, Samples: 61, DiskWriteBytes: 2_149_000_000}}
+	window.Outer = &windowSpanJSON{From: "2026-10-09T10:00:29.4Z", To: "2026-10-09T10:01:31.4Z", Usage: windowUsageJSON{
+		SpanMillis: 62_000, CoveredMillis: 62_000, Complete: true, Samples: 63, DiskWriteBytes: 2_151_000_000}}
+
+	type shape struct {
+		usage  *alloc.RecordedUsage
+		window *windowJSON
+	}
+	shapes := map[string]shape{"measured": {usage: measured}, "partial": {usage: &partial}, "no-report": {},
+		"measured-window": {usage: measured, window: window}}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name], nil); err != nil {
+		if err := renderJobJSON(&out, record, shapes[name].usage, nil, shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

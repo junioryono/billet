@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"strconv"
@@ -32,14 +33,31 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 	cfgPath := cli.AddConfigFlag(fs)
 	asJSON := fs.Bool("json", false, "print the record as one JSON object")
 	asHTML := fs.Bool("html", false, "print the job as one self-contained HTML page")
+	windowFlag := fs.String("window", "", "with --json, add the usage the host's series shows between FROM and "+
+		"TO, given as FROM,TO in RFC 3339")
 	if err := cli.ParseWithArgs(fs, args, 1); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: billet jobs show [--config PATH] [--json | --html] <lease>")
+		return errors.New("usage: billet jobs show [--config PATH] [--json [--window FROM,TO] | --html] <lease>")
 	}
 	if *asJSON && *asHTML {
 		return errors.New("billet jobs show: --json and --html each print the whole record; choose one")
+	}
+	// GIVEN AT ALL, EVEN EMPTY, it is a request: an empty --window= is refused
+	// rather than read as no window.
+	windowGiven := false
+	fs.Visit(func(f *flag.Flag) { windowGiven = windowGiven || f.Name == "window" })
+	var w *window
+	if windowGiven {
+		if !*asJSON {
+			return errors.New("billet jobs show: --window adds to the --json record; give --json too")
+		}
+		parsed, err := parseWindow(*windowFlag)
+		if err != nil {
+			return fmt.Errorf("billet jobs show: %w", err)
+		}
+		w = &parsed
 	}
 	leaseID := fs.Arg(0)
 
@@ -65,7 +83,12 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
-		return renderJobJSON(env.Stdout, rec, measured, guest)
+		var wj *windowJSON
+		if w != nil {
+			wj = windowJSONOf(ctx, a, leaseID, measured, *w)
+		}
+
+		return renderJobJSON(env.Stdout, rec, measured, guest, wj)
 	}
 	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	if *asHTML {
@@ -105,6 +128,8 @@ type jobJSON struct {
 	Usage       *usageJSON `json:"usage"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
+	// Window is present only when --window asked for one.
+	Window *windowJSON `json:"window,omitempty"`
 }
 
 // usageJSON is what the host measured. Groups answers for every group, with
@@ -124,14 +149,14 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // renderJobJSON writes one job's record as an indented JSON object. A job with
 // no usage report has a null usage, and one with no guest report a null guest,
 // never a report of zeros.
-func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *jobGuest) error {
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *jobGuest, win *windowJSON) error {
 	out := jobJSON{
 		Lease: rec.LeaseID, Tier: rec.Tier, Node: rec.Node, Provider: rec.ChosenProvider,
 		VCPU: rec.VCPU, MemoryBytes: rec.Memory, GitHubJobID: rec.Job.JobID, RunID: rec.RunID,
 		RequestID: max(rec.RequestID, 0), JobName: rec.Job.Name, Repository: rec.Repo,
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
-		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g),
+		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))

@@ -93,7 +93,8 @@ func TestCollectAsksBilletForEveryLeaseTheInputsName(t *testing.T) {
 	}
 	// THE FLAGS PRECEDE THE LEASE: billet's flag set stops at its first
 	// positional argument.
-	if !strings.Contains(string(argv), "jobs show --config /etc/billet/billet.yaml --json lease-100-idle\n") {
+	if !strings.Contains(string(argv), "jobs show --config /etc/billet/billet.yaml --json "+
+		"--window 2026-10-09T10:00:30Z,2026-10-09T10:01:31Z lease-100-idle\n") {
 		t.Errorf("billet was asked:\n%s", argv)
 	}
 }
