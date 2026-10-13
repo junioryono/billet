@@ -85,6 +85,15 @@ type Client struct {
 	// purgeSlot serialises PurgeTrash passes: a pass holds its one token, and a
 	// caller waiting for it can still be cancelled.
 	purgeSlot chan struct{}
+	// checkSlot serialises every read-only map of a generation's snapshot, from
+	// the map to the unmap; generationMapSlot, shared by every Client in the
+	// process, outside tests. See withGenerationMap.
+	checkSlot chan struct{}
+	// mapLock is the file whose flock extends checkSlot to every process on the
+	// host, empty for none; see WithGenerationMapLock.
+	mapLock string
+	// damaged checks a mapped generation's filesystem; checkDamage outside tests.
+	damaged func(ctx context.Context, device string) (bool, error)
 	// trashHeld remembers each trash entry a deletion found still read by a
 	// copy-on-write child, so PurgeTrash asks again only when trashHeldDue says.
 	trashHeldMu sync.Mutex
@@ -239,7 +248,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 
 	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
-		purgeSlot: make(chan struct{}, 1)}
+		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -885,12 +894,14 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 }
 
 // rbdMap maps one image under MapTimeout rather than DefaultTimeout, and is the
-// only way billet runs `rbd device map`.
-func (c *Client) rbdMap(ctx context.Context, spec string) ([]byte, error) {
+// only way billet runs `rbd device map`. options come before the spec.
+func (c *Client) rbdMap(ctx context.Context, spec string, options ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, MapTimeout)
 	defer cancel()
 
-	return c.run(ctx, c.bin, append(c.identity(), "device", "map", spec))
+	args := append(append(c.identity(), "device", "map"), options...)
+
+	return c.run(ctx, c.bin, append(args, spec))
 }
 
 // keepKernelClient prefixes a command that may take a root disk's exclusive lock

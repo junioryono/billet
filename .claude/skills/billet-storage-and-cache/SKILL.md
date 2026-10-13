@@ -22,6 +22,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **Clone v2 is a requirement, and two settings decide it.**
 - **A real build on RBD costs 2%, and the fio number that said otherwise measured a machine doing nothing but IO.**
 - **The ebs-s3 store's first real publication was refused twice by things every fake accepted.**
+- **A candidate is verified as it is published, not only as it was written.**
 - **A discard is storage, not compute, and never runs on the node's command path (#223).**
 - **On Ceph, a discard moves to the trash and the node's sweep deletes (#280, #292).**
 - **Every cache image carries object-map, and every command that changes one keeps the kernel client (#394).**
@@ -43,7 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### Sticky disks, the Go and Bazel caches and the Git proxy: [references/build-caches.md](references/build-caches.md)
 
 - **Sticky disks and the builder actions.**
-- **Go and Bazel share a content-addressed host volume per session (`casvolume.go`).**
+- **Go and Bazel share a content-addressed host volume per session (`casvolume.go`).** A damaged generation starts over, on a check's proof.
 - **The Go helper and the Bazel credential helper are billet itself, in the guest.**
 - **The Git proxy serves github.com fetches from a mirror, and only what GitHub would give that job (`gitproxy.go`).**
 - **A guest reaches its build caches through a relay that waits out a node restart (#374).**
