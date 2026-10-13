@@ -15,12 +15,14 @@ import (
 )
 
 type cacheFake struct {
-	calls               [][]string
-	images              map[string]bool
-	snapshots           map[string]bool
-	parents             map[string]string
-	depths              map[string]int
-	trash               map[string]string
+	calls     [][]string
+	images    map[string]bool
+	snapshots map[string]bool
+	parents   map[string]string
+	depths    map[string]int
+	trash     map[string]string
+	// trashFailures makes `trash rm` of a handle answer its error.
+	trashFailures       map[string]error
 	metadata            map[string]map[string]string
 	mappings            map[string]string
 	lockCookie          string
@@ -175,6 +177,10 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 
 		return json.Marshal(entries)
 	case "rm":
+		if err, ok := f.trashFailures[args[1]]; ok {
+			return nil, err
+		}
+
 		_, id, _ := strings.Cut(args[1], "/")
 		name, ok := f.trash[id]
 		if !ok {
