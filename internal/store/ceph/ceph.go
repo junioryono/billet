@@ -85,9 +85,13 @@ type Client struct {
 	// purgeSlot serialises PurgeTrash passes: a pass holds its one token, and a
 	// caller waiting for it can still be cancelled.
 	purgeSlot chan struct{}
-	// checkSlot serialises every read-only map of a generation's snapshot on
-	// this host, from the map to the unmap; see withGenerationMap.
+	// checkSlot serialises every read-only map of a generation's snapshot, from
+	// the map to the unmap; generationMapSlot, shared by every Client in the
+	// process, outside tests. See withGenerationMap.
 	checkSlot chan struct{}
+	// mapLock is the file whose flock extends checkSlot to every process on the
+	// host, empty for none; see WithGenerationMapLock.
+	mapLock string
 	// damaged checks a mapped generation's filesystem; checkDamage outside tests.
 	damaged func(ctx context.Context, device string) (bool, error)
 	// trashHeld remembers each trash entry a deletion found still read by a
@@ -244,7 +248,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 
 	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem,
 		purgeWorkers: trashPurgeWorkers, ioPressure: readHostIOPressure, pause: sleepFor,
-		purgeSlot: make(chan struct{}, 1), checkSlot: make(chan struct{}, 1), damaged: checkDamage}
+		purgeSlot: make(chan struct{}, 1), checkSlot: generationMapSlot, damaged: checkDamage}
 	for _, opt := range opts {
 		opt(c)
 	}

@@ -225,8 +225,10 @@ func TestACandidateThatFailsAsPublishedIsRemovedAndNeverPublished(t *testing.T) 
 }
 
 // publishedGeneration publishes one generation of key and answers it.
-func publishedGeneration(t *testing.T, c *Client, key string) storecontract.Candidate {
+func publishedGeneration(t *testing.T, c *Client) storecontract.Candidate {
 	t.Helper()
+
+	const key = "acme/api/go"
 
 	volume, err := c.Create(t.Context(), key, 1<<30)
 	if err != nil {
@@ -269,7 +271,7 @@ func TestAGenerationIsCheckedThroughAReadOnlyMapOfItsOwnSnapshot(t *testing.T) {
 			f := newCacheFake()
 			v := &verifiedSpecs{f: f, verdict: clean}
 			c := verifyingClient(t, f, v)
-			generation := publishedGeneration(t, c, "acme/api/go")
+			generation := publishedGeneration(t, c)
 			var checked []string
 			var readOnly []bool
 			c.damaged = func(_ context.Context, device string) (bool, error) {
@@ -308,7 +310,7 @@ func TestAGenerationMapThatLandsAsItsCallerGivesUpIsUnmapped(t *testing.T) {
 	f := newCacheFake()
 	v := &verifiedSpecs{f: f, verdict: clean}
 	c := verifyingClient(t, f, v)
-	generation := publishedGeneration(t, c, "acme/api/go")
+	generation := publishedGeneration(t, c)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

@@ -31,6 +31,9 @@ func TestADamagedGenerationStartsOverAndIsReplaced(t *testing.T) {
 	if !slices.Equal(storage.damageChecks, []string{"damaged"}) {
 		t.Fatalf("the store was asked about %v, want the generation the clone came from", storage.damageChecks)
 	}
+	if !slices.Equal(storage.damageKeys, []string{hv.Volume.Key}) || hv.Volume.Key != storage.keys[0] {
+		t.Fatalf("the store was asked about keys %v, want the session's %q", storage.damageKeys, storage.keys[0])
+	}
 	if hv.Supersedes != "damaged" || hv.Volume.Device != "/dev/rbd7" || !volumes.fresh["/dev/rbd7"] {
 		t.Fatalf("supersedes %q on %s (fresh %v); want a fresh volume in place of the damaged generation",
 			hv.Supersedes, hv.Volume.Device, volumes.fresh["/dev/rbd7"])
@@ -141,6 +144,9 @@ func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing
 	if !slices.Equal(storage.damageChecks, []string{"damaged"}) {
 		t.Fatalf("the store was asked about %v, want the newest generation", storage.damageChecks)
 	}
+	if !slices.Equal(storage.damageKeys, []string{snapshotKey(storage)}) {
+		t.Fatalf("the store was asked about keys %v, want the session's %q", storage.damageKeys, snapshotKey(storage))
+	}
 	snapshotted := storage.snapshotVolumes[len(storage.snapshotVolumes)-1]
 	if snapshotted.Device != "/dev/rbd7" {
 		t.Fatalf("snapshotted %s, want the job's own volume", snapshotted.Device)
@@ -151,4 +157,9 @@ func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing
 	if len(storage.discardedVolumes) != 1 || storage.discardedVolumes[0].Device != "/dev/rbd8" {
 		t.Fatalf("discarded %+v, want the clone of the damaged generation alone", storage.discardedVolumes)
 	}
+}
+
+// snapshotKey is the key of the volume the store last snapshotted.
+func snapshotKey(storage *fakeCacheStore) string {
+	return storage.snapshotVolumes[len(storage.snapshotVolumes)-1].Key
 }

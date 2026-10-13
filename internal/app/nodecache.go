@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -25,6 +26,10 @@ import (
 const cacheEvictionAge = 7 * 24 * time.Hour
 
 const cacheConnectionLimit = 128
+
+// generationMapLockName is the file in node.lock_dir whose flock keeps two
+// processes on a host from unmapping each other's read-only generation maps.
+const generationMapLockName = "ceph-generation-maps.lock"
 
 // NodeCacheControl is what the node's cache service asks the control plane:
 // the kill switch, and what a job may publish. The node client is both.
@@ -70,7 +75,16 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 			return nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
 
-		return ceph.New(*cfg.Node.Ceph, ceph.WithCacheSessions(CacheSessionNames(cfg)))
+		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg))}
+		// THE NODE'S LOCK DIRECTORY, because only billet's account can write it:
+		// a lock file another account could create could be held to stop every
+		// generation check on the host.
+		if cfg.Node.LockDir != "" {
+			options = append(options,
+				ceph.WithGenerationMapLock(filepath.Join(cfg.Node.LockDir, generationMapLockName)))
+		}
+
+		return ceph.New(*cfg.Node.Ceph, options...)
 	case config.ProviderEC2:
 		if cfg.Node.EBSS3 == nil {
 			return nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")

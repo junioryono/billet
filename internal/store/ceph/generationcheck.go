@@ -5,13 +5,34 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 
 	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 var _ storecontract.GenerationChecker = (*Client)(nil)
+
+// generationMapSlot is checkSlot for every Client in this process: a node holds
+// more than one (its cache store, its root disks), and a sweep by one must not
+// unmap a check the other is reading.
+var generationMapSlot = make(chan struct{}, 1)
+
+// generationMapLockPoll is how often a check waiting on another process's
+// generation-map lock tries again.
+const generationMapLockPoll = 100 * time.Millisecond
+
+// WithGenerationMapLock extends the generation-map exclusion to every process on
+// the host through an flock on path, which must be in a directory only billet's
+// account can write (a node's lock_dir): a file another account could create
+// there could be held to stop every check. Without it the exclusion is this
+// process's alone.
+func WithGenerationMapLock(path string) Option {
+	return func(c *Client) { c.mapLock = path }
+}
 
 // e2fsckUncorrected is the bit e2fsck sets in its exit status for errors it left
 // uncorrected, which under -n is every error it found. e2fsck 1.47.2 answered 12
@@ -87,12 +108,11 @@ func (c *Client) generationHandle(ctx context.Context, key, generation string) (
 func (c *Client) withGenerationMap(
 	ctx context.Context, handle, snapshot string, fn func(device string) error,
 ) error {
-	select {
-	case c.checkSlot <- struct{}{}:
-		defer func() { <-c.checkSlot }()
-	case <-ctx.Done():
-		return ctx.Err()
+	release, err := c.holdGenerationMaps(ctx)
+	if err != nil {
+		return err
 	}
+	defer release()
 
 	spec := handle + "@" + snapshot
 	out, err := c.rbdMap(ctx, spec, "--read-only")
@@ -130,6 +150,15 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 			d.Snap == "" || d.Snap == "-" || d.Device == "" {
 			continue
 		}
+		// NO UNMAP STARTS PAST THE BUDGET. One already started runs to its own
+		// bound (unmapDevice will not be cut short), so the slot is held for at
+		// most c.wait plus one unmap's bound, and the rest wait for the next sweep.
+		if cleanupCtx.Err() != nil {
+			failures = append(failures, fmt.Errorf("ceph: the generation-map cleanup ran out of time; "+
+				"%s and any after it are left for the next sweep", d.Device))
+
+			break
+		}
 		if err := c.unmapDevice(cleanupCtx, d.Device, d.Name+"@"+d.Snap); err != nil {
 			failures = append(failures, err)
 		}
@@ -142,14 +171,65 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 // failed unmap left behind, which would otherwise keep their images from ever
 // being evicted.
 func (c *Client) sweepGenerationMaps(ctx context.Context) error {
-	select {
-	case c.checkSlot <- struct{}{}:
-		defer func() { <-c.checkSlot }()
-	case <-ctx.Done():
-		return ctx.Err()
+	release, err := c.holdGenerationMaps(ctx)
+	if err != nil {
+		return err
 	}
+	defer release()
 
 	return c.unmapGenerationMaps(ctx)
+}
+
+// holdGenerationMaps takes checkSlot and, when the client has one, the host's
+// generation-map lock, in that order; release gives both back.
+func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
+	select {
+	case c.checkSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	leaveSlot := func() { <-c.checkSlot }
+	if c.mapLock == "" {
+		return leaveSlot, nil
+	}
+
+	f, err := os.OpenFile(c.mapLock, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		leaveSlot()
+
+		return nil, fmt.Errorf("ceph: open the generation-map lock: %w", err)
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = f.Close()
+			leaveSlot()
+
+			return nil, fmt.Errorf("ceph: take the generation-map lock: %w", err)
+		}
+
+		timer := time.NewTimer(generationMapLockPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			_ = f.Close()
+			leaveSlot()
+
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return func() {
+		// THE CLOSE RELEASES THE LOCK whatever the unlock answers: an flock belongs
+		// to the open file description, and this is its only descriptor.
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // the Close below releases it
+		_ = f.Close()
+		leaveSlot()
+	}, nil
 }
 
 // checkDamage runs `e2fsck -f -n` on device: damaged, clean, or could-not-tell.

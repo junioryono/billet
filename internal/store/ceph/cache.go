@@ -634,6 +634,7 @@ func (c *Client) snapshotAt(
 	if err := c.verifyCandidate(ctx, handle, generation, filesystem); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle, err)
 	}
+	filesystem.CheckedAsPublished = true
 
 	for key, value := range map[string]string{
 		cacheMetaPrefix + "key":        cacheDigest(volume.Key),
@@ -849,6 +850,17 @@ func (c *Client) publishCASAt(
 
 	if fence == 0 {
 		return fmt.Errorf("%w: fencing token zero authorises nothing", storecontract.ErrConflict)
+	}
+
+	// A CANDIDATE MADE BEFORE ITS BYTES WERE CHECKED AS PUBLISHED is checked here,
+	// outside the index lock: a publication journaled by an older release
+	// resumes after an upgrade without another Snapshot, and a restart in the
+	// middle of a publication is how the damaged generation of 2026-10-05 came
+	// to be.
+	if !candidate.Filesystem.CheckedAsPublished {
+		if err := c.verifyCandidate(ctx, candidate.Handle, candidate.Generation, candidate.Filesystem); err != nil {
+			return err
+		}
 	}
 
 	return c.withCacheLock(ctx, now, func(lockedAt time.Time) error {

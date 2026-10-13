@@ -78,8 +78,10 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
+	lockDir := t.TempDir()
 	cfg := &config.Config{Node: &config.NodeConfig{
 		Provider: config.ProviderFirecracker,
+		LockDir:  lockDir,
 		Ceph:     &config.CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache"},
 	}}
 	storage, err := nodeCacheStore(cfg, "test-deployment")
@@ -89,6 +91,16 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 	if _, ok := storage.(storecontract.GenerationChecker); !ok {
 		t.Fatalf("the Firecracker node's cache store, a %T, cannot check a generation", storage)
 	}
+
+	// AND ITS GENERATION MAPS ARE EXCLUDED HOST-WIDE through node.lock_dir: an
+	// eviction takes the lock before anything else, so it creates the file even
+	// though the stubbed rbd answers nothing.
+	if err := storage.Evict(t.Context(), time.Hour); err == nil {
+		t.Fatal("Evict succeeded against an rbd that answers nothing")
+	}
+	if _, err := os.Stat(filepath.Join(lockDir, generationMapLockName)); err != nil {
+		t.Fatalf("the generation-map lock is not in node.lock_dir: %v", err)
+	}
 }
 
 // AND THE NODE'S CACHE STORE IS BUILT WITH THAT READER. Without it Evict keeps
@@ -97,38 +109,108 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	t.Parallel()
 
-	var found bool
+	var withSessions, newWithOptions bool
 
 	ast.Inspect(nodeFunc(t, "nodecache.go", "nodeCacheStore"), func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
-		if !ok || !namesSelector(call.Fun, "ceph", "New") {
+		if !ok {
 			return true
 		}
 
-		for _, arg := range call.Args {
-			option, ok := arg.(*ast.CallExpr)
-			if !ok || !namesSelector(option.Fun, "ceph", "WithCacheSessions") || len(option.Args) != 1 {
-				continue
-			}
-
-			reader, ok := option.Args[0].(*ast.CallExpr)
-			if !ok || len(reader.Args) != 1 {
-				continue
-			}
-
-			name, nameOK := reader.Fun.(*ast.Ident)
-			cfg, cfgOK := reader.Args[0].(*ast.Ident)
-			if nameOK && cfgOK && name.Name == "CacheSessionNames" && cfg.Name == "cfg" {
-				found = true
-			}
+		if namesSelector(call.Fun, "ceph", "New") && call.Ellipsis.IsValid() && len(call.Args) == 2 {
+			options, ok := call.Args[1].(*ast.Ident)
+			newWithOptions = newWithOptions || ok && options.Name == "options"
 		}
+
+		if !namesSelector(call.Fun, "ceph", "WithCacheSessions") || len(call.Args) != 1 {
+			return true
+		}
+		reader, ok := call.Args[0].(*ast.CallExpr)
+		if !ok || len(reader.Args) != 1 {
+			return true
+		}
+		name, nameOK := reader.Fun.(*ast.Ident)
+		cfg, cfgOK := reader.Args[0].(*ast.Ident)
+		withSessions = withSessions || nameOK && cfgOK && name.Name == "CacheSessionNames" && cfg.Name == "cfg"
 
 		return true
 	})
 
-	if !found {
-		t.Fatal("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg))")
+	if !withSessions || !newWithOptions {
+		t.Fatalf("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg)) "+
+			"among the options it passes ceph.New (option %v, ceph.New(..., options...) %v)", withSessions, newWithOptions)
 	}
+}
+
+// AND THE STORE nodeCacheStore BUILDS IS THE ONE THE CACHE SERVICE IS HANDED,
+// unwrapped: the node finds the generation check by asserting that value, so an
+// adapter between the two would hide it the way #317's hid a capability.
+// startNodeCache needs a provider and a listener, so this reads the two steps.
+func TestTheNodeCacheServiceIsHandedTheStoreNodeCacheStoreBuilds(t *testing.T) {
+	t.Parallel()
+
+	assigned := func(fn *ast.FuncDecl, name string) []ast.Expr {
+		var values []ast.Expr
+		ast.Inspect(fn, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for i, lhs := range assign.Lhs {
+				if ident, ok := lhs.(*ast.Ident); ok && ident.Name == name {
+					if len(assign.Rhs) == len(assign.Lhs) {
+						values = append(values, assign.Rhs[i])
+					} else {
+						values = append(values, assign.Rhs[0])
+					}
+				}
+			}
+
+			return true
+		})
+
+		return values
+	}
+	passes := func(fn *ast.FuncDecl, matches func(ast.Expr) bool, at int, name string) bool {
+		found := false
+		ast.Inspect(fn, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if ok && matches(call.Fun) && len(call.Args) > at {
+				ident, ok := call.Args[at].(*ast.Ident)
+				found = found || ok && ident.Name == name
+			}
+
+			return true
+		})
+
+		return found
+	}
+
+	start := nodeFunc(t, "nodecache.go", "startNodeCache")
+	values := assigned(start, "storage")
+	if len(values) != 1 {
+		t.Fatalf("startNodeCache assigns storage %d times, want once, from nodeCacheStore", len(values))
+	}
+	if call, ok := values[0].(*ast.CallExpr); !ok || !isIdent(call.Fun, "nodeCacheStore") {
+		t.Fatal("startNodeCache's storage is not nodeCacheStore's result")
+	}
+	if !passes(start, func(e ast.Expr) bool { return isIdent(e, "NewNodeCacheService") }, 2, "storage") {
+		t.Fatal("startNodeCache does not hand storage to NewNodeCacheService")
+	}
+
+	service := nodeFunc(t, "nodecache.go", "NewNodeCacheService")
+	if len(assigned(service, "storage")) != 0 {
+		t.Fatal("NewNodeCacheService replaces the storage it is handed")
+	}
+	if !passes(service, func(e ast.Expr) bool { return namesSelector(e, "node", "NewCacheService") }, 3, "storage") {
+		t.Fatal("NewNodeCacheService does not hand storage to node.NewCacheService")
+	}
+}
+
+func isIdent(expr ast.Expr, name string) bool {
+	ident, ok := expr.(*ast.Ident)
+
+	return ok && ident.Name == name
 }
 
 // A HANDOVER LETS THE CACHE FINISH WHAT IT IS SENDING (#374), within what the

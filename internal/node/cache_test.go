@@ -71,6 +71,7 @@ type fakeCacheStore struct {
 	damagedGenerations map[string]bool
 	damageErr          error
 	damageChecks       []string
+	damageKeys         []string
 	// discardedVolumes are the volumes Discard was handed, in order.
 	discardedVolumes []storecontract.Volume
 }
@@ -328,8 +329,9 @@ func (f *fakeCacheStore) Discard(_ context.Context, volume storecontract.Volume)
 
 func (f *fakeCacheStore) Evict(context.Context, time.Duration) error { return nil }
 
-func (f *fakeCacheStore) GenerationDamaged(_ context.Context, _, generation string) (bool, error) {
+func (f *fakeCacheStore) GenerationDamaged(_ context.Context, key, generation string) (bool, error) {
 	f.damageChecks = append(f.damageChecks, generation)
+	f.damageKeys = append(f.damageKeys, key)
 	if f.damageErr != nil {
 		return false, f.damageErr
 	}
