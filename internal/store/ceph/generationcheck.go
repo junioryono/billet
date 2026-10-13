@@ -147,7 +147,10 @@ func (c *Client) unmapGenerationMaps(ctx context.Context) error {
 
 	var failures []error
 	for _, d := range devices {
-		if d.Pool != c.cfg.CachePool || !strings.HasPrefix(d.Name, "cache-g-") ||
+		// A NAME BILLET GIVES A GENERATION, EXACTLY, as every destructive pass
+		// requires: a lookalike an operator mapped by hand is not billet's to unmap.
+		kind, _, named := cacheImageName(d.Name)
+		if d.Pool != c.cfg.CachePool || !named || kind != "g" ||
 			d.Snap == "" || d.Snap == "-" || d.Device == "" {
 			continue
 		}
@@ -243,12 +246,12 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 // linked to its name, which never replaces a file already there. A crash midway
 // leaves a temporary file, never a lock file another account cannot open.
 func openGenerationMapLock(path string) (*os.File, error) {
-	return openGenerationMapLockRacing(path, func() {})
+	return openGenerationMapLockRacing(path, func(string) {})
 }
 
-// openGenerationMapLockRacing is openGenerationMapLock with beforeLink run at the
-// moment another process may create the file first.
-func openGenerationMapLockRacing(path string, beforeLink func()) (*os.File, error) {
+// openGenerationMapLockRacing is openGenerationMapLock with beforeLink run, given
+// the temporary file, at the moment another process may create the file first.
+func openGenerationMapLockRacing(path string, beforeLink func(tmp string)) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if !errors.Is(err, os.ErrNotExist) {
 		return f, err
@@ -262,7 +265,7 @@ func openGenerationMapLockRacing(path string, beforeLink func()) (*os.File, erro
 	if err := errors.Join(tmp.Chmod(0o660), tmp.Close()); err != nil {
 		return nil, err
 	}
-	beforeLink()
+	beforeLink(tmp.Name())
 	if err := os.Link(tmp.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}

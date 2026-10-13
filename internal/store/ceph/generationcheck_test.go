@@ -353,7 +353,7 @@ func TestTheGenerationMapLockIsNeverReplaced(t *testing.T) {
 	// the one opened, so both lock the same file.
 	raced := filepath.Join(t.TempDir(), "ceph-generation-maps.lock")
 	var theirs os.FileInfo
-	g, err := openGenerationMapLockRacing(raced, func() {
+	g, err := openGenerationMapLockRacing(raced, func(string) {
 		if err := os.WriteFile(raced, []byte("theirs"), 0o660); err != nil {
 			t.Error(err)
 		}
@@ -408,4 +408,31 @@ func TestALeaseThatExpiresDuringALegacyCheckPublishesNothing(t *testing.T) {
 			t.Fatalf("the pointer moved to the candidate: %s", pointer)
 		}
 	})
+}
+
+// The lock file has its mode before it has its name: at the link, nothing is at
+// the name yet and the temporary file is already 0660, so a crash can leave no
+// lock file another account cannot open.
+func TestTheGenerationMapLockHasItsModeBeforeItsName(t *testing.T) {
+	t.Parallel()
+
+	lock := filepath.Join(t.TempDir(), "ceph-generation-maps.lock")
+	linked := false
+	f, err := openGenerationMapLockRacing(lock, func(tmp string) {
+		linked = true
+		if _, err := os.Lstat(lock); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("something is at the lock's name before the link: %v", err)
+		}
+		info, err := os.Stat(tmp)
+		if err != nil || info.Mode().Perm() != 0o660 {
+			t.Errorf("the temporary file is %v (%v) at the link, want 0660", info.Mode().Perm(), err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("openGenerationMapLockRacing: %v", err)
+	}
+	_ = f.Close()
+	if !linked {
+		t.Fatal("the file was put in place without a link")
+	}
 }
