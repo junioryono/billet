@@ -179,3 +179,11 @@ type VolumeSizer interface {
 type KeyMatcher interface {
 	Match(ctx context.Context, exact string, restorePrefixes []string) (key, generation string, err error)
 }
+
+// GenerationChecker checks a published generation's own filesystem, read-only.
+// true is proof the generation is damaged, whatever error comes with it; false
+// with an error is could-not-tell, never "clean". Optional: a store that cannot
+// check leaves a generation that will not mount in place.
+type GenerationChecker interface {
+	GenerationDamaged(ctx context.Context, key, generation string) (bool, error)
+}

@@ -745,34 +745,18 @@ func (c *Client) copyCacheCandidate(
 func (c *Client) verifyCandidate(
 	ctx context.Context, handle, generation string, source storecontract.Filesystem,
 ) error {
-	spec := handle + "@" + generation
-	_, name, _ := strings.Cut(handle, "/")
-
-	out, err := c.rbdMap(ctx, spec, "--read-only")
-	device := strings.TrimSpace(string(out))
-	if err != nil || !strings.HasPrefix(device, "/dev/rbd") {
-		// A MAP THAT TIMED OUT CAN STILL LAND, and a device left mapping the
-		// snapshot would refuse the removal of the candidate that follows.
-		if err == nil {
-			err = fmt.Errorf("%s answered %s, which is not a device path", c.bin, bounded(device))
+	return c.withGenerationMap(ctx, handle, generation, func(device string) error {
+		filesystem, err := c.verify(ctx, device)
+		if err != nil {
+			return fmt.Errorf("ceph: verify candidate %s@%s as published: %w", handle, generation, err)
+		}
+		if filesystem.UUID != source.UUID {
+			return fmt.Errorf("ceph: candidate %s@%s holds filesystem %s, not the %s verified before "+
+				"it was made", handle, generation, bounded(filesystem.UUID), bounded(source.UUID))
 		}
 
-		return errors.Join(fmt.Errorf("ceph: map candidate %s to verify it: %w", spec, err),
-			c.unmapAll(ctx, name))
-	}
-
-	filesystem, verifyErr := c.verify(ctx, device)
-	unmapErr := c.unmapDevice(ctx, device, spec)
-	if verifyErr != nil {
-		return errors.Join(fmt.Errorf("ceph: verify candidate %s as published: %w", spec, verifyErr),
-			unmapErr)
-	}
-	if filesystem.UUID != source.UUID {
-		return errors.Join(fmt.Errorf("ceph: candidate %s holds filesystem %s, not the %s verified "+
-			"before it was made", spec, bounded(filesystem.UUID), bounded(source.UUID)), unmapErr)
-	}
-
-	return unmapErr
+		return nil
+	})
 }
 
 func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {
@@ -1660,11 +1644,14 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ceph: cache eviction needs a positive inactivity age")
 	}
 
+	// A GENERATION MAPPING A CRASH LEFT BEHIND GOES FIRST, because eviction
+	// keeps every image this host maps.
+	sweep := c.sweepGenerationMaps(ctx)
 	generations := c.withCacheLock(ctx, time.Now(), func(now time.Time) error {
 		return c.evictGenerations(ctx, olderThan, now)
 	})
 
-	return errors.Join(generations, c.evictVolumes(ctx, olderThan))
+	return errors.Join(sweep, generations, c.evictVolumes(ctx, olderThan))
 }
 
 func (c *Client) evictGenerations(ctx context.Context, olderThan time.Duration, now time.Time) error {

@@ -394,6 +394,7 @@ func (f *cacheFake) device(args []string) ([]byte, error) {
 		type mapping struct {
 			Pool   string `json:"pool"`
 			Name   string `json:"name"`
+			Snap   string `json:"snap"`
 			Device string `json:"device"`
 		}
 
@@ -401,9 +402,12 @@ func (f *cacheFake) device(args []string) ([]byte, error) {
 		for device, image := range f.mappings {
 			pool, name, _ := strings.Cut(image, "/")
 			// A mapped snapshot is listed under its image's name, its snapshot in
-			// a field of its own.
-			name, _, _ = strings.Cut(name, "@")
-			out = append(out, mapping{Pool: pool, Name: name, Device: device})
+			// a field of its own, which an image's head answers with "-".
+			name, snap, found := strings.Cut(name, "@")
+			if !found {
+				snap = "-"
+			}
+			out = append(out, mapping{Pool: pool, Name: name, Snap: snap, Device: device})
 		}
 
 		if out == nil {

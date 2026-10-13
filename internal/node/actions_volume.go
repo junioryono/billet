@@ -19,9 +19,6 @@ type actionsVolumeManager interface {
 	// Mounted reports whether something is mounted at target in this process's
 	// mount namespace; an error is could-not-tell, never "no".
 	Mounted(ctx context.Context, target string) (bool, error)
-	// Damaged reports whether a read-only check of the unmounted filesystem on
-	// device finds it damaged; an error is could-not-tell, never "no".
-	Damaged(ctx context.Context, device string) (bool, error)
 }
 
 type hostActionsVolumeManager struct{}
@@ -29,38 +26,6 @@ type hostActionsVolumeManager struct{}
 // mountpointNotMounted is util-linux mountpoint's exit status for a directory that
 // is not a mount point.
 const mountpointNotMounted = 32
-
-// e2fsckUncorrected is the bit e2fsck sets in its exit status for errors it left
-// uncorrected, which under -n is every error it found. e2fsck 1.47.2 answered 12
-// (this bit with 8, "cannot proceed") for a Go cache generation whose journal
-// superblock was corrupt, measured 2026-10-13; 8 alone is a check that could not
-// run, and says nothing about the filesystem.
-const e2fsckUncorrected = 4
-
-func (hostActionsVolumeManager) Damaged(ctx context.Context, device string) (bool, error) {
-	e2fsck, err := exec.LookPath("e2fsck")
-	if err != nil {
-		return false, fmt.Errorf("node: e2fsck is required to check a cache volume: %w", err)
-	}
-	output, err := exec.CommandContext(ctx, e2fsck, "-f", "-n", device).CombinedOutput()
-
-	return e2fsckVerdict(device, err, output)
-}
-
-// e2fsckVerdict reads what `e2fsck -f -n` answered: clean, damaged, or an error
-// for a check that ended any other way, a signal included.
-func e2fsckVerdict(device string, err error, output []byte) (bool, error) {
-	if err == nil {
-		return false, nil
-	}
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() > 0 &&
-		exitErr.ExitCode()&e2fsckUncorrected != 0 {
-		return true, nil
-	}
-
-	return false, fmt.Errorf("node: check the cache filesystem on %s: %w: %s", device, err,
-		boundedOutput(output))
-}
 
 func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target string) error {
 	mkfs, err := exec.LookPath("mkfs.ext4")

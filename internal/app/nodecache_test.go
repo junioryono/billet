@@ -11,6 +11,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 func TestCacheNamespacesIncludeTheSite(t *testing.T) {
@@ -63,15 +64,42 @@ func TestEvictionReadsTheNodesCacheSessionsEachTime(t *testing.T) {
 	}
 }
 
+// THE STORE A FIRECRACKER NODE'S CACHE IS HANDED CHECKS GENERATIONS. The node
+// finds the check by asserting the value it is given, and a damaged generation
+// stays in place without it, so it is proved on that value and not on a fake.
+func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
+	// Not parallel: the store looks for the ceph client commands on PATH, and
+	// stubs stand in for them here, which t.Setenv refuses in a parallel test.
+	dir := t.TempDir()
+	for _, name := range []string{"rbd", "ceph"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Provider: config.ProviderFirecracker,
+		Ceph:     &config.CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache"},
+	}}
+	storage, err := nodeCacheStore(cfg, "test-deployment")
+	if err != nil {
+		t.Fatalf("nodeCacheStore: %v", err)
+	}
+	if _, ok := storage.(storecontract.GenerationChecker); !ok {
+		t.Fatalf("the Firecracker node's cache store, a %T, cannot check a generation", storage)
+	}
+}
+
 // AND THE NODE'S CACHE STORE IS BUILT WITH THAT READER. Without it Evict keeps
 // every writable volume, which fails safe and leaks them all; no run-time test
-// reaches startNodeCache without a provider and a listener, so this one reads it.
+// reaches nodeCacheStore's ceph branch without a cluster, so this one reads it.
 func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	t.Parallel()
 
 	var found bool
 
-	ast.Inspect(nodeFunc(t, "nodecache.go", "startNodeCache"), func(n ast.Node) bool {
+	ast.Inspect(nodeFunc(t, "nodecache.go", "nodeCacheStore"), func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || !namesSelector(call.Fun, "ceph", "New") {
 			return true
@@ -99,7 +127,7 @@ func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	})
 
 	if !found {
-		t.Fatal("startNodeCache builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg))")
+		t.Fatal("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg))")
 	}
 }
 

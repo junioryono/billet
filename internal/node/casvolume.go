@@ -184,12 +184,14 @@ func (s *CacheService) casVolume(
 			return nil, mountErr
 		}
 
-		// A DAMAGED GENERATION STARTS OVER, as a full one does, and only on a
-		// check's proof: a mount that failed for any other reason, or a check
-		// that could not tell, leaves the generation to the next job. Before
-		// this, one damaged Go generation refused every job's clone and every
-		// merge into it from 2026-10-05 to 2026-10-13, and nothing replaced it.
-		damaged, checkErr := s.actionIO.Damaged(ctx, volume.Device)
+		// A DAMAGED GENERATION STARTS OVER, as a full one does, and only on the
+		// store's proof about the generation itself: a mount that failed for any
+		// other reason, the job's copy of a sound generation among them, or a
+		// check that could not tell, leaves the generation to the next job.
+		// Before this, one damaged Go generation refused every job's clone and
+		// every merge into it from 2026-10-05 to 2026-10-13, and nothing
+		// replaced it.
+		damaged, checkErr := s.generationDamaged(ctx, key, volume.Generation)
 		if !damaged {
 			return nil, errors.Join(mountErr, checkErr)
 		}
@@ -217,6 +219,18 @@ func (s *CacheService) casVolume(
 	}
 
 	return hv, nil
+}
+
+// generationDamaged asks the site's store whether a published generation's own
+// filesystem is damaged: true is proof, and false with an error could-not-tell,
+// which is all a store that cannot check answers.
+func (s *CacheService) generationDamaged(ctx context.Context, key, generation string) (bool, error) {
+	checker, ok := s.store.(storecontract.GenerationChecker)
+	if !ok {
+		return false, errors.New("the site's store cannot check a generation's filesystem")
+	}
+
+	return checker.GenerationDamaged(ctx, key, generation)
 }
 
 // startFresh replaces a mounted clone of a full generation with a new empty
@@ -773,7 +787,7 @@ func (s *CacheService) mergeCASVolume(
 		return "", false, release(err)
 	}
 	if err := s.actionIO.MountWritable(ctx, latest.Device, target); err != nil {
-		damaged, checkErr := s.actionIO.Damaged(ctx, latest.Device)
+		damaged, checkErr := s.generationDamaged(ctx, key, current)
 		if !damaged {
 			return "", false, release(errors.Join(err, checkErr))
 		}

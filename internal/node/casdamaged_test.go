@@ -3,21 +3,22 @@ package node
 import (
 	"errors"
 	"net/http"
-	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 // A DAMAGED GENERATION STARTS OVER WITHOUT ANYONE: the first job whose clone of
-// it will not mount, and whose check finds the filesystem damaged, starts an
-// empty volume in its place, and what that job publishes replaces it.
+// it will not mount, and whose store proves the generation itself damaged,
+// starts an empty volume in its place, and what that job publishes replaces it.
 func TestADamagedGenerationStartsOverAndIsReplaced(t *testing.T) {
 	t.Parallel()
 
-	storage := &fakeCacheStore{current: "damaged"}
+	storage := &fakeCacheStore{current: "damaged", damagedGenerations: map[string]bool{"damaged": true}}
 	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
 	volumes.damaged = map[string]bool{"/dev/rbd8": true}
 	session := service.sessionOf(instance)
@@ -27,12 +28,15 @@ func TestADamagedGenerationStartsOverAndIsReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("casVolume over a damaged generation: %v", err)
 	}
+	if !slices.Equal(storage.damageChecks, []string{"damaged"}) {
+		t.Fatalf("the store was asked about %v, want the generation the clone came from", storage.damageChecks)
+	}
 	if hv.Supersedes != "damaged" || hv.Volume.Device != "/dev/rbd7" || !volumes.fresh["/dev/rbd7"] {
 		t.Fatalf("supersedes %q on %s (fresh %v); want a fresh volume in place of the damaged generation",
 			hv.Supersedes, hv.Volume.Device, volumes.fresh["/dev/rbd7"])
 	}
-	if storage.discarded != 1 {
-		t.Fatalf("discarded %d volumes, want the clone of the damaged generation", storage.discarded)
+	if len(storage.discardedVolumes) != 1 || storage.discardedVolumes[0].Device != "/dev/rbd8" {
+		t.Fatalf("discarded %+v, want the clone of the damaged generation", storage.discardedVolumes)
 	}
 	if code := putObject(t, service, token, "after the damage"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
@@ -48,34 +52,51 @@ func TestADamagedGenerationStartsOverAndIsReplaced(t *testing.T) {
 	}
 }
 
-// A GENERATION IS STARTED OVER ONLY ON A CHECK'S PROOF: a mount that failed
-// with the filesystem found clean, or with a check that could not tell, keeps
-// the generation and the clone for the session's cleanup.
-func TestAGenerationIsKeptUnlessTheCheckFindsItDamaged(t *testing.T) {
+// uncheckedStore is a store that offers no generation check.
+type uncheckedStore struct{ storecontract.Store }
+
+// A GENERATION IS STARTED OVER ONLY ON THE STORE'S PROOF ABOUT IT: a job's copy
+// that will not mount while the generation is sound, a check that could not
+// tell, and a store that cannot check all keep the generation and leave the
+// clone to the session's cleanup.
+func TestAGenerationIsKeptUnlessTheStoreProvesItDamaged(t *testing.T) {
 	t.Parallel()
 
 	couldNotTell := errors.New("the check could not run")
-	for name, checkErr := range map[string]error{"clean": nil, "could not tell": couldNotTell} {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		damageErr error
+		unchecked bool
+	}{
+		{name: "a damaged copy of a sound generation"},
+		{name: "a check that could not tell", damageErr: couldNotTell},
+		{name: "a store that cannot check", unchecked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			storage := &fakeCacheStore{current: "published"}
+			storage := &fakeCacheStore{current: "published", damageErr: tc.damageErr}
 			service, volumes, _, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
-			volumes.failSuffix = "/go"
-			volumes.checkErr = checkErr
+			volumes.damaged = map[string]bool{"/dev/rbd8": true}
+			if tc.unchecked {
+				service.store = uncheckedStore{storage}
+			}
 			session := service.sessionOf(instance)
 			session.mu.Lock()
 			_, err := service.casVolume(t.Context(), session, config.CacheGo)
 			hv := session.hosts[config.CacheGo]
 			session.mu.Unlock()
-			if err == nil || !strings.Contains(err.Error(), "the mount failed") {
+			if err == nil || !strings.Contains(err.Error(), "probably corrupted filesystem") {
 				t.Fatalf("casVolume = %v, want the mount's failure", err)
 			}
-			if checkErr != nil && !errors.Is(err, checkErr) {
+			if tc.damageErr != nil && !errors.Is(err, tc.damageErr) {
 				t.Errorf("casVolume = %v, which drops what the check could not tell", err)
 			}
-			if len(volumes.checked) != 1 || volumes.checked[0] != "/dev/rbd8" {
-				t.Errorf("checked %v, want the clone that failed to mount", volumes.checked)
+			if tc.unchecked && !strings.Contains(err.Error(), "cannot check") {
+				t.Errorf("casVolume = %v, which does not say the store cannot check", err)
+			}
+			if want := !tc.unchecked; (len(storage.damageChecks) == 1) != want {
+				t.Errorf("the store was asked %v; asked: %v", storage.damageChecks, want)
 			}
 			if storage.created != 0 || storage.discarded != 0 || hv == nil || hv.Supersedes != "" {
 				t.Fatalf("created %d, discarded %d, record %+v; want the generation and clone kept",
@@ -85,9 +106,9 @@ func TestAGenerationIsKeptUnlessTheCheckFindsItDamaged(t *testing.T) {
 	}
 }
 
-// A MERGE INTO A DAMAGED GENERATION PUBLISHES THE JOB'S OWN VOLUME IN ITS PLACE,
-// discarding its clone of the damaged generation and unmounting its own volume
-// before the snapshot.
+// A MERGE INTO A DAMAGED GENERATION PUBLISHES THE JOB'S OWN VOLUME IN ITS PLACE:
+// its own volume is unmounted before the snapshot, and the clone of the damaged
+// generation, not the job's volume, is what is discarded.
 func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing.T) {
 	t.Parallel()
 
@@ -96,8 +117,19 @@ func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing
 	if code := putObject(t, service, token, "ours"); code != http.StatusOK {
 		t.Fatalf("PUT = %d", code)
 	}
+	session := service.sessionOf(instance)
+	source := service.casMountPath(session, config.CacheGo) + ".source"
 	storage.current = "damaged"
+	storage.damagedGenerations = map[string]bool{"damaged": true}
 	volumes.damaged = map[string]bool{"/dev/rbd8": true}
+	var sourceMountedAtSnapshot []bool
+	storage.snapshotHook = func() {
+		mounted, err := volumes.Mounted(t.Context(), source)
+		if err != nil {
+			t.Errorf("Mounted(%s): %v", source, err)
+		}
+		sourceMountedAtSnapshot = append(sourceMountedAtSnapshot, mounted)
+	}
 	finish(t, service, instance)
 	if err := service.RetryClosed(t.Context()); err != nil {
 		t.Fatalf("RetryClosed: %v", err)
@@ -106,41 +138,17 @@ func TestAMergeIntoADamagedGenerationPublishesTheJobsVolumeInItsPlace(t *testing
 		t.Fatalf("published %d over %v, current %q; want the job's volume over the damaged generation",
 			storage.published, storage.publishExpected, storage.current)
 	}
+	if !slices.Equal(storage.damageChecks, []string{"damaged"}) {
+		t.Fatalf("the store was asked about %v, want the newest generation", storage.damageChecks)
+	}
 	snapshotted := storage.snapshotVolumes[len(storage.snapshotVolumes)-1]
 	if snapshotted.Device != "/dev/rbd7" {
 		t.Fatalf("snapshotted %s, want the job's own volume", snapshotted.Device)
 	}
-	if storage.discarded != 1 {
-		t.Fatalf("discarded %d, want the clone of the damaged generation alone", storage.discarded)
+	if !slices.Equal(sourceMountedAtSnapshot, []bool{false}) {
+		t.Fatalf("the job's volume was mounted at the snapshot: %v", sourceMountedAtSnapshot)
 	}
-	for _, target := range volumes.targets {
-		if mounted, err := volumes.Mounted(t.Context(), target); err != nil || mounted {
-			t.Errorf("%s is still mounted (%v) after the publication", target, err)
-		}
-	}
-}
-
-// e2fsck's exit status decides: the uncorrected-errors bit is damage, 8 alone
-// is a check that could not run, and a signal is no verdict.
-func TestTheCheckReadsE2fsckExitStatus(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		script  string
-		damaged bool
-		err     bool
-	}{
-		{"exit 0", false, false},
-		{"exit 4", true, false},
-		{"exit 12", true, false},
-		{"exit 8", false, true},
-		{"kill -9 $$", false, true},
-	} {
-		err := exec.CommandContext(t.Context(), "sh", "-c", tc.script).Run()
-		damaged, verdictErr := e2fsckVerdict("/dev/rbd9", err, nil)
-		if damaged != tc.damaged || (verdictErr != nil) != tc.err {
-			t.Errorf("%q: damaged %v, error %v; want %v and an error %v",
-				tc.script, damaged, verdictErr, tc.damaged, tc.err)
-		}
+	if len(storage.discardedVolumes) != 1 || storage.discardedVolumes[0].Device != "/dev/rbd8" {
+		t.Fatalf("discarded %+v, want the clone of the damaged generation alone", storage.discardedVolumes)
 	}
 }

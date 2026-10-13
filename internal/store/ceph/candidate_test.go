@@ -3,6 +3,8 @@ package ceph
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -219,6 +221,191 @@ func TestACandidateThatFailsAsPublishedIsRemovedAndNeverPublished(t *testing.T) 
 				}
 			})
 		}
+	}
+}
+
+// publishedGeneration publishes one generation of key and answers it.
+func publishedGeneration(t *testing.T, c *Client, key string) storecontract.Candidate {
+	t.Helper()
+
+	volume, err := c.Create(t.Context(), key, 1<<30)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	lease, fence, err := c.AcquireWriter(t.Context(), key, "writer", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireWriter: %v", err)
+	}
+	candidate, err := c.Snapshot(t.Context(), volume)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if err := c.PublishCAS(t.Context(), key, "", candidate, lease, fence); err != nil {
+		t.Fatalf("PublishCAS: %v", err)
+	}
+
+	return candidate
+}
+
+// A generation is checked through a read-only map of its own snapshot, which is
+// unmapped afterwards; the check's answer is the store's, could-not-tell
+// included, and a generation the key never had is never mapped.
+func TestAGenerationIsCheckedThroughAReadOnlyMapOfItsOwnSnapshot(t *testing.T) {
+	t.Parallel()
+
+	couldNotTell := errors.New("e2fsck: exit status 8")
+	for _, tc := range []struct {
+		name    string
+		damaged bool
+		err     error
+	}{
+		{name: "damaged", damaged: true},
+		{name: "sound"},
+		{name: "could not tell", err: couldNotTell},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCacheFake()
+			v := &verifiedSpecs{f: f, verdict: clean}
+			c := verifyingClient(t, f, v)
+			generation := publishedGeneration(t, c, "acme/api/go")
+			var checked []string
+			var readOnly []bool
+			c.damaged = func(_ context.Context, device string) (bool, error) {
+				checked = append(checked, f.mappings[device])
+				readOnly = append(readOnly, v.mappedReadOnly(device))
+
+				return tc.damaged, tc.err
+			}
+
+			damaged, err := c.GenerationDamaged(t.Context(), "acme/api/go", generation.Generation)
+			if damaged != tc.damaged || !errors.Is(err, tc.err) || (tc.err == nil && err != nil) {
+				t.Fatalf("GenerationDamaged = %v, %v; want %v, %v", damaged, err, tc.damaged, tc.err)
+			}
+			want := generation.Handle + "@" + generation.Generation
+			if !slices.Equal(checked, []string{want}) || !readOnly[0] {
+				t.Fatalf("checked %v (read-only %v), want %s read-only", checked, readOnly, want)
+			}
+			if len(f.mappings) != 0 {
+				t.Errorf("devices are still mapped: %v", f.mappings)
+			}
+
+			checked = nil
+			_, err = c.GenerationDamaged(t.Context(), "acme/api/go", "1791000000-0000000000000000000000ab")
+			if !errors.Is(err, storecontract.ErrMiss) || len(checked) != 0 {
+				t.Errorf("a generation the key never had answered %v after checking %v", err, checked)
+			}
+		})
+	}
+}
+
+// A map that the kernel finishes as its caller gives up is unmapped all the
+// same, under a context of its own.
+func TestAGenerationMapThatLandsAsItsCallerGivesUpIsUnmapped(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	v := &verifiedSpecs{f: f, verdict: clean}
+	c := verifyingClient(t, f, v)
+	generation := publishedGeneration(t, c, "acme/api/go")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c.run = func(runCtx context.Context, bin string, args []string) ([]byte, error) {
+		if slices.Contains(args, "map") && slices.Contains(args, "--read-only") {
+			if _, err := f.run(runCtx, bin, args); err != nil {
+				return nil, err
+			}
+			cancel()
+
+			return nil, errors.New("exit status 110: rbd: map failed: (110) Connection timed out")
+		}
+
+		return f.run(runCtx, bin, args)
+	}
+
+	if _, err := c.GenerationDamaged(ctx, "acme/api/go", generation.Generation); err == nil {
+		t.Fatal("GenerationDamaged answered although its map failed")
+	}
+	if len(f.mappings) != 0 {
+		t.Fatalf("the map that landed is still mapped: %v", f.mappings)
+	}
+}
+
+// Eviction first unmaps a read-only generation mapping a crash left behind, and
+// no other mapping.
+func TestEvictionUnmapsAGenerationMappingACrashLeftBehind(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	f.mappings["/dev/rbd40"] = "billet-cache/cache-g-1791233900-6916d9e459925223c4c82c1b@1791233900-7f26324f3e5fd2d379cf1af8"
+	f.mappings["/dev/rbd41"] = "billet-cache/cache-v-1791233827-6d7c5816deb0541e07660197"
+	f.mappings["/dev/rbd42"] = "billet-cache/billet-71d12938a937b3369325e5f25dee1f5e"
+	f.mappings["/dev/rbd43"] = "billet-cache/cache-g-1791184358-ce496b62ed22214a13fbed7b"
+	f.mappings["/dev/rbd44"] = "billet-cache/cache-v-1791233827-6d7c5816deb0541e07660197@1791233900-7f26324f3e5fd2d379cf1af8"
+	f.mappings["/dev/rbd45"] = "billet-images/ubuntu-2404-x64@g20261013005155"
+
+	if err := c.Evict(t.Context(), time.Hour); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	if _, ok := f.mappings["/dev/rbd40"]; ok {
+		t.Error("the generation mapping a crash left behind is still mapped")
+	}
+	for _, device := range []string{"/dev/rbd41", "/dev/rbd42", "/dev/rbd43", "/dev/rbd44", "/dev/rbd45"} {
+		if _, ok := f.mappings[device]; !ok {
+			t.Errorf("eviction unmapped %s, which is no generation's snapshot", device)
+		}
+	}
+}
+
+// The damage check runs `e2fsck -f -n <device>` and reads its exit status: the
+// uncorrected-errors bit is damage, and anything else that is not 0 (8 alone, a
+// signal, a missing executable, a cancelled check) is could-not-tell.
+func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		body    string
+		damaged bool
+		err     bool
+	}{
+		{"clean", "exit 0", false, false},
+		{"uncorrected", "exit 4", true, false},
+		{"uncorrected and cannot proceed", "exit 12", true, false},
+		{"operational error", "exit 8", false, true},
+		{"signal", "kill -9 $$", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			e2fsck := filepath.Join(dir, "e2fsck")
+			script := "#!/bin/sh\nprintf '%s ' \"$@\" > " + filepath.Join(dir, "args") + "\n" + tc.body + "\n"
+			if err := os.WriteFile(e2fsck, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9")
+			if damaged != tc.damaged || (err != nil) != tc.err {
+				t.Fatalf("checkDamageWith = %v, %v; want %v and an error %v", damaged, err, tc.damaged, tc.err)
+			}
+			args, err := os.ReadFile(filepath.Join(dir, "args"))
+			if err != nil || string(args) != "-f -n /dev/rbd9 " {
+				t.Fatalf("e2fsck ran with %q (%v), want -f -n /dev/rbd9", args, err)
+			}
+		})
+	}
+
+	if damaged, err := checkDamageWith(t.Context(), filepath.Join(t.TempDir(), "absent"), "/dev/rbd9"); damaged || err == nil {
+		t.Errorf("a missing e2fsck answered %v, %v; want could-not-tell", damaged, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if damaged, err := checkDamageWith(ctx, "/bin/sh", "/dev/rbd9"); damaged || err == nil {
+		t.Errorf("a cancelled check answered %v, %v; want could-not-tell", damaged, err)
 	}
 }
 
