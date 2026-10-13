@@ -885,12 +885,14 @@ func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]
 }
 
 // rbdMap maps one image under MapTimeout rather than DefaultTimeout, and is the
-// only way billet runs `rbd device map`.
-func (c *Client) rbdMap(ctx context.Context, spec string) ([]byte, error) {
+// only way billet runs `rbd device map`. options come before the spec.
+func (c *Client) rbdMap(ctx context.Context, spec string, options ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, MapTimeout)
 	defer cancel()
 
-	return c.run(ctx, c.bin, append(c.identity(), "device", "map", spec))
+	args := append(append(c.identity(), "device", "map"), options...)
+
+	return c.run(ctx, c.bin, append(args, spec))
 }
 
 // keepKernelClient prefixes a command that may take a root disk's exclusive lock

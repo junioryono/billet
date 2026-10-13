@@ -36,6 +36,13 @@ type deviceVolumes struct {
 	// target ends with it.
 	targets    []string
 	failSuffix string
+	// damaged are the devices whose filesystem a check finds damaged, which
+	// refuse every mount the way the kernel refuses a corrupt ext4; checkErr is
+	// what a check answers when it could not tell, and checked every device a
+	// check was asked about.
+	damaged  map[string]bool
+	checkErr error
+	checked  []string
 }
 
 func newDeviceVolumes(t *testing.T) *deviceVolumes {
@@ -63,9 +70,13 @@ func (d *deviceVolumes) mount(device, target string) error {
 	d.mu.Lock()
 	d.targets = append(d.targets, target)
 	fail := d.failSuffix != "" && strings.HasSuffix(target, d.failSuffix)
+	damaged := d.damaged[device]
 	d.mu.Unlock()
 	if fail {
 		return errors.New("the mount failed")
+	}
+	if damaged {
+		return errors.New("exit status 32: mount: cannot mount; probably corrupted filesystem on " + device)
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return err
@@ -91,6 +102,17 @@ func (d *deviceVolumes) MountReadOnly(_ context.Context, device, target string) 
 }
 
 func (d *deviceVolumes) Trim(context.Context, string) error { return nil }
+
+func (d *deviceVolumes) Damaged(_ context.Context, device string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.checked = append(d.checked, device)
+	if d.checkErr != nil {
+		return false, d.checkErr
+	}
+
+	return d.damaged[device], nil
+}
 
 // Mounted reports a link, which is what this manager's mount makes.
 func (d *deviceVolumes) Mounted(_ context.Context, target string) (bool, error) {

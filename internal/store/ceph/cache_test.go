@@ -378,8 +378,10 @@ func (f *cacheFake) imageMeta(args []string, asJSON bool) ([]byte, error) {
 func (f *cacheFake) device(args []string) ([]byte, error) {
 	switch args[0] {
 	case "map":
-		image := args[1]
-		if !f.images[image] {
+		image := args[len(args)-1]
+		// A snapshot maps only read-only, as rbd maps one whatever it is asked.
+		readOnly := slices.Contains(args, "--read-only")
+		if !f.images[image] && (!readOnly || !f.snapshots[image]) {
 			return nil, errors.New("rbd: (2) No such file or directory")
 		}
 
@@ -398,6 +400,9 @@ func (f *cacheFake) device(args []string) ([]byte, error) {
 		var out []mapping
 		for device, image := range f.mappings {
 			pool, name, _ := strings.Cut(image, "/")
+			// A mapped snapshot is listed under its image's name, its snapshot in
+			// a field of its own.
+			name, _, _ = strings.Cut(name, "@")
 			out = append(out, mapping{Pool: pool, Name: name, Device: device})
 		}
 

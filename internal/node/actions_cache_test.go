@@ -116,6 +116,11 @@ func (f *fakeActionsVolumeManager) Mounted(_ context.Context, target string) (bo
 	return true, nil
 }
 
+// Damaged could never tell: no mount here fails for a damaged filesystem.
+func (f *fakeActionsVolumeManager) Damaged(context.Context, string) (bool, error) {
+	return false, errors.New("the fake does not check filesystems")
+}
+
 func (f *fakeActionsVolumeManager) Trim(_ context.Context, target string) error {
 	f.trimmed++
 	if f.trimCheck != nil {

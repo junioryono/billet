@@ -631,6 +631,10 @@ func (c *Client) snapshotAt(
 		}
 	}
 
+	if err := c.verifyCandidate(ctx, handle, generation, filesystem); err != nil {
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle, err)
+	}
+
 	for key, value := range map[string]string{
 		cacheMetaPrefix + "key":        cacheDigest(volume.Key),
 		cacheMetaPrefix + "generation": generation,
@@ -726,6 +730,49 @@ func (c *Client) copyCacheCandidate(
 	}
 
 	return nil
+}
+
+// verifyCandidate checks the filesystem a clone of a frozen candidate will hold,
+// read from the cluster through a read-only device of its own, and requires it
+// to be the filesystem verified before the candidate was made.
+//
+// THE SOURCE'S CHECK DOES NOT PROVE THE CANDIDATE. It reads through the kernel
+// device that wrote the volume, and a compacted candidate is a copy made after
+// it. On 2026-10-05, while the cluster was timing out, a compaction published a
+// Go cache generation holding 4 MiB of data, whose journal superblock e2fsck
+// calls corrupt (exit 12, measured 2026-10-13). Every clone of it failed to
+// mount for eight days, and every merge into it failed, so nothing replaced it.
+func (c *Client) verifyCandidate(
+	ctx context.Context, handle, generation string, source storecontract.Filesystem,
+) error {
+	spec := handle + "@" + generation
+	_, name, _ := strings.Cut(handle, "/")
+
+	out, err := c.rbdMap(ctx, spec, "--read-only")
+	device := strings.TrimSpace(string(out))
+	if err != nil || !strings.HasPrefix(device, "/dev/rbd") {
+		// A MAP THAT TIMED OUT CAN STILL LAND, and a device left mapping the
+		// snapshot would refuse the removal of the candidate that follows.
+		if err == nil {
+			err = fmt.Errorf("%s answered %s, which is not a device path", c.bin, bounded(device))
+		}
+
+		return errors.Join(fmt.Errorf("ceph: map candidate %s to verify it: %w", spec, err),
+			c.unmapAll(ctx, name))
+	}
+
+	filesystem, verifyErr := c.verify(ctx, device)
+	unmapErr := c.unmapDevice(ctx, device, spec)
+	if verifyErr != nil {
+		return errors.Join(fmt.Errorf("ceph: verify candidate %s as published: %w", spec, verifyErr),
+			unmapErr)
+	}
+	if filesystem.UUID != source.UUID {
+		return errors.Join(fmt.Errorf("ceph: candidate %s holds filesystem %s, not the %s verified "+
+			"before it was made", spec, bounded(filesystem.UUID), bounded(source.UUID)), unmapErr)
+	}
+
+	return unmapErr
 }
 
 func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {

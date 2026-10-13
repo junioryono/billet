@@ -179,7 +179,27 @@ func (s *CacheService) casVolume(
 		mount = s.actionIO.MountNew
 	}
 	if err := mount(ctx, volume.Device, s.casMountPath(session, kind)); err != nil {
-		return nil, fmt.Errorf("mount the %s cache: %w", kind, err)
+		mountErr := fmt.Errorf("mount the %s cache: %w", kind, err)
+		if cold {
+			return nil, mountErr
+		}
+
+		// A DAMAGED GENERATION STARTS OVER, as a full one does, and only on a
+		// check's proof: a mount that failed for any other reason, or a check
+		// that could not tell, leaves the generation to the next job. Before
+		// this, one damaged Go generation refused every job's clone and every
+		// merge into it from 2026-10-05 to 2026-10-13, and nothing replaced it.
+		damaged, checkErr := s.actionIO.Damaged(ctx, volume.Device)
+		if !damaged {
+			return nil, errors.Join(mountErr, checkErr)
+		}
+		s.log.Warn("a published cache generation is damaged; this job starts it over in its place",
+			"instance", session.instance, "kind", kind, "generation", volume.Generation, "error", err)
+		if err := s.startFresh(ctx, session, hv, key, ceiling); err != nil {
+			return nil, err
+		}
+
+		return hv, nil
 	}
 	hv.Mounted = true
 	if err := s.persistSession(session); err != nil {
@@ -753,7 +773,35 @@ func (s *CacheService) mergeCASVolume(
 		return "", false, release(err)
 	}
 	if err := s.actionIO.MountWritable(ctx, latest.Device, target); err != nil {
-		return "", false, release(err)
+		damaged, checkErr := s.actionIO.Damaged(ctx, latest.Device)
+		if !damaged {
+			return "", false, release(errors.Join(err, checkErr))
+		}
+
+		// THE NEWEST GENERATION IS DAMAGED, so nothing can be merged into it:
+		// the session's own volume is published in its place, as a fresh start's
+		// is in place of a full one.
+		s.log.Warn("the newest generation of a cache is damaged; this job's volume is published in its place",
+			"instance", session.instance, "kind", hv.Kind, "generation", current, "error", err)
+		if err := s.actionIO.Unmount(ctx, source); err != nil {
+			return "", false, release(err)
+		}
+		if err := s.store.Discard(ctx, latest); err != nil {
+			return "", false, release(err)
+		}
+		hv.Merge = nil
+		if err := s.persistSession(session); err != nil {
+			return "", false, release(err)
+		}
+		candidate, err := s.store.Snapshot(ctx, hv.Volume)
+		if err != nil {
+			return "", false, release(fmt.Errorf("snapshot: %w", err))
+		}
+		if err := publish(current, candidate); err != nil {
+			return "", false, err
+		}
+
+		return candidate.Generation, true, nil
 	}
 	if err := copyMissingObjects(ctx, source, target); err != nil {
 		return "", false, release(err)
