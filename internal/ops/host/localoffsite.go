@@ -181,6 +181,8 @@ func uploadArchive(ctx context.Context, env cli.Env, cfg *config.Config, dir, de
 	fmt.Fprintf(env.Stdout, "Restore it on another machine with:\n")
 	fmt.Fprintf(env.Stdout, "\n  billet local restore --from-backup %s --dry-run\n", name)
 
+	pruneLocalArchives(ctx, env, store, deployment, dir)
+
 	return nil
 }
 

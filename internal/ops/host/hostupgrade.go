@@ -1123,6 +1123,18 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 		return errors.Join(err, claimErr)
 	}
 
+	// RETENTION NEVER DECIDES THE OUTCOME: the transaction is over, and a
+	// directory that could not be removed is said and left for the next one.
+	removed, pruneErr := pruneRecoveries(root)
+	if len(removed) > 0 {
+		fmt.Fprintf(env.Stdout, "\nRemoved %d older recovery directories from %s; the newest %d are kept.\n",
+			len(removed), upgradeRoot, keepRecoveries)
+	}
+
+	if pruneErr != nil {
+		fmt.Fprintf(env.Stdout, "\nCould not remove every older recovery directory: %v\n", pruneErr)
+	}
+
 	return err
 }
 
@@ -1657,8 +1669,8 @@ func activePath() string { return filepath.Join(upgradeRoot, activePointer) }
 // THE RECOVERY DIRECTORY STAYS. Its journal is the record of what happened and
 // the only place the preserved binary, units and configuration live; removing it
 // with the pointer would delete the evidence an operator reads after a rollback,
-// and the snapshot a second attempt might still need. Ordinary retention is a
-// person's decision, not this command's.
+// and the snapshot a second attempt might still need. Retention is
+// pruneRecoveries', after the claim is released, and it keeps the newest few.
 func releaseClaim(root *os.File, dir string) error {
 	// IT REMOVES THE CLAIM IT WAS GIVEN, NOT WHATEVER CLAIM EXISTS.
 	//

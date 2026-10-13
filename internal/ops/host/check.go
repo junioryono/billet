@@ -785,8 +785,9 @@ func reportTimer(ctx context.Context, env cli.Env, label, timer, consequence str
 }
 
 // localBackupDir is where the packaged backup unit writes, one directory per
-// run; the unit's ExecStart is the one spelling of it.
-const localBackupDir = "/var/lib/billet/backups"
+// run; the unit's ExecStart is the one spelling of it. A variable so a test can
+// stand a directory in for it.
+var localBackupDir = "/var/lib/billet/backups"
 
 // localBackupStale is two missed daily runs.
 const localBackupStale = 48 * time.Hour
