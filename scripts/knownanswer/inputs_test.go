@@ -14,7 +14,7 @@ import (
 // renamed there fails here rather than reading as zero on the host.
 func TestTheRecordsAreReadAsJobsShowWritesThem(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"measured", "partial", "no-report"} {
+	for _, name := range []string{"measured", "partial", "no-report", "measured-window"} {
 		body, err := os.ReadFile(filepath.Join("testdata", "jobs-show", name+".json"))
 		if err != nil {
 			t.Fatal(err)
@@ -53,6 +53,26 @@ func TestTheRecordsAreReadAsJobsShowWritesThem(t *testing.T) {
 		if partial.Usage.Measured[group] != want {
 			t.Errorf("partial: %s measured = %v, want %v", group, partial.Usage.Measured[group], want)
 		}
+	}
+
+	if measured.Window != nil {
+		t.Errorf("a record collected without --window carries one: %+v", *measured.Window)
+	}
+
+	windowed, err := loadRecord(dir, "measured-window")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := windowed.Window; w == nil || w.From != "2026-10-09T10:00:30Z" || w.To != "2026-10-09T10:01:31Z" ||
+		w.Usage == nil || !w.Usage.Complete || w.Usage.SpanMillis != 61_000 || w.Usage.CoveredMillis != 61_000 ||
+		w.Usage.DiskWriteBytes == nil || *w.Usage.DiskWriteBytes != 2_150_000_000 {
+		t.Errorf("window = %+v", w)
+	}
+	if w := windowed.Window; w == nil || w.Inner == nil || w.Outer == nil ||
+		w.Inner.Usage.DiskWriteBytes == nil || *w.Inner.Usage.DiskWriteBytes != 2_149_000_000 ||
+		w.Outer.Usage.DiskWriteBytes == nil || *w.Outer.Usage.DiskWriteBytes != 2_151_000_000 ||
+		w.Outer.From != "2026-10-09T10:00:29.4Z" {
+		t.Errorf("bounds = %+v", w)
 	}
 
 	none, err := loadRecord(dir, "no-report")

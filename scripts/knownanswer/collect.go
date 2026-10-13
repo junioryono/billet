@@ -36,8 +36,12 @@ func collectLeases(exps []expectation, rows []powerRow) []string {
 // <out>/<lease>.json. It runs where the ledger is: `billet jobs show` opens the
 // control plane's, so on a two-host deployment this runs on the control plane.
 // A lease billet cannot answer for is reported and counted, and the others are
-// still collected.
-func collect(ctx context.Context, w io.Writer, billet, config, out string, leases []string) (int, error) {
+// still collected. windows gives a lease's load window, which billet is asked
+// to integrate its series over; a billet too old to know --window is asked
+// again without it.
+func collect(ctx context.Context, w io.Writer, billet, config, out string, leases []string,
+	windows map[string]string,
+) (int, error) {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return 0, err
 	}
@@ -53,11 +57,9 @@ func collect(ctx context.Context, w io.Writer, billet, config, out string, lease
 		if config != "" {
 			args = append(args, "--config", config)
 		}
-		args = append(args, "--json", lease)
-		var stdout, stderr bytes.Buffer
-		cmd := exec.CommandContext(ctx, billet, args...)
-		cmd.Stdout, cmd.Stderr = &stdout, &stderr
-		if err := cmd.Run(); err != nil {
+		args = append(args, "--json")
+		stdout, stderr, err := jobsShow(ctx, billet, args, windows[lease], lease)
+		if err != nil {
 			fmt.Fprintf(w, "%s: billet jobs show failed: %v: %s\n", lease, err, strings.TrimSpace(stderr.String()))
 			failed++
 
@@ -87,4 +89,30 @@ func collect(ctx context.Context, w io.Writer, billet, config, out string, lease
 	}
 
 	return failed, nil
+}
+
+// jobsShow runs `billet jobs show` with args, the window when there is one,
+// and the lease. A billet that does not define --window refuses the flag by
+// name, and is asked again without it, so its record keeps the median rule.
+func jobsShow(ctx context.Context, billet string, args []string, window, lease string,
+) (bytes.Buffer, bytes.Buffer, error) {
+	run := func(args []string) (bytes.Buffer, bytes.Buffer, error) {
+		var stdout, stderr bytes.Buffer
+		cmd := exec.CommandContext(ctx, billet, args...)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+
+		return stdout, stderr, err
+	}
+
+	if window == "" {
+		return run(append(slices.Clone(args), lease))
+	}
+
+	stdout, stderr, err := run(append(slices.Clone(args), "--window", window, lease))
+	if err != nil && strings.Contains(stderr.String(), "flag provided but not defined: -window") {
+		return run(append(slices.Clone(args), lease))
+	}
+
+	return stdout, stderr, err
 }
