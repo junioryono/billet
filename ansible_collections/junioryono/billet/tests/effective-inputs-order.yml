@@ -114,6 +114,7 @@
         - (billet_effective_config.node.cache | default({})).tls_cert is defined
     - {name: Configure Firecracker, condition: billet_firecracker_enabled}
     - {name: Configure guest networking, condition: billet_firecracker_enabled}
+    - {name: "Leave cephadm's log to ceph-common's rotation", condition: ['billet_ceph_enabled', 'not billet_retirement_node_ordinary | bool']}
     - {name: Configure Ceph, condition: billet_ceph_enabled}
     - {name: Remove disabled Ceph kernel module policy, condition: 'not billet_ceph_enabled'}
     - {name: Configure or remove Ceph health alerts, condition: []}
