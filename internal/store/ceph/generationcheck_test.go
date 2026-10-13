@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -434,5 +435,100 @@ func TestTheGenerationMapLockHasItsModeBeforeItsName(t *testing.T) {
 	_ = f.Close()
 	if !linked {
 		t.Fatal("the file was put in place without a link")
+	}
+}
+
+// The lock file excludes another process's sweep from a check in progress,
+// through the real check and eviction paths: two clients with slots of their
+// own, as two processes have, and one lock file.
+func TestAnotherProcesssSweepWaitsForACheckThroughTheLockFile(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		lock := filepath.Join(t.TempDir(), "ceph-generation-maps.lock")
+		f := newCacheFake()
+		v := &verifiedSpecs{f: f, verdict: clean}
+		checker := verifyingClient(t, f, v)
+		sweeper := cacheClient(t, f)
+		checker.checkSlot, sweeper.checkSlot = make(chan struct{}, 1), make(chan struct{}, 1)
+		checker.mapLock, sweeper.mapLock = lock, lock
+		generation := publishedGeneration(t, checker)
+		spec := generation.Handle + "@" + generation.Generation
+
+		// THE ONE CLUSTER BOTH PROCESSES REACH, serialised as a cluster would be:
+		// the flock orders the two clients, but the race detector cannot see it.
+		var cluster sync.Mutex
+		shared := func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			cluster.Lock()
+			defer cluster.Unlock()
+
+			return f.run(ctx, bin, args)
+		}
+		checker.run, sweeper.run = shared, shared
+		mapped := func() []string {
+			cluster.Lock()
+			defer cluster.Unlock()
+
+			return mappedSpecs(f)
+		}
+
+		hold := make(chan struct{})
+		checker.damaged = func(context.Context, string) (bool, error) {
+			<-hold
+
+			return false, nil
+		}
+		checked := make(chan error, 1)
+		go func() {
+			_, err := checker.GenerationDamaged(t.Context(), "acme/api/go", generation.Generation)
+			checked <- err
+		}()
+		synctest.Wait()
+		evicted := make(chan error, 1)
+		go func() { evicted <- sweeper.Evict(t.Context(), time.Hour) }()
+		time.Sleep(10 * generationMapLockPoll)
+
+		if specs := mapped(); !slices.Contains(specs, spec) {
+			t.Fatalf("another process's sweep unmapped the check's device: %v", specs)
+		}
+
+		close(hold)
+		if err := <-checked; err != nil {
+			t.Fatalf("GenerationDamaged: %v", err)
+		}
+		if err := <-evicted; err != nil {
+			t.Fatalf("Evict: %v", err)
+		}
+		if specs := mapped(); len(specs) != 0 {
+			t.Errorf("devices are still mapped: %v", specs)
+		}
+	})
+}
+
+// The check a client built by New runs is e2fsck itself, read-only: a stub on
+// PATH answering 12 is damage, and it was asked about the mapped device.
+func TestTheBuiltClientsGenerationCheckRunsE2fsck(t *testing.T) {
+	// Not parallel: the check finds e2fsck on PATH, and a stub stands in for it,
+	// which t.Setenv refuses in a parallel test.
+	dir := t.TempDir()
+	args := filepath.Join(dir, "args")
+	script := "#!/bin/sh\nprintf '%s ' \"$@\" > " + args + "\nexit 12\n"
+	if err := os.WriteFile(filepath.Join(dir, "e2fsck"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	f := newCacheFake()
+	v := &verifiedSpecs{f: f, verdict: clean}
+	c := verifyingClient(t, f, v)
+	generation := publishedGeneration(t, c)
+
+	damaged, err := c.GenerationDamaged(t.Context(), "acme/api/go", generation.Generation)
+	if !damaged || err != nil {
+		t.Fatalf("GenerationDamaged = %v, %v; want the damage e2fsck's 12 proves", damaged, err)
+	}
+	ran, err := os.ReadFile(args)
+	if err != nil || !strings.HasPrefix(string(ran), "-f -n /dev/rbd") {
+		t.Fatalf("e2fsck ran with %q (%v), want -f -n on the mapped device", ran, err)
 	}
 }

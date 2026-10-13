@@ -228,3 +228,54 @@ func TestAFailedDiscardOfADamagedGenerationsCloneIsRetried(t *testing.T) {
 			clones, storage.discardedVolumes)
 	}
 }
+
+// A MERGE WHOSE NEWEST GENERATION WILL NOT MOUNT, WITHOUT THE STORE'S PROOF IT
+// IS DAMAGED, publishes nothing: a check that could not tell and a store that
+// cannot check both leave the generation, and the cleanup discards both clones.
+func TestAMergeIntoAnUnprovedGenerationPublishesNothing(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		unchecked bool
+	}{
+		{name: "a check that could not tell"},
+		{name: "a store that cannot check", unchecked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+			if tc.unchecked {
+				service.store = uncheckedStore{storage}
+			}
+			if code := putObject(t, service, token, "ours"); code != http.StatusOK {
+				t.Fatalf("PUT = %d", code)
+			}
+			storage.current = "unproved"
+			storage.damagedGenerations = map[string]bool{"unproved": true}
+			storage.damageErr = errors.New("the check could not run")
+			if !tc.unchecked {
+				storage.damagedGenerations = nil
+			}
+			volumes.damaged = map[string]bool{"/dev/rbd8": true}
+			finish(t, service, instance)
+			if err := service.RetryClosed(t.Context()); err != nil {
+				t.Fatalf("RetryClosed: %v", err)
+			}
+			if storage.snapshots != 0 || storage.published != 0 || storage.current != "unproved" {
+				t.Fatalf("%d snapshots, %d publications, current %q; want the unproved generation left alone",
+					storage.snapshots, storage.published, storage.current)
+			}
+			devices := []string{}
+			for _, volume := range storage.discardedVolumes {
+				devices = append(devices, volume.Device)
+			}
+			slices.Sort(devices)
+			if !slices.Equal(devices, []string{"/dev/rbd7", "/dev/rbd8"}) {
+				t.Fatalf("discarded %v, want the job's volume and the clone", devices)
+			}
+		})
+	}
+}
