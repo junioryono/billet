@@ -522,13 +522,23 @@ func TestTheBuiltClientsGenerationCheckRunsE2fsck(t *testing.T) {
 	v := &verifiedSpecs{f: f, verdict: clean}
 	c := verifyingClient(t, f, v)
 	generation := publishedGeneration(t, c)
+	spec := generation.Handle + "@" + generation.Generation
+	var device string
+	c.run = func(ctx context.Context, bin string, rbdArgs []string) ([]byte, error) {
+		out, err := f.run(ctx, bin, rbdArgs)
+		if err == nil && slices.Contains(rbdArgs, "map") && rbdArgs[len(rbdArgs)-1] == spec {
+			device = strings.TrimSpace(string(out))
+		}
+
+		return out, err
+	}
 
 	damaged, err := c.GenerationDamaged(t.Context(), "acme/api/go", generation.Generation)
 	if !damaged || err != nil {
 		t.Fatalf("GenerationDamaged = %v, %v; want the damage e2fsck's 12 proves", damaged, err)
 	}
 	ran, err := os.ReadFile(args)
-	if err != nil || !strings.HasPrefix(string(ran), "-f -n /dev/rbd") {
-		t.Fatalf("e2fsck ran with %q (%v), want -f -n on the mapped device", ran, err)
+	if err != nil || device == "" || string(ran) != "-f -n "+device+" " {
+		t.Fatalf("e2fsck ran with %q (%v), want -f -n on %q, the generation's own map", ran, err, device)
 	}
 }
