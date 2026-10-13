@@ -28,6 +28,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The host role owns the fail-closed ledger mount and the upgrade transaction.**
 - **The role gives way to a rollout, and renders the timers that carry one out.**
 - **The role keeps needrestart away from billet's services.**
+- **cephadm.log has one rotation rule, ceph-common's.**
 - **A converge restarts services, so never drive one from a runner billet manages.**
 - **The ordinary node restart is requested, never awaited.**
 - **The role's variables that must be supplied, never guessed.**

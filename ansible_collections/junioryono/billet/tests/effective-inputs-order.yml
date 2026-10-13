@@ -90,7 +90,7 @@
          'upgrade-recover.yml', 'upgrade-fresh-converge.yml', 'validate-interpreted-inputs.yml', 'network-disable.yml',
          'retirement-node-preflight.yml', 'needrestart.yml', 'account.yml',
          'service-account.yml', 'ledger-mount.yml', 'cache-tls.yml', 'firecracker.yml', 'network.yml',
-         'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml', 'uplink.yml']
+         'cephadm-logrotate.yml', 'ceph.yml', 'alerts.yml', 'images-refresh.yml', 'backup.yml', 'services.yml', 'uplink.yml']
       - billet_gate_main_source[-1].block[-2]['ansible.builtin.meta'] == 'flush_handlers'
     fail_msg: >-
       The ordinary imports are now {{ billet_gate_ordinary_imports }}.

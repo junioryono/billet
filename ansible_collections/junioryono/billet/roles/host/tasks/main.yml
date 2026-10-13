@@ -533,6 +533,15 @@
       ansible.builtin.import_tasks: network.yml
       when: billet_firecracker_enabled
 
+    # BEFORE ceph.yml, whose bootstrap is when cephadm writes its own logrotate
+    # file, and never on the retained route, whose writes are admitted one
+    # destination at a time.
+    - name: Leave cephadm's log to ceph-common's rotation
+      ansible.builtin.import_tasks: cephadm-logrotate.yml
+      when:
+        - billet_ceph_enabled
+        - not billet_retirement_node_ordinary | bool
+
     - name: Configure Ceph
       ansible.builtin.import_tasks: ceph.yml
       when: billet_ceph_enabled
