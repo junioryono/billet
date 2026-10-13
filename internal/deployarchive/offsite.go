@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 // ObjectStore is the narrow thing an off-box copy needs.
@@ -102,6 +104,111 @@ func Upload(ctx context.Context, a *Archive, store ObjectStore, prefix string) (
 	}
 
 	return append(uploaded, key), nil
+}
+
+// Identity is what an archive's manifest alone says about it: the name its
+// upload used and when it was taken. Reading one validates nothing else in the
+// directory, so it still answers for an archive whose other entries are gone.
+type Identity struct {
+	Name      string
+	CreatedAt time.Time
+	digest    string
+	files     []FileRecord
+}
+
+// ReadIdentity reads the identity of the archive at dir from its manifest.
+func ReadIdentity(dir string) (Identity, error) {
+	raw, err := readSmall(filepath.Join(dir, EntryManifest))
+	if err != nil {
+		return Identity{}, fmt.Errorf("deployarchive: read %s: %w", filepath.Join(dir, EntryManifest), err)
+	}
+
+	m, err := decodeManifest(raw)
+	if err != nil {
+		return Identity{}, err
+	}
+
+	created, err := time.Parse(time.RFC3339, m.CreatedAt)
+	if err != nil {
+		return Identity{}, fmt.Errorf("deployarchive: %s records no time it was taken: %w",
+			filepath.Join(dir, EntryManifest), err)
+	}
+
+	a := Archive{Manifest: m, manifestSHA: digest(raw)}
+
+	return Identity{Name: a.Name(), CreatedAt: created, digest: a.manifestSHA, files: m.Files}, nil
+}
+
+// VerifyRemainder proves that everything still in the archive at dir is what
+// its manifest declares: every file a declared entry of the declared size and
+// digest, and nothing a link, a device or anything else. A declared entry that
+// is missing is allowed, because a removal cut short leaves exactly that. Its
+// refusal names the first thing the manifest does not account for, which is
+// local data the bucket does not hold.
+func (id Identity) VerifyRemainder(dir string) error {
+	declared := make(map[string]FileRecord, len(id.files))
+	parents := map[string]bool{".": true}
+
+	for _, rec := range id.files {
+		declared[rec.Path] = rec
+
+		for d := path.Dir(rec.Path); d != "." && d != "/"; d = path.Dir(d) {
+			parents[d] = true
+		}
+	}
+
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("deployarchive: read %s: %w", p, err)
+		}
+
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+
+		rel = filepath.ToSlash(rel)
+
+		switch {
+		case d.IsDir() && parents[rel]:
+			return nil
+		case d.IsDir():
+			return fmt.Errorf("deployarchive: %s is a directory no entry %s declares lies in", p, EntryManifest)
+		case rel == EntryManifest:
+			return nil
+		case !d.Type().IsRegular():
+			return fmt.Errorf("deployarchive: %s is %s, which no archive entry is", p, d.Type())
+		}
+
+		rec, ok := declared[rel]
+		if !ok {
+			return fmt.Errorf("deployarchive: %s is not an entry %s declares", p, EntryManifest)
+		}
+
+		sum, size, err := digestFile(p)
+		if err != nil {
+			return err
+		}
+
+		if sum != rec.SHA256 || size != rec.Size {
+			return fmt.Errorf("deployarchive: %s is not the entry %s declares", p, EntryManifest)
+		}
+
+		return nil
+	})
+}
+
+// HeldBy reports whether the store holds this archive's own manifest at
+// prefix: the same bytes, by digest, and not merely an archive of the same
+// name. The manifest is uploaded last and carries every entry's digest, so
+// the store holding it is the store holding the whole archive.
+func (id Identity) HeldBy(ctx context.Context, store ObjectStore, prefix string) (bool, error) {
+	remote, err := store.Get(ctx, path.Join(prefix, EntryManifest))
+	if err != nil {
+		return false, fmt.Errorf("deployarchive: read the bucket's %s for %s: %w", EntryManifest, id.Name, err)
+	}
+
+	return digest(remote) == id.digest, nil
 }
 
 // putOrProveIdentical writes one object, or proves the one already there is the
