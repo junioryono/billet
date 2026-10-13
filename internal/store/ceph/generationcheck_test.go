@@ -171,10 +171,15 @@ func TestTheGenerationMapLockExcludesAnotherProcess(t *testing.T) {
 		}
 		again()
 
-		// GROUP-WRITABLE WHATEVER THE UMASK, for a lock_dir two accounts share.
+		// GROUP-WRITABLE WHATEVER THE UMASK, for a lock_dir two accounts share,
+		// and nothing left beside it.
 		info, err := os.Stat(lock)
 		if err != nil || info.Mode().Perm() != 0o660 {
 			t.Fatalf("the lock file is %v (%v), want 0660", info.Mode().Perm(), err)
+		}
+		entries, err := os.ReadDir(filepath.Dir(lock))
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("the lock directory holds %v (%v), want the lock file alone", entries, err)
 		}
 	})
 }
@@ -314,4 +319,93 @@ func TestDamageProvedBeforeAFailedUnmapIsStillProof(t *testing.T) {
 	if !damaged || err == nil {
 		t.Fatalf("GenerationDamaged = %v, %v; want the proof with the unmap's failure", damaged, err)
 	}
+}
+
+// An existing lock file is never replaced, and a temporary file an interrupted
+// creation left behind does not stand in for it.
+func TestTheGenerationMapLockIsNeverReplaced(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "ceph-generation-maps.lock")
+	stray := filepath.Join(dir, ".ceph-generation-maps.lock.123")
+	for _, file := range []string{lock, stray} {
+		if err := os.WriteFile(file, []byte(file), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.Stat(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := openGenerationMapLock(lock)
+	if err != nil {
+		t.Fatalf("openGenerationMapLock: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	after, err := os.Stat(lock)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("the existing lock file was replaced (%v)", err)
+	}
+
+	// AND ONE ANOTHER PROCESS PUT IN PLACE WHILE THIS ONE WAS MAKING ITS OWN is
+	// the one opened, so both lock the same file.
+	raced := filepath.Join(t.TempDir(), "ceph-generation-maps.lock")
+	var theirs os.FileInfo
+	g, err := openGenerationMapLockRacing(raced, func() {
+		if err := os.WriteFile(raced, []byte("theirs"), 0o660); err != nil {
+			t.Error(err)
+		}
+		var err error
+		if theirs, err = os.Stat(raced); err != nil {
+			t.Error(err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("openGenerationMapLockRacing: %v", err)
+	}
+	defer func() { _ = g.Close() }()
+	ours, err := g.Stat()
+	if err != nil || theirs == nil || !os.SameFile(theirs, ours) {
+		t.Fatalf("the file another process put in place first was not the one opened (%v)", err)
+	}
+}
+
+// A legacy candidate's check counts against the writer lease: a lease that
+// expires while the check waits publishes nothing.
+func TestALeaseThatExpiresDuringALegacyCheckPublishesNothing(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		f := newCacheFake()
+		v := &verifiedSpecs{f: f, verdict: clean}
+		c := verifyingClient(t, f, v)
+		volume, err := c.Create(t.Context(), "acme/api/go", 1<<30)
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		lease, fence, err := c.AcquireWriter(t.Context(), "acme/api/go", "writer", time.Minute)
+		if err != nil {
+			t.Fatalf("AcquireWriter: %v", err)
+		}
+		candidate, err := c.Snapshot(t.Context(), volume)
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		candidate.Filesystem.CheckedAsPublished = false
+		v.verdict = func(spec string) (storecontract.Filesystem, error) {
+			time.Sleep(2 * time.Minute)
+
+			return clean(spec)
+		}
+
+		err = c.PublishCAS(t.Context(), "acme/api/go", "", candidate, lease, fence)
+		if !errors.Is(err, storecontract.ErrConflict) {
+			t.Fatalf("PublishCAS after the lease expired during the check = %v, want a conflict", err)
+		}
+		if pointer := f.metadata[c.cacheIndex()][pointerKey("acme/api/go")]; strings.Contains(pointer, candidate.Generation) {
+			t.Fatalf("the pointer moved to the candidate: %s", pointer)
+		}
+	})
 }

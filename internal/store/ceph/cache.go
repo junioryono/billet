@@ -858,9 +858,13 @@ func (c *Client) publishCASAt(
 	// middle of a publication is how the damaged generation of 2026-10-05 came
 	// to be.
 	if !candidate.Filesystem.CheckedAsPublished {
+		started := time.Now()
 		if err := c.verifyCandidate(ctx, candidate.Handle, candidate.Generation, candidate.Filesystem); err != nil {
 			return err
 		}
+		// THE CHECK'S TIME COUNTS AGAINST THE WRITER LEASE: it can wait on another
+		// check's slot, and a lease that expired meanwhile authorises nothing.
+		now = now.Add(time.Since(started))
 	}
 
 	return c.withCacheLock(ctx, now, func(lockedAt time.Time) error {

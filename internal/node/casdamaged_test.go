@@ -193,3 +193,38 @@ func testAMergeIntoADamagedGeneration(t *testing.T, damageErr error) {
 func snapshotKey(storage *fakeCacheStore) string {
 	return storage.snapshotVolumes[len(storage.snapshotVolumes)-1].Key
 }
+
+// A DISCARD OF THE DAMAGED GENERATION'S CLONE THAT FAILS publishes nothing, and
+// the session's cleanup discards that same clone again: the record of it is
+// cleared only once the discard succeeded.
+func TestAFailedDiscardOfADamagedGenerationsCloneIsRetried(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, volumes, token, instance := casService(t, provider.TrustTrusted, goBazelCache(), storage)
+	if code := putObject(t, service, token, "ours"); code != http.StatusOK {
+		t.Fatalf("PUT = %d", code)
+	}
+	storage.current = "damaged"
+	storage.damagedGenerations = map[string]bool{"damaged": true}
+	storage.discardFailures = 1
+	volumes.damaged = map[string]bool{"/dev/rbd8": true}
+	finish(t, service, instance)
+	if err := service.RetryClosed(t.Context()); err != nil {
+		t.Fatalf("RetryClosed: %v", err)
+	}
+	if storage.published != 0 || storage.snapshots != 0 {
+		t.Fatalf("%d snapshots and %d publications after the clone's discard failed, want none",
+			storage.snapshots, storage.published)
+	}
+	clones := 0
+	for _, volume := range storage.discardedVolumes {
+		if volume.Device == "/dev/rbd8" {
+			clones++
+		}
+	}
+	if clones != 2 {
+		t.Fatalf("the damaged generation's clone was discarded %d times, want the failure and the retry: %+v",
+			clones, storage.discardedVolumes)
+	}
+}

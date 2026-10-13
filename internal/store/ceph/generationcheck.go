@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -232,26 +233,41 @@ func (c *Client) holdGenerationMaps(ctx context.Context) (func(), error) {
 	}, nil
 }
 
-// openGenerationMapLock opens the lock file, creating it 0660 when it is absent.
+// openGenerationMapLock opens the lock file, putting it in place 0660 when it is
+// absent.
 //
 // GROUP-WRITABLE, because node.lock_dir may be a SETGID directory two accounts
 // share, and a file only its creator could open would stop every check the
-// other account makes. The mode is set on the descriptor of a file this call
-// created, so the process's umask cannot narrow it; a file that already exists
-// is opened as it is.
+// other account makes. PUT IN PLACE WHOLE: the file is made under a temporary
+// name, its mode set on the descriptor (so no umask narrows it), and only then
+// linked to its name, which never replaces a file already there. A crash midway
+// leaves a temporary file, never a lock file another account cannot open.
 func openGenerationMapLock(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o660)
-	if errors.Is(err, os.ErrExist) {
-		return os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	return openGenerationMapLockRacing(path, func() {})
+}
+
+// openGenerationMapLockRacing is openGenerationMapLock with beforeLink run at the
+// moment another process may create the file first.
+func openGenerationMapLockRacing(path string, beforeLink func()) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if !errors.Is(err, os.ErrNotExist) {
+		return f, err
 	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
 	if err != nil {
 		return nil, err
 	}
-	if err := f.Chmod(0o660); err != nil {
-		return nil, errors.Join(err, f.Close())
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if err := errors.Join(tmp.Chmod(0o660), tmp.Close()); err != nil {
+		return nil, err
+	}
+	beforeLink()
+	if err := os.Link(tmp.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
 	}
 
-	return f, nil
+	return os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 }
 
 // checkDamage runs `e2fsck -f -n` on device: damaged, clean, or could-not-tell.
