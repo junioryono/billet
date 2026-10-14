@@ -366,6 +366,7 @@ func TestTheNetworkJobIsJudgedOnItsOwnLoadWindow(t *testing.T) {
 		{90 * mib, 95 * mib, fail},
 		{111 * mib, 120 * mib, fail},
 		{94 * mib, 100 * mib, unmeasured},
+		{100 * mib, 120 * mib, unmeasured},
 	} {
 		exps, recs := windowedRun(nil)
 		network := recs["lease-9-network"]
