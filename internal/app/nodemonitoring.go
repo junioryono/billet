@@ -117,6 +117,18 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 // and unable to measure them, a node that started anyway would report every
 // job's destinations as unmeasured with nobody told why.
 func startFlows(ctx context.Context, root string, interval time.Duration) (*flows.Watcher, error) {
+	// A SWITCH THAT IS OFF IS TURNED ON rather than refused, because the node
+	// is root and the refusal had no other remedy: a reboot that applies the
+	// host's sysctl.d before the connection tracker loads leaves both off.
+	on, err := flows.Enable(root)
+	if len(on) > 0 {
+		slog.Info("turned on the connection tracker's accounting that flows need", "switches", on)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("node.monitoring.flows is set, but %w", err)
+	}
+
 	if err := flows.Ready(root); err != nil {
 		return nil, fmt.Errorf("node.monitoring.flows is set, but %w; set both with "+
 			"`sysctl -w net.netfilter.nf_conntrack_acct=1 net.netfilter.nf_conntrack_timestamp=1` "+
