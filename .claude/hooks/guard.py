@@ -86,6 +86,10 @@ def candidate_paths(payload, root):
     path = text_field(tool_input, "file_path") or text_field(tool_input, "notebook_path")
     if not path:
         return None, []
+    # No file system takes a NUL, and whether os.path raises on one depends on
+    # the Python: 3.13 does, 3.9 resolves it (measured 2026-10-14).
+    if "\0" in path:
+        raise CannotTell("the edited path holds a NUL character")
     cwd = text_field(payload, "cwd") or root
     raw = path if os.path.isabs(path) else os.path.join(cwd, path)
     roots = (root, os.path.realpath(root))
