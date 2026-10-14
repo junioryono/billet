@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime"
 	"strings"
 
@@ -17,7 +18,8 @@ import (
 // shaped, `clear` removes what a run left behind.
 func Uplink(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet uplink shape [--interface NAME] [--reflectors A,B,...], " +
+		return errors.New("usage: billet uplink shape [--interface NAME] [--reflectors A,B,...] " +
+			"[--max-up MBIT] [--max-down MBIT], " +
 			"billet uplink check [--interface NAME], or billet uplink clear [--interface NAME]")
 	}
 
@@ -44,11 +46,8 @@ func linuxOnly() error {
 }
 
 func uplinkShape(ctx context.Context, env cli.Env, args []string) error {
-	fs := cli.NewFlagSet("billet uplink shape", env.Stdout)
-	iface := fs.String("interface", "", "the interface to shape; empty shapes the one the default route leaves by")
-	reflectors := fs.String("reflectors", strings.Join(uplink.DefaultReflectors, ","),
-		"IPv4 addresses whose round trip measures the line's queue, comma-separated")
-	if err := cli.Parse(fs, args); err != nil {
+	opts, err := uplinkShapeOptions(env, args)
+	if err != nil {
 		return err
 	}
 
@@ -56,12 +55,49 @@ func uplinkShape(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
-	return uplink.Run(ctx, uplink.Options{
+	return uplink.Run(ctx, opts)
+}
+
+// uplinkShapeOptions is what `billet uplink shape`'s flags ask the shaper for.
+func uplinkShapeOptions(env cli.Env, args []string) (uplink.Options, error) {
+	fs := cli.NewFlagSet("billet uplink shape", env.Stdout)
+	iface := fs.String("interface", "", "the interface to shape; empty shapes the one the default route leaves by")
+	reflectors := fs.String("reflectors", strings.Join(uplink.DefaultReflectors, ","),
+		"IPv4 addresses whose round trip measures the line's queue, comma-separated")
+	maxUp := fs.Float64("max-up", 0, "the most this host sends, in Mbit/s; 0 is the interface's speed")
+	maxDown := fs.Float64("max-down", 0, "the most this host receives, in Mbit/s; 0 is the interface's speed")
+	if err := cli.Parse(fs, args); err != nil {
+		return uplink.Options{}, err
+	}
+
+	for name, value := range map[string]float64{"--max-up": *maxUp, "--max-down": *maxDown} {
+		if err := uplinkCeiling(name, value); err != nil {
+			return uplink.Options{}, err
+		}
+	}
+
+	return uplink.Options{
 		Iface:      *iface,
 		Reflectors: strings.Split(*reflectors, ","),
+		MaxUp:      *maxUp,
+		MaxDown:    *maxDown,
 		Params:     uplink.DefaultParams(),
 		Log:        slog.New(slog.NewTextHandler(env.Stderr, nil)),
-	})
+	}, nil
+}
+
+// uplinkCeiling refuses a ceiling the shaper could not hold: a negative or
+// non-finite one, and one under the floor no cut goes below.
+func uplinkCeiling(name string, mbit float64) error {
+	if mbit == 0 {
+		return nil
+	}
+
+	if math.IsNaN(mbit) || math.IsInf(mbit, 0) || mbit < uplink.Floor {
+		return fmt.Errorf("%s %v: want 0 (the interface's speed) or at least %v Mbit/s", name, mbit, uplink.Floor)
+	}
+
+	return nil
 }
 
 func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
