@@ -251,6 +251,13 @@ billet_networks:
 # a host on a line it does not fill is never slowed, and nothing about the line
 # is configured. false stops it and removes its unit.
 billet_uplink_shaping: true
+# The most this host sends and receives, in Mbit/s; 0 leaves the interface's
+# speed. Set them below the line on a site whose gateway drops rather than
+# queues: there the latency the shaper learns from barely moves, and on
+# 2026-10-14 the reference node sent 888 Mbit/s with no cut while a laptop behind
+# the same gateway lost its connections. Needs a billet with `--max-up`.
+billet_uplink_max_up_mbit: 0
+billet_uplink_max_down_mbit: 0
 billet_guest_dns_servers:
   - 1.1.1.1
   - 1.0.0.1

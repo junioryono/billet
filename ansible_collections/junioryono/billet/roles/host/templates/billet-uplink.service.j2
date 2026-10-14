@@ -6,7 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/billet uplink shape
+ExecStart=/usr/bin/billet uplink shape{% if billet_uplink_max_up_mbit | int > 0 %} --max-up {{ billet_uplink_max_up_mbit | int }}{% endif %}{% if billet_uplink_max_down_mbit | int > 0 %} --max-down {{ billet_uplink_max_down_mbit | int }}{% endif %}
+
 ExecStopPost=/usr/bin/billet uplink clear
 # The interface the shaper chose, kept past a stop so the cleanup above finds
 # it; a reboot empties it along with the shaping.

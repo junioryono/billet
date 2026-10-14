@@ -194,6 +194,8 @@ type record struct {
 	StartedAt   string `json:"started_at"`
 	FinishedAt  string `json:"finished_at"`
 	Usage       *usage `json:"usage"`
+	// Window is present when collect asked for the job's load window.
+	Window *recordWindow `json:"window"`
 }
 
 // usage is the host's report. Measured is the command's own answer per group;

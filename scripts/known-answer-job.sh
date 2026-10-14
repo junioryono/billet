@@ -140,6 +140,14 @@ mkdir -p "$work"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng fio curl
 
+# THE DISK JOB'S WINDOW HOLDS NOTHING OF ITS SETUP. Its check reads the writes
+# between the two stamps, and a stamp is cut to the second, so the window can
+# open up to a second before the stamp was taken: the setup's writes are
+# flushed and two quiet seconds pass before it is taken.
+if [ "$kind" = disk ]; then
+	sync
+	sleep 2
+fi
 load_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 case "$kind" in
 baseline) ;;
@@ -164,12 +172,22 @@ network)
 	expected_value=$got
 	;;
 disk)
+	# QUIET FOR A SAMPLE INTERVAL AT EACH END OF THE LOAD, inside its stamps.
+	# The check bounds what the sample intervals at the window's edges hold, and
+	# an edge interval that holds nothing bounds it exactly; billet samples
+	# every second.
+	sleep 2
 	fio --name=known-answer --filename="$work/fio.dat" --rw=write --bs=1M \
 		--size="$KA_DISK_BYTES" --direct=1 --ioengine=libaio --iodepth=16 --end_fsync=1
 	rm -f "$work/fio.dat"
+	sleep 2
 	;;
 esac
 load_finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# AND NOTHING OF WHAT FOLLOWS: the window closes a second after the stamp.
+if [ "$kind" = disk ]; then
+	sleep 2
+fi
 
 expected='{}'
 if [ -n "$expected_key" ]; then
