@@ -31,6 +31,7 @@ type windowUsage struct {
 	CoveredMillis  int64  `json:"covered_ms"`
 	Complete       bool   `json:"complete"`
 	DiskWriteBytes *int64 `json:"disk_write_bytes"`
+	NetRxBytes     *int64 `json:"net_rx_bytes"`
 }
 
 // loadWindow is the wall time a job's load ran in, from its expectation.
@@ -110,11 +111,11 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 			"the load's whole", w.Usage.CoveredMillis, w.Usage.SpanMillis)
 
 		return r
-	case w.Usage.DiskWriteBytes == nil:
-		r.reason = "the record's window carries no disk_write_bytes"
+	case m.windowed(w.Usage) == nil:
+		r.reason = "the record's window carries no " + m.name
 
 		return r
-	case w.Outer == nil || !spanCovers(w.Outer) || w.Outer.Usage.DiskWriteBytes == nil:
+	case w.Outer == nil || !spanCovers(w.Outer) || m.windowed(&w.Outer.Usage) == nil:
 		r.reason = "billet's series does not cover the whole sample intervals over the load window, so what its " +
 			"edges hold cannot be bounded"
 
@@ -124,16 +125,16 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 	// NO WHOLE INTERVAL INSIDE THE WINDOW BOUNDS IT BELOW BY NOTHING.
 	inner := 0.0
 	if w.Inner != nil {
-		if !spanCovers(w.Inner) || w.Inner.Usage.DiskWriteBytes == nil {
+		if !spanCovers(w.Inner) || m.windowed(&w.Inner.Usage) == nil {
 			r.reason = "billet's series does not cover the whole sample intervals inside the load window"
 
 			return r
 		}
 
-		inner = float64(*w.Inner.Usage.DiskWriteBytes)
+		inner = float64(*m.windowed(&w.Inner.Usage))
 	}
 
-	outer := float64(*w.Outer.Usage.DiskWriteBytes)
+	outer := float64(*m.windowed(&w.Outer.Usage))
 
 	if why := boundsDisagree(w, from, to, inner, outer); why != "" {
 		r.reason = "the record's bounds on the load window " + why
@@ -141,12 +142,12 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 		return r
 	}
 
-	r.value = m.windowed(w.Usage)
+	r.value = float64(*m.windowed(w.Usage))
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), nil)
 
 	if r.low <= 0 {
-		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds nothing "+
-			"written; run a larger one", r.metric.rule, formatValue(r.low, m.unit), formatValue(r.high, m.unit))
+		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds nothing; "+
+			"run a larger one", r.metric.rule, formatValue(r.low, m.unit), formatValue(r.high, m.unit))
 
 		return r
 	}

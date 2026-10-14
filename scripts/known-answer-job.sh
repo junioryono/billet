@@ -140,14 +140,17 @@ mkdir -p "$work"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng fio curl
 
-# THE DISK JOB'S WINDOW HOLDS NOTHING OF ITS SETUP. Its check reads the writes
-# between the two stamps, and a stamp is cut to the second, so the window can
-# open up to a second before the stamp was taken: the setup's writes are
-# flushed and two quiet seconds pass before it is taken.
-if [ "$kind" = disk ]; then
+# THE DISK AND NETWORK JOBS' WINDOWS HOLD NOTHING OF THEIR SETUP. Their checks
+# read the writes or the received bytes between the two stamps, and a stamp is
+# cut to the second, so the window can open up to a second before the stamp
+# was taken: the setup's writes are flushed and two quiet seconds pass before
+# it is taken.
+case "$kind" in
+disk | network)
 	sync
 	sleep 2
-fi
+	;;
+esac
 load_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 case "$kind" in
 baseline) ;;
@@ -163,8 +166,11 @@ memory)
 network)
 	# TO /dev/null, so the download writes nothing to the guest's disk, and with
 	# no retry, since a retried transfer reaches the guest more than once.
+	# Quiet for a sample interval at each end, inside the stamps, as for disk.
+	sleep 2
 	got=$(curl --fail --silent --show-error --location --output /dev/null \
 		--write-out '%{size_download}' "$url")
+	sleep 2
 	positive "the downloaded size" "$got"
 	if [ -n "${KA_NETWORK_BYTES:-}" ] && [ "$got" != "$KA_NETWORK_BYTES" ]; then
 		die "the body was $got bytes and $KA_NETWORK_BYTES were expected; the known answer is not known"
@@ -185,9 +191,9 @@ disk)
 esac
 load_finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # AND NOTHING OF WHAT FOLLOWS: the window closes a second after the stamp.
-if [ "$kind" = disk ]; then
-	sleep 2
-fi
+case "$kind" in
+disk | network) sleep 2 ;;
+esac
 
 expected='{}'
 if [ -n "$expected_key" ]; then

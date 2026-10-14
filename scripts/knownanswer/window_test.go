@@ -342,3 +342,53 @@ func TestCollectFailsOnAnUnreadableLoadWindow(t *testing.T) {
 		}
 	}
 }
+
+// networkWindowOf is a window over the network job's load whose whole
+// intervals inside it hold inner received bytes and whose whole intervals over
+// it hold outer.
+func networkWindowOf(inner, outer int64) *recordWindow {
+	w := boundedWindow(0, 0, 0)
+	w.Usage.DiskWriteBytes, w.Inner.Usage.DiskWriteBytes, w.Outer.Usage.DiskWriteBytes = nil, nil, nil
+	w.Usage.NetRxBytes, w.Inner.Usage.NetRxBytes, w.Outer.Usage.NetRxBytes = ptr(inner), ptr(inner), ptr(outer)
+
+	return w
+}
+
+// THE NETWORK JOB IS JUDGED ON ITS OWN LOAD WINDOW TOO: every job's setup
+// downloads packages, so a whole-lease figure the median rule fails passes on
+// what the window received, and the bounds still decide.
+func TestTheNetworkJobIsJudgedOnItsOwnLoadWindow(t *testing.T) {
+	for _, tc := range []struct {
+		inner, outer int64
+		want         verdict
+	}{
+		{100 * mib, 103 * mib, pass},
+		{90 * mib, 95 * mib, fail},
+		{111 * mib, 120 * mib, fail},
+		{94 * mib, 100 * mib, unmeasured},
+	} {
+		exps, recs := windowedRun(nil)
+		network := recs["lease-9-network"]
+		u := *network.Usage
+		u.NetRxBytes += 160 * mib
+		network.Usage, network.Window = &u, networkWindowOf(tc.inner, tc.outer)
+		recs["lease-9-network"] = network
+
+		r := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork)
+		if r.verdict != tc.want || !strings.Contains(r.metric.rule, "load window") {
+			t.Errorf("%d to %d B received in the window = %s by %q (%s); want %s", tc.inner, tc.outer,
+				r.verdict, r.metric.rule, r.reason, tc.want)
+		}
+	}
+
+	exps, recs := windowedRun(nil)
+	network := recs["lease-9-network"]
+	network.Window = loadWindowOf(100 * mib)
+	recs["lease-9-network"] = network
+
+	if r := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork); r.verdict != unmeasured ||
+		!strings.Contains(r.reason, "carries no net_rx_bytes") {
+		t.Errorf("a window with no received bytes = %s (%s), want UNMEASURED naming net_rx_bytes", r.verdict,
+			r.reason)
+	}
+}

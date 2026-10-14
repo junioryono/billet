@@ -48,10 +48,12 @@ type metric struct {
 	value  func(job, ref *usage) float64
 	bounds func(expected, seconds float64, ref *usage) (low, high float64)
 	rule   string
-	// windowed, when set, reads the value from the job's own load window when
-	// its record carries one, and windowRule is then the rule reported. The
-	// window needs no reference: no other job's setup is subtracted.
-	windowed   func(w *windowUsage) float64
+	// windowed, when set, reads the metric's counter from a window's usage (nil
+	// when the record carries none), and the value is then taken from the job's
+	// own load window when its record has one, with windowRule the rule
+	// reported. The window needs no reference: no other job's setup is
+	// subtracted.
+	windowed   func(w *windowUsage) *int64
 	windowRule string
 }
 
@@ -95,6 +97,12 @@ var metrics = []metric{
 			return e - 4*mib, 1.06*e + 4*mib
 		},
 		rule: "received minus the median unloaded job within [S - 4 MiB, 1.06 S + 4 MiB]",
+		// THE WINDOW, WHEN THE RECORD HAS ONE, as for disk. Every job's setup
+		// downloads packages, and run 11 (2026-10-14) failed at 210.2 MiB against
+		// 161.4 by the median rule while the job's own load window held 166.7 to
+		// 169.8 MiB.
+		windowed:   func(w *windowUsage) *int64 { return w.NetRxBytes },
+		windowRule: "received in the job's own load window within [S - 4 MiB, 1.06 S + 4 MiB]",
 	},
 	{
 		kind: kindDisk, name: "disk_write_bytes", unit: "B", group: "io", against: kindIdle,
@@ -110,7 +118,7 @@ var metrics = []metric{
 		// packages, and that setup wrote 1,360 to 1,915 MiB a job across runs 8
 		// and 9 (2026-10-12 and 13), against a tolerance of 64 MiB: run 9's disk
 		// job failed at 1,287.5 MiB while its own fio step wrote 2.4 GiB.
-		windowed:   func(w *windowUsage) float64 { return float64(*w.DiskWriteBytes) },
+		windowed:   func(w *windowUsage) *int64 { return w.DiskWriteBytes },
 		windowRule: "written in the job's own load window within [X - 64 MiB, 1.10 X + 64 MiB]",
 	},
 }
