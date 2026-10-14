@@ -411,3 +411,88 @@ func TestARemovalFlushesTheDirectoryThenItsParent(t *testing.T) {
 		t.Fatalf("the directory is still there: %v", err)
 	}
 }
+
+// recoveriesIn is the recovery directories under the upgrade root, without the
+// marks and the lock the timer leaves beside them.
+func recoveriesIn(t *testing.T) []string {
+	t.Helper()
+
+	var names []string
+
+	for _, name := range entriesOf(t, upgradeRoot) {
+		if recoveryTempName.MatchString(name) {
+			names = append(names, name)
+		}
+	}
+
+	return names
+}
+
+// THE FIRST UPGRADE ONTO A RELEASE THAT PRUNES IS CARRIED OUT BY ONE THAT DOES
+// NOT, so the timer's tick that finds nothing to do is where the host's
+// retention happens, under the lock it already holds.
+func TestTheTimersIdleTickRemovesOlderRecoveries(t *testing.T) {
+	runningAs(t, "v0.9.4")
+
+	cfg, _ := ledgerWithRollout(t, "v0.9.4")
+	cfgPath := writeConfigFor(t, cfg)
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	for i, name := range []string{"upgrade-10", "upgrade-11", "upgrade-12", "upgrade-13", "upgrade-14"} {
+		stageRecovery(t, name, hostupgrade.StepCommitted, base.Add(time.Duration(i)*time.Hour))
+	}
+
+	out := capture(t, func() {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
+			t.Errorf("the timer: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "nothing to do") {
+		t.Fatalf("the timer did not settle as nothing to do:\n%s", out)
+	}
+
+	if got, want := recoveriesIn(t), []string{"upgrade-12", "upgrade-13", "upgrade-14"}; !slices.Equal(got, want) {
+		t.Fatalf("the root holds %v, want %v", got, want)
+	}
+
+	if !strings.Contains(out, "Removed 2 older recovery directories") {
+		t.Fatalf("the removal was not said:\n%s", out)
+	}
+}
+
+// A GUARDED HOST IS A CONVERGE'S, and the timer that leaves it alone removes
+// nothing from it either.
+func TestTheTimerRemovesNothingFromAGuardedHost(t *testing.T) {
+	newGuardedFixture(t)
+	runningAs(t, "v0.9.4")
+
+	cfg, _ := ledgerWithRollout(t, "v0.9.4")
+	cfgPath := writeConfigFor(t, cfg)
+	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	mustHold(t, "ci-1")
+
+	names := []string{"upgrade-10", "upgrade-11", "upgrade-12", "upgrade-13", "upgrade-14"}
+	for i, name := range names {
+		stageRecovery(t, name, hostupgrade.StepCommitted, base.Add(time.Duration(i)*time.Hour))
+	}
+
+	out := capture(t, func() {
+		if err := hostUpgradeFromRollout(t.Context(), processEnv(), cfg, cfgPath, false); err != nil {
+			t.Errorf("the timer on a guarded host: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "guarded by ci-1 since") {
+		t.Fatalf("the timer did not see the guard:\n%s", out)
+	}
+
+	if got := recoveriesIn(t); !slices.Equal(got, names) {
+		t.Fatalf("the guarded root holds %v, want every one of %v", got, names)
+	}
+
+	if err := guardRun(t, "release", "--holder", "ci-1"); err != nil {
+		t.Fatal(err)
+	}
+}

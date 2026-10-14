@@ -226,8 +226,20 @@ func hostUpgradeFromRollout(ctx context.Context, env cli.Env, cfg *config.Config
 	}
 
 	target, ok, err := rolloutInstructionHolding(ctx, env, cfg, tx)
-	if err != nil || !ok {
+	if err != nil {
 		return err
+	}
+
+	// A TRANSACTION IS CARRIED OUT BY THE BINARY INSTALLED BEFORE IT, so the
+	// upgrade onto the first release that keeps only the newest recoveries
+	// cannot remove anything: the controller kept all 46 of its directories
+	// through v0.16.1 -> v0.16.3 (2026-10-14). The tick that finds nothing to
+	// do holds the same lock and root a finished transaction does, and is where
+	// that host's retention happens.
+	if !ok {
+		pruneRecoveriesSaying(env, tx.dir)
+
+		return nil
 	}
 
 	target.skipVerify = skipVerify
@@ -1123,19 +1135,24 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 		return errors.Join(err, claimErr)
 	}
 
-	// RETENTION NEVER DECIDES THE OUTCOME: the transaction is over, and a
-	// directory that could not be removed is said and left for the next one.
-	removed, pruneErr := pruneRecoveries(root)
+	pruneRecoveriesSaying(env, root)
+
+	return err
+}
+
+// pruneRecoveriesSaying runs pruneRecoveries under the transaction lock the
+// caller holds and says what it did. RETENTION NEVER DECIDES AN OUTCOME: a
+// directory that could not be removed is said and left for the next pass.
+func pruneRecoveriesSaying(env cli.Env, root *os.File) {
+	removed, err := pruneRecoveries(root)
 	if len(removed) > 0 {
 		fmt.Fprintf(env.Stdout, "\nRemoved %d older recovery directories from %s; the newest %d are kept.\n",
 			len(removed), upgradeRoot, keepRecoveries)
 	}
 
-	if pruneErr != nil {
-		fmt.Fprintf(env.Stdout, "\nCould not remove every older recovery directory: %v\n", pruneErr)
+	if err != nil {
+		fmt.Fprintf(env.Stdout, "\nCould not remove every older recovery directory: %v\n", err)
 	}
-
-	return err
 }
 
 // settleCommitted raises the settled mark for a transaction that committed: to
