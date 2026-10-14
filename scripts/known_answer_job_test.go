@@ -230,9 +230,9 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 		"apt-get DEBIAN_FRONTEND=noninteractive install -y -qq stress-ng fio curl",
 	}
 	// EACH LOAD RUNS BETWEEN ITS TWO STAMPS, and before and after are what
-	// runs outside them: the disk job flushes and waits before its first
-	// stamp and waits after its second, so its window holds neither setup
-	// nor what follows.
+	// runs outside them: the disk and network jobs flush and wait before their
+	// first stamp and wait after their second, so their windows hold neither
+	// setup nor what follows.
 	for _, tc := range []struct {
 		kind          string
 		load          []string
@@ -245,9 +245,9 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 			`expected {"cpu_seconds":240}`, nil, nil},
 		{kindMemory, []string{"stress-ng --vm 1 --vm-bytes 2147483648 --vm-keep --timeout 60s --metrics-brief"},
 			`expected {"memory_peak_bytes":2147483648}`, nil, nil},
-		{kindNetwork, []string{"curl --fail --silent --show-error --location --output /dev/null " +
-			"--write-out %{size_download} https://objects.example/known?bytes=104857600"},
-			`expected {"net_rx_bytes":104857600}`, nil, nil},
+		{kindNetwork, []string{"sleep 2", "curl --fail --silent --show-error --location --output /dev/null " +
+			"--write-out %{size_download} https://objects.example/known?bytes=104857600", "sleep 2"},
+			`expected {"net_rx_bytes":104857600}`, []string{"sync", "sleep 2"}, []string{"sleep 2"}},
 		{kindDisk, []string{"sleep 2", "fio --name=known-answer --filename=RUNNER_TEMP/known-answer-work/fio.dat " +
 			"--rw=write --bs=1M --size=2147483648 --direct=1 --ioengine=libaio --iodepth=16 --end_fsync=1", "sleep 2"},
 			`expected {"disk_write_bytes":2147483648}`, []string{"sync", "sleep 2"}, []string{"sleep 2"}},
