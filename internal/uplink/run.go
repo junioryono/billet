@@ -32,8 +32,32 @@ type Options struct {
 	// Iface is the interface to shape; empty means the default route's.
 	Iface      string
 	Reflectors []string
-	Params     Params
-	Log        *slog.Logger
+	// MaxUp and MaxDown are the most each direction is ever let through, in
+	// Mbit/s; zero is the interface's speed. Learning the line from latency
+	// alone left a gateway that drops before it queues unprotected: from
+	// 02:05 to 05:15 UTC on 2026-10-14 the reference node cut nothing while it
+	// sent up to 888 Mbit/s and a laptop behind the same gateway lost its
+	// connections (shared-uplink record).
+	MaxUp, MaxDown float64
+	Params         Params
+	Log            *slog.Logger
+}
+
+// Ceiling is the rate a direction starts at and never exceeds: the configured
+// maximum when there is one below the interface's speed, else that speed.
+func Ceiling(speed, configured float64) float64 {
+	if configured > 0 && configured < speed {
+		return configured
+	}
+
+	return speed
+}
+
+// newRunController is the controller a run starts with, each direction at its
+// ceiling.
+func newRunController(speed float64, opts Options) *Controller {
+	return &Controller{Params: opts.Params, Up: NewDirection(Ceiling(speed, opts.MaxUp)),
+		Down: NewDirection(Ceiling(speed, opts.MaxDown))}
 }
 
 // Run shapes the uplink until ctx ends, and removes the shaping as it returns.
@@ -73,7 +97,7 @@ func Run(ctx context.Context, opts Options) error {
 		speed = fallbackSpeed
 	}
 
-	ctl := &Controller{Params: opts.Params, Up: NewDirection(speed), Down: NewDirection(speed)}
+	ctl := newRunController(speed, opts)
 
 	// WHAT AN EARLIER RUN LEFT IS CLEARED FIRST, wherever its record says it is
 	// now, so every run starts from an interface carrying nothing of billet's: a
@@ -101,9 +125,10 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("install CAKE on %s: %w", iface, err)
 	}
 
-	opts.Log.Info("shaping the uplink; each direction starts at the interface's speed and is cut "+
+	opts.Log.Info("shaping the uplink; each direction starts at its ceiling and is cut "+
 		"only when its own traffic raises the latency to the reflectors",
-		"interface", iface, "start_mbit", speed, "reflectors", reflectors, "bloat", opts.Params.Bloat)
+		"interface", iface, "interface_mbit", speed, "up_ceiling_mbit", ctl.Up.Max,
+		"down_ceiling_mbit", ctl.Down.Max, "reflectors", reflectors, "bloat", opts.Params.Bloat)
 
 	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper)
 
