@@ -30,8 +30,9 @@ type NodeMonitoringConfig struct {
 	IdlePackageWatts float64 `yaml:"idle_package_watts,omitempty"`
 	// Flows totals each job's traffic by destination from the host's
 	// connection tracker, which needs net.netfilter.nf_conntrack_acct and
-	// nf_conntrack_timestamp set to 1; a node asked for flows on a host
-	// without them refuses to start. Firecracker only: the guest's address is
+	// nf_conntrack_timestamp set to 1; a node turns either on when it reads 0,
+	// and refuses to start when the tracker is not loaded or a switch cannot be
+	// read or set. Firecracker only: the guest's address is
 	// learned from the DHCP lease its bridge's dnsmasq granted it.
 	Flows bool `yaml:"flows,omitempty"`
 	// Perf counts each microVM's vCPU threads with the CPU's hardware counters
