@@ -393,3 +393,91 @@ func TestTheNetworkJobIsJudgedOnItsOwnLoadWindow(t *testing.T) {
 			r.reason)
 	}
 }
+
+// A LOAD TOO SMALL FOR ITS TOLERANCE IS UNMEASURED, never a PASS: a 3 MiB
+// download accepts [-1, 7.2] MiB, which holds receiving nothing at all.
+func TestAWindowedLoadTooSmallToCompareIsUnmeasured(t *testing.T) {
+	exps, recs := windowedRun(nil)
+	for i := range exps {
+		if exps[i].Kind == kindNetwork {
+			exps[i].Expected = map[string]int64{"net_rx_bytes": 3 * mib}
+		}
+	}
+
+	network := recs["lease-9-network"]
+	network.Window = networkWindowOf(3*mib, 3*mib)
+	recs["lease-9-network"] = network
+
+	if r := resultFor(t, evaluate(exps, fromMap(recs)), kindNetwork); r.verdict != unmeasured ||
+		!strings.Contains(r.reason, "too small to compare") {
+		t.Errorf("a 3 MiB load = %s (%s), want UNMEASURED as too small", r.verdict, r.reason)
+	}
+}
+
+// idleWindowOf is a window over the idle job's sleep whose whole intervals
+// inside it were charged inner CPU-seconds and whose whole intervals over it
+// outer.
+func idleWindowOf(inner, outer float64) *recordWindow {
+	w := boundedWindow(0, 0, 0)
+	w.Usage.DiskWriteBytes, w.Inner.Usage.DiskWriteBytes, w.Outer.Usage.DiskWriteBytes = nil, nil, nil
+	us := func(s float64) *int64 { return ptr(int64(s * 1e6)) }
+	w.Usage.CPUMicros, w.Inner.Usage.CPUMicros, w.Outer.Usage.CPUMicros = us(inner), us(inner), us(outer)
+
+	return w
+}
+
+// idleRun is fixtureRun with load windows, its idle job's record carrying win
+// and vcpu, and a whole-lease CPU the median-free rule fails: the idle lease
+// charged 9.5 s more than the baseline's, as run 12's did (2026-10-14).
+func idleRun(win *recordWindow, vcpu int64) ([]expectation, map[string]record) {
+	exps, recs := windowedRun(nil)
+	idle := recs["lease-9-idle"]
+	u := *idle.Usage
+	u.CPUUserMicros += 9_500_000
+	idle.Usage, idle.Window, idle.VCPU = &u, win, vcpu
+	recs["lease-9-idle"] = idle
+
+	return exps, recs
+}
+
+// THE IDLE JOB IS JUDGED ON WHAT ITS SLEEP WAS CHARGED, with an allowance for
+// each vCPU: 60 s on 8 vCPUs accepts [0, 1.2 + 4.8 + 3] = [0, 9] s. The bounds
+// decide, as for disk and network, and the whole-lease rule's FAIL is gone.
+func TestTheIdleJobIsJudgedOnItsOwnLoadWindow(t *testing.T) {
+	exps, recs := idleRun(nil, 8)
+	if r := resultFor(t, evaluate(exps, fromMap(recs)), kindIdle); r.verdict != fail {
+		t.Fatalf("with no window = %s (%s), want the whole-lease rule's FAIL", r.verdict, r.reason)
+	}
+
+	for _, tc := range []struct {
+		inner, outer float64
+		vcpu         int64
+		want         verdict
+	}{
+		{3.71, 3.9, 8, pass},
+		{5.45, 5.6, 8, pass},
+		{9.5, 10, 8, fail},
+		{8, 10, 8, unmeasured},
+		// The allowance is the vCPUs': the same 5.45 s fails on one.
+		{5.45, 5.6, 1, fail},
+	} {
+		exps, recs := idleRun(idleWindowOf(tc.inner, tc.outer), tc.vcpu)
+		r := resultFor(t, evaluate(exps, fromMap(recs)), kindIdle)
+		if r.verdict != tc.want || !strings.Contains(r.metric.rule, "load window") {
+			t.Errorf("%.2f to %.2f s on %d vCPUs = %s by %q (%s), value %.2f; want %s", tc.inner, tc.outer,
+				tc.vcpu, r.verdict, r.metric.rule, r.reason, r.value, tc.want)
+		}
+	}
+
+	exps, recs = idleRun(idleWindowOf(3.71, 3.9), 0)
+	if r := resultFor(t, evaluate(exps, fromMap(recs)), kindIdle); r.verdict != unmeasured ||
+		!strings.Contains(r.reason, "no vCPU count") {
+		t.Errorf("a record with no vCPU count = %s (%s), want UNMEASURED", r.verdict, r.reason)
+	}
+
+	exps, recs = idleRun(networkWindowOf(1, 1), 8)
+	if r := resultFor(t, evaluate(exps, fromMap(recs)), kindIdle); r.verdict != unmeasured ||
+		!strings.Contains(r.reason, "carries no cpu_seconds") {
+		t.Errorf("a window with no CPU = %s (%s), want UNMEASURED naming the counter", r.verdict, r.reason)
+	}
+}

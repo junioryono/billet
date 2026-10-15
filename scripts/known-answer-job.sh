@@ -140,13 +140,13 @@ mkdir -p "$work"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq stress-ng fio curl
 
-# THE DISK AND NETWORK JOBS' WINDOWS HOLD NOTHING OF THEIR SETUP. Their checks
-# read the writes or the received bytes between the two stamps, and a stamp is
+# THE IDLE, DISK AND NETWORK JOBS' WINDOWS HOLD NOTHING OF THEIR SETUP. Their
+# checks read the CPU, the writes or the received bytes between the two stamps, and a stamp is
 # cut to the second, so the window can open up to a second before the stamp
 # was taken: the setup's writes are flushed and two quiet seconds pass before
 # it is taken.
 case "$kind" in
-disk | network)
+idle | disk | network)
 	sync
 	sleep 2
 	;;
@@ -192,7 +192,7 @@ esac
 load_finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 # AND NOTHING OF WHAT FOLLOWS: the window closes a second after the stamp.
 case "$kind" in
-disk | network) sleep 2 ;;
+idle | disk | network) sleep 2 ;;
 esac
 
 expected='{}'

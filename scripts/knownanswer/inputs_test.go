@@ -73,6 +73,10 @@ func TestTheRecordsAreReadAsJobsShowWritesThem(t *testing.T) {
 		w.Outer == nil || w.Outer.Usage.NetRxBytes == nil || *w.Outer.Usage.NetRxBytes != 0 {
 		t.Errorf("the window's received bytes did not decode: %+v", w)
 	}
+	if w := windowed.Window; w == nil || w.Usage == nil || w.Usage.CPUMicros == nil || *w.Usage.CPUMicros != 4_000_000 ||
+		w.Inner == nil || w.Inner.Usage.CPUMicros == nil || w.Outer == nil || w.Outer.Usage.CPUMicros == nil {
+		t.Errorf("the window's CPU did not decode: %+v", w)
+	}
 	if w := windowed.Window; w == nil || w.Inner == nil || w.Outer == nil ||
 		w.Inner.Usage.DiskWriteBytes == nil || *w.Inner.Usage.DiskWriteBytes != 2_149_000_000 ||
 		w.Outer.Usage.DiskWriteBytes == nil || *w.Outer.Usage.DiskWriteBytes != 2_151_000_000 ||
