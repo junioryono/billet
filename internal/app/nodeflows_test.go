@@ -97,7 +97,9 @@ func TestANodeAskedForFlowsRefusesAHostThatCannotMeasureThem(t *testing.T) {
 				t.Fatalf("started (%v, %v) on a host that cannot measure flows", w, err)
 			}
 
-			for _, want := range []string{"node.monitoring.flows", tc.want} {
+			// EVERY REFUSAL NAMES THE REMEDY, a failed write included.
+			for _, want := range []string{"node.monitoring.flows", tc.want,
+				"sysctl -w net.netfilter.nf_conntrack_acct=1", "or remove flows"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the refusal %q does not say %q", err, want)
 				}

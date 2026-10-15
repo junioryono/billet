@@ -98,26 +98,50 @@ func leaseFor(data []byte, mac net.HardwareAddr) (netip.Addr, time.Time, error) 
 var Switches = []string{"nf_conntrack_acct", "nf_conntrack_timestamp"}
 
 // Enable turns on each of the Switches under root that reads exactly 0, and
-// answers the names it turned on. A switch that is absent or unreadable is left
-// for Ready to refuse: absent means the connection tracker is not loaded, and
-// loading a module is the host's business.
+// answers the names it turned on. The switches are the host network
+// namespace's, so they count every tracked flow on the host, not only jobs'.
 //
 // A SETTING PERSISTED UNDER /etc/sysctl.d IS NOT A SETTING THE KERNEL HOLDS.
 // systemd-sysctl applies it at boot only if nf_conntrack is loaded by then, and
 // on the reference node it was not: after the reboot of 2026-10-14 both read
 // 0 and the node refused to start 54 times until a person set them.
-func Enable(root string) ([]string, error) {
-	var on []string
+//
+// NOTHING IS WRITTEN UNLESS WRITING CAN MAKE THE HOST READY: every switch is
+// read first, and one that is absent (the tracker is not loaded, which is the
+// host's business), unreadable or neither 0 nor 1 leaves the host as it was for
+// Ready to refuse. A write that fails after another succeeded answers the
+// switch already turned on beside the error.
+func Enable(root string) ([]string, error) { return enable(root, os.WriteFile) }
 
-	for _, name := range Switches {
-		path := filepath.Join(root, "proc", "sys", "net", "netfilter", name)
+func enable(root string, write func(string, []byte, os.FileMode) error) ([]string, error) {
+	path := func(name string) string { return filepath.Join(root, "proc", "sys", "net", "netfilter", name) }
 
-		raw, err := os.ReadFile(path)
-		if err != nil || strings.TrimSpace(string(raw)) != "0" {
-			continue
+	// A switch that cannot be read reads as nothing, which is neither 0 nor 1.
+	value := func(name string) string {
+		raw, err := os.ReadFile(path(name))
+		if err != nil {
+			return ""
 		}
 
-		if err := os.WriteFile(path, []byte("1\n"), 0); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+
+	var off []string
+
+	for _, name := range Switches {
+		switch value(name) {
+		case "1":
+		case "0":
+			off = append(off, name)
+		default:
+			return nil, nil
+		}
+	}
+
+	var on []string
+
+	for _, name := range off {
+		if err := write(path(name), []byte("1\n"), 0); err != nil {
 			return on, fmt.Errorf("flows: turn on net.netfilter.%s: %w", name, err)
 		}
 
