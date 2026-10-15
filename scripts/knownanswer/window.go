@@ -137,7 +137,7 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 
 	outer := float64(*m.windowed(&w.Outer.Usage)) * m.scale()
 
-	if why := boundsDisagree(w, from, to, inner, outer); why != "" {
+	if why := boundsDisagree(w, from, to, inner, outer, m.unit); why != "" {
 		r.reason = "the record's bounds on the load window " + why
 
 		return r
@@ -186,7 +186,7 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 // bounds of the window from..to, or "" when they can: the inner span inside
 // the window, the window inside the outer span, and inner no more than outer,
 // none of it negative. A record that says otherwise decides no verdict.
-func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64) string {
+func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64, unit string) string {
 	span := func(s *windowSpan) (time.Time, time.Time, bool) {
 		a, errA := time.Parse(time.RFC3339Nano, s.From)
 		b, errB := time.Parse(time.RFC3339Nano, s.To)
@@ -208,7 +208,8 @@ func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64) s
 	}
 
 	if inner < 0 || inner > outer {
-		return fmt.Sprintf("are not bounds: %.0f B inside and %.0f B over it", inner, outer)
+		return fmt.Sprintf("are not bounds: %s inside and %s over it", formatValue(inner, unit),
+			formatValue(outer, unit))
 	}
 
 	return ""

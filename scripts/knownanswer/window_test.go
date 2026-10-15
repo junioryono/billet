@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -421,7 +422,9 @@ func idleWindowOf(inner, outer float64) *recordWindow {
 	w := boundedWindow(0, 0, 0)
 	w.Usage.DiskWriteBytes, w.Inner.Usage.DiskWriteBytes, w.Outer.Usage.DiskWriteBytes = nil, nil, nil
 	us := func(s float64) *int64 { return ptr(int64(s * 1e6)) }
-	w.Usage.CPUMicros, w.Inner.Usage.CPUMicros, w.Outer.Usage.CPUMicros = us(inner), us(inner), us(outer)
+	// The split by time lies between the bounds, and differs from both, so a
+	// value read from the wrong one or scaled wrongly is seen.
+	w.Usage.CPUMicros, w.Inner.Usage.CPUMicros, w.Outer.Usage.CPUMicros = us((inner+outer)/2), us(inner), us(outer)
 
 	return w
 }
@@ -466,6 +469,16 @@ func TestTheIdleJobIsJudgedOnItsOwnLoadWindow(t *testing.T) {
 		if r.verdict != tc.want || !strings.Contains(r.metric.rule, "load window") {
 			t.Errorf("%.2f to %.2f s on %d vCPUs = %s by %q (%s), value %.2f; want %s", tc.inner, tc.outer,
 				tc.vcpu, r.verdict, r.metric.rule, r.reason, r.value, tc.want)
+		}
+
+		// THE NUMBERS REPORTED ARE SECONDS: the split, and the tolerance for this N.
+		if tc.want != unmeasured {
+			wantHigh := 0.02*60 + 0.01*float64(tc.vcpu)*60 + 3
+			if !r.compared || math.Abs(r.value-(tc.inner+tc.outer)/2) > 1e-6 || r.low != 0 ||
+				math.Abs(r.high-wantHigh) > 1e-9 {
+				t.Errorf("%.2f to %.2f s on %d vCPUs reported value %v in [%v, %v] (compared %v); want %v in [0, %v]",
+					tc.inner, tc.outer, tc.vcpu, r.value, r.low, r.high, r.compared, (tc.inner+tc.outer)/2, wantHigh)
+			}
 		}
 	}
 
