@@ -32,6 +32,7 @@ type windowUsage struct {
 	Complete       bool   `json:"complete"`
 	DiskWriteBytes *int64 `json:"disk_write_bytes"`
 	NetRxBytes     *int64 `json:"net_rx_bytes"`
+	CPUMicros      *int64 `json:"cpu_us"`
 }
 
 // loadWindow is the wall time a job's load ran in, from its expectation.
@@ -131,21 +132,35 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 			return r
 		}
 
-		inner = float64(*m.windowed(&w.Inner.Usage))
+		inner = float64(*m.windowed(&w.Inner.Usage)) * m.scale()
 	}
 
-	outer := float64(*m.windowed(&w.Outer.Usage))
+	outer := float64(*m.windowed(&w.Outer.Usage)) * m.scale()
 
-	if why := boundsDisagree(w, from, to, inner, outer); why != "" {
+	if why := boundsDisagree(w, from, to, inner, outer, m.unit); why != "" {
 		r.reason = "the record's bounds on the load window " + why
 
 		return r
 	}
 
-	r.value = float64(*m.windowed(w.Usage))
+	r.value = float64(*m.windowed(w.Usage)) * m.scale()
 	r.low, r.high = m.bounds(r.expected, float64(e.Seconds), nil)
 
-	if r.low <= 0 {
+	// A TOLERANCE THAT GROWS WITH THE GUEST'S vCPUs, for a metric whose cost to
+	// the host does: the record's own count, never a guess.
+	if m.windowBounds != nil {
+		if job.VCPU <= 0 {
+			r.reason = "the record carries no vCPU count to size the tolerance by"
+
+			return r
+		}
+
+		r.low, r.high = m.windowBounds(float64(e.Seconds), float64(job.VCPU))
+	}
+
+	// A LOAD EXPECTED TO BE NOTHING IS COMPARED WITH NOTHING; only a load
+	// expected to be something is too small when its tolerance reaches zero.
+	if r.expected > 0 && r.low <= 0 {
 		r.reason = fmt.Sprintf("the load is too small to compare: %s accepts [%s, %s], which holds nothing; "+
 			"run a larger one", r.metric.rule, formatValue(r.low, m.unit), formatValue(r.high, m.unit))
 
@@ -171,7 +186,7 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 // bounds of the window from..to, or "" when they can: the inner span inside
 // the window, the window inside the outer span, and inner no more than outer,
 // none of it negative. A record that says otherwise decides no verdict.
-func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64) string {
+func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64, unit string) string {
 	span := func(s *windowSpan) (time.Time, time.Time, bool) {
 		a, errA := time.Parse(time.RFC3339Nano, s.From)
 		b, errB := time.Parse(time.RFC3339Nano, s.To)
@@ -193,7 +208,8 @@ func boundsDisagree(w *recordWindow, from, to time.Time, inner, outer float64) s
 	}
 
 	if inner < 0 || inner > outer {
-		return fmt.Sprintf("are not bounds: %.0f B inside and %.0f B over it", inner, outer)
+		return fmt.Sprintf("are not bounds: %s inside and %s over it", formatValue(inner, unit),
+			formatValue(outer, unit))
 	}
 
 	return ""

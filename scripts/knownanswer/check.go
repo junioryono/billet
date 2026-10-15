@@ -55,6 +55,20 @@ type metric struct {
 	// subtracted.
 	windowed   func(w *windowUsage) *int64
 	windowRule string
+	// windowScale converts the window's counter to the metric's unit; zero is
+	// one. windowBounds, when set, is the window's tolerance from the load's
+	// seconds and the record's vCPU count, in place of bounds.
+	windowScale  float64
+	windowBounds func(seconds, vcpu float64) (low, high float64)
+}
+
+// scale is windowScale, one when unset.
+func (m *metric) scale() float64 {
+	if m.windowScale == 0 {
+		return 1
+	}
+
+	return m.windowScale
 }
 
 func cpuSeconds(u *usage) float64 { return float64(u.CPUUserMicros+u.CPUSystemMicros) / 1e6 }
@@ -68,6 +82,20 @@ var metrics = []metric{
 			return -3, 0.02*seconds + 3
 		},
 		rule: "idle minus baseline CPU within [-3 s, 0.02 CPU x T + 3 s]",
+		// THE WINDOW, WHEN THE RECORD HAS ONE: the CPU billet charged the guest
+		// while it slept, with nothing subtracted. Whole leases differ by their
+		// setup: run 12 (2026-10-14) failed at 9.5 s by the rule above while its
+		// sleep was charged 3.71 s. AND A PER-vCPU ALLOWANCE, because an idle
+		// vCPU costs the host something (KVM halt polling): beyond what the guest
+		// itself reported busy, runs 11 and 12 charged 0.0082 and 0.0037 CPU per
+		// vCPU across their 8-vCPU sleeps. The guest's own idle work, its agent
+		// and the runner's listener, stays in 0.02 CPU x T + 3 s.
+		windowed:    func(w *windowUsage) *int64 { return w.CPUMicros },
+		windowScale: 1e-6,
+		windowBounds: func(seconds, vcpu float64) (float64, float64) {
+			return 0, 0.02*seconds + 0.01*vcpu*seconds + 3
+		},
+		windowRule: "CPU charged in the job's own load window within [0 s, 0.02 CPU x T + 0.01 CPU x N x T + 3 s]",
 	},
 	{
 		kind: kindCPU, name: "cpu_seconds", unit: "s", group: "cpu", against: kindIdle,

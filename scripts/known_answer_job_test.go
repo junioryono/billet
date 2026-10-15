@@ -230,9 +230,9 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 		"apt-get DEBIAN_FRONTEND=noninteractive install -y -qq stress-ng fio curl",
 	}
 	// EACH LOAD RUNS BETWEEN ITS TWO STAMPS, and before and after are what
-	// runs outside them: the disk and network jobs flush and wait before their
-	// first stamp and wait after their second, so their windows hold neither
-	// setup nor what follows.
+	// runs outside them: the idle, disk and network jobs flush and wait before
+	// their first stamp and wait after their second, so their windows hold
+	// neither setup nor what follows.
 	for _, tc := range []struct {
 		kind          string
 		load          []string
@@ -240,7 +240,7 @@ func TestTheKnownAnswerJobWritesWhatItRan(t *testing.T) {
 		before, after []string
 	}{
 		{kindBaseline, nil, "expected {}", nil, nil},
-		{kindIdle, []string{"sleep 60"}, `expected {"cpu_seconds":0}`, nil, nil},
+		{kindIdle, []string{"sleep 60"}, `expected {"cpu_seconds":0}`, []string{"sync", "sleep 2"}, []string{"sleep 2"}},
 		{kindCPU, []string{"stress-ng --cpu 4 --cpu-method matrixprod --timeout 60s --metrics-brief"},
 			`expected {"cpu_seconds":240}`, nil, nil},
 		{kindMemory, []string{"stress-ng --vm 1 --vm-bytes 2147483648 --vm-keep --timeout 60s --metrics-brief"},
