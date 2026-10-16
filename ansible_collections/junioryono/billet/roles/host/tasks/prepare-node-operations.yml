@@ -13,6 +13,7 @@
   ansible.builtin.set_fact:
     billet_retirement_planned_filesystem:
       - {kind: write, path: "{{ billet_ordinary_config_path }}"}
+      - {kind: write, path: /etc/tmpfiles.d/billet.conf}
       - {kind: delete, path: /etc/modules-load.d/billet-rbd.conf}
     billet_retirement_planned_services:
       - {verb: enable, unit: billet-node.service}

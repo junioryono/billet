@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -88,7 +89,8 @@ func TestRetainedNodePathsAdmitPackagedAndRoleDirectoryValues(t *testing.T) {
 					node[key] = strings.ReplaceAll(value, "\"", "")
 				}
 			}
-			if node["ReadWritePaths"] == "" || node["RuntimeDirectory"] != "billet/locks billet/registration" || (!role && node["StateDirectory"] != "billet/node") {
+			if !slices.Contains(strings.Fields(node["ReadWritePaths"]), "/run/billet/locks") ||
+				node["RuntimeDirectory"] != "billet/registration" || (!role && node["StateDirectory"] != "billet/node") {
 				t.Fatal("control lost the source's real directory values")
 			}
 			node["PrivateTmp"] = "yes"
@@ -105,6 +107,49 @@ func TestRetainedNodePathsAdmitPackagedAndRoleDirectoryValues(t *testing.T) {
 			node["ReadWritePaths"] += " /run/billet/somewhere-else"
 			if err := f.inspector.AdmitOperations(t.Context(), nil, p); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
 				t.Fatalf("runtime exemption escaped the node's own prefix: %v", err)
+			}
+		})
+	}
+}
+
+// THE HOST LOCK DIRECTORY IS DISPOSABLE ONLY AS THE PACKAGE NAMES IT (#175).
+// The current node unit names /run/billet/locks in ReadWritePaths and declares
+// only billet/registration; a unit from before still declares the lock
+// directory as a RuntimeDirectory, and both are admitted. Named as optional
+// ('-') it is the same directory. Anything else under /run/billet, or the lock
+// directory named only by another property, is still a volatile input.
+func TestRetainedNodePathsAdmitTheLockDirectoryOnlyWhereTheUnitNamesIt(t *testing.T) {
+	p := OperationProtection{Units: []string{"billet-node.service"}, RetainedPathUnits: []string{"billet-node.service"}, ArchivedInputRoots: []string{"/var/lib/billet/server"}}
+
+	cases := []struct {
+		name, runtime, readWrite, condition string
+		admitted                            bool
+	}{
+		{name: "named in ReadWritePaths", runtime: "billet/registration", readWrite: "/run/billet/locks", admitted: true},
+		{name: "named as optional", runtime: "billet/registration", readWrite: "-/run/billet/locks", admitted: true},
+		{name: "a lock record beneath it", runtime: "billet/registration", readWrite: "/run/billet/locks /run/billet/locks/deployment-x.lock", admitted: true},
+		{name: "a unit from before declares it", runtime: "billet/locks billet/registration", readWrite: "/run/billet/locks/deployment-x.lock", admitted: true},
+		{name: "a sibling beside it", runtime: "billet/registration", readWrite: "/run/billet/locks /run/billet/locks-else", admitted: false},
+		{name: "its parent", runtime: "billet/registration", readWrite: "/run/billet/locks /run/billet", admitted: false},
+		{name: "named only by a condition", runtime: "billet/registration", readWrite: "-/etc/billet/tls", condition: "/run/billet/locks/x", admitted: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOperationFixture(t)
+			node := f.unit(t, "billet-node.service")
+			node["RuntimeDirectory"] = tc.runtime
+			node["ReadWritePaths"] = tc.readWrite
+			if tc.condition != "" {
+				node["ConditionPathExists"] = tc.condition
+			}
+
+			err := f.inspector.AdmitOperations(t.Context(), nil, p)
+			switch {
+			case tc.admitted && err != nil:
+				t.Fatalf("refused: %v", err)
+			case !tc.admitted && (err == nil || !strings.Contains(err.Error(), "retained-input-volatile")):
+				t.Fatalf("admitted, or refused for another reason: %v", err)
 			}
 		})
 	}

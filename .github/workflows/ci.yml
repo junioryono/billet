@@ -934,7 +934,7 @@ jobs:
           fi
           retirement_postgres_address=$(docker port "$retirement_postgres" 5432/tcp)
           cd internal/lifeops
-          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^TestRealSystemdRetirementOperationEffects$'
+          sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "$RUNNER_TEMP/lifeops.test" -test.count=1 -test.v -test.run '^(TestRealSystemdRetirementOperationEffects|TestRealSystemdHostLockDirectoryOutlivesTheNodeStop)$'
           cd ../ops/host
           sudo env "PATH=/usr/bin:/bin:$PATH" BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 "BILLET_TEST_POSTGRES_DSN=postgres://billet:billet@$retirement_postgres_address/billet?sslmode=disable" "$RUNNER_TEMP/billet-command.test" -test.count=1 -test.v -test.run '^TestRealSystemd'
 

@@ -77,6 +77,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/account.yml / Create or adopt the billet service account | parity:verified retained account disables account creation and adoption |
 | tasks/account.yml / Install billet host dependencies | parity:package installation and maintainer scripts are the ordinary node-host operation, outside path admission (R7.7) |
 | tasks/account.yml / Create billet directories | loop:billet_common_directories; loop:billet_server_directories; loop:billet_node_directories |
+| tasks/account.yml / Keep the host lock directory across unit stops and reboots | const:/etc/tmpfiles.d/billet.conf |
 | tasks/account.yml / Reload systemd before inspecting host-upgrade service overlays | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Inspect billet service drop-ins before the upgrade transaction | parity:binary transaction only; retained binary changes refuse before ordinary work |
 | tasks/account.yml / Preserve configuration and units before replacing them | parity:binary transaction only; retained binary changes refuse before ordinary work |

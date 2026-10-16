@@ -5,6 +5,7 @@ import (
 	"errors"
 	"go/ast"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -164,7 +165,7 @@ func TestTheVerifyCommandLaunchesOnTheDiskItChose(t *testing.T) {
 				}
 			}
 		case *ast.CallExpr:
-			if isCallTo(n, "verifyGuestImage") && len(n.Args) == 9 {
+			if isCallTo(n, "verifyGuestImage") && len(n.Args) == 10 {
 				passed = isIdent(n.Args[7], "disk")
 			}
 		}
@@ -175,6 +176,55 @@ func TestTheVerifyCommandLaunchesOnTheDiskItChose(t *testing.T) {
 		t.Fatalf("cmdImagesVerify assigned disk %d times, chose it as verifyDisk(cfg, override): %v, "+
 			"and passed it as verifyGuestImage's disk: %v; want once, true, true",
 			assignments, chosen, passed)
+	}
+}
+
+// THE COMMAND ACTS AS THE LOCK'S HOLDER ONLY AFTER ASKING (#175). A structural
+// test, because cmdImagesVerify needs a real node and a Ceph store to run: the
+// pre-launch cleanup and the recorded promotion are each preceded, with no other
+// act between, by lock.held(), and the verification is handed lock.held to ask
+// before its own launch and destroys.
+func TestTheVerifyCommandAsksWhetherItStillHoldsTheLock(t *testing.T) {
+	t.Parallel()
+
+	fn := findFunc(t, "cmdImagesVerify")
+
+	isHeld := func(expr ast.Expr) bool {
+		sel, ok := expr.(*ast.SelectorExpr)
+
+		return ok && isIdent(sel.X, "lock") && sel.Sel.Name == "held"
+	}
+
+	var acts []string
+	handed := false
+
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		switch {
+		case isHeld(call.Fun):
+			acts = append(acts, "held")
+		case isIdent(call.Fun, "destroyProbe"):
+			acts = append(acts, "destroyProbe")
+		case isIdent(call.Fun, "verifyGuestImage"):
+			acts = append(acts, "verifyGuestImage")
+			handed = len(call.Args) == 10 && isHeld(call.Args[9])
+		default:
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "RecordVerification" {
+				acts = append(acts, "RecordVerification")
+			}
+		}
+
+		return true
+	})
+
+	want := []string{"held", "destroyProbe", "verifyGuestImage", "held", "RecordVerification"}
+	if !slices.Equal(acts, want) || !handed {
+		t.Fatalf("cmdImagesVerify acts in the order %q and hands verifyGuestImage lock.held: %v; want %q and true",
+			acts, handed, want)
 	}
 }
 
@@ -193,13 +243,14 @@ func isCallTo(expr ast.Expr, name string) bool {
 // launchRecorder records what a verification asks the backend to launch. With
 // no report it refuses the launch, so the verification ends at once; with one,
 // it starts the probe and the guest posts that report. Its Destroy finds
-// nothing.
+// nothing and records the name it was asked for.
 type launchRecorder struct {
 	provider.Provider
 
-	launched []provider.Spec
-	report   string
-	reports  chan<- string
+	launched  []provider.Spec
+	destroyed []string
+	report    string
+	reports   chan<- string
 }
 
 func (l *launchRecorder) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
@@ -228,7 +279,9 @@ func fakeGuestListener(t *testing.T, backend *launchRecorder) {
 	}
 }
 
-func (l *launchRecorder) Destroy(context.Context, string) (provider.Teardown, error) {
+func (l *launchRecorder) Destroy(_ context.Context, name string) (provider.Teardown, error) {
+	l.destroyed = append(l.destroyed, name)
+
 	return provider.TeardownStopped, nil
 }
 
@@ -239,7 +292,7 @@ func TestAVerificationLaunchesOnTheGrownDisk(t *testing.T) {
 	backend := &launchRecorder{}
 	fakeGuestListener(t, backend)
 	err := verifyGuestImage(t.Context(), processEnv(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
-		120*config.GiB, time.Second)
+		120*config.GiB, time.Second, nil)
 	if err == nil || !strings.Contains(err.Error(), "did not launch") {
 		t.Fatalf("verifyGuestImage = %v, want the refused launch reported", err)
 	}
@@ -262,8 +315,72 @@ func TestAnUngrownGuestFailsTheVerification(t *testing.T) {
 	fakeGuestListener(t, backend)
 
 	err := verifyGuestImage(t.Context(), processEnv(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
-		120*config.GiB, time.Minute)
+		120*config.GiB, time.Minute, nil)
 	if err == nil || !strings.Contains(err.Error(), "did not reach it") {
 		t.Fatalf("verifyGuestImage = %v, want the ungrown filesystem refused", err)
+	}
+}
+
+// A VERIFICATION THAT NO LONGER HOLDS ITS LOCK NEITHER LAUNCHES NOR DESTROYS
+// (#175). The probe's name is the same on every run, so once the lock's name
+// moved under this run, a probe by that name may be another verification's live
+// one. Lost before the launch: nothing is launched and nothing destroyed. Lost
+// after it: the probe is left for the next verification's pre-launch cleanup,
+// and the run says so. The control holds throughout and destroys its probe.
+// Serial: it replaces listenGuestReport.
+func TestAVerificationThatLostItsLockLeavesTheProbeAlone(t *testing.T) {
+	ungrown := strings.Join([]string{
+		"jit=SECRET", "whoami=runner", "runner=2.336.0",
+		"docker=29.1.3 storage=overlay2 cgroups=2",
+		"buildx=github.com/docker/buildx v0.33.0 7f91f038ac14",
+		"compose=2.40.3", "container=1",
+		"rootfs=" + strconv.FormatInt(int64(36*config.GiB), 10),
+	}, "\n")
+	lost := errors.New("the lock's name moved")
+
+	cases := []struct {
+		name                      string
+		heldFor                   int
+		launched, destroyed, left bool
+	}{
+		{name: "held throughout", heldFor: -1, launched: true, destroyed: true},
+		{name: "lost before the launch", heldFor: 0},
+		{name: "lost after the launch", heldFor: 1, launched: true, left: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &launchRecorder{report: ungrown}
+			fakeGuestListener(t, backend)
+
+			asked := 0
+			held := func() error {
+				asked++
+				if tc.heldFor >= 0 && asked > tc.heldFor {
+					return lost
+				}
+
+				return nil
+			}
+
+			err := verifyGuestImage(t.Context(), processEnv(), backend, "br0", 7719, "ubuntu-2404-x64@g1", "probe",
+				120*config.GiB, time.Minute, held)
+
+			if got := len(backend.launched) == 1; got != tc.launched {
+				t.Errorf("launched %v, want %v", backend.launched, tc.launched)
+			}
+
+			if got := len(backend.destroyed) == 1; got != tc.destroyed {
+				t.Errorf("destroyed %q, want destroyed=%v", backend.destroyed, tc.destroyed)
+			}
+
+			if tc.heldFor >= 0 && !errors.Is(err, lost) {
+				t.Errorf("verifyGuestImage = %v, want the lost lock reported", err)
+			}
+
+			if left := err != nil && strings.Contains(err.Error(), "was left in place for the next verification"); left != tc.left {
+				t.Errorf("verifyGuestImage = %v, want left=%v", err, tc.left)
+			}
+		})
 	}
 }

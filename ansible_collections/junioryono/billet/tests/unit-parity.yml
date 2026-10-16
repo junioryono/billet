@@ -217,27 +217,35 @@
         - ReadOnlyPaths
         - WantedBy
 
-    # THE NODE'S RUNTIME DIRECTORIES ARE THE NODE'S ALONE, ON EVERY VARIANT. The
-    # registration record lives under billet/registration; a directive conditional
-    # on one variant, a later reset, a placement outside [Service], or a
-    # RuntimeDirectoryPreserve other than `no` would each pass the steady-state
-    # comparison above, and a server render declaring the same directory would
-    # re-own and remove the node's record at its own start and stop (measured on
-    # systemd 255, 2026-09-09).
-    - name: The node declares its runtime directories once, in [Service], on every variant
+    # THE NODE'S RUNTIME DIRECTORY IS THE NODE'S ALONE, ON EVERY VARIANT, AND IT
+    # IS ONLY THE REGISTRATION RECORD'S. A directive conditional on one variant, a
+    # later reset, a placement outside [Service], or a RuntimeDirectoryPreserve
+    # other than `no` would each pass the steady-state comparison above, and a
+    # server render declaring the same directory would re-own and remove the
+    # node's record at its own start and stop (measured on systemd 255,
+    # 2026-09-09). The host lock directory is not one of them: a node's stop
+    # removed it under a lock an image verification held, and the next
+    # verification destroyed that one's probe (#175). Every variant names it in
+    # [Service]'s ReadWritePaths instead, without a '-'.
+    - name: The node declares only its registration directory, in [Service], on every variant
       ansible.builtin.assert:
         that:
           - item.text | regex_findall('(?m)^RuntimeDirectory=(.*)$') | map('trim') | list
-            == ['billet/locks billet/registration']
+            == ['billet/registration']
           - (item.text.split('[Service]') | last).split('[Install]') | first
-            is search('(?m)^RuntimeDirectory=billet/locks billet/registration$')
+            is search('(?m)^RuntimeDirectory=billet/registration$')
           - (item.text | regex_findall('(?m)^RuntimeDirectoryPreserve=(.*)$') | map('trim') | list) in [[], ['no']]
+          - (item.text.split('[Service]') | last).split('[Install]') | first
+            is search('(?m)^ReadWritePaths=.* /run/billet/locks$')
         fail_msg: >-
           {{ item.name }} declares RuntimeDirectory as
-          {{ item.text | regex_findall('(?m)^RuntimeDirectory=(.*)$') | map('trim') | list }}
-          and RuntimeDirectoryPreserve as
-          {{ item.text | regex_findall('(?m)^RuntimeDirectoryPreserve=(.*)$') | map('trim') | list }};
-          want exactly one `billet/locks billet/registration` in [Service] and no preservation.
+          {{ item.text | regex_findall('(?m)^RuntimeDirectory=(.*)$') | map('trim') | list }},
+          RuntimeDirectoryPreserve as
+          {{ item.text | regex_findall('(?m)^RuntimeDirectoryPreserve=(.*)$') | map('trim') | list }}
+          and ReadWritePaths as
+          {{ item.text | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list }};
+          want exactly one `billet/registration` in [Service], no preservation, and
+          /run/billet/locks required in [Service]'s ReadWritePaths.
       loop:
         - { name: packaged node, text: "{{ packaged_node }}" }
         - { name: role node steady, text: "{{ role_node_steady }}" }
@@ -296,11 +304,6 @@
         - { unit: billet-images-refresh.service, directive: ExecStart }
         - { unit: billet-images-refresh.service, directive: TimeoutStartSec }
         - { unit: billet-images-refresh.service, directive: ReadWritePaths }
-        # The lock directory the boot-verification needs, and the preserve that
-        # keeps this oneshot from removing the node's when it finishes.
-        - { unit: billet-images-refresh.service, directive: RuntimeDirectory }
-        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryMode }
-        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryPreserve }
         - { unit: billet-images-refresh.timer, directive: OnCalendar }
         - { unit: billet-images-refresh.timer, directive: RandomizedDelaySec }
         - { unit: billet-images-refresh.timer, directive: Persistent }
@@ -411,39 +414,41 @@
           report notify. An absent unit does not prove the installed binary can send READY=1,
           and this path runs with a binary of unknown vintage.
 
-    # A DIRECTIVE IN THE WRONG SECTION IS NOT A DIRECTIVE, and the comparison
-    # above is section-blind: it matches a line anywhere in the file, so moving
-    # the refresh's RuntimeDirectoryPreserve into [Unit] keeps both copies equal
-    # while systemd ignores the setting entirely — and an ignored preserve means
-    # the refresh removes the running node's lock directory every time it
-    # finishes. These three are checked where they must be because the lock
-    # directory is shared with billet-node.service; the packaged copy is pinned
-    # the same way in deploy/units_test.go.
-    - name: The refresh's runtime directory directives are in [Service] in both copies
+    # THE REFRESH TAKES THE HOST LOCK AND DECLARES NO DIRECTORY FOR IT, in both
+    # copies. A runtime directory is removed at its unit's stop, and this oneshot
+    # stops after every run; the lock directory is the tmpfiles entry's (#175).
+    # The comparison above is section-blind, so the required entry is looked for
+    # in [Service], the one section systemd reads it from, without a '-' so a
+    # missing directory fails the oneshot before its download.
+    - name: The refresh names the host lock directory and declares no runtime directory, in both copies
       ansible.builtin.assert:
-        that: >-
-          {{ [packaged_scheduled['billet-images-refresh.service'],
-              role_scheduled['billet-images-refresh.service']]
-             | map('split', '[Service]')
-             | map('last')
-             | select('search', '(?m)^' ~ item ~ '=')
-             | list | length == 2
-             and [packaged_scheduled['billet-images-refresh.service'],
-                  role_scheduled['billet-images-refresh.service']]
-             | map('split', '[Service]')
-             | map('first')
-             | select('search', '(?m)^' ~ item ~ '=')
-             | list | length == 0 }}
+        that:
+          - item is not search('(?m)^RuntimeDirectory')
+          - (item.split('[Service]') | last) is search('(?m)^ReadWritePaths=.* /run/billet/locks$')
         fail_msg: >-
-          {{ item }} must be assigned inside [Service] in both
-          deploy/billet-images-refresh.service and the role's template. systemd
-          reads it nowhere else, and an ignored RuntimeDirectoryPreserve lets
-          this oneshot delete billet-node.service's /run/billet/locks when it
-          finishes.
+          A copy of billet-images-refresh.service declares a runtime directory, or
+          does not require /run/billet/locks in [Service]'s ReadWritePaths:
+          {{ item }}
       loop:
-        - RuntimeDirectory
-        - RuntimeDirectoryMode
-        - RuntimeDirectoryPreserve
+        - "{{ packaged_scheduled['billet-images-refresh.service'] }}"
+        - "{{ role_scheduled['billet-images-refresh.service'] }}"
+      loop_control:
+        label: billet-images-refresh.service
+
+    # THE HOST LOCK DIRECTORY IS MADE ONE WAY ON EVERY HOST. The package installs
+    # deploy/billet-tmpfiles.conf under /usr/lib/tmpfiles.d and the role renders
+    # its template under /etc/tmpfiles.d; a byte of difference is a host whose
+    # lock directory has another owner or mode, or an age that cleans a held lock
+    # away, depending on how it was provisioned.
+    - name: The role's tmpfiles entry is the package's
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.file', billet_role_templates + '/billet-tmpfiles.conf.j2', rstrip=false)
+            == lookup('ansible.builtin.file', billet_repo_root + '/deploy/billet-tmpfiles.conf', rstrip=false)
+        fail_msg: >-
+          roles/host/templates/billet-tmpfiles.conf.j2 differs from
+          deploy/billet-tmpfiles.conf; a role-converged host and a packaged one
+          would make /run/billet/locks differently.
 
     # THE DIFFERENCES ARE ASSERTED TOO, not merely tolerated. Each is deliberate
     # and each is the kind of thing that would otherwise drift into an accident;
@@ -470,9 +475,9 @@
           # role grants its state dir by path where the package gets it from
           # StateDirectory.
           - packaged_node | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
-            == ['-/etc/billet/tls -/srv/jailer']
+            == ['-/etc/billet/tls -/srv/jailer /run/billet/locks']
           - role_node_steady | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list
-            == ['-/etc/billet/tls -/srv/jailer "/var/lib/billet/node"']
+            == ['-/etc/billet/tls -/srv/jailer "/var/lib/billet/node" /run/billet/locks']
           # The backup's writable path is the server's, quoted the way the
           # server template quotes it; the package writes it bare.
           - packaged_scheduled['billet-backup.service'] | regex_findall('(?m)^ReadWritePaths=(.*)$') | map('trim') | list

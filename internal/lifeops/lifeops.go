@@ -166,6 +166,11 @@ type ServiceFacts struct {
 	// different path is a service that will fail on its first write.
 	StateDirectory   string
 	RuntimeDirectory string
+	// ReadWritePaths is what the unit names writable beyond those, as systemd
+	// renders it (absolute paths separated by spaces, a '-' marking one whose
+	// absence is not an error). The node names its lock directory here: no unit
+	// may declare it a RuntimeDirectory, whose stop removes it (#175).
+	ReadWritePaths string
 
 	// ReloadPending is systemd's own NeedDaemonReload: the unit file on disk has
 	// changed since the manager read it, so the bytes on disk and the unit the
@@ -497,7 +502,7 @@ func (i *Inspector) service(ctx context.Context, unit, packaged string,
 	props, err := i.properties(ctx, unit,
 		"LoadState", "ActiveState", "SubState", "UnitFileState", "Result",
 		"Type", "User", "Group", "FragmentPath", "DropInPaths",
-		"StateDirectory", "RuntimeDirectory",
+		"StateDirectory", "RuntimeDirectory", "ReadWritePaths",
 		"ExecStartPre", "ExecStartPost", "ExecCondition", "ExecStopPost", "ExecReload",
 		"RootDirectory", "RootImage", "BindPaths", "BindReadOnlyPaths", "MountImages",
 		"SupplementaryGroups", "AmbientCapabilities", "PAMName", "ExecSearchPath", "DynamicUser",
@@ -533,6 +538,7 @@ func (i *Inspector) service(ctx context.Context, unit, packaged string,
 
 		StateDirectory:   first(props, "StateDirectory"),
 		RuntimeDirectory: first(props, "RuntimeDirectory"),
+		ReadWritePaths:   first(props, "ReadWritePaths"),
 
 		// Rendered down to the command line: systemd's full answer carries pids
 		// and timestamps that make a refusal unreadable.

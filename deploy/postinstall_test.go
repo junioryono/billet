@@ -180,3 +180,64 @@ test ! -s /etc/needrestart/conf.d
 		t.Fatalf("package needrestart exclusion: %v\n%s", err, out)
 	}
 }
+
+// TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns executes the
+// postinstall in a container: where systemd runs, it asks systemd-tmpfiles to
+// create the entry the package installs, exactly once and by its path; a
+// failure is said and never ends the install, because the next boot creates the
+// directory; and where systemd is not running (an image build, a chroot) it
+// asks nothing. Stand-ins answer for systemctl and systemd-tmpfiles, whose real
+// effect on the entry is measured against systemd in
+// internal/lifeops's real-systemd test.
+func TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns(t *testing.T) {
+	t.Parallel()
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skip("Docker is required to execute the package installer on Linux")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "docker", "image", "inspect", "ubuntu:24.04").Run(); err != nil {
+		t.Skipf("a local ubuntu:24.04 image and Docker daemon are required: %v", err)
+	}
+	script, err := filepath.Abs("scripts/postinstall.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "billet-package-tmpfiles-" + filepath.Base(filepath.Dir(t.TempDir()))
+	t.Cleanup(func() {
+		cleanup, stop := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer stop()
+		out, err := exec.CommandContext(cleanup, "docker", "rm", "-f", name).CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "No such container:") {
+			t.Errorf("remove the package-test container: %v: %s", err, out)
+		}
+	})
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--pull=never", "--network=none",
+		"--name", name, "--mount", "type=bind,src="+script+",dst=/postinstall.sh,readonly",
+		"-i", "ubuntu:24.04", "sh", "-eu")
+	cmd.Stdin = strings.NewReader(`
+mkdir /shim
+printf '#!/bin/sh\nexit 0\n' >/shim/systemctl
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/tmpfiles.argv\nexit "${TMPFILES_EXIT:-0}"\n' >/shim/systemd-tmpfiles
+chmod 0755 /shim/systemctl /shim/systemd-tmpfiles
+
+PATH="/shim:${PATH}" sh /postinstall.sh
+if [ -e /tmpfiles.argv ]; then
+    echo 'the package asked systemd-tmpfiles for something where systemd is not running' >&2
+    exit 1
+fi
+
+mkdir -p /run/systemd/system
+PATH="/shim:${PATH}" sh /postinstall.sh
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+
+rm /tmpfiles.argv
+TMPFILES_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/tmpfiles.err
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+grep -F '/run/billet/locks could not be created now' /tmpfiles.err
+`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("package host lock directory: %v\n%s", err, out)
+	}
+}

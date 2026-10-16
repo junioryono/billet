@@ -118,6 +118,8 @@ billet_node_directories: >-
       {'path': '/var/lib/billet/health', 'owner': 'root', 'group': 'root', 'mode': '0750'},
       {'path': billet_firecracker_stage, 'owner': 'root', 'group': 'root', 'mode': '0700'},
       {'path': '/srv/jailer', 'owner': 'root', 'group': 'root', 'mode': '0755'},
-      {'path': '/usr/local/libexec', 'owner': 'root', 'group': 'root', 'mode': '0755'}]
+      {'path': '/usr/local/libexec', 'owner': 'root', 'group': 'root', 'mode': '0755'},
+      {'path': '/run/billet', 'owner': 'root', 'group': 'root', 'mode': '0755'},
+      {'path': '/run/billet/locks', 'owner': 'root', 'group': 'root', 'mode': '0750'}]
      + ([] if billet_retirement_node_ordinary | default(false) | bool else
         [{'path': '/var/lib/billet/upgrades', 'owner': 'root', 'group': 'root', 'mode': '0700'}]) }}

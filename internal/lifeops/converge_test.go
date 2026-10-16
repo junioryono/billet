@@ -68,8 +68,11 @@ func healthyNode(t *testing.T, h *host, over map[string]string) string {
 		"User":           "root",
 		"Group":          "root",
 		"StateDirectory": "billet/node",
-		// The packaged node unit's two entries, as systemctl renders them.
-		"RuntimeDirectory": "billet/locks billet/registration",
+		// The packaged node unit's directories, as systemctl renders them: the
+		// registration record's runtime directory, and the host lock directory
+		// named rather than declared (#175).
+		"RuntimeDirectory": "billet/registration",
+		"ReadWritePaths":   "-/etc/billet/tls -/srv/jailer /run/billet/locks",
 	}
 	maps.Copy(fields, over)
 
@@ -603,9 +606,10 @@ func TestPlanRefusesStateTheUnitCannotWrite(t *testing.T) {
 }
 
 // A DIRECTORY DIRECTIVE IS A LIST, rendered by systemctl as entries separated
-// by spaces: the node unit declares its locks beside its registration
-// record, so the lock directory is admitted as one entry of two, a prefix of
-// an entry is refused naming both, and the joined text is never a directory.
+// by spaces: a node unit from before #175 declares its locks beside its
+// registration record, so the lock directory is admitted as one entry of two, a
+// prefix of an entry is refused naming both, and the joined text is never a
+// directory.
 func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 	cases := []struct {
 		name, dir string
@@ -621,7 +625,14 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHost(t)
-			c, _ := h.converger(t, healthyHost(t, h))
+			a := &answers{reply: map[string]string{
+				deploy.ServerUnitName: healthyServer(t, h, nil),
+				deploy.NodeUnitName: healthyNode(t, h, map[string]string{
+					"RuntimeDirectory": "billet/locks billet/registration",
+					"ReadWritePaths":   "-/etc/billet/tls -/srv/jailer",
+				}),
+			}}
+			c, _ := h.converger(t, a)
 
 			req := upRequest()
 			req.NodeLockDir = tc.dir
@@ -638,6 +649,59 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 
 			if tc.refused && !strings.Contains(joined, "/run/billet/locks or /run/billet/registration") {
 				t.Errorf("the refusal does not name both directories the unit makes writable:\n%s", joined)
+			}
+		})
+	}
+}
+
+// THE LOCK DIRECTORY IS NAMED, NOT DECLARED, BY THIS RELEASE'S NODE UNIT
+// (#175): a RuntimeDirectory's stop removes it under another process's lock, so
+// billet-tmpfiles.conf makes it and the unit names it in ReadWritePaths. The
+// named entry, with or without a leading '-', admits it whole; a neighbour of
+// it, its parent and a relative entry do not, and the refusal names what the
+// unit does make writable.
+func TestPlanAdmitsTheLockDirectoryTheUnitNames(t *testing.T) {
+	cases := []struct {
+		name, readWrite, dir string
+		refused              bool
+	}{
+		{"named", "-/etc/billet/tls -/srv/jailer /run/billet/locks", "/run/billet/locks", false},
+		{"named as optional", "-/run/billet/locks", "/run/billet/locks", false},
+		{"named with a trailing slash", "/run/billet/locks/", "/run/billet/locks", false},
+		{"a neighbour", "/run/billet/locks", "/run/billet/locks-else", true},
+		{"the parent", "/run/billet/locks", "/run/billet", true},
+		{"a relative entry is not a path", "run/billet/locks", "/run/billet/locks", true},
+		{"named nowhere", "-/etc/billet/tls", "/run/billet/locks", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHost(t)
+			a := &answers{reply: map[string]string{
+				deploy.ServerUnitName: healthyServer(t, h, nil),
+				deploy.NodeUnitName: healthyNode(t, h, map[string]string{
+					"RuntimeDirectory": "billet/registration",
+					"ReadWritePaths":   tc.readWrite,
+				}),
+			}}
+			c, _ := h.converger(t, a)
+
+			req := upRequest()
+			req.NodeLockDir = tc.dir
+
+			plan, err := c.Plan(t.Context(), req)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+
+			joined := strings.Join(refusalText(plan.Refusals), "\n")
+			if refused := strings.Contains(joined, "lock_dir is "); refused != tc.refused {
+				t.Fatalf("lock_dir %q under ReadWritePaths %q refused=%v, want %v:\n%s",
+					tc.dir, tc.readWrite, refused, tc.refused, joined)
+			}
+
+			if tc.refused && !strings.Contains(joined, "/run/billet/registration") {
+				t.Errorf("the refusal does not name the directories the unit makes writable:\n%s", joined)
 			}
 		})
 	}

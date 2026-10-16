@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"github.com/junioryono/billet/deploy"
 )
 
 // AdmitRetainedUnitPaths rereads the complete loaded property set at stopped
@@ -47,6 +49,23 @@ func (w *operationWalk) admitRetainedUnitPaths(ctx context.Context) error {
 				return err
 			}
 			disposable = append(disposable, filepath.Join(runtimeRoot, entry), path)
+		}
+		// THE HOST LOCK DIRECTORY IS DISPOSABLE WHERE THE UNIT NAMES IT AS THE
+		// PACKAGE DOES. billet-tmpfiles.conf makes it at boot and no unit
+		// declares it, because a RuntimeDirectory's stop removed it under
+		// another process's lock (#175); what it holds is lock records any
+		// process recreates. Only the exact directory, only from ReadWritePaths:
+		// a sibling under /run/billet, or the directory named by another
+		// property, remains a volatile input.
+		for _, entry := range strings.Fields(first(props, "ReadWritePaths")) {
+			if strings.TrimPrefix(entry, "-") != deploy.NodeLockDir {
+				continue
+			}
+			path, err := w.bindPath(deploy.NodeLockDir)
+			if err != nil {
+				return err
+			}
+			disposable = append(disposable, deploy.NodeLockDir, path)
 		}
 		paths, err := w.inspector.retainedUnitPaths(ctx, unit, props)
 		if err != nil {

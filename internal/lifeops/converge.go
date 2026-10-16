@@ -756,22 +756,20 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 
 	for _, d := range []struct {
 		what, configured, declared, root string
+		// named is a ReadWritePaths answer whose entries also admit the
+		// directory, each with any '-' (missing is not an error) stripped.
+		named string
 	}{
-		{"state_dir", spec.stateDir, s.StateDirectory, stateRoot},
-		{"lock_dir", spec.lockDir, s.RuntimeDirectory, runtimeRoot},
+		{what: "state_dir", configured: spec.stateDir, declared: s.StateDirectory, root: stateRoot},
+		// THE LOCK DIRECTORY IS NAMED, NOT DECLARED, by this release's node
+		// unit: a RuntimeDirectory is removed at the unit's stop under a lock
+		// another process holds in it (#175), so billet-tmpfiles.conf creates
+		// /run/billet/locks and the unit names it in ReadWritePaths. A unit from
+		// before that still declares it, and is admitted too: its node starts.
+		{what: "lock_dir", configured: spec.lockDir, declared: s.RuntimeDirectory, root: runtimeRoot,
+			named: s.ReadWritePaths},
 	} {
 		if d.configured == "" {
-			continue
-		}
-
-		if d.declared == "" {
-			refusals = append(refusals, Refusal{
-				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
-					"%s is writable by it", s.Name, d.what, d.configured),
-				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
-					"and makes writable",
-			})
-
 			continue
 		}
 
@@ -781,6 +779,21 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 		var wants []string
 		for _, entry := range strings.Fields(d.declared) {
 			wants = append(wants, filepath.Join(d.root, entry))
+		}
+
+		for _, entry := range strings.Fields(d.named) {
+			wants = append(wants, filepath.Clean(strings.TrimPrefix(entry, "-")))
+		}
+
+		if len(wants) == 0 {
+			refusals = append(refusals, Refusal{
+				What: fmt.Sprintf("%s declares no directory for %s, so billet cannot tell whether "+
+					"%s is writable by it", s.Name, d.what, d.configured),
+				Remedy: "restore the packaged unit, which declares the directories systemd creates " +
+					"and makes writable",
+			})
+
+			continue
 		}
 
 		if !slices.Contains(wants, filepath.Clean(d.configured)) {

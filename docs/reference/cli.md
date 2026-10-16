@@ -119,6 +119,8 @@ The report names the host's converge guard when one is held: informational under
 
 On Linux it also says whether needrestart, which unattended upgrades run after every package upgrade, leaves billet's services alone: nothing when needrestart is not installed, the file carrying `$nrconf{override_rc}{qr(^billet-)} = 0;` when one does, a `WARNING` naming `/etc/needrestart/conf.d/90-billet.conf` when none does, and could-not-tell when a configuration file cannot be read. It recognises only that line, so a host kept safe another way still reads as the warning.
 
+On a Linux node it also says whether `node.lock_dir` outlives the node's stop: a `WARNING` when `billet-node.service` still declares it, or a parent of it, as a `RuntimeDirectory`, which systemd removes at every stop of the node under the locks other processes hold there (an image verification's among them); nothing when the unit is not installed; and could-not-tell when systemd could not be asked. The units this release ships name the directory in `ReadWritePaths` and a tmpfiles.d entry creates it at boot, but a host a rollout upgraded keeps the units it had until the package is installed or the host role converges it.
+
 ## Running the services
 
 ### `billet local status|up|down|uninstall`

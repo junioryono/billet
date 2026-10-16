@@ -581,6 +581,19 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
 
+    # THE HOST LOCK DIRECTORY, NOW, as systemd-tmpfiles makes it at every boot
+    # from the entry this package installs. No unit declares it a
+    # RuntimeDirectory, because a unit's stop removes those under a lock another
+    # process holds (#175); the units name it in ReadWritePaths without a '-', so
+    # a node or an image refresh started before it exists refuses with
+    # 226/NAMESPACE naming the path. A failure is reported, never fatal: the next
+    # boot creates it.
+    if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf; then
+        echo "billet: /run/billet/locks could not be created now; billet-node and the image" >&2
+        echo "        refresh will not start until it exists. Run" >&2
+        echo "        \`systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf\`, or reboot." >&2
+    fi
+
     # A DROP-IN CAN OUTLIVE THE ASSUMPTION IT WAS WRITTEN UNDER. These units
     # are Type=notify: the service is ready when billet's MAIN process sends
     # READY=1, so an override whose ExecStart wraps billet in something that

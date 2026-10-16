@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"io"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -556,15 +557,15 @@ func TestRequiredPathsUnderPrivateTmpReadsTheUnitAsSystemdDoes(t *testing.T) {
 	}
 }
 
-// THE NODE DECLARES ITS TWO RUNTIME DIRECTORIES ONCE, IN [Service], AND THE
+// THE NODE DECLARES ITS REGISTRATION DIRECTORY ONCE, IN [Service], AND THE
 // SERVER DECLARES NONE. The registration record lives under
 // billet/registration; a second assignment or a later empty one would reset
 // the list, a placement under [Unit] would be ignored, a RuntimeDirectoryPreserve
 // other than no would keep a record across a restart (the empty directory at a
 // start is what the inspector's currency rule rests on), and a server unit
 // declaring the same directory would re-own and remove the node's record.
-func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *testing.T) {
-	const want = "RuntimeDirectory=billet/locks billet/registration"
+func TestTheNodeUnitDeclaresItsRegistrationDirectoryAndTheServerDeclaresNone(t *testing.T) {
+	const want = "RuntimeDirectory=billet/registration"
 
 	lines := strings.Split(deploy.NodeUnit, "\n")
 	section := ""
@@ -596,42 +597,130 @@ func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *tes
 	}
 }
 
-// A UNIT THAT TAKES THE HOST LOCK DECLARES THE DIRECTORY IT LIVES IN, AND ONLY
-// ITS OWNER MAY REMOVE IT.
+// NO UNIT OWNS THE HOST LOCK DIRECTORY. A unit removes the runtime directories
+// it declares when it stops, and a lock in /run/billet/locks is held by
+// processes that outlive a node restart: `billet images verify` holds its probe
+// lock for the minutes a boot verification takes. A stop that removed the
+// directory unlinked the lock's name under its holder, and the next verifier
+// locked a fresh file at the same path and destroyed the first one's live probe
+// (#175; measured on systemd 255.4, 2026-10-16: the second flock on the
+// recreated name was granted). A declaration of the directory's parent removes
+// it just the same, so billet itself and every prefix of the lock directory are
+// refused too.
+func TestNoUnitDeclaresTheHostLockDirectory(t *testing.T) {
+	units := map[string]string{
+		deploy.ServerUnitName:        deploy.ServerUnit,
+		deploy.NodeUnitName:          deploy.NodeUnit,
+		deploy.BackupUnitName:        deploy.BackupUnit,
+		deploy.UpgradeUnitName:       deploy.UpgradeUnit,
+		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
+	}
+
+	lockDir := strings.TrimPrefix(deploy.NodeLockDir, "/run/")
+
+	for name, unit := range units {
+		for _, value := range serviceAssignments(unit, "RuntimeDirectory") {
+			for _, entry := range strings.Fields(value) {
+				if entry == lockDir || strings.HasPrefix(lockDir, entry+"/") || strings.HasPrefix(entry, lockDir+"/") {
+					t.Errorf("%s declares RuntimeDirectory %q, whose stop removes %s under the locks "+
+						"other processes hold in it", name, entry, deploy.NodeLockDir)
+				}
+			}
+		}
+	}
+}
+
+// A UNIT THAT TAKES THE HOST LOCK NAMES ITS DIRECTORY, AND REQUIRES IT.
 //
-// /run/billet/locks is the host-wide collision domain, and ProtectSystem=strict
-// leaves nothing under /run writable except a directory the unit itself
-// declares. The image refresh takes that lock to boot-verify a generation before
-// promoting it, so without the declaration a pull downloaded the image (about
-// 5.1 GiB of parts, 23.6 GB decompressed), imported the generation and then
-// failed on the lock, leaving the image unpromoted and @verified on the old one
-// (measured on a node 2026-09-22).
-//
-// The preserve is the other half. A unit removes the runtime directories it
-// declares when it stops, and a oneshot stops after every run, so a refresh
-// without RuntimeDirectoryPreserve=yes would take the running node's lock
-// directory with it. billet-node.service is the owner and must NOT preserve,
-// which the test above pins; every other unit that declares the directory must.
-func TestAUnitThatTakesTheHostLockDeclaresItWithoutTakingItAway(t *testing.T) {
+// ProtectSystem=strict leaves nothing under /run writable that a unit does not
+// name, so the node (the deployment lock) and the image refresh (the probe lock
+// a promotion takes) carry it in ReadWritePaths. Without a leading '-': a host
+// whose directory is missing then refuses the start with 226/NAMESPACE naming
+// the path, rather than starting a node that cannot lock or a refresh that
+// downloads a 5 GiB image before failing on the lock (measured on systemd
+// 255.4, 2026-10-16).
+func TestAUnitThatTakesTheHostLockRequiresItsDirectory(t *testing.T) {
 	for name, unit := range map[string]string{
+		deploy.NodeUnitName:          deploy.NodeUnit,
 		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
 	} {
-		if got := serviceAssignments(unit, "RuntimeDirectory"); !slices.Equal(got, []string{"billet/locks"}) {
-			t.Errorf("%s assigns RuntimeDirectory=%q; it takes the host lock, and under "+
-				"ProtectSystem=strict a directory it does not declare cannot be opened, so the "+
-				"pull it follows is wasted", name, got)
+		var entries []string
+		for _, value := range serviceAssignments(unit, "ReadWritePaths") {
+			entries = append(entries, strings.Fields(value)...)
 		}
 
-		if got := serviceAssignments(unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, []string{"yes"}) {
-			t.Errorf("%s assigns RuntimeDirectoryPreserve=%q; a unit removes the runtime "+
-				"directories it declares when it stops, and this one stops after every run, so "+
-				"anything but yes takes %s's lock directory with it", name, got, deploy.NodeUnitName)
+		if !slices.Contains(entries, deploy.NodeLockDir) {
+			t.Errorf("%s names ReadWritePaths %q, without %s as a required entry; under "+
+				"ProtectSystem=strict it cannot take the host lock there", name, entries, deploy.NodeLockDir)
+		}
+	}
+}
+
+// THE TMPFILES ENTRY MAKES THE LOCK DIRECTORY AS THE NODE UNIT USED TO, AND
+// NEVER AGES IT. root:root 0750 is what RuntimeDirectoryMode gave the
+// directory, so a host moving from the old units to this entry re-owns
+// nothing; an age field other than '-' would let systemd-tmpfiles --clean
+// remove a lock file a process holds, which is #175 again on a timer.
+func TestTheTmpfilesEntryMakesTheLockDirectoryAndNeverAgesIt(t *testing.T) {
+	var lines []string
+
+	for line := range strings.Lines(deploy.Tmpfiles) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
 
-		if got := serviceAssignments(unit, "RuntimeDirectoryMode"); !slices.Equal(got, []string{"0750"}) {
-			t.Errorf("%s assigns RuntimeDirectoryMode=%q; %s creates that directory 0750, and a "+
-				"different mode re-owns what the two units share", name, got, deploy.NodeUnitName)
+		lines = append(lines, strings.Join(strings.Fields(line), " "))
+	}
+
+	want := []string{
+		"d /run/billet 0755 root root -",
+		"d " + deploy.NodeLockDir + " 0750 root root -",
+	}
+
+	if !slices.Equal(lines, want) {
+		t.Errorf("billet-tmpfiles.conf declares %q, want exactly %q", lines, want)
+	}
+}
+
+// THE PACKAGE INSTALLS THE ENTRY WHERE postinstall CREATES IT FROM, AND THE
+// ROLE RENDERS THE SAME BYTES. A host converged by the role and one that
+// installed the package carry one directory with one owner and mode; the
+// role's template must carry no Jinja delimiter, or its render would differ
+// from its source.
+func TestThePackageAndTheRoleInstallOneTmpfilesEntry(t *testing.T) {
+	release, err := os.ReadFile("../.goreleaser.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(release), "- src: deploy/billet-tmpfiles.conf\n        dst: "+deploy.TmpfilesPath+"\n") {
+		t.Errorf(".goreleaser.yaml does not install deploy/billet-tmpfiles.conf at %s", deploy.TmpfilesPath)
+	}
+
+	role, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/templates/billet-tmpfiles.conf.j2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(role) != deploy.Tmpfiles {
+		t.Errorf("the role's tmpfiles template differs from deploy/billet-tmpfiles.conf:\nrole:\n%s\npackage:\n%s",
+			role, deploy.Tmpfiles)
+	}
+
+	for _, delimiter := range []string{"{{", "{%", "{#"} {
+		if strings.Contains(string(role), delimiter) {
+			t.Errorf("the role's tmpfiles template carries the Jinja delimiter %q", delimiter)
 		}
+	}
+
+	account, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/tasks/account.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(account), "src: billet-tmpfiles.conf.j2\n    dest: "+deploy.TmpfilesRolePath+"\n") {
+		t.Errorf("the role's account.yml does not render billet-tmpfiles.conf.j2 at %s", deploy.TmpfilesRolePath)
 	}
 }
 
