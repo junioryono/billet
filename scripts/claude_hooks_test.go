@@ -479,6 +479,16 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"git push origin >/dev/null 2>&1", "must name what it pushes"},
 		{"git push --force origin junior-oct03-work > /tmp/push.log 2>&1", "force"},
 		{"git push origin 2>/dev/null main", "never pushes to main"},
+		// A redirection whose target never closes its quote leaves the line
+		// unreadable, and the git rules still refuse what they cannot read.
+		{"echo x >'unterminated; git push --force origin junior-oct03-work", "could not be parsed"},
+		{"echo x >\"unterminated; git rebase main", "could not be parsed"},
+		// A line continuation joins words before a descriptor is read.
+		{"make 2\\\n>/dev/null", bare},
+		{"make check 2\\\n>/dev/null", gate},
+		{"make > \\\n /tmp/make.log", bare},
+		{"git push origin main\\\n2>/dev/null", ""},
+		{"git push origin junior-oct03-work 2>\\\n/dev/null", ""},
 		{"make test", gate},
 		{"make lint", gate},
 		{"make lint-custom", gate},

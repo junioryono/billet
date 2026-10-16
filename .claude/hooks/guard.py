@@ -209,7 +209,8 @@ WORD_ENDS = " \t\n;&|()<>"
 
 
 def word_end(text, j):
-    """The index just past the shell word that starts at j, quotes included."""
+    """The index just past the shell word that starts at j, quotes included; None
+    when a quote in it never closes, so the line stays as unreadable as it is."""
     n = len(text)
     while j < n and text[j] not in WORD_ENDS:
         c = text[j]
@@ -217,29 +218,41 @@ def word_end(text, j):
             j += 2
         elif c == "'":
             close = text.find("'", j + 1)
-            j = n if close < 0 else close + 1
+            if close < 0:
+                return None
+            j = close + 1
         elif c == '"':
             j += 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                return None
             j += 1
         else:
             j += 1
     return min(j, n)
 
 
-def redirection_end(text, i):
+def past_continuations(text, j):
+    while text.startswith("\\\n", j):
+        j += 2
+    return j
+
+
+def redirection_end(text, i, previous):
     """The index just past a redirection starting at i (`>log`, `2>&1`, `&>/dev/null`,
     `<<<word`), or None when none starts there. Heredocs and process substitution
     are left to the caller. Read here, before the line is split into words, because
     only here is a quoted `>` still told apart from an operator and `2>&1` not yet
-    split at its `&`."""
+    split at its `&`. previous is the last character already kept, line
+    continuations removed, so a descriptor is told from the end of a word the way
+    the shell tells it."""
     n, j = len(text), i
     if text[j].isdigit():
-        if i > 0 and text[i - 1] not in " \t\n;&|()":
+        if previous and previous not in " \t\n;&|()":
             return None
         while j < n and text[j].isdigit():
-            j += 1
+            j = past_continuations(text, j + 1)
     elif text.startswith("&>", j):
         j += 1
     if j >= n or text[j] not in "<>":
@@ -248,8 +261,8 @@ def redirection_end(text, i):
         return None
     # The target is the next word: a file, or after >& and <& a descriptor or `-`.
     j += len(next(op for op in REDIRECTION_OPERATORS if text.startswith(op, j)))
-    while j < n and text[j] in " \t":
-        j += 1
+    while j < n and (text[j] in " \t" or text.startswith("\\\n", j)):
+        j = past_continuations(text, j) if text[j] == "\\" else j + 1
     return word_end(text, j)
 
 
@@ -287,7 +300,7 @@ def preprocess(text):
             i += 1
             continue
         # top level, or inside $( ... ) or ( ... )
-        end = redirection_end(text, i)
+        end = redirection_end(text, i, next((s[-1] for s in reversed(out) if s), ""))
         if end is not None:
             out.append(" ")
             i = end
