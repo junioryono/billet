@@ -54,26 +54,48 @@ func TestJitterUnderBloatNeverCreditsACut(t *testing.T) {
 func TestAGatewayThatGaveNoReadingIsNotAClearRound(t *testing.T) {
 	t.Parallel()
 
+	// THE GATEWAY'S LAST READING WAS A STALL, taken by a trickle that is
+	// blamed for nothing, and then it gives no reading.
 	c := newController()
+	c.Step(withGateway(moving(0, 1, 1, 2*time.Millisecond), gatewayRose(60*time.Millisecond)))
 	c.Down.episode, c.Down.futile = true, c.Params.Futile
 	c.Down.lastCut, c.Down.cutSince = at(-100), true
 
-	for n := range 12 {
+	for n := 1; n < 13; n++ {
 		c.Step(withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayLost()))
 	}
 
 	if !c.Down.episode || c.Down.futile != c.Params.Futile {
-		t.Errorf("rounds with the gateway unmeasured cleared a latched episode (episode %v, futile %d)",
+		t.Errorf("rounds with a stalled gateway unmeasured cleared a latched episode (episode %v, futile %d)",
 			c.Down.episode, c.Down.futile)
 	}
 
 	r := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	r.Down.Rate = 50
-	for n := range 6 {
+	r.Step(withGateway(moving(0, 1, 1, 2*time.Millisecond), gatewayRose(60*time.Millisecond)))
+	for n := 1; n < 7; n++ {
 		r.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gatewayLost()))
 	}
 	if r.Down.Rate != 50 {
-		t.Errorf("a full download climbed to %.1f beside a counted gateway that gave no reading", r.Down.Rate)
+		t.Errorf("a full download climbed to %.1f beside a stalled gateway that gave no reading", r.Down.Rate)
+	}
+
+	// BUT A GATEWAY WHOSE LAST READING WAS QUIET, AND THAT ANSWERS ONLY SOME OF
+	// ITS PROBES, HOLDS NOTHING UP: one that limits ICMP would otherwise slow
+	// every raise.
+	q := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
+	q.Down.Rate = 50
+	for n := range 6 {
+		gateway := gatewayLost()
+		if n%2 == 0 {
+			gateway = gatewayRose(time.Millisecond)
+		}
+		q.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gateway))
+	}
+	// SIX RAISES, NOT THREE: every round is clear (three raises would reach 57.8).
+	if q.Down.Rate <= 60 {
+		t.Errorf("a full download beside a quiet gateway answering every other probe climbed only to %.1f, "+
+			"so its unanswered rounds held the rate", q.Down.Rate)
 	}
 
 	// A GATEWAY THAT HAS GONE SILENT IS NOT COUNTED, and a line it no longer
@@ -85,6 +107,25 @@ func TestAGatewayThatGaveNoReadingIsNotAClearRound(t *testing.T) {
 	}
 	if s.Down.Rate <= 50 {
 		t.Errorf("a full download beside a gateway no longer counted did not climb (%.1f)", s.Down.Rate)
+	}
+}
+
+// THE GATEWAY'S STALL MUST FALL BY A FIFTH TO HAVE SHORTENED, the reflectors'
+// delay by a tenth: one ping a round wanders more than a median of three, and a
+// steady 60 ms stall read anywhere from 50 to 70 ms.
+func TestTheGatewaysMarginIsWiderThanTheReflectors(t *testing.T) {
+	t.Parallel()
+
+	at60 := measured{60 * time.Millisecond, true}
+
+	if (measured{50 * time.Millisecond, true}).shorter(at60, gatewayShare) {
+		t.Error("a gateway stall read 50 ms after 60 counted as shortened")
+	}
+	if !(measured{48 * time.Millisecond, true}).shorter(at60, gatewayShare) {
+		t.Error("a gateway stall fallen from 60 ms to 48 did not count as shortened")
+	}
+	if !(measured{53 * time.Millisecond, true}).shorter(at60, reflectorsShare) {
+		t.Error("a reflector delay fallen from 60 ms to 53 did not count as shortened")
 	}
 }
 

@@ -174,6 +174,9 @@ func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(20*time.Millisecond)), true},
 		"the gateway's stall stayed at 59 ms": {
 			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(59*time.Millisecond)), false},
+		// A FIFTH OF ITS 60 MS, NOT A TENTH: one ping wanders more than a median.
+		"the gateway's stall read 50 ms": {
+			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(50*time.Millisecond)), false},
 		// SOURCE AGAINST SOURCE: the reflectors' unchanged 20 ms is not a shorter
 		// 60 ms stall, though the gateway went unanswered.
 		"the gateway went unanswered and the reflectors stayed": {
