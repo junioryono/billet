@@ -63,6 +63,17 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	name := "selftest-" + env.lease[:12]
 	published := filepath.Join(golden.snapshotsDir(), name)
 
+	// A STORE THIS TEST MADE IS A STORE IT TAKES AWAY, on the node's own chroot base.
+	// Registered first so it runs last, after the snapshots in it are gone, and by
+	// Remove rather than RemoveAll, so a store something else has used is never taken.
+	if _, err := os.Lstat(golden.snapshotsDir()); errors.Is(err, os.ErrNotExist) {
+		t.Cleanup(func() {
+			if err := os.Remove(golden.snapshotsDir()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("remove the snapshots directory this test made: %v", err)
+			}
+		})
+	}
+
 	if err := os.MkdirAll(published, 0o755); err != nil {
 		t.Fatalf("make the snapshot directory: %v", err)
 	}

@@ -157,6 +157,9 @@ type Provider struct {
 	// could not tie to this microVM — is only testable if "could not tell" can be
 	// staged.
 	pidOwner func(pid int, jailID string) (bool, error)
+	// tapOwner reports the uid that owns a tap, and whether the device exists. A
+	// seam because it reads /sys, and because what a teardown deletes depends on it.
+	tapOwner func(tap string) (int, bool, error)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -240,6 +243,15 @@ func withPidOwner(f func(pid int, jailID string) (bool, error)) Option {
 	}
 }
 
+// withTapOwner replaces the kernel's answer to whose a network device is.
+func withTapOwner(f func(tap string) (int, bool, error)) Option {
+	return func(p *Provider) {
+		if f != nil {
+			p.tapOwner = f
+		}
+	}
+}
+
 // withDurability replaces filesystem syncs for crash-ordering tests.
 func withDurability(file func(*os.File) error, dir func(string) error) Option {
 	return func(p *Provider) {
@@ -307,6 +319,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		syncFile: func(file *os.File) error { return file.Sync() },
 		syncDir:  syncDirectory,
 		pidOwner: pidIsVMM,
+		tapOwner: sysTapOwner,
 		bootWait: DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
@@ -627,17 +640,7 @@ func (p *Provider) launch(
 		}
 	}
 
-	// MARKED BEFORE IT IS MADE (markTap). Every failure above leaves the claim
-	// saying unmade, so no teardown deletes a device under a name billet only took.
-	if err := p.markTap(j, res.Tap, true); err != nil {
-		return nil, err
-	}
-
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
-		if errors.Is(err, errTapTaken) {
-			err = errors.Join(err, p.markTap(j, res.Tap, false))
-		}
-
 		return nil, err
 	}
 
@@ -1128,14 +1131,9 @@ const guestInterface = "eth0"
 // persistent-MAC policy rewrite it from a baked machine-id -- collapses every clone
 // onto one address.
 func guestMAC(tap string) (string, error) {
-	suffix, ok := strings.CutPrefix(tap, config.TapPrefix)
-	n, err := strconv.Atoi(suffix)
-	// Require the CANONICAL spelling claimTap produces: the prefix present, the index
-	// round-tripping (so "bt-07", "bt-+7", a bare "7" and out-of-range are refused),
-	// and in the claimed range. Anything else is a caller bug, not a guest to launch.
-	if !ok || err != nil || n < 0 || n >= maxTaps || strconv.Itoa(n) != suffix {
-		return "", fmt.Errorf("firecracker: cannot derive a MAC from tap %q: expected the "+
-			"canonical %s<index> with index in [0,%d)", tap, config.TapPrefix, maxTaps)
+	n, err := tapIndex(tap)
+	if err != nil {
+		return "", fmt.Errorf("firecracker: cannot derive a MAC from tap %q: %w", tap, err)
 	}
 	// 0x02 in the first octet marks the address locally administered and unicast. The
 	// tap index is < maxTaps (4096, 12 bits) and fills the low two octets; the tap
@@ -1149,6 +1147,21 @@ func guestMAC(tap string) (string, error) {
 	// be broken -- two DHCP servers answering one subnet -- so it is out of scope
 	// rather than a case this MAC must also disambiguate.
 	return fmt.Sprintf("02:00:00:00:%02x:%02x", byte(n>>8), byte(n)), nil
+}
+
+// tapIndex is the index of a tap name in the CANONICAL spelling claimTap produces:
+// the prefix present, the index round-tripping (so "bt-07", "bt-+7", a bare "7" and
+// out-of-range are refused), and in the claimed range. Anything else is a caller bug.
+func tapIndex(tap string) (int, error) {
+	suffix, ok := strings.CutPrefix(tap, config.TapPrefix)
+	n, err := strconv.Atoi(suffix)
+
+	if !ok || err != nil || n < 0 || n >= maxTaps || strconv.Itoa(n) != suffix {
+		return 0, fmt.Errorf("expected the canonical %s<index> with index in [0,%d)",
+			config.TapPrefix, maxTaps)
+	}
+
+	return n, nil
 }
 
 // mmdsAddress is the link-local address the metadata service answers on. The same
@@ -1398,9 +1411,8 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	// fails identically until an operator intervenes. Keeping the claim is what lets
 	// a later teardown find this device and finish removing it.
 	//
-	// AND ONLY A DEVICE BILLET MAY HAVE MADE IS DELETED: removeTap reads the claim,
-	// which says whether this microVM's launch ever got as far as creating one.
-	tapGone, err := p.removeTap(ctx, res.Tap, j.id)
+	// AND ONLY A DEVICE THE KERNEL SAYS IS BILLET'S IS DELETED (removeTap).
+	keep, err := p.removeTap(ctx, res, j.id)
 	if err != nil {
 		failures = append(failures, err)
 	}
@@ -1437,12 +1449,7 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	// legitimately taken this uid or device name in the gap. Deleting it by name
 	// alone would then free a live claim and hand a running microVM's uid to the
 	// launch after it.
-	held := res
-	if !tapGone {
-		held.Tap = ""
-	}
-
-	if err := p.releaseResources(held, j.id); err != nil {
+	if err := p.releaseResources(releasable(res, keep), j.id); err != nil {
 		failures = append(failures, err)
 	}
 
@@ -1729,18 +1736,18 @@ func (p *Provider) unwind(
 	// billet's to delete, so the name must stay out of the pool rather than be handed
 	// to a launch that would fail on it too.
 	//
-	// AND NOT A DEVICE THIS LAUNCH NEVER MADE. A failure before addTap leaves the
-	// claim saying unmade (markTap), so removeTap deletes nothing under the name, and
-	// a retained jail's later Destroy reads the same claim and does the same.
-	tapGone := false
+	// AND NOT A DEVICE THIS LAUNCH NEVER MADE. A failure before addTap finds no
+	// device under the name, or one the kernel says is not billet's, and removeTap
+	// deletes neither; a retained jail's later Destroy asks the kernel again.
+	keep := resources{Tap: res.Tap}
 
 	if !errors.Is(cause, errTapTaken) {
-		gone, err := p.removeTap(ctx, res.Tap, j.id)
+		var err error
+
+		keep, err = p.removeTap(ctx, res, j.id)
 		if err != nil {
 			failures = append(failures, err)
 		}
-
-		tapGone = gone
 	}
 
 	if err := p.removeCgroupFn(j); err != nil {
@@ -1765,12 +1772,7 @@ func (p *Provider) unwind(
 	// let another launch take the uid a live VMM is running as — and each release
 	// checks the claim still names THIS jail, since the jail is gone by now and a
 	// concurrent launch may have legitimately reaped and re-taken it.
-	held := res
-	if !tapGone {
-		held.Tap = ""
-	}
-
-	if err := p.releaseResources(held, j.id); err != nil {
+	if err := p.releaseResources(releasable(res, keep), j.id); err != nil {
 		failures = append(failures, err)
 	}
 

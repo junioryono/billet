@@ -192,12 +192,37 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
+	j := p.jailFor(name)
+
+	res, err := resourcesOf(j)
+	if err != nil {
+		t.Fatalf("read what %s was given: %v", name, err)
+	}
+
+	// THE KERNEL'S ANSWER IS WHAT TEARDOWN TRUSTS, so it is read here as teardown
+	// reads it: the tap exists, and it is owned by the uid this microVM was given.
+	if owner, present, err := sysTapOwner(res.Tap); err != nil || !present || owner != res.UID {
+		t.Fatalf("the kernel says %s is present %v, owned by %d (%v), want owned by %d",
+			res.Tap, present, owner, err, res.UID)
+	}
+
 	if _, err := p.Destroy(t.Context(), name); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 	env.disk.assertGone(t, name)
 
-	j := p.jailFor(name)
+	// UNLESS ANOTHER LAUNCH HAS ALREADY TAKEN THE NAME. The reference node runs jobs
+	// beside this test, and a name given back is the lowest free one, so the next
+	// launch on the host may hold it and its own device by the time this looks.
+	if _, present, err := sysTapOwner(res.Tap); err != nil {
+		t.Errorf("ask the kernel about %s after its destroy: %v", res.Tap, err)
+	} else if present {
+		raw, readErr := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
+		if readErr != nil || strings.TrimSpace(string(raw)) == name {
+			t.Errorf("the tap %s is still on the host after its destroy, and no other lease holds "+
+				"its name (%v)", res.Tap, readErr)
+		}
+	}
 
 	if _, err := os.Stat(j.dir()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the jail survived: %v", err)

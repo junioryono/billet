@@ -400,6 +400,46 @@ type harness struct {
 	jailerErr error
 	// chowned is every path billet asked to chown, in order.
 	chowned []string
+	// devices is the host's network devices by name, and the uid the kernel reports
+	// as each one's owner (-1 for a device that is not a tap). `ip tuntap add` and
+	// `ip link del` change it as they would change the kernel's, and a test puts a
+	// device billet did not make here to see what teardown does with it.
+	devices map[string]int
+	// ownerErr makes asking the kernel whose a device is fail.
+	ownerErr error
+}
+
+// tapOwner is the kernel's answer for the fake host.
+func (h *harness) tapOwner(tap string) (int, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.ownerErr != nil {
+		return 0, false, h.ownerErr
+	}
+
+	owner, ok := h.devices[tap]
+
+	return owner, ok, nil
+}
+
+// putDevice places a network device on the fake host, as something other than this
+// launch would.
+func (h *harness) putDevice(name string, owner int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.devices[name] = owner
+}
+
+// hasDevice reports whether the fake host still has a network device.
+func (h *harness) hasDevice(name string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	_, ok := h.devices[name]
+
+	return ok
 }
 
 // chownedPaths returns every path billet asked to chown.
@@ -455,7 +495,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		t.Fatalf("make the stub kernel readable: %v", err)
 	}
 
-	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}}
+	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}, devices: map[string]int{}}
 
 	cfg := config.FirecrackerConfig{
 		BinaryPath:   link,
@@ -472,6 +512,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		// its own success messages.
 		WithLogger(slog.New(slog.DiscardHandler)),
 		withRunner(h.record),
+		withTapOwner(h.tapOwner),
 		// mknod and chown need root and a real device; what matters for these tests
 		// is that they were CALLED with the right arguments, which the jail
 		// assertions check by the file the fake creates.
@@ -538,6 +579,12 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 		}
 	}
 
+	if bin == ipBinary {
+		if err := h.changeDevices(args); err != nil {
+			return nil, err
+		}
+	}
+
 	if strings.HasSuffix(bin, "jailer") {
 		if err != nil {
 			return nil, err
@@ -557,6 +604,33 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 	}
 
 	return nil, nil
+}
+
+// changeDevices applies an `ip` command billet ran to the fake host's devices, and
+// refuses a name the host already has, as the kernel does.
+func (h *harness) changeDevices(args []string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	switch {
+	// tuntap add dev <name> mode tap user <uid>
+	case len(args) == 8 && args[0] == "tuntap" && args[1] == "add":
+		if _, taken := h.devices[args[3]]; taken {
+			return errors.New("ioctl(TUNSETIFF): Device or resource busy; RTNETLINK answers: File exists")
+		}
+
+		owner, err := strconv.Atoi(args[7])
+		if err != nil {
+			owner = -1
+		}
+
+		h.devices[args[3]] = owner
+	// link del dev <name>
+	case len(args) == 4 && args[0] == "link" && args[1] == "del":
+		delete(h.devices, args[3])
+	}
+
+	return nil
 }
 
 // writeExitedPID puts a pid that has certainly exited into a jail's pid file.

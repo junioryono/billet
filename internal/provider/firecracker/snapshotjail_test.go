@@ -393,8 +393,9 @@ func TestAPublishedFileMustBeARegularFile(t *testing.T) {
 }
 
 // A LAUNCH THAT FAILS BEFORE ITS TAP EXISTS DELETES NO DEVICE, whichever step it
-// failed at: the clone, the filesystem growth, or placing a snapshot. The name was
-// claimed, not made, so a device carrying it is someone else's.
+// failed at: the clone or the filesystem growth (placing a snapshot is
+// TestARestoreRefusesASnapshotThatIsNotReadOnly). The name was claimed, not made, so
+// a device carrying it is someone else's.
 func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
 	t.Parallel()
 
@@ -402,6 +403,7 @@ func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
 		t.Parallel()
 
 		h := newHarness(t)
+		h.putDevice("bt-0", -1)
 		h.disk.cloneErr = errors.New("rbd: cluster unavailable")
 
 		if _, err := h.p.Launch(t.Context(), aSpec()); err == nil {
@@ -415,6 +417,7 @@ func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
 		t.Parallel()
 
 		h := newHarness(t)
+		h.putDevice("bt-0", -1)
 		h.refuse = func(bin string, _ []string) error {
 			if bin == resize2fsBinary {
 				return errors.New("bad ext4 superblock")
@@ -432,45 +435,46 @@ func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
 }
 
 // AND A RETRY DOES NOT DELETE IT EITHER. A refused restore whose discard also fails
-// keeps its jail for a later Destroy, and Destroy reads the tap's claim; the claim
-// still says no device was made, so the retry deletes nothing and gives the name back.
+// keeps its jail for a later Destroy, and Destroy asks the kernel whose the device
+// under the name is: one billet never made is left, and its name kept; with no device
+// there, the name goes back.
 func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t)
-	publish(t, h, "gold-1", 0o644) // refused: not read-only
-	h.disk.discardErr = errors.New("rbd: cluster unavailable")
+	for _, foreign := range []bool{true, false} {
+		t.Run(map[bool]string{true: "a device someone else made", false: "no device"}[foreign], func(t *testing.T) {
+			t.Parallel()
 
-	if _, _, err := h.restoreWith(t, "gold-1"); err == nil {
-		t.Fatal("Restore of a writable snapshot succeeded")
-	}
+			h := newHarness(t)
+			if foreign {
+				h.putDevice("bt-0", 1000)
+			}
 
-	j := h.p.jailFor(theInstance)
+			publish(t, h, "gold-1", 0o644) // refused: not read-only
+			h.disk.discardErr = errors.New("rbd: cluster unavailable")
 
-	held, err := resourcesOf(j)
-	if err != nil {
-		t.Fatalf("the retained jail's record: %v", err)
-	}
+			if _, _, err := h.restoreWith(t, "gold-1"); err == nil {
+				t.Fatal("Restore of a writable snapshot succeeded")
+			}
 
-	claim := filepath.Join(h.p.claimsDir("taps"), held.Tap)
+			assertNoTapDeleted(t, h)
 
-	if !markedUnmade(h, held.Tap) {
-		t.Errorf("the retained claim on %s is not marked unmade, so a later Destroy would delete it", held.Tap)
-	}
+			h.disk.discardErr = nil
 
-	h.disk.discardErr = nil
+			if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+				t.Fatalf("the retried Destroy: %v", err)
+			}
 
-	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
-		t.Fatalf("the retried Destroy: %v", err)
-	}
+			assertNoTapDeleted(t, h)
 
-	assertNoTapDeleted(t, h)
+			_, err := os.Stat(filepath.Join(h.p.claimsDir("taps"), "bt-0"))
+			if foreign && err != nil {
+				t.Errorf("the name of a device billet did not make went back to the pool: %v", err)
+			}
 
-	if _, err := os.Stat(claim); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the retried Destroy kept the name of a device nobody made: %v", err)
-	}
-
-	if _, err := os.Stat(filepath.Join(h.p.unmadeDir(), held.Tap)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the retried Destroy left the unmade mark of a name it gave back: %v", err)
+			if !foreign && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the retried Destroy kept the name of a device nobody made: %v", err)
+			}
+		})
 	}
 }
