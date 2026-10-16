@@ -406,8 +406,8 @@ func TestAFailedCloseIsJoinedToHowTheRunEnded(t *testing.T) {
 		t.Error("a stop beside a failed close exits 0")
 	}
 
-	if _, ok := errors.AsType[*state.SchemaMoved](got); ok {
-		t.Error("a run that already failed had what its open moved joined twice")
+	if twice, ok := errors.AsType[*state.SchemaMoved](got); ok {
+		t.Errorf("a run that already failed had what its open moved (%+v) joined again by the close", twice)
 	}
 
 	got = closeAfter(nil, failingClose{closed: fault, moved: moved})
