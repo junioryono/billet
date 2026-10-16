@@ -39,7 +39,7 @@ func TestTheStampedContractMatchesWhatTheArchitectureCarries(t *testing.T) {
 				t.Errorf("a %s image is stamped contract %d, want %d", tc.arch, got, tc.want)
 			}
 
-			script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
+			script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
 			if err != nil {
 				t.Fatalf("provisionScript for %s: %v", tc.arch, err)
 			}

@@ -26,6 +26,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **`TerminateInstances` returns when the request is accepted.**
 - **The AMI is verified by booting it, and the tag is the promotion.**
 - **User data is 16384 bytes, gzipped, and `packUserData` is the gate.**
+- **The builder checks the runner tarball against the pin before it unpacks it, and an unpinned release needs `--runner-sha256` (#180).**
 - **Spot warnings are one queue per node.**
 - **The builder's owner tag is the deployment's, and the policy's pattern comes from the same function that stamps it.**
 - **`awspolicy` is one generator with three consumers and a measured boundary.**
