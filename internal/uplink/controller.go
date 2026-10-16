@@ -223,6 +223,8 @@ type Controller struct {
 	// evidence that caused it, but not that the line is still losing probes:
 	// a round that forgot would read as clear and end a futile episode.
 	losses, trail [][]Probe
+	// clearRun is how many rounds in a row have been clear.
+	clearRun int
 }
 
 // verdict is what one step's evidence says, the same for both directions.
@@ -236,6 +238,11 @@ type verdict struct {
 	// under Bloat, and a line that has not been dropping over the last Window
 	// rounds, cuts or no cuts.
 	clear bool
+	// cleared is a line that has been clear for a whole Window of rounds, which
+	// ends an episode of cuts. One clear round is not enough: the window a cut
+	// empties makes the round after it look clear even with the queue still
+	// there, and an episode that ended on that would never latch.
+	cleared bool
 	// tally is each reflector's probes and misses since the last cut.
 	tally tally
 	cut   float64
@@ -264,6 +271,14 @@ func (c *Controller) Step(o Observation) bool {
 	c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
 
 	v := c.judge(o)
+
+	if v.clear {
+		c.clearRun++
+	} else {
+		c.clearRun = 0
+	}
+
+	v.cleared = c.clearRun >= p.Window
 
 	seconds := o.Interval.Seconds()
 	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, v, o)
@@ -388,30 +403,31 @@ func tallyOf(window [][]Probe) tally {
 	return t
 }
 
-// lessLossThan is whether this tally lost less than then, by a tenth: the mean
-// of each reflector's own loss rate, over the reflectors this round counts
-// that both of them asked, each weighed the same in both. A reflector that
-// joined or left in between, or was asked more often in one window than the
-// other, changes a pooled share without the line changing at all.
+// lessLossThan is whether this tally lost less than then, by a tenth: each
+// reflector's own loss rate, over the reflectors this round counts that both
+// of them asked, weighed in both by the fewer probes either window sent it. A
+// reflector that joined or left in between, or was asked more often in one
+// window than the other, changes a pooled share without the line changing at
+// all; and one asked once in either window is one probe's worth of evidence,
+// not a third of the verdict.
 func (t tally) lessLossThan(then tally, counted []Probe) bool {
-	var nowRate, thenRate float64
-
-	cohort := 0
+	var nowLoss, thenLoss, weight float64
 
 	for _, probe := range counted {
 		now, ok := t[probe.Reflector]
 		before, was := then[probe.Reflector]
 
-		if !ok || !was || now.probes == 0 || before.probes == 0 {
+		w := float64(min(now.probes, before.probes))
+		if !ok || !was || w == 0 {
 			continue
 		}
 
-		cohort++
-		nowRate += float64(now.lost) / float64(now.probes)
-		thenRate += float64(before.lost) / float64(before.probes)
+		weight += w
+		nowLoss += w * float64(now.lost) / float64(now.probes)
+		thenLoss += w * float64(before.lost) / float64(before.probes)
 	}
 
-	return cohort > 0 && nowRate < thenRate*0.9
+	return weight > 0 && nowLoss < thenLoss*0.9
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
@@ -439,6 +455,13 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 	}
 
 	before := d.Rate
+
+	// THE QUEUE CLEARED, for a whole window: a later one starts a new episode,
+	// and its cuts are judged afresh, against nothing from this one. A cleared
+	// line is never a full one, so this never meets a cut below.
+	if v.cleared {
+		d.futile, d.episode = 0, false
+	}
 
 	switch {
 	case v.full:
@@ -497,13 +520,6 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// holds the traffic from before it, which runs above any rate just cut and
 		// would undo the cut at once.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
-		d.futile, d.episode = 0, false
-	case v.clear:
-		// THE QUEUE CLEARED: a later one starts a new episode, and cuts are judged
-		// afresh, against nothing from this one. Not merely "not full": the window
-		// refills after every cut, and forgetting futility while it does would let
-		// cuts ratchet on regardless.
-		d.futile, d.episode = 0, false
 	}
 
 	return d.Rate != before, false

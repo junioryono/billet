@@ -323,6 +323,48 @@ func TestADropBeforeAnOutageDoesNotHoldTheRateAfterIt(t *testing.T) {
 	}
 }
 
+// A REFLECTOR ASKED ONCE IS ONE PROBE'S WORTH OF EVIDENCE. Two reflectors lose
+// every probe throughout; the third is counted for one round in each window
+// between cuts, lost in one and answered in the next. That one probe must not
+// read as the loss falling by a third, or each answered round would reset the
+// futility and the cuts would never stop.
+func TestASparselyAskedReflectorDoesNotReadAsACutHelping(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+	lossy := []Probe{{Reflector: "b", Lost: true}, {Reflector: "c", Lost: true}}
+
+	for n := range 120 {
+		s := Sample{Probes: lossy}
+
+		switch {
+		case n == 5:
+			s.Probes = append([]Probe{{Reflector: "a", Lost: true}}, lossy...)
+		case n >= 12 && n%6 == 0:
+			s.Probes = append([]Probe{{Reflector: "a", Lost: (n/6)%2 == 1}}, lossy...)
+		}
+
+		// Quiet until the first window is full, then busy.
+		mbit := 300.0
+		if n < 6 {
+			mbit = 8
+		}
+
+		before := c.Down.Rate
+		c.Step(probed(n, 0, mbit, s))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a loss the two steady reflectors never shed drew %d cuts over a minute; want %d",
+			cuts, c.Params.Futile)
+	}
+}
+
 // A REFLECTOR ASKED MORE OFTEN IS NOT A CUT HELPING. Two reflectors lose every
 // probe throughout; the third answers every probe, but had answered only one
 // round before the first cut. Pooled, the loss falls from 4 in 5 to 12 in 18

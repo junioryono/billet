@@ -248,6 +248,36 @@ func TestCutsThatHelpReachTheFloorAndNoFurther(t *testing.T) {
 	}
 }
 
+// ONE CLEAR ROUND DOES NOT END AN EPISODE. A 30 ms queue no cut moves, with a
+// single clear round every six seconds: the round after a cut finds the window
+// empty and looks clear, and an episode that ended on it would hand the next
+// cut a fresh budget every time. The cuts still stop at two.
+func TestAnIsolatedClearRoundDoesNotEndAnEpisode(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 120 {
+		delay := 30 * time.Millisecond
+		if n%12 == 3 {
+			delay = 0
+		}
+
+		before := c.Down.Rate
+		c.Step(moving(n, 0, 300, delay))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a queue no cut moved, clear for one round in twelve, drew %d cuts over a minute; want %d",
+			cuts, c.Params.Futile)
+	}
+}
+
 // A NEW EPISODE IS JUDGED AGAINST NOTHING FROM THE LAST ONE. A 30 ms queue no
 // cut moves draws two cuts; the queue clears while the host is idle; the same
 // queue comes back, and draws two cuts of its own, not one measured against
