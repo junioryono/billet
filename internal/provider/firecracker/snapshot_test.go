@@ -3,9 +3,11 @@ package firecracker
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // aVMM serves one fake VMM and returns a client for it.
@@ -45,8 +47,8 @@ func TestARestoreLoadsPausedAndPlacesMetadataBeforeItResumes(t *testing.T) {
 		t.Fatalf("restore: %v", err)
 	}
 
-	want := []string{"/snapshot/load", "/mmds", "/vm"}
-	if got := vmm.pathsPut(); !slices.Equal(got, want) {
+	want := []string{"PUT /snapshot/load", "PUT /mmds", "PATCH /vm"}
+	if got := vmm.calls(); !slices.Equal(got, want) {
 		t.Fatalf("calls %v, want %v: the metadata must land while the guest is paused", got, want)
 	}
 
@@ -55,12 +57,18 @@ func TestARestoreLoadsPausedAndPlacesMetadataBeforeItResumes(t *testing.T) {
 		t.Errorf("the load asked to resume (%v), so the guest could run before its metadata", load["resume_vm"])
 	}
 
-	if vm, _ := vmm.bodyPut("/vm"); vm["state"] != stateResumed {
-		t.Errorf("the last call set the run state to %v, want %s", vm["state"], stateResumed)
+	if load["snapshot_path"] != "snap.state" {
+		t.Errorf("snapshot_path = %v, want snap.state: the api requires it", load["snapshot_path"])
 	}
 
-	if md, _ := vmm.bodyPut("/mmds"); md["billet"] == nil {
-		t.Errorf("the metadata document was not the one asked for: %v", md)
+	// THE WIRE'S OWN WORD, written out rather than taken from billet's constant.
+	if vm, _ := vmm.bodyPut("/vm"); vm["state"] != "Resumed" {
+		t.Errorf("the last call set the run state to %v, want Resumed", vm["state"])
+	}
+
+	md, _ := vmm.bodyPut("/mmds")
+	if want := map[string]any{"billet": map[string]any{"workspace": "ws-1"}}; !reflect.DeepEqual(md, want) {
+		t.Errorf("the metadata document was %v, want exactly %v", md, want)
 	}
 }
 
@@ -136,8 +144,8 @@ func TestARestoreThatCannotPlaceMetadataNeverResumes(t *testing.T) {
 		t.Errorf("the vmm's reason was dropped: %v", err)
 	}
 
-	if slices.Contains(vmm.pathsPut(), "/vm") {
-		t.Errorf("the guest was resumed after its metadata was refused: calls %v", vmm.pathsPut())
+	if slices.Contains(vmm.calls(), "PATCH /vm") {
+		t.Errorf("the guest was resumed after its metadata was refused: calls %v", vmm.calls())
 	}
 
 	if got := vmm.currentState(); got != statePaused {
@@ -158,7 +166,7 @@ func TestARestoreGivesNothingToAVMMWithAnotherID(t *testing.T) {
 		t.Fatalf("restore = %v, want errNotRestorable", err)
 	}
 
-	if got := vmm.pathsPut(); !slices.Equal(got, []string{"/snapshot/load"}) {
+	if got := vmm.calls(); !slices.Equal(got, []string{"PUT /snapshot/load"}) {
 		t.Errorf("calls %v after the id mismatch, want the load alone: no metadata, no resume", got)
 	}
 }
@@ -176,8 +184,8 @@ func TestARestoreGivesNothingToAVMMThatRunsAfterAPausedLoad(t *testing.T) {
 		t.Fatalf("restore = %v, want errNotRestorable", err)
 	}
 
-	if slices.Contains(vmm.pathsPut(), "/mmds") {
-		t.Errorf("metadata was placed in a guest that was already running: calls %v", vmm.pathsPut())
+	if slices.Contains(vmm.calls(), "PUT /mmds") {
+		t.Errorf("metadata was placed in a guest that was already running: calls %v", vmm.calls())
 	}
 }
 
@@ -193,7 +201,7 @@ func TestACapturePausesThenWritesAFullSnapshotAndLeavesItPaused(t *testing.T) {
 		t.Fatalf("capture: %v", err)
 	}
 
-	if got, want := vmm.pathsPut(), []string{"/vm", "/snapshot/create"}; !slices.Equal(got, want) {
+	if got, want := vmm.calls(), []string{"PATCH /vm", "PUT /snapshot/create"}; !slices.Equal(got, want) {
 		t.Fatalf("calls %v, want %v", got, want)
 	}
 
@@ -220,8 +228,24 @@ func TestACaptureThatCannotPauseWritesNoSnapshot(t *testing.T) {
 		t.Fatalf("capture = %v, want the vmm's refusal of the pause", err)
 	}
 
-	if slices.Contains(vmm.pathsPut(), "/snapshot/create") {
-		t.Errorf("a snapshot was written although the pause was refused: calls %v", vmm.pathsPut())
+	if slices.Contains(vmm.calls(), "PUT /snapshot/create") {
+		t.Errorf("a snapshot was written although the pause was refused: calls %v", vmm.calls())
+	}
+}
+
+// WRITING A SNAPSHOT OUTLASTS THE BOUND ON AN ORDINARY CALL. Firecracker answers
+// only after it has written and fsynced the guest's memory, so a healthy capture of
+// a large guest takes longer than any configuration call, and an http.Client's
+// Timeout is not something a longer caller context can extend.
+func TestACaptureIsNotCutShortByTheBoundOnAnOrdinaryCall(t *testing.T) {
+	t.Parallel()
+
+	vmm, api := aVMM(t, "billet-gold-1", stateRunning)
+	vmm.createTakes = 300 * time.Millisecond
+	api.http.Timeout = 100 * time.Millisecond // the ordinary bound, shrunk to below the write
+
+	if err := capture(t.Context(), api, snapshotFiles{State: "g.state", Memory: "g.mem"}); err != nil {
+		t.Fatalf("capture of a write that takes longer than an ordinary call: %v", err)
 	}
 }
 

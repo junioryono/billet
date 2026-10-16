@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // snapshotFiles names a snapshot's two files as the VMM sees them, inside its chroot.
@@ -30,7 +31,7 @@ func capture(ctx context.Context, api *vmmAPI, files snapshotFiles) error {
 		return fmt.Errorf("firecracker: pause before a snapshot: %w", err)
 	}
 
-	if err := api.put(ctx, "/snapshot/create", map[string]string{
+	if err := api.withTimeout(snapshotTimeout).put(ctx, "/snapshot/create", map[string]string{
 		"snapshot_type": "Full",
 		"snapshot_path": files.State,
 		"mem_file_path": files.Memory,
@@ -40,6 +41,13 @@ func capture(ctx context.Context, api *vmmAPI, files snapshotFiles) error {
 
 	return nil
 }
+
+// snapshotTimeout bounds writing one snapshot.
+//
+// Measured on the reference node: 4.0 s for a 2 GiB guest. The time grows with the
+// guest's memory and the disk under the files, so this is a bound on a wedged VMM
+// rather than an estimate of a slow one.
+const snapshotTimeout = 10 * time.Minute
 
 // restoreSpec is what one restore of a snapshot needs that the snapshot itself
 // does not carry.

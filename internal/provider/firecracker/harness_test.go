@@ -55,6 +55,8 @@ type fakeVMM struct {
 	ignoreResumeFlag bool
 	// stayPausedOnResume makes a resume answer success and leave the guest paused.
 	stayPausedOnResume bool
+	// createTakes is how long writing a snapshot holds its call open.
+	createTakes time.Duration
 
 	listener net.Listener
 	server   *http.Server
@@ -146,22 +148,30 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// THE RUN STATE A REAL VMM KEEPS, measured on v1.16.1: a paused load reports
 	// Paused, PATCH /vm moves between Paused and Running, and GET / says which.
-	switch r.URL.Path {
-	case "/vm":
+	//
+	// LITERALS, NOT billet's CONSTANTS: a fake that shared them would agree with a
+	// wrong one. And only the method the real API takes for each path moves the state.
+	switch {
+	case r.Method == http.MethodPatch && r.URL.Path == "/vm":
 		switch body["state"] {
-		case statePaused:
-			v.state = statePaused
-		case stateResumed:
+		case "Paused":
+			v.state = "Paused"
+		case "Resumed":
 			if !v.stayPausedOnResume {
-				v.state = stateRunning
+				v.state = "Running"
 			}
 		}
-	case "/snapshot/load":
+	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/load":
 		if resume, isBool := body["resume_vm"].(bool); (isBool && resume) || v.ignoreResumeFlag {
-			v.state = stateRunning
+			v.state = "Running"
 		} else {
-			v.state = statePaused
+			v.state = "Paused"
 		}
+	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/create" && v.createTakes > 0:
+		// THE WRITE HOLDS THE CALL, as Firecracker's does while it fsyncs memory.
+		v.mu.Unlock()
+		time.Sleep(v.createTakes)
+		v.mu.Lock()
 	}
 
 	if r.URL.Path == "/actions" {
@@ -187,6 +197,19 @@ func (v *fakeVMM) currentState() string {
 	defer v.mu.Unlock()
 
 	return v.state
+}
+
+// calls lists the calls in the order they arrived, as "METHOD /path".
+func (v *fakeVMM) calls() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	out := make([]string, 0, len(v.puts))
+	for _, p := range v.puts {
+		out = append(out, p.method+" "+p.path)
+	}
+
+	return out
 }
 
 // pathsPut lists the configuration calls in the order they arrived.

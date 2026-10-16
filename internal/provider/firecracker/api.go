@@ -70,6 +70,20 @@ func newVMMAPI(socket string) *vmmAPI {
 	}
 }
 
+// withTimeout returns a client for the same socket whose calls are bounded by d
+// rather than apiTimeout.
+//
+// FOR THE ONE CALL THAT IS NOT A LOCAL STATE CHANGE. Writing a Full snapshot copies
+// and fsyncs the guest's whole memory before the VMM answers, so it takes as long
+// as the disk does, and an http.Client's Timeout is not something a caller's longer
+// context can extend.
+func (a *vmmAPI) withTimeout(d time.Duration) *vmmAPI {
+	c := *a.http
+	c.Timeout = d
+
+	return &vmmAPI{http: &c, socket: a.socket}
+}
+
 // instanceInfo is what the VMM says about itself.
 type instanceInfo struct {
 	ID    string `json:"id"`
