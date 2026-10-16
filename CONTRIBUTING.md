@@ -37,7 +37,7 @@ make check     # the pre-commit gate
 | `make dist` | build the release artifacts exactly as a tag would | no |
 | `make package-lifecycle`, `make restore-rehearsal`, `make postgres-restore-rehearsal`, `make systemd-lifecycle` | the real-package rehearsals | no; CI runs the first three |
 
-A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Do not push work that has not passed `make check`, and expect CI to catch the rest.
+A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Before pushing, run `make check` if you want the whole gate on your own machine, or `make verify` for what you changed; either way the pull request needs a green CI run, which runs the full gate and the rest. A Claude session runs `make verify` and reads CI, and the repository's hook refuses it the full gate unless Claude Code was started with `CLAUDE_FULL_CHECKS=1`.
 
 ## Making changes
 

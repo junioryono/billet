@@ -153,6 +153,7 @@ go_files=()
 pkg_dirs=()
 pkg_why=()
 mod_changed=()
+build_only=()
 docs_files=()
 tf_files=()
 notes=()
@@ -185,8 +186,13 @@ while IFS= read -r -d '' path; do
 		fi
 		if has_go "$dir"; then
 			add_pkg "$dir" "$path changed"
-		elif [ "$dir" = "$(dirname "$path")" ]; then
+		else
+			# A package that is gone still has importers to build.
 			notes+=("$dir holds no Go file any more; go build ./... covers what imported it")
+			if m=$(module_of "$dir"); then
+				contains "$m" ${mod_changed[@]+"${mod_changed[@]}"} ||
+					contains "$m" ${build_only[@]+"${build_only[@]}"} || build_only+=("$m")
+			fi
 		fi
 		continue
 		;;
@@ -253,7 +259,7 @@ for i in ${pkg_dirs[@]+"${!pkg_dirs[@]}"}; do
 	fi
 	contains "$m" ${modules[@]+"${modules[@]}"} || modules+=("$m")
 done
-for m in ${mod_changed[@]+"${mod_changed[@]}"}; do
+for m in ${mod_changed[@]+"${mod_changed[@]}"} ${build_only[@]+"${build_only[@]}"}; do
 	contains "$m" ${modules[@]+"${modules[@]}"} || modules+=("$m")
 done
 
@@ -301,9 +307,16 @@ for m in ${modules[@]+"${modules[@]}"}; do
 
 	# golangci-lint runs for the root module, as make lint does; tools/lint is
 	# checked by its own tests and by billetlint in CI.
+	# As make lint does: from the physical path, and never from a path holding glob
+	# syntax, which depguard reads as a pattern so a rule could check no file.
 	if [ "$m" = . ]; then
-		if command -v golangci-lint >/dev/null 2>&1; then
-			run "golangci-lint" golangci-lint run --allow-serial-runners --concurrency=4 "${pkgs[@]}"
+		if ! here=$(pwd -P); then
+			fail "golangci-lint (could not read this directory)"
+		elif case "$here" in *[][*?{}]*) true ;; *) false ;; esac then
+			say "$here contains glob syntax ([ ] * ? { }), which depguard would read as a pattern; lint from a checkout whose path has none"
+			fail "golangci-lint (checkout path)"
+		elif command -v golangci-lint >/dev/null 2>&1; then
+			run "golangci-lint" env PWD="$here" golangci-lint run --allow-serial-runners --concurrency=4 "${pkgs[@]}"
 		else
 			say "golangci-lint is not installed; \`make tools\` installs the pinned version"
 			fail "golangci-lint (not installed)"

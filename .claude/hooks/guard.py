@@ -552,7 +552,7 @@ def judge_worktree_add(call):
         lexical = os.path.normpath(os.path.join(call.repo, os.path.expanduser(path)))
         if worktree_home(lexical) or worktree_home(os.path.realpath(lexical)):
             return
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - a path it cannot work out passes
         return
     refuse(
         f"billet hook: {path} is outside .claude/worktrees/. Worktrees live under the main checkout's "
@@ -576,8 +576,12 @@ MAKE_VALUE_OPTIONS = {
     "-C", "-f", "-I", "-o", "-W", "--directory", "--file", "--makefile", "--include-dir", "--old-file",
     "--assume-old", "--what-if", "--new-file", "--assume-new",
 }
-MAKE_OTHER_MAKEFILE = {"-C", "-f", "--directory", "--file", "--makefile"}
+MAKE_OPTIONAL_NUMBER = {"--jobs", "--load-average", "--max-load"}
+MAKEFILE_NAMES = {"GNUmakefile", "makefile", "Makefile"}
 MAKE_DRY_RUN = {"--dry-run", "--just-print", "--recon", "--question", "--touch"}
+# A redirection word: an optional descriptor, the operator, and the file when it
+# is attached (`2>/dev/null`); without one the file is the next word.
+REDIRECTION = re.compile(r"(\d*|&)(>>|>\||<>|>&|<&|>|<)(.*)")
 GO_TEST_VALUE_FLAGS = {
     "run", "skip", "bench", "benchtime", "count", "cpu", "parallel", "timeout", "coverprofile", "covermode",
     "coverpkg", "blockprofile", "blockprofilerate", "cpuprofile", "memprofile", "memprofilerate", "mutexprofile",
@@ -617,29 +621,77 @@ def whole_tree(pattern, cwd):
     return pattern in ("./...", "...") and billet_root(cwd)
 
 
-def judge_make(words):
-    targets, other_makefile, dry, i = [], False, False, 1
-    while i < len(words):
-        w = words[i]
+def drop_redirections(words):
+    """The words without shell redirections: `>log`, `2>/dev/null`, and an
+    operator standing alone with the file after it."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+            continue
+        m = REDIRECTION.fullmatch(w)
+        if m:
+            skip = not m.group(3)
+            continue
+        out.append(w)
+    return out
+
+
+def runs_billet_makefile(directory, makefiles):
+    """True when make, run in directory with these -f files, reads billet's own
+    Makefile, whose default goal is check."""
+    if not makefiles:
+        return billet_root(directory)
+    for name in makefiles:
+        path = os.path.join(directory, name)
+        if os.path.basename(path) in MAKEFILE_NAMES and billet_root(os.path.dirname(path) or "."):
+            return True
+    return False
+
+
+def judge_make(words, cwd):
+    targets, directory, makefiles, dry, i = [], cwd, [], False, 1
+
+    def next_word():
+        nonlocal i
         i += 1
+        return words[i - 1] if i - 1 < len(words) else ""
+
+    def numeric_next():
+        return i < len(words) and re.fullmatch(r"[0-9.]+", words[i]) is not None
+
+    while i < len(words):
+        w = next_word()
         if w == "--":
             targets.extend(x for x in words[i:] if "=" not in x)
             break
         if w.startswith("--"):
-            name = w.partition("=")[0]
-            other_makefile = other_makefile or name in MAKE_OTHER_MAKEFILE
+            name, eq, value = w.partition("=")
             dry = dry or name in MAKE_DRY_RUN
-            if "=" not in w and name in MAKE_VALUE_OPTIONS:
-                i += 1
+            if name in MAKE_OPTIONAL_NUMBER:
+                if not eq and numeric_next():
+                    next_word()
+            elif name in MAKE_VALUE_OPTIONS:
+                value = value if eq else next_word()
+                if name == "--directory":
+                    directory = os.path.join(directory, value)
+                elif name in ("--file", "--makefile"):
+                    makefiles.append(value)
             continue
         if w.startswith("-") and len(w) > 1:
             for j, letter in enumerate(w[1:], start=1):
                 if letter in "nqt":
                     dry = True
-                if letter in "CfIoWjlO":
-                    other_makefile = other_makefile or letter in "Cf"
-                    if letter in "CfIoW" and j == len(w) - 1:
-                        i += 1  # the value is the next word
+                if letter in "CfIoW":
+                    value = w[j + 1 :] or next_word()
+                    if letter == "C":
+                        directory = os.path.join(directory, value)
+                    elif letter == "f":
+                        makefiles.append(value)
+                    break
+                if letter in "jlO":
+                    if letter in "jl" and j == len(w) - 1 and numeric_next():
+                        next_word()
                     break
             continue
         if "=" in w:
@@ -650,7 +702,7 @@ def judge_make(words):
     gates = [t for t in targets if t in FULL_GATE_TARGETS]
     if gates:
         refuse(f"billet hook: `make {gates[0]}` is a full gate, which CI runs on every push. {GATE_ADVICE}")
-    if not targets and not other_makefile:
+    if not targets and runs_billet_makefile(directory, makefiles):
         refuse(f"billet hook: a bare `make` runs the default goal, `check`, the full gate. {GATE_ADVICE}")
 
 
@@ -692,17 +744,26 @@ def judge_go_test(words, cwd):
 
 def judge_golangci(words, cwd):
     args = words[1:]
-    run_at = next((k for k, a in enumerate(args) if not a.startswith("-")), None)
+    for a in args:
+        name, eq, value = a.partition("=")
+        if name == "--allow-parallel-runners" and (not eq or value.lower() not in ("false", "f", "0")):
+            refuse("billet hook: golangci-lint takes --allow-serial-runners, never --allow-parallel-runners: "
+                   "its machine-wide lock is what keeps several sessions' lint runs from starving the machine "
+                   "together.")
+    run_at, k = None, 0
+    while k < len(args):
+        if not args[k].startswith("-"):
+            run_at = k
+            break
+        if "=" not in args[k] and args[k] in GOLANGCI_VALUE_FLAGS:
+            k += 1
+        k += 1
     if run_at is None or args[run_at] != "run":
         return
     rest, packages, j = args[run_at + 1 :], [], 0
     while j < len(rest):
         a = rest[j]
         j += 1
-        if a == "--allow-parallel-runners":
-            refuse("billet hook: golangci-lint takes --allow-serial-runners, never --allow-parallel-runners: "
-                   "its machine-wide lock is what keeps several sessions' lint runs from starving the machine "
-                   "together.")
         if a.startswith("-"):
             if "=" not in a and a in GOLANGCI_VALUE_FLAGS:
                 j += 1
@@ -726,14 +787,15 @@ def judge_gates(commands):
         return
     for words, cwd in commands:
         try:
+            words = drop_redirections(words)
             program = os.path.basename(words[0])
             if program in MAKE_PROGRAMS:
-                judge_make(words)
+                judge_make(words, cwd)
             elif program == "go":
                 judge_go_test(words, cwd)
             elif program == "golangci-lint":
                 judge_golangci(words, cwd)
-        except (IndexError, OSError, ValueError):
+        except Exception:  # noqa: BLE001 - these judgements fail open; refuse() exits, which this does not catch
             continue
 
 

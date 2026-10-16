@@ -13,14 +13,26 @@ import (
 // verifyFixture is a throwaway module shaped like billet for scripts/verify-changed.sh:
 // main and origin/main hold package a, whose test always fails, so any run that
 // reaches a package nobody changed fails; e, whose test passes and reads a
-// testdata file; scripts, which the hook and skill files select; a docs page; and
-// a Makefile whose docs target stands in for Sphinx. HEAD is a working branch.
-// The returned bin directory holds stand-ins for golangci-lint, sphinx-build and
-// terraform that record their argv and exit as told.
+// testdata file; f, which imports g; scripts, which the hook and skill files
+// select; a docs page; and a Makefile whose docs target stands in for Sphinx. HEAD
+// is a working branch. The returned bin directory holds stand-ins for
+// golangci-lint, sphinx-build and terraform that record their argv and exit as
+// told.
 func verifyFixture(t *testing.T) (dir, bin string) {
 	t.Helper()
 
-	dir = t.TempDir()
+	return verifyFixtureNamed(t, "repo")
+}
+
+// verifyFixtureNamed is verifyFixture in a checkout directory of the given name.
+func verifyFixtureNamed(t *testing.T, name string) (dir, bin string) {
+	t.Helper()
+
+	dir = filepath.Join(t.TempDir(), name)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	hookGit(t, dir, "init", "-q", "-b", "main")
 	hookGit(t, dir, "config", "user.email", "test@example.com")
 	hookGit(t, dir, "config", "user.name", "test")
@@ -33,6 +45,8 @@ func verifyFixture(t *testing.T) (dir, bin string) {
 		"e/e.go":            "package e\n\nfunc E() int { return 1 }\n",
 		"e/e_test.go":       "package e\n\nimport \"testing\"\n\nfunc TestE(t *testing.T) { t.Log(\"package e was tested\") }\n",
 		"e/testdata/in.txt": "one\n",
+		"g/g.go":            "package g\n\nfunc G() int { return 7 }\n",
+		"f/f.go":            "package f\n\nimport \"example.com/fixture/g\"\n\nfunc F() int { return g.G() }\n",
 		"scripts/s_test.go": "package scripts\n\nimport \"testing\"\n\nfunc TestS(t *testing.T) {}\n",
 		"docs/index.rst":    "Fixture\n=======\n",
 		"Makefile":          ".PHONY: docs\ndocs:\n\t@echo fixture docs built\n",
@@ -268,6 +282,32 @@ func TestVerifyChecksTheChangedPackagesAndNothingElse(t *testing.T) {
 
 		if strings.Contains(out, "go build") {
 			t.Errorf("a change with no Go in it built the module:\n%s", out)
+		}
+	})
+
+	t.Run("a deleted package still builds the module that imported it", func(t *testing.T) {
+		t.Parallel()
+
+		dir, bin := verifyFixture(t)
+		hookGit(t, dir, "rm", "-q", "-r", "g")
+		hookGit(t, dir, "commit", "-q", "-m", "drop g")
+
+		code, out := runVerify(t, dir, bin)
+		wantVerify(t, out, code, 1, "g holds no Go file any more", "go build ./...",
+			"FAILED: the root module: build or tidy")
+	})
+
+	t.Run("a checkout path holding glob syntax is refused before lint", func(t *testing.T) {
+		t.Parallel()
+
+		dir, bin := verifyFixtureNamed(t, "billet[2]")
+		hookWrite(t, dir, "e/e.go", "package e\n\nfunc E() int { return 2 }\n")
+
+		code, out := runVerify(t, dir, bin)
+		wantVerify(t, out, code, 1, "contains glob syntax", "FAILED: golangci-lint (checkout path)")
+
+		if got := recorded(t, bin, "golangci-lint"); got != "" {
+			t.Errorf("golangci-lint ran from a glob path: %q", got)
 		}
 	})
 
