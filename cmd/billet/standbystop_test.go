@@ -9,7 +9,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -138,8 +137,8 @@ func TestForgettingTheFleetEndsAsItWasAskedTo(t *testing.T) {
 	stop()
 
 	_, err := ctl.ForgetFleet(stopped)
-	if err == nil {
-		t.Fatal("forgetting the fleet on a stopped context succeeded, so this test stages nothing")
+	if err == nil || !strings.Contains(err.Error(), "could not clear the fleet's liveness") {
+		t.Fatalf("forgetting the fleet on a stopped context returned %v, so this test stages nothing", err)
 	}
 
 	if _, got := endedWith(stopped, cp.LeadershipLost(), err); got != nil {
@@ -193,15 +192,12 @@ func TestAStopWhileAdoptingTheAuthorityIsAStop(t *testing.T) {
 	stopped, stop := context.WithCancel(t.Context())
 	stop()
 
-	began := time.Now()
-
+	// THE STORE'S OWN READ, so the stop is the one the store reports and not an
+	// earlier step's: the authority lock before it takes no wait.
 	_, err := ctl.AdoptAuthority(stopped)
-	if err == nil {
-		t.Fatal("adopting the authority on a stopped context succeeded, so this test stages nothing")
-	}
-
-	if elapsed := time.Since(began); elapsed > 10*time.Second {
-		t.Errorf("a stopped adoption took %s, so something waited on the network", elapsed)
+	if err == nil || !strings.Contains(err.Error(), "awsssm: read") {
+		t.Fatalf("adopting the authority on a stopped context returned %v, so the stop did not "+
+			"land in the store's read", err)
 	}
 
 	if _, got := endedWith(stopped, false, err); got != nil {
@@ -301,9 +297,40 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 		return found
 	}
 
-	if calls(findFunc(t, "serveControlPlane").Body, "LeadershipLost") {
+	serve := findFunc(t, "serveControlPlane")
+
+	if calls(serve.Body, "LeadershipLost") {
 		t.Error("serveControlPlane reads the fence itself, before its deferred calls stop the wire " +
 			"and join the controller's loops")
+	}
+
+	// AND THOSE CALLS ARE ITS OWN AND SYNCHRONOUS: deferred directly, so they have
+	// returned before serveControlPlane has. One moved into a goroutine, or a
+	// deferred function that starts one, would let a teardown write land after
+	// the read.
+	deferred := map[string]bool{}
+
+	for _, stmt := range serve.Body.List {
+		def, ok := stmt.(*ast.DeferStmt)
+		if !ok {
+			continue
+		}
+
+		sel, ok := def.Call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+
+		if recv, ok := sel.X.(*ast.Ident); ok {
+			deferred[recv.Name+"."+sel.Sel.Name] = true
+		}
+	}
+
+	for _, want := range []string{"wire.Stop", "ctl.Close"} {
+		if !deferred[want] {
+			t.Errorf("serveControlPlane does not defer %s() directly, so the fence can be read "+
+				"before it has returned", want)
+		}
 	}
 
 	served, read := -1, -1

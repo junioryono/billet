@@ -39,8 +39,9 @@ import (
 //
 // AND A FENCED HOST EXITS NON-ZERO WHATEVER ELSE IS TRUE. A successor has the
 // deployment; a clean exit would leave a healed partition with no controller at
-// all, while Restart=on-failure starts this one again to take it back or be
-// refused naming the holder.
+// all, while a failure is what Restart=on-failure acts on, unless systemd was
+// itself stopping the unit: it starts this one again to take the deployment
+// back or be refused naming the holder.
 //
 // WHAT A STOP DURING STARTUP LEAVES IN SYSTEMD IS MEASURED, not assumed. A
 // Type=notify unit stopped while still `activating`, whose process exits 0

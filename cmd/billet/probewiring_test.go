@@ -120,13 +120,15 @@ func isVerdictBranch(stmt *ast.IfStmt) bool {
 	return isName
 }
 
-// isFlagRef recognises `name`, `*name` and `x.name`.
+// isFlagRef recognises `name`, `*name` and `run.name`.
 func isFlagRef(e ast.Expr, name string) bool {
 	switch v := e.(type) {
 	case *ast.Ident:
 		return v.Name == name
 	case *ast.SelectorExpr:
-		return v.Sel.Name == name
+		recv, ok := v.X.(*ast.Ident)
+
+		return ok && recv.Name == "run" && v.Sel.Name == name
 	case *ast.StarExpr:
 		id, ok := v.X.(*ast.Ident)
 

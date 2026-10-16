@@ -39,7 +39,7 @@ func runServer(
 		return err
 	}
 
-	// ctx, NOT THE CONTEXT runControlPlane STOPPED ITS LOOPS WITH: that one is
+	// ctx, NOT THE CONTEXT serveControlPlane RAN THE CONTROLLER UNDER: that one is
 	// cancelled on every path out by its own deferred stop, and by the fence. This
 	// is the process's, which only a signal cancels.
 	return serverEnded(ctx, env, fenced, err)
@@ -110,9 +110,12 @@ func serveControlPlane(
 
 	// AFTER THE PROBE, which runs beside the service that holds the port, and
 	// BEFORE THE CLAIM, so a standby can be scraped while it waits.
+	//
+	// BETWEEN THE OPEN AND THE CLAIM, so its failure carries what the open
+	// migrated, as the open's own refusals and every failed claim do.
 	served, err := app.ServeMetrics(ctx, "server", cfg.Server.Metrics, cp.LedgerMetrics())
 	if err != nil {
-		return err
+		return errors.Join(err, cp.UnclaimedMove())
 	}
 
 	defer served.Close(ctx)

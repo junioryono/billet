@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -253,4 +255,36 @@ func (h *capturingHandler) startupStop() string {
 	}
 
 	return ""
+}
+
+// A TIER THAT ENDS WITH A CANCELLATION WHILE NOBODY ASKED THE PLANE TO STOP HAS
+// FAILED. A session response billet cannot act on ends its tier whatever else
+// is true, and one cut short by an inner context carries context.Canceled; the
+// classification that asked errors.Is of every branch read that as the stop,
+// so Run answered nil, the process exited 0, and Restart=on-failure had nothing
+// to restart.
+func TestATierEndingOnACancellationNobodyAskedForIsAFailure(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	cut := fmt.Errorf("%w: the runner lookup was cut short: %w", ErrUntrustworthySession, context.Canceled)
+
+	prov := &fakeProvisioner{newSession: func(string) Session {
+		return &fakeSession{onGet: func() (*Message, error) { return nil, cut }}
+	}}
+
+	// A FAILURE GUARD, never the condition: a Run that reopened the session
+	// instead of ending would come back at this deadline with no error.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	err := New(newAllocator(t, startupLimits, tiers), prov, tiers, "test-owner", nil).Run(ctx)
+	if !errors.Is(err, ErrUntrustworthySession) {
+		t.Fatalf("a tier that ended on a cancellation nobody asked for returned %v, want its failure", err)
+	}
+
+	if ctx.Err() != nil {
+		t.Errorf("Run returned only once its guard had expired: %v", err)
+	}
 }

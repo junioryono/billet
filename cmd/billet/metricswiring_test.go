@@ -179,7 +179,14 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 		return false
 	}
 
-	if r, ok := ret.Results[len(ret.Results)-1].(*ast.Ident); !ok || r.Name != "err" {
+	// THE ERROR ITSELF, or the error first in a join: the server's carries what
+	// its open migrated beside it.
+	last := ret.Results[len(ret.Results)-1]
+	if join, ok := last.(*ast.CallExpr); ok && isPkgCall(join, "errors", "Join") && len(join.Args) > 0 {
+		last = join.Args[0]
+	}
+
+	if r, ok := last.(*ast.Ident); !ok || r.Name != "err" {
 		return false
 	}
 
@@ -203,13 +210,16 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 }
 
 // isAppCall recognises app.<name>(...), whatever its arguments.
-func isAppCall(call *ast.CallExpr, name string) bool {
+func isAppCall(call *ast.CallExpr, name string) bool { return isPkgCall(call, "app", name) }
+
+// isPkgCall recognises <pkg>.<name>(...), whatever its arguments.
+func isPkgCall(call *ast.CallExpr, pkg, name string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != name {
 		return false
 	}
 
-	pkg, ok := sel.X.(*ast.Ident)
+	id, ok := sel.X.(*ast.Ident)
 
-	return ok && pkg.Name == "app"
+	return ok && id.Name == pkg
 }

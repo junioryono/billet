@@ -242,7 +242,7 @@ func (db *DB) ClaimController(
 
 		if err != nil {
 			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err),
-				promoted.orNil()))
+				moved.orNil()))
 		}
 	}
 
@@ -373,6 +373,12 @@ func (db *DB) AwaitController(
 // refusal reaches anybody, so it is already true when anything begins tearing
 // down.
 func (db *DB) LeadershipLost() bool { return db.fenced.Load() }
+
+// UnclaimedMove is what this handle migrated and no claim has recorded yet, as
+// an error to join to a failure, or nil. The open and the claim join it to their
+// own failures; this is for a caller that fails between the two. Ask it from the
+// goroutine that claims.
+func (db *DB) UnclaimedMove() error { return db.unclaimedMove.orNil() }
 
 // LeadershipLostSignal is closed the first time a write is refused because a
 // successor claimed. It never carries a value and is never closed twice.

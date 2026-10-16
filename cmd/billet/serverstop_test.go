@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -371,13 +373,21 @@ func TestAControlPlaneFencedDuringStartupExitsNonZero(t *testing.T) {
 
 	cfg := stopTestConfig(t)
 
+	// A FAILURE GUARD, never the condition: a run whose fence never ended it
+	// would keep reopening its session, and this ends it as a test failure
+	// rather than at the binary's timeout. It ends the run as a stop, which
+	// the assertions below refuse.
+	guard, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
 	var staged sync.Once
 
-	run := stopTestRun(t, t.Context(), cfg, stopHooks{ready: func() error {
+	run := stopTestRun(t, guard, cfg, stopHooks{ready: func() error {
 		staged.Do(func() {
 			operator, err := state.OpenAdmin(t.Context(), cfg.Server.IdentityDir)
 			if err != nil {
 				t.Errorf("open an operator handle: %v", err)
+				cancel()
 
 				return
 			}
@@ -398,13 +408,42 @@ func TestAControlPlaneFencedDuringStartupExitsNonZero(t *testing.T) {
 		t.Error("the run did not report the fence its ledger latched")
 	}
 
-	// THE SCHEDULER SAW THE FENCE ITSELF, so the refused write was one of its own
-	// and the answer did not come only from serverEnded's reading of the latch.
+	// THE SCHEDULER REPORTED THE FENCE, so the latch reached Scheduler.Run and the
+	// answer did not come only from serverEnded's own reading of it.
 	if !errors.Is(run.ran, state.ErrLeadershipLost) {
-		t.Errorf("the scheduler did not report the fence it met: %v", run.ran)
+		t.Errorf("the scheduler did not report the fence: %v", run.ran)
 	}
 
 	if strings.Contains(run.stdout, "stopped") {
 		t.Errorf("a fenced control plane reported a clean stop: %q", run.stdout)
+	}
+}
+
+// A FAILURE BETWEEN THE OPEN AND THE CLAIM SAYS WHAT THE OPEN MIGRATED. The
+// metrics endpoint is bound between the two, and on a ledger nothing has
+// migrated yet the open has just created the whole schema: a process that then
+// cannot bind its port has left that behind, and the exit has to say so.
+func TestAFailureBeforeTheClaimSaysWhatTheOpenMigrated(t *testing.T) {
+	t.Parallel()
+
+	taken, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("take a port: %v", err)
+	}
+
+	t.Cleanup(func() { _ = taken.Close() })
+
+	cfg := stopTestConfig(t)
+	cfg.Server.IdentityDir = t.TempDir()
+	cfg.Server.Metrics = &config.MetricsConfig{Listen: taken.Addr().String()}
+
+	run := stopTestRun(t, t.Context(), cfg, stopHooks{})
+	if run.exit == nil {
+		t.Fatal("a control plane whose metrics port was taken started")
+	}
+
+	moved, ok := errors.AsType[*state.SchemaMoved](run.exit)
+	if !ok || moved.From != 0 || moved.To != state.LatestSchemaVersion() {
+		t.Errorf("a failure between the open and the claim does not say what the open migrated: %v", run.exit)
 	}
 }

@@ -394,6 +394,109 @@ func TestAnOpenStoppedBeforeItsClaimSaysWhatItMoved(t *testing.T) {
 	}
 }
 
+// bareStandby is a standby handle over dir's ledger, its writes through w: the
+// shape of a promoting PostgreSQL standby on the one engine a unit test needs no
+// server for. The SQLite backend's claim answers from a lock the handle is
+// taken to hold, so the promotion's migration and its claim are what run.
+func bareStandby(t *testing.T, dir string, w *sql.DB) *DB {
+	t.Helper()
+
+	t.Cleanup(func() { _ = w.Close() })
+
+	db := &DB{w: w, backend: newSQLiteBackend(dir)}
+	db.standby.Store(true)
+	db.revalidate.Store(true)
+
+	return db
+}
+
+// sqliteWriter is a plain writer pool over dir's ledger.
+func sqliteWriter(t *testing.T, dir string) *sql.DB {
+	t.Helper()
+
+	pools, err := newSQLiteBackend(dir).dataSources()
+	if err != nil {
+		t.Fatalf("dataSources: %v", err)
+	}
+
+	w, err := sql.Open("sqlite", pools.writer)
+	if err != nil {
+		t.Fatalf("open the writer: %v", err)
+	}
+
+	return w
+}
+
+// A PROMOTION WHOSE COMMIT NOBODY ANSWERED SAYS SO IN ITS REFUSAL, not only in
+// what migrate returned: the claim is where a control plane hears about it.
+func TestAPromotionWhoseMigrationWentUnansweredSaysItCouldNotTell(t *testing.T) {
+	t.Parallel()
+
+	dir := rewoundLedger(t)
+
+	pools, err := newSQLiteBackend(dir).dataSources()
+	if err != nil {
+		t.Fatalf("dataSources: %v", err)
+	}
+
+	probe := sqliteWriter(t, dir)
+	drv := probe.Driver()
+
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close the probe: %v", err)
+	}
+
+	standby := bareStandby(t, dir, sql.OpenDB(lostReplyConnector{drv: drv, dsn: pools.writer}))
+
+	_, err = standby.ClaimController(t.Context(), "standby", "deployment-a")
+
+	moved, ok := errors.AsType[*SchemaMoved](err)
+	if !ok || !moved.Unknown || moved.From != newestMigration-1 || moved.To != newestMigration {
+		t.Fatalf("a promotion whose migration went unanswered refused with %v", err)
+	}
+
+	if !standby.standby.Load() {
+		t.Error("a refused promotion left the standby latch off")
+	}
+}
+
+// A RETRY STOPPED IN ITS OWN MIGRATION STILL SAYS WHAT AN EARLIER ONE MOVED. The
+// retry has nothing left to apply, so its own migration moves nothing and is
+// stopped at its BEGIN; what the handle carries from the attempt before is all
+// that says the ledger moved, and without it the stop reads as a clean one.
+func TestARetryStoppedInItsMigrationSaysWhatAnEarlierAttemptMoved(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	standby := bareStandby(t, dir, sqliteWriter(t, dir))
+
+	// WHAT THE EARLIER ATTEMPT LEFT, as TestAPromotionRefusedAfterItsMigrationSaysWhatItMoved
+	// produces it against a real server.
+	standby.unclaimedMove = &SchemaMoved{From: newestMigration - 1, To: newestMigration}
+
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	_, err = standby.ClaimController(stopped, "standby", "deployment-a")
+	if !strings.Contains(fmt.Sprint(err), "migrate on promotion") {
+		t.Fatalf("the retry was meant to be stopped in its migration and returned %v", err)
+	}
+
+	if moved, ok := errors.AsType[*SchemaMoved](err); !ok || StoppedBy(stopped, err) {
+		t.Errorf("a retry stopped in its migration forgot what the earlier attempt moved (%+v): %v", moved, err)
+	}
+}
+
 // lostReplyConnector hands out real SQLite connections whose COMMIT succeeds
 // and then reports errReplyLost.
 type lostReplyConnector struct {
