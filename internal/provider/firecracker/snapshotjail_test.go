@@ -114,6 +114,19 @@ func TestARestoreLoadsTheLinkedSnapshotAndConfiguresNoMachine(t *testing.T) {
 		}
 	}
 
+	// AND NEVER CHOWNED: the chroot is handed to the jail's account, the links in
+	// it are not, so the account the VMM runs as never owns the file every fork maps.
+	chowned := h.chownedPaths()
+	if !slices.Contains(chowned, j.root()) {
+		t.Errorf("the chroot was never chowned (chowned %v), so this test cannot tell", chowned)
+	}
+
+	for _, path := range chowned {
+		if strings.HasPrefix(filepath.Base(path), "snapshot.") {
+			t.Errorf("%s was chowned, handing the published inode to the jail's account", path)
+		}
+	}
+
 	// AND THE CREDENTIAL REACHED THE GUEST THE WAY A LAUNCH'S DOES: through MMDS,
 	// never through argv.
 	md, _ := vmm.bodyPut("/mmds")
@@ -156,6 +169,20 @@ func TestARestoreRefusesASnapshotThatIsNotReadOnly(t *testing.T) {
 	if !slices.Contains(h.disk.discards(), theInstance) {
 		t.Errorf("the refused restore's root clone was not discarded: %v", h.disk.discards())
 	}
+
+	assertNoTapDeleted(t, h)
+}
+
+// assertNoTapDeleted fails if billet deleted a network device. A restore refused
+// before its tap existed made none, so a device under the claimed name is not its own.
+func assertNoTapDeleted(t *testing.T, h *harness) {
+	t.Helper()
+
+	for _, run := range h.commands() {
+		if run.bin == ipBinary && slices.Contains(run.args, "del") {
+			t.Errorf("a refused restore deleted a network device it never made: %s %v", run.bin, run.args)
+		}
+	}
 }
 
 // A SYMLINK IS NOT A PUBLISHED SNAPSHOT, whatever it points at.
@@ -181,6 +208,90 @@ func TestARestoreRefusesASnapshotThatIsALink(t *testing.T) {
 
 	if _, _, err := h.restoreWith(t, "gold-1"); !errors.Is(err, errSnapshotNotPublished) {
 		t.Fatalf("Restore of a symlinked memory file = %v, want errSnapshotNotPublished", err)
+	}
+
+	// THE STATE FILE WAS ALREADY LINKED when the memory was refused, so this is the
+	// partial placement: everything still goes.
+	if _, statErr := os.Stat(h.p.jailFor(theInstance).dir()); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("the partly placed restore left its jail: %v", statErr)
+	}
+
+	if !slices.Contains(h.disk.discards(), theInstance) {
+		t.Errorf("the partly placed restore's root clone was not discarded: %v", h.disk.discards())
+	}
+
+	assertNoTapDeleted(t, h)
+}
+
+// A SNAPSHOT DIRECTORY THAT IS A SYMLINK IS NOT ONE, even to a directory that holds
+// a perfectly published snapshot.
+func TestARestoreRefusesASnapshotDirectoryThatIsALink(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	target := publish(t, h, "gold-real", 0o444)
+
+	if err := os.Symlink(target, filepath.Join(h.p.snapshotsDir(), "gold-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := h.restoreWith(t, "gold-1")
+	if !errors.Is(err, errSnapshotNotPublished) || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Restore through a symlinked snapshot directory = %v, want refusal as a symlink", err)
+	}
+}
+
+// NOR ONE SOMEONE ELSE COULD WRITE: they could rename a different file into place
+// between billet judging the snapshot and linking it.
+func TestARestoreRefusesASnapshotDirectoryOthersCanWrite(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	dir := publish(t, h, "gold-1", 0o444)
+
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := h.restoreWith(t, "gold-1")
+	if !errors.Is(err, errSnapshotNotPublished) || !strings.Contains(err.Error(), "mode 0777") {
+		t.Fatalf("Restore from a world-writable snapshot directory = %v, want refusal naming its mode", err)
+	}
+}
+
+// COULD NOT TELL IS NOT "NOT PUBLISHED". A directory billet cannot read says nothing
+// about whether the snapshot is there, so it is not reported as absent.
+func TestARestoreThatCannotReadTheSnapshotDoesNotCallItUnpublished(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-0000 directory, so the inspection cannot be made to fail here")
+	}
+
+	h := newHarness(t)
+	dir := publish(t, h, "gold-1", 0o444)
+
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Errorf("make the directory removable again: %v", err)
+		}
+	})
+
+	_, _, err := h.restoreWith(t, "gold-1")
+	if err == nil {
+		t.Fatal("Restore of an unreadable snapshot succeeded")
+	}
+
+	if errors.Is(err, errSnapshotNotPublished) {
+		t.Errorf("an inspection that could not answer was reported as an unpublished snapshot: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "could not tell") {
+		t.Errorf("the error does not say billet could not tell: %v", err)
 	}
 }
 
@@ -251,8 +362,8 @@ func TestAPublishedFileIsNeverJudgedThroughASymlink(t *testing.T) {
 	}
 
 	err := checkPublished(link)
-	if !errors.Is(err, errSnapshotNotPublished) || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("checkPublished(symlink to a valid file) = %v, want refusal as not a regular file", err)
+	if !errors.Is(err, errSnapshotNotPublished) || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("checkPublished(symlink to a valid file) = %v, want refusal as a symlink", err)
 	}
 }
 

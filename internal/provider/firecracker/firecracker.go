@@ -616,14 +616,14 @@ func (p *Provider) launch(
 	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources, snapshot string,
 ) (*Instance, error) {
 	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
-		return nil, err
+		return nil, beforeTap(err)
 	}
 
 	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
 	// after it: a link is the published file itself, and must never be chowned.
 	if snapshot != "" {
 		if err := p.placeSnapshot(j, snapshot); err != nil {
-			return nil, err
+			return nil, beforeTap(err)
 		}
 	}
 
@@ -1717,9 +1717,16 @@ func (p *Provider) unwind(
 	// The errTapTaken case keeps the name for the opposite reason — the device is not
 	// billet's to delete, so the name must stay out of the pool rather than be handed
 	// to a launch that would fail on it too.
+	//
+	// AND NOT A DEVICE THIS LAUNCH NEVER TRIED TO MAKE. A failure before addTap
+	// leaves the claimed name unused by billet, so a device that carries it now is
+	// someone else's; the name goes back to the pool and the device is left alone.
 	tapGone := false
 
-	if !errors.Is(cause, errTapTaken) {
+	switch {
+	case errors.Is(cause, errNoTapMade):
+		tapGone = true
+	case !errors.Is(cause, errTapTaken):
 		if err := p.deleteTap(ctx, res.Tap); err != nil {
 			failures = append(failures, err)
 		} else {

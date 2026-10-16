@@ -390,6 +390,16 @@ type harness struct {
 	refuse   func(bin string, args []string) error
 	// jailerErr makes the jailer fail.
 	jailerErr error
+	// chowned is every path billet asked to chown, in order.
+	chowned []string
+}
+
+// chownedPaths returns every path billet asked to chown.
+func (h *harness) chownedPaths() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]string(nil), h.chowned...)
 }
 
 // theLease is a lease id of the shape alloc mints: 32 hex characters.
@@ -461,7 +471,14 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 			func(path, _ string, _, _ int) error {
 				return os.WriteFile(path, []byte("device node"), 0o600)
 			},
-			func(string, int, int) error { return nil },
+			func(path string, _, _ int) error {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+
+				h.chowned = append(h.chowned, path)
+
+				return nil
+			},
 		),
 		// GENEROUS, because no test here waits for it to expire: every fake VMM
 		// answers, and a failed start is asserted at the start action. At 2 seconds a

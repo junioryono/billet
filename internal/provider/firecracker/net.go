@@ -86,6 +86,21 @@ func (p *Provider) deleteTap(ctx context.Context, tap string) error {
 // device alone: it belongs to a microVM this launch did not start.
 var errTapTaken = errors.New("the network device name is already taken")
 
+// errNoTapMade marks a launch that failed before it created its network device, so
+// the unwind deletes nothing under the claimed name.
+var errNoTapMade = errors.New("no network device was made")
+
+// beforeTap marks a failure that happened before the launch created its tap.
+func beforeTap(err error) error { return noTapMadeError{err} }
+
+// noTapMadeError carries a failure unchanged, and answers errors.Is for
+// errNoTapMade, so the reason a launch failed stays the headline.
+type noTapMadeError struct{ err error }
+
+func (e noTapMadeError) Error() string        { return e.err.Error() }
+func (e noTapMadeError) Unwrap() error        { return e.err }
+func (e noTapMadeError) Is(target error) bool { return target == errNoTapMade }
+
 // ipBinary is iproute2, which every distribution billet targets installs.
 const ipBinary = "ip"
 

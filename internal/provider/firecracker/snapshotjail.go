@@ -7,7 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -29,8 +30,9 @@ func (p *Provider) snapshotsDir() string {
 	return filepath.Join(p.cfg.ChrootBase, "billet-snapshots")
 }
 
-// errSnapshotNotPublished is a snapshot that is missing, or that is not in the
-// shape a jailed VMM may be given.
+// errSnapshotNotPublished is a snapshot that is absent, or that is not in the shape
+// a jailed VMM may be given. An inspection that could not answer is not this: it is
+// returned as itself, because "could not tell" is not "no".
 var errSnapshotNotPublished = errors.New("not a published snapshot")
 
 // placeSnapshot links a published snapshot's state and memory into a jail.
@@ -42,6 +44,13 @@ var errSnapshotNotPublished = errors.New("not a published snapshot")
 // are never chowned themselves, and the source must already be owned by billet and
 // read-only: a jailed VMM reads it, nothing it runs as can write it.
 //
+// THROUGH DESCRIPTORS, NEVER PATHNAMES. Each directory on the way is opened without
+// following a symlink and proved to be billet's and writable by no one else, the
+// file is judged through its own descriptor, and the link is made relative to the
+// directories already held. Only billet's account can rename anything in a directory
+// proved that way, so the name linked is the file judged, and the link is checked
+// against that file's inode afterwards.
+//
 // AND NEVER BY COPY. A copy would lose the shared page cache and write gigabytes per
 // restore, and a source on another filesystem than the jails is a deployment billet
 // refuses rather than one it quietly makes slow.
@@ -51,29 +60,26 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 			bounded(name))
 	}
 
+	store, err := openOwnedDir(unix.AT_FDCWD, p.snapshotsDir())
+	if err != nil {
+		return err
+	}
+	defer unix.Close(store)
+
+	dir, err := openOwnedDir(store, name)
+	if err != nil {
+		return fmt.Errorf("firecracker: the snapshot %s: %w", name, err)
+	}
+	defer unix.Close(dir)
+
+	root, err := unix.Open(j.root(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("firecracker: open the jail root %s: %w", j.root(), err)
+	}
+	defer unix.Close(root)
+
 	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
-		src := filepath.Join(p.snapshotsDir(), name, file)
-
-		if err := checkPublished(src); err != nil {
-			return err
-		}
-
-		dst := filepath.Join(j.root(), file)
-
-		if err := os.Link(src, dst); err != nil {
-			if errors.Is(err, syscall.EXDEV) {
-				return fmt.Errorf("firecracker: %s is on another filesystem than the jails under %s, "+
-					"so it cannot be linked into one, and billet does not copy a snapshot: %w",
-					src, p.cfg.ChrootBase, err)
-			}
-
-			return fmt.Errorf("firecracker: link %s into the jail of %s: %w", src, j.id, err)
-		}
-
-		// THE SAME FILE, STILL IN THE SAME SHAPE, read through the link the VMM will
-		// open, because a check of the source alone says nothing about what the jail
-		// now holds.
-		if err := samePublished(src, dst); err != nil {
+		if err := linkPublished(dir, root, file, filepath.Join(p.snapshotsDir(), name, file), j.id); err != nil {
 			return err
 		}
 	}
@@ -81,31 +87,134 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 	return nil
 }
 
-// checkPublished proves a snapshot file is one a jailed VMM may read and never write.
-//
-// FROM WHAT IS PROVED, NOT WHAT IS PRESENT: a regular file, not a link to one,
-// owned by the account billet runs as, and mode 0444 exactly. Anything else is
-// refused rather than repaired, because repairing it would be billet deciding that a
-// file someone else could write is the snapshot it published.
-func checkPublished(path string) error {
-	info, err := os.Lstat(path)
+// linkPublished judges one published file through its descriptor, links it into the
+// jail root, and proves the link is that file.
+func linkPublished(dir, root int, file, path, jailID string) error {
+	fd, err := openNoFollow(dir, file, path)
 	if err != nil {
-		return fmt.Errorf("firecracker: %w: %s: %w", errSnapshotNotPublished, path, err)
+		return err
+	}
+	defer unix.Close(fd)
+
+	var src unix.Stat_t
+	if err := unix.Fstat(fd, &src); err != nil {
+		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
 	}
 
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("firecracker: %w: %s is a %s, not a regular file", errSnapshotNotPublished,
-			path, info.Mode().Type())
+	if err := judgePublished(src, path); err != nil {
+		return err
 	}
 
-	if perm := info.Mode().Perm(); perm != 0o444 {
+	if err := unix.Linkat(dir, file, root, file, 0); err != nil {
+		if errors.Is(err, unix.EXDEV) {
+			return fmt.Errorf("firecracker: %s is on another filesystem than the jails, so it cannot "+
+				"be linked into one, and billet does not copy a snapshot: %w", path, err)
+		}
+
+		return fmt.Errorf("firecracker: link %s into the jail of %s: %w", path, jailID, err)
+	}
+
+	// THE SAME FILE, STILL IN THE SAME SHAPE, read through the name the VMM will
+	// open, because a check of the source alone says nothing about what the jail
+	// now holds.
+	var linked unix.Stat_t
+	if err := unix.Fstatat(root, file, &linked, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("firecracker: could not tell what was linked into the jail of %s: %w", jailID, err)
+	}
+
+	if linked.Dev != src.Dev || linked.Ino != src.Ino {
+		return fmt.Errorf("firecracker: %w: %s in the jail of %s is not the file published at %s",
+			errSnapshotNotPublished, file, jailID, path)
+	}
+
+	return judgePublished(linked, path)
+}
+
+// openOwnedDir opens a directory without following a symlink and proves it is
+// owned by the account billet runs as and writable by no one else.
+func openOwnedDir(at int, name string) (int, error) {
+	fd, err := unix.Openat(at, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, refusalOrUnknown(at, name, name, err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		unix.Close(fd)
+
+		return -1, fmt.Errorf("firecracker: could not tell who owns %s: %w", name, err)
+	}
+
+	if uid := os.Geteuid(); int(st.Uid) != uid {
+		unix.Close(fd)
+
+		return -1, fmt.Errorf("firecracker: %w: %s is owned by uid %d, not by the account billet runs as (%d)",
+			errSnapshotNotPublished, name, st.Uid, uid)
+	}
+
+	if perm := os.FileMode(st.Mode).Perm(); perm&0o022 != 0 {
+		unix.Close(fd)
+
+		return -1, fmt.Errorf("firecracker: %w: %s has mode %04o, so someone other than billet could "+
+			"replace what it holds", errSnapshotNotPublished, name, perm)
+	}
+
+	return fd, nil
+}
+
+// openNoFollow opens a published file for reading, refusing a symlink as itself and
+// never waiting on a FIFO.
+func openNoFollow(at int, name, path string) (int, error) {
+	fd, err := unix.Openat(at, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, refusalOrUnknown(at, name, path, err)
+	}
+
+	return fd, nil
+}
+
+// refusalOrUnknown says which of the two an open's failure was: absent, or a symlink
+// or non-directory where one was required, is a snapshot that is not published;
+// anything else is an inspection that could not answer.
+//
+// A SYMLINK IS NAMED AS ONE ON EVERY PLATFORM. O_NOFOLLOW on a symlink fails with
+// ELOOP, but with O_DIRECTORY as well darwin answers ENOTDIR instead, so the name
+// itself is looked at, not followed, before the refusal says what it found.
+func refusalOrUnknown(at int, name, path string, err error) error {
+	switch {
+	case errors.Is(err, unix.ENOENT):
+		return fmt.Errorf("firecracker: %w: %s does not exist", errSnapshotNotPublished, path)
+	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENOTDIR):
+		var st unix.Stat_t
+		if statErr := unix.Fstatat(at, name, &st, unix.AT_SYMLINK_NOFOLLOW); statErr == nil &&
+			st.Mode&unix.S_IFMT == unix.S_IFLNK {
+			return fmt.Errorf("firecracker: %w: %s is a symlink, and billet judges a snapshot as itself",
+				errSnapshotNotPublished, path)
+		}
+
+		return fmt.Errorf("firecracker: %w: %s is not what a published snapshot holds there",
+			errSnapshotNotPublished, path)
+	default:
+		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
+	}
+}
+
+// judgePublished proves one stat is of a file a jailed VMM may read and never write.
+//
+// FROM WHAT IS PROVED, NOT WHAT IS PRESENT: a regular file, owned by the account
+// billet runs as, and mode 0444 exactly. Anything else is refused rather than
+// repaired, because repairing it would be billet deciding that a file someone else
+// could write is the snapshot it published.
+func judgePublished(st unix.Stat_t, path string) error {
+	mode := os.FileMode(st.Mode & 0o777)
+
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("firecracker: %w: %s is not a regular file", errSnapshotNotPublished, path)
+	}
+
+	if mode.Perm() != 0o444 {
 		return fmt.Errorf("firecracker: %w: %s has mode %04o, and a published snapshot is 0444",
-			errSnapshotNotPublished, path, perm)
-	}
-
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("firecracker: %w: could not tell who owns %s", errSnapshotNotPublished, path)
+			errSnapshotNotPublished, path, mode.Perm())
 	}
 
 	if uid := os.Geteuid(); int(st.Uid) != uid {
@@ -114,6 +223,23 @@ func checkPublished(path string) error {
 	}
 
 	return nil
+}
+
+// checkPublished judges a file by pathname, opened without following a symlink,
+// for a caller that holds no directory descriptor.
+func checkPublished(path string) error {
+	fd, err := openNoFollow(unix.AT_FDCWD, path, path)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
+	}
+
+	return judgePublished(st, path)
 }
 
 // samePublished proves a link in a jail is the published file, still read-only.

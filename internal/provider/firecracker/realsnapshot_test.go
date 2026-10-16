@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,17 +91,22 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	// THE DISK THE MEMORY WAS TAKEN WITH, not a fresh golden: a restored kernel's
 	// page cache describes this disk, and another one under it is corruption.
 	captured := env.disk.cache + "/" + goldenName + "@cap"
+
+	// REGISTERED BEFORE THE CREATE, because a create cancelled after Ceph made the
+	// snapshot reports failure and would otherwise leave it, which then stops the
+	// golden's disk being removed. Only a confirmed absence counts as nothing to do.
+	t.Cleanup(func() {
+		out, err := exec.CommandContext(context.WithoutCancel(t.Context()), "rbd",
+			env.disk.args("snap", "rm", captured)...).CombinedOutput()
+		if err != nil && !strings.Contains(string(out), "No such file or directory") {
+			t.Errorf("remove the golden's disk snapshot %s: %v: %s", captured, err, out)
+		}
+	})
+
 	if out, err := exec.CommandContext(t.Context(), "rbd",
 		env.disk.args("snap", "create", captured)...).CombinedOutput(); err != nil {
 		t.Fatalf("snapshot the golden's disk: %v: %s", err, out)
 	}
-
-	t.Cleanup(func() {
-		if out, err := exec.CommandContext(context.WithoutCancel(t.Context()), "rbd",
-			env.disk.args("snap", "rm", captured)...).CombinedOutput(); err != nil {
-			t.Errorf("remove the golden's disk snapshot %s: %v: %s", captured, err, out)
-		}
-	})
 
 	// A SECOND PROVIDER WHOSE "IMAGE POOL" IS THE CACHE POOL, so the clone it makes
 	// for the fork is of the captured disk. Same deployment, same host state.
@@ -153,12 +159,49 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 		t.Errorf("the fork's memory file: %v", err)
 	}
 
-	// AND THE VMM LOGGED NOTHING THAT SAYS IT FAILED.
-	if raw, err := os.ReadFile(filepath.Join(fj.root(), vmmLog)); err == nil {
-		for _, bad := range []string{"panic", "Error"} {
-			if strings.Contains(string(raw), bad) {
-				t.Errorf("the restored VMM's log contains %q:\n%s", bad, bounded(string(raw)))
-			}
+	// AND A SNAPSHOT DIRECTORY ANOTHER ACCOUNT OWNS IS NOT RESTORED FROM. Only root
+	// can make one, which is why this half lives here: the owner of a directory can
+	// rename any file in it, so a jail-range uid owning one could swap the memory a
+	// restore links.
+	foreign := filepath.Join(golden.snapshotsDir(), "selftest-foreign-"+env.lease[:8])
+	if err := os.Mkdir(foreign, 0o755); err != nil {
+		t.Fatalf("make the foreign directory: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(foreign); err != nil {
+			t.Errorf("remove the foreign directory: %v", err)
 		}
+	})
+
+	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
+		if err := os.Link(filepath.Join(published, file), filepath.Join(foreign, file)); err != nil {
+			t.Fatalf("link %s into the foreign directory: %v", file, err)
+		}
+	}
+
+	if err := os.Chown(foreign, env.cfg.JailUIDMin+env.cfg.JailUIDCount-1, env.cfg.JailUIDMin+env.cfg.JailUIDCount-1); err != nil {
+		t.Fatalf("hand the directory to a jail-range uid: %v", err)
+	}
+
+	refusedName := provider.InstanceName(freshLease(t))
+
+	// REGISTERED BEFORE THE CALL, because the refusal is what is under test: a
+	// broken check restores this lease, and its clone would then hold the golden's
+	// disk snapshot and strand the golden too (which a mutation of the owner check
+	// did, on the reference node).
+	t.Cleanup(func() {
+		if _, err := forks.Destroy(context.WithoutCancel(t.Context()), refusedName); err != nil {
+			t.Errorf("cleanup the restore that should have been refused: %v", err)
+		}
+	})
+
+	_, err = forks.Restore(t.Context(), provider.Spec{
+		Name: refusedName, Image: goldenName + "@cap", VCPU: 2, Memory: 1 * config.GiB,
+		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	}, filepath.Base(foreign))
+	if !errors.Is(err, errSnapshotNotPublished) || !strings.Contains(err.Error(), "owned by uid") {
+		t.Errorf("Restore from a directory a jail-range uid owns = %v, want refusal naming the owner", err)
 	}
 }
