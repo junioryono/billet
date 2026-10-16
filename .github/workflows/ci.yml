@@ -8,7 +8,9 @@ name: CI
 # as its merge ref, and the commit the merge leaves on release/vX.Y is a different
 # one; Cut Release cuts from that commit and its report shows CI on exactly it
 # (#145). The cut's own `Release vX.Y.Z` commit is pushed with GITHUB_TOKEN, which
-# starts no workflow, so it adds no run.
+# starts no workflow, so it adds no run. A push reads the pushed branch's own copy
+# of this file, so a release branch cut before this trigger gets it only once it
+# is carried there.
 on:
   push:
     branches: [main, 'release/**']

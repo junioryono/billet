@@ -4,6 +4,16 @@ set -euo pipefail
 requested=${REQUESTED:-}
 output=${GITHUB_OUTPUT:?GITHUB_OUTPUT must name the workflow output file}
 
+# THE CALLER MUST PREVIEW AND CONFIRM (#145). Re-running an old Cut Release run
+# from the Actions page runs that run's own workflow file, which predates the
+# preview: it checks out main, runs THIS planner, and cuts whatever main is with
+# nobody having read it. The planner is the one step every version of the
+# workflow shares, so it is where an old caller is turned away.
+if [ "${BILLET_CUT_PROTOCOL:-}" != preview-confirm ]; then
+	echo "::error::this run of Cut Release predates its preview and confirmation; start a new run from the Actions page instead of re-running this one" >&2
+	exit 1
+fi
+
 # Reject line injection before any grep or workflow-output operation sees the input.
 case "$requested" in
 	*[$'\n\r']*)

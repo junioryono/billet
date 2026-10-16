@@ -92,15 +92,25 @@ docs='https://billet.readthedocs.io/en/latest/operating/upgrades.html'
 	fi
 } >"$work/report"
 
+# WHAT THE RELEASE IS READ AGAINST: the previous release's tree, or the empty
+# tree before billet's first release, so even that one reports its migrations.
+if [ -n "$previous" ]; then
+	base=$previous
+else
+	base=$(git hash-object -t tree /dev/null)
+fi
+
+# PATHS ARE READ NUL-TERMINATED, as git wrote them. Without -z git quotes a path
+# with a non-ASCII byte or a tab, and a quoted path no longer matches the
+# directories below, so a change to the scheduler would read as nothing at all.
+# A newline inside a pathname is the one spelling this cannot carry, and billet
+# has none.
+
 # THE LEDGER SCHEMA, AS TREES, so a migration the previous release already
 # carried is not counted again. Added files are new migrations; a published one
 # changed or removed is its own alarm, because deployments record its checksum.
-if [ -n "$previous" ]; then
-	git diff --no-renames --name-status "$previous" "$candidate" -- \
-		internal/state/migrations internal/state/pgmigrations >"$work/schema"
-else
-	: >"$work/schema"
-fi
+git diff -z --no-renames --name-status "$base" "$candidate" -- \
+	internal/state/migrations internal/state/pgmigrations | tr '\0' '\n' | paste - - >"$work/schema"
 
 awk -F '\t' '$1 == "A" { print $2 }' "$work/schema" >"$work/added"
 awk -F '\t' '$1 != "A" { print $1 "\t" $2 }' "$work/schema" >"$work/altered"
@@ -143,10 +153,14 @@ fi
 : >"$work/rows"
 
 while IFS=$'\t' read -r sha subject; do
+	# A TAB IN A SUBJECT would split the row below and cut the title short.
+	subject=${subject//$'\t'/ }
+
 	if git rev-parse -q --verify "$sha^1" >/dev/null; then
-		git diff --no-renames --name-only "$sha^1" "$sha" >"$work/files"
+		git diff -z --no-renames --name-only "$sha^1" "$sha" | tr '\0' '\n' >"$work/files"
 	else
-		git diff-tree --root --no-commit-id --no-renames --name-only -r "$sha" >"$work/files"
+		git diff-tree -z --root --no-commit-id --no-renames --name-only -r "$sha" |
+			tr '\0' '\n' >"$work/files"
 	fi
 
 	# ONLY WHAT SHIPS MARKS A CHANGE: a test, a fixture or a directory's CLAUDE.md
@@ -210,14 +224,14 @@ changes=$(wc -l <"$work/rows" | tr -d ' ')
 
 	if [ -z "${GITHUB_REPOSITORY:-}" ]; then
 		printf 'Not looked up: no repository is named (GITHUB_REPOSITORY), as on a workstation.\n\n'
-	elif ! gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-		-f head_sha="$candidate" -f per_page=20 \
+	elif ! gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+		-f head_sha="$candidate" -f per_page=100 \
 		--jq '.workflow_runs[] | [.event, .status, (.conclusion // "none"), .html_url] | @tsv' \
 		>"$work/runs" 2>"$work/gh-error"; then
 		printf '**Could not read CI for this commit**, so this report cannot say whether it passed: %s\n\n' \
 			"$(head -c 300 "$work/gh-error" | tr '\n' ' ')"
 	elif [ ! -s "$work/runs" ]; then
-		printf '**No CI run on this commit**: nothing has tested this tree as it is. A release branch'"'"'s tip gets a run of its own when a pull request merges into it.\n\n'
+		printf '**No CI run on this commit**: nothing has tested this tree as it is. A release branch'"'"'s tip has a run of its own only where that branch'"'"'s own ci.yml runs on pushes to `release/**`; a branch cut before that trigger existed runs CI on pull requests alone.\n\n'
 	else
 		awk -F '\t' '{ printf "- %s: %s, %s (%s)\n", $1, $2, $3, $4 }' "$work/runs"
 		printf '\n'

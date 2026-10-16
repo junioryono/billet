@@ -613,6 +613,9 @@ func fixtureGitEnv() []string {
 		env = append(env, kv)
 	}
 
+	// THE DATES ARE PINNED so a fixture's commit ids are the same on every run,
+	// and an assertion about an order cannot pass by the luck of a hash.
 	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_CONFIG_NOSYSTEM=1")
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_DATE=2026-01-01T00:00:00Z",
+		"GIT_COMMITTER_DATE=2026-01-01T00:00:00Z")
 }

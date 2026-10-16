@@ -986,8 +986,14 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 		requested   string
 		wantOutput  string
 		wantSuccess bool
+		// unconfirmed leaves out BILLET_CUT_PROTOCOL, as a re-run of a Cut Release
+		// that predates the preview does.
+		unconfirmed bool
 	}{
 		{name: "backward new series", requested: "v0.3.0"},
+		// AN OLDER WORKFLOW, RE-RUN, IS TURNED AWAY before it is handed a plan it
+		// would cut with no preview.
+		{name: "a workflow that does not preview", requested: "v0.6.0", unconfirmed: true},
 		// A NEW SERIES IS READ AGAINST THE NEWEST RELEASE OF ALL, a patch against
 		// its own series' newest: what release-contents.sh compares the cut with.
 		{name: "forward new series", requested: "v0.6.0", wantOutput: "tag=v0.6.0\nbranch=release/v0.6\ncollection_version=0.6.0\nprevious=v0.5.0\n", wantSuccess: true},
@@ -1001,11 +1007,22 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 			cmd := exec.CommandContext(t.Context(), planner)
 			cmd.Dir = repository
 			cmd.Env = append(os.Environ(), "REQUESTED="+tc.requested, "GITHUB_OUTPUT="+output)
-			err := cmd.Run()
+			if !tc.unconfirmed {
+				cmd.Env = append(cmd.Env, "BILLET_CUT_PROTOCOL=preview-confirm")
+			}
+			said, err := cmd.CombinedOutput()
 			if (err == nil) != tc.wantSuccess {
 				t.Fatalf("plan error = %v; want success %t", err, tc.wantSuccess)
 			}
 			if !tc.wantSuccess {
+				if tc.unconfirmed {
+					if !strings.Contains(string(said), "predates its preview and confirmation") {
+						t.Errorf("the refusal does not say why:\n%s", said)
+					}
+					if _, err := os.Stat(output); !os.IsNotExist(err) {
+						t.Errorf("a refused caller was handed a plan (stat: %v)", err)
+					}
+				}
 				return
 			}
 			body, err := os.ReadFile(output)

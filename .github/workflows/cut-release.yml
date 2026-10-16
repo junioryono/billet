@@ -62,6 +62,9 @@ jobs:
           # matters here: an expression substituted into a shell script is an
           # injection, and this job holds contents: write.
           REQUESTED: ${{ inputs.version }}
+          # What tells the planner this workflow previews and confirms; an older
+          # run re-run from the Actions page does not say it, and is refused.
+          BILLET_CUT_PROTOCOL: preview-confirm
         run: scripts/plan-release.sh
 
       # THE COMMIT THE RELEASE WOULD BE CUT FROM, decided once, read by the report
@@ -69,6 +72,11 @@ jobs:
       # patch on the same minor series looks like, and it is the case this shape
       # exists for. ls-remote's 2 is "no such branch"; any other failure is
       # could-not-tell, which must not become "cut a new branch from main".
+      #
+      # FETCHED, NOT CHECKED OUT. The report runs main's release-contents.sh,
+      # which reads the candidate by its id; checking the branch out here would
+      # run the branch's copy instead, which no branch cut before it exists has,
+      # and each branch would carry a gate of its own. The cut checks it out.
       - name: Find the candidate
         id: candidate
         env:
@@ -85,10 +93,11 @@ jobs:
             0)
               echo "${BRANCH} already exists; the candidate is its tip rather than main"
               git fetch origin "${BRANCH}:${BRANCH}"
-              git checkout "${BRANCH}"
+              commit=$(git rev-parse --verify "refs/heads/${BRANCH}^{commit}")
               existing=true
               ;;
             2)
+              commit=$(git rev-parse --verify "HEAD^{commit}")
               existing=false
               ;;
             *)
@@ -98,7 +107,7 @@ jobs:
           esac
 
           {
-            echo "commit=$(git rev-parse HEAD)"
+            echo "commit=${commit}"
             echo "existing=${existing}"
           } >> "$GITHUB_OUTPUT"
 
@@ -128,14 +137,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ "${EXISTING}" = true ]; then
+            git checkout "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+          fi
+
           # THE TAG CARRIES WHAT WAS READ, plus the rewrite below and nothing else.
           if [ "$(git rev-parse HEAD)" != "${CANDIDATE}" ]; then
             echo "::error::HEAD is $(git rev-parse HEAD), not the candidate ${CANDIDATE} the report described"
             exit 1
-          fi
-
-          if [ "${EXISTING}" != true ]; then
-            git checkout -b "${BRANCH}"
           fi
 
           # Main composes current sibling actions at @main. A RELEASE MUST NOT:
