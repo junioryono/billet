@@ -333,11 +333,13 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 		}
 	}
 
-	// AND THE LEDGER CLOSES AFTER THE READ, in a statement of its own after it,
-	// never in a defer, which could not hand its error back.
-	served, read, closed := -1, -1, -1
+	// AND THE LEDGER CLOSES AFTER THE READ, in an assignment of its own, never in a
+	// defer, which could not hand its error back; and the run's last word joins
+	// that error to the run's, so neither hides the other.
+	body := findFunc(t, "runControlPlane").Body.List
+	served, read, closed, closeVar := -1, -1, -1, ""
 
-	for i, stmt := range findFunc(t, "runControlPlane").Body.List {
+	for i, stmt := range body {
 		if _, isDefer := stmt.(*ast.DeferStmt); isDefer {
 			if calls(stmt, "Close") {
 				t.Error("runControlPlane defers the ledger's close, so its failure is dropped")
@@ -354,14 +356,29 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 			read = i
 		}
 
-		if ret, ok := stmt.(*ast.ReturnStmt); ok && calls(ret, "Close") {
-			closed = i
+		if assign, ok := stmt.(*ast.AssignStmt); ok && closed < 0 && len(assign.Lhs) == 1 &&
+			len(assign.Rhs) == 1 && calls(assign.Rhs[0], "Close") {
+			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
+				closed, closeVar = i, id.Name
+			}
 		}
 	}
 
 	if served < 0 || read <= served || closed <= read {
-		t.Errorf("runControlPlane does not read the fence after serveControlPlane has returned and "+
+		t.Fatalf("runControlPlane does not read the fence after serveControlPlane has returned and "+
 			"before the ledger closes (serve at statement %d, read at %d, close at %d)", served, read, closed)
+	}
+
+	ret, ok := body[len(body)-1].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 2 {
+		t.Fatal("runControlPlane does not end in a return of the fence and an error")
+	}
+
+	join, ok := ret.Results[1].(*ast.CallExpr)
+	if !ok || !isPkgCall(join, "errors", "Join") || len(join.Args) != 2 ||
+		!isIdent(join.Args[0], "err") || !isIdent(join.Args[1], closeVar) {
+		t.Errorf("runControlPlane does not return errors.Join(err, %s), so a close that failed "+
+			"beside a stop can be dropped", closeVar)
 	}
 }
 

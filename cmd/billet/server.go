@@ -85,8 +85,14 @@ func runControlPlane(
 
 	// AND THE CLOSE'S OWN FAILURE IS JOINED, not dropped: a lock or a connection
 	// that would not let go beside a stop is a fault, and a stop that discarded
-	// it would exit 0 over it.
-	return fenced, errors.Join(err, cp.Close())
+	// it would exit 0 over it. A run that failed already says what its open
+	// migrated; one that did not, a probe, says it here if its close fails.
+	closed := cp.Close()
+	if closed != nil && err == nil {
+		closed = errors.Join(closed, cp.UnclaimedMove())
+	}
+
+	return fenced, errors.Join(err, closed)
 }
 
 // serveControlPlane is the control plane cp after its open: the probe's hold,

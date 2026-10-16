@@ -473,12 +473,28 @@ func (s *Server) Run(ctx context.Context) error {
 	// live is never a stop: every tier returning a cancellation while nobody
 	// asked this process to stop is a failure, and reporting it as a clean stop
 	// would leave the service manager nothing to restart.
-	joined := errors.Join(group.Wait()...)
-	if joined != nil && !state.StoppedBy(ctx, joined) {
-		return joined
+	if errs := group.Wait(); !allStopped(ctx, errs) {
+		return errors.Join(errs...)
 	}
 
 	return nil
+}
+
+// allStopped reports whether every error a tier ended with is nothing but ctx
+// ending.
+//
+// EACH ON ITS OWN, never their join. The walk behind state.StoppedBy has a
+// budget for the whole tree it is given, and a deployment with enough tiers
+// would exhaust it on a join of nothing but cancellations: a clean stop read as
+// a could-not-tell, and the process would exit 1 for it.
+func allStopped(ctx context.Context, errs []error) bool {
+	for _, err := range errs {
+		if !state.StoppedBy(ctx, err) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // reconcile resolves every tier to its target, reports scale sets no tier

@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // requestCancelled is how the scale-set client reports a round trip its
@@ -286,6 +287,43 @@ func TestATierEndingOnACancellationNobodyAskedForIsAFailure(t *testing.T) {
 
 	if ctx.Err() != nil {
 		t.Errorf("Run returned only once its guard had expired: %v", err)
+	}
+}
+
+// A STOP ACROSS MANY TIERS IS STILL A STOP. Each tier's error is asked on its
+// own: their join, for a deployment this size, is more than the cause walk
+// will read, and a stop read through it comes back as could-not-tell.
+func TestAStopAcrossManyTiersIsStillAStop(t *testing.T) {
+	t.Parallel()
+
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	errs := make([]error, 0, 300)
+	for i := range 300 {
+		errs = append(errs, fmt.Errorf("server: listener billet-%d: %w", i, context.Canceled))
+	}
+
+	// THE REASON THIS IS ASKED TIER BY TIER, so the test fails if the walk's budget
+	// grows past it and this stops proving anything.
+	if state.StoppedBy(stopped, errors.Join(errs...)) {
+		t.Fatal("the join of 300 tiers' stops is within the cause walk's budget, so this case " +
+			"no longer exceeds it; grow it")
+	}
+
+	if !allStopped(stopped, errs) {
+		t.Error("300 tiers that each ended on the stop were not read as a stop")
+	}
+
+	withFault := make([]error, 0, len(errs)+1)
+	withFault = append(withFault, errs...)
+	withFault = append(withFault, errors.New("a tier failed for a reason of its own"))
+	if allStopped(stopped, withFault) {
+		t.Error("a tier's own failure among 300 stops was read as a stop")
+	}
+
+	if allStopped(t.Context(), errs) {
+		t.Error("tiers that ended on a cancellation with nobody stopping were read as a stop")
 	}
 }
 
