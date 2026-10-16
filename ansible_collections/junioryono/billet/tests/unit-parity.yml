@@ -433,7 +433,7 @@
         refresh_copies:
           - "{{ packaged_scheduled['billet-images-refresh.service'] }}"
           - "{{ role_scheduled['billet-images-refresh.service'] }}"
-        service_section: '(?ms)^\[Service\][ \t]*$.*?(?=^\[|\Z)'
+        service_section: '(?ms)^[ \t]*\[Service\][ \t]*$.*?(?=^[ \t]*\[|\Z)'
       ansible.builtin.assert:
         that: >-
           {{ refresh_copies

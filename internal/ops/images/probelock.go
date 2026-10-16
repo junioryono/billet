@@ -51,7 +51,7 @@ const probeLockAttempts = 2
 
 // probeLockOpened is a test hook called between the lock file's open and its
 // flock, the window a unit's stop can move the name in; nil in production.
-var probeLockOpened func(path string)
+var probeLockOpened func(path string, file *os.File)
 
 // errProbeLockContended is a flock another open file description holds.
 var errProbeLockContended = errors.New("billet images verify: the lock is held by another verification")
@@ -121,7 +121,7 @@ func lockName(path string) (*os.File, error) {
 	}
 
 	if probeLockOpened != nil {
-		probeLockOpened(path)
+		probeLockOpened(path, file)
 	}
 
 	// NON-BLOCKING, because waiting would turn a mistake into a hang: the thing

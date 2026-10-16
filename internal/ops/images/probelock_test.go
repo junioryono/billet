@@ -321,7 +321,7 @@ func TestTakingTheProbeLockRetakesANameMovedUnderIt(t *testing.T) {
 			dir := t.TempDir()
 			opened := 0
 
-			probeLockOpened = func(path string) {
+			probeLockOpened = func(path string, _ *os.File) {
 				opened++
 				if opened > tc.moves {
 					return
@@ -402,7 +402,11 @@ func TestARetakeWhoseNameMovesAgainIsNotAHold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	probeLockOpened = func(path string) {
+	var retaken *os.File
+
+	probeLockOpened = func(path string, file *os.File) {
+		retaken = file
+
 		if err := os.Remove(path); err != nil {
 			t.Error(err)
 		}
@@ -414,7 +418,6 @@ func TestARetakeWhoseNameMovesAgainIsNotAHold(t *testing.T) {
 	t.Cleanup(func() { probeLockOpened = nil })
 
 	held := lock.file
-	before := openDescriptors(t)
 
 	if err := lock.hold(); err == nil || !strings.Contains(err.Error(), "now names a different file") {
 		t.Fatalf("hold() over a name that moved under the re-take = %v, want the move named", err)
@@ -425,30 +428,12 @@ func TestARetakeWhoseNameMovesAgainIsNotAHold(t *testing.T) {
 	}
 
 	// THE RE-TAKEN DESCRIPTOR IS CLOSED: its lock is on the inode the hook
-	// unlinked, so no second lock can show it held; the descriptor count can.
-	if after := openDescriptors(t); after != before {
-		t.Errorf("the failed re-take left %d descriptors open, %d before it", after, before)
-	}
-}
-
-// openDescriptors counts this process's open file descriptors. Serial callers
-// only: a parallel test opening files changes the count.
-func openDescriptors(t *testing.T) int {
-	t.Helper()
-
-	// NAMES, NOT ENTRIES: the listing includes the descriptor reading it, which
-	// is closed by the time an entry would be examined.
-	dir, err := os.Open("/dev/fd")
-	if err != nil {
-		t.Fatal(err)
+	// unlinked, so no second lock can show it held; the file itself can.
+	if retaken == nil {
+		t.Fatal("the re-take opened nothing")
 	}
 
-	defer func() { _ = dir.Close() }()
-
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := retaken.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Errorf("the failed re-take's descriptor answers Stat with %v, want it closed", err)
 	}
-
-	return len(names)
 }

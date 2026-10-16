@@ -137,9 +137,9 @@
 
 # THE HOST LOCK DIRECTORY OUTLIVES EVERY UNIT (#175). The task above makes
 # /run/billet/locks now, and this entry has systemd-tmpfiles make it again at
-# every boot, before any billet unit starts; the units name it in ReadWritePaths
-# and none declares it a RuntimeDirectory, whose stop would remove it under a
-# lock another process holds. The package installs the same bytes under
+# every boot, before any billet unit starts; no unit's stop removes it under a
+# lock another process holds: the node names it in ReadWritePaths, and the image
+# refresh declares it preserved. The package installs the same bytes under
 # /usr/lib/tmpfiles.d, which a file of this name in /etc/tmpfiles.d overrides.
 - name: Keep the host lock directory across unit stops and reboots
   ansible.builtin.template:

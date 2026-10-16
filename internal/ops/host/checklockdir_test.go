@@ -130,12 +130,16 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 		{"the shipped spelling, a link to elsewhere", "/run/billet/locks", loaded("billet/registration"), nil,
 			lockDirHost{aliases: map[string]string{"/run/billet/locks": "/var/lib/billet/locks"}},
 			"locks    WARNING: /run/billet/locks leads to /var/lib/billet/locks, so the lock records"},
+		{"the shipped spelling, a link into the registration record's directory", "/run/billet/locks",
+			loaded("billet/registration"), nil,
+			lockDirHost{aliases: map[string]string{"/run/billet/locks": "/run/billet/registration"}},
+			"locks    WARNING: /run/billet/locks leads to /run/billet/registration, under billet-node.service's " +
+				"RuntimeDirectory /run/billet/registration, which every stop of the node removes under the locks " +
+				"other processes hold in it (#175); make /run/billet/locks a directory"},
 		{"a unit from before", "/run/billet/locks", loaded("billet/locks billet/registration"), nil, lockDirHost{},
 			"locks    WARNING: billet-node.service declares /run/billet/locks as a RuntimeDirectory"},
 		{"a unit from before, the directory missing", "/run/billet/locks", loaded("billet/locks billet/registration"), nil,
 			lockDirHost{stat: missing}, "locks    WARNING: billet-node.service declares /run/billet/locks"},
-		{"a unit from before, through /var/run", "/var/run/billet/locks", loaded("billet/locks billet/registration"), nil,
-			lockDirHost{aliases: varRun}, "locks    WARNING: billet-node.service declares /run/billet/locks"},
 		{"a parent declared", "/run/billet/locks", loaded("billet"), nil, lockDirHost{},
 			"locks    WARNING: billet-node.service declares /run/billet as a RuntimeDirectory"},
 		{"a lock directory elsewhere", "/var/lock/billet", loaded("billet/locks billet/registration"), nil, lockDirHost{},
@@ -185,6 +189,24 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 
 	if got, asked := reportedLockDir(t, "", nil, nil, lockDirHost{}); got != "" || asked != nil {
 		t.Errorf("with no lock_dir it reported %q and asked %q, want neither", got, asked)
+	}
+}
+
+// BOTH FAULTS ARE SAID WHEN BOTH APPLY: a unit from before that declares the lock
+// directory, and a lock_dir spelled through /var/run, which `billet local up`
+// refuses on the units this release ships as well; naming only the first sends
+// the operator round twice.
+func TestCheckNamesTheSpellingBesideAUnitFromBefore(t *testing.T) {
+	props := map[string][]string{"LoadState": {"loaded"}, "RuntimeDirectory": {"billet/locks billet/registration"}}
+	host := lockDirHost{aliases: map[string]string{"/var/run/billet/locks": "/run/billet/locks"}}
+
+	got, _ := reportedLockDir(t, "/var/run/billet/locks", props, nil, host)
+
+	lines := strings.Split(strings.TrimSuffix(got, "\n"), "\n")
+	if len(lines) != 2 ||
+		!strings.HasPrefix(lines[0], "locks    WARNING: billet-node.service declares /run/billet/locks as a RuntimeDirectory") ||
+		!strings.HasPrefix(lines[1], "locks    WARNING: /var/run/billet/locks is not /run/billet/locks") {
+		t.Fatalf("reported %q, want the declaration and then the spelling", got)
 	}
 }
 
