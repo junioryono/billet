@@ -361,13 +361,24 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 			"(serve at statement %d of %d)", served, len(body))
 	}
 
-	if !calls(body[served+1], "LeadershipLost") || calls(body[served+1], "Close") {
-		t.Error("the statement after the serving is not the fence read alone")
+	// THE READ ALONE, AND RETURNED AS IT WAS READ: `fenced := cp.LeadershipLost()`,
+	// whose identifier is the return's first result, so nothing between can
+	// qualify the latch away.
+	read, ok := body[served+1].(*ast.AssignStmt)
+	if !ok || len(read.Lhs) != 1 || len(read.Rhs) != 1 {
+		t.Fatal("the statement after the serving is not an assignment of the fence read")
+	}
+
+	fenceName, okName := read.Lhs[0].(*ast.Ident)
+
+	readCall, okCall := read.Rhs[0].(*ast.CallExpr)
+	if !okName || !okCall || calleeName(readCall) != "LeadershipLost" || len(readCall.Args) != 0 {
+		t.Fatal("the statement after the serving is not `fenced := cp.LeadershipLost()`")
 	}
 
 	ret, ok := body[served+2].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) != 2 {
-		t.Fatal("runControlPlane does not end in a return of the fence and an error")
+	if !ok || len(ret.Results) != 2 || !isIdent(ret.Results[0], fenceName.Name) {
+		t.Fatal("runControlPlane does not end in a return of the fence it read and an error")
 	}
 
 	closing, ok := ret.Results[1].(*ast.CallExpr)
