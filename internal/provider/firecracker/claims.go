@@ -330,8 +330,10 @@ func (p *Provider) removeTap(ctx context.Context, res resources, jailID string) 
 //   - No claim on the name, or one naming another jail: nothing here is this
 //     microVM's. Nothing is deleted and nothing kept.
 //   - No device: nothing to delete. The name goes back.
-//   - A device that is not provably billet's: left alone, and its name kept out of
-//     the pool, because a launch handed it would fail on the device too.
+//   - A device that is not billet's (no owner, or one outside the jail uid range):
+//     left alone, and its name kept out of the pool, because a launch handed it would
+//     fail on the device too.
+//   - A tap owned by a jail uid another microVM holds now: could not tell (below).
 //   - billet's device: deleted, and the name goes back only if it went.
 //   - Anything that could not be read: could not tell, which is not permission.
 //     Nothing is deleted and the name is kept for a later teardown to judge.
@@ -403,7 +405,18 @@ func (p *Provider) ownedByJail(owner int, jailID string) (bool, error) {
 
 	switch {
 	case err == nil:
-		return strings.TrimSpace(string(raw)) == jailID, nil
+		holder := strings.TrimSpace(string(raw))
+		if holder == jailID {
+			return true, nil
+		}
+
+		// HELD BY ANOTHER MICROVM IS NOT PROOF OF FOREIGN. A teardown that kept this
+		// stuck tap's name gave its uid back, and another launch may hold it now, so the
+		// tap may well be this jail's. Could not tell, which keeps the name and the
+		// lease's lifecycle authority, so a teardown after that uid is released again
+		// can prove the tap billet's and finish.
+		return false, fmt.Errorf("firecracker: could not tell whether the tap owned by uid %d is "+
+			"%s's: %s holds that uid now", owner, jailID, bounded(holder))
 	case !errors.Is(err, os.ErrNotExist):
 		return false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
 	}
