@@ -483,12 +483,42 @@ func TestAPromotionRefusedAfterItsMigrationSaysWhatItMoved(t *testing.T) {
 		t.Fatalf("a standby refused after migrating could write; got %v", err)
 	}
 
+	// AND ITS READS RE-CHECK THE SCHEMA AGAIN, because with the exclusion given
+	// back another controller can migrate under it.
+	if !standby.revalidate.Load() {
+		t.Error("a refused promotion left the standby's reads without their schema re-check")
+	}
+
+	// THE MOVE STAYS THIS HANDLE'S UNTIL A CLAIM LANDS: a later attempt stopped
+	// before it does still says what moved.
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	_, err = standby.ClaimController(stopped, "standby", testDeployment)
+	if moved, ok := errors.AsType[*SchemaMoved](err); !ok || StoppedBy(stopped, err) {
+		t.Errorf("a stopped retry after a refused promotion forgot what it moved (%+v): %v", moved, err)
+	}
+
 	plane, err := OpenPostgres(t.Context(), t.TempDir(), dsn)
 	if err != nil {
 		t.Fatalf("a controller could not start after a refused promotion released nothing: %v", err)
 	}
 
 	t.Cleanup(func() { _ = plane.Close() })
+
+	// AND SO DOES A WAIT STOPPED BEHIND THE CONTROLLER THAT TOOK OVER.
+	waiting, stopWaiting := context.WithCancel(t.Context())
+	defer stopWaiting()
+
+	_, err = standby.AwaitController(waiting, "standby", testDeployment,
+		func(ControllerClaim) { stopWaiting() })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a stopped wait returned %v", err)
+	}
+
+	if moved, ok := errors.AsType[*SchemaMoved](err); !ok || StoppedBy(waiting, err) {
+		t.Errorf("a wait stopped after a refused promotion forgot what it moved (%+v): %v", moved, err)
+	}
 }
 
 // THE STOP IS THE CONTEXT'S OWN REASON AND NOTHING ELSE. Each case is a way a

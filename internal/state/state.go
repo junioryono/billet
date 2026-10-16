@@ -125,13 +125,14 @@ type DB struct {
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
 
-	// unclaimedMove is what this handle's open migrated, until a claim records
-	// this release in the watermark and the move becomes the deployment's: from
-	// then on an older billet is refused by the mark anyway. Every claim that
-	// fails before that joins it, so a control plane that opened, migrated and
-	// was stopped before it held the claim does not report a clean stop. Set by
-	// openDir before the handle is returned and touched afterwards only by
-	// ClaimController, which one goroutine calls.
+	// unclaimedMove is what this handle migrated, at its open or at a promotion
+	// that did not complete, until a claim records this release in the
+	// watermark and the move becomes the deployment's: from then on an older
+	// billet is refused by the mark anyway. Every claim that fails before that
+	// joins it, so a control plane that migrated and was stopped before it held
+	// the claim does not report a clean stop. Set by openDir before the handle is
+	// returned and touched afterwards only by ClaimController and AwaitController,
+	// which one goroutine calls.
 	unclaimedMove *SchemaMoved
 
 	// inspect marks a handle opened for a report, whose every write transaction

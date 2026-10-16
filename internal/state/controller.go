@@ -199,8 +199,12 @@ func (db *DB) ClaimController(
 	// can write anyway, which is the exact hole the latch exists to close.
 	wasStandby := db.standby.Swap(false)
 
+	// AND SO DOES THE SCHEMA RE-CHECK a standby's reads depend on: once the
+	// exclusion is given back another controller can migrate under this handle
+	// again.
 	restore := func(err error) (ControllerClaim, error) {
 		if wasStandby {
+			db.revalidate.Store(true)
 			db.standby.Store(true)
 		}
 
@@ -228,16 +232,17 @@ func (db *DB) ClaimController(
 		// promote onto a ledger no controller has ever migrated.
 		db.revalidate.Store(false)
 
+		// KEPT ON THE HANDLE as well as joined below, so a later attempt from this
+		// same handle that fails still reports it.
 		promoted, err := db.migrate(ctx)
-		if err != nil {
-			db.revalidate.Store(true)
-
-			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err),
-				promoted.orNil()))
-		}
-
 		if promoted != nil {
 			moved = promoted
+			db.unclaimedMove = promoted
+		}
+
+		if err != nil {
+			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err),
+				promoted.orNil()))
 		}
 	}
 
@@ -344,7 +349,9 @@ func (db *DB) AwaitController(
 		case <-ctx.Done():
 			wait.Stop()
 
-			return ControllerClaim{}, fmt.Errorf("state: waiting for the controller claim: %w", ctx.Err())
+			return ControllerClaim{}, errors.Join(
+				fmt.Errorf("state: waiting for the controller claim: %w", ctx.Err()),
+				db.unclaimedMove.orNil())
 		case <-wait.C:
 		}
 	}
