@@ -67,6 +67,14 @@ func (h *fakeHost) Migrate(context.Context) error     { return h.record("migrate
 func (h *fakeHost) ProbeReady(context.Context) error  { return h.record("probe") }
 func (h *fakeHost) ProveStable(context.Context) error { return h.record("prove-stable") }
 
+func (h *fakeHost) RestartUplink(context.Context) error {
+	if h.rollingBack {
+		return h.record("restart-uplink-rollback")
+	}
+
+	return h.record("restart-uplink")
+}
+
 func (h *fakeHost) PreserveCurrent(_ context.Context, _ string) error {
 	return h.record("preserve")
 }
@@ -193,6 +201,10 @@ func TestAHealthyUpgradeRunsInOrder(t *testing.T) {
 		"clear-fence",
 		"start-services",
 		"prove-stable",
+		// THE UPLINK SHAPER LAST, once the binary it should run is final: it is a
+		// billet process nothing above stops, and it would otherwise go on running
+		// the release this replaced.
+		"restart-uplink",
 	}
 
 	if !slices.Equal(h.did, want) {

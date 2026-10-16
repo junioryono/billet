@@ -445,6 +445,26 @@
           - billet_finalization_names.index('Prove committed services are stably active') < billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup')
           - billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup') < billet_finalization_names.index('Durably close the host-upgrade transaction')
 
+    # THE UPLINK SHAPER IS STOPPED BEFORE THE EXECUTABLE IS HIDDEN, by the
+    # transaction and by its recovery, and started again after the services are
+    # proved; a start that fails is said and fails nothing, because the shaper is
+    # not what the transaction upgraded.
+    - name: Require the uplink shaper to leave and return around the binary without deciding the transaction
+      vars:
+        billet_uplink_restart: "{{ billet_host_finalization_tasks | selectattr('name', 'equalto', 'Start the uplink shaper again after the transaction') | first }}"
+      ansible.builtin.assert:
+        that:
+          - billet_upgrade_names.index('Stop the uplink shaper for the transaction') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
+          - billet_recovery_names.index('Stop the uplink shaper before recovering the ledger') < billet_recovery_names.index('Hide the installed executable while recovery owns the ledger')
+          - billet_finalization_names.index('Prove committed services are stably active') < billet_finalization_names.index('Start the uplink shaper again after the transaction')
+          - billet_finalization_names.index('Start the uplink shaper again after the transaction') < billet_finalization_names.index('Say the uplink shaper did not start again after the transaction')
+          - billet_finalization_names.index('Say the uplink shaper did not start again after the transaction') < billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup')
+          - billet_uplink_restart.failed_when | default(true) is false
+          - billet_uplink_restart.register == 'billet_uplink_started_after_upgrade'
+        fail_msg: >-
+          The uplink shaper must stop before the executable is hidden, start again after the services are
+          proved, and a failed start must be reported without failing the transaction.
+
     - name: Require recovery to exclude processes before restoring state
       ansible.builtin.assert:
         that:

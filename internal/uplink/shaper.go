@@ -78,6 +78,10 @@ type state struct {
 	// ingress is an ingress qdisc, clsact one of the kind that also carries
 	// ingress filters, and ifb whether the shaper's device exists.
 	ingress, clsact, ifb bool
+	// missing is tc saying no interface has the name: nothing was inspected on
+	// it, which a caller that asked about a name rather than a record must not
+	// read as an interface carrying nothing.
+	missing bool
 }
 
 func (s *Shaper) inspect(ctx context.Context) (state, error) {
@@ -86,15 +90,16 @@ func (s *Shaper) inspect(ctx context.Context) (state, error) {
 	// AN INTERFACE THAT IS GONE TOOK ITS QDISCS WITH IT, and is not a failure to
 	// inspect: only the IFB device can be left, and it is still found below.
 	// Measured on the reference node: tc answers `Cannot find device "NAME"`.
+	missing := false
 	if err != nil && strings.Contains(out, "Cannot find device") {
-		out, err = "", nil
+		out, err, missing = "", nil, true
 	}
 
 	if err != nil {
 		return state{}, err
 	}
 
-	st := state{kernel: true}
+	st := state{kernel: true, missing: missing}
 
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
