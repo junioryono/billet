@@ -1006,7 +1006,13 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 			output := filepath.Join(t.TempDir(), "github-output")
 			cmd := exec.CommandContext(t.Context(), planner)
 			cmd.Dir = repository
-			cmd.Env = append(os.Environ(), "REQUESTED="+tc.requested, "GITHUB_OUTPUT="+output)
+			// WITHOUT AN INHERITED PROTOCOL, so the case that leaves it out does.
+			cmd.Env = []string{"REQUESTED=" + tc.requested, "GITHUB_OUTPUT=" + output}
+			for _, kv := range os.Environ() {
+				if !strings.HasPrefix(kv, "BILLET_CUT_PROTOCOL=") {
+					cmd.Env = append(cmd.Env, kv)
+				}
+			}
 			if !tc.unconfirmed {
 				cmd.Env = append(cmd.Env, "BILLET_CUT_PROTOCOL=preview-confirm")
 			}

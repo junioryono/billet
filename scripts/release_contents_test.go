@@ -137,6 +137,12 @@ func newReleaseFixture(t *testing.T) releaseFixture {
 		"README.md": "billet, placed\n",
 	})
 
+	// AND A MIGRATION WITH A TAB IN ITS NAME, which the status and the path are
+	// split around, so its commit is marked only if the whole name survives.
+	squashed("State: Add a tabbed migration (#16)", map[string]string{
+		"internal/state/migrations/0004_tab\tname.sql": "ALTER TABLE a ADD v;\n",
+	})
+
 	return releaseFixture{
 		repo:      repo,
 		candidate: strings.TrimSpace(gitOutput(t, repo, "rev-parse", "HEAD")),
@@ -237,7 +243,7 @@ func TestTheReleaseReportSaysWhatTheReleaseCarries(t *testing.T) {
 		t.Errorf("a preview wrote %q to GITHUB_OUTPUT, want confirmed=false", written)
 	}
 
-	banner := strings.Index(report, "**This release migrates the ledger, and it cannot be rolled back.** It adds 1 migration(s)")
+	banner := strings.Index(report, "**This release migrates the ledger, and it cannot be rolled back.** It adds 2 migration(s)")
 	flagged := strings.Index(report, "### Flagged")
 	if banner < 0 || flagged < 0 || banner > flagged {
 		t.Fatalf("the migration is not announced ahead of the changes:\n%s", report)
@@ -246,6 +252,7 @@ func TestTheReleaseReportSaysWhatTheReleaseCarries(t *testing.T) {
 	for _, want := range []string{
 		"> - `internal/state/migrations/0003_window.sql`\n",
 		"> - `internal/state/pgmigrations/0003_window.sql`\n",
+		"> - `internal/state/migrations/0004_tab\tname.sql`\n",
 		"**This release changes or removes a migration an earlier release published.**",
 		"> - `internal/state/migrations/0001_init.sql` (M)\n",
 		"`v0.4.1` is on another branch",
@@ -270,6 +277,7 @@ func TestTheReleaseReportSaysWhatTheReleaseCarries(t *testing.T) {
 		"- **scheduler**: Listener: Serve the scale set (#11) (`",
 		"- **node wire**: Plane: Answer a node (#12) (`",
 		"- **node wire**: Client: Ask the plane (#13) (`",
+		"- **ledger schema**: State: Add a tabbed migration (#16) (`",
 	} {
 		if !strings.Contains(flags, want) {
 			t.Errorf("the flagged changes are missing %q:\n%s", want, flags)
@@ -285,7 +293,7 @@ func TestTheReleaseReportSaysWhatTheReleaseCarries(t *testing.T) {
 		}
 	}
 
-	areas := section(t, report, "### By area (14 changes)")
+	areas := section(t, report, "### By area (15 changes)")
 	for _, want := range []string{
 		"#### Capacity\n\n- Capacity: Place by name (#10) (`",
 		"#### Other\n\n- fix a typo (`",
@@ -667,6 +675,7 @@ func TestCutReleaseCutsOnlyWhatItsReportConfirmed(t *testing.T) {
 	}
 
 	if report.ID != "contents" || report.Env["CONFIRM"] != "${{ inputs.confirm }}" ||
+		report.Env["TAG"] != "${{ steps.plan.outputs.tag }}" ||
 		report.Env["PREVIOUS"] != "${{ steps.plan.outputs.previous }}" ||
 		report.Env["CANDIDATE"] != "${{ steps.candidate.outputs.commit }}" {
 		t.Errorf("the report step is not wired to the plan, the candidate and the confirmation: %+v", report)
@@ -679,6 +688,21 @@ func TestCutReleaseCutsOnlyWhatItsReportConfirmed(t *testing.T) {
 
 	if cutIt.If != "steps.contents.outputs.confirmed == 'true'" {
 		t.Errorf("the cut step runs on %q, want only a confirmation", cutIt.If)
+	}
+
+	// THE CUT USES WHAT THE REPORT WAS GIVEN: the planned tag the confirmation
+	// named, and the candidate it read. A literal or another step's value here
+	// would cut one thing after confirming another.
+	for name, want := range map[string]string{
+		"TAG":                "${{ steps.plan.outputs.tag }}",
+		"BRANCH":             "${{ steps.plan.outputs.branch }}",
+		"COLLECTION_VERSION": "${{ steps.plan.outputs.collection_version }}",
+		"CANDIDATE":          "${{ steps.candidate.outputs.commit }}",
+		"EXISTING":           "${{ steps.candidate.outputs.existing }}",
+	} {
+		if cutIt.Env[name] != want {
+			t.Errorf("the cut step's %s is %q, want %q", name, cutIt.Env[name], want)
+		}
 	}
 
 	if !strings.Contains(cutIt.Run, `git tag -a "${TAG}"`) {

@@ -112,9 +112,13 @@ fi
 git diff -z --no-renames --name-status "$base" "$candidate" -- \
 	internal/state/migrations internal/state/pgmigrations | tr '\0' '\n' | paste - - >"$work/schema"
 
-awk -F '\t' '$1 == "A" { print $2 }' "$work/schema" >"$work/added"
-awk -F '\t' '$1 != "A" { print $1 "\t" $2 }' "$work/schema" >"$work/altered"
-awk -F '\t' '{ print $2 }' "$work/schema" >"$work/schema-files"
+# THE PATH IS EVERYTHING AFTER THE FIRST TAB, which paste put between the status
+# and the path; a tab inside the path itself stays part of it.
+awk '{ status = $0; sub(/\t.*/, "", status); path = $0; sub(/^[^\t]*\t/, "", path); if (status == "A") print path }' \
+	"$work/schema" >"$work/added"
+awk '{ status = $0; sub(/\t.*/, "", status); path = $0; sub(/^[^\t]*\t/, "", path); if (status != "A") print status "\t" path }' \
+	"$work/schema" >"$work/altered"
+awk '{ sub(/^[^\t]*\t/, ""); print }' "$work/schema" >"$work/schema-files"
 
 if [ -s "$work/added" ]; then
 	{
