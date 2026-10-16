@@ -103,7 +103,8 @@ func (a *vmmAPI) put(ctx context.Context, path string, body any) error {
 	return a.call(ctx, http.MethodPut, path, body, nil)
 }
 
-// patch replaces the backing path of a drive the guest has left unmounted.
+// patch changes a resource the VMM already has: a drive's backing path, or the
+// microVM's run state.
 func (a *vmmAPI) patch(ctx context.Context, path string, body any) error {
 	return a.call(ctx, http.MethodPatch, path, body, nil)
 }

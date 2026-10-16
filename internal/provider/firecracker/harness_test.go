@@ -50,6 +50,11 @@ type fakeVMM struct {
 	// dieOnStart makes the VMM stop answering when it is told to start, which is
 	// the measured shape of a boot that fails after the jailer has already exited 0.
 	dieOnStart bool
+	// ignoreResumeFlag makes a snapshot load leave the guest running even when it
+	// was asked to load it paused, which is the shape a restore must refuse.
+	ignoreResumeFlag bool
+	// stayPausedOnResume makes a resume answer success and leave the guest paused.
+	stayPausedOnResume bool
 
 	listener net.Listener
 	server   *http.Server
@@ -139,6 +144,26 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	v.puts = append(v.puts, recordedPut{method: r.Method, path: r.URL.Path, body: body})
 
+	// THE RUN STATE A REAL VMM KEEPS, measured on v1.16.1: a paused load reports
+	// Paused, PATCH /vm moves between Paused and Running, and GET / says which.
+	switch r.URL.Path {
+	case "/vm":
+		switch body["state"] {
+		case statePaused:
+			v.state = statePaused
+		case stateResumed:
+			if !v.stayPausedOnResume {
+				v.state = stateRunning
+			}
+		}
+	case "/snapshot/load":
+		if resume, isBool := body["resume_vm"].(bool); (isBool && resume) || v.ignoreResumeFlag {
+			v.state = stateRunning
+		} else {
+			v.state = statePaused
+		}
+	}
+
 	if r.URL.Path == "/actions" {
 		action, isString := body["action_type"].(string)
 
@@ -154,6 +179,14 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// currentState is the run state the VMM would report now.
+func (v *fakeVMM) currentState() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.state
 }
 
 // pathsPut lists the configuration calls in the order they arrived.
