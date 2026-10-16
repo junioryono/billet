@@ -12,10 +12,23 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/guestagent"
 )
 
 // monitorMode is what the stand-in for `billet guest monitor` does once started.
 type monitorMode int
+
+// stopGuard is the most seconds the agent's stop block may take in any case, and
+// the stop block's own deadline is set far past it wherever that deadline is not
+// what is measured. The 3 s the monitor owes is then the only wait the stop can
+// mean, so a case that must not wait for it cannot be confused with one that
+// did by how slowly a loaded machine starts processes: "the stop took 4.16s,
+// want between 0.00s and 1.00s" was a loaded Mac and not a wait (#188).
+const stopGuard = 30.0
+
+// monitorDeadline is the stop block's 3 s, as the agent spells it.
+const monitorDeadline = "+ 3000000))"
 
 const (
 	// monitorFlushes takes a second over its final batch on SIGTERM, then exits 0.
@@ -80,37 +93,41 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 		sleepFails bool // the agent's sleep fails while it waits
 		jobStatus  int
 		started    bool
-		// The seconds the agent spends in its stop block.
-		atLeast, atMost float64
-		flushed         bool // the monitor's final batch was finished before the helper ran
+		// The fewest seconds the agent spends in its stop block; the most is
+		// stopGuard.
+		atLeast float64
+		// realDeadline runs the stop block with its own 3 s deadline; every other
+		// case has it moved past stopGuard, so a wait for it is a failure.
+		realDeadline bool
+		flushed      bool // the monitor's final batch was finished before the helper ran
 	}{
 		{name: "asked, and it flushes on SIGTERM", key: "1", endpoint: endpoint, token: token,
-			mode: monitorFlushes, jobStatus: 0, started: true, atLeast: 0.9, atMost: 2.5, flushed: true},
+			mode: monitorFlushes, jobStatus: 0, started: true, atLeast: 0.9, flushed: true},
 		{name: "asked, for a failed job", key: "1", endpoint: endpoint, token: token,
-			mode: monitorFlushes, jobStatus: 3, started: true, atLeast: 0.9, atMost: 2.5, flushed: true},
+			mode: monitorFlushes, jobStatus: 3, started: true, atLeast: 0.9, flushed: true},
 		{name: "asked, and it fails at once", key: "1", endpoint: endpoint, token: token,
-			mode: monitorFails, jobStatus: 3, started: true, atMost: 1},
+			mode: monitorFails, jobStatus: 3, started: true},
 		{name: "asked, and it ignores SIGTERM", key: "1", endpoint: endpoint, token: token,
-			mode: monitorHangs, jobStatus: 0, started: true, atLeast: 2.9, atMost: 3.8},
+			mode: monitorHangs, jobStatus: 0, started: true, atLeast: 2.9, realDeadline: true},
 		{name: "asked, but the image carries no hook", key: "1", endpoint: endpoint, token: token,
-			mode: monitorFlushes, noHook: true, jobStatus: 0, started: true, atLeast: 0.9, atMost: 2.5,
+			mode: monitorFlushes, noHook: true, jobStatus: 0, started: true, atLeast: 0.9,
 			flushed: true},
 		// A FAILED SLEEP UNDER set -e would otherwise end the agent before the image
 		// store is settled; it ends the wait instead, and the monitor is killed.
 		{name: "asked, and the agent's sleep fails", key: "1", endpoint: endpoint, token: token,
-			mode: monitorHangs, sleepFails: true, jobStatus: 3, started: true, atMost: 1},
-		{name: "not asked", key: "absent", endpoint: endpoint, token: token, jobStatus: 0, atMost: 1},
+			mode: monitorHangs, sleepFails: true, jobStatus: 3, started: true},
+		{name: "not asked", key: "absent", endpoint: endpoint, token: token, jobStatus: 0},
 		{name: "the key could not be read", key: "unreadable", endpoint: endpoint, token: token,
-			jobStatus: 3, atMost: 1},
+			jobStatus: 3},
 		{name: "the key says something other than 1", key: "0", endpoint: endpoint, token: token,
-			jobStatus: 0, atMost: 1},
-		{name: "asked, with no cache endpoint", key: "1", token: token, jobStatus: 3, atMost: 1},
-		{name: "asked, with no bearer", key: "1", endpoint: endpoint, jobStatus: 0, atMost: 1},
+			jobStatus: 0},
+		{name: "asked, with no cache endpoint", key: "1", token: token, jobStatus: 3},
+		{name: "asked, with no bearer", key: "1", endpoint: endpoint, jobStatus: 0},
 		{name: "asked, with no billet in the image", key: "1", endpoint: endpoint, token: token,
-			notExec: true, jobStatus: 0, atMost: 1},
+			notExec: true, jobStatus: 0},
 		// A NEWLINE WOULD BE A SECOND VARIABLE in the monitor's environment.
 		{name: "asked, with a bearer holding a newline", key: "1", endpoint: endpoint,
-			token: token + "\nINJECTED=1", jobStatus: 0, atMost: 1},
+			token: token + "\nINJECTED=1", jobStatus: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -180,6 +197,11 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 				answer = "printf '%s' " + shellQuote(tc.key)
 			}
 
+			stop := tail
+			if !tc.realDeadline {
+				stop = pastTheGuard(t, tail)
+			}
+
 			script := strings.Join([]string{
 				"set -euo pipefail",
 				`PATH="` + fakes + `:$PATH"`,
@@ -204,11 +226,13 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 				"fi",
 				"job_status=" + strconv.Itoa(tc.jobStatus),
 				`printf 'stop_begin=%s\n' "$EPOCHREALTIME"`,
-				strings.ReplaceAll(tail, "/usr/local/bin/billet-docker-cache", dockerCache),
+				strings.ReplaceAll(stop, "/usr/local/bin/billet-docker-cache", dockerCache),
 			}, "\n")
 
-			// A MONITOR THE AGENT WAITS ON FOREVER FAILS HERE rather than holding the suite.
-			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			// A MONITOR THE AGENT WAITS ON FOREVER FAILS HERE rather than holding the
+			// suite; past the moved deadline, so a stop that waited for it ends and
+			// is measured.
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 			defer cancel()
 			run := exec.CommandContext(ctx, "bash", "-c", script)
 			// A monitor left running holds the output pipes open after bash exits.
@@ -253,9 +277,17 @@ func TestTheGuestMonitorStartsOnlyWhenAskedAndNeverChangesTheJob(t *testing.T) {
 			}
 
 			stopped := stopDuration(t, string(output))
-			if stopped < tc.atLeast || stopped > tc.atMost {
+			if stopped < tc.atLeast || stopped > stopGuard {
 				t.Errorf("the stop took %.2fs, want between %.2fs and %.2fs:\n%s",
-					stopped, tc.atLeast, tc.atMost, output)
+					stopped, tc.atLeast, stopGuard, output)
+			}
+
+			// THE KILL IS FOR A MONITOR THAT IGNORED SIGTERM AND NO OTHER: it is the
+			// stop block's own account of how its wait ended, which no load moves.
+			const killed = "the guest monitor did not exit within 3 s of SIGTERM; killing it"
+			if got := strings.Contains(string(output), killed); got != (tc.mode == monitorHangs && tc.started) {
+				t.Errorf("the stop killed the monitor=%v, want %v:\n%s", got,
+					tc.mode == monitorHangs && tc.started, output)
 			}
 			if got := strings.Contains(completed[0], "flushed=yes"); got != tc.flushed {
 				t.Errorf("the monitor's final batch was finished before the image store was "+
@@ -361,23 +393,35 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 			strings.Count(string(raw), installed))
 	}
 
+	// THE HOOK'S BOUND IS OUTSIDE THE FLUSH'S 2 S, never inside it, read from the
+	// hook as installed: a bound measured against a stand-in's sleep is a race with
+	// how fast the machine starts it.
+	const bound = `timeout -k 1 3 "$billet" guest flush`
+	if strings.Count(string(raw), bound) != 1 || 3*time.Second <= guestagent.FlushWait {
+		t.Fatalf("the hook does not bound the flush by %q, outside the flush's own %s", bound, guestagent.FlushWait)
+	}
+
 	for _, tc := range []struct {
 		name     string
 		body     string        // the stand-in billet; empty means there is none
 		atMost   time.Duration // 0 leaves the time unchecked
 		finishes bool          // the stand-in leaves <billet>.done once it has finished
+		// unbounded runs the hook with its bound moved far past the guard, where
+		// what is asserted is that the hook waits for the flush, not how long.
+		unbounded bool
 	}{
 		{name: "the monitor answers", body: "exit 0\n"},
-		// A FLUSH THAT TAKES WELL OVER A SECOND IS LET FINISH: the hook's own bound
-		// is outside the flush's 2 s, never inside it. 1.5 s leaves the hook's 3 s
-		// half again for a loaded runner's scheduling.
-		{name: "the monitor answers late", body: "/bin/sleep 1.5\n: >\"$0.done\"\nexit 0\n", finishes: true},
+		// A FLUSH THAT TAKES WELL OVER A SECOND IS LET FINISH, which a hook that
+		// went on without it would not; the hook's own 3 s is not what is timed here.
+		{name: "the monitor answers late", body: "/bin/sleep 1.5\n: >\"$0.done\"\nexit 0\n",
+			finishes: true, unbounded: true},
 		{name: "no monitor answers", body: "echo 'no monitor answered' >&2\nexit 1\n"},
 		{name: "the binary talks", body: "echo out\necho err >&2\nexit 0\n"},
-		// timeout -k 1 3 ends it at 4 s. The stand-in is run once before it is timed,
-		// because the first exec of a freshly written file can take seconds on a Mac.
+		// timeout -k 1 3 ends it at 4 s; the guard is far past that, so this
+		// catches a bound that does not end a binary ignoring SIGTERM rather than
+		// one a loaded machine took a second longer over.
 		{name: "the binary hangs through SIGTERM",
-			body: "trap '' TERM\nwhile :; do /bin/sleep 0.05; done\n", atMost: 5 * time.Second},
+			body: "trap '' TERM\nwhile :; do /bin/sleep 0.05; done\n", atMost: 30 * time.Second},
 		{name: "there is no binary"},
 	} {
 		for _, shell := range [][]string{{"sh"}, {"bash", "-e"}} {
@@ -398,13 +442,17 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 					}
 				}
 				hook := filepath.Join(dir, "job-completed-hook.sh")
+				installedHook := string(raw)
+				if tc.unbounded {
+					installedHook = strings.Replace(installedHook, "timeout -k 1 3 ", "timeout -k 1 600 ", 1)
+				}
 				if err := forkSafeWriteFile(hook,
-					[]byte(strings.Replace(string(raw), installed, billet, 1)), 0o755); err != nil {
+					[]byte(strings.Replace(installedHook, installed, billet, 1)), 0o755); err != nil {
 					t.Fatal(err)
 				}
 
 				// AN UNBOUNDED HOOK FAILS HERE rather than holding the suite.
-				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 				defer cancel()
 				run := exec.CommandContext(ctx, shell[0], append(shell[1:], hook)...)
 				run.WaitDelay = 2 * time.Second
@@ -533,6 +581,22 @@ func monitorStopTail(t *testing.T) string {
 	}
 
 	return strings.Replace(tail, end, end+`printf 'stop_end=%s\n' "$EPOCHREALTIME"`+"\n", 1)
+}
+
+// pastTheGuard is the agent's tail with the stop block's 3 s deadline, and its
+// poll-count backstop, moved far past stopGuard.
+func pastTheGuard(t *testing.T, tail string) string {
+	t.Helper()
+
+	const polls = `"$guest_monitor_polls" -lt 100 ]`
+	if strings.Count(tail, monitorDeadline) != 1 || strings.Count(tail, polls) != 1 {
+		t.Fatalf("the stop block no longer spells its 3 s deadline as %q and its backstop as %q",
+			monitorDeadline, polls)
+	}
+
+	moved := strings.Replace(tail, monitorDeadline, "+ 120000000))", 1)
+
+	return strings.Replace(moved, polls, `"$guest_monitor_polls" -lt 4000 ]`, 1)
 }
 
 // fakeMonitor is a stand-in for `billet guest monitor` that records its argv and

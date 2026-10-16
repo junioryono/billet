@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -35,6 +36,12 @@ func bootScriptFunction(t *testing.T, name string) string {
 	return source[start : start+end+2]
 }
 
+// watchGuard is the longest a watch may run before the test fails. It is a
+// failure deadline, never a condition: the stand-in guest outlives it, so a watch
+// that waited for the guest rather than for its own verdict is still running at
+// it, and every timeout a test does not mean to reach is far past it.
+const watchGuard = 2 * time.Minute
+
 // watchConsole runs watch_console against a console file that later is appended
 // to after the given delay, with a live guest process, and returns what it saw.
 func watchConsole(t *testing.T, first, later string, delay time.Duration, timeout int) string {
@@ -47,7 +54,7 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 		t.Fatal(err)
 	}
 
-	guest := exec.CommandContext(t.Context(), "sleep", "60")
+	guest := exec.CommandContext(t.Context(), "sleep", "600")
 	if err := guest.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +101,18 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 		t.Fatal(err)
 	}
 
-	out, err := exec.CommandContext(t.Context(), "bash", path, console,
-		strconv.Itoa(guest.Process.Pid), strconv.Itoa(timeout)).CombinedOutput()
+	ctx, cancel := context.WithTimeout(t.Context(), watchGuard)
+	defer cancel()
+
+	watch := exec.CommandContext(ctx, "bash", path, console,
+		strconv.Itoa(guest.Process.Pid), strconv.Itoa(timeout))
+	watch.WaitDelay = 5 * time.Second
+
+	out, err := watch.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("watch_console was still waiting after %s:\n%s", watchGuard, out)
+	}
+
 	if err != nil {
 		t.Fatalf("watch_console did not run to its verdict: %v\n%s", err, out)
 	}
@@ -116,40 +133,32 @@ const (
 func TestTheBootWatchWaitsForTheTargetAfterTheAgentAnswers(t *testing.T) {
 	t.Parallel()
 
-	got := watchConsole(t, agentRefusal, multiUser, 2*time.Second, 30)
+	got := watchConsole(t, agentRefusal, multiUser, 2*time.Second, 600)
 	if got != "multiuser=1 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q, want both the target and the agent seen", got)
 	}
 }
 
-// AND A TARGET THAT NEVER COMES IS STILL A FAILURE, within the timeout.
+// AND A TARGET THAT NEVER COMES IS STILL A FAILURE, within the timeout: the
+// guest outlives the guard, so only the 3 s timeout ends this watch.
 func TestTheBootWatchReportsATargetThatNeverCame(t *testing.T) {
 	t.Parallel()
 
-	start := time.Now()
 	got := watchConsole(t, agentRefusal, "", 0, 3)
 
 	if got != "multiuser=0 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q, want the agent seen and the target not", got)
 	}
-
-	if elapsed := time.Since(start); elapsed > 20*time.Second {
-		t.Errorf("the watch took %s against a 3 s timeout", elapsed)
-	}
 }
 
-// THE USUAL ORDER still ends as soon as both are seen.
+// THE USUAL ORDER still ends as soon as both are seen: the timeout and the guest
+// both outlive the guard, so only seeing both ends this watch.
 func TestTheBootWatchEndsWhenBothAreSeen(t *testing.T) {
 	t.Parallel()
 
-	start := time.Now()
-	got := watchConsole(t, multiUser+agentRefusal, "", 0, 30)
+	got := watchConsole(t, multiUser+agentRefusal, "", 0, 600)
 
 	if got != "multiuser=1 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q", got)
-	}
-
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("the watch kept waiting %s after it had seen both", elapsed)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -925,7 +926,16 @@ case "$*" in
     *) exit 98 ;;
 esac
 `)
-	cmd := exec.CommandContext(t.Context(), verifier)
+	// THE ATTEMPT'S OWN TIMEOUT IS FAR PAST THE GUARD, so only the one-second
+	// deadline can end the blocked request before it: a wall-clock bound of 3 s
+	// on the run measured how fast the machine started the fakes.
+	const guard = time.Minute
+
+	ctx, cancel := context.WithTimeout(t.Context(), guard)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, verifier)
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(),
 		"PATH="+tools+":"+os.Getenv("PATH"),
 		"GITHUB_REPOSITORY=junioryono/billet",
@@ -933,15 +943,15 @@ esac
 		"RELEASE_VERIFY_ATTEMPTS=4",
 		"RELEASE_VERIFY_INTERVAL_SECONDS=0",
 		"RELEASE_VERIFY_DEADLINE_SECONDS=1",
-		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=15",
+		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=600",
 	)
-	started := time.Now()
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("blocked API request was still running after %s; the deadline did not bound it\n%s",
+			guard, output)
+	}
 	if err == nil {
 		t.Fatalf("blocked API request unexpectedly succeeded\n%s", output)
-	}
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
-		t.Fatalf("blocked API request ran for %s; want no more than 3s\n%s", elapsed, output)
 	}
 }
 

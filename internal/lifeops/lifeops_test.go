@@ -533,14 +533,16 @@ func TestASlowSystemdIsBounded(t *testing.T) {
 	a := &answers{block: make(chan struct{})}
 	t.Cleanup(func() { close(a.block) })
 
-	start := time.Now()
-	_, err := h.inspector(a, WithTimeout(50*time.Millisecond)).
-		Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
+	// BELOW DefaultTimeout, so an inspection bounded by the default rather than
+	// the configured timeout is caught as well as an unbounded one.
+	err := within(t, DefaultTimeout/2, "an inspection against a systemctl that never answers", func() error {
+		_, err := h.inspector(a, WithTimeout(50*time.Millisecond)).
+			Inspect(t.Context(), "/etc/billet/billet.yaml", nil)
+
+		return err
+	})
 	if err == nil {
 		t.Fatal("a systemctl that never answered did not time out")
-	}
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("the call was not bounded by the configured timeout: took %s", elapsed)
 	}
 }
 

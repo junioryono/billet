@@ -145,16 +145,21 @@ func TestSystemdDispatchCarriesTheUpdatersRefusal(t *testing.T) {
 
 func TestSystemdRunFailureIsReportedWithoutWaitingForAnAnswer(t *testing.T) {
 	fakeSystemdRun(t, true, "Unit billet-host-upgrade-abc123-g7.service already exists")
+
+	// FAR PAST THE GUARD, so a dispatch that went on to wait for an answer no
+	// updater will give is still waiting when the guard ends the test.
+	original := ackWait
+	ackWait = 10 * time.Minute
+
+	t.Cleanup(func() { ackWait = original })
+
 	e := ExecUpgrader{Binary: fakeUpdater(t, AckAccepted), AckDir: shortAckDir(t)}
-	start := time.Now()
-	err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.9.3"})
+	err := returnsWithinAckGuard(t, "the dispatch after systemd-run failed", func() error {
+		return e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.9.3"})
+	})
 
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("systemd-run's failure was lost: %v", err)
-	}
-
-	if time.Since(start) > 5*time.Second {
-		t.Error("the dispatch waited for an answer after systemd-run failed")
 	}
 
 	assertNoAckSockets(t, e.AckDir)

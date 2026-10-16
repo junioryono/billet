@@ -30,11 +30,17 @@ func socketDir(t *testing.T) string {
 	return dir
 }
 
-// waitFor polls cond for at most five seconds of real time.
+// socketGuard is how long a test over a real socket waits for something whose
+// bound under test is a few seconds or none. It is a failure deadline, never a
+// condition: what it waits for happens long before it however loaded the
+// machine, or never happens at all.
+const socketGuard = time.Minute
+
+// waitFor polls cond for at most socketGuard of real time.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(socketGuard)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -44,12 +50,37 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// flushWithin is Flush with a wait of its own, failing the test if it has not
+// returned by socketGuard.
+func flushWithin(t *testing.T, what, socket string, wait time.Duration) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- Flush(t.Context(), socket, wait) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(socketGuard):
+		t.Fatalf("%s had not returned after %s", what, socketGuard)
+
+		return nil
+	}
+}
+
 // The job-completed hook's flush sends the final batch and is answered once it
 // is; after it the agent sends nothing more, a second flush is answered at once,
 // and the SIGTERM that follows only ends the agent. Over a real socket and a real
 // connection to the node, through the transport the agent builds itself.
+//
+// SERIAL, because it lengthens flushAnswerWait past the guard: a connection is
+// then answered only by a finished flush, so neither answer can be the timer's,
+// and how fast a loaded machine answers is not what is measured.
 func TestASocketFlushThenSIGTERMSendsExactlyOneFinalBatch(t *testing.T) {
-	t.Parallel()
+	saved := flushAnswerWait
+	flushAnswerWait = 10 * time.Minute
+
+	t.Cleanup(func() { flushAnswerWait = saved })
 
 	node := newFakeNode(t)
 	server := httptest.NewServer(node)
@@ -81,7 +112,7 @@ func TestASocketFlushThenSIGTERMSendsExactlyOneFinalBatch(t *testing.T) {
 		return err == nil && info.Mode()&fs.ModeSocket != 0 && info.Mode().Perm() == 0o666
 	})
 
-	if err := Flush(t.Context(), socket, FlushWait); err != nil {
+	if err := flushWithin(t, "the flush", socket, flushAnswerWait); err != nil {
 		t.Fatalf("the flush was not answered: %v", err)
 	}
 
@@ -89,12 +120,14 @@ func TestASocketFlushThenSIGTERMSendsExactlyOneFinalBatch(t *testing.T) {
 		t.Fatalf("after the flush's answer, %d posts, want the final alone", len(posts))
 	}
 
-	began := time.Now()
-	if err := Flush(t.Context(), socket, FlushWait); err != nil || time.Since(began) > time.Second {
-		t.Fatalf("a second flush answered %v after %v, want at once", err, time.Since(began))
+	if err := flushWithin(t, "a second flush", socket, flushAnswerWait); err != nil {
+		t.Fatalf("a second flush answered %v, want at once", err)
 	}
 
-	stopped := time.Now()
+	// THE THREE SECONDS SIGTERM IS ANSWERED IN are proved on the bubble's clock
+	// (TestSIGTERMIsAnsweredWithinThreeSecondsWhateverHoldsTheLoop); here the
+	// guard only ends a test whose agent never returns, and that SIGTERM only
+	// ends the agent is the count of what it sent.
 	cancel()
 
 	select {
@@ -102,12 +135,8 @@ func TestASocketFlushThenSIGTERMSendsExactlyOneFinalBatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("the agent returned %v", err)
 		}
-	case <-time.NewTimer(3 * time.Second).C:
-		t.Fatal("the agent did not return within 3s of SIGTERM")
-	}
-
-	if took := time.Since(stopped); took > time.Second {
-		t.Errorf("SIGTERM after a flush took %v; it only ends the agent", took)
+	case <-time.After(socketGuard):
+		t.Fatalf("the agent did not return within %s of SIGTERM", socketGuard)
 	}
 
 	if _, posts := node.snapshot(); len(posts) != 1 || finals(posts) != 1 {
@@ -216,20 +245,17 @@ func TestTheFlushSocketListensOnlyWhereItIsSafeTo(t *testing.T) {
 
 // With no monitor listening, `billet guest flush` has nothing to wait for.
 //
-// THE BOUND IS A FRACTION OF A LONG WAIT, not a second: a failed dial took 1.87 s
-// on a loaded CI runner (2026-10-12), and what this holds is that the flush does
-// not wait out its wait, which here is a minute.
+// THE WAIT IS FAR PAST THE GUARD, not a second: a failed dial took 1.87 s on a
+// loaded CI runner (2026-10-12), and what this holds is that the flush does not
+// wait out its wait.
 func TestAFlushWithNoMonitorReturnsAtOnce(t *testing.T) {
 	t.Parallel()
 
-	const wait = time.Minute
-
 	socket := filepath.Join(socketDir(t), "absent.sock")
-	began := time.Now()
 
-	err := Flush(t.Context(), socket, wait)
-	if took := time.Since(began); !errors.Is(err, fs.ErrNotExist) || took > wait/4 {
-		t.Fatalf("answered %v after %v, want no such socket well inside the %v wait", err, took, wait)
+	err := flushWithin(t, "a flush with no monitor", socket, 10*time.Minute)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("answered %v, want no such socket", err)
 	}
 }
 
@@ -248,11 +274,13 @@ func TestAFlushWaitsNoLongerThanItsWait(t *testing.T) {
 
 	began := time.Now()
 
-	if err := Flush(t.Context(), socket, 200*time.Millisecond); err == nil {
+	// NO EARLIER THAN THE WAIT, which no load can make shorter; the guard, not a
+	// stopwatch, catches a flush that waits for an answer the monitor never sends.
+	if err := flushWithin(t, "a flush to a silent monitor", socket, 200*time.Millisecond); err == nil {
 		t.Fatal("a silent monitor answered")
 	}
 
-	if took := time.Since(began); took < 200*time.Millisecond || took > 2*time.Second {
-		t.Fatalf("waited %v, want about 200ms", took)
+	if took := time.Since(began); took < 200*time.Millisecond {
+		t.Fatalf("waited %v, want the whole 200ms", took)
 	}
 }

@@ -2,8 +2,12 @@ package lifeops
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -14,6 +18,39 @@ import (
 // not read whole; output past the bound is an error and never a truncated
 // value; a property read runs under the inspector's timeout; a stop and a
 // start run under the caller's context and nothing shorter.
+
+// runGuard is how long a test waits for a run whose bound under test is a second
+// or so. It is a failure deadline, never a condition: the stand-ins here sleep
+// for ten minutes, so a bounded run returns long before it however loaded the
+// machine, and an unbounded one is still running at it. A correct run took 5 s
+// to 12 s under a full local gate (2026-10-04 to 10-10, #188), almost all of it
+// starting processes, so a bound of a few seconds measured the machine.
+const runGuard = 2 * time.Minute
+
+// within runs call and fails the test if it has not returned by guard.
+func within[T any](t *testing.T, guard time.Duration, what string, call func() T) T {
+	t.Helper()
+
+	done := make(chan T, 1)
+	go func() { done <- call() }()
+
+	select {
+	case v := <-done:
+		return v
+	case <-time.After(guard):
+		t.Fatalf("%s had not returned after %s; nothing bounded it", what, guard)
+
+		var zero T
+
+		return zero
+	}
+}
+
+// ranOut is what a run returned.
+type ranOut struct {
+	out []byte
+	err error
+}
 
 // fakeSystemctl writes an executable answering as body says and returns its
 // path; every case here runs the real execRunner against it.
@@ -38,42 +75,40 @@ func shortWaitDelay(t *testing.T, d time.Duration) {
 }
 
 func TestARunEndsAtTheCallersDeadlineByTerm(t *testing.T) {
-	bin := fakeSystemctl(t, "exec sleep 30\n")
-	i := NewInspector(WithSystemctl(bin))
+	// THE WAIT DELAY IS AS LONG AS THE SLEEP, so only the TERM can end the run
+	// before the guard: a cancel that sent nothing would wait for the KILL.
+	bin := fakeSystemctl(t, "exec sleep 600\n")
+	i := NewInspector(WithSystemctl(bin), WithWaitDelay(10*time.Minute))
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
-	started := time.Now()
+	ran := within(t, runGuard, "a hanging stop under a one-second deadline", func() ranOut {
+		out, err := i.exec(ctx, []string{"stop", "--", "x.service"})
 
-	_, err := i.exec(ctx, []string{"stop", "--", "x.service"})
-	if err == nil || !strings.Contains(err.Error(), "the deadline ended it") {
-		t.Fatalf("a hanging stop under a one-second deadline: %v", err)
-	}
-
-	if took := time.Since(started); took > 5*time.Second {
-		t.Fatalf("the deadline took %s to end the run", took)
+		return ranOut{out, err}
+	})
+	if ran.err == nil || !strings.Contains(ran.err.Error(), "the deadline ended it") {
+		t.Fatalf("a hanging stop under a one-second deadline: %v", ran.err)
 	}
 }
 
 func TestARunThatIgnoresTermIsKilledAfterTheWaitDelay(t *testing.T) {
 	shortWaitDelay(t, 500*time.Millisecond)
 
-	bin := fakeSystemctl(t, "trap '' TERM\nexec sleep 30\n")
+	bin := fakeSystemctl(t, "trap '' TERM\nexec sleep 600\n")
 	i := NewInspector(WithSystemctl(bin))
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
-	started := time.Now()
+	ran := within(t, runGuard, "a TERM-ignoring stop under a one-second deadline", func() ranOut {
+		out, err := i.exec(ctx, []string{"stop", "--", "x.service"})
 
-	_, err := i.exec(ctx, []string{"stop", "--", "x.service"})
-	if err == nil || !strings.Contains(err.Error(), "the deadline ended it") {
-		t.Fatalf("a TERM-ignoring stop under a one-second deadline: %v", err)
-	}
-
-	if took := time.Since(started); took > 5*time.Second {
-		t.Fatalf("the kill after the wait delay took %s", took)
+		return ranOut{out, err}
+	})
+	if ran.err == nil || !strings.Contains(ran.err.Error(), "the deadline ended it") {
+		t.Fatalf("a TERM-ignoring stop under a one-second deadline: %v", ran.err)
 	}
 }
 
@@ -83,25 +118,33 @@ func TestAnOutputHeldOpenByADescendantIsNotReadWhole(t *testing.T) {
 	// The background sleep inherits stdout and keeps it open after the script
 	// exits; the run ends at the wait delay and the prefix is refused.
 	//
-	// THE SLEEP OUTLASTS THE TIME BOUND BY A WIDE MARGIN. A run that ends at the
-	// wait delay took about 0.75s alone and 5.3s to 6.1s under a full `make
-	// check` (2026-10-04, the process start being the slow part), so the 20s
-	// bound leaves room for the load measured; a run that returned the refusal
-	// only once the descendant let go would take the whole sleep and exceed it.
-	// The 5s bound failed every loaded run (#188), and a 3s sleep sat inside it,
-	// so only the error assertion could catch that regression.
-	bin := fakeSystemctl(t, "sleep 30 &\necho 'ActiveState=active'\nexit 0\n")
+	// THE SLEEP OUTLASTS THE GUARD, so a run that returned only once the
+	// descendant let go is still waiting when the guard ends the test. A run
+	// that ends at the wait delay took about 0.75s alone and 5.3s to 6.1s under
+	// a full `make check` (2026-10-04, the process start being the slow part),
+	// which a 5s bound could not tell from the regression (#188). The sleep is
+	// ended by the test, never left to outlive it.
+	pidFile := filepath.Join(t.TempDir(), "descendant")
+	bin := fakeSystemctl(t, "sleep 600 &\necho $! > '"+pidFile+"'\necho 'ActiveState=active'\nexit 0\n")
 	i := NewInspector(WithSystemctl(bin))
 
-	started := time.Now()
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					t.Errorf("end the descendant %d: %v", pid, err)
+				}
+			}
+		}
+	})
 
-	out, err := i.exec(t.Context(), []string{"show", "--", "x.service"})
-	if err == nil || !strings.Contains(err.Error(), "not read whole") || out != nil {
-		t.Fatalf("an output held open past the wait delay: %v (%q)", err, out)
-	}
+	ran := within(t, runGuard, "a run whose output a descendant holds open", func() ranOut {
+		out, err := i.exec(t.Context(), []string{"show", "--", "x.service"})
 
-	if took := time.Since(started); took > 20*time.Second {
-		t.Fatalf("the held output took %s to refuse", took)
+		return ranOut{out, err}
+	})
+	if ran.err == nil || !strings.Contains(ran.err.Error(), "not read whole") || ran.out != nil {
+		t.Fatalf("an output held open past the wait delay: %v (%q)", ran.err, ran.out)
 	}
 }
 
@@ -124,18 +167,19 @@ func TestAnOutputPastTheBoundIsAnErrorNeverATruncatedValue(t *testing.T) {
 }
 
 func TestAPropertyReadRunsUnderTheInspectorsTimeout(t *testing.T) {
-	bin := fakeSystemctl(t, "exec sleep 30\n")
+	bin := fakeSystemctl(t, "exec sleep 600\n")
 	i := NewInspector(WithSystemctl(bin), WithTimeout(500*time.Millisecond))
 
-	started := time.Now()
+	// BELOW DefaultTimeout, so a read bounded by the default rather than the
+	// inspector's own timeout is caught too; the deadline itself is compared
+	// exactly in TestAStopAndAStartRunUnderTheCallersContextAlone.
+	err := within(t, DefaultTimeout/2, "a hanging property read", func() error {
+		_, err := i.properties(t.Context(), "x.service", "ActiveState")
 
-	_, err := i.properties(t.Context(), "x.service", "ActiveState")
+		return err
+	})
 	if err == nil || !strings.Contains(err.Error(), "the deadline ended it") {
 		t.Fatalf("a hanging property read under the inspector's timeout: %v", err)
-	}
-
-	if took := time.Since(started); took > 5*time.Second {
-		t.Fatalf("the property read took %s to end", took)
 	}
 }
 
@@ -219,26 +263,40 @@ func TestAStopAndAStartRunUnderTheCallersContextAlone(t *testing.T) {
 	}
 }
 
+// THE TWO BOUNDS ARE FAR APART AND THE TWO STARTS TOO, so how fast the machine
+// starts a process decides neither answer: a start that never finishes under a
+// one-second bound, and a two-second start under a ten-minute one. A
+// two-second start against a ten-second bound took 12.68s on a loaded machine
+// (2026-10-10, #188).
 func TestASlowStartSucceedsUnderTheUnitsBoundAndFailsUnderAShorterOne(t *testing.T) {
-	bin := fakeSystemctl(t, `case "$1" in
-  start) sleep 2 ;;
+	const script = `case "$1" in
+  start) exec sleep %s ;;
   show) printf 'ActiveState=active\nSubState=running\nResult=success\nMainPID=4242\nNRestarts=0\nExecMainStartTimestampMonotonic=1\n' ;;
 esac
 exit 0
-`)
-	c := NewConverger(NewInspector(WithSystemctl(bin)), WithStabilityWait(0))
+`
+
+	hung := NewConverger(NewInspector(WithSystemctl(fakeSystemctl(t, strings.Replace(script, "%s", "600", 1)))),
+		WithStabilityWait(0))
 
 	short, cancelShort := context.WithTimeout(t.Context(), time.Second)
 	defer cancelShort()
 
-	if _, err := c.StartAndProve(short, "x.service"); err == nil || !strings.Contains(err.Error(), "the deadline ended it") {
-		t.Fatalf("a two-second start under a one-second bound: %v", err)
+	if err := within(t, runGuard, "a start under a one-second bound", func() error {
+		_, err := hung.StartAndProve(short, "x.service")
+
+		return err
+	}); err == nil || !strings.Contains(err.Error(), "the deadline ended it") {
+		t.Fatalf("a start that never finishes under a one-second bound: %v", err)
 	}
 
-	long, cancelLong := context.WithTimeout(t.Context(), 10*time.Second)
+	slow := NewConverger(NewInspector(WithSystemctl(fakeSystemctl(t, strings.Replace(script, "%s", "2", 1)))),
+		WithStabilityWait(0))
+
+	long, cancelLong := context.WithTimeout(t.Context(), 10*time.Minute)
 	defer cancelLong()
 
-	if _, err := c.StartAndProve(long, "x.service"); err != nil {
-		t.Fatalf("a two-second start under a ten-second bound: %v", err)
+	if _, err := slow.StartAndProve(long, "x.service"); err != nil {
+		t.Fatalf("a two-second start under a ten-minute bound: %v", err)
 	}
 }

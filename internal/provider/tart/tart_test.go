@@ -56,6 +56,12 @@ type stub struct {
 	// proveSays makes a non-delivery exec print exactly these bytes, which is how
 	// a guest chooses what the liveness proof reads on stdout.
 	proveSays string
+	// proveHold makes the FIRST liveness proof run, write its answer to
+	// proveOut, mark proveAnswered, and hold that answer back until proveRelease
+	// exists. A test can then change the guest between two samples by
+	// construction rather than by guessing how long a loaded machine takes to
+	// take one.
+	proveHold, proveTaken, proveOut, proveAnswered, proveRelease string
 	// listStealsMarker makes `tart list` rewrite a VM's ownership marker as it
 	// answers, which places the replacement EXACTLY between the observation and
 	// the delete. Deterministic where a sleep is not.
@@ -119,6 +125,11 @@ func newStub(t *testing.T) *stub {
 		execReflects:     filepath.Join(dir, "exec-reflects"),
 		getBlind:         filepath.Join(dir, "get-blind"),
 		proveSays:        filepath.Join(dir, "prove-says"),
+		proveHold:        filepath.Join(dir, "prove-hold"),
+		proveTaken:       filepath.Join(dir, "prove-taken"),
+		proveOut:         filepath.Join(dir, "prove-out"),
+		proveAnswered:    filepath.Join(dir, "prove-answered"),
+		proveRelease:     filepath.Join(dir, "prove-release"),
 		stopSlow:         filepath.Join(dir, "stop-slow"),
 		listStealsMarker: filepath.Join(dir, "list-steals-marker"),
 		listHangs:        filepath.Join(dir, "list-hangs"),
@@ -393,6 +404,27 @@ exec)
     # A talkative guest: the liveness query gets bytes of the guest's choosing.
     cat "` + s.proveSays + `"
     exit 0
+  fi
+  # THE FIRST PROOF'S ANSWER, HELD: taken now, given only once the test has
+  # changed the guest. mkdir makes it the first and only one; the wait is
+  # bounded so a test that never releases it still ends.
+  if [ "$interactive" = no ] && [ -e "` + s.proveHold + `" ]; then
+    case "$*" in
+    *no-identity*)
+      if mkdir "` + s.proveTaken + `" 2>/dev/null; then
+        HOME="` + s.guestHome + `" "$@" < /dev/null > "` + s.proveOut + `"
+        rc=$?
+        : > "` + s.proveAnswered + `"
+        n=0
+        while [ ! -e "` + s.proveRelease + `" ] && [ "$n" -lt 2400 ]; do
+          sleep 0.05
+          n=$((n + 1))
+        done
+        cat "` + s.proveOut + `"
+        exit "$rc"
+      fi
+      ;;
+    esac
   fi
   if [ "$interactive" = no ]; then
     HOME="` + s.guestHome + `" "$@" < /dev/null
@@ -1436,28 +1468,29 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 
 	p := newProvider(t, s)
 	p.proveWindow = 30 * time.Second
-	// Long enough that the kill below lands between the two samples.
-	p.proveRetry = 2 * time.Second
+	p.proveRetry = 100 * time.Millisecond
 
-	// A BARRIER, NOT A TIMER: the victim dies once the FIRST proof has actually
-	// been taken, so the second sample sees a dead process by construction. A
-	// fixed delay raced Launch's own setup and let a one-sample proof pass.
+	// A BARRIER ON BOTH SIDES, NOT A TIMER: the stub takes the first sample,
+	// holds its answer, and gives it only once the victim is dead and reaped,
+	// so the first sample saw it alive and the second sees it dead by
+	// construction. Killing a fixed 300 ms after the proof's argv appeared
+	// could land before the first sample on a loaded machine, and a one-sample
+	// proof would then pass (#188).
+	if err := os.WriteFile(s.proveHold, nil, 0o600); err != nil {
+		t.Fatalf("hold the first proof: %v", err)
+	}
+
 	go func() {
 		for {
-			// KEYED ON THE PROOF, NOT ON THE DELIVERY. billet_birth appears in
-			// both scripts, so waiting for it killed the victim before any
-			// sample had been taken and the first reading was already dead —
-			// which a one-sample proof passes just as happily. "no-identity" is
-			// written only by the proof.
-			if b, err := os.ReadFile(s.argvLog); err == nil &&
-				strings.Contains(string(b), "no-identity") {
-				// Long enough for the first sample to have finished, and well
-				// inside the two-second gap before the second one.
-				time.Sleep(300 * time.Millisecond)
+			if _, err := os.Stat(s.proveAnswered); err == nil {
 				// Killed and reaped, as a guest's init would reap it. A zombie
 				// reads as dead too (TestAZombieRunnerIsNotProved), so this
 				// test does not depend on the wait.
 				stopStandIn(t, victim)
+
+				if err := os.WriteFile(s.proveRelease, nil, 0o600); err != nil {
+					t.Errorf("release the first proof: %v", err)
+				}
 
 				return
 			}
@@ -1477,6 +1510,12 @@ func TestARunnerThatDiesBetweenSamplesIsNotProved(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "not running") && !strings.Contains(err.Error(), "never stayed") {
 		t.Errorf("Launch = %v, want an error naming the dead runner", err)
+	}
+
+	// THE FIRST SAMPLE SAW IT ALIVE, so the refusal is the second sample's; a
+	// first answer of anything else would make this a test of a dead runner.
+	if first, err := os.ReadFile(s.proveOut); err != nil || strings.TrimSpace(string(first)) != "alive" {
+		t.Fatalf("the held first proof answered %q (%v), want alive", first, err)
 	}
 }
 

@@ -135,10 +135,14 @@ func TestAPowerShellModuleThatHangsIsStoppedAndNamed(t *testing.T) {
 		t.Fatalf("write the fake pwsh: %v", err)
 	}
 
+	// TWENTY SECONDS, so the calls that are not the install (marking the gallery
+	// trusted, which the fake answers at once) are never cut off by how long a
+	// loaded machine takes to start a process: a 2 s bound was missed by a fake
+	// that exits at once on a loaded CI runner (#188).
 	script := psmoduleHarness(t, dir, fake,
-		`{"powershellModules":[{"name":"Wedged"}],"azureModules":[]}`, 2, 1)
+		`{"powershellModules":[{"name":"Wedged"}],"azureModules":[]}`, 20, 1)
 
-	out, elapsed, err := runPSModules(t, script, 120*time.Second)
+	out, elapsed, err := runPSModules(t, script, 300*time.Second)
 
 	if err == nil {
 		t.Fatalf("a module whose install never finished was reported as installed\n%s", out)
@@ -154,7 +158,7 @@ func TestAPowerShellModuleThatHangsIsStoppedAndNamed(t *testing.T) {
 	// THE TIMEOUT-SPECIFIC MESSAGE, not merely a failure that mentions the module.
 	// A generic failure names it too, which is how a broken bound reads as a
 	// working one.
-	if !strings.Contains(out, "did not finish within 2s") {
+	if !strings.Contains(out, "did not finish within 20s") {
 		t.Errorf("the failure does not report a timeout, so it cannot be distinguished "+
 			"from an install that simply failed:\n%s", out)
 	}
@@ -163,12 +167,13 @@ func TestAPowerShellModuleThatHangsIsStoppedAndNamed(t *testing.T) {
 		t.Errorf("the failure does not name the module that hung:\n%s", out)
 	}
 
-	// NEAR THE BOUND. Two seconds plus the kill grace and teardown; sixty is loose
-	// enough for a loaded machine and far under the minutes a real default would
-	// take, so a removed bound cannot slip through.
-	if elapsed > 60*time.Second {
-		t.Errorf("the install took %s against a 2s bound, so the bound is not what "+
-			"stopped it", elapsed)
+	// NEAR THE BOUND. Twenty seconds plus the thirty-second kill grace, with a
+	// minute for a loaded machine, and far under the ten minutes the default would
+	// take, so a removed bound or one that ignored the override cannot slip
+	// through.
+	if elapsed > 110*time.Second {
+		t.Errorf("the install took %s against a 20s bound and a 30s grace, so the bound "+
+			"is not what stopped it", elapsed)
 	}
 }
 
@@ -194,6 +199,13 @@ func TestAStalledModuleInstallIsRetried(t *testing.T) {
 	//
 	// THE COUNT IS ON DISK because each attempt is a separate process; a shell
 	// variable would reset every time and the fake would stall forever.
+	//
+	// THE STALLS END AT THE BOUND'S TERM, which the hang test above refuses to do:
+	// what is under test here is the retry after a bounded attempt, and a stall
+	// that took the thirty-second grace twice would make this a minute longer.
+	// The bound is twenty seconds so that the attempt that does not stall is
+	// never cut off by how long a loaded machine takes to start it: under a 2 s
+	// bound all three attempts timed out on a loaded CI runner (#188).
 	fake := filepath.Join(dir, "pwsh")
 	body := "#!/bin/sh\n" +
 		"case \"$*\" in\n" +
@@ -203,7 +215,7 @@ func TestAStalledModuleInstallIsRetried(t *testing.T) {
 		"n=$(cat " + counter + " 2>/dev/null || echo 0)\n" +
 		"n=$((n + 1))\n" +
 		"echo $n > " + counter + "\n" +
-		"if [ \"$n\" -le 2 ]; then trap '' TERM; exec sleep 3600; fi\n" +
+		"if [ \"$n\" -le 2 ]; then exec sleep 3600; fi\n" +
 		"exit 0\n"
 
 	if err := forkSafeWriteFile(fake, []byte(body), 0o700); err != nil {
@@ -211,9 +223,9 @@ func TestAStalledModuleInstallIsRetried(t *testing.T) {
 	}
 
 	script := psmoduleHarness(t, dir, fake,
-		`{"powershellModules":[{"name":"Stally"}],"azureModules":[]}`, 2, 3)
+		`{"powershellModules":[{"name":"Stally"}],"azureModules":[]}`, 20, 3)
 
-	out, _, err := runPSModules(t, script, 180*time.Second)
+	out, _, err := runPSModules(t, script, 300*time.Second)
 
 	if err != nil {
 		t.Fatalf("two stalls that cleared were reported as a failure; a build fails on "+
