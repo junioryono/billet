@@ -91,6 +91,11 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 	if _, ok := storage.(storecontract.GenerationChecker); !ok {
 		t.Fatalf("the Firecracker node's cache store, a %T, cannot check a generation", storage)
 	}
+	// AND RELEASES THE KERNEL MAPPINGS NOTHING ACCOUNTS FOR (#494), which
+	// evictPass finds by asserting this same value.
+	if _, ok := storage.(kernelMappingSweeper); !ok {
+		t.Fatalf("the Firecracker node's cache store, a %T, cannot sweep the kernel's mappings", storage)
+	}
 
 	// AND ITS GENERATION MAPS ARE EXCLUDED HOST-WIDE through node.lock_dir: an
 	// eviction takes the lock before anything else, so it creates the file even

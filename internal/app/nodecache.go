@@ -213,15 +213,7 @@ func startNodeCache(
 					"error", err)
 			}
 		}
-		evict := func() {
-			if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not evict expired cache generations; will retry",
-					"error", err)
-			}
-			if err := service.ReapGitMirrors(ctx); err != nil && ctx.Err() == nil {
-				slog.Default().Warn("could not reap unused git mirrors; will retry", "error", err)
-			}
-		}
+		evict := func() { evictPass(ctx, storage, service.ReapGitMirrors, slog.Default()) }
 
 		retryClosed()
 		renewActive()
@@ -269,6 +261,60 @@ func startNodeCache(
 				"grace", stopGrace, "error", err)
 		}
 	}, nil
+}
+
+// cacheEvictor is the part of a site store an eviction pass runs.
+type cacheEvictor interface {
+	Evict(ctx context.Context, olderThan time.Duration) error
+}
+
+// kernelMappingSweeper is a store that maps volumes into this host's kernel and
+// can release the mappings nothing accounts for: the Ceph store.
+type kernelMappingSweeper interface {
+	SweepKernelMappings(ctx context.Context) (ceph.MappingReport, error)
+}
+
+// evictPass is one of the node's background storage passes: the kernel mappings
+// no cache session accounts for, then expired cache generations and volumes,
+// then unused git mirrors. Every failure is logged and left for the next pass.
+//
+// THE MAPPINGS FIRST, because eviction keeps every volume this host maps: a
+// leaked mapping released here lets the same pass reclaim its volume once the
+// volume is old enough.
+func evictPass(ctx context.Context, storage cacheEvictor, reapGitMirrors func(context.Context) error,
+	log *slog.Logger,
+) {
+	if sweeper, ok := storage.(kernelMappingSweeper); ok {
+		report, err := sweeper.SweepKernelMappings(ctx)
+		if unmapped := mappingNames(report, ceph.MappingUnmapped); len(unmapped) > 0 {
+			log.Info("unmapped cache volumes the kernel still mapped and no cache session names",
+				"volumes", unmapped)
+		}
+		if err != nil && ctx.Err() == nil {
+			log.Warn("kept kernel mappings of cache volumes no cache session names, never forcing one; "+
+				"will retry", "error", err)
+		}
+	}
+
+	if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {
+		log.Warn("could not evict expired cache generations; will retry", "error", err)
+	}
+	if err := reapGitMirrors(ctx); err != nil && ctx.Err() == nil {
+		log.Warn("could not reap unused git mirrors; will retry", "error", err)
+	}
+}
+
+// mappingNames are the images of the mappings a report puts in state.
+func mappingNames(report ceph.MappingReport, state ceph.MappingState) []string {
+	var names []string
+
+	for _, m := range report.Mappings {
+		if m.State == state {
+			names = append(names, m.Name)
+		}
+	}
+
+	return names
 }
 
 // nodeCacheStopGrace is how long the guest cache listener lets requests already
