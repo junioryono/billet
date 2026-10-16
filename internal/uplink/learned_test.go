@@ -202,6 +202,13 @@ func TestTheStepperRemembersOnlyAppliedRates(t *testing.T) {
 		t.Fatalf("rates tc refused were remembered: %v", remembered)
 	}
 
+	// AND THE MINUTE'S AND THE STOP'S RECORD SAY NOTHING EITHER, since a set
+	// that failed may have changed one direction.
+	st.record()
+	if len(remembered) != 0 {
+		t.Fatalf("after a failed set, record told %v", remembered)
+	}
+
 	failing = false
 	for range 8 {
 		clock = clock.Add(Tick)
@@ -215,6 +222,14 @@ func TestTheStepperRemembersOnlyAppliedRates(t *testing.T) {
 	}
 	if last := remembered[len(remembered)-1]; last != [2]float64{ctl.Up.Rate, ctl.Down.Rate} {
 		t.Errorf("remembered %v, want the rates applied last, %.1f/%.1f", last, ctl.Up.Rate, ctl.Down.Rate)
+	}
+
+	// ONCE A SET HAS SUCCEEDED, record tells the rates CAKE holds, read when it
+	// runs.
+	told := len(remembered)
+	st.record()
+	if len(remembered) != told+1 || remembered[told] != st.applied {
+		t.Errorf("record told %v, want the applied %v", remembered[told:], st.applied)
 	}
 
 	// AND THE CUT SAYS WHAT THE GATEWAY MEASURED.
@@ -305,9 +320,10 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 	// AND RECORDS THE APPLIED RATES EVERY MINUTE AND AS IT ENDS, so the next run
 	// counts only the time the shaper was down: a call of the recorder with the
 	// stepper's applied pair inside the minute's block, and one deferred.
+	// st.record READS THE RATES WHEN IT RUNS (a method value on the stepper), so
+	// even deferred it records what CAKE holds as the loop ends.
 	applied := func(call *ast.CallExpr) bool {
-		return isName(call.Fun, "remember") && len(call.Args) == 2 &&
-			types.ExprString(call.Args[0]) == "st.applied[0]" && types.ExprString(call.Args[1]) == "st.applied[1]"
+		return types.ExprString(call.Fun) == "st.record" && len(call.Args) == 0
 	}
 
 	var inMinute, deferred, follows bool

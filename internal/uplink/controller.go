@@ -55,7 +55,8 @@
 // ms to spikes of 128 ms) while the round trip to the reflectors rose about 11
 // ms (2026-10-14). Its rise past Bloat in two rounds in a row (step.go) makes a
 // round delayed as the reflectors' does, and holds a rate as theirs does, but
-// only in a round that counted a reflector; its unanswered probes are never loss,
+// only in a round that counted a reflector, and a round in which a counted
+// gateway gave no reading is not clear; its unanswered probes are never loss,
 // because a gateway answers ICMP when it has the time (the reference node's went
 // unanswered about 2% of the time with the line quiet, 2026-10-16), and read as
 // loss they would cut a busy host on every miss.
@@ -253,6 +254,14 @@ func (o Observation) gatewayCounts() bool {
 	return o.Gateway.DelayKnown && len(o.Probes) > 0
 }
 
+// gatewayUnmeasured reports whether a gateway being counted (it has a baseline
+// and has not gone silent) gave no rise this round. Such a round is not clear:
+// a stalled gateway that misses a few probes has not cleared, and a round that
+// cannot tell must neither end an episode nor raise a rate.
+func (o Observation) gatewayUnmeasured() bool {
+	return len(o.Gateway.Probes) > 0 && !o.Gateway.DelayKnown
+}
+
 // delayed reports whether the round measured a queue: the reflectors' delay or
 // the gateway's rise past bloat.
 func (o Observation) delayed(bloat time.Duration) bool {
@@ -393,7 +402,7 @@ func (c *Controller) judge(o Observation) verdict {
 		full:    delayFull || dropping,
 		onDelay: delayFull && delayedNow,
 		onLoss:  dropping && o.Lost() > 0,
-		clear:   o.DelayKnown && !delayedNow && !stillDropping,
+		clear:   o.DelayKnown && !delayedNow && !stillDropping && !o.gatewayUnmeasured(),
 		tally:   tallyOf(c.losses),
 		cut:     1,
 	}
@@ -576,8 +585,12 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
-		d.cutReflectors = measured{o.Delay, o.DelayKnown}
-		d.cutGateway = measured{o.Gateway.Delay, o.gatewayCounts()}
+		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay
+		// under Bloat that wanders from 12 ms to 8 ms says nothing of the gateway's
+		// stall the cut was taken on, and crediting it would keep cutting for a
+		// queue that is not this host's.
+		d.cutReflectors = measured{o.Delay, o.DelayKnown && o.Delay > p.Bloat}
+		d.cutGateway = measured{o.Gateway.Delay, o.gatewayCounts() && o.Gateway.Delay > p.Bloat}
 		d.cutTally = v.tally
 
 		return d.Rate != before, true
@@ -612,6 +625,18 @@ func helped(d *Direction, v verdict, o Observation) bool {
 	}
 
 	return v.tally.lessLossThan(d.cutTally, o.Probes)
+}
+
+// forgetGateway drops what the controller learned from a gateway it no longer
+// asks: the delay windows the old gateway filled and each direction's episode,
+// whose futility latch it may have set. Rare, since a route seldom moves, and
+// the safe way: a queue still there is seen again within Detect rounds.
+func (c *Controller) forgetGateway() {
+	c.recent, c.delayTrail = nil, nil
+
+	for _, d := range []*Direction{&c.Up, &c.Down} {
+		d.episode, d.futile, d.cutGateway = false, 0, measured{}
+	}
 }
 
 func clamp(rate, maxMbit float64) float64 {

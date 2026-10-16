@@ -39,8 +39,11 @@ type stepper struct {
 	now         func() time.Time
 	history     []reading
 	applied     [2]float64
-	// remember is told every pair of rates CAKE was set to, nil for nothing.
+	// remember is told every pair of rates CAKE was set to, nil for nothing;
+	// unsure is a set that failed partway, after which what CAKE holds is not
+	// known and nothing is told.
 	remember func(upMbit, downMbit float64)
+	unsure   bool
 	// blind is when counted reflectors stopped answering, zero while one does;
 	// told is whether that has been logged.
 	blind time.Time
@@ -123,6 +126,11 @@ func (s *stepper) tick(ctx context.Context) error {
 	}
 
 	if err := s.set(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
+		// A SET THAT FAILED MAY HAVE CHANGED ONE DIRECTION (Shaper.Set changes the
+		// upload, then the download), so what CAKE holds is no longer known, and
+		// nothing more is recorded: the last record, and its time, stand.
+		s.unsure = true
+
 		return err
 	}
 
@@ -144,11 +152,22 @@ func (s *stepper) tick(ctx context.Context) error {
 	s.applied = [2]float64{ctl.Up.Rate, ctl.Down.Rate}
 
 	// ONLY ONCE CAKE HAS THE RATES, so what is remembered is what was applied.
-	if s.remember != nil {
-		s.remember(ctl.Up.Rate, ctl.Down.Rate)
-	}
+	s.unsure = false
+	s.record()
 
 	return nil
+}
+
+// record tells remember the rates CAKE holds now, read when it runs: the run
+// calls it after every change, once a minute and as it ends, so the next run
+// counts only the time the shaper was down. Nothing when a failed set left
+// what CAKE holds unknown.
+func (s *stepper) record() {
+	if s.remember == nil || s.unsure {
+		return
+	}
+
+	s.remember(s.applied[0], s.applied[1])
 }
 
 // notice logs the rounds going blind, once no counted reflector has answered

@@ -121,15 +121,30 @@ func TestAGatewayThatDoesNotAnswerChangesNothing(t *testing.T) {
 			lost.Up.Rate, lost.Down.Rate, quiet.Up.Rate, quiet.Down.Rate)
 	}
 
-	// AND A RATE BELOW ITS CEILING STILL CLIMBS beside a gateway that does not
-	// answer.
+	// AND ONE THAT STOPPED ANSWERING FOR GOOD GOES SILENT AND STOPS COUNTING
+	// (delay.go's silentAfter), after which a rate below its ceiling climbs as
+	// it would without it; while it is still counted, a round it gave no reading
+	// in is not clear (TestAGatewayThatGaveNoReadingIsNotAClearRound).
+	var gw Delays
+	for range silentAfter + 1 {
+		gw.Observe([]string{"192.168.1.254"}, nil)
+	}
+	gw.Observe([]string{"192.168.1.254"}, map[string]time.Duration{"192.168.1.254": time.Millisecond})
+	for range silentAfter + 1 {
+		gw.Observe([]string{"192.168.1.254"}, nil)
+	}
+	silent := gw.Observe([]string{"192.168.1.254"}, nil)
+	if len(silent.Probes) != 0 {
+		t.Fatalf("a gateway unanswered %d rounds in a row is still counted: %+v", silentAfter+2, silent)
+	}
+
 	c := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
 	c.Down.Rate = 50
 	for n := range 6 {
-		c.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gatewayLost()))
+		c.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), silent))
 	}
 	if c.Down.Rate <= 50 {
-		t.Errorf("a full download beside a gateway that did not answer did not climb (%.1f)", c.Down.Rate)
+		t.Errorf("a full download beside a gateway gone silent did not climb (%.1f)", c.Down.Rate)
 	}
 }
 

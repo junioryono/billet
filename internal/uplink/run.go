@@ -223,7 +223,7 @@ func followGateway(log *slog.Logger, lookup func() (string, error), pinger gatew
 	}
 
 	st.gateway, st.lastGateway = Delays{}, Sample{}
-	ctl.Up.cutGateway, ctl.Down.cutGateway = measured{}, measured{}
+	ctl.forgetGateway()
 
 	log.Info("the default route's gateway changed; asking the new one", "gateway", gatewayLabel(pinger.Gateway()))
 }
@@ -304,7 +304,7 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 	// shaper was down, not the time since the line was last cut. A rate held for
 	// hours resumed after an upgrade's restart would otherwise come back near the
 	// ceiling. What CAKE was given (applied), never a rise too small to apply.
-	defer func() { remember(st.applied[0], st.applied[1]) }()
+	defer st.record()
 
 	exe := currentExecutable()
 	exeCheckedAt := time.Now()
@@ -329,7 +329,7 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 
 		if time.Since(exeCheckedAt) >= time.Minute {
 			exeCheckedAt = time.Now()
-			remember(st.applied[0], st.applied[1])
+			st.record()
 
 			if follow != nil {
 				followGateway(log, follow, pinger, st, ctl)
