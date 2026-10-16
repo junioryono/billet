@@ -278,13 +278,10 @@ func TestAnIsolatedClearRoundDoesNotEndAnEpisode(t *testing.T) {
 	}
 }
 
-// A LATCHED DIRECTION IS NOT RAISED UNTIL THE LINE HAS BEEN CLEAR FOR A WINDOW.
-// A 16 ms queue no cut moves latches the download after two cuts; the queue
-// then clears with the host still running at its rate. A raise before the
-// window of clear rounds is out could refill the queue with the host's own
-// traffic, and a latched direction could not be cut for it.
-func TestALatchedDirectionIsNotRaisedBeforeTheLineHasCleared(t *testing.T) {
-	t.Parallel()
+// latched is a controller whose download a 16 ms queue no cut moved has
+// latched after two cuts, and the step after its last.
+func latched(t *testing.T) (*Controller, int) {
+	t.Helper()
 
 	c := newController()
 
@@ -297,21 +294,89 @@ func TestALatchedDirectionIsNotRaisedBeforeTheLineHasCleared(t *testing.T) {
 		t.Fatalf("a queue no cut moved left the download unlatched (futile %d)", c.Down.futile)
 	}
 
-	latched := c.Down.Rate
+	return c, n
+}
 
-	for round := 1; round < c.Params.Window; round, n = round+1, n+1 {
+// A LATCHED DIRECTION IS RAISED ONLY ONCE THE LINE HAS CLEARED, and is then no
+// longer latched. The queue clears with the host still running at its rate:
+// while the last rounds still hold the queue, a raise could refill it with the
+// host's own traffic, and a latched direction could not be cut for it.
+func TestALatchedDirectionIsRaisedOnlyOnceTheLineHasCleared(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	// The trail still holds Detect delayed rounds through this many clear ones.
+	still := c.Params.Window - c.Params.Detect
+
+	for round := 1; round <= still; round, n = round+1, n+1 {
 		c.Step(moving(n, 0, c.Down.Rate, 0))
 
-		if c.Down.Rate != latched {
-			t.Fatalf("clear round %d of %d raised the latched download from %.2f to %.2f",
-				round, c.Params.Window, latched, c.Down.Rate)
+		if c.Down.Rate != held {
+			t.Fatalf("clear round %d raised the latched download from %.2f to %.2f with the queue still in "+
+				"the last %d rounds", round, held, c.Down.Rate, c.Params.Window)
 		}
 	}
 
 	c.Step(moving(n, 0, c.Down.Rate, 0))
 
-	if c.Down.Rate <= latched {
-		t.Fatalf("a window of clear rounds left the download at %.2f; the latch should have lifted", c.Down.Rate)
+	if c.Down.Rate <= held || c.Down.futile != 0 {
+		t.Fatalf("a cleared line left the download at %.2f (futile %d); want it raised and unlatched",
+			c.Down.Rate, c.Down.futile)
+	}
+}
+
+// THE OTHER DIRECTION'S CUT DOES NOT UNLATCH THIS ONE. The download is
+// latched; the upload starts moving into the same queue and is cut, which
+// empties the windows both directions read. The round after finds them empty
+// and the delay gone, but the queue was there a moment ago: the latched
+// download, running at its rate, is not raised.
+func TestTheOtherDirectionsCutDoesNotRaiseALatchedOne(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	for upCut := false; !upCut; n++ {
+		if n > 200 {
+			t.Fatal("the upload moving into the queue was never cut")
+		}
+
+		before := c.Up.Rate
+		c.Step(moving(n, 50, c.Down.Rate, 16*time.Millisecond))
+		upCut = c.Up.Rate < before
+	}
+
+	c.Step(moving(n, 50, c.Down.Rate, 0))
+
+	if c.Down.Rate != held {
+		t.Fatalf("the round after the upload's cut moved the latched download from %.2f to %.2f",
+			held, c.Down.Rate)
+	}
+}
+
+// AN ISOLATED SPIKE DOES NOT KEEP A DIRECTION LATCHED. After the queue that
+// latched it, the line runs clear but for one 16 ms round in six: below what
+// detects a queue, and the download climbs back, as it did before a clear
+// round had to outlast the trail.
+func TestAnIsolatedSpikeDoesNotKeepADirectionLatched(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	for end := n + 60; n < end; n++ {
+		delay := time.Duration(0)
+		if n%6 == 5 {
+			delay = 16 * time.Millisecond
+		}
+
+		c.Step(moving(n, 0, c.Down.Rate, delay))
+	}
+
+	if c.Down.Rate <= held {
+		t.Fatalf("thirty seconds of a line clear but for one spike in six left the download at %.2f", c.Down.Rate)
 	}
 }
 

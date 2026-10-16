@@ -205,8 +205,9 @@ func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
 			cuts++
 		}
 
-		if n >= 2 && c.clearRun != 0 {
-			t.Fatalf("step %d, %d cuts in: a round of a line still dropping read as clear", n, cuts)
+		if c.Down.Rate > before {
+			t.Fatalf("step %d, %d cuts in: a round of a line still dropping raised the download to %.1f",
+				n, cuts, c.Down.Rate)
 		}
 	}
 

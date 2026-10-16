@@ -216,15 +216,14 @@ type Controller struct {
 	// nothing.
 	Cause Cause
 
-	recent []bool
-	// losses are the rounds' probes since the last cut, which a loss cut is
-	// judged on; trail is the last Window rounds' probes, kept across cuts,
-	// which say whether the line has stopped dropping. A cut forgets the
-	// evidence that caused it, but not that the line is still losing probes:
-	// a round that forgot would read as clear and end a futile episode.
-	losses, trail [][]Probe
-	// clearRun is how many rounds in a row have been clear.
-	clearRun int
+	// recent and losses are the rounds' delays and probes since the last cut,
+	// which a cut is judged on; delayTrail and trail are the last Window
+	// rounds', kept across cuts, which say whether the line has stopped
+	// queueing and dropping. A cut forgets the evidence that caused it, but not
+	// that the queue is still there: a round after it that forgot would read as
+	// clear and end a futile episode.
+	recent, delayTrail []bool
+	losses, trail      [][]Probe
 }
 
 // verdict is what one step's evidence says, the same for both directions.
@@ -238,10 +237,10 @@ type verdict struct {
 	// under Bloat, and a line that has not been dropping over the last Window
 	// rounds, cuts or no cuts.
 	clear bool
-	// cleared is a line that has been clear for a whole Window of rounds, which
-	// ends an episode of cuts. One clear round is not enough: the window a cut
-	// empties makes the round after it look clear even with the queue still
-	// there, and an episode that ended on that would never latch.
+	// cleared is a clear round whose trail, kept across cuts, is not full of
+	// delays either, which ends an episode of cuts. The windows a cut empties
+	// are not enough: the round after a cut would find them empty with the
+	// queue still there, and an episode that ended on that would never latch.
 	cleared bool
 	// tally is each reflector's probes and misses since the last cut.
 	tally tally
@@ -262,23 +261,13 @@ func (c *Controller) Step(o Observation) bool {
 	// was seen before an outage is not still evidence a minute later. A round
 	// with no measured delay is not a delayed one, and one that counted no
 	// reflector lost nothing.
-	c.recent = append(c.recent, o.DelayKnown && o.Delay > p.Bloat)
-	if len(c.recent) > p.Window {
-		c.recent = c.recent[len(c.recent)-p.Window:]
-	}
-
+	delayed := o.DelayKnown && o.Delay > p.Bloat
+	c.recent = lastRounds(append(c.recent, delayed), p.Window)
+	c.delayTrail = lastRounds(append(c.delayTrail, delayed), p.Window)
 	c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
 	c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
 
 	v := c.judge(o)
-
-	if v.clear {
-		c.clearRun++
-	} else {
-		c.clearRun = 0
-	}
-
-	v.cleared = c.clearRun >= p.Window
 
 	seconds := o.Interval.Seconds()
 	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, v, o)
@@ -303,7 +292,19 @@ func (c *Controller) Step(o Observation) bool {
 	return upChanged || downChanged
 }
 
-func lastRounds(rounds [][]Probe, n int) [][]Probe {
+func countTrue(window []bool) int {
+	n := 0
+
+	for _, b := range window {
+		if b {
+			n++
+		}
+	}
+
+	return n
+}
+
+func lastRounds[T any](rounds []T, n int) []T {
 	if len(rounds) > n {
 		return rounds[len(rounds)-n:]
 	}
@@ -315,14 +316,8 @@ func lastRounds(rounds [][]Probe, n int) [][]Probe {
 func (c *Controller) judge(o Observation) verdict {
 	p := c.Params
 
-	delayed := 0
-	for _, d := range c.recent {
-		if d {
-			delayed++
-		}
-	}
-
-	delayFull := delayed >= p.Detect
+	delayFull := countTrue(c.recent) >= p.Detect
+	stillDelayed := countTrue(c.delayTrail) >= p.Detect
 	dropping := c.dropping(c.losses, o)
 	stillDropping := c.dropping(c.trail, o)
 	delayedNow := o.DelayKnown && o.Delay > p.Bloat
@@ -335,6 +330,7 @@ func (c *Controller) judge(o Observation) verdict {
 		tally:   tallyOf(c.losses),
 		cut:     1,
 	}
+	v.cleared = v.clear && !stillDelayed
 
 	if v.onDelay {
 		v.cut = c.cutFactor(o.Delay)
@@ -456,9 +452,10 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 
 	before := d.Rate
 
-	// THE QUEUE CLEARED, for a whole window: a later one starts a new episode,
-	// and its cuts are judged afresh, against nothing from this one. A cleared
-	// line is never a full one, so this never meets a cut below.
+	// THE QUEUE CLEARED, by the trails a cut does not empty: a later one starts
+	// a new episode, and its cuts are judged afresh, against nothing from this
+	// one. The trails hold every round the windows do, so a cleared line is
+	// never a full one, and this never meets a cut below.
 	if v.cleared {
 		d.futile, d.episode = 0, false
 	}
@@ -520,7 +517,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// holds the traffic from before it, which runs above any rate just cut and
 		// would undo the cut at once. NOR WHILE LATCHED: a raise could refill the
 		// queue with this host's own traffic, and a latched direction could not be
-		// cut for it; the latch lifts once the line has been clear for a window.
+		// cut for it; the latch lifts once the line has cleared.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
 	}
 
