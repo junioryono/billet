@@ -8,12 +8,18 @@ import (
 // at is the step clock: tick n is n half-seconds after an arbitrary start.
 func at(n int) time.Time { return time.Unix(1_000_000, 0).Add(time.Duration(n) * Tick) }
 
-// moving is an observation of these rates in Mbit/s over one tick.
+// moving is an observation of these rates in Mbit/s over one tick, with every
+// one of three reflectors answering at this delay.
 func moving(n int, upMbit, downMbit float64, delay time.Duration) Observation {
+	return probed(n, upMbit, downMbit, Sample{Delay: delay, DelayKnown: true,
+		Probes: []Probe{{Reflector: "a"}, {Reflector: "b"}, {Reflector: "c"}}})
+}
+
+// probed is an observation of these rates with what a round's probes said.
+func probed(n int, upMbit, downMbit float64, s Sample) Observation {
 	bits := func(mbit float64) uint64 { return uint64(mbit * 1e6 * Tick.Seconds()) }
 
-	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit),
-		Delay: delay, DelayKnown: true}
+	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit), Sample: s}
 }
 
 func newController() *Controller {
@@ -102,12 +108,10 @@ func TestBaselineDriftDoesNotReadAsACutHelping(t *testing.T) {
 	cuts := 0
 
 	for n := range 120 {
-		delay, known := d.Observe(asked, map[string]time.Duration{"r": 47 * time.Millisecond})
+		s := d.Observe(asked, map[string]time.Duration{"r": 47 * time.Millisecond})
 		before := c.Down.Rate
 
-		o := moving(n, 0, 300, delay)
-		o.DelayKnown = known
-		c.Step(o)
+		c.Step(probed(n, 0, 300, s))
 
 		if c.Down.Rate < before {
 			cuts++
@@ -241,5 +245,195 @@ func TestCutsThatHelpReachTheFloorAndNoFurther(t *testing.T) {
 
 	if c.Down.Rate != Floor {
 		t.Fatalf("the download ended at %.2f Mbit/s; want exactly the %.0f floor", c.Down.Rate, Floor)
+	}
+}
+
+// ONE CLEAR ROUND DOES NOT END AN EPISODE. A 30 ms queue no cut moves, with a
+// single clear round every six seconds: the round after a cut finds the window
+// empty and looks clear, and an episode that ended on it would hand the next
+// cut a fresh budget every time. The cuts still stop at two.
+func TestAnIsolatedClearRoundDoesNotEndAnEpisode(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 120 {
+		delay := 30 * time.Millisecond
+		if n%12 == 3 {
+			delay = 0
+		}
+
+		before := c.Down.Rate
+		c.Step(moving(n, 0, 300, delay))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a queue no cut moved, clear for one round in twelve, drew %d cuts over a minute; want %d",
+			cuts, c.Params.Futile)
+	}
+}
+
+// latched is a controller whose download a 16 ms queue no cut moved has
+// latched after two cuts, and the step after its last.
+func latched(t *testing.T) (*Controller, int) {
+	t.Helper()
+
+	c := newController()
+
+	n := 0
+	for ; n < 40; n++ {
+		c.Step(moving(n, 0, 300, 16*time.Millisecond))
+	}
+
+	if c.Down.futile < c.Params.Futile {
+		t.Fatalf("a queue no cut moved left the download unlatched (futile %d)", c.Down.futile)
+	}
+
+	return c, n
+}
+
+// A LATCHED DIRECTION IS RAISED ONLY ONCE THE LINE HAS CLEARED, and is then no
+// longer latched. The queue clears with the host still running at its rate:
+// while the last rounds still hold the queue, a raise could refill it with the
+// host's own traffic, and a latched direction could not be cut for it.
+func TestALatchedDirectionIsRaisedOnlyOnceTheLineHasCleared(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	// The trail still holds Detect delayed rounds through this many clear ones.
+	still := c.Params.Window - c.Params.Detect
+
+	for round := 1; round <= still; round, n = round+1, n+1 {
+		c.Step(moving(n, 0, c.Down.Rate, 0))
+
+		if c.Down.Rate != held {
+			t.Fatalf("clear round %d raised the latched download from %.2f to %.2f with the queue still in "+
+				"the last %d rounds", round, held, c.Down.Rate, c.Params.Window)
+		}
+	}
+
+	c.Step(moving(n, 0, c.Down.Rate, 0))
+
+	if c.Down.Rate <= held || c.Down.futile != 0 {
+		t.Fatalf("a cleared line left the download at %.2f (futile %d); want it raised and unlatched",
+			c.Down.Rate, c.Down.futile)
+	}
+}
+
+// THE OTHER DIRECTION'S CUT DOES NOT UNLATCH THIS ONE. The download is
+// latched; the upload starts moving into the same queue and is cut, which
+// empties the windows both directions read. The round after finds them empty
+// and the delay gone, but the queue was there a moment ago: the latched
+// download, running at its rate, is not raised.
+func TestTheOtherDirectionsCutDoesNotRaiseALatchedOne(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	for upCut := false; !upCut; n++ {
+		if n > 200 {
+			t.Fatal("the upload moving into the queue was never cut")
+		}
+
+		before := c.Up.Rate
+		c.Step(moving(n, 50, c.Down.Rate, 16*time.Millisecond))
+		upCut = c.Up.Rate < before
+	}
+
+	c.Step(moving(n, 50, c.Down.Rate, 0))
+
+	if c.Down.Rate != held {
+		t.Fatalf("the round after the upload's cut moved the latched download from %.2f to %.2f",
+			held, c.Down.Rate)
+	}
+}
+
+// AN ISOLATED SPIKE DOES NOT KEEP A DIRECTION LATCHED. After the queue that
+// latched it, the line runs clear but for one 16 ms round in six: below what
+// detects a queue, and the download climbs back, as it did before a clear
+// round had to outlast the trail.
+func TestAnIsolatedSpikeDoesNotKeepADirectionLatched(t *testing.T) {
+	t.Parallel()
+
+	c, n := latched(t)
+	held := c.Down.Rate
+
+	for end := n + 60; n < end; n++ {
+		delay := time.Duration(0)
+		if n%6 == 5 {
+			delay = 16 * time.Millisecond
+		}
+
+		c.Step(moving(n, 0, c.Down.Rate, delay))
+	}
+
+	if c.Down.Rate <= held {
+		t.Fatalf("thirty seconds of a line clear but for one spike in six left the download at %.2f", c.Down.Rate)
+	}
+}
+
+// A THIN TRAIL JUST AFTER A CUT DOES NOT END AN EPISODE. A 30 ms queue no cut
+// moves, delayed at first in only three rounds of six, so the round after the
+// first cut sees the oldest of them leave the trail: the queue has not
+// cleared, it has had no time to, and the cuts still stop at two.
+func TestAThinTrailJustAfterACutDoesNotEndAnEpisode(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 120 {
+		delay := 30 * time.Millisecond
+		if n < 7 && n != 0 && n != 3 && n != 5 {
+			delay = 0
+		}
+
+		before := c.Down.Rate
+		c.Step(moving(n, 0, 300, delay))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a queue no cut moved drew %d cuts over a minute; want %d", cuts, c.Params.Futile)
+	}
+}
+
+// A NEW EPISODE IS JUDGED AGAINST NOTHING FROM THE LAST ONE. A 30 ms queue no
+// cut moves draws two cuts; the queue clears while the host is idle; the same
+// queue comes back, and draws two cuts of its own, not one measured against
+// the first episode's last cut.
+func TestEachEpisodeGetsItsOwnCuts(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 92 {
+		o := moving(n, 0, 300, 30*time.Millisecond)
+		if n >= 40 && n < 52 {
+			o = moving(n, 0, 1, 0)
+		}
+
+		before := c.Down.Rate
+		c.Step(o)
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != 2*c.Params.Futile {
+		t.Fatalf("two episodes of a queue no cut moved drew %d cuts; want %d each", cuts, c.Params.Futile)
 	}
 }
