@@ -398,8 +398,17 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 	t.Parallel()
 
 	found := map[string]bool{}
+	latched := false
 
 	ast.Inspect(nodeFunc(t, "node.go", "Run"), func(n ast.Node) bool {
+		// THE DRAIN REQUEST IS THE HOST'S, LATCHED: the loop and the cache's stop
+		// read one answer (latchedDrainRequest).
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && isIdent(assign.Lhs[0], "drainRequested") {
+			call, ok := assign.Rhs[0].(*ast.CallExpr)
+			latched = latched || ok && isIdent(call.Fun, "latchedDrainRequest") && len(call.Args) == 1 &&
+				namesSelector(call.Args[0], "host", "DrainRequested")
+		}
+
 		literal, ok := n.(*ast.CompositeLit)
 		if !ok || !namesSelector(literal.Type, "nodeclient", "LoopOptions") {
 			return true
@@ -418,7 +427,11 @@ func TestTheNodeLoopIsGivenItsStopPolicy(t *testing.T) {
 				if value, ok := field.Value.(*ast.Ident); ok && value.Name == "handOver" {
 					found[key.Name] = true
 				}
-			case key.Name == "DrainRequested", key.Name == "Hurry":
+			case key.Name == "DrainRequested":
+				if isIdent(field.Value, "drainRequested") && latched {
+					found[key.Name] = true
+				}
+			case key.Name == "Hurry":
 				if namesSelector(field.Value, "host", key.Name) {
 					found[key.Name] = true
 				}

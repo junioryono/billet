@@ -306,9 +306,10 @@ func nodeCacheSweepWait(handOver bool) time.Duration {
 
 // nodeCacheSweepWaitFor is the stop's wait, decided when the stop runs: a stop
 // asked to drain overrides node.stop's handover, as the node loop's own
-// DrainRequested does, and then has no lease to spare the wait for. A handover
-// whose withdrawal did not land drains too, which the cache cannot see; it keeps
-// the handover's wait.
+// DrainRequested does, and then has no lease to spare the wait for. Run hands
+// both the same latched answer (latchedDrainRequest), so the two never disagree.
+// A handover whose withdrawal did not land drains too, which the cache cannot
+// see; it keeps the handover's wait.
 func nodeCacheSweepWaitFor(handOver bool, drainRequested func() bool) func() time.Duration {
 	return func() time.Duration {
 		return nodeCacheSweepWait(handOver && (drainRequested == nil || !drainRequested()))
@@ -367,6 +368,12 @@ func evictPass(ctx context.Context, storage cacheEvictor, reapGitMirrors func(co
 			log.Warn("kept kernel mappings of cache volumes no cache session names, never forcing one; "+
 				"will retry", "error", err)
 		}
+	}
+
+	// NOTHING MORE ONCE A STOP HAS CANCELLED THE PASS: eviction's own generation-map
+	// sweep unmaps outside the slot the stop waits on.
+	if ctx.Err() != nil {
+		return
 	}
 
 	if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {

@@ -288,6 +288,27 @@ func TestAnEvictionPassSweepsTheKernelMappingsFirst(t *testing.T) {
 	}
 }
 
+// A PASS A STOP HAS CANCELLED ENDS AFTER ITS SWEEP: eviction's own
+// generation-map sweep unmaps outside the slot the stop waits on.
+func TestACancelledEvictionPassEndsAfterTheSweep(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	sweeping := make(chan struct{}, 1)
+	store := &evictionRecorder{sweeping: sweeping}
+	evictPass(ctx, store, func(context.Context) error {
+		store.calls = append(store.calls, "mirrors")
+
+		return nil
+	}, sweeping, slog.New(&logLines{}))
+
+	if got := strings.Join(store.calls, ","); got != "sweep" {
+		t.Errorf("a cancelled pass asked %s, want the sweep alone", got)
+	}
+}
+
 // AND A STORE THAT MAPS NOTHING INTO THE KERNEL IS EVICTED AND ITS MIRRORS
 // REAPED, with no slot taken.
 func TestAnEvictionPassOfAStoreWithoutMappingsOnlyEvicts(t *testing.T) {
@@ -457,19 +478,31 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 
 	// THE WAIT IS DECIDED WHEN THE STOP RUNS, from the policy it was given: a
 	// stop asked to drain is known only then.
+	// A STATEMENT OF THE STOP ITSELF: one before the closure would decide it at
+	// startup.
 	decided := false
 	ast.Inspect(start, func(n ast.Node) bool {
-		assign, ok := n.(*ast.AssignStmt)
-		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 || !isIdent(assign.Lhs[0], "wait") {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 4 {
 			return true
 		}
-		call, ok := assign.Rhs[0].(*ast.CallExpr)
-		decided = decided || ok && isIdent(call.Fun, "sweepWait") && len(call.Args) == 0
+		stop, ok := ret.Results[2].(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		for _, stmt := range stop.Body.List {
+			assign, ok := stmt.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 || !isIdent(assign.Lhs[0], "wait") {
+				continue
+			}
+			call, ok := assign.Rhs[0].(*ast.CallExpr)
+			decided = decided || ok && isIdent(call.Fun, "sweepWait") && len(call.Args) == 0
+		}
 
 		return true
 	})
 	if !decided {
-		t.Error("startNodeCache's stop does not decide its wait with wait := sweepWait()")
+		t.Error("startNodeCache's stop does not decide its wait with wait := sweepWait() in its own body")
 	}
 
 	// BESIDE THE LISTENER, NOT AFTER IT: on a handover both waits come out of
@@ -489,12 +522,13 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 		}
 		wait, ok := call.Args[len(call.Args)-2].(*ast.CallExpr)
 		given = ok && isIdent(wait.Fun, "nodeCacheSweepWaitFor") && len(wait.Args) == 2 &&
-			isIdent(wait.Args[0], "handOver") && namesSelector(wait.Args[1], "host", "DrainRequested")
+			isIdent(wait.Args[0], "handOver") && isIdent(wait.Args[1], "drainRequested")
 
 		return true
 	})
 	if !given {
-		t.Error("the node starts its cache without nodeCacheSweepWaitFor(handOver, host.DrainRequested)")
+		t.Error("the node starts its cache without nodeCacheSweepWaitFor(handOver, drainRequested), the " +
+			"latched request its loop is given (TestTheNodeLoopIsGivenItsStopPolicy)")
 	}
 }
 
@@ -509,22 +543,35 @@ func TestTheSweepWaitFitsTheStopPolicy(t *testing.T) {
 
 	for name, c := range map[string]struct {
 		handOver bool
-		drain    func() bool
+		noReader bool
+		drain    bool
 		want     time.Duration
 	}{
-		"a handover":                       {handOver: true, drain: func() bool { return false }, want: handover},
-		"a handover with no drain request": {handOver: true, want: handover},
-		"a drain over a handover":          {handOver: true, drain: func() bool { return true }, want: drain},
-		"a drain":                          {drain: func() bool { return false }, want: drain},
+		"a handover":                       {handOver: true, want: handover},
+		"a handover with no drain request": {handOver: true, noReader: true, want: handover},
+		"a drain over a handover":          {handOver: true, drain: true, want: drain},
+		"a drain":                          {want: drain},
 	} {
-		if got := nodeCacheSweepWaitFor(c.handOver, c.drain)(); got != c.want {
+		// THE REQUEST IS READ WHEN THE STOP RUNS, not when the policy is built:
+		// it says the opposite until then.
+		requested := !c.drain
+		var read func() bool
+		if !c.noReader {
+			read = func() bool { return requested }
+		}
+		policy := nodeCacheSweepWaitFor(c.handOver, read)
+		requested = c.drain
+
+		if got := policy(); got != c.want {
 			t.Errorf("%s waits %v for a sweep, want %v", name, got, c.want)
 		}
 	}
 
-	if handover <= 0 || handover > nodeCacheStopGrace(true) || drain <= ceph.MapTimeout {
-		t.Errorf("a handover waits %v (want above zero and within the listener's %v), a drain %v "+
-			"(want past one unmap's %v)", handover, nodeCacheStopGrace(true), drain, ceph.MapTimeout)
+	if got := nodeCacheSweepWait(true); got <= 0 || got > nodeCacheStopGrace(true) {
+		t.Errorf("a handover waits %v, want above zero and within the listener's %v", got, nodeCacheStopGrace(true))
+	}
+	if got := nodeCacheSweepWait(false); got <= ceph.MapTimeout || got > ceph.MapTimeout+10*time.Second {
+		t.Errorf("a drain waits %v, want past one unmap's %v and not far past it", got, ceph.MapTimeout)
 	}
 }
 
@@ -589,5 +636,27 @@ func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 
 	if len(callers) != 1 || !strings.HasSuffix(callers[0], "internal/app/nodecache.go:evictPass") {
 		t.Errorf("SweepKernelMappings is called from %v, want only evictPass", callers)
+	}
+}
+
+// THE DRAIN REQUEST IS ANSWERED ONCE FOR THE WHOLE STOP: the node loop reads it
+// when its stop begins and the cache's stop after, and a request that arrives
+// between them must not have the two disagree on what kind of stop this is.
+func TestTheDrainRequestIsLatchedAtItsFirstReading(t *testing.T) {
+	t.Parallel()
+
+	requested := false
+	latched := latchedDrainRequest(func() bool { return requested })
+
+	if latched() {
+		t.Fatal("the first reading answered a drain nobody requested")
+	}
+	requested = true
+	if latched() {
+		t.Error("a request arriving after the first reading changed the answer")
+	}
+
+	if latchedDrainRequest(nil) != nil {
+		t.Error("no reader became a reader")
 	}
 }
