@@ -33,7 +33,45 @@ func publish(t *testing.T, h *harness, name string, mode os.FileMode) string {
 		}
 	}
 
+	writeCompatibility(t, h, dir, func(*compatibility) {})
+
 	return dir
+}
+
+// writeCompatibility publishes the record a capture on this harness's host would
+// have written, changed by edit, read-only as billet publishes one.
+func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compatibility)) {
+	t.Helper()
+
+	guest, err := h.p.digests.of(h.p.cfg.KernelImage)
+	if err != nil {
+		t.Fatalf("digest the stub kernel: %v", err)
+	}
+
+	record, err := h.p.hostCompatibility(guest)
+	if err != nil {
+		t.Fatalf("describe the harness host: %v", err)
+	}
+
+	edit(&record)
+
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, compatibilityFile)
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("make the compatibility record writable again: %v", err)
+	}
+
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write the compatibility record: %v", err)
+	}
+
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod the compatibility record: %v", err)
+	}
 }
 
 // aRestoreSpec is a restore that should succeed: a launch's spec with the disk size

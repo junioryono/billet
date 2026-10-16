@@ -49,6 +49,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
@@ -160,6 +161,16 @@ type Provider struct {
 	// tapOwner reports the uid that owns a tap, and whether the device exists. A
 	// seam because it reads /sys, and because what a teardown deletes depends on it.
 	tapOwner func(tap string) (int, bool, error)
+	// cpuinfoPath and hostKernel are where this host's compatibility record comes
+	// from (hostCompatibility). Seams, because a test has to stage a host a
+	// snapshot was not taken on.
+	cpuinfoPath string
+	hostKernel  func() (string, error)
+	// digests remembers the digests of the VMM binary and the guest kernels.
+	digests fileDigests
+	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
+	// because the account a VMM runs as is one only root can create files as.
+	jailWrote func(st unix.Stat_t, res resources) bool
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -306,21 +317,24 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	}
 
 	p := &Provider{
-		log:      slog.Default(),
-		owner:    owner,
-		cfg:      cfg,
-		disk:     disk,
-		run:      execRunner,
-		lookPath: exec.LookPath,
-		mknod:    mknodBlock,
-		chown:    chownTree,
-		chownOne: os.Chown,
-		apiFor:   newVMMAPI,
-		syncFile: func(file *os.File) error { return file.Sync() },
-		syncDir:  syncDirectory,
-		pidOwner: pidIsVMM,
-		tapOwner: sysTapOwner,
-		bootWait: DefaultBootWait,
+		log:         slog.Default(),
+		owner:       owner,
+		cfg:         cfg,
+		disk:        disk,
+		run:         execRunner,
+		lookPath:    exec.LookPath,
+		mknod:       mknodBlock,
+		chown:       chownTree,
+		chownOne:    os.Chown,
+		apiFor:      newVMMAPI,
+		syncFile:    func(file *os.File) error { return file.Sync() },
+		syncDir:     syncDirectory,
+		pidOwner:    pidIsVMM,
+		tapOwner:    sysTapOwner,
+		cpuinfoPath: "/proc/cpuinfo",
+		hostKernel:  unameKernel,
+		jailWrote:   jailWritten,
+		bootWait:    DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
 	p.processStart = hostProcessStart
@@ -635,7 +649,7 @@ func (p *Provider) launch(
 	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
 	// after it: a link is the published file itself, and must never be chowned.
 	if snapshot != "" {
-		if err := p.placeSnapshot(j, snapshot); err != nil {
+		if err := p.placeSnapshot(j, snapshot, kernel); err != nil {
 			return nil, err
 		}
 	}

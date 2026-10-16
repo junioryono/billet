@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -58,6 +60,11 @@ type fakeVMM struct {
 	stayPausedOnResume bool
 	// createTakes is how long writing a snapshot holds its call open.
 	createTakes time.Duration
+	// root is the jail root the VMM is chrooted in, where a snapshot it is asked to
+	// write lands, and onCreate runs after it has written one, so a test can do what
+	// a VMM that has been taken over could do to its own files.
+	root     string
+	onCreate func(root string)
 
 	listener net.Listener
 	server   *http.Server
@@ -168,11 +175,22 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			v.state = "Paused"
 		}
-	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/create" && v.createTakes > 0:
+	case r.Method == http.MethodPut && r.URL.Path == "/snapshot/create":
 		// THE WRITE HOLDS THE CALL, as Firecracker's does while it fsyncs memory.
-		v.mu.Unlock()
-		time.Sleep(v.createTakes)
-		v.mu.Lock()
+		if v.createTakes > 0 {
+			v.mu.Unlock()
+			time.Sleep(v.createTakes)
+			v.mu.Lock()
+		}
+
+		// AND LANDS IN THE CHROOT, at the paths it was given, as the jailed account.
+		if v.root != "" {
+			if err := v.writeSnapshot(body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+
+				return
+			}
+		}
 	}
 
 	if r.URL.Path == "/actions" {
@@ -557,8 +575,47 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	}
 	h.p.procMountsPath = mounts
 
+	// A HOST OF ITS OWN, so a snapshot's compatibility record has something fixed to
+	// match, and a test can stage a host it was not taken on.
+	cpuinfo := filepath.Join(t.TempDir(), "cpuinfo")
+	if err := os.WriteFile(cpuinfo, []byte(aCPUInfo), 0o600); err != nil {
+		t.Fatalf("write the stub cpuinfo: %v", err)
+	}
+
+	h.p.cpuinfoPath = cpuinfo
+	h.p.hostKernel = func() (string, error) { return "6.1.155 #1 SMP PREEMPT_DYNAMIC", nil }
+
+	// THE TEST RUNS AS ITSELF, not as a jail uid only root can create files as, so a
+	// file it writes into a jail stands in for one the VMM wrote. The real check is
+	// held by jailWritten's own test and by the real-host capture.
+	h.p.jailWrote = func(st unix.Stat_t, res resources) bool {
+		return int(st.Uid) == os.Geteuid() || jailWritten(st, res)
+	}
+
 	return h
 }
+
+// aCPUInfo is two identical x86 cores, as /proc/cpuinfo lists them.
+const aCPUInfo = `processor	: 0
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 1
+model name	: AMD EPYC 7713 64-Core Processor
+stepping	: 1
+microcode	: 0xa0011d5
+cpu MHz		: 2000.000
+flags		: fpu vme de pse sse sse2 avx avx2
+
+processor	: 1
+vendor_id	: AuthenticAMD
+cpu family	: 25
+model		: 1
+model name	: AMD EPYC 7713 64-Core Processor
+stepping	: 1
+microcode	: 0xa0011d5
+cpu MHz		: 3100.000
+flags		: avx2 avx sse2 sse pse de vme fpu
+`
 
 // record is the runner seam: it captures the argv and, for the jailer, lets the
 // test decide what the VMM does next.
@@ -708,7 +765,13 @@ func (h *harness) everyArgument() string {
 func (h *harness) serveVMM(t *testing.T, id string) *fakeVMM {
 	t.Helper()
 
-	return startFakeVMM(t, h.p.jailFor(id).socket(), id)
+	v := startFakeVMM(t, h.p.jailFor(id).socket(), id)
+
+	v.mu.Lock()
+	v.root = h.p.jailFor(id).root()
+	v.mu.Unlock()
+
+	return v
 }
 
 // aSpec is a launch that should succeed.
@@ -745,4 +808,25 @@ func (h *harness) launch(t *testing.T) (*provider.Instance, *fakeVMM) {
 	}
 
 	return inst, vmm
+}
+
+// writeSnapshot writes what a snapshot/create body names, inside the VMM's chroot.
+// The caller holds v.mu.
+func (v *fakeVMM) writeSnapshot(body map[string]any) error {
+	for _, field := range []string{"snapshot_path", "mem_file_path"} {
+		name, ok := body[field].(string)
+		if !ok {
+			return errors.New("snapshot/create without " + field)
+		}
+
+		if err := os.WriteFile(filepath.Join(v.root, name), []byte("written by the VMM at "+name), 0o600); err != nil {
+			return err
+		}
+	}
+
+	if v.onCreate != nil {
+		v.onCreate(v.root)
+	}
+
+	return nil
 }
