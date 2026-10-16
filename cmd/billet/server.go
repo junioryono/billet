@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
@@ -120,13 +117,16 @@ func serveControlPlane(
 
 	defer served.Close(ctx)
 
-	// Ctrl-C and SIGTERM stop the listeners through the context, which is what
-	// releases escrowed capacity — see the listener's deferred release. A hard
-	// kill skips that and leaves the reaper to expire it.
+	// Ctrl-C and SIGTERM stop the listeners through ctx, which cli.Main cancels
+	// on the first signal; that is what releases escrowed capacity — see the
+	// listener's deferred release. A hard kill skips that and leaves the reaper to
+	// expire it.
 	//
-	// AND IT IS INSTALLED BEFORE THE CLAIM, because a standby may wait there for
-	// days and an operator stopping one must not have to kill it.
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	// THIS CONTEXT IS THE FENCE'S, AND ONLY THE FENCE'S: stopWhenReplaced ends the
+	// process through it when a successor claims. A signal handler of its own here
+	// would race cli.Main's, and a stop it saw first would unwind while the
+	// context serverEnded asks was still live, and exit 1.
+	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 
 	// THE CONTROLLER CLAIM, BEFORE ANYTHING POLLS GITHUB OR DISPATCHES A NODE.

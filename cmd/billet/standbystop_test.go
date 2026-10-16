@@ -221,7 +221,16 @@ func TestAStopWhileAdoptingTheAuthorityIsAStop(t *testing.T) {
 func TestRunServerAnswersEveryEndingOnce(t *testing.T) {
 	t.Parallel()
 
-	body := findFunc(t, "runServer").Body.List
+	fn := findFunc(t, "runServer")
+	body := fn.Body.List
+
+	// THE PROCESS'S OWN CONTEXT, the one a signal cancels, reaches both calls:
+	// asked of any other, a stop is a fault again.
+	if len(fn.Type.Params.List) == 0 || len(fn.Type.Params.List[0].Names) == 0 {
+		t.Fatal("runServer takes no context")
+	}
+
+	ctxName := fn.Type.Params.List[0].Names[0].Name
 	if len(body) != 3 {
 		t.Fatalf("runServer has %d statements, want three: run the control plane, return a "+
 			"probe's error as it is, return serverEnded's answer", len(body))
@@ -232,8 +241,9 @@ func TestRunServerAnswersEveryEndingOnce(t *testing.T) {
 		t.Fatal("runServer does not begin by assigning runControlPlane's two results")
 	}
 
-	if call, ok := assign.Rhs[0].(*ast.CallExpr); !ok || calleeName(call) != "runControlPlane" {
-		t.Fatal("runServer's first statement is not runControlPlane's call")
+	run, ok := assign.Rhs[0].(*ast.CallExpr)
+	if !ok || calleeName(run) != "runControlPlane" || len(run.Args) == 0 || !isIdent(run.Args[0], ctxName) {
+		t.Fatalf("runServer's first statement is not runControlPlane's call on %s", ctxName)
 	}
 
 	fenced, okFenced := assign.Lhs[0].(*ast.Ident)
@@ -260,10 +270,61 @@ func TestRunServerAnswersEveryEndingOnce(t *testing.T) {
 	}
 
 	call, ok := ret.Results[0].(*ast.CallExpr)
-	if !ok || calleeName(call) != "serverEnded" || len(call.Args) != 4 ||
+	if !ok || calleeName(call) != "serverEnded" || len(call.Args) != 4 || !isIdent(call.Args[0], ctxName) ||
 		!isIdent(call.Args[2], fenced.Name) || !isIdent(call.Args[3], errName.Name) {
 		t.Error("runServer does not return serverEnded's answer for runControlPlane's results, so " +
 			"a control plane asked to stop exits 1 again and every retirement of one refuses at intent")
+	}
+}
+
+// THE FENCE IS READ ONCE THE CONTROL PLANE HAS STOPPED. serveControlPlane stops
+// the wire and joins the controller's loops in its deferred calls, so a fence
+// read inside it would be read before them and miss a write refused during
+// teardown, and one read after runControlPlane's own deferred Close would read
+// a closed ledger. No hook lands a refusal in teardown, so the place is read
+// from the source: the read is runControlPlane's return, after the call that
+// serves, and serveControlPlane makes none.
+func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
+	t.Parallel()
+
+	calls := func(n ast.Node, name string) bool {
+		found := false
+
+		ast.Inspect(n, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && calleeName(call) == name {
+				found = true
+			}
+
+			return !found
+		})
+
+		return found
+	}
+
+	if calls(findFunc(t, "serveControlPlane").Body, "LeadershipLost") {
+		t.Error("serveControlPlane reads the fence itself, before its deferred calls stop the wire " +
+			"and join the controller's loops")
+	}
+
+	served, read := -1, -1
+
+	for i, stmt := range findFunc(t, "runControlPlane").Body.List {
+		if _, isDefer := stmt.(*ast.DeferStmt); isDefer {
+			continue
+		}
+
+		if calls(stmt, "serveControlPlane") && served < 0 {
+			served = i
+		}
+
+		if ret, ok := stmt.(*ast.ReturnStmt); ok && len(ret.Results) == 2 && calls(ret.Results[0], "LeadershipLost") {
+			read = i
+		}
+	}
+
+	if served < 0 || read <= served {
+		t.Errorf("runControlPlane does not return the fence read after serveControlPlane has "+
+			"returned (serve at statement %d, read at %d)", served, read)
 	}
 }
 
