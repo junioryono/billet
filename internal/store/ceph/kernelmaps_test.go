@@ -84,6 +84,11 @@ func newMapRig(t *testing.T, table string, inSession func(string) bool, readErr 
 				return []byte("[" + strings.Join(entries, ",") + "]"), nil
 			case strings.HasPrefix(joined, "--id site-reader --format json image-meta list billet-cache/"):
 				name := strings.TrimPrefix(args[len(args)-1], "billet-cache/")
+				// A READ STARTED ON A DONE CONTEXT FAILS, as rbd's would; one the
+				// pass is cancelled during (onMeta) still answers.
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if rig.onMeta != nil {
 					rig.onMeta()
 				}
@@ -535,6 +540,15 @@ func TestASecondSightingUnmapsOnlyAnHourAfterTheFirst(t *testing.T) {
 	if len(rig.unmaps) != 1 {
 		t.Errorf("a mapping unaccounted for an hour by two sightings was not released: %q", rig.unmaps)
 	}
+
+	// A RELEASED MAPPING THE TABLE STILL LISTS, as a second mapping of the image
+	// would be, starts its hour again rather than being unmapped at once.
+	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(rig.unmaps) != 1 {
+		t.Errorf("a mapping listed again after its release was unmapped without a fresh hour: %q", rig.unmaps)
+	}
 }
 
 // ONLY THIS NODE'S VOLUME IS UNMAPPED: the mapping table is the host's and the
@@ -558,7 +572,8 @@ func TestTheSweepUnmapsOnlyAVolumeThisNodeMapped(t *testing.T) {
 	), naming(), nil, false)
 	rig.mappers[theirs] = "deployment-b/node-1"
 	rig.noMapper[unrecorded] = true
-	rig.metaErr[unreadable] = errors.New("rbd: error opening image: (2) No such file or directory")
+	// NOT ENOENT, which asks the trash: a read that failed otherwise says nothing.
+	rig.metaErr[unreadable] = errors.New("rbd: image-meta list: (110) Connection timed out")
 
 	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
 		t.Fatal(err)
@@ -566,8 +581,8 @@ func TestTheSweepUnmapsOnlyAVolumeThisNodeMapped(t *testing.T) {
 	rig.nextPass()
 
 	report, err := c.SweepKernelMappings(t.Context())
-	if err == nil || !strings.Contains(err.Error(), unreadable) || strings.Contains(err.Error(), theirs) ||
-		strings.Contains(err.Error(), unrecorded) {
+	if err == nil || !strings.Contains(err.Error(), unreadable) || !strings.Contains(err.Error(), "read which node mapped") ||
+		strings.Contains(err.Error(), theirs) || strings.Contains(err.Error(), unrecorded) {
 		t.Errorf("want only the unreadable owner reported as a failure: %v", err)
 	}
 

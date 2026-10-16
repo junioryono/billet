@@ -204,11 +204,16 @@ type evictionRecorder struct {
 	sweepErr error
 	sweeping chan struct{}
 	held     bool
+	// onSweep runs as the sweep returns.
+	onSweep func()
 }
 
 func (e *evictionRecorder) SweepKernelMappings(context.Context) (ceph.MappingReport, error) {
 	e.calls = append(e.calls, "sweep")
 	e.held = len(e.sweeping) == 1
+	if e.onSweep != nil {
+		e.onSweep()
+	}
 
 	return e.report, e.sweepErr
 }
@@ -306,6 +311,21 @@ func TestACancelledEvictionPassEndsAfterTheSweep(t *testing.T) {
 
 	if got := strings.Join(store.calls, ","); got != "sweep" {
 		t.Errorf("a cancelled pass asked %s, want the sweep alone", got)
+	}
+
+	// AND A STOP THAT COMES DURING THE SWEEP ENDS THE PASS THERE TOO.
+	during, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	store = &evictionRecorder{sweeping: sweeping, onSweep: stop}
+	evictPass(during, store, func(context.Context) error {
+		store.calls = append(store.calls, "mirrors")
+
+		return nil
+	}, sweeping, slog.New(&logLines{}))
+
+	if got := strings.Join(store.calls, ","); got != "sweep" {
+		t.Errorf("a pass cancelled during its sweep asked %s, want the sweep alone", got)
 	}
 }
 
@@ -645,15 +665,31 @@ func TestOnlyTheEvictionPassSweepsTheKernelMappings(t *testing.T) {
 func TestTheDrainRequestIsLatchedAtItsFirstReading(t *testing.T) {
 	t.Parallel()
 
-	requested := false
-	latched := latchedDrainRequest(func() bool { return requested })
+	for _, first := range []bool{false, true} {
+		requested, reads := !first, 0
+		latched := latchedDrainRequest(func() bool {
+			reads++
 
-	if latched() {
-		t.Fatal("the first reading answered a drain nobody requested")
-	}
-	requested = true
-	if latched() {
-		t.Error("a request arriving after the first reading changed the answer")
+			return requested
+		})
+
+		// READ AT THE FIRST ASKING, NOT WHEN BUILT: Run builds it at startup, and
+		// a drain is requested only when a stop comes.
+		if reads != 0 {
+			t.Fatalf("the latch read the request %d times when built", reads)
+		}
+		requested = first
+
+		if got := latched(); got != first {
+			t.Errorf("the first reading answered %v, want what was requested then, %v", got, first)
+		}
+		requested = !first
+		if got := latched(); got != first {
+			t.Errorf("a request changed after the first reading turned %v into %v", first, got)
+		}
+		if reads != 1 {
+			t.Errorf("the request was read %d times, want once", reads)
+		}
 	}
 
 	if latchedDrainRequest(nil) != nil {
