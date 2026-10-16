@@ -427,33 +427,43 @@
     # a running node's lock (#175). These three are checked where they must be;
     # the packaged copy is pinned the same way in deploy/units_test.go. The
     # [Service] section ends at the next section header, so a directive moved
-    # into a trailing [Unit] or [Install] is outside it.
+    # into a trailing [Unit] or [Install] is outside it. Read as systemd reads
+    # it: a line may be indented and space its '=', and the LAST assignment in
+    # the section is the one in force, so a later `RuntimeDirectoryPreserve=no`
+    # undoes the `yes` before it.
     - name: The refresh's runtime directory directives are in [Service] in both copies
       vars:
         refresh_copies:
           - "{{ packaged_scheduled['billet-images-refresh.service'] }}"
           - "{{ role_scheduled['billet-images-refresh.service'] }}"
         service_section: '(?ms)^[ \t]*\[Service\][ \t]*$.*?(?=^[ \t]*\[|\Z)'
+        assigned: '(?m)^[ \t]*{{ item.key }}[ \t]*=[ \t]*(.*?)[ \t]*$'
+        # systemd ends a line at a lone carriage return too, which these
+        # patterns would not; neither copy may carry one.
+        carriage_return: '\r'
       ansible.builtin.assert:
         that: >-
-          {{ refresh_copies
+          {{ refresh_copies | select('search', carriage_return) | list | length == 0
+             and refresh_copies
              | map('regex_search', service_section)
-             | select('string')
-             | select('search', '(?m)^' ~ item ~ '=')
+             | map('default', '', true)
+             | map('regex_findall', assigned)
+             | map('last')
+             | select('equalto', item.value)
              | list | length == 2
              and refresh_copies
              | map('regex_replace', service_section, '')
-             | select('search', '(?m)^' ~ item ~ '=')
+             | select('search', assigned)
              | list | length == 0 }}
         fail_msg: >-
-          {{ item }} must be assigned inside [Service] in both
-          deploy/billet-images-refresh.service and the role's template. systemd
-          reads it nowhere else, and an ignored RuntimeDirectoryPreserve lets
-          this oneshot delete /run/billet/locks when it finishes.
-      loop:
-        - RuntimeDirectory
-        - RuntimeDirectoryMode
-        - RuntimeDirectoryPreserve
+          {{ item.key }}={{ item.value }} must be the last assignment of
+          {{ item.key }} inside [Service], and it must be assigned nowhere else,
+          in both deploy/billet-images-refresh.service and the role's template.
+          systemd reads it nowhere else, and an ignored or overridden
+          RuntimeDirectoryPreserve lets this oneshot delete /run/billet/locks
+          when it finishes.
+      loop: "{{ {'RuntimeDirectory': 'billet/locks', 'RuntimeDirectoryMode': '0750',
+                 'RuntimeDirectoryPreserve': 'yes'} | dict2items }}"
 
     # THE HOST LOCK DIRECTORY IS MADE ONE WAY ON EVERY HOST. The package installs
     # deploy/billet-tmpfiles.conf under /usr/lib/tmpfiles.d and the role renders
