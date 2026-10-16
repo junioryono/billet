@@ -1187,7 +1187,7 @@ func (l *Listener) Run(ctx context.Context) error {
 //
 // WHICH IS THE COST OF THIS ONE, AND THE REASON NOT TO REACH FOR IT MORE WIDELY.
 // It is a blanket collapse: a genuine storage fault racing a SIGTERM comes out of
-// here as a bare cancellation, and `onlyCancellation` then discards it. It is
+// here as a bare cancellation, and Run's `state.StoppedBy` then discards it. It is
 // used on the poll loop's paths, where a cancellation is the OVERWHELMING case
 // and the alternative is a drain that reports nothing. Adding it to a startup
 // path — which a round of this already tried — buys nothing the state layer does

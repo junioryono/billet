@@ -488,7 +488,10 @@ type fakeProvisioner struct {
 	onEnsure    func(label string) error
 	newSession  func(label string) Session
 	validateErr error
-	validated   []string
+	// onValidate, when set, answers ValidateTrustedRunnerGroup instead of
+	// validateErr.
+	onValidate func(group string) error
+	validated  []string
 
 	mu     sync.Mutex
 	next   int
@@ -535,5 +538,10 @@ func (f *fakeProvisioner) ValidateTrustedRunnerGroup(_ context.Context, group st
 	_ []string,
 ) error {
 	f.validated = append(f.validated, group)
+
+	if f.onValidate != nil {
+		return f.onValidate(group)
+	}
+
 	return f.validateErr
 }
