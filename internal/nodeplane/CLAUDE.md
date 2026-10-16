@@ -7,4 +7,4 @@ The control plane's half of the node wire: routes, guards, dispatch, and the com
 - Commands to a host are a queue with a ten-minute timeout that starts when queued. A node runs one at a time, except launches on a provider that allows several (four on Firecracker), and every other command waits for the launches in flight.
 - An inventory is an observation, never permission to claim another node's lease, and a proof of absence is two observations spanning the grace.
 
-Gates: `make check`.
+Gates (CI runs them on every push; locally, `make verify`): `make check`.

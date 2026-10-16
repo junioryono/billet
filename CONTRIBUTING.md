@@ -25,6 +25,7 @@ make check     # the pre-commit gate
 | Command | What it does | In `make check`? |
 |---|---|---|
 | `make check` | `no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources` | it is the gate |
+| `make verify` | gofmt, `go build ./...`, then vet, tests without `-race` and golangci-lint on only the packages this checkout changed against origin/main; the check a Claude session runs while working, since CI runs the full gate on every push | no |
 | `make test` | `go test -race -count=1 -covermode=atomic ./...`; the coverage counters are part of the gate because they reorder goroutines | yes |
 | `make lint` | golangci-lint (pinned) for the host **and** for `GOOS=linux`, because a linter only sees the files it would compile | yes |
 | `make lint-custom` | build `tools/lint`, run its own tests, run `billetlint` for darwin/arm64 and linux/amd64 | yes |
@@ -36,7 +37,7 @@ make check     # the pre-commit gate
 | `make dist` | build the release artifacts exactly as a tag would | no |
 | `make package-lifecycle`, `make restore-rehearsal`, `make postgres-restore-rehearsal`, `make systemd-lifecycle` | the real-package rehearsals | no; CI runs the first three |
 
-A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Do not push work that has not passed `make check`, and expect CI to catch the rest.
+A green `make check` is necessary rather than sufficient: CI additionally proves `go mod tidy` leaves no diff, runs the suite against a real PostgreSQL, runs `govulncheck`, cross-builds, and runs everything in the table's "no" rows. Before pushing, run `make check` if you want the whole gate on your own machine, or `make verify` for what you changed; either way the pull request needs a green CI run, which runs the full gate and the rest. A Claude session runs `make verify` and reads CI, and the repository's hook refuses it the full gate unless Claude Code was started with `CLAUDE_FULL_CHECKS=1`.
 
 ## Making changes
 

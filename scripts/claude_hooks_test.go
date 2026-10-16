@@ -16,12 +16,15 @@ const claudeGuardScript = "../.claude/hooks/guard.py"
 
 // hookEnv is the environment every fixture git command and every hook run
 // gets: no global or system git configuration and no inherited GIT_ variable,
-// so a developer's hooksPath or GIT_DIR cannot reach a fixture.
+// so a developer's hooksPath or GIT_DIR cannot reach a fixture; and neither CI
+// nor CLAUDE_FULL_CHECKS, which change what the bash hook refuses, so a case
+// reads the same on a laptop and in CI unless it sets one itself.
 func hookEnv(extra ...string) []string {
 	var env []string
 
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
+		name, _, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(kv, "GIT_") && name != "CI" && name != "CLAUDE_FULL_CHECKS" {
 			env = append(env, kv)
 		}
 	}
@@ -423,6 +426,206 @@ func TestTheBashHookRefusesAPullThatWouldRebase(t *testing.T) {
 
 	code, stderr = runClaudeGuard(t, "bash", root, bashPayload(root, "git pull --no-rebase"))
 	expectHook(t, "git pull --no-rebase with pull.rebase", code, stderr, "")
+}
+
+// THE BASH GUARD REFUSES THE FULL GATES, which CI runs on every push, and points
+// at `make verify`; it lets every targeted check through, and a command line it
+// cannot read.
+func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T) {
+	t.Parallel()
+
+	root := claudeHookRepo(t, bothRefs)
+	hookWrite(t, root, "go.mod", "module github.com/junioryono/billet\n\ngo 1.26\n")
+	hookWrite(t, root, "tools/lint/go.mod", "module github.com/junioryono/billet/tools/lint\n\ngo 1.26\n")
+
+	const (
+		gate      = "make verify"
+		bare      = "default goal, `check`"
+		tree      = "over the whole tree"
+		race      = "-race` across several packages"
+		module    = "over the whole module"
+		files     = "lint packages, never files"
+		parallel  = "never --allow-parallel-runners"
+		worktrees = "outside .claude/worktrees/"
+	)
+
+	for _, tc := range []struct{ command, refuse string }{
+		{"make check", gate},
+		{"make", bare},
+		{"make -j4", bare},
+		{"make -k", bare},
+		{"make CHECK_LOCK=/tmp/x", bare},
+		{"make > /tmp/check.log", bare},
+		{"make >/tmp/check.log 2>&1", bare},
+		{"make -j 4", bare},
+		{"make --jobs 4", bare},
+		{"make -l 2.5", bare},
+		{"make -C .", bare},
+		{"make -f Makefile", bare},
+		{"make -C . -f Makefile -j 4", bare},
+		{"golangci-lint run > /tmp/lint.log", module},
+		{"golangci-lint --color always run ./...", module},
+		{"golangci-lint run --allow-parallel-runners=true ./internal/alloc", parallel},
+		{"go test -race ./internal/alloc ./internal/state > /tmp/test.log", race},
+		{"go test -run '>' ./...", tree},
+		{"go test -run \">\" ./...", tree},
+		{"go test -run \\> ./...", tree},
+		{"make 2>&1 check", gate},
+		{"make 2>'/tmp/a log' check", gate},
+		{"make >\"/tmp/a log\" check", gate},
+		{"make 2>&1", bare},
+		{"go test -race 2>&1 ./internal/alloc ./internal/state", race},
+		{"git push origin 2>&1", "must name what it pushes"},
+		{"git push origin >/dev/null 2>&1", "must name what it pushes"},
+		{"git push --force origin junior-oct03-work > /tmp/push.log 2>&1", "force"},
+		{"git push origin 2>/dev/null main", "never pushes to main"},
+		// A redirection whose target never closes its quote leaves the line
+		// unreadable, and the git rules still refuse what they cannot read.
+		{"echo x >'unterminated; git push --force origin junior-oct03-work", "could not be parsed"},
+		{"echo x >\"unterminated; git rebase main", "could not be parsed"},
+		{"echo x >\"$(printf 'unterminated; git rebase main", "could not be parsed"},
+		// A target holding a quoted command substitution is one word.
+		{"git push origin junior-oct03-work >\"$(printf '\"')\"", ""},
+		{"git push origin junior-oct03-work >$(printf '%s' \"a)b\").log; git rebase main", "merging"},
+		{"make check >\"$(date '+%H)%M').log\"", gate},
+		{"make >$(printf ')') check", "`make check` is a full gate"},
+		{"make >$(printf ')') verify", ""},
+		{"make >$(mktemp) verify", ""},
+		// A target that runs across a line can hide a quote or a parenthesis in a
+		// comment or a heredoc, so the line is unreadable, which the git rules
+		// refuse and the gate rules let through.
+		{"echo x >$(printf log # (\n); git rebase main # )", "could not be parsed"},
+		{"echo x >$(cat <<'EOF'\n(\nEOF\n); git rebase main # )", "could not be parsed"},
+		{"git >$(printf log\n) rebase main", "could not be parsed"},
+		{"echo x >$(printf log # '\n); git rebase main # ')", "could not be parsed"},
+		{"echo x >$(printf log # '\\\n); git rebase main # ')", "could not be parsed"},
+		{"make >$(printf log\n) check", ""},
+		{"make verify > /tmp/verify.log\ngit status", ""},
+		{"git push origin junior-oct03-work > /tmp/a\\\nb.log", ""},
+		// A line continuation joins words before a descriptor is read.
+		{"make 2\\\n>/dev/null", bare},
+		{"make check 2\\\n>/dev/null", gate},
+		{"make > \\\n /tmp/make.log", bare},
+		{"git push origin main\\\n2>/dev/null", ""},
+		{"git push origin junior-oct03-work 2>\\\n/dev/null", ""},
+		{"make test", gate},
+		{"make lint", gate},
+		{"make lint-custom", gate},
+		{"make cross", gate},
+		{"make check-unlocked", gate},
+		{"make cover", gate},
+		{"make -j 4 check", gate},
+		{"make --no-print-directory -C . check", gate},
+		{"gmake check", gate},
+		{"make build lint", gate},
+		{"CLAUDE_FULL_CHECKS=1 make check", gate},
+		{"env CLAUDE_FULL_CHECKS=1 make check", gate},
+		{"export CLAUDE_FULL_CHECKS=1; make check", gate},
+		{"nice -n 10 make check", gate},
+		{"timeout 600 make check", gate},
+		{"timeout -k 10 600 make test", gate},
+		{"bash -c 'make check'", gate},
+		{"make build && make check 2>&1 | tail -20", gate},
+		{"go test ./...", tree},
+		{"go test -count=1 -race ./...", tree},
+		{"GOMAXPROCS=4 go test -p 2 ./...", tree},
+		{"go test all", tree},
+		{"go test github.com/junioryono/billet/...", tree},
+		{"cd tools/lint && cd ../.. && go test ./...", tree},
+		{"go -C . test ./...", tree},
+		{"go test -race ./internal/alloc ./internal/state", race},
+		{"go test -race ./internal/...", race},
+		{"go test -race=true -run TestX ./internal/alloc ./internal/node", race},
+		{"golangci-lint run", module},
+		{"golangci-lint run --allow-serial-runners", module},
+		{"golangci-lint run --timeout 5m", module},
+		{"golangci-lint run ./...", module},
+		{"golangci-lint run internal/alloc/alloc.go", files},
+		{"golangci-lint run --allow-parallel-runners ./internal/alloc", parallel},
+		{"git worktree add ../billet-feature -b junior-oct15-x", worktrees},
+		{"git worktree add /tmp/billet-x origin/main", worktrees},
+		{"git worktree add -b junior-oct15-x ../elsewhere", worktrees},
+		{"git worktree add .claude/other/x", worktrees},
+		{"make verify", ""},
+		{"make docs", ""},
+		{"make build", ""},
+		{"make -n check", ""},
+		{"make -nk check", ""},
+		{"make --dry-run test", ""},
+		{"make help", ""},
+		{"make sqlc-check", ""},
+		{"make tf-fmt-check tf-validate", ""},
+		{"make -C docs html", ""},
+		{"make -f other.mk", ""},
+		{"make -Cdocs", ""},
+		{"make -C test", ""},
+		{"cd docs && make", ""},
+		{"make -j 4 verify", ""},
+		{"make verify > /tmp/verify.log 2>&1", ""},
+		{"make 2>&1 verify", ""},
+		{"make lint2>/dev/null", ""},
+		{"make &>/tmp/verify.log verify", ""},
+		{"go test -run '>' ./internal/alloc", ""},
+		{"golangci-lint run 2>/dev/null --allow-serial-runners ./internal/alloc", ""},
+		{"git push -u origin junior-oct03-work 2>&1 | tail -5", ""},
+		{"git commit -m 'a > b' 2>&1", ""},
+		{"go test -race ./internal/alloc > /tmp/test.log", ""},
+		{"go test -race -run TestX ./internal/alloc 2>&1 | tail -20", ""},
+		{"golangci-lint run --allow-serial-runners ./internal/alloc > /tmp/lint.log", ""},
+		{"golangci-lint run --allow-parallel-runners=false ./internal/alloc", ""},
+		{"echo make check", ""},
+		{"grep -n 'make check' Makefile", ""},
+		{"go build ./...", ""},
+		{"go vet ./internal/alloc", ""},
+		{"go test ./internal/alloc", ""},
+		{"go test ./internal/alloc ./internal/state", ""},
+		{"go test ./internal/...", ""},
+		{"go test -run TestX ./internal/alloc", ""},
+		{"go test -race -run TestX ./internal/alloc", ""},
+		{"go test -race", ""},
+		{"go test -race=false ./internal/alloc ./internal/state", ""},
+		{"go test -run ./... ./internal/alloc", ""},
+		{"cd tools/lint && go test ./...", ""},
+		{"go test -C tools/lint ./...", ""},
+		{"golangci-lint run --allow-serial-runners ./internal/alloc", ""},
+		{"golangci-lint run --timeout 5m ./internal/alloc ./internal/state", ""},
+		{"golangci-lint version", ""},
+		{"golangci-lint fmt", ""},
+		{"git worktree add .claude/worktrees/feature -b junior-oct15-x origin/main", ""},
+		{"git worktree add -b junior-oct15-x .claude/worktrees/x origin/main", ""},
+		{"git worktree add " + filepath.Join(root, ".claude", "worktrees", "y"), ""},
+		{"git -C " + root + " worktree add .claude/worktrees/z", ""},
+		{"git worktree add /private/tmp/claude-501/project/session/scratchpad/wt", ""},
+		{"git worktree add /tmp/claude-501/project/session/scratchpad/wt", ""},
+		{"git worktree list", ""},
+		{"git worktree remove ../billet-feature", ""},
+		// What cannot be read passes: these judgements fail open.
+		{"make check '", ""},
+		{"go test ./... \"", ""},
+	} {
+		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command))
+		expectHook(t, tc.command, code, stderr, tc.refuse)
+	}
+
+	// Only the hook's own environment lifts the gate refusals, and only to 1; a CI
+	// environment skips every one of these judgements.
+	for _, tc := range []struct{ env, command, refuse string }{
+		{"CLAUDE_FULL_CHECKS=1", "make check", ""},
+		{"CLAUDE_FULL_CHECKS=1", "make", ""},
+		{"CLAUDE_FULL_CHECKS=1", "go test -race ./...", ""},
+		{"CLAUDE_FULL_CHECKS=1", "golangci-lint run", ""},
+		{"CLAUDE_FULL_CHECKS=1", "git worktree add ../billet-feature", worktrees},
+		{"CLAUDE_FULL_CHECKS=1", "make check && git push origin main", "never pushes to main"},
+		{"CLAUDE_FULL_CHECKS=0", "make check", gate},
+		{"CLAUDE_FULL_CHECKS=", "make check", gate},
+		{"CI=true", "make check", ""},
+		{"CI=true", "go test -race ./...", ""},
+		{"CI=true", "git worktree add ../billet-feature", ""},
+		{"CI=true", "git rebase main", "merging"},
+	} {
+		code, stderr := runClaudeGuard(t, "bash", root, bashPayload(root, tc.command), tc.env)
+		expectHook(t, tc.env+" "+tc.command, code, stderr, tc.refuse)
+	}
 }
 
 // THE FORMAT HOOK REFORMATS GO, LEAVES EVERYTHING ELSE, AND NEVER REFUSES.
