@@ -6,9 +6,11 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -17,13 +19,16 @@ import (
 
 // THE RUNNER IS CHECKED BEFORE IT IS UNPACKED, and the check is run, not read.
 //
-// The fragment is lifted out of the rendered script and executed against a real
-// tarball and a tampered one, under every shell that might run it, WITHOUT
-// `set -e` as well as with it: the script runs under `set -eux`, and a check
-// that only holds because of it is a check one edit away from a `;` chain that
-// prints FAILED and extracts anyway. The line after the fragment stands in for
-// the rest of the script, poweroff included, so "the build stopped" is observed
-// rather than inferred from an exit status.
+// The fragment is lifted out of the rendered script, for each architecture, and
+// executed against a genuine tarball, a tampered one, a refused download and one
+// cut off partway, under every shell that might run it, WITHOUT `set -e` as well
+// as with it: the script runs under `set -eux`, and a check that only holds
+// because of it is a check one edit away from a `;` chain that prints FAILED and
+// extracts anyway. The line after the fragment stands in for the rest of the
+// script, poweroff included, so "the build stopped" is observed rather than
+// inferred. The exit status says WHICH step stopped it: under `set -e` a failed
+// curl ends the script with curl's own status, and everywhere else it is the
+// check, which must say so.
 func TestTheRunnerIsCheckedBeforeItIsUnpacked(t *testing.T) {
 	t.Parallel()
 
@@ -37,14 +42,6 @@ func TestTheRunnerIsCheckedBeforeItIsUnpacked(t *testing.T) {
 	sum := sha256.Sum256(genuine)
 	digest := hex.EncodeToString(sum[:])
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
-		RunnerSHA256: digest, RunnerVersion: "2.328.0", Arch: "x64"})
-	if err != nil {
-		t.Fatalf("provisionScript: %v", err)
-	}
-
-	fragment := runnerFetchBlock(t, script)
-
 	const rest = "billet-reached-the-rest-of-the-script"
 
 	shells := []string{"sh"}
@@ -54,124 +51,160 @@ func TestTheRunnerIsCheckedBeforeItIsUnpacked(t *testing.T) {
 		}
 	}
 
-	for _, tc := range []struct {
-		name    string
-		tarball []byte
-		// download false makes the fake curl fail as a refused download does.
-		download bool
-		wantOK   bool
-	}{
-		{name: "the release billet pins", tarball: genuine, download: true, wantOK: true},
-		{name: "a tarball that is not that release", tarball: tampered, download: true},
-		{name: "a download that failed", download: false},
+	for _, arch := range []struct{ arch, platform string }{
+		{"x64", "linux-x64"},
+		{"arm64", "linux-arm64"},
 	} {
-		for _, shell := range shells {
-			for _, errexit := range []bool{false, true} {
-				name := tc.name + "/" + shell
-				if errexit {
-					name += "/set -e"
-				}
+		script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL,
+			payloadSHA256: testPayloadDigest, RunnerSHA256: digest, RunnerVersion: "2.328.0",
+			Arch: arch.arch})
+		if err != nil {
+			t.Fatalf("provisionScript(%s): %v", arch.arch, err)
+		}
 
-				t.Run(name, func(t *testing.T) {
-					t.Parallel()
+		fragment := runnerFetchBlock(t, script)
+		wantURL := "https://github.com/actions/runner/releases/download/v2.328.0/" +
+			"actions-runner-" + arch.platform + "-2.328.0.tar.gz\n"
 
-					src := t.TempDir()
-					work := t.TempDir()
-
-					fixture := ""
-					if tc.download {
-						fixture = filepath.Join(src, "served.tar.gz")
-						if err := os.WriteFile(fixture, tc.tarball, 0o600); err != nil {
-							t.Fatalf("write the served tarball: %v", err)
-						}
-					}
-
-					urlFile := filepath.Join(src, "url")
-
-					// A curl FUNCTION, not an executable on PATH: a parallel test's
-					// fork can hold the descriptor that wrote one, and exec then fails
-					// with ETXTBSY (see TestTheFreeSpaceGuardRefusesWhatItCannotRead).
-					fake := "curl() {\n" +
-						"  out=''\n" +
-						"  while [ \"$#\" -gt 0 ]; do\n" +
-						"    case \"$1\" in\n" +
-						"      -o) out=$2; shift ;;\n" +
-						"      https://*) printf '%s\\n' \"$1\" > \"$BILLET_TEST_URL\" ;;\n" +
-						"    esac\n" +
-						"    shift\n" +
-						"  done\n" +
-						"  [ -n \"$BILLET_TEST_FIXTURE\" ] || return 22\n" +
-						"  cp \"$BILLET_TEST_FIXTURE\" \"$out\"\n" +
-						"}\n"
-
-					prelude := ""
+		for _, tc := range []struct {
+			name string
+			// served is what the fake curl writes before it exits with curlStatus;
+			// nil writes nothing, as a refused download does.
+			served     []byte
+			curlStatus int
+			wantOK     bool
+		}{
+			{name: "the release billet pins", served: genuine, wantOK: true},
+			{name: "a tarball that is not that release", served: tampered},
+			{name: "a download that was refused", curlStatus: 22},
+			// curl's 18 is a partial transfer, and it leaves the bytes it got.
+			{name: "a download cut off partway", served: genuine[:len(genuine)/2], curlStatus: 18},
+		} {
+			for _, shell := range shells {
+				for _, errexit := range []bool{false, true} {
+					name := arch.arch + "/" + tc.name + "/" + shell
 					if errexit {
-						prelude = "set -e\n"
+						name += "/set -e"
 					}
 
-					cmd := exec.CommandContext(t.Context(), shell, "-c",
-						prelude+fake+fragment+"echo "+rest+"\n")
-					cmd.Dir = work
-					cmd.Env = append(os.Environ(),
-						"BILLET_TEST_FIXTURE="+fixture, "BILLET_TEST_URL="+urlFile)
+					t.Run(name, func(t *testing.T) {
+						t.Parallel()
 
-					out, err := cmd.CombinedOutput()
+						src := t.TempDir()
+						work := t.TempDir()
 
-					_, statErr := os.Stat(filepath.Join(work, "run.sh"))
-					extracted := statErr == nil
-
-					if tc.wantOK {
-						if err != nil {
-							t.Fatalf("the check refused the release it pins: %v\n%s", err, out)
+						fixture := ""
+						if tc.served != nil {
+							fixture = filepath.Join(src, "served.tar.gz")
+							if err := os.WriteFile(fixture, tc.served, 0o600); err != nil {
+								t.Fatalf("write the served tarball: %v", err)
+							}
 						}
 
-						if !extracted {
-							t.Fatalf("the check passed and nothing was unpacked\n%s", out)
+						urlFile := filepath.Join(src, "url")
+
+						// A curl FUNCTION, not an executable on PATH: a parallel test's
+						// fork can hold the descriptor that wrote one, and exec then
+						// fails with ETXTBSY (see TestTheFreeSpaceGuardRefusesWhatItCannotRead).
+						fake := "curl() {\n" +
+							"  out=''\n" +
+							"  while [ \"$#\" -gt 0 ]; do\n" +
+							"    case \"$1\" in\n" +
+							"      -o) out=$2; shift ;;\n" +
+							"      https://*) printf '%s\\n' \"$1\" > \"$BILLET_TEST_URL\" ;;\n" +
+							"    esac\n" +
+							"    shift\n" +
+							"  done\n" +
+							"  if [ -n \"$BILLET_TEST_FIXTURE\" ]; then cp \"$BILLET_TEST_FIXTURE\" \"$out\"; fi\n" +
+							"  return \"$BILLET_TEST_CURL_STATUS\"\n" +
+							"}\n"
+
+						prelude := ""
+						if errexit {
+							prelude = "set -e\n"
 						}
 
-						if _, err := os.Stat(filepath.Join(work, "runner.tar.gz")); !os.IsNotExist(err) {
-							t.Errorf("the tarball was left behind in the image (stat: %v)", err)
+						cmd := exec.CommandContext(t.Context(), shell, "-c",
+							prelude+fake+fragment+"echo "+rest+"\n")
+						cmd.Dir = work
+						cmd.Env = append(os.Environ(),
+							"BILLET_TEST_FIXTURE="+fixture, "BILLET_TEST_URL="+urlFile,
+							"BILLET_TEST_CURL_STATUS="+strconv.Itoa(tc.curlStatus))
+
+						out, err := cmd.CombinedOutput()
+
+						_, statErr := os.Stat(filepath.Join(work, "run.sh"))
+						if statErr != nil && !os.IsNotExist(statErr) {
+							t.Fatalf("could not tell whether a runner was unpacked: %v", statErr)
 						}
 
-						if !strings.Contains(string(out), rest) {
-							t.Errorf("the script stopped after a runner that verified\n%s", out)
+						extracted := statErr == nil
+
+						url, urlErr := os.ReadFile(urlFile)
+						if urlErr != nil {
+							t.Fatalf("the fragment never called curl: %v\n%s", urlErr, out)
 						}
 
-						url, err := os.ReadFile(urlFile)
-						if err != nil {
-							t.Fatalf("the fake curl recorded no URL: %v", err)
+						if string(url) != wantURL {
+							t.Errorf("the runner was fetched from %q, want %q", url, wantURL)
 						}
 
-						want := "https://github.com/actions/runner/releases/download/v2.328.0/" +
-							"actions-runner-linux-x64-2.328.0.tar.gz\n"
-						if string(url) != want {
-							t.Errorf("the runner was fetched from %q, want %q", url, want)
+						if tc.wantOK {
+							if err != nil {
+								t.Fatalf("the check refused the release it pins: %v\n%s", err, out)
+							}
+
+							if !extracted {
+								t.Fatalf("the check passed and nothing was unpacked\n%s", out)
+							}
+
+							if _, err := os.Stat(filepath.Join(work, "runner.tar.gz")); !os.IsNotExist(err) {
+								t.Errorf("the tarball was left behind in the image (stat: %v)", err)
+							}
+
+							if !strings.Contains(string(out), rest) {
+								t.Errorf("the script stopped after a runner that verified\n%s", out)
+							}
+
+							return
 						}
 
-						return
-					}
+						var exit *exec.ExitError
+						if !errors.As(err, &exit) {
+							t.Fatalf("the shell did not run the fragment to an exit status: %v\n%s",
+								err, out)
+						}
 
-					if err == nil {
-						t.Fatalf("the fragment exited 0 for %s; the build would go on to "+
-							"poweroff and billet would image it\n%s", tc.name, out)
-					}
+						if extracted {
+							t.Errorf("a runner was unpacked from %s\n%s", tc.name, out)
+						}
 
-					if extracted {
-						t.Errorf("a runner was unpacked from %s\n%s", tc.name, out)
-					}
+						if strings.Contains(string(out), rest) {
+							t.Errorf("the script carried on past %s, so the rest of the "+
+								"build, poweroff included, would run\n%s", tc.name, out)
+						}
 
-					if strings.Contains(string(out), rest) {
-						t.Errorf("the script carried on past %s, so the rest of the "+
-							"build, poweroff included, would run\n%s", tc.name, out)
-					}
+						// WHICH STEP STOPPED IT. Only `set -e` with a failed curl ends
+						// the script before the check; every other path must be the
+						// check's own refusal, with its status and its sentence.
+						checkStops := !errexit || tc.curlStatus == 0
 
-					// THE DIAGNOSTIC, where the check is what refused: a fixture this
-					// test broke would also exit non-zero, for some other reason.
-					if tc.download && !strings.Contains(string(out), "does not hash to "+digest) {
-						t.Errorf("the refusal does not name the digest the tarball "+
-							"failed\n%s", out)
-					}
-				})
+						wantStatus := 1
+						if !checkStops {
+							wantStatus = tc.curlStatus
+						}
+
+						if exit.ExitCode() != wantStatus {
+							t.Errorf("the fragment exited %d for %s, want %d\n%s",
+								exit.ExitCode(), tc.name, wantStatus, out)
+						}
+
+						if checkStops && !strings.Contains(string(out), "does not hash to "+digest) {
+							t.Errorf("the check is what stopped %s and its refusal does not "+
+								"name the digest\n%s", tc.name, out)
+						}
+					})
+				}
 			}
 		}
 	}
