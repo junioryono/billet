@@ -46,9 +46,10 @@
 // has already overflowed, and gives no measure of by how much.
 //
 // A round whose delay was not measured, because most of the reflectors went
-// unanswered, is never read as a delay: it counts as neither delayed nor clear,
-// so it never raises a rate and cuts only by the loss rule. A round that counted
-// no reflector at all is a could-not-tell, and neither cuts nor raises.
+// unanswered, is never read as the reflectors' delay: it counts as neither
+// delayed nor clear by them, so it never raises a rate and cuts only by the loss
+// rule or a confirmed gateway stall. A round that counted no reflector at all is
+// a could-not-tell, and neither cuts nor raises.
 //
 // The default route's gateway is asked each round too, against a baseline of
 // its own, because a host beside the reference node saw its gateway stall (1.6
@@ -57,13 +58,14 @@
 // most four rounds before it (readGateway), a reply slipped between them or
 // not, though a quiet pair between ends the stall, makes a round delayed for a
 // cut as the reflectors' does, so its stall cuts as their delay would, save a
-// lone spike; the stall spans one of the rounds it went unread between the two,
-// so a gateway answering one probe in three still cuts, but never more, so two
-// pings alone never do. One high reading keeps an episode from ending and a
-// rate from rising, and a quiet reading clears a stall unless a high one stands
-// just before it, one reply slipping through. All of it only in a round that
-// counted a reflector, and while the gateway stalls a round it gave no reading
-// in is not clear. A cut's effect is judged on two readings too, and on the
+// lone spike; the pair covers one earlier round too, nearest first: its first
+// reading's, when the two are in a row, or one it went unread in between, so a
+// gateway answering one probe in three still cuts; but never more, so two pings
+// alone never do. One high reading keeps an episode from ending and a rate from
+// rising, and a quiet reading clears a stall unless a high one stands just
+// before it, one reply slipping through. All of it only in a round that counted
+// a reflector, and while the gateway stalls a round it gave no reading in is
+// not clear. A cut's effect is judged on two readings too, and on the
 // reflectors' loss only when the line was dropping at the cut. Its unanswered
 // probes are never loss, because a gateway answers ICMP when it has the time
 // (the reference node's went unanswered about 2% of the time with the line
@@ -353,9 +355,9 @@ type Controller struct {
 	// round counts the rounds stepped. lastGateway and lastHigh are the
 	// gateway's last counted reading and its last one over Bloat since its last
 	// quiet pair, with the rounds they were read in, which a reading now pairs
-	// with; gatewayStalled is
-	// whether the last counted reading was over Bloat, or quiet beside one that
-	// was, which decides what a round it gave no reading in says.
+	// with; gatewayStalled is whether the last counted reading was over Bloat, or
+	// quiet beside one that was, which decides what a round it gave no reading in
+	// says.
 	round                           int
 	lastGateway, lastHigh           measured
 	lastGatewayRound, lastHighRound int
