@@ -1901,7 +1901,15 @@ func newHostFor(env cli.Env, cfg *config.Config, cfgPath, staged string,
 const (
 	nodeUnit   = "billet-node.service"
 	serverUnit = "billet-server.service"
+	// uplinkUnit is the uplink shaper the host role installs where it enables
+	// `billet uplink shape`; the package does not ship it.
+	uplinkUnit = "billet-uplink.service"
 )
+
+// uplinkRestartBound is how long the shaper's restart may take: systemd's
+// default stop and start bounds (TimeoutStopSec and TimeoutStartSec, ninety
+// seconds each, which the role's unit leaves alone) and the settle window.
+const uplinkRestartBound = 3*time.Minute + lifecycleDeadlineMargin
 
 // StopNode stops the node and proves it stopped.
 //
@@ -2880,6 +2888,28 @@ func (h *systemdHost) ProveStable(ctx context.Context) error {
 			return fmt.Errorf("%s is %s after %s, so it did not stay up",
 				svc.unit, svc.facts.ActiveState, stabilityWait)
 		}
+	}
+
+	return nil
+}
+
+// RestartUplink restarts a running, enabled uplink shaper onto the installed
+// billet, and says what it did either way: the transaction replaces
+// /usr/bin/billet under it, and a shaper nobody restarts runs the release it
+// started from until it notices the replacement itself.
+func (h *systemdHost) RestartUplink(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, uplinkRestartBound)
+	defer cancel()
+
+	done, err := h.converge.RestartIfRunning(ctx, uplinkUnit)
+	if err != nil {
+		return fmt.Errorf("restarting %s onto the installed billet: %w", uplinkUnit, err)
+	}
+
+	if done.Restarted {
+		fmt.Fprintf(h.env.Stdout, "  restarted %s onto the installed billet (%s)\n", uplinkUnit, done.How)
+	} else {
+		fmt.Fprintf(h.env.Stdout, "  left %s alone: %s\n", uplinkUnit, done.How)
 	}
 
 	return nil

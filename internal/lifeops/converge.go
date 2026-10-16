@@ -1575,6 +1575,72 @@ func (c *Converger) StartTimer(ctx context.Context, unit string) error {
 	return nil
 }
 
+// Restarted is what RestartIfRunning did to a unit.
+type Restarted struct {
+	// Restarted is whether the unit was restarted and proved holding its new
+	// process; false is a unit left alone.
+	Restarted bool
+	// How is why a unit was left alone, or how the restart ended, in systemd's
+	// words.
+	How string
+}
+
+// RestartIfRunning restarts a unit that is installed, enabled and running, and
+// proves it held its new process. A unit that is not installed, not enabled or
+// not running is left alone and the answer says which. It is for a process
+// beside billet's own services, the uplink shaper, that has to move onto a
+// binary replaced under it.
+//
+// A STATE SYSTEMD DID NOT STATE IS AN ERROR, never "not running": the caller
+// reports it, and a restart billet could not tell it should make is one it does
+// not make. Only exactly `enabled` is enabled, as in EnabledNow.
+//
+// THE RESTART RUNS UNDER THE CALLER'S CONTEXT AND NO DEADLINE OF ITS OWN, as a
+// start or a stop does: the caller derives the bound from the unit's.
+func (c *Converger) RestartIfRunning(ctx context.Context, unit string) (Restarted, error) {
+	props, err := c.inspector.properties(ctx, unit, "LoadState", "UnitFileState", "ActiveState")
+	if err != nil {
+		return Restarted{}, fmt.Errorf("ask systemd about %s: %w", unit, err)
+	}
+
+	switch load := first(props, "LoadState"); load {
+	case "not-found", "masked":
+		return Restarted{How: "LoadState=" + load}, nil
+	case "loaded":
+	default:
+		return Restarted{}, fmt.Errorf("systemd reports %s as LoadState=%q, so billet cannot tell whether "+
+			"it should be restarted", unit, load)
+	}
+
+	switch state := first(props, "UnitFileState"); state {
+	case "enabled":
+	case "":
+		return Restarted{}, fmt.Errorf("systemd gave no UnitFileState for %s, so billet cannot tell whether "+
+			"it is enabled", unit)
+	default:
+		return Restarted{How: "not enabled (UnitFileState=" + state + ")"}, nil
+	}
+
+	switch active := first(props, "ActiveState"); active {
+	case "active", "activating", "reloading":
+	case "inactive", "failed", "deactivating":
+		return Restarted{How: "not running (ActiveState=" + active + ")"}, nil
+	default:
+		return Restarted{}, fmt.Errorf("systemd reports %s as ActiveState=%q, so billet cannot tell whether "+
+			"it runs", unit, active)
+	}
+
+	if _, err := c.inspector.exec(ctx, []string{"restart", "--", unit}); err != nil {
+		return Restarted{}, fmt.Errorf("restart %s: %w", unit, err)
+	}
+
+	if err := c.ProveStable(ctx, unit); err != nil {
+		return Restarted{}, err
+	}
+
+	return Restarted{Restarted: true, How: "restarted, and still running after the settle window"}, nil
+}
+
 // Enablement is whether a service will start itself at the next boot.
 //
 // A VERDICT AND A WORD, rather than the manager's raw string. systemd answers

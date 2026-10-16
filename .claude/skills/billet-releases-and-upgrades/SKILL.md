@@ -41,6 +41,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **One transaction, two service managers, three ledgers.**
 - **Two answers over a Unix socket, and a spawn is not an answer.**
 - **The probe answers by exiting or by saying it is ready, the candidate says which, and the fence is cleared under the reason it was written with.**
+- **The uplink shaper is moved onto the binary the transaction leaves, last, and its failure decides nothing.**
 - **A host keeps its three newest decided recovery directories (`pruneRecoveries`).**
 - **The claim bounds concurrency; the decision mark fences generations; the transaction lock is a lock.**
 

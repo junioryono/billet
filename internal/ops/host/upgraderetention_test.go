@@ -182,6 +182,7 @@ func (committedHost) RecordInstalled(context.Context, string, string) error { re
 func (committedHost) ClearFence(context.Context, string) error              { return nil }
 func (committedHost) StartServices(context.Context) error                   { return nil }
 func (committedHost) ProveStable(context.Context) error                     { return nil }
+func (committedHost) RestartUplink(context.Context) error                   { return nil }
 
 func TestAFinishedUpgradeRemovesOlderRecoveries(t *testing.T) {
 	root := useRecoveryRoot(t)

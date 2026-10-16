@@ -305,7 +305,9 @@
 # transaction left: the transaction and its rollback stopped it so its cleanup
 # could run while the executable was there, and a rollback or a recovery ends
 # this converge before uplink.yml would start it. Started only where it was
-# enabled, because the role enables it only where it can shape.
+# enabled, because the role enables it only where it can shape. A START THAT
+# FAILS IS SAID AND DECIDES NOTHING: the shaper is not what was upgraded, and
+# failing here would hold a committed transaction open over it.
 - name: Ask whether the uplink shaper is enabled here
   ansible.builtin.command:
     argv: [systemctl, is-enabled, --quiet, billet-uplink.service]
@@ -318,8 +320,24 @@
   ansible.builtin.systemd_service:
     name: billet-uplink.service
     state: started
+  register: billet_uplink_started_after_upgrade
+  failed_when: false
   when: billet_uplink_enabled_after_upgrade.rc == 0
   become: true
+
+# systemd_service reports `state` only when the start succeeded; its failure
+# carries the message alone.
+- name: Say the uplink shaper did not start again after the transaction
+  ansible.builtin.debug:
+    msg: >-
+      The billet transaction finished, but billet-uplink.service did not start
+      again, so this host's traffic is not held back from the site's line until
+      it does: {{ billet_uplink_started_after_upgrade.msg | default('no reason given') }}.
+      `journalctl -u billet-uplink.service` says why; `systemctl start
+      billet-uplink.service` starts it.
+  when:
+    - billet_uplink_enabled_after_upgrade.rc == 0
+    - billet_uplink_started_after_upgrade.state is not defined
 
 # THE CLOSE, BY SHAPE. Under the guard the transaction's pointer is removed
 # ALONE and the guard stays held (the converge releases nothing; the operator

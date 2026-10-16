@@ -85,6 +85,12 @@ type Host interface {
 
 	// ProveStable reports whether the services stayed up long enough to believe.
 	ProveStable(ctx context.Context) error
+
+	// RestartUplink restarts the uplink shaper onto the billet now installed,
+	// where it is installed, enabled and running, and leaves one that is not
+	// alone. The shaper is a billet process outside the node and the server, so
+	// nothing else in the transaction moves it off the binary it replaced.
+	RestartUplink(ctx context.Context) error
 }
 
 // Request is one machine's upgrade.
@@ -145,6 +151,8 @@ const fenceReason = "host upgrade"
 //     step putting the old binary back cannot undo.
 //   - Readiness is PROVED, not assumed from a process being alive.
 //   - The commit record is written last, and after it nothing may restore.
+//   - The uplink shaper is restarted after everything, commit or rollback, once
+//     the binary it should run is final; its failure is reported, never decisive.
 //
 // A RESUMED RUN SKIPS WHAT THE JOURNAL SAYS IS DONE. Each step is idempotent
 // anyway, but skipping is what makes a resume cheap enough to be the ordinary
@@ -355,6 +363,10 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 func finish(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
+	// THE CANDIDATE IS THE INSTALLED BINARY ON EVERY WAY OUT OF HERE, whether or
+	// not the services come up, so the shaper is moved onto it last on each.
+	defer restartUplink(ctx, host, log)
+
 	// RECORDED HERE BECAUSE BOTH WAYS IN GO THROUGH HERE, and putting it beside the
 	// commit did not. A crash between writing the commit record and writing this
 	// one leaves a journal at StepCommitted, and Run resumes THAT by calling finish
@@ -521,6 +533,12 @@ func rollBack(ctx context.Context, req Request, log *slog.Logger, cause error) e
 func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
+	// THE PRESERVED BINARY WAS PUT BACK as a new file, and the shaper may by then
+	// run the candidate, so it is moved onto the restored file last on every way
+	// out. (A decided journal has reached every step, so this runs as the
+	// services' start below does, whatever step failed.)
+	defer restartUplink(ctx, host, log)
+
 	if j.Reached(StepFenced) && !j.ExternalLedger() {
 		if err := host.ClearFence(ctx, fenceReason); err != nil {
 			return fmt.Errorf("clearing the maintenance fence: %w", err)
@@ -543,4 +561,20 @@ func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 	log.Info("the restored services are back", "version", j.FromVersion)
 
 	return nil
+}
+
+// restartUplink moves the uplink shaper onto the installed billet, and only
+// reports a failure.
+//
+// A FAILED RESTART NEVER DECIDES THE TRANSACTION. The shaper is not what was
+// upgraded: failing a committed upgrade, or rolling one back, over it would
+// undo a good host to fix a side process. It is said, in the log, with the
+// command that finishes it; the shaper also notices a replaced binary itself
+// within a minute and restarts onto it.
+func restartUplink(ctx context.Context, host Host, log *slog.Logger) {
+	if err := host.RestartUplink(ctx); err != nil {
+		log.Warn("the uplink shaper could not be restarted onto the installed billet, so it may still run "+
+			"the release it started from; the transaction's outcome stands. "+
+			"`systemctl restart billet-uplink.service` finishes it", "error", err)
+	}
 }
