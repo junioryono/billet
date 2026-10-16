@@ -1,11 +1,15 @@
 package usage
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
 	"math/rand/v2"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -115,6 +119,39 @@ func TestACauseThisBuildDoesNotKnowIsRefused(t *testing.T) {
 	}
 }
 
+// THE CAUSE NUMBERS ARE FROZEN: they are what a stored series holds, so a
+// renumbering would rename every gap already in a ledger. The numbers and the
+// names are written out here rather than read from the constants, and a series
+// written by hand with a number decodes to its name.
+func TestTheGapCauseNumbersAreFrozen(t *testing.T) {
+	t.Parallel()
+
+	frozen := []string{"none", "unspecified", "missed_tick", "slow_read", "failed_read", "late_first_read",
+		"counter_fell", "final_energy", "sampler_stuck", "handover", "several"}
+	for n, name := range frozen {
+		if got := GapCause(n).String(); got != name {
+			t.Errorf("cause %d is named %q, want %q", n, got, name)
+		}
+	}
+	if got := len(GapCauses()); got != len(frozen)-1 {
+		t.Errorf("%d causes, want %d: a new cause needs a wire version and a line here", got, len(frozen)-1)
+	}
+
+	raw := binary.AppendUvarint(nil, 1)
+	raw = binary.AppendUvarint(raw, uint64(len(SeriesColumns)+1))
+	raw = binary.AppendUvarint(raw, 2)
+	for range SeriesColumns {
+		raw = binary.AppendVarint(raw, 0)
+		raw = binary.AppendVarint(raw, 0)
+	}
+	raw = binary.AppendVarint(raw, 0)
+	raw = binary.AppendVarint(raw, 4)
+	tl, err := DecodeSeriesGaps(encodedRaw(t, raw))
+	if err != nil || tl.Points[1].Gap.String() != "failed_read" {
+		t.Errorf("a series holding cause 4 read back as %+v (%v), want failed_read", tl.Points, err)
+	}
+}
+
 // HALVING KEEPS EACH GAP'S CAUSE, and one interval made of gaps of different
 // causes says several.
 func TestHalvingKeepsEachGapsCause(t *testing.T) {
@@ -166,7 +203,8 @@ func TestGapsAreWhatTheWindowLeavesUncovered(t *testing.T) {
 		var unseen time.Duration
 		gaps := tl.Gaps()
 		for i, g := range gaps {
-			if g.Length() <= 0 || g.Cause == GapNone || i > 0 && !gaps[i-1].To.Before(g.From) {
+			if g.Length() <= 0 || g.Cause == GapNone || i > 0 && (gaps[i-1].To.After(g.From) ||
+				gaps[i-1].To.Equal(g.From) && gaps[i-1].Cause == g.Cause) {
 				t.Fatalf("case %d: gap %d is %+v after %+v", c, i, g, gaps[max(i-1, 0)])
 			}
 			if inside := tl.Window(g.From, g.To); inside.Covered != 0 {
@@ -262,6 +300,124 @@ func TestTheObserverHearsEachTickAndEachGap(t *testing.T) {
 	}
 	if o.bounded != 0 {
 		t.Errorf("%d bounded io reads observed of a cgroup whose io.stat never moved", o.bounded)
+	}
+}
+
+// A FALL AND A GROUP FIRST READ AT THE END ARE HEARD TOO: the interval a
+// counter fell into and the catch-up after it, which every reader's settle
+// leaves uncovered, and the earlier intervals a final read's first sight of a
+// group marks.
+func TestTheObserverHearsFallsAndALateFinalRead(t *testing.T) {
+	tr, target := referenceVM(t)
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	o := &recordingObserver{}
+	m := runMonitor(t, tr.root, Options{Interval: time.Second, Observer: o, Now: func() time.Time { return now }})
+	m.Start("vm", target, 8)
+	tick := func() {
+		now = now.Add(time.Second)
+		m.Tick()
+	}
+	tick()
+	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 1", 1))
+	tick()
+	tr.write(refCgroup+"/cpu.stat", refCPUStat)
+	tick()
+	tick()
+
+	o.mu.Lock()
+	falls := slices.Clone(o.gaps)
+	o.mu.Unlock()
+	if want := []string{"counter_fell", "counter_fell"}; !slices.Equal(falls, want) {
+		t.Errorf("a fall and its catch-up were observed as %v, want %v", falls, want)
+	}
+
+	tr2, target2 := referenceVM(t)
+	tr2.remove(refCgroup + "/cpu.stat")
+	o2 := &recordingObserver{}
+	m2 := runMonitor(t, tr2.root, Options{Interval: time.Second, Observer: o2, Now: func() time.Time { return now }})
+	m2.Start("vm", target2, 8)
+	for range 3 {
+		now = now.Add(time.Second)
+		m2.Tick()
+	}
+	tr2.write(refCgroup+"/cpu.stat", refCPUStat)
+	now = now.Add(time.Second)
+	if _, ok := m2.Final("vm"); !ok {
+		t.Fatal("no summary")
+	}
+	o2.mu.Lock()
+	defer o2.mu.Unlock()
+	if want := []string{"late_first_read", "late_first_read", "late_first_read"}; !slices.Equal(o2.gaps, want) {
+		t.Errorf("a group first read at the final read was observed as %v, want %v", o2.gaps, want)
+	}
+}
+
+// A READ WRITEBACK KEPT MOVING KEEPS ITS SAMPLE AND IS TOLD (#495): through a
+// real tick, the point is kept and seen, its disk written is the lower bound,
+// the observer hears one bounded read, and the job's series has no gap.
+func TestABoundedReadKeepsItsSampleThroughATick(t *testing.T) {
+	tr, target := referenceVM(t)
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	o := &recordingObserver{}
+	m := NewMonitor(tr.root, Options{Interval: time.Second, Observer: o, Now: func() time.Time { return now }})
+	m.ticker, m.limit = false, testLimit
+	var moving atomic.Bool
+	var written atomic.Int64
+	written.Store(4 << 20)
+	m.reader.ReadFile = func(name string) ([]byte, error) {
+		if !moving.Load() || !strings.HasSuffix(name, "/io.stat") {
+			return os.ReadFile(name)
+		}
+		// The reference VM's io.stat, its first device's written bytes moving on
+		// every read as writeback would move them.
+		return fmt.Appendf(nil, "251:16 rbytes=1048576 wbytes=%d rios=10 wios=40 dbytes=0 dios=0\n"+
+			"251:32 rbytes=2097152 wbytes=0 rios=5 wios=0 dbytes=0 dios=0\n", written.Add(4096)), nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	m.Start("vm", target, 8)
+	tick := func() {
+		now = now.Add(time.Second)
+		m.Tick()
+	}
+	tick()
+	moving.Store(true)
+	tick()
+	moving.Store(false)
+	tick()
+
+	s, ok := m.Final("vm")
+	if !ok {
+		t.Fatal("no summary")
+	}
+	if !s.Measured.IO {
+		t.Error("io reads as unmeasured")
+	}
+	if len(s.Points) != 5 {
+		t.Fatalf("the series holds %d points, want 5: the bounded tick's sample was dropped", len(s.Points))
+	}
+	for i, p := range s.Points {
+		if p.Gap != GapNone {
+			t.Errorf("point %d is marked %v", i, p.Gap)
+		}
+	}
+	if s.Points[2].DiskWrite <= s.Points[1].DiskWrite {
+		t.Errorf("the bounded sample's written %d is not above the one before (%d)", s.Points[2].DiskWrite,
+			s.Points[1].DiskWrite)
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.bounded != 1 || len(o.gaps) != 0 {
+		t.Errorf("observed %d bounded reads and gaps %v, want one and none", o.bounded, o.gaps)
 	}
 }
 

@@ -168,15 +168,17 @@ type job struct {
 	// it kept, a read that failed or took a whole interval, so the next point it
 	// keeps is marked with it; GapNone when it has seen every one.
 	unseen GapCause
+	// fell says a counter fell into the last point kept, so the next interval
+	// holds its catch-up and is uncovered too (settle).
+	fell bool
 }
 
-// see records that an interval since the last kept point went unseen, and why.
-// The first cause recorded is the one kept: what follows from it (the spacing
-// a dropped sample leaves) is not a second cause.
+// see records that an interval since the last kept point went unseen, and why;
+// two different causes for one interval are GapSeveral. What follows from a
+// cause (the spacing a dropped sample leaves) is not a second one: nextPoint
+// reads the spacing only when nothing was recorded.
 func (j *job) see(c GapCause) {
-	if j.unseen == GapNone {
-		j.unseen = c
-	}
+	j.unseen = joinGaps(j.unseen, c)
 }
 
 type seen struct{ cpu, memory, oom, io, net, threads, pressure, processEnergy bool }
@@ -604,21 +606,29 @@ func (j *job) nextPoint(now time.Time, unseen GapCause, interval time.Duration) 
 // read would be held at its last value at a time it was not read, and a read
 // that took a whole interval read its counters at times not known, so the
 // interval is marked unseen instead and the next point kept carries the
-// cause. It answers the cause of the point it kept, GapNone when it kept one
-// for an interval it saw or kept none.
+// cause. It answers the cause the kept point's interval is uncovered for,
+// GapNone when it saw it or kept none: its own mark, or, for a point a counter
+// fell into or the catch-up after one, the GapCounterFell every reader's settle
+// gives it, so the falls are counted where they happen.
 func (j *job) keepPoint(cause GapCause, now time.Time, interval time.Duration) GapCause {
 	if cause != GapNone {
 		j.see(cause)
 		return GapNone
 	}
 	p := j.nextPoint(now, GapNone, interval)
+	dropped := len(j.points) > 0 && falls(j.points[len(j.points)-1], p)
+	uncovered := p.Gap
+	if uncovered == GapNone && (dropped || j.fell) {
+		uncovered = GapCounterFell
+	}
+	j.fell = dropped
 	j.points = append(j.points, p)
 	j.unseen = GapNone
 	if len(j.points) > maxPoints {
 		j.points = downsample(j.points, 2)
 	}
 
-	return p.Gap
+	return uncovered
 }
 
 // firstRead reports whether a sample read a group of the series that the job
@@ -747,7 +757,7 @@ func (m *Monitor) final(key string) (Summary, bool) {
 	if counting {
 		j.counters = counters
 	}
-	j.lateRead(firstRead(s, before, j.target.Process))
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
 	// WHAT THIS READ COULD NOT SEE IS KEPT ON THE JOB, not only in the summary:
 	// a destroy that fails discards the summary, and the Final its retry asks
 	// for must still mark the interval. A read that failed, one that took a

@@ -38,7 +38,11 @@ type Point struct {
 type GapCause uint8
 
 // The causes. The numbers are what SeriesCodecGaps stores, so they never
-// change and a new cause takes the next number.
+// change (TestTheGapCauseNumbersAreFrozen). A new cause takes the next number
+// and needs a wire version of its own, below which a node sends it as
+// GapUnspecified: a reader refuses a whole series that names a cause it does
+// not know, so a cause an older billet has never heard of would cost every
+// step its usage, not one interval its cause.
 const (
 	// GapNone is an interval the sampler saw.
 	GapNone GapCause = iota
@@ -70,8 +74,8 @@ const (
 	// GapHandover is the time between two node processes: the one that handed
 	// the job over and the one that adopted it.
 	GapHandover
-	// GapSeveral is an interval made of intervals marked for different causes,
-	// which halving a long series merges.
+	// GapSeveral is an interval with more than one cause: intervals of different
+	// causes that halving a long series merged, or two causes met in one.
 	GapSeveral
 
 	gapCauses // one past the last cause

@@ -85,12 +85,20 @@ type Reader struct {
 	// Process reads a process's own accounting; nil means the platform's. A
 	// test sets it, since the real one reads the running kernel.
 	Process func(pid int) (ProcessCounters, error)
+	// ReadFile reads one counter file under Root; nil means os.ReadFile. A test
+	// sets it to answer a file that changes between two reads, as io.stat does
+	// under writeback.
+	ReadFile func(name string) ([]byte, error)
 }
 
 func (r Reader) path(p string) string { return filepath.Join(r.Root, p) }
 
 func (r Reader) read(p string) (string, error) {
-	b, err := os.ReadFile(r.path(p))
+	readFile := r.ReadFile
+	if readFile == nil {
+		readFile = os.ReadFile
+	}
+	b, err := readFile(r.path(p))
 	return string(b), err
 }
 
@@ -235,25 +243,33 @@ func (s *Sample) readIO(r Reader, t Target) {
 // VM holding gigabytes dirty kept io.stat moving for every pass of 3 samples in
 // 120 (2026-10-16, 0.4 to 1.1 ms a read at a load of 24), which is what left a
 // known-answer window two seconds short (#495). The job's running maximum
-// takes the shortfall back at the next coherent read, so its total stays exact.
+// takes the shortfall back at the next coherent read, so its total stays exact
+// unless the bounded read is the job's last, which is the writeback-batch
+// caveat readIO states for any last sample.
+//
+// ONLY WRITEBACK MOVING FORWARD MAKES THE BOUND ONE: io.stat's written bytes
+// never fall, so a pass that saw them fall, or one that began below where the
+// last ended, is not writeback, and the read cannot tell.
 //
 // It answers the bytes read, the bytes written, whether that is a lower bound,
 // and whether it could tell at all: a read that fails cannot.
 func coherentWritten(readIO func() (int64, int64, error), readDirty func() (int64, error),
 ) (int64, int64, bool, bool) {
 	var rb, before, dirty int64
+	last := int64(-1)
 	for range 3 {
 		var err error
-		if _, before, err = readIO(); err != nil {
+		if _, before, err = readIO(); err != nil || before < last {
 			return 0, 0, false, false
 		}
 		if dirty, err = readDirty(); err != nil || dirty < 0 {
 			return 0, 0, false, false
 		}
 		var after int64
-		if rb, after, err = readIO(); err != nil {
+		if rb, after, err = readIO(); err != nil || after < before {
 			return 0, 0, false, false
 		}
+		last = after
 		if after != before {
 			continue
 		}

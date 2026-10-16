@@ -200,8 +200,10 @@ func (g Gap) Length() time.Duration { return g.To.Sub(g.From) }
 
 // Gaps is every interval Window leaves uncovered for want of a sample: each
 // the sampler marked unseen, and each a counter fell across with the catch-up
-// after it, adjacent ones joined into one (GapSeveral when their causes
-// differ). Together with what Window covers they make up the whole series.
+// after it, adjacent ones of one cause joined into one. Together with what
+// Window covers they make up the whole series, save one case no sampler
+// produces: an interval Window leaves uncovered because the window's total
+// would pass an int64, which depends on the window and is no gap.
 func (tl Timeline) Gaps() []Gap {
 	points := settle(tl.Points)
 	var out []Gap
@@ -211,8 +213,8 @@ func (tl Timeline) Gaps() []Gap {
 			continue
 		}
 		from, to := tl.First.Add(p.offset()), tl.First.Add(next.offset())
-		if n := len(out); n > 0 && out[n-1].To.Equal(from) {
-			out[n-1].To, out[n-1].Cause = to, joinGaps(out[n-1].Cause, next.Gap)
+		if n := len(out); n > 0 && out[n-1].To.Equal(from) && out[n-1].Cause == next.Gap {
+			out[n-1].To = to
 
 			continue
 		}

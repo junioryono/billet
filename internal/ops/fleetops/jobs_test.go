@@ -378,7 +378,8 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 		"measured-window": {usage: measured, window: window}, "gapped-window": {usage: measured, window: &gapped}}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name].usage, nil, nil, shapes[name].window); err != nil {
+		if err := renderJobJSON(&out, record, shapes[name].usage, nil, "the usage report came with no series", nil,
+			shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

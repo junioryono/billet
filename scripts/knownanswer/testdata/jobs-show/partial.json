@@ -32,6 +32,7 @@
       "threads": true
     },
     "series": null,
+    "series_unavailable": "the usage report came with no series",
     "source": "host",
     "unmeasured": [
       "memory",

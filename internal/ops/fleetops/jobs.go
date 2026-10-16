@@ -90,7 +90,7 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return renderJobJSON(env.Stdout, rec, measured, tl, guest, wj)
+		return renderJobJSON(env.Stdout, rec, measured, tl, unaligned, guest, wj)
 	}
 	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	if *asHTML {
@@ -143,12 +143,14 @@ type jobJSON struct {
 // usageJSON is what the host measured. Groups answers for every group, with
 // the OOM count unmeasured whenever memory is, so a reader never re-derives
 // which zeros were read. Series is the per-sample series' account of its own
-// sampling, null when none is on the host's clock.
+// sampling, null when none is on the host's clock, and SeriesUnavailable then
+// says why: none was recorded, it has no clock, or it could not be read.
 type usageJSON struct {
-	Node       string          `json:"node"`
-	RecordedAt string          `json:"recorded_at"`
-	Groups     map[string]bool `json:"measured"`
-	Series     *seriesJSON     `json:"series"`
+	Node              string          `json:"node"`
+	RecordedAt        string          `json:"recorded_at"`
+	Groups            map[string]bool `json:"measured"`
+	Series            *seriesJSON     `json:"series"`
+	SeriesUnavailable string          `json:"series_unavailable,omitempty"`
 	alloc.JobUsage
 }
 
@@ -159,7 +161,8 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // renderJobJSON writes one job's record as an indented JSON object. A job with
 // no usage report has a null usage, and one with no guest report a null guest,
 // never a report of zeros.
-func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, g *jobGuest,
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, unaligned string,
+	g *jobGuest,
 	win *windowJSON,
 ) error {
 	out := jobJSON{
@@ -176,7 +179,8 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl 
 			groups[g] = u.Measured(g)
 		}
 		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, Series: seriesJSONOf(tl),
-			JobUsage: u.JobUsage}
+			SeriesUnavailable: seriesUnavailable(tl, unaligned),
+			JobUsage:          u.JobUsage}
 	}
 	body, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

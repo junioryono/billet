@@ -30,7 +30,7 @@ var gapMeaning = map[usage.GapCause]string{
 	usage.GapFinalEnergy:   "the last interval, whose package energy the final read does not take",
 	usage.GapSamplerStuck:  "the last interval, whose final read the sampler did not answer in time",
 	usage.GapHandover:      "between the node process that handed the job over and the one that adopted it",
-	usage.GapSeveral:       "intervals with different causes, merged when the series was halved",
+	usage.GapSeveral:       "more than one of these at once, as when a long series is halved",
 }
 
 // gapText is one gap as the text report and the page word it.
@@ -156,6 +156,19 @@ func seriesJSONOf(tl *usage.Timeline) *seriesJSON {
 	out.Gaps, out.GapsMore, out.UnseenMillis = gapsJSONOf(tl.Gaps())
 
 	return out
+}
+
+// seriesUnavailable is why a record has no series on the host's clock, empty
+// when it has one or nothing is known of why.
+func seriesUnavailable(tl *usage.Timeline, unaligned string) string {
+	switch {
+	case tl == nil:
+		return unaligned
+	case len(tl.Points) == 0:
+		return "the series holds no samples"
+	default:
+		return ""
+	}
 }
 
 // gapsJSONOf lists gaps for a JSON record, the first maxGapsListed of them,

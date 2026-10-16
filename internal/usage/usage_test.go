@@ -153,7 +153,9 @@ func TestTheReferenceVMReadsAsItWasMeasured(t *testing.T) {
 // MiB dirty, then io.stat 512 MiB (the batch moved): it is discarded, and the
 // second pass reads dirty afresh (0), so the answer is 512 MiB, once. Reusing
 // the first pass's dirty read would answer 1 GiB. Each pass reads io, dirty,
-// io, in that order. Three passes that keep moving are could-not-tell.
+// io, in that order. Three passes that writeback kept moving forward are a
+// lower bound; a counter that fell, within a pass or between two, is
+// could-not-tell.
 func TestWrittenIsReadCoherentlyAcrossWriteback(t *testing.T) {
 	t.Parallel()
 
@@ -212,6 +214,21 @@ func TestWrittenIsReadCoherentlyAcrossWriteback(t *testing.T) {
 	if _, w, _, ok := coherentWritten(func() (int64, int64, error) { return 0, 0, errors.New("gone") },
 		func() (int64, error) { return 0, nil }); ok {
 		t.Errorf("an io.stat that could not be read answered %d written", w)
+	}
+
+	// A COUNTER THAT FALLS IS NOT WRITEBACK, so it is no lower bound: falling
+	// on every read, and rising within each pass but starting the next below
+	// where the last ended.
+	for name, reads := range map[string][]int64{
+		"falling":           {100, 90, 80, 70, 60, 50},
+		"falling between":   {100, 110, 50, 60, 20, 30},
+		"falling in a pass": {100, 110, 110, 120, 130, 125},
+	} {
+		next := 0
+		read := func() (int64, int64, error) { next++; return 0, reads[next-1], nil }
+		if _, w, _, ok := coherentWritten(read, func() (int64, error) { return 0, nil }); ok {
+			t.Errorf("%s: io.stat that went %v answered %d written", name, reads, w)
+		}
 	}
 	if _, _, err := parseIOStat("8:0 rbytes=0 wbytes=9223372036854775807\n8:16 rbytes=0 wbytes=1\n"); err == nil {
 		t.Error("io.stat devices summing past an int64 parsed")

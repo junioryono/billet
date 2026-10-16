@@ -120,7 +120,7 @@ func TestTheJSONRecordAndItsWindowListTheGaps(t *testing.T) {
 	w := window{from: tl.First.Add(5500 * time.Millisecond), to: tl.First.Add(9 * time.Second)}
 
 	var out bytes.Buffer
-	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, tl, nil,
+	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, tl, "", nil,
 		windowJSONOf(tl, "", w)); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
@@ -150,16 +150,58 @@ func TestTheJSONRecordAndItsWindowListTheGaps(t *testing.T) {
 			win.Usage.CoveredMillis, win.Usage.SpanMillis)
 	}
 
+	// A SERIES THAT SAW EVERYTHING SAYS SO WITH AN EMPTY LIST, in its own
+	// account and in a window alike: none is not could-not-tell.
+	seen := run15()
+	seen.Points[6].Gap = usage.GapNone
 	out.Reset()
-	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, nil, nil, nil); err != nil {
+	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, seen, "", nil,
+		windowJSONOf(seen, "", w)); err != nil {
 		t.Fatalf("renderJobJSON: %v", err)
 	}
-	if !strings.Contains(out.String(), `"series": null`) {
-		t.Errorf("a report with no series on the clock does not say series null:\n%s", out.String())
+	whole := decodeRecord(t, out.Bytes())
+	var series map[string]json.RawMessage
+	if err := json.Unmarshal(whole["usage"]["series"], &series); err != nil {
+		t.Fatalf("decode usage.series: %v", err)
 	}
-	if strings.Contains(out.String(), `"gaps": null`) {
-		t.Errorf("a record wrote gaps as null")
+	if string(series["gaps"]) != "[]" || string(whole["window"]["gaps"]) != "[]" {
+		t.Errorf("a series that saw everything lists gaps %s and its window %s, want [] and []",
+			series["gaps"], whole["window"]["gaps"])
 	}
+
+	// AND ONE THAT CANNOT TELL SAYS NULL, AND WHY.
+	out.Reset()
+	if err := renderJobJSON(&out, alloc.JobRecord{LeaseID: "l1"}, measured, nil, "the usage report came with "+
+		"no series", nil, windowJSONOf(nil, "the usage report came with no series", w)); err != nil {
+		t.Fatalf("renderJobJSON: %v", err)
+	}
+	whole = decodeRecord(t, out.Bytes())
+	if string(whole["usage"]["series"]) != "null" ||
+		string(whole["usage"]["series_unavailable"]) != `"the usage report came with no series"` ||
+		string(whole["window"]["gaps"]) != "null" {
+		t.Errorf("a report with no series on the clock says series %s (%s) and window gaps %s, want null, "+
+			"why, and null", whole["usage"]["series"], whole["usage"]["series_unavailable"], whole["window"]["gaps"])
+	}
+}
+
+// decodeRecord is a JSON record's usage and window, each field as written.
+func decodeRecord(t *testing.T, body []byte) map[string]map[string]json.RawMessage {
+	t.Helper()
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	out := map[string]map[string]json.RawMessage{}
+	for _, key := range []string{"usage", "window"} {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(top[key], &fields); err != nil {
+			t.Fatalf("decode %s: %v\n%s", key, err, body)
+		}
+		out[key] = fields
+	}
+
+	return out
 }
 
 // THE PAGE DRAWS THE GAPS ONCE, as a strip on the charts' axis, and lists them
