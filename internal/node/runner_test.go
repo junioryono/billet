@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -907,13 +908,18 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 		t.Fatalf("ForceRelease: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	var logged bytes.Buffer
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, slog.New(slog.NewTextHandler(&logged, nil)))
 	destroyed := len(p.destroyed)
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if len(restarted.heldLeases()) != 0 {
 		t.Fatal("recovery retained custody after consuming the pending force release")
+	}
+	// NOT CALLED A JOB LEFT RUNNING WITH ITS CAPACITY HELD, which it is not.
+	if log := logged.String(); strings.Contains(log, "adopted a running job") || !strings.Contains(log, "adopted=0") {
+		t.Errorf("recovery logged a force-released job as adopted:\n%s", log)
 	}
 	// A FORCE RELEASE LETS GO OF THE LEASE, never of the compute.
 	if len(p.destroyed) != destroyed {
@@ -978,8 +984,11 @@ func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
 
 // A CUSTODY ASSUMED FOR A LOST LAUNCH REPORT SETTLES A FORCE RELEASE AT ONCE:
 // it adopts one job, so nothing waits behind the settlement, and no tend is
-// needed. The launch's report was lost, the plane held the lease in custody,
-// and an operator forced its release before the node took custody.
+// needed. DEFENSIVE: a lost report leaves the lease launching, which cannot be
+// force-released, and only this node's own tend moves it to custody, after
+// which the job is no longer the launch AssumeCustody looks for. The ledger is
+// advanced here directly, so what this proves is that the single adoption is
+// completed at once, whatever reached it.
 func TestAssumedCustodySettlesAForceReleaseAtOnce(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)

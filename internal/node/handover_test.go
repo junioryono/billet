@@ -790,10 +790,15 @@ func TestAForceReleaseATendSettledFirstIsNotSettledAgain(t *testing.T) {
 type notingJIT struct {
 	*fakeJIT
 	rec *recordingLedger
+	// onRemove, when set, runs inside each removal.
+	onRemove func()
 }
 
 func (j *notingJIT) EnsureRunnerRemoved(_ context.Context, leaseID string) error {
 	j.rec.note("remove " + leaseID)
+	if j.onRemove != nil {
+		j.onRemove()
+	}
 
 	return nil
 }
@@ -827,8 +832,12 @@ func TestRecoveryRenewsEverySurvivorBeforeItSettlesAForceRelease(t *testing.T) {
 		t.Fatalf("ForceRelease: %v", err)
 	}
 
-	next := New(h.rec, h.host, &notingJIT{fakeJIT: &fakeJIT{setID: 7}, rec: h.rec}, h.p, nil,
-		WithMonitor(runningMonitor(t, h.root)), WithUsageCheckpoints(h.dir))
+	h.p.writeCPU(t, "instance-"+provider.InstanceName(other.ID), "1000")
+	m := runningMonitor(t, h.root)
+	jit := &notingJIT{fakeJIT: &fakeJIT{setID: 7}, rec: h.rec}
+	measuredFirst := false
+	jit.onRemove = func() { measuredFirst = m.Measuring(provider.InstanceName(other.ID)) }
+	next := New(h.rec, h.host, jit, h.p, nil, WithMonitor(m), WithUsageCheckpoints(h.dir))
 	h.p.onTarget = func(id string) { h.rec.note("target " + id) }
 	h.rec.mu.Lock()
 	h.rec.events = nil
@@ -845,8 +854,9 @@ func TestRecoveryRenewsEverySurvivorBeforeItSettlesAForceRelease(t *testing.T) {
 	}
 	// AND MEASURED BEFORE IT, since the removal can wait on GitHub.
 	if looked := slices.Index(events, "target instance-"+provider.InstanceName(other.ID)); looked < 0 ||
-		looked > removed {
-		t.Errorf("events = %v, want the other survivor's counters looked for before the removal", events)
+		looked > removed || !measuredFirst {
+		t.Errorf("events = %v, measured at the removal %v; want the other survivor measured before the "+
+			"removal", events, measuredFirst)
 	}
 }
 
