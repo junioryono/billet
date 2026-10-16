@@ -1047,6 +1047,9 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 		}
 		entry.epoch.Store(lease.Epoch)
 		entry.unconfirmed.Store(true)
+		// A JOB THAT RAN, measured here, whose usage the custody that ends it
+		// reports (#384).
+		entry.measured.Store(true)
 		r.custody[lease.ID] = entry
 		r.mu.Unlock()
 
@@ -1212,18 +1215,15 @@ func (r *Runner) Recover(ctx context.Context) error {
 	// EVERY SURVIVOR IS ADOPTED AND RENEWED BEFORE ANY IS MEASURED (#384): finding
 	// a job's counters asks the backend and the sampler, each bounded at seconds,
 	// and done inline it would hold the next survivor's first renewal behind it.
-	// Deferred, so it runs whichever way recovery ends; one it does not reach is
-	// measured by the next recovery, since the entry still owes its report.
+	// Measured only once the adoptions are all done: a recovery that fails part
+	// way leaves later survivors unadopted and unrenewed, and is retried, and its
+	// adopted jobs are measured by the next one, since their entries still owe
+	// their reports.
 	type toMeasure struct {
 		lease *alloc.Lease
 		inst  *provider.Instance
 	}
 	var measure []toMeasure
-	defer func() {
-		for _, m := range measure {
-			r.resumeMonitoring(ctx, m.lease, m.inst)
-		}
-	}()
 
 	for _, inst := range instances {
 		leaseID, ours := provider.LeaseOf(inst.Name)
@@ -1334,6 +1334,10 @@ func (r *Runner) Recover(ctx context.Context) error {
 			r.log.Warn("destroyed an instance but could not release its lease",
 				"lease", leaseID, "error", err)
 		}
+	}
+
+	for _, m := range measure {
+		r.resumeMonitoring(ctx, m.lease, m.inst)
 	}
 
 	if failed > 0 {

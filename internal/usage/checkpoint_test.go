@@ -172,6 +172,12 @@ func TestACarriedJobLeftPendingStillMarksTheHandover(t *testing.T) {
 	if err := b.Resume("vm", target, 8, &cp); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
+	// AND A STOP NOW CAN STILL HAND IT ON, as it was carried.
+	again, ok := b.Checkpoint("vm")
+	if !ok || !slices.Equal(again.Series, cp.Series) || again.Unseen != GapHandover {
+		t.Errorf("a carried job awaiting its baseline was checkpointed %v (unseen %v), want its series as "+
+			"carried with the handover marked", ok, again.Unseen)
+	}
 	close(release)
 	<-ticked
 

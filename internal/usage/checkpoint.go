@@ -54,13 +54,16 @@ type Checkpoint struct {
 // Checkpoint is what the sampler knows of a job, for the next node process to
 // continue its series from, or false for a job it does not measure or has
 // taken no baseline of. It reads nothing and asks the sampler nothing, so it
-// answers at once on a process that is stopping.
+// answers at once on a process that is stopping. A job carried from an earlier
+// checkpoint and still waiting for its baseline is checkpointed as it was
+// carried, its handover already marked, so a stop soon after a handover does
+// not lose the first process's series.
 func (m *Monitor) Checkpoint(key string) (Checkpoint, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	j, ok := m.jobs[key]
-	if !ok || j.pending || len(j.points) == 0 {
+	if !ok || j.pending && !j.carried || len(j.points) == 0 {
 		return Checkpoint{}, false
 	}
 	series, _, err := EncodeSeriesGaps(j.points, j.first, maxCheckpointSeries)

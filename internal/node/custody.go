@@ -213,6 +213,12 @@ func (r *Runner) adoptWithObservation(
 		}
 	}
 
+	// TENDING FIRST, as everywhere: a tend settling the entry this replaces holds
+	// it from its last sample to its release, and handing the report over in the
+	// middle of that left the old tend releasing the lease without reporting and
+	// the new entry with a lease that was gone.
+	r.tending.Lock()
+	defer r.tending.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

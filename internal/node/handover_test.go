@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -27,6 +29,17 @@ type recordingLedger struct {
 
 	mu     sync.Mutex
 	events []string
+	// failRead, when positive, is how many lease reads succeed before one fails,
+	// as a ledger blip would; that read disarms it.
+	failRead atomic.Int32
+}
+
+func (l *recordingLedger) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
+	if l.failRead.Load() > 0 && l.failRead.Add(-1) == 0 {
+		return nil, errors.New("the ledger could not be read")
+	}
+
+	return l.Allocator.Lease(ctx, leaseID)
 }
 
 func (l *recordingLedger) note(event string) {
@@ -333,21 +346,112 @@ func TestRecoveryRenewsEverySurvivorBeforeItMeasuresAny(t *testing.T) {
 	h.rec.mu.Lock()
 	events := slices.Clone(h.rec.events)
 	h.rec.mu.Unlock()
-	lastRenewal, firstTarget, targets := -1, -1, 0
+	firstTarget, targets := len(events), 0
 	for i, e := range events {
-		switch {
-		case strings.HasPrefix(e, "heartbeat "):
-			lastRenewal = i
-		case strings.HasPrefix(e, "target "):
+		if strings.HasPrefix(e, "target ") {
 			targets++
-			if firstTarget < 0 {
-				firstTarget = i
-			}
+			firstTarget = min(firstTarget, i)
 		}
 	}
-	if targets != 2 || firstTarget < lastRenewal {
-		t.Errorf("recovery's renewals and lookups ran %v; want both survivors renewed before either was "+
-			"measured", events)
+	for _, leaseID := range []string{h.lease.ID, second.ID} {
+		if i := slices.Index(events, "heartbeat "+leaseID); i < 0 || i > firstTarget {
+			t.Errorf("lease %s was renewed at %d, want before the first lookup at %d: %v", leaseID, i,
+				firstTarget, events)
+		}
+	}
+	if targets != 2 {
+		t.Errorf("recovery looked for %d jobs' counters, want both survivors': %v", targets, events)
+	}
+}
+
+// A RECOVERY THAT FAILS PART WAY MEASURES NOTHING, AND THE NEXT MEASURES IT
+// ALL: a survivor it never reached is neither adopted nor renewed, so nothing
+// slow may run ahead of the retry that reaches it, and the jobs it did adopt
+// still owe their reports.
+func TestARecoveryThatFailsPartWayLeavesTheMeasuringToTheNext(t *testing.T) {
+	h := newHandoverHost(t)
+	second := assignedLease(t, h.a)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	if err := first.Launch(t.Context(), second, dockerSpec(),
+		Job{RequestID: second.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	targets := h.p.targets.Load()
+
+	next, nextMonitor := h.process(t)
+	// THE SECOND SURVIVOR RECOVERY READS, whichever it is, so the first is
+	// adopted and renewed before the recovery fails.
+	h.rec.failRead.Store(2)
+	if err := next.Recover(t.Context()); err == nil {
+		t.Fatal("a recovery that could not read a survivor's lease succeeded")
+	}
+	if got := h.p.targets.Load(); got != targets {
+		t.Errorf("a failed recovery looked for %d jobs' counters before reaching every survivor", got-targets)
+	}
+
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	for _, lease := range []*alloc.Lease{h.lease, second} {
+		if name := provider.InstanceName(lease.ID); !nextMonitor.Measuring(name) {
+			t.Errorf("the recovery after the failed one does not measure %s", name)
+		}
+	}
+}
+
+// AN ADOPTION WAITS FOR A TEND IN PROGRESS: a tend settling an entry holds it
+// from its last sample to its release, and an adoption replacing the entry in
+// the middle took the report from it, so the old tend released the lease
+// unreported and the new entry found the lease gone.
+func TestAnAdoptionWaitsForATendInProgress(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, _ := h.process(t)
+	lease, err := h.a.Lease(t.Context(), h.lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next.tending.Lock()
+	adopted := make(chan error, 1)
+	go func() {
+		_, err := next.takeCustody(t.Context(), lease, &provider.Instance{ID: h.id, Name: h.name, Running: true}, true)
+		adopted <- err
+	}()
+	select {
+	case err := <-adopted:
+		next.tending.Unlock()
+		t.Fatalf("an adoption ran (%v) while a tend held its entry", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	next.tending.Unlock()
+	select {
+	case err := <-adopted:
+		if err != nil {
+			t.Errorf("the adoption after the tend: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the adoption never ran once the tend was done")
+	}
+}
+
+// A JOB WHOSE ENTRY OWES NO REPORT IS NOT LEFT MEASURED: one that settled, or
+// whose lease went, while its counters were being found starts a series that
+// nothing would ever end.
+func TestAResumeForAnEntryThatOwesNothingIsForgotten(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, nextMonitor := h.process(t)
+
+	next.resumeMonitoring(t.Context(), h.lease, &provider.Instance{ID: h.id, Name: h.name, Running: true})
+	if nextMonitor.Measuring(h.name) {
+		t.Error("a job with no custody entry owing its report was left measured")
 	}
 }
 

@@ -154,12 +154,33 @@ func (r *Runner) resumeMonitoring(ctx context.Context, lease *alloc.Lease, inst 
 		return
 	}
 	cp := r.takeCheckpoint(inst.Name)
-	if err := r.monitor.Resume(inst.Name, usageTargetOf(target), lease.VCPU, cp); err != nil {
+	err = r.monitor.Resume(inst.Name, usageTargetOf(target), lease.VCPU, cp)
+
+	// A SERIES NOBODY WILL END IS FORGOTTEN AT ONCE: the entry may have settled
+	// its report, or been released, while the counters were being found, and
+	// nothing else would ever forget a series started after that.
+	if !r.owesReport(lease.ID, inst.Name) {
+		r.forgetMonitoring(inst.Name)
+
+		return
+	}
+	if err != nil {
 		r.log.Warn("measuring an adopted job from its adoption", "runner", inst.Name, "error", err)
 
 		return
 	}
 	r.log.Info("measuring an adopted job", "runner", inst.Name, "continued", cp != nil)
+}
+
+// owesReport reports whether a custody entry for the instance still owes its
+// usage report.
+func (r *Runner) owesReport(leaseID, name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	c, ok := r.custody[leaseID]
+
+	return ok && c.name == name && c.measured.Load()
 }
 
 // checkpointFile is where a job's checkpoint is kept, for an instance name
