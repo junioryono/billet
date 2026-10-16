@@ -436,6 +436,38 @@ func (p *Provider) bridgeFor(trust provider.TrustClass) string {
 // this repository was bitten by, where every signal reported success and no runner
 // ever started.
 func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, error) {
+	return p.start(ctx, spec, "")
+}
+
+// Restore starts one microVM from a snapshot this node has published, rather than
+// from a cold boot. The spec names the lease, the trust class and the root disk
+// generation that was captured with the snapshot, exactly as a launch does.
+//
+// EVERYTHING BEFORE THE VMM IS A LAUNCH'S, the lease lock, the lifecycle record, the
+// claimed jail, the clone and the unwind, because what a restore leaves behind on a
+// failure is the same set of things a launch does, and one path is what keeps them
+// accounted for. Only the last step differs: the snapshot is linked into the jail
+// and loaded through restore, in place of configuring and booting a kernel.
+func (p *Provider) Restore(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
+	if snapshot == "" {
+		return nil, fmt.Errorf("firecracker: %w: a restore of %s names no snapshot",
+			errSnapshotNotPublished, spec.Name)
+	}
+
+	// NEVER GROWN. A restored guest's kernel already has the root filesystem mounted
+	// at the size it had when the snapshot was taken; resizing it underneath would
+	// change a filesystem the guest believes it knows.
+	if spec.Disk > 0 {
+		return nil, fmt.Errorf("firecracker: %s asks for a %s root disk, and a restore keeps the "+
+			"size the snapshot was taken at", spec.Name, spec.Disk)
+	}
+
+	return p.start(ctx, spec, snapshot)
+}
+
+// start is Launch and Restore: a cold boot when snapshot is empty, a restore of
+// that published snapshot otherwise.
+func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
 	if err := checkSpec(spec); err != nil {
 		return nil, err
 	}
@@ -565,7 +597,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// something started" and asks Find — so this is not the safety net, it is the
 	// ordinary case being tidy. What it must never do is replace the reason the
 	// launch failed with the reason a cleanup failed.
-	inst, err := p.launch(ctx, j, spec, device, kernel, res)
+	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot)
 	if err != nil {
 		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 	}
@@ -581,10 +613,18 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 // launch does the work Launch unwinds on failure.
 func (p *Provider) launch(
-	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources,
+	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources, snapshot string,
 ) (*Instance, error) {
 	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
 		return nil, err
+	}
+
+	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
+	// after it: a link is the published file itself, and must never be chowned.
+	if snapshot != "" {
+		if err := p.placeSnapshot(j, snapshot); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
@@ -598,6 +638,10 @@ func (p *Provider) launch(
 	api, err := p.awaitAPI(ctx, j)
 	if err != nil {
 		return nil, err
+	}
+
+	if snapshot != "" {
+		return p.restoreInto(ctx, api, spec, res.Tap)
 	}
 
 	if err := p.configure(ctx, api, spec, res.Tap); err != nil {
