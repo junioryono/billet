@@ -300,6 +300,9 @@ func TestDestroyDeletesNoTapItCannotJudge(t *testing.T) {
 		h := newHarness(t)
 		h.launch(t)
 
+		// OUTSIDE THE RANGE NOW, so only this jail's own claim can prove the tap.
+		h.p.cfg.JailUIDMin = 910000
+
 		claim := filepath.Join(h.p.claimsDir("uids"), "900000")
 		if err := os.Chmod(claim, 0o000); err != nil {
 			t.Fatal(err)
@@ -411,50 +414,58 @@ func TestATapOutlivesAChangeOfTheJailUIDRange(t *testing.T) {
 	}
 }
 
-// A TAP OWNED BY A UID ANOTHER MICROVM HOLDS NOW MAY STILL BE THIS ONE'S: the teardown
-// that kept its name gave the uid back, and a launch took it. So nothing is deleted,
-// the name and lifecycle authority are kept, and once that uid is released the next
-// teardown proves the tap billet's and finishes.
-func TestATapWhoseOwnerUIDAnotherLeaseHoldsIsRetriedNotAbandoned(t *testing.T) {
+// AND ANOTHER LEASE'S CLAIM ON AN OUT-OF-RANGE UID PROVES NOTHING FOR THIS ONE. Outside
+// the range only this jail's own claim makes a tap billet's to delete.
+func TestAnOutOfRangeOwnerClaimedByAnotherLeaseIsLeft(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+	h.p.cfg.JailUIDMin = 910000
+
+	other := otherLeaseOnAnotherStripe(t, theInstance)
+	if err := os.WriteFile(filepath.Join(h.p.claimsDir("uids"), "900006"), []byte(other+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.putDevice("bt-0", 900006)
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if !h.hasDevice("bt-0") {
+		t.Error("Destroy deleted a device owned outside the range by a uid another lease holds")
+	}
+}
+
+// A TAP OWNED BY A UID ANOTHER MICROVM HOLDS NOW IS STILL BILLET'S TO DELETE. The
+// teardown that kept its name gave the uid back and a launch took it; that launch's
+// own tap is under its own name, so the one under this name is nobody's live device.
+// Treating it as foreign would strand it, and treating it as could-not-tell would
+// fail recovery until the other lease let the uid go.
+func TestATapOwnedByAUIDAnotherLeaseHoldsIsStillDeleted(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 	h.launch(t)
 
 	other := otherLeaseOnAnotherStripe(t, theInstance)
-	taken := filepath.Join(h.p.claimsDir("uids"), "900006")
-
-	if err := os.WriteFile(taken, []byte(other+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(h.p.claimsDir("uids"), "900006"), []byte(other+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	h.putDevice("bt-0", 900006)
 
-	_, err := h.p.Destroy(t.Context(), theInstance)
-	if err == nil || !strings.Contains(err.Error(), "could not tell") {
-		t.Fatalf("Destroy = %v, want it to say it could not tell", err)
-	}
-
-	assertNoTapDeleted(t, h)
-
-	if !claimExists(t, filepath.Join(h.p.claimsDir("taps"), "bt-0")) {
-		t.Error("the name of a tap that may be this microVM's went back to the pool")
-	}
-
-	if !claimExists(t, h.p.lifecycleFile(theInstance)) {
-		t.Fatal("lifecycle authority went, so no later teardown can finish the tap")
-	}
-
-	// THE OTHER LEASE LETS THE UID GO, and the next teardown finishes.
-	if err := os.Remove(taken); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
-		t.Fatalf("the retried Destroy: %v", err)
+		t.Fatalf("Destroy: %v", err)
 	}
 
 	if h.hasDevice("bt-0") || claimExists(t, filepath.Join(h.p.claimsDir("taps"), "bt-0")) {
-		t.Error("the retried Destroy did not delete the tap and give its name back")
+		t.Error("Destroy left billet's tap, or its name, because another lease holds the uid that owns it")
+	}
+
+	if !claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900006")) {
+		t.Error("Destroy released another lease's uid")
 	}
 }

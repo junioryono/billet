@@ -321,8 +321,8 @@ func (p *Provider) removeTap(ctx context.Context, res resources, jailID string) 
 // THE KERNEL DECIDES WHOSE A DEVICE IS, NOT A RECORD OF WHAT BILLET MEANT TO DO.
 // addTap creates every tap with `user <jail uid>`, and the kernel reports that owner
 // for as long as the device exists. So a device under this jail's claimed name is
-// deleted only when it is a tap owned by a jail uid that is this jail's, or that no
-// jail holds. A launch that failed before creating its tap finds no device, or finds
+// deleted only when it is a tap owned by a jail uid (ownedByJail says why whoever
+// holds that uid now does not matter). A launch that failed before creating its tap finds no device, or finds
 // somebody else's, and deletes nothing; and because the proof is the device itself,
 // there is no second record a crash, a failed write or an older billet can leave
 // disagreeing with it.
@@ -330,10 +330,9 @@ func (p *Provider) removeTap(ctx context.Context, res resources, jailID string) 
 //   - No claim on the name, or one naming another jail: nothing here is this
 //     microVM's. Nothing is deleted and nothing kept.
 //   - No device: nothing to delete. The name goes back.
-//   - A device that is not billet's (no owner, or one outside the jail uid range):
-//     left alone, and its name kept out of the pool, because a launch handed it would
-//     fail on the device too.
-//   - A tap owned by a jail uid another microVM holds now: could not tell (below).
+//   - A device that is not billet's (no owner, or one outside the jail uid range that
+//     is not this jail's): left alone, and its name kept out of the pool, because a
+//     launch handed it would fail on the device too.
 //   - billet's device: deleted, and the name goes back only if it went.
 //   - Anything that could not be read: could not tell, which is not permission.
 //     Nothing is deleted and the name is kept for a later teardown to judge.
@@ -390,38 +389,35 @@ func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID st
 	return resources{}, nil
 }
 
-// ownedByJail reports whether a tap's owner is billet's and this jail's to delete:
-// a uid this jail holds, or a jail uid no lease holds.
+// ownedByJail reports whether a tap's owner proves it billet's to delete: a jail uid,
+// or a uid whose claim names this jail.
 //
-// THIS JAIL'S OWN CLAIM IS READ FIRST, whatever the configured range says now, so a
-// range changed under a running microVM does not strand the tap it made.
+// ANY JAIL UID, WHOEVER HOLDS IT NOW. billet creates a tap only under a name it has
+// claimed, and a name has one claim, which this jail holds. So a tap under it owned
+// by a jail uid is this jail's own, or a leftover of an earlier holder of the name,
+// whose jail is gone (the reaper frees a name only then): no live microVM is using it.
+// The uid's current holder says nothing about the device. A teardown that kept a
+// stuck tap's name gave its uid back, so another launch holding that uid is the
+// ordinary case, and treating it as foreign stranded the tap (or, as could-not-tell,
+// blocked recovery until a lease that recovery itself had to reach let the uid go).
 //
-// A UID NO JAIL HOLDS STILL PROVES THE DEVICE IS BILLET'S when it is in the range:
-// only billet hands those out, and only to a VMM's tap. It is the ordinary case for
-// orphan cleanup of a tap that would not go, because the teardown that kept its name
-// gave its uid back.
+// THIS JAIL'S OWN CLAIM COUNTS OUTSIDE THE RANGE, so a range changed under a running
+// microVM does not strand the tap it made.
 func (p *Provider) ownedByJail(owner int, jailID string) (bool, error) {
+	if owner >= p.cfg.JailUIDMin && owner < p.cfg.JailUIDMin+p.cfg.JailUIDCount {
+		return true, nil
+	}
+
 	raw, err := os.ReadFile(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)))
 
 	switch {
 	case err == nil:
-		holder := strings.TrimSpace(string(raw))
-		if holder == jailID {
-			return true, nil
-		}
-
-		// HELD BY ANOTHER MICROVM IS NOT PROOF OF FOREIGN. A teardown that kept this
-		// stuck tap's name gave its uid back, and another launch may hold it now, so the
-		// tap may well be this jail's. Could not tell, which keeps the name and the
-		// lease's lifecycle authority, so a teardown after that uid is released again
-		// can prove the tap billet's and finish.
-		return false, fmt.Errorf("firecracker: could not tell whether the tap owned by uid %d is "+
-			"%s's: %s holds that uid now", owner, jailID, bounded(holder))
-	case !errors.Is(err, os.ErrNotExist):
+		return strings.TrimSpace(string(raw)) == jailID, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
 		return false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
 	}
-
-	return owner >= p.cfg.JailUIDMin && owner < p.cfg.JailUIDMin+p.cfg.JailUIDCount, nil
 }
 
 // releasable is what a microVM held, less the tap name a teardown must keep claimed.
