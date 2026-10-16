@@ -542,12 +542,23 @@ func TestASecondSightingUnmapsOnlyAnHourAfterTheFirst(t *testing.T) {
 	}
 
 	// A RELEASED MAPPING THE TABLE STILL LISTS, as a second mapping of the image
-	// would be, starts its hour again rather than being unmapped at once.
+	// would be, is sighted afresh by the next pass, an hour after the release,
+	// and released only an hour after that: its hour starts at a sighting, never
+	// at the release.
+	rig.nextPass()
 	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if len(rig.unmaps) != 1 {
-		t.Errorf("a mapping listed again after its release was unmapped without a fresh hour: %q", rig.unmaps)
+		t.Errorf("a mapping listed again after its release was unmapped at its first new sighting: %q", rig.unmaps)
+	}
+
+	rig.nextPass()
+	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(rig.unmaps) != 2 {
+		t.Errorf("a mapping sighted again an hour apart after its release was not released: %q", rig.unmaps)
 	}
 }
 
