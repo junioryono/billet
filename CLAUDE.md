@@ -136,6 +136,8 @@ Deliver what was asked, at the scope asked. Make routine judgment calls yourself
 
 **Worktrees live under the main checkout's `.claude/worktrees/`**, never beside the repository in `../` and never in `/tmp`: `git worktree add .claude/worktrees/<name> -b <branch> origin/main`. The directory is ignored by git and excluded from lint, so a parked worktree never reaches another session's diff or lint pass; a Claude scratchpad is the one other place the hook accepts. Work only in your own worktree, and never edit the main checkout another session is using.
 
+**No resident gopls.** `.claude/settings.json` turns off the `gopls-lsp@claude-plugins-official` plugin for this repository, because each session ran a gopls of its own that held 0.3 to 2.6 GB, a cold first index of a fresh worktree peaked at 3.6 GB, the shared-daemon mode (`-remote=auto`) saved 0 to 10% across separate worktrees, and the plugin's LSP tool was used in two sessions ever (measured 2026-10-15). Navigate with grep; when precise navigation is needed, run gopls one-shot, which exits afterwards: `gopls definition <file>:<line>:<col>`, `gopls references <file>:<line>:<col>`, `gopls implementation <file>:<line>:<col>`, `gopls check <file>`.
+
 The architecture program is tracked in #356: one assembly, a use-case layer, a pinned wire, and skills that load fast. A PR that is part of it says `Part of #356` and, in the session it merges, updates that issue's Progress table with its status, its link and what it measured; a finding that changes the plan is written into the issue body, with a dated line under Plan changes, before the PR that acts on it.
 
 ## Codex compatibility

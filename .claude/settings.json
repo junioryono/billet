@@ -35,5 +35,8 @@
       }
     ]
   },
-  "idleCompaction": false
+  "idleCompaction": false,
+  "enabledPlugins": {
+    "gopls-lsp@claude-plugins-official": false
+  }
 }
