@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"go/ast"
+	"go/types"
 	"net/http"
 	"slices"
 	"strconv"
@@ -179,51 +180,73 @@ func TestTheVerifyCommandLaunchesOnTheDiskItChose(t *testing.T) {
 	}
 }
 
-// THE COMMAND ACTS AS THE LOCK'S HOLDER ONLY AFTER ASKING (#175). A structural
-// test, because cmdImagesVerify needs a real node and a Ceph store to run: the
-// pre-launch cleanup and the recorded promotion are each preceded, with no other
-// act between, by lock.held(), and the verification is handed lock.held to ask
-// before its own launch and destroys.
+// THE COMMAND ACTS AS THE LOCK'S HOLDER ONLY AFTER MAKING SURE OF IT (#175). A
+// structural test, because cmdImagesVerify needs a real node and a Ceph store to
+// run: the pre-launch cleanup is preceded, with no other act between, by a GUARD
+// (`if err := lock.hold(); err != nil { ... return ... }`, so a failure ends the
+// command rather than being discarded), and the verification is handed
+// lock.hold to ask before its own launch and destroys. The record follows a
+// verdict authenticated by the run's own secret, and is not guarded.
 func TestTheVerifyCommandAsksWhetherItStillHoldsTheLock(t *testing.T) {
 	t.Parallel()
 
 	fn := findFunc(t, "cmdImagesVerify")
 
-	isHeld := func(expr ast.Expr) bool {
+	isHold := func(expr ast.Expr) bool {
 		sel, ok := expr.(*ast.SelectorExpr)
 
-		return ok && isIdent(sel.X, "lock") && sel.Sel.Name == "held"
+		return ok && isIdent(sel.X, "lock") && sel.Sel.Name == "hold"
+	}
+
+	// guard says an if statement takes lock.hold() in its init, tests the
+	// error and returns from its body.
+	guard := func(stmt *ast.IfStmt) bool {
+		assign, ok := stmt.Init.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 {
+			return false
+		}
+
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !isHold(call.Fun) || types.ExprString(stmt.Cond) != "err != nil" || len(stmt.Body.List) == 0 {
+			return false
+		}
+
+		_, returns := stmt.Body.List[len(stmt.Body.List)-1].(*ast.ReturnStmt)
+
+		return returns
 	}
 
 	var acts []string
 	handed := false
 
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-
-		switch {
-		case isHeld(call.Fun):
-			acts = append(acts, "held")
-		case isIdent(call.Fun, "destroyProbe"):
-			acts = append(acts, "destroyProbe")
-		case isIdent(call.Fun, "verifyGuestImage"):
-			acts = append(acts, "verifyGuestImage")
-			handed = len(call.Args) == 10 && isHeld(call.Args[9])
-		default:
-			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "RecordVerification" {
-				acts = append(acts, "RecordVerification")
+		switch n := node.(type) {
+		case *ast.IfStmt:
+			if guard(n) {
+				acts = append(acts, "guard")
+			}
+		case *ast.CallExpr:
+			switch {
+			case isHold(n.Fun):
+				acts = append(acts, "hold")
+			case isIdent(n.Fun, "destroyProbe"):
+				acts = append(acts, "destroyProbe")
+			case isIdent(n.Fun, "verifyGuestImage"):
+				acts = append(acts, "verifyGuestImage")
+				handed = len(n.Args) == 10 && isHold(n.Args[9])
+			default:
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "RecordVerification" {
+					acts = append(acts, "RecordVerification")
+				}
 			}
 		}
 
 		return true
 	})
 
-	want := []string{"held", "destroyProbe", "verifyGuestImage", "held", "RecordVerification"}
+	want := []string{"guard", "hold", "destroyProbe", "verifyGuestImage", "RecordVerification"}
 	if !slices.Equal(acts, want) || !handed {
-		t.Fatalf("cmdImagesVerify acts in the order %q and hands verifyGuestImage lock.held: %v; want %q and true",
+		t.Fatalf("cmdImagesVerify acts in the order %q and hands verifyGuestImage lock.hold: %v; want %q and true",
 			acts, handed, want)
 	}
 }

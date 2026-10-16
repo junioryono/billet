@@ -56,16 +56,26 @@ func (w *operationWalk) admitRetainedUnitPaths(ctx context.Context) error {
 		// another process's lock (#175); what it holds is lock records any
 		// process recreates. Only the exact directory, only from ReadWritePaths:
 		// a sibling under /run/billet, or the directory named by another
-		// property, remains a volatile input.
+		// property, remains a volatile input. AND ONLY AS ITSELF: a symlink
+		// at the directory or its parent would make wherever it leads
+		// disposable, so a name that resolves elsewhere is refused.
+		lockDir := w.inspector.retainedLockDir
+		if lockDir == "" {
+			lockDir = deploy.NodeLockDir
+		}
 		for _, entry := range strings.Fields(first(props, "ReadWritePaths")) {
-			if strings.TrimPrefix(entry, "-") != deploy.NodeLockDir {
+			if strings.TrimPrefix(entry, "-") != lockDir {
 				continue
 			}
-			path, err := w.bindPath(deploy.NodeLockDir)
+			path, err := w.bindPath(lockDir)
 			if err != nil {
 				return err
 			}
-			disposable = append(disposable, deploy.NodeLockDir, path)
+			if path != lockDir {
+				return fmt.Errorf("retained-input-volatile: %s resolves to %s, and the host lock directory is "+
+					"disposable only as itself", lockDir, path)
+			}
+			disposable = append(disposable, lockDir, path)
 		}
 		paths, err := w.inspector.retainedUnitPaths(ctx, unit, props)
 		if err != nil {

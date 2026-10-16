@@ -218,8 +218,8 @@ func TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns(t *testing.T) {
 		"-i", "ubuntu:24.04", "sh", "-eu")
 	cmd.Stdin = strings.NewReader(`
 mkdir /shim
-printf '#!/bin/sh\nexit 0\n' >/shim/systemctl
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/tmpfiles.argv\nexit "${TMPFILES_EXIT:-0}"\n' >/shim/systemd-tmpfiles
+printf '#!/bin/sh\nprintf "systemctl %%s\\n" "$*" >>/calls\nexit 0\n' >/shim/systemctl
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/tmpfiles.argv\nprintf "tmpfiles\\n" >>/calls\nexit "${TMPFILES_EXIT:-0}"\n' >/shim/systemd-tmpfiles
 chmod 0755 /shim/systemctl /shim/systemd-tmpfiles
 
 PATH="/shim:${PATH}" sh /postinstall.sh
@@ -229,8 +229,22 @@ if [ -e /tmpfiles.argv ]; then
 fi
 
 mkdir -p /run/systemd/system
+# A billet that answers the authority status open, so the unit decisions run
+# and arm the timers.
+printf '#!/bin/sh\necho "{\\"closed\\":false}"\n' >/usr/bin/billet
+chmod 0755 /usr/bin/billet
+rm -f /calls
 PATH="/shim:${PATH}" sh /postinstall.sh
 test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+
+# BEFORE THE TIMERS ARE ARMED: the image refresh requires the directory.
+tmpfiles_at=$(grep -n '^tmpfiles$' /calls | cut -d: -f1)
+timer_at=$(grep -n 'enable --now billet-images-refresh.timer' /calls | cut -d: -f1)
+if [ -z "${tmpfiles_at}" ] || [ -z "${timer_at}" ] || [ "${tmpfiles_at}" -ge "${timer_at}" ]; then
+    echo "the directory was not made before the image refresh's timer was armed:" >&2
+    cat /calls >&2
+    exit 1
+fi
 
 rm /tmpfiles.argv
 TMPFILES_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/tmpfiles.err

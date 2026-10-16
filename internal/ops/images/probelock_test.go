@@ -206,58 +206,94 @@ func TestReleasingTheProbeLockReleasesItWhileADuplicateIsOpen(t *testing.T) {
 	}
 }
 
-// A LOCK WHOSE NAME MOVED IS NO LONGER AN EXCLUSION, AND SAYS SO (#175). A
-// unit's stop removing its RuntimeDirectory unlinks the lock's name under its
-// holder, and the next verification locks a fresh file at the same path: that
-// second lock succeeding is the race, staged here, and held() is what lets the
-// first run know before it acts as the holder. Removed and replaced are two
-// answers, each naming the directory's removal as the cause.
-func TestAProbeLockWhoseNameMovedIsNoLongerHeld(t *testing.T) {
+// A LOCK WHOSE NAME MOVED IS TAKEN AGAIN, UNLESS ANOTHER VERIFICATION HOLDS IT
+// (#175). A unit's stop removing its RuntimeDirectory unlinks the lock's name
+// under its holder, and the next verification locks a fresh file at the same
+// path. hold() asks before every act only the holder may perform: with nobody
+// else on the name, it takes the name again, so a later verification is refused
+// as it would have been; with another verification already on it, it refuses,
+// because a probe by this name may now be that one's.
+func TestAProbeLockWhoseNameMovedIsTakenAgainUnlessAnotherHoldsIt(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-
-	first, err := takeProbeLock(dir, nodeDeployment)
-	if err != nil {
-		t.Fatalf("take the lock: %v", err)
+	release := func(t *testing.T, l *probeLock) {
+		t.Helper()
+		t.Cleanup(func() {
+			if err := l.release(); err != nil {
+				t.Errorf("release: %v", err)
+			}
+		})
 	}
 
-	t.Cleanup(func() {
-		if err := first.release(); err != nil {
-			t.Errorf("release: %v", err)
+	t.Run("nobody else on the name", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+
+		first, err := takeProbeLock(dir, nodeDeployment)
+		if err != nil {
+			t.Fatalf("take the lock: %v", err)
+		}
+		release(t, first)
+
+		if err := os.Remove(first.path); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := first.named(); err == nil || !strings.Contains(err.Error(), "was removed while this verification held it") {
+			t.Fatalf("named() over a removed name = %v, want the removal named", err)
+		}
+
+		if err := first.hold(); err != nil {
+			t.Fatalf("hold() with nobody else on the name = %v, want the name taken again", err)
+		}
+
+		if err := first.named(); err != nil {
+			t.Errorf("after hold() the name does not lead to the lock held: %v", err)
+		}
+
+		if second, err := takeProbeLock(dir, nodeDeployment); err == nil {
+			if err := second.release(); err != nil {
+				t.Errorf("release: %v", err)
+			}
+
+			t.Fatal("a second verification took the name the first had taken again")
 		}
 	})
 
-	if err := first.held(); err != nil {
-		t.Fatalf("a lock nothing moved is not held: %v", err)
-	}
+	t.Run("another verification on the name", func(t *testing.T) {
+		t.Parallel()
 
-	if err := os.Remove(first.path); err != nil {
-		t.Fatal(err)
-	}
+		dir := t.TempDir()
 
-	if err := first.held(); err == nil || !strings.Contains(err.Error(), "was removed while this verification held it") {
-		t.Fatalf("held() over a removed name = %v, want the removal named", err)
-	}
+		first, err := takeProbeLock(dir, nodeDeployment)
+		if err != nil {
+			t.Fatalf("take the lock: %v", err)
+		}
+		release(t, first)
 
-	second, err := takeProbeLock(dir, nodeDeployment)
-	if err != nil {
-		t.Fatalf("the recreated name was not lockable, so this does not stage the race: %v", err)
-	}
+		if err := os.Remove(first.path); err != nil {
+			t.Fatal(err)
+		}
 
-	t.Cleanup(func() {
-		if err := second.release(); err != nil {
-			t.Errorf("release: %v", err)
+		second, err := takeProbeLock(dir, nodeDeployment)
+		if err != nil {
+			t.Fatalf("the recreated name was not lockable, so this does not stage the race: %v", err)
+		}
+		release(t, second)
+
+		if err := first.named(); err == nil || !strings.Contains(err.Error(), "now names a different file") {
+			t.Fatalf("named() over a replaced name = %v, want the replacement named", err)
+		}
+
+		if err := first.hold(); err == nil || !strings.Contains(err.Error(), "another verification holds it now") {
+			t.Fatalf("hold() under another verification's lock = %v, want the overlap named", err)
+		}
+
+		if err := second.hold(); err != nil {
+			t.Errorf("the lock on the recreated name is not held: %v", err)
 		}
 	})
-
-	if err := first.held(); err == nil || !strings.Contains(err.Error(), "now names a different file") {
-		t.Fatalf("held() over a replaced name = %v, want the replacement named", err)
-	}
-
-	if err := second.held(); err != nil {
-		t.Errorf("the lock on the recreated name is not held: %v", err)
-	}
 }
 
 // A NAME MOVED BETWEEN THE OPEN AND THE FLOCK IS TAKEN AGAIN, ONCE MORE THAN
@@ -325,7 +361,7 @@ func TestTakingTheProbeLockRetakesANameMovedUnderIt(t *testing.T) {
 				}
 			}()
 
-			if err := lock.held(); err != nil {
+			if err := lock.named(); err != nil {
 				t.Errorf("the retaken lock is not held: %v", err)
 			}
 

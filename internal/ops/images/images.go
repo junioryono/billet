@@ -698,8 +698,10 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	// those are indistinguishable from a real node launch caught mid-creation.
 	//
 	// ONLY AS THE HOLDER: a probe by this name may be another verification's
-	// live one when the lock's name has moved (#175).
-	if err := lock.held(); err != nil {
+	// live one when the lock's name has moved (#175). Nothing guards the
+	// record below: the report the verdict rests on is authenticated by this
+	// run's own secret, so a verdict that passed is this run's guest's boot.
+	if err := lock.hold(); err != nil {
 		return err
 	}
 
@@ -708,7 +710,7 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	if err := verifyGuestImage(ctx, env, prov, cfg.Node.Firecracker.Bridge,
-		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait, lock.held); err != nil {
+		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, disk, *wait, lock.hold); err != nil {
 		return err
 	}
 
@@ -758,13 +760,6 @@ func cmdImagesVerify(ctx context.Context, env cli.Env, args []string) error {
 		// classify a kernel as managed while the launch looks somewhere else, and the
 		// pairing then names a file the launch will never find.
 		record, note := kernelToRecord(existing, configuredKernelName(cfg, nodeKernelDir(cfg)))
-
-		// A BOOT THIS RUN DID NOT HOLD THE MICROVM FOR PROVES NOTHING: a second
-		// verification that locked a moved name shares the probe's name, so the
-		// report that came back may be its guest's, or none was this one's.
-		if err := lock.held(); err != nil {
-			return fmt.Errorf("%s was not recorded as verified: %w", rest, err)
-		}
 
 		// ONE CALL, UNDER THE PUBLISH LOCK, having proved the generation still
 		// exists. The pairing and the verification were two unordered writes, and a
@@ -825,14 +820,14 @@ func verifyDisk(cfg *config.Config, override config.ByteSize) config.ByteSize {
 }
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
-// held answers whether this run still holds the verification lock, and is asked
+// hold makes sure this run holds the verification lock, and is asked
 // before the launch and before each destroy of the probe; nil asks nothing.
 func verifyGuestImage(
 	ctx context.Context, env cli.Env, prov provider.Provider, bridge string, port int,
-	image, lease string, disk config.ByteSize, wait time.Duration, held func() error,
+	image, lease string, disk config.ByteSize, wait time.Duration, hold func() error,
 ) error {
-	if held == nil {
-		held = func() error { return nil }
+	if hold == nil {
+		hold = func() error { return nil }
 	}
 
 	// A PROBE IS DESTROYED ONLY BY ITS HOLDER. The name is the same on every run,
@@ -840,7 +835,7 @@ func verifyGuestImage(
 	// live microVM; it is left in place, and the next verification's pre-launch
 	// cleanup collects it.
 	destroy := func(name string) error {
-		if err := held(); err != nil {
+		if err := hold(); err != nil {
 			return fmt.Errorf("%w; the probe %s was left in place for the next verification's "+
 				"cleanup", err, name)
 		}
@@ -876,7 +871,7 @@ func verifyGuestImage(
 
 	fmt.Fprintf(env.Stdout, "verifying %s on a root disk grown to %s\n", image, disk)
 
-	if err := held(); err != nil {
+	if err := hold(); err != nil {
 		return err
 	}
 

@@ -111,3 +111,4 @@ e8e645e2b725 The terraform gates are named by make verify and run by CI; billet-
 ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10-15 policy); the sentence is restated with both.
 298aa03ea951 The node unit declares only billet/registration since #175; host-inspection.md now names RuntimeDirectory=billet/registration, the lock directory being the tmpfiles entry's.
 b79b507956a0 The node's writable paths gained the host lock directory (#175); systemd.md restates the list with it.
+2614b062c2dc The node unit's two-entry RuntimeDirectory is the shape before #175; the measured fact is restated as of then.

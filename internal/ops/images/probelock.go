@@ -38,7 +38,7 @@ import (
 // which systemd removes at the unit's stop: a node restarted under a running
 // verification, and the next verification destroyed its live probe (#175).
 // The packaged units no longer declare the directory, but a host a rollout
-// upgraded keeps the units it had, so held() is asked again before each act
+// upgraded keeps the units it had, so hold() is asked again before each act
 // that only the holder may perform.
 type probeLock struct {
 	file *os.File
@@ -52,6 +52,9 @@ const probeLockAttempts = 2
 // probeLockOpened is a test hook called between the lock file's open and its
 // flock, the window a unit's stop can move the name in; nil in production.
 var probeLockOpened func(path string)
+
+// errProbeLockContended is a flock another open file description holds.
+var errProbeLockContended = errors.New("billet images verify: the lock is held by another verification")
 
 // takeProbeLock acquires it, or says who has it in terms an operator can act on.
 func takeProbeLock(dir, deployment string) (*probeLock, error) {
@@ -73,44 +76,27 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 		dir = "/var/lock"
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("billet images verify: make the lock directory %s: %w", dir, err)
-	}
-
 	path := filepath.Join(dir, "billet-imageverify-"+deployment+".lock")
 
 	var lost error
 
 	for range probeLockAttempts {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		file, err := lockName(path)
+		if errors.Is(err, errProbeLockContended) {
+			return nil, fmt.Errorf("billet images verify: another verification is already "+
+				"running on this machine, and two would be the same microVM — the second one's "+
+				"cleanup would destroy the first one's probe. Wait for it, or look at %s", path)
+		}
+
 		if err != nil {
-			return nil, fmt.Errorf("billet images verify: open the lock at %s: %w", path, err)
-		}
-
-		if probeLockOpened != nil {
-			probeLockOpened(path)
-		}
-
-		// NON-BLOCKING, because waiting would turn a mistake into a hang: the thing
-		// being waited for takes minutes, and the operator who started a second one
-		// wants to be told, not queued.
-		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-			_ = file.Close()
-
-			if errors.Is(err, unix.EWOULDBLOCK) {
-				return nil, fmt.Errorf("billet images verify: another verification is already "+
-					"running on this machine, and two would be the same microVM — the second one's "+
-					"cleanup would destroy the first one's probe. Wait for it, or look at %s", path)
-			}
-
-			return nil, fmt.Errorf("billet images verify: lock %s: %w", path, err)
+			return nil, err
 		}
 
 		lock := &probeLock{file: file, path: path}
 
 		// THE NAME CAN MOVE BETWEEN THE OPEN AND THE FLOCK, and a lock on a file
 		// nobody else can open excludes nobody: taken again from the name.
-		if lost = lock.held(); lost == nil {
+		if lost = lock.named(); lost == nil {
 			return lock, nil
 		}
 
@@ -122,11 +108,43 @@ func takeProbeLock(dir, deployment string) (*probeLock, error) {
 	return nil, lost
 }
 
-// held reports whether the lock's name still leads to the inode it holds, so
+// lockName opens the lock file at path, creating it and its directory, and
+// takes its flock without waiting: errProbeLockContended when another holds it.
+func lockName(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("billet images verify: make the lock directory %s: %w", filepath.Dir(path), err)
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("billet images verify: open the lock at %s: %w", path, err)
+	}
+
+	if probeLockOpened != nil {
+		probeLockOpened(path)
+	}
+
+	// NON-BLOCKING, because waiting would turn a mistake into a hang: the thing
+	// being waited for takes minutes, and the operator who started a second one
+	// wants to be told, not queued.
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = file.Close()
+
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, errProbeLockContended
+		}
+
+		return nil, fmt.Errorf("billet images verify: lock %s: %w", path, err)
+	}
+
+	return file, nil
+}
+
+// named reports whether the lock's name still leads to the inode it holds, so
 // that a second verification opening that name would contend with this one.
 // Anything else (the name gone, another file there, a stat that failed) is an
-// error naming the race, and the caller does not act as the holder.
-func (l *probeLock) held() error {
+// error naming what moved.
+func (l *probeLock) named() error {
 	locked, err := l.file.Stat()
 	if err != nil {
 		return fmt.Errorf("billet images verify: examine the lock held on %s: %w", l.path, err)
@@ -134,10 +152,7 @@ func (l *probeLock) held() error {
 
 	named, err := os.Lstat(l.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("billet images verify: %s was removed while this verification held it, so a "+
-			"second verification could lock a new file there and share this one's microVM. The directory "+
-			"is removed by a unit's stop when it is that unit's RuntimeDirectory (#175); install the units "+
-			"this release ships (converge the host role, or install the package)", l.path)
+		return fmt.Errorf("billet images verify: %s was removed while this verification held it", l.path)
 	}
 
 	if err != nil {
@@ -146,12 +161,46 @@ func (l *probeLock) held() error {
 
 	if !os.SameFile(locked, named) {
 		return fmt.Errorf("billet images verify: %s now names a different file from the one this "+
-			"verification locked, so a second verification could lock it and share this one's microVM. "+
-			"The directory is removed by a unit's stop when it is that unit's RuntimeDirectory (#175); "+
-			"install the units this release ships (converge the host role, or install the package)", l.path)
+			"verification locked", l.path)
 	}
 
 	return nil
+}
+
+// hold makes sure this verification holds the lock its name leads to before an
+// act only the holder may perform. A name that moved under the lock (#175) is
+// taken again, without waiting, from whatever the path holds now: a lock taken
+// there excludes every other verification from that moment, and the old one is
+// dropped. When another verification holds the name it refuses, because a probe
+// by this name may now be that one's: the two overlapped, and nothing here can
+// undo what the other's cleanup already did. The units this release ships keep
+// the directory across a node stop, so on them the name never moves.
+func (l *probeLock) hold() error {
+	moved := l.named()
+	if moved == nil {
+		return nil
+	}
+
+	file, err := lockName(l.path)
+	if errors.Is(err, errProbeLockContended) {
+		return fmt.Errorf("%w, and another verification holds it now, so the two may share one microVM. The "+
+			"directory is removed by a unit's stop when it is that unit's RuntimeDirectory (#175); install the "+
+			"units this release ships (converge the host role, or install the package)", moved)
+	}
+
+	if err != nil {
+		return errors.Join(moved, err)
+	}
+
+	retaken := &probeLock{file: file, path: l.path}
+	if err := retaken.named(); err != nil {
+		return errors.Join(moved, err, retaken.release())
+	}
+
+	previous := &probeLock{file: l.file, path: l.path}
+	l.file = file
+
+	return previous.release()
 }
 
 // release drops the lock.

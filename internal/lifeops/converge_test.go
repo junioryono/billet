@@ -656,18 +656,19 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 
 // THE LOCK DIRECTORY IS NAMED, NOT DECLARED, BY THIS RELEASE'S NODE UNIT
 // (#175): a RuntimeDirectory's stop removes it under another process's lock, so
-// billet-tmpfiles.conf makes it and the unit names it in ReadWritePaths. The
-// named entry, with or without a leading '-', admits it whole; a neighbour of
-// it, its parent and a relative entry do not, and the refusal names what the
-// unit does make writable.
+// billet-tmpfiles.conf makes it and the unit names it in ReadWritePaths. Only
+// that directory, named exactly and required, admits it: an optional entry
+// starts a node that cannot create it, the unit's other writable paths are not
+// lock directories, and a neighbour, its parent and a relative entry are not
+// it. The refusal names what the unit does make writable for a lock.
 func TestPlanAdmitsTheLockDirectoryTheUnitNames(t *testing.T) {
 	cases := []struct {
 		name, readWrite, dir string
 		refused              bool
 	}{
 		{"named", "-/etc/billet/tls -/srv/jailer /run/billet/locks", "/run/billet/locks", false},
-		{"named as optional", "-/run/billet/locks", "/run/billet/locks", false},
-		{"named with a trailing slash", "/run/billet/locks/", "/run/billet/locks", false},
+		{"named as optional", "-/run/billet/locks", "/run/billet/locks", true},
+		{"another writable path", "-/etc/billet/tls -/srv/jailer /run/billet/locks", "/srv/jailer", true},
 		{"a neighbour", "/run/billet/locks", "/run/billet/locks-else", true},
 		{"the parent", "/run/billet/locks", "/run/billet", true},
 		{"a relative entry is not a path", "run/billet/locks", "/run/billet/locks", true},

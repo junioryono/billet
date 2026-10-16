@@ -198,6 +198,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/services.yml / Validate and migrate with the new billet binary as the only ledger writer | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Return the migrated ledger to the control-plane account before restart | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Start the quiescent upgraded server readiness probe | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
+| tasks/services.yml / Make the host lock directory before the upgraded node starts | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Start the quiescent upgraded node readiness probe | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Inspect upgraded readiness-probe stability baseline | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
 | tasks/services.yml / Observe upgraded readiness probes across the restart interval | parity:binary transaction only; retirement-binary-refusal.yml rejects it before ordinary work |
@@ -217,6 +218,7 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/endpoint-migration.yml / Write the registration's confirmation | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
 | tasks/endpoint-migration.yml / Write the migration's receipt | parity:shared migration/receipt command owns its runtime footprint and is followed by strict closing (R7.2) |
 | tasks/endpoint-migration.yml / Remove the migration's temporary files | const:/tmp; parity:private tempfile children allocated after admission, written and removed without a recursive parent operation (R7.2) |
+| tasks/services.yml / Make the host lock directory before the node starts | loop:billet_host_lock_directories |
 | tasks/node-restart.yml / Record the billet node's main process before its restart | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-restart.yml / Request the billet node's restart without waiting for its drain | parity:shared manager reload or node service lifecycle; node enable/stop/start superset is admitted |
 | tasks/node-restart.yml / Poll the billet node until a new main process runs | parity:read-only observation or node validation; exact full module arguments and definitions are bound |

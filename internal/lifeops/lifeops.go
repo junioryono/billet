@@ -298,6 +298,9 @@ type Inspector struct {
 	operationBootIDPath string
 	operationTempRoots  []string
 	retainedInputRoots  []string
+	// retainedLockDir replaces deploy.NodeLockDir in the retained-node path
+	// admission, for a test that has to plant a symlink; empty in production.
+	retainedLockDir string
 	// waitDelay is the grace execRunner gives a cancelled run; see
 	// WithWaitDelay.
 	waitDelay time.Duration

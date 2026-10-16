@@ -756,8 +756,8 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 
 	for _, d := range []struct {
 		what, configured, declared, root string
-		// named is a ReadWritePaths answer whose entries also admit the
-		// directory, each with any '-' (missing is not an error) stripped.
+		// named is a ReadWritePaths answer, which admits the directory only
+		// as exactly deploy.NodeLockDir.
 		named string
 	}{
 		{what: "state_dir", configured: spec.stateDir, declared: s.StateDirectory, root: stateRoot},
@@ -781,8 +781,12 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 			wants = append(wants, filepath.Join(d.root, entry))
 		}
 
-		for _, entry := range strings.Fields(d.named) {
-			wants = append(wants, filepath.Clean(strings.TrimPrefix(entry, "-")))
+		// ONLY THE SHIPPED LOCK DIRECTORY, AND REQUIRED: the unit's other
+		// writable paths (its credentials, the jailer) are not where a lock
+		// belongs, and an optional entry starts a node that cannot create the
+		// directory under the read-only /run.
+		if slices.Contains(strings.Fields(d.named), deploy.NodeLockDir) {
+			wants = append(wants, deploy.NodeLockDir)
 		}
 
 		if len(wants) == 0 {
