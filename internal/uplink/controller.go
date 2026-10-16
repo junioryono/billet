@@ -53,14 +53,15 @@
 // The default route's gateway is asked each round too, against a baseline of
 // its own, because a host beside the reference node saw its gateway stall (1.6
 // ms to spikes of 128 ms) while the round trip to the reflectors rose about 11
-// ms (2026-10-14). Its rise past Bloat in two rounds in a row (step.go) makes a
-// round delayed as the reflectors' does, and holds a rate as theirs does, but
-// only in a round that counted a reflector, and while its last reading was a
-// stall a round it gave no reading in is not clear; its unanswered probes are
-// never loss,
-// because a gateway answers ICMP when it has the time (the reference node's went
-// unanswered about 2% of the time with the line quiet, 2026-10-16), and read as
-// loss they would cut a busy host on every miss.
+// ms (2026-10-14). Its rise past Bloat confirmed by two readings within two
+// seconds (readGateway) makes a round delayed for a cut as the reflectors' does,
+// one high reading alone keeps an episode from ending and a rate from rising,
+// and one quiet reading clears a stall; all of it only in a round that counted a
+// reflector, and while its last reading was a stall a round it gave no reading
+// in is not clear. Its unanswered probes are never loss, because a gateway
+// answers ICMP when it has the time (the reference node's went unanswered about
+// 2% of the time with the line quiet, 2026-10-16), and read as loss they would
+// cut a busy host on every miss.
 //
 // A rate near the interface's speed is not a signal, with no ceiling set or any
 // other. The shaper cannot tell a line as fast as the interface, where such a
@@ -274,19 +275,35 @@ func (o Observation) gatewayUnmeasured() bool {
 	return len(o.Gateway.Probes) > 0 && !o.Gateway.DelayKnown
 }
 
-// delayed reports whether the round measured a queue: the reflectors' delay or
-// the gateway's rise past bloat.
-func (o Observation) delayed(bloat time.Duration) bool {
-	return o.DelayKnown && o.Delay > bloat || o.gatewayCounts() && o.Gateway.Delay > bloat
+// gatewayPairWithin is how close two of the gateway's readings must be to
+// confirm a stall between them: four rounds, so a gateway that answers ICMP
+// once a second, never two rounds in a row, still confirms one.
+const gatewayPairWithin = 2 * time.Second
+
+// gatewayRound is what one round's gateway reading says, beside the one before.
+type gatewayRound struct {
+	// high is a counted reading over Bloat, and quiet one at or under it; a
+	// round may be neither, when the gateway gave no counted reading.
+	high, quiet bool
+	// confirmed is a high reading whose last counted reading, within
+	// gatewayPairWithin, was high too: a stall, not one ping's spike. rise is
+	// the lesser of the two, the stall both reached.
+	confirmed bool
+	rise      time.Duration
+}
+
+// reflectorsDelayed is whether the reflectors measured a delay past Bloat.
+func (o Observation) reflectorsDelayed(bloat time.Duration) bool {
+	return o.DelayKnown && o.Delay > bloat
 }
 
 // queue is the deepest queue the round measured, the reflectors' delay or the
-// gateway's rise, and whether it measured either.
-func (o Observation) queue() (time.Duration, bool) {
+// gateway's confirmed rise, and whether it measured either.
+func (o Observation) queue(g gatewayRound) (time.Duration, bool) {
 	delay, known := o.Delay, o.DelayKnown
 
-	if o.gatewayCounts() && (!known || o.Gateway.Delay > delay) {
-		delay, known = o.Gateway.Delay, true
+	if g.confirmed && (!known || g.rise > delay) {
+		delay, known = g.rise, true
 	}
 
 	return delay, known
@@ -309,9 +326,29 @@ type Controller struct {
 	// clear and end a futile episode.
 	recent, delayTrail []bool
 	losses, trail      [][]Probe
-	// gatewayStalled is whether the gateway's last counted reading was over
-	// Bloat, which decides what a round it gave no reading in says.
+	// lastGateway and lastGatewayAt are the gateway's last counted reading and
+	// when, which a high one now needs to confirm a stall; gatewayStalled is
+	// whether it was over Bloat, which decides what a round it gave no reading in
+	// says, and one quiet reading clears it.
+	lastGateway    measured
+	lastGatewayAt  time.Time
 	gatewayStalled bool
+}
+
+// readGateway judges this round's gateway reading against the last counted one.
+func (c *Controller) readGateway(o Observation) gatewayRound {
+	if !o.gatewayCounts() {
+		return gatewayRound{}
+	}
+
+	bloat := c.Params.Bloat
+	g := gatewayRound{high: o.Gateway.Delay > bloat, quiet: o.Gateway.Delay <= bloat}
+
+	if g.high && c.lastGateway.known && c.lastGateway.delay > bloat && o.At.Sub(c.lastGatewayAt) <= gatewayPairWithin {
+		g.confirmed, g.rise = true, min(o.Gateway.Delay, c.lastGateway.delay)
+	}
+
+	return g
 }
 
 // verdict is what one step's evidence says, the same for both directions.
@@ -332,7 +369,9 @@ type verdict struct {
 	cleared bool
 	// tally is each reflector's probes and misses since the last cut.
 	tally tally
-	cut   float64
+	// gateway is what this round's gateway reading said.
+	gateway gatewayRound
+	cut     float64
 }
 
 // Step applies one observation and reports whether either rate changed.
@@ -349,17 +388,24 @@ func (c *Controller) Step(o Observation) bool {
 	// was seen before an outage is not still evidence a minute later. A round
 	// with no measured delay is not a delayed one, and one that counted no
 	// reflector lost nothing.
-	delayed := o.delayed(p.Bloat)
-	c.recent = lastRounds(append(c.recent, delayed), p.Window)
-	c.delayTrail = lastRounds(append(c.delayTrail, delayed), p.Window)
+	//
+	// A CUT WAITS FOR A CONFIRMED GATEWAY STALL, AN EPISODE ENDS ONLY WITHOUT
+	// ANY HIGH READING: the windows that decide a cut take the gateway's stall
+	// once two readings confirm it, so one spike cuts nothing, while the trail
+	// that decides whether a queue has gone takes every high reading, so a stall
+	// with one quiet reply in four never reads as cleared.
+	g := c.readGateway(o)
+	reflectors := o.reflectorsDelayed(p.Bloat)
+	c.recent = lastRounds(append(c.recent, reflectors || g.confirmed), p.Window)
+	c.delayTrail = lastRounds(append(c.delayTrail, reflectors || g.high), p.Window)
 	c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
 	c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
 
-	v := c.judge(o)
+	v := c.judge(o, g)
 
-	// AFTER THE JUDGEMENT, which reads the reading before this one.
 	if o.gatewayCounts() {
-		c.gatewayStalled = o.Gateway.Delay > p.Bloat
+		c.lastGateway, c.lastGatewayAt = measured{o.Gateway.Delay, true}, o.At
+		c.gatewayStalled = g.high
 	}
 
 	seconds := o.Interval.Seconds()
@@ -406,31 +452,33 @@ func lastRounds[T any](rounds []T, n int) []T {
 }
 
 // judge reads the windows and this round into what both directions act on.
-func (c *Controller) judge(o Observation) verdict {
+func (c *Controller) judge(o Observation, g gatewayRound) verdict {
 	p := c.Params
 
 	delayFull := countTrue(c.recent) >= p.Detect
 	stillDelayed := countTrue(c.delayTrail) >= p.Detect
 	dropping := c.dropping(c.losses, o)
 	stillDropping := c.dropping(c.trail, o)
-	delayedNow := o.delayed(p.Bloat)
+	reflectors := o.reflectorsDelayed(p.Bloat)
 	stallUnread := o.gatewayUnmeasured() && c.gatewayStalled
 
-	// CLEAR ONLY WHEN THE REFLECTORS MEASURED THE LINE, and the gateway, when it
-	// answered, shows no stall either, nor went unread after one: a gateway alone
-	// says nothing about the line beyond it.
+	// CLEAR ONLY WHEN THE REFLECTORS MEASURED THE LINE UNDER BLOAT, and the
+	// gateway shows no high reading, nor went unread after one: a gateway alone
+	// says nothing about the line beyond it, and one high reading not yet
+	// confirmed is no evidence the queue has gone.
 	v := verdict{
 		full:    delayFull || dropping,
-		onDelay: delayFull && delayedNow,
+		onDelay: delayFull && (reflectors || g.confirmed),
 		onLoss:  dropping && o.Lost() > 0,
-		clear:   o.DelayKnown && !delayedNow && !stillDropping && !stallUnread,
+		clear:   o.DelayKnown && !reflectors && !g.high && !stillDropping && !stallUnread,
 		tally:   tallyOf(c.losses),
+		gateway: g,
 		cut:     1,
 	}
 	v.cleared = v.clear && !stillDelayed
 
 	if v.onDelay {
-		queue, _ := o.queue()
+		queue, _ := o.queue(g)
 		v.cut = c.cutFactor(queue)
 	}
 
@@ -611,7 +659,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// stall the cut was taken on, and crediting it would keep cutting for a
 		// queue that is not this host's.
 		d.cutReflectors = measured{o.Delay, o.DelayKnown && o.Delay > p.Bloat}
-		d.cutGateway = measured{o.Gateway.Delay, o.gatewayCounts() && o.Gateway.Delay > p.Bloat}
+		d.cutGateway = measured{v.gateway.rise, v.gateway.confirmed}
 		d.cutTally = v.tally
 
 		return d.Rate != before, true
@@ -654,6 +702,7 @@ func helped(d *Direction, v verdict, o Observation) bool {
 // the safe way: a queue still there is seen again within Detect rounds.
 func (c *Controller) forgetGateway() {
 	c.recent, c.delayTrail, c.gatewayStalled = nil, nil, false
+	c.lastGateway, c.lastGatewayAt = measured{}, time.Time{}
 
 	for _, d := range []*Direction{&c.Up, &c.Down} {
 		d.episode, d.futile, d.cutGateway = false, 0, measured{}

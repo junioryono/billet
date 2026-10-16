@@ -222,7 +222,7 @@ func followGateway(log *slog.Logger, lookup func() (string, error), pinger gatew
 		return
 	}
 
-	st.gateway, st.lastGateway = Delays{}, Sample{}
+	st.gateway = Delays{}
 	ctl.forgetGateway()
 
 	log.Info("the default route's gateway changed; asking the new one", "gateway", gatewayLabel(pinger.Gateway()))
