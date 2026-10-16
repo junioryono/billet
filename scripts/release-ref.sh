@@ -21,10 +21,11 @@
 # then make main's own CI expect a release ref. The first-parent chain of a
 # merge into main stays on main.
 #
-# COULD NOT TELL IS NOT `main`. Outside a git work tree, or in a shallow clone
-# whose history is cut off before the release commit, this refuses rather than
+# COULD NOT TELL IS NOT `main`. Outside a git work tree, in a shallow clone whose
+# history is cut off before the release commit, or in a clone whose history
+# reaches a `Release vX.Y.Z` commit that carries no tag, this refuses rather than
 # answering: a release branch read as `main` fails for the wrong reason, and a
-# main read as a release would pass a tree that composes an old release.
+# tree read as the wrong release passes references reverted to that release.
 set -euo pipefail
 
 if ! inside=$(git rev-parse --is-inside-work-tree 2>/dev/null) || [ "$inside" != true ]; then
@@ -52,16 +53,24 @@ git for-each-ref \
 	--format='%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end) %(refname:strip=2)' \
 	'refs/tags/v*' >"$work/tags"
 
-git rev-list --first-parent HEAD >"$work/chain"
+git log --first-parent --format='%H %s' HEAD >"$work/chain"
 
 # One pass: the tags by commit, then the chain from HEAD back. The first commit
 # carrying a release tag answers, with the highest version on it, compared by
 # number rather than as text so v0.4.10 is newer than v0.4.9.
 #
+# A RELEASE COMMIT WITHOUT ITS TAG IS COULD-NOT-TELL. Full history does not
+# prove the tags came with it (`git fetch --no-tags`), and with them missing a
+# release branch would read as main, or as an older release when only its newest
+# tag is gone. cut-release.yml commits `Release vX.Y.Z` on the branch it tags,
+# so a commit with that exact subject that the walk reaches before any tag is a
+# tag this clone lacks, and the answer is a refusal (status 3).
+#
 # THE PATTERN IS A LITERAL IN THE PROGRAM, not passed with -v: awk processes
 # escapes in a -v value, so `\.` would arrive as `.` and match any character.
 # FILENAME, not FNR == NR, tells the files apart, because with no tags at all
 # the first file is empty and FNR == NR holds for the chain as well.
+set +e
 ref=$(awk '
 	function newer(a, b,    x, y, i) {
 		split(substr(a, 2), x, ".")
@@ -76,8 +85,28 @@ ref=$(awk '
 			(!($1 in best) || newer($2, best[$1]))) best[$1] = $2
 		next
 	}
-	$1 in best { print best[$1]; found = 1; exit }
-	END { if (!found) print "main" }
+	$1 in best { print best[$1]; done = 1; exit }
+	substr($0, length($1) + 2) ~ /^Release v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {
+		print substr($0, length($1) + 10) " " $1
+		done = 1
+		exit 3
+	}
+	END { if (!done) print "main" }
 ' "$work/tags" "$work/chain")
+status=$?
+set -e
+
+case $status in
+	0) ;;
+	3)
+		printf 'release-ref: commit %s cut %s, and this clone has no %s tag on it\n' "${ref#* }" "${ref%% *}" "${ref%% *}" >&2
+		printf '  fetch the tags (git fetch --tags, or actions/checkout with fetch-depth: 0)\n' >&2
+		exit 1
+		;;
+	*)
+		printf 'release-ref: reading the tags against the history failed (awk exited %d)\n' "$status" >&2
+		exit 1
+		;;
+esac
 
 printf '%s\n' "$ref"

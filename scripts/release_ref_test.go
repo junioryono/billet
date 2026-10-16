@@ -39,7 +39,7 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "v0.4.0")
+				fixtureGit(t, repo, "tag", "v0.4.0")
 				commit(t, repo, "a carry")
 			},
 			want: "v0.4.0",
@@ -51,7 +51,7 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
 				commit(t, repo, "a carry")
 			},
 			want: "v0.4.0",
@@ -62,10 +62,10 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
 				commit(t, repo, "a carry")
 				commit(t, repo, "Release v0.4.1")
-				runGit(t, repo, "tag", "-a", "v0.4.1", "-m", "v0.4.1")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.1", "-m", "v0.4.1")
 				commit(t, repo, "another carry")
 			},
 			want: "v0.4.1",
@@ -77,8 +77,8 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "Release")
-				runGit(t, repo, "tag", "v0.4.10")
-				runGit(t, repo, "tag", "v0.4.9")
+				fixtureGit(t, repo, "tag", "v0.4.10")
+				fixtureGit(t, repo, "tag", "v0.4.9")
 			},
 			want: "v0.4.10",
 		},
@@ -91,11 +91,11 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "v0.4.0")
+				fixtureGit(t, repo, "tag", "v0.4.0")
 				for _, tag := range []string{"v0", "v0.5.0-rc.1", "guest-20260101-000000",
 					"release-4", "v0.05.0", "v0x5x0"} {
 					commit(t, repo, tag)
-					runGit(t, repo, "tag", tag)
+					fixtureGit(t, repo, "tag", tag)
 				}
 			},
 			want: "v0.4.0",
@@ -109,12 +109,12 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "main before the cut")
-				runGit(t, repo, "checkout", "--quiet", "-b", "release/v0.4")
+				fixtureGit(t, repo, "checkout", "--quiet", "-b", "release/v0.4")
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
-				runGit(t, repo, "checkout", "--quiet", "main")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				fixtureGit(t, repo, "checkout", "--quiet", "main")
 				commit(t, repo, "main after the cut")
-				runGit(t, repo, "merge", "--quiet", "--no-ff", "-m", "Merge the hotfix back",
+				fixtureGit(t, repo, "merge", "--quiet", "--no-ff", "-m", "Merge the hotfix back",
 					"release/v0.4")
 			},
 			want: "main",
@@ -127,13 +127,13 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				t.Helper()
 
 				commit(t, repo, "main before the cut")
-				runGit(t, repo, "checkout", "--quiet", "-b", "release/v0.4")
+				fixtureGit(t, repo, "checkout", "--quiet", "-b", "release/v0.4")
 				commit(t, repo, "Release v0.4.0")
-				runGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
-				runGit(t, repo, "checkout", "--quiet", "-b", "carry")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				fixtureGit(t, repo, "checkout", "--quiet", "-b", "carry")
 				commit(t, repo, "the carry")
-				runGit(t, repo, "checkout", "--quiet", "release/v0.4")
-				runGit(t, repo, "merge", "--quiet", "--no-ff", "-m", "Merge the carry", "carry")
+				fixtureGit(t, repo, "checkout", "--quiet", "release/v0.4")
+				fixtureGit(t, repo, "merge", "--quiet", "--no-ff", "-m", "Merge the carry", "carry")
 			},
 			want: "v0.4.0",
 		},
@@ -167,11 +167,11 @@ func TestTheReleaseRefRefusesWhatItCannotTell(t *testing.T) {
 
 		origin := newRepo(t)
 		commit(t, origin, "Release v0.4.0")
-		runGit(t, origin, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+		fixtureGit(t, origin, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
 		commit(t, origin, "a carry")
 
 		clone := filepath.Join(t.TempDir(), "clone")
-		runGit(t, origin, "clone", "--quiet", "--depth", "1", "file://"+origin, clone)
+		fixtureGit(t, origin, "clone", "--quiet", "--depth", "1", "file://"+origin, clone)
 
 		got, stderr, err := releaseRef(t, clone)
 		if err == nil {
@@ -184,6 +184,56 @@ func TestTheReleaseRefRefusesWhatItCannotTell(t *testing.T) {
 
 		if got != "" {
 			t.Errorf("a refusal also printed an answer: %q", got)
+		}
+	})
+
+	// FULL HISTORY IS NOT ALL THE TAGS. cut-release.yml commits `Release vX.Y.Z`
+	// on the branch it tags, so a clone that reaches that commit without its tag
+	// is missing a tag, and reading on past it would answer main, or an older
+	// release when only the newest tag is gone.
+	t.Run("a full clone fetched without tags", func(t *testing.T) {
+		t.Parallel()
+
+		origin := newRepo(t)
+		commit(t, origin, "main before the cut")
+		commit(t, origin, "Release v0.4.0")
+		fixtureGit(t, origin, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+		commit(t, origin, "a carry")
+
+		clone := filepath.Join(t.TempDir(), "clone")
+		fixtureGit(t, origin, "clone", "--quiet", "--no-tags", "file://"+origin, clone)
+
+		got, stderr, err := releaseRef(t, clone)
+		if err == nil {
+			t.Fatalf("release-ref.sh answered %q from a clone without its tags", got)
+		}
+
+		if !strings.Contains(stderr, "cut v0.4.0, and this clone has no v0.4.0 tag") {
+			t.Errorf("the refusal does not name the missing tag:\n%s", stderr)
+		}
+
+		if got != "" {
+			t.Errorf("a refusal also printed an answer: %q", got)
+		}
+	})
+
+	t.Run("only the newest release's tag missing", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		commit(t, repo, "Release v0.4.0")
+		fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+		commit(t, repo, "a carry")
+		commit(t, repo, "Release v0.4.1")
+		commit(t, repo, "another carry")
+
+		got, stderr, err := releaseRef(t, repo)
+		if err == nil {
+			t.Fatalf("release-ref.sh answered %q past an untagged v0.4.1", got)
+		}
+
+		if !strings.Contains(stderr, "cut v0.4.1, and this clone has no v0.4.1 tag") {
+			t.Errorf("the refusal does not name the missing tag:\n%s", stderr)
 		}
 	})
 
@@ -258,11 +308,11 @@ func TestTheModuleSourcesCheckExpectsTheTreesOwnRef(t *testing.T) {
 				}
 			}
 
-			runGit(t, repo, "add", "-A")
+			fixtureGit(t, repo, "add", "-A")
 			commit(t, repo, "the documentation")
 
 			if tc.tag != "" {
-				runGit(t, repo, "tag", "-a", tc.tag, "-m", tc.tag)
+				fixtureGit(t, repo, "tag", "-a", tc.tag, "-m", tc.tag)
 			}
 
 			cmd := exec.CommandContext(t.Context(), checker)
@@ -278,6 +328,69 @@ func TestTheModuleSourcesCheckExpectsTheTreesOwnRef(t *testing.T) {
 				t.Errorf("the refusal does not say %q:\n%s", tc.wantOutput, out)
 			}
 		})
+	}
+}
+
+// THE FIXTURES DO NOT DEPEND ON THE DEVELOPER'S GIT. A global configuration whose
+// hooks refuse every commit and which signs every commit and tag is installed
+// for this test, proved hostile on a plain git, and the fixture helpers and the
+// resolver still build and read a release branch through it. Not parallel:
+// t.Setenv changes the process's environment.
+func TestTheReleaseRefFixturesIgnoreTheDevelopersGitConfiguration(t *testing.T) {
+	home := t.TempDir()
+	hooks := filepath.Join(home, "hooks")
+
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatalf("create the hooks directory: %v", err)
+	}
+
+	for _, hook := range []string{"pre-commit", "commit-msg"} {
+		if err := forkSafeWriteFile(filepath.Join(hooks, hook), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatalf("write the %s hook: %v", hook, err)
+		}
+	}
+
+	// WHERE AN UNGUARDED GIT LOOKS: the global file under HOME, and the -c
+	// settings a parent passes in GIT_CONFIG_PARAMETERS. The first is what
+	// GIT_CONFIG_GLOBAL=/dev/null shuts out, the second what stripping GIT_* does.
+	config := "[core]\n\thooksPath = " + hooks + "\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n" +
+		"[user]\n\tname = Hostile\n\temail = hostile@example.invalid\n"
+
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte(config), 0o600); err != nil {
+		t.Fatalf("write the hostile configuration: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'core.hookspath'='"+hooks+"'")
+
+	// HOSTILE, PROVED: a plain git under it cannot commit.
+	plain := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "--quiet"},
+		{"commit", "--quiet", "--allow-empty", "-m", "probe"},
+	} {
+		cmd := exec.CommandContext(t.Context(), "git", args...)
+		cmd.Dir = plain
+
+		out, err := cmd.CombinedOutput()
+		if args[0] == "commit" && err == nil {
+			t.Fatalf("the hostile configuration let a plain commit through, so it proves nothing\n%s", out)
+		}
+	}
+
+	repo := newRepo(t)
+	commit(t, repo, "Release v0.4.0")
+	fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+	commit(t, repo, "a carry")
+
+	got, stderr, err := releaseRef(t, repo)
+	if err != nil {
+		t.Fatalf("release-ref.sh refused: %v\n%s", err, stderr)
+	}
+
+	if got != "v0.4.0\n" {
+		t.Errorf("release-ref.sh answered %q, want %q", got, "v0.4.0\n")
 	}
 }
 
@@ -310,21 +423,10 @@ func newRepo(t *testing.T) string {
 
 	repo := t.TempDir()
 
-	for _, args := range [][]string{
-		{"init", "--quiet", "--initial-branch", "main"},
-		{"config", "user.name", "Billet Test"},
-		{"config", "user.email", "billet@example.invalid"},
-		{"config", "commit.gpgsign", "false"},
-		{"config", "tag.gpgsign", "false"},
-	} {
-		cmd := exec.CommandContext(t.Context(), "git", args...)
-		cmd.Dir = repo
-		cmd.Env = fixtureGitEnv()
-
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-	}
+	// --template= copies no template, so no hook a template carries is installed.
+	fixtureGit(t, repo, "init", "--quiet", "--template=", "--initial-branch", "main")
+	fixtureGit(t, repo, "config", "user.name", "Billet Test")
+	fixtureGit(t, repo, "config", "user.email", "billet@example.invalid")
 
 	return repo
 }
@@ -333,11 +435,37 @@ func newRepo(t *testing.T) string {
 func commit(t *testing.T, repo, message string) {
 	t.Helper()
 
-	runGit(t, repo, "commit", "--quiet", "--allow-empty", "-m", message)
+	fixtureGit(t, repo, "commit", "--quiet", "--allow-empty", "-m", message)
 }
 
-// fixtureGitEnv is the environment a fixture repository's git runs in: none of
-// the developer's hooks, templates or includes, any of which can fail a commit.
+// fixtureGit runs git in a fixture repository, in fixtureGitEnv.
+func fixtureGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "git", args...)
+	cmd.Dir = dir
+	cmd.Env = fixtureGitEnv()
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+// fixtureGitEnv is the environment a fixture repository's git runs in, and the
+// resolver under test with it: no inherited GIT_* variable (a GIT_DIR would point
+// it at another repository), and neither the developer's global nor the system
+// configuration, whose hooks, signing or includes can fail or change a commit.
 func fixtureGitEnv() []string {
-	return append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	env := make([]string, 0, len(os.Environ())+3)
+
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GIT_") {
+			continue
+		}
+
+		env = append(env, kv)
+	}
+
+	return append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1")
 }
