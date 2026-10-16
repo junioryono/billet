@@ -170,7 +170,10 @@ func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 	// controller pairs them: the gateway is evidence only on two readings.
 	ms := time.Millisecond
 	round := func(reflectors, before time.Duration, now Sample) (verdict, Observation) {
-		k := &Controller{Params: c.Params, lastGateway: measured{before, true}, lastGatewayAt: at(8)}
+		k := &Controller{Params: c.Params, round: 1, lastGateway: measured{before, true}}
+		if before > c.Params.Bloat {
+			k.lastHigh = k.lastGateway
+		}
 		o := withGateway(moving(9, 5, 400, reflectors), now)
 
 		return verdict{gateway: k.readGateway(o)}, o
@@ -224,14 +227,21 @@ func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 	}
 
 	// THE SAME REFLECTORS ASKED THEN AND NOW JUDGE A CUT BY THEIR LOSS, though no
-	// delay was measured both times.
+	// delay was measured both times; but only a cut that saw a loss, as a delay
+	// is evidence only when the cut saw one.
 	cut = *d
 	cut.cutReflectors = measured{}
 	v, o = round(20*ms, 60*ms, gatewayLost())
-	v.tally = cut.cutTally
 	if len(cut.cutTally) == 0 {
 		t.Fatal("the cut kept no tally of its reflectors' probes")
 	}
+	v.tally = cut.cutTally
+	if shortened, judged := helped(&cut, v, o); shortened || judged {
+		t.Errorf("no loss at the cut and none now judged helped %v, judged %v; want neither", shortened, judged)
+	}
+
+	cut.cutTally = tally{"a": {6, 2}, "b": {6, 2}, "c": {6, 2}}
+	v.tally = cut.cutTally
 	if shortened, judged := helped(&cut, v, o); shortened || !judged {
 		t.Errorf("an unchanged loss judged helped %v, judged %v; want false, true", shortened, judged)
 	}
@@ -272,25 +282,27 @@ func TestAGatewayAloneNeverCutsOrRaises(t *testing.T) {
 	}
 }
 
-// A SINGLE GATEWAY SPIKE IS NOT A STALL: its rise is the one two rounds in a row
-// reach, so a gateway that hiccups every other round cuts nothing, while one that
-// stays stalled does.
-func TestASingleGatewaySpikeCutsNothing(t *testing.T) {
+// A LONE GATEWAY SPIKE IS NOT A STALL: a high reading with no other within
+// gatewayPairRounds counts toward no cut, so beside the reflectors delayed two
+// rounds in six, under the three a cut needs, a spike in a third round tips
+// nothing; while a gateway that stays stalled cuts.
+func TestALoneGatewaySpikeCutsNothing(t *testing.T) {
 	t.Parallel()
 
-	spiky := &fakeProber{reflectors: three, gateway: "192.168.1.254", rtt: func(round int) map[string]time.Duration {
-		answers := idle()
-		answers["192.168.1.254"] = time.Millisecond
-		if round > 0 && round%2 == 0 {
-			answers["192.168.1.254"] = 80 * time.Millisecond
+	c := newController()
+	for n := range 120 {
+		delay, rise := 2*time.Millisecond, time.Millisecond
+		switch n % 6 {
+		case 1, 2:
+			delay = 30 * time.Millisecond
+		case 4:
+			rise = 80 * time.Millisecond
 		}
 
-		return answers
-	}}
-	r := newRig(t, spiky, 400)
-	r.run(30)
-	if len(r.cuts()) != 0 {
-		t.Errorf("a gateway spiking every other round cut %d times", len(r.cuts()))
+		c.Step(withGateway(moving(n, 5, 400, delay), gatewayRose(rise)))
+		if c.Cause != CauseNone {
+			t.Fatalf("round %d: a cut on the reflectors delayed two rounds in six and a lone gateway spike", n)
+		}
 	}
 
 	stalled := &fakeProber{reflectors: three, gateway: "192.168.1.254", rtt: func(round int) map[string]time.Duration {
@@ -302,7 +314,7 @@ func TestASingleGatewaySpikeCutsNothing(t *testing.T) {
 
 		return answers
 	}}
-	r = newRig(t, stalled, 400)
+	r := newRig(t, stalled, 400)
 	r.run(30)
 	if len(r.cuts()) == 0 {
 		t.Error("a gateway stalled 80 ms in every round cut nothing")

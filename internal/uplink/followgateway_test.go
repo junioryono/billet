@@ -35,7 +35,7 @@ func TestARunFollowsTheDefaultRoutesGateway(t *testing.T) {
 	ctl.Down.cutGateway = measured{40 * time.Millisecond, true}
 	ctl.Up.cutGateway = measured{40 * time.Millisecond, true}
 	ctl.gatewayStalled = true
-	ctl.lastGateway, ctl.lastGatewayAt = measured{30 * time.Millisecond, true}, at(0)
+	ctl.lastGateway, ctl.lastHigh = measured{30 * time.Millisecond, true}, measured{30 * time.Millisecond, true}
 	pinger := &fakeGateway{gateway: "192.168.1.254"}
 
 	followGateway(slog.New(logs), func() (string, error) { return "192.168.1.254", nil }, pinger, st, ctl)
@@ -50,7 +50,7 @@ func TestARunFollowsTheDefaultRoutesGateway(t *testing.T) {
 		t.Errorf("the run still asks %s after the route moved to 192.168.1.1", pinger.gateway)
 	}
 	if ctl.Down.cutGateway.known || ctl.Up.cutGateway.known || ctl.gatewayStalled ||
-		st.gateway.baseline != nil || ctl.lastGateway.known {
+		st.gateway.baseline != nil || ctl.lastGateway.known || ctl.lastHigh.known {
 		t.Error("the old gateway's baseline, its stall or a cut's evidence of it outlived the change")
 	}
 	if logs.count("gateway changed") != 1 {

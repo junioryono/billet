@@ -45,8 +45,8 @@ func TestAStallWithQuietRepliesBetweenStillLatches(t *testing.T) {
 }
 
 // A CONFIRMED STALL RARER THAN THE DETECTION WINDOW CUTS NOTHING: two high
-// readings in a row once in six rounds, and a lone one beside them, are not a
-// queue, however high.
+// readings in a row once in six rounds are not a queue, however high, as the
+// reflectors' delay two rounds in six is not.
 func TestARareConfirmedStallCutsNothing(t *testing.T) {
 	t.Parallel()
 
@@ -59,7 +59,7 @@ func TestARareConfirmedStallCutsNothing(t *testing.T) {
 			}
 
 			switch round % 6 {
-			case 1, 2, 4:
+			case 1, 2:
 				if round > 0 {
 					return 80 * time.Millisecond
 				}
@@ -79,7 +79,7 @@ func TestARareConfirmedStallCutsNothing(t *testing.T) {
 // A QUIET READING CLEARS A STALL UNLESS A HIGH ONE STANDS BESIDE IT: a gateway
 // that answers quietly after its stall and then not at all, still counted,
 // holds nothing up once two quiet readings, or one with no stall within
-// gatewayPairWithin before it, say the stall has gone; one reply slipping
+// gatewayPairRounds before it, say the stall has gone; one reply slipping
 // through a stall says nothing of it.
 func TestAQuietReadingClearsAStallUnlessAHighOneStandsBesideIt(t *testing.T) {
 	t.Parallel()
@@ -232,40 +232,61 @@ func TestAConfirmedStallACutShortenedHelped(t *testing.T) {
 	}
 }
 
-// A STALL CONFIRMS ONLY ACROSS TWO READINGS WITHIN gatewayPairWithin: one past
-// it is a fresh first reading, so a gateway that stalls, falls silent and comes
-// back stalled needs a second reading before it counts toward a cut.
+// A STALL CONFIRMS ONLY ACROSS TWO HIGH READINGS AT MOST gatewayPairRounds
+// APART: one further is a fresh first reading, so a gateway that stalls, falls
+// silent and comes back stalled needs a second reading before it counts toward
+// a cut. Rounds, as the controller steps them, not timestamps.
 func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 	t.Parallel()
 
 	stalled := func(n int) Observation {
 		return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(60*time.Millisecond))
 	}
-	rounds := int(gatewayPairWithin / Tick)
+	unread := func(n int) Observation { return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayLost()) }
 
 	for name, tc := range map[string]struct {
 		gap  int
 		want bool
 	}{
-		"at the window":     {rounds, true},
-		"one round past it": {rounds + 1, false},
+		"at the window":     {gatewayPairRounds, true},
+		"one round past it": {gatewayPairRounds + 1, false},
 	} {
 		c := newController()
 		c.Step(stalled(0))
-
-		if got := c.readGateway(stalled(tc.gap)); got.confirmed != tc.want {
-			t.Errorf("%s: a stall %v after the last confirmed %v, want %v", name,
-				time.Duration(tc.gap)*Tick, got.confirmed, tc.want)
+		for n := 1; n < tc.gap; n++ {
+			c.Step(unread(n))
 		}
+		c.Step(stalled(tc.gap))
+
+		if got := c.recent[len(c.recent)-1]; got != tc.want {
+			t.Errorf("%s: a stall %d rounds after the last confirmed %v, want %v", name, tc.gap, got, tc.want)
+		}
+	}
+
+	// A REPLY SLIPPED BETWEEN TWO HIGH READINGS DOES NOT BREAK THEIR PAIR.
+	c := newController()
+	quiet := func(n int) Observation {
+		return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(time.Millisecond))
+	}
+	for _, o := range []Observation{stalled(0), quiet(1), stalled(2)} {
+		c.Step(o)
+	}
+	if !c.recent[len(c.recent)-1] || c.recent[len(c.recent)-2] {
+		t.Errorf("a stall read either side of one quiet reply was confirmed %v, the reply delayed %v; want a "+
+			"stall and a reply that is not", c.recent[len(c.recent)-1], c.recent[len(c.recent)-2])
 	}
 
 	// THROUGH THE CONTROLLER: a stall, silence past the window, and then three
 	// high readings in a row confirm only two of them, under the Detect of three
 	// a cut needs, so nothing is cut.
-	c := newController()
+	c = newController()
 	c.Step(stalled(0))
 
-	n := rounds + 1
+	n := 1
+	for ; n <= gatewayPairRounds; n++ {
+		c.Step(unread(n))
+	}
+
 	for range 3 {
 		c.Step(stalled(n))
 		if c.Cause != CauseNone {
@@ -281,10 +302,30 @@ func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 	}
 }
 
+// A STALL WITH A QUIET REPLY IN THREE CUTS: its high readings pair across the
+// reply, so two in three confirmed fill the window as the reflectors' delay in
+// two rounds of three would. Paired only with the reading before, nothing would
+// ever confirm but one round in three.
+func TestAStallWithAQuietReplyInThreeCuts(t *testing.T) {
+	t.Parallel()
+
+	r := newRig(t, gatewayProber(func(round int) time.Duration {
+		if round == 0 || round%3 == 0 {
+			return time.Millisecond
+		}
+
+		return 60 * time.Millisecond
+	}), 400)
+	r.run(30)
+
+	if len(r.cuts()) == 0 {
+		t.Error("a gateway stalled 60 ms two rounds in three, under a 400 Mbit/s download, cut nothing")
+	}
+}
+
 // A STALLED GATEWAY THAT ANSWERS ONE PROBE IN THREE STILL CUTS: its readings
-// are a second and a half apart, within gatewayPairWithin, and each confirmed
-// stall spans the rounds it went unread, so the window fills as it would for a
-// gateway that answered every probe.
+// are three rounds apart, within gatewayPairRounds, and each confirmed stall
+// spans one of the rounds it went unread, so its third reading fills the window.
 func TestAStalledGatewayAnsweringOneProbeInThreeCuts(t *testing.T) {
 	t.Parallel()
 
@@ -306,26 +347,97 @@ func TestAStalledGatewayAnsweringOneProbeInThreeCuts(t *testing.T) {
 }
 
 // AND ITS QUIET REPLIES DO NOT END THE EPISODE: the trail spans the unread
-// rounds too, so a stall answering one probe in three, one reading in three of
+// rounds too, and a quiet reply slipping through the stall is not a clear round,
+// so a stall answering one probe in three, or in four, one reading in four of
 // them quiet, still reads as a queue the latch holds against.
 func TestASparseStallWithQuietRepliesStillLatches(t *testing.T) {
 	t.Parallel()
 
-	r := newRig(t, gatewayProber(func(round int) time.Duration {
-		switch {
-		case round == 0 || round%9 == 0:
-			return time.Millisecond
-		case round%3 == 0:
-			return 60 * time.Millisecond
+	for _, every := range []int{3, 4} {
+		r := newRig(t, gatewayProber(func(round int) time.Duration {
+			switch {
+			case round == 0 || round%(4*every) == 0:
+				return time.Millisecond
+			case round%every == 0:
+				return 60 * time.Millisecond
+			}
+
+			return 0
+		}), 400)
+		r.run(600)
+
+		if cuts := len(r.cuts()); cuts != r.controller.Params.Futile {
+			t.Errorf("a stall answering one probe in %d, no cut shortening it, was cut %d times; want exactly %d, "+
+				"then the latch", every, cuts, r.controller.Params.Futile)
+		}
+	}
+}
+
+// A SPAN FILLS ONLY THE ROUNDS THAT COUNTED A REFLECTOR, AND NEVER ENOUGH FOR
+// ONE PAIR ALONE TO CUT: two stalled readings either side of rounds whose
+// reflectors all went uncounted lend those rounds nothing, and two either side
+// of unread rounds that counted reflectors fill one of them, so a gateway that
+// drops its replies as it delays them cuts on a third reading, not on two pings.
+func TestASpanSkipsRoundsThatCountedNoReflectorAndNeverFillsAWindowAlone(t *testing.T) {
+	t.Parallel()
+
+	stalled := func(n int) Observation {
+		return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(60*time.Millisecond))
+	}
+	empty := func(n int) Observation {
+		return withGateway(probed(n, 5, 400, Sample{}), gatewayRose(60*time.Millisecond))
+	}
+	unread := func(n int) Observation { return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayLost()) }
+
+	for name, tc := range map[string]struct {
+		rounds []Observation
+		want   []bool
+	}{
+		"across rounds that counted no reflector": {
+			[]Observation{stalled(0), empty(1), empty(2), stalled(3)}, []bool{false, false, false, true}},
+		"across three unread rounds": {
+			[]Observation{stalled(0), unread(1), unread(2), unread(3), stalled(4)},
+			[]bool{false, false, false, true, true}},
+		"past a round that counted no reflector": {
+			[]Observation{stalled(0), unread(1), empty(2), stalled(3)}, []bool{false, true, false, true}},
+	} {
+		c := newController()
+		for n, o := range tc.rounds {
+			c.Step(o)
+			if c.Cause != CauseNone {
+				t.Fatalf("%s: round %d cut on one pair of stalled readings", name, n)
+			}
 		}
 
-		return 0
-	}), 400)
-	r.run(600)
+		if !slices.Equal(c.recent, tc.want) {
+			t.Errorf("%s: the window is %v, want %v", name, c.recent, tc.want)
+		}
+	}
 
-	if cuts := len(r.cuts()); cuts != r.controller.Params.Futile {
-		t.Errorf("a sparse stall no cut shortened was cut %d times; want exactly %d, then the latch",
-			cuts, r.controller.Params.Futile)
+	// AND A THIRD READING CUTS.
+	c := newController()
+	for _, o := range []Observation{stalled(0), unread(1), unread(2), stalled(3), unread(4), stalled(5)} {
+		c.Step(o)
+	}
+	if c.Cause == CauseNone {
+		t.Error("three stalled readings, each two unread rounds apart, cut nothing")
+	}
+
+	// THE TRAIL SPANS WHAT THE WINDOW DOES, so a quiet pair straight after a
+	// span, a sparse gateway answering every probe again, does not end a latched
+	// episode while the window still says the line is full. A trickle, so nothing
+	// is cut and the window keeps its rounds.
+	c = newController()
+	c.Down.episode, c.Down.futile = true, c.Params.Futile
+	trickle := func(n int, s Sample) Observation { return withGateway(moving(n, 0.1, 0.1, 2*time.Millisecond), s) }
+	for n, s := range []Sample{gatewayRose(60 * time.Millisecond), gatewayLost(), gatewayLost(),
+		gatewayRose(60 * time.Millisecond), gatewayRose(time.Millisecond), gatewayRose(time.Millisecond)} {
+		c.Step(trickle(n, s))
+	}
+
+	if !c.Down.episode || c.Down.futile != c.Params.Futile {
+		t.Errorf("a quiet pair beside a window still full ended a latched episode (episode %v, futile %d, "+
+			"trail %v)", c.Down.episode, c.Down.futile, c.delayTrail)
 	}
 }
 
@@ -341,6 +453,7 @@ func TestACutNothingCouldJudgeIsNotDeepened(t *testing.T) {
 	c.Down.Rate = 300
 	c.Down.episode, c.Down.lastCut, c.Down.cutSince = true, at(-100), true
 	c.Down.cutGateway = measured{60 * time.Millisecond, true}
+	c.Down.cutTally = tally{"a": {6, 0}, "b": {6, 0}, "c": {6, 0}}
 
 	delay := 20 * time.Millisecond
 	for n := range 3 {
