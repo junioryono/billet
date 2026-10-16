@@ -778,19 +778,27 @@ func TestTheCandidateStepFindsTheCommitAndLeavesMainCheckedOut(t *testing.T) {
 	step, _ := cutJobStep(t, readCutWorkflow(t), "Find the candidate")
 
 	for _, tc := range []struct {
-		name         string
-		withBranch   bool
-		breakOrigin  bool
+		name        string
+		withBranch  bool
+		breakOrigin bool
+		// decoy puts someone/release/v0.4 on origin, whose name ends the way the
+		// branch's does, which a bare ls-remote pattern matches.
+		decoy        bool
 		wantExisting string
 	}{
 		{name: "a patch on an existing branch", withBranch: true, wantExisting: "true"},
 		{name: "a new series", wantExisting: "false"},
+		{name: "a new series beside a branch whose name ends the same", decoy: true, wantExisting: "false"},
 		{name: "an origin that cannot be asked", breakOrigin: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, work, mainTip, branchTip := candidateRepos(t, tc.withBranch)
+			origin, work, mainTip, branchTip := candidateRepos(t, tc.withBranch)
+
+			if tc.decoy {
+				fixtureGit(t, origin, "branch", "someone/release/v0.4")
+			}
 
 			if tc.breakOrigin {
 				fixtureGit(t, work, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone"))

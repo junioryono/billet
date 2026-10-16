@@ -1006,13 +1006,15 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 			output := filepath.Join(t.TempDir(), "github-output")
 			cmd := exec.CommandContext(t.Context(), planner)
 			cmd.Dir = repository
-			// WITHOUT AN INHERITED PROTOCOL, so the case that leaves it out does.
-			cmd.Env = []string{"REQUESTED=" + tc.requested, "GITHUB_OUTPUT=" + output}
+			// WITHOUT AN INHERITED PROTOCOL, so the case that leaves it out does,
+			// and the fixture's own values AFTER the inherited ones: exec keeps
+			// the last of a repeated name, and Actions sets GITHUB_OUTPUT itself.
 			for _, kv := range os.Environ() {
 				if !strings.HasPrefix(kv, "BILLET_CUT_PROTOCOL=") {
 					cmd.Env = append(cmd.Env, kv)
 				}
 			}
+			cmd.Env = append(cmd.Env, "REQUESTED="+tc.requested, "GITHUB_OUTPUT="+output)
 			if !tc.unconfirmed {
 				cmd.Env = append(cmd.Env, "BILLET_CUT_PROTOCOL=preview-confirm")
 			}

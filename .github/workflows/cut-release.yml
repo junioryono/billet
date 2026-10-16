@@ -1,7 +1,8 @@
 name: Cut Release
 
-# The manual "ship main" button. Press it and billet cuts a release branch, tags
-# it, and builds it.
+# The manual "ship main" button. Press it once and it reports what the release
+# would carry and cuts nothing; press it again with `confirm` set to the line that
+# report ends with, and billet cuts the release branch, tags it, and builds it.
 #
 # THE BRANCH OUTLIVES THE RELEASE, which is the point of the shape. One branch
 # per MINOR version carries every patch on it: cut release/v0.4 and tag v0.4.0,
@@ -84,8 +85,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # THE WHOLE REF, because ls-remote matches a pattern against the end of
+          # a ref name: `release/v0.4` alone also matches someone/release/v0.4.
           set +e
-          git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null
+          git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null
           status=$?
           set -e
 
