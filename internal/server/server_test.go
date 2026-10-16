@@ -491,6 +491,8 @@ type fakeProvisioner struct {
 	// onValidate, when set, answers ValidateTrustedRunnerGroup instead of
 	// validateErr.
 	onValidate func(group string) error
+	// sessionErr, when set, is what opening any session answers.
+	sessionErr error
 	validated  []string
 
 	mu     sync.Mutex
@@ -520,6 +522,10 @@ func (f *fakeProvisioner) EnsureScaleSet(_ context.Context, name, group string, 
 }
 
 func (f *fakeProvisioner) Session(_ context.Context, scaleSetID int, _ string) (Session, error) {
+	if f.sessionErr != nil {
+		return nil, f.sessionErr
+	}
+
 	if f.newSession == nil {
 		return &fakeSession{}, nil
 	}

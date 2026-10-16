@@ -276,9 +276,9 @@ func TestRunServerAnswersEveryEndingOnce(t *testing.T) {
 // THE FENCE IS READ ONCE THE CONTROL PLANE HAS STOPPED. serveControlPlane stops
 // the wire and joins the controller's loops in its deferred calls, so a fence
 // read inside it would be read before them and miss a write refused during
-// teardown, and one read after runControlPlane's own deferred Close would read
+// teardown, and one read after runControlPlane closes the ledger would read
 // a closed ledger. No hook lands a refusal in teardown, so the place is read
-// from the source: the read is runControlPlane's return, after the call that
+// from the source: the read is runControlPlane's, after the call that
 // serves, and serveControlPlane makes none.
 func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 	t.Parallel()
@@ -333,10 +333,16 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 		}
 	}
 
-	served, read := -1, -1
+	// AND THE LEDGER CLOSES AFTER THE READ, in a statement of its own after it,
+	// never in a defer, which could not hand its error back.
+	served, read, closed := -1, -1, -1
 
 	for i, stmt := range findFunc(t, "runControlPlane").Body.List {
 		if _, isDefer := stmt.(*ast.DeferStmt); isDefer {
+			if calls(stmt, "Close") {
+				t.Error("runControlPlane defers the ledger's close, so its failure is dropped")
+			}
+
 			continue
 		}
 
@@ -344,14 +350,18 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 			served = i
 		}
 
-		if ret, ok := stmt.(*ast.ReturnStmt); ok && len(ret.Results) == 2 && calls(ret.Results[0], "LeadershipLost") {
+		if calls(stmt, "LeadershipLost") && read < 0 {
 			read = i
+		}
+
+		if ret, ok := stmt.(*ast.ReturnStmt); ok && calls(ret, "Close") {
+			closed = i
 		}
 	}
 
-	if served < 0 || read <= served {
-		t.Errorf("runControlPlane does not return the fence read after serveControlPlane has "+
-			"returned (serve at statement %d, read at %d)", served, read)
+	if served < 0 || read <= served || closed <= read {
+		t.Errorf("runControlPlane does not read the fence after serveControlPlane has returned and "+
+			"before the ledger closes (serve at statement %d, read at %d, close at %d)", served, read, closed)
 	}
 }
 

@@ -74,8 +74,6 @@ func runControlPlane(
 		return false, err
 	}
 
-	defer cp.Close()
-
 	err = serveControlPlane(ctx, env, lc, cfg, run, cp)
 
 	// THE FENCE IS READ ONCE EVERYTHING ELSE HAS STOPPED: serveControlPlane has
@@ -83,7 +81,12 @@ func runControlPlane(
 	// and the ledger closes only after this. A write refused during startup or
 	// teardown has latched it by then, and the claim's own write, which a
 	// successor can refuse, is read the same way.
-	return cp.LeadershipLost(), err
+	fenced := cp.LeadershipLost()
+
+	// AND THE CLOSE'S OWN FAILURE IS JOINED, not dropped: a lock or a connection
+	// that would not let go beside a stop is a fault, and a stop that discarded
+	// it would exit 0 over it.
+	return fenced, errors.Join(err, cp.Close())
 }
 
 // serveControlPlane is the control plane cp after its open: the probe's hold,
@@ -99,8 +102,10 @@ func serveControlPlane(
 	cp *app.ControlPlane,
 ) error {
 	if run.probe {
+		// A probe's open can migrate as any open does, so a probe that fails to
+		// say it is ready says what it moved.
 		if err := host.NotifyReady(env); err != nil {
-			return fmt.Errorf("server upgrade-probe readiness: %w", err)
+			return errors.Join(fmt.Errorf("server upgrade-probe readiness: %w", err), cp.UnclaimedMove())
 		}
 
 		host.HoldProbe(ctx, env, run.holdProbe, host.ServerProbeReadyLine)

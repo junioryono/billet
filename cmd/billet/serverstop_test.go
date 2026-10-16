@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -416,6 +417,42 @@ func TestAControlPlaneFencedDuringStartupExitsNonZero(t *testing.T) {
 
 	if strings.Contains(run.stdout, "stopped") {
 		t.Errorf("a fenced control plane reported a clean stop: %q", run.stdout)
+	}
+}
+
+// A PROBE THAT CANNOT SAY IT IS READY SAYS WHAT ITS OPEN MIGRATED. A probe
+// opens the candidate's ledger the way a control plane does, and on a ledger
+// nothing has migrated the open creates the schema; the probe's failure is its
+// verdict, and it still has to say what it left behind.
+func TestAProbeThatCannotReportReadinessSaysWhatItsOpenMigrated(t *testing.T) {
+	t.Parallel()
+
+	cfg := stopTestConfig(t)
+	cfg.Server.IdentityDir = t.TempDir()
+
+	socket := filepath.Join(t.TempDir(), "no-such-notify.sock")
+	env := cli.Env{Stdout: io.Discard, Stderr: io.Discard, Getenv: func(name string) string {
+		if name == "NOTIFY_SOCKET" {
+			return socket
+		}
+
+		return ""
+	}}
+
+	targets := stopTestGitHub(t)
+
+	_, err := runControlPlane(t.Context(), env, cli.NewLifecycle(func() {}, io.Discard), cfg, controlPlaneRun{
+		host:    stopTestHost(stopHooks{}),
+		targets: func(context.Context, *config.Config) ([]app.Target, error) { return targets, nil },
+		probe:   true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "upgrade-probe readiness") {
+		t.Fatalf("a probe that could not report readiness returned %v", err)
+	}
+
+	moved, ok := errors.AsType[*state.SchemaMoved](err)
+	if !ok || moved.From != 0 || moved.To != state.LatestSchemaVersion() {
+		t.Errorf("a probe that could not report readiness does not say what its open migrated: %v", err)
 	}
 }
 

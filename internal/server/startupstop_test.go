@@ -288,3 +288,27 @@ func TestATierEndingOnACancellationNobodyAskedForIsAFailure(t *testing.T) {
 		t.Errorf("Run returned only once its guard had expired: %v", err)
 	}
 }
+
+// AND A TIER THAT ENDS ON NOTHING BUT A CANCELLATION, with nobody asking the
+// plane to stop, has failed too. There is no other cause here to make it a
+// failure, so this is the case only the context answers: every cause is a
+// cancellation, and it is not the stop.
+func TestATierEndingOnlyOnACancellationNobodyAskedForIsAFailure(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	prov := &fakeProvisioner{sessionErr: requestCancelled()}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	err := New(newAllocator(t, startupLimits, tiers), prov, tiers, "test-owner", nil).Run(ctx)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "open session") {
+		t.Fatalf("a tier whose session open was cancelled with nobody stopping returned %v, want "+
+			"that failure", err)
+	}
+
+	if ctx.Err() != nil {
+		t.Errorf("Run returned only once its guard had expired: %v", err)
+	}
+}
