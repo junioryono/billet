@@ -135,4 +135,8 @@ func TestALaunchWhoseSocketAnotherVMMAnswersFailsAtOnce(t *testing.T) {
 	if took := time.Since(started); took > 30*time.Second {
 		t.Errorf("the launch took %s to give up on a socket another VMM answers", took)
 	}
+
+	if uids := peers.builtFor(); len(uids) != 1 || uids[0] != 900000 {
+		t.Errorf("the launch built checked clients for uids %v, want one for its own 900000", uids)
+	}
 }
