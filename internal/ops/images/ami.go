@@ -245,6 +245,14 @@ func runnerDigest(version, arch, supplied string) (string, error) {
 		return "", err
 	}
 
+	// THE VERSION FIRST, because the remedy for an unpinned release is a digest
+	// and no digest makes `v2.337.0` or an empty version a release.
+	if !ec2.IsRunnerVersion(version) {
+		return "", fmt.Errorf("--runner-version %q is not an actions/runner release version; "+
+			"it is three numbers, without the leading v, such as %s",
+			version, runnerrelease.Pinned())
+	}
+
 	tarball := "actions-runner-" + platform + "-" + version + ".tar.gz"
 
 	if supplied != "" && !ec2.IsRunnerSHA256(supplied) {

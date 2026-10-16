@@ -53,6 +53,14 @@ func TestTheRunnerDigestComesFromThePinOrTheOperator(t *testing.T) {
 			supplied: strings.Repeat("C", 64), refusal: "is not a sha256"},
 		{name: "an architecture billet does not map", version: pinned, arch: "amd64",
 			refusal: "is not x64 or arm64"},
+		// NO DIGEST MAKES A VERSION A RELEASE, so a malformed one is refused for
+		// what it is, with a digest or without, rather than told to bring one.
+		{name: "a version with a leading v", version: "v2.337.0", arch: "x64",
+			refusal: "is not an actions/runner release version"},
+		{name: "a version with a leading v and a digest", version: "v2.337.0", arch: "x64",
+			supplied: supplied, refusal: "is not an actions/runner release version"},
+		{name: "no version at all", version: "", arch: "x64",
+			refusal: "is not an actions/runner release version"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

@@ -192,6 +192,9 @@ var runnerVersionPattern = regexp.MustCompile(`^\d{1,6}\.\d{1,6}\.\d{1,6}([-+][0
 // compares the text it is given.
 var runnerDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// IsRunnerVersion says whether v is a version a build will write into its script.
+func IsRunnerVersion(v string) bool { return runnerVersionPattern.MatchString(v) }
+
 // IsRunnerSHA256 says whether s is a digest a build will write into its script.
 func IsRunnerSHA256(s string) bool { return runnerDigestPattern.MatchString(s) }
 
