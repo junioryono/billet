@@ -75,7 +75,10 @@ A fork gets a new identity; a resumed suspension keeps its own but still gets fr
 - the agent process exits, and the credential home's writes are drained before its unmount completes, so a restore never continues using that mounted client. This does not erase credential bytes from guest memory: freed pages can still hold them, so every suspension generation remains credential-bearing confidential state, as above;
 - every application process is parked behind the guest agent's restore barrier, and its external traffic is blocked.
 
-If any of these cannot be proved, the suspend is refused and the workspace keeps running. After restore, applications stay parked until the clock is corrected, the home is mounted again and the network is restored; an unknown result holds the barrier. A resumed suspension keeps its own identities, because it is the same workspace continuing, so golden-fork identity regeneration does not apply. Restore mounts the current home and starts a fresh agent process, which continues its session through the agent's own mechanism.
+If preparation fails at any step, the suspend is refused and billet undoes what it did:
+1. restores the home and the network;
+2. restarts the agent;
+3. releases the barrier only once those steps are proved. After restore, applications stay parked until the clock is corrected, the home is mounted again and the network is restored; an unknown result holds the barrier. A resumed suspension keeps its own identities, because it is the same workspace continuing, so golden-fork identity regeneration does not apply. Restore mounts the current home and starts a fresh agent process, which continues its session through the agent's own mechanism.
 
 **Durability is proved before the VMM stops.** A suspend, behind that barrier:
 1. pauses the VM;
@@ -84,7 +87,15 @@ If any of these cannot be proved, the suspend is refused and the workspace keeps
 
 Only then is the deployment-owned VMM stopped, through the existing pid proof and SIGKILL path, and capacity is released only on positive proof the VMM is gone. A generation becomes eligible for restore only once its source VMM is proved gone and unable to execute further.
 
-If the generation fails, or billet cannot tell whether it is complete, billet first durably and exclusively marks it unusable for restore, under the same fence restore claims use, and only then resumes the original VMM. If even that mark's outcome is unknown, the VMM stays paused and keeps its capacity.
+If the generation fails, or billet cannot tell whether it is complete, billet follows a recoverable abort:
+1. It durably and exclusively marks the generation unusable for restore, under the same fence restore claims use.
+2. It resumes the original VMM.
+3. It restores the credential home's mount and the network.
+4. It recovers the vsock connections that the snapshot attempt reset.
+5. It restarts the agent.
+6. It releases the application barrier only after all of that is proved.
+
+Any unknown outcome keeps the capacity and reports the workspace as needing recovery, never as running.
 
 **A suspension generation runs at most once.** Firecracker warns that executing one state twice duplicates it even when the two runs are sequential, and that includes the original VM continuing after its own snapshot is restored. So a resume first takes a durable, fenced claim on the generation, and only then loads it. Once execution may have begun, the generation is never loaded again: recovery reconciles that incarnation, even after it stops. A lost acknowledgement or a restart between any durable decision and the VMM action that follows it therefore never runs the captured state twice.
 
@@ -96,7 +107,13 @@ The traversal is confined to the checkout through verified directory descriptors
 - it never follows a symlink, crosses a mount point or opens a special file;
 - symlinks are copied as their link text;
 - no source inode is shared with the destination;
-- a path replaced while the copy runs cannot lead outside either root. Whatever the source's agent wrote into its checkout, a token in an untracked file included, comes along, which is why a fork belongs to the same owner only. The new workspace gets its own identity and its own repository token.
+- a path replaced while the copy runs cannot lead outside either root.
+
+Git metadata that points outside the checkout is refused: a `.git` file, a `commondir` or an object alternate never authorises traversal outside the source view. Before a fork is published, billet proves that its git metadata and every object its refs need are inside the copy. A linked worktree or an alternate store must first be materialised into the confined view.
+
+The fork gets a branch of its own. After the copy, and before the barrier releases, billet creates and checks out a fresh branch at the copied HEAD, keeping staged and unstaged changes, and removes any inherited push configuration that targets the source branch. Failure leaves the fork unpublished.
+
+Whatever the source's agent wrote into its checkout, a token in an untracked file included, comes along, which is why a fork belongs to the same owner only. The new workspace gets its own identity and its own repository token.
 
 ### Access
 
@@ -129,7 +146,11 @@ Everything else stays where it is. A team that wants all five private puts the c
 
 **Repository access is a separate GitHub App, and the App alone entitles no one.** A runner App holds only what registering runners needs, and billet refuses an installation holding a permission it did not request, in both directions. Workspaces need `contents: write` and `pull_requests: write`, so they use an App of their own per target, created and verified the same way, rather than widening the runner App. Before creating a workspace, and before minting or renewing its repository token, billet proves that the workspace's owner may write to that repository under the target's policy; the installation covering a repository says nothing about who may use it, and could-not-tell refuses. The same check applies to the golden a workspace starts from and the data it carries. Tokens are scoped to the one repository, short-lived, and delivered through MMDS, never argv.
 
-**The agent's model credentials are the user's own, and billet never handles a sign-in credential.** A workspace runs the agent's binary unmodified. A user either authenticates with their own API key or cloud-provider credential (delivered through MMDS to a key helper), or signs in to their own subscription through the agent's own sign-in flow. For the latter, each user has a home directory on a shared filesystem with proved concurrent-client semantics (CephFS is the candidate, since the nodes already run Ceph), mounted into that user's workspaces only.
+**The agent's model credentials are the user's own, and billet never handles a sign-in credential.** A workspace runs the agent's binary unmodified. A user either authenticates with their own API key or cloud-provider credential (delivered through MMDS to a key helper), or signs in to their own subscription through the agent's own sign-in flow. For the latter, each user has a home directory on a shared filesystem with proved concurrent-client semantics (CephFS is the candidate, since the nodes already run Ceph), mounted into that user's workspaces only. Isolation between users is enforced by the storage service against a client the guest controls, never by a mount path or a guest uid:
+- any storage credential inside a workspace authorises only its owner's home;
+- for CephFS, both the MDS path and the underlying RADOS access are restricted;
+- a node-wide storage credential never enters a guest;
+- missing or unproved isolation refuses the mount.
 - **How it's used:** the agent writes its own login there, as several sessions on one laptop share one home, and billet never reads, copies or special-cases it.
 - **Never a snapshot:** it is never an ordinary block filesystem mounted by two guests. Its storage is outside every recovery generation and every fork, and it is unmounted before a suspension is captured, so a restore never resumes a stale client session. (Bytes it once held may still be in a suspension's memory; that is why a suspension is confidential.)
 - **Never in a golden:** it is never part of a golden, and the agent starts after a restore, so a golden's memory holds no credential.
@@ -166,6 +187,9 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - a file-level copy of a checkout carries the files and no deleted contents;
   - with commits and file rewrites running in the source, the copy is a consistent repository;
   - a symlink pointing out of the checkout, a special file and a rename during the copy all fail to escape either root.
+- **Home isolation:** from one user's workspace, as guest root, reading another user's home fails both through the filesystem and through direct object access.
+- **Aborted suspension:** after a failure during preparation and during capture, the workspace is usable again (home mounted, network up, agent running, applications released) or reported as needing recovery.
+- **Fork git integrity:** a linked worktree and an alternate object store in the source are either materialised or refused, never left dangling; the fork is on a fresh branch with no push configuration targeting the source.
 - **Shared home:**
   - two workspaces of one user share the home concurrently;
   - suspending one (agent stopped, writes drained, home unmounted) and resuming it while the other writes, and while the other rotates the login, loses nothing and rolls nothing back.
