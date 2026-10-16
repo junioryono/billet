@@ -311,3 +311,94 @@ func TestADelayingProberIsMeasuredInsideTheWaitAndBlindBeyondIt(t *testing.T) {
 		t.Fatalf("replies too late to measure moved the rates: down at %.1f, sets %v", r.controller.Down.Rate, r.sets)
 	}
 }
+
+// count is how many records the run logged with a message containing text.
+func (r *rig) count(text string) int {
+	n := 0
+
+	for i := range r.log.list {
+		if strings.Contains(r.log.list[i].Message, text) {
+			n++
+		}
+	}
+
+	return n
+}
+
+// THE COULD-NOT-TELL IS LOGGED WHEN THE REFLECTORS STOP ANSWERING, on the
+// round they stop counting and both rates are held, and their return is logged
+// when they answer again; each time they fall silent. Answers count, not
+// probes: the lost probes of reflectors still being given their time are not
+// answers, and neither is a first answer that only sets a baseline.
+func TestTheCouldNotTellIsLoggedWhenTheReflectorsStopAndWhenTheyReturn(t *testing.T) {
+	t.Parallel()
+
+	answering := true
+	p := &fakeProber{reflectors: three, rtt: func(int) map[string]time.Duration {
+		if !answering {
+			return nil
+		}
+
+		return idle()
+	}}
+	r := newRig(t, p, 1)
+
+	r.run(5)
+
+	for episode := 1; episode <= 2; episode++ {
+		answering = false
+
+		r.run(silentAfter)
+
+		if n := r.count("cannot be told"); n != episode-1 {
+			t.Fatalf("episode %d: after %d silent rounds the could-not-tell was logged %d times in all; "+
+				"the reflectors still count", episode, silentAfter, n)
+		}
+
+		r.run(1)
+
+		if n := r.count("cannot be told"); n != episode {
+			t.Fatalf("episode %d: on the round the silent reflectors stopped counting the could-not-tell "+
+				"was logged %d times in all; want %d", episode, n, episode)
+		}
+
+		answering = true
+
+		r.run(1)
+
+		if n := r.count("answer again"); n != episode {
+			t.Fatalf("episode %d: the reflectors' return was logged %d times in all; want %d", episode, n, episode)
+		}
+	}
+
+	// From a start no reflector answered: a first answer only sets the
+	// baselines, and a lost round after it is no return.
+	answering = false
+	p = &fakeProber{reflectors: three, rtt: func(int) map[string]time.Duration {
+		if !answering {
+			return nil
+		}
+
+		return idle()
+	}}
+	r = newRig(t, p, 1)
+
+	r.run(silentAfter + 5)
+
+	answering = true
+	r.run(1)
+	answering = false
+	r.run(1)
+
+	if r.count("cannot be told") != 1 || r.count("answer again") != 0 {
+		t.Fatalf("a start with no answers, then a baseline and a lost round, logged %d could-not-tells and %d "+
+			"returns; want 1 and 0", r.count("cannot be told"), r.count("answer again"))
+	}
+
+	answering = true
+	r.run(1)
+
+	if r.count("answer again") != 1 {
+		t.Fatalf("a counted answer after the start's silence logged %d returns; want 1", r.count("answer again"))
+	}
+}

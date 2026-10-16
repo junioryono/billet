@@ -183,3 +183,52 @@ func TestALossTheLineHasStoppedIsNotCutFor(t *testing.T) {
 			c.Down.Rate)
 	}
 }
+
+// A CUT FORGETS WHAT CAUSED IT, NOT THAT THE LINE IS STILL DROPPING. One probe
+// in three lost every round, from a different reflector each time, with the
+// answers at their baselines: the round after a cut has only one lossy round
+// since it, and must still not read as a clear line, or it would end the
+// futile episode and the cuts would never stop.
+func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+	names := []string{"a", "b", "c"}
+
+	for n := range 120 {
+		before := c.Down.Rate
+
+		c.Step(probed(n, 0, 300, of3(time.Millisecond, true, names[n%3])))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a loss that never moved drew %d cuts over a minute; want %d before they stop", cuts, c.Params.Futile)
+	}
+}
+
+// A REFLECTOR THAT HAS STOPPED COUNTING LENDS THE WINDOW NONE OF ITS MISSES.
+// Two reflectors went silent while the host was quiet and are no longer
+// counted; the one left misses a single probe as the host gets busy, which is
+// one lossy round, not a dropping line.
+func TestABenchedReflectorsMissesDoNotMakeALoss(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+
+	c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
+
+	for n := 1; n < 5; n++ {
+		c.Step(probed(n, 0, 8, of3(0, false, "a", "b")))
+	}
+
+	alone := Sample{Probes: []Probe{{Reflector: "c", Lost: true}}}
+	if c.Step(probed(5, 0, 400, alone)) {
+		t.Fatalf("one miss from the only counted reflector cut the download to %.1f, on misses of reflectors "+
+			"no longer counted", c.Down.Rate)
+	}
+}

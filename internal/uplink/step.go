@@ -32,8 +32,8 @@ type stepper struct {
 	now     func() time.Time
 	history []reading
 	applied [2]float64
-	// blind is when the rounds stopped counting any reflector, zero while they
-	// count one; told is whether that has been logged.
+	// blind is when counted reflectors stopped answering, zero while one does;
+	// told is whether that has been logged.
 	blind time.Time
 	told  bool
 }
@@ -118,23 +118,26 @@ func (s *stepper) tick(ctx context.Context) error {
 	return nil
 }
 
-// notice logs the rounds going blind, once that has lasted as long as a
-// reflector is given to answer, and their seeing again: a could-not-tell is
-// said as such, never as a measurement.
+// notice logs the rounds going blind, once no counted reflector has answered
+// for as long as a reflector is given (when the silent ones stop counting and
+// both rates are held), and their seeing again: a could-not-tell is said as
+// such, never as a measurement. Answers are what count, not probes: the lost
+// probes of reflectors still being given their time measure loss, not the
+// line's queue, and a first answer only sets a baseline.
 func (s *stepper) notice(sample Sample, at time.Time) {
-	measured := len(sample.Probes) > 0
+	answered := len(sample.Probes) > sample.Lost()
 
 	switch {
-	case measured && !s.blind.IsZero():
+	case answered && !s.blind.IsZero():
 		if s.told {
 			s.log.Info("the reflectors answer again; measuring the line",
 				"could_not_tell_for", at.Sub(s.blind).Round(time.Second))
 		}
 
 		s.blind, s.told = time.Time{}, false
-	case !measured && s.blind.IsZero():
+	case !answered && s.blind.IsZero():
 		s.blind = at
-	case !measured && !s.told && at.Sub(s.blind) >= silentAfter*Tick:
+	case !answered && !s.told && at.Sub(s.blind) >= silentAfter*Tick:
 		s.told = true
 		s.log.Warn("no reflector answers, so the line's queue cannot be told; holding both rates until one does",
 			"reflectors", s.prober.Reflectors(), "for", at.Sub(s.blind).Round(time.Second))

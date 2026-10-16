@@ -213,13 +213,12 @@ type Controller struct {
 	Cause Cause
 
 	recent []bool
-	losses []lossRound
-}
-
-// lossRound is one measured round's probes, for the loss window.
-type lossRound struct {
-	probes, lost int
-	missed       []string
+	// losses are the rounds' probes since the last cut, which a loss cut is
+	// judged on; trail is the last Window rounds' probes, kept across cuts,
+	// which say whether the line has stopped dropping. A cut forgets the
+	// evidence that caused it, but not that the line is still losing probes:
+	// a round that forgot would read as clear and end a futile episode.
+	losses, trail [][]Probe
 }
 
 // verdict is what one step's evidence says, the same for both directions.
@@ -230,9 +229,11 @@ type verdict struct {
 	// round too: a cut is taken only on a queue that is there now.
 	onDelay, onLoss bool
 	// clear is a round that measured the line and found no queue: a known delay
-	// under Bloat and no loss window.
+	// under Bloat, and a line that has not been dropping over the last Window
+	// rounds, cuts or no cuts.
 	clear bool
-	// lossShare is the share of the window's probes that went unanswered.
+	// lossShare is the share of the probes since the last cut that went
+	// unanswered.
 	lossShare float64
 	cut       float64
 }
@@ -255,19 +256,8 @@ func (c *Controller) Step(o Observation) bool {
 	}
 
 	if len(o.Probes) > 0 {
-		round := lossRound{probes: len(o.Probes)}
-
-		for _, probe := range o.Probes {
-			if probe.Lost {
-				round.lost++
-				round.missed = append(round.missed, probe.Reflector)
-			}
-		}
-
-		c.losses = append(c.losses, round)
-		if len(c.losses) > p.Window {
-			c.losses = c.losses[len(c.losses)-p.Window:]
-		}
+		c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
+		c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
 	}
 
 	v := c.judge(o)
@@ -295,6 +285,14 @@ func (c *Controller) Step(o Observation) bool {
 	return upChanged || downChanged
 }
 
+func lastRounds(rounds [][]Probe, n int) [][]Probe {
+	if len(rounds) > n {
+		return rounds[len(rounds)-n:]
+	}
+
+	return rounds
+}
+
 // judge reads the windows and this round into what both directions act on.
 func (c *Controller) judge(o Observation) verdict {
 	p := c.Params
@@ -307,14 +305,15 @@ func (c *Controller) judge(o Observation) verdict {
 	}
 
 	delayFull := delayed >= p.Detect
-	dropping, share := c.dropping(o)
+	dropping, share := c.dropping(c.losses, o)
+	stillDropping, _ := c.dropping(c.trail, o)
 	delayedNow := o.DelayKnown && o.Delay > p.Bloat
 
 	v := verdict{
 		full:      delayFull || dropping,
 		onDelay:   delayFull && delayedNow,
 		onLoss:    dropping && o.Lost() > 0,
-		clear:     o.DelayKnown && !delayedNow && !dropping,
+		clear:     o.DelayKnown && !delayedNow && !stillDropping,
 		lossShare: share,
 		cut:       1,
 	}
@@ -330,25 +329,40 @@ func (c *Controller) judge(o Observation) verdict {
 	return v
 }
 
-// dropping reports whether the loss window says the line is dropping, and the
-// share of the window's probes it lost. It needs both kinds of breadth: losses
-// in at least LossRounds rounds, so one instant's blip is not a full line, and
-// from a strict majority of this round's counted reflectors, so one reflector
-// that stopped answering is not either.
-func (c *Controller) dropping(o Observation) (bool, float64) {
+// dropping reports whether a loss window says the line is dropping, and the
+// share of its probes the line lost. Only the reflectors this round counts are
+// read, so one that has since gone silent lends the window none of its misses.
+// It needs both kinds of breadth: losses in at least LossRounds rounds, so one
+// instant's blip is not a full line, and from a strict majority of the counted
+// reflectors, so one reflector that stopped answering is not either.
+func (c *Controller) dropping(window [][]Probe, o Observation) (bool, float64) {
+	counted := make(map[string]bool, len(o.Probes))
+	for _, probe := range o.Probes {
+		counted[probe.Reflector] = true
+	}
+
 	probes, lost, rounds := 0, 0, 0
 	missed := map[string]bool{}
 
-	for _, r := range c.losses {
-		probes += r.probes
-		lost += r.lost
+	for _, round := range window {
+		lossy := false
 
-		if r.lost > 0 {
-			rounds++
+		for _, probe := range round {
+			if !counted[probe.Reflector] {
+				continue
+			}
+
+			probes++
+
+			if probe.Lost {
+				lost++
+				lossy = true
+				missed[probe.Reflector] = true
+			}
 		}
 
-		for _, reflector := range r.missed {
-			missed[reflector] = true
+		if lossy {
+			rounds++
 		}
 	}
 
@@ -357,15 +371,7 @@ func (c *Controller) dropping(o Observation) (bool, float64) {
 		share = float64(lost) / float64(probes)
 	}
 
-	broad := 0
-
-	for _, probe := range o.Probes {
-		if missed[probe.Reflector] {
-			broad++
-		}
-	}
-
-	return rounds >= c.Params.LossRounds && 2*broad > len(o.Probes), share
+	return rounds >= c.Params.LossRounds && 2*len(missed) > len(o.Probes), share
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
