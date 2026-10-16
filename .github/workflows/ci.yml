@@ -3,9 +3,15 @@ name: CI
 # billet's own CI runs on GitHub-hosted runners for now. Dogfooding it on billet
 # is a goal, but a runner platform that can only be built by an already-working
 # copy of itself is a bootstrap trap — the hosted path stays supported forever.
+#
+# A RELEASE BRANCH'S TIP GETS A RUN OF ITS OWN. A carry's pull request is tested
+# as its merge ref, and the commit the merge leaves on release/vX.Y is a different
+# one; Cut Release cuts from that commit and its report shows CI on exactly it
+# (#145). The cut's own `Release vX.Y.Z` commit is pushed with GITHUB_TOKEN, which
+# starts no workflow, so it adds no run.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 
 permissions:

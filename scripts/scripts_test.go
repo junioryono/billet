@@ -988,8 +988,10 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 		wantSuccess bool
 	}{
 		{name: "backward new series", requested: "v0.3.0"},
-		{name: "forward new series", requested: "v0.6.0", wantOutput: "tag=v0.6.0\nbranch=release/v0.6\ncollection_version=0.6.0\n", wantSuccess: true},
-		{name: "maintained older series hotfix", requested: "v0.4.3", wantOutput: "tag=v0.4.3\nbranch=release/v0.4\ncollection_version=0.4.3\n", wantSuccess: true},
+		// A NEW SERIES IS READ AGAINST THE NEWEST RELEASE OF ALL, a patch against
+		// its own series' newest: what release-contents.sh compares the cut with.
+		{name: "forward new series", requested: "v0.6.0", wantOutput: "tag=v0.6.0\nbranch=release/v0.6\ncollection_version=0.6.0\nprevious=v0.5.0\n", wantSuccess: true},
+		{name: "maintained older series hotfix", requested: "v0.4.3", wantOutput: "tag=v0.4.3\nbranch=release/v0.4\ncollection_version=0.4.3\nprevious=v0.4.2\n", wantSuccess: true},
 		{name: "backward older series patch", requested: "v0.4.1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

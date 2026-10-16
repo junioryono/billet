@@ -49,8 +49,16 @@ if [[ -z $series_newest && -n $newest && $(printf '%s\n%s\n' "$newest" "$tag" | 
 fi
 
 branch="release/$series"
+
+# THE RELEASE THIS ONE IS READ AGAINST (release-contents.sh): the series' newest
+# for a patch, which is what the branch carried until now, and the newest release
+# of all for a new series, which is what an operator is moving from. Empty only
+# before billet's first release.
+previous=${series_newest:-$newest}
+
 {
 	echo "tag=$tag"
 	echo "branch=$branch"
 	echo "collection_version=$collection_version"
+	echo "previous=$previous"
 } >> "$output"
