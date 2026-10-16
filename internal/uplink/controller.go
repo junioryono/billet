@@ -58,19 +58,19 @@
 // most four rounds before it (readGateway), a reply slipped between them or
 // not, though a quiet pair between ends the stall, makes a round delayed for a
 // cut as the reflectors' does, so its stall cuts as their delay would, save a
-// lone spike; the pair covers one earlier round too, nearest first: its first
-// reading's, when the two are in a row, or one it went unread in between, so a
-// gateway answering one probe in three still cuts; but never more, so two pings
-// alone never do. One high reading keeps an episode from ending and a rate from
-// rising, and a quiet reading clears a stall unless a high one stands just
-// before it, one reply slipping through. All of it only in a round that counted
-// a reflector, and while the gateway stalls a round it gave no reading in is
-// not clear. A cut's effect is judged on two readings too, and on the
-// reflectors' loss only when the line was dropping at the cut. Its unanswered
-// probes are never loss, because a gateway answers ICMP when it has the time
-// (the reference node's went unanswered about 2% of the time with the line
-// quiet, 2026-10-16), and read as loss they would cut a busy host on every
-// miss.
+// lone spike; with no reply read between them, the pair covers at most one
+// earlier round too, the nearest that counted a reflector, its first reading's
+// included, so a gateway answering one probe in three still cuts and three high
+// readings in a row cut on the third; but never more, so two pings alone never
+// do. One high reading keeps an episode from ending and a rate from rising, and
+// a quiet reading clears a stall unless a high one stands just before it, one
+// reply slipping through. All of it only in a round that counted a reflector,
+// and while the gateway stalls a round it gave no reading in is not clear. A
+// cut's effect is judged on two readings too, and on the reflectors' loss only
+// when the line was dropping at the cut. Its unanswered probes are never loss,
+// because a gateway answers ICMP when it has the time (the reference node's
+// went unanswered about 2% of the time with the line quiet, 2026-10-16), and
+// read as loss they would cut a busy host on every miss.
 //
 // A rate near the interface's speed is not a signal, with no ceiling set or any
 // other. The shaper cannot tell a line as fast as the interface, where such a
