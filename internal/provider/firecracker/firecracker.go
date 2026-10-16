@@ -149,6 +149,9 @@ type Provider struct {
 	chown    chownFunc
 	chownOne chownFunc
 	apiFor   func(socket string) *vmmAPI
+	// apiAs is apiFor for a VMM that must answer as a given uid (newVMMAPIAs). A
+	// seam because the fake VMMs in tests answer as the test's own account.
+	apiAs func(socket string, uid int) *vmmAPI
 	// syncFile and syncDir are the durability boundary for ownership and resource
 	// records. They are seams so crash-ordering tests can observe the operations a
 	// normal filesystem cannot report after the fact.
@@ -332,6 +335,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		chown:       chownTree,
 		chownOne:    os.Chown,
 		apiFor:      newVMMAPI,
+		apiAs:       newVMMAPIAs,
 		syncFile:    func(file *os.File) error { return file.Sync() },
 		syncDir:     syncDirectory,
 		pidOwner:    pidIsVMM,

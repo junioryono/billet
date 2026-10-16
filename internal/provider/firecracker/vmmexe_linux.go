@@ -28,29 +28,9 @@ func apiPeerExecutable(socket string, uid int) (*os.File, error) {
 	}
 	defer conn.Close()
 
-	unixConn, ok := conn.(*net.UnixConn)
-	if !ok {
-		return nil, fmt.Errorf("firecracker: %s is not a unix socket", socket)
-	}
-
-	raw, err := unixConn.SyscallConn()
+	cred, err := peerCred(conn)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: read the peer of %s: %w", socket, err)
-	}
-
-	var (
-		cred    *unix.Ucred
-		credErr error
-	)
-
-	if err := raw.Control(func(fd uintptr) {
-		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); err != nil {
-		return nil, fmt.Errorf("firecracker: read the peer of %s: %w", socket, err)
-	}
-
-	if credErr != nil {
-		return nil, fmt.Errorf("firecracker: read the peer of %s: %w", socket, credErr)
 	}
 
 	if uid <= 0 || cred.Uid != uint32(uid) { //nolint:gosec // a uid billet claimed fits a uint32.
@@ -79,4 +59,41 @@ func apiPeerExecutable(socket string, uid int) (*os.File, error) {
 	}
 
 	return exe, nil
+}
+
+// peerCred is the kernel's record of the process that listens on a unix connection's
+// other end.
+func peerCred(conn net.Conn) (*unix.Ucred, error) {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return nil, errors.New("not a unix connection")
+	}
+
+	raw, err := unixConn.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		cred    *unix.Ucred
+		credErr error
+	)
+
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return nil, err
+	}
+
+	return cred, credErr
+}
+
+// peerUID is the uid of the process listening on a unix connection's other end.
+func peerUID(conn net.Conn) (int, error) {
+	cred, err := peerCred(conn)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(cred.Uid), nil
 }

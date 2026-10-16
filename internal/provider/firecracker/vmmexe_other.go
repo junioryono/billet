@@ -4,6 +4,7 @@ package firecracker
 
 import (
 	"errors"
+	"net"
 	"os"
 )
 
@@ -12,4 +13,10 @@ import (
 // there.
 func apiPeerExecutable(string, int) (*os.File, error) {
 	return nil, errors.New("firecracker: telling which executable serves a VMM socket needs Linux")
+}
+
+// peerUID needs the kernel's credentials for a socket's peer, which this check reads
+// only on Linux.
+func peerUID(net.Conn) (int, error) {
+	return 0, errors.New("firecracker: telling whose process answers a VMM socket needs Linux")
 }

@@ -144,7 +144,9 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	}
 	defer store.close()
 
-	if err := capture(ctx, p.apiFor(j.socket()),
+	// EVERY CONNECTION CHECKED FOR WHOSE VMM ANSWERS (newVMMAPIAs): this guest has
+	// run, so the socket's name is no longer evidence of where it leads.
+	if err := capture(ctx, p.apiAs(j.socket(), res.UID),
 		snapshotFiles{State: "/" + captureStateFile, Memory: "/" + captureMemoryFile}); err != nil {
 		return err
 	}

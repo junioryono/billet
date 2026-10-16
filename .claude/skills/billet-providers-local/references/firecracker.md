@@ -23,6 +23,7 @@ Part of the `billet-providers-local` skill. Each rule is stated in full, with th
     - a jail kernel that is not a regular file billet's account owns, opened without following a link (`linkedByBillet`);
     - a jail with no `billet-shape`. That record is written beside the jail root at launch (vCPUs and memory) and bounds the capture.
   - **It then describes the host,** so a host that cannot describe itself never stops a guest.
+  - **Every connection Capture makes checks whose VMM answers** (`newVMMAPIAs`: the kernel's `SO_PEERCRED` uid must be the microVM's), because the socket is in the jail root and a guest that has run could make it a link to another lease's socket, which root would follow. The rest of the provider's calls to running guests are tracked in #550.
   - **It takes the store's publish lock before pausing,** polling so the wait ends with its context, because a capture queued behind another's copy would otherwise hold a paused guest and its lease lock indefinitely. The lock file stays in the store for good.
   - **Its own output names:** the VMM writes `capture.state` and `capture.mem`, never `snapshot.*`. A restored jail holds those names as billet's read-only links, and asking the VMM to overwrite them fails after the pause.
   - **Copy, never rename:** `publishCapture` copies the files out of the jail. A renamed file would be the VMM's own inode, which its account may still hold open for writing.

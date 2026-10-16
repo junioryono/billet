@@ -603,6 +603,10 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		return int(st.Uid) == os.Geteuid() || jailWritten(st, res)
 	}
 
+	// AND IT ANSWERS AS THE TEST'S ACCOUNT, not a jail uid, so the uid check on its
+	// connections has its own test (vmmexe_linux_test.go).
+	h.p.apiAs = func(socket string, _ int) *vmmAPI { return h.p.apiFor(socket) }
+
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
 	h.p.runningVMM = func(jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 

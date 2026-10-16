@@ -44,6 +44,34 @@ const apiTimeout = 10 * time.Second
 
 // newVMMAPI returns a client for the socket at that path.
 func newVMMAPI(socket string) *vmmAPI {
+	return newVMMAPIDialing(socket, func(net.Conn) error { return nil })
+}
+
+// newVMMAPIAs is newVMMAPI for a VMM that must be running as uid, checked on every
+// connection before a request is written to it.
+//
+// FOR A GUEST THAT HAS RUN. The socket is inside the jail root, which the jailed
+// account owns, and a VMM that has been taken over can replace it with a link to
+// another lease's socket; billet, as root, would follow it and pause or snapshot a
+// guest whose lease it does not hold. The kernel's credentials for the listener say
+// whose VMM answered, and another lease's runs as another uid.
+func newVMMAPIAs(socket string, uid int) *vmmAPI {
+	return newVMMAPIDialing(socket, func(conn net.Conn) error {
+		peer, err := peerUID(conn)
+		if err != nil {
+			return fmt.Errorf("firecracker: tell whose VMM answers on %s: %w", socket, err)
+		}
+
+		if uid <= 0 || peer != uid {
+			return fmt.Errorf("firecracker: %s is answered by uid %d, not the microVM's uid %d",
+				socket, peer, uid)
+		}
+
+		return nil
+	})
+}
+
+func newVMMAPIDialing(socket string, check func(net.Conn) error) *vmmAPI {
 	var d net.Dialer
 
 	return &vmmAPI{
@@ -63,7 +91,16 @@ func newVMMAPI(socket string) *vmmAPI {
 				// request line from, and the dialer sends it to this socket whatever
 				// that host says. Nothing here can reach the network.
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return d.DialContext(ctx, "unix", socket)
+					conn, err := d.DialContext(ctx, "unix", socket)
+					if err != nil {
+						return nil, err
+					}
+
+					if err := check(conn); err != nil {
+						return nil, errors.Join(err, conn.Close())
+					}
+
+					return conn, nil
 				},
 			},
 		},
