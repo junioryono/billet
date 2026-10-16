@@ -2202,17 +2202,37 @@ type deadlineCompletionStore struct {
 	ok       bool
 }
 
-// blockingCompletionStore holds every transition write until its context ends.
-type blockingCompletionStore struct{ completionStore }
+// deadlineRecordingStore holds every transition write until its context ends and
+// records the deadline each one was handed; a write with none is let go after a
+// minute so the test can fail rather than hang.
+type deadlineRecordingStore struct {
+	completionStore
+	mu        sync.Mutex
+	deadlines []time.Time
+	unbounded int
+}
 
-// PutPendingCompletion blocks on the supplied persistence deadline.
-func (blockingCompletionStore) PutPendingCompletion(
+// PutPendingCompletion records its deadline and blocks on it.
+func (s *deadlineRecordingStore) PutPendingCompletion(
 	ctx context.Context,
 	_ state.PendingCompletion,
 ) (state.PendingCompletionDisposition, error) {
-	<-ctx.Done()
+	deadline, ok := ctx.Deadline()
 
-	return state.PendingCompletionActionable, ctx.Err()
+	s.mu.Lock()
+	if ok {
+		s.deadlines = append(s.deadlines, deadline)
+	} else {
+		s.unbounded++
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return state.PendingCompletionActionable, ctx.Err()
+	case <-time.After(time.Minute):
+		return state.PendingCompletionActionable, errors.New("a write with no deadline was let go by the test")
+	}
 }
 
 // failingRetirementStore injects tombstone or deletion failures independently.
@@ -4485,8 +4505,13 @@ func TestReleaseOnlyPersistenceDoesNotExtendAShutdownDeadline(t *testing.T) {
 	}
 }
 
+// THE DEADLINES THE WRITES WERE HANDED ARE COMPARED, not how long the three
+// took: a shared deadline is the one shutdown deadline exactly, and a write that
+// derived its own, or had none, is caught however fast or slow the machine is. A
+// one-second bound on the whole release measured the machine instead.
 func TestParkedCompletionWritesShareTheShutdownDeadline(t *testing.T) {
-	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(blockingCompletionStore{}))
+	store := &deadlineRecordingStore{}
+	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(store))
 	l.releaseGrace = time.Hour
 	for id := int64(81); id <= 83; id++ {
 		l.cleanup[id] = &pendingCleanup{
@@ -4497,10 +4522,19 @@ func TestParkedCompletionWritesShareTheShutdownDeadline(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
 	defer cancel()
-	started := time.Now()
+	shutdown, _ := ctx.Deadline()
 	l.releaseAll(ctx, map[int64]bool{})
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("three parked writes outlived one shutdown deadline: %s", elapsed)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.unbounded != 0 || len(store.deadlines) == 0 {
+		t.Fatalf("%d parked write(s) had a deadline and %d had none; want every one under the shutdown's",
+			len(store.deadlines), store.unbounded)
+	}
+	for _, d := range store.deadlines {
+		if !d.Equal(shutdown) {
+			t.Fatalf("a parked write ran under the deadline %s, want the shutdown's own %s", d, shutdown)
+		}
 	}
 }
 

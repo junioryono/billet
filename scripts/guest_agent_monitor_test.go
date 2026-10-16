@@ -411,9 +411,11 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 		unbounded bool
 	}{
 		{name: "the monitor answers", body: "exit 0\n"},
-		// A FLUSH THAT TAKES WELL OVER A SECOND IS LET FINISH, which a hook that
-		// went on without it would not; the hook's own 3 s is not what is timed here.
-		{name: "the monitor answers late", body: "/bin/sleep 1.5\n: >\"$0.done\"\nexit 0\n",
+		// A FLUSH THAT TAKES SECONDS IS LET FINISH, which a hook that went on
+		// without it would not; the hook's own 3 s is not what is timed here. Five
+		// seconds, so a hook that returned at once is not rescued by a test a
+		// loaded machine kept from looking until the flush was done.
+		{name: "the monitor answers late", body: "/bin/sleep 5\n: >\"$0.done\"\nexit 0\n",
 			finishes: true, unbounded: true},
 		{name: "no monitor answers", body: "echo 'no monitor answered' >&2\nexit 1\n"},
 		{name: "the binary talks", body: "echo out\necho err >&2\nexit 0\n"},

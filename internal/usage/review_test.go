@@ -237,7 +237,7 @@ func finalWithin(t *testing.T, m *Monitor, key string) Summary {
 	}()
 	select {
 	case a := <-finished:
-		if !a.ok || a.took > testLimit+time.Second {
+		if !a.ok || pastTheTestLimit(a.took) {
 			t.Errorf("Final(%s) answered %v after %s, want an answer within about %s", key, a.ok,
 				a.took, testLimit)
 		}

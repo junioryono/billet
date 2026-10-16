@@ -79,16 +79,20 @@ func TestMonitorWithoutItsEnvironmentReportsNothingAndExitsZero(t *testing.T) {
 }
 
 // The hook's client exits 0, quietly, with nobody to ask.
+//
+// THAT IT DOES NOT WAIT is the client's own property, proved where its wait can be
+// set far past a guard (guestagent's TestAFlushWithNoMonitorReturnsAtOnce): here
+// the wait is the fixed two seconds, which a one-second bound could not tell from
+// a loaded machine, where a failed dial alone took 1.87 s (2026-10-12, #188).
 func TestFlushExitsZeroQuietlyWithNoMonitor(t *testing.T) {
 	t.Parallel()
 
 	env, stdout, stderr := testEnv()
 
-	began := time.Now()
 	err := Run(t.Context(), env, []string{"flush", "--socket", filepath.Join(t.TempDir(), "absent.sock")})
 
-	if err != nil || stdout.Len() != 0 || stderr.Len() != 0 || time.Since(began) > time.Second {
-		t.Fatalf("answered %v after %v, printed %q %q", err, time.Since(began), stdout.String(), stderr.String())
+	if err != nil || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("answered %v, printed %q %q", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -189,7 +193,9 @@ func TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
+	// A GUARD, NOT A CONDITION: a monitor says hello at once, however long a
+	// loaded machine takes to start the process.
+	deadline := time.Now().Add(time.Minute)
 	for n.helloed() == 0 {
 		if time.Now().After(deadline) {
 			_ = cmd.Process.Kill() //nolint:errcheck // the test fails either way
@@ -206,20 +212,26 @@ func TestSIGTERMEndsTheMonitorWithOneFinalBatchAndStatusZero(t *testing.T) {
 		t.Fatalf("the monitor's argv (%v) carries the endpoint or the bearer: %q", err, cmdline)
 	}
 
-	stopped := time.Now()
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
 
-	err = cmd.Wait()
-	took := time.Since(stopped)
+	// THE THREE SECONDS ARE THE AGENT'S, proved on the bubble's clock
+	// (guestagent's TestSIGTERMIsAnsweredWithinThreeSecondsWhateverHoldsTheLoop);
+	// what this process can show is that SIGTERM ends it, which a guard far past
+	// those seconds does without measuring how fast the machine reaps a process.
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	select {
+	case err = <-exited:
+	case <-time.After(time.Minute):
+		_ = cmd.Process.Kill() //nolint:errcheck // the test fails either way
+		t.Fatalf("the monitor had not exited a minute after SIGTERM; its log: %s", stderr.String())
+	}
 
 	if err != nil {
 		t.Fatalf("the monitor exited %v; its log: %s", err, stderr.String())
-	}
-
-	if took > 3*time.Second {
-		t.Errorf("the monitor took %v to exit after SIGTERM, past 3s", took)
 	}
 
 	t.Logf("the monitor's log: %s", stderr.String())

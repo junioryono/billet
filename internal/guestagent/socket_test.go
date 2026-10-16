@@ -259,7 +259,11 @@ func TestAFlushWithNoMonitorReturnsAtOnce(t *testing.T) {
 	}
 }
 
-// A monitor that never answers is waited for FlushWait and no longer.
+// A monitor that never answers is waited for the wait asked for and no longer.
+//
+// THE WAIT IS LONGER THAN FlushWait, so a flush that waited the default rather
+// than what it was asked returns early and fails the lower bound, which no load
+// can make shorter; the guard, not a stopwatch, catches one that never stops.
 func TestAFlushWaitsNoLongerThanItsWait(t *testing.T) {
 	t.Parallel()
 
@@ -272,15 +276,15 @@ func TestAFlushWaitsNoLongerThanItsWait(t *testing.T) {
 
 	t.Cleanup(func() { _ = l.Close() })
 
+	const wait = FlushWait + time.Second
+
 	began := time.Now()
 
-	// NO EARLIER THAN THE WAIT, which no load can make shorter; the guard, not a
-	// stopwatch, catches a flush that waits for an answer the monitor never sends.
-	if err := flushWithin(t, "a flush to a silent monitor", socket, 200*time.Millisecond); err == nil {
+	if err := flushWithin(t, "a flush to a silent monitor", socket, wait); err == nil {
 		t.Fatal("a silent monitor answered")
 	}
 
-	if took := time.Since(began); took < 200*time.Millisecond {
-		t.Fatalf("waited %v, want the whole 200ms", took)
+	if took := time.Since(began); took < wait {
+		t.Fatalf("waited %v, want the whole %v asked for", took, wait)
 	}
 }

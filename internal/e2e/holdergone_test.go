@@ -540,6 +540,8 @@ type wiredConfig struct {
 	// reapEvery replaces the harness's 200ms reaper tick. Against real AWS every
 	// tick is an inventory walk, and a walk every 200ms is a throttled account.
 	reapEvery time.Duration
+	// leaseTTL replaces cbWireTTL.
+	leaseTTL time.Duration
 }
 
 // withRealProviders assembles the wired stack over backends the caller builds,
@@ -556,6 +558,11 @@ func supersedableFirstNode(c *wiredConfig) { c.supersedable = true }
 // withWiredReapInterval replaces the reaper tick.
 func withWiredReapInterval(d time.Duration) wiredOpt {
 	return func(c *wiredConfig) { c.reapEvery = d }
+}
+
+// withWiredLeaseTTL replaces the stack's lease TTL.
+func withWiredLeaseTTL(d time.Duration) wiredOpt {
+	return func(c *wiredConfig) { c.leaseTTL = d }
 }
 
 // cbWireTTL is the lease TTL of the wired stack: short enough that a lease
@@ -609,6 +616,11 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 		reapEvery = 200 * time.Millisecond
 	}
 
+	leaseTTL := wc.leaseTTL
+	if leaseTTL == 0 {
+		leaseTTL = cbWireTTL
+	}
+
 	// THE SERVER'S OWN SECOND SIGNAL, separate from the node's: this stack stops
 	// a node process while the control plane keeps running, and a channel shared
 	// with the server would end the plane's drain later for the wrong reason.
@@ -617,7 +629,7 @@ func newWiredCodeBuild(t *testing.T, opts ...wiredOpt) *wiredCodeBuild {
 	c := openAssembled(t, harnessConfig(dir, 64, 256*config.GiB, tiers),
 		[]app.Target{{Config: config.GitHubTarget{Name: config.DefaultTargetName, Org: "acme"}, Client: client}},
 		&app.Steering{
-			Allocator: []alloc.Option{alloc.WithClock(clock.now), alloc.WithLeaseTTL(cbWireTTL)},
+			Allocator: []alloc.Option{alloc.WithClock(clock.now), alloc.WithLeaseTTL(leaseTTL)},
 			// A SHORT COMMAND TIMEOUT, because a destroy queued for a process that is
 			// gone otherwise waits ten minutes before the plane will say so.
 			Plane: []nodeplane.Option{nodeplane.WithCommandTimeout(10 * time.Second)},
@@ -920,7 +932,14 @@ func TestACompletionBoundToAKilledIncarnationIsSettledOnceItsHolderIsReplaced(t 
 // process that a lease it still holds custody of is over (the plane's record
 // is gone by then, and "superseded" is a refusal a drain cannot act on).
 func TestASupersededProcessDrainsTheJobItHoldsWhileTheCompletionWaits(t *testing.T) {
-	w := newWiredCodeBuild(t, supersedableFirstNode)
+	// A LONGER TTL THAN THE STACK'S, because what is asserted is that a live
+	// holder renews, and a renewal is wall-clock work: under a three-second TTL a
+	// heartbeat a loaded machine delayed by two seconds lost the lease of a holder
+	// that was renewing it (#188). Renewing every third of ten seconds, a holder
+	// keeps the lease through a stall of six.
+	const ttl = 10 * time.Second
+
+	w := newWiredCodeBuild(t, supersedableFirstNode, withWiredLeaseTTL(ttl))
 
 	const requestID = 7002
 
@@ -969,10 +988,11 @@ func TestASupersededProcessDrainsTheJobItHoldsWhileTheCompletionWaits(t *testing
 	w.plane.queue(fakeactions.StatisticsJSON(0, 0), done)
 	awaitAck(t, w.stack, 3)
 
-	// NEVER QUARANTINED WHILE THE BUILD RUNS. The listener has let go, the TTL
-	// is three seconds, and the reaper ticks five times a second: if nothing
-	// renewed the lease it would be quarantined well inside this window.
-	deadline := time.Now().Add(3 * cbWireTTL)
+	// NEVER QUARANTINED WHILE THE BUILD RUNS. The listener has let go, and the
+	// reaper ticks five times a second: if nothing renewed the lease it would
+	// expire at most a TTL after the acknowledgement and be quarantined inside
+	// this window.
+	deadline := time.Now().Add(ttl + 2*time.Second)
 	for time.Now().Before(deadline) {
 		lease, err := w.alloc.Lease(t.Context(), leaseID)
 		if err != nil {

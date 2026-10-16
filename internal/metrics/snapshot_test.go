@@ -143,14 +143,25 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	srv := serveSnapshot(t, 50*time.Millisecond, func(ctx context.Context) (Snapshot, error) {
 		n := reads.Add(1)
 
+		// THE FIRST READ'S DEADLINE IS THE ONE ASKED ABOUT; a later read, of
+		// which a loaded machine may start several, must not block on a full
+		// channel.
 		_, ok := ctx.Deadline()
-		deadlines <- ok
+		select {
+		case deadlines <- ok:
+		default:
+		}
 
 		if n == 1 {
 			<-release // deaf to its context, on purpose
+
+			return Snapshot{"billet_test_nodes": {{Value: 1}}}, nil
 		}
 
-		return Snapshot{"billet_test_nodes": {{Value: float64(n)}}}, nil
+		// EVERY LATER READ SAYS THE SAME, so a fresh read that itself missed its
+		// 50 ms on a loaded machine is answered by the next one rather than
+		// leaving a count no scrape will ever match.
+		return Snapshot{"billet_test_nodes": {{Value: 2}}}, nil
 	})
 
 	// Registered after serveSnapshot's, so it runs first: the read is let go

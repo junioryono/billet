@@ -52,6 +52,53 @@ type ranOut struct {
 	err error
 }
 
+// runningStandIn is a stand-in systemctl body that records its pid at path once
+// whatever comes before it in the script has run, and then becomes body's last
+// command; the pid is the one the run's TERM and KILL reach, since exec keeps it.
+func runningStandIn(path, before, last string) string {
+	return before + "printf '%s\\n' $$ > '" + path + ".tmp' && mv '" + path + ".tmp' '" + path + "'\n" + last
+}
+
+// cancelOnceRunning ends ctx once the stand-in has written its pid to path, so
+// the run's cancellation reaches a process that is running and has set itself up,
+// and never one still starting: a deadline that expired before the start was a
+// refusal no TERM or KILL was needed for. The stand-in is killed when the test
+// ends, whatever the run did with it.
+func cancelOnceRunning(t *testing.T, path string) context.Context {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 1 {
+				if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+					t.Errorf("end the stand-in %d: %v", pid, err)
+				}
+			}
+		}
+	})
+
+	go func() {
+		for {
+			if _, err := os.Stat(path); err == nil {
+				cancel()
+
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}()
+
+	return ctx
+}
+
 // fakeSystemctl writes an executable answering as body says and returns its
 // path; every case here runs the real execRunner against it.
 func fakeSystemctl(t *testing.T, body string) string {
@@ -76,39 +123,40 @@ func shortWaitDelay(t *testing.T, d time.Duration) {
 
 func TestARunEndsAtTheCallersDeadlineByTerm(t *testing.T) {
 	// THE WAIT DELAY IS AS LONG AS THE SLEEP, so only the TERM can end the run
-	// before the guard: a cancel that sent nothing would wait for the KILL.
-	bin := fakeSystemctl(t, "exec sleep 600\n")
+	// before the guard: a cancel that sent nothing would wait for the KILL. The
+	// caller's context ends once the stand-in is running.
+	pid := filepath.Join(t.TempDir(), "pid")
+	bin := fakeSystemctl(t, runningStandIn(pid, "", "exec sleep 600\n"))
 	i := NewInspector(WithSystemctl(bin), WithWaitDelay(10*time.Minute))
+	ctx := cancelOnceRunning(t, pid)
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-
-	ran := within(t, runGuard, "a hanging stop under a one-second deadline", func() ranOut {
+	ran := within(t, runGuard, "a hanging stop whose caller's context ended", func() ranOut {
 		out, err := i.exec(ctx, []string{"stop", "--", "x.service"})
 
 		return ranOut{out, err}
 	})
 	if ran.err == nil || !strings.Contains(ran.err.Error(), "the deadline ended it") {
-		t.Fatalf("a hanging stop under a one-second deadline: %v", ran.err)
+		t.Fatalf("a hanging stop whose caller's context ended: %v", ran.err)
 	}
 }
 
 func TestARunThatIgnoresTermIsKilledAfterTheWaitDelay(t *testing.T) {
 	shortWaitDelay(t, 500*time.Millisecond)
 
-	bin := fakeSystemctl(t, "trap '' TERM\nexec sleep 600\n")
+	// THE TRAP IS SET BEFORE THE PID IS WRITTEN, so the TERM always meets a
+	// process that ignores it and only the KILL after the wait delay ends it.
+	pid := filepath.Join(t.TempDir(), "pid")
+	bin := fakeSystemctl(t, runningStandIn(pid, "trap '' TERM\n", "exec sleep 600\n"))
 	i := NewInspector(WithSystemctl(bin))
+	ctx := cancelOnceRunning(t, pid)
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-
-	ran := within(t, runGuard, "a TERM-ignoring stop under a one-second deadline", func() ranOut {
+	ran := within(t, runGuard, "a TERM-ignoring stop whose caller's context ended", func() ranOut {
 		out, err := i.exec(ctx, []string{"stop", "--", "x.service"})
 
 		return ranOut{out, err}
 	})
 	if ran.err == nil || !strings.Contains(ran.err.Error(), "the deadline ended it") {
-		t.Fatalf("a TERM-ignoring stop under a one-second deadline: %v", ran.err)
+		t.Fatalf("a TERM-ignoring stop whose caller's context ended: %v", ran.err)
 	}
 }
 

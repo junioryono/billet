@@ -582,43 +582,51 @@ func TestAnIdlePollIsNotAnError(t *testing.T) {
 // control plane.
 //
 // The timing assertion is deliberately loose: it proves "concurrent, not serial".
+//
+// EVERY NODE HAS ITS COMMAND WHILE NONE HAS ANSWERED, which a destroy that asked
+// them one at a time cannot arrange: under a command timeout no test outlives, it
+// would still be waiting on the first. Ordered by what the nodes received, not by
+// how long the destroy took: a ceiling between one timeout and three was a
+// stopwatch under t.Parallel() with the whole package running.
 func TestOneWedgedNodeDoesNotStallADestroy(t *testing.T) {
 	t.Parallel()
 
-	const timeout = 600 * time.Millisecond
+	p := testPlane(t, WithCommandTimeout(10*time.Minute))
 
-	p := testPlane(t, WithCommandTimeout(timeout))
+	received := make(chan string, 3)
 
 	for _, name := range []string{"wedged-a", "wedged-b", "wedged-c"} {
 		register(t, p, name, config.ProviderDocker)
 
 		// Each takes its command and never answers.
 		go func() {
-			if _, _, err := p.Poll(t.Context(), name, ""); err != nil {
-				return
+			if cmd, _, err := p.Poll(t.Context(), name, ""); err == nil && cmd.Kind == nodeapi.CommandDestroy {
+				received <- name
 			}
 		}()
 	}
 
-	start := time.Now()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 
-	err := p.NewRunner().Destroy(t.Context(), 7)
-	if err == nil {
-		t.Fatal("three silent nodes reported a successful destroy")
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- p.NewRunner().Destroy(ctx, 7) }()
+
+	for range 3 {
+		select {
+		case <-received:
+		case err := <-destroyed:
+			t.Fatalf("the destroy returned %v before every silent node had its command", err)
+		case <-time.After(time.Minute):
+			t.Fatal("not every node had its command while the first was still silent, which " +
+				"means the destroy asked them one at a time")
+		}
 	}
 
-	// Serial would be at least three timeouts; concurrent is about one, so the
-	// ceiling sits between them.
-	//
-	// 2.5x RATHER THAN 2x, AND NOT 3x. Three is exactly what serial costs, so a
-	// ceiling there would pass against the very implementation this test exists to
-	// refuse; two leaves only one timeout of slack above the concurrent case,
-	// which is a wall clock under t.Parallel() with the whole package running.
-	// Two and a half keeps half a timeout clear of serial and gives one and a half
-	// above concurrent.
-	if elapsed := time.Since(start); elapsed > 5*timeout/2 {
-		t.Errorf("the destroy took %v against three nodes with a %v timeout, which means it "+
-			"asked them one at a time", elapsed, timeout)
+	cancel()
+
+	if err := <-destroyed; err == nil {
+		t.Fatal("three silent nodes reported a successful destroy")
 	}
 }
 

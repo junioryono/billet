@@ -23,15 +23,22 @@ func (s *countingSweeper) SweepStagedCredentials(context.Context) error {
 	return s.err
 }
 
+// sweepGuard is how long a test waits for the reaper ticks it counts, and how
+// long the plane may run before a test ends it. It is a failure deadline, never a
+// condition: a test stops the plane once it has counted what it needs, which a
+// 20 ms reaper reaches long before it however loaded the machine. Five seconds
+// for three ticks ran out at 5.89 s on a loaded CI runner (#188).
+const sweepGuard = 2 * time.Minute
+
 // runPlaneWith runs a one-tier control plane with a fast reaper until stop is
-// called or the deadline passes.
+// called or the guard passes.
 func runPlaneWith(t *testing.T, opts ...ControlPlaneOption) (stop context.CancelFunc, done <-chan error) {
 	t.Helper()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), sweepGuard+time.Minute)
 
 	prov := &fakeProvisioner{
 		newSession: func(string) Session {
@@ -80,7 +87,7 @@ func TestTheStagedCredentialSweepRunsOnTheReapersClock(t *testing.T) {
 	)
 
 	// Wait for the third pass, then stop the plane.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(sweepGuard)
 	for passes.Load() < 3 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -129,7 +136,7 @@ func TestAFencedControlPlaneNeverSweepsStagedCredentials(t *testing.T) {
 	)
 
 	// Three wholly fenced ticks, inside runPlaneWith's own lifetime.
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(sweepGuard)
 	for ticks.Load() < 4 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}

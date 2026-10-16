@@ -43,8 +43,9 @@ func bootScriptFunction(t *testing.T, name string) string {
 const watchGuard = 2 * time.Minute
 
 // watchConsole runs watch_console against a console file that later is appended
-// to after the given delay, with a live guest process, and returns what it saw.
-func watchConsole(t *testing.T, first, later string, delay time.Duration, timeout int) string {
+// to once the watch has sampled the first console whole, with a live guest
+// process, and returns what it saw.
+func watchConsole(t *testing.T, first, later string, timeout int) string {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -70,9 +71,38 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 		}
 	})
 
-	if later != "" {
+	ctx, cancel := context.WithTimeout(t.Context(), watchGuard)
+	defer cancel()
+
+	// AFTER A WHOLE SAMPLE OF THE FIRST CONSOLE, NEVER ON A TIMER: the watch
+	// marks the end of each sample as it sleeps, so the later lines arrive only
+	// once it has read the first ones alone and gone on waiting. A two-second
+	// delay let a watch a loaded machine started late read both at once.
+	sampled := filepath.Join(dir, "sampled")
+	appended := make(chan struct{})
+
+	defer func() {
+		cancel()
+		<-appended
+	}()
+
+	if later == "" {
+		close(appended)
+	} else {
 		go func() {
-			time.Sleep(delay)
+			defer close(appended)
+
+			for {
+				if _, err := os.Stat(sampled); err == nil {
+					break
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 
 			f, err := os.OpenFile(console, os.O_APPEND|os.O_WRONLY, 0o644)
 			if err != nil {
@@ -92,7 +122,8 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 	}
 
 	script := "#!/usr/bin/env bash\nset -euo pipefail\n" + bootScriptFunction(t, "watch_console") + "\n" +
-		"CONSOLE=$1 FCPID=$2 BOOT_TIMEOUT=$3 REFUSED_CONTRACT=999\n" +
+		"CONSOLE=$1 FCPID=$2 BOOT_TIMEOUT=$3 REFUSED_CONTRACT=999 SAMPLED=$4\n" +
+		"sleep() { : >\"$SAMPLED\"; command sleep \"$@\"; }\n" +
 		"watch_console\n" +
 		"echo \"multiuser=$saw_multiuser agent=$saw_agent docker=$docker_started\"\n"
 
@@ -101,11 +132,8 @@ func watchConsole(t *testing.T, first, later string, delay time.Duration, timeou
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), watchGuard)
-	defer cancel()
-
 	watch := exec.CommandContext(ctx, "bash", path, console,
-		strconv.Itoa(guest.Process.Pid), strconv.Itoa(timeout))
+		strconv.Itoa(guest.Process.Pid), strconv.Itoa(timeout), sampled)
 	watch.WaitDelay = 5 * time.Second
 
 	out, err := watch.CombinedOutput()
@@ -133,7 +161,7 @@ const (
 func TestTheBootWatchWaitsForTheTargetAfterTheAgentAnswers(t *testing.T) {
 	t.Parallel()
 
-	got := watchConsole(t, agentRefusal, multiUser, 2*time.Second, 600)
+	got := watchConsole(t, agentRefusal, multiUser, 600)
 	if got != "multiuser=1 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q, want both the target and the agent seen", got)
 	}
@@ -144,7 +172,7 @@ func TestTheBootWatchWaitsForTheTargetAfterTheAgentAnswers(t *testing.T) {
 func TestTheBootWatchReportsATargetThatNeverCame(t *testing.T) {
 	t.Parallel()
 
-	got := watchConsole(t, agentRefusal, "", 0, 3)
+	got := watchConsole(t, agentRefusal, "", 3)
 
 	if got != "multiuser=0 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q, want the agent seen and the target not", got)
@@ -156,7 +184,7 @@ func TestTheBootWatchReportsATargetThatNeverCame(t *testing.T) {
 func TestTheBootWatchEndsWhenBothAreSeen(t *testing.T) {
 	t.Parallel()
 
-	got := watchConsole(t, multiUser+agentRefusal, "", 0, 600)
+	got := watchConsole(t, multiUser+agentRefusal, "", 600)
 
 	if got != "multiuser=1 agent=1 docker=0" {
 		t.Fatalf("the watch reported %q", got)

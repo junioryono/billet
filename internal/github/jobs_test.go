@@ -522,26 +522,31 @@ func TestARefusedTokenExchangeDoesNotEchoTheJWT(t *testing.T) {
 	}
 }
 
-// A SLOW GITHUB IS CUT OFF AT THE CALLER'S DEADLINE.
+// A SLOW GITHUB IS CUT OFF AT THE CALLER'S DEADLINE: the server answers only
+// once the test ends, so a read that did not honour the deadline is still waiting
+// at the guard, however long a loaded machine took over one that did.
 func TestASlowJobListEndsAtTheDeadline(t *testing.T) {
 	t.Parallel()
 
+	ended := make(chan struct{})
 	c, _ := jobsServer(t, func(_ http.ResponseWriter, r *http.Request, _ int) {
 		select {
 		case <-r.Context().Done():
-		case <-time.After(10 * time.Second):
+		case <-ended:
 		}
 	})
+	t.Cleanup(func() { close(ended) })
+
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
 
-	started := time.Now()
-	_, err := c.RunnerJob(ctx, "acme", "api", 31, "billet-lease-1")
+	err := returnsWithin(t, func() error {
+		_, err := c.RunnerJob(ctx, "acme", "api", 31, "billet-lease-1")
+
+		return err
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a silent server = %v, want the deadline", err)
-	}
-	if took := time.Since(started); took > 5*time.Second {
-		t.Errorf("the read took %s past a 200ms deadline", took)
 	}
 }
 
