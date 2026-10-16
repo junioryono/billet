@@ -360,7 +360,7 @@ func TestABoundedReadKeepsItsSampleThroughATick(t *testing.T) {
 	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	o := &recordingObserver{}
 	m := NewMonitor(tr.root, Options{Interval: time.Second, Observer: o, Now: func() time.Time { return now }})
-	m.ticker, m.limit = false, testLimit
+	m.ticker, m.limit = false, answerLimit
 	var moving atomic.Bool
 	var written atomic.Int64
 	written.Store(4 << 20)

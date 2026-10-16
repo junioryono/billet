@@ -10,8 +10,15 @@ import (
 	"time"
 )
 
-// testLimit is how long Start and Final wait for a sampler in these tests.
+// testLimit is how long Start and Final wait for a sampler a test has made
+// stuck.
 const testLimit = 200 * time.Millisecond
+
+// answerLimit is how long they wait for one that is not: past what any loaded
+// machine takes, since a test of what the sampler read must read that, not a
+// timeout. Under the race detector in CI a final read once took longer than
+// testLimit and was marked sampler_stuck (2026-10-16).
+const answerLimit = 10 * time.Second
 
 // pastTheTestLimit says whether a call took as long as the production limit,
 // which is what one bounded by lifecycleLimit rather than the monitor's own limit
@@ -21,13 +28,14 @@ const testLimit = 200 * time.Millisecond
 func pastTheTestLimit(took time.Duration) bool { return took >= lifecycleLimit }
 
 // runMonitor is a monitor whose Run is serving, ticking only when the test
-// calls Tick, with a short lifecycle limit. Cleanup stops Run and proves it
-// returned.
+// calls Tick, whose Start and Final are answered (answerLimit) unless the test
+// makes the sampler stuck, which shortens the limit to testLimit. Cleanup stops
+// Run and proves it returned.
 func runMonitor(t *testing.T, root string, opts Options) *Monitor {
 	t.Helper()
 
 	m := NewMonitor(root, opts)
-	m.ticker, m.limit = false, testLimit
+	m.ticker, m.limit = false, answerLimit
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -69,6 +77,9 @@ func TestATickDoesNotApplyOneJobsReadToItsSuccessor(t *testing.T) {
 	successor.CgroupDir = "/sys/fs/cgroup/successor"
 	h.tr.write(successor.CgroupDir+"/cpu.stat", "usage_usec 5\nuser_usec 5\nsystem_usec 0\n")
 	h.advance(10*time.Second, "69571715")
+	// THE START BELOW RUNS INSIDE RUN, which cannot answer it, so it waits out
+	// its limit.
+	h.m.limit = testLimit
 	h.m.afterTickRead = func() {
 		h.m.afterTickRead = nil
 		h.m.Forget("vm")
@@ -198,6 +209,7 @@ func stuckJob(t *testing.T, tr tree, target Target, m *Monitor) string {
 	t.Helper()
 
 	stuck, fifo := stuckTarget(t, tr, target)
+	m.limit = testLimit
 	m.mu.Lock()
 	m.jobs["stuck"] = &job{target: stuck, first: m.opts.Now()}
 	m.mu.Unlock()
@@ -262,6 +274,7 @@ func TestAStartThatOutlivesItsLimitDoesNotBringAForgottenJobBack(t *testing.T) {
 	m := runMonitor(t, tr.root, Options{Interval: time.Minute, RAPL: true})
 	m.Tick()
 	stuck, fifo := stuckTarget(t, tr, target)
+	m.limit = testLimit
 	t.Cleanup(func() { releaseAnyReader(t, fifo) })
 
 	begun := time.Now()
