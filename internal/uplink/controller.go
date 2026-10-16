@@ -63,8 +63,8 @@ type Params struct {
 	// the cut grows from GentleCut to DeepCut.
 	Severe time.Duration
 	// Window and Detect: the queue is taken to be full when at least Detect of
-	// the last Window measured delays were delayed, so one slow answer changes
-	// nothing.
+	// the last Window rounds came back delayed, so one slow answer changes
+	// nothing; a round with no measured delay is not a delayed one.
 	Window, Detect int
 	// LossRounds is how many of the last Window rounds must have lost a probe,
 	// from a strict majority of the reflectors between them, for the line to be
@@ -177,7 +177,7 @@ type Direction struct {
 	cutSince      bool
 	cutDelay      time.Duration
 	cutDelayKnown bool
-	cutLoss       float64
+	cutTally      tally
 	futile        int
 }
 
@@ -232,10 +232,9 @@ type verdict struct {
 	// under Bloat, and a line that has not been dropping over the last Window
 	// rounds, cuts or no cuts.
 	clear bool
-	// lossShare is the share of the probes since the last cut that went
-	// unanswered.
-	lossShare float64
-	cut       float64
+	// tally is each reflector's probes and misses since the last cut.
+	tally tally
+	cut   float64
 }
 
 // Step applies one observation and reports whether either rate changed.
@@ -248,17 +247,17 @@ func (c *Controller) Step(o Observation) bool {
 
 	p := c.Params
 
-	if o.DelayKnown {
-		c.recent = append(c.recent, o.Delay > p.Bloat)
-		if len(c.recent) > p.Window {
-			c.recent = c.recent[len(c.recent)-p.Window:]
-		}
+	// EVERY ROUND AGES THE WINDOWS, one that measured nothing included, so what
+	// was seen before an outage is not still evidence a minute later. A round
+	// with no measured delay is not a delayed one, and one that counted no
+	// reflector lost nothing.
+	c.recent = append(c.recent, o.DelayKnown && o.Delay > p.Bloat)
+	if len(c.recent) > p.Window {
+		c.recent = c.recent[len(c.recent)-p.Window:]
 	}
 
-	if len(o.Probes) > 0 {
-		c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
-		c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
-	}
+	c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
+	c.trail = lastRounds(append(c.trail, o.Probes), p.Window)
 
 	v := c.judge(o)
 
@@ -305,17 +304,17 @@ func (c *Controller) judge(o Observation) verdict {
 	}
 
 	delayFull := delayed >= p.Detect
-	dropping, share := c.dropping(c.losses, o)
-	stillDropping, _ := c.dropping(c.trail, o)
+	dropping := c.dropping(c.losses, o)
+	stillDropping := c.dropping(c.trail, o)
 	delayedNow := o.DelayKnown && o.Delay > p.Bloat
 
 	v := verdict{
-		full:      delayFull || dropping,
-		onDelay:   delayFull && delayedNow,
-		onLoss:    dropping && o.Lost() > 0,
-		clear:     o.DelayKnown && !delayedNow && !stillDropping,
-		lossShare: share,
-		cut:       1,
+		full:    delayFull || dropping,
+		onDelay: delayFull && delayedNow,
+		onLoss:  dropping && o.Lost() > 0,
+		clear:   o.DelayKnown && !delayedNow && !stillDropping,
+		tally:   tallyOf(c.losses),
+		cut:     1,
 	}
 
 	if v.onDelay {
@@ -329,33 +328,26 @@ func (c *Controller) judge(o Observation) verdict {
 	return v
 }
 
-// dropping reports whether a loss window says the line is dropping, and the
-// share of its probes the line lost. Only the reflectors this round counts are
-// read, so one that has since gone silent lends the window none of its misses.
-// It needs both kinds of breadth: losses in at least LossRounds rounds, so one
-// instant's blip is not a full line, and from a strict majority of the counted
-// reflectors, so one reflector that stopped answering is not either.
-func (c *Controller) dropping(window [][]Probe, o Observation) (bool, float64) {
+// dropping reports whether a loss window says the line is dropping. Only the
+// reflectors this round counts are read, so one that has since gone silent
+// lends the window none of its misses. It needs both kinds of breadth: losses
+// in at least LossRounds rounds, so one instant's blip is not a full line, and
+// from a strict majority of the counted reflectors, so one reflector that
+// stopped answering is not either.
+func (c *Controller) dropping(window [][]Probe, o Observation) bool {
 	counted := make(map[string]bool, len(o.Probes))
 	for _, probe := range o.Probes {
 		counted[probe.Reflector] = true
 	}
 
-	probes, lost, rounds := 0, 0, 0
+	rounds := 0
 	missed := map[string]bool{}
 
 	for _, round := range window {
 		lossy := false
 
 		for _, probe := range round {
-			if !counted[probe.Reflector] {
-				continue
-			}
-
-			probes++
-
-			if probe.Lost {
-				lost++
+			if counted[probe.Reflector] && probe.Lost {
 				lossy = true
 				missed[probe.Reflector] = true
 			}
@@ -366,12 +358,56 @@ func (c *Controller) dropping(window [][]Probe, o Observation) (bool, float64) {
 		}
 	}
 
-	share := 0.0
-	if probes > 0 {
-		share = float64(lost) / float64(probes)
+	return rounds >= c.Params.LossRounds && 2*len(missed) > len(o.Probes)
+}
+
+// tally is, for each reflector, how many probes a window sent it and how many
+// of them it lost.
+type tally map[string]struct{ probes, lost int }
+
+func tallyOf(window [][]Probe) tally {
+	t := tally{}
+
+	for _, round := range window {
+		for _, probe := range round {
+			n := t[probe.Reflector]
+			n.probes++
+
+			if probe.Lost {
+				n.lost++
+			}
+
+			t[probe.Reflector] = n
+		}
 	}
 
-	return rounds >= c.Params.LossRounds && 2*len(missed) > len(o.Probes), share
+	return t
+}
+
+// lessLossThan is whether this tally lost a smaller share than then, by a
+// tenth, over the reflectors this round counts that both of them asked: a
+// reflector that joined or left in between changes the share without the line
+// changing at all.
+func (t tally) lessLossThan(then tally, counted []Probe) bool {
+	var nowProbes, nowLost, thenProbes, thenLost int
+
+	for _, probe := range counted {
+		now, ok := t[probe.Reflector]
+		before, was := then[probe.Reflector]
+
+		if !ok || !was {
+			continue
+		}
+
+		nowProbes, nowLost = nowProbes+now.probes, nowLost+now.lost
+		thenProbes, thenLost = thenProbes+before.probes, thenLost+before.lost
+	}
+
+	if nowProbes == 0 || thenProbes == 0 {
+		return false
+	}
+
+	return float64(nowLost)/float64(nowProbes) < float64(thenLost)/float64(thenProbes)*0.9
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
@@ -445,7 +481,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
 		d.lastCut, d.cutSince = o.At, true
-		d.cutDelay, d.cutDelayKnown, d.cutLoss = o.Delay, o.DelayKnown, v.lossShare
+		d.cutDelay, d.cutDelayKnown, d.cutTally = o.Delay, o.DelayKnown, v.tally
 
 		return d.Rate != before, true
 	case v.clear && moving >= p.Full*d.Rate &&
@@ -469,14 +505,14 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 }
 
 // helped is whether the queue is shorter now than at the direction's last cut:
-// a measured delay lower by a margin than the measured delay then, or a smaller
-// share of the probes lost by a tenth.
+// a measured delay lower by a margin than the measured delay then, or a share
+// of the same reflectors' probes lost that is lower by a tenth.
 func helped(d *Direction, v verdict, o Observation) bool {
 	if o.DelayKnown && d.cutDelayKnown && o.Delay <= d.cutDelay-max(improvement, d.cutDelay/10) {
 		return true
 	}
 
-	return v.lossShare < d.cutLoss*0.9
+	return v.tally.lessLossThan(d.cutTally, o.Probes)
 }
 
 func clamp(rate, maxMbit float64) float64 {

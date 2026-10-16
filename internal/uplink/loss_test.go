@@ -211,6 +211,72 @@ func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
 	}
 }
 
+// WHAT WAS SEEN BEFORE AN OUTAGE IS NOT EVIDENCE AFTER IT. Two reflectors
+// missed a probe each, and two rounds came back delayed, while the host was
+// quiet; then for five seconds no reflector counted. A single miss and a
+// single delayed round as the host gets busy are one round's evidence, not a
+// window's.
+func TestEvidenceFromBeforeAnOutageExpires(t *testing.T) {
+	t.Parallel()
+
+	for _, after := range []Sample{of3(time.Millisecond, true, "a"), of3(30*time.Millisecond, true)} {
+		c := newController()
+
+		c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
+		c.Step(probed(1, 0, 8, of3(30*time.Millisecond, true, "a")))
+		c.Step(probed(2, 0, 8, of3(30*time.Millisecond, true, "b")))
+
+		for n := 3; n < 13; n++ {
+			c.Step(probed(n, 0, 8, Sample{}))
+		}
+
+		if c.Step(probed(13, 0, 400, after)) {
+			t.Fatalf("one round of %+v after the outage cut the download to %.1f, on evidence from before it",
+				after, c.Down.Rate)
+		}
+	}
+}
+
+// A REFLECTOR LEAVING IS NOT A CUT HELPING. One reflector lost every probe and
+// stopped counting soon after the first cut, while the other two kept losing
+// one probe a round between them: the share over every reflector the window
+// asked fell, but the loss of the ones still asked did not, and the cuts still
+// stop at two.
+func TestAReflectorLeavingDoesNotReadAsACutHelping(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+	firstCut := -1
+
+	for n := range 120 {
+		lost := []string{"b", "c"}[n%2]
+
+		// a is still counted, and losing, for two rounds after the first cut.
+		var s Sample
+		if firstCut < 0 || n <= firstCut+2 {
+			s = of3(0, false, "a", lost)
+		} else {
+			s = Sample{Probes: []Probe{{Reflector: "b", Lost: lost == "b"}, {Reflector: "c", Lost: lost == "c"}}}
+		}
+
+		before := c.Down.Rate
+		c.Step(probed(n, 0, 300, s))
+
+		if c.Down.Rate < before {
+			cuts++
+
+			if firstCut < 0 {
+				firstCut = n
+			}
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a loss the remaining reflectors never shed drew %d cuts over a minute; want %d", cuts, c.Params.Futile)
+	}
+}
+
 // A REFLECTOR THAT HAS STOPPED COUNTING LENDS THE WINDOW NONE OF ITS MISSES.
 // Two reflectors went silent while the host was quiet and are no longer
 // counted; the one left misses a single probe as the host gets busy, which is
