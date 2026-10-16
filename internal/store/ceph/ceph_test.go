@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -470,12 +470,12 @@ func TestAnInvocationIsBounded(t *testing.T) {
 	//
 	// time.NewTimer rather than time.After, which forbidigo bans for leaking its
 	// timer until it fires.
-	var remaining atomic.Int64
+	var remaining deadlines
 
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, _ string, _ []string) ([]byte, error) {
-			noteRemaining(ctx, &remaining)
+			remaining.note(ctx)
 
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
@@ -501,45 +501,60 @@ func TestAnInvocationIsBounded(t *testing.T) {
 
 	// The bound has to be the one that was configured. A client that gave up
 	// because the TEST's context ended would satisfy every assertion above.
-	configuredBound(t, &remaining, 20*time.Millisecond)
+	remaining.within(t, 20*time.Millisecond)
 }
 
-// noteRemaining records the most time any invocation's deadline left it, or -1
-// for one that had no deadline at all.
-func noteRemaining(ctx context.Context, most *atomic.Int64) {
+// deadlines records the deadline each stalled invocation ran under.
+type deadlines struct {
+	mu        sync.Mutex
+	seen      int
+	unbounded int
+	// most is the most time any bounded invocation had left when it arrived,
+	// which is negative for one whose deadline had already passed.
+	most time.Duration
+}
+
+// note records ctx's deadline.
+func (d *deadlines) note(ctx context.Context) {
 	deadline, ok := ctx.Deadline()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.seen++
+
 	if !ok {
-		most.Store(-1)
+		d.unbounded++
 
 		return
 	}
 
-	left := int64(time.Until(deadline))
-	for {
-		seen := most.Load()
-		if seen < 0 || seen >= left || most.CompareAndSwap(seen, left) {
-			return
-		}
+	if left := time.Until(deadline); d.seen-d.unbounded == 1 || left > d.most {
+		d.most = left
 	}
 }
 
-// configuredBound fails unless every invocation ran under a deadline no further
-// away than bound.
+// within fails unless an invocation arrived and every one ran under a deadline
+// no further away than bound.
 //
 // THE DEADLINE, NOT THE STOPWATCH: what an invocation had left can only shrink
 // however loaded the machine, so a bound derived from anything but the configured
 // timeout shows here exactly, where a one-second ceiling on the whole call
-// measured the machine as much as the bound.
-func configuredBound(t *testing.T, most *atomic.Int64, bound time.Duration) {
+// measured the machine as much as the bound. A deadline already passed when the
+// invocation arrived is still the configured one.
+func (d *deadlines) within(t *testing.T, bound time.Duration) {
 	t.Helper()
 
-	switch left := time.Duration(most.Load()); {
-	case left < 0:
-		t.Error("an invocation ran with no deadline; the configured timeout did not apply")
-	case left == 0:
-		t.Error("no invocation recorded its deadline; the runner was never reached")
-	case left > bound:
-		t.Errorf("an invocation had %s left, past the configured %s", left, bound)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	switch {
+	case d.seen == 0:
+		t.Error("no stalled invocation arrived; the runner was never reached")
+	case d.unbounded > 0:
+		t.Errorf("%d invocation(s) ran with no deadline; the configured timeout did not apply", d.unbounded)
+	case d.most > bound:
+		t.Errorf("an invocation had %s left, past the configured %s", d.most, bound)
 	}
 }
 
@@ -1608,7 +1623,7 @@ func TestAMissingCephIsRefusedEvenWhenRBDIsPresent(t *testing.T) {
 func TestACephInvocationIsBoundedToo(t *testing.T) {
 	t.Parallel()
 
-	var remaining atomic.Int64
+	var remaining deadlines
 
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		WithTimeout(20*time.Millisecond),
@@ -1625,7 +1640,7 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 				return []byte("mimic\n"), nil
 			}
 
-			noteRemaining(ctx, &remaining)
+			remaining.note(ctx)
 
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
@@ -1647,7 +1662,7 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 		t.Errorf("the failure is not the deadline: %v", err)
 	}
 
-	configuredBound(t, &remaining, 20*time.Millisecond)
+	remaining.within(t, 20*time.Millisecond)
 }
 
 // THE CLONE FORMAT IS PER POOL, and both of these hold clones.

@@ -8,6 +8,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // STATUS SAYS EVERY SWEEP THE LEDGER RECORDED, including the host nothing sweeps
@@ -15,7 +16,10 @@ import (
 // drives the sweep to record and pins field by field; this is the report
 // another process prints from them.
 func TestStatusReportsEveryRecordedCredentialSweep(t *testing.T) {
-	db, err := state.Open(t.Context(), t.TempDir())
+	// FROM THE TEMPLATE, NOT MIGRATED FROM EMPTY: a migration from empty runs
+	// under the ledger's thirty-second startup budget, which a loaded machine
+	// missed (#188), and nothing here is about migrating.
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}

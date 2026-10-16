@@ -99,7 +99,7 @@ func TestMigrateDryRunJudgesEveryBranch(t *testing.T) {
 			f.preRBinary(t)
 			mustOK(t, os.Remove(f.recordPath))
 
-			o := f.migrate(t, f.rendering(c.rendered), "--dry-run")
+			o := f.migrate(t, f.rendering(c.rendered), "--dry-run", "--wait", endpointExpiryWait)
 			mustEndpointOutcome(t, o, outcomeReported)
 
 			if o.str("record") != recordAbsentPreR || o.doc["effective"] != nil || o.boolean("planned") != c.planned ||
@@ -120,7 +120,7 @@ func TestMigrateDryRunJudgesEveryBranch(t *testing.T) {
 		f.installB(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		o := f.migrate(t, f.rendering(endpointB))
+		o := f.migrate(t, f.rendering(endpointB), "--wait", endpointExpiryWait)
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonPreR)
 
 		if f.calls(t, "stop") != 0 {
@@ -151,7 +151,7 @@ func TestMigrateDryRunJudgesEveryBranch(t *testing.T) {
 			c.plant(t, f)
 
 			for _, extra := range [][]string{{"--dry-run"}, nil} {
-				o := f.migrate(t, rendering, extra...)
+				o := f.migrate(t, rendering, append(extra, "--wait", endpointExpiryWait)...)
 				mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
 
 				if !strings.Contains(o.str("why"), "restore") || f.calls(t, "stop") != 0 {
@@ -299,7 +299,7 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 
 		t.Cleanup(func() { inspectAfterRecordRead = prev })
 
-		o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+		o := f.migrate(t, f.rendering(endpointB), "--wait", endpointAnswerWait)
 		mustEndpointOutcome(t, o, outcomeMigrated)
 
 		if reads < 3 {
@@ -319,7 +319,7 @@ func TestMigrateRecordWaitsBeforeAndAfterTheStart(t *testing.T) {
 			f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalA}))
 		})
 
-		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", "3s")
+		o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", endpointAnswerWait)
 		mustEndpointOutcome(t, o, outcomeReported)
 
 		if !o.boolean("planned") || o.str("effective") != canonicalA {
@@ -719,6 +719,9 @@ func TestTheMigrationFixturesAreTheCommandsOwn(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Helper()
 			f := newEndpointFixture(t)
+			// EVERY ANSWER HERE IS A FIRST READ OR THE WAIT RUNNING OUT, and the
+			// fixtures name the wait the latter ran out.
+			f.wait = endpointExpiryWait
 
 			o := produce(t, f)
 

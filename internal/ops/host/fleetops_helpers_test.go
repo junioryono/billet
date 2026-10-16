@@ -8,6 +8,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // Helpers this package's tests share with internal/ops/fleetops's and
@@ -24,9 +25,12 @@ import (
 func drainFixture(t *testing.T) (*state.DB, string) {
 	t.Helper()
 
-	stateDir := t.TempDir()
+	stateDir := ledgertest.Dir(t)
 	cfg := writeCAConfig(t, stateDir)
 
+	// FROM THE TEMPLATE, NOT MIGRATED FROM EMPTY: a migration from empty runs
+	// under the ledger's thirty-second startup budget, which a loaded machine
+	// missed (#188), and nothing here is about migrating.
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)

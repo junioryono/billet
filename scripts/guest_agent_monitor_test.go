@@ -401,6 +401,14 @@ func TestTheJobCompletedHookIsBoundedSilentAndNeverFails(t *testing.T) {
 		t.Fatalf("the hook does not bound the flush by %q, outside the flush's own %s", bound, guestagent.FlushWait)
 	}
 
+	// AND IN THE FOREGROUND, read from the hook as well as run: a hook that sent
+	// the flush to the background and returned would be caught below only if the
+	// test looked before the flush finished, which a loaded machine need not do.
+	// The redirections are the only ampersands the hook may carry.
+	if bare := strings.NewReplacer(">&", "", "&&", "").Replace(string(raw)); strings.Contains(bare, "&") {
+		t.Fatal("the hook runs something in the background; the flush has to finish before the hook returns")
+	}
+
 	for _, tc := range []struct {
 		name     string
 		body     string        // the stand-in billet; empty means there is none

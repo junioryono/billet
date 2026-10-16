@@ -2,6 +2,7 @@ package fleetops
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -264,13 +266,14 @@ func TestJobsShowStopsWaitingForGitHub(t *testing.T) {
 	// Registered after the fake's own cleanup, so the request is let go before
 	// the server closes.
 	ended := make(chan struct{})
+	release := sync.OnceFunc(func() { close(ended) })
 	fakeJobsGitHub(t, func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 		case <-ended:
 		}
 	})
-	t.Cleanup(func() { close(ended) })
+	t.Cleanup(release)
 
 	prev := stepsReadLimit
 	stepsReadLimit = 300 * time.Millisecond
@@ -282,9 +285,14 @@ func TestJobsShowStopsWaitingForGitHub(t *testing.T) {
 	// command was a stopwatch on that machine.
 	const guard = 15 * time.Second
 
+	// A GUARD THAT FIRES ENDS THE COMMAND AND JOINS IT before capture restores
+	// stdout and the cleanups restore what the command reads.
 	out := capture(t, func() {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
 		done := make(chan error, 1)
-		go func() { done <- Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}) }()
+		go func() { done <- Jobs(ctx, processEnv(), []string{"show", "--config", cfg, lease}) }()
 
 		select {
 		case err := <-done:
@@ -292,7 +300,10 @@ func TestJobsShowStopsWaitingForGitHub(t *testing.T) {
 				t.Errorf("billet jobs show: %v", err)
 			}
 		case <-time.After(guard):
-			t.Fatalf("the command was still waiting on GitHub after %s, on a 300ms limit", guard)
+			t.Errorf("the command was still waiting on GitHub after %s, on a 300ms limit", guard)
+			cancel()
+			release()
+			<-done
 		}
 	})
 	if !strings.Contains(out, "could not be read from GitHub") || !strings.Contains(out, "deadline exceeded") {

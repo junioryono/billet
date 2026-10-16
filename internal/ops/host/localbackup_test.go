@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/deployarchive"
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -86,6 +87,11 @@ tiers:
 	if !commissioned {
 		return f
 	}
+
+	// FROM THE TEMPLATE, NOT MIGRATED FROM EMPTY: a migration from empty runs
+	// under the ledger's thirty-second startup budget, which a loaded machine
+	// missed (#188), and nothing here is about migrating.
+	ledgertest.Seed(t, stateDir)
 
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
