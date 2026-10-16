@@ -491,10 +491,16 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"make >$(printf ')') check", "`make check` is a full gate"},
 		{"make >$(printf ')') verify", ""},
 		{"make >$(mktemp) verify", ""},
-		// A comment or a heredoc inside a target's substitution hides parentheses
-		// from a count, so the scanner leaves those lines to preprocess.
-		{"echo x >$(printf log # (\n); git rebase main # )", "merging"},
-		{"echo x >$(cat <<'EOF'\n(\nEOF\n); git rebase main # )", "merging"},
+		// A target that runs across a line can hide a quote or a parenthesis in a
+		// comment or a heredoc, so the line is unreadable, which the git rules
+		// refuse and the gate rules let through.
+		{"echo x >$(printf log # (\n); git rebase main # )", "could not be parsed"},
+		{"echo x >$(cat <<'EOF'\n(\nEOF\n); git rebase main # )", "could not be parsed"},
+		{"git >$(printf log\n) rebase main", "could not be parsed"},
+		{"echo x >$(printf log # '\n); git rebase main # ')", "could not be parsed"},
+		{"make >$(printf log\n) check", ""},
+		{"make verify > /tmp/verify.log\ngit status", ""},
+		{"git push origin junior-oct03-work > /tmp/a\\\nb.log", ""},
 		// A line continuation joins words before a descriptor is read.
 		{"make 2\\\n>/dev/null", bare},
 		{"make check 2\\\n>/dev/null", gate},

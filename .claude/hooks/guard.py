@@ -204,6 +204,10 @@ RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}",
 COMMENT_STARTS = " \t\n;&|()"
 
 
+class Unreadable(Exception):
+    """A command line the parser will not split into words."""
+
+
 REDIRECTION_OPERATORS = ("<<<", ">>", ">|", ">&", "<&", "<>", ">", "<")
 WORD_ENDS = " \t\n;&|()<>"
 
@@ -225,15 +229,10 @@ def quoted_end(text, j):
             else:
                 j += 2 if text[j] == "\\" else 1
         return None if j >= n else j + 1
-    # $( ... ): balanced parentheses, with quotes inside it read as their own. A
-    # comment or a heredoc in it would hide parentheses from the count, and either
-    # can be closed only after a newline, so a newline gives up and leaves the
-    # line to preprocess, which reads both.
+    # $( ... ): balanced parentheses, with quotes inside it read as their own.
     j, depth = j + 2, 1
     while j < n:
         c = text[j]
-        if c == "\n":
-            return None
         if c in "'\"" or text.startswith("$(", j):
             j = quoted_end(text, j)
             if j is None:
@@ -293,7 +292,13 @@ def redirection_end(text, i, previous):
     j += len(next(op for op in REDIRECTION_OPERATORS if text.startswith(op, j)))
     while j < n and (text[j] in " \t" or text.startswith("\\\n", j)):
         j = past_continuations(text, j) if text[j] == "\\" else j + 1
-    return word_end(text, j)
+    end = word_end(text, j)
+    # A target that runs across a line (a quoted string or a substitution holding
+    # a newline, where a comment or a heredoc can hide a quote or a parenthesis)
+    # is not read at all: the line is unreadable, which the git rules refuse.
+    if "\n" in text[j : n if end is None else end].replace("\\\n", ""):
+        raise Unreadable("a redirection target runs across a line")
+    return end
 
 
 def preprocess(text):
@@ -381,7 +386,11 @@ def preprocess(text):
 def simple_commands(text):
     """The command line as events: a simple command's words, or "(" / ")" where
     a subshell opens or closes. None when it does not parse."""
-    lexer = shlex.shlex(preprocess(text), posix=True, punctuation_chars=SEPARATOR_CHARS)
+    try:
+        source = preprocess(text)
+    except Unreadable:
+        return None
+    lexer = shlex.shlex(source, posix=True, punctuation_chars=SEPARATOR_CHARS)
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
