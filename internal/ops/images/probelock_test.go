@@ -413,7 +413,42 @@ func TestARetakeWhoseNameMovesAgainIsNotAHold(t *testing.T) {
 	}
 	t.Cleanup(func() { probeLockOpened = nil })
 
+	held := lock.file
+	before := openDescriptors(t)
+
 	if err := lock.hold(); err == nil || !strings.Contains(err.Error(), "now names a different file") {
 		t.Fatalf("hold() over a name that moved under the re-take = %v, want the move named", err)
 	}
+
+	if lock.file != held {
+		t.Error("a re-take that failed replaced the descriptor the verification held")
+	}
+
+	// THE RE-TAKEN DESCRIPTOR IS CLOSED: its lock is on the inode the hook
+	// unlinked, so no second lock can show it held; the descriptor count can.
+	if after := openDescriptors(t); after != before {
+		t.Errorf("the failed re-take left %d descriptors open, %d before it", after, before)
+	}
+}
+
+// openDescriptors counts this process's open file descriptors. Serial callers
+// only: a parallel test opening files changes the count.
+func openDescriptors(t *testing.T) int {
+	t.Helper()
+
+	// NAMES, NOT ENTRIES: the listing includes the descriptor reading it, which
+	// is closed by the time an entry would be examined.
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return len(names)
 }

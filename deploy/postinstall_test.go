@@ -219,7 +219,7 @@ func TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns(t *testing.T) {
 		"-i", "ubuntu:24.04", "sh", "-eu")
 	cmd.Stdin = strings.NewReader(`
 mkdir /shim
-printf '#!/bin/sh\nprintf "systemctl %%s\\n" "$*" >>/calls\nexit 0\n' >/shim/systemctl
+printf '#!/bin/sh\nprintf "systemctl %%s\\n" "$*" >>/calls\n[ "$1" != daemon-reload ] || exit "${RELOAD_EXIT:-0}"\nexit 0\n' >/shim/systemctl
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>/tmpfiles.argv\nprintf "tmpfiles\\n" >>/calls\nexit "${TMPFILES_EXIT:-0}"\n' >/shim/systemd-tmpfiles
 chmod 0755 /shim/systemctl /shim/systemd-tmpfiles
 
@@ -254,6 +254,14 @@ rm /tmpfiles.argv
 TMPFILES_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/tmpfiles.err
 test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
 grep -F '/run/billet/locks could not be created now' /tmpfiles.err
+
+# A RELOAD THAT FAILED IS SAID, with the order to run both in, and the
+# directory is still made.
+rm /tmpfiles.argv
+RELOAD_EXIT=1 PATH="/shim:${PATH}" sh /postinstall.sh 2>/reload.err
+test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
+grep -F 'systemd could not be reloaded' /reload.err
+grep -F 'systemctl daemon-reload && systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf' /reload.err
 `)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("package host lock directory: %v\n%s", err, out)

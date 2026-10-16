@@ -85,15 +85,15 @@ var ImagesRefreshTimer string
 
 // Tmpfiles is the tmpfiles.d entry that creates the host lock directory,
 // NodeLockDir, at boot. The package installs it at TmpfilesPath and the Ansible
-// host role renders it byte for byte at TmpfilesRolePath. The directory is no
-// unit's RuntimeDirectory, because a unit's stop removes those and the locks in
-// it outlive a node restart (#175).
+// host role renders it byte for byte at TmpfilesRolePath. No unit's stop removes
+// the directory, because the locks in it outlive a node restart (#175): the node
+// names it in ReadWritePaths, and the image refresh declares it preserved.
 //
 //go:embed billet-tmpfiles.conf
 var Tmpfiles string
 
 const (
-	// NodeLockDir is the host-wide lock directory the shipped units name in
+	// NodeLockDir is the host-wide lock directory the shipped node unit names in
 	// ReadWritePaths and the packaged configuration names as node.lock_dir.
 	NodeLockDir      = "/run/billet/locks"
 	TmpfilesPath     = "/usr/lib/tmpfiles.d/billet.conf"

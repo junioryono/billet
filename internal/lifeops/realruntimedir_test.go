@@ -16,9 +16,9 @@ import (
 
 // realHostLockDir makes the host lock directory as billet-tmpfiles.conf does,
 // root:root 0750 under a 0755 /run/billet, when the disposable host has none,
-// and removes only what it made once the test is done. The shipped node and
-// image-refresh units name it in ReadWritePaths without a '-', so a unit that
-// carries their directory settings does not start without it.
+// and removes only what it made once the test is done. The shipped node unit
+// names it in ReadWritePaths without a '-', so a unit that carries its
+// directory settings does not start without it.
 func realHostLockDir(t *testing.T) {
 	t.Helper()
 
@@ -60,9 +60,9 @@ func realHostLockDir(t *testing.T) {
 // unit from before, which declared its lock directory a RuntimeDirectory: its
 // stop removes the name under the holder, and a second lock on the recreated
 // file is granted, which is how two verifications became one microVM. The
-// image refresh writes there under the same naming, and a missing directory
-// refuses the node's start with 226/NAMESPACE rather than starting a node that
-// cannot lock.
+// image refresh writes there under its preserved RuntimeDirectory and leaves the
+// held lock in place when it ends, and a missing directory refuses the node's
+// start with 226/NAMESPACE rather than starting a node that cannot lock.
 func TestRealSystemdHostLockDirectoryOutlivesTheNodeStop(t *testing.T) {
 	if os.Getenv("BILLET_TEST_SYSTEMD_OPERATION_EFFECTS") != "1" {
 		t.Skip("requires BILLET_TEST_SYSTEMD_OPERATION_EFFECTS=1 in a disposable systemd host")
@@ -152,11 +152,17 @@ func TestRealSystemdHostLockDirectoryOutlivesTheNodeStop(t *testing.T) {
 	h.run("start", "--", refresh)
 
 	if got := h.property(refresh, "Result"); got != "success" {
-		t.Fatalf("the image refresh's start under the shipped ReadWritePaths ended %q", got)
+		t.Fatalf("the image refresh's run under its preserved RuntimeDirectory ended %q", got)
 	}
 
 	if _, err := os.Stat(refreshMarker); err != nil {
-		t.Fatalf("the image refresh did not write the host lock directory: %v", err)
+		t.Fatalf("the image refresh did not write the host lock directory, or its end removed it: %v", err)
+	}
+
+	// PRESERVED: the oneshot has ended, and the directory it declares is still
+	// the one the held lock is in.
+	if !held.stillNamed(t) || granted(t, held.path) {
+		t.Fatalf("the image refresh's end removed %s under a held lock", deploy.NodeLockDir)
 	}
 
 	// THE COUNTERFACTUAL: the unit from before, its lock directory declared.

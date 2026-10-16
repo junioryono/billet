@@ -251,6 +251,38 @@ func TestTheVerifyCommandAsksWhetherItStillHoldsTheLock(t *testing.T) {
 		t.Fatalf("cmdImagesVerify acts in the order %q and hands verifyGuestImage lock.hold: %v; want %q and true",
 			acts, handed, want)
 	}
+
+	// UNCONDITIONALLY, AND IMMEDIATELY BEFORE THE CLEANUP: the order above is a
+	// walk of the syntax tree, which a guard nested under a condition also
+	// satisfies, so the guard and the statement that destroys the probe must be
+	// adjacent statements of the function's own body.
+	destroys := func(stmt ast.Stmt) bool {
+		ifStmt, ok := stmt.(*ast.IfStmt)
+		if !ok {
+			return false
+		}
+
+		assign, ok := ifStmt.Init.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 {
+			return false
+		}
+
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+
+		return ok && isIdent(call.Fun, "destroyProbe")
+	}
+
+	adjacent := false
+	for i, stmt := range fn.Body.List[:len(fn.Body.List)-1] {
+		if ifStmt, ok := stmt.(*ast.IfStmt); ok && guard(ifStmt) && destroys(fn.Body.List[i+1]) {
+			adjacent = true
+		}
+	}
+
+	if !adjacent {
+		t.Fatal("cmdImagesVerify's guard is not the statement immediately before its pre-launch cleanup, " +
+			"both in the function's own body")
+	}
 }
 
 func isIdent(expr ast.Expr, name string) bool {

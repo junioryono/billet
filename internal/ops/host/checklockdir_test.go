@@ -125,7 +125,11 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 			lockDirHost{stat: unreadable}, "locks    could not tell whether /run/billet/locks outlives billet-node.service's " +
 				"stop: examine /run/billet/locks"},
 		{"the shipped unit, through /var/run", "/var/run/billet/locks", loaded("billet/registration"), nil,
-			lockDirHost{aliases: varRun}, "locks    /var/run/billet/locks outlives billet-node.service's stop"},
+			lockDirHost{aliases: varRun}, "locks    WARNING: /var/run/billet/locks is not /run/billet/locks, the one " +
+				"directory billet-node.service makes writable for its lock and the one spelling `billet local up` accepts"},
+		{"the shipped spelling, a link to elsewhere", "/run/billet/locks", loaded("billet/registration"), nil,
+			lockDirHost{aliases: map[string]string{"/run/billet/locks": "/var/lib/billet/locks"}},
+			"locks    WARNING: /run/billet/locks leads to /var/lib/billet/locks, so the lock records"},
 		{"a unit from before", "/run/billet/locks", loaded("billet/locks billet/registration"), nil, lockDirHost{},
 			"locks    WARNING: billet-node.service declares /run/billet/locks as a RuntimeDirectory"},
 		{"a unit from before, the directory missing", "/run/billet/locks", loaded("billet/locks billet/registration"), nil,
@@ -138,7 +142,9 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 			"locks    WARNING: /var/lock/billet is not /run/billet/locks, the one directory billet-node.service makes " +
 				"writable for its lock"},
 		{"the registration record's directory", "/run/billet/registration", loaded("billet/registration"), nil, lockDirHost{},
-			"locks    WARNING: billet-node.service declares /run/billet/registration as a RuntimeDirectory"},
+			"locks    WARNING: /run/billet/registration is under billet-node.service's RuntimeDirectory " +
+				"/run/billet/registration, which every stop of the node removes under the locks other processes " +
+				"hold in it (#175); set node.lock_dir to /run/billet/locks"},
 		{"a neighbour is not a parent", "/run/billet/locks", loaded("billet/lock"), nil, lockDirHost{},
 			"locks    /run/billet/locks outlives billet-node.service's stop"},
 		{"no unit", "/run/billet/locks", map[string][]string{"LoadState": {"not-found"}}, nil, lockDirHost{}, ""},
@@ -185,10 +191,9 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 // THE LOCK DIRECTORY IS RESOLVED THROUGH EVERY LINK ON ITS WAY, a dangling one
 // included: a lock_dir spelled through an alias of /run, or a link to a
 // directory a stopped unit from before #175 removed, still names the directory
-// it leads to, so the report judges that one and never the spelling.
+// it leads to, so the unit's declarations are judged against that one. Serial:
+// it reads the variable the report's own test stands a filesystem in.
 func TestTheLockDirectoryIsResolvedThroughDanglingLinks(t *testing.T) {
-	t.Parallel()
-
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

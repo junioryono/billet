@@ -425,20 +425,24 @@
     # while systemd ignores the setting entirely — and an ignored preserve means
     # the refresh removes the host lock directory every time it finishes, under
     # a running node's lock (#175). These three are checked where they must be;
-    # the packaged copy is pinned the same way in deploy/units_test.go.
+    # the packaged copy is pinned the same way in deploy/units_test.go. The
+    # [Service] section ends at the next section header, so a directive moved
+    # into a trailing [Unit] or [Install] is outside it.
     - name: The refresh's runtime directory directives are in [Service] in both copies
+      vars:
+        refresh_copies:
+          - "{{ packaged_scheduled['billet-images-refresh.service'] }}"
+          - "{{ role_scheduled['billet-images-refresh.service'] }}"
+        service_section: '(?ms)^\[Service\][ \t]*$.*?(?=^\[|\Z)'
       ansible.builtin.assert:
         that: >-
-          {{ [packaged_scheduled['billet-images-refresh.service'],
-              role_scheduled['billet-images-refresh.service']]
-             | map('split', '[Service]')
-             | map('last')
+          {{ refresh_copies
+             | map('regex_search', service_section)
+             | select('string')
              | select('search', '(?m)^' ~ item ~ '=')
              | list | length == 2
-             and [packaged_scheduled['billet-images-refresh.service'],
-                  role_scheduled['billet-images-refresh.service']]
-             | map('split', '[Service]')
-             | map('first')
+             and refresh_copies
+             | map('regex_replace', service_section, '')
              | select('search', '(?m)^' ~ item ~ '=')
              | list | length == 0 }}
         fail_msg: >-

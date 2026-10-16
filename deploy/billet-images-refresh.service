@@ -74,7 +74,9 @@ ReadOnlyPaths=/etc/billet
 # without declaring it; declaring it with RuntimeDirectoryPreserve=yes writes,
 # leaves other units' files untouched, leaves the directory in place when the
 # oneshot finishes, and creates it where nothing has. Same root:root 0750 as the
-# tmpfiles entry, so the declaration re-owns nothing.
+# tmpfiles entry, so the declaration re-owns nothing. NEVER `systemctl clean`
+# THIS UNIT: a clean with no --what removes its runtime directories, preserved or
+# not, under every lock held in them (measured under systemd 255.4, 2026-10-16).
 RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes

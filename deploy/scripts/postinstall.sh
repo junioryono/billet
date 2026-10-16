@@ -135,7 +135,11 @@ chmod 0750 "${CONF_DIR}"
 # loaded, not the file on disk, so until the reload a stop of a node started
 # under the old unit still removes this directory (measured on systemd 255).
 if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload || true
+    if ! systemctl daemon-reload; then
+        echo "billet: systemd could not be reloaded; until it is, a stop of a node started under the" >&2
+        echo "        previous unit removes /run/billet/locks again. Run" >&2
+        echo "        \`systemctl daemon-reload && systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf\`." >&2
+    fi
 
     if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf; then
         echo "billet: /run/billet/locks could not be created now; billet-node and the image" >&2

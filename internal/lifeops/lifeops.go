@@ -168,8 +168,8 @@ type ServiceFacts struct {
 	RuntimeDirectory string
 	// ReadWritePaths is what the unit names writable beyond those, as systemd
 	// renders it (absolute paths separated by spaces, a '-' marking one whose
-	// absence is not an error). The node names its lock directory here: no unit
-	// may declare it a RuntimeDirectory, whose stop removes it (#175).
+	// absence is not an error). The node names its lock directory here rather
+	// than declaring it a RuntimeDirectory, whose stop removes it (#175).
 	ReadWritePaths string
 
 	// ReloadPending is systemd's own NeedDaemonReload: the unit file on disk has

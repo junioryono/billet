@@ -87,24 +87,46 @@ func reportLockDir(w io.Writer, lockDir string, show func(unit string, props ...
 		return
 	}
 
+	within := func(path, root string) bool { return path == root || strings.HasPrefix(path, root+"/") }
+
 	for _, entry := range strings.Fields(firstProp(props, "RuntimeDirectory")) {
 		declared := filepath.Clean("/run/" + entry)
-		if dir == declared || strings.HasPrefix(dir, declared+"/") {
+		if !within(dir, declared) {
+			continue
+		}
+
+		// A UNIT FROM BEFORE #175 declares the shipped lock directory; any
+		// other runtime directory is the configuration's to move away from.
+		if within(deploy.NodeLockDir, declared) {
 			_, _ = fmt.Fprintf(w, "locks    WARNING: %s declares %s as a RuntimeDirectory, so every stop of "+
 				"the node removes %s under the locks other processes hold in it, and a second image "+
 				"verification can share the first one's microVM (#175); install the units this release ships "+
 				"(converge the host role, or install the package)\n", nodeUnit, declared, lockDir)
-
-			return
+		} else {
+			_, _ = fmt.Fprintf(w, "locks    WARNING: %s is under %s's RuntimeDirectory %s, which every stop of the "+
+				"node removes under the locks other processes hold in it (#175); set node.lock_dir to %s\n",
+				lockDir, nodeUnit, declared, deploy.NodeLockDir)
 		}
+
+		return
 	}
 
 	// THE SHIPPED UNIT MAKES ONE DIRECTORY WRITABLE FOR A LOCK, and refuses to
 	// start without it: anywhere else is read-only under ProtectSystem=strict.
-	if dir != deploy.NodeLockDir {
-		_, _ = fmt.Fprintf(w, "locks    WARNING: %s is not %s, the one directory %s makes writable for its lock, "+
-			"so the node cannot take its lock there; set node.lock_dir to %s\n", lockDir, deploy.NodeLockDir,
+	// Judged as SPELLED, as `billet local up` judges it, which refuses any other
+	// spelling of the same directory.
+	if filepath.Clean(lockDir) != deploy.NodeLockDir {
+		_, _ = fmt.Fprintf(w, "locks    WARNING: %s is not %s, the one directory %s makes writable for its lock "+
+			"and the one spelling `billet local up` accepts; set node.lock_dir to %s\n", lockDir, deploy.NodeLockDir,
 			nodeUnit, deploy.NodeLockDir)
+
+		return
+	}
+
+	if dir != deploy.NodeLockDir {
+		_, _ = fmt.Fprintf(w, "locks    WARNING: %s leads to %s, so the lock records billet-node.service and an "+
+			"image verification take are wherever that link points; make %s a directory, as billet's "+
+			"tmpfiles.d entry does at boot\n", lockDir, dir, deploy.NodeLockDir)
 
 		return
 	}

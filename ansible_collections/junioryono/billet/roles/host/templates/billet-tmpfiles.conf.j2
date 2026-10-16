@@ -2,8 +2,9 @@
 # package's postinstall (the Ansible host role renders the same bytes to
 # /etc/tmpfiles.d/billet.conf and creates it before any unit starts).
 #
-# NOT A RuntimeDirectory, deliberately. systemd removes a unit's runtime
-# directories when that unit stops, and every lock in here is held by a process
+# NO UNIT'S STOP REMOVES IT, deliberately: the node only names it, and the image
+# refresh declares it preserved. systemd removes a unit's runtime directories
+# when that unit stops, and every lock in here is held by a process
 # that outlives a node restart: `billet images verify` holds its probe lock for
 # the minutes a boot verification takes. Removing the directory unlinks the
 # lock's name under its holder, and the next verifier locks a fresh file at the
