@@ -291,9 +291,10 @@ func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 			"stall and a reply that is not", c.recent[len(c.recent)-1], c.recent[len(c.recent)-2])
 	}
 
-	// THROUGH THE CONTROLLER: a stall, silence past the window, and then three
-	// high readings in a row confirm only two of them, under the Detect of three
-	// a cut needs, so nothing is cut.
+	// THROUGH THE CONTROLLER: a stall, silence past the window, and then high
+	// readings in a row, which pair with none before the silence: two are under
+	// the Detect of three a cut needs, and the third cuts, as the reflectors'
+	// delay in three rounds in a row would.
 	c = newController()
 	c.Step(stalled(0))
 
@@ -302,19 +303,43 @@ func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 		c.Step(unread(n))
 	}
 
-	for range 3 {
+	for range 2 {
 		c.Step(stalled(n))
 		if c.Cause != CauseNone {
 			t.Fatalf("round %d: the gateway was cut on, back from a silence past the pairing window with "+
-				"only two of three readings confirmed", n)
+				"two readings", n)
 		}
 		n++
 	}
 
 	c.Step(stalled(n))
 	if c.Cause == CauseNone {
-		t.Error("a fourth stalled reading, the third confirmed, cut nothing")
+		t.Error("a third stalled reading in a row cut nothing")
 	}
+}
+
+// A STALL HIGH ONE SECOND IN TWO CUTS: the first reading of each pair in a row
+// counts once the second confirms it, so two high readings, two quiet ones and
+// two high again fill a window as the reflectors' delay in the same rounds
+// would. The quiet pair between ends each stall, so counting only what confirms
+// would never fill one.
+func TestAStallHighOneSecondInTwoCuts(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	for n := range 30 {
+		rise := 60 * time.Millisecond
+		if n%4 >= 2 {
+			rise = time.Millisecond
+		}
+
+		c.Step(withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(rise)))
+		if c.Cause != CauseNone {
+			return
+		}
+	}
+
+	t.Error("a gateway stalled 60 ms one second in two, under a 400 Mbit/s download, cut nothing")
 }
 
 // SPIKES WITH A QUIET PAIR BETWEEN ARE NOT ONE STALL: a calm pair is the stall
@@ -441,9 +466,10 @@ func TestASparseStallWithQuietRepliesStillLatches(t *testing.T) {
 
 // A SPAN FILLS ONLY THE ROUNDS THAT COUNTED A REFLECTOR, AND NEVER ENOUGH FOR
 // ONE PAIR ALONE TO CUT: two stalled readings either side of rounds whose
-// reflectors all went uncounted lend those rounds nothing, and two either side
-// of unread rounds that counted reflectors fill one of them, so a gateway that
-// drops its replies as it delays them cuts on a third reading, not on two pings.
+// reflectors all went uncounted lend those rounds nothing and count the first
+// reading instead, and two either side of unread rounds that counted reflectors
+// fill the nearest, so a gateway that drops its replies as it delays them cuts
+// on a third reading, not on two pings.
 func TestASpanSkipsRoundsThatCountedNoReflectorAndNeverFillsAWindowAlone(t *testing.T) {
 	t.Parallel()
 
@@ -460,7 +486,7 @@ func TestASpanSkipsRoundsThatCountedNoReflectorAndNeverFillsAWindowAlone(t *test
 		want   []bool
 	}{
 		"across rounds that counted no reflector": {
-			[]Observation{stalled(0), empty(1), empty(2), stalled(3)}, []bool{false, false, false, true}},
+			[]Observation{stalled(0), empty(1), empty(2), stalled(3)}, []bool{true, false, false, true}},
 		"across three unread rounds": {
 			[]Observation{stalled(0), unread(1), unread(2), unread(3), stalled(4)},
 			[]bool{false, false, false, true, true}},

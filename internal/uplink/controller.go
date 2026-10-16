@@ -63,7 +63,8 @@
 // rate from rising, and a quiet reading clears a stall unless a high one stands
 // just before it, one reply slipping through. All of it only in a round that
 // counted a reflector, and while the gateway stalls a round it gave no reading
-// in is not clear. A cut's effect is judged on two readings too. Its unanswered
+// in is not clear. A cut's effect is judged on two readings too, and on the
+// reflectors' loss only when the line was dropping at the cut. Its unanswered
 // probes are never loss, because a gateway answers ICMP when it has the time
 // (the reference node's went unanswered about 2% of the time with the line
 // quiet, 2026-10-16), and read as loss they would cut a busy host on every
@@ -295,10 +296,11 @@ type gatewayRound struct {
 	// round may be neither, when the gateway gave no counted reading.
 	high, quiet bool
 	// confirmed is a high reading with another high one at most
-	// gatewayPairRounds before it, a reply slipped between them or not: a stall,
-	// not one ping's spike. rise is the lesser of the two, the stall both
-	// reached. spans is how many rounds before this one the stall spans: those
-	// between the two in which the gateway gave no counted reading at all.
+	// gatewayPairRounds before it, a reply slipped between them or not, though a
+	// quiet pair between ends the stall: a stall, not one ping's spike. rise is
+	// the lesser of the two, the stall both reached. spans is how many rounds
+	// before this one the stall covers, the first reading's included, when the
+	// gateway gave no counted reading between the two.
 	confirmed bool
 	rise      time.Duration
 	spans     int
@@ -349,8 +351,9 @@ type Controller struct {
 	recent, delayTrail []bool
 	losses, trail      [][]Probe
 	// round counts the rounds stepped. lastGateway and lastHigh are the
-	// gateway's last counted reading and its last one over Bloat, with the
-	// rounds they were read in, which a reading now pairs with; gatewayStalled is
+	// gateway's last counted reading and its last one over Bloat since its last
+	// quiet pair, with the rounds they were read in, which a reading now pairs
+	// with; gatewayStalled is
 	// whether the last counted reading was over Bloat, or quiet beside one that
 	// was, which decides what a round it gave no reading in says.
 	round                           int
@@ -372,9 +375,10 @@ func (c *Controller) readGateway(o Observation) gatewayRound {
 		g.confirmed, g.rise = true, min(reading, c.lastHigh.delay)
 
 		// A REPLY BETWEEN SAYS WHAT THE ROUNDS BETWEEN WERE, so only a stall read
-		// at both ends with nothing in the middle spans them.
+		// at both ends with nothing in the middle spans them, its first reading's
+		// round included.
 		if c.lastGatewayRound == c.lastHighRound {
-			g.spans = c.round - c.lastHighRound - 1
+			g.spans = c.round - c.lastHighRound
 		}
 	}
 
@@ -450,12 +454,15 @@ func (c *Controller) Step(o Observation) bool {
 	// that decides whether a queue has gone takes every high reading, so a stall
 	// with one quiet reply in four never reads as cleared.
 	//
-	// A CONFIRMED STALL SPANS THE ROUNDS IT WENT UNREAD BETWEEN ITS TWO READINGS,
-	// so a stalled gateway that answers one probe in three still fills a window,
-	// rather than holding every rate with no cut ever coming. Only the rounds
-	// that counted a reflector, as for any gateway reading, and never so many
-	// that one pair alone fills the window: a gateway that drops its replies as
-	// it delays them would otherwise cut a host on two pings.
+	// A CONFIRMED STALL COVERS ONE OF THE EARLIER ROUNDS IT SPANS, nearest first:
+	// its first reading's, when the two are in a row, so a stall high one second
+	// in two fills a window as the reflectors' delay in the same rounds would;
+	// or the nearest it went unread in, so a stalled gateway that answers one
+	// probe in three still does, rather than holding every rate with no cut ever
+	// coming. Only the rounds that counted a reflector, as for any gateway
+	// reading, and never so many that one pair alone fills the window: a gateway
+	// that drops its replies as it delays them would otherwise cut a host on two
+	// pings.
 	c.round++
 	g := c.readGateway(o)
 	reflectors := o.reflectorsDelayed(p.Bloat)
@@ -651,8 +658,9 @@ func tallyOf(window [][]Probe) tally {
 // all; and one asked once in either window is one probe's worth of evidence,
 // not a third of the verdict. The second answer is whether the tally could judge
 // at all: a reflector asked in both, and a loss at the cut, as a delay is
-// evidence of a cut only when the cut saw one. No loss then and none now is not
-// a cut that failed.
+// evidence of a cut only when the cut saw one; and a cut keeps a tally only from
+// a window that was dropping. No loss then and none now is not a cut that
+// failed.
 func (t tally) lessLossThan(then tally, counted []Probe) (bool, bool) {
 	var nowLoss, thenLoss, weight float64
 
