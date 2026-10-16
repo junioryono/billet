@@ -101,7 +101,7 @@ What *is* checked is the question that survives the change of engine: `synchrono
   **What it costs was measured rather than asserted:** one single-row read by primary key per write transaction. On an empty transaction, SQLite goes 8.3µs → 15.8µs and PostgreSQL over loopback 419µs → 585µs — one round trip, which on PostgreSQL is the dominant cost of anything. Against a real `Reserve`+`Release` cycle (two write transactions) SQLite measured 318–327µs unfenced against 328–350µs fenced, and PostgreSQL 2.9–3.1ms against 3.6–4.1ms, where the run-to-run variance is larger than the effect. Writes are serialized behind one lock by design, so this is throughput on a path that was already serial.
 
   **What still has no election behind it is the promotion.** Nothing decides that a leader is dead or that a follower should take over; that is the election's remaining phase, and this is the half it has to be built on.
-- Backup and restore for an external ledger are not yet paired with the deployment identity. `billet local backup` and `restore` remain SQLite-only.
+- On an external ledger, `billet local backup` writes an identity-only archive that records the ledger as external, and `billet local restore` puts the identity back only when the operator asserts that the database it belongs to is attached and reachable (`ExternalLedgerAttached`); `billet local recover` refuses such an archive. The ledger's rows are covered only by the operator's own database backup until billet carries a dump of them (#19).
 - The transactional host upgrade runs on an external ledger since [ADR-010](adr-010-automatic-updates.md), without copying it: it fences, snapshots and migrates nothing there, and the rollback boundary is the candidate's start.
 
 ## Alternatives rejected
