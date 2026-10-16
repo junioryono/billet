@@ -97,7 +97,8 @@ type Params struct {
 	// answering, is never enough.
 	LossRounds int
 	// GentleCut and DeepCut are the fractions a busy direction is cut to, at a
-	// delay of Bloat and of Severe and beyond; a cut on loss is DeepCut.
+	// delay of Bloat and of Severe and beyond; a cut on loss, and one after a cut
+	// that did not shorten the queue, is DeepCut.
 	GentleCut, DeepCut float64
 	// Busy is the share of a direction's recent peak it must be moving to be
 	// blamed for a full queue: a delay that rises while the host is quiet is
@@ -649,10 +650,18 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 			return false, false
 		}
 
+		// THE LAST CUT BEFORE THE LATCH IS THE DEEPEST: a gentle cut that left the
+		// queue alone may only have been too gentle for a queue that is this
+		// host's, and the latch would leave it full for good.
+		cut := v.cut
+		if d.futile > 0 {
+			cut = min(cut, p.DeepCut)
+		}
+
 		// CUT BELOW WHAT IS FLOWING, not below the old rate: an unshaped direction
 		// starts at the interface's speed, far above anything the line carries,
 		// and only what is actually moving says where the line is.
-		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
+		d.Rate = clamp(min(d.Rate, moving)*cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
 		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay
 		// under Bloat that wanders from 12 ms to 8 ms says nothing of the gateway's

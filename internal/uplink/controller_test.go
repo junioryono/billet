@@ -152,6 +152,7 @@ func TestAQueueThatDrainedIsNotCutForWhenTheCooldownEnds(t *testing.T) {
 
 // CUTS THAT DO NOT SHORTEN THE QUEUE STOP: a delay that stays where it was
 // through two cuts is not this host's, and cutting on would take it to the floor.
+// The second, the last before the latch, is the deepest.
 func TestCutsThatLeaveTheDelayAloneStop(t *testing.T) {
 	t.Parallel()
 
@@ -163,8 +164,40 @@ func TestCutsThatLeaveTheDelayAloneStop(t *testing.T) {
 		c.Step(moving(n, 0, 300, delay))
 	}
 
-	if want := 300 * f * f; c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
-		t.Fatalf("after thirty seconds of a delay no cut moved, the download is at %.1f; want two cuts, %.1f",
+	if want := 300 * f * c.Params.DeepCut; c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
+		t.Fatalf("after thirty seconds of a delay no cut moved, the download is at %.1f; want a cut of %.3f "+
+			"and a deep one, %.1f", c.Down.Rate, f, want)
+	}
+}
+
+// A CUT THAT HELPED IS NOT DEEPENED: the escalation is for a cut that left the
+// queue alone, and a queue a gentle cut is shortening keeps being cut gently.
+func TestACutThatHelpedIsFollowedByAGentleOne(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	first, second := 40*time.Millisecond, 25*time.Millisecond
+
+	n := 0
+	for ; c.Down.Rate >= 300; n++ {
+		c.Step(moving(n, 0, 300, first))
+	}
+
+	after := c.Down.Rate
+	if want := 300 * c.cutFactor(first); after < want*0.999 || after > want*1.001 {
+		t.Fatalf("the first cut took the download to %.1f, want %.1f", after, want)
+	}
+
+	for ; c.Down.Rate >= after; n++ {
+		if n > 60 {
+			t.Fatalf("no second cut while the queue stood at %v", second)
+		}
+
+		c.Step(moving(n, 0, 300, second))
+	}
+
+	if want := after * c.cutFactor(second); c.Down.Rate < want*0.999 || c.Down.Rate > want*1.001 {
+		t.Errorf("a cut after one that shortened the queue took the download to %.1f, want a gentle %.1f",
 			c.Down.Rate, want)
 	}
 }
