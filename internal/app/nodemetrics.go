@@ -17,8 +17,9 @@ var nodeMappingFamilies = []metrics.Family{
 		Help: "This host's kernel mappings of images in the site's Ceph pools, by what accounts for each: " +
 			"root_disk (a guest's root disk), generation (a read-only generation check), session (a cache " +
 			"volume a cache session names), recent (a cache volume named too recently to judge), unaccounted " +
-			"(a cache volume named long ago that no cache session names, which the node's eviction pass " +
-			"unmaps unless the kernel holds it), or other (anything else in those pools)."},
+			"(a cache volume named long ago that no cache session of this node names, which the node's eviction " +
+			"pass unmaps when the volume records this node as its mapper and the kernel does not hold it; a second " +
+			"node identity's volumes on the same host count here too), or other (anything else in those pools)."},
 }
 
 // mappingStateLabels is the gauge's label for each state a read of the

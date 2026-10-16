@@ -114,6 +114,10 @@ type Client struct {
 	// sessions reads which images the node's cache sessions name, for Evict.
 	sessions func() (func(name string) bool, error)
 
+	// owner names the node this client maps writable volumes for, written on each
+	// before it is mapped (markMapper); empty writes nothing and sweeps nothing.
+	owner string
+
 	// mapSightings is when a SweepKernelMappings pass first found each mapping
 	// it holds unaccounted, keyed by device and image; under mapSightingsMu.
 	mapSightingsMu sync.Mutex
@@ -205,6 +209,15 @@ func withPurgeWorkers(n int) Option {
 // Evict keeps every writable volume and reports that it did.
 func WithCacheSessions(read func() (func(name string) bool, error)) Option {
 	return func(c *Client) { c.sessions = read }
+}
+
+// WithMapOwner names the node this client maps writable cache volumes for: its
+// deployment identity and node name. Create and Clone record it on each volume
+// before mapping it, and SweepKernelMappings unmaps only a volume that names it,
+// since another identity on the same host maps volumes this node's sessions
+// cannot know about.
+func WithMapOwner(owner string) Option {
+	return func(c *Client) { c.owner = strings.TrimSpace(owner) }
 }
 
 // WithTimeout bounds one invocation.

@@ -114,12 +114,24 @@ func TestAFirecrackerNodesCacheStoreChecksGenerations(t *testing.T) {
 func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	t.Parallel()
 
-	var withSessions, newWithOptions bool
+	var withSessions, newWithOptions, withOwner bool
 
 	ast.Inspect(nodeFunc(t, "nodecache.go", "nodeCacheStore"), func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
+		}
+
+		// AND THE NODE IT MAPS FOR, by deployment: without it the sweep unmaps
+		// nothing, and with another identity's it would judge that one's volumes.
+		if namesSelector(call.Fun, "ceph", "WithMapOwner") && len(call.Args) == 1 {
+			ast.Inspect(call.Args[0], func(inner ast.Node) bool {
+				if expr, ok := inner.(ast.Expr); ok && isIdent(expr, "deployment") {
+					withOwner = true
+				}
+
+				return true
+			})
 		}
 
 		if namesSelector(call.Fun, "ceph", "New") && call.Ellipsis.IsValid() && len(call.Args) == 2 {
@@ -141,6 +153,9 @@ func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 		return true
 	})
 
+	if !withOwner {
+		t.Error("nodeCacheStore builds its ceph store without ceph.WithMapOwner naming the deployment")
+	}
 	if !withSessions || !newWithOptions {
 		t.Fatalf("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg)) "+
 			"among the options it passes ceph.New (option %v, ceph.New(..., options...) %v)", withSessions, newWithOptions)

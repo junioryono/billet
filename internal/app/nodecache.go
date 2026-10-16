@@ -75,7 +75,11 @@ func nodeCacheStore(cfg *config.Config, deployment string) (storecontract.Store,
 			return nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
 		}
 
-		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg))}
+		// THE NODE IT MAPS FOR, recorded on every writable volume it maps: the
+		// mapping table is the host's, so only that record proves a leftover
+		// mapping this node's rather than another identity's on the same host.
+		options := []ceph.Option{ceph.WithCacheSessions(CacheSessionNames(cfg)),
+			ceph.WithMapOwner(deployment + "/" + cfg.Node.Name)}
 		// THE NODE'S LOCK DIRECTORY, because only billet's account can write it:
 		// a lock file another account could create could be held to stop every
 		// generation check on the host.
@@ -103,7 +107,7 @@ func startNodeCache(
 	p provider.Provider,
 	deployment string,
 	cachePolicy NodeCacheControl,
-	stopGrace time.Duration,
+	sweepWait, stopGrace time.Duration,
 ) (*node.CacheService, func(), func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, func() {}, nil
@@ -259,6 +263,12 @@ func startNodeCache(
 		"has registered and recovered", "provider", cfg.Node.Provider, "addr", ln.Addr().String())
 
 	return service, serve, func() {
+		// THE SWEEP IS STOPPED FIRST AND WAITED FOR BESIDE THE LISTENER, not after
+		// it: on a handover both waits come out of what the leases can spare.
+		stopEviction()
+		swept := make(chan bool, 1)
+		go func() { swept <- awaitSweep(sweeping, sweepWait) }()
+
 		// A listener never served is closed here, since Shutdown closes only what
 		// Serve was given; and once this has run, serve does nothing.
 		serveOnce.Do(func() { _ = serveListener.Close() })
@@ -269,18 +279,28 @@ func startNodeCache(
 				"grace", stopGrace, "error", err)
 		}
 
-		stopEviction()
-		if !awaitSweep(sweeping, sweepStopWait) {
+		if !<-swept {
 			slog.Default().Warn("stopping while a kernel-mapping sweep is still unmapping a volume",
-				"waited", sweepStopWait)
+				"waited", sweepWait)
 		}
 	}, nil
 }
 
-// sweepStopWait bounds how long a stop waits for a kernel-mapping sweep: once
-// its context is cancelled a sweep starts no unmap, so it ends within the one
-// it has started.
-const sweepStopWait = ceph.MapTimeout + 5*time.Second
+// nodeCacheSweepWait is how long a stop waits for a kernel-mapping sweep in
+// flight. Once its context is cancelled a sweep starts no unmap, so it ends
+// within the one it has started, which MapTimeout bounds.
+//
+// ON A HANDOVER, NO LONGER THAN THE LISTENER'S GRACE, alongside which it runs:
+// nothing renews the handed-over leases until the next process registers
+// (nodeCacheStopGrace), and an unmap cut short there is the lesser harm than
+// the running jobs quarantined. A drain has no running job left to lose.
+func nodeCacheSweepWait(handOver bool) time.Duration {
+	if handOver {
+		return nodeCacheStopGrace(true)
+	}
+
+	return ceph.MapTimeout + 5*time.Second
+}
 
 // awaitSweep waits, at most bound, until no kernel-mapping sweep holds the
 // slot, and reports whether none did by then.

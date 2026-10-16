@@ -56,6 +56,10 @@ const (
 	// MappingOther is any other mapping in billet's pools: not one a node makes
 	// for a job, so nothing here judges it.
 	MappingOther MappingState = "not a mapping a node makes for a job"
+	// MappingNotMine is an unaccounted mapping of a volume that does not record
+	// this node as the one that mapped it: another node identity on this host may
+	// hold it, or it predates the record. The sweep keeps it.
+	MappingNotMine MappingState = "not recorded as this node's"
 	// MappingUnmapped is an unaccounted mapping the sweep released.
 	MappingUnmapped MappingState = "unmapped"
 	// MappingHeld is an unaccounted mapping the kernel refused to release because
@@ -193,9 +197,12 @@ func (c *Client) mappingState(d *mappedDevice, now time.Time, inSession func(str
 // custody record on this node, read afresh for this pass before the table, so a
 // session that ends meanwhile unmaps its own volume rather than leaving it to be
 // judged; found so by an earlier pass at least mapSightingGap before, by the
-// monotonic clock; and then the kernel's agreement, since a plain unmap succeeds
-// only when nothing holds the device open. A pass without a session reader, or
-// whose records cannot be read, unmaps nothing.
+// monotonic clock; recorded as mapped by this node (WithMapOwner), because the
+// mapping table is the host's and the custody records are this node's alone, so
+// a volume of another node identity on the same host is in none of them; and
+// then the kernel's agreement, since a plain unmap succeeds only when nothing
+// holds the device open. A pass without a session reader or an owner, or whose
+// records cannot be read, unmaps nothing.
 //
 // LEFT BEHIND FOR TEN DAYS ON THE REFERENCE NODE: eight such mappings, from the
 // 2026-10-03 incident in which its kernel client was blocklisted, survived every
@@ -216,6 +223,10 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 	if c.sessions == nil {
 		return MappingReport{}, errors.New("ceph: kernel mappings are kept: this client was given no way " +
 			"to read the node's cache sessions")
+	}
+	if c.owner == "" {
+		return MappingReport{}, errors.New("ceph: kernel mappings are kept: this client names no node it " +
+			"maps volumes for, so none can be proved this node's")
 	}
 
 	inSession, err := c.sessions()
@@ -274,7 +285,20 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 
 		tried[spec] = true
 
-		err := c.rbdCmdWithin(context.WithoutCancel(ctx), MapTimeout, "device", "unmap", spec)
+		mine, err := c.mappedByThisNode(ctx, spec)
+		if err != nil {
+			m.State, m.Err = MappingUnknown, err
+			failures = append(failures, err)
+
+			continue
+		}
+		if !mine {
+			m.State = MappingNotMine
+
+			continue
+		}
+
+		err = c.rbdCmdWithin(context.WithoutCancel(ctx), MapTimeout, "device", "unmap", spec)
 
 		switch {
 		case err == nil:
@@ -294,4 +318,26 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 	c.mapSightings = sighted
 
 	return report, errors.Join(failures...)
+}
+
+// mappedByThisNode reports whether a writable volume records this client's
+// owner as the node that mapped it. It reads the whole metadata list, where only
+// the image's absence answers ENOENT: a get answers it alike for a missing key,
+// which says the volume is not this node's, and a missing image, which says
+// nothing. Either failure is could-not-tell.
+func (c *Client) mappedByThisNode(ctx context.Context, spec string) (bool, error) {
+	out, err := c.rbdCmd(ctx, true, "image-meta", "list", spec)
+	if err != nil {
+		return false, fmt.Errorf("ceph: read which node mapped %s, which no cache session names: %w", spec, err)
+	}
+
+	metadata := map[string]string{}
+	if len(trimSpace(out)) > 0 {
+		if err := json.Unmarshal(out, &metadata); err != nil || metadata == nil {
+			return false, fmt.Errorf("ceph: %s did not answer with the metadata of %s as a json object", c.bin,
+				spec)
+		}
+	}
+
+	return metadata[mapperKey] == c.owner, nil
 }

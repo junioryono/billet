@@ -372,7 +372,39 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 		t.Errorf("startNodeCache calls evictPass(evictCtx, storage, _, sweeping, _) %d times, want once", passes)
 	}
 
-	var stopped, awaited token.Pos
+	// THE CONTEXT IS ITS OWN, made from the node's, and the eviction loop ends on
+	// it: a stop that cancelled something else would wait out a pass still
+	// starting unmaps.
+	var derived, loopEnds bool
+	ast.Inspect(start, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Lhs) == 2 && len(node.Rhs) == 1 && isIdent(node.Lhs[0], "evictCtx") &&
+				isIdent(node.Lhs[1], "stopEviction") {
+				call, ok := node.Rhs[0].(*ast.CallExpr)
+				derived = ok && namesSelector(call.Fun, "context", "WithCancel") && len(call.Args) == 1 &&
+					isIdent(call.Args[0], "ctx")
+			}
+		case *ast.CommClause:
+			recv, ok := node.Comm.(*ast.ExprStmt)
+			if !ok {
+				return true
+			}
+			if arrow, ok := recv.X.(*ast.UnaryExpr); ok && arrow.Op == token.ARROW {
+				if call, ok := arrow.X.(*ast.CallExpr); ok && namesSelector(call.Fun, "evictCtx", "Done") {
+					loopEnds = true
+				}
+			}
+		}
+
+		return true
+	})
+	if !derived || !loopEnds {
+		t.Errorf("startNodeCache's eviction does not run on evictCtx, stopEviction := context.WithCancel(ctx) "+
+			"(made %v) or its loop does not end on evictCtx.Done() (%v)", derived, loopEnds)
+	}
+
+	var stopped, awaited, received, shut token.Pos
 	ast.Inspect(start, func(n ast.Node) bool {
 		ret, ok := n.(*ast.ReturnStmt)
 		if !ok || len(ret.Results) != 4 {
@@ -391,10 +423,25 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 				}
 			}
 
+			// IN A GO STATEMENT OF ITS OWN, so it runs while the listener shuts
+			// down: deferred, it would start only after.
+			_, concurrent := stmt.(*ast.GoStmt)
+
 			ast.Inspect(stmt, func(inner ast.Node) bool {
-				if call, ok := inner.(*ast.CallExpr); ok && isIdent(call.Fun, "awaitSweep") && len(call.Args) == 2 &&
-					isIdent(call.Args[0], "sweeping") && isIdent(call.Args[1], "sweepStopWait") {
-					awaited = call.Pos()
+				switch node := inner.(type) {
+				case *ast.CallExpr:
+					if concurrent && isIdent(node.Fun, "awaitSweep") && len(node.Args) == 2 &&
+						isIdent(node.Args[0], "sweeping") && isIdent(node.Args[1], "sweepWait") {
+						awaited = node.Pos()
+					}
+					if namesSelector(node.Fun, "srv", "Shutdown") {
+						shut = node.Pos()
+					}
+				case *ast.UnaryExpr:
+					// AND THE STOP RETURNS ONLY ONCE THE WAIT HAS ANSWERED.
+					if node.Op == token.ARROW && isIdent(node.X, "swept") {
+						received = node.Pos()
+					}
 				}
 
 				return true
@@ -403,8 +450,47 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 
 		return true
 	})
-	if !stopped.IsValid() || !awaited.IsValid() || awaited < stopped {
-		t.Error("startNodeCache's stop does not cancel the eviction and then awaitSweep(sweeping, sweepStopWait)")
+	if !stopped.IsValid() || !awaited.IsValid() || !received.IsValid() || awaited < stopped || received < awaited {
+		t.Error("startNodeCache's stop does not cancel the eviction, awaitSweep(sweeping, sweepWait) and " +
+			"receive its answer, in that order")
+	}
+
+	// BESIDE THE LISTENER, NOT AFTER IT: on a handover both waits come out of
+	// what the leases can spare, so the sweep's wait starts first and the answer
+	// is taken once the listener is down.
+	if !shut.IsValid() || awaited > shut || received < shut {
+		t.Error("startNodeCache's stop does not start the sweep's wait before srv.Shutdown and take its " +
+			"answer after it")
+	}
+
+	// AND THE NODE GIVES IT THE WAIT ITS STOP POLICY ALLOWS.
+	given := false
+	ast.Inspect(nodeFunc(t, "node.go", "Run"), func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !isIdent(call.Fun, "startNodeCache") || len(call.Args) < 2 {
+			return true
+		}
+		wait, ok := call.Args[len(call.Args)-2].(*ast.CallExpr)
+		given = ok && isIdent(wait.Fun, "nodeCacheSweepWait") && len(wait.Args) == 1 && isIdent(wait.Args[0], "handOver")
+
+		return true
+	})
+	if !given {
+		t.Error("the node starts its cache without nodeCacheSweepWait(handOver)")
+	}
+}
+
+// A HANDOVER WAITS FOR A SWEEP NO LONGER THAN ITS LISTENER, alongside which it
+// runs, because nothing renews the handed-over leases meanwhile; a drain waits
+// for the one unmap a cancelled sweep can still be running.
+func TestTheSweepWaitFitsTheStopPolicy(t *testing.T) {
+	t.Parallel()
+
+	if got := nodeCacheSweepWait(true); got > nodeCacheStopGrace(true) {
+		t.Errorf("a handover waits %v for a sweep, more than the listener's %v", got, nodeCacheStopGrace(true))
+	}
+	if got := nodeCacheSweepWait(false); got <= ceph.MapTimeout {
+		t.Errorf("a drain waits %v for a sweep, not past one unmap's bound %v", got, ceph.MapTimeout)
 	}
 }
 

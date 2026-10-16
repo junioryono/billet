@@ -39,13 +39,22 @@ type mapRig struct {
 	busy            map[string]bool
 	failWith        map[string]error
 	onUnmap         func()
+	// mappers is the node each volume records as the one that mapped it, absent
+	// for rigOwner; noMapper records none, and metaErr fails the read.
+	mappers  map[string]string
+	noMapper map[string]bool
+	metaErr  map[string]error
 }
+
+// rigOwner is the node a rig's client maps volumes for.
+const rigOwner = "deployment-a/node-1"
 
 func newMapRig(t *testing.T, table string, inSession func(string) bool, readErr error, noReader bool) (*Client, *mapRig) {
 	t.Helper()
 
-	rig := &mapRig{now: kernelMapsNow, busy: map[string]bool{}, failWith: map[string]error{}}
-	opts := []Option{WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+	rig := &mapRig{now: kernelMapsNow, busy: map[string]bool{}, failWith: map[string]error{},
+		mappers: map[string]string{}, noMapper: map[string]bool{}, metaErr: map[string]error{}}
+	opts := []Option{WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), WithMapOwner(rigOwner),
 		withRunner(func(ctx context.Context, _ string, args []string) ([]byte, error) {
 			joined := strings.Join(args, " ")
 
@@ -58,6 +67,20 @@ func newMapRig(t *testing.T, table string, inSession func(string) bool, readErr 
 				rig.lists++
 
 				return []byte(table), nil
+			case strings.HasPrefix(joined, "--id site-reader --format json image-meta list billet-cache/"):
+				name := strings.TrimPrefix(args[len(args)-1], "billet-cache/")
+				if err := rig.metaErr[name]; err != nil {
+					return nil, err
+				}
+				if rig.noMapper[name] {
+					return []byte(`{"billet.cache.lineage":"1"}`), nil
+				}
+				mapper, ok := rig.mappers[name]
+				if !ok {
+					mapper = rigOwner
+				}
+
+				return []byte(`{"billet.cache.lineage":"1","billet.cache.mapped_by":"` + mapper + `"}`), nil
 			case strings.HasPrefix(joined, "--id site-reader device unmap "):
 				spec := args[len(args)-1]
 				rig.unmaps = append(rig.unmaps, joined)
@@ -109,11 +132,14 @@ func newMapRig(t *testing.T, table string, inSession func(string) bool, readErr 
 }
 
 // nextPass moves the rig's clock on to the next pass that may unmap.
-func (r *mapRig) nextPass() {
+func (r *mapRig) nextPass() { r.advance(mapSightingGap) }
+
+// advance moves the rig's clock on by d.
+func (r *mapRig) advance(d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.now = r.now.Add(mapSightingGap)
+	r.now = r.now.Add(d)
 }
 
 func naming(names ...string) func(string) bool {
@@ -462,5 +488,103 @@ func TestAnUnmapThatFailsOtherwiseIsCouldNotTell(t *testing.T) {
 	}
 	if got := report.Count(MappingUnknown); got != 1 {
 		t.Errorf("%d could-not-tell, want 1: %+v", got, report.Mappings)
+	}
+}
+
+// A SECOND SIGHTING UNMAPS ONLY AN HOUR AFTER THE FIRST, whatever the passes
+// between: a pass at once, or a second short of the hour, unmaps nothing.
+func TestASecondSightingUnmapsOnlyAnHourAfterTheFirst(t *testing.T) {
+	t.Parallel()
+
+	leaked := volumeNamed(10*time.Hour, "a1")
+	c, rig := newMapRig(t, table(row("1", "billet-cache", leaked, "-")), naming(), nil, false)
+
+	for _, step := range []time.Duration{0, 0, 59*time.Minute + 59*time.Second} {
+		rig.advance(step)
+		if _, err := c.SweepKernelMappings(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if len(rig.unmaps) != 0 {
+			t.Fatalf("a mapping first seen unaccounted %v ago was unmapped: %q",
+				rig.now.Sub(kernelMapsNow), rig.unmaps)
+		}
+	}
+
+	rig.advance(time.Second)
+	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(rig.unmaps) != 1 {
+		t.Errorf("a mapping unaccounted for an hour by two sightings was not released: %q", rig.unmaps)
+	}
+}
+
+// ONLY THIS NODE'S VOLUME IS UNMAPPED: the mapping table is the host's and the
+// custody records this node's, so another identity's volume on the same host is
+// in none of them, and only the record of who mapped it tells the two apart. A
+// volume that records nobody, or another node, is kept without a failure; one
+// whose record cannot be read is could-not-tell.
+func TestTheSweepUnmapsOnlyAVolumeThisNodeMapped(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mine       = volumeNamed(10*time.Hour, "a1")
+		theirs     = volumeNamed(10*time.Hour, "b2")
+		unrecorded = volumeNamed(10*time.Hour, "c3")
+		unreadable = volumeNamed(10*time.Hour, "d4")
+	)
+
+	c, rig := newMapRig(t, table(
+		row("1", "billet-cache", mine, "-"), row("2", "billet-cache", theirs, "-"),
+		row("3", "billet-cache", unrecorded, "-"), row("4", "billet-cache", unreadable, "-"),
+	), naming(), nil, false)
+	rig.mappers[theirs] = "deployment-b/node-1"
+	rig.noMapper[unrecorded] = true
+	rig.metaErr[unreadable] = errors.New("rbd: error opening image: (2) No such file or directory")
+
+	if _, err := c.SweepKernelMappings(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	rig.nextPass()
+
+	report, err := c.SweepKernelMappings(t.Context())
+	if err == nil || !strings.Contains(err.Error(), unreadable) || strings.Contains(err.Error(), theirs) ||
+		strings.Contains(err.Error(), unrecorded) {
+		t.Errorf("want only the unreadable owner reported as a failure: %v", err)
+	}
+
+	if want := []string{"--id site-reader device unmap billet-cache/" + mine}; !slices.Equal(rig.unmaps, want) {
+		t.Fatalf("the sweep unmapped %q, want only this node's volume", rig.unmaps)
+	}
+
+	states := statesOf(report)
+	for name, want := range map[string]MappingState{
+		"/dev/rbd1 billet-cache//" + mine:       MappingUnmapped,
+		"/dev/rbd2 billet-cache//" + theirs:     MappingNotMine,
+		"/dev/rbd3 billet-cache//" + unrecorded: MappingNotMine,
+		"/dev/rbd4 billet-cache//" + unreadable: MappingUnknown,
+	} {
+		if got := states[name+"@-"]; got != want {
+			t.Errorf("%s: %q, want %q", name, got, want)
+		}
+	}
+}
+
+// A CLIENT THAT NAMES NO NODE UNMAPS NOTHING: nothing could prove a volume its.
+func TestTheSweepUnmapsNothingWithoutAnOwner(t *testing.T) {
+	t.Parallel()
+
+	c, rig := newMapRig(t, table(row("1", "billet-cache", volumeNamed(10*time.Hour, "a1"), "-")),
+		naming(), nil, false)
+	c.owner = ""
+
+	for range 2 {
+		if _, err := c.SweepKernelMappings(t.Context()); err == nil || !strings.Contains(err.Error(), "names no node") {
+			t.Errorf("a client with no owner swept: %v", err)
+		}
+		rig.nextPass()
+	}
+	if len(rig.unmaps) != 0 {
+		t.Errorf("a client with no owner unmapped %q", rig.unmaps)
 	}
 }
