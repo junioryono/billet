@@ -169,6 +169,37 @@ func TestTheBuildChecksTheDigestRunnerDigestResolved(t *testing.T) {
 	}
 }
 
+// AND ASKS IT FOR THE ARCHITECTURE THE BUILD NAMES, through the command line: an
+// arm64 build given x64's pin is refused before the config is read, and given its
+// own it gets past the runner rule to the config this test withholds.
+func TestAnArm64BuildIsHeldToArm64sDigest(t *testing.T) {
+	t.Parallel()
+
+	x64, _ := runnerrelease.PinnedSHA256For("linux-x64")
+	arm64, ok := runnerrelease.PinnedSHA256For("linux-arm64")
+	if !ok {
+		t.Fatal("runnerrelease pins nothing for linux-arm64")
+	}
+
+	missing := filepath.Join(t.TempDir(), "absent.yaml")
+
+	build := func(digest string) error {
+		return AMI(t.Context(), processEnv(), []string{"build", "--config", missing,
+			"--base-image", "ami-base", "--payload-bucket", "bucket", "--arch", "arm64",
+			"--runner-sha256", digest})
+	}
+
+	err := build(x64)
+	if err == nil || !strings.Contains(err.Error(), "is not the digest billet pins for actions-runner-linux-arm64-") {
+		t.Errorf("an arm64 build with x64's digest was not refused for it: %v", err)
+	}
+
+	err = build(arm64)
+	if err == nil || !strings.Contains(err.Error(), "no ec2 configuration found in "+missing) {
+		t.Errorf("an arm64 build with arm64's digest did not reach the config this test withheld: %v", err)
+	}
+}
+
 // AND `billet ami build` ASKS IT, before the config is read and before anything
 // is bought. The config path here does not exist, so a build that reached the
 // config would refuse for that instead; the runner's refusal arriving first is
