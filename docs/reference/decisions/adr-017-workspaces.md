@@ -1,6 +1,6 @@
 # ADR-017: Workspaces, long-lived environments forked from a warm snapshot
 
-Proposed, 2026-10-16. Nothing here is implemented, and nothing here is measured yet: every fact below about Firecracker is a reading of its documentation, which a house rule says is not enough, so each one is listed under Measure before this is accepted. Relates to issue #28: accepting this record revises the exposure rule #28 states for HTTP views (see The edge), and its attach transport is meant to serve #28's SSH item too.
+Proposed, 2026-10-16. Nothing here is implemented. The Firecracker facts it rests on were first a reading of the documentation; those the [workspace snapshots record](../records/workspace-snapshots.md) has since measured (2026-10-16, v1.16.1) are marked so under Measure before accepting, and the rest are still to be measured before this is accepted. Relates to issue #28: accepting this record revises the exposure rule #28 states for HTTP views (see The edge), and its attach transport is meant to serve #28's SSH item too.
 
 ## Context
 
@@ -54,7 +54,7 @@ Only an authorised golden builder, or the custodian assigned to that workspace, 
 - **After restore:**
   - the barrier holds until the agent has proved the kernel reseeded from the VMGenID notification;
   - the agent sets the guest's wall clock to the current time through a measured mechanism, because a restored clock continues from snapshot time (an aged golden or a long suspension would otherwise start TLS and credential checks in the past), and an unknown result holds the barrier;
-  - the agent then regenerates per-fork identity (machine id, host keys, hostname, the Docker daemon's identity);
+  - the agent then regenerates per-fork identity (machine id, host keys, hostname, the Docker daemon's identity). `boot_id` is the same in every fork and cannot be changed from userspace (measured), so nothing may rely on it to tell forks apart;
   - only then do services start.
 - **Services:** a service with clone-sensitive state (a database's system identifier, a TLS server or client session, a persistent random seed, a cached token) is reinitialised through a procedure measured for that service, or is not in the golden at all and starts fresh after restore.
 - **No guess:** a golden whose services include one billet cannot classify is refused at publication.
@@ -180,17 +180,26 @@ Everything else stays where it is. A team that wants all five private puts the c
 ## Measure before accepting
 
 Each is a probe on the reference Firecracker host, recorded here with the Firecracker version, the guest kernel and the date:
-- **Speed and memory:** the time from a create request to a healthy stack, at 1, 5, 10 and 20 concurrent workspaces; memory per workspace and how much is shared.
-- **Reseeding:**
-  - the restore barrier holds every application process until the guest kernel reseeds from VMGenID with the kernel billet ships;
+- **Speed and memory:** *mechanics measured:*
+  - load takes 4 to 5 ms;
+  - a fork's agent answers 31 to 38 ms after its process starts, and 10 concurrent forks take 0.52 s;
+  - each fork dirties about 11.5 MiB, and 10 forks were 227 MiB PSS together.
+
+  Still to measure: the time from a create request to a healthy application stack at 1, 5, 10 and 20 concurrent workspaces.
+- **Reseeding:** *partly measured:*
+  - the guest kernel billet ships binds Firecracker's VMGenID device, and its random output differed in 10 of 10 forks;
+  - a userspace RNG seeded before capture returned the same value in every fork, which is the case the barrier exists for.
+
+  Still to measure:
+  - the restore barrier holds every application process until the guest kernel reseeds from VMGenID;
   - the reseed is observable to the agent;
   - each service in the reference golden either reinitialises its clone-sensitive state by a named procedure or is excluded.
 - **MMDS and configuration:**
-  - logging and metrics configured on a fresh VMM before load take effect;
-  - the MMDS data store is empty after a paused load and accepts a document before resume;
+  - *measured:* logging and metrics configured on a fresh VMM before load are accepted (`204`), and after load both are refused with `400`;
+  - *measured:* the MMDS data store is `{}` after a paused load and accepts a document before resume;
   - a suspension restored after its previous repository token expired runs with a fresh one.
 - **Integrity:** a substituted component, a mix of two generations and a bundle from another deployment are each refused before load.
-- **Pinning:** replacing a golden and cleaning up a consumed suspension while workspaces still run from them leaves their memory intact.
+- **Pinning:** *the mechanism measured:* replacing a running fork's memory file by rename leaves the fork intact, and truncating it in place ends its VMM within a second. Still to measure: billet's own rebuild and cleanup leave running workspaces intact.
 - **Storage admission:**
   - create, fork and suspend at the storage limit are refused without touching existing work;
   - a running guest filling its disks or its home stops at its reservation;
@@ -198,15 +207,15 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
 - **Fresh code:** with the golden, the source workspace and the fork each answering with a distinguishable response (an uncommitted change in the source included), each workspace's preview serves its own checkout.
 - **Revocation:** revoking access while an attach terminal and a preview WebSocket are open ends both.
 - **Network:**
-  - a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay;
+  - *measured within the namespace:* every fork, each in its own namespace with the golden's tap name and address, answered HTTP from inside that namespace. Still to measure: reachability through its veth from the relay;
   - a direct connection to its services from another workspace or from a physical-network peer fails.
 - **vsock:**
-  - a vsock listener in the guest survives restore with its CID updated, as documented;
-  - an established attach stream is closed by the restore;
+  - *measured:* a vsock listener in the guest survives a snapshot;
+  - *measured:* an established connection is closed by a snapshot of the running VM (the next read returns end of file);
   - the agent and the relay recover it.
-- **The memory file in a jail:** how it reaches each jail without handing a hard link to a jailed uid (a read-only bind mount, or a copy, measured for cost).
+- **The memory file in a jail:** *measured.* A hard link into the chroot, root-owned and mode 0444 as the kernel is, restores under the jailer, and the jailed uid can read it but not write it. A golden's memory file reaches a jail that way. A suspension's is confidential, so it needs a mode only its own VM can read; that is still to be measured.
 - **Compatibility:** a golden with a mismatched or unreadable fingerprint is refused by billet before load, and a matching one restores.
-- **Clock:** after restoring an aged golden and a long suspension, the guest's wall clock is current before the barrier releases, with whatever the chosen Firecracker clock mechanism requires of the host.
+- **Clock:** *measured:* the guest's wall clock continues from the moment of capture, 64 to 75 s behind for forks restored a minute later. Still to measure: after restoring an aged golden and a long suspension, the guest's wall clock is current before the barrier releases, with whatever the chosen Firecracker clock mechanism requires of the host.
 - **Disks:**
   - replacing a restored golden's placeholder slot with a workspace volume through the existing-drive update works, covering device sizing, cached reads and writes and repeated restores;
   - an old workspace volume mounts after journal recovery for the fallback.
