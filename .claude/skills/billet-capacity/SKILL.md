@@ -44,6 +44,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A drain is two barriers, and the second asks the machines.**
 - **An unsealed server stop is a handoff, not a drain (#365, #368).**
 - **A node hands over on a stop only when its config says so (#374).**
+- **A launch that has begun is finished, not cancelled, by a stop (#393).**
 - **A clean exit withdraws; silence still means nothing.**
 - **A restart waits for its own message session, and so does a failover.**
 - **A tier whose session fails keeps everything it holds while it reopens (#207).**

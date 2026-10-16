@@ -1117,10 +1117,25 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
 
+	// A LAUNCH ALREADY EXECUTING FINISHES; THE STOP DOES NOT CANCEL IT (#393). A
+	// stop cut the first live handover's launch off while it sized its root disk,
+	// which wasted the launch, held its capacity in quarantine for minutes and
+	// read like a storage fault, when the launch was seconds of work. Only the
+	// operator's second signal cancels one.
+	launchCtx, endLaunches := launchContext(ctx, opts.Hurry)
+
 	// EVERY LAUNCH STARTED HERE IS REPORTED BEFORE serve RETURNS, so a
-	// re-registration never runs beside a launch begun under the last one.
+	// re-registration never runs beside a launch begun under the last one. The
+	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
-	defer launches.wait()
+	defer func() {
+		if n := launches.running(); n > 0 && ctx.Err() != nil {
+			log.Info("waiting for the launches already running to finish before stopping; a second "+
+				"signal cancels them", "launches", n)
+		}
+		launches.wait()
+		endLaunches()
+	}()
 
 	// CUSTODY IS ADVANCED BY ONE CALLER AT A TIME. A launch whose report is lost
 	// takes custody from its own goroutine, and the custody it creates can settle
@@ -1213,7 +1228,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// destroy run under a fresh, bounded context so shutdown can still converge.
 		run := func() error {
 			return reportOutcome(ctx, c, compute, log, &custody, cmd,
-				executePolled(ctx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+				executePolled(ctx, launchCtx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1235,6 +1250,24 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			return err
 		}
 	}
+}
+
+// launchContext is what a launch runs under once it has begun: ctx's values
+// without its cancellation, ended by hurry (the operator's second signal) or by
+// the returned cancel, which the caller runs once every launch has returned.
+func launchContext(ctx context.Context, hurry <-chan struct{}) (context.Context, context.CancelFunc) {
+	launchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if hurry != nil {
+		go func() {
+			select {
+			case <-hurry:
+				cancel()
+			case <-launchCtx.Done():
+			}
+		}()
+	}
+
+	return launchCtx, cancel
 }
 
 // reportOutcome reports what one command did, taking custody of a launch whose
@@ -1302,12 +1335,14 @@ func reportOutcome(
 // staging either over a real wire would mean building a deliberately wrong
 // control plane to test a node.
 func ExecuteForTest(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
-	return executePolled(ctx, compute, cmd, false, requestTimeout, nodeapi.Version)
+	return executePolled(ctx, ctx, compute, cmd, false, requestTimeout, nodeapi.Version)
 }
 
-// executePolled settles the shutdown boundary before a command starts.
+// executePolled settles the shutdown boundary before a command starts: the
+// poll's context decides it, and a launch that passes it runs under launchCtx,
+// which the stop does not cancel.
 func executePolled(
-	ctx context.Context,
+	ctx, launchCtx context.Context,
 	compute Compute,
 	cmd nodeapi.Command,
 	draining bool,
@@ -1315,6 +1350,10 @@ func executePolled(
 	negotiated int,
 ) nodeapi.CommandResult {
 	if ctx.Err() == nil {
+		if cmd.Kind == nodeapi.CommandLaunch {
+			return execute(launchCtx, compute, cmd, draining, negotiated)
+		}
+
 		return execute(ctx, compute, cmd, draining, negotiated)
 	}
 
