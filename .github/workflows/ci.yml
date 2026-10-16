@@ -85,7 +85,13 @@ jobs:
       BILLET_TEST_POSTGRES_ELSEWHERE: test-postgres
 
     steps:
+      # THE WHOLE HISTORY AND ITS TAGS, because the actions suite asks
+      # scripts/release-ref.sh which release this tree is, and on a release
+      # branch the answer is a tag a one-commit clone does not have. The resolver
+      # refuses a shallow clone rather than reading it as main. 25 MiB packed.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
@@ -509,7 +515,10 @@ jobs:
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
+      # The whole history, for `make module-sources`: see the test job.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:

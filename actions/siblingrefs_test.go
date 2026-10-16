@@ -1,7 +1,9 @@
 package actions_test
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -23,20 +25,25 @@ var siblingRef = regexp.MustCompile(
 // behind, with nobody having done anything wrong and nothing saying so.
 //
 // THIS ASSERTS THE TREE'S HALF, and check-release-metadata.sh asserts the
-// release's. In the repository a sibling is `@main`, so main composes main; at
-// release time cut-release.yml rewrites every one to the tag being cut, before
-// the tag exists, so a released action composes exactly its own release. Both are
-// the same rule — resolve to the billet you are part of — but they are checked in
-// different places because they run at different times, and duplicating the
-// release check here would be a second implementation to keep in step with the
-// first.
+// release's. On main a sibling is `@main`, so main composes main; at release time
+// cut-release.yml rewrites every one to the tag being cut, before the tag exists,
+// so a released action composes exactly its own release. Both are the same rule —
+// resolve to the billet you are part of — but they are checked in different
+// places because they run at different times, and duplicating the release check
+// here would be a second implementation to keep in step with the first.
 //
 // THE TREE'S HALF IS THE ONE THAT WAS MISSING. The release gate has always
 // existed and always passed, because the rewrite runs immediately before it; what
 // nothing checked was main, where the refs sat on v0.3.26 for as long as it took
 // somebody to notice.
-func TestBundledActionsComposeMainInTheTree(t *testing.T) {
-	const want = "main"
+//
+// WHICH BILLET THE TREE IS COMES FROM scripts/release-ref.sh, the answer
+// check-module-sources.sh takes too: `main` on main, and on a release branch the
+// tag cut-release.yml rewrote these to. This test used to expect `main`
+// everywhere, so CI on a release branch failed because the branch was right
+// (#149), and every carry merged through a red run nobody could read.
+func TestBundledActionsComposeTheReleaseTheTreeIs(t *testing.T) {
+	want := treeReleaseRef(t)
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -71,10 +78,12 @@ func TestBundledActionsComposeMainInTheTree(t *testing.T) {
 
 			t.Errorf("%s composes %s@%s, want @%s.\n"+
 				"A bundled action must resolve to the same billet as the action that "+
-				"calls it. In the tree that is @main; a release tag gets there by "+
-				"cut-release.yml rewriting these before it tags, so a version left "+
-				"behind here means every consumer following main runs the outer action "+
-				"from main and the inner ones from an old release.",
+				"calls it. On main that is @main, and on a release branch the tag "+
+				"cut-release.yml rewrote these to; scripts/release-ref.sh says which "+
+				"this tree is (a release branch checked out without its tags reads as "+
+				"main). A version left behind on main means every consumer following "+
+				"main runs the outer action from main and the inner ones from an old "+
+				"release.",
 				path, sibling, ref, want)
 		}
 	}
@@ -88,6 +97,37 @@ func TestBundledActionsComposeMainInTheTree(t *testing.T) {
 			"stopped composing each other, or the pattern this test matches on no " +
 			"longer describes how they do it")
 	}
+}
+
+// treeReleaseRef is the ref scripts/release-ref.sh says this tree's references
+// must name. Its refusal (a shallow clone, no repository) fails the test with
+// the reason, because a tree whose release cannot be told is not one to assume.
+func treeReleaseRef(t *testing.T) string {
+	t.Helper()
+
+	resolver, err := filepath.Abs(filepath.Join("..", "scripts", "release-ref.sh"))
+	if err != nil {
+		t.Fatalf("absolute resolver path: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), resolver)
+	cmd.Dir = ".."
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("scripts/release-ref.sh could not say which release this tree is: %v\n%s",
+			err, stderr.String())
+	}
+
+	ref := strings.TrimSuffix(string(out), "\n")
+	if ref == "" || strings.ContainsAny(ref, " \t\n") {
+		t.Fatalf("scripts/release-ref.sh answered %q, which is not one ref", out)
+	}
+
+	return ref
 }
 
 // THE REWRITE MUST BE ABLE TO SEE EVERY REF IT HAS TO CHANGE.
