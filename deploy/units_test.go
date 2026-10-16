@@ -658,13 +658,26 @@ func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
 			"ProtectSystem=strict it cannot take the host lock there", deploy.NodeUnitName, entries, deploy.NodeLockDir)
 	}
 
-	for key, want := range map[string]string{
-		"RuntimeDirectory":         strings.TrimPrefix(deploy.NodeLockDir, "/run/"),
-		"RuntimeDirectoryMode":     "0750",
-		"RuntimeDirectoryPreserve": "yes",
+	// THE ROLE'S COPY IS READ BY THE SAME PARSER: it renders no variables, so
+	// the template is the unit, and unit-parity's line patterns cannot follow a
+	// continuation or a second [Service] the way systemd does.
+	role, err := os.ReadFile("../ansible_collections/junioryono/billet/roles/host/templates/billet-images-refresh.service.j2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, unit := range map[string]string{
+		deploy.ImagesRefreshUnitName:  deploy.ImagesRefreshUnit,
+		"the role's refresh template": string(role),
 	} {
-		if got := serviceAssignments(deploy.ImagesRefreshUnit, key); !slices.Equal(got, []string{want}) {
-			t.Errorf("%s assigns %s=%q, want exactly %q in [Service]", deploy.ImagesRefreshUnitName, key, got, want)
+		for key, want := range map[string]string{
+			"RuntimeDirectory":         strings.TrimPrefix(deploy.NodeLockDir, "/run/"),
+			"RuntimeDirectoryMode":     "0750",
+			"RuntimeDirectoryPreserve": "yes",
+		} {
+			if got := serviceAssignments(unit, key); !slices.Equal(got, []string{want}) {
+				t.Errorf("%s assigns %s=%q, want exactly %q in [Service]", name, key, got, want)
+			}
 		}
 	}
 }
@@ -744,17 +757,31 @@ func TestThePackageAndTheRoleInstallOneTmpfilesEntry(t *testing.T) {
 // PARSED RATHER THAN SEARCHED, because a directive named in a COMMENT satisfies
 // a substring search: the first version of the rule above passed against a unit
 // with the preserve deleted, on the strength of the comment that explains why it
-// has to be there.
+// has to be there. A lone carriage return ends a line and a trailing backslash
+// continues one, as systemd's parser reads them: a continuation folds the next
+// line into the assignment it ends, so a directive on that next line is no
+// directive.
 func serviceAssignments(unit, key string) []string {
 	var out []string
 
 	section := ""
+	pending := ""
+
+	unit = strings.ReplaceAll(strings.ReplaceAll(unit, "\r\n", "\n"), "\r", "\n")
 
 	for line := range strings.Lines(unit) {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		if line == "" && pending == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
+
+		if continued, ok := strings.CutSuffix(line, `\`); ok {
+			pending += continued + " "
+
+			continue
+		}
+
+		line, pending = pending+line, ""
 
 		if strings.HasPrefix(line, "[") {
 			section = line
@@ -786,6 +813,11 @@ func TestServiceAssignmentsReadsAssignmentsAndNotProse(t *testing.T) {
 		{"back in [Service]", "[Unit]\nX=1\n[Service]\nRuntimeDirectoryPreserve=no\n", []string{"no"}},
 		{"every assignment, in order", "[Service]\nRuntimeDirectoryPreserve=yes\nRuntimeDirectoryPreserve=no\n", []string{"yes", "no"}},
 		{"a longer key is not this one", "[Service]\nRuntimeDirectoryPreserveMore=yes\n", nil},
+		{"indented, in a second [Service]", "[Service]\nRuntimeDirectoryPreserve=yes\n[Install]\n[Service]\n  RuntimeDirectoryPreserve = no\n",
+			[]string{"yes", "no"}},
+		{"folded into the line before", "[Service]\nEnvironment=A=1 \\\nRuntimeDirectoryPreserve=yes\n", nil},
+		{"a lone carriage return ends a line", "[Service]\nX=1\r[Install]\nRuntimeDirectoryPreserve=yes\n", nil},
+		{"a continuation ends", "[Service]\nEnvironment=A=1 \\\n  B=2\nRuntimeDirectoryPreserve=yes\n", []string{"yes"}},
 	} {
 		if got := serviceAssignments(tc.unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)

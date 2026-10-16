@@ -425,7 +425,8 @@
     # while systemd ignores the setting entirely — and an ignored preserve means
     # the refresh removes the host lock directory every time it finishes, under
     # a running node's lock (#175). These three are checked where they must be;
-    # the packaged copy is pinned the same way in deploy/units_test.go. The
+    # deploy/units_test.go parses both copies as systemd does, a continuation
+    # and a second [Service] included, which these line patterns cannot. The
     # [Service] section ends at the next section header, so a directive moved
     # into a trailing [Unit] or [Install] is outside it. Read as systemd reads
     # it: a line may be indented and space its '=', and the LAST assignment in
