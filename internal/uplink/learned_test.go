@@ -232,17 +232,25 @@ func TestTheStepperRemembersOnlyAppliedRates(t *testing.T) {
 		t.Errorf("record told %v, want the applied %v", remembered[told:], st.applied)
 	}
 
-	// AND THE CUT SAYS WHAT THE GATEWAY MEASURED.
+	// AND THE CUT SAYS WHAT THE GATEWAY MEASURED, and the confirmed stall it was
+	// cut on: past Bloat, and no more than this round's reading, being the lesser
+	// of two.
 	said := false
 	for _, rec := range logs.list {
-		if strings.HasSuffix(rec.Message, "; cut") {
-			if v, ok := attrs(rec)["gateway_delay"]; ok && v.Kind() == slog.KindDuration {
-				said = true
-			}
+		if !strings.HasSuffix(rec.Message, "; cut") {
+			continue
+		}
+
+		a := attrs(rec)
+		reading, read := a["gateway_delay"]
+		stall, stalled := a["gateway_stall"]
+		if read && stalled && reading.Kind() == slog.KindDuration && stall.Kind() == slog.KindDuration &&
+			stall.Duration() > ctl.Params.Bloat && stall.Duration() <= reading.Duration() {
+			said = true
 		}
 	}
 	if !said {
-		t.Error("no cut logged the gateway's measured rise")
+		t.Error("no cut logged the gateway's measured rise beside the confirmed stall it was cut on")
 	}
 }
 

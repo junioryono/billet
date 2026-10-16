@@ -166,27 +166,74 @@ func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 			d.cutGateway, d.cutReflectors)
 	}
 
-	for name, c := range map[string]struct {
-		o    Observation
-		want bool
+	// EACH READING BESIDE THE ONE BEFORE IT, half a second earlier, as the
+	// controller pairs them: the gateway is evidence only on two readings.
+	ms := time.Millisecond
+	round := func(reflectors, before time.Duration, now Sample) (verdict, Observation) {
+		k := &Controller{Params: c.Params, lastGateway: measured{before, true}, lastGatewayAt: at(8)}
+		o := withGateway(moving(9, 5, 400, reflectors), now)
+
+		return verdict{gateway: k.readGateway(o)}, o
+	}
+
+	for name, tc := range map[string]struct {
+		reflectors, before time.Duration
+		now                Sample
+		forgetReflectors   bool
+		shortened, judged  bool
 	}{
-		"the gateway's stall fell to 20 ms": {
-			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(20*time.Millisecond)), true},
-		"the gateway's stall stayed at 59 ms": {
-			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(59*time.Millisecond)), false},
+		"the gateway's stall fell to 20 ms":   {20 * ms, 22 * ms, gatewayRose(20 * ms), false, true, true},
+		"the gateway's stall stayed at 59 ms": {20 * ms, 61 * ms, gatewayRose(59 * ms), false, false, true},
 		// A FIFTH OF ITS 60 MS, NOT A TENTH: one ping wanders more than a median.
-		"the gateway's stall read 50 ms": {
-			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(50*time.Millisecond)), false},
+		"the gateway's stall read 50 ms": {20 * ms, 52 * ms, gatewayRose(50 * ms), false, false, true},
+		// JUDGED BY THE PAIR'S LESSER READING, as the cut was: 70 beside 45.
+		"the gateway's stall wandered 45 to 70 ms": {20 * ms, 45 * ms, gatewayRose(70 * ms), false, true, true},
 		// SOURCE AGAINST SOURCE: the reflectors' unchanged 20 ms is not a shorter
 		// 60 ms stall, though the gateway went unanswered.
 		"the gateway went unanswered and the reflectors stayed": {
-			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayLost()), false},
+			20 * ms, 60 * ms, gatewayLost(), false, false, true},
 		"the reflectors fell to 12 ms beside a gateway still stalled": {
-			withGateway(moving(9, 5, 400, 12*time.Millisecond), gatewayRose(60*time.Millisecond)), true},
+			12 * ms, 60 * ms, gatewayRose(60 * ms), false, true, true},
+		// ONE REPLY SLIPPING THROUGH A STALL IS NOT THE STALL GONE; TWO ARE.
+		"one quiet reply beside a stalled one": {20 * ms, 60 * ms, gatewayRose(ms), false, false, true},
+		"two quiet replies":                    {20 * ms, 2 * ms, gatewayRose(ms), false, true, true},
+		// NEITHER SOURCE MEASURED THEN AND NOW: a cut that kept no reflectors'
+		// delay, and a gateway that gave no reading.
+		"nothing measured both then and now": {20 * ms, 60 * ms, gatewayLost(), true, false, false},
+		"only the gateway measured both":     {20 * ms, 61 * ms, gatewayRose(59 * ms), true, false, true},
 	} {
-		if got := helped(d, verdict{}, c.o); got != c.want {
-			t.Errorf("%s: helped %v, want %v", name, got, c.want)
+		v, o := round(tc.reflectors, tc.before, tc.now)
+		cut := *d
+		if tc.forgetReflectors {
+			cut.cutReflectors = measured{}
 		}
+
+		if shortened, judged := helped(&cut, v, o); shortened != tc.shortened || judged != tc.judged {
+			t.Errorf("%s: helped %v, judged %v; want %v, %v", name, shortened, judged, tc.shortened, tc.judged)
+		}
+	}
+
+	// A QUIET PAIR IS JUDGED BY ITS GREATER READING: 14 ms beside 1 ms is not a
+	// fifth under a stall of 17 ms cut on just past Bloat.
+	cut := *d
+	cut.cutReflectors, cut.cutGateway = measured{}, measured{17 * ms, true}
+	v, o := round(20*ms, 14*ms, gatewayRose(ms))
+	if shortened, judged := helped(&cut, v, o); shortened || !judged {
+		t.Errorf("a quiet pair of 14 and 1 ms against a 17 ms stall judged helped %v, judged %v; want false, true",
+			shortened, judged)
+	}
+
+	// THE SAME REFLECTORS ASKED THEN AND NOW JUDGE A CUT BY THEIR LOSS, though no
+	// delay was measured both times.
+	cut = *d
+	cut.cutReflectors = measured{}
+	v, o = round(20*ms, 60*ms, gatewayLost())
+	v.tally = cut.cutTally
+	if len(cut.cutTally) == 0 {
+		t.Fatal("the cut kept no tally of its reflectors' probes")
+	}
+	if shortened, judged := helped(&cut, v, o); shortened || !judged {
+		t.Errorf("an unchanged loss judged helped %v, judged %v; want false, true", shortened, judged)
 	}
 }
 

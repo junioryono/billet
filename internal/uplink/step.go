@@ -137,6 +137,9 @@ func (s *stepper) tick(ctx context.Context) error {
 		}
 		if s.prober.Gateway() != "" {
 			attrs = append(attrs, gatewayAttr(gateway))
+			if ctl.cutStall.known {
+				attrs = append(attrs, slog.Duration("gateway_stall", ctl.cutStall.delay))
+			}
 		}
 
 		s.log.LogAttrs(ctx, slog.LevelInfo, cutMessage(ctl.Cause), attrs...)
