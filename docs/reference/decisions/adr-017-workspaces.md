@@ -14,6 +14,11 @@ A coding agent now opens many changes in parallel, and each one is only verifiab
 
 **A workspace is a resource of its own, not a lease with a longer TTL.** It is owned by one user in one organisation, it lives until it is removed, and it is never charged to a tier's escrow or advertised to GitHub. It is still bought before compute exists and released only on proof the compute is gone, through the same placement, capacity vector and custody rules a lease follows. A workspace's compute is a set of new command kinds on the node wire (launch from a golden, fork, suspend, resume, destroy), so a node that does not speak them is never sent one.
 
+**Storage is admitted separately from compute.** A suspension releases compute and keeps its snapshot and disks, so compute capacity alone bounds nothing on storage. Persistent storage is therefore admitted under deployment and owner limits:
+- create, fork and suspend each reserve the storage they need, temporary capture space included, before writing;
+- a suspension keeps its storage charge after its compute is released;
+- insufficient or unknown headroom refuses the operation and never deletes existing work.
+
 **Only explicit requests stop or delete a workspace.** Idle time produces a warning to the owner and a suspension recommendation; it never stops the VM, because a timer never authorises a teardown and an idle observation does not prove that a background agent or an outside operation has finished. Suspending and deleting are requests that name the workspace, made by its owner or an operator. Any automatic policy would be a change to that invariant, made in a record of its own.
 
 ### Goldens, and making a fork unique
@@ -30,6 +35,16 @@ Nothing billet carries from one workspace into another goes on the system disk.
 
 **A golden is pinned to a compatibility fingerprint, and billet refuses a mismatch before loading.** Firecracker requires a restore on the software and hardware configuration a snapshot was taken on; that is a requirement on the integrator, not a refusal Firecracker promises to make. So every golden records a fingerprint (CPU model and configuration, host kernel, Firecracker build, guest kernel), and billet compares it with the host's before invoking a load; a mismatch, or a fingerprint it cannot read, refuses. A host whose fingerprint changes builds new goldens.
 
+**A snapshot is authenticated, not only compatible.** Firecracker treats snapshot files as trusted input, and a compatible fingerprint says nothing about who wrote the bytes. Before any load, billet verifies an authenticated manifest that binds every component (memory, VM state, disks) to:
+- its generation;
+- its fingerprint;
+- its deployment;
+- its permitted scope (a golden's repository, or one workspace).
+
+Only an authorised golden builder, or the custodian assigned to that workspace, may publish one. Missing, mismatched or unreadable evidence refuses the load.
+
+**A memory file is immutable and pinned while anything runs from it.** A restored VMM keeps faulting pages from its memory file for as long as it runs, so a consumed suspension's file is not expendable. Published memory files are immutable to the host and to every jailed process. Every loaded VMM pins its backing generation until there is positive proof the VMM is gone, and an unknown outcome keeps the pin. A rebuild or a new capture writes new files and never overwrites, truncates or repurposes a pinned one.
+
 **Nothing in a warmed stack is trusted to be unique, so nothing runs until it is made so.** Firecracker's documentation calls resuming one state more than once insecure: identifiers, seeds, the entropy pool and any token in memory are replicated into every restore, VMGenID reseeds only the guest kernel, and userspace can run before the reseed lands. So:
 - **Before capture:** every application process is stopped at a restore barrier the guest agent holds, the guest's network is down, and the golden holds no credential, key or token of any kind.
 - **After restore:**
@@ -42,11 +57,13 @@ Nothing billet carries from one workspace into another goes on the system disk.
 
 TLS for previews terminates at the edge, so no fork serves with a private key a golden held.
 
-**Per-fork state is delivered after load and before resume.**
-1. Logging and metrics are configured on each fresh VMM before the snapshot is loaded, because they are not in a snapshot and Firecracker accepts that configuration only before load.
+**Every load follows one sequence, a suspension's included.**
+1. Logging and metrics are configured on the fresh VMM before the snapshot is loaded, because they are not in a snapshot and Firecracker accepts that configuration only before load.
 2. The snapshot is loaded paused.
-3. The fork is given its MMDS document (its identity, its repository token, its model-credential source, its task), since the MMDS data store does not survive a snapshot.
-4. Only then is it resumed.
+3. Current, authorised MMDS data is installed (identity, a freshly minted repository token, the model-credential source, the task), since the MMDS data store does not survive any load.
+4. Only then is the VM resumed.
+
+A fork gets a new identity; a resumed suspension keeps its own but still gets fresh credentials and metadata. A missing or unknown step refuses the resume.
 
 **A fork's network is its own namespace.** A restored guest keeps the address and tap name the golden had, so every workspace runs in a network namespace of its own with that tap name inside it, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests.
 
@@ -129,7 +146,11 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - each service in the reference golden either reinitialises its clone-sensitive state by a named procedure or is excluded.
 - **MMDS and configuration:**
   - logging and metrics configured on a fresh VMM before load take effect;
-  - the MMDS data store is empty after a paused load and accepts a document before resume.
+  - the MMDS data store is empty after a paused load and accepts a document before resume;
+  - a suspension restored after its previous repository token expired runs with a fresh one.
+- **Integrity:** a substituted component, a mix of two generations and a bundle from another deployment are each refused before load.
+- **Pinning:** replacing a golden and cleaning up a consumed suspension while workspaces still run from them leaves their memory intact.
+- **Storage admission:** create, fork and suspend at the storage limit are refused without touching existing work.
 - **Network:** a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay.
 - **vsock:**
   - a vsock listener in the guest survives restore with its CID updated, as documented;
