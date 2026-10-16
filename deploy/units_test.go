@@ -666,6 +666,14 @@ func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The template is the unit only while Jinja has nothing to render in it.
+	for _, delimiter := range []string{"{{", "{%", "{#"} {
+		if strings.Contains(string(role), delimiter) {
+			t.Errorf("the role's refresh template carries the Jinja delimiter %q, so it is not the unit it renders",
+				delimiter)
+		}
+	}
+
 	for name, unit := range map[string]string{
 		deploy.ImagesRefreshUnitName:  deploy.ImagesRefreshUnit,
 		"the role's refresh template": string(role),
@@ -761,40 +769,69 @@ func TestThePackageAndTheRoleInstallOneTmpfilesEntry(t *testing.T) {
 // continues one, as systemd's parser reads them: a continuation folds the next
 // line into the assignment it ends, so a directive on that next line is no
 // directive.
+//
+// The line handling follows systemd 255's config_parse: a line continues when
+// it ends in an UNESCAPED backslash (counted over the line as joined so far,
+// before any trimming), the backslash becomes a space, a comment line inside a
+// continuation is skipped, the joined line is trimmed before it is read as a
+// section or an assignment, and a continuation still open at the end of the
+// file is read as it stands.
 func serviceAssignments(unit, key string) []string {
 	var out []string
 
 	section := ""
-	pending := ""
 
-	unit = strings.ReplaceAll(strings.ReplaceAll(unit, "\r\n", "\n"), "\r", "\n")
-
-	for line := range strings.Lines(unit) {
+	parse := func(line string) {
 		line = strings.TrimSpace(line)
-		if line == "" && pending == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			return
 		}
-
-		if continued, ok := strings.CutSuffix(line, `\`); ok {
-			pending += continued + " "
-
-			continue
-		}
-
-		line, pending = pending+line, ""
 
 		if strings.HasPrefix(line, "[") {
 			section = line
 
-			continue
+			return
 		}
 
 		k, v, ok := strings.Cut(line, "=")
-		if !ok || section != "[Service]" || strings.TrimSpace(k) != key {
+		if ok && section == "[Service]" && strings.TrimSpace(k) == key {
+			out = append(out, strings.TrimSpace(v))
+		}
+	}
+
+	unit = strings.ReplaceAll(strings.ReplaceAll(unit, "\r\n", "\n"), "\r", "\n")
+
+	continuation, continued := "", false
+
+	for line := range strings.Lines(unit) {
+		line = strings.TrimSuffix(line, "\n")
+
+		if continued {
+			if lead := strings.TrimLeft(line, " \t"); strings.HasPrefix(lead, "#") || strings.HasPrefix(lead, ";") {
+				continue
+			}
+
+			line = continuation + line
+		}
+
+		escaped := false
+		for _, c := range line {
+			escaped = !escaped && c == '\\'
+		}
+
+		if escaped {
+			continuation, continued = line[:len(line)-1]+" ", true
+
 			continue
 		}
 
-		out = append(out, strings.TrimSpace(v))
+		continuation, continued = "", false
+
+		parse(line)
+	}
+
+	if continued {
+		parse(continuation)
 	}
 
 	return out
@@ -818,6 +855,15 @@ func TestServiceAssignmentsReadsAssignmentsAndNotProse(t *testing.T) {
 		{"folded into the line before", "[Service]\nEnvironment=A=1 \\\nRuntimeDirectoryPreserve=yes\n", nil},
 		{"a lone carriage return ends a line", "[Service]\nX=1\r[Install]\nRuntimeDirectoryPreserve=yes\n", nil},
 		{"a continuation ends", "[Service]\nEnvironment=A=1 \\\n  B=2\nRuntimeDirectoryPreserve=yes\n", []string{"yes"}},
+		{"an escaped backslash does not continue", "[Service]\nRuntimeDirectoryPreserve=yes\nX-Note=\\\\\nRuntimeDirectoryPreserve=no\n",
+			[]string{"yes", "no"}},
+		{"a space after the backslash does not continue", "[Service]\nX-Note=a\\ \nRuntimeDirectoryPreserve=no\n",
+			[]string{"no"}},
+		{"a joined line is trimmed before it is a section", "[Unit]\n\\\n[Service]\nRuntimeDirectoryPreserve=no\n",
+			[]string{"no"}},
+		{"a comment inside a continuation is skipped", "[Service]\nRuntimeDirectoryPreserve=\\\n# why\nno\n", []string{"no"}},
+		{"a continuation open at the end of the file", "[Service]\nRuntimeDirectoryPreserve=no\\", []string{"no"}},
+		{"a continuation open at the last newline", "[Service]\nRuntimeDirectoryPreserve=no\\\n", []string{"no"}},
 	} {
 		if got := serviceAssignments(tc.unit, "RuntimeDirectoryPreserve"); !slices.Equal(got, tc.want) {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
