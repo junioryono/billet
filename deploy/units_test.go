@@ -3,6 +3,7 @@ package deploy_test
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -667,9 +668,9 @@ func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
 	}
 
 	// The template is the unit only while Jinja has nothing to render in it.
-	for _, delimiter := range []string{"{{", "{%", "{#"} {
+	for _, delimiter := range []string{"{{", "{%", "{#", "#jinja2:"} {
 		if strings.Contains(string(role), delimiter) {
-			t.Errorf("the role's refresh template carries the Jinja delimiter %q, so it is not the unit it renders",
+			t.Errorf("the role's refresh template carries the Jinja marker %q, so it is not the unit it renders",
 				delimiter)
 		}
 	}
@@ -678,6 +679,10 @@ func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
 		deploy.ImagesRefreshUnitName:  deploy.ImagesRefreshUnit,
 		"the role's refresh template": string(role),
 	} {
+		if err := plainUnit(unit); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+
 		for key, want := range map[string]string{
 			"RuntimeDirectory":         strings.TrimPrefix(deploy.NodeLockDir, "/run/"),
 			"RuntimeDirectoryMode":     "0750",
@@ -770,12 +775,13 @@ func TestThePackageAndTheRoleInstallOneTmpfilesEntry(t *testing.T) {
 // line into the assignment it ends, so a directive on that next line is no
 // directive.
 //
-// The line handling follows systemd 255's config_parse: a line continues when
-// it ends in an UNESCAPED backslash (counted over the line as joined so far,
-// before any trimming), the backslash becomes a space, a comment line inside a
-// continuation is skipped, the joined line is trimmed before it is read as a
-// section or an assignment, and a continuation still open at the end of the
-// file is read as it stands.
+// The line handling follows systemd 255's config_parse for the plain form
+// plainUnit admits: a comment line is skipped before any joining, a line
+// continues when it ends in an UNESCAPED backslash (counted over the line as
+// joined so far, before any trimming), the backslash becomes a space, the joined
+// line is trimmed before it is read as a section or an assignment, and a
+// continuation still open at the end of the file is read as it stands. Outside
+// that form systemd reads differently in ways this does not follow.
 func serviceAssignments(unit, key string) []string {
 	var out []string
 
@@ -806,11 +812,13 @@ func serviceAssignments(unit, key string) []string {
 	for line := range strings.Lines(unit) {
 		line = strings.TrimSuffix(line, "\n")
 
-		if continued {
-			if lead := strings.TrimLeft(line, " \t"); strings.HasPrefix(lead, "#") || strings.HasPrefix(lead, ";") {
-				continue
-			}
+		// A COMMENT LINE IS SKIPPED BEFORE ANY JOINING, inside a continuation
+		// or not, so a backslash ending one continues nothing.
+		if lead := strings.TrimLeft(line, " \t"); strings.HasPrefix(lead, "#") || strings.HasPrefix(lead, ";") {
+			continue
+		}
 
+		if continued {
 			line = continuation + line
 		}
 
@@ -835,6 +843,72 @@ func serviceAssignments(unit, key string) []string {
 	}
 
 	return out
+}
+
+// plainUnit refuses a unit outside the plain form both refresh copies are
+// written in, where serviceAssignments reads every line as systemd 255 does:
+// printable ASCII and newlines only (no carriage return, NUL, BOM, tab or
+// Unicode space, each of which systemd's reader and Go's trimming treat
+// differently), a final newline, no indented line, no line ending in a
+// backslash (a comment line included, since systemd joins what follows it), and
+// every line opening with '[' a bare section header. FAILING CLOSED, because
+// emulating each of systemd's line rules was measured to leave the next one
+// open: six review rounds each found another way to hide an override.
+func plainUnit(unit string) error {
+	if !strings.HasSuffix(unit, "\n") {
+		return errors.New("the unit does not end in a newline")
+	}
+
+	for i, line := range strings.Split(strings.TrimSuffix(unit, "\n"), "\n") {
+		// A comment line is skipped whole, so it may carry prose beyond ASCII;
+		// a control byte ends or splits a line anywhere.
+		comment := strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";")
+
+		for _, c := range []byte(line) {
+			if c < 0x20 || c == 0x7f || c > 0x7e && !comment {
+				return fmt.Errorf("line %d carries the byte %#x, outside printable ASCII", i+1, c)
+			}
+		}
+
+		switch {
+		case strings.HasPrefix(line, " "):
+			return fmt.Errorf("line %d is indented", i+1)
+		case strings.HasSuffix(strings.TrimRight(line, " "), `\`):
+			return fmt.Errorf("line %d ends in a backslash, which continues it", i+1)
+		case strings.HasPrefix(line, "[") && !sectionHeader.MatchString(line):
+			return fmt.Errorf("line %d opens with '[' and is not a bare section header: %q", i+1, line)
+		}
+	}
+
+	return nil
+}
+
+var sectionHeader = regexp.MustCompile(`^\[[A-Za-z]+\]$`)
+
+// THE PLAIN FORM REFUSES EVERY SHAPE THAT HID AN OVERRIDE FROM A READER.
+func TestPlainUnitRefusesWhatSystemdReadsDifferently(t *testing.T) {
+	for _, tc := range []struct{ name, unit string }{
+		{"a comment that continues", "[Service]\n# why \\\nRuntimeDirectoryPreserve\\\n=no\n"},
+		{"an escaped backslash", "[Service]\nX-Note=\\\\\nRuntimeDirectoryPreserve=no\n"},
+		{"a carriage return", "[Service]\nX=1\r[Install]\n"},
+		{"a NUL", "[Service]\n# note\x00RuntimeDirectoryPreserve=no\n"},
+		{"a byte-order mark", "[Service]\n\ufeffRuntimeDirectoryPreserve=no\n"},
+		{"a non-breaking space", "[Service]\nRuntimeDirectoryPreserve\u00a0=yes\n"},
+		{"a tab", "[Service]\nRuntimeDirectoryPreserve\t=yes\n"},
+		{"an indented line", "[Service]\n  RuntimeDirectoryPreserve = no\n"},
+		{"a header with a comment", "[Service] # why\nRuntimeDirectoryPreserve=yes\n"},
+		{"no final newline", "[Service]\nRuntimeDirectoryPreserve=yes"},
+		{"a byte-order mark before a comment", "[Service]\n\ufeff# why\nRuntimeDirectoryPreserve=yes\n"},
+		{"a NUL inside a comment", "[Service]\n# why\x00\nRuntimeDirectoryPreserve=yes\n"},
+	} {
+		if plainUnit(tc.unit) == nil {
+			t.Errorf("%s: admitted %q", tc.name, tc.unit)
+		}
+	}
+
+	if err := plainUnit("# a unit — with prose\n[Unit]\nDescription=x\n\n[Service]\nRuntimeDirectoryPreserve=yes\n"); err != nil {
+		t.Errorf("a plain unit was refused: %v", err)
+	}
 }
 
 // THE READER IS TESTED ON WHAT FOOLED ITS PREDECESSOR.
