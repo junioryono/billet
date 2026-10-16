@@ -197,6 +197,14 @@ func startNodeCache(
 	// sessions, whose publications are abandoned after publishWindow. It starts
 	// after the first renewal, so a restarted node's live clones are renewed before
 	// any eviction pass reads their records.
+	//
+	// ON A CONTEXT THE STOP CANCELS, and the stop waits for a kernel-mapping sweep
+	// in flight (sweeping): an unmap the process exits under is killed with the
+	// unit's cgroup, and one cut short leaves the image's lock with the host's one
+	// kernel client.
+	evictCtx, stopEviction := context.WithCancel(ctx)
+	sweeping := make(chan struct{}, 1)
+
 	go func() {
 		cleanupTicker := time.NewTicker(5 * time.Minute)
 		defer cleanupTicker.Stop()
@@ -213,7 +221,7 @@ func startNodeCache(
 					"error", err)
 			}
 		}
-		evict := func() { evictPass(ctx, storage, service.ReapGitMirrors, slog.Default()) }
+		evict := func() { evictPass(evictCtx, storage, service.ReapGitMirrors, sweeping, slog.Default()) }
 
 		retryClosed()
 		renewActive()
@@ -226,7 +234,7 @@ func startNodeCache(
 
 			for {
 				select {
-				case <-ctx.Done():
+				case <-evictCtx.Done():
 					return
 				case <-evictionTicker.C:
 					evict()
@@ -260,7 +268,34 @@ func startNodeCache(
 			slog.Default().Warn("the guest cache listener did not shut down cleanly",
 				"grace", stopGrace, "error", err)
 		}
+
+		stopEviction()
+		if !awaitSweep(sweeping, sweepStopWait) {
+			slog.Default().Warn("stopping while a kernel-mapping sweep is still unmapping a volume",
+				"waited", sweepStopWait)
+		}
 	}, nil
+}
+
+// sweepStopWait bounds how long a stop waits for a kernel-mapping sweep: once
+// its context is cancelled a sweep starts no unmap, so it ends within the one
+// it has started.
+const sweepStopWait = ceph.MapTimeout + 5*time.Second
+
+// awaitSweep waits, at most bound, until no kernel-mapping sweep holds the
+// slot, and reports whether none did by then.
+func awaitSweep(sweeping chan struct{}, bound time.Duration) bool {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+
+	select {
+	case sweeping <- struct{}{}:
+		<-sweeping
+
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // cacheEvictor is the part of a site store an eviction pass runs.
@@ -277,15 +312,20 @@ type kernelMappingSweeper interface {
 // evictPass is one of the node's background storage passes: the kernel mappings
 // no cache session accounts for, then expired cache generations and volumes,
 // then unused git mirrors. Every failure is logged and left for the next pass.
+// The sweep holds the one-token sweeping for its whole run, which a stop waits
+// on (awaitSweep).
 //
 // THE MAPPINGS FIRST, because eviction keeps every volume this host maps: a
 // leaked mapping released here lets the same pass reclaim its volume once the
 // volume is old enough.
 func evictPass(ctx context.Context, storage cacheEvictor, reapGitMirrors func(context.Context) error,
-	log *slog.Logger,
+	sweeping chan struct{}, log *slog.Logger,
 ) {
 	if sweeper, ok := storage.(kernelMappingSweeper); ok {
+		sweeping <- struct{}{}
 		report, err := sweeper.SweepKernelMappings(ctx)
+		<-sweeping
+
 		if unmapped := mappingNames(report, ceph.MappingUnmapped); len(unmapped) > 0 {
 			log.Info("unmapped cache volumes the kernel still mapped and no cache session names",
 				"volumes", unmapped)

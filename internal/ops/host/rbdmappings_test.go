@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"io/fs"
 	"strings"
@@ -58,15 +59,54 @@ func TestTheCheckNamesOnlyTheFirstUnaccountedMappings(t *testing.T) {
 	t.Parallel()
 
 	var report ceph.MappingReport
-	for range mappingNamesShown + 3 {
+	for i := range mappingNamesShown + 3 {
 		report.Mappings = append(report.Mappings, ceph.KernelMapping{
-			Pool: "billet-cache", Name: "cache-v-1", State: ceph.MappingUnaccounted,
+			Pool: "billet-cache", Name: fmt.Sprintf("cache-v-%d-x", i), State: ceph.MappingUnaccounted,
 		})
 	}
 
 	out := mappingCheckOutput(report, nil)
-	if got := strings.Count(out, "billet-cache/cache-v-1"); got != mappingNamesShown || !strings.Contains(out, "and 3 more") {
-		t.Errorf("the check named %d mappings, want %d and the rest counted:\n%s", got, mappingNamesShown, out)
+	for i := range mappingNamesShown + 3 {
+		named := strings.Contains(out, fmt.Sprintf("billet-cache/cache-v-%d-x", i))
+		if named != (i < mappingNamesShown) {
+			t.Errorf("mapping %d named %v, want the first %d named and the rest counted:\n%s",
+				i, named, mappingNamesShown, out)
+		}
+	}
+	if !strings.Contains(out, "and 3 more") {
+		t.Errorf("the mappings not named are not counted:\n%s", out)
+	}
+}
+
+// A HOST WHOSE MAPPINGS ARE ALL OF ANOTHER KIND STILL HAS THEM: each kind is
+// counted, and none of them reads as a host that maps nothing.
+func TestTheCheckCountsEveryKindOfMapping(t *testing.T) {
+	t.Parallel()
+
+	out := mappingCheckOutput(ceph.MappingReport{Mappings: []ceph.KernelMapping{
+		{Pool: "billet-cache", State: ceph.MappingGeneration},
+		{Pool: "billet-cache", State: ceph.MappingRecent},
+		{Pool: "billet-images", State: ceph.MappingOther},
+	}}, nil)
+
+	for _, want := range []string{
+		"3 kernel mapping(s) here", "1 generation check(s)", "1 cache volume(s) named too recently to judge",
+		"1 other mapping(s) in the site's pools",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the check does not say %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "maps nothing") {
+		t.Errorf("a host with mappings was said to map nothing:\n%s", out)
+	}
+
+	// EVEN IN A STATE THE LIST DOES NOT NAME, which a read never gives today.
+	out = mappingCheckOutput(ceph.MappingReport{Mappings: []ceph.KernelMapping{
+		{Pool: "billet-cache", State: ceph.MappingHeld},
+	}}, nil)
+	if strings.Contains(out, "maps nothing") || !strings.Contains(out, "1 kernel mapping(s) here") {
+		t.Errorf("a host whose one mapping is in a state the check does not name was misreported:\n%s", out)
 	}
 }
 

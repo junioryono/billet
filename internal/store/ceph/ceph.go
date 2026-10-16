@@ -114,6 +114,11 @@ type Client struct {
 	// sessions reads which images the node's cache sessions name, for Evict.
 	sessions func() (func(name string) bool, error)
 
+	// mapSightings is when a SweepKernelMappings pass first found each mapping
+	// it holds unaccounted, keyed by device and image; under mapSightingsMu.
+	mapSightingsMu sync.Mutex
+	mapSightings   map[string]time.Time
+
 	// evictResume is the last generation an eviction pass cut short by its lock
 	// budget reached, so the next pass begins after it.
 	evictMu     sync.Mutex

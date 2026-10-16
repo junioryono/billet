@@ -28,7 +28,7 @@ func reportKernelMappings(ctx context.Context, env cli.Env, cfg *config.Config) 
 }
 
 func readKernelMappings(ctx context.Context, cfg *config.Config) (ceph.MappingReport, error) {
-	records, err := app.CacheSessionRecords(cfg)
+	inSession, err := app.CacheSessionNames(cfg)()
 	if err != nil {
 		return ceph.MappingReport{}, err
 	}
@@ -38,7 +38,7 @@ func readKernelMappings(ctx context.Context, cfg *config.Config) (ceph.MappingRe
 		return ceph.MappingReport{}, err
 	}
 
-	return client.KernelMappings(ctx, records.Mentions)
+	return client.KernelMappings(ctx, inSession)
 }
 
 // printKernelMappings is the check's account of one read of the mappings.
@@ -68,10 +68,16 @@ func printKernelMappings(env cli.Env, report ceph.MappingReport, err error) {
 		}
 	}
 
-	if len(parts) == 0 {
+	// FROM THE TABLE, NOT FROM WHAT WAS SAID ABOUT IT: a state left out of the
+	// list above must not turn a host's mappings into none.
+	if len(report.Mappings) == 0 {
 		fmt.Fprintln(env.Stdout, "rbd      this host maps nothing from the site's pools")
 
 		return
+	}
+
+	if len(parts) == 0 {
+		parts = []string{"none of a kind this check names"}
 	}
 
 	fmt.Fprintf(env.Stdout, "rbd      %d kernel mapping(s) here: %s\n", len(report.Mappings),

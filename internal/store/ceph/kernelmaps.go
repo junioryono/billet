@@ -22,6 +22,17 @@ import (
 // the node's eviction cadence, which is what runs the sweep.
 const VolumeMapAge = 6 * time.Hour
 
+// mapSightingGap is how long, by this process's monotonic clock, a mapping must
+// have stayed unaccounted across passes before the sweep unmaps it.
+//
+// THE NAME IS WALL-CLOCK, AND A CLOCK STEPPED FORWARD BY VolumeMapAge WOULD AGE
+// A VOLUME STILL WAITING FOR ITS RECORD. A second sighting an hour later on the
+// monotonic clock, which no step moves, outlasts the longest window between a
+// map and its record (the cache handler's bound, under 13 minutes) several
+// times over. It starts again with the process, so a restart only delays a
+// release.
+const mapSightingGap = time.Hour
+
 // MappingState is what KernelMappings or SweepKernelMappings made of one kernel
 // mapping of an image in billet's pools.
 type MappingState string
@@ -58,8 +69,8 @@ const (
 // KernelMapping is one row of this host's kernel mapping table in billet's
 // pools, and what was made of it.
 type KernelMapping struct {
-	Pool, Name, Snap, Device string
-	State                    MappingState
+	Pool, Namespace, Name, Snap, Device string
+	State                               MappingState
 	// Err is why the sweep could not release it, for MappingHeld and
 	// MappingUnknown.
 	Err error
@@ -87,7 +98,8 @@ func (r MappingReport) Count(state MappingState) int {
 // KernelMappings reads this host's kernel mappings of billet's two pools and
 // says what accounts for each, changing nothing. inSession reports whether a
 // cache custody record on this node names an image. A mapping table it cannot
-// read is an error, never an empty report.
+// read, or a row in billet's pools that does not say which snapshot it maps, is
+// an error, never an empty report or a verdict.
 //
 // HOLDERS AND MOUNTS PROVE NOTHING HERE, so neither is read. On the reference
 // deployment's Linux node, `/sys/block/rbdN/holders` was empty and the host's
@@ -128,8 +140,15 @@ func (c *Client) KernelMappings(ctx context.Context, inSession func(name string)
 			continue
 		}
 
+		// WHETHER IT IS AN IMAGE'S HEAD IS PART OF THE PROOF, so a row that does
+		// not say is could-not-tell rather than somebody else's.
+		if d.Snap == "" {
+			return MappingReport{}, fmt.Errorf("ceph: %s listed %s/%s without saying which snapshot it maps",
+				c.bin, d.Pool, bounded(d.Name))
+		}
+
 		report.Mappings = append(report.Mappings, KernelMapping{
-			Pool: d.Pool, Name: d.Name, Snap: d.Snap, Device: d.Device,
+			Pool: d.Pool, Namespace: d.Namespace, Name: d.Name, Snap: d.Snap, Device: d.Device,
 			State: c.mappingState(d, now, inSession),
 		})
 	}
@@ -137,17 +156,18 @@ func (c *Client) KernelMappings(ctx context.Context, inSession func(name string)
 	return report, nil
 }
 
-// mappingState judges one mapping in billet's pools.
+// mappingState judges one mapping in billet's pools. Only the pools' default
+// namespace holds what billet names, and `pool/name` addresses nothing else.
 func (c *Client) mappingState(d *mappedDevice, now time.Time, inSession func(string) bool) MappingState {
 	head := d.Snap == "-"
 	kind, named, ok := cacheImageName(d.Name)
 
 	switch {
-	case d.Pool != c.cfg.CachePool:
+	case d.Pool != c.cfg.CachePool || d.Namespace != "":
 		return MappingOther
 	case head && strings.HasPrefix(d.Name, "billet-"):
 		return MappingRootDisk
-	case ok && kind == "g" && !head && d.Snap != "":
+	case ok && kind == "g" && !head:
 		return MappingGeneration
 	case !ok || kind != "v" || !head:
 		return MappingOther
@@ -163,16 +183,19 @@ func (c *Client) mappingState(d *mappedDevice, now time.Time, inSession func(str
 // SweepKernelMappings unmaps, never forced, this host's kernel mappings of the
 // writable cache volumes nothing accounts for, and reports every mapping in
 // billet's pools with what became of it. A mapping the kernel holds open, or
-// whose unmap failed otherwise, is kept and joined into the error by name.
+// whose unmap failed otherwise, is kept and joined into the error by name; one
+// seen unaccounted for the first time stays MappingUnaccounted until a later
+// pass sees it again.
 //
 // ONLY ON POSITIVE PROOF, in this order: the exact name Create and Clone give a
-// writable volume, in the cache pool and not a snapshot; named at least
-// VolumeMapAge ago by this host's clock; named by no cache custody record on
-// this node, read afresh for this pass before the table, so a session that ends
-// meanwhile unmaps its own volume rather than leaving it to be judged; and
-// then the kernel's agreement, since a plain unmap succeeds only when nothing
-// holds the device open. A pass without a session reader, or whose records
-// cannot be read, unmaps nothing.
+// writable volume, in the cache pool's default namespace and not a snapshot;
+// named at least VolumeMapAge ago by this host's clock; named by no cache
+// custody record on this node, read afresh for this pass before the table, so a
+// session that ends meanwhile unmaps its own volume rather than leaving it to be
+// judged; found so by an earlier pass at least mapSightingGap before, by the
+// monotonic clock; and then the kernel's agreement, since a plain unmap succeeds
+// only when nothing holds the device open. A pass without a session reader, or
+// whose records cannot be read, unmaps nothing.
 //
 // LEFT BEHIND FOR TEN DAYS ON THE REFERENCE NODE: eight such mappings, from the
 // 2026-10-03 incident in which its kernel client was blocklisted, survived every
@@ -180,11 +203,15 @@ func (c *Client) mappingState(d *mappedDevice, now time.Time, inSession func(str
 // volume); each unmapped cleanly without force on 2026-10-14.
 //
 // BY IMAGE, NOT BY DEVICE: the kernel gives a released device's number to the
-// next map, and the proof is about the image. An image mapped twice loses one
-// mapping a pass, as `rbd device unmap <spec>` releases one. ONE ATTEMPT, where
-// unmapDevice retries: busy here is a verdict, not a teardown racing a VMM's
-// exit. And never killed by the caller, for unmapDevice's reason: an unmap cut
-// short leaves the image's lock with the host's one kernel client.
+// next map, and the proof is about the image. No other billet path unmaps an
+// image no session or jail names, so nothing else resolves the same spec
+// meanwhile. ONE UNMAP PER IMAGE A PASS, because `rbd device unmap <spec>`
+// releases whichever of its mappings comes first, and the next pass takes the
+// next. ONE ATTEMPT, where unmapDevice retries: busy here is a verdict, not a
+// teardown racing a VMM's exit. And never killed by the caller, for
+// unmapDevice's reason: an unmap cut short leaves the image's lock with the
+// host's one kernel client. No unmap starts once ctx is done, so a caller that
+// cancels waits at most one MapTimeout for the pass to return.
 func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error) {
 	if c.sessions == nil {
 		return MappingReport{}, errors.New("ceph: kernel mappings are kept: this client was given no way " +
@@ -205,6 +232,15 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 		return MappingReport{}, fmt.Errorf("ceph: kernel mappings are kept: %w", err)
 	}
 
+	c.mapSightingsMu.Lock()
+	defer c.mapSightingsMu.Unlock()
+
+	// c.now carries the monotonic reading outside tests, which Sub uses, so no
+	// wall-clock step moves a sighting.
+	now := c.now()
+	sighted := map[string]time.Time{}
+	tried := map[string]bool{}
+
 	var failures []error
 
 	for i := range report.Mappings {
@@ -214,6 +250,17 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 		}
 
 		spec := m.Pool + "/" + m.Name
+
+		key := m.Device + " " + spec
+		first, seen := c.mapSightings[key]
+		if !seen {
+			first = now
+		}
+		sighted[key] = first
+
+		if now.Sub(first) < mapSightingGap || tried[spec] {
+			continue
+		}
 
 		// NO UNMAP STARTS ONCE THE PASS IS CANCELLED; one already started runs to
 		// its own bound.
@@ -225,21 +272,26 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 			continue
 		}
 
+		tried[spec] = true
+
 		err := c.rbdCmdWithin(context.WithoutCancel(ctx), MapTimeout, "device", "unmap", spec)
 
 		switch {
 		case err == nil:
 			m.State = MappingUnmapped
+			delete(sighted, key)
 		case isDeviceBusy(err):
-			m.State, m.Err = MappingHeld, fmt.Errorf("ceph: %s (%s) is mapped and named by no cache "+
-				"session, and the kernel holds it open, so it is kept: %w", spec, m.Device, err)
+			m.State, m.Err = MappingHeld, fmt.Errorf("ceph: %s is mapped and named by no cache session, and "+
+				"the kernel holds it open, so it is kept: %w", spec, err)
 			failures = append(failures, m.Err)
 		default:
-			m.State, m.Err = MappingUnknown, fmt.Errorf("ceph: unmap %s (%s), which no cache session "+
-				"names: %w", spec, m.Device, err)
+			m.State, m.Err = MappingUnknown, fmt.Errorf("ceph: unmap %s, which no cache session names: %w",
+				spec, err)
 			failures = append(failures, m.Err)
 		}
 	}
+
+	c.mapSightings = sighted
 
 	return report, errors.Join(failures...)
 }

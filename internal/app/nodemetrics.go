@@ -56,14 +56,7 @@ func (n *Node) KernelMappingMetrics() MetricsSource {
 			}
 
 			return client, nil
-		}, func() (func(string) bool, error) {
-			records, err := CacheSessionRecords(cfg)
-			if err != nil {
-				return nil, err
-			}
-
-			return records.Mentions, nil
-		}),
+		}, CacheSessionNames(cfg)),
 	}
 }
 
