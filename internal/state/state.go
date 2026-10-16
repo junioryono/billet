@@ -125,6 +125,15 @@ type DB struct {
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
 
+	// unclaimedMove is what this handle's open migrated, until a claim records
+	// this release in the watermark and the move becomes the deployment's: from
+	// then on an older billet is refused by the mark anyway. Every claim that
+	// fails before that joins it, so a control plane that opened, migrated and
+	// was stopped before it held the claim does not report a clean stop. Set by
+	// openDir before the handle is returned and touched afterwards only by
+	// ClaimController, which one goroutine calls.
+	unclaimedMove *SchemaMoved
+
 	// inspect marks a handle opened for a report, whose every write transaction
 	// is refused with ErrInspect. See OpenInspect.
 	inspect bool
@@ -606,6 +615,8 @@ func openDir(
 
 		db.revalidate.Store(true)
 	}
+
+	db.unclaimedMove = moved
 
 	return db, nil
 }
@@ -1963,6 +1974,16 @@ func (db *DB) migrate(ctx context.Context) (*SchemaMoved, error) {
 			}
 
 			to = m.Version
+		}
+
+		// THE CONTEXT IS ASKED LAST, so a stop that arrived during the statements
+		// rolls them back here and is reported as the nothing it is. Without it,
+		// sql.Tx.Commit answers an ended context with ctx.Err() and never sends
+		// the COMMIT, which would read as a commit nobody answered. What is left
+		// is the instant between this and Commit's own check, and a stop landing
+		// there is reported as could-not-tell: the safe direction.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		committing = true

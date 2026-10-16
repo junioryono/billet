@@ -206,17 +206,191 @@ func TestAMigrationWhoseCommitWasNotAnsweredIsReportedAsUnknown(t *testing.T) {
 		t.Errorf("an unknown move does not say it could not tell: %v", moved)
 	}
 
-	// THE LEDGER DID MOVE, which is why Unknown can never be read as "no".
-	reopened, err := OpenAdmin(t.Context(), dir)
+	// THE LEDGER DID MOVE, which is why Unknown can never be read as "no". Read
+	// through a bare connection: any open would migrate it first.
+	if got := appliedVersion(t, dir); got != newestMigration {
+		t.Errorf("the ledger whose commit went unanswered is at version %d, want %d", got, newestMigration)
+	}
+}
+
+// appliedVersion is the newest migration a SQLite ledger records, read through
+// a bare connection so the read cannot migrate it.
+func appliedVersion(t *testing.T, dir string) int {
+	t.Helper()
+
+	pools, err := newSQLiteBackend(dir).dataSources()
 	if err != nil {
-		t.Fatalf("OpenAdmin over the migrated ledger: %v", err)
+		t.Fatalf("dataSources: %v", err)
 	}
 
-	t.Cleanup(func() { _ = reopened.Close() })
+	r, err := sql.Open("sqlite", pools.reader)
+	if err != nil {
+		t.Fatalf("open a bare reader: %v", err)
+	}
 
-	if moved, err := reopened.migrate(t.Context()); err != nil || moved != nil {
-		t.Errorf("the ledger whose commit went unanswered was not at the newest schema: (%+v, %v)",
-			moved, err)
+	defer func() { _ = r.Close() }()
+
+	var version int
+	if err := r.QueryRowContext(t.Context(),
+		`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read the applied version: %v", err)
+	}
+
+	return version
+}
+
+// A STOP BEFORE THE COMMIT MOVED NOTHING, AND SAYS SO. The driver below cancels
+// the migration's context as the last migration is recorded, so the statements
+// ran and the COMMIT was never sent: database/sql answers an ended context
+// without sending one. Reporting that as could-not-tell would turn every stop
+// during a migration into a failure for a ledger that is exactly as it was.
+func TestAMigrationStoppedBeforeItsCommitMovedNothing(t *testing.T) {
+	t.Parallel()
+
+	dir := rewoundLedger(t)
+
+	pools, err := newSQLiteBackend(dir).dataSources()
+	if err != nil {
+		t.Fatalf("dataSources: %v", err)
+	}
+
+	probe, err := sql.Open("sqlite", pools.writer)
+	if err != nil {
+		t.Fatalf("open the driver: %v", err)
+	}
+
+	drv := probe.Driver()
+
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close the probe: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	w := sql.OpenDB(stopAtRecordConnector{drv: drv, dsn: pools.writer, cancel: cancel})
+
+	t.Cleanup(func() { _ = w.Close() })
+
+	db := &DB{w: w, backend: newSQLiteBackend(dir)}
+
+	moved, err := db.migrate(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a migration stopped before its commit reported %v", err)
+	}
+
+	if moved != nil {
+		t.Errorf("a migration stopped before its commit reported %+v", moved)
+	}
+
+	if got := appliedVersion(t, dir); got != newestMigration-1 {
+		t.Errorf("a migration stopped before its commit left the ledger at %d, want %d",
+			got, newestMigration-1)
+	}
+}
+
+// stopAtRecordConnector hands out real SQLite connections that cancel the
+// caller's context once a migration has been recorded, inside the transaction.
+type stopAtRecordConnector struct {
+	drv    driver.Driver
+	dsn    string
+	cancel context.CancelFunc
+}
+
+func (c stopAtRecordConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.drv.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return stopAtRecordConn{Conn: conn, cancel: c.cancel}, nil
+}
+
+func (c stopAtRecordConnector) Driver() driver.Driver { return c.drv }
+
+type stopAtRecordConn struct {
+	driver.Conn
+
+	cancel context.CancelFunc
+}
+
+func (c stopAtRecordConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	begin, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, errors.New("state test: the SQLite connection has no BeginTx")
+	}
+
+	return begin.BeginTx(ctx, opts)
+}
+
+func (c stopAtRecordConn) Prepare(query string) (driver.Stmt, error) {
+	stmt, err := c.Conn.Prepare(query)
+	if err != nil || !strings.Contains(query, "INSERT INTO schema_migrations") {
+		return stmt, err
+	}
+
+	return stopAtRecordStmt{Stmt: stmt, cancel: c.cancel}, nil
+}
+
+type stopAtRecordStmt struct {
+	driver.Stmt
+
+	cancel context.CancelFunc
+}
+
+func (s stopAtRecordStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	exec, ok := s.Stmt.(driver.StmtExecContext)
+	if !ok {
+		return nil, errors.New("state test: the SQLite statement has no ExecContext")
+	}
+
+	res, err := exec.ExecContext(ctx, args)
+
+	s.cancel()
+
+	return res, err
+}
+
+// AN OPEN THAT MIGRATED AND WAS STOPPED BEFORE ITS CLAIM SAYS WHAT IT MOVED, and
+// a claim that succeeded makes the move the deployment's. The claim is what
+// records this release, so until it lands an older billet is refused by the
+// schema alone, and a stop there that read as clean would hide that.
+func TestAnOpenStoppedBeforeItsClaimSaysWhatItMoved(t *testing.T) {
+	t.Parallel()
+
+	db, err := Open(t.Context(), rewoundLedger(t), WithRunningRelease("v0.5.0"))
+	if err != nil {
+		t.Fatalf("Open the rewound ledger: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	_, err = db.ClaimController(stopped, "controller", "deployment-a")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a claim on a stopped context returned %v", err)
+	}
+
+	moved, ok := errors.AsType[*SchemaMoved](err)
+	if !ok || moved.From != newestMigration-1 || moved.To != newestMigration {
+		t.Fatalf("a claim stopped after its open migrated does not say what moved: %v", err)
+	}
+
+	if StoppedBy(stopped, err) {
+		t.Error("a claim stopped after its open moved the schema reads as a clean stop")
+	}
+
+	// THE CLAIM THAT LANDS MAKES THE MOVE THE DEPLOYMENT'S, so a later failure is
+	// not reported as one.
+	if _, err := db.ClaimController(t.Context(), "controller", "deployment-a"); err != nil {
+		t.Fatalf("ClaimController: %v", err)
+	}
+
+	_, err = db.ClaimController(stopped, "controller", "deployment-a")
+	if moved, ok := errors.AsType[*SchemaMoved](err); ok || !StoppedBy(stopped, err) {
+		t.Errorf("a claim stopped after a claim recorded the release reported %v (move %+v)", err, moved)
 	}
 }
 

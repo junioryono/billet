@@ -44,8 +44,9 @@ var ErrStandby = errors.New(
 	"state: this process is a standby and has not claimed this deployment's controller")
 
 // SchemaMoved is a migration that moved this deployment's ledger to a newer
-// schema, reported beside a failure that came after it: the open or the claim
-// it was part of did not complete, and the schema does not move back.
+// schema, reported beside a failure that came after it and before a claim
+// recorded this release: the open or the claim it was part of did not
+// complete, and the schema does not move back.
 //
 // A LEAF, AND THAT IS THE POINT. It wraps nothing, so an error that joins it to
 // a cancellation is not only a cancellation, and a process that was asked to
@@ -82,9 +83,14 @@ func (e *SchemaMoved) Error() string {
 			"ledger from %s to schema %d committed", from, e.To)
 	}
 
-	return "state: " + moved + " before it failed. Migrations do not move back: a billet that " +
-		"expects an older schema is refused by this ledger, and the way back is a restore or a " +
-		"forward fix (see Downgrades in docs/operating/upgrades.md)"
+	refused := "a billet that expects an older schema is refused by this ledger"
+	if e.Unknown {
+		refused = "if it did, a billet that expects an older schema is refused by this ledger"
+	}
+
+	return "state: " + moved + " before it failed. Migrations do not move back: " + refused +
+		", and the way back is a restore or a forward fix (see Downgrades in " +
+		"docs/operating/upgrades.md)"
 }
 
 // controllerPollInterval paces a standby's attempts to take the claim.
@@ -174,8 +180,13 @@ func (db *DB) ClaimController(
 		return ControllerClaim{}, ErrInspect
 	}
 
+	// WHAT THIS HANDLE'S OPEN MIGRATED IS STILL THIS PROCESS'S TO REPORT, and
+	// stays joined to every failure below until the claim's own transaction has
+	// recorded this release (see unclaimedMove).
+	moved := db.unclaimedMove
+
 	if err := db.backend.claimController(ctx, db); err != nil {
-		return ControllerClaim{}, err
+		return ControllerClaim{}, errors.Join(err, moved.orNil())
 	}
 
 	// THE EXCLUSION IS WHAT MAKES THIS PROCESS THE CONTROLLER, so the standby
@@ -205,9 +216,8 @@ func (db *DB) ClaimController(
 	// AND WHAT IT MOVED IS JOINED TO EVERY FAILURE AFTER IT. The migration commits
 	// on its own, so a claim refused or stopped below it leaves the ledger on a
 	// schema an older billet is refused by, and the restore gives back only the
-	// exclusion and the latch (#148).
-	var moved *SchemaMoved
-
+	// exclusion and the latch (#148). A standby's open migrated nothing, so this
+	// replaces nothing.
 	if wasStandby {
 		// THE PER-TRANSACTION SCHEMA RE-CHECK COMES OFF FIRST, AND IT HAS TO.
 		// Nothing can migrate underneath a handle that holds the exclusion, so it
@@ -218,13 +228,16 @@ func (db *DB) ClaimController(
 		// promote onto a ledger no controller has ever migrated.
 		db.revalidate.Store(false)
 
-		var err error
-
-		moved, err = db.migrate(ctx)
+		promoted, err := db.migrate(ctx)
 		if err != nil {
 			db.revalidate.Store(true)
 
-			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err), moved.orNil()))
+			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err),
+				promoted.orNil()))
+		}
+
+		if promoted != nil {
+			moved = promoted
 		}
 	}
 
@@ -263,8 +276,11 @@ func (db *DB) ClaimController(
 		// record itself would leave the deployment excluded by a process that
 		// does not believe it is the controller, and the only way out would be
 		// restarting something whose logs say it never started.
-		return restore(errors.Join(fmt.Errorf("state: record the controller claim: %w", err), moved.orNil()))
+		return restore(errors.Join(fmt.Errorf("state: record the controller claim: %w", err),
+			moved.orNil()))
 	}
+
+	db.unclaimedMove = nil
 
 	// RECORDED AFTER THE COMMIT, NEVER BEFORE. The transaction above goes through
 	// DB.Tx and is fenced by checkLeadership like every other write, so a handle
