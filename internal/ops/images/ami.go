@@ -263,8 +263,14 @@ func runnerDigest(version, arch, supplied string) (string, error) {
 		return supplied, nil
 	}
 
+	// NO PIN FOR THIS ARCHITECTURE IS THE UNPINNED CASE, so the operator's digest
+	// is what decides it; unreachable while every mapped platform is pinned.
 	pinned, ok := ec2.PinnedRunnerSHA256(arch)
 	if !ok {
+		if supplied != "" {
+			return supplied, nil
+		}
+
 		return "", fmt.Errorf("billet pins no digest for %s; pass --runner-sha256 with the "+
 			"sha256 of %s", platform, tarball)
 	}

@@ -277,8 +277,16 @@ func TestTheRunnerArchitectureIsRefusedUnlessItIsOneAWSHas(t *testing.T) {
 func TestAProvisionScriptNeedsARunnerVersion(t *testing.T) {
 	t.Parallel()
 
-	if _, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, Arch: "x64"}); err == nil {
+	// THE DIGEST IS SUPPLIED, so the version is the one thing missing and the
+	// refusal has to be the version's: every other field would refuse on its own.
+	_, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+		RunnerSHA256: testRunnerDigest, Arch: "x64"})
+	if err == nil {
 		t.Fatal("a build with no runner version was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "needs a runner version") {
+		t.Errorf("a build with no runner version was refused for another reason: %v", err)
 	}
 }
 

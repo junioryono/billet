@@ -111,7 +111,7 @@ func TestAnUnpinnedRunnerIsRefusedBeforeTheBuildStarts(t *testing.T) {
 		t.Fatal("a build with no config went ahead")
 	}
 
-	if strings.Contains(err.Error(), "--runner-sha256") {
-		t.Errorf("the pinned release was refused for want of a digest: %v", err)
+	if !strings.Contains(err.Error(), "no ec2 configuration found in "+missing) {
+		t.Errorf("the pinned release did not reach the config this test withheld: %v", err)
 	}
 }
