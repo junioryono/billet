@@ -11,8 +11,10 @@ import (
 // Prober asks every reflector once a round; Pinger is the one a run uses.
 type Prober interface {
 	Reflectors() []string
-	// Round returns the round trip of every reflector that answered within
-	// wait; a reflector missing from it went unanswered.
+	// Gateway is the first hop each round also asks, empty for none.
+	Gateway() string
+	// Round returns the round trip of every reflector, and of the gateway, that
+	// answered within wait; one missing from it went unanswered.
 	Round(ctx context.Context, wait time.Duration) (map[string]time.Duration, error)
 }
 
@@ -23,15 +25,20 @@ var errStopping = errors.New("the run is ending")
 // counters, one step of the controller, and the rates it chose applied and
 // logged.
 type stepper struct {
-	log     *slog.Logger
-	prober  Prober
-	ctl     *Controller
-	delays  Delays
+	log    *slog.Logger
+	prober Prober
+	ctl    *Controller
+	delays Delays
+	// gateway is the first hop's own baseline and silence, kept apart from the
+	// reflectors' so it never moves their median or their loss.
+	gateway Delays
 	read    func() (Counters, error)
 	set     func(ctx context.Context, upMbit, downMbit float64) error
 	now     func() time.Time
 	history []reading
 	applied [2]float64
+	// remember is told every pair of rates CAKE was set to, nil for nothing.
+	remember func(upMbit, downMbit float64)
 	// blind is when counted reflectors stopped answering, zero while one does;
 	// told is whether that has been logged.
 	blind time.Time
@@ -70,6 +77,11 @@ func (s *stepper) tick(ctx context.Context) error {
 
 	sample := s.delays.Observe(s.prober.Reflectors(), answered)
 
+	var gateway Sample
+	if g := s.prober.Gateway(); g != "" {
+		gateway = s.gateway.Observe([]string{g}, answered)
+	}
+
 	now, err := s.read()
 	if err != nil {
 		return err
@@ -92,7 +104,7 @@ func (s *stepper) tick(ctx context.Context) error {
 
 	ctl := s.ctl
 	if !ctl.Step(Observation{At: at, Interval: interval, SentBits: sent, ReceivedBits: received,
-		Sample: sample}) {
+		Sample: sample, Gateway: gateway}) {
 		return nil
 	}
 
@@ -105,15 +117,26 @@ func (s *stepper) tick(ctx context.Context) error {
 	}
 
 	if ctl.Cause != CauseNone && (ctl.Up.Rate < s.applied[0] || ctl.Down.Rate < s.applied[1]) {
-		s.log.LogAttrs(ctx, slog.LevelInfo, cutMessage(ctl.Cause),
+		attrs := []slog.Attr{
 			slog.Float64("up_mbit", round(ctl.Up.Rate)), slog.Float64("down_mbit", round(ctl.Down.Rate)),
 			slog.Float64("moving_up_mbit", round(float64(sent)/interval.Seconds()/1e6)),
 			slog.Float64("moving_down_mbit", round(float64(received)/interval.Seconds()/1e6)),
 			slog.String("cause", ctl.Cause.String()), delayAttr(sample),
-			slog.String("lost", fmt.Sprintf("%d/%d", sample.Lost(), len(sample.Probes))))
+			slog.String("lost", fmt.Sprintf("%d/%d", sample.Lost(), len(sample.Probes))),
+		}
+		if s.prober.Gateway() != "" {
+			attrs = append(attrs, gatewayAttr(gateway))
+		}
+
+		s.log.LogAttrs(ctx, slog.LevelInfo, cutMessage(ctl.Cause), attrs...)
 	}
 
 	s.applied = [2]float64{ctl.Up.Rate, ctl.Down.Rate}
+
+	// ONLY ONCE CAKE HAS THE RATES, so what is remembered is what was applied.
+	if s.remember != nil {
+		s.remember(ctl.Up.Rate, ctl.Down.Rate)
+	}
 
 	return nil
 }
@@ -166,6 +189,16 @@ func delayAttr(sample Sample) slog.Attr {
 	}
 
 	return slog.Duration("delay", sample.Delay)
+}
+
+// gatewayAttr is the gateway's rise as logged: the measurement, or that there
+// was none this round.
+func gatewayAttr(gateway Sample) slog.Attr {
+	if !gateway.DelayKnown {
+		return slog.String("gateway_delay", "unmeasured")
+	}
+
+	return slog.Duration("gateway_delay", gateway.Delay)
 }
 
 // reading is an interface's counters at a moment.

@@ -49,6 +49,27 @@
 // unanswered, is never read as a delay: it counts as neither delayed nor clear,
 // so it never raises a rate and cuts only by the loss rule. A round that counted
 // no reflector at all is a could-not-tell, and neither cuts nor raises.
+//
+// The default route's gateway is asked each round too, against a baseline of
+// its own, because a host beside the reference node saw its gateway stall (1.6
+// ms to spikes of 128 ms) while the round trip to the reflectors rose about 11
+// ms (2026-10-14). Its rise past Bloat makes a round delayed as the reflectors'
+// does, and holds a rate as theirs does; its unanswered probes are never loss,
+// because a gateway answers ICMP when it has the time (the reference node's went
+// unanswered about 2% of the time with the line quiet, 2026-10-16), and read as
+// loss they would cut a busy host on every miss.
+//
+// A rate near the interface's speed is not a signal, with no ceiling set or any
+// other. The shaper cannot tell a line as fast as the interface, where such a
+// rule would throttle a healthy host for good, from a slower one, where a
+// gateway that drops shows as loss to the reflectors, which the loss rule reads.
+// A rule on rate alone would be a ceiling in disguise, and the ceiling is the
+// operator's to set (MaxUp, MaxDown).
+//
+// And what a run learned outlives it: the rates CAKE was last set to are kept
+// beside the interface record, and the next run starts from them, returned
+// toward the ceiling with the time it was down (learned.go), where every restart,
+// and so every upgrade, used to start at the ceiling again.
 package uplink
 
 import "time"
@@ -205,6 +226,28 @@ type Observation struct {
 	// as neither delayed nor clear, and a round with no probes measured
 	// nothing.
 	Sample
+	// Gateway is what the round's probe of the first hop said: its rise above
+	// its own baseline when it answered. Its loss is never read, because many
+	// gateways answer ICMP only when they have the time.
+	Gateway Sample
+}
+
+// delayed reports whether the round measured a queue: the reflectors' delay or
+// the gateway's rise past bloat.
+func (o Observation) delayed(bloat time.Duration) bool {
+	return o.DelayKnown && o.Delay > bloat || o.Gateway.DelayKnown && o.Gateway.Delay > bloat
+}
+
+// queue is the deepest queue the round measured, the reflectors' delay or the
+// gateway's rise, and whether it measured either.
+func (o Observation) queue() (time.Duration, bool) {
+	delay, known := o.Delay, o.DelayKnown
+
+	if o.Gateway.DelayKnown && (!known || o.Gateway.Delay > delay) {
+		delay, known = o.Gateway.Delay, true
+	}
+
+	return delay, known
 }
 
 // Controller decides both directions' rates.
@@ -261,7 +304,7 @@ func (c *Controller) Step(o Observation) bool {
 	// was seen before an outage is not still evidence a minute later. A round
 	// with no measured delay is not a delayed one, and one that counted no
 	// reflector lost nothing.
-	delayed := o.DelayKnown && o.Delay > p.Bloat
+	delayed := o.delayed(p.Bloat)
 	c.recent = lastRounds(append(c.recent, delayed), p.Window)
 	c.delayTrail = lastRounds(append(c.delayTrail, delayed), p.Window)
 	c.losses = lastRounds(append(c.losses, o.Probes), p.Window)
@@ -320,8 +363,11 @@ func (c *Controller) judge(o Observation) verdict {
 	stillDelayed := countTrue(c.delayTrail) >= p.Detect
 	dropping := c.dropping(c.losses, o)
 	stillDropping := c.dropping(c.trail, o)
-	delayedNow := o.DelayKnown && o.Delay > p.Bloat
+	delayedNow := o.delayed(p.Bloat)
 
+	// CLEAR ONLY WHEN THE REFLECTORS MEASURED THE LINE, and the gateway, when it
+	// answered, shows no stall either: a gateway alone says nothing about the
+	// line beyond it.
 	v := verdict{
 		full:    delayFull || dropping,
 		onDelay: delayFull && delayedNow,
@@ -333,7 +379,8 @@ func (c *Controller) judge(o Observation) verdict {
 	v.cleared = v.clear && !stillDelayed
 
 	if v.onDelay {
-		v.cut = c.cutFactor(o.Delay)
+		queue, _ := o.queue()
+		v.cut = c.cutFactor(queue)
 	}
 
 	if v.onLoss {
@@ -508,7 +555,8 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
-		d.cutDelay, d.cutDelayKnown, d.cutTally = o.Delay, o.DelayKnown, v.tally
+		d.cutDelay, d.cutDelayKnown = o.queue()
+		d.cutTally = v.tally
 
 		return d.Rate != before, true
 	case v.clear && moving >= p.Full*d.Rate && d.futile < p.Futile &&
@@ -531,7 +579,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 // a measured delay lower by a margin than the measured delay then, or a share
 // of the same reflectors' probes lost that is lower by a tenth.
 func helped(d *Direction, v verdict, o Observation) bool {
-	if o.DelayKnown && d.cutDelayKnown && o.Delay <= d.cutDelay-max(improvement, d.cutDelay/10) {
+	if queue, known := o.queue(); known && d.cutDelayKnown && queue <= d.cutDelay-max(improvement, d.cutDelay/10) {
 		return true
 	}
 

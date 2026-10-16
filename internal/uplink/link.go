@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,7 +31,16 @@ func DefaultInterface() (string, error) {
 }
 
 func defaultInterface(table []byte) (string, error) {
-	best, bestMetric := "", -1
+	iface, _, err := defaultRoute(table, "")
+
+	return iface, err
+}
+
+// defaultRoute is the IPv4 default route with the lowest metric, leaving by
+// iface when it is named: the interface it leaves by and its gateway, in the
+// spelling a reply's source takes, or empty for a route with none.
+func defaultRoute(table []byte, iface string) (string, string, error) {
+	best, gateway, bestMetric := "", "", -1
 	scanner := bufio.NewScanner(bytes.NewReader(table))
 
 	for first := true; scanner.Scan(); first = false {
@@ -46,21 +56,58 @@ func defaultInterface(table []byte) (string, error) {
 			continue
 		}
 
+		if iface != "" && fields[0] != iface {
+			continue
+		}
+
 		metric, err := strconv.Atoi(fields[6])
 		if err != nil {
 			continue
 		}
 
 		if bestMetric < 0 || metric < bestMetric {
-			best, bestMetric = fields[0], metric
+			best, gateway, bestMetric = fields[0], routeGateway(fields[2], flags), metric
 		}
 	}
 
 	if best == "" {
-		return "", errors.New("this host has no IPv4 default route, so there is no uplink to shape")
+		if iface != "" {
+			return "", "", fmt.Errorf("this host has no IPv4 default route leaving by %s", iface)
+		}
+
+		return "", "", errors.New("this host has no IPv4 default route, so there is no uplink to shape")
 	}
 
-	return best, nil
+	return best, gateway, nil
+}
+
+// routeGateway is a route's gateway as an IPv4 address, or empty when the route
+// has none (flag 0x2, RTF_GATEWAY, unset, or an address of zero).
+//
+// THE TABLE PRINTS IT IN THE HOST'S BYTE ORDER, little-endian on the two Linux
+// architectures billet builds for: the reference node's `FE01A8C0` is
+// 192.168.1.254, its BGW320 (measured 2026-10-16).
+func routeGateway(field string, flags uint64) string {
+	value, err := strconv.ParseUint(field, 16, 32)
+	if err != nil || value == 0 || flags&2 == 0 {
+		return ""
+	}
+
+	return net.IPv4(byte(value), byte(value>>8), byte(value>>16), byte(value>>24)).String()
+}
+
+// DefaultGateway is the gateway of the lowest-metric IPv4 default route leaving
+// by iface, or empty when that route has none. A table it cannot read, or no
+// default route by iface, is an error.
+func DefaultGateway(iface string) (string, error) {
+	body, err := os.ReadFile(procRoute)
+	if err != nil {
+		return "", fmt.Errorf("read the routing table: %w", err)
+	}
+
+	_, gateway, err := defaultRoute(body, iface)
+
+	return gateway, err
 }
 
 // Speed is the interface's link speed in Mbit/s, or zero when the kernel does

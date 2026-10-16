@@ -81,3 +81,34 @@ func TestTheUplinkFlagsReachTheShaper(t *testing.T) {
 		t.Fatalf("with no flags the shaper was asked for %v up and %v down, want neither", opts.MaxUp, opts.MaxDown)
 	}
 }
+
+// THE GATEWAY FLAG NAMES THE FIRST HOP, TURNS IT OFF, OR LEAVES THE DEFAULT
+// ROUTE'S; anything else is refused before the shaper starts.
+func TestTheUplinkGatewayFlagReachesTheShaper(t *testing.T) {
+	t.Parallel()
+
+	for args, want := range map[string]struct {
+		gateway string
+		none    bool
+	}{
+		"":                        {},
+		"--gateway 192.168.1.254": {gateway: "192.168.1.254"},
+		"--gateway none":          {none: true},
+	} {
+		opts, err := uplinkShapeOptions(processEnv(), strings.Fields(args))
+		if err != nil {
+			t.Fatalf("%q: %v", args, err)
+		}
+		if opts.Gateway != want.gateway || opts.NoGateway != want.none {
+			t.Errorf("%q: the shaper was asked for gateway %q, none %v; want %q, %v",
+				args, opts.Gateway, opts.NoGateway, want.gateway, want.none)
+		}
+	}
+
+	for _, bad := range []string{"gateway.lan", "fe80::1", "192.168.1"} {
+		if _, err := uplinkShapeOptions(processEnv(), []string{"--gateway", bad}); err == nil ||
+			!strings.Contains(err.Error(), "--gateway") {
+			t.Errorf("--gateway %s: err = %v, want a refusal naming the flag", bad, err)
+		}
+	}
+}
