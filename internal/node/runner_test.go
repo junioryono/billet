@@ -908,11 +908,16 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 	}
 
 	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	destroyed := len(p.destroyed)
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if len(restarted.heldLeases()) != 0 {
 		t.Fatal("recovery retained custody after consuming the pending force release")
+	}
+	// A FORCE RELEASE LETS GO OF THE LEASE, never of the compute.
+	if len(p.destroyed) != destroyed {
+		t.Errorf("settling the force release destroyed %d instances, want none", len(p.destroyed)-destroyed)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Fatalf("forced lease is still open after recovery: %v", err)
@@ -943,13 +948,14 @@ func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
 
 	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7}, ensureErr: errors.New("github is unreachable")}
 	restarted := New(a, host, jit, p, nil)
+	destroyed := len(p.destroyed)
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover = %v, want a runner it could not remove left to the tend", err)
 	}
-	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) {
-		t.Fatalf("recovery tried to remove the runner %v, want once before settling", jit.ensureCalls)
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) || len(p.destroyed) != destroyed {
+		t.Fatalf("recovery tried to remove the runner %v and destroyed %d instances, want one removal "+
+			"and no destroy", jit.ensureCalls, len(p.destroyed)-destroyed)
 	}
-	destroyed := len(p.destroyed)
 	if _, err := a.Lease(t.Context(), lease.ID); err != nil || len(restarted.heldLeases()) != 1 {
 		t.Fatalf("lease %v, held %v; want a runner not yet removed to keep its lease held", err,
 			restarted.heldLeases())
@@ -967,6 +973,46 @@ func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
 	if !slices.Equal(jit.ensureCalls, []string{lease.ID, lease.ID}) || len(p.destroyed) != destroyed {
 		t.Errorf("removals %v and %d destroys after the tend, want the removal tried again and no destroy",
 			jit.ensureCalls, len(p.destroyed)-destroyed)
+	}
+}
+
+// A CUSTODY ASSUMED FOR A LOST LAUNCH REPORT SETTLES A FORCE RELEASE AT ONCE:
+// it adopts one job, so nothing waits behind the settlement, and no tend is
+// needed. The launch's report was lost, the plane held the lease in custody,
+// and an operator forced its release before the node took custody.
+func TestAssumedCustodySettlesAForceReleaseAtOnce(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7}}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, live.Epoch, alloc.PhaseCustody); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	destroyed := len(p.destroyed)
+	if err := r.AssumeCustody(t.Context(), live, 11); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) || len(r.heldLeases()) != 0 {
+		t.Fatalf("removals %v, held %v; want the runner removed and the force release settled at once",
+			jit.ensureCalls, r.heldLeases())
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("the force-released lease is still open: %v", err)
+	}
+	if len(p.destroyed) != destroyed {
+		t.Errorf("settling the force release destroyed %d instances, want none", len(p.destroyed)-destroyed)
 	}
 }
 

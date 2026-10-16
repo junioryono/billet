@@ -829,6 +829,7 @@ func TestRecoveryRenewsEverySurvivorBeforeItSettlesAForceRelease(t *testing.T) {
 
 	next := New(h.rec, h.host, &notingJIT{fakeJIT: &fakeJIT{setID: 7}, rec: h.rec}, h.p, nil,
 		WithMonitor(runningMonitor(t, h.root)), WithUsageCheckpoints(h.dir))
+	h.p.onTarget = func(id string) { h.rec.note("target " + id) }
 	h.rec.mu.Lock()
 	h.rec.events = nil
 	h.rec.mu.Unlock()
@@ -841,6 +842,11 @@ func TestRecoveryRenewsEverySurvivorBeforeItSettlesAForceRelease(t *testing.T) {
 	if removed < 0 || renewed < 0 || removed < renewed || !slices.Contains(events, "release "+forced.ID) {
 		t.Errorf("events = %v, want the other survivor renewed before the forced one's runner is removed "+
 			"and its lease released", events)
+	}
+	// AND MEASURED BEFORE IT, since the removal can wait on GitHub.
+	if looked := slices.Index(events, "target instance-"+provider.InstanceName(other.ID)); looked < 0 ||
+		looked > removed {
+		t.Errorf("events = %v, want the other survivor's counters looked for before the removal", events)
 	}
 }
 

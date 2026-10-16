@@ -1230,11 +1230,18 @@ func (r *Runner) Recover(ctx context.Context) error {
 		inst  *provider.Instance
 	}
 	var pending []survivor
+	// MEASURED BEFORE ANY IS SETTLED, since a settlement can wait on GitHub and
+	// a job measured late has lost what it did meanwhile.
 	defer func() {
-		for _, s := range pending {
-			if err := r.completeAdoption(ctx, s.adoption, s.lease, s.inst); err != nil {
-				r.log.Warn("could not settle the force release of an adopted job; the next tend tries again",
-					"name", s.inst.Name, "lease", s.lease.ID, "error", err)
+		for _, settling := range []bool{false, true} {
+			for _, s := range pending {
+				if (s.forced != nil) != settling {
+					continue
+				}
+				if err := r.completeAdoption(ctx, s.adoption, s.lease, s.inst); err != nil {
+					r.log.Warn("could not settle the force release of an adopted job; the next tend tries again",
+						"name", s.inst.Name, "lease", s.lease.ID, "error", err)
+				}
 			}
 		}
 	}()
@@ -1283,6 +1290,12 @@ func (r *Runner) Recover(ctx context.Context) error {
 				pending = append(pending, survivor{adoption: a, lease: lease, inst: inst})
 				if err != nil {
 					return err
+				}
+				if a.forced != nil {
+					r.log.Warn("an operator forced the release of a surviving job; settling it once every "+
+						"survivor is held", "name", inst.Name, "instance", inst.ID, "lease", leaseID)
+
+					continue
 				}
 
 				adopted++
