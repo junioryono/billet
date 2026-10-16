@@ -210,7 +210,7 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
 - **Fresh code:** with the golden, the source workspace and the fork each answering with a distinguishable response (an uncommitted change in the source included), each workspace's preview serves its own checkout.
 - **Revocation:** revoking access while an attach terminal and a preview WebSocket are open ends both.
 - **Network:**
-  - *measured within the namespace:* every fork, each in its own namespace with the golden's tap name and address, answered HTTP from inside that namespace. Still to measure: reachability through its veth from the relay;
+  - *measured within the namespace:* the baseline forks used the golden's tap name and address and answered HTTP; a separate fork answered HTTP through a differently named tap selected by `network_overrides`. Still to measure: reachability through its veth from the relay;
   - a direct connection to its services from another workspace or from a physical-network peer fails.
 - **vsock:**
   - *measured:* a new connection to the guest's vsock listener was answered after a snapshot and resume. Still to measure: the listener works after a restore with an updated guest CID;

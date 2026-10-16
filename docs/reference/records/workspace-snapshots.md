@@ -51,7 +51,7 @@ Batches of 1, 5 and 10 forks ran concurrently, after the snapshot had aged about
   - `boot_id` was identical in the base and in every sampled fork, so it cannot tell these forks apart. Whether userspace can change it was not tested.
 - **Ordering.** MMDS and logging behave as the record states: logging before load, MMDS after load and before resume.
 - **Network and vsock.**
-  - Every tested fork answered HTTP from inside its own namespace, with the same tap name and guest address.
+  - In the baseline batches, every fork answered HTTP from inside its own namespace, with the same tap name and guest address.
   - In the snapshot-and-resume check, an established vsock connection returned end of file, and a new connection after resume was answered.
   - Restoring with a changed guest CID was not tested. A different socket path through `vsock_override` was, and a different tap name through `network_overrides` was, and both worked.
 - **Clock.** Without help, forks restored about a minute after capture were 64 to 75 s behind the host. That is consistent with a clock resuming near capture time, though its exact progression was not established. Firecracker's `clock_realtime` fixed it only when the guest kept time on `kvm-clock`: booting the golden with `clocksource=kvm-clock` brought a fork within 0.02 s. With the guest's default `tsc` it did nothing, which is the case its documentation describes. Only snapshots aged a minute or two were tried.
