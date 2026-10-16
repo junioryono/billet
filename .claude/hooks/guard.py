@@ -204,12 +204,61 @@ RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}",
 COMMENT_STARTS = " \t\n;&|()"
 
 
+REDIRECTION_OPERATORS = ("<<<", ">>", ">|", ">&", "<&", "<>", ">", "<")
+WORD_ENDS = " \t\n;&|()<>"
+
+
+def word_end(text, j):
+    """The index just past the shell word that starts at j, quotes included."""
+    n = len(text)
+    while j < n and text[j] not in WORD_ENDS:
+        c = text[j]
+        if c == "\\":
+            j += 2
+        elif c == "'":
+            close = text.find("'", j + 1)
+            j = n if close < 0 else close + 1
+        elif c == '"':
+            j += 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            j += 1
+        else:
+            j += 1
+    return min(j, n)
+
+
+def redirection_end(text, i):
+    """The index just past a redirection starting at i (`>log`, `2>&1`, `&>/dev/null`,
+    `<<<word`), or None when none starts there. Heredocs and process substitution
+    are left to the caller. Read here, before the line is split into words, because
+    only here is a quoted `>` still told apart from an operator and `2>&1` not yet
+    split at its `&`."""
+    n, j = len(text), i
+    if text[j].isdigit():
+        if i > 0 and text[i - 1] not in " \t\n;&|()":
+            return None
+        while j < n and text[j].isdigit():
+            j += 1
+    elif text.startswith("&>", j):
+        j += 1
+    if j >= n or text[j] not in "<>":
+        return None
+    if (text.startswith("<<", j) and not text.startswith("<<<", j)) or text.startswith(("<(", ">("), j):
+        return None
+    # The target is the next word: a file, or after >& and <& a descriptor or `-`.
+    j += len(next(op for op in REDIRECTION_OPERATORS if text.startswith(op, j)))
+    while j < n and text[j] in " \t":
+        j += 1
+    return word_end(text, j)
+
+
 def preprocess(text):
     """Remove what the shell never runs as a command: line continuations,
-    comments and heredoc bodies. Quotes are tracked, and `$(...)` inside double
-    quotes opens a fresh context, so a `#` or a `<<` inside a string is left
-    alone while a heredoc inside a quoted command substitution is still a
-    heredoc."""
+    comments, heredoc bodies and redirections. Quotes are tracked, and `$(...)`
+    inside double quotes opens a fresh context, so a `#`, a `<<` or a `>` inside a
+    string is left alone while a heredoc inside a quoted command substitution is
+    still a heredoc."""
     out, stack, pending, i, n = [], ["top"], [], 0, len(text)
     while i < n:
         c, ctx = text[i], stack[-1]
@@ -238,6 +287,11 @@ def preprocess(text):
             i += 1
             continue
         # top level, or inside $( ... ) or ( ... )
+        end = redirection_end(text, i)
+        if end is not None:
+            out.append(" ")
+            i = end
+            continue
         if c in "'\"":
             stack.append(c)
         elif text.startswith("$(", i):
@@ -579,9 +633,6 @@ MAKE_VALUE_OPTIONS = {
 MAKE_OPTIONAL_NUMBER = {"--jobs", "--load-average", "--max-load"}
 MAKEFILE_NAMES = {"GNUmakefile", "makefile", "Makefile"}
 MAKE_DRY_RUN = {"--dry-run", "--just-print", "--recon", "--question", "--touch"}
-# A redirection word: an optional descriptor, the operator, and the file when it
-# is attached (`2>/dev/null`); without one the file is the next word.
-REDIRECTION = re.compile(r"(\d*|&)(>>|>\||<>|>&|<&|>|<)(.*)")
 GO_TEST_VALUE_FLAGS = {
     "run", "skip", "bench", "benchtime", "count", "cpu", "parallel", "timeout", "coverprofile", "covermode",
     "coverpkg", "blockprofile", "blockprofilerate", "cpuprofile", "memprofile", "memprofilerate", "mutexprofile",
@@ -619,22 +670,6 @@ def whole_tree(pattern, cwd):
     if pattern in ("all", BILLET_MODULE + "/..."):
         return True
     return pattern in ("./...", "...") and billet_root(cwd)
-
-
-def drop_redirections(words):
-    """The words without shell redirections: `>log`, `2>/dev/null`, and an
-    operator standing alone with the file after it."""
-    out, skip = [], False
-    for w in words:
-        if skip:
-            skip = False
-            continue
-        m = REDIRECTION.fullmatch(w)
-        if m:
-            skip = not m.group(3)
-            continue
-        out.append(w)
-    return out
 
 
 def runs_billet_makefile(directory, makefiles):
@@ -787,7 +822,6 @@ def judge_gates(commands):
         return
     for words, cwd in commands:
         try:
-            words = drop_redirections(words)
             program = os.path.basename(words[0])
             if program in MAKE_PROGRAMS:
                 judge_make(words, cwd)
