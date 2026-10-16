@@ -187,8 +187,8 @@ func TestALossTheLineHasStoppedIsNotCutFor(t *testing.T) {
 // A CUT FORGETS WHAT CAUSED IT, NOT THAT THE LINE IS STILL DROPPING. One probe
 // in three lost every round, from a different reflector each time, with the
 // answers at their baselines: the round after a cut has only one lossy round
-// since it, and must still not read as a clear line, or it would end the
-// futile episode and the cuts would never stop.
+// since it, and must still not read as a clear line, or it would count toward
+// ending the futile episode, and raise a rate.
 func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
 	t.Parallel()
 
@@ -203,6 +203,10 @@ func TestCutsThatLeaveARotatingLossAloneStop(t *testing.T) {
 
 		if c.Down.Rate < before {
 			cuts++
+		}
+
+		if n >= 2 && c.clearRun != 0 {
+			t.Fatalf("step %d, %d cuts in: a round of a line still dropping read as clear", n, cuts)
 		}
 	}
 

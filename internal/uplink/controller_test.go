@@ -278,6 +278,43 @@ func TestAnIsolatedClearRoundDoesNotEndAnEpisode(t *testing.T) {
 	}
 }
 
+// A LATCHED DIRECTION IS NOT RAISED UNTIL THE LINE HAS BEEN CLEAR FOR A WINDOW.
+// A 16 ms queue no cut moves latches the download after two cuts; the queue
+// then clears with the host still running at its rate. A raise before the
+// window of clear rounds is out could refill the queue with the host's own
+// traffic, and a latched direction could not be cut for it.
+func TestALatchedDirectionIsNotRaisedBeforeTheLineHasCleared(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+
+	n := 0
+	for ; n < 40; n++ {
+		c.Step(moving(n, 0, 300, 16*time.Millisecond))
+	}
+
+	if c.Down.futile < c.Params.Futile {
+		t.Fatalf("a queue no cut moved left the download unlatched (futile %d)", c.Down.futile)
+	}
+
+	latched := c.Down.Rate
+
+	for round := 1; round < c.Params.Window; round, n = round+1, n+1 {
+		c.Step(moving(n, 0, c.Down.Rate, 0))
+
+		if c.Down.Rate != latched {
+			t.Fatalf("clear round %d of %d raised the latched download from %.2f to %.2f",
+				round, c.Params.Window, latched, c.Down.Rate)
+		}
+	}
+
+	c.Step(moving(n, 0, c.Down.Rate, 0))
+
+	if c.Down.Rate <= latched {
+		t.Fatalf("a window of clear rounds left the download at %.2f; the latch should have lifted", c.Down.Rate)
+	}
+}
+
 // A NEW EPISODE IS JUDGED AGAINST NOTHING FROM THE LAST ONE. A 30 ms queue no
 // cut moves draws two cuts; the queue clears while the host is idle; the same
 // queue comes back, and draws two cuts of its own, not one measured against

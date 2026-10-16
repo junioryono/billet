@@ -511,14 +511,16 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		d.cutDelay, d.cutDelayKnown, d.cutTally = o.Delay, o.DelayKnown, v.tally
 
 		return d.Rate != before, true
-	case v.clear && moving >= p.Full*d.Rate &&
+	case v.clear && moving >= p.Full*d.Rate && d.futile < p.Futile &&
 		(!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
 		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and this
 		// round measured no queue, so a rate climbs back toward the line's speed as
 		// fast as the line allows and no faster, and never on a round that could
 		// not tell. NOT WITHIN THE COOLDOWN OF A CUT: the throughput window still
 		// holds the traffic from before it, which runs above any rate just cut and
-		// would undo the cut at once.
+		// would undo the cut at once. NOR WHILE LATCHED: a raise could refill the
+		// queue with this host's own traffic, and a latched direction could not be
+		// cut for it; the latch lifts once the line has been clear for a window.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
 	}
 
