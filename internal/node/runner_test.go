@@ -918,7 +918,14 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 		t.Fatal("recovery retained custody after consuming the pending force release")
 	}
 	// NOT CALLED A JOB LEFT RUNNING WITH ITS CAPACITY HELD, which it is not.
-	if log := logged.String(); strings.Contains(log, "adopted a running job") || !strings.Contains(log, "adopted=0") {
+	log := logged.String()
+	reconciled := ""
+	for line := range strings.Lines(log) {
+		if strings.Contains(line, `msg="reconciled compute left by an earlier run"`) {
+			reconciled = line
+		}
+	}
+	if strings.Contains(log, "adopted a running job") || !slices.Contains(strings.Fields(reconciled), "adopted=0") {
 		t.Errorf("recovery logged a force-released job as adopted:\n%s", log)
 	}
 	// A FORCE RELEASE LETS GO OF THE LEASE, never of the compute.
