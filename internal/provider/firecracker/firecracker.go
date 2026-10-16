@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -171,9 +172,10 @@ type Provider struct {
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
 	// because the account a VMM runs as is one only root can create files as.
 	jailWrote func(st unix.Stat_t, res resources) bool
-	// runningVMM opens the executable a jail's VMM is running, which may no longer
-	// be the file at its path. A seam because it reads /proc/<pid>/exe.
-	runningVMM func(j jail) (*os.File, error)
+	// runningVMM opens the executable of the process serving a jail's API socket,
+	// which may no longer be the file at the configured path. A seam because it
+	// needs the kernel's socket credentials and /proc/<pid>/exe.
+	runningVMM func(j jail, res resources) (*os.File, error)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -340,7 +342,9 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		bootWait:    DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
-	p.runningVMM = p.procVMMExecutable
+	p.runningVMM = func(j jail, res resources) (*os.File, error) {
+		return apiPeerExecutable(j.socket(), res.UID)
+	}
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
@@ -1594,7 +1598,7 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 // longer this jail's VMM. No pid file, an unreadable one and a process billet
 // cannot inspect are all "could not tell", which is false here.
 func (p *Provider) vmmExited(j jail) bool {
-	raw, err := os.ReadFile(j.pidFile())
+	raw, err := readPIDFile(j)
 	if err != nil {
 		return false
 	}
@@ -1610,7 +1614,7 @@ func (p *Provider) vmmExited(j jail) bool {
 }
 
 func (p *Provider) vmmPID(j jail) (int, error) {
-	raw, err := os.ReadFile(j.pidFile())
+	raw, err := readPIDFile(j)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// NO PID FILE IS ONLY "NOTHING IS RUNNING" IF NO VMM EVER STARTED, and
@@ -1663,6 +1667,41 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 
 	return pid, nil
 }
+
+// readPIDFile reads a jail's pid file as a file and nothing else.
+//
+// IT IS IN THE JAIL ROOT, which the jailed account owns, so the name could be
+// anything by the time billet reads it: a FIFO with no writer, on which a plain read
+// waits forever while billet holds this lease's locks, or a link to somewhere else.
+// So it is opened without following a link and without blocking, refused unless it
+// is a regular file, and read no further than a pid could need.
+func readPIDFile(j jail) ([]byte, error) {
+	fd, err := unix.Open(j.pidFile(), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil, os.ErrNotExist
+		}
+
+		return nil, fmt.Errorf("open %s: %w", j.pidFile(), err)
+	}
+
+	f := os.NewFile(uintptr(fd), j.pidFile())
+	defer f.Close()
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("read %s: %w", j.pidFile(), err)
+	}
+
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("%s is not a regular file", j.pidFile())
+	}
+
+	return io.ReadAll(io.LimitReader(f, maxPIDFile))
+}
+
+// maxPIDFile is far more than any pid and its newline.
+const maxPIDFile = 64
 
 // awaitExit waits for a signalled VMM to actually be gone.
 //

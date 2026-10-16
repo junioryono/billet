@@ -112,6 +112,23 @@ func (a *vmmAPI) info(ctx context.Context) (instanceInfo, error) {
 	return out, nil
 }
 
+// machineConfig is the guest shape a VMM reports it is running.
+type machineConfig struct {
+	VCPUCount  int   `json:"vcpu_count"`
+	MemSizeMiB int64 `json:"mem_size_mib"`
+}
+
+// machineConfig reads the VMM's account of its guest's vCPUs and memory.
+func (a *vmmAPI) machineConfig(ctx context.Context) (machineConfig, error) {
+	var out machineConfig
+
+	if err := a.call(ctx, http.MethodGet, "/machine-config", nil, &out); err != nil {
+		return machineConfig{}, err
+	}
+
+	return out, nil
+}
+
 // put sends one configuration change.
 func (a *vmmAPI) put(ctx context.Context, path string, body any) error {
 	return a.call(ctx, http.MethodPut, path, body, nil)

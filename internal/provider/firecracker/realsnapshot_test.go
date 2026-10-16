@@ -63,13 +63,23 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	// Remove rather than RemoveAll, so a store something else has used is never taken.
 	if _, err := os.Lstat(golden.snapshotsDir()); errors.Is(err, os.ErrNotExist) {
 		t.Cleanup(func() {
-			// THE PUBLISH LOCK IS THE STORE'S OWN, made by the first capture into it.
-			lock := filepath.Join(golden.snapshotsDir(), ".publish.lock")
-			if err := os.Remove(lock); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// UNDER THE STORE'S OWN LOCK, so no publisher on this node is mid-publish
+			// while its lock file goes: one waiting on the old inode then fails to
+			// stage into a store that is gone, rather than locking a new inode beside
+			// a publisher still copying.
+			store, err := golden.openStore(context.WithoutCancel(t.Context()))
+			if err != nil {
+				t.Errorf("lock the snapshots directory this test made: %v", err)
+
+				return
+			}
+			defer store.close()
+
+			if err := os.Remove(filepath.Join(store.path, publishLock)); err != nil {
 				t.Errorf("remove the publish lock this test made: %v", err)
 			}
 
-			if err := os.Remove(golden.snapshotsDir()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(store.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("remove the snapshots directory this test made: %v", err)
 			}
 		})

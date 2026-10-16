@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -116,18 +117,61 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	// THE BINARY THIS VMM IS RUNNING, NOT THE ONE AT ITS PATH NOW. A build replaced
 	// under the same name while the guest ran would otherwise label this snapshot
 	// with a VMM it was not taken by, and a restore with the new build would pass.
-	if err := p.checkRunningVMM(j, record.VMM); err != nil {
+	if err := p.checkRunningVMM(j, res, record.VMM); err != nil {
 		return err
 	}
 
 	record.VCPUs, record.Memory = shape.VCPUs, shape.Memory
+
+	// THE STORE IS TAKEN BEFORE THE GUEST IS PAUSED, and the wait for it can be
+	// abandoned: a capture queued behind another's multi-GiB copy holds this lease's
+	// lock while it waits, and a guest paused for that long has stopped for nothing.
+	store, err := p.openStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer store.close()
 
 	if err := capture(ctx, p.apiFor(j.socket()),
 		snapshotFiles{State: "/" + captureStateFile, Memory: "/" + captureMemoryFile}); err != nil {
 		return err
 	}
 
-	return p.publishCapture(ctx, j, res, shape, snapshot, record)
+	return p.publishCapture(ctx, j, res, shape, store, snapshot, record)
+}
+
+// heldStore is the snapshot store, open and locked for one publish.
+type heldStore struct {
+	path   string
+	fd     int
+	unlock func()
+}
+
+func (s heldStore) close() {
+	s.unlock()
+	_ = unix.Close(s.fd)
+}
+
+// openStore opens the snapshot store, creating it if need be, and takes its publish
+// lock, giving up when ctx does.
+func (p *Provider) openStore(ctx context.Context) (heldStore, error) {
+	store := p.snapshotsDir()
+
+	if err := os.MkdirAll(store, 0o755); err != nil {
+		return heldStore{}, fmt.Errorf("firecracker: create the snapshot store %s: %w", store, err)
+	}
+
+	fd, err := openOwnedDir(unix.AT_FDCWD, store)
+	if err != nil {
+		return heldStore{}, err
+	}
+
+	unlock, err := lockStore(ctx, fd, store)
+	if err != nil {
+		return heldStore{}, errors.Join(err, unix.Close(fd))
+	}
+
+	return heldStore{path: store, fd: fd, unlock: unlock}, nil
 }
 
 // checkSnapshotName refuses a snapshot name that is not one plain directory entry.
@@ -141,8 +185,8 @@ func checkSnapshotName(name string) error {
 }
 
 // checkRunningVMM refuses a microVM whose running VMM is not the build at execPath.
-func (p *Provider) checkRunningVMM(j jail, want string) error {
-	running, err := p.runningVMM(j)
+func (p *Provider) checkRunningVMM(j jail, res resources, want string) error {
+	running, err := p.runningVMM(j, res)
 	if err != nil {
 		return err
 	}
@@ -159,36 +203,6 @@ func (p *Provider) checkRunningVMM(j jail, want string) error {
 	}
 
 	return nil
-}
-
-// procVMMExecutable opens the executable a jail's VMM process is running.
-//
-// THROUGH /proc/<pid>/exe, which names the inode the process was started from even
-// after the path has been given to another file. The pid is checked to be this
-// jail's VMM before the open and again after it, so a pid reused in between is
-// never taken for the VMM.
-func (p *Provider) procVMMExecutable(j jail) (*os.File, error) {
-	pid, err := p.vmmPID(j)
-	if err != nil {
-		return nil, err
-	}
-
-	if pid == 0 {
-		return nil, fmt.Errorf("firecracker: %s has no running VMM to capture", j.id)
-	}
-
-	f, err := os.Open(fmt.Sprintf("/proc/%d/exe", pid))
-	if err != nil {
-		return nil, fmt.Errorf("firecracker: open the executable of the VMM of %s: %w", j.id, err)
-	}
-
-	owns, err := p.pidOwner(pid, j.id)
-	if err != nil || !owns {
-		return nil, errors.Join(fmt.Errorf("firecracker: pid %d stopped being the VMM of %s while its "+
-			"executable was opened", pid, j.id), err, f.Close())
-	}
-
-	return f, nil
 }
 
 // jailKernelDigest is the digest of the kernel linked into a jail, read through a
@@ -228,25 +242,10 @@ func (p *Provider) jailKernelDigest(j jail) (string, error) {
 // gigabytes under a random name no later capture would choose, so each one sweeps
 // them first.
 func (p *Provider) publishCapture(
-	ctx context.Context, j jail, res resources, shape guestShape, name string, record compatibility,
+	ctx context.Context, j jail, res resources, shape guestShape, held heldStore, name string,
+	record compatibility,
 ) error {
-	store := p.snapshotsDir()
-
-	if err := os.MkdirAll(store, 0o755); err != nil {
-		return fmt.Errorf("firecracker: create the snapshot store %s: %w", store, err)
-	}
-
-	storeFD, err := openOwnedDir(unix.AT_FDCWD, store)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(storeFD)
-
-	unlock, err := lockStore(storeFD, store)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+	store, storeFD := held.path, held.fd
 
 	p.sweepStaging(store)
 
@@ -465,19 +464,39 @@ func (p *Provider) sealPublished(f *os.File, file string) error {
 // beginning with a dot, so no restore can name one.
 const stagingPrefix = ".staging-"
 
-// lockStore takes the store's publish lock, held for one publish.
-func lockStore(storeFD int, store string) (func(), error) {
-	fd, err := unix.Openat(storeFD, ".publish.lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+// publishLock is the store's lock file. It stays in the store for good: a lock file
+// removed while somebody waits on it lets the next publisher lock a new inode
+// beside them.
+const publishLock = ".publish.lock"
+
+// lockStore takes the store's publish lock, polling so the wait ends when ctx does.
+func lockStore(ctx context.Context, storeFD int, store string) (func(), error) {
+	fd, err := unix.Openat(storeFD, publishLock, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: open the publish lock of %s: %w", store, err)
 	}
 
-	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
-		return nil, errors.Join(fmt.Errorf("firecracker: lock the snapshot store %s: %w", store, err),
-			unix.Close(fd))
-	}
+	ticker := time.NewTicker(lifecycleLockPoll)
+	defer ticker.Stop()
 
-	return func() { _ = unix.Close(fd) }, nil
+	for {
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() { _ = unix.Close(fd) }, nil
+		}
+
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			return nil, errors.Join(fmt.Errorf("firecracker: lock the snapshot store %s: %w", store, err),
+				unix.Close(fd))
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(fmt.Errorf("firecracker: wait for the snapshot store %s: %w", store,
+				ctx.Err()), unix.Close(fd))
+		case <-ticker.C:
+		}
+	}
 }
 
 // sweepStaging removes staging directories abandoned by a publish that was killed.

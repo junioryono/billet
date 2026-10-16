@@ -297,7 +297,9 @@ func (p *Provider) restoreInto(
 		Tap:   tap,
 		// Metadata is this lease's, never the golden's: the data store is empty after
 		// a load, so nothing of the golden's survives into it.
-		Metadata: md,
+		Metadata:  md,
+		VCPUs:     spec.VCPU,
+		MemoryMiB: int64(spec.Memory) >> 20,
 	}); err != nil {
 		return nil, err
 	}

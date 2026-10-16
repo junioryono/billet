@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -403,7 +404,7 @@ func TestACaptureRefusesAVMMRunningAReplacedBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h.p.runningVMM = func(jail) (*os.File, error) { return os.Open(older) }
+	h.p.runningVMM = func(jail, resources) (*os.File, error) { return os.Open(older) }
 
 	err := h.p.Capture(t.Context(), theInstance, "gold-1")
 	if !errors.Is(err, errSnapshotIncompatible) {
@@ -587,5 +588,66 @@ func TestACapturePublishesDurably(t *testing.T) {
 
 	if !slices.Contains(synced, filepath.Dir(h.p.snapshotsDir())) {
 		t.Errorf("the directory holding the store was never synced; synced %v", synced)
+	}
+}
+
+// A CAPTURE QUEUED BEHIND ANOTHER PUBLISH CAN BE ABANDONED, and it waits for the
+// store before it pauses its guest, so giving up leaves the guest running.
+func TestACaptureWaitingForTheStoreCanBeAbandonedWithItsGuestRunning(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	held, err := h.p.openStore(t.Context())
+	if err != nil {
+		t.Fatalf("hold the store: %v", err)
+	}
+	defer held.close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	err = h.p.Capture(ctx, theInstance, "gold-1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Capture behind a held store = %v, want it to give up with its context", err)
+	}
+
+	if state := vmm.currentState(); state == statePaused {
+		t.Error("a capture that never got the store paused its guest")
+	}
+}
+
+// A PID FILE THE JAIL TURNED INTO A FIFO IS NOT WAITED ON. A plain read of one with no
+// writer never returns, and billet would hold this lease's locks while it waited.
+func TestAPIDFileThatIsAFIFOIsRefusedWithoutWaiting(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	j := h.p.jailFor(theInstance)
+	if err := os.Remove(j.pidFile()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := unix.Mkfifo(j.pidFile(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := h.p.vmmPID(j)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO in place of the pid file was read as a pid")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a FIFO in place of the pid file did not return")
 	}
 }

@@ -65,6 +65,9 @@ type fakeVMM struct {
 	// a VMM that has been taken over could do to its own files.
 	root     string
 	onCreate func(root string)
+	// vcpus and memMiB are the guest shape it reports, as a loaded snapshot set it.
+	vcpus  int
+	memMiB int64
 
 	listener net.Listener
 	server   *http.Server
@@ -85,7 +88,8 @@ func startFakeVMM(t *testing.T, socket, id string) *fakeVMM {
 		t.Fatalf("make the socket directory: %v", err)
 	}
 
-	v := &fakeVMM{id: id, state: "Not started", refuse: map[string]string{}}
+	// THE SHAPE aSpec ASKS FOR, which is what a snapshot of one of its guests loads as.
+	v := &fakeVMM{id: id, state: "Not started", refuse: map[string]string{}, vcpus: 2, memMiB: 2048}
 
 	var lc net.ListenConfig
 
@@ -127,6 +131,13 @@ func (v *fakeVMM) stop() {
 func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+
+	if r.Method == http.MethodGet && r.URL.Path == "/machine-config" {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(w, map[string]any{"vcpu_count": v.vcpus, "mem_size_mib": v.memMiB, "smt": false})
+
+		return
+	}
 
 	if r.Method == http.MethodGet && r.URL.Path == "/" {
 		w.Header().Set("Content-Type", "application/json")
@@ -593,7 +604,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	}
 
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
-	h.p.runningVMM = func(jail) (*os.File, error) { return os.Open(h.p.execPath) }
+	h.p.runningVMM = func(jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 
 	return h
 }
