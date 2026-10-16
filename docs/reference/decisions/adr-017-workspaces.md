@@ -54,7 +54,7 @@ Only an authorised golden builder, or the custodian assigned to that workspace, 
 - **After restore:**
   - the barrier holds until the agent has proved the kernel reseeded from the VMGenID notification;
   - the agent sets the guest's wall clock to the current time through a measured mechanism, because a restored clock continues from snapshot time (an aged golden or a long suspension would otherwise start TLS and credential checks in the past), and an unknown result holds the barrier;
-  - the agent then regenerates per-fork identity (machine id, host keys, hostname, the Docker daemon's identity). `boot_id` is the same in every fork and cannot be changed from userspace (measured), so nothing may rely on it to tell forks apart;
+  - the agent then regenerates per-fork identity (machine id, host keys, hostname, the Docker daemon's identity). `boot_id` was identical in the base and every sampled fork (measured), so nothing may rely on the inherited value to tell forks apart;
   - only then do services start.
 - **Services:** a service with clone-sensitive state (a database's system identifier, a TLS server or client session, a persistent random seed, a cached token) is reinitialised through a procedure measured for that service, or is not in the golden at all and starts fresh after restore.
 - **No guess:** a golden whose services include one billet cannot classify is refused at publication.
@@ -187,7 +187,7 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
 
   Still to measure: the time from a create request to a healthy application stack at 1, 5, 10 and 20 concurrent workspaces.
 - **Reseeding:** *partly measured:*
-  - the guest kernel billet ships binds Firecracker's VMGenID device, and its random output differed in 10 of 10 forks;
+  - the guest kernel billet ships binds Firecracker's VMGenID device, and kernel random samples differed in 10 of 10 forks (that VMGenID caused the reseed is not established);
   - a userspace RNG seeded before capture returned the same value in every fork, which is the case the barrier exists for.
 
   Still to measure:
@@ -210,12 +210,12 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - *measured within the namespace:* every fork, each in its own namespace with the golden's tap name and address, answered HTTP from inside that namespace. Still to measure: reachability through its veth from the relay;
   - a direct connection to its services from another workspace or from a physical-network peer fails.
 - **vsock:**
-  - *measured:* a vsock listener in the guest survives a snapshot;
+  - *measured:* a new connection to the guest's vsock listener was answered after a snapshot and resume. Still to measure: the listener works after a restore with an updated guest CID;
   - *measured:* an established connection is closed by a snapshot of the running VM (the next read returns end of file);
   - the agent and the relay recover it.
 - **The memory file in a jail:** *measured.* A hard link into the chroot, root-owned and mode 0444 as the kernel is, restores under the jailer, and the jailed uid can read it but not write it. A golden's memory file reaches a jail that way. A suspension's is confidential, so it needs a mode only its own VM can read; that is still to be measured.
 - **Compatibility:** a golden with a mismatched or unreadable fingerprint is refused by billet before load, and a matching one restores.
-- **Clock:** *measured:* the guest's wall clock continues from the moment of capture, 64 to 75 s behind for forks restored a minute later. Still to measure: after restoring an aged golden and a long suspension, the guest's wall clock is current before the barrier releases, with whatever the chosen Firecracker clock mechanism requires of the host.
+- **Clock:** *measured:* the guest's wall clock was 64 to 75 s behind the host for forks restored about a minute after capture. Still to measure: after restoring an aged golden and a long suspension, the guest's wall clock is current before the barrier releases, with whatever the chosen Firecracker clock mechanism requires of the host.
 - **Disks:**
   - replacing a restored golden's placeholder slot with a workspace volume through the existing-drive update works, covering device sizing, cached reads and writes and repeated restores;
   - an old workspace volume mounts after journal recovery for the fallback.
