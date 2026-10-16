@@ -154,6 +154,10 @@ func runCheck(ctx context.Context, env cli.Env, opts checkOptions) (checkReport,
 		reportNeedrestart(env.Stdout, "/")
 	}
 
+	if runtime.GOOS == "linux" && cfg.Node != nil {
+		reportLockDir(env.Stdout, cfg.Node.LockDir, checkUnitProperties(ctx))
+	}
+
 	// The probe flag skips the network; so does the BILLET_MAINTENANCE
 	// environment variable — for the SKIPS ONLY, never the fence. The env form
 	// exists for binary-vintage compatibility: the Ansible upgrade transaction

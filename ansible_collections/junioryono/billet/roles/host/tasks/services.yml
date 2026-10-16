@@ -575,6 +575,23 @@
         state: started
       when: billet_server_should_run
 
+    # THE LOCK DIRECTORY THE CANDIDATE UNIT REQUIRES, MADE AGAIN HERE (#175). The
+    # node was stopped above with the previous unit still loaded, and a unit from
+    # before declared /run/billet/locks a RuntimeDirectory, which its stop
+    # removes; the candidate unit names it in ReadWritePaths and refuses to
+    # start without it (226/NAMESPACE). Measured on systemd 255.4, 2026-10-16:
+    # a stop with the unit file replaced and not yet reloaded removes the
+    # previous unit's runtime directories, and the start after the reload fails.
+    - name: Make the host lock directory before the upgraded node starts
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop: "{{ billet_host_lock_directories }}"
+      when: billet_node_should_run
+
     - name: Start the quiescent upgraded node readiness probe
       ansible.builtin.systemd_service:
         name: billet-node.service
@@ -848,6 +865,27 @@
     - not ansible_check_mode
     - not billet_binary_upgrade | default(false)
     - billet_config_install.changed | default(false)
+
+# THE LOCK DIRECTORY THE NODE UNIT REQUIRES, MADE AGAIN BEFORE ANY OF THE NODE
+# STARTS BELOW (#175): a stop earlier in this converge (guest networking's
+# drain) can run with the previous unit still loaded, whose RuntimeDirectory
+# removal takes the directory with it, and the migration, the restart and the
+# start below load the unit that requires it. Measured on systemd 255.4,
+# 2026-10-16: a stop with the unit file replaced and not yet reloaded removes
+# the previous unit's runtime directories, and the start after the reload
+# fails with 226/NAMESPACE.
+- name: Make the host lock directory before the node starts
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ billet_host_lock_directories }}"
+  when:
+    - billet_node_should_run
+    - not ansible_check_mode
+  become: true
 
 # THE ENDPOINT MIGRATION, in place of the ordinary restart: the command judges
 # afresh whether the running node dials the installed endpoint and, when it

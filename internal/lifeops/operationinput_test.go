@@ -1,6 +1,7 @@
 package lifeops
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,26 +84,44 @@ func TestRequiredRetainedInputsProtectEveryTraversalEntry(t *testing.T) {
 	}
 }
 
+// ON BOTH NODE UNIT SHAPES: the shipped one names the host lock directory in
+// ReadWritePaths and declares only the registration record's (#175); the one
+// from before declares both. A required input under either directory stays
+// volatile, the exemption being for the records the node recreates.
 func TestRequiredRetainedInputsAreCheckedAtEveryAdmission(t *testing.T) {
-	for _, verb := range []string{"", "enable", "disable", "stop", "start"} {
-		t.Run(verb, func(t *testing.T) {
-			f := newOperationFixture(t)
-			f.unit(t, "billet-node.service")["RuntimeDirectory"] = "billet/locks billet/registration"
-			p := OperationProtection{Units: []string{"billet-node.service"},
-				UnitPaths:      map[string][]string{"billet-node.service": {"/run/billet/locks", "/run/billet/registration"}},
-				RequiredInputs: map[string][]string{"billet-node.service": {"/etc/billet/tls/node.key"}}}
-			var sequence []Operation
-			if verb != "" {
-				sequence = []Operation{{Verb: verb, Unit: "billet-node.service"}}
-			}
-			if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err != nil {
-				t.Fatalf("persistent input with disposable own records refused: %v", err)
-			}
-			p.RequiredInputs["billet-node.service"] = []string{"/run/billet/locks/tls/node.key"}
-			if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
-				t.Fatalf("own runtime directory exempted required input: %v", err)
-			}
-		})
+	shapes := map[string]map[string]string{
+		"shipped":     {"RuntimeDirectory": "billet/registration", "ReadWritePaths": "-/etc/billet/tls -/srv/jailer /run/billet/locks"},
+		"from before": {"RuntimeDirectory": "billet/locks billet/registration", "ReadWritePaths": "-/etc/billet/tls -/srv/jailer"},
+	}
+	for shape, values := range shapes {
+		for _, verb := range []string{"", "enable", "disable", "stop", "start"} {
+			t.Run(shape+"/"+verb, func(t *testing.T) {
+				requiredRetainedInputsCase(t, verb, values)
+			})
+		}
+	}
+}
+
+func requiredRetainedInputsCase(t *testing.T, verb string, values map[string]string) {
+	t.Helper()
+
+	f := newOperationFixture(t)
+	node := f.unit(t, "billet-node.service")
+	maps.Copy(node, values)
+	p := OperationProtection{Units: []string{"billet-node.service"}, RetainedPathUnits: []string{"billet-node.service"},
+		ArchivedInputRoots: []string{"/var/lib/billet/server"},
+		UnitPaths:          map[string][]string{"billet-node.service": {"/run/billet/locks", "/run/billet/registration"}},
+		RequiredInputs:     map[string][]string{"billet-node.service": {"/etc/billet/tls/node.key"}}}
+	var sequence []Operation
+	if verb != "" {
+		sequence = []Operation{{Verb: verb, Unit: "billet-node.service"}}
+	}
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err != nil {
+		t.Fatalf("persistent input with disposable own records refused: %v", err)
+	}
+	p.RequiredInputs["billet-node.service"] = []string{"/run/billet/locks/tls/node.key"}
+	if err := f.inspector.AdmitOperations(t.Context(), sequence, p); err == nil || !strings.Contains(err.Error(), "retained-input-volatile") {
+		t.Fatalf("own runtime directory exempted required input: %v", err)
 	}
 }
 

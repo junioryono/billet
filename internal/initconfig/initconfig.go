@@ -102,7 +102,8 @@ const (
 	// ProfileLocalService is the system-service shape the services billet ships
 	// run, and its CONTENTS differ by platform. On Linux: config and App key
 	// under /etc/billet, state under /var/lib/billet, the node's deployment lock
-	// under /run/billet/locks — the units' own RuntimeDirectory. On macOS the
+	// under /run/billet/locks — the directory billet's tmpfiles.d entry makes
+	// at boot and the node unit names writable. On macOS the
 	// same shape lives under /usr/local, because launchd performs no variable
 	// substitution and every path a launch agent uses is a literal in a file
 	// billet ships. Written for `billet local up` on either.
@@ -113,9 +114,10 @@ const (
 const DefaultListen = "127.0.0.1:7717"
 
 // Paths a local-service config must use, matched to the packaged units.
-// deploy/billet-server.service pins StateDirectory=billet/server and the node
-// unit RuntimeDirectory=billet/locks; TestLocalServiceMatchesThePackagedUnits
-// keeps these in step with the unit files.
+// deploy/billet-server.service pins StateDirectory=billet/server, and
+// deploy/billet-tmpfiles.conf the lock directory the node unit names in
+// ReadWritePaths; TestGenerateLocalServiceMatchesThePackagedUnits keeps these
+// in step with the shipped files.
 const (
 	serviceConfDir    = "/etc/billet"
 	serviceStateBase  = "/var/lib/billet"
@@ -1340,8 +1342,8 @@ func stateDirBase() string {
 // ec2 node is an orchestrator, so it is the one backend a Mac can run without
 // any of the hardware the others need.
 func (p Params) lockBlock(dir string) string {
-	note := "in the tmpfs directory the packaged node\n" +
-		"  # unit creates per boot (RuntimeDirectory=billet/locks). The per-user\n" +
+	note := "in the tmpfs directory billet's tmpfiles.d\n" +
+		"  # entry creates at boot (no unit removes it at a stop). The per-user\n" +
 		"  # default is wrong for a system service sharing a rootful runtime socket."
 
 	if p.platform() == "darwin" {
@@ -1387,9 +1389,9 @@ func (p Params) platform() string {
 // profilePaths is where a generated config points, resolved by profile.
 type profilePaths struct {
 	serverState, nodeState, keyPath string
-	// lockDir is set only for the service shape: the packaged node unit's
-	// RuntimeDirectory creates it per boot, while the user-session shape takes
-	// billet's per-user default.
+	// lockDir is set only for the service shape: billet's tmpfiles.d entry
+	// creates it per boot, while the user-session shape takes billet's per-user
+	// default.
 	lockDir string
 }
 

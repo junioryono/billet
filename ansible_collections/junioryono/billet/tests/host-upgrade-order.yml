@@ -428,6 +428,15 @@
           - billet_upgrade_names.index('Inspect candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes')
           - billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
           - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the quiescent upgraded server readiness probe')
+          # THE LOCK DIRECTORY IS MADE AFTER THE CANDIDATE UNITS LOAD AND BEFORE THE
+          # NODE STARTS (#175): the original node's stop, under the previous unit,
+          # may have removed it, and the candidate unit refuses to start without it.
+          - billet_upgrade_names.index('Load candidate systemd units before starting either upgraded service') < billet_upgrade_names.index('Make the host lock directory before the upgraded node starts')
+          - billet_upgrade_names.index('Make the host lock directory before the upgraded node starts') + 1 == billet_upgrade_names.index('Start the quiescent upgraded node readiness probe')
+          - billet_host_service_tasks | map(attribute='name') | list | select('equalto', 'Make the host lock directory before the node starts') | list | length == 1
+          - (billet_host_service_tasks | map(attribute='name') | list).index('Make the host lock directory before the node starts') < (billet_host_service_tasks | map(attribute='name') | list).index("Migrate the node's endpoint before the ordinary restart")
+          - (billet_host_service_tasks | map(attribute='name') | list).index('Make the host lock directory before the node starts') < (billet_host_service_tasks | map(attribute='name') | list).index('Restart the billet node after non-binary inputs change')
+          - (billet_host_service_tasks | map(attribute='name') | list).index('Make the host lock directory before the node starts') < (billet_host_service_tasks | map(attribute='name') | list).index('Enable and start the billet node')
           - billet_upgrade_names.index('Start the quiescent upgraded node readiness probe') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline')
           - billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline') < billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval')
           - billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability before committing the transaction')

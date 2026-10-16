@@ -88,7 +88,7 @@ func TestGenerateLocalServicePathsAreServiceShaped(t *testing.T) {
 
 // THE SERVICE SHAPE IS PINNED TO THE PACKAGED UNITS THEMSELVES, not to a copy
 // of their values: the paths here are read out of deploy/*.service, so moving a
-// StateDirectory or the RuntimeDirectory breaks this test rather than shipping
+// StateDirectory or the lock directory breaks this test rather than shipping
 // units and generator that disagree.
 func TestGenerateLocalServiceMatchesThePackagedUnits(t *testing.T) {
 	asPlatform(t, "linux")
@@ -115,12 +115,16 @@ func TestGenerateLocalServiceMatchesThePackagedUnits(t *testing.T) {
 		t.Errorf("node.state_dir %q does not match the node unit's StateDirectory (%q)",
 			cfg.Node.StateDir, want)
 	}
-	// The node unit declares more than one runtime directory (its locks and
-	// its registration record); the lock directory must be one of them.
-	runtimeDirs := strings.Fields(unitValue(t, nodeUnit, "RuntimeDirectory"))
-	if !slices.Contains(runtimeDirs, strings.TrimPrefix(cfg.Node.LockDir, "/run/")) {
-		t.Errorf("node.lock_dir %q is not one of the node unit's RuntimeDirectory entries (%q)",
-			cfg.Node.LockDir, runtimeDirs)
+	// The lock directory is the one billet's tmpfiles.d entry makes, and the node
+	// unit names it in ReadWritePaths rather than declaring it a RuntimeDirectory,
+	// whose stop would remove it under a lock another process holds (#175).
+	if cfg.Node.LockDir != deploy.NodeLockDir || !strings.Contains(deploy.Tmpfiles, "d "+cfg.Node.LockDir+" ") {
+		t.Errorf("node.lock_dir %q is not the directory billet-tmpfiles.conf makes (%q)",
+			cfg.Node.LockDir, deploy.NodeLockDir)
+	}
+	if writable := strings.Fields(unitValue(t, nodeUnit, "ReadWritePaths")); !slices.Contains(writable, cfg.Node.LockDir) {
+		t.Errorf("node.lock_dir %q is not one of the node unit's ReadWritePaths entries (%q)",
+			cfg.Node.LockDir, writable)
 	}
 
 	// Both units read the config from the path their ExecStart names — parsed

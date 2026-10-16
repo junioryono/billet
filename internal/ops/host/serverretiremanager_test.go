@@ -37,6 +37,15 @@ func TestMain(m *testing.M) {
 	}
 	nodeDrainRequestFile = filepath.Join(dir, "billet-node-drain")
 
+	// THE HOST'S OWN systemd IS NOT ASKED BY A CHECK: runCheck's lock directory
+	// report answers from a node unit nothing installed, and its own tests stand
+	// in their answers.
+	checkUnitProperties = func(context.Context) func(string, ...string) (map[string][]string, error) {
+		return func(string, ...string) (map[string][]string, error) {
+			return map[string][]string{"LoadState": {"not-found"}}, nil
+		}
+	}
+
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
