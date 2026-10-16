@@ -47,11 +47,24 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# PEELED, so an annotated tag (what cut-release.yml writes) names its commit
-# rather than the tag object, and a lightweight one names its commit as it is.
-git for-each-ref \
-	--format='%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end) %(refname:strip=2)' \
-	'refs/tags/v*' >"$work/tags"
+# THE RELEASE TAGS AND THE COMMITS THEY NAME, peeled all the way: an annotated
+# tag (what cut-release.yml writes) names a tag object, and a tag of a tag names
+# another, which for-each-ref's %(*objectname) peels only once. `^{commit}`
+# follows the chain to the end, and one cat-file answers for every tag in input
+# order, with `missing` for a tag that does not end at a commit; that tag names
+# no release, so it is left out. cat-file's own failure ends this under set -e.
+git for-each-ref --format='%(refname:strip=2)' 'refs/tags/v*' >"$work/refs"
+awk '/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/' "$work/refs" >"$work/names"
+awk '{ print "refs/tags/" $0 "^{commit}" }' "$work/names" |
+	git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null >"$work/peeled"
+
+if [ "$(wc -l <"$work/names")" -ne "$(wc -l <"$work/peeled")" ]; then
+	printf 'release-ref: git answered for %s of %s release tags\n' \
+		"$(wc -l <"$work/peeled" | tr -d ' ')" "$(wc -l <"$work/names" | tr -d ' ')" >&2
+	exit 1
+fi
+
+paste -d ' ' "$work/peeled" "$work/names" | awk '$2 == "commit" { print $1, $3 }' >"$work/tags"
 
 git log --first-parent --format='%H %s' HEAD >"$work/chain"
 
@@ -63,8 +76,9 @@ git log --first-parent --format='%H %s' HEAD >"$work/chain"
 # prove the tags came with it (`git fetch --no-tags`), and with them missing a
 # release branch would read as main, or as an older release when only its newest
 # tag is gone. cut-release.yml commits `Release vX.Y.Z` on the branch it tags,
-# so a commit with that exact subject that the walk reaches before any tag is a
-# tag this clone lacks, and the answer is a refusal (status 3).
+# so a commit with that exact subject whose own tags do not include vX.Y.Z is a
+# tag this clone lacks, even when an older tag shares the commit, and the answer
+# is a refusal (status 3).
 #
 # THE PATTERN IS A LITERAL IN THE PROGRAM, not passed with -v: awk processes
 # escapes in a -v value, so `\.` would arrive as `.` and match any character.
@@ -81,16 +95,22 @@ ref=$(awk '
 		return 0
 	}
 	FILENAME == ARGV[1] {
-		if ($2 ~ /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ &&
-			(!($1 in best) || newer($2, best[$1]))) best[$1] = $2
+		has[$1, $2] = 1
+		if (!($1 in best) || newer($2, best[$1])) best[$1] = $2
 		next
 	}
-	$1 in best { print best[$1]; done = 1; exit }
-	substr($0, length($1) + 2) ~ /^Release v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {
-		print substr($0, length($1) + 10) " " $1
-		done = 1
-		exit 3
+	{
+		subject = substr($0, length($1) + 2)
+		if (subject ~ /^Release v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) {
+			version = substr(subject, 9)
+			if (!(($1, version) in has)) {
+				print version " " $1
+				done = 1
+				exit 3
+			}
+		}
 	}
+	$1 in best { print best[$1]; done = 1; exit }
 	END { if (!done) print "main" }
 ' "$work/tags" "$work/chain")
 status=$?

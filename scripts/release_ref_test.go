@@ -97,6 +97,24 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 					commit(t, repo, tag)
 					fixtureGit(t, repo, "tag", tag)
 				}
+
+				// A RELEASE NAME ON A TREE names no commit, so it is no release.
+				commit(t, repo, "a tagged tree")
+				fixtureGit(t, repo, "tag", "v0.9.0", "HEAD^{tree}")
+			},
+			want: "v0.4.0",
+		},
+		{
+			// A TAG OF A TAG, which %(*objectname) would peel only as far as the
+			// inner tag object, so no commit would ever match it.
+			name: "a release tag on another tag",
+			build: func(t *testing.T, repo string) {
+				t.Helper()
+
+				commit(t, repo, "Release v0.4.0")
+				fixtureGit(t, repo, "tag", "-a", "inner", "-m", "inner")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0", "inner")
+				commit(t, repo, "a carry")
 			},
 			want: "v0.4.0",
 		},
@@ -237,6 +255,26 @@ func TestTheReleaseRefRefusesWhatItCannotTell(t *testing.T) {
 		}
 	})
 
+	// AN OLDER TAG ON THE RELEASE COMMIT IS NOT ITS TAG: the subject names the
+	// release the commit was cut as, and that tag is the one that must be here.
+	t.Run("the release's tag missing beside an older one on its commit", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		commit(t, repo, "Release v0.4.10")
+		fixtureGit(t, repo, "tag", "v0.4.9")
+		commit(t, repo, "a carry")
+
+		got, stderr, err := releaseRef(t, repo)
+		if err == nil {
+			t.Fatalf("release-ref.sh answered %q for a commit cut as v0.4.10 with only v0.4.9 on it", got)
+		}
+
+		if !strings.Contains(stderr, "cut v0.4.10, and this clone has no v0.4.10 tag") {
+			t.Errorf("the refusal does not name the missing tag:\n%s", stderr)
+		}
+	})
+
 	t.Run("no repository", func(t *testing.T) {
 		t.Parallel()
 
@@ -344,8 +382,11 @@ func TestTheReleaseRefFixturesIgnoreTheDevelopersGitConfiguration(t *testing.T) 
 		t.Fatalf("create the hooks directory: %v", err)
 	}
 
+	const refusal = "billet-hostile-hook refused this commit"
+
 	for _, hook := range []string{"pre-commit", "commit-msg"} {
-		if err := forkSafeWriteFile(filepath.Join(hooks, hook), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		body := "#!/bin/sh\necho '" + refusal + "' >&2\nexit 1\n"
+		if err := forkSafeWriteFile(filepath.Join(hooks, hook), []byte(body), 0o755); err != nil {
 			t.Fatalf("write the %s hook: %v", hook, err)
 		}
 	}
@@ -362,20 +403,41 @@ func TestTheReleaseRefFixturesIgnoreTheDevelopersGitConfiguration(t *testing.T) 
 
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
-	t.Setenv("GIT_CONFIG_PARAMETERS", "'core.hookspath'='"+hooks+"'")
+	// An identity too, so the hook is the only thing this route can refuse with.
+	parameters := "'core.hookspath'='" + hooks + "' 'user.name'='Hostile' " +
+		"'user.email'='hostile@example.invalid'"
 
-	// HOSTILE, PROVED: a plain git under it cannot commit.
-	plain := t.TempDir()
-	for _, args := range [][]string{
-		{"init", "--quiet"},
-		{"commit", "--quiet", "--allow-empty", "-m", "probe"},
+	t.Setenv("GIT_CONFIG_PARAMETERS", parameters)
+
+	// HOSTILE, PROVED, EACH ROUTE ON ITS OWN: a plain git that reads only that
+	// route initialises a repository and then cannot commit, refused by the hook.
+	for _, route := range []struct {
+		name string
+		env  []string
+	}{
+		{"the global configuration under HOME", withoutEnv("GIT_CONFIG_PARAMETERS")},
+		{"GIT_CONFIG_PARAMETERS", append(withoutEnv("GIT_CONFIG_PARAMETERS"),
+			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_PARAMETERS="+parameters)},
 	} {
-		cmd := exec.CommandContext(t.Context(), "git", args...)
-		cmd.Dir = plain
+		plain := t.TempDir()
 
-		out, err := cmd.CombinedOutput()
-		if args[0] == "commit" && err == nil {
-			t.Fatalf("the hostile configuration let a plain commit through, so it proves nothing\n%s", out)
+		initialise := exec.CommandContext(t.Context(), "git", "init", "--quiet")
+		initialise.Dir = plain
+		initialise.Env = route.env
+
+		if out, err := initialise.CombinedOutput(); err != nil {
+			t.Fatalf("a plain git init under %s failed, so the probe proves nothing: %v\n%s",
+				route.name, err, out)
+		}
+
+		probe := exec.CommandContext(t.Context(), "git", "commit", "--quiet", "--allow-empty", "-m", "probe")
+		probe.Dir = plain
+		probe.Env = route.env
+
+		out, err := probe.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), refusal) {
+			t.Fatalf("%s did not make a plain commit fail in its hook (%v), so it proves "+
+				"nothing\n%s", route.name, err, out)
 		}
 	}
 
@@ -436,6 +498,21 @@ func commit(t *testing.T, repo, message string) {
 	t.Helper()
 
 	fixtureGit(t, repo, "commit", "--quiet", "--allow-empty", "-m", message)
+}
+
+// withoutEnv is this process's environment without the named variable.
+func withoutEnv(name string) []string {
+	env := make([]string, 0, len(os.Environ()))
+
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, name+"=") {
+			continue
+		}
+
+		env = append(env, kv)
+	}
+
+	return env
 }
 
 // fixtureGit runs git in a fixture repository, in fixtureGitEnv.
