@@ -919,6 +919,50 @@ func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
 	}
 }
 
+// A FORCE RELEASE RECOVERY CONSUMES REMOVES THE RUNNER FIRST, as a tend's
+// does, and one it cannot remove is left held for the tend that tries again:
+// the lease is released only once nothing at GitHub can still route the job's
+// runner work.
+func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	first := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 81, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := first.Destroy(t.Context(), 81); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7}, ensureErr: errors.New("github is unreachable")}
+	restarted := New(a, host, jit, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover = %v, want a runner it could not remove left to the tend", err)
+	}
+	if !slices.Contains(jit.ensureCalls, lease.ID) {
+		t.Fatalf("recovery settled a force release without removing its runner: %v", jit.ensureCalls)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil || len(restarted.heldLeases()) != 1 {
+		t.Fatalf("lease %v, held %v; want a runner not yet removed to keep its lease held", err,
+			restarted.heldLeases())
+	}
+
+	jit.ensureErr = nil
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the force release was not settled once its runner was removed: %v", err)
+	}
+}
+
 // AND IT KEEPS SAYING SO. The SECOND destroy for the same request must answer
 // ErrCustody too, not success.
 //

@@ -527,7 +527,25 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
+	// EVERY WAY OUT OF THIS TEST RELEASES THE TEND AND JOINS BOTH WORKERS, which
+	// run detached from the test's context.
 	inDestroy, resume := make(chan struct{}), make(chan struct{})
+	var resumed sync.Once
+	release := func() { resumed.Do(func() { close(resume) }) }
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		release()
+		joined := make(chan struct{})
+		go func() {
+			workers.Wait()
+			close(joined)
+		}()
+		select {
+		case <-joined:
+		case <-time.After(10 * time.Second):
+			t.Error("a worker outlived the test")
+		}
+	})
 	var once sync.Once
 	h.p.onDestroy = func(string) {
 		once.Do(func() {
@@ -536,7 +554,7 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 		})
 	}
 	destroyed := make(chan error, 1)
-	go func() { destroyed <- next.Destroy(context.WithoutCancel(t.Context()), h.lease.RequestID) }()
+	workers.Go(func() { destroyed <- next.Destroy(context.WithoutCancel(t.Context()), h.lease.RequestID) })
 	select {
 	case <-inDestroy:
 	case err := <-destroyed:
@@ -553,15 +571,12 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 		}
 	}
 	readopted := make(chan error, 1)
-	go func() { readopted <- next.Recover(context.WithoutCancel(t.Context())) }()
+	workers.Go(func() { readopted <- next.Recover(context.WithoutCancel(t.Context())) })
 	select {
 	case <-read:
 	case err := <-readopted:
-		close(resume)
-		<-destroyed
 		t.Fatalf("the re-registration's recovery ended (%v) without reading the lease", err)
 	case <-time.After(10 * time.Second):
-		close(resume)
 		t.Fatal("the re-registration's recovery never read the lease")
 	}
 	// THE ADOPTION IS NEXT for the recovery that read the lease. Nothing it does
@@ -569,7 +584,7 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 	// time is a window for the defect to show in, and the assertions below
 	// hold however long it is.
 	time.Sleep(50 * time.Millisecond)
-	close(resume)
+	release()
 
 	destroyErr, readoptErr := within(t, destroyed, "the destroy"), within(t, readopted, "the re-adoption")
 	if destroyErr != nil {
@@ -651,9 +666,11 @@ func TestAnEntrySettledDuringItsLookupLeavesNothingMeasured(t *testing.T) {
 	}
 }
 
-// A RECOVERY THE STOP CANCELLED LOOKS FOR NO COUNTERS: the process is leaving,
-// and the checkpoint it has not read stays for the next process.
-func TestARecoveryTheStopCancelledLeavesTheCheckpointsForTheNextProcess(t *testing.T) {
+// A RECOVERY THE STOP CANCELLED AFTER ITS RENEWALS STILL MEASURES WHAT IT
+// ADOPTED: it returns as recovered, so the drain that follows does not recover
+// again, and skipping the measuring left a drained job settling with nothing
+// measured. A handoff after it still leaves the next process the series.
+func TestARecoveryTheStopCancelledStillMeasuresWhatItAdopted(t *testing.T) {
 	h := newHandoverHost(t)
 
 	first, firstMonitor := h.process(t)
@@ -674,33 +691,64 @@ func TestARecoveryTheStopCancelledLeavesTheCheckpointsForTheNextProcess(t *testi
 	if ctx.Err() == nil {
 		t.Fatal("the stop never came, so this proves nothing")
 	}
-	if got := h.p.targets.Load(); got != targets || nextMonitor.Measuring(h.name) {
-		t.Errorf("a cancelled recovery looked for counters %d times and measuring = %v, want neither",
-			got-targets, nextMonitor.Measuring(h.name))
+	if got := h.p.targets.Load(); got == targets || !nextMonitor.Measuring(h.name) {
+		t.Fatalf("a recovery the stop cancelled looked for counters %d times and measuring = %v, want it "+
+			"measured", got-targets, nextMonitor.Measuring(h.name))
 	}
-	if _, err := os.Stat(filepath.Join(h.dir, h.name+checkpointSuffix)); err != nil {
-		t.Errorf("a cancelled recovery took the checkpoint the next process needs: %v", err)
+
+	// AND A HANDOFF STILL LEAVES THE NEXT PROCESS WHAT BOTH SAMPLED.
+	checkpoint := filepath.Join(h.dir, h.name+checkpointSuffix)
+	if _, err := os.Stat(checkpoint); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the checkpoint outlived the adoption that read it: %v", err)
+	}
+	next.HandOver(t.Context())
+	data, err := os.ReadFile(checkpoint)
+	if err != nil {
+		t.Fatalf("the handoff after a cancelled recovery kept no checkpoint: %v", err)
+	}
+	cp, err := usage.ReadCheckpoint(data)
+	if err != nil {
+		t.Fatalf("the handoff's checkpoint does not read back: %v", err)
+	}
+	tl, err := usage.DecodeSeriesGaps(cp.Series)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(causes(tl), usage.GapHandover) && cp.Unseen != usage.GapHandover {
+		t.Errorf("marks %v, unseen %v; want the first handover carried into the next", causes(tl), cp.Unseen)
 	}
 }
 
 // A FORCE RELEASE A TEND SETTLED FIRST IS DONE WITH: the adoption's renewal
 // finds the lease force-released, and before the adoption acts on it, a tend
 // has settled the entry and released the lease. The adoption leaves the entry
-// to that tend, releasing the lease once, and the recovery goes on.
+// to that tend, releasing the lease once, and the recovery goes on to the next
+// survivor.
 func TestAForceReleaseATendSettledFirstIsNotSettledAgain(t *testing.T) {
 	h := newHandoverHost(t)
 	h.p.asyncTeardown = true
+	second := assignedLease(t, h.a)
 
 	first, _ := h.process(t)
 	h.launch(t, first)
+	if err := first.Launch(t.Context(), second, dockerSpec(),
+		Job{RequestID: second.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	// THE FORCED ONE IS THE FIRST SURVIVOR RECOVERY READS, in the backend's
+	// order, so the other is reached only if the recovery goes on.
+	forced, other := h.lease, second
+	if provider.InstanceName(second.ID) < h.name {
+		forced, other = second, h.lease
+	}
 	// AN OPERATOR FORCES THE RELEASE OF A TEARDOWN THE BACKEND NEVER CONFIRMED.
-	if err := first.Destroy(t.Context(), h.lease.RequestID); !errors.Is(err, dispatch.ErrCustody) {
+	if err := first.Destroy(t.Context(), forced.RequestID); !errors.Is(err, dispatch.ErrCustody) {
 		t.Fatalf("Destroy = %v, want the unconfirmed teardown held in custody", err)
 	}
 	if err := first.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend: %v", err)
 	}
-	if _, err := h.a.ForceRelease(t.Context(), h.lease.ID); err != nil {
+	if _, err := h.a.ForceRelease(t.Context(), forced.ID); err != nil {
 		t.Fatalf("ForceRelease: %v", err)
 	}
 	next, nextMonitor := h.process(t)
@@ -721,16 +769,19 @@ func TestAForceReleaseATendSettledFirstIsNotSettledAgain(t *testing.T) {
 	}
 	releases := 0
 	for _, e := range h.rec.sent() {
-		if e == "release "+h.lease.ID {
+		if e == "release "+forced.ID {
 			releases++
 		}
 	}
 	if releases != 1 {
-		t.Errorf("the lease was released %d times, want once: %v", releases, h.rec.sent())
+		t.Errorf("the forced lease was released %d times, want once: %v", releases, h.rec.sent())
 	}
-	if len(next.heldLeases()) != 0 || nextMonitor.Measuring(h.name) {
-		t.Errorf("held %v and measuring %v after the force release was settled, want neither",
-			next.heldLeases(), nextMonitor.Measuring(h.name))
+	if held := next.heldLeases(); len(held) != 1 || !held[other.ID] {
+		t.Errorf("held %v after the recovery, want only the other survivor %s", held, other.ID)
+	}
+	forcedName, otherName := provider.InstanceName(forced.ID), provider.InstanceName(other.ID)
+	if nextMonitor.Measuring(forcedName) || !nextMonitor.Measuring(otherName) {
+		t.Error("want the forced job unmeasured and the other survivor measured")
 	}
 }
 

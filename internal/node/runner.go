@@ -1218,18 +1218,15 @@ func (r *Runner) Recover(ctx context.Context) error {
 	// MEASURED HOWEVER THE RECOVERY ENDS: one that fails part way has still
 	// adopted and renewed the survivors before the failure, and a job that ends
 	// before the retry would otherwise settle with nothing measured and its
-	// checkpoint pruned. Except one the stop cancelled: the process is leaving,
-	// a lookup each would only hold it up, and the checkpoints stay for the
-	// next process.
+	// checkpoint pruned. One the stop cancelled measures too: a recovery that
+	// returns has recovered, and the drain that follows does not recover again,
+	// while a handoff keeps what was resumed in the checkpoint it writes.
 	type toMeasure struct {
 		lease *alloc.Lease
 		inst  *provider.Instance
 	}
 	var measure []toMeasure
 	defer func() {
-		if ctx.Err() != nil {
-			return
-		}
 		for _, m := range measure {
 			r.resumeMonitoring(ctx, m.lease, m.inst)
 		}
@@ -1425,6 +1422,12 @@ func (r *Runner) settleForceReleased(ctx context.Context, c *custody) error {
 	current := r.custody[c.leaseID] == c
 	r.mu.Unlock()
 	if !current {
+		return nil
+	}
+	if err := r.ensureRegistrationRemoved(ctx, c); err != nil {
+		r.log.Warn("could not remove a force-released runner before settling it; the next tend tries again",
+			"name", c.name, "lease", c.leaseID, "error", err)
+
 		return nil
 	}
 
