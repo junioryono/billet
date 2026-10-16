@@ -361,14 +361,26 @@ func TestAControlPlaneWithManyTiersStopsCleanly(t *testing.T) {
 		}}
 	}}
 
-	ctx, stop := context.WithCancel(t.Context())
-	defer stop()
-
 	limits := alloc.Limits{MaxVCPU: 4 * n, MaxMemory: 4 * n * config.GiB}
+	plane := New(newAllocator(t, limits, tiers), prov, tiers, "test-owner", nil)
+
+	ctx, stop := context.WithCancel(t.Context())
 
 	ran := make(chan error, 1)
+	done := make(chan struct{})
 
-	go func() { ran <- New(newAllocator(t, limits, tiers), prov, tiers, "test-owner", nil).Run(ctx) }()
+	// STOPPED AND JOINED BEFORE THE LEDGER'S OWN CLEANUP, which was registered
+	// first and so runs after this, whichever way the test ends.
+	t.Cleanup(func() {
+		stop()
+		<-done
+	})
+
+	go func() {
+		defer close(done)
+
+		ran <- plane.Run(ctx)
+	}()
 
 	// A FAILURE GUARD, never the condition: every tier polling is.
 	guard := time.NewTimer(2 * time.Minute)

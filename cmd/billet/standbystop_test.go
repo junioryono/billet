@@ -337,11 +337,19 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 	// ledger through closeAfter, nothing between the serving and either. A
 	// statement between them is where a return that drops the close's failure,
 	// or reads the fence late, would go.
-	body := findFunc(t, "runControlPlane").Body.List
+	fn := findFunc(t, "runControlPlane")
+	body := fn.Body.List
 	served := -1
 
+	// THE SERVING IS A PLAIN ASSIGNMENT OF ITS ERROR, never a branch on it that
+	// could return before the close.
 	for i, stmt := range body {
-		if calls(stmt, "serveControlPlane") {
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) != 1 || !isIdent(assign.Lhs[0], "err") {
+			continue
+		}
+
+		if call, ok := assign.Rhs[0].(*ast.CallExpr); ok && calleeName(call) == "serveControlPlane" {
 			served = i
 
 			break
@@ -368,11 +376,14 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 			"stop can be dropped")
 	}
 
-	for _, stmt := range body {
-		if _, isDefer := stmt.(*ast.DeferStmt); isDefer && calls(stmt, "Close") {
+	// NOWHERE, nested ones included.
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if def, ok := n.(*ast.DeferStmt); ok && calls(def, "Close") {
 			t.Error("runControlPlane defers the ledger's close, so its failure is dropped")
 		}
-	}
+
+		return true
+	})
 }
 
 // failingClose is a ledger whose close fails, and what its open migrated.

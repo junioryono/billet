@@ -409,10 +409,11 @@ func TestAControlPlaneFencedDuringStartupExitsNonZero(t *testing.T) {
 		t.Error("the run did not report the fence its ledger latched")
 	}
 
-	// THE SCHEDULER REPORTED THE FENCE, so the latch reached Scheduler.Run and the
-	// answer did not come only from serverEnded's own reading of it.
-	if !errors.Is(run.ran, state.ErrLeadershipLost) {
-		t.Errorf("the scheduler did not report the fence: %v", run.ran)
+	// THE SCHEDULER REPORTED THE FENCE, AND THE WRITE IT MET: the latch reached
+	// Scheduler.Run, and the refused write, the tier's scale-set record, is kept
+	// beside it rather than replaced by it.
+	if !errors.Is(run.ran, state.ErrLeadershipLost) || !strings.Contains(run.ran.Error(), "record scale set") {
+		t.Errorf("the scheduler did not report the fence and the write it refused: %v", run.ran)
 	}
 
 	if strings.Contains(run.stdout, "stopped") {

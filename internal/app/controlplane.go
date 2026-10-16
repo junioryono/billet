@@ -651,11 +651,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	// stops through a CANCELLED CONTEXT here, which Run reports as a clean stop.
 	// Returning nil would exit 0 — a control plane that was fenced out of its own
 	// deployment reporting a successful shutdown, and systemd leaving it stopped.
+	//
+	// AND WHAT THE PLANE ITSELF RETURNED IS KEPT BESIDE IT: the refused write
+	// says which ledger record moved, and a fault of the plane's own is still a
+	// fault.
 	if s.db.LeadershipLost() {
-		return fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
+		return errors.Join(fmt.Errorf("%w. Nothing running here was destroyed and no capacity was "+
 			"handed back; the controller that replaced this one adopts both. If that "+
 			"replacement was itself transient, restarting is how this host takes the "+
-			"deployment back", state.ErrLeadershipLost)
+			"deployment back", state.ErrLeadershipLost), err)
 	}
 
 	return err
