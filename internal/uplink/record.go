@@ -191,6 +191,14 @@ func clearOrInspect(ctx context.Context, iface string,
 		iface = found
 	}
 
+	// AN INTERFACE THAT IS NOT THERE WAS NOT INSPECTED: inspect reads tc's
+	// "Cannot find device" as no qdiscs, which is right for a recorded interface
+	// that has gone and would be "carries nothing" about a name that is wrong.
+	if _, err := os.Stat(filepath.Join(sysNet, iface)); err != nil {
+		return Cleared{}, fmt.Errorf("no record of shaping on this host, and %s could not be inspected "+
+			"for shaping without one: %w", iface, err)
+	}
+
 	s := &Shaper{Iface: iface, Run: run}
 
 	st, err := s.inspect(ctx)
@@ -199,25 +207,31 @@ func clearOrInspect(ctx context.Context, iface string,
 			"for shaping without one: %w", iface, err)
 	}
 
-	var found []string
-
-	if st.root == "cake" {
-		found = append(found, "a CAKE root qdisc")
-	}
+	// THE REMEDY NAMES ONLY WHAT WAS SEEN, in the order a shaper's own clear
+	// removes it: the redirect before the device it points at, and a root that
+	// is not CAKE never.
+	var found, remove []string
 
 	if st.ingress {
 		found = append(found, "an ingress qdisc")
+		remove = append(remove, "tc qdisc del dev "+iface+" handle ffff: ingress")
+	}
+
+	if st.root == "cake" {
+		found = append(found, "a CAKE root qdisc")
+		remove = append(remove, "tc qdisc del dev "+iface+" root")
 	}
 
 	if st.ifb {
 		found = append(found, "the device "+s.IFB())
+		remove = append(remove, "ip link del "+s.IFB())
 	}
 
 	if len(found) > 0 {
 		return Cleared{}, fmt.Errorf("%w: %s carries %s and no record says billet installed it, so nothing "+
-			"was removed; if a shaper of billet's left it, remove it by hand (tc qdisc del dev %s handle "+
-			"ffff: ingress; tc qdisc del dev %s root; ip link del %s)",
-			ErrUnrecorded, iface, strings.Join(found, ", "), iface, iface, s.IFB())
+			"was removed; if you know a shaper of billet's left it, remove it by hand, each only once the "+
+			"one before it succeeded: %s",
+			ErrUnrecorded, iface, strings.Join(found, ", "), strings.Join(remove, ", then "))
 	}
 
 	return Cleared{Looked: iface}, nil

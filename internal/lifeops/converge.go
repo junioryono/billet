@@ -1614,11 +1614,12 @@ func (c *Converger) RestartIfRunning(ctx context.Context, unit string) (Restarte
 
 	switch state := first(props, "UnitFileState"); state {
 	case "enabled":
-	case "":
-		return Restarted{}, fmt.Errorf("systemd gave no UnitFileState for %s, so billet cannot tell whether "+
-			"it is enabled", unit)
-	default:
+	case "disabled", "static", "masked", "masked-runtime", "indirect", "generated", "transient", "alias",
+		"linked", "linked-runtime", "enabled-runtime", "bad":
 		return Restarted{How: "not enabled (UnitFileState=" + state + ")"}, nil
+	default:
+		return Restarted{}, fmt.Errorf("systemd reports %s as UnitFileState=%q, so billet cannot tell whether "+
+			"it is enabled", unit, state)
 	}
 
 	switch active := first(props, "ActiveState"); active {

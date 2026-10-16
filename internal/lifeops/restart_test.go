@@ -106,6 +106,7 @@ func TestRestartIfRunningCannotTellAndSaysSo(t *testing.T) {
 		{name: "no LoadState", over: map[string]string{"LoadState": "REMOVE"}},
 		{name: "a broken unit", over: map[string]string{"LoadState": "bad-setting"}},
 		{name: "no UnitFileState", over: map[string]string{"UnitFileState": "REMOVE"}},
+		{name: "an enablement word billet has no rule for", over: map[string]string{"UnitFileState": "garbage"}},
 		{name: "no ActiveState", over: map[string]string{"ActiveState": "REMOVE"}},
 		{name: "an unknown ActiveState", over: map[string]string{"ActiveState": "maintenance"}},
 		{name: "systemd could not be asked", fail: errors.New("Failed to connect to bus")},

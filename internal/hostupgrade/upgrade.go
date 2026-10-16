@@ -572,6 +572,15 @@ func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 // command that finishes it; the shaper also notices a replaced binary itself
 // within a minute and restarts onto it.
 func restartUplink(ctx context.Context, host Host, log *slog.Logger) {
+	// A PANIC IS A FAILURE LIKE ANY OTHER HERE: escaping, it would end the run
+	// after the decision and before the caller releases the claim.
+	defer func() {
+		if p := recover(); p != nil {
+			log.Error("the uplink shaper's restart panicked; the transaction's outcome stands. "+
+				"`systemctl restart billet-uplink.service` finishes it", "panic", fmt.Sprint(p))
+		}
+	}()
+
 	if err := host.RestartUplink(ctx); err != nil {
 		log.Warn("the uplink shaper could not be restarted onto the installed billet, so it may still run "+
 			"the release it started from; the transaction's outcome stands. "+

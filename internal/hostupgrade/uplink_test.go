@@ -2,6 +2,7 @@ package hostupgrade
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"slices"
@@ -81,6 +82,33 @@ func TestAFailedUplinkRestartNeitherFailsNorRollsBackTheUpgrade(t *testing.T) {
 		if !strings.Contains(logged.String(), want) {
 			t.Errorf("the failed restart was not reported with %q:\n%s", want, logged.String())
 		}
+	}
+}
+
+// panickingHost's shaper restart panics.
+type panickingHost struct{ *fakeHost }
+
+func (h *panickingHost) RestartUplink(context.Context) error {
+	h.did = append(h.did, "restart-uplink")
+
+	panic("the shaper's restart panicked")
+}
+
+// A PANIC IN THE SHAPER'S RESTART DECIDES NOTHING EITHER: escaping, it would
+// end the run after the commit and before the caller releases the claim.
+func TestAPanickingUplinkRestartLeavesTheUpgradeCommitted(t *testing.T) {
+	j := newJournal(t)
+	h := &panickingHost{fakeHost: &fakeHost{}}
+
+	var logged bytes.Buffer
+
+	err := Run(t.Context(), Request{Journal: j, Host: h, Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	if err != nil || j.Step != StepCommitted {
+		t.Fatalf("an upgrade whose shaper restart panicked returned %v at %s; want committed", err, j.Step)
+	}
+
+	if !strings.Contains(logged.String(), "level=ERROR") || !strings.Contains(logged.String(), "panicked") {
+		t.Fatalf("the panic was not reported:\n%s", logged.String())
 	}
 }
 

@@ -203,13 +203,36 @@ func TestAClearWithNoRecordInspectsTheInterfaceBeforeSayingNothing(t *testing.T)
 		t.Fatalf("a clear with no record removed something:\n%s", strings.Join(live.ran, "\n"))
 	}
 
-	// THE DEVICE ALONE IS ENOUGH: it is what a crash between the device and the
-	// qdiscs leaves.
-	device := newFakeLink("eth0", "mq")
-	device.ifb = true
+	// THE REMEDY GOES REDIRECT, ROOT, DEVICE, the order a shaper's own clear
+	// keeps, so a device is never removed under a redirect still pointing at it.
+	ingress := strings.Index(err.Error(), "handle ffff: ingress")
+	root := strings.Index(err.Error(), "tc qdisc del dev eth0 root")
+	device := strings.Index(err.Error(), "ip link del ifb-eth0")
 
-	if _, err := clearOrInspect(t.Context(), "eth0", device.run); !errors.Is(err, ErrUnrecorded) {
+	if ingress < 0 || root < ingress || device < root {
+		t.Errorf("the remedy is not ingress, then root, then device: %v", err)
+	}
+
+	// THE DEVICE ALONE IS ENOUGH: it is what a crash between the device and the
+	// qdiscs leaves. And a root somebody configured is never offered for removal.
+	alone := newFakeLink("eth0", "htb")
+	alone.handle, alone.ifb = "1:", true
+
+	_, err = clearOrInspect(t.Context(), "eth0", alone.run)
+	if !errors.Is(err, ErrUnrecorded) {
 		t.Fatalf("no record and ifb-eth0 alone answered %v; want ErrUnrecorded", err)
+	}
+
+	if strings.Contains(err.Error(), " root") || strings.Contains(err.Error(), "ingress") {
+		t.Fatalf("the remedy for a device alone offers to remove what was not seen: %v", err)
+	}
+
+	// A NAME NO INTERFACE HAS WAS NOT INSPECTED, though tc's "Cannot find
+	// device" reads as no qdiscs.
+	missing := newFakeLink("eth9", "mq")
+
+	if cleared, err := clearOrInspect(t.Context(), "eth9", missing.run); err == nil {
+		t.Fatalf("no record and no interface eth9 answered %+v; want could not inspect", cleared)
 	}
 
 	broken := newFakeLink("eth0", "mq")
