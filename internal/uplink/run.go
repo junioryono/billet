@@ -147,7 +147,15 @@ func Run(ctx context.Context, opts Options) error {
 		"down_ceiling_mbit", ctl.Down.Max, "up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
 		"reflectors", pinger.Reflectors(), "gateway", gatewayLabel(pinger.Gateway()), "bloat", opts.Params.Bloat)
 
-	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper, remember)
+	// THE DEFAULT ROUTE'S GATEWAY IS FOLLOWED, one the operator named is not: a
+	// route that moves to another gateway on the same interface would otherwise
+	// have the shaper ask the old one, whose stalls are no longer this line's.
+	var follow func() (string, error)
+	if !opts.NoGateway && opts.Gateway == "" {
+		follow = func() (string, error) { return DefaultGateway(iface) }
+	}
+
+	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper, remember, follow)
 
 	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
 	// ran is still cleared; a removal that failed is an error, and the unit's
@@ -182,6 +190,42 @@ func runGateway(opts Options, iface string) string {
 	}
 
 	return gateway
+}
+
+// gatewaySetter is what followGateway moves: the Pinger.
+type gatewaySetter interface {
+	Gateway() string
+	setGateway(gateway string) (bool, error)
+}
+
+// followGateway asks the gateway lookup names now, when it has changed, and
+// starts its baseline and every cut's evidence of it afresh: a new device's
+// round trip is no measure against the old one's. A lookup that could not tell
+// keeps the gateway asked now.
+func followGateway(log *slog.Logger, lookup func() (string, error), pinger gatewaySetter, st *stepper,
+	ctl *Controller,
+) {
+	gateway, err := lookup()
+	if err != nil {
+		return
+	}
+
+	changed, err := pinger.setGateway(gateway)
+	if err != nil {
+		log.Warn("the default route's gateway changed to one that cannot be asked; asking the old one",
+			"gateway", gateway, "error", err)
+
+		return
+	}
+
+	if !changed {
+		return
+	}
+
+	st.gateway, st.lastGateway = Delays{}, Sample{}
+	ctl.Up.cutGateway, ctl.Down.cutGateway = measured{}, measured{}
+
+	log.Info("the default route's gateway changed; asking the new one", "gateway", gatewayLabel(pinger.Gateway()))
 }
 
 // gatewayLabel is the gateway as logged.
@@ -237,7 +281,7 @@ func Lock() (func(), error) {
 }
 
 func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pinger, ctl *Controller,
-	shaper *Shaper, remember func(upMbit, downMbit float64),
+	shaper *Shaper, remember func(upMbit, downMbit float64), follow func() (string, error),
 ) error {
 	read := func() (Counters, error) { return ReadCounters(iface) }
 	set := func(ctx context.Context, upMbit, downMbit float64) error {
@@ -253,6 +297,14 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 		return err
 	}
 	st.remember = remember
+
+	// AND THE RATES IN FORCE ARE RECORDED AGAIN EVERY MINUTE AND AS THE LOOP
+	// ENDS, though they have not changed: the next run returns them toward the
+	// ceiling for the time since they were recorded, which must be the time the
+	// shaper was down, not the time since the line was last cut. A rate held for
+	// hours resumed after an upgrade's restart would otherwise come back near the
+	// ceiling. What CAKE was given (applied), never a rise too small to apply.
+	defer func() { remember(st.applied[0], st.applied[1]) }()
 
 	exe := currentExecutable()
 	exeCheckedAt := time.Now()
@@ -277,6 +329,11 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 
 		if time.Since(exeCheckedAt) >= time.Minute {
 			exeCheckedAt = time.Now()
+			remember(st.applied[0], st.applied[1])
+
+			if follow != nil {
+				followGateway(log, follow, pinger, st, ctl)
+			}
 
 			if exe.replaced() {
 				log.Info("the installed billet was replaced; stopping so the unit restarts onto it")

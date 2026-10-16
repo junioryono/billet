@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"log/slog"
 	"math"
 	"os"
@@ -262,11 +263,15 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 				resumed = call.Pos()
 			case fun.Name == "remember" && !recorded.IsValid():
 				recorded = call.Pos()
-			case fun.Name == "loop" && len(call.Args) == 8 && isName(call.Args[7], "remember"):
+			case fun.Name == "loop" && len(call.Args) == 9 && isName(call.Args[7], "remember") &&
+				isName(call.Args[8], "follow"):
 				looped = call.Pos()
 			}
 		case *ast.SelectorExpr:
-			if fun.Sel.Name == "Install" && isName(fun.X, "shaper") {
+			// WITH THE CONTROLLER'S RATES, which resumeLearned set: installing at
+			// the ceilings would resume nothing.
+			if fun.Sel.Name == "Install" && isName(fun.X, "shaper") && len(call.Args) == 3 &&
+				types.ExprString(call.Args[1]) == "ctl.Up.Rate" && types.ExprString(call.Args[2]) == "ctl.Down.Rate" {
 				installed = call.Pos()
 			}
 		}
@@ -295,6 +300,97 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 	})
 	if !handed {
 		t.Error("loop does not hand its stepper the recorder")
+	}
+
+	// AND RECORDS THE APPLIED RATES EVERY MINUTE AND AS IT ENDS, so the next run
+	// counts only the time the shaper was down: a call of the recorder with the
+	// stepper's applied pair inside the minute's block, and one deferred.
+	applied := func(call *ast.CallExpr) bool {
+		return isName(call.Fun, "remember") && len(call.Args) == 2 &&
+			types.ExprString(call.Args[0]) == "st.applied[0]" && types.ExprString(call.Args[1]) == "st.applied[1]"
+	}
+
+	var inMinute, deferred, follows bool
+	ast.Inspect(funcs["loop"], func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.IfStmt:
+			if types.ExprString(node.Cond) == "time.Since(exeCheckedAt) >= time.Minute" {
+				for _, stmt := range node.Body.List {
+					if expr, ok := stmt.(*ast.ExprStmt); ok {
+						if call, ok := expr.X.(*ast.CallExpr); ok && applied(call) {
+							inMinute = true
+						}
+					}
+
+					// AND FOLLOWS THE DEFAULT ROUTE'S GATEWAY, when it was given that.
+					if inner, ok := stmt.(*ast.IfStmt); ok && types.ExprString(inner.Cond) == "follow != nil" {
+						ast.Inspect(inner, func(m ast.Node) bool {
+							if call, ok := m.(*ast.CallExpr); ok && isName(call.Fun, "followGateway") &&
+								len(call.Args) == 5 && isName(call.Args[1], "follow") && isName(call.Args[2], "pinger") {
+								follows = true
+							}
+
+							return true
+						})
+					}
+				}
+			}
+		case *ast.DeferStmt:
+			ast.Inspect(node, func(inner ast.Node) bool {
+				if call, ok := inner.(*ast.CallExpr); ok && applied(call) {
+					deferred = true
+				}
+
+				return true
+			})
+		}
+
+		return true
+	})
+	if !inMinute || !deferred {
+		t.Errorf("loop records the applied rates every minute %v and as it ends %v, want both", inMinute, deferred)
+	}
+	if !follows {
+		t.Error("loop does not follow the default route's gateway every minute")
+	}
+
+	// RUN FOLLOWS ONLY THE DEFAULT ROUTE'S: a gateway the operator named, or
+	// none, is not replaced.
+	onlyDefault := false
+	ast.Inspect(funcs["Run"], func(n ast.Node) bool {
+		ifs, ok := n.(*ast.IfStmt)
+		if !ok || types.ExprString(ifs.Cond) != `!opts.NoGateway && opts.Gateway == ""` {
+			return true
+		}
+		for _, stmt := range ifs.Body.List {
+			if assign, ok := stmt.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && isName(assign.Lhs[0], "follow") {
+				onlyDefault = true
+			}
+		}
+
+		return true
+	})
+	if !onlyDefault {
+		t.Error(`Run does not set follow only when !opts.NoGateway && opts.Gateway == ""`)
+	}
+}
+
+// A RUN THAT WAS DOWN AN HOUR RESUMES HALFWAY BACK TO ITS CEILING, through the
+// same path a start takes. Not parallel: StateFile is the package's.
+func TestAResumeCountsTheTimeTheShaperWasDown(t *testing.T) {
+	fakeRuntimeDir(t)
+
+	stopped := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
+	if err := writeLearned(learned{Iface: "eno2np1", Index: "2", At: stopped,
+		Up: learnedRate{Max: 400, Rate: 100}, Down: learnedRate{Max: 400, Rate: 200}}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 400})
+	resumeLearned(slog.New(&records{}), ctl, "eno2np1", "2", stopped.Add(time.Hour))
+
+	if math.Abs(ctl.Up.Rate-250) > 0.01 || math.Abs(ctl.Down.Rate-300) > 0.01 {
+		t.Errorf("an hour down resumed at %.2f/%.2f, want halfway back, 250/300", ctl.Up.Rate, ctl.Down.Rate)
 	}
 }
 

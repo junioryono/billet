@@ -94,12 +94,27 @@ func probeTargets(reflectors []string, gateway string) ([]string, string, []stri
 		return nil, "", nil, fmt.Errorf("the gateway: %w", err)
 	}
 
-	gateway = addrs[0]
-	if slices.Contains(reflectors, gateway) {
-		return reflectors, gateway, reflectors, nil
+	// A GATEWAY THAT IS ALSO A REFLECTOR IS ASKED ONLY AS A REFLECTOR: in both
+	// roles its unanswered probes would reach the reflectors' loss rule, which a
+	// gateway's never may.
+	if slices.Contains(reflectors, addrs[0]) {
+		return reflectors, "", reflectors, nil
 	}
 
-	return reflectors, gateway, append(slices.Clone(reflectors), gateway), nil
+	return reflectors, addrs[0], append(slices.Clone(reflectors), addrs[0]), nil
+}
+
+// setGateway asks gateway from the next round in place of the one asked now,
+// none when empty, and reports whether that changed whom a round asks.
+func (p *Pinger) setGateway(gateway string) (bool, error) {
+	_, gateway, targets, err := probeTargets(p.reflectors, gateway)
+	if err != nil || gateway == p.gateway {
+		return false, err
+	}
+
+	p.gateway, p.targets = gateway, targets
+
+	return true, nil
 }
 
 // Close closes the socket.

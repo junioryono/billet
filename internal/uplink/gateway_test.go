@@ -138,15 +138,109 @@ func TestAGatewayThatDoesNotAnswerChangesNothing(t *testing.T) {
 func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 	t.Parallel()
 
-	d := &Direction{cutDelay: 60 * time.Millisecond, cutDelayKnown: true}
-	shorter := withGateway(moving(0, 5, 400, 2*time.Millisecond), gatewayRose(20*time.Millisecond))
-	unchanged := withGateway(moving(0, 5, 400, 2*time.Millisecond), gatewayRose(59*time.Millisecond))
-
-	if !helped(d, verdict{}, shorter) {
-		t.Error("a cut after which the gateway's stall fell from 60 ms to 20 ms did not count as helping")
+	// A CUT TAKEN WITH THE GATEWAY AT 60 MS AND THE REFLECTORS AT 20, through
+	// the controller, so the evidence it keeps is what a cut records.
+	c := newController()
+	for n := range 3 {
+		c.Step(withGateway(moving(n, 5, 400, 20*time.Millisecond), gatewayRose(60*time.Millisecond)))
 	}
-	if helped(d, verdict{}, unchanged) {
-		t.Error("a cut after which the gateway's stall stayed at 59 ms counted as helping")
+	d := &c.Down
+	if !d.episode || d.cutGateway != (measured{60 * time.Millisecond, true}) ||
+		d.cutReflectors != (measured{20 * time.Millisecond, true}) {
+		t.Fatalf("the cut kept gateway %+v and reflectors %+v, want 60 ms and 20 ms, both measured",
+			d.cutGateway, d.cutReflectors)
+	}
+
+	for name, c := range map[string]struct {
+		o    Observation
+		want bool
+	}{
+		"the gateway's stall fell to 20 ms": {
+			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(20*time.Millisecond)), true},
+		"the gateway's stall stayed at 59 ms": {
+			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayRose(59*time.Millisecond)), false},
+		// SOURCE AGAINST SOURCE: the reflectors' unchanged 20 ms is not a shorter
+		// 60 ms stall, though the gateway went unanswered.
+		"the gateway went unanswered and the reflectors stayed": {
+			withGateway(moving(9, 5, 400, 20*time.Millisecond), gatewayLost()), false},
+		"the reflectors fell to 12 ms beside a gateway still stalled": {
+			withGateway(moving(9, 5, 400, 12*time.Millisecond), gatewayRose(60*time.Millisecond)), true},
+	} {
+		if got := helped(d, verdict{}, c.o); got != c.want {
+			t.Errorf("%s: helped %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// A ROUND THAT COUNTED NO REFLECTOR NEITHER CUTS NOR RAISES, GATEWAY OR NOT: a
+// line whose far end has gone quiet is a could-not-tell, and its first hop alone
+// says nothing of it.
+func TestAGatewayAloneNeverCutsOrRaises(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	for n := range 8 {
+		c.Step(withGateway(probed(n, 5, 400, Sample{}), gatewayRose(40*time.Millisecond)))
+	}
+	if c.Down.Rate != c.Down.Max {
+		t.Errorf("a gateway stalled 40 ms with no reflector counted cut the download to %.1f", c.Down.Rate)
+	}
+
+	// NOR DOES A GATEWAY THAT ANSWERED, WITH THE REFLECTORS UNMEASURED, RAISE: a
+	// round is clear only when the reflectors measured the line.
+	// THE FIRST LOSSY ROUND IN THE WINDOW, so the loss rule is not yet in force:
+	// clean rounds climb, and that one, with the reflectors unmeasured, must not.
+	r := &Controller{Params: DefaultParams(), Up: NewDirection(100), Down: NewDirection(100)}
+	r.Down.Rate = 50
+	for n := range 5 {
+		r.Step(withGateway(moving(n, 1, 49, 2*time.Millisecond), gatewayRose(time.Millisecond)))
+	}
+	before := r.Down.Rate
+	if before <= 50 {
+		t.Fatalf("clean full rounds did not climb (%.1f)", before)
+	}
+
+	unmeasured := Sample{Probes: []Probe{{Reflector: "a", Lost: true}, {Reflector: "b", Lost: true}, {Reflector: "c"}}}
+	r.Step(withGateway(probed(5, 1, 49, unmeasured), gatewayRose(time.Millisecond)))
+	if r.Down.Rate != before {
+		t.Errorf("a round with only the gateway measured moved the rate from %.1f to %.1f", before, r.Down.Rate)
+	}
+}
+
+// A SINGLE GATEWAY SPIKE IS NOT A STALL: its rise is the one two rounds in a row
+// reach, so a gateway that hiccups every other round cuts nothing, while one that
+// stays stalled does.
+func TestASingleGatewaySpikeCutsNothing(t *testing.T) {
+	t.Parallel()
+
+	spiky := &fakeProber{reflectors: three, gateway: "192.168.1.254", rtt: func(round int) map[string]time.Duration {
+		answers := idle()
+		answers["192.168.1.254"] = time.Millisecond
+		if round > 0 && round%2 == 0 {
+			answers["192.168.1.254"] = 80 * time.Millisecond
+		}
+
+		return answers
+	}}
+	r := newRig(t, spiky, 400)
+	r.run(30)
+	if len(r.cuts()) != 0 {
+		t.Errorf("a gateway spiking every other round cut %d times", len(r.cuts()))
+	}
+
+	stalled := &fakeProber{reflectors: three, gateway: "192.168.1.254", rtt: func(round int) map[string]time.Duration {
+		answers := idle()
+		answers["192.168.1.254"] = time.Millisecond
+		if round > 0 {
+			answers["192.168.1.254"] = 80 * time.Millisecond
+		}
+
+		return answers
+	}}
+	r = newRig(t, stalled, 400)
+	r.run(30)
+	if len(r.cuts()) == 0 {
+		t.Error("a gateway stalled 80 ms in every round cut nothing")
 	}
 }
 
@@ -164,8 +258,12 @@ func TestARoundAsksTheGatewayBesideTheReflectors(t *testing.T) {
 		t.Errorf("reflectors %v, gateway %q, targets %v", reflectors, gateway, targets)
 	}
 
-	if _, _, targets, err := probeTargets([]string{"1.1.1.1"}, "1.1.1.1"); err != nil || len(targets) != 1 {
-		t.Errorf("a gateway that is also a reflector is asked as %v (%v), want once", targets, err)
+	// A GATEWAY THAT IS ALSO A REFLECTOR IS ASKED ONCE, AS A REFLECTOR ONLY: in
+	// both roles its misses would reach the loss rule.
+	if _, gateway, targets, err := probeTargets([]string{"1.1.1.1"}, "1.1.1.1"); err != nil || len(targets) != 1 ||
+		gateway != "" {
+		t.Errorf("a gateway that is also a reflector is asked as %v, gateway %q (%v), want once and as a "+
+			"reflector only", targets, gateway, err)
 	}
 	if _, _, targets, err := probeTargets([]string{"1.1.1.1"}, ""); err != nil || strings.Join(targets, ",") != "1.1.1.1" {
 		t.Errorf("no gateway asked %v (%v)", targets, err)

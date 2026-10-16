@@ -30,13 +30,15 @@ type stepper struct {
 	ctl    *Controller
 	delays Delays
 	// gateway is the first hop's own baseline and silence, kept apart from the
-	// reflectors' so it never moves their median or their loss.
-	gateway Delays
-	read    func() (Counters, error)
-	set     func(ctx context.Context, upMbit, downMbit float64) error
-	now     func() time.Time
-	history []reading
-	applied [2]float64
+	// reflectors' so it never moves their median or their loss; lastGateway is
+	// what it said the round before.
+	gateway     Delays
+	lastGateway Sample
+	read        func() (Counters, error)
+	set         func(ctx context.Context, upMbit, downMbit float64) error
+	now         func() time.Time
+	history     []reading
+	applied     [2]float64
 	// remember is told every pair of rates CAKE was set to, nil for nothing.
 	remember func(upMbit, downMbit float64)
 	// blind is when counted reflectors stopped answering, zero while one does;
@@ -77,9 +79,17 @@ func (s *stepper) tick(ctx context.Context) error {
 
 	sample := s.delays.Observe(s.prober.Reflectors(), answered)
 
+	// THE GATEWAY'S RISE IS THE ONE TWO ROUNDS IN A ROW REACH: one ping a round
+	// to one device is noisier than the median of three reflectors, and a single
+	// spike read as a queue would cut a busy host for a gateway that hiccuped. A
+	// stall lasts a second before it counts.
 	var gateway Sample
 	if g := s.prober.Gateway(); g != "" {
-		gateway = s.gateway.Observe([]string{g}, answered)
+		now := s.gateway.Observe([]string{g}, answered)
+		gateway = now
+		gateway.DelayKnown = now.DelayKnown && s.lastGateway.DelayKnown
+		gateway.Delay = min(now.Delay, s.lastGateway.Delay)
+		s.lastGateway = now
 	}
 
 	now, err := s.read()

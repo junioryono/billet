@@ -53,8 +53,9 @@
 // The default route's gateway is asked each round too, against a baseline of
 // its own, because a host beside the reference node saw its gateway stall (1.6
 // ms to spikes of 128 ms) while the round trip to the reflectors rose about 11
-// ms (2026-10-14). Its rise past Bloat makes a round delayed as the reflectors'
-// does, and holds a rate as theirs does; its unanswered probes are never loss,
+// ms (2026-10-14). Its rise past Bloat in two rounds in a row (step.go) makes a
+// round delayed as the reflectors' does, and holds a rate as theirs does, but
+// only in a round that counted a reflector; its unanswered probes are never loss,
 // because a gateway answers ICMP when it has the time (the reference node's went
 // unanswered about 2% of the time with the line quiet, 2026-10-16), and read as
 // loss they would cut a busy host on every miss.
@@ -197,13 +198,25 @@ type Direction struct {
 	lastCut  time.Time
 	cutSince bool
 	// episode is whether a cut has been taken since the queue last cleared;
-	// cutDelay, cutDelayKnown and cutTally are that cut's evidence, which the
+	// cutReflectors, cutGateway and cutTally are that cut's evidence, which the
 	// next cut in the same episode must improve on.
 	episode       bool
-	cutDelay      time.Duration
-	cutDelayKnown bool
+	cutReflectors measured
+	cutGateway    measured
 	cutTally      tally
 	futile        int
+}
+
+// measured is one source's delay at a cut, and whether that source measured
+// it.
+type measured struct {
+	delay time.Duration
+	known bool
+}
+
+// shorter is whether now is shorter than then by a margin, both measured.
+func (now measured) shorter(then measured) bool {
+	return now.known && then.known && now.delay <= then.delay-max(improvement, then.delay/10)
 }
 
 // NewDirection starts a direction at its ceiling.
@@ -232,10 +245,18 @@ type Observation struct {
 	Gateway Sample
 }
 
+// gatewayCounts reports whether the gateway's rise is evidence this round: it
+// answered, and the round counted a reflector. A round that counted none is a
+// could-not-tell that neither cuts nor raises, gateway or not, so a line whose
+// far end has gone quiet is never shaped by its first hop alone.
+func (o Observation) gatewayCounts() bool {
+	return o.Gateway.DelayKnown && len(o.Probes) > 0
+}
+
 // delayed reports whether the round measured a queue: the reflectors' delay or
 // the gateway's rise past bloat.
 func (o Observation) delayed(bloat time.Duration) bool {
-	return o.DelayKnown && o.Delay > bloat || o.Gateway.DelayKnown && o.Gateway.Delay > bloat
+	return o.DelayKnown && o.Delay > bloat || o.gatewayCounts() && o.Gateway.Delay > bloat
 }
 
 // queue is the deepest queue the round measured, the reflectors' delay or the
@@ -243,7 +264,7 @@ func (o Observation) delayed(bloat time.Duration) bool {
 func (o Observation) queue() (time.Duration, bool) {
 	delay, known := o.Delay, o.DelayKnown
 
-	if o.Gateway.DelayKnown && (!known || o.Gateway.Delay > delay) {
+	if o.gatewayCounts() && (!known || o.Gateway.Delay > delay) {
 		delay, known = o.Gateway.Delay, true
 	}
 
@@ -555,7 +576,8 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
 		d.lastCut, d.cutSince, d.episode = o.At, true, true
-		d.cutDelay, d.cutDelayKnown = o.queue()
+		d.cutReflectors = measured{o.Delay, o.DelayKnown}
+		d.cutGateway = measured{o.Gateway.Delay, o.gatewayCounts()}
 		d.cutTally = v.tally
 
 		return d.Rate != before, true
@@ -576,10 +598,16 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 }
 
 // helped is whether the queue is shorter now than at the direction's last cut:
-// a measured delay lower by a margin than the measured delay then, or a share
+// a delay lower by a margin than the same source's delay then, the reflectors'
+// against the reflectors' and the gateway's against the gateway's, or a share
 // of the same reflectors' probes lost that is lower by a tenth.
+//
+// SOURCE AGAINST SOURCE: the gateway goes unanswered now and then, and a cut
+// taken on its stall judged later against the reflectors' smaller delay would
+// read as having helped, and the reverse as having failed.
 func helped(d *Direction, v verdict, o Observation) bool {
-	if queue, known := o.queue(); known && d.cutDelayKnown && queue <= d.cutDelay-max(improvement, d.cutDelay/10) {
+	if (measured{o.Delay, o.DelayKnown}).shorter(d.cutReflectors) ||
+		(measured{o.Gateway.Delay, o.gatewayCounts()}).shorter(d.cutGateway) {
 		return true
 	}
 
