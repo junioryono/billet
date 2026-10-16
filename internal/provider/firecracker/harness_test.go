@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -471,13 +472,21 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 			func(path, _ string, _, _ int) error {
 				return os.WriteFile(path, []byte("device node"), 0o600)
 			},
+			// EVERY PATH IN THE TREE, as chownTree changes them, so a chown that
+			// reached a snapshot link is seen even when it named the directory.
 			func(path string, _, _ int) error {
 				h.mu.Lock()
 				defer h.mu.Unlock()
 
-				h.chowned = append(h.chowned, path)
+				return filepath.WalkDir(path, func(p string, _ fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
 
-				return nil
+					h.chowned = append(h.chowned, p)
+
+					return nil
+				})
 			},
 		),
 		// GENEROUS, because no test here waits for it to expire: every fake VMM

@@ -391,3 +391,77 @@ func TestAPublishedFileMustBeARegularFile(t *testing.T) {
 		t.Fatalf("checkPublished(a 0444 directory) = %v, want refusal as not a regular file", err)
 	}
 }
+
+// A LAUNCH THAT FAILS BEFORE ITS TAP EXISTS DELETES NO DEVICE, whichever step it
+// failed at: the clone, the filesystem growth, or placing a snapshot. The name was
+// claimed, not made, so a device carrying it is someone else's.
+func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
+	t.Parallel()
+
+	t.Run("clone", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.disk.cloneErr = errors.New("rbd: cluster unavailable")
+
+		if _, err := h.p.Launch(t.Context(), aSpec()); err == nil {
+			t.Fatal("Launch succeeded although the clone failed")
+		}
+
+		assertNoTapDeleted(t, h)
+	})
+
+	t.Run("growth", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.refuse = func(bin string, _ []string) error {
+			if bin == resize2fsBinary {
+				return errors.New("bad ext4 superblock")
+			}
+
+			return nil
+		}
+
+		if _, err := h.p.Launch(t.Context(), aSpec()); err == nil {
+			t.Fatal("Launch succeeded although the filesystem could not be grown")
+		}
+
+		assertNoTapDeleted(t, h)
+	})
+}
+
+// AND A RETRY DOES NOT DELETE IT EITHER. A refused restore whose discard also fails
+// keeps its jail and record for a later Destroy, and Destroy deletes the tap its
+// record names; so the record must stop naming a tap nobody made before the discard
+// can fail.
+func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	publish(t, h, "gold-1", 0o644) // refused: not read-only
+	h.disk.discardErr = errors.New("rbd: cluster unavailable")
+
+	if _, _, err := h.restoreWith(t, "gold-1"); err == nil {
+		t.Fatal("Restore of a writable snapshot succeeded")
+	}
+
+	j := h.p.jailFor(theInstance)
+
+	held, err := resourcesOf(j)
+	if err != nil {
+		t.Fatalf("the retained jail's record: %v", err)
+	}
+
+	if held.Tap != "" {
+		t.Errorf("the retained record still names the tap %s, which a later Destroy would delete", held.Tap)
+	}
+
+	h.disk.discardErr = nil
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("the retried Destroy: %v", err)
+	}
+
+	assertNoTapDeleted(t, h)
+}

@@ -572,7 +572,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 		// timeout instead of a crash.
 		return nil, errors.Join(
 			fmt.Errorf("firecracker: root disk for %s: %w", spec.Name, err),
-			p.unwind(ctx, j, spec, res, err))
+			p.unwind(ctx, j, spec, res, beforeTap(err)))
 	}
 
 	// THE FILESYSTEM, NOT ONLY ITS DEVICE. RBD resize makes blocks addressable by
@@ -585,7 +585,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 
 	if spec.Disk > 0 {
 		if err := p.growRootFilesystem(ctx, spec.Name, device); err != nil {
-			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
+			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, beforeTap(err)))
 		}
 	}
 
@@ -1725,6 +1725,16 @@ func (p *Provider) unwind(
 
 	switch {
 	case errors.Is(cause, errNoTapMade):
+		// FORGOTTEN BEFORE ANYTHING BELOW CAN FAIL. A discard that fails keeps the
+		// jail and its record for a later Destroy to retry, and Destroy deletes the
+		// tap its record names; a record still naming a tap nobody made would have
+		// it delete whatever device carries that name by then.
+		if err := p.forgetTap(j, res); err != nil {
+			failures = append(failures, err)
+		} else {
+			res.Tap = ""
+		}
+
 		tapGone = true
 	case !errors.Is(cause, errTapTaken):
 		if err := p.deleteTap(ctx, res.Tap); err != nil {

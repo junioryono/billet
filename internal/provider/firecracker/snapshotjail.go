@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/regularfile"
 )
 
 // The files of a published snapshot, under its own directory and inside a jail.
@@ -66,11 +67,13 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 	}
 	defer unix.Close(store)
 
-	dir, err := openOwnedDir(store, name)
+	dirFD, err := openOwnedDir(store, name)
 	if err != nil {
 		return fmt.Errorf("firecracker: the snapshot %s: %w", name, err)
 	}
-	defer unix.Close(dir)
+
+	dir := os.NewFile(uintptr(dirFD), filepath.Join(p.snapshotsDir(), name))
+	defer dir.Close()
 
 	root, err := unix.Open(j.root(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -79,7 +82,7 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 	defer unix.Close(root)
 
 	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
-		if err := linkPublished(dir, root, file, filepath.Join(p.snapshotsDir(), name, file), j.id); err != nil {
+		if err := linkPublished(dir, root, file, filepath.Join(dir.Name(), file), j.id); err != nil {
 			return err
 		}
 	}
@@ -89,15 +92,19 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 
 // linkPublished judges one published file through its descriptor, links it into the
 // jail root, and proves the link is that file.
-func linkPublished(dir, root int, file, path, jailID string) error {
-	fd, err := openNoFollow(dir, file, path)
+//
+// OPENED FOR ITS IDENTITY ALONE (regularfile.OpenIdentityAt: O_PATH on Linux), so a
+// device someone published by mistake is refused without being opened: an open is an
+// operation on a device, and a watchdog is armed by one.
+func linkPublished(dir *os.File, root int, file, path, jailID string) error {
+	id, err := regularfile.OpenIdentityAt(dir, file)
 	if err != nil {
-		return err
+		return refusalOrUnknown(int(dir.Fd()), file, path, err)
 	}
-	defer unix.Close(fd)
+	defer id.Close()
 
 	var src unix.Stat_t
-	if err := unix.Fstat(fd, &src); err != nil {
+	if err := unix.Fstat(int(id.Fd()), &src); err != nil {
 		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
 	}
 
@@ -105,7 +112,7 @@ func linkPublished(dir, root int, file, path, jailID string) error {
 		return err
 	}
 
-	if err := unix.Linkat(dir, file, root, file, 0); err != nil {
+	if err := unix.Linkat(int(dir.Fd()), file, root, file, 0); err != nil {
 		if errors.Is(err, unix.EXDEV) {
 			return fmt.Errorf("firecracker: %s is on another filesystem than the jails, so it cannot "+
 				"be linked into one, and billet does not copy a snapshot: %w", path, err)
@@ -162,17 +169,6 @@ func openOwnedDir(at int, name string) (int, error) {
 	return fd, nil
 }
 
-// openNoFollow opens a published file for reading, refusing a symlink as itself and
-// never waiting on a FIFO.
-func openNoFollow(at int, name, path string) (int, error) {
-	fd, err := unix.Openat(at, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, refusalOrUnknown(at, name, path, err)
-	}
-
-	return fd, nil
-}
-
 // refusalOrUnknown says which of the two an open's failure was: absent, or a symlink
 // or non-directory where one was required, is a snapshot that is not published;
 // anything else is an inspection that could not answer.
@@ -208,7 +204,12 @@ func refusalOrUnknown(at int, name, path string, err error) error {
 func judgePublished(st unix.Stat_t, path string) error {
 	mode := os.FileMode(st.Mode & 0o777)
 
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+	switch st.Mode & unix.S_IFMT {
+	case unix.S_IFREG:
+	case unix.S_IFLNK:
+		return fmt.Errorf("firecracker: %w: %s is a symlink, and billet judges a snapshot as itself",
+			errSnapshotNotPublished, path)
+	default:
 		return fmt.Errorf("firecracker: %w: %s is not a regular file", errSnapshotNotPublished, path)
 	}
 
@@ -225,17 +226,23 @@ func judgePublished(st unix.Stat_t, path string) error {
 	return nil
 }
 
-// checkPublished judges a file by pathname, opened without following a symlink,
-// for a caller that holds no directory descriptor.
+// checkPublished judges a file by pathname for a caller that holds no directory
+// descriptor: the entry is opened for its identity alone, never followed.
 func checkPublished(path string) error {
-	fd, err := openNoFollow(unix.AT_FDCWD, path, path)
+	dir, err := os.Open(filepath.Dir(path))
 	if err != nil {
-		return err
+		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
 	}
-	defer unix.Close(fd)
+	defer dir.Close()
+
+	id, err := regularfile.OpenIdentityAt(dir, filepath.Base(path))
+	if err != nil {
+		return refusalOrUnknown(int(dir.Fd()), filepath.Base(path), path, err)
+	}
+	defer id.Close()
 
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
+	if err := unix.Fstat(int(id.Fd()), &st); err != nil {
 		return fmt.Errorf("firecracker: could not tell whether %s is published: %w", path, err)
 	}
 
