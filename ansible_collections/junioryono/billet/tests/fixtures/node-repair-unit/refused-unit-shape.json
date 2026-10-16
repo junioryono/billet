@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "outcome": "refused",
+  "reason": "unit-shape",
+  "why": "billet-node.service has drop-ins (/etc/systemd/system/billet-node.service.d/x.conf), which a repair does not admit",
+  "state": "nothing"
+}

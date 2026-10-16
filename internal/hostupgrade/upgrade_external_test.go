@@ -34,6 +34,7 @@ func TestAnExternalLedgerUpgradeSkipsExactlyTheLedgerSteps(t *testing.T) {
 	}
 
 	want := []string{
+		"check-unit-requirements",
 		"preserve",
 		"stop-node",
 		"stop-server",

@@ -64,6 +64,8 @@ const (
 	endpointReasonTrust       = "trust"
 	endpointReasonUnbound     = "unbound"
 	endpointReasonUnexamined  = "unexamined"
+	endpointReasonRepair      = "repair-required"
+	endpointReasonShape       = "unit-shape"
 
 	// The states a migration is left in, named on every refusal.
 	stateNothing         = "nothing"
@@ -76,6 +78,10 @@ const (
 	recordNone       = "none"
 	recordAbsentPreR = "absent-pre-r"
 	recordUnread     = "unread"
+	// recordUnitCannotHold is a running node with no record whose loaded unit
+	// declares no directory for one (#168): its effective endpoint is unknown,
+	// and `node repair-unit` is what makes it known.
+	recordUnitCannotHold = "unit-cannot-hold"
 
 	// maxRenderingBytes bounds the rendering read from stdin or a file.
 	maxRenderingBytes = 1 << 20
@@ -328,13 +334,16 @@ func nodeEndpointOf(cfg *config.Config) (endpoint.Endpoint, bool, error) {
 type unitObservation struct {
 	LoadState, ActiveState, SubState, Result, KillMode string
 	MainPID, InvocationID, StateChangeTimestamp        string
+	// RuntimeDirectory is systemd's rendering of the loaded unit's directive,
+	// its entries separated by spaces.
+	RuntimeDirectory string
 	// raw is the answer as read, for the missing-member rule: a property
 	// systemd did not answer is absent from it.
 	raw map[string][]string
 }
 
 var unitObservationNames = []string{"LoadState", "ActiveState", "SubState", "Result", "KillMode", "MainPID",
-	"InvocationID", "StateChangeTimestamp"}
+	"InvocationID", "StateChangeTimestamp", "RuntimeDirectory"}
 
 // observeUnit reads the node unit through the lifeops inspector (bounded by
 // its timeout). A failed read is could-not-tell; a zero exit without
@@ -349,7 +358,8 @@ func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string) (uni
 		LoadState: firstProp(props, "LoadState"), ActiveState: firstProp(props, "ActiveState"),
 		SubState: firstProp(props, "SubState"), Result: firstProp(props, "Result"), KillMode: firstProp(props, "KillMode"),
 		MainPID: firstProp(props, "MainPID"), InvocationID: firstProp(props, "InvocationID"),
-		StateChangeTimestamp: firstProp(props, "StateChangeTimestamp"), raw: props,
+		StateChangeTimestamp: firstProp(props, "StateChangeTimestamp"),
+		RuntimeDirectory:     firstProp(props, "RuntimeDirectory"), raw: props,
 	}
 
 	if _, ok := props["ActiveState"]; !ok || obs.ActiveState == "" {
@@ -536,10 +546,10 @@ func readRecordUnderBracket(ctx context.Context, insp *lifeops.Inspector, unit s
 	return bracketedRecord{}, fmt.Sprintf("the %s moved under every attempt to read its record", unit)
 }
 
-// waitForRecord polls readRecordUnderBracket until the record is usable, the
-// unit stops running, a foreign record refuses, or the wait elapses; the last
-// bracket is returned with elapsed=true on exhaustion.
-func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, identity registrationIdentity, wait time.Duration) (bracketedRecord, bool, string) {
+// waitForRecord polls readRecordUnderBracket on the node unit until the record
+// is usable, the unit stops running, a foreign record refuses, or the wait
+// elapses; the last bracket is returned with elapsed=true on exhaustion.
+func waitForRecord(ctx context.Context, insp *lifeops.Inspector, identity registrationIdentity, wait time.Duration) (bracketedRecord, bool, string) {
 	// NO BRACKET STARTS AFTER THE WAIT, and the sleep between brackets never
 	// outlasts it: a record that appears after the deadline is the next
 	// converge's. A bracket already running finishes under its own bounds
@@ -556,7 +566,7 @@ func waitForRecord(ctx context.Context, insp *lifeops.Inspector, unit string, id
 			return last, true, ""
 		}
 
-		br, problem := readRecordUnderBracket(ctx, insp, unit, identity, deadline)
+		br, problem := readRecordUnderBracket(ctx, insp, nodeUnit, identity, deadline)
 		if problem == recordWaitEndedUnderMove && last.obs.ActiveState != "" {
 			return last, true, ""
 		}

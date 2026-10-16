@@ -58,6 +58,17 @@ var ServerUnit string
 //go:embed billet-node.service
 var NodeUnit string
 
+// NodeRuntimeDirectories are the RuntimeDirectory entries this build's node
+// writes into and the unit that runs it must therefore declare: the
+// registration record's directory (#168). `billet release requirements`
+// answers them, and a host upgrade compares them with the loaded unit before it
+// stops anything, because a rollout replaces the binary and never the units.
+var NodeRuntimeDirectories = []string{NodeRegistrationDirectory}
+
+// NodeRegistrationDirectory is the node's registration record's directory, as
+// a RuntimeDirectory entry names it (relative to /run).
+const NodeRegistrationDirectory = "billet/registration"
+
 // BackupUnit and BackupTimer are the scheduled backup this build ships.
 //
 //go:embed billet-backup.service

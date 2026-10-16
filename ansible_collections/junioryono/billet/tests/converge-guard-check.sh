@@ -603,7 +603,7 @@ for spec in "${specs[@]+"${specs[@]}"}"; do
 done
 out=$(mktemp); err=$(mktemp)
 endpoint_answer=0
-case "$cmd" in migrate-endpoint|receipt|registration|release) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
+case "$cmd" in migrate-endpoint|repair-unit|receipt|registration|release) [ -n "$substituted" ] && endpoint_answer=1 ;; esac
 if [ "$endpoint_answer" = 1 ]; then
   # AN ENDPOINT ANSWER STANDS IN FOR THE BACKING RUN: the fixture is the
   # command's own, and its outcome decides the exit as the command does.
@@ -3418,6 +3418,61 @@ e e11d-current-null-node "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e11
 ep_case e11d-current-null-node
 expect_refused e11d-current-null-node "Judge the migration's answer" "answered with a member this role cannot read: node"
 echo "ok   E11: a current receipt keeps a holder that is one (by the command's grammar), a written receipt carries this run's, evidence mode never answers current, and an unchanged current answer names its node"
+
+# E12. A node unit that cannot hold its registration record (#168): the
+# decision's dry run reports `unit-cannot-hold`, the repair runs through the
+# answerer, and the decision is asked again from scratch, whose answer the
+# converge then follows; a repair that is not proved, a dry run, a policy that
+# will not start the node, a repair that left the unit as it was and an answer
+# the parser cannot read each stop the converge by name.
+ep_repair_answers() { # case repair-fixture [after-decision]
+  printf 'migrate-endpoint:1:%s;repair-unit:1:%s;migrate-endpoint:2:%s;migrate-endpoint:3:%s;receipt:1:%s' \
+    "$(ep_fixture "$1" node-migrate-endpoint reported-unit-cannot-hold.json)" "$2" \
+    "$(ep_fixture "$1" node-migrate-endpoint "${3:-reported-unplanned.json}")" \
+    "$(ep_fixture "$1" node-migrate-endpoint unchanged.json)" "$(ep_fixture "$1" node-receipt current.json)"
+}
+ep_plant_ordinary e12-repaired $EP_A $EP_A
+e e12-repaired "BILLET_GATE_ANSWER=$(ep_repair_answers e12-repaired "$(ep_fixture e12-repaired node-repair-unit repaired.json)")"
+ep_case e12-repaired
+expect_allowed e12-repaired
+expect_fact e12-repaired record current
+expect_calls e12-repaired managed "node repair-unit --config /etc/billet/billet.yaml --stop-timeout 3600s --wait 120s --json" 1
+expect_calls e12-repaired managed "node repair-unit --config /etc/billet/billet.yaml --wait 120s --dry-run --json" 0
+expect_calls e12-repaired managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 2
+order=$(commands e12-repaired | grep -v " prepare$\| version$\| settle$" | tr '\n' ';')
+[ "$order" = "managed migrate-endpoint;managed repair-unit;managed migrate-endpoint;managed migrate-endpoint;managed receipt;" ] \
+  || fail "e12-repaired: the order is not decision, repair, decision, action, refresh: $order" "$work/cases/e12-repaired/log"
+grep -q "now declares the registration record's directory" "$work/cases/e12-repaired/out" || fail "e12: the repair report is missing" "$work/cases/e12-repaired/out"
+ep_plant_ordinary e12b-unproved $EP_A $EP_A
+e e12b-unproved "BILLET_GATE_ANSWER=$(ep_repair_answers e12b-unproved "$(ep_fixture e12b-unproved node-repair-unit unknown-unit-installed.json)")"
+ep_case e12b-unproved
+expect_refused e12b-unproved "Refuse the runtime-unit repair's answer" "could not be proved (unproved, the host left with unit-installed done)"
+expect_calls e12b-unproved managed "node migrate-endpoint" 1
+expect_no_play_task e12b-unproved "Install the rendering as the render would"
+ep_plant_ordinary e12c-check $EP_A $EP_A
+a e12c-check --check
+e e12c-check "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12c-check node-migrate-endpoint reported-unit-cannot-hold.json);repair-unit:1:$(ep_fixture e12c-check node-repair-unit reported-required.json)"
+HOLDER=""; ep_case e12c-check; HOLDER=h1
+expect_refused e12c-check "Stop a dry run at the runtime-unit repair" "A converge would repair it with \`billet node repair-unit\`" "Nothing was stopped or changed"
+expect_calls e12c-check managed "node repair-unit --config /etc/billet/billet.yaml --wait 120s --dry-run --json" 1
+expect_calls e12c-check managed "--stop-timeout" 0
+ep_plant_ordinary e12d-policy $EP_A $EP_A
+a e12d-policy -e billet_node_should_run=false
+e e12d-policy "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12d-policy node-migrate-endpoint reported-unit-cannot-hold.json)"
+ep_case e12d-policy
+expect_refused e12d-policy "Refuse a runtime-unit repair the policy will not let start the node" "Stop billet-node.service, then converge again"
+expect_calls e12d-policy managed "node repair-unit" 0
+ep_plant_ordinary e12e-still $EP_A $EP_A
+e e12e-still "BILLET_GATE_ANSWER=$(ep_repair_answers e12e-still "$(ep_fixture e12e-still node-repair-unit repaired.json)" reported-unit-cannot-hold.json)"
+ep_case e12e-still
+expect_refused e12e-still "Refuse a node unit the repair left unable to hold its record" "still finds a node unit that cannot hold the registration record"
+f=$(ep_fixture e12f-parser node-repair-unit repaired.json)
+ep_corrupt "$f" invocation_id '"0123456789abcdef0123456789abcdef"'
+ep_plant_ordinary e12f-parser $EP_A $EP_A
+e e12f-parser "BILLET_GATE_ANSWER=$(ep_repair_answers e12f-parser "$f")"
+ep_case e12f-parser
+expect_refused e12f-parser "Judge the runtime-unit repair's answer" "answered with a member this role cannot read: new_invocation"
+echo "ok   E12: a unit that cannot hold the record is repaired and the decision asked again; an unproved repair, a dry run, the policy, an unchanged unit and an unreadable answer each stop the converge by name"
 sections_ran="$sections_ran, endpoint (E)"
 
 else

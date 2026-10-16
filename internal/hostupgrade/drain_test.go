@@ -86,7 +86,7 @@ func TestAnUpgradeDoesNothingElseWhileTheNodeIsDraining(t *testing.T) {
 	// NOT ONE STEP FURTHER. Asserted as the whole prefix rather than as "the
 	// binary is still there", because the failure is a step MOVING and any single
 	// absence check would miss the other five.
-	if want := []string{"preserve"}; !slices.Equal(h.did, want) {
+	if want := []string{"check-unit-requirements", "preserve"}; !slices.Equal(h.did, want) {
 		t.Errorf("while the node was draining the upgrade had already run\n  %v\nwant only\n  %v",
 			h.did, want)
 	}

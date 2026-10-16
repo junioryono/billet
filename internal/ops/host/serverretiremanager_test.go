@@ -18,6 +18,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv(repairStandinEnv) == "1" {
+		os.Exit(runRepairStandin())
+	}
 	if os.Getenv("BILLET_RETIRE_MANAGER_FAKE") == "1" {
 		name := filepath.Base(os.Args[0])
 		if name == "systemctl" || name == "busctl" || name == "busctl-execution" {

@@ -11,7 +11,8 @@ import (
 func Release(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: billet release record --manifest <path> --archive " +
-			"<path> --binary <path>, or billet release inspect [--json] [--config <path>]")
+			"<path> --binary <path>, billet release inspect [--json] [--config <path>], or billet release " +
+			"requirements --json [--config <path>]")
 	}
 
 	switch args[0] {
@@ -19,7 +20,9 @@ func Release(ctx context.Context, env cli.Env, args []string) error {
 		return cmdReleaseRecord(ctx, env, args[1:])
 	case "inspect":
 		return cmdReleaseInspect(ctx, env, args[1:])
+	case "requirements":
+		return releaseRequirements(env, args[1:])
 	}
 
-	return fmt.Errorf("unknown release command %q; try record or inspect", args[0])
+	return fmt.Errorf("unknown release command %q; try record, inspect or requirements", args[0])
 }

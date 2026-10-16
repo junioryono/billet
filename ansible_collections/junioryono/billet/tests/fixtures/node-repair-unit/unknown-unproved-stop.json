@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "outcome": "unknown",
+  "reason": "unproved",
+  "why": "the stop of billet-node.service is not proved: systemd reports ActiveState=failed SubState=failed Result=timeout, and only inactive/dead/success proves the process gone",
+  "next": "inspect the unit; check and approve afresh",
+  "state": "stopped"
+}

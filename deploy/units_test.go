@@ -596,6 +596,28 @@ func TestTheNodeUnitDeclaresItsRuntimeDirectoriesAndTheServerDeclaresNone(t *tes
 	}
 }
 
+// THE NODE UNIT THIS BUILD SHIPS PROVIDES WHAT THIS BUILD REQUIRES OF IT. A
+// host upgrade refuses a candidate whose requirements the loaded unit does not
+// meet (#168), so a requirement the shipped unit does not meet either would
+// refuse every upgrade onto this release, even on a freshly converged host.
+func TestTheShippedNodeUnitMeetsTheNodesRuntimeRequirements(t *testing.T) {
+	var declared []string
+	for _, value := range serviceAssignments(deploy.NodeUnit, "RuntimeDirectory") {
+		declared = append(declared, strings.Fields(value)...)
+	}
+
+	if len(deploy.NodeRuntimeDirectories) == 0 {
+		t.Fatal("this build declares no runtime directory its node needs; the registration record needs one")
+	}
+
+	for _, entry := range deploy.NodeRuntimeDirectories {
+		if !slices.Contains(declared, entry) {
+			t.Errorf("%s declares RuntimeDirectory %q without %q, which this build's node writes into",
+				deploy.NodeUnitName, declared, entry)
+		}
+	}
+}
+
 // A UNIT THAT TAKES THE HOST LOCK DECLARES THE DIRECTORY IT LIVES IN, AND ONLY
 // ITS OWNER MAY REMOVE IT.
 //

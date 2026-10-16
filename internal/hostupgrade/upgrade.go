@@ -20,6 +20,12 @@ import (
 // returns an error, because a recovery that has to reason about half-completed
 // steps is a recovery nobody can write correctly.
 type Host interface {
+	// CheckUnitRequirements refuses a candidate that needs something of the
+	// loaded node unit it does not provide (#168), before anything stops: a
+	// rollout replaces the binary and never the units, so the unit a host
+	// runs is the one its last converge or package installed.
+	CheckUnitRequirements(ctx context.Context) error
+
 	// StopNode stops the node so its compute drains. UNBOUNDED: a drain waits for
 	// the work already running for as long as it runs, and no elapsed time here
 	// may end a job.
@@ -286,6 +292,12 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 		step: StepStopped,
 		what: "stopping the services and hiding the installed binary",
 		do: func(ctx context.Context) error {
+			// WHAT THE CANDIDATE NEEDS OF THE UNITS, FIRST: a refusal here has
+			// stopped nothing, so the rollback has nothing to restore.
+			if err := host.CheckUnitRequirements(ctx); err != nil {
+				return err
+			}
+
 			if err := host.PreserveCurrent(ctx, j.Dir); err != nil {
 				return err
 			}

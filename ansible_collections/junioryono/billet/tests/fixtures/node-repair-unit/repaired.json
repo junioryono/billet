@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "outcome": "repaired",
+  "node": "node-a",
+  "deployment": "dddddddddddddddddddddddddddddddd",
+  "endpoint": "http://127.0.0.1:7717",
+  "unit_path": "/etc/systemd/system/billet-node.service",
+  "before_sha256": "abababababababababababababababababababababababababababababababab",
+  "after_sha256": "abababababababababababababababababababababababababababababababab",
+  "from_invocation": "0123456789abcdef0123456789abcdef",
+  "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
+  "incarnation": "ffeeddccbbaa99887766554433221100",
+  "registered_at": "2026-09-09T12:00:00Z",
+  "stopped": {
+    "active_state": "inactive",
+    "sub_state": "dead",
+    "result": "success"
+  }
+}

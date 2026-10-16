@@ -1,0 +1,146 @@
+---
+# THE RUNTIME-UNIT REPAIR (#168), included by the endpoint decision when its dry
+# run reported `unit-cannot-hold`: a running node whose loaded unit declares no
+# directory for its registration record, so its effective endpoint is unknown
+# and neither waiting nor a restart under that unit changes it. The answerer's
+# `billet node repair-unit` admits only the unit an older collection rendered
+# (the role's fragment, loaded, no drop-in, no reload pending, exactly
+# `RuntimeDirectory=billet/locks`), stops the node under the migration's own
+# proof, changes only that line, reloads, starts, and requires a record the new
+# invocation wrote naming the installed endpoint. It claims no endpoint
+# continuity it did not prove: the decision is asked again from scratch, and
+# what this converge does next follows that answer.
+#
+# A CHECK MODE RUN ASKS THE REPAIR'S DRY RUN AND STOPS: whether the unit is
+# one the repair admits is worth saying, and nothing after it can be decided
+# without the record the repair is what makes appear.
+
+- name: Repair the node unit
+  vars:
+    # THE BOUND IS THE SUM OF EVERY PHASE the command may take, the guard's
+    # bound as the margin: the loaded unit's shape, the record's bracket (its
+    # attempts, two observations each), the observation before the stop, the
+    # stop under its deadline and the observation after it, the reload and the
+    # shape after it, the start under the unit's bound and the observation
+    # after it, the record wait under the new invocation with the two
+    # observations of a bracket that outlives it, and the closing observation.
+    billet_repair_bound: >-
+      {{ (2 * (billet_migration_bracket_attempts | int) + 9) * (billet_migration_observation_bound | int)
+         + (billet_migration_stop_timeout | int) + (billet_migration_start_bound | int)
+         + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
+  block:
+    - name: Ask whether the runtime-unit repair is admitted
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', billet_repair_bound | string, billet_endpoint_answerer, 'node', 'repair-unit',
+              '--config', '/etc/billet/billet.yaml', '--wait', (billet_migration_record_wait | string) ~ 's',
+              '--dry-run', '--json'] }}
+        expand_argument_vars: false
+      register: billet_repair_dry
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      become: true
+      when: ansible_check_mode
+
+    - name: Judge the runtime-unit repair's dry run
+      ansible.builtin.include_tasks: repair-answer.yml
+      vars:
+        billet_repair_raw: "{{ billet_repair_dry }}"
+        billet_repair_call: dry-run
+        billet_repair_answered_by: "{{ billet_endpoint_answerer }}"
+      when: ansible_check_mode
+
+    - name: Stop a dry run at the runtime-unit repair
+      ansible.builtin.assert:
+        that: false
+        fail_msg: >-
+          billet-node.service cannot hold the running node's registration
+          record, so its effective endpoint is unknown (#168).
+          {{ ('A converge would repair it with `billet node repair-unit` (' ~ billet_repair_answer.why ~ '), then decide the endpoint from the record the restarted node writes.')
+             if billet_repair_answer.outcome | default('') == 'reported'
+             else ('The repair would refuse this host (' ~ (billet_repair_answer.reason | default('no reason')) ~ '): '
+                   ~ (billet_repair_answer.why | default('no reason')) ~ '.') }}
+          Nothing was stopped or changed.
+      when: ansible_check_mode
+
+    # NEVER INSIDE A RETAINED RETIREMENT: there every node operation is one the
+    # retirement admits through its own inventory, and a repair stops, reloads
+    # and starts outside it. A host on a unit from before takes an ordinary
+    # converge first, as a retained retirement already requires.
+    - name: Refuse a runtime-unit repair inside a retained retirement
+      ansible.builtin.assert:
+        that:
+          - not (billet_retirement_node_ordinary | default(false) | bool)
+        fail_msg: >-
+          billet-node.service cannot hold the running node's registration record
+          (#168), and a retained retirement admits no runtime-unit repair: it
+          would stop, reload and start the node outside the operations the
+          retirement admits. Converge this host ordinarily first, then retire it.
+          Nothing was stopped or changed.
+
+    # A REPAIR RESTARTS THE NODE, which a policy that will not start it in this
+    # converge does not allow; the operator's stop is what that host needs.
+    - name: Refuse a runtime-unit repair the policy will not let start the node
+      ansible.builtin.assert:
+        that:
+          - billet_node_should_run | default(false) | bool
+        fail_msg: >-
+          billet-node.service cannot hold the running node's registration record
+          (#168), and the repair restarts the node, which the policy will not do
+          in this converge (billet_enable_node or billet_server_prepare_only).
+          Stop billet-node.service, then converge again. Nothing was stopped or changed.
+
+    - name: Run the runtime-unit repair
+      ansible.builtin.command:
+        argv: >-
+          {{ ['timeout', '-k', '10', billet_repair_bound | string, billet_endpoint_answerer, 'node', 'repair-unit',
+              '--config', '/etc/billet/billet.yaml', '--stop-timeout', (billet_migration_stop_timeout | string) ~ 's',
+              '--wait', (billet_migration_record_wait | string) ~ 's', '--json'] }}
+        expand_argument_vars: false
+      register: billet_repair_action
+      changed_when: >-
+        billet_repair_action.rc == 0 and (billet_repair_action.stdout | default('') is search('"outcome":\s*"repaired"'))
+      failed_when: false
+      become: true
+
+    - name: Judge the runtime-unit repair's answer
+      ansible.builtin.include_tasks: repair-answer.yml
+      vars:
+        billet_repair_raw: "{{ billet_repair_action }}"
+        billet_repair_call: action
+        billet_repair_answered_by: "{{ billet_endpoint_answerer }}"
+
+    - name: Refuse the runtime-unit repair's answer
+      ansible.builtin.assert:
+        that:
+          - billet_repair_answer.outcome in ['repaired', 'unchanged']
+        fail_msg: >-
+          The runtime-unit repair through {{ billet_endpoint_answerer }}
+          {{ 'was refused' if billet_repair_answer.outcome == 'refused' else 'could not be proved' }}
+          ({{ billet_repair_answer.reason | default('no reason') }}, the host left with
+          {{ billet_repair_answer.state | default('unexamined') }} done):
+          {{ billet_repair_answer.why | default('no reason') }}.
+          {{ ('Next: ' ~ billet_repair_answer.next ~ '.') if (billet_repair_answer.next | default('') | length > 0) else '' }}
+
+    - name: Report the runtime-unit repair
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('billet-node.service now declares the registration record''s directory: the node was stopped, the unit repaired and reloaded, and the node restarted as invocation '
+              ~ billet_repair_answer.invocation_id ~ ', which registered on ' ~ billet_repair_answer.endpoint ~ '.')
+             if billet_repair_answer.outcome == 'repaired'
+             else ('No runtime-unit repair was needed when it was asked: ' ~ billet_repair_answer.why ~ '.') }}
+          The endpoint decision is asked again from scratch.
+
+    # FROM SCRATCH: the answer that named the unit is not read again.
+    - name: Ask for and judge the endpoint migration's dry run after the repair
+      ansible.builtin.import_tasks: endpoint-dry-run.yml
+
+    - name: Refuse a node unit the repair left unable to hold its record
+      ansible.builtin.assert:
+        that:
+          - billet_endpoint_answer.outcome != 'reported' or billet_endpoint_answer.record != 'unit-cannot-hold'
+        fail_msg: >-
+          After the runtime-unit repair the endpoint decision still finds a
+          node unit that cannot hold the registration record; inspect
+          billet-node.service (systemctl cat billet-node.service) and converge again.

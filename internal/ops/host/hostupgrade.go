@@ -1923,6 +1923,19 @@ func (h *systemdHost) StopNode(ctx context.Context) error {
 	return h.stop(ctx, nodeUnit)
 }
 
+// CheckUnitRequirements asks the staged candidate what it needs of the node
+// unit and holds the loaded unit to it, before anything stops (#168).
+func (h *systemdHost) CheckUnitRequirements(ctx context.Context) error {
+	found, err := checkUnitRequirements(ctx, h.staged, h.cfgPath, h.inspect)
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(h.env.Stdout, "unit requirements: %s\n", found)
+
+	return nil
+}
+
 // StopServer stops the control plane, after the node's custody has settled.
 func (h *systemdHost) StopServer(ctx context.Context) error {
 	return h.stop(ctx, serverUnit)
