@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -223,7 +224,8 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody)}
+	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody),
+		node.WithUsageCheckpoints(filepath.Join(cfg.Node.StateDir, usageCheckpointDir))}
 	if cacheService != nil {
 		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
 	}

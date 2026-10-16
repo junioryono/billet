@@ -171,6 +171,10 @@ type job struct {
 	// fell says a counter fell into the last point kept, so the next interval
 	// holds its catch-up and is uncovered too (settle).
 	fell bool
+	// resumed is a job this process adopted (Resume): its hardware counters are
+	// not opened and its package energy is broken, since neither was counted
+	// before it. carried says its series so far came from a checkpoint.
+	resumed, carried bool
 }
 
 // see records that an interval since the last kept point went unseen, and why;
@@ -283,7 +287,8 @@ func (m *Monitor) start(key string, j *job) {
 	s, vcpus := m.reader.readListing(j.target)
 	now := m.opts.Now()
 	var counters *Counters
-	if m.opts.Counters != nil && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" && !j.target.Process {
+	if m.opts.Counters != nil && !j.resumed && j.target.PID > 0 && j.target.VCPUThreadPrefix != "" &&
+		!j.target.Process {
 		c := &jobCounters{}
 		m.counting[j] = c
 		m.count(j, c, s, vcpus)
@@ -295,16 +300,37 @@ func (m *Monitor) start(key string, j *job) {
 	if m.jobs[key] != j {
 		return
 	}
-	j.first, j.pending, j.points = now, false, nil
-	j.absorb(s, now)
+	if j.carried {
+		m.continueFrom(j, s, now)
+	} else {
+		j.first, j.pending, j.points = now, false, nil
+		j.absorb(s, now)
+		j.points = append(j.points, j.point(now))
+		j.unseen = GapNone
+	}
 	j.counters = counters
 	j.lastCPU, j.lastCPUOK = s.CPUUsage, s.CPUOK
-	j.points = append(j.points, j.point(now))
-	j.unseen = GapNone
 	if now.Sub(began) >= m.opts.Interval {
 		j.see(GapSlowRead)
 	}
 	m.readBounded(s)
+}
+
+// continueFrom takes the baseline of a job whose series a checkpoint carried
+// from the process that handed it over: its first sample in this process ends
+// the interval between the two, which nobody sampled, and is marked so.
+// Called with mu held.
+func (m *Monitor) continueFrom(j *job, s Sample, now time.Time) {
+	before := j.seen
+	j.pending = false
+	j.absorb(s, now)
+	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
+	p := j.point(now)
+	p.Gap = joinGaps(j.unseen, GapHandover)
+	j.fell = falls(j.points[len(j.points)-1], p)
+	j.points = append(j.points, p)
+	j.unseen = GapNone
+	m.observeGaps(p.Gap, 1)
 }
 
 // Forget stops measuring a job without reporting it.

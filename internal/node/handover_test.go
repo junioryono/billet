@@ -1,0 +1,270 @@
+package node
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/usage"
+)
+
+// handoverHost is one node's host as two processes of it see it: one ledger,
+// one backend whose instances outlive either process, and one state directory.
+type handoverHost struct {
+	a     *alloc.Allocator
+	host  string
+	p     *measuredProvider
+	root  string
+	dir   string
+	lease *alloc.Lease
+	name  string
+	id    string
+}
+
+func newHandoverHost(t *testing.T) *handoverHost {
+	t.Helper()
+
+	root := t.TempDir()
+	h := &handoverHost{root: root, dir: t.TempDir(),
+		p: &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, root: root}}
+	h.a, h.host = newAllocatorWithHost(t)
+	h.lease = assignedLease(t, h.a)
+	h.name = provider.InstanceName(h.lease.ID)
+	h.id = "instance-" + h.name
+
+	return h
+}
+
+// process is one node process on the host, with a sampler of its own.
+func (h *handoverHost) process(t *testing.T) (*Runner, *usage.Monitor) {
+	t.Helper()
+
+	m := runningMonitor(t, h.root)
+
+	return New(h.a, h.host, &fakeJIT{setID: 7}, h.p, nil, WithMonitor(m), WithUsageCheckpoints(h.dir)), m
+}
+
+// launch starts the job on r, its cgroup having used a millisecond.
+func (h *handoverHost) launch(t *testing.T, r *Runner) {
+	t.Helper()
+
+	h.p.writeCPU(t, h.id, "1000")
+	if err := r.Launch(t.Context(), h.lease, dockerSpec(), Job{RequestID: h.lease.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+}
+
+// timeline is the series the ledger kept for the lease.
+func (h *handoverHost) timeline(t *testing.T) usage.Timeline {
+	t.Helper()
+
+	series, err := h.a.LeaseUsageSeries(t.Context(), h.lease.ID)
+	if err != nil {
+		t.Fatalf("no series was kept: %v", err)
+	}
+	tl, err := usage.TimelineOf(series.Codec, series.Data)
+	if err != nil {
+		t.Fatalf("the kept series does not read back: %v", err)
+	}
+
+	return tl
+}
+
+// causes are the marks of a timeline's points.
+func causes(tl usage.Timeline) []usage.GapCause {
+	var out []usage.GapCause
+	for _, p := range tl.Points {
+		out = append(out, p.Gap)
+	}
+
+	return out
+}
+
+// A JOB THAT RUNS ACROSS A HANDOVER REPORTS ITS USAGE (#384). The process that
+// launched it keeps what it measured as it hands over; the next process adopts
+// the job, continues its series from that, and when the job completes, the
+// path that ends an adopted job reports it, fenced on the lease, with what
+// both processes sampled and the time between them marked handover. The
+// checkpoint is used once.
+func TestAJobRunAcrossAHandoverReportsUsageFromBothProcesses(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, firstMonitor := h.process(t)
+	h.launch(t, first)
+	h.p.writeCPU(t, h.id, "2000000")
+	firstMonitor.Tick()
+	first.HandOver(t.Context())
+	checkpoint := filepath.Join(h.dir, h.name+checkpointSuffix)
+	if _, err := os.Stat(checkpoint); err != nil {
+		t.Fatalf("the handover kept no checkpoint: %v", err)
+	}
+
+	next, nextMonitor := h.process(t)
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if _, err := os.Stat(checkpoint); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the checkpoint outlived the adoption that read it: %v", err)
+	}
+	h.p.writeCPU(t, h.id, "7000000")
+	nextMonitor.Tick()
+
+	// THE JOB COMPLETES, and its completion's destroy reaches the process that
+	// adopted it, which holds it in custody.
+	if err := next.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	got, err := h.a.LeaseUsage(t.Context(), h.lease.ID)
+	if err != nil {
+		t.Fatalf("a job run across a handover reported no usage: %v", err)
+	}
+	if got.CPUUserMicros != 7_000_000 {
+		t.Errorf("cpu = %d µs, want the 7000000 read before the destroy", got.CPUUserMicros)
+	}
+	if got.Counters != nil {
+		t.Errorf("a handed-over job reported hardware counters %+v, which counted only part of its life", got.Counters)
+	}
+	tl := h.timeline(t)
+	marks := causes(tl)
+	handovers := 0
+	for _, c := range marks {
+		if c == usage.GapHandover {
+			handovers++
+		}
+	}
+	if len(tl.Points) < 5 || handovers != 1 || marks[1] != usage.GapNone {
+		t.Errorf("marks = %v, want the first process's samples unmarked and one handover", marks)
+	}
+	if tl.Points[1].CPUUsage != 2_000_000 {
+		t.Errorf("the first process's tick is gone from the series: %+v", tl.Points[1])
+	}
+	if _, ok := nextMonitor.Final(h.name); ok {
+		t.Error("the sampler still measures a job whose compute is gone")
+	}
+}
+
+// A PROCESS THAT ADOPTS ITS OWN JOB KEEPS MEASURING IT (#384). Recovery runs at
+// every registration and moves this process's own running jobs into custody;
+// their series goes on unbroken, and the custody that ends them reports it.
+func TestAJobItsOwnProcessReadoptsKeepsAnUnbrokenSeries(t *testing.T) {
+	h := newHandoverHost(t)
+
+	r, m := h.process(t)
+	h.launch(t, r)
+	h.p.writeCPU(t, h.id, "2000000")
+	m.Tick()
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if held, _ := r.heldForRequest(h.lease.RequestID); held == "" {
+		t.Fatal("recovery did not adopt the process's own job, so this proves nothing")
+	}
+	h.p.writeCPU(t, h.id, "3000000")
+	m.Tick()
+	if err := r.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	got, err := h.a.LeaseUsage(t.Context(), h.lease.ID)
+	if err != nil || got.CPUUserMicros != 3_000_000 {
+		t.Fatalf("usage = %+v, %v; want the 3000000 read before the destroy", got, err)
+	}
+	tl := h.timeline(t)
+	for i, c := range causes(tl) {
+		if c != usage.GapNone {
+			t.Errorf("point %d is marked %v in a series one process sampled throughout", i, c)
+		}
+	}
+	if len(tl.Points) != 4 || tl.Points[1].CPUUsage != 2_000_000 || tl.Points[2].CPUUsage != 3_000_000 {
+		t.Errorf("the series lost samples across the re-adoption: %+v", tl.Points)
+	}
+}
+
+// A JOB ADOPTED WITH NOTHING HANDED OVER IS MEASURED FROM ITS ADOPTION: a
+// process that crashed left no checkpoint, and what the job's cgroup counts
+// for its whole life is still its usage.
+func TestAJobAdoptedWithoutACheckpointIsMeasuredFromItsAdoption(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+
+	next, nextMonitor := h.process(t)
+	h.p.writeCPU(t, h.id, "4000000")
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	h.p.writeCPU(t, h.id, "6000000")
+	nextMonitor.Tick()
+	if err := next.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	got, err := h.a.LeaseUsage(t.Context(), h.lease.ID)
+	if err != nil || got.CPUUserMicros != 6_000_000 {
+		t.Fatalf("usage = %+v, %v; want the cgroup's 6000000", got, err)
+	}
+	tl := h.timeline(t)
+	if tl.Points[0].CPUUsage != 4_000_000 {
+		t.Errorf("the series begins at %d µs, want the adoption's 4000000", tl.Points[0].CPUUsage)
+	}
+}
+
+// AN ADOPTED JOB WHOSE LEASE IS GONE REPORTS NOTHING: the report is fenced on
+// a lease the ledger no longer holds, and the job stops being measured.
+func TestAnAdoptedJobWhoseLeaseIsGoneReportsNothing(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, nextMonitor := h.process(t)
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	lease, err := h.a.Lease(t.Context(), h.lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := next.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if _, err := h.a.LeaseUsage(t.Context(), h.lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("LeaseUsage = %v, want nothing recorded for a lease that was gone", err)
+	}
+	if _, ok := nextMonitor.Final(h.name); ok {
+		t.Error("the sampler still measures a job whose lease is gone")
+	}
+}
+
+// RECOVERY REMOVES THE CHECKPOINTS OF COMPUTE THE BACKEND NO LONGER LISTS, and
+// leaves every other file alone.
+func TestRecoveryRemovesTheCheckpointsOfComputeThatIsGone(t *testing.T) {
+	h := newHandoverHost(t)
+	r, _ := h.process(t)
+
+	gone := filepath.Join(h.dir, provider.InstanceName("a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5")+checkpointSuffix)
+	other := filepath.Join(h.dir, "notes.txt")
+	for _, path := range []string{gone, other} {
+		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the checkpoint of compute that is gone was kept: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("recovery removed a file that is no checkpoint: %v", err)
+	}
+}

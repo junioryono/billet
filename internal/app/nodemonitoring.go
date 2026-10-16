@@ -55,6 +55,11 @@ func requireJobAccounting(p provider.Provider) error {
 	return fc.RequireJobAccounting()
 }
 
+// usageCheckpointDir is where, under the node's state directory, a handover
+// keeps what the sampler knew of each job it leaves running, for the next
+// node process to continue measuring it from (#384).
+const usageCheckpointDir = "usage"
+
 // The sampler reports through usage.Observer, which the usage package declares
 // and internal/metrics satisfies without either importing the other.
 var _ jobusage.Observer = (*metrics.UsageObserver)(nil)

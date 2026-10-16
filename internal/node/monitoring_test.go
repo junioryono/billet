@@ -125,8 +125,12 @@ type startedMonitor struct{ targets []usage.Target }
 func (m *startedMonitor) Start(_ string, target usage.Target, _ int) {
 	m.targets = append(m.targets, target)
 }
-func (m *startedMonitor) Final(string) (usage.Summary, bool) { return usage.Summary{}, false }
-func (m *startedMonitor) Forget(string)                      {}
+func (m *startedMonitor) Final(string) (usage.Summary, bool)                        { return usage.Summary{}, false }
+func (m *startedMonitor) Forget(string)                                             {}
+func (m *startedMonitor) Resume(string, usage.Target, int, *usage.Checkpoint) error { return nil }
+func (m *startedMonitor) Checkpoint(string) (usage.Checkpoint, bool) {
+	return usage.Checkpoint{}, false
+}
 
 // EVERY FIELD A BACKEND SAYS REACHES THE SAMPLER. The provider's target and the
 // sampler's are two structs with the same fields, and one the conversion drops

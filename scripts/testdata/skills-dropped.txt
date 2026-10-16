@@ -109,3 +109,4 @@ c1d37654415e The full gate's steps are now listed in billet-git-flow as what CI 
 e71e192ec55c make verify runs make docs for a docs/ change when Sphinx is installed, and otherwise says CI's docs job runs it.
 e8e645e2b725 The terraform gates are named by make verify and run by CI; billet-infra-terraform-ansible keeps the rule to run them before pushing a .tf change.
 ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10-15 policy); the sentence is restated with both.
+e51f6255d097 An adoption now drops the running entry without forgetting the job's measurement (#384); the sentence names dropRunningLocked beside forgetRunningLocked.

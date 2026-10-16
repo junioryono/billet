@@ -132,6 +132,9 @@ type Runner struct {
 	registryMirrors config.RegistryMirrors
 	// monitor measures each running job from the host; nil measures nothing.
 	monitor JobMonitor
+	// checkpoints is where a handover keeps what the sampler knew of each job,
+	// for the next process; empty keeps nothing.
+	checkpoints string
 	// flows totals each job's traffic by destination, and leaseDir is where it
 	// learns a guest's address; nil measures none.
 	flows    FlowWatcher
@@ -653,15 +656,26 @@ func (r *Runner) forgetRunning(name string) {
 // both: custody's finish removes only the custody entry, so a running entry beside
 // it would outlive the compute.
 func (r *Runner) forgetRunningLocked(name string) {
+	r.dropRunningLocked(name)
+	r.forgetMonitoring(name)
+}
+
+// dropRunningLocked is forgetRunningLocked for a job that goes on being
+// measured, which an adoption into custody is (#384). It reports whether the
+// instance was running here. Requires r.mu.
+func (r *Runner) dropRunningLocked(name string) bool {
+	was := false
 	for requestID, inst := range r.running {
 		if inst != nil && inst.Name == name {
 			delete(r.running, requestID)
 			delete(r.runningLease, requestID)
+			was = true
 		}
 	}
 	delete(r.stoppedSince, name)
 	delete(r.stoppedProved, name)
-	r.forgetMonitoring(name)
+
+	return was
 }
 
 func (r *Runner) removeRegistration(
@@ -1174,6 +1188,10 @@ func (r *Runner) Recover(ctx context.Context) error {
 		}
 	}
 
+	// A HANDOVER'S CHECKPOINTS ARE FOR WHAT THE LIST STILL SHOWS; the rest
+	// describe compute that is gone, which no adoption will read.
+	r.pruneCheckpoints(instances)
+
 	if len(instances) == 0 {
 		return nil
 	}
@@ -1348,9 +1366,17 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
 	// then discovered by Tend, which destroys the compute rather than leaving it
 	// running against capacity somebody else now holds.
-	r.adoptWithObservation(lease, inst, observed, recovery)
+	known := r.adoptWithObservation(lease, inst, observed, recovery)
 
-	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+	err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch)
+
+	// MEASURED FROM HERE ON, after the renewal and never before it: finding the
+	// counters asks the backend, and the renewal is what keeps the reaper away.
+	if !known && !errors.Is(err, alloc.ErrForceRelease) {
+		r.resumeMonitoring(ctx, lease, inst)
+	}
+
+	if err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
 			for _, c := range r.custodySnapshot() {
 				if c.leaseID != lease.ID {
@@ -1359,6 +1385,7 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 				c.discard = true
 				c.outcome = alloc.PhaseFailed
 				c.unconfirmed.Store(false)
+				r.settleHeldUsage(ctx, c, heldUsage{}, false)
 				r.cleanupCache(ctx, c.name)
 
 				return r.finish(ctx, c)

@@ -69,6 +69,13 @@ type completionAwareCompute interface {
 		authority dispatch.CacheAuthority) error
 }
 
+// handingOver keeps, for the next node process, what this one knows of the
+// jobs a handoff leaves running. Optional: compute that keeps nothing hands
+// its jobs over unmeasured, which costs a measurement and nothing else.
+type handingOver interface {
+	HandOver(ctx context.Context)
+}
+
 // upgradableCompute can replace this node's own billet.
 //
 // OPTIONAL, AND ITS ABSENCE IS A REFUSAL rather than a silent no-op. A build or a
@@ -601,6 +608,12 @@ func stopGracefully(
 	// stopped before its first recovery may already own what it registered with.
 	if opts.HandOverOnStop && !drainRequested {
 		if withdraw(ctx, c, log, opts) {
+			// WHAT IS KNOWN OF THE JOBS IS KEPT FOR THE NEXT PROCESS, which adopts
+			// them and continues measuring them from it (#384). Only now: a
+			// withdrawal that did not land drains instead, and measures them here.
+			if h, ok := compute.(handingOver); ok {
+				h.HandOver(context.WithoutCancel(ctx))
+			}
 			log.Info("handing over to the next node process: the compute running here keeps " +
 				"running and is adopted when billet node starts again")
 
