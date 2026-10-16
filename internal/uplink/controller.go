@@ -53,20 +53,21 @@
 // The default route's gateway is asked each round too, against a baseline of
 // its own, because a host beside the reference node saw its gateway stall (1.6
 // ms to spikes of 128 ms) while the round trip to the reflectors rose about 11
-// ms (2026-10-14). Its rise past Bloat confirmed by another high reading at most
-// four rounds before it (readGateway), a quiet reply between them or not, makes
-// a round delayed for a cut as the reflectors' does, so its stall cuts as their
-// delay would, save a lone spike; the stall spans one of the rounds it went
-// unread between the two, so a gateway answering one probe in three still
-// cuts, but never more, so two pings alone never do. One high reading keeps an
-// episode from ending and a rate from rising, and a quiet reading clears a stall
-// unless a high one stands just before it, one reply slipping through. All of it
-// only in a round that counted a reflector, and while the gateway stalls a round
-// it gave no reading in is not clear. A cut's effect is judged on two readings
-// too. Its unanswered probes are never loss, because a gateway answers ICMP when
-// it has the time (the reference node's went unanswered about
-// 2% of the time with the line quiet, 2026-10-16), and read as loss they would
-// cut a busy host on every miss.
+// ms (2026-10-14). Its rise past Bloat confirmed by another high reading at
+// most four rounds before it (readGateway), a reply slipped between them or
+// not, though a quiet pair between ends the stall, makes a round delayed for a
+// cut as the reflectors' does, so its stall cuts as their delay would, save a
+// lone spike; the stall spans one of the rounds it went unread between the two,
+// so a gateway answering one probe in three still cuts, but never more, so two
+// pings alone never do. One high reading keeps an episode from ending and a
+// rate from rising, and a quiet reading clears a stall unless a high one stands
+// just before it, one reply slipping through. All of it only in a round that
+// counted a reflector, and while the gateway stalls a round it gave no reading
+// in is not clear. A cut's effect is judged on two readings too. Its unanswered
+// probes are never loss, because a gateway answers ICMP when it has the time
+// (the reference node's went unanswered about 2% of the time with the line
+// quiet, 2026-10-16), and read as loss they would cut a busy host on every
+// miss.
 //
 // A rate near the interface's speed is not a signal, with no ceiling set or any
 // other. The shaper cannot tell a line as fast as the interface, where such a
@@ -419,8 +420,10 @@ type verdict struct {
 	// are not enough: the round after a cut would find them empty with the
 	// queue still there, and an episode that ended on that would never latch.
 	cleared bool
-	// tally is each reflector's probes and misses since the last cut.
-	tally tally
+	// tally is each reflector's probes and misses since the last cut, and
+	// dropping whether they say the line is dropping.
+	tally    tally
+	dropping bool
 	// gateway is what this round's gateway reading said.
 	gateway gatewayRound
 	cut     float64
@@ -470,8 +473,14 @@ func (c *Controller) Step(o Observation) bool {
 
 	if o.gatewayCounts() {
 		c.lastGateway, c.lastGatewayRound = measured{o.Gateway.Delay, true}, c.round
-		if g.high {
+		// A CALM PAIR IS THE STALL GONE, so a high reading after it is a fresh
+		// one: spikes three rounds apart with quiet pairs between are not one
+		// stall, while the rounds between them read clear.
+		switch {
+		case g.high:
 			c.lastHigh, c.lastHighRound = c.lastGateway, c.round
+		case g.calm:
+			c.lastHigh = measured{}
 		}
 
 		c.gatewayStalled = g.high || g.slipped
@@ -555,13 +564,14 @@ func (c *Controller) judge(o Observation, g gatewayRound) verdict {
 	// line beyond it, one high reading not yet confirmed is no evidence the queue
 	// has gone, and one reply slipping through a stall is none that it has.
 	v := verdict{
-		full:    delayFull || dropping,
-		onDelay: delayFull && (reflectors || g.confirmed),
-		onLoss:  dropping && o.Lost() > 0,
-		clear:   o.DelayKnown && !reflectors && !g.high && !g.slipped && !stillDropping && !stallUnread,
-		tally:   tallyOf(c.losses),
-		gateway: g,
-		cut:     1,
+		full:     delayFull || dropping,
+		onDelay:  delayFull && (reflectors || g.confirmed),
+		onLoss:   dropping && o.Lost() > 0,
+		clear:    o.DelayKnown && !reflectors && !g.high && !g.slipped && !stillDropping && !stallUnread,
+		tally:    tallyOf(c.losses),
+		dropping: dropping,
+		gateway:  g,
+		cut:      1,
 	}
 	v.cleared = v.clear && !stillDelayed
 
@@ -767,11 +777,16 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// ONLY A SOURCE THAT SHOWED THE QUEUE IS EVIDENCE OF IT: a reflector delay
 		// under Bloat that wanders from 12 ms to 8 ms says nothing of the gateway's
 		// stall the cut was taken on, and crediting it would keep cutting for a
-		// queue that is not this host's.
+		// queue that is not this host's. Nor does a stray lost probe in a window
+		// that was not dropping, which at the 1.7% a reflector loses on a quiet
+		// line would credit about one cut in five that changed nothing.
 		d.cutReflectors = measured{o.Delay, o.DelayKnown && o.Delay > p.Bloat}
 		d.cutGateway = measured{v.gateway.rise, v.gateway.confirmed}
 		c.cutStall = d.cutGateway
-		d.cutTally = v.tally
+		d.cutTally = nil
+		if v.dropping {
+			d.cutTally = v.tally
+		}
 
 		return d.Rate != before, true
 	case v.clear && moving >= p.Full*d.Rate && d.futile < p.Futile &&

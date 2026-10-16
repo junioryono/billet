@@ -1,6 +1,7 @@
 package uplink
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -469,4 +470,45 @@ func TestEachEpisodeGetsItsOwnCuts(t *testing.T) {
 	if cuts != 2*c.Params.Futile {
 		t.Fatalf("two episodes of a queue no cut moved drew %d cuts; want %d each", cuts, c.Params.Futile)
 	}
+}
+
+// A LOSS CUT THAT LESSENED THE LOSS HELPED: a cut taken on a dropping line keeps
+// its tally, so the next cut, on a line still dropping but losing one probe in
+// three where it lost two, counts the first as having helped.
+func TestALossCutThatLessenedTheLossHelped(t *testing.T) {
+	t.Parallel()
+
+	lossy := func(n int, lost ...string) Observation {
+		probes := []Probe{{Reflector: "a"}, {Reflector: "b"}, {Reflector: "c"}}
+		for i := range probes {
+			probes[i].Lost = slices.Contains(lost, probes[i].Reflector)
+		}
+
+		return probed(n, 5, 400, Sample{Delay: 2 * time.Millisecond, DelayKnown: true, Probes: probes})
+	}
+
+	c := newController()
+	cuts := 0
+	for n := range 60 {
+		o := lossy(n, "a", "b")
+		if cuts > 0 {
+			o = lossy(n, []string{"a", "b"}[n%2])
+		}
+
+		c.Step(o)
+		if c.Cause == CauseNone {
+			continue
+		}
+
+		cuts++
+		if cuts == 2 {
+			if c.Down.futile != 0 {
+				t.Errorf("a loss cut after one that halved the loss was counted futile (%d)", c.Down.futile)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("a line dropping a probe in three was cut %d times; want a second cut to judge", cuts)
 }

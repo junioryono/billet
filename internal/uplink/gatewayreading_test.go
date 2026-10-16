@@ -120,8 +120,9 @@ func TestAQuietReadingClearsAStallUnlessAHighOneStandsBesideIt(t *testing.T) {
 }
 
 // A GATEWAY THAT RECOVERS WHILE ANSWERING EVERY OTHER PROBE STOPS HOLDING RATES:
-// one quiet reading clears its stall, so the rounds it gives no reading in no
-// longer read as a stall gone unread.
+// its second quiet reading, two rounds after the first, is a calm pair that
+// clears its stall, so the rounds it gives no reading in no longer read as a
+// stall gone unread.
 func TestAGatewayThatRecoversWhileAnsweringHalfLetsRatesClimb(t *testing.T) {
 	t.Parallel()
 
@@ -263,8 +264,22 @@ func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 		}
 	}
 
-	// A REPLY SLIPPED BETWEEN TWO HIGH READINGS DOES NOT BREAK THEIR PAIR.
+	// ROUNDS, NOT THE CLOCK: four rounds apart pair though the last round's
+	// probes came in 400 ms after its tick, 2.4 s after the first reading.
 	c := newController()
+	c.Step(stalled(0))
+	for n := 1; n < gatewayPairRounds; n++ {
+		c.Step(unread(n))
+	}
+	late := stalled(gatewayPairRounds)
+	late.At = late.At.Add(Tick * 8 / 10)
+	c.Step(late)
+	if !c.recent[len(c.recent)-1] {
+		t.Errorf("a stall four rounds after the last, %v by the clock, was not confirmed", late.At.Sub(at(0)))
+	}
+
+	// A REPLY SLIPPED BETWEEN TWO HIGH READINGS DOES NOT BREAK THEIR PAIR.
+	c = newController()
 	quiet := func(n int) Observation {
 		return withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(time.Millisecond))
 	}
@@ -299,6 +314,57 @@ func TestAStallConfirmsOnlyWithinThePairingWindow(t *testing.T) {
 	c.Step(stalled(n))
 	if c.Cause == CauseNone {
 		t.Error("a fourth stalled reading, the third confirmed, cut nothing")
+	}
+}
+
+// SPIKES WITH A QUIET PAIR BETWEEN ARE NOT ONE STALL: a calm pair is the stall
+// gone, so a spike three rounds after the last is a lone one again, and beside
+// the reflectors delayed one round in six, under the three a cut needs, tips
+// nothing. Paired across the calm rounds, every spike would confirm.
+func TestSpikesWithAQuietPairBetweenAreNotOneStall(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	for n := range 120 {
+		delay, rise := 2*time.Millisecond, time.Millisecond
+		if n%6 == 1 {
+			delay = 30 * time.Millisecond
+		}
+		if n > 0 && n%3 == 0 {
+			rise = 80 * time.Millisecond
+		}
+
+		c.Step(withGateway(moving(n, 5, 400, delay), gatewayRose(rise)))
+		if c.Cause != CauseNone {
+			t.Fatalf("round %d: a cut on gateway spikes three rounds apart with quiet pairs between", n)
+		}
+	}
+}
+
+// A STRAY LOST PROBE AT A CUT CREDITS NO LATER CUT: a window that was not
+// dropping keeps no tally, so a stall no cut shortens latches after Futile cuts
+// though the window at the first cut lost one probe and none since did.
+func TestAStrayLostProbeAtACutCreditsNoLaterCut(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 120 {
+		o := withGateway(moving(n, 5, 400, 2*time.Millisecond), gatewayRose(60*time.Millisecond))
+		if n == 1 {
+			o.Probes = []Probe{{Reflector: "a", Lost: true}, {Reflector: "b"}, {Reflector: "c"}}
+		}
+
+		c.Step(o)
+		if c.Cause != CauseNone {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Errorf("a stall no cut shortened, one probe lost before the first cut, was cut %d times; want "+
+			"exactly %d, then the latch", cuts, c.Params.Futile)
 	}
 }
 

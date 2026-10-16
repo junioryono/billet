@@ -232,9 +232,10 @@ func TestAShorterGatewayStallCountsAsHelping(t *testing.T) {
 	cut = *d
 	cut.cutReflectors = measured{}
 	v, o = round(20*ms, 60*ms, gatewayLost())
-	if len(cut.cutTally) == 0 {
-		t.Fatal("the cut kept no tally of its reflectors' probes")
+	if len(cut.cutTally) != 0 {
+		t.Fatalf("a cut on a line that was not dropping kept a tally, %v", cut.cutTally)
 	}
+	cut.cutTally = tally{"a": {6, 0}, "b": {6, 0}, "c": {6, 0}}
 	v.tally = cut.cutTally
 	if shortened, judged := helped(&cut, v, o); shortened || judged {
 		t.Errorf("no loss at the cut and none now judged helped %v, judged %v; want neither", shortened, judged)
