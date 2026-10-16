@@ -18,6 +18,7 @@ A coding agent now opens many changes in parallel, and each one is only verifiab
 - create, fork and suspend each reserve the storage they need, temporary capture space included, before writing;
 - a reservation covers the maximum growth its writable disks and the owner's home are allowed, copy-on-write growth while older generations are retained included, and the storage enforces that limit against the guest's own writes, so growing it is itself an admitted operation;
 - a suspension keeps its storage charge after its compute is released;
+- golden builds reserve compute and their maximum temporary and persistent storage under deployment admission before they start. A builder's compute stays charged until it is proved gone, and a published golden's storage stays charged while it is retained, including while any workspace pins it. A rebuild needs a reservation of its own and never overwrites a retained generation;
 - insufficient or unknown headroom refuses the operation and never deletes existing work.
 
 **Only explicit requests stop or delete a workspace.** Idle time produces a warning to the owner and a suspension recommendation; it never stops the VM, because a timer never authorises a teardown and an idle observation does not prove that a background agent or an outside operation has finished. Suspending and deleting are requests that name the workspace, made by its owner or an operator. Any automatic policy would be a change to that invariant, made in a record of its own.
@@ -33,6 +34,8 @@ A coding agent now opens many changes in parallel, and each one is only verifiab
 How the volume reaches the guest: Firecracker creates drives only before boot and afterwards updates an existing one, so the golden carries an unused drive slot backed by a disposable placeholder, with no filesystem mounted on it and no outstanding I/O. billet already attaches cache volumes this way, through pre-declared `cacheN` slots. After restore, billet replaces that slot's backing store with the workspace volume through the existing-drive update, and the guest mounts it only after the replacement and its cache invalidation are proved. This is conditional on a dated probe.
 
 Nothing billet carries from one workspace into another goes on the system disk.
+
+**Only what does not depend on the checkout stays warm.** A process the golden warmed holds the golden's code, open files, working directories and filesystem watches, and none of that follows a checkout copied in later. So only checkout-independent services (the database, the cache, the queue) stay warm across a restore. Checkout-dependent processes start afresh from the workspace's checkout once it is mounted and finalised, unless a measured procedure proves their loaded code, open files and watches have been rebound to it. Readiness is judged after that.
 
 **A golden is pinned to a compatibility fingerprint, and billet refuses a mismatch before loading.** Firecracker requires a restore on the software and hardware configuration a snapshot was taken on; that is a requirement on the integrator, not a refusal Firecracker promises to make. So every golden records a fingerprint (CPU model and configuration, host kernel, Firecracker build, guest kernel), and billet compares it with the host's before invoking a load; a mismatch, or a fingerprint it cannot read, refuses. A host whose fingerprint changes builds new goldens.
 
@@ -190,7 +193,9 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
 - **Pinning:** replacing a golden and cleaning up a consumed suspension while workspaces still run from them leaves their memory intact.
 - **Storage admission:**
   - create, fork and suspend at the storage limit are refused without touching existing work;
-  - a running guest filling its disks or its home stops at its reservation.
+  - a running guest filling its disks or its home stops at its reservation;
+  - repeated golden rebuilds while older goldens stay pinned are refused before compute or storage is overcommitted.
+- **Fresh code:** with the golden, the source workspace and the fork each answering with a distinguishable response (an uncommitted change in the source included), each workspace's preview serves its own checkout.
 - **Revocation:** revoking access while an attach terminal and a preview WebSocket are open ends both.
 - **Network:**
   - a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay;
