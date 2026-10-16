@@ -53,7 +53,10 @@ Only an authorised golden builder, or the custodian assigned to that workspace, 
 - **Before capture:** every application process is stopped at a restore barrier the guest agent holds, the guest's network is down, and the golden holds no credential, key or token of any kind.
 - **After restore:**
   - the barrier holds until the agent has proved the kernel reseeded from the VMGenID notification;
-  - the agent sets the guest's wall clock to the current time through a measured mechanism, because a restored clock continues from snapshot time (an aged golden or a long suspension would otherwise start TLS and credential checks in the past), and an unknown result holds the barrier;
+  - the guest's wall clock is made current before anything trusts it. Sampled forks restored about a minute after capture were 64 to 75 s behind the host, and an aged golden or a long suspension would start TLS and credential checks in the past. The mechanism (measured):
+    - the golden boots with `clocksource=kvm-clock`, and every load passes `clock_realtime`, on a host with a TSC clock source and Linux 5.16 or later;
+    - a fork restored more than a minute after capture was then within 0.02 s of the host, whereas with the guest's default `tsc` clock source the option changed nothing;
+    - the agent still checks the clock against the host time in its MMDS document, and an unknown or wrong result holds the barrier;
   - the agent then regenerates per-fork identity (machine id, host keys, hostname, the Docker daemon's identity). `boot_id` was identical in the base and every sampled fork (measured), so nothing may rely on the inherited value to tell forks apart;
   - only then do services start.
 - **Services:** a service with clone-sensitive state (a database's system identifier, a TLS server or client session, a persistent random seed, a cached token) is reinitialised through a procedure measured for that service, or is not in the golden at all and starts fresh after restore.
@@ -69,7 +72,7 @@ TLS for previews terminates at the edge, so no fork serves with a private key a 
 
 A fork gets a new identity; a resumed suspension keeps its own but still gets fresh credentials and metadata. A missing or unknown step refuses the resume.
 
-**A fork's network is its own namespace.** A restored guest keeps the address and tap name the golden had, so every workspace runs in a network namespace of its own with that tap name inside it, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests. Ingress is denied too, and the host enforces both:
+**A fork's network is its own namespace.** A restored guest keeps the address the golden had, so every workspace runs in a network namespace of its own, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. The tap inside it need not carry the golden's name: `network_overrides` on load points the interface at whatever tap billet allocated, and that was measured to work. `vsock_override` likewise gives each fork its own socket path. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests. Ingress is denied too, and the host enforces both:
 - no new inbound connection reaches a workspace's services except one the authenticated relay opens, to a port explicitly permitted for previews;
 - other workspaces and peers on the physical network cannot reach those ports directly;
 - the guest cannot alter this policy, and missing or unproved enforcement refuses the launch.
@@ -135,7 +138,7 @@ Whatever the source's agent wrote into its checkout, a token in an untracked fil
 
 ### Access
 
-**Previews and attach need no new externally reachable listener on a node host.** The node initiates authenticated relay connections to the control plane and serves nothing outward. Attach is a terminal the guest agent serves over vsock, relayed node to control plane on a multiplexed stream beside the long-poll. A snapshot resets established vsock connections, so the agent reconnects after every restore and the relay treats a reset as normal. Previews are HTTPS requests to the control plane's edge, routed to a workspace and down the same stream to the fork's address inside its namespace.
+**Previews and attach need no new externally reachable listener on a node host.** The node initiates authenticated relay connections to the control plane and serves nothing outward. Attach is a terminal the guest agent serves over vsock, relayed node to control plane on a multiplexed stream beside the long-poll. The sampled snapshot-and-resume sequence closed an established vsock connection, so the design requires the agent to reconnect after every restore and the relay to treat a reset as normal. Previews are HTTPS requests to the control plane's edge, routed to a workspace and down the same stream to the fork's address inside its namespace.
 
 **Every request is authorised for the workspace it names, not only authenticated.** Every preview request, attach stream, resume and MCP call authenticates the caller and authorises that caller against the destination organisation, workspace and current assignment before a relay opens. Missing, unknown or unreadable authorisation refuses. The edge consumes billet's session cookies and authorisation headers and never forwards them into a guest.
 
@@ -211,11 +214,15 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - a direct connection to its services from another workspace or from a physical-network peer fails.
 - **vsock:**
   - *measured:* a new connection to the guest's vsock listener was answered after a snapshot and resume. Still to measure: the listener works after a restore with an updated guest CID;
-  - *measured:* an established connection is closed by a snapshot of the running VM (the next read returns end of file);
+  - *measured:* in the sampled snapshot-and-resume sequence, the next read on an established vsock connection returned end of file;
   - the agent and the relay recover it.
 - **The memory file in a jail:** *measured.* A hard link into the chroot, root-owned and mode 0444 as the kernel is, restores under the jailer, and the jailed uid can read it but not write it. A golden's memory file reaches a jail that way. A suspension's is confidential, so it needs a mode only its own VM can read; that is still to be measured.
 - **Compatibility:** a golden with a mismatched or unreadable fingerprint is refused by billet before load, and a matching one restores.
-- **Clock:** *measured:* the guest's wall clock was 64 to 75 s behind the host for forks restored about a minute after capture. Still to measure: after restoring an aged golden and a long suspension, the guest's wall clock is current before the barrier releases, with whatever the chosen Firecracker clock mechanism requires of the host.
+- **Clock:** *measured:*
+  - without a mechanism, forks restored about a minute after capture were 64 to 75 s behind the host;
+  - with a `clocksource=kvm-clock` guest and `clock_realtime` on load, a fork was within 0.02 s after more than a minute.
+
+  Still to measure: the same after a long suspension and an aged golden (hours to days), and the agent's check holding the barrier when the clock is wrong.
 - **Disks:**
   - replacing a restored golden's placeholder slot with a workspace volume through the existing-drive update works, covering device sizing, cached reads and writes and repeated restores;
   - an old workspace volume mounts after journal recovery for the fallback.
