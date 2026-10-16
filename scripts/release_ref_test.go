@@ -76,7 +76,10 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 			build: func(t *testing.T, repo string) {
 				t.Helper()
 
+				// THREE, so neither the first nor the last listed wins by position,
+				// and a patch number decides it.
 				commit(t, repo, "Release")
+				fixtureGit(t, repo, "tag", "v0.4.1")
 				fixtureGit(t, repo, "tag", "v0.4.10")
 				fixtureGit(t, repo, "tag", "v0.4.9")
 			},
@@ -101,8 +104,34 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 				// A RELEASE NAME ON A TREE names no commit, so it is no release.
 				commit(t, repo, "a tagged tree")
 				fixtureGit(t, repo, "tag", "v0.9.0", "HEAD^{tree}")
+
+				// AND SUBJECTS THAT ARE NOT A CUT, which would be refused for a
+				// tag they never needed if the subject pattern loosened.
+				commit(t, repo, "Release v0.5.0-rc.1")
+				commit(t, repo, "Release v0x5x0")
+				commit(t, repo, "Release v0.5.0 notes")
 			},
 			want: "v0.4.0",
+		},
+		{
+			// A RELEASE BRANCH REBASED BACK INTO MAIN copies its `Release vX.Y.Z`
+			// commit onto main without the tag, which is on the original. The tag
+			// is in the clone, so the copy is passed over and main is still main.
+			name: "a release commit copied onto main",
+			build: func(t *testing.T, repo string) {
+				t.Helper()
+
+				commit(t, repo, "main before the cut")
+				fixtureGit(t, repo, "checkout", "--quiet", "-b", "release/v0.4")
+				commit(t, repo, "Release v0.4.0")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				fixtureGit(t, repo, "checkout", "--quiet", "main")
+				// Main moved, so the copy has another parent and is another commit.
+				commit(t, repo, "main during the release")
+				fixtureGit(t, repo, "cherry-pick", "--allow-empty", "release/v0.4")
+				commit(t, repo, "main after the hotfix")
+			},
+			want: "main",
 		},
 		{
 			// A TAG OF A TAG, which %(*objectname) would peel only as far as the
@@ -275,6 +304,34 @@ func TestTheReleaseRefRefusesWhatItCannotTell(t *testing.T) {
 		}
 	})
 
+	// A TAG WHOSE OBJECT CANNOT BE READ is not a tag on a tree: skipping it would
+	// let the older release that shares its commit answer for it.
+	t.Run("a release tag whose object cannot be read", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		commit(t, repo, "Release v0.4.1")
+		fixtureGit(t, repo, "tag", "v0.4.0")
+		fixtureGit(t, repo, "tag", "-a", "v0.4.1", "-m", "v0.4.1")
+		commit(t, repo, "a carry")
+
+		object := strings.TrimSpace(gitOutput(t, repo, "rev-parse", "refs/tags/v0.4.1"))
+		loose := filepath.Join(repo, ".git", "objects", object[:2], object[2:])
+
+		if err := os.Remove(loose); err != nil {
+			t.Fatalf("remove the tag object %s: %v", object, err)
+		}
+
+		got, stderr, err := releaseRef(t, repo)
+		if err == nil {
+			t.Fatalf("release-ref.sh answered %q past a tag it could not read", got)
+		}
+
+		if !strings.Contains(stderr, "the tag v0.4.1 names an object this clone cannot read") {
+			t.Errorf("the refusal does not name the unreadable tag:\n%s", stderr)
+		}
+	})
+
 	t.Run("no repository", func(t *testing.T) {
 		t.Parallel()
 
@@ -306,6 +363,9 @@ func TestTheModuleSourcesCheckExpectsTheTreesOwnRef(t *testing.T) {
 		// is the release tag on the commit that carries it.
 		documented string
 		tag        string
+		// cut, when set, commits `Release <cut>` on top with no tag: a release this
+		// clone cannot prove, which the resolver refuses.
+		cut        string
 		expected   string
 		wantOK     bool
 		wantOutput string
@@ -318,6 +378,10 @@ func TestTheModuleSourcesCheckExpectsTheTreesOwnRef(t *testing.T) {
 			wantOutput: "expected ?ref=main"},
 		{name: "EXPECTED_REF wins over the tree", documented: "v0.4.3", tag: "v0.4.3",
 			expected: "main", wantOutput: "expected ?ref=main"},
+		// THE RESOLVER'S REFUSAL IS THE CHECK'S, never a quiet main. The
+		// documentation says main, so main read in its place would pass.
+		{name: "a release whose tag this clone lacks", documented: "main", cut: "v0.4.3",
+			wantOutput: "this clone has no v0.4.3 tag"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -351,6 +415,10 @@ func TestTheModuleSourcesCheckExpectsTheTreesOwnRef(t *testing.T) {
 
 			if tc.tag != "" {
 				fixtureGit(t, repo, "tag", "-a", tc.tag, "-m", tc.tag)
+			}
+
+			if tc.cut != "" {
+				commit(t, repo, "Release "+tc.cut)
 			}
 
 			cmd := exec.CommandContext(t.Context(), checker)
@@ -415,13 +483,13 @@ func TestTheReleaseRefFixturesIgnoreTheDevelopersGitConfiguration(t *testing.T) 
 		name string
 		env  []string
 	}{
-		{"the global configuration under HOME", withoutEnv("GIT_CONFIG_PARAMETERS")},
-		{"GIT_CONFIG_PARAMETERS", append(withoutEnv("GIT_CONFIG_PARAMETERS"),
+		{"the global configuration under HOME", probeGitEnv()},
+		{"GIT_CONFIG_PARAMETERS", append(probeGitEnv(),
 			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_PARAMETERS="+parameters)},
 	} {
 		plain := t.TempDir()
 
-		initialise := exec.CommandContext(t.Context(), "git", "init", "--quiet")
+		initialise := exec.CommandContext(t.Context(), "git", "init", "--quiet", "--template=")
 		initialise.Dir = plain
 		initialise.Env = route.env
 
@@ -500,19 +568,21 @@ func commit(t *testing.T, repo, message string) {
 	fixtureGit(t, repo, "commit", "--quiet", "--allow-empty", "-m", message)
 }
 
-// withoutEnv is this process's environment without the named variable.
-func withoutEnv(name string) []string {
-	env := make([]string, 0, len(os.Environ()))
+// probeGitEnv is this process's environment without any inherited GIT_ variable
+// (a GIT_DIR would point a probe at another repository) or the system
+// configuration, so a probe reads only the route it adds.
+func probeGitEnv() []string {
+	env := make([]string, 0, len(os.Environ())+2)
 
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, name+"=") {
+		if strings.HasPrefix(kv, "GIT_") {
 			continue
 		}
 
 		env = append(env, kv)
 	}
 
-	return env
+	return append(env, "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
 }
 
 // fixtureGit runs git in a fixture repository, in fixtureGitEnv.

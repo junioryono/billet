@@ -49,13 +49,16 @@ trap 'rm -rf "$work"' EXIT
 
 # THE RELEASE TAGS AND THE COMMITS THEY NAME, peeled all the way: an annotated
 # tag (what cut-release.yml writes) names a tag object, and a tag of a tag names
-# another, which for-each-ref's %(*objectname) peels only once. `^{commit}`
-# follows the chain to the end, and one cat-file answers for every tag in input
-# order, with `missing` for a tag that does not end at a commit; that tag names
-# no release, so it is left out. cat-file's own failure ends this under set -e.
+# another, which for-each-ref's %(*objectname) peels only once. `^{}` follows the
+# chain to the first object that is not a tag, and one cat-file answers for every
+# tag in input order. Three answers, kept apart: a commit is a release; a tree or
+# a blob names no release and is left out; `missing` is an object this clone
+# cannot read, which is could-not-tell and refuses, because skipping it could
+# leave an older release on the same commit to answer. cat-file's own failure
+# ends this under set -e.
 git for-each-ref --format='%(refname:strip=2)' 'refs/tags/v*' >"$work/refs"
 awk '/^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/' "$work/refs" >"$work/names"
-awk '{ print "refs/tags/" $0 "^{commit}" }' "$work/names" |
+awk '{ print "refs/tags/" $0 "^{}" }' "$work/names" |
 	git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null >"$work/peeled"
 
 if [ "$(wc -l <"$work/names")" -ne "$(wc -l <"$work/peeled")" ]; then
@@ -64,7 +67,16 @@ if [ "$(wc -l <"$work/names")" -ne "$(wc -l <"$work/peeled")" ]; then
 	exit 1
 fi
 
-paste -d ' ' "$work/peeled" "$work/names" | awk '$2 == "commit" { print $1, $3 }' >"$work/tags"
+paste -d ' ' "$work/peeled" "$work/names" >"$work/answers"
+
+if unreadable=$(awk '$2 == "missing" { print $NF; exit 1 }' "$work/answers"); then
+	:
+else
+	printf 'release-ref: the tag %s names an object this clone cannot read\n' "$unreadable" >&2
+	exit 1
+fi
+
+awk '$2 == "commit" { print $1, $3 }' "$work/answers" >"$work/tags"
 
 git log --first-parent --format='%H %s' HEAD >"$work/chain"
 
@@ -72,13 +84,15 @@ git log --first-parent --format='%H %s' HEAD >"$work/chain"
 # carrying a release tag answers, with the highest version on it, compared by
 # number rather than as text so v0.4.10 is newer than v0.4.9.
 #
-# A RELEASE COMMIT WITHOUT ITS TAG IS COULD-NOT-TELL. Full history does not
+# A RELEASE THIS CLONE HAS NO TAG FOR IS COULD-NOT-TELL. Full history does not
 # prove the tags came with it (`git fetch --no-tags`), and with them missing a
 # release branch would read as main, or as an older release when only its newest
 # tag is gone. cut-release.yml commits `Release vX.Y.Z` on the branch it tags,
-# so a commit with that exact subject whose own tags do not include vX.Y.Z is a
-# tag this clone lacks, even when an older tag shares the commit, and the answer
-# is a refusal (status 3).
+# so a commit with that exact subject, reached before any tag answers, whose
+# vX.Y.Z is no tag in this clone at all, is a tag this clone lacks, and the
+# answer is a refusal (status 3). When vX.Y.Z IS a tag, on another commit, this
+# one is a copy (a release branch rebased back into main writes one), and the
+# walk goes on past it.
 #
 # THE PATTERN IS A LITERAL IN THE PROGRAM, not passed with -v: awk processes
 # escapes in a -v value, so `\.` would arrive as `.` and match any character.
@@ -95,7 +109,7 @@ ref=$(awk '
 		return 0
 	}
 	FILENAME == ARGV[1] {
-		has[$1, $2] = 1
+		known[$2] = 1
 		if (!($1 in best) || newer($2, best[$1])) best[$1] = $2
 		next
 	}
@@ -103,7 +117,7 @@ ref=$(awk '
 		subject = substr($0, length($1) + 2)
 		if (subject ~ /^Release v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) {
 			version = substr(subject, 9)
-			if (!(($1, version) in has)) {
+			if (!(version in known)) {
 				print version " " $1
 				done = 1
 				exit 3
@@ -119,7 +133,7 @@ set -e
 case $status in
 	0) ;;
 	3)
-		printf 'release-ref: commit %s cut %s, and this clone has no %s tag on it\n' "${ref#* }" "${ref%% *}" "${ref%% *}" >&2
+		printf 'release-ref: commit %s cut %s, and this clone has no %s tag\n' "${ref#* }" "${ref%% *}" "${ref%% *}" >&2
 		printf '  fetch the tags (git fetch --tags, or actions/checkout with fetch-depth: 0)\n' >&2
 		exit 1
 		;;
