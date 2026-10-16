@@ -16,6 +16,7 @@ A coding agent now opens many changes in parallel, and each one is only verifiab
 
 **Storage is admitted separately from compute.** A suspension releases compute and keeps its snapshot and disks, so compute capacity alone bounds nothing on storage. Persistent storage is therefore admitted under deployment and owner limits:
 - create, fork and suspend each reserve the storage they need, temporary capture space included, before writing;
+- a reservation covers the maximum growth its writable disks and the owner's home are allowed, copy-on-write growth while older generations are retained included, and the storage enforces that limit against the guest's own writes, so growing it is itself an admitted operation;
 - a suspension keeps its storage charge after its compute is released;
 - insufficient or unknown headroom refuses the operation and never deletes existing work.
 
@@ -65,7 +66,12 @@ TLS for previews terminates at the edge, so no fork serves with a private key a 
 
 A fork gets a new identity; a resumed suspension keeps its own but still gets fresh credentials and metadata. A missing or unknown step refuses the resume.
 
-**A fork's network is its own namespace.** A restored guest keeps the address and tap name the golden had, so every workspace runs in a network namespace of its own with that tap name inside it, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests.
+**A fork's network is its own namespace.** A restored guest keeps the address and tap name the golden had, so every workspace runs in a network namespace of its own with that tap name inside it, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests. Ingress is denied too, and the host enforces both:
+- no new inbound connection reaches a workspace's services except one the authenticated relay opens, to a port explicitly permitted for previews;
+- other workspaces and peers on the physical network cannot reach those ports directly;
+- the guest cannot alter this policy, and missing or unproved enforcement refuses the launch.
+
+Firecracker's network-for-clones example forwards freely and disclaims its own security, so it is followed for addressing only.
 
 ### Suspension and forks of a running workspace
 
@@ -111,6 +117,13 @@ The traversal is confined to the checkout through verified directory descriptors
 
 Git metadata that points outside the checkout is refused: a `.git` file, a `commondir` or an object alternate never authorises traversal outside the source view. Before a fork is published, billet proves that its git metadata and every object its refs need are inside the copy. A linked worktree or an alternate store must first be materialised into the confined view.
 
+No code from the checkout runs during a fork. Git validation, materialisation and branch creation never run on the host. They run inside the destination microVM as the workspace user, after the identity and reseeding checks, with:
+- a clean environment;
+- allowlisted configuration (no `core.fsmonitor`, no `core.hooksPath`);
+- repository hooks and executable helpers disabled.
+
+Nothing the checkout controls executes before the barrier releases.
+
 The fork gets a branch of its own. After the copy, and before the barrier releases, billet creates and checks out a fresh branch at the copied HEAD, keeping staged and unstaged changes, and removes any inherited push configuration that targets the source branch. Failure leaves the fork unpublished.
 
 Whatever the source's agent wrote into its checkout, a token in an untracked file included, comes along, which is why a fork belongs to the same owner only. The new workspace gets its own identity and its own repository token.
@@ -120,6 +133,8 @@ Whatever the source's agent wrote into its checkout, a token in an untracked fil
 **Previews and attach need no new externally reachable listener on a node host.** The node initiates authenticated relay connections to the control plane and serves nothing outward. Attach is a terminal the guest agent serves over vsock, relayed node to control plane on a multiplexed stream beside the long-poll. A snapshot resets established vsock connections, so the agent reconnects after every restore and the relay treats a reset as normal. Previews are HTTPS requests to the control plane's edge, routed to a workspace and down the same stream to the fork's address inside its namespace.
 
 **Every request is authorised for the workspace it names, not only authenticated.** Every preview request, attach stream, resume and MCP call authenticates the caller and authorises that caller against the destination organisation, workspace and current assignment before a relay opens. Missing, unknown or unreadable authorisation refuses. The edge consumes billet's session cookies and authorisation headers and never forwards them into a guest.
+
+**Authorisation lasts as long as it holds, not as long as a connection does.** Every relay stream (an attach terminal, a preview WebSocket, a long-lived request) is bound to its authorisation grant and to the workspace's assignment generation. Revocation, the grant's expiry or a change of assignment ends the stream, and forwarding continues only while authorisation is current; an unknown result stops forwarding. Closing a relay neither stops the workspace nor releases its capacity.
 
 **A browser cannot be made to send a command.** A preview is application content its owner's browser runs, so being signed in and owning the workspace does not prove a request was intended:
 - every cookie-authenticated mutation validates `Origin` and carries a session-bound CSRF token;
@@ -171,8 +186,13 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - a suspension restored after its previous repository token expired runs with a fresh one.
 - **Integrity:** a substituted component, a mix of two generations and a bundle from another deployment are each refused before load.
 - **Pinning:** replacing a golden and cleaning up a consumed suspension while workspaces still run from them leaves their memory intact.
-- **Storage admission:** create, fork and suspend at the storage limit are refused without touching existing work.
-- **Network:** a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay.
+- **Storage admission:**
+  - create, fork and suspend at the storage limit are refused without touching existing work;
+  - a running guest filling its disks or its home stops at its reservation.
+- **Revocation:** revoking access while an attach terminal and a preview WebSocket are open ends both.
+- **Network:**
+  - a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay;
+  - a direct connection to its services from another workspace or from a physical-network peer fails.
 - **vsock:**
   - a vsock listener in the guest survives restore with its CID updated, as documented;
   - an established attach stream is closed by the restore;
@@ -189,6 +209,7 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - a symlink pointing out of the checkout, a special file and a rename during the copy all fail to escape either root.
 - **Home isolation:** from one user's workspace, as guest root, reading another user's home fails both through the filesystem and through direct object access.
 - **Aborted suspension:** after a failure during preparation and during capture, the workspace is usable again (home mounted, network up, agent running, applications released) or reported as needing recovery.
+- **Fork executes nothing:** an executable `post-checkout` hook and a `core.fsmonitor` setting in the source run neither on the host nor in the guest during finalisation.
 - **Fork git integrity:** a linked worktree and an alternate object store in the source are either materialised or refused, never left dangling; the fork is on a fresh branch with no push configuration targeting the source.
 - **Shared home:**
   - two workspaces of one user share the home concurrently;
