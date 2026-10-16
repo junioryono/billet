@@ -139,6 +139,25 @@ func TestARoundThatMeasuredNothingNeitherCutsNorRaises(t *testing.T) {
 	}
 }
 
+// A WINDOW FULL OF DELAYS DOES NOT CUT ON A ROUND THAT MEASURED NOTHING. Three
+// delayed rounds while the host was quiet fill the window; then the host is
+// busy, below its rate, in a round that counted no reflector: the queue may be
+// there or gone, and a could-not-tell is no evidence that it is there now.
+func TestAFullWindowDoesNotCutOnARoundThatMeasuredNothing(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Down.Rate = 400
+
+	for n := range 3 {
+		c.Step(moving(n, 0, 8, 30*time.Millisecond))
+	}
+
+	if c.Step(probed(3, 0, 300, Sample{})) {
+		t.Fatalf("a round that measured nothing cut the download to %.1f on the window's delays", c.Down.Rate)
+	}
+}
+
 // A CUT ON LOSS THAT LEAVES THE LOSS WHERE IT WAS COUNTS AS FUTILE, as a cut on
 // delay does: the line is dropping under somebody else's traffic, and two such
 // cuts are all the host takes until the line clears.

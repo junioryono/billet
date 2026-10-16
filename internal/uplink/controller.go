@@ -454,9 +454,12 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 
 	// THE QUEUE CLEARED, by the trails a cut does not empty: a later one starts
 	// a new episode, and its cuts are judged afresh, against nothing from this
-	// one. The trails hold every round the windows do, so a cleared line is
-	// never a full one, and this never meets a cut below.
-	if v.cleared {
+	// one. Not within the cooldown of this direction's last cut, while the
+	// queue that cut is meant to drain still has the time to show it has not:
+	// the trail can thin out under a queue that never left. The trails hold
+	// every round the windows do, so a cleared line is never a full one, and
+	// this never meets a cut below.
+	if v.cleared && (!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown) {
 		d.futile, d.episode = 0, false
 	}
 

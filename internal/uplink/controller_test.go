@@ -380,6 +380,35 @@ func TestAnIsolatedSpikeDoesNotKeepADirectionLatched(t *testing.T) {
 	}
 }
 
+// A THIN TRAIL JUST AFTER A CUT DOES NOT END AN EPISODE. A 30 ms queue no cut
+// moves, delayed at first in only three rounds of six, so the round after the
+// first cut sees the oldest of them leave the trail: the queue has not
+// cleared, it has had no time to, and the cuts still stop at two.
+func TestAThinTrailJustAfterACutDoesNotEndAnEpisode(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 120 {
+		delay := 30 * time.Millisecond
+		if n < 7 && n != 0 && n != 3 && n != 5 {
+			delay = 0
+		}
+
+		before := c.Down.Rate
+		c.Step(moving(n, 0, 300, delay))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a queue no cut moved drew %d cuts over a minute; want %d", cuts, c.Params.Futile)
+	}
+}
+
 // A NEW EPISODE IS JUDGED AGAINST NOTHING FROM THE LAST ONE. A 30 ms queue no
 // cut moves draws two cuts; the queue clears while the host is idle; the same
 // queue comes back, and draws two cuts of its own, not one measured against
