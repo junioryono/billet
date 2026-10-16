@@ -119,11 +119,13 @@ func (s *stepper) tick(ctx context.Context) error {
 }
 
 // notice logs the rounds going blind, once no counted reflector has answered
-// for as long as a reflector is given (when the silent ones stop counting and
-// both rates are held), and their seeing again: a could-not-tell is said as
-// such, never as a measurement. Answers are what count, not probes: the lost
-// probes of reflectors still being given their time measure loss, not the
-// line's queue, and a first answer only sets a baseline.
+// for as long as a reflector is given and the silent ones have stopped
+// counting, so both rates are held, and their seeing again: a could-not-tell is
+// said as such, never as a measurement. Answers are what count for the time,
+// not probes: the lost probes of reflectors still being given their time
+// measure loss, not the line's queue, and a first answer only sets a baseline.
+// And the warning waits for the round that counts nobody, not only for the
+// time, which a stalled process can pass in two rounds whose losses still cut.
 func (s *stepper) notice(sample Sample, at time.Time) {
 	answered := len(sample.Probes) > sample.Lost()
 
@@ -137,7 +139,7 @@ func (s *stepper) notice(sample Sample, at time.Time) {
 		s.blind, s.told = time.Time{}, false
 	case !answered && s.blind.IsZero():
 		s.blind = at
-	case !answered && !s.told && at.Sub(s.blind) >= silentAfter*Tick:
+	case !answered && !s.told && len(sample.Probes) == 0 && at.Sub(s.blind) >= silentAfter*Tick:
 		s.told = true
 		s.log.Warn("no reflector answers, so the line's queue cannot be told; holding both rates until one does",
 			"reflectors", s.prober.Reflectors(), "for", at.Sub(s.blind).Round(time.Second))

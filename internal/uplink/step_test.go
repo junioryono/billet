@@ -401,4 +401,17 @@ func TestTheCouldNotTellIsLoggedWhenTheReflectorsStopAndWhenTheyReturn(t *testin
 	if r.count("answer again") != 1 {
 		t.Fatalf("a counted answer after the start's silence logged %d returns; want 1", r.count("answer again"))
 	}
+
+	// A stalled process passes the ten seconds in two rounds, whose reflectors
+	// are still counted and whose losses can still cut: the rates are not held,
+	// and the journal must not say they are.
+	answering = false
+	r.run(1)
+	r.clock = r.clock.Add(silentAfter * Tick)
+	r.run(1)
+
+	if n := r.count("cannot be told"); n != 1 {
+		t.Fatalf("two lost rounds across a ten-second stall logged the could-not-tell (%d in all); the "+
+			"reflectors still count", n)
+	}
 }
