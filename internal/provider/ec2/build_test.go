@@ -258,6 +258,12 @@ func TestTheRunnerArchitectureIsRefusedUnlessItIsOneAWSHas(t *testing.T) {
 						"build would fail halfway through", tc.arch)
 				}
 
+				// THE ARCHITECTURE'S OWN REFUSAL: every other field is valid, but an
+				// error about any of them would also be an error.
+				if !strings.Contains(err.Error(), "is not x64 or arm64") {
+					t.Errorf("architecture %q was refused for another reason: %v", tc.arch, err)
+				}
+
 				return
 			}
 

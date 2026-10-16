@@ -1,6 +1,9 @@
 package images
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,6 +92,80 @@ func TestTheRunnerDigestComesFromThePinOrTheOperator(t *testing.T) {
 				t.Errorf("the refusal %q does not say %q", err, tc.refusal)
 			}
 		})
+	}
+}
+
+// AND WHAT IT ANSWERS IS WHAT THE BUILD CHECKS. The spec cmdAMIBuild hands
+// BuildImage takes RunnerSHA256 from the variable runnerDigest assigned, not the
+// flag: the flag is empty on every default build, and provisionScript would refuse
+// all of them. Read from the source because the call site is behind a real EC2
+// client, and asserted on both ends of the variable.
+func TestTheBuildChecksTheDigestRunnerDigestResolved(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "ami.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse ami.go: %v", err)
+	}
+
+	var build *ast.FuncDecl
+
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "cmdAMIBuild" {
+			build = fn
+		}
+	}
+
+	if build == nil {
+		t.Fatal("ami.go has no cmdAMIBuild")
+	}
+
+	var assigned, specField string
+
+	ast.Inspect(build.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if call, ok := n.Rhs[0].(*ast.CallExpr); ok && len(n.Rhs) == 1 {
+				if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "runnerDigest" {
+					if id, ok := n.Lhs[0].(*ast.Ident); ok {
+						assigned = id.Name
+					}
+				}
+			}
+		case *ast.CompositeLit:
+			sel, ok := n.Type.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "BuildSpec" {
+				return true
+			}
+
+			for _, elt := range n.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "RunnerSHA256" {
+					if value, ok := kv.Value.(*ast.Ident); ok {
+						specField = value.Name
+					} else {
+						specField = "a value that is not a variable"
+					}
+				}
+			}
+		}
+
+		return true
+	})
+
+	if assigned == "" {
+		t.Fatal("cmdAMIBuild does not assign runnerDigest's answer to a variable")
+	}
+
+	if specField != assigned {
+		t.Errorf("the BuildSpec's RunnerSHA256 is %q, not %q, the digest runnerDigest resolved",
+			specField, assigned)
 	}
 }
 
