@@ -225,10 +225,15 @@ def quoted_end(text, j):
             else:
                 j += 2 if text[j] == "\\" else 1
         return None if j >= n else j + 1
-    # $( ... ): balanced parentheses, with quotes inside it read as their own.
+    # $( ... ): balanced parentheses, with quotes inside it read as their own. A
+    # comment or a heredoc in it would hide parentheses from the count, and either
+    # can be closed only after a newline, so a newline gives up and leaves the
+    # line to preprocess, which reads both.
     j, depth = j + 2, 1
     while j < n:
         c = text[j]
+        if c == "\n":
+            return None
         if c in "'\"" or text.startswith("$(", j):
             j = quoted_end(text, j)
             if j is None:

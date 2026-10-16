@@ -488,8 +488,13 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"git push origin junior-oct03-work >\"$(printf '\"')\"", ""},
 		{"git push origin junior-oct03-work >$(printf '%s' \"a)b\").log; git rebase main", "merging"},
 		{"make check >\"$(date '+%H)%M').log\"", gate},
-		{"make >$(printf ')') check", gate},
+		{"make >$(printf ')') check", "`make check` is a full gate"},
+		{"make >$(printf ')') verify", ""},
 		{"make >$(mktemp) verify", ""},
+		// A comment or a heredoc inside a target's substitution hides parentheses
+		// from a count, so the scanner leaves those lines to preprocess.
+		{"echo x >$(printf log # (\n); git rebase main # )", "merging"},
+		{"echo x >$(cat <<'EOF'\n(\nEOF\n); git rebase main # )", "merging"},
 		// A line continuation joins words before a descriptor is read.
 		{"make 2\\\n>/dev/null", bare},
 		{"make check 2\\\n>/dev/null", gate},
