@@ -221,6 +221,10 @@ func (h *launchdHost) ProveStable(ctx context.Context) error {
 	return nil
 }
 
+// RestartUplink has nothing to restart: the shaper is Linux's tc and CAKE, and
+// `billet uplink shape` refuses on a Mac.
+func (h *launchdHost) RestartUplink(context.Context) error { return nil }
+
 // RestorePreserved puts back what PreserveCurrent copied.
 func (h *launchdHost) RestorePreserved(_ context.Context, dir string) error {
 	preserved := filepath.Join(dir, "preserved")

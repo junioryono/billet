@@ -103,7 +103,7 @@ func Run(ctx context.Context, opts Options) error {
 	// now, so every run starts from an interface carrying nothing of billet's: a
 	// crash's leftovers, and those on an interface the default route has since
 	// left, which overwriting the record would strand.
-	if err := clearRecorded(ctx, nil); err != nil {
+	if _, _, err := clearRecorded(ctx, nil); err != nil {
 		return fmt.Errorf("clear what an earlier run left before shaping %s: %w", iface, err)
 	}
 
@@ -134,8 +134,15 @@ func Run(ctx context.Context, opts Options) error {
 
 	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
 	// ran is still cleared; a removal that failed is an error, and the unit's
-	// ExecStopPost tries again.
-	return errors.Join(err, clearRecorded(context.WithoutCancel(ctx), nil))
+	// ExecStopPost tries again. SAID IN THE LOG, because the ExecStopPost that
+	// follows finds no record, and without this line nothing says the shaping
+	// was there and is gone.
+	r, cleared, clearErr := clearRecorded(context.WithoutCancel(ctx), nil)
+	if clearErr == nil && cleared {
+		opts.Log.Info("removed the shaping this run installed, as it stopped", "interface", r.Iface, "ifb", r.IFB)
+	}
+
+	return errors.Join(err, clearErr)
 }
 
 // Lock takes the one claim on this host's shaping, held by a shaper for its

@@ -1,6 +1,8 @@
 package uplink
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -68,7 +70,7 @@ func TestAnUndecidedLookupKeepsTheDeviceAndTheRecord(t *testing.T) {
 	f := newFakeLink("wan0", "cake")
 	f.ifb = true
 
-	if err := clearRecorded(t.Context(), f.run); err == nil {
+	if _, _, err := clearRecorded(t.Context(), f.run); err == nil {
 		t.Fatal("a clear that could not find the interface reported success")
 	}
 
@@ -76,7 +78,7 @@ func TestAnUndecidedLookupKeepsTheDeviceAndTheRecord(t *testing.T) {
 		t.Fatalf("an undecided clear changed something:\n%s", strings.Join(f.ran, "\n"))
 	}
 
-	if _, ok := ReadRecord(); !ok {
+	if _, ok, err := ReadRecord(); err != nil || !ok {
 		t.Fatal("an undecided clear forgot the record")
 	}
 }
@@ -93,7 +95,7 @@ func TestClearingFollowsARenameAndLeavesTheNamesNewOwnerAlone(t *testing.T) {
 	f := newFakeLink("wan0", "cake")
 	f.ifbName, f.handle, f.ingress, f.ifb = "ifb-eth0", "8001:", true, true
 
-	if err := clearRecorded(t.Context(), f.run); err != nil {
+	if _, _, err := clearRecorded(t.Context(), f.run); err != nil {
 		t.Fatalf("clearing a renamed interface: %v", err)
 	}
 
@@ -105,7 +107,7 @@ func TestClearingFollowsARenameAndLeavesTheNamesNewOwnerAlone(t *testing.T) {
 		t.Fatalf("the device that took the old name was touched:\n%s", strings.Join(f.ran, "\n"))
 	}
 
-	if _, ok := ReadRecord(); ok {
+	if _, ok, err := ReadRecord(); err != nil || ok {
 		t.Fatal("the record survived a clear that succeeded")
 	}
 }
@@ -122,7 +124,7 @@ func TestClearingAGoneInterfaceRemovesOnlyItsDevice(t *testing.T) {
 	f := newFakeLink("eth0", "htb")
 	f.handle, f.ifb = "1:", true
 
-	if err := clearRecorded(t.Context(), f.run); err != nil {
+	if _, _, err := clearRecorded(t.Context(), f.run); err != nil {
 		t.Fatalf("clearing a gone interface: %v", err)
 	}
 
@@ -132,5 +134,150 @@ func TestClearingAGoneInterfaceRemovesOnlyItsDevice(t *testing.T) {
 
 	if slices.ContainsFunc(f.ran, func(line string) bool { return strings.HasPrefix(line, "tc ") }) {
 		t.Fatalf("tc was asked about a name another device holds:\n%s", strings.Join(f.ran, "\n"))
+	}
+}
+
+// A RECORD THAT COULD NOT BE READ IS NOT NO RECORD. Reading it as absence let a
+// clear remove nothing and say there was nothing to clear while the shaping it
+// recorded was live; it is an error, and nothing is changed.
+func TestAnUnreadableRecordIsAnErrorAndNotAbsence(t *testing.T) {
+	fakeSys(t, map[string]string{"eth0": "5"})
+
+	// A directory where the record belongs is a read that failed (EISDIR).
+	if err := os.Mkdir(StateFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := ReadRecord(); err == nil || ok {
+		t.Fatalf("an unreadable record read as ok %v, err %v; want an error", ok, err)
+	}
+
+	f := newFakeLink("eth0", "cake")
+	f.handle, f.ingress, f.ifb = "8001:", true, true
+
+	if _, err := clearOrInspect(t.Context(), "eth0", f.run); err == nil || !strings.Contains(err.Error(), StateFile) {
+		t.Fatalf("a clear over an unreadable record answered %v; want the failed read, naming %s", err, StateFile)
+	}
+
+	if len(f.changed()) != 0 {
+		t.Fatalf("a clear that could not read its record changed something:\n%s", strings.Join(f.ran, "\n"))
+	}
+
+	if err := os.Remove(StateFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// AN EMPTY RECORD NAMES NOTHING, which is not a record of nothing: the
+	// shaper publishes its record by rename, so an empty one is not its own.
+	if err := os.WriteFile(StateFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := ReadRecord(); err == nil || ok {
+		t.Fatalf("an empty record read as ok %v, err %v; want an error", ok, err)
+	}
+}
+
+// "NOTHING TO CLEAR" IS SAID ONLY OF AN INTERFACE SEEN CARRYING NOTHING. With
+// no record a clear removes nothing, because nothing proves the shaping is
+// billet's, and it inspects the interface: CAKE, an ingress qdisc or the
+// shaper's device there is ErrUnrecorded, an inspection that failed is an
+// error, and only a clean interface is nothing to clear.
+func TestAClearWithNoRecordInspectsTheInterfaceBeforeSayingNothing(t *testing.T) {
+	fakeSys(t, map[string]string{"eth0": "5"})
+
+	live := newFakeLink("eth0", "cake")
+	live.handle, live.ingress, live.ifb = "8001:", true, true
+
+	cleared, err := clearOrInspect(t.Context(), "eth0", live.run)
+	if !errors.Is(err, ErrUnrecorded) {
+		t.Fatalf("no record and CAKE, ingress and ifb-eth0 live answered %+v, %v; want ErrUnrecorded", cleared, err)
+	}
+
+	for _, want := range []string{"a CAKE root qdisc", "an ingress qdisc", "the device ifb-eth0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+
+	if len(live.changed()) != 0 {
+		t.Fatalf("a clear with no record removed something:\n%s", strings.Join(live.ran, "\n"))
+	}
+
+	// THE REMEDY GOES REDIRECT, ROOT, DEVICE, the order a shaper's own clear
+	// keeps, so a device is never removed under a redirect still pointing at it.
+	ingress := strings.Index(err.Error(), "handle ffff: ingress")
+	root := strings.Index(err.Error(), "tc qdisc del dev eth0 root")
+	device := strings.Index(err.Error(), "ip link del ifb-eth0")
+
+	if ingress < 0 || root < ingress || device < root {
+		t.Errorf("the remedy is not ingress, then root, then device: %v", err)
+	}
+
+	// THE DEVICE ALONE IS ENOUGH: it is what a crash between the device and the
+	// qdiscs leaves. And a root somebody configured is never offered for removal.
+	alone := newFakeLink("eth0", "htb")
+	alone.handle, alone.ifb = "1:", true
+
+	_, err = clearOrInspect(t.Context(), "eth0", alone.run)
+	if !errors.Is(err, ErrUnrecorded) {
+		t.Fatalf("no record and ifb-eth0 alone answered %v; want ErrUnrecorded", err)
+	}
+
+	if strings.Contains(err.Error(), " root") || strings.Contains(err.Error(), "ingress") {
+		t.Fatalf("the remedy for a device alone offers to remove what was not seen: %v", err)
+	}
+
+	// A NAME TC CANNOT FIND WAS NOT INSPECTED, though inspect reads "Cannot find
+	// device" as no qdiscs: eth0 is listed, and renamed before tc is asked,
+	// carrying CAKE under its new name.
+	renamed := newFakeLink("eth0", "cake")
+	renamed.handle, renamed.ingress = "8001:", true
+	gone := func(ctx context.Context, argv ...string) (string, error) {
+		if strings.Join(argv, " ") == "tc qdisc show dev eth0" {
+			return `Cannot find device "eth0"`, errors.New("exit status 1")
+		}
+
+		return renamed.run(ctx, argv...)
+	}
+
+	if cleared, err := clearOrInspect(t.Context(), "eth0", gone); err == nil {
+		t.Fatalf("no record and an eth0 tc could not find answered %+v; want could not inspect", cleared)
+	}
+
+	broken := newFakeLink("eth0", "mq")
+	broken.fail = "tc qdisc show"
+
+	if _, err := clearOrInspect(t.Context(), "eth0", broken.run); err == nil {
+		t.Fatal("no record and an interface that could not be inspected answered nothing to clear")
+	}
+
+	clean := newFakeLink("eth0", "mq")
+
+	cleared, err = clearOrInspect(t.Context(), "eth0", clean.run)
+	if err != nil || cleared.Recorded || cleared.Looked != "eth0" {
+		t.Fatalf("no record and a clean eth0 answered %+v, %v; want nothing to clear, having looked at eth0",
+			cleared, err)
+	}
+}
+
+// A RECORDED CLEAR STILL GOES BY THE RECORD, and says which interface it was.
+func TestAClearWithARecordRemovesWhatItRecorded(t *testing.T) {
+	fakeSys(t, map[string]string{"eth0": "5"})
+
+	if err := writeRecord(Record{Iface: "eth0", Index: "5", IFB: "ifb-eth0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFakeLink("eth0", "cake")
+	f.handle, f.ingress, f.ifb = "8001:", true, true
+
+	cleared, err := clearOrInspect(t.Context(), "", f.run)
+	if err != nil || !cleared.Recorded || cleared.Record.Iface != "eth0" {
+		t.Fatalf("a recorded clear answered %+v, %v; want eth0's record cleared", cleared, err)
+	}
+
+	if f.root == "cake" || f.ingress || f.ifb {
+		t.Fatalf("after a recorded clear eth0 has root %s, ingress %v, ifb-eth0 %v", f.root, f.ingress, f.ifb)
 	}
 }

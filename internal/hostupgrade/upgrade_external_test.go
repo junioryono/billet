@@ -44,6 +44,7 @@ func TestAnExternalLedgerUpgradeSkipsExactlyTheLedgerSteps(t *testing.T) {
 		"record-installed",
 		"start-services",
 		"prove-stable",
+		"restart-uplink",
 	}
 
 	if !slices.Equal(h.did, want) {
