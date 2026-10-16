@@ -320,11 +320,22 @@ func (m *Monitor) start(key string, j *job) {
 // from the process that handed it over: its first sample in this process ends
 // the interval between the two, which nobody sampled, and is marked so.
 // Called with mu held.
+//
+// A BASELINE THAT COULD NOT READ A GROUP THE FIRST PROCESS READ KEEPS NO POINT,
+// as a tick's would not: it would hold that group's value from before the
+// handover at a time it was not read, and the interval after it would be given
+// what the job did across the handover. The gap stays open until a sample
+// that reads it all.
 func (m *Monitor) continueFrom(j *job, s Sample, now time.Time) {
 	before := j.seen
 	j.pending = false
 	j.absorb(s, now)
 	m.observeGaps(GapLateFirstRead, j.lateRead(firstRead(s, before, j.target.Process)))
+	if unread(s, before, j.target.Process) {
+		j.see(GapFailedRead)
+
+		return
+	}
 	p := j.point(now)
 	p.Gap = joinGaps(j.unseen, GapHandover)
 	j.fell = falls(j.points[len(j.points)-1], p)

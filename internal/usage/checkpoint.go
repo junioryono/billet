@@ -134,6 +134,16 @@ func (c Checkpoint) continues(target Target, interval time.Duration) error {
 	return nil
 }
 
+// Measuring reports whether the sampler measures a job under key.
+func (m *Monitor) Measuring(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	_, ok := m.jobs[key]
+
+	return ok
+}
+
 // Resume begins measuring a job this process adopted from another, or from
 // itself before a restart, and is a no-op for a job it already measures.
 //
@@ -158,7 +168,10 @@ func (m *Monitor) Resume(key string, target Target, vcpus int, from *Checkpoint)
 		j.first, j.points, j.samples = from.timeline.First, from.timeline.Points, from.Samples
 		j.latest, j.peakMemory = from.Latest, from.PeakMemory
 		j.energyActive, j.energyIdle, j.processEnergyAt = from.EnergyActive, from.EnergyIdle, from.ProcessEnergyAt
-		j.unseen = from.Unseen
+		// MARKED FROM THE MOMENT IT IS PUBLISHED: a sampler that does not take
+		// the baseline in time leaves the job pending, and a later final read
+		// must still find the time between the processes unseen.
+		j.unseen = joinGaps(from.Unseen, GapHandover)
 		j.seen = seen{cpu: from.Seen.CPU, memory: from.Seen.Memory, oom: from.Seen.OOM, io: from.Seen.IO,
 			net: from.Seen.Net, threads: from.Seen.Threads, pressure: from.Seen.Pressure,
 			processEnergy: from.Seen.ProcessEnergy}

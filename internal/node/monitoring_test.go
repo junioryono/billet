@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,11 +25,18 @@ type measuredProvider struct {
 	targetErr error
 	// target, when set, is the answer to every UsageTarget.
 	target *provider.UsageTarget
+	// targets counts UsageTarget calls, and onTarget runs inside each.
+	targets  atomic.Int32
+	onTarget func(id string)
 }
 
 func (p *measuredProvider) cgroupFor(id string) string { return "/cg/" + id }
 
 func (p *measuredProvider) UsageTarget(_ context.Context, id string) (provider.UsageTarget, error) {
+	p.targets.Add(1)
+	if p.onTarget != nil {
+		p.onTarget(id)
+	}
 	if p.targetErr != nil {
 		return provider.UsageTarget{}, p.targetErr
 	}
@@ -128,6 +136,8 @@ func (m *startedMonitor) Start(_ string, target usage.Target, _ int) {
 func (m *startedMonitor) Final(string) (usage.Summary, bool)                        { return usage.Summary{}, false }
 func (m *startedMonitor) Forget(string)                                             {}
 func (m *startedMonitor) Resume(string, usage.Target, int, *usage.Checkpoint) error { return nil }
+func (m *startedMonitor) Measuring(string) bool                                     { return false }
+
 func (m *startedMonitor) Checkpoint(string) (usage.Checkpoint, bool) {
 	return usage.Checkpoint{}, false
 }

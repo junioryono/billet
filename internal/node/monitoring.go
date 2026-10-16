@@ -32,6 +32,8 @@ type JobMonitor interface {
 	Resume(key string, target usage.Target, vcpus int, from *usage.Checkpoint) error
 	// Checkpoint is what is known of a job, for the next process.
 	Checkpoint(key string) (usage.Checkpoint, bool)
+	// Measuring reports whether the job is measured already.
+	Measuring(key string) bool
 	Final(key string) (usage.Summary, bool)
 	Forget(key string)
 }
@@ -129,13 +131,17 @@ func usageTargetOf(target provider.UsageTarget) usage.Target {
 // over left, when one was left and continues it (#384). Off the job's path,
 // as startMonitoring is. Its traffic by destination is not followed: what it
 // sent before this process looked is in no tracker this process reads.
+//
+// THE CHECKPOINT IS TAKEN ONLY ONCE THE COUNTERS ARE FOUND: a lookup that
+// fails leaves it for the next recovery, which tries again, since the entry
+// still owes its report and the sampler does not yet measure the job.
 func (r *Runner) resumeMonitoring(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) {
-	cp := r.takeCheckpoint(inst.Name)
-	if r.monitor == nil {
+	src, ok := r.provider.(provider.UsageSource)
+	if r.monitor == nil || !ok {
+		r.takeCheckpoint(inst.Name)
 		return
 	}
-	src, ok := r.provider.(provider.UsageSource)
-	if !ok {
+	if r.monitor.Measuring(inst.Name) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
@@ -143,10 +149,11 @@ func (r *Runner) resumeMonitoring(ctx context.Context, lease *alloc.Lease, inst 
 
 	target, err := src.UsageTarget(ctx, inst.ID)
 	if err != nil {
-		r.log.Warn("could not find where an adopted job's host counters are; it will not be measured",
-			"runner", inst.Name, "error", err)
+		r.log.Warn("could not find where an adopted job's host counters are; the next recovery tries "+
+			"again", "runner", inst.Name, "error", err)
 		return
 	}
+	cp := r.takeCheckpoint(inst.Name)
 	if err := r.monitor.Resume(inst.Name, usageTargetOf(target), lease.VCPU, cp); err != nil {
 		r.log.Warn("measuring an adopted job from its adoption", "runner", inst.Name, "error", err)
 

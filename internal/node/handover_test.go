@@ -1,21 +1,81 @@
 package node
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/usage"
 )
+
+// recordingLedger is the ledger as a node reaches it, keeping, in order, every
+// renewal and every usage and guest report sent, whether the ledger kept it
+// or not: a report the ledger refused is still one the node should not have
+// sent.
+type recordingLedger struct {
+	*alloc.Allocator
+
+	mu     sync.Mutex
+	events []string
+}
+
+func (l *recordingLedger) note(event string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, event)
+}
+
+func (l *recordingLedger) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
+	l.note("heartbeat " + leaseID)
+
+	return l.Allocator.Heartbeat(ctx, leaseID, epoch)
+}
+
+func (l *recordingLedger) RecordLeaseUsage(ctx context.Context, leaseID string, epoch int64,
+	u alloc.JobUsage, series *alloc.UsageSeries,
+) error {
+	l.note(fmt.Sprintf("usage %s@%d", leaseID, epoch))
+
+	return l.Allocator.RecordLeaseUsage(ctx, leaseID, epoch, u, series)
+}
+
+func (l *recordingLedger) RecordGuestReport(ctx context.Context, leaseID string, epoch int64,
+	report alloc.GuestReport,
+) error {
+	l.note("guest " + leaseID)
+
+	return l.Allocator.RecordGuestReport(ctx, leaseID, epoch, report)
+}
+
+// usageReports is how many usage reports were sent.
+func (l *recordingLedger) usageReports() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, e := range l.events {
+		if strings.HasPrefix(e, "usage ") {
+			n++
+		}
+	}
+
+	return n
+}
 
 // handoverHost is one node's host as two processes of it see it: one ledger,
 // one backend whose instances outlive either process, and one state directory.
 type handoverHost struct {
 	a     *alloc.Allocator
+	rec   *recordingLedger
 	host  string
 	p     *measuredProvider
 	root  string
@@ -32,6 +92,7 @@ func newHandoverHost(t *testing.T) *handoverHost {
 	h := &handoverHost{root: root, dir: t.TempDir(),
 		p: &measuredProvider{fakeProvider: &fakeProvider{kind: config.ProviderDocker}, root: root}}
 	h.a, h.host = newAllocatorWithHost(t)
+	h.rec = &recordingLedger{Allocator: h.a}
 	h.lease = assignedLease(t, h.a)
 	h.name = provider.InstanceName(h.lease.ID)
 	h.id = "instance-" + h.name
@@ -39,13 +100,14 @@ func newHandoverHost(t *testing.T) *handoverHost {
 	return h
 }
 
-// process is one node process on the host, with a sampler of its own.
+// process is one node process on the host, with a sampler of its own,
+// reaching the ledger through the recorder.
 func (h *handoverHost) process(t *testing.T) (*Runner, *usage.Monitor) {
 	t.Helper()
 
 	m := runningMonitor(t, h.root)
 
-	return New(h.a, h.host, &fakeJIT{setID: 7}, h.p, nil, WithMonitor(m), WithUsageCheckpoints(h.dir)), m
+	return New(h.rec, h.host, &fakeJIT{setID: 7}, h.p, nil, WithMonitor(m), WithUsageCheckpoints(h.dir)), m
 }
 
 // launch starts the job on r, its cgroup having used a millisecond.
@@ -237,11 +299,161 @@ func TestAnAdoptedJobWhoseLeaseIsGoneReportsNothing(t *testing.T) {
 		t.Fatalf("Tend: %v", err)
 	}
 
-	if _, err := h.a.LeaseUsage(t.Context(), h.lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Errorf("LeaseUsage = %v, want nothing recorded for a lease that was gone", err)
+	if n := h.rec.usageReports(); n != 0 {
+		t.Errorf("%d usage reports were sent for a lease that was gone, want none", n)
 	}
 	if _, ok := nextMonitor.Final(h.name); ok {
 		t.Error("the sampler still measures a job whose lease is gone")
+	}
+}
+
+// RECOVERY RENEWS EVERY SURVIVOR BEFORE IT MEASURES ANY: finding a job's
+// counters asks the backend and the sampler, and done inline it held the next
+// survivor's first renewal behind it.
+func TestRecoveryRenewsEverySurvivorBeforeItMeasuresAny(t *testing.T) {
+	h := newHandoverHost(t)
+	second := assignedLease(t, h.a)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	if err := first.Launch(t.Context(), second, dockerSpec(),
+		Job{RequestID: second.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	h.p.onTarget = func(id string) { h.rec.note("target " + id) }
+
+	next, _ := h.process(t)
+	h.rec.mu.Lock()
+	h.rec.events = nil
+	h.rec.mu.Unlock()
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	h.rec.mu.Lock()
+	events := slices.Clone(h.rec.events)
+	h.rec.mu.Unlock()
+	lastRenewal, firstTarget, targets := -1, -1, 0
+	for i, e := range events {
+		switch {
+		case strings.HasPrefix(e, "heartbeat "):
+			lastRenewal = i
+		case strings.HasPrefix(e, "target "):
+			targets++
+			if firstTarget < 0 {
+				firstTarget = i
+			}
+		}
+	}
+	if targets != 2 || firstTarget < lastRenewal {
+		t.Errorf("recovery's renewals and lookups ran %v; want both survivors renewed before either was "+
+			"measured", events)
+	}
+}
+
+// A JOB IS REPORTED ONCE, NOT ONCE PER ADOPTION, AND ITS OWN PROCESS DOES NOT
+// LOOK FOR ITS COUNTERS AGAIN. An adopted job whose teardown the backend has not
+// confirmed has reported and stays in custody; a re-registration adopts it
+// again, and neither that nor the next tend reports it or measures it again.
+func TestAJobIsReportedOnceAcrossReadoptions(t *testing.T) {
+	h := newHandoverHost(t)
+	h.p.asyncTeardown = true
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, _ := h.process(t)
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	targets := h.p.targets.Load()
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover again: %v", err)
+	}
+	if got := h.p.targets.Load(); got != targets {
+		t.Errorf("re-adopting a job this process measures looked for its counters again (%d lookups, was %d)",
+			got, targets)
+	}
+
+	if err := next.Destroy(t.Context(), h.lease.RequestID); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want the unconfirmed teardown held in custody", err)
+	}
+	if n := h.rec.usageReports(); n != 1 {
+		t.Fatalf("%d usage reports after the teardown was asked, want 1", n)
+	}
+
+	targets = h.p.targets.Load()
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover after the report: %v", err)
+	}
+	if err := next.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if n := h.rec.usageReports(); n != 1 {
+		t.Errorf("%d usage reports after a re-adoption and another tend, want still 1", n)
+	}
+	if got := h.p.targets.Load(); got != targets {
+		t.Errorf("a re-adoption resumed measuring a job already reported (%d lookups, was %d)", got, targets)
+	}
+}
+
+// A LOOKUP THAT FAILED IS TRIED AGAIN, AND THE CHECKPOINT WAITS FOR IT: the
+// entry still owes its report, so the next recovery looks for the counters
+// again and continues the series from what the handover kept.
+func TestAFailedLookupLeavesTheCheckpointForTheNextRecovery(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, firstMonitor := h.process(t)
+	h.launch(t, first)
+	firstMonitor.Tick()
+	first.HandOver(t.Context())
+
+	next, nextMonitor := h.process(t)
+	h.p.targetErr = errors.New("the jail cannot be read yet")
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(h.dir, h.name+checkpointSuffix)); err != nil {
+		t.Fatalf("a failed lookup consumed the checkpoint: %v", err)
+	}
+	if nextMonitor.Measuring(h.name) {
+		t.Fatal("a job whose counters were not found is measured")
+	}
+
+	h.p.targetErr = nil
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover again: %v", err)
+	}
+	if !nextMonitor.Measuring(h.name) {
+		t.Fatal("the next recovery did not measure the job")
+	}
+	if err := next.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if marks := causes(h.timeline(t)); !slices.Contains(marks, usage.GapHandover) {
+		t.Errorf("marks = %v, want the series continued from the checkpoint", marks)
+	}
+}
+
+// A SUPERSEDED PROCESS REPORTS NOTHING: another process owns the name now, and
+// the adopted job it measured is let go unreported.
+func TestASupersededProcessReportsNoAdoptedJob(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	next, nextMonitor := h.process(t)
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	next.Superseded()
+	if _, ok := nextMonitor.Final(h.name); ok {
+		t.Error("a superseded process still measures the job it adopted")
+	}
+	if err := next.Destroy(t.Context(), h.lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if n := h.rec.usageReports(); n != 0 {
+		t.Errorf("a superseded process sent %d usage reports, want none", n)
 	}
 }
 

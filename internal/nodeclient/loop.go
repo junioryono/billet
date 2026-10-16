@@ -69,10 +69,10 @@ type completionAwareCompute interface {
 		authority dispatch.CacheAuthority) error
 }
 
-// handingOver keeps, for the next node process, what this one knows of the
+// HandingOver keeps, for the next node process, what this one knows of the
 // jobs a handoff leaves running. Optional: compute that keeps nothing hands
 // its jobs over unmeasured, which costs a measurement and nothing else.
-type handingOver interface {
+type HandingOver interface {
 	HandOver(ctx context.Context)
 }
 
@@ -611,7 +611,7 @@ func stopGracefully(
 			// WHAT IS KNOWN OF THE JOBS IS KEPT FOR THE NEXT PROCESS, which adopts
 			// them and continues measuring them from it (#384). Only now: a
 			// withdrawal that did not land drains instead, and measures them here.
-			if h, ok := compute.(handingOver); ok {
+			if h, ok := compute.(HandingOver); ok {
 				h.HandOver(context.WithoutCancel(ctx))
 			}
 			log.Info("handing over to the next node process: the compute running here keeps " +
@@ -1325,11 +1325,12 @@ func reportOutcome(
 		// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
 		// runner records the lease before it tries to renew it, precisely
 		// because this call happens during the outage that lost the report
-		// — so the janitor already owns it and will keep retrying. On the
-		// report's context, because a launch the stop let finish lands here
-		// after the poll's has ended, and its first renewal would fail on it.
+		// — so the janitor already owns it and will keep retrying. Never on
+		// the poll's context, which a stop may end before or during the
+		// report, and a launch the stop let finish lands here: its first
+		// renewal would fail on it. The renewal bounds its own request.
 		custody.Lock()
-		custodyErr := compute.AssumeCustody(reportCtx, cmd.Lease, cmd.RequestIDOf())
+		custodyErr := compute.AssumeCustody(context.WithoutCancel(ctx), cmd.Lease, cmd.RequestIDOf())
 		custody.Unlock()
 		if custodyErr != nil {
 			log.Warn("took custody of a launch whose result was lost, but could not "+

@@ -169,9 +169,10 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // instance exists. Provider inventory supplies it everywhere; a successful
 // Launch supplies it only for a host backend whose runtime is locally consistent.
 //
-// THE JOB GOES ON BEING MEASURED, and the entry owes its usage report (#384). It
-// answers whether this process already measures it: a job it was running, or
-// held adopted, keeps its series; any other is for the caller to resume.
+// THE JOB GOES ON BEING MEASURED, and the entry owes its usage report (#384),
+// unless it replaces an entry for the same compute that settled its report
+// already: a job is reported once, not once per adoption. It answers whether
+// the new entry owes one.
 func (r *Runner) adoptWithObservation(
 	lease *alloc.Lease, inst *provider.Instance, observed bool, recovery RunnerRecovery,
 ) bool {
@@ -241,15 +242,20 @@ func (r *Runner) adoptWithObservation(
 	// capacity underneath a live job. It is cleared the moment a tend proves the
 	// instance gone, which is the ordinary way an adoption ends.
 	entry.unconfirmed.Store(true)
-	entry.measured.Store(true)
 
-	known := r.dropRunningLocked(inst.Name)
-	if held, ok := r.custody[lease.ID]; ok && held.name == inst.Name && held.measured.Load() {
-		known = true
+	// THE REPLACED ENTRY HANDS OVER WHAT IT OWES, and owes nothing after: a tend
+	// still holding it must not settle the report, or forget the series, that
+	// is now this entry's.
+	owes := true
+	if held, ok := r.custody[lease.ID]; ok && held.name == inst.Name {
+		owes = held.measured.Swap(false)
 	}
+	entry.measured.Store(owes)
+
+	r.dropRunningLocked(inst.Name)
 	r.custody[lease.ID] = entry
 
-	return known
+	return owes
 }
 
 // hold takes custody of a lease whose compute could not be confirmed gone.

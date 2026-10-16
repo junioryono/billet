@@ -180,6 +180,10 @@ func (n *Node) Deployment() string { return n.deployment }
 // Close releases the host-wide deployment lock.
 func (n *Node) Close() error { return n.lock.Release() }
 
+// THE LOOP FINDS THE RUNNER'S HANDOVER BY ASSERTION, so a signature that
+// drifted would compile and keep nothing for the next process (#384).
+var _ nodeclient.HandingOver = (*node.Runner)(nil)
+
 // NodeHost is what the node takes from this process and machine.
 type NodeHost struct {
 	// Ready tells the service manager this process is serving.

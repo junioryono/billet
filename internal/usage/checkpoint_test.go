@@ -1,9 +1,11 @@
 package usage
 
 import (
+	"context"
 	"encoding/json"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -90,6 +92,95 @@ func TestACheckpointCarriesTheSeriesAcrossAHandover(t *testing.T) {
 	defer o.mu.Unlock()
 	if !slices.Equal(o.gaps, []string{"handover"}) {
 		t.Errorf("the observer heard %v, want the handover", o.gaps)
+	}
+}
+
+// A RESUME WHOSE BASELINE COULD NOT READ A GROUP KEEPS THE GAP OPEN: no sample
+// holding the old process's value at the resume's time is kept, and the
+// interval from the last sample before the handover to the first after it
+// that read everything is not counted.
+func TestAResumeWhoseBaselineFailedKeepsTheGapOpen(t *testing.T) {
+	tr, target, cp, now := handedOver(t)
+	start := time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
+
+	*now = now.Add(5 * time.Second)
+	tr.remove(refCgroup + "/cpu.stat")
+	b := runMonitor(t, tr.root, Options{Interval: time.Second, Now: func() time.Time { return *now }})
+	if err := b.Resume("vm", target, 8, &cp); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	tr.write(refCgroup+"/cpu.stat", strings.Replace(refCPUStat, "usage_usec 62338613", "usage_usec 99999999", 1))
+	*now = now.Add(time.Second)
+	b.Tick()
+	s, ok := b.Final("vm")
+	if !ok {
+		t.Fatal("no summary")
+	}
+	var offsets []int64
+	for _, p := range s.Points {
+		offsets = append(offsets, p.OffsetMillis)
+	}
+	if want := []int64{0, 1000, 2000, 3000, 9000, 9000}; !slices.Equal(offsets, want) {
+		t.Fatalf("offsets = %v, want no sample at the resume (8000)", offsets)
+	}
+	if s.Points[4].Gap == GapNone {
+		t.Errorf("the first sample after the handover is unmarked: %+v", s.Points[4])
+	}
+	tl := Timeline{First: s.First, Points: s.Points}
+	if w := tl.Window(start.Add(3*time.Second), start.Add(9*time.Second)); w.Covered != 0 || w.CPUMicros != 0 {
+		t.Errorf("the handover and the failed baseline were covered %s with %d µs", w.Covered, w.CPUMicros)
+	}
+}
+
+// A CARRIED JOB WHOSE BASELINE THE SAMPLER NEVER TOOK STILL MARKS THE
+// HANDOVER: it stays pending, and its final read must not give the old
+// process's last sample's interval everything that happened since.
+func TestACarriedJobLeftPendingStillMarksTheHandover(t *testing.T) {
+	tr, target, cp, now := handedOver(t)
+
+	*now = now.Add(5 * time.Second)
+	b := NewMonitor(tr.root, Options{Interval: time.Second, Now: func() time.Time { return *now }})
+	b.ticker, b.limit = false, testLimit
+	var block atomic.Bool
+	release, entered := make(chan struct{}), make(chan struct{}, 1)
+	b.afterTickRead = func() {
+		if block.Load() {
+			entered <- struct{}{}
+			<-release
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	block.Store(true)
+	ticked := make(chan struct{})
+	go func() {
+		defer close(ticked)
+		b.Tick()
+	}()
+	// THE SAMPLER IS BUSY inside that tick, so the resume cannot reach it and
+	// the job stays pending with the first process's samples.
+	<-entered
+	if err := b.Resume("vm", target, 8, &cp); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	close(release)
+	<-ticked
+
+	s, ok := b.Final("vm")
+	if !ok || len(s.Points) == 0 {
+		t.Fatalf("summary %v with %d points", ok, len(s.Points))
+	}
+	if last := s.Points[len(s.Points)-1]; last.Gap != GapHandover {
+		t.Errorf("the last sample, after the handover, is marked %v, want %v", last.Gap, GapHandover)
 	}
 }
 
