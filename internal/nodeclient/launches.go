@@ -3,7 +3,6 @@ package nodeclient
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 )
 
 // launchSet runs launch commands beside the command loop, at most limit at once.
@@ -18,8 +17,6 @@ import (
 type launchSet struct {
 	slots chan struct{}
 	wg    sync.WaitGroup
-	// inflight counts the launches started and not yet returned.
-	inflight atomic.Int32
 
 	mu  sync.Mutex
 	err error
@@ -38,10 +35,8 @@ func (s *launchSet) start(ctx context.Context, launch func() error) bool {
 		return false
 	}
 
-	s.inflight.Add(1)
 	s.wg.Go(func() {
 		defer func() { <-s.slots }()
-		defer s.inflight.Add(-1)
 
 		if err := launch(); err != nil {
 			s.mu.Lock()
@@ -54,9 +49,6 @@ func (s *launchSet) start(ctx context.Context, launch func() error) bool {
 
 	return true
 }
-
-// running is how many launches started here have not yet returned.
-func (s *launchSet) running() int { return int(s.inflight.Load()) }
 
 // wait returns once every launch started has finished.
 func (s *launchSet) wait() { s.wg.Wait() }

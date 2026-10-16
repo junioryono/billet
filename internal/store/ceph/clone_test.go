@@ -33,8 +33,6 @@ func newCloneFake() *cloneFake {
 }
 
 func (f *cloneFake) run(ctx context.Context, _ string, args []string) ([]byte, error) {
-	f.calls = append(f.calls, args)
-
 	// SUBCOMMANDS ARE MATCHED AS WHOLE ARGUMENTS, not as substrings of the joined
 	// line — which is not fussiness. A fake keyed on `strings.Contains(joined,
 	// "rm")` matches `--format`, so a case staging a failed REMOVE failed the
@@ -46,10 +44,13 @@ func (f *cloneFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 		f.duringInfo()
 	}
 
-	// A CANCELLED CONTEXT KILLS THE COMMAND, as exec.CommandContext does.
+	// A CANCELLED CONTEXT KILLS THE COMMAND, as exec.CommandContext does, and a
+	// command that never ran is not recorded as run.
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("rbd did not answer: %w", err)
 	}
+
+	f.calls = append(f.calls, args)
 
 	if f.failOn != "" && f.failOn == sub {
 		err := f.failErr

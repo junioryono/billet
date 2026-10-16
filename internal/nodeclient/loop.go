@@ -143,8 +143,9 @@ type LoopOptions struct {
 	// renewed — so the node has to be re-enrolled by hand.
 	Identity *wirecert.Rotating
 
-	// Hurry, when closed, ends the drain's wait early. It is the operator's
-	// second signal: stop waiting, but still stop properly.
+	// Hurry, when closed, ends the drain's wait early, and cancels a launch the
+	// stop was letting finish (#393). It is the operator's second signal: stop
+	// waiting, but still stop properly.
 	Hurry <-chan struct{}
 	// DrainTimeout is when a stopping node starts REPORTING that it is still
 	// waiting for the compute it holds. It is not a deadline — nothing bounds
@@ -1124,16 +1125,24 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 	// operator's second signal cancels one.
 	launchCtx, endLaunches := launchContext(ctx, opts.Hurry)
 
+	// SAID WHEN THE STOP ARRIVES, while the launches it waits for run, whether
+	// they overlap or run inline: a stop that waits in silence is one somebody
+	// kills.
+	var executing atomic.Int32
+	stopSaying := context.AfterFunc(ctx, func() {
+		if n := executing.Load(); n > 0 {
+			log.Info("waiting for the launches already running to finish before stopping; a second "+
+				"signal cancels them", "launches", n)
+		}
+	})
+
 	// EVERY LAUNCH STARTED HERE IS REPORTED BEFORE serve RETURNS, so a
 	// re-registration never runs beside a launch begun under the last one. The
 	// wait comes before the cancel: the other order would cancel what it waits for.
 	launches := newLaunchSet(opts.LaunchConcurrency)
 	defer func() {
-		if n := launches.running(); n > 0 && ctx.Err() != nil {
-			log.Info("waiting for the launches already running to finish before stopping; a second "+
-				"signal cancels them", "launches", n)
-		}
 		launches.wait()
+		stopSaying()
 		endLaunches()
 	}()
 
@@ -1228,7 +1237,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		// destroy run under a fresh, bounded context so shutdown can still converge.
 		run := func() error {
 			return reportOutcome(ctx, c, compute, log, &custody, cmd,
-				executePolled(ctx, launchCtx, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
+				executePolled(ctx, launchCtx, &executing, compute, cmd, draining, c.reqTimeout, c.WireVersion()))
 		}
 
 		// A LAUNCH RUNS BESIDE THE LOOP when the provider allows it, and the poll
@@ -1303,9 +1312,11 @@ func reportOutcome(
 		// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
 		// runner records the lease before it tries to renew it, precisely
 		// because this call happens during the outage that lost the report
-		// — so the janitor already owns it and will keep retrying.
+		// — so the janitor already owns it and will keep retrying. On the
+		// report's context, because a launch the stop let finish lands here
+		// after the poll's has ended, and its first renewal would fail on it.
 		custody.Lock()
-		custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf())
+		custodyErr := compute.AssumeCustody(reportCtx, cmd.Lease, cmd.RequestIDOf())
 		custody.Unlock()
 		if custodyErr != nil {
 			log.Warn("took custody of a launch whose result was lost, but could not "+
@@ -1335,14 +1346,16 @@ func reportOutcome(
 // staging either over a real wire would mean building a deliberately wrong
 // control plane to test a node.
 func ExecuteForTest(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
-	return executePolled(ctx, ctx, compute, cmd, false, requestTimeout, nodeapi.Version)
+	return executePolled(ctx, ctx, nil, compute, cmd, false, requestTimeout, nodeapi.Version)
 }
 
 // executePolled settles the shutdown boundary before a command starts: the
 // poll's context decides it, and a launch that passes it runs under launchCtx,
-// which the stop does not cancel.
+// which the stop does not cancel, counted in executing while it runs (nil
+// counts nothing).
 func executePolled(
 	ctx, launchCtx context.Context,
+	executing *atomic.Int32,
 	compute Compute,
 	cmd nodeapi.Command,
 	draining bool,
@@ -1350,11 +1363,15 @@ func executePolled(
 	negotiated int,
 ) nodeapi.CommandResult {
 	if ctx.Err() == nil {
-		if cmd.Kind == nodeapi.CommandLaunch {
-			return execute(launchCtx, compute, cmd, draining, negotiated)
+		if cmd.Kind != nodeapi.CommandLaunch {
+			return execute(ctx, compute, cmd, draining, negotiated)
+		}
+		if executing != nil {
+			executing.Add(1)
+			defer executing.Add(-1)
 		}
 
-		return execute(ctx, compute, cmd, draining, negotiated)
+		return execute(launchCtx, compute, cmd, draining, negotiated)
 	}
 
 	commandCtx, finishCommand := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
