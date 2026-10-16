@@ -592,6 +592,9 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		return int(st.Uid) == os.Geteuid() || jailWritten(st, res)
 	}
 
+	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
+	h.p.runningVMM = func(jail) (*os.File, error) { return os.Open(h.p.execPath) }
+
 	return h
 }
 

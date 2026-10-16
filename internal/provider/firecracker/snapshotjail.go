@@ -56,7 +56,7 @@ var errSnapshotNotPublished = errors.New("not a published snapshot")
 // AND NEVER BY COPY. A copy would lose the shared page cache and write gigabytes per
 // restore, and a source on another filesystem than the jails is a deployment billet
 // refuses rather than one it quietly makes slow.
-func (p *Provider) placeSnapshot(j jail, name, kernel string) error {
+func (p *Provider) placeSnapshot(j jail, name, kernel string, spec provider.Spec) error {
 	if err := checkSnapshotName(name); err != nil {
 		return err
 	}
@@ -78,7 +78,7 @@ func (p *Provider) placeSnapshot(j jail, name, kernel string) error {
 	// WHERE IT CAN RUN, BEFORE ANYTHING IS LINKED: a snapshot taken on another CPU,
 	// host kernel, Firecracker build or guest kernel is refused here, because the
 	// VMM would load it and the guest would misbehave after it resumed.
-	if err := p.checkCompatibility(dir, kernel); err != nil {
+	if err := p.checkCompatibility(dir, kernel, spec); err != nil {
 		return err
 	}
 
@@ -306,7 +306,7 @@ func (p *Provider) restoreInto(
 }
 
 // checkCompatibility refuses a snapshot whose record does not match this host.
-func (p *Provider) checkCompatibility(dir *os.File, kernel string) error {
+func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider.Spec) error {
 	record, err := readCompatibility(dir, filepath.Join(dir.Name(), compatibilityFile))
 	if err != nil {
 		return err
@@ -325,6 +325,15 @@ func (p *Provider) checkCompatibility(dir *os.File, kernel string) error {
 
 	if diff := record.mismatch(host); diff != "" {
 		return fmt.Errorf("firecracker: %w: %s differs in %s", errSnapshotIncompatible, dir.Name(), diff)
+	}
+
+	// THE SHAPE THE SNAPSHOT FIXES. The restored guest has the vCPUs and memory it
+	// was captured with whatever the spec says, so a spec asking for less would be
+	// admitted for less than it uses.
+	if record.VCPUs != spec.VCPU || record.Memory != int64(spec.Memory) {
+		return fmt.Errorf("firecracker: %w: %s is a guest of %d vCPUs and %d bytes, and the restore "+
+			"asks for %d and %d", errSnapshotIncompatible, dir.Name(), record.VCPUs, record.Memory,
+			spec.VCPU, int64(spec.Memory))
 	}
 
 	return nil

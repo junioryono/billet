@@ -171,6 +171,9 @@ type Provider struct {
 	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
 	// because the account a VMM runs as is one only root can create files as.
 	jailWrote func(st unix.Stat_t, res resources) bool
+	// runningVMM opens the executable a jail's VMM is running, which may no longer
+	// be the file at its path. A seam because it reads /proc/<pid>/exe.
+	runningVMM func(j jail) (*os.File, error)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -337,6 +340,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		bootWait:    DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
+	p.runningVMM = p.procVMMExecutable
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
@@ -646,10 +650,16 @@ func (p *Provider) launch(
 		return nil, err
 	}
 
+	// THE SIZE BILLET ASKED FOR, where the guest cannot rewrite it: what a capture of
+	// this microVM is bounded by, and what a restore from it must ask for again.
+	if err := p.writeShape(j, spec); err != nil {
+		return nil, err
+	}
+
 	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
 	// after it: a link is the published file itself, and must never be chowned.
 	if snapshot != "" {
-		if err := p.placeSnapshot(j, snapshot, kernel); err != nil {
+		if err := p.placeSnapshot(j, snapshot, kernel, spec); err != nil {
 			return nil, err
 		}
 	}

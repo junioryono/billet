@@ -63,6 +63,12 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	// Remove rather than RemoveAll, so a store something else has used is never taken.
 	if _, err := os.Lstat(golden.snapshotsDir()); errors.Is(err, os.ErrNotExist) {
 		t.Cleanup(func() {
+			// THE PUBLISH LOCK IS THE STORE'S OWN, made by the first capture into it.
+			lock := filepath.Join(golden.snapshotsDir(), ".publish.lock")
+			if err := os.Remove(lock); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("remove the publish lock this test made: %v", err)
+			}
+
 			if err := os.Remove(golden.snapshotsDir()); err != nil && !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("remove the snapshots directory this test made: %v", err)
 			}
@@ -158,6 +164,24 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	if err := samePublished(filepath.Join(published, snapshotMemoryFile),
 		filepath.Join(fj.root(), snapshotMemoryFile)); err != nil {
 		t.Errorf("the fork's memory file: %v", err)
+	}
+
+	// AND THE FORK CAN BE CAPTURED IN TURN, which a capture writing over the
+	// read-only links its own restore placed could not, while the snapshot it came
+	// from stays the file it was.
+	forkSnapshot := "selftest-fork-" + env.lease[:8]
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(filepath.Join(golden.snapshotsDir(), forkSnapshot)); err != nil {
+			t.Errorf("remove the fork's snapshot: %v", err)
+		}
+	})
+
+	if err := forks.Capture(t.Context(), forkName, forkSnapshot); err != nil {
+		t.Errorf("Capture of a restored fork: %v", err)
+	} else if err := samePublished(filepath.Join(published, snapshotMemoryFile),
+		filepath.Join(fj.root(), snapshotMemoryFile)); err != nil {
+		t.Errorf("capturing the fork changed the snapshot it was restored from: %v", err)
 	}
 
 	// AND A SNAPSHOT TAKEN ON ANOTHER HOST KERNEL IS REFUSED BEFORE THE LOAD, by the

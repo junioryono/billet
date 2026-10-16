@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/provider"
 )
 
 // A HOST'S CPU IS ITS IDENTITY AND ITS FEATURES, read the same however the cores are
@@ -297,6 +299,8 @@ func hostRecordAnd(edit func([]byte) []byte) func(*testing.T, *harness, string) 
 			t.Fatal(err)
 		}
 
+		record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
+
 		raw, err := json.Marshal(record)
 		if err != nil {
 			t.Fatal(err)
@@ -351,5 +355,57 @@ func TestTheCPUFeatureDigestIgnoresTheOrderOfTheFlags(t *testing.T) {
 
 	if digests[0] != digests[1] {
 		t.Errorf("the same flags in another order digest to %s and %s", digests[0], digests[1])
+	}
+}
+
+// THE CHECK COMES BEFORE ANY LINK: placeSnapshot itself, asked to place a snapshot
+// taken elsewhere, leaves the jail root as it found it.
+func TestPlaceSnapshotLinksNothingForASnapshotTakenElsewhere(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	dir := publish(t, h, "gold-1", 0o444)
+	writeCompatibility(t, h, dir, func(c *compatibility) { c.HostKernel = "5.10.0 #1" })
+
+	j := h.p.jailFor(theInstance)
+	if err := os.MkdirAll(j.root(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.p.placeSnapshot(j, "gold-1", h.p.cfg.KernelImage, aRestoreSpec())
+	if !errors.Is(err, errSnapshotIncompatible) {
+		t.Fatalf("placeSnapshot = %v, want errSnapshotIncompatible", err)
+	}
+
+	if entries, err := os.ReadDir(j.root()); err != nil || len(entries) != 0 {
+		t.Errorf("a refused snapshot left %v in the jail root (%v)", entries, err)
+	}
+}
+
+// A RESTORE MUST ASK FOR THE SHAPE THE SNAPSHOT FIXES, or admission would charge it
+// for a guest it is not.
+func TestARestoreRefusesASpecOfAnotherShape(t *testing.T) {
+	t.Parallel()
+
+	for name, spec := range map[string]func() provider.Spec{
+		"more vCPUs": func() provider.Spec { s := aRestoreSpec(); s.VCPU = 4; return s },
+		"less memory": func() provider.Spec {
+			s := aRestoreSpec()
+			s.Memory /= 2
+
+			return s
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			publish(t, h, "gold-1", 0o444)
+
+			_, err := h.p.Restore(t.Context(), spec(), "gold-1")
+			if !errors.Is(err, errSnapshotIncompatible) {
+				t.Fatalf("Restore = %v, want errSnapshotIncompatible", err)
+			}
+		})
 	}
 }

@@ -2,11 +2,14 @@ package firecracker
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -28,13 +31,15 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	vmm.onCreate = func(root string) {
 		written = map[string]unix.Stat_t{}
 
-		for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
+		for published, file := range map[string]string{
+			snapshotStateFile: captureStateFile, snapshotMemoryFile: captureMemoryFile,
+		} {
 			var st unix.Stat_t
 			if err := unix.Lstat(filepath.Join(root, file), &st); err != nil {
 				t.Errorf("stat what the VMM wrote: %v", err)
 			}
 
-			written[file] = st
+			written[published] = st
 		}
 	}
 	vmm.mu.Unlock()
@@ -66,11 +71,11 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 	}
 
 	raw, err := os.ReadFile(filepath.Join(dir, snapshotMemoryFile))
-	if err != nil || string(raw) != "written by the VMM at /"+snapshotMemoryFile {
+	if err != nil || string(raw) != "written by the VMM at /"+captureMemoryFile {
 		t.Errorf("the published memory reads %q (%v), want what the VMM wrote", raw, err)
 	}
 
-	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
+	for _, file := range []string{captureStateFile, captureMemoryFile} {
 		if _, err := os.Lstat(filepath.Join(root, file)); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("the jail's own %s was left behind: %v", file, err)
 		}
@@ -90,7 +95,10 @@ func TestACaptureIsPublishedAsReadOnlyCopiesARestoreAccepts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if host, err := h.p.hostCompatibility(guest); err != nil || record != host {
+	host, err := h.p.hostCompatibility(guest)
+	host.VCPUs, host.Memory = aSpec().VCPU, int64(aSpec().Memory)
+
+	if err != nil || record != host {
 		t.Errorf("the published record = %+v (%v), want this host's %+v", record, err, host)
 	}
 
@@ -188,7 +196,7 @@ func TestACaptureRefusesWhatTheVMMLeftThatIsNotAFile(t *testing.T) {
 		"a symlink": func(t *testing.T, root string) {
 			t.Helper()
 
-			mem := filepath.Join(root, snapshotMemoryFile)
+			mem := filepath.Join(root, captureMemoryFile)
 			if err := os.Remove(mem); err != nil {
 				t.Error(err)
 			}
@@ -200,7 +208,7 @@ func TestACaptureRefusesWhatTheVMMLeftThatIsNotAFile(t *testing.T) {
 		"a FIFO, which would copy as an empty memory file": func(t *testing.T, root string) {
 			t.Helper()
 
-			mem := filepath.Join(root, snapshotMemoryFile)
+			mem := filepath.Join(root, captureMemoryFile)
 			if err := os.Remove(mem); err != nil {
 				t.Error(err)
 			}
@@ -212,7 +220,7 @@ func TestACaptureRefusesWhatTheVMMLeftThatIsNotAFile(t *testing.T) {
 		"a directory": func(t *testing.T, root string) {
 			t.Helper()
 
-			mem := filepath.Join(root, snapshotMemoryFile)
+			mem := filepath.Join(root, captureMemoryFile)
 			if err := os.Remove(mem); err != nil {
 				t.Error(err)
 			}
@@ -347,5 +355,237 @@ func TestOnlyARegularFileBilletOwnsCountsAsTheKernelItLinked(t *testing.T) {
 		if got := linkedByBillet(tc.st); got != tc.want {
 			t.Errorf("%s counts as billet's kernel = %v, want %v", name, got, tc.want)
 		}
+	}
+}
+
+// A RESTORED MICROVM CAN BE CAPTURED AGAIN, and its own snapshot is untouched. A
+// restored jail holds the snapshot it came from as billet's read-only links, so a
+// capture that asked the VMM to write those names would be refused after the pause.
+func TestARestoredMicroVMCanBeCapturedWithoutTouchingItsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	dir := publish(t, h, "gold-1", 0o444)
+
+	before, err := os.ReadFile(filepath.Join(dir, snapshotMemoryFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := h.restoreWith(t, "gold-1"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	if err := h.p.Capture(t.Context(), theInstance, "gold-2"); err != nil {
+		t.Fatalf("Capture of a restored microVM: %v", err)
+	}
+
+	after, err := os.ReadFile(filepath.Join(dir, snapshotMemoryFile))
+	if err != nil || !bytes.Equal(after, before) {
+		t.Errorf("capturing a fork changed the snapshot it was restored from: %q (%v)", after, err)
+	}
+
+	if err := checkPublished(filepath.Join(h.p.snapshotsDir(), "gold-2", snapshotMemoryFile)); err != nil {
+		t.Errorf("the fork's own capture: %v", err)
+	}
+}
+
+// A VMM RUNNING A BUILD OTHER THAN THE ONE AT ITS PATH IS NOT CAPTURED: its snapshot
+// would be labelled with a Firecracker it was not taken by.
+func TestACaptureRefusesAVMMRunningAReplacedBuild(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	older := filepath.Join(t.TempDir(), "firecracker-v1.16.1")
+	if err := os.WriteFile(older, []byte("the build this VMM was started from"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.p.runningVMM = func(jail) (*os.File, error) { return os.Open(older) }
+
+	err := h.p.Capture(t.Context(), theInstance, "gold-1")
+	if !errors.Is(err, errSnapshotIncompatible) {
+		t.Fatalf("Capture = %v, want errSnapshotIncompatible", err)
+	}
+
+	if state := vmm.currentState(); state == statePaused {
+		t.Error("a refused capture paused the guest")
+	}
+}
+
+// WHAT A VMM WRITES IS HELD TO THE SIZE BILLET GAVE ITS GUEST. A memory file larger
+// than the guest's memory, or a state file larger than any state, is refused before a
+// byte of it is copied.
+func TestACaptureRefusesFilesLargerThanItsGuestCouldWrite(t *testing.T) {
+	t.Parallel()
+
+	for file, size := range map[string]int64{
+		captureMemoryFile: int64(aSpec().Memory) + 1,
+		captureStateFile:  maxCapturedState + 1,
+	} {
+		t.Run(file, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			_, vmm := h.launch(t)
+
+			vmm.mu.Lock()
+			vmm.onCreate = func(root string) {
+				// SPARSE, so the test writes nothing.
+				if err := os.Truncate(filepath.Join(root, file), size); err != nil {
+					t.Error(err)
+				}
+			}
+			vmm.mu.Unlock()
+
+			err := h.p.Capture(t.Context(), theInstance, "gold-1")
+			if err == nil || !strings.Contains(err.Error(), "more than") {
+				t.Fatalf("Capture = %v, want a refusal for its size", err)
+			}
+
+			if _, err := os.Lstat(filepath.Join(h.p.snapshotsDir(), "gold-1")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("an oversized capture was published: %v", err)
+			}
+
+			assertNoStaging(t, h)
+		})
+	}
+}
+
+// A JAIL WITH NO RECORD OF ITS GUEST'S SIZE IS NOT CAPTURED, because nothing would
+// bound what its VMM left: refused before the pause.
+func TestACaptureRefusesAJailWithNoRecordedShape(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	if err := os.Remove(h.p.jailFor(theInstance).shapeFile()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err == nil {
+		t.Fatal("Capture took a microVM with no recorded size")
+	}
+
+	if state := vmm.currentState(); state == statePaused {
+		t.Error("a refused capture paused the guest")
+	}
+}
+
+// A COPY STOPS WHEN ITS CALLER DOES, between chunks, rather than running to the end
+// of a file billet did not size.
+func TestACaptureCopyStopsWhenCanceled(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	j := h.p.jailFor(theInstance)
+	if err := os.WriteFile(filepath.Join(j.root(), captureMemoryFile), []byte("memory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := unix.Open(j.root(), unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(root)
+
+	staging, err := unix.Open(t.TempDir(), unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(staging)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	res, err := resourcesOf(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = h.p.copyOut(ctx, root, staging, captureMemoryFile, snapshotMemoryFile, 1<<20, j, res)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("copyOut with a canceled context = %v, want it canceled", err)
+	}
+}
+
+// A STAGING DIRECTORY A KILLED PUBLISH LEFT IS SWEPT BY THE NEXT ONE.
+func TestACaptureSweepsStagingAKilledPublishLeft(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	left := filepath.Join(h.p.snapshotsDir(), stagingPrefix+"0123456789abcdef")
+	if err := os.MkdirAll(left, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(left, snapshotMemoryFile), []byte("half a copy"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	assertNoStaging(t, h)
+}
+
+// DURABLE IN THE RIGHT ORDER: every published file is read-only by the time it is
+// synced, and the directory above the store is synced, since a first capture creates
+// the store itself.
+func TestACapturePublishesDurably(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu      sync.Mutex
+		unready []string
+		synced  []string
+	)
+
+	h := newHarness(t, withDurability(
+		func(f *os.File) error {
+			info, err := f.Stat()
+			if err == nil && strings.Contains(f.Name(), "snapshot") && info.Mode().Perm() != 0o444 {
+				mu.Lock()
+				unready = append(unready, f.Name())
+				mu.Unlock()
+			}
+
+			return f.Sync()
+		},
+		func(dir string) error {
+			mu.Lock()
+			synced = append(synced, dir)
+			mu.Unlock()
+
+			return syncDirectory(dir)
+		}))
+	h.launch(t)
+
+	// ONLY WHAT THE CAPTURE SYNCS: a launch syncs directories of its own.
+	mu.Lock()
+	synced = nil
+	mu.Unlock()
+
+	if err := h.p.Capture(t.Context(), theInstance, "gold-1"); err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(unready) > 0 {
+		t.Errorf("synced before it was read-only: %v", unready)
+	}
+
+	if !slices.Contains(synced, filepath.Dir(h.p.snapshotsDir())) {
+		t.Errorf("the directory holding the store was never synced; synced %v", synced)
 	}
 }

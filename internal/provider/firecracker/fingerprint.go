@@ -55,6 +55,11 @@ type compatibility struct {
 	VMM string `json:"vmm"`
 	// GuestKernel is a digest of the kernel the guest booted.
 	GuestKernel string `json:"guest_kernel"`
+	// VCPUs and Memory are the guest's shape, which the snapshot fixes: a restore
+	// must ask for exactly this, because admission charges a microVM by its spec.
+	// Not part of the host's description, so mismatch leaves them to the restore.
+	VCPUs  int   `json:"vcpus"`
+	Memory int64 `json:"memory_bytes"`
 }
 
 // mismatch names the first field two records disagree on, or "" when they agree.

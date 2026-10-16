@@ -53,6 +53,8 @@ func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compati
 		t.Fatalf("describe the harness host: %v", err)
 	}
 
+	record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
+
 	edit(&record)
 
 	encoded, err := json.Marshal(record)
