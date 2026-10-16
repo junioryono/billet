@@ -270,6 +270,9 @@ type fakeDisk struct {
 	// onClone runs inside CloneRoot, so a test can observe what the host looked
 	// like at the moment the disk was cloned rather than afterwards.
 	onClone func()
+	// onDiscard runs inside DiscardRoot, so a test can change the host between the
+	// discard and the releases a teardown makes after it.
+	onDiscard func()
 }
 
 // resolve stands in for the store turning `@verified` into a generation. The fake
@@ -328,6 +331,10 @@ func (d *fakeDisk) DiscardRoot(_ context.Context, name string) error {
 	defer d.mu.Unlock()
 
 	d.discarded = append(d.discarded, name)
+
+	if d.onDiscard != nil {
+		d.onDiscard()
+	}
 
 	return d.discardErr
 }

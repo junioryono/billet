@@ -281,9 +281,18 @@ func (p *Provider) claimTap(j jail) (string, error) {
 			return "", fmt.Errorf("firecracker: claim the network device %s: %w", name, err)
 		}
 
-		if taken {
-			return name, nil
+		if !taken {
+			continue
 		}
+
+		// UNMADE FROM THE MOMENT IT IS HELD, until markTap says otherwise, so nothing
+		// that reads the claim later deletes a device under a name billet only took.
+		// A name that cannot be marked is given back rather than held unmarked.
+		if err := p.writeUnmade(name, j.id); err != nil {
+			return "", errors.Join(err, p.releaseClaim(filepath.Join(dir, name), j.id))
+		}
+
+		return name, nil
 	}
 
 	return "", fmt.Errorf("firecracker: every network device name up to %s%d is claimed by a "+
@@ -291,12 +300,197 @@ func (p *Provider) claimTap(j jail) (string, error) {
 }
 
 // releaseTap gives a device name back, if it is still that microVM's.
+//
+// THE CLAIM BEFORE ITS UNMADE MARK. A mark removed first would leave, if the claim
+// then would not go, a claim that says billet may have made a device it never did.
 func (p *Provider) releaseTap(name, jailID string) error {
 	if name == "" {
 		return nil
 	}
 
-	return p.releaseClaim(filepath.Join(p.claimsDir("taps"), name), jailID)
+	if err := p.releaseClaim(filepath.Join(p.claimsDir("taps"), name), jailID); err != nil {
+		return err
+	}
+
+	return p.clearUnmade(name, jailID)
+}
+
+// unmadeDir holds one mark per tap claim under which billet has made no device.
+//
+// BESIDE THE CLAIMS, NOT IN THEM, AND NOT IN THE JAIL'S RECORD. Not in the record,
+// because the claim outlives the jail and orphan cleanup reads only claims; a record
+// lost with the jail would leave a surviving claim authorizing the deletion of
+// whatever device carries the name. Not in the claim, because every billet before
+// this one compares a claim's whole content with a jail id, and one that read a
+// second line would take the claim for a jail that does not exist and reap it from
+// under a jail that does — which a rollout's automatic rollback would reach.
+//
+// A CLAIM WITHOUT A MARK MAY HAVE A DEVICE: one taken by an older billet, one marked
+// made because a device was about to be created, or one taken in the instant before
+// its mark was written. All are deleted, which is what every teardown did before.
+func (p *Provider) unmadeDir() string {
+	return p.claimsDir("unmade-taps")
+}
+
+// writeUnmade marks a tap claim as one under which billet has made no device.
+//
+// STAGED, SYNCED AND RENAMED, so the mark is whole or absent.
+func (p *Provider) writeUnmade(tap, jailID string) error {
+	dir := p.unmadeDir()
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("firecracker: create the unmade tap marks directory %s: %w", dir, err)
+	}
+
+	staged, err := os.CreateTemp(dir, ".staging-")
+	if err != nil {
+		return fmt.Errorf("firecracker: stage the unmade mark on %s: %w", tap, err)
+	}
+
+	defer os.Remove(staged.Name())
+
+	if _, err := staged.WriteString(jailID + "\n"); err != nil {
+		return errors.Join(fmt.Errorf("firecracker: write the unmade mark on %s: %w", tap, err), staged.Close())
+	}
+
+	if err := p.syncFile(staged); err != nil {
+		return errors.Join(fmt.Errorf("firecracker: sync the unmade mark on %s: %w", tap, err), staged.Close())
+	}
+
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("firecracker: close the unmade mark on %s: %w", tap, err)
+	}
+
+	if err := os.Rename(staged.Name(), filepath.Join(dir, tap)); err != nil {
+		return fmt.Errorf("firecracker: place the unmade mark on %s: %w", tap, err)
+	}
+
+	if err := p.syncDir(dir); err != nil {
+		return fmt.Errorf("firecracker: sync the unmade mark on %s: %w", tap, err)
+	}
+
+	return nil
+}
+
+// clearUnmade removes a jail's unmade mark on a tap, if the mark is still its own.
+func (p *Provider) clearUnmade(tap, jailID string) error {
+	mark := filepath.Join(p.unmadeDir(), tap)
+
+	raw, err := os.ReadFile(mark)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("firecracker: read the unmade mark on %s: %w", tap, err)
+	}
+
+	if strings.TrimSpace(string(raw)) != jailID {
+		return nil
+	}
+
+	if err := os.Remove(mark); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("firecracker: clear the unmade mark on %s: %w", tap, err)
+	}
+
+	if err := p.syncDir(p.unmadeDir()); err != nil {
+		return fmt.Errorf("firecracker: sync the cleared unmade mark on %s: %w", tap, err)
+	}
+
+	return nil
+}
+
+// markTap records whether billet may have made the device under a jail's tap claim.
+//
+// MADE BEFORE THE DEVICE IS, never after. A crash between `ip tuntap add` and a later
+// mark would leave a device under a claim marked unmade, and every teardown would
+// hand its name back with the device still attached — the wedge Destroy exists to
+// avoid. Marked first, the worst a crash leaves is a claim saying made over no
+// device, and deleting a device that is not there succeeds.
+//
+// UNMADE AGAIN when the kernel refuses the name (errTapTaken): the device there is
+// not billet's, and a claim saying made would have a later teardown delete it.
+func (p *Provider) markTap(j jail, tap string, made bool) error {
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), tap))
+	if err != nil {
+		return fmt.Errorf("firecracker: read the claim on %s: %w", tap, err)
+	}
+
+	if strings.TrimSpace(string(raw)) != j.id {
+		return fmt.Errorf("firecracker: the claim on %s does not name %s", tap, j.id)
+	}
+
+	if made {
+		return p.clearUnmade(tap, j.id)
+	}
+
+	return p.writeUnmade(tap, j.id)
+}
+
+// removeTap deletes a microVM's network device if its claim says billet may have
+// made it, reporting whether the name may now go back to the pool.
+func (p *Provider) removeTap(ctx context.Context, tap, jailID string) (bool, error) {
+	if tap == "" {
+		return true, nil
+	}
+
+	unlock, err := p.lockClaims()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
+	return p.removeTapLocked(ctx, tap, jailID)
+}
+
+// removeTapLocked is removeTap for a caller holding lockClaims.
+//
+// THE CLAIM AND ITS MARK DECIDE, read as they are now:
+//   - no claim, or one naming another jail: the name is not this microVM's, so
+//     neither is a device carrying it. Nothing is deleted.
+//   - this jail's claim, marked unmade by this jail: billet never created the
+//     device. Nothing is deleted, and the name may go back.
+//   - this jail's claim otherwise: the device is deleted, and the name goes back
+//     only if the device did.
+//   - either unreadable: could not tell, which is not permission. Nothing is
+//     deleted, and the name is kept for a later teardown to judge.
+func (p *Provider) removeTapLocked(ctx context.Context, tap, jailID string) (bool, error) {
+	if tap == "" {
+		return true, nil
+	}
+
+	raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), tap))
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("firecracker: could not tell whether %s is still claimed: %w", tap, err)
+	}
+
+	if strings.TrimSpace(string(raw)) != jailID {
+		return true, nil
+	}
+
+	mark, err := os.ReadFile(filepath.Join(p.unmadeDir(), tap))
+	switch {
+	case err == nil && strings.TrimSpace(string(mark)) == jailID:
+		return true, nil
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return false, fmt.Errorf("firecracker: could not tell whether billet made %s: %w", tap, err)
+	}
+
+	if err := p.deleteTap(ctx, tap); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // maxTaps bounds how many microVMs one host may run at once, as far as naming goes.
@@ -449,23 +643,11 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	}
 	defer unlock()
 
-	// RE-READ UNDER THE LOCK. What claimedBy found is a snapshot taken without it,
-	// and the jail is gone, so a launch may have reaped this tap's claim and created
-	// its own device under the same name since. Only a claim that still names this
-	// jail authorizes deleting the device.
-	if res.Tap != "" {
-		raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("firecracker: read the claim on %s: %w", res.Tap, err)
-		}
-		if err != nil || strings.TrimSpace(string(raw)) != jailID {
-			res.Tap = ""
-		}
-	}
-
-	// THE DEVICE FIRST, because releasing the NAME while the device still exists
-	// would let another microVM claim a name the kernel already has — and `ip tuntap
-	// add` would then refuse a launch for a reason that names nothing billet did.
+	// RE-READ UNDER THE LOCK (removeTapLocked). What claimedBy found is a snapshot
+	// taken without it, and the jail is gone, so a launch may have reaped this tap's
+	// claim and created its own device under the same name since. Only a claim that
+	// still names this jail, and is not marked unmade by it, authorizes deleting the
+	// device.
 	//
 	// AND THE NAME IS KEPT WHEN THE DEVICE WOULD NOT GO. Releasing it anyway is how
 	// a host wedges itself permanently: the device stays attached to the bridge,
@@ -474,10 +656,9 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID st
 	// and every launch after it fails the same way until an operator deletes the
 	// device by hand. Keeping the claim is what lets a later teardown find the device
 	// and finish the job.
-	if res.Tap != "" {
-		if err := p.deleteTap(ctx, res.Tap); err != nil {
-			return errors.Join(err, p.releaseUID(res.UID, jailID))
-		}
+	gone, err := p.removeTapLocked(ctx, res.Tap, jailID)
+	if !gone {
+		return errors.Join(err, p.releaseUID(res.UID, jailID))
 	}
 
 	return p.releaseResourcesLocked(res, jailID)

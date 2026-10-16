@@ -432,9 +432,8 @@ func TestAFailureBeforeTheTapExistsDeletesNoDevice(t *testing.T) {
 }
 
 // AND A RETRY DOES NOT DELETE IT EITHER. A refused restore whose discard also fails
-// keeps its jail and record for a later Destroy, and Destroy deletes the tap its
-// record names; so the record must stop naming a tap nobody made before the discard
-// can fail.
+// keeps its jail for a later Destroy, and Destroy reads the tap's claim; the claim
+// still says no device was made, so the retry deletes nothing and gives the name back.
 func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
 	t.Parallel()
 
@@ -453,8 +452,10 @@ func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
 		t.Fatalf("the retained jail's record: %v", err)
 	}
 
-	if held.Tap != "" {
-		t.Errorf("the retained record still names the tap %s, which a later Destroy would delete", held.Tap)
+	claim := filepath.Join(h.p.claimsDir("taps"), held.Tap)
+
+	if !markedUnmade(h, held.Tap) {
+		t.Errorf("the retained claim on %s is not marked unmade, so a later Destroy would delete it", held.Tap)
 	}
 
 	h.disk.discardErr = nil
@@ -464,4 +465,12 @@ func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
 	}
 
 	assertNoTapDeleted(t, h)
+
+	if _, err := os.Stat(claim); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the retried Destroy kept the name of a device nobody made: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(h.p.unmadeDir(), held.Tap)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the retried Destroy left the unmade mark of a name it gave back: %v", err)
+	}
 }

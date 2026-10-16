@@ -71,8 +71,7 @@ func (p *Provider) addTap(ctx context.Context, tap, bridge string, uid int) erro
 // permissions failure or a busy device still fails loudly — a tap left attached to
 // a bridge is a device the next launch under the same lease will collide with.
 func (p *Provider) deleteTap(ctx context.Context, tap string) error {
-	// A RECORD THAT NAMES NO TAP HAS NONE TO DELETE: a launch that failed before
-	// making one forgets it (forgetTap), and an empty name is no device.
+	// AN EMPTY NAME IS NO DEVICE: a record written before the tap was claimed.
 	if tap == "" {
 		return nil
 	}
@@ -91,41 +90,6 @@ func (p *Provider) deleteTap(ctx context.Context, tap string) error {
 // errTapTaken marks a collision on the truncated tap name, so the unwind leaves the
 // device alone: it belongs to a microVM this launch did not start.
 var errTapTaken = errors.New("the network device name is already taken")
-
-// errNoTapMade marks a launch that failed before it created its network device, so
-// the unwind deletes nothing under the claimed name.
-var errNoTapMade = errors.New("no network device was made")
-
-// beforeTap marks a failure that happened before the launch created its tap.
-func beforeTap(err error) error { return noTapMadeError{err} }
-
-// noTapMadeError carries a failure unchanged, and answers errors.Is for
-// errNoTapMade, so the reason a launch failed stays the headline.
-type noTapMadeError struct{ err error }
-
-func (e noTapMadeError) Error() string        { return e.err.Error() }
-func (e noTapMadeError) Unwrap() error        { return e.err }
-func (e noTapMadeError) Is(target error) bool { return target == errNoTapMade }
-
-// forgetTap rewrites a jail's record without the tap a failed launch claimed but
-// never created, then returns the name to the pool.
-//
-// THE RECORD FIRST, because it is what a later Destroy reads: a name released while
-// the record still holds it is a name Destroy would delete a device under.
-func (p *Provider) forgetTap(j jail, res resources) error {
-	if res.Tap == "" {
-		return nil
-	}
-
-	untapped := res
-	untapped.Tap = ""
-
-	if err := p.writeResources(j, untapped); err != nil {
-		return fmt.Errorf("firecracker: forget the unused network device %s of %s: %w", res.Tap, j.id, err)
-	}
-
-	return p.releaseTap(res.Tap, j.id)
-}
 
 // ipBinary is iproute2, which every distribution billet targets installs.
 const ipBinary = "ip"

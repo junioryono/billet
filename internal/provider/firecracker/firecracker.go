@@ -572,7 +572,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 		// timeout instead of a crash.
 		return nil, errors.Join(
 			fmt.Errorf("firecracker: root disk for %s: %w", spec.Name, err),
-			p.unwind(ctx, j, spec, res, beforeTap(err)))
+			p.unwind(ctx, j, spec, res, err))
 	}
 
 	// THE FILESYSTEM, NOT ONLY ITS DEVICE. RBD resize makes blocks addressable by
@@ -585,7 +585,7 @@ func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot strin
 
 	if spec.Disk > 0 {
 		if err := p.growRootFilesystem(ctx, spec.Name, device); err != nil {
-			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, beforeTap(err)))
+			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 		}
 	}
 
@@ -616,18 +616,28 @@ func (p *Provider) launch(
 	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources, snapshot string,
 ) (*Instance, error) {
 	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
-		return nil, beforeTap(err)
+		return nil, err
 	}
 
 	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
 	// after it: a link is the published file itself, and must never be chowned.
 	if snapshot != "" {
 		if err := p.placeSnapshot(j, snapshot); err != nil {
-			return nil, beforeTap(err)
+			return nil, err
 		}
 	}
 
+	// MARKED BEFORE IT IS MADE (markTap). Every failure above leaves the claim
+	// saying unmade, so no teardown deletes a device under a name billet only took.
+	if err := p.markTap(j, res.Tap, true); err != nil {
+		return nil, err
+	}
+
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
+		if errors.Is(err, errTapTaken) {
+			err = errors.Join(err, p.markTap(j, res.Tap, false))
+		}
+
 		return nil, err
 	}
 
@@ -1387,11 +1397,12 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	// has it, that launch fails and releases the name, and every launch after it
 	// fails identically until an operator intervenes. Keeping the claim is what lets
 	// a later teardown find this device and finish removing it.
-	tapGone := true
-
-	if err := p.deleteTap(ctx, res.Tap); err != nil {
+	//
+	// AND ONLY A DEVICE BILLET MAY HAVE MADE IS DELETED: removeTap reads the claim,
+	// which says whether this microVM's launch ever got as far as creating one.
+	tapGone, err := p.removeTap(ctx, res.Tap, j.id)
+	if err != nil {
 		failures = append(failures, err)
-		tapGone = false
 	}
 
 	if err := p.removeCgroupFn(j); err != nil {
@@ -1718,30 +1729,18 @@ func (p *Provider) unwind(
 	// billet's to delete, so the name must stay out of the pool rather than be handed
 	// to a launch that would fail on it too.
 	//
-	// AND NOT A DEVICE THIS LAUNCH NEVER TRIED TO MAKE. A failure before addTap
-	// leaves the claimed name unused by billet, so a device that carries it now is
-	// someone else's; the name goes back to the pool and the device is left alone.
+	// AND NOT A DEVICE THIS LAUNCH NEVER MADE. A failure before addTap leaves the
+	// claim saying unmade (markTap), so removeTap deletes nothing under the name, and
+	// a retained jail's later Destroy reads the same claim and does the same.
 	tapGone := false
 
-	switch {
-	case errors.Is(cause, errNoTapMade):
-		// FORGOTTEN BEFORE ANYTHING BELOW CAN FAIL. A discard that fails keeps the
-		// jail and its record for a later Destroy to retry, and Destroy deletes the
-		// tap its record names; a record still naming a tap nobody made would have
-		// it delete whatever device carries that name by then.
-		if err := p.forgetTap(j, res); err != nil {
+	if !errors.Is(cause, errTapTaken) {
+		gone, err := p.removeTap(ctx, res.Tap, j.id)
+		if err != nil {
 			failures = append(failures, err)
-		} else {
-			res.Tap = ""
 		}
 
-		tapGone = true
-	case !errors.Is(cause, errTapTaken):
-		if err := p.deleteTap(ctx, res.Tap); err != nil {
-			failures = append(failures, err)
-		} else {
-			tapGone = true
-		}
+		tapGone = gone
 	}
 
 	if err := p.removeCgroupFn(j); err != nil {

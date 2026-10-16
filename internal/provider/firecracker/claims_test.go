@@ -136,6 +136,11 @@ func TestAClaimAlwaysNamesItsJailTheMomentItExists(t *testing.T) {
 			t.Errorf("the claim %s names %q and the jail is %q", claim, got, j.id)
 		}
 	}
+
+	// AND A TAP IS MARKED UNMADE BEFORE claimResources RETURNS IT.
+	if !markedUnmade(h, res.Tap) {
+		t.Errorf("the claim on %s was handed out without an unmade mark", res.Tap)
+	}
 }
 
 // A TEARDOWN ONLY RELEASES WHAT IS STILL ITS OWN.
