@@ -444,7 +444,7 @@ func TestPerfStartsOnlyWhereTheHostCanCount(t *testing.T) {
 		proof = jobusage.ProveCounting(src)
 	}
 
-	opts, err := nodeMonitorOptions(t.Context(), cfg, p)
+	opts, err := nodeMonitorOptions(t.Context(), cfg, p, nil)
 	if proof == nil {
 		if err != nil || len(opts) != 1 {
 			t.Fatalf("perf on a host that counts = %d options, %v; want a sampler", len(opts), err)
@@ -458,7 +458,7 @@ func TestPerfStartsOnlyWhereTheHostCanCount(t *testing.T) {
 
 	// AND WITHOUT perf THE SAME NODE STARTS, so the refusal is perf's alone.
 	cfg.Node.Monitoring.Perf = false
-	if opts, err := nodeMonitorOptions(t.Context(), cfg, p); err != nil || len(opts) != 1 {
+	if opts, err := nodeMonitorOptions(t.Context(), cfg, p, nil); err != nil || len(opts) != 1 {
 		t.Fatalf("monitoring without perf = %d options, %v; want a sampler", len(opts), err)
 	}
 }

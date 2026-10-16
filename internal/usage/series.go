@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"slices"
 	"time"
 )
 
@@ -26,10 +25,96 @@ type Point struct {
 	GuestCPU      int64 // µs
 	VMMCPU        int64
 	EnergyActive  int64 // µJ attributed so far
-	// AfterGap says the sampler did not see the interval that ends at this
-	// point, so what it holds is known only as that interval's total. It is not
-	// one of SeriesColumns: a SeriesCodec series never marks one.
-	AfterGap bool
+	// Gap is why the sampler did not see the interval that ends at this point,
+	// so what it holds is known only as that interval's total; GapNone when it
+	// saw it. It is not one of SeriesColumns: a SeriesCodec series never marks
+	// one, and a SeriesCodecClocked one marks one without its cause.
+	Gap GapCause
+}
+
+// GapCause is why the sampler did not see an interval of a job's series. The
+// set is closed: a series is refused when it names a cause this build does not
+// know, and the node's metrics label gaps with these names.
+type GapCause uint8
+
+// The causes. The numbers are what SeriesCodecGaps stores, so they never
+// change and a new cause takes the next number.
+const (
+	// GapNone is an interval the sampler saw.
+	GapNone GapCause = iota
+	// GapUnspecified is an interval marked by a series that records no cause
+	// (SeriesCodecClocked).
+	GapUnspecified
+	// GapMissedTick is two intervals or more between two samples the sampler
+	// kept with nothing else to say why: a tick it did not take.
+	GapMissedTick
+	// GapSlowRead is a read of the job that took a whole interval, so which of
+	// its counters were read when is not known.
+	GapSlowRead
+	// GapFailedRead is a group the job had read before that a read could not:
+	// that sample is not kept, since it would hold the group's last value at a
+	// time it was not read.
+	GapFailedRead
+	// GapLateFirstRead is every interval before a group was first read, each of
+	// which held that group at zero.
+	GapLateFirstRead
+	// GapCounterFell is an interval a cumulative counter fell across, and the
+	// one after it, which holds the catch-up.
+	GapCounterFell
+	// GapFinalEnergy is the last interval of a job whose energy is shared from
+	// the package: the final read takes no package reading.
+	GapFinalEnergy
+	// GapSamplerStuck is the last interval of a job whose final read the
+	// sampler did not answer in time.
+	GapSamplerStuck
+	// GapHandover is the time between two node processes: the one that handed
+	// the job over and the one that adopted it.
+	GapHandover
+	// GapSeveral is an interval made of intervals marked for different causes,
+	// which halving a long series merges.
+	GapSeveral
+
+	gapCauses // one past the last cause
+)
+
+var gapCauseNames = [gapCauses]string{
+	GapNone: "none", GapUnspecified: "unspecified", GapMissedTick: "missed_tick",
+	GapSlowRead: "slow_read", GapFailedRead: "failed_read", GapLateFirstRead: "late_first_read",
+	GapCounterFell: "counter_fell", GapFinalEnergy: "final_energy", GapSamplerStuck: "sampler_stuck",
+	GapHandover: "handover", GapSeveral: "several",
+}
+
+// String is the cause's name, as `billet jobs show` and the metrics write it.
+func (c GapCause) String() string {
+	if c >= gapCauses {
+		return fmt.Sprintf("cause-%d", uint8(c))
+	}
+
+	return gapCauseNames[c]
+}
+
+// GapCauses is every cause an interval can be marked with, GapNone aside.
+func GapCauses() []GapCause {
+	out := make([]GapCause, 0, gapCauses-1)
+	for c := GapUnspecified; c < gapCauses; c++ {
+		out = append(out, c)
+	}
+
+	return out
+}
+
+// joinGaps is the cause of an interval made of two, either of which may be
+// GapNone: the one when only one is marked or both say the same, GapSeveral
+// when they differ.
+func joinGaps(a, b GapCause) GapCause {
+	switch {
+	case a == GapNone || a == b:
+		return b
+	case b == GapNone:
+		return a
+	default:
+		return GapSeveral
+	}
 }
 
 // SeriesColumns names Point's columns in the order the codec writes them.
@@ -52,13 +137,44 @@ func pointFrom(c []int64) Point {
 // point, the whole compressed with DEFLATE.
 const SeriesCodec = 1
 
+// layout is what a codec writes after SeriesColumns: nothing, each point's gap
+// mark, or each point's gap cause.
+type layout int
+
+const (
+	unmarked layout = iota
+	marked
+	caused
+)
+
+// columns is how many columns the layout writes.
+func (l layout) columns() int {
+	if l == unmarked {
+		return len(SeriesColumns)
+	}
+
+	return len(SeriesColumns) + 1
+}
+
+// name is the name of column col, for an error about it.
+func (l layout) name(col int) string {
+	switch {
+	case col < len(SeriesColumns):
+		return SeriesColumns[col]
+	case l == caused:
+		return "gap_cause"
+	default:
+		return "after_gap"
+	}
+}
+
 // EncodeSeries encodes points into at most limit bytes, keeping every point
 // if it fits and otherwise every second, fourth, ... point plus the last one,
 // so the totals the last point carries are never lost. It reports the stride
 // it kept.
 func EncodeSeries(points []Point, limit int) ([]byte, int, error) {
 	return encodeWithin(points, limit, func(kept []Point) ([]byte, error) {
-		return encode(nil, kept, false)
+		return encode(nil, kept, unmarked)
 	})
 }
 
@@ -84,8 +200,9 @@ func encodeWithin(points []Point, limit int, enc func([]Point) ([]byte, error)) 
 }
 
 // downsample keeps every stride-th point of the settled series and its last.
-// A point dropped with its AfterGap mark passes the mark to the point kept
-// after it, whose interval now holds the one the sampler did not see.
+// A point dropped with a gap passes it to the point kept after it, whose
+// interval now holds the one the sampler did not see; gaps of different causes
+// merged into one interval are GapSeveral.
 //
 // SETTLED FIRST, so a counter fall, a fall between two samples at one offset
 // included, is already a mark on the point it fell into and on the one after
@@ -96,34 +213,31 @@ func downsample(points []Point, stride int) []Point {
 	}
 	points = settle(points)
 	var out []Point
-	gap := false
+	gap := GapNone
 	for i, p := range points {
-		gap = gap || p.AfterGap
+		gap = joinGaps(gap, p.Gap)
 		if i%stride != 0 && i != len(points)-1 {
 			continue
 		}
-		p.AfterGap = gap
-		gap = false
+		p.Gap = gap
+		gap = GapNone
 		out = append(out, p)
 	}
 
 	return out
 }
 
-// encode writes prefix, then the points' columns (with the gap mark when
-// clocked), and compresses the whole.
-func encode(prefix []byte, points []Point, clocked bool) ([]byte, error) {
-	columns := len(SeriesColumns)
-	if clocked {
-		columns = len(clockedColumns)
-	}
+// encode writes prefix, then the points' columns in the layout, and
+// compresses the whole.
+func encode(prefix []byte, points []Point, l layout) ([]byte, error) {
+	columns := l.columns()
 	raw := prefix
 	raw = binary.AppendUvarint(raw, uint64(columns))
 	raw = binary.AppendUvarint(raw, uint64(len(points)))
 	for col := range columns {
 		var prev int64
 		for _, p := range points {
-			v := p.column(col)
+			v := p.column(col, l)
 			raw = binary.AppendVarint(raw, v-prev)
 			prev = v
 		}
@@ -144,17 +258,19 @@ func encode(prefix []byte, points []Point, clocked bool) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// column is one of clockedColumns' values for the point; the last, the gap
-// mark, is 1 or 0.
-func (p Point) column(col int) int64 {
-	if col < len(SeriesColumns) {
+// column is the point's value of column col in the layout: one of
+// SeriesColumns, then its mark (1 or 0) or its cause.
+func (p Point) column(col int, l layout) int64 {
+	switch {
+	case col < len(SeriesColumns):
 		return p.columns()[col]
-	}
-	if p.AfterGap {
+	case l == caused:
+		return int64(p.Gap)
+	case p.Gap != GapNone:
 		return 1
+	default:
+		return 0
 	}
-
-	return 0
 }
 
 // maxDecodedSeries bounds what DecodeSeries will inflate, and maxDecodedPoints
@@ -176,7 +292,7 @@ func DecodeSeries(data []byte) ([]Point, error) {
 		return nil, err
 	}
 
-	return decode(bytes.NewReader(raw), false)
+	return decode(bytes.NewReader(raw), unmarked)
 }
 
 // inflate decompresses a series within maxDecodedSeries.
@@ -192,12 +308,11 @@ func inflate(data []byte) ([]byte, error) {
 	return raw, nil
 }
 
-// decode reads the columns encode wrote, to the end of r.
-func decode(r *bytes.Reader, clocked bool) ([]Point, error) {
-	want := len(SeriesColumns)
-	if clocked {
-		want = len(clockedColumns)
-	}
+// decode reads the columns encode wrote in the layout, to the end of r. A
+// mark read back is GapUnspecified, since the layout that writes one records
+// no cause.
+func decode(r *bytes.Reader, l layout) ([]Point, error) {
+	want := l.columns()
 	columns, err := binary.ReadUvarint(r)
 	if err != nil || columns != uint64(want) {
 		return nil, fmt.Errorf("usage: the series has %d columns, want %d", columns, want)
@@ -212,27 +327,28 @@ func decode(r *bytes.Reader, clocked bool) ([]Point, error) {
 	for i := range values {
 		values[i] = make([]int64, want)
 	}
-	names := SeriesColumns
-	if clocked {
-		names = clockedColumns
+	highest := int64(1)
+	if l == caused {
+		highest = int64(gapCauses - 1)
 	}
 	for col := range want {
 		var prev int64
 		for i := range values {
 			d, err := binary.ReadVarint(r)
 			if err != nil {
-				return nil, fmt.Errorf("usage: the series ends inside column %s", names[col])
+				return nil, fmt.Errorf("usage: the series ends inside column %s", l.name(col))
 			}
 			prev += d
-			// EVERY COLUMN IS A COUNT, A LEVEL, AN OFFSET OR A MARK, none of them
-			// negative, which also catches overflow: prev is never negative before
-			// this add, so a positive d that overflows wraps negative, and a
+			// EVERY COLUMN IS A COUNT, A LEVEL, AN OFFSET, A MARK OR A CAUSE, none
+			// of them negative, which also catches overflow: prev is never negative
+			// before this add, so a positive d that overflows wraps negative, and a
 			// negative d cannot overflow.
 			if prev < 0 {
-				return nil, fmt.Errorf("usage: column %s goes negative", names[col])
+				return nil, fmt.Errorf("usage: column %s goes negative", l.name(col))
 			}
-			if col == len(SeriesColumns) && prev > 1 {
-				return nil, fmt.Errorf("usage: column %s is not a mark", names[col])
+			if col == len(SeriesColumns) && prev > highest {
+				return nil, fmt.Errorf("usage: column %s holds %d, which is not a %s this build knows",
+					l.name(col), prev, map[bool]string{true: "cause", false: "mark"}[l == caused])
 			}
 			values[i][col] = prev
 		}
@@ -243,8 +359,11 @@ func decode(r *bytes.Reader, clocked bool) ([]Point, error) {
 	points := make([]Point, n)
 	for i, v := range values {
 		points[i] = pointFrom(v)
-		if clocked {
-			points[i].AfterGap = v[len(SeriesColumns)] == 1
+		switch {
+		case l == caused:
+			points[i].Gap = GapCause(v[len(SeriesColumns)])
+		case l == marked && v[len(SeriesColumns)] == 1:
+			points[i].Gap = GapUnspecified
 		}
 		if i > 0 && points[i].OffsetMillis < points[i-1].OffsetMillis {
 			return nil, errors.New("usage: the series goes back in time")
@@ -261,30 +380,52 @@ func decode(r *bytes.Reader, clocked bool) ([]Point, error) {
 
 // SeriesCodecClocked is the encoding EncodeSeriesAt writes: SeriesCodec's,
 // preceded by the Unix milliseconds of the first sample on the host's clock and
-// followed by one more column, each point's AfterGap mark, the whole compressed
-// with DEFLATE. It is what lets a reader place a window of wall time on the
-// series, and what tells it which intervals the sampler did not see.
+// followed by one more column, each point's gap mark (1 when its interval was
+// not seen, 0 when it was), the whole compressed with DEFLATE. It is what lets
+// a reader place a window of wall time on the series, and what tells it which
+// intervals the sampler did not see, but not why.
 const SeriesCodecClocked = 2
 
-// clockedColumns is SeriesColumns and the gap mark.
-var clockedColumns = append(slices.Clone(SeriesColumns), "after_gap")
+// SeriesCodecGaps is the encoding EncodeSeriesGaps writes: SeriesCodecClocked's,
+// with each point's GapCause in place of its mark, so a reader can say why an
+// interval was not seen as well as which.
+const SeriesCodecGaps = 3
 
 // EncodeSeriesAt encodes points as SeriesCodecClocked, first being the wall
 // time of the first point, into at most limit bytes, downsampling as
-// EncodeSeries does and carrying every dropped point's gap mark onto the point
-// kept after it.
+// EncodeSeries does and carrying every dropped point's gap onto the point kept
+// after it.
 func EncodeSeriesAt(points []Point, first time.Time, limit int) ([]byte, int, error) {
+	return encodeClocked(points, first, limit, marked)
+}
+
+// EncodeSeriesGaps encodes points as SeriesCodecGaps, as EncodeSeriesAt does.
+func EncodeSeriesGaps(points []Point, first time.Time, limit int) ([]byte, int, error) {
+	return encodeClocked(points, first, limit, caused)
+}
+
+func encodeClocked(points []Point, first time.Time, limit int, l layout) ([]byte, int, error) {
 	if first.UnixMilli() <= 0 {
 		return nil, 0, errors.New("usage: a clocked series needs the wall time of its first sample")
 	}
 
 	return encodeWithin(points, limit, func(kept []Point) ([]byte, error) {
-		return encode(binary.AppendUvarint(nil, uint64(first.UnixMilli())), kept, true)
+		return encode(binary.AppendUvarint(nil, uint64(first.UnixMilli())), kept, l)
 	})
 }
 
-// DecodeSeriesAt reverses EncodeSeriesAt.
+// DecodeSeriesAt reverses EncodeSeriesAt. Every marked interval reads back as
+// GapUnspecified.
 func DecodeSeriesAt(data []byte) (Timeline, error) {
+	return decodeClocked(data, marked)
+}
+
+// DecodeSeriesGaps reverses EncodeSeriesGaps.
+func DecodeSeriesGaps(data []byte) (Timeline, error) {
+	return decodeClocked(data, caused)
+}
+
+func decodeClocked(data []byte, l layout) (Timeline, error) {
 	raw, err := inflate(data)
 	if err != nil {
 		return Timeline{}, err
@@ -294,7 +435,7 @@ func DecodeSeriesAt(data []byte) (Timeline, error) {
 	if err != nil || ms == 0 || ms > math.MaxInt64 {
 		return Timeline{}, errors.New("usage: the series has no valid start time")
 	}
-	points, err := decode(r, true)
+	points, err := decode(r, l)
 	if err != nil {
 		return Timeline{}, err
 	}
@@ -302,11 +443,34 @@ func DecodeSeriesAt(data []byte) (Timeline, error) {
 	return Timeline{First: time.UnixMilli(int64(ms)).UTC(), Points: points}, nil
 }
 
-// WithoutClock re-encodes a SeriesCodecClocked series as SeriesCodec, for a
-// peer that reads only that one. The start time and the gap marks are dropped,
-// which is what a SeriesCodec series has never had.
-func WithoutClock(data []byte, limit int) ([]byte, error) {
-	tl, err := DecodeSeriesAt(data)
+// WithoutCauses re-encodes a SeriesCodecGaps series as SeriesCodecClocked, for a
+// peer that reads only that one. Each gap keeps its mark and loses its cause,
+// which is what a SeriesCodecClocked series has never had.
+func WithoutCauses(data []byte, limit int) ([]byte, error) {
+	tl, err := DecodeSeriesGaps(data)
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := EncodeSeriesAt(tl.Points, tl.First, limit)
+
+	return out, err
+}
+
+// WithoutClock re-encodes a SeriesCodecClocked or SeriesCodecGaps series (codec
+// says which) as SeriesCodec, for a peer that reads only that one. The start
+// time and the gaps are dropped, which is what a SeriesCodec series has never
+// had.
+func WithoutClock(codec int, data []byte, limit int) ([]byte, error) {
+	var tl Timeline
+	var err error
+	switch codec {
+	case SeriesCodecClocked:
+		tl, err = DecodeSeriesAt(data)
+	case SeriesCodecGaps:
+		tl, err = DecodeSeriesGaps(data)
+	default:
+		return nil, fmt.Errorf("usage: series codec %d has no clock to drop", codec)
+	}
 	if err != nil {
 		return nil, err
 	}

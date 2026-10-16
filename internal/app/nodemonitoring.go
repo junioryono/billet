@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/metrics"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/provider"
@@ -54,10 +55,39 @@ func requireJobAccounting(p provider.Provider) error {
 	return fc.RequireJobAccounting()
 }
 
+// The sampler reports through usage.Observer, which the usage package declares
+// and internal/metrics satisfies without either importing the other.
+var _ jobusage.Observer = (*metrics.UsageObserver)(nil)
+
+// UsageMetrics is the node's job sampler as metrics: how long its ticks take,
+// the intervals of jobs it did not see by why, and the disk reads it recorded
+// as a lower bound (#495), told by the sampler as they happen. It has no gauge
+// to read at a scrape, and without node.monitoring nothing reports to it.
+func (n *Node) UsageMetrics() MetricsSource {
+	return MetricsSource{
+		name: "usage",
+		attach: func(reg *metrics.Registry) error {
+			causes := make([]string, 0, len(jobusage.GapCauses()))
+			for _, c := range jobusage.GapCauses() {
+				causes = append(causes, c.String())
+			}
+			o, err := reg.UsageObserver(causes)
+			if err != nil {
+				return err
+			}
+			n.sampled = o
+
+			return nil
+		},
+	}
+}
+
 // nodeMonitorOptions starts the sampler node.monitoring asks for and returns
 // the runner option that feeds it jobs, or none when monitoring is off. The
-// sampler runs until ctx ends.
-func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Provider) ([]node.Option, error) {
+// sampler runs until ctx ends and reports how it keeps up to observer, nil
+// reporting nowhere.
+func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Provider, observer jobusage.Observer,
+) ([]node.Option, error) {
 	m := cfg.Node.Monitoring
 	if m == nil {
 		return nil, nil
@@ -88,7 +118,8 @@ func nodeMonitorOptions(ctx context.Context, cfg *config.Config, p provider.Prov
 			"service; it is kept as the guest's and never acted on")
 	}
 
-	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts}
+	sampling := jobusage.Options{Interval: interval, RAPL: m.RAPL, IdleWatts: m.IdlePackageWatts,
+		Observer: observer}
 	if m.Perf {
 		if sampling.Counters, err = counterSource(); err != nil {
 			return nil, err

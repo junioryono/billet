@@ -360,16 +360,25 @@ func TestTheKnownAnswerFixturesAreJobsShowsOwn(t *testing.T) {
 		SpanMillis: 60_000, CoveredMillis: 60_000, Complete: true, Samples: 61, DiskWriteBytes: 2_149_000_000}}
 	window.Outer = &windowSpanJSON{From: "2026-10-09T10:00:29.4Z", To: "2026-10-09T10:01:31.4Z", Usage: windowUsageJSON{
 		SpanMillis: 62_000, CoveredMillis: 62_000, Complete: true, Samples: 63, DiskWriteBytes: 2_151_000_000}}
+	window.Gaps = []gapJSON{}
+
+	// AND ONE SHORT BY A GAP, as run 15's idle job's was (#495).
+	gapped := *window
+	gappedUsage := *window.Usage
+	gappedUsage.CoveredMillis, gappedUsage.Complete = 59_002, false
+	gapped.Usage = &gappedUsage
+	gapped.Gaps = []gapJSON{{From: "2026-10-09T10:01:05.293Z", To: "2026-10-09T10:01:07.291Z", Millis: 1998,
+		Cause: "failed_read"}}
 
 	type shape struct {
 		usage  *alloc.RecordedUsage
 		window *windowJSON
 	}
 	shapes := map[string]shape{"measured": {usage: measured}, "partial": {usage: &partial}, "no-report": {},
-		"measured-window": {usage: measured, window: window}}
+		"measured-window": {usage: measured, window: window}, "gapped-window": {usage: measured, window: &gapped}}
 	for _, name := range slices.Sorted(maps.Keys(shapes)) {
 		var out bytes.Buffer
-		if err := renderJobJSON(&out, record, shapes[name].usage, nil, shapes[name].window); err != nil {
+		if err := renderJobJSON(&out, record, shapes[name].usage, nil, nil, shapes[name].window); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		path := filepath.Join(knownAnswerFixtures, name+".json")

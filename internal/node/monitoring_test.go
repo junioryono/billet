@@ -103,8 +103,9 @@ func TestAJobsUsageIsSampledBeforeItsComputeGoesAndReported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no series was kept: %v", err)
 	}
-	if series.Codec != alloc.UsageSeriesCodecClocked {
-		t.Errorf("the series was kept as codec %d, want the clocked %d", series.Codec, alloc.UsageSeriesCodecClocked)
+	if series.Codec != alloc.UsageSeriesCodecGaps {
+		t.Errorf("the series was kept as codec %d, want the clocked one with causes %d", series.Codec,
+			alloc.UsageSeriesCodecGaps)
 	}
 	tl, err := usage.TimelineOf(series.Codec, series.Data)
 	if err != nil {
@@ -233,6 +234,10 @@ func TestTheSeriesCodecsAgree(t *testing.T) {
 	if usage.SeriesCodecClocked != alloc.UsageSeriesCodecClocked {
 		t.Fatalf("usage writes the clocked codec as %d and the ledger accepts %d", usage.SeriesCodecClocked,
 			alloc.UsageSeriesCodecClocked)
+	}
+	if usage.SeriesCodecGaps != alloc.UsageSeriesCodecGaps {
+		t.Fatalf("usage writes the codec with causes as %d and the ledger accepts %d", usage.SeriesCodecGaps,
+			alloc.UsageSeriesCodecGaps)
 	}
 }
 

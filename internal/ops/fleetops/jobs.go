@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/cli"
+	"github.com/junioryono/billet/internal/usage"
 )
 
 // cmdJobs is the operator's view of what jobs did.
@@ -83,18 +84,25 @@ func cmdJobsShow(ctx context.Context, env cli.Env, args []string) error {
 
 	// THE JSON RECORD IS THE LEDGER'S ALONE, and asks GitHub nothing.
 	if *asJSON {
+		tl, unaligned := jobTimeline(ctx, a, leaseID, measured)
 		var wj *windowJSON
 		if w != nil {
-			wj = windowJSONOf(ctx, a, leaseID, measured, *w)
+			wj = windowJSONOf(tl, unaligned, *w)
 		}
 
-		return renderJobJSON(env.Stdout, rec, measured, guest, wj)
+		return renderJobJSON(env.Stdout, rec, measured, tl, guest, wj)
 	}
 	steps := readJobSteps(ctx, *cfgPath, a, rec, measured)
 	if *asHTML {
 		return renderJobPage(env.Stdout, buildJobPage(ctx, a, rec, measured, steps, guest))
 	}
+	// THE SERIES THE STEPS WERE PLACED ON, read here when no step was asked about.
+	tl, unaligned := steps.timeline, steps.unaligned
+	if steps.none != "" {
+		tl, unaligned = jobTimeline(ctx, a, leaseID, measured)
+	}
 	renderJob(env.Stdout, rec, measured)
+	renderSeries(env.Stdout, tl, unaligned, measured)
 	renderSteps(env.Stdout, steps)
 	renderGuest(env.Stdout, guestViewOf(guest, measured, steps))
 
@@ -134,11 +142,13 @@ type jobJSON struct {
 
 // usageJSON is what the host measured. Groups answers for every group, with
 // the OOM count unmeasured whenever memory is, so a reader never re-derives
-// which zeros were read.
+// which zeros were read. Series is the per-sample series' account of its own
+// sampling, null when none is on the host's clock.
 type usageJSON struct {
 	Node       string          `json:"node"`
 	RecordedAt string          `json:"recorded_at"`
 	Groups     map[string]bool `json:"measured"`
+	Series     *seriesJSON     `json:"series"`
 	alloc.JobUsage
 }
 
@@ -149,7 +159,9 @@ var usageGroups = []string{alloc.UsageCPU, alloc.UsageThreads, alloc.UsageMemory
 // renderJobJSON writes one job's record as an indented JSON object. A job with
 // no usage report has a null usage, and one with no guest report a null guest,
 // never a report of zeros.
-func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *jobGuest, win *windowJSON) error {
+func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, tl *usage.Timeline, g *jobGuest,
+	win *windowJSON,
+) error {
 	out := jobJSON{
 		Lease: rec.LeaseID, Tier: rec.Tier, Node: rec.Node, Provider: rec.ChosenProvider,
 		VCPU: rec.VCPU, MemoryBytes: rec.Memory, GitHubJobID: rec.Job.JobID, RunID: rec.RunID,
@@ -163,7 +175,8 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *
 		for _, g := range usageGroups {
 			groups[g] = u.Measured(g)
 		}
-		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, JobUsage: u.JobUsage}
+		out.Usage = &usageJSON{Node: u.Node, RecordedAt: u.RecordedAt, Groups: groups, Series: seriesJSONOf(tl),
+			JobUsage: u.JobUsage}
 	}
 	body, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

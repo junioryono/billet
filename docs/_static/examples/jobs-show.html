@@ -14,6 +14,7 @@
   --panel: #f6f8fa;
   --band0: #eef1f4;
   --band1: #e3e8ee;
+  --gap: #cf222e;
   --focus: #fff1c2;
   --a: #1f6feb;
   --b: #bf6c00;
@@ -33,6 +34,7 @@
     --panel: #151b23;
     --band0: #1b222c;
     --band1: #232b36;
+    --gap: #f85149;
     --focus: #4a3b07;
     --a: #4493f8;
     --b: #e3a13b;
@@ -89,6 +91,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 .plot .top { top: 0; left: 0; }
 .plot .x0 { bottom: 0; left: 0; }
 .plot .x1 { bottom: 0; right: 0; }
+.plot.strip { padding-top: 0; }
+.plot.strip svg { height: 1.25rem; }
+.gap { fill: var(--gap); }
 .band0 { fill: var(--band0); }
 .band1 { fill: var(--band1); }
 rect.on { fill: var(--focus); }
@@ -178,6 +183,16 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <h2>Usage over the job</h2>
 <p>The host's series from 2026-10-09T12:00:00Z to 2026-10-09T12:02:47Z on its own clock (2m47.5s). <span id="focus">Showing the whole series.</span> <button type="button" id="whole" data-from="0" data-to="100000" data-origin="0" data-width="167500">Show the whole series</button></p>
 <p class="note">Every one of the series&#39; 169 samples is drawn: a rate is the average over each sample interval. Choosing a step focuses every chart on its window; the vertical scale stays the whole series'.</p>
+<figure class="chart">
+<figcaption>Not seen by the sampler</figcaption>
+<div class="plot strip">
+<svg data-chart="" viewBox="0 0 100000 100" preserveAspectRatio="none" role="img" aria-label="Intervals the sampler did not see">
+<path class="gap" d="M35224 0H35821V100H35224Z"></path>
+</svg>
+<span class="x0">&#43;0m00s</span><span class="x1">&#43;2m48s</span>
+</div>
+<p class="note">Each mark is an interval the sampler did not see, listed with its cause under What the host measured; every chart's lines break there, and no step's usage counts it.</p>
+</figure>
 <figure class="chart">
 <figcaption>CPU (cores busy) <span class="key a">cpu</span></figcaption>
 <div class="plot">
@@ -271,6 +286,10 @@ footer { margin-top: 2.5rem; color: var(--muted); font-size: .85em; }
 <section id="usage">
 <h2>What the host measured</h2>
 <p>measured by the host epyc-1, 169 samples every 1s over 2m47.5s</p>
+<p>The series: 169 samples on the host&#39;s clock from 2026-10-09T12:00:00.000Z to 2026-10-09T12:02:47.500Z; 1 interval not seen, 1s in all, which no window counts.</p>
+<ul class="gaps">
+<li>2026-10-09T12:00:59.000Z to 2026-10-09T12:01:00.000Z (1s): failed_read, a counter the sampler had read before could not be read</li>
+</ul>
 <dl class="fields">
 <dt>cpu</dt><dd>user 193.3s, system 21.5s</dd>
 <dt>vmm split</dt><dd>guest vCPUs 208.3s, VMM 6.4s</dd>

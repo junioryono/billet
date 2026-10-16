@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -14,7 +15,35 @@ type recordWindow struct {
 	Usage       *windowUsage `json:"usage"`
 	Inner       *windowSpan  `json:"inner"`
 	Outer       *windowSpan  `json:"outer"`
+	Gaps        []windowGap  `json:"gaps"`
+	GapsMore    int          `json:"gaps_more"`
 	Unavailable string       `json:"unavailable"`
+}
+
+// windowGap is an interval inside the window the series did not see, and why.
+type windowGap struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Millis int64  `json:"ms"`
+	Cause  string `json:"cause"`
+}
+
+// gapsSaid is what the record says the window's gaps were, for a reason that
+// says the window is not covered whole: each gap's span and cause, or nothing
+// from a billet that does not list them.
+func gapsSaid(w *recordWindow) string {
+	if len(w.Gaps) == 0 {
+		return ""
+	}
+	said := make([]string, 0, len(w.Gaps))
+	for _, g := range w.Gaps {
+		said = append(said, fmt.Sprintf("%s to %s (%d ms, %s)", g.From, g.To, g.Millis, g.Cause))
+	}
+	if w.GapsMore > 0 {
+		said = append(said, fmt.Sprintf("and %d more", w.GapsMore))
+	}
+
+	return "; the sampler did not see " + strings.Join(said, ", ")
 }
 
 // windowSpan is a span of whole sample intervals and its usage.
@@ -109,7 +138,7 @@ func compareWindow(r result, e *expectation, m *metric, job record) result {
 		return r
 	case !covers(w.Usage, from, to):
 		r.reason = fmt.Sprintf("billet's series covers %d ms of the %d ms load window, so what it shows is not "+
-			"the load's whole", w.Usage.CoveredMillis, w.Usage.SpanMillis)
+			"the load's whole%s", w.Usage.CoveredMillis, w.Usage.SpanMillis, gapsSaid(w))
 
 		return r
 	case m.windowed(w.Usage) == nil:

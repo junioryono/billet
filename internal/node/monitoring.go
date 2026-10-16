@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"net"
 	"path/filepath"
@@ -266,6 +267,7 @@ func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name strin
 	}
 	report, series := jobUsageOf(sum)
 	report.Destinations = destinations
+	logGaps(r.log, lease.ID, name, sum)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageReportLimit)
 	defer cancel()
 
@@ -273,6 +275,30 @@ func (r *Runner) reportUsage(ctx context.Context, lease *alloc.Lease, name strin
 		r.log.Warn("could not report what a job did to the host; the job is unaffected",
 			"runner", name, "lease", lease.ID, "error", err)
 	}
+}
+
+// logGaps says in the node's log how much of a job's series the sampler did not
+// see, by cause, beside the report that carries it: the series says which
+// intervals, and this is what an operator searching the node's journal for a
+// lease finds (#495). A series it saw whole says nothing.
+func logGaps(log *slog.Logger, leaseID, name string, sum usage.Summary) {
+	gaps := usage.Timeline{First: sum.First, Points: sum.Points}.Gaps()
+	if len(gaps) == 0 {
+		return
+	}
+	unseen := map[usage.GapCause]time.Duration{}
+	var total time.Duration
+	for _, g := range gaps {
+		unseen[g.Cause] += g.Length()
+		total += g.Length()
+	}
+	attrs := []any{"runner", name, "lease", leaseID, "gaps", len(gaps), "unseen", total.Round(time.Millisecond)}
+	for _, c := range usage.GapCauses() {
+		if d, ok := unseen[c]; ok {
+			attrs = append(attrs, c.String(), d.Round(time.Millisecond))
+		}
+	}
+	log.Info("a job's series has intervals the sampler did not see", attrs...)
 }
 
 // reportGuest sends what a job's guest told the node to the ledger, fenced on the
@@ -352,12 +378,13 @@ func jobUsageOf(sum usage.Summary) (alloc.JobUsage, *alloc.UsageSeries) {
 		return u, nil
 	}
 	// CLOCKED WHENEVER THE SAMPLER SAYS WHEN IT BEGAN, which is what lets an
-	// operator place a step's window on the series; the node client re-encodes
-	// it without the clock for a plane too old to keep one.
+	// operator place a step's window on the series, and with each unseen
+	// interval's cause; the node client re-encodes it without the causes, or
+	// without the clock, for a plane too old to keep them.
 	if !sum.First.IsZero() {
-		data, _, err := usage.EncodeSeriesAt(sum.Points, sum.First, alloc.MaxUsageSeriesBytes)
+		data, _, err := usage.EncodeSeriesGaps(sum.Points, sum.First, alloc.MaxUsageSeriesBytes)
 		if err == nil {
-			return u, &alloc.UsageSeries{Codec: usage.SeriesCodecClocked, Data: data}
+			return u, &alloc.UsageSeries{Codec: usage.SeriesCodecGaps, Data: data}
 		}
 	}
 	data, _, err := usage.EncodeSeries(sum.Points, alloc.MaxUsageSeriesBytes)

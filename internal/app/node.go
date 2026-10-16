@@ -25,6 +25,7 @@ import (
 	"github.com/junioryono/billet/internal/provider/tart"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
+	jobusage "github.com/junioryono/billet/internal/usage"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -45,6 +46,9 @@ type Node struct {
 	client     *nodeclient.Client
 	provider   provider.Provider
 	upgrader   node.ExecUpgrader
+	// sampled is what the job sampler reports to, set by UsageMetrics' source
+	// when the node serves metrics and nil, which reports nowhere, when not.
+	sampled jobusage.Observer
 }
 
 // OpenNode loads the certificate this node presents, claims the deployment
@@ -240,7 +244,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	// running and being measured until this command returns.
 	monitorCtx, stopMonitor := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopMonitor()
-	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p)
+	monitorOpts, err := nodeMonitorOptions(monitorCtx, cfg, p, n.sampled)
 	if err != nil {
 		return err
 	}
