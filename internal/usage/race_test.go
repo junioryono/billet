@@ -120,6 +120,9 @@ func TestAStartDuringAStuckSamplerLeavesItsFirstIntervalUnattributed(t *testing.
 	}
 	unstick(t, writer, stuck)
 	h.m.Forget("stuck")
+	// ANSWERED FROM HERE, so the energy below is unmeasured for want of a
+	// baseline and not because a slow final read timed out.
+	h.m.limit = answerLimit
 
 	h.advance(10*time.Second, "69571715")
 	h.m.Tick()

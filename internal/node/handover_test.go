@@ -785,6 +785,65 @@ func TestAForceReleaseATendSettledFirstIsNotSettledAgain(t *testing.T) {
 	}
 }
 
+// notingJIT notes each runner removal among the ledger's events, so a test can
+// order it against the renewals.
+type notingJIT struct {
+	*fakeJIT
+	rec *recordingLedger
+}
+
+func (j *notingJIT) EnsureRunnerRemoved(_ context.Context, leaseID string) error {
+	j.rec.note("remove " + leaseID)
+
+	return nil
+}
+
+// RECOVERY RENEWS EVERY SURVIVOR BEFORE IT SETTLES A FORCE RELEASE: settling
+// removes the runner at GitHub, for up to half a minute, and done inline it
+// held the next survivor's first renewal behind it.
+func TestRecoveryRenewsEverySurvivorBeforeItSettlesAForceRelease(t *testing.T) {
+	h := newHandoverHost(t)
+	h.p.asyncTeardown = true
+	second := assignedLease(t, h.a)
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	if err := first.Launch(t.Context(), second, dockerSpec(),
+		Job{RequestID: second.RequestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	// THE FORCED ONE IS THE FIRST SURVIVOR RECOVERY READS.
+	forced, other := h.lease, second
+	if provider.InstanceName(second.ID) < h.name {
+		forced, other = second, h.lease
+	}
+	if err := first.Destroy(t.Context(), forced.RequestID); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want the unconfirmed teardown held in custody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := h.a.ForceRelease(t.Context(), forced.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	next := New(h.rec, h.host, &notingJIT{fakeJIT: &fakeJIT{setID: 7}, rec: h.rec}, h.p, nil,
+		WithMonitor(runningMonitor(t, h.root)), WithUsageCheckpoints(h.dir))
+	h.rec.mu.Lock()
+	h.rec.events = nil
+	h.rec.mu.Unlock()
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	events := h.rec.sent()
+	removed, renewed := slices.Index(events, "remove "+forced.ID), slices.Index(events, "heartbeat "+other.ID)
+	if removed < 0 || renewed < 0 || removed < renewed || !slices.Contains(events, "release "+forced.ID) {
+		t.Errorf("events = %v, want the other survivor renewed before the forced one's runner is removed "+
+			"and its lease released", events)
+	}
+}
+
 // A JOB A PROVIDER WARNS IT WILL RECLAIM REPORTS WHAT IT DID: the warning moves
 // the running job into custody to be torn down, and that custody reports it
 // once, before its lease is released, and stops measuring it.

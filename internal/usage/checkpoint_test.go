@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -159,6 +160,11 @@ func TestACarriedJobLeftPendingStillMarksTheHandover(t *testing.T) {
 		cancel()
 		<-done
 	})
+	// RELEASED ON EVERY WAY OUT, before Run is stopped: Run blocked in the tick
+	// cannot see its context.
+	var released sync.Once
+	unblock := func() { released.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
 
 	block.Store(true)
 	ticked := make(chan struct{})
@@ -178,8 +184,10 @@ func TestACarriedJobLeftPendingStillMarksTheHandover(t *testing.T) {
 		t.Errorf("a carried job awaiting its baseline was checkpointed %v (unseen %v), want its series as "+
 			"carried with the handover marked", ok, again.Unseen)
 	}
-	close(release)
+	unblock()
 	<-ticked
+	// ANSWERED FROM HERE: the final read must be the sampler's, not a timeout.
+	b.limit = answerLimit
 
 	s, ok := b.Final("vm")
 	if !ok || len(s.Points) == 0 {

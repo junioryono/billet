@@ -946,9 +946,10 @@ func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover = %v, want a runner it could not remove left to the tend", err)
 	}
-	if !slices.Contains(jit.ensureCalls, lease.ID) {
-		t.Fatalf("recovery settled a force release without removing its runner: %v", jit.ensureCalls)
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) {
+		t.Fatalf("recovery tried to remove the runner %v, want once before settling", jit.ensureCalls)
 	}
+	destroyed := len(p.destroyed)
 	if _, err := a.Lease(t.Context(), lease.ID); err != nil || len(restarted.heldLeases()) != 1 {
 		t.Fatalf("lease %v, held %v; want a runner not yet removed to keep its lease held", err,
 			restarted.heldLeases())
@@ -960,6 +961,12 @@ func TestRecoveryRemovesAForceReleasedRunnerBeforeSettling(t *testing.T) {
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Fatalf("the force release was not settled once its runner was removed: %v", err)
+	}
+	// THE TEND TRIED THE REMOVAL AGAIN, and settling destroyed nothing: a force
+	// release lets go of the lease, never of the compute.
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID, lease.ID}) || len(p.destroyed) != destroyed {
+		t.Errorf("removals %v and %d destroys after the tend, want the removal tried again and no destroy",
+			jit.ensureCalls, len(p.destroyed)-destroyed)
 	}
 }
 

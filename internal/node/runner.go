@@ -1212,23 +1212,30 @@ func (r *Runner) Recover(ctx context.Context) error {
 
 	var adopted, failed int
 
-	// EVERY SURVIVOR IS ADOPTED AND RENEWED BEFORE ANY IS MEASURED (#384): finding
-	// a job's counters asks the backend and the sampler, each bounded at seconds,
-	// and done inline it would hold the next survivor's first renewal behind it.
-	// MEASURED HOWEVER THE RECOVERY ENDS: one that fails part way has still
+	// EVERY SURVIVOR IS ADOPTED AND RENEWED BEFORE ANY IS MEASURED (#384), OR ITS
+	// FORCE RELEASE SETTLED: finding a job's counters asks the backend and the
+	// sampler, each bounded at seconds, and removing a runner asks GitHub, for up
+	// to half a minute under tending; done inline, either would hold the next
+	// survivor's first renewal behind it. A settlement that fails leaves the
+	// entry held for the tend, which settles it again.
+	// DONE HOWEVER THE RECOVERY ENDS: one that fails part way has still
 	// adopted and renewed the survivors before the failure, and a job that ends
 	// before the retry would otherwise settle with nothing measured and its
 	// checkpoint pruned. One the stop cancelled measures too: a recovery that
 	// returns has recovered, and the drain that follows does not recover again,
 	// while a handoff keeps what was resumed in the checkpoint it writes.
-	type toMeasure struct {
+	type survivor struct {
+		adoption
 		lease *alloc.Lease
 		inst  *provider.Instance
 	}
-	var measure []toMeasure
+	var pending []survivor
 	defer func() {
-		for _, m := range measure {
-			r.resumeMonitoring(ctx, m.lease, m.inst)
+		for _, s := range pending {
+			if err := r.completeAdoption(ctx, s.adoption, s.lease, s.inst); err != nil {
+				r.log.Warn("could not settle the force release of an adopted job; the next tend tries again",
+					"name", s.inst.Name, "lease", s.lease.ID, "error", err)
+			}
 		}
 	}()
 
@@ -1266,16 +1273,14 @@ func (r *Runner) Recover(ctx context.Context) error {
 				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
 
 			default:
-				var owes bool
+				var a adoption
 				var err error
 				if lease.Phase == alloc.PhaseQuarantine {
-					owes, err = r.takeQuarantinedCustody(ctx, lease, inst)
+					a, err = r.takeQuarantinedCustody(ctx, lease, inst)
 				} else {
-					owes, err = r.takeCustody(ctx, lease, inst, true)
+					a, err = r.takeCustody(ctx, lease, inst, true)
 				}
-				if owes {
-					measure = append(measure, toMeasure{lease: lease, inst: inst})
-				}
+				pending = append(pending, survivor{adoption: a, lease: lease, inst: inst})
 				if err != nil {
 					return err
 				}
@@ -1363,18 +1368,18 @@ func (r *Runner) Recover(ctx context.Context) error {
 // is adopting can already be expired — and the control plane runs a reap BEFORE
 // its first tend. The reaper would terminalize the lease it had just adopted,
 // hand the capacity back, and let a listener advertise it while the container
-// carried on running. It answers whether the caller should measure the job
-// once its renewals are done (resumeMonitoring).
+// carried on running. It answers what the caller is left to do once its
+// renewals are done (completeAdoption).
 func (r *Runner) takeCustody(
 	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
-) (bool, error) {
+) (adoption, error) {
 	return r.takeCustodyWithRunnerRecovery(ctx, lease, inst, observed, RunnerRecoveryTracked)
 }
 
 func (r *Runner) takeCustodyWithRunnerRecovery(
 	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
 	recovery RunnerRecovery,
-) (bool, error) {
+) (adoption, error) {
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
@@ -1392,22 +1397,38 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 	entry, owes := r.adoptWithObservation(lease, inst, observed, recovery)
 
 	err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch)
-
-	// MEASURED AFTER THE RENEWAL AND NEVER BEFORE IT, which is why it is the
-	// caller's to do: finding the counters asks the backend, and the renewal is
-	// what keeps the reaper away. Recovery renews every survivor first.
-	measure := owes && !errors.Is(err, alloc.ErrForceRelease)
-
+	if errors.Is(err, alloc.ErrForceRelease) {
+		return adoption{forced: entry}, nil
+	}
 	if err != nil {
-		if errors.Is(err, alloc.ErrForceRelease) {
-			return false, r.settleForceReleased(ctx, entry)
-		}
-
-		return measure, fmt.Errorf("node: renew the lease of adopted instance %s (it is held in custody "+
-			"regardless, and renewal will be retried): %w", inst.Name, err)
+		return adoption{measure: owes}, fmt.Errorf("node: renew the lease of adopted instance %s (it is held "+
+			"in custody regardless, and renewal will be retried): %w", inst.Name, err)
 	}
 
-	return measure, nil
+	return adoption{measure: owes}, nil
+}
+
+// adoption is what taking custody of a survivor leaves its caller to do once
+// its renewal is done: measure the job, or settle the force release the
+// renewal found. Each asks something slow, the backend for the counters or
+// GitHub for the runner, so recovery renews every survivor before doing any.
+type adoption struct {
+	measure bool
+	forced  *custody
+}
+
+// completeAdoption does what an adoption left to do.
+func (r *Runner) completeAdoption(ctx context.Context, a adoption, lease *alloc.Lease,
+	inst *provider.Instance,
+) error {
+	if a.forced != nil {
+		return r.settleForceReleased(ctx, a.forced)
+	}
+	if a.measure {
+		r.resumeMonitoring(ctx, lease, inst)
+	}
+
+	return nil
 }
 
 // settleForceReleased ends an entry just adopted whose lease an operator
@@ -1468,12 +1489,9 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 		return nil
 	}
 
-	measure, err := r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
-	if measure {
-		r.resumeMonitoring(ctx, lease, inst)
-	}
+	a, err := r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
 
-	return err
+	return errors.Join(err, r.completeAdoption(ctx, a, lease, inst))
 }
 
 // purgeDiscarded starts, in the background, the deletion of storage earlier
@@ -1712,12 +1730,9 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
 	}
 
-	measure, err := r.takeQuarantinedCustody(ctx, lease, inst)
-	if measure {
-		r.resumeMonitoring(ctx, lease, inst)
-	}
+	a, err := r.takeQuarantinedCustody(ctx, lease, inst)
 
-	return err
+	return errors.Join(err, r.completeAdoption(ctx, a, lease, inst))
 }
 
 // takeQuarantinedCustody resolves a quarantined survivor's runner registration
@@ -1726,17 +1741,17 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 // a busy legacy runner from an idle or absent one.
 func (r *Runner) takeQuarantinedCustody(
 	ctx context.Context, lease *alloc.Lease, inst *provider.Instance,
-) (bool, error) {
+) (adoption, error) {
 	leaseID := lease.ID
 
 	recovery, err := r.jit.RecoverRunner(ctx, lease.ID, lease.Tier, lease.RequestID, inst.Name)
 	if err != nil {
-		return false, fmt.Errorf("node: recover the runner registration for quarantined lease %s: %w",
+		return adoption{}, fmt.Errorf("node: recover the runner registration for quarantined lease %s: %w",
 			leaseID, err)
 	}
 	if recovery != RunnerRecoveryTracked && recovery != RunnerRecoveryBusy &&
 		recovery != RunnerRecoveryRetired {
-		return false, fmt.Errorf("node: recover the runner registration for quarantined lease %s: unknown disposition %q",
+		return adoption{}, fmt.Errorf("node: recover the runner registration for quarantined lease %s: unknown disposition %q",
 			leaseID, recovery)
 	}
 
