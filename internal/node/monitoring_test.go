@@ -28,6 +28,8 @@ type measuredProvider struct {
 	// targets counts UsageTarget calls, and onTarget runs inside each.
 	targets  atomic.Int32
 	onTarget func(id string)
+	// onDestroy runs at the start of every Destroy.
+	onDestroy func(id string)
 }
 
 func (p *measuredProvider) cgroupFor(id string) string { return "/cg/" + id }
@@ -61,6 +63,9 @@ func (p *measuredProvider) writeCPU(t *testing.T, id, usec string) {
 }
 
 func (p *measuredProvider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
+	if p.onDestroy != nil {
+		p.onDestroy(id)
+	}
 	if err := os.RemoveAll(filepath.Join(p.root, p.cgroupFor(id))); err != nil {
 		return provider.TeardownRequested, err
 	}

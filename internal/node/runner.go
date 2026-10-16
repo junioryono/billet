@@ -1215,15 +1215,20 @@ func (r *Runner) Recover(ctx context.Context) error {
 	// EVERY SURVIVOR IS ADOPTED AND RENEWED BEFORE ANY IS MEASURED (#384): finding
 	// a job's counters asks the backend and the sampler, each bounded at seconds,
 	// and done inline it would hold the next survivor's first renewal behind it.
-	// Measured only once the adoptions are all done: a recovery that fails part
-	// way leaves later survivors unadopted and unrenewed, and is retried, and its
-	// adopted jobs are measured by the next one, since their entries still owe
-	// their reports.
+	// MEASURED HOWEVER THE RECOVERY ENDS: one that fails part way has still
+	// adopted and renewed the survivors before the failure, and a job that ends
+	// before the retry would otherwise settle with nothing measured and its
+	// checkpoint pruned.
 	type toMeasure struct {
 		lease *alloc.Lease
 		inst  *provider.Instance
 	}
 	var measure []toMeasure
+	defer func() {
+		for _, m := range measure {
+			r.resumeMonitoring(ctx, m.lease, m.inst)
+		}
+	}()
 
 	for _, inst := range instances {
 		leaseID, ours := provider.LeaseOf(inst.Name)
@@ -1336,10 +1341,6 @@ func (r *Runner) Recover(ctx context.Context) error {
 		}
 	}
 
-	for _, m := range measure {
-		r.resumeMonitoring(ctx, m.lease, m.inst)
-	}
-
 	if failed > 0 {
 		// REPORTED, not swallowed. An instance that resists destruction is holding
 		// capacity the ledger believes is free, and a caller that starts admitting
@@ -1386,7 +1387,7 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
 	// then discovered by Tend, which destroys the compute rather than leaving it
 	// running against capacity somebody else now holds.
-	owes := r.adoptWithObservation(lease, inst, observed, recovery)
+	entry, owes := r.adoptWithObservation(lease, inst, observed, recovery)
 
 	err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch)
 
@@ -1397,17 +1398,8 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 
 	if err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
-			for _, c := range r.custodySnapshot() {
-				if c.leaseID != lease.ID {
-					continue
-				}
-				c.discard = true
-				c.outcome = alloc.PhaseFailed
-				c.unconfirmed.Store(false)
-				r.settleHeldUsage(ctx, c, heldUsage{}, false)
-				r.cleanupCache(ctx, c.name)
-
-				return false, r.finish(ctx, c)
+			if settled, finishErr := r.settleForceReleased(ctx, entry); settled {
+				return false, finishErr
 			}
 		}
 
@@ -1416,6 +1408,30 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 	}
 
 	return measure, nil
+}
+
+// settleForceReleased ends an entry just adopted whose lease an operator
+// force-released, and says whether it did: under tending, as a tend ends one,
+// and only while it is still its lease's entry, since a tend may have settled
+// it or a later adoption replaced it since.
+func (r *Runner) settleForceReleased(ctx context.Context, c *custody) (bool, error) {
+	r.tending.Lock()
+	defer r.tending.Unlock()
+
+	r.mu.Lock()
+	current := r.custody[c.leaseID] == c
+	r.mu.Unlock()
+	if !current {
+		return false, nil
+	}
+
+	c.discard = true
+	c.outcome = alloc.PhaseFailed
+	c.unconfirmed.Store(false)
+	r.settleHeldUsage(ctx, c, heldUsage{}, false)
+	r.cleanupCache(ctx, c.name)
+
+	return true, r.finish(ctx, c)
 }
 
 // AssumeCustody takes responsibility for a lease whose launch SUCCEEDED but

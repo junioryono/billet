@@ -171,11 +171,11 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 //
 // THE JOB GOES ON BEING MEASURED, and the entry owes its usage report (#384),
 // unless it replaces an entry for the same compute that settled its report
-// already: a job is reported once, not once per adoption. It answers whether
-// the new entry owes one.
+// already: a job is reported once, not once per adoption. It answers the new
+// entry and whether it owes one.
 func (r *Runner) adoptWithObservation(
 	lease *alloc.Lease, inst *provider.Instance, observed bool, recovery RunnerRecovery,
-) bool {
+) (*custody, bool) {
 	outcome := alloc.PhaseDone
 	discard := false
 	phase := alloc.PhaseCustody
@@ -213,7 +213,7 @@ func (r *Runner) adoptWithObservation(
 		}
 	}
 
-	// TENDING FIRST, as everywhere: a tend settling the entry this replaces holds
+	// TENDING FIRST, then mu: a tend settling the entry this replaces holds
 	// it from its last sample to its release, and handing the report over in the
 	// middle of that left the old tend releasing the lease without reporting and
 	// the new entry with a lease that was gone.
@@ -261,7 +261,7 @@ func (r *Runner) adoptWithObservation(
 	r.dropRunningLocked(inst.Name)
 	r.custody[lease.ID] = entry
 
-	return owes
+	return entry, owes
 }
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
