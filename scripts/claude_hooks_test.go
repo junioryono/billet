@@ -498,6 +498,7 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		{"echo x >$(cat <<'EOF'\n(\nEOF\n); git rebase main # )", "could not be parsed"},
 		{"git >$(printf log\n) rebase main", "could not be parsed"},
 		{"echo x >$(printf log # '\n); git rebase main # ')", "could not be parsed"},
+		{"echo x >$(printf log # '\\\n); git rebase main # ')", "could not be parsed"},
 		{"make >$(printf log\n) check", ""},
 		{"make verify > /tmp/verify.log\ngit status", ""},
 		{"git push origin junior-oct03-work > /tmp/a\\\nb.log", ""},

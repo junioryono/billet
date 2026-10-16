@@ -295,8 +295,12 @@ def redirection_end(text, i, previous):
     end = word_end(text, j)
     # A target that runs across a line (a quoted string or a substitution holding
     # a newline, where a comment or a heredoc can hide a quote or a parenthesis)
-    # is not read at all: the line is unreadable, which the git rules refuse.
-    if "\n" in text[j : n if end is None else end].replace("\\\n", ""):
+    # is not read at all: the line is unreadable, which the git rules refuse. A
+    # continuation is exempt only in a plain word, since inside a comment it is
+    # no continuation at all.
+    span = text[j : n if end is None else end]
+    plain = not any(c in span for c in "'\"(")
+    if "\n" in (span.replace("\\\n", "") if plain else span):
         raise Unreadable("a redirection target runs across a line")
     return end
 
