@@ -71,8 +71,8 @@ jobs:
       # THE COMMIT THE RELEASE WOULD BE CUT FROM, decided once, read by the report
       # and held by the cut. The branch may already exist: that is what a second
       # patch on the same minor series looks like, and it is the case this shape
-      # exists for. ls-remote's 2 is "no such branch"; any other failure is
-      # could-not-tell, which must not become "cut a new branch from main".
+      # exists for. A listing origin could not give is could-not-tell, which must
+      # not become "cut a new branch from main".
       #
       # FETCHED, NOT CHECKED OUT. The report runs main's release-contents.sh,
       # which reads the candidate by its id; checking the branch out here would
@@ -85,29 +85,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # THE WHOLE REF, because ls-remote matches a pattern against the end of
-          # a ref name: `release/v0.4` alone also matches someone/release/v0.4.
+          # EVERY HEAD, MATCHED BY ITS WHOLE NAME. ls-remote matches a pattern
+          # against the end of a ref name, and even `refs/heads/<branch>` is
+          # matched as `*/refs/heads/<branch>`, so a branch named
+          # someone/refs/heads/<branch> would read as this one existing. The
+          # listing's own status is the could-not-tell answer.
           set +e
-          git ls-remote --exit-code origin "refs/heads/${BRANCH}" >/dev/null
+          heads=$(git ls-remote --heads origin)
           status=$?
           set -e
 
-          case "${status}" in
-            0)
-              echo "${BRANCH} already exists; the candidate is its tip rather than main"
-              git fetch origin "${BRANCH}:${BRANCH}"
-              commit=$(git rev-parse --verify "refs/heads/${BRANCH}^{commit}")
-              existing=true
-              ;;
-            2)
-              commit=$(git rev-parse --verify "HEAD^{commit}")
-              existing=false
-              ;;
-            *)
-              echo "::error::could not ask origin whether ${BRANCH} exists (git ls-remote exited ${status})"
-              exit 1
-              ;;
-          esac
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::could not ask origin whether ${BRANCH} exists (git ls-remote exited ${status})"
+            exit 1
+          fi
+
+          if printf '%s\n' "${heads}" | awk -v want="refs/heads/${BRANCH}" '$2 == want { found = 1 } END { exit !found }'; then
+            echo "${BRANCH} already exists; the candidate is its tip rather than main"
+            git fetch origin "refs/heads/${BRANCH}:refs/heads/${BRANCH}"
+            commit=$(git rev-parse --verify "refs/heads/${BRANCH}^{commit}")
+            existing=true
+          else
+            commit=$(git rev-parse --verify "HEAD^{commit}")
+            existing=false
+          fi
 
           {
             echo "commit=${commit}"

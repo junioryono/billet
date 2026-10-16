@@ -796,8 +796,12 @@ func TestTheCandidateStepFindsTheCommitAndLeavesMainCheckedOut(t *testing.T) {
 
 			origin, work, mainTip, branchTip := candidateRepos(t, tc.withBranch)
 
+			// EVERY SHAPE A TAIL MATCH ADMITS: a branch ending in the name, one
+			// ending in its whole ref, and a tag spelled as that ref.
 			if tc.decoy {
 				fixtureGit(t, origin, "branch", "someone/release/v0.4")
+				fixtureGit(t, origin, "branch", "someone/refs/heads/release/v0.4")
+				fixtureGit(t, origin, "tag", "refs/heads/release/v0.4")
 			}
 
 			if tc.breakOrigin {
