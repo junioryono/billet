@@ -42,7 +42,11 @@ Nothing billet carries from one workspace into another goes on the system disk.
 
 TLS for previews terminates at the edge, so no fork serves with a private key a golden held.
 
-**Per-fork state is delivered after load and before resume.** The MMDS data store does not survive a snapshot, so a fork is loaded paused, given its MMDS document (its identity, its repository token, its model-credential source, its task), and only then resumed. Metrics and logging configuration are not in a snapshot either and are configured on every load.
+**Per-fork state is delivered after load and before resume.**
+1. Logging and metrics are configured on each fresh VMM before the snapshot is loaded, because they are not in a snapshot and Firecracker accepts that configuration only before load.
+2. The snapshot is loaded paused.
+3. The fork is given its MMDS document (its identity, its repository token, its model-credential source, its task), since the MMDS data store does not survive a snapshot.
+4. Only then is it resumed.
 
 **A fork's network is its own namespace.** A restored guest keeps the address and tap name the golden had, so every workspace runs in a network namespace of its own with that tap name inside it, reached from the host through a veth pair and NAT, following Firecracker's network-for-clones recommendation. Egress is an allowlist per workspace, on top of the deny rules the host already applies to guests.
 
@@ -51,10 +55,10 @@ TLS for previews terminates at the edge, so no fork serves with a private key a 
 **A suspended workspace is private, and it is never a source for anyone else.** A running workspace's memory holds its owner's repository token and model credentials, so a suspension snapshot is confidential user state, bound to one deployment, one owner and one workspace. It is never a golden and never the source of a fork. It lives in storage only its node and its owner's restore can reach, and a resume is authorised the same way as attach.
 
 **A suspension is captured behind the same barrier a golden is.** Before the VM pauses:
-- the agent process stops, and the credential home's writes are drained and the home is unmounted, so no filesystem client state or credential cache for the home sits in the captured memory;
+- the agent process exits, and the credential home's writes are drained before its unmount completes, so a restore never continues using that mounted client. This does not erase credential bytes from guest memory: freed pages can still hold them, so every suspension generation remains credential-bearing confidential state, as above;
 - every application process is parked behind the guest agent's restore barrier, and its external traffic is blocked.
 
-If any of these cannot be proved, the suspend is refused and the workspace keeps running. After restore, applications stay parked until the clock is corrected, the home is mounted again and the network is restored; an unknown result holds the barrier. A resumed suspension keeps its own identities, because it is the same workspace continuing, so golden-fork identity regeneration does not apply. The agent is started again with its session's own continuation.
+If any of these cannot be proved, the suspend is refused and the workspace keeps running. After restore, applications stay parked until the clock is corrected, the home is mounted again and the network is restored; an unknown result holds the barrier. A resumed suspension keeps its own identities, because it is the same workspace continuing, so golden-fork identity regeneration does not apply. Restore mounts the current home and starts a fresh agent process, which continues its session through the agent's own mechanism.
 
 **Durability is proved before the VMM stops.** A suspend, behind that barrier:
 1. pauses the VM;
@@ -67,9 +71,9 @@ If the generation fails, or billet cannot tell whether it is complete, billet fi
 
 **A suspension generation runs at most once.** Firecracker warns that executing one state twice duplicates it even when the two runs are sequential, and that includes the original VM continuing after its own snapshot is restored. So a resume first takes a durable, fenced claim on the generation, and only then loads it. Once execution may have begun, the generation is never loaded again: recovery reconciles that incarnation, even after it stops. A lost acknowledgement or a restart between any durable decision and the VMM action that follows it therefore never runs the captured state twice.
 
-**A suspended workspace pins its configuration.** A resume needs the fingerprint the suspension was taken on. An upgrade may not retire that configuration while a suspended workspace depends on it, unless its owner resumes it first or explicitly chooses the fallback. The fallback is a new workspace from a current golden with the old workspace volume attached after the barrier. That volume is treated as crash-consistent: it is mounted only after its journal is recovered. It keeps the checkout and loses process memory and anything the old system disk held, the database's changes included. Rebuilding a golden never replaces a workspace's own snapshot.
+**A suspended workspace pins its configuration.** A resume needs the fingerprint the suspension was taken on. An upgrade may not retire that configuration while a suspended workspace depends on it, unless its owner resumes it first or explicitly chooses the fallback. The fallback is a new workspace from a current golden with the old workspace volume attached after the barrier. It is an exclusive transition under the workspace's restore fence: before the volume moves, billet durably makes every old suspension generation ineligible for restore and transfers exclusive ownership of the volume to the new workspace, and an unknown outcome permits neither the attachment nor a resume. That volume is treated as crash-consistent: it is mounted only after its journal is recovered. It keeps the checkout and loses process memory and anything the old system disk held, the database's changes included. Rebuilding a golden never replaces a workspace's own snapshot.
 
-**`fork` is a new workspace for the same owner with a copy of the source's checkout files.** It restores a current golden like any create, then copies the files of the source's checkout into the new workspace volume, file by file. It does not clone a block device, so deleted contents do not come along. It never copies memory, the system disk or a credential home.
+**`fork` is a new workspace for the same owner with a copy of the source's checkout files.** It restores a current golden like any create, then copies the files of the source's checkout into the new workspace volume, file by file. The source is an immutable view of the checkout, captured while every writer to it is quiesced, so a commit or rewrite in progress cannot produce a repository whose refs name objects that were never copied. The new workspace stays behind its barrier until the copy is complete, and an incomplete or unreadable copy is never published. It does not clone a block device, so deleted contents do not come along. It never copies memory, the system disk or a credential home.
 
 The traversal is confined to the checkout through verified directory descriptors, following billet's rule that privileged operations go through a descriptor, never a pathname:
 - it never follows a symlink, crosses a mount point or opens a special file;
@@ -97,9 +101,10 @@ Only the start of the sign-in flow is reachable without a session.
 - the sign-in flow;
 - the preview edge;
 - the OAuth callback broker;
-- the MCP endpoint.
+- the MCP endpoint;
+- attach, which requires control-plane authentication, workspace authorisation and an allowlisted control-plane `Origin`, and which a preview session can never authorise.
 
-Everything else stays where it is. A team that wants all four private puts the control plane behind its own network. An MCP client that connects from its own cloud cannot then reach the MCP endpoint, which the team accepts or exposes alone.
+Everything else stays where it is. A team that wants all five private puts the control plane behind its own network. An MCP client that connects from its own cloud cannot then reach the MCP endpoint, which the team accepts or exposes alone.
 
 **Workspaces are trusted-only and Firecracker-only.** The code in a workspace is written live by an agent and pulls dependencies from the internet, and a person attaches to it, so it needs the jailer's boundary and a trusted classification. A workspace is refused on a backend or tier that cannot give both. Attach is never offered on an untrusted tier, which is also #28's rule for SSH into a job.
 
@@ -109,7 +114,7 @@ Everything else stays where it is. A team that wants all four private puts the c
 
 **The agent's model credentials are the user's own, and billet never handles a sign-in credential.** A workspace runs the agent's binary unmodified. A user either authenticates with their own API key or cloud-provider credential (delivered through MMDS to a key helper), or signs in to their own subscription through the agent's own sign-in flow. For the latter, each user has a home directory on a shared filesystem with proved concurrent-client semantics (CephFS is the candidate, since the nodes already run Ceph), mounted into that user's workspaces only.
 - **How it's used:** the agent writes its own login there, as several sessions on one laptop share one home, and billet never reads, copies or special-cases it.
-- **Never a snapshot:** it is never an ordinary block filesystem mounted by two guests. Its storage is outside every recovery generation and every fork, and it is unmounted before a suspension is captured, so no client session or cached page for it is in a snapshot either.
+- **Never a snapshot:** it is never an ordinary block filesystem mounted by two guests. Its storage is outside every recovery generation and every fork, and it is unmounted before a suspension is captured, so a restore never resumes a stale client session. (Bytes it once held may still be in a suspension's memory; that is why a suspension is confidential.)
 - **Never in a golden:** it is never part of a golden, and the agent starts after a restore, so a golden's memory holds no credential.
 
 **Agents reach billet through MCP.** The control plane's MCP endpoint offers tools to create, list, fork, inspect, suspend and remove the caller's own workspaces, each call authorised as above.
@@ -122,7 +127,9 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - the restore barrier holds every application process until the guest kernel reseeds from VMGenID with the kernel billet ships;
   - the reseed is observable to the agent;
   - each service in the reference golden either reinitialises its clone-sensitive state by a named procedure or is excluded.
-- **MMDS and configuration:** the MMDS data store is empty after load and accepts a document before resume; metrics and logging configuration must be set again after load.
+- **MMDS and configuration:**
+  - logging and metrics configured on a fresh VMM before load take effect;
+  - the MMDS data store is empty after a paused load and accepts a document before resume.
 - **Network:** a workspace in its own namespace with the golden's tap name reaches the network through its veth and is reachable from the relay.
 - **vsock:**
   - a vsock listener in the guest survives restore with its CID updated, as documented;
@@ -136,6 +143,7 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - an old workspace volume mounts after journal recovery for the fallback.
 - **Fork:**
   - a file-level copy of a checkout carries the files and no deleted contents;
+  - with commits and file rewrites running in the source, the copy is a consistent repository;
   - a symlink pointing out of the checkout, a special file and a rename during the copy all fail to escape either root.
 - **Shared home:**
   - two workspaces of one user share the home concurrently;
@@ -146,6 +154,7 @@ Each is a probe on the reference Firecracker host, recorded here with the Firecr
   - **process crashes:** a crash of the billet node or controller process, injected at every suspend step while the host and VMM survive, leaves either the original VMM or a complete generation;
   - **host or storage failure:** an acknowledged suspension stays recoverable, and an interrupted, unacknowledged one may lose volatile state but is never reported complete;
   - **at most once:** a resume whose acknowledgement is lost, and a restart in the middle of a resume, never load one generation twice;
+  - **fallback versus resume:** a fallback racing a resume, with a crash at each step, never leaves the old volume attached to two workspaces or a generation restorable after its volume moved;
   - **between decision and action:** a crash between every durable decision and the VMM action it permits, a failed suspend's invalidation and the original's resume included, never runs one captured state twice.
 
 ## Rejected
