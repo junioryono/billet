@@ -208,28 +208,53 @@ REDIRECTION_OPERATORS = ("<<<", ">>", ">|", ">&", "<&", "<>", ">", "<")
 WORD_ENDS = " \t\n;&|()<>"
 
 
+def quoted_end(text, j):
+    """The index just past the quoted string or `$(...)` that starts at j, nested
+    quotes and substitutions included; None when it never closes."""
+    n = len(text)
+    if text[j] == "'":
+        close = text.find("'", j + 1)
+        return None if close < 0 else close + 1
+    if text[j] == '"':
+        j += 1
+        while j < n and text[j] != '"':
+            if text.startswith("$(", j):
+                j = quoted_end(text, j)
+                if j is None:
+                    return None
+            else:
+                j += 2 if text[j] == "\\" else 1
+        return None if j >= n else j + 1
+    # $( ... ): balanced parentheses, with quotes inside it read as their own.
+    j, depth = j + 2, 1
+    while j < n:
+        c = text[j]
+        if c in "'\"" or text.startswith("$(", j):
+            j = quoted_end(text, j)
+            if j is None:
+                return None
+            continue
+        if c == "\\":
+            j += 2
+            continue
+        depth += {"(": 1, ")": -1}.get(c, 0)
+        j += 1
+        if depth == 0:
+            return j
+    return None
+
+
 def word_end(text, j):
     """The index just past the shell word that starts at j, quotes included; None
     when a quote in it never closes, so the line stays as unreadable as it is."""
     n = len(text)
     while j < n and text[j] not in WORD_ENDS:
-        c = text[j]
-        if c == "\\":
-            j += 2
-        elif c == "'":
-            close = text.find("'", j + 1)
-            if close < 0:
+        if text[j] in "'\"" or text.startswith("$(", j):
+            j = quoted_end(text, j)
+            if j is None:
                 return None
-            j = close + 1
-        elif c == '"':
-            j += 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            if j >= n:
-                return None
-            j += 1
         else:
-            j += 1
+            j += 2 if text[j] == "\\" else 1
     return min(j, n)
 
 

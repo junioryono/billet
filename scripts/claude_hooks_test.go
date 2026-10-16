@@ -483,6 +483,13 @@ func TestTheBashHookRefusesTheFullGatesAndLetsTargetedChecksThrough(t *testing.T
 		// unreadable, and the git rules still refuse what they cannot read.
 		{"echo x >'unterminated; git push --force origin junior-oct03-work", "could not be parsed"},
 		{"echo x >\"unterminated; git rebase main", "could not be parsed"},
+		{"echo x >\"$(printf 'unterminated; git rebase main", "could not be parsed"},
+		// A target holding a quoted command substitution is one word.
+		{"git push origin junior-oct03-work >\"$(printf '\"')\"", ""},
+		{"git push origin junior-oct03-work >$(printf '%s' \"a)b\").log; git rebase main", "merging"},
+		{"make check >\"$(date '+%H)%M').log\"", gate},
+		{"make >$(printf ')') check", gate},
+		{"make >$(mktemp) verify", ""},
 		// A line continuation joins words before a descriptor is read.
 		{"make 2\\\n>/dev/null", bare},
 		{"make check 2\\\n>/dev/null", gate},
