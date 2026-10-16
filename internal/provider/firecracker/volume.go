@@ -32,8 +32,10 @@ func (p *Provider) AttachVolume(
 		return err
 	}
 
+	// TO THIS MICROVM'S VMM AND NO OTHER (newVMMAPIAs): the guest has run, so the
+	// socket's name is no longer evidence of whose VMM it reaches.
 	id := provider.VolumeSlotID(slot)
-	if err := p.apiFor(j.socket()).patch(ctx, "/drives/"+id, map[string]string{
+	if err := p.apiAs(j.socket(), res.UID).patch(ctx, "/drives/"+id, map[string]string{
 		"drive_id": id, "path_on_host": "/" + id,
 	}); err != nil {
 		return fmt.Errorf("firecracker: attach cache slot %d to %s: %w", slot, instanceID, err)
@@ -63,7 +65,7 @@ func (p *Provider) DetachVolume(
 	}
 
 	id := provider.VolumeSlotID(slot)
-	if err := p.apiFor(j.socket()).patch(ctx, "/drives/"+id, map[string]string{
+	if err := p.apiAs(j.socket(), res.UID).patch(ctx, "/drives/"+id, map[string]string{
 		"drive_id": id, "path_on_host": "/" + id,
 	}); err != nil {
 		return fmt.Errorf("firecracker: detach cache slot %d from %s: %w", slot, instanceID, err)
