@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -324,6 +326,71 @@ func TestAStopAcrossManyTiersIsStillAStop(t *testing.T) {
 
 	if allStopped(t.Context(), errs) {
 		t.Error("tiers that ended on a cancellation with nobody stopping were read as a stop")
+	}
+}
+
+// AND RUN ASKS IT THAT WAY. Three hundred tiers, every one polling, are stopped
+// together, and each ends on nothing but the stop; the join of their endings is
+// more than the cause walk reads, so a Run that asked it of the join would
+// answer a clean stop with an error and the process would exit 1.
+func TestAControlPlaneWithManyTiersStopsCleanly(t *testing.T) {
+	t.Parallel()
+
+	const n = 300
+
+	tiers := make([]config.Tier, 0, n)
+	for i := range n {
+		tiers = append(tiers, tier(fmt.Sprintf("billet-4vcpu-%03d", i)))
+	}
+
+	var (
+		polling  atomic.Int32
+		allReady sync.Once
+		ready    = make(chan struct{})
+	)
+
+	prov := &fakeProvisioner{newSession: func(string) Session {
+		var first sync.Once
+
+		return &fakeSession{longPoll: time.Minute, onPoll: func(int) {
+			first.Do(func() {
+				if polling.Add(1) == n {
+					allReady.Do(func() { close(ready) })
+				}
+			})
+		}}
+	}}
+
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+
+	limits := alloc.Limits{MaxVCPU: 4 * n, MaxMemory: 4 * n * config.GiB}
+
+	ran := make(chan error, 1)
+
+	go func() { ran <- New(newAllocator(t, limits, tiers), prov, tiers, "test-owner", nil).Run(ctx) }()
+
+	// A FAILURE GUARD, never the condition: every tier polling is.
+	guard := time.NewTimer(2 * time.Minute)
+	defer guard.Stop()
+
+	select {
+	case <-ready:
+	case err := <-ran:
+		t.Fatalf("Run ended before every tier polled: %v", err)
+	case <-guard.C:
+		t.Fatalf("only %d of %d tiers polled", polling.Load(), n)
+	}
+
+	stop()
+
+	select {
+	case err := <-ran:
+		if err != nil {
+			t.Errorf("a control plane of %d tiers stopped together returned %v", n, err)
+		}
+	case <-guard.C:
+		t.Fatal("Run did not return after the stop")
 	}
 }
 

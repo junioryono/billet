@@ -37,11 +37,11 @@ import (
 // (#148). A process nobody asked to stop is never stopped, whatever its error
 // wraps.
 //
-// AND A FENCED HOST EXITS NON-ZERO WHATEVER ELSE IS TRUE. A successor has the
-// deployment; a clean exit would leave a healed partition with no controller at
-// all, while a failure is what Restart=on-failure acts on, unless systemd was
-// itself stopping the unit: it starts this one again to take the deployment
-// back or be refused naming the holder.
+// AND A FENCED HOST EXITS NON-ZERO WHATEVER ELSE IS TRUE. Its ledger no longer
+// names it the controller, and a clean exit would leave a healed partition with
+// no controller at all, while a failure is what Restart=on-failure acts on,
+// unless systemd was itself stopping the unit: it starts this one again to take
+// the deployment back or be refused naming the holder.
 //
 // WHAT A STOP DURING STARTUP LEAVES IN SYSTEMD IS MEASURED, not assumed. A
 // Type=notify unit stopped while still `activating`, whose process exits 0
@@ -54,13 +54,16 @@ func serverEnded(ctx context.Context, env cli.Env, fenced bool, err error) error
 	switch {
 	case fenced && errors.Is(err, state.ErrLeadershipLost):
 		return err
+	// WHAT THE LATCH PROVES, AND NO MORE: the ledger refused a write because its
+	// record of the controller is no longer this process's, which a successor's
+	// claim does and a missing row does too.
 	case fenced && err == nil:
-		return fmt.Errorf("%w: a successor claimed the deployment while this process was "+
-			"stopping; restarting is how this host takes it back, or is refused naming the holder",
+		return fmt.Errorf("%w: its ledger refused a write as it was stopping; restarting is how "+
+			"this host takes the deployment back, or is refused naming the holder",
 			state.ErrLeadershipLost)
 	case fenced:
-		return fmt.Errorf("%w: a successor claimed the deployment while this process held it, "+
-			"and restarting is how this host takes it back, or is refused naming the holder: %w",
+		return fmt.Errorf("%w: its ledger refused a write before it ended; restarting is how "+
+			"this host takes the deployment back, or is refused naming the holder: %w",
 			state.ErrLeadershipLost, err)
 	case err == nil:
 	case state.StoppedBy(ctx, err):

@@ -83,16 +83,30 @@ func runControlPlane(
 	// successor can refuse, is read the same way.
 	fenced := cp.LeadershipLost()
 
-	// AND THE CLOSE'S OWN FAILURE IS JOINED, not dropped: a lock or a connection
-	// that would not let go beside a stop is a fault, and a stop that discarded
-	// it would exit 0 over it. A run that failed already says what its open
-	// migrated; one that did not, a probe, says it here if its close fails.
-	closed := cp.Close()
+	return fenced, closeAfter(err, cp)
+}
+
+// closingLedger is what closeAfter needs of the control plane: its ledger's
+// close, and what its open migrated that no claim has recorded.
+type closingLedger interface {
+	Close() error
+	UnclaimedMove() error
+}
+
+// closeAfter closes the ledger a run ended with err and answers both.
+//
+// THE CLOSE'S OWN FAILURE IS JOINED, never dropped and never dropping err: a
+// lock or a connection that would not let go beside a stop is a fault, and a
+// stop that discarded it would exit 0 over it. A run that failed already says
+// what its open migrated; one that did not, a probe, says it here if its close
+// fails.
+func closeAfter(err error, ledger closingLedger) error {
+	closed := ledger.Close()
 	if closed != nil && err == nil {
-		closed = errors.Join(closed, cp.UnclaimedMove())
+		closed = errors.Join(closed, ledger.UnclaimedMove())
 	}
 
-	return fenced, errors.Join(err, closed)
+	return errors.Join(err, closed)
 }
 
 // serveControlPlane is the control plane cp after its open: the probe's hold,

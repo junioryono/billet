@@ -333,52 +333,90 @@ func TestTheFenceIsReadOnceTheControlPlaneHasStopped(t *testing.T) {
 		}
 	}
 
-	// AND THE LEDGER CLOSES AFTER THE READ, in an assignment of its own, never in a
-	// defer, which could not hand its error back; and the run's last word joins
-	// that error to the run's, so neither hides the other.
+	// AND THE RUN ENDS RIGHT THERE: the read, then one return that closes the
+	// ledger through closeAfter, nothing between the serving and either. A
+	// statement between them is where a return that drops the close's failure,
+	// or reads the fence late, would go.
 	body := findFunc(t, "runControlPlane").Body.List
-	served, read, closed, closeVar := -1, -1, -1, ""
+	served := -1
 
 	for i, stmt := range body {
-		if _, isDefer := stmt.(*ast.DeferStmt); isDefer {
-			if calls(stmt, "Close") {
-				t.Error("runControlPlane defers the ledger's close, so its failure is dropped")
-			}
-
-			continue
-		}
-
-		if calls(stmt, "serveControlPlane") && served < 0 {
+		if calls(stmt, "serveControlPlane") {
 			served = i
-		}
 
-		if calls(stmt, "LeadershipLost") && read < 0 {
-			read = i
-		}
-
-		if assign, ok := stmt.(*ast.AssignStmt); ok && closed < 0 && len(assign.Lhs) == 1 &&
-			len(assign.Rhs) == 1 && calls(assign.Rhs[0], "Close") {
-			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
-				closed, closeVar = i, id.Name
-			}
+			break
 		}
 	}
 
-	if served < 0 || read <= served || closed <= read {
-		t.Fatalf("runControlPlane does not read the fence after serveControlPlane has returned and "+
-			"before the ledger closes (serve at statement %d, read at %d, close at %d)", served, read, closed)
+	if served < 0 || len(body) != served+3 {
+		t.Fatalf("runControlPlane does not end with the serving, the fence read and the return "+
+			"(serve at statement %d of %d)", served, len(body))
 	}
 
-	ret, ok := body[len(body)-1].(*ast.ReturnStmt)
+	if !calls(body[served+1], "LeadershipLost") || calls(body[served+1], "Close") {
+		t.Error("the statement after the serving is not the fence read alone")
+	}
+
+	ret, ok := body[served+2].(*ast.ReturnStmt)
 	if !ok || len(ret.Results) != 2 {
 		t.Fatal("runControlPlane does not end in a return of the fence and an error")
 	}
 
-	join, ok := ret.Results[1].(*ast.CallExpr)
-	if !ok || !isPkgCall(join, "errors", "Join") || len(join.Args) != 2 ||
-		!isIdent(join.Args[0], "err") || !isIdent(join.Args[1], closeVar) {
-		t.Errorf("runControlPlane does not return errors.Join(err, %s), so a close that failed "+
-			"beside a stop can be dropped", closeVar)
+	closing, ok := ret.Results[1].(*ast.CallExpr)
+	if !ok || calleeName(closing) != "closeAfter" || len(closing.Args) != 2 || !isIdent(closing.Args[0], "err") {
+		t.Error("runControlPlane does not return closeAfter(err, ...), so a close that failed beside a " +
+			"stop can be dropped")
+	}
+
+	for _, stmt := range body {
+		if _, isDefer := stmt.(*ast.DeferStmt); isDefer && calls(stmt, "Close") {
+			t.Error("runControlPlane defers the ledger's close, so its failure is dropped")
+		}
+	}
+}
+
+// failingClose is a ledger whose close fails, and what its open migrated.
+type failingClose struct {
+	closed error
+	moved  error
+}
+
+func (f failingClose) Close() error         { return f.closed }
+func (f failingClose) UnclaimedMove() error { return f.moved }
+
+// A CLOSE THAT FAILS BESIDE A STOP IS A FAULT, AND NEITHER HIDES THE OTHER. A
+// lock or connection that would not let go is reported whatever the run ended
+// with, and a stop that came with one is not a clean stop; a run that ended
+// well and then failed to close, a probe, says what its open migrated.
+func TestAFailedCloseIsJoinedToHowTheRunEnded(t *testing.T) {
+	t.Parallel()
+
+	stopped, stop := context.WithCancel(t.Context())
+	stop()
+
+	fault := errors.New("release the directory lock: bad file descriptor")
+	moved := &state.SchemaMoved{From: 0, To: 60}
+
+	got := closeAfter(claimCancellation(), failingClose{closed: fault, moved: moved})
+	if !errors.Is(got, fault) || !errors.Is(got, context.Canceled) {
+		t.Errorf("a stop beside a failed close answered %v, want both", got)
+	}
+
+	if _, end := endedWith(stopped, false, got); end == nil {
+		t.Error("a stop beside a failed close exits 0")
+	}
+
+	if _, ok := errors.AsType[*state.SchemaMoved](got); ok {
+		t.Error("a run that already failed had what its open moved joined twice")
+	}
+
+	got = closeAfter(nil, failingClose{closed: fault, moved: moved})
+	if !errors.Is(got, fault) || !errors.Is(got, moved) {
+		t.Errorf("a run that ended well and failed to close answered %v, want the fault and the move", got)
+	}
+
+	if got := closeAfter(claimCancellation(), failingClose{moved: moved}); !state.StoppedBy(stopped, got) {
+		t.Errorf("a stop whose close succeeded answered %v, which is no longer only the stop", got)
 	}
 }
 
