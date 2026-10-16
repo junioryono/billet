@@ -8,12 +8,18 @@ import (
 // at is the step clock: tick n is n half-seconds after an arbitrary start.
 func at(n int) time.Time { return time.Unix(1_000_000, 0).Add(time.Duration(n) * Tick) }
 
-// moving is an observation of these rates in Mbit/s over one tick.
+// moving is an observation of these rates in Mbit/s over one tick, with every
+// one of three reflectors answering at this delay.
 func moving(n int, upMbit, downMbit float64, delay time.Duration) Observation {
+	return probed(n, upMbit, downMbit, Sample{Delay: delay, DelayKnown: true,
+		Probes: []Probe{{Reflector: "a"}, {Reflector: "b"}, {Reflector: "c"}}})
+}
+
+// probed is an observation of these rates with what a round's probes said.
+func probed(n int, upMbit, downMbit float64, s Sample) Observation {
 	bits := func(mbit float64) uint64 { return uint64(mbit * 1e6 * Tick.Seconds()) }
 
-	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit),
-		Delay: delay, DelayKnown: true}
+	return Observation{At: at(n), Interval: Tick, SentBits: bits(upMbit), ReceivedBits: bits(downMbit), Sample: s}
 }
 
 func newController() *Controller {
@@ -102,12 +108,10 @@ func TestBaselineDriftDoesNotReadAsACutHelping(t *testing.T) {
 	cuts := 0
 
 	for n := range 120 {
-		delay, known := d.Observe(asked, map[string]time.Duration{"r": 47 * time.Millisecond})
+		s := d.Observe(asked, map[string]time.Duration{"r": 47 * time.Millisecond})
 		before := c.Down.Rate
 
-		o := moving(n, 0, 300, delay)
-		o.DelayKnown = known
-		c.Step(o)
+		c.Step(probed(n, 0, 300, s))
 
 		if c.Down.Rate < before {
 			cuts++

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"time"
 )
 
@@ -23,10 +24,9 @@ type Pinger struct {
 // NewPinger opens the socket. Every reflector must be a literal IPv4 address,
 // so a round never waits on a resolver that the full queue is also delaying.
 func NewPinger(ctx context.Context, reflectors []string) (*Pinger, error) {
-	for _, reflector := range reflectors {
-		if ip := net.ParseIP(reflector); ip == nil || ip.To4() == nil {
-			return nil, fmt.Errorf("reflector %q is not an IPv4 address", reflector)
-		}
+	reflectors, err := reflectorAddrs(reflectors)
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := (&net.ListenConfig{}).ListenPacket(ctx, "ip4:icmp", "0.0.0.0")
@@ -46,6 +46,31 @@ func NewPinger(ctx context.Context, reflectors []string) (*Pinger, error) {
 	return &Pinger{conn: conn, id: binary.BigEndian.Uint16(id[:]), reflectors: reflectors}, nil
 }
 
+// reflectorAddrs is each reflector in the one spelling a reply's source takes,
+// once. A reply is matched to its probe by that spelling, so a reflector named
+// any other way (`::ffff:1.1.1.1` is IPv4 too) would never be answered and a
+// reflector named twice would be counted twice.
+func reflectorAddrs(reflectors []string) ([]string, error) {
+	addrs := make([]string, 0, len(reflectors))
+
+	for _, reflector := range reflectors {
+		ip := net.ParseIP(reflector).To4()
+		if ip == nil {
+			return nil, fmt.Errorf("reflector %q is not an IPv4 address", reflector)
+		}
+
+		if !slices.Contains(addrs, ip.String()) {
+			addrs = append(addrs, ip.String())
+		}
+	}
+
+	if len(addrs) == 0 {
+		return nil, errors.New("no reflector to measure the line against")
+	}
+
+	return addrs, nil
+}
+
 // Close closes the socket.
 func (p *Pinger) Close() error { return p.conn.Close() }
 
@@ -63,8 +88,8 @@ func (p *Pinger) Round(ctx context.Context, wait time.Duration) (map[string]time
 		at := time.Now()
 
 		if _, err := p.conn.WriteTo(echo(p.id, p.seq), addr); err != nil {
-			// ONE REFLECTOR UNREACHABLE IS AN UNANSWERED ONE, not a failed round:
-			// the delay is a median, and a lost answer already counts against it.
+			// ONE REFLECTOR UNREACHABLE IS AN UNANSWERED ONE, not a failed round: it
+			// is a lost probe, which the loss rule weighs beside the others.
 			continue
 		}
 

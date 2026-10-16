@@ -5,20 +5,50 @@
 // residential or office gateway holds one queue for everybody behind it: while
 // the fleet fills it, a call stutters and a game lags (the shared-uplink record).
 // The host cannot see the gateway's queue, but it can see what the queue does to
-// latency. The controller here shapes the host's own egress and ingress with
-// CAKE, and moves each rate from two observations: how far the round trip to a
-// few public reflectors has risen above its idle baseline, and how much the host
-// is moving in that direction.
+// a few public reflectors' answers. The controller here shapes the host's own
+// egress and ingress with CAKE, and moves each rate from three observations: how
+// far the round trip to the reflectors has risen above its idle baseline, how
+// many of their answers the line lost, and how much the host is moving in that
+// direction.
 //
 // The approach and most thresholds follow cake-autorate
 // (github.com/lynxthecat/cake-autorate), which has tuned them on routers for
-// years; no code is taken from it. Two things differ on purpose. Nothing about
-// the line is configured: cake-autorate needs a minimum, base and maximum rate
-// per direction, while this starts each direction unshaped at the interface's
-// speed and learns the line by cutting to below what was flowing when the
-// queue rose. And the delay that counts as a queue is 15 ms, not 30, because a
-// residential line measured 7 ms idle and 22 to 29 ms full: at 30 the lag a game
-// felt would never have been seen.
+// years; no code is taken from it. Three things differ on purpose. Nothing about
+// the line has to be configured: cake-autorate needs a minimum, base and maximum
+// rate per direction, while this starts each direction at a ceiling (the
+// interface's speed unless one is set) and learns the line by cutting to below
+// what was flowing when the queue rose. The delay that counts as a queue is
+// 15 ms, not 30, because a residential line measured 7 ms idle and 22 to 29 ms
+// full: at 30 the lag a game felt would never have been seen.
+//
+// And loss is a signal of its own. cake-autorate detects bufferbloat from delay
+// alone and treats a reflector's missing answers as the reflector misbehaving
+// (an answer later than a second is an offence, three offences in a minute
+// rotate the reflector out). That fits a gateway that queues. A gateway that
+// drops rather than queues barely moves the round trip as the line fills, and
+// loses packets instead: on one 500 Mbit/s site a host moving 378 Mbit/s down
+// and 180 up gave every device there 2.5% loss, and on another day the round
+// trip rose only about 11 ms while the host sent up to 888 Mbit/s and a laptop
+// behind the same gateway lost its connections (the shared-uplink record).
+// Delay-based transports answer loss as well as delay: LEDBAT (RFC 6817) backs
+// off on loss as TCP does, and BBRv2 takes loss above 2% in a round trip as the
+// line's limit. Three probes a round cannot resolve a rate like 2% in a few
+// seconds, so the rule is stated in reflectors and rounds, chosen so one broken
+// reflector and one stray drop are never enough: the line is dropping when at
+// least LossRounds of the last Window rounds lost a probe, the reflectors that
+// went unanswered in them are a strict majority of those counted, and this
+// round lost one too. Simulated with three reflectors and independent losses,
+// 10% probe loss is seen in about 5 s on average, 5% in about 13 s and 2.5% in
+// about 40 s; a background loss of 0.1% sets it off by chance about once in
+// five hours (0.5%, about every eleven minutes), and even then it cuts only a
+// direction busy with traffic of its own. A loss cut is the deepest one,
+// DeepCut, as TCP's halving and BBR's 0.7 are: a dropping line says the queue
+// has already overflowed, and gives no measure of by how much.
+//
+// A round whose delay was not measured, because most of the reflectors went
+// unanswered, is never read as a delay: it counts as neither delayed nor clear,
+// so it never raises a rate and cuts only by the loss rule. A round that counted
+// no reflector at all is a could-not-tell, and neither cuts nor raises.
 package uplink
 
 import "time"
@@ -33,10 +63,16 @@ type Params struct {
 	// the cut grows from GentleCut to DeepCut.
 	Severe time.Duration
 	// Window and Detect: the queue is taken to be full when at least Detect of
-	// the last Window samples were delayed, so one slow answer changes nothing.
+	// the last Window measured delays were delayed, so one slow answer changes
+	// nothing.
 	Window, Detect int
+	// LossRounds is how many of the last Window rounds must have lost a probe,
+	// from a strict majority of the reflectors between them, for the line to be
+	// taken as dropping: one round's blip, or one reflector that stopped
+	// answering, is never enough.
+	LossRounds int
 	// GentleCut and DeepCut are the fractions a busy direction is cut to, at a
-	// delay of Bloat and of Severe and beyond.
+	// delay of Bloat and of Severe and beyond; a cut on loss is DeepCut.
 	GentleCut, DeepCut float64
 	// Busy is the share of a direction's recent peak it must be moving to be
 	// blamed for a full queue: a delay that rises while the host is quiet is
@@ -49,9 +85,9 @@ type Params struct {
 	// than that could gain nothing from a cut, while one just above it, a
 	// saturated upload on a slow line, still can.
 	MinBlame float64
-	// Futile is how many cuts in a row may leave the delay no lower before a
-	// direction stops being cut until the queue clears: a cut that does not
-	// shorten the queue says the queue is not this host's.
+	// Futile is how many cuts in a row may leave the delay and the loss no
+	// lower before a direction stops being cut until the queue clears: a cut
+	// that does not shorten the queue says the queue is not this host's.
 	Futile int
 	// Cooldown is the least time between two cuts in one direction, so the
 	// queue a cut is meant to drain has the chance to drain before the next.
@@ -69,14 +105,16 @@ type Params struct {
 // DefaultParams are cake-autorate's defaults where they carry over (a window
 // of 6 with 3 delayed, cuts from 0.99 to 0.75 reaching the deepest at 60 ms, a
 // high-load share of 0.75, a raise of 1.04), with the threshold a residential
-// line calls for. The cooldown is longer than the two seconds throughput is
-// measured over, so a cut is never judged on traffic from before it.
+// line calls for and the loss rule the package comment explains. The cooldown
+// is longer than the two seconds throughput is measured over, so a cut is never
+// judged on traffic from before it.
 func DefaultParams() Params {
 	return Params{
 		Bloat:      15 * time.Millisecond,
 		Severe:     60 * time.Millisecond,
 		Window:     6,
 		Detect:     3,
+		LossRounds: 2,
 		GentleCut:  0.99,
 		DeepCut:    0.75,
 		Busy:       0.5,
@@ -97,23 +135,53 @@ const Floor = 10.0
 // helped, when a tenth of the delay is less.
 const improvement = 2 * time.Millisecond
 
+// Cause is what a step's cut was taken on.
+type Cause int
+
+const (
+	// CauseNone is a step that cut nothing.
+	CauseNone Cause = iota
+	// CauseDelay is a cut on a measured delay.
+	CauseDelay
+	// CauseLoss is a cut on probes the line lost.
+	CauseLoss
+	// CauseDelayAndLoss is a cut on both at once.
+	CauseDelayAndLoss
+)
+
+func (c Cause) String() string {
+	switch c {
+	case CauseDelay:
+		return "delay"
+	case CauseLoss:
+		return "loss"
+	case CauseDelayAndLoss:
+		return "delay and loss"
+	}
+
+	return "none"
+}
+
 // Direction is one direction's shaper.
 type Direction struct {
 	// Max is the rate the shaper starts at and never exceeds: the interface's
-	// own speed, at which CAKE holds nothing back.
+	// own speed, at which CAKE holds nothing back, or the ceiling configured
+	// below it.
 	Max float64
 	// Rate is the rate CAKE is set to now, in Mbit/s.
 	Rate float64
 
-	peak     float64
-	peakAt   time.Time
-	lastCut  time.Time
-	cutSince bool
-	cutDelay time.Duration
-	futile   int
+	peak          float64
+	peakAt        time.Time
+	lastCut       time.Time
+	cutSince      bool
+	cutDelay      time.Duration
+	cutDelayKnown bool
+	cutLoss       float64
+	futile        int
 }
 
-// NewDirection starts a direction unshaped, at the interface's own speed.
+// NewDirection starts a direction at its ceiling.
 func NewDirection(maxMbit float64) Direction {
 	if maxMbit < Floor {
 		maxMbit = Floor
@@ -129,11 +197,10 @@ type Observation struct {
 	Interval time.Duration
 	// SentBits and ReceivedBits are what the interface moved in Interval.
 	SentBits, ReceivedBits uint64
-	// Delay is how far the round trip has risen above its baseline, and
-	// DelayKnown whether the reflectors said anything at all: an unknown delay
-	// counts as neither delayed nor clear.
-	Delay      time.Duration
-	DelayKnown bool
+	// Sample is what the round's probes said. A delay that is not known counts
+	// as neither delayed nor clear, and a round with no probes measured
+	// nothing.
+	Sample
 }
 
 // Controller decides both directions' rates.
@@ -141,22 +208,96 @@ type Controller struct {
 	Params Params
 	Up     Direction
 	Down   Direction
+	// Cause is what the last step's cut was taken on, CauseNone when it cut
+	// nothing.
+	Cause Cause
 
 	recent []bool
+	losses []lossRound
+}
+
+// lossRound is one measured round's probes, for the loss window.
+type lossRound struct {
+	probes, lost int
+	missed       []string
+}
+
+// verdict is what one step's evidence says, the same for both directions.
+type verdict struct {
+	// full is a window that says the line is full, by delay or by loss.
+	full bool
+	// onDelay and onLoss are a full window whose evidence is there in this
+	// round too: a cut is taken only on a queue that is there now.
+	onDelay, onLoss bool
+	// clear is a round that measured the line and found no queue: a known delay
+	// under Bloat and no loss window.
+	clear bool
+	// lossShare is the share of the window's probes that went unanswered.
+	lossShare float64
+	cut       float64
 }
 
 // Step applies one observation and reports whether either rate changed.
 func (c *Controller) Step(o Observation) bool {
+	c.Cause = CauseNone
+
 	if o.Interval <= 0 {
 		return false
 	}
 
+	p := c.Params
+
 	if o.DelayKnown {
-		c.recent = append(c.recent, o.Delay > c.Params.Bloat)
-		if len(c.recent) > c.Params.Window {
-			c.recent = c.recent[len(c.recent)-c.Params.Window:]
+		c.recent = append(c.recent, o.Delay > p.Bloat)
+		if len(c.recent) > p.Window {
+			c.recent = c.recent[len(c.recent)-p.Window:]
 		}
 	}
+
+	if len(o.Probes) > 0 {
+		round := lossRound{probes: len(o.Probes)}
+
+		for _, probe := range o.Probes {
+			if probe.Lost {
+				round.lost++
+				round.missed = append(round.missed, probe.Reflector)
+			}
+		}
+
+		c.losses = append(c.losses, round)
+		if len(c.losses) > p.Window {
+			c.losses = c.losses[len(c.losses)-p.Window:]
+		}
+	}
+
+	v := c.judge(o)
+
+	seconds := o.Interval.Seconds()
+	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, v, o)
+	downChanged, downCut := c.step(&c.Down, float64(o.ReceivedBits)/seconds/1e6, v, o)
+
+	// A CUT IS JUDGED ON FRESH EVIDENCE: the samples that caused it are
+	// forgotten, so the next cut needs the windows to fill with delays and
+	// losses seen after it.
+	if upCut || downCut {
+		c.recent, c.losses = nil, nil
+
+		switch {
+		case v.onDelay && v.onLoss:
+			c.Cause = CauseDelayAndLoss
+		case v.onLoss:
+			c.Cause = CauseLoss
+		default:
+			c.Cause = CauseDelay
+		}
+	}
+
+	return upChanged || downChanged
+}
+
+// judge reads the windows and this round into what both directions act on.
+func (c *Controller) judge(o Observation) verdict {
+	p := c.Params
 
 	delayed := 0
 	for _, d := range c.recent {
@@ -165,21 +306,66 @@ func (c *Controller) Step(o Observation) bool {
 		}
 	}
 
-	full := delayed >= c.Params.Detect
-	cut := c.cutFactor(o.Delay)
+	delayFull := delayed >= p.Detect
+	dropping, share := c.dropping(o)
+	delayedNow := o.DelayKnown && o.Delay > p.Bloat
 
-	seconds := o.Interval.Seconds()
-	upChanged, upCut := c.step(&c.Up, float64(o.SentBits)/seconds/1e6, full, cut, o)
-	downChanged, downCut := c.step(&c.Down, float64(o.ReceivedBits)/seconds/1e6, full, cut, o)
-
-	// A CUT IS JUDGED ON FRESH EVIDENCE: the samples that caused it are
-	// forgotten, so the next cut needs the window to fill with delays seen after
-	// it.
-	if upCut || downCut {
-		c.recent = nil
+	v := verdict{
+		full:      delayFull || dropping,
+		onDelay:   delayFull && delayedNow,
+		onLoss:    dropping && o.Lost() > 0,
+		clear:     o.DelayKnown && !delayedNow && !dropping,
+		lossShare: share,
+		cut:       1,
 	}
 
-	return upChanged || downChanged
+	if v.onDelay {
+		v.cut = c.cutFactor(o.Delay)
+	}
+
+	if v.onLoss {
+		v.cut = min(v.cut, p.DeepCut)
+	}
+
+	return v
+}
+
+// dropping reports whether the loss window says the line is dropping, and the
+// share of the window's probes it lost. It needs both kinds of breadth: losses
+// in at least LossRounds rounds, so one instant's blip is not a full line, and
+// from a strict majority of this round's counted reflectors, so one reflector
+// that stopped answering is not either.
+func (c *Controller) dropping(o Observation) (bool, float64) {
+	probes, lost, rounds := 0, 0, 0
+	missed := map[string]bool{}
+
+	for _, r := range c.losses {
+		probes += r.probes
+		lost += r.lost
+
+		if r.lost > 0 {
+			rounds++
+		}
+
+		for _, reflector := range r.missed {
+			missed[reflector] = true
+		}
+	}
+
+	share := 0.0
+	if probes > 0 {
+		share = float64(lost) / float64(probes)
+	}
+
+	broad := 0
+
+	for _, probe := range o.Probes {
+		if missed[probe.Reflector] {
+			broad++
+		}
+	}
+
+	return rounds >= c.Params.LossRounds && 2*broad > len(o.Probes), share
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
@@ -199,7 +385,7 @@ func (c *Controller) cutFactor(delay time.Duration) float64 {
 
 // step moves one direction's rate, and reports whether it changed and whether
 // that was a cut.
-func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, o Observation) (bool, bool) {
+func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation) (bool, bool) {
 	p := c.Params
 
 	if moving >= d.peak || o.At.Sub(d.peakAt) > p.PeakWindow {
@@ -207,19 +393,19 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 	}
 
 	before := d.Rate
-	delayedNow := o.DelayKnown && o.Delay > p.Bloat
 
 	switch {
-	case full:
+	case v.full:
 		// BLAMED ONLY WHEN BUSY. The queue is the line's, and a direction carrying
 		// a trickle, or little of its own recent peak, is not what filled it.
 		if moving < p.MinBlame || moving < p.Busy*d.peak {
 			return false, false
 		}
 
-		// CUT ONLY ON A QUEUE THAT IS THERE NOW: a window full of delays the queue
-		// has since drained says nothing about the next second.
-		if !delayedNow {
+		// CUT ONLY ON A QUEUE THAT IS THERE NOW: a window full of delays or losses
+		// the queue has since drained says nothing about the next second, and a
+		// round that measured nothing says nothing at all.
+		if !v.onDelay && !v.onLoss {
 			return false, false
 		}
 
@@ -231,13 +417,14 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 		// is somebody else's, and cutting on would only take this host to the
 		// floor. Shorter means by a margin, because each reflector's baseline
 		// creeps toward a round trip held above it, so an unchanged queue reads a
-		// little lower every sample. And once futile, LATCHED until a clear sample
-		// ends the episode: over a minute the creep alone crosses any margin.
+		// little lower every sample; and a delay is compared only with a delay
+		// that was measured. And once futile, LATCHED until a clear sample ends
+		// the episode: over a minute the creep alone crosses any margin.
 		if d.futile >= p.Futile {
 			return false, false
 		}
 
-		if d.cutSince && o.Delay > d.cutDelay-max(improvement, d.cutDelay/10) {
+		if d.cutSince && !helped(d, v, o) {
 			d.futile++
 		} else {
 			d.futile = 0
@@ -250,20 +437,22 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 		// CUT BELOW WHAT IS FLOWING, not below the old rate: an unshaped direction
 		// starts at the interface's speed, far above anything the line carries,
 		// and only what is actually moving says where the line is.
-		d.Rate = clamp(min(d.Rate, moving)*cut, d.Max)
-		d.lastCut, d.cutSince, d.cutDelay = o.At, true, o.Delay
+		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
+		d.lastCut, d.cutSince = o.At, true
+		d.cutDelay, d.cutDelayKnown, d.cutLoss = o.Delay, o.DelayKnown, v.lossShare
 
 		return d.Rate != before, true
-	case moving >= p.Full*d.Rate && !delayedNow &&
+	case v.clear && moving >= p.Full*d.Rate &&
 		(!d.cutSince || o.At.Sub(d.lastCut) >= p.Cooldown):
 		// PROBED UPWARD ONLY WHILE THE RATE IS WHAT HOLDS THE TRAFFIC BACK and this
-		// sample shows no queue, so a rate climbs back toward the line's speed as
-		// fast as the line allows and no faster. NOT WITHIN THE COOLDOWN OF A CUT:
-		// the throughput window still holds the traffic from before it, which runs
-		// above any rate just cut and would undo the cut at once.
+		// round measured no queue, so a rate climbs back toward the line's speed as
+		// fast as the line allows and no faster, and never on a round that could
+		// not tell. NOT WITHIN THE COOLDOWN OF A CUT: the throughput window still
+		// holds the traffic from before it, which runs above any rate just cut and
+		// would undo the cut at once.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
 		d.futile = 0
-	case !delayedNow:
+	case v.clear:
 		// THE QUEUE CLEARED: a later one starts a new episode, and cuts are judged
 		// afresh. Not merely "not full": the window refills after every cut, and
 		// forgetting futility while it does would let cuts ratchet on regardless.
@@ -271,6 +460,17 @@ func (c *Controller) step(d *Direction, moving float64, full bool, cut float64, 
 	}
 
 	return d.Rate != before, false
+}
+
+// helped is whether the queue is shorter now than at the direction's last cut:
+// a measured delay lower by a margin than the measured delay then, or a smaller
+// share of the probes lost by a tenth.
+func helped(d *Direction, v verdict, o Observation) bool {
+	if o.DelayKnown && d.cutDelayKnown && o.Delay <= d.cutDelay-max(improvement, d.cutDelay/10) {
+		return true
+	}
+
+	return v.lossShare < d.cutLoss*0.9
 }
 
 func clamp(rate, maxMbit float64) float64 {
