@@ -86,6 +86,33 @@ func TestTheReleaseRefIsTheNearestReleaseOnTheFirstParentChain(t *testing.T) {
 			want: "v0.4.10",
 		},
 		{
+			// PAST WHAT A DOUBLE HOLDS, where awk's numbers call the two equal.
+			name: "two releases past 2^53 on one commit",
+			build: func(t *testing.T, repo string) {
+				t.Helper()
+
+				commit(t, repo, "Release")
+				fixtureGit(t, repo, "tag", "v0.4.9007199254740992")
+				fixtureGit(t, repo, "tag", "v0.4.9007199254740993")
+			},
+			want: "v0.4.9007199254740993",
+		},
+		{
+			// A COPY IS PASSED OVER, NOT AN ANSWER: the walk goes on to the tag
+			// the original carries further back.
+			name: "a release commit copied onto its own branch",
+			build: func(t *testing.T, repo string) {
+				t.Helper()
+
+				commit(t, repo, "Release v0.4.0")
+				fixtureGit(t, repo, "tag", "-a", "v0.4.0", "-m", "v0.4.0")
+				commit(t, repo, "a carry")
+				fixtureGit(t, repo, "cherry-pick", "--allow-empty", "v0.4.0")
+				commit(t, repo, "another carry")
+			},
+			want: "v0.4.0",
+		},
+		{
 			// NONE OF THESE IS A RELEASE: the moving major, a prerelease, a guest
 			// image, a name that is not a version, a leading zero, and a tag whose
 			// dots are not dots (what an unescaped pattern would admit).

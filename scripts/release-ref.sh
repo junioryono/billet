@@ -100,11 +100,15 @@ git log --first-parent --format='%H %s' HEAD >"$work/chain"
 # the first file is empty and FNR == NR holds for the chain as well.
 set +e
 ref=$(awk '
+	# BY DIGITS, NOT AS AWK NUMBERS, which are doubles and call two components
+	# past 2^53 equal. The pattern admits no leading zero, so the longer number
+	# is the larger, and two of one length compare as strings.
 	function newer(a, b,    x, y, i) {
 		split(substr(a, 2), x, ".")
 		split(substr(b, 2), y, ".")
 		for (i = 1; i <= 3; i++) {
-			if (x[i] + 0 != y[i] + 0) return x[i] + 0 > y[i] + 0
+			if (length(x[i]) != length(y[i])) return length(x[i]) > length(y[i])
+			if (x[i] "" != y[i] "") return x[i] "" > y[i] ""
 		}
 		return 0
 	}
