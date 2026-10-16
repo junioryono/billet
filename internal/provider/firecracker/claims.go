@@ -191,8 +191,9 @@ func (p *Provider) take(claim, jailID string) (bool, error) {
 // and without this the range would shrink by one on every such crash until a host
 // that has been up for months could not start a microVM at all.
 //
-// It reads the jail's own existence rather than a timestamp: a claim is free exactly
-// when the thing it was taken for is gone, which is a fact rather than a heuristic.
+// It reads the jail's own existence, and its lease's lifecycle authority, rather than
+// a timestamp: a claim is free exactly when the thing it was taken for is gone and no
+// teardown of it is unfinished, which are facts rather than a heuristic.
 func (p *Provider) reapClaim(claim string) bool {
 	raw, err := os.ReadFile(claim)
 	if err != nil {
@@ -206,7 +207,19 @@ func (p *Provider) reapClaim(claim string) bool {
 		return false
 	}
 
-	if _, found, err := p.findJail(strings.TrimSpace(string(raw))); err != nil || found {
+	holder := strings.TrimSpace(string(raw))
+
+	if _, found, err := p.findJail(holder); err != nil || found {
+		return false
+	}
+
+	// NOR WHILE ITS LEASE STILL HOLDS LIFECYCLE AUTHORITY. A teardown that could not
+	// finish keeps that record, and may have removed the jail and deliberately kept a
+	// claim: the name of a tap that would not go, and the uid that owns it. Reaping
+	// either on the jail's absence alone hands a launch a name the kernel will refuse
+	// and a uid that can open the stuck tap. Recovery (cleanupLifecycleOnly) is what
+	// releases those claims, once it has finished the teardown.
+	if _, err := os.Lstat(p.lifecycleFile(holder)); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 
@@ -366,7 +379,7 @@ func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID st
 		return resources{}, nil
 	}
 
-	ours, err := p.ownedByJail(owner, jailID)
+	ours, unclaimed, err := p.ownedByJail(owner, jailID)
 	if err != nil {
 		return held, err
 	}
@@ -379,33 +392,54 @@ func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID st
 	}
 
 	if err := p.deleteTap(ctx, res.Tap); err != nil {
-		return held, err
+		if !unclaimed {
+			return held, err
+		}
+
+		// THE UID THAT OWNS IT IS RESERVED FOR THIS JAIL, because nothing holds it: an
+		// earlier teardown released it and kept the name. Left free, the next launch
+		// could be given the one uid that can open this tap.
+		taken, takeErr := false, os.MkdirAll(p.claimsDir("uids"), 0o700)
+		if takeErr == nil {
+			taken, takeErr = p.take(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)), jailID+"\n")
+		}
+
+		if takeErr != nil || !taken {
+			return held, errors.Join(err, fmt.Errorf("firecracker: reserve uid %d, which owns %s: "+
+				"taken %v: %w", owner, res.Tap, taken, takeErr))
+		}
+
+		return resources{Tap: res.Tap, UID: owner, GID: owner}, err
 	}
 
 	return resources{}, nil
 }
 
-// ownedByJail reports whether a tap's owner is a jail uid that is this jail's, or
-// that no jail holds.
+// ownedByJail reports whether a tap's owner is billet's and this jail's to delete:
+// a uid this jail holds, or a jail uid no lease holds. The second answer says it was
+// the latter, so a teardown that cannot delete the tap knows to reserve that uid.
 //
-// A UID NO JAIL HOLDS STILL PROVES THE DEVICE IS BILLET'S: only billet hands out the
-// configured range, and only to a VMM's tap. It happens when a teardown that predates
-// keeping the uid with a stuck device released one and kept the other.
-func (p *Provider) ownedByJail(owner int, jailID string) (bool, error) {
-	if owner < p.cfg.JailUIDMin || owner >= p.cfg.JailUIDMin+p.cfg.JailUIDCount {
-		return false, nil
-	}
-
+// THIS JAIL'S OWN CLAIM IS READ FIRST, whatever the configured range says now, so a
+// range changed under a running microVM does not strand the tap it made.
+//
+// A UID NO JAIL HOLDS STILL PROVES THE DEVICE IS BILLET'S when it is in the range:
+// only billet hands those out, and only to a VMM's tap. It happens when a teardown
+// that predates keeping the uid with a stuck device released one and kept the other.
+func (p *Provider) ownedByJail(owner int, jailID string) (bool, bool, error) {
 	raw, err := os.ReadFile(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)))
-	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
+
+	switch {
+	case err == nil:
+		return strings.TrimSpace(string(raw)) == jailID, false, nil
+	case !errors.Is(err, os.ErrNotExist):
+		return false, false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
 	}
 
-	if err != nil {
-		return false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
+	if owner < p.cfg.JailUIDMin || owner >= p.cfg.JailUIDMin+p.cfg.JailUIDCount {
+		return false, false, nil
 	}
 
-	return strings.TrimSpace(string(raw)) == jailID, nil
+	return true, true, nil
 }
 
 // releasable is what a microVM held, less what a teardown must keep claimed.
@@ -414,7 +448,9 @@ func releasable(res, keep resources) resources {
 		res.Tap = ""
 	}
 
-	if keep.UID != 0 {
+	// THE KEPT UID IS THE ONE THAT OWNS THE DEVICE. When that is not the uid this
+	// microVM was given (removeTapLocked reserving an unclaimed owner), the given one owns nothing and goes back.
+	if keep.UID != 0 && keep.UID == res.UID {
 		res.UID, res.GID = 0, 0
 	}
 
@@ -537,7 +573,20 @@ func (p *Provider) claimedBy(jailID string) (resources, error) {
 
 		for _, entry := range entries {
 			raw, err := os.ReadFile(filepath.Join(p.claimsDir(kind), entry.Name()))
-			if err != nil || strings.TrimSpace(string(raw)) != jailID {
+			if err != nil {
+				// COULD NOT TELL WHOSE IT IS, so the inventory is incomplete, and
+				// releasing from an incomplete inventory would let lifecycle authority
+				// go while a claim of this jail's may remain. A claim gone since the
+				// listing is simply not there.
+				if !errors.Is(err, os.ErrNotExist) {
+					failures = append(failures, fmt.Errorf("firecracker: could not tell whose the claim %s is: %w",
+						filepath.Join(p.claimsDir(kind), entry.Name()), err))
+				}
+
+				continue
+			}
+
+			if strings.TrimSpace(string(raw)) != jailID {
 				continue
 			}
 

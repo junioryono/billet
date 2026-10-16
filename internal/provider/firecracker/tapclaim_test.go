@@ -320,6 +320,10 @@ func TestDestroyDeletesNoTapItCannotJudge(t *testing.T) {
 		})
 
 		assertCouldNotTell(t, h)
+
+		// AND AGAIN THROUGH ORPHAN CLEANUP, now the jail is gone: an inventory with a
+		// claim it cannot read is incomplete, and nothing is released from it.
+		assertCouldNotTell(t, h)
 	})
 
 	t.Run("a kernel that cannot answer", func(t *testing.T) {
@@ -403,5 +407,171 @@ func TestSysTapOwnerReadsTheKernelsAnswer(t *testing.T) {
 		if !tc.fails && (owner != tc.owner || present != tc.present) {
 			t.Errorf("sysTapOwnerIn(%q) = %d, %v, want %d, %v", tc.tap, owner, present, tc.owner, tc.present)
 		}
+	}
+}
+
+// AN UNFINISHED TEARDOWN'S CLAIMS ARE NOT REAPED. The jail is gone, which is the
+// reaper's old condition, but the lease still holds lifecycle authority, and the
+// claims it kept name a tap still on the host and the uid that owns it. The next
+// launch must take neither: with one uid in the range it is refused, and with two it
+// gets the other uid and the next name.
+func TestAClaimKeptByAnUnfinishedTeardownIsNotReaped(t *testing.T) {
+	t.Parallel()
+
+	for _, uids := range []int{1, 2} {
+		t.Run(strconv.Itoa(uids)+" uids", func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.p.cfg.JailUIDCount = uids
+			h.launch(t)
+			h.refuse = func(bin string, args []string) error {
+				if bin == ipBinary && slices.Contains(args, "del") {
+					return errors.New("RTNETLINK answers: Device or resource busy")
+				}
+
+				return nil
+			}
+
+			if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
+				t.Fatal("Destroy succeeded although the tap would not go")
+			}
+
+			if _, err := os.Stat(h.p.jailFor(theInstance).dir()); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the jail outlived the teardown, so this tests nothing: %v", err)
+			}
+
+			next := h.p.jailFor(otherLeaseOnAnotherStripe(t, theInstance))
+			if err := h.p.claim(next); err != nil {
+				t.Fatalf("claim the next jail: %v", err)
+			}
+
+			res, err := h.p.claimResources(next)
+
+			if uids == 1 {
+				if err == nil {
+					t.Errorf("the next launch was given %+v, including the uid that owns a stuck tap", res)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("claimResources for the next launch: %v", err)
+			}
+
+			if res.UID == 900000 || res.Tap == "bt-0" {
+				t.Errorf("the next launch was given %+v, taking a claim an unfinished teardown kept", res)
+			}
+		})
+	}
+}
+
+// A TAP AN EARLIER TEARDOWN KEPT WITHOUT ITS UID GETS THAT UID BACK. The claim names
+// the tap and no uid; the kernel says the tap is owned by a jail uid no lease holds.
+// If the device will not go, that uid is reserved for this jail, so no launch can be
+// given the one uid that opens the tap; once it goes, both are released.
+func TestAnUnclaimedOwnerOfAStuckTapIsReservedUntilTheTapGoes(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	dir := h.p.claimsDir("taps")
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "bt-3"), []byte(theInstance+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h.putDevice("bt-3", 900003)
+	h.refuse = func(bin string, args []string) error {
+		if bin == ipBinary && slices.Contains(args, "del") {
+			return errors.New("RTNETLINK answers: Device or resource busy")
+		}
+
+		return nil
+	}
+
+	uid := filepath.Join(h.p.claimsDir("uids"), "900003")
+
+	// THE RECORD STILL NAMES THE UID, whose claim an earlier teardown released.
+	if err := h.p.releaseOrphaned(t.Context(), resources{Tap: "bt-3", UID: 900003, GID: 900003},
+		theInstance); err == nil {
+		t.Fatal("orphan cleanup succeeded although the tap would not go")
+	}
+
+	raw, err := os.ReadFile(uid)
+	if err != nil || strings.TrimSpace(string(raw)) != theInstance {
+		t.Fatalf("the uid owning the stuck tap = %q (%v), want it reserved for %s", raw, err, theInstance)
+	}
+
+	if !claimExists(t, filepath.Join(dir, "bt-3")) {
+		t.Error("the name of a tap still on the host went back to the pool")
+	}
+
+	// AND THE RETRY FINDS THE UID WITH THE NAME, and finishes.
+	h.refuse = nil
+
+	left, err := h.p.claimedBy(theInstance)
+	if err != nil || left.UID != 900003 || left.Tap != "bt-3" {
+		t.Fatalf("claimedBy = %+v (%v), want bt-3 and uid 900003", left, err)
+	}
+
+	if err := h.p.releaseOrphaned(t.Context(), left, theInstance); err != nil {
+		t.Fatalf("the retried orphan cleanup: %v", err)
+	}
+
+	if h.hasDevice("bt-3") || claimExists(t, uid) || claimExists(t, filepath.Join(dir, "bt-3")) {
+		t.Error("the retried orphan cleanup did not delete the tap and release both claims")
+	}
+}
+
+// A RANGE CHANGED UNDER A RUNNING MICROVM DOES NOT STRAND ITS TAP. The uid it was
+// given is no longer in the configured range, but its claim still names this jail.
+func TestATapOutlivesAChangeOfTheJailUIDRange(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+	h.p.cfg.JailUIDMin = 910000
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if h.hasDevice("bt-0") {
+		t.Error("Destroy left the tap its launch made because the range moved")
+	}
+}
+
+// AND THE UID A MICROVM WAS GIVEN GOES BACK WHEN IT IS NOT THE ONE THAT OWNS THE TAP.
+// Only the owner can open the device; holding the other would shrink the range for
+// nothing.
+func TestOnlyTheUIDThatOwnsAStuckTapIsKept(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+	h.putDevice("bt-0", 900003)
+	h.refuse = func(bin string, args []string) error {
+		if bin == ipBinary && slices.Contains(args, "del") {
+			return errors.New("RTNETLINK answers: Device or resource busy")
+		}
+
+		return nil
+	}
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
+		t.Fatal("Destroy succeeded although the tap would not go")
+	}
+
+	if claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900000")) {
+		t.Error("the uid this microVM was given, which owns nothing, was kept")
+	}
+
+	if !claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900003")) {
+		t.Error("the uid that owns the stuck tap was not reserved")
 	}
 }

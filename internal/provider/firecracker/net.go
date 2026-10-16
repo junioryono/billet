@@ -114,21 +114,21 @@ func sysTapOwnerIn(root, tap string) (int, bool, error) {
 
 	dev := filepath.Join(root, tap)
 
-	if _, err := os.Lstat(dev); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, false, nil
-		}
-
-		return 0, false, err
-	}
-
 	raw, err := os.ReadFile(filepath.Join(dev, "owner"))
 	if errors.Is(err, os.ErrNotExist) {
-		if _, statErr := os.Lstat(dev); errors.Is(statErr, os.ErrNotExist) {
-			return 0, false, nil
-		}
+		// NO OWNER FILE IS EITHER NO DEVICE OR A DEVICE THAT IS NOT A TAP, and only the
+		// device's own entry tells them apart; a look that failed some other way could
+		// not tell.
+		_, statErr := os.Lstat(dev)
 
-		return -1, true, nil
+		switch {
+		case statErr == nil:
+			return -1, true, nil
+		case errors.Is(statErr, os.ErrNotExist):
+			return 0, false, nil
+		default:
+			return 0, false, statErr
+		}
 	}
 
 	if err != nil {

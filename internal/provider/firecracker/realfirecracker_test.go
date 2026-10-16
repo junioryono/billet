@@ -184,6 +184,14 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	name := provider.InstanceName(env.lease)
 	rootCapacity := env.disk.growthCapacity(t, env.image)
 
+	// A BACKSTOP FOR AN ASSERTION THAT STOPS THE TEST before its own Destroy: this
+	// node runs jobs beside it. Destroy of a microVM already gone is success.
+	t.Cleanup(func() {
+		if _, err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
 	if _, err := p.Launch(t.Context(), provider.Spec{
 		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: rootCapacity,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
