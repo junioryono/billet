@@ -482,6 +482,7 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/known-answer-job.sh", "none"},
 		{"scripts/power-log.sh", "none"},
 		{"scripts/power-summary.sh", "none"},
+		{"scripts/verify-changed.sh", "none"},
 		{"scripts/knownanswer/testdata/power-log/power.csv", "none"},
 		{"scripts/knownanswer/check.go", families("lint", "postgres")},
 		{".claude/settings.json", "none"},

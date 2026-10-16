@@ -49,22 +49,27 @@ Layering is enforced by `depguard` in `.golangci.yml`, not by convention: `confi
 ## Commands
 
 ```bash
-make check       # the pre-commit gate, one run per user at a time across projects (a shared lock): no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources
+make verify      # THE CHECK WHILE WORKING: gofmt, go build ./..., then vet, tests (no -race) and golangci-lint on the changed packages only; says what it ran and why
 make build       # ./bin/billet
+make docs        # Sphinx with -W, as CI and Read the Docs run it (15 s); make verify runs it when docs/ changed and sphinx-build is installed
+make sqlc        # regenerate internal/state/ledgerdb after editing queries/ or adding a migration
+make sqlc-check  # prove the committed query code is what the pinned sqlc generates
+make tf-fmt-check tf-validate tf-test tf-lint tf-scan   # the terraform gates, which CI runs on a .tf change; they need make tools
+make bench       # the allocator's and the node wire's benchmarks; a change to escrow, placement or renewal shows benchstat before and after
+make fuzz        # search past every fuzz target's seeds, FUZZTIME each (default 1m); the seeds already run in the suite
+make tools       # install the pinned golangci-lint, goreleaser, sqlc, tflint, trivy
+
+# THE FULL GATE. CI runs it on every push; the hook refuses it to a session unless CLAUDE_FULL_CHECKS=1.
+make check       # no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources, one run per user at a time (a shared lock); bare `make` is this
 make test        # go test -race -count=1 -covermode=atomic ./...   (coverage counters are part of the gate; they reorder goroutines; locally -p 4 under nice)
 make lint        # golangci-lint for the host AND GOOS=linux (a linter only sees files it would compile)
 make lint-custom # tools/lint: build, run its own tests, run billetlint for darwin/arm64 and linux/amd64
-make bench       # the allocator's and the node wire's benchmarks; a change to escrow, placement or renewal shows benchstat before and after
-make fuzz        # search past every fuzz target's seeds, FUZZTIME each (default 1m); the seeds already run in make test
-make cross       # build linux/amd64, linux/arm64, darwin/arm64 — before anything touching a build tag
-make docs        # Sphinx with -W, as CI and Read the Docs run it — after any change under docs/
-make sqlc        # regenerate internal/state/ledgerdb after editing queries/ or adding a migration
-make sqlc-check  # prove the committed query code is what the pinned sqlc generates
-make tf-fmt-check tf-validate tf-test tf-lint tf-scan   # before pushing a .tf change
-make tools       # install the pinned golangci-lint, goreleaser, sqlc, tflint, trivy
+make cross       # build linux/amd64, linux/arm64, darwin/arm64, which CI's lint job runs for a build-tag change
 ```
 
-`make check` must be clean before every commit. What is outside it is outside for a stated reason, in the Makefile: the terraform gates need tools installed; `sqlc` is committed so an ordinary build never downloads it; `dist`, `acceptance`, the rehearsals and `systemd-lifecycle` need a package, a real account or a real service manager. CI runs all of that too, so a green `check` is necessary rather than sufficient. A lint failure is fixed at the cause, never suppressed without a reason.
+**Verify narrowly here; CI runs the full gate.** While working, run `make verify`: it reads what this checkout changed against its merge base with origin/main (commits, staged, unstaged and untracked files) and runs gofmt on the changed Go files, `go build ./...`, and `go vet`, `go test` (without `-race`, at `-p 2` and `GOMAXPROCS=4`) and golangci-lint for this platform on the changed packages. Run a new or changed test by name, `go test -run '^TestName$' ./internal/<pkg>`; a concurrency test may run under `-race` on its own package. For a build-tag change, `GOOS=linux GOARCH=amd64 go vet ./internal/<pkg>` covers the other platform. Do not run the full gates locally: `make check` (bare `make` is the same), `make test`, `make lint`, `make lint-custom`, `make cross`, `go test ./...`, `-race` across several packages, golangci-lint over the whole module, or golangci-lint on a file (packages only). CI runs all of that and more on every push; read it with `gh pr checks <n> --watch` and `gh run view <id> --log-failed`, and fix what it reports. The reason is measured on a 32 GiB development Mac on 2026-10-15: it kernel-panicked under memory pressure while sessions ran full gates side by side, and a targeted check costs a fraction (one package's tests 28 s and 0.9 GiB, the same under `-race` 491 s, golangci-lint on one package 10 s and 1.6 GiB against 52 s and 2.6 GiB for the module). `.claude/hooks/guard.py` refuses the full gates to a session; a person who wants `make check` here starts Claude Code with `CLAUDE_FULL_CHECKS=1` in its environment, and a prefix on the command does not lift it. Subagents follow the same rule. A directory's `CLAUDE.md` names the gates CI must pass there; locally, `make verify` runs the part of them that covers the change.
+
+What is outside `make check` is outside for a stated reason, in the Makefile: the terraform gates need tools installed; `sqlc` is committed so an ordinary build never downloads it; `dist`, `acceptance`, the rehearsals and `systemd-lifecycle` need a package, a real account or a real service manager. CI runs all of that too. A lint failure is fixed at the cause, never suppressed without a reason.
 
 ## Skills
 
@@ -73,7 +78,7 @@ Load the skill before starting, not after being stuck. Each holds rules that cos
 | Skill | Load it when |
 |---|---|
 | `billet-git-flow` | branching, committing, pushing, opening a PR |
-| `billet-checks-and-lint` | `make check` or a linter fails; adding an import across a layer; touching `.golangci.yml`, `tools/lint`, the Makefile or a build tag |
+| `billet-checks-and-lint` | `make verify`, CI or a linter fails; adding an import across a layer; touching `.golangci.yml`, `tools/lint`, the Makefile or a build tag |
 | `billet-testing` | writing or changing any test; a test passes suspiciously; a probe on this Mac |
 | `billet-shell-gates` | editing any `.sh`, any Go that emits shell, or any gate whose verdict is an exit status |
 | `billet-config` | `internal/config`, `internal/initconfig`, `billet.yaml`, `billet init`, tier/node/site validation |
@@ -109,7 +114,7 @@ Eleven directories carry a short `CLAUDE.md` of their own (`internal/state`, `in
 
 ## Hooks
 
-`.claude/settings.json` runs `.claude/hooks/guard.py` around Claude Code's tools. Before an edit it refuses `internal/state/ledgerdb/` (generated by sqlc), a migration file that already exists on main (its checksum is frozen in every deployment), and the Codex symlink paths; before a shell command it refuses what the git flow forbids (a force-push, a rebase, a push to main, a commit on main); after an edit to a Go file it runs gofmt. It reads the repository as it is, never as a command line would leave it, so a call that both switches branch and commits or pushes is refused (run them as two calls), and a push must name what it pushes (`git push -u origin <branch>`). A refusal names the rule it holds, and a question it cannot answer (no main to tell whether a migration is published) refuses rather than allows. `scripts/claude_hooks_test.go` executes every rule against throwaway repositories.
+`.claude/settings.json` runs `.claude/hooks/guard.py` around Claude Code's tools. Before an edit it refuses `internal/state/ledgerdb/` (generated by sqlc), a migration file that already exists on main (its checksum is frozen in every deployment), and the Codex symlink paths; before a shell command it refuses what the git flow forbids (a force-push, a rebase, a push to main, a commit on main), the full gates (`make check`, bare `make`, `make test`, `make lint`, `make lint-custom`, `make cross`, `go test` over `./...` or with `-race` across several packages, golangci-lint over the whole module or on a file) unless Claude Code was started with `CLAUDE_FULL_CHECKS=1`, and a `git worktree add` outside `.claude/worktrees/` or a Claude scratchpad; after an edit to a Go file it runs gofmt. It reads the repository as it is, never as a command line would leave it, so a call that both switches branch and commits or pushes is refused (run them as two calls), and a push must name what it pushes (`git push -u origin <branch>`). A refusal names the rule it holds, and a question the git rules cannot answer (no main to tell whether a migration is published) refuses rather than allows; the gate and worktree rules are the exception and let through what they cannot read, and a `CI` environment skips them. `scripts/claude_hooks_test.go` executes every rule against throwaway repositories.
 
 ## House rules
 
@@ -128,6 +133,8 @@ Types and functions get a doc comment cut to what the name does not already say.
 ## Working style
 
 Deliver what was asked, at the scope asked. Make routine judgment calls yourself and check in only when two readings of the request would produce materially different work. If the request looks mistaken, say so in a sentence and continue rather than quietly narrowing or widening it. Prefer reading a whole file over sampling it; most mistakes in this repository's history came from patching a region without seeing what surrounded it. Delegate to a subagent only for a genuinely independent, wide investigation, never for work a handful of tool calls finishes and never to double-check your own work. Report what happened, not what should have happened: if a test fails, say so and show the output; if you skipped part of a task, say which part.
+
+**Worktrees live under the main checkout's `.claude/worktrees/`**, never beside the repository in `../` and never in `/tmp`: `git worktree add .claude/worktrees/<name> -b <branch> origin/main`. The directory is ignored by git and excluded from lint, so a parked worktree never reaches another session's diff or lint pass; a Claude scratchpad is the one other place the hook accepts. Work only in your own worktree, and never edit the main checkout another session is using.
 
 The architecture program is tracked in #356: one assembly, a use-case layer, a pinned wire, and skills that load fast. A PR that is part of it says `Part of #356` and, in the session it merges, updates that issue's Progress table with its status, its link and what it measured; a finding that changes the plan is written into the issue body, with a dated line under Plan changes, before the PR that acts on it.
 

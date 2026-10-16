@@ -13,6 +13,15 @@ predict what a command line will do to the repository before a later command
 runs: a call that both changes branch and commits or pushes is refused and split
 into two calls, and a push must name what it pushes, so every judgement reads
 the repository as it really is.
+
+The bash mode also refuses the full gates (`make check` and its kin, `go test`
+over the whole tree or with -race across packages, golangci-lint over the whole
+module) and a worktree made outside .claude/worktrees/. Those judgements are the
+opposite of the git ones on one point: a command line they cannot read is let
+through, because a session that cannot run a command it needs is worse off than
+one that runs a gate CI would have run anyway. CLAUDE_FULL_CHECKS=1 in the hook's
+own environment, which is the one Claude Code was started with, lifts the gate
+refusals; a CI environment skips the new judgements altogether.
 """
 import json
 import os
@@ -185,7 +194,11 @@ WRAPPERS = {
     "nohup": set(),
     "time": {"-f", "-o"},
     "builtin": set(),
+    "timeout": {"-s", "--signal", "-k", "--kill-after"},
+    "gtimeout": {"-s", "--signal", "-k", "--kill-after"},
 }
+# Wrappers whose first operand is not the program but a value of their own.
+WRAPPER_OPERAND = {"timeout", "gtimeout"}
 HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
 RESERVED = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "fi", "done"}
 COMMENT_STARTS = " \t\n;&|()"
@@ -320,6 +333,8 @@ def unwrap(words):
                     chdir = value
         if words and words[0] == "--":
             words = words[1:]
+        if name in WRAPPER_OPERAND and words:
+            words = words[1:]
     return words, chdir
 
 
@@ -358,11 +373,13 @@ def parse_git(words, cwd):
 
 
 class Shell:
-    """The git calls a command line makes, gathered first and judged together."""
+    """The git calls a command line makes, gathered first and judged together, and
+    every simple command it runs with the directory it runs in."""
 
-    def __init__(self, cwd, calls=None):
+    def __init__(self, cwd, calls=None, commands=None):
         self.cwd = cwd
         self.calls = calls if calls is not None else []
+        self.commands = commands if commands is not None else []
 
     def gather(self, text):
         parsed = simple_commands(text)
@@ -387,7 +404,7 @@ class Shell:
             if program in SHELLS:
                 for i, a in enumerate(words[1:], start=1):
                     if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", a) and i + 1 < len(words):
-                        Shell(cwd, self.calls).gather(words[i + 1])
+                        Shell(cwd, self.calls, self.commands).gather(words[i + 1])
                         break
                 continue
             if program == "cd":
@@ -396,6 +413,7 @@ class Shell:
                 elif words[1] != "-":
                     self.cwd = os.path.join(self.cwd, os.path.expanduser(words[1]))
                 continue
+            self.commands.append((words, cwd))
             call = parse_git(words, cwd)
             if call:
                 self.calls.append(call)
@@ -450,6 +468,8 @@ def judge_git(call):
         judge_push(call)
     if sub == "commit" and current_branch(repo) == DEFAULT_BRANCH:
         refuse(f"billet never commits to {DEFAULT_BRANCH}; create a branch first (billet-git-flow).")
+    if sub == "worktree" and args[:1] == ["add"] and not os.environ.get("CI"):
+        judge_worktree_add(call)
 
 
 def current_branch(repo):
@@ -499,16 +519,240 @@ def judge_push(call):
             refuse(f"billet never pushes to {DEFAULT_BRANCH}; push a branch and open a pull request.")
 
 
+WORKTREE_VALUE_OPTIONS = {"-b", "-B", "--reason"}
+SCRATCHPAD = re.compile(r"/(private/)?tmp/claude-[^/]+/(.+/)?scratchpad(/.*)?")
+
+
+def worktree_home(path):
+    """True when path is inside some .claude/worktrees/ or a Claude scratchpad."""
+    parts = path.split(os.sep)
+    for i in range(len(parts) - 2):
+        if parts[i] == ".claude" and parts[i + 1] == "worktrees" and parts[i + 2]:
+            return True
+    return bool(SCRATCHPAD.fullmatch(path))
+
+
+def judge_worktree_add(call):
+    """Refuse a worktree made anywhere but .claude/worktrees/ or a scratchpad. A
+    path it cannot work out is let through."""
+    try:
+        rest, path = call.args[1:], None
+        while rest:
+            a = rest.pop(0)
+            if a == "--":
+                path = rest[0] if rest else None
+                break
+            if a in WORKTREE_VALUE_OPTIONS:
+                rest = rest[1:]
+            elif not a.startswith("-"):
+                path = a
+                break
+        if not path:
+            return
+        lexical = os.path.normpath(os.path.join(call.repo, os.path.expanduser(path)))
+        if worktree_home(lexical) or worktree_home(os.path.realpath(lexical)):
+            return
+    except (OSError, ValueError):
+        return
+    refuse(
+        f"billet hook: {path} is outside .claude/worktrees/. Worktrees live under the main checkout's "
+        ".claude/worktrees/ (or a Claude scratchpad), never beside the repository or in /tmp: "
+        "`git worktree add .claude/worktrees/<name> -b <branch> origin/main`."
+    )
+
+
+# ---------------------------------------------------------------- full gates
+
+BILLET_MODULE = "github.com/junioryono/billet"
+GATE_ADVICE = (
+    "Run `make verify` instead: it checks what this checkout changed (gofmt, build, vet, the changed packages' "
+    "tests without -race, golangci-lint on those packages). CI runs the full gate on every push; read it with "
+    "`gh pr checks <n> --watch`. A person who wants the full gate here starts Claude Code with "
+    "CLAUDE_FULL_CHECKS=1 in its environment."
+)
+MAKE_PROGRAMS = {"make", "gmake"}
+FULL_GATE_TARGETS = {"check", "check-unlocked", "test", "cover", "lint", "lint-custom", "lint-fix", "cross"}
+MAKE_VALUE_OPTIONS = {
+    "-C", "-f", "-I", "-o", "-W", "--directory", "--file", "--makefile", "--include-dir", "--old-file",
+    "--assume-old", "--what-if", "--new-file", "--assume-new",
+}
+MAKE_OTHER_MAKEFILE = {"-C", "-f", "--directory", "--file", "--makefile"}
+MAKE_DRY_RUN = {"--dry-run", "--just-print", "--recon", "--question", "--touch"}
+GO_TEST_VALUE_FLAGS = {
+    "run", "skip", "bench", "benchtime", "count", "cpu", "parallel", "timeout", "coverprofile", "covermode",
+    "coverpkg", "blockprofile", "blockprofilerate", "cpuprofile", "memprofile", "memprofilerate", "mutexprofile",
+    "mutexprofilefraction", "outputdir", "trace", "fuzz", "fuzztime", "fuzzminimizetime", "list", "shuffle", "vet",
+    "exec", "o", "p", "tags", "ldflags", "gcflags", "asmflags", "mod", "modfile", "overlay", "pgo", "pkgdir",
+    "toolexec", "installsuffix", "C", "compiler", "gccgoflags", "debug-actiongraph", "debug-runtime-trace",
+    "debug-trace",
+}
+GOLANGCI_VALUE_FLAGS = {
+    "-c", "--config", "-j", "--concurrency", "--timeout", "--build-tags", "--path-prefix", "--path-mode", "-E",
+    "--enable", "-D", "--disable", "--enable-only", "--default", "--new-from-rev", "--new-from-patch",
+    "--max-issues-per-linter", "--max-same-issues", "--modules-download-mode", "--go", "--color",
+    "--cpu-profile-path", "--mem-profile-path", "--trace-path", "--output.text.path", "--output.json.path",
+    "--output.tab.path", "--output.html.path", "--output.checkstyle.path", "--output.code-climate.path",
+    "--output.junit-xml.path", "--output.teamcity.path", "--output.sarif.path",
+}
+
+
+def billet_root(directory):
+    """True when directory holds billet's root go.mod; False when it does not or
+    cannot be read."""
+    try:
+        with open(os.path.join(directory, "go.mod"), encoding="utf-8") as f:
+            for line in f:
+                words = line.split()
+                if words[:1] == ["module"]:
+                    return words[1:2] == [BILLET_MODULE]
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def whole_tree(pattern, cwd):
+    """True when a package pattern names every package of billet's module."""
+    if pattern in ("all", BILLET_MODULE + "/..."):
+        return True
+    return pattern in ("./...", "...") and billet_root(cwd)
+
+
+def judge_make(words):
+    targets, other_makefile, dry, i = [], False, False, 1
+    while i < len(words):
+        w = words[i]
+        i += 1
+        if w == "--":
+            targets.extend(x for x in words[i:] if "=" not in x)
+            break
+        if w.startswith("--"):
+            name = w.partition("=")[0]
+            other_makefile = other_makefile or name in MAKE_OTHER_MAKEFILE
+            dry = dry or name in MAKE_DRY_RUN
+            if "=" not in w and name in MAKE_VALUE_OPTIONS:
+                i += 1
+            continue
+        if w.startswith("-") and len(w) > 1:
+            for j, letter in enumerate(w[1:], start=1):
+                if letter in "nqt":
+                    dry = True
+                if letter in "CfIoWjlO":
+                    other_makefile = other_makefile or letter in "Cf"
+                    if letter in "CfIoW" and j == len(w) - 1:
+                        i += 1  # the value is the next word
+                    break
+            continue
+        if "=" in w:
+            continue
+        targets.append(w)
+    if dry:
+        return
+    gates = [t for t in targets if t in FULL_GATE_TARGETS]
+    if gates:
+        refuse(f"billet hook: `make {gates[0]}` is a full gate, which CI runs on every push. {GATE_ADVICE}")
+    if not targets and not other_makefile:
+        refuse(f"billet hook: a bare `make` runs the default goal, `check`, the full gate. {GATE_ADVICE}")
+
+
+def judge_go_test(words, cwd):
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        if words[i] == "-C" and i + 1 < len(words):
+            cwd = os.path.join(cwd, words[i + 1])
+            i += 1
+        elif words[i].startswith("-C="):
+            cwd = os.path.join(cwd, words[i][3:])
+        i += 1
+    if words[i : i + 1] != ["test"]:
+        return
+    rest, race, packages, j = words[i + 1 :], False, [], 0
+    while j < len(rest):
+        a = rest[j]
+        j += 1
+        if a in ("-args", "--args"):
+            break
+        if a.startswith("-"):
+            name, eq, value = a.lstrip("-").partition("=")
+            if name == "race":
+                race = not eq or value.lower() in ("1", "t", "true")
+            elif name == "C":
+                cwd = os.path.join(cwd, value if eq else (rest[j] if j < len(rest) else ""))
+            if not eq and name in GO_TEST_VALUE_FLAGS:
+                j += 1
+            continue
+        packages.append(a)
+    if any(whole_tree(p, cwd) for p in packages):
+        refuse(f"billet hook: `go test` over the whole tree is the full suite, which CI runs on every push. "
+               f"{GATE_ADVICE}")
+    if race and (len(packages) > 1 or any("..." in p for p in packages)):
+        refuse("billet hook: `go test -race` across several packages costs what the full gate costs (-race made "
+               "internal/alloc 21x slower, 23 s against 491 s, 2026-10-15); CI runs the race suite. Run the tests "
+               f"without -race, or -race on one package with -run. {GATE_ADVICE}")
+
+
+def judge_golangci(words, cwd):
+    args = words[1:]
+    run_at = next((k for k, a in enumerate(args) if not a.startswith("-")), None)
+    if run_at is None or args[run_at] != "run":
+        return
+    rest, packages, j = args[run_at + 1 :], [], 0
+    while j < len(rest):
+        a = rest[j]
+        j += 1
+        if a == "--allow-parallel-runners":
+            refuse("billet hook: golangci-lint takes --allow-serial-runners, never --allow-parallel-runners: "
+                   "its machine-wide lock is what keeps several sessions' lint runs from starving the machine "
+                   "together.")
+        if a.startswith("-"):
+            if "=" not in a and a in GOLANGCI_VALUE_FLAGS:
+                j += 1
+            continue
+        packages.append(a)
+    if not packages or any(whole_tree(p, cwd) for p in packages):
+        refuse("billet hook: golangci-lint over the whole module is part of the full gate, which CI runs on every "
+               f"push (52 s and 2.6 GiB here). Lint the changed packages: `golangci-lint run "
+               f"--allow-serial-runners ./internal/<pkg>`. {GATE_ADVICE}")
+    files = [p for p in packages if p.endswith(".go")]
+    if files:
+        refuse(f"billet hook: lint packages, never files: golangci-lint on {files[0]} type-checks it without the "
+               "rest of its package (22 bogus `undefined` errors on one file, 2026-10-15). Name its directory: "
+               "`golangci-lint run --allow-serial-runners ./<dir>`.")
+
+
+def judge_gates(commands):
+    """Refuse the full gates; lifted by CLAUDE_FULL_CHECKS=1 in the hook's own
+    environment and skipped under CI. Anything that cannot be judged passes."""
+    if os.environ.get("CI") or os.environ.get("CLAUDE_FULL_CHECKS") == "1":
+        return
+    for words, cwd in commands:
+        try:
+            program = os.path.basename(words[0])
+            if program in MAKE_PROGRAMS:
+                judge_make(words)
+            elif program == "go":
+                judge_go_test(words, cwd)
+            elif program == "golangci-lint":
+                judge_golangci(words, cwd)
+        except (IndexError, OSError, ValueError):
+            continue
+
+
 def judge_bash(payload):
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         raise CannotTell("the hook input carries no tool_input object")
     text = text_field(tool_input, "command") or ""
-    if "git" not in text:
-        return
     shell = Shell(text_field(payload, "cwd") or project_root(payload))
-    shell.gather(text)
-    judge_calls(shell.calls)
+    if "git" in text:
+        shell.gather(text)
+        judge_calls(shell.calls)
+    else:
+        # Nothing the git judgements hold: what cannot be read here passes.
+        try:
+            shell.gather(text)
+        except Exception:  # noqa: BLE001 - the gate judgements fail open
+            return
+    judge_gates(shell.commands)
 
 
 # ---------------------------------------------------------------- format

@@ -7,4 +7,4 @@ The host's commands: `billet check` and its preflights, `local up|down|status|ba
 - `convergeguardgatecrash.go` builds only under the `billetgatecrash` tag the collection's gate uses, and `convergeguard_dev_linux.go`, `convergeguard_scan_linux.go` and `releaseinspect_linux.go` only on Linux: `make lint` and `make cross` see them, a darwin `go vet` does not.
 - The retirement tests (`^TestRetirement`) need PostgreSQL and run in CI's retirement shards, which `scripts/check-retirement-shards.py` partitions from this directory; the PostgreSQL command job runs the rest.
 
-Gates: `make check`; `make cross` before anything touching a build tag.
+Gates (CI runs them on every push; locally, `make verify`): `make check`; `make cross` for anything touching a build tag, which locally is `GOOS=linux GOARCH=amd64 go vet ./internal/ops/host`.

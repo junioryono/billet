@@ -188,7 +188,7 @@ classify() {
 		.claude/settings.json | .claude/hooks/* | \
 		scripts/check-guest-image.sh | scripts/boot-guest-image.sh | scripts/check-module-sources.sh | \
 		scripts/run-runner-images.sh | scripts/runner-images/* | \
-		scripts/known-answer-job.sh | scripts/power-log.sh | scripts/power-summary.sh | \
+		scripts/known-answer-job.sh | scripts/power-log.sh | scripts/power-summary.sh | scripts/verify-changed.sh | \
 		scripts/knownanswer/testdata/*)
 		known=0
 		;;

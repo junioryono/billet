@@ -95,3 +95,17 @@ d1410b1ea27d The wire's newest version moved to 26 (VersionJobCounters); the sen
 c1296f9f64d5 Migrations 58 (job_counters) and 59 (job_destinations) were added; the sentence now counts 59 of each and is otherwise unchanged.
 7213c487ff95 The listener's renewal tests moved into a synctest bubble (#356 Phase 7) and the six seams this sentence named were deleted; conventions-and-concurrency.md states the bubble rule.
 baa6f9daf23c In a synctest bubble a pass's budget is on the fake clock and cannot run out while the pass works, so the TTL no longer has to be long for that reason.
+3af19018d9d9 A session no longer runs the race suite locally (2026-10-15 policy): the sentence now says CI runs it and a session runs its changed packages' tests through make verify.
+4a5b5cf7d452 billet-git-flow's pre-commit block now runs make verify; make check is the full gate CI runs on every push (2026-10-15 policy).
+5836c8dd9095 A session runs make verify and CI runs the full gate (2026-10-15 policy); the bullet now says so.
+5e523a56ffda Restated in billet-git-flow's make verify section: CI runs the full gate, with the same list of what it adds.
+7397a7c95f36 The PR floor is now make verify and a green CI run (2026-10-15 policy).
+7f65f63ad169 make check is no longer the pre-commit step a session runs; billet-git-flow now says CI is the full gate and how to read it.
+94eb6baa2f0d Restated as "All clean, every commit." of make verify in billet-git-flow.
+a90ff6d61567 The review loop now runs make verify between rounds (2026-10-15 policy).
+b53a4917572c make verify is deliberately weaker than CI; gate.md now says it is never read as a green gate, which only CI's run is.
+bb0ac45147df make cross is part of the full gate the hook refuses a session; restated as checking the other platform with GOOS=linux go vet, and CI's lint job running make cross.
+c1d37654415e The full gate's steps are now listed in billet-git-flow as what CI runs; the local step is make verify.
+e71e192ec55c make verify runs make docs for a docs/ change when Sphinx is installed, and otherwise says CI's docs job runs it.
+e8e645e2b725 The terraform gates are named by make verify and run by CI; billet-infra-terraform-ansible keeps the rule to run them before pushing a .tf change.
+ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10-15 policy); the sentence is restated with both.

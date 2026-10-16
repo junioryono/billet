@@ -1,7 +1,9 @@
 # billet — development commands.
 #
-# `make check` is the pre-commit gate. CI runs all of it, so a red check is a red
-# CI run — that is what makes the gate worth having. CI does MORE besides:
+# `make check` is the full gate. CI runs all of it on every push, so a red check is
+# a red CI run — that is what makes the gate worth having. While working, `make
+# verify` checks only what changed and CI runs the whole gate; `make check` stays
+# for a person who wants it locally. CI does MORE besides:
 # `go mod tidy` diff, coverage upload, govulncheck, cross-builds, the Ansible
 # role tests, and the terraform gates (tf-fmt-check/tf-validate/tf-test/tf-lint/
 # tf-scan — run those before pushing a .tf change). So a green check is
@@ -79,6 +81,16 @@ check: ## The pre-commit gate (CI runs this and more), one run at a time per mac
 
 .PHONY: check-unlocked
 check-unlocked: no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources ## The gate's steps, without the machine-wide lock
+
+# THE CHECK WHILE WORKING. It checks what this checkout changed against its merge
+# base with origin/main (VERIFY_BASE overrides): gofmt, the build, vet, tests
+# without -race and golangci-lint for this platform, on the changed packages
+# only, and it says what it ran and why. CI runs the full gate on every push, so
+# a session verifies narrowly here and reads CI; `check` stays for a person who
+# wants the whole gate on their own machine. See scripts/verify-changed.sh.
+.PHONY: verify
+verify: ## Check only what changed: gofmt, build, vet, tests (no -race) and lint of the changed packages
+	@$(NICE) scripts/verify-changed.sh
 
 .PHONY: build
 build: ## Build ./bin/billet

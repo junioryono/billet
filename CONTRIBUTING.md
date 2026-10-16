@@ -25,6 +25,7 @@ make check     # the pre-commit gate
 | Command | What it does | In `make check`? |
 |---|---|---|
 | `make check` | `no-mutants build vet fmt-check lint lint-custom test lambda-test module-sources` | it is the gate |
+| `make verify` | gofmt, `go build ./...`, then vet, tests without `-race` and golangci-lint on only the packages this checkout changed against origin/main; the check a Claude session runs while working, since CI runs the full gate on every push | no |
 | `make test` | `go test -race -count=1 -covermode=atomic ./...`; the coverage counters are part of the gate because they reorder goroutines | yes |
 | `make lint` | golangci-lint (pinned) for the host **and** for `GOOS=linux`, because a linter only sees the files it would compile | yes |
 | `make lint-custom` | build `tools/lint`, run its own tests, run `billetlint` for darwin/arm64 and linux/amd64 | yes |
