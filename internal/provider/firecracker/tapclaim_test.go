@@ -51,7 +51,7 @@ func TestDestroyDeletesOnlyADeviceTheKernelSaysIsBillets(t *testing.T) {
 		name               string
 		owner              int // -2: no device at all
 		deleted            bool
-		keepTap, keepUID   bool
+		keepTap            bool
 		claimTakenByOthers bool
 		claimGone          bool
 	}{
@@ -104,18 +104,18 @@ func TestDestroyDeletesOnlyADeviceTheKernelSaysIsBillets(t *testing.T) {
 				t.Errorf("the name bt-0 kept claimed = %v, want %v", got, tc.keepTap)
 			}
 
-			uid := filepath.Join(h.p.claimsDir("uids"), strconv.Itoa(ours))
-			if got := claimExists(t, uid); got != tc.keepUID {
-				t.Errorf("uid %d kept claimed = %v, want %v", ours, got, tc.keepUID)
+			if claimExists(t, filepath.Join(h.p.claimsDir("uids"), strconv.Itoa(ours))) {
+				t.Errorf("uid %d was kept claimed after its microVM was destroyed", ours)
 			}
 		})
 	}
 }
 
-// BILLET'S OWN DEVICE THAT WOULD NOT GO KEEPS ITS UID AS WELL AS ITS NAME. The uid
-// owns the tap still attached to the bridge, so a VMM given it could open that tap,
-// and a later teardown needs it to prove the device is billet's.
-func TestADeviceThatWouldNotGoKeepsItsUIDAndItsName(t *testing.T) {
+// BILLET'S OWN DEVICE THAT WOULD NOT GO IS FINISHED BY THE NEXT TEARDOWN. Destroy
+// keeps the name and gives the uid back, as it always has; orphan cleanup, once the
+// jail is gone, still proves the tap is billet's from an owner no lease holds, keeps
+// the name while the device stays, and deletes it once the kernel lets it go.
+func TestATapThatWouldNotGoIsFinishedByTheNextTeardown(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
@@ -128,56 +128,37 @@ func TestADeviceThatWouldNotGoKeepsItsUIDAndItsName(t *testing.T) {
 		return nil
 	}
 
+	tap := filepath.Join(h.p.claimsDir("taps"), "bt-0")
+
 	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
 		t.Fatal("Destroy succeeded although the tap would not go")
 	}
 
-	if !claimExists(t, filepath.Join(h.p.claimsDir("taps"), "bt-0")) {
+	if !claimExists(t, tap) {
 		t.Error("the name of a device still on the host went back to the pool")
 	}
 
-	if !claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900000")) {
-		t.Error("the uid owning a device still on the host went back to the pool")
-	}
-
-	// ORPHAN CLEANUP KEEPS BOTH TOO, now the jail is gone and only the claims say
-	// whose the device is.
 	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
 		t.Fatal("the orphan cleanup succeeded although the tap would not go")
 	}
 
-	for _, claim := range []string{
-		filepath.Join(h.p.claimsDir("taps"), "bt-0"),
-		filepath.Join(h.p.claimsDir("uids"), "900000"),
-	} {
-		if !claimExists(t, claim) {
-			t.Errorf("orphan cleanup gave back %s while its device is still on the host", claim)
-		}
+	if !claimExists(t, tap) {
+		t.Error("orphan cleanup gave back the name of a device still on the host")
 	}
 
-	// AND THE NEXT TEARDOWN FINISHES IT.
 	h.refuse = nil
 
 	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("the retried Destroy: %v", err)
 	}
 
-	if h.hasDevice("bt-0") {
-		t.Error("the retried Destroy left billet's device on the host")
-	}
-
-	for _, claim := range []string{
-		filepath.Join(h.p.claimsDir("taps"), "bt-0"),
-		filepath.Join(h.p.claimsDir("uids"), "900000"),
-	} {
-		if claimExists(t, claim) {
-			t.Errorf("the retried Destroy kept %s", claim)
-		}
+	if h.hasDevice("bt-0") || claimExists(t, tap) {
+		t.Error("the retried Destroy did not delete billet's tap and give its name back")
 	}
 }
 
-// A FAILED LAUNCH WHOSE TAP WOULD NOT GO KEEPS ITS NAME AND ITS UID, as Destroy does.
-func TestAFailedLaunchWhoseTapWouldNotGoKeepsItsUIDAndItsName(t *testing.T) {
+// A FAILED LAUNCH WHOSE TAP WOULD NOT GO KEEPS ITS NAME, as Destroy does.
+func TestAFailedLaunchWhoseTapWouldNotGoKeepsItsName(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
@@ -198,13 +179,8 @@ func TestAFailedLaunchWhoseTapWouldNotGoKeepsItsUIDAndItsName(t *testing.T) {
 		t.Fatal("the launch never made its tap, so this tests nothing")
 	}
 
-	for _, claim := range []string{
-		filepath.Join(h.p.claimsDir("taps"), "bt-0"),
-		filepath.Join(h.p.claimsDir("uids"), "900000"),
-	} {
-		if !claimExists(t, claim) {
-			t.Errorf("the unwind gave back %s while its device is still on the host", claim)
-		}
+	if !claimExists(t, filepath.Join(h.p.claimsDir("taps"), "bt-0")) {
+		t.Error("the unwind gave back the name of a device still on the host")
 	}
 }
 
@@ -293,8 +269,8 @@ func TestATapNameTheKernelRefusedIsNeverDeletedByALaterDestroy(t *testing.T) {
 }
 
 // COULD NOT TELL IS NOT PERMISSION. Whether it is the claim or the kernel that cannot
-// be read, Destroy deletes nothing, says so, and keeps both claims for a later
-// teardown to judge.
+// be read, Destroy deletes nothing, says so, and keeps the name for a later teardown
+// to judge.
 func TestDestroyDeletesNoTapItCannotJudge(t *testing.T) {
 	t.Parallel()
 
@@ -326,6 +302,30 @@ func TestDestroyDeletesNoTapItCannotJudge(t *testing.T) {
 		assertCouldNotTell(t, h)
 	})
 
+	t.Run("an unreadable claim on the uid that owns the tap", func(t *testing.T) {
+		t.Parallel()
+
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a file whatever its mode")
+		}
+
+		h := newHarness(t)
+		h.launch(t)
+
+		claim := filepath.Join(h.p.claimsDir("uids"), "900000")
+		if err := os.Chmod(claim, 0o000); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Cleanup(func() {
+			if err := os.Chmod(claim, 0o600); err != nil {
+				t.Errorf("restore the mode of %s: %v", claim, err)
+			}
+		})
+
+		assertCouldNotTell(t, h)
+	})
+
 	t.Run("a kernel that cannot answer", func(t *testing.T) {
 		t.Parallel()
 
@@ -351,13 +351,8 @@ func assertCouldNotTell(t *testing.T, h *harness) {
 
 	assertNoTapDeleted(t, h)
 
-	for _, claim := range []string{
-		filepath.Join(h.p.claimsDir("taps"), "bt-0"),
-		filepath.Join(h.p.claimsDir("uids"), "900000"),
-	} {
-		if !claimExists(t, claim) {
-			t.Errorf("Destroy gave back %s, which it could not judge", claim)
-		}
+	if !claimExists(t, filepath.Join(h.p.claimsDir("taps"), "bt-0")) {
+		t.Error("Destroy gave back the name of a device it could not judge")
 	}
 }
 
@@ -410,124 +405,6 @@ func TestSysTapOwnerReadsTheKernelsAnswer(t *testing.T) {
 	}
 }
 
-// AN UNFINISHED TEARDOWN'S CLAIMS ARE NOT REAPED. The jail is gone, which is the
-// reaper's old condition, but the lease still holds lifecycle authority, and the
-// claims it kept name a tap still on the host and the uid that owns it. The next
-// launch must take neither: with one uid in the range it is refused, and with two it
-// gets the other uid and the next name.
-func TestAClaimKeptByAnUnfinishedTeardownIsNotReaped(t *testing.T) {
-	t.Parallel()
-
-	for _, uids := range []int{1, 2} {
-		t.Run(strconv.Itoa(uids)+" uids", func(t *testing.T) {
-			t.Parallel()
-
-			h := newHarness(t)
-			h.p.cfg.JailUIDCount = uids
-			h.launch(t)
-			h.refuse = func(bin string, args []string) error {
-				if bin == ipBinary && slices.Contains(args, "del") {
-					return errors.New("RTNETLINK answers: Device or resource busy")
-				}
-
-				return nil
-			}
-
-			if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
-				t.Fatal("Destroy succeeded although the tap would not go")
-			}
-
-			if _, err := os.Stat(h.p.jailFor(theInstance).dir()); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("the jail outlived the teardown, so this tests nothing: %v", err)
-			}
-
-			next := h.p.jailFor(otherLeaseOnAnotherStripe(t, theInstance))
-			if err := h.p.claim(next); err != nil {
-				t.Fatalf("claim the next jail: %v", err)
-			}
-
-			res, err := h.p.claimResources(next)
-
-			if uids == 1 {
-				if err == nil {
-					t.Errorf("the next launch was given %+v, including the uid that owns a stuck tap", res)
-				}
-
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("claimResources for the next launch: %v", err)
-			}
-
-			if res.UID == 900000 || res.Tap == "bt-0" {
-				t.Errorf("the next launch was given %+v, taking a claim an unfinished teardown kept", res)
-			}
-		})
-	}
-}
-
-// A TAP AN EARLIER TEARDOWN KEPT WITHOUT ITS UID GETS THAT UID BACK. The claim names
-// the tap and no uid; the kernel says the tap is owned by a jail uid no lease holds.
-// If the device will not go, that uid is reserved for this jail, so no launch can be
-// given the one uid that opens the tap; once it goes, both are released.
-func TestAnUnclaimedOwnerOfAStuckTapIsReservedUntilTheTapGoes(t *testing.T) {
-	t.Parallel()
-
-	h := newHarness(t)
-	dir := h.p.claimsDir("taps")
-
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "bt-3"), []byte(theInstance+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	h.putDevice("bt-3", 900003)
-	h.refuse = func(bin string, args []string) error {
-		if bin == ipBinary && slices.Contains(args, "del") {
-			return errors.New("RTNETLINK answers: Device or resource busy")
-		}
-
-		return nil
-	}
-
-	uid := filepath.Join(h.p.claimsDir("uids"), "900003")
-
-	// THE RECORD STILL NAMES THE UID, whose claim an earlier teardown released.
-	if err := h.p.releaseOrphaned(t.Context(), resources{Tap: "bt-3", UID: 900003, GID: 900003},
-		theInstance); err == nil {
-		t.Fatal("orphan cleanup succeeded although the tap would not go")
-	}
-
-	raw, err := os.ReadFile(uid)
-	if err != nil || strings.TrimSpace(string(raw)) != theInstance {
-		t.Fatalf("the uid owning the stuck tap = %q (%v), want it reserved for %s", raw, err, theInstance)
-	}
-
-	if !claimExists(t, filepath.Join(dir, "bt-3")) {
-		t.Error("the name of a tap still on the host went back to the pool")
-	}
-
-	// AND THE RETRY FINDS THE UID WITH THE NAME, and finishes.
-	h.refuse = nil
-
-	left, err := h.p.claimedBy(theInstance)
-	if err != nil || left.UID != 900003 || left.Tap != "bt-3" {
-		t.Fatalf("claimedBy = %+v (%v), want bt-3 and uid 900003", left, err)
-	}
-
-	if err := h.p.releaseOrphaned(t.Context(), left, theInstance); err != nil {
-		t.Fatalf("the retried orphan cleanup: %v", err)
-	}
-
-	if h.hasDevice("bt-3") || claimExists(t, uid) || claimExists(t, filepath.Join(dir, "bt-3")) {
-		t.Error("the retried orphan cleanup did not delete the tap and release both claims")
-	}
-}
-
 // A RANGE CHANGED UNDER A RUNNING MICROVM DOES NOT STRAND ITS TAP. The uid it was
 // given is no longer in the configured range, but its claim still names this jail.
 func TestATapOutlivesAChangeOfTheJailUIDRange(t *testing.T) {
@@ -543,35 +420,5 @@ func TestATapOutlivesAChangeOfTheJailUIDRange(t *testing.T) {
 
 	if h.hasDevice("bt-0") {
 		t.Error("Destroy left the tap its launch made because the range moved")
-	}
-}
-
-// AND THE UID A MICROVM WAS GIVEN GOES BACK WHEN IT IS NOT THE ONE THAT OWNS THE TAP.
-// Only the owner can open the device; holding the other would shrink the range for
-// nothing.
-func TestOnlyTheUIDThatOwnsAStuckTapIsKept(t *testing.T) {
-	t.Parallel()
-
-	h := newHarness(t)
-	h.launch(t)
-	h.putDevice("bt-0", 900003)
-	h.refuse = func(bin string, args []string) error {
-		if bin == ipBinary && slices.Contains(args, "del") {
-			return errors.New("RTNETLINK answers: Device or resource busy")
-		}
-
-		return nil
-	}
-
-	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
-		t.Fatal("Destroy succeeded although the tap would not go")
-	}
-
-	if claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900000")) {
-		t.Error("the uid this microVM was given, which owns nothing, was kept")
-	}
-
-	if !claimExists(t, filepath.Join(h.p.claimsDir("uids"), "900003")) {
-		t.Error("the uid that owns the stuck tap was not reserved")
 	}
 }

@@ -191,9 +191,8 @@ func (p *Provider) take(claim, jailID string) (bool, error) {
 // and without this the range would shrink by one on every such crash until a host
 // that has been up for months could not start a microVM at all.
 //
-// It reads the jail's own existence, and its lease's lifecycle authority, rather than
-// a timestamp: a claim is free exactly when the thing it was taken for is gone and no
-// teardown of it is unfinished, which are facts rather than a heuristic.
+// It reads the jail's own existence rather than a timestamp: a claim is free exactly
+// when the thing it was taken for is gone, which is a fact rather than a heuristic.
 func (p *Provider) reapClaim(claim string) bool {
 	raw, err := os.ReadFile(claim)
 	if err != nil {
@@ -207,19 +206,7 @@ func (p *Provider) reapClaim(claim string) bool {
 		return false
 	}
 
-	holder := strings.TrimSpace(string(raw))
-
-	if _, found, err := p.findJail(holder); err != nil || found {
-		return false
-	}
-
-	// NOR WHILE ITS LEASE STILL HOLDS LIFECYCLE AUTHORITY. A teardown that could not
-	// finish keeps that record, and may have removed the jail and deliberately kept a
-	// claim: the name of a tap that would not go, and the uid that owns it. Reaping
-	// either on the jail's absence alone hands a launch a name the kernel will refuse
-	// and a uid that can open the stuck tap. Recovery (cleanupLifecycleOnly) is what
-	// releases those claims, once it has finished the teardown.
-	if _, err := os.Lstat(p.lifecycleFile(holder)); !errors.Is(err, os.ErrNotExist) {
+	if _, found, err := p.findJail(strings.TrimSpace(string(raw))); err != nil || found {
 		return false
 	}
 
@@ -345,17 +332,20 @@ func (p *Provider) removeTap(ctx context.Context, res resources, jailID string) 
 //   - No device: nothing to delete. The name goes back.
 //   - A device that is not provably billet's: left alone, and its name kept out of
 //     the pool, because a launch handed it would fail on the device too.
-//   - billet's device: deleted, and the name goes back only if it went. A device that
-//     would not go keeps its uid as well as its name, because the uid owns the device
-//     and a VMM given it could open the tap still attached to the bridge.
+//   - billet's device: deleted, and the name goes back only if it went.
 //   - Anything that could not be read: could not tell, which is not permission.
-//     Nothing is deleted and both are kept for a later teardown to judge.
+//     Nothing is deleted and the name is kept for a later teardown to judge.
+//
+// ONLY THE NAME IS EVER KEPT, as before this rule: the uid goes back with the rest.
+// What a kept claim can and cannot protect against once its jail is gone (the reaper
+// frees it, and the uid that owns a stuck tap can be handed out again) is a property
+// of the claims as a whole, not of this decision (#522).
 func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID string) (resources, error) {
 	if res.Tap == "" {
 		return resources{}, nil
 	}
 
-	held := resources{Tap: res.Tap, UID: res.UID, GID: res.GID}
+	held := resources{Tap: res.Tap}
 
 	raw, err := os.ReadFile(filepath.Join(p.claimsDir("taps"), res.Tap))
 	if errors.Is(err, os.ErrNotExist) {
@@ -379,7 +369,7 @@ func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID st
 		return resources{}, nil
 	}
 
-	ours, unclaimed, err := p.ownedByJail(owner, jailID)
+	ours, err := p.ownedByJail(owner, jailID)
 	if err != nil {
 		return held, err
 	}
@@ -392,66 +382,39 @@ func (p *Provider) removeTapLocked(ctx context.Context, res resources, jailID st
 	}
 
 	if err := p.deleteTap(ctx, res.Tap); err != nil {
-		if !unclaimed {
-			return held, err
-		}
-
-		// THE UID THAT OWNS IT IS RESERVED FOR THIS JAIL, because nothing holds it: an
-		// earlier teardown released it and kept the name. Left free, the next launch
-		// could be given the one uid that can open this tap.
-		taken, takeErr := false, os.MkdirAll(p.claimsDir("uids"), 0o700)
-		if takeErr == nil {
-			taken, takeErr = p.take(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)), jailID+"\n")
-		}
-
-		if takeErr != nil || !taken {
-			return held, errors.Join(err, fmt.Errorf("firecracker: reserve uid %d, which owns %s: "+
-				"taken %v: %w", owner, res.Tap, taken, takeErr))
-		}
-
-		return resources{Tap: res.Tap, UID: owner, GID: owner}, err
+		return held, err
 	}
 
 	return resources{}, nil
 }
 
 // ownedByJail reports whether a tap's owner is billet's and this jail's to delete:
-// a uid this jail holds, or a jail uid no lease holds. The second answer says it was
-// the latter, so a teardown that cannot delete the tap knows to reserve that uid.
+// a uid this jail holds, or a jail uid no lease holds.
 //
 // THIS JAIL'S OWN CLAIM IS READ FIRST, whatever the configured range says now, so a
 // range changed under a running microVM does not strand the tap it made.
 //
 // A UID NO JAIL HOLDS STILL PROVES THE DEVICE IS BILLET'S when it is in the range:
-// only billet hands those out, and only to a VMM's tap. It happens when a teardown
-// that predates keeping the uid with a stuck device released one and kept the other.
-func (p *Provider) ownedByJail(owner int, jailID string) (bool, bool, error) {
+// only billet hands those out, and only to a VMM's tap. It is the ordinary case for
+// orphan cleanup of a tap that would not go, because the teardown that kept its name
+// gave its uid back.
+func (p *Provider) ownedByJail(owner int, jailID string) (bool, error) {
 	raw, err := os.ReadFile(filepath.Join(p.claimsDir("uids"), strconv.Itoa(owner)))
 
 	switch {
 	case err == nil:
-		return strings.TrimSpace(string(raw)) == jailID, false, nil
+		return strings.TrimSpace(string(raw)) == jailID, nil
 	case !errors.Is(err, os.ErrNotExist):
-		return false, false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
+		return false, fmt.Errorf("firecracker: could not tell which microVM holds uid %d: %w", owner, err)
 	}
 
-	if owner < p.cfg.JailUIDMin || owner >= p.cfg.JailUIDMin+p.cfg.JailUIDCount {
-		return false, false, nil
-	}
-
-	return true, true, nil
+	return owner >= p.cfg.JailUIDMin && owner < p.cfg.JailUIDMin+p.cfg.JailUIDCount, nil
 }
 
-// releasable is what a microVM held, less what a teardown must keep claimed.
+// releasable is what a microVM held, less the tap name a teardown must keep claimed.
 func releasable(res, keep resources) resources {
 	if keep.Tap != "" {
 		res.Tap = ""
-	}
-
-	// THE KEPT UID IS THE ONE THAT OWNS THE DEVICE. When that is not the uid this
-	// microVM was given (removeTapLocked reserving an unclaimed owner), the given one owns nothing and goes back.
-	if keep.UID != 0 && keep.UID == res.UID {
-		res.UID, res.GID = 0, 0
 	}
 
 	return res

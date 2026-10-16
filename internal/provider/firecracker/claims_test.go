@@ -242,11 +242,9 @@ func TestADeviceNameIsHeldUntilTheDeviceIsActuallyGone(t *testing.T) {
 			"by hand (%v)", res.Tap, err)
 	}
 
-	// AND SO IS THE UID THAT OWNS IT. The tap was made with `user <uid>`, so a VMM
-	// later given that uid could open a device still attached to the bridge; and the
-	// uid is what lets a later teardown prove the device is billet's. One uid per
-	// stuck device is the price, and that device already holds a name.
-	if _, err := os.Stat(filepath.Join(h.p.claimsDir("uids"), strconv.Itoa(res.UID))); err != nil {
-		t.Errorf("the uid owning a device still on the host went back to the pool: %v", err)
+	// AND THE UID IS STILL RELEASED, because nothing is wrong with it. Holding it
+	// back would shrink the range on every failure of an unrelated resource.
+	if _, err := os.Stat(filepath.Join(h.p.claimsDir("uids"), strconv.Itoa(res.UID))); err == nil {
+		t.Error("the uid was held back even though only the network device failed to go")
 	}
 }
