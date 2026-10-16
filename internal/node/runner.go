@@ -1218,13 +1218,18 @@ func (r *Runner) Recover(ctx context.Context) error {
 	// MEASURED HOWEVER THE RECOVERY ENDS: one that fails part way has still
 	// adopted and renewed the survivors before the failure, and a job that ends
 	// before the retry would otherwise settle with nothing measured and its
-	// checkpoint pruned.
+	// checkpoint pruned. Except one the stop cancelled: the process is leaving,
+	// a lookup each would only hold it up, and the checkpoints stay for the
+	// next process.
 	type toMeasure struct {
 		lease *alloc.Lease
 		inst  *provider.Instance
 	}
 	var measure []toMeasure
 	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
 		for _, m := range measure {
 			r.resumeMonitoring(ctx, m.lease, m.inst)
 		}
@@ -1398,9 +1403,7 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 
 	if err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
-			if settled, finishErr := r.settleForceReleased(ctx, entry); settled {
-				return false, finishErr
-			}
+			return false, r.settleForceReleased(ctx, entry)
 		}
 
 		return measure, fmt.Errorf("node: renew the lease of adopted instance %s (it is held in custody "+
@@ -1411,10 +1414,10 @@ func (r *Runner) takeCustodyWithRunnerRecovery(
 }
 
 // settleForceReleased ends an entry just adopted whose lease an operator
-// force-released, and says whether it did: under tending, as a tend ends one,
-// and only while it is still its lease's entry, since a tend may have settled
-// it or a later adoption replaced it since.
-func (r *Runner) settleForceReleased(ctx context.Context, c *custody) (bool, error) {
+// force-released: under tending, as a tend settles one, and only while it is
+// still its lease's entry. One a tend settled meanwhile, or a later adoption
+// replaced, is that tend's or that adoption's, and nothing is left to do here.
+func (r *Runner) settleForceReleased(ctx context.Context, c *custody) error {
 	r.tending.Lock()
 	defer r.tending.Unlock()
 
@@ -1422,7 +1425,7 @@ func (r *Runner) settleForceReleased(ctx context.Context, c *custody) (bool, err
 	current := r.custody[c.leaseID] == c
 	r.mu.Unlock()
 	if !current {
-		return false, nil
+		return nil
 	}
 
 	c.discard = true
@@ -1431,7 +1434,7 @@ func (r *Runner) settleForceReleased(ctx context.Context, c *custody) (bool, err
 	r.settleHeldUsage(ctx, c, heldUsage{}, false)
 	r.cleanupCache(ctx, c.name)
 
-	return true, r.finish(ctx, c)
+	return r.finish(ctx, c)
 }
 
 // AssumeCustody takes responsibility for a lease whose launch SUCCEEDED but

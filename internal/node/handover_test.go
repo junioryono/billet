@@ -32,8 +32,14 @@ type recordingLedger struct {
 	// failRead, when positive, is how many lease reads succeed before one fails,
 	// as a ledger blip would; that read disarms it.
 	failRead atomic.Int32
+	// failRenewal, when positive, is how many renewals land before one is lost
+	// on the way, as a dropped connection would; that renewal disarms it.
+	failRenewal atomic.Int32
 	// onRead, when set, runs after every lease read that succeeded.
 	onRead func(leaseID string)
+	// afterRenewal, when set, runs after every renewal the ledger answered,
+	// with its answer, before the answer is returned.
+	afterRenewal func(leaseID string, err error)
 }
 
 func (l *recordingLedger) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
@@ -62,8 +68,15 @@ func (l *recordingLedger) note(event string) {
 
 func (l *recordingLedger) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
 	l.note("heartbeat " + leaseID)
+	if l.failRenewal.Load() > 0 && l.failRenewal.Add(-1) == 0 {
+		return errors.New("the renewal was lost on the way")
+	}
+	err := l.Allocator.Heartbeat(ctx, leaseID, epoch)
+	if l.afterRenewal != nil {
+		l.afterRenewal(leaseID, err)
+	}
 
-	return l.Allocator.Heartbeat(ctx, leaseID, epoch)
+	return err
 }
 
 func (l *recordingLedger) RecordLeaseUsage(ctx context.Context, leaseID string, epoch int64,
@@ -157,7 +170,14 @@ func (h *handoverHost) launch(t *testing.T, r *Runner) {
 func (h *handoverHost) timeline(t *testing.T) usage.Timeline {
 	t.Helper()
 
-	series, err := h.a.LeaseUsageSeries(t.Context(), h.lease.ID)
+	return h.timelineOf(t, h.lease.ID)
+}
+
+// timelineOf is the series the ledger kept for a lease on the host.
+func (h *handoverHost) timelineOf(t *testing.T, leaseID string) usage.Timeline {
+	t.Helper()
+
+	series, err := h.a.LeaseUsageSeries(t.Context(), leaseID)
 	if err != nil {
 		t.Fatalf("no series was kept: %v", err)
 	}
@@ -167,6 +187,20 @@ func (h *handoverHost) timeline(t *testing.T) usage.Timeline {
 	}
 
 	return tl
+}
+
+// within is what ch answers, failing the test if it does not within ten
+// seconds.
+func within[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s did not finish", what)
+		panic("unreachable")
+	}
 }
 
 // causes are the marks of a timeline's points.
@@ -432,16 +466,47 @@ func TestARecoveryThatFailsPartWayMeasuresWhatItAdopted(t *testing.T) {
 	if _, err := h.a.LeaseUsage(t.Context(), adopted.ID); err != nil {
 		t.Fatalf("a job adopted by a recovery that failed, and ended before the retry, reported no usage: %v", err)
 	}
-	series, err := h.a.LeaseUsageSeries(t.Context(), adopted.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tl, err := usage.TimelineOf(series.Codec, series.Data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if marks := causes(tl); !slices.Contains(marks, usage.GapHandover) || tl.Points[1].CPUUsage != 2_000_000 {
+	tl := h.timelineOf(t, adopted.ID)
+	if marks := causes(tl); len(tl.Points) < 2 || !slices.Contains(marks, usage.GapHandover) ||
+		tl.Points[1].CPUUsage != 2_000_000 {
 		t.Errorf("marks = %v, points = %+v; want the series continued from the handover", marks, tl.Points)
+	}
+}
+
+// AN ADOPTION WHOSE OWN RENEWAL IS LOST IS STILL MEASURED: the entry holds the
+// lease regardless and renewal is retried, and the recovery that fails on it
+// measures the job after the renewal it tried, so the job reports what the
+// handover kept when it ends before the retry.
+func TestAnAdoptionWhoseRenewalFailedIsStillMeasured(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, firstMonitor := h.process(t)
+	h.launch(t, first)
+	h.p.writeCPU(t, h.id, "2000000")
+	firstMonitor.Tick()
+	first.HandOver(t.Context())
+
+	next, nextMonitor := h.process(t)
+	h.p.onTarget = func(id string) { h.rec.note("target " + id) }
+	h.rec.failRenewal.Store(1)
+	if err := next.Recover(t.Context()); err == nil || !strings.Contains(err.Error(), "lost on the way") {
+		t.Fatalf("Recover = %v, want the lost renewal", err)
+	}
+	events := h.rec.sent()
+	renewed, looked := slices.Index(events, "heartbeat "+h.lease.ID), slices.Index(events, "target "+h.id)
+	if renewed < 0 || looked < renewed {
+		t.Errorf("events = %v, want the counters looked for after the renewal was tried", events)
+	}
+	if !nextMonitor.Measuring(h.name) {
+		t.Fatal("a job whose adoption's renewal was lost is not measured")
+	}
+
+	delete(h.p.live, h.name)
+	if err := next.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if marks := causes(h.timeline(t)); !slices.Contains(marks, usage.GapHandover) {
+		t.Errorf("marks = %v, want the series continued from the handover", marks)
 	}
 }
 
@@ -476,6 +541,8 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 	case <-inDestroy:
 	case err := <-destroyed:
 		t.Fatalf("the destroy ended (%v) without reaching the backend", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the destroy never reached the backend")
 	}
 
 	read := make(chan struct{})
@@ -491,7 +558,11 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 	case <-read:
 	case err := <-readopted:
 		close(resume)
+		<-destroyed
 		t.Fatalf("the re-registration's recovery ended (%v) without reading the lease", err)
+	case <-time.After(10 * time.Second):
+		close(resume)
+		t.Fatal("the re-registration's recovery never read the lease")
 	}
 	// THE ADOPTION IS NEXT for the recovery that read the lease. Nothing it does
 	// short of the swap itself can be observed, so it is given a moment: the
@@ -500,10 +571,15 @@ func TestAnAdoptionWaitsForATendSettlingTheEntryItReplaces(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(resume)
 
-	if err := <-destroyed; err != nil {
-		t.Fatalf("Destroy: %v", err)
+	destroyErr, readoptErr := within(t, destroyed, "the destroy"), within(t, readopted, "the re-adoption")
+	if destroyErr != nil {
+		t.Fatalf("Destroy: %v", destroyErr)
 	}
-	<-readopted
+	// THE ADOPTION RAN ONCE THE TEND HAD RELEASED THE LEASE, so its renewal
+	// finds the lease gone.
+	if !errors.Is(readoptErr, alloc.ErrLeaseNotFound) {
+		t.Errorf("the re-adoption's recovery = %v, want its renewal to find the lease gone", readoptErr)
+	}
 	if err := next.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend: %v", err)
 	}
@@ -575,6 +651,89 @@ func TestAnEntrySettledDuringItsLookupLeavesNothingMeasured(t *testing.T) {
 	}
 }
 
+// A RECOVERY THE STOP CANCELLED LOOKS FOR NO COUNTERS: the process is leaving,
+// and the checkpoint it has not read stays for the next process.
+func TestARecoveryTheStopCancelledLeavesTheCheckpointsForTheNextProcess(t *testing.T) {
+	h := newHandoverHost(t)
+
+	first, firstMonitor := h.process(t)
+	h.launch(t, first)
+	firstMonitor.Tick()
+	first.HandOver(t.Context())
+	targets := h.p.targets.Load()
+
+	next, nextMonitor := h.process(t)
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+	h.rec.afterRenewal = func(string, error) { stop() }
+	// THE STOP COMES AFTER THE ONE SURVIVOR'S RENEWAL, so the adoption itself
+	// is done.
+	if err := next.Recover(ctx); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the stop never came, so this proves nothing")
+	}
+	if got := h.p.targets.Load(); got != targets || nextMonitor.Measuring(h.name) {
+		t.Errorf("a cancelled recovery looked for counters %d times and measuring = %v, want neither",
+			got-targets, nextMonitor.Measuring(h.name))
+	}
+	if _, err := os.Stat(filepath.Join(h.dir, h.name+checkpointSuffix)); err != nil {
+		t.Errorf("a cancelled recovery took the checkpoint the next process needs: %v", err)
+	}
+}
+
+// A FORCE RELEASE A TEND SETTLED FIRST IS DONE WITH: the adoption's renewal
+// finds the lease force-released, and before the adoption acts on it, a tend
+// has settled the entry and released the lease. The adoption leaves the entry
+// to that tend, releasing the lease once, and the recovery goes on.
+func TestAForceReleaseATendSettledFirstIsNotSettledAgain(t *testing.T) {
+	h := newHandoverHost(t)
+	h.p.asyncTeardown = true
+
+	first, _ := h.process(t)
+	h.launch(t, first)
+	// AN OPERATOR FORCES THE RELEASE OF A TEARDOWN THE BACKEND NEVER CONFIRMED.
+	if err := first.Destroy(t.Context(), h.lease.RequestID); !errors.Is(err, dispatch.ErrCustody) {
+		t.Fatalf("Destroy = %v, want the unconfirmed teardown held in custody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := h.a.ForceRelease(t.Context(), h.lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+	next, nextMonitor := h.process(t)
+	var tended atomic.Bool
+	h.rec.afterRenewal = func(_ string, err error) {
+		if errors.Is(err, alloc.ErrForceRelease) && tended.CompareAndSwap(false, true) {
+			if err := next.Tend(t.Context()); err != nil {
+				t.Errorf("Tend: %v", err)
+			}
+		}
+	}
+	if err := next.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover = %v, want a force release a tend settled to be done with", err)
+	}
+
+	if !tended.Load() {
+		t.Fatal("no renewal found the force release, so this proves nothing")
+	}
+	releases := 0
+	for _, e := range h.rec.sent() {
+		if e == "release "+h.lease.ID {
+			releases++
+		}
+	}
+	if releases != 1 {
+		t.Errorf("the lease was released %d times, want once: %v", releases, h.rec.sent())
+	}
+	if len(next.heldLeases()) != 0 || nextMonitor.Measuring(h.name) {
+		t.Errorf("held %v and measuring %v after the force release was settled, want neither",
+			next.heldLeases(), nextMonitor.Measuring(h.name))
+	}
+}
+
 // A JOB A PROVIDER WARNS IT WILL RECLAIM REPORTS WHAT IT DID: the warning moves
 // the running job into custody to be torn down, and that custody reports it
 // once, before its lease is released, and stops measuring it.
@@ -585,6 +744,9 @@ func TestAJobAProviderReclaimsReportsItsUsage(t *testing.T) {
 	h.launch(t, r)
 	h.p.writeCPU(t, h.id, "3000000")
 	m.Tick()
+	// READ ONLY BY THE LAST SAMPLE, which the teardown takes before the compute
+	// goes.
+	h.p.writeCPU(t, h.id, "4000000")
 	notice := &provider.InterruptionNotice{InstanceID: h.id, Action: "terminate"}
 	if err := r.handleInterruption(t.Context(), notice); err != nil {
 		t.Fatalf("handleInterruption: %v", err)
@@ -595,6 +757,10 @@ func TestAJobAProviderReclaimsReportsItsUsage(t *testing.T) {
 	released := slices.Index(events, "release "+h.lease.ID)
 	if reported < 0 || released < 0 || reported > released || h.rec.usageReports() != 1 {
 		t.Errorf("events = %v, want one usage report and it before the release", events)
+	}
+	got, err := h.a.LeaseUsage(t.Context(), h.lease.ID)
+	if err != nil || got.CPUUserMicros != 4_000_000 || slices.Contains(got.Unmeasured, alloc.UsageCPU) {
+		t.Errorf("usage = %+v, %v; want the 4000000 the last sample read, measured", got, err)
 	}
 	if m.Measuring(h.name) {
 		t.Error("the sampler still measures a job whose compute is gone")
