@@ -44,6 +44,11 @@ type mapRig struct {
 	mappers  map[string]string
 	noMapper map[string]bool
 	metaErr  map[string]error
+	// trashed are the names the cache pool's trash lists, and trashErr fails
+	// the listing; onMeta runs as an owner read answers.
+	trashed  []string
+	trashErr error
+	onMeta   func()
 }
 
 // rigOwner is the node a rig's client maps volumes for.
@@ -67,8 +72,21 @@ func newMapRig(t *testing.T, table string, inSession func(string) bool, readErr 
 				rig.lists++
 
 				return []byte(table), nil
+			case joined == "--id site-reader --format json trash list billet-cache":
+				if rig.trashErr != nil {
+					return nil, rig.trashErr
+				}
+				entries := make([]string, 0, len(rig.trashed))
+				for i, name := range rig.trashed {
+					entries = append(entries, fmt.Sprintf(`{"id":"%x","name":%q}`, i+1, name))
+				}
+
+				return []byte("[" + strings.Join(entries, ",") + "]"), nil
 			case strings.HasPrefix(joined, "--id site-reader --format json image-meta list billet-cache/"):
 				name := strings.TrimPrefix(args[len(args)-1], "billet-cache/")
+				if rig.onMeta != nil {
+					rig.onMeta()
+				}
 				if err := rig.metaErr[name]; err != nil {
 					return nil, err
 				}

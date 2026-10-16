@@ -107,7 +107,8 @@ func startNodeCache(
 	p provider.Provider,
 	deployment string,
 	cachePolicy NodeCacheControl,
-	sweepWait, stopGrace time.Duration,
+	sweepWait func() time.Duration,
+	stopGrace time.Duration,
 ) (*node.CacheService, func(), func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, func() {}, nil
@@ -266,8 +267,9 @@ func startNodeCache(
 		// THE SWEEP IS STOPPED FIRST AND WAITED FOR BESIDE THE LISTENER, not after
 		// it: on a handover both waits come out of what the leases can spare.
 		stopEviction()
+		wait := sweepWait()
 		swept := make(chan bool, 1)
-		go func() { swept <- awaitSweep(sweeping, sweepWait) }()
+		go func() { swept <- awaitSweep(sweeping, wait) }()
 
 		// A listener never served is closed here, since Shutdown closes only what
 		// Serve was given; and once this has run, serve does nothing.
@@ -281,7 +283,7 @@ func startNodeCache(
 
 		if !<-swept {
 			slog.Default().Warn("stopping while a kernel-mapping sweep is still unmapping a volume",
-				"waited", sweepWait)
+				"waited", wait)
 		}
 	}, nil
 }
@@ -300,6 +302,17 @@ func nodeCacheSweepWait(handOver bool) time.Duration {
 	}
 
 	return ceph.MapTimeout + 5*time.Second
+}
+
+// nodeCacheSweepWaitFor is the stop's wait, decided when the stop runs: a stop
+// asked to drain overrides node.stop's handover, as the node loop's own
+// DrainRequested does, and then has no lease to spare the wait for. A handover
+// whose withdrawal did not land drains too, which the cache cannot see; it keeps
+// the handover's wait.
+func nodeCacheSweepWaitFor(handOver bool, drainRequested func() bool) func() time.Duration {
+	return func() time.Duration {
+		return nodeCacheSweepWait(handOver && (drainRequested == nil || !drainRequested()))
+	}
 }
 
 // awaitSweep waits, at most bound, until no kernel-mapping sweep holds the

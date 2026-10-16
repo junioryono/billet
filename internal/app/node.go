@@ -203,7 +203,7 @@ func (n *Node) Run(ctx context.Context, host NodeHost) error {
 	}
 
 	cacheService, serveCache, stopCache, err := startNodeCache(ctx, cfg, p, n.deployment, n.client,
-		nodeCacheSweepWait(handOver), nodeCacheStopGrace(handOver))
+		nodeCacheSweepWaitFor(handOver, host.DrainRequested), nodeCacheStopGrace(handOver))
 	if err != nil {
 		return err
 	}

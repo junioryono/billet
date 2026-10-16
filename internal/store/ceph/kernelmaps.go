@@ -298,6 +298,16 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 			continue
 		}
 
+		// AND AGAIN AFTER THE READ, the last moment before the unmap is detached
+		// from the pass: a stop that came during it must not see a new one start.
+		if err := ctx.Err(); err != nil {
+			m.State, m.Err = MappingUnknown, fmt.Errorf("ceph: the sweep stopped before unmapping %s: %w",
+				spec, err)
+			failures = append(failures, m.Err)
+
+			continue
+		}
+
 		err = c.rbdCmdWithin(context.WithoutCancel(ctx), MapTimeout, "device", "unmap", spec)
 
 		switch {
@@ -325,8 +335,20 @@ func (c *Client) SweepKernelMappings(ctx context.Context) (MappingReport, error)
 // the image's absence answers ENOENT: a get answers it alike for a missing key,
 // which says the volume is not this node's, and a missing image, which says
 // nothing. Either failure is could-not-tell.
+//
+// A VOLUME IN THE TRASH IS ANSWERED BY THE TRASH: its mapping is a leftover
+// whoever made it. A writable volume goes there only once its owner disposed of
+// it (discardCacheVolume, which unmaps first) or the orphan pass found it
+// unwatched, and a trashed image cannot be mapped again; but the kernel can
+// finish a map that passed its bound after the failed Create trashed the volume
+// (2026-10-03, discardCacheVolume), and `image-meta list` opens the image by a
+// name the pool no longer lists. The 96-bit nonce in the name makes the match
+// exact.
 func (c *Client) mappedByThisNode(ctx context.Context, spec string) (bool, error) {
 	out, err := c.rbdCmd(ctx, true, "image-meta", "list", spec)
+	if err != nil && isNoSuchFile(err) {
+		return c.trashHolds(ctx, spec)
+	}
 	if err != nil {
 		return false, fmt.Errorf("ceph: read which node mapped %s, which no cache session names: %w", spec, err)
 	}
@@ -340,4 +362,30 @@ func (c *Client) mappedByThisNode(ctx context.Context, spec string) (bool, error
 	}
 
 	return metadata[mapperKey] == c.owner, nil
+}
+
+// trashHolds reports whether the cache pool's trash holds the image a spec
+// named, for a mapping whose image the pool no longer lists: true is proof it
+// was disposed of, and anything else is could-not-tell.
+func (c *Client) trashHolds(ctx context.Context, spec string) (bool, error) {
+	_, name, _ := strings.Cut(spec, "/")
+
+	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
+	if err != nil {
+		return false, fmt.Errorf("ceph: %s is mapped and its image is not in the pool, and the pool's trash "+
+			"could not be read: %w", spec, err)
+	}
+
+	var images []cacheTrashImage
+	if err := json.Unmarshal(out, &images); err != nil || images == nil {
+		return false, fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)
+	}
+
+	for _, image := range images {
+		if image.Name == name {
+			return true, nil
+		}
+	}
+
+	return false, fmt.Errorf("ceph: %s is mapped, and its image is neither in the pool nor in its trash", spec)
 }

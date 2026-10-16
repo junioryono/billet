@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
@@ -117,21 +118,25 @@ func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	var withSessions, newWithOptions, withOwner bool
 
 	ast.Inspect(nodeFunc(t, "nodecache.go", "nodeCacheStore"), func(n ast.Node) bool {
+		// AND THE NODE IT MAPS FOR, deployment and node name, among the options
+		// ceph.New is given: without it the sweep unmaps nothing, and with the
+		// deployment alone two nodes of one deployment on a host would judge each
+		// other's volumes.
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && isIdent(assign.Lhs[0], "options") {
+			if literal, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
+				for _, element := range literal.Elts {
+					option, ok := element.(*ast.CallExpr)
+					if ok && namesSelector(option.Fun, "ceph", "WithMapOwner") && len(option.Args) == 1 &&
+						types.ExprString(option.Args[0]) == `deployment + "/" + cfg.Node.Name` {
+						withOwner = true
+					}
+				}
+			}
+		}
+
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
-		}
-
-		// AND THE NODE IT MAPS FOR, by deployment: without it the sweep unmaps
-		// nothing, and with another identity's it would judge that one's volumes.
-		if namesSelector(call.Fun, "ceph", "WithMapOwner") && len(call.Args) == 1 {
-			ast.Inspect(call.Args[0], func(inner ast.Node) bool {
-				if expr, ok := inner.(ast.Expr); ok && isIdent(expr, "deployment") {
-					withOwner = true
-				}
-
-				return true
-			})
 		}
 
 		if namesSelector(call.Fun, "ceph", "New") && call.Ellipsis.IsValid() && len(call.Args) == 2 {
@@ -154,7 +159,8 @@ func TestTheNodeCacheStoreEvictsWithTheNodesSessions(t *testing.T) {
 	})
 
 	if !withOwner {
-		t.Error("nodeCacheStore builds its ceph store without ceph.WithMapOwner naming the deployment")
+		t.Error(`nodeCacheStore builds its ceph store without ceph.WithMapOwner(deployment + "/" + cfg.Node.Name) ` +
+			"in the options it passes ceph.New")
 	}
 	if !withSessions || !newWithOptions {
 		t.Fatalf("nodeCacheStore builds its ceph store without ceph.WithCacheSessions(CacheSessionNames(cfg)) "+

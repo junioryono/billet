@@ -431,7 +431,7 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 				switch node := inner.(type) {
 				case *ast.CallExpr:
 					if concurrent && isIdent(node.Fun, "awaitSweep") && len(node.Args) == 2 &&
-						isIdent(node.Args[0], "sweeping") && isIdent(node.Args[1], "sweepWait") {
+						isIdent(node.Args[0], "sweeping") && isIdent(node.Args[1], "wait") {
 						awaited = node.Pos()
 					}
 					if namesSelector(node.Fun, "srv", "Shutdown") {
@@ -451,8 +451,25 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 		return true
 	})
 	if !stopped.IsValid() || !awaited.IsValid() || !received.IsValid() || awaited < stopped || received < awaited {
-		t.Error("startNodeCache's stop does not cancel the eviction, awaitSweep(sweeping, sweepWait) and " +
+		t.Error("startNodeCache's stop does not cancel the eviction, awaitSweep(sweeping, wait) and " +
 			"receive its answer, in that order")
+	}
+
+	// THE WAIT IS DECIDED WHEN THE STOP RUNS, from the policy it was given: a
+	// stop asked to drain is known only then.
+	decided := false
+	ast.Inspect(start, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 || !isIdent(assign.Lhs[0], "wait") {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		decided = decided || ok && isIdent(call.Fun, "sweepWait") && len(call.Args) == 0
+
+		return true
+	})
+	if !decided {
+		t.Error("startNodeCache's stop does not decide its wait with wait := sweepWait()")
 	}
 
 	// BESIDE THE LISTENER, NOT AFTER IT: on a handover both waits come out of
@@ -471,26 +488,43 @@ func TestTheNodeCacheRunsEvictPassAndItsStopWaitsForTheSweep(t *testing.T) {
 			return true
 		}
 		wait, ok := call.Args[len(call.Args)-2].(*ast.CallExpr)
-		given = ok && isIdent(wait.Fun, "nodeCacheSweepWait") && len(wait.Args) == 1 && isIdent(wait.Args[0], "handOver")
+		given = ok && isIdent(wait.Fun, "nodeCacheSweepWaitFor") && len(wait.Args) == 2 &&
+			isIdent(wait.Args[0], "handOver") && namesSelector(wait.Args[1], "host", "DrainRequested")
 
 		return true
 	})
 	if !given {
-		t.Error("the node starts its cache without nodeCacheSweepWait(handOver)")
+		t.Error("the node starts its cache without nodeCacheSweepWaitFor(handOver, host.DrainRequested)")
 	}
 }
 
 // A HANDOVER WAITS FOR A SWEEP NO LONGER THAN ITS LISTENER, alongside which it
-// runs, because nothing renews the handed-over leases meanwhile; a drain waits
-// for the one unmap a cancelled sweep can still be running.
+// runs, because nothing renews the handed-over leases meanwhile, and still
+// waits; a drain, including one a stop asks for over node.stop's handover,
+// waits for the one unmap a cancelled sweep can still be running, and no more.
 func TestTheSweepWaitFitsTheStopPolicy(t *testing.T) {
 	t.Parallel()
 
-	if got := nodeCacheSweepWait(true); got > nodeCacheStopGrace(true) {
-		t.Errorf("a handover waits %v for a sweep, more than the listener's %v", got, nodeCacheStopGrace(true))
+	handover, drain := nodeCacheStopGrace(true), ceph.MapTimeout+5*time.Second
+
+	for name, c := range map[string]struct {
+		handOver bool
+		drain    func() bool
+		want     time.Duration
+	}{
+		"a handover":                       {handOver: true, drain: func() bool { return false }, want: handover},
+		"a handover with no drain request": {handOver: true, want: handover},
+		"a drain over a handover":          {handOver: true, drain: func() bool { return true }, want: drain},
+		"a drain":                          {drain: func() bool { return false }, want: drain},
+	} {
+		if got := nodeCacheSweepWaitFor(c.handOver, c.drain)(); got != c.want {
+			t.Errorf("%s waits %v for a sweep, want %v", name, got, c.want)
+		}
 	}
-	if got := nodeCacheSweepWait(false); got <= ceph.MapTimeout {
-		t.Errorf("a drain waits %v for a sweep, not past one unmap's bound %v", got, ceph.MapTimeout)
+
+	if handover <= 0 || handover > nodeCacheStopGrace(true) || drain <= ceph.MapTimeout {
+		t.Errorf("a handover waits %v (want above zero and within the listener's %v), a drain %v "+
+			"(want past one unmap's %v)", handover, nodeCacheStopGrace(true), drain, ceph.MapTimeout)
 	}
 }
 
