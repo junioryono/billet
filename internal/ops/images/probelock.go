@@ -37,7 +37,7 @@ import (
 // That happened whenever the lock directory was a unit's RuntimeDirectory,
 // which systemd removes at the unit's stop: a node restarted under a running
 // verification, and the next verification destroyed its live probe (#175).
-// The packaged units no longer declare the directory, but a host a rollout
+// No packaged unit's stop removes the directory any more, but a host a rollout
 // upgraded keeps the units it had, so hold() is asked again before each act
 // that only the holder may perform.
 type probeLock struct {
@@ -200,7 +200,10 @@ func (l *probeLock) hold() error {
 	previous := &probeLock{file: l.file, path: l.path}
 	l.file = file
 
-	return previous.release()
+	//nolint:errcheck // THE LOCK THAT MATTERS IS HELD: a failure to close the descriptor it replaced costs one descriptor until this short-lived process exits, and refusing the act over it would leak the run's own probe.
+	_ = previous.release()
+
+	return nil
 }
 
 // release drops the lock.

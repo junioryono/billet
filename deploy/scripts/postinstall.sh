@@ -123,16 +123,25 @@ chmod 0750 "${CONF_DIR}"
 
 # THE HOST LOCK DIRECTORY, NOW, as systemd-tmpfiles makes it at every boot from
 # the entry this package installs, and before the unit decisions below arm the
-# image refresh's timer. No unit declares it a RuntimeDirectory, because a
-# unit's stop removes those under a lock another process holds (#175); the units
-# name it in ReadWritePaths without a '-', so a node or an image refresh started
-# before it exists refuses with 226/NAMESPACE naming the path. Where systemd is
+# image refresh's timer. No unit's stop removes it, because a stop that removes
+# a runtime directory does so under a lock another process holds (#175): the
+# node names it in ReadWritePaths without a '-', so a node started before it
+# exists refuses with 226/NAMESPACE naming the path, and the image refresh
+# declares it preserved. Where systemd is
 # not running (an image build, a chroot) the boot makes it. A failure is
 # reported, never fatal: the next boot creates it.
-if [ -d /run/systemd/system ] && ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf; then
-    echo "billet: /run/billet/locks could not be created now; billet-node and the image" >&2
-    echo "        refresh will not start until it exists. Run" >&2
-    echo "        \`systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf\`, or reboot." >&2
+#
+# RELOADED FIRST: what a stop removes is decided by the unit systemd has
+# loaded, not the file on disk, so until the reload a stop of a node started
+# under the old unit still removes this directory (measured on systemd 255).
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+
+    if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf; then
+        echo "billet: /run/billet/locks could not be created now; billet-node and the image" >&2
+        echo "        refresh will not start until it exists. Run" >&2
+        echo "        \`systemd-tmpfiles --create /usr/lib/tmpfiles.d/billet.conf\`, or reboot." >&2
+    fi
 fi
 
 # SEEDED, NOT OWNED, for the same reason as the state directory. A config the

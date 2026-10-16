@@ -304,6 +304,11 @@
         - { unit: billet-images-refresh.service, directive: ExecStart }
         - { unit: billet-images-refresh.service, directive: TimeoutStartSec }
         - { unit: billet-images-refresh.service, directive: ReadWritePaths }
+        # The lock directory the boot-verification needs, declared so the refresh
+        # makes it where nothing has, and preserved so its stop removes nothing.
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectory }
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryMode }
+        - { unit: billet-images-refresh.service, directive: RuntimeDirectoryPreserve }
         - { unit: billet-images-refresh.timer, directive: OnCalendar }
         - { unit: billet-images-refresh.timer, directive: RandomizedDelaySec }
         - { unit: billet-images-refresh.timer, directive: Persistent }
@@ -414,26 +419,37 @@
           report notify. An absent unit does not prove the installed binary can send READY=1,
           and this path runs with a binary of unknown vintage.
 
-    # THE REFRESH TAKES THE HOST LOCK AND DECLARES NO DIRECTORY FOR IT, in both
-    # copies. A runtime directory is removed at its unit's stop, and this oneshot
-    # stops after every run; the lock directory is the tmpfiles entry's (#175).
-    # The comparison above is section-blind, so the required entry is looked for
-    # in [Service], the one section systemd reads it from, without a '-' so a
-    # missing directory fails the oneshot before its download.
-    - name: The refresh names the host lock directory and declares no runtime directory, in both copies
+    # A DIRECTIVE IN THE WRONG SECTION IS NOT A DIRECTIVE, and the comparison
+    # above is section-blind: it matches a line anywhere in the file, so moving
+    # the refresh's RuntimeDirectoryPreserve into [Unit] keeps both copies equal
+    # while systemd ignores the setting entirely — and an ignored preserve means
+    # the refresh removes the host lock directory every time it finishes, under
+    # a running node's lock (#175). These three are checked where they must be;
+    # the packaged copy is pinned the same way in deploy/units_test.go.
+    - name: The refresh's runtime directory directives are in [Service] in both copies
       ansible.builtin.assert:
-        that:
-          - item is not search('(?m)^RuntimeDirectory')
-          - (item.split('[Service]') | last) is search('(?m)^ReadWritePaths=.* /run/billet/locks$')
+        that: >-
+          {{ [packaged_scheduled['billet-images-refresh.service'],
+              role_scheduled['billet-images-refresh.service']]
+             | map('split', '[Service]')
+             | map('last')
+             | select('search', '(?m)^' ~ item ~ '=')
+             | list | length == 2
+             and [packaged_scheduled['billet-images-refresh.service'],
+                  role_scheduled['billet-images-refresh.service']]
+             | map('split', '[Service]')
+             | map('first')
+             | select('search', '(?m)^' ~ item ~ '=')
+             | list | length == 0 }}
         fail_msg: >-
-          A copy of billet-images-refresh.service declares a runtime directory, or
-          does not require /run/billet/locks in [Service]'s ReadWritePaths:
-          {{ item }}
+          {{ item }} must be assigned inside [Service] in both
+          deploy/billet-images-refresh.service and the role's template. systemd
+          reads it nowhere else, and an ignored RuntimeDirectoryPreserve lets
+          this oneshot delete /run/billet/locks when it finishes.
       loop:
-        - "{{ packaged_scheduled['billet-images-refresh.service'] }}"
-        - "{{ role_scheduled['billet-images-refresh.service'] }}"
-      loop_control:
-        label: billet-images-refresh.service
+        - RuntimeDirectory
+        - RuntimeDirectoryMode
+        - RuntimeDirectoryPreserve
 
     # THE HOST LOCK DIRECTORY IS MADE ONE WAY ON EVERY HOST. The package installs
     # deploy/billet-tmpfiles.conf under /usr/lib/tmpfiles.d and the role renders

@@ -756,9 +756,9 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 
 	for _, d := range []struct {
 		what, configured, declared, root string
-		// named is a ReadWritePaths answer, which admits the directory only
-		// as exactly deploy.NodeLockDir.
+		// named is a ReadWritePaths answer, read for the lock directory alone.
 		named string
+		lock  bool
 	}{
 		{what: "state_dir", configured: spec.stateDir, declared: s.StateDirectory, root: stateRoot},
 		// THE LOCK DIRECTORY IS NAMED, NOT DECLARED, by this release's node
@@ -767,7 +767,7 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 		// /run/billet/locks and the unit names it in ReadWritePaths. A unit from
 		// before that still declares it, and is admitted too: its node starts.
 		{what: "lock_dir", configured: spec.lockDir, declared: s.RuntimeDirectory, root: runtimeRoot,
-			named: s.ReadWritePaths},
+			named: s.ReadWritePaths, lock: true},
 	} {
 		if d.configured == "" {
 			continue
@@ -781,12 +781,20 @@ func directoryRefusals(s ServiceFacts, spec unitSpec) []Refusal {
 			wants = append(wants, filepath.Join(d.root, entry))
 		}
 
-		// ONLY THE SHIPPED LOCK DIRECTORY, AND REQUIRED: the unit's other
-		// writable paths (its credentials, the jailer) are not where a lock
-		// belongs, and an optional entry starts a node that cannot create the
-		// directory under the read-only /run.
-		if slices.Contains(strings.Fields(d.named), deploy.NodeLockDir) {
-			wants = append(wants, deploy.NodeLockDir)
+		// ONLY THE SHIPPED LOCK DIRECTORY, declared by a unit from before or
+		// named, required, by this release's: the unit's other directories
+		// (the registration record's, removed at every stop; its credentials;
+		// the jailer) are not where a lock belongs, and an optional entry
+		// starts a node that cannot create the directory under the read-only
+		// /run.
+		if d.lock {
+			lockWritable := slices.Contains(wants, deploy.NodeLockDir) ||
+				slices.Contains(strings.Fields(d.named), deploy.NodeLockDir)
+
+			wants = nil
+			if lockWritable {
+				wants = []string{deploy.NodeLockDir}
+			}
 		}
 
 		if len(wants) == 0 {

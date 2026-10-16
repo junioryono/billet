@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/lifeops"
 )
 
@@ -24,34 +25,11 @@ var checkUnitProperties = func(ctx context.Context) func(unit string, props ...s
 	}
 }
 
-// resolveLockDir resolves the lock directory as resolveExisting does; a
-// variable so a test can stand a filesystem in.
-var resolveLockDir = resolveExisting
-
-// resolveExisting is path with every symlink in its longest existing prefix
-// followed and the missing rest joined on: /var/run/billet/locks is
-// /run/billet/locks on a host whose /var/run leads to /run, whether or not the
-// directory exists yet.
-func resolveExisting(path string) (string, error) {
-	path = filepath.Clean(path)
-
-	resolved, err := filepath.EvalSymlinks(path)
-	if err == nil || !errors.Is(err, fs.ErrNotExist) {
-		return resolved, err
-	}
-
-	parent := filepath.Dir(path)
-	if parent == path {
-		return "", err
-	}
-
-	resolvedParent, err := resolveExisting(parent)
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(resolvedParent, filepath.Base(path)), nil
-}
+// resolveLockDir resolves the lock directory through every symlink on its
+// way, a dangling one included, so /var/run/billet/locks is /run/billet/locks
+// on a host whose /var/run leads to /run, and a link to a directory a stopped
+// unit removed still names it; a variable so a test can stand a filesystem in.
+var resolveLockDir = lifeops.ResolveOperationPath
 
 // statLockDir examines the lock directory; a variable so a test can stand a
 // filesystem in.
@@ -62,10 +40,10 @@ var statLockDir = os.Stat
 // unit declared the lock directory (or a parent of it) a node restarted under a
 // running `billet images verify` unlinked the verifier's lock, and the next
 // verification locked a fresh file at the same path and destroyed the first
-// one's live probe (#175). The units this release ships declare none of it and
-// name it in ReadWritePaths, which refuses the node's start when it is missing,
-// so a unit that does not declare it needs the directory to exist; a host a
-// rollout upgraded keeps the units it had until a package install or a
+// one's live probe (#175). The node unit this release ships declares none of it
+// and names it in ReadWritePaths, which refuses the node's start when it is
+// missing, so a unit that does not declare it needs the directory to exist; a
+// host a rollout upgraded keeps the units it had until a package install or a
 // converge. ADVISORY: it reports and decides nothing, and anything systemd or
 // the filesystem did not answer is said to be could-not-tell.
 func reportLockDir(w io.Writer, lockDir string, show func(unit string, props ...string) (map[string][]string, error)) {
@@ -102,7 +80,7 @@ func reportLockDir(w io.Writer, lockDir string, show func(unit string, props ...
 		return
 	}
 
-	dir, err := resolveLockDir(lockDir)
+	dir, err := resolveLockDir(filepath.Clean(lockDir))
 	if err != nil {
 		unknown("resolve " + lockDir + ": " + err.Error())
 
@@ -121,8 +99,16 @@ func reportLockDir(w io.Writer, lockDir string, show func(unit string, props ...
 		}
 	}
 
-	// NO UNIT MAKES IT, so it has to be there: the shipped unit requires it and
-	// refuses to start without it.
+	// THE SHIPPED UNIT MAKES ONE DIRECTORY WRITABLE FOR A LOCK, and refuses to
+	// start without it: anywhere else is read-only under ProtectSystem=strict.
+	if dir != deploy.NodeLockDir {
+		_, _ = fmt.Fprintf(w, "locks    WARNING: %s is not %s, the one directory %s makes writable for its lock, "+
+			"so the node cannot take its lock there; set node.lock_dir to %s\n", lockDir, deploy.NodeLockDir,
+			nodeUnit, deploy.NodeLockDir)
+
+		return
+	}
+
 	switch info, err := statLockDir(lockDir); {
 	case errors.Is(err, fs.ErrNotExist):
 		_, _ = fmt.Fprintf(w, "locks    WARNING: %s does not exist, and no unit makes it: billet-node.service "+

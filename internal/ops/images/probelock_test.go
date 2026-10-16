@@ -236,7 +236,8 @@ func TestAProbeLockWhoseNameMovedIsTakenAgainUnlessAnotherHoldsIt(t *testing.T) 
 		}
 		release(t, first)
 
-		if err := os.Remove(first.path); err != nil {
+		// THE WHOLE DIRECTORY, as a unit's stop removes its RuntimeDirectory.
+		if err := os.RemoveAll(dir); err != nil {
 			t.Fatal(err)
 		}
 
@@ -244,12 +245,18 @@ func TestAProbeLockWhoseNameMovedIsTakenAgainUnlessAnotherHoldsIt(t *testing.T) 
 			t.Fatalf("named() over a removed name = %v, want the removal named", err)
 		}
 
+		replaced := first.file
+
 		if err := first.hold(); err != nil {
 			t.Fatalf("hold() with nobody else on the name = %v, want the name taken again", err)
 		}
 
 		if err := first.named(); err != nil {
 			t.Errorf("after hold() the name does not lead to the lock held: %v", err)
+		}
+
+		if _, err := replaced.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("the descriptor the re-take replaced is still open (%v), holding a lock on a file nobody can name", err)
 		}
 
 		if second, err := takeProbeLock(dir, nodeDeployment); err == nil {
@@ -369,5 +376,44 @@ func TestTakingTheProbeLockRetakesANameMovedUnderIt(t *testing.T) {
 				t.Errorf("opened %d times, want 2", opened)
 			}
 		})
+	}
+}
+
+// A RE-TAKE WHOSE NAME MOVES AGAIN UNDER IT IS NOT A HOLD. hold() re-checks the
+// lock it just took, because a lock on a file nobody can name excludes nobody;
+// the hook moves the name between the re-take's open and its flock, and the
+// answer is a refusal naming the move rather than a lock kept on the old inode.
+// Serial: it sets probeLockOpened.
+func TestARetakeWhoseNameMovesAgainIsNotAHold(t *testing.T) {
+	dir := t.TempDir()
+
+	lock, err := takeProbeLock(dir, nodeDeployment)
+	if err != nil {
+		t.Fatalf("take the lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := lock.release(); err != nil {
+			t.Errorf("release: %v", err)
+		}
+	})
+
+	if err := os.Remove(lock.path); err != nil {
+		t.Fatal(err)
+	}
+
+	probeLockOpened = func(path string) {
+		if err := os.Remove(path); err != nil {
+			t.Error(err)
+		}
+
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { probeLockOpened = nil })
+
+	if err := lock.hold(); err == nil || !strings.Contains(err.Error(), "now names a different file") {
+		t.Fatalf("hold() over a name that moved under the re-take = %v, want the move named", err)
 	}
 }

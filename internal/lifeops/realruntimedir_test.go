@@ -190,8 +190,115 @@ func TestRealSystemdHostLockDirectoryOutlivesTheNodeStop(t *testing.T) {
 		t.Fatalf("a node unit whose lock directory is missing started (ExecMainStatus=%q), want 226/NAMESPACE", got)
 	}
 
+	transitionLoadedUnitDecidesTheStop(t, h, adapt)
+
 	t.Logf("measured %s: the shipped units keep a held lock across the node's stop; the declared one does not",
 		time.Now().UTC().Format(time.RFC3339))
+}
+
+// transitionLoadedUnitDecidesTheStop measures what the package's reload and the
+// role's directory tasks rest on: a node started under the unit from before and
+// stopped after its file was replaced loses the directory when systemd has not
+// reloaded, because the LOADED unit decides what a stop removes, and the start
+// after the reload then refuses with 226/NAMESPACE until the directory is made
+// again; reloaded before the stop, the directory survives it. The directory is
+// this test's own, so the host's lock directory is never removed.
+func transitionLoadedUnitDecidesTheStop(t *testing.T, h *realOperationHost,
+	adapt func(unit, exec string, extra ...string) string,
+) {
+	t.Helper()
+
+	unit := h.prefix + "-transition.service"
+	dir := "/run/" + h.prefix + "/transition"
+	before := adapt(deploy.NodeUnit, "/bin/sleep infinity",
+		"RuntimeDirectory=billet/registration", "RuntimeDirectory="+h.prefix+"/transition "+h.prefix+"/registration",
+		"-/srv/jailer "+deploy.NodeLockDir, "-/srv/jailer")
+	shipped := adapt(deploy.NodeUnit, "/bin/sleep infinity", "-/srv/jailer "+deploy.NodeLockDir, "-/srv/jailer "+dir)
+
+	if !strings.Contains(before, "-/srv/jailer\n") || !strings.Contains(shipped, "-/srv/jailer "+dir+"\n") {
+		t.Fatalf("the transition's units did not move the lock directory to %s:\n%s\n%s", dir, before, shipped)
+	}
+
+	exists := func() bool {
+		t.Helper()
+
+		_, err := os.Stat(dir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+
+		return err == nil
+	}
+
+	// REPLACED, NOT RELOADED: the stop removes the directory the loaded unit
+	// declared, and the start after the reload cannot bind it.
+	h.write(unit, before)
+	h.run("daemon-reload")
+	h.run("start", "--", unit)
+
+	if !exists() {
+		t.Fatalf("the unit from before did not make its runtime directory %s", dir)
+	}
+
+	h.replace(unit, shipped)
+	h.run("stop", "--", unit)
+
+	if exists() {
+		t.Fatalf("%s survived a stop whose loaded unit declared it; the measurement is void", dir)
+	}
+
+	h.run("daemon-reload")
+
+	if err := h.ctl(t.Context(), "start", "--", unit); err == nil {
+		t.Fatal("the shipped unit started with its lock directory removed by the previous unit's stop")
+	}
+
+	if got := h.property(unit, "ExecMainStatus"); got != "226" {
+		t.Fatalf("the start after the removal ended ExecMainStatus=%q, want 226/NAMESPACE", got)
+	}
+
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	h.run("reset-failed", "--", unit)
+	h.run("start", "--", unit)
+	h.run("stop", "--", unit)
+
+	if !exists() {
+		t.Fatalf("the shipped unit's stop removed %s, which it only names", dir)
+	}
+
+	// RELOADED BEFORE THE STOP: the loaded unit no longer declares it.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	h.replace(unit, before)
+	h.run("daemon-reload")
+	h.run("start", "--", unit)
+	h.replace(unit, shipped)
+	h.run("daemon-reload")
+	h.run("stop", "--", unit)
+
+	if !exists() {
+		t.Fatalf("%s was removed by a stop after the reload that replaced the unit declaring it", dir)
+	}
+}
+
+// replace puts body in place of a unit this test wrote, by a rename, as a
+// package or the role replaces a unit file.
+func (h *realOperationHost) replace(name, body string) {
+	h.t.Helper()
+
+	path := filepath.Join(runtimeRoot, "systemd", "system", name)
+	if err := os.WriteFile(path+".next", []byte(body), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+
+	if err := os.Rename(path+".next", path); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 // heldLock is a lock this process holds on a file, and the file it locked.

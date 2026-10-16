@@ -49,24 +49,35 @@ IOSchedulingClass=idle
 # what kept this unit from ever starting (systemd resolves the entry inside the
 # fresh private directory and fails with 226/NAMESPACE; measured 2026-09-22
 # under systemd 255). The config is read-only.
-#
-# THE HOST LOCK IS THE REST OF THE PULL. Promotion boot-verifies the generation,
-# and `images verify` takes /run/billet/locks/billet-imageverify-<deployment>.lock:
-# ProtectSystem=strict leaves nothing under /run writable that a unit does not
-# name, so without the entry the pull downloaded the image (about 5.1 GiB of
-# parts, 23.6 GB decompressed), imported the generation and then failed to
-# verify it — leaving the image unpromoted and @verified still on the old one
-# (measured on a node 2026-09-22). billet-tmpfiles.conf creates the directory
-# at boot and no unit removes it, so a node restarting under a running
-# verification leaves its lock where it is (#175). WITHOUT a leading '-': a host
-# whose directory is missing fails this oneshot at its start with 226/NAMESPACE
-# naming the path, before the download rather than after it (measured on systemd
-# 255.4, 2026-10-16).
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/billet -/srv/jailer /run/billet/locks
+ReadWritePaths=/var/lib/billet -/srv/jailer
 ReadOnlyPaths=/etc/billet
+
+# THE HOST LOCK IS THE REST OF THE PULL. Promotion boot-verifies the generation,
+# and `images verify` takes /run/billet/locks/billet-imageverify-<deployment>.lock:
+# ProtectSystem=strict leaves nothing under /run writable except a directory the
+# unit declares, so without this the pull downloaded the image (about 5.1 GiB of
+# parts, 23.6 GB decompressed), imported the generation and then failed to
+# verify it — leaving the image unpromoted and @verified still on the old one
+# (measured on a node 2026-09-22).
+#
+# PRESERVED, BECAUSE THIS DIRECTORY OUTLIVES EVERY UNIT (#175). billet's
+# tmpfiles.d entry makes it at boot and no unit's stop removes it; a unit removes
+# the runtime directories it declares when it stops unless they are preserved,
+# and this oneshot stops after every pull. Declared rather than only named in
+# ReadWritePaths, because the declaration makes it when it is missing: on a host
+# whose tmpfiles entry has not run since a node unit from before #175 removed it
+# (a rolled-back upgrade, a converge between two stops) the refresh still runs.
+# Measured under systemd 255.4 on 2026-09-22: a strict oneshot cannot write there
+# without declaring it; declaring it with RuntimeDirectoryPreserve=yes writes,
+# leaves other units' files untouched, leaves the directory in place when the
+# oneshot finishes, and creates it where nothing has. Same root:root 0750 as the
+# tmpfiles entry, so the declaration re-owns nothing.
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 
 # The pull maps RBD devices and the probe boots under the jailer, which creates
 # cgroups through sysfs; ProtectKernelTunables would remount those read-only.

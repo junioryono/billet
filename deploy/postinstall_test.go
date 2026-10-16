@@ -182,8 +182,9 @@ test ! -s /etc/needrestart/conf.d
 }
 
 // TestPackageCreatesTheHostLockDirectoryWhereSystemdRuns executes the
-// postinstall in a container: where systemd runs, it asks systemd-tmpfiles to
-// create the entry the package installs, exactly once and by its path; a
+// postinstall in a container: where systemd runs, it reloads systemd and then
+// asks systemd-tmpfiles to create the entry the package installs, exactly once
+// and by its path, before the timers are armed; a
 // failure is said and never ends the install, because the next boot creates the
 // directory; and where systemd is not running (an image build, a chroot) it
 // asks nothing. Stand-ins answer for systemctl and systemd-tmpfiles, whose real
@@ -237,11 +238,14 @@ rm -f /calls
 PATH="/shim:${PATH}" sh /postinstall.sh
 test "$(cat /tmpfiles.argv)" = '--create /usr/lib/tmpfiles.d/billet.conf'
 
-# BEFORE THE TIMERS ARE ARMED: the image refresh requires the directory.
+# AFTER A RELOAD, so a stop under the old loaded unit no longer removes it,
+# and BEFORE THE TIMERS ARE ARMED: the image refresh requires the directory.
+reload_at=$(grep -n '^systemctl daemon-reload$' /calls | head -n 1 | cut -d: -f1)
 tmpfiles_at=$(grep -n '^tmpfiles$' /calls | cut -d: -f1)
 timer_at=$(grep -n 'enable --now billet-images-refresh.timer' /calls | cut -d: -f1)
-if [ -z "${tmpfiles_at}" ] || [ -z "${timer_at}" ] || [ "${tmpfiles_at}" -ge "${timer_at}" ]; then
-    echo "the directory was not made before the image refresh's timer was armed:" >&2
+if [ -z "${reload_at}" ] || [ -z "${tmpfiles_at}" ] || [ -z "${timer_at}" ] ||
+    [ "${reload_at}" -ge "${tmpfiles_at}" ] || [ "${tmpfiles_at}" -ge "${timer_at}" ]; then
+    echo "the directory was not made between a reload and the image refresh's timer:" >&2
     cat /calls >&2
     exit 1
 fi

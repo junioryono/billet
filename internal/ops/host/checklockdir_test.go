@@ -45,7 +45,11 @@ func reportedLockDir(t *testing.T, lockDir string, props map[string][]string, er
 		return path, nil
 	}
 
-	statLockDir = func(string) (os.FileInfo, error) {
+	statLockDir = func(path string) (os.FileInfo, error) {
+		if path != lockDir {
+			t.Errorf("the report examined %s, not the lock directory %s", path, lockDir)
+		}
+
 		if host.stat == nil {
 			return dirInfo{}, nil
 		}
@@ -118,7 +122,10 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 		{"the shipped unit, the directory a file", "/run/billet/locks", loaded("billet/registration"), nil,
 			lockDirHost{stat: file}, "locks    WARNING: /run/billet/locks is not a directory"},
 		{"the shipped unit, the directory unreadable", "/run/billet/locks", loaded("billet/registration"), nil,
-			lockDirHost{stat: unreadable}, "locks    could not tell whether /run/billet/locks outlives"},
+			lockDirHost{stat: unreadable}, "locks    could not tell whether /run/billet/locks outlives billet-node.service's " +
+				"stop: examine /run/billet/locks"},
+		{"the shipped unit, through /var/run", "/var/run/billet/locks", loaded("billet/registration"), nil,
+			lockDirHost{aliases: varRun}, "locks    /var/run/billet/locks outlives billet-node.service's stop"},
 		{"a unit from before", "/run/billet/locks", loaded("billet/locks billet/registration"), nil, lockDirHost{},
 			"locks    WARNING: billet-node.service declares /run/billet/locks as a RuntimeDirectory"},
 		{"a unit from before, the directory missing", "/run/billet/locks", loaded("billet/locks billet/registration"), nil,
@@ -128,7 +135,10 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 		{"a parent declared", "/run/billet/locks", loaded("billet"), nil, lockDirHost{},
 			"locks    WARNING: billet-node.service declares /run/billet as a RuntimeDirectory"},
 		{"a lock directory elsewhere", "/var/lock/billet", loaded("billet/locks billet/registration"), nil, lockDirHost{},
-			"locks    /var/lock/billet outlives billet-node.service's stop"},
+			"locks    WARNING: /var/lock/billet is not /run/billet/locks, the one directory billet-node.service makes " +
+				"writable for its lock"},
+		{"the registration record's directory", "/run/billet/registration", loaded("billet/registration"), nil, lockDirHost{},
+			"locks    WARNING: billet-node.service declares /run/billet/registration as a RuntimeDirectory"},
 		{"a neighbour is not a parent", "/run/billet/locks", loaded("billet/lock"), nil, lockDirHost{},
 			"locks    /run/billet/locks outlives billet-node.service's stop"},
 		{"no unit", "/run/billet/locks", map[string][]string{"LoadState": {"not-found"}}, nil, lockDirHost{}, ""},
@@ -141,7 +151,8 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 		{"systemd could not be asked", "/run/billet/locks", nil, errors.New("no bus"), lockDirHost{},
 			"locks    could not tell whether /run/billet/locks outlives billet-node.service's stop: no bus"},
 		{"the path could not be resolved", "/run/billet/locks", loaded("billet/registration"), nil,
-			lockDirHost{resolve: fs.ErrPermission}, "locks    could not tell whether /run/billet/locks outlives"},
+			lockDirHost{resolve: fs.ErrPermission}, "locks    could not tell whether /run/billet/locks outlives " +
+				"billet-node.service's stop: resolve /run/billet/locks"},
 	}
 
 	for _, tc := range cases {
@@ -171,10 +182,11 @@ func TestCheckWarnsWhereTheNodeUnitStillRemovesTheLockDirectory(t *testing.T) {
 	}
 }
 
-// A PATH IS RESOLVED THROUGH THE SYMLINKS IN ITS EXISTING PREFIX, the missing
-// rest joined on, so a lock directory not made yet is still compared where it
-// will be; a failure to read a component is an error, never the path as spelled.
-func TestResolveExistingFollowsTheExistingPrefix(t *testing.T) {
+// THE LOCK DIRECTORY IS RESOLVED THROUGH EVERY LINK ON ITS WAY, a dangling one
+// included: a lock_dir spelled through an alias of /run, or a link to a
+// directory a stopped unit from before #175 removed, still names the directory
+// it leads to, so the report judges that one and never the spelling.
+func TestTheLockDirectoryIsResolvedThroughDanglingLinks(t *testing.T) {
 	t.Parallel()
 
 	root, err := filepath.EvalSymlinks(t.TempDir())
@@ -183,7 +195,7 @@ func TestResolveExistingFollowsTheExistingPrefix(t *testing.T) {
 	}
 
 	realRun := filepath.Join(root, "run")
-	if err := os.MkdirAll(filepath.Join(realRun, "billet"), 0o755); err != nil {
+	if err := os.MkdirAll(realRun, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -192,25 +204,19 @@ func TestResolveExistingFollowsTheExistingPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for spelled, want := range map[string]string{
-		filepath.Join(alias, "billet", "locks"):   filepath.Join(realRun, "billet", "locks"),
-		filepath.Join(alias, "billet"):            filepath.Join(realRun, "billet"),
-		filepath.Join(realRun, "billet", "locks"): filepath.Join(realRun, "billet", "locks"),
-		filepath.Join(alias, "a", "b", "c"):       filepath.Join(realRun, "a", "b", "c"),
-	} {
-		got, err := resolveExisting(spelled)
-		if err != nil || got != want {
-			t.Errorf("resolveExisting(%s) = %q, %v; want %q", spelled, got, err, want)
-		}
-	}
-
-	loop := filepath.Join(root, "loop")
-	if err := os.Symlink(loop, loop); err != nil {
+	dangling := filepath.Join(root, "persistent-locks")
+	if err := os.Symlink(filepath.Join(realRun, "billet", "locks"), dangling); err != nil {
 		t.Fatal(err)
 	}
 
-	if got, err := resolveExisting(filepath.Join(loop, "locks")); err == nil {
-		t.Errorf("a symlink loop resolved to %q", got)
+	for spelled, want := range map[string]string{
+		filepath.Join(alias, "billet", "locks"): filepath.Join(realRun, "billet", "locks"),
+		dangling:                                filepath.Join(realRun, "billet", "locks"),
+	} {
+		got, err := resolveLockDir(spelled)
+		if err != nil || got != want {
+			t.Errorf("resolveLockDir(%s) = %q, %v; want %q", spelled, got, err, want)
+		}
 	}
 }
 

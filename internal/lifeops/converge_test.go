@@ -607,16 +607,17 @@ func TestPlanRefusesStateTheUnitCannotWrite(t *testing.T) {
 
 // A DIRECTORY DIRECTIVE IS A LIST, rendered by systemctl as entries separated
 // by spaces: a node unit from before #175 declares its locks beside its
-// registration record, so the lock directory is admitted as one entry of two, a
-// prefix of an entry is refused naming both, and the joined text is never a
-// directory.
+// registration record, so the lock directory is admitted as one entry of two;
+// the registration record's directory, removed at every stop, is no lock
+// directory (#175 again, by configuration); a prefix of an entry is refused
+// naming the one admitted, and the joined text is never a directory.
 func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 	cases := []struct {
 		name, dir string
 		refused   bool
 	}{
 		{"the first entry", "/run/billet/locks", false},
-		{"the second entry", "/run/billet/registration", false},
+		{"the second entry", "/run/billet/registration", true},
 		{"a prefix of an entry", "/run/billet/regist", true},
 		{"the entries' parent", "/run/billet", true},
 		{"the rendered text", "/run/billet/locks billet/registration", true},
@@ -643,12 +644,13 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 			}
 
 			joined := strings.Join(refusalText(plan.Refusals), "\n")
-			if refused := strings.Contains(joined, "lock_dir is "); refused != tc.refused {
+			if refused := lockDirRefused(joined); refused != tc.refused {
 				t.Fatalf("lock_dir %q refused=%v, want %v:\n%s", tc.dir, refused, tc.refused, joined)
 			}
 
-			if tc.refused && !strings.Contains(joined, "/run/billet/locks or /run/billet/registration") {
-				t.Errorf("the refusal does not name both directories the unit makes writable:\n%s", joined)
+			if tc.refused && (!strings.Contains(joined, "can only write /run/billet/locks") ||
+				strings.Contains(joined, "/run/billet/registration ||")) {
+				t.Errorf("the refusal does not name the one lock directory the unit makes writable:\n%s", joined)
 			}
 		})
 	}
@@ -658,9 +660,11 @@ func TestPlanReadsARuntimeDirectoryDirectiveAsAList(t *testing.T) {
 // (#175): a RuntimeDirectory's stop removes it under another process's lock, so
 // billet-tmpfiles.conf makes it and the unit names it in ReadWritePaths. Only
 // that directory, named exactly and required, admits it: an optional entry
-// starts a node that cannot create it, the unit's other writable paths are not
-// lock directories, and a neighbour, its parent and a relative entry are not
-// it. The refusal names what the unit does make writable for a lock.
+// starts a node that cannot create it, the unit's other writable paths (the
+// registration record's directory, its credentials, the jailer, each required
+// here) are not lock directories, and a neighbour, its parent and a relative
+// entry are not it. The refusal names the one lock directory the unit does make
+// writable, or that it makes none.
 func TestPlanAdmitsTheLockDirectoryTheUnitNames(t *testing.T) {
 	cases := []struct {
 		name, readWrite, dir string
@@ -668,7 +672,8 @@ func TestPlanAdmitsTheLockDirectoryTheUnitNames(t *testing.T) {
 	}{
 		{"named", "-/etc/billet/tls -/srv/jailer /run/billet/locks", "/run/billet/locks", false},
 		{"named as optional", "-/run/billet/locks", "/run/billet/locks", true},
-		{"another writable path", "-/etc/billet/tls -/srv/jailer /run/billet/locks", "/srv/jailer", true},
+		{"another writable path", "/etc/billet/tls /srv/jailer /run/billet/locks", "/srv/jailer", true},
+		{"the registration record's directory", "/run/billet/locks", "/run/billet/registration", true},
 		{"a neighbour", "/run/billet/locks", "/run/billet/locks-else", true},
 		{"the parent", "/run/billet/locks", "/run/billet", true},
 		{"a relative entry is not a path", "run/billet/locks", "/run/billet/locks", true},
@@ -696,16 +701,25 @@ func TestPlanAdmitsTheLockDirectoryTheUnitNames(t *testing.T) {
 			}
 
 			joined := strings.Join(refusalText(plan.Refusals), "\n")
-			if refused := strings.Contains(joined, "lock_dir is "); refused != tc.refused {
+			if refused := lockDirRefused(joined); refused != tc.refused {
 				t.Fatalf("lock_dir %q under ReadWritePaths %q refused=%v, want %v:\n%s",
 					tc.dir, tc.readWrite, refused, tc.refused, joined)
 			}
 
-			if tc.refused && !strings.Contains(joined, "/run/billet/registration") {
-				t.Errorf("the refusal does not name the directories the unit makes writable:\n%s", joined)
+			if tc.refused && !strings.Contains(joined, "can only write /run/billet/locks") &&
+				!strings.Contains(joined, "declares no directory for lock_dir") {
+				t.Errorf("the refusal names neither the one lock directory the unit makes writable nor "+
+					"that it makes none:\n%s", joined)
 			}
 		})
 	}
+}
+
+// lockDirRefused says whether a plan's refusals refuse lock_dir, in either of
+// the two ways: a directory the unit does not make writable for a lock, or a
+// unit that makes none.
+func lockDirRefused(joined string) bool {
+	return strings.Contains(joined, "lock_dir is ") || strings.Contains(joined, "no directory for lock_dir")
 }
 
 // THE REPAIR TARGET IS THE CONFIGURED DIRECTORY, not the directive's text: a

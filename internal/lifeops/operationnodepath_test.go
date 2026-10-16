@@ -132,7 +132,7 @@ func TestRetainedNodePathsAdmitTheLockDirectoryOnlyWhereTheUnitNamesIt(t *testin
 		{name: "a sibling beside it", runtime: "billet/registration", readWrite: "/run/billet/locks /run/billet/locks-else", admitted: false},
 		{name: "a lock record named without its directory", runtime: "billet/registration", readWrite: "/run/billet/locks/deployment-x.lock", admitted: false},
 		{name: "its parent", runtime: "billet/registration", readWrite: "/run/billet/locks /run/billet", admitted: false},
-		{name: "named only by a condition", runtime: "billet/registration", readWrite: "-/etc/billet/tls", condition: "/run/billet/locks/x", admitted: false},
+		{name: "named only by a condition", runtime: "billet/registration", readWrite: "-/etc/billet/tls", condition: "/run/billet/locks", admitted: false},
 	}
 
 	for _, tc := range cases {
@@ -206,7 +206,8 @@ func TestRetainedNodePathsRefuseALockDirectoryThatLeadsElsewhere(t *testing.T) {
 			switch {
 			case tc.admitted && err != nil:
 				t.Fatalf("refused: %v", err)
-			case !tc.admitted && (err == nil || !strings.Contains(err.Error(), "retained-input-volatile")):
+			case !tc.admitted && (err == nil || !strings.Contains(err.Error(), "retained-input-volatile") ||
+				!strings.Contains(err.Error(), "disposable only as itself")):
 				t.Fatalf("admitted, or refused for another reason: %v", err)
 			}
 		})

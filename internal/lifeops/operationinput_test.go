@@ -108,9 +108,10 @@ func requiredRetainedInputsCase(t *testing.T, verb string, values map[string]str
 	f := newOperationFixture(t)
 	node := f.unit(t, "billet-node.service")
 	maps.Copy(node, values)
-	p := OperationProtection{Units: []string{"billet-node.service"},
-		UnitPaths:      map[string][]string{"billet-node.service": {"/run/billet/locks", "/run/billet/registration"}},
-		RequiredInputs: map[string][]string{"billet-node.service": {"/etc/billet/tls/node.key"}}}
+	p := OperationProtection{Units: []string{"billet-node.service"}, RetainedPathUnits: []string{"billet-node.service"},
+		ArchivedInputRoots: []string{"/var/lib/billet/server"},
+		UnitPaths:          map[string][]string{"billet-node.service": {"/run/billet/locks", "/run/billet/registration"}},
+		RequiredInputs:     map[string][]string{"billet-node.service": {"/etc/billet/tls/node.key"}}}
 	var sequence []Operation
 	if verb != "" {
 		sequence = []Operation{{Verb: verb, Unit: "billet-node.service"}}

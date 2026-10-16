@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"net/http"
 	"slices"
@@ -198,11 +199,12 @@ func TestTheVerifyCommandAsksWhetherItStillHoldsTheLock(t *testing.T) {
 		return ok && isIdent(sel.X, "lock") && sel.Sel.Name == "hold"
 	}
 
-	// guard says an if statement takes lock.hold() in its init, tests the
-	// error and returns from its body.
+	// guard says an if statement declares err from lock.hold() in its init,
+	// tests that err and returns it from its body.
 	guard := func(stmt *ast.IfStmt) bool {
 		assign, ok := stmt.Init.(*ast.AssignStmt)
-		if !ok || len(assign.Rhs) != 1 {
+		if !ok || assign.Tok != token.DEFINE || len(assign.Lhs) != 1 || !isIdent(assign.Lhs[0], "err") ||
+			len(assign.Rhs) != 1 {
 			return false
 		}
 
@@ -211,9 +213,9 @@ func TestTheVerifyCommandAsksWhetherItStillHoldsTheLock(t *testing.T) {
 			return false
 		}
 
-		_, returns := stmt.Body.List[len(stmt.Body.List)-1].(*ast.ReturnStmt)
+		ret, ok := stmt.Body.List[len(stmt.Body.List)-1].(*ast.ReturnStmt)
 
-		return returns
+		return ok && len(ret.Results) == 1 && isIdent(ret.Results[0], "err")
 	}
 
 	var acts []string
@@ -348,8 +350,9 @@ func TestAnUngrownGuestFailsTheVerification(t *testing.T) {
 // (#175). The probe's name is the same on every run, so once the lock's name
 // moved under this run, a probe by that name may be another verification's live
 // one. Lost before the launch: nothing is launched and nothing destroyed. Lost
-// after it: the probe is left for the next verification's pre-launch cleanup,
-// and the run says so. The control holds throughout and destroys its probe.
+// after it, whether the guest reported or the launch was refused: the probe is
+// left for the next verification's pre-launch cleanup, and the run says so. The
+// controls hold throughout and destroy their probe.
 // Serial: it replaces listenGuestReport.
 func TestAVerificationThatLostItsLockLeavesTheProbeAlone(t *testing.T) {
 	ungrown := strings.Join([]string{
@@ -364,16 +367,22 @@ func TestAVerificationThatLostItsLockLeavesTheProbeAlone(t *testing.T) {
 	cases := []struct {
 		name                      string
 		heldFor                   int
+		refused                   bool
 		launched, destroyed, left bool
 	}{
 		{name: "held throughout", heldFor: -1, launched: true, destroyed: true},
 		{name: "lost before the launch", heldFor: 0},
 		{name: "lost after the launch", heldFor: 1, launched: true, left: true},
+		{name: "held through a refused launch", heldFor: -1, refused: true, launched: true, destroyed: true},
+		{name: "lost after a refused launch", heldFor: 1, refused: true, launched: true, left: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			backend := &launchRecorder{report: ungrown}
+			if tc.refused {
+				backend.report = ""
+			}
 			fakeGuestListener(t, backend)
 
 			asked := 0

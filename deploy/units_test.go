@@ -597,16 +597,17 @@ func TestTheNodeUnitDeclaresItsRegistrationDirectoryAndTheServerDeclaresNone(t *
 	}
 }
 
-// NO UNIT OWNS THE HOST LOCK DIRECTORY. A unit removes the runtime directories
-// it declares when it stops, and a lock in /run/billet/locks is held by
-// processes that outlive a node restart: `billet images verify` holds its probe
-// lock for the minutes a boot verification takes. A stop that removed the
+// NO UNIT'S STOP REMOVES THE HOST LOCK DIRECTORY. A unit removes the runtime
+// directories it declares when it stops, and a lock in /run/billet/locks is held
+// by processes that outlive a node restart: `billet images verify` holds its
+// probe lock for the minutes a boot verification takes. A stop that removed the
 // directory unlinked the lock's name under its holder, and the next verifier
 // locked a fresh file at the same path and destroyed the first one's live probe
 // (#175; measured on systemd 255.4, 2026-10-16: the second flock on the
 // recreated name was granted). A declaration of the directory's parent removes
-// it just the same, so billet itself and every prefix of the lock directory are
-// refused too.
+// it just the same, so billet itself and every prefix of the lock directory
+// count, and a unit may declare one only with RuntimeDirectoryPreserve=yes,
+// which the node cannot set (its registration record must not outlive it).
 func TestNoUnitDeclaresTheHostLockDirectory(t *testing.T) {
 	units := map[string]string{
 		deploy.ServerUnitName:        deploy.ServerUnit,
@@ -619,39 +620,51 @@ func TestNoUnitDeclaresTheHostLockDirectory(t *testing.T) {
 	lockDir := strings.TrimPrefix(deploy.NodeLockDir, "/run/")
 
 	for name, unit := range units {
+		preserved := slices.Equal(serviceAssignments(unit, "RuntimeDirectoryPreserve"), []string{"yes"})
+
 		for _, value := range serviceAssignments(unit, "RuntimeDirectory") {
 			for _, entry := range strings.Fields(value) {
-				if entry == lockDir || strings.HasPrefix(lockDir, entry+"/") || strings.HasPrefix(entry, lockDir+"/") {
-					t.Errorf("%s declares RuntimeDirectory %q, whose stop removes %s under the locks "+
-						"other processes hold in it", name, entry, deploy.NodeLockDir)
+				covers := entry == lockDir || strings.HasPrefix(lockDir, entry+"/") || strings.HasPrefix(entry, lockDir+"/")
+				if covers && !preserved {
+					t.Errorf("%s declares RuntimeDirectory %q without RuntimeDirectoryPreserve=yes, so its stop "+
+						"removes %s under the locks other processes hold in it", name, entry, deploy.NodeLockDir)
 				}
 			}
 		}
 	}
 }
 
-// A UNIT THAT TAKES THE HOST LOCK NAMES ITS DIRECTORY, AND REQUIRES IT.
+// A UNIT THAT TAKES THE HOST LOCK CAN WRITE ITS DIRECTORY, AND NEITHER REMOVES IT.
 //
 // ProtectSystem=strict leaves nothing under /run writable that a unit does not
-// name, so the node (the deployment lock) and the image refresh (the probe lock
-// a promotion takes) carry it in ReadWritePaths. Without a leading '-': a host
-// whose directory is missing then refuses the start with 226/NAMESPACE naming
-// the path, rather than starting a node that cannot lock or a refresh that
-// downloads a 5 GiB image before failing on the lock (measured on systemd
-// 255.4, 2026-10-16).
-func TestAUnitThatTakesTheHostLockRequiresItsDirectory(t *testing.T) {
-	for name, unit := range map[string]string{
-		deploy.NodeUnitName:          deploy.NodeUnit,
-		deploy.ImagesRefreshUnitName: deploy.ImagesRefreshUnit,
-	} {
-		var entries []string
-		for _, value := range serviceAssignments(unit, "ReadWritePaths") {
-			entries = append(entries, strings.Fields(value)...)
-		}
+// name. The node (the deployment lock) names it in ReadWritePaths, without a
+// leading '-': a host whose directory is missing then refuses the start with
+// 226/NAMESPACE naming the path, rather than starting a node that cannot lock
+// (measured on systemd 255.4, 2026-10-16). The image refresh (the probe lock a
+// promotion takes) declares it, 0750 like the tmpfiles entry so it re-owns
+// nothing, and preserves it: the declaration makes it where something removed
+// it, and the preserve keeps this oneshot's stop after every run from removing
+// it under a running node's lock (measured on a node 2026-09-22: without the
+// declaration the pull downloaded about 5.1 GiB, imported the generation and
+// then failed to verify it on the lock).
+func TestAUnitThatTakesTheHostLockCanWriteItsDirectory(t *testing.T) {
+	var entries []string
+	for _, value := range serviceAssignments(deploy.NodeUnit, "ReadWritePaths") {
+		entries = append(entries, strings.Fields(value)...)
+	}
 
-		if !slices.Contains(entries, deploy.NodeLockDir) {
-			t.Errorf("%s names ReadWritePaths %q, without %s as a required entry; under "+
-				"ProtectSystem=strict it cannot take the host lock there", name, entries, deploy.NodeLockDir)
+	if !slices.Contains(entries, deploy.NodeLockDir) {
+		t.Errorf("%s names ReadWritePaths %q, without %s as a required entry; under "+
+			"ProtectSystem=strict it cannot take the host lock there", deploy.NodeUnitName, entries, deploy.NodeLockDir)
+	}
+
+	for key, want := range map[string]string{
+		"RuntimeDirectory":         strings.TrimPrefix(deploy.NodeLockDir, "/run/"),
+		"RuntimeDirectoryMode":     "0750",
+		"RuntimeDirectoryPreserve": "yes",
+	} {
+		if got := serviceAssignments(deploy.ImagesRefreshUnit, key); !slices.Equal(got, []string{want}) {
+			t.Errorf("%s assigns %s=%q, want exactly %q in [Service]", deploy.ImagesRefreshUnitName, key, got, want)
 		}
 	}
 }
