@@ -191,20 +191,21 @@ func clearOrInspect(ctx context.Context, iface string,
 		iface = found
 	}
 
-	// AN INTERFACE THAT IS NOT THERE WAS NOT INSPECTED: inspect reads tc's
-	// "Cannot find device" as no qdiscs, which is right for a recorded interface
-	// that has gone and would be "carries nothing" about a name that is wrong.
-	if _, err := os.Stat(filepath.Join(sysNet, iface)); err != nil {
-		return Cleared{}, fmt.Errorf("no record of shaping on this host, and %s could not be inspected "+
-			"for shaping without one: %w", iface, err)
-	}
-
 	s := &Shaper{Iface: iface, Run: run}
 
 	st, err := s.inspect(ctx)
 	if err != nil {
 		return Cleared{}, fmt.Errorf("no record of shaping on this host, and %s could not be inspected "+
 			"for shaping without one: %w", iface, err)
+	}
+
+	// AN INTERFACE TC COULD NOT FIND WAS NOT INSPECTED. inspect reads tc's
+	// "Cannot find device" as no qdiscs, which is right for a recorded interface
+	// that has gone; for a name, wrong or renamed under the question, it would be
+	// "carries nothing" about qdiscs that may be live under another name.
+	if st.missing {
+		return Cleared{}, fmt.Errorf("no record of shaping on this host, and tc found no interface named %s "+
+			"to inspect for shaping without one", iface)
 	}
 
 	// THE REMEDY NAMES ONLY WHAT WAS SEEN, in the order a shaper's own clear

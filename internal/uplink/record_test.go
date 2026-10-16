@@ -1,6 +1,7 @@
 package uplink
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -227,12 +228,21 @@ func TestAClearWithNoRecordInspectsTheInterfaceBeforeSayingNothing(t *testing.T)
 		t.Fatalf("the remedy for a device alone offers to remove what was not seen: %v", err)
 	}
 
-	// A NAME NO INTERFACE HAS WAS NOT INSPECTED, though tc's "Cannot find
-	// device" reads as no qdiscs.
-	missing := newFakeLink("eth9", "mq")
+	// A NAME TC CANNOT FIND WAS NOT INSPECTED, though inspect reads "Cannot find
+	// device" as no qdiscs: eth0 is listed, and renamed before tc is asked,
+	// carrying CAKE under its new name.
+	renamed := newFakeLink("eth0", "cake")
+	renamed.handle, renamed.ingress = "8001:", true
+	gone := func(ctx context.Context, argv ...string) (string, error) {
+		if strings.Join(argv, " ") == "tc qdisc show dev eth0" {
+			return `Cannot find device "eth0"`, errors.New("exit status 1")
+		}
 
-	if cleared, err := clearOrInspect(t.Context(), "eth9", missing.run); err == nil {
-		t.Fatalf("no record and no interface eth9 answered %+v; want could not inspect", cleared)
+		return renamed.run(ctx, argv...)
+	}
+
+	if cleared, err := clearOrInspect(t.Context(), "eth0", gone); err == nil {
+		t.Fatalf("no record and an eth0 tc could not find answered %+v; want could not inspect", cleared)
 	}
 
 	broken := newFakeLink("eth0", "mq")
