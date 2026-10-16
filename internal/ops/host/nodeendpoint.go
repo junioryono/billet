@@ -603,10 +603,17 @@ func identityFor(installed, rendering *config.Config) registrationIdentity {
 	return registrationIdentity{why: "neither configuration has a node section"}
 }
 
+// endpointPropertyTimeout bounds each property read the endpoint commands make,
+// which guards a service manager that does not answer. A variable so the tests'
+// stand-in systemctl, which a loaded machine can take longer than this to run, is
+// never what ends a read; nothing in production changes it.
+var endpointPropertyTimeout = lifeops.DefaultTimeout
+
 // endpointInspector is the lifeops inspector the endpoint commands run
 // systemctl through, on the binary the inspector uses (a test's fake).
 func endpointInspector() *lifeops.Inspector {
-	return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithWaitDelay(guardWaitDelay), managerRunnerOption())
+	return lifeops.NewInspector(lifeops.WithSystemctl(systemctlBinary), lifeops.WithTimeout(endpointPropertyTimeout),
+		lifeops.WithWaitDelay(guardWaitDelay), managerRunnerOption())
 }
 
 // preRProcess says whether a running process is positively a release before

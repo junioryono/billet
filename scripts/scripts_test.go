@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -913,9 +914,10 @@ func TestReleaseAttestationVerifierBoundsABlockedAPIRequest(t *testing.T) {
 		t.Fatalf("absolute attestation verifier path: %v", err)
 	}
 	tools := t.TempDir()
+	entered := filepath.Join(tools, "api-entered")
 	writeExecutable(t, filepath.Join(tools, "gh"), `#!/bin/sh
 if [ "$1 $2" = "release view" ]; then printf 'true\n'; exit 0; fi
-if [ "$1" = api ]; then exec /usr/bin/perl -e '$SIG{TERM} = "IGNORE"; while (1) {}'; fi
+if [ "$1" = api ]; then : > '`+entered+`'; exec /usr/bin/perl -e '$SIG{TERM} = "IGNORE"; while (1) {}'; fi
 exit 97
 `)
 	writeExecutable(t, filepath.Join(tools, "git"), `#!/bin/sh
@@ -925,23 +927,42 @@ case "$*" in
     *) exit 98 ;;
 esac
 `)
-	cmd := exec.CommandContext(t.Context(), verifier)
+	// THE ATTEMPT'S OWN TIMEOUT IS FAR PAST THE GUARD, so only the deadline can
+	// end the blocked request before it: a wall-clock bound of 3 s on the run
+	// measured how fast the machine started the fakes. The deadline is five
+	// seconds, not one, so the calls before the API's are inside it however
+	// loaded the machine; a deadline they used up would refuse before the
+	// request this is about was ever made.
+	const guard = time.Minute
+
+	ctx, cancel := context.WithTimeout(t.Context(), guard)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, verifier)
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Env = append(os.Environ(),
 		"PATH="+tools+":"+os.Getenv("PATH"),
 		"GITHUB_REPOSITORY=junioryono/billet",
 		"RELEASE_TAG=v0.2.0",
 		"RELEASE_VERIFY_ATTEMPTS=4",
 		"RELEASE_VERIFY_INTERVAL_SECONDS=0",
-		"RELEASE_VERIFY_DEADLINE_SECONDS=1",
-		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=15",
+		"RELEASE_VERIFY_DEADLINE_SECONDS=5",
+		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=600",
 	)
-	started := time.Now()
 	output, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("blocked API request unexpectedly succeeded\n%s", output)
+	if ctx.Err() != nil {
+		t.Fatalf("blocked API request was still running after %s; the deadline did not bound it\n%s",
+			guard, output)
 	}
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
-		t.Fatalf("blocked API request ran for %s; want no more than 3s\n%s", elapsed, output)
+	if _, statErr := os.Stat(entered); statErr != nil {
+		t.Fatalf("the verifier stopped before the API request, so nothing here was bounded: %v\n%s",
+			statErr, output)
+	}
+	// KILLED BY THE BOUND, which is the status timeout's KILL leaves: anything
+	// else is the verifier failing for a reason of its own.
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 137 {
+		t.Fatalf("blocked API request ended with %v, want the bound's KILL (137)\n%s", err, output)
 	}
 }
 

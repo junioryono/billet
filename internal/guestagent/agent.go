@@ -34,11 +34,17 @@ import (
 // that never returns included, and settleWait is how long the final flush waits
 // for the answer to a request it cancelled.
 const (
-	finalBudget     = 2750 * time.Millisecond
-	flushAnswerWait = 2 * time.Second
-	exitBudget      = 2900 * time.Millisecond
-	settleWait      = 250 * time.Millisecond
+	finalBudget = 2750 * time.Millisecond
+	exitBudget  = 2900 * time.Millisecond
+	settleWait  = 250 * time.Millisecond
 )
+
+// flushAnswerWait is how long a connection to the socket waits for the final
+// batch's answer before it is answered anyway. A VAR so a test over a real socket
+// can lengthen it past its own guard, which is what tells a connection answered
+// because the flush was done from one answered because this ran out; a test that
+// replaces it must stay serial.
+var flushAnswerWait = 2 * time.Second
 
 // Config is what one agent reads and where it reports.
 type Config struct {

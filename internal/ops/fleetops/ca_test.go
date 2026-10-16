@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -16,8 +17,29 @@ import (
 	"github.com/junioryono/billet/internal/hostauthority"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
+
+// seedLedger puts a migrated ledger in stateDir unless it already holds one,
+// so the command or the open that follows verifies a ledger rather than
+// migrating one from empty.
+//
+// A MIGRATION FROM EMPTY RUNS UNDER THE LEDGER'S THIRTY-SECOND STARTUP BUDGET,
+// and a loaded machine missed it in a dozen of this package's tests at once
+// ("apply migration 49 ... did not finish inside the 30s startup budget", each
+// test failing at 30.3 s, 2026-10-10, #188). None of them is about migrating.
+// A directory that holds a ledger is opened as it is, since a seed would hide
+// what the test wrote.
+func seedLedger(t *testing.T, stateDir string) {
+	t.Helper()
+
+	if _, err := os.Stat(state.LedgerPath(stateDir)); errors.Is(err, os.ErrNotExist) {
+		ledgertest.Seed(t, stateDir)
+	} else if err != nil {
+		t.Fatalf("look for a ledger in %s: %v", stateDir, err)
+	}
+}
 
 // THE CLI LAYER HAD NO TEST, AND BOTH ITS BUGS LIVED THERE.
 //
@@ -32,6 +54,8 @@ import (
 // operator takes exactly once per node, and the failure of the second is silent.
 func writeCAConfig(t *testing.T, stateDir string) string {
 	t.Helper()
+
+	seedLedger(t, stateDir)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "billet.yaml")

@@ -13,6 +13,31 @@ import (
 	"github.com/junioryono/billet/internal/nodeapi"
 )
 
+// ackGuard is how long a test waits for a dispatch or a read whose bound under
+// test is a small fraction of it. It is a failure deadline, never a condition: a
+// bounded call returns long before it however loaded the machine, and an
+// unbounded one never returns at all. It is below the production ackWait, so a
+// wait that ignored the variable a test set is caught as well.
+const ackGuard = 60 * time.Second
+
+// returnsWithinAckGuard runs call and fails the test if it has not returned by
+// ackGuard.
+func returnsWithinAckGuard(t *testing.T, what string, call func() error) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- call() }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(ackGuard):
+		t.Fatalf("%s had not returned after %s; nothing bounded it", what, ackGuard)
+
+		return nil
+	}
+}
+
 // ackPipe gives a test the two ends the updater and the node hold.
 func ackPipe(t *testing.T) (reader, writer *os.File) {
 	t.Helper()
@@ -301,15 +326,17 @@ func TestTheDispatchBoundsAnUpdaterThatNeverConnects(t *testing.T) {
 	t.Cleanup(func() { ackWait = original })
 
 	e := ExecUpgrader{Binary: fakeUpdaterMode(t, "never", ""), AckDir: shortAckDir(t)}
-	start := time.Now()
-	err := e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"})
+
+	// THE GUARD, NOT A STOPWATCH: the updater exits without connecting, so only
+	// the accept deadline can end the dispatch, and a dispatch without one never
+	// returns. How long a loaded machine takes to start the updater is not the
+	// property (4.87 s against a one-second bound on a CI runner, 2026-10-11).
+	err := returnsWithinAckGuard(t, "the dispatch to a never-connected updater", func() error {
+		return e.StartUpgrade(t.Context(), nodeapi.UpgradeSpec{Version: "v0.4.0"})
+	})
 
 	if !errors.Is(err, ErrUpgradeRefused) || !strings.Contains(err.Error(), "did not say within") {
 		t.Fatalf("a never-connected updater returned %v, want an acknowledgement timeout", err)
-	}
-
-	if time.Since(start) > time.Second {
-		t.Error("the accept deadline did not bound the dispatch")
 	}
 }
 
@@ -337,16 +364,11 @@ func TestTheWaitForAnAnswerIsBounded(t *testing.T) {
 	// cannot end this wait and only the deadline can.
 	_ = w
 
-	start := time.Now()
-
-	err := awaitAck(r, "v0.4.0")
+	err := returnsWithinAckGuard(t, "the wait for a silent updater's answer", func() error {
+		return awaitAck(r, "v0.4.0")
+	})
 	if !errors.Is(err, ErrUpgradeRefused) {
 		t.Fatalf("a silent updater returned %v, want ErrUpgradeRefused", err)
-	}
-
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("the wait took %s against a bound of %s, so the deadline did not apply",
-			elapsed, ackWait)
 	}
 
 	// AND IT SAYS WHICH SITUATION THIS IS. An operator reading a node's log needs
@@ -368,8 +390,10 @@ func TestTheWaitForAnAnswerIsBounded(t *testing.T) {
 func TestTheAnswerIsReadAsOneLineRatherThanUntilTheChannelCloses(t *testing.T) {
 	r, w := ackPipe(t)
 
+	// FAR PAST THE GUARD, so a read that waited for the channel to close rather
+	// than for the answer is still waiting when the guard ends the test.
 	original := ackWait
-	ackWait = 30 * time.Second
+	ackWait = 10 * time.Minute
 
 	t.Cleanup(func() { ackWait = original })
 
@@ -379,17 +403,11 @@ func TestTheAnswerIsReadAsOneLineRatherThanUntilTheChannelCloses(t *testing.T) {
 		t.Fatalf("write the acknowledgement: %v", err)
 	}
 
-	start := time.Now()
-
-	if err := awaitAck(r, "v0.4.0"); err != nil {
+	if err := returnsWithinAckGuard(t, "the read of an answered channel held open", func() error {
+		return awaitAck(r, "v0.4.0")
+	}); err != nil {
 		t.Fatalf("an updater that answered and held the channel open was reported as "+
 			"refusing: %v", err)
-	}
-
-	// AND IT RETURNED ON THE ANSWER, not on the deadline.
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("the read took %s, so it waited for the channel to close rather than "+
-			"for the answer", elapsed)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 
 	"github.com/junioryono/billet/internal/rollout"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 // blockedRollout stages the state an operator meets: one host the coordinator
@@ -12,7 +13,10 @@ import (
 func blockedRollout(t *testing.T, node string) (*rollout.Store, string, string) {
 	t.Helper()
 
-	stateDir := t.TempDir()
+	// FROM THE TEMPLATE, NOT MIGRATED FROM EMPTY: a migration from empty runs
+	// under the ledger's thirty-second startup budget, which a loaded machine
+	// missed (#188), and nothing here is about migrating.
+	stateDir := ledgertest.Dir(t)
 	cfgPath := writeCAConfig(t, stateDir)
 
 	db, err := state.Open(t.Context(), stateDir)

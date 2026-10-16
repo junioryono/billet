@@ -24,6 +24,16 @@ const (
 	regIncarnationOld = "0000000000000000000000000000aaaa"
 	regIncarnationNew = "0000000000000000000000000000bbbb"
 	regDeployment2    = "fedcba9876543210fedcba9876543210"
+
+	// regAnswerWait is the wait of a run whose answer comes from a poll, a
+	// confirmation or a refusal: so long that no load reaches it, because
+	// expiry is judged before every poll and a 300ms wait on a loaded machine
+	// expired before the poll that would have answered (#188).
+	regAnswerWait = "10m"
+	// regTimeoutWait is the wait of a run that must time out: long enough that
+	// a loaded machine completes a poll inside it, which is what a timeout
+	// speaks from.
+	regTimeoutWait = 2 * time.Second
 )
 
 // regLedger is a claimed SQLite ledger and the config that names it.
@@ -100,13 +110,21 @@ func (l *regLedger) polls(t *testing.T, between func(n int)) *int {
 	return &n
 }
 
+// run answers under regAnswerWait unless extra names a wait of its own.
 func (l *regLedger) run(t *testing.T, extra ...string) endpointOut {
 	t.Helper()
 
-	args := append([]string{"--config", l.cfgPath, "--node", "node-a", "--incarnation", regIncarnationNew, "--wait", "300ms"},
-		extra...)
+	args := append([]string{"--config", l.cfgPath, "--node", "node-a", "--incarnation", regIncarnationNew,
+		"--wait", regAnswerWait}, extra...)
 
 	return runEndpoint(t, cmdRolloutRegistration, "", args...)
+}
+
+// runToTimeout runs a registration that must time out, under regTimeoutWait.
+func (l *regLedger) runToTimeout(t *testing.T) endpointOut {
+	t.Helper()
+
+	return l.run(t, "--wait", regTimeoutWait.String())
 }
 
 func mustTimeout(t *testing.T, o endpointOut) {
@@ -183,7 +201,7 @@ func TestRegistrationConfirmsTheLiveRowWhateverTheEpochDid(t *testing.T) {
 			l.register(t, "node-a", regIncarnationOld)
 		}
 
-		o := l.run(t)
+		o := l.runToTimeout(t)
 		mustTimeout(t, o)
 
 		last := asMap(o.doc["last"])
@@ -203,11 +221,13 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 
 		started := time.Now()
 
-		o := l.run(t)
+		o := l.runToTimeout(t)
 		mustTimeout(t, o)
 
-		if took := time.Since(started); took < 300*time.Millisecond || took > 5*time.Second {
-			t.Errorf("the wait took %s", took)
+		// NO EARLIER THAN THE WAIT, which no load can shorten; the upper bound
+		// only catches a wait that ran to something else's deadline.
+		if took := time.Since(started); took < regTimeoutWait || took > time.Minute {
+			t.Errorf("the wait took %s against %s", took, regTimeoutWait)
 		}
 
 		last := asMap(o.doc["last"])
@@ -226,7 +246,7 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 		}
 
 		if *n < 2 {
-			t.Errorf("%d polls over a 300ms wait at a 20ms interval", *n)
+			t.Errorf("%d polls over a %s wait at a 20ms interval", *n, regTimeoutWait)
 		}
 	})
 
@@ -234,7 +254,7 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 		l := newRegLedger(t, true)
 		l.register(t, "node-b", regIncarnationNew)
 
-		o := l.run(t)
+		o := l.runToTimeout(t)
 		mustTimeout(t, o)
 
 		if last, present := o.doc["last"]; !present || last != nil {
@@ -247,7 +267,7 @@ func TestRegistrationTimesOutNamingTheLastRow(t *testing.T) {
 		epoch := l.register(t, "node-a", regIncarnationNew)
 		l.gone(t, "node-a", epoch)
 
-		o := l.run(t)
+		o := l.runToTimeout(t)
 		mustTimeout(t, o)
 
 		last := asMap(o.doc["last"])

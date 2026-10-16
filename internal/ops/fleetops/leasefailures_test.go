@@ -19,6 +19,8 @@ import (
 func seedAttributedFailure(t *testing.T, stateDir, result string, requestID int64) string {
 	t.Helper()
 
+	seedLedger(t, stateDir)
+
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)

@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -485,17 +486,32 @@ func TestReceiptTypesAnInvalidRecordAndAnUnjudgeableOne(t *testing.T) {
 		f.migrated(t)
 		writeFile(t, f.recordPath, "not json\n", 0o600)
 
-		started := time.Now()
+		// NOT WAITED FOR, COUNTED RATHER THAN TIMED: a wait reads the record
+		// again, so a refusal that did not wait reads it as often under a
+		// three-second wait as under the fixture's short one. A two-second bound
+		// on the refusal measured a loaded machine instead (#188).
+		reads := 0
+		prev := inspectAfterRecordRead
+		inspectAfterRecordRead = func() { reads++ }
 
-		o := f.refresh(t, f.rendering(endpointB), "--wait", "3s")
-		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
+		t.Cleanup(func() { inspectAfterRecordRead = prev })
 
-		if time.Since(started) > 2*time.Second {
-			t.Error("a malformed record was waited for")
+		for _, extra := range [][]string{nil, {"--dry-run"}} {
+			reads = 0
+			mustEndpointRefusal(t, f.refresh(t, f.rendering(endpointB), append(extra, "--wait", endpointExpiryWait)...),
+				outcomeRefused, endpointReasonRecord)
+
+			unwaited := reads
+			reads = 0
+
+			o := f.refresh(t, f.rendering(endpointB), append(extra, "--wait", "3s")...)
+			mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
+
+			if unwaited == 0 || reads != unwaited {
+				t.Errorf("%v: a malformed record was waited for: %d record reads under a 3s wait, %d under %s",
+					extra, reads, unwaited, endpointExpiryWait)
+			}
 		}
-
-		o = f.refresh(t, f.rendering(endpointB), "--dry-run", "--wait", "3s")
-		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
 	})
 
 	t.Run("an identity that cannot be read", func(t *testing.T) {
@@ -560,7 +576,7 @@ func TestRegistrationTimeoutSpeaksFromACompletedSnapshot(t *testing.T) {
 
 		t.Cleanup(func() { registrationPoll = prev })
 
-		o := l.run(t, "--wait", "200ms")
+		o := l.runToTimeout(t)
 		mustTimeout(t, o)
 
 		if polls != 1 {
@@ -588,18 +604,37 @@ func TestRegistrationTimeoutSpeaksFromACompletedSnapshot(t *testing.T) {
 
 // The wait bounds every poll: a ledger that holds a query past --wait
 // answers the timeout with the last row a completed poll saw.
+//
+// THE DEADLINE THE HELD POLL WAS HANDED IS COMPARED, NOT HOW LONG THE RUN TOOK:
+// what remained of it at the poll is never more than the wait, and a poll the
+// wait did not bound has none, or a later one. A bound of 3 s on the whole run
+// measured the machine. The guard only keeps an unbounded poll from holding
+// the test.
 func TestRegistrationEndsAPollTheWaitOutlasts(t *testing.T) {
 	l := newRegLedger(t, true)
 	l.register(t, "node-a", regIncarnationOld)
+
+	var (
+		bounded   bool
+		remaining time.Duration
+	)
 
 	prev := registrationPoll
 	n := 0
 	registrationPoll = func(ctx context.Context, store *rollout.Store) (rollout.StatusSnapshot, error) {
 		n++
 		if n == 2 {
-			<-ctx.Done()
+			var deadline time.Time
+			if deadline, bounded = ctx.Deadline(); bounded {
+				remaining = time.Until(deadline)
+			}
 
-			return rollout.StatusSnapshot{}, ctx.Err()
+			select {
+			case <-ctx.Done():
+				return rollout.StatusSnapshot{}, ctx.Err()
+			case <-time.After(time.Minute):
+				return rollout.StatusSnapshot{}, errors.New("the held poll outlasted the guard")
+			}
 		}
 
 		return store.StatusSnapshot(ctx)
@@ -607,13 +642,12 @@ func TestRegistrationEndsAPollTheWaitOutlasts(t *testing.T) {
 
 	t.Cleanup(func() { registrationPoll = prev })
 
-	started := time.Now()
-
-	o := l.run(t)
+	o := l.runToTimeout(t)
 	mustTimeout(t, o)
 
-	if took := time.Since(started); took > 3*time.Second {
-		t.Errorf("the wait took %s", took)
+	if !bounded || remaining > regTimeoutWait {
+		t.Errorf("the held poll ran under a deadline %s away (bounded %v); want one inside the %s wait",
+			remaining, bounded, regTimeoutWait)
 	}
 
 	if last := asMap(o.doc["last"]); last["incarnation"] != regIncarnationOld {

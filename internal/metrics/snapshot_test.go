@@ -100,27 +100,29 @@ func TestAFailedReadServesAGapNotZeros(t *testing.T) {
 // stopped bounding its reads fails the test rather than hangs it. It returns
 // its error rather than failing the test, so a caller on another goroutine can
 // hand the error back.
-func getWithin(ctx context.Context, srv *Server, path string) (string, time.Duration, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+//
+// THE DEADLINE IS A FAILURE DEADLINE, NEVER A CONDITION: a scrape a collector
+// bounds answers long before it however loaded the machine, and one it does not
+// waits on a read the test releases only afterwards.
+func getWithin(ctx context.Context, srv *Server, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+srv.Addr().String()+path, http.NoBody)
 	if err != nil {
-		return "", 0, err
+		return "", err
 	}
-
-	begun := time.Now()
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", time.Since(begun), fmt.Errorf("the scrape did not answer within its own deadline: %w", err)
+		return "", fmt.Errorf("the scrape did not answer within its own deadline: %w", err)
 	}
 
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 
-	return string(body), time.Since(begun), err
+	return string(body), err
 }
 
 // THE COLLECTOR BOUNDS THE READ ITSELF. A read that ignores its deadline holds
@@ -141,14 +143,25 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	srv := serveSnapshot(t, 50*time.Millisecond, func(ctx context.Context) (Snapshot, error) {
 		n := reads.Add(1)
 
+		// THE FIRST READ'S DEADLINE IS THE ONE ASKED ABOUT; a later read, of
+		// which a loaded machine may start several, must not block on a full
+		// channel.
 		_, ok := ctx.Deadline()
-		deadlines <- ok
+		select {
+		case deadlines <- ok:
+		default:
+		}
 
 		if n == 1 {
 			<-release // deaf to its context, on purpose
+
+			return Snapshot{"billet_test_nodes": {{Value: 1}}}, nil
 		}
 
-		return Snapshot{"billet_test_nodes": {{Value: float64(n)}}}, nil
+		// EVERY LATER READ SAYS THE SAME, so a fresh read that itself missed its
+		// 50 ms on a loaded machine is answered by the next one rather than
+		// leaving a count no scrape will ever match.
+		return Snapshot{"billet_test_nodes": {{Value: 2}}}, nil
 	})
 
 	// Registered after serveSnapshot's, so it runs first: the read is let go
@@ -159,14 +172,14 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 		}
 	})
 
+	// THE READ IS HELD UNTIL BOTH SCRAPES HAVE ANSWERED, so an answer at all is
+	// the bound's doing: a collector that waited for the read would still be
+	// waiting at getWithin's deadline. How long a loaded machine takes to serve
+	// a scrape is not the property.
 	for scrape := range 2 {
-		body, took, err := getWithin(t.Context(), srv, "/metrics")
+		body, err := getWithin(t.Context(), srv, "/metrics")
 		if err != nil {
-			t.Fatal(err)
-		}
-
-		if took > 2*time.Second {
-			t.Errorf("scrape %d took %v against a 50ms bound", scrape, took)
+			t.Fatalf("scrape %d: %v", scrape, err)
 		}
 
 		if !strings.Contains(body, `billet_scrape_up{source="ledger"} 0`) {
@@ -198,11 +211,12 @@ func TestAReadThatNeverAnswersEndsTheScrapeAtItsBound(t *testing.T) {
 	close(release)
 
 	// ONCE IT RETURNS, A NEW READ ANSWERS: within a bound, a scrape serves the
-	// second read's value.
-	until := time.Now().Add(5 * time.Second)
+	// second read's value. A fresh read can itself miss its 50 ms on a loaded
+	// machine, so the bound is on asking again, not on the first ask.
+	until := time.Now().Add(time.Minute)
 
 	for {
-		body, _, err := getWithin(t.Context(), srv, "/metrics")
+		body, err := getWithin(t.Context(), srv, "/metrics")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -235,7 +249,9 @@ func TestConcurrentScrapesShareOneRead(t *testing.T) {
 	}
 	t.Cleanup(func() { onJoin = nil })
 
-	srv := serveSnapshot(t, 10*time.Second, func(context.Context) (Snapshot, error) {
+	// THE COLLECTOR'S BOUND IS FAR PAST THE TEST'S, so the held read is ended by
+	// its release and never by a machine slow to start the second scrape.
+	srv := serveSnapshot(t, 10*time.Minute, func(context.Context) (Snapshot, error) {
 		reads.Add(1)
 		<-release
 
@@ -256,11 +272,11 @@ func TestConcurrentScrapesShareOneRead(t *testing.T) {
 
 	answers := make(chan answer, 2)
 	scrape := func() {
-		body, _, err := getWithin(t.Context(), srv, "/metrics")
+		body, err := getWithin(t.Context(), srv, "/metrics")
 		answers <- answer{body, err}
 	}
 
-	bound := time.NewTimer(5 * time.Second)
+	bound := time.NewTimer(time.Minute)
 	defer bound.Stop()
 
 	go scrape()

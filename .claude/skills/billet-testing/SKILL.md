@@ -31,6 +31,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **A parallel test that writes an executable and then execs it can exec something else.**
 - **Concurrency tests use the scheduler under test.**
 - **A test about time runs in a `testing/synctest` bubble, and nothing in the bubble waits on a real socket.**
+- **Off the bubble, a wall-clock bound is a failure guard, never a condition.**
 - **A stand-in must stay alive and be observable.**
 - **Structural tests assert order and call graphs where a unit test cannot reach the call site.**
 

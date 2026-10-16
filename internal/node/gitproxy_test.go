@@ -31,6 +31,31 @@ import (
 // repository the fake upstream serves.
 const githubBasic = "basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0"
 
+// gitGuard is how long a test waits for git work whose bound under test is a
+// few seconds. It is a failure deadline, never a condition: what it waits for
+// is held until the test ends, so bounded work returns long before it however
+// loaded the machine, and unbounded work never returns at all.
+const gitGuard = 2 * time.Minute
+
+// gitWithin runs call and fails the test if it has not returned by gitGuard.
+func gitWithin[T any](t *testing.T, what string, call func() T) T {
+	t.Helper()
+
+	done := make(chan T, 1)
+	go func() { done <- call() }()
+
+	select {
+	case v := <-done:
+		return v
+	case <-time.After(gitGuard):
+		t.Fatalf("%s had not returned after %s; nothing bounded it", what, gitGuard)
+
+		var zero T
+
+		return zero
+	}
+}
+
 // gitUpstream is github.com: git's own smart-HTTP server over one private
 // repository, refusing any request without githubBasic, counting fetches.
 type gitUpstream struct {
@@ -618,26 +643,28 @@ func TestAnOlderGrantDoesNotOvertakeANewerRefusal(t *testing.T) {
 func TestAFetchIsStoppedWhileItRunsAtTheCeiling(t *testing.T) {
 	t.Parallel()
 
+	// THE UPSTREAM NEVER ANSWERS WHILE THE TEST RUNS, so only the watchdog can
+	// end the fetch and a fetch without one is still running at the guard.
+	ended := make(chan struct{})
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
-		case <-time.After(20 * time.Second):
+		case <-ended:
 		}
 		http.Error(w, "slow", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(slow.Close)
+	t.Cleanup(func() { close(ended) })
 	service, _, _, _ := casService(t, provider.TrustUntrusted, gitCache(), &fakeCacheStore{})
 	service.git.upstream, service.git.fullFraction = slow.URL, 1
 	request := gitRequest{session: service.sessionOf(provider.InstanceName(scopedLease)),
 		owner: "acme", repo: "api"}
 
-	start := time.Now()
-	err := service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 1)
+	err := gitWithin(t, "a fetch past its ceiling", func() error {
+		return service.fetchMirror(t.Context(), service.git.mirrorPath(request.key()), request, 1)
+	})
 	if !errors.Is(err, errMirrorTooLarge) {
 		t.Fatalf("fetchMirror = %v, want errMirrorTooLarge", err)
-	}
-	if took := time.Since(start); took > 10*time.Second {
-		t.Fatalf("the fetch ran %s past its ceiling", took)
 	}
 }
 
@@ -672,12 +699,12 @@ func TestTheReaperPassesOverAMirrorInUse(t *testing.T) {
 	held.use.RLock()
 	defer held.use.RUnlock()
 
-	start := time.Now()
-	if err := service.ReapGitMirrors(t.Context()); err != nil {
+	// THE HOLD OUTLASTS THE GUARD, so a reaper that waited for the mirror
+	// rather than passing over it never returns.
+	if err := gitWithin(t, "the reaper beside a mirror in use", func() error {
+		return service.ReapGitMirrors(t.Context())
+	}); err != nil {
 		t.Fatalf("ReapGitMirrors: %v", err)
-	}
-	if waited := time.Since(start); waited > 3*time.Second {
-		t.Fatalf("the reaper waited %s on a mirror in use", waited)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("a mirror in use was removed: %v", err)
@@ -833,16 +860,23 @@ func TestABusyFetchSlotFallsBackPromptly(t *testing.T) {
 
 	upstream := newGitUpstream(t)
 	service, node, token := gitNode(t, upstream)
+	// THE SLOTS ARE NEVER GIVEN BACK, so a refresh that waited for one rather
+	// than for gitFetchWait never answers.
 	for range gitFetches {
 		service.git.fetches <- struct{}{}
 	}
-	start := time.Now()
-	if output, err := gitClient(t, node, token, githubBasic)("clone", "-q",
-		"https://github.com/acme/api.git", "c"); err != nil {
-		t.Fatalf("clone while every slot is busy: %v\n%s", err, output)
+	git := gitClient(t, node, token, githubBasic)
+	type cloned struct {
+		output string
+		err    error
 	}
-	if took := time.Since(start); took > 3*gitFetchWait+5*time.Second {
-		t.Fatalf("the clone waited %s behind busy fetch slots", took)
+	result := gitWithin(t, "a clone behind busy fetch slots", func() cloned {
+		output, err := git("clone", "-q", "https://github.com/acme/api.git", "c")
+
+		return cloned{output, err}
+	})
+	if result.err != nil {
+		t.Fatalf("clone while every slot is busy: %v\n%s", result.err, result.output)
 	}
 	if _, err := os.Stat(service.git.mirrorPath("untrusted/acme/api")); err == nil {
 		t.Fatal("a mirror was fetched while every slot was held")

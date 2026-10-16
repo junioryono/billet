@@ -211,7 +211,7 @@ func (f *receiptCmdFixture) evidence(t *testing.T, ev, conf any, extra ...string
 func (f *receiptCmdFixture) refresh(t *testing.T, rendering string, extra ...string) endpointOut {
 	t.Helper()
 
-	args := []string{"--refresh", "--config", f.configPath, "--wait", "200ms"}
+	args := []string{"--refresh", "--config", f.configPath, "--wait", endpointAnswerWait}
 	if rendering != "" {
 		args = append(args, "--desired", "-")
 	}
@@ -601,7 +601,7 @@ func TestReceiptRefreshKeepsTheReceiptCurrent(t *testing.T) {
 				"invocation_id": newInvocation, "incarnation": newIncarnation}))
 		})
 
-		o := f.refresh(t, f.rendering(endpointB), "--wait", "3s")
+		o := f.refresh(t, f.rendering(endpointB), "--wait", endpointAnswerWait)
 		mustWritten(t, o)
 	})
 
@@ -611,10 +611,10 @@ func TestReceiptRefreshKeepsTheReceiptCurrent(t *testing.T) {
 		f.migrated(t)
 		mustOK(t, os.Remove(f.recordPath))
 
-		o := f.refresh(t, f.rendering(endpointB))
+		o := f.refresh(t, f.rendering(endpointB), "--wait", endpointExpiryWait)
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
 
-		if !strings.Contains(o.str("why"), "200ms") {
+		if !strings.Contains(o.str("why"), endpointExpiryWait) {
 			t.Errorf("why %q names no wait", o.str("why"))
 		}
 
@@ -628,7 +628,7 @@ func TestReceiptRefreshKeepsTheReceiptCurrent(t *testing.T) {
 		f.writeRecord(t, f.record(map[string]any{"deployment": f.deployment, "endpoint": canonicalB,
 			"invocation_id": nodeInvocation, "incarnation": testIncarnation}))
 
-		o := f.refresh(t, f.rendering(endpointB))
+		o := f.refresh(t, f.rendering(endpointB), "--wait", endpointExpiryWait)
 		mustEndpointRefusal(t, o, outcomeRefused, endpointReasonRecord)
 		f.noReceipt(t)
 	})
@@ -1027,7 +1027,7 @@ func TestReceiptRefreshDryRunWritesNothing(t *testing.T) {
 
 		started := time.Now()
 
-		o := f.refresh(t, f.rendering(endpointB), "--dry-run")
+		o := f.refresh(t, f.rendering(endpointB), "--dry-run", "--wait", endpointExpiryWait)
 		mustEndpointOutcome(t, o, outcomeReported)
 
 		if time.Since(started) < 200*time.Millisecond || !strings.Contains(o.str("why"), "no current record") {
@@ -1249,7 +1249,7 @@ func TestTheReceiptFixturesAreTheCommandsOwn(t *testing.T) {
 			t.Helper()
 			mustOK(t, os.Remove(f.recordPath))
 
-			return f.refresh(t, f.rendering(endpointB))
+			return f.refresh(t, f.rendering(endpointB), "--wait", endpointExpiryWait)
 		},
 		"unknown-config": func(t *testing.T, f *receiptCmdFixture) endpointOut {
 			t.Helper()

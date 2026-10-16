@@ -32,6 +32,8 @@ type endpointFixture struct {
 	deployment string
 	logPath    string
 	nodeState  string
+	// wait replaces endpointAnswerWait as migrate's default.
+	wait string
 }
 
 const (
@@ -91,8 +93,8 @@ case "$cmd" in
   stop)
     mode=$(cat "$BILLET_FAKE_UNITS/stop.mode" 2>/dev/null || echo ok)
     case "$mode" in
-      hang) exec sleep 30 ;;
-      hang-ignoring-term) trap '' TERM; exec sleep 30 ;;
+      hang) exec sleep 90 ;;
+      hang-ignoring-term) trap '' TERM; exec sleep 90 ;;
       fail) exit 1 ;;
       replace-config) cp "$BILLET_FAKE_CONFIG" "$BILLET_FAKE_CONFIG.new" && mv "$BILLET_FAKE_CONFIG.new" "$BILLET_FAKE_CONFIG" ;;
     esac
@@ -113,6 +115,14 @@ exit 1
 	endpointPoll = 10 * time.Millisecond
 
 	t.Cleanup(func() { endpointPoll = prevPoll })
+
+	// A STAND-IN systemctl IS NEVER WHAT THE PROPERTY TIMEOUT IS FOR, and a loaded
+	// machine took past its thirty seconds to run one (a receipt test failed at
+	// 53 s on "the deadline ended it", #188). No fake here hangs a read.
+	prevProperty := endpointPropertyTimeout
+	endpointPropertyTimeout = 10 * time.Minute
+
+	t.Cleanup(func() { endpointPropertyTimeout = prevProperty })
 
 	f.setNode(t, "active", "running", inspectPID, nodeInvocation, "mixed")
 	f.writeRecord(t, f.record(map[string]any{"deployment": deployment, "endpoint": canonicalA}))
@@ -341,10 +351,30 @@ func runEndpoint(t *testing.T, fn func(context.Context, cli.Env, []string) error
 	return o
 }
 
+// The two waits an endpoint command's test runs under.
+const (
+	// endpointAnswerWait is the wait of a run whose answer comes from a read: so
+	// long that no load reaches it, because no bracket but the first starts after
+	// the wait, and a 200 ms wait on a loaded machine ended before the read that
+	// would have answered (#188).
+	endpointAnswerWait = "10m"
+	// endpointExpiryWait is the wait of a run whose answer is the wait running
+	// out: a record that never appears. Short, because it is waited out whole, and
+	// load only lengthens it.
+	endpointExpiryWait = "200ms"
+)
+
+// migrate runs `billet node migrate` under endpointAnswerWait unless extra
+// names a wait of its own.
 func (f *endpointFixture) migrate(t *testing.T, stdin string, extra ...string) endpointOut {
 	t.Helper()
 
-	args := append([]string{"--config", f.configPath, "--wait", "200ms"}, extra...)
+	wait := endpointAnswerWait
+	if f.wait != "" {
+		wait = f.wait
+	}
+
+	args := append([]string{"--config", f.configPath, "--wait", wait}, extra...)
 	if stdin != "" {
 		args = append(args, "--desired", "-")
 	}
@@ -648,7 +678,10 @@ func TestMigrateStopDeadlineSignalsOnlyItsOwnSubprocess(t *testing.T) {
 				t.Errorf("why %q state %q", o.str("why"), o.str("state"))
 			}
 
-			if took := time.Since(started); took > 6*time.Second {
+			// HALF THE STAND-IN'S NINETY SECONDS, which a stop the deadline did not
+			// end runs to, and far past the second and a half one it did end takes on
+			// a loaded machine: six seconds was a stopwatch on that machine.
+			if took := time.Since(started); took > 45*time.Second {
 				t.Errorf("the deadline took %s to end the stop", took)
 			}
 
@@ -801,7 +834,7 @@ func TestMigrateWaitsForTheRecordUnderTheNewInvocation(t *testing.T) {
 			f.afterStart(t)
 			c.setup(t, f)
 
-			o := f.migrate(t, f.rendering(endpointB))
+			o := f.migrate(t, f.rendering(endpointB), "--wait", endpointExpiryWait)
 			mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonUnproved)
 
 			if o.str("state") != stateStartedNoRecord || !strings.Contains(o.str("why"), c.words) {
@@ -821,7 +854,7 @@ func TestMigrateDoesNotReadAMissingRecordAsPreR(t *testing.T) {
 	f.rBinary(t)
 
 	for _, extra := range [][]string{{"--dry-run"}, nil} {
-		o := f.migrate(t, f.rendering(endpointB), extra...)
+		o := f.migrate(t, f.rendering(endpointB), append(extra, "--wait", endpointExpiryWait)...)
 		mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
 
 		if !strings.Contains(o.str("why"), "published no record") || f.calls(t, "stop") != 0 {

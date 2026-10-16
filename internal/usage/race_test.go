@@ -13,6 +13,13 @@ import (
 // testLimit is how long Start and Final wait for a sampler in these tests.
 const testLimit = 200 * time.Millisecond
 
+// pastTheTestLimit says whether a call took as long as the production limit,
+// which is what one bounded by lifecycleLimit rather than the monitor's own limit
+// takes at the least. A call under testLimit that a loaded machine stretched to a
+// second and more is not that, and the bound is as far from testLimit as it can
+// be while still catching it.
+func pastTheTestLimit(took time.Duration) bool { return took >= lifecycleLimit }
+
 // runMonitor is a monitor whose Run is serving, ticking only when the test
 // calls Tick, with a short lifecycle limit. Cleanup stops Run and proves it
 // returned.
@@ -97,7 +104,7 @@ func TestAStartDuringAStuckSamplerLeavesItsFirstIntervalUnattributed(t *testing.
 	writer := waitForReader(t, fifo)
 	begun := time.Now()
 	h.m.Start("vm", h.target, 8)
-	if took := time.Since(begun); took > testLimit+time.Second {
+	if took := time.Since(begun); pastTheTestLimit(took) {
 		t.Errorf("Start took %s against a stuck sampler, want about %s", took, testLimit)
 	}
 	unstick(t, writer, stuck)
@@ -266,8 +273,8 @@ func TestAStartThatOutlivesItsLimitDoesNotBringAForgottenJobBack(t *testing.T) {
 	writer := waitForReader(t, fifo)
 	select {
 	case <-started:
-		if took := time.Since(begun); took > testLimit+time.Second {
-			t.Errorf("Start took %s", took)
+		if took := time.Since(begun); pastTheTestLimit(took) {
+			t.Errorf("Start took %s against a limit of %s", took, testLimit)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Start waited on its own stuck read")

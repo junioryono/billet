@@ -2,6 +2,7 @@ package fleetops
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -259,25 +261,51 @@ func TestJobsShowStopsWaitingForGitHub(t *testing.T) {
 	stateDir := t.TempDir()
 	cfg := writeJobsConfig(t, stateDir)
 	lease := seedMeasuredJob(t, stateDir, 77, nil)
+
+	// GITHUB NEVER ANSWERS WHILE THE TEST RUNS, so only a bound ends the read.
+	// Registered after the fake's own cleanup, so the request is let go before
+	// the server closes.
+	ended := make(chan struct{})
+	release := sync.OnceFunc(func() { close(ended) })
 	fakeJobsGitHub(t, func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
-		case <-time.After(30 * time.Second):
+		case <-ended:
 		}
 	})
+	t.Cleanup(release)
+
 	prev := stepsReadLimit
 	stepsReadLimit = 300 * time.Millisecond
 	t.Cleanup(func() { stepsReadLimit = prev })
 
-	started := time.Now()
+	// THE GUARD IS BELOW THE 20 S DEFAULT, so a read bounded by anything but
+	// stepsReadLimit is caught as well as an unbounded one, and far above what a
+	// loaded machine spends around a 300 ms limit; a 10 s bound on the whole
+	// command was a stopwatch on that machine.
+	const guard = 15 * time.Second
+
+	// A GUARD THAT FIRES ENDS THE COMMAND AND JOINS IT before capture restores
+	// stdout and the cleanups restore what the command reads.
 	out := capture(t, func() {
-		if err := Jobs(t.Context(), processEnv(), []string{"show", "--config", cfg, lease}); err != nil {
-			t.Errorf("billet jobs show: %v", err)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- Jobs(ctx, processEnv(), []string{"show", "--config", cfg, lease}) }()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("billet jobs show: %v", err)
+			}
+		case <-time.After(guard):
+			t.Errorf("the command was still waiting on GitHub after %s, on a 300ms limit", guard)
+			cancel()
+			release()
+			<-done
 		}
 	})
-	if took := time.Since(started); took > 10*time.Second {
-		t.Errorf("the command waited %s on a 300ms limit", took)
-	}
 	if !strings.Contains(out, "could not be read from GitHub") || !strings.Contains(out, "deadline exceeded") {
 		t.Errorf("a silent GitHub was not reported as one:\n%s", out)
 	}

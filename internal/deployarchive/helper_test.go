@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -79,15 +80,20 @@ type deployment struct {
 
 // newDeployment builds a REAL one, not a fixture of one.
 //
-// state.Open creates and migrates the ledger, state.DeploymentID mints the
-// identity, and wirecert.LoadOrCreateCA mints the authority and its marker — so
-// what the tests capture and restore is the shape the production code produces
-// rather than an approximation of it that could drift from it silently.
+// state.Open opens the ledger, state.DeploymentID mints the identity, and
+// wirecert.LoadOrCreateCA mints the authority and its marker — so what the tests
+// capture and restore is the shape the production code produces rather than an
+// approximation of it that could drift from it silently. The ledger starts from
+// the template this binary's own state.Open migrated (ledgertest), which the open
+// then verifies migration by migration: migrating every deployment from empty ran
+// each under the ledger's thirty-second startup budget, which a loaded machine
+// missed in three of this package's tests at once (2026-10-10, #188).
 func newDeployment(t *testing.T) deployment {
 	t.Helper()
 
 	root := t.TempDir()
 	stateDir := filepath.Join(root, "state")
+	ledgertest.Seed(t, stateDir)
 
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {

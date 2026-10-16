@@ -159,6 +159,8 @@ func seedPageJob(t *testing.T, stateDir string, job alloc.HistoryJob, measured *
 ) string {
 	t.Helper()
 
+	seedLedger(t, stateDir)
+
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)

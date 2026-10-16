@@ -11,10 +11,14 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
 func TestCheckReportsEveryRegisteredNodesSiteAndLiveness(t *testing.T) {
-	stateDir := t.TempDir()
+	// FROM THE TEMPLATE, NOT MIGRATED FROM EMPTY: a migration from empty runs
+	// under the ledger's thirty-second startup budget, which a loaded machine
+	// missed (#188), and nothing here is about migrating.
+	stateDir := ledgertest.Dir(t)
 	configPath := writeAdminConfig(t, stateDir)
 	body, err := os.ReadFile(configPath)
 	if err != nil {

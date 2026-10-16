@@ -131,7 +131,7 @@ func TestMigrateBindsTheRecordWaitToTheStartedInvocation(t *testing.T) {
 			"invocation_id": later, "incarnation": newIncarnation}))
 	})
 
-	o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+	o := f.migrate(t, f.rendering(endpointB), "--wait", endpointAnswerWait)
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
 
 	if o.str("state") != stateStarted || !strings.Contains(o.str("why"), "moved under the wait") {
@@ -237,7 +237,7 @@ func TestMigrateJudgesPreRWithoutARegistrationDirectory(t *testing.T) {
 	f.preRBinary(t)
 	mustOK(t, os.RemoveAll(f.recordDir))
 
-	o := f.migrate(t, f.rendering(endpointB), "--dry-run")
+	o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", endpointExpiryWait)
 	mustEndpointOutcome(t, o, outcomeReported)
 
 	if o.str("record") != recordAbsentPreR {
@@ -329,7 +329,7 @@ func TestMigrateDoesNotReadAnIncompleteProbeAsPreR(t *testing.T) {
 	writeFile(t, installedBinary, script, 0o755)
 	writeFile(t, filepath.Join(f.procDir, strconv.Itoa(inspectPID), "image"), script, 0o755)
 
-	o := f.migrate(t, f.rendering(endpointB), "--dry-run")
+	o := f.migrate(t, f.rendering(endpointB), "--dry-run", "--wait", endpointExpiryWait)
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonRecord)
 
 	if !strings.Contains(o.str("why"), "within its bound") {
@@ -426,7 +426,7 @@ func TestMigrateCloseRequiresARunningProcess(t *testing.T) {
 		f.afterShows(t, f.calls(t, "show")+1, nodeUnitBody("inactive", "dead", inspectPID+1, newInvocation, "mixed", "success"))
 	})
 
-	o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+	o := f.migrate(t, f.rendering(endpointB), "--wait", endpointAnswerWait)
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
 
 	if o.str("state") != stateStarted || !strings.Contains(o.str("why"), "moved or stopped") {
@@ -604,7 +604,7 @@ func TestMigrateCloseRefusesAStateItDoesNotJudge(t *testing.T) {
 		f.afterShows(t, f.calls(t, "show")+1, nodeUnitBody("maintenance", "running", inspectPID+1, newInvocation, "mixed", "success"))
 	})
 
-	o := f.migrate(t, f.rendering(endpointB), "--wait", "3s")
+	o := f.migrate(t, f.rendering(endpointB), "--wait", endpointAnswerWait)
 	mustEndpointRefusal(t, o, outcomeUnknown, endpointReasonProcess)
 
 	if o.str("state") != stateStarted || !strings.Contains(o.str("why"), "does not judge") {

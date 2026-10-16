@@ -389,7 +389,11 @@ func TestTheDamageCheckReadsE2fsckExitStatus(t *testing.T) {
 			dir := t.TempDir()
 			e2fsck := filepath.Join(dir, "e2fsck")
 			script := "#!/bin/sh\nprintf '%s ' \"$@\" > " + filepath.Join(dir, "args") + "\n" + tc.body + "\n"
-			if err := os.WriteFile(e2fsck, []byte(script), 0o700); err != nil {
+			// FORK-SAFE, because these subtests run in parallel and each execs the
+			// file it has just written: a sibling's fork that inherited this write
+			// descriptor made the exec fail with ETXTBSY, which read as an
+			// operational error on a loaded machine (#188).
+			if err := forkSafeWriteFile(e2fsck, []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			damaged, err := checkDamageWith(t.Context(), e2fsck, "/dev/rbd9")

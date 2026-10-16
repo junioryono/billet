@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -469,9 +470,13 @@ func TestAnInvocationIsBounded(t *testing.T) {
 	//
 	// time.NewTimer rather than time.After, which forbidigo bans for leaking its
 	// timer until it fires.
+	var remaining deadlines
+
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, _ string, _ []string) ([]byte, error) {
+			remaining.note(ctx)
+
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
 
@@ -486,7 +491,6 @@ func TestAnInvocationIsBounded(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	start := time.Now()
 	// errors.Is, not a substring: a %v somewhere in the wrapping chain would
 	// leave the text intact and break every caller that asks what went wrong.
 	if _, err := c.CheckReachable(t.Context()); err == nil {
@@ -497,8 +501,60 @@ func TestAnInvocationIsBounded(t *testing.T) {
 
 	// The bound has to be the one that was configured. A client that gave up
 	// because the TEST's context ended would satisfy every assertion above.
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("the configured timeout did not apply; the call took %s", elapsed)
+	remaining.within(t, 20*time.Millisecond)
+}
+
+// deadlines records the deadline each stalled invocation ran under.
+type deadlines struct {
+	mu        sync.Mutex
+	seen      int
+	unbounded int
+	// most is the most time any bounded invocation had left when it arrived,
+	// which is negative for one whose deadline had already passed.
+	most time.Duration
+}
+
+// note records ctx's deadline.
+func (d *deadlines) note(ctx context.Context) {
+	deadline, ok := ctx.Deadline()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.seen++
+
+	if !ok {
+		d.unbounded++
+
+		return
+	}
+
+	if left := time.Until(deadline); d.seen-d.unbounded == 1 || left > d.most {
+		d.most = left
+	}
+}
+
+// within fails unless an invocation arrived and every one ran under a deadline
+// no further away than bound.
+//
+// THE DEADLINE, NOT THE STOPWATCH: what an invocation had left can only shrink
+// however loaded the machine, so a bound derived from anything but the configured
+// timeout shows here exactly, where a one-second ceiling on the whole call
+// measured the machine as much as the bound. A deadline already passed when the
+// invocation arrived is still the configured one.
+func (d *deadlines) within(t *testing.T, bound time.Duration) {
+	t.Helper()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	switch {
+	case d.seen == 0:
+		t.Error("no stalled invocation arrived; the runner was never reached")
+	case d.unbounded > 0:
+		t.Errorf("%d invocation(s) ran with no deadline; the configured timeout did not apply", d.unbounded)
+	case d.most > bound:
+		t.Errorf("an invocation had %s left, past the configured %s", d.most, bound)
 	}
 }
 
@@ -1567,6 +1623,8 @@ func TestAMissingCephIsRefusedEvenWhenRBDIsPresent(t *testing.T) {
 func TestACephInvocationIsBoundedToo(t *testing.T) {
 	t.Parallel()
 
+	var remaining deadlines
+
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, bin string, args []string) ([]byte, error) {
@@ -1582,6 +1640,8 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 				return []byte("mimic\n"), nil
 			}
 
+			remaining.note(ctx)
+
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
 
@@ -1596,17 +1656,13 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	start := time.Now()
-
 	if _, err := c.CheckReachable(t.Context()); err == nil {
 		t.Fatal("CheckReachable waited out a cluster that never answered and reported success")
 	} else if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("the failure is not the deadline: %v", err)
 	}
 
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("the configured timeout did not apply to the ceph call; it took %s", elapsed)
-	}
+	remaining.within(t, 20*time.Millisecond)
 }
 
 // THE CLONE FORMAT IS PER POOL, and both of these hold clones.

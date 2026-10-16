@@ -47,6 +47,8 @@ type jobSeed struct {
 func seedJob(t *testing.T, stateDir string, seed jobSeed) string {
 	t.Helper()
 
+	seedLedger(t, stateDir)
+
 	db, err := state.Open(t.Context(), stateDir)
 	if err != nil {
 		t.Fatalf("open the ledger: %v", err)
