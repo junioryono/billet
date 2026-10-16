@@ -124,7 +124,13 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 	// WHAT A RUNNING SHAPER INSTALLED IS ITS OWN AND PASSES, which is the state a
 	// converge finds; the record decides that, by the interface's index.
 	shaper := &uplink.Shaper{Iface: name}
-	if r, ok := uplink.ReadRecord(); ok {
+
+	r, ok, err := uplink.ReadRecord()
+	if err != nil {
+		return err
+	}
+
+	if ok {
 		if current, gone, err := r.Resolve(); err == nil && !gone && current == name && r.IFB == shaper.IFB() {
 			shaper.Owned = true
 		}
@@ -141,6 +147,8 @@ func uplinkCheck(ctx context.Context, env cli.Env, args []string) error {
 
 func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 	fs := cli.NewFlagSet("billet uplink clear", env.Stdout)
+	iface := fs.String("interface", "", "with no record, the interface to inspect for shaping; "+
+		"empty inspects the one the default route leaves by")
 	if err := cli.Parse(fs, args); err != nil {
 		return err
 	}
@@ -160,19 +168,21 @@ func uplinkClear(ctx context.Context, env cli.Env, args []string) error {
 
 	// BY THE RECORD AND NOTHING ELSE: wherever the recorded interface is now, and
 	// nothing at all without a record, because nothing else proves what is on an
-	// interface is billet's.
-	r, err := uplink.ClearRecorded(ctx)
+	// interface is billet's. Without one, "nothing to clear" is said only of an
+	// interface inspected and found carrying none of the shaping billet installs.
+	cleared, err := uplink.ClearRecorded(ctx, *iface)
 	if err != nil {
 		return err
 	}
 
-	if r.Iface == "" {
-		fmt.Fprintln(env.Stdout, "billet uplink: no record of shaping on this host; nothing to clear")
+	if !cleared.Recorded {
+		fmt.Fprintf(env.Stdout, "billet uplink: no record of shaping on this host, and %s carries none of "+
+			"the shaping billet installs; nothing to clear\n", cleared.Looked)
 
 		return nil
 	}
 
-	fmt.Fprintf(env.Stdout, "billet uplink: cleared what was recorded on %s\n", r.Iface)
+	fmt.Fprintf(env.Stdout, "billet uplink: cleared what was recorded on %s\n", cleared.Record.Iface)
 
 	return nil
 }

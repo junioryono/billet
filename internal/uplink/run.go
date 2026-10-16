@@ -103,7 +103,7 @@ func Run(ctx context.Context, opts Options) error {
 	// now, so every run starts from an interface carrying nothing of billet's: a
 	// crash's leftovers, and those on an interface the default route has since
 	// left, which overwriting the record would strand.
-	if err := clearRecorded(ctx, nil); err != nil {
+	if _, _, err := clearRecorded(ctx, nil); err != nil {
 		return fmt.Errorf("clear what an earlier run left before shaping %s: %w", iface, err)
 	}
 
@@ -126,16 +126,23 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	opts.Log.Info("shaping the uplink; each direction starts at its ceiling and is cut "+
-		"only when its own traffic raises the latency to the reflectors",
+		"only when its own traffic raises the latency to the reflectors or makes the line drop their probes",
 		"interface", iface, "interface_mbit", speed, "up_ceiling_mbit", ctl.Up.Max,
-		"down_ceiling_mbit", ctl.Down.Max, "reflectors", reflectors, "bloat", opts.Params.Bloat)
+		"down_ceiling_mbit", ctl.Down.Max, "reflectors", pinger.Reflectors(), "bloat", opts.Params.Bloat)
 
 	err = loop(ctx, opts.Log, iface, index, pinger, ctl, shaper)
 
 	// REMOVED ON EVERY WAY OUT, by the record, so an interface renamed while it
 	// ran is still cleared; a removal that failed is an error, and the unit's
-	// ExecStopPost tries again.
-	return errors.Join(err, clearRecorded(context.WithoutCancel(ctx), nil))
+	// ExecStopPost tries again. SAID IN THE LOG, because the ExecStopPost that
+	// follows finds no record, and without this line nothing says the shaping
+	// was there and is gone.
+	r, cleared, clearErr := clearRecorded(context.WithoutCancel(ctx), nil)
+	if clearErr == nil && cleared {
+		opts.Log.Info("removed the shaping this run installed, as it stopped", "interface", r.Iface, "ifb", r.IFB)
+	}
+
+	return errors.Join(err, clearErr)
 }
 
 // Lock takes the one claim on this host's shaping, held by a shaper for its
@@ -166,15 +173,20 @@ func Lock() (func(), error) {
 func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pinger, ctl *Controller,
 	shaper *Shaper,
 ) error {
-	var delays Delays
+	read := func() (Counters, error) { return ReadCounters(iface) }
+	set := func(ctx context.Context, upMbit, downMbit float64) error {
+		if err := shaper.Set(ctx, upMbit, downMbit); err != nil {
+			return fmt.Errorf("change CAKE's rate on %s: %w", iface, err)
+		}
 
-	first, err := ReadCounters(iface)
+		return nil
+	}
+
+	st, err := newStepper(log, pinger, ctl, read, set, time.Now)
 	if err != nil {
 		return err
 	}
 
-	history := []reading{{at: time.Now(), counters: first}}
-	applied := [2]float64{ctl.Up.Rate, ctl.Down.Rate}
 	exe := currentExecutable()
 	exeCheckedAt := time.Now()
 	ticker := time.NewTicker(Tick)
@@ -206,75 +218,12 @@ func loop(ctx context.Context, log *slog.Logger, iface, index string, pinger *Pi
 			}
 		}
 
-		answered, err := pinger.Round(ctx, Tick*8/10)
-		if err != nil {
-			if ctx.Err() != nil {
+		if err := st.tick(ctx); err != nil {
+			if errors.Is(err, errStopping) {
 				return nil
 			}
 
 			return err
 		}
-
-		delay, known := delays.Observe(pinger.Reflectors(), answered)
-
-		now, err := ReadCounters(iface)
-		if err != nil {
-			return err
-		}
-
-		at := time.Now()
-		history = append(history, reading{at: at, counters: now})
-
-		// THE OLDEST READING STILL INSIDE THE WINDOW, keeping one at its edge so
-		// the span is never shorter than the window once it has filled.
-		for len(history) > 2 && at.Sub(history[1].at) >= rateWindow {
-			history = history[1:]
-		}
-
-		oldest := history[0]
-		interval := at.Sub(oldest.at)
-		sent, received := now.Since(oldest.counters)
-
-		if !ctl.Step(Observation{At: at, Interval: interval, SentBits: sent,
-			ReceivedBits: received, Delay: delay, DelayKnown: known}) {
-			continue
-		}
-
-		if !worthApplying(applied, ctl) {
-			continue
-		}
-
-		if err := shaper.Set(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
-			return fmt.Errorf("change CAKE's rate on %s: %w", iface, err)
-		}
-
-		if ctl.Up.Rate < applied[0] || ctl.Down.Rate < applied[1] {
-			log.Info("the line's queue rose under this host's traffic; cut",
-				"up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
-				"moving_up_mbit", round(float64(sent)/interval.Seconds()/1e6),
-				"moving_down_mbit", round(float64(received)/interval.Seconds()/1e6), "delay", delay)
-		}
-
-		applied = [2]float64{ctl.Up.Rate, ctl.Down.Rate}
 	}
 }
-
-// reading is an interface's counters at a moment.
-type reading struct {
-	at       time.Time
-	counters Counters
-}
-
-// worthApplying is whether the rates moved enough to tell tc: every cut, and a
-// rise only once it is two percent, so probing upward is not a command a tick.
-func worthApplying(applied [2]float64, ctl *Controller) bool {
-	for i, rate := range []float64{ctl.Up.Rate, ctl.Down.Rate} {
-		if rate < applied[i] || rate > applied[i]*1.02 {
-			return true
-		}
-	}
-
-	return false
-}
-
-func round(mbit float64) float64 { return float64(int64(mbit*10)) / 10 }
