@@ -247,3 +247,32 @@ func TestCutsThatHelpReachTheFloorAndNoFurther(t *testing.T) {
 		t.Fatalf("the download ended at %.2f Mbit/s; want exactly the %.0f floor", c.Down.Rate, Floor)
 	}
 }
+
+// A NEW EPISODE IS JUDGED AGAINST NOTHING FROM THE LAST ONE. A 30 ms queue no
+// cut moves draws two cuts; the queue clears while the host is idle; the same
+// queue comes back, and draws two cuts of its own, not one measured against
+// the first episode's last cut.
+func TestEachEpisodeGetsItsOwnCuts(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+
+	for n := range 92 {
+		o := moving(n, 0, 300, 30*time.Millisecond)
+		if n >= 40 && n < 52 {
+			o = moving(n, 0, 1, 0)
+		}
+
+		before := c.Down.Rate
+		c.Step(o)
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != 2*c.Params.Futile {
+		t.Fatalf("two episodes of a queue no cut moved drew %d cuts; want %d each", cuts, c.Params.Futile)
+	}
+}

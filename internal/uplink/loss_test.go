@@ -298,3 +298,57 @@ func TestABenchedReflectorsMissesDoNotMakeALoss(t *testing.T) {
 			"no longer counted", c.Down.Rate)
 	}
 }
+
+// A LINE THAT DROPPED BEFORE AN OUTAGE IS CLEAR AFTER IT. Two reflectors
+// missed a probe each while the host was quiet; then five seconds counted no
+// reflector; then a round at baseline with nothing lost, the host running at
+// its rate below the ceiling: the rate rises, because the drops have aged out.
+func TestADropBeforeAnOutageDoesNotHoldTheRateAfterIt(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	c.Down.Rate = 300
+
+	c.Step(probed(0, 0, 8, of3(time.Millisecond, true)))
+	c.Step(probed(1, 0, 8, of3(time.Millisecond, true, "a")))
+	c.Step(probed(2, 0, 8, of3(time.Millisecond, true, "b")))
+
+	for n := 3; n < 13; n++ {
+		c.Step(probed(n, 0, 8, Sample{}))
+	}
+
+	if !c.Step(probed(13, 0, 300, of3(time.Millisecond, true))) || c.Down.Rate <= 300 {
+		t.Fatalf("a clear round after the outage left the download at %.1f; drops from before it still held it",
+			c.Down.Rate)
+	}
+}
+
+// A REFLECTOR ASKED MORE OFTEN IS NOT A CUT HELPING. Two reflectors lose every
+// probe throughout; the third answers every probe, but had answered only one
+// round before the first cut. Pooled, the loss falls from 4 in 5 to 12 in 18
+// with no reflector's own loss changing, and the cuts must still stop at two.
+func TestAReflectorAskedMoreOftenDoesNotReadAsACutHelping(t *testing.T) {
+	t.Parallel()
+
+	c := newController()
+	cuts := 0
+	lossy := []Probe{{Reflector: "b", Lost: true}, {Reflector: "c", Lost: true}}
+
+	for n := range 120 {
+		s := Sample{Probes: append([]Probe{{Reflector: "a"}}, lossy...)}
+		if n == 0 {
+			s = Sample{Probes: lossy}
+		}
+
+		before := c.Down.Rate
+		c.Step(probed(n, 0, 300, s))
+
+		if c.Down.Rate < before {
+			cuts++
+		}
+	}
+
+	if cuts != c.Params.Futile {
+		t.Fatalf("a loss no reflector shed drew %d cuts over a minute; want %d", cuts, c.Params.Futile)
+	}
+}

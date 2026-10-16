@@ -171,10 +171,14 @@ type Direction struct {
 	// Rate is the rate CAKE is set to now, in Mbit/s.
 	Rate float64
 
-	peak          float64
-	peakAt        time.Time
-	lastCut       time.Time
-	cutSince      bool
+	peak     float64
+	peakAt   time.Time
+	lastCut  time.Time
+	cutSince bool
+	// episode is whether a cut has been taken since the queue last cleared;
+	// cutDelay, cutDelayKnown and cutTally are that cut's evidence, which the
+	// next cut in the same episode must improve on.
+	episode       bool
 	cutDelay      time.Duration
 	cutDelayKnown bool
 	cutTally      tally
@@ -384,30 +388,30 @@ func tallyOf(window [][]Probe) tally {
 	return t
 }
 
-// lessLossThan is whether this tally lost a smaller share than then, by a
-// tenth, over the reflectors this round counts that both of them asked: a
-// reflector that joined or left in between changes the share without the line
-// changing at all.
+// lessLossThan is whether this tally lost less than then, by a tenth: the mean
+// of each reflector's own loss rate, over the reflectors this round counts
+// that both of them asked, each weighed the same in both. A reflector that
+// joined or left in between, or was asked more often in one window than the
+// other, changes a pooled share without the line changing at all.
 func (t tally) lessLossThan(then tally, counted []Probe) bool {
-	var nowProbes, nowLost, thenProbes, thenLost int
+	var nowRate, thenRate float64
+
+	cohort := 0
 
 	for _, probe := range counted {
 		now, ok := t[probe.Reflector]
 		before, was := then[probe.Reflector]
 
-		if !ok || !was {
+		if !ok || !was || now.probes == 0 || before.probes == 0 {
 			continue
 		}
 
-		nowProbes, nowLost = nowProbes+now.probes, nowLost+now.lost
-		thenProbes, thenLost = thenProbes+before.probes, thenLost+before.lost
+		cohort++
+		nowRate += float64(now.lost) / float64(now.probes)
+		thenRate += float64(before.lost) / float64(before.probes)
 	}
 
-	if nowProbes == 0 || thenProbes == 0 {
-		return false
-	}
-
-	return float64(nowLost)/float64(nowProbes) < float64(thenLost)/float64(thenProbes)*0.9
+	return cohort > 0 && nowRate < thenRate*0.9
 }
 
 // cutFactor grows the cut with the delay, from GentleCut at Bloat to DeepCut
@@ -466,7 +470,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 			return false, false
 		}
 
-		if d.cutSince && !helped(d, v, o) {
+		if d.episode && !helped(d, v, o) {
 			d.futile++
 		} else {
 			d.futile = 0
@@ -480,7 +484,7 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// starts at the interface's speed, far above anything the line carries,
 		// and only what is actually moving says where the line is.
 		d.Rate = clamp(min(d.Rate, moving)*v.cut, d.Max)
-		d.lastCut, d.cutSince = o.At, true
+		d.lastCut, d.cutSince, d.episode = o.At, true, true
 		d.cutDelay, d.cutDelayKnown, d.cutTally = o.Delay, o.DelayKnown, v.tally
 
 		return d.Rate != before, true
@@ -493,12 +497,13 @@ func (c *Controller) step(d *Direction, moving float64, v verdict, o Observation
 		// holds the traffic from before it, which runs above any rate just cut and
 		// would undo the cut at once.
 		d.Rate = clamp(d.Rate*p.Raise+0.5, d.Max)
-		d.futile = 0
+		d.futile, d.episode = 0, false
 	case v.clear:
 		// THE QUEUE CLEARED: a later one starts a new episode, and cuts are judged
-		// afresh. Not merely "not full": the window refills after every cut, and
-		// forgetting futility while it does would let cuts ratchet on regardless.
-		d.futile = 0
+		// afresh, against nothing from this one. Not merely "not full": the window
+		// refills after every cut, and forgetting futility while it does would let
+		// cuts ratchet on regardless.
+		d.futile, d.episode = 0, false
 	}
 
 	return d.Rate != before, false
