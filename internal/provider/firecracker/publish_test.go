@@ -651,3 +651,23 @@ func TestAPIDFileThatIsAFIFOIsRefusedWithoutWaiting(t *testing.T) {
 		t.Fatal("reading a FIFO in place of the pid file did not return")
 	}
 }
+
+// A PID FILE LONGER THAN ANY PID IS REFUSED, not parsed by its first bytes: padding
+// after a stranger's pid would otherwise read as that pid.
+func TestAPIDFileLongerThanAnyPIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	j := h.p.jailFor(theInstance)
+	padded := "1" + strings.Repeat(" ", maxPIDFile) + "garbage"
+
+	if err := os.WriteFile(j.pidFile(), []byte(padded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if pid, err := h.p.vmmPID(j); err == nil {
+		t.Errorf("a padded pid file read as pid %d", pid)
+	}
+}

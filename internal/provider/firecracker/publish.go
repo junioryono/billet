@@ -39,6 +39,11 @@ const copyChunk = 64 << 20
 // Capture snapshots a running microVM and publishes it under a snapshot name a
 // later Restore can name.
 //
+// CAPTURE ONLY A GUEST YOU TRUST. Every fork restored from the snapshot resumes as
+// that guest was, and a VMM that has been taken over writes the snapshot it likes.
+// billet keeps such a snapshot from harming the host (see Restore); it cannot make it
+// a good golden.
+//
 // THE GUEST IS LEFT PAUSED. Whether a captured state runs again is the caller's
 // decision, because running it duplicates everything in it; Destroy is how it ends.
 //
@@ -117,6 +122,13 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	// THE BINARY THIS VMM IS RUNNING, NOT THE ONE AT ITS PATH NOW. A build replaced
 	// under the same name while the guest ran would otherwise label this snapshot
 	// with a VMM it was not taken by, and a restore with the new build would pass.
+	//
+	// A LABEL, NOT AN AUTHENTICATION. This catches an honest VMM whose binary was
+	// upgraded under it. It does not try to prove which process sends the capture's
+	// bytes against a VMM that has been taken over, because such a VMM already writes
+	// every byte of the snapshot: the label would protect nothing it could not
+	// already change. What contains a hostile snapshot is the restore side, which runs
+	// billet's own build jailed and refuses a loaded guest of another shape.
 	if err := p.checkRunningVMM(j, res, record.VMM); err != nil {
 		return err
 	}

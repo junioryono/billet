@@ -58,33 +58,10 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	name := "selftest-" + env.lease[:12]
 	published := filepath.Join(golden.snapshotsDir(), name)
 
-	// A STORE THIS TEST MADE IS A STORE IT TAKES AWAY, on the node's own chroot base.
-	// Registered first so it runs last, after the snapshots in it are gone, and by
-	// Remove rather than RemoveAll, so a store something else has used is never taken.
-	if _, err := os.Lstat(golden.snapshotsDir()); errors.Is(err, os.ErrNotExist) {
-		t.Cleanup(func() {
-			// UNDER THE STORE'S OWN LOCK, so no publisher on this node is mid-publish
-			// while its lock file goes: one waiting on the old inode then fails to
-			// stage into a store that is gone, rather than locking a new inode beside
-			// a publisher still copying.
-			store, err := golden.openStore(context.WithoutCancel(t.Context()))
-			if err != nil {
-				t.Errorf("lock the snapshots directory this test made: %v", err)
-
-				return
-			}
-			defer store.close()
-
-			if err := os.Remove(filepath.Join(store.path, publishLock)); err != nil {
-				t.Errorf("remove the publish lock this test made: %v", err)
-			}
-
-			if err := os.Remove(store.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("remove the snapshots directory this test made: %v", err)
-			}
-		})
-	}
-
+	// THE STORE AND ITS PUBLISH LOCK STAY. Every publisher on this node shares them,
+	// and removing the lock file, even while holding it, would let a later publisher
+	// lock a new inode beside one already waiting on the old. Only this test's own
+	// snapshots are removed.
 	t.Cleanup(func() {
 		if err := os.RemoveAll(published); err != nil {
 			t.Errorf("remove the published snapshot: %v", err)

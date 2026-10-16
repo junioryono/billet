@@ -1697,7 +1697,18 @@ func readPIDFile(j jail) ([]byte, error) {
 		return nil, fmt.Errorf("%s is not a regular file", j.pidFile())
 	}
 
-	return io.ReadAll(io.LimitReader(f, maxPIDFile))
+	raw, err := io.ReadAll(io.LimitReader(f, maxPIDFile+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", j.pidFile(), err)
+	}
+
+	// LONGER THAN ANY PID IS NOT A PID, and its first bytes are not either: a prefix
+	// of a padded file can parse as a pid it does not hold.
+	if len(raw) > maxPIDFile {
+		return nil, fmt.Errorf("%s is longer than any pid file the jailer writes", j.pidFile())
+	}
+
+	return raw, nil
 }
 
 // maxPIDFile is far more than any pid and its newline.
