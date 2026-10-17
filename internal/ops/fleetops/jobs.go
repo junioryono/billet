@@ -18,13 +18,16 @@ import (
 // cmdJobs is the operator's view of what jobs did.
 func Jobs(ctx context.Context, env cli.Env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet jobs show <lease>")
+		return errors.New("usage: billet jobs show <lease> | billet jobs wait")
 	}
-	if args[0] == "show" {
+	switch args[0] {
+	case "show":
 		return cmdJobsShow(ctx, env, args[1:])
+	case "wait":
+		return cmdJobsWait(ctx, env, args[1:])
 	}
 
-	return fmt.Errorf("unknown jobs command %q; try show", args[0])
+	return fmt.Errorf("unknown jobs command %q; try show or wait", args[0])
 }
 
 // cmdJobsShow prints one job's history and what the host measured it do.
@@ -114,18 +117,24 @@ type jobJSON struct {
 	RunID       int64  `json:"run_id"`
 	// RequestID is GitHub's runner request id, zero for a pooled lease, whose
 	// negative id is billet's own scheduler identity and nothing GitHub shows.
-	RequestID   int64      `json:"request_id"`
-	JobName     string     `json:"job_name"`
-	Repository  string     `json:"repository"`
-	WorkflowRef string     `json:"workflow_ref"`
-	Event       string     `json:"event"`
-	Result      string     `json:"result"`
-	Conclusion  string     `json:"conclusion"`
-	QueuedAt    string     `json:"queued_at"`
-	AssignedAt  string     `json:"assigned_at"`
-	StartedAt   string     `json:"started_at"`
-	FinishedAt  string     `json:"finished_at"`
-	Usage       *usageJSON `json:"usage"`
+	RequestID   int64  `json:"request_id"`
+	JobName     string `json:"job_name"`
+	Repository  string `json:"repository"`
+	WorkflowRef string `json:"workflow_ref"`
+	Event       string `json:"event"`
+	Result      string `json:"result"`
+	Conclusion  string `json:"conclusion"`
+	QueuedAt    string `json:"queued_at"`
+	AssignedAt  string `json:"assigned_at"`
+	StartedAt   string `json:"started_at"`
+	FinishedAt  string `json:"finished_at"`
+	// GitHubQueuedAt, GitHubScaleSetAssignedAt and GitHubRunnerAssignedAt are
+	// GitHub's clock; BoughtAt is when billet bought the lease, on billet's.
+	GitHubQueuedAt           string     `json:"github_queued_at"`
+	GitHubScaleSetAssignedAt string     `json:"github_scale_set_assigned_at"`
+	GitHubRunnerAssignedAt   string     `json:"github_runner_assigned_at"`
+	BoughtAt                 string     `json:"bought_at"`
+	Usage                    *usageJSON `json:"usage"`
 	// Guest is what the job's own VM reported, null when no row was recorded.
 	Guest *guestJSON `json:"guest"`
 	// Window is present only when --window asked for one.
@@ -157,6 +166,8 @@ func renderJobJSON(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage, g *
 		WorkflowRef: rec.Job.WorkflowRef, Event: rec.Job.Event, Result: rec.Result,
 		Conclusion: rec.Conclusion, QueuedAt: rec.QueuedAt, AssignedAt: rec.AssignedAt,
 		StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt, Guest: guestJSONOf(g), Window: win,
+		GitHubQueuedAt: rec.GitHubQueuedAt, GitHubScaleSetAssignedAt: rec.GitHubScaleSetAssignedAt,
+		GitHubRunnerAssignedAt: rec.GitHubRunnerAssignedAt, BoughtAt: rec.BoughtAt,
 	}
 	if u != nil {
 		groups := make(map[string]bool, len(usageGroups))
@@ -212,6 +223,8 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("result", "github %s; billet %s", quoted(rec.Result), orUnknown(rec.Conclusion))
 	line("times", "queued %s, assigned %s, started %s, finished %s", orUnknown(rec.QueuedAt),
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
+	line("github", "%s", githubTimes(rec, orUnknown))
+	line("waited", "%s", waitedLine(rec))
 
 	fmt.Fprintln(w)
 	if u == nil {

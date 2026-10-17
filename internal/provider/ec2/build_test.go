@@ -35,6 +35,9 @@ const (
 		"&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=" +
 		"0000000000000000000000000000000000000000000000000000000000000000"
 	testPayloadDigest = "1111111111111111111111111111111111111111111111111111111111111111"
+	// testRunnerDigest is the runner tarball's digest a test spec carries; the
+	// tests that execute the check compute a real one instead.
+	testRunnerDigest = "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
 func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
@@ -105,7 +108,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 func TestTheArm64ProvisionScriptCarriesTheMatchingRunner(t *testing.T) {
 	t.Parallel()
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -156,7 +159,7 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -247,12 +250,18 @@ func TestTheRunnerArchitectureIsRefusedUnlessItIsOneAWSHas(t *testing.T) {
 		t.Run(tc.arch, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
+			got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: tc.arch})
 
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("architecture %q was accepted; the download would 404 and the "+
 						"build would fail halfway through", tc.arch)
+				}
+
+				// THE ARCHITECTURE'S OWN REFUSAL: every other field is valid, but an
+				// error about any of them would also be an error.
+				if !strings.Contains(err.Error(), "is not x64 or arm64") {
+					t.Errorf("architecture %q was refused for another reason: %v", tc.arch, err)
 				}
 
 				return
@@ -274,8 +283,16 @@ func TestTheRunnerArchitectureIsRefusedUnlessItIsOneAWSHas(t *testing.T) {
 func TestAProvisionScriptNeedsARunnerVersion(t *testing.T) {
 	t.Parallel()
 
-	if _, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, Arch: "x64"}); err == nil {
+	// THE DIGEST IS SUPPLIED, so the version is the one thing missing and the
+	// refusal has to be the version's: every other field would refuse on its own.
+	_, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
+		RunnerSHA256: testRunnerDigest, Arch: "x64"})
+	if err == nil {
 		t.Fatal("a build with no runner version was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "needs a runner version") {
+		t.Errorf("a build with no runner version was refused for another reason: %v", err)
 	}
 }
 
@@ -290,7 +307,7 @@ func TestAProvisionScriptNeedsARunnerVersion(t *testing.T) {
 func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "x64"})
+	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -472,7 +489,7 @@ func TestTheBuilderInstallsTheGitHubCLI(t *testing.T) {
 func mustScript(t *testing.T) string {
 	t.Helper()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "x64"})
+	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -655,7 +672,7 @@ func TestOnlyAGuestInitiatedStopIsTreatedAsASuccessfulBuild(t *testing.T) {
 
 			image, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-				Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
 
 			if tc.wantOK {
@@ -702,7 +719,7 @@ func TestTheBuilderRestatesEveryDeviceTheBaseImageDeclares(t *testing.T) {
 
 	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
 		t.Fatalf("BuildImage: %v", err)
 	}
@@ -762,7 +779,7 @@ func TestABuilderThatIsNotVisibleYetIsNotTreatedAsGone(t *testing.T) {
 
 	image, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	})
 	if err != nil {
 		t.Fatalf("a builder that was not visible on the first ask was treated as gone: %v", err)
@@ -785,7 +802,7 @@ func TestAnImageThatFailsToBecomeAvailableIsNamedInTheError(t *testing.T) {
 
 	_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	})
 	if err == nil {
 		t.Fatal("an image that ended in state \"failed\" was returned as a success")
@@ -808,7 +825,7 @@ func TestAnImageThatFailsToBecomeAvailableIsNamedInTheError(t *testing.T) {
 func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -870,7 +887,7 @@ func TestTheImageStoreIsProvenAgainstTheDaemonNotTheScript(t *testing.T) {
 func TestTheDockerRootCheckResolvesBeforeComparing(t *testing.T) {
 	t.Parallel()
 
-	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	got, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -1033,7 +1050,7 @@ func TestTheImageStoreAssertionsActuallyRefuse(t *testing.T) {
 		t.Skip("no realpath -m here; this runs on the Linux images the AMI targets")
 	}
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
+	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
