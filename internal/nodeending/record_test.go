@@ -685,6 +685,59 @@ func TestAStandingWithoutItsLock(t *testing.T) {
 	}
 }
 
+// A STATE DIRECTORY THAT APPEARS WHILE A STANDING IS JUDGED UNLOCKED IS
+// JUDGED AGAIN UNDER ITS LOCK: a writer may already be recording a stop there.
+func TestADirectoryThatAppearsIsJudgedAgainUnderItsLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "made-meanwhile")
+	calls, heldOnSecond := 0, false
+
+	JudgeStanding(dir, false, func() Unit {
+		calls++
+
+		switch calls {
+		case 1:
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		case 2:
+			heldOnSecond = lockHeld(t, dir)
+		}
+
+		return cleanUnit
+	})
+
+	if calls != 2 || !heldOnSecond {
+		t.Fatalf("systemd was asked %d times, the second with the lock held %v; want twice, the second locked",
+			calls, heldOnSecond)
+	}
+}
+
+// A LOCK HELD PAST THE WAIT IS COULD-NOT-TELL, never a wait without end: one
+// hung holder would otherwise hold every start and stop behind it.
+func TestALockHeldPastTheWaitIsCouldNotTell(t *testing.T) {
+	dir := t.TempDir()
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	j := JudgeStanding(dir, false, func() Unit { return cleanUnit })
+	if j.Verdict != Unknown || !strings.Contains(j.Why, "locked by another process") {
+		t.Fatalf("a standing behind a held lock is %s (%s), want could-not-tell", j.Verdict, j.Why)
+	}
+}
+
 // A MARKER AN EARLIER RESET LEFT IS REMOVED BY THE NEXT ONE, whatever path it
 // takes, or a record that later went missing would read as a reset interrupted.
 func TestAResetRemovesAStaleMarker(t *testing.T) {

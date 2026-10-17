@@ -441,6 +441,20 @@ func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement
 		defer unlock()
 	case !errors.Is(err, fs.ErrNotExist) || dirExists(dir):
 		return lockRefused(err)
+	default:
+		// STILL ABSENT AFTERWARDS, or it is judged again under the lock: a
+		// directory that appeared meanwhile may hold a stop being recorded.
+		after := sample()
+		rec, _, readErr := Read(dir)
+
+		if !dirExists(dir) {
+			return Standing(rec, readErr, after, drainRequired, BootID())
+		}
+
+		if unlock, err = lock(dir); err != nil {
+			return lockRefused(err)
+		}
+		defer unlock()
 	}
 
 	after := sample()

@@ -151,6 +151,13 @@ func judgeNodeStop(
 // acknowledgement. A node already running is not started, so there is nothing
 // to admit: a resumed upgrade proves it as it proves any running service.
 func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Config) error {
+	// A NODE ALREADY RUNNING IS ASKED ABOUT FIRST, without the record's lock,
+	// since nothing is started and a state directory it cannot write must not
+	// refuse it; anything else is judged afresh under the lock.
+	if running(observeNodeUnit(ctx, insp)) {
+		return nil
+	}
+
 	var now nodeending.Unit
 
 	j := nodeending.JudgeStanding(cfg.Node.StateDir, false, func() nodeending.Unit {
@@ -159,8 +166,7 @@ func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Co
 		return now
 	})
 
-	switch now.ActiveState {
-	case "active", "activating", "reloading":
+	if running(now) {
 		return nil
 	}
 
@@ -170,6 +176,17 @@ func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Co
 	}
 
 	return nil
+}
+
+// running says systemd reports the unit up or coming up, so a start of it
+// starts nothing.
+func running(u nodeending.Unit) bool {
+	switch u.ActiveState {
+	case "active", "activating", "reloading":
+		return true
+	}
+
+	return false
 }
 
 // observeNodeUnit is what a judgement reads of the node unit; a failed read

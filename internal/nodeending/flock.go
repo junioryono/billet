@@ -5,19 +5,39 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 // noFollow refuses a symlink planted at the lock's name.
 const noFollow = syscall.O_NOFOLLOW
 
-// flock takes an exclusive lock on f, waiting for the holder: a read-modify-write
-// of the record is a few milliseconds.
+// lockWait bounds the wait for the record's lock. A write is milliseconds and
+// a judgement asks systemd once under it (its own bound is 30 s); a holder past
+// this is hung, and waiting on it would hold every start and stop behind it.
+var lockWait = 90 * time.Second
+
+// errLockHeld is the refusal when the lock stays held past lockWait.
+var errLockHeld = errors.New("the ending record is locked by another process past the wait for it")
+
+// flock takes an exclusive lock on f, waiting for the holder up to lockWait.
 func flock(f *os.File) error {
+	deadline := time.Now().Add(lockWait)
+
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-		if err != syscall.EINTR {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+
+		switch {
+		case err == nil:
+			return nil
+		case err == syscall.EINTR:
+			continue
+		case err != syscall.EWOULDBLOCK:
 			return err
+		case time.Now().After(deadline):
+			return errLockHeld
 		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

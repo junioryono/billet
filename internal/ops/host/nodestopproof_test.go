@@ -245,6 +245,72 @@ func TestARunningNodeIsNotAdmittedAgain(t *testing.T) {
 	}
 }
 
+// A RUNNING NODE IS ADMITTED WITHOUT THE RECORD'S LOCK: a state directory it
+// cannot write (a read-only remount) does not refuse a start that starts
+// nothing.
+func TestARunningNodeNeedsNoLock(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+
+	h := newStopProofHost(t, cleanAfter)
+
+	if err := os.Chmod(h.stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(h.stateDir, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if err := admitNodeStart(t.Context(), h.host.inspect, h.host.cfg); err != nil {
+		t.Fatalf("admitNodeStart over a running node with an unwritable state directory = %v", err)
+	}
+
+	writeFile(t, h.state, cleanAfter, 0o644)
+
+	if err := admitNodeStart(t.Context(), h.host.inspect, h.host.cfg); err == nil ||
+		!strings.Contains(err.Error(), "is not started") {
+		t.Fatalf("admitNodeStart over a stopped node whose record's lock cannot be taken = %v, want refused",
+			err)
+	}
+}
+
+// THE HOST'S START GATE AND ITS JUDGEMENT OF A NODE ALREADY STOPPED TAKE THE
+// RECORD'S LOCK: with a lock this user cannot create, both answer that the
+// record is root's, which only the locked judgement says.
+func TestTheHostsJudgementsTakeTheRecordsLock(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+
+	h := newStopProofHost(t, cleanAfter)
+	writeFile(t, h.state, cleanAfter, 0o644)
+
+	if err := os.Chmod(h.stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(h.stateDir, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+
+	checks := systemdNodeEndings{insp: h.host.inspect}
+
+	if err := checks.AdmitStart(t.Context(), h.host.cfg); err == nil || !strings.Contains(err.Error(), "as root") {
+		t.Errorf("the start gate = %v, want the locked judgement's refusal", err)
+	}
+
+	if j := checks.JudgeStop(t.Context(), h.host.cfg, "", true); !strings.Contains(j.Why, "as root") {
+		t.Errorf("the judgement of a node already stopped = %s (%s), want the locked judgement's refusal",
+			j.Answer, j.Why)
+	}
+}
+
 // THE CHECKS `local up` AND `local down` USE ASK THE UNIT AND THE RECORD: the
 // adapter behind the seam TestMain replaces, driven through a systemctl.
 func TestTheSystemdChecksAskTheUnitAndTheRecord(t *testing.T) {
