@@ -45,6 +45,10 @@ UPDATE job_history SET run_id = @run_id
 -- the statement so a message about a different job can never splice its name
 -- or repository onto the one this row recorded, which is also why the job id
 -- itself needs no CASE: the filter admits only an empty one or the same.
+--
+-- GITHUB'S TIMES FOLLOW THE SAME RULE: each is written once, from the first
+-- message about this job that carried it, and an empty one (a time the message
+-- left out) never replaces anything. They are GitHub's clock, kept verbatim.
 UPDATE job_history
    SET github_job_id = CAST(@github_job_id AS TEXT),
        repo          = CASE WHEN COALESCE(repo, '') = '' THEN CAST(@repo AS TEXT)
@@ -53,9 +57,41 @@ UPDATE job_history
                             ELSE workflow_ref END,
        job_name      = CASE WHEN job_name = '' THEN CAST(@job_name AS TEXT)
                             ELSE job_name END,
-       event         = CASE WHEN event = '' THEN CAST(@event AS TEXT) ELSE event END
+       event         = CASE WHEN event = '' THEN CAST(@event AS TEXT) ELSE event END,
+       github_queued_at = CASE WHEN github_queued_at = ''
+                               THEN CAST(@github_queued_at AS TEXT) ELSE github_queued_at END,
+       github_scale_set_assigned_at = CASE WHEN github_scale_set_assigned_at = ''
+                               THEN CAST(@github_scale_set_assigned_at AS TEXT)
+                               ELSE github_scale_set_assigned_at END,
+       github_runner_assigned_at = CASE WHEN github_runner_assigned_at = ''
+                               THEN CAST(@github_runner_assigned_at AS TEXT)
+                               ELSE github_runner_assigned_at END
  WHERE lease_id = @lease_id
    AND (github_job_id = '' OR github_job_id = CAST(@github_job_id AS TEXT));
+
+-- name: ReadJobWait :one
+-- The two ends of one job's queue wait, and its tier: GitHub's queue time and
+-- billet's start, each empty while unrecorded.
+SELECT tier, github_queued_at, COALESCE(started_at, '') AS started_at
+  FROM job_history WHERE lease_id = @lease_id;
+
+-- name: ListJobWaits :many
+-- The jobs that started since a moment, with every time their wait is split
+-- by, newest start first, bounded: a window past the bound loses its oldest
+-- jobs, never the ones an operator is looking at now.
+--
+-- WINDOWED ON started_at, because a wait is known once the job starts: a job
+-- still queued has no row here that says so, and the report counts those from
+-- the listeners' own reports instead. Every empty time is "not recorded", which
+-- the report keeps out of the parts it cannot compute rather than reading it
+-- as zero. vcpu is the charged shape, written when the row opens.
+SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
+       github_runner_assigned_at, bought_at, COALESCE(assigned_at, '') AS assigned_at,
+       COALESCE(started_at, '') AS started_at
+  FROM job_history
+ WHERE started_at IS NOT NULL AND started_at >= @since
+ ORDER BY started_at DESC, lease_id DESC
+ LIMIT CAST(@max_rows AS BIGINT);
 
 -- name: ListAttributedFailures :many
 -- Jobs that did not succeed while billet's own infrastructure was disrupted.
@@ -118,16 +154,28 @@ UPDATE job_history SET failure_reason = @failure_reason
 -- AT ASSIGNMENT RATHER THAN AT TERMINALIZATION, so the row carries a real
 -- assignment time instead of one fabricated when the lease closes.
 --
+-- WITH WHEN THE LEASE WAS BOUGHT AND ITS CHARGED SHAPE, which a queue-wait
+-- report splits a wait by and groups jobs under while the lease still runs;
+-- the archive overwrites the shape with the same terminal facts. The purchase
+-- time is the lease row's own, read here because that row is reaped and this
+-- one is what an operator reads, and kept at its first value.
+--
 -- THE HOST IS COALESCE(node, target_node), the way the rest of the arithmetic
 -- reads a lease: `node` is filled at bind and escrow chose the machine long
 -- before that, so a lease that never binds -- assigned by GitHub, then the
 -- process dies -- recorded no host at all, and the jobs most worth investigating
 -- are exactly the ones that end that way.
-INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at)
-VALUES (@lease_id, @tier, @node, @run_id, @request_id, @queued_at, @assigned_at)
+INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at,
+                         vcpu, memory, bought_at)
+VALUES (@lease_id, @tier, @node, @run_id, @request_id, @queued_at, @assigned_at,
+        @vcpu, @memory,
+        COALESCE((SELECT created_at FROM leases WHERE id = @lease_id), ''))
 ON CONFLICT (lease_id) DO UPDATE SET
   run_id = excluded.run_id, request_id = excluded.request_id,
-  assigned_at = excluded.assigned_at;
+  assigned_at = excluded.assigned_at,
+  vcpu = excluded.vcpu, memory = excluded.memory,
+  bought_at = CASE WHEN job_history.bought_at = '' THEN excluded.bought_at
+                   ELSE job_history.bought_at END;
 
 -- name: ArchiveJobHistory :exec
 -- Close the history row when the lease terminalizes.
@@ -292,5 +340,6 @@ SELECT lease_id, tier, COALESCE(node, '') AS node, COALESCE(run_id, 0) AS run_id
        COALESCE(conclusion, '') AS conclusion, failure_reason, result, disruption,
        queued_at, COALESCE(assigned_at, '') AS assigned_at,
        COALESCE(started_at, '') AS started_at, COALESCE(finished_at, '') AS finished_at,
-       chosen_provider, instance_type, vcpu, memory, site
+       chosen_provider, instance_type, vcpu, memory, site, github_queued_at,
+       github_scale_set_assigned_at, github_runner_assigned_at, bought_at
   FROM job_history WHERE lease_id = @lease_id;

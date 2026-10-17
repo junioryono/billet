@@ -2,8 +2,11 @@ package scaleset
 
 import (
 	"testing"
+	"time"
 
 	gh "github.com/actions/scaleset"
+
+	"github.com/junioryono/billet/internal/dispatch"
 )
 
 // Field mapping is where a silent error hides, so every field gets a DISTINCT
@@ -188,5 +191,54 @@ func TestTranslateDropsPreAssignmentMessages(t *testing.T) {
 	}
 	if len(got.Started) != 1 || got.Started[0].RequestID != 10 {
 		t.Errorf("JobStarted binding = %+v, want request 10", got.Started)
+	}
+}
+
+// GitHub's queue, scale-set and runner times reach billet from every message
+// kind, each job its own, and a time the message left out stays zero rather
+// than borrowing another job's.
+func TestTranslateCarriesGitHubsTimesForEveryKind(t *testing.T) {
+	at := func(minute int) time.Time { return time.Date(2026, 10, 16, 7, minute, 0, 0, time.UTC) }
+	base := func(request int64, minute int) gh.JobMessageBase {
+		return gh.JobMessageBase{RunnerRequestID: request, QueueTime: at(minute),
+			ScaleSetAssignTime: at(minute + 1), RunnerAssignTime: at(minute + 2)}
+	}
+
+	got := translate(&gh.RunnerScaleSetMessage{
+		MessageID:            1,
+		JobAvailableMessages: []*gh.JobAvailable{{JobMessageBase: base(1, 10)}},
+		JobAssignedMessages:  []*gh.JobAssigned{{JobMessageBase: base(2, 20)}},
+		JobStartedMessages:   []*gh.JobStarted{{RunnerID: 7, JobMessageBase: base(3, 30)}},
+		JobCompletedMessages: []*gh.JobCompleted{
+			{Result: "succeeded", JobMessageBase: base(4, 40)},
+			{JobMessageBase: gh.JobMessageBase{RunnerRequestID: 5}},
+		},
+	})
+
+	for _, c := range []struct {
+		kind   string
+		jobs   []dispatch.Job
+		minute int
+	}{
+		{"available", got.Available, 10}, {"assigned", got.Assigned, 20},
+		{"started", got.Started, 30}, {"completed", got.Completed, 40},
+	} {
+		if len(c.jobs) == 0 {
+			t.Fatalf("%s: no job translated", c.kind)
+		}
+		j := c.jobs[0]
+		if !j.QueuedAt.Equal(at(c.minute)) || !j.ScaleSetAssignedAt.Equal(at(c.minute+1)) ||
+			!j.RunnerAssignedAt.Equal(at(c.minute+2)) {
+			t.Errorf("%s: times = %v, %v, %v; want minutes %d, %d, %d", c.kind,
+				j.QueuedAt, j.ScaleSetAssignedAt, j.RunnerAssignedAt, c.minute, c.minute+1, c.minute+2)
+		}
+	}
+	if got.Started[0].RunnerID != 7 || got.Completed[0].Result != "succeeded" {
+		t.Errorf("the kind's own fields were lost: started %+v, completed %+v",
+			got.Started[0], got.Completed[0])
+	}
+	bare := got.Completed[1]
+	if !bare.QueuedAt.IsZero() || !bare.ScaleSetAssignedAt.IsZero() || !bare.RunnerAssignedAt.IsZero() {
+		t.Errorf("a message without times gained some: %+v", bare)
 	}
 }

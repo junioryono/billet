@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -49,6 +50,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sys/unix"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/deploymentid"
@@ -147,6 +149,9 @@ type Provider struct {
 	chown    chownFunc
 	chownOne chownFunc
 	apiFor   func(socket string) *vmmAPI
+	// apiAs is apiFor for a VMM that must answer as a given uid (newVMMAPIAs). A
+	// seam because the fake VMMs in tests answer as the test's own account.
+	apiAs func(socket string, uid int) *vmmAPI
 	// syncFile and syncDir are the durability boundary for ownership and resource
 	// records. They are seams so crash-ordering tests can observe the operations a
 	// normal filesystem cannot report after the fact.
@@ -157,6 +162,23 @@ type Provider struct {
 	// could not tie to this microVM — is only testable if "could not tell" can be
 	// staged.
 	pidOwner func(pid int, jailID string) (bool, error)
+	// tapOwner reports the uid that owns a tap, and whether the device exists. A
+	// seam because it reads /sys, and because what a teardown deletes depends on it.
+	tapOwner func(tap string) (int, bool, error)
+	// cpuinfoPath and hostKernel are where this host's compatibility record comes
+	// from (hostCompatibility). Seams, because a test has to stage a host a
+	// snapshot was not taken on.
+	cpuinfoPath string
+	hostKernel  func() (string, error)
+	// digests remembers the digests of the VMM binary and the guest kernels.
+	digests fileDigests
+	// jailWrote reports whether a file in a jail is one its VMM wrote. A seam
+	// because the account a VMM runs as is one only root can create files as.
+	jailWrote func(st unix.Stat_t, res resources) bool
+	// runningVMM opens the executable of the process serving a jail's API socket,
+	// which may no longer be the file at the configured path. A seam because it
+	// needs the kernel's socket credentials and /proc/<pid>/exe.
+	runningVMM func(ctx context.Context, j jail, res resources) (*os.File, error)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -240,6 +262,15 @@ func withPidOwner(f func(pid int, jailID string) (bool, error)) Option {
 	}
 }
 
+// withTapOwner replaces the kernel's answer to whose a network device is.
+func withTapOwner(f func(tap string) (int, bool, error)) Option {
+	return func(p *Provider) {
+		if f != nil {
+			p.tapOwner = f
+		}
+	}
+}
+
 // withDurability replaces filesystem syncs for crash-ordering tests.
 func withDurability(file func(*os.File) error, dir func(string) error) Option {
 	return func(p *Provider) {
@@ -294,22 +325,30 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 	}
 
 	p := &Provider{
-		log:      slog.Default(),
-		owner:    owner,
-		cfg:      cfg,
-		disk:     disk,
-		run:      execRunner,
-		lookPath: exec.LookPath,
-		mknod:    mknodBlock,
-		chown:    chownTree,
-		chownOne: os.Chown,
-		apiFor:   newVMMAPI,
-		syncFile: func(file *os.File) error { return file.Sync() },
-		syncDir:  syncDirectory,
-		pidOwner: pidIsVMM,
-		bootWait: DefaultBootWait,
+		log:         slog.Default(),
+		owner:       owner,
+		cfg:         cfg,
+		disk:        disk,
+		run:         execRunner,
+		lookPath:    exec.LookPath,
+		mknod:       mknodBlock,
+		chown:       chownTree,
+		chownOne:    os.Chown,
+		apiFor:      newVMMAPI,
+		apiAs:       newVMMAPIAs,
+		syncFile:    func(file *os.File) error { return file.Sync() },
+		syncDir:     syncDirectory,
+		pidOwner:    pidIsVMM,
+		tapOwner:    sysTapOwner,
+		cpuinfoPath: "/proc/cpuinfo",
+		hostKernel:  unameKernel,
+		jailWrote:   jailWritten,
+		bootWait:    DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
+	p.runningVMM = func(ctx context.Context, j jail, res resources) (*os.File, error) {
+		return apiPeerExecutable(ctx, j.socket(), res.UID)
+	}
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle
 	p.removeCgroupAtFn = p.removeCgroupAt
@@ -436,6 +475,38 @@ func (p *Provider) bridgeFor(trust provider.TrustClass) string {
 // this repository was bitten by, where every signal reported success and no runner
 // ever started.
 func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, error) {
+	return p.start(ctx, spec, "")
+}
+
+// Restore starts one microVM from a snapshot this node has published, rather than
+// from a cold boot. The spec names the lease, the trust class and the root disk
+// generation that was captured with the snapshot, exactly as a launch does.
+//
+// EVERYTHING BEFORE THE VMM IS A LAUNCH'S, the lease lock, the lifecycle record, the
+// claimed jail, the clone and the unwind, because what a restore leaves behind on a
+// failure is the same set of things a launch does, and one path is what keeps them
+// accounted for. Only the last step differs: the snapshot is linked into the jail
+// and loaded through restore, in place of configuring and booting a kernel.
+func (p *Provider) Restore(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
+	if snapshot == "" {
+		return nil, fmt.Errorf("firecracker: %w: a restore of %s names no snapshot",
+			errSnapshotNotPublished, spec.Name)
+	}
+
+	// NEVER GROWN. A restored guest's kernel already has the root filesystem mounted
+	// at the size it had when the snapshot was taken; resizing it underneath would
+	// change a filesystem the guest believes it knows.
+	if spec.Disk > 0 {
+		return nil, fmt.Errorf("firecracker: %s asks for a %s root disk, and a restore keeps the "+
+			"size the snapshot was taken at", spec.Name, spec.Disk)
+	}
+
+	return p.start(ctx, spec, snapshot)
+}
+
+// start is Launch and Restore: a cold boot when snapshot is empty, a restore of
+// that published snapshot otherwise.
+func (p *Provider) start(ctx context.Context, spec provider.Spec, snapshot string) (*Instance, error) {
 	if err := checkSpec(spec); err != nil {
 		return nil, err
 	}
@@ -565,7 +636,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// something started" and asks Find — so this is not the safety net, it is the
 	// ordinary case being tidy. What it must never do is replace the reason the
 	// launch failed with the reason a cleanup failed.
-	inst, err := p.launch(ctx, j, spec, device, kernel, res)
+	inst, err := p.launch(ctx, j, spec, device, kernel, res, snapshot)
 	if err != nil {
 		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 	}
@@ -581,10 +652,24 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 // launch does the work Launch unwinds on failure.
 func (p *Provider) launch(
-	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources,
+	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources, snapshot string,
 ) (*Instance, error) {
 	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
 		return nil, err
+	}
+
+	// THE SIZE BILLET ASKED FOR, where the guest cannot rewrite it: what a capture of
+	// this microVM is bounded by, and what a restore from it must ask for again.
+	if err := p.writeShape(j, spec); err != nil {
+		return nil, err
+	}
+
+	// AFTER build, WHICH CHOWNS THE CHROOT, for the reason the kernel is placed
+	// after it: a link is the published file itself, and must never be chowned.
+	if snapshot != "" {
+		if err := p.placeSnapshot(j, snapshot, kernel, spec); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
@@ -598,6 +683,10 @@ func (p *Provider) launch(
 	api, err := p.awaitAPI(ctx, j)
 	if err != nil {
 		return nil, err
+	}
+
+	if snapshot != "" {
+		return p.restoreInto(ctx, api, spec, res.Tap)
 	}
 
 	if err := p.configure(ctx, api, spec, res.Tap); err != nil {
@@ -1074,14 +1163,9 @@ const guestInterface = "eth0"
 // persistent-MAC policy rewrite it from a baked machine-id -- collapses every clone
 // onto one address.
 func guestMAC(tap string) (string, error) {
-	suffix, ok := strings.CutPrefix(tap, config.TapPrefix)
-	n, err := strconv.Atoi(suffix)
-	// Require the CANONICAL spelling claimTap produces: the prefix present, the index
-	// round-tripping (so "bt-07", "bt-+7", a bare "7" and out-of-range are refused),
-	// and in the claimed range. Anything else is a caller bug, not a guest to launch.
-	if !ok || err != nil || n < 0 || n >= maxTaps || strconv.Itoa(n) != suffix {
-		return "", fmt.Errorf("firecracker: cannot derive a MAC from tap %q: expected the "+
-			"canonical %s<index> with index in [0,%d)", tap, config.TapPrefix, maxTaps)
+	n, err := tapIndex(tap)
+	if err != nil {
+		return "", fmt.Errorf("firecracker: cannot derive a MAC from tap %q: %w", tap, err)
 	}
 	// 0x02 in the first octet marks the address locally administered and unicast. The
 	// tap index is < maxTaps (4096, 12 bits) and fills the low two octets; the tap
@@ -1095,6 +1179,21 @@ func guestMAC(tap string) (string, error) {
 	// be broken -- two DHCP servers answering one subnet -- so it is out of scope
 	// rather than a case this MAC must also disambiguate.
 	return fmt.Sprintf("02:00:00:00:%02x:%02x", byte(n>>8), byte(n)), nil
+}
+
+// tapIndex is the index of a tap name in the CANONICAL spelling claimTap produces:
+// the prefix present, the index round-tripping (so "bt-07", "bt-+7", a bare "7" and
+// out-of-range are refused), and in the claimed range. Anything else is a caller bug.
+func tapIndex(tap string) (int, error) {
+	suffix, ok := strings.CutPrefix(tap, config.TapPrefix)
+	n, err := strconv.Atoi(suffix)
+
+	if !ok || err != nil || n < 0 || n >= maxTaps || strconv.Itoa(n) != suffix {
+		return 0, fmt.Errorf("expected the canonical %s<index> with index in [0,%d)",
+			config.TapPrefix, maxTaps)
+	}
+
+	return n, nil
 }
 
 // mmdsAddress is the link-local address the metadata service answers on. The same
@@ -1343,11 +1442,11 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	// has it, that launch fails and releases the name, and every launch after it
 	// fails identically until an operator intervenes. Keeping the claim is what lets
 	// a later teardown find this device and finish removing it.
-	tapGone := true
-
-	if err := p.deleteTap(ctx, res.Tap); err != nil {
+	//
+	// AND ONLY A DEVICE THE KERNEL SAYS IS BILLET'S IS DELETED (removeTap).
+	keep, err := p.removeTap(ctx, res, j.id)
+	if err != nil {
 		failures = append(failures, err)
-		tapGone = false
 	}
 
 	if err := p.removeCgroupFn(j); err != nil {
@@ -1382,12 +1481,7 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 	// legitimately taken this uid or device name in the gap. Deleting it by name
 	// alone would then free a live claim and hand a running microVM's uid to the
 	// launch after it.
-	held := res
-	if !tapGone {
-		held.Tap = ""
-	}
-
-	if err := p.releaseResources(held, j.id); err != nil {
+	if err := p.releaseResources(releasable(res, keep), j.id); err != nil {
 		failures = append(failures, err)
 	}
 
@@ -1508,7 +1602,7 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 // longer this jail's VMM. No pid file, an unreadable one and a process billet
 // cannot inspect are all "could not tell", which is false here.
 func (p *Provider) vmmExited(j jail) bool {
-	raw, err := os.ReadFile(j.pidFile())
+	raw, err := readPIDFile(j)
 	if err != nil {
 		return false
 	}
@@ -1524,7 +1618,7 @@ func (p *Provider) vmmExited(j jail) bool {
 }
 
 func (p *Provider) vmmPID(j jail) (int, error) {
-	raw, err := os.ReadFile(j.pidFile())
+	raw, err := readPIDFile(j)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// NO PID FILE IS ONLY "NOTHING IS RUNNING" IF NO VMM EVER STARTED, and
@@ -1577,6 +1671,52 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 
 	return pid, nil
 }
+
+// readPIDFile reads a jail's pid file as a file and nothing else.
+//
+// IT IS IN THE JAIL ROOT, which the jailed account owns, so the name could be
+// anything by the time billet reads it: a FIFO with no writer, on which a plain read
+// waits forever while billet holds this lease's locks, or a link to somewhere else.
+// So it is opened without following a link and without blocking, refused unless it
+// is a regular file, and read no further than a pid could need.
+func readPIDFile(j jail) ([]byte, error) {
+	fd, err := unix.Open(j.pidFile(), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil, os.ErrNotExist
+		}
+
+		return nil, fmt.Errorf("open %s: %w", j.pidFile(), err)
+	}
+
+	f := os.NewFile(uintptr(fd), j.pidFile())
+	defer f.Close()
+
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("read %s: %w", j.pidFile(), err)
+	}
+
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, fmt.Errorf("%s is not a regular file", j.pidFile())
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(f, maxPIDFile+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", j.pidFile(), err)
+	}
+
+	// LONGER THAN ANY PID IS NOT A PID, and its first bytes are not either: a prefix
+	// of a padded file can parse as a pid it does not hold.
+	if len(raw) > maxPIDFile {
+		return nil, fmt.Errorf("%s is longer than any pid file the jailer writes", j.pidFile())
+	}
+
+	return raw, nil
+}
+
+// maxPIDFile is far more than any pid and its newline.
+const maxPIDFile = 64
 
 // awaitExit waits for a signalled VMM to actually be gone.
 //
@@ -1673,13 +1813,18 @@ func (p *Provider) unwind(
 	// The errTapTaken case keeps the name for the opposite reason — the device is not
 	// billet's to delete, so the name must stay out of the pool rather than be handed
 	// to a launch that would fail on it too.
-	tapGone := false
+	//
+	// AND NOT A DEVICE THIS LAUNCH NEVER MADE. A failure before addTap finds no
+	// device under the name, or one the kernel says is not billet's, and removeTap
+	// deletes neither; a retained jail's later Destroy asks the kernel again.
+	keep := resources{Tap: res.Tap}
 
 	if !errors.Is(cause, errTapTaken) {
-		if err := p.deleteTap(ctx, res.Tap); err != nil {
+		var err error
+
+		keep, err = p.removeTap(ctx, res, j.id)
+		if err != nil {
 			failures = append(failures, err)
-		} else {
-			tapGone = true
 		}
 	}
 
@@ -1705,12 +1850,7 @@ func (p *Provider) unwind(
 	// let another launch take the uid a live VMM is running as — and each release
 	// checks the claim still names THIS jail, since the jail is gone by now and a
 	// concurrent launch may have legitimately reaped and re-taken it.
-	held := res
-	if !tapGone {
-		held.Tap = ""
-	}
-
-	if err := p.releaseResources(held, j.id); err != nil {
+	if err := p.releaseResources(releasable(res, keep), j.id); err != nil {
 		failures = append(failures, err)
 	}
 
