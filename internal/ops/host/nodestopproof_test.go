@@ -310,6 +310,50 @@ func TestANodeThatCameUpMeanwhileIsAdmitted(t *testing.T) {
 	}
 }
 
+// A RUNNING SAMPLE THE VERDICT DOES NOT REST ON ADMITS NOTHING: the gate looks
+// first (inactive), the unlocked judgement then sees the node running as its
+// state directory appears, and the lock there is refused. The answer is the
+// refusal, not an admission on the discarded sample.
+func TestADiscardedRunningSampleAdmitsNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+
+	inactive := nodeending.Unit{ActiveState: "inactive", SubState: "dead", Result: "success", MainPID: "0",
+		JobAnswered: true}
+	active := nodeending.Unit{ActiveState: "active", SubState: "running", Result: "success", MainPID: "5",
+		JobAnswered: true}
+
+	dir := filepath.Join(t.TempDir(), "made-meanwhile")
+
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o700); err != nil && !os.IsNotExist(err) {
+			t.Error(err)
+		}
+	})
+
+	calls := 0
+
+	j := admitStart(dir, func() nodeending.Unit {
+		calls++
+		if calls == 1 {
+			return inactive
+		}
+
+		if err := os.Mkdir(dir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+
+		return active
+	})
+
+	if j.Verdict != nodeending.Unknown || !strings.Contains(j.Why, "as root") ||
+		j.Sampled != (nodeending.Unit{}) {
+		t.Fatalf("the gate over a discarded running sample = %s on %+v (%s), want could-not-tell on none",
+			j.Answer, j.Sampled, j.Why)
+	}
+}
+
 // THE HOST'S START GATE AND ITS JUDGEMENT OF A NODE ALREADY STOPPED TAKE THE
 // RECORD'S LOCK: with a lock this user cannot create, both answer that the
 // record is root's, which only the locked judgement says.

@@ -202,6 +202,12 @@ func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 		return unit
 	})
 
+	// Only the sample the answer rests on: one discarded because the lock was
+	// then refused is not evidence of anything.
+	if j.Sampled == (nodeending.Unit{}) {
+		observed = nil
+	}
+
 	return answerEnding(env, endingAnswer{Command: "admit-start", Unit: observed, judgement: &j})
 }
 

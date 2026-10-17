@@ -167,16 +167,18 @@ func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Co
 // admitted as running only on the sample that judgement rests on, never on one
 // taken before a lock that was then refused.
 func admitStart(dir string, sample func() nodeending.Unit) nodeending.Judgement {
-	runs := nodeending.Judgement{Verdict: nodeending.Proved, Answer: nodeending.Proved.String(),
-		Why: "the node is running, so a start starts nothing"}
+	runs := func(u nodeending.Unit) nodeending.Judgement {
+		return nodeending.Judgement{Verdict: nodeending.Proved, Answer: nodeending.Proved.String(),
+			Proof: nodeending.ProofRunning, Why: "the node is running, so a start starts nothing", Sampled: u}
+	}
 
-	if running(sample()) {
-		return runs
+	if u := sample(); running(u) {
+		return runs(u)
 	}
 
 	j := nodeending.JudgeStanding(dir, false, sample)
 	if running(j.Sampled) {
-		return runs
+		return runs(j.Sampled)
 	}
 
 	return j

@@ -37,6 +37,9 @@ const (
 	ProofSystemd      = "systemd"
 	ProofAcknowledged = "acknowledged"
 	ProofReboot       = "reboot"
+	// ProofRunning is a start admitted because the node already runs: it
+	// starts nothing, and admits a start, never a restart.
+	ProofRunning = "running"
 )
 
 // Judgement is a verdict with what it rests on and why.

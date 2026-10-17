@@ -214,8 +214,10 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		f.begin(t, "inv-1", nodeending.Running)
 		f.unit(t, "active", "running", "success", "41", "inv-1")
 
-		if a := f.run(t, "admit-start"); a.code != 0 || !strings.Contains(a.str("why"), "starts nothing") {
-			t.Fatalf("admit-start over a running node: code %d (%s), want admitted", a.code, a.str("why"))
+		if a := f.run(t, "admit-start"); a.code != 0 || a.str("proof") != nodeending.ProofRunning ||
+			!strings.Contains(a.raw, `"active_state": "active"`) {
+			t.Fatalf("admit-start over a running node: code %d proof %q (%s), want admitted as running with "+
+				"the unit it rests on:\n%s", a.code, a.str("proof"), a.str("why"), a.raw)
 		}
 	})
 

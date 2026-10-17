@@ -436,7 +436,9 @@ func lockRefused(err error) Judgement {
 func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement {
 	unlock, err := lock(dir)
 	if errors.Is(err, fs.ErrNotExist) && dirExists(dir) {
-		// The directory appeared between the attempt and the look.
+		// The directory appeared between the attempt and the look. Untested: the
+		// window is a few instructions wide, and missing it costs only a
+		// could-not-tell.
 		unlock, err = lock(dir)
 	}
 
