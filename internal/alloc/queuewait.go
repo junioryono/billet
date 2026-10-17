@@ -44,7 +44,9 @@ type waitsToTell struct {
 // ifCompleted adds the lease's wait when this transaction's write is the one
 // that made both of its ends known: the queue time and the start are each
 // written once, so exactly one write ever completes the pair, whichever of the
-// two lands second.
+// two lands second. That holds because writes are serialized (SQLite's
+// IMMEDIATE begin, PostgreSQL's advisory lock), so this before is read after
+// any other write's commit; it must stay inside the write that changes the row.
 func (w *waitsToTell) ifCompleted(ctx context.Context, tx *sql.Tx, leaseID string,
 	before ledgerdb.ReadJobWaitRow,
 ) error {

@@ -41,18 +41,18 @@ func cmdJobsWait(ctx context.Context, env cli.Env, args []string) error {
 		return err
 	}
 
+	// A LABEL THE CONFIGURATION DOES NOT NAME IS REFUSED, so a typo is not read
+	// as a tier that started nothing.
+	if *tier != "" && !slices.ContainsFunc(cfg.Tiers, func(t config.Tier) bool { return t.Label == *tier }) {
+		return fmt.Errorf("billet jobs wait: --tier %q is not a tier in %s", *tier, *cfgPath)
+	}
+
 	a, closeDB, err := ControlPlaneAllocator(ctx, *cfgPath)
 	if err != nil {
 		return err
 	}
 
 	defer closeDB()
-
-	// A LABEL THE CONFIGURATION DOES NOT NAME IS REFUSED, so a typo is not read
-	// as a tier that started nothing.
-	if *tier != "" && !slices.ContainsFunc(cfg.Tiers, func(t config.Tier) bool { return t.Label == *tier }) {
-		return fmt.Errorf("billet jobs wait: --tier %q is not a tier in %s", *tier, *cfgPath)
-	}
 
 	report, err := buildJobWaits(ctx, a, cfg.Tiers, *tier, time.Now().Add(-*since))
 	if err != nil {

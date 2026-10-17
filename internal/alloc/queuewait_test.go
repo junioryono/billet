@@ -1,6 +1,8 @@
 package alloc
 
 import (
+	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -111,6 +113,98 @@ func TestAQueueTimeRecordedBeforeTheStartIsToldByTheStart(t *testing.T) {
 
 	if len(*heard) != 1 || (*heard)[0] != 8*time.Minute {
 		t.Errorf("heard %v, want one 8m wait told by the start", *heard)
+	}
+}
+
+// A NODE'S BUSY REPORT TELLS THE WAIT TOO when it is the start that lands
+// second, and a repeated report tells nothing more.
+func TestABusyReportAfterTheQueueTimeTellsTheWaitOnce(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+
+	heard := &waitsHeard{}
+	a.ObserveQueueWaits(heard)
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	fresh, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	advanceTo(t, a, fresh, PhaseOnline)
+
+	if err := a.RecordJobIdentity(t.Context(), fresh.ID, HistoryJob{JobID: "j",
+		QueuedAt: now.Add(-7 * time.Minute)}); err != nil {
+		t.Fatalf("RecordJobIdentity: %v", err)
+	}
+
+	now = now.Add(time.Minute)
+	for range 2 {
+		if err := a.Advance(t.Context(), fresh.ID, fresh.Epoch, PhaseBusy); err != nil {
+			t.Fatalf("Advance to busy: %v", err)
+		}
+	}
+
+	if len(*heard) != 1 || (*heard)[0] != 8*time.Minute {
+		t.Errorf("heard %v, want one 8m wait told by the busy report", *heard)
+	}
+}
+
+// A WRITE THAT ROLLS BACK TELLS NOTHING, and leaves the wait to the write that
+// commits: the start it recorded is undone with it.
+func TestARolledBackStartTellsNoWait(t *testing.T) {
+	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB},
+		[]config.Tier{tier("linux", 2, 8*config.GiB)}, WithClock(func() time.Time { return now }))
+
+	heard := &waitsHeard{}
+	a.ObserveQueueWaits(heard)
+
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.RecordJobIdentity(t.Context(), lease.ID, HistoryJob{JobID: "j",
+		QueuedAt: now.Add(-time.Minute)}); err != nil {
+		t.Fatalf("RecordJobIdentity: %v", err)
+	}
+
+	refused := errors.New("refused after the start")
+	err := a.txTelling(t.Context(), func(tx *sql.Tx, told *waitsToTell) error {
+		if err := a.recordJobStartTx(t.Context(), tx, lease.ID, now, told); err != nil {
+			return err
+		}
+		if len(told.waits) != 1 {
+			t.Errorf("the start inside the write collected %d waits, want 1", len(told.waits))
+		}
+
+		return refused
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("txTelling = %v, want the refusal", err)
+	}
+	if len(*heard) != 0 {
+		t.Fatalf("a rolled-back write told %v", *heard)
+	}
+	if got, err := a.Job(t.Context(), lease.ID); err != nil || got.StartedAt != "" {
+		t.Fatalf("after the rollback the start reads %q (%v), want none", got.StartedAt, err)
+	}
+
+	name := "billet-" + lease.ID
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+		LaunchRequestID: 1, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 1, name, 1, 9, "j", JobIdentity{}); err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+	if len(*heard) != 1 || (*heard)[0] != time.Minute {
+		t.Errorf("heard %v after the committed start, want one 1m wait", *heard)
 	}
 }
 
