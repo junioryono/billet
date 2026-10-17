@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/dispatch"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -188,6 +189,19 @@ type LoopOptions struct {
 	// Now is the clock the record's registered_at is read from. Nil is the
 	// wall clock.
 	Now func() time.Time
+
+	// Ended is told how this process's stop ended, once, on every way Run
+	// returns nil, with whether the stop was asked to drain; a Run that returns
+	// an error reports nothing, and its caller records the failure. Nil records
+	// nothing.
+	Ended func(ending nodeending.Ending, drainRequested bool)
+}
+
+// ended reports how the stop ended, when the caller asked.
+func (o LoopOptions) ended(ending nodeending.Ending, drainRequested bool) {
+	if o.Ended != nil {
+		o.Ended(ending, drainRequested)
+	}
 }
 
 // registration is what this node tells the control plane about itself.
@@ -385,6 +399,8 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	// have systemd mark the unit failed — the same reasoning as stopGracefully's
 	// own returns.
 	if errors.Is(err, ErrSuperseded) && ctx.Err() != nil {
+		opts.ended(nodeending.Superseded, opts.DrainRequested != nil && opts.DrainRequested())
+
 		return nil
 	}
 
@@ -602,6 +618,7 @@ func stopGracefully(
 		if withdraw(ctx, c, log, opts) {
 			log.Info("handing over to the next node process: the compute running here keeps " +
 				"running and is adopted when billet node starts again")
+			opts.ended(nodeending.HandedOff, drainRequested)
 
 			return nil
 		}
@@ -627,7 +644,7 @@ func stopGracefully(
 		if !drainRequested {
 			attempts = unrecoveredStopAttempts
 		}
-		recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
+		recovered = recoverBeforeDrain(ctx, c, compute, log, opts, startJanitor, attempts)
 	}
 
 	// A node holding nothing stops at once. The drain is for work in flight, not
@@ -641,6 +658,18 @@ func stopGracefully(
 	// succeeding, and the caller turns what comes back into a process exit status.
 	if !compute.Holding() {
 		withdraw(ctx, c, log, opts)
+
+		// HOLDING NOTHING IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST RUNS.
+		// One that never registered was given nothing; one that registered and
+		// never recovered may own guests it cannot see, and leaves them running.
+		switch {
+		case recovered:
+			opts.ended(nodeending.Drained, drainRequested)
+		case !c.EverRegistered():
+			opts.ended(nodeending.Idle, drainRequested)
+		default:
+			opts.ended(nodeending.LeftRunning, drainRequested)
+		}
 
 		return nil
 	}
@@ -792,6 +821,15 @@ func stopGracefully(
 		withdraw(ctx, c, log, opts)
 	}
 
+	switch {
+	case drained:
+		opts.ended(nodeending.Drained, drainRequested)
+	case superseded.Load():
+		opts.ended(nodeending.Superseded, drainRequested)
+	default:
+		opts.ended(nodeending.LeftRunning, drainRequested)
+	}
+
 	if drained {
 		log.Info("everything running here has finished; stopping")
 
@@ -918,14 +956,15 @@ const unrecoveredStopAttempts = 3
 
 // recoverBeforeDrain registers if this process never did and recovers, until it
 // succeeds, a second signal arrives or, when attempts is positive, that many
-// attempts have failed. The janitor starts once a registration
-// has told it the lease TTL and before anything is recovered, exactly as at an
-// ordinary registration: recovery adopts leases, and a drain can outlast their
-// TTL many times over while Tend's provider calls are not what renews them.
+// attempts have failed, and says whether it recovered. The janitor starts once a
+// registration has told it the lease TTL and before anything is recovered,
+// exactly as at an ordinary registration: recovery adopts leases, and a drain
+// can outlast their TTL many times over while Tend's provider calls are not
+// what renews them.
 func recoverBeforeDrain(
 	ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions,
 	startJanitor func(), attempts int,
-) {
+) bool {
 	recoverCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
 
@@ -949,23 +988,25 @@ func recoverBeforeDrain(
 			err = compute.Recover(recoverCtx)
 		}
 		if err == nil {
-			return
+			return true
 		}
 
 		if attempts > 0 && attempt >= attempts {
 			log.Error("could not learn what this host runs before stopping; stopping anyway, "+
 				"and the next node process adopts what it finds", "attempts", attempt, "error", err)
 
-			return
+			return false
 		}
 
 		log.Error("stopping before this process knew what its host runs; recovering before "+
 			"deciding whether it holds anything", "error", err)
 
 		if !sleep(recoverCtx, backoffFor(opts)) {
-			return
+			return false
 		}
 	}
+
+	return false
 }
 
 // backoffFor is the pause after a failed registration or poll.
