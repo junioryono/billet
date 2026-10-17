@@ -201,9 +201,25 @@ func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) e
 	return errors.Join(errs...)
 }
 
-// integrityCheck refuses to serve from a corrupt ledger. quick_check is cheap
-// enough to run at every startup for a database this size, and scheduling
-// against corrupt capacity data is worse than not starting.
+// integrityScanBudget bounds the integrity scan an open runs, which reads the
+// whole file.
+//
+// ITS OWN BOUND, NOT THE STARTUP ONE, and sized for a COLD read, which is what
+// a host upgrade always gets (the services stopped and the snapshot copy just
+// read): the reference controller's 740 MB ledger took 55 seconds to check
+// cold and 0.5 seconds warm (2026-10-17, 2 vCPU, 1.8 GiB RAM, gp3). With the
+// startup budget it stays under the server unit's TimeoutStartSec even when
+// systemd grants no extension (TestTheIntegrityScanFitsTheServerUnitsStartBound).
+const integrityScanBudget = 80 * time.Second
+
+// StartupBound is the longest an open that scans may take: the scan's own
+// bound and the startup budget paused around it.
+func StartupBound() time.Duration { return integrityScanBudget + startupTimeout }
+
+// integrityCheck refuses to serve from a corrupt ledger, because scheduling
+// against corrupt capacity data is worse than not starting. Bounded by its
+// caller: an open bounds it with integrityScanBudget, and `billet check` waits
+// for it.
 func (*sqliteBackend) integrityCheck(ctx context.Context, w *sql.DB) error {
 	var result string
 	//billet:ignore rawsql // a pragma is not a query; sqlc has no catalogue entry for one
