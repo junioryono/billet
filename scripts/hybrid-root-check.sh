@@ -27,6 +27,20 @@ fi
 
 module=$repo_root/terraform/modules/billet
 
+# THE FIRST ROOT'S LOCK IS EVERY LATER ROOT'S. A root resolves the newest aws
+# provider (an attribute it renamed is one of the things this check exists to
+# catch), so none is committed with a lock, and with no lock terraform neither
+# takes a provider from a plugin cache nor trusts one: it downloads and
+# authenticates it, 194 MB a root (measured with 1.14.0, 1.14.1 and 1.15.9). So the
+# first root does that, and its lock, which records what was authenticated,
+# goes into each later root before its init: those take the cached copy, which
+# terraform checks against the lock and downloads again if it does not match.
+# Never TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE, which would take whatever
+# the cache held, and a pull request can write its own cache entries: unset
+# here, so a developer's shell cannot bring it back.
+unset TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE
+lock=$work/first-root.terraform.lock.hcl
+
 check_shape() {
     shape=$1
     shift
@@ -65,11 +79,19 @@ check_shape() {
     sed -i.bak "s#\"github.com/junioryono/billet//terraform/modules/billet?ref=[^\"]*\"#\"$module\"#" "$main"
     rm -f "$main.bak"
 
+    if [ -f "$lock" ]; then
+        cp "$lock" "$out/terraform/.terraform.lock.hcl"
+    fi
+
     terraform -chdir="$out/terraform" init -backend=false -input=false >"$work/$shape.init.log" 2>&1 || {
         echo "hybrid-root-check: terraform init failed for the $shape root" >&2
         cat "$work/$shape.init.log" >&2
         exit 1
     }
+
+    if [ ! -f "$lock" ]; then
+        cp "$out/terraform/.terraform.lock.hcl" "$lock"
+    fi
     terraform -chdir="$out/terraform" validate
     echo "ok   the $shape root validates against this checkout's module"
 }
