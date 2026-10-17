@@ -138,7 +138,7 @@
     - name: Report the runtime-unit repair
       ansible.builtin.debug:
         msg: >-
-          {{ ('billet-node.service now declares the registration record''s directory: the node was stopped, the unit repaired and reloaded, and the node restarted as invocation '
+          {{ ("billet-node.service now declares the registration record's directory: the node was stopped, the unit repaired and reloaded, and the node restarted as invocation "
               ~ billet_repair_answer.invocation_id ~ ', which registered on ' ~ billet_repair_answer.endpoint ~ '.')
              if billet_repair_answer.outcome == 'repaired'
              else ('No runtime-unit repair was needed when it was asked: ' ~ billet_repair_answer.why ~ '.') }}
