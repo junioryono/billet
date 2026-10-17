@@ -88,12 +88,13 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	//	13m50s  provisioning, including the whole toolcache
 	//	38m46s  snapshot to available
 	//	52m37s  launch to the verifier's launch
-	//	 6m13s  the verifier's boot and report
 	//
-	// About 59 minutes in all. The snapshot of a larger image is what grew: it
-	// was 9m20s when the image was smaller, and the default of 60 minutes, chosen
-	// then with room, now leaves almost none. The cost of a generous bound is
-	// nothing: it is a deadline, not a wait.
+	// That run's own timeout ended it there, and `billet ami verify`, run on its
+	// own, then booted the image and stamped it in 6m13s, so a whole build is
+	// about 59 minutes by the sum of the two. The snapshot of a larger image is
+	// what grew: it was 9m20s when the image was smaller, and the default of 60
+	// minutes, chosen then with room, now leaves almost none. The cost of a
+	// generous bound is nothing: it is a deadline, not a wait.
 	timeout := fs.Duration("timeout", 90*time.Minute, "how long to wait for the whole build")
 	public := fs.Bool("public-ip", false,
 		"give the builder a public address, for a subnet with no NAT gateway")
