@@ -209,10 +209,12 @@ func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) e
 // cold: the services are stopped and the snapshot copy has just evicted the
 // cache on a 1.8 GiB machine. Under the shared 30-second startup budget the
 // candidate's probe failed, the restored release then failed to start twice the
-// same way, and the controller was left cordoned. The bound stays under the
-// server unit's TimeoutStartSec, which kills a start that outlasts it whatever
-// billet allows (TestTheIntegrityScanFitsTheServerUnitsStartBound).
-const integrityScanBudget = 90 * time.Second
+// same way, and the controller was left cordoned. The bound and the startup
+// budget together stay under the server unit's TimeoutStartSec, with room to
+// start the process and report ready, because systemd kills a start that
+// outlasts it whatever billet allows
+// (TestTheIntegrityScanFitsTheServerUnitsStartBound).
+const integrityScanBudget = 80 * time.Second
 
 // integrityCheck refuses to serve from a corrupt ledger, because scheduling
 // against corrupt capacity data is worse than not starting.

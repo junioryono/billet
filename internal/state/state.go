@@ -410,6 +410,8 @@ func openDir(
 	db.revalidate.Store(lock == nil)
 	db.standby.Store(mode.standby)
 
+	started := time.Now()
+
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 
@@ -441,11 +443,15 @@ func openDir(
 	// inspection is not even that.
 	//
 	// THE SCAN HAS A BOUND OF ITS OWN (the backend's), because a cold read of a
-	// large ledger outlasts the startup budget on a healthy disk; and the rest of
-	// startup starts its clock after it, so a long scan leaves the migrations
-	// their whole budget rather than what the scan did not use.
+	// large ledger outlasts the startup budget on a healthy disk, and the startup
+	// budget is PAUSED for it rather than restarted: what the scan took is not
+	// charged to the rest of startup, and what came before it still is, so the
+	// whole open stays inside the scan's bound plus one startup budget. A backend
+	// that does not scan resumes with exactly what it had.
 	if !admin && !mode.inspect {
 		noteOpenSideEffect("integrity")
+
+		spent := time.Since(started)
 
 		if err := db.backend.integrityCheck(ctx, db.w); err != nil {
 			return nil, errors.Join(err, db.Close())
@@ -453,7 +459,7 @@ func openDir(
 
 		var cancelRest context.CancelFunc
 
-		startupCtx, cancelRest = context.WithTimeout(ctx, startupTimeout)
+		startupCtx, cancelRest = context.WithTimeout(ctx, startupTimeout-spent)
 		defer cancelRest()
 	}
 
@@ -616,9 +622,9 @@ func openDir(
 	return db, nil
 }
 
-// startupTimeout bounds the pragma verification and the migrations, each side of
-// the integrity scan (which has its own bound, integrityScanBudget), and a
-// migration run at promotion takes the same bound for itself (see migrate).
+// startupTimeout bounds an open's pragma verification and migrations together,
+// paused for the integrity scan (which has its own bound, integrityScanBudget),
+// and a migration run at promotion takes the same bound for itself (see migrate).
 // Generous, because a first run creates the database; anything slower than this
 // is a sick disk, not a slow one — or, on PostgreSQL, another session holding a
 // lock the migration is waiting for.
