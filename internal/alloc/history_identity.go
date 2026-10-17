@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/state/ledgerdb"
@@ -21,6 +22,11 @@ type HistoryJob struct {
 	WorkflowRef string
 	Name        string
 	Event       string
+	// QueuedAt, ScaleSetAssignedAt and RunnerAssignedAt are GitHub's times for
+	// the job, on GitHub's clock; zero is a time the message did not carry.
+	QueuedAt           time.Time
+	ScaleSetAssignedAt time.Time
+	RunnerAssignedAt   time.Time
 }
 
 // Repo is the job's repository as owner/name, or whichever half is known.
@@ -42,25 +48,69 @@ func (j HistoryJob) Repo() string {
 // A lease with no history row records nothing: the row opens at assignment,
 // and a message about a lease the ledger never assigned is not evidence of a
 // job this deployment ran.
+//
+// THE WRITE THAT FIRST HOLDS BOTH ENDS OF THE JOB'S WAIT REPORTS IT, once,
+// after it commits. The start is on the row before this runs: identifyStarted
+// binds the runner, which records the start, before it records the identity,
+// and a completion only fills what JobStarted left out of a job that started.
 func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job HistoryJob) error {
 	if strings.TrimSpace(leaseID) == "" || strings.TrimSpace(job.JobID) == "" {
 		return nil
 	}
 
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+	var waited *JobWait
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		before, found, err := readJobWait(ctx, tx, leaseID)
+		if err != nil || !found {
+			return err
+		}
+
 		if err := state.WriteQueries(tx).RecordJobIdentity(ctx, ledgerdb.RecordJobIdentityParams{
-			GithubJobID: job.JobID,
-			Repo:        job.Repo(),
-			WorkflowRef: job.WorkflowRef,
-			JobName:     job.Name,
-			Event:       job.Event,
-			LeaseID:     leaseID,
+			GithubJobID:              job.JobID,
+			Repo:                     job.Repo(),
+			WorkflowRef:              job.WorkflowRef,
+			JobName:                  job.Name,
+			Event:                    job.Event,
+			GithubQueuedAt:           stamp(job.QueuedAt),
+			GithubScaleSetAssignedAt: stamp(job.ScaleSetAssignedAt),
+			GithubRunnerAssignedAt:   stamp(job.RunnerAssignedAt),
+			LeaseID:                  leaseID,
 		}); err != nil {
 			return fmt.Errorf("alloc: record the job lease %s ran: %w", leaseID, err)
 		}
 
+		after, _, err := readJobWait(ctx, tx, leaseID)
+		if err != nil {
+			return err
+		}
+
+		if before.GithubQueuedAt == "" && after.GithubQueuedAt != "" && after.StartedAt != "" {
+			waited = &JobWait{LeaseID: leaseID, Tier: after.Tier,
+				QueuedAt: parseStamp(after.GithubQueuedAt), StartedAt: parseStamp(after.StartedAt)}
+		}
+
 		return nil
 	})
+	if err == nil && waited != nil {
+		a.reportWait(*waited)
+	}
+
+	return err
+}
+
+// readJobWait reads the two ends of one job's wait inside a write, so the
+// decision to report it is the write's own.
+func readJobWait(ctx context.Context, tx *sql.Tx, leaseID string) (ledgerdb.ReadJobWaitRow, bool, error) {
+	row, err := state.ReadQueries(tx).ReadJobWait(ctx, leaseID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return row, false, nil
+	case err != nil:
+		return row, false, fmt.Errorf("alloc: read the queue wait of lease %s: %w", leaseID, err)
+	}
+
+	return row, true, nil
 }
 
 // JobRecord is one job's history row as an operator reads it. Every empty
@@ -87,6 +137,12 @@ type JobRecord struct {
 	VCPU           int64
 	Memory         int64
 	Site           string
+	// GitHubQueuedAt, GitHubScaleSetAssignedAt and GitHubRunnerAssignedAt are
+	// on GitHub's clock; BoughtAt is when billet bought the lease, on its own.
+	GitHubQueuedAt           string
+	GitHubScaleSetAssignedAt string
+	GitHubRunnerAssignedAt   string
+	BoughtAt                 string
 }
 
 // Job reads one lease's history row. A lease that was never assigned a job is
@@ -111,6 +167,8 @@ func (a *Allocator) Job(ctx context.Context, leaseID string) (JobRecord, error) 
 			AssignedAt: row.AssignedAt, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt,
 			ChosenProvider: row.ChosenProvider, InstanceType: row.InstanceType,
 			VCPU: row.Vcpu, Memory: row.Memory, Site: row.Site,
+			GitHubQueuedAt: row.GithubQueuedAt, GitHubScaleSetAssignedAt: row.GithubScaleSetAssignedAt,
+			GitHubRunnerAssignedAt: row.GithubRunnerAssignedAt, BoughtAt: row.BoughtAt,
 		}
 		return nil
 	})

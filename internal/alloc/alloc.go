@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -200,6 +201,10 @@ type Allocator struct {
 
 	// now is injectable so expiry can be tested without sleeping.
 	now func() time.Time
+
+	// waits is told each job's queue wait; see ObserveQueueWaits. Atomic,
+	// because it is set once the metrics endpoint serves, while writes run.
+	waits atomic.Pointer[QueueWaitObserver]
 }
 
 // Option configures an Allocator.
@@ -1204,6 +1209,8 @@ func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, 
 		RequestID:  sql.NullInt64{Int64: requestID, Valid: true},
 		QueuedAt:   ts(now),
 		AssignedAt: sql.NullString{String: ts(now), Valid: true},
+		Vcpu:       int64(l.VCPU),
+		Memory:     int64(l.Memory),
 	}); err != nil {
 		return fmt.Errorf("alloc: record assignment for %s: %w", l.ID, err)
 	}

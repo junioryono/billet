@@ -337,6 +337,9 @@ type JobFields struct {
 	RunnerID   int64
 	RunnerName string
 	Result     string
+	// QueuedAt, ScaleSetAssignedAt and RunnerAssignedAt are GitHub's times for
+	// the job. Zero leaves JobJSON's queue time and sends no other.
+	QueuedAt, ScaleSetAssignedAt, RunnerAssignedAt time.Time
 }
 
 // Apply sets the fields on a job message JobJSON built, and returns it.
@@ -371,6 +374,15 @@ func (f JobFields) Apply(job map[string]any) map[string]any {
 
 	if f.Result != "" {
 		job["result"] = f.Result
+	}
+
+	for key, at := range map[string]time.Time{
+		"queueTime": f.QueuedAt, "scaleSetAssignTime": f.ScaleSetAssignedAt,
+		"runnerAssignTime": f.RunnerAssignedAt,
+	} {
+		if !at.IsZero() {
+			job[key] = at.Format(time.RFC3339Nano)
+		}
 	}
 
 	return job

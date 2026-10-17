@@ -98,6 +98,19 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// know which owner's jobs it serves.
 	targets := cfg.GitHubTargets()
 
+	// ONE READ FOR EVERY TIER'S LAST HOUR, grouped here.
+	now := time.Now()
+
+	recent, _, err := a.JobWaits(ctx, now.Add(-time.Hour))
+	if err != nil {
+		return err
+	}
+
+	waits := map[string][]alloc.JobWait{}
+	for i := range recent {
+		waits[recent[i].Tier] = append(waits[recent[i].Tier], recent[i])
+	}
+
 	for _, target := range targets {
 		if len(targets) > 1 {
 			fmt.Fprintf(env.Stdout, "target    %s (%s)\n", target.Name, app.DescribeGitHubTarget(target))
@@ -113,7 +126,8 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 			if err != nil {
 				return err
 			}
-			printTierCapacity(env.Stdout, fleetops.TierDisplay(t), report, time.Now())
+			printTierCapacity(env.Stdout, fleetops.TierDisplay(t), report, now)
+			printTierWait(env.Stdout, waits[t.Label])
 		}
 	}
 

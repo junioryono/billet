@@ -395,3 +395,98 @@ func sampleValue(t *testing.T, body, series string) float64 {
 
 	return 0
 }
+
+// THE LEDGER SOURCE ATTACHES THE QUEUE-WAIT HISTOGRAM TO THE ALLOCATOR IT
+// READS: a job the allocator starts and names with GitHub's queue time is
+// observed on the served endpoint, and one whose clocks disagree is counted
+// apart rather than observed as no wait.
+func TestTheLedgerSourceServesQueueWaits(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), ledgertest.Dir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := metricsTestTier()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := ServeMetrics(t.Context(), "server", &config.MetricsConfig{Listen: "127.0.0.1:0"},
+		ledgerSource(a, db, []config.Tier{tier}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { m.Close(t.Context()) })
+
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "docker-1", Provider: config.ProviderDocker, VCPU: 16, Memory: 64 * config.GiB,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for request, queued := range map[int64]time.Time{
+		1: time.Now().Add(-90 * time.Second), 2: time.Now().Add(time.Hour),
+	} {
+		lease, err := a.Reserve(t.Context(), tier.Label)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, request); err != nil {
+			t.Fatal(err)
+		}
+		name := "billet-" + lease.ID
+		if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID, Tier: tier.Label,
+			LaunchRequestID: request, RunnerName: name}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.StartPoolRunner(t.Context(), lease.ID, tier.Label, request, name, request, 9,
+			"job", alloc.JobIdentity{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{JobID: "job",
+			QueuedAt: queued}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), metricsTestWait)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+m.srv.Addr().String()+"/metrics", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := string(body)
+	if n := sampleValue(t, got, `billet_job_queue_wait_seconds_count{tier="billet-2vcpu"}`); n != 1 {
+		t.Errorf("the histogram observed %v waits, want the one whose clocks agree", n)
+	}
+	if v := sampleValue(t, got, `billet_job_queue_wait_seconds_bucket{tier="billet-2vcpu",le="60"}`); v != 0 {
+		t.Errorf("a 90-second wait landed at or under 60 seconds (%v)", v)
+	}
+	if v := sampleValue(t, got, `billet_job_queue_wait_seconds_bucket{tier="billet-2vcpu",le="120"}`); v != 1 {
+		t.Errorf("a 90-second wait is not under 120 seconds (%v)", v)
+	}
+	if n := sampleValue(t, got, `billet_job_queue_wait_negative_total{tier="billet-2vcpu"}`); n != 1 {
+		t.Errorf("the negative counter is %v, want the one queued after it started", n)
+	}
+}

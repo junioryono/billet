@@ -330,16 +330,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Available = append(out.Available, dispatch.Job{
-			RequestID:   j.RunnerRequestID,
-			RunID:       j.WorkflowRunID,
-			JobID:       j.JobID,
-			Event:       j.EventName,
-			Owner:       j.OwnerName,
-			Repository:  j.RepositoryName,
-			WorkflowRef: j.JobWorkflowRef,
-			JobName:     j.JobDisplayName,
-		})
+		out.Available = append(out.Available, jobOf(&j.JobMessageBase))
 	}
 
 	for _, j := range msg.JobAssignedMessages {
@@ -347,16 +338,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Assigned = append(out.Assigned, dispatch.Job{
-			RequestID:   j.RunnerRequestID,
-			RunID:       j.WorkflowRunID,
-			JobID:       j.JobID,
-			Event:       j.EventName,
-			Owner:       j.OwnerName,
-			Repository:  j.RepositoryName,
-			WorkflowRef: j.JobWorkflowRef,
-			JobName:     j.JobDisplayName,
-		})
+		out.Assigned = append(out.Assigned, jobOf(&j.JobMessageBase))
 	}
 
 	for _, j := range msg.JobStartedMessages {
@@ -364,18 +346,9 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Started = append(out.Started, dispatch.Job{
-			RequestID:   j.RunnerRequestID,
-			RunID:       j.WorkflowRunID,
-			JobID:       j.JobID,
-			RunnerID:    int64(j.RunnerID),
-			RunnerName:  j.RunnerName,
-			Event:       j.EventName,
-			Owner:       j.OwnerName,
-			Repository:  j.RepositoryName,
-			WorkflowRef: j.JobWorkflowRef,
-			JobName:     j.JobDisplayName,
-		})
+		job := jobOf(&j.JobMessageBase)
+		job.RunnerID, job.RunnerName = int64(j.RunnerID), j.RunnerName
+		out.Started = append(out.Started, job)
 	}
 
 	for _, j := range msg.JobCompletedMessages {
@@ -383,20 +356,32 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			continue
 		}
 
-		out.Completed = append(out.Completed, dispatch.Job{
-			RequestID:   j.RunnerRequestID,
-			RunID:       j.WorkflowRunID,
-			JobID:       j.JobID,
-			Event:       j.EventName,
-			Owner:       j.OwnerName,
-			Repository:  j.RepositoryName,
-			WorkflowRef: j.JobWorkflowRef,
-			JobName:     j.JobDisplayName,
-			Result:      j.Result,
-			RunnerID:    int64(j.RunnerID),
-			RunnerName:  j.RunnerName,
-		})
+		job := jobOf(&j.JobMessageBase)
+		job.Result = j.Result
+		job.RunnerID, job.RunnerName = int64(j.RunnerID), j.RunnerName
+		out.Completed = append(out.Completed, job)
 	}
 
 	return out
+}
+
+// jobOf is what every message kind says about its job.
+//
+// GITHUB'S THREE TIMES ARE CARRIED FROM EVERY KIND, because which kind fills
+// which time is GitHub's to decide and is read from the fleet, not assumed: a
+// time a message leaves out stays zero, which the ledger records as unknown.
+func jobOf(j *gh.JobMessageBase) dispatch.Job {
+	return dispatch.Job{
+		RequestID:          j.RunnerRequestID,
+		RunID:              j.WorkflowRunID,
+		JobID:              j.JobID,
+		Event:              j.EventName,
+		Owner:              j.OwnerName,
+		Repository:         j.RepositoryName,
+		WorkflowRef:        j.JobWorkflowRef,
+		JobName:            j.JobDisplayName,
+		QueuedAt:           j.QueueTime,
+		ScaleSetAssignedAt: j.ScaleSetAssignTime,
+		RunnerAssignedAt:   j.RunnerAssignTime,
+	}
 }

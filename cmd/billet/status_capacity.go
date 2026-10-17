@@ -54,6 +54,36 @@ func printTierCapacity(w io.Writer, label string, r alloc.TierCapacity, now time
 	}
 }
 
+// printTierWait says how long the tier's jobs that started in the last hour
+// waited, from GitHub's queue time to billet's start, as the p99 of them.
+//
+// PRINTED ONLY WHEN A JOB STARTED, for the waiting line's reason. A job with no
+// GitHub queue time on record is unknown, and is said so rather than averaged
+// in as no wait.
+func printTierWait(w io.Writer, jobs []alloc.JobWait) {
+	if len(jobs) == 0 {
+		return
+	}
+
+	s := alloc.Summarize(jobs, alloc.JobWait.Wait)
+	unknown := len(jobs) - s.Count
+
+	if s.Count == 0 {
+		fmt.Fprintf(w, "          queue wait unknown: %d job(s) started in the last hour "+
+			"with no GitHub queue time on record\n", unknown)
+
+		return
+	}
+
+	more := ""
+	if unknown > 0 {
+		more = fmt.Sprintf("; %d more unknown", unknown)
+	}
+
+	fmt.Fprintf(w, "          queue wait p99 %s over the last hour's %d job(s) "+
+		"(GitHub's queue time to billet's start%s)\n", s.P99.Round(time.Second), s.Count, more)
+}
+
 // stalledFor is how long ago a waiter last progressed, or zero when the report
 // predates the field or cannot be read: an unknown is not shown as a stall.
 func stalledFor(progress string, now time.Time) time.Duration {
