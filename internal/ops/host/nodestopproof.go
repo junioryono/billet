@@ -2,7 +2,6 @@ package host
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/junioryono/billet/internal/config"
@@ -129,70 +128,23 @@ func (s systemdNodeEndings) AdmitStart(ctx context.Context, cfg *config.Config) 
 var nodeEndings = func() nodeEndingChecks { return systemdNodeEndings{insp: lifeops.NewInspector()} }
 
 // judgeNodeStop judges a stopped invocation against the record and what
-// systemd says of the unit now, and records a stop only systemd spoke for. With
-// no invocation, nothing was running to stop, and what the newest node
-// process left is judged instead.
+// systemd says of the unit, and records a stop only systemd spoke for, all under
+// the record's lock (nodeending.JudgeStop). With no invocation, nothing was
+// running to stop, and what the newest node process left is judged instead.
 func judgeNodeStop(
 	ctx context.Context, insp *lifeops.Inspector, cfg *config.Config, invocation string, drain bool,
 ) nodeending.Judgement {
-	after := observeNodeUnit(ctx, insp)
-
-	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-
 	if invocation == "" {
+		after := observeNodeUnit(ctx, insp)
+		rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
+
 		return nodeending.Standing(rec, readErr, after, drain, nodeending.BootID())
 	}
 
-	j, _ := recordSystemdStop(cfg, invocation, drain,
-		nodeending.Judge(rec, readErr, invocation, after, drain, nodeending.BootID()))
+	j, _ := nodeending.JudgeStop(cfg.Node.StateDir, invocation, drain, cfg.Node.Provider.RunsOnHost(),
+		func() nodeending.Unit { return observeNodeUnit(ctx, insp) }, nil)
 
 	return j
-}
-
-// recordSystemdStop writes down a stop only systemd spoke for, clean or not, so
-// the start after it, and anyone reading later, see it after reset-failed or
-// the unit's garbage collection have erased systemd's own account. A clean
-// stop that cannot be recorded is could-not-tell: the start gate would not see
-// it, and the record may have changed since it was read. recorded says the
-// record now holds what systemd said.
-func recordSystemdStop(
-	cfg *config.Config, invocation string, drain bool, j nodeending.Judgement,
-) (nodeending.Judgement, bool) {
-	if !j.Floor {
-		return j, false
-	}
-
-	ending := nodeending.Stopped
-	if j.Verdict != nodeending.Proved {
-		ending = nodeending.Failed
-	}
-
-	after, err := nodeending.Observe(cfg.Node.StateDir, nodeending.Entry{
-		InvocationID: invocation, BootID: nodeending.BootID(), Ending: ending,
-		RunsOnHost: cfg.Node.Provider.RunsOnHost(),
-	}, drain, nil)
-
-	switch {
-	case err == nil && j.Verdict != nodeending.Proved:
-		// Named from the record as written, whose newest entry the failure may
-		// or may not be.
-		j.Acknowledge = nodeending.Remedy(after)
-
-		return j, true
-	case err == nil:
-		return j, true
-	case j.Verdict != nodeending.Proved:
-		j.Why += "; and it could not be recorded: " + err.Error()
-
-		return j, false
-	case errors.Is(err, nodeending.ErrRecordChanged):
-		return nodeending.Judgement{Verdict: nodeending.Unknown, Answer: nodeending.Unknown.String(),
-			Why: "systemd reports a clean stop, but " + err.Error() + "; judge it again"}, false
-	default:
-		return nodeending.Judgement{Verdict: nodeending.Unknown, Answer: nodeending.Unknown.String(),
-			Why: "systemd reports a clean stop, but it could not be recorded for the start that follows: " +
-				err.Error()}, false
-	}
 }
 
 // admitNodeStart is the gate before every node start billet performs: what the

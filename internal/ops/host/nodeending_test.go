@@ -172,6 +172,23 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 	})
 
+	t.Run("a repeated check names the newest process", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.unit(t, "failed", "failed", "timeout", "0", "inv-old")
+
+		if o := f.run(t, "check", "--invocation", "inv-old"); o.code != exitRefused || !o.boolean("recorded") {
+			t.Fatalf("the first check: code %d recorded %v (%s)", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		f.begin(t, "inv-new", nodeending.LeftRunning)
+
+		o := f.run(t, "check", "--invocation", "inv-old")
+		if o.code != exitRefused || o.str("acknowledge") != "--invocation inv-new" {
+			t.Fatalf("the repeated check: code %d acknowledge %q (%s), want the newest, inv-new, named", o.code,
+				o.str("acknowledge"), o.str("why"))
+		}
+	})
+
 	t.Run("an acknowledged history does not pass the floor a drain needs", func(t *testing.T) {
 		f := newEndingFixture(t)
 		f.begin(t, "inv-1", nodeending.Running)

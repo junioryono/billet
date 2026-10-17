@@ -53,7 +53,7 @@ type Judgement struct {
 	// it, which is all an acknowledgement does.
 	Acknowledge string `json:"acknowledge,omitempty"`
 	// Floor says systemd's account of a stop the record holds no entry for
-	// decided the verdict, which the caller records (Observe) so the start
+	// decided the verdict, which JudgeStop records so the start
 	// after it reads the same answer.
 	Floor bool `json:"-"`
 }
@@ -225,10 +225,12 @@ func Judge(rec Record, readErr error, invocation string, after Unit, drainRequir
 	// AN UNANSWERED PROPERTY IS NOT A FAILURE. Where systemd's triple is what
 	// decides, a stop it did not fully describe is could-not-tell, and is not
 	// recorded, since a recorded failure stands for good.
-	if entryFor(rec, invocation) < 0 && observedFor(rec, invocation) < 0 &&
-		(after.SubState == "" || after.Result == "") {
-		return judged(Unknown, "", nil, "invocation %s kept no ending record and systemd reports %s",
-			invocation, after.triple())
+	if after.SubState == "" || after.Result == "" {
+		if o := observedFor(rec, invocation); entryFor(rec, invocation) < 0 &&
+			(o < 0 || rec.Entries[o].Ending == Stopped) {
+			return judged(Unknown, "", nil, "invocation %s kept no ending record and systemd reports %s",
+				invocation, after.triple())
+		}
 	}
 
 	return remedied(rec, judgeInvocation(rec, invocation, after, drainRequired, bootID))
@@ -404,10 +406,10 @@ func remedied(rec Record, j Judgement) Judgement {
 		return j
 	}
 
-	// An acknowledgement already made is not named again: what it could admit,
-	// it has, and what is refused needs a drain it cannot give.
-	if i := newestNode(rec.Entries); i < 0 || !rec.Entries[i].Acknowledged {
-		j.Acknowledge = Remedy(rec)
+	j.Acknowledge = Remedy(rec)
+	if j.Acknowledge == "" {
+		j.Why += "; its stop is already acknowledged, which admits a start and nothing that needs a drain: " +
+			"start the node so it adopts what was left, then stop it again to drain"
 	}
 
 	return j
@@ -415,13 +417,19 @@ func remedied(rec Record, j Judgement) Judgement {
 
 // Remedy is the `billet node ending acknowledge` arguments that admit a start
 // over rec: its newest node entry by invocation, or --unrecorded where there is
-// none or it has no invocation.
+// none or it has no invocation; empty when that entry is already acknowledged,
+// since what an acknowledgement can admit, it has.
 func Remedy(rec Record) string {
-	if i := newestNode(rec.Entries); i >= 0 && rec.Entries[i].InvocationID != "" {
-		return "--invocation " + rec.Entries[i].InvocationID
-	}
+	i := newestNode(rec.Entries)
 
-	return "--unrecorded"
+	switch {
+	case i >= 0 && rec.Entries[i].Acknowledged:
+		return ""
+	case i >= 0 && rec.Entries[i].InvocationID != "":
+		return "--invocation " + rec.Entries[i].InvocationID
+	default:
+		return "--unrecorded"
+	}
 }
 
 func describe(e Entry) string {

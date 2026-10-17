@@ -55,7 +55,7 @@ const (
 	// Unrecorded is an operator's acknowledgement of a stop no record covers.
 	Unrecorded Ending = "unrecorded"
 	// Stopped is systemd's inactive/dead/success for a process that kept no
-	// record (a node binary from before the record), written by Observe: the
+	// record (a node binary from before the record), written by JudgeStop: the
 	// floor, and weaker than any ending a node wrote.
 	Stopped Ending = "stopped"
 )
@@ -151,6 +151,9 @@ func BootID() string {
 func Read(dir string) (Record, bool, error) {
 	f, info, err := regularfile.Open(Path(dir), regularfile.Options{NoFollow: true})
 	switch {
+	case errors.Is(err, fs.ErrNotExist) && resetInterrupted(dir):
+		return Record{}, false, fmt.Errorf("%s is missing because a reset of it was interrupted; run "+
+			"`billet node ending acknowledge --reset-unreadable` again", Path(dir))
 	case errors.Is(err, fs.ErrNotExist):
 		return Record{}, false, nil
 	case err != nil:
@@ -341,13 +344,13 @@ func (h *Handle) End(ending Ending, drainRequested bool) error {
 	return err
 }
 
-// ErrRecordChanged is Observe's refusal when the record no longer says what
+// ErrRecordChanged is an observation's refusal when the record no longer says what
 // the judgement it records read: the invocation has an entry of its own now,
 // or systemd's account of it, or the history beneath it, no longer says what
 // the judgement read.
 var ErrRecordChanged = errors.New("the ending record changed since the stop was judged")
 
-// Observe appends what systemd said of a stop of e.InvocationID, which no
+// observeIn appends what systemd said of a stop of e.InvocationID, which no
 // node entry covers, so the evidence outlives reset-failed and the unit's
 // garbage collection. It re-reads the record under its lock first: an
 // invocation that has an entry of its own is the node's to speak for; an
@@ -355,7 +358,7 @@ var ErrRecordChanged = errors.New("the ending record changed since the stop was 
 // an identical one is not written twice; and a clean stop is recorded only over
 // a history that passes the stop's own standard, as the judgement it records
 // required.
-func Observe(dir string, e Entry, drainRequired bool, now func() time.Time) (Record, error) {
+func observeIn(dir string, e Entry, drainRequired bool, now func() time.Time) (Record, error) {
 	if now == nil {
 		now = time.Now
 	}
@@ -365,45 +368,122 @@ func Observe(dir string, e Entry, drainRequired bool, now func() time.Time) (Rec
 	}
 
 	at := now().UTC()
-	e.Source, e.EndedAt, e.Role, e.Acknowledged = SourceSystemd, &at, RoleNode, false
+	e.EndedAt = &at
 
 	var after Record
 
 	err := update(dir, func(r *Record) error {
 		defer func() { after = *r }()
 
-		if i := entryFor(*r, e.InvocationID); i >= 0 {
-			return fmt.Errorf("%w: invocation %s has an entry of its own", ErrRecordChanged, e.InvocationID)
-		}
-
-		// A FAILURE OUTRANKS A CLEAN ACCOUNT, whichever was written first: a
-		// check that read the timeout before reset-failed may reach the lock
-		// after one that read the clean triple after it.
-		seen := observedFor(*r, e.InvocationID)
-
-		switch {
-		case seen >= 0 && r.Entries[seen].Ending == e.Ending:
-		case seen >= 0 && e.Ending == Stopped:
-			return fmt.Errorf("%w: systemd's account of invocation %s was recorded as %s", ErrRecordChanged,
-				e.InvocationID, r.Entries[seen].Ending)
-		case seen >= 0:
-			r.Entries[seen].Ending, r.Entries[seen].EndedAt = e.Ending, e.EndedAt
-		}
-
-		if n := newestNode(r.Entries); e.Ending == Stopped && n >= 0 {
-			if s := standing(*r, n, standardFor(drainRequired), e.BootID); s.Verdict != Proved {
-				return fmt.Errorf("%w: %s", ErrRecordChanged, s.Why)
-			}
-		}
-
-		if seen < 0 {
-			r.Entries = append(r.Entries, e)
-		}
-
-		return nil
+		return observe(r, e, drainRequired)
 	})
 
 	return after, err
+}
+
+// observe is the change JudgeStop and observeIn make to a record read under the lock.
+func observe(r *Record, e Entry, drainRequired bool) error {
+	e.Source, e.Role, e.Acknowledged = SourceSystemd, RoleNode, false
+
+	if i := entryFor(*r, e.InvocationID); i >= 0 {
+		return fmt.Errorf("%w: invocation %s has an entry of its own", ErrRecordChanged, e.InvocationID)
+	}
+
+	// A FAILURE OUTRANKS A CLEAN ACCOUNT, whichever was written first, and an
+	// acknowledgement given for the clean one does not carry over to it.
+	seen := observedFor(*r, e.InvocationID)
+
+	switch {
+	case seen >= 0 && r.Entries[seen].Ending == e.Ending:
+	case seen >= 0 && e.Ending == Stopped:
+		return fmt.Errorf("%w: systemd's account of invocation %s was recorded as %s", ErrRecordChanged,
+			e.InvocationID, r.Entries[seen].Ending)
+	case seen >= 0:
+		old := &r.Entries[seen]
+		old.Ending, old.EndedAt, old.Acknowledged = e.Ending, e.EndedAt, false
+	}
+
+	if n := newestNode(r.Entries); e.Ending == Stopped && n >= 0 {
+		if s := standing(*r, n, standardFor(drainRequired), e.BootID); s.Verdict != Proved {
+			return fmt.Errorf("%w: %s", ErrRecordChanged, s.Why)
+		}
+	}
+
+	if seen < 0 {
+		r.Entries = append(r.Entries, e)
+	}
+
+	return nil
+}
+
+// JudgeStop judges a stop of invocation and records systemd's account where
+// that decided it, with the record's lock held across asking systemd (sample),
+// reading the record, judging and writing. Two checks of one stop are then
+// judged one after the other, each on what systemd said in its turn: a clean
+// account read after reset-failed can no longer be proved while an earlier
+// check's failure is still unwritten. recorded says the record now holds
+// systemd's account.
+func JudgeStop(
+	dir, invocation string, drainRequired, runsOnHost bool, sample func() Unit, now func() time.Time,
+) (Judgement, bool) {
+	if now == nil {
+		now = time.Now
+	}
+
+	unlock, err := lock(dir)
+	if err != nil {
+		return judged(Unknown, "", nil, "%v", err), false
+	}
+	defer unlock()
+
+	after := sample()
+	bootID := BootID()
+
+	rec, present, readErr := Read(dir)
+
+	j := Judge(rec, readErr, invocation, after, drainRequired, bootID)
+	if !j.Floor {
+		return j, false
+	}
+
+	if !present {
+		rec = Record{Schema: Schema}
+	}
+
+	ending := Stopped
+	if j.Verdict != Proved {
+		ending = Failed
+	}
+
+	at := now().UTC()
+
+	err = observe(&rec, Entry{InvocationID: invocation, BootID: bootID, Ending: ending, RunsOnHost: runsOnHost,
+		EndedAt: &at}, drainRequired)
+	if err == nil {
+		named := Remedy(rec)
+
+		rec.trim()
+
+		if err = install(dir, rec); err == nil {
+			if j.Verdict != Proved {
+				j.Acknowledge = named
+			}
+
+			return j, true
+		}
+	}
+
+	if j.Verdict != Proved {
+		j.Why += "; and it could not be recorded: " + err.Error()
+
+		return j, false
+	}
+
+	unknown := judged(Unknown, "", nil, "systemd reports a clean stop, but it could not be recorded for the "+
+		"start that follows: %v", err)
+	unknown.Floor = true
+
+	return unknown, false
 }
 
 // Acknowledge marks the newest node entry acknowledged, only when it is the
@@ -484,16 +564,30 @@ func Reset(dir string, now func() time.Time) (string, Entry, error) {
 	// judgement answers could-not-tell, until the replacement is installed
 	// over it in one rename. A rename first left a moment, and after a crash a
 	// host, with no record at all, which systemd's clean triple then proves. A
-	// directory cannot be linked or renamed over, so it alone is moved aside
-	// first, and only by this command, which holds the node's lock.
+	// directory cannot be linked or renamed over, so it is moved aside, and
+	// for that moment a durable marker makes the missing record read as a
+	// reset interrupted (Read). A marker already there is that interruption,
+	// whose directory is already aside.
+	marked := false
+
 	if err := os.Link(Path(dir), aside); err != nil {
 		info, statErr := os.Lstat(Path(dir))
-		if statErr != nil || !info.IsDir() {
-			return "", Entry{}, fmt.Errorf("keep the unreadable record beside itself: %w", err)
-		}
 
-		if err := os.Rename(Path(dir), aside); err != nil {
-			return "", Entry{}, fmt.Errorf("set the directory at the record's name aside: %w", err)
+		switch {
+		case errors.Is(statErr, fs.ErrNotExist) && resetInterrupted(dir):
+			aside, marked = "", true
+		case statErr != nil || !info.IsDir():
+			return "", Entry{}, fmt.Errorf("keep the unreadable record beside itself: %w", err)
+		default:
+			if err := markReset(dir, at); err != nil {
+				return "", Entry{}, err
+			}
+
+			marked = true
+
+			if err := os.Rename(Path(dir), aside); err != nil {
+				return "", Entry{}, fmt.Errorf("set the directory at the record's name aside: %w", err)
+			}
 		}
 	}
 
@@ -504,7 +598,41 @@ func Reset(dir string, now func() time.Time) (string, Entry, error) {
 		return aside, Entry{}, err
 	}
 
+	if marked {
+		// The record is installed, so a marker left by a failed removal reads
+		// as nothing: Read consults it only when the record is missing.
+		_ = os.Remove(filepath.Join(dir, resetMarker))
+	}
+
 	return aside, e, nil
+}
+
+// resetMarker is written before a reset moves a directory away from the
+// record's name and removed once the replacement is installed.
+const resetMarker = "endings.resetting"
+
+// markReset durably writes the marker that a missing record is a reset in
+// progress, not an absent record.
+func markReset(dir string, at time.Time) error {
+	_, err := durablefile.Installer{}.Install(dir, resetMarker, 0o600, func(w io.Writer) error {
+		_, err := io.WriteString(w, at.Format(time.RFC3339Nano)+"\n")
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("mark the ending record's reset in progress: %w", err)
+	}
+
+	return nil
+}
+
+// resetInterrupted says a reset's marker is present. A marker that cannot be
+// asked about counts as present: a missing record is absent only when
+// nothing says otherwise.
+func resetInterrupted(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, resetMarker))
+
+	return !errors.Is(err, fs.ErrNotExist)
 }
 
 // newestNode is the index of the newest entry that is not a probe's, or -1.

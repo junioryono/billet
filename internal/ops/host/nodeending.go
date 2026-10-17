@@ -160,15 +160,20 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 		return answerEnding(env, *r)
 	}
 
-	unit, observed := observeEndingUnit(ctx)
+	var observed *endingUnitAnswer
 
-	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-	judged := nodeending.Judge(rec, readErr, *invocation, unit, *drain, nodeending.BootID())
-	j, recorded := recordSystemdStop(cfg, *invocation, *drain, judged)
+	j, recorded := nodeending.JudgeStop(cfg.Node.StateDir, *invocation, *drain, cfg.Node.Provider.RunsOnHost(),
+		func() nodeending.Unit {
+			var unit nodeending.Unit
+
+			unit, observed = observeEndingUnit(ctx)
+
+			return unit
+		}, nil)
 
 	answer := endingAnswer{Command: "check", Invocation: *invocation, Drain: *drain, Unit: observed, judgement: &j}
 
-	if judged.Floor {
+	if j.Floor {
 		answer.Recorded = &recorded
 	}
 

@@ -297,7 +297,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-1"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+		if _, err := observeIn(dir, stopped("inv-1"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("Observe over the node's own entry returned %v, want ErrRecordChanged", err)
 		}
 	})
@@ -308,14 +308,14 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-stale"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+		if _, err := observeIn(dir, stopped("inv-stale"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("a clean stop over a killed process was recorded: %v", err)
 		}
 
 		failed := stopped("inv-stale")
 		failed.Ending = Failed
 
-		if _, err := Observe(dir, failed, false, clock(epoch)); err != nil {
+		if _, err := observeIn(dir, failed, false, clock(epoch)); err != nil {
 			t.Fatalf("a failed stop was refused: %v", err)
 		}
 	})
@@ -325,7 +325,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		now := clock(epoch)
 
 		for range 2 {
-			if _, err := Observe(dir, stopped("inv-old"), false, now); err != nil {
+			if _, err := observeIn(dir, stopped("inv-old"), false, now); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -340,11 +340,11 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		failed := stopped("inv-old")
 		failed.Ending = Failed
 
-		if _, err := Observe(dir, failed, false, now); err != nil {
+		if _, err := observeIn(dir, failed, false, now); err != nil {
 			t.Fatalf("a failure over a recorded clean stop returned %v, want it recorded", err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-old"), false, now); !errors.Is(err, ErrRecordChanged) {
+		if _, err := observeIn(dir, stopped("inv-old"), false, now); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("a clean account over a recorded failure returned %v, want ErrRecordChanged", err)
 		}
 
@@ -365,7 +365,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		failed := stopped("inv-a")
 		failed.Ending = Failed
 
-		if _, err := Observe(dir, failed, false, now); err != nil {
+		if _, err := observeIn(dir, failed, false, now); err != nil {
 			t.Fatal(err)
 		}
 
@@ -378,10 +378,37 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		after, err := Observe(dir, failed, false, now)
+		after, err := observeIn(dir, failed, false, now)
 		if err != nil || Remedy(after) != "--invocation inv-b" {
 			t.Fatalf("a repeated observation returned %v and names %q, want the newest, inv-b", err,
 				Remedy(after))
+		}
+	})
+
+	t.Run("a failure over an acknowledged clean account", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		if _, err := observeIn(dir, stopped("inv-x"), false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Acknowledge(dir, "inv-x", false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		failed := stopped("inv-x")
+		failed.Ending = Failed
+
+		after, err := observeIn(dir, failed, false, now)
+		if err != nil || after.Entries[0].Acknowledged || after.Entries[0].Ending != Failed {
+			t.Fatalf("a failure over an acknowledged clean stop left %+v (%v), want failed and not acknowledged",
+				after.Entries, err)
+		}
+
+		if got := AdmitStart(after, nil, cleanUnit, "boot-a"); got.Verdict != Unproved {
+			t.Errorf("a start over the failure is %s (%s), want refused: the acknowledgement was of a clean "+
+				"stop", got.Verdict, got.Why)
 		}
 	})
 
@@ -392,7 +419,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		failed := stopped("inv-x")
 		failed.Ending = Failed
 
-		if _, err := Observe(dir, failed, false, now); err != nil {
+		if _, err := observeIn(dir, failed, false, now); err != nil {
 			t.Fatal(err)
 		}
 
@@ -400,7 +427,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-x"), false, now); !errors.Is(err, ErrRecordChanged) {
+		if _, err := observeIn(dir, stopped("inv-x"), false, now); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("a clean account over an acknowledged failure returned %v, want ErrRecordChanged", err)
 		}
 	})
@@ -417,17 +444,17 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-2"), true, now); !errors.Is(err, ErrRecordChanged) {
+		if _, err := observeIn(dir, stopped("inv-2"), true, now); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("a clean stop over an acknowledgement, a drain required, returned %v", err)
 		}
 
-		if _, err := Observe(dir, stopped("inv-2"), false, now); err != nil {
+		if _, err := observeIn(dir, stopped("inv-2"), false, now); err != nil {
 			t.Fatalf("a clean stop over an acknowledgement, no drain required, returned %v", err)
 		}
 	})
 
 	t.Run("no invocation", func(t *testing.T) {
-		if _, err := Observe(t.TempDir(), stopped(""), false, clock(epoch)); err == nil {
+		if _, err := observeIn(t.TempDir(), stopped(""), false, clock(epoch)); err == nil {
 			t.Fatal("a stop with no invocation was recorded")
 		}
 	})
@@ -464,6 +491,110 @@ func TestADirectoryAtTheRecordsNameIsReset(t *testing.T) {
 // every judgement still answers could-not-tell, and the host never has no
 // record, which systemd's clean triple alone would prove.
 func TestAFailedResetLeavesTheRecordInPlace(t *testing.T) {
+	t.Run("a directory", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(Path(dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		prev := resetInstall
+		resetInstall = func(string, Record) error { return errors.New("the disk is full") }
+
+		if _, _, err := Reset(dir, clock(epoch)); err == nil {
+			t.Fatal("a reset whose install failed reported success")
+		}
+
+		resetInstall = prev
+
+		// The directory is aside and nothing is at the record's name, which the
+		// marker makes could-not-tell rather than absent.
+		rec, present, err := Read(dir)
+		if err == nil || present || !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("after a failed directory reset the record reads present %v, err %v; want interrupted",
+				present, err)
+		}
+
+		if got := Standing(rec, err, cleanUnit, true, "boot-a"); got.Verdict != Unknown {
+			t.Fatalf("a drain over an interrupted reset is %s (%s), want could-not-tell", got.Verdict, got.Why)
+		}
+
+		if _, _, err := Reset(dir, clock(epoch.Add(time.Hour))); err != nil {
+			t.Fatalf("the reset run again returned %v", err)
+		}
+
+		if _, err := os.Lstat(filepath.Join(dir, resetMarker)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the marker outlived the reset: %v", err)
+		}
+
+		if rec, _, err := Read(dir); err != nil || AdmitStart(rec, nil, cleanUnit, "boot-a").Verdict != Proved {
+			t.Errorf("after the reset completed the record reads %v and a start is not admitted", err)
+		}
+	})
+
+	t.Run("a file", func(t *testing.T) { aFailedFileResetLeavesTheRecordInPlace(t) })
+}
+
+// TWO CHECKS OF ONE STOP ARE JUDGED ONE AFTER THE OTHER: the second asks
+// systemd only once the first has written what it saw, so a clean account
+// read after reset-failed cannot be proved while the first check's failure is
+// still unwritten.
+func TestTwoChecksOfOneStopAreJudgedInTurn(t *testing.T) {
+	dir := t.TempDir()
+
+	inSample, release := make(chan struct{}), make(chan struct{})
+
+	first := make(chan Judgement, 1)
+
+	go func() {
+		j, _ := JudgeStop(dir, "inv-x", false, true, func() Unit {
+			close(inSample)
+			<-release
+
+			return timedOut
+		}, clock(epoch))
+		first <- j
+	}()
+
+	<-inSample
+
+	second := make(chan Judgement, 1)
+
+	var sawFailure bool
+
+	go func() {
+		j, _ := JudgeStop(dir, "inv-x", false, true, func() Unit {
+			rec, _, err := Read(dir)
+			sawFailure = err == nil && len(rec.Entries) == 1 && rec.Entries[0].Ending == Failed
+
+			return cleanUnit
+		}, clock(epoch))
+		second <- j
+	}()
+
+	// Long enough for the second check to reach systemd if nothing held it,
+	// which the assertion below would then catch; never a condition for
+	// passing.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	if j := <-first; j.Verdict != Unproved {
+		t.Fatalf("the check that saw the timeout is %s (%s), want unproved", j.Verdict, j.Why)
+	}
+
+	j := <-second
+	if !sawFailure {
+		t.Fatal("the second check asked systemd before the first had written what it saw")
+	}
+
+	if j.Verdict != Unproved {
+		t.Fatalf("the check that saw the clean triple after the failure is %s (%s), want unproved", j.Verdict,
+			j.Why)
+	}
+}
+
+func aFailedFileResetLeavesTheRecordInPlace(t *testing.T) {
+	t.Helper()
+
 	dir := t.TempDir()
 	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
