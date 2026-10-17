@@ -82,6 +82,9 @@ func TestLearnedRatesResumeOnlyOnTheirInterface(t *testing.T) {
 		"no boot either side, the same":   {l("eno2np1", "2", mac, ""), nic{"eno2np1", "2", mac, ""}, true},
 		"no index, another device":        {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", other, "a"}, false},
 		"no index, the same device":       {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", mac, "a"}, true},
+		"no index now, another device":    {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "", other, "a"}, false},
+		"no index then, another device":   {l("eno2np1", "", mac, "a"), nic{"eno2np1", "2", other, "a"}, false},
+		"no index, no address now":        {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", "", "a"}, true},
 	} {
 		if ok, why := c.l.resumes(c.at, now); ok != c.want || (!ok && why == "") {
 			t.Errorf("%s: resumes %v (%q), want %v with a reason when not", name, ok, why, c.want)
@@ -722,6 +725,18 @@ func TestTheAddressRecordedIsTheOneAtTheWrite(t *testing.T) {
 	blind(150, 150)
 	if l, found, err := readLearned(); err != nil || !found || l.Up.Rate != 150 || l.Addr != testMAC {
 		t.Errorf("a run with no index recorded %+v (%v, %v), want its starting address %q", l, found, err, testMAC)
+	}
+
+	// EVEN WHEN THE INDEX STILL CANNOT BE READ, so "none" equals "none": that is
+	// no proof the device is the same one.
+	if err := os.Remove(filepath.Join(sysNet, "eno2np1", "ifindex")); err != nil {
+		t.Fatal(err)
+	}
+	setAddress(t, "02:00:00:77:88:99")
+	blind(160, 160)
+	if l, found, err := readLearned(); err != nil || !found || l.Up.Rate != 160 || l.Addr != testMAC {
+		t.Errorf("a run with no index, its index still unreadable, recorded %+v (%v, %v), want %q", l, found,
+			err, testMAC)
 	}
 }
 
