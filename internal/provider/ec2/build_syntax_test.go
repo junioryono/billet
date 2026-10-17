@@ -17,7 +17,7 @@ import (
 //
 // THE FAILURE IF IT IS WRONG IS THE EXPENSIVE SHAPE. A syntax error produces a
 // builder that boots, has cloud-init fail, never reaches `poweroff`, and burns
-// the whole 60-minute timeout on a paid instance before billet reports that the
+// the whole build timeout on a paid instance before billet reports that the
 // guest never stopped — which names neither the script nor the line.
 //
 // EVERY SHELL THAT MIGHT RUN IT. Ubuntu's /bin/sh is dash and this suite's is
