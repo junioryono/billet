@@ -86,17 +86,29 @@ func TestEveryTerraformLockRecordsEveryPlatformsChecksum(t *testing.T) {
 
 	// THE MODULES CI'S TERRAFORM GATES WALK, from the Makefile that names them,
 	// not a second discovery that could disagree with it.
-	cmd := exec.CommandContext(t.Context(), "make", "-s", "tf-modules-check")
+	// A SUB-MAKE WHEN `make test` RUNS THIS, so what it inherits is dropped and
+	// the directory lines a sub-make prints are turned off; and the list is the
+	// one line that says it is.
+	cmd := exec.CommandContext(t.Context(), "make", "-s", "--no-print-directory", "tf-modules-check")
 	cmd.Dir = ".."
+	cmd.Env = environmentWithout("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("make tf-modules-check: %v", err)
+		t.Fatalf("make tf-modules-check: %v\n%s", err, stderr.String())
 	}
 
-	listed, found := strings.CutPrefix(strings.TrimSpace(string(out)), "terraform modules:")
-	if !found {
-		t.Fatalf("make tf-modules-check printed %q, want the module list", out)
+	var lists []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "terraform modules:"); ok {
+			lists = append(lists, rest)
+		}
 	}
+	if len(lists) != 1 {
+		t.Fatalf("make tf-modules-check printed %q, want exactly one module list", out)
+	}
+	listed := lists[0]
 
 	var modules []string
 	for _, m := range strings.Fields(listed) {
