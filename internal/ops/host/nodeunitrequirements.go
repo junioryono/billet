@@ -80,9 +80,11 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 		return "the candidate needs nothing of a node unit", nil
 	}
 
-	names := []string{"LoadState", "FragmentPath", "DropInPaths", "RuntimeDirectory"}
+	// DropInPaths is asked for the remedy alone, which says when it was not
+	// answered; the judgement reads only these.
+	names := []string{"LoadState", "FragmentPath", "RuntimeDirectory"}
 
-	props, err := insp.UnitProperties(ctx, nodeUnit, names...)
+	props, err := insp.UnitProperties(ctx, nodeUnit, append(slices.Clone(names), "DropInPaths")...)
 	if err != nil {
 		return "", fmt.Errorf("ask systemd about %s: %w", nodeUnit, err)
 	}
@@ -113,9 +115,14 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 	if missing := missingRuntimeDirectories(required, firstProp(props, "RuntimeDirectory")); len(missing) > 0 {
 		fragment := firstProp(props, "FragmentPath")
 
+		remedy := unitRemedy(fragment, firstProp(props, "DropInPaths"))
+		if _, ok := props["DropInPaths"]; !ok {
+			remedy += "; its drop-ins could not be read, so check them too (systemctl cat " + nodeUnit + ")"
+		}
+
 		return "", fmt.Errorf("%s needs %s to provide %s, and the loaded unit (%s) does not; a rollout installs no "+
 			"units, so %s, and the rollout takes this host when it next asks", candidate, nodeUnit,
-			strings.Join(missing, " and "), fragment, unitRemedy(fragment, firstProp(props, "DropInPaths")))
+			strings.Join(missing, " and "), fragment, remedy)
 	}
 
 	return fmt.Sprintf("the loaded node unit provides everything %s needs", candidate), nil
@@ -145,26 +152,38 @@ var (
 // repair-unit`) or by hand, and a package install does not reach it; a unit
 // between the two is outranked by the one a converge installs; a packaged unit,
 // or one below it, is replaced by either; a unit above the role's, or one
-// systemd names no file for, is neither's. Drop-ins apply over whichever file
-// is in effect, and neither a converge nor a package removes one it did not
-// install.
+// systemd names no file for, is neither's. A fragment named otherwise is the
+// target of an alias, whose own rank its path does not show. A host refused
+// for its unit runs a node of a release that publishes its record (the
+// refusing binary is one), and a converge over that node stops at its repair,
+// which edits the role's own unit alone: so a converge reaches any other unit
+// only once the node is stopped. Drop-ins apply over whichever file is in
+// effect, and neither a converge nor a package removes one it did not install.
+// The upgrade's refusal and the repair's both name their remedy here.
 func unitRemedy(fragment string, dropIns string) string {
+	const stopFirst = "stop " + nodeUnit + ", then converge the host role (over a running node a converge stops " +
+		"at its repair, which edits only the role's own unit)"
+
 	var remedy string
 
 	switch dir := path.Dir(fragment); {
 	case fragment == "":
 		remedy = "systemd names no file for the unit in effect, so find what defines it (systemctl cat " +
 			nodeUnit + ") before converging or installing the package"
+	case path.Base(fragment) != nodeUnit:
+		remedy = nodeUnit + " is an alias of " + path.Base(fragment) + ", and where the alias itself ranks is not " +
+			"shown by its target's path, so find what defines it (systemctl cat " + nodeUnit + ") before " +
+			"converging or installing the package"
 	case dir == "/etc/systemd/system":
 		remedy = "converge the host role, which repairs that unit, or follow the manual repair in " +
 			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
 			"/etc/systemd/system outranks the packaged one"
 	case slices.Contains(unitDirsBetween, dir):
-		remedy = "converge the host role, whose unit under /etc/systemd/system outranks that one; installing the " +
-			"package does not help, since that one outranks the packaged unit"
+		remedy = stopFirst + ", whose unit under /etc/systemd/system outranks that one; installing the package " +
+			"does not help, since that one outranks the packaged unit"
 	case slices.Contains(unitDirsPackage, dir), dir == "/run/systemd/generator.late":
-		remedy = "install this release's package, or converge the host role, so that the unit in effect is one " +
-			"this release ships"
+		remedy = "install this release's package, which replaces that unit with one this release ships; or " +
+			stopFirst
 	case slices.Contains(unitDirsAboveRole, dir):
 		remedy = "remove that unit or give it the directory by hand as " + unitRequirementsRemedyDoc +
 			" describes; it outranks both the host role's unit and the packaged one, so neither a converge nor " +

@@ -98,7 +98,10 @@ func TestTheCandidateIsHeldToWhatItNeedsOfTheNodeUnit(t *testing.T) {
 		{"FragmentPath unanswered", "v0.17.0", "LoadState=loaded\nDropInPaths=\nRuntimeDirectory=billet/locks\n", nodeConfig,
 			"answered no FragmentPath", ""},
 		{"DropInPaths unanswered", "v0.17.0", "LoadState=loaded\nFragmentPath=/etc/x\nRuntimeDirectory=billet/locks\n",
-			nodeConfig, "answered no DropInPaths", ""},
+			nodeConfig, "its drop-ins could not be read", ""},
+		{"DropInPaths unanswered over a unit that meets it", "v0.17.0",
+			"LoadState=loaded\nFragmentPath=/etc/x\nRuntimeDirectory=billet/locks billet/registration\n", nodeConfig, "",
+			"provides everything v0.17.0 needs"},
 		{"a unit in another state", "v0.17.0", "LoadState=error\nFragmentPath=\nDropInPaths=\nRuntimeDirectory=\n", nodeConfig,
 			"LoadState=error", ""},
 	} {
@@ -130,10 +133,12 @@ func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
 
 	const (
 		repairs   = "converge the host role, which repairs that unit"
-		outranks  = "converge the host role, whose unit under /etc/systemd/system outranks that one"
+		outranks  = "whose unit under /etc/systemd/system outranks that one"
 		pkg       = "install this release's package"
 		neither   = "neither a converge nor installing the package changes it"
 		noPackage = "installing the package does not help"
+		stopFirst = "stop billet-node.service, then converge the host role"
+		alias     = "is an alias of"
 	)
 
 	for _, tc := range []struct {
@@ -143,29 +148,37 @@ func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
 		{"a unit the role rendered", legacyNodeUnit,
 			[]string{"(/etc/systemd/system/billet-node.service)", repairs,
 				"the manual repair in docs/operating/upgrades.md", noPackage},
-			[]string{pkg, outranks, neither}},
+			[]string{pkg, outranks, neither, stopFirst}},
 		{"a packaged unit", packagedLegacyNodeUnit,
-			[]string{"(/usr/lib/systemd/system/billet-node.service)", pkg},
+			[]string{"(/usr/lib/systemd/system/billet-node.service)", pkg, stopFirst},
 			[]string{noPackage, repairs, neither}},
-		{"a packaged unit without a merged /usr", at("/lib/systemd/system"), []string{pkg},
+		{"a packaged unit without a merged /usr", at("/lib/systemd/system"), []string{pkg, stopFirst},
 			[]string{noPackage, repairs, neither}},
-		{"a late generator's unit", at("/run/systemd/generator.late"), []string{pkg},
+		{"a late generator's unit", at("/run/systemd/generator.late"), []string{pkg, stopFirst},
 			[]string{noPackage, repairs, neither}},
 		{"a runtime unit", at("/run/systemd/system"),
-			[]string{"(/run/systemd/system/billet-node.service)", outranks, noPackage},
+			[]string{"(/run/systemd/system/billet-node.service)", outranks, noPackage, stopFirst},
 			[]string{pkg, repairs, neither}},
-		{"a local administrator's unit", at("/usr/local/lib/systemd/system"), []string{outranks, noPackage},
+		{"a local administrator's unit", at("/usr/local/lib/systemd/system"), []string{outranks, noPackage, stopFirst},
 			[]string{pkg, repairs, neither}},
-		{"an attached unit", at("/etc/systemd/system.attached"), []string{outranks}, []string{pkg, repairs, neither}},
-		{"a generator's unit", at("/run/systemd/generator"), []string{outranks}, []string{pkg, repairs, neither}},
+		{"an attached unit", at("/etc/systemd/system.attached"), []string{outranks, stopFirst},
+			[]string{pkg, repairs, neither}},
+		{"a generator's unit", at("/run/systemd/generator"), []string{outranks, stopFirst}, []string{pkg, repairs, neither}},
 		{"a control unit", at("/etc/systemd/system.control"), []string{neither},
-			[]string{pkg, repairs, outranks}},
+			[]string{pkg, repairs, outranks, stopFirst}},
 		{"a transient unit", at("/run/systemd/transient"), []string{neither}, []string{pkg, repairs, outranks}},
 		{"an early generator's unit", at("/run/systemd/generator.early"), []string{neither},
 			[]string{pkg, repairs, outranks}},
 		{"a unit with no file", strings.Replace(legacyNodeUnit, "FragmentPath=/etc/systemd/system/billet-node.service",
 			"FragmentPath=", 1),
 			[]string{"systemd names no file for the unit in effect"}, []string{pkg, repairs, outranks, neither}},
+		{"an alias whose target ranks below the role's", strings.Replace(legacyNodeUnit,
+			"FragmentPath=/etc/systemd/system/billet-node.service",
+			"FragmentPath=/usr/local/lib/systemd/system/legacy-node.service", 1),
+			[]string{"billet-node.service is an alias of legacy-node.service", "systemctl cat billet-node.service"},
+			[]string{pkg, repairs, outranks, neither, stopFirst}},
+		{"an alias in the role's directory", strings.Replace(legacyNodeUnit, "billet-node.service", "other.service", 1),
+			[]string{alias}, []string{pkg, repairs, outranks, neither}},
 		{"a unit somewhere systemd's order does not name", at("/opt/units"),
 			[]string{"which is neither the host role's nor the package's"}, []string{pkg, repairs, outranks, neither}},
 		{"a packaged unit with a drop-in", strings.Replace(packagedLegacyNodeUnit, "DropInPaths=\n",

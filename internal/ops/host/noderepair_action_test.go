@@ -388,6 +388,43 @@ func TestTheRepairAdmitsOnlyTheLegacyShape(t *testing.T) {
 	}
 }
 
+// A REFUSED SHAPE NAMES THE REMEDY THAT CHANGES IT, never the package for a
+// unit the package cannot reach: a unit between the role's and the package's
+// is outranked by a converge once the node is stopped; the role's own unit in
+// another shape is edited by hand; a packaged one is replaced by the package.
+func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stage        func(t *testing.T, f *repairFixture)
+		want, absent string
+	}{
+		{"a runtime unit", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "FragmentPath", "/run/systemd/system/billet-node.service")
+		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		{"the role's unit in another shape", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/other")
+		}, "add billet/registration to its RuntimeDirectory by hand", "install this release's package"},
+		{"a packaged unit", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "FragmentPath", "/usr/lib/systemd/system/billet-node.service")
+		}, "install this release's package", "by hand"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRepairFixture(t)
+			tc.stage(t, f)
+
+			o := f.repair(t)
+			if o.str("outcome") != outcomeRefused || o.str("reason") != endpointReasonShape ||
+				!strings.Contains(o.str("next"), tc.want) || strings.Contains(o.str("next"), tc.absent) {
+				t.Fatalf("outcome %q reason %q next %q, want a shape refusal whose next says %q and not %q",
+					o.str("outcome"), o.str("reason"), o.str("next"), tc.want, tc.absent)
+			}
+		})
+	}
+}
+
 // EVERY STEP THAT FAILS SAYS WHAT IT LEFT. A stop that is not proved leaves the
 // unit untouched; a unit file changed under the stop is not replaced; a
 // reload that fails, or one after which systemd does not load the repair,

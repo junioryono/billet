@@ -755,16 +755,25 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 		return false, "the unit already declares " + deploy.NodeRegistrationDirectory, nil
 	}
 
+	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks, except for
+	// the role's own unit in another shape: only a hand edit changes that one.
+	remedy := unitRemedy(shape.FragmentPath, firstProp(props, "DropInPaths"))
+
 	switch {
 	case !slices.Equal(entries, []string{"billet/locks"}):
+		if shape.FragmentPath == repairUnitPath {
+			remedy = "add " + deploy.NodeRegistrationDirectory + " to its RuntimeDirectory by hand as " +
+				unitRequirementsRemedyDoc + " describes; installing the package does not change a unit under " +
+				"/etc/systemd/system"
+		}
+
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s declares RuntimeDirectory=%s, which is "+
-			"not the one shape a repair admits (billet/locks alone)", nodeUnit, shape.RuntimeDirectory),
-			"add "+deploy.NodeRegistrationDirectory+" to its RuntimeDirectory by hand as docs/operating/upgrades.md "+
-				"describes, or install the package this release ships", stateNothing)
+			"not the one shape a repair admits (billet/locks alone)", nodeUnit, shape.RuntimeDirectory), remedy,
+			stateNothing)
 	case shape.FragmentPath != repairUnitPath:
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s is loaded from %s, not from %s, "+
-			"which is the only unit a repair edits", nodeUnit, shape.FragmentPath, repairUnitPath),
-			"install the package this release ships, which carries the unit", stateNothing)
+			"which is the only unit a repair edits", nodeUnit, shape.FragmentPath, repairUnitPath), remedy,
+			stateNothing)
 	case firstProp(props, "DropInPaths") != "":
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s has drop-ins (%s), which a repair "+
 			"does not admit", nodeUnit, firstProp(props, "DropInPaths")), "", stateNothing)
