@@ -297,7 +297,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := Observe(dir, stopped("inv-1"), clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+		if err := Observe(dir, stopped("inv-1"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("Observe over the node's own entry returned %v, want ErrRecordChanged", err)
 		}
 	})
@@ -308,14 +308,14 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := Observe(dir, stopped("inv-stale"), clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+		if err := Observe(dir, stopped("inv-stale"), false, clock(epoch)); !errors.Is(err, ErrRecordChanged) {
 			t.Fatalf("a clean stop over a killed process was recorded: %v", err)
 		}
 
 		failed := stopped("inv-stale")
 		failed.Ending = Failed
 
-		if err := Observe(dir, failed, clock(epoch)); err != nil {
+		if err := Observe(dir, failed, false, clock(epoch)); err != nil {
 			t.Fatalf("a failed stop was refused: %v", err)
 		}
 	})
@@ -325,7 +325,7 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		now := clock(epoch)
 
 		for range 2 {
-			if err := Observe(dir, stopped("inv-old"), now); err != nil {
+			if err := Observe(dir, stopped("inv-old"), false, now); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -334,10 +334,38 @@ func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
 		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Source != SourceSystemd {
 			t.Fatalf("after two observations the record is %+v (%v), want one systemd entry", rec.Entries, err)
 		}
+
+		failed := stopped("inv-old")
+		failed.Ending = Failed
+
+		if err := Observe(dir, failed, false, now); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a different account of the same stop returned %v, want ErrRecordChanged", err)
+		}
+	})
+
+	t.Run("a clean stop where a drain is required", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), now); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := Acknowledge(dir, "inv-1", false, now); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Observe(dir, stopped("inv-2"), true, now); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean stop over an acknowledgement, a drain required, returned %v", err)
+		}
+
+		if err := Observe(dir, stopped("inv-2"), false, now); err != nil {
+			t.Fatalf("a clean stop over an acknowledgement, no drain required, returned %v", err)
+		}
 	})
 
 	t.Run("no invocation", func(t *testing.T) {
-		if err := Observe(t.TempDir(), stopped(""), clock(epoch)); err == nil {
+		if err := Observe(t.TempDir(), stopped(""), false, clock(epoch)); err == nil {
 			t.Fatal("a stop with no invocation was recorded")
 		}
 	})

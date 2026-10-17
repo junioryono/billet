@@ -343,16 +343,19 @@ func (h *Handle) End(ending Ending, drainRequested bool) error {
 
 // ErrRecordChanged is Observe's refusal when the record no longer says what
 // the judgement it records read: the invocation has an entry of its own now,
-// or the history beneath it no longer admits a start.
+// or systemd's account of it, or the history beneath it, no longer says what
+// the judgement read.
 var ErrRecordChanged = errors.New("the ending record changed since the stop was judged")
 
 // Observe appends what systemd said of a stop of e.InvocationID, which no
 // node entry covers, so the evidence outlives reset-failed and the unit's
 // garbage collection. It re-reads the record under its lock first: an
-// invocation that has an entry of its own is the node's to speak for, a stop
-// already observed is not observed twice, and a clean stop is recorded only
-// over a history that admits a start, as the judgement it records required.
-func Observe(dir string, e Entry, now func() time.Time) error {
+// invocation that has an entry of its own is the node's to speak for; an
+// observation that differs from one already recorded for it is refused, and
+// an identical one is not written twice; and a clean stop is recorded only over
+// a history that passes the stop's own standard, as the judgement it records
+// required.
+func Observe(dir string, e Entry, drainRequired bool, now func() time.Time) error {
 	if now == nil {
 		now = time.Now
 	}
@@ -365,26 +368,25 @@ func Observe(dir string, e Entry, now func() time.Time) error {
 	e.Source, e.EndedAt, e.Role, e.Acknowledged = SourceSystemd, &at, RoleNode, false
 
 	return update(dir, func(r *Record) error {
-		for i := range r.Entries {
-			old := &r.Entries[i]
-			if old.InvocationID != e.InvocationID || old.Role != RoleNode {
-				continue
-			}
-
-			if old.Source == SourceSystemd {
-				return nil
-			}
-
+		if i := entryFor(*r, e.InvocationID); i >= 0 {
 			return fmt.Errorf("%w: invocation %s has an entry of its own", ErrRecordChanged, e.InvocationID)
 		}
 
+		seen := observedFor(*r, e.InvocationID)
+		if seen >= 0 && r.Entries[seen].Ending != e.Ending {
+			return fmt.Errorf("%w: systemd's account of invocation %s was recorded as %s", ErrRecordChanged,
+				e.InvocationID, r.Entries[seen].Ending)
+		}
+
 		if n := newestNode(r.Entries); e.Ending == Stopped && n >= 0 {
-			if s := standing(*r, n, forStart, e.BootID); s.Verdict != Proved {
+			if s := standing(*r, n, standardFor(drainRequired), e.BootID); s.Verdict != Proved {
 				return fmt.Errorf("%w: %s", ErrRecordChanged, s.Why)
 			}
 		}
 
-		r.Entries = append(r.Entries, e)
+		if seen < 0 {
+			r.Entries = append(r.Entries, e)
+		}
 
 		return nil
 	})
@@ -432,8 +434,8 @@ func Acknowledge(dir, invocation string, unrecorded bool, now func() time.Time) 
 	return got, err
 }
 
-// Reset sets aside a record that cannot be read, renaming it beside itself
-// rather than deleting the evidence, and starts a new one holding an
+// Reset sets aside a record that cannot be read, keeping it beside itself
+// rather than deleting the evidence, and replaces it with a new one holding an
 // acknowledged Unrecorded entry: the operator's word that the host runs nothing
 // a node would not adopt, which is all a start then rests on. A record that can
 // be read is refused, since its newest entry is what to acknowledge.
@@ -458,10 +460,14 @@ func Reset(dir string, now func() time.Time) (string, Entry, error) {
 	}
 
 	at := now().UTC()
-	aside := Path(dir) + ".unreadable-" + at.Format("20060102T150405Z")
+	aside := Path(dir) + ".unreadable-" + at.Format("20060102T150405.000000000Z")
 
-	if err := os.Rename(Path(dir), aside); err != nil {
-		return "", Entry{}, fmt.Errorf("set the unreadable record aside: %w", err)
+	// A LINK, NOT A RENAME: the unreadable record stays at its name, and every
+	// judgement answers could-not-tell, until the replacement is installed
+	// over it in one rename. A rename first left a moment, and after a crash a
+	// host, with no record at all, which systemd's clean triple then proves.
+	if err := os.Link(Path(dir), aside); err != nil {
+		return "", Entry{}, fmt.Errorf("keep the unreadable record beside itself: %w", err)
 	}
 
 	e := Entry{Role: RoleNode, StartedAt: at, EndedAt: &at, Ending: Unrecorded, Source: SourceOperator,

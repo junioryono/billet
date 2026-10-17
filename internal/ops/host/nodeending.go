@@ -164,7 +164,7 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 
 	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
 	judged := nodeending.Judge(rec, readErr, *invocation, unit, *drain, nodeending.BootID())
-	j, recorded := recordSystemdStop(cfg, *invocation, judged)
+	j, recorded := recordSystemdStop(cfg, *invocation, *drain, judged)
 
 	answer := endingAnswer{Command: "check", Invocation: *invocation, Drain: *drain, Unit: observed, judgement: &j}
 

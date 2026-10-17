@@ -67,7 +67,7 @@ An `idle` process never registered, so it never adopted what the process before 
 
 An acknowledgement takes the node's own deployment lock, so it refuses while a node process holds the identity. It permits a start only, never an operation that needs a drain.
 
-**A record that cannot be read** (corrupt, from a newer release, or writable by another user) is never overwritten, and every judgement reads it as could-not-tell. Once what the host runs is known, `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --reset-unreadable --json` renames it beside itself (`endings.json.unreadable-<time>`) and starts a new record that holds only the acknowledgement.
+**A record that cannot be read** (corrupt, from a newer release, or writable by another user) is never overwritten, and every judgement reads it as could-not-tell. Once what the host runs is known, `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --reset-unreadable --json` keeps it beside itself (`endings.json.unreadable-<time>`, a hard link) and replaces it in one rename with a new record that holds only the acknowledgement, so the host never has no record at all.
 
 These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet. The Ansible role's own node restarts read the same record once the collection adopts it.
 

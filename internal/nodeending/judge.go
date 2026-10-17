@@ -149,13 +149,13 @@ func standing(rec Record, i int, std standard, bootID string) Judgement {
 
 		switch {
 		case std == forStart && e.Acknowledged:
-			return through(via, judged(Proved, ProofAcknowledged, &e, "the stop of %s was acknowledged",
-				describe(e)))
+			return through(via, judged(Proved, weakest(proof, ProofAcknowledged), &e,
+				"the stop of %s was acknowledged", describe(e)))
 		case e.Source == SourceNode && e.Ending == Drained:
 			return through(via, judged(Proved, proof, &e, "%s drained", describe(e)))
 		case e.RunsOnHost && e.BootID != "" && bootID != "" && e.BootID != bootID:
-			return through(via, judged(Proved, ProofReboot, &e, "%s ran in an earlier boot, and the reboot "+
-				"ended the compute it ran on this host", describe(e)))
+			return through(via, judged(Proved, weakest(proof, ProofReboot), &e,
+				"%s ran in an earlier boot, and the reboot ended the compute it ran on this host", describe(e)))
 		case e.Source == SourceNode && e.Ending == HandedOff && std == forStart:
 			return through(via, judged(Proved, proof, &e, "%s handed its compute to the next process to adopt",
 				describe(e)))
@@ -180,6 +180,16 @@ func standing(rec Record, i int, std standard, bootID string) Judgement {
 	}
 
 	return through(via, judged(Proved, proof, nil, "no earlier process is recorded"))
+}
+
+// weakest is a proved chain's label: systemd's floor, once the chain passed a
+// stop only systemd spoke for, whatever proved the entry beneath it.
+func weakest(chain, proof string) string {
+	if chain == ProofSystemd {
+		return ProofSystemd
+	}
+
+	return proof
 }
 
 // through prefixes a judgement with the endings it inherited through.
@@ -218,6 +228,15 @@ func Judge(rec Record, readErr error, invocation string, after Unit, drainRequir
 func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bool, bootID string) Judgement {
 	i := entryFor(rec, invocation)
 	if i < 0 {
+		// WHAT SYSTEMD SAID FIRST STANDS: a stop recorded failed before
+		// reset-failed made the triple clean is still the stop that failed.
+		if o := observedFor(rec, invocation); o >= 0 && rec.Entries[o].Ending != Stopped {
+			e := rec.Entries[o]
+
+			return judged(Unproved, "", &e, "invocation %s kept no ending record, and systemd reported its stop "+
+				"%s when it was first judged", invocation, e.Ending)
+		}
+
 		if !after.cleanTriple() {
 			j := judged(Unproved, "", nil, "invocation %s kept no ending record and systemd reports %s",
 				invocation, after.triple())
@@ -227,10 +246,10 @@ func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bo
 		}
 
 		if n := newestNode(rec.Entries); n >= 0 {
-			if s := standing(rec, n, forStart, bootID); s.Verdict != Proved {
+			if s := standing(rec, n, standardFor(drainRequired), bootID); s.Verdict != Proved {
 				s.Why = fmt.Sprintf("invocation %s kept no ending record, so only systemd's %s speaks for it, "+
-					"and that covers a process only over a history that admits a start: %s", invocation,
-					after.triple(), s.Why)
+					"and that covers a process only over a history that passes this stop as well: %s",
+					invocation, after.triple(), s.Why)
 
 				return s
 			}
@@ -253,10 +272,7 @@ func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bo
 			"the stop may have ended that one", invocation, describe(newer))
 	}
 
-	std := forStart
-	if drainRequired || e.DrainRequested {
-		std = forDrain
-	}
+	std := standardFor(drainRequired || e.DrainRequested)
 
 	switch {
 	case e.Ending == Drained:
@@ -278,6 +294,28 @@ func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bo
 	default:
 		return judged(Unproved, "", &e, "invocation %s ended %s", invocation, e.Ending)
 	}
+}
+
+// standardFor is the standard a stop that needs a drain, or does not, is
+// judged at.
+func standardFor(drainRequired bool) standard {
+	if drainRequired {
+		return forDrain
+	}
+
+	return forStart
+}
+
+// observedFor is the index of the systemd observation of invocation, or -1.
+func observedFor(rec Record, invocation string) int {
+	for i := len(rec.Entries) - 1; i >= 0; i-- {
+		e := rec.Entries[i]
+		if e.InvocationID == invocation && e.Role == RoleNode && e.Source == SourceSystemd {
+			return i
+		}
+	}
+
+	return -1
 }
 
 // entryFor is the index of the newest node-written entry for invocation, or -1.
@@ -325,12 +363,7 @@ func Standing(rec Record, readErr error, now Unit, drainRequired bool, bootID st
 			now.triple()))
 	}
 
-	std := forStart
-	if drainRequired {
-		std = forDrain
-	}
-
-	return remedied(rec, standing(rec, i, std, bootID))
+	return remedied(rec, standing(rec, i, standardFor(drainRequired), bootID))
 }
 
 // unreadable is could-not-tell for a record that cannot be read. Only a

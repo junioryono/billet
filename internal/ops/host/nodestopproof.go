@@ -53,7 +53,8 @@ func acknowledgeRemedy(j nodeending.Judgement) string {
 	}
 
 	return fmt.Sprintf(". Once what it left is known, `billet node ending acknowledge %s` permits a start, "+
-		"and nothing that needs a drain", j.Acknowledge)
+		"and nothing that needs a drain: start the node so it adopts what was left, then stop it again to "+
+		"drain", j.Acknowledge)
 }
 
 // nodeUnitProperties are what a judgement reads of the node unit.
@@ -142,7 +143,7 @@ func judgeNodeStop(
 		return nodeending.Standing(rec, readErr, after, drain, nodeending.BootID())
 	}
 
-	j, _ := recordSystemdStop(cfg, invocation,
+	j, _ := recordSystemdStop(cfg, invocation, drain,
 		nodeending.Judge(rec, readErr, invocation, after, drain, nodeending.BootID()))
 
 	return j
@@ -155,7 +156,7 @@ func judgeNodeStop(
 // it, and the record may have changed since it was read. recorded says the
 // record now holds what systemd said.
 func recordSystemdStop(
-	cfg *config.Config, invocation string, j nodeending.Judgement,
+	cfg *config.Config, invocation string, drain bool, j nodeending.Judgement,
 ) (nodeending.Judgement, bool) {
 	if !j.Floor {
 		return j, false
@@ -169,9 +170,14 @@ func recordSystemdStop(
 	err := nodeending.Observe(cfg.Node.StateDir, nodeending.Entry{
 		InvocationID: invocation, BootID: nodeending.BootID(), Ending: ending,
 		RunsOnHost: cfg.Node.Provider.RunsOnHost(),
-	}, nil)
+	}, drain, nil)
 
 	switch {
+	case err == nil && j.Verdict != nodeending.Proved:
+		// The failure is now the newest entry, so it is what to acknowledge.
+		j.Acknowledge = "--invocation " + invocation
+
+		return j, true
 	case err == nil:
 		return j, true
 	case j.Verdict != nodeending.Proved:

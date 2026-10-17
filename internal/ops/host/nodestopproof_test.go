@@ -234,9 +234,10 @@ func TestARunningNodeIsNotAdmittedAgain(t *testing.T) {
 	h := newStopProofHost(t, cleanAfter)
 	h.record(t, nodeending.Running)
 
+	// The fake's start fails, so the error is the start's own, after the gate.
 	err := h.host.StartServices(t.Context())
-	if err != nil && strings.Contains(err.Error(), "is not started") {
-		t.Fatalf("StartServices over a running node = %v, want no gate", err)
+	if err == nil || !strings.Contains(err.Error(), "starting "+nodeUnit) {
+		t.Fatalf("StartServices over a running node = %v, want past the gate to the start", err)
 	}
 
 	if h.verbs(t) != "start" {

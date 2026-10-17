@@ -80,8 +80,8 @@ func (f *endingFixture) unit(t *testing.T, active, sub, result, mainPID, invocat
 func (f *endingFixture) begin(t *testing.T, invocation string, ending nodeending.Ending) {
 	t.Helper()
 
-	h, err := nodeending.Begin(f.stateDir, nodeending.Entry{InvocationID: invocation, PID: 4, BootID: "b",
-		Role: nodeending.RoleNode, RunsOnHost: true}, nil)
+	h, err := nodeending.Begin(f.stateDir, nodeending.Entry{InvocationID: invocation, PID: 4,
+		BootID: nodeending.BootID(), Role: nodeending.RoleNode, RunsOnHost: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,16 +137,52 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		f.begin(t, "inv-0", nodeending.Drained)
 		f.unit(t, "failed", "failed", "timeout", "0", "inv-old")
 
-		if o := f.run(t, "check", "--invocation", "inv-old"); o.code != exitRefused || !o.boolean("recorded") {
-			t.Fatalf("a node with no record killed at the timeout: code %d recorded %v (%s), want unproved and "+
-				"recorded", o.code, o.boolean("recorded"), o.str("why"))
+		o := f.run(t, "check", "--invocation", "inv-old")
+		if o.code != exitRefused || !o.boolean("recorded") || o.str("acknowledge") != "--invocation inv-old" {
+			t.Fatalf("a node with no record killed at the timeout: code %d recorded %v acknowledge %q (%s), want "+
+				"unproved, recorded, and the failure named", o.code, o.boolean("recorded"), o.str("acknowledge"),
+				o.str("why"))
 		}
 
 		f.unit(t, "inactive", "dead", "success", "0", "")
 
+		if c := f.run(t, "check", "--invocation", "inv-old"); c.code != exitRefused {
+			t.Fatalf("check after reset-failed: code %d (%s), want the first account to stand", c.code, c.str("why"))
+		}
+
 		if a := f.run(t, "admit-start"); a.code != exitRefused || a.str("acknowledge") != "--invocation inv-old" {
 			t.Fatalf("admit-start after reset-failed: code %d acknowledge %q (%s), want the recorded failure "+
 				"refused", a.code, a.str("acknowledge"), a.str("why"))
+		}
+
+		// The acknowledgement the refusal named is one the command accepts.
+		args := append([]string{"acknowledge"}, strings.Fields(o.str("acknowledge"))...)
+		if k := f.run(t, args...); k.code != 0 {
+			t.Fatalf("%v: code %d (%s), want accepted", args, k.code, k.str("why"))
+		}
+
+		if a := f.run(t, "admit-start"); a.code != 0 {
+			t.Fatalf("admit-start after the acknowledgement: code %d (%s)", a.code, a.str("why"))
+		}
+	})
+
+	t.Run("an acknowledged history does not pass the floor a drain needs", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if k := f.run(t, "acknowledge", "--invocation", "inv-1"); k.code != 0 {
+			t.Fatalf("acknowledge: code %d (%s)", k.code, k.str("why"))
+		}
+
+		if o := f.run(t, "check", "--invocation", "inv-absent", "--drain"); o.code != exitRefused ||
+			o.boolean("recorded") {
+			t.Fatalf("the floor over an acknowledged killed node with --drain: code %d recorded %v (%s), want "+
+				"unproved and nothing recorded", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		if o := f.run(t, "check", "--invocation", "inv-absent"); o.code != 0 {
+			t.Fatalf("the floor over an acknowledged node without --drain: code %d (%s), want proved", o.code,
+				o.str("why"))
 		}
 	})
 
