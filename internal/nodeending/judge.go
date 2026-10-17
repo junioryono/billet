@@ -208,7 +208,7 @@ func through(via []string, j Judgement) Judgement {
 // handoff passes too. An idle ending is judged by the process before it. With
 // no entry for the invocation (a node binary from before the record) systemd's
 // inactive/dead/success proves it, as the floor labelled ProofSystemd, and only
-// over a history that admits a start.
+// over a history that passes the stop's own standard.
 func Judge(rec Record, readErr error, invocation string, after Unit, drainRequired bool, bootID string) Judgement {
 	if readErr != nil {
 		return unreadable(readErr)
@@ -220,6 +220,15 @@ func Judge(rec Record, readErr error, invocation string, after Unit, drainRequir
 
 	if invocation == "" {
 		return judged(Unknown, "", nil, "the stopped invocation is not known, so no entry can be bound to it")
+	}
+
+	// AN UNANSWERED PROPERTY IS NOT A FAILURE. Where systemd's triple is what
+	// decides, a stop it did not fully describe is could-not-tell, and is not
+	// recorded, since a recorded failure stands for good.
+	if entryFor(rec, invocation) < 0 && observedFor(rec, invocation) < 0 &&
+		(after.SubState == "" || after.Result == "") {
+		return judged(Unknown, "", nil, "invocation %s kept no ending record and systemd reports %s",
+			invocation, after.triple())
 	}
 
 	return remedied(rec, judgeInvocation(rec, invocation, after, drainRequired, bootID))
@@ -250,6 +259,10 @@ func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bo
 				s.Why = fmt.Sprintf("invocation %s kept no ending record, so only systemd's %s speaks for it, "+
 					"and that covers a process only over a history that passes this stop as well: %s",
 					invocation, after.triple(), s.Why)
+				if drainRequired {
+					s.Why += "; a release that keeps no record cannot prove a drain itself, so one is proved " +
+						"only once the node runs a release that does"
+				}
 
 				return s
 			}
@@ -391,12 +404,24 @@ func remedied(rec Record, j Judgement) Judgement {
 		return j
 	}
 
-	j.Acknowledge = "--unrecorded"
-	if i := newestNode(rec.Entries); i >= 0 && rec.Entries[i].InvocationID != "" {
-		j.Acknowledge = "--invocation " + rec.Entries[i].InvocationID
+	// An acknowledgement already made is not named again: what it could admit,
+	// it has, and what is refused needs a drain it cannot give.
+	if i := newestNode(rec.Entries); i < 0 || !rec.Entries[i].Acknowledged {
+		j.Acknowledge = Remedy(rec)
 	}
 
 	return j
+}
+
+// Remedy is the `billet node ending acknowledge` arguments that admit a start
+// over rec: its newest node entry by invocation, or --unrecorded where there is
+// none or it has no invocation.
+func Remedy(rec Record) string {
+	if i := newestNode(rec.Entries); i >= 0 && rec.Entries[i].InvocationID != "" {
+		return "--invocation " + rec.Entries[i].InvocationID
+	}
+
+	return "--unrecorded"
 }
 
 func describe(e Entry) string {

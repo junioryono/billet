@@ -167,15 +167,16 @@ func recordSystemdStop(
 		ending = nodeending.Failed
 	}
 
-	err := nodeending.Observe(cfg.Node.StateDir, nodeending.Entry{
+	after, err := nodeending.Observe(cfg.Node.StateDir, nodeending.Entry{
 		InvocationID: invocation, BootID: nodeending.BootID(), Ending: ending,
 		RunsOnHost: cfg.Node.Provider.RunsOnHost(),
 	}, drain, nil)
 
 	switch {
 	case err == nil && j.Verdict != nodeending.Proved:
-		// The failure is now the newest entry, so it is what to acknowledge.
-		j.Acknowledge = "--invocation " + invocation
+		// Named from the record as written, whose newest entry the failure may
+		// or may not be.
+		j.Acknowledge = nodeending.Remedy(after)
 
 		return j, true
 	case err == nil:

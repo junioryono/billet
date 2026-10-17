@@ -164,6 +164,12 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		if a := f.run(t, "admit-start"); a.code != 0 {
 			t.Fatalf("admit-start after the acknowledgement: code %d (%s)", a.code, a.str("why"))
 		}
+
+		// The acknowledgement admits a start; it does not make the killed stop
+		// a proved one, however clean systemd reports the unit now.
+		if c := f.run(t, "check", "--invocation", "inv-old"); c.code != exitRefused {
+			t.Fatalf("check after the acknowledgement: code %d (%s), want still unproved", c.code, c.str("why"))
+		}
 	})
 
 	t.Run("an acknowledged history does not pass the floor a drain needs", func(t *testing.T) {
