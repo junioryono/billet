@@ -89,14 +89,38 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 			}
 
 			left, ok := call.Args[1].(*ast.BinaryExpr)
-			if !ok || left.Op != token.SUB || exprName(left.X) != "startupTimeout" {
-				t.Errorf("the startup budget after the scan is not startupTimeout less what was " +
-					"spent before it; restarting it whole lets an open outlast the unit's start bound")
+			if !ok || left.Op != token.SUB || exprName(left.X) != "startupTimeout" ||
+				exprName(left.Y) != "spent" {
+				t.Errorf("the startup budget after the scan is not startupTimeout - spent; " +
+					"restarting it whole lets an open outlast the unit's start bound")
 			}
 		}
 
 		return true
 	})
+
+	// AND spent IS WHAT STARTUP TOOK BEFORE THE SCAN: measured from started,
+	// before the scan, so the scan is charged to neither budget twice.
+	var measured token.Pos
+
+	ast.Inspect(open.Body, func(n ast.Node) bool {
+		node, ok := n.(*ast.AssignStmt)
+		if !ok || len(node.Lhs) != 1 || exprName(node.Lhs[0]) != "spent" || len(node.Rhs) != 1 {
+			return true
+		}
+
+		call, ok := node.Rhs[0].(*ast.CallExpr)
+		if ok && exprName(call.Fun) == "time.Since" && len(call.Args) == 1 && exprName(call.Args[0]) == "started" {
+			measured = node.Pos()
+		}
+
+		return true
+	})
+
+	if !measured.IsValid() || measured > scan {
+		t.Error("spent is not time.Since(started) measured before the scan, so the resumed budget " +
+			"either restores time the open already spent or charges it the scan")
+	}
 
 	if !scan.IsValid() {
 		t.Fatal("openDir no longer runs the integrity scan")

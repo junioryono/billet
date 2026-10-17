@@ -41,6 +41,9 @@ type Host struct {
 	Ready func() error
 	// Status replaces the service manager's one-line status (STATUS=).
 	Status func(string) error
+	// ExtendStart tells the service manager the ledger open about to run may
+	// take up to the duration given (EXTEND_TIMEOUT_USEC). Nil asks nothing.
+	ExtendStart func(time.Duration) error
 	// Out is where the lines an operator reads go.
 	Out io.Writer
 }
@@ -158,6 +161,17 @@ func OpenControlPlane(
 		mode = LedgerMaintenance
 	case standby:
 		mode = LedgerStandby
+	}
+
+	// THE SERVICE MANAGER IS TOLD BEFORE THE OPEN THAT IT MAY BE LONG. A cold
+	// integrity scan of a large ledger outlasts the unit's start bound on a
+	// healthy disk, and a Type=notify start still opening past it is killed:
+	// on 2026-10-17 that failed a control plane's start twice. A failure to ask
+	// is said and decides nothing, because the open may well be fast.
+	if host.ExtendStart != nil {
+		if err := host.ExtendStart(state.OpenBound()); err != nil {
+			fmt.Fprintf(host.Out, "could not ask the service manager for time to open the ledger: %v\n", err)
+		}
 	}
 
 	db, err := OpenLedger(ctx, cfg, mode)
