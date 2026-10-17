@@ -365,7 +365,7 @@ func TestAReleaseThatTouchesNothingFlaggedSaysSo(t *testing.T) {
 		t.Errorf("a patch on its own line is described as another branch's:\n%s", report)
 	}
 
-	if !strings.Contains(report, "### By area (1 changes)") {
+	if !strings.Contains(report, "### By area (1 change)\n") {
 		t.Errorf("the patch is not one change:\n%s", report)
 	}
 }
