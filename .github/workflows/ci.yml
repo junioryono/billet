@@ -1015,11 +1015,12 @@ jobs:
     # pool's internet share shaped to 150 Mbit/s and every concurrent job pulling
     # through it, three attempts in a row were cancelled at 15 minutes with
     # nothing failed: each leg downloaded a 194 MB AWS provider for every module
-    # and every hybrid root. The provider cache below now fetches each version
-    # once, and once main has saved it only the first hybrid root's newest
-    # provider comes from the internet (the Go cache is restored from the node).
-    # A leg with nothing cached still took 14 minutes on a saturated line, so the
-    # limit keeps that room.
+    # and every hybrid root. The provider cache below shares what the modules
+    # download, and the first hybrid root's lock serves the other three; when a
+    # cache main saved for these same lock files is restored, only the first
+    # hybrid root's providers come from the internet, which it authenticates
+    # (the Go cache is restored from the node). A leg with nothing cached still
+    # took 14 minutes on a saturated line, so the limit keeps that room.
     timeout-minutes: 25
     strategy:
       fail-fast: false
