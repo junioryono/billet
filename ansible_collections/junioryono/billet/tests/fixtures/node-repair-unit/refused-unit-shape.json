@@ -3,5 +3,6 @@
   "outcome": "refused",
   "reason": "unit-shape",
   "why": "billet-node.service has drop-ins (/etc/systemd/system/billet-node.service.d/x.conf), which a repair does not admit",
+  "next": "stop billet-node.service, then converge the host role (over a running node a converge stops at its repair, which edits only the role's own unit in its one admitted shape), which renders that unit afresh; or follow the manual repair in docs/operating/upgrades.md; installing the package does not help, since a unit under /etc/systemd/system outranks the packaged one; a drop-in that sets RuntimeDirectory still applies over the unit a converge renders, so check it first",
   "state": "nothing"
 }

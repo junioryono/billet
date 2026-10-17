@@ -755,18 +755,18 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 		return false, "the unit already declares " + deploy.NodeRegistrationDirectory, nil
 	}
 
-	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks, except for
-	// the role's own unit in another shape: only a hand edit changes that one.
-	remedy := unitRemedy(shape.FragmentPath, firstProp(props, "DropInPaths"))
+	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks; the role's
+	// own unit in a shape the repair refuses is reached by a converge only once
+	// the node is stopped, or by hand.
+	dropIns := firstProp(props, "DropInPaths")
+
+	remedy := unitRemedy(shape.FragmentPath, shape.RuntimeDirectory, dropIns)
+	if shape.FragmentPath == repairUnitPath {
+		remedy = roleUnitRemedy
+	}
 
 	switch {
 	case !slices.Equal(entries, []string{"billet/locks"}):
-		if shape.FragmentPath == repairUnitPath {
-			remedy = "add " + deploy.NodeRegistrationDirectory + " to its RuntimeDirectory by hand as " +
-				unitRequirementsRemedyDoc + " describes; installing the package does not change a unit under " +
-				"/etc/systemd/system"
-		}
-
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s declares RuntimeDirectory=%s, which is "+
 			"not the one shape a repair admits (billet/locks alone)", nodeUnit, shape.RuntimeDirectory), remedy,
 			stateNothing)
@@ -774,9 +774,10 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s is loaded from %s, not from %s, "+
 			"which is the only unit a repair edits", nodeUnit, shape.FragmentPath, repairUnitPath), remedy,
 			stateNothing)
-	case firstProp(props, "DropInPaths") != "":
+	case dropIns != "":
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s has drop-ins (%s), which a repair "+
-			"does not admit", nodeUnit, firstProp(props, "DropInPaths")), "", stateNothing)
+			"does not admit", nodeUnit, dropIns), remedy+"; a drop-in that sets RuntimeDirectory still applies "+
+			"over the unit a converge renders, so check it first", stateNothing)
 	case firstProp(props, "NeedDaemonReload") != "no":
 		return false, "", endpointUnknown(endpointReasonShape, fmt.Sprintf("%s has NeedDaemonReload=%s, so the "+
 			"file on disk is not the unit systemd runs", nodeUnit, orUnknownWord(firstProp(props, "NeedDaemonReload"))),
@@ -821,7 +822,7 @@ func readRepairUnit() ([]byte, *endpointRefusal) {
 	defer func() { _ = f.Close() }()
 
 	if err := repairUnitOwned(info); err != nil {
-		return nil, endpointRefuse(endpointReasonShape, err.Error(), "", stateNothing)
+		return nil, endpointRefuse(endpointReasonShape, err.Error(), roleUnitRemedy, stateNothing)
 	}
 
 	body, err := regularfile.ReadAllLimited(f, repairUnitPath, maxUnitBytes)
@@ -830,7 +831,7 @@ func readRepairUnit() ([]byte, *endpointRefusal) {
 	}
 
 	if _, problem := repairRuntimeDirectory(body); problem != "" {
-		return nil, endpointRefuse(endpointReasonShape, problem, "", stateNothing)
+		return nil, endpointRefuse(endpointReasonShape, problem, roleUnitRemedy, stateNothing)
 	}
 
 	return body, nil

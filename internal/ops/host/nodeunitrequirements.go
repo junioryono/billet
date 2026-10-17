@@ -115,7 +115,7 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 	if missing := missingRuntimeDirectories(required, firstProp(props, "RuntimeDirectory")); len(missing) > 0 {
 		fragment := firstProp(props, "FragmentPath")
 
-		remedy := unitRemedy(fragment, firstProp(props, "DropInPaths"))
+		remedy := unitRemedy(fragment, firstProp(props, "RuntimeDirectory"), firstProp(props, "DropInPaths"))
 		if _, ok := props["DropInPaths"]; !ok {
 			remedy += "; its drop-ins could not be read, so check them too (systemctl cat " + nodeUnit + ")"
 		}
@@ -147,6 +147,18 @@ var (
 	unitDirsPackage = []string{"/usr/lib/systemd/system", "/lib/systemd/system"}
 )
 
+const (
+	// unitRemedyStopFirst is a converge's route to a unit its repair does not
+	// admit: over a running node a converge stops at the repair.
+	unitRemedyStopFirst = "stop " + nodeUnit + ", then converge the host role (over a running node a converge " +
+		"stops at its repair, which edits only the role's own unit in its one admitted shape)"
+	// roleUnitRemedy is the remedy for the role's own unit in a shape the
+	// repair refuses.
+	roleUnitRemedy = unitRemedyStopFirst + ", which renders that unit afresh; or follow the manual repair in " +
+		unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
+		"/etc/systemd/system outranks the packaged one"
+)
+
 // unitRemedy names what makes the unit in effect meet a requirement, by where
 // its file ranks: the role's own unit is repaired by its converge (`billet node
 // repair-unit`) or by hand, and a package install does not reach it; a unit
@@ -159,11 +171,11 @@ var (
 // which edits the role's own unit alone: so a converge reaches any other unit
 // only once the node is stopped. Drop-ins apply over whichever file is in
 // effect, and neither a converge nor a package removes one it did not install.
+// The role's own unit is repaired by a converge only in the one shape the
+// repair admits (billet/locks alone, no drop-in); in any other, the converge
+// reaches it only once the node is stopped and it renders the unit afresh.
 // The upgrade's refusal and the repair's both name their remedy here.
-func unitRemedy(fragment string, dropIns string) string {
-	const stopFirst = "stop " + nodeUnit + ", then converge the host role (over a running node a converge stops " +
-		"at its repair, which edits only the role's own unit)"
-
+func unitRemedy(fragment, runtime, dropIns string) string {
 	var remedy string
 
 	switch dir := path.Dir(fragment); {
@@ -174,16 +186,18 @@ func unitRemedy(fragment string, dropIns string) string {
 		remedy = nodeUnit + " is an alias of " + path.Base(fragment) + ", and where the alias itself ranks is not " +
 			"shown by its target's path, so find what defines it (systemctl cat " + nodeUnit + ") before " +
 			"converging or installing the package"
-	case dir == "/etc/systemd/system":
+	case dir == "/etc/systemd/system" && runtime == "billet/locks" && dropIns == "":
 		remedy = "converge the host role, which repairs that unit, or follow the manual repair in " +
 			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
 			"/etc/systemd/system outranks the packaged one"
+	case dir == "/etc/systemd/system":
+		remedy = roleUnitRemedy
 	case slices.Contains(unitDirsBetween, dir):
-		remedy = stopFirst + ", whose unit under /etc/systemd/system outranks that one; installing the package " +
-			"does not help, since that one outranks the packaged unit"
+		remedy = unitRemedyStopFirst + ", whose unit under /etc/systemd/system outranks that one; installing the " +
+			"package does not help, since that one outranks the packaged unit"
 	case slices.Contains(unitDirsPackage, dir), dir == "/run/systemd/generator.late":
 		remedy = "install this release's package, which replaces that unit with one this release ships; or " +
-			stopFirst
+			unitRemedyStopFirst
 	case slices.Contains(unitDirsAboveRole, dir):
 		remedy = "remove that unit or give it the directory by hand as " + unitRequirementsRemedyDoc +
 			" describes; it outranks both the host role's unit and the packaged one, so neither a converge nor " +

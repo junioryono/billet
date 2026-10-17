@@ -405,7 +405,19 @@ func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
 		{"the role's unit in another shape", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/other")
-		}, "add billet/registration to its RuntimeDirectory by hand", "install this release's package"},
+		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		{"the role's unit with a drop-in", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "DropInPaths", "/etc/systemd/system/billet-node.service.d/env.conf")
+		}, "a drop-in that sets RuntimeDirectory still applies", "install this release's package"},
+		{"the role's file not root's", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			repairUnitOwned = func(os.FileInfo) error { return errors.New(f.unitPath + " is not owned by root") }
+		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		{"an alias", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "FragmentPath", "/etc/systemd/system/other.service")
+		}, "billet-node.service is an alias of other.service", "install this release's package"},
 		{"a packaged unit", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "FragmentPath", "/usr/lib/systemd/system/billet-node.service")
