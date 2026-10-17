@@ -59,10 +59,10 @@ type Unit struct {
 	Job         string
 }
 
-// noProcess says whether systemd positively reports no process and no pending
+// NoProcess says whether systemd positively reports no process and no pending
 // job: inactive or failed, MainPID 0, Job empty. "failed" is in the allowlist
 // because the question here is the process; how it ended is the record's.
-func (u Unit) noProcess() (Verdict, string) {
+func (u Unit) NoProcess() (Verdict, string) {
 	switch u.ActiveState {
 	case "inactive", "failed":
 	case "":
@@ -111,7 +111,7 @@ func Judge(rec Record, readErr error, invocation string, after Unit, drainRequir
 		return judged(Unknown, "", nil, "the ending record could not be read: %v", readErr)
 	}
 
-	if v, why := after.noProcess(); v != Proved {
+	if v, why := after.NoProcess(); v != Proved {
 		return judged(v, "", nil, "%s", why)
 	}
 
@@ -172,7 +172,7 @@ func AdmitStart(rec Record, readErr error, now Unit, bootID string) Judgement {
 		return judged(Unknown, "", nil, "the ending record could not be read: %v", readErr)
 	}
 
-	if v, why := now.noProcess(); v != Proved {
+	if v, why := now.NoProcess(); v != Proved {
 		return judged(v, "", nil, "%s", why)
 	}
 

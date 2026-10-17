@@ -128,7 +128,7 @@ func beginNodeEnding(cfg *config.Config, opts NodeOptions) (*nodeending.Handle, 
 	h, err := nodeending.Begin(cfg.Node.StateDir, nodeending.Entry{
 		InvocationID: opts.InvocationID,
 		PID:          os.Getpid(),
-		BootID:       bootID(),
+		BootID:       nodeending.BootID(),
 		Release:      version.Version(),
 		Role:         role,
 		RunsOnHost:   cfg.Node.Provider.RunsOnHost(),
@@ -139,19 +139,6 @@ func beginNodeEnding(cfg *config.Config, opts NodeOptions) (*nodeending.Handle, 
 	}
 
 	return h, nil
-}
-
-// bootIDPath is where Linux names the current boot; nothing on a Mac.
-const bootIDPath = "/proc/sys/kernel/random/boot_id"
-
-// bootID is the current boot's id, empty where the host has none.
-func bootID() string {
-	body, err := os.ReadFile(bootIDPath)
-	if err != nil {
-		return ""
-	}
-
-	return strings.TrimSpace(string(body))
 }
 
 // endNode writes how this process's stop ended. A failed write is reported

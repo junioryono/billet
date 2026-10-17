@@ -306,6 +306,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 			return host.NodeMigrate(ctx, env, args[1:])
 		case "receipt":
 			return host.NodeReceipt(ctx, env, args[1:])
+		case "ending":
+			return host.NodeEnding(ctx, env, args[1:])
 		}
 	}
 

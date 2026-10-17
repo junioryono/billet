@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/durablefile"
@@ -123,6 +124,20 @@ var ErrNoEntry = errors.New("this process has no entry in the ending record")
 
 // Path is the record's path in dir.
 func Path(dir string) string { return filepath.Join(dir, FileName) }
+
+// bootIDPath is where Linux names the current boot; a Mac has nothing there.
+var bootIDPath = "/proc/sys/kernel/random/boot_id"
+
+// BootID is the current boot's id, empty where the host has none: the one
+// read, for the process that records itself and the command that judges it.
+func BootID() string {
+	body, err := os.ReadFile(bootIDPath)
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(body))
+}
 
 // Read reads the record in dir. A missing file is a zero Record and present
 // false; anything else that is not a valid record is an error, which every
