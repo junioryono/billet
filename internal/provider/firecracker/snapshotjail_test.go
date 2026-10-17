@@ -33,7 +33,47 @@ func publish(t *testing.T, h *harness, name string, mode os.FileMode) string {
 		}
 	}
 
+	writeCompatibility(t, h, dir, func(*compatibility) {})
+
 	return dir
+}
+
+// writeCompatibility publishes the record a capture on this harness's host would
+// have written, changed by edit, read-only as billet publishes one.
+func writeCompatibility(t *testing.T, h *harness, dir string, edit func(*compatibility)) {
+	t.Helper()
+
+	guest, err := h.p.digests.of(h.p.cfg.KernelImage)
+	if err != nil {
+		t.Fatalf("digest the stub kernel: %v", err)
+	}
+
+	record, err := h.p.hostCompatibility(guest)
+	if err != nil {
+		t.Fatalf("describe the harness host: %v", err)
+	}
+
+	record.VCPUs, record.Memory = aRestoreSpec().VCPU, int64(aRestoreSpec().Memory)
+
+	edit(&record)
+
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, compatibilityFile)
+	if err := os.Chmod(path, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("make the compatibility record writable again: %v", err)
+	}
+
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write the compatibility record: %v", err)
+	}
+
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod the compatibility record: %v", err)
+	}
 }
 
 // aRestoreSpec is a restore that should succeed: a launch's spec with the disk size
@@ -476,5 +516,42 @@ func TestARefusedRestoreWhoseDiscardFailsLeavesNoTapForDestroy(t *testing.T) {
 				t.Errorf("the retried Destroy kept the name of a device nobody made: %v", err)
 			}
 		})
+	}
+}
+
+// THE GUEST THE STATE FILE LOADS IS CHECKED BEFORE IT RESUMES. A capture's state is
+// what its VMM wrote, and Firecracker restores the vCPUs it says, so a snapshot whose
+// record is honest and whose state claims more vCPUs is refused while still paused.
+func TestARestoreRefusesALoadedGuestLargerThanItWasAdmittedFor(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	publish(t, h, "gold-1", 0o444)
+
+	var vmm *fakeVMM
+
+	h.mu.Lock()
+	h.onJailer = func(id string) {
+		vmm = h.serveVMM(t, id)
+
+		vmm.mu.Lock()
+		vmm.vcpus = 8
+		vmm.mu.Unlock()
+	}
+	h.mu.Unlock()
+
+	_, err := h.p.Restore(t.Context(), aRestoreSpec(), "gold-1")
+	if !errors.Is(err, errNotRestorable) {
+		t.Fatalf("Restore of a guest larger than admitted = %v, want errNotRestorable", err)
+	}
+
+	if vmm == nil {
+		t.Fatal("no VMM was started, so this tests nothing")
+	}
+
+	for _, call := range vmm.calls() {
+		if strings.Contains(call, "/mmds") || strings.Contains(call, "PATCH /vm") {
+			t.Errorf("a guest larger than admitted was given metadata or resumed: %s", call)
+		}
 	}
 }

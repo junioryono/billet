@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -36,7 +35,9 @@ func (p *Provider) snapshotsDir() string {
 // returned as itself, because "could not tell" is not "no".
 var errSnapshotNotPublished = errors.New("not a published snapshot")
 
-// placeSnapshot links a published snapshot's state and memory into a jail.
+// placeSnapshot links a published snapshot's state and memory into a jail, once its
+// compatibility record says this host, this VMM and the guest kernel this restore
+// resolved (kernel) are the ones it was taken with.
 //
 // THE KERNEL'S RULE, FOR THE SAME REASON (see build). A hard link is the same inode,
 // so chowning the name inside the jail would hand the one copy every fork maps to
@@ -55,10 +56,9 @@ var errSnapshotNotPublished = errors.New("not a published snapshot")
 // AND NEVER BY COPY. A copy would lose the shared page cache and write gigabytes per
 // restore, and a source on another filesystem than the jails is a deployment billet
 // refuses rather than one it quietly makes slow.
-func (p *Provider) placeSnapshot(j jail, name string) error {
-	if name == "" || name != filepath.Base(name) || strings.HasPrefix(name, ".") {
-		return fmt.Errorf("firecracker: %w: %s is not a plain snapshot name", errSnapshotNotPublished,
-			bounded(name))
+func (p *Provider) placeSnapshot(j jail, name, kernel string, spec provider.Spec) error {
+	if err := checkSnapshotName(name); err != nil {
+		return err
 	}
 
 	store, err := openOwnedDir(unix.AT_FDCWD, p.snapshotsDir())
@@ -74,6 +74,13 @@ func (p *Provider) placeSnapshot(j jail, name string) error {
 
 	dir := os.NewFile(uintptr(dirFD), filepath.Join(p.snapshotsDir(), name))
 	defer dir.Close()
+
+	// WHERE IT CAN RUN, BEFORE ANYTHING IS LINKED: a snapshot taken on another CPU,
+	// host kernel, Firecracker build or guest kernel is refused here, because the
+	// VMM would load it and the guest would misbehave after it resumed.
+	if err := p.checkCompatibility(dir, kernel, spec); err != nil {
+		return err
+	}
 
 	root, err := unix.Open(j.root(), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -290,10 +297,46 @@ func (p *Provider) restoreInto(
 		Tap:   tap,
 		// Metadata is this lease's, never the golden's: the data store is empty after
 		// a load, so nothing of the golden's survives into it.
-		Metadata: md,
+		Metadata:  md,
+		VCPUs:     spec.VCPU,
+		MemoryMiB: int64(spec.Memory) >> 20,
 	}); err != nil {
 		return nil, err
 	}
 
 	return &Instance{ID: spec.Name, Name: spec.Name, Running: true}, nil
+}
+
+// checkCompatibility refuses a snapshot whose record does not match this host.
+func (p *Provider) checkCompatibility(dir *os.File, kernel string, spec provider.Spec) error {
+	record, err := readCompatibility(dir, filepath.Join(dir.Name(), compatibilityFile))
+	if err != nil {
+		return err
+	}
+
+	guest, err := p.digests.of(kernel)
+	if err != nil {
+		return fmt.Errorf("firecracker: could not tell where %s can be restored: digest the guest kernel "+
+			"%s: %w", dir.Name(), kernel, err)
+	}
+
+	host, err := p.hostCompatibility(guest)
+	if err != nil {
+		return fmt.Errorf("firecracker: could not tell where %s can be restored: %w", dir.Name(), err)
+	}
+
+	if diff := record.mismatch(host); diff != "" {
+		return fmt.Errorf("firecracker: %w: %s differs in %s", errSnapshotIncompatible, dir.Name(), diff)
+	}
+
+	// THE SHAPE THE SNAPSHOT FIXES. The restored guest has the vCPUs and memory it
+	// was captured with whatever the spec says, so a spec asking for less would be
+	// admitted for less than it uses.
+	if record.VCPUs != spec.VCPU || record.Memory != int64(spec.Memory) {
+		return fmt.Errorf("firecracker: %w: %s is a guest of %d vCPUs and %d bytes, and the restore "+
+			"asks for %d and %d", errSnapshotIncompatible, dir.Name(), record.VCPUs, record.Memory,
+			spec.VCPU, int64(spec.Memory))
+	}
+
+	return nil
 }

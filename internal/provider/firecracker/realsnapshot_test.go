@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -52,50 +53,32 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	// restore can crash a kernel that has not set up its handling yet.
 	time.Sleep(5 * time.Second)
 
-	gj := golden.jailFor(goldenName)
-
-	if err := capture(t.Context(), golden.apiFor(gj.socket()),
-		snapshotFiles{State: "/" + snapshotStateFile, Memory: "/" + snapshotMemoryFile}); err != nil {
-		t.Fatalf("capture the golden: %v", err)
-	}
-
-	// PUBLISHED AS A NODE WILL PUBLISH IT: out of the jail, owned by billet, read-only.
+	// PUBLISHED AS A NODE WILL PUBLISH IT, by Capture: copied out of the jail into
+	// the store, owned by billet, read-only, with the host it was taken on.
 	name := "selftest-" + env.lease[:12]
 	published := filepath.Join(golden.snapshotsDir(), name)
 
-	// A STORE THIS TEST MADE IS A STORE IT TAKES AWAY, on the node's own chroot base.
-	// Registered first so it runs last, after the snapshots in it are gone, and by
-	// Remove rather than RemoveAll, so a store something else has used is never taken.
-	if _, err := os.Lstat(golden.snapshotsDir()); errors.Is(err, os.ErrNotExist) {
-		t.Cleanup(func() {
-			if err := os.Remove(golden.snapshotsDir()); err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("remove the snapshots directory this test made: %v", err)
-			}
-		})
-	}
-
-	if err := os.MkdirAll(published, 0o755); err != nil {
-		t.Fatalf("make the snapshot directory: %v", err)
-	}
-
+	// THE STORE AND ITS PUBLISH LOCK STAY. Every publisher on this node shares them,
+	// and removing the lock file, even while holding it, would let a later publisher
+	// lock a new inode beside one already waiting on the old. Only this test's own
+	// snapshots are removed.
 	t.Cleanup(func() {
 		if err := os.RemoveAll(published); err != nil {
 			t.Errorf("remove the published snapshot: %v", err)
 		}
 	})
 
-	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
-		dst := filepath.Join(published, file)
-		if err := os.Rename(filepath.Join(gj.root(), file), dst); err != nil {
-			t.Fatalf("publish %s: %v", file, err)
-		}
+	captureStarted := time.Now()
 
-		if err := os.Chown(dst, 0, 0); err != nil {
-			t.Fatalf("own %s: %v", file, err)
-		}
+	if err := golden.Capture(t.Context(), goldenName, name); err != nil {
+		t.Fatalf("Capture the golden: %v", err)
+	}
 
-		if err := os.Chmod(dst, 0o444); err != nil {
-			t.Fatalf("make %s read-only: %v", file, err)
+	t.Logf("captured and published a 1 GiB guest in %s", time.Since(captureStarted).Round(time.Millisecond))
+
+	for _, file := range []string{snapshotStateFile, snapshotMemoryFile, compatibilityFile} {
+		if err := checkPublished(filepath.Join(published, file)); err != nil {
+			t.Errorf("the published %s: %v", file, err)
 		}
 	}
 
@@ -168,6 +151,82 @@ func TestRealFirecrackerRestoresACapturedMicroVM(t *testing.T) {
 	if err := samePublished(filepath.Join(published, snapshotMemoryFile),
 		filepath.Join(fj.root(), snapshotMemoryFile)); err != nil {
 		t.Errorf("the fork's memory file: %v", err)
+	}
+
+	// AND THE FORK CAN BE CAPTURED IN TURN, which a capture writing over the
+	// read-only links its own restore placed could not, while the snapshot it came
+	// from stays the file it was.
+	forkSnapshot := "selftest-fork-" + env.lease[:8]
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(filepath.Join(golden.snapshotsDir(), forkSnapshot)); err != nil {
+			t.Errorf("remove the fork's snapshot: %v", err)
+		}
+	})
+
+	if err := forks.Capture(t.Context(), forkName, forkSnapshot); err != nil {
+		t.Errorf("Capture of a restored fork: %v", err)
+	} else if err := samePublished(filepath.Join(published, snapshotMemoryFile),
+		filepath.Join(fj.root(), snapshotMemoryFile)); err != nil {
+		t.Errorf("capturing the fork changed the snapshot it was restored from: %v", err)
+	}
+
+	// AND A SNAPSHOT TAKEN ON ANOTHER HOST KERNEL IS REFUSED BEFORE THE LOAD, by the
+	// real provider against the record a real capture wrote.
+	incompatible := filepath.Join(golden.snapshotsDir(), "selftest-elsewhere-"+env.lease[:8])
+	if err := os.Mkdir(incompatible, 0o755); err != nil {
+		t.Fatalf("make the incompatible directory: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.RemoveAll(incompatible); err != nil {
+			t.Errorf("remove the incompatible directory: %v", err)
+		}
+	})
+
+	for _, file := range []string{snapshotStateFile, snapshotMemoryFile} {
+		if err := os.Link(filepath.Join(published, file), filepath.Join(incompatible, file)); err != nil {
+			t.Fatalf("link %s into the incompatible directory: %v", file, err)
+		}
+	}
+
+	stagedRecord, err := os.ReadFile(filepath.Join(published, compatibilityFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var elsewhere compatibility
+	if err := json.Unmarshal(stagedRecord, &elsewhere); err != nil {
+		t.Fatalf("the record a real capture wrote: %v", err)
+	}
+
+	elsewhere.HostKernel = "5.10.0-elsewhere #1 SMP"
+
+	if raw, err := json.Marshal(elsewhere); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filepath.Join(incompatible, compatibilityFile), raw, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(filepath.Join(incompatible, compatibilityFile), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	elsewhereName := provider.InstanceName(freshLease(t))
+
+	t.Cleanup(func() {
+		if _, err := forks.Destroy(context.WithoutCancel(t.Context()), elsewhereName); err != nil {
+			t.Errorf("cleanup the restore that should have been refused: %v", err)
+		}
+	})
+
+	_, err = forks.Restore(t.Context(), provider.Spec{
+		Name: elsewhereName, Image: goldenName + "@cap", VCPU: 2, Memory: 1 * config.GiB,
+		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	}, filepath.Base(incompatible))
+	if !errors.Is(err, errSnapshotIncompatible) || !strings.Contains(err.Error(), "host kernel") {
+		t.Errorf("Restore of a snapshot taken on another host kernel = %v, want a refusal naming it", err)
 	}
 
 	// AND A SNAPSHOT DIRECTORY ANOTHER ACCOUNT OWNS IS NOT RESTORED FROM. Only root

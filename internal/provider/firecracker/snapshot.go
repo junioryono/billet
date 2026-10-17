@@ -66,6 +66,10 @@ type restoreSpec struct {
 	// corrects a guest that keeps time on kvm-clock and changes nothing on one that
 	// keeps it on tsc (measured, docs/reference/records/workspace-snapshots.md).
 	ClockRealtime bool
+	// VCPUs and MemoryMiB, when set, are the shape billet admitted this restore for,
+	// which the loaded guest must be before it is resumed.
+	VCPUs     int
+	MemoryMiB int64
 }
 
 // restore loads a snapshot into a fresh VMM, gives it this restore's metadata, and
@@ -113,6 +117,24 @@ func restore(ctx context.Context, api *vmmAPI, spec restoreSpec) error {
 	if info.State != statePaused || info.ID != spec.ID {
 		return fmt.Errorf("firecracker: %w: asked to load %s paused, and it reports %s in state %s",
 			errNotRestorable, spec.ID, bounded(info.ID), bounded(info.State))
+	}
+
+	// THE SHAPE THE STATE FILE GAVE IT, asked of the VMM billet just started rather
+	// than read from the record beside the snapshot. The state file is what the
+	// captured VMM wrote, and Firecracker restores as many vCPUs and as much memory
+	// as it says (v1.16.1 persist.rs); a guest larger than it was admitted for is
+	// refused while it is still paused.
+	if spec.VCPUs > 0 {
+		shape, err := api.machineConfig(ctx)
+		if err != nil {
+			return fmt.Errorf("firecracker: %s did not report its shape after a load: %w", spec.ID, err)
+		}
+
+		if shape.VCPUCount != spec.VCPUs || shape.MemSizeMiB != spec.MemoryMiB {
+			return fmt.Errorf("firecracker: %w: %s loaded a guest of %d vCPUs and %d MiB, and was "+
+				"admitted for %d and %d", errNotRestorable, spec.ID, shape.VCPUCount, shape.MemSizeMiB,
+				spec.VCPUs, spec.MemoryMiB)
+		}
 	}
 
 	if err := api.put(ctx, "/mmds", spec.Metadata); err != nil {
