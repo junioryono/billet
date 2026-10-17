@@ -210,16 +210,31 @@ func through(via []string, j Judgement) Judgement {
 // inactive/dead/success proves it, as the floor labelled ProofSystemd, and only
 // over a history that passes the stop's own standard.
 func Judge(rec Record, readErr error, invocation string, after Unit, drainRequired bool, bootID string) Judgement {
+	j, decided := judge(rec, readErr, invocation, after, drainRequired, bootID)
+	if decided {
+		return remedied(rec, j)
+	}
+
+	return j
+}
+
+// judge is Judge without its remedy; decided says the record decided the
+// verdict, so the remedy is the record's to name, on the record as it stands
+// once anything this judgement records has been written.
+func judge(
+	rec Record, readErr error, invocation string, after Unit, drainRequired bool, bootID string,
+) (Judgement, bool) {
 	if readErr != nil {
-		return unreadable(readErr)
+		return unreadable(readErr), false
 	}
 
 	if v, why := after.NoProcess(); v != Proved {
-		return judged(v, "", nil, "%s", why)
+		return judged(v, "", nil, "%s", why), false
 	}
 
 	if invocation == "" {
-		return judged(Unknown, "", nil, "the stopped invocation is not known, so no entry can be bound to it")
+		return judged(Unknown, "", nil, "the stopped invocation is not known, so no entry can be bound to it"),
+			false
 	}
 
 	// AN UNANSWERED PROPERTY IS NOT A FAILURE. Where systemd's triple is what
@@ -229,11 +244,11 @@ func Judge(rec Record, readErr error, invocation string, after Unit, drainRequir
 		if o := observedFor(rec, invocation); entryFor(rec, invocation) < 0 &&
 			(o < 0 || rec.Entries[o].Ending == Stopped) {
 			return judged(Unknown, "", nil, "invocation %s kept no ending record and systemd reports %s",
-				invocation, after.triple())
+				invocation, after.triple()), false
 		}
 	}
 
-	return remedied(rec, judgeInvocation(rec, invocation, after, drainRequired, bootID))
+	return judgeInvocation(rec, invocation, after, drainRequired, bootID), true
 }
 
 func judgeInvocation(rec Record, invocation string, after Unit, drainRequired bool, bootID string) Judgement {

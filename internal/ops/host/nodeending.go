@@ -192,10 +192,15 @@ func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 		return answerEnding(env, *r)
 	}
 
-	unit, observed := observeEndingUnit(ctx)
+	var observed *endingUnitAnswer
 
-	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-	j := nodeending.AdmitStart(rec, readErr, unit, nodeending.BootID())
+	j := nodeending.JudgeStanding(cfg.Node.StateDir, false, func() nodeending.Unit {
+		var unit nodeending.Unit
+
+		unit, observed = observeEndingUnit(ctx)
+
+		return unit
+	})
 
 	return answerEnding(env, endingAnswer{Command: "admit-start", Unit: observed, judgement: &j})
 }

@@ -416,6 +416,47 @@ func observe(r *Record, e Entry, drainRequired bool) error {
 	return nil
 }
 
+// lockRefused is could-not-tell for a record whose lock could not be taken,
+// with the hint a check run as someone other than root needs.
+func lockRefused(err error) Judgement {
+	j := judged(Unknown, "", nil, "%v", err)
+	if errors.Is(err, fs.ErrPermission) {
+		j.Why += "; the record is root's, so judge it as root"
+	}
+
+	return j
+}
+
+// JudgeStanding is Standing with the record's lock held across asking systemd
+// (sample) and reading, so it is judged before or after a JudgeStop or a reset,
+// never between a stop's sampling and its write, nor while a reset has moved a
+// directory away. A state directory that does not exist holds no record and
+// no lock, and is judged unlocked: there is nothing for a writer to be partway
+// through.
+func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement {
+	unlock, err := lock(dir)
+
+	switch {
+	case err == nil:
+		defer unlock()
+	case !errors.Is(err, fs.ErrNotExist) || dirExists(dir):
+		return lockRefused(err)
+	}
+
+	after := sample()
+	rec, _, readErr := Read(dir)
+
+	return Standing(rec, readErr, after, drainRequired, BootID())
+}
+
+// dirExists says dir is there, or that asking failed: only a positive absence
+// lets a judgement go unlocked.
+func dirExists(dir string) bool {
+	_, err := os.Lstat(dir)
+
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
 // JudgeStop judges a stop of invocation and records systemd's account where
 // that decided it, with the record's lock held across asking systemd (sample),
 // reading the record, judging and writing. Two checks of one stop are then
@@ -432,7 +473,7 @@ func JudgeStop(
 
 	unlock, err := lock(dir)
 	if err != nil {
-		return judged(Unknown, "", nil, "%v", err), false
+		return lockRefused(err), false
 	}
 	defer unlock()
 
@@ -441,8 +482,12 @@ func JudgeStop(
 
 	rec, present, readErr := Read(dir)
 
-	j := Judge(rec, readErr, invocation, after, drainRequired, bootID)
+	j, decided := judge(rec, readErr, invocation, after, drainRequired, bootID)
 	if !j.Floor {
+		if decided {
+			j = remedied(rec, j)
+		}
+
 		return j, false
 	}
 
@@ -460,21 +505,19 @@ func JudgeStop(
 	err = observe(&rec, Entry{InvocationID: invocation, BootID: bootID, Ending: ending, RunsOnHost: runsOnHost,
 		EndedAt: &at}, drainRequired)
 	if err == nil {
-		named := Remedy(rec)
-
 		rec.trim()
 
+		// THE REMEDY IS NAMED FROM THE RECORD AS WRITTEN: the failure just
+		// recorded may be the newest entry, or may have replaced an
+		// acknowledged clean account, either of which changes what to say.
 		if err = install(dir, rec); err == nil {
-			if j.Verdict != Proved {
-				j.Acknowledge = named
-			}
-
-			return j, true
+			return remedied(rec, j), true
 		}
 	}
 
 	if j.Verdict != Proved {
-		j.Why += "; and it could not be recorded: " + err.Error()
+		j.Why += "; and it could not be recorded, so check it again once the record can be written: " +
+			err.Error()
 
 		return j, false
 	}
@@ -568,22 +611,18 @@ func Reset(dir string, now func() time.Time) (string, Entry, error) {
 	// for that moment a durable marker makes the missing record read as a
 	// reset interrupted (Read). A marker already there is that interruption,
 	// whose directory is already aside.
-	marked := false
-
 	if err := os.Link(Path(dir), aside); err != nil {
 		info, statErr := os.Lstat(Path(dir))
 
 		switch {
 		case errors.Is(statErr, fs.ErrNotExist) && resetInterrupted(dir):
-			aside, marked = "", true
+			aside = ""
 		case statErr != nil || !info.IsDir():
 			return "", Entry{}, fmt.Errorf("keep the unreadable record beside itself: %w", err)
 		default:
 			if err := markReset(dir, at); err != nil {
 				return "", Entry{}, err
 			}
-
-			marked = true
 
 			if err := os.Rename(Path(dir), aside); err != nil {
 				return "", Entry{}, fmt.Errorf("set the directory at the record's name aside: %w", err)
@@ -598,11 +637,9 @@ func Reset(dir string, now func() time.Time) (string, Entry, error) {
 		return aside, Entry{}, err
 	}
 
-	if marked {
-		// The record is installed, so a marker left by a failed removal reads
-		// as nothing: Read consults it only when the record is missing.
-		_ = os.Remove(filepath.Join(dir, resetMarker))
-	}
+	// WHATEVER PATH THIS TOOK: a marker an earlier reset failed to remove would
+	// make a record that later goes missing read as an interrupted reset.
+	_ = os.Remove(filepath.Join(dir, resetMarker))
 
 	return aside, e, nil
 }

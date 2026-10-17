@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -500,11 +501,15 @@ func TestAFailedResetLeavesTheRecordInPlace(t *testing.T) {
 		prev := resetInstall
 		resetInstall = func(string, Record) error { return errors.New("the disk is full") }
 
-		if _, _, err := Reset(dir, clock(epoch)); err == nil {
-			t.Fatal("a reset whose install failed reported success")
-		}
+		t.Cleanup(func() { resetInstall = prev })
+
+		_, _, err := Reset(dir, clock(epoch))
 
 		resetInstall = prev
+
+		if err == nil {
+			t.Fatal("a reset whose install failed reported success")
+		}
 
 		// The directory is aside and nothing is at the record's name, which the
 		// marker makes could-not-tell rather than absent.
@@ -534,61 +539,170 @@ func TestAFailedResetLeavesTheRecordInPlace(t *testing.T) {
 	t.Run("a file", func(t *testing.T) { aFailedFileResetLeavesTheRecordInPlace(t) })
 }
 
-// TWO CHECKS OF ONE STOP ARE JUDGED ONE AFTER THE OTHER: the second asks
-// systemd only once the first has written what it saw, so a clean account
-// read after reset-failed cannot be proved while the first check's failure is
-// still unwritten.
-func TestTwoChecksOfOneStopAreJudgedInTurn(t *testing.T) {
+// lockHeld says another descriptor holds the record's flock, by failing to
+// take it without waiting.
+func lockHeld(t *testing.T, dir string) bool {
+	t.Helper()
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open the lock: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return false // the close releases it
+	}
+
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("flock: %v", err)
+	}
+
+	return true
+}
+
+// SYSTEMD IS ASKED WITH THE RECORD'S LOCK HELD, by a stop's judgement and by a
+// start's or an already-stopped node's alike, so each is judged before or
+// after a stop is written, never between its sampling and its write.
+func TestSystemdIsAskedUnderTheRecordsLock(t *testing.T) {
+	for name, judge := range map[string]func(dir string, sample func() Unit){
+		"a stop": func(dir string, sample func() Unit) {
+			JudgeStop(dir, "inv-x", false, true, sample, clock(epoch))
+		},
+		"a standing": func(dir string, sample func() Unit) { JudgeStanding(dir, true, sample) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			held := false
+
+			judge(dir, func() Unit {
+				held = lockHeld(t, dir)
+
+				return cleanUnit
+			})
+
+			if !held {
+				t.Fatal("systemd was asked without the record's lock held")
+			}
+		})
+	}
+}
+
+// A STOP'S REFUSAL IS ADVISED FROM THE RECORD AS WRITTEN: the failure just
+// recorded is the newest entry, so it is what to acknowledge, and nothing
+// tells the operator to start a node the gate would refuse.
+func TestAStopsRemedyIsNamedFromTheRecordAsWritten(t *testing.T) {
 	dir := t.TempDir()
+	now := clock(epoch)
 
-	inSample, release := make(chan struct{}), make(chan struct{})
-
-	first := make(chan Judgement, 1)
-
-	go func() {
-		j, _ := JudgeStop(dir, "inv-x", false, true, func() Unit {
-			close(inSample)
-			<-release
-
-			return timedOut
-		}, clock(epoch))
-		first <- j
-	}()
-
-	<-inSample
-
-	second := make(chan Judgement, 1)
-
-	var sawFailure bool
-
-	go func() {
-		j, _ := JudgeStop(dir, "inv-x", false, true, func() Unit {
-			rec, _, err := Read(dir)
-			sawFailure = err == nil && len(rec.Entries) == 1 && rec.Entries[0].Ending == Failed
-
-			return cleanUnit
-		}, clock(epoch))
-		second <- j
-	}()
-
-	// Long enough for the second check to reach systemd if nothing held it,
-	// which the assertion below would then catch; never a condition for
-	// passing.
-	time.Sleep(50 * time.Millisecond)
-	close(release)
-
-	if j := <-first; j.Verdict != Unproved {
-		t.Fatalf("the check that saw the timeout is %s (%s), want unproved", j.Verdict, j.Why)
+	if _, err := Begin(dir, nodeEntry("inv-0", 1), now); err != nil {
+		t.Fatal(err)
 	}
 
-	j := <-second
-	if !sawFailure {
-		t.Fatal("the second check asked systemd before the first had written what it saw")
+	if _, err := Acknowledge(dir, "inv-0", false, now); err != nil {
+		t.Fatal(err)
 	}
 
-	if j.Verdict != Unproved {
-		t.Fatalf("the check that saw the clean triple after the failure is %s (%s), want unproved", j.Verdict,
+	j, recorded := JudgeStop(dir, "inv-1", false, true, func() Unit { return timedOut }, now)
+	if j.Verdict != Unproved || !recorded || j.Acknowledge != "--invocation inv-1" ||
+		strings.Contains(j.Why, "start the node") {
+		t.Fatalf("JudgeStop = %s recorded %v acknowledge %q (%s), want unproved, recorded, inv-1 named and no "+
+			"start advised", j.Verdict, recorded, j.Acknowledge, j.Why)
+	}
+}
+
+// A STOP THAT CANNOT BE RECORDED IS NOT PROVED: a clean one is could-not-tell,
+// since the start after it would not see it, and a failed one names no
+// acknowledgement of a record that does not hold it.
+func TestAStopThatCannotBeRecordedIsNotProved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+
+	for name, tc := range map[string]struct {
+		unit Unit
+		want Verdict
+	}{
+		"clean":     {cleanUnit, Unknown},
+		"timed out": {timedOut, Unproved},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, lockName), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Chmod(dir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() {
+				if err := os.Chmod(dir, 0o700); err != nil {
+					t.Error(err)
+				}
+			})
+
+			j, recorded := JudgeStop(dir, "inv-1", false, true, func() Unit { return tc.unit }, clock(epoch))
+			if j.Verdict != tc.want || recorded || !j.Floor || j.Acknowledge != "" ||
+				!strings.Contains(j.Why, "could not be recorded") {
+				t.Fatalf("JudgeStop = %s recorded %v floor %v acknowledge %q (%s), want %s, unrecorded, "+
+					"nothing to acknowledge", j.Verdict, recorded, j.Floor, j.Acknowledge, j.Why, tc.want)
+			}
+		})
+	}
+}
+
+// A STANDING OVER A STATE DIRECTORY THAT DOES NOT EXIST IS JUDGED UNLOCKED,
+// since nothing can be partway through writing there; one whose lock this
+// user may not take says it is root's.
+func TestAStandingWithoutItsLock(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "never-made")
+
+	if j := JudgeStanding(missing, false, func() Unit { return cleanUnit }); j.Verdict != Proved {
+		t.Fatalf("a start on a host with no state directory is %s (%s), want proved by systemd", j.Verdict, j.Why)
+	}
+
+	if os.Geteuid() == 0 {
+		return
+	}
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Error(err)
+		}
+	})
+
+	if j := JudgeStanding(dir, false, func() Unit { return cleanUnit }); j.Verdict != Unknown ||
+		!strings.Contains(j.Why, "judge it as root") {
+		t.Fatalf("a standing whose lock cannot be taken is %s (%s), want could-not-tell naming root", j.Verdict,
 			j.Why)
+	}
+}
+
+// A MARKER AN EARLIER RESET LEFT IS REMOVED BY THE NEXT ONE, whatever path it
+// takes, or a record that later went missing would read as a reset interrupted.
+func TestAResetRemovesAStaleMarker(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, resetMarker), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Reset(dir, clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(dir, resetMarker)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the stale marker outlived the reset: %v", err)
 	}
 }
 

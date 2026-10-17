@@ -135,10 +135,8 @@ func judgeNodeStop(
 	ctx context.Context, insp *lifeops.Inspector, cfg *config.Config, invocation string, drain bool,
 ) nodeending.Judgement {
 	if invocation == "" {
-		after := observeNodeUnit(ctx, insp)
-		rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-
-		return nodeending.Standing(rec, readErr, after, drain, nodeending.BootID())
+		return nodeending.JudgeStanding(cfg.Node.StateDir, drain,
+			func() nodeending.Unit { return observeNodeUnit(ctx, insp) })
 	}
 
 	j, _ := nodeending.JudgeStop(cfg.Node.StateDir, invocation, drain, cfg.Node.Provider.RunsOnHost(),
@@ -153,16 +151,19 @@ func judgeNodeStop(
 // acknowledgement. A node already running is not started, so there is nothing
 // to admit: a resumed upgrade proves it as it proves any running service.
 func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Config) error {
-	now := observeNodeUnit(ctx, insp)
+	var now nodeending.Unit
+
+	j := nodeending.JudgeStanding(cfg.Node.StateDir, false, func() nodeending.Unit {
+		now = observeNodeUnit(ctx, insp)
+
+		return now
+	})
 
 	switch now.ActiveState {
 	case "active", "activating", "reloading":
 		return nil
 	}
 
-	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-
-	j := nodeending.AdmitStart(rec, readErr, now, nodeending.BootID())
 	if j.Verdict != nodeending.Proved {
 		return fmt.Errorf("%s is not started: what its last process left is %s: %s%s", nodeUnit, j.Answer,
 			j.Why, acknowledgeRemedy(j))
