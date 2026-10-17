@@ -28,7 +28,7 @@ func TestTheBuilderRootIsSized(t *testing.T) {
 
 	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
 		t.Fatalf("BuildImage: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestAnExplicitBuilderDiskIsWhatIsRequested(t *testing.T) {
 
 	if _, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: want,
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}); err != nil {
 		t.Fatalf("BuildImage: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestABuilderDiskTooSmallForTheImageIsRefusedBeforeAnyLaunch(t *testing.T) {
 
 			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.gib,
-				Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
 
 			if !tc.wantErr {
@@ -223,7 +223,7 @@ func TestABuilderDiskUnderTheBaseImagesRootIsRefused(t *testing.T) {
 
 			_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 				BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: tc.ask,
-				Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+				Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 			})
 
 			if !tc.wantErr {
@@ -272,7 +272,7 @@ func TestTheBaseImageFloorSurvivesTheLayoutCache(t *testing.T) {
 
 	spec := BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge", BuilderDiskGiB: baseGiB - 1,
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}
 
 	for i := range 2 {

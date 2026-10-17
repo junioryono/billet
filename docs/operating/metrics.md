@@ -40,6 +40,8 @@ The control plane also reads its ledger at every scrape, through the same report
 | `billet_ledger_write_wait_seconds` | how long each write waited for the ledger's single writer slot (a histogram); a rising tail is scheduling queueing behind other writers |
 | `billet_ledger_write_held_seconds{outcome}` | how long each write held the slot, `committed` or `rolled_back` (a histogram) |
 | `billet_ledger_write_busy_retries_total` | each time a write found the slot taken and tried again |
+| `billet_job_queue_wait_seconds{tier}` | how long each job waited, from GitHub's queue time to billet recording its start (a histogram, buckets from 5 seconds to 6 hours), observed once a job when the ledger first holds both. The queue time is GitHub's clock and the start billet's, so a wait is only as exact as the two agree. A job with no GitHub queue time is not observed. The histogram counts what this process saw since it started; `billet jobs wait` reads the same waits from the ledger and splits them into their parts |
+| `billet_job_queue_wait_negative_total{tier}` | jobs whose start on billet's clock came before their queue time on GitHub's: the clocks disagreed by more than the wait. Counted here and kept out of the histogram, where it would read as no wait |
 
 A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
 

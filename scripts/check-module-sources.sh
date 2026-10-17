@@ -10,15 +10,24 @@
 # `billet_version: latest` in those words — so the module an operator uses to
 # create the instance the binary runs on has to be pinnable too.
 #
-# TWO MODES, ONE SCRIPT. On main EXPECTED_REF is `main`, which is honest: the
-# documentation on main describes main. `cut-release.yml` rewrites every source
-# to the release tag on the release branch and runs this again with EXPECTED_REF
-# set to it, exactly as it already does for the internal action refs — so the
-# README inside a release names that release, and a rename that would break a
-# consumer's `terraform init` fails the release instead.
+# THE REF IS THE TREE'S OWN, ONE SCRIPT FOR EVERY CHECKOUT. On main it is
+# `main`, which is honest: the documentation on main describes main.
+# `cut-release.yml` rewrites every source to the release tag on the release
+# branch and runs this with EXPECTED_REF set to that tag, exactly as it does for
+# the internal action refs — so the README inside a release names that release,
+# and a rename that would break a consumer's `terraform init` fails the release
+# instead. Without EXPECTED_REF the ref is release-ref.sh's answer, which is the
+# branch's tag on a release branch: assuming `main` made CI on every release
+# branch fail because the branch was right (#149).
 set -euo pipefail
 
-expected_ref=${EXPECTED_REF:-main}
+if [ -n "${EXPECTED_REF:-}" ]; then
+	expected_ref=$EXPECTED_REF
+else
+	# BESIDE ME, for the reason check-release-metadata.sh finds this script that
+	# way. A plain assignment, so the resolver's refusal ends this under set -e.
+	expected_ref=$("$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/release-ref.sh")
+fi
 prefix='github.com/junioryono/billet//'
 
 # FROM THE TOP OF THE REPOSITORY, and said rather than assumed. Every path here

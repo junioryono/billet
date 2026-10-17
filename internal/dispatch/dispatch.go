@@ -11,6 +11,7 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/junioryono/billet/internal/lease"
 )
@@ -105,6 +106,12 @@ type Job struct {
 	// JobName is the job's display name, kept for people to read and never
 	// consulted for a decision.
 	JobName string
+	// QueuedAt, ScaleSetAssignedAt and RunnerAssignedAt are when GitHub queued
+	// the job, handed it to this scale set and to a runner, on GitHub's clock.
+	// Zero is a time the message did not carry. Read for reports only.
+	QueuedAt           time.Time
+	ScaleSetAssignedAt time.Time
+	RunnerAssignedAt   time.Time
 }
 
 // CacheAuthority is what a cache may do for one job, decided from evidence

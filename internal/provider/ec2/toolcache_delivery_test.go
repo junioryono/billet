@@ -97,7 +97,7 @@ func TestTheBuilderRefusesADeclarationThatIsNotThePinnedOne(t *testing.T) {
 	t.Parallel()
 
 	script, err := provisionScript(BuildSpec{
-		RunnerVersion: "2.328.0", Arch: "x64",
+		RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64",
 		payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 	})
 	if err != nil {

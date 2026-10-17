@@ -1,7 +1,8 @@
 name: Cut Release
 
-# The manual "ship main" button. Press it and billet cuts a release branch, tags
-# it, and builds it.
+# The manual "ship main" button. Press it once and it reports what the release
+# would carry and cuts nothing; press it again with `confirm` set to the line that
+# report ends with, and billet cuts the release branch, tags it, and builds it.
 #
 # THE BRANCH OUTLIVES THE RELEASE, which is the point of the shape. One branch
 # per MINOR version carries every patch on it: cut release/v0.4 and tag v0.4.0,
@@ -13,6 +14,14 @@ on:
     inputs:
       version:
         description: 'Version to cut, e.g. v0.4.0. Leave blank for the next minor.'
+        required: false
+        type: string
+      # PRESS ONCE TO READ, AGAIN TO CUT (#145). Blank previews what the release
+      # carries in the run's summary and cuts nothing; the summary ends with the
+      # exact `<tag>@<commit>` to paste here, and a value naming any other tag or
+      # commit (main moved since the preview) cuts nothing either.
+      confirm:
+        description: 'Leave blank to preview what the release carries. To cut it, paste the <tag>@<commit> line the preview printed.'
         required: false
         type: string
 
@@ -34,8 +43,12 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
+      # 'true' only when this run cut the release; the release job waits on it.
+      confirmed: ${{ steps.contents.outputs.confirmed }}
     permissions:
       contents: write
+      # To read CI's runs on the candidate commit for the report.
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -50,24 +63,94 @@ jobs:
           # matters here: an expression substituted into a shell script is an
           # injection, and this job holds contents: write.
           REQUESTED: ${{ inputs.version }}
+          # What tells the planner this workflow previews and confirms; an older
+          # run re-run from the Actions page does not say it, and is refused.
+          BILLET_CUT_PROTOCOL: preview-confirm
         run: scripts/plan-release.sh
 
+      # THE COMMIT THE RELEASE WOULD BE CUT FROM, decided once, read by the report
+      # and held by the cut. The branch may already exist: that is what a second
+      # patch on the same minor series looks like, and it is the case this shape
+      # exists for. A listing origin could not give is could-not-tell, which must
+      # not become "cut a new branch from main".
+      #
+      # FETCHED, NOT CHECKED OUT. The report runs main's release-contents.sh,
+      # which reads the candidate by its id; checking the branch out here would
+      # run the branch's copy instead, which no branch cut before it exists has,
+      # and each branch would carry a gate of its own. The cut checks it out.
+      - name: Find the candidate
+        id: candidate
+        env:
+          BRANCH: ${{ steps.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          # EVERY HEAD, MATCHED BY ITS WHOLE NAME. ls-remote matches a pattern
+          # against the end of a ref name, and even `refs/heads/<branch>` is
+          # matched as `*/refs/heads/<branch>`, so a branch named
+          # someone/refs/heads/<branch> would read as this one existing. The
+          # listing's own status is the could-not-tell answer.
+          set +e
+          heads=$(git ls-remote --heads origin)
+          status=$?
+          set -e
+
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::could not ask origin whether ${BRANCH} exists (git ls-remote exited ${status})"
+            exit 1
+          fi
+
+          if printf '%s\n' "${heads}" | awk -v want="refs/heads/${BRANCH}" '$2 == want { found = 1 } END { exit !found }'; then
+            echo "${BRANCH} already exists; the candidate is its tip rather than main"
+            git fetch origin "refs/heads/${BRANCH}:refs/heads/${BRANCH}"
+            commit=$(git rev-parse --verify "refs/heads/${BRANCH}^{commit}")
+            existing=true
+          else
+            commit=$(git rev-parse --verify "HEAD^{commit}")
+            existing=false
+          fi
+
+          {
+            echo "commit=${commit}"
+            echo "existing=${existing}"
+          } >> "$GITHUB_OUTPUT"
+
+      # WHAT IT CARRIES, in the run's summary, before anything is pushed. Without a
+      # confirmation naming this tag and this commit, nothing below runs (#145).
+      - name: Read what it carries
+        id: contents
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          PREVIOUS: ${{ steps.plan.outputs.previous }}
+          CANDIDATE: ${{ steps.candidate.outputs.commit }}
+          # Through the environment, like REQUESTED above.
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/release-contents.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Cut it
+        if: steps.contents.outputs.confirmed == 'true'
         env:
           TAG: ${{ steps.plan.outputs.tag }}
           BRANCH: ${{ steps.plan.outputs.branch }}
           COLLECTION_VERSION: ${{ steps.plan.outputs.collection_version }}
+          CANDIDATE: ${{ steps.candidate.outputs.commit }}
+          EXISTING: ${{ steps.candidate.outputs.existing }}
         run: |
           set -euo pipefail
 
-          # The branch may already exist: that is what a second patch on the same
-          # minor series looks like, and it is the case this shape exists for.
-          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
-            echo "${BRANCH} already exists; tagging its tip rather than main"
-            git fetch origin "${BRANCH}:${BRANCH}"
+          if [ "${EXISTING}" = true ]; then
             git checkout "${BRANCH}"
           else
             git checkout -b "${BRANCH}"
+          fi
+
+          # THE TAG CARRIES WHAT WAS READ, plus the rewrite below and nothing else.
+          if [ "$(git rev-parse HEAD)" != "${CANDIDATE}" ]; then
+            echo "::error::HEAD is $(git rev-parse HEAD), not the candidate ${CANDIDATE} the report described"
+            exit 1
           fi
 
           # Main composes current sibling actions at @main. A RELEASE MUST NOT:
@@ -143,6 +226,9 @@ jobs:
   # start a workflow of its own.
   release:
     needs: cut
+    # A PREVIEW CUT NOTHING, so there is nothing to build. advance-major needs
+    # this job, so it is skipped with it.
+    if: needs.cut.outputs.confirmed == 'true'
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.cut.outputs.tag }}
