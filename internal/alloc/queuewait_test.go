@@ -155,17 +155,36 @@ func TestABusyReportAfterTheQueueTimeTellsTheWaitOnce(t *testing.T) {
 	}
 }
 
+// waitsSeenCommitted is a QueueWaitObserver that, as it is told a wait, reads
+// the lease's row through the reader pool: told inside the write, the read
+// cannot yet see the start that write recorded.
+type waitsSeenCommitted struct {
+	t     *testing.T
+	a     *Allocator
+	lease string
+	waitsHeard
+}
+
+func (w *waitsSeenCommitted) JobWaited(tier string, wait time.Duration) {
+	if got, err := w.a.Job(w.t.Context(), w.lease); err != nil || got.StartedAt == "" {
+		w.t.Errorf("told a wait while the row's start reads %q (%v): told before the commit", got.StartedAt, err)
+	}
+
+	w.waitsHeard.JobWaited(tier, wait)
+}
+
 // A WRITE THAT ROLLS BACK TELLS NOTHING, and leaves the wait to the write that
-// commits: the start it recorded is undone with it.
+// commits, which tells it only once its start can be read.
 func TestARolledBackStartTellsNoWait(t *testing.T) {
 	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB},
 		[]config.Tier{tier("linux", 2, 8*config.GiB)}, WithClock(func() time.Time { return now }))
 
-	heard := &waitsHeard{}
-	a.ObserveQueueWaits(heard)
-
 	lease := reserve(t, a, "linux")
+	probe := &waitsSeenCommitted{t: t, a: a, lease: lease.ID}
+	heard := &probe.waitsHeard
+	a.ObserveQueueWaits(probe)
+
 	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, 1); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
