@@ -98,6 +98,7 @@
                    if billet_repair_answer.outcome | default('') == 'reported'
                    else ('The repair would refuse this host (' ~ (billet_repair_answer.reason | default('no reason')) ~ '): '
                          ~ (billet_repair_answer.why | default('no reason')) ~ '.')) }}
+          {{ ('Next: ' ~ billet_repair_answer.next ~ '.') if (billet_repair_answer.next | default('') | length > 0) else '' }}
           Nothing was stopped or changed.
       when: ansible_check_mode
 

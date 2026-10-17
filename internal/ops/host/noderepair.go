@@ -299,9 +299,10 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 		}
 
-		// THE ACTION'S RETIREMENT REFUSAL, PREDICTED: read without the lock it
-		// is decided under, so a dry run never says a converge would repair a
-		// host the action refuses.
+		// THE ACTION'S RETIREMENT REFUSAL, PREDICTED from what it is decided on,
+		// read without the lock, so a dry run never says a converge would repair
+		// a host a retirement holds. The guard's own shape is the action's to
+		// judge: a dry run names no holder to judge it against.
 		if judged.required {
 			if r := predictRepairRetirementRefusal(); r != nil {
 				return nil, r
@@ -453,10 +454,10 @@ func predictRepairRetirementRefusal() *endpointRefusal {
 
 	switch {
 	case err != nil:
-		return endpointUnknown(endpointReasonRetirement, "this host's converge guard could not be read: "+err.Error(),
+		return endpointUnknown(endpointReasonGuard, "this host's converge guard could not be read: "+err.Error(),
 			"", stateNothing)
 	case shape.Kind == claimGuard && shape.RecordErr != "":
-		return endpointUnknown(endpointReasonRetirement, "this host's converge guard record could not be read: "+
+		return endpointUnknown(endpointReasonGuard, "this host's converge guard record could not be read: "+
 			shape.RecordErr, "", stateNothing)
 	}
 

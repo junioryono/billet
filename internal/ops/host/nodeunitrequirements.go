@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 
@@ -79,7 +80,7 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 		return "the candidate needs nothing of a node unit", nil
 	}
 
-	names := []string{"LoadState", "FragmentPath", "RuntimeDirectory"}
+	names := []string{"LoadState", "FragmentPath", "DropInPaths", "RuntimeDirectory"}
 
 	props, err := insp.UnitProperties(ctx, nodeUnit, names...)
 	if err != nil {
@@ -114,7 +115,7 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 
 		return "", fmt.Errorf("%s needs %s to provide %s, and the loaded unit (%s) does not; a rollout installs no "+
 			"units, so %s, and the rollout takes this host when it next asks", candidate, nodeUnit,
-			strings.Join(missing, " and "), fragment, unitRemedy(fragment))
+			strings.Join(missing, " and "), fragment, unitRemedy(fragment, firstProp(props, "DropInPaths")))
 	}
 
 	return fmt.Sprintf("the loaded node unit provides everything %s needs", candidate), nil
@@ -123,27 +124,62 @@ func checkUnitRequirements(ctx context.Context, cfg *config.Config, candidate st
 // unitRequirementsRemedyDoc is the operator page that holds the manual repair.
 const unitRequirementsRemedyDoc = "docs/operating/upgrades.md"
 
-// unitRemedy names what makes the unit in effect meet a requirement. A unit
-// under /etc overrides the packaged one, so installing a package changes
-// nothing there: the host role's converge repairs it (`billet node
-// repair-unit`), or the manual procedure does. A packaged unit is replaced by
-// installing this release's package, and a converge installs the role's. A
-// unit loaded from anywhere else (a /run override, or no file systemd names)
-// is neither's, and overrides both.
-func unitRemedy(fragment string) string {
-	switch {
-	case strings.HasPrefix(fragment, "/etc/"):
-		return "converge the host role, which repairs that unit, or follow the manual repair in " +
-			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under /etc " +
-			"overrides the packaged one"
-	case strings.HasPrefix(fragment, "/usr/lib/systemd/system/"), strings.HasPrefix(fragment, "/lib/systemd/system/"):
-		return "install this release's package, or converge the host role, so that the unit in effect is one this " +
-			"release ships"
+// The directories systemd loads a system unit from, by where they rank against
+// the two a billet unit is installed in: the role's /etc/systemd/system and the
+// package's /usr/lib/systemd/system. The order is systemd's own (`systemd-analyze
+// unit-paths`, systemd 255 on Ubuntu 24.04, measured 2026-10-16): system.control,
+// transient and generator.early above /etc/systemd/system; system.attached,
+// /run/systemd/system, generator and /usr/local/lib between the two; and
+// generator.late below both. /lib/systemd/system is /usr/lib's on a host
+// without a merged /usr.
+var (
+	unitDirsAboveRole = []string{"/etc/systemd/system.control", "/run/systemd/system.control",
+		"/run/systemd/transient", "/run/systemd/generator.early"}
+	unitDirsBetween = []string{"/etc/systemd/system.attached", "/run/systemd/system",
+		"/run/systemd/system.attached", "/run/systemd/generator", "/usr/local/lib/systemd/system"}
+	unitDirsPackage = []string{"/usr/lib/systemd/system", "/lib/systemd/system"}
+)
+
+// unitRemedy names what makes the unit in effect meet a requirement, by where
+// its file ranks: the role's own unit is repaired by its converge (`billet node
+// repair-unit`) or by hand, and a package install does not reach it; a unit
+// between the two is outranked by the one a converge installs; a packaged unit,
+// or one below it, is replaced by either; a unit above the role's, or one
+// systemd names no file for, is neither's. Drop-ins apply over whichever file
+// is in effect, and neither a converge nor a package removes one it did not
+// install.
+func unitRemedy(fragment string, dropIns string) string {
+	var remedy string
+
+	switch dir := path.Dir(fragment); {
+	case fragment == "":
+		remedy = "systemd names no file for the unit in effect, so find what defines it (systemctl cat " +
+			nodeUnit + ") before converging or installing the package"
+	case dir == "/etc/systemd/system":
+		remedy = "converge the host role, which repairs that unit, or follow the manual repair in " +
+			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
+			"/etc/systemd/system outranks the packaged one"
+	case slices.Contains(unitDirsBetween, dir):
+		remedy = "converge the host role, whose unit under /etc/systemd/system outranks that one; installing the " +
+			"package does not help, since that one outranks the packaged unit"
+	case slices.Contains(unitDirsPackage, dir), dir == "/run/systemd/generator.late":
+		remedy = "install this release's package, or converge the host role, so that the unit in effect is one " +
+			"this release ships"
+	case slices.Contains(unitDirsAboveRole, dir):
+		remedy = "remove that unit or give it the directory by hand as " + unitRequirementsRemedyDoc +
+			" describes; it outranks both the host role's unit and the packaged one, so neither a converge nor " +
+			"installing the package changes it"
 	default:
-		return "find what installed the unit in effect, which neither the host role nor the package did and which " +
-			"overrides both, and remove it or give it the directory by hand as " + unitRequirementsRemedyDoc +
-			" describes; neither a converge nor installing the package changes it"
+		remedy = "find what installed that unit (systemctl cat " + nodeUnit + "), which is neither the host " +
+			"role's nor the package's, before converging or installing the package"
 	}
+
+	if dropIns != "" {
+		remedy += "; and check its drop-ins (" + dropIns + "), which apply over whichever unit is in effect and " +
+			"which neither a converge nor a package removes"
+	}
+
+	return remedy
 }
 
 // unitRequirementsInspector is the inspector the upgrade holds the node unit

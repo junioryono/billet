@@ -38,11 +38,11 @@ exit 0
 }
 
 const (
-	legacyNodeUnit = "LoadState=loaded\nFragmentPath=/etc/systemd/system/billet-node.service\n" +
+	legacyNodeUnit = "LoadState=loaded\nFragmentPath=/etc/systemd/system/billet-node.service\nDropInPaths=\n" +
 		"RuntimeDirectory=billet/locks\n"
-	packagedLegacyNodeUnit = "LoadState=loaded\nFragmentPath=/usr/lib/systemd/system/billet-node.service\n" +
+	packagedLegacyNodeUnit = "LoadState=loaded\nFragmentPath=/usr/lib/systemd/system/billet-node.service\nDropInPaths=\n" +
 		"RuntimeDirectory=billet/locks\n"
-	currentNodeUnit = "LoadState=loaded\nFragmentPath=/etc/systemd/system/billet-node.service\n" +
+	currentNodeUnit = "LoadState=loaded\nFragmentPath=/etc/systemd/system/billet-node.service\nDropInPaths=\n" +
 		"RuntimeDirectory=billet/locks billet/registration\n"
 )
 
@@ -89,15 +89,17 @@ func TestTheCandidateIsHeldToWhatItNeedsOfTheNodeUnit(t *testing.T) {
 		{"a release whose order cannot be told", "(devel)", legacyNodeUnit, nodeConfig,
 			"(devel) needs billet-node.service", ""},
 		{"a host that runs no node", "v0.17.0", legacyNodeUnit, &config.Config{}, "", "runs no node"},
-		{"no node unit", "v0.17.0", "LoadState=not-found\nFragmentPath=\nRuntimeDirectory=\n", nodeConfig,
+		{"no node unit", "v0.17.0", "LoadState=not-found\nFragmentPath=\nDropInPaths=\nRuntimeDirectory=\n", nodeConfig,
 			"billet-node.service is not-found, so the upgrade would start a unit systemd cannot start", ""},
-		{"a masked node unit", "v0.17.0", "LoadState=masked\nFragmentPath=\nRuntimeDirectory=\n", nodeConfig,
+		{"a masked node unit", "v0.17.0", "LoadState=masked\nFragmentPath=\nDropInPaths=\nRuntimeDirectory=\n", nodeConfig,
 			"billet-node.service is masked", ""},
-		{"RuntimeDirectory unanswered", "v0.17.0", "LoadState=loaded\nFragmentPath=/etc/x\n", nodeConfig,
+		{"RuntimeDirectory unanswered", "v0.17.0", "LoadState=loaded\nFragmentPath=/etc/x\nDropInPaths=\n", nodeConfig,
 			"answered no RuntimeDirectory", ""},
-		{"FragmentPath unanswered", "v0.17.0", "LoadState=loaded\nRuntimeDirectory=billet/locks\n", nodeConfig,
+		{"FragmentPath unanswered", "v0.17.0", "LoadState=loaded\nDropInPaths=\nRuntimeDirectory=billet/locks\n", nodeConfig,
 			"answered no FragmentPath", ""},
-		{"a unit in another state", "v0.17.0", "LoadState=error\nFragmentPath=\nRuntimeDirectory=\n", nodeConfig,
+		{"DropInPaths unanswered", "v0.17.0", "LoadState=loaded\nFragmentPath=/etc/x\nRuntimeDirectory=billet/locks\n",
+			nodeConfig, "answered no DropInPaths", ""},
+		{"a unit in another state", "v0.17.0", "LoadState=error\nFragmentPath=\nDropInPaths=\nRuntimeDirectory=\n", nodeConfig,
 			"LoadState=error", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,34 +117,60 @@ func TestTheCandidateIsHeldToWhatItNeedsOfTheNodeUnit(t *testing.T) {
 	}
 }
 
-// THE REMEDY IS THE ONE THAT CHANGES THE UNIT IN EFFECT: a unit under /etc
-// overrides the packaged one, so a package install leaves it as it was, and the
-// refusal names the converge's repair and the manual procedure instead; a
-// packaged unit is replaced by this release's package.
+// THE REMEDY IS THE ONE THAT CHANGES THE UNIT IN EFFECT, by where its file
+// ranks in systemd's search order: the role's own unit is repaired by its
+// converge and not by a package; a unit between the role's and the package's
+// is outranked by a converge; a packaged unit, or one below it, by either; a
+// unit above the role's, or one with no file, by neither; and drop-ins are
+// named, since neither removes them.
 func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
+	at := func(dir string) string {
+		return strings.Replace(legacyNodeUnit, "/etc/systemd/system/", dir+"/", 1)
+	}
+
+	const (
+		repairs   = "converge the host role, which repairs that unit"
+		outranks  = "converge the host role, whose unit under /etc/systemd/system outranks that one"
+		pkg       = "install this release's package"
+		neither   = "neither a converge nor installing the package changes it"
+		noPackage = "installing the package does not help"
+	)
+
 	for _, tc := range []struct {
 		name, unit   string
 		want, absent []string
 	}{
 		{"a unit the role rendered", legacyNodeUnit,
-			[]string{"(/etc/systemd/system/billet-node.service)", "converge the host role, which repairs that unit",
-				"the manual repair in docs/operating/upgrades.md", "installing the package does not help"},
-			[]string{"install this release's package"}},
+			[]string{"(/etc/systemd/system/billet-node.service)", repairs,
+				"the manual repair in docs/operating/upgrades.md", noPackage},
+			[]string{pkg, outranks, neither}},
 		{"a packaged unit", packagedLegacyNodeUnit,
-			[]string{"(/usr/lib/systemd/system/billet-node.service)", "install this release's package"},
-			[]string{"installing the package does not help"}},
-		{"a runtime override", strings.Replace(legacyNodeUnit, "/etc/systemd/system/", "/run/systemd/system/", 1),
-			[]string{"(/run/systemd/system/billet-node.service)", "neither the host role nor the package did",
-				"neither a converge nor installing the package changes it"},
-			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
-		{"a local administrator's unit", strings.Replace(legacyNodeUnit, "/etc/systemd/system/",
-			"/usr/local/lib/systemd/system/", 1),
-			[]string{"(/usr/local/lib/systemd/system/billet-node.service)", "neither the host role nor the package did"},
-			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
+			[]string{"(/usr/lib/systemd/system/billet-node.service)", pkg},
+			[]string{noPackage, repairs, neither}},
+		{"a packaged unit without a merged /usr", at("/lib/systemd/system"), []string{pkg},
+			[]string{noPackage, repairs, neither}},
+		{"a late generator's unit", at("/run/systemd/generator.late"), []string{pkg},
+			[]string{noPackage, repairs, neither}},
+		{"a runtime unit", at("/run/systemd/system"),
+			[]string{"(/run/systemd/system/billet-node.service)", outranks, noPackage},
+			[]string{pkg, repairs, neither}},
+		{"a local administrator's unit", at("/usr/local/lib/systemd/system"), []string{outranks, noPackage},
+			[]string{pkg, repairs, neither}},
+		{"an attached unit", at("/etc/systemd/system.attached"), []string{outranks}, []string{pkg, repairs, neither}},
+		{"a generator's unit", at("/run/systemd/generator"), []string{outranks}, []string{pkg, repairs, neither}},
+		{"a control unit", at("/etc/systemd/system.control"), []string{neither},
+			[]string{pkg, repairs, outranks}},
+		{"a transient unit", at("/run/systemd/transient"), []string{neither}, []string{pkg, repairs, outranks}},
+		{"an early generator's unit", at("/run/systemd/generator.early"), []string{neither},
+			[]string{pkg, repairs, outranks}},
 		{"a unit with no file", strings.Replace(legacyNodeUnit, "FragmentPath=/etc/systemd/system/billet-node.service",
 			"FragmentPath=", 1),
-			[]string{"neither the host role nor the package did"},
-			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
+			[]string{"systemd names no file for the unit in effect"}, []string{pkg, repairs, outranks, neither}},
+		{"a unit somewhere systemd's order does not name", at("/opt/units"),
+			[]string{"which is neither the host role's nor the package's"}, []string{pkg, repairs, outranks, neither}},
+		{"a packaged unit with a drop-in", strings.Replace(packagedLegacyNodeUnit, "DropInPaths=\n",
+			"DropInPaths=/etc/systemd/system/billet-node.service.d/rt.conf\n", 1),
+			[]string{pkg, "check its drop-ins (/etc/systemd/system/billet-node.service.d/rt.conf)"}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := checkUnitRequirements(t.Context(), nodeConfig, "v0.17.0", requirementsSystemctl(t, tc.unit))

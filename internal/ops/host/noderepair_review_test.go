@@ -48,6 +48,52 @@ func TestTheRepairRunsUnderThisConvergesGuard(t *testing.T) {
 	})
 }
 
+// A DRY RUN THAT CANNOT READ THE GUARD CANNOT SAY A RETIREMENT IS ABSENT: an
+// unreadable record, and a root that cannot be opened, are could-not-tell
+// rather than a report that a converge would repair the host.
+func TestTheRepairsDryRunCannotTellWithoutTheGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage func(t *testing.T)
+		why   string
+	}{
+		{"a record that cannot be read", func(t *testing.T) {
+			t.Helper()
+			record := filepath.Join(upgradeRoot, activePointer, guardRecordName)
+			body, err := os.ReadFile(record)
+			mustOK(t, err)
+			mustOK(t, os.WriteFile(record, []byte(strings.Replace(string(body), `"holder":`,
+				`"transition":{"kind":"unheard-of","id":"x"},"holder":`, 1)), 0o600))
+		}, "guard record could not be read"},
+		{"a root that cannot be opened", func(t *testing.T) {
+			t.Helper()
+			notADirectory := filepath.Join(t.TempDir(), "upgrades")
+			writeFile(t, notADirectory, "", 0o600)
+
+			prev := upgradeRoot
+			upgradeRoot = notADirectory
+
+			t.Cleanup(func() { upgradeRoot = prev })
+		}, "converge guard could not be read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRepairFixture(t)
+			tc.stage(t)
+
+			o := f.repair(t, "--dry-run")
+			if o.str("outcome") != outcomeUnknown || o.str("reason") != endpointReasonGuard ||
+				!strings.Contains(o.str("why"), tc.why) {
+				t.Fatalf("outcome %q reason %q (%s), want could-not-tell saying %q", o.str("outcome"), o.str("reason"),
+					o.str("why"), tc.why)
+			}
+
+			if got := f.acted(t); len(got) != 0 || f.locks != 0 {
+				t.Errorf("a dry run asked systemctl to %q and took %d lifecycle locks", got, f.locks)
+			}
+		})
+	}
+}
+
 // A RETIREMENT ADMITS NO REPAIR, whoever holds the guard: a guard carrying the
 // retirement's marker is this converge's (a retirement's holder is a guard's
 // holder), and a journal, finished or not, is a host whose node operations the
@@ -170,6 +216,8 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 		name  string
 		stage func(t *testing.T, f *repairFixture)
 		why   string
+		// outcome is the one outcome the refusal must have, or "" for any but repaired.
+		outcome string
 	}{
 		{"the process moved", func(t *testing.T, f *repairFixture) {
 			t.Helper()
@@ -179,14 +227,14 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 			mustOK(t, err)
 			f.afterShows(t, 3, strings.ReplaceAll(string(body), "InvocationID="+nodeInvocation,
 				"InvocationID="+newInvocation))
-		}, "between the judgement and the locks"},
+		}, "between the judgement and the locks", outcomeUnknown},
 		{"the node unit was reloaded with the directory", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
 			mustOK(t, err)
 			f.afterShows(t, 3, strings.Replace(string(body), "RuntimeDirectory=billet/locks\n",
 				"RuntimeDirectory=billet/locks billet/registration\n", 1))
-		}, "between the judgement and the locks"},
+		}, "between the judgement and the locks", outcomeUnknown},
 		{"the unit gained a drop-in after the second judgement", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			// Each judgement reads the unit three times and the stop's admission
@@ -196,20 +244,20 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 			mustOK(t, err)
 			f.showsBetween(t, 6, 7, strings.Replace(string(body), "DropInPaths=\n",
 				"DropInPaths=/etc/systemd/system/billet-node.service.d/x.conf\n", 1))
-		}, "drop-ins"},
+		}, "drop-ins", outcomeRefused},
 		{"the unit was reloaded with the directory after the second judgement", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
 			mustOK(t, err)
 			f.showsBetween(t, 6, 7, strings.Replace(string(body), "RuntimeDirectory=billet/locks\n",
 				"RuntimeDirectory=billet/locks billet/registration\n", 1))
-		}, "changed under the judgement"},
+		}, "changed under the judgement", outcomeUnknown},
 		{"the stop's admission answered no DropInPaths", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
 			mustOK(t, err)
 			f.showsBetween(t, 6, 7, strings.Replace(string(body), "DropInPaths=\n", "", 1))
-		}, "answered no DropInPaths"},
+		}, "answered no DropInPaths", outcomeUnknown},
 		{"systemd restarted the node after the second judgement", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
@@ -217,14 +265,15 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 			f.afterShows(t, 6, strings.ReplaceAll(strings.ReplaceAll(string(body), "InvocationID="+nodeInvocation,
 				"InvocationID="+newInvocation), "MainPID="+strconv.Itoa(inspectPID), "MainPID="+
 				strconv.Itoa(inspectPID+7)))
-		}, "moved between the judgement and the stop"},
+		}, "moved between the judgement and the stop", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRepairFixture(t)
 			tc.stage(t, f)
 
 			o := f.repair(t)
-			if o.str("outcome") == outcomeRepaired || o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) {
+			if o.str("outcome") == outcomeRepaired || (tc.outcome != "" && o.str("outcome") != tc.outcome) ||
+				o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) {
 				t.Fatalf("outcome %q state %q (%s), want a refusal saying %q with nothing done", o.str("outcome"),
 					o.str("state"), o.str("why"), tc.why)
 			}
