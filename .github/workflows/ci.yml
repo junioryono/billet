@@ -1011,7 +1011,14 @@ jobs:
     # satisfied on the next version bump.
     name: terraform (${{ matrix.label }})
     runs-on: billet-2vcpu-ubuntu-2404
-    timeout-minutes: 15
+    # THE JOB IS BOUND BY THE NETWORK, not the CPU: one leg moves about 1.3 GiB
+    # from the internet (the Go cache restore, an AWS provider download for each
+    # module and each generated hybrid root, the Go modules for the hybrid
+    # check's build). It took 9 to 14 minutes when the pool's line was idle,
+    # and on 2026-10-17, with the pool's internet share shaped to 150 Mbit/s and
+    # every concurrent job pulling through it, three attempts in a row were
+    # cancelled at 15 with nothing failed.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
