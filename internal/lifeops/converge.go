@@ -1758,10 +1758,15 @@ func (c *Converger) StopAndProveAdmitted(ctx context.Context, unit string, admit
 	// empty answer is systemd not telling us, which is uncertainty rather than
 	// absence, and a state a future systemd adds must not be read as proof.
 	//
-	// `failed` counts as stopped: nothing is running, which is the question here.
-	// How it ended is reported separately in Result, because a unit killed at
-	// TimeoutStopSec is inactive AND failed, and an operator being told their
-	// host is down should know which.
+	// `failed` counts as stopped: nothing is running, which is the question here,
+	// and the only one this answers. It proves no process remains; it does NOT
+	// prove how the process ended. A node killed at TimeoutStopSec, one that
+	// handed its compute over and one whose drain a second signal cut short all
+	// pass, and reset-failed erases the difference (#127): a node's stop is
+	// proved by its own ending record (internal/nodeending), which the callers
+	// that need a drain read after this. How it ended is reported separately in
+	// Result, because a unit killed at TimeoutStopSec is inactive AND failed, and
+	// an operator being told their host is down should know which.
 	switch active {
 	case "inactive", "failed":
 		return StopResult{Gone: Yes, How: how}, nil

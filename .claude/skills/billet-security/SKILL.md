@@ -53,6 +53,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The role runs a guard's recorded executable only after the fallback module proved it, and holds under a name the driver chose.**
 - **The node's registration record is root-owned evidence under the node unit's own runtime directory, and it is judged on the descriptor that is read.**
 - **The endpoint receipt is root-owned evidence, and the migration signals only its own subprocess.**
+- **The node's ending record is root-owned evidence that gates every node start, and only root under the node's own lock may acknowledge past it.**
 
 Measured facts for this area, dated: [references/measured-facts.md](references/measured-facts.md).
 

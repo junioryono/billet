@@ -306,6 +306,8 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 			return host.NodeMigrate(ctx, env, args[1:])
 		case "receipt":
 			return host.NodeReceipt(ctx, env, args[1:])
+		case "ending":
+			return host.NodeEnding(ctx, env, args[1:])
 		}
 	}
 
@@ -361,7 +363,11 @@ func cmdNode(ctx context.Context, env cli.Env, lc *cli.Lifecycle, args []string)
 	}
 
 	// THE IDENTITY, ITS LOCK AND THE PROVIDER, IN THAT ORDER: see app.OpenNode.
-	n, err := app.OpenNode(cfg, app.NodeOptions{Upgrader: upgrader})
+	n, err := app.OpenNode(cfg, app.NodeOptions{
+		Upgrader: upgrader, Probe: *upgradeProbe,
+		// systemd's name for this process, which its ending is recorded under.
+		InvocationID: env.Getenv("INVOCATION_ID"),
+	})
 	if err != nil {
 		return err
 	}
