@@ -267,14 +267,23 @@ func TestANodeThatNeverRecoveredDidNotDrain(t *testing.T) {
 		rec, ready := &endings{}, &atomic.Int32{}
 		compute := &fakeCompute{recoverErr: errors.New("the provider could not list its guests")}
 
-		err := runAndStop(t, c, compute, endingOpts(rec, ready), func() bool { return compute.aliveCount() == 1 },
+		opts := endingOpts(rec, ready)
+		opts.DrainRequested = func() bool { return true }
+
+		// Every Recover before the stop fails, and only one that STARTED after it,
+		// by the count taken at the cancel, is let succeed: so the drain rests on
+		// the stop's own recovery, not on the ordinary loop's.
+		err := runAndStop(t, c, compute, opts, func() bool { return compute.recoverCount() >= 1 },
 			func(cancel context.CancelFunc) {
+				cancel()
+				atCancel := compute.recoverCount()
+				waitFor(t, func() bool { return compute.recoverCount() >= atCancel+2 })
+
 				compute.mu.Lock()
 				compute.recoverErr = nil
 				compute.mu.Unlock()
-				cancel()
 			})
-		wantEndings(t, rec, err, "drained")
+		wantEndings(t, rec, err, "drained+drain")
 	})
 
 	t.Run("registered, never recovered", func(t *testing.T) {
@@ -286,6 +295,30 @@ func TestANodeThatNeverRecoveredDidNotDrain(t *testing.T) {
 
 		err := runAndStop(t, c, compute, endingOpts(rec, ready), func() bool { return compute.aliveCount() == 1 },
 			func(cancel context.CancelFunc) { cancel() })
+		wantEndings(t, rec, err, "left-running")
+	})
+
+	// A wait that empties Holding() is not a drain for a process that never
+	// recovered: what it could not see was never in Holding() to wait for.
+	t.Run("registered, never recovered, its own work finished", func(t *testing.T) {
+		t.Parallel()
+
+		_, c := harness(t)
+		rec, ready := &endings{}, &atomic.Int32{}
+		compute := &fakeCompute{holding: true, recoverErr: errors.New("the provider could not list its guests")}
+
+		err := runAndStop(t, c, compute, endingOpts(rec, ready), func() bool { return compute.aliveCount() == 1 },
+			func(cancel context.CancelFunc) {
+				base := compute.tended()
+				cancel()
+				waitFor(t, func() bool { return compute.tended() > base })
+
+				if got := rec.list(); len(got) != 0 {
+					t.Errorf("the loop reported %q while it was still waiting", got)
+				}
+
+				compute.setHolding(false)
+			})
 		wantEndings(t, rec, err, "left-running")
 	})
 }

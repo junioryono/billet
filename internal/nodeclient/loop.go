@@ -821,8 +821,11 @@ func stopGracefully(
 		withdraw(ctx, c, log, opts)
 	}
 
+	// A WAIT THAT EMPTIED IS A DRAIN ONLY WHEN THIS PROCESS KNEW WHAT ITS HOST
+	// RUNS: a recovery that adopted one guest and failed on the next leaves the
+	// second outside Holding() for the whole wait.
 	switch {
-	case drained:
+	case drained && recovered:
 		opts.ended(nodeending.Drained, drainRequested)
 	case superseded.Load():
 		opts.ended(nodeending.Superseded, drainRequested)

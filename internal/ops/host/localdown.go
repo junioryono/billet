@@ -509,13 +509,14 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 		}
 
 		// BEFORE THE SERVER'S STOP, which tears down every lease its listener
-		// holds: a node that did not drain may have left work running.
-		if unit == nodeService && endings != nil && nodeInvocation != "" {
+		// holds: a node that did not drain may have left work running. A node
+		// that was already stopped is judged too, by what its last process left,
+		// so a second `down` does not pass a stop the first one refused.
+		if unit == nodeService && endings != nil {
 			if j := endings.JudgeStop(ctx, cfg, nodeInvocation, true); j.Verdict != nodeending.Proved {
 				return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
-					fmt.Errorf("%s stopped, but did not prove it drained: %s (%s). Once what it left is known, "+
-						"`billet node ending acknowledge --invocation %s` permits a start; nothing else was "+
-						"stopped", unit, j.Answer, j.Why, nodeInvocation))
+					fmt.Errorf("%s is stopped, but did not prove it drained: %s (%s); nothing else was "+
+						"stopped%s", unit, j.Answer, j.Why, acknowledgeRemedy(j)))
 			}
 		}
 

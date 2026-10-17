@@ -181,3 +181,95 @@ func TestTheUpgradeStartsTheNodeOnlyOverAProvedEnding(t *testing.T) {
 		})
 	}
 }
+
+// A NODE ALREADY STOPPED IS JUDGED BY WHAT ITS LAST PROCESS LEFT: a retried
+// upgrade over a node an earlier attempt stopped unproved is refused again,
+// with nothing stopped; one that drained passes.
+func TestTheUpgradeJudgesANodeThatWasAlreadyStopped(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ending  nodeending.Ending
+		wantErr string
+	}{
+		{"killed", nodeending.Running, "acknowledge --invocation inv-1"},
+		{"drained", nodeending.Drained, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newStopProofHost(t, cleanAfter)
+			writeFile(t, h.state, timedOutAfter, 0o644)
+			h.record(t, tc.ending)
+
+			err := h.host.StopNode(t.Context())
+
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("StopNode = %v, want what the drained node left proved", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("StopNode = %v, want a refusal saying %q", err, tc.wantErr)
+			}
+
+			if h.verbs(t) != "" {
+				t.Errorf("systemctl was asked %q of a node with no process, want nothing", h.verbs(t))
+			}
+		})
+	}
+}
+
+// A JOB SYSTEMD DID NOT ANSWER IS NOT NO JOB: an inactive node whose pending
+// job is unknown may have a start queued, so nothing is stopped or judged.
+func TestAnUnansweredJobIsNotNoJob(t *testing.T) {
+	h := newStopProofHost(t, cleanAfter)
+	writeFile(t, h.state, "ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nInvocationID=\n", 0o644)
+	h.record(t, nodeending.Drained)
+
+	if err := h.host.StopNode(t.Context()); err == nil || !strings.Contains(err.Error(), "did not answer Job") {
+		t.Fatalf("StopNode with Job unanswered = %v, want could-not-tell", err)
+	}
+}
+
+// A NODE ALREADY RUNNING IS NOT STARTED, SO THERE IS NOTHING TO ADMIT: a
+// resumed upgrade whose services came up before it was interrupted is not
+// refused by the gate.
+func TestARunningNodeIsNotAdmittedAgain(t *testing.T) {
+	h := newStopProofHost(t, cleanAfter)
+	h.record(t, nodeending.Running)
+
+	err := h.host.StartServices(t.Context())
+	if err != nil && strings.Contains(err.Error(), "is not started") {
+		t.Fatalf("StartServices over a running node = %v, want no gate", err)
+	}
+
+	if h.verbs(t) != "start" {
+		t.Errorf("systemctl was asked %q, want the start that proves the running node", h.verbs(t))
+	}
+}
+
+// THE CHECKS `local up` AND `local down` USE ASK THE UNIT AND THE RECORD: the
+// adapter behind the seam TestMain replaces, driven through a systemctl.
+func TestTheSystemdChecksAskTheUnitAndTheRecord(t *testing.T) {
+	h := newStopProofHost(t, cleanAfter)
+	writeFile(t, h.state, timedOutAfter, 0o644)
+	h.record(t, nodeending.Running)
+
+	checks := systemdNodeEndings{insp: h.host.inspect}
+	cfg := h.host.cfg
+
+	if inv, err := checks.InvocationBeforeStop(t.Context()); err != nil || inv != "" {
+		t.Fatalf("InvocationBeforeStop of a stopped node = %q, %v; want none", inv, err)
+	}
+
+	if err := checks.AdmitStart(t.Context(), cfg); err == nil ||
+		!strings.Contains(err.Error(), "acknowledge --invocation inv-1") {
+		t.Fatalf("AdmitStart over a killed node = %v, want the refusal naming the acknowledgement", err)
+	}
+
+	if j := checks.JudgeStop(t.Context(), cfg, "", true); j.Verdict != nodeending.Unproved {
+		t.Fatalf("JudgeStop of a node already stopped killed = %s (%s), want unproved", j.Answer, j.Why)
+	}
+
+	writeFile(t, h.state, runningUnit, 0o644)
+
+	if inv, err := checks.InvocationBeforeStop(t.Context()); err != nil || inv != "inv-1" {
+		t.Fatalf("InvocationBeforeStop of a running node = %q, %v; want inv-1", inv, err)
+	}
+}

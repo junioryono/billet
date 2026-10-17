@@ -52,20 +52,22 @@ An entry still `running` names a process that was killed or crashed. `billet nod
 **A stop billet performs is proved by the stopped invocation's own entry.** `billet host-upgrade` and `billet local down` read the node's invocation before the stop, since a clean stop clears systemd's, and judge its ending after it:
 - `local down` requires `drained` before it stops the server;
 - so does an upgrade while a drain is requested;
-- otherwise `idle` and `handed-off` pass too.
+- otherwise `handed-off` passes too.
 
-An unproved stop leaves the node stopped and goes no further. An upgrade rolls back with nothing installed.
+An `idle` process never registered, so it never adopted what the process before it left: its stop is as good as that one's. The invocation must also be the newest process the record holds; one that a restart followed proves nothing about the process the stop ended. A node that was already stopped is judged by what its last process left, so running `local down` or an upgrade again does not pass a stop an earlier attempt refused. An unproved stop leaves the node stopped and goes no further. An upgrade rolls back with nothing installed.
 
-**A node of a release before the record keeps none.** Its stop falls back to systemd's `inactive`/`dead`/`success`, labelled `proof: systemd`. That is the weaker floor, which a handoff or a cut-short drain also passes, and it is recorded so the start after it can see it. An updater older than this release stops its node with the old check one last time.
+**A node of a release before the record keeps none.** Its stop falls back to systemd's `inactive`/`dead`/`success`, labelled `proof: systemd`, and only when the processes the record holds before it left nothing a start may not run over. That is the weaker floor, which a handoff or a cut-short drain also passes. systemd's answer is recorded either way, clean or not, so the start after it reads the same thing after `reset-failed`. An updater older than this release stops its node with the old check one last time.
 
-**A node is started only over a proved ending.** `billet local up`, and an upgrade's finish, rollback or resumed journal, each check the newest node entry first. It passes when it is a proved ending, an acknowledgement, or an ending from an earlier boot on a host-run provider (the reboot ended its compute). With no entry at all, systemd's account of the unit decides.
+**A node is started only over a proved ending.** `billet local up`, and an upgrade's finish, rollback or resumed journal, each read what the node's processes left first. A start passes over a drain, a handoff, an acknowledgement, or an ending from an earlier boot on a host-run provider (the reboot ended its compute). An `idle` ending, and systemd's clean stop of a process that kept no record, pass the question to the process before them. With no entry at all, systemd's account of the unit decides. A node that is already running is not started again, so there is nothing to admit.
 
 **When a stop is unproved:**
 1. Find out what it left: `billet node ending show`, `billet leases`, and the provider's own view (`pgrep -a firecracker`, `docker ps`, `tart list`).
-2. Acknowledge it: `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --invocation <id> --json`. Pass the id the refusal named, or `--unrecorded` for a stop no entry covers.
+2. Acknowledge it with the arguments the refusal named (its `acknowledge` field in JSON): `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --invocation <id> --json`. That is the newest node entry, or `--unrecorded` where none has an invocation.
 3. Start the node again. Its recovery adopts what is still running.
 
 An acknowledgement takes the node's own deployment lock, so it refuses while a node process holds the identity. It permits a start only, never an operation that needs a drain.
+
+**A record that cannot be read** (corrupt, from a newer release, or writable by another user) is never overwritten, and every judgement reads it as could-not-tell. Once what the host runs is known, `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --reset-unreadable --json` renames it beside itself (`endings.json.unreadable-<time>`) and starts a new record that holds only the acknowledgement.
 
 These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet. The Ansible role's own node restarts read the same record once the collection adopts it.
 

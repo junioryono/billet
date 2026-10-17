@@ -104,6 +104,10 @@ type Entry struct {
 type Record struct {
 	Schema  int     `json:"schema"`
 	Entries []Entry `json:"entries"`
+	// Trimmed says a node process's entry has been dropped to keep the record
+	// to MaxEntries, so a judgement that reads past the oldest entry kept
+	// cannot tell what the dropped ones left.
+	Trimmed bool `json:"trimmed,omitempty"`
 }
 
 const (
@@ -141,13 +145,25 @@ func BootID() string {
 
 // Read reads the record in dir. A missing file is a zero Record and present
 // false; anything else that is not a valid record is an error, which every
-// caller treats as could-not-tell.
+// caller treats as could-not-tell. The record is evidence only when this
+// process's own user wrote it and no one else could have: owned by the reader
+// (root, where it is judged) and writable by no group or other.
 func Read(dir string) (Record, bool, error) {
-	body, err := regularfile.ReadFile(Path(dir), maxBytes, regularfile.Options{NoFollow: true})
+	f, info, err := regularfile.Open(Path(dir), regularfile.Options{NoFollow: true})
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return Record{}, false, nil
 	case err != nil:
+		return Record{}, false, fmt.Errorf("read %s: %w", Path(dir), err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := ownedByReader(info); err != nil {
+		return Record{}, false, fmt.Errorf("%s: %w", Path(dir), err)
+	}
+
+	body, err := regularfile.ReadAllLimited(f, Path(dir), maxBytes)
+	if err != nil {
 		return Record{}, false, fmt.Errorf("read %s: %w", Path(dir), err)
 	}
 
@@ -163,7 +179,7 @@ func Read(dir string) (Record, bool, error) {
 	return rec, true, nil
 }
 
-func (r Record) validate() error {
+func (r *Record) validate() error {
 	if r.Schema != Schema {
 		return fmt.Errorf("schema %d, want %d", r.Schema, Schema)
 	}
@@ -216,11 +232,28 @@ func update(dir string, change func(*Record) error) error {
 		return err
 	}
 
-	if over := len(rec.Entries) - MaxEntries; over > 0 {
-		rec.Entries = slices.Clone(rec.Entries[over:])
-	}
+	rec.trim()
 
-	_, err = durablefile.Installer{}.Install(dir, FileName, 0o600, func(w io.Writer) error {
+	return install(dir, rec)
+}
+
+// trim keeps the record to MaxEntries, dropping probes' entries before any
+// node process's, since no judgement reads a probe, and never the newest entry,
+// which may be a process that has yet to end.
+func (r *Record) trim() {
+	for len(r.Entries) > MaxEntries {
+		drop := slices.IndexFunc(r.Entries[:len(r.Entries)-1], func(e Entry) bool { return e.Role == RoleProbe })
+		if drop < 0 {
+			drop, r.Trimmed = 0, true
+		}
+
+		r.Entries = slices.Delete(slices.Clone(r.Entries), drop, drop+1)
+	}
+}
+
+// install writes rec durably as the record in dir.
+func install(dir string, rec Record) error {
+	_, err := durablefile.Installer{}.Install(dir, FileName, 0o600, func(w io.Writer) error {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 
@@ -308,17 +341,49 @@ func (h *Handle) End(ending Ending, drainRequested bool) error {
 	return err
 }
 
-// Observe appends what systemd said of a stop no node entry covers, so the
-// evidence outlives reset-failed and the unit's garbage collection.
+// ErrRecordChanged is Observe's refusal when the record no longer says what
+// the judgement it records read: the invocation has an entry of its own now,
+// or the history beneath it no longer admits a start.
+var ErrRecordChanged = errors.New("the ending record changed since the stop was judged")
+
+// Observe appends what systemd said of a stop of e.InvocationID, which no
+// node entry covers, so the evidence outlives reset-failed and the unit's
+// garbage collection. It re-reads the record under its lock first: an
+// invocation that has an entry of its own is the node's to speak for, a stop
+// already observed is not observed twice, and a clean stop is recorded only
+// over a history that admits a start, as the judgement it records required.
 func Observe(dir string, e Entry, now func() time.Time) error {
 	if now == nil {
 		now = time.Now
 	}
 
+	if e.InvocationID == "" {
+		return errors.New("a stop systemd observed is recorded only for a known invocation")
+	}
+
 	at := now().UTC()
-	e.Source, e.EndedAt, e.Role = SourceSystemd, &at, RoleNode
+	e.Source, e.EndedAt, e.Role, e.Acknowledged = SourceSystemd, &at, RoleNode, false
 
 	return update(dir, func(r *Record) error {
+		for i := range r.Entries {
+			old := &r.Entries[i]
+			if old.InvocationID != e.InvocationID || old.Role != RoleNode {
+				continue
+			}
+
+			if old.Source == SourceSystemd {
+				return nil
+			}
+
+			return fmt.Errorf("%w: invocation %s has an entry of its own", ErrRecordChanged, e.InvocationID)
+		}
+
+		if n := newestNode(r.Entries); e.Ending == Stopped && n >= 0 {
+			if s := standing(*r, n, forStart, e.BootID); s.Verdict != Proved {
+				return fmt.Errorf("%w: %s", ErrRecordChanged, s.Why)
+			}
+		}
+
 		r.Entries = append(r.Entries, e)
 
 		return nil
@@ -365,6 +430,48 @@ func Acknowledge(dir, invocation string, unrecorded bool, now func() time.Time) 
 	})
 
 	return got, err
+}
+
+// Reset sets aside a record that cannot be read, renaming it beside itself
+// rather than deleting the evidence, and starts a new one holding an
+// acknowledged Unrecorded entry: the operator's word that the host runs nothing
+// a node would not adopt, which is all a start then rests on. A record that can
+// be read is refused, since its newest entry is what to acknowledge.
+func Reset(dir string, now func() time.Time) (string, Entry, error) {
+	if now == nil {
+		now = time.Now
+	}
+
+	unlock, err := lock(dir)
+	if err != nil {
+		return "", Entry{}, err
+	}
+	defer unlock()
+
+	_, present, readErr := Read(dir)
+
+	switch {
+	case readErr == nil && present:
+		return "", Entry{}, errors.New("the ending record can be read; acknowledge its newest entry instead")
+	case readErr == nil:
+		return "", Entry{}, errors.New("there is no ending record to reset; acknowledge --unrecorded instead")
+	}
+
+	at := now().UTC()
+	aside := Path(dir) + ".unreadable-" + at.Format("20060102T150405Z")
+
+	if err := os.Rename(Path(dir), aside); err != nil {
+		return "", Entry{}, fmt.Errorf("set the unreadable record aside: %w", err)
+	}
+
+	e := Entry{Role: RoleNode, StartedAt: at, EndedAt: &at, Ending: Unrecorded, Source: SourceOperator,
+		Acknowledged: true}
+
+	if err := install(dir, Record{Schema: Schema, Entries: []Entry{e}}); err != nil {
+		return aside, Entry{}, err
+	}
+
+	return aside, e, nil
 }
 
 // newestNode is the index of the newest entry that is not a probe's, or -1.

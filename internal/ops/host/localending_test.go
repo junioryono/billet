@@ -23,6 +23,9 @@ type stagedNodeEndings struct {
 	admitErr   error
 	judged     []string
 	admitted   int
+	// trace, when set, is the converger's, so a judgement's place among the
+	// stops is asserted.
+	trace *[]string
 }
 
 func (s *stagedNodeEndings) InvocationBeforeStop(context.Context) (string, error) {
@@ -35,7 +38,16 @@ func (s *stagedNodeEndings) JudgeStop(_ context.Context, _ *config.Config, invoc
 		s.judged = append(s.judged, "no drain required")
 	}
 
-	return nodeending.Judgement{Verdict: s.verdict, Answer: s.verdict.String(), Why: "staged"}
+	if s.trace != nil {
+		*s.trace = append(*s.trace, "judge "+invocation)
+	}
+
+	j := nodeending.Judgement{Verdict: s.verdict, Answer: s.verdict.String(), Why: "staged"}
+	if s.verdict != nodeending.Proved {
+		j.Acknowledge = "--invocation staged-newest"
+	}
+
+	return j
 }
 
 func (s *stagedNodeEndings) AdmitStart(context.Context, *config.Config) error {
@@ -74,7 +86,7 @@ func TestDownStopsAtANodeThatDidNotDrain(t *testing.T) {
 	capture(t, func() { err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}) })
 
 	if err == nil || !strings.Contains(err.Error(), "did not prove it drained") ||
-		!strings.Contains(err.Error(), "acknowledge --invocation inv-9") {
+		!strings.Contains(err.Error(), "acknowledge --invocation staged-newest") {
 		t.Fatalf("down over a node that did not drain = %v, want the refusal naming the acknowledgement", err)
 	}
 
@@ -124,6 +136,7 @@ func TestDownOverADrainedNodeStopsTheServer(t *testing.T) {
 	_ = openLedger(t, stateDir)
 
 	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
+	s.trace = &f.trace
 
 	var err error
 
@@ -133,9 +146,44 @@ func TestDownOverADrainedNodeStopsTheServer(t *testing.T) {
 		t.Fatalf("down over a drained node = %v", err)
 	}
 
-	if !slices.Contains(f.trace, "stop "+deploy.ServerUnitName) || len(s.judged) != 1 {
-		t.Errorf("down's trace %q and judgements %q, want the node judged once and the server stopped", f.trace,
-			s.judged)
+	node := slices.Index(f.trace, "stop "+deploy.NodeUnitName)
+	judge := slices.Index(f.trace, "judge inv-9")
+	server := slices.Index(f.trace, "stop "+deploy.ServerUnitName)
+
+	if node < 0 || judge <= node || server <= judge || len(s.judged) != 1 {
+		t.Errorf("down's trace %q and judgements %q, want the node stopped, then judged once, then the server "+
+			"stopped", f.trace, s.judged)
+	}
+}
+
+// A SECOND `down` OVER A NODE THE FIRST LEFT STOPPED UNPROVED IS REFUSED AGAIN:
+// a node with no process is judged by what its last process left, and the
+// server is not stopped.
+func TestDownOverAStoppedNodeJudgesWhatItLeft(t *testing.T) {
+	asLinux(t)
+
+	s := &stagedNodeEndings{verdict: nodeending.Unproved}
+	onLinuxWith(t, s)
+
+	cfgPath, stateDir := downConfig(t, true)
+	_ = openLedger(t, stateDir)
+
+	f := stageDown(t, &fakeConverger{}, deploy.ServerUnitName, deploy.NodeUnitName)
+
+	var err error
+
+	capture(t, func() { err = runLocalDown(t.Context(), processEnv(), downOptions{configPath: cfgPath}) })
+
+	if err == nil || !strings.Contains(err.Error(), "did not prove it drained") {
+		t.Fatalf("a second down over a node stopped unproved = %v, want the refusal", err)
+	}
+
+	if !slices.Equal(s.judged, []string{""}) {
+		t.Errorf("the stop was judged as %q, want what the last process left, with a drain required", s.judged)
+	}
+
+	if slices.Contains(f.trace, "stop "+deploy.ServerUnitName) {
+		t.Errorf("down went on to stop the server: %q", f.trace)
 	}
 }
 

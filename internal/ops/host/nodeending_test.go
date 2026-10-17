@@ -117,8 +117,9 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 	})
 
-	t.Run("an idle stop, with and without --drain", func(t *testing.T) {
+	t.Run("an idle stop over a handoff, with and without --drain", func(t *testing.T) {
 		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.HandedOff)
 		f.begin(t, "inv-1", nodeending.Idle)
 
 		if o := f.run(t, "check", "--invocation", "inv-1"); o.code != 0 {
@@ -126,8 +127,41 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 
 		if o := f.run(t, "check", "--invocation", "inv-1", "--drain"); o.code != exitRefused ||
-			!strings.Contains(o.str("why"), "required a drain") {
+			!strings.Contains(o.str("why"), "never adopted it") {
 			t.Fatalf("an idle stop with --drain: code %d (%s), want unproved", o.code, o.str("why"))
+		}
+	})
+
+	t.Run("no record, systemd timeout", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-0", nodeending.Drained)
+		f.unit(t, "failed", "failed", "timeout", "0", "inv-old")
+
+		if o := f.run(t, "check", "--invocation", "inv-old"); o.code != exitRefused || !o.boolean("recorded") {
+			t.Fatalf("a node with no record killed at the timeout: code %d recorded %v (%s), want unproved and "+
+				"recorded", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		f.unit(t, "inactive", "dead", "success", "0", "")
+
+		if a := f.run(t, "admit-start"); a.code != exitRefused || a.str("acknowledge") != "--invocation inv-old" {
+			t.Fatalf("admit-start after reset-failed: code %d acknowledge %q (%s), want the recorded failure "+
+				"refused", a.code, a.str("acknowledge"), a.str("why"))
+		}
+	})
+
+	t.Run("a stale invocation over a killed node", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+
+		if o := f.run(t, "check", "--invocation", "inv-stale"); o.code != exitRefused || o.boolean("recorded") {
+			t.Fatalf("a stale invocation over a killed node: code %d recorded %v (%s), want unproved and "+
+				"nothing recorded", o.code, o.boolean("recorded"), o.str("why"))
+		}
+
+		if a := f.run(t, "admit-start"); a.code != exitRefused || a.str("acknowledge") != "--invocation inv-1" {
+			t.Fatalf("admit-start after a stale check: code %d acknowledge %q (%s), want refused", a.code,
+				a.str("acknowledge"), a.str("why"))
 		}
 	})
 
@@ -191,10 +225,9 @@ func TestAcknowledgementAdmitsTheStartItWasRefused(t *testing.T) {
 	f.begin(t, "inv-1", nodeending.Running)
 	f.unit(t, "failed", "failed", "timeout", "0", "inv-1")
 
-	if o := f.run(t, "admit-start"); o.code != exitRefused || !strings.Contains(o.str("why"),
-		`acknowledge --invocation "inv-1"`) {
-		t.Fatalf("admit-start over a killed node: code %d (%s), want refused naming the acknowledgement", o.code,
-			o.str("why"))
+	if o := f.run(t, "admit-start"); o.code != exitRefused || o.str("acknowledge") != "--invocation inv-1" {
+		t.Fatalf("admit-start over a killed node: code %d acknowledge %q (%s), want refused naming the "+
+			"acknowledgement", o.code, o.str("acknowledge"), o.str("why"))
 	}
 
 	endingEUID = func() int { return 1000 }
@@ -231,6 +264,32 @@ func TestAcknowledgementAdmitsTheStartItWasRefused(t *testing.T) {
 
 	if o := f.run(t, "admit-start"); o.code != 0 || o.str("proof") != nodeending.ProofAcknowledged {
 		t.Fatalf("admit-start after the acknowledgement: code %d (%s), want admitted", o.code, o.str("why"))
+	}
+}
+
+// AN UNREADABLE RECORD IS RECOVERED BY THE RESET IT NAMES: admit-start answers
+// could-not-tell naming --reset-unreadable, which sets the record aside under
+// the node's lock, after which a start is admitted.
+func TestAnUnreadableRecordIsRecoveredByItsReset(t *testing.T) {
+	f := newEndingFixture(t)
+	writeFile(t, nodeending.Path(f.stateDir), "{", 0o600)
+
+	if o := f.run(t, "admit-start"); o.code != exitUnknown || o.str("acknowledge") != "--reset-unreadable" {
+		t.Fatalf("admit-start over an unreadable record: code %d acknowledge %q (%s), want could-not-tell "+
+			"naming the reset", o.code, o.str("acknowledge"), o.str("why"))
+	}
+
+	if o := f.run(t, "acknowledge", "--reset-unreadable"); o.code != 0 || f.claimed != 1 ||
+		!strings.Contains(o.str("why"), "set aside") {
+		t.Fatalf("the reset: code %d claims %d (%s), want proved under the lock", o.code, f.claimed, o.str("why"))
+	}
+
+	if o := f.run(t, "admit-start"); o.code != 0 {
+		t.Fatalf("admit-start after the reset: code %d (%s), want admitted", o.code, o.str("why"))
+	}
+
+	if o := f.run(t, "acknowledge", "--reset-unreadable", "--unrecorded"); o.err == nil {
+		t.Fatal("two acknowledgements at once were accepted")
 	}
 }
 

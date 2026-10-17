@@ -212,3 +212,174 @@ func TestOnlyTheNewestStopIsAcknowledged(t *testing.T) {
 		t.Errorf("the record is %+v (%v), want the unrecorded acknowledgement appended", rec.Entries, err)
 	}
 }
+
+// PROBES GO BEFORE ANY NODE PROCESS: sixteen readiness probes never push out
+// the node's own unresolved ending, and the record says it was trimmed only
+// once a node process's entry went.
+func TestTheTrimDropsProbesFirst(t *testing.T) {
+	dir := t.TempDir()
+	now := clock(epoch)
+
+	if _, err := Begin(dir, nodeEntry("inv-node", 1), now); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range MaxEntries + 4 {
+		p := nodeEntry("inv-probe", 100+i)
+		p.Role = RoleProbe
+
+		if _, err := Begin(dir, p, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(rec.Entries) != MaxEntries || rec.Entries[0].InvocationID != "inv-node" || rec.Trimmed {
+		t.Fatalf("kept %d entries, the first %q, trimmed %v; want %d with the node's first and not trimmed",
+			len(rec.Entries), rec.Entries[0].InvocationID, rec.Trimmed, MaxEntries)
+	}
+
+	if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Unproved {
+		t.Fatalf("the node's killed process was admitted over: %s (%s)", got.Verdict, got.Why)
+	}
+
+	for i := range MaxEntries {
+		if _, err := Begin(dir, nodeEntry("inv-later", 200+i), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, _, err = Read(dir)
+	if err != nil || !rec.Trimmed {
+		t.Fatalf("after node entries were dropped the record is trimmed %v (%v), want true", rec.Trimmed, err)
+	}
+}
+
+// A RECORD ANOTHER USER COULD HAVE WRITTEN IS NOT EVIDENCE.
+func TestARecordOthersCanWriteIsRefused(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Read(dir); err != nil {
+		t.Fatalf("the record as written was refused: %v", err)
+	}
+
+	for _, mode := range []os.FileMode{0o620, 0o602} {
+		if err := os.Chmod(Path(dir), mode); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, _, err := Read(dir); err == nil || !strings.Contains(err.Error(), "lets another user write it") {
+			t.Errorf("a record at %04o read as %v, want a refusal", mode, err)
+		}
+	}
+}
+
+// SYSTEMD'S ACCOUNT IS RECORDED ONLY WHERE THE NODE KEPT NONE, ONCE, AND A
+// CLEAN STOP ONLY OVER A HISTORY THAT ADMITS A START, all read again under the
+// record's lock: so a stale check cannot write a clean stop over a newer
+// failure.
+func TestASystemdObservationIsRecordedOnlyWhereItHolds(t *testing.T) {
+	stopped := func(inv string) Entry {
+		return Entry{InvocationID: inv, BootID: "boot-a", Ending: Stopped}
+	}
+
+	t.Run("the invocation has its own entry", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Observe(dir, stopped("inv-1"), clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("Observe over the node's own entry returned %v, want ErrRecordChanged", err)
+		}
+	})
+
+	t.Run("over a killed process", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Observe(dir, stopped("inv-stale"), clock(epoch)); !errors.Is(err, ErrRecordChanged) {
+			t.Fatalf("a clean stop over a killed process was recorded: %v", err)
+		}
+
+		failed := stopped("inv-stale")
+		failed.Ending = Failed
+
+		if err := Observe(dir, failed, clock(epoch)); err != nil {
+			t.Fatalf("a failed stop was refused: %v", err)
+		}
+	})
+
+	t.Run("once", func(t *testing.T) {
+		dir := t.TempDir()
+		now := clock(epoch)
+
+		for range 2 {
+			if err := Observe(dir, stopped("inv-old"), now); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		rec, _, err := Read(dir)
+		if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Source != SourceSystemd {
+			t.Fatalf("after two observations the record is %+v (%v), want one systemd entry", rec.Entries, err)
+		}
+	})
+
+	t.Run("no invocation", func(t *testing.T) {
+		if err := Observe(t.TempDir(), stopped(""), clock(epoch)); err == nil {
+			t.Fatal("a stop with no invocation was recorded")
+		}
+	})
+}
+
+// AN UNREADABLE RECORD IS SET ASIDE, NEVER DELETED, by the reset alone, which
+// leaves an acknowledgement a start may follow; a readable or absent record is
+// refused, naming what to acknowledge instead.
+func TestAnUnreadableRecordIsSetAsideByTheReset(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, _, err := Reset(dir, clock(epoch)); err == nil || !strings.Contains(err.Error(), "no ending record") {
+		t.Fatalf("a reset with no record returned %v, want a refusal", err)
+	}
+
+	if _, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := Reset(dir, clock(epoch)); err == nil || !strings.Contains(err.Error(), "can be read") {
+		t.Fatalf("a reset of a readable record returned %v, want a refusal", err)
+	}
+
+	if err := os.WriteFile(Path(dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	aside, e, err := Reset(dir, clock(epoch))
+	if err != nil || !e.Acknowledged || e.Ending != Unrecorded {
+		t.Fatalf("the reset returned %+v, %v", e, err)
+	}
+
+	if body, err := os.ReadFile(aside); err != nil || string(body) != "{" {
+		t.Errorf("the unreadable record set aside holds %q (%v), want what it held", body, err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := AdmitStart(rec, nil, cleanUnit, "boot-a"); got.Verdict != Proved {
+		t.Errorf("after the reset a start is %s (%s), want proved", got.Verdict, got.Why)
+	}
+}
