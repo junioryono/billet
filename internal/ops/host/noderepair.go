@@ -755,14 +755,13 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 		return false, "the unit already declares " + deploy.NodeRegistrationDirectory, nil
 	}
 
-	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks; the role's
-	// own unit in a shape the repair refuses is reached by a converge only once
-	// the node is stopped, or by hand.
+	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks, and the
+	// role's own unit is the one at the path this repair edits.
 	dropIns := firstProp(props, "DropInPaths")
 
 	remedy := unitRemedy(shape.FragmentPath, shape.RuntimeDirectory, dropIns)
 	if shape.FragmentPath == repairUnitPath {
-		remedy = roleUnitRemedy
+		remedy = dropInsFirst(dropIns, roleUnitRemedyFor(shape.RuntimeDirectory))
 	}
 
 	switch {
@@ -776,8 +775,7 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 			stateNothing)
 	case dropIns != "":
 		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s has drop-ins (%s), which a repair "+
-			"does not admit", nodeUnit, dropIns), remedy+"; a drop-in that sets RuntimeDirectory still applies "+
-			"over the unit a converge renders, so check it first", stateNothing)
+			"does not admit", nodeUnit, dropIns), remedy, stateNothing)
 	case firstProp(props, "NeedDaemonReload") != "no":
 		return false, "", endpointUnknown(endpointReasonShape, fmt.Sprintf("%s has NeedDaemonReload=%s, so the "+
 			"file on disk is not the unit systemd runs", nodeUnit, orUnknownWord(firstProp(props, "NeedDaemonReload"))),

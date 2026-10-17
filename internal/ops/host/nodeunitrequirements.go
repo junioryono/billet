@@ -168,12 +168,11 @@ const (
 // target of an alias, whose own rank its path does not show. A host refused
 // for its unit runs a node of a release that publishes its record (the
 // refusing binary is one), and a converge over that node stops at its repair,
-// which edits the role's own unit alone: so a converge reaches any other unit
-// only once the node is stopped. Drop-ins apply over whichever file is in
-// effect, and neither a converge nor a package removes one it did not install.
-// The role's own unit is repaired by a converge only in the one shape the
-// repair admits (billet/locks alone, no drop-in); in any other, the converge
-// reaches it only once the node is stopped and it renders the unit afresh.
+// which edits the role's own unit alone and only in its one admitted shape
+// (billet/locks alone, no drop-in): so a converge reaches any other unit, or
+// the role's in another shape, only once the node is stopped. A drop-in comes
+// first whatever the unit: a converge that upgrades billet refuses any drop-in
+// on the node unit, and one that sets RuntimeDirectory applies over any unit.
 // The upgrade's refusal and the repair's both name their remedy here.
 func unitRemedy(fragment, runtime, dropIns string) string {
 	var remedy string
@@ -186,12 +185,8 @@ func unitRemedy(fragment, runtime, dropIns string) string {
 		remedy = nodeUnit + " is an alias of " + path.Base(fragment) + ", and where the alias itself ranks is not " +
 			"shown by its target's path, so find what defines it (systemctl cat " + nodeUnit + ") before " +
 			"converging or installing the package"
-	case dir == "/etc/systemd/system" && runtime == "billet/locks" && dropIns == "":
-		remedy = "converge the host role, which repairs that unit, or follow the manual repair in " +
-			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
-			"/etc/systemd/system outranks the packaged one"
 	case dir == "/etc/systemd/system":
-		remedy = roleUnitRemedy
+		remedy = roleUnitRemedyFor(runtime)
 	case slices.Contains(unitDirsBetween, dir):
 		remedy = unitRemedyStopFirst + ", whose unit under /etc/systemd/system outranks that one; installing the " +
 			"package does not help, since that one outranks the packaged unit"
@@ -207,12 +202,32 @@ func unitRemedy(fragment, runtime, dropIns string) string {
 			"role's nor the package's, before converging or installing the package"
 	}
 
-	if dropIns != "" {
-		remedy += "; and check its drop-ins (" + dropIns + "), which apply over whichever unit is in effect and " +
-			"which neither a converge nor a package removes"
+	return dropInsFirst(dropIns, remedy)
+}
+
+// roleUnitRemedyFor is the remedy for the role's own unit declaring runtime,
+// with any drop-in removed: a converge repairs the one shape its repair
+// admits, and renders any other afresh once the node is stopped.
+func roleUnitRemedyFor(runtime string) string {
+	if runtime == "billet/locks" {
+		return "converge the host role, which repairs that unit, or follow the manual repair in " +
+			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
+			"/etc/systemd/system outranks the packaged one"
 	}
 
-	return remedy
+	return roleUnitRemedy
+}
+
+// dropInsFirst puts the removal of the node unit's drop-ins before remedy.
+func dropInsFirst(dropIns, remedy string) string {
+	if dropIns == "" {
+		return remedy
+	}
+
+	return "remove the drop-ins on " + nodeUnit + " (" + dropIns + ") or fold their settings into the host " +
+		"role's variables, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in " +
+		"on " + nodeUnit + " and one that sets RuntimeDirectory applies over whatever unit is in effect; then " +
+		remedy
 }
 
 // unitRequirementsInspector is the inspector the upgrade holds the node unit

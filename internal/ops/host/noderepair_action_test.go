@@ -409,7 +409,19 @@ func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
 		{"the role's unit with a drop-in", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "DropInPaths", "/etc/systemd/system/billet-node.service.d/env.conf")
-		}, "a drop-in that sets RuntimeDirectory still applies", "install this release's package"},
+		}, "systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then converge the host role, which repairs that unit", "stop billet-node.service"},
+		{"the role's unit in another shape with a drop-in", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/cache")
+			f.set(t, nodeUnit, "DropInPaths", "/etc/systemd/system/billet-node.service.d/rt.conf")
+		}, "remove the drop-ins on billet-node.service (/etc/systemd/system/billet-node.service.d/rt.conf) or fold " +
+			"their settings into the host role's variables, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then stop billet-node.service, then converge",
+			"which repairs that unit"},
+		{"the role's file in another line shape", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			writeFile(t, f.unitPath, strings.Replace(f.legacy, "RuntimeDirectory=billet/locks\n",
+				"RuntimeDirectory=billet/locks \n", 1), 0o644)
+		}, "stop billet-node.service, then converge the host role", "install this release's package"},
 		{"the role's file not root's", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			repairUnitOwned = func(os.FileInfo) error { return errors.New(f.unitPath + " is not owned by root") }

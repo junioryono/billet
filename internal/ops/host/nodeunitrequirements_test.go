@@ -182,9 +182,9 @@ func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
 			[]string{alias}, []string{pkg, repairs, outranks, neither, stopFirst}},
 		{"the role's unit with a drop-in", strings.Replace(legacyNodeUnit, "DropInPaths=\n",
 			"DropInPaths=/etc/systemd/system/billet-node.service.d/env.conf\n", 1),
-			[]string{stopFirst, "which renders that unit afresh", noPackage,
-				"check its drop-ins (/etc/systemd/system/billet-node.service.d/env.conf)"},
-			[]string{pkg, repairs}},
+			[]string{"remove the drop-ins on billet-node.service (/etc/systemd/system/billet-node.service.d/env.conf)",
+				"; then " + repairs, noPackage},
+			[]string{pkg, stopFirst}},
 		{"the role's unit in another shape", strings.Replace(legacyNodeUnit, "RuntimeDirectory=billet/locks\n",
 			"RuntimeDirectory=billet/locks billet/cache\n", 1),
 			[]string{stopFirst, "which renders that unit afresh", "the manual repair in docs/operating/upgrades.md"},
@@ -193,7 +193,9 @@ func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
 			[]string{"which is neither the host role's nor the package's"}, []string{pkg, repairs, outranks, neither}},
 		{"a packaged unit with a drop-in", strings.Replace(packagedLegacyNodeUnit, "DropInPaths=\n",
 			"DropInPaths=/etc/systemd/system/billet-node.service.d/rt.conf\n", 1),
-			[]string{pkg, "check its drop-ins (/etc/systemd/system/billet-node.service.d/rt.conf)"}, nil},
+			[]string{"remove the drop-ins on billet-node.service (/etc/systemd/system/billet-node.service.d/rt.conf)",
+				"; then " + pkg},
+			[]string{repairs}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := checkUnitRequirements(t.Context(), nodeConfig, "v0.17.0", requirementsSystemctl(t, tc.unit))
