@@ -20,8 +20,8 @@ const newestMigration = 61
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do:
 // the index and the four columns migration 61 added, and its record. It refuses
 // to run once a newer one exists, so the ledger it leaves is always the schema
-// just before this binary's newest and the report every caller expects is
-// {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
+// just before this binary's newest and, when a move is reported, its endpoints
+// are {newest-1, newest}; rewinding 61 under a 62 would leave a ledger at 62 with
 // 61 missing, which migrate would fill and report as {62, 61}.
 func rewindNewest(t *testing.T, db *DB) {
 	t.Helper()
