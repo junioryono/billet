@@ -41,7 +41,7 @@ func TestTheScriptFitsWithARealisticCACert(t *testing.T) {
 		// runtimes, three toolchains and the global sets it no longer fits beside a
 		// realistic CA -- which is not a regression but the reason staging exists.
 		script, err := provisionScript(BuildSpec{
-			RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: bundle.String(),
+			RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: bundle.String(),
 			payloadURL:    "https://b.s3.us-west-2.amazonaws.com/p.tar.gz?X-Amz-Signature=" + strings.Repeat("s", 64),
 			payloadSHA256: strings.Repeat("d", 64),
 		})
@@ -101,7 +101,7 @@ func TestTheCABoundIsDeliverable(t *testing.T) {
 	// 16384-byte cap is what made the compiler sections not fit at all. The
 	// fallback's own limit is asserted below, as a refusal that names the remedy.
 	script, err := provisionScript(BuildSpec{
-		RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: atBound.String(),
+		RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64", CACertPEM: atBound.String(),
 		payloadURL:    "https://example-bucket.s3.us-west-2.amazonaws.com/billet-payload-" + strings.Repeat("a", 64) + ".tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=" + strings.Repeat("c", 40) + "&X-Amz-Date=20260101T000000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=" + strings.Repeat("s", 64),
 		payloadSHA256: strings.Repeat("d", 64),
 	})
@@ -161,7 +161,7 @@ const caDeliveryMargin = 1024
 func TestTheEmbeddedFallbackRefusesWithTheRemedy(t *testing.T) {
 	t.Parallel()
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "x64"})
+	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}

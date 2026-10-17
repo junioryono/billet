@@ -110,3 +110,4 @@ e71e192ec55c make verify runs make docs for a docs/ change when Sphinx is instal
 e8e645e2b725 The terraform gates are named by make verify and run by CI; billet-infra-terraform-ansible keeps the rule to run them before pushing a .tf change.
 ea5dd02815a7 make check is the full gate and a session runs make verify (2026-10-15 policy); the sentence is restated with both.
 f2dc70408ec2 The fixture list gained node-repair-unit, the runtime-unit repair (#168); the sentence is restated with it.
+697517353b3a #149 made check-module-sources.sh expect the tree's own ref (scripts/release-ref.sh), so a release branch is held at its tag; the sentence now says both.

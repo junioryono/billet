@@ -32,17 +32,17 @@ func TestTheGeneratedScriptParses(t *testing.T) {
 	}{
 		{
 			name: "x64",
-			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "x64"},
+			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"},
 		},
 		{
 			// arm64 TAKES A DIFFERENT PATH — no toolcache, no gate — so parsing
 			// one says nothing about the other.
 			name: "arm64",
-			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "arm64"},
+			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "arm64"},
 		},
 		{
 			name: "x64 with a CA",
-			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.328.0", Arch: "x64"},
+			spec: BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Arch: "x64"},
 		},
 	} {
 		t.Run(spec.name, func(t *testing.T) {
@@ -121,6 +121,9 @@ func TestEveryGateRunsBeforeTheSuccessSignal(t *testing.T) {
 		// The property is unchanged: the BUILDER verifies what it received, so a
 		// check on only the Go side does not leave it trusting whatever arrived.
 		{"sha256sum -c -", "the staged payload is the one billet sent"},
+		// AND THE RUNNER'S, by its own refusal: the payload's check above matches
+		// the same command, so the marker is the line only the runner's carries.
+		{"does not hash to", "the actions/runner tarball is the release billet pins"},
 	} {
 		at := firstLineOf(t, lines, gate.marker)
 		if at >= poweroff {

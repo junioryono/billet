@@ -18,7 +18,7 @@ There is no configuration that gets both. What narrows the gap is that `@v0` onl
 
 If your threat model includes this repository being compromised, use a SHA. If it includes you forgetting to update a pin for two years, use `@v0`. Most people running self-hosted CI have the second problem.
 
-On `converge-fleet` the reference carries more: the action runs the Ansible collection from the same checkout, so its ref pins the roles a converge runs as well as the action. With an exact tag, Dependabot's `github-actions` ecosystem opens a pull request for each release, and that pull request's `check` job is where you read what the new roles would change before anything runs. With `@v0` there is no pull request: the tag moves when a release is accepted and the next converge, whenever a change to the fleet triggers one, runs the new roles, so the moving reference is a choice to take the roles unread. The release workflow rewrites the documented reference to the tag being cut, and `scripts/check-module-sources.sh` holds it at `main` in the tree, the same rule the Terraform module sources follow.
+On `converge-fleet` the reference carries more: the action runs the Ansible collection from the same checkout, so its ref pins the roles a converge runs as well as the action. With an exact tag, Dependabot's `github-actions` ecosystem opens a pull request for each release, and that pull request's `check` job is where you read what the new roles would change before anything runs. With `@v0` there is no pull request: the tag moves when a release is accepted and the next converge, whenever a change to the fleet triggers one, runs the new roles, so the moving reference is a choice to take the roles unread. The release workflow rewrites the documented reference to the tag being cut, and `scripts/check-module-sources.sh` holds it at the tree's own ref (`main` on `main`, the tag on a release branch), the same rule the Terraform module sources follow.
 
 ## Nested actions resolve to one release
 
@@ -28,7 +28,7 @@ It did. Between v0.3.26 and this change, `build-push-action` on `main` composed 
 
 The rule now is that a bundled action resolves to the same Billet as the action that called it, and it is enforced in two places because the tree has two lives:
 
-- **In the repository**, siblings are `@main`, so `main` composes `main`. `TestBundledActionsComposeMainInTheTree` runs in `make check`.
+- **In the repository**, siblings are `@main`, so `main` composes `main`, and on a release branch they name the tag the branch was last cut at. `TestBundledActionsComposeTheReleaseTheTreeIs` runs in `make check` and asks `scripts/release-ref.sh` which of the two the tree is: the nearest release tag on its first-parent history, or `main` when there is none. It used to expect `main` everywhere, so CI on a release branch failed because the branch was right, and a real regression there could not be told from that failure.
 - **In a release**, `cut-release.yml` rewrites every internal reference to the tag being cut, before it creates that tag, and `check-release-metadata.sh` refuses to tag if any of them did not land.
 
 `TestEveryFileWithASiblingRefIsRewrittenAtReleaseTime` covers the gap between the two: a new composite action that composes a sibling and is not listed in the rewrite step would ship inside an immutable tag still pointing at `main`, which quietly removes the property the pin was chosen for.

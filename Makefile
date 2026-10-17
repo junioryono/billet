@@ -174,7 +174,9 @@ module-sources: ## Prove every documented Terraform module source names a versio
 	@# IN `check` RATHER THAN WITH THE tf-* TARGETS, which are outside it because
 	@# they need terraform, tflint and trivy installed. This one is git and shell,
 	@# so it can fail on the commit that breaks it instead of on the release.
-	EXPECTED_REF=main scripts/check-module-sources.sh
+	@# The ref it expects is the tree's own (scripts/release-ref.sh): main here,
+	@# the branch's tag on a release branch.
+	scripts/check-module-sources.sh
 
 .PHONY: lambda-test
 lambda-test: ## Unit-test the Terraform spot-router Lambda (stdlib only, boto3 stubbed)
