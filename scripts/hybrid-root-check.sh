@@ -27,6 +27,16 @@ fi
 
 module=$repo_root/terraform/modules/billet
 
+# A PLUGIN CACHE SERVES THESE ROOTS ONLY WITH LEAVE TO BREAK THEIR LOCK. Each
+# root resolves the newest aws provider afresh (an attribute it renamed is one of
+# the things this check exists to catch), so none has a lock file, and with no
+# lock entry terraform downloads a provider rather than take it from the cache
+# (measured with 1.14.1): 194 MB, four times a run. Breaking the lock is
+# harmless here, because every root lives under $work and is deleted.
+if [ -n "${TF_PLUGIN_CACHE_DIR:-}" ]; then
+    export TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true
+fi
+
 check_shape() {
     shape=$1
     shift
