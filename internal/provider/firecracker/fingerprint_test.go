@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -89,18 +90,30 @@ func TestAFileDigestIsRecomputedWhenTheFileChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var d fileDigests
+	// SETTLED, by a clock an hour ahead, so the first digest is remembered.
+	d := fileDigests{now: func() time.Time { return time.Now().Add(time.Hour) }}
 
 	first, err := d.of(path)
 	if err != nil {
 		t.Fatalf("of: %v", err)
 	}
 
+	if len(d.seen) != 1 {
+		t.Fatalf("a settled file's digest was not remembered: %d entries", len(d.seen))
+	}
+
 	if again, err := d.of(path); err != nil || again != first {
 		t.Fatalf("a second read = %q (%v), want %q", again, err, first)
 	}
 
+	// THE REWRITE, given a modification time of its own: two writes inside one
+	// timestamp tick are TestADigestOfAFileJustWrittenIsNotRemembered's case.
 	if err := os.WriteFile(path, []byte("kernel two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(path, later, later); err != nil {
 		t.Fatal(err)
 	}
 
@@ -407,5 +420,38 @@ func TestARestoreRefusesASpecOfAnotherShape(t *testing.T) {
 				t.Fatalf("Restore = %v, want errSnapshotIncompatible", err)
 			}
 		})
+	}
+}
+
+// A FILE STILL BEING WRITTEN IS NEVER REMEMBERED. Two same-size writes inside one
+// timestamp tick leave the inode, the size and both times as they were (measured on
+// Linux CI), so only a file whose last change has settled may be cached.
+func TestADigestOfAFileJustWrittenIsNotRemembered(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "vmlinux")
+	if err := os.WriteFile(path, []byte("kernel one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var d fileDigests
+
+	first, err := d.of(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A STAT CANNOT STAGE THE TICK (a utimes call moves the change time), so the
+	// cache itself is the evidence: nothing remembered means nothing to go stale.
+	if len(d.seen) != 0 {
+		t.Fatalf("a file written moments ago had its digest remembered: %v", d.seen)
+	}
+
+	if err := os.WriteFile(path, []byte("kernel two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if second, err := d.of(path); err != nil || second == first {
+		t.Errorf("a file rewritten moments after its first write kept the digest %q (%v)", second, err)
 	}
 }

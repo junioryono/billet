@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -196,9 +197,19 @@ func unameKernel() (string, error) {
 // the inode and everything a rewrite changes (size, modification and change time),
 // so a file replaced or edited in place is digested again, and a file merely read
 // again is not.
+//
+// AND ONLY ONCE THE FILE HAS SETTLED. A filesystem stamps times at its clock's tick,
+// not to the nanosecond (measured on Linux CI: a same-size rewrite within one tick
+// kept the inode, the size and both times), so a key read moments after a write can
+// equal the key after the next one. A digest is remembered only when the file's last
+// change is older than settledAfter, the way git treats a "racy" index entry; a file
+// still being written is digested every time.
 type fileDigests struct {
 	mu   sync.Mutex
 	seen map[fileIdentity]string
+
+	// now is the clock a file's settling is judged by; nil is time.Now.
+	now func() time.Time
 }
 
 type fileIdentity struct {
@@ -257,6 +268,10 @@ func (d *fileDigests) ofOpen(f *os.File, path string) (string, error) {
 
 	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
 
+	if !d.settled(&after) {
+		return digest, nil
+	}
+
 	d.mu.Lock()
 	if d.seen == nil {
 		d.seen = map[fileIdentity]string{}
@@ -265,6 +280,23 @@ func (d *fileDigests) ofOpen(f *os.File, path string) (string, error) {
 	d.mu.Unlock()
 
 	return digest, nil
+}
+
+// settledAfter is how long a file must go unchanged before its digest is
+// remembered: far more than any filesystem's timestamp tick.
+const settledAfter = 2 * time.Second
+
+// settled reports whether a file's last change is old enough that a later change
+// is certain to carry a later time.
+func (d *fileDigests) settled(st *unix.Stat_t) bool {
+	now := time.Now
+	if d.now != nil {
+		now = d.now
+	}
+
+	changed := time.Unix(0, max(unix.TimespecToNsec(st.Mtim), unix.TimespecToNsec(st.Ctim)))
+
+	return now().Sub(changed) > settledAfter
 }
 
 // readCompatibility reads the record published beside a snapshot, through the
