@@ -39,6 +39,8 @@ Which waiting tier takes that room is `server.admission_order`. Under `fair`, th
           NO ADMISSION PROGRESS PUBLISHED for 18m2s (last 2026-09-23T15:58:38Z): other tiers may buy ahead of it until it progresses
 ```
 
+**Taking turns is fair between tiers, not between jobs.** On a full fleet each waiting tier buys one lease a turn, and GitHub hands a tier's new runner to that tier's own queue, roughly in order. So a job waits behind its own tier's backlog: on 2026-10-16 a 2 vCPU tier with 20 to 33 jobs queued at GitHub waited up to 52 minutes while a 16 vCPU tier with one or two queued started in three ([Queue wait on a shared node](../reference/records/queue-wait-2026-10-16.md)). That is a fleet without room, not an order holding small work behind large: `billet jobs wait` splits each tier's wait into GitHub's part, the wait for room and the launch, and a long wait for room with a short launch is this. What moves it is room (a target's share, so one target's burst cannot take another's, `server.admission_order: fill`, or more capacity), not the order alone.
+
 That line is an observation, not the queue's decision: a stalled listener cannot publish that it has stalled, so `billet status` compares the last progress it did publish with its own clock. The listener publishes once a poll, so the queue can have seen a launch start or finish that the report has not yet shown. Under `fill` anything that fits starts instead, and the largest shape may wait indefinitely.
 
 ## `billet leases`
