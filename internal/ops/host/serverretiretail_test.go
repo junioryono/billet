@@ -680,3 +680,26 @@ func TestThePendingListAsksForTheWholeError(t *testing.T) {
 		t.Fatalf("an outage joined with a cleanup failure was pending: %q", why)
 	}
 }
+
+// A REFUSAL AFTER THIS HOST MIGRATED THE LEDGER IS NOT A ROW TO HAND AWAY. An
+// open that migrates before its watermark refuses it leaves the ledger on a
+// schema newer than the release the watermark names, which is the survivor's:
+// handed the row as pending, the survivor would be refused by the schema this
+// host moved, and nobody could finish it. The move rides beside the refusal as
+// its own leaf, so the refusal is not the whole error.
+func TestARefusalAfterThisHostMigratedIsNotPending(t *testing.T) {
+	refused := fmt.Errorf("open the ledger: %w", state.ErrReleaseBehind)
+	if why := retirePendingReason(refused); why == "" {
+		t.Fatal("a release refusal alone was not pending")
+	}
+
+	moved := errors.Join(refused, &state.SchemaMoved{From: 59, To: 60})
+	if why := retirePendingReason(moved); why != "" {
+		t.Fatalf("a release refusal after this host migrated the ledger was pending: %q", why)
+	}
+
+	r := retireLedgerProblem(t.Context(), t.Context(), moved, "open the ledger", &retireTailAnswer{})
+	if r == nil || !strings.Contains(r.Why, "from schema 59 to schema 60") {
+		t.Fatalf("the refusal does not say what this host moved: %+v", r)
+	}
+}

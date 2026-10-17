@@ -451,7 +451,10 @@ func retireLocatorDSN(env cli.Env, loc retirement.JournalLocator) (state.DSN, st
 // could-not-tell and refuses, because those say something about the ledger
 // rather than about this host's distance from it. It is asked of EVERY error
 // the tail's ledger work produces, not only of the open's, because an outage
-// that begins after the connection is established is the same outage.
+// that begins after the connection is established is the same outage. And a
+// refusal this host met after migrating the ledger carries a state.SchemaMoved
+// beside it, so it is not pending either: the survivor's release is the one
+// the watermark names, and the schema this host moved would refuse it too.
 func retirePendingReason(err error) string {
 	// EVERY QUESTION BELOW IS ASKED OF THE WHOLE ERROR, and each the same way:
 	// an open that refuses joins its answer with its own cleanup, so a tree
