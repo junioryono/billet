@@ -61,6 +61,8 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 
 	var started, firstBudget, spent, bound, scan, resumed token.Pos
 
+	var budgeted []token.Pos
+
 	ast.Inspect(open.Body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.AssignStmt:
@@ -114,6 +116,12 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 				}
 			}
 		case *ast.CallExpr:
+			for _, arg := range node.Args {
+				if exprName(arg) == "startupCtx" {
+					budgeted = append(budgeted, node.Pos())
+				}
+			}
+
 			sel, ok := node.Fun.(*ast.SelectorExpr)
 			if !ok || sel.Sel.Name != "integrityCheck" || len(node.Args) == 0 {
 				return true
@@ -145,6 +153,29 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 			t.Errorf("%s is missing or out of order in openDir; the open takes started, derives the "+
 				"startup budget, measures spent, bounds and runs the scan, then resumes the budget", step.what)
 		}
+	}
+
+	// What ran under the first budget must be measured into spent, and what runs
+	// after the scan under the resumed one: a step between the two would be
+	// either counted twice or not at all.
+	var before, after int
+
+	for _, at := range budgeted {
+		switch {
+		case spent.IsValid() && at < spent:
+			before++
+		case resumed.IsValid() && at > resumed:
+			after++
+		default:
+			t.Errorf("a step at %s runs under startupCtx between spent and the resumed budget",
+				fset.Position(at))
+		}
+	}
+
+	if before == 0 || after == 0 {
+		t.Errorf("openDir runs %d steps under the startup budget before the scan and %d after it; "+
+			"the ping and the preparation precede spent and the schema's checks follow the resume",
+			before, after)
 	}
 
 	check := funcDecl(t, fset, "sqlitebackend.go", "integrityCheck")
