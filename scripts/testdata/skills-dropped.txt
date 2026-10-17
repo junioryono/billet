@@ -95,3 +95,4 @@ d1410b1ea27d The wire's newest version moved to 26 (VersionJobCounters); the sen
 c1296f9f64d5 Migrations 58 (job_counters) and 59 (job_destinations) were added; the sentence now counts 59 of each and is otherwise unchanged.
 7213c487ff95 The listener's renewal tests moved into a synctest bubble (#356 Phase 7) and the six seams this sentence named were deleted; conventions-and-concurrency.md states the bubble rule.
 baa6f9daf23c In a synctest bubble a pass's budget is on the fake clock and cannot run out while the pass works, so the TTL no longer has to be long for that reason.
+697517353b3a #149 made check-module-sources.sh expect the tree's own ref (scripts/release-ref.sh), so a release branch is held at its tag; the sentence now says both.

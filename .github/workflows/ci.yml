@@ -3,9 +3,17 @@ name: CI
 # billet's own CI runs on GitHub-hosted runners for now. Dogfooding it on billet
 # is a goal, but a runner platform that can only be built by an already-working
 # copy of itself is a bootstrap trap — the hosted path stays supported forever.
+#
+# A RELEASE BRANCH'S TIP GETS A RUN OF ITS OWN. A carry's pull request is tested
+# as its merge ref, and the commit the merge leaves on release/vX.Y is a different
+# one; Cut Release cuts from that commit and its report shows CI on exactly it
+# (#145). The cut's own `Release vX.Y.Z` commit is pushed with GITHUB_TOKEN, which
+# starts no workflow, so it adds no run. A push reads the pushed branch's own copy
+# of this file, so a release branch cut before this trigger gets it only once it
+# is carried there.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 
 permissions:
@@ -85,7 +93,13 @@ jobs:
       BILLET_TEST_POSTGRES_ELSEWHERE: test-postgres
 
     steps:
+      # THE WHOLE HISTORY AND ITS TAGS, because the actions suite asks
+      # scripts/release-ref.sh which release this tree is, and on a release
+      # branch the answer is a tag a one-commit clone does not have. The resolver
+      # refuses a shallow clone rather than reading it as main. 25 MiB packed.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
@@ -509,7 +523,10 @@ jobs:
     runs-on: billet-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
+      # The whole history, for `make module-sources`: see the test job.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v6
         with:
