@@ -442,18 +442,28 @@ func openDir(
 	// make scheduling decisions against it; a command is neither, and an
 	// inspection is not even that.
 	//
-	// THE SCAN HAS A BOUND OF ITS OWN (the backend's), because a cold read of a
-	// large ledger outlasts the startup budget on a healthy disk, and the startup
-	// budget is PAUSED for it rather than restarted: what the scan took is not
-	// charged to the rest of startup, and what came before it still is, so the
-	// whole open stays inside the scan's bound plus one startup budget. A backend
-	// that does not scan resumes with exactly what it had.
+	// THE SCAN HAS A BOUND OF ITS OWN, integrityScanBudget, because a cold read
+	// of a large ledger outlasts the startup budget on a healthy disk, and the
+	// startup budget is PAUSED for it rather than restarted: what the scan took
+	// is not charged to the rest of startup, and what came before it still is,
+	// so the whole open stays inside the scan's bound plus one startup budget. A
+	// backend that does not scan resumes with exactly what it had.
 	if !admin && !mode.inspect {
 		noteOpenSideEffect("integrity")
 
 		spent := time.Since(started)
 
-		if err := db.backend.integrityCheck(ctx, db.w); err != nil {
+		scanCtx, cancelScan := context.WithTimeout(ctx, integrityScanBudget)
+		err := db.backend.integrityCheck(scanCtx, db.w)
+		// NAMED ONLY WHEN IT WAS THE SCAN'S OWN BOUND that ended it, not the
+		// caller's deadline or cancellation.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = fmt.Errorf("the whole-file read did not finish within its %s bound: %w",
+				integrityScanBudget, err)
+		}
+		cancelScan()
+
+		if err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
 

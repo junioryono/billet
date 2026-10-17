@@ -745,7 +745,9 @@ const lifecycleDeadlineMargin = 30 * time.Second
 // margin, and for the server the start extension it asks for before opening
 // the ledger (NotifyExtendStart), which systemd grants on top of the time the
 // start had already taken, up to the unit's whole bound. Giving up sooner
-// would call a slow, healthy start a failed one while systemd still waits.
+// would call a slow, healthy start a failed one while systemd still waits. A
+// server that asks for no extension (a PostgreSQL ledger) is ended by systemd at
+// the unit's own bound, so the longer wait never outlives it.
 func unitStartDeadline(unit string) time.Duration {
 	deadline := deploy.UnitStartTimeout + lifecycleDeadlineMargin
 

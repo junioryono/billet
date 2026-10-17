@@ -201,19 +201,15 @@ func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) e
 	return errors.Join(errs...)
 }
 
-// integrityScanBudget bounds one quick_check, which reads the whole file.
+// integrityScanBudget bounds the integrity scan an open runs, which reads the
+// whole file.
 //
-// ITS OWN BOUND, NOT THE STARTUP ONE, and sized for a COLD read. On 2026-10-17
-// the reference controller's 740 MB ledger took 55 seconds to check with the
-// page cache empty and 0.5 seconds warm, and a host upgrade always checks it
-// cold: the services are stopped and the snapshot copy has just evicted the
-// cache on a 1.8 GiB machine. Under the shared 30-second startup budget the
-// candidate's probe failed, the restored release then failed to start twice the
-// same way, and the controller was left cordoned. The bound and the startup
-// budget together stay under the server unit's TimeoutStartSec, with room to
-// start the process and report ready, because systemd kills a start that
-// outlasts it whatever billet allows
-// (TestTheIntegrityScanFitsTheServerUnitsStartBound).
+// ITS OWN BOUND, NOT THE STARTUP ONE, and sized for a COLD read, which is what
+// a host upgrade always gets (the services stopped and the snapshot copy just
+// read): the reference controller's 740 MB ledger took 55 seconds to check
+// cold and 0.5 seconds warm (2026-10-17, 2 vCPU, 1.8 GiB RAM, gp3). With the
+// startup budget it stays under the server unit's TimeoutStartSec even when
+// systemd grants no extension (TestTheIntegrityScanFitsTheServerUnitsStartBound).
 const integrityScanBudget = 80 * time.Second
 
 // StartupBound is the longest an open that scans may take: the scan's own
@@ -221,19 +217,13 @@ const integrityScanBudget = 80 * time.Second
 func StartupBound() time.Duration { return integrityScanBudget + startupTimeout }
 
 // integrityCheck refuses to serve from a corrupt ledger, because scheduling
-// against corrupt capacity data is worse than not starting.
+// against corrupt capacity data is worse than not starting. Bounded by its
+// caller: an open bounds it with integrityScanBudget, and `billet check` waits
+// for it.
 func (*sqliteBackend) integrityCheck(ctx context.Context, w *sql.DB) error {
-	ctx, cancel := context.WithTimeout(ctx, integrityScanBudget)
-	defer cancel()
-
 	var result string
 	//billet:ignore rawsql // a pragma is not a query; sqlc has no catalogue entry for one
 	if err := w.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("integrity check: the whole-file read did not finish in %s, "+
-				"which a cold read of a ledger this size should: %w", integrityScanBudget, err)
-		}
-
 		return fmt.Errorf("integrity check: %w", err)
 	}
 

@@ -1,9 +1,8 @@
 package host
 
 import (
-	"os"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/state"
@@ -13,7 +12,9 @@ import (
 // asks for an extension before it opens the ledger, which systemd grants on top
 // of up to the unit's whole start bound already spent, so a caller that gave
 // up at the plain bound would call a slow, healthy start a failure; the node
-// asks for nothing and keeps the plain bound.
+// asks for nothing and keeps the plain bound. The two callers' own deadlines
+// are observed in TestUpStartsEachUnitUnderItsOwnStartBound and
+// TestTheTransactionWaitsTheServersExtendedStart.
 func TestTheServersStartDeadlineCoversItsExtension(t *testing.T) {
 	t.Parallel()
 
@@ -26,22 +27,17 @@ func TestTheServersStartDeadlineCoversItsExtension(t *testing.T) {
 		t.Errorf("billet waits %s for the node to start; its unit's bound and the margin are %s",
 			node, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
 	}
+}
 
-	// AND THE TWO PLACES THAT START THE SERVER WAIT THAT LONG: a start bounded by
-	// the plain unit bound there is the defect this guards.
-	for _, file := range []string{"localup.go", "hostupgrade.go"} {
-		body, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatal(err)
-		}
+// THE CANDIDATE PROBE OUTLASTS A COLD LEDGER OPEN. The host upgrade runs the
+// candidate's probe with the services stopped, so its ledger open reads cold
+// and may take its whole bound; a probe deadline inside that would roll back a
+// healthy candidate exactly as the shared startup budget once did.
+func TestTheCandidateProbeOutlastsAColdLedgerOpen(t *testing.T) {
+	t.Parallel()
 
-		if strings.Contains(string(body), "deploy.UnitStartTimeout+lifecycleDeadlineMargin") {
-			t.Errorf("%s bounds a start by the plain unit bound; it starts the server, so it waits "+
-				"unitStartDeadline(unit)", file)
-		}
-
-		if !strings.Contains(string(body), "unitStartDeadline(") {
-			t.Errorf("%s no longer waits a start with unitStartDeadline", file)
-		}
+	if candidateProbeDeadline < state.StartupBound()+30*time.Second {
+		t.Errorf("the candidate probe is given %s and its ledger open may take %s", candidateProbeDeadline,
+			state.StartupBound())
 	}
 }

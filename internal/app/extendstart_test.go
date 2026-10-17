@@ -15,6 +15,26 @@ import (
 	"github.com/junioryono/billet/internal/state/ledgertest"
 )
 
+// ONLY A LEDGER THAT IS SCANNED ASKS FOR TIME: PostgreSQL's open reads no whole
+// file, so its start keeps the unit's own bound and a wedged one fails at it.
+func TestOnlyAScannedLedgerAsksForTime(t *testing.T) {
+	t.Parallel()
+
+	for _, c := range []struct {
+		state *config.StateConfig
+		want  bool
+	}{
+		{nil, true},
+		{&config.StateConfig{Backend: config.StateSQLite}, true},
+		{&config.StateConfig{Backend: config.StatePostgres}, false},
+	} {
+		cfg := &config.Config{Server: &config.ServerConfig{State: c.state}}
+		if got := scansAtOpen(cfg); got != c.want {
+			t.Errorf("a ledger of %+v scans at open = %v, want %v", c.state, got, c.want)
+		}
+	}
+}
+
 // THE SERVICE MANAGER IS ASKED FOR THE OPEN'S BOUND BEFORE THE LEDGER IS OPENED.
 //
 // The identity access is released as soon as the open returns, so an

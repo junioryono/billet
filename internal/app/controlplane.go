@@ -163,12 +163,14 @@ func OpenControlPlane(
 		mode = LedgerStandby
 	}
 
-	// THE SERVICE MANAGER IS TOLD BEFORE THE OPEN THAT IT MAY BE LONG. A cold
-	// integrity scan of a large ledger outlasts the unit's start bound on a
-	// healthy disk, and a Type=notify start still opening past it is killed:
-	// on 2026-10-17 that failed a control plane's start twice. A failure to ask
-	// is said and decides nothing, because the open may well be fast.
-	if host.ExtendStart != nil {
+	// THE SERVICE MANAGER IS TOLD BEFORE A SQLITE OPEN THAT IT MAY BE LONG. The
+	// open's scan may take its whole bound on a cold cache, and the identity
+	// access before it and the authority steps after it count against the same
+	// Type=notify start bound, so the extension gives the open its bound and
+	// what follows the unit's whole start bound again. A PostgreSQL ledger is
+	// not scanned and asks for nothing. A failure to ask is said and decides
+	// nothing, because the open may well be fast.
+	if host.ExtendStart != nil && scansAtOpen(cfg) {
 		if err := host.ExtendStart(state.StartupBound()); err != nil {
 			fmt.Fprintf(host.Out, "could not ask the service manager for time to open the ledger: %v\n", err)
 		}
@@ -663,6 +665,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// scansAtOpen reports whether opening this config's ledger reads the whole
+// file first: a SQLite ledger does, and a PostgreSQL one is not scanned.
+func scansAtOpen(cfg *config.Config) bool {
+	return cfg.Server.LedgerBackend() != config.StatePostgres
 }
 
 // closeIfOpen closes a handle an open may or may not have produced.

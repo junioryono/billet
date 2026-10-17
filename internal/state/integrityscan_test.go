@@ -10,12 +10,12 @@ import (
 	"github.com/junioryono/billet/deploy"
 )
 
-// readinessMargin is what the server unit's start bound must leave beyond an
-// open's own budgets: the process starting, the identity and the listeners
-// before it reports ready.
+// readinessMargin is a floor the server unit's start bound must leave beyond
+// an open's own budgets when systemd grants no extension, for the process's
+// own start and its report of readiness. Not a measurement.
 const readinessMargin = 10 * time.Second
 
-// THE WHOLE OPEN FITS THE SERVER UNIT'S START BOUND.
+// THE WHOLE OPEN FITS THE SERVER UNIT'S START BOUND WITHOUT AN EXTENSION.
 //
 // The unit is Type=notify with TimeoutStartSec, so systemd kills a control
 // plane still opening past it whatever billet's own budgets say. The open is
@@ -32,16 +32,25 @@ func TestTheIntegrityScanFitsTheServerUnitsStartBound(t *testing.T) {
 		t.Errorf("the integrity scan's bound %s does not cover the 55s cold read the reference "+
 			"ledger measured on 2026-10-17", integrityScanBudget)
 	}
+
+	if StartupBound() != integrityScanBudget+startupTimeout {
+		t.Errorf("StartupBound is %s, want the scan's bound and the startup budget, %s",
+			StartupBound(), integrityScanBudget+startupTimeout)
+	}
 }
 
-// THE SCAN IS NOT BOUND BY THE STARTUP BUDGET, WHICH IS PAUSED FOR IT.
+// THE SCAN RUNS UNDER ITS OWN BOUND, AND THE STARTUP BUDGET IS PAUSED FOR IT.
 //
 // A cold quick_check of a large ledger cannot be produced in a unit test, so
-// the open path is asserted structurally: openDir hands the backend's scan the
-// caller's context rather than the one carrying startupTimeout, measures what
-// startup had spent before it, and resumes from the caller's context with
-// startupTimeout less that; the SQLite scan bounds the caller's context with
-// integrityScanBudget and reads through the bounded one.
+// the open path is asserted structurally. openDir:
+//   - takes started before the first startup budget is derived;
+//   - measures spent := time.Since(started) before the scan;
+//   - scans under scanCtx := context.WithTimeout(ctx, integrityScanBudget),
+//     from the caller's context and not the one carrying startupTimeout;
+//   - resumes context.WithTimeout(ctx, startupTimeout - spent) after it.
+//
+// And the SQLite scan reads through the context it is handed, so the open's
+// bound reaches the read and `billet check`'s unbounded context does too.
 func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 	fset := token.NewFileSet()
 
@@ -50,100 +59,97 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 		t.Fatal("state.go no longer declares openDir, the open path this test reads")
 	}
 
-	var scan, resumed token.Pos
+	var started, firstBudget, spent, bound, scan, resumed token.Pos
 
 	ast.Inspect(open.Body, func(n ast.Node) bool {
 		switch node := n.(type) {
+		case *ast.AssignStmt:
+			if len(node.Rhs) != 1 {
+				return true
+			}
+
+			call, ok := node.Rhs[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			lhs := exprName(node.Lhs[0])
+
+			switch {
+			case lhs == "started" && exprName(call.Fun) == "time.Now":
+				started = node.Pos()
+			case lhs == "spent" && exprName(call.Fun) == "time.Since" && len(call.Args) == 1 &&
+				exprName(call.Args[0]) == "started":
+				spent = node.Pos()
+			case lhs == "scanCtx" && exprName(call.Fun) == "context.WithTimeout" && len(call.Args) == 2:
+				if exprName(call.Args[0]) != "ctx" || exprName(call.Args[1]) != "integrityScanBudget" {
+					t.Error("the scan's context is not context.WithTimeout(ctx, integrityScanBudget)")
+				}
+
+				bound = node.Pos()
+			case lhs == "startupCtx" && exprName(call.Fun) == "context.WithTimeout" && len(call.Args) == 2:
+				if !firstBudget.IsValid() {
+					firstBudget = node.Pos()
+
+					return true
+				}
+
+				if resumed.IsValid() {
+					return true
+				}
+
+				resumed = node.Pos()
+
+				if exprName(call.Args[0]) != "ctx" {
+					t.Errorf("the startup budget after the scan derives from %s; deriving from the "+
+						"first startup context resumes one that may already have expired",
+						exprName(call.Args[0]))
+				}
+
+				left, ok := call.Args[1].(*ast.BinaryExpr)
+				if !ok || left.Op != token.SUB || exprName(left.X) != "startupTimeout" ||
+					exprName(left.Y) != "spent" {
+					t.Error("the startup budget after the scan is not startupTimeout - spent; " +
+						"restarting it whole lets an open outlast the unit's start bound")
+				}
+			}
 		case *ast.CallExpr:
 			sel, ok := node.Fun.(*ast.SelectorExpr)
 			if !ok || sel.Sel.Name != "integrityCheck" || len(node.Args) == 0 {
 				return true
 			}
 
-			if exprName(node.Args[0]) != "ctx" {
-				t.Errorf("openDir scans under %s at %s; the scan must run under the caller's ctx, "+
-					"outside the startup budget", exprName(node.Args[0]), fset.Position(node.Pos()))
+			if exprName(node.Args[0]) != "scanCtx" {
+				t.Errorf("openDir scans under %s at %s; the scan runs under scanCtx, its own bound",
+					exprName(node.Args[0]), fset.Position(node.Pos()))
 			}
 
 			scan = node.Pos()
-		case *ast.AssignStmt:
-			if !scan.IsValid() || node.Pos() < scan || resumed.IsValid() ||
-				len(node.Lhs) != 2 || exprName(node.Lhs[0]) != "startupCtx" || len(node.Rhs) != 1 {
-				return true
-			}
-
-			resumed = node.Pos()
-
-			call, ok := node.Rhs[0].(*ast.CallExpr)
-			if !ok || exprName(call.Fun) != "context.WithTimeout" || len(call.Args) != 2 {
-				t.Errorf("the startup budget after the scan at %s is not context.WithTimeout",
-					fset.Position(node.Pos()))
-
-				return true
-			}
-
-			if exprName(call.Args[0]) != "ctx" {
-				t.Errorf("the startup budget after the scan derives from %s; deriving from the "+
-					"first startup context resumes one that may already have expired",
-					exprName(call.Args[0]))
-			}
-
-			left, ok := call.Args[1].(*ast.BinaryExpr)
-			if !ok || left.Op != token.SUB || exprName(left.X) != "startupTimeout" ||
-				exprName(left.Y) != "spent" {
-				t.Errorf("the startup budget after the scan is not startupTimeout - spent; " +
-					"restarting it whole lets an open outlast the unit's start bound")
-			}
 		}
 
 		return true
 	})
 
-	// AND spent IS WHAT STARTUP TOOK BEFORE THE SCAN: measured from started,
-	// before the scan, so the scan is charged to neither budget twice.
-	var measured token.Pos
-
-	ast.Inspect(open.Body, func(n ast.Node) bool {
-		node, ok := n.(*ast.AssignStmt)
-		if !ok || len(node.Lhs) != 1 || exprName(node.Lhs[0]) != "spent" || len(node.Rhs) != 1 {
-			return true
+	for _, step := range []struct {
+		what   string
+		at     token.Pos
+		before token.Pos
+	}{
+		{"started := time.Now()", started, firstBudget},
+		{"the first startup budget", firstBudget, spent},
+		{"spent := time.Since(started)", spent, scan},
+		{"the scan's bound", bound, scan},
+		{"the scan", scan, resumed},
+	} {
+		if !step.at.IsValid() || !step.before.IsValid() || step.at > step.before {
+			t.Errorf("%s is missing or out of order in openDir; the open takes started, derives the "+
+				"startup budget, measures spent, bounds and runs the scan, then resumes the budget", step.what)
 		}
-
-		call, ok := node.Rhs[0].(*ast.CallExpr)
-		if ok && exprName(call.Fun) == "time.Since" && len(call.Args) == 1 && exprName(call.Args[0]) == "started" {
-			measured = node.Pos()
-		}
-
-		return true
-	})
-
-	if !measured.IsValid() || measured > scan {
-		t.Error("spent is not time.Since(started) measured before the scan, so the resumed budget " +
-			"either restores time the open already spent or charges it the scan")
-	}
-
-	if !scan.IsValid() {
-		t.Fatal("openDir no longer runs the integrity scan")
-	}
-
-	if !resumed.IsValid() {
-		t.Error("openDir does not resume the startup budget after the scan")
 	}
 
 	check := funcDecl(t, fset, "sqlitebackend.go", "integrityCheck")
 	if check == nil {
 		t.Fatal("sqlitebackend.go no longer declares integrityCheck")
-	}
-
-	first, ok := check.Body.List[0].(*ast.AssignStmt)
-	if !ok || len(first.Lhs) != 2 || exprName(first.Lhs[0]) != "ctx" || len(first.Rhs) != 1 {
-		t.Fatal("the SQLite scan's first statement does not rebind ctx to a bounded context")
-	}
-
-	call, ok := first.Rhs[0].(*ast.CallExpr)
-	if !ok || exprName(call.Fun) != "context.WithTimeout" || len(call.Args) != 2 ||
-		exprName(call.Args[0]) != "ctx" || exprName(call.Args[1]) != "integrityScanBudget" {
-		t.Error("the SQLite scan's first statement is not ctx, cancel := context.WithTimeout(ctx, integrityScanBudget)")
 	}
 
 	reads := false
@@ -159,7 +165,7 @@ func TestTheIntegrityScanRunsOutsideTheStartupBudget(t *testing.T) {
 	})
 
 	if !reads {
-		t.Error("the SQLite scan does not read through its bounded ctx")
+		t.Error("the SQLite scan does not read through the context it is handed")
 	}
 }
 
