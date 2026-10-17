@@ -31,12 +31,14 @@ module=$repo_root/terraform/modules/billet
 # provider (an attribute it renamed is one of the things this check exists to
 # catch), so none is committed with a lock, and with no lock terraform neither
 # takes a provider from a plugin cache nor trusts one: it downloads and
-# authenticates it, 194 MB a root (measured with 1.14.0 and 1.14.1). So the
+# authenticates it, 194 MB a root (measured with 1.14.0, 1.14.1 and 1.15.9). So the
 # first root does that, and its lock, which records what was authenticated,
 # goes into each later root before its init: those take the cached copy, which
 # terraform checks against the lock and downloads again if it does not match.
 # Never TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE, which would take whatever
-# the cache held, and a pull request can write its own cache entries.
+# the cache held, and a pull request can write its own cache entries: unset
+# here, so a developer's shell cannot bring it back.
+unset TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE
 lock=$work/first-root.terraform.lock.hcl
 
 check_shape() {

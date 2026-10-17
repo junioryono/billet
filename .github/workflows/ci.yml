@@ -1057,10 +1057,11 @@ jobs:
       # reached and was cancelled at the limit, the module's validate taking up to
       # five minutes against 55 s on a quiet line. The cache is shared by the
       # job's inits and carried between runs by the Actions cache, which a billet
-      # runner serves from its own node: main and the release branches save it,
-      # and a pull request restores its base branch's. Terraform takes a cached
-      # provider only when the lock file holds this platform's h1 checksum, and
-      # checks it against that (measured with 1.14.0 and 1.14.1), which is why
+      # runner serves from its own node: main saves it, a release branch whose
+      # locks differ from main's saves its own, and a pull request restores its
+      # base's or main's. Terraform takes a cached provider only when the lock
+      # file holds this platform's h1 checksum, and checks it against that
+      # (measured with 1.14.0, 1.14.1 and 1.15.9), which is why
       # each lock records all four platforms and a test in scripts/ says so; the
       # hybrid roots have no lock, so the first of them downloads and
       # authenticates the newest aws provider in every leg, and

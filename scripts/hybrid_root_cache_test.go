@@ -10,12 +10,13 @@ import (
 
 // THE FIRST HYBRID ROOT'S LOCK IS EVERY LATER ROOT'S: the roots have no
 // committed lock, and with no lock terraform neither takes a provider from the
-// plugin cache nor trusts one (measured with 1.14.0 and 1.14.1), so without
-// the hand-over each of the four roots downloaded the 194 MB aws provider. The
-// first root's init runs with no lock, which authenticates what it downloads;
-// each later root is given the lock it wrote; and nothing ever sets
-// TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE, which would take whatever the
-// cache held. Executed with a terraform and a billet that record each init.
+// plugin cache nor trusts one (measured with 1.14.0, 1.14.1 and 1.15.9), so
+// without the hand-over each of the four roots downloaded the 194 MB aws
+// provider. The first root's init runs with no lock, which authenticates what
+// it downloads; each later root is given the lock it wrote; and no init runs
+// with TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE, which would take whatever
+// the cache held, even when it is inherited. Executed with a terraform and a
+// billet that record each init.
 func TestTheFirstHybridRootsLockIsEveryLaterRoots(t *testing.T) {
 	t.Parallel()
 
@@ -65,7 +66,9 @@ exit 0
 		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"BILLET_HYBRID_CHECK_BINARY="+filepath.Join(bin, "billet"),
 		"HYBRID_TEST_CALLS="+calls,
-		"TF_PLUGIN_CACHE_DIR="+t.TempDir())
+		"TF_PLUGIN_CACHE_DIR="+t.TempDir(),
+		// INHERITED, as from a developer's shell: the script must drop it.
+		"TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE=true")
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("hybrid-root-check.sh: %v\n%s", err, out)
