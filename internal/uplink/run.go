@@ -242,12 +242,14 @@ func gatewayLabel(gateway string) string {
 // the shaping. THE ADDRESS IS READ AT EACH WRITE, not once at the start, so a
 // MAC set while the shaper runs is the one the next boot compares; but only
 // while the name still has the run's index, so a device that took the name, or
-// none, never puts its address, or nothing, beside this device's rates.
+// none, never puts its address, or nothing, beside this device's rates; a run
+// that could not read its index at the start keeps the address it started
+// with, having nothing to tell its own device by.
 func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit float64) {
 	told, addr := false, at.addr
 
 	return func(upMbit, downMbit float64) {
-		if now := ifaddr(at.iface); now != "" && (at.index == "" || ifindex(at.iface) == at.index) {
+		if now := ifaddr(at.iface); now != "" && at.index != "" && ifindex(at.iface) == at.index {
 			addr = now
 		}
 

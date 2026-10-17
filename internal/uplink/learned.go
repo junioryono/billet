@@ -176,6 +176,9 @@ func (l learned) resumes(at nic, now time.Time) (bool, string) {
 			l.Index, at.iface, at.index)
 	case (l.Index == "" || at.index == "") && l.Iface != at.iface:
 		return false, fmt.Sprintf("they were learned on %s, not %s", l.Iface, at.iface)
+	case (l.Index == "" || at.index == "") && l.Addr != "" && at.addr != "" && l.Addr != at.addr:
+		return false, fmt.Sprintf("they were learned on the device with address %s, not %s's %s",
+			l.Addr, at.iface, at.addr)
 	case l.At.IsZero() || l.At.After(now):
 		return false, "they carry no time this clock has reached"
 	}

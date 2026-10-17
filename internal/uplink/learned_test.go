@@ -80,6 +80,8 @@ func TestLearnedRatesResumeOnlyOnTheirInterface(t *testing.T) {
 		"no boot read now, renumbered":    {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "3", mac, ""}, false},
 		"no boot read now, renamed":       {l("eth0", "2", mac, "a"), nic{"eno2np1", "2", mac, ""}, false},
 		"no boot either side, the same":   {l("eno2np1", "2", mac, ""), nic{"eno2np1", "2", mac, ""}, true},
+		"no index, another device":        {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", other, "a"}, false},
+		"no index, the same device":       {l("eno2np1", "", mac, "a"), nic{"eno2np1", "", mac, "a"}, true},
 	} {
 		if ok, why := c.l.resumes(c.at, now); ok != c.want || (!ok && why == "") {
 			t.Errorf("%s: resumes %v (%q), want %v with a reason when not", name, ok, why, c.want)
@@ -112,20 +114,20 @@ func fakeRuntimeDir(t *testing.T) {
 	sysNet = t.TempDir()
 	t.Cleanup(func() { StateFile, LearnedFile, sysNet = oldState, oldLearned, oldNet })
 
-	setAddress(t, "eno2np1", testMAC)
+	setAddress(t, testMAC)
 }
 
 // testMAC is eno2np1's hardware address in the fake sysfs.
 const testMAC = "7c:c2:55:e2:9d:6d"
 
-// setAddress gives iface the hardware address addr in the fake sysfs.
-func setAddress(t *testing.T, iface, addr string) {
+// setAddress gives eno2np1 the hardware address addr in the fake sysfs.
+func setAddress(t *testing.T, addr string) {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Join(sysNet, iface), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(sysNet, "eno2np1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sysNet, iface, "address"), []byte(addr+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(sysNet, "eno2np1", "address"), []byte(addr+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -668,61 +670,69 @@ func TestTheAddressRecordedIsTheOneAtTheWrite(t *testing.T) {
 
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
 	remember := rememberer(slog.New(&records{}), ctl, nic{"eno2np1", "2", testMAC, "boot-a"})
-	recorded := func() string {
+
+	// EACH WRITE IS A WRITE, its rates new, and its address as the case says.
+	rate := 100.0
+	write := func(t *testing.T, want, why string) {
 		t.Helper()
 
-		l, found, err := readLearned()
-		if err != nil || !found {
-			t.Fatalf("no record read (%v, %v)", found, err)
-		}
+		rate++
+		remember(rate, rate)
 
-		return l.Addr
+		l, found, err := readLearned()
+		if err != nil || !found || l.Up.Rate != rate {
+			t.Fatalf("%s: the write did not land (%+v, %v, %v)", why, l, found, err)
+		}
+		if l.Addr != want {
+			t.Errorf("%s: recorded the address %q, want %q", why, l.Addr, want)
+		}
 	}
 
 	// EACH WRITE READS IT AGAIN, while the name still has the run's index.
-	setIndex(t, "eno2np1", "2")
+	setIndex(t, "2")
 	for _, mac := range []string{"02:00:00:aa:bb:cc", "02:00:00:dd:ee:ff"} {
-		setAddress(t, "eno2np1", mac)
-		remember(120, 80)
-		if got := recorded(); got != mac {
-			t.Errorf("recorded the address %q, want the %q eno2np1 has at this write", got, mac)
-		}
+		setAddress(t, mac)
+		write(t, mac, "the address at this write")
 	}
 
-	// ANOTHER DEVICE UNDER THE NAME, by its index, or the name gone: the last
-	// address this device had stays beside its rates.
-	setIndex(t, "eno2np1", "7")
-	setAddress(t, "eno2np1", "02:00:00:11:22:33")
-	remember(120, 80)
-	if got := recorded(); got != "02:00:00:dd:ee:ff" {
-		t.Errorf("recorded %q beside this device's rates, the address of the device that took its name", got)
-	}
+	// ANOTHER DEVICE UNDER THE NAME, by its index: the last address this device
+	// had stays beside its rates.
+	setIndex(t, "7")
+	setAddress(t, "02:00:00:11:22:33")
+	write(t, "02:00:00:dd:ee:ff", "another device under the name")
 
-	if err := os.RemoveAll(filepath.Join(sysNet, "eno2np1")); err != nil {
+	// THE INDEX UNREADABLE, the address readable: nothing says it is this device.
+	if err := os.Remove(filepath.Join(sysNet, "eno2np1", "ifindex")); err != nil {
 		t.Fatal(err)
 	}
-	remember(120, 80)
-	if got := recorded(); got != "02:00:00:dd:ee:ff" {
-		t.Errorf("recorded %q once the interface was gone, want the last address it had", got)
-	}
+	write(t, "02:00:00:dd:ee:ff", "an index that cannot be read")
 
-	// AND ITS ADDRESS UNREADABLE UNDER THE RUN'S OWN INDEX: nothing is not an
-	// address, and the last one stays.
-	setIndex(t, "eno2np1", "2")
-	remember(120, 80)
-	if got := recorded(); got != "02:00:00:dd:ee:ff" {
-		t.Errorf("recorded %q when its address could not be read, want the last address it had", got)
+	// THE ADDRESS UNREADABLE UNDER THE RUN'S OWN INDEX: nothing is not an
+	// address.
+	if err := os.Remove(filepath.Join(sysNet, "eno2np1", "address")); err != nil {
+		t.Fatal(err)
+	}
+	setIndex(t, "2")
+	write(t, "02:00:00:dd:ee:ff", "an address that cannot be read")
+
+	// A RUN THAT COULD NOT READ ITS INDEX AT THE START has nothing to tell its
+	// own device by, and keeps the address it started with.
+	blind := rememberer(slog.New(&records{}), ctl, nic{"eno2np1", "", testMAC, "boot-a"})
+	setAddress(t, "02:00:00:44:55:66")
+	blind(150, 150)
+	if l, found, err := readLearned(); err != nil || !found || l.Up.Rate != 150 || l.Addr != testMAC {
+		t.Errorf("a run with no index recorded %+v (%v, %v), want its starting address %q", l, found, err, testMAC)
 	}
 }
 
-// setIndex gives iface the kernel index index in the fake sysfs.
-func setIndex(t *testing.T, iface, index string) {
+// setIndex gives eno2np1 the kernel index index in the fake sysfs.
+func setIndex(t *testing.T, index string) {
 	t.Helper()
 
-	if err := os.MkdirAll(filepath.Join(sysNet, iface), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(sysNet, "eno2np1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sysNet, iface, "ifindex"), []byte(index+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(sysNet, "eno2np1", "ifindex"), []byte(index+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
