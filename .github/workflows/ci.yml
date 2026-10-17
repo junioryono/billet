@@ -1057,11 +1057,14 @@ jobs:
       # reached and was cancelled at the limit, the module's validate taking up to
       # five minutes against 55 s on a quiet line. The cache is shared by the
       # job's inits and carried between runs by the Actions cache, which a billet
-      # runner serves from its own site: main saves it and a pull request restores
-      # main's. Terraform takes a cached provider only when the lock file holds
-      # this platform's h1 checksum (measured with 1.14.1), which is why each lock
-      # records all four platforms; the hybrid roots have no lock, and
-      # scripts/hybrid-root-check.sh says how they use it.
+      # runner serves from its own node: main and the release branches save it,
+      # and a pull request restores its base branch's. Terraform takes a cached
+      # provider only when the lock file holds this platform's h1 checksum, and
+      # checks it against that (measured with 1.14.0 and 1.14.1), which is why
+      # each lock records all four platforms and a test in scripts/ says so; the
+      # hybrid roots have no lock, so the first of them downloads and
+      # authenticates the newest aws provider in every leg, and
+      # scripts/hybrid-root-check.sh hands its lock to the other three.
       - name: Share one provider cache across the job's inits
         run: |
           mkdir -p "$RUNNER_TEMP/terraform-plugins"
@@ -1106,12 +1109,15 @@ jobs:
       - name: Prove the generated hybrid root validates against the module
         run: make hybrid-root-check
 
-      # ONLY MAIN SAVES, and only a job that passed: a pull request restores what
-      # main saved, so it never writes a cache entry of its own for every push.
-      # The legs share the key, so the first to finish saves and the others are
-      # told it exists, which the action reports as a warning, not a failure.
+      # ONLY A PUSH TO MAIN OR A RELEASE BRANCH SAVES, and only a job that passed:
+      # a pull request restores what its base branch saved, so it never writes an
+      # entry of its own for every push. The legs share the key, so the first to
+      # finish saves and the others are told it exists, which the action reports
+      # as a warning, not a failure.
       - name: Save the provider cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.providers.outputs.cache-hit != 'true'
+        if: >-
+          github.event_name == 'push' && steps.providers.outputs.cache-hit != 'true' &&
+          (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/terraform-plugins

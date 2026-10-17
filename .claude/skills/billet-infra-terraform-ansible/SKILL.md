@@ -16,7 +16,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 ### Terraform: [references/terraform.md](references/terraform.md)
 
 - **The terraform gates are outside `make check` and CI runs them on every PR that touches more than documentation.** Run `make tf-fmt-check tf-validate tf-test tf-lint tf-scan` before pushing a `.tf` change.
-- **Every lock file records all four platforms' h1 checksum, so CI's one provider cache is ever used.**
+- **Every lock file records all four platforms' h1 checksum, or CI's provider cache is never used.**
 - **The root `billet init hybrid` writes is validated by terraform, not by Go.**
 - **`tfclass` says what a change costs a running deployment; `terraform plan` cannot.**
 - **`tfpolicy` keeps the module's IAM equal to the generator's.**
