@@ -2103,8 +2103,10 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 // DECIDED HERE, BY THE ONE FUNCTION, from the binding the ledger holds and
 // GitHub's record read fresh, and narrowed to the tier's namespace. A lease with
 // no binding yet (JobStarted not processed) or evidence that cannot be read
-// answers the unproven authority, which writes nothing: the node splices to
-// GitHub and asks again on the next call. Only a lease this node holds now is
+// answers the unproven authority, which writes nothing. THE UNBOUND ANSWER NAMES
+// NO JOB, and nodes rely on it: a node waits for a lease whose answer names none
+// to be bound before splicing its first call to GitHub, and splices at once for
+// a job the plane names and cannot prove. Only a lease this node holds now is
 // answered.
 func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 	leaseID := r.PathValue("lease")

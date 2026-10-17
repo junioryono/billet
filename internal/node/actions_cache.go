@@ -486,8 +486,7 @@ func (s *CacheService) actionsKeysFor(
 
 // sessionActionsAuthority is the proven authority of a default-branch
 // session's job, asked of the control plane once and kept once proven. An
-// unproven answer is not kept: the job may not have been bound yet, and the
-// next call asks again.
+// unproven answer is not kept, and a later call asks again.
 func (s *CacheService) sessionActionsAuthority(
 	ctx context.Context, session *cacheSession,
 ) (dispatch.CacheAuthority, bool) {
@@ -499,9 +498,16 @@ func (s *CacheService) sessionActionsAuthority(
 	if s.authority == nil || session.leaseID == "" || s.now().Before(session.unprovenUntil) {
 		return dispatch.CacheAuthority{}, false
 	}
-	askCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
-	defer cancel()
-	authority, err := s.authority.CacheAuthority(askCtx, session.leaseID)
+	authority, err := s.askActionsAuthority(ctx, session)
+	// A JOB THE PLANE HAS NOT BOUND YET IS WAITED FOR, once per session. The
+	// binding comes from GitHub's JobStarted message, which reached the plane a
+	// median of 18 s and at most 51 s after GitHub started the job (44 jobs of
+	// one run, 2026-10-17), and setup-go restores about 20 s in. A call answered
+	// unproven then is spliced, and a restore is one call: its whole archive comes
+	// from GitHub over the site's line instead of from the site's store.
+	if err == nil && !session.bindingWaited && unboundAuthority(authority, session.leaseID) {
+		authority, err = s.awaitBinding(ctx, session, authority)
+	}
 	if err != nil {
 		s.log.Warn("could not ask what this job may do with the Actions cache; it goes to GitHub",
 			"instance", session.instance, "error", err)
@@ -523,9 +529,82 @@ func (s *CacheService) sessionActionsAuthority(
 	return authority, true
 }
 
-// actionsUnprovenFor is how long an unproven authority stands before a job's
-// next cache call asks again.
-const actionsUnprovenFor = 30 * time.Second
+// askActionsAuthority asks the control plane once.
+func (s *CacheService) askActionsAuthority(
+	ctx context.Context, session *cacheSession,
+) (dispatch.CacheAuthority, error) {
+	askCtx, cancel := context.WithTimeout(ctx, actionsPolicyLimit)
+	defer cancel()
+
+	return s.authority.CacheAuthority(askCtx, session.leaseID)
+}
+
+// unboundAuthority is an answer about this lease that names no job: the plane
+// holds the lease and has not yet learned which job its runner took. A job the
+// plane knows and cannot prove (a fork's pull request) is answered with its job.
+func unboundAuthority(authority dispatch.CacheAuthority, leaseID string) bool {
+	return !authority.Proven && authority.LeaseID == leaseID && authority.JobID == ""
+}
+
+// awaitBinding asks again every actionsBindingPoll until the plane names the
+// job, for at most actionsBindingWait, and returns the last answer. A caller
+// that gives up first is answered with its error and leaves the session to
+// wait again on its next call.
+func (s *CacheService) awaitBinding(
+	ctx context.Context, session *cacheSession, authority dispatch.CacheAuthority,
+) (dispatch.CacheAuthority, error) {
+	started := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, actionsBindingWait)
+	defer cancel()
+
+	poll := time.NewTicker(actionsBindingPoll)
+	defer poll.Stop()
+
+	for unboundAuthority(authority, session.leaseID) {
+		select {
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return authority, ctx.Err()
+			}
+			session.bindingWaited = true
+			s.log.Warn("the control plane did not learn this job in time; its Actions cache calls go to GitHub",
+				"instance", session.instance, "waited", time.Since(started).Round(time.Second))
+
+			return authority, nil
+		case <-poll.C:
+		}
+
+		next, err := s.askActionsAuthority(waitCtx, session)
+		if err != nil {
+			if ctx.Err() != nil {
+				return authority, ctx.Err()
+			}
+			if waitCtx.Err() != nil {
+				continue
+			}
+
+			return next, err
+		}
+		authority = next
+	}
+	session.bindingWaited = true
+	s.log.Info("waited for the control plane to learn this job before its first Actions cache call",
+		"instance", session.instance, "waited", time.Since(started).Round(time.Second),
+		"proven", authority.Proven)
+
+	return authority, nil
+}
+
+const (
+	// actionsUnprovenFor is how long an unproven authority stands before a
+	// job's next cache call asks again.
+	actionsUnprovenFor = 30 * time.Second
+	// actionsBindingWait bounds the wait for the plane to bind a job, past the
+	// longest lag measured, and actionsBindingPoll is how often it asks
+	// meanwhile.
+	actionsBindingWait = time.Minute
+	actionsBindingPoll = time.Second
+)
 
 // actionsLimit is the largest archive a session's tier accepts.
 func actionsLimit(session *cacheSession) int64 {
