@@ -183,9 +183,9 @@ func TestProvisionScriptInstallsTheCACert(t *testing.T) {
 	// covers that. What this test is about is the CA ordering, so it must not also
 	// be the one test standing on a delivery shape parity has outgrown.
 	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
-		RunnerVersion: "2.328.0",
-		Arch:          "x64",
-		CACertPEM:     ca,
+		RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0",
+		Arch:      "x64",
+		CACertPEM: ca,
 	})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
@@ -392,7 +392,7 @@ func TestAnOversizedCACertIsRefusedBeforeAnyLaunch(t *testing.T) {
 
 	_, err := p.BuildImage(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 		CACertPEM: bundle,
 	})
 	if err == nil {

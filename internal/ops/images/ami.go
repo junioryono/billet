@@ -63,6 +63,9 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			strconv.Itoa(ec2.DefaultBuilderDiskGiB)+")")
 	arch := fs.String("arch", "x64", "runner build to install: x64 or arm64")
 	version := fs.String("runner-version", runnerrelease.Pinned(), "actions/runner release")
+	runnerSHA := fs.String("runner-sha256", "",
+		"sha256 of the actions/runner tarball for --arch, which the builder checks before "+
+			"unpacking it; required when --runner-version is not the pinned release")
 	name := fs.String("name", "", "name for the produced AMI (default: billet-runner-<timestamp>)")
 	caCert := fs.String("ca-cert", "",
 		"PEM file of CA(s) to trust in the image's host store — the cache endpoint's issuer")
@@ -128,6 +131,13 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 			"can reach will do; billet writes one object and deletes it when the build ends")
 	}
 
+	// RESOLVED BEFORE THE CONFIG IS READ OR ANYTHING IS BOUGHT, for the reason the
+	// bucket is: a build that cannot check its runner is refused, not discovered.
+	digest, err := runnerDigest(*version, *arch, *runnerSHA)
+	if err != nil {
+		return err
+	}
+
 	cfg, err := ec2ConfigFor(*cfgPath, *region, *subnet, *group)
 	if err != nil {
 		return err
@@ -189,6 +199,7 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 		BuilderDiskGiB:     *disk,
 		Arch:               *arch,
 		RunnerVersion:      *version,
+		RunnerSHA256:       digest,
 		Name:               *name,
 		CACertPEM:          caCertPEM,
 		PayloadBucket:      *payloadBucket,
@@ -219,6 +230,66 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	fmt.Fprintf(env.Stdout, "An AMI id is REGION-SCOPED: this one only works in %s.\n", cfg.Region)
 
 	return nil
+}
+
+// runnerDigest is the sha256 the build checks the runner tarball against.
+//
+// ONLY THE PINNED RELEASE HAS A DIGEST BILLET KNOWS, so --runner-version takes
+// another release only when the operator names that release's digest; otherwise
+// the build would install a runner nothing checked. On the pinned release a
+// supplied digest must agree with the pin, because two answers that differ mean
+// one is wrong and billet cannot tell which.
+func runnerDigest(version, arch, supplied string) (string, error) {
+	platform, err := ec2.RunnerPlatform(arch)
+	if err != nil {
+		return "", err
+	}
+
+	// THE VERSION FIRST, because the remedy for an unpinned release is a digest
+	// and no digest makes `v2.337.0` or an empty version a release.
+	if !ec2.IsRunnerVersion(version) {
+		return "", fmt.Errorf("--runner-version %q is not an actions/runner release version; "+
+			"it is three numbers, without the leading v, such as %s",
+			version, runnerrelease.Pinned())
+	}
+
+	tarball := "actions-runner-" + platform + "-" + version + ".tar.gz"
+
+	if supplied != "" && !ec2.IsRunnerSHA256(supplied) {
+		return "", fmt.Errorf("--runner-sha256 %q is not a sha256: 64 lowercase hex digits, as "+
+			"sha256sum prints for %s", supplied, tarball)
+	}
+
+	if version != runnerrelease.Pinned() {
+		if supplied == "" {
+			return "", fmt.Errorf("--runner-version %s is not the release billet pins (%s), so "+
+				"billet has no digest to check its runner against; pass --runner-sha256 with the "+
+				"sha256 of %s from that release's page, or build the pinned release",
+				version, runnerrelease.Pinned(), tarball)
+		}
+
+		return supplied, nil
+	}
+
+	// NO PIN FOR THIS ARCHITECTURE IS THE UNPINNED CASE, so the operator's digest
+	// is what decides it; unreachable while every mapped platform is pinned.
+	pinned, ok := ec2.PinnedRunnerSHA256(arch)
+	if !ok {
+		if supplied != "" {
+			return supplied, nil
+		}
+
+		return "", fmt.Errorf("billet pins no digest for %s; pass --runner-sha256 with the "+
+			"sha256 of %s", platform, tarball)
+	}
+
+	if supplied != "" && supplied != pinned {
+		return "", fmt.Errorf("--runner-sha256 %s is not the digest billet pins for %s (%s); "+
+			"one of them is wrong, so the build is refused rather than trusting either",
+			supplied, tarball, pinned)
+	}
+
+	return pinned, nil
 }
 
 // cmdAMIVerify boots an AMI that already exists and stamps it if it proves itself.
