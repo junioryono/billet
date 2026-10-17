@@ -681,12 +681,11 @@ func TestThePendingListAsksForTheWholeError(t *testing.T) {
 	}
 }
 
-// A REFUSAL AFTER THIS HOST MIGRATED THE LEDGER IS NOT A ROW TO HAND AWAY. An
-// open that migrates before its watermark refuses it leaves the ledger on a
-// schema newer than the release the watermark names, which is the survivor's:
-// handed the row as pending, the survivor would be refused by the schema this
-// host moved, and nobody could finish it. The move rides beside the refusal as
-// its own leaf, so the refusal is not the whole error.
+// A SCHEMA MOVE BESIDE A PENDING CAUSE IS NOT PENDING. The tail opens through a
+// completion handle, which never migrates, so this is defensive: an open that
+// did migrate joins a state.SchemaMoved to whatever refused it, and that leaf
+// is not one of the closed list's causes. Asked of the whole error, the pair
+// refuses, and the refusal says both what refused the open and what moved.
 func TestARefusalAfterThisHostMigratedIsNotPending(t *testing.T) {
 	refused := fmt.Errorf("open the ledger: %w", state.ErrReleaseBehind)
 	if why := retirePendingReason(refused); why == "" {
@@ -699,7 +698,13 @@ func TestARefusalAfterThisHostMigratedIsNotPending(t *testing.T) {
 	}
 
 	r := retireLedgerProblem(t.Context(), t.Context(), moved, "open the ledger", &retireTailAnswer{})
-	if r == nil || !strings.Contains(r.Why, "from schema 59 to schema 60") {
-		t.Fatalf("the refusal does not say what this host moved: %+v", r)
+	if r == nil {
+		t.Fatal("a release refusal beside a schema move was not refused")
+	}
+
+	for _, want := range []string{state.ErrReleaseBehind.Error(), "from schema 59 to schema 60"} {
+		if !strings.Contains(r.Why, want) {
+			t.Errorf("the refusal does not say %q: %s", want, r.Why)
+		}
 	}
 }
