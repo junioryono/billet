@@ -52,7 +52,7 @@ Archives are limited to 10 GiB. A thin-provisioned upload volume reserves 22 GiB
 
 ### An organization target
 
-A pool under an organization target has no repository scope of its own, so it gets no local Actions cache by default, and every `actions/cache` call goes to GitHub, as on a GitHub-hosted runner. The cache's scope is static because a pooled runner's caches are attached before GitHub chooses its job, so the scope cannot come from the job. To serve the pool locally, name one repository:
+A pool under an organization target has no repository scope of its own, so it gets no local Actions cache by default, and every `actions/cache` call goes to GitHub, as on a GitHub-hosted runner. The scope is static because a pooled runner joins the pool before GitHub chooses its job, so the cache's namespace cannot come from the job. To serve the pool locally, name one repository:
 
 ```yaml
 tiers:
@@ -62,9 +62,10 @@ tiers:
     cache_scope:
       owner: acme
       repository: platform
+    # provider, shape and image as for any tier
 ```
 
-The pool then publishes from that repository's default branch and, on a Linux Firecracker tier, turns on the Actions, Go and Bazel caches with it. A job from another repository of the organization runs on the pool as before: its Actions cache calls go to GitHub, and it publishes nothing. It does read what the named repository's default branch published to the pool's Docker store, sticky disks, Go and Bazel caches, because those are attached before billet knows which repository the job belongs to ([what a cache can leak](../concepts/trust-and-isolation.md#what-a-cache-can-leak-and-to-whom)). So a scope fits an organization whose pool serves one repository, or whose repositories may read each other's build outputs. Otherwise give the repositories that need the cache a repository target of their own.
+The pool then publishes from that repository's default branch and, on a Linux Firecracker tier, turns on the Actions, Go and Bazel caches with it. `cache_scope.owner` must be the target's organization; billet refuses any other. A job from another repository of the organization runs on the pool as before: its Actions cache calls go to GitHub, and it publishes nothing, and so does a fork's pull request or any job whose authority cannot be proved. It does read what the named repository's default branch published to the pool's Docker store, sticky disks, Go and Bazel caches, because those caches use the pool's static repository namespace rather than the running job's repository ([what a cache can leak](../concepts/trust-and-isolation.md#what-a-cache-can-leak-and-to-whom)). So a scope fits an organization whose pool serves one repository, or whose other repositories may read the named repository's build outputs. Otherwise give the repositories that need the cache a repository target of their own.
 
 Grant the organization's App `actions: read` before adding the scope. Publication is proved from GitHub's record of each run, and without the permission nothing publishes. The scope would then turn on Go and Bazel caches that stay cold, and `GOCACHEPROG` would replace the Go build cache the workflow restores itself, so the pool's Go builds would get slower, not faster. `billet check` fails a target whose tiers publish from a default branch while its App lacks the permission.
 
