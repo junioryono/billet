@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -75,10 +76,26 @@ func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testi
 	seen := map[string]time.Time{}
 	unbounded := map[string]bool{}
 
+	// A systemctl holding one unit's state in a file: `show` answers from it,
+	// `stop` leaves it clean, and `start` fails, which is fine: the deadline is
+	// observed before the failure. The gate before the start and the proof
+	// after the stop read the state through the same seam.
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	systemctl := filepath.Join(dir, "systemctl")
+	writeFile(t, systemctl, `#!/bin/sh
+case "$1" in
+show) cat "`+state+`" ;;
+stop) printf 'ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n' >"`+state+`" ;;
+*) exit 1 ;;
+esac
+`, 0o755)
+	writeFile(t, state, "ActiveState=inactive\nSubState=dead\nResult=success\nMainPID=0\nJob=\nInvocationID=\n", 0o644)
+
 	prev := newHostInspector
 	newHostInspector = func() *lifeops.Inspector {
 		return lifeops.NewInspector(
-			lifeops.WithSystemctl("/usr/bin/false"),
+			lifeops.WithSystemctl(systemctl),
 			lifeops.WithObserver(func(ctx context.Context, args []string) {
 				if d, ok := ctx.Deadline(); ok {
 					seen[args[0]+" "+args[len(args)-1]] = d
@@ -90,16 +107,17 @@ func TestTheTransactionStartsUnderTheStartBoundAndStopsTheNodeUnbounded(t *testi
 
 	t.Cleanup(func() { newHostInspector = prev })
 
-	cfg := &config.Config{Node: &config.NodeConfig{}}
+	cfg := &config.Config{Node: &config.NodeConfig{StateDir: t.TempDir()}}
 	h := newSystemdHost(processEnv(), cfg, "/etc/billet/billet.yaml", "/tmp/staged", nil)
 
-	// The starts: /usr/bin/false fails them, which is fine; the deadline was
-	// observed before the failure.
 	if err := h.StartServices(t.Context()); err == nil || !strings.Contains(err.Error(), "starting") {
-		t.Fatalf("a start through /usr/bin/false: %v", err)
+		t.Fatalf("a start through a systemctl that fails it: %v", err)
 	}
 
 	deadlineWithin(t, "the transaction's node start", seen["start "+nodeUnit], deploy.UnitStartTimeout)
+
+	writeFile(t, state, "ActiveState=active\nSubState=running\nResult=success\nMainPID=5\nJob=\n"+
+		"InvocationID=inv-1\n", 0o644)
 
 	if err := h.StopNode(t.Context()); err != nil {
 		t.Logf("the node's stop: %v", err)

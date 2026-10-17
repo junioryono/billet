@@ -37,6 +37,11 @@ func TestMain(m *testing.M) {
 	}
 	nodeDrainRequestFile = filepath.Join(dir, "billet-node-drain")
 
+	// THE NODE'S ENDING IS PROVED for every test that does not test it: the
+	// lifecycle commands' tests drive a recording converger with no systemd
+	// behind it, and the tests of the checks install their own.
+	nodeEndings = func() nodeEndingChecks { return provedNodeEndings{} }
+
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)

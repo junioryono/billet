@@ -33,9 +33,45 @@ sudo systemctl kill --kill-whom=main --signal=SIGTERM billet-server
 
 `--kill-whom=main` matters because without it systemd signals every process in the service, including a container CLI billet has in flight. The jobs still running are left running, their capacity stays charged until a host proves the compute gone, and the next control plane re-adopts their leases.
 
+## Proving a node stop
+
+**systemd's exit says nothing about how a node stopped.** The node exits 0 after a drain, after a handoff, after a drain a second signal cut short, and when superseded. Measured on systemd 255:
+- a stop killed at `TimeoutStopSec` still has `systemctl stop` exit 0, and leaves the unit `failed` with `Result=timeout`;
+- `systemctl reset-failed` then turns that into exactly what a clean stop leaves.
+
+So the node keeps its own record, `<node.state_dir>/endings.json` (root's, 0600). It holds the newest sixteen processes, each written `running` when it starts, under systemd's invocation id, and replaced when it stops by one of:
+- `drained`: it held nothing and knew what its host runs;
+- `idle`: it never registered;
+- `handed-off`;
+- `left-running`: a second signal, or a stop that never learned what its host runs;
+- `superseded`;
+- `failed`.
+
+An entry still `running` names a process that was killed or crashed. `billet node ending show --config /etc/billet/billet.yaml --json` prints it.
+
+**A stop billet performs is proved by the stopped invocation's own entry.** `billet host-upgrade` and `billet local down` read the node's invocation before the stop, since a clean stop clears systemd's, and judge its ending after it:
+- `local down` requires `drained` before it stops the server;
+- so does an upgrade while a drain is requested;
+- otherwise `idle` and `handed-off` pass too.
+
+An unproved stop leaves the node stopped and goes no further. An upgrade rolls back with nothing installed.
+
+**A node of a release before the record keeps none.** Its stop falls back to systemd's `inactive`/`dead`/`success`, labelled `proof: systemd`. That is the weaker floor, which a handoff or a cut-short drain also passes, and it is recorded so the start after it can see it. An updater older than this release stops its node with the old check one last time.
+
+**A node is started only over a proved ending.** `billet local up`, and an upgrade's finish, rollback or resumed journal, each check the newest node entry first. It passes when it is a proved ending, an acknowledgement, or an ending from an earlier boot on a host-run provider (the reboot ended its compute). With no entry at all, systemd's account of the unit decides.
+
+**When a stop is unproved:**
+1. Find out what it left: `billet node ending show`, `billet leases`, and the provider's own view (`pgrep -a firecracker`, `docker ps`, `tart list`).
+2. Acknowledge it: `sudo billet node ending acknowledge --config /etc/billet/billet.yaml --invocation <id> --json`. Pass the id the refusal named, or `--unrecorded` for a stop no entry covers.
+3. Start the node again. Its recovery adopts what is still running.
+
+An acknowledgement takes the node's own deployment lock, so it refuses while a node process holds the identity. It permits a start only, never an operation that needs a drain.
+
+These checks are Linux's. The record is written on a Mac too, but a launch agent's stop is not judged by it yet. The Ansible role's own node restarts read the same record once the collection adopts it.
+
 ## `billet local down` and `uninstall`
 
-`billet local down` is a drain that then stops, in that order: seal, wait, stop the node, stop the server, disable both. It has no default time limit (`--timeout` bounds the wait; `--reason` is recorded). It re-reads the clearance immediately before the first stop, refuses to stop a service that is still deactivating, and on a node-only host says that it cannot fence anything and names `billet drain` against the control plane. Its seal is cleared by the next successful `billet local up`; an operator's seal from `billet drain` is left alone. `billet local uninstall` is `down` plus forgetting the services, leaving the config, App key, ledger, identity and CA where they are.
+`billet local down` is a drain that then stops, in that order: seal, wait, stop the node, prove it drained from its own ending record, stop the server, disable both. It has no default time limit (`--timeout` bounds the wait; `--reason` is recorded). It re-reads the clearance immediately before the first stop, refuses to stop a service that is still deactivating, and on a node-only host says that it cannot fence anything and names `billet drain` against the control plane. Its seal is cleared by the next successful `billet local up`; an operator's seal from `billet drain` is left alone. `billet local uninstall` is `down` plus forgetting the services, leaving the config, App key, ledger, identity and CA where they are.
 
 On a Mac the same commands drive the launch agents, with one difference: launchd cannot start a disabled service, so `up` enables before it proves, and what protects the host is the unwinding ([Run jobs on a Mac](../deploying/mac-tart.md)).
 

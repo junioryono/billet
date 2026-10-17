@@ -37,6 +37,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The seal is not the authority; the barrier is.**
 - **Provenance decides who may clear a seal.**
 - **Only states that prove no process remains count as stopped.**
+- **A node's stop is proved by its own ending record, never by its exit or systemd's Result, and a node starts only over a proved ending.**
 - **One lifecycle command at a time, via a host flock taken immediately before the first mutation.**
 - **A root installer prepares the PACKAGED directory, never the calling account's.**
 - **A host is moved onto the authority exclusion by an installer, and only an installer.**

@@ -160,28 +160,14 @@ func endingCheck(ctx context.Context, env cli.Env, args []string) error {
 	unit, observed := observeEndingUnit(ctx)
 
 	rec, _, readErr := nodeending.Read(cfg.Node.StateDir)
-	j := nodeending.Judge(rec, readErr, *invocation, unit, *drain)
+	judged := nodeending.Judge(rec, readErr, *invocation, unit, *drain)
+	j := recordSystemdStop(cfg, *invocation, judged)
 
 	answer := endingAnswer{Command: "check", Invocation: *invocation, Drain: *drain, Unit: observed, judgement: &j}
 
-	// A STOP ONLY systemd PROVED IS WRITTEN DOWN, so the start gate after it
-	// and anyone reading later see it after reset-failed or the unit's garbage
-	// collection have erased systemd's own account.
-	if j.Verdict == nodeending.Proved && j.Proof == nodeending.ProofSystemd {
-		err := nodeending.Observe(cfg.Node.StateDir, nodeending.Entry{
-			InvocationID: *invocation, BootID: nodeending.BootID(), Ending: nodeending.Stopped,
-			RunsOnHost: cfg.Node.Provider.RunsOnHost(),
-		}, nil)
-
-		recorded := err == nil
+	if judged.Proof == nodeending.ProofSystemd && judged.Verdict == nodeending.Proved {
+		recorded := j.Verdict == nodeending.Proved
 		answer.Recorded = &recorded
-
-		if err != nil {
-			j = nodeending.Judgement{Verdict: nodeending.Unknown, Answer: nodeending.Unknown.String(),
-				Why: "systemd reports a clean stop, but it could not be recorded for the start that follows: " +
-					err.Error()}
-			answer.judgement = &j
-		}
 	}
 
 	return answerEnding(env, answer)

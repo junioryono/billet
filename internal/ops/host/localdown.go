@@ -16,6 +16,7 @@ import (
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/lifeops"
+	"github.com/junioryono/billet/internal/nodeending"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -417,6 +418,27 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 		}
 	}
 
+	// THE NODE'S STOP IS PROVED BY ITS OWN ENDING (#127), and a `down` needs a
+	// drain: a stop systemd killed at TimeoutStopSec exits 0 too. The invocation
+	// is read before the stop, because a clean stop clears systemd's.
+	var (
+		endings        nodeEndingChecks
+		nodeInvocation string
+	)
+
+	_, nodeService := c.Services()
+
+	if req.WantNode && cli.HostOS == "linux" && cfg.Node != nil {
+		endings = nodeEndings()
+
+		inv, err := endings.InvocationBeforeStop(ctx)
+		if err != nil {
+			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits, err)
+		}
+
+		nodeInvocation = inv
+	}
+
 	for _, unit := range downOrder(c, req) {
 		// OBSERVED, NOT PREDICTED. A stop is a systemd TRANSACTION: `Conflicts=`,
 		// `PartOf=` and `BindsTo=` all reach other units, and the closure is
@@ -484,6 +506,17 @@ func stopAndDisable(ctx context.Context, env cli.Env, c converger, cfg *config.C
 			return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
 				fmt.Errorf("%s %s, so its process is not proved gone and this host is not down",
 					unit, stopped.How))
+		}
+
+		// BEFORE THE SERVER'S STOP, which tears down every lease its listener
+		// holds: a node that did not drain may have left work running.
+		if unit == nodeService && endings != nil && nodeInvocation != "" {
+			if j := endings.JudgeStop(ctx, cfg, nodeInvocation, true); j.Verdict != nodeending.Proved {
+				return partialDown(ctx, env, c, cfg, req, stoppedUnits, disabledUnits,
+					fmt.Errorf("%s stopped, but did not prove it drained: %s (%s). Once what it left is known, "+
+						"`billet node ending acknowledge --invocation %s` permits a start; nothing else was "+
+						"stopped", unit, j.Answer, j.Why, nodeInvocation))
+			}
 		}
 
 		// THE MANAGER'S OWN ACCOUNT, PRINTED VERBATIM. Rendering it here would
