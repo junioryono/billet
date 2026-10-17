@@ -54,7 +54,9 @@ The machine-readable catalog is `retained-drift.json`. Each row binds the comple
 | tasks/upgrade-rollback.yml / Durably publish the rollback commit before opening administration | parity:historical recovery only; the retained entry has no interrupted transaction and binary changes refuse before ordinary work |
 | tasks/endpoint-decision.yml / Observe the node unit on a host with no billet | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/endpoint-decision.yml / Compare the endpoints without an executable to ask | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
-| tasks/endpoint-decision.yml / Ask for the endpoint migration's dry run | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/endpoint-dry-run.yml / Ask for the endpoint migration's dry run | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/node-repair.yml / Ask whether the runtime-unit repair is admitted | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
+| tasks/node-repair.yml / Run the runtime-unit repair | parity:ordinary converge only; refused inside a retained retirement before it runs (Refuse a runtime-unit repair inside a retained retirement) |
 | tasks/node-environment.yml / Inspect the installed node environment | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-environment.yml / Prove the retained environment files are readable or optionally absent | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
 | tasks/node-environment.yml / Inspect the node environment again before replacement | parity:read-only observation or node validation; exact full module arguments and definitions are bound |
