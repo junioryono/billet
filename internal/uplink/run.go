@@ -123,7 +123,7 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("shape %s: %w", iface, err)
 	}
 
-	index := ifindex(iface)
+	index, boot := ifindex(iface), bootID()
 	if err := writeRecord(Record{Iface: iface, Index: index, IFB: shaper.IFB()}); err != nil {
 		return err
 	}
@@ -131,13 +131,13 @@ func Run(ctx context.Context, opts Options) error {
 	// WHAT AN EARLIER RUN LEARNED, BEFORE ANYTHING IS INSTALLED, so the line is
 	// held where it was from the first packet rather than relearned from the
 	// ceiling after every restart.
-	resumeLearned(opts.Log, ctl, iface, index, time.Now())
+	resumeLearned(opts.Log, ctl, iface, index, boot, time.Now())
 
 	if err := shaper.Install(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
 		return fmt.Errorf("install CAKE on %s: %w", iface, err)
 	}
 
-	remember := rememberer(opts.Log, ctl, iface, index)
+	remember := rememberer(opts.Log, ctl, iface, index, boot)
 	remember(ctl.Up.Rate, ctl.Down.Rate)
 
 	opts.Log.Info("shaping the uplink; each direction starts at its ceiling, or at the rate an earlier run "+
@@ -237,14 +237,14 @@ func gatewayLabel(gateway string) string {
 	return gateway
 }
 
-// rememberer records the rates CAKE was set to beside the interface record,
-// for the next run to resume; a write that fails is said once and changes
-// nothing about the shaping.
-func rememberer(log *slog.Logger, ctl *Controller, iface, index string) func(upMbit, downMbit float64) {
+// rememberer records the rates CAKE was set to, for the next run, or the next
+// boot's, to resume; a write that fails is said once and changes nothing about
+// the shaping.
+func rememberer(log *slog.Logger, ctl *Controller, iface, index, boot string) func(upMbit, downMbit float64) {
 	told := false
 
 	return func(upMbit, downMbit float64) {
-		err := writeLearned(learned{Iface: iface, Index: index, At: time.Now(),
+		err := writeLearned(learned{Iface: iface, Index: index, Boot: boot, At: time.Now(),
 			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit},
 			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit}})
 		if err != nil && !told {
