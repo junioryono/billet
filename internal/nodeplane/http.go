@@ -2130,6 +2130,9 @@ func (h *handler) cacheAuthority(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, bindingErr)
 		return
 	}
+	if bindingErr == nil {
+		unproven.JobID, unproven.RunID = binding.JobID, binding.RunID
+	}
 	tier, ok := h.plane.tierFor(lease.Tier)
 	if !ok {
 		writeErr(w, http.StatusConflict, nodeapi.CodeRefused, "the lease's tier is not in the catalogue")

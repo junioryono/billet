@@ -241,15 +241,19 @@ func TestAnUnprovenJobGoesToGitHubAndIsAskedAgain(t *testing.T) {
 
 // bindingAuthority is a plane that has not bound the job for its first
 // unboundAsks questions and names it afterwards; a negative count never binds
-// it.
+// it. A failAsk above zero is the one question it fails instead.
 type bindingAuthority struct {
 	unboundAsks int
+	failAsk     int
 	job         dispatch.CacheAuthority
 	asked       int
 }
 
 func (b *bindingAuthority) CacheAuthority(context.Context, string) (dispatch.CacheAuthority, error) {
 	b.asked++
+	if b.asked == b.failAsk {
+		return dispatch.CacheAuthority{}, errors.New("the plane is unreachable")
+	}
 	if b.unboundAsks < 0 || b.asked <= b.unboundAsks {
 		return unboundAnswer(), nil
 	}
@@ -257,9 +261,9 @@ func (b *bindingAuthority) CacheAuthority(context.Context, string) (dispatch.Cac
 	return b.job, nil
 }
 
-// lookup is one restore of key "npm", and whether it was served here rather
-// than spliced to GitHub.
-func lookup(t *testing.T, service *CacheService, session *cacheSession) bool {
+// lookup is one restore of key "npm": what it answered when it was served
+// here, or nil when it was spliced to GitHub.
+func lookup(t *testing.T, service *CacheService, session *cacheSession) map[string]any {
 	t.Helper()
 
 	response, handled, err := service.actionsResponse(
@@ -267,14 +271,18 @@ func lookup(t *testing.T, service *CacheService, session *cacheSession) bool {
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	if response != nil {
-		response.Body.Close()
+	if !handled {
+		if response != nil {
+			response.Body.Close()
+		}
+
+		return nil
 	}
 
-	return handled
+	return responseJSON(t, response)
 }
 
-// A JOB THE PLANE HAS NOT BOUND YET IS WAITED FOR, AND SERVED HERE. Its first
+// A JOB THE PLANE HAS NOT BOUND YET IS WAITED FOR, AND RESTORED HERE. Its first
 // cache call, a restore, came before the plane had GitHub's JobStarted; spliced,
 // it would have fetched the whole archive from GitHub.
 func TestACallBeforeTheBindingWaitsForIt(t *testing.T) {
@@ -282,12 +290,15 @@ func TestACallBeforeTheBindingWaitsForIt(t *testing.T) {
 
 	synctest.Test(t, func(t *testing.T) {
 		plane := &bindingAuthority{unboundAsks: 3, job: pullRequestAuthority()}
-		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		store := &presentMatcher{fakeCacheStore: &fakeCacheStore{current: "g"},
+			present: map[string]string{refPrefix("refs/heads/main") + "npm": "g"}}
+		service, session := defaultBranchActions(t, nil, store)
 		service.SetAuthorityReader(plane)
 		start := time.Now()
 
-		if !lookup(t, service, session) {
-			t.Fatal("the restore was spliced to GitHub, want it served once the plane bound the job")
+		found := lookup(t, service, session)
+		if found == nil || found["ok"] != true || found["matched_key"] != "npm" {
+			t.Fatalf("lookup = %v, want the default branch's archive restored here", found)
 		}
 		if plane.asked != 4 {
 			t.Fatalf("asked %d times, want 3 unbound answers and the bound one", plane.asked)
@@ -311,8 +322,8 @@ func TestAJobNeverBoundIsWaitedForOnce(t *testing.T) {
 		service.SetAuthorityReader(plane)
 		start := time.Now()
 
-		if lookup(t, service, session) {
-			t.Fatal("a job that was never bound was served here")
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a job that was never bound was served here: %v", found)
 		}
 		if waited := time.Since(start); waited != actionsBindingWait {
 			t.Fatalf("the first call waited %v, want %v", waited, actionsBindingWait)
@@ -320,8 +331,8 @@ func TestAJobNeverBoundIsWaitedForOnce(t *testing.T) {
 
 		time.Sleep(actionsUnprovenFor)
 		asked, again := plane.asked, time.Now()
-		if lookup(t, service, session) {
-			t.Fatal("a job that was never bound was served here")
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a job that was never bound was served here: %v", found)
 		}
 		if plane.asked != asked+1 || time.Since(again) != 0 {
 			t.Fatalf("the next call asked %d times over %v, want one ask and no wait",
@@ -340,8 +351,8 @@ func TestAnUnprovableJobIsNotWaitedFor(t *testing.T) {
 		service, session := defaultBranchActions(t, plane, &fakeCacheStore{})
 		start := time.Now()
 
-		if lookup(t, service, session) {
-			t.Fatal("an unprovable job was served here")
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("an unprovable job was served here: %v", found)
 		}
 		if plane.asked != 1 || time.Since(start) != 0 {
 			t.Fatalf("asked %d times over %v, want one ask and no wait", plane.asked, time.Since(start))
@@ -360,17 +371,89 @@ func TestARetryAfterAnAbandonedWaitWaitsAgain(t *testing.T) {
 		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
 		service.SetAuthorityReader(plane)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 5*actionsBindingPoll+actionsBindingPoll/2)
+		patience := 5*actionsBindingPoll + actionsBindingPoll/2
+		ctx, cancel := context.WithTimeout(t.Context(), patience)
 		defer cancel()
+		start := time.Now()
 		if _, ok := service.sessionActionsAuthority(ctx, session); ok {
 			t.Fatal("an abandoned wait proved the job")
 		}
+		if plane.asked != 6 || time.Since(start) != patience {
+			t.Fatalf("the abandoned call asked %d times over %v, want 6 over %v",
+				plane.asked, time.Since(start), patience)
+		}
 
+		retried := time.Now()
 		if _, ok := service.sessionActionsAuthority(t.Context(), session); !ok {
 			t.Fatal("the retry was not proven once the plane named the job")
 		}
-		if plane.asked != 11 {
-			t.Fatalf("asked %d times, want 11: the retry waited on until the job was named", plane.asked)
+		if plane.asked != 11 || time.Since(retried) != 4*actionsBindingPoll {
+			t.Fatalf("the retry brought the asks to %d over %v, want 11 over %v: it asked at once "+
+				"and waited until the job was named", plane.asked, time.Since(retried), 4*actionsBindingPoll)
 		}
+	})
+}
+
+// A PLANE THAT FAILS WHILE WAITED FOR ENDS THE JOB'S WAIT, as running out of
+// time does: the call goes to GitHub, and the next asks without waiting again.
+func TestAPlaneErrorEndsTheWait(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: -1, failAsk: 4}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+		start := time.Now()
+
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("a call whose plane failed was served here: %v", found)
+		}
+		if plane.asked != 4 || time.Since(start) != 3*actionsBindingPoll {
+			t.Fatalf("the first call asked %d times over %v, want 4 over %v",
+				plane.asked, time.Since(start), 3*actionsBindingPoll)
+		}
+
+		again := time.Now()
+		if found := lookup(t, service, session); found != nil {
+			t.Fatalf("an unbound job was served here: %v", found)
+		}
+		if plane.asked != 5 || time.Since(again) != 0 {
+			t.Fatalf("the next call asked %d times over %v, want one ask and no wait",
+				plane.asked-4, time.Since(again))
+		}
+	})
+}
+
+// A CALL QUEUED BEHIND ANOTHER'S WAIT KEEPS ITS OWN DEADLINE: it gives up when
+// its context does, not a minute later when the wait ahead of it ends. A plain
+// Lock fails this by hanging rather than by an assertion: a goroutine blocked
+// on a mutex is not durably blocked, so the bubble's clock never advances and
+// the test binary's timeout is what reports it.
+func TestACallQueuedBehindAWaitKeepsItsDeadline(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		plane := &bindingAuthority{unboundAsks: -1}
+		service, session := defaultBranchActions(t, nil, &fakeCacheStore{})
+		service.SetAuthorityReader(plane)
+
+		waiting := make(chan struct{})
+		go func() {
+			defer close(waiting)
+			service.sessionActionsAuthority(t.Context(), session)
+		}()
+		synctest.Wait()
+
+		patience := 2 * actionsBindingPoll
+		ctx, cancel := context.WithTimeout(t.Context(), patience)
+		defer cancel()
+		start := time.Now()
+		if _, ok := service.sessionActionsAuthority(ctx, session); ok {
+			t.Fatal("a queued call was proven while the plane had not bound the job")
+		}
+		if queued := time.Since(start); queued != patience {
+			t.Fatalf("the queued call returned after %v, want its own %v", queued, patience)
+		}
+		<-waiting
 	})
 }

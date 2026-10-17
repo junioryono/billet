@@ -490,7 +490,10 @@ func (s *CacheService) actionsKeysFor(
 func (s *CacheService) sessionActionsAuthority(
 	ctx context.Context, session *cacheSession,
 ) (dispatch.CacheAuthority, bool) {
-	session.authorityMu.Lock()
+	// A CALL QUEUED BEHIND ANOTHER'S WAIT FOR THE BINDING keeps its own deadline.
+	if err := lockCacheMutex(ctx, &session.authorityMu); err != nil {
+		return dispatch.CacheAuthority{}, false
+	}
 	defer session.authorityMu.Unlock()
 	if session.actionsAuthority != nil {
 		return *session.actionsAuthority, true
@@ -548,8 +551,9 @@ func unboundAuthority(authority dispatch.CacheAuthority, leaseID string) bool {
 
 // awaitBinding asks again every actionsBindingPoll until the plane names the
 // job, for at most actionsBindingWait, and returns the last answer. A caller
-// that gives up first is answered with its error and leaves the session to
-// wait again on its next call.
+// that gives up first gets its context's error, which sends the call to GitHub
+// as a failed ask does, and leaves the wait to the session's next call; a plane
+// that fails meanwhile ends the session's wait as running out of time does.
 func (s *CacheService) awaitBinding(
 	ctx context.Context, session *cacheSession, authority dispatch.CacheAuthority,
 ) (dispatch.CacheAuthority, error) {
@@ -567,7 +571,7 @@ func (s *CacheService) awaitBinding(
 				return authority, ctx.Err()
 			}
 			session.bindingWaited = true
-			s.log.Warn("the control plane did not learn this job in time; its Actions cache calls go to GitHub",
+			s.log.Warn("the control plane did not learn this job in time; this Actions cache call goes to GitHub",
 				"instance", session.instance, "waited", time.Since(started).Round(time.Second))
 
 			return authority, nil
@@ -582,6 +586,7 @@ func (s *CacheService) awaitBinding(
 			if waitCtx.Err() != nil {
 				continue
 			}
+			session.bindingWaited = true
 
 			return next, err
 		}
