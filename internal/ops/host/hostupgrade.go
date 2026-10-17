@@ -796,6 +796,14 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		return err
 	}
 
+	// WHAT THE CANDIDATE NEEDS OF THE NODE UNIT, before the claim and before the
+	// node is told the job was taken (#168): a rollout installs no units, and a
+	// refusal after acceptance would leave the rollout waiting on a host that
+	// never moves.
+	if err := refuseUnmetUnitRequirements(ctx, env, cfg, manifest.Version); err != nil {
+		return err
+	}
+
 	// THE FENCE IS ASKED BEFORE ANYTHING ELSE IS DECIDED, INCLUDING WHETHER THERE
 	// IS ANYTHING TO DO. Putting the already-running fast path first was a defect a
 	// review caught: a machine could satisfy decision 10 without ever raising its
@@ -1098,15 +1106,6 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 	host hostupgrade.Host,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
-
-	// REFUSED BEFORE ITS FIRST STEP, the transaction touched nothing outside its
-	// directory, so the claim goes back with it as for a refusal before
-	// acceptance, and the host runs the release it ran.
-	if errors.Is(err, hostupgrade.ErrRefusedUntouched) {
-		fmt.Fprintf(env.Stdout, "\nThis upgrade was refused before anything was stopped: %v\n", err)
-
-		return refuseClaimed(root, journal.Dir, err)
-	}
 
 	// THE DECISION IS SETTLED HERE, AS A REQUIRED STEP OF ITS OWN. A committed
 	// transaction carried its decision out whatever came after the commit, and a
@@ -1930,19 +1929,6 @@ const uplinkRestartBound = 3*time.Minute + lifecycleDeadlineMargin
 // none of its own to a stop.
 func (h *systemdHost) StopNode(ctx context.Context) error {
 	return h.stop(ctx, nodeUnit)
-}
-
-// CheckUnitRequirements asks the staged candidate what it needs of the node
-// unit and holds the loaded unit to it, before anything stops (#168).
-func (h *systemdHost) CheckUnitRequirements(ctx context.Context) error {
-	found, err := checkUnitRequirements(ctx, h.staged, h.cfgPath, h.inspect)
-	if err != nil {
-		return err
-	}
-
-	_, _ = fmt.Fprintf(h.env.Stdout, "unit requirements: %s\n", found)
-
-	return nil
 }
 
 // StopServer stops the control plane, after the node's custody has settled.

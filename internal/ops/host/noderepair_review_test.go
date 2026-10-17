@@ -19,7 +19,8 @@ func TestTheRepairRunsUnderThisConvergesGuard(t *testing.T) {
 		f := newRepairFixture(t)
 
 		o := f.repair(t, "--run", "h2")
-		if o.str("outcome") != outcomeRefused || o.str("reason") != endpointReasonGuard || o.str("state") != stateNothing {
+		if o.str("outcome") != outcomeRefused || o.str("reason") != endpointReasonGuard || o.str("state") != stateNothing ||
+			!strings.Contains(o.str("why"), "the guard names "+repairHolder+", not h2") {
 			t.Fatalf("outcome %q reason %q state %q (%s), want a guard refusal with nothing done", o.str("outcome"),
 				o.str("reason"), o.str("state"), o.str("why"))
 		}
@@ -74,6 +75,12 @@ func TestTheRepairNeedsAProcessThatPublishes(t *testing.T) {
 			t.Helper()
 			f.preRBinary(t)
 		}, outcomeRefused, endpointReasonPreR},
+		{"a managed binary that fails before the guard answers", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			script := "#!/bin/sh\necho 'panic: runtime error' >&2\nexit 2\n"
+			writeFile(t, installedBinary, script, 0o755)
+			writeFile(t, filepath.Join(f.procDir, strconv.Itoa(inspectPID), "image"), script, 0o755)
+		}, outcomeUnknown, endpointReasonProcess},
 		{"an image that is not the managed binary", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			writeFile(t, filepath.Join(f.procDir, strconv.Itoa(inspectPID), "image"), "#!/bin/sh\nexit 0\n", 0o755)
@@ -105,6 +112,7 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		stage func(t *testing.T, f *repairFixture)
+		why   string
 	}{
 		{"the process moved", func(t *testing.T, f *repairFixture) {
 			t.Helper()
@@ -114,23 +122,38 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 			mustOK(t, err)
 			f.afterShows(t, 3, strings.ReplaceAll(string(body), "InvocationID="+nodeInvocation,
 				"InvocationID="+newInvocation))
-		}},
+		}, "between the judgement and the locks"},
 		{"the node unit was reloaded with the directory", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
 			mustOK(t, err)
 			f.afterShows(t, 3, strings.Replace(string(body), "RuntimeDirectory=billet/locks\n",
 				"RuntimeDirectory=billet/locks billet/registration\n", 1))
-		}},
+		}, "between the judgement and the locks"},
+		{"the unit gained a drop-in after the second judgement", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			// Each judgement reads the unit three times and the stop's admission
+			// once: the eighth read is the last look before the stop.
+			body, err := os.ReadFile(f.unitFile(nodeUnit))
+			mustOK(t, err)
+			f.afterShows(t, 7, strings.Replace(string(body), "DropInPaths=\n",
+				"DropInPaths=/etc/systemd/system/billet-node.service.d/x.conf\n", 1))
+		}, "drop-ins"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRepairFixture(t)
 			tc.stage(t, f)
 
 			o := f.repair(t)
-			if o.str("outcome") != outcomeUnknown || o.str("state") != stateNothing {
-				t.Fatalf("outcome %q state %q (%s), want could-not-tell with nothing done", o.str("outcome"),
-					o.str("state"), o.str("why"))
+			if o.str("outcome") == outcomeRepaired || o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) {
+				t.Fatalf("outcome %q state %q (%s), want a refusal saying %q with nothing done", o.str("outcome"),
+					o.str("state"), o.str("why"), tc.why)
+			}
+
+			// UNDER THE LOCKS: the refusal is the later look's, not the first
+			// judgement's.
+			if f.locks != 1 {
+				t.Errorf("the repair took %d lifecycle locks, want the one it refused under", f.locks)
 			}
 
 			if got := f.acted(t); len(got) != 0 || f.unitOnDisk(t) != f.legacy {

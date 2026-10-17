@@ -63,10 +63,6 @@ func newLaunchdHost(env cli.Env, cfg *config.Config, cfgPath, staged string,
 	}
 }
 
-// CheckUnitRequirements has nothing to hold on a Mac: the node agent writes no
-// registration record there, and `billet local up` installs its plist.
-func (h *launchdHost) CheckUnitRequirements(context.Context) error { return nil }
-
 // StopNode boots the node agent out and waits for its process, which drains.
 func (h *launchdHost) StopNode(ctx context.Context) error {
 	_, node := h.agents.Services()

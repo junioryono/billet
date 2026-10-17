@@ -1,9 +1,11 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -683,7 +685,39 @@ func processVintageOf(ctx context.Context, pid int) (processVintage, string) {
 		return vintagePreR, ""
 	}
 
+	// THE GUARD'S OWN ANSWER, recognised: a binary that crashed before its
+	// dispatch, or printed nothing, exits non-zero without naming an unknown
+	// command, and that is no evidence it carries the guard.
+	if !guardAnswered(rc, stdout) {
+		return vintageUnknown, fmt.Sprintf("the managed binary's answer to the preparation's dry run (exit %d) is not "+
+			"the preparation's", rc)
+	}
+
 	return vintageR, "the managed binary answers the preparation, so the running process is a release that carries the guard"
+}
+
+// guardAnswered says whether a completed run is the preparation's dry run
+// answering: its exit one the preparation answers with, and its standard output
+// one JSON object whose outcome is one of the preparation's.
+func guardAnswered(rc int, stdout []byte) bool {
+	if rc != 0 && rc != exitRefused && rc != exitUnknown {
+		return false
+	}
+
+	var answer struct {
+		Outcome *string `json:"outcome"`
+	}
+
+	if err := json.Unmarshal(bytes.TrimSpace(stdout), &answer); err != nil || answer.Outcome == nil {
+		return false
+	}
+
+	switch *answer.Outcome {
+	case outcomeReported, outcomeRefused, outcomeUnknown:
+		return true
+	}
+
+	return false
 }
 
 // answerObject prints one successful answer as JSON with exit 0.

@@ -18,16 +18,20 @@
 - name: Repair the node unit
   vars:
     # THE BOUND IS THE SUM OF EVERY PHASE the command may take, the guard's
-    # bound as the margin: the loaded unit's shape, the record's bracket (its
-    # attempts, two observations each), the observation before the stop, the
-    # stop under its deadline and the observation after it, the reload and the
-    # shape after it, the start under the unit's bound and the observation
-    # after it, the record wait under the new invocation with the two
-    # observations of a bracket that outlives it, and the closing observation.
+    # bound as the margin: TWO judgements (before the locks and under them),
+    # each the loaded unit's shape, the record's bracket (its attempts, two
+    # observations each) and the process's vintage (the managed binary asked
+    # under the guard's bound); the observation before the stop and the shape
+    # after it; the stop under its deadline and the observations after it; the
+    # reload and the shape after it; the start under the unit's bound and the
+    # observations after it; the record wait under the new invocation with the
+    # two observations of a bracket that outlives it; and the closing
+    # observation.
     billet_repair_bound: >-
-      {{ (2 * (billet_migration_bracket_attempts | int) + 9) * (billet_migration_observation_bound | int)
+      {{ (4 * (billet_migration_bracket_attempts | int) + 13) * (billet_migration_observation_bound | int)
+         + 3 * (billet_guard_timeout | int)
          + (billet_migration_stop_timeout | int) + (billet_migration_start_bound | int)
-         + (billet_migration_record_wait | int) + (billet_guard_timeout | int) }}
+         + (billet_migration_record_wait | int) }}
   block:
     # THE REFUSALS FIRST, so a dry run says what the converge would do: neither
     # a retained retirement nor a policy that will not start the node admits a

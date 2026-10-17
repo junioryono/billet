@@ -606,14 +606,19 @@ func TestTheShippedNodeUnitMeetsTheNodesRuntimeRequirements(t *testing.T) {
 		declared = append(declared, strings.Fields(value)...)
 	}
 
-	if len(deploy.NodeRuntimeDirectories) == 0 {
+	if len(deploy.NodeRuntimeRequirements) == 0 {
 		t.Fatal("this build declares no runtime directory its node needs; the registration record needs one")
 	}
 
-	for _, entry := range deploy.NodeRuntimeDirectories {
-		if !slices.Contains(declared, entry) {
+	for _, req := range deploy.NodeRuntimeRequirements {
+		if !slices.Contains(declared, req.Entry) {
 			t.Errorf("%s declares RuntimeDirectory %q without %q, which this build's node writes into",
-				deploy.NodeUnitName, declared, entry)
+				deploy.NodeUnitName, declared, req.Entry)
+		}
+
+		if !strings.HasPrefix(req.Since, "v") || strings.Count(req.Since, ".") != 2 {
+			t.Errorf("the requirement %q names %q as the release that first needs it, which is not a release",
+				req.Entry, req.Since)
 		}
 	}
 }

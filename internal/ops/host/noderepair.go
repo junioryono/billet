@@ -366,7 +366,7 @@ func repairGuard(run string) (*txLock, *os.File, *endpointRefusal) {
 		return nil, nil, endpointUnknown(endpointReasonGuard, "open this converge's guard: "+err.Error(), "", stateNothing)
 	}
 
-	if rr := judgeGuardShape(shape, run); rr != nil {
+	if rr := judgeGuardShape(shape, run, "a runtime-unit repair"); rr != nil {
 		if dir != nil {
 			_ = dir.Close()
 		}
@@ -378,7 +378,7 @@ func repairGuard(run string) (*txLock, *os.File, *endpointRefusal) {
 			refusal = endpointUnknown
 		}
 
-		return nil, nil, refusal(endpointReasonGuard, "a repair runs under this converge's guard: "+rr.Why, "",
+		return nil, nil, refusal(endpointReasonGuard, rr.Why, "",
 			stateNothing)
 	}
 
@@ -401,6 +401,16 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 
 	if r := admitNodeStop(ctx, insp, br.obs, "repaired"); r != nil {
 		return nil, r
+	}
+
+	// AND THE LOADED UNIT, LAST: a drop-in or a reload since the judgement read
+	// it changes what the stop is for, without moving the process.
+	if now, required, _, r := observeRepairShape(ctx, insp); r != nil {
+		return nil, r
+	} else if !required || now != judged.shape {
+		return nil, endpointUnknown(endpointReasonShape, fmt.Sprintf("%s changed under the judgement (RuntimeDirectory=%s "+
+			"from %s); nothing was stopped", nodeUnit, now.RuntimeDirectory, now.FragmentPath), "converge again",
+			stateNothing)
 	}
 
 	// (6) THE STOP, under the repair's own deadline, and its proof.
@@ -456,8 +466,16 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 
 			return err
 		}); err != nil {
-		if now, readErr := regularfile.ReadFile(repairUnitPath, maxUnitBytes, regularfile.Options{NoFollow: true}); readErr == nil &&
-			bytes.Equal(now, repaired) {
+		now, readErr := regularfile.ReadFile(repairUnitPath, maxUnitBytes, regularfile.Options{NoFollow: true})
+
+		switch {
+		case readErr != nil:
+			// COULD-NOT-TELL WHICH UNIT IS ON DISK is not a unit untouched: the
+			// rename may have landed, so the worse of the two states is named.
+			return nil, endpointUnknown(endpointReasonShape, "install the repaired unit: "+err.Error()+"; and whether "+
+				"it was put in place cannot be told: "+readErr.Error(), "inspect "+repairUnitPath+", then converge again",
+				stateUnitInstalled)
+		case bytes.Equal(now, repaired):
 			return nil, endpointUnknown(endpointReasonShape, "the repaired unit was put in place and its durability is "+
 				"unproved: "+err.Error(), "inspect "+repairUnitPath+", then converge again", stateUnitInstalled)
 		}

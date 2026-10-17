@@ -54,9 +54,6 @@ func (h *fakeHost) record(what string) error {
 	return nil
 }
 
-func (h *fakeHost) CheckUnitRequirements(context.Context) error {
-	return h.record("check-unit-requirements")
-}
 func (h *fakeHost) StopNode(context.Context) error   { return h.record("stop-node") }
 func (h *fakeHost) StopServer(context.Context) error { return h.record("stop-server") }
 func (h *fakeHost) HideBinary(context.Context) error { return h.record("hide-binary") }
@@ -171,9 +168,6 @@ func TestAHealthyUpgradeRunsInOrder(t *testing.T) {
 	}
 
 	want := []string{
-		// What the candidate needs of the node unit, before anything is
-		// preserved or stopped: a refusal here leaves the host as it was.
-		"check-unit-requirements",
 		// Nothing has stopped yet: the candidate was staged and verified before
 		// this run began.
 		"preserve",
@@ -739,49 +733,6 @@ func TestACommittedUpgradeResumedAfterACrashStillRecordsItsManifest(t *testing.T
 
 	if record > start {
 		t.Errorf("the manifest was recorded after the services started: %v", h.did)
-	}
-}
-
-// A CANDIDATE THE LOADED UNIT CANNOT RUN AS IT NEEDS IS REFUSED BEFORE THE FIRST
-// STEP (#168), and that refusal is no rollback: a decided journal reaches every
-// step, so a rollback would start the services and restart the uplink on a host
-// the transaction never touched. The whole trace is the check, and the journal
-// is left undecided at the step it was at, for the caller to give back.
-func TestAnUnmetUnitRequirementTouchesNothing(t *testing.T) {
-	j := newJournal(t)
-	from := j.Step
-	h := &fakeHost{failAt: "check-unit-requirements"}
-
-	if err := runUnwinding(t, j, h); !errors.Is(err, ErrRefusedUntouched) || errors.Is(err, ErrRolledBack) {
-		t.Fatalf("an unmet unit requirement returned %v, want ErrRefusedUntouched and no rollback", err)
-	}
-
-	if want := []string{"check-unit-requirements"}; !slices.Equal(h.did, want) {
-		t.Errorf("an unmet unit requirement did\n  %v\nwant only\n  %v", h.did, want)
-	}
-
-	if j.Step != from || j.Failure != "" {
-		t.Errorf("the journal moved to %s (failure %q); a refusal before the first step records nothing", j.Step,
-			j.Failure)
-	}
-}
-
-// A RESUMED TRANSACTION PAST ITS FIRST STEP IS NOT ASKED AGAIN: what it needs
-// was judged before anything stopped, and a refusal now would leave a host
-// half-moved without its rollback.
-func TestAResumedTransactionIsNotAskedForItsRequirementsAgain(t *testing.T) {
-	j := newJournal(t)
-	if err := j.Advance(StepStopped); err != nil {
-		t.Fatal(err)
-	}
-	h := &fakeHost{}
-
-	if err := run(t, j, h); err != nil {
-		t.Fatalf("a resumed upgrade failed: %v", err)
-	}
-
-	if slices.Contains(h.did, "check-unit-requirements") {
-		t.Errorf("a transaction resumed past its first step was asked for its requirements again:\n  %v", h.did)
 	}
 }
 
