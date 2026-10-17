@@ -3,6 +3,6 @@
   "outcome": "refused",
   "reason": "unit-shape",
   "why": "billet-node.service has drop-ins (/etc/systemd/system/billet-node.service.d/x.conf), which a repair does not admit",
-  "next": "remove the drop-ins on billet-node.service (/etc/systemd/system/billet-node.service.d/x.conf) or fold their settings into the host role's variables, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then converge the host role, which repairs that unit, or follow the manual repair in docs/operating/upgrades.md; installing the package does not help, since a unit under /etc/systemd/system outranks the packaged one",
+  "next": "remove the drop-ins that apply to billet-node.service (/etc/systemd/system/billet-node.service.d/x.conf; one outside billet-node.service.d applies to other units too) or carry what they set by other means, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then converge the host role, which judges the unit without them: it repairs the one shape the repair admits and otherwise refuses with nothing stopped, naming the next step; installing the package does not help, since a unit under /etc/systemd/system outranks the packaged one",
   "state": "nothing"
 }

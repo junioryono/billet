@@ -186,7 +186,7 @@ func unitRemedy(fragment, runtime, dropIns string) string {
 			"shown by its target's path, so find what defines it (systemctl cat " + nodeUnit + ") before " +
 			"converging or installing the package"
 	case dir == "/etc/systemd/system":
-		remedy = roleUnitRemedyFor(runtime)
+		remedy = roleUnitRemedyFor(runtime, dropIns)
 	case slices.Contains(unitDirsBetween, dir):
 		remedy = unitRemedyStopFirst + ", whose unit under /etc/systemd/system outranks that one; installing the " +
 			"package does not help, since that one outranks the packaged unit"
@@ -206,12 +206,23 @@ func unitRemedy(fragment, runtime, dropIns string) string {
 }
 
 // roleUnitRemedyFor is the remedy for the role's own unit declaring runtime,
-// with any drop-in removed: a converge repairs the one shape its repair
-// admits, and renders any other afresh once the node is stopped.
-func roleUnitRemedyFor(runtime string) string {
+// once any drop-in is removed: a converge repairs the one shape its repair
+// admits, and renders any other afresh once the node is stopped. With drop-ins
+// the merged value says nothing of the file beneath them, so the converge
+// judges it then.
+func roleUnitRemedyFor(runtime, dropIns string) string {
+	if dropIns != "" {
+		return "converge the host role, which judges the unit without them: it repairs the one shape the repair " +
+			"admits and otherwise refuses with nothing stopped, naming the next step; installing the package does " +
+			"not help, since a unit under /etc/systemd/system outranks the packaged one"
+	}
+
+	// SYSTEMD'S MERGED VALUE IS NOT THE FILE: the repair reads the file itself
+	// and may still refuse it, stopping nothing and naming the next step.
 	if runtime == "billet/locks" {
-		return "converge the host role, which repairs that unit, or follow the manual repair in " +
-			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
+		return "converge the host role, which repairs that unit when its file holds the one line the repair " +
+			"admits and otherwise refuses with nothing stopped, naming the next step; or follow the manual repair " +
+			"in " + unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under " +
 			"/etc/systemd/system outranks the packaged one"
 	}
 
@@ -224,10 +235,10 @@ func dropInsFirst(dropIns, remedy string) string {
 		return remedy
 	}
 
-	return "remove the drop-ins on " + nodeUnit + " (" + dropIns + ") or fold their settings into the host " +
-		"role's variables, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in " +
-		"on " + nodeUnit + " and one that sets RuntimeDirectory applies over whatever unit is in effect; then " +
-		remedy
+	return "remove the drop-ins that apply to " + nodeUnit + " (" + dropIns + "; one outside " + nodeUnit +
+		".d applies to other units too) or carry what they set by other means, then systemctl daemon-reload, " +
+		"since a converge that upgrades billet refuses any drop-in on " + nodeUnit + " and one that sets " +
+		"RuntimeDirectory applies over whatever unit is in effect; then " + remedy
 }
 
 // unitRequirementsInspector is the inspector the upgrade holds the node unit

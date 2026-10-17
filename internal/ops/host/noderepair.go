@@ -756,12 +756,14 @@ func judgeRepairShape(props map[string][]string, shape repairShape) (bool, strin
 	}
 
 	// THE REMEDY IS THE UPGRADE'S, by where the unit in effect ranks, and the
-	// role's own unit is the one at the path this repair edits.
+	// role's own unit is the one at the path this repair edits: the same answer
+	// unitRemedy gives for /etc/systemd/system, named here by repairUnitPath,
+	// which a test moves.
 	dropIns := firstProp(props, "DropInPaths")
 
 	remedy := unitRemedy(shape.FragmentPath, shape.RuntimeDirectory, dropIns)
 	if shape.FragmentPath == repairUnitPath {
-		remedy = dropInsFirst(dropIns, roleUnitRemedyFor(shape.RuntimeDirectory))
+		remedy = dropInsFirst(dropIns, roleUnitRemedyFor(shape.RuntimeDirectory, dropIns))
 	}
 
 	switch {

@@ -391,49 +391,63 @@ func TestTheRepairAdmitsOnlyTheLegacyShape(t *testing.T) {
 // A REFUSED SHAPE NAMES THE REMEDY THAT CHANGES IT, never the package for a
 // unit the package cannot reach: a unit between the role's and the package's
 // is outranked by a converge once the node is stopped; the role's own unit in
-// another shape is edited by hand; a packaged one is replaced by the package.
+// another shape is rendered afresh the same way; a packaged one is replaced by
+// the package; and a drop-in is removed first, after which a converge judges
+// the unit again. Each case names the refusal it reaches, so a remedy shared
+// by several refusals cannot pass for another's.
 func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
+	const (
+		stopFirst = "stop billet-node.service, then converge the host role"
+		pkg       = "install this release's package"
+		judges    = "; then converge the host role, which judges the unit without them"
+	)
+
 	for _, tc := range []struct {
 		name         string
 		stage        func(t *testing.T, f *repairFixture)
-		want, absent string
+		why          string
+		want, absent []string
 	}{
 		{"a runtime unit", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "FragmentPath", "/run/systemd/system/billet-node.service")
-		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		}, "is loaded from /run/systemd/system/billet-node.service", []string{stopFirst}, []string{pkg}},
 		{"the role's unit in another shape", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/other")
-		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		}, "declares RuntimeDirectory=billet/locks billet/other", []string{stopFirst, "renders that unit afresh"},
+			[]string{pkg}},
 		{"the role's unit with a drop-in", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "DropInPaths", "/etc/systemd/system/billet-node.service.d/env.conf")
-		}, "systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then converge the host role, which repairs that unit", "stop billet-node.service"},
+		}, "has drop-ins", []string{"remove the drop-ins that apply to billet-node.service " +
+			"(/etc/systemd/system/billet-node.service.d/env.conf", "then systemctl daemon-reload", judges},
+			[]string{pkg, stopFirst}},
 		{"the role's unit in another shape with a drop-in", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "RuntimeDirectory", "billet/locks billet/cache")
 			f.set(t, nodeUnit, "DropInPaths", "/etc/systemd/system/billet-node.service.d/rt.conf")
-		}, "remove the drop-ins on billet-node.service (/etc/systemd/system/billet-node.service.d/rt.conf) or fold " +
-			"their settings into the host role's variables, then systemctl daemon-reload, since a converge that upgrades billet refuses any drop-in on billet-node.service and one that sets RuntimeDirectory applies over whatever unit is in effect; then stop billet-node.service, then converge",
-			"which repairs that unit"},
+		}, "declares RuntimeDirectory=billet/locks billet/cache", []string{"remove the drop-ins that apply to " +
+			"billet-node.service (/etc/systemd/system/billet-node.service.d/rt.conf", judges},
+			[]string{pkg, stopFirst}},
+		{"the role's file not root's", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			repairUnitOwned = func(os.FileInfo) error { return errors.New(f.unitPath + " is not owned by root") }
+		}, "is not owned by root", []string{stopFirst}, []string{pkg}},
 		{"the role's file in another line shape", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			writeFile(t, f.unitPath, strings.Replace(f.legacy, "RuntimeDirectory=billet/locks\n",
 				"RuntimeDirectory=billet/locks \n", 1), 0o644)
-		}, "stop billet-node.service, then converge the host role", "install this release's package"},
-		{"the role's file not root's", func(t *testing.T, f *repairFixture) {
-			t.Helper()
-			repairUnitOwned = func(os.FileInfo) error { return errors.New(f.unitPath + " is not owned by root") }
-		}, "stop billet-node.service, then converge the host role", "install this release's package"},
+		}, "does not hold exactly one RuntimeDirectory assignment", []string{stopFirst}, []string{pkg}},
 		{"an alias", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "FragmentPath", "/etc/systemd/system/other.service")
-		}, "billet-node.service is an alias of other.service", "install this release's package"},
+		}, "is loaded from /etc/systemd/system/other.service",
+			[]string{"billet-node.service is an alias of other.service"}, []string{pkg, stopFirst}},
 		{"a packaged unit", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			f.set(t, nodeUnit, "FragmentPath", "/usr/lib/systemd/system/billet-node.service")
-		}, "install this release's package", "by hand"},
+		}, "is loaded from /usr/lib/systemd/system/billet-node.service", []string{pkg}, []string{"by hand"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRepairFixture(t)
@@ -441,9 +455,21 @@ func TestTheRepairsRefusalNamesTheRemedyThatReachesTheUnit(t *testing.T) {
 
 			o := f.repair(t)
 			if o.str("outcome") != outcomeRefused || o.str("reason") != endpointReasonShape ||
-				!strings.Contains(o.str("next"), tc.want) || strings.Contains(o.str("next"), tc.absent) {
-				t.Fatalf("outcome %q reason %q next %q, want a shape refusal whose next says %q and not %q",
-					o.str("outcome"), o.str("reason"), o.str("next"), tc.want, tc.absent)
+				!strings.Contains(o.str("why"), tc.why) {
+				t.Fatalf("outcome %q reason %q why %q, want the shape refusal saying %q", o.str("outcome"),
+					o.str("reason"), o.str("why"), tc.why)
+			}
+
+			for _, clause := range tc.want {
+				if !strings.Contains(o.str("next"), clause) {
+					t.Errorf("next %q does not say %q", o.str("next"), clause)
+				}
+			}
+
+			for _, clause := range tc.absent {
+				if strings.Contains(o.str("next"), clause) {
+					t.Errorf("next %q says %q, which is not this refusal's remedy", o.str("next"), clause)
+				}
 			}
 		})
 	}
