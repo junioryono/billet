@@ -131,6 +131,18 @@ func TestTheRefusalNamesTheRemedyForTheUnitInEffect(t *testing.T) {
 		{"a packaged unit", packagedLegacyNodeUnit,
 			[]string{"(/usr/lib/systemd/system/billet-node.service)", "install this release's package"},
 			[]string{"installing the package does not help"}},
+		{"a runtime override", strings.Replace(legacyNodeUnit, "/etc/systemd/system/", "/run/systemd/system/", 1),
+			[]string{"(/run/systemd/system/billet-node.service)", "neither the host role nor the package did",
+				"neither a converge nor installing the package changes it"},
+			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
+		{"a local administrator's unit", strings.Replace(legacyNodeUnit, "/etc/systemd/system/",
+			"/usr/local/lib/systemd/system/", 1),
+			[]string{"(/usr/local/lib/systemd/system/billet-node.service)", "neither the host role nor the package did"},
+			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
+		{"a unit with no file", strings.Replace(legacyNodeUnit, "FragmentPath=/etc/systemd/system/billet-node.service",
+			"FragmentPath=", 1),
+			[]string{"neither the host role nor the package did"},
+			[]string{"install this release's package", "converge the host role, which repairs that unit"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := checkUnitRequirements(t.Context(), nodeConfig, "v0.17.0", requirementsSystemctl(t, tc.unit))
@@ -237,8 +249,10 @@ func noClaim(t *testing.T) {
 }
 
 // AN UPGRADE THE NODE UNIT CANNOT RUN IS REFUSED BEFORE THE CLAIM AND BEFORE THE
-// JOB IS TAKEN (#168): the node reads the refusal through the caller's own
-// bookkeeping, so the rollout backs off; nothing is claimed; and the decision
+// JOB IS TAKEN (#168): nothing accepted the job before the refusal, so the
+// caller's refusal (which this test stands in for, as hostUpgrade's last step
+// does) is what the node reads and the rollout backs off; nothing is claimed;
+// and the decision
 // mark does not move, so the same decision is carried out once a converge has
 // installed the unit.
 func TestAnUpgradeTheNodeUnitCannotRunIsRefusedBeforeTheClaim(t *testing.T) {
@@ -311,6 +325,58 @@ func TestAHostAlreadyOnTheTargetSettlesWhateverItsUnitLacks(t *testing.T) {
 
 	if mark, err := readDecision(); err != nil || mark != 10 {
 		t.Errorf("the decision mark is %d (err %v) after the no-op, want 10", mark, err)
+	}
+}
+
+// A HOST ON THE TARGET'S VERSION THAT WILL STILL INSTALL IS JUDGED: a reinstall,
+// and a binary whose record names another manifest, each restart the node onto
+// the candidate, so the version alone exempts neither.
+func TestAHostOnTheTargetVersionThatWillInstallIsJudged(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reinstall bool
+		recorded  string
+	}{
+		{"a reinstall", true, ""},
+		{"a binary from another manifest", false, strings.Repeat("6", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			onALegacyLinuxNode(t, "v0.17.0")
+
+			if tc.recorded != "" {
+				exe, err := os.Executable()
+				mustOK(t, err)
+
+				sum, err := provenance.HashFile(exe)
+				mustOK(t, err)
+
+				mustOK(t, provenance.Write(provenance.Record{
+					Version: "v0.17.0", ManifestDigest: tc.recorded, BinarySHA256: sum,
+				}))
+			}
+
+			ack, answer := ackReader(t)
+
+			err := actOnResolved(t.Context(), processEnv(), nodeConfig, "",
+				hostUpgradeTarget{generation: 10, reinstall: tc.reinstall}, ack, nil, candidateManifest(t),
+				strings.Repeat("b", 64), heldTxLock(t))
+			if err == nil || !strings.Contains(err.Error(), "the loaded unit (/etc/systemd/system/billet-node.service) does not") {
+				t.Fatalf("an upgrade that installs onto a legacy unit returned %v, want the unit requirement's refusal",
+					err)
+			}
+
+			ack.refuse(err)
+
+			if got := answer(); !strings.HasPrefix(got, node.AckRefused) {
+				t.Errorf("the node was answered %q, want the refusal", got)
+			}
+
+			noClaim(t)
+
+			if mark, err := readDecision(); err != nil || mark != 0 {
+				t.Errorf("the refused upgrade moved the decision mark to %d (err %v), want it unmoved", mark, err)
+			}
+		})
 	}
 }
 

@@ -55,26 +55,27 @@ func TestTheRepairRunsUnderThisConvergesGuard(t *testing.T) {
 // could-not-tell.
 func TestTheRepairRefusesAHostARetirementTouched(t *testing.T) {
 	for _, tc := range []struct {
-		name, outcome, why string
-		plant              func(t *testing.T)
+		name, outcome, why, next string
+		plant                    func(t *testing.T)
 	}{
-		{"the guard carries the marker", outcomeRefused, "guard carries retirement " + markerID, func(t *testing.T) {
-			t.Helper()
-			markGuard(t, &guardFixture{root: upgradeRoot}, &guardTransition{Kind: transitionRetirement, ID: markerID},
-				nil)
-		}},
+		{"the guard carries the marker", outcomeRefused, "guard carries retirement " + markerID,
+			"finish the retirement", func(t *testing.T) {
+				t.Helper()
+				markGuard(t, &guardFixture{root: upgradeRoot}, &guardTransition{Kind: transitionRetirement, ID: markerID},
+					nil)
+			}},
 		{"a journal mid-retirement", outcomeRefused, "retirement journal (phase stopped, settled false)",
-			func(t *testing.T) {
+			"finish the retirement", func(t *testing.T) {
 				t.Helper()
 				plantJournal(t, retirement.PhaseStopped, repairHolder, false)
 			}},
 		{"a settled retained host", outcomeRefused, "retirement journal (phase done, settled true)",
-			func(t *testing.T) {
+			"follow the manual repair", func(t *testing.T) {
 				t.Helper()
 				plantJournal(t, retirement.PhaseDone, repairHolder, true)
 			}},
 		{"a journal that cannot be read", outcomeUnknown, "the retirement journal could not be judged",
-			func(t *testing.T) {
+			"", func(t *testing.T) {
 				t.Helper()
 				mustOK(t, os.MkdirAll(retirement.JournalPath(), 0o700))
 			}},
@@ -83,11 +84,17 @@ func TestTheRepairRefusesAHostARetirementTouched(t *testing.T) {
 			f := newRepairFixture(t)
 			tc.plant(t)
 
-			o := f.repair(t)
-			if o.str("outcome") != tc.outcome || o.str("reason") != endpointReasonRetirement ||
-				o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) {
-				t.Fatalf("outcome %q reason %q state %q (%s), want %s for the retirement saying %q", o.str("outcome"),
-					o.str("reason"), o.str("state"), o.str("why"), tc.outcome, tc.why)
+			// THE DRY RUN PREDICTS THE ACTION'S REFUSAL, so a converge's check mode
+			// never says it would repair a host the action refuses.
+			for _, args := range [][]string{{"--dry-run"}, nil} {
+				o := f.repair(t, args...)
+				if o.str("outcome") != tc.outcome || o.str("reason") != endpointReasonRetirement ||
+					o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) ||
+					!strings.HasPrefix(o.str("next"), tc.next) {
+					t.Fatalf("%q: outcome %q reason %q state %q (%s, next %q), want %s for the retirement saying %q "+
+						"and next %q", args, o.str("outcome"), o.str("reason"), o.str("state"), o.str("why"),
+						o.str("next"), tc.outcome, tc.why, tc.next)
+				}
 			}
 
 			if got := f.acted(t); len(got) != 0 || f.locks != 0 {
@@ -190,6 +197,19 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 			f.showsBetween(t, 6, 7, strings.Replace(string(body), "DropInPaths=\n",
 				"DropInPaths=/etc/systemd/system/billet-node.service.d/x.conf\n", 1))
 		}, "drop-ins"},
+		{"the unit was reloaded with the directory after the second judgement", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			body, err := os.ReadFile(f.unitFile(nodeUnit))
+			mustOK(t, err)
+			f.showsBetween(t, 6, 7, strings.Replace(string(body), "RuntimeDirectory=billet/locks\n",
+				"RuntimeDirectory=billet/locks billet/registration\n", 1))
+		}, "changed under the judgement"},
+		{"the stop's admission answered no DropInPaths", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			body, err := os.ReadFile(f.unitFile(nodeUnit))
+			mustOK(t, err)
+			f.showsBetween(t, 6, 7, strings.Replace(string(body), "DropInPaths=\n", "", 1))
+		}, "answered no DropInPaths"},
 		{"systemd restarted the node after the second judgement", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			body, err := os.ReadFile(f.unitFile(nodeUnit))

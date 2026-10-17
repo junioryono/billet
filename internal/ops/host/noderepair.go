@@ -299,6 +299,15 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 		}
 
+		// THE ACTION'S RETIREMENT REFUSAL, PREDICTED: read without the lock it
+		// is decided under, so a dry run never says a converge would repair a
+		// host the action refuses.
+		if judged.required {
+			if r := predictRepairRetirementRefusal(); r != nil {
+				return nil, r
+			}
+		}
+
 		return repairReport{Schema: endpointSchema, Outcome: outcomeReported, Required: judged.required, Why: judged.why,
 			Unit: judged.shape}, nil
 	}
@@ -405,13 +414,16 @@ func repairGuard(run string) (*txLock, *os.File, *endpointRefusal) {
 // admits a retirement's holder, so the marker is asked here. An unreadable
 // journal is could-not-tell.
 func repairRetirementRefusal(shape claimShape) *endpointRefusal {
-	const next = "converge this host ordinarily before retiring it; on a host already retired, follow the manual " +
-		"repair in " + unitRequirementsRemedyDoc
+	const (
+		inProgress = "finish the retirement (billet server retire), then follow the manual repair in " +
+			unitRequirementsRemedyDoc
+		settled = "follow the manual repair in " + unitRequirementsRemedyDoc
+	)
 
 	if t := shape.Guard.Transition; t != nil {
 		return endpointRefuse(endpointReasonRetirement, fmt.Sprintf("this converge's guard carries %s %s, and a "+
 			"retirement admits no runtime-unit repair: it would stop, reload and start the node outside the "+
-			"operations the retirement admits", t.Kind, t.ID), next, stateNothing)
+			"operations the retirement admits", t.Kind, t.ID), inProgress, stateNothing)
 	}
 
 	j, presence, err := retirement.ReadJournal()
@@ -420,6 +432,11 @@ func repairRetirementRefusal(shape claimShape) *endpointRefusal {
 	case retirement.JournalAbsent:
 		return nil
 	case retirement.JournalPresent:
+		next := inProgress
+		if j.Settled {
+			next = settled
+		}
+
 		return endpointRefuse(endpointReasonRetirement, fmt.Sprintf("this host holds a retirement journal (phase %s, "+
 			"settled %t), and a retirement admits no runtime-unit repair: it would stop, reload and start the node "+
 			"outside the operations the retirement admits", j.Phase, j.Settled), next, stateNothing)
@@ -427,6 +444,23 @@ func repairRetirementRefusal(shape claimShape) *endpointRefusal {
 		return endpointUnknown(endpointReasonRetirement, "the retirement journal could not be judged: "+err.Error(), "",
 			stateNothing)
 	}
+}
+
+// predictRepairRetirementRefusal is repairRetirementRefusal over a guard read
+// without a lock; a guard that cannot be read is could-not-tell.
+func predictRepairRetirementRefusal() *endpointRefusal {
+	shape, err := classifyClaim()
+
+	switch {
+	case err != nil:
+		return endpointUnknown(endpointReasonRetirement, "this host's converge guard could not be read: "+err.Error(),
+			"", stateNothing)
+	case shape.Kind == claimGuard && shape.RecordErr != "":
+		return endpointUnknown(endpointReasonRetirement, "this host's converge guard record could not be read: "+
+			shape.RecordErr, "", stateNothing)
+	}
+
+	return repairRetirementRefusal(shape)
 }
 
 // repairUnderLock is the stop, the unit, the start and the record, under the

@@ -211,6 +211,50 @@ func TestTheRepairChangesOneLineAndEndsWithTheNewInvocationsRecord(t *testing.T)
 	if o.str("before_sha256") != digestHex([]byte(f.legacy)) || o.str("after_sha256") != digestHex([]byte(want)) {
 		t.Error("the evidence's digests are not the unit's before and after")
 	}
+
+	// THE STOP IS ADMITTED ON ONE ANSWER: the last read before it asks for the
+	// process and the unit's shape together, and it is the seventh, after the
+	// two judgements' three each, as the staged reviews of it count.
+	shows, stop := f.showsBeforeStop(t)
+	if len(shows) != 7 {
+		t.Fatalf("systemd was asked %d times before the stop, want 7: %q", len(shows), shows)
+	}
+
+	for _, property := range []string{"MainPID", "InvocationID", "KillMode", "FragmentPath", "DropInPaths",
+		"NeedDaemonReload", "RuntimeDirectory"} {
+		if !strings.Contains(shows[6], "--property="+property) {
+			t.Errorf("the stop's admission (%q) did not ask for %s on the same answer", shows[6], property)
+		}
+	}
+
+	if !stop {
+		t.Error("the repair asked systemctl to stop nothing")
+	}
+}
+
+// showsBeforeStop is every show the fake answered before the first stop, and
+// whether a stop was asked for at all.
+func (f *repairFixture) showsBeforeStop(t *testing.T) ([]string, bool) {
+	t.Helper()
+
+	body, err := os.ReadFile(f.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var shows []string
+
+	for line := range strings.Lines(string(body)) {
+		switch fields := strings.Fields(line); {
+		case len(fields) == 0:
+		case fields[0] == "stop":
+			return shows, true
+		case fields[0] == "show":
+			shows = append(shows, strings.TrimSpace(line))
+		}
+	}
+
+	return shows, false
 }
 
 // THE DRY RUN SAYS WHAT A CONVERGE WOULD DO AND DOES NOTHING: the repair is

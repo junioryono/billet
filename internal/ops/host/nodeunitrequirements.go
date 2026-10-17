@@ -127,16 +127,23 @@ const unitRequirementsRemedyDoc = "docs/operating/upgrades.md"
 // under /etc overrides the packaged one, so installing a package changes
 // nothing there: the host role's converge repairs it (`billet node
 // repair-unit`), or the manual procedure does. A packaged unit is replaced by
-// installing this release's package, and a converge installs the role's.
+// installing this release's package, and a converge installs the role's. A
+// unit loaded from anywhere else (a /run override, or no file systemd names)
+// is neither's, and overrides both.
 func unitRemedy(fragment string) string {
-	if strings.HasPrefix(fragment, "/etc/") {
+	switch {
+	case strings.HasPrefix(fragment, "/etc/"):
 		return "converge the host role, which repairs that unit, or follow the manual repair in " +
 			unitRequirementsRemedyDoc + "; installing the package does not help, since a unit under /etc " +
 			"overrides the packaged one"
+	case strings.HasPrefix(fragment, "/usr/lib/systemd/system/"), strings.HasPrefix(fragment, "/lib/systemd/system/"):
+		return "install this release's package, or converge the host role, so that the unit in effect is one this " +
+			"release ships"
+	default:
+		return "find what installed the unit in effect, which neither the host role nor the package did and which " +
+			"overrides both, and remove it or give it the directory by hand as " + unitRequirementsRemedyDoc +
+			" describes; neither a converge nor installing the package changes it"
 	}
-
-	return "install this release's package, or converge the host role, so that the unit in effect is one this " +
-		"release ships"
 }
 
 // unitRequirementsInspector is the inspector the upgrade holds the node unit

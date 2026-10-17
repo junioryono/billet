@@ -164,6 +164,11 @@ func TestTheVintageProbeRecognisesThePreparationsAnswer(t *testing.T) {
 		t.Errorf("the dry run over a held guard (exit %d) is not recognised: %s", rc, out)
 	}
 
+	// THE PREPARATION'S COULD-NOT-TELL is its answer too, at its own status.
+	if !guardAnswered(exitUnknown, []byte(`{"outcome":"unknown","reason":"unreadable"}`)) {
+		t.Errorf("the preparation's could-not-tell at exit %d is not recognised", exitUnknown)
+	}
+
 	for name, tc := range map[string]struct {
 		rc  int
 		out string
