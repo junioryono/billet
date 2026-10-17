@@ -81,19 +81,20 @@ func cmdAMIBuild(ctx context.Context, env cli.Env, args []string) error {
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
 	group := fs.String("security-group", "", "override the security group from the config")
-	// THE WHOLE BUILD: provisioning, CreateImage, and waiting for the image to
-	// become launchable. Timed on a real build of the full toolcache path:
+	// THE WHOLE BUILD: provisioning, CreateImage, waiting for the image to become
+	// launchable, and the verifier's boot. Timed on a real build in us-west-2 on
+	// 2026-10-17, with the parity toolcache:
 	//
-	//	3m23s  provisioning, including the whole toolcache
-	//	9m20s  snapshot and registration
-	//	12m43s total
+	//	13m50s  provisioning, including the whole toolcache
+	//	38m46s  snapshot to available
+	//	 6m13s  the verifier's boot and report
+	//	58m49s  total
 	//
-	// The toolcache is the cheap half -- EC2's network pulls several GiB in about
-	// three minutes -- and the snapshot of a larger image is what grew. 20 minutes
-	// would have fitted this run with seven to spare, which is not enough margin
-	// for a slower region or a larger image, and the cost of a generous bound is
+	// The snapshot of a larger image is what grew: it was 9m20s when the image
+	// was smaller, and the default of 60 minutes, chosen then with room, expired
+	// two minutes into that day's verification. The cost of a generous bound is
 	// nothing: it is a deadline, not a wait.
-	timeout := fs.Duration("timeout", 60*time.Minute, "how long to wait for the whole build")
+	timeout := fs.Duration("timeout", 90*time.Minute, "how long to wait for the whole build")
 	public := fs.Bool("public-ip", false,
 		"give the builder a public address, for a subnet with no NAT gateway")
 	// ON BY DEFAULT, AND THE DEFAULT IS THE WHOLE POINT. A gate nobody remembers to
