@@ -3,6 +3,7 @@
 package firecracker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -21,8 +22,10 @@ import (
 //
 // HELD BY A PIDFD while its executable is opened, and proved still alive after, so
 // a pid the kernel reused in between is never mistaken for it.
-func apiPeerExecutable(socket string, uid int) (*os.File, error) {
-	conn, err := net.DialTimeout("unix", socket, apiTimeout)
+func apiPeerExecutable(ctx context.Context, socket string, uid int) (*os.File, error) {
+	d := net.Dialer{Timeout: apiTimeout}
+
+	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: connect to %s: %w", socket, err)
 	}
@@ -33,7 +36,7 @@ func apiPeerExecutable(socket string, uid int) (*os.File, error) {
 		return nil, fmt.Errorf("firecracker: read the peer of %s: %w", socket, err)
 	}
 
-	if uid <= 0 || cred.Uid != uint32(uid) { //nolint:gosec // a uid billet claimed fits a uint32.
+	if uid <= 0 || cred.Uid != uint32(uid) {
 		return nil, fmt.Errorf("firecracker: %s is served by uid %d, not the microVM's uid %d",
 			socket, cred.Uid, uid)
 	}

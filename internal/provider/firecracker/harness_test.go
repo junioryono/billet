@@ -608,7 +608,7 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	h.p.apiAs = func(socket string, _ int) *vmmAPI { return h.p.apiFor(socket) }
 
 	// THE FAKE VMM IS NO PROCESS, so the executable it "runs" is the configured one.
-	h.p.runningVMM = func(jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
+	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(h.p.execPath) }
 
 	return h
 }

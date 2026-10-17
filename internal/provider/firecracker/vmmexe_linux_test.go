@@ -16,7 +16,9 @@ func TestTheSocketPeerNamesTheExecutableServingIt(t *testing.T) {
 
 	socket := filepath.Join(shortDir(t), "api.sock")
 
-	ln, err := net.Listen("unix", socket)
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +39,7 @@ func TestTheSocketPeerNamesTheExecutableServingIt(t *testing.T) {
 		t.Skip("root's uid is 0, which a jail is never given")
 	}
 
-	exe, err := apiPeerExecutable(socket, os.Getuid())
+	exe, err := apiPeerExecutable(t.Context(), socket, os.Getuid())
 	if err != nil {
 		t.Fatalf("apiPeerExecutable: %v", err)
 	}
@@ -59,7 +61,7 @@ func TestTheSocketPeerNamesTheExecutableServingIt(t *testing.T) {
 		t.Errorf("the socket's peer executable digests to %s, and this test binary to %s", got, want)
 	}
 
-	if _, err := apiPeerExecutable(socket, os.Getuid()+1); err == nil {
+	if _, err := apiPeerExecutable(t.Context(), socket, os.Getuid()+1); err == nil {
 		t.Error("a socket served by another uid was accepted as the microVM's")
 	}
 }

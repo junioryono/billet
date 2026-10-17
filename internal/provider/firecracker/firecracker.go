@@ -178,7 +178,7 @@ type Provider struct {
 	// runningVMM opens the executable of the process serving a jail's API socket,
 	// which may no longer be the file at the configured path. A seam because it
 	// needs the kernel's socket credentials and /proc/<pid>/exe.
-	runningVMM func(j jail, res resources) (*os.File, error)
+	runningVMM func(ctx context.Context, j jail, res resources) (*os.File, error)
 	// removeCgroupFn is the cgroup teardown boundary. It is a seam so lifecycle
 	// recovery tests can prove that a failed removal retains its retry authority.
 	removeCgroupFn   func(jail) error
@@ -346,8 +346,8 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		bootWait:    DefaultBootWait,
 	}
 	p.removeCgroupFn = p.removeCgroup
-	p.runningVMM = func(j jail, res resources) (*os.File, error) {
-		return apiPeerExecutable(j.socket(), res.UID)
+	p.runningVMM = func(ctx context.Context, j jail, res resources) (*os.File, error) {
+		return apiPeerExecutable(ctx, j.socket(), res.UID)
 	}
 	p.processStart = hostProcessStart
 	p.openHandle = openVMMHandle

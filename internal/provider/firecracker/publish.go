@@ -129,7 +129,7 @@ func (p *Provider) Capture(ctx context.Context, id, snapshot string) error {
 	// every byte of the snapshot: the label would protect nothing it could not
 	// already change. What contains a hostile snapshot is the restore side, which runs
 	// billet's own build jailed and refuses a loaded guest of another shape.
-	if err := p.checkRunningVMM(j, res, record.VMM); err != nil {
+	if err := p.checkRunningVMM(ctx, j, res, record.VMM); err != nil {
 		return err
 	}
 
@@ -199,8 +199,8 @@ func checkSnapshotName(name string) error {
 }
 
 // checkRunningVMM refuses a microVM whose running VMM is not the build at execPath.
-func (p *Provider) checkRunningVMM(j jail, res resources, want string) error {
-	running, err := p.runningVMM(j, res)
+func (p *Provider) checkRunningVMM(ctx context.Context, j jail, res resources, want string) error {
+	running, err := p.runningVMM(ctx, j, res)
 	if err != nil {
 		return err
 	}

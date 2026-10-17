@@ -404,7 +404,7 @@ func TestACaptureRefusesAVMMRunningAReplacedBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h.p.runningVMM = func(jail, resources) (*os.File, error) { return os.Open(older) }
+	h.p.runningVMM = func(context.Context, jail, resources) (*os.File, error) { return os.Open(older) }
 
 	err := h.p.Capture(t.Context(), theInstance, "gold-1")
 	if !errors.Is(err, errSnapshotIncompatible) {
