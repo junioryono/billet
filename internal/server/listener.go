@@ -161,7 +161,8 @@ const identityWriteLimit = 2 * time.Second
 // historyJob is what a message said about its job, as job_history keeps it.
 func historyJob(j dispatch.Job) alloc.HistoryJob {
 	return alloc.HistoryJob{JobID: j.JobID, Owner: j.Owner, Repository: j.Repository,
-		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event}
+		WorkflowRef: j.WorkflowRef, Name: j.JobName, Event: j.Event, QueuedAt: j.QueuedAt,
+		ScaleSetAssignedAt: j.ScaleSetAssignedAt, RunnerAssignedAt: j.RunnerAssignedAt}
 }
 
 // Statistics is GitHub's own view of the scale set.
