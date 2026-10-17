@@ -144,6 +144,8 @@ type ReadOps interface {
 	ReadJobIdentity(ctx context.Context, jobID string) (int64, error)
 	ReadJobIdentityByInternalID(ctx context.Context, internalID int64) (string, error)
 	ReadJob(ctx context.Context, leaseID string) (ledgerdb.ReadJobRow, error)
+	ReadJobWait(ctx context.Context, leaseID string) (ledgerdb.ReadJobWaitRow, error)
+	ListJobWaits(ctx context.Context, arg ledgerdb.ListJobWaitsParams) ([]ledgerdb.ListJobWaitsRow, error)
 	ReadJobUsage(ctx context.Context, leaseID string) (ledgerdb.JobUsage, error)
 	ReadJobSeries(ctx context.Context, leaseID string) (ledgerdb.ReadJobSeriesRow, error)
 	ReadJobDestinations(ctx context.Context, leaseID string) ([]ledgerdb.ReadJobDestinationsRow, error)

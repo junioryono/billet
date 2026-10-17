@@ -208,7 +208,11 @@ changes=$(wc -l <"$work/rows" | tr -d ' ')
 	fi
 	printf '\n'
 
-	printf '### By area (%s changes)\n\n' "$changes"
+	if [ "$changes" = 1 ]; then
+		printf '### By area (1 change)\n\n'
+	else
+		printf '### By area (%s changes)\n\n' "$changes"
+	fi
 	if [ "$changes" = 0 ]; then
 		printf 'No commits since `%s`.\n\n' "$previous"
 	else
