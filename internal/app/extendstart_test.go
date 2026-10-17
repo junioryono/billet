@@ -30,7 +30,10 @@ func TestTheControlPlaneAsksForTimeBeforeItOpensTheLedger(t *testing.T) {
 			events []string
 			asked  time.Duration
 			out    bytes.Buffer
+			opened error
 		)
+
+		dir := ledgertest.Dir(t)
 
 		note := func(event string) {
 			mu.Lock()
@@ -52,6 +55,14 @@ func TestTheControlPlaneAsksForTimeBeforeItOpensTheLedger(t *testing.T) {
 				note("extend")
 				asked = d
 
+				// NOT YET OPENED: the control plane's open takes the state
+				// directory's lock, so an open here succeeds only before it.
+				db, err := state.Open(t.Context(), dir)
+				if err == nil {
+					err = db.Close()
+				}
+				opened = err
+
 				if refuse {
 					return errors.New("no notification socket")
 				}
@@ -62,7 +73,7 @@ func TestTheControlPlaneAsksForTimeBeforeItOpensTheLedger(t *testing.T) {
 		}
 
 		cfg := &config.Config{Server: &config.ServerConfig{
-			Listen: "127.0.0.1:0", IdentityDir: ledgertest.Dir(t), MaxVCPU: 8, MaxMemory: 16 * config.GiB,
+			Listen: "127.0.0.1:0", IdentityDir: dir, MaxVCPU: 8, MaxMemory: 16 * config.GiB,
 		}}
 
 		cp, err := OpenControlPlane(t.Context(), cfg, host, nil, ControlPlaneOptions{})
@@ -81,8 +92,13 @@ func TestTheControlPlaneAsksForTimeBeforeItOpensTheLedger(t *testing.T) {
 				"releasing it after the open", refuse, got)
 		}
 
-		if asked != state.OpenBound() {
-			t.Errorf("refuse=%v: asked for %s, want the open's bound %s", refuse, asked, state.OpenBound())
+		if opened != nil {
+			t.Errorf("refuse=%v: the ledger was already open when the extension was asked for (%v); "+
+				"asked after the open, a cold scan has already been killed", refuse, opened)
+		}
+
+		if asked != state.StartupBound() {
+			t.Errorf("refuse=%v: asked for %s, want the open's bound %s", refuse, asked, state.StartupBound())
 		}
 
 		if refuse && !strings.Contains(out.String(), "could not ask the service manager for time") {

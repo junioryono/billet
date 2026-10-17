@@ -45,8 +45,11 @@ func TestUpStartsEachUnitUnderItsOwnStartBound(t *testing.T) {
 		t.Fatalf("a prepared host was refused: %v", err)
 	}
 
+	// THE SERVER'S BOUND CARRIES THE EXTENSION it asks systemd for before it
+	// opens the ledger (unitStartDeadline); the node's is the unit's own.
 	for _, unit := range []string{deploy.ServerUnitName, deploy.NodeUnitName} {
-		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit], deploy.UnitStartTimeout)
+		deadlineWithin(t, "the start of "+unit, f.deadlines["start "+unit],
+			unitStartDeadline(unit)-lifecycleDeadlineMargin)
 	}
 }
 

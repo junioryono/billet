@@ -216,9 +216,9 @@ func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) e
 // (TestTheIntegrityScanFitsTheServerUnitsStartBound).
 const integrityScanBudget = 80 * time.Second
 
-// OpenBound is the longest an open that scans may take: the scan's own bound
-// and the startup budget paused around it.
-func OpenBound() time.Duration { return integrityScanBudget + startupTimeout }
+// StartupBound is the longest an open that scans may take: the scan's own
+// bound and the startup budget paused around it.
+func StartupBound() time.Duration { return integrityScanBudget + startupTimeout }
 
 // integrityCheck refuses to serve from a corrupt ledger, because scheduling
 // against corrupt capacity data is worse than not starting.

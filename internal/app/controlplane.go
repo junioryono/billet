@@ -169,7 +169,7 @@ func OpenControlPlane(
 	// on 2026-10-17 that failed a control plane's start twice. A failure to ask
 	// is said and decides nothing, because the open may well be fast.
 	if host.ExtendStart != nil {
-		if err := host.ExtendStart(state.OpenBound()); err != nil {
+		if err := host.ExtendStart(state.StartupBound()); err != nil {
 			fmt.Fprintf(host.Out, "could not ask the service manager for time to open the ledger: %v\n", err)
 		}
 	}

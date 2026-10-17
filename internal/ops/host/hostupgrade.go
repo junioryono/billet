@@ -18,7 +18,6 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/app"
 	"github.com/junioryono/billet/internal/cli"
 	"github.com/junioryono/billet/internal/config"
@@ -2835,7 +2834,7 @@ func (h *systemdHost) StartServices(ctx context.Context) error {
 		}
 
 		// UNDER THE UNIT'S OWN START BOUND, as `local up` starts one.
-		startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
+		startCtx, cancelStart := context.WithTimeout(ctx, unitStartDeadline(unit))
 		_, err := h.converge.StartAndProve(startCtx, unit)
 		cancelStart()
 
