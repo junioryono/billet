@@ -101,9 +101,14 @@ func cmdStatus(ctx context.Context, env cli.Env, args []string) error {
 	// ONE READ FOR EVERY TIER'S LAST HOUR, grouped here.
 	now := time.Now()
 
-	recent, _, err := a.JobWaits(ctx, now.Add(-time.Hour))
+	recent, partial, err := a.JobWaits(ctx, now.Add(-time.Hour))
 	if err != nil {
 		return err
+	}
+
+	if partial {
+		fmt.Fprintln(env.Stdout, "waits     PARTIAL: the last hour started more jobs than one read takes; "+
+			"each tier's queue wait below leaves its oldest out")
 	}
 
 	waits := map[string][]alloc.JobWait{}

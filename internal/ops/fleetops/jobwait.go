@@ -48,6 +48,12 @@ func cmdJobsWait(ctx context.Context, env cli.Env, args []string) error {
 
 	defer closeDB()
 
+	// A LABEL THE CONFIGURATION DOES NOT NAME IS REFUSED, so a typo is not read
+	// as a tier that started nothing.
+	if *tier != "" && !slices.ContainsFunc(cfg.Tiers, func(t config.Tier) bool { return t.Label == *tier }) {
+		return fmt.Errorf("billet jobs wait: --tier %q is not a tier in %s", *tier, *cfgPath)
+	}
+
 	report, err := buildJobWaits(ctx, a, cfg.Tiers, *tier, time.Now().Add(-*since))
 	if err != nil {
 		return err
@@ -94,11 +100,11 @@ type stillWaiting struct {
 	Oldest string
 }
 
-// waitParts are the rows of a group, in the order they add up: at GitHub, for
-// room and to start telescope to the whole wait.
+// waitParts are the rows of a group. For each job, at GitHub, for room and to
+// start add up to its wait; each row is summarised over the jobs whose two ends
+// of that part were recorded, so the rows' percentiles need not add up.
 //
-// below says what a part under zero means: for room it is usually the room
-// bought first, and everywhere else a clock that disagreed.
+// below says what a part under zero means.
 var waitParts = []struct {
 	name  string
 	part  func(alloc.JobWait) (time.Duration, bool)
@@ -186,7 +192,8 @@ func renderJobWaits(w io.Writer, r jobWaits) {
 		"negative when the room was bought first); to start: the purchase to the start (billet's clock)")
 
 	if r.Partial {
-		fmt.Fprintln(w, "PARTIAL: the window holds more jobs than one report reads; shorten --since")
+		fmt.Fprintln(w, "PARTIAL: the window holds more jobs than one report reads, and its oldest were "+
+			"left out; shorten --since")
 	}
 
 	if len(r.Groups) == 0 {
@@ -220,12 +227,12 @@ func renderJobWaits(w io.Writer, r jobWaits) {
 			}
 
 			fmt.Fprintf(w, "  %-10s %6d %9s %9s %9s %9s %9s %9s %9s  %s\n", p.name, s.Count,
-				waitText(s.Mean), waitText(s.P50), waitText(s.P75), waitText(s.P90), waitText(s.P99),
-				waitText(s.P9999), waitText(s.Longest), s.LongestLease)
+				WaitText(s.Mean), WaitText(s.P50), WaitText(s.P75), WaitText(s.P90), WaitText(s.P99),
+				WaitText(s.P9999), WaitText(s.Longest), s.LongestLease)
 
 			if s.Negative > 0 {
 				fmt.Fprintf(w, "  %-10s %6s %d below zero, down to %s: %s\n",
-					"", "", s.Negative, waitText(s.Shortest), p.below)
+					"", "", s.Negative, WaitText(s.Shortest), p.below)
 			}
 		}
 	}
@@ -234,6 +241,19 @@ func renderJobWaits(w io.Writer, r jobWaits) {
 		fmt.Fprintf(w, "\nstill waiting: %s, %d job(s) for room, oldest since %s (the listener's last report)\n",
 			q.Tier, q.Jobs, orUnknown(q.Oldest))
 	}
+}
+
+// githubTimes is when GitHub queued the job and handed it on, each through
+// missing where no message carried it.
+func githubTimes(rec alloc.JobRecord, missing func(string) string) string {
+	clock := ""
+	if rec.GitHubQueuedAt != "" || rec.GitHubScaleSetAssignedAt != "" || rec.GitHubRunnerAssignedAt != "" {
+		clock = " (GitHub's clock)"
+	}
+
+	return fmt.Sprintf("queued %s, assigned to the scale set %s, to a runner %s%s",
+		missing(rec.GitHubQueuedAt), missing(rec.GitHubScaleSetAssignedAt),
+		missing(rec.GitHubRunnerAssignedAt), clock)
 }
 
 // waitedLine is one job's wait and its parts, each "unknown" where an end of it
@@ -245,20 +265,29 @@ func waitedLine(rec alloc.JobRecord) string {
 			return "unknown"
 		}
 
-		return waitText(d)
+		return WaitText(d)
 	}
 
 	return fmt.Sprintf("%s (at github %s, for room %s, to start %s)", text(w.Wait()),
 		text(w.AtGitHub()), text(w.ForRoom()), text(w.ToStart()))
 }
 
-// waitText is a wait to the second, or to a tenth under ten seconds, signed.
-func waitText(d time.Duration) string {
+// WaitText is a wait to the second, or to a tenth under ten seconds. THE SIGN
+// SURVIVES THE ROUNDING: a wait just below zero is printed to the millisecond,
+// or whole under one, never as 0s.
+func WaitText(d time.Duration) string {
+	r := d.Round(time.Second)
 	if d > -10*time.Second && d < 10*time.Second {
-		return d.Round(100 * time.Millisecond).String()
+		r = d.Round(100 * time.Millisecond)
 	}
 
-	return d.Round(time.Second).String()
+	if d < 0 && r == 0 {
+		if r = d.Round(time.Millisecond); r == 0 {
+			r = d
+		}
+	}
+
+	return r.String()
 }
 
 // The JSON report. Every duration is in seconds, and a part no job could be
@@ -272,8 +301,9 @@ type jobWaitsJSON struct {
 }
 
 type waitGroupJSON struct {
-	Tier     string           `json:"tier"`
-	VCPU     int              `json:"vcpu"`
+	Tier string `json:"tier"`
+	// VCPU is null for a shape the rows did not record.
+	VCPU     *int             `json:"vcpu"`
 	Started  int              `json:"started"`
 	Unknown  int              `json:"no_queue_time"`
 	Wait     *waitSummaryJSON `json:"wait"`
@@ -322,7 +352,12 @@ func renderJobWaitsJSON(w io.Writer, r jobWaits) error {
 
 	for i := range r.Groups {
 		g := &r.Groups[i]
-		out.Groups = append(out.Groups, waitGroupJSON{Tier: g.Tier, VCPU: g.VCPU, Started: g.Started,
+		var vcpu *int
+		if g.VCPU > 0 {
+			vcpu = &g.VCPU
+		}
+
+		out.Groups = append(out.Groups, waitGroupJSON{Tier: g.Tier, VCPU: vcpu, Started: g.Started,
 			Unknown: g.Unknown, Wait: summaryJSON(g.Wait), AtGitHub: summaryJSON(g.AtGitHub),
 			ForRoom: summaryJSON(g.ForRoom), ToStart: summaryJSON(g.ToStart)})
 	}

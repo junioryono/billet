@@ -7,7 +7,7 @@ workflow   "acme/api/.github/workflows/ci.yml@refs/heads/main"
 event      "push"
 result     github "succeeded"; billet done
 times      queued 2026-10-09T11:59:57.000000000Z, assigned 2026-10-09T11:59:57.000000000Z, started 2026-10-09T12:00:00.000000000Z, finished 2026-10-09T12:02:51.000000000Z
-github     queued -, assigned to the scale set -, to a runner - (GitHub's clock)
+github     queued -, assigned to the scale set -, to a runner -
 waited     unknown (at github unknown, for room unknown, to start 3s)
 
 usage      measured by the host epyc-1, 169 samples every 1s over 2m47.5s

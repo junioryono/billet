@@ -55,8 +55,62 @@ func TestSummarizeLeavesUnknownsOutAndKeepsNegatives(t *testing.T) {
 		t.Errorf("mean = %s, want %s with the negative wait counted as negative", s.Mean, want)
 	}
 
+	// A WINDOW AT THE REPORT'S BOUND, of waits a day long, would overflow a sum
+	// of nanoseconds into a negative mean.
+	long := make([]JobWait, 120_000)
+	for i := range long {
+		long[i] = job("l", 24*time.Hour)
+	}
+	if m := Summarize(long, JobWait.Wait).Mean; m != 24*time.Hour {
+		t.Errorf("the mean of 120,000 one-day waits is %s, want 24h", m)
+	}
+
 	if none := Summarize([]JobWait{{LeaseID: "x", StartedAt: base}}, JobWait.Wait); none != (WaitSummary{}) {
 		t.Errorf("a set with no measurable wait summarized as %+v, want nothing", none)
+	}
+}
+
+// waitsHeard is a QueueWaitObserver that keeps what it heard.
+type waitsHeard []time.Duration
+
+func (w *waitsHeard) JobWaited(_ string, wait time.Duration) { *w = append(*w, wait) }
+
+// WHICHEVER END LANDS SECOND TELLS THE WAIT, once: a queue time recorded before
+// the start is told by the start, and a repeated start tells nothing.
+func TestAQueueTimeRecordedBeforeTheStartIsToldByTheStart(t *testing.T) {
+	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB},
+		[]config.Tier{tier("linux", 2, 8*config.GiB)}, WithClock(func() time.Time { return now }))
+
+	heard := &waitsHeard{}
+	a.ObserveQueueWaits(heard)
+
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 0, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := "billet-" + lease.ID
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+		LaunchRequestID: 1, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if err := a.RecordJobIdentity(t.Context(), lease.ID, HistoryJob{JobID: "j",
+		QueuedAt: now.Add(-7 * time.Minute)}); err != nil {
+		t.Fatalf("RecordJobIdentity: %v", err)
+	}
+	if len(*heard) != 0 {
+		t.Fatalf("a wait was told before the job started: %v", *heard)
+	}
+
+	now = now.Add(time.Minute)
+	for range 2 {
+		if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 1, name, 1, 9, "j", JobIdentity{}); err != nil {
+			t.Fatalf("StartPoolRunner: %v", err)
+		}
+	}
+
+	if len(*heard) != 1 || (*heard)[0] != 8*time.Minute {
+		t.Errorf("heard %v, want one 8m wait told by the start", *heard)
 	}
 }
 
@@ -113,6 +167,16 @@ func TestJobWaitsReadsTheWindowAndItsPartsAddUp(t *testing.T) {
 	if partial || len(jobs) != 1 || jobs[0].LeaseID != waited.ID {
 		t.Fatalf("JobWaits = %+v (partial %v), want only %s: %s started before the window and %s never",
 			jobs, partial, waited.ID, before.ID, unstarted.ID)
+	}
+
+	// THE BOUND KEEPS THE NEWEST, and a window of exactly the bound is whole.
+	all, partial, err := a.jobWaits(t.Context(), since.Add(-2*time.Hour), 1)
+	if err != nil || !partial || len(all) != 1 || all[0].LeaseID != waited.ID {
+		t.Errorf("a bound of one over two started jobs read %+v (partial %v, %v); want only the newest, %s, partial",
+			all, partial, err, waited.ID)
+	}
+	if _, partial, err := a.jobWaits(t.Context(), since.Add(-2*time.Hour), 2); err != nil || partial {
+		t.Errorf("a bound of two over two started jobs was called partial (%v)", err)
 	}
 
 	w := jobs[0]

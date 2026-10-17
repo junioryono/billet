@@ -36,15 +36,59 @@ func (a *Allocator) ObserveQueueWaits(o QueueWaitObserver) {
 	a.waits.Store(&o)
 }
 
-func (a *Allocator) reportWait(w JobWait) {
-	o := a.waits.Load()
-	if o == nil {
-		return
+// waitsToTell holds the queue waits one write transaction completed.
+type waitsToTell struct {
+	waits []JobWait
+}
+
+// ifCompleted adds the lease's wait when this transaction's write is the one
+// that made both of its ends known: the queue time and the start are each
+// written once, so exactly one write ever completes the pair, whichever of the
+// two lands second.
+func (w *waitsToTell) ifCompleted(ctx context.Context, tx *sql.Tx, leaseID string,
+	before ledgerdb.ReadJobWaitRow,
+) error {
+	if before.GithubQueuedAt != "" && before.StartedAt != "" {
+		return nil
 	}
 
-	if wait, ok := w.Wait(); ok {
-		(*o).JobWaited(w.Tier, wait)
+	after, found, err := readJobWait(ctx, tx, leaseID)
+	if err != nil || !found || after.GithubQueuedAt == "" || after.StartedAt == "" {
+		return err
 	}
+
+	w.waits = append(w.waits, JobWait{LeaseID: leaseID, Tier: after.Tier,
+		QueuedAt: parseStamp(after.GithubQueuedAt), StartedAt: parseStamp(after.StartedAt)})
+
+	return nil
+}
+
+// txTelling runs one write and, only once it commits, tells the observer every
+// queue wait it completed.
+func (a *Allocator) txTelling(ctx context.Context, fn func(*sql.Tx, *waitsToTell) error) error {
+	var told waitsToTell
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		told = waitsToTell{}
+
+		return fn(tx, &told)
+	})
+	if err != nil {
+		return err
+	}
+
+	o := a.waits.Load()
+	if o == nil {
+		return nil
+	}
+
+	for i := range told.waits {
+		if wait, ok := told.waits[i].Wait(); ok {
+			(*o).JobWaited(told.waits[i].Tier, wait)
+		}
+	}
+
+	return nil
 }
 
 // JobWait is one started job's times, each zero where the ledger has none.
@@ -106,22 +150,35 @@ func between(from, to time.Time) (time.Duration, bool) {
 	return to.Sub(from), true
 }
 
-// jobWaitsLimit bounds one report's read. A day of the reference deployment's
-// busiest recorded week was under 3,000 jobs, so this is months of history; a
-// window past it says the report is partial rather than reading without end.
+// jobWaitsLimit bounds one report's read. The reference deployment's busiest
+// recorded day, 2026-10-16, started under 3,000 jobs, so this is months of
+// history; a window past it says the report is partial rather than reading
+// without end.
 const jobWaitsLimit = 200_000
 
-// JobWaits reads every job that started at or after since, oldest start first.
-// The bool is true when the read stopped at its bound, so the report is partial.
+// JobWaits reads the jobs that started at or after since, newest start first.
+// The bool is true when the window held more than one read takes, in which case
+// the oldest are the ones left out.
 func (a *Allocator) JobWaits(ctx context.Context, since time.Time) ([]JobWait, bool, error) {
+	return a.jobWaits(ctx, since, jobWaitsLimit)
+}
+
+func (a *Allocator) jobWaits(ctx context.Context, since time.Time, limit int) ([]JobWait, bool, error) {
 	var out []JobWait
 
+	partial := false
+
 	err := a.db.View(ctx, func(q querier) error {
+		// ONE PAST THE BOUND, so a window of exactly the bound is not called partial.
 		rows, err := state.ReadQueries(q).ListJobWaits(ctx, ledgerdb.ListJobWaitsParams{
-			Since: sql.NullString{String: ts(since), Valid: true}, MaxRows: jobWaitsLimit,
+			Since: sql.NullString{String: ts(since), Valid: true}, MaxRows: int64(limit) + 1,
 		})
 		if err != nil {
 			return fmt.Errorf("alloc: list job waits: %w", err)
+		}
+
+		if len(rows) > limit {
+			rows, partial = rows[:limit], true
 		}
 
 		out = make([]JobWait, 0, len(rows))
@@ -141,7 +198,7 @@ func (a *Allocator) JobWaits(ctx context.Context, since time.Time) ([]JobWait, b
 		return nil
 	})
 
-	return out, len(out) >= jobWaitsLimit, err
+	return out, partial, err
 }
 
 // WaitSummary is one distribution of waits. Every percentile is nearest rank
@@ -158,9 +215,9 @@ type WaitSummary struct {
 	// number leads to a job.
 	Longest      time.Duration
 	LongestLease string
-	// Shortest is the smallest. Negative counts the waits below zero: the two
-	// clocks disagreed by more than the wait. They are kept in the distribution
-	// as they are.
+	// Shortest is the smallest, and Negative counts the values below zero, kept
+	// in the distribution as they are. What one means is the part's: a room
+	// bought before the job, or two clocks or one clock's times out of order.
 	Shortest time.Duration
 	Negative int
 }
@@ -175,7 +232,9 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 
 	samples := make([]sample, 0, len(jobs))
 
-	var sum time.Duration
+	// IN SECONDS, AS A FLOAT: the report's bound of days-long waits would
+	// overflow a sum of nanoseconds.
+	var sum float64
 
 	for i := range jobs {
 		d, ok := part(jobs[i])
@@ -184,7 +243,7 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 		}
 
 		samples = append(samples, sample{d, jobs[i].LeaseID})
-		sum += d
+		sum += d.Seconds()
 	}
 
 	if len(samples) == 0 {
@@ -203,7 +262,7 @@ func Summarize(jobs []JobWait, part func(JobWait) (time.Duration, bool)) WaitSum
 	}
 
 	out := WaitSummary{
-		Count: n, Mean: sum / time.Duration(n),
+		Count: n, Mean: time.Duration(sum / float64(n) * float64(time.Second)),
 		P50: at(5000), P75: at(7500), P90: at(9000), P99: at(9900), P9999: at(9999),
 		Longest: samples[n-1].d, LongestLease: samples[n-1].lease, Shortest: samples[0].d,
 	}

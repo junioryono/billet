@@ -126,6 +126,53 @@ func (w *waitsTold) told() ([]string, []time.Duration) {
 	return slices.Clone(w.tiers), slices.Clone(w.waits)
 }
 
+// A COMPLETION FILLS THE TIMES ITS JOBSTARTED LEFT OUT, and that write tells
+// the wait; a completion that names no runner brings none, because the lease
+// its request id finds may be running another job.
+func TestACompletionFillsTheQueueTimeOnlyWhenItNamesItsRunner(t *testing.T) {
+	t.Parallel()
+
+	for _, named := range []bool{true, false} {
+		p := newRunnerlessPool(t, job11)
+		runner := p.launchedFor11(t)
+
+		told := &waitsTold{}
+		p.a.ObserveQueueWaits(told)
+
+		started := job11
+		started.RunnerID, started.RunnerName = 77, runner.RunnerName
+		if err := p.l.handle(t.Context(), &Message{MessageID: 2, Started: []dispatch.Job{started},
+			Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+			t.Fatalf("start job 11: %v", err)
+		}
+
+		completed := started
+		completed.Result = "Succeeded"
+		completed.QueuedAt = time.Now().Add(-5 * time.Minute)
+		if !named {
+			completed.RunnerID, completed.RunnerName = 0, ""
+		}
+		if err := p.l.handle(t.Context(), &Message{MessageID: 3, Completed: []dispatch.Job{completed},
+			Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+			t.Fatalf("complete job 11: %v", err)
+		}
+
+		got, err := p.a.Job(t.Context(), runner.LeaseID)
+		if err != nil {
+			t.Fatalf("Job: %v", err)
+		}
+		_, waits := told.told()
+		if named && (got.GitHubQueuedAt == "" || len(waits) != 1) {
+			t.Errorf("a completion naming its runner left queue time %q and told %v; want it filled and one wait",
+				got.GitHubQueuedAt, waits)
+		}
+		if !named && (got.GitHubQueuedAt != "" || len(waits) != 0) {
+			t.Errorf("a runnerless completion recorded queue time %q and told %v; want neither",
+				got.GitHubQueuedAt, waits)
+		}
+	}
+}
+
 // GITHUB'S TIMES REACH THE ROW OF THE JOB THAT RAN, AND ITS WAIT IS TOLD ONCE.
 // Driven through handle: a redelivered JobStarted and the completion, whose
 // times differ, write nothing over the first and tell nothing again.

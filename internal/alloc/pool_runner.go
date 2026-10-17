@@ -92,7 +92,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 	}
 
 	var out PoolRunner
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.txTelling(ctx, func(tx *sql.Tx, told *waitsToTell) error {
 		q := state.WriteQueries(tx)
 
 		prior, found, err := poolRunnerByLease(ctx, q, leaseID)
@@ -123,7 +123,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 					return fmt.Errorf("alloc: bind recovered pool runner %q to job %q: %w",
 						runnerName, jobID, err)
 				}
-				if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+				if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 					return err
 				}
 				prior.ActualRequestID, prior.RunID, prior.JobID = requestID, runID, jobID
@@ -144,7 +144,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			}
 			// The same job reported started again: the start is already recorded,
 			// and a reason that landed in between is repaired now.
-			if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+			if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 				return err
 			}
 			out = prior
@@ -169,7 +169,7 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		// a pool member stays where the launch left it while GitHub binds work
 		// to the physical runner, so the ledger's evidence that a job ran (see
 		// disruptionFor) is written on this edge as well as on `busy`.
-		if err := a.recordJobStartTx(ctx, tx, leaseID, a.now()); err != nil {
+		if err := a.recordJobStartTx(ctx, tx, leaseID, a.now(), told); err != nil {
 			return err
 		}
 		prior.RunnerID, prior.Status = runnerID, PoolRunnerBusy

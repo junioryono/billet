@@ -47,20 +47,14 @@ func (j HistoryJob) Repo() string {
 // this one, so a later message can complete the record but never rewrite it.
 // A lease with no history row records nothing: the row opens at assignment,
 // and a message about a lease the ledger never assigned is not evidence of a
-// job this deployment ran.
-//
-// THE WRITE THAT FIRST HOLDS BOTH ENDS OF THE JOB'S WAIT REPORTS IT, once,
-// after it commits. The start is on the row before this runs: identifyStarted
-// binds the runner, which records the start, before it records the identity,
-// and a completion only fills what JobStarted left out of a job that started.
+// job this deployment ran. A write that completes the job's queue wait tells it,
+// as the start does when it lands second.
 func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job HistoryJob) error {
 	if strings.TrimSpace(leaseID) == "" || strings.TrimSpace(job.JobID) == "" {
 		return nil
 	}
 
-	var waited *JobWait
-
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	return a.txTelling(ctx, func(tx *sql.Tx, told *waitsToTell) error {
 		before, found, err := readJobWait(ctx, tx, leaseID)
 		if err != nil || !found {
 			return err
@@ -80,23 +74,8 @@ func (a *Allocator) RecordJobIdentity(ctx context.Context, leaseID string, job H
 			return fmt.Errorf("alloc: record the job lease %s ran: %w", leaseID, err)
 		}
 
-		after, _, err := readJobWait(ctx, tx, leaseID)
-		if err != nil {
-			return err
-		}
-
-		if before.GithubQueuedAt == "" && after.GithubQueuedAt != "" && after.StartedAt != "" {
-			waited = &JobWait{LeaseID: leaseID, Tier: after.Tier,
-				QueuedAt: parseStamp(after.GithubQueuedAt), StartedAt: parseStamp(after.StartedAt)}
-		}
-
-		return nil
+		return told.ifCompleted(ctx, tx, leaseID, before)
 	})
-	if err == nil && waited != nil {
-		a.reportWait(*waited)
-	}
-
-	return err
 }
 
 // readJobWait reads the two ends of one job's wait inside a write, so the

@@ -223,9 +223,7 @@ func renderJob(w io.Writer, rec alloc.JobRecord, u *alloc.RecordedUsage) {
 	line("result", "github %s; billet %s", quoted(rec.Result), orUnknown(rec.Conclusion))
 	line("times", "queued %s, assigned %s, started %s, finished %s", orUnknown(rec.QueuedAt),
 		orUnknown(rec.AssignedAt), orUnknown(rec.StartedAt), orUnknown(rec.FinishedAt))
-	line("github", "queued %s, assigned to the scale set %s, to a runner %s (GitHub's clock)",
-		orUnknown(rec.GitHubQueuedAt), orUnknown(rec.GitHubScaleSetAssignedAt),
-		orUnknown(rec.GitHubRunnerAssignedAt))
+	line("github", "%s", githubTimes(rec, orUnknown))
 	line("waited", "%s", waitedLine(rec))
 
 	fmt.Fprintln(w)

@@ -426,7 +426,7 @@ SELECT lease_id, tier, vcpu, github_queued_at, github_scale_set_assigned_at,
        COALESCE(started_at, '') AS started_at
   FROM job_history
  WHERE started_at IS NOT NULL AND started_at >= $1
- ORDER BY started_at, lease_id
+ ORDER BY started_at DESC, lease_id DESC
  LIMIT CAST($2 AS BIGINT)
 `
 
@@ -448,7 +448,8 @@ type ListJobWaitsRow struct {
 }
 
 // The jobs that started since a moment, with every time their wait is split
-// by, oldest start first, bounded.
+// by, newest start first, bounded: a window past the bound loses its oldest
+// jobs, never the ones an operator is looking at now.
 //
 // WINDOWED ON started_at, because a wait is known once the job starts: a job
 // still queued has no row here that says so, and the report counts those from

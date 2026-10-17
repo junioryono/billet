@@ -165,12 +165,21 @@ func TestJobsWaitPrintsTheLedgersWaits(t *testing.T) {
 		t.Errorf("at github = %+v for a job GitHub gave no scale-set time; want null", report.Groups[0].AtGitHub)
 	}
 
-	other := capture(t, func() {
-		if err := Jobs(t.Context(), processEnv(), []string{"wait", "--config", cfg, "--tier", "nobody"}); err != nil {
-			t.Errorf("billet jobs wait --tier nobody: %v", err)
+	err := Jobs(t.Context(), processEnv(), []string{"wait", "--config", cfg, "--tier", "nobody"})
+	if err == nil || !strings.Contains(err.Error(), `--tier "nobody" is not a tier`) {
+		t.Errorf("--tier nobody = %v, want it refused as no tier of the configuration", err)
+	}
+}
+
+// A WAIT JUST BELOW ZERO KEEPS ITS SIGN, however it is rounded.
+func TestAWaitBelowZeroIsNeverPrintedAsZero(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		-40 * time.Millisecond: "-40ms", -400 * time.Microsecond: "-400µs",
+		-12 * time.Second: "-12s", 40 * time.Millisecond: "0s", 3*time.Minute + 400*time.Millisecond: "3m0s",
+		-1500 * time.Millisecond: "-1.5s",
+	} {
+		if got := WaitText(d); got != want {
+			t.Errorf("WaitText(%s) = %q, want %q", d, got, want)
 		}
-	})
-	if !strings.Contains(other, "no job started in the window") || strings.Contains(other, lease) {
-		t.Errorf("--tier nobody reported another tier's job:\n%s", other)
 	}
 }

@@ -2658,7 +2658,7 @@ func (a *Allocator) ServiceableRunnerLeaseIDs(ctx context.Context, tier string) 
 
 // transition performs a fenced, state-machine-checked phase change.
 func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64, to Phase, extra func(*sql.Tx) error) error {
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+	return a.txTelling(ctx, func(tx *sql.Tx, told *waitsToTell) error {
 		lease, err := a.load(ctx, tx, leaseID, epoch)
 		if err != nil {
 			return err
@@ -2736,7 +2736,7 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			// A REPEATED BUSY REPORT STILL LOOKS BACK, because a reason may have
 			// landed between the first report and this one.
 			if to == PhaseBusy {
-				return a.recordJobStartTx(ctx, tx, leaseID, a.now().UTC())
+				return a.recordJobStartTx(ctx, tx, leaseID, a.now().UTC(), told)
 			}
 
 			return nil
@@ -2786,7 +2786,7 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 		// contradicts it (see disruptionFor). A lease with no history row ran
 		// no job GitHub told billet about, and the update matches nothing.
 		if to == PhaseBusy {
-			if err := a.recordJobStartTx(ctx, tx, leaseID, now); err != nil {
+			if err := a.recordJobStartTx(ctx, tx, leaseID, now, told); err != nil {
 				return err
 			}
 		}
@@ -2819,14 +2819,27 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 // busy with the same job — because the reason may have landed between two of
 // them. The guard behind markLeaseDisruptedTx keeps a token already written
 // and refuses one for a job GitHub has already reported on.
-func (a *Allocator) recordJobStartTx(ctx context.Context, tx *sql.Tx, leaseID string, now time.Time) error {
+//
+// A start that completes the job's queue wait is added to told.
+func (a *Allocator) recordJobStartTx(ctx context.Context, tx *sql.Tx, leaseID string, now time.Time,
+	told *waitsToTell,
+) error {
 	q := state.WriteQueries(tx)
+
+	before, _, err := readJobWait(ctx, tx, leaseID)
+	if err != nil {
+		return err
+	}
 
 	if err := q.RecordJobStart(ctx, ledgerdb.RecordJobStartParams{
 		StartedAt: sql.NullString{String: ts(now), Valid: true},
 		LeaseID:   leaseID,
 	}); err != nil {
 		return fmt.Errorf("alloc: record the job start of lease %s: %w", leaseID, err)
+	}
+
+	if err := told.ifCompleted(ctx, tx, leaseID, before); err != nil {
+		return err
 	}
 
 	settlement, err := q.ReadLeaseSettlement(ctx, leaseID)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/ops/fleetops"
 	"github.com/junioryono/billet/internal/server"
 )
 
@@ -81,7 +82,7 @@ func printTierWait(w io.Writer, jobs []alloc.JobWait) {
 	}
 
 	fmt.Fprintf(w, "          queue wait p99 %s over the last hour's %d job(s) "+
-		"(GitHub's queue time to billet's start%s)\n", s.P99.Round(time.Second), s.Count, more)
+		"(GitHub's queue time to billet's start%s)\n", fleetops.WaitText(s.P99), s.Count, more)
 }
 
 // stalledFor is how long ago a waiter last progressed, or zero when the report

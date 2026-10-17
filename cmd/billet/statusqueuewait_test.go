@@ -30,7 +30,11 @@ func TestStatusPrintsTheLastHoursQueueWait(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, cfg.Tiers)
+	// ONE INSTANT FOR THE START AND THE QUEUE TIME, so the wait is exact whatever
+	// the scheduler does between the writes; status's own hour still holds it.
+	started := time.Now().Add(-time.Minute)
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, cfg.Tiers,
+		alloc.WithClock(func() time.Time { return started }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +61,7 @@ func TestStatusPrintsTheLastHoursQueueWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := a.RecordJobIdentity(t.Context(), lease.ID, alloc.HistoryJob{JobID: "j1",
-		QueuedAt: time.Now().Add(-20 * time.Minute)}); err != nil {
+		QueuedAt: started.Add(-20 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 
