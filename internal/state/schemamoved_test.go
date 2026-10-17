@@ -12,14 +12,15 @@ import (
 )
 
 // newestMigration is the version rewindNewest takes back off a ledger.
-const newestMigration = 60
+const newestMigration = 61
 
 // rewindNewest takes the newest migration back off a migrated ledger, so the
 // next migration has exactly one version to apply.
 //
 // IT KNOWS THAT MIGRATION'S STATEMENTS, the way the version tests beside it do,
-// and refuses to run once a newer one exists: rewinding 60 under a 61 would
+// and refuses to run once a newer one exists: rewinding 61 under a 62 would
 // leave a gap the timeline refuses, and the failure would be about the rewind.
+// The index goes first: a column an index names cannot be dropped.
 func rewindNewest(t *testing.T, db *DB) {
 	t.Helper()
 
@@ -30,8 +31,12 @@ func rewindNewest(t *testing.T, db *DB) {
 
 	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
 		for _, stmt := range []string{
-			`DROP TABLE job_guest_reports`,
-			`DELETE FROM schema_migrations WHERE version = 60`,
+			`DROP INDEX job_history_started_idx`,
+			`ALTER TABLE job_history DROP COLUMN github_queued_at`,
+			`ALTER TABLE job_history DROP COLUMN github_scale_set_assigned_at`,
+			`ALTER TABLE job_history DROP COLUMN github_runner_assigned_at`,
+			`ALTER TABLE job_history DROP COLUMN bought_at`,
+			`DELETE FROM schema_migrations WHERE version = 61`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
