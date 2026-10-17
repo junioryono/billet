@@ -40,6 +40,7 @@ jobs:
           - { package: ./internal/guestagent, fuzz: FuzzStepLine }
           - { package: ./internal/guestagent, fuzz: FuzzPIDStat }
           - { package: ./internal/guestagent, fuzz: FuzzJUnitParse }
+          - { package: ./internal/usage, fuzz: FuzzDecodeSeriesGaps }
     steps:
       - uses: actions/checkout@v6
 

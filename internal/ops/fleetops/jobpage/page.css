@@ -6,6 +6,7 @@
   --panel: #f6f8fa;
   --band0: #eef1f4;
   --band1: #e3e8ee;
+  --gap: #cf222e;
   --focus: #fff1c2;
   --a: #1f6feb;
   --b: #bf6c00;
@@ -25,6 +26,7 @@
     --panel: #151b23;
     --band0: #1b222c;
     --band1: #232b36;
+    --gap: #f85149;
     --focus: #4a3b07;
     --a: #4493f8;
     --b: #e3a13b;
@@ -81,6 +83,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 .plot .top { top: 0; left: 0; }
 .plot .x0 { bottom: 0; left: 0; }
 .plot .x1 { bottom: 0; right: 0; }
+.plot.strip { padding-top: 0; }
+.plot.strip svg { height: 1.25rem; }
+.gap { fill: var(--gap); }
 .band0 { fill: var(--band0); }
 .band1 { fill: var(--band1); }
 rect.on { fill: var(--focus); }

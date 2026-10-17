@@ -1,0 +1,63 @@
+{
+  "epoch": 0,
+  "usage": {
+    "source": "",
+    "unmeasured": [
+      ""
+    ],
+    "samples": 0,
+    "interval_ms": 0,
+    "window_ms": 0,
+    "cpu_user_us": 0,
+    "cpu_system_us": 0,
+    "guest_cpu_us": 0,
+    "vmm_cpu_us": 0,
+    "memory_peak_bytes": 0,
+    "oom_kills": 0,
+    "disk_read_bytes": 0,
+    "disk_write_bytes": 0,
+    "net_rx_bytes": 0,
+    "net_tx_bytes": 0,
+    "net_rx_packets": 0,
+    "net_tx_packets": 0,
+    "cpu_some_us": 0,
+    "cpu_full_us": 0,
+    "memory_some_us": 0,
+    "memory_full_us": 0,
+    "io_some_us": 0,
+    "io_full_us": 0,
+    "energy_active_uj": 0,
+    "energy_idle_uj": 0,
+    "counters": {
+      "cycles": 0,
+      "instructions": 0,
+      "cache_references": 0,
+      "cache_misses": 0,
+      "branch_misses": 0,
+      "frontend_stall_cycles": 0
+    },
+    "destinations": {
+      "destinations": [
+        {
+          "sent_bytes": 0,
+          "received_bytes": 0,
+          "connections": 0
+        }
+      ],
+      "other": {
+        "sent_bytes": 0,
+        "received_bytes": 0,
+        "connections": 0
+      },
+      "incomplete": false,
+      "tap": {
+        "sent_bytes": 0,
+        "received_bytes": 0
+      }
+    }
+  },
+  "series": {
+    "codec": 0,
+    "data": ""
+  }
+}

@@ -24,21 +24,33 @@ type cloneFake struct {
 	size    int64  // what `rbd info` reports, in bytes
 	failOn  string // a subcommand that fails
 	failErr error
+	// duringInfo runs while `rbd info` is answering, before its answer.
+	duringInfo func()
 }
 
 func newCloneFake() *cloneFake {
 	return &cloneFake{device: "/dev/rbd0", mapped: "[]", size: 4 * int64(config.GiB)}
 }
 
-func (f *cloneFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
-	f.calls = append(f.calls, args)
-
+func (f *cloneFake) run(ctx context.Context, _ string, args []string) ([]byte, error) {
 	// SUBCOMMANDS ARE MATCHED AS WHOLE ARGUMENTS, not as substrings of the joined
 	// line — which is not fussiness. A fake keyed on `strings.Contains(joined,
 	// "rm")` matches `--format`, so a case staging a failed REMOVE failed the
 	// device listing instead and the test reported the wrong conclusion about the
 	// code. Found by that test.
 	sub := subcommandOf(args)
+
+	if sub == "info" && f.duringInfo != nil {
+		f.duringInfo()
+	}
+
+	// A CANCELLED CONTEXT KILLS THE COMMAND, as exec.CommandContext does, and a
+	// command that never ran is not recorded as run.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("rbd did not answer: %w", err)
+	}
+
+	f.calls = append(f.calls, args)
 
 	if f.failOn != "" && f.failOn == sub {
 		err := f.failErr
@@ -245,6 +257,29 @@ func TestACloneThatCannotBeGrownIsRemoved(t *testing.T) {
 			t.Errorf("billet mapped a clone whose promised capacity was not established: %v", call)
 		}
 	}
+}
+
+// A CLONE WHOSE SIZING A STOP CUT OFF IS STILL REMOVED (#393). The caller's
+// context ending is the usual reason sizing fails, and the removal asked on that
+// same context failed too, leaving the clone holding pool space.
+func TestACloneWhoseSizingWasCancelledIsStillRemoved(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	f := newCloneFake()
+	f.duringInfo = cancel
+
+	_, err := cloneClient(t, f).CloneRoot(ctx, "img@g1", "billet-abc", 20*config.GiB)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CloneRoot = %v, want the sizing's cancellation", err)
+	}
+	if strings.Contains(err.Error(), "could not be removed") {
+		t.Errorf("the clone's removal ran on the cancelled context: %v", err)
+	}
+
+	f.ran(t, "trash", "mv", "billet-cache/billet-abc")
 }
 
 // ZERO MEANS THE BACKEND DEFAULT. Existing configurations may omit disk, so the

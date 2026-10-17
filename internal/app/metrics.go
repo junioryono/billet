@@ -39,6 +39,11 @@ func ServeMetrics(ctx context.Context, role string, m *config.MetricsConfig, sou
 	}
 
 	for _, s := range sources {
+		// A SOURCE WITH NOTHING TO READ AT A SCRAPE only attaches observers, and
+		// has no billet_scrape_up, since there is no read that could fail.
+		if s.read == nil {
+			continue
+		}
 		if err := reg.RegisterSnapshot(ctx, s.name, s.families, ledgerScrapeTimeout, s.read); err != nil {
 			return nil, err
 		}

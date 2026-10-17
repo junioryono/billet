@@ -1,0 +1,39 @@
+LeaseResponse.lease pointer
+LeaseResponse.lease.ID string
+LeaseResponse.lease.Tier string
+LeaseResponse.lease.Node string
+LeaseResponse.lease.TargetNode string
+LeaseResponse.lease.MacOSSlot bool
+LeaseResponse.lease.GuestOS string
+LeaseResponse.lease.Provider string
+LeaseResponse.lease.Providers slice
+LeaseResponse.lease.Providers[] string
+LeaseResponse.lease.Phase string
+LeaseResponse.lease.VCPU int
+LeaseResponse.lease.Memory int64
+LeaseResponse.lease.RequestedVCPU int
+LeaseResponse.lease.RequestedMemory int64
+LeaseResponse.lease.InstanceType string
+LeaseResponse.lease.Site string
+LeaseResponse.lease.PriceUSDPerHour int64
+LeaseResponse.lease.ImageCache string
+LeaseResponse.lease.CacheGeneration string
+LeaseResponse.lease.ActionsCache string
+LeaseResponse.lease.sticky_cache tag omitempty
+LeaseResponse.lease.sticky_cache string
+LeaseResponse.lease.git_cache tag omitempty
+LeaseResponse.lease.git_cache string
+LeaseResponse.lease.bazel_cache tag omitempty
+LeaseResponse.lease.bazel_cache string
+LeaseResponse.lease.go_cache tag omitempty
+LeaseResponse.lease.go_cache string
+LeaseResponse.lease.PreferenceRank int
+LeaseResponse.lease.HeldSince string
+LeaseResponse.lease.HolderIncarnation string
+LeaseResponse.lease.ForceRelease bool
+LeaseResponse.lease.FailureReason string
+LeaseResponse.lease.Disruption string
+LeaseResponse.lease.DisruptedAt string
+LeaseResponse.lease.Epoch int64
+LeaseResponse.lease.RunID int64
+LeaseResponse.lease.RequestID int64
