@@ -1,6 +1,7 @@
 package uplink
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"go/ast"
@@ -50,33 +51,51 @@ func TestAResumedRateReturnsTowardItsCeilingWithTheTimeDown(t *testing.T) {
 // RATES LEARNED ON ANOTHER INTERFACE DESCRIBE ANOTHER LINE, and a record from a
 // clock ahead of this one cannot say how long the shaper was down. WITHIN ONE
 // BOOT the index decides, so another device under the name is refused; ACROSS A
-// REBOOT, which renumbers interfaces, the name does.
+// REBOOT, which renumbers interfaces, the name and the hardware address do; and
+// a boot ID unknown on either side wants the name as well as the index.
 func TestLearnedRatesResumeOnlyOnTheirInterface(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
 	ago := now.Add(-time.Minute)
+	l := func(iface, index, addr, boot string) learned {
+		return learned{Iface: iface, Index: index, Addr: addr, Boot: boot, At: ago}
+	}
+	const mac, other = "7c:c2:55:e2:9d:6d", "7c:c2:55:e2:9d:6e"
 
 	for name, c := range map[string]struct {
-		l                  learned
-		iface, index, boot string
-		want               bool
+		l    learned
+		at   nic
+		want bool
 	}{
-		"the same interface":            {learned{Iface: "eno2np1", Index: "2", Boot: "a", At: ago}, "eno2np1", "2", "a", true},
-		"the same interface renamed":    {learned{Iface: "eth0", Index: "2", Boot: "a", At: ago}, "eno2np1", "2", "a", true},
-		"another device under the name": {learned{Iface: "eno2np1", Index: "2", Boot: "a", At: ago}, "eno2np1", "7", "a", false},
-		"by name, no index":             {learned{Iface: "eno2np1", At: ago}, "eno2np1", "", "a", true},
-		"another name, no index":        {learned{Iface: "eth0", At: ago}, "eno2np1", "", "a", false},
-		"a time ahead of this clock":    {learned{Iface: "eno2np1", Index: "2", At: now.Add(time.Minute)}, "eno2np1", "2", "a", false},
-		"no time":                       {learned{Iface: "eno2np1", Index: "2"}, "eno2np1", "2", "a", false},
-		"after a reboot renumbered it":  {learned{Iface: "eno2np1", Index: "2", Boot: "a", At: ago}, "eno2np1", "3", "b", true},
-		"after a reboot, another name":  {learned{Iface: "eth0", Index: "2", Boot: "a", At: ago}, "eno2np1", "2", "b", false},
-		"no boot recorded, renumbered":  {learned{Iface: "eno2np1", Index: "2", At: ago}, "eno2np1", "3", "b", false},
-		"no boot read now, renumbered":  {learned{Iface: "eno2np1", Index: "2", Boot: "a", At: ago}, "eno2np1", "3", "", false},
+		"the same interface":              {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "2", mac, "a"}, true},
+		"the same interface renamed":      {l("eth0", "2", mac, "a"), nic{"eno2np1", "2", mac, "a"}, true},
+		"another device under the name":   {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "7", mac, "a"}, false},
+		"by name, no index":               {l("eno2np1", "", "", "a"), nic{"eno2np1", "", "", "a"}, true},
+		"another name, no index":          {l("eth0", "", "", "a"), nic{"eno2np1", "", "", "a"}, false},
+		"after a reboot renumbered it":    {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "3", mac, "b"}, true},
+		"after a reboot, another name":    {l("eth0", "2", mac, "a"), nic{"eno2np1", "2", mac, "b"}, false},
+		"after a reboot, another device":  {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "2", other, "b"}, false},
+		"after a reboot, no address read": {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "3", "", "b"}, true},
+		"no boot recorded, renumbered":    {l("eno2np1", "2", mac, ""), nic{"eno2np1", "3", mac, "b"}, false},
+		"no boot read now, renumbered":    {l("eno2np1", "2", mac, "a"), nic{"eno2np1", "3", mac, ""}, false},
+		"no boot read now, renamed":       {l("eth0", "2", mac, "a"), nic{"eno2np1", "2", mac, ""}, false},
+		"no boot either side, the same":   {l("eno2np1", "2", mac, ""), nic{"eno2np1", "2", mac, ""}, true},
 	} {
-		ok, why := c.l.resumes(c.iface, c.index, c.boot, now)
-		if ok != c.want || (!ok && why == "") {
+		if ok, why := c.l.resumes(c.at, now); ok != c.want || (!ok && why == "") {
 			t.Errorf("%s: resumes %v (%q), want %v with a reason when not", name, ok, why, c.want)
+		}
+	}
+
+	// A CLOCK BEHIND THE RECORD, AND A RECORD WITH NO TIME, CANNOT SAY HOW LONG
+	// THE SHAPER WAS DOWN.
+	at := nic{"eno2np1", "2", mac, "a"}
+	for name, r := range map[string]learned{
+		"a time ahead of this clock": {Iface: "eno2np1", Index: "2", Boot: "a", At: now.Add(time.Minute)},
+		"no time":                    {Iface: "eno2np1", Index: "2", Boot: "a"},
+	} {
+		if ok, why := r.resumes(at, now); ok || why == "" {
+			t.Errorf("%s: resumes %v (%q), want refused with a reason", name, ok, why)
 		}
 	}
 }
@@ -94,15 +113,14 @@ func fakeRuntimeDir(t *testing.T) {
 }
 
 // WHAT A RUN RECORDS IS WHAT THE NEXT ONE RESUMES, under the state directory
-// rather than beside the interface record a reboot empties, and a clear of the
-// shaping leaves it.
+// rather than beside the interface record a reboot empties.
 func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 	fakeRuntimeDir(t)
 
 	log := slog.New(&records{})
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
 
-	rememberer(log, ctl, "eno2np1", "2", "boot-a")(120, 80)
+	rememberer(log, ctl, nic{"eno2np1", "2", "7c:c2:55:e2:9d:6d", "boot-a"}, time.Time{})(120, 80)
 
 	if _, err := os.Stat(LearnedFile); err != nil {
 		t.Fatalf("the learned rates are not at %s: %v", LearnedFile, err)
@@ -113,7 +131,7 @@ func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 
 	logs := &records{}
 	next := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(logs), next, "eno2np1", "2", "boot-a", time.Now())
+	resumeLearned(slog.New(logs), next, nic{"eno2np1", "2", "7c:c2:55:e2:9d:6d", "boot-a"}, time.Now())
 
 	if math.Abs(next.Up.Rate-120) > 0.5 || math.Abs(next.Down.Rate-80) > 0.5 {
 		t.Errorf("the next run started at %.1f/%.1f, want about the 120/80 recorded", next.Up.Rate, next.Down.Rate)
@@ -128,15 +146,24 @@ func TestTheNextRunResumesWhatThisOneRecorded(t *testing.T) {
 	// AFTER A REBOOT THAT RENUMBERED THE INTERFACE, the same rates, by its name:
 	// the record says which boot set it.
 	rebooted := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), rebooted, "eno2np1", "3", "boot-b", time.Now())
+	resumeLearned(slog.New(&records{}), rebooted, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6d", "boot-b"}, time.Now())
 	if math.Abs(rebooted.Up.Rate-120) > 0.5 || math.Abs(rebooted.Down.Rate-80) > 0.5 {
 		t.Errorf("after a reboot renumbered eno2np1 the run started at %.1f/%.1f, want about the 120/80 recorded",
 			rebooted.Up.Rate, rebooted.Down.Rate)
 	}
 
+	// BUT A REBOOT ONTO ANOTHER DEVICE UNDER THE NAME, by its hardware address,
+	// the ceiling: the record says which device set it.
+	swapped := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	resumeLearned(slog.New(&records{}), swapped, nic{"eno2np1", "3", "7c:c2:55:e2:9d:6e", "boot-b"}, time.Now())
+	if swapped.Up.Rate != 400 || swapped.Down.Rate != 300 {
+		t.Errorf("a NIC swapped under eno2np1 across a reboot started at %.1f/%.1f, want the ceilings",
+			swapped.Up.Rate, swapped.Down.Rate)
+	}
+
 	// ON ANOTHER INTERFACE, THE CEILING.
 	other := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
-	resumeLearned(slog.New(&records{}), other, "wlan0", "7", "boot-a", time.Now())
+	resumeLearned(slog.New(&records{}), other, nic{"wlan0", "7", "", "boot-a"}, time.Now())
 	if other.Up.Rate != 400 || other.Down.Rate != 300 {
 		t.Errorf("rates learned on eno2np1 were resumed on wlan0: %.1f/%.1f", other.Up.Rate, other.Down.Rate)
 	}
@@ -148,7 +175,7 @@ func TestUnreadableLearnedRatesStartAtTheCeiling(t *testing.T) {
 	fakeRuntimeDir(t)
 
 	ctl := newRunController(1000, Options{Params: DefaultParams()})
-	resumeLearned(slog.New(&records{}), ctl, "eno2np1", "2", "boot-a", time.Now())
+	resumeLearned(slog.New(&records{}), ctl, nic{"eno2np1", "2", "", "boot-a"}, time.Now())
 	if ctl.Up.Rate != 1000 || ctl.Down.Rate != 1000 {
 		t.Fatalf("with nothing recorded the run started at %.1f/%.1f", ctl.Up.Rate, ctl.Down.Rate)
 	}
@@ -158,7 +185,7 @@ func TestUnreadableLearnedRatesStartAtTheCeiling(t *testing.T) {
 	}
 
 	logs := &records{}
-	resumeLearned(slog.New(logs), ctl, "eno2np1", "2", "boot-a", time.Now())
+	resumeLearned(slog.New(logs), ctl, nic{"eno2np1", "2", "", "boot-a"}, time.Now())
 	if ctl.Up.Rate != 1000 || ctl.Down.Rate != 1000 || logs.count("could not be read") != 1 {
 		t.Errorf("an unreadable record started the run at %.1f/%.1f, said %d times",
 			ctl.Up.Rate, ctl.Down.Rate, logs.count("could not be read"))
@@ -294,14 +321,21 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 		}
 	}
 
-	// THE SAME BOOT GOES TO BOTH, read from bootID: a record that does not say
-	// which boot set it would have its index compared across a reboot, which
-	// renumbers interfaces.
-	var resumed, installed, recorded, looped, remembering, booted token.Pos
+	// THE SAME INTERFACE GOES TO BOTH, read once by thisNIC (its boot and
+	// hardware address with it), and WHAT RESUMING SAYS TO HOLD GOES TO THE
+	// RECORDER, so a record from a clock ahead of this one is not overwritten.
+	var resumed, installed, recorded, looped, remembering, read token.Pos
 	ast.Inspect(funcs["Run"], func(n ast.Node) bool {
-		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 2 && len(assign.Rhs) == 2 &&
-			isName(assign.Lhs[1], "boot") && types.ExprString(assign.Rhs[1]) == "bootID()" {
-			booted = assign.Pos()
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
+			switch {
+			case isName(assign.Lhs[0], "at") && types.ExprString(assign.Rhs[0]) == "thisNIC(iface)":
+				read = assign.Pos()
+			case isName(assign.Lhs[0], "hold"):
+				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok && isName(call.Fun, "resumeLearned") &&
+					len(call.Args) == 4 && isName(call.Args[1], "ctl") && isName(call.Args[2], "at") {
+					resumed = assign.Pos()
+				}
+			}
 		}
 
 		call, ok := n.(*ast.CallExpr)
@@ -312,10 +346,8 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 		switch fun := call.Fun.(type) {
 		case *ast.Ident:
 			switch {
-			case fun.Name == "resumeLearned" && len(call.Args) == 6 && isName(call.Args[1], "ctl") &&
-				isName(call.Args[4], "boot"):
-				resumed = call.Pos()
-			case fun.Name == "rememberer" && len(call.Args) == 5 && isName(call.Args[4], "boot"):
+			case fun.Name == "rememberer" && len(call.Args) == 4 && isName(call.Args[2], "at") &&
+				isName(call.Args[3], "hold"):
 				remembering = call.Pos()
 			case fun.Name == "remember" && !recorded.IsValid():
 				recorded = call.Pos()
@@ -338,8 +370,9 @@ func TestARunResumesBeforeInstallingAndRemembersThroughItsStepper(t *testing.T) 
 	if !resumed.IsValid() || !installed.IsValid() || resumed > installed {
 		t.Error("Run does not resume what an earlier run learned before it installs CAKE")
 	}
-	if !booted.IsValid() || !remembering.IsValid() || booted > resumed {
-		t.Error("Run does not read the boot from bootID and hand it to both resumeLearned and rememberer")
+	if !read.IsValid() || !remembering.IsValid() || read > resumed || remembering < resumed {
+		t.Error("Run does not read the interface with thisNIC, hand it to resumeLearned and rememberer, " +
+			"and hand rememberer what resuming said to hold")
 	}
 	if !recorded.IsValid() || recorded < installed || !looped.IsValid() {
 		t.Error("Run does not record the installed rates and hand loop its recorder")
@@ -447,7 +480,7 @@ func TestAResumeCountsTheTimeTheShaperWasDown(t *testing.T) {
 	}
 
 	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 400})
-	resumeLearned(slog.New(&records{}), ctl, "eno2np1", "2", "boot-a", stopped.Add(time.Hour))
+	resumeLearned(slog.New(&records{}), ctl, nic{"eno2np1", "2", "", "boot-a"}, stopped.Add(time.Hour))
 
 	if math.Abs(ctl.Up.Rate-250) > 0.01 || math.Abs(ctl.Down.Rate-300) > 0.01 {
 		t.Errorf("an hour down resumed at %.2f/%.2f, want halfway back, 250/300", ctl.Up.Rate, ctl.Down.Rate)
@@ -493,5 +526,193 @@ func TestTheBootIsTheKernelsBootID(t *testing.T) {
 	bootIDFile = filepath.Join(t.TempDir(), "absent")
 	if got := bootID(); got != "" {
 		t.Errorf("an unreadable boot ID read as %q, want nothing", got)
+	}
+}
+
+// THE UPGRADE THAT MOVES THE RATES KEEPS THEM: with nothing at the new path, the
+// rates a shaper before the move kept beside the interface record are resumed
+// once, and written to the new path; but a new file that cannot be read is an
+// answer of its own, and the old one is not read over it.
+func TestTheRatesKeptBeforeTheMoveAreResumedOnce(t *testing.T) {
+	fakeRuntimeDir(t)
+
+	if err := os.WriteFile(legacyLearnedFile(), []byte(`{"interface":"eno2np1","index":"2",`+
+		`"up":{"max_mbit":400,"rate_mbit":120},"down":{"max_mbit":300,"rate_mbit":80},"at":"`+
+		time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano)+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	at := nic{"eno2np1", "2", "", "boot-a"}
+	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	resumeLearned(slog.New(&records{}), ctl, at, time.Now())
+	if math.Abs(ctl.Up.Rate-120) > 0.5 || math.Abs(ctl.Down.Rate-80) > 0.5 {
+		t.Fatalf("with only the old record the run started at %.1f/%.1f, want about its 120/80",
+			ctl.Up.Rate, ctl.Down.Rate)
+	}
+
+	rememberer(slog.New(&records{}), ctl, at, time.Time{})(ctl.Up.Rate, ctl.Down.Rate)
+	if _, err := os.Stat(LearnedFile); err != nil {
+		t.Fatalf("the resumed rates were not written to the new path: %v", err)
+	}
+
+	if err := os.WriteFile(LearnedFile, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := &records{}
+	over := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	resumeLearned(slog.New(logs), over, at, time.Now())
+	if over.Up.Rate != 400 || over.Down.Rate != 300 || logs.count("could not be read") != 1 {
+		t.Errorf("an unreadable new record read the old one over it: %.1f/%.1f", over.Up.Rate, over.Down.Rate)
+	}
+
+	// NOR ONE THAT CANNOT BE READ AT ALL, here a directory where the file goes.
+	if err := os.Remove(LearnedFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(LearnedFile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logs = &records{}
+	unreadable := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	resumeLearned(slog.New(logs), unreadable, at, time.Now())
+	if unreadable.Up.Rate != 400 || unreadable.Down.Rate != 300 || logs.count("could not be read") != 1 {
+		t.Errorf("a new record that could not be read had the old one read over it: %.1f/%.1f",
+			unreadable.Up.Rate, unreadable.Down.Rate)
+	}
+}
+
+// THE RATES ARE INSTALLED THROUGH durablefile, whose one ordering syncs the
+// file and the directory that names it: a power cut, the case they are kept
+// across a reboot for, then leaves the last whole record. A sync cannot be
+// observed from here, so this reads writeLearned.
+func TestTheLearnedRatesAreInstalledDurably(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := parser.ParseFile(token.NewFileSet(), "learned.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var write *ast.FuncDecl
+	for _, decl := range parsed.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "writeLearned" {
+			write = fn
+		}
+	}
+	if write == nil {
+		t.Fatal("no writeLearned in learned.go")
+	}
+
+	calls := map[string]bool{}
+	ast.Inspect(write, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			calls[types.ExprString(call.Fun)] = true
+		}
+
+		return true
+	})
+
+	for _, want := range []string{"installer.MkdirAll", "installer.Install"} {
+		if !calls[want] {
+			t.Errorf("writeLearned does not call %s", want)
+		}
+	}
+	for _, unsafe := range []string{"os.WriteFile", "os.Rename", "os.Create", "os.OpenFile"} {
+		if calls[unsafe] {
+			t.Errorf("writeLearned calls %s, which installs nothing durably", unsafe)
+		}
+	}
+}
+
+// A RECORD FROM A CLOCK AHEAD OF THIS ONE IS HELD, NOT REPLACED: a host booted
+// with its clock not yet set cannot weigh it, and the run starts at the
+// ceiling, but writes nothing over it until the clock has reached its time, so
+// a run once the clock is right can use it.
+func TestARecordFromAClockAheadIsHeldUntilTheClockReachesIt(t *testing.T) {
+	fakeRuntimeDir(t)
+
+	at := nic{"eno2np1", "2", "", "boot-a"}
+	ahead := time.Now().Add(time.Hour).Truncate(time.Second)
+	record := learned{Iface: "eno2np1", Index: "2", Boot: "boot-a", At: ahead,
+		Up: learnedRate{Max: 400, Rate: 120}, Down: learnedRate{Max: 300, Rate: 80}}
+	if err := writeLearned(record); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(LearnedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctl := newRunController(1000, Options{Params: DefaultParams(), MaxUp: 400, MaxDown: 300})
+	hold := resumeLearned(slog.New(&records{}), ctl, at, time.Now())
+	if !hold.Equal(ahead) || ctl.Up.Rate != 400 || ctl.Down.Rate != 300 {
+		t.Fatalf("a record ahead of the clock held until %v and started at %.1f/%.1f; want held until %v, "+
+			"at the ceilings", hold, ctl.Up.Rate, ctl.Down.Rate, ahead)
+	}
+
+	rememberer(slog.New(&records{}), ctl, at, hold)(ctl.Up.Rate, ctl.Down.Rate)
+	if after, err := os.ReadFile(LearnedFile); err != nil || !bytes.Equal(after, before) {
+		t.Errorf("the held record was replaced (%v): %s", err, after)
+	}
+
+	// AND A RECORD THIS RUN COULD WEIGH, OR REFUSED FOR ANOTHER REASON, HOLDS NOTHING.
+	if err := writeLearned(learned{Iface: "wlan0", Index: "9", At: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if hold := resumeLearned(slog.New(&records{}), ctl, at, time.Now()); !hold.IsZero() {
+		t.Errorf("a record of another interface held until %v", hold)
+	}
+}
+
+// THE HARDWARE ADDRESS IS SYSFS'S, trimmed, and nothing for a virtual device's
+// all-zero one or one that cannot be read. Not parallel: sysNet is the package's.
+func TestTheHardwareAddressIsSysfss(t *testing.T) {
+	old := sysNet
+	t.Cleanup(func() { sysNet = old })
+	sysNet = t.TempDir()
+
+	for iface, addr := range map[string]string{"eno2np1": "7c:c2:55:e2:9d:6d\n", "lo": "00:00:00:00:00:00\n"} {
+		if err := os.MkdirAll(filepath.Join(sysNet, iface), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sysNet, iface, "address"), []byte(addr), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for iface, want := range map[string]string{"eno2np1": "7c:c2:55:e2:9d:6d", "lo": "", "absent": ""} {
+		if got := ifaddr(iface); got != want {
+			t.Errorf("%s's address read as %q, want %q", iface, got, want)
+		}
+	}
+}
+
+// THE UNIT MAKES THE DIRECTORY THE RATES ARE KEPT IN: the host role's unit
+// declares StateDirectory for exactly the directory defaultLearnedFile names,
+// so a reboot keeps them, and the RuntimeDirectory the interface record lives
+// in is another.
+func TestTheUnitMakesTheDirectoryTheRatesAreKeptIn(t *testing.T) {
+	t.Parallel()
+
+	unit, err := os.ReadFile("../../ansible_collections/junioryono/billet/roles/host/templates/billet-uplink.service.j2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var state, runtime []string
+	for _, line := range strings.Split(string(unit), "\n") {
+		if v, ok := strings.CutPrefix(line, "StateDirectory="); ok {
+			state = append(state, v)
+		}
+		if v, ok := strings.CutPrefix(line, "RuntimeDirectory="); ok {
+			runtime = append(runtime, v)
+		}
+	}
+
+	if len(state) != 1 || "/var/lib/"+state[0] != filepath.Dir(defaultLearnedFile) {
+		t.Errorf("the unit declares StateDirectory %q, want exactly the directory of %s", state, defaultLearnedFile)
+	}
+	if len(runtime) != 1 || "/run/"+runtime[0] == filepath.Dir(defaultLearnedFile) {
+		t.Errorf("the unit's RuntimeDirectory %q holds the learned rates a reboot must keep", runtime)
 	}
 }

@@ -175,6 +175,22 @@ func (c Counters) Since(before Counters) (uint64, uint64) {
 }
 
 // ifindex is the kernel's index for an interface, or empty when it cannot say.
+// ifaddr is iface's hardware address, or empty when it cannot be read or is
+// none (a virtual device answers all zeroes).
+func ifaddr(iface string) string {
+	body, err := os.ReadFile(filepath.Join(sysNet, iface, "address"))
+	if err != nil {
+		return ""
+	}
+
+	addr := strings.TrimSpace(string(body))
+	if strings.Trim(addr, "0:") == "" {
+		return ""
+	}
+
+	return addr
+}
+
 func ifindex(iface string) string {
 	body, err := os.ReadFile(filepath.Join(sysNet, iface, "ifindex"))
 	if err != nil {
