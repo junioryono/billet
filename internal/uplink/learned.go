@@ -198,32 +198,28 @@ func (r learnedRate) resume(ceiling float64, down time.Duration) float64 {
 
 // resumeLearned starts ctl's directions at what an earlier run learned on this
 // interface, and says so; a record it cannot use leaves them at their ceilings,
-// and says why. It returns the time before which that record must not be
-// replaced: a record from a clock ahead of this one, a host booted with its
-// clock not yet set, is evidence this run cannot weigh, not a record of
-// nothing, and the next run, once the clock is right, can use it.
-func resumeLearned(log *slog.Logger, ctl *Controller, at nic, now time.Time) time.Time {
+// and says why. A record from a clock ahead of this one, as on a host booted
+// before its clock is set, is refused and the run starts at the ceilings; the
+// first record this run writes replaces it, because holding it would hold back
+// every later one with it.
+func resumeLearned(log *slog.Logger, ctl *Controller, at nic, now time.Time) {
 	l, found, err := readLearned()
 	if err != nil {
 		log.Warn("starting each direction at its ceiling: the rates an earlier run learned could not be read",
 			"error", err)
 
-		return time.Time{}
+		return
 	}
 
 	if !found {
-		return time.Time{}
+		return
 	}
 
 	if ok, why := l.resumes(at, now); !ok {
 		log.Info("starting each direction at its ceiling rather than at the rates an earlier run learned: "+why,
 			"interface", at.iface)
 
-		if l.At.After(now) {
-			return l.At
-		}
-
-		return time.Time{}
+		return
 	}
 
 	down := now.Sub(l.At)
@@ -234,6 +230,4 @@ func resumeLearned(log *slog.Logger, ctl *Controller, at nic, now time.Time) tim
 		"up_mbit", round(ctl.Up.Rate), "down_mbit", round(ctl.Down.Rate),
 		"learned_up_mbit", round(l.Up.Rate), "learned_down_mbit", round(l.Down.Rate),
 		"down_for", down.Round(time.Second))
-
-	return time.Time{}
 }

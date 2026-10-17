@@ -131,13 +131,13 @@ func Run(ctx context.Context, opts Options) error {
 	// WHAT AN EARLIER RUN LEARNED, BEFORE ANYTHING IS INSTALLED, so the line is
 	// held where it was from the first packet rather than relearned from the
 	// ceiling after every restart.
-	hold := resumeLearned(opts.Log, ctl, at, time.Now())
+	resumeLearned(opts.Log, ctl, at, time.Now())
 
 	if err := shaper.Install(ctx, ctl.Up.Rate, ctl.Down.Rate); err != nil {
 		return fmt.Errorf("install CAKE on %s: %w", iface, err)
 	}
 
-	remember := rememberer(opts.Log, ctl, at, hold)
+	remember := rememberer(opts.Log, ctl, at)
 	remember(ctl.Up.Rate, ctl.Down.Rate)
 
 	opts.Log.Info("shaping the uplink; each direction starts at its ceiling, or at the rate an earlier run "+
@@ -239,18 +239,14 @@ func gatewayLabel(gateway string) string {
 
 // rememberer records the rates CAKE was set to, for the next run, or the next
 // boot's, to resume; a write that fails is said once and changes nothing about
-// the shaping. Nothing is written before hold, so a record from a clock ahead
-// of this one survives until the clock has reached it.
-func rememberer(log *slog.Logger, ctl *Controller, at nic, hold time.Time) func(upMbit, downMbit float64) {
+// the shaping. THE ADDRESS IS READ AT EACH WRITE, not once at the start, so a
+// MAC set while the shaper runs is the one the next boot compares.
+func rememberer(log *slog.Logger, ctl *Controller, at nic) func(upMbit, downMbit float64) {
 	told := false
 
 	return func(upMbit, downMbit float64) {
-		now := time.Now()
-		if now.Before(hold) {
-			return
-		}
-
-		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: at.addr, Boot: at.boot, At: now,
+		err := writeLearned(learned{Iface: at.iface, Index: at.index, Addr: ifaddr(at.iface), Boot: at.boot,
+			At:   time.Now(),
 			Up:   learnedRate{Max: ctl.Up.Max, Rate: upMbit},
 			Down: learnedRate{Max: ctl.Down.Max, Rate: downMbit}})
 		if err != nil && !told {
