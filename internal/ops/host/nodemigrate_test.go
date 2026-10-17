@@ -111,7 +111,10 @@ case "$cmd" in
   daemon-reload)
     mode=$(cat "$BILLET_FAKE_UNITS/reload.mode" 2>/dev/null || echo ok)
     [ "$mode" = fail ] && exit 1
-    [ -f "$BILLET_FAKE_UNITS/billet-node.service.after-reload" ] && cp "$BILLET_FAKE_UNITS/billet-node.service.after-reload" "$BILLET_FAKE_UNITS/billet-node.service"
+    # SYSTEMD LOADS WHAT IS ON DISK: the repaired answer only over a repaired file.
+    if [ -f "$BILLET_FAKE_UNITS/billet-node.service.after-reload" ] && grep -qx 'RuntimeDirectory=billet/locks billet/registration' "${BILLET_FAKE_UNIT_FILE:-/dev/null}"; then
+      cp "$BILLET_FAKE_UNITS/billet-node.service.after-reload" "$BILLET_FAKE_UNITS/billet-node.service"
+    fi
     exit 0 ;;
 esac
 exit 1

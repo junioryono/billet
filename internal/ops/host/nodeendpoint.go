@@ -66,6 +66,8 @@ const (
 	endpointReasonUnexamined  = "unexamined"
 	endpointReasonRepair      = "repair-required"
 	endpointReasonShape       = "unit-shape"
+	endpointReasonGuard       = "guard"
+	endpointReasonLock        = "lock"
 
 	// The states a migration is left in, named on every refusal.
 	stateNothing         = "nothing"
@@ -626,22 +628,41 @@ func endpointInspector() *lifeops.Inspector {
 		lifeops.WithWaitDelay(guardWaitDelay), managerRunnerOption())
 }
 
-// preRProcess says whether a running process is positively a release before
-// the guard: its image is the managed binary's bytes, and the managed binary
-// answers "unknown command" to the preparation's dry run.
-func preRProcess(ctx context.Context, pid int) (bool, string) {
+// processVintage is what a running node's image positively is, as far as the
+// endpoint commands need to know it.
+type processVintage int
+
+const (
+	// vintageUnknown is could-not-tell: an image or a binary that could not be
+	// read, an image that is not the managed binary's, a probe that did not
+	// complete. Never the premise of an act.
+	vintageUnknown processVintage = iota
+	// vintagePreR is positively a release before the guard, which publishes no
+	// registration record.
+	vintagePreR
+	// vintageR is positively a release that carries the guard, and so one that
+	// publishes its registration record where its unit lets it.
+	vintageR
+)
+
+// processVintageOf says what a running process positively is: its image must be
+// the managed binary's bytes, and the managed binary's answer to the
+// preparation's dry run decides (an unknown command is a release before the
+// guard; any completed answer is one that carries it). Anything else is
+// could-not-tell, with why.
+func processVintageOf(ctx context.Context, pid int) (processVintage, string) {
 	imageSum, _, err := hashImage(filepath.Join(procRoot, strconv.Itoa(pid), "exe"))
 	if err != nil {
-		return false, fmt.Sprintf("hash the process image of %d: %v", pid, err)
+		return vintageUnknown, fmt.Sprintf("hash the process image of %d: %v", pid, err)
 	}
 
 	managedSum, _, err := hashRegular(installedBinary, maxExecutableBytes)
 	if err != nil {
-		return false, fmt.Sprintf("hash the managed binary %s: %v", installedBinary, err)
+		return vintageUnknown, fmt.Sprintf("hash the managed binary %s: %v", installedBinary, err)
 	}
 
 	if imageSum != managedSum {
-		return false, "the running process is not the managed binary's image"
+		return vintageUnknown, "the running process is not the managed binary's image"
 	}
 
 	stdout, stderr, rc, err := runBounded(ctx, installedBinary, "converge-guard", "prepare", "--dry-run", "--json")
@@ -651,18 +672,18 @@ func preRProcess(ctx context.Context, pid int) (bool, string) {
 	// holding the words is not the diagnostic.
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		return false, "the managed binary did not answer the preparation's dry run within its bound"
+		return vintageUnknown, "the managed binary did not answer the preparation's dry run within its bound"
 	case errors.Is(err, errOutputOverflow):
-		return false, "the managed binary's answer to the preparation's dry run overflowed its bound"
+		return vintageUnknown, "the managed binary's answer to the preparation's dry run overflowed its bound"
 	case rc < 0:
-		return false, "the managed binary could not be run: " + err.Error()
+		return vintageUnknown, "the managed binary could not be run: " + err.Error()
 	}
 
 	if rc != 0 && unknownCommandPattern.Match(append(append([]byte{}, stdout...), stderr...)) {
-		return true, ""
+		return vintagePreR, ""
 	}
 
-	return false, "the managed binary answers the preparation, so the running process is a release that carries the guard"
+	return vintageR, "the managed binary answers the preparation, so the running process is a release that carries the guard"
 }
 
 // answerObject prints one successful answer as JSON with exit 0.

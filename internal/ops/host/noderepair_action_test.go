@@ -22,13 +22,23 @@ type repairFixture struct {
 	*endpointFixture
 	unitPath string
 	legacy   string
+	// locks counts the lifecycle locks the repair took.
+	locks int
 }
+
+// repairHolder is the converge whose guard the fixture holds.
+const repairHolder = "h1"
 
 func newRepairFixture(t *testing.T) *repairFixture {
 	t.Helper()
 
 	f := &repairFixture{endpointFixture: newEndpointFixture(t)}
 	f.wait = endpointExpiryWait
+
+	// THIS CONVERGE'S GUARD, which the repair runs under; the managed binary
+	// the guard fixture names is then the R release the node runs.
+	newGuardFixture(t)
+	mustHold(t, repairHolder)
 	f.rBinary(t)
 	mustOK(t, os.Remove(f.recordPath))
 
@@ -45,7 +55,11 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	prevPath, prevOwned, prevLock := repairUnitPath, repairUnitOwned, lifecycleLock
 	repairUnitPath = f.unitPath
 	repairUnitOwned = func(os.FileInfo) error { return nil }
-	lifecycleLock = func() (*hostauthority.LifecycleLock, error) { return &hostauthority.LifecycleLock{}, nil }
+	lifecycleLock = func() (*hostauthority.LifecycleLock, error) {
+		f.locks++
+
+		return &hostauthority.LifecycleLock{}, nil
+	}
 
 	t.Cleanup(func() { repairUnitPath, repairUnitOwned, lifecycleLock = prevPath, prevOwned, prevLock })
 
@@ -100,7 +114,7 @@ func (f *repairFixture) repair(t *testing.T, extra ...string) endpointOut {
 	t.Helper()
 
 	return runEndpoint(t, NodeRepairUnit, "", append([]string{"--config", f.configPath, "--wait", f.wait,
-		"--stop-timeout", "1m"}, extra...)...)
+		"--stop-timeout", "1m", "--run", repairHolder}, extra...)...)
 }
 
 // acted is every systemctl verb other than show the fake was asked for, in
@@ -305,9 +319,9 @@ func TestTheRepairAdmitsOnlyTheLegacyShape(t *testing.T) {
 			tc.stage(t, f)
 
 			o := f.repair(t)
-			if o.str("outcome") != tc.outcome || o.str("state") != stateNothing {
-				t.Fatalf("outcome %q state %q (reason %q, why %q), want %s with nothing done", o.str("outcome"),
-					o.str("state"), o.str("reason"), o.str("why"), tc.outcome)
+			if o.str("outcome") != tc.outcome || o.str("state") != stateNothing || o.str("reason") != endpointReasonShape {
+				t.Fatalf("outcome %q state %q (reason %q, why %q), want %s %s with nothing done", o.str("outcome"),
+					o.str("state"), o.str("reason"), o.str("why"), tc.outcome, endpointReasonShape)
 			}
 
 			if got := f.acted(t); len(got) != 0 {
@@ -348,10 +362,23 @@ func TestTheRepairNamesTheStateEachFailureLeaves(t *testing.T) {
 			t.Helper()
 			mustOK(t, os.Remove(f.unitFile(nodeUnit+".after-reload")))
 		}, stateUnitInstalled, true},
+		{"a drop-in loaded with the repair", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit+".after-reload", "DropInPaths", "/etc/systemd/system/billet-node.service.d/x.conf")
+		}, stateUnitInstalled, true},
+		{"a reload still pending after the repair", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.set(t, nodeUnit+".after-reload", "NeedDaemonReload", "yes")
+		}, stateUnitInstalled, true},
 		{"the start failed", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			writeFile(t, f.unitFile("start.mode"), "fail\n", 0o644)
 		}, stateUnitInstalled, true},
+		{"a start whose proof failed with a process running", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			f.loaded(t, nodeUnit+".after-start", "activating", "start", inspectPID+1, newInvocation,
+				"billet/locks billet/registration")
+		}, stateStartedNoRecord, true},
 		{"no record after the start", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			mustOK(t, os.Remove(f.unitFile("record.after-start")))
@@ -389,6 +416,12 @@ func TestTheRepairNamesTheStateEachFailureLeaves(t *testing.T) {
 
 			if tc.name == "the record names another node" && !strings.Contains(o.str("why"), "cannot be judged") {
 				t.Errorf("a foreign record was answered %q, want it named as one that cannot be judged", o.str("why"))
+			}
+
+			// THE STEP THAT FAILED IS THE ONE NAMED: a failed reload leaves the
+			// same state as a reload that loaded something else.
+			if tc.name == "the reload failed" && !strings.Contains(o.str("why"), "reload systemd") {
+				t.Errorf("a failed reload was answered %q, want the reload named", o.str("why"))
 			}
 
 			repaired := strings.Contains(f.unitOnDisk(t), "RuntimeDirectory=billet/locks billet/registration\n")

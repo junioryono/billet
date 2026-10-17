@@ -6,7 +6,7 @@
   "endpoint": "http://127.0.0.1:7717",
   "unit_path": "/etc/systemd/system/billet-node.service",
   "before_sha256": "abababababababababababababababababababababababababababababababab",
-  "after_sha256": "abababababababababababababababababababababababababababababababab",
+  "after_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
   "from_invocation": "0123456789abcdef0123456789abcdef",
   "invocation_id": "abcdefabcdefabcdefabcdefabcdefab",
   "incarnation": "ffeeddccbbaa99887766554433221100",

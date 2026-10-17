@@ -220,6 +220,64 @@ func TestAFinishedUpgradeRemovesOlderRecoveries(t *testing.T) {
 	}
 }
 
+// unmetHost refuses the candidate's unit requirements and records anything else
+// the transaction asks of it.
+type unmetHost struct {
+	hostupgrade.Host
+	asked *[]string
+}
+
+func (h unmetHost) CheckUnitRequirements(context.Context) error {
+	*h.asked = append(*h.asked, "check-unit-requirements")
+
+	return errors.New("the candidate needs billet-node.service to provide RuntimeDirectory=billet/registration")
+}
+
+// A TRANSACTION REFUSED BEFORE ITS FIRST STEP GIVES ITS CLAIM BACK (#168): it
+// touched nothing outside its directory, so the claim and the directory go as
+// for a refusal before acceptance, and nothing else of the host is asked for.
+func TestARefusalBeforeTheFirstStepGivesTheClaimBack(t *testing.T) {
+	root := useRecoveryRoot(t)
+	current := stageRecovery(t, "upgrade-20", hostupgrade.StepStaged, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+
+	if err := os.Symlink(current, filepath.Join(upgradeRoot, activePointer)); err != nil {
+		t.Fatalf("publish the claim: %v", err)
+	}
+
+	journal, err := hostupgrade.ReadJournal(current)
+	if err != nil {
+		t.Fatalf("read the journal: %v", err)
+	}
+
+	var (
+		out   bytes.Buffer
+		asked []string
+	)
+
+	env := cli.Env{Stdout: &out, Stderr: &out, Getenv: func(string) string { return "" }}
+
+	err = finishHostUpgrade(t.Context(), env, root, journal, unmetHost{asked: &asked})
+	if !errors.Is(err, hostupgrade.ErrRefusedUntouched) {
+		t.Fatalf("finish returned %v, want the untouched refusal", err)
+	}
+
+	if want := []string{"check-unit-requirements"}; !slices.Equal(asked, want) {
+		t.Errorf("the refused transaction asked the host for %v, want only %v", asked, want)
+	}
+
+	if _, err := os.Lstat(filepath.Join(upgradeRoot, activePointer)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the claim is still published after a refusal that touched nothing (%v)", err)
+	}
+
+	if _, err := os.Stat(current); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the refused transaction's directory was kept (%v)", err)
+	}
+
+	if !strings.Contains(out.String(), "refused before anything was stopped") {
+		t.Errorf("the refusal was not said:\n%s", out.String())
+	}
+}
+
 func TestADirectoryThatIsNotTheOneJudgedIsKept(t *testing.T) {
 	root := useRecoveryRoot(t)
 	base := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)

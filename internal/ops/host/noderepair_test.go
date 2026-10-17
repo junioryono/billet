@@ -2,6 +2,8 @@ package host
 
 import (
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -37,6 +39,12 @@ func TestTheDecisionNamesAUnitThatCannotHoldTheRecord(t *testing.T) {
 			f.preRBinary(t)
 			f.legacyRuntimeDirectory(t)
 		}, true, recordAbsentPreR, "", ""},
+		{"a process that cannot be identified under the unit from before", func(t *testing.T, f *endpointFixture) {
+			t.Helper()
+			f.rBinary(t)
+			f.legacyRuntimeDirectory(t)
+			writeFile(t, filepath.Join(f.procDir, strconv.Itoa(inspectPID), "image"), "#!/bin/sh\nexit 0\n", 0o755)
+		}, true, "", outcomeUnknown, endpointReasonRecord},
 		{"the unit declares the directory", func(t *testing.T, f *endpointFixture) {
 			t.Helper()
 			f.rBinary(t)
@@ -89,9 +97,9 @@ func TestTheDecisionNamesAUnitThatCannotHoldTheRecord(t *testing.T) {
 					o.str("record"), o.str("why"), tc.record)
 			}
 
-			if tc.record == recordUnitCannotHold && (o.boolean("planned") || o.doc["effective"] != nil) {
-				t.Errorf("a unit that cannot hold the record was reported planned=%v effective=%v; the endpoint it "+
-					"dials is unknown", o.boolean("planned"), o.doc["effective"])
+			if tc.record == recordUnitCannotHold && o.doc["effective"] != nil {
+				t.Errorf("a unit that cannot hold the record was reported effective=%v; the endpoint it dials is "+
+					"unknown", o.doc["effective"])
 			}
 		})
 	}

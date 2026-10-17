@@ -34,15 +34,16 @@ import (
 // IT ADMITS ONE SHAPE AND MAKES ONE CHANGE. The unit the role rendered at
 // /etc/systemd/system/billet-node.service, loaded, with no drop-in and no
 // pending reload, declaring exactly RuntimeDirectory=billet/locks in exactly one
-// [Service] line, under a running node that has published no record. That line
-// becomes RuntimeDirectory=billet/locks billet/registration and nothing else in
-// the file changes; the converge that follows installs the current unit. The
-// node is stopped under the migration's own proof (inactive, dead, success),
-// the unit installed and reloaded, the node started, and the answer waits for a
-// record the new invocation wrote naming the expected identity and the
-// installed endpoint. A restart here is maintenance the operator's converge
-// authorises: it claims no endpoint continuity it did not prove, and the
-// endpoint decision is then made from scratch.
+// [Service] line, under a running node positively of a release that publishes
+// its record and that has published none. That line becomes
+// RuntimeDirectory=billet/locks billet/registration and nothing else in the file
+// changes; the converge that follows installs the current unit. The node is
+// stopped under the migration's own proof (inactive, dead, success), the unit
+// installed and reloaded, the node started, and the answer waits for a record
+// the new invocation wrote naming the expected identity and the installed
+// endpoint. A restart here is maintenance the operator's converge authorises:
+// it runs under this converge's guard (`--run`), claims no endpoint continuity
+// it did not prove, and the endpoint decision is then made from scratch.
 //
 // `--dry-run` says whether the repair is required and changes nothing.
 
@@ -65,9 +66,12 @@ const (
 // edits; a variable so a test can point it into its own directory.
 var repairUnitPath = "/etc/systemd/system/" + deploy.NodeUnitName
 
-// repairUnitOwned refuses a unit file root does not own; a variable so a test,
-// which is not root, can admit its own fixture.
-var repairUnitOwned = func(info os.FileInfo) error {
+// repairUnitOwned refuses a unit file root does not own, judged on the file
+// the descriptor that is read was opened on; a variable so a test, which is
+// not root, can admit its own fixture.
+var repairUnitOwned = rootOwnedUnit
+
+func rootOwnedUnit(info os.FileInfo) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || st.Uid != 0 {
 		return fmt.Errorf("%s is not owned by root", repairUnitPath)
@@ -77,7 +81,7 @@ var repairUnitOwned = func(info os.FileInfo) error {
 }
 
 type repairMode struct {
-	configPath        string
+	configPath, run   string
 	stopTimeout, wait time.Duration
 	dryRun            bool
 }
@@ -123,10 +127,15 @@ type repairEvidence struct {
 	Stopped        migrateStopped `json:"stopped"`
 }
 
+const repairUsage = "repair-unit --config PATH --run ID [--stop-timeout D] [--wait D] --json, or " +
+	"repair-unit --config PATH --dry-run --json"
+
 // NodeRepairUnit is `billet node repair-unit`.
 func NodeRepairUnit(ctx context.Context, env cli.Env, args []string) error {
 	flags := cli.NewFlagSet("billet node repair-unit", env.Stdout)
 	configPath := flags.String("config", "", "the installed configuration (required)")
+	run := flags.String("run", "", "the holder of this converge's guard, which the repair runs under (required "+
+		"unless --dry-run)")
 	stopTimeout := flags.Duration("stop-timeout", time.Hour, "the repair's own deadline for the node's stop; "+
 		"only this command's systemctl is signalled when it expires, never the node or its compute")
 	wait := flags.Duration("wait", 5*time.Minute, "how long to wait for the node's own record under the new invocation")
@@ -141,17 +150,19 @@ func NodeRepairUnit(ctx context.Context, env cli.Env, args []string) error {
 		return errors.New("repair-unit answers as JSON; pass --json")
 	}
 
-	m := repairMode{configPath: *configPath, stopTimeout: *stopTimeout, wait: *wait, dryRun: *dryRun}
+	m := repairMode{configPath: *configPath, run: *run, stopTimeout: *stopTimeout, wait: *wait, dryRun: *dryRun}
 
 	switch {
 	case m.configPath == "":
 		return answerEndpointRefusal(env, endpointRefuse(endpointReasonCombination,
-			"--config names the installed configuration, and it is empty",
-			"repair-unit --config PATH [--stop-timeout D] [--wait D] [--dry-run] --json", stateNothing))
+			"--config names the installed configuration, and it is empty", repairUsage, stateNothing))
+	case m.run == "" && !m.dryRun:
+		return answerEndpointRefusal(env, endpointRefuse(endpointReasonCombination,
+			"--run names the holder of this converge's guard, which a repair runs under, and it is empty",
+			repairUsage, stateNothing))
 	case m.stopTimeout <= 0 || m.wait <= 0:
 		return answerEndpointRefusal(env, endpointRefuse(endpointReasonCombination,
-			"--stop-timeout and --wait must be positive",
-			"repair-unit --config PATH [--stop-timeout D] [--wait D] [--dry-run] --json", stateNothing))
+			"--stop-timeout and --wait must be positive", repairUsage, stateNothing))
 	}
 
 	if cli.HostOS != "linux" {
@@ -165,6 +176,78 @@ func NodeRepairUnit(ctx context.Context, env cli.Env, args []string) error {
 	}
 
 	return answerObject(env, answer)
+}
+
+// repairJudgement is what a repair rests on, judged afresh under the locks: the
+// loaded unit's shape, the file's bytes, and the running node's record.
+type repairJudgement struct {
+	shape    repairShape
+	required bool
+	why      string
+	body     []byte
+	br       bracketedRecord
+}
+
+// judgeRepair observes the loaded unit, reads its file and the running node's
+// record, and says whether the repair is required; a refusal is a unit or a
+// node a repair does not admit.
+func judgeRepair(ctx context.Context, insp *lifeops.Inspector, identity registrationIdentity) (repairJudgement, *endpointRefusal) {
+	var j repairJudgement
+
+	var r *endpointRefusal
+
+	j.shape, j.required, j.why, r = observeRepairShape(ctx, insp)
+	if r != nil || !j.required {
+		return j, r
+	}
+
+	// THE FILE, read once by descriptor: exactly the role's, root's, with
+	// exactly the one admitted line.
+	if j.body, r = readRepairUnit(); r != nil {
+		return j, r
+	}
+
+	// THE RUNNING NODE, its record read inside a bracket: a repair is for a node
+	// that runs and publishes nothing.
+	br, problem := readRecordUnderBracket(ctx, insp, nodeUnit, identity, time.Time{})
+	if problem != "" {
+		return j, endpointUnknown(endpointReasonUnit, problem, "", stateNothing)
+	}
+
+	j.br = br
+
+	switch {
+	case !br.running:
+		j.required, j.why = false, "the node is not running, so the converge installs the current unit before it starts"
+
+		return j, nil
+	case br.class == recordUsable:
+		return j, endpointRefuse(endpointReasonRecord, "the running node published a record although its unit "+
+			"declares no directory for one; inspect the host", "", stateNothing)
+	case br.class != recordAbsent:
+		return j, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
+			stateNothing)
+	}
+
+	// A RELEASE THAT PUBLISHES, POSITIVELY: a restart of anything else under
+	// the repaired unit would still publish nothing.
+	pid, _, _ := runningPID(br.obs)
+
+	switch vintage, why := processVintageOf(ctx, pid); vintage {
+	case vintageR:
+	case vintagePreR:
+		return j, endpointRefuse(endpointReasonPreR, "the running node is a release before the converge guard, which "+
+			"publishes no registration record under any unit; a repair would restart it for nothing",
+			"upgrade the binary first", stateNothing)
+	default:
+		return j, endpointUnknown(endpointReasonProcess, "whether the running node publishes a registration record "+
+			"cannot be told ("+why+")", "", stateNothing)
+	}
+
+	j.why = "runtime-unit repair required; effective endpoint unknown: the running node cannot publish its " +
+		"registration record, because its unit declares no " + deploy.NodeRegistrationDirectory + " directory"
+
+	return j, nil
 }
 
 // repairNodeUnit is the command's order of operations; every refusal names the
@@ -204,48 +287,10 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 
 	insp := endpointInspector()
 
-	// (2) THE LOADED UNIT'S SHAPE.
-	shape, required, why, r := observeRepairShape(ctx, insp)
+	// (2) THE JUDGEMENT, for the dry run's answer and the action's premise.
+	judged, r := judgeRepair(ctx, insp, identity)
 	if r != nil {
 		return nil, r
-	}
-
-	var unitBody []byte
-
-	if required {
-		// (3) THE FILE, read once by descriptor: exactly the role's, root's,
-		// with exactly the one admitted line.
-		unitBody, r = readRepairUnit()
-		if r != nil {
-			return nil, r
-		}
-	}
-
-	// (4) THE RUNNING NODE, and its record read inside a bracket: a repair is
-	// for a node that runs and publishes nothing.
-	var br bracketedRecord
-
-	if required {
-		var problem string
-
-		br, problem = readRecordUnderBracket(ctx, insp, nodeUnit, identity, time.Time{})
-		if problem != "" {
-			return nil, endpointUnknown(endpointReasonUnit, problem, "", stateNothing)
-		}
-
-		switch {
-		case !br.running:
-			required, why = false, "the node is not running, so the converge installs the current unit before it starts"
-		case br.class == recordUsable:
-			return nil, endpointRefuse(endpointReasonRecord, "the running node published a record although its unit "+
-				"declares no directory for one; inspect the host", "", stateNothing)
-		case br.class != recordAbsent:
-			return nil, endpointUnknown(endpointReasonRecord, "the running node's record cannot be judged: "+br.why, "",
-				stateNothing)
-		default:
-			why = "runtime-unit repair required; effective endpoint unknown: the running node cannot publish its " +
-				"registration record, because its unit declares no " + deploy.NodeRegistrationDirectory + " directory"
-		}
 	}
 
 	if m.dryRun {
@@ -253,51 +298,123 @@ func repairNodeUnit(ctx context.Context, m repairMode) (any, *endpointRefusal) {
 			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 		}
 
-		return repairReport{Schema: endpointSchema, Outcome: outcomeReported, Required: required, Why: why,
-			Unit: shape}, nil
+		return repairReport{Schema: endpointSchema, Outcome: outcomeReported, Required: judged.required, Why: judged.why,
+			Unit: judged.shape}, nil
 	}
 
-	if !required {
+	if !judged.required {
 		if problem := closeInstalledConfig(installed); problem != "" {
 			return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 		}
 
-		return repairUnchanged{Schema: endpointSchema, Outcome: outcomeUnchanged, Why: why, Unit: shape}, nil
+		return repairUnchanged{Schema: endpointSchema, Outcome: outcomeUnchanged, Why: judged.why,
+			Unit: judged.shape}, nil
 	}
 
-	// (5) THE LIFECYCLE LOCK, so a `local up` or `local down` cannot act on
-	// the node between this stop and this start.
+	// (3) THIS CONVERGE'S GUARD, under the transaction lock, so no upgrade and
+	// no other converge moves the host while the node is stopped; and the
+	// lifecycle lock, so no `local up` or `local down` does.
+	tx, guard, r := repairGuard(m.run)
+	if r != nil {
+		return nil, r
+	}
+
+	defer func() {
+		_ = guard.Close()
+
+		tx.release()
+	}()
+
 	lock, err := lifecycleLock()
 	if err != nil {
-		return nil, endpointUnknown(endpointReasonUnit, "take the lifecycle lock: "+err.Error(), "", stateNothing)
+		return nil, endpointUnknown(endpointReasonLock, "take the lifecycle lock: "+err.Error(), "", stateNothing)
 	}
 
 	//nolint:errcheck // the answer is JSON alone and has no place for a warning, and the process's exit releases the flock whatever this returns.
 	defer func() { _ = lock.Release() }()
 
-	return repairUnderLock(ctx, m, insp, installed, installedEP, identity, br, unitBody)
+	// (4) THE JUDGEMENT AGAIN, UNDER THE LOCKS: a record published, a unit
+	// replaced or reloaded, a process moved since the first is not what was
+	// judged, and nothing is stopped over it.
+	again, r := judgeRepair(ctx, insp, identity)
+	if r != nil {
+		return nil, r
+	}
+
+	if !again.required || !bytes.Equal(again.body, judged.body) || processMoved(judged.br.obs, again.br.obs) {
+		return nil, endpointUnknown(endpointReasonProcess, "the node unit, its file or its process changed between the "+
+			"judgement and the locks; nothing was stopped", "converge again", stateNothing)
+	}
+
+	return repairUnderLock(ctx, m, insp, installed, installedEP, identity, again)
 }
 
-// repairUnderLock is steps (6) to (13): the stop, the unit, the start and the
-// record, under the lifecycle lock.
+// repairGuard takes the transaction lock and requires this converge's guard, as
+// a retirement does (judgeGuardShape): the lock and the guard directory are the
+// caller's to release.
+func repairGuard(run string) (*txLock, *os.File, *endpointRefusal) {
+	tx, err := takeTxLock()
+	if err != nil {
+		return nil, nil, endpointRefuse(endpointReasonLock, "take the upgrade transaction lock: "+err.Error(),
+			"wait for the transaction to finish, then converge again", stateNothing)
+	}
+
+	dir, shape, err := openGuardForMutation(tx)
+	if err != nil {
+		tx.release()
+
+		return nil, nil, endpointUnknown(endpointReasonGuard, "open this converge's guard: "+err.Error(), "", stateNothing)
+	}
+
+	if rr := judgeGuardShape(shape, run); rr != nil {
+		if dir != nil {
+			_ = dir.Close()
+		}
+
+		tx.release()
+
+		refusal := endpointRefuse
+		if rr.Outcome == outcomeUnknown {
+			refusal = endpointUnknown
+		}
+
+		return nil, nil, refusal(endpointReasonGuard, "a repair runs under this converge's guard: "+rr.Why, "",
+			stateNothing)
+	}
+
+	return tx, dir, nil
+}
+
+// repairUnderLock is the stop, the unit, the start and the record, under the
+// locks.
 func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector, installed *installedConfigObservation,
-	installedEP endpoint.Endpoint, identity registrationIdentity, br bracketedRecord, unitBody []byte,
+	installedEP endpoint.Endpoint, identity registrationIdentity, judged repairJudgement,
 ) (any, *endpointRefusal) {
-	// (6) THE PROCESS AGAIN, IMMEDIATELY BEFORE THE STOP: the same one the
-	// bracket read, not stopping, under a KillMode whose stop proves something.
+	unitBody, br := judged.body, judged.br
+
+	// (5) THE CONFIGURATION AND THE PROCESS, IMMEDIATELY BEFORE THE STOP: the
+	// file still the one judged, the process the one the bracket read, not
+	// stopping, under a KillMode whose stop proves something.
+	if problem := closeInstalledConfig(installed); problem != "" {
+		return nil, endpointUnknown(endpointReasonConfig, problem+"; nothing was stopped", "", stateNothing)
+	}
+
 	if r := admitNodeStop(ctx, insp, br.obs, "repaired"); r != nil {
 		return nil, r
 	}
 
-	// (7) THE STOP, under the repair's own deadline, and its proof.
+	// (6) THE STOP, under the repair's own deadline, and its proof.
 	stopCtx, cancelStop := context.WithTimeout(ctx, m.stopTimeout)
 	_, stopErr := lifeops.NewConverger(insp).StopAndProve(stopCtx, nodeUnit)
 	cancelStop()
 
 	if stopErr != nil && errors.Is(stopCtx.Err(), context.DeadlineExceeded) {
+		after, _ := observeUnit(ctx, insp, nodeUnit)
+
 		return nil, endpointUnknown(endpointReasonUnproved, fmt.Sprintf("the stop of %s did not complete within the "+
-			"repair's deadline of %s; the stop continues under systemd's own bound, and nothing else was signalled",
-			nodeUnit, m.stopTimeout), "wait for the stop to complete, then converge again", stateNothing)
+			"repair's deadline of %s (the unit is %s); the stop continues under systemd's own bound, and nothing else "+
+			"was signalled", nodeUnit, m.stopTimeout, orUnknownWord(after.ActiveState)),
+			"wait for the stop to complete, then converge again", stateNothing)
 	}
 
 	stopped, r := proveNodeStopped(ctx, insp)
@@ -305,7 +422,7 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 		return nil, r
 	}
 
-	// (8) THE FILE AGAIN, before it is replaced: bytes changed under the stop
+	// (7) THE FILE AGAIN, before it is replaced: bytes changed under the stop
 	// are not the ones admitted, and the node stays stopped.
 	again, r := readRepairUnit()
 	if r != nil {
@@ -324,51 +441,68 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 		return nil, endpointRefuse(endpointReasonShape, problem, "", stateStopped)
 	}
 
-	// (9) THE INSTALL, through the durable installer's one ordering, with the
-	// file's own mode.
+	// (8) THE INSTALL, through the durable installer's one ordering, with the
+	// file's own mode. An error after the rename (the directory's sync) leaves
+	// the repaired file in place, so what is on disk is read back to name the
+	// state.
 	info, err := os.Lstat(repairUnitPath)
 	if err != nil {
 		return nil, endpointUnknown(endpointReasonShape, "examine "+repairUnitPath+": "+err.Error(), "", stateStopped)
 	}
 
-	if _, err := (durablefile.Installer{}).Install(filepath.Dir(repairUnitPath), filepath.Base(repairUnitPath),
+	if _, err := repairInstaller.Install(filepath.Dir(repairUnitPath), filepath.Base(repairUnitPath),
 		info.Mode().Perm(), func(w io.Writer) error {
 			_, err := w.Write(repaired)
 
 			return err
 		}); err != nil {
+		if now, readErr := regularfile.ReadFile(repairUnitPath, maxUnitBytes, regularfile.Options{NoFollow: true}); readErr == nil &&
+			bytes.Equal(now, repaired) {
+			return nil, endpointUnknown(endpointReasonShape, "the repaired unit was put in place and its durability is "+
+				"unproved: "+err.Error(), "inspect "+repairUnitPath+", then converge again", stateUnitInstalled)
+		}
+
 		return nil, endpointUnknown(endpointReasonShape, "install the repaired unit: "+err.Error(),
 			"inspect "+repairUnitPath+", then converge again", stateStopped)
 	}
 
-	// (10) THE RELOAD, and the manager's own word that it loaded the repair.
+	// (9) THE RELOAD, and the manager's own word that it loaded the repair and
+	// nothing else: the role's fragment, no drop-in, no reload pending.
 	if err := insp.DaemonReload(ctx); err != nil {
 		return nil, endpointUnknown(endpointReasonShape, "reload systemd: "+err.Error(),
 			"systemctl daemon-reload, then converge again", stateUnitInstalled)
 	}
 
-	loaded, _, _, r := observeRepairShape(ctx, insp)
-	if r != nil {
-		r.State = stateUnitInstalled
-
+	if r := proveRepairLoaded(ctx, insp); r != nil {
 		return nil, r
 	}
 
-	if loaded.FragmentPath != repairUnitPath || !slices.Equal(strings.Fields(loaded.RuntimeDirectory),
-		strings.Fields(strings.TrimPrefix(repairedRuntimeDirectory, "RuntimeDirectory="))) {
-		return nil, endpointUnknown(endpointReasonShape, fmt.Sprintf("after the reload systemd loads %s from %s "+
-			"declaring RuntimeDirectory=%s, not the repair", nodeUnit, loaded.FragmentPath, loaded.RuntimeDirectory),
-			"inspect the unit, then converge again", stateUnitInstalled)
+	// (10) THE CONFIGURATION AGAIN, before the start: a file replaced under the
+	// stop is not the one judged, and the node stays stopped rather than
+	// starting on it.
+	if problem := closeInstalledConfig(installed); problem != "" {
+		return nil, endpointUnknown(endpointReasonConfig, problem+"; the node is stopped with the repaired unit "+
+			"installed and was not started on it", "converge again", stateUnitInstalled)
 	}
 
-	// (11) THE START, under the unit's own start bound.
+	// (11) THE START, under the unit's own start bound. A start whose proof
+	// failed may have left a process running, so what systemd says now names
+	// the state.
 	startCtx, cancelStart := context.WithTimeout(ctx, deploy.UnitStartTimeout+lifecycleDeadlineMargin)
 	_, startErr := lifeops.NewConverger(insp).StartAndProve(startCtx, nodeUnit)
 	cancelStart()
 
 	if startErr != nil {
-		return nil, endpointUnknown(endpointReasonUnproved, "the repaired unit is installed and the node did not start: "+
-			startErr.Error(), "systemctl start "+nodeUnit+", then converge again", stateUnitInstalled)
+		state := stateStartedNoRecord
+
+		if after, problem := observeUnit(ctx, insp, nodeUnit); problem == "" {
+			if _, running, problem := runningPID(after); problem == "" && !running {
+				state = stateUnitInstalled
+			}
+		}
+
+		return nil, endpointUnknown(endpointReasonUnproved, "the repaired unit is installed and the node's start was not "+
+			"proved: "+startErr.Error(), "inspect "+nodeUnit+", then converge again", state)
 	}
 
 	started, problem := observeUnit(ctx, insp, nodeUnit)
@@ -444,26 +578,42 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 	}, nil
 }
 
-// observeRepairShape reads the loaded node unit and says whether it is the one
-// shape a repair admits (required), a unit that needs none (it declares the
-// registration directory), or one refused.
-func observeRepairShape(ctx context.Context, insp *lifeops.Inspector) (repairShape, bool, string, *endpointRefusal) {
-	props, err := insp.UnitProperties(ctx, nodeUnit, "LoadState", "FragmentPath", "DropInPaths", "NeedDaemonReload",
-		"RuntimeDirectory")
+// repairInstaller is the durable install the repair puts the unit in place
+// with; a variable so a test can fail a step after the rename.
+var repairInstaller = durablefile.Installer{}
+
+// repairShapeProperties are what a repair reads of the loaded unit.
+var repairShapeProperties = []string{"LoadState", "FragmentPath", "DropInPaths", "NeedDaemonReload", "RuntimeDirectory"}
+
+// observeRepairShapeProps reads the loaded node unit's shape properties, every
+// one answered or could-not-tell.
+func observeRepairShapeProps(ctx context.Context, insp *lifeops.Inspector, state string) (map[string][]string, repairShape, *endpointRefusal) {
+	props, err := insp.UnitProperties(ctx, nodeUnit, repairShapeProperties...)
 	if err != nil {
-		return repairShape{}, false, "", endpointUnknown(endpointReasonUnit, "ask systemd about "+nodeUnit+": "+err.Error(),
-			"", stateNothing)
+		return nil, repairShape{}, endpointUnknown(endpointReasonUnit, "ask systemd about "+nodeUnit+": "+err.Error(),
+			"", state)
 	}
 
 	shape := repairShape{LoadState: firstProp(props, "LoadState"), FragmentPath: firstProp(props, "FragmentPath"),
 		RuntimeDirectory: firstProp(props, "RuntimeDirectory")}
 
 	// EVERY PROPERTY ANSWERED: an absent one is could-not-tell, never empty.
-	for _, name := range []string{"LoadState", "FragmentPath", "DropInPaths", "NeedDaemonReload", "RuntimeDirectory"} {
+	for _, name := range repairShapeProperties {
 		if _, ok := props[name]; !ok {
-			return shape, false, "", endpointUnknown(endpointReasonUnit, "systemd answered no "+name+" for "+nodeUnit, "",
-				stateNothing)
+			return nil, shape, endpointUnknown(endpointReasonUnit, "systemd answered no "+name+" for "+nodeUnit, "", state)
 		}
+	}
+
+	return props, shape, nil
+}
+
+// observeRepairShape reads the loaded node unit and says whether it is the one
+// shape a repair admits (required), a unit that needs none (it declares the
+// registration directory), or one refused.
+func observeRepairShape(ctx context.Context, insp *lifeops.Inspector) (repairShape, bool, string, *endpointRefusal) {
+	props, shape, r := observeRepairShapeProps(ctx, insp, stateNothing)
+	if r != nil {
+		return shape, false, "", r
 	}
 
 	if shape.LoadState != "loaded" {
@@ -481,8 +631,8 @@ func observeRepairShape(ctx context.Context, insp *lifeops.Inspector) (repairSha
 	case !slices.Equal(entries, []string{"billet/locks"}):
 		return shape, false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s declares RuntimeDirectory=%s, which is "+
 			"not the one shape a repair admits (billet/locks alone)", nodeUnit, shape.RuntimeDirectory),
-			"install the units this release ships (converge with a release that carries them, or install the package)",
-			stateNothing)
+			"add "+deploy.NodeRegistrationDirectory+" to its RuntimeDirectory by hand as docs/operating/upgrades.md "+
+				"describes, or install the package this release ships", stateNothing)
 	case shape.FragmentPath != repairUnitPath:
 		return shape, false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s is loaded from %s, not from %s, "+
 			"which is the only unit a repair edits", nodeUnit, shape.FragmentPath, repairUnitPath),
@@ -499,19 +649,45 @@ func observeRepairShape(ctx context.Context, insp *lifeops.Inspector) (repairSha
 	return shape, true, "", nil
 }
 
-// readRepairUnit reads the role's unit once, by descriptor and without
-// following a symlink, root's, bounded, and holding exactly the admitted line.
-func readRepairUnit() ([]byte, *endpointRefusal) {
-	info, err := os.Lstat(repairUnitPath)
-	if err != nil {
-		return nil, endpointUnknown(endpointReasonShape, "examine "+repairUnitPath+": "+err.Error(), "", stateNothing)
+// proveRepairLoaded is the manager's word after the reload, every condition the
+// start rests on: the role's fragment, loaded, no drop-in, no reload pending,
+// and exactly the repaired runtime directories.
+func proveRepairLoaded(ctx context.Context, insp *lifeops.Inspector) *endpointRefusal {
+	props, shape, r := observeRepairShapeProps(ctx, insp, stateUnitInstalled)
+	if r != nil {
+		return r
 	}
+
+	want := strings.Fields(strings.TrimPrefix(repairedRuntimeDirectory, "RuntimeDirectory="))
+
+	if shape.LoadState != "loaded" || shape.FragmentPath != repairUnitPath || firstProp(props, "DropInPaths") != "" ||
+		firstProp(props, "NeedDaemonReload") != "no" || !slices.Equal(strings.Fields(shape.RuntimeDirectory), want) {
+		return endpointUnknown(endpointReasonShape, fmt.Sprintf("after the reload systemd loads %s as LoadState=%s from "+
+			"%s with drop-ins %q, NeedDaemonReload=%s and RuntimeDirectory=%s, which is not the repair alone", nodeUnit,
+			orUnknownWord(shape.LoadState), orUnknownWord(shape.FragmentPath), firstProp(props, "DropInPaths"),
+			orUnknownWord(firstProp(props, "NeedDaemonReload")), shape.RuntimeDirectory),
+			"inspect the unit, then converge again", stateUnitInstalled)
+	}
+
+	return nil
+}
+
+// readRepairUnit reads the role's unit once, by descriptor and without
+// following a symlink, root's (judged on the file the descriptor is open on),
+// bounded, and holding exactly the admitted line.
+func readRepairUnit() ([]byte, *endpointRefusal) {
+	f, info, err := regularfile.Open(repairUnitPath, regularfile.Options{NoFollow: true})
+	if err != nil {
+		return nil, endpointUnknown(endpointReasonShape, "open "+repairUnitPath+": "+err.Error(), "", stateNothing)
+	}
+
+	defer func() { _ = f.Close() }()
 
 	if err := repairUnitOwned(info); err != nil {
 		return nil, endpointRefuse(endpointReasonShape, err.Error(), "", stateNothing)
 	}
 
-	body, err := regularfile.ReadFile(repairUnitPath, maxUnitBytes, regularfile.Options{NoFollow: true})
+	body, err := regularfile.ReadAllLimited(f, repairUnitPath, maxUnitBytes)
 	if err != nil {
 		return nil, endpointUnknown(endpointReasonShape, "read "+repairUnitPath+": "+err.Error(), "", stateNothing)
 	}

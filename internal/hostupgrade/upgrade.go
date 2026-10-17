@@ -21,7 +21,7 @@ import (
 // steps is a recovery nobody can write correctly.
 type Host interface {
 	// CheckUnitRequirements refuses a candidate that needs something of the
-	// loaded node unit it does not provide (#168), before anything stops: a
+	// loaded node unit it does not provide (#168), before the first step: a
 	// rollout replaces the binary and never the units, so the unit a host
 	// runs is the one its last converge or package installed.
 	CheckUnitRequirements(ctx context.Context) error
@@ -121,6 +121,12 @@ var ErrRolledBack = errors.New("hostupgrade: the upgrade failed and the previous
 // compute may or may not exist. The only safe act is to leave it alone with its
 // recovery journal intact and tell a person.
 var ErrCordoned = errors.New("hostupgrade: the upgrade failed and the rollback could not be proved")
+
+// ErrRefusedUntouched means the transaction refused before its first step:
+// nothing was preserved, stopped, fenced or installed, and nothing is restored
+// or started. The caller gives the claim back, as for a refusal before the
+// transaction was accepted, and the host runs the release it ran.
+var ErrRefusedUntouched = errors.New("hostupgrade: refused before anything was touched")
 
 // ErrUnsafeToRestore is what a step wraps when it failed in a way that leaves the
 // candidate possibly still running, so that restoring the previous release and
@@ -238,6 +244,20 @@ func Run(ctx context.Context, req Request) error {
 		return rollBack(ctx, req, log, errors.New(j.Failure))
 	}
 
+	// WHAT THE CANDIDATE NEEDS OF THE UNITS, BEFORE THE FIRST STEP: a refusal
+	// here has preserved, stopped and fenced nothing, so it is no rollback.
+	// Through beginRollback it would be one, and a decided journal reaches every
+	// step, so the services would be started and the uplink restarted on a host
+	// the transaction never touched.
+	if !j.Reached(StepStopped) {
+		if err := req.Host.CheckUnitRequirements(ctx); err != nil {
+			log.Error("the candidate needs what the loaded units do not provide; nothing was touched",
+				"from", j.FromVersion, "to", j.ToVersion, "error", err)
+
+			return fmt.Errorf("%w: %w", ErrRefusedUntouched, err)
+		}
+	}
+
 	if err := advance(ctx, req, log); err != nil {
 		if errors.Is(err, ErrUnsafeToRestore) {
 			return cordonWithoutRestoring(req, log, err)
@@ -292,12 +312,6 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 		step: StepStopped,
 		what: "stopping the services and hiding the installed binary",
 		do: func(ctx context.Context) error {
-			// WHAT THE CANDIDATE NEEDS OF THE UNITS, FIRST: a refusal here has
-			// stopped nothing, so the rollback has nothing to restore.
-			if err := host.CheckUnitRequirements(ctx); err != nil {
-				return err
-			}
-
 			if err := host.PreserveCurrent(ctx, j.Dir); err != nil {
 				return err
 			}

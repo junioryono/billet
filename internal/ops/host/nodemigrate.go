@@ -523,20 +523,22 @@ func judgeMigration(ctx context.Context, m migrateMode, insp *lifeops.Inspector,
 		// the guard, or could-not-tell.
 		pid, _, _ := runningPID(br.obs)
 
-		preR, why := preRProcess(ctx, pid)
-		if !preR {
+		vintage, why := processVintageOf(ctx, pid)
+		if vintage != vintagePreR {
 			// A UNIT THAT CANNOT HOLD THE RECORD (#168): a rollout moved the
 			// binary past the unit an older collection rendered, so the node runs
 			// and publishes nothing, and neither waiting nor a restart changes
-			// that. Proved only from the loaded unit's own answer; an unanswered
-			// RuntimeDirectory is the could-not-tell below.
-			if unitCannotHoldRecord(br.obs) {
+			// that. Proved only from a process positively of a release that
+			// publishes and from the loaded unit's own answer; a process that
+			// could not be identified, or an unanswered RuntimeDirectory, is the
+			// could-not-tell below.
+			if vintage == vintageR && unitCannotHoldRecord(br.obs) {
 				if !m.dryRun {
 					return judgedMigration{}, endpointRefuse(endpointReasonRepair, fmt.Sprintf("the running node cannot "+
 						"publish its registration record, because %s declares RuntimeDirectory=%s without %s; its "+
 						"effective endpoint is unknown until the unit is repaired", nodeUnit, br.obs.RuntimeDirectory,
-						deploy.NodeRegistrationDirectory), "billet node repair-unit --config "+installed.path+" --json",
-						stateNothing), false
+						deploy.NodeRegistrationDirectory), "billet node repair-unit --config "+installed.path+
+						" --run ID --json", stateNothing), false
 				}
 
 				recordKind = recordUnitCannotHold

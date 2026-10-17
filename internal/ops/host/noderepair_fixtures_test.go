@@ -72,8 +72,12 @@ func TestTheRepairFixturesAreTheCommandsOwn(t *testing.T) {
 			out := strings.ReplaceAll(o.raw, f.deployment, strings.Repeat("d", 32))
 			out = strings.ReplaceAll(out, f.unitPath, repairUnitInstalledPath)
 			out = strings.ReplaceAll(out, f.configPath, "/etc/billet/billet.yaml")
-			out = regexp.MustCompile(`"(before|after)_sha256": "[0-9a-f]{64}"`).
-				ReplaceAllString(out, `"${1}_sha256": "`+strings.Repeat("ab", 32)+`"`)
+			// TWO DIGESTS THAT DIFFER, as a repair's always do: the role holds
+			// them to that.
+			out = regexp.MustCompile(`"before_sha256": "[0-9a-f]{64}"`).
+				ReplaceAllString(out, `"before_sha256": "`+strings.Repeat("ab", 32)+`"`)
+			out = regexp.MustCompile(`"after_sha256": "[0-9a-f]{64}"`).
+				ReplaceAllString(out, `"after_sha256": "`+strings.Repeat("cd", 32)+`"`)
 			out = strings.ReplaceAll(out, f.recordPath, "/run/billet/registration/current")
 			out = strings.ReplaceAll(out, f.dir, "/var/lib/billet-fixture")
 			compareFixture(t, "node-repair-unit", name, out)

@@ -27,6 +27,22 @@ import (
 // needs exists, which is the skew #168 describes.
 const repairStandinEnv = "BILLET_REPAIR_NODE_STANDIN"
 
+// repairGuardStandinEnv makes the test binary, run as the witness's managed
+// binary, answer the converge guard's dry run as a release that carries the
+// guard does, so the node it runs is positively one that publishes.
+const repairGuardStandinEnv = "BILLET_REPAIR_GUARD_STANDIN"
+
+// runRepairGuardStandin is that answer, when the arguments are the dry run's.
+func runRepairGuardStandin(args []string) bool {
+	if len(args) < 3 || args[0] != "converge-guard" || args[1] != "prepare" || args[2] != "--dry-run" {
+		return false
+	}
+
+	fmt.Println(`{"outcome":"reported"}`)
+
+	return true
+}
+
 // runRepairStandin is the witness's node, run by TestMain under systemd: it
 // waits for the record's directory, writes a record naming its invocation, and
 // stays up until stopped.
@@ -157,6 +173,18 @@ func TestRealSystemdRepairGivesALegacyNodeUnitItsRecordDirectory(t *testing.T) {
 	standin := filepath.Join(root, "standin")
 	writeFile(t, standin, string(body), 0o755)
 
+	// THIS CONVERGE'S GUARD, in a temporary upgrade root, and the stand-in as
+	// the managed binary the node runs, answering the guard's dry run as a
+	// release that publishes its record.
+	newGuardFixture(t)
+	mustHold(t, repairHolder)
+
+	prevBinary := installedBinary
+	installedBinary = standin
+
+	t.Cleanup(func() { installedBinary = prevBinary })
+	t.Setenv(repairGuardStandinEnv, "1")
+
 	incarnation := make([]byte, 16)
 	_, err = rand.Read(incarnation)
 	mustOK(t, err)
@@ -196,7 +224,8 @@ func TestRealSystemdRepairGivesALegacyNodeUnitItsRecordDirectory(t *testing.T) {
 	}
 
 	// THE REPAIR.
-	o := runEndpoint(t, NodeRepairUnit, "", "--config", configPath, "--wait", "30s", "--stop-timeout", "1m")
+	o := runEndpoint(t, NodeRepairUnit, "", "--config", configPath, "--wait", "30s", "--stop-timeout", "1m",
+		"--run", repairHolder)
 	if o.code != 0 || o.str("outcome") != outcomeRepaired {
 		t.Fatalf("the repair answered code %d outcome %q (%s: %s, state %s)", o.code, o.str("outcome"), o.str("reason"),
 			o.str("why"), o.str("state"))

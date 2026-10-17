@@ -3436,7 +3436,7 @@ e e12-repaired "BILLET_GATE_ANSWER=$(ep_repair_answers e12-repaired "$(ep_fixtur
 ep_case e12-repaired
 expect_allowed e12-repaired
 expect_fact e12-repaired record current
-expect_calls e12-repaired managed "node repair-unit --config /etc/billet/billet.yaml --stop-timeout 3600s --wait 120s --json" 1
+expect_calls e12-repaired managed "node repair-unit --config /etc/billet/billet.yaml --run h1 --stop-timeout 3600s --wait 120s --json" 1
 expect_calls e12-repaired managed "node repair-unit --config /etc/billet/billet.yaml --wait 120s --dry-run --json" 0
 expect_calls e12-repaired managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 2
 order=$(commands e12-repaired | grep -v " prepare$\| version$\| settle$" | tr '\n' ';')
@@ -3462,6 +3462,29 @@ e e12d-policy "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12d-policy no
 ep_case e12d-policy
 expect_refused e12d-policy "Refuse a runtime-unit repair the policy will not let start the node" "Stop billet-node.service, then converge again"
 expect_calls e12d-policy managed "node repair-unit" 0
+ep_plant_ordinary e12d2-retained $EP_A $EP_A
+a e12d2-retained -e billet_retirement_node_ordinary=true
+e e12d2-retained "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12d2-retained node-migrate-endpoint reported-unit-cannot-hold.json)"
+ep_case e12d2-retained
+expect_refused e12d2-retained "Refuse a runtime-unit repair inside a retained retirement" "Converge this host ordinarily first, then retire it"
+expect_calls e12d2-retained managed "node repair-unit" 0
+ep_plant_ordinary e12d3-retained-check $EP_A $EP_A
+a e12d3-retained-check --check -e billet_retirement_node_ordinary=true
+e e12d3-retained-check "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12d3-retained-check node-migrate-endpoint reported-unit-cannot-hold.json)"
+HOLDER=""; ep_case e12d3-retained-check; HOLDER=h1
+expect_refused e12d3-retained-check "Refuse a runtime-unit repair inside a retained retirement" "Converge this host ordinarily first"
+expect_calls e12d3-retained-check managed "node repair-unit" 0
+ep_plant_ordinary e12g-unchanged $EP_A $EP_A
+e e12g-unchanged "BILLET_GATE_ANSWER=$(ep_repair_answers e12g-unchanged "$(ep_fixture e12g-unchanged node-repair-unit unchanged.json)")"
+ep_case e12g-unchanged
+expect_allowed e12g-unchanged
+expect_calls e12g-unchanged managed "node migrate-endpoint --config /etc/billet/billet.yaml --desired - --wait 120s --dry-run --json" 2
+grep -q "No runtime-unit repair was needed when it was asked" "$work/cases/e12g-unchanged/out" || fail "e12g: the unchanged report is missing" "$work/cases/e12g-unchanged/out"
+ep_plant_ordinary e12h-check-refused $EP_A $EP_A
+a e12h-check-refused --check
+e e12h-check-refused "BILLET_GATE_ANSWER=migrate-endpoint:1:$(ep_fixture e12h-check-refused node-migrate-endpoint reported-unit-cannot-hold.json);repair-unit:1:$(ep_fixture e12h-check-refused node-repair-unit refused-unit-shape.json)"
+HOLDER=""; ep_case e12h-check-refused; HOLDER=h1
+expect_refused e12h-check-refused "Stop a dry run at the runtime-unit repair" "The repair would refuse this host (unit-shape)"
 ep_plant_ordinary e12e-still $EP_A $EP_A
 e e12e-still "BILLET_GATE_ANSWER=$(ep_repair_answers e12e-still "$(ep_fixture e12e-still node-repair-unit repaired.json)" reported-unit-cannot-hold.json)"
 ep_case e12e-still

@@ -82,7 +82,7 @@
       - name: unit_path
         ok: "{{ billet_repair_outcome != 'repaired' or billet_repair_a.unit_path | default('') == '/etc/systemd/system/billet-node.service' }}"
       - name: digests
-        ok: "{{ billet_repair_outcome != 'repaired' or ((billet_repair_a.before_sha256 | default('x')) is string and (billet_repair_a.before_sha256 | default('')) is match(billet_repair_sha) and (billet_repair_a.after_sha256 | default('x')) is string and (billet_repair_a.after_sha256 | default('')) is match(billet_repair_sha)) }}"
+        ok: "{{ billet_repair_outcome != 'repaired' or ((billet_repair_a.before_sha256 | default('x')) is string and (billet_repair_a.before_sha256 | default('')) is match(billet_repair_sha) and (billet_repair_a.after_sha256 | default('x')) is string and (billet_repair_a.after_sha256 | default('')) is match(billet_repair_sha) and billet_repair_a.before_sha256 != billet_repair_a.after_sha256) }}"
       - name: identities
         ok: "{{ billet_repair_outcome != 'repaired' or (['deployment', 'from_invocation', 'invocation_id', 'incarnation'] | map('extract', billet_repair_a) | select('string') | select('match', billet_repair_hex32) | list | length == 4) }}"
       - name: new_invocation

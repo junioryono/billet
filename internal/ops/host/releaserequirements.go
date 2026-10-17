@@ -79,6 +79,29 @@ func missingRuntimeDirectories(req unitRequirements, runtime string) []string {
 	return missing
 }
 
+// candidateVintage says what a candidate binary positively is from its answer
+// to the converge guard's dry run, as processVintageOf does for the managed
+// binary: an unknown command is a release before the guard, any completed
+// answer one that carries it, anything else could-not-tell.
+func candidateVintage(ctx context.Context, staged string) (processVintage, string) {
+	stdout, stderr, rc, err := runBounded(ctx, staged, "converge-guard", "prepare", "--dry-run", "--json")
+
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return vintageUnknown, "the candidate did not answer the preparation's dry run within its bound"
+	case errors.Is(err, errOutputOverflow):
+		return vintageUnknown, "the candidate's answer to the preparation's dry run overflowed its bound"
+	case rc < 0:
+		return vintageUnknown, "the candidate could not be run: " + err.Error()
+	}
+
+	if rc != 0 && unknownCommandPattern.Match(append(append([]byte{}, stdout...), stderr...)) {
+		return vintagePreR, ""
+	}
+
+	return vintageR, ""
+}
+
 // checkUnitRequirements asks the staged candidate what it needs of the node
 // unit and refuses a loaded unit that does not provide it, naming the
 // preparation. A candidate that predates the question says so positively (its
@@ -99,24 +122,39 @@ func checkUnitRequirements(ctx context.Context, staged, configPath string, insp 
 		return "", fmt.Errorf("the candidate could not be asked what it requires of the node unit: %w", err)
 	}
 
-	if rc != 0 {
-		both := append(append([]byte{}, stdout...), stderr...)
-		if bytes.Contains(both, []byte(`unknown release command "requirements"`)) || unknownCommandPattern.Match(both) {
-			return "the candidate predates the unit requirements and declares none", nil
-		}
-
-		return "", fmt.Errorf("the candidate refused to say what it requires of the node unit (exit %d): %s", rc,
-			strings.TrimSpace(string(both)))
-	}
-
 	var req unitRequirements
 
-	dec := json.NewDecoder(bytes.NewReader(stdout))
-	dec.DisallowUnknownFields()
+	if rc != 0 {
+		both := append(append([]byte{}, stdout...), stderr...)
+		if !bytes.Contains(both, []byte(`unknown release command "requirements"`)) && !unknownCommandPattern.Match(both) {
+			return "", fmt.Errorf("the candidate refused to say what it requires of the node unit (exit %d): %s", rc,
+				strings.TrimSpace(string(both)))
+		}
 
-	if err := dec.Decode(&req); err != nil || req.Schema != requirementsSchema || req.RuntimeDirectories == nil {
-		return "", fmt.Errorf("the candidate's answer to what it requires of the node unit is not one this build "+
-			"reads (schema %d): %v", req.Schema, err)
+		// A CANDIDATE FROM BEFORE THE QUESTION is not therefore one that needs
+		// nothing: every release that publishes its registration record and
+		// predates this command needs the record's directory too (#168). Such
+		// a release carries the converge guard, so the guard's dry run is what
+		// tells the two apart.
+		vintage, why := candidateVintage(ctx, staged)
+
+		switch vintage {
+		case vintagePreR:
+			return "the candidate is a release before the converge guard and requires nothing of a node unit", nil
+		case vintageR:
+			req = unitRequirements{Schema: requirementsSchema, RuntimeDirectories: slices.Clone(deploy.NodeRuntimeDirectories)}
+		default:
+			return "", fmt.Errorf("the candidate predates the unit requirements, and whether it publishes a "+
+				"registration record cannot be told: %s", why)
+		}
+	} else {
+		dec := json.NewDecoder(bytes.NewReader(stdout))
+		dec.DisallowUnknownFields()
+
+		if err := dec.Decode(&req); err != nil || req.Schema != requirementsSchema || req.RuntimeDirectories == nil {
+			return "", fmt.Errorf("the candidate's answer to what it requires of the node unit is not one this build "+
+				"reads (schema %d): %v", req.Schema, err)
+		}
 	}
 
 	if len(req.RuntimeDirectories) == 0 {
@@ -139,8 +177,8 @@ func checkUnitRequirements(ctx context.Context, staged, configPath string, insp 
 
 	switch load := firstProp(props, "LoadState"); load {
 	case "loaded":
-	case "not-found":
-		return nodeUnit + " is not installed, so there is no node unit to hold to the candidate's requirements", nil
+	case "not-found", "masked":
+		return fmt.Sprintf("%s is %s, so no node runs here to hold to the candidate's requirements", nodeUnit, load), nil
 	default:
 		return "", fmt.Errorf("%s is LoadState=%s, so whether it meets the candidate's requirements cannot be told",
 			nodeUnit, load)

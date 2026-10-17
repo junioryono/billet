@@ -1099,6 +1099,15 @@ func finishHostUpgrade(ctx context.Context, env cli.Env, root *os.File, journal 
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
 
+	// REFUSED BEFORE ITS FIRST STEP, the transaction touched nothing outside its
+	// directory, so the claim goes back with it as for a refusal before
+	// acceptance, and the host runs the release it ran.
+	if errors.Is(err, hostupgrade.ErrRefusedUntouched) {
+		fmt.Fprintf(env.Stdout, "\nThis upgrade was refused before anything was stopped: %v\n", err)
+
+		return refuseClaimed(root, journal.Dir, err)
+	}
+
 	// THE DECISION IS SETTLED HERE, AS A REQUIRED STEP OF ITS OWN. A committed
 	// transaction carried its decision out whatever came after the commit, and a
 	// rollback never reaches this. It is not inside RecordInstalled, whose failure
