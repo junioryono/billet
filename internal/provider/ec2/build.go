@@ -1179,6 +1179,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\nset -eux\n")
 
+	// A HOME, BECAUSE CLOUD-INIT GIVES USER DATA NONE and the shared installers are
+	// written for a root shell, which the guest build always runs them from.
+	// Composer's installer refuses to run without HOME or COMPOSER_HOME, and since
+	// it joined the hosted tools every AMI build died there, before the runner was
+	// fetched (measured on a real builder, 2026-10-17).
+	b.WriteString("export HOME=/root\n")
+
 	// THE DISK IS THERE BEFORE ANYTHING TRIES TO USE IT.
 	//
 	// billet asks for a larger root than the base image declares, and growing an
