@@ -209,6 +209,16 @@ func TestEndingCheckAnswersByTheStoppedInvocation(t *testing.T) {
 		}
 	})
 
+	t.Run("admit-start over a running node agrees with the host's gate", func(t *testing.T) {
+		f := newEndingFixture(t)
+		f.begin(t, "inv-1", nodeending.Running)
+		f.unit(t, "active", "running", "success", "41", "inv-1")
+
+		if a := f.run(t, "admit-start"); a.code != 0 || !strings.Contains(a.str("why"), "starts nothing") {
+			t.Fatalf("admit-start over a running node: code %d (%s), want admitted", a.code, a.str("why"))
+		}
+	})
+
 	t.Run("a stale invocation over a killed node", func(t *testing.T) {
 		f := newEndingFixture(t)
 		f.begin(t, "inv-1", nodeending.Running)

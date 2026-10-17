@@ -691,24 +691,123 @@ func TestADirectoryThatAppearsIsJudgedAgainUnderItsLock(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "made-meanwhile")
 	calls, heldOnSecond := 0, false
 
-	JudgeStanding(dir, false, func() Unit {
+	// The first, unlocked sample is clean and would prove the start; the
+	// second, locked one is a timeout, which the verdict must rest on.
+	j := JudgeStanding(dir, false, func() Unit {
 		calls++
 
-		switch calls {
-		case 1:
+		if calls == 1 {
 			if err := os.Mkdir(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-		case 2:
-			heldOnSecond = lockHeld(t, dir)
+
+			return cleanUnit
 		}
 
-		return cleanUnit
+		heldOnSecond = lockHeld(t, dir)
+
+		return timedOut
 	})
 
-	if calls != 2 || !heldOnSecond {
-		t.Fatalf("systemd was asked %d times, the second with the lock held %v; want twice, the second locked",
-			calls, heldOnSecond)
+	if calls != 2 || !heldOnSecond || j.Verdict != Unproved || j.Sampled != timedOut {
+		t.Fatalf("systemd was asked %d times, the second locked %v, and the verdict is %s on %+v (%s); want "+
+			"twice, the second locked, and unproved on the timeout", calls, heldOnSecond, j.Verdict, j.Sampled,
+			j.Why)
+	}
+}
+
+// A NODE WHOSE RECORD STAYS LOCKED PAST THE WAIT DOES NOT START, and one whose
+// ending cannot be written leaves its entry running, which reads as killed:
+// both the safe direction.
+func TestANodeBehindAHeldLock(t *testing.T) {
+	dir := t.TempDir()
+
+	h, err := Begin(dir, nodeEntry("inv-1", 1), clock(epoch))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	if _, err := Begin(dir, nodeEntry("inv-2", 2), clock(epoch)); !errors.Is(err, errLockHeld) {
+		t.Fatalf("Begin behind a held lock returned %v, want errLockHeld", err)
+	}
+
+	if err := h.End(Drained, false); !errors.Is(err, errLockHeld) || h.Ended() {
+		t.Fatalf("End behind a held lock returned %v and ended %v, want errLockHeld and not ended", err,
+			h.Ended())
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, _, err := Read(dir)
+	if err != nil || len(rec.Entries) != 1 || rec.Entries[0].Ending != Running {
+		t.Fatalf("the record is %+v (%v), want the one entry still running", rec.Entries, err)
+	}
+}
+
+// A SAMPLE TAKEN BEFORE A LOCK THAT WAS THEN REFUSED IS NOT WHAT THE VERDICT
+// RESTS ON: a node seen running there may have been killed during the wait,
+// so the judgement carries no sample, and a completed one carries its own.
+func TestARefusedRetryCarriesNoSample(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "made-meanwhile")
+	active := Unit{ActiveState: "active", SubState: "running", Result: "success", MainPID: "5", JobAnswered: true}
+
+	var holder *os.File
+
+	t.Cleanup(func() {
+		if holder != nil {
+			_ = holder.Close()
+		}
+	})
+
+	prev := lockWait
+	lockWait = 100 * time.Millisecond
+
+	t.Cleanup(func() { lockWait = prev })
+
+	j := JudgeStanding(dir, false, func() Unit {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		holder = f
+
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			t.Fatal(err)
+		}
+
+		return active
+	})
+
+	if j.Verdict != Unknown || j.Sampled != (Unit{}) {
+		t.Fatalf("a refused retry is %s carrying %+v (%s), want could-not-tell and no sample", j.Verdict,
+			j.Sampled, j.Why)
+	}
+
+	done := JudgeStanding(t.TempDir(), false, func() Unit { return active })
+	if done.Sampled != active {
+		t.Fatalf("a completed standing carries %+v, want the sample it rests on", done.Sampled)
 	}
 }
 

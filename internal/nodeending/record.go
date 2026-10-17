@@ -435,6 +435,10 @@ func lockRefused(err error) Judgement {
 // through.
 func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement {
 	unlock, err := lock(dir)
+	if errors.Is(err, fs.ErrNotExist) && dirExists(dir) {
+		// The directory appeared between the attempt and the look.
+		unlock, err = lock(dir)
+	}
 
 	switch {
 	case err == nil:
@@ -448,7 +452,7 @@ func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement
 		rec, _, readErr := Read(dir)
 
 		if !dirExists(dir) {
-			return Standing(rec, readErr, after, drainRequired, BootID())
+			return sampled(Standing(rec, readErr, after, drainRequired, BootID()), after)
 		}
 
 		if unlock, err = lock(dir); err != nil {
@@ -460,7 +464,14 @@ func JudgeStanding(dir string, drainRequired bool, sample func() Unit) Judgement
 	after := sample()
 	rec, _, readErr := Read(dir)
 
-	return Standing(rec, readErr, after, drainRequired, BootID())
+	return sampled(Standing(rec, readErr, after, drainRequired, BootID()), after)
+}
+
+// sampled records on a completed judgement the unit it rests on.
+func sampled(j Judgement, u Unit) Judgement {
+	j.Sampled = u
+
+	return j
 }
 
 // dirExists says dir is there, or that asking failed: only a positive absence

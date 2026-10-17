@@ -13,8 +13,9 @@ const noFollow = syscall.O_NOFOLLOW
 
 // lockWait bounds the wait for the record's lock. A write is milliseconds and
 // a judgement asks systemd once under it (its own bound is 30 s); a holder past
-// this is hung, and waiting on it would hold every start and stop behind it.
-var lockWait = 90 * time.Second
+// this is hung, and waiting on it would hold every start and stop behind it. It
+// leaves a starting node most of its unit's 120 s start budget.
+var lockWait = 60 * time.Second
 
 // errLockHeld is the refusal when the lock stays held past lockWait.
 var errLockHeld = errors.New("the ending record is locked by another process past the wait for it")
@@ -29,9 +30,9 @@ func flock(f *os.File) error {
 		switch {
 		case err == nil:
 			return nil
-		case err == syscall.EINTR:
+		case errors.Is(err, syscall.EINTR):
 			continue
-		case err != syscall.EWOULDBLOCK:
+		case !errors.Is(err, syscall.EWOULDBLOCK):
 			return err
 		case time.Now().After(deadline):
 			return errLockHeld

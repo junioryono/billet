@@ -151,31 +151,35 @@ func judgeNodeStop(
 // acknowledgement. A node already running is not started, so there is nothing
 // to admit: a resumed upgrade proves it as it proves any running service.
 func admitNodeStart(ctx context.Context, insp *lifeops.Inspector, cfg *config.Config) error {
-	// A NODE ALREADY RUNNING IS ASKED ABOUT FIRST, without the record's lock,
-	// since nothing is started and a state directory it cannot write must not
-	// refuse it; anything else is judged afresh under the lock.
-	if running(observeNodeUnit(ctx, insp)) {
-		return nil
-	}
-
-	var now nodeending.Unit
-
-	j := nodeending.JudgeStanding(cfg.Node.StateDir, false, func() nodeending.Unit {
-		now = observeNodeUnit(ctx, insp)
-
-		return now
-	})
-
-	if running(now) {
-		return nil
-	}
-
+	j := admitStart(cfg.Node.StateDir, func() nodeending.Unit { return observeNodeUnit(ctx, insp) })
 	if j.Verdict != nodeending.Proved {
 		return fmt.Errorf("%s is not started: what its last process left is %s: %s%s", nodeUnit, j.Answer,
 			j.Why, acknowledgeRemedy(j))
 	}
 
 	return nil
+}
+
+// admitStart is the one start gate, for the host's starts and for `billet node
+// ending admit-start`. A NODE ALREADY RUNNING IS ASKED ABOUT FIRST, without the
+// record's lock, since nothing is started and a state directory it cannot
+// write must not refuse it; anything else is judged afresh under the lock, and
+// admitted as running only on the sample that judgement rests on, never on one
+// taken before a lock that was then refused.
+func admitStart(dir string, sample func() nodeending.Unit) nodeending.Judgement {
+	runs := nodeending.Judgement{Verdict: nodeending.Proved, Answer: nodeending.Proved.String(),
+		Why: "the node is running, so a start starts nothing"}
+
+	if running(sample()) {
+		return runs
+	}
+
+	j := nodeending.JudgeStanding(dir, false, sample)
+	if running(j.Sampled) {
+		return runs
+	}
+
+	return j
 }
 
 // running says systemd reports the unit up or coming up, so a start of it

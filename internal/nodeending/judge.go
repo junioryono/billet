@@ -56,6 +56,10 @@ type Judgement struct {
 	// decided the verdict, which JudgeStop records so the start
 	// after it reads the same answer.
 	Floor bool `json:"-"`
+	// Sampled is the unit a completed JudgeStanding rests on, and zero for one
+	// that did not complete: a sample taken before a lock that was then refused
+	// says nothing the verdict stands on.
+	Sampled Unit `json:"-"`
 }
 
 func judged(v Verdict, proof string, e *Entry, why string, args ...any) Judgement {

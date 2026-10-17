@@ -194,7 +194,7 @@ func endingAdmitStart(ctx context.Context, env cli.Env, args []string) error {
 
 	var observed *endingUnitAnswer
 
-	j := nodeending.JudgeStanding(cfg.Node.StateDir, false, func() nodeending.Unit {
+	j := admitStart(cfg.Node.StateDir, func() nodeending.Unit {
 		var unit nodeending.Unit
 
 		unit, observed = observeEndingUnit(ctx)

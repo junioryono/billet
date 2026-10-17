@@ -278,6 +278,38 @@ func TestARunningNodeNeedsNoLock(t *testing.T) {
 	}
 }
 
+// A NODE THAT CAME UP BETWEEN THE FIRST LOOK AND THE LOCKED ONE IS RUNNING: the
+// gate admits it on the sample its judgement rests on, since a start of it
+// starts nothing.
+func TestANodeThatCameUpMeanwhileIsAdmitted(t *testing.T) {
+	inactive := nodeending.Unit{ActiveState: "inactive", SubState: "dead", Result: "success", MainPID: "0",
+		JobAnswered: true}
+	active := nodeending.Unit{ActiveState: "active", SubState: "running", Result: "success", MainPID: "5",
+		JobAnswered: true}
+
+	dir := t.TempDir()
+	if _, err := nodeending.Begin(dir, nodeending.Entry{InvocationID: "inv-1", PID: 5, Role: nodeending.RoleNode},
+		nil); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+
+	j := admitStart(dir, func() nodeending.Unit {
+		calls++
+		if calls == 1 {
+			return inactive
+		}
+
+		return active
+	})
+
+	if j.Verdict != nodeending.Proved || !strings.Contains(j.Why, "starts nothing") || calls != 2 {
+		t.Fatalf("the gate over a node that came up meanwhile = %s (%s) after %d looks, want admitted as "+
+			"running after two", j.Answer, j.Why, calls)
+	}
+}
+
 // THE HOST'S START GATE AND ITS JUDGEMENT OF A NODE ALREADY STOPPED TAKE THE
 // RECORD'S LOCK: with a lock this user cannot create, both answer that the
 // record is root's, which only the locked judgement says.
