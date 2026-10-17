@@ -439,12 +439,22 @@ func openDir(
 	// the emergency one. A control plane opens the ledger once and is about to
 	// make scheduling decisions against it; a command is neither, and an
 	// inspection is not even that.
+	//
+	// THE SCAN HAS A BOUND OF ITS OWN (the backend's), because a cold read of a
+	// large ledger outlasts the startup budget on a healthy disk; and the rest of
+	// startup starts its clock after it, so a long scan leaves the migrations
+	// their whole budget rather than what the scan did not use.
 	if !admin && !mode.inspect {
 		noteOpenSideEffect("integrity")
 
-		if err := db.backend.integrityCheck(startupCtx, db.w); err != nil {
+		if err := db.backend.integrityCheck(ctx, db.w); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
+
+		var cancelRest context.CancelFunc
+
+		startupCtx, cancelRest = context.WithTimeout(ctx, startupTimeout)
+		defer cancelRest()
 	}
 
 	// MIGRATING IS AUTHORISED BY THE CONTROLLER EXCLUSION, AND THE DIRECTORY LOCK
@@ -606,12 +616,17 @@ func openDir(
 	return db, nil
 }
 
-// startupTimeout bounds the pragma verification, integrity check and migrations,
-// and a migration run at promotion takes the same bound for itself (see
-// migrate). Generous, because a first run creates the database and an integrity
-// check scans it; anything slower than this is a sick disk, not a slow one — or,
-// on PostgreSQL, another session holding a lock the migration is waiting for.
-var startupTimeout = 30 * time.Second
+// startupTimeout bounds the pragma verification and the migrations, each side of
+// the integrity scan (which has its own bound, integrityScanBudget), and a
+// migration run at promotion takes the same bound for itself (see migrate).
+// Generous, because a first run creates the database; anything slower than this
+// is a sick disk, not a slow one — or, on PostgreSQL, another session holding a
+// lock the migration is waiting for.
+var startupTimeout = defaultStartupTimeout
+
+// defaultStartupTimeout is startupTimeout's production value, named so a test
+// that shortens the variable can still check the bound a real start has.
+const defaultStartupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
 //

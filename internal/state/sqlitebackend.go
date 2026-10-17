@@ -201,13 +201,33 @@ func (*sqliteBackend) verifyDurability(ctx context.Context, w *sql.DB, _ bool) e
 	return errors.Join(errs...)
 }
 
-// integrityCheck refuses to serve from a corrupt ledger. quick_check is cheap
-// enough to run at every startup for a database this size, and scheduling
+// integrityScanBudget bounds one quick_check, which reads the whole file.
+//
+// ITS OWN BOUND, NOT THE STARTUP ONE, and sized for a COLD read. On 2026-10-17
+// the reference controller's 740 MB ledger took 55 seconds to check with the
+// page cache empty and 0.5 seconds warm, and a host upgrade always checks it
+// cold: the services are stopped and the snapshot copy has just evicted the
+// cache on a 1.8 GiB machine. Under the shared 30-second startup budget the
+// candidate's probe failed, the restored release then failed to start twice the
+// same way, and the controller was left cordoned. The bound stays under the
+// server unit's TimeoutStartSec, which kills a start that outlasts it whatever
+// billet allows (TestTheIntegrityScanFitsTheServerUnitsStartBound).
+const integrityScanBudget = 90 * time.Second
+
+// integrityCheck refuses to serve from a corrupt ledger, because scheduling
 // against corrupt capacity data is worse than not starting.
 func (*sqliteBackend) integrityCheck(ctx context.Context, w *sql.DB) error {
+	ctx, cancel := context.WithTimeout(ctx, integrityScanBudget)
+	defer cancel()
+
 	var result string
 	//billet:ignore rawsql // a pragma is not a query; sqlc has no catalogue entry for one
 	if err := w.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("integrity check: the whole-file read did not finish in %s, "+
+				"which a cold read of a ledger this size should: %w", integrityScanBudget, err)
+		}
+
 		return fmt.Errorf("integrity check: %w", err)
 	}
 
