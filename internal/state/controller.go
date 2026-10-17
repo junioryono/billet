@@ -43,6 +43,56 @@ var ErrLeadershipLost = errors.New("state: this process is no longer this deploy
 var ErrStandby = errors.New(
 	"state: this process is a standby and has not claimed this deployment's controller")
 
+// SchemaMoved is a migration that moved this deployment's ledger to a newer
+// schema, reported beside a failure that came after it and before a claim
+// recorded this release: the open or the claim it was part of did not
+// complete, and the schema does not move back.
+//
+// A LEAF, AND THAT IS THE POINT. It wraps nothing, so an error that joins it to
+// a cancellation is not only a cancellation, and a process that was asked to
+// stop after moving the schema does not report that stop as a clean one.
+type SchemaMoved struct {
+	// From is the newest version the ledger had applied before, zero for a
+	// ledger nothing had migrated; To is the newest this migration applied.
+	From, To int
+	// Unknown is a migration whose COMMIT was sent and not answered: the
+	// ledger is at From or at To, and nothing here can tell which.
+	Unknown bool
+}
+
+// orNil is e as an error for errors.Join, and nil when nothing moved. A nil
+// *SchemaMoved converted to error is not a nil error: joined as it is, it
+// reports a move that never happened.
+func (e *SchemaMoved) orNil() error {
+	if e == nil {
+		return nil
+	}
+
+	return e
+}
+
+func (e *SchemaMoved) Error() string {
+	from := fmt.Sprintf("schema %d", e.From)
+	if e.From == 0 {
+		from = "an empty schema"
+	}
+
+	moved := fmt.Sprintf("this process migrated the deployment's ledger from %s to schema %d", from, e.To)
+	if e.Unknown {
+		moved = fmt.Sprintf("this process could not tell whether its migration of the deployment's "+
+			"ledger from %s to schema %d committed", from, e.To)
+	}
+
+	refused := "a billet that expects an older schema is refused by this ledger"
+	if e.Unknown {
+		refused = "if it did, a billet that expects an older schema is refused by this ledger"
+	}
+
+	return "state: " + moved + " before it failed. Migrations do not move back: " + refused +
+		", and the way back is a restore or a forward fix (see Downgrades in " +
+		"docs/operating/upgrades.md)"
+}
+
 // controllerPollInterval paces a standby's attempts to take the claim.
 //
 // SHORT, BECAUSE THE ONLY THING IT COSTS IS ONE pg_try_advisory_lock AGAINST A
@@ -130,8 +180,13 @@ func (db *DB) ClaimController(
 		return ControllerClaim{}, ErrInspect
 	}
 
+	// WHAT THIS HANDLE'S OPEN MIGRATED IS STILL THIS PROCESS'S TO REPORT, and
+	// stays joined to every failure below until the claim's own transaction has
+	// recorded this release (see unclaimedMove).
+	moved := db.unclaimedMove
+
 	if err := db.backend.claimController(ctx, db); err != nil {
-		return ControllerClaim{}, err
+		return ControllerClaim{}, errors.Join(err, moved.orNil())
 	}
 
 	// THE EXCLUSION IS WHAT MAKES THIS PROCESS THE CONTROLLER, so the standby
@@ -144,8 +199,12 @@ func (db *DB) ClaimController(
 	// can write anyway, which is the exact hole the latch exists to close.
 	wasStandby := db.standby.Swap(false)
 
+	// AND SO DOES THE SCHEMA RE-CHECK a standby's reads depend on: once the
+	// exclusion is given back another controller can migrate under this handle
+	// again.
 	restore := func(err error) (ControllerClaim, error) {
 		if wasStandby {
+			db.revalidate.Store(true)
 			db.standby.Store(true)
 		}
 
@@ -157,6 +216,12 @@ func (db *DB) ClaimController(
 	// change the schema, and it was allowed to wait beside a leader whose schema
 	// was older than its own binary — which is the whole shape of a
 	// follower-first upgrade. This is where that gets resolved.
+	//
+	// AND WHAT IT MOVED IS JOINED TO EVERY FAILURE AFTER IT. The migration commits
+	// on its own, so a claim refused or stopped below it leaves the ledger on a
+	// schema an older billet is refused by, and the restore gives back only the
+	// exclusion and the latch (#148). A standby's open migrated nothing, so this
+	// replaces nothing.
 	if wasStandby {
 		// THE PER-TRANSACTION SCHEMA RE-CHECK COMES OFF FIRST, AND IT HAS TO.
 		// Nothing can migrate underneath a handle that holds the exclusion, so it
@@ -167,10 +232,17 @@ func (db *DB) ClaimController(
 		// promote onto a ledger no controller has ever migrated.
 		db.revalidate.Store(false)
 
-		if err := db.migrate(ctx); err != nil {
-			db.revalidate.Store(true)
+		// KEPT ON THE HANDLE as well as joined below, so a later attempt from this
+		// same handle that fails still reports it.
+		promoted, err := db.migrate(ctx)
+		if promoted != nil {
+			moved = promoted
+			db.unclaimedMove = promoted
+		}
 
-			return restore(fmt.Errorf("state: migrate on promotion: %w", err))
+		if err != nil {
+			return restore(errors.Join(fmt.Errorf("state: migrate on promotion: %w", err),
+				moved.orNil()))
 		}
 	}
 
@@ -209,8 +281,11 @@ func (db *DB) ClaimController(
 		// record itself would leave the deployment excluded by a process that
 		// does not believe it is the controller, and the only way out would be
 		// restarting something whose logs say it never started.
-		return restore(fmt.Errorf("state: record the controller claim: %w", err))
+		return restore(errors.Join(fmt.Errorf("state: record the controller claim: %w", err),
+			moved.orNil()))
 	}
+
+	db.unclaimedMove = nil
 
 	// RECORDED AFTER THE COMMIT, NEVER BEFORE. The transaction above goes through
 	// DB.Tx and is fenced by checkLeadership like every other write, so a handle
@@ -274,7 +349,9 @@ func (db *DB) AwaitController(
 		case <-ctx.Done():
 			wait.Stop()
 
-			return ControllerClaim{}, fmt.Errorf("state: waiting for the controller claim: %w", ctx.Err())
+			return ControllerClaim{}, errors.Join(
+				fmt.Errorf("state: waiting for the controller claim: %w", ctx.Err()),
+				db.unclaimedMove.orNil())
 		case <-wait.C:
 		}
 	}
@@ -296,6 +373,12 @@ func (db *DB) AwaitController(
 // refusal reaches anybody, so it is already true when anything begins tearing
 // down.
 func (db *DB) LeadershipLost() bool { return db.fenced.Load() }
+
+// UnclaimedMove is what this handle migrated and no claim has recorded yet, as
+// an error to join to a failure, or nil. The open and the claim join it to their
+// own failures; this is for a caller that fails between the two. Ask it from the
+// goroutine that claims.
+func (db *DB) UnclaimedMove() error { return db.unclaimedMove.orNil() }
 
 // LeadershipLostSignal is closed the first time a write is refused because a
 // successor claimed. It never carries a value and is never closed twice.

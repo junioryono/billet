@@ -16,7 +16,7 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 		fn, role, block, before string
 		sources                 []string // the methods whose results are its sources, in order
 	}{
-		{fn: "runServer", role: "server", block: "Server", before: "BecomeController", sources: []string{"LedgerMetrics"}},
+		{fn: "serveControlPlane", role: "server", block: "Server", before: "BecomeController", sources: []string{"LedgerMetrics"}},
 		{fn: "cmdNode", role: "node", block: "Node", before: "Run"},
 	} {
 		t.Run(c.fn, func(t *testing.T) {
@@ -25,7 +25,7 @@ func TestEachRoleServesItsMetricsAfterItsProbe(t *testing.T) {
 			probe, serve, after, serves := -1, -1, -1, 0
 
 			for i, stmt := range body {
-				if ifs, ok := stmt.(*ast.IfStmt); ok && isFlagRef(ifs.Cond, "upgradeProbe") {
+				if ifs, ok := stmt.(*ast.IfStmt); ok && isUpgradeProbeCondition(ifs.Cond) {
 					probe = i
 
 					// THE PROBE BRANCH ENDS THE COMMAND, or the probe falls
@@ -172,12 +172,21 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 		return false
 	}
 
+	// THE ERROR IS THE LAST RESULT, which is every result for cmdNode and the
+	// second of runControlPlane's (fenced, err).
 	ret, ok := ifs.Body.List[0].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) != 1 {
+	if !ok || len(ret.Results) == 0 {
 		return false
 	}
 
-	if r, ok := ret.Results[0].(*ast.Ident); !ok || r.Name != "err" {
+	// THE ERROR ITSELF, or the error first in a join: the server's carries what
+	// its open migrated beside it.
+	last := ret.Results[len(ret.Results)-1]
+	if join, ok := last.(*ast.CallExpr); ok && isPkgCall(join, "errors", "Join") && len(join.Args) > 0 {
+		last = join.Args[0]
+	}
+
+	if r, ok := last.(*ast.Ident); !ok || r.Name != "err" {
 		return false
 	}
 
@@ -201,13 +210,16 @@ func servesThenChecksThenCloses(assign, check, closer ast.Stmt) bool {
 }
 
 // isAppCall recognises app.<name>(...), whatever its arguments.
-func isAppCall(call *ast.CallExpr, name string) bool {
+func isAppCall(call *ast.CallExpr, name string) bool { return isPkgCall(call, "app", name) }
+
+// isPkgCall recognises <pkg>.<name>(...), whatever its arguments.
+func isPkgCall(call *ast.CallExpr, pkg, name string) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != name {
 		return false
 	}
 
-	pkg, ok := sel.X.(*ast.Ident)
+	id, ok := sel.X.(*ast.Ident)
 
-	return ok && pkg.Name == "app"
+	return ok && id.Name == pkg
 }

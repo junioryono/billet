@@ -174,9 +174,16 @@ func TestAClaimThatFailsAfterTakingTheExclusionPutsTheLatchBack(t *testing.T) {
 
 	standby := openStandby(t, dsn)
 
-	if _, err := standby.ClaimController(
-		t.Context(), "standby", "a-different-deployment"); !errors.Is(err, ErrForeignLedger) {
+	_, err = standby.ClaimController(t.Context(), "standby", "a-different-deployment")
+	if !errors.Is(err, ErrForeignLedger) {
 		t.Fatalf("expected ErrForeignLedger past the exclusion; got %v", err)
+	}
+
+	// THE LEADER HAD MIGRATED EVERYTHING, so the promotion moved nothing, and a
+	// refusal that said otherwise would send an operator after a schema change
+	// that never happened.
+	if moved, ok := errors.AsType[*SchemaMoved](err); ok {
+		t.Errorf("a promotion that migrated nothing reported %+v", moved)
 	}
 
 	if err := standby.Tx(t.Context(), func(*sql.Tx) error {

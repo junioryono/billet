@@ -125,6 +125,16 @@ type DB struct {
 	// is after the handle has been read from — see ClaimController.
 	revalidate atomic.Bool
 
+	// unclaimedMove is what this handle migrated, at its open or at a promotion
+	// that did not complete, until a claim records this release in the
+	// watermark and the move becomes the deployment's: from then on an older
+	// billet is refused by the mark anyway. Every claim that fails before that
+	// joins it, so a control plane that migrated and was stopped before it held
+	// the claim does not report a clean stop. Set by openDir before the handle is
+	// returned and touched afterwards only by ClaimController and AwaitController,
+	// which one goroutine calls.
+	unclaimedMove *SchemaMoved
+
 	// inspect marks a handle opened for a report, whose every write transaction
 	// is refused with ErrInspect. See OpenInspect.
 	inspect bool
@@ -563,8 +573,12 @@ func openDir(
 
 	noteOpenSideEffect("migrate")
 
-	if err := db.migrate(startupCtx); err != nil {
-		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
+	// WHAT THE MIGRATION MOVED IS JOINED TO EVERY FAILURE BELOW IT. A process
+	// that cannot open has still left the ledger on the newer schema, which an
+	// older billet now refuses, and saying only that it failed would hide that.
+	moved, err := db.migrate(startupCtx)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), moved.orNil(), db.Close())
 	}
 
 	// AFTER THE MIGRATION, BECAUSE THE TABLE IT READS ARRIVED IN ONE. A proved
@@ -575,7 +589,7 @@ func openDir(
 	// ledger would raise that ledger's mark on the way to being refused, and
 	// fence its real controller out of its own restart. See openMode.records.
 	if err := db.enforceReleaseWatermark(startupCtx, mode.release); err != nil {
-		return nil, errors.Join(err, db.Close())
+		return nil, errors.Join(err, moved.orNil(), db.Close())
 	}
 
 	// AND AN OPERATOR COMMAND GIVES THE EXCLUSION BACK THE MOMENT IT HAS FINISHED
@@ -597,11 +611,13 @@ func openDir(
 		if err := be.releaseController(); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("state: release the controller exclusion after migrating: %w", err),
-				db.Close())
+				moved.orNil(), db.Close())
 		}
 
 		db.revalidate.Store(true)
 	}
+
+	db.unclaimedMove = moved
 
 	return db, nil
 }
@@ -815,6 +831,24 @@ func OnlyCause(err, target error) bool {
 	})
 
 	return only && whole
+}
+
+// StoppedBy reports whether err is nothing but ctx ending: ctx has ended, and
+// every cause at the bottom of err is the reason it did.
+//
+// WHOSE CLOCK IT WAS DECIDES IT. A process asked to stop has a cancelled
+// context, so a deadline among the causes is some inner budget running out,
+// which is a fault, and a test that bounds a run with its own deadline still
+// sees that deadline as the stop. And a context that is still live is never a
+// stop, whatever the error carries: an inner context cancelled for its own
+// reason is a failure that happens to wrap context.Canceled.
+//
+// THE ONE ANSWER to "was this the stop" for the control plane's startup and
+// its scheduler alike; a second classifier is one that disagrees with it.
+func StoppedBy(ctx context.Context, err error) bool {
+	cause := ctx.Err()
+
+	return cause != nil && err != nil && OnlyCause(err, cause)
 }
 
 // OnlyCancellation reports whether a context ending is THE WHOLE of err: every
@@ -1852,13 +1886,26 @@ func readAppliedMigrations(ctx context.Context, q ReadOps) (map[int]appliedMigra
 // fails with a diagnostic, the claim is given back, and the service manager
 // starts it again. Deriving a context is safe here because the transaction
 // never leaves this function; the caution in beginWrite is about one that does.
-func (db *DB) migrate(ctx context.Context) error {
+//
+// IT SAYS WHAT IT DID TO THE SCHEMA, because the caller's next step can fail and
+// a migration does not move back: a non-nil SchemaMoved is a committed move,
+// or, beside an error, one whose COMMIT was sent and not answered. The caller
+// joins it to any failure after this, so a process that gives up says what it
+// left behind.
+func (db *DB) migrate(ctx context.Context) (*SchemaMoved, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 
 		ctx, cancel = context.WithTimeout(ctx, startupTimeout)
 		defer cancel()
 	}
+
+	var (
+		from, to int
+		// committing is set once fn has returned nil, so an error from Tx after
+		// it is the COMMIT's: rolled back or not, nobody can say.
+		committing bool
+	)
 
 	err := db.Tx(ctx, func(tx *sql.Tx) error {
 		// FIRST, before the bootstrap DDL: that CREATE TABLE IF NOT EXISTS takes
@@ -1894,6 +1941,10 @@ func (db *DB) migrate(ctx context.Context) error {
 			return err
 		}
 
+		for v := range seen {
+			from = max(from, v)
+		}
+
 		for _, m := range db.backend.timeline().migrations {
 			if rec, ok := seen[m.Version]; ok {
 				if rec.checksum != m.checksum() {
@@ -1922,9 +1973,34 @@ func (db *DB) migrate(ctx context.Context) error {
 			}); err != nil {
 				return fmt.Errorf("record migration %d (%s): %w", m.Version, m.Name, err)
 			}
+
+			to = m.Version
 		}
+
+		// THE CONTEXT IS ASKED LAST, so a stop that arrived during the statements
+		// rolls them back here and is reported as the nothing it is. Without it,
+		// sql.Tx.Commit answers an ended context with ctx.Err() and never sends
+		// the COMMIT, which would read as a commit nobody answered. What is left
+		// is the instant between this and Commit's own check, and a stop landing
+		// there is reported as could-not-tell: the safe direction.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		committing = true
+
 		return nil
 	})
+
+	var moved *SchemaMoved
+
+	switch {
+	case to == 0:
+	case err == nil:
+		moved = &SchemaMoved{From: from, To: to}
+	case committing:
+		moved = &SchemaMoved{From: from, To: to, Unknown: true}
+	}
 
 	// A DEADLINE, NOT A CANCELLATION. Tx has already translated the engine's
 	// spelling of "interrupted" into the context's error, so what arrives here
@@ -1932,9 +2008,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	// number was and where to look. A plain cancellation is a shutdown during
 	// startup and not a stall, so it is left alone.
 	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%w; the migration did not finish inside the %s startup budget. %s",
+		return moved, fmt.Errorf("%w; the migration did not finish inside the %s startup budget. %s",
 			err, startupTimeout, db.backend.migrationTimeoutAdvice())
 	}
 
-	return err
+	return moved, err
 }
