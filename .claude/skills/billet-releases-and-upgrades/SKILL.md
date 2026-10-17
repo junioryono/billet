@@ -19,6 +19,7 @@ Each invariant below is one line here and stated in full, with the incident or m
 - **The manifest is built and signed inside GoReleaser's `signs` stage, and that ordering is forced.** An immutable release refuses any upload after publication.
 - **A release manifest is signed as `release.yml@refs/heads/main`, and the policy says so.** `releasesource.PublishRefPattern` accepts that identity and a hand-pushed hotfix tag, nothing else.
 - **`cut-release.yml` calls `release.yml` rather than relying on the tag push.** A ref pushed with `GITHUB_TOKEN` starts no workflow.
+- **Cut Release previews what a release carries and cuts only on `confirm=<tag>@<commit>` (#145).** The report is a report, not a policy; the token binds the cut to the commit that was read.
 - **Installing the package directly is not a transactional upgrade.**
 
 ### Automatic updates: [references/automatic-updates.md](references/automatic-updates.md)
