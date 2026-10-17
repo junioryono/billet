@@ -45,6 +45,12 @@ The control plane also reads its ledger at every scrape, through the same report
 
 A standby serves these too: it reads the same ledger, and its gauges show what the active controller has recorded.
 
+A node with `node.ceph` also reads its kernel's RBD mappings at every scrape, with the same could-not-tell rule (`billet_scrape_up{source="rbd"}`). A node without `node.ceph` reports none.
+
+| Metric | What it is |
+|---|---|
+| `billet_node_rbd_mappings{state}` | this host's kernel mappings of images in the site's pools, by what accounts for each: `root_disk` (a guest's root disk, which its microVM holds), `generation` (a read-only check of a cache generation), `session` (a cache volume a cache session on this node names), `recent` (a cache volume named less than six hours ago, whose custody record may not be written yet), `unaccounted` (a cache volume named longer ago that no cache session on this node names, held by no job of this node's; on a host that runs a second node identity, that one's volumes count here too), and `other` (anything else in those pools, such as a map an interrupted `billet images pull` left). The node's eviction pass, at start and every six hours, unmaps without force each `unaccounted` mapping that an earlier pass in the same process also found unaccounted, at least an hour before, and whose volume records this node as the one that mapped it, unless the kernel holds it open; a count that stays above zero is a mapping something on the host still has open, named in the node's `kept kernel mappings` warning |
+
 ## Reaching it from another host
 
 The endpoint has no authentication, and what it reports is the deployment's own business. So `listen` must be a literal loopback address, `127.0.0.1` or `[::1]`, unless `allow_remote: true` is set beside it. A name such as `localhost` is not accepted on its own, because the bind would resolve it again and a resolver could map it to another interface:
