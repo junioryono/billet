@@ -482,6 +482,11 @@ func TestCIScopeMapsEachPathToItsFamilies(t *testing.T) {
 		{"scripts/known-answer-job.sh", "none"},
 		{"scripts/power-log.sh", "none"},
 		{"scripts/power-summary.sh", "none"},
+		// The release scripts: test runs them against fixtures and release-config
+		// runs the resolver through make module-sources; cut-release.yml is not CI.
+		{"scripts/release-ref.sh", "none"},
+		{"scripts/release-contents.sh", "none"},
+		{"scripts/plan-release.sh", "none"},
 		{"scripts/knownanswer/testdata/power-log/power.csv", "none"},
 		{"scripts/knownanswer/check.go", families("lint", "postgres")},
 		{".claude/settings.json", "none"},

@@ -4,6 +4,16 @@ set -euo pipefail
 requested=${REQUESTED:-}
 output=${GITHUB_OUTPUT:?GITHUB_OUTPUT must name the workflow output file}
 
+# THE CALLER MUST PREVIEW AND CONFIRM (#145). Re-running an old Cut Release run
+# from the Actions page runs that run's own workflow file, which predates the
+# preview: it checks out main, runs THIS planner, and cuts whatever main is with
+# nobody having read it. The planner is the one step every version of the
+# workflow shares, so it is where an old caller is turned away.
+if [ "${BILLET_CUT_PROTOCOL:-}" != preview-confirm ]; then
+	echo "::error::this run of Cut Release predates its preview and confirmation; start a new run from the Actions page instead of re-running this one" >&2
+	exit 1
+fi
+
 # Reject line injection before any grep or workflow-output operation sees the input.
 case "$requested" in
 	*[$'\n\r']*)
@@ -49,8 +59,16 @@ if [[ -z $series_newest && -n $newest && $(printf '%s\n%s\n' "$newest" "$tag" | 
 fi
 
 branch="release/$series"
+
+# THE RELEASE THIS ONE IS READ AGAINST (release-contents.sh): the series' newest
+# for a patch, which is what the branch carried until now, and the newest release
+# of all for a new series, which is what an operator is moving from. Empty only
+# before billet's first release.
+previous=${series_newest:-$newest}
+
 {
 	echo "tag=$tag"
 	echo "branch=$branch"
 	echo "collection_version=$collection_version"
+	echo "previous=$previous"
 } >> "$output"

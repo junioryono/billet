@@ -151,7 +151,7 @@ func TestAScriptTooLargeEvenCompressedIsRefusedBeforeABuilderExists(t *testing.T
 func TestTheRealProvisionScriptReportsItsUserDataHeadroom(t *testing.T) {
 	t.Parallel()
 
-	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerVersion: "2.336.0", Arch: "x64"})
+	script, err := provisionScript(BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest, RunnerSHA256: testRunnerDigest, RunnerVersion: "2.336.0", Arch: "x64"})
 	if err != nil {
 		t.Fatalf("provisionScript: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestLaunchBuilderRefusesAnUndeliverableScriptBeforeRunInstances(t *testing.
 
 	_, err := p.launchBuilder(t.Context(), BuildSpec{payloadURL: testPayloadURL, payloadSHA256: testPayloadDigest,
 		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
-		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+		Arch: "x64", RunnerSHA256: testRunnerDigest, RunnerVersion: "2.328.0", Name: "test-image",
 	}, script)
 	if err == nil {
 		t.Fatal("launchBuilder accepted a script it could not deliver, so the failure would " +

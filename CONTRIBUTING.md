@@ -65,7 +65,9 @@ The body covers what changed and why, how it was verified beyond `make check` (a
 
 ## Releases
 
-Releases are maintainer-operated through the **Cut Release** workflow. It creates or reuses the `release/vX.Y` branch (one per minor, carrying every patch), tags, builds through GoReleaser, publishes a signed release manifest beside the archives and packages, verifies the release's immutability attestation, advances the signed `stable` channel, and moves the `v0` tag. A hotfix is a commit on the release branch and the same button with the patch version, then a merge back to `main`. Never tag by hand. `.claude/skills/billet-releases-and-upgrades/SKILL.md` covers the pipeline and the fleet rollout.
+Releases are maintainer-operated through the **Cut Release** workflow. It creates or reuses the `release/vX.Y` branch (one per minor, carrying every patch), tags, builds through GoReleaser, publishes a signed release manifest beside the archives and packages, verifies the release's immutability attestation, advances the signed `stable` channel, and moves the `v0` tag. A hotfix is a commit on the release branch and the same button with the patch version, then a merge back to `main`. Never tag by hand.
+
+Press the button twice. The first run cuts nothing: its summary is a report of what the release carries against the previous one, one line per merged pull request grouped by area, with every change to the scheduler, the ledger schema or the node wire flagged, any new migration announced first because it makes the release one-way, and what CI said about the exact commit being cut. Read it, then run the workflow again with `confirm` set to the `<tag>@<commit>` line the report ends with. A confirmation naming any other tag or commit, because `main` or the branch moved since, cuts nothing and fails the run. `.claude/skills/billet-releases-and-upgrades/SKILL.md` covers the pipeline and the fleet rollout.
 
 ## Reporting security issues
 
