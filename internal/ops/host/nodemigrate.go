@@ -292,7 +292,7 @@ func migrateEndpoint(ctx context.Context, env cli.Env, m migrateMode) (any, *end
 		return nil, endpointUnknown(endpointReasonConfig, problem, "", stateNothing)
 	}
 
-	if r := admitNodeStop(ctx, insp, br.obs, "migrated"); r != nil {
+	if r := admitNodeStop(ctx, insp, br.obs, "migrated", nil, nil); r != nil {
 		return nil, r
 	}
 

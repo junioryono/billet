@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/junioryono/billet/internal/durablefile"
+	"github.com/junioryono/billet/internal/retirement"
 )
 
 // A REPAIR RUNS UNDER THIS CONVERGE'S GUARD, and only there: another
@@ -45,6 +46,55 @@ func TestTheRepairRunsUnderThisConvergesGuard(t *testing.T) {
 			t.Fatalf("a dry run without a holder answered code %d (%s), want the report", dry.code, dry.str("why"))
 		}
 	})
+}
+
+// A RETIREMENT ADMITS NO REPAIR, whoever holds the guard: a guard carrying the
+// retirement's marker is this converge's (a retirement's holder is a guard's
+// holder), and a journal, finished or not, is a host whose node operations the
+// retirement admits. Neither stops anything; a journal that cannot be read is
+// could-not-tell.
+func TestTheRepairRefusesAHostARetirementTouched(t *testing.T) {
+	for _, tc := range []struct {
+		name, outcome, why string
+		plant              func(t *testing.T)
+	}{
+		{"the guard carries the marker", outcomeRefused, "guard carries retirement " + markerID, func(t *testing.T) {
+			t.Helper()
+			markGuard(t, &guardFixture{root: upgradeRoot}, &guardTransition{Kind: transitionRetirement, ID: markerID},
+				nil)
+		}},
+		{"a journal mid-retirement", outcomeRefused, "retirement journal (phase stopped, settled false)",
+			func(t *testing.T) {
+				t.Helper()
+				plantJournal(t, retirement.PhaseStopped, repairHolder, false)
+			}},
+		{"a settled retained host", outcomeRefused, "retirement journal (phase done, settled true)",
+			func(t *testing.T) {
+				t.Helper()
+				plantJournal(t, retirement.PhaseDone, repairHolder, true)
+			}},
+		{"a journal that cannot be read", outcomeUnknown, "the retirement journal could not be judged",
+			func(t *testing.T) {
+				t.Helper()
+				mustOK(t, os.MkdirAll(retirement.JournalPath(), 0o700))
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRepairFixture(t)
+			tc.plant(t)
+
+			o := f.repair(t)
+			if o.str("outcome") != tc.outcome || o.str("reason") != endpointReasonRetirement ||
+				o.str("state") != stateNothing || !strings.Contains(o.str("why"), tc.why) {
+				t.Fatalf("outcome %q reason %q state %q (%s), want %s for the retirement saying %q", o.str("outcome"),
+					o.str("reason"), o.str("state"), o.str("why"), tc.outcome, tc.why)
+			}
+
+			if got := f.acted(t); len(got) != 0 || f.locks != 0 {
+				t.Errorf("a repair under a retirement asked systemctl to %q and took %d lifecycle locks", got, f.locks)
+			}
+		})
+	}
 }
 
 // THE LIFECYCLE LOCK IS TAKEN BY THE ACTION, and only by the action: a dry run
@@ -133,12 +183,21 @@ func TestTheRepairJudgesAgainUnderTheLocks(t *testing.T) {
 		{"the unit gained a drop-in after the second judgement", func(t *testing.T, f *repairFixture) {
 			t.Helper()
 			// Each judgement reads the unit three times and the stop's admission
-			// once: the eighth read is the last look before the stop.
+			// once: the seventh read is the admission, and only it sees the
+			// drop-in, so the shape is judged on the read the process is.
 			body, err := os.ReadFile(f.unitFile(nodeUnit))
 			mustOK(t, err)
-			f.afterShows(t, 7, strings.Replace(string(body), "DropInPaths=\n",
+			f.showsBetween(t, 6, 7, strings.Replace(string(body), "DropInPaths=\n",
 				"DropInPaths=/etc/systemd/system/billet-node.service.d/x.conf\n", 1))
 		}, "drop-ins"},
+		{"systemd restarted the node after the second judgement", func(t *testing.T, f *repairFixture) {
+			t.Helper()
+			body, err := os.ReadFile(f.unitFile(nodeUnit))
+			mustOK(t, err)
+			f.afterShows(t, 6, strings.ReplaceAll(strings.ReplaceAll(string(body), "InvocationID="+nodeInvocation,
+				"InvocationID="+newInvocation), "MainPID="+strconv.Itoa(inspectPID), "MainPID="+
+				strconv.Itoa(inspectPID+7)))
+		}, "moved between the judgement and the stop"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newRepairFixture(t)

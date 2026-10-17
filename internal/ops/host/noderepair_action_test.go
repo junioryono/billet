@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/hostauthority"
+	"github.com/junioryono/billet/internal/retirement"
 )
 
 // repairFixture is the endpoint fixture holding the skew #168 describes: an R
@@ -39,6 +40,7 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	// the guard fixture names is then the R release the node runs.
 	newGuardFixture(t)
 	mustHold(t, repairHolder)
+	pinRetirementRoot(t)
 	f.rBinary(t)
 	mustOK(t, os.Remove(f.recordPath))
 
@@ -71,6 +73,17 @@ func newRepairFixture(t *testing.T) *repairFixture {
 	f.recordAfterStart(t, canonicalA)
 
 	return f
+}
+
+// pinRetirementRoot puts the retirement journal's root in a directory of the
+// test's own, so a repair reads no host's journal.
+func pinRetirementRoot(t *testing.T) {
+	t.Helper()
+
+	prev := retirement.Root
+	retirement.Root = t.TempDir()
+
+	t.Cleanup(func() { retirement.Root = prev })
 }
 
 // loaded writes one of the fake's unit answers: the node unit as systemd has

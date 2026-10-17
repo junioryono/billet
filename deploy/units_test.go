@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/deploy"
+	"github.com/junioryono/billet/internal/version"
 )
 
 // plistValue reads the value a plist associates with a top-level key, by
@@ -616,7 +617,7 @@ func TestTheShippedNodeUnitMeetsTheNodesRuntimeRequirements(t *testing.T) {
 				deploy.NodeUnitName, declared, req.Entry)
 		}
 
-		if !strings.HasPrefix(req.Since, "v") || strings.Count(req.Since, ".") != 2 {
+		if !version.IsRelease(req.Since) {
 			t.Errorf("the requirement %q names %q as the release that first needs it, which is not a release",
 				req.Entry, req.Since)
 		}

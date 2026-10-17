@@ -21,15 +21,15 @@
     # bound as the margin: TWO judgements (before the locks and under them),
     # each the loaded unit's shape, the record's bracket (its attempts, two
     # observations each) and the process's vintage (the managed binary asked
-    # under the guard's bound); the observation before the stop and the shape
-    # after it; the stop under its deadline and the observations after it; the
-    # reload and the shape after it; the start under the unit's bound and the
-    # observations after it; the record wait under the new invocation with the
-    # two observations of a bracket that outlives it; and the closing
-    # observation.
+    # under the probe's bound, which a Go test holds to the command's); the
+    # observation before the stop; the stop under its deadline and the
+    # observations after it; the reload and the shape after it; the start under
+    # the unit's bound and the observations after it; the record wait under the
+    # new invocation with the two observations of a bracket that outlives it;
+    # and the closing observation.
     billet_repair_bound: >-
       {{ (4 * (billet_migration_bracket_attempts | int) + 13) * (billet_migration_observation_bound | int)
-         + 3 * (billet_guard_timeout | int)
+         + 2 * (billet_migration_probe_bound | int) + (billet_guard_timeout | int)
          + (billet_migration_stop_timeout | int) + (billet_migration_start_bound | int)
          + (billet_migration_record_wait | int) }}
   block:

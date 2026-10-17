@@ -21,6 +21,7 @@ import (
 	"github.com/junioryono/billet/internal/endpoint"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/regularfile"
+	"github.com/junioryono/billet/internal/retirement"
 )
 
 // `billet node repair-unit` gives a node unit rendered before the registration
@@ -382,7 +383,50 @@ func repairGuard(run string) (*txLock, *os.File, *endpointRefusal) {
 			stateNothing)
 	}
 
+	// UNDER THE TRANSACTION LOCK, which a retirement's marker and journal are
+	// written under.
+	if rr := repairRetirementRefusal(shape); rr != nil {
+		if dir != nil {
+			_ = dir.Close()
+		}
+
+		tx.release()
+
+		return nil, nil, rr
+	}
+
 	return tx, dir, nil
+}
+
+// repairRetirementRefusal refuses a repair on a host a retirement has touched:
+// a guard carrying its marker, or a journal, finished or not. A retained node's
+// operations are the ones the retirement admits through its own inventory, and
+// a repair stops, reloads and starts the node outside them; a guard shape
+// admits a retirement's holder, so the marker is asked here. An unreadable
+// journal is could-not-tell.
+func repairRetirementRefusal(shape claimShape) *endpointRefusal {
+	const next = "converge this host ordinarily before retiring it; on a host already retired, follow the manual " +
+		"repair in " + unitRequirementsRemedyDoc
+
+	if t := shape.Guard.Transition; t != nil {
+		return endpointRefuse(endpointReasonRetirement, fmt.Sprintf("this converge's guard carries %s %s, and a "+
+			"retirement admits no runtime-unit repair: it would stop, reload and start the node outside the "+
+			"operations the retirement admits", t.Kind, t.ID), next, stateNothing)
+	}
+
+	j, presence, err := retirement.ReadJournal()
+
+	switch presence {
+	case retirement.JournalAbsent:
+		return nil
+	case retirement.JournalPresent:
+		return endpointRefuse(endpointReasonRetirement, fmt.Sprintf("this host holds a retirement journal (phase %s, "+
+			"settled %t), and a retirement admits no runtime-unit repair: it would stop, reload and start the node "+
+			"outside the operations the retirement admits", j.Phase, j.Settled), next, stateNothing)
+	default:
+		return endpointUnknown(endpointReasonRetirement, "the retirement journal could not be judged: "+err.Error(), "",
+			stateNothing)
+	}
 }
 
 // repairUnderLock is the stop, the unit, the start and the record, under the
@@ -392,25 +436,18 @@ func repairUnderLock(ctx context.Context, m repairMode, insp *lifeops.Inspector,
 ) (any, *endpointRefusal) {
 	unitBody, br := judged.body, judged.br
 
-	// (5) THE CONFIGURATION AND THE PROCESS, IMMEDIATELY BEFORE THE STOP: the
-	// file still the one judged, the process the one the bracket read, not
-	// stopping, under a KillMode whose stop proves something.
+	// (5) THE CONFIGURATION, THE PROCESS AND THE LOADED UNIT, IMMEDIATELY BEFORE
+	// THE STOP: the file still the one judged; and in ONE answer from systemd,
+	// the process the one the bracket read, not stopping, under a KillMode whose
+	// stop proves something, and the unit still the one shape a repair admits,
+	// since a drop-in or a reload since the judgement changes what the stop is
+	// for without moving the process.
 	if problem := closeInstalledConfig(installed); problem != "" {
 		return nil, endpointUnknown(endpointReasonConfig, problem+"; nothing was stopped", "", stateNothing)
 	}
 
-	if r := admitNodeStop(ctx, insp, br.obs, "repaired"); r != nil {
+	if r := admitNodeStop(ctx, insp, br.obs, "repaired", repairShapeProperties, stillRepairable); r != nil {
 		return nil, r
-	}
-
-	// AND THE LOADED UNIT, LAST: a drop-in or a reload since the judgement read
-	// it changes what the stop is for, without moving the process.
-	if now, required, _, r := observeRepairShape(ctx, insp); r != nil {
-		return nil, r
-	} else if !required || now != judged.shape {
-		return nil, endpointUnknown(endpointReasonShape, fmt.Sprintf("%s changed under the judgement (RuntimeDirectory=%s "+
-			"from %s); nothing was stopped", nodeUnit, now.RuntimeDirectory, now.FragmentPath), "converge again",
-			stateNothing)
 	}
 
 	// (6) THE STOP, under the repair's own deadline, and its proof.
@@ -612,59 +649,97 @@ func observeRepairShapeProps(ctx context.Context, insp *lifeops.Inspector, state
 			"", state)
 	}
 
+	shape, r := readRepairShape(props, state)
+
+	return props, shape, r
+}
+
+// readRepairShape is the shape in an answer, every property answered or
+// could-not-tell.
+func readRepairShape(props map[string][]string, state string) (repairShape, *endpointRefusal) {
 	shape := repairShape{LoadState: firstProp(props, "LoadState"), FragmentPath: firstProp(props, "FragmentPath"),
 		RuntimeDirectory: firstProp(props, "RuntimeDirectory")}
 
 	// EVERY PROPERTY ANSWERED: an absent one is could-not-tell, never empty.
 	for _, name := range repairShapeProperties {
 		if _, ok := props[name]; !ok {
-			return nil, shape, endpointUnknown(endpointReasonUnit, "systemd answered no "+name+" for "+nodeUnit, "", state)
+			return shape, endpointUnknown(endpointReasonUnit, "systemd answered no "+name+" for "+nodeUnit, "", state)
 		}
 	}
 
-	return props, shape, nil
+	return shape, nil
 }
 
-// observeRepairShape reads the loaded node unit and says whether it is the one
-// shape a repair admits (required), a unit that needs none (it declares the
-// registration directory), or one refused.
+// observeRepairShape reads the loaded node unit and judges its shape.
 func observeRepairShape(ctx context.Context, insp *lifeops.Inspector) (repairShape, bool, string, *endpointRefusal) {
 	props, shape, r := observeRepairShapeProps(ctx, insp, stateNothing)
 	if r != nil {
 		return shape, false, "", r
 	}
 
+	required, why, r := judgeRepairShape(props, shape)
+
+	return shape, required, why, r
+}
+
+// stillRepairable is the stop's admission of the loaded unit: still the one
+// shape a repair admits. A shape that needs no repair now changed under the
+// judgement, which is could-not-tell.
+func stillRepairable(props map[string][]string) *endpointRefusal {
+	shape, r := readRepairShape(props, stateNothing)
+	if r != nil {
+		return r
+	}
+
+	required, _, r := judgeRepairShape(props, shape)
+	if r != nil {
+		return r
+	}
+
+	if !required {
+		return endpointUnknown(endpointReasonShape, fmt.Sprintf("%s changed under the judgement (RuntimeDirectory=%s "+
+			"from %s); nothing was stopped", nodeUnit, shape.RuntimeDirectory, shape.FragmentPath), "converge again",
+			stateNothing)
+	}
+
+	return nil
+}
+
+// judgeRepairShape says whether the loaded unit is the one shape a repair
+// admits (required), a unit that needs none (it declares the registration
+// directory), or one refused.
+func judgeRepairShape(props map[string][]string, shape repairShape) (bool, string, *endpointRefusal) {
 	if shape.LoadState != "loaded" {
-		return shape, false, "", endpointRefuse(endpointReasonUnit, fmt.Sprintf("%s is LoadState=%s, so there is no "+
+		return false, "", endpointRefuse(endpointReasonUnit, fmt.Sprintf("%s is LoadState=%s, so there is no "+
 			"unit to repair", nodeUnit, orUnknownWord(shape.LoadState)), "", stateNothing)
 	}
 
 	entries := strings.Fields(shape.RuntimeDirectory)
 
 	if slices.Contains(entries, deploy.NodeRegistrationDirectory) {
-		return shape, false, "the unit already declares " + deploy.NodeRegistrationDirectory, nil
+		return false, "the unit already declares " + deploy.NodeRegistrationDirectory, nil
 	}
 
 	switch {
 	case !slices.Equal(entries, []string{"billet/locks"}):
-		return shape, false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s declares RuntimeDirectory=%s, which is "+
+		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s declares RuntimeDirectory=%s, which is "+
 			"not the one shape a repair admits (billet/locks alone)", nodeUnit, shape.RuntimeDirectory),
 			"add "+deploy.NodeRegistrationDirectory+" to its RuntimeDirectory by hand as docs/operating/upgrades.md "+
 				"describes, or install the package this release ships", stateNothing)
 	case shape.FragmentPath != repairUnitPath:
-		return shape, false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s is loaded from %s, not from %s, "+
+		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s is loaded from %s, not from %s, "+
 			"which is the only unit a repair edits", nodeUnit, shape.FragmentPath, repairUnitPath),
 			"install the package this release ships, which carries the unit", stateNothing)
 	case firstProp(props, "DropInPaths") != "":
-		return shape, false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s has drop-ins (%s), which a repair "+
+		return false, "", endpointRefuse(endpointReasonShape, fmt.Sprintf("%s has drop-ins (%s), which a repair "+
 			"does not admit", nodeUnit, firstProp(props, "DropInPaths")), "", stateNothing)
 	case firstProp(props, "NeedDaemonReload") != "no":
-		return shape, false, "", endpointUnknown(endpointReasonShape, fmt.Sprintf("%s has NeedDaemonReload=%s, so the "+
+		return false, "", endpointUnknown(endpointReasonShape, fmt.Sprintf("%s has NeedDaemonReload=%s, so the "+
 			"file on disk is not the unit systemd runs", nodeUnit, orUnknownWord(firstProp(props, "NeedDaemonReload"))),
 			"systemctl daemon-reload, then converge again", stateNothing)
 	}
 
-	return shape, true, "", nil
+	return true, "", nil
 }
 
 // proveRepairLoaded is the manager's word after the reload, every condition the

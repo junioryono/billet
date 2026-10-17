@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -70,6 +71,7 @@ const (
 	endpointReasonShape       = "unit-shape"
 	endpointReasonGuard       = "guard"
 	endpointReasonLock        = "lock"
+	endpointReasonRetirement  = "retirement"
 
 	// The states a migration is left in, named on every refusal.
 	stateNothing         = "nothing"
@@ -351,9 +353,10 @@ var unitObservationNames = []string{"LoadState", "ActiveState", "SubState", "Res
 
 // observeUnit reads the node unit through the lifeops inspector (bounded by
 // its timeout). A failed read is could-not-tell; a zero exit without
-// ActiveState is could-not-tell too, never "not running".
-func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string) (unitObservation, string) {
-	props, err := insp.UnitProperties(ctx, unit, unitObservationNames...)
+// ActiveState is could-not-tell too, never "not running". Extra properties are
+// read in the same answer and kept in raw.
+func observeUnit(ctx context.Context, insp *lifeops.Inspector, unit string, extra ...string) (unitObservation, string) {
+	props, err := insp.UnitProperties(ctx, unit, append(slices.Clone(unitObservationNames), extra...)...)
 	if err != nil {
 		return unitObservation{}, fmt.Sprintf("ask systemd about %s: %v", unit, err)
 	}

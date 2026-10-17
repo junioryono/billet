@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/cli"
 )
 
 // A RUNNING NODE WITHOUT A RECORD IS JUDGED BY WHAT ITS UNIT POSITIVELY SAYS
@@ -102,5 +104,81 @@ func TestTheDecisionNamesAUnitThatCannotHoldTheRecord(t *testing.T) {
 					"unknown", o.doc["effective"])
 			}
 		})
+	}
+}
+
+// THE VINTAGE PROBE RECOGNISES WHAT THE PREPARATION ANSWERS: every committed
+// answer of `converge-guard prepare` (a report at 0, a refusal at 2) and the
+// dry run's own output over a host with no guard and one with a guard held,
+// in-process, so a change to the answer's shape that would make every R node
+// could-not-tell fails here; and what is not that answer (another exit, no
+// outcome, an outcome the preparation does not give, the shell's own error
+// text) is never taken for it.
+func TestTheVintageProbeRecognisesThePreparationsAnswer(t *testing.T) {
+	dir := filepath.Join("..", "..", "..", "ansible_collections", "junioryono", "billet", "tests", "fixtures",
+		"guard-prepare")
+
+	for pattern, rc := range map[string]int{"dry-run-*.json": 0, "refused-*.json": exitRefused} {
+		fixtures, err := filepath.Glob(filepath.Join(dir, pattern))
+		mustOK(t, err)
+
+		if len(fixtures) == 0 {
+			t.Fatalf("no committed answers %s under %s", pattern, dir)
+		}
+
+		for _, path := range fixtures {
+			body, err := os.ReadFile(path)
+			mustOK(t, err)
+
+			if !guardAnswered(rc, body) {
+				t.Errorf("the committed answer %s at exit %d is not recognised", filepath.Base(path), rc)
+			}
+		}
+	}
+
+	f := newGuardFixture(t)
+	managedScript(t, f, "v0.11.0")
+
+	dryRun := func(t *testing.T) (int, []byte) {
+		t.Helper()
+
+		var err error
+
+		out := capture(t, func() { err = guardRun(t, "prepare", "--json", "--dry-run") })
+
+		code := 0
+		if err != nil {
+			code = cli.ExitStatus(err)
+		}
+
+		return code, []byte(out)
+	}
+
+	if rc, out := dryRun(t); !guardAnswered(rc, out) {
+		t.Errorf("the dry run over no guard (exit %d) is not recognised: %s", rc, out)
+	}
+
+	mustHold(t, "ci-1")
+
+	if rc, out := dryRun(t); !guardAnswered(rc, out) {
+		t.Errorf("the dry run over a held guard (exit %d) is not recognised: %s", rc, out)
+	}
+
+	for name, tc := range map[string]struct {
+		rc  int
+		out string
+	}{
+		"another exit":         {1, `{"outcome":"reported"}`},
+		"no outcome":           {0, `{"shape":"none"}`},
+		"another outcome":      {0, `{"outcome":"acquired"}`},
+		"not an object":        {0, `"reported"`},
+		"an unknown command":   {2, "billet: unknown command \"converge-guard\"\n"},
+		"nothing printed":      {0, ""},
+		"two objects":          {0, `{"outcome":"reported"}{"outcome":"reported"}`},
+		"an outcome not words": {0, `{"outcome":null}`},
+	} {
+		if guardAnswered(tc.rc, []byte(tc.out)) {
+			t.Errorf("%s (exit %d, %q) was taken for the preparation's answer", name, tc.rc, tc.out)
+		}
 	}
 }

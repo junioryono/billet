@@ -178,6 +178,7 @@ func TestRealSystemdRepairGivesALegacyNodeUnitItsRecordDirectory(t *testing.T) {
 	// release that publishes its record.
 	newGuardFixture(t)
 	mustHold(t, repairHolder)
+	pinRetirementRoot(t)
 
 	prevBinary := installedBinary
 	installedBinary = standin

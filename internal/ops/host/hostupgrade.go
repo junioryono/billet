@@ -796,14 +796,6 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		return err
 	}
 
-	// WHAT THE CANDIDATE NEEDS OF THE NODE UNIT, before the claim and before the
-	// node is told the job was taken (#168): a rollout installs no units, and a
-	// refusal after acceptance would leave the rollout waiting on a host that
-	// never moves.
-	if err := refuseUnmetUnitRequirements(ctx, env, cfg, manifest.Version); err != nil {
-		return err
-	}
-
 	// THE FENCE IS ASKED BEFORE ANYTHING ELSE IS DECIDED, INCLUDING WHETHER THERE
 	// IS ANYTHING TO DO. Putting the already-running fast path first was a defect a
 	// review caught: a machine could satisfy decision 10 without ever raising its
@@ -879,6 +871,15 @@ func actOnResolved(ctx context.Context, env cli.Env, cfg *config.Config, cfgPath
 		ack.accept()
 
 		return nil
+	}
+
+	// WHAT THE CANDIDATE NEEDS OF THE NODE UNIT, judged only when something is to
+	// be installed, and before the claim and before the node is told the job was
+	// taken (#168): a rollout installs no units, and a refusal after acceptance
+	// would leave the rollout waiting on a host that never moves. A host already
+	// on the target installs nothing, so it settles above whatever its unit lacks.
+	if err := refuseUnmetUnitRequirements(ctx, env, cfg, manifest.Version); err != nil {
+		return err
 	}
 
 	dir, err := stageClaim()

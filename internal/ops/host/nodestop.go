@@ -15,9 +15,14 @@ import (
 // only for the process judged: the same pid and invocation, not stopping,
 // loaded, under a KillMode whose stop proves something, and with the SubState
 // and Result the proof will read answered. act names what the stop is for in a
-// refusal ("migrated", "repaired").
-func admitNodeStop(ctx context.Context, insp *lifeops.Inspector, judged unitObservation, act string) *endpointRefusal {
-	pre, problem := observeUnit(ctx, insp, nodeUnit)
+// refusal ("migrated", "repaired"). A command whose stop rests on more of the
+// unit names those properties in extra and judges them in judge, on the same
+// observation the process is judged on: a second read would leave whichever
+// came first stale by the length of the other.
+func admitNodeStop(ctx context.Context, insp *lifeops.Inspector, judged unitObservation, act string, extra []string,
+	judge func(props map[string][]string) *endpointRefusal,
+) *endpointRefusal {
+	pre, problem := observeUnit(ctx, insp, nodeUnit, extra...)
 	if problem != "" {
 		return endpointUnknown(endpointReasonUnit, "before the stop: "+problem, "", stateNothing)
 	}
@@ -64,6 +69,10 @@ func admitNodeStop(ctx context.Context, insp *lifeops.Inspector, judged unitObse
 	if pre.SubState == "" || pre.Result == "" {
 		return endpointUnknown(endpointReasonUnit, "systemd answered no SubState or Result for "+nodeUnit+", so the "+
 			"observation is incomplete and the stop cannot be judged", "check and approve afresh", stateNothing)
+	}
+
+	if judge != nil {
+		return judge(pre.raw)
 	}
 
 	return nil
